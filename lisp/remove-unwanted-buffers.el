@@ -7,6 +7,7 @@
 
 (defun remove-unwanted-buffers ()
   (setq initial-scratch-message "")  ;; Makes *scratch* empty.
+;;  (remove-scratch-buffer)
   (add-hook 'after-change-major-mode-hook 'remove-scratch-buffer)
   (setq-default message-log-max nil) ;; Removes *messages* from the buffer.
   (kill-buffer "*Messages*")

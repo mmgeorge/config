@@ -6,13 +6,15 @@ PROMPT_DIRTRIM=4
 alias tmux='tmux -f $HOME/config/tmux.conf '
 
 
+KILLEMACS="(kill-emacs)"
+
 # bindings
 alias clear='clear;tmux clear-history'
 alias ll='ls -l --block-size=M --group-directories-first --color'
 alias ls='ls --block-size=M --group-directories-first --color' 
 alias lla='ls -la --block-size=M --group-directories-first --color'
 alias ec='emacsclient'
-alias kec='emacsclient -e \"\(kill-emacs\)\"'
+alias kec='pkill emacs'
 alias create='$HOME/config/scripts/create-repo.sh'
 
 # color directories
