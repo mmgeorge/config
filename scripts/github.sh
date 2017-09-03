@@ -40,7 +40,7 @@ source $HOME/.bashrc
 ssh-keygen
 key=$(cat $HOME/.ssh/id_rsa.pub)
 
-curl -i -H 'Authorization: token '"$GITHUB_TOKEN"'' \
+curl -i -H 'Authorization: token '"$token"'' \
      -d '{ "title": "'"$HOSTNAME"'", "key": "'"$key"'" }' https://api.github.com/user/keys \
      > $local/key.json
 
