@@ -1,0 +1,2 @@
+
+rm $HOME/.bashrc
