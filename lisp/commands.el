@@ -28,6 +28,10 @@
 (global-set-key (kbd "M-;") 'forward-char)
 (global-set-key (kbd "M-j") 'backward-char)
 
+;(define-key dired-mode-map (kbd "w") 'dired-previous-line)
+;(define-key dired-mode-map (kbd "s") 'dired-next-line)
+
+
 
 (provide 'emacs-commands)
 ;;; emacs-commands ends here
