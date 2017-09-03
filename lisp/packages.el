@@ -123,6 +123,46 @@
 ;;      (define-key helm-gtags-mode-map (kbd "C-c >") 'helm-gtags-next-history)
 ;;      (define-key helm-gtags-mode-map (kbd "M-,") 'helm-gtags-pop-stack)))
 
+;;;; Typescript
+
+(defun setup-tide-mode ()
+  (interactive)
+  (tide-setup)
+  (flycheck-mode +1)
+  (setq flycheck-check-syntax-automatically '(save mode-enabled))
+  (eldoc-mode +1)
+  (tide-hl-identifier-mode +1)
+  (company-mode +1))
+
+(setq tide-format-options
+                 '(:insertSpaceAfterFunctionKeywordForAnonymousFunctions
+                   t
+                   :placeOpenBraceOnNewLineForFunctions
+                   nil
+                   :InsertSpaceAfterOpeningAndBeforeClosingNonemptyBrackets t
+                   )))
+
+;; aligns annotation to the right hand side
+(setq company-tooltip-align-annotations t)
+
+;; formats the buffer before saving
+;;(add-hook 'before-save-hook 'tide-format-before-save)
+
+(add-hook 'typescript-mode-hook #'setup-tide-mode)
+
+
+;;;; GLSL
+
+(flycheck-define-checker glsl-lang-validator
+  "A GLSL checker using glslangValidator.
+   See URL https://www.khronos.org/opengles/sdk/tools/Reference-Compiler/"
+  :command ("glslangValidator" source)
+  :error-patterns
+  ((error line-start "ERROR: " column ":" line ": " (message) line-end))
+  :modes glsl-mode)
+(add-to-list 'flycheck-checkers 'glsl-lang-validator)
+
+
 ;; autopair
 (run-with-idle-timer 0 nil (lambda () (require 'autopair)))
 (run-with-idle-timer 0 nil (lambda () (autopair-global-mode)))
