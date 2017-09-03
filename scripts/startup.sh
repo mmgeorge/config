@@ -1,56 +1,9 @@
-
 #!/bin/bash
-
-prefix=""
-reject=""
-
-echo "
-(setq CONFIG-LOAD-PATH \"$HOME/.pref/\") 
-(load \"$HOME/.pref/load.el\")" > ~/.emacs;
-
-echo '
-# reload with tmux source-file ~/.tmux.conf
-set -g status-justify left
-set -g status-bg default
-#set -g status-fg colour250
-set -g status-interval 2
-#set -g status-bg colour196
-set -g default-terminal "screen-256color"
-# set -g pane-active-border-fg brightblue
-setw -g mode-bg colour6
-setw -g mode-fg colour0
-# set -g pane-border-bg colour235
-# set -g pane-border-fg colour238
-
-# Pane border
-set -g pane-border-bg colour236
-set -g pane-active-border-bg colour236
-set -g pane-border-fg colour51
-set -g pane-active-border-fg colour51
-setw -g mode-bg colour6
-
-# Window status
-set-window-option -g status-left ""
-#set -g status-right "#H >> #S:#I >> %a %H:%M"
-set -g status-right "#H >> %a %H:%M"
-set -g status-right-length 100
-
-set-window-option -g window-status-current-bg white
-set-window-option -g window-status-current-fg black
-set-window-option -g window-status-fg colour230 #6
-set-window-option -g status-right-fg colour143 #6
-set-window-option -g window-status-format "#I-#W"
-set-window-option -g window-status-current-format "#I-#W"
-
-# Key bindings
-bind-key -t emacs-copy 'i' halfpage-up
-bind-key -t emacs-copy 'o' halfpage-down
-set-option -g status-position top
-' > ~/.tmux.conf;
-
 
 PROMPT_DIRTRIM=4
 
+# OVERRIDE default tmux command so as to load configuration file
+alias tmux='tmux -f $HOME/config/tmux.conf '
 
 
 # bindings
