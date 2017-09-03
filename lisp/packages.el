@@ -1,4 +1,5 @@
 
+
 (setq package-list
       '(helm
         helm-projectile
@@ -69,7 +70,8 @@
 ;; slime
 (if (file-exists-p "/usr/bin/sbcl" )
     (progn
-      (load (expand-file-name "/cloud/.pref/quicklisp/slime-helper.el"))
+                                        ;(load (expand-file-name "quicklisp/slime-helper.el"))
+      (setq slime-contribs '(slime-fancy))
       (setq inferior-lisp-program "/usr/bin/sbcl")
       (global-set-key (kbd "M-z") 'slime-repl-clear-buffer)))
 

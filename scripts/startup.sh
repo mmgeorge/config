@@ -13,7 +13,7 @@ alias clear='clear;tmux clear-history'
 alias ll='ls -l --block-size=M --group-directories-first --color'
 alias ls='ls --block-size=M --group-directories-first --color' 
 alias lla='ls -la --block-size=M --group-directories-first --color'
-alias ec='emacsclient'
+alias ec='emacsclient -nw '
 alias kec='pkill emacs'
 alias create='$HOME/config/scripts/create-repo.sh'
 
