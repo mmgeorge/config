@@ -6,8 +6,7 @@
           "remove-unwanted-buffers.el"
           "half-page-scroll.el"
           "commands.el"
-          "native-modes.el"
-          "root.el"
+          "default.el"
           "templates.el"
           "packages.el"))
   (dolist (file loads)

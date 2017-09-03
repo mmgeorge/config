@@ -11,6 +11,8 @@ alias clear='clear;tmux clear-history'
 alias ll='ls -l --block-size=M --group-directories-first --color'
 alias ls='ls --block-size=M --group-directories-first --color' 
 alias lla='ls -la --block-size=M --group-directories-first --color'
+alias ec='emacsclient'
+alias kec='emacsclient -e \"\(kill-emacs\)\"'
 
 
 # color directories
