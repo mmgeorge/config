@@ -1,4 +1,4 @@
-
+apt-get install curl jq -y
 
 startup="$HOME/config/scripts/startup.sh"
 eload="$HOME/config/lisp/load.el"

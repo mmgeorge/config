@@ -13,7 +13,7 @@ alias ls='ls --block-size=M --group-directories-first --color'
 alias lla='ls -la --block-size=M --group-directories-first --color'
 alias ec='emacsclient'
 alias kec='emacsclient -e \"\(kill-emacs\)\"'
-
+alias create='$HOME/config/scripts/create-repo.sh'
 
 # color directories
 LS_COLORS=$LS_COLORS:'di=1;37:' ; export LS_COLORS

@@ -1,6 +1,11 @@
 
-printf "Repository name: "
-read name
+name=$1
 
-curl -i -H 'Authorization: token '"$GITHUB_TOKEN"'' \
-     -d '{ "name": "test" }' https://api.github.com/user/repos
+ssh_path=$(curl -H 'Authorization: token '"$GITHUB_TOKEN"'' \
+                -d '{ "name": "'"$name"'" }' \
+                https://api.github.com/user/repos \
+                  | jq '.ssh_url')
+
+echo "Created Github repository at ${ssh_path//\"}"
+
+git clone "${ssh_path//\"}"
