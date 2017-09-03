@@ -140,7 +140,7 @@
                    :placeOpenBraceOnNewLineForFunctions
                    nil
                    :InsertSpaceAfterOpeningAndBeforeClosingNonemptyBrackets t
-                   )))
+                   ))
 
 ;; aligns annotation to the right hand side
 (setq company-tooltip-align-annotations t)
