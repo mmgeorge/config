@@ -70,8 +70,8 @@
 ;; slime
 (if (file-exists-p "/usr/bin/sbcl" )
     (progn
-                                        ;(load (expand-file-name "quicklisp/slime-helper.el"))
-      (setq slime-contribs '(slime-fancy))
+      (require 'slime-autoloads)
+      (setq slime-contribs '(slime-fancy slime-asdf))
       (setq inferior-lisp-program "/usr/bin/sbcl")
       (global-set-key (kbd "M-z") 'slime-repl-clear-buffer)))
 
