@@ -1,9 +1,9 @@
 
 printf "Git username: "
-read username
-printf "Git email"
-read email
+read USERNAME
+printf "Git email: "
+read EMAIL
 
 git config --global core.editor emacs
-git config --global user.name "Matt"
-git config --global user.email matt@mattgeorge.net
+git config --global user.name $USERNAME
+git config --global user.email $EMAIL

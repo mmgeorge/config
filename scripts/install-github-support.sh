@@ -44,3 +44,5 @@ curl -i -H 'Authorization: token '""${token//\"}""'' \
      -d '{ "title": "'"$HOSTNAME"'", "key": "'"$key"'" }' https://api.github.com/user/keys \
      > $local/key.json
 
+
+source ./setup-git.sh 
