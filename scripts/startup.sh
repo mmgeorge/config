@@ -2,9 +2,6 @@
 
 PROMPT_DIRTRIM=4
 
-# OVERRIDE default tmux command so as to load configuration file
-alias tmux='tmux -f $HOME/config/tmux.conf '
-
 
 KILLEMACS="(kill-emacs)"
 
@@ -118,3 +115,4 @@ if ! shopt -oq posix; then
     . /etc/bash_completion
   fi
 fi
+

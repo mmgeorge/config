@@ -23,3 +23,7 @@ else
     echo "(load \"$eload\")" >> $HOME/.emacs
     printf "ADDED!\n"
 fi
+
+printf "Installing tmux conf into home directory ... "
+cp ../tmux.conf  $HOME/.tmux.conf
+printf "ADDED!\n"
