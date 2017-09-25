@@ -18,7 +18,7 @@
 (global-set-key (kbd "M-w") 'previous-line)
 (global-set-key (kbd "M-s") 'next-line)
 (global-set-key (kbd "M-d") 'forward-word)
-(global-set-key (kbd "C-d") 'forward-char)
+;;(global-set-key (kbd "C-d") 'forward-char)
 (global-set-key (kbd "M-a") 'backward-word)
 (global-set-key (kbd "C-c v") 'erase-buffer)
 (global-set-key (kbd "C-x f") 'set-mark-command)

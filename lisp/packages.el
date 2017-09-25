@@ -7,13 +7,24 @@
         company
         autopair
         markdown-mode
-        
-        ;; lisp
-        slime
 
+        ;; javascript
+        ;;js2-mode
+        ;;company-tern ;; requires tern installed (npm install -g tern)
+        ;; npm install -g eslint babel-eslint eslint-plugin-react
+
+        tern
+        js2-refactor
+        rjsx-mode
+        web-mode
+        
         ;; typescript
         tide
-        typescript-mode))
+        typescript-mode
+
+        
+        ;; lisp
+        slime))
 
 
 (require 'package)
@@ -125,6 +136,53 @@
 ;;      (define-key helm-gtags-mode-map (kbd "C-c >") 'helm-gtags-next-history)
 ;;      (define-key helm-gtags-mode-map (kbd "M-,") 'helm-gtags-pop-stack)))
 
+;;;; Javascript
+(require 'web-mode)
+(defun my-web-mode-hook ()
+  "Hooks for Web mode."
+  (setq web-mode-markup-indent-offset 2))
+
+(add-hook 'web-mode-hook  'my-web-mode-hook)
+
+(add-to-list 'auto-mode-alist '("\\.js\\'" . rjsx-mode))
+(setq js2-basic-offset 2)
+
+
+
+;; (require 'js2-mode)
+;; (add-to-list 'auto-mode-alist '("\\.js\\'" . js2-mode))
+(add-hook 'js2-mode-hook #'js2-imenu-extras-mode)
+
+;; (require 'js2-refactor)
+;; (add-hook 'rjsx-mode-hook #'js2-refactor-mode)
+;; (js2r-add-keybindings-with-prefix "C-c C-r")
+;; (define-key rjsx-mode-map (kbd "C-k") #'js2r-kill)
+
+(require 'company-tern)
+(add-to-list 'company-backends 'company-tern)
+
+(add-hook 'rjsx-mode-hook (lambda ()
+                           (tern-mode)
+                           (company-mode)))
+(setq js-indent-level 2)
+(add-hook 'json-mode-hook
+          (lambda ()
+            (make-local-variable 'js-indent-level)
+            (setq js-indent-level 2)))
+
+;;eslint 
+(flycheck-add-mode 'javascript-eslint 'rjsx-mode)
+(setq-default flycheck-temp-prefix ".flycheck")
+
+(setq-default flycheck-disabled-checkers
+              (append flycheck-disabled-checkers
+                      '(javascript-jshint)))
+(setq-default flycheck-disabled-checkers
+              (append flycheck-disabled-checkers
+                      '(json-jsonlist)))
+
+
+
 ;;;; Typescript
 
 (defun setup-tide-mode ()
@@ -149,6 +207,7 @@
 
 ;; formats the buffer before saving
 ;;(add-hook 'before-save-hook 'tide-format-before-save)
+(setq typescript-indent-level 2)
 
 (add-hook 'typescript-mode-hook #'setup-tide-mode)
 
