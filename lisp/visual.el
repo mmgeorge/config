@@ -1,18 +1,18 @@
 
 
 ;; Colors
-(custom-set-variables
- '(ansi-color-faces-vector
-   [default default default italic underline success warning error])
- '(custom-enabled-themes (quote (wombat)))
- '(inhibit-startup-screen t)
- '(safe-local-variable-values (quote ((Package . LISP-UNIT)))))
+;; (custom-set-variables
+;;  '(ansi-color-faces-vector
+;;    [default default default italic underline success warning error])
+;;  '(custom-enabled-themes (quote (wombat)))
+;;  '(inhibit-startup-screen t)
+;;  '(safe-local-variable-values (quote ((Package . LISP-UNIT)))))
 
-(custom-set-faces
- '(custom-variable-tag ((t (:foreground "old lace" :weight bold))))
- '(font-lock-keyword-face ((t (:foreground "gold" :weight bold))))
- '(py-def-class-face ((t (:inherit font-lock-keyword-face :foreground "sandy brown"))))
- '(variable-pitch ((t (:foreground "sky blue" :family "Sans Serif")))))
+;; (custom-set-faces
+;;  '(custom-variable-tag ((t (:foreground "old lace" :weight bold))))
+;;  '(font-lock-keyword-face ((t (:foreground "gold" :weight bold))))
+;;  '(py-def-class-face ((t (:inherit font-lock-keyword-face :foreground "sandy brown"))))
+;;  '(variable-pitch ((t (:foreground "sky blue" :family "Sans Serif")))))
 
 ;; (setq initial-frame-alist
 ;;       `((background-color . ,(face-background 'default))
@@ -26,9 +26,9 @@
 
 
 (setq visible-bell 1)
-(set-face-attribute 'default nil :height 100)
+;;(set-face-attribute 'default nil :height 100)
 (menu-bar-mode -1)
-(set-face-attribute 'region nil :background "#766")
+;;(set-face-attribute 'region nil :background "#766")
 
 ;; Linum-mode
 (global-linum-mode t)
@@ -109,36 +109,53 @@
 
 ;; TABS FORMATING
 
+;; (custom-set-variables
+;;  ;; custom-set-variables was added by Custom.
+;;  ;; If you edit it by hand, you could mess it up, so be careful.
+;;  ;; Your init file should contain only one such instance.
+;;  ;; If there is more than one, they won't work right.
+;;  '(ansi-color-faces-vector
+;;    [default default default italic underline success warning error])
+;;  '(custom-enabled-themes (quote (wombat)))
+;;  '(inhibit-startup-screen t)
+;;  '(safe-local-variable-values (quote ((Package . LISP-UNIT)))))
+;; (custom-set-faces
+;;  ;; custom-set-faces was added by Custom.
+;;  ;; If you edit it by hand, you could mess it up, so be careful.
+;;  ;; Your init file should contain only one such instance.
+;;  ;; If there is more than one, they won't work right.
+;;  '(cua-rectangle-noselect ((t (:background "dimgray" :foreground "white"))))
+;;  '(custom-variable-tag ((t (:foreground "old lace" :weight bold))))
+;;  '(flycheck-warning ((t (:underline (:color "red" :style wave)))))
+;;  '(font-lock-function-name-face ((t (:foreground "color-24"))))
+;;  '(font-lock-keyword-face ((t (:foreground "gold" :weight bold))))
+;;  '(font-lock-string-face ((t (:foreground "color-98"))))
+;;  '(font-lock-type-face ((t (:foreground "red" :weight bold))))
+;;  '(helm-selection ((t (:background "color-66" :distant-foreground "color-18"))))
+;;  '(linum ((t (:inherit (shadow default) :foreground "color-102"))))
+;;  '(mode-line ((t (:background "red" :foreground "blue"))))
+;;  '(mode-line-buffer-id ((t (:foreground "color-16"))))
+;;  '(py-def-class-face ((t (:inherit font-lock-keyword-face :foreground "sandy brown"))))
+;;  '(variable-pitch ((t (:foreground "sky blue" :family "Sans Serif")))))
+
+
 (custom-set-variables
  ;; custom-set-variables was added by Custom.
  ;; If you edit it by hand, you could mess it up, so be careful.
  ;; Your init file should contain only one such instance.
  ;; If there is more than one, they won't work right.
- '(ansi-color-faces-vector
-   [default default default italic underline success warning error])
- '(custom-enabled-themes (quote (wombat)))
- '(inhibit-startup-screen t)
- '(safe-local-variable-values (quote ((Package . LISP-UNIT)))))
+ )
 (custom-set-faces
  ;; custom-set-faces was added by Custom.
  ;; If you edit it by hand, you could mess it up, so be careful.
  ;; Your init file should contain only one such instance.
  ;; If there is more than one, they won't work right.
- '(cua-rectangle-noselect ((t (:background "dimgray" :foreground "white"))))
- '(custom-variable-tag ((t (:foreground "old lace" :weight bold))))
- '(flycheck-warning ((t (:underline (:color "red" :style wave)))))
- '(font-lock-function-name-face ((t (:foreground "color-24"))))
- '(font-lock-keyword-face ((t (:foreground "gold" :weight bold))))
- '(font-lock-string-face ((t (:foreground "color-98"))))
- '(font-lock-type-face ((t (:foreground "red" :weight bold))))
- '(helm-selection ((t (:background "color-66" :distant-foreground "color-18"))))
- '(linum ((t (:inherit (shadow default) :foreground "color-102"))))
- '(mode-line ((t (:background "red" :foreground "blue"))))
- '(mode-line-buffer-id ((t (:foreground "color-16"))))
- '(py-def-class-face ((t (:inherit font-lock-keyword-face :foreground "sandy brown"))))
- '(variable-pitch ((t (:foreground "sky blue" :family "Sans Serif")))))
-
-
+ '(default ((t (:inherit nil :stipple nil :background "unspecified-bg" :foreground "brightwhite" :inverse-video nil :box nil :strike-through nil :overline nil :underline nil :slant normal :weight normal :height 1 :width normal :foundry "default" :family "default"))))
+ '(flycheck-error ((t (:foreground "brightred" :underline "brightred"))))
+ '(font-lock-function-name-face ((t (:foreground "color-197"))))
+ '(font-lock-keyword-face ((t (:foreground "color-221"))))
+ '(font-lock-string-face ((t (:foreground "color-39"))))
+ '(font-lock-variable-name-face ((t (:foreground "color-197")))))
 
 
 

@@ -13,10 +13,11 @@
         ;;company-tern ;; requires tern installed (npm install -g tern)
         ;; npm install -g eslint babel-eslint eslint-plugin-react
 
-        tern
-        js2-refactor
-        rjsx-mode
+        ;;tern
+        ;;js2-refactor
+        ;;rjsx-mode
         web-mode
+        js2-mode
         
         ;; typescript
         tide
@@ -100,7 +101,6 @@
 (global-set-key (kbd "M-,") 'helm-gtags-find-tag)
 
 ;; C/C++
-
 ;; HideShow
 ;; (setq HS-MODE-HIDDEN nil)
 ;; (defun toggle-hide-all ()
@@ -136,55 +136,22 @@
 ;;      (define-key helm-gtags-mode-map (kbd "C-c >") 'helm-gtags-next-history)
 ;;      (define-key helm-gtags-mode-map (kbd "M-,") 'helm-gtags-pop-stack)))
 
-;;;; Javascript
+;;;; WEB Dev
+
+;; web-mode
 (require 'web-mode)
 (defun my-web-mode-hook ()
   "Hooks for Web mode."
   (setq web-mode-markup-indent-offset 2))
-
 (add-hook 'web-mode-hook  'my-web-mode-hook)
 
-(add-to-list 'auto-mode-alist '("\\.js\\'" . rjsx-mode))
-(setq js2-basic-offset 2)
-
-
-
-;; (require 'js2-mode)
-;; (add-to-list 'auto-mode-alist '("\\.js\\'" . js2-mode))
+;; js2-mode
+(require 'js2-mode)
+(add-to-list 'auto-mode-alist '("\\.js\\'" . js2-mode))
 (add-hook 'js2-mode-hook #'js2-imenu-extras-mode)
-
-;; (require 'js2-refactor)
-;; (add-hook 'rjsx-mode-hook #'js2-refactor-mode)
-;; (js2r-add-keybindings-with-prefix "C-c C-r")
-;; (define-key rjsx-mode-map (kbd "C-k") #'js2r-kill)
-
-(require 'company-tern)
-(add-to-list 'company-backends 'company-tern)
-
-(add-hook 'rjsx-mode-hook (lambda ()
-                           (tern-mode)
-                           (company-mode)))
 (setq js-indent-level 2)
-(add-hook 'json-mode-hook
-          (lambda ()
-            (make-local-variable 'js-indent-level)
-            (setq js-indent-level 2)))
 
-;;eslint 
-(flycheck-add-mode 'javascript-eslint 'rjsx-mode)
-(setq-default flycheck-temp-prefix ".flycheck")
-
-(setq-default flycheck-disabled-checkers
-              (append flycheck-disabled-checkers
-                      '(javascript-jshint)))
-(setq-default flycheck-disabled-checkers
-              (append flycheck-disabled-checkers
-                      '(json-jsonlist)))
-
-
-
-;;;; Typescript
-
+;; typescript
 (defun setup-tide-mode ()
   (interactive)
   (tide-setup)
@@ -195,12 +162,11 @@
   (company-mode +1))
 
 (setq tide-format-options
-                 '(:insertSpaceAfterFunctionKeywordForAnonymousFunctions
-                   t
-                   :placeOpenBraceOnNewLineForFunctions
-                   nil
-                   :InsertSpaceAfterOpeningAndBeforeClosingNonemptyBrackets t
-                   ))
+      '(:insertSpaceAfterFunctionKeywordForAnonymousFunctions
+        t
+        :placeOpenBraceOnNewLineForFunctions
+        nil
+        :InsertSpaceAfterOpeningAndBeforeClosingNonemptyBrackets t))
 
 ;; aligns annotation to the right hand side
 (setq company-tooltip-align-annotations t)
@@ -209,11 +175,11 @@
 ;;(add-hook 'before-save-hook 'tide-format-before-save)
 (setq typescript-indent-level 2)
 
+(add-to-list 'auto-mode-alist '("\\.tsx\\'" . typescript-mode))
 (add-hook 'typescript-mode-hook #'setup-tide-mode)
 
 
 ;;;; GLSL
-
 (flycheck-define-checker glsl-lang-validator
   "A GLSL checker using glslangValidator.
    See URL https://www.khronos.org/opengles/sdk/tools/Reference-Compiler/"
