@@ -138,7 +138,7 @@
 
       
       (run-with-idle-timer 0 nil (lambda () (start-slime)))
-      (run-with-idle-timer 2 nil (lambda () (slime-load-system (project-system-name))))
+      (run-with-idle-timer 1 nil (lambda () (slime-load-system (project-system-name))))
       
       (global-set-key (kbd "M-z") 'slime-repl-clear-buffer)
       (global-set-key (kbd "C-p c") 'reload-project)
