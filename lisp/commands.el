@@ -26,6 +26,7 @@
 (global-set-key (kbd "M-k") 'previous-line)
 (global-set-key (kbd "M-l") 'next-line)
 (global-set-key (kbd "M-;") 'forward-char)
+(global-set-key (kbd "M-:") 'forward-char)
 (global-set-key (kbd "M-j") 'backward-char)
 
 ;(define-key dired-mode-map (kbd "w") 'dired-previous-line)

@@ -25,7 +25,9 @@
 
         
         ;; lisp
-        slime))
+        slime
+        slime-company
+        ))
 
 
 (require 'package)
@@ -78,14 +80,71 @@
             (local-set-key (kbd "C-l p") 'markdown-live-preview-mode)))
 
 
+;;(locate-dominating-file (cua--M/o) )
 
-;; slime
+;; (defun find-system-name (asd-file)
+;;   (with-temp-buffer
+;;     (insert-file-contents (concat asd-file "system.asd"))
+;;     (when (string-match "asdf:defsystem :\\(.*\\)" (buffer-string))
+;;       (message (match-string 1 (buffer-string)))
+;;       (match-string 1 (buffer-string))
+;;     )))
+
+(defun project-system-name ()
+  (interactive)
+  (file-name-base (car (directory-files (projectile-project-root) t "asd"))))
+
+
+(defun reload-project ()
+  (interactive)
+  (message "hello project")
+  (slime-reload-system (project-system-name)))
+
+  ;; (let ((root (locate-dominating-file
+  ;;                  (file-name-directory buffer-file-name)
+  ;;                  (lambda (parent) (directory-files parent nil "\\(*.\\).asd")))))
+  ;;   (if root
+  ;;       (message root
+  ;;        ;(car (directory-files root nil "asd"))
+  ;;        ))))
+        ;(find-system-name asd-file))))
+
+;;slime
+(defun start-slime ()
+  (interactive)
+  (if (string-equal "lisp" (file-name-extension buffer-file-name))
+      (unless (slime-connected-p)
+        (slime)
+        (shrink-window 15)
+        (other-window 1)
+        )))
+
+;;(setq *project-path(projectile-project-pa) (projectile-project-info))
+
 (if (file-exists-p "/usr/bin/sbcl" )
     (progn
       (require 'slime-autoloads)
-      (setq slime-contribs '(slime-fancy slime-asdf))
+      (setq slime-lisp-implementations
+            '((sbcl ("sbcl" "--core" "/home/matt/config/lisp/sbcl.core-with-swank")
+                    :init (lambda (port-file _)
+                            (format "(swank:start-server %S)\n" port-file))
+                    )))
+
+      (setq slime-contribs '(slime-fancy slime-asdf slime-cl-indent))
+      (setq slime-kill-without-query-p t)
       (setq inferior-lisp-program "/usr/bin/sbcl")
-      (global-set-key (kbd "M-z") 'slime-repl-clear-buffer)))
+      (slime-setup '(slime-company))
+      
+
+      
+      (run-with-idle-timer 0 nil (lambda () (start-slime)))
+      (run-with-idle-timer 2 nil (lambda () (slime-load-system (project-system-name))))
+      
+      (global-set-key (kbd "M-z") 'slime-repl-clear-buffer)
+      (global-set-key (kbd "C-p c") 'reload-project)
+      
+      ))
+
 
 ;; js2-mode
 (add-to-list 'auto-mode-alist '("\\.js\\'" . js2-mode))
