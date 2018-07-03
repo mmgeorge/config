@@ -124,11 +124,13 @@
 (if (file-exists-p "/usr/bin/sbcl" )
     (progn
       (require 'slime-autoloads)
-      (setq slime-lisp-implementations
-            '((sbcl ("sbcl" "--core" "/home/matt/config/lisp/sbcl.core-with-swank")
-                    :init (lambda (port-file _)
-                            (format "(swank:start-server %S)\n" port-file))
-                    )))
+      ;; This causes new packages not to be found!!!
+      ;; Danger danger!!
+      ;; (setq slime-lisp-implementations
+      ;;       '((sbcl ("sbcl" "--core" "/home/matt/config/lisp/sbcl.core-with-swank")
+      ;;               :init (lambda (port-file _)
+      ;;                       (format "(swank:start-server %S)\n" port-file))
+      ;;               )))
 
       (setq slime-contribs '(slime-fancy slime-asdf slime-cl-indent))
       (setq slime-kill-without-query-p t)
