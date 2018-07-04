@@ -1,3 +1,5 @@
+(define-key input-decode-map "\e\eOA" [(meta up)])
+(define-key input-decode-map "\e\eOB" [(meta down)])
 
 ;;; Code:
 ;; Hotkey rebinds
@@ -20,6 +22,8 @@
 (global-set-key (kbd "M-a") 'backward-word)
 (global-set-key (kbd "C-c v") 'erase-buffer)
 (global-set-key (kbd "C-x f") 'set-mark-command)
+(global-set-key (kbd "M-<down>") 'shrink-window)
+(global-set-key (kbd "M-<up>") 'enlarge-window)
 
 (global-set-key (kbd "M-k") 'previous-line)
 (global-set-key (kbd "M-l") 'next-line)

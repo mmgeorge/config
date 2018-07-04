@@ -1,5 +1,3 @@
-
-
 (setq package-list
       '(helm
         helm-projectile
@@ -110,43 +108,60 @@
         ;(find-system-name asd-file))))
 
 ;;slime
-(defun start-slime ()
-  (interactive)
-  (if (string-equal "lisp" (file-name-extension buffer-file-name))
-      (unless (slime-connected-p)
-        (slime)
-        (shrink-window 15)
-        (other-window 1)
-        )))
+;; (defun start-slime ()
+;;   (interactive)
+;;   (if (string-equal "lisp" (file-name-extension buffer-file-name))
+;;       (unless (slime-connected-p)
+;;         (slime)
+;;         )))
 
+
+;;(setq shackle-rules '(:align 'below :size 0.2)))
 ;;(setq *project-path(projectile-project-pa) (projectile-project-info))
 
-(if (file-exists-p "/usr/bin/sbcl" )
-    (progn
-      (require 'slime-autoloads)
-      ;; This causes new packages not to be found!!!
-      ;; Danger danger!!
-      ;; (setq slime-lisp-implementations
-      ;;       '((sbcl ("sbcl" "--core" "/home/matt/config/lisp/sbcl.core-with-swank")
-      ;;               :init (lambda (port-file _)
-      ;;                       (format "(swank:start-server %S)\n" port-file))
-      ;;               )))
 
-      (setq slime-contribs '(slime-fancy slime-asdf slime-cl-indent))
-      (setq slime-kill-without-query-p t)
-      (setq inferior-lisp-program "/usr/bin/sbcl")
-      (slime-setup '(slime-company))
-      
+(require 'slime-autoloads)
+;; This causes new packages not to be found!!!
+;; Use this and bad thing will happen to you!
+;; (setq slime-lisp-implementations
+;;       '((sbcl ("sbcl" "--core" "/home/matt/config/lisp/sbcl.core-with-swank")
+;;               :init (lambda (port-file _)
+;;                       (format "(swank:start-server %S)\n" port-file))
+;;               )))
+(setq inferior-lisp-program "/usr/bin/sbcl")
+(slime-setup '(slime-company))
+(setq slime-contribs '(slime-fancy slime-asdf slime-cl-indent))
+(setq slime-kill-without-query-p t)
+                                        ;(start-slime)
 
-      
-      (run-with-idle-timer 0 nil (lambda () (start-slime)))
-      (run-with-idle-timer 1 nil (lambda () (slime-load-system (project-system-name))))
-      
-      (global-set-key (kbd "M-z") 'slime-repl-clear-buffer)
-      (global-set-key (kbd "C-p c") 'reload-project)
-      
-      ))
+                                        ;(run-with-idle-timer 0 nil (lambda () ))
+                                        ;(run-with-idle-timer 1 nil (lambda () (slime-load-system (project-system-name))))
+(global-set-key (kbd "C-p c") 'reload-project)
 
+(defun slime-hook ()
+  (run-with-idle-timer 0.25 nil (lambda ()
+                                  (slime)
+                                  (other-window 1)
+                                 (slime-load-system (project-system-name))
+                                 ))
+
+ )
+
+(setq display-buffer-alist
+      '(("\\*inferior-lisp\\*" display-buffer-below-selected (window-height . 15)   
+
+         (nil))))
+
+
+(defun slime-repl-hook ()
+  (define-key slime-repl-mode-map (kbd "M-s") nil)
+  (define-key slime-repl-mode-map (kbd "M-z") 'slime-repl-clear-buffer))
+
+(add-hook 'slime-repl-mode-hook 'slime-repl-hook)
+;(add-hook 'slime-mode-hook 'slime-hook)
+;(add-hook 'lisp-mode-hook 'slime-hook)
+
+(add-hook 'lisp-mode-hook (lambda () (slime-hook)))
 
 ;; js2-mode
 (add-to-list 'auto-mode-alist '("\\.js\\'" . js2-mode))
