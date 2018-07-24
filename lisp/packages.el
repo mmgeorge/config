@@ -27,7 +27,6 @@
         slime-company
         ))
 
-
 (require 'package)
 (add-to-list 'package-archives '("melpa" . "http://melpa.org/packages/"))
 (package-initialize)
@@ -88,6 +87,8 @@
 ;;       (match-string 1 (buffer-string))
 ;;     )))
 
+;; Lisp Dev
+
 (defun project-system-name ()
   (interactive)
   (file-name-base (car (directory-files (projectile-project-root) t "asd"))))
@@ -98,44 +99,14 @@
   (message "hello project")
   (slime-reload-system (project-system-name)))
 
-  ;; (let ((root (locate-dominating-file
-  ;;                  (file-name-directory buffer-file-name)
-  ;;                  (lambda (parent) (directory-files parent nil "\\(*.\\).asd")))))
-  ;;   (if root
-  ;;       (message root
-  ;;        ;(car (directory-files root nil "asd"))
-  ;;        ))))
-        ;(find-system-name asd-file))))
-
-;;slime
-;; (defun start-slime ()
-;;   (interactive)
-;;   (if (string-equal "lisp" (file-name-extension buffer-file-name))
-;;       (unless (slime-connected-p)
-;;         (slime)
-;;         )))
-
-
-;;(setq shackle-rules '(:align 'below :size 0.2)))
-;;(setq *project-path(projectile-project-pa) (projectile-project-info))
-
 
 (require 'slime-autoloads)
-;; This causes new packages not to be found!!!
-;; Use this and bad thing will happen to you!
-;; (setq slime-lisp-implementations
-;;       '((sbcl ("sbcl" "--core" "/home/matt/config/lisp/sbcl.core-with-swank")
-;;               :init (lambda (port-file _)
-;;                       (format "(swank:start-server %S)\n" port-file))
-;;               )))
+
 (setq inferior-lisp-program "/usr/bin/sbcl")
-(slime-setup '(slime-company))
 (setq slime-contribs '(slime-fancy slime-asdf slime-cl-indent))
 (setq slime-kill-without-query-p t)
-                                        ;(start-slime)
+(slime-setup '(slime-company))
 
-                                        ;(run-with-idle-timer 0 nil (lambda () ))
-                                        ;(run-with-idle-timer 1 nil (lambda () (slime-load-system (project-system-name))))
 (global-set-key (kbd "C-p c") 'reload-project)
 
 (defun slime-hook ()
@@ -143,14 +114,25 @@
                                   (slime)
                                   (other-window 1)
                                  (slime-load-system (project-system-name))
-                                 ))
-
- )
+                                 )))
 
 (setq display-buffer-alist
       '(("\\*inferior-lisp\\*" display-buffer-below-selected (window-height . 15)   
 
          (nil))))
+
+
+;; (defvar *lisp-special-forms*
+;;   (regexp-opt '("defunc") 'words))
+
+;; (font-lock-add-keywords 'lisp-mode
+;;                         `((,*lisp-special-forms* . font-lock-keyword-face)))
+
+
+(add-to-list 'load-path "/home/matt/.emacs.d/clx-mode")
+;;(require 'clx-mode)
+;(setq-default lisp-mode 'clx-mode)
+;(add-to-list 'auto-mode-alist '("\\.lisp\\'" . clx-mode))
 
 
 (defun slime-repl-hook ()
