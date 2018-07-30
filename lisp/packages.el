@@ -101,6 +101,7 @@
 
 
 (require 'slime-autoloads)
+;(require 'cl)
 
 (setq inferior-lisp-program "/usr/bin/sbcl")
 (setq slime-contribs '(slime-fancy slime-asdf slime-cl-indent))
@@ -113,8 +114,8 @@
   (run-with-idle-timer 0.25 nil (lambda ()
                                   (slime)
                                   (other-window 1)
-                                 (slime-load-system (project-system-name))
-                                 )))
+                                  (slime-load-system (project-system-name))
+                                  )))
 
 (setq display-buffer-alist
       '(("\\*inferior-lisp\\*" display-buffer-below-selected (window-height . 15)   
@@ -122,17 +123,98 @@
          (nil))))
 
 
-;; (defvar *lisp-special-forms*
-;;   (regexp-opt '("defunc") 'words))
 
-;; (font-lock-add-keywords 'lisp-mode
-;;                         `((,*lisp-special-forms* . font-lock-keyword-face)))
+(defface decorator-default-face
+  '((t ( :foreground "color-230")))
+  "Face for `decorators'.")
+
+(defvar decorator-face 'decorator-default-face)
+
+(defun clx-region-for-defun-at-point ()
+  (let ((start (point)))
+  (save-excursion
+    (save-match-data
+      (end-of-defun)
+      (let ((end (point))
+            (start-defun (progn (beginning-of-defun) (point))))
+        (list (if (< start start-defun) start start-defun)
+              end))))))
 
 
-(add-to-list 'load-path "/home/matt/.emacs.d/clx-mode")
-;;(require 'clx-mode)
-;(setq-default lisp-mode 'clx-mode)
-;(add-to-list 'auto-mode-alist '("\\.lisp\\'" . clx-mode))
+(defun clx-compile-defun ()
+  (interactive)
+  (apply #'slime-compile-region (clx-region-for-defun-at-point)))
+
+
+(defconst clx-mode-syntax-table
+  (let ((table (make-syntax-table)))
+    (modify-syntax-entry ?[ "(" table)
+    (modify-syntax-entry ?] ")" table)
+    table))
+
+(setq clx-locks
+      ; Should probably refactor this...
+      '(("(\\(local-nicknames\\)" (1 font-lock-keyword-face)) ;; Don't highlight the import
+        ( "#\\[[^][]*\\]" . decorator-face ) 
+        ;; Match @dtype(([TYPE]*) [TYPE]) ;;\|\(\\(&[a-zA-Z0-9\s_-]*\\)\)
+        ( "#.*\(\s*dtype\s*\(\\([\)\(&:a-zA-Z0-9\s_-]*\\)\)\\([a-zA-Z0-9\s\(\)_-]*\\)?\).*"
+          (0 decorator-face)
+          (1 font-lock-type-face prepend)
+          (2 font-lock-type-face prepend))
+
+        ( "#.*\(\s*dtype.*\\(&[a-zA-Z0-9\s_-]*\\) \\(\(\\(:[a-zA-Z0-9_-]*\\)\\([a-zA-Z0-9\s_-]*\\)\)\\).*"
+          (1 decorator-face prepend) ;; Highlight & token
+          (2 decorator-face prepend) ;; Highlight keywords
+          (3 decorator-face prepend)
+          (4 font-lock-type-face prepend))
+
+       ;; ( "#.*\(\s*dtype.*\\(&[a-zA-Z0-9_-]*\\).*"
+       ;;   (1 font-lock-builtin-face prepend)
+       ;; )
+
+))
+        
+
+
+
+(define-derived-mode clx-mode lisp-mode "clx mode" 
+  (set-syntax-table clx-mode-syntax-table)
+  ;(substitute-key-definition 'slime-compile-defun 'clx-compile-defun clx-mode-map)
+  ;(use-local-map clx-mode-map)
+  (define-key slime-mode-indirect-map (kbd "C-c C-c") 'clx-compile-defun)
+  
+  (font-lock-add-keywords lisp-mode clx-locks))
+
+
+
+(setq-default lisp-mode 'clx-mode)
+(add-to-list 'auto-mode-alist '("\\.lisp\\'" . clx-mode))
+
+
+;; (defun clx-mode-decorator-matcher (limit)
+;;   (let (res)
+;;     (while
+;;         (and (setq res (re-search-forward "\(\\([a-zA-Z0-9\s_-]+\\)\)" limit t))
+;;              (not (eql (syntax-ppss-context (syntax-ppss)) 'comment)) ;; Continue, unless in a comment
+
+;;              ))
+;;     res))
+
+
+;; (defun clx-mode-decorator-matcher (limit)
+;;   "Match @dtype((MATCH+) [ret-type]) group 0 is the entire construct, 1 the symbol."
+;;   (let (res)
+;;     (while
+;;         (setq res (re-search-forward "\)\\([a-zA-Z0-9\s_-]+\\)\)" limit t)))
+;;     res))
+
+;; (defun clx-mode-decorator-matcher-2 (limit)
+;;   "Match @dtype(([arg-type]+) MATCH) group 0 is the entire construct, 1 the symbol."
+;;   (let (res)
+;;     (while
+;;         (and (setq res (re-search-forward "\)\\([a-zA-Z0-9\s_-]+\\)\)" limit t))
+;;              (not (nth 4 (syntax-ppss)))))
+;;     res))
 
 
 (defun slime-repl-hook ()
@@ -140,12 +222,10 @@
   (define-key slime-repl-mode-map (kbd "M-z") 'slime-repl-clear-buffer))
 
 (add-hook 'slime-repl-mode-hook 'slime-repl-hook)
-;(add-hook 'slime-mode-hook 'slime-hook)
-;(add-hook 'lisp-mode-hook 'slime-hook)
+(add-hook 'lisp-mode-hook 'slime-hook)
 
-(add-hook 'lisp-mode-hook (lambda () (slime-hook)))
 
-;; js2-mode
+;; js
 (add-to-list 'auto-mode-alist '("\\.js\\'" . js2-mode))
 (add-to-list 'interpreter-mode-alist '("node" . js2-mode))
 
