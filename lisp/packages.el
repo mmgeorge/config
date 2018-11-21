@@ -103,19 +103,21 @@
 (require 'slime-autoloads)
 ;(require 'cl)
 
-(setq inferior-lisp-program "/usr/bin/sbcl")
+(setq inferior-lisp-program "sbcl")
 (setq slime-contribs '(slime-fancy slime-asdf slime-cl-indent))
 (setq slime-kill-without-query-p t)
 (slime-setup '(slime-company))
 
-(global-set-key (kbd "C-p c") 'reload-project)
 
-(defun slime-hook ()
-  (run-with-idle-timer 0.25 nil (lambda ()
-                                  (slime)
-                                  (other-window 1)
-                                  (slime-load-system (project-system-name))
-                                  )))
+(global-set-key (kbd "C-p c") 'reload-project)
+(global-set-key (kbd "M-r") 'slime-compile-region)
+
+;;(defun slime-hook ()
+  ;;(run-with-idle-timer 0.25 nil (lambda ()
+                                  ;;(slime)
+                                  ;;(other-window 1)
+                                  ;;(slime-load-system (project-system-name))
+                                  ;;)))
 
 (setq display-buffer-alist
       '(("\\*inferior-lisp\\*" display-buffer-below-selected (window-height . 15)   
@@ -222,7 +224,7 @@
   (define-key slime-repl-mode-map (kbd "M-z") 'slime-repl-clear-buffer))
 
 (add-hook 'slime-repl-mode-hook 'slime-repl-hook)
-(add-hook 'lisp-mode-hook 'slime-hook)
+;;(add-hook 'lisp-mode-hook 'slime-hook)
 
 
 ;; js

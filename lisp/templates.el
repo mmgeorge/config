@@ -22,12 +22,18 @@
   > "/** " @ _ " */"
   )
 
+(define-skeleton mc
+  "Add material-ui import"
+  > '(setq name (skeleton-read "Class Name: "))
+  > "import "name" from '@material-ui/core/"name"';" \n
+  )
+
 
 (define-skeleton react
   "Template for owny component"
   > '(setq name (skeleton-read "Class Name: "))
   > "import { createElement as e } from 'react';" \n
-  > "import { withStyles } from 'material-ui/styles';" \n
+  > "import withStyles from '@material-ui/core/styles/withStyles';" \n
   > "import { IStyled } from 'owny/interfaces';" \n
   > \n
   > "const styles = () => ({" \n
@@ -41,6 +47,36 @@
   > \n
   > "export default withStyles(styles)(" name ");"
 );
+
+(define-skeleton container
+  "Template for owny component"
+  > '(setq name (skeleton-read "Class Name: "))
+  > "import { connect } from 'react-redux';" \n
+  > "import { IState } from '../../../reducers';" \n
+  > "import { Dispatch } from 'redux';" \n
+  > "import "name" from './"name"';" \n
+  > \n
+  > "const mapState = (_state: IState) => ({});" \n
+  > "const mapDispatch = (_dispatch: Dispatch) => ({});" \n
+  > \n
+  > "export default connect(mapState, mapDispatch)("name");"
+);
+
+(define-skeleton clpack
+  "Template for owny component"
+  > '(setq path (skeleton-read "path: "))
+  > '(setq name (skeleton-read "class name: "))
+  > "(defpackage :" path "/" name \n
+  > "(:use :cl)" \n
+  > "(:export))" \n
+  > \n
+  > "(in-package :"path "/" name")"
+  > \n
+  > \n
+  > "(defclass "name" ()" \n
+  > "())"
+);
+
 
 (provide 'emacs-templates)
 ;;; emacs-templates ends here
