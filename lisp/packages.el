@@ -1,3 +1,6 @@
+(require 'package)
+(require 'cl-lib)
+
 (setq package-list
       '(helm
         helm-projectile
@@ -27,7 +30,6 @@
         slime-company
         ))
 
-(require 'package)
 (add-to-list 'package-archives '("melpa" . "http://melpa.org/packages/"))
 (package-initialize)
 
@@ -89,15 +91,28 @@
 
 ;; Lisp Dev
 
-(defun project-system-name ()
-  (interactive)
-  (file-name-base (car (directory-files (projectile-project-root) t "asd"))))
-
 
 (defun reload-project ()
   (interactive)
   (message "hello project")
-  (slime-reload-system (project-system-name)))
+  (slime-reload-system (find-current-system)))
+
+
+(defun find-current-system ()
+  "Find the name of the current asd system."
+  (let ((system-file (find-system-file default-directory)))
+    (when system-file
+      (file-name-base system-file))))
+
+
+(defun find-system-file (directory)
+  "Find the first file in the current DIRECTORY or a parent of DIRECTORY that includes a .asd file."
+  (let ((fname (directory-file-name directory)))
+    (or
+     (cl-find-if #'(lambda (file) (string-equal "asd" (file-name-extension file))) (directory-files directory))
+     (and (file-name-directory fname) 
+          (find-system-file (file-name-directory fname))))))
+
 
 
 (require 'slime-autoloads)
