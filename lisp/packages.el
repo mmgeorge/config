@@ -1,3 +1,7 @@
+;;(add-to-list 'load-path "~/.emacs.d/lisp/slime")
+(add-to-list 'load-path "~/.emacs.d/lisp/sly")
+;;(add-to-list 'load-path "~/.emacs.d/lisp/sly-asdf")
+
 (require 'package)
 (require 'cl-lib)
 
@@ -26,8 +30,8 @@
 
         
         ;; lisp
-        slime
-        slime-company
+        ;; slime
+        ;; slime-company
         ))
 
 (add-to-list 'package-archives '("melpa" . "http://melpa.org/packages/"))
@@ -43,6 +47,9 @@
   (unless (package-installed-p package)
     (package-install package)))
 
+
+;;(setq show-paren-delay 0)
+(show-paren-mode 1)
 
 
 ;; flycheck
@@ -78,24 +85,27 @@
             (local-set-key (kbd "C-l l") 'markdown-insert-link) 
             (local-set-key (kbd "C-l p") 'markdown-live-preview-mode)))
 
+;;;; ELisp
 
-;;(locate-dominating-file (cua--M/o) )
+(defun elisp-bindings ()
+  (define-key emacs-lisp-mode-map (kbd "M-.") 'xref-find-definitions)
+  (define-key emacs-lisp-mode-map (kbd "M-,") 'xref-pop-marker-stack))
 
-;; (defun find-system-name (asd-file)
-;;   (with-temp-buffer
-;;     (insert-file-contents (concat asd-file "system.asd"))
-;;     (when (string-match "asdf:defsystem :\\(.*\\)" (buffer-string))
-;;       (message (match-string 1 (buffer-string)))
-;;       (match-string 1 (buffer-string))
-;;     )))
-
-;; Lisp Dev
+(add-hook 'emacs-lisp-mode-hook 'elisp-bindings)
 
 
-(defun reload-project ()
-  (interactive)
-  (message "hello project")
-  (slime-reload-system (find-current-system)))
+;;;; Common Lisp
+
+;; When using local copy of sly
+(require 'sly-autoloads)
+(setq sly-contribs '(sly-fancy sly-asdf))
+;; End local sly
+
+
+(setq inferior-lisp-program "sbcl")
+
+(add-hook 'sly-mrepl-mode-hook 'sly-repl-bindings)
+(add-hook 'sly-mode-hook 'sly-bindings)
 
 
 (defun find-current-system ()
@@ -109,23 +119,58 @@
   "Find the first file in the current DIRECTORY or a parent of DIRECTORY that includes a .asd file."
   (let ((fname (directory-file-name directory)))
     (or
-     (cl-find-if #'(lambda (file) (string-equal "asd" (file-name-extension file))) (directory-files directory))
+     (cl-find-if #'(lambda (file) (string-equal "asd" (file-name-extension file)))
+                 (directory-files directory))
      (and (file-name-directory fname) 
           (find-system-file (file-name-directory fname))))))
 
 
-
-(require 'slime-autoloads)
-;(require 'cl)
-
-(setq inferior-lisp-program "sbcl")
-(setq slime-contribs '(slime-fancy slime-asdf slime-cl-indent))
-(setq slime-kill-without-query-p t)
-(slime-setup '(slime-company))
+(defun sly-reload-project ()
+  (interactive)
+  ;(sly-mrepl--eval-for-repl `(asdf:load-system ,(find-current-system))))
+  (sly-asdf-load-system (find-current-system)))
 
 
-(global-set-key (kbd "C-p c") 'reload-project)
-(global-set-key (kbd "M-r") 'slime-compile-region)
+(defun sly-repl-bindings ()
+  (define-key sly-mrepl-mode-map (kbd "C-p c") 'sly-reload-project)
+  (define-key sly-mrepl-mode-map (kbd "C-c l") 'sly-mrepl-sync)
+  (define-key sly-mrepl-mode-map (kbd "M-z") 'sly-mrepl-clear-repl))
+
+
+(defun sly-bindings ()
+  (define-key sly-mode-map (kbd "C-p c") 'sly-reload-project)
+  (define-key sly-mode-map (kbd "C-c l") 'sly-mrepl-sync)
+  (define-key sly-mode-map (kbd "M-z") 'sly-mrepl-clear-repl))
+
+
+;; (defun slime-reload-project ()
+;;   (interactive)
+;;   (message "hello project")
+;;   (slime-reload-system (find-current-system)))
+
+;; (defun slime-bindings ()
+;;   (define-key slime-repl-mode-map (kbd "C-p c") 'slime-reload-project))
+
+;; ;; (add-hook 'slime-repl-mode-hook 'slime-bindings)
+
+
+;; (require 'slime-autoloads)
+;; (setq slime-contribs '(slime-fancy slime-asdf slime-cl-indent))
+;; ;;(setq slime-kill-without-query-p t)
+
+;; (defun slime-repl-hook ()
+;;   (define-key sly-mode-map (kbd "C-p c") 'slime-reload-project)
+;;   (define-key slime-repl-mode-map (kbd "M-s") nil)
+;;   (define-key slime-repl-mode-map (kbd "M-z") 'slime-repl-clear-buffer))
+
+;; (add-hook 'slime-repl-mode-hook 'slime-repl-hook)
+;;(add-hook 'lisp-mode-hook 'slime-hook)
+
+ ;(slime-setup '(slime-company))
+
+
+;;(global-set-key (kbd "C-p c") 'reload-project)
+; (global-set-key (kbd "M-r") 'slime-compile-region)
 
 ;;(defun slime-hook ()
   ;;(run-with-idle-timer 0.25 nil (lambda ()
@@ -193,7 +238,6 @@
         
 
 
-
 (define-derived-mode clx-mode lisp-mode "clx mode" 
   (set-syntax-table clx-mode-syntax-table)
   ;(substitute-key-definition 'slime-compile-defun 'clx-compile-defun clx-mode-map)
@@ -202,10 +246,8 @@
   
   (font-lock-add-keywords lisp-mode clx-locks))
 
-
-
-(setq-default lisp-mode 'clx-mode)
-(add-to-list 'auto-mode-alist '("\\.lisp\\'" . clx-mode))
+;;(setq-default lisp-mode 'clx-mode)
+;(add-to-list 'auto-mode-alist '("\\.lisp\\'" . clx-mode))
 
 
 ;; (defun clx-mode-decorator-matcher (limit)
@@ -233,13 +275,6 @@
 ;;              (not (nth 4 (syntax-ppss)))))
 ;;     res))
 
-
-(defun slime-repl-hook ()
-  (define-key slime-repl-mode-map (kbd "M-s") nil)
-  (define-key slime-repl-mode-map (kbd "M-z") 'slime-repl-clear-buffer))
-
-(add-hook 'slime-repl-mode-hook 'slime-repl-hook)
-;;(add-hook 'lisp-mode-hook 'slime-hook)
 
 
 ;; js
