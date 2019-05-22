@@ -1,18 +1,19 @@
 ;;(add-to-list 'load-path "~/.emacs.d/lisp/slime")
 (add-to-list 'load-path "~/.emacs.d/lisp/sly")
-;;(add-to-list 'load-path "~/.emacs.d/lisp/sly-asdf")
+(add-to-list 'load-path "~/.emacs.d/lisp/sly-asdf")
 
 (require 'package)
 (require 'cl-lib)
 
 (setq package-list
-      '(helm
+      '(use-package
+         lsp-mode
+        helm
         helm-projectile
         flycheck
         company
         autopair
         markdown-mode
-
         ;; javascript
         ;;js2-mode
         ;;company-tern ;; requires tern installed (npm install -g tern)
@@ -28,7 +29,7 @@
         tide
         typescript-mode
 
-        
+        ;; sly
         ;; lisp
         ;; slime
         ;; slime-company
@@ -98,7 +99,9 @@
 
 ;; When using local copy of sly
 (require 'sly-autoloads)
-(setq sly-contribs '(sly-fancy sly-asdf))
+(require 'sly-asdf)
+
+(add-to-list 'sly-contribs 'sly-asdf 'append)
 ;; End local sly
 
 
@@ -127,7 +130,7 @@
 
 (defun sly-reload-project ()
   (interactive)
-  ;(sly-mrepl--eval-for-repl `(asdf:load-system ,(find-current-system))))
+                                        ;(sly-mrepl--eval-for-repl `(asdf:load-system ,(find-current-system))))
   (sly-asdf-load-system (find-current-system)))
 
 
@@ -166,18 +169,18 @@
 ;; (add-hook 'slime-repl-mode-hook 'slime-repl-hook)
 ;;(add-hook 'lisp-mode-hook 'slime-hook)
 
- ;(slime-setup '(slime-company))
+                                        ;(slime-setup '(slime-company))
 
 
 ;;(global-set-key (kbd "C-p c") 'reload-project)
-; (global-set-key (kbd "M-r") 'slime-compile-region)
+                                        ; (global-set-key (kbd "M-r") 'slime-compile-region)
 
 ;;(defun slime-hook ()
-  ;;(run-with-idle-timer 0.25 nil (lambda ()
-                                  ;;(slime)
-                                  ;;(other-window 1)
-                                  ;;(slime-load-system (project-system-name))
-                                  ;;)))
+;;(run-with-idle-timer 0.25 nil (lambda ()
+;;(slime)
+;;(other-window 1)
+;;(slime-load-system (project-system-name))
+;;)))
 
 (setq display-buffer-alist
       '(("\\*inferior-lisp\\*" display-buffer-below-selected (window-height . 15)   
@@ -194,13 +197,13 @@
 
 (defun clx-region-for-defun-at-point ()
   (let ((start (point)))
-  (save-excursion
-    (save-match-data
-      (end-of-defun)
-      (let ((end (point))
-            (start-defun (progn (beginning-of-defun) (point))))
-        (list (if (< start start-defun) start start-defun)
-              end))))))
+    (save-excursion
+      (save-match-data
+        (end-of-defun)
+        (let ((end (point))
+              (start-defun (progn (beginning-of-defun) (point))))
+          (list (if (< start start-defun) start start-defun)
+                end))))))
 
 
 (defun clx-compile-defun ()
@@ -211,11 +214,11 @@
 (defconst clx-mode-syntax-table
   (let ((table (make-syntax-table)))
     (modify-syntax-entry ?[ "(" table)
-    (modify-syntax-entry ?] ")" table)
+                         (modify-syntax-entry ?] ")" table)
     table))
 
 (setq clx-locks
-      ; Should probably refactor this...
+                                        ; Should probably refactor this...
       '(("(\\(local-nicknames\\)" (1 font-lock-keyword-face)) ;; Don't highlight the import
         ( "#\\[[^][]*\\]" . decorator-face ) 
         ;; Match @dtype(([TYPE]*) [TYPE]) ;;\|\(\\(&[a-zA-Z0-9\s_-]*\\)\)
@@ -230,24 +233,24 @@
           (3 decorator-face prepend)
           (4 font-lock-type-face prepend))
 
-       ;; ( "#.*\(\s*dtype.*\\(&[a-zA-Z0-9_-]*\\).*"
-       ;;   (1 font-lock-builtin-face prepend)
-       ;; )
+        ;; ( "#.*\(\s*dtype.*\\(&[a-zA-Z0-9_-]*\\).*"
+        ;;   (1 font-lock-builtin-face prepend)
+        ;; )
 
-))
-        
+        ))
+
 
 
 (define-derived-mode clx-mode lisp-mode "clx mode" 
   (set-syntax-table clx-mode-syntax-table)
-  ;(substitute-key-definition 'slime-compile-defun 'clx-compile-defun clx-mode-map)
-  ;(use-local-map clx-mode-map)
+                                        ;(substitute-key-definition 'slime-compile-defun 'clx-compile-defun clx-mode-map)
+                                        ;(use-local-map clx-mode-map)
   (define-key slime-mode-indirect-map (kbd "C-c C-c") 'clx-compile-defun)
   
   (font-lock-add-keywords lisp-mode clx-locks))
 
 ;;(setq-default lisp-mode 'clx-mode)
-;(add-to-list 'auto-mode-alist '("\\.lisp\\'" . clx-mode))
+                                        ;(add-to-list 'auto-mode-alist '("\\.lisp\\'" . clx-mode))
 
 
 ;; (defun clx-mode-decorator-matcher (limit)
@@ -277,6 +280,22 @@
 
 
 
+;; elpy
+(setq use-package-always-ensure t)
+
+(use-package lsp-mode
+  :hook (python-mode . lsp)
+  :commands lsp)
+
+(use-package lsp-ui :commands lsp-ui-mode)
+(use-package company-lsp :commands company-lsp)
+(use-package helm-lsp :commands helm-lsp-workspace-symbol)
+(use-package lsp-treemacs :commands lsp-treemacs-errors-list)
+
+(require 'lsp-mode)
+(add-hook 'python-mode-hook #'lsp)
+
+ 
 ;; js
 (add-to-list 'auto-mode-alist '("\\.js\\'" . js2-mode))
 (add-to-list 'interpreter-mode-alist '("node" . js2-mode))
