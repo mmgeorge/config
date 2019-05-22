@@ -281,33 +281,40 @@
 
 
 ;; elpy
+(setq use-package-always-demand t)
 (setq use-package-always-ensure t)
+(setq lsp-enable-snippet nil)
 
 (use-package lsp-mode
+  :ensure t
   :hook (python-mode . lsp)
   :commands lsp)
 
-(use-package lsp-ui :commands lsp-ui-mode)
+(use-package lsp-ui
+  ;:bind (("M-." . lsp-ui-peek-find-references)
+                                        ;("M-," . lsp-ui-peek-find-definitions))
+  :commands lsp-ui-mode
+  )
 (use-package company-lsp :commands company-lsp)
 (use-package helm-lsp :commands helm-lsp-workspace-symbol)
 (use-package lsp-treemacs :commands lsp-treemacs-errors-list)
 
-(require 'lsp-mode)
-(add-hook 'python-mode-hook #'lsp)
+(define-key lsp-ui-mode-map [remap xref-find-definitions] #'lsp-ui-peek-find-definitions)
+(define-key lsp-ui-mode-map [remap xref-find-references] #'lsp-ui-peek-find-references)
 
- 
+
 ;; js
 (add-to-list 'auto-mode-alist '("\\.js\\'" . js2-mode))
 (add-to-list 'interpreter-mode-alist '("node" . js2-mode))
 
 
 ;; Enable helm-gtags-mode
-(add-hook 'c-mode-hook 'helm-gtags-mode)
-(add-hook 'c++-mode-hook 'helm-gtags-mode)
-(add-hook 'asm-mode-hook 'helm-gtags-mode)
+;(add-hook 'c-mode-hook 'helm-gtags-mode)
+;(add-hook 'c++-mode-hook 'helm-gtags-mode)
+;(add-hook 'asm-mode-hook 'helm-gtags-mode)
 
-(global-set-key (kbd "M-.") 'helm-gtags-dwim)
-(global-set-key (kbd "M-,") 'helm-gtags-find-tag)
+;(global-set-key (kbd "M-.") 'helm-gtags-dwim)
+;(global-set-key (kbd "M-,") 'helm-gtags-find-tag)
 
 ;; C/C++
 ;; HideShow
