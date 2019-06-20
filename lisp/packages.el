@@ -24,6 +24,7 @@
         tide
         typescript-mode
 
+        flx-ido
         
         ;; lisp
         slime
@@ -64,7 +65,9 @@
 (projectile-mode)
 (require 'helm-projectile)
 (helm-projectile-on)
+(setq projectile-enable-caching t)
 
+(flx-ido-mode 1)
 
 (global-unset-key (kbd "C-p"))
 
@@ -77,6 +80,9 @@
           (lambda ()
             (local-set-key (kbd "C-l l") 'markdown-insert-link) 
             (local-set-key (kbd "C-l p") 'markdown-live-preview-mode)))
+
+
+
 
 
 ;;(locate-dominating-file (cua--M/o) )
@@ -203,6 +209,7 @@
   (font-lock-add-keywords lisp-mode clx-locks))
 
 
+(add-to-list 'auto-mode-alist '("\\.html\\'" . we-mode))
 
 (setq-default lisp-mode 'clx-mode)
 (add-to-list 'auto-mode-alist '("\\.lisp\\'" . clx-mode))
@@ -297,8 +304,15 @@
 (require 'web-mode)
 (defun my-web-mode-hook ()
   "Hooks for Web mode."
-  (setq web-mode-markup-indent-offset 2))
+  (setq web-mode-markup-indent-offset 2)
+  (setq web-mode-js-indent-offset 2)
+  (setq web-mode-code-indent-offset 2)
+  (define-key web-mode-map (kbd "M-;") nil)
+  (define-key web-mode-map (kbd "M-:") nil))
 (add-hook 'web-mode-hook  'my-web-mode-hook)
+
+
+(add-to-list 'auto-mode-alist '("\\.html\\'" . web-mode))
 
 ;; js2-mode
 (require 'js2-mode)
@@ -307,6 +321,22 @@
 (setq js-indent-level 2)
 
 ;; typescript
+(defun tslint-fix ()
+  "Apply linter."
+  (interactive)
+  (shell-command (concat "tslint --fix " (buffer-file-name)))
+  (revert-buffer t t))
+
+
+(defun tslint-fix-hook ()
+  "Tslint fix hook."
+  (when (and (eq major-mode 'typescript-mode)
+             (executable-find "tslint"))
+    (tslint-fix)))
+
+
+
+
 (defun setup-tide-mode ()
   (interactive)
   (tide-setup)
@@ -314,7 +344,11 @@
   (setq flycheck-check-syntax-automatically '(save mode-enabled))
   (eldoc-mode +1)
   (tide-hl-identifier-mode +1)
-  (company-mode +1))
+  (company-mode +1)
+  (local-set-key (kbd "C-c l") 'tslint-fix) 
+  ;(add-hook 'after-save-hook 'tslint-fix-hook)
+
+  )
 
 (setq tide-format-options
       '(:insertSpaceAfterFunctionKeywordForAnonymousFunctions

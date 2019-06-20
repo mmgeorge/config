@@ -11,8 +11,22 @@
 (global-set-key (kbd "M-e") 'move-end-of-line)
 (global-set-key (kbd "C-f") 'kill-whole-line)
 (global-set-key (kbd "M-f") 'kill-word)
+
+;;(global-set-key (kbd "M-l") 'View-scroll-half-page-forward) 
+;;(global-set-key (kbd "M-k") 'View-scroll-half-page-backward)   
+
 (global-set-key (kbd "M-o") 'View-scroll-half-page-forward) 
 (global-set-key (kbd "M-i") 'View-scroll-half-page-backward)   
+(global-set-key (kbd "M-k") 'previous-line)
+(global-set-key (kbd "M-l") 'next-line)
+
+(global-set-key (kbd "C-;") 'forward-word)
+(global-set-key (kbd "C-:") 'forward-word)
+(global-set-key (kbd "C-j") 'backward-word)
+(global-set-key (kbd "C-k") 'View-scroll-half-page-backward)
+(global-set-key (kbd "C-l") 'View-scroll-half-page-forward)
+
+
 ;;(global-set-key (kbd "M-4") 'delete-other-windows)
 (global-set-key (kbd "M-3") 'kill-buffer)
 (global-set-key (kbd "M-w") 'previous-line)
@@ -25,8 +39,6 @@
 (global-set-key (kbd "M-<down>") 'shrink-window)
 (global-set-key (kbd "M-<up>") 'enlarge-window)
 
-(global-set-key (kbd "M-k") 'previous-line)
-(global-set-key (kbd "M-l") 'next-line)
 (global-set-key (kbd "M-;") 'forward-char)
 (global-set-key (kbd "M-:") 'forward-char)
 (global-set-key (kbd "M-j") 'backward-char)
