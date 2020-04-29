@@ -61,6 +61,8 @@
 (global-set-key (kbd "M-x") 'helm-M-x)
 (global-set-key (kbd "M-2") 'helm-buffers-list)
 
+(global-set-key (kbd "C-a") 'helm-select-action)
+
 
 (projectile-mode)
 (require 'helm-projectile)
@@ -131,7 +133,7 @@
 
 
 (global-set-key (kbd "C-p c") 'reload-project)
-(global-set-key (kbd "M-r") 'slime-compile-region)
+;(global-set-key (kbd "M-r") 'slime-compile-region)
 
 ;;(defun slime-hook ()
   ;;(run-with-idle-timer 0.25 nil (lambda ()
@@ -339,13 +341,15 @@
 
 (defun setup-tide-mode ()
   (interactive)
+  (setq tide-completion-detailed t)
+  (setq tide-always-show-documentation t)
   (tide-setup)
   (flycheck-mode +1)
   (setq flycheck-check-syntax-automatically '(save mode-enabled))
   (eldoc-mode +1)
   (tide-hl-identifier-mode +1)
   (company-mode +1)
-  (local-set-key (kbd "C-c l") 'tslint-fix) 
+  (local-set-key (kbd "C-c l") 'tslint-fix)
   ;(add-hook 'after-save-hook 'tslint-fix-hook)
 
   )

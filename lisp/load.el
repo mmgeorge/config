@@ -5,10 +5,11 @@
         '("visual.el"
           "remove-unwanted-buffers.el"
           "half-page-scroll.el"
-          "commands.el"
           "default.el"
           "templates.el"
-          "packages.el"))
+          "packages.el"
+          "commands.el"
+          ))
   (dolist (file loads)
     (load-file (concat path file))))
 
