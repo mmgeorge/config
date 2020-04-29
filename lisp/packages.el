@@ -38,6 +38,8 @@
 (add-to-list 'package-archives '("melpa" . "http://melpa.org/packages/"))
 (package-initialize)
 
+(setq load-prefer-newer t)
+
 ;; Fetch list of available packages
 (unless package-archive-contents
   (package-refresh-contents))
@@ -53,11 +55,21 @@
 (show-paren-mode 1)
 
 
+;; flymake
+
+;; (use-package flymake-diagnostic-at-point
+;;   :after flymake
+;;   :config
+;;     (add-hook 'flymake-mode-hook #'flymake-diagnostic-at-point-mode))
+
+(setq confirm-kill-processes nil)
+
+
 ;; flycheck
+
 (global-flycheck-mode)
 (add-hook 'after-init-hook 'global-company-mode)
 (global-set-key (kbd "C-e") 'company-complete)
-
 
 (require 'helm-config)
 (helm-mode 1)
@@ -102,6 +114,9 @@
 (require 'sly-asdf)
 
 (add-to-list 'sly-contribs 'sly-asdf 'append)
+
+(setq sly-asdf-enable-experimental-syntax-checking t)
+
 ;; End local sly
 
 
