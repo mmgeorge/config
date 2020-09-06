@@ -46,7 +46,40 @@
   > "e('div', { className: props.classes.root })" \n
   > \n
   > "export default withStyles(styles)(" name ");"
-);
+  );
+
+;;(skeleton-read "Class Name: ")
+(define-skeleton fc
+  "Template for a react functional component"
+  > '(setq name (file-name-base (buffer-file-name)))
+  > '(setq styles-path (s-join "-" (append (s-split-words name) (list "styles"))))
+  > "import * as React from 'react';" \n
+  > "import { use"(s-upper-camel-case styles-path)" } from './"styles-path"';" \n
+  > "import { useTheme } from 'components/styles';" \n
+  > \n
+  > "interface I"(s-upper-camel-case name)"Props {}" \n
+  > \n
+  > "export const " (s-upper-camel-case name)": React.FunctionComponent<I"(s-upper-camel-case name)"Props> = props => {" \n
+  > "const theme = useTheme();"\n
+  > "const classes = use"(s-upper-camel-case styles-path)"(theme);"\n
+  > "" \n
+  > "return (" \n
+  > "<div className={classes."(s-lower-camel-case name)"}>" \n
+  > "</div>" \n
+  > ")" \n
+  > "}"
+  );
+
+(define-skeleton fcs
+  "Template for a react functional component"
+  > '(setq name (file-name-base (buffer-file-name)))
+  > '(setq styles-path (s-join "-" (append (s-split-words name) (list "styles"))))
+  > "import { makeStyles } from 'components/styles';" \n
+  > \n
+  > "export const use"(s-upper-camel-case name) " = makeStyles(_theme => ({}))"
+  )
+
+
 
 (define-skeleton container
   "Template for owny component"

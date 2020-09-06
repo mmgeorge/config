@@ -1,5 +1,6 @@
 ;;(add-to-list 'load-path "~/.emacs.d/lisp/slime")
 (add-to-list 'load-path "~/.emacs.d/lisp/sly")
+(add-to-list 'load-path "~/.emacs.d/lisp/sly-stepper")
 (add-to-list 'load-path "~/.emacs.d/lisp/sly-asdf")
 
 (require 'package)
@@ -29,16 +30,21 @@
         tide
         typescript-mode
 
+        s
+
         ;; sly
         ;; lisp
         ;; slime
         ;; slime-company
+        ;;paredit
         ))
 
 (add-to-list 'package-archives '("melpa" . "http://melpa.org/packages/"))
 (package-initialize)
 
 (setq load-prefer-newer t)
+;;(electric-pair-mode)
+
 
 ;; Fetch list of available packages
 (unless package-archive-contents
@@ -109,22 +115,21 @@
 
 ;;;; Common Lisp
 
-;; When using local copy of sly
+;;;;;; SLY ;;;;;;;;
+
+;; START LOCAL SLY
 (require 'sly-autoloads)
 (require 'sly-asdf)
-
+(require 'sly-stepper-autoloads)
 (add-to-list 'sly-contribs 'sly-asdf 'append)
+;; END LOCAL SLY
 
-(setq sly-asdf-enable-experimental-syntax-checking t)
-
-;; End local sly
-
+;; (setq sly-asdf-enable-experimental-syntax-checking t)
 
 (setq inferior-lisp-program "sbcl")
 
 (add-hook 'sly-mrepl-mode-hook 'sly-repl-bindings)
 (add-hook 'sly-mode-hook 'sly-bindings)
-
 
 (defun find-current-system ()
   "Find the name of the current asd system."
@@ -145,7 +150,7 @@
 
 (defun sly-reload-project ()
   (interactive)
-                                        ;(sly-mrepl--eval-for-repl `(asdf:load-system ,(find-current-system))))
+  ;;(sly-mrepl--eval-for-repl `(asdf:load-system ,(find-current-system))))
   (sly-asdf-load-system (find-current-system)))
 
 
@@ -161,6 +166,8 @@
   (define-key sly-mode-map (kbd "M-z") 'sly-mrepl-clear-repl))
 
 
+;;;;;; SLIME ;;;;;;;;
+
 ;; (defun slime-reload-project ()
 ;;   (interactive)
 ;;   (message "hello project")
@@ -174,21 +181,22 @@
 
 ;; (require 'slime-autoloads)
 ;; (setq slime-contribs '(slime-fancy slime-asdf slime-cl-indent))
-;; ;;(setq slime-kill-without-query-p t)
+;; (setq slime-contribs '(slime-fancy ;;slime-asdf slime-cl-indent
+                                   
+;;(setq slime-kill-without-query-p t)
 
 ;; (defun slime-repl-hook ()
-;;   (define-key sly-mode-map (kbd "C-p c") 'slime-reload-project)
 ;;   (define-key slime-repl-mode-map (kbd "M-s") nil)
 ;;   (define-key slime-repl-mode-map (kbd "M-z") 'slime-repl-clear-buffer))
 
 ;; (add-hook 'slime-repl-mode-hook 'slime-repl-hook)
 ;;(add-hook 'lisp-mode-hook 'slime-hook)
 
-                                        ;(slime-setup '(slime-company))
+;;(slime-setup '(slime-company))
 
 
 ;;(global-set-key (kbd "C-p c") 'reload-project)
-                                        ; (global-set-key (kbd "M-r") 'slime-compile-region)
+;; (global-set-key (kbd "M-r") 'slime-compile-region)
 
 ;;(defun slime-hook ()
 ;;(run-with-idle-timer 0.25 nil (lambda ()
@@ -197,9 +205,9 @@
 ;;(slime-load-system (project-system-name))
 ;;)))
 
+
 (setq display-buffer-alist
       '(("\\*inferior-lisp\\*" display-buffer-below-selected (window-height . 15)   
-
          (nil))))
 
 
@@ -373,7 +381,12 @@
 (require 'web-mode)
 (defun my-web-mode-hook ()
   "Hooks for Web mode."
-  (setq web-mode-markup-indent-offset 2))
+  (setq web-mode-markup-indent-offset 2)
+  (setq web-mode-css-indent-offset 2)
+  (setq web-mode-code-indent-offset 2)
+  (setq create-lockfiles nil) ;; for typescript/webpack errors
+  )
+
 (add-hook 'web-mode-hook  'my-web-mode-hook)
 
 ;; js2-mode
@@ -390,7 +403,18 @@
   (setq flycheck-check-syntax-automatically '(save mode-enabled))
   (eldoc-mode +1)
   (tide-hl-identifier-mode +1)
-  (company-mode +1))
+  (company-mode +1)
+  (local-set-key (kbd "M-;") 'forward-char)
+  (local-set-key (kbd "C-c l") 'eslint-fix))
+
+
+(defun eslint-fix ()
+  "Apply linter."
+  (interactive)
+  ;;(shell-command (concat "eslint --fix " (buffer-file-name)))
+  (shell-command (concat "npx prettier --write " (buffer-file-name)))
+  (revert-buffer t t))
+
 
 (setq tide-format-options
       '(:insertSpaceAfterFunctionKeywordForAnonymousFunctions
@@ -406,8 +430,20 @@
 ;;(add-hook 'before-save-hook 'tide-format-before-save)
 (setq typescript-indent-level 2)
 
-(add-to-list 'auto-mode-alist '("\\.tsx\\'" . typescript-mode))
+;;(add-to-list 'auto-mode-alist '("\\.tsx\\'" . typescript-mode))
 (add-hook 'typescript-mode-hook #'setup-tide-mode)
+
+(require 'web-mode)
+
+(add-to-list 'auto-mode-alist '("\\.tsx\\'" . web-mode))
+
+(add-hook 'web-mode-hook
+          (lambda ()
+            (when (string-equal "tsx" (file-name-extension buffer-file-name))
+              (setup-tide-mode))))
+;; enable typescript-tslint checker
+
+(flycheck-add-mode 'typescript-tslint 'web-mode)
 
 
 ;;;; GLSL
