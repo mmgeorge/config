@@ -14,6 +14,21 @@ alias ec='emacsclient -nw '
 alias kec='pkill emacs'
 alias create='$HOME/config/scripts/create-repo.sh'
 
+alias wg='watch -n 1 gcloud'
+alias wk='watch -n 1 kubectl'
+alias k=kubectl
+alias mk=kubectl
+alias g=gcloud
+
+source <(kubectl completion bash) # enable autocompletion
+complete -F __start_kubectl k # enable autocomplete for alias
+complete -F __start_gcloud g # enable autocomplete for alias
+complete -F __start_kubectl mk # enable autocomplete for alias
+complete -F __start_kubectl wk # enable autocomplete for alias
+complete -F __start_gcloud wg # enable autocomplete for alias
+
+export PATH=$PATH:$HOME/.cargo/bin
+
 # color directories
 LS_COLORS=$LS_COLORS:'di=1;37:' ; export LS_COLORS
 
