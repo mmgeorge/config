@@ -1,7 +1,7 @@
 ;;(add-to-list 'load-path "~/.emacs.d/lisp/slime")
-(add-to-list 'load-path "~/.emacs.d/lisp/sly")
-(add-to-list 'load-path "~/.emacs.d/lisp/sly-stepper")
-(add-to-list 'load-path "~/.emacs.d/lisp/sly-asdf")
+;;(add-to-list 'load-path "~/.emacs.d/lisp/sly")
+;;(add-to-list 'load-path "~/.emacs.d/lisp/sly-stepper")
+;;(add-to-list 'load-path "~/.emacs.d/lisp/sly-asdf")
 
 (require 'package)
 (require 'cl-lib)
@@ -118,10 +118,10 @@
 ;;;;;; SLY ;;;;;;;;
 
 ;; START LOCAL SLY
-(require 'sly-autoloads)
-(require 'sly-asdf)
-(require 'sly-stepper-autoloads)
-(add-to-list 'sly-contribs 'sly-asdf 'append)
+;;(require 'sly-autoloads)
+;;(require 'sly-asdf)
+;;(require 'sly-stepper-autoloads)
+;;(add-to-list 'sly-contribs 'sly-asdf 'append)
 ;; END LOCAL SLY
 
 ;; (setq sly-asdf-enable-experimental-syntax-checking t)
@@ -455,6 +455,27 @@
   ((error line-start "ERROR: " column ":" line ": " (message) line-end))
   :modes glsl-mode)
 (add-to-list 'flycheck-checkers 'glsl-lang-validator)
+
+
+;;;; Rust
+
+;;(use-package lsp-mode
+  ;;:commands lsp
+  ;;:config (require 'lsp-clients))
+
+;;(use-package lsp-ui)
+
+(use-package rust-mode
+  :hook (rust-mode . lsp))
+
+;; (setq racer-cmd "~/.cargo/bin/racer") ;; Rustup binaries PATH
+;; ;;x(setq racer-rust-src-path "~/rust/src") ;; Rust source code PATH
+
+;; (add-hook 'rust-mode-hook #'racer-mode)
+;; (add-hook 'racer-mode-hook #'eldoc-mode)
+;; (add-hook 'racer-mode-hook #'company-mode)
+;; (add-hook 'flycheck-mode-hook #'flycheck-rust-setup)
+
 
 
 ;; autopair
