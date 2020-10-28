@@ -6,44 +6,65 @@
 (require 'package)
 (require 'cl-lib)
 
+(add-to-list 'package-archives
+             '("melpa" . "http://melpa.org/packages/")
+             '("gnu" . "http://elpa.gnu.org/packages/"))
+
+
 (setq package-list
       '(use-package
          lsp-mode
-        helm
-        helm-projectile
-        flycheck
-        company
-        autopair
-        markdown-mode
-        ;; javascript
-        ;;js2-mode
-        ;;company-tern ;; requires tern installed (npm install -g tern)
-        ;; npm install -g eslint babel-eslint eslint-plugin-react
+         helm
+         helm-projectile
+         flycheck
+         company
+         autopair
+         markdown-mode
+         ;; javascript
+         ;;js2-mode
+         ;;company-tern ;; requires tern installed (npm install -g tern)
+         ;; npm install -g eslint babel-eslint eslint-plugin-react
 
-        ;;tern
-        ;;js2-refactor
-        ;;rjsx-mode
-        web-mode
-        js2-mode
-        
-        ;; typescript
-        tide
-        typescript-mode
+         ;;tern
+         ;;js2-refactor
+         ;;rjsx-mode
+         web-mode
+         js2-mode
+         
+         ;; typescript
+         tide
+         typescript-mode
 
-        s
+         s
 
-        ;; sly
-        ;; lisp
-        ;; slime
-        ;; slime-company
-        ;;paredit
-        ))
+         ;; rust
+         ;;rustic
+         ;;racer
 
-(add-to-list 'package-archives '("melpa" . "http://melpa.org/packages/"))
+         ;; sly
+         ;; lisp
+         ;; slime
+         ;; slime-company
+         ;;paredit
+         ))
+
 (package-initialize)
 
+
+(setq compilation-scroll-output t)
+(setq compilation-scroll-output 'first-error)
+;;(setq compilation-skip-threshold 2)
+
+;; Performance
+
+;; Increase gc threshold to 500 MB
+(setq gc-cons-threshold 500000000)
+
+;; Increase emacs process data read (for lsp)
+(setq read-process-output-max (* 2048 2048)) ;; 4mb
+
+
 (setq load-prefer-newer t)
-;;(electric-pair-mode)
 
 
 ;; Fetch list of available packages
@@ -58,6 +79,9 @@
 
 
 ;;(setq show-paren-delay 0)
+
+(auto-revert-mode 1)
+
 (show-paren-mode 1)
 
 
@@ -182,7 +206,7 @@
 ;; (require 'slime-autoloads)
 ;; (setq slime-contribs '(slime-fancy slime-asdf slime-cl-indent))
 ;; (setq slime-contribs '(slime-fancy ;;slime-asdf slime-cl-indent
-                                   
+
 ;;(setq slime-kill-without-query-p t)
 
 ;; (defun slime-repl-hook ()
@@ -306,24 +330,65 @@
 ;; elpy
 (setq use-package-always-demand t)
 (setq use-package-always-ensure t)
-(setq lsp-enable-snippet nil)
 
 (use-package lsp-mode
   :ensure t
+  :custom
+  (lsp-log-io t)
+  (lsp-keep-workspace-alive nil)
+  (lsp-enable-snippet nil)
+  (lsp--auto-configure t )
   :hook (python-mode . lsp)
   :commands lsp)
 
 (use-package lsp-ui
-  ;:bind (("M-." . lsp-ui-peek-find-references)
-                                        ;("M-," . lsp-ui-peek-find-definitions))
+  ;;:bind (("M-." . lsp-ui-peek-find-references)
+  ;;("M-," . lsp-ui-peek-find-definitions))
   :commands lsp-ui-mode
   )
-(use-package company-lsp :commands company-lsp)
+
 (use-package helm-lsp :commands helm-lsp-workspace-symbol)
+
+(use-package lsp-mode
+  :
+  )
+
 (use-package lsp-treemacs :commands lsp-treemacs-errors-list)
 
 (define-key lsp-ui-mode-map [remap xref-find-definitions] #'lsp-ui-peek-find-definitions)
 (define-key lsp-ui-mode-map [remap xref-find-references] #'lsp-ui-peek-find-references)
+
+
+;;;; Rust
+
+(defun my-project-try-cargo-toml (dir)
+  (when-let* ((output
+               (let ((default-directory dir))
+                 (shell-command-to-string "cargo metadata --no-deps --format-version 1")))
+              (js (ignore-errors (json-read-from-string output)))
+              (found (cdr (assq 'workspace_root js))))
+    (cons 'eglot-project found)))
+
+(cl-defmethod project-roots ((project (head eglot-project)))
+  (list (cdr project)))
+
+;;(setq lsp-auto-guess-root nil)
+
+
+(use-package rust-mode
+  :ensure t
+  :hook (rust-mode . lsp)
+  :bind
+  ("C-c k" . rust-compile)
+  ("C-c t" . rust-test)
+  :custom
+  (lsp-rust-analyzer-diagnostics-enable nil)
+  :init (progn
+          ;; Warning! This seems fairly buggy 2020-08-10 is the last version that seems to work for me
+          (setq lsp-rust-server 'rust-analyzer)
+          (setq lsp-restart 'ignore)
+          (add-hook 'flycheck-mode-hook #'flycheck-rust-setup)
+          (add-to-list 'projectile-project-root-files-bottom-up "Cargo.toml")))
 
 
 ;; js
@@ -332,12 +397,12 @@
 
 
 ;; Enable helm-gtags-mode
-;(add-hook 'c-mode-hook 'helm-gtags-mode)
-;(add-hook 'c++-mode-hook 'helm-gtags-mode)
-;(add-hook 'asm-mode-hook 'helm-gtags-mode)
+                                        ;(add-hook 'c-mode-hook 'helm-gtags-mode)
+                                        ;(add-hook 'c++-mode-hook 'helm-gtags-mode)
+                                        ;(add-hook 'asm-mode-hook 'helm-gtags-mode)
 
-;(global-set-key (kbd "M-.") 'helm-gtags-dwim)
-;(global-set-key (kbd "M-,") 'helm-gtags-find-tag)
+                                        ;(global-set-key (kbd "M-.") 'helm-gtags-dwim)
+                                        ;(global-set-key (kbd "M-,") 'helm-gtags-find-tag)
 
 ;; C/C++
 ;; HideShow
@@ -377,6 +442,9 @@
 
 ;;;; WEB Dev
 
+(setq create-lockfiles nil) ;; for typescript/webpack errors
+
+
 ;; web-mode
 (require 'web-mode)
 (defun my-web-mode-hook ()
@@ -384,7 +452,6 @@
   (setq web-mode-markup-indent-offset 2)
   (setq web-mode-css-indent-offset 2)
   (setq web-mode-code-indent-offset 2)
-  (setq create-lockfiles nil) ;; for typescript/webpack errors
   )
 
 (add-hook 'web-mode-hook  'my-web-mode-hook)
@@ -456,17 +523,6 @@
   :modes glsl-mode)
 (add-to-list 'flycheck-checkers 'glsl-lang-validator)
 
-
-;;;; Rust
-
-;;(use-package lsp-mode
-  ;;:commands lsp
-  ;;:config (require 'lsp-clients))
-
-;;(use-package lsp-ui)
-
-(use-package rust-mode
-  :hook (rust-mode . lsp))
 
 ;; (setq racer-cmd "~/.cargo/bin/racer") ;; Rustup binaries PATH
 ;; ;;x(setq racer-rust-src-path "~/rust/src") ;; Rust source code PATH

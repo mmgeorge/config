@@ -6,6 +6,10 @@
 (global-set-key (kbd "M-1") 'find-file)
 (global-set-key (kbd "M-2") 'switch-to-buffer)
 (global-set-key (kbd "C-<tab>") 'other-window)
+(global-set-key (kbd "M-o") 'other-window)
+
+(global-set-key (kbd "C-t") 'next-error)
+
 ;;(global-set-key (kbd "C-v") 'yank)
 (global-set-key (kbd "M-q") 'back-to-indentation)
 (global-set-key (kbd "M-q") 'back-to-indentation)
@@ -46,6 +50,9 @@
 (global-set-key (kbd "C-x f") 'set-mark-command)
 (global-set-key (kbd "M-<down>") 'shrink-window)
 (global-set-key (kbd "M-<up>") 'enlarge-window)
+
+(global-set-key (kbd "C-k") 'shrink-window)
+(global-set-key (kbd "C-l") 'enlarge-window)
 
 (global-set-key (kbd "M-;") 'forward-char)
 (global-set-key (kbd "M-:") 'forward-char)
