@@ -2,7 +2,6 @@
 
 PROMPT_DIRTRIM=4
 
-
 KILLEMACS="(kill-emacs)"
 
 # bindings
@@ -20,7 +19,9 @@ alias k=kubectl
 alias mk=kubectl
 alias g=gcloud
 
+source /etc/bash_completion.d/git-prompt  # enable git autocomplete
 source <(kubectl completion bash) # enable autocompletion
+
 complete -F __start_kubectl k # enable autocomplete for alias
 complete -F __start_gcloud g # enable autocomplete for alias
 complete -F __start_kubectl mk # enable autocomplete for alias
@@ -74,43 +75,6 @@ esac
 force_color_prompt=yes
 
 export PS1="\[\033[38;5;11m\]\u\[$(tput sgr0)\]\[\033[38;5;15m\]@\h:\[$(tput sgr0)\]\[\033[38;5;6m\][\w]:\[$(tput sgr0)\]\[\033[38;5;15m\] \[$(tput sgr0)\]"
-
-# if [ -n "$force_color_prompt" ]; then
-#     if [ -x /usr/bin/tput ] && tput setaf 1 >&/dev/null; then
-# 	# We have color support; assume it's compliant with Ecma-48
-# 	# (ISO/IEC-6429). (Lack of such support is extremely rare, and such
-# 	# a case would tend to support setf rather than setaf.)
-# 	color_prompt=yes
-#     else
-# 	color_prompt=
-#     fi
-# fi
-
-# if [ "$color_prompt" = yes ]; then
-#     PS1='${debian_chroot:+($debian_chroot)}\[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ '
-# else
-#     PS1='${debian_chroot:+($debian_chroot)}\u@\h:\w\$ '
-# fi
-# unset color_prompt force_color_prompt
-
-# # If this is an xterm set the title to user@host:dir
-# case "$TERM" in
-# xterm*|rxvt*)
-#     PS1="\[\e]0;${debian_chroot:+($debian_chroot)}\u@\h: \w\a\]$PS1"
-#     ;;
-# *)
-#     ;;
-# esac
-
-# # enable color support of ls and also add handy aliases
-# if [ -x /usr/bin/dircolors ]; then
-#     test -r ~/.dircolors && eval "$(dircolors -b ~/.dircolors)" || eval "$(dircolors -b)"
-#     alias ls='ls --color=auto'
-#     alias p='python'
-#     alias grep='grep --color=auto'
-#     alias fgrep='fgrep --color=auto'
-#     alias egrep='egrep --color=auto'
-# fi
 
 # # colored GCC warnings and errors
 export GCC_COLORS='error=01;31:warning=01;35:note=01;36:caret=01;32:locus=01:quote=01'
