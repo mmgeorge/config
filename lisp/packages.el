@@ -42,7 +42,6 @@
 
 ;; elpy
 
-(setq use-package-always-demand t)
 (setq use-package-always-ensure t)
 
 ;; Performance
@@ -53,7 +52,7 @@
 ;; Misc settings
 
 (setq create-lockfiles nil) ;; for typescript/webpack errors
-(setq load-prefer-newer t)
+;;(setq load-prefer-newer t)
 (setq confirm-kill-processes nil)
 
 
@@ -127,7 +126,6 @@
 ;; lsp-mode
 
 (use-package lsp-mode
-  :ensure t
   :custom
   (lsp-log-io t)
   (lsp-keep-workspace-alive nil)
@@ -175,7 +173,6 @@
 
 
 (use-package rustic-mode
-  :ensure t
   :hook (rustic-mode . lsp)
   :bind
   ("C-c k" . rustic-recompile)
@@ -201,7 +198,6 @@
 ;;;; WEB Dev
 
 (use-package web-mode
-  :ensure t
   :mode "\\.tsx\\'"
   :custom
   (web-mode-markup-indent-offset 2)
@@ -223,7 +219,6 @@
 
 
 (use-package tide
-  :ensure t
   :bind
   ("C-c f" . tide-fix)
   ("C-c l" . eslint-fix)
