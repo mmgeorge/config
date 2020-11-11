@@ -1,5 +1,3 @@
-
-
 (defun load-config (path)
   (setq loads
         '("visual.el"

@@ -1,7 +1,5 @@
 (setq visible-bell 1)
-;;(set-face-attribute 'default nil :height 100)
 (menu-bar-mode -1)
-;;(set-face-attribute 'region nil :background "#766")
 
 ;; Linum-mode
 (global-linum-mode t)
