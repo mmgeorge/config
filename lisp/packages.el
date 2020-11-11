@@ -122,6 +122,10 @@
 (define-key projectile-mode-map (kbd "C-p g") 'helm-projectile-grep)
 (define-key projectile-mode-map (kbd "C-p f") 'helm-projectile-find-file)
 
+
+(setq projectile-enable-caching t)
+
+
 ;; markdown-mode
 (add-hook 'markdown-mode-hook
           (lambda ()
@@ -348,11 +352,6 @@
   )
 
 (use-package helm-lsp :commands helm-lsp-workspace-symbol)
-
-(use-package lsp-mode
-  :
-  )
-
 (use-package lsp-treemacs :commands lsp-treemacs-errors-list)
 
 (define-key lsp-ui-mode-map [remap xref-find-definitions] #'lsp-ui-peek-find-definitions)
@@ -387,7 +386,7 @@
           ;; Warning! This seems fairly buggy 2020-08-10 is the last version that seems to work for me
           (setq lsp-rust-server 'rust-analyzer)
           (setq lsp-restart 'ignore)
-          (add-hook 'flycheck-mode-hook #'flycheck-rust-setup)
+          ;;(add-hook 'flycheck-mode-hook #'flycheck-rust-setup)
           (add-to-list 'projectile-project-root-files-bottom-up "Cargo.toml")))
 
 
@@ -471,6 +470,7 @@
   (eldoc-mode +1)
   (tide-hl-identifier-mode +1)
   (company-mode +1)
+  (setq tide-completion-detailed t)
   (local-set-key (kbd "M-;") 'forward-char)
   (local-set-key (kbd "C-c l") 'eslint-fix))
 
@@ -478,8 +478,8 @@
 (defun eslint-fix ()
   "Apply linter."
   (interactive)
-  ;;(shell-command (concat "eslint --fix " (buffer-file-name)))
-  (shell-command (concat "npx prettier --write " (buffer-file-name)))
+  (shell-command (concat "npx tslint --fix " (buffer-file-name)))
+  ;;(shell-command (concat "npx prettier --write " (buffer-file-name)))
   (revert-buffer t t))
 
 
@@ -496,6 +496,8 @@
 ;; formats the buffer before saving
 ;;(add-hook 'before-save-hook 'tide-format-before-save)
 (setq typescript-indent-level 2)
+(setq tide-tsserver-executable "/usr/bin/tsserver")
+
 
 ;;(add-to-list 'auto-mode-alist '("\\.tsx\\'" . typescript-mode))
 (add-hook 'typescript-mode-hook #'setup-tide-mode)
