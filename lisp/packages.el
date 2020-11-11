@@ -157,16 +157,42 @@
   (list (cdr project)))
 
 
-(use-package rust-mode
+;; (use-package rust-mode
+;;   :ensure t
+;;   :hook (rust-mode . lsp)
+;;   :bind
+;;   ("C-c k" . rust-compile)
+;;   ("C-c t" . rust-test)
+;;   ("C-c f" . helm-lsp-code-actions)
+;;   :custom
+;;   (lsp-rust-analyzer-diagnostics-enable nil)
+;;   :init (progn
+;;           ;; Warning! This seems fairly buggy 2020-08-10 is the last version that seems to work for me
+;;           (setq lsp-rust-server 'rust-analyzer)
+;;           (setq lsp-restart 'ignore)
+;;           ;;(add-hook 'flycheck-mode-hook #'flycheck-rust-setup)
+;;           (add-to-list 'projectile-project-root-files-bottom-up "Cargo.toml")))
+
+
+(use-package rustic-mode
   :ensure t
-  :hook (rust-mode . lsp)
+  :hook (rustic-mode . lsp)
   :bind
-  ("C-c k" . rust-compile)
-  ("C-c t" . rust-test)
+  ("C-c k" . rustic-recompile)
+  ;;("C-c t" . rust-test)
+  ("C-c f" . helm-lsp-code-actions)
   :custom
   (lsp-rust-analyzer-diagnostics-enable nil)
+  (rustic-ansi-faces
+   ["black"
+    "deeppink2"
+    "springgreen1"
+    "lightgoldenrod2"
+    "deepskyblue1"
+    "magenta3"
+    "cyan3"
+    "white"])
   :init (progn
-          ;; Warning! This seems fairly buggy 2020-08-10 is the last version that seems to work for me
           (setq lsp-rust-server 'rust-analyzer)
           (setq lsp-restart 'ignore)
           ;;(add-hook 'flycheck-mode-hook #'flycheck-rust-setup)
