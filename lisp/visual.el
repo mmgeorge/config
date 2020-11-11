@@ -70,6 +70,7 @@
  '(font-lock-string-face ((t (:foreground "deepskyblue1"))))
  '(font-lock-type-face ((t (:foreground "springgreen1"))))
  '(font-lock-comment-face ((t (:foreground "snow3"))))
+ 
  '(typescript-jsdoc-tag ((t (:foreground "lightgoldenrod2"))))
  '(typescript-jsdoc-value ((t (:foreground "ivory1"))))
  '(font-lock-variable-name-face ((t (:foreground "deeppink2"))))
@@ -79,6 +80,14 @@
  `(company-tooltip-common ((t (:foreground "brightwhite"))))
  `(company-tooltip-common-selection ((t (:foreground "brightwhite"))))
 
+
+ ;;`(rustic-errno-face ((t (:foreground "deeppink2"))))
+ ;;`(rustic-compilation-warning ((t (:foreground "deeppink2"))))
+ ;;`(rustic-compilation-error-face ((t (:inherit compilation-error-face))))
+ ;;`(rustic-compilation-error ((t (:inherit compilation-error))))
+ ;;`(rustic-compilation-warning-face ((t (:inherit compilation-warning-face))))
+ ;;`(rustic-compilation-warning ((t (:inherit compilation-warning))))
+ 
  `(company-tooltip-annotation ((t (:foreground "brightwhite"))))
  `(company-tooltip-annotation-selection ((t (:foreground "brightwhite"))))
  `(company-scrollbar-fg ((t (:background "brightwhite"))))
