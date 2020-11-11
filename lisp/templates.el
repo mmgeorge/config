@@ -70,6 +70,29 @@
   > "}"
   );
 
+;;(skeleton-read "Class Name: ")
+(define-skeleton rc
+  "Template for a react functional component"
+  > '(setq name (file-name-base (buffer-file-name)))
+  > "import * as React from 'react';" \n
+  > "import { makeStyles } from 'components/styles';" \n
+  > \n
+  > "export interface I"(s-upper-camel-case name)"Props {}" \n
+  > \n
+  > "const useStyles = makeStyles<I"(s-upper-camel-case name)"Props>(\""(s-upper-camel-case name)"\", _theme => ({" \n
+  > "root: {}" \n
+  > "}));"\n
+  > \n
+  > "export const " (s-upper-camel-case name)": React.FunctionComponent<I"(s-upper-camel-case name)"Props> = props => {" \n
+  > "const classes = useStyles(props);" \n
+  > "" \n
+  > "return (" \n
+  > "<div className={classes."(s-lower-camel-case name)"}>" \n
+  > "</div>" \n
+  > ")" \n
+  > "}" \n
+  );
+
 (define-skeleton fcs
   "Template for a react functional component"
   > '(setq name (file-name-base (buffer-file-name)))

@@ -40,6 +40,9 @@
 
 
 ;;(global-set-key (kbd "M-4") 'delete-other-windows)
+
+(global-set-key (kbd "C-x )") 'delete-window)
+
 (global-set-key (kbd "M-3") 'kill-buffer)
 (global-set-key (kbd "M-s") 'previous-line)
 (global-set-key (kbd "M-d") 'next-line)
