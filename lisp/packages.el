@@ -67,7 +67,7 @@
 (global-flycheck-mode)
 (setq flycheck-check-syntax-automatically '(save mode-enable)) ;; editing is very slow otherwise
 ;;(setq flycheck-check-syntax-automatically '(save idle-change mode-enable)) ;; editing is very slow otherwise
-;;(setq flycheck-idle-change-delay 4)
+(setq flycheck-idle-change-delay 4)
 
 ;; Autopair
 
@@ -138,8 +138,8 @@
 (use-package helm-lsp :commands helm-lsp-workspace-symbol)
 ;;(use-package lsp-treemacs :commands lsp-treemacs-errors-list)
 
-(define-key lsp-ui-mode-map [remap xref-find-definitions] #'lsp-ui-peek-find-definitions)
-(define-key lsp-ui-mode-map [remap xref-find-references] #'lsp-ui-peek-find-references)
+;;(define-key lsp-ui-mode-map [remap xref-find-definitions] #'lsp-ui-peek-find-definitions)
+;;(define-key lsp-ui-mode-map [remap xref-find-references] #'lsp-ui-peek-find-references)
 
 ;;;; rust
 
@@ -198,7 +198,11 @@
 ;;;; WEB Dev
 
 (use-package web-mode
-  :mode "\\.tsx\\'"
+ :mode (("\\.tsx\\'" . web-mode)
+        ("\\.html\\'" . web-mode))
+  :config
+  (add-to-list 'auto-mode-alist '("\\.html\\'" . web-mode))
+  (add-to-list 'auto-mode-alist '("\\.tsx\\'" . web-mode))
   :custom
   (web-mode-markup-indent-offset 2)
   (web-mode-css-indent-offset 2)
