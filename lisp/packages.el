@@ -125,14 +125,20 @@
 
 ;; lsp-mode
 
+
+;;(setq lsp-completion-sort-initial-results nil) 
+;;(setq lsp-completion--no-reordering t)
+
 (use-package lsp-mode
   :custom
   (lsp-log-io t)
   (lsp-keep-workspace-alive nil)
   (lsp-enable-snippet nil)
   (lsp--auto-configure t )
+  (lsp-imenu-sort-methods '(position))
   :hook (python-mode . lsp)
   :commands lsp)
+
 
 (use-package lsp-ui :commands lsp-ui-mode)
 (use-package helm-lsp :commands helm-lsp-workspace-symbol)
@@ -172,14 +178,13 @@
 ;;           (add-to-list 'projectile-project-root-files-bottom-up "Cargo.toml")))
 
 
-(use-package rustic-mode
-  :hook (rustic-mode . lsp)
+(use-package rustic
+  :ensure t
   :bind
   ("C-c k" . rustic-recompile)
   ;;("C-c t" . rust-test)
   ("C-c f" . helm-lsp-code-actions)
   :custom
-  (lsp-rust-analyzer-diagnostics-enable nil)
   (rustic-ansi-faces
    ["black"
     "deeppink2"
@@ -189,13 +194,11 @@
     "magenta3"
     "cyan3"
     "white"])
-  :init (progn
-          (setq lsp-rust-server 'rust-analyzer)
-          (setq lsp-restart 'ignore)
-          ;;(add-hook 'flycheck-mode-hook #'flycheck-rust-setup)
-          (add-to-list 'projectile-project-root-files-bottom-up "Cargo.toml")))
+  :init 
+  ;;(add-to-list 'projectile-project-root-files-bottom-up "Cargo.toml")
+  )
+;;(add-to-list 'projectile-project-root-files-bottom-up "Cargo.toml")
 
-;;;; WEB Dev
 
 (use-package web-mode
  :mode (("\\.tsx\\'" . web-mode)
@@ -208,6 +211,14 @@
   (web-mode-css-indent-offset 2)
   (web-mode-code-indent-offset 2))
 
+(add-hook 'web-mode-hook
+          (lambda ()
+            (define-key web-mode-map (kbd "M-;") nil)
+            (define-key web-mode-map (kbd "M-:") nil)
+            (when (string-equal "tsx" (file-name-extension buffer-file-name))
+              (tide-mode)
+              (tide-setup)
+              )))
 
 (flycheck-add-mode 'typescript-tslint 'web-mode)
 
@@ -227,7 +238,9 @@
   ("C-c f" . tide-fix)
   ("C-c l" . eslint-fix)
   :custom
-  (tide-tsserver-executable "/usr/bin/tsserver")
+  ;; Use global install if applicable
+  (when (file-exists-p "/usr/bin/tsserver")
+    (tide-tsserver-executable "/usr/bin/tsserver"))
   (tide-completion-detailed t)
   (typescript-indent-level 2)
   (tide-format-options
@@ -237,13 +250,11 @@
      nil
      :InsertSpaceAfterOpeningAndBeforeClosingNonemptyBrackets t))
   :after (typescript-mode company flycheck)
-  :hook ((typescript-mode . tide-setup)
-         ;;(typescript-mode . tide-hl-identifier-mode)
-         ))
+  :hook ((typescript-mode . tide-setup)))
 
 ;; autopair
-(run-with-idle-timer 0 nil (lambda () (require 'autopair)))
-(run-with-idle-timer 0 nil (lambda () (autopair-global-mode)))
+;;(run-with-idle-timer 0 nil (lambda () (require 'autopair)))
+;;(run-with-idle-timer 0 nil (lambda () (autopair-global-mode)))
 
 
 ;;; emacs-packages ends here
