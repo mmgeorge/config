@@ -175,7 +175,8 @@
           (setq lsp-rust-server 'rust-analyzer)
           (setq lsp-restart 'ignore)
           ;;(add-hook 'flycheck-mode-hook #'flycheck-rust-setup)
-          (add-to-list 'projectile-project-root-files-bottom-up "Cargo.toml")))
+          ;;(add-to-list 'projectile-project-root-files-bottom-up "Cargo.toml")
+          ))
 
 
 ;; (use-package rustic
@@ -202,7 +203,8 @@
 
 (use-package web-mode
  :mode (("\\.tsx\\'" . web-mode)
-        ("\\.html\\'" . web-mode))
+        ("\\.html\\'" . web-mode)
+        ("\\.json\\'" . web-mode))
   :config
   (add-to-list 'auto-mode-alist '("\\.html\\'" . web-mode))
   (add-to-list 'auto-mode-alist '("\\.tsx\\'" . web-mode))
