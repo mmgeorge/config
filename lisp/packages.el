@@ -1,16 +1,21 @@
 (require 'package)
 (require 'cl-lib)
 
-(add-to-list 'package-archives '("melpa" . "http://melpa.org/packages/") '("gnu" . "http://elpa.gnu.org/packages/"))
+(add-to-list
+ 'package-archives
+ '("melpa" . "http://melpa.org/packages/")
+ '("gnu" . "http://elpa.gnu.org/packages/"))
 
 (setq package-list
       '(use-package
-         lsp-mode
+         ;;lsp-mode
+         ;;lsp-haskell
+
          helm
          helm-projectile
          flycheck
          company
-         autopair
+         ;; autopair
          markdown-mode
          web-mode
          tide
@@ -19,9 +24,12 @@
 
          ;; rust
          ;;rustic
-         ;;racer
+         ;;racer 
 
-         ;; sly
+         sly
+         ;;sly-asdf
+
+         
          ;; lisp
          ;; slime
          ;; slime-company
@@ -31,8 +39,8 @@
 (package-initialize)
 
 ;; Fetch list of available packages
-(unless package-archive-contents
-  (package-refresh-contents))
+;; (unless package-archive-contents
+;;   (package-refresh-contents))
 
 
 ;; Install missing packages
@@ -42,7 +50,7 @@
 
 ;; elpy
 
-(setq use-package-always-ensure t)
+;;(setq use-package-always-ensure t)
 
 ;; Performance
 
@@ -56,6 +64,7 @@
 (setq confirm-kill-processes nil)
 
 
+(electric-pair-mode 1)
 (auto-revert-mode 1)
 (show-paren-mode 1)
 ;;(auto-compression-mode 0)
@@ -64,15 +73,15 @@
 
 ;; flycheck
 
-(global-flycheck-mode)
+;;(global-flycheck-mode)
 (setq flycheck-check-syntax-automatically '(save mode-enable)) ;; editing is very slow otherwise
 ;;(setq flycheck-check-syntax-automatically '(save idle-change mode-enable)) ;; editing is very slow otherwise
 (setq flycheck-idle-change-delay 4)
 
 ;; Autopair
 
-(require 'autopair)
-(autopair-global-mode)
+;; (require 'autopair)
+;; (autopair-global-mode)
 
 ;; company
 
@@ -102,7 +111,7 @@
 (define-key projectile-mode-map (kbd "C-p f") 'helm-projectile-find-file)
 (setq projectile-enable-caching t)
 
- ;; compilation-mode
+;; compilation-mode
 (setq compilation-scroll-output t)
 (setq compilation-scroll-output 'first-error)
 
@@ -129,19 +138,19 @@
 ;;(setq lsp-completion-sort-initial-results nil) 
 ;;(setq lsp-completion--no-reordering t)
 
-(use-package lsp-mode
-  :custom
-  (lsp-log-io t)
-  (lsp-keep-workspace-alive nil)
-  (lsp-enable-snippet nil)
-  (lsp--auto-configure t )
-  (lsp-imenu-sort-methods '(position))
-  :hook (python-mode . lsp)
-  :commands lsp)
+;; (use-package lsp-mode
+;;   :custom
+;;   (lsp-log-io t)
+;;   (lsp-keep-workspace-alive nil)
+;;   (lsp-enable-snippet nil)
+;;   (lsp--auto-configure t )
+;;   (lsp-imenu-sort-methods '(position))
+;;   :hook (python-mode . lsp)
+;;   :commands lsp)
 
 
-(use-package lsp-ui :commands lsp-ui-mode)
-(use-package helm-lsp :commands helm-lsp-workspace-symbol)
+;; (use-package lsp-ui :commands lsp-ui-mode)
+;; (use-package helm-lsp :commands helm-lsp-workspace-symbol)
 ;;(use-package lsp-treemacs :commands lsp-treemacs-errors-list)
 
 ;;(define-key lsp-ui-mode-map [remap xref-find-definitions] #'lsp-ui-peek-find-definitions)
@@ -179,6 +188,77 @@
           ))
 
 
+;; Haskell
+
+(use-package haskell-mode
+  ;;:ensure t
+  :mode (("\\.hs\\'" . haskell-mode)))
+
+(add-hook 'haskell-mode-hook 'interactive-haskell-mode)
+
+
+(defun cabal-root (dir)
+  (message default-directory)
+  (when-let ((root (find-cabal-directory default-directory)))
+    (message root)
+    (cons 'cabal root)))
+
+(add-hook 'project-find-functions #'cabal-root)
+
+
+(cl-defmethod project-roots ((project (head cabal)))
+  (list (cdr project)))
+
+
+(cl-defun find-cabal-directory (directory &optional (depth 10))
+  "Find the first file in the current DIRECTORY or a parent of DIRECTORY that includes a .cabal file."
+  (message "Search" directory)
+  (message directory)
+  (let ((fname (directory-file-name directory)))
+    (or
+     (and (cl-find-if #'(lambda (file) (string-equal "cabal" (file-name-extension file)))
+                      (directory-files directory))
+          directory)
+     (and (> depth 0)
+          (file-name-directory fname)
+          (find-cabal-directory (file-name-directory fname) (1- depth))))))
+
+
+(use-package eglot-mode
+  ;;:ensure t
+  :bind
+  ("C-c f" . eglot-code-actions)
+  ("C-c l" . haskell-process-load-file)
+  ("M-z" . haskell-interactive-mode-clear)
+  :init
+  (setq project-current-inhibit-prompt nil))
+
+(setq eglot-workspace-configuration
+      '((haskell
+         (formattingProvider . "stylish-haskell"))))
+
+(defun eglot-code-action-import (beg &optional end)
+  ;;(format "Execute '%s' code actions between BEG and END." kind)
+  (interactive (eglot--region-bounds))
+  (eglot-code-actions beg end "quickfix.import.extend.list.topLevel"))
+
+(use-package flymake-diagnostic-at-point
+  :after flymake
+  :custom
+  (flymake-diagnostic-at-point-timer-delay 0.1)
+  (flymake-diagnostic-at-point-error-prefix "> ")
+  (flymake-diagnostic-at-point-display-diagnostic-function 'flymake-diagnostic-at-point-display-popup)
+  :hook
+    (flymake-mode . flymake-diagnostic-at-point-mode))
+
+
+;; (use-package dap-mode
+;;   :ensure t :after lsp-mode
+;;   :config
+;;   (dap-mode t)
+;;   (dap-ui-mode t))
+
+
 ;; (use-package rustic
 ;;   :ensure t
 ;;   :bind
@@ -202,9 +282,9 @@
 
 
 (use-package web-mode
- :mode (("\\.tsx\\'" . web-mode)
-        ("\\.html\\'" . web-mode)
-        ("\\.json\\'" . web-mode))
+  :mode (("\\.tsx\\'" . web-mode)
+         ("\\.html\\'" . web-mode)
+         ("\\.json\\'" . web-mode))
   :config
   (add-to-list 'auto-mode-alist '("\\.html\\'" . web-mode))
   (add-to-list 'auto-mode-alist '("\\.tsx\\'" . web-mode))
@@ -222,7 +302,7 @@
               (tide-setup)
               )))
 
-(flycheck-add-mode 'typescript-tslint 'web-mode)
+;;(flycheck-add-mode 'typescript-tslint 'web-mode)
 
 
 ;;;; Typescript
@@ -243,7 +323,7 @@
   ;; Use global install if applicable
   (when (file-exists-p "/usr/bin/tsserver")
     (tide-tsserver-executable "/usr/bin/tsserver"))
-  (tide-completion-detailed t)
+  ;;(tide-completion-detailed t)
   (typescript-indent-level 2)
   (tide-format-options
    '(:insertSpaceAfterFunctionKeywordForAnonymousFunctions
