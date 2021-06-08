@@ -3,7 +3,7 @@
 
 ;;; Code:
 ;; Hotkey rebinds
-(global-set-key (kbd "M-1") 'find-file)
+(global-set-key (kbd "M-1") 'helm-find-files)
 (global-set-key (kbd "M-2") 'switch-to-buffer)
 (global-set-key (kbd "C-<tab>") 'other-window)
 (global-set-key (kbd "M-o") 'other-window)
@@ -21,7 +21,7 @@
 (global-set-key (kbd "M-u") 'kill-ring-save)
 (global-set-key (kbd "M-y") 'cua-paste)
 (global-set-key (kbd "C-u") 'kill-region)
-(global-set-key (kbd "M-z") 'undo)
+;;(global-set-key (kbd "M-z") 'undo)
 (global-set-key (kbd "M-c") 'company-complete)
   
 ;;(global-set-key (kbd "M-l") 'View-scroll-half-page-forward) 
@@ -37,8 +37,6 @@
 ;(global-set-key (kbd "C-s") 'backward-word)
 ;(global-set-key (kbd "C-k") 'View-scroll-half-page-backward)
 ;(global-set-key (kbd "C-l") 'View-scroll-half-page-forward)
-
-
 ;;(global-set-key (kbd "M-4") 'delete-other-windows)
 
 (global-set-key (kbd "C-x )") 'delete-window)

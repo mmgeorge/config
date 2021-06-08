@@ -1,7 +1,7 @@
 ;;(add-to-list 'load-path "~/.emacs.d/lisp/slime")
 ;;(add-to-list 'load-path "~/.emacs.d/lisp/sly")
 ;;(add-to-list 'load-path "~/.emacs.d/lisp/sly-stepper")
-;;(add-to-list 'load-path "~/.emacs.d/lisp/sly-asdf")
+(add-to-list 'load-path "~/.emacs.d/lisp/sly-asdf")
 
 ;;;; Common Lisp
 
@@ -9,12 +9,10 @@
 
 ;; START LOCAL SLY
 ;;(require 'sly-autoloads)
-;;(require 'sly-asdf)
+(require 'sly-asdf)
 ;;(require 'sly-stepper-autoloads)
-;;(add-to-list 'sly-contribs 'sly-asdf 'append)
+(add-to-list 'sly-contribs 'sly-asdf 'append)
 ;; END LOCAL SLY
-
-;; (setq sly-asdf-enable-experimental-syntax-checking t)
 
 (setq inferior-lisp-program "sbcl")
 
