@@ -70,7 +70,9 @@
  '(font-lock-string-face ((t (:foreground "deepskyblue1"))))
  '(font-lock-type-face ((t (:foreground "springgreen1"))))
  '(font-lock-comment-face ((t (:foreground "snow3"))))
- 
+
+ '(flymake-error ((t (:foreground "brightred" :underline t))))
+
  '(typescript-jsdoc-tag ((t (:foreground "lightgoldenrod2"))))
  '(typescript-jsdoc-value ((t (:foreground "ivory1"))))
  '(font-lock-variable-name-face ((t (:foreground "deeppink2"))))
@@ -80,6 +82,7 @@
  `(company-tooltip-common ((t (:foreground "brightwhite"))))
  `(company-tooltip-common-selection ((t (:foreground "brightwhite"))))
 
+ '(popup-tip-face ((t (:foreground "brightwhite" :background "gray13"))))
 
  ;;`(rustic-errno-face ((t (:foreground "deeppink2"))))
  ;;`(rustic-compilation-warning ((t (:foreground "deeppink2"))))

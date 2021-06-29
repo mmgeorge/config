@@ -19,6 +19,7 @@ alias k=kubectl
 alias mk=kubectl
 alias g=gcloud
 
+eval "$(stack --bash-completion-script stack)"
 source /etc/bash_completion.d/git-prompt  # enable git autocomplete
 source <(kubectl completion bash) # enable autocompletion
 
