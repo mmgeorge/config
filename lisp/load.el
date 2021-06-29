@@ -6,7 +6,9 @@
           "commands.el"
           "default.el"
           "templates.el"
-          "packages.el"))
+          "packages.el"
+          "lang/cl.lisp"
+          ))
   (dolist (file loads)
     (load-file (concat path file))))
 
