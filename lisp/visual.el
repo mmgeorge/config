@@ -6,7 +6,7 @@
 (setq linum-format "%d ")
 
 
-(defvar *path-length 5)
+(defvar *path-length 8)
 (defun shorten-path-when-long ()
   ;; Displays only the last 5 elements of the path
   (let ((dir-list (split-string default-directory "/")))
@@ -71,7 +71,8 @@
  '(font-lock-type-face ((t (:foreground "springgreen1"))))
  '(font-lock-comment-face ((t (:foreground "snow3"))))
 
- '(flymake-error ((t (:foreground "brightred" :underline t))))
+'(flymake-error ((t (:foreground "brightred" :underline t))))
+'(haskell-error-face ((t (:foreground "brightred" :underline t))))
 
  '(typescript-jsdoc-tag ((t (:foreground "lightgoldenrod2"))))
  '(typescript-jsdoc-value ((t (:foreground "ivory1"))))
@@ -96,6 +97,11 @@
  `(company-scrollbar-fg ((t (:background "brightwhite"))))
  `(company-scrollbar-bg ((t (:background "gray"))))
 
+ `(helm-ff-file-extension ((t (:foreground "deepskyblue1"))))
+ `(helm-ff-file ((t (:foreground "deepskyblue1"))))
+ `(helm-ff-directory ((t (:foreground "brightwhite"))))
+ `(helm-buffer-file ((t (:foreground "deepskyblue1"))))
+ `(helm-buffer-directory ((t (:foreground "brightwhite"))))
  `(helm-buffer-process ((t (:foreground "deepskyblue1"))))
  `(helm-selection ((t (:background "gray24"))))
  `(helm-source-header ((t (:foreground "black" :background "gray72"))))

@@ -4,7 +4,7 @@
 ;; ------------------------------------------------------------------------
 ;; Determines how much of the page to scroll down.
 ;; Recommended: 2 or 4, 1 sets to default emacs scroll behavior
-(defvar scroll-amount 4)
+(defvar scroll-amount 16)
 
 (defvar view-half-page-size nil
   "Default number of lines to scroll by View half page commands.

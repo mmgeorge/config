@@ -8,7 +8,7 @@
 
 (setq package-list
       '(use-package
-         ;;lsp-mode
+         ;;jplsp-mode
          ;;lsp-haskell
 
          helm
@@ -22,6 +22,9 @@
          typescript-mode
          s
 
+         ;;lsp-haskell
+         helm-lsp
+
          ;; rust
          ;;rustic
          ;;racer 
@@ -34,6 +37,11 @@
          ;; slime
          ;; slime-company
          ;;paredit
+
+
+         ;; haskell
+         ;;shm ;; structured-haskell-mode
+         
          ))
 
 (package-initialize)
@@ -90,6 +98,10 @@
 ;; aligns annotation to the right hand side
 (setq company-tooltip-align-annotations t)
 
+;; yasnippet
+(require 'yasnippet)
+(yas-global-mode 1)
+
 ;; helm
 
 (require 'helm-config)
@@ -138,19 +150,33 @@
 ;;(setq lsp-completion-sort-initial-results nil) 
 ;;(setq lsp-completion--no-reordering t)
 
-;; (use-package lsp-mode
-;;   :custom
-;;   (lsp-log-io t)
-;;   (lsp-keep-workspace-alive nil)
-;;   (lsp-enable-snippet nil)
-;;   (lsp--auto-configure t )
-;;   (lsp-imenu-sort-methods '(position))
-;;   :hook (python-mode . lsp)
-;;   :commands lsp)
+(use-package lsp-mode
+  ;;:ensure t
+  :bind
+  ("C-c f" . helm-lsp-code-actions)
+  :custom
+  ;;(lsp-completion-enable-additional-text-edit nil)
+  (lsp-headerline-breadcrumb-enable nil)
+
+  (lsp-ui-doc-enable t)
+  ;;(lsp-log-io t)
+  (lsp-keep-workspace-alive nil)
+  (lsp-enable-snippet nil)
+  (lsp--auto-configure t )
+  (lsp-imenu-sort-methods '(position))
+  (lsp-ui-sideline-show-code-actions nil)
+  (lsp-ui-doc-max-height 4)
+  ;;:hook (haskell-mode . lsp)
+  :commands lsp)
 
 
-;; (use-package lsp-ui :commands lsp-ui-mode)
-;; (use-package helm-lsp :commands helm-lsp-workspace-symbol)
+(use-package lsp-ui
+  :commands lsp-ui-mode
+  
+  )
+(use-package helm-lsp :commands helm-lsp-workspace-symbol)
+
+
 ;;(use-package lsp-treemacs :commands lsp-treemacs-errors-list)
 
 ;;(define-key lsp-ui-mode-map [remap xref-find-definitions] #'lsp-ui-peek-find-definitions)
@@ -190,12 +216,84 @@
 
 ;; Haskell
 
+;;(setq haskell-process-args-ghci '("-interactive-print=Text.Pretty.Simple.pPrint"))
+;;(setq haskell-interactive-mode-collapse t);;
+
+(setq-default abbrev-mode t)
+
+(define-abbrev-table 'haskell-mode-abbrev-table
+  '(("imq"  "import qualified")
+    ("fm" "<$>")
+    ("ff"  "$")
+    ("tis"  "::")
+    ("is"  "=")
+    ("eql"  "==")
+    ("la"  "<-")
+    ("ra"  "->")
+    )
+      "Unicode characters I use all the time.")
+
+
+(setq haskell-process-log t)
+
 (use-package haskell-mode
-  ;;:ensure t
-  :mode (("\\.hs\\'" . haskell-mode)))
+  :bind
+  ("C-c t" . haskell-insert-type)
+  ("C-c l" . haskell-process-load-file)
+  ("M-z" . haskell-interactive-mode-clear)
+  ("<return>" . align-newline)
+  :mode (("\\.hs\\'" . haskell-mode)
+         ("\\.cabal\\'" . haskell-mode)))
+
+
+;; This works, but we really need to have a linter to do this 
+;; (require 'align)
+
+;; (add-to-list 'align-rules-list
+;;              '(haskell-left-arrows
+;;                (regexp . "\\(\\s-+\\)\\(<-\\|←\\)\\s-+") ;; Can also be a function
+;;                (modes . '(haskell-mode))))
+
+;; (add-to-list 'align-rules-list
+;;              '(haskell-assignment
+;;                (regexp . "\\(\\s-+\\)=\\s-+")
+;;                (modes . '(haskell-mode))))
+
+;; (add-to-list 'align-rules-list
+;;              '(haskell-arrows
+;;                (regexp . "\\(\\s-+\\)\\(->\\|→\\)\\s-+")
+;;                (modes . '(haskell-mode))))
+
+
+;; (defun align-newline ()
+;;   "A replacement function for `newline-and-indent', aligning as it goes.
+;; The alignment is done by calling `align' on the region that was
+;; indented."
+;;   (interactive)
+;;   (let ((separate (or (if (and (symbolp align-region-separate)
+;; 			       (boundp align-region-separate))
+;; 			  (symbol-value align-region-separate)
+;; 			align-region-separate)
+;; 		      'entire))
+;; 	(end (point)))
+;;     (call-interactively 'newline)
+;;     (save-excursion
+;;       (forward-line -1)
+;;       (while (not (or (bobp)
+;; 		      (align-new-section-p (point) end separate)))
+;; 	(forward-line -1))
+;;       (align (point) end))))
+
+(defun haskell-insert-type ()
+  (interactive)
+  (haskell-process-do-type t))
+
+(require 'lsp-haskell)
+(add-hook 'haskell-mode-hook #'lsp)
+(add-hook 'haskell-literate-mode-hook #'lsp)
+
 
 (add-hook 'haskell-mode-hook 'interactive-haskell-mode)
-
 
 (defun cabal-root (dir)
   (message default-directory)
@@ -224,23 +322,21 @@
           (find-cabal-directory (file-name-directory fname) (1- depth))))))
 
 
-(use-package eglot-mode
-  ;;:ensure t
-  :bind
-  ("C-c f" . eglot-code-actions)
-  ("C-c l" . haskell-process-load-file)
-  ("M-z" . haskell-interactive-mode-clear)
-  :init
-  (setq project-current-inhibit-prompt nil))
+;; (use-package eglot-mode
+;;   ;;:ensure t
+;;   :bind
+;;   ;;("C-c f" . eglot-code-actions)
+;;   :init
+;;   (setq project-current-inhibit-prompt nil))
 
-(setq eglot-workspace-configuration
-      '((haskell
-         (formattingProvider . "stylish-haskell"))))
+;; (setq eglot-workspace-configuration
+;;       '((haskell
+;;          (formattingProvider . "stylish-haskell"))))
 
-(defun eglot-code-action-import (beg &optional end)
-  ;;(format "Execute '%s' code actions between BEG and END." kind)
-  (interactive (eglot--region-bounds))
-  (eglot-code-actions beg end "quickfix.import.extend.list.topLevel"))
+;; (defun eglot-code-action-import (beg &optional end)
+;;   ;;(format "Execute '%s' code actions between BEG and END." kind)
+;;   (interactive (eglot--region-bounds))
+;;   (eglot-code-actions beg end "quickfix.import.extend.list.topLevel"))
 
 (use-package flymake-diagnostic-at-point
   :after flymake
