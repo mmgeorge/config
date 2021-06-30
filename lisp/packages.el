@@ -1,141 +1,141 @@
 (require 'package)
 (require 'cl-lib)
 
+;;------------------------------------------------------------------------------------
+;; Package Loading
+;;------------------------------------------------------------------------------------
+
 (add-to-list
  'package-archives
  '("melpa" . "http://melpa.org/packages/")
  '("gnu" . "http://elpa.gnu.org/packages/"))
 
-(setq package-list
-      '(use-package
-         ;;jplsp-mode
-         ;;lsp-haskell
+(require 'use-package-ensure)
 
-         helm
-         helm-projectile
-         flycheck
-         company
-         ;; autopair
-         markdown-mode
-         web-mode
-         tide
-         typescript-mode
-         s
+(setq use-package-always-ensure t) ;; Always make sure we have any package that we use
 
-         ;;lsp-haskell
-         helm-lsp
+;;------------------------------------------------------------------------------------
+;; Common modes
+;;------------------------------------------------------------------------------------
 
-         ;; rust
-         ;;rustic
-         ;;racer 
-
-         sly
-         ;;sly-asdf
-
-         
-         ;; lisp
-         ;; slime
-         ;; slime-company
-         ;;paredit
+;; Syntax checking. Flymake (builtin) used instead for some modes
+(use-package flycheck
+  ;; :init (global-flycheck-mode)
+  :custom ((flycheck-check-syntax-automatically '(save mode-enable))
+           (flycheck-idle-change-delay 1)))
 
 
-         ;; haskell
-         ;;shm ;; structured-haskell-mode
-         
-         ))
-
-(package-initialize)
-
-;; Fetch list of available packages
-;; (unless package-archive-contents
-;;   (package-refresh-contents))
-
-
-;; Install missing packages
-(dolist (package package-list)
-  (unless (package-installed-p package)
-    (package-install package)))
-
-;; elpy
-
-;;(setq use-package-always-ensure t)
-
-;; Performance
-
-(setq gc-cons-threshold 800000) ;; Increase gc threshold
-(setq read-process-output-max (* 2048 2048)) ;; Increase emacs process data read (for lsp)
-
-;; Misc settings
-
-(setq create-lockfiles nil) ;; for typescript/webpack errors
-;;(setq load-prefer-newer t)
-(setq confirm-kill-processes nil)
+;; Syntax checking UI library for flymake
+(use-package flymake-diagnostic-at-point
+  :after flymake
+  :custom
+  (flymake-diagnostic-at-point-timer-delay 0.1)
+  (flymake-diagnostic-at-point-error-prefix "> ")
+  (flymake-diagnostic-at-point-display-diagnostic-function 'flymake-diagnostic-at-point-display-popup)
+  :hook
+    (flymake-mode . flymake-diagnostic-at-point-mode))
 
 
-(electric-pair-mode 1)
-(auto-revert-mode 1)
-(show-paren-mode 1)
-;;(auto-compression-mode 0)
-(auto-encryption-mode 0)
-(semantic-mode 0)
+;; Autocompletion
+(use-package company
+  :bind (("C-e" . company-complete))
+  :init (global-company-mode)
+  :custom ((company-tooltip-align-annotations t)))
 
-;; flycheck
 
-;;(global-flycheck-mode)
-(setq flycheck-check-syntax-automatically '(save mode-enable)) ;; editing is very slow otherwise
-;;(setq flycheck-check-syntax-automatically '(save idle-change mode-enable)) ;; editing is very slow otherwise
-(setq flycheck-idle-change-delay 4)
+;;(use-package yasnippet
+  ;;:init (yas-global-mode 1))
 
-;; Autopair
 
-;; (require 'autopair)
-;; (autopair-global-mode)
+;; Allows for viewing project files (e.g.., find a file within git project)
+(use-package projectile
+  :bind (("C-p g" . helm-projectile-grep)
+         ("C-p f" . helm-projectile-find-file))
+  :init (projectile-mode)
+  :custom ((projectile-enable-caching t)))
 
-;; company
 
-(add-hook 'after-init-hook 'global-company-mode)
-(global-set-key (kbd "C-e") 'company-complete)
-;; aligns annotation to the right hand side
-(setq company-tooltip-align-annotations t)
+;; Mode for interacting with language servers that implement the Language Server Protocol
+(use-package lsp-mode
+  :bind
+  (("C-c f" . helm-lsp-code-actions))
+  :custom
+  ((lsp-headerline-breadcrumb-enable nil)
+   ;;(lsp-completion-enable-additional-text-edit nil)
+   ;;(lsp-log-io t)
+  (lsp-ui-doc-enable t)
+  (lsp-keep-workspace-alive nil)
+  (lsp-enable-snippet nil)
+  (lsp--auto-configure t )
+  (lsp-imenu-sort-methods '(position))
+  (lsp-ui-sideline-show-code-actions nil)
+  (lsp-ui-doc-max-height 4))
+  ;;:hook (haskell-mode . lsp)
+  :commands lsp)
 
-;; yasnippet
-(require 'yasnippet)
-(yas-global-mode 1)
 
-;; helm
+(use-package lsp-ui
+  :commands lsp-ui-mode)
 
-(require 'helm-config)
-(helm-mode 1)
 
-(global-semanticdb-minor-mode)
-(setq helm-semantic-fuzzy-match t)
+;; Vastly simpler version of lsp, in some cases easier to get working. However,
+;; not quite the same level of functionality 
+;; (use-package eglot-mode
+;;   :bind
+;;   ;;("C-c f" . eglot-code-actions)
+;;   :init
+;;   (setq project-current-inhibit-prompt nil))
 
-(global-set-key (kbd "M-x") 'helm-M-x)
-(global-set-key (kbd "M-2") 'helm-buffers-list)
+;; (setq eglot-workspace-configuration
+;;       '((haskell
+;;          (formattingProvider . "stylish-haskell"))))
 
-;; projectile
+;; (defun eglot-code-action-import (beg &optional end)
+;;   ;;(format "Execute '%s' code actions between BEG and END." kind)
+;;   (interactive (eglot--region-bounds))
+;;   (eglot-code-actions beg end "quickfix.import.extend.list.topLevel"))
 
-(projectile-mode)
-(require 'helm-projectile)
-(helm-projectile-on)
-(global-unset-key (kbd "C-p"))
-(define-key projectile-mode-map (kbd "C-p g") 'helm-projectile-grep)
-(define-key projectile-mode-map (kbd "C-p f") 'helm-projectile-find-file)
-(setq projectile-enable-caching t)
+
+;; Debbuger protocol interop
+;; (use-package dap-mode
+;;   :after lsp-mode
+;;   :config
+;;   (dap-mode t)
+;;   (dap-ui-mode t))
+
+
+;; Provides a great alternative to standard emacs menus for searching for files, commands, etc
+(use-package helm
+  :preface (require 'helm-config)
+  :bind (("M-x" . 'helm-M-x)
+         ("M-2" . 'helm-buffers-list))
+  :init (helm-mode 1)
+  :custom (helm-semantic-fuzzy-match t))
+
+
+(use-package helm-projectile
+  :init (helm-projectile-on))
+
+
+(use-package helm-lsp
+  :commands helm-lsp-workspace-symbol)
+
 
 ;; compilation-mode
 (setq compilation-scroll-output t)
 (setq compilation-scroll-output 'first-error)
 
-;; markdown-mode
+;;------------------------------------------------------------------------------------
+;; Language - Markdown
+;;------------------------------------------------------------------------------------
 
-(add-hook 'markdown-mode-hook
-          (lambda ()
-            (local-set-key (kbd "C-l l") 'markdown-insert-link) 
-            (local-set-key (kbd "C-l p") 'markdown-live-preview-mode)))
+;; (use-package markdown-mode
+;; :bind (("C-l l" . 'markdown-insert-link)
+;;    ("C-l p". 'markdown-live-preview-mode)))
 
-
-;;;; elisp
+;;------------------------------------------------------------------------------------
+;; Language - Elisp
+;;------------------------------------------------------------------------------------
 
 (defun elisp-bindings ()
   (define-key emacs-lisp-mode-map (kbd "M-.") 'xref-find-definitions)
@@ -143,46 +143,9 @@
 
 (add-hook 'emacs-lisp-mode-hook 'elisp-bindings)
 
-
-;; lsp-mode
-
-
-;;(setq lsp-completion-sort-initial-results nil) 
-;;(setq lsp-completion--no-reordering t)
-
-(use-package lsp-mode
-  ;;:ensure t
-  :bind
-  ("C-c f" . helm-lsp-code-actions)
-  :custom
-  ;;(lsp-completion-enable-additional-text-edit nil)
-  (lsp-headerline-breadcrumb-enable nil)
-
-  (lsp-ui-doc-enable t)
-  ;;(lsp-log-io t)
-  (lsp-keep-workspace-alive nil)
-  (lsp-enable-snippet nil)
-  (lsp--auto-configure t )
-  (lsp-imenu-sort-methods '(position))
-  (lsp-ui-sideline-show-code-actions nil)
-  (lsp-ui-doc-max-height 4)
-  ;;:hook (haskell-mode . lsp)
-  :commands lsp)
-
-
-(use-package lsp-ui
-  :commands lsp-ui-mode
-  
-  )
-(use-package helm-lsp :commands helm-lsp-workspace-symbol)
-
-
-;;(use-package lsp-treemacs :commands lsp-treemacs-errors-list)
-
-;;(define-key lsp-ui-mode-map [remap xref-find-definitions] #'lsp-ui-peek-find-definitions)
-;;(define-key lsp-ui-mode-map [remap xref-find-references] #'lsp-ui-peek-find-references)
-
-;;;; rust
+;;------------------------------------------------------------------------------------
+;; Language - Rust
+;;------------------------------------------------------------------------------------
 
 (defun my-project-try-cargo-toml (dir)
   (when-let* ((output
@@ -197,30 +160,39 @@
 
 
 (use-package rust-mode
-  :ensure t
   :hook (rust-mode . lsp)
-  :bind
-  ("C-c k" . rust-compile)
-  ("C-c t" . rust-test)
-  ("C-c f" . helm-lsp-code-actions)
-  :custom
-  (lsp-rust-analyzer-diagnostics-enable nil)
+  :bind (("C-c k" . rust-compile)
+         ("C-c t" . rust-test)
+         ("C-c f" . helm-lsp-code-actions))
+  :custom ((lsp-rust-analyzer-diagnostics-enable nil))
   :init (progn
           ;; Warning! This seems fairly buggy 2020-08-10 is the last version that seems to work for me
-          (setq lsp-rust-server 'rust-analyzer)
-          (setq lsp-restart 'ignore)
           ;;(add-hook 'flycheck-mode-hook #'flycheck-rust-setup)
           ;;(add-to-list 'projectile-project-root-files-bottom-up "Cargo.toml")
-          ))
+          (setq lsp-rust-server 'rust-analyzer)
+          (setq lsp-restart 'ignore)))
+
+;;------------------------------------------------------------------------------------
+;; Language - Haskell
+;;------------------------------------------------------------------------------------
+
+(use-package haskell-mode
+  :mode (("\\.hs\\'" . haskell-mode)
+         ("\\.cabal\\'" . haskell-mode))
+  :bind (("C-c t" . haskell-insert-type)
+         ("C-c l" . haskell-process-load-file)
+         ("M-z" . haskell-interactive-mode-clear)
+         ("<return>" . align-newline))
+  :hook ((haskell-mode-hook . interactive-haskell-mode))
+  :custom ((haskell-process-log t)))
 
 
-;; Haskell
+(use-package lsp-haskell
+  :hook ((haskell-mode . lsp)
+         (haskell-literate . lsp)))
 
-;;(setq haskell-process-args-ghci '("-interactive-print=Text.Pretty.Simple.pPrint"))
-;;(setq haskell-interactive-mode-collapse t);;
 
-(setq-default abbrev-mode t)
-
+;; Abreviations to save my wrists
 (define-abbrev-table 'haskell-mode-abbrev-table
   '(("imq"  "import qualified")
     ("fm" "<$>")
@@ -230,20 +202,37 @@
     ("eql"  "==")
     ("la"  "<-")
     ("ra"  "->")
-    )
-      "Unicode characters I use all the time.")
+    ) "Haskell shortcuts")
 
 
-(setq haskell-process-log t)
+(defun haskell-insert-type ()
+  (interactive)
+  (haskell-process-do-type t))
 
-(use-package haskell-mode
-  :bind
-  ("C-c t" . haskell-insert-type)
-  ("C-c l" . haskell-process-load-file)
-  ("M-z" . haskell-interactive-mode-clear)
-  ("<return>" . align-newline)
-  :mode (("\\.hs\\'" . haskell-mode)
-         ("\\.cabal\\'" . haskell-mode)))
+
+;; (add-hook 'project-find-functions #'cabal-root)
+
+;; (defun cabal-root (dir)
+;;   (message default-directory)
+;;   (when-let ((root (find-cabal-directory default-directory)))
+;;     (message root)
+;;     (cons 'cabal root)))
+
+;; (cl-defmethod project-roots ((project (head cabal)))
+;;   (list (cdr project)))
+
+;; (cl-defun find-cabal-directory (directory &optional (depth 10))
+;;   "Find the first file in the current DIRECTORY or a parent of DIRECTORY that includes a .cabal file."
+;;   (message "Search" directory)
+;;   (message directory)
+;;   (let ((fname (directory-file-name directory)))
+;;     (or
+;;      (and (cl-find-if #'(lambda (file) (string-equal "cabal" (file-name-extension file)))
+;;                       (directory-files directory))
+;;           directory)
+;;      (and (> depth 0)
+;;           (file-name-directory fname)
+;;           (find-cabal-directory (file-name-directory fname) (1- depth))))))
 
 
 ;; This works, but we really need to have a linter to do this 
@@ -284,133 +273,44 @@
 ;; 	(forward-line -1))
 ;;       (align (point) end))))
 
-(defun haskell-insert-type ()
-  (interactive)
-  (haskell-process-do-type t))
 
-(require 'lsp-haskell)
-(add-hook 'haskell-mode-hook #'lsp)
-(add-hook 'haskell-literate-mode-hook #'lsp)
-
-
-(add-hook 'haskell-mode-hook 'interactive-haskell-mode)
-
-(defun cabal-root (dir)
-  (message default-directory)
-  (when-let ((root (find-cabal-directory default-directory)))
-    (message root)
-    (cons 'cabal root)))
-
-(add-hook 'project-find-functions #'cabal-root)
-
-
-(cl-defmethod project-roots ((project (head cabal)))
-  (list (cdr project)))
-
-
-(cl-defun find-cabal-directory (directory &optional (depth 10))
-  "Find the first file in the current DIRECTORY or a parent of DIRECTORY that includes a .cabal file."
-  (message "Search" directory)
-  (message directory)
-  (let ((fname (directory-file-name directory)))
-    (or
-     (and (cl-find-if #'(lambda (file) (string-equal "cabal" (file-name-extension file)))
-                      (directory-files directory))
-          directory)
-     (and (> depth 0)
-          (file-name-directory fname)
-          (find-cabal-directory (file-name-directory fname) (1- depth))))))
-
-
-;; (use-package eglot-mode
-;;   ;;:ensure t
-;;   :bind
-;;   ;;("C-c f" . eglot-code-actions)
-;;   :init
-;;   (setq project-current-inhibit-prompt nil))
-
-;; (setq eglot-workspace-configuration
-;;       '((haskell
-;;          (formattingProvider . "stylish-haskell"))))
-
-;; (defun eglot-code-action-import (beg &optional end)
-;;   ;;(format "Execute '%s' code actions between BEG and END." kind)
-;;   (interactive (eglot--region-bounds))
-;;   (eglot-code-actions beg end "quickfix.import.extend.list.topLevel"))
-
-(use-package flymake-diagnostic-at-point
-  :after flymake
-  :custom
-  (flymake-diagnostic-at-point-timer-delay 0.1)
-  (flymake-diagnostic-at-point-error-prefix "> ")
-  (flymake-diagnostic-at-point-display-diagnostic-function 'flymake-diagnostic-at-point-display-popup)
-  :hook
-    (flymake-mode . flymake-diagnostic-at-point-mode))
-
-
-;; (use-package dap-mode
-;;   :ensure t :after lsp-mode
-;;   :config
-;;   (dap-mode t)
-;;   (dap-ui-mode t))
-
-
-;; (use-package rustic
-;;   :ensure t
-;;   :bind
-;;   ("C-c k" . rustic-recompile)
-;;   ;;("C-c t" . rust-test)
-;;   ("C-c f" . helm-lsp-code-actions)
-;;   :custom
-;;   (rustic-ansi-faces
-;;    ["black"
-;;     "deeppink2"
-;;     "springgreen1"
-;;     "lightgoldenrod2"
-;;     "deepskyblue1"
-;;     "magenta3"
-;;     "cyan3"
-;;     "white"])
-;;   :init 
-;;   ;;(add-to-list 'projectile-project-root-files-bottom-up "Cargo.toml")
-;;   )
-;; ;;(add-to-list 'projectile-project-root-files-bottom-up "Cargo.toml")
-
+;;------------------------------------------------------------------------------------
+;; Language - Web
+;;------------------------------------------------------------------------------------
 
 (use-package web-mode
   :mode (("\\.tsx\\'" . web-mode)
          ("\\.html\\'" . web-mode)
          ("\\.json\\'" . web-mode))
-  :config
-  (add-to-list 'auto-mode-alist '("\\.html\\'" . web-mode))
-  (add-to-list 'auto-mode-alist '("\\.tsx\\'" . web-mode))
-  :custom
-  (web-mode-markup-indent-offset 2)
-  (web-mode-css-indent-offset 2)
-  (web-mode-code-indent-offset 2))
-
-(add-hook 'web-mode-hook
-          (lambda ()
-            (define-key web-mode-map (kbd "M-;") nil)
-            (define-key web-mode-map (kbd "M-:") nil)
-            (when (string-equal "tsx" (file-name-extension buffer-file-name))
-              (tide-mode)
-              (tide-setup)
-              )))
-
-;;(flycheck-add-mode 'typescript-tslint 'web-mode)
+  :config ((add-to-list 'auto-mode-alist '("\\.html\\'" . web-mode))
+           (add-to-list 'auto-mode-alist '("\\.tsx\\'" . web-mode)))
+  :custom ((web-mode-markup-indent-offset 2)
+           (web-mode-css-indent-offset 2)
+           (web-mode-code-indent-offset 2))
+  :hook ((web-mode . setup-tsx-tide-hook)
+         (web-mode . (lambda ()
+                       (define-key web-mode-map (kbd "M-;") nil)
+                       (define-key web-mode-map (kbd "M-:") nil)))))
 
 
-;;;; Typescript
+(defun setup-tsx-tide-hook ()
+  (when (string-equal "tsx" (file-name-extension buffer-file-name))
+    (tide-mode)
+    (tide-setup)))
 
-(defun eslint-fix ()
-  "Apply linter."
-  (interactive)
-  (shell-command (concat "npx tslint --fix " (buffer-file-name)))
-  ;;(shell-command (concat "npx prettier --write " (buffer-file-name)))
-  (revert-buffer t t))
+;;------------------------------------------------------------------------------------
+;; Language - Typescript
+;;------------------------------------------------------------------------------------
+
+(use-package typescript-mode
+  :mode (("\\.ts\\'" . typescript-mode))
+  ;;:init
+  ;;(add-hook 'after-save-hook #'eslint-fix) -- too slow
+  :hook ((typescript-mode . tide-setup)
+         (typescript-mode . flycheck-mode)))
 
 
+;; TsServer interop
 (use-package tide
   :bind
   ("C-c f" . tide-fix)
@@ -430,9 +330,86 @@
   :after (typescript-mode company flycheck)
   :hook ((typescript-mode . tide-setup)))
 
-;; autopair
-;;(run-with-idle-timer 0 nil (lambda () (require 'autopair)))
-;;(run-with-idle-timer 0 nil (lambda () (autopair-global-mode)))
+
+(defun tslint-fix ()
+  "Apply linter."
+  (interactive)
+  (shell-command (concat "npx tslint --fix " (buffer-file-name)))
+  ;;(shell-command (concat "npx prettier --write " (buffer-file-name)))
+  (revert-buffer t t))
+
+;;------------------------------------------------------------------------------------
+;; Language - GLSL Shaders
+;;------------------------------------------------------------------------------------
+
+(defun glsl-define-checker ()
+  (flycheck-define-checker glsl-lang-validator
+    "A GLSL checker using glslangValidator.
+   See URL https://www.khronos.org/opengles/sdk/tools/Reference-Compiler/"
+    :command ("glslangValidator" source)
+    :error-patterns
+    ((error line-start "ERROR: " column ":" line ": " (message) line-end))
+    :modes glsl-mode)
+
+  (add-to-list 'flycheck-checkers 'glsl-lang-validator))
 
 
-;;; emacs-packages ends here
+(use-package glsl-mode
+  :init (glsl-define-checker))
+
+
+;;------------------------------------------------------------------------------------
+;; Language - Common Lisp
+;;------------------------------------------------------------------------------------
+
+;; (add-to-list 'load-path "~/.emacs.d/lisp/slime")
+;; (add-to-list 'load-path "~/.emacs.d/lisp/sly")
+;; (add-to-list 'load-path "~/.emacs.d/lisp/sly-stepper")
+;; (add-to-list 'load-path "~/.emacs.d/lisp/sly-asdf")
+
+;;(require 'sly-autoloads)
+;;(require 'sly-stepper-autoloads)
+
+(use-package sly)
+(use-package sly-asdf)
+
+(add-to-list 'sly-contribs 'sly-asdf 'append)
+
+(setq inferior-lisp-program "sbcl")
+
+(add-hook 'sly-mrepl-mode-hook 'sly-repl-bindings)
+(add-hook 'sly-mode-hook 'sly-bindings)
+
+(defun find-current-system ()
+  "Find the name of the current asd system."
+  (let ((system-file (find-system-file default-directory)))
+    (when system-file
+      (file-name-base system-file))))
+
+
+(defun find-system-file (directory)
+  "Find the first file in the current DIRECTORY or a parent of DIRECTORY that includes a .asd file."
+  (let ((fname (directory-file-name directory)))
+    (or
+     (cl-find-if #'(lambda (file) (string-equal "asd" (file-name-extension file)))
+                 (directory-files directory))
+     (and (file-name-directory fname) 
+          (find-system-file (file-name-directory fname))))))
+
+
+(defun sly-reload-project ()
+  (interactive)
+  ;;(sly-mrepl--eval-for-repl `(asdf:load-system ,(find-current-system))))
+  (sly-asdf-load-system (find-current-system)))
+
+
+(defun sly-repl-bindings ()
+  (define-key sly-mrepl-mode-map (kbd "C-p c") 'sly-reload-project)
+  (define-key sly-mrepl-mode-map (kbd "C-c l") 'sly-mrepl-sync)
+  (define-key sly-mrepl-mode-map (kbd "M-z") 'sly-mrepl-clear-repl))
+
+
+(defun sly-bindings ()
+  (define-key sly-mode-map (kbd "C-p c") 'sly-reload-project)
+  (define-key sly-mode-map (kbd "C-c l") 'sly-mrepl-sync)
+  (define-key sly-mode-map (kbd "M-z") 'sly-mrepl-clear-repl))

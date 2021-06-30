@@ -16,6 +16,8 @@ This is different from `scroll-down-command' that scrolls a full screen."
   (interactive)
   (scroll-down 4))
 
+(global-unset-key (kbd "C-p"))
+
 
 ;;; Code:
 ;; Hotkey rebinds
