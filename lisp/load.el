@@ -1,13 +1,11 @@
 (defun load-config (path)
   (setq loads
-        '("visual.el"
-          "remove-unwanted-buffers.el"
+        '("theme.el"
           "half-page-scroll.el"
           "commands.el"
           "default.el"
           "templates.el"
           "packages.el"
-          "lang/cl.lisp"
           ))
   (dolist (file loads)
     (load-file (concat path file))))
