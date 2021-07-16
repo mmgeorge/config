@@ -184,7 +184,9 @@
          ("M-z" . haskell-interactive-mode-clear)
          ("<return>" . align-newline))
   :hook ((haskell-mode-hook . interactive-haskell-mode))
-  :custom ((haskell-process-log t)))
+  :custom ((haskell-process-log t)
+           (haskell-process-args-stack-ghci ;; +RTS -M128m
+            '("--ghci-options=-interactive-print=Text.Pretty.Simple.pPrint" "--no-build" "--no-load"))))
 
 
 (use-package lsp-haskell
