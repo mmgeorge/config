@@ -18,6 +18,8 @@
 ;; Common modes
 ;;------------------------------------------------------------------------------------
 
+(setq *lsp-server* 'lsp) ;; set to 'lsp or 'eglot
+
 ;; Syntax checking. Flymake (builtin) used instead for some modes
 (use-package flycheck
   ;; :init (global-flycheck-mode)
@@ -56,35 +58,37 @@
 
 
 ;; Mode for interacting with language servers that implement the Language Server Protocol
-(use-package lsp-mode
-  :bind
-  (("C-c f" . helm-lsp-code-actions))
-  :custom
-  ((lsp-headerline-breadcrumb-enable nil)
-   ;;(lsp-completion-enable-additional-text-edit nil)
-   ;;(lsp-log-io t)
-  (lsp-ui-doc-enable t)
-  (lsp-keep-workspace-alive nil)
-  (lsp-enable-snippet nil)
-  (lsp--auto-configure t )
-  (lsp-imenu-sort-methods '(position))
-  (lsp-ui-sideline-show-code-actions nil)
-  (lsp-ui-doc-max-height 4))
-  ;;:hook (haskell-mode . lsp)
-  :commands lsp)
+(when (eq *lsp-server* 'lsp)
+  (use-package lsp-mode
+    :bind
+    (("C-c f" . helm-lsp-code-actions))
+    :custom
+    ((lsp-headerline-breadcrumb-enable nil)
+     ;;(lsp-completion-enable-additional-text-edit nil)
+     ;;(lsp-log-io t)
+     (lsp-ui-doc-enable t)
+     (lsp-keep-workspace-alive nil)
+     (lsp-enable-snippet nil)
+     (lsp--auto-configure t )
+     (lsp-imenu-sort-methods '(position))
+     (lsp-ui-sideline-show-code-actions nil)
+     (lsp-ui-doc-max-height 4))
+    ;;:hook (haskell-mode . lsp)
+    :commands lsp)
 
 
-(use-package lsp-ui
-  :commands lsp-ui-mode)
+  (use-package lsp-ui
+    :commands lsp-ui-mode))
 
 
 ;; Vastly simpler version of lsp, in some cases easier to get working. However,
-;; not quite the same level of functionality 
-;; (use-package eglot-mode
-;;   :bind
-;;   ;;("C-c f" . eglot-code-actions)
-;;   :init
-;;   (setq project-current-inhibit-prompt nil))
+;; not quite the same level of functionality
+(when (eq *lsp-server* 'eglot) 
+  (use-package eglot
+    :bind
+    ;;("C-c f" . eglot-code-actions)
+    :init
+    (setq project-current-inhibit-prompt nil)))
 
 ;; (setq eglot-workspace-configuration
 ;;       '((haskell
@@ -117,8 +121,9 @@
   :init (helm-projectile-on))
 
 
-(use-package helm-lsp
-  :commands helm-lsp-workspace-symbol)
+(when (eq *lsp-server* 'lsp)
+  (use-package helm-lsp
+    :commands helm-lsp-workspace-symbol))
 
 
 ;; compilation-mode
@@ -183,15 +188,25 @@
          ("C-c l" . haskell-process-load-file)
          ("M-z" . haskell-interactive-mode-clear)
          ("<return>" . align-newline))
-  :hook ((haskell-mode-hook . interactive-haskell-mode))
+  ;;:hook (;;(haskell-mode-hook . interactive-haskell-mode)
+         ;;(haskell-mode-hook . eglot-ensure)
+    ;;     )
   :custom ((haskell-process-log t)
-           (haskell-process-args-stack-ghci ;; +RTS -M128m
-            '("--ghci-options=-interactive-print=Text.Pretty.Simple.pPrint" "--no-build" "--no-load"))))
+           ;(haskell-process-args-stack-ghci ;; +RTS -M128m
+            ;'("--ghci-options=-interactive-print=Text.Pretty.Simple.pPrint" "--no-build" "--no-load")
+
+            ;)
+           ))
 
 
-(use-package lsp-haskell
-  :hook ((haskell-mode . lsp)
-         (haskell-literate . lsp)))
+(when (eq *lsp-server* 'eglot)
+  (add-hook 'haskell-mode-hook 'eglot-ensure))
+
+
+(when (eq *lsp-server* 'lsp)
+  (use-package lsp-haskell
+    :hook ((haskell-mode . lsp)
+           (haskell-literate . lsp))))
 
 
 ;; Abreviations to save my wrists
@@ -212,29 +227,29 @@
   (haskell-process-do-type t))
 
 
-;; (add-hook 'project-find-functions #'cabal-root)
+(add-hook 'project-find-functions #'cabal-root)
 
-;; (defun cabal-root (dir)
-;;   (message default-directory)
-;;   (when-let ((root (find-cabal-directory default-directory)))
-;;     (message root)
-;;     (cons 'cabal root)))
+(defun cabal-root (dir)
+  (message default-directory)
+  (when-let ((root (find-cabal-directory default-directory)))
+    (message root)
+    (cons 'cabal root)))
 
-;; (cl-defmethod project-roots ((project (head cabal)))
-;;   (list (cdr project)))
+(cl-defmethod project-roots ((project (head cabal)))
+  (list (cdr project)))
 
-;; (cl-defun find-cabal-directory (directory &optional (depth 10))
-;;   "Find the first file in the current DIRECTORY or a parent of DIRECTORY that includes a .cabal file."
-;;   (message "Search" directory)
-;;   (message directory)
-;;   (let ((fname (directory-file-name directory)))
-;;     (or
-;;      (and (cl-find-if #'(lambda (file) (string-equal "cabal" (file-name-extension file)))
-;;                       (directory-files directory))
-;;           directory)
-;;      (and (> depth 0)
-;;           (file-name-directory fname)
-;;           (find-cabal-directory (file-name-directory fname) (1- depth))))))
+(cl-defun find-cabal-directory (directory &optional (depth 10))
+  "Find the first file in the current DIRECTORY or a parent of DIRECTORY that includes a .cabal file."
+  (message "Search" directory)
+  (message directory)
+  (let ((fname (directory-file-name directory)))
+    (or
+     (and (cl-find-if #'(lambda (file) (string-equal "cabal" (file-name-extension file)))
+                      (directory-files directory))
+          directory)
+     (and (> depth 0)
+          (file-name-directory fname)
+          (find-cabal-directory (file-name-directory fname) (1- depth))))))
 
 
 ;; This works, but we really need to have a linter to do this 
