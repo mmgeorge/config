@@ -18,11 +18,33 @@ This is different from `scroll-down-command' that scrolls a full screen."
 
 (global-unset-key (kbd "C-p"))
 
+(define-prefix-command 'find-key-map)
+
+(global-set-key (kbd "C-f") 'find-key-map)
+
+(define-key find-key-map (kbd "f") 'helm-find-files)
+(define-key find-key-map (kbd "d") 'switch-to-buffer)
+
+(define-prefix-command 'basic-key-map)
+
+(global-set-key (kbd "C-k") 'basic-key-map)
+
+(define-key basic-key-map (kbd "k") 'kill-current-buffer)
+(define-key basic-key-map (kbd "j") 'kill-buffer-and-window)
+(define-key basic-key-map (kbd "l") 'delete-window)
+(define-key basic-key-map (kbd ";") 'delete-other-windows)
+
+(global-set-key (kbd "C-x l") 'split-window-below)
+(global-set-key (kbd "C-x ;") 'split-window-right)
+
+
+;;(define-key basic-key-map (kbd "k") 'switch-to-buffer)
 
 ;;; Code:
 ;; Hotkey rebinds
 (global-set-key (kbd "M-1") 'helm-find-files)
 (global-set-key (kbd "M-2") 'switch-to-buffer)
+
 (global-set-key (kbd "C-<tab>") 'other-window)
 (global-set-key (kbd "M-o") 'other-window)
 
@@ -69,8 +91,8 @@ This is different from `scroll-down-command' that scrolls a full screen."
 (global-set-key (kbd "M-<down>") 'enlarge-window)
 (global-set-key (kbd "M-<up>") 'shrink-window)
 
-(global-set-key (kbd "C-k") 'shrink-window)
-(global-set-key (kbd "C-l") 'enlarge-window)
+;;(global-set-key (kbd "C-k") 'shrink-window)
+;;(global-set-key (kbd "C-l") 'enlarge-window)
 
 (global-set-key (kbd "M-;") 'forward-char)
 (global-set-key (kbd "M-:") 'forward-char)
