@@ -52,7 +52,9 @@
 ;; Allows for viewing project files (e.g.., find a file within git project)
 (use-package projectile
   :bind (("C-p g" . helm-projectile-grep)
-         ("C-p f" . helm-projectile-find-file))
+         ;;("C-p f" . helm-projectile-find-file)
+         ("M-o f" . helm-projectile-find-file)
+         )
   :init (projectile-mode)
   :custom ((projectile-enable-caching t)))
 
@@ -112,9 +114,34 @@
 (use-package helm
   :preface (require 'helm-config)
   :bind (("M-x" . 'helm-M-x)
-         ("M-2" . 'helm-buffers-list))
+         ;;("M-2" . 'helm-buffers-list))
+         ("C-f d" . 'helm-buffers-list)
+         ("f" . 'helm-next-source))
   :init (helm-mode 1)
-  :custom (helm-semantic-fuzzy-match t))
+  :custom ((helm-semantic-fuzzy-match t)
+           (helm-bookmark-show-location t)))
+
+(define-key helm-map (kbd "M-s") 'helm-previous-line)
+(define-key helm-map (kbd "M-d") 'helm-next-line)
+(define-key helm-map (kbd "M-a") 'helm-find-files-up-one-level)
+(define-key helm-map (kbd "M-f") 'helm-execute-persistent-action)
+(define-key helm-map (kbd "C-r") 'helm-find-files-rename)
+(define-key helm-map (kbd "M-/") 'helm-find-files-down-last-level); 
+
+;; Modify helm-bookmark to avoid prompting
+(require 'helm-bookmark)
+
+(defun helm-bookmark-run-delete-no-prompt ()
+  "Delete bookmark from keyboard."
+  (interactive)
+  (with-helm-alive-p
+      (helm-exit-and-execute-action 'helm-delete-marked-bookmarks)))
+
+(define-key helm-bookmark-map (kbd "C-d") 'helm-bookmark-run-delete-no-prompt)
+
+;; Faster alternative for text searching
+(use-package helm-ag
+  :bind (("C-p s" . 'helm-projectile-ag)))
 
 
 (use-package helm-projectile
@@ -194,7 +221,7 @@
          ("\\.cabal\\'" . haskell-mode))
   :bind (("C-c t" . haskell-insert-type)
          ("C-c l" . haskell-process-load-file)
-         ("M-z" . haskell-interactive-mode-clear)
+         ;;("M-z" . haskell-interactive-mode-clear)
          ("<return>" . align-newline))
   ;;:hook (;;(haskell-mode-hook . interactive-haskell-mode)
          ;;(haskell-mode-hook . eglot-ensure)
