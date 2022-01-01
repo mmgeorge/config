@@ -36,10 +36,13 @@
 (semantic-mode 0)
 
 ;; cua-mode
+(setq cua-remap-control-v nil)
+
 (cua-mode t)
 (setq cua-auto-tabify-rectangles nil) ;; Don't tabify after rectangle commands
 (setq cua-keep-region-after-copy t) ;; Standard Windows behaviour
 (transient-mark-mode 1)
+(setq cua-highlight-region-shift-only t)
 
 ;; ido-mode
 (run-with-idle-timer 0 nil (lambda () (ido-mode t)))
@@ -58,6 +61,9 @@
 
 (put 'dired-find-alternate-file 'disabled nil)
 (put 'erase-buffer 'disabled nil)
+
+;; bookmarks
+(setq bookmark-menu-confirm-deletion nil)
 
 ;;------------------------------------------------------------------------------------
 ;; Remove unwanted buffers
