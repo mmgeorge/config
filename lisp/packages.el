@@ -58,7 +58,6 @@
   :init (projectile-mode)
   :custom ((projectile-enable-caching t)))
 
-
 ;; Mode for interacting with language servers that implement the Language Server Protocol
 (when (eq *lsp-server* 'lsp)
   (use-package lsp-mode
@@ -157,6 +156,43 @@
 (setq compilation-scroll-output t)
 (setq compilation-scroll-output 'first-error)
 
+;; Modal editing
+(use-package modalka
+  :init (progn
+          (modalka-define-kbd "q" "M-q")
+          (modalka-define-kbd "w" "M-w")
+          (modalka-define-kbd "e" "M-e")
+          (modalka-define-kbd "r" "M-r")
+          (modalka-define-kbd "t" "M-t")
+          (modalka-define-kbd "a" "M-a")
+          (modalka-define-kbd "s" "M-s")
+          (modalka-define-kbd "d" "M-d")
+          (modalka-define-kbd "f" "M-f")
+          (modalka-define-kbd "g" "M-g")
+          (modalka-define-kbd "z" "M-z")
+          (modalka-define-kbd "x" "M-x")
+          (modalka-define-kbd "c" "M-c")
+          (modalka-define-kbd "v" "M-v")
+          (modalka-define-kbd "b" "M-b")
+          (modalka-define-kbd "f" "M-f")
+          (modalka-define-kbd "f" "M-f")
+
+          (modalka-define-kbd "y" "M-y")
+          (modalka-define-kbd "u" "M-u")
+          (modalka-define-kbd "i" "M-i")
+          (modalka-define-kbd "o" "M-o")
+          (modalka-define-kbd "p" "M-p")
+          (modalka-define-kbd "h" "M-h")
+          (modalka-define-kbd "j" "M-j")
+          (modalka-define-kbd "k" "M-k")
+          (modalka-define-kbd "l" "M-l")
+          (modalka-define-kbd ";" "M-;")
+          (modalka-define-kbd "n" "M-n")
+          (modalka-define-kbd "m" "M-m")
+          (modalka-define-kbd "," "M-,")
+          (modalka-define-kbd "." "M-.")
+          (modalka-define-kbd "/" "M-/")))
+
 ;;------------------------------------------------------------------------------------
 ;; Language - Config/Nginx - Editing nginx configuration files
 ;;------------------------------------------------------------------------------------
@@ -215,22 +251,22 @@
 ;;------------------------------------------------------------------------------------
 ;; Language - Haskell
 ;;------------------------------------------------------------------------------------
-
+ 
 (use-package haskell-mode
   :mode (("\\.hs\\'" . haskell-mode)
          ("\\.cabal\\'" . haskell-mode))
   :bind (("C-c t" . haskell-insert-type)
          ("C-c l" . haskell-process-load-file)
-         ;;("M-z" . haskell-interactive-mode-clear)
+         ("M-z" . haskell-interactive-mode-clear)
          ("<return>" . align-newline))
   ;;:hook (;;(haskell-mode-hook . interactive-haskell-mode)
          ;;(haskell-mode-hook . eglot-ensure)
     ;;     )
   :custom ((haskell-process-log t)
-           ;(haskell-process-args-stack-ghci ;; +RTS -M128m
-            ;'("--ghci-options=-interactive-print=Text.Pretty.Simple.pPrint" "--no-build" "--no-load")
+           (haskell-process-args-stack-ghci ;; +RTS -M128m
+            '("--ghci-options=-interactive-print=Text.Pretty.Simple.pPrint" "--no-build" "--no-load")
 
-            ;)
+            )
            ))
 
 

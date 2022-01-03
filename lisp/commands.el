@@ -108,14 +108,18 @@ the cursor by ARG lines."
 (global-unset-key (kbd "M-m"))
 (global-unset-key (kbd "M-/"))
 
+(global-set-key (kbd "M-i c") 'comment-or-uncomment-region)
+
+(global-set-key (kbd "C-h") 'kill-whole-line)
+
 (global-set-key (kbd "M-m") 'back-to-indentation)
 (global-set-key (kbd "M-/") 'move-end-of-line)
-(global-set-key (kbd "M-z") 'back-to-indentation)
+;;(global-set-key (kbd "M-z") 'back-to-indentation)
 (global-set-key (kbd "M-v") 'move-end-of-line)
 
 ;;(global-set-key (kbd "M-u") 'back-to-indentation)
 ;;(global-set-key (kbd "M-p") 'move-end-of-line)
-(global-set-key (kbd "C-h") 'kill-whole-line)
+;;(global-set-key (kbd "C-h") 'kill-whole-line)
 (global-set-key (kbd "M-h") 'kill-word)
 (global-set-key (kbd "M-u") 'cua-copy-deselect)
 (global-set-key (kbd "M-y") 'cua-paste)
