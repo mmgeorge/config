@@ -156,42 +156,12 @@
 (setq compilation-scroll-output t)
 (setq compilation-scroll-output 'first-error)
 
-;; Modal editing
-(use-package modalka
-  :init (progn
-          (modalka-define-kbd "q" "M-q")
-          (modalka-define-kbd "w" "M-w")
-          (modalka-define-kbd "e" "M-e")
-          (modalka-define-kbd "r" "M-r")
-          (modalka-define-kbd "t" "M-t")
-          (modalka-define-kbd "a" "M-a")
-          (modalka-define-kbd "s" "M-s")
-          (modalka-define-kbd "d" "M-d")
-          (modalka-define-kbd "f" "M-f")
-          (modalka-define-kbd "g" "M-g")
-          (modalka-define-kbd "z" "M-z")
-          (modalka-define-kbd "x" "M-x")
-          (modalka-define-kbd "c" "M-c")
-          (modalka-define-kbd "v" "M-v")
-          (modalka-define-kbd "b" "M-b")
-          (modalka-define-kbd "f" "M-f")
-          (modalka-define-kbd "f" "M-f")
-
-          (modalka-define-kbd "y" "M-y")
-          (modalka-define-kbd "u" "M-u")
-          (modalka-define-kbd "i" "M-i")
-          (modalka-define-kbd "o" "M-o")
-          (modalka-define-kbd "p" "M-p")
-          (modalka-define-kbd "h" "M-h")
-          (modalka-define-kbd "j" "M-j")
-          (modalka-define-kbd "k" "M-k")
-          (modalka-define-kbd "l" "M-l")
-          (modalka-define-kbd ";" "M-;")
-          (modalka-define-kbd "n" "M-n")
-          (modalka-define-kbd "m" "M-m")
-          (modalka-define-kbd "," "M-,")
-          (modalka-define-kbd "." "M-.")
-          (modalka-define-kbd "/" "M-/")))
+;; Window resizing
+(use-package windsize
+  :bind (("C-k a" . 'windsize-left)
+         ("C-k f" . 'windsize-right)
+         ("C-k s" . 'windsize-up)
+         ("C-k d" . 'windsize-down)))
 
 ;;------------------------------------------------------------------------------------
 ;; Language - Config/Nginx - Editing nginx configuration files
