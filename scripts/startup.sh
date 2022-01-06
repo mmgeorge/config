@@ -96,8 +96,6 @@ if ! shopt -oq posix; then
   fi
 fi
 
-<<<<<<< HEAD
 EDITOR=emacs
-=======
-export GHCRTS='-M1G'
->>>>>>> ee9a59bb28bef52ea24acbb683d6f0469aa10b1a
+
+#export GHCRTS='-M1G'

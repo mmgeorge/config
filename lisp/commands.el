@@ -41,6 +41,7 @@ the cursor by ARG lines."
 (global-unset-key (kbd "M-r"))
 (global-unset-key (kbd "M-v"))
 (global-unset-key (kbd "M-z"))
+;;(global-unset-key (kbd "C-i"))
 
 ;; Find commands
 (define-prefix-command 'find-key-map)
@@ -69,6 +70,8 @@ the cursor by ARG lines."
 (define-key mark-key-map (kbd "M-p") 'mark-page)
 (define-key mark-key-map (kbd "M-d") 'mark-defun)
 (define-key mark-key-map (kbd "M-i") 'cua-set-mark)
+(define-key mark-key-map (kbd "C-i") 'kill-region)
+
 (define-key mark-key-map (kbd "M-l") 'select-current-line-and-forward-line)
 (define-key mark-key-map (kbd "s") 'mark-sexp)
 (define-key mark-key-map (kbd "p") 'mark-page)
@@ -77,11 +80,11 @@ the cursor by ARG lines."
 (define-key mark-key-map (kbd "l") 'select-current-line-and-forward-line)
 
 ;; Kill commands
-
 (define-prefix-command 'basic-key-map)
 (global-set-key (kbd "C-k") 'basic-key-map)
-(define-key basic-key-map (kbd "k") 'kill-current-buffer)
-(define-key basic-key-map (kbd "a") 'kill-buffer-and-window)
+(define-key basic-key-map (kbd "b") 'kill-current-buffer)
+(define-key basic-key-map (kbd "r s") 'replace-string)
+;;(define-key basic-key-map (kbd "a") 'kill-buffer-and-window)
 (define-key basic-key-map (kbd "w") 'delete-window)
 (define-key basic-key-map (kbd "o") 'delete-other-windows)
 
@@ -109,6 +112,7 @@ the cursor by ARG lines."
 (global-unset-key (kbd "M-/"))
 
 (global-set-key (kbd "M-i c") 'comment-or-uncomment-region)
+(global-set-key (kbd "M-i M-c") 'comment-or-uncomment-region)
 
 (global-set-key (kbd "C-h") 'kill-whole-line)
 
