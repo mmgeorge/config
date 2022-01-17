@@ -52,7 +52,7 @@
 ;; Allows for viewing project files (e.g.., find a file within git project)
 (use-package projectile
   :bind (("C-p g" . helm-projectile-grep)
-         ;;("C-p f" . helm-projectile-find-file)
+         ("C-p f" . helm-projectile-find-file)
          ("M-o f" . helm-projectile-find-file)
          )
   :init (projectile-mode)
@@ -113,12 +113,43 @@
 (use-package helm
   :preface (require 'helm-config)
   :bind (("M-x" . 'helm-M-x)
-         ;;("M-2" . 'helm-buffers-list))
+         ("C-;" . 'helm-M-x)
          ("C-f d" . 'helm-buffers-list)
+         ("C-s" . 'helm-occur)
          ("f" . 'helm-next-source))
   :init (helm-mode 1)
   :custom ((helm-semantic-fuzzy-match t)
            (helm-bookmark-show-location t)))
+
+
+(defun helm-imenu-candidates-override (&optional buffer)
+  (with-current-buffer (or buffer helm-current-buffer)
+    (let ((tick (buffer-modified-tick)))
+      (if (eq helm-cached-imenu-tick tick)
+          helm-cached-imenu-candidates
+        (setq imenu--index-alist nil)
+        (prog1 (setq helm-cached-imenu-candidates
+                     (let ((index (cl-remove-if
+                                   (lambda (list)
+                                     (message "%s" (car list))
+                                     (or (cl-search "alias" (car list))
+                                         (cl-search "const" (car list))
+                                         (cl-search "alias" (car list))))
+                                   (imenu--make-index-alist t))))
+                       (helm-imenu--candidates-1
+                        (delete (assoc "*Rescan*" index) index))))
+          (setq helm-cached-imenu-tick tick))))))
+
+
+(advice-add 'helm-imenu-candidates :override #'helm-imenu-candidates-override)
+
+(global-set-key (kbd "C-s") 'helm-occur)
+
+(define-key mark-key-map (kbd "M-r") 'helm-mark-ring)
+(define-key mark-key-map (kbd "r") 'helm-mark-ring)
+
+(define-key find-key-map (kbd "M-r") 'helm-register)
+(define-key find-key-map (kbd "r") 'helm-register)
 
 (define-key helm-map (kbd "M-s") 'helm-previous-line)
 (define-key helm-map (kbd "M-d") 'helm-next-line)
@@ -142,6 +173,9 @@
 (use-package helm-ag
   :bind (("C-p s" . 'helm-projectile-ag)))
 
+(define-key find-key-map (kbd "M-g") 'helm-ag)
+(define-key find-key-map (kbd "g") 'helm-ag)
+
 
 (use-package helm-projectile
   :init (helm-projectile-on))
@@ -162,6 +196,57 @@
          ("C-k f" . 'windsize-right)
          ("C-k s" . 'windsize-up)
          ("C-k d" . 'windsize-down)))
+
+
+(use-package multiple-cursors
+  :bind (:map cursor-key-map
+              ("d" . mmc/mark-all-like-this-in-defun)
+              ("M-d" . mc/mark-all-like-this-in-defun)
+              ("s" . mc/mark-all-symbols-like-this-in-defun)
+              ("M-s" . mc/mark-all-symbols-like-this-in-defun)
+              ("n" . mc/insert-numbers)
+              ("M-n" . mc/insert-numbers)
+              ("l" . mc/edit-lines)
+              ("M-l" . mc/edit-lines)
+              ("m" . mc/edit-beginnings-of-lines)
+              ("M-m" . mc/edit-beginnings-of-lines)
+              ("b" . mc/mark-all-symbols-like-this)
+              ("M-b" . mc/mark-all-symbols-like-this)
+              ("i" . mc/mark-more-like-this-extended)
+              ("M-i" . mc/mark-more-like-this-extended))
+  :custom ((mc/always-repeat-command t)
+           (mc/always-run-for-all t)))
+
+
+;; Iteratively expand the selected region
+(use-package expand-region
+  :bind (:map mark-key-map
+              ("k" . er/expand-region)
+              ("M-k" . er/expand-region))
+  :custom
+  (expand-region-contract-fast-key "M-l")
+  (expand-region-smart-cursor t))
+
+
+;; Override function to allow also using the meta+key to repeat expansion
+(defun prepare-for-more-expansions-with-meta (repeat-key-str)
+  "Return bindings and a message to inform user about them"
+  (let ((msg (format "Type %s or M-%s to expand again" repeat-key-str repeat-key-str))
+        (bindings (list (cons repeat-key-str '(er/expand-region 1))
+                        (cons (concat "M-" repeat-key-str) '(er/expand-region 1)))))
+    ;; If contract and expand are on the same binding, ignore contract
+    (unless (string-equal repeat-key-str expand-region-contract-fast-key)
+      (setq msg (concat msg (format ", %s to contract" expand-region-contract-fast-key)))
+      (push (cons expand-region-contract-fast-key '(er/contract-region 1)) bindings))
+    ;; If reset and either expand or contract are on the same binding, ignore reset
+    (unless (or (string-equal repeat-key-str expand-region-reset-fast-key)
+                (string-equal expand-region-contract-fast-key expand-region-reset-fast-key))
+      (setq msg (concat msg (format ", %s to reset" expand-region-reset-fast-key)))
+      (push (cons expand-region-reset-fast-key '(er/expand-region 0)) bindings))
+    (cons msg bindings)))
+
+
+(advice-add 'er/prepare-for-more-expansions-internal :override #'prepare-for-more-expansions-with-meta)
 
 ;;------------------------------------------------------------------------------------
 ;; Language - Config/Nginx - Editing nginx configuration files
