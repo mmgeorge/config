@@ -1,18 +1,30 @@
 (require 'package)
+
 (require 'cl-lib)
 
 ;;------------------------------------------------------------------------------------
 ;; Package Loading
 ;;------------------------------------------------------------------------------------
 
-(add-to-list
- 'package-archives
- '("melpa" . "http://melpa.org/packages/")
- '("gnu" . "http://elpa.gnu.org/packages/"))
+(add-to-list 'package-archives '("melpa" . "http://melpa.org/packages/") t)
+(add-to-list 'package-archives '("gnu"   . "http://elpa.gnu.org/packages/") t)
 
+(package-initialize)  
+
+(unless package-archive-contents     ; Unless a package archive already exists,
+  (package-refresh-contents))        ; Refresh package contents so that Emacs knows which packages to load
+
+
+;; Initialize use-package on non-linux platforms
+(unless (package-installed-p 'use-package)        ; Unless "use-package" is installed, install "use-packa
+  (package-install 'use-package))
+
+(require 'use-package)                            ; Once it's installed, we load it using require
 (require 'use-package-ensure)
 
-(setq use-package-always-ensure t) ;; Always make sure we have any package that we use
+;; Make sure packages are downloaded and installed before they are run
+;; also frees you from having to put :ensure t after installing EVERY PACKAGE.
+(setq use-package-always-ensure t)
 
 ;;------------------------------------------------------------------------------------
 ;; Common modes
@@ -22,7 +34,7 @@
 
 ;; Syntax checking. Flymake (builtin) used instead for some modes
 (use-package flycheck
-  ;; :init (global-flycheck-mode)
+  :init (global-flycheck-mode)
   :custom ((flycheck-check-syntax-automatically '(save mode-enable))
            (flycheck-idle-change-delay 1)))
 
@@ -58,6 +70,8 @@
   :init (projectile-mode)
   :custom ((projectile-enable-caching t)))
 
+;;(add-to-list 'projectile-project-root-files-bottom-up "package.json")
+
 ;; Mode for interacting with language servers that implement the Language Server Protocol
 (when (eq *lsp-server* 'lsp)
   (use-package lsp-mode
@@ -74,7 +88,7 @@
      (lsp-imenu-sort-methods '(position))
      (lsp-ui-sideline-show-code-actions nil)
      (lsp-ui-doc-max-height 4))
-    ;;:hook (haskell-mode . lsp)
+    :hook (haskell-mode . lsp)
     :commands lsp)
 
 
@@ -114,9 +128,10 @@
   :preface (require 'helm-config)
   :bind (("M-x" . 'helm-M-x)
          ("C-;" . 'helm-M-x)
-         ("C-f d" . 'helm-buffers-list)
+         ;;("C-f d" . 'helm-buffers-list)
          ("C-s" . 'helm-occur)
-         ("f" . 'helm-next-source))
+         ;;("f" . 'helm-next-source)
+         )
   :init (helm-mode 1)
   :custom ((helm-semantic-fuzzy-match t)
            (helm-bookmark-show-location t)))
@@ -425,8 +440,6 @@
   :mode (("\\.tsx\\'" . web-mode)
          ("\\.html\\'" . web-mode)
          ("\\.json\\'" . web-mode))
-  :config ((add-to-list 'auto-mode-alist '("\\.html\\'" . web-mode))
-           (add-to-list 'auto-mode-alist '("\\.tsx\\'" . web-mode)))
   :custom ((web-mode-markup-indent-offset 2)
            (web-mode-css-indent-offset 2)
            (web-mode-code-indent-offset 2))
@@ -435,11 +448,11 @@
                        (define-key web-mode-map (kbd "M-;") nil)
                        (define-key web-mode-map (kbd "M-:") nil)))))
 
-
 (defun setup-tsx-tide-hook ()
   (when (string-equal "tsx" (file-name-extension buffer-file-name))
     (tide-mode)
-    (tide-setup)))
+    (tide-setup)
+    (setq flycheck-check-syntax-automatically '(save mode-enabled))))
 
 ;;------------------------------------------------------------------------------------
 ;; Language - Typescript
@@ -458,10 +471,11 @@
   :bind
   ("C-c f" . tide-fix)
   ("C-c l" . eslint-fix)
+  :init (add-to-list 'projectile-project-root-files-bottom-up "package.json")
   :custom
   ;; Use global install if applicable
-  (when (file-exists-p "/usr/bin/tsserver")
-    (tide-tsserver-executable "/usr/bin/tsserver"))
+  ;;(when (file-exists-p "/usr/bin/tsserver")
+    ;;(tide-tsserver-executable "/usr/bin/tsserver"))
   ;;(tide-completion-detailed t)
   (typescript-indent-level 2)
   (tide-format-options
