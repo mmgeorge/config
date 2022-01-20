@@ -73,6 +73,9 @@ the cursor by ARG lines."
 (define-key find-key-map (kbd "M-a") 'helm-find-files)
 (define-key find-key-map (kbd "M-s") 'helm-buffers-list)
 
+(define-key find-key-map (kbd "o") 'other-window)
+(define-key find-key-map (kbd "M-o") 'other-window)
+
 (define-key find-key-map (kbd "M-l") 'goto-line)
 (define-key find-key-map (kbd "l") 'goto-line)
 
