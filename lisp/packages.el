@@ -249,6 +249,16 @@
 (advice-add 'er/prepare-for-more-expansions-internal :override #'prepare-for-more-expansions-with-meta)
 
 ;;------------------------------------------------------------------------------------
+;; Git
+;;------------------------------------------------------------------------------------
+
+(use-package magit
+  :bind (:map magit-mode-map
+              ("RET" . magit-diff-visit-file-other-window)
+              ("M-f" . magit-section-toggle)
+              ("M-a" . magit-section-show-level-2)))
+
+;;------------------------------------------------------------------------------------
 ;; Language - Config/Nginx - Editing nginx configuration files
 ;;------------------------------------------------------------------------------------
 
