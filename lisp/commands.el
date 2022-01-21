@@ -141,6 +141,8 @@ the cursor by ARG lines."
 (define-key kill-key-map (kbd "o") 'delete-other-windows)
 (define-key kill-key-map (kbd "c") 'comment-line)
 
+(define-key kill-key-map (kbd "k") 'kill-buffer)
+
 ;; Window Split commands
 (global-set-key (kbd "C-x l") 'split-window-below)
 (global-set-key (kbd "C-x ;") 'split-window-right)
