@@ -52,7 +52,10 @@
 
 ;; Autocompletion
 (use-package company
-  :bind (("C-e" . company-complete))
+  :bind (("C-e" . company-complete)
+         :map company-active-map
+         ("M-s" . company-select-previous)
+         ("M-d" . company-select-next))
   :init (global-company-mode)
   :custom ((company-tooltip-align-annotations t)))
 
