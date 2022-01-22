@@ -272,7 +272,7 @@
 
 (use-package magit
   :bind (:map magit-mode-map
-              ("RET" . magit-diff-visit-file-other-window)
+              ("RET" . magit-diff-visit-worktree-file-other-window)
               ("M-f" . magit-section-toggle)
               ("M-a" . magit-section-show-level-2)))
 
