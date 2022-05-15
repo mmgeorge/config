@@ -2,6 +2,11 @@
 
 (require 'cl-lib)
 
+;; Natively compile packages when available
+(when (fboundp 'native-compile-async)
+  (setq comp-deferred-compilation t
+        comp-deferred-compilation-black-list '("/mu4e.*\\.el$")))
+
 ;;------------------------------------------------------------------------------------
 ;; Package Loading
 ;;------------------------------------------------------------------------------------
@@ -14,12 +19,10 @@
 (unless package-archive-contents     ; Unless a package archive already exists,
   (package-refresh-contents))        ; Refresh package contents so that Emacs knows which packages to load
 
-
-;; Initialize use-package on non-linux platforms
-(unless (package-installed-p 'use-package)        ; Unless "use-package" is installed, install "use-packa
+(unless (package-installed-p 'use-package)  ; Unless "use-package" is installed, install "use-package"
   (package-install 'use-package))
 
-(require 'use-package)                            ; Once it's installed, we load it using require
+(require 'use-package)                      ; Once it's installed, we load it using require
 (require 'use-package-ensure)
 
 ;; Make sure packages are downloaded and installed before they are run
@@ -60,16 +63,11 @@
   :custom ((company-tooltip-align-annotations t)))
 
 
-;;(use-package yasnippet
-  ;;:init (yas-global-mode 1))
-
-
 ;; Allows for viewing project files (e.g.., find a file within git project)
 (use-package projectile
   :bind (("C-p g" . helm-projectile-grep)
          ("C-p f" . helm-projectile-find-file)
-         ("M-o f" . helm-projectile-find-file)
-         )
+         ("M-o f" . helm-projectile-find-file))
   :init (projectile-mode)
   :custom ((projectile-enable-caching t)))
 
@@ -314,8 +312,11 @@
               (found (cdr (assq 'workspace_root js))))
     (cons 'eglot-project found)))
 
-(cl-defmethod project-roots ((project (head eglot-project)))
+(cl-defmethod project-root ((project (head eglot-project)))
   (list (cdr project)))
+
+;;(cl-defmethod project-roots ((project (head eglot-project)))
+  ;;(list (cdr project)))
 
 
 (use-package rust-mode
@@ -323,7 +324,11 @@
   :bind (("C-c k" . rust-compile)
          ("C-c t" . rust-test)
          ("C-c f" . helm-lsp-code-actions))
-  :custom ((lsp-rust-analyzer-diagnostics-enable nil))
+  :custom ((lsp-rust-analyzer-diagnostics-enable nil)
+           (lsp-rust-analyzer-cargo-target "wasm32-unknown-unknown")
+           (lsp-rust-analyzer-proc-macro-enable t)
+           (lsp-rust-analyzer-experimental-proc-attr-macros t)
+           )
   :init (progn
           ;; Warning! This seems fairly buggy 2020-08-10 is the last version that seems to work for me
           ;;(add-hook 'flycheck-mode-hook #'flycheck-rust-setup)
@@ -389,8 +394,11 @@
     (message root)
     (cons 'cabal root)))
 
-(cl-defmethod project-roots ((project (head cabal)))
+(cl-defmethod project-root  ((project (head cabal)))
   (list (cdr project)))
+
+;; (cl-defmethod project-roots ((project (head cabal)))
+  ;; (list (cdr project)))
 
 (cl-defun find-cabal-directory (directory &optional (depth 10))
   "Find the first file in the current DIRECTORY or a parent of DIRECTORY that includes a .cabal file."
