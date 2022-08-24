@@ -234,21 +234,29 @@
            (mc/always-run-for-all t)))
 
 
+
 ;; Iteratively expand the selected region
 (use-package expand-region
   :bind (:map mark-key-map
               ("k" . er/expand-region)
               ("M-k" . er/expand-region))
+  :init
+  ;; Add expand region support for TypeScript files edited with Tide
+  (require 'expand-region-core)
+  (require 'js-mode-expansions)
+  (er/enable-mode-expansions 'tide-mode 'er/add-js-mode-expansions)
+  ;; Inject override function
+  (advice-add 'er/prepare-for-more-expansions-internal :override #'prepare-for-more-expansions-with-meta)
   :custom
   (expand-region-contract-fast-key "M-l")
   (expand-region-smart-cursor t))
 
 
-;; Override function to allow also using the meta+key to repeat expansion
+;; Override function to use meta+key to repeat expansion, NOT just key
 (defun prepare-for-more-expansions-with-meta (repeat-key-str)
   "Return bindings and a message to inform user about them"
-  (let ((msg (format "Type %s or M-%s to expand again" repeat-key-str repeat-key-str))
-        (bindings (list (cons repeat-key-str '(er/expand-region 1))
+  (let ((msg (format "Type M-%s to expand again" repeat-key-str repeat-key-str))
+        (bindings (list ;; (cons repeat-key-str '(er/expand-region 1))
                         (cons (concat "M-" repeat-key-str) '(er/expand-region 1)))))
     ;; If contract and expand are on the same binding, ignore contract
     (unless (string-equal repeat-key-str expand-region-contract-fast-key)
@@ -262,7 +270,7 @@
     (cons msg bindings)))
 
 
-(advice-add 'er/prepare-for-more-expansions-internal :override #'prepare-for-more-expansions-with-meta)
+
 
 ;;------------------------------------------------------------------------------------
 ;; Git
@@ -316,8 +324,7 @@
   (list (cdr project)))
 
 ;;(cl-defmethod project-roots ((project (head eglot-project)))
-  ;;(list (cdr project)))
-
+;;(list (cdr project)))
 
 (use-package rust-mode
   :hook (rust-mode . lsp)
@@ -327,9 +334,10 @@
   :custom ((lsp-rust-analyzer-diagnostics-enable nil)
            (lsp-rust-analyzer-cargo-target "wasm32-unknown-unknown")
            (lsp-rust-analyzer-proc-macro-enable t)
-           (lsp-rust-analyzer-experimental-proc-attr-macros t)
-           )
+           (lsp-rust-analyzer-experimental-proc-attr-macros t))
   :init (progn
+          (setenv "RUSTFLAGS" "--cfg=web_sys_unstable_apis")
+
           ;; Warning! This seems fairly buggy 2020-08-10 is the last version that seems to work for me
           ;;(add-hook 'flycheck-mode-hook #'flycheck-rust-setup)
           ;;(add-to-list 'projectile-project-root-files-bottom-up "Cargo.toml")
@@ -468,6 +476,11 @@
          (web-mode . (lambda ()
                        (define-key web-mode-map (kbd "M-;") nil)
                        (define-key web-mode-map (kbd "M-:") nil)))))
+
+(define-abbrev-table 'web-mode-abbrev-table
+  '(("udef"  "useDefaults(arguments);")
+    ) "Web mode shortcuts")
+
 
 (defun setup-tsx-tide-hook ()
   (when (string-equal "tsx" (file-name-extension buffer-file-name))
