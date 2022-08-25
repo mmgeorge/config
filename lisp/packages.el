@@ -234,23 +234,23 @@
            (mc/always-run-for-all t)))
 
 
+(require 'expand-region-core)
+;; (require 'js2-mode-expansions)
 
 ;; Iteratively expand the selected region
 (use-package expand-region
   :bind (:map mark-key-map
               ("k" . er/expand-region)
-              ("M-k" . er/expand-region))
-  :init
-  ;; Add expand region support for TypeScript files edited with Tide
-  (require 'expand-region-core)
-  (require 'js-mode-expansions)
-  (er/enable-mode-expansions 'tide-mode 'er/add-js-mode-expansions)
-  ;; Inject override function
-  (advice-add 'er/prepare-for-more-expansions-internal :override #'prepare-for-more-expansions-with-meta)
+              ("M-k" . er/expand-region)
+              )
   :custom
   (expand-region-contract-fast-key "M-l")
   (expand-region-smart-cursor t))
 
+;; Causes a problem for the second file opened? 
+;; (er/enable-mode-expansions 'typescript-mode 'er/add-js2-mode-expansions)
+
+;; Inject override function
 
 ;; Override function to use meta+key to repeat expansion, NOT just key
 (defun prepare-for-more-expansions-with-meta (repeat-key-str)
@@ -270,7 +270,7 @@
     (cons msg bindings)))
 
 
-
+(advice-add 'er/prepare-for-more-expansions-internal :override #'prepare-for-more-expansions-with-meta)
 
 ;;------------------------------------------------------------------------------------
 ;; Git
