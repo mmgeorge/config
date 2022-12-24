@@ -128,7 +128,7 @@
 
 ;; Provides a great alternative to standard emacs menus for searching for files, commands, etc
 (use-package helm
-  :preface (require 'helm-config)
+;;  :preface (require 'helm-config)
   :bind (("M-x" . 'helm-M-x)
          ("C-;" . 'helm-M-x)
          ;;("C-f d" . 'helm-buffers-list)
@@ -236,7 +236,7 @@
            (mc/always-run-for-all t)))
 
 
-(require 'expand-region-core)
+;;(require 'expand-region-core)
 ;; (require 'js2-mode-expansions)
 
 ;; Iteratively expand the selected region
