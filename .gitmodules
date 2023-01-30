@@ -1,0 +1,3 @@
+[submodule "lisp/wgsl-mode"]
+	path = lisp/wgsl-mode
+	url = https://github.com/acowley/wgsl-mode.git

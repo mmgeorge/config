@@ -325,16 +325,40 @@
          ("C-c t" . rust-test)
          ("C-c f" . helm-lsp-code-actions))
   :custom ((lsp-rust-analyzer-diagnostics-enable nil)
-           (lsp-rust-analyzer-cargo-target "wasm32-unknown-unknown")
            (lsp-rust-analyzer-proc-macro-enable t)
            (lsp-rust-analyzer-experimental-proc-attr-macros t)
+           (lsp-rust-clippy-preference "on")
+           (lsp-rust-analyzer-cargo-watch-command "clippy")
+           (rust-indent-offset 2)
            )
   :init (progn
+;; (require 'lsp-mode)
+;;           ;; (setq lsp-rust-analyzer-cargo-target '("wasm32-unknown-unknown" "x86_64-pc-windows-gnu"))
+;;           (lsp-register-custom-settings
+;;            '(("rust.target" '("wasm32-unknown-unknown" "x86_64-pc-windows-gnu"))))
+          
+          ;; Needed for WASM + wgpu rust server when WGL not listed in features 
+          (setenv "RUSTFLAGS" "--cfg=web_sys_unstable_apis")
           ;; Warning! This seems fairly buggy 2020-08-10 is the last version that seems to work for me
           ;;(add-hook 'flycheck-mode-hook #'flycheck-rust-setup)
           ;;(add-to-list 'projectile-project-root-files-bottom-up "Cargo.toml")
           (setq lsp-rust-server 'rust-analyzer)
           (setq lsp-restart 'ignore)))
+
+(defun dont-insert-expansion-char ()  t)    ;; this is the "hook" function
+  (put 'dont-insert-expansion-char 'no-self-insert t)   ;; the hook should have a "no-self-insert"-property set
+
+(define-abbrev-table 'rust-mode-abbrev-table
+  '(("imq"  "import qualified")
+    ("fm" "<$>")
+    ("ff"  "$")
+    ("tis"  "::" dont-insert-expansion-char 0)
+    ("eql"  "==")
+    ("la"  "<-")
+    ("ra"  "->")
+    ("ja"  "->")
+    ("jja"  "=>")
+    ) "Rust shortcuts")
 
 ;;------------------------------------------------------------------------------------
 ;; Language - Haskell
