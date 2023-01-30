@@ -131,6 +131,12 @@ the cursor by ARG lines."
 (define-key mark-key-map (kbd "j") 'cursor-key-map)
 (define-key mark-key-map (kbd "M-j") 'cursor-key-map)
 
+(define-prefix-command 'window-key-map)
+(global-set-key (kbd "M-w") 'window-key-map)
+(define-key window-key-map (kbd "l") 'split-window-below)
+(define-key window-key-map (kbd ";") 'split-window-right)
+
+
 ;; Kill commands
 (define-prefix-command 'kill-key-map)
 (global-set-key (kbd "C-k") 'kill-key-map)

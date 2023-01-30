@@ -1,0 +1,9 @@
+# Add home permissions
+chmod 755 /home
+chmod 755 /home/$USER
+
+# Add user to www-data
+sudo usermod -aG www-datat $USER
+
+# Create link to home directory
+sudo ln -s /home/$USER/www [domain-name]
