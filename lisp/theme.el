@@ -8,7 +8,7 @@
 (menu-bar-mode -1)
 
 ;; Show line numbers
-(global-linum-mode t)
+;;(global-linum-mode t)
 
 (setq linum-format "%d ")
 

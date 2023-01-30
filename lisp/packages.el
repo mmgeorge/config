@@ -37,10 +37,12 @@
 
 ;; Syntax checking. Flymake (builtin) used instead for some modes
 (use-package flycheck
+  :bind (("M-e" . flycheck-next-error))
   :init (global-flycheck-mode)
   :custom ((flycheck-check-syntax-automatically '(save mode-enable))
            (flycheck-idle-change-delay 1)))
 
+(define-key window-key-map (kbd "e") 'flycheck-list-errors)
 
 ;; Syntax checking UI library for flymake
 (use-package flymake-diagnostic-at-point
@@ -126,7 +128,7 @@
 
 ;; Provides a great alternative to standard emacs menus for searching for files, commands, etc
 (use-package helm
-  :preface (require 'helm-config)
+;;  :preface (require 'helm-config)
   :bind (("M-x" . 'helm-M-x)
          ("C-;" . 'helm-M-x)
          ;;("C-f d" . 'helm-buffers-list)
@@ -234,21 +236,29 @@
            (mc/always-run-for-all t)))
 
 
+;;(require 'expand-region-core)
+;; (require 'js2-mode-expansions)
+
 ;; Iteratively expand the selected region
 (use-package expand-region
   :bind (:map mark-key-map
               ("k" . er/expand-region)
-              ("M-k" . er/expand-region))
+              ("M-k" . er/expand-region)
+              )
   :custom
   (expand-region-contract-fast-key "M-l")
   (expand-region-smart-cursor t))
 
+;; Causes a problem for the second file opened? 
+;; (er/enable-mode-expansions 'typescript-mode 'er/add-js2-mode-expansions)
 
-;; Override function to allow also using the meta+key to repeat expansion
+;; Inject override function
+
+;; Override function to use meta+key to repeat expansion, NOT just key
 (defun prepare-for-more-expansions-with-meta (repeat-key-str)
   "Return bindings and a message to inform user about them"
-  (let ((msg (format "Type %s or M-%s to expand again" repeat-key-str repeat-key-str))
-        (bindings (list (cons repeat-key-str '(er/expand-region 1))
+  (let ((msg (format "Type M-%s to expand again" repeat-key-str repeat-key-str))
+        (bindings (list ;; (cons repeat-key-str '(er/expand-region 1))
                         (cons (concat "M-" repeat-key-str) '(er/expand-region 1)))))
     ;; If contract and expand are on the same binding, ignore contract
     (unless (string-equal repeat-key-str expand-region-contract-fast-key)
@@ -272,7 +282,11 @@
   :bind (:map magit-mode-map
               ("RET" . magit-diff-visit-worktree-file-other-window)
               ("M-f" . magit-section-toggle)
-              ("M-a" . magit-section-show-level-2)))
+              ("M-a" . magit-section-show-level-2))
+  
+  )
+
+
 
 ;;------------------------------------------------------------------------------------
 ;; Language - Config/Nginx - Editing nginx configuration files
@@ -316,8 +330,7 @@
   (list (cdr project)))
 
 ;;(cl-defmethod project-roots ((project (head eglot-project)))
-  ;;(list (cdr project)))
-
+;;(list (cdr project)))
 
 (use-package rust-mode
   :hook (rust-mode . lsp)
@@ -493,6 +506,11 @@
                        (define-key web-mode-map (kbd "M-;") nil)
                        (define-key web-mode-map (kbd "M-:") nil)))))
 
+(define-abbrev-table 'web-mode-abbrev-table
+  '(("udef"  "useDefaults(arguments);")
+    ) "Web mode shortcuts")
+
+
 (defun setup-tsx-tide-hook ()
   (when (string-equal "tsx" (file-name-extension buffer-file-name))
     (tide-mode)
@@ -539,6 +557,40 @@
   (shell-command (concat "npx tslint --fix " (buffer-file-name)))
   ;;(shell-command (concat "npx prettier --write " (buffer-file-name)))
   (revert-buffer t t))
+
+;;------------------------------------------------------------------------------------
+;; Edit Indirect
+;;------------------------------------------------------------------------------------
+
+(use-package edit-indirect)
+
+(require 'edit-indirect)
+
+
+(defun custom-edit-indirect-save ())
+
+(advice-add 'edit-indirect-save :override #'custom-edit-indirect-save)
+
+;;------------------------------------------------------------------------------------
+;; Language - TypeScript/GLSL
+;;------------------------------------------------------------------------------------
+
+;; Does not seem to work very well
+;; (use-package mmm-mode)
+
+;; (require 'mmm-mode)
+
+;; (setq mmm-global-mode 'maybe)
+
+;; (mmm-add-classes
+;;  '((ts-glsl-mode
+;;     :submode glsl-mode
+;;     :front "glsl`"
+;;     :back "`")))
+
+;; (mmm-add-mode-ext-class 'typescript-mode nil 'ts-glsl-mode)
+;; ;; (setq mmm-indent-line-function #'mmm-indent-line-narrowed)
+;; (setq indent-line-function #'mmm-indent-line-narrowed)
 
 ;;------------------------------------------------------------------------------------
 ;; Language - GLSL Shaders
