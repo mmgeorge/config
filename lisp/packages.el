@@ -11,8 +11,9 @@
 ;; Package Loading
 ;;------------------------------------------------------------------------------------
 
-(add-to-list 'package-archives '("melpa" . "http://melpa.org/packages/") t)
+
 (add-to-list 'package-archives '("gnu"   . "http://elpa.gnu.org/packages/") t)
+(add-to-list 'package-archives '("melpa" . "http://melpa.org/packages/") t)
 
 (package-initialize)  
 
@@ -33,12 +34,14 @@
 ;; Common modes
 ;;------------------------------------------------------------------------------------
 
-(setq *lsp-server* 'lsp) ;; set to 'lsp or 'eglot
+;; (setq *lsp-server* 'lsp) ;; set to 'lsp or 'eglot
+
+(setq *lsp-server* 'lsp)
 
 ;; Syntax checking. Flymake (builtin) used instead for some modes
 (use-package flycheck
   :bind (("M-e" . flycheck-next-error))
-  :init (global-flycheck-mode)
+  ;; :init (global-flycheck-mode)
   :custom ((flycheck-check-syntax-automatically '(save mode-enable))
            (flycheck-idle-change-delay 1)))
 
@@ -84,19 +87,27 @@
     ((lsp-headerline-breadcrumb-enable nil)
      ;;(lsp-completion-enable-additional-text-edit nil)
      ;;(lsp-log-io t)
-     (lsp-ui-doc-enable t)
+     (lsp-ui-doc-enable nil)
      (lsp-keep-workspace-alive nil)
      (lsp-enable-snippet nil)
-     (lsp--auto-configure t )
+     ;; (lsp--auto-configure t )
      (lsp-imenu-sort-methods '(position))
-     (lsp-ui-sideline-show-code-actions nil)
-     (lsp-ui-doc-max-height 4))
+     (lsp-ui-sideline-show-code-actions t)
+     ;; (lsp-ui-doc-max-height 1)
+     (lsp-idle-delay .1)
+     (lsp-eldoc-hook nil)
+     (lsp-lens-enable nil)
+     ;; Disable or a really annoying doc buffer will show up
+     (lsp-signature-auto-activate nil))
     :hook (haskell-mode . lsp)
     :commands lsp)
 
-
   (use-package lsp-ui
-    :commands lsp-ui-mode))
+    :commands lsp-ui-mode
+    :custom
+    ((lsp-ui-doc-enabled nil))
+
+    ))
 
 
 ;; Vastly simpler version of lsp, in some cases easier to get working. However,
@@ -106,8 +117,13 @@
     :bind
     ;;("C-c f" . eglot-code-actions)
     :init
-    (setq project-current-inhibit-prompt nil)))
+    ;; (add-to-list 'eglot-server-programs
+    ;;              '(rust-mode) . ("~/.local/bin/rust-analyzer"))
+    
+    ;;(setq project-current-inhibit-prompt nil)
+    ))
 
+;; (add-hook 'rust-mode-hook 'eglot-ensure)
 ;; (setq eglot-workspace-configuration
 ;;       '((haskell
 ;;          (formattingProvider . "stylish-haskell"))))
@@ -339,16 +355,16 @@
          ("C-c f" . helm-lsp-code-actions))
   :custom ((lsp-rust-analyzer-diagnostics-enable nil)
            (lsp-rust-analyzer-proc-macro-enable t)
+           ;; (lsp-rust-analyzer-cargo-target "wasm32-unknown-unknown")
            (lsp-rust-analyzer-experimental-proc-attr-macros t)
            (lsp-rust-clippy-preference "on")
            (lsp-rust-analyzer-cargo-watch-command "clippy")
-           (rust-indent-offset 2)
-           )
+           (rust-indent-offset 2))
   :init (progn
-;; (require 'lsp-mode)
-;;           ;; (setq lsp-rust-analyzer-cargo-target '("wasm32-unknown-unknown" "x86_64-pc-windows-gnu"))
-;;           (lsp-register-custom-settings
-;;            '(("rust.target" '("wasm32-unknown-unknown" "x86_64-pc-windows-gnu"))))
+(require 'lsp-mode)
+          ;; (setq lsp-rust-analyzer-cargo-target '("wasm32-unknown-unknown" "x86_64-pc-windows-gnu"))
+          (lsp-register-custom-settings
+           '(("rust.target" '("wasm32-unknown-unknown" "x86_64-pc-windows-gnu"))))
           
           ;; Needed for WASM + wgpu rust server when WGL not listed in features 
           (setenv "RUSTFLAGS" "--cfg=web_sys_unstable_apis")
@@ -356,7 +372,9 @@
           ;;(add-hook 'flycheck-mode-hook #'flycheck-rust-setup)
           ;;(add-to-list 'projectile-project-root-files-bottom-up "Cargo.toml")
           (setq lsp-rust-server 'rust-analyzer)
-          (setq lsp-restart 'ignore)))
+          (setq lsp-restart 'ignore)
+
+          ))
 
 (defun dont-insert-expansion-char ()  t)    ;; this is the "hook" function
   (put 'dont-insert-expansion-char 'no-self-insert t)   ;; the hook should have a "no-self-insert"-property set
