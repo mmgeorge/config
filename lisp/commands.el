@@ -56,6 +56,7 @@ the cursor by ARG lines."
   ;;(global-set-key (kbd "s-.") 'jpt-toggle-mark-word-at-point)
 
 
+(global-unset-key (kbd "C-z"))
 (global-unset-key (kbd "C-p"))
 (global-unset-key (kbd "M-i"))
 (global-unset-key (kbd "M-q"))
