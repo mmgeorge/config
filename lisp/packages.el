@@ -60,12 +60,34 @@
 
 ;; Autocompletion
 (use-package company
-  :bind (("C-e" . company-complete)
-         :map company-active-map
-         ("M-s" . company-select-previous)
-         ("M-d" . company-select-next))
+  :bind (;;("C-e" . company-complete)
+         ;; :map company-active-map
+         ;; ("M-s" . company-select-previous)
+         ;; ("M-d" . company-select-next)
+         ;; ("M-a" . company-select-previous)
+         ;; ("M-f" . company-select-next)
+         ;; ("M-j" . company-complete)
+         )
   :init (global-company-mode)
-  :custom ((company-tooltip-align-annotations t)))
+  :custom ((company-tooltip-align-annotations t)
+           (company-selection-wrap-around t)
+           (company-require-match nil)))
+
+(add-hook 'company-completion-started-hook
+          (lambda (value)
+            (global-unset-key (kbd "M-c"))
+            (global-set-key (kbd "M-c") 'company-select-next)))
+
+(add-hook 'company-completion-cancelled-hook
+          (lambda (value)
+            (global-unset-key (kbd "M-c"))
+            (global-set-key (kbd "M-c") 'company-complete)))
+
+(global-set-key (kbd "M-c") 'company-complete)
+
+
+(setq company-idle-delay
+      (lambda () (if (company-in-string-or-comment) nil 0.1)))
 
 
 ;; Allows for viewing project files (e.g.., find a file within git project)

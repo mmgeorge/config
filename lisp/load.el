@@ -6,7 +6,6 @@
           "default.el"
           "templates.el"
           "packages.el"
-          "wgsl-mode/wgsl-mode.el"
           ))
   (dolist (file loads)
     (load-file (concat path file))))
