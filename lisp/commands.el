@@ -171,6 +171,7 @@ the cursor by ARG lines."
 
 (global-unset-key (kbd "M-m"))
 (global-unset-key (kbd "M-/"))
+(global-unset-key (kbd "M-j"))
 
 (global-set-key (kbd "M-i c") 'comment-or-uncomment-region)
 (global-set-key (kbd "M-i M-c") 'comment-or-uncomment-region)
@@ -191,7 +192,7 @@ the cursor by ARG lines."
 (global-set-key (kbd "M-y") 'cua-paste)
 ;;(global-set-key (kbd "C-u") 'kill-region)
 ;;(global-set-key (kbd "M-z") 'undo)
-(global-set-key (kbd "M-c") 'company-complete)
+;; (global-set-key (kbd "M-c") 'company-complete)
   
 ;;(global-set-key (kbd "M-l") 'View-scroll-half-page-forward) 
 ;;(global-set-key (kbd "M-k") 'View-scroll-half-page-backward)   
