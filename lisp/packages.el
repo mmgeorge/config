@@ -73,6 +73,10 @@
            (company-selection-wrap-around t)
            (company-require-match nil)))
 
+(global-set-key (kbd "M-;") 'forward-char)
+(global-set-key (kbd "M-:") 'forward-char)
+(global-set-key (kbd "M-j") 'backward-char)
+
 (add-hook 'company-completion-started-hook
           (lambda (value)
             (global-unset-key (kbd "M-c"))
@@ -87,6 +91,20 @@
             (global-set-key (kbd "M-j") 'company-select-previous)))
 
 (add-hook 'company-completion-cancelled-hook
+          (lambda (value)
+            (global-unset-key (kbd "M-c"))
+            (global-set-key (kbd "M-c") 'company-complete)
+
+            (global-unset-key (kbd "M-;"))
+            (global-unset-key (kbd "M-:"))
+            (global-set-key (kbd "M-;") 'forward-char)
+            (global-set-key (kbd "M-:") 'forward-char)
+
+            (global-unset-key (kbd "M-j"))
+            (global-set-key (kbd "M-j") 'backward-char)
+            ))
+
+(add-hook 'company-completion-finished-hook
           (lambda (value)
             (global-unset-key (kbd "M-c"))
             (global-set-key (kbd "M-c") 'company-complete)
