@@ -76,18 +76,35 @@
 (add-hook 'company-completion-started-hook
           (lambda (value)
             (global-unset-key (kbd "M-c"))
-            (global-set-key (kbd "M-c") 'company-select-next)))
+            (global-set-key (kbd "M-c") 'company-select-next)
+
+            (global-unset-key (kbd "M-;"))
+            (global-unset-key (kbd "M-:"))
+            (global-set-key (kbd "M-;") 'company-select-next)
+            (global-set-key (kbd "M-:") 'company-select-next)
+
+            (global-unset-key (kbd "M-j"))
+            (global-set-key (kbd "M-j") 'company-select-previous)))
 
 (add-hook 'company-completion-cancelled-hook
           (lambda (value)
             (global-unset-key (kbd "M-c"))
-            (global-set-key (kbd "M-c") 'company-complete)))
+            (global-set-key (kbd "M-c") 'company-complete)
+
+            (global-unset-key (kbd "M-;"))
+            (global-unset-key (kbd "M-:"))
+            (global-set-key (kbd "M-;") 'forward-char)
+            (global-set-key (kbd "M-:") 'forward-char)
+
+            (global-unset-key (kbd "M-j"))
+            (global-set-key (kbd "M-j") 'backward-char)
+            ))
 
 (global-set-key (kbd "M-c") 'company-complete)
 
 
 (setq company-idle-delay
-      (lambda () (if (company-in-string-or-comment) nil 0.1)))
+      (lambda () (if (company-in-string-or-comment) nil 0)))
 
 
 ;; Allows for viewing project files (e.g.., find a file within git project)
