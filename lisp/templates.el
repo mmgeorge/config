@@ -3,9 +3,12 @@
 
 (define-skeleton doc
   "template for documenation"
-  > '(setq docstr (skeleton-read "Documentation:")) \n
-  > ";; " docstr \n
-  > ";; ----------------------------------------------------------------" \n
+  > '(setq docstr (skeleton-read "Header:")) \n
+  > "//--------------------------------------------------------------------------" \n
+  > "//" \n
+  > "//  " docstr \n
+  > "//" \n
+  > "//--------------------------------------------------------------------------" \n
   )
 
 (define-skeleton docjs
