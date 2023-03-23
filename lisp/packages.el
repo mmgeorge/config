@@ -140,7 +140,8 @@
          ("C-p f" . helm-projectile-find-file)
          ("M-o f" . helm-projectile-find-file))
   :init (projectile-mode)
-  :custom ((projectile-enable-caching t)))
+  :custom ((projectile-enable-caching t)
+           (helm-projectile-fuzzy-match nil)))
 
 ;;(add-to-list 'projectile-project-root-files-bottom-up "package.json")
 
@@ -219,6 +220,8 @@
          )
   :init (helm-mode 1)
   :custom ((helm-semantic-fuzzy-match t)
+           ;; (helm-completion-style \\='(flex))
+           ;; (helm-completion-style 'helm-fuzzy)
            (helm-bookmark-show-location t)))
 
 
