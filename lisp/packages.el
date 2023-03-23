@@ -34,6 +34,15 @@
 ;; Common modes
 ;;------------------------------------------------------------------------------------
 
+;; This will pull in linum-mode which we active instead of nlinum mode
+;; (nlinum lags) or global-line-number-mode (no way to remove extra space)
+(use-package nlinum
+  :hook (prog-mode . linum-mode)
+  :custom (linum-format "%d  "))
+
+;; Display line numbers on any code buffers
+;; (add-hook 'prog-mode-hook #'display-line-numbers-mode)
+
 ;; (setq *lsp-server* 'lsp) ;; set to 'lsp or 'eglot
 
 (setq *lsp-server* 'lsp)
