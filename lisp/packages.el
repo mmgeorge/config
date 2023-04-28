@@ -38,7 +38,7 @@
 ;; (nlinum lags) or global-line-number-mode (no way to remove extra space)
 (use-package nlinum
   :hook (prog-mode . linum-mode)
-  :custom (linum-format "%d  "))
+  :custom (linum-format "%d "))
 
 ;; Display line numbers on any code buffers
 ;; (add-hook 'prog-mode-hook #'display-line-numbers-mode)
