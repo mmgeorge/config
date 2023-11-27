@@ -67,6 +67,10 @@
     (flymake-mode . flymake-diagnostic-at-point-mode))
 
 
+(use-package flycheck-projectile
+  :after flymake)
+
+
 ;; Autocompletion
 (use-package company
   :bind (;;("C-e" . company-complete)
@@ -398,6 +402,23 @@
   (define-key emacs-lisp-mode-map (kbd "M-,") 'xref-pop-marker-stack))
 
 (add-hook 'emacs-lisp-mode-hook 'elisp-bindings)
+
+;;------------------------------------------------------------------------------------
+;; Language - Wgsl
+;;------------------------------------------------------------------------------------
+
+(require 'lsp)
+
+(defvar lsp-language-id-configuration
+  '((wgsl-mode . "wgsl")))
+
+(add-to-list 'lsp-language-id-configuration '(wgsl-mode . "wgsl"))
+
+(lsp-register-client
+ (make-lsp-client :new-connection (lsp-stdio-connection "wgsl_analyzer")
+                  :activation-fn (lsp-activate-on "wgsl")
+                  :server-id 'wgsl
+                  ))
 
 ;;------------------------------------------------------------------------------------
 ;; Language - Rust
