@@ -47,6 +47,12 @@
 
 (setq *lsp-server* 'lsp)
 
+
+(when (eq *lsp-server* 'eglot)
+  (add-hook 'haskell-mode-hook 'eglot-ensure))
+
+
+
 ;; Syntax checking. Flymake (builtin) used instead for some modes
 (use-package flycheck
   :bind (("M-e" . flycheck-next-error))
@@ -492,28 +498,15 @@
          ("C-c l" . haskell-process-load-file)
          ("M-z" . haskell-interactive-mode-clear)
          ("<return>" . align-newline))
-  ;;:hook (;;(haskell-mode-hook . interactive-haskell-mode)
-         ;;(haskell-mode-hook . eglot-ensure)
-    ;;     )
   :custom ((haskell-process-log t)
            (haskell-process-args-stack-ghci ;; +RTS -M128m
-            '("--ghci-options=-interactive-print=Text.Pretty.Simple.pPrint" "--no-build" "--no-load")
-
-            )
-           ))
-
-
-(when (eq *lsp-server* 'eglot)
-  (add-hook 'haskell-mode-hook 'eglot-ensure))
-
+            '("--ghci-options=-interactive-print=Text.Pretty.Simple.pPrint" "--no-build" "--no-load"))))
 
 (when (eq *lsp-server* 'lsp)
   (use-package lsp-haskell
     :hook ((haskell-mode . lsp)
            (haskell-literate . lsp))))
 
-
-;; Abreviations to save my wrists
 (define-abbrev-table 'haskell-mode-abbrev-table
   '(("imq"  "import qualified")
     ("fm" "<$>")
@@ -557,46 +550,6 @@
      (and (> depth 0)
           (file-name-directory fname)
           (find-cabal-directory (file-name-directory fname) (1- depth))))))
-
-
-;; This works, but we really need to have a linter to do this 
-;; (require 'align)
-
-;; (add-to-list 'align-rules-list
-;;              '(haskell-left-arrows
-;;                (regexp . "\\(\\s-+\\)\\(<-\\|←\\)\\s-+") ;; Can also be a function
-;;                (modes . '(haskell-mode))))
-
-;; (add-to-list 'align-rules-list
-;;              '(haskell-assignment
-;;                (regexp . "\\(\\s-+\\)=\\s-+")
-;;                (modes . '(haskell-mode))))
-
-;; (add-to-list 'align-rules-list
-;;              '(haskell-arrows
-;;                (regexp . "\\(\\s-+\\)\\(->\\|→\\)\\s-+")
-;;                (modes . '(haskell-mode))))
-
-
-;; (defun align-newline ()
-;;   "A replacement function for `newline-and-indent', aligning as it goes.
-;; The alignment is done by calling `align' on the region that was
-;; indented."
-;;   (interactive)
-;;   (let ((separate (or (if (and (symbolp align-region-separate)
-;; 			       (boundp align-region-separate))
-;; 			  (symbol-value align-region-separate)
-;; 			align-region-separate)
-;; 		      'entire))
-;; 	(end (point)))
-;;     (call-interactively 'newline)
-;;     (save-excursion
-;;       (forward-line -1)
-;;       (while (not (or (bobp)
-;; 		      (align-new-section-p (point) end separate)))
-;; 	(forward-line -1))
-;;       (align (point) end))))
-
 
 ;;------------------------------------------------------------------------------------
 ;; Language - Web
