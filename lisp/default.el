@@ -3,7 +3,7 @@
 ;; Performance
 ;;------------------------------------------------------------------------------------
 
-(setq gc-cons-threshold 100000000) ;; Increase gc threshold
+(setq gc-cons-threshold 200000000) ;; Increase gc threshold
 (setq read-process-output-max (* 2048 2048)) ;; Increase emacs process data read (for lsp)
 
 ;;------------------------------------------------------------------------------------

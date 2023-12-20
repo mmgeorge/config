@@ -7,6 +7,17 @@
   (setq comp-deferred-compilation t
         comp-deferred-compilation-black-list '("/mu4e.*\\.el$")))
 
+
+;; Temp lsp mode
+;; (add-to-list 'load-path "~/.emacs.d/site-lisp/lsp-mode")
+
+;; (require 'lsp-wgsl)
+;; (with-eval-after-load 'info
+  ;; (info-initialize)
+  ;; (add-to-list 'Info-directory-list
+               ;; "~/.emacs.d/site-lisp/lsp-mode/"))
+;; End temp
+
 ;;------------------------------------------------------------------------------------
 ;; Package Loading
 ;;------------------------------------------------------------------------------------
@@ -27,7 +38,7 @@
 (require 'use-package-ensure)
 
 ;; Make sure packages are downloaded and installed before they are run
-;; also frees you from having to put :ensure t after installing EVERY PACKAGE.
+;; also frees you from having to put :ensure t for each package
 (setq use-package-always-ensure t)
 
 ;;------------------------------------------------------------------------------------
@@ -43,9 +54,8 @@
 ;; Display line numbers on any code buffers
 ;; (add-hook 'prog-mode-hook #'display-line-numbers-mode)
 
-;; (setq *lsp-server* 'lsp) ;; set to 'lsp or 'eglot
-
-(setq *lsp-server* 'lsp)
+(setq *lsp-server* 'lsp) ;; set to 'lsp or 'eglot
+;; (setq *lsp-server* 'eglot)
 
 
 (when (eq *lsp-server* 'eglot)
@@ -70,7 +80,7 @@
   (flymake-diagnostic-at-point-error-prefix "> ")
   (flymake-diagnostic-at-point-display-diagnostic-function 'flymake-diagnostic-at-point-display-popup)
   :hook
-    (flymake-mode . flymake-diagnostic-at-point-mode))
+  (flymake-mode . flymake-diagnostic-at-point-mode))
 
 
 (use-package flycheck-projectile
@@ -163,28 +173,78 @@
     :custom
     ((lsp-headerline-breadcrumb-enable nil)
      ;;(lsp-completion-enable-additional-text-edit nil)
-     ;;(lsp-log-io t)
      (lsp-ui-doc-enable nil)
      (lsp-keep-workspace-alive nil)
      (lsp-enable-snippet nil)
-     ;; (lsp--auto-configure t )
      (lsp-imenu-sort-methods '(position))
-     (lsp-ui-sideline-show-code-actions t)
-     ;; (lsp-ui-doc-max-height 1)
-     (lsp-idle-delay .1)
+     (lsp-ui-sideline-show-code-actions nil)
+     (lsp-idle-delay .5)
      (lsp-eldoc-hook nil)
      (lsp-lens-enable nil)
-     ;; Disable or a really annoying doc buffer will show up
      (lsp-signature-auto-activate nil))
     :hook (haskell-mode . lsp)
     :commands lsp)
 
   (use-package lsp-ui
     :commands lsp-ui-mode
-    :custom
-    ((lsp-ui-doc-enabled nil))
+    ;; :init (require lsp-ui-project-errors)
+    :bind
+    (("M-o e" . lsp-ui-project-errors-list)
+     (:map lsp-ui-project-errors-list-mode-map
+           ("RET" . lsp-ui-project-errors-list--view)
+           ("M-a" . lsp-ui-project-errors-list--visit)
+           ("M-f" . lsp-ui-project-errors-list--visit)
+           ("e" . lsp-ui-project-errors-list--toggle-severity)
 
-    ))
+           ))
+                ;; ("M-a" . magit-section-show-level-2))
+    :custom
+    ((lsp-ui-doc-enabled nil)
+     (lsp-ui-peek-enabled nil)
+     (lsp-ui-flycheck-list-position 'bottom)))
+
+
+  (with-eval-after-load 'flycheck
+    (require 'lsp-ui-project-errors))
+
+
+  )
+
+
+;; (require 'lsp-ui-flycheck)
+
+;; (defun lsp-ui-flycheck-list-override (orig-func &rest args)
+;;   "List all the diagnostics in the whole workspace."
+;;   (interactive)
+;;   (let ((buffer (get-buffer-create "*lsp-diagnostics*"))
+;;         (workspace lsp--cur-workspace)
+;;         (window (selected-window)))
+;;     (with-current-buffer buffer
+;;       (lsp-ui-flycheck-list--update window workspace))
+;;     (add-hook 'lsp-diagnostics-updated-hook 'lsp-ui-flycheck-list--refresh nil t)
+;;     (setq lsp-ui-flycheck-list--buffer buffer)
+;;     (let ((win (display-buffer-in-side-window
+;;                 buffer `((side . ,lsp-ui-flycheck-list-position) (slot . 5) (window-width . 0.20)))))
+;;       (set-window-dedicated-p win t)
+;;       (select-window win)
+;;       ;; (fit-window-to-buffer nil nil 10)
+;;       )))
+
+;; (defun lsp-ui-flycheck-list--refresh-override (orig-func &rest args)
+;;   (let ((workspace lsp--cur-workspace)
+;;         (current-window (selected-window)))
+;;     (when (and (buffer-live-p lsp-ui-flycheck-list--buffer)
+;;                (get-buffer-window lsp-ui-flycheck-list--buffer)
+;;                workspace)
+;;       (with-selected-window (get-buffer-window lsp-ui-flycheck-list--buffer)
+;;         (lsp-ui-flycheck-list--update current-window workspace)
+;;         ;;(fit-window-to-buffer nil nil 10)
+;;         ))))
+
+;; (advice-add 'lsp-ui-flycheck-list :around #'lsp-ui-flycheck-list-override)
+;; (advice-add 'lsp-ui-flycheck-list--refresh :around #'lsp-ui-flycheck-list--refresh-override)
+
+
 
 
 ;; Vastly simpler version of lsp, in some cases easier to get working. However,
@@ -211,17 +271,9 @@
 ;;   (eglot-code-actions beg end "quickfix.import.extend.list.topLevel"))
 
 
-;; Debbuger protocol interop
-;; (use-package dap-mode
-;;   :after lsp-mode
-;;   :config
-;;   (dap-mode t)
-;;   (dap-ui-mode t))
-
-
 ;; Provides a great alternative to standard emacs menus for searching for files, commands, etc
 (use-package helm
-;;  :preface (require 'helm-config)
+  ;;  :preface (require 'helm-config)
   :bind (("M-x" . 'helm-M-x)
          ("C-;" . 'helm-M-x)
          ;;("C-f d" . 'helm-buffers-list)
@@ -278,7 +330,7 @@
   "Delete bookmark from keyboard."
   (interactive)
   (with-helm-alive-p
-      (helm-exit-and-execute-action 'helm-delete-marked-bookmarks)))
+    (helm-exit-and-execute-action 'helm-delete-marked-bookmarks)))
 
 (define-key helm-bookmark-map (kbd "C-d") 'helm-bookmark-run-delete-no-prompt)
 
@@ -354,7 +406,7 @@
   "Return bindings and a message to inform user about them"
   (let ((msg (format "Type M-%s to expand again" repeat-key-str repeat-key-str))
         (bindings (list ;; (cons repeat-key-str '(er/expand-region 1))
-                        (cons (concat "M-" repeat-key-str) '(er/expand-region 1)))))
+                   (cons (concat "M-" repeat-key-str) '(er/expand-region 1)))))
     ;; If contract and expand are on the same binding, ignore contract
     (unless (string-equal repeat-key-str expand-region-contract-fast-key)
       (setq msg (concat msg (format ", %s to contract" expand-region-contract-fast-key)))
@@ -377,9 +429,7 @@
   :bind (:map magit-mode-map
               ("RET" . magit-diff-visit-worktree-file-other-window)
               ("M-f" . magit-section-toggle)
-              ("M-a" . magit-section-show-level-2))
-  
-  )
+              ("M-a" . magit-section-show-level-2)))
 
 
 
@@ -413,18 +463,17 @@
 ;; Language - Wgsl
 ;;------------------------------------------------------------------------------------
 
-(require 'lsp)
+(use-package wgsl-mode
+  :hook (wgsl-mode . lsp))
 
-(defvar lsp-language-id-configuration
-  '((wgsl-mode . "wgsl")))
+;; (use-package wgsl-mode)
+  ;; :hook (wgsl-mode . 'eglot-ensure))
 
-(add-to-list 'lsp-language-id-configuration '(wgsl-mode . "wgsl"))
 
-(lsp-register-client
- (make-lsp-client :new-connection (lsp-stdio-connection "wgsl_analyzer")
-                  :activation-fn (lsp-activate-on "wgsl")
-                  :server-id 'wgsl
-                  ))
+;; (with-eval-after-load 'eglot
+;;   (add-to-list 'eglot-server-programs
+;;                `(wgsl-mode . ("/home/matt/wgslx/target/debug/wgslx"))))
+
 
 ;;------------------------------------------------------------------------------------
 ;; Language - Rust
@@ -451,29 +500,26 @@
          ("C-c f" . helm-lsp-code-actions))
   :custom ((lsp-rust-analyzer-diagnostics-enable nil)
            ;; (lsp-rust-analyzer-proc-macro-enable t)
-           (lsp-rust-analyzer-cargo-target "wasm32-unknown-unknown")
+           ;; (lsp-rust-analyzer-cargo-target "wasm32-unknown-unknown")
            ;; (lsp-rust-analyzer-experimental-proc-attr-macros t)
            (lsp-rust-clippy-preference "on")
            (lsp-rust-analyzer-cargo-watch-command "clippy")
            (rust-indent-offset 2))
   :init (progn
-(require 'lsp-mode)
-          ;; (setq lsp-rust-analyzer-cargo-target '("wasm32-unknown-unknown" "x86_64-pc-windows-gnu"))
-          (lsp-register-custom-settings
-           '(("rust.target" '("wasm32-unknown-unknown" "x86_64-pc-windows-gnu"))))
-          
+          (require 'lsp-mode)
           ;; Needed for WASM + wgpu rust server when WGL not listed in features 
-          (setenv "RUSTFLAGS" "--cfg=web_sys_unstable_apis")
+          ;; (setq lsp-rust-analyzer-cargo-target '("wasm32-unknown-unknown" "x86_64-pc-windows-gnu"))
+          ;; (lsp-register-custom-settings
+          ;;  '(("rust.target" '("wasm32-unknown-unknown" "x86_64-pc-windows-gnu"))))
+          ;; (setenv "RUSTFLAGS" "--cfg=web_sys_unstable_apis")
           ;; Warning! This seems fairly buggy 2020-08-10 is the last version that seems to work for me
           ;;(add-hook 'flycheck-mode-hook #'flycheck-rust-setup)
           ;;(add-to-list 'projectile-project-root-files-bottom-up "Cargo.toml")
           (setq lsp-rust-server 'rust-analyzer)
-          (setq lsp-restart 'ignore)
-
-          ))
+          (setq lsp-restart 'ignore)))
 
 (defun dont-insert-expansion-char ()  t)    ;; this is the "hook" function
-  (put 'dont-insert-expansion-char 'no-self-insert t)   ;; the hook should have a "no-self-insert"-property set
+(put 'dont-insert-expansion-char 'no-self-insert t)   ;; the hook should have a "no-self-insert"-property set
 
 (define-abbrev-table 'rust-mode-abbrev-table
   '(("imq"  "import qualified")
@@ -490,7 +536,7 @@
 ;;------------------------------------------------------------------------------------
 ;; Language - Haskell
 ;;------------------------------------------------------------------------------------
- 
+
 (use-package haskell-mode
   :mode (("\\.hs\\'" . haskell-mode)
          ("\\.cabal\\'" . haskell-mode))
@@ -536,7 +582,7 @@
   (list (cdr project)))
 
 ;; (cl-defmethod project-roots ((project (head cabal)))
-  ;; (list (cdr project)))
+;; (list (cdr project)))
 
 (cl-defun find-cabal-directory (directory &optional (depth 10))
   "Find the first file in the current DIRECTORY or a parent of DIRECTORY that includes a .cabal file."
@@ -599,7 +645,7 @@
   :custom
   ;; Use global install if applicable
   ;;(when (file-exists-p "/usr/bin/tsserver")
-    ;;(tide-tsserver-executable "/usr/bin/tsserver"))
+  ;;(tide-tsserver-executable "/usr/bin/tsserver"))
   ;;(tide-completion-detailed t)
   (typescript-indent-level 2)
   (tide-format-options
