@@ -221,8 +221,8 @@ the cursor by ARG lines."
 (global-set-key (kbd "C-c v") 'erase-buffer)
 (global-set-key (kbd "C-x f") 'set-mark-command)
 
-;;(global-set-key (kbd "C-x o") 'shrink-window)
-;;(global-set-key (kbd "C-x i") 'enlarge-window)
+(global-set-key (kbd "C-w") 'enlarge-window)
+(global-set-key (kbd "C-e") 'shrink-window)
 
 (global-set-key (kbd "M-;") 'forward-char)
 (global-set-key (kbd "M-:") 'forward-char)
