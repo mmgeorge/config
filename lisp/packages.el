@@ -55,13 +55,9 @@
 ;; (add-hook 'prog-mode-hook #'display-line-numbers-mode)
 
 (setq *lsp-server* 'lsp) ;; set to 'lsp or 'eglot
-;; (setq *lsp-server* 'eglot)
-
 
 (when (eq *lsp-server* 'eglot)
   (add-hook 'haskell-mode-hook 'eglot-ensure))
-
-
 
 ;; Syntax checking. Flymake (builtin) used instead for some modes
 (use-package flycheck
@@ -464,6 +460,7 @@
 ;;------------------------------------------------------------------------------------
 
 (use-package wgsl-mode
+  :mode (("\\.wgslx\\'" . wgsl-mode))
   :hook (wgsl-mode . lsp))
 
 ;; (use-package wgsl-mode)
