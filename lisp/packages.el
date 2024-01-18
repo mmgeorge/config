@@ -159,7 +159,7 @@
   :custom ((projectile-enable-caching t)
            (helm-projectile-fuzzy-match nil)))
 
-;;(add-to-list 'projectile-project-root-files-bottom-up "package.json")
+;; (add-to-list 'projectile-project-root-files-bottom-up "wgslx.toml")
 
 ;; Mode for interacting with language servers that implement the Language Server Protocol
 (when (eq *lsp-server* 'lsp)
@@ -169,6 +169,7 @@
     :custom
     ((lsp-headerline-breadcrumb-enable nil)
      ;;(lsp-completion-enable-additional-text-edit nil)
+     ;; (lsp-auto-guess-root t)
      (lsp-ui-doc-enable nil)
      (lsp-keep-workspace-alive nil)
      (lsp-enable-snippet nil)
