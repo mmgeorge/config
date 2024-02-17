@@ -88,7 +88,10 @@ Use `lsp-diagnostics' to receive diagnostics from your LSP server."
           (when (seq-some (lambda (diag)
                                      (-let* (((&Diagnostic :message :severity? :source?
                                                            :range (&Range :start (&Position :line start-line))) diag))
-                                       (eq severity? lsp-ui-project-errors-list-severity)))
+                                       ;; Filter out clippy warnings (comes back as warnings instead of lint)
+                                       (and (eq severity? lsp-ui-project-errors-list-severity)
+                                            (not (cl-search "clippy" source?))
+                                            )))
                          diagnostic)
             (overlay-put
              (make-overlay (point) (point))
@@ -109,7 +112,10 @@ Use `lsp-diagnostics' to receive diagnostics from your LSP server."
                                   ": "
                                   (car (split-string formatted-message "\n")))))
               ;; Only output errors
-              (when (eq severity lsp-ui-project-errors-list-severity)
+              (when (and (eq severity lsp-ui-project-errors-list-severity)
+                         ;; Filter out clippy warnings (comes back as warnings instead of lint errors)
+                         (not (cl-search "clippy" source?))
+                         )
                 (add-text-properties 0 (length text) `(diag ,diag file ,file window ,window) text)
                 (insert (concat text "\n")))))))))
   (if (= (point) 1)
