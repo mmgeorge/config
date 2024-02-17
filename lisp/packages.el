@@ -497,8 +497,10 @@
          ("C-c t" . rust-test)
          ("C-c f" . helm-lsp-code-actions))
   :custom ((lsp-rust-analyzer-diagnostics-enable nil)
-           ;; (lsp-rust-analyzer-proc-macro-enable t)
-           ;; (lsp-rust-analyzer-cargo-target "wasm32-unknown-unknown")
+
+           (lsp-rust-analyzer-cargo-target "wasm32-unknown-unknown")
+           (lsp-rust-analyzer-proc-macro-enable t)
+
            ;; (lsp-rust-analyzer-experimental-proc-attr-macros t)
            (lsp-rust-clippy-preference "on")
            (lsp-rust-analyzer-cargo-watch-command "clippy")
