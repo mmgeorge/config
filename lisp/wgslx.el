@@ -21,6 +21,7 @@
 ;;; Commentary:
 
 ;; LSP Client for WGSLX (WebGPU Shading Language eXtended)
+(require 'lsp-mode)
 
 ;;; Code:
 (when (require 'projectile nil 'noerror)
