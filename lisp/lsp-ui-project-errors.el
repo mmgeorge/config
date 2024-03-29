@@ -114,7 +114,7 @@ Use `lsp-diagnostics' to receive diagnostics from your LSP server."
               ;; Only output errors
               (when (and (eq severity lsp-ui-project-errors-list-severity)
                          ;; Filter out clippy warnings (comes back as warnings instead of lint errors)
-                         (not (cl-search "clippy" source?))
+                         ;; (not (cl-search "clippy" source?))
                          )
                 (add-text-properties 0 (length text) `(diag ,diag file ,file window ,window) text)
                 (insert (concat text "\n")))))))))

@@ -63,8 +63,8 @@
 (use-package flycheck
   :bind (("M-e" . flycheck-next-error))
   ;; :init (global-flycheck-mode)
-  :custom ((flycheck-check-syntax-automatically '(save mode-enable))
-           (flycheck-idle-change-delay 1)))
+  :custom ((flycheck-check-syntax-automatically '(save mode-enable idle-change idle-buffer-switch))
+           (flycheck-idle-change-delay 0.1)))
 
 (define-key window-key-map (kbd "e") 'flycheck-list-errors)
 
@@ -263,6 +263,9 @@
      (lsp-headerline-breadcrumb-enable nil)
      (lsp-inlay-hint-enable nil)
      (lsp-enable-snippet nil)
+     (lsp-modeline-diagnostics-enable t)
+     (lsp-modeline-code-actions-enable nil)
+     (lsp-modeline-diagnostics-scope :worskapce)
      ;;(lsp-completion-enable-additional-text-edit nil)
      ;; (lsp-auto-guess-root t)
      ;; (lsp-ui-doc-enable nil)
@@ -272,7 +275,10 @@
      ;; (lsp-ui-sideline-show-code-actions nil)
      (lsp-idle-delay .5)
      ;; (lsp-eldoc-hook nil)
-     ;; (lsp-lens-enable t)
+     (lsp-lens-enable nil)
+
+     ;; typescript
+     (lsp-clients-typescript-max-ts-server-memory 8192)
      ;; (lsp-signature-auto-activate nil)
      )
     :hook (rust-mode . lsp)
@@ -671,7 +677,7 @@
   :custom ((web-mode-markup-indent-offset 2)
            (web-mode-css-indent-offset 2)
            (web-mode-code-indent-offset 2))
-  :hook ((web-mode . setup-tsx-tide-hook)
+  :hook (;(web-mode . setup-tsx-tide-hook)
          (web-mode . (lambda ()
                        (define-key web-mode-map (kbd "M-;") nil)
                        (define-key web-mode-map (kbd "M-:") nil)))))
@@ -681,11 +687,11 @@
     ) "Web mode shortcuts")
 
 
-(defun setup-tsx-tide-hook ()
-  (when (string-equal "tsx" (file-name-extension buffer-file-name))
-    (tide-mode)
-    (tide-setup)
-    (setq flycheck-check-syntax-automatically '(save mode-enabled))))
+;; (defun setup-tsx-tide-hook ()
+;;   (when (string-equal "tsx" (file-name-extension buffer-file-name))
+;;     (tide-mode)
+;;     (tide-setup)
+;;     (setq flycheck-check-syntax-automatically '(save mode-enabled))))
 
 ;;------------------------------------------------------------------------------------
 ;; Language - Typescript
@@ -695,30 +701,30 @@
   :mode (("\\.ts\\'" . typescript-mode))
   ;;:init
   ;;(add-hook 'after-save-hook #'eslint-fix) -- too slow
-  :hook ((typescript-mode . tide-setup)
+  :hook ((typescript-mode . lsp)
          (typescript-mode . flycheck-mode)))
 
 
 ;; TsServer interop
-(use-package tide
-  :bind
-  ("C-c f" . tide-fix)
-  ("C-c l" . eslint-fix)
-  :init (add-to-list 'projectile-project-root-files-bottom-up "package.json")
-  :custom
-  ;; Use global install if applicable
-  ;;(when (file-exists-p "/usr/bin/tsserver")
-  ;;(tide-tsserver-executable "/usr/bin/tsserver"))
-  ;;(tide-completion-detailed t)
-  (typescript-indent-level 2)
-  (tide-format-options
-   '(:insertSpaceAfterFunctionKeywordForAnonymousFunctions
-     t
-     :placeOpenBraceOnNewLineForFunctions
-     nil
-     :InsertSpaceAfterOpeningAndBeforeClosingNonemptyBrackets t))
-  :after (typescript-mode company flycheck)
-  :hook ((typescript-mode . tide-setup)))
+;; (use-package tide
+;;   :bind
+;;   ("C-c f" . tide-fix)
+;;   ("C-c l" . eslint-fix)
+;;   :init (add-to-list 'projectile-project-root-files-bottom-up "package.json")
+;;   :custom
+;;   ;; Use global install if applicable
+;;   ;;(when (file-exists-p "/usr/bin/tsserver")
+;;   ;;(tide-tsserver-executable "/usr/bin/tsserver"))
+;;   ;;(tide-completion-detailed t)
+;;   (typescript-indent-level 2)
+;;   (tide-format-options
+;;    '(:insertSpaceAfterFunctionKeywordForAnonymousFunctions
+;;      t
+;;      :placeOpenBraceOnNewLineForFunctions
+;;      nil
+;;      :InsertSpaceAfterOpeningAndBeforeClosingNonemptyBrackets t))
+;;   :after (typescript-mode company flycheck)
+;;   :hook ((typescript-mode . tide-setup)))
 
 
 (defun tslint-fix ()

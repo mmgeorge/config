@@ -50,7 +50,10 @@
   ": "
   (shorten-path-when-long)
   ;;default-directory
-  
+  ;; 'lsp-modeline--code-actions-string
+  'global-mode-string
+  ;; 'lsp-modeline--diagnostics-string
+
   ;; Fill until the end of line but 10 characters
   (mode-line-fill 'mode-line 10)
   "L/C: %l/%c"
