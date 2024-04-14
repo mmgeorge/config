@@ -163,6 +163,8 @@
 
 ;; Mode for interacting with language servers that implement the Language Server Protocol
 (when (eq *lsp-server* 'lsp)
+;;  (require 'lsp-mode)
+  ;;(require 'lsp-rust)
 
   (defun lsp-rust-analyzer-init-override ()
     "Init options for rust-analyzer"
@@ -254,7 +256,6 @@
       :experimental (:procAttrMacros ,(lsp-json-bool lsp-rust-analyzer-experimental-proc-attr-macros))))
   (advice-add 'lsp-rust-analyzer--make-init-options :override #'lsp-rust-analyzer-init-override)
 
-
   (use-package lsp-mode
     :bind
     (("C-c f" . helm-lsp-code-actions))
@@ -284,8 +285,8 @@
     :hook (rust-mode . lsp)
     :commands lsp)
 
-  (use-package lsp-treemacs
-    :ensure t)
+  ;; (use-package lsp-treemacs
+  ;;   :ensure t)
 
   (use-package lsp-ui
     :commands lsp-ui-mode
@@ -569,6 +570,7 @@
            ;; (lsp-rust-analyzer-experimental-proc-attr-macros t)
            (lsp-rust-clippy-preference "on")
            (lsp-rust-analyzer-cargo-watch-command "clippy")
+           (rust-format-on-save t)
            (rust-indent-offset 2))
   :init (progn
           (require 'lsp-rust)
