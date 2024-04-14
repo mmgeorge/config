@@ -1,0 +1,93 @@
+
+-- Unmaps -
+vim.keymap.set({'n', 'v'}, 'o', '<Nop>', {})
+vim.keymap.set({'n', 'v'}, 'q', '<Nop>', {})
+vim.keymap.set({'n', 'v'}, 'xo', '<Nop>', {})
+vim.keymap.set({'n', 'v'}, 'x', '<Nop>', {})
+vim.keymap.set({'n', 'v'}, 'c', '<Nop>', {})
+vim.keymap.set({'n', 'v'}, 'C', '<Nop>', {})
+vim.keymap.set({'n', 'v'}, 'b', '<Nop>', {})
+vim.keymap.set({'n', 'v'}, 'a%', '<Nop>', {})
+--vim.keymap.set({'n', 'v'}, 'g', '<Nop>', {})
+--vim.keymap.set({'n', 'v'}, 'w', '<Nop>', {})
+
+
+-- Basic navigation --
+--  Left
+vim.keymap.set({'n', 'v'}, 'f', 'w', { nowait = true, silent = true }) -- Forward word
+vim.keymap.set({'n', 'v'}, 'a', 'b', { nowait = true, silent = true }) -- Backward word
+vim.keymap.set({'n', 'v'}, 'd', 'j', { nowait = true, silent = true }) -- Down
+vim.keymap.set({'n', 'v'}, 's', 'k', { nowait = true, silent = true }) -- Up
+
+-- Right
+--vim.keymap.set({'n', 'v'}, 'k', '5<C-U>', { nowait = true, silent = true }) -- Scroll Up
+--vim.keymap.set({'n', 'v'}, 'l', '5<C-D>', { nowait = true, silent = true }) -- Scroll Down
+-- Keeps screen in the center
+vim.keymap.set({'n', 'v'}, 'k', '5<C-U>zz', { nowait = true, silent = true }) -- Scroll Up
+vim.keymap.set({'n', 'v'}, 'l', '5<C-D>zz', { nowait = true, silent = true }) -- Scroll Down
+--vim.keymap.set({'n', 'v'}, 'k', '<C-u>zz', { nowait = true, silent = true }) -- Scroll Up
+--vim.keymap.set({'n', 'v'}, 'l', '<C-d>zz', { nowait = true, silent = true }) -- Scroll Down
+
+-- Search, keeping centered
+-- vim.keymap.set('n', '<C-;>', 'nzzzv', { nowait = true, silent = true })
+-- vim.keymap.set('n', '<C-;>', 'Nzzzv', { nowait = true, silent = true })
+
+
+vim.keymap.set({'n', 'v'}, 'j', 'h', { nowait = true, silent = true }) -- Left
+vim.keymap.set({'n', 'v'}, ';', 'l', { nowait = true, silent = true }) -- Right
+vim.keymap.set({'n', 'v'}, 'm', '^', { nowait = true, silent = true }) -- Start Line
+vim.keymap.set({'n', 'v'}, '/', '$', { nowait = true, silent = true }) -- End Line
+
+-- Enter Modes
+vim.keymap.set('n', '<C-i>', 'i', { nowait = true }) -- Enter insert mode
+vim.keymap.set('n', 'J', 'i', { nowait = true }) -- Enter insert mode
+
+vim.keymap.set('n', 'D', 'o', { nowait = true }) -- Enter insert mode
+vim.keymap.set('n', 'S', 'O', { nowait = true }) -- Enter insert mode
+
+-- Selection
+vim.keymap.set('n', 'i', 'v', { nowait = true }) -- Enter selection mode
+vim.keymap.set('v', 'il', 'V', { nowait = true }) -- Select line
+vim.keymap.set('n', '<A-i>l', 'V', { nowait = true }) -- Select line
+vim.keymap.set('v', 'u', 'y`]', { nowait = true }) -- Copy (Kill-copy)
+--vim.keymap.set('n', 'u', 'y', { nowait = true }) -- Copy (Kill-copy)
+vim.keymap.set({'n', 'v'}, 'y', 'p', { nowait = true }) -- Past / Yank (in emacs lingo)
+vim.keymap.set({'i'}, '<C-y>', '<C-o>p', { nowait = true }) -- Past / Yank (in emacs lingo)
+vim.keymap.set('v', 'x', 'd', { nowait = true }) -- Cut
+
+-- Window
+vim.keymap.set('n', 'wsb', ':split<CR>', { })
+vim.keymap.set('n', 'wko', ':only<CR>', { })
+vim.keymap.set('n', 'wks', ':close!<CR>', { })
+vim.keymap.set('n', 'woo', '<C-w>W', { })
+
+-- Goto/Open
+
+-- Character within a line: 
+vim.keymap.set({'n', 'v'}, 'oc', 'f', { })   -- Goto character in line
+vim.keymap.set('n', 'oxc', 'df', { }) -- Goto delete character in line
+vim.keymap.set({'n', 'v'}, 'orc', 'F', { })   -- Reverse, Goto character in line
+vim.keymap.set('n', 'oxrc', 'dF', { }) -- Goto delete character in line
+vim.keymap.set({'n', 'v'}, '.', ';', { nowait = true, silent = true }) -- Forward character
+
+vim.keymap.set('n', 'ok', 'gg', { }) -- Top of Page
+vim.keymap.set('n', 'ol', ']]', { }) -- End of page
+
+vim.keymap.set({'n', 'v'}, '<C-f>', require("plugins.telescope.occur").occur_in_file, {})
+vim.keymap.set({'n', 'v'}, 'of', require("plugins.telescope.find_files").find_files, {})
+
+vim.keymap.set({'n', 'v'}, 'os', require("telescope.builtin").buffers, {})
+vim.keymap.set({'n', 'v'}, 'ot', require("telescope.builtin").help_tags, {})
+vim.keymap.set({'n', 'v'}, 'or', require("telescope.builtin").resume, { nowait=true })
+
+-- Insert -- 
+vim.keymap.set('i', '<Tab>', '<C-f>', { })
+
+-- Common
+vim.keymap.set({'n', 'i', 'v', 'c', 't', 's', 'o', 'x'}, '<C-g>', '<Esc>', { nowait = true }) -- Cancel
+vim.keymap.set({'n', 'i', 'v', 'c', 't', 's', 'o', 'x'}, '<C-k>', '<Esc>', { nowait = true }) -- Cancel
+
+vim.keymap.set('n', '<C-s>', ':w<CR>', { nowait = true }) -- Save file
+vim.keymap.set('n', '<C-r>', ':earlier 10f<CR>', {}) -- Revert file
+vim.keymap.set('n', '<C-e>', ':q<CR>', { nowait = true }) -- Save file
+-- vim.keymap.set('n', '<C-X><83>', ':q<CR>', {}) -- Does not work!
