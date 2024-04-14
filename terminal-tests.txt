@@ -1,0 +1,53 @@
+ https://aka.ms/PSWindows
+
+256 colors:
+
+awk 'BEGIN{
+    s="/\\/\\/\\/\\/\\"; s=s s s s s s s s;
+    for (colnum = 0; colnum<77; colnum++) {
+        r = 255-(colnum*255/76);
+        g = (colnum*510/76);
+        b = (colnum*255/76);
+        if (g>255) g = 510-g;
+        printf "\033[48;2;%d;%d;%dm", r,g,b;
+        printf "\033[38;2;%d;%d;%dm", 255-r,255-g,255-b;
+        printf "%s\033[0m", substr(s,colnum+1,1);
+    }
+    printf "\n";
+}'
+
+Undercurl: 
+printf '\e[4:3mUnderlined\n' 
+
+
+See https://github.com/microsoft/vscode/issues/158827
+and https://sw.kovidgoyal.net/kitty/underlines/
+underline blue color
+echo -e "\x1b[58:5:32m\x1b[4mtest\x1b[59m\x1b[24m"
+  -- Consists of straight, blue test, !blue, !straight
+
+truecolor?
+echo -e "\x1b[58:2::255:192:203m\x1b[4mtest\x1b[59m\x1b[24m"
+
+undercurl 
+echo -e "\x1b[4:3mTest\x1b[24m "
+
+
+
+Others: 
+# Previously supported underline sequences
+\x1b[4m    # straight underline
+\x1b[24m   # no underline
+
+# Underline styles
+\x1b[4:0m  # no underline
+\x1b[4:1m  # straight underline
+\x1b[4:2m  # double underline
+\x1b[4:3m  # curly underline
+\x1b[4:4m  # dotted underline
+\x1b[4:5m  # dashed underline
+
+# Underline colors (a style is required)
+\x1b[58:5:32m            # 256 color palette: ANSI color number 32, see https://en.wikipedia.org/wiki/ANSI_escape_code#8-bit
+\x1b[58:2:0:255:128:64m  # True color: Red=255, Green=128, Blue=64
+\x1b[59m                 # reset color
