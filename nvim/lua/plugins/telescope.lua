@@ -31,7 +31,7 @@ return {
       
       require('telescope').setup({
           defaults = {
-            -- winblend = 0,
+            winblend = 0,
             layout_strategy = "vertical", 
             layout_config = {
               --height = vim.o.lines, -- Maximally available lines
@@ -55,7 +55,8 @@ return {
               theme = "ivy"
             },
             current_buffer_fuzzy_find = {
-              sorter = sorters.get_substr_matcher(),
+            winblend = 0,
+            sorter = sorters.get_substr_matcher(),
               theme = "ivy",
               previewer = false,
               layout_config = {

@@ -7,6 +7,11 @@ return {
             -- ...
                                    })
 
-      vim.cmd('colorscheme github_dark_default')
+      vim.cmd([[highlight LspDiagnosticsError cterm=underline ctermfg=blue]])
+
+      vim.cmd([[highlight LspDiagnosticsUnderlineError cterm=underline ctermfg=red gui=underline guifg=red]])
+vim.cmd([[highlight LspDiagnosticsUnderlineErrorSign cterm=bold ctermfg=red gui=bold guifg=red]])
+      -- vim.cmd('colorscheme github_dark_default')
+      -- vim.cmd([[highlight LspDiagnosticsUnderlineError cterm=underline ctermfg=red gui=underline guifg=red]])
    end,
 }

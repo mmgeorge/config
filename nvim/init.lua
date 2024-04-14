@@ -25,3 +25,4 @@ require("lazy").setup(
 
 require("vim_options")
 require("keymap"); 
+require("diagnostics"); 

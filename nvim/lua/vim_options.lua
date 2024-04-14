@@ -1,4 +1,4 @@
-
+-- vim.o.termguicolors = true
 vim.o.expandtab = true;
 vim.o.smartindent = true
 vim.o.tabstop = 2

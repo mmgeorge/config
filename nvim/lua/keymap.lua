@@ -20,11 +20,11 @@ vim.keymap.set({'n', 'v'}, 'd', 'j', { nowait = true, silent = true }) -- Down
 vim.keymap.set({'n', 'v'}, 's', 'k', { nowait = true, silent = true }) -- Up
 
 -- Right
---vim.keymap.set({'n', 'v'}, 'k', '5<C-U>', { nowait = true, silent = true }) -- Scroll Up
---vim.keymap.set({'n', 'v'}, 'l', '5<C-D>', { nowait = true, silent = true }) -- Scroll Down
+vim.keymap.set({'n', 'v'}, 'k', '5<C-U>', { nowait = true, silent = true }) -- Scroll Up
+vim.keymap.set({'n', 'v'}, 'l', '5<C-D>', { nowait = true, silent = true }) -- Scroll Down
 -- Keeps screen in the center
-vim.keymap.set({'n', 'v'}, 'k', '5<C-U>zz', { nowait = true, silent = true }) -- Scroll Up
-vim.keymap.set({'n', 'v'}, 'l', '5<C-D>zz', { nowait = true, silent = true }) -- Scroll Down
+--vim.keymap.set({'n', 'v'}, 'k', '5<C-U>zz', { nowait = true, silent = true }) -- Scroll Up
+--vim.keymap.set({'n', 'v'}, 'l', '5<C-D>zz', { nowait = true, silent = true }) -- Scroll Down
 --vim.keymap.set({'n', 'v'}, 'k', '<C-u>zz', { nowait = true, silent = true }) -- Scroll Up
 --vim.keymap.set({'n', 'v'}, 'l', '<C-d>zz', { nowait = true, silent = true }) -- Scroll Down
 
@@ -62,13 +62,15 @@ vim.keymap.set('n', 'wks', ':close!<CR>', { })
 vim.keymap.set('n', 'woo', '<C-w>W', { })
 
 -- Goto/Open
-
 -- Character within a line: 
 vim.keymap.set({'n', 'v'}, 'oc', 'f', { })   -- Goto character in line
 vim.keymap.set('n', 'oxc', 'df', { }) -- Goto delete character in line
 vim.keymap.set({'n', 'v'}, 'orc', 'F', { })   -- Reverse, Goto character in line
 vim.keymap.set('n', 'oxrc', 'dF', { }) -- Goto delete character in line
 vim.keymap.set({'n', 'v'}, '.', ';', { nowait = true, silent = true }) -- Forward character
+vim.keymap.set({'n', 'v'}, 'ou',
+   function() vim.diagnostic.open_float(nil, { focus = false }) end,
+   { nowait = true, silent = true }) -- Forward character
 
 vim.keymap.set('n', 'ok', 'gg', { }) -- Top of Page
 vim.keymap.set('n', 'ol', ']]', { }) -- End of page
@@ -80,14 +82,19 @@ vim.keymap.set({'n', 'v'}, 'os', require("telescope.builtin").buffers, {})
 vim.keymap.set({'n', 'v'}, 'ot', require("telescope.builtin").help_tags, {})
 vim.keymap.set({'n', 'v'}, 'or', require("telescope.builtin").resume, { nowait=true })
 
+-- Text --
+vim.keymap.set({'n', 'v', 'i'}, '<C-h>', 'dd', { })
+
+
 -- Insert -- 
-vim.keymap.set('i', '<Tab>', '<C-f>', { })
+vim.keymap.set({'n', 'v', 'i'}, '<Tab>', '==', { })
 
 -- Common
 vim.keymap.set({'n', 'i', 'v', 'c', 't', 's', 'o', 'x'}, '<C-g>', '<Esc>', { nowait = true }) -- Cancel
 vim.keymap.set({'n', 'i', 'v', 'c', 't', 's', 'o', 'x'}, '<C-k>', '<Esc>', { nowait = true }) -- Cancel
 
 vim.keymap.set('n', '<C-s>', ':w<CR>', { nowait = true }) -- Save file
+vim.keymap.set('i', '<C-s>', '<C-o>:w<CR>', { nowait = true }) -- Save file
 vim.keymap.set('n', '<C-r>', ':earlier 10f<CR>', {}) -- Revert file
 vim.keymap.set('n', '<C-e>', ':q<CR>', { nowait = true }) -- Save file
 -- vim.keymap.set('n', '<C-X><83>', ':q<CR>', {}) -- Does not work!
