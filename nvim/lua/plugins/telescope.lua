@@ -1,4 +1,5 @@
 return {
+   {
     'nvim-telescope/telescope.nvim', tag = '0.1.6',
     dependencies = { 'nvim-lua/plenary.nvim' },
     config = function()
@@ -76,5 +77,74 @@ return {
                                 })
 
     end,
-  }
+   },
+
+   {   
+      "nvim-telescope/telescope-file-browser.nvim",
+      lazy = false, 
+      dependencies = {
+         "nvim-telescope/telescope.nvim",
+         "nvim-lua/plenary.nvim"
+      },
+      config = function ()
+         local actions = require( "telescope.actions")
+         local fb_actions = require( "telescope").extensions.file_browser.actions
+
+         require("telescope").setup ({
+            extensions = {
+               file_browser = {
+                  -- grouped = true, 
+                  theme = "ivy",
+                  disable_devicons = true,
+                  -- -- File tree depth to display, false for unlimited depth
+                  depth = 1,
+                  auto_depth = false,
+                  select_buffer = true,
+                  hide_parent_dir = true,
+                  hidden = {
+                     file_browser = true,
+                     folder_browser = true, 
+                  },
+                  no_ignore = false,
+                  follow_symlinks = false,
+                  collapse_dirs = true,
+                  quiet = true,
+                  dir_icon = "",
+                  dir_icon_hl = "",
+                  display_stat = false, 
+                  -- display_stat = {
+                  --    date = true,
+                  --    size = false,
+                  --    mode = false, 
+                  -- },
+                  git_status = true,
+                  prompt_path = false,
+                  use_fd = false, 
+                  -- disables netrw and use telescope-file-browser in its place
+                  hijack_netrw = true,
+                  mappings = {
+                     ["i"] = {
+                        ["<Left>"] = fb_actions.goto_parent_dir,
+                        ["<Right>"] = fb_actions.change_cwd,
+                        ["<C-r>"] = fb_actions.rename, 
+                        ["<C-k>"] = fb_actions.remove, 
+                        ["<C-m>"] = fb_actions.move, 
+                        ["<C-n>"] = fb_actions.create, 
+                        ["<C-p>"] = fb_actions.create_from_prompt, 
+                        ["<CR>"] = actions.select_default, 
+                        ["<C-g>"] = actions.close, 
+                        -- your custom insert mode mappings
+                     },
+                     ["n"] = {
+                        ["<CR>"] = actions.select_default, 
+                        -- your custom normal mode mappings
+                     },
+                  },
+               },
+            },
+             })
+            require("telescope").load_extension("file_browser")
+      end
+   }
+}
 
