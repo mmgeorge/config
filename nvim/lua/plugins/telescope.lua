@@ -32,6 +32,7 @@ return {
       
       require('telescope').setup({
           defaults = {
+             disable_devicons = true,
             winblend = 0,
             layout_strategy = "vertical", 
             layout_config = {
@@ -67,6 +68,7 @@ return {
             },
             buffers = {
               theme = "ivy",
+               disable_devicons = true,
               previewer = false,
               layout_config = {
                 height = 0.4,
@@ -93,9 +95,9 @@ return {
          require("telescope").setup ({
             extensions = {
                file_browser = {
+                  disable_devicons = true,
                   -- grouped = true, 
                   theme = "ivy",
-                  disable_devicons = true,
                   -- -- File tree depth to display, false for unlimited depth
                   depth = 1,
                   auto_depth = false,

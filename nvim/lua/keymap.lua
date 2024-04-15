@@ -60,7 +60,7 @@ vim.keymap.set('v', 'x', 'd', { nowait = true }) -- Cut
 vim.keymap.set('n', 'wsb', ':split<CR>', { })
 vim.keymap.set('n', 'wko', ':only<CR>', { })
 vim.keymap.set('n', 'wks', ':close!<CR>', { })
-vim.keymap.set('n', 'woo', '<C-w>W', { })
+vim.keymap.set('n', 'wo', '<C-w>W', { }) 
 
 -- Goto/Open
 -- Character within a line: 
@@ -78,17 +78,20 @@ vim.keymap.set({'n', 'v'}, 'ou',
 
 vim.keymap.set('n', '<C-l>f', vim.lsp.buf.code_action, { }) -- Top of Page
 
--- vim.keymap.set({'n', 'v'}, '.', vim.lsp.buf.references, { nowait = true, silent = true }) -- Forward character
--- vim.keymap.set({'n', 'v'}, '.', vim.lsp.buf.type_definition, { nowait = true, silent = true }) -- Forward character
-vim.keymap.set('n', '.', vim.lsp.buf.implementation, { nowait = true, silent = true }) -- Forward character
+vim.keymap.set('n', '.', vim.lsp.buf.definition, { nowait = true }) 
+vim.keymap.set('n', ',', '<C-o>' , { nowait = true }) -- Jump back
 -- vim.keymap.set({'i'}, '<Tab>', vim.lsp.buf.completion, { })
 
+vim.keymap.set('n', 'ou', vim.lsp.buf.hover, { nowait = true }) 
+vim.keymap.set('n', 'ot', vim.lsp.buf.type_definition, { nowait = true }) 
+vim.keymap.set('n', 'orr', vim.lsp.buf.rename, { nowait = true }) 
 
 vim.keymap.set('n', 'ok', 'gg', { }) -- Top of Page
 vim.keymap.set('n', 'ol', ']]', { }) -- End of page
 
 vim.keymap.set({'n', 'v'}, '<C-f>', require("plugins.telescope.occur").occur_in_file, {})
-vim.keymap.set({'n', 'v'}, 'of', require("plugins.telescope.find_files").find_files, {})
+vim.keymap.set({'n', 'v'}, 'opf', require("plugins.telescope.find_files").find_files, {})
+vim.keymap.set({'n', 'v'}, 'of', vim.lsp.buf.document_symbol, {})
 vim.keymap.set({'n', 'v'}, 'oa', ":Telescope file_browser path=%:p:h select_buffer=true<CR>", {})
 
 vim.keymap.set({'n', 'v'}, 'os', require("telescope.builtin").buffers, {})
