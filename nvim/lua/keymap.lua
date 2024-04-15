@@ -8,6 +8,7 @@ vim.keymap.set({'n', 'v'}, 'c', '<Nop>', {})
 vim.keymap.set({'n', 'v'}, 'C', '<Nop>', {})
 vim.keymap.set({'n', 'v'}, 'b', '<Nop>', {})
 vim.keymap.set({'n', 'v'}, 'a%', '<Nop>', {})
+vim.keymap.set({'n', 'v', 'i'}, '<C-z>', '<Nop>', {})
 --vim.keymap.set({'n', 'v'}, 'g', '<Nop>', {})
 --vim.keymap.set({'n', 'v'}, 'w', '<Nop>', {})
 
@@ -67,16 +68,28 @@ vim.keymap.set({'n', 'v'}, 'oc', 'f', { })   -- Goto character in line
 vim.keymap.set('n', 'oxc', 'df', { }) -- Goto delete character in line
 vim.keymap.set({'n', 'v'}, 'orc', 'F', { })   -- Reverse, Goto character in line
 vim.keymap.set('n', 'oxrc', 'dF', { }) -- Goto delete character in line
-vim.keymap.set({'n', 'v'}, '.', ';', { nowait = true, silent = true }) -- Forward character
+-- vim.keymap.set({'n', 'v'}, '.', ';', { nowait = true, silent = true }) -- Forward character
+
+-- Lsp --
 vim.keymap.set({'n', 'v'}, 'ou',
+   --vim.lsp.buf.hover,
    function() vim.diagnostic.open_float(nil, { focus = false }) end,
    { nowait = true, silent = true }) -- Forward character
+
+vim.keymap.set('n', '<C-l>f', vim.lsp.buf.code_action, { }) -- Top of Page
+
+-- vim.keymap.set({'n', 'v'}, '.', vim.lsp.buf.references, { nowait = true, silent = true }) -- Forward character
+-- vim.keymap.set({'n', 'v'}, '.', vim.lsp.buf.type_definition, { nowait = true, silent = true }) -- Forward character
+vim.keymap.set('n', '.', vim.lsp.buf.implementation, { nowait = true, silent = true }) -- Forward character
+-- vim.keymap.set({'i'}, '<Tab>', vim.lsp.buf.completion, { })
+
 
 vim.keymap.set('n', 'ok', 'gg', { }) -- Top of Page
 vim.keymap.set('n', 'ol', ']]', { }) -- End of page
 
 vim.keymap.set({'n', 'v'}, '<C-f>', require("plugins.telescope.occur").occur_in_file, {})
 vim.keymap.set({'n', 'v'}, 'of', require("plugins.telescope.find_files").find_files, {})
+vim.keymap.set({'n', 'v'}, 'oa', ":Telescope file_browser path=%:p:h select_buffer=true<CR>", {})
 
 vim.keymap.set({'n', 'v'}, 'os', require("telescope.builtin").buffers, {})
 vim.keymap.set({'n', 'v'}, 'ot', require("telescope.builtin").help_tags, {})
@@ -87,7 +100,7 @@ vim.keymap.set({'n', 'v', 'i'}, '<C-h>', 'dd', { })
 
 
 -- Insert -- 
-vim.keymap.set({'n', 'v', 'i'}, '<Tab>', '==', { })
+vim.keymap.set({'n', 'v'}, '<Tab>', '==', { })
 
 -- Common
 vim.keymap.set({'n', 'i', 'v', 'c', 't', 's', 'o', 'x'}, '<C-g>', '<Esc>', { nowait = true }) -- Cancel
