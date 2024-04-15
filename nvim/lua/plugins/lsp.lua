@@ -27,6 +27,29 @@ return {
          lspconfig.rust_analyzer.setup({})
       end
    },
+
+   -- Log startup status --
+   {
+      "j-hui/fidget.nvim",
+      opts = {
+         -- options
+      },
+   },
+
+   -- {
+   --    "aznhe21/actions-preview.nvim",
+   --    config = function()
+   --       -- vim.keymap.set({ "v", "n" }, "olf", require("actions-preview").code_actions)
+   --    end,
+   -- },
+
+   -- {
+   --    'filipdutescu/renamer.nvim',
+   --    branch = 'master',
+   --    requires = { {'nvim-lua/plenary.nvim'} }
+   -- },
+
+   
    -- Very cool idea, but visual distracting. Make as a toggle?
    -- Could toggle, see: <https://github.com/ErichDonGubler/lsp_lines.nvim>
    -- {

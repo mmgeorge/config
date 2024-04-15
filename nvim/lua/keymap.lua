@@ -84,7 +84,7 @@ vim.keymap.set('n', ',', '<C-o>' , { nowait = true }) -- Jump back
 
 vim.keymap.set('n', 'ou', vim.lsp.buf.hover, { nowait = true }) 
 vim.keymap.set('n', 'ot', vim.lsp.buf.type_definition, { nowait = true }) 
-vim.keymap.set('n', 'orr', vim.lsp.buf.rename, { nowait = true }) 
+vim.keymap.set('n', 'ow', vim.lsp.buf.rename, { nowait = true }) 
 
 vim.keymap.set('n', 'ok', 'gg', { }) -- Top of Page
 vim.keymap.set('n', 'ol', ']]', { }) -- End of page
