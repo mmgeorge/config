@@ -179,7 +179,12 @@
                  :group ,(lsp-json-bool lsp-rust-analyzer-import-group)
                  :merge (:glob ,(lsp-json-bool lsp-rust-analyzer-imports-merge-glob))
                  :prefix ,lsp-rust-analyzer-import-prefix)
-      :hover (:memoryLayout (:enable :json-false))
+      :signatureInfo ( :documentation (:enable :json-false))
+      :hover ( :memoryLayout (:enable :json-false)
+               :documentation (:enable :json-false)
+               :links (:enable :json-false)
+               :show (:traitAssocItems 0)
+               :actions (:enable :json-false))
       :lruCapacity ,lsp-rust-analyzer-lru-capacity
       :checkOnSave ( :enable ,(lsp-json-bool lsp-rust-analyzer-cargo-watch-enable)
                      :command ,lsp-rust-analyzer-cargo-watch-command
@@ -258,7 +263,8 @@
 
   (use-package lsp-mode
     :bind
-    (("C-c f" . helm-lsp-code-actions))
+    (("C-c f" . helm-lsp-code-actions)
+     ("M-t" . lsp-goto-type-definition))
     :custom
     (
      (lsp-headerline-breadcrumb-enable nil)
@@ -269,18 +275,20 @@
      (lsp-modeline-diagnostics-scope :worskapce)
      ;;(lsp-completion-enable-additional-text-edit nil)
      ;; (lsp-auto-guess-root t)
-     ;; (lsp-ui-doc-enable nil)
+     (lsp-ui-doc-enable nil)
+     (lsp-ui-doc-show-with-cursor nil)
      ;; (lsp-keep-workspace-alive nil)
      ;; (lsp-enable-snippet nil)
      ;; (lsp-imenu-sort-methods '(position))
      ;; (lsp-ui-sideline-show-code-actions nil)
      (lsp-idle-delay .5)
-     ;; (lsp-eldoc-hook nil)
+     (lsp-eldoc-hook nil)
      (lsp-lens-enable nil)
+     (lsp-ui-doc-position 'bottom)
+     (lsp-signature-auto-activate nil)
 
      ;; typescript
      (lsp-clients-typescript-max-ts-server-memory 8192)
-     ;; (lsp-signature-auto-activate nil)
      )
     :hook (rust-mode . lsp)
     :commands lsp)
@@ -292,13 +300,14 @@
     :commands lsp-ui-mode
     :bind
     (("M-o e" . lsp-ui-project-errors-list)
+     ("M-o h" . lsp-ui-doc-glance)
      (:map lsp-ui-project-errors-list-mode-map
            ("RET" . lsp-ui-project-errors-list--view)
            ("M-a" . lsp-ui-project-errors-list--visit)
            ("M-f" . lsp-ui-project-errors-list--visit)
            ("e" . lsp-ui-project-errors-list--toggle-severity)))
     :custom (
-     (lsp-ui-flycheck-list-position 'bottom)
+             (lsp-ui-flycheck-list-position 'bottom)
      ))
 
   (with-eval-after-load 'flycheck
@@ -577,9 +586,9 @@
           (advice-add 'lsp-rust-analyzer--make-init-options :override #'lsp-rust-analyzer-init-override)
   ;;         (require 'lsp-mode)
   ;;         ;; Needed for WASM + wgpu rust server when WGL not listed in features 
-  ;;         ;; (setq lsp-rust-analyzer-cargo-target '("wasm32-unknown-unknown" "x86_64-pc-windows-gnu"))
-  ;;         ;; (lsp-register-custom-settings
-  ;;         ;;  '(("rust.target" '("wasm32-unknown-unknown" "x86_64-pc-windows-gnu"))))
+          ;; (setq lsp-rust-analyzer-cargo-target '("wasm32-unknown-unknown" "x86_64-pc-windows-gnu"))
+          ;; (lsp-register-custom-settings
+           ;; '(("rust.target" '("wasm32-unknown-unknown" "x86_64-pc-windows-gnu"))))
   ;;         ;; (setenv "RUSTFLAGS" "--cfg=web_sys_unstable_apis")
   ;;         ;; Warning! This seems fairly buggy 2020-08-10 is the last version that seems to work for me
   ;;         ;;(add-hook 'flycheck-mode-hook #'flycheck-rust-setup)
