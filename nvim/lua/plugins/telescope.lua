@@ -55,29 +55,54 @@ return {
           },
           pickers = {
             find_files = {
-              theme = "ivy"
+               theme = "ivy",
+               previewer = false,
+               layout_config = {
+                  height = .3, -- 0.4,
+                  preview_cutoff=0,
+               },        
             },
             current_buffer_fuzzy_find = {
-            winblend = 0,
-            sorter = sorters.get_substr_matcher(),
-              theme = "ivy",
-              previewer = false,
-              layout_config = {
-                height = .3, -- 0.4,
-                preview_cutoff=0,
-              },        
+               sorter = sorters.get_substr_matcher(),
+               theme = "ivy",
+               previewer = false,
+               layout_config = {
+                  height = .3, -- 0.4,
+                  preview_cutoff=0,
+               },        
             },
             buffers = {
               theme = "ivy",
-               disable_devicons = true,
               previewer = false,
               layout_config = {
                 height = 0.4,
                 preview_cutoff=0,
               },        
+            },
+            lsp_document_symbols = {
+              theme = "ivy",
+              previewer = false,
+              show_line=true,
+              layout_config = {
+                height = 0.4,
+                preview_cutoff=0,
+              },        
+            },
+            lsp_workspace_symbols = {
+               theme = "ivy",
+               fname_width= 45,
+               symbol_width = 25, 
+               symbol_type_width = 8, 
+               previewer = false,
+               show_line=true,
+               layout_config = {
+                  height = 0.4,
+                  preview_cutoff=0,
+               },        
             }
+            
           }
-                                })
+        })
 
     end,
    },

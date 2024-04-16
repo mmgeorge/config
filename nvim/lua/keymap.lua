@@ -91,8 +91,11 @@ vim.keymap.set('n', 'ol', ']]', { }) -- End of page
 
 vim.keymap.set({'n', 'v'}, '<C-f>', require("plugins.telescope.occur").occur_in_file, {})
 vim.keymap.set({'n', 'v'}, 'opf', require("plugins.telescope.find_files").find_files, {})
-vim.keymap.set({'n', 'v'}, 'of', vim.lsp.buf.document_symbol, {})
 vim.keymap.set({'n', 'v'}, 'oa', ":Telescope file_browser path=%:p:h select_buffer=true<CR>", {})
+vim.keymap.set({'n', 'v'}, 'of', ":Telescope lsp_document_symbols<CR>", {})
+vim.keymap.set({'n', 'v'}, 'ops', ":Telescope lsp_workspace_symbols<CR>", {})
+vim.keymap.set({'n', 'v'}, 'opp', vim.lsp.buf.list_workspace_folders, {})
+
 
 vim.keymap.set({'n', 'v'}, 'os', require("telescope.builtin").buffers, {})
 vim.keymap.set({'n', 'v'}, 'ot', require("telescope.builtin").help_tags, {})
