@@ -66,10 +66,17 @@ return {
    
    {
       "folke/trouble.nvim",
-      -- dependencies = { "nvim-tree/nvim-web-devicons" },
+      dependencies = { "nvim-tree/nvim-web-devicons" },
+      keys = {
+         {
+            "we",
+            "<cmd>TroubleToggle<cr>",
+            desc = "Diagnostics (Trouble)",
+         }
+      },
       opts = {
          position = "bottom", -- position of the list can be: bottom, top, left, right
-         height = 10, -- height of the trouble list when position is top or bottom
+         height = 15, -- height of the trouble list when position is top or bottom
          width = 50, -- width of the list when position is left or right
          icons = false, -- use devicons for filenames
          mode = "workspace_diagnostics", -- "workspace_diagnostics", "document_diagnostics", "quickfix", "lsp_references", "loclist"
@@ -105,7 +112,7 @@ return {
             next = { "d" }, -- next item
             help = { "?"}, -- help menu
          },
-         multiline = true, -- render multi-line messages
+         multiline = false, -- render multi-line messages
          indent_lines = true, -- add an indent guide below the fold icons
          win_config = { border = "single" }, -- window configuration for floating windows. See |nvim_open_win()|.
          auto_open = false, -- automatically open the list when you have diagnostics
@@ -115,16 +122,15 @@ return {
          auto_jump = {"lsp_definitions"}, -- for the given modes, automatically jump if there is only a single result
          include_declaration = { "lsp_references", "lsp_implementations", "lsp_definitions"  }, -- for the given modes, include the declaration of the current symbol in the results
          signs = {
-            -- icons / text used for a diagnostic
-            -- error = "",
-            -- warning = "",
-            -- hint = "",
-            -- information = "",
-            -- other = "",
-            error = "E",
-            warning = "W",
-            hint = "H",
-            information = "I",
+            error = "",
+            warning = "",
+            hint = "",
+            information = "",
+            other = "",
+            -- error = "E",
+            -- warning = "W",
+            -- hint = "H",
+            -- information = "I",
          },
          use_diagnostic_signs = false -- enabling this will use the signs defined in your lsp client
       },
