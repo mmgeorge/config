@@ -33,7 +33,7 @@ return {
       
       require('telescope').setup({
           defaults = {
-             disable_devicons = true,
+             disable_devicons = false,
             winblend = 0,
             layout_strategy = "vertical", 
             layout_config = {
@@ -86,6 +86,7 @@ return {
       "nvim-telescope/telescope-file-browser.nvim",
       lazy = false, 
       dependencies = {
+         "nvim-tree/nvim-web-devicons",
          "nvim-telescope/telescope.nvim",
          "nvim-lua/plenary.nvim"
       },
@@ -96,7 +97,7 @@ return {
          require("telescope").setup ({
             extensions = {
                file_browser = {
-                  disable_devicons = true,
+                  disable_devicons = false,
                   -- grouped = true, 
                   theme = "ivy",
                   -- -- File tree depth to display, false for unlimited depth

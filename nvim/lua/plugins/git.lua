@@ -1,10 +1,22 @@
 return {
    {
+      "sindrets/diffview.nvim"
+   }
+   ,
+   
+   {
       "NeogitOrg/neogit",
       dependencies = {
          "nvim-lua/plenary.nvim",         -- required
          "sindrets/diffview.nvim",        -- optional - Diff integration
          "nvim-telescope/telescope.nvim", -- optional
+      },
+      keys = {
+         {
+            "wg",
+            "<cmd>Neogit<cr>",
+            desc = "Neogit",
+         }
       },
       config = function()
          local neogit = require("neogit")
@@ -54,7 +66,7 @@ return {
                underline = true
             },
             -- Set to false if you want to be responsible for creating _ALL_ keymappings
-            use_default_keymaps = true,
+            use_default_keymaps = false,
             -- Neogit refreshes its internal state after specific events, which can be
             -- expensive depending on the repository size. Disabling `auto_refresh`
             -- will make it so you have to manually refresh the status after you open it.
@@ -108,7 +120,7 @@ return {
             },
             signs = {
                -- { CLOSED, OPENED }
-               hunk = { "", "" },
+               hunk = { "##", "##" },
                item = { ">", "v" },
                section = { ">", "v" },
             },
@@ -164,16 +176,17 @@ return {
                   hidden = false,
                },
                recent = {
-                  folded = true,
+                  folded = false,
                   hidden = false,
                },
                rebase = {
                   folded = true,
-                  hidden = false,
+                  hidden = true,
                },
             },
             mappings = {
                commit_editor = {
+                  ["g"] = "Close", -- ["q"] = "Close",
                   ["q"] = "Close",
                   ["<c-c><c-c>"] = "Submit",
                   ["<c-c><c-k>"] = "Abort",
@@ -186,15 +199,19 @@ return {
                   ["f"] = "Fixup",
                   ["x"] = "Execute",
                   ["d"] = "Drop",
+                  --["d"] = nil,
                   ["b"] = "Break",
-                  ["q"] = "Close",
+                  ["g"] = "Close", --["q"] = "Close",
                   ["<cr>"] = "OpenCommit",
-                  ["gk"] = "MoveUp",
-                  ["gj"] = "MoveDown",
+                  --["gk"] = "MoveUp",
+                  --["gj"] = "MoveDown",
                   ["<c-c><c-c>"] = "Submit",
                   ["<c-c><c-k>"] = "Abort",
                },
                finder = {
+                  ["g"] = "Close",
+                  ["q"] = "Close",
+
                   ["<cr>"] = "Select",
                   ["<c-c>"] = "Close",
                   ["<esc>"] = "Close",
@@ -205,6 +222,9 @@ return {
                   ["<tab>"] = "MultiselectToggleNext",
                   ["<s-tab>"] = "MultiselectTogglePrevious",
                   ["<c-j>"] = "NOP",
+
+                  ["d"] = "Next",
+                  ["s"] = "Previous",
                },
                -- Setting any of these to `false` will disable the mapping.
                popup = {
@@ -217,27 +237,31 @@ return {
                   ["Z"] = "StashPopup",
                   ["b"] = "BranchPopup",
                   ["c"] = "CommitPopup",
-                  ["f"] = "FetchPopup",
-                  ["l"] = "LogPopup",
+                  ["F"] = "FetchPopup", -- ["f"] = "FetchPopup",
+                  ["L"] = "LogPopup",
                   ["m"] = "MergePopup",
                   ["p"] = "PullPopup",
                   ["r"] = "RebasePopup",
                   ["v"] = "RevertPopup",
-                  ["w"] = "WorktreePopup",
+                  ["ww"] = "WorktreePopup",
                },
                status = {
+                  ["g"] = "Close", -- ["q"] = "Close",
                   ["q"] = "Close",
+
                   ["I"] = "InitRepo",
                   ["1"] = "Depth1",
-                  ["2"] = "Depth2",
+
+                  ["a"] = "Depth2", -- ["2"] = "Depth2",
+
                   ["3"] = "Depth3",
                   ["4"] = "Depth4",
-                  ["<tab>"] = false,
-                  ["<Right>"] = "Toggle",
+
+                  ["f"] = "Toggle", -- ["<tab>"] = "Toggle",
                   ["x"] = "Discard",
-                  ["s"] = "Stage",
-                  ["S"] = "StageUnstaged",
-                  ["<c-s>"] = "StageAll",
+                  ["o"] = "Stage",
+                  ["O"] = "StageUnstaged",
+                  ["<c-o>"] = "StageAll",
                   ["u"] = "Unstage",
                   ["U"] = "UnstageStaged",
                   ["$"] = "CommandHistory",
@@ -248,8 +272,8 @@ return {
                   ["<c-v>"] = "VSplitOpen",
                   ["<c-x>"] = "SplitOpen",
                   ["<c-t>"] = "TabOpen",
-                  ["{"] = "GoToPreviousHunkHeader",
-                  ["}"] = "GoToNextHunkHeader",
+                  [","] = "GoToPreviousHunkHeader", -- ["{"] = "GoToPreviousHunkHeader",
+                  ["."] = "GoToNextHunkHeader", -- ["}"] = "GoToNextHunkHeader",
                },
             },
          }
