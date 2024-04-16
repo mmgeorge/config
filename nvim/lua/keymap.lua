@@ -43,8 +43,8 @@ vim.keymap.set({'n', 'v'}, '/', '$', { nowait = true, silent = true }) -- End Li
 vim.keymap.set('n', '<C-i>', 'i', { nowait = true }) -- Enter insert mode
 vim.keymap.set('n', 'J', 'i', { nowait = true }) -- Enter insert mode
 
-vim.keymap.set('n', 'D', 'o', { nowait = true }) -- Enter insert mode
-vim.keymap.set('n', 'S', 'O', { nowait = true }) -- Enter insert mode
+vim.keymap.set('n', 'K', 'O', { nowait = true }) -- Enter insert above
+vim.keymap.set('n', 'L', 'o', { nowait = true }) -- Enter insert below
 
 -- Selection
 vim.keymap.set('n', 'i', 'v', { nowait = true }) -- Enter selection mode
