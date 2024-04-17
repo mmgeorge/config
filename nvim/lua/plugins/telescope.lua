@@ -72,8 +72,17 @@ return {
                },        
             },
             buffers = {
+               -- Also includes other options, could provide a custom sorting function
               theme = "ivy",
               previewer = false,
+              -- sorts current and last buffer to the top and selects the lastused
+              sort_lastused = true,
+              -- Sorts all buffers after most recent used. Not just the current & last one
+              sort_mru = true,
+              -- Only show buffers in the current working directory
+              only_cwd = false,
+              --ignore_current_buffer = true,
+              --select_current = false,
               layout_config = {
                 height = 0.4,
                 preview_cutoff=0,

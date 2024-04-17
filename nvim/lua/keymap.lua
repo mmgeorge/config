@@ -9,6 +9,15 @@ vim.keymap.set({'n', 'v'}, 'C', '<Nop>', {})
 vim.keymap.set({'n', 'v'}, 'b', '<Nop>', {})
 vim.keymap.set({'n', 'v'}, 'a%', '<Nop>', {})
 vim.keymap.set({'n', 'v', 'i'}, '<C-z>', '<Nop>', {})
+-- vim.keymap.set({'n', 'v', 'i'}, '<C-g> s', '<Nop>', {})
+-- vim.keymap.set({'n', 'v', 'i'}, '<C-g><C-j>', '<Nop>', {})
+-- vim.keymap.set({'n', 'v', 'i'}, '<C-g> j', '<Nop>', {})
+-- vim.keymap.set({'n', 'v', 'i'}, '<C-g><Down>', '<Nop>', {})
+-- vim.keymap.set({'n', 'v', 'i'}, '<C-g><C-k>', '<Nop>', {})
+-- vim.keymap.set({'n', 'v', 'i'}, '<C-g>ok', '<Nop>', {})
+-- vim.keymap.set({'n', 'v', 'i'}, '<C-g><Up>', '<Nop>', {})
+--vim.keymap.set({'n', 'v', 'i'}, '<C-g>u', '<Nop>', {})
+--vim.keymap.set({'n', 'v', 'i'}, '<C-g>U', '<Nop>', {})
 --vim.keymap.set({'n', 'v'}, 'g', '<Nop>', {})
 --vim.keymap.set({'n', 'v'}, 'w', '<Nop>', {})
 
@@ -80,6 +89,9 @@ vim.keymap.set('n', '<C-l>f', vim.lsp.buf.code_action, { }) -- Top of Page
 
 vim.keymap.set('n', '.', vim.lsp.buf.definition, { nowait = true }) 
 vim.keymap.set('n', ',', '<C-o>' , { nowait = true }) -- Jump back
+--vim.keymap.set('n', '<C-,>', 'g;' , { nowait = true }) -- Jump back to last change
+vim.keymap.set('n', '=', 'g;' , { nowait = true }) -- Jump back to last change
+vim.keymap.set('n', '{', 'g,' , { nowait = true }) -- Jump recent change
 -- vim.keymap.set({'i'}, '<Tab>', vim.lsp.buf.completion, { })
 
 vim.keymap.set('n', 'ou', vim.lsp.buf.hover, { nowait = true }) 
@@ -95,6 +107,11 @@ vim.keymap.set({'n', 'v'}, 'oa', ":Telescope file_browser path=%:p:h select_buff
 vim.keymap.set({'n', 'v'}, 'of', ":Telescope lsp_document_symbols<CR>", {})
 vim.keymap.set({'n', 'v'}, 'ops', ":Telescope lsp_workspace_symbols<CR>", {})
 vim.keymap.set({'n', 'v'}, 'opp', vim.lsp.buf.list_workspace_folders, {})
+vim.keymap.set({'n', 'v'}, 'oq', function()
+      vim.lsp.buf.format {
+         filter = function(client) return client.name ~= "tsserver" end
+      }
+end, {})
 
 
 vim.keymap.set({'n', 'v'}, 'os', require("telescope.builtin").buffers, {})
@@ -109,7 +126,8 @@ vim.keymap.set({'n', 'v', 'i'}, '<C-h>', 'dd', { })
 vim.keymap.set({'n', 'v'}, '<Tab>', '==', { })
 
 -- Common
-vim.keymap.set({'n', 'i', 'v', 'c', 't', 's', 'o', 'x'}, '<C-g>', '<Esc>', { nowait = true }) -- Cancel
+vim.keymap.set({'n', 'i', 'v'}, '<C-g>', '<Esc>', { nowait = false, unique=true }) -- Cancel
+--vim.keymap.set({'n', 'i', 'v'}, '<Left>', '<Esc>', { nowait = false, unique=true }) -- Cancel
 vim.keymap.set({'n', 'i', 'v', 'c', 't', 's', 'o', 'x'}, '<C-k>', '<Esc>', { nowait = true }) -- Cancel
 
 vim.keymap.set('n', '<C-s>', ':w<CR>', { nowait = true }) -- Save file
