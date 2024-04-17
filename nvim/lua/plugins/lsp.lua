@@ -12,9 +12,22 @@ return {
       "williamboman/mason-lspconfig.nvim",
       config = function()
          require("mason-lspconfig").setup({
-               ensure_installed = { "lua_ls", "tsserver" }
+               ensure_installed = { "lua_ls", "tsserver", "eslint" }
 
          })
+      end
+   },
+
+   -- Install mason tools automatically -- 
+   {
+      "WhoIsSethDaniel/mason-tool-installer.nvim",
+      config = function()
+         require("mason-tool-installer").setup({
+               ensure_installed = { "stylua", "prettierd" },
+               auto_update = false,
+               run_on_start = true,
+               debounce_hours = 5, 
+      })
       end
    },
 
@@ -26,6 +39,51 @@ return {
          lspconfig.lua_ls.setup({})
          lspconfig.rust_analyzer.setup({})
          lspconfig.tsserver.setup({})
+         lspconfig.eslint.setup({
+               on_attach = function(client, bufnr)
+                  vim.api.nvim_create_autocmd("BufWritePre", {
+                                                 buffer = bufnr,
+                                                 command = "EslintFixAll",
+                  })
+               end,
+               settings = {
+                  codeAction = {
+                     disableRuleComment = {
+                        enable = true,
+                        location = "separateLine"
+                     },
+                     showDocumentation = {
+                        enable = true
+                     }
+                  },
+                  codeActionOnSave = {
+                     enable = true,
+                     mode = "all"
+                  },
+                  experimental = {
+                     useFlatConfig = false
+                  },
+                  format = true,
+                  nodePath = "",
+                  onIgnoredFiles = "off",
+                  problems = {
+                     shortenToSingleLine = false
+                  },
+                  quiet = false,
+                  rulesCustomizations = {
+                     {
+                        rule = 'prettier/prettier',
+                        severity = 'off', 
+                     }
+                  },
+                  run = "onType",
+                  useESLintClass = false,
+                  validate = "on",
+                  workingDirectory = {
+                     mode = "location"
+                  }
+               }
+         })
       end
    },
 
@@ -80,9 +138,9 @@ return {
          width = 50, -- width of the list when position is left or right
          icons = false, -- use devicons for filenames
          mode = "workspace_diagnostics", -- "workspace_diagnostics", "document_diagnostics", "quickfix", "lsp_references", "loclist"
-         severity = { vim.diagnostic.severity.ERROR,
-                      vim.diagnostic.severity.WARN
-         }, -- nil (ALL) or vim.diagnostic.severity.ERROR | WARN | INFO | HINT
+         --severity = { vim.diagnostic.severity.ERROR,
+           --           vim.diagnostic.severity.WARN
+         -- }, -- nil (ALL) or vim.diagnostic.severity.ERROR | WARN | INFO | HINT
          fold_open = "", --"", -- icon used for open folds
          fold_closed = "", -- "", -- icon used for closed folds
          group = true, -- group results by file

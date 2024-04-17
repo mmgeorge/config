@@ -8,6 +8,7 @@ return {
          "hrsh7th/cmp-path", 
          "hrsh7th/cmp-cmdline", 
          "hrsh7th/cmp-nvim-lsp", 
+         "saadparwaiz1/cmp_luasnip", 
          "onsails/lspkind.nvim", -- pretty formatting
       },
       config = function()
@@ -31,14 +32,14 @@ return {
                },
                snippet = {
                   expand = function(args)
-                     vim.snippet.expand(args.body)
+                     require'luasnip'.lsp_expand(args.body)
+                     --vim.snippet.expand(args.body)
                   end
                },
                completion = {
                   scrollbar = false,
-                  -- completeopt = "menu, menuone, preview, noselect",
-                  -- keyword_length = 5, -- # of characters to trigger auto completion
-                  
+                  completeopt = "menu, menuone, preview, noselect",
+                  -- keyword_length = 4, -- # of characters to trigger auto completion
                },
                window = {
                   -- completion = cmp.config.window.bordered(),
@@ -57,19 +58,21 @@ return {
                      -- Intellij-like mapping
                      --   If no completion is selected, insert the first one in the list.
                      --   If a completion is selected, insert this one.
-                     ["<Tab>"] = cmp.mapping(function(fallback)
-                           -- This little snippet will confirm with tab, and if no entry is selected,
-                           -- will confirm the first item
-                           if cmp.visible() then
-                              local entry = cmp.get_selected_entry()
-                              if not entry then
-                                 cmp.select_next_item({ behavior = cmp.SelectBehavior.Select })
-                              end
-                              cmp.confirm()
-                           else
-                              fallback()
-                           end
-                     end, {"i","s","c",}),
+                     -- ["<Tab>"] = cmp.mapping(function(fallback)
+                     --       -- This little snippet will confirm with tab, and if no entry is selected,
+                     --       -- will confirm the first item
+                     --       if cmp.visible() then
+                     --          local entry = cmp.get_selected_entry()
+                     --          if not entry then
+                     --             cmp.select_next_item({ behavior = cmp.SelectBehavior.Select })
+                     --          end
+                     --          cmp.confirm()
+                     --       elseif require("luasnip").locally_jumpable(1) then
+                     --          require("luasnip").jump(1)
+                     --       else
+                     --          fallback()
+                     --       end
+                     -- end, {"i","s","c",}),
                      ['<C-b>'] = cmp.mapping.scroll_docs(-4),
                      ['<C-f>'] = cmp.mapping.scroll_docs(4),
                      ['<C-Space>'] = cmp.mapping.complete(),
@@ -79,17 +82,38 @@ return {
                      ['<CR>'] = cmp.mapping.confirm({ select = true }),
                }),
                sources = cmp.config.sources({
+                     { name = 'luasnip' },
                      { name = 'nvim_lsp' },
-                     { name = 'path' },
-                     { name = 'cmdline' },
-                     { name = 'buffer' },
+                     -- { name = 'path' },
+                     -- { name = 'buffer' },
                })
          })
+
+         cmp.setup.cmdline({ '/', '?' }, {
+               mapping = cmp.mapping.preset.cmdline(),
+               sources = {
+                  { name = 'buffer' }
+               }
+         })
+
+         cmp.setup.cmdline(':', {
+                              mapping = cmp.mapping.preset.cmdline(),
+                              sources = cmp.config.sources({
+                                    { name = 'path' }
+                                                           }, {
+                                    { name = 'cmdline' }
+                              }),
+                              matching = { disallow_symbol_nonprefix_matching = false }
+         })
+         
 
          local capabilities = require('cmp_nvim_lsp').default_capabilities()
          require('lspconfig')['rust_analyzer'].setup({
                capabilities = capabilities
                                                     })
+         require('lspconfig')['tsserver'].setup({
+               capabilities = capabilities
+         })
       end
       
 }}
