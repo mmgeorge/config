@@ -38,7 +38,7 @@ vim.keymap.set({'n', 'v'}, ';', 'l', { nowait = true, silent = true }) -- Right
 --vim.keymap.set({'n', 'v'}, '<Right>', '$', { nowait = true, silent = true }) -- End Line
 vim.keymap.set({'n', 'v'}, 'm', '^', { nowait = true, silent = true }) -- Start Line
 vim.keymap.set({'n', 'v'}, '/', '$', { nowait = true, silent = true }) -- End Line
-vim.keymap.set({'n', 'v'}, 'o/', '/', { nowait = true  }) -- End Line
+vim.keymap.set({'n', 'v'}, 'o/', '/\\c', { nowait = true  }) -- End Line
 
 -- Selection
 -- vim.keymap.set('n', '<C-v>', '<C-v>: ', { nowait = true }) -- Enter selection mode
@@ -124,6 +124,9 @@ vim.keymap.set('n', '<C-l>f', vim.lsp.buf.code_action, { }) -- Top of Page
 vim.keymap.set('n', '=', 'g;' , { nowait = true }) -- Jump back to last change
 vim.keymap.set('n', '{', 'g,' , { nowait = true }) -- Jump recent change
 -- vim.keymap.set({'i'}, '<Tab>', vim.lsp.buf.completion, { })
+
+
+vim.keymap.set('n', 'wq', function() require("trouble").toggle("quickfix") end, { nowait = true }) 
 
 vim.keymap.set('n', 'ou', vim.lsp.buf.hover, { nowait = true }) 
 vim.keymap.set('n', 'ot', vim.lsp.buf.type_definition, { nowait = true }) 
