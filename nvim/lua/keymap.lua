@@ -29,8 +29,8 @@ vim.keymap.set({'n', 'v'}, 'l', '5<C-D>', { nowait = true, silent = true }) -- S
 --vim.keymap.set({'n', 'v'}, 'k', '<C-u>zz', { nowait = true, silent = true }) -- Scroll Up
 --vim.keymap.set({'n', 'v'}, 'l', '<C-d>zz', { nowait = true, silent = true }) -- Scroll Down
 -- Search, keeping centered
--- vim.keymap.set('n', '<C-;>', 'nzzzv', { nowait = true, silent = true })
--- vim.keymap.set('n', '<C-;>', 'Nzzzv', { nowait = true, silent = true })
+vim.keymap.set('n', 'n', 'nzzzv', { nowait = true, silent = true })
+vim.keymap.set('n', 'n', 'Nzzzv', { nowait = true, silent = true })
 
 vim.keymap.set({'n', 'v'}, 'j', 'h', { nowait = true, silent = true }) -- Left
 vim.keymap.set({'n', 'v'}, ';', 'l', { nowait = true, silent = true }) -- Right
@@ -40,15 +40,6 @@ vim.keymap.set({'n', 'v'}, 'm', '^', { nowait = true, silent = true }) -- Start 
 vim.keymap.set({'n', 'v'}, '/', '$', { nowait = true, silent = true }) -- End Line
 vim.keymap.set({'n', 'v'}, 'o/', '/\\c', { nowait = true  }) -- End Line
 
--- Selection
--- vim.keymap.set('n', '<C-v>', '<C-v>: ', { nowait = true }) -- Enter selection mode
-vim.keymap.set('v', 'il', 'V', { nowait = true }) -- Select line
-vim.keymap.set('n', '<A-i>l', 'V', { nowait = true }) -- Select line
-vim.keymap.set('v', 'u', 'y`]', { nowait = true }) -- Copy (Kill-copy), `] jumpts to end
---vim.keymap.set('n', 'u', 'y', { nowait = true }) -- Copy (Kill-copy)
-vim.keymap.set({'n', 'v'}, 'y', 'p', { nowait = true }) -- Past / Yank (in emacs lingo)
-vim.keymap.set({'n', 'v'}, 'Y', 'P', { nowait = true }) -- Past / Yank (in emacs lingo)
-vim.keymap.set({'i'}, '<C-y>', '<C-o>p', { nowait = true }) -- Past / Yank (in emacs lingo)
 
 -- Enter Modes
 vim.keymap.set('n', '<C-i>', 'i', { nowait = true }) -- Enter insert mode
@@ -79,16 +70,47 @@ vim.keymap.set({'n', 'v'}, 'xx', 'dd', { }) -- Kill
 vim.keymap.set({'n', 'v'}, 'xp', 'df', { }) -- Kill
 vim.keymap.set({'n', 'v'}, 'xj', 'dF', { }) -- Kill
 
+-- Move text up or downsss
+vim.keymap.set({'v'}, 'L', ":m '<+1<CR>gv=gv", { }) -- Kill
+vim.keymap.set({'v'}, 'K', ":m '>-2<CR>gv=gv", { }) -- Kill
+
+-- vim.keymap.set({'n'}, 'Z', "J", { }) -- Join lines of text
+
+-- Selection
+-- vim.keymap.set('n', '<C-v>', '<C-v>: ', { nowait = true }) -- Enter selection mode
+vim.keymap.set('v', 'il', 'V', { nowait = true }) -- Select line
+vim.keymap.set('n', '<A-i>l', 'V', { nowait = true }) -- Select line
+-- vim.keymap.set('v', 'u', "\"+y`]", { nowait = true }) -- Copy (Kill-copy), \+ is sys clipboard, `] jumps to end
+vim.keymap.set('v', 'u', "\"+y", { nowait = true }) -- Copy (Kill-copy), \+ is sys clipboard, `] jumps to end
+vim.keymap.set('v', 'U', "\"+Y", { nowait = true }) -- Copy (Kill-copy), jumps to end g
+
+--vim.keymap.set('n', 'u', 'y', { nowait = true }) -- Copy (Kill-copy)
+vim.keymap.set({'n', 'v'}, 'y', 'p', { nowait = true }) -- Past / Yank (in emacs lingo)
+vim.keymap.set({'n', 'v'}, 'Y', 'P', { nowait = true }) -- Past / Yank (in emacs lingo)
+vim.keymap.set({'i'}, '<C-y>', '<C-o>p', { nowait = true }) -- Past / Yank (in emacs lingo)
+
+vim.keymap.set({'n', 'v'}, '<leader>y', "\"_dPd", { nowait = true }) -- Paste over (don't add to clipboard)
+
+vim.keymap.set({'n', 'v'}, '<leader>s', ":%s/\\<<C-r><C-w>\\>/<C-r><C-w>/gI<Left><Left><Left>", { nowait = true }) -- Paste over (don't add to clipboard)
+
+---- Jump quickfix
+vim.keymap.set('n', '<leader>k', "<cmd>lnext<CR>zz", { nowait = true }) -- Paste over (don't add to clipboard)
+vim.keymap.set('n', '<leader>j', "<cmd>lprev<CR>zz", { nowait = true }) -- Paste over (don't add to clipboard)
+vim.keymap.set('n', '<C-k>', "<cmd>cnext<CR>zz", { nowait = true }) -- Paste over (don't add to clipboard)
+vim.keymap.set('n', '<C-j>', "<cmd>cprev<CR>zz", { nowait = true }) -- Paste over (don't add to clipboard)
+
+
 
 vim.keymap.set('n', '.', ';', { nowait = true }) 
 
 -- Folding
-vim.keymap.set('n', 'zz', 'zo', { nowait = true }) -- Kill line
+vim.keymap.set('n', 'zz', 'zo', { nowait = true })
 
 -- Insert -- 
 vim.keymap.set({'n', 'v'}, '<Tab>', '==', { })
 
--- vim.keymap.set({'n'}, 'zf', 'zf', { })
+
+
 
 -- Window
 vim.keymap.set('n', 'wsb', ':split<CR>', { })
