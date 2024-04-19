@@ -121,6 +121,7 @@ vim.keymap.set('n', '{', vim.lsp.buf.definition, { nowait = true })
 vim.keymap.set('n', '=', '<C-o>' , { nowait = true }) -- Jump back
 vim.keymap.set('n', '@', 'g;' , { nowait = true }) -- Jump back to last change
 vim.keymap.set('n', '~', 'g,' , { nowait = true }) -- Jump recent change
+vim.keymap.set({'n', 'i', 'v'}, '<Tab>', '==' , { nowait = true }) -- Jump recent change
 
 -- vim.keymap.set({'i'}, '<Tab>', vim.lsp.buf.completion, { })
 vim.keymap.set('n', 'wq', function() require("trouble").toggle("quickfix") end, { nowait = true }) 
@@ -133,7 +134,7 @@ vim.keymap.set('n', 'ok', 'gg', { }) -- Top of Page
 vim.keymap.set('n', 'ol', 'G', { }) -- End of page
 
 vim.keymap.set({'n', 'v'}, '<C-f>', require("plugins.telescope.occur").occur_in_file, {})
-vim.keymap.set({'n', 'v'}, 'opf', ":Telescope find_files<CR>", {})
+vim.keymap.set({'n', 'v'}, 'opf', require("plugins.telescope.find_files").find_files, {})
 vim.keymap.set({'n', 'v'}, 'oa', ":Telescope file_browser path=%:p:h select_buffer=true<CR><ESC>", {})
 vim.keymap.set({'n', 'v'}, 'of', ":Telescope lsp_document_symbols<CR>", {})
 vim.keymap.set({'n', 'v'}, 'ops', ":Telescope lsp_workspace_symbols<CR>", {})
