@@ -42,14 +42,22 @@ return {
 
               preview_cutoff=1,
             },
+            -- See <https://github.com/nvim-telescope/telescope.nvim/blob/master/lua/telescope/mappings.lua>
             mappings = {
               i = {
-                ["<C-g>"] = actions.close, 
+                --["<C-g>"] = actions.close, 
                 ["<C-k>"] = actions.close, 
               },
               n = {
-                ["<C-g>"] = actions.close, 
+                --["<C-g>"] = actions.close, 
                 ["<C-k>"] = actions.close, 
+                ["s"] = actions.move_selection_previous, 
+                ["d"] = actions.move_selection_next,
+                ["k"] = actions.preview_scrolling_up, 
+                ["l"] = actions.preview_scrolling_down, 
+                ["ok"] = actions.move_to_top, 
+                ["ol"] = actions.move_to_bottom, 
+                ["<tab>"] = actions.select_tab, 
               }
             }
           },
