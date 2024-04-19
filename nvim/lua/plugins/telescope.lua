@@ -173,7 +173,7 @@ return {
                         ["<Left>"] = fb_actions.goto_parent_dir,
                         ["<Right>"] = fb_actions.change_cwd,
                         ["<C-r>"] = fb_actions.rename, 
-                        ["<C-x>"] = fb_actions.remove, 
+                        ["<c-x>"] = fb_actions.remove, 
                         ["<C-m>"] = fb_actions.move, 
                         ["<C-n>"] = fb_actions.create, 
                         ["<C-p>"] = fb_actions.create_from_prompt, 
@@ -185,6 +185,7 @@ return {
                         ["<CR>"] = actions.select_default,
                         ["a"] = fb_actions.goto_parent_dir, 
                         ["f"] = fb_actions.change_cwd, 
+                        ["<c-x>"] = fb_actions.remove, 
 
                         -- your custom normal mode mappings
                      },
