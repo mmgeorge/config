@@ -55,7 +55,7 @@ return {
                         -- [']]'] = '@class.inner',
                      },
                      goto_next_end = {
-                        ['cf'] = '@function.outer',
+                        -- ['cf'] = '@function.outer',
                         -- [']['] = '@class.outer',
                      },
                      goto_previous_start = {
