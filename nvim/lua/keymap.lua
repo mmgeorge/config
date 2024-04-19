@@ -61,6 +61,9 @@ vim.keymap.set('n', 'n', 'Nzzzv', { nowait = true, silent = true })
 vim.keymap.set({'n', 'v', 'i'}, '<C-h>', 'dd', { })
 vim.keymap.set({'n', 'v'}, 'U', '<C-r>', { }) -- Redo
 
+vim.keymap.set({'n'}, 'I', 'O<ESC>', { }) -- Insert blank line below
+vim.keymap.set({'n'}, 'O', 'o<ESC>', { }) -- Insert blank line above
+
 
 -------------------------------------------------------------------------------
 ---- VisualMode ----
@@ -71,7 +74,7 @@ vim.keymap.set({'v'}, 'K', ":m '>-2<CR>gv=gv", { }) -- Kill
 
 -- Selection
 -- vim.keymap.set('v', 'il', 'V', { nowait = true }) -- Select line -> No, just use V?
--- vim.keymap.set('v', 'u', "\"+y`]", { nowait = true }) -- Copy (Kill-copy), \+ is sys clipboard, `] jumps to end
+vim.keymap.set('v', 'y', "y`]", { nowait = true }) -- Copy (Kill-copy),  `] jumps to end
 -- vim.keymap.set('v', 'y', "\"+y", { }) -- Copy to clipboard
 -- vim.keymap.set('v', 'Y', "\"+Y", { }) -- Copy to clipboard
 vim.keymap.set({'n', 'v'}, '<leader>p', "\"_dPd", { nowait = true }) -- Paste over (don't add to clipboard)
