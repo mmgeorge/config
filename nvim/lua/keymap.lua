@@ -78,6 +78,7 @@ vim.keymap.set('v', 'y', "y`]", { nowait = true }) -- Copy (Kill-copy),  `] jump
 -- vim.keymap.set('v', 'y', "\"+y", { }) -- Copy to clipboard
 -- vim.keymap.set('v', 'Y', "\"+Y", { }) -- Copy to clipboard
 vim.keymap.set({'n', 'v'}, '<leader>p', "\"_dPd", { nowait = true }) -- Paste over (don't add to clipboard)
+vim.keymap.set({'n', 'v'}, '<C-p>', "\"+p", { nowait = true }) -- Paste over (don't add to clipboard)
 
 -- Commands --
 ---- Replace text
