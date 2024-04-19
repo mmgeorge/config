@@ -19,7 +19,7 @@ return {
               mappings = {
                  -- Toggle comment (like `gcip` - comment inner paragraph) for both
                  -- Normal and Visual modes
-                 comment = '',
+                 comment = '<C-/>',
                  -- Toggle comment on current line
                  -- comment_line = 'i/',
                  -- Toggle comment on visual selection
