@@ -15,7 +15,7 @@ vim.api.nvim_command(":unmap b")
 vim.api.nvim_command(":unmap a%")
 
 -- Remaps --
-vim.api.nvim_command(":noremap f <cmd>lua require('spider').motion('w')<CR>") -- Move right word
+vim.api.nvim_command(":noremap f <cmd>lua require('spider').motion('e')<CR>") -- Move right word
 vim.api.nvim_command(":noremap a <cmd>lua require('spider').motion('b')<CR>") -- Move right word
 -- vim.api.nvim_command(":noremap f <cmd>require('spider').motion('w')<CR>") -- Move right word
 -- vim.api.nvim_command(":noremap a b") -- Move left word
