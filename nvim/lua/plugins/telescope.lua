@@ -172,13 +172,9 @@ return {
                      ["i"] = {
                         ["<Left>"] = fb_actions.goto_parent_dir,
                         ["<Right>"] = fb_actions.change_cwd,
-                        ["<C-r>"] = fb_actions.rename, 
-                        ["<c-x>"] = fb_actions.remove, 
-                        ["<C-m>"] = fb_actions.move, 
-                        ["<C-n>"] = fb_actions.create, 
                         ["<C-p>"] = fb_actions.create_from_prompt, 
                         ["<CR>"] = actions.select_default, 
-                        ["<C-g>"] = actions.close, 
+                        -- ["<C-g>"] = actions.close, 
                         -- your custom insert mode mappings
                      },
                      ["n"] = {
@@ -186,6 +182,10 @@ return {
                         ["a"] = fb_actions.goto_parent_dir, 
                         ["f"] = fb_actions.change_cwd, 
                         ["<c-x>"] = fb_actions.remove, 
+                        ["<C-r>"] = fb_actions.rename, 
+                        ["<C-x>"] = fb_actions.remove, 
+                        ["<C-m>"] = fb_actions.move, 
+                        ["<C-n>"] = fb_actions.create, 
 
                         -- your custom normal mode mappings
                      },
