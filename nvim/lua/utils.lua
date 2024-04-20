@@ -1,6 +1,50 @@
 
 local provides = {}
 
+provides.get_uuid = function(opts)
+  local templates = {
+    v4 = "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx",
+  }
+
+  local uuid = string.gsub(templates.v4, "[xy]", function(c)
+    local r = math.random()
+
+    -- if c == 'x', generate a random hex digit (0-15)
+    -- if c == 'y', generate a random hex digit (8-11)
+    local v = c == "x" and math.floor(r * 0x10) or (math.floor(r * 0x4) + 8)
+
+    return string.format("%x", v)
+  end)
+
+  -- Convert to upper case if requested (always lower case by default)
+  -- if opts.case == "upper" then
+  --   uuid = string.upper(uuid)
+  -- end
+  --
+  -- if opts.quotes == "double" then
+  --   uuid = '"' .. uuid .. '"'
+  -- elseif opts.quotes == "single" then
+  --   uuid = "'" .. uuid .. "'"
+  -- end
+  --
+  -- if opts.prefix ~= "" then
+  --   uuid = opts.prefix .. uuid
+  -- end
+  --
+  -- if opts.suffix ~= "" then
+  --   uuid = uuid .. opts.suffix
+  -- end
+  --
+  return uuid
+end
+
+provides.insert_v4 = function(opts)
+  local uuid = provides.get_uuid(opts)
+  local after = true
+
+  vim.api.nvim_put({ uuid }, "c", after, true)
+end
+
 local function tbl_length(T)
   local count = 0
   for _ in pairs(T) do count = count + 1 end
