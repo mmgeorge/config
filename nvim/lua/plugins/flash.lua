@@ -4,7 +4,7 @@ return {
   ---@type Flash.Config
   -- stylua: ignore
   keys = {
-    { "og", mode = { "n", "x", "o" }, function() require("flash").jump() end, desc = "Flash" }, 
+    { "<Leader>f", mode = { "n", "x", "o" }, function() require("flash").jump() end, desc = "Flash" }, 
   },
   opts = {
     -- labels = "abcdefghijklmnopqrstuvwxyz",
