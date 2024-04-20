@@ -9,8 +9,8 @@ return {
         scroll_center = true,
         search_key = nil,
         cancel_search_key = nil,
-        color_key = "oh",
-        cancel_color_key = "oH",
+        color_key = "<leader>h",
+        cancel_color_key = "<leader>H",
       }
     end
   }, 

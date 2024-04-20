@@ -137,7 +137,7 @@ provides.occur_in_file = function ()
    
    local opts = {
       attach_mappings=on_occur_change,
-      default_text=utils.get_visual_selection(),
+      -- default_text=utils.get_visual_selection(),
       -- tiebreak = function(entry1, entry2, prompt)
       --    local start_pos1, _ = entry1.ordinal:find(prompt)
       --    if start_pos1 then

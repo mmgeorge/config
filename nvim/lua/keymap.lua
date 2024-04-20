@@ -146,8 +146,8 @@ vim.keymap.set('n', 'ou', vim.lsp.buf.hover, { nowait = true })
 vim.keymap.set('n', 'ot', vim.lsp.buf.type_definition, { nowait = true }) 
 vim.keymap.set('n', 'ow', vim.lsp.buf.rename, { nowait = true }) 
 
-vim.keymap.set('n', 'ok', 'gg', { }) -- Top of Page
-vim.keymap.set('n', 'ol', 'G', { }) -- End of page
+-- vim.keymap.set('n', 'ok', 'gg', { }) -- Top of Page
+-- vim.keymap.set('n', 'ol', 'G', { }) -- End of page
 
 vim.keymap.set({'n', 'v'}, '<C-f>', require("plugins.telescope.occur").occur_in_file, {})
 vim.keymap.set({'n', 'v'}, 'of', require("plugins.telescope.find_files").find_files, {})
