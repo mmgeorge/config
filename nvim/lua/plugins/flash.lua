@@ -4,7 +4,17 @@ return {
   ---@type Flash.Config
   -- stylua: ignore
   keys = {
-    { "<Leader>f", mode = { "n", "x", "o" }, function() require("flash").jump() end, desc = "Flash" }, 
+    { "<Leader>f", mode = { "n", "x", "o" }, function() 
+      -- Jump ignoring casing
+      local gi = vim.go.ignorecase
+      local gs = vim.go.smartcase
+      vim.go.ignorecase = true
+      vim.go.smartcase = false
+      require("flash").jump()
+      vim.go.ignorecase = gi
+      vim.go.smartcase = gs
+      -- require("flash").jump() 
+    end, desc = "Flash" }, 
   },
   opts = {
     -- labels = "abcdefghijklmnopqrstuvwxyz",

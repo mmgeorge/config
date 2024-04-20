@@ -75,8 +75,8 @@ vim.keymap.set('n', 'n', 'Nzzzv', { nowait = true, silent = true })
 vim.keymap.set({'n', 'v', 'i'}, '<C-h>', 'dd', { })
 vim.keymap.set({'n', 'v'}, 'U', '<C-r>', { }) -- Redo
 
-vim.keymap.set({'n'}, 'I', 'o<ESC>', { }) -- Insert blank line below
-vim.keymap.set({'n'}, 'O', 'O<ESC>', { }) -- Insert blank line above
+vim.keymap.set({'n'}, 'I', 'O<ESC>', { }) -- Insert blank line below
+vim.keymap.set({'n'}, 'O', 'o<ESC>', { }) -- Insert blank line above
 
 
 -------------------------------------------------------------------------------
