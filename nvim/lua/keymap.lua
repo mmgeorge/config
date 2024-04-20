@@ -1,4 +1,17 @@
 
+vim.g.clipboard = {
+  name = "wslClipboard",
+  copy = {
+    ['+'] = 'clip.exe',
+    ['*'] = 'clip.exe'
+  },
+  paste = {
+    ['+'] = 'powershell.exe -c [Console]::Out.Write($(Get-Clipboard -Raw).tostring().replace("`r", ""))',
+    ['*'] = 'powershell.exe -c [Console]::Out.Write($(Get-Clipboard -Raw).tostring().replace("`r", ""))'
+  },
+  cache_enabled = 0
+}
+
 -- Unmaps -
 vim.keymap.set({'n', 'v'}, 'o', '<Nop>', {})
 vim.keymap.set({'n', 'v'}, 'q', '<Nop>', {})
@@ -62,8 +75,8 @@ vim.keymap.set('n', 'n', 'Nzzzv', { nowait = true, silent = true })
 vim.keymap.set({'n', 'v', 'i'}, '<C-h>', 'dd', { })
 vim.keymap.set({'n', 'v'}, 'U', '<C-r>', { }) -- Redo
 
-vim.keymap.set({'n'}, 'I', 'O<ESC>', { }) -- Insert blank line below
-vim.keymap.set({'n'}, 'O', 'o<ESC>', { }) -- Insert blank line above
+vim.keymap.set({'n'}, 'I', 'o<ESC>', { }) -- Insert blank line below
+vim.keymap.set({'n'}, 'O', 'O<ESC>', { }) -- Insert blank line above
 
 
 -------------------------------------------------------------------------------
@@ -76,10 +89,11 @@ vim.keymap.set({'v'}, 'K', ":m '>-2<CR>gv=gv", { }) -- Kill
 -- Selection
 -- vim.keymap.set('v', 'il', 'V', { nowait = true }) -- Select line -> No, just use V?
 vim.keymap.set('v', 'y', "y`]", { nowait = true }) -- Copy (Kill-copy),  `] jumps to end
--- vim.keymap.set('v', 'y', "\"+y", { }) -- Copy to clipboard
--- vim.keymap.set('v', 'Y', "\"+Y", { }) -- Copy to clipboard
+vim.keymap.set('v', 'y', "\"+y", { }) -- Copy to clipboard
+vim.keymap.set('v', 'Y', "\"+Y", { }) -- Copy to clipboard
 vim.keymap.set({'n', 'v'}, '<leader>p', "\"_dPd", { nowait = true }) -- Paste over (don't add to clipboard)
-vim.keymap.set({'n', 'v', 'i'}, '<C-p>', "\"+p:%s/^V^M/\r/g<cr>", { nowait = true }) -- Paste from clipboard, removing ^M
+vim.keymap.set({'n', 'v', 'i'}, '<C-p>', "\"*p", { nowait = true }) -- Paste from clipboard, removing ^M
+-- vim.keymap.set('v', "<C-y>", "\"+y", { nowait = true }) -- Copy (Kill-copy),  `] jumps to end
 
 -- Commands --
 ---- Replace text
@@ -103,7 +117,7 @@ vim.keymap.set('n', 'bo', ':%bd | e# <CR>', { })
 
 -- Goto/Open
 -- Character within a line: 
-vim.keymap.set({'n', 'v'}, 'o/', '/\\c', { nowait = true  }) -- Search
+vim.keymap.set({'n', 'v'}, '<Leader>/', '/\\c', { nowait = true  }) -- Search
 vim.keymap.set({'n', 'v'}, 'oc', 'f', { })   -- Goto character in line
 vim.keymap.set('n', 'oxc', 'df', { }) -- Goto delete character in line
 vim.keymap.set({'n', 'v'}, 'orc', 'F', { })   -- Reverse, Goto character in line
