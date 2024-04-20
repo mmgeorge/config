@@ -13,7 +13,7 @@ return {
       },
       keys = {
          {
-            "wg",
+            "og",
             "<cmd>Neogit<cr>",
             desc = "Neogit",
          }
