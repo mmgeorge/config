@@ -2,10 +2,9 @@
 -- Unmaps -
 vim.keymap.set({'n', 'v'}, 'o', '<Nop>', {})
 vim.keymap.set({'n', 'v'}, 'q', '<Nop>', {})
-vim.keymap.set({'n', 'v'}, 'xo', '<Nop>', {})
+-- vim.keymap.set({'n', 'v'}, 'xo', '<Nop>', {})
 vim.keymap.set({'n', 'v'}, 'x', '<Nop>', {})
 vim.keymap.set({'n', 'v'}, 'b', '<Nop>', {})
-vim.keymap.set({'n', 'v'}, 'a%', '<Nop>', {})
 vim.keymap.set({'n', 'v'}, 'a%', '<Nop>', {})
 vim.keymap.set({'n', 'v'}, 'w', '<Nop>', {})
 vim.keymap.set({'n', 'v', 'i'}, '<C-z>', '<Nop>', {})
@@ -134,10 +133,10 @@ vim.keymap.set('n', 'ok', 'gg', { }) -- Top of Page
 vim.keymap.set('n', 'ol', 'G', { }) -- End of page
 
 vim.keymap.set({'n', 'v'}, '<C-f>', require("plugins.telescope.occur").occur_in_file, {})
-vim.keymap.set({'n', 'v'}, 'opf', require("plugins.telescope.find_files").find_files, {})
+vim.keymap.set({'n', 'v'}, 'of', require("plugins.telescope.find_files").find_files, {})
 vim.keymap.set({'n', 'v'}, 'oa', ":Telescope file_browser path=%:p:h select_buffer=true<CR><ESC>", {})
-vim.keymap.set({'n', 'v'}, 'of', ":Telescope lsp_document_symbols<CR>", {})
-vim.keymap.set({'n', 'v'}, 'ops', ":Telescope lsp_workspace_symbols<CR>", {})
+vim.keymap.set({'n', 'v'}, 'oo', ":Telescope lsp_document_symbols<CR>", {})
+vim.keymap.set({'n', 'v'}, 'ows', ":Telescope lsp_workspace_symbols<CR>", {})
 vim.keymap.set({'n', 'v'}, 'opp', vim.lsp.buf.list_workspace_folders, {})
 vim.keymap.set({'n', 'v'}, 'oq', function()
       vim.lsp.buf.format {
@@ -156,6 +155,10 @@ vim.keymap.set({'n', 'v'}, 'or', require("telescope.builtin").resume, { nowait=t
 vim.keymap.set({'i', 'v', 'c', 't', 's', 'o', 'x'}, '<C-k>', '<Esc>', { nowait = true }) -- Cancel
 vim.keymap.set({'n'}, '<C-k>', '<Esc>:noh<CR>', { nowait = true, silent=true }) -- Cancel
 
+-- vim.keymap.set('n', '<C-->', '<Plug>(comment_toggle_linewise_current)', {}) -- Comment line, maps to C-/
+vim.keymap.set('n', '<C-_>', '<Plug>(comment_toggle_linewise_current)j', {}) -- Comment line, maps to C-/
+-- vim.keymap.set('n', '<C-/>', '<Plug>(comment_toggle_linewise_current)', {}) -- Comment line, maps to C-/
+vim.keymap.set('n', '<C-e>', ':x<CR>', { nowait = true }) -- Save file
 vim.keymap.set('n', '<C-s>', ':w<CR>', { nowait = true }) -- Save file
 vim.keymap.set('i', '<C-s>', '<C-o>:w<CR>', { nowait = true }) -- Save file
 -- vim.keymap.set('n', '<C-r>', ':earlier 10f<CR>', {}) -- Revert file
