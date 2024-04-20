@@ -92,7 +92,8 @@ vim.keymap.set('v', 'y', "y`]", { nowait = true }) -- Copy (Kill-copy),  `] jump
 vim.keymap.set('v', 'y', "\"+y", { }) -- Copy to clipboard
 vim.keymap.set('v', 'Y', "\"+Y", { }) -- Copy to clipboard
 vim.keymap.set({'n', 'v'}, '<leader>p', "\"_dPd", { nowait = true }) -- Paste over (don't add to clipboard)
-vim.keymap.set({'n', 'v', 'i'}, '<C-p>', "\"*p", { nowait = true }) -- Paste from clipboard, removing ^M
+vim.keymap.set({'n', 'v'}, '<C-p>', "\"*p", { nowait = true }) -- Paste from clipboard, removing ^M
+vim.keymap.set({'i'}, '<C-p>', "<C-o>\"*p", { nowait = true }) -- Paste from clipboard, removing ^M
 -- vim.keymap.set('v', "<C-y>", "\"+y", { nowait = true }) -- Copy (Kill-copy),  `] jumps to end
 
 -- Commands --
@@ -133,10 +134,10 @@ vim.keymap.set({'n', 'v'}, 'ou',
 
 vim.keymap.set('n', '<C-l>f', vim.lsp.buf.code_action, { }) -- Top of Page
 
-vim.keymap.set('n', '{', vim.lsp.buf.definition, { nowait = true }) 
-vim.keymap.set('n', '=', '<C-o>' , { nowait = true }) -- Jump back
-vim.keymap.set('n', '@', 'g;' , { nowait = true }) -- Jump back to last change
-vim.keymap.set('n', '~', 'g,' , { nowait = true }) -- Jump recent change
+vim.keymap.set('n', ',', '<C-o>' , { nowait = true }) -- Jump back
+vim.keymap.set('n', '.', vim.lsp.buf.definition, { nowait = true }) 
+vim.keymap.set('n', '=', 'g;' , { nowait = true }) -- Jump back to last change
+vim.keymap.set('n', '{', 'g,' , { nowait = true }) -- Jump recent change
 vim.keymap.set({'n', 'v'}, '<Tab>', '==' , { nowait = true }) 
 
 -- vim.keymap.set({'i'}, '<Tab>', vim.lsp.buf.completion, { })
