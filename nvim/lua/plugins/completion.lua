@@ -58,21 +58,21 @@ return {
                      -- Intellij-like mapping
                      --   If no completion is selected, insert the first one in the list.
                      --   If a completion is selected, insert this one.
-                     -- ["<Tab>"] = cmp.mapping(function(fallback)
-                     --       -- This little snippet will confirm with tab, and if no entry is selected,
-                     --       -- will confirm the first item
-                     --       if cmp.visible() then
-                     --          local entry = cmp.get_selected_entry()
-                     --          if not entry then
-                     --             cmp.select_next_item({ behavior = cmp.SelectBehavior.Select })
-                     --          end
-                     --          cmp.confirm()
-                     --       elseif require("luasnip").locally_jumpable(1) then
-                     --          require("luasnip").jump(1)
-                     --       else
-                     --          fallback()
-                     --       end
-                     -- end, {"i","s","c",}),
+                     ["<Tab>"] = cmp.mapping(function(fallback)
+                           -- This little snippet will confirm with tab, and if no entry is selected,
+                           -- will confirm the first item
+                           if cmp.visible() then
+                              local entry = cmp.get_selected_entry()
+                              if not entry then
+                                 cmp.select_next_item({ behavior = cmp.SelectBehavior.Select })
+                              end
+                              cmp.confirm()
+                           elseif require("luasnip").locally_jumpable(1) then
+                              require("luasnip").jump(1)
+                           else
+                              fallback()
+                           end
+                     end, {"i","s","c",}),
                      ['<C-b>'] = cmp.mapping.scroll_docs(-4),
                      ['<C-f>'] = cmp.mapping.scroll_docs(4),
                      ['<C-Space>'] = cmp.mapping.complete(),
