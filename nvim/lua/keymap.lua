@@ -100,6 +100,7 @@ vim.keymap.set({'i'}, '<C-p>', "<C-o>\"*p", { nowait = true }) -- Paste from cli
 ---- Replace text
 vim.keymap.set({'n', 'v'}, '<leader>s', ":%s/\\<<C-r><C-w>\\>/<C-r><C-w>/gI<Left><Left><Left>", { })
 vim.keymap.set({'n', 'v'}, '<leader>iu', function() require("utils").insert_v4({}) end, { nowait = true })
+vim.keymap.set({'n', 'v'}, '<leader>t', 'gg=G', { nowait = true })
 
 ---- Jump quickfix
 vim.keymap.set('n', '<leader>k', "<cmd>lnext<CR>zz", { nowait = true }) -- Paste over (don't add to clipboard)
@@ -135,16 +136,21 @@ vim.keymap.set({'n', 'v'}, 'ou',
 vim.keymap.set('n', '<C-l>f', vim.lsp.buf.code_action, { }) -- Top of Page
 
 vim.keymap.set('n', ',', '<C-o>' , { nowait = true }) -- Jump back
-vim.keymap.set('n', '.', vim.lsp.buf.definition, { nowait = true }) 
+-- vim.keymap.set('n', '.', vim.lsp.buf.definition, { nowait = true }) 
+vim.keymap.set('n', '.', '<CMD>Glance definitions<CR>', { nowait = true }) 
 vim.keymap.set('n', '=', 'g;' , { nowait = true }) -- Jump back to last change
 vim.keymap.set('n', '{', 'g,' , { nowait = true }) -- Jump recent change
 vim.keymap.set({'n', 'v'}, '<Tab>', '==' , { nowait = true }) 
+
+vim.keymap.set('n', 'or', '<CMD>Glance references<CR>', { nowait = true }) 
+vim.keymap.set('n', 'ot', '<CMD>Glance type_definitions<CR>', { nowait = true }) 
+vim.keymap.set('n', 'oi', '<CMD>Glance implementations<CR>', { nowait = true }) 
 
 -- vim.keymap.set({'i'}, '<Tab>', vim.lsp.buf.completion, { })
 vim.keymap.set('n', 'wq', function() require("trouble").toggle("quickfix") end, { nowait = true }) 
 
 vim.keymap.set('n', 'ou', vim.lsp.buf.hover, { nowait = true }) 
-vim.keymap.set('n', 'ot', vim.lsp.buf.type_definition, { nowait = true }) 
+-- vim.keymap.set('n', 'ot', vim.lsp.buf.type_definition, { nowait = true }) 
 vim.keymap.set('n', 'ow', vim.lsp.buf.rename, { nowait = true }) 
 
 -- vim.keymap.set('n', 'ok', 'gg', { }) -- Top of Page
@@ -163,8 +169,8 @@ vim.keymap.set({'n', 'v'}, 'oq', function()
 end, {})
 
 vim.keymap.set({'n', 'v'}, 'os', ":Telescope buffers<CR><ESC>", {})
-vim.keymap.set({'n', 'v'}, 'ot', require("telescope.builtin").help_tags, {})
-vim.keymap.set({'n', 'v'}, 'or', require("telescope.builtin").resume, { nowait=true })
+-- vim.keymap.set({'n', 'v'}, 'ot', require("telescope.builtin").help_tags, {})
+-- vim.keymap.set({'n', 'v'}, 'or', require("telescope.builtin").resume, { nowait=true })
 
 -- Common
 --vim.keymap.set({'n'}, '<C-g>', '<Esc>:noh<CR>', { nowait = false, unique=true, silent=true }) -- Cancel
