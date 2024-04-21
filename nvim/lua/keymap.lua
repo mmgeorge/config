@@ -114,6 +114,7 @@ vim.keymap.set('n', 'wsb', ':split<CR>', { })
 vim.keymap.set('n', 'wko', ':only<CR>', { })
 vim.keymap.set('n', 'wks', ':close!<CR>', { })
 vim.keymap.set('n', 'wo', '<C-w>W', { })
+vim.keymap.set('n', 'wkb', ':bd<CR>', { })
 
 -- Buffers
 vim.keymap.set('n', 'bk', ':bd<CR>', { })
