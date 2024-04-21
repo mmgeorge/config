@@ -13,6 +13,7 @@ return {
       light_gray = "#b4b4b4",
       teal = "#9dffe7" 
     }
+    -- local lualine_theme = require('lualine.themes.github')
     require('github-theme').setup({
       options = {
         -- Compiled file's destination location
