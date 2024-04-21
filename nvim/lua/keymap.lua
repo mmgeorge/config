@@ -101,6 +101,7 @@ vim.keymap.set({'i'}, '<C-p>', "<C-o>\"*p", { nowait = true }) -- Paste from cli
 vim.keymap.set({'n', 'v'}, '<leader>s', ":%s/\\<<C-r><C-w>\\>/<C-r><C-w>/gI<Left><Left><Left>", { })
 vim.keymap.set({'n', 'v'}, '<leader>iu', function() require("utils").insert_v4({}) end, { nowait = true })
 vim.keymap.set({'n', 'v'}, '<leader>t', 'gg=G', { nowait = true })
+-- vim.keymap.set({'n', 'v'}, '<leader>q', vim.lsp.buf.code_action, { nowait = true })
 
 ---- Jump quickfix
 vim.keymap.set('n', '<leader>k', "<cmd>lnext<CR>zz", { nowait = true }) -- Paste over (don't add to clipboard)
