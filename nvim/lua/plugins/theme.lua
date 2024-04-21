@@ -98,6 +98,7 @@ return {
     vim.api.nvim_set_hl(0, "dropbarkindfile", { fg = colors.white }) 
     vim.api.nvim_set_hl(0, "dropbarkindfolder", { fg = colors.white }) 
     
+    -- Change breadcrumb colors based on current mode
     vim.api.nvim_create_autocmd('ModeChanged', {
       callback = function()
         local new_mode = vim.v.event.new_mode
@@ -106,21 +107,25 @@ return {
           vim.api.nvim_set_hl(0, "dropbarkindfile", { fg = colors.green }) 
           vim.api.nvim_set_hl(0, "dropbarkindfolder", { fg = colors.green }) 
           vim.api.nvim_set_hl(0, "dropbariconuiseparator", { fg = colors.green }) 
+          vim.api.nvim_set_hl(0, "TelescopeBorder", { fg = colors.green }) 
         elseif new_mode == "n" then
           vim.api.nvim_set_hl(0, "dropbariconkindfolder", { fg = colors.white })
           vim.api.nvim_set_hl(0, "dropbarkindfile", { fg = colors.white }) 
           vim.api.nvim_set_hl(0, "dropbarkindfolder", { fg = colors.white }) 
           vim.api.nvim_set_hl(0, "dropbariconuiseparator", { fg = colors.white }) 
+          vim.api.nvim_set_hl(0, "TelescopeBorder", { fg = colors.white }) 
         elseif new_mode == "c" then
           vim.api.nvim_set_hl(0, "dropbariconkindfolder", { fg = colors.yellow })
           vim.api.nvim_set_hl(0, "dropbarkindfile", { fg = colors.yellow }) 
           vim.api.nvim_set_hl(0, "dropbarkindfolder", { fg = colors.yellow }) 
           vim.api.nvim_set_hl(0, "dropbariconuiseparator", { fg = colors.yellow }) 
+          vim.api.nvim_set_hl(0, "TelescopeBorder", { fg = colors.yellow }) 
         elseif new_mode == "v" then
           vim.api.nvim_set_hl(0, "dropbariconkindfolder", { fg = colors.red })
           vim.api.nvim_set_hl(0, "dropbarkindfile", { fg = colors.red }) 
           vim.api.nvim_set_hl(0, "dropbarkindfolder", { fg = colors.red }) 
           vim.api.nvim_set_hl(0, "dropbariconuiseparator", { fg = colors.red }) 
+          vim.api.nvim_set_hl(0, "TelescopeBorder", { fg = colors.red }) 
         end
       end
     })
