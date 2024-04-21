@@ -27,8 +27,8 @@ return {
     lualine_theme.normal = getColors(colors.white)
     lualine_theme.insert = getColors(colors.green)
     lualine_theme.visual = getColors(colors.red)
-    lualine_theme.command = getColors(colors.light_blue)
-    lualine_theme.replace = getColors(colors.teal)
+    lualine_theme.command = getColors(colors.yellow)
+    lualine_theme.replace = getColors(colors.light_blue)
     lualine_theme.terminal = getColors(colors.teal)
 
     require('lualine').setup({

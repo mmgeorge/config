@@ -61,7 +61,7 @@ return {
             builtin0    = colors.yellow,                   -- Builtin variable
             builtin1    = colors.teal,                    -- Builtin type
             builtin2    = colors.yellow,                   -- Builtin const
-            comment     = colors.gray,                    -- Comment
+            -- comment     = colors.gray,                    -- Comment
             conditional = colors.yellow,                    -- Conditional and loop
             const       = colors.white,                   -- Constants, imports and booleans
             dep         = colors.red,                     -- Deprecated
@@ -90,5 +90,39 @@ return {
     vim.api.nvim_set_hl(0, "@lsp.type.enumMember", { fg = colors.green })
     vim.api.nvim_set_hl(0, "@lsp.mod.declaration", { fg = colors.red })
     -- vim.api.nvim_set_hl(0, "@lsp.type.variable", { fg = colors.green })
+    -- Dropbar theming
+    -- See <https://github.com/Bekaboo/dropbar.nvim?tab=readme-ov-file#highlighting>
+    -- vim.api.nvim_set_hl(0, "DropBarMenuNormalFloat", { fg = colors.white })
+    -- vim.api.nvim_set_hl(0, "DropBarMenuCurrentContext", { fg = colors.white })
+    vim.api.nvim_set_hl(0, "dropbariconkindfolder", { fg = colors.white })
+    vim.api.nvim_set_hl(0, "dropbarkindfile", { fg = colors.white }) 
+    vim.api.nvim_set_hl(0, "dropbarkindfolder", { fg = colors.white }) 
+    
+    vim.api.nvim_create_autocmd('ModeChanged', {
+      callback = function()
+        local new_mode = vim.v.event.new_mode
+        if new_mode == "i" then 
+          vim.api.nvim_set_hl(0, "dropbariconkindfolder", { fg = colors.green })
+          vim.api.nvim_set_hl(0, "dropbarkindfile", { fg = colors.green }) 
+          vim.api.nvim_set_hl(0, "dropbarkindfolder", { fg = colors.green }) 
+          vim.api.nvim_set_hl(0, "dropbariconuiseparator", { fg = colors.green }) 
+        elseif new_mode == "n" then
+          vim.api.nvim_set_hl(0, "dropbariconkindfolder", { fg = colors.white })
+          vim.api.nvim_set_hl(0, "dropbarkindfile", { fg = colors.white }) 
+          vim.api.nvim_set_hl(0, "dropbarkindfolder", { fg = colors.white }) 
+          vim.api.nvim_set_hl(0, "dropbariconuiseparator", { fg = colors.white }) 
+        elseif new_mode == "c" then
+          vim.api.nvim_set_hl(0, "dropbariconkindfolder", { fg = colors.yellow })
+          vim.api.nvim_set_hl(0, "dropbarkindfile", { fg = colors.yellow }) 
+          vim.api.nvim_set_hl(0, "dropbarkindfolder", { fg = colors.yellow }) 
+          vim.api.nvim_set_hl(0, "dropbariconuiseparator", { fg = colors.yellow }) 
+        elseif new_mode == "v" then
+          vim.api.nvim_set_hl(0, "dropbariconkindfolder", { fg = colors.red })
+          vim.api.nvim_set_hl(0, "dropbarkindfile", { fg = colors.red }) 
+          vim.api.nvim_set_hl(0, "dropbarkindfolder", { fg = colors.red }) 
+          vim.api.nvim_set_hl(0, "dropbariconuiseparator", { fg = colors.red }) 
+        end
+      end
+    })
   end,
 }
