@@ -26,7 +26,7 @@ return {
         wrap = true,
       },
       border = {
-        enable = true, -- Show window borders. Only horizontal borders allowed
+        enable = false, -- Show window borders. Only horizontal borders allowed
         -- top_char = '-',
         -- bottom_char = '-',
       },
