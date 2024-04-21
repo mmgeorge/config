@@ -136,7 +136,7 @@ return {
          position = "bottom", -- position of the list can be: bottom, top, left, right
          height = 15, -- height of the trouble list when position is top or bottom
          width = 50, -- width of the list when position is left or right
-         icons = false, -- use devicons for filenames
+         icons = true, -- use devicons for filenames
          mode = "workspace_diagnostics", -- "workspace_diagnostics", "document_diagnostics", "quickfix", "lsp_references", "loclist"
          --severity = { vim.diagnostic.severity.ERROR,
            --           vim.diagnostic.severity.WARN
