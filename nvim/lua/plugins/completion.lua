@@ -38,7 +38,8 @@ return {
         },
         completion = {
           scrollbar = false,
-          completeopt = "menu, menuone, preview, noselect",
+          completeopt = "menu, menuone, noinsert"
+          -- completeopt = "menu, menuone, preview, noselect",
           -- keyword_length = 4, -- # of characters to trigger auto completion
         },
         window = {
@@ -61,19 +62,21 @@ return {
           ["<Tab>"] = cmp.mapping(function(fallback)
             -- This little snippet will confirm with tab, and if no entry is selected,
             -- will confirm the first item
-            if cmp.visible() then
+            -- if cmp.visible() then
               -- local entry = cmp.get_selected_entry()
               -- if not entry then
-              cmp.select_next_item({ behavior = cmp.SelectBehavior.Select })
+              -- cmp.select_next_item({ behavior = cmp.SelectBehavior.Select })
               -- end
               -- cmp.confirm()
-            elseif require("luasnip").locally_jumpable(1) then
+            if require("luasnip").locally_jumpable(1) then
               require("luasnip").jump(1)
             else
               fallback()
             end
           end, {"i","s","c",}),
           ['<C-p>'] = cmp.config.disable, 
+          ["<C-k>"] = cmp.mapping.select_prev_item(),
+          ["<C-l>"] = cmp.mapping.select_next_item(),
           ['<C-n>'] = cmp.config.disable, 
           ['<C-b>'] = cmp.mapping.scroll_docs(-4),
           ['<C-f>'] = cmp.mapping.scroll_docs(4),
