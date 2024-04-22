@@ -51,16 +51,20 @@ return {
           mappings = {
             [ "i" ] = {
               --["<C-g>"] = actions.close, 
-              ["<C-k>"] = actions.close, 
+              ["<C-o>"] = actions.close, 
+              ["<C-k>"] = actions.move_selection_previous, 
+              ["<C-l>"] = actions.move_selection_next,
             },
             [ "n" ] = {
-              ["<C-k>"] = actions.close, 
+              ["<C-o>"] = actions.close, 
               ["s"] = actions.move_selection_previous, 
               ["d"] = actions.move_selection_next,
-              ["k"] = actions.preview_scrolling_up, 
-              ["l"] = actions.preview_scrolling_down, 
-              ["ok"] = actions.move_to_top, 
-              ["ol"] = actions.move_to_bottom, 
+              ["k"] = actions.move_selection_previous, 
+              ["l"] = actions.move_selection_next,
+              -- ["k"] = actions.preview_scrolling_up, 
+              -- ["l"] = actions.preview_scrolling_down, 
+              ["gg"] = actions.move_to_top, 
+              ["G"] = actions.move_to_bottom, 
               -- ["<Tab>"] = actions.select_tab, 
             }
           }

@@ -47,6 +47,10 @@ vim.api.nvim_command(":noremap R F") -- To n'th chart to the right
 vim.api.nvim_command(":noremap . ;") -- Repeat last f or T
 vim.api.nvim_command(":noremap m ^") -- Start line
 vim.api.nvim_command(":noremap / $") -- End line
+
+
+-- vim.keymap.set({'s'}, 'a', '<Nop>', {})
+
 ---- Unmap x in favor of xc 
 vim.keymap.set({'n'}, 'xc', 'x', { nowait = true }) -- Delete character
 ---- Unmap r in favor of cx
@@ -106,8 +110,8 @@ vim.keymap.set({'n', 'v'}, '<leader>t', 'gg=G', { nowait = true })
 ---- Jump quickfix
 vim.keymap.set('n', '<leader>k', "<cmd>lnext<CR>zz", { nowait = true }) -- Paste over (don't add to clipboard)
 vim.keymap.set('n', '<leader>j', "<cmd>lprev<CR>zz", { nowait = true }) -- Paste over (don't add to clipboard)
-vim.keymap.set('n', '<C-k>', "<cmd>cnext<CR>zz", { nowait = true }) -- Paste over (don't add to clipboard)
-vim.keymap.set('n', '<C-j>', "<cmd>cprev<CR>zz", { nowait = true }) -- Paste over (don't add to clipboard)
+-- vim.keymap.set('n', '<C-k>', "<cmd>cnext<CR>zz", { nowait = true }) -- Paste over (don't add to clipboard)
+-- vim.keymap.set('n', '<C-j>', "<cmd>cprev<CR>zz", { nowait = true }) -- Paste over (don't add to clipboard)
 
 -- Window
 vim.keymap.set('n', 'wsb', ':split<CR>', { })
@@ -181,7 +185,7 @@ vim.keymap.set({'n', 'v'}, 'os', ":Telescope buffers<CR><ESC>", {})
 --vim.keymap.set({'n'}, '<C-g>', '<Esc>:noh<CR>', { nowait = false, unique=true, silent=true }) -- Cancel
 --vim.keymap.set({'i', 'v'}, '<C-g>', '<Esc>', { nowait = false, unique=true }) -- Cancel
 --vim.keymap.set({'n', 'i', 'v'}, '<Left>', '<Esc>', { nowait = false, unique=true }) -- Cancel
-vim.keymap.set({'i', 'v', 'c', 't', 's', 'o', 'x'}, '<C-k>', '<Esc>', { nowait = true }) -- Cancel
+vim.keymap.set({'i', 'v', 'c', 't', 's', 'o', 'x'}, '<C-o>', '<Esc>', { nowait = true }) -- Cancel
 vim.keymap.set({'n'}, '<C-k>', '<Esc>:noh<CR>', { nowait = true, silent=true }) -- Cancel
 
 -- vim.keymap.set('n', '<C-->', '<Plug>(comment_toggle_linewise_current)', {}) -- Comment line, maps to C-/
