@@ -17,7 +17,12 @@
 -- vim.cmd("autocmd User LspDiagnosticsChanged :lua apply_diagnostic_colors()")
 
 vim.diagnostic.config({
-  virtual_text = true,
+  virtual_text = {
+    severity = {
+        -- vim.diagnostic.severity.WARN,
+        vim.diagnostic.severity.ERROR,
+     }
+  },
   signs = false,
   underline = {
      severity = {

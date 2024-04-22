@@ -87,6 +87,7 @@ return {
 
     vim.cmd('colorscheme github_dark_default')
     vim.cmd([[highlight DiagnosticUnderlineError cterm=undercurl ctermfg=red gui=undercurl guifg=red]])
+    vim.cmd([[highlight DiagnosticUnderlineWarn cterm=undercurl ctermfg=yellow gui=undercurl guifg=yellow]])
     vim.api.nvim_set_hl(0, "@lsp.type.enumMember", { fg = colors.green })
     vim.api.nvim_set_hl(0, "@lsp.mod.declaration", { fg = colors.red })
     -- vim.api.nvim_set_hl(0, "@lsp.type.variable", { fg = colors.green })
