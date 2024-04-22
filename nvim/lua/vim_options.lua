@@ -7,7 +7,7 @@ vim.o.timeoutlen = 1500
 vim.o.ttimeoutlen = 100
 vim.o.guicursor= ""
 vim.o.number=true
-
+vim.o.laststatus=3
 vim.opt.statuscolumn = "%l %=%s" -- %= means right align
 
 vim.g.rust_recommended_style = '0' -- Otherwise will override indentation settings
