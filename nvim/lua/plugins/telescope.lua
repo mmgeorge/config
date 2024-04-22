@@ -1,13 +1,12 @@
 return {
   {
-    'nvim-telescope/telescope.nvim', tag = '0.1.6',
+    'nvim-telescope/telescope.nvim', -- tag = '0.1.6',
     dependencies = { 
       'nvim-lua/plenary.nvim',
-      "nvim-tree/nvim-web-devicons",
-      "nvim-telescope/telescope.nvim",
+      -- "nvim-tree/nvim-web-devicons",
       "nvim-telescope/telescope-file-browser.nvim",
     },
-    lazy = false, 
+    -- lazy = false, 
     config = function()
       local actions = require "telescope.actions"
       local sorters = require('telescope.sorters')
@@ -16,37 +15,37 @@ return {
       -- Sorters in telescope do more than just sorting, they perform the actual filter
       -- and search & highlight as well
       -- See <https://github.com/nvim-telescope/telescope.nvim/blob/master/lua/telescope/sorters.lua>
-      --
+
       -- Directly sort results, bypassing any fuzzy matching.
-      -- local contains_exactly = sorters.Sorter:new{
-      --    scoring_function = function(_, prompt, line)
-      --       local prompt_lower = prompt:lower()
-      --       local line_lower = line:lower()
-      --       local contains_string = line_lower:find(prompt_lower, 1, true)
+      local contains_exactly = sorters.Sorter:new{
+        scoring_function = function(_, prompt, line)
+          local prompt_lower = prompt:lower()
+          local line_lower = line:lower()
+          local contains_string = line_lower:find(prompt_lower, 1, true)
 
-      --       -- Negative numbers mean we filter the result
-      --       if not contains_string then
-      --          return -1 
-      --       end
-
-      --       return 1
-      --    end,
-
-      --    highlighter = function(_, prompt, line)
-      --       return { 1, 2, 3, 4, 5, 6, 7, 8, 9 }
-      --    end
-      -- }
+          -- Negative numbers mean we filter the result
+          if not contains_string then
+            return -1 
+          end
+          --
+          return 1
+        end,
+        --
+        highlighter = function(_, prompt, line)
+          return { 1, 2, 3, 4, 5, 6, 7, 8, 9 }
+        end
+      }
 
       require('telescope').setup({
         defaults = {
-          disable_devicons = false,
-          winblend = 0,
-          layout_strategy = "vertical", 
+          -- layout_strategy = "vertical", 
+          sorting_strategy = "ascending",
           layout_config = {
+            prompt_position = "top",
+            height = 0.4,
             --height = vim.o.lines, -- Maximally available lines
             --width = vim.o.columns, -- Maximally available columns
 
-            preview_cutoff=1,
           },
           -- See <https://github.com/nvim-telescope/telescope.nvim/blob/master/lua/telescope/mappings.lua>
           mappings = {
@@ -70,19 +69,11 @@ return {
           find_files = {
             theme = "ivy",
             previewer = false,
-            layout_config = {
-              height = .3, -- 0.4,
-              preview_cutoff=0,
-            },        
           },
           current_buffer_fuzzy_find = {
             sorter = sorters.get_substr_matcher(),
             theme = "ivy",
             previewer = false,
-            layout_config = {
-              height = .3, -- 0.4,
-              preview_cutoff=0,
-            },        
           },
           buffers = {
             -- Also includes other options, could provide a custom sorting function
@@ -96,19 +87,11 @@ return {
             only_cwd = false,
             --ignore_current_buffer = true,
             --select_current = false,
-            layout_config = {
-              height = 0.4,
-              preview_cutoff=0,
-            },        
           },
           lsp_document_symbols = {
             theme = "ivy",
             previewer = false,
             show_line=true,
-            layout_config = {
-              height = 0.4,
-              preview_cutoff=0,
-            },        
           },
           lsp_workspace_symbols = {
             theme = "ivy",
@@ -117,10 +100,6 @@ return {
             symbol_type_width = 8, 
             previewer = false,
             show_line=true,
-            layout_config = {
-              height = 0.4,
-              preview_cutoff=0,
-            },        
           }
 
         },

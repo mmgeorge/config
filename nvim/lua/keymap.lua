@@ -158,7 +158,7 @@ vim.keymap.set('n', 'ow', vim.lsp.buf.rename, { nowait = true })
 -- vim.keymap.set('n', 'ok', 'gg', { }) -- Top of Page
 -- vim.keymap.set('n', 'ol', 'G', { }) -- End of page
 
-vim.keymap.set({'n', 'v'}, '<C-f>', require("plugins.telescope.occur").occur_in_file, {})
+-- vim.keymap.set({'n', 'v'}, '<C-f>', require("plugins.telescope.occur").occur_in_file, {})
 vim.keymap.set({'n', 'v'}, 'of', require("plugins.telescope.find_files").find_files, {})
 vim.keymap.set({'n', 'v'}, 'oa', ":Telescope file_browser path=%:p:h select_buffer=true<CR><ESC>", {})
 vim.keymap.set({'n', 'v'}, 'oo', ":Telescope lsp_document_symbols<CR>", {})
