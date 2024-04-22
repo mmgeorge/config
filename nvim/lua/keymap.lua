@@ -152,6 +152,9 @@ vim.keymap.set('n', 'oi', '<CMD>Glance implementations<CR>', { nowait = true })
 vim.keymap.set('n', 'wq', function() require("trouble").toggle("quickfix") end, { nowait = true }) 
 
 vim.keymap.set('n', 'ou', vim.lsp.buf.hover, { nowait = true }) 
+vim.keymap.set('n', 'oe', function ()
+  vim.diagnostic.open_float(0, {})
+end, { nowait = true }) 
 -- vim.keymap.set('n', 'ot', vim.lsp.buf.type_definition, { nowait = true }) 
 vim.keymap.set('n', 'ow', vim.lsp.buf.rename, { nowait = true }) 
 
@@ -159,7 +162,6 @@ vim.keymap.set('n', 'ow', vim.lsp.buf.rename, { nowait = true })
 -- vim.keymap.set('n', 'ol', 'G', { }) -- End of page
 
 vim.keymap.set({'n', 'v'}, '<C-f>', require("plugins.telescope.occur").occur_in_file, {})
--- vim.keymap.set({'n', 'v'}, 'of', require("plugins.telescope.find_files").find_files, {})
 vim.keymap.set({'n', 'v'}, 'of', ":Telescope find_files<CR>", {})
 vim.keymap.set({'n', 'v'}, 'oa', ":Telescope file_browser path=%:p:h select_buffer=true<CR><ESC>", {})
 vim.keymap.set({'n', 'v'}, 'oo', ":Telescope lsp_document_symbols<CR>", {})
