@@ -13,14 +13,14 @@ vim.g.clipboard = {
 }
 
 -- Unmaps -
-vim.keymap.set({'n', 'v'}, 'o', '<Nop>', {})
-vim.keymap.set({'n', 'v'}, 'q', '<Nop>', {})
+vim.keymap.set({'n', 'x'}, 'o', '<Nop>', {})
+vim.keymap.set({'n', 'x'}, 'q', '<Nop>', {})
 -- vim.keymap.set({'n', 'v'}, 'xo', '<Nop>', {})
-vim.keymap.set({'n', 'v'}, 'x', '<Nop>', {})
-vim.keymap.set({'n', 'v'}, 'b', '<Nop>', {})
-vim.keymap.set({'n', 'v'}, 'a%', '<Nop>', {})
-vim.keymap.set({'n', 'v'}, 'w', '<Nop>', {})
-vim.keymap.set({'n', 'v', 'i'}, '<C-z>', '<Nop>', {})
+vim.keymap.set({'n', 'x'}, 'x', '<Nop>', {})
+vim.keymap.set({'n', 'x'}, 'b', '<Nop>', {})
+vim.keymap.set({'n', 'x'}, 'a%', '<Nop>', {})
+vim.keymap.set({'n', 'x'}, 'w', '<Nop>', {})
+vim.keymap.set({'n', 'x', 'i'}, '<C-z>', '<Nop>', {})
 --vim.keymap.set({'n', 'v',}, 'w', '<Nop>', {})
 
 vim.api.nvim_command(":unmap w")
@@ -28,26 +28,56 @@ vim.api.nvim_command(":unmap b")
 vim.api.nvim_command(":unmap a%")
 
 -- Remaps --
-vim.api.nvim_command(":noremap f <cmd>lua require('spider').motion('e')<CR>") -- Move right word
-vim.api.nvim_command(":noremap a <cmd>lua require('spider').motion('b')<CR>") -- Move right word
--- vim.api.nvim_command(":noremap f <cmd>require('spider').motion('w')<CR>") -- Move right word
--- vim.api.nvim_command(":noremap a b") -- Move left word
--- vim.api.nvim_command(":noremap A B") -- Move left word
-vim.api.nvim_command(":noremap x d") -- Delete
-vim.api.nvim_command(":noremap X D") -- Delete
-vim.api.nvim_command(":noremap s k") -- Up
-vim.api.nvim_command(":noremap D K") -- Up
-vim.api.nvim_command(":noremap d j") -- Down
-vim.api.nvim_command(":noremap D J") -- Down
-vim.api.nvim_command(":noremap e a") -- Down
-vim.api.nvim_command(":noremap E A") -- Down
-vim.api.nvim_command(":noremap h .") -- Repeat last command
-vim.api.nvim_command(":noremap r f") -- To n'th chart to the right
-vim.api.nvim_command(":noremap R F") -- To n'th chart to the right
-vim.api.nvim_command(":noremap . ;") -- Repeat last f or T
-vim.api.nvim_command(":noremap m ^") -- Start line
-vim.api.nvim_command(":noremap / $") -- End line
+vim.api.nvim_command(":nnoremap f <cmd>lua require('spider').motion('e')<CR>") -- Move right word
+vim.api.nvim_command(":nnoremap a <cmd>lua require('spider').motion('b')<CR>") -- Move right word
+vim.api.nvim_command(":nnoremap x d") -- Delete
+vim.api.nvim_command(":nnoremap X D") -- Delete
+vim.api.nvim_command(":nnoremap s k") -- Up
+vim.api.nvim_command(":nnoremap D K") -- Up
+vim.api.nvim_command(":nnoremap d j") -- Down
+vim.api.nvim_command(":nnoremap D J") -- Down
+vim.api.nvim_command(":nnoremap e a") -- Down
+vim.api.nvim_command(":nnoremap E A") -- Down
+vim.api.nvim_command(":nnoremap h .") -- Repeat last command
+vim.api.nvim_command(":nnoremap r f") -- To n'th chart to the right
+vim.api.nvim_command(":nnoremap R F") -- To n'th chart to the right
+vim.api.nvim_command(":nnoremap . ;") -- Repeat last f or T
+vim.api.nvim_command(":nnoremap m ^") -- Start line
+vim.api.nvim_command(":nnoremap / $") -- End line
 
+vim.api.nvim_command(":xnoremap f <cmd>lua require('spider').motion('e')<CR>") -- Move right word
+vim.api.nvim_command(":xnoremap a <cmd>lua require('spider').motion('b')<CR>") -- Move right word
+vim.api.nvim_command(":xnoremap x d") -- Delete
+vim.api.nvim_command(":xnoremap X D") -- Delete
+vim.api.nvim_command(":xnoremap s k") -- Up
+vim.api.nvim_command(":xnoremap D K") -- Up
+vim.api.nvim_command(":xnoremap d j") -- Down
+vim.api.nvim_command(":xnoremap D J") -- Down
+vim.api.nvim_command(":xnoremap e a") -- Down
+vim.api.nvim_command(":xnoremap E A") -- Down
+vim.api.nvim_command(":xnoremap h .") -- Repeat last command
+vim.api.nvim_command(":xnoremap r f") -- To n'th chart to the right
+vim.api.nvim_command(":xnoremap R F") -- To n'th chart to the right
+vim.api.nvim_command(":xnoremap . ;") -- Repeat last f or T
+vim.api.nvim_command(":xnoremap m ^") -- Start line
+vim.api.nvim_command(":xnoremap / $") -- End line
+
+vim.api.nvim_command(":onoremap f <cmd>lua require('spider').motion('e')<CR>") -- Move right word
+vim.api.nvim_command(":onoremap a <cmd>lua require('spider').motion('b')<CR>") -- Move right word
+vim.api.nvim_command(":onoremap x d") -- Delete
+vim.api.nvim_command(":onoremap X D") -- Delete
+vim.api.nvim_command(":onoremap s k") -- Up
+vim.api.nvim_command(":onoremap D K") -- Up
+vim.api.nvim_command(":onoremap d j") -- Down
+vim.api.nvim_command(":onoremap D J") -- Down
+vim.api.nvim_command(":onoremap e a") -- Down
+vim.api.nvim_command(":onoremap E A") -- Down
+vim.api.nvim_command(":onoremap h .") -- Repeat last command
+vim.api.nvim_command(":onoremap r f") -- To n'th chart to the right
+vim.api.nvim_command(":onoremap R F") -- To n'th chart to the right
+vim.api.nvim_command(":onoremap . ;") -- Repeat last f or T
+vim.api.nvim_command(":onoremap m ^") -- Start line
+vim.api.nvim_command(":onoremap / $") -- End line
 
 -- vim.keymap.set({'s'}, 'a', '<Nop>', {})
 
@@ -57,8 +87,8 @@ vim.keymap.set({'n'}, 'xc', 'x', { nowait = true }) -- Delete character
 vim.keymap.set({'n'}, 'cx', 'r', { nowait = true }) -- Replace character
 
 -- Right --
-vim.keymap.set({'n', 'v'}, 'k', '5<C-U>', { nowait = true, silent = true }) -- Scroll Up
-vim.keymap.set({'n', 'v'}, 'l', '5<C-D>', { nowait = true, silent = true }) -- Scroll Down
+vim.keymap.set({'n', 'x'}, 'k', '5<C-U>', { nowait = true, silent = true }) -- Scroll Up
+vim.keymap.set({'n', 'x'}, 'l', '5<C-D>', { nowait = true, silent = true }) -- Scroll Down
 --vim.keymap.set({'n', 'v'}, 'k', '5<C-U>zz', { nowait = true, silent = true }) -- Scroll Up
 --vim.keymap.set({'n', 'v'}, 'l', '5<C-D>zz', { nowait = true, silent = true }) -- Scroll Down
 --vim.keymap.set({'n', 'v'}, 'k', '<C-u>zz', { nowait = true, silent = true }) -- Scroll Up
@@ -67,17 +97,17 @@ vim.keymap.set({'n', 'v'}, 'l', '5<C-D>', { nowait = true, silent = true }) -- S
 vim.keymap.set('n', 'K', 'O', { nowait = true }) -- Enter insert above
 vim.keymap.set('n', 'L', 'o', { nowait = true }) -- Enter insert below
 
-vim.keymap.set({'n', 'v'}, 'j', 'h', { nowait = true, silent = true }) -- Left
-vim.keymap.set({'n', 'v'}, ';', 'l', { nowait = true, silent = true }) -- Right
+vim.keymap.set({'n', 'x'}, 'j', 'h', { nowait = true, silent = true }) -- Left
+vim.keymap.set({'n', 'x'}, ';', 'l', { nowait = true, silent = true }) -- Right
 
 -- Search, keeping centered
-vim.keymap.set('n', 'n', 'nzzzv', { nowait = true, silent = true })
-vim.keymap.set('n', 'n', 'Nzzzv', { nowait = true, silent = true })
+vim.keymap.set('n', 'x', 'nzzzv', { nowait = true, silent = true })
+vim.keymap.set('n', 'x', 'Nzzzv', { nowait = true, silent = true })
 
 -- Text --
 ---- Remaps ----
 vim.keymap.set({'n', 'v', 'i'}, '<C-h>', 'dd', { })
-vim.keymap.set({'n', 'v'}, 'U', '<C-r>', { }) -- Redo
+vim.keymap.set({'n', 'x'}, 'U', '<C-r>', { }) -- Redo
 
 vim.keymap.set({'n'}, 'I', 'O<ESC>', { }) -- Insert blank line below
 vim.keymap.set({'n'}, 'O', 'o<ESC>', { }) -- Insert blank line above
@@ -87,16 +117,16 @@ vim.keymap.set({'n'}, 'O', 'o<ESC>', { }) -- Insert blank line above
 ---- VisualMode ----
 -------------------------------------------------------------------------------
 -- Move text up or down
-vim.keymap.set({'v'}, 'L', ":m '<+1<CR>gv=gv", { }) -- Kill
-vim.keymap.set({'v'}, 'K', ":m '>-2<CR>gv=gv", { }) -- Kill
+vim.keymap.set({'x'}, 'L', ":m '<+1<CR>gv=gv", { }) -- Kill
+vim.keymap.set({'x'}, 'K', ":m '>-2<CR>gv=gv", { }) -- Kill
 
 -- Selection
 -- vim.keymap.set('v', 'il', 'V', { nowait = true }) -- Select line -> No, just use V?
-vim.keymap.set('v', 'y', "y`]", { nowait = true }) -- Copy (Kill-copy),  `] jumps to end
-vim.keymap.set('v', 'y', "\"+y", { }) -- Copy to clipboard
-vim.keymap.set('v', 'Y', "\"+Y", { }) -- Copy to clipboard
-vim.keymap.set({'n', 'v'}, '<leader>p', "\"_dPd", { nowait = true }) -- Paste over (don't add to clipboard)
-vim.keymap.set({'n', 'v'}, '<C-p>', "\"*p", { nowait = true }) -- Paste from clipboard, removing ^M
+vim.keymap.set('x', 'y', "y`]", { nowait = true }) -- Copy (Kill-copy),  `] jumps to end
+vim.keymap.set('x', 'y', "\"+y", { }) -- Copy to clipboard
+vim.keymap.set('x', 'Y', "\"+Y", { }) -- Copy to clipboard
+vim.keymap.set({'n', 'x'}, '<leader>p', "\"_dPd", { nowait = true }) -- Paste over (don't add to clipboard)
+vim.keymap.set({'n', 'x'}, '<C-p>', "\"*p", { nowait = true }) -- Paste from clipboard, removing ^M
 vim.keymap.set({'i'}, '<C-p>', "<C-o>\"*p", { nowait = true }) -- Paste from clipboard, removing ^M
 -- vim.keymap.set('v', "<C-y>", "\"+y", { nowait = true }) -- Copy (Kill-copy),  `] jumps to end
 
@@ -126,15 +156,15 @@ vim.keymap.set('n', 'bo', ':%bd | e# <CR>', { })
 
 -- Goto/Open
 -- Character within a line: 
-vim.keymap.set({'n', 'v'}, '<Leader>/', '/\\c', { nowait = true  }) -- Search
-vim.keymap.set({'n', 'v'}, 'oc', 'f', { })   -- Goto character in line
+vim.keymap.set({'n', 'x'}, '<Leader>/', '/\\c', { nowait = true  }) -- Search
+vim.keymap.set({'n', 'x'}, 'oc', 'f', { })   -- Goto character in line
 vim.keymap.set('n', 'oxc', 'df', { }) -- Goto delete character in line
-vim.keymap.set({'n', 'v'}, 'orc', 'F', { })   -- Reverse, Goto character in line
+vim.keymap.set({'n', 'x'}, 'orc', 'F', { })   -- Reverse, Goto character in line
 vim.keymap.set('n', 'oxrc', 'dF', { }) -- Goto delete character in line
 -- vim.keymap.set({'n', 'v'}, '.', ';', { nowait = true, silent = true }) -- Forward character
 
 -- Lsp --
-vim.keymap.set({'n', 'v'}, 'ou',
+vim.keymap.set({'n', 'x'}, 'ou',
    --vim.lsp.buf.hover,
    function() vim.diagnostic.open_float(nil, { focus = false }) end,
    { nowait = true, silent = true }) -- Forward character
@@ -165,19 +195,19 @@ vim.keymap.set('n', 'ow', vim.lsp.buf.rename, { nowait = true })
 -- vim.keymap.set('n', 'ok', 'gg', { }) -- Top of Page
 -- vim.keymap.set('n', 'ol', 'G', { }) -- End of page
 
-vim.keymap.set({'n', 'v'}, '<C-f>', require("plugins.telescope.occur").occur_in_file, {})
-vim.keymap.set({'n', 'v'}, 'of', ":Telescope find_files<CR>", {})
-vim.keymap.set({'n', 'v'}, 'oa', ":Telescope file_browser path=%:p:h select_buffer=true<CR><ESC>", {})
-vim.keymap.set({'n', 'v'}, 'oo', ":Telescope lsp_document_symbols<CR>", {})
-vim.keymap.set({'n', 'v'}, 'ows', ":Telescope lsp_workspace_symbols<CR>", {})
-vim.keymap.set({'n', 'v'}, 'opp', vim.lsp.buf.list_workspace_folders, {})
-vim.keymap.set({'n', 'v'}, 'oq', function()
+vim.keymap.set({'n', 'x'}, '<C-f>', require("plugins.telescope.occur").occur_in_file, {})
+vim.keymap.set({'n', 'x'}, 'of', ":Telescope find_files<CR>", {})
+vim.keymap.set({'n', 'x'}, 'oa', ":Telescope file_browser path=%:p:h select_buffer=true<CR><ESC>", {})
+vim.keymap.set({'n', 'x'}, 'oo', ":Telescope lsp_document_symbols<CR>", {})
+vim.keymap.set({'n', 'x'}, 'ows', ":Telescope lsp_workspace_symbols<CR>", {})
+vim.keymap.set({'n', 'x'}, 'opp', vim.lsp.buf.list_workspace_folders, {})
+vim.keymap.set({'n', 'x'}, 'oq', function()
       vim.lsp.buf.format {
          filter = function(client) return client.name ~= "tsserver" end
       }
 end, {})
 
-vim.keymap.set({'n', 'v'}, 'os', ":Telescope buffers<CR><ESC>", {})
+vim.keymap.set({'n', 'x'}, 'os', ":Telescope buffers<CR><ESC>", {})
 -- vim.keymap.set({'n', 'v'}, 'ot', require("telescope.builtin").help_tags, {})
 -- vim.keymap.set({'n', 'v'}, 'or', require("telescope.builtin").resume, { nowait=true })
 
