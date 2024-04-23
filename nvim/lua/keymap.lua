@@ -101,8 +101,8 @@ vim.keymap.set({'n', 'x'}, 'j', 'h', { nowait = true, silent = true }) -- Left
 vim.keymap.set({'n', 'x'}, ';', 'l', { nowait = true, silent = true }) -- Right
 
 -- Search, keeping centered
-vim.keymap.set('n', 'x', 'nzzzv', { nowait = true, silent = true })
-vim.keymap.set('n', 'x', 'Nzzzv', { nowait = true, silent = true })
+-- vim.keymap.set({'n', 'x'}, 'nzzzv', { nowait = true, silent = true })
+-- vim.keymap.set({'n', 'x'}, 'Nzzzv', { nowait = true, silent = true })
 
 -- Text --
 ---- Remaps ----
