@@ -24,6 +24,7 @@ return {
         highlight = { enable = true },
         indent = { enable = true },  
       })
+
       vim.filetype.add({extension = {wgslx = "wgslx"}})
       vim.treesitter.language.register('wgsl', { 'wgslx' })
 
