@@ -98,7 +98,8 @@ provides.occur_in_file = function ()
             vim.api.nvim_win_call(
                initial_window,
                function ()
-                  vim.api.nvim_win_set_cursor(initial_window, { lnum + cursor_offset, 1 })
+                  vim.api.nvim_win_set_cursor(initial_window, { math.min(win_height, lnum + cursor_offset ), 1 })
+                  -- vim.api.nvim_win_set_cursor(initial_window, { lnum, 1 })
                   --vim.cmd([[normal! 10\<C-y>]])  -- Scroll down using Ctrl + e
                   --vim.cmd('normal! zt10<C-y>')
                end
