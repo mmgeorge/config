@@ -6,6 +6,7 @@ KILLEMACS="(kill-emacs)"
 
 # bindings
 alias nvim='XDG_CONFIG_HOME="$HOME/config" nvim'
+alias nonvim=nvim
 alias vi='XDG_CONFIG_HOME="$HOME/config" $HOME/nvim-linux64/bin/nvim'
 #alias clear='clear;tmux clear-history'
 alias ll='ls -l --block-size=M --group-directories-first --color'
