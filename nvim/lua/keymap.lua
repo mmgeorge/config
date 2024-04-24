@@ -117,8 +117,8 @@ vim.keymap.set({'n'}, 'O', 'o<ESC>', { }) -- Insert blank line above
 ---- VisualMode ----
 -------------------------------------------------------------------------------
 -- Move text up or down
-vim.keymap.set({'x'}, 'L', ":m '<+1<CR>gv=gv", { }) -- Kill
-vim.keymap.set({'x'}, 'K', ":m '>-2<CR>gv=gv", { }) -- Kill
+vim.keymap.set({'x'}, 'L', "<CMD>m '<+1<CR>gv=gv", { }) -- Kill
+vim.keymap.set({'x'}, 'K', "<CMD>m '>-2<CR>gv=gv", { }) -- Kill
 
 -- Selection
 -- vim.keymap.set('v', 'il', 'V', { nowait = true }) -- Select line -> No, just use V?
@@ -144,15 +144,15 @@ vim.keymap.set('n', '<leader>j', "<cmd>lprev<CR>zz", { nowait = true }) -- Paste
 -- vim.keymap.set('n', '<C-j>', "<cmd>cprev<CR>zz", { nowait = true }) -- Paste over (don't add to clipboard)
 
 -- Window
-vim.keymap.set('n', 'wsb', ':split<CR>', { })
-vim.keymap.set('n', 'wko', ':only<CR>', { })
-vim.keymap.set('n', 'wks', ':close!<CR>', { })
+vim.keymap.set('n', 'wsb', '<CMD>split<CR>', { })
+vim.keymap.set('n', 'wko', '<CMD>only<CR>', { })
+vim.keymap.set('n', 'wks', '<CMD>close!<CR>', { })
 vim.keymap.set('n', 'wo', '<C-w>W', { })
-vim.keymap.set('n', 'wkb', ':bd<CR>', { })
+vim.keymap.set('n', 'wkb', '<CMD>bd<CR>', { })
 
 -- Buffers
-vim.keymap.set('n', 'bk', ':bd<CR>', { })
-vim.keymap.set('n', 'bo', ':%bd | e# <CR>', { })
+vim.keymap.set('n', 'bk', '<CMD>bd<CR>', { })
+vim.keymap.set('n', 'bo', '<CMD>%bd | e# <CR>', { })
 
 -- Goto/Open
 -- Character within a line: 
@@ -196,18 +196,19 @@ vim.keymap.set('n', 'ow', vim.lsp.buf.rename, { nowait = true })
 -- vim.keymap.set('n', 'ol', 'G', { }) -- End of page
 
 vim.keymap.set({'n', 'x'}, '<C-f>', require("plugins.telescope.occur").occur_in_file, {})
-vim.keymap.set({'n', 'x'}, 'of', ":Telescope find_files<CR>", {})
-vim.keymap.set({'n', 'x'}, 'oa', ":Telescope file_browser path=%:p:h select_buffer=true<CR><ESC>", {})
-vim.keymap.set({'n', 'x'}, 'oo', ":Telescope lsp_document_symbols<CR>", {})
-vim.keymap.set({'n', 'x'}, 'ows', ":Telescope lsp_workspace_symbols<CR>", {})
-vim.keymap.set({'n', 'x'}, 'opp', vim.lsp.buf.list_workspace_folders, {})
+vim.keymap.set({'n', 'x'}, 'of', require("telescope.builtin").find_files, { nowait = true  })
+vim.keymap.set({'n', 'x'}, 'oa', "<CMD>Telescope file_browser path=%:p:h select_buffer=true<CR><ESC>", { nowait = true })
+vim.keymap.set({'n', 'x'}, 'oo', require("telescope.builtin").lsp_document_symbols, { nowait = true })
+vim.keymap.set({'n', 'x'}, 'ows', require("telescope.builtin").lsp_workspace_symbols, { nowait = true })
+vim.keymap.set({'n', 'x'}, 'opp', vim.lsp.buf.list_workspace_folders, { nowait = true })
 vim.keymap.set({'n', 'x'}, 'oq', function()
       vim.lsp.buf.format {
          filter = function(client) return client.name ~= "tsserver" end
       }
 end, {})
 
-vim.keymap.set({'n', 'x'}, 'os', ":Telescope buffers<CR><ESC>", {})
+-- vim.keymap.set({'n', 'x'}, 'os', ":Telescope buffers<CR><ESC>", {})
+vim.keymap.set({'n', 'x'}, 'os', require("telescope.builtin").buffers, { nowait = true })
 -- vim.keymap.set({'n', 'v'}, 'ot', require("telescope.builtin").help_tags, {})
 -- vim.keymap.set({'n', 'v'}, 'or', require("telescope.builtin").resume, { nowait=true })
 
@@ -216,12 +217,12 @@ vim.keymap.set({'n', 'x'}, 'os', ":Telescope buffers<CR><ESC>", {})
 --vim.keymap.set({'i', 'v'}, '<C-g>', '<Esc>', { nowait = false, unique=true }) -- Cancel
 --vim.keymap.set({'n', 'i', 'v'}, '<Left>', '<Esc>', { nowait = false, unique=true }) -- Cancel
 vim.keymap.set({'i', 'v', 'c', 't', 's', 'o', 'x'}, '<C-o>', '<Esc>', { nowait = true }) -- Cancel
-vim.keymap.set({'n'}, '<C-k>', '<Esc>:noh<CR>', { nowait = true, silent=true }) -- Cancel
+-- vim.keymap.set({'n'}, '<C-k>', '<Esc>:noh<CR>', { nowait = true, silent=true }) -- Cancel
 
 -- vim.keymap.set('n', '<C-->', '<Plug>(comment_toggle_linewise_current)', {}) -- Comment line, maps to C-/
 vim.keymap.set('n', '<C-_>', '<Plug>(comment_toggle_linewise_current)j', {}) -- Comment line, maps to C-/
 -- vim.keymap.set('n', '<C-/>', '<Plug>(comment_toggle_linewise_current)', {}) -- Comment line, maps to C-/
-vim.keymap.set('n', '<C-e>', ':x<CR>', { nowait = true }) -- Save file
-vim.keymap.set('n', '<C-s>', ':w<CR>', { nowait = true }) -- Save file
+vim.keymap.set('n', '<C-e>', '<CMD>x<CR>', { nowait = true }) -- Save file
+vim.keymap.set('n', '<C-s>', '<CMD>w<CR>', { nowait = true }) -- Save file
 vim.keymap.set('i', '<C-s>', '<C-o>:w<CR>', { nowait = true }) -- Save file
 -- vim.keymap.set('n', '<C-r>', ':earlier 10f<CR>', {}) -- Revert file
