@@ -30,6 +30,8 @@ vim.api.nvim_command(":unmap a%")
 -- Remaps --
 vim.api.nvim_command(":nnoremap f <cmd>lua require('spider').motion('e')<CR>") -- Move right word
 vim.api.nvim_command(":nnoremap a <cmd>lua require('spider').motion('b')<CR>") -- Move right word
+vim.api.nvim_command(":nnoremap p P") -- Delete
+vim.api.nvim_command(":nnoremap P p") -- Delete
 vim.api.nvim_command(":nnoremap x d") -- Delete
 vim.api.nvim_command(":nnoremap X D") -- Delete
 vim.api.nvim_command(":nnoremap s k") -- Up
@@ -47,6 +49,8 @@ vim.api.nvim_command(":nnoremap / $") -- End line
 
 vim.api.nvim_command(":xnoremap f <cmd>lua require('spider').motion('e')<CR>") -- Move right word
 vim.api.nvim_command(":xnoremap a <cmd>lua require('spider').motion('b')<CR>") -- Move right word
+vim.api.nvim_command(":xnoremap p P") -- Delete
+vim.api.nvim_command(":xnoremap P p") -- Delete
 vim.api.nvim_command(":xnoremap x d") -- Delete
 vim.api.nvim_command(":xnoremap X D") -- Delete
 vim.api.nvim_command(":xnoremap s k") -- Up
@@ -64,6 +68,8 @@ vim.api.nvim_command(":xnoremap / $") -- End line
 
 vim.api.nvim_command(":onoremap f <cmd>lua require('spider').motion('e')<CR>") -- Move right word
 vim.api.nvim_command(":onoremap a <cmd>lua require('spider').motion('b')<CR>") -- Move right word
+vim.api.nvim_command(":onoremap p P") -- Delete
+vim.api.nvim_command(":onoremap P p") -- Delete
 vim.api.nvim_command(":onoremap x d") -- Delete
 vim.api.nvim_command(":onoremap X D") -- Delete
 vim.api.nvim_command(":onoremap s k") -- Up
