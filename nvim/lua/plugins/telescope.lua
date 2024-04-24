@@ -43,7 +43,7 @@ return {
           sorting_strategy = "ascending",
           layout_config = {
             prompt_position = "top",
-            height = 0.4,
+            height = 20,
             --height = vim.o.lines, -- Maximally available lines
             --width = vim.o.columns, -- Maximally available columns
 
