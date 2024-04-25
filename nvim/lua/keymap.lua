@@ -212,6 +212,7 @@ vim.keymap.set({'n', 'x'}, 'oq', function()
          filter = function(client) return client.name ~= "tsserver" end
       }
 end, {})
+vim.keymap.set('n', '<C-q>', '<CMD>x<CR>', { nowait = true }) -- Save file
 
 -- vim.keymap.set({'n', 'x'}, 'os', ":Telescope buffers<CR><ESC>", {})
 vim.keymap.set({'n', 'x'}, 'os', require("telescope.builtin").buffers, { nowait = true })
@@ -225,10 +226,11 @@ vim.keymap.set({'n', 'x'}, 'os', require("telescope.builtin").buffers, { nowait 
 vim.keymap.set({'i', 'v', 'c', 't', 's', 'o', 'x'}, '<C-o>', '<Esc>', { nowait = true }) -- Cancel
 -- vim.keymap.set({'n'}, '<C-k>', '<Esc>:noh<CR>', { nowait = true, silent=true }) -- Cancel
 
+vim.keymap.set('n', '<C-e>', function() vim.diagnostic.goto_next() end, { nowait = true })
+vim.keymap.set('n', '<S-C-e>', function() vim.diagnostic.goto_prev() end, { nowait = true })
 -- vim.keymap.set('n', '<C-->', '<Plug>(comment_toggle_linewise_current)', {}) -- Comment line, maps to C-/
 vim.keymap.set('n', '<C-_>', '<Plug>(comment_toggle_linewise_current)j', {}) -- Comment line, maps to C-/
 -- vim.keymap.set('n', '<C-/>', '<Plug>(comment_toggle_linewise_current)', {}) -- Comment line, maps to C-/
-vim.keymap.set('n', '<C-e>', '<CMD>x<CR>', { nowait = true }) -- Save file
 vim.keymap.set('n', '<C-s>', '<CMD>w<CR>', { nowait = true }) -- Save file
 vim.keymap.set('i', '<C-s>', '<C-o>:w<CR>', { nowait = true }) -- Save file
 -- vim.keymap.set('n', '<C-r>', ':earlier 10f<CR>', {}) -- Revert file
