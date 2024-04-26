@@ -16,12 +16,12 @@ local keys = {
 --           *    *
   '', 'k', 'j', '', 'g',
 --sb    *    *    se      
-  'u', 'd', 'c', 'v', 'b',
+  'u', 'r', 'c', 'v', 'b',
 -- *    *      
 
-  'y', 'y', 'i', 'o', 'p', 
+  'x', 'y', 'i', 'o', 'p', 
 --      *              
-  '.', '',  '',  '',  '', 
+  'd', '',  '',  '',  '', 
 -- *    h   up  down   l                   
   'n', '^', ',', ';', '$'
 --      *         *    *      (start line, back, lsp-ref, end line)
@@ -96,7 +96,6 @@ end
 
 function remap(in_key, dest)
   local key = to_layout_key(in_key)
-  print(key, dest)
   vim.api.nvim_command(":nnoremap " .. key .. ' ' .. dest)
   vim.api.nvim_command(":xnoremap " .. key .. ' ' .. dest)
   vim.api.nvim_command(":onoremap " .. key .. ' ' .. dest)
@@ -106,6 +105,12 @@ function keymap(modes, in_key, dest)
   local key = to_layout_key(in_key)
   vim.keymap.set(modes, key, dest, { nowait=true, silent=false })
 end
+
+function keymap_leader(modes, in_key, dest)
+  local key = to_layout_key(in_key)
+  vim.keymap.set(modes, "<leader>d" .. key, dest, { nowait=true, silent=false })
+end
+
 
 -- Unmaps -
 vim.keymap.set({'n', 'x'}, 'o', '<Nop>', {})
@@ -137,52 +142,39 @@ end
 keymap('n', ',', back)
 keymap({'n', 'x'}, 'k', up)
 keymap({'n', 'x'}, 'l', down)
+keymap({'x'}, 'p', 'P') -- P will paste over in x without yanking
 
 remap('f', se)
 remap('a', sb)
 remap('j', 'h') -- Left
 remap(';', 'l') -- Right
 
-
-keymap({'n'}, 'xc', 'x') -- Delete character
-keymap({'n'}, 'cx', 'r') -- Replace character
+-- keymap({'n'}, 'xc', 'x') -- Delete character
+-- keymap({'n'}, 'cx', 'r') -- Replace character
 
 ----Enter Modes
 keymap('n', 'K', 'O') -- Enter insert above
 keymap('n', 'L', 'o') -- Enter insert below
--- Search, keeping centered
 -- keymap({'n', 'x'}, 'nzzzv')
 -- keymap({'n', 'x'}, 'Nzzzv')
 
--- Text --
----- Remaps ----
 keymap({'n', 'v', 'i'}, '<C-h>', 'dd')
 keymap({'n', 'x'}, 'Z', '<C-r>') -- Redo
 
 keymap({'n'}, 'I', 'O<ESC>') -- Insert blank line below
 keymap({'n'}, 'O', 'o<ESC>') -- Insert blank line above
 
-
--------------------------------------------------------------------------------
----- VisualMode ----
--------------------------------------------------------------------------------
 -- Move text up or down
 keymap({'x'}, 'L', "<CMD>m '<+1<CR>gv=gv") -- Kill
 keymap({'x'}, 'K', "<CMD>m '>-2<CR>gv=gv") -- Kill
 
--- Selection
--- keymap('x', 'y', "y`]") -- Copy (Kill-copy),  `] jumps to end
--- keymap('x', 'y', "\"+y") -- Copy to clipboard
--- keymap('x', 'Y', "\"+Y") -- Copy to clipboard
--- keymap({'n', 'x'}, '<leader>p', "\"_dPd") -- Paste over (don't add to clipboard)
--- keymap({'n', 'x'}, '<C-p>', "\"*p") -- Paste from clipboard, removing ^M
--- keymap({'i'}, '<C-p>', "<C-o>\"*p") -- Paste from clipboard, removing ^M
-
--- Commands --
----- Replace text
--- keymap({'n', 'v'}, '<leader>s', ":%s/\\<<C-r><C-w>\\>/<C-r><C-w>/gI<Left><Left><Left>")
--- keymap({'n', 'v'}, '<leader>iu', function() require("utils").insert_v4({}) end)
--- keymap({'n', 'v'}, '<leader>t', 'gg=G')
+-- Commands
+keymap_leader({'x', 'n'}, 'u', "\"+y") -- Copy to clipboard
+keymap_leader({'x', 'n'}, 'U', "\"+Y") -- Copy to clipboard
+keymap_leader({'x', 'n'}, 'p', "\"+P") -- Paste to clipboard
+keymap_leader({'n', 'v'}, 's', ":%s/\\<<C-r><C-w>\\>/<C-r><C-w>/gI<Left><Left><Left>")
+keymap_leader({'n', 'v'}, 'iu', function() require("utils").insert_v4({}) end)
+keymap_leader({'n', 'v'}, 't', 'gg=G')
 
 ---- Jump quickfix
 -- keymap('n', '<leader>k', "<cmd>lnext<CR>zz") -- Paste over (don't add to clipboard)
