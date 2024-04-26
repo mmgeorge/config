@@ -203,6 +203,7 @@ vim.keymap.set('n', 'ow', vim.lsp.buf.rename, { nowait = true })
 
 vim.keymap.set({'n', 'x'}, '<C-f>', require("plugins.telescope.occur").occur_in_file, {})
 vim.keymap.set({'n', 'x'}, 'of', require("telescope.builtin").find_files, { nowait = true  })
+vim.keymap.set({'n', 'x'}, 'od', require("telescope.builtin").live_grep, { nowait = true  })
 vim.keymap.set({'n', 'x'}, 'oa', "<CMD>Telescope file_browser path=%:p:h select_buffer=true<CR><ESC>", { nowait = true })
 vim.keymap.set({'n', 'x'}, 'oo', require("telescope.builtin").lsp_document_symbols, { nowait = true })
 vim.keymap.set({'n', 'x'}, 'ows', require("telescope.builtin").lsp_workspace_symbols, { nowait = true })

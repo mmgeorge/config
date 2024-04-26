@@ -39,13 +39,13 @@ return {
 
       require('telescope').setup({
         defaults = {
-          -- layout_strategy = "vertical", 
+          layout_strategy = "vertical", 
           sorting_strategy = "ascending",
           layout_config = {
             prompt_position = "top",
             height = 20,
-            --height = vim.o.lines, -- Maximally available lines
-            --width = vim.o.columns, -- Maximally available columns
+            --height = vim.o.lines, -- maximally available lines
+            --width = vim.o.columns, -- maximally available columns
 
           },
           -- See <https://github.com/nvim-telescope/telescope.nvim/blob/master/lua/telescope/mappings.lua>
@@ -71,6 +71,16 @@ return {
           }
         },
         pickers = {
+          live_grep = {
+            -- theme = "dropdown",
+            layout_config = {
+              prompt_position = "top",
+              height = .8, -- maximally available lines
+              width = .8, -- maximally available columns
+            },
+            previewer = true,
+            -- disable_coordinates=true
+          },
           find_files = {
             theme = "ivy",
             previewer = false,
