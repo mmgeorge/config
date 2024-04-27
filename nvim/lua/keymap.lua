@@ -108,7 +108,7 @@ end
 
 function keymap_leader(modes, in_key, dest)
   local key = to_layout_key(in_key)
-  vim.keymap.set(modes, "<leader>d" .. key, dest, { nowait=true, silent=false })
+  vim.keymap.set(modes, "<leader>" .. key, dest, { nowait=true, silent=false })
 end
 
 
