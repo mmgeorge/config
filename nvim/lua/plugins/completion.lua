@@ -118,12 +118,86 @@ return {
         capabilities = capabilities
       })
 
+      local function organize_imports()
+        local params = {
+          command = "_typescript.organizeImports",
+          arguments = {vim.api.nvim_buf_get_name(0)},
+          title = ""
+        }
+        vim.lsp.buf.execute_command(params)
+      end
+      
       require('lspconfig')['tsserver'].setup({
-        capabilities = capabilities
+        capabilities = capabilities,
+        commands = {
+          OrganizeImports = {
+            organize_imports,
+            description = "Organize Imports"
+          }
+        }
+        -- on_attach = function(client, bufnr)
+        --   vim.api.nvim_create_autocmd("BufWritePre", {
+        --     buffer = bufnr,
+        --     command = "_typescript.organizeImports",
+        --   })
+        -- end,
       })
 
       require('lspconfig')['lua_ls'].setup({
         capabilities = capabilities
+      })
+
+      require('lspconfig')['eslint'].setup({
+        capabilities = capabilities,
+        on_attach = function(client, bufnr)
+          vim.api.nvim_create_autocmd("BufWritePre", {
+            buffer = bufnr,
+            command = "EslintFixAll",
+          })
+        end,
+        -- cmd = { "npx", "eslint", "--stdio" },
+        settings = {
+          codeAction = {
+            disableRuleComment = {
+              enable = true,
+              location = "separateLine"
+            },
+            showDocumentation = {
+              enable = true
+            }
+          },
+          codeActionOnSave = {
+            enable = true,
+            mode = "all"
+          },
+          -- experimental = {
+            -- useFlatConfig = true
+          -- },
+          format = true,
+          -- nodePath = "",
+          -- onIgnoredFiles = "off",
+          problems = {
+            shortenToSingleLine = false
+          },
+          -- quiet = true,
+          rulesCustomizations = {
+            {
+              rule = 'prettier/prettier',
+              severity = 'off', 
+            },
+            {
+              rule = '@typescript-eslint/no-unused-vars',
+              severity = 'warn', 
+            }
+          },
+          run = "onType",
+          -- useESLintClass = false,
+          validate = "on",
+          workingDirectory = {
+            mode = "location"
+          },
+          -- root_dir = lspconfig.util.find_git_ancestor,
+        }
       })
     end
 

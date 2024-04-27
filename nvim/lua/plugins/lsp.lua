@@ -23,7 +23,8 @@ return {
     "WhoIsSethDaniel/mason-tool-installer.nvim",
     config = function()
       require("mason-tool-installer").setup({
-        ensure_installed = { "stylua", "prettierd" },
+        -- ensure_installed = { "stylua", "prettierd" },
+        ensure_installed = { "prettierd" },
         auto_update = false,
         run_on_start = true,
         debounce_hours = 5, 
@@ -35,55 +36,11 @@ return {
   {
     "neovim/nvim-lspconfig",
     config = function()
-      local lspconfig = require("lspconfig")
-      lspconfig.lua_ls.setup({})
-      lspconfig.rust_analyzer.setup({})
-      lspconfig.tsserver.setup({})
-      lspconfig.eslint.setup({
-        on_attach = function(client, bufnr)
-          vim.api.nvim_create_autocmd("BufWritePre", {
-            buffer = bufnr,
-            command = "EslintFixAll",
-          })
-        end,
-        settings = {
-          codeAction = {
-            disableRuleComment = {
-              enable = true,
-              location = "separateLine"
-            },
-            showDocumentation = {
-              enable = true
-            }
-          },
-          codeActionOnSave = {
-            enable = true,
-            mode = "all"
-          },
-          experimental = {
-            useFlatConfig = false
-          },
-          format = true,
-          nodePath = "",
-          onIgnoredFiles = "off",
-          problems = {
-            shortenToSingleLine = false
-          },
-          quiet = false,
-          rulesCustomizations = {
-            {
-              rule = 'prettier/prettier',
-              severity = 'off', 
-            }
-          },
-          run = "onType",
-          useESLintClass = false,
-          validate = "on",
-          workingDirectory = {
-            mode = "location"
-          }
-        }
-      })
+      -- local lspconfig = require("lspconfig")
+      -- lspconfig.lua_ls.setup({})
+      -- lspconfig.rust_analyzer.setup({})
+      -- lspconfig.tsserver.setup({})
+      -- lspconfig.eslint.setup({})
     end
   },
 
