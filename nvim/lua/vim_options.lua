@@ -10,6 +10,7 @@ vim.o.number=true
 vim.o.laststatus=3
 vim.opt.statuscolumn = "%l %=%s" -- %= means right align
 vim.opt.signcolumn = 'yes'
+vim.o.scrolloff = 0
 
 vim.g.rust_recommended_style = '0' -- Otherwise will override indentation settings
 
