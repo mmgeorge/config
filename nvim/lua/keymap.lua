@@ -42,6 +42,8 @@ for i, v in ipairs(k.keys) do
   end
 end
 
+vim.keymap.set({'n', 'x'}, '<iw>', '<Nop>', {})
+
 k.keymap('n', ',', back)
 k.keymap({'n', 'x'}, 'k', up)
 k.keymap({'n', 'x'}, 'l', down)
@@ -51,6 +53,8 @@ k.remap('f', se)
 k.remap('a', sb)
 k.remap('j', 'h') -- Left
 k.remap(';', 'l') -- Right
+
+k.keymap({ 'n' }, 'cc', 'ciw')
 
 -- keymap({'n'}, 'xc', 'x') -- Delete character
 -- keymap({'n'}, 'cx', 'r') -- Replace character
@@ -64,6 +68,7 @@ k.keymap('n', 'L', 'o') -- Enter insert below
 k.keymap({'n', 'v', 'i'}, '<C-h>', 'dd')
 k.keymap({'n', 'x'}, 'Z', '<C-r>') -- Redo
 
+-- vim.keymap.set({'n'}, '<CR>', 'O<ESC>') -- Insert blank line below
 k.keymap({'n'}, 'I', 'O<ESC>') -- Insert blank line below
 k.keymap({'n'}, 'O', 'o<ESC>') -- Insert blank line above
 
