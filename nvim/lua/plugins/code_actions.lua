@@ -1,3 +1,5 @@
+local key = require("../keys").key
+
 return {
   "luckasRanarison/clear-action.nvim",
   opts = {
@@ -43,11 +45,11 @@ return {
       -- example: "<leader>aq" | { "<leader>aq", "Quickfix" }
       -- Or if you want more control: { key = "<leader>aq", mode = { "n" }, options = { desc = "Quickfix" } }
       -- `options` accetps the same keys as vim.keymap.set()
-      code_action = "<Leader>a", -- a modified version of `vim.lsp.buf.code_action`
+      code_action = "<Leader>" .. key("a"), -- a modified version of `vim.lsp.buf.code_action`
       apply_first = nil, -- directly applies the first code action
       -- These are just basically `vim.lsp.buf.code_action` with the `apply` option with some filters
       -- If there's only one code action, it gets automatically applied.
-      quickfix = "<Leader>q", -- can be filtered with the `quickfix_filter` option bellow
+      quickfix = nil, -- can be filtered with the `quickfix_filter` option bellow
       quickfix_next = nil, -- tries to fix the next diagnostic
       quickfix_prev = nil, -- tries to fix the previous diagnostic
       refactor = nil,

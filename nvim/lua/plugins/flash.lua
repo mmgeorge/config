@@ -1,10 +1,12 @@
+local key = require("../keys").key
+
 return {
  "folke/flash.nvim",
   event = "VeryLazy",
   ---@type Flash.Config
   -- stylua: ignore
   keys = {
-    { "<Leader>f", mode = { "n", "x", "o" }, function() 
+    { "<Leader>" .. key("f"), mode = { "n", "x", "o" }, function() 
       -- Jump ignoring casing
       local gi = vim.go.ignorecase
       local gs = vim.go.smartcase

@@ -83,13 +83,13 @@ return {
     "folke/trouble.nvim",
     dependencies = { "nvim-tree/nvim-web-devicons" },
     branch = "dev",
-    keys = {
-      {
-        "we",
-        "<cmd>Trouble diagnostics toggle<cr>",
-        desc = "Diagnostics (Trouble)",
-      }
-    },
+    -- keys = {
+      -- {
+        -- "we",
+        -- "<cmd>Trouble diagnostics toggle<cr>",
+        -- desc = "Diagnostics (Trouble)",
+      -- }
+    -- },
     opts = {
       auto_close = false, -- auto close when there are no items
       auto_open = false, -- auto open when there are items
