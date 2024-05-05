@@ -1,3 +1,5 @@
+local key = require("../keys").key
+
 return {
   {
     'nvim-telescope/telescope.nvim', -- tag = '0.1.6',
@@ -52,20 +54,20 @@ return {
           mappings = {
             [ "i" ] = {
               --["<C-g>"] = actions.close, 
-              ["<C-o>"] = actions.close, 
-              ["<C-k>"] = actions.move_selection_previous, 
-              ["<C-l>"] = actions.move_selection_next,
+              [key("<C-o>")] = actions.close, 
+              [key("<C-k>")] = actions.move_selection_previous, 
+              [key("<C-l>")] = actions.move_selection_next,
             },
             [ "n" ] = {
-              ["<C-o>"] = actions.close, 
-              ["s"] = actions.move_selection_previous, 
-              ["d"] = actions.move_selection_next,
-              ["k"] = actions.move_selection_previous, 
-              ["l"] = actions.move_selection_next,
+              [key("<C-o>")] = actions.close, 
+              [key("s")] = actions.move_selection_previous, 
+              [key("d")] = actions.move_selection_next,
+              [key("k")] = actions.move_selection_previous, 
+              [key("l")] = actions.move_selection_next,
               -- ["k"] = actions.preview_scrolling_up, 
               -- ["l"] = actions.preview_scrolling_down, 
-              ["gg"] = actions.move_to_top, 
-              ["G"] = actions.move_to_bottom, 
+              [key("gg")] = actions.move_to_top, 
+              [key("G")] = actions.move_to_bottom, 
               -- ["<Tab>"] = actions.select_tab, 
             }
           }
@@ -153,7 +155,7 @@ return {
               ["i"] = {
                 ["<Left>"] = fb_actions.goto_parent_dir,
                 ["<Right>"] = fb_actions.change_cwd,
-                ["<C-p>"] = fb_actions.create_from_prompt, 
+                [key("<C-p>")] = fb_actions.create_from_prompt, 
                 ["<CR>"] = actions.select_default, 
                 -- ["<C-g>"] = actions.close, 
                 -- ["<C-m>"] = fb_actions.move, 
@@ -162,8 +164,8 @@ return {
               ["n"] = {
                 ["<CR>"] = actions.select_default,
                 ["<C-p>"] = fb_actions.move, 
-                ["a"] = fb_actions.goto_parent_dir, 
-                ["f"] = fb_actions.change_cwd, 
+                [key("a")] = fb_actions.goto_parent_dir, 
+                [key("f")] = fb_actions.change_cwd, 
                 ["<C-r>"] = fb_actions.rename, 
                 ["<C-x>"] = fb_actions.remove, 
                 ["<C-m>"] = fb_actions.move, 

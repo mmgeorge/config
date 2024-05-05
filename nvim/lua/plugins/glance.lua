@@ -1,3 +1,5 @@
+local key = require("../keys").key
+
 return {
   "dnlhc/glance.nvim",
   config = function()
@@ -40,34 +42,34 @@ return {
       },
       mappings = {
         list = {
-          ['d'] = actions.next, -- Bring the cursor to the next item in the list
-          ['s'] = actions.previous, -- Bring the cursor to the previous item in the list
+          [key('d')] = actions.next, -- Bring the cursor to the next item in the list
+          [key('s')] = actions.previous, -- Bring the cursor to the previous item in the list
           ['<Down>'] = actions.next,
           ['<Up>'] = actions.previous,
           ['<Tab>'] = actions.next_location, -- Bring the cursor to the next location skipping groups in the list
           ['<S-Tab>'] = actions.previous_location, -- Bring the cursor to the previous location skipping groups in the list
-          ['<C-u>'] = actions.preview_scroll_win(5),
-          ['<C-d>'] = actions.preview_scroll_win(-5),
+          -- ['<C-u>'] = actions.preview_scroll_win(5),
+          -- ['<C-d>'] = actions.preview_scroll_win(-5),
           -- ['v'] = actions.jump_vsplit,
           -- ['s'] = actions.jump_split,
-          ['t'] = actions.jump_tab,
+          [key('t')] = actions.jump_tab,
           ['<CR>'] = actions.jump,
           -- ['o'] = actions.jump,
-          ['f'] = actions.open_fold,
-          ['a'] = actions.close_fold,
+          [key('f')] = actions.open_fold,
+          [key('a')] = actions.close_fold,
           -- ['<leader>l'] = actions.enter_win('preview'), -- Focus preview window
-          ['q'] = actions.close,
-          ['Q'] = actions.close,
+          [key('q')] = actions.close,
+          [key('Q')] = actions.close,
           ['<Esc>'] = actions.close,
           ['<C-k>'] = actions.close,
           ['<C-q>'] = actions.quickfix,
           -- ['<Esc>'] = false -- disable a mapping
         },
         preview = {
-          ['Q'] = actions.close,
+          [key('Q')] = actions.close,
           ['<Tab>'] = actions.next_location,
           ['<S-Tab>'] = actions.previous_location,
-          ['<leader>l'] = actions.enter_win('list'), -- Focus list window
+          ['<leader>' .. key("l")] = actions.enter_win('list'), -- Focus list window
         },
       },
       hooks = {

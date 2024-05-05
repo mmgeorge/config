@@ -1,3 +1,5 @@
+local key = require("../keys").key
+
 return {
   {
     "otavioschwanck/arrow.nvim",
@@ -12,17 +14,17 @@ return {
         return vim.fn.stdpath("cache") .. "/arrow"
       end,
       mappings = {
-        edit = "o",
-        delete_mode = "x",
-        clear_all_items = "X",
-        toggle = "j", -- used as save if separate_save_and_remove is true
-        open_vertical = "v",
-        open_horizontal = "-",
-        quit = "<C-k>",
+        edit = key("o"),
+        delete_mode = key("x"),
+        clear_all_items = key("X"),
+        toggle = key("j"), -- used as save if separate_save_and_remove is true
+        open_vertical = key("v"),
+        open_horizontal = key("-"),
+        quit = key("<C-k>"),
         -- quit = "<C-k>",
-        remove = "x", -- only used if separate_save_and_remove is true
-        next_item = "k",
-        prev_item = "l"
+        remove = key("x"), -- only used if separate_save_and_remove is true
+        next_item = key("k"),
+        prev_item = key("l")
       },
       -- custom_actions = {
         -- open = function(target_file_name, current_file_name) end, -- target_file_name = file selected to be open, current_file_name = filename from where this was called
