@@ -1,3 +1,5 @@
+local key = require("../keys").key
+
 return {
   {
     "sindrets/diffview.nvim"
@@ -12,7 +14,7 @@ return {
     },
     keys = {
       {
-        "og",
+        key("og"),
         "<cmd>Neogit<cr>",
         desc = "Neogit",
       }
@@ -139,7 +141,7 @@ return {
         },
         mappings = {
           commit_editor = {
-            ["q"] = "Close",
+            [key("q")] = "Close",
             ["<C-k>"] = "Close",
             ["<c-c><c-c>"] = "Submit",
             ["<c-c><c-k>"] = "Abort",
@@ -154,7 +156,7 @@ return {
             ["x"] = "Execute",
             ["d"] = "Drop",
             ["b"] = "Break",
-            ["q"] = "Close",
+            [key("q")] = "Close",
             ["<cr>"] = "OpenCommit",
             ["gk"] = "MoveUp",
             ["gj"] = "MoveDown",
@@ -190,10 +192,10 @@ return {
             ["p"] = "PullPopup",
             ["r"] = "RebasePopup",
             ["v"] = "RevertPopup",
-            ["w"] = "WorktreePopup",
+            -- ["w"] = "WorktreePopup",
           },
           status = {
-            ["q"] = "Close",
+            [key("q")] = "Close",
             ["<C-k>"] = "Close",
             ["I"] = "InitRepo",
             ["1"] = "Depth1",
