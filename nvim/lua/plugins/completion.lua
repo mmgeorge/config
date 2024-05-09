@@ -62,14 +62,14 @@ return {
           ["<Tab>"] = cmp.mapping(function(fallback)
             -- This little snippet will confirm with tab, and if no entry is selected,
             -- will confirm the first item
-            -- if cmp.visible() then
-              -- local entry = cmp.get_selected_entry()
-              -- if not entry then
-              -- cmp.select_next_item({ behavior = cmp.SelectBehavior.Select })
-              -- end
+            if cmp.visible() then
+              local entry = cmp.get_selected_entry()
+              if not entry then
+              cmp.select_next_item({ behavior = cmp.SelectBehavior.Select })
+              end
               -- cmp.confirm()
-            if require("luasnip").locally_jumpable(1) then
-              require("luasnip").jump(1)
+            -- if require("luasnip").locally_jumpable(1) then
+              -- require("luasnip").jump(1)
             else
               fallback()
             end
@@ -87,10 +87,8 @@ return {
           ['<CR>'] = cmp.mapping.confirm({ select = true }),
         }),
         sources = cmp.config.sources({
-          { name = 'luasnip' },
+          -- { name = 'luasnip' },
           { name = 'nvim_lsp' },
-          -- { name = 'path' },
-          -- { name = 'buffer' },
         })
       })
 
@@ -127,21 +125,15 @@ return {
         vim.lsp.buf.execute_command(params)
       end
       
-      require('lspconfig')['tsserver'].setup({
-        capabilities = capabilities,
-        commands = {
-          OrganizeImports = {
-            organize_imports,
-            description = "Organize Imports"
-          }
-        }
-        -- on_attach = function(client, bufnr)
-        --   vim.api.nvim_create_autocmd("BufWritePre", {
-        --     buffer = bufnr,
-        --     command = "_typescript.organizeImports",
-        --   })
-        -- end,
-      })
+      -- require('lspconfig')['tsserver'].setup({
+        -- capabilities = capabilities,
+        -- commands = {
+          -- OrganizeImports = {
+            -- organize_imports,
+            -- description = "Organize Imports"
+          -- }
+        -- }
+      -- })
 
       require('lspconfig')['lua_ls'].setup({
         capabilities = capabilities
