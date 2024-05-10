@@ -33,7 +33,7 @@ vim.api.nvim_command(":unmap a%")
 local se = "<cmd>lua require('spider').motion('e')<CR>"
 local sb = "<cmd>lua require('spider').motion('b')<CR>"
 local up = '5<C-U>'
-local down = '5<C-D>'
+local down = '5<C-e>'
 local back = '<C-o>'
 
 for i, v in ipairs(k.keys) do
@@ -55,6 +55,8 @@ k.remap('j', 'h') -- Left
 k.remap(';', 'l') -- Right
 
 k.keymap({ 'n' }, 'cc', 'ciw')
+k.keymap({ 'n', 'v' }, 'm', 'g^')
+k.keymap({ 'n', 'v' }, '/', 'g$')
 
 -- keymap({'n'}, 'xc', 'x') -- Delete character
 -- keymap({'n'}, 'cx', 'r') -- Replace character

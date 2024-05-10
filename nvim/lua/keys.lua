@@ -6,7 +6,7 @@ local mode = 'qwerty'
 local keys = {
   'q', 'w', 'a', 'f', 't',
 --           *    *
-  '', 'k', 'j', '', 'g',
+  '', 'gk', 'gj', '', 'g',
 --sb    *    *    se      
   'u', 'r', 'c', 'v', 'b',
 -- *    *      
