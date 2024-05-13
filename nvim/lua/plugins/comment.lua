@@ -1,3 +1,5 @@
+local key = require("../keys").key
+
 return {
   {
     'numToStr/Comment.nvim',
@@ -12,16 +14,16 @@ return {
       ---LHS of toggle mappings in NORMAL mode
       toggler = {
         ---Line-comment toggle keymap
-        line = 'gcc',
+        line = key('gcc'),
         ---Block-comment toggle keymap
-        block = 'gbc',
+        block = key('gbc'),
       },
       ---LHS of operator-pending mappings in NORMAL and VISUAL mode
       opleader = {
         ---Line-comment keymap
-        line = 'gc',
+        line = key('gc'),
         ---Block-comment keymap
-        block = 'gb',
+        block = key('gb'),
       },
       ---LHS of extra mappings
       extra = {
