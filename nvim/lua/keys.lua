@@ -1,7 +1,7 @@
 local provides = {}
 
-local mode = 'qwerty'
--- local mode = 'apt3'
+-- local mode = 'qwerty'
+local mode = 'apt3'
 
 local keys = {
   'q', 'w', 'a', 'f', 't',
@@ -63,11 +63,15 @@ provides.key = function(key)
   local out = ''
   for i = 1, #key do 
     local c = key:sub(i, i)
-    local index = indexOf(qwerty, c)
+    local index = indexOf(qwerty, string.lower(c))
     if c == 'C' or c == 'S' then 
       out = out .. c
     elseif index then 
-      out = out .. apt3[index]
+      if c == string.lower(c) then
+        out = out .. apt3[index]
+      else
+        out = out .. string.upper(apt3[index])
+      end
     else
       out = out .. c
     end
