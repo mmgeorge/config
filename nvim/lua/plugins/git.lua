@@ -141,7 +141,7 @@ return {
         },
         mappings = {
           commit_editor = {
-            [key("q")] = "Close",
+            ["q"] = "Close",
             ["<C-k>"] = "Close",
             ["<c-c><c-c>"] = "Submit",
             ["<c-c><c-k>"] = "Abort",
@@ -156,7 +156,7 @@ return {
             ["x"] = "Execute",
             ["d"] = "Drop",
             ["b"] = "Break",
-            [key("q")] = "Close",
+            ["q"] = "Close",
             ["<cr>"] = "OpenCommit",
             ["gk"] = "MoveUp",
             ["gj"] = "MoveDown",
@@ -192,10 +192,10 @@ return {
             ["p"] = "PullPopup",
             ["r"] = "RebasePopup",
             ["v"] = "RevertPopup",
-            -- ["w"] = "WorktreePopup",
+            ["w"] = "WorktreePopup",
           },
           status = {
-            [key("q")] = "Close",
+            ["q"] = "Close",
             ["<C-k>"] = "Close",
             ["I"] = "InitRepo",
             ["1"] = "Depth1",

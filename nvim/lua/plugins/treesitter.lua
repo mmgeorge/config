@@ -1,3 +1,5 @@
+local key = require("../keys").key
+
 return {
   {
     "nvim-treesitter/nvim-treesitter",
@@ -32,8 +34,8 @@ return {
         incremental_selection = {
           enable = true,
           keymaps = {
-            node_incremental = "k",
-            node_decremental = "l",  
+            node_incremental = key("k"),
+            node_decremental = key("l"),  
             --scope_incremental = "k",
             -- scope_decremental = "l",
           },
@@ -45,10 +47,10 @@ return {
             lookahead = true,
             keymaps = {
               -- You can use the capture groups defined in textobjects.scm
-              ['of'] = '@function.outer',
-              ['if'] = '@function.inner',
-              ['oc'] = '@class.outer',
-              ['ic'] = '@class.inner',
+              [key('of')] = '@function.outer',
+              [key('if')] = '@function.inner',
+              [key('oc')] = '@class.outer',
+              [key('ic')] = '@class.inner',
             },
           },
           move = {
