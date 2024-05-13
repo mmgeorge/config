@@ -58,6 +58,7 @@ k.keymap({ 'n' }, 'cc', 'ciw')
 k.keymap({ 'n', 'v' }, 'm', 'g^')
 k.keymap({ 'n', 'v' }, '/', 'g$')
 
+-- vim.keymap.set({'n', 'x'}, 'l', 'u', {})
 -- keymap({'n'}, 'xc', 'x') -- Delete character
 -- keymap({'n'}, 'cx', 'r') -- Replace character
 
