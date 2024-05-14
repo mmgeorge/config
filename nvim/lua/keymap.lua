@@ -54,7 +54,8 @@ k.remap('a', sb)
 k.remap('j', 'h') -- Left
 k.remap(';', 'l') -- Right
 
-k.keymap({ 'n' }, 'cc', 'ciw')
+-- k.keymap({ 'n' }, 'cc', 'ciw')
+k.keymap({ 'n' }, 'vv', 'viw')
 k.keymap({ 'n', 'v' }, 'm', 'g^')
 k.keymap({ 'n', 'v' }, '/', 'g$')
 
