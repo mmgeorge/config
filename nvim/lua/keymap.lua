@@ -42,6 +42,9 @@ end
 
 vim.keymap.set({'n', 'x'}, '<iw>', '<Nop>', {})
 
+-- Semantic keymaps
+vim.keymap.set({'n', 'x'}, '<C-a>', 'ggVG', {})
+
 k.keymap('n', ',', back)
 k.keymap({'n', 'x'}, 'k', up)
 k.keymap({'n', 'x'}, 'l', down)
@@ -89,6 +92,11 @@ k.keymap_leader({'n', 'v'}, 's', ":%s/\\<<C-r><C-w>\\>/<C-r><C-w>/gI<Left><Left>
 k.keymap_leader({'n', 'v'}, 'iu', function() require("utils").insert_v4({}) end)
 k.keymap_leader({'n', 'v'}, 't', 'gg=G')
 k.keymap_leader({'n'}, 'r', vim.lsp.buf.rename) 
+k.keymap_leader({'n', 'x'}, 'd', function ()
+  require("telescope.builtin")
+    .live_grep({ cwd = require("telescope.utils").buffer_dir() })
+end
+)
 
 ---- Jump quickfix
 -- keymap('n', '<leader>k', "<cmd>lnext<CR>zz") -- Paste over (don't add to clipboard)
