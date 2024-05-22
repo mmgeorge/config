@@ -19,6 +19,7 @@ return {
           "vimdoc",
           "query",
           "javascript",
+          "css",
           "html", 
           "wgsl"
         },

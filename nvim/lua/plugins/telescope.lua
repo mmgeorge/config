@@ -148,7 +148,7 @@ return {
             -- },
             git_status = true,
             prompt_path = false,
-            use_fd = false, 
+            use_fd = true, 
             -- disables netrw and use telescope-file-browser in its place
             hijack_netrw = true,
             mappings = {
