@@ -1,6 +1,5 @@
 local k = require("keys")
 
-
 vim.g.clipboard = {
   name = "wslClipboard",
   copy = {
@@ -13,7 +12,6 @@ vim.g.clipboard = {
   },
   cache_enabled = 0
 }
-
 
 -- Unmaps -
 vim.keymap.set({'n', 'x'}, 'o', '<Nop>', {})
@@ -60,6 +58,8 @@ k.keymap({ 'n' }, 'vv', 'viw')
 k.keymap({ 'n', 'v' }, 'm', 'g^')
 k.keymap({ 'n', 'v' }, '/', 'g$')
 
+k.keymap({ 'n', 'x' }, 'gg', 'gg')
+k.keymap({ 'n', 'x' }, 'G', 'G')
 -- vim.keymap.set({'n', 'x'}, 'l', 'u', {})
 -- keymap({'n'}, 'xc', 'x') -- Delete character
 -- keymap({'n'}, 'cx', 'r') -- Replace character
@@ -88,6 +88,7 @@ k.keymap_leader({'x', 'n'}, 'p', "\"+P") -- Paste to clipboard
 k.keymap_leader({'n', 'v'}, 's', ":%s/\\<<C-r><C-w>\\>/<C-r><C-w>/gI<Left><Left><Left>")
 k.keymap_leader({'n', 'v'}, 'iu', function() require("utils").insert_v4({}) end)
 k.keymap_leader({'n', 'v'}, 't', 'gg=G')
+k.keymap_leader({'n'}, 'r', vim.lsp.buf.rename) 
 
 ---- Jump quickfix
 -- keymap('n', '<leader>k', "<cmd>lnext<CR>zz") -- Paste over (don't add to clipboard)
@@ -124,7 +125,7 @@ k.keymap('n', 'oe', function ()
   vim.diagnostic.open_float(0)
 end) 
 -- keymap('n', 'ot', vim.lsp.buf.type_definition) 
-k.keymap('n', 'ow', vim.lsp.buf.rename) 
+-- k.keymap('n', 'ow', vim.lsp.buf.rename) 
 
 k.keymap({'n', 'x'}, '<C-f>', require("plugins.telescope.occur").occur_in_file)
 k.keymap({'n', 'x'}, 'of', require("telescope.builtin").find_files)
