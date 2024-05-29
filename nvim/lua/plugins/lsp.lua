@@ -92,10 +92,10 @@ return {
     -- },
     opts = {
       auto_close = false, -- auto close when there are no items
-      auto_open = false, -- auto open when there are items
+      auto_open = true, -- auto open when there are items
       auto_preview = true, -- automatically open preview when on an item
       auto_refresh = true, -- auto refresh when open
-      focus = false, -- Focus the window when opened
+      focus = true, -- Focus the window when opened
       restore = true, -- restores the last location in the list when opening
       follow = true, -- Follow the current item
       indent_guides = true, -- show indent guides
