@@ -15,6 +15,7 @@ return {
       local sorters = require('telescope.sorters')
 
       local fb_actions = require( "telescope").extensions.file_browser.actions
+      local open_with_trouble = require("trouble.sources.telescope").open
       -- Sorters in telescope do more than just sorting, they perform the actual filter
       -- and search & highlight as well
       -- See <https://github.com/nvim-telescope/telescope.nvim/blob/master/lua/telescope/sorters.lua>
@@ -57,6 +58,7 @@ return {
               [key("<C-o>")] = actions.close, 
               [key("<C-k>")] = actions.move_selection_previous, 
               [key("<C-l>")] = actions.move_selection_next,
+              ["<C-q>"] = actions.send_to_qflist,
             },
             [ "n" ] = {
               [key("<C-o>")] = actions.close, 
@@ -68,6 +70,8 @@ return {
               -- ["l"] = actions.preview_scrolling_down, 
               [key("gg")] = actions.move_to_top, 
               [key("G")] = actions.move_to_bottom, 
+              ["<C-q>"] = actions.send_to_qflist,
+              -- ["<C-q>"] = actions.send_to_qflist + actions.open_qflist,
               -- ["<Tab>"] = actions.select_tab, 
             }
           }
