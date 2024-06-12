@@ -70,21 +70,29 @@ return {
     local ms = ls.multi_snippet
     local k = require("luasnip.nodes.key_indexer").new_key
 
-    luasnip.add_snippets(
+    -- luasnip.add_snippets(
+    --   "all",
+    --     s("ra ", t"-> "),
+    --     s("udef ", t"self.useDefaults?.(arguments)"),
+    --   -- {
+    --     -- s("fflags ", t"<script>var esriConfig = { has: {} }</script>") 
+    --   -- },
+    --   {
+    --     type = "autosnippets",
+    --     key = "all_auto"
+    --   }
+    -- )
+
+   luasnip.add_snippets(
       "all",
       {
-        s("ra ", t"-> ") 
-      },
-      {
-        s("udef ", t"self.useDefaults?.(arguments)") 
-      },
-      {
-        s("fflags ", t"<script>var esriConfig = { has: {} }</script>") 
+        s("ra ", t"-> "),
+        s("udef ", t"self.useDefaults?.(arguments)"),
       },
       {
         type = "autosnippets",
         key = "all_auto"
       }
-    )
+    ) 
   end
 }
