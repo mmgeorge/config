@@ -72,23 +72,9 @@ return {
 
     luasnip.add_snippets(
       "all",
-      -- {
-      -- snippet("hhf ", fmt("foo() { return []; }", insert_node(1, "x"), { delimiters = "[]" }))
-      -- },
       {
         s("ra ", t"-> ") 
       },
-      {
-        type = "autosnippets",
-        key = "all_auto"
-      }
-    )
-
-    luasnip.add_snippets(
-      "all",
-      -- {
-      -- snippet("hhf ", fmt("foo() { return []; }", insert_node(1, "x"), { delimiters = "[]" }))
-      -- },
       {
         s("udef ", t"self.useDefaults?.(arguments)") 
       },

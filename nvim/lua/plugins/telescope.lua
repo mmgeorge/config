@@ -106,7 +106,7 @@ return {
             sort_mru = true,
             -- Only show buffers in the current working directory
             only_cwd = false,
-            --ignore_current_buffer = true,
+            ignore_current_buffer = true,
             --select_current = false,
           },
           lsp_document_symbols = {
