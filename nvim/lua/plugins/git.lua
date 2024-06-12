@@ -7,7 +7,7 @@ return {
 
   {
     "NeogitOrg/neogit",
-    commit = "746502a",
+    commit = "0cae7abc30cb91d661f28257c331fcb5b5198e31",
     dependencies = {
       "nvim-lua/plenary.nvim",         -- required
       "sindrets/diffview.nvim",        -- optional - Diff integration
