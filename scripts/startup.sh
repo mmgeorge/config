@@ -99,6 +99,6 @@ if ! shopt -oq posix; then
   fi
 fi
 
-EDITOR=emacs
+EDITOR=nvim
 
-#export GHCRTS='-M1G'
+export PATH="$PATH:/opt/nvim-linux64/bin"

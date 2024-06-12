@@ -8,6 +8,7 @@ return {
       "hrsh7th/cmp-path", 
       "hrsh7th/cmp-cmdline", 
       "hrsh7th/cmp-nvim-lsp", 
+      "ryo33/nvim-cmp-rust",  
       "saadparwaiz1/cmp_luasnip", 
       "onsails/lspkind.nvim", -- pretty formatting
     },
@@ -48,7 +49,7 @@ return {
         },
         view = {
           docs = {
-            auto_open = false,
+            -- auto_open = false,
           } ,
           -- entries = {
           --    follow_cursor = false, 
@@ -109,12 +110,36 @@ return {
         matching = { disallow_symbol_nonprefix_matching = false }
       })
 
+      local compare = require("cmp.config.compare");
+      cmp.setup.filetype({ "rust" }, {
+        sorting = {
+          priority_weight = 2,
+          comparators = {
+            -- deprioritize `.box`, `.mut`, etc.
+            require("cmp-rust").deprioritize_postfix,
+            -- deprioritize `Borrow::borrow` and `BorrowMut::borrow_mut`
+            require("cmp-rust").deprioritize_borrow,
+            -- deprioritize `Deref::deref` and `DerefMut::deref_mut`
+            require("cmp-rust").deprioritize_deref,
+            -- deprioritize `Into::into`, `Clone::clone`, etc.
+            require("cmp-rust").deprioritize_common_traits,
+            compare.offset,
+            compare.exact,
+            compare.score,
+            compare.recently_used,
+            compare.locality,
+            compare.sort_text,
+            compare.length,
+            compare.order,
+          },
+        },
+      })
 
       local capabilities = require('cmp_nvim_lsp').default_capabilities()
 
-      require('lspconfig')['rust_analyzer'].setup({
-        capabilities = capabilities
-      })
+      -- require('lspconfig')['rust_analyzer'].setup({
+        -- capabilities = capabilities
+      -- })
 
       local function organize_imports()
         local params = {

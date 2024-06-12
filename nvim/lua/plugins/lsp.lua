@@ -82,7 +82,7 @@ return {
   {
     "folke/trouble.nvim",
     dependencies = { "nvim-tree/nvim-web-devicons" },
-    branch = "dev",
+    -- branch = "dev",
     -- keys = {
       -- {
         -- "we",
@@ -92,7 +92,7 @@ return {
     -- },
     opts = {
       auto_close = false, -- auto close when there are no items
-      auto_open = true, -- auto open when there are items
+      -- auto_open = true, -- auto open when there are items
       auto_preview = true, -- automatically open preview when on an item
       auto_refresh = true, -- auto refresh when open
       focus = true, -- Focus the window when opened
