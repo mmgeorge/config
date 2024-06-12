@@ -88,6 +88,7 @@ k.keymap({'x'}, 'K', "<CMD>m '>-2<CR>gv=gv") -- Kill
 
 k.keymap({'n', 'x'}, 'p', 'P') -- P will paste before cursor & over in x without yanking
 k.keymap({'i'}, '<C-p>', '<C-o>p') -- P will paste before cursor & over in x without yanking
+k.keymap({'n', 'x'}, 'u', 'ygv<Esc>') -- Yank selection and move to the end
 
 -- Commands
 k.keymap_leader({'x', 'n'}, 'u', "\"+y") -- Copy to clipboard
