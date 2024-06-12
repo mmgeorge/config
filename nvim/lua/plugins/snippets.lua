@@ -79,6 +79,9 @@ return {
         s("udef ", t"self.useDefaults?.(arguments)") 
       },
       {
+        s("fflags ", t"<script>var esriConfig = { has: {} }</script>") 
+      },
+      {
         type = "autosnippets",
         key = "all_auto"
       }
