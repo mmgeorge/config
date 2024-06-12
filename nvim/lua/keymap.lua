@@ -45,10 +45,12 @@ vim.keymap.set({'n', 'x'}, '<iw>', '<Nop>', {})
 -- Semantic keymaps
 vim.keymap.set({'n', 'x'}, '<C-a>', 'ggVG', {})
 
+vim.keymap.set({'n', 'x'}, '<Tab>', '==', {})
+vim.keymap.set({'i'}, '<Tab>', '<C-f>', {})
+
 k.keymap('n', ',', back)
 k.keymap({'n', 'x'}, 'k', up)
 k.keymap({'n', 'x'}, 'l', down)
-k.keymap({'x'}, 'p', 'P') -- P will paste over in x without yanking
 
 k.remap('f', se)
 k.remap('a', sb)
@@ -83,6 +85,9 @@ k.keymap({'n'}, 'O', 'o<ESC>') -- Insert blank line above
 -- Move text up or down
 k.keymap({'x'}, 'L', "<CMD>m '<+1<CR>gv=gv") -- Kill
 k.keymap({'x'}, 'K', "<CMD>m '>-2<CR>gv=gv") -- Kill
+
+k.keymap({'n', 'x'}, 'p', 'P') -- P will paste before cursor & over in x without yanking
+k.keymap({'i'}, '<C-p>', '<C-o>p') -- P will paste before cursor & over in x without yanking
 
 -- Commands
 k.keymap_leader({'x', 'n'}, 'u', "\"+y") -- Copy to clipboard
