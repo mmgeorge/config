@@ -70,24 +70,26 @@ return {
     local ms = ls.multi_snippet
     local k = require("luasnip.nodes.key_indexer").new_key
 
-    -- luasnip.add_snippets(
-    --   "all",
-    --     s("ra ", t"-> "),
-    --     s("udef ", t"self.useDefaults?.(arguments)"),
-    --   -- {
-    --     -- s("fflags ", t"<script>var esriConfig = { has: {} }</script>") 
-    --   -- },
-    --   {
-    --     type = "autosnippets",
-    --     key = "all_auto"
-    --   }
-    -- )
-
-   luasnip.add_snippets(
+    -- See https://github.com/L3MON4D3/LuaSnip/blob/master/Examples/snippets.lua, 
+    -- for example snippets
+    luasnip.add_snippets(
       "all",
       {
+        s("la ", t"<- "),
         s("ra ", t"-> "),
         s("udef ", t"self.useDefaults?.(arguments)"),
+        s("sf ", {
+          t({"<script>", 
+            "  var esriConfig = {",
+            "    has: {",
+            "      \"esri-2d-update-debug\": 1,",
+            "      \"esri-2d-debug\": 1,",
+            "      \"esri-tiles-debug\": 1,",
+            "      \"featurelayer-pbf\": 1,",
+            "    }",
+            "  }",
+            "</script>"}), 
+        }) 
       },
       {
         type = "autosnippets",
