@@ -54,7 +54,7 @@ return {
           -- See <https://github.com/nvim-telescope/telescope.nvim/blob/master/lua/telescope/mappings.lua>
           mappings = {
             [ "i" ] = {
-              --["<C-g>"] = actions.close, 
+              --["<C-g>"] = actions.close
               [key("<C-o>")] = actions.close, 
               [key("<C-k>")] = actions.move_selection_previous, 
               [key("<C-l>")] = actions.move_selection_next,
@@ -160,9 +160,12 @@ return {
                 ["<Left>"] = fb_actions.goto_parent_dir,
                 ["<Right>"] = fb_actions.change_cwd,
                 [key("<C-p>")] = fb_actions.create_from_prompt, 
+                ["<C-x>"] = fb_actions.remove, 
+                ["<C-f>"] = fb_actions.rename, 
                 ["<CR>"] = actions.select_default, 
+                ["<C-p>"] = fb_actions.move, 
+                ["<C-m>"] = fb_actions.move, 
                 -- ["<C-g>"] = actions.close, 
-                -- ["<C-m>"] = fb_actions.move, 
                 -- your custom insert mode mappings
               },
               ["n"] = {
@@ -170,7 +173,7 @@ return {
                 ["<C-p>"] = fb_actions.move, 
                 [key("a")] = fb_actions.goto_parent_dir, 
                 [key("f")] = fb_actions.change_cwd, 
-                ["<C-r>"] = fb_actions.rename, 
+                ["<leader>f"] = fb_actions.rename, 
                 ["<C-x>"] = fb_actions.remove, 
                 ["<C-m>"] = fb_actions.move, 
                 ["<C-n>"] = fb_actions.create, 
