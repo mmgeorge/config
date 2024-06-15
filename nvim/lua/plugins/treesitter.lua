@@ -21,12 +21,18 @@ return {
           "javascript",
           "css",
           "html", 
-          "wgsl"
+          "wgsl", 
+          "glsl"
         },
         sync_install = false,
         highlight = { enable = true },
         indent = { enable = true },  
       })
+      vim.filetype.add({extension = {frag = "frag"}})
+      vim.treesitter.language.register('glsl', { 'frag' })
+
+      vim.filetype.add({extension = {vert = "vert"}})
+      vim.treesitter.language.register('glsl', { 'vert' })
 
       vim.filetype.add({extension = {wgslx = "wgslx"}})
       vim.treesitter.language.register('wgsl', { 'wgslx' })
