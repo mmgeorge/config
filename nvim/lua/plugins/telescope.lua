@@ -90,6 +90,20 @@ return {
           find_files = {
             theme = "ivy",
             previewer = false,
+            find_command = {
+              'rg',
+              '--files',
+              '--color=never',
+              '--no-heading',
+              '--line-number',
+              '--column',
+              '--smart-case',
+              '--hidden',
+              '--glob',
+              '!{.git/*,target/*,node_modules/*}',
+              '--path-separator',
+              '/',
+            },
           },
           current_buffer_fuzzy_find = {
             sorter = sorters.get_substr_matcher(),
