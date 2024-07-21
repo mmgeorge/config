@@ -4,7 +4,7 @@ local wezterm = require 'wezterm'
 -- This will hold the configuration.
 local config = wezterm.config_builder()
 
-config.default_cwd = "D:/"
+-- config.default_cwd = "D:/"
 config.default_prog = { "C:/Program Files/PowerShell/7/pwsh.exe" }
 -- This is where you actually apply your config choices
 
@@ -94,12 +94,17 @@ config.keys = {
     mods = 'LEADER',
     action = wezterm.action.CloseCurrentPane { confirm = false },
   },
+  -- {
+  --   key = 'o',
+  --   mods = 'LEADER',
+  --   action = wezterm.action.PaneSelect { 
+  --     alphabet = 'rsthneai'
+  --   },
+  -- },
   {
     key = 'o',
     mods = 'LEADER',
-    action = wezterm.action.PaneSelect { 
-      alphabet = 'rsthneai'
-    },
+    action = wezterm.action.ActivatePaneDirection "Next" 
   },
   {
     key = ';',
