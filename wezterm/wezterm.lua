@@ -4,10 +4,18 @@ local wezterm = require 'wezterm'
 -- This will hold the configuration.
 local config = wezterm.config_builder()
 
--- config.default_cwd = "D:/"
-config.default_prog = { "C:/Program Files/PowerShell/7/pwsh.exe" }
--- This is where you actually apply your config choices
+config.default_cwd = "D:/"
+config.set_environment_variables  = {
+  HOME = "D:/"
+}
 
+config.default_prog = { 
+  "C:/Program Files/PowerShell/7/pwsh.exe", 
+  "-NoExit", 
+  "-Command", "D:/config/windows/init.ps1"
+}
+
+-- This is where you actually apply your config choices
 -- For example, changing the color scheme:
 -- config.color_scheme = "Catppuccin Mocha"
 -- config.color_scheme = 'Campbell'

@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<Types>
+    <Type>
+        <Name>System.IO.FileInfo</Name>
+        <Members>
+            <ScriptProperty>
+                <!-- Filesize converts the length to a human readable
+                    format (kb, mb, gb, tb) -->
+                <Name>FileSize</Name>
+                <GetScriptBlock>
+                    switch($this.length) {
+                        { $_ -gt 1tb } 
+                            { "{0:n2} TB" -f ($_ / 1tb) ; break }
+                        { $_ -gt 1gb } 
+                            { "{0:n2} GB" -f ($_ / 1gb) ; break }
+                        { $_ -gt 1mb } 
+                            { "{0:n2} MB " -f ($_ / 1mb) ; break }
+                        { $_ -gt 1kb } 
+                            { "{0:n2} KB " -f ($_ / 1Kb) ; break }
+                        default
+                            { "{0}  B " -f $_}
+                    }
+                </GetScriptBlock>
+            </ScriptProperty>
+        </Members>
+    </Type>
+</Types>
+
