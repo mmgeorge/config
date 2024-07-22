@@ -110,9 +110,27 @@ config.keys = {
   --   },
   -- },
   {
+    key = 's',
+    mods = 'ALT|SHIFT',
+    action = wezterm.action.AdjustPaneSize { 'Up', 2 }
+  },
+  {
+    key = 't',
+    mods = 'ALT|SHIFT',
+    action = wezterm.action.AdjustPaneSize { 'Down', 2 }
+  },
+  {
     key = 'o',
     mods = 'LEADER',
     action = wezterm.action.ActivatePaneDirection "Next" 
+  },
+  {
+    key = 'O',
+    mods = 'LEADER',
+    action = wezterm.action.PaneSelect { 
+      alphabet = 'rsthneai', 
+      mode = "SwapWithActiveKeepFocus"
+    },
   },
   {
     key = ';',
