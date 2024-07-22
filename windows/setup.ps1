@@ -39,6 +39,7 @@ winget install Git.Git -h
 winget install Github.cli -h
 winget install Wez.Wezterm -h
 winget install Microsoft.Powershell -h
+winget install JanDeDobbeleer.OhMyPosh -h
 winget install Neovim.Neovim -h
 winget install BurntSushi.ripgrep.MSVC -h
 winget install Microsoft.PowerToys -h
