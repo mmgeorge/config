@@ -112,11 +112,17 @@ end
 -- keymap('n', '<C-j>', "<cmd>cprev<CR>zz") -- Paste over (don't add to clipboard)
 
 -- Window
-k.keymap('n', 'wsb', '<CMD>split<CR>')
-k.keymap('n', 'wko', '<CMD>only<CR>')
-k.keymap('n', 'wks', '<CMD>close!<CR>')
+k.keymap('n', 'wsl', '<CMD>split<CR>')
 k.keymap('n', 'wo', '<C-w>W')
-k.keymap('n', 'wkb', '<CMD>bd<CR>')
+-- k.keymap('n', 'wko', '<CMD>only<CR>')
+-- k.keymap('n', 'wks', '<CMD>close!<CR>')
+-- k.keymap('n', 'wkb', '<CMD>bd<CR>')
+vim.keymap.set({'n'}, 'gko', '<CMD>only<CR>', {})
+vim.keymap.set({'n'}, 'gks', '<CMD>close!<CR>', {})
+vim.keymap.set({'n'}, 'gkb', '<CMD>bd<CR>', {})
+
+vim.keymap.set({'n'}, 'ge', '<CMD>Trouble diagnostics filter.severity=vim.diagnostic.severity.ERROR<CR>', {})
+vim.keymap.set({'n'}, 'gd', '<CMD>Trouble diagnostics toggle focus=false filter.buf=0 <CR>', {})
 
 k.keymap('n', 'wq', function() require("trouble").toggle("quickfix") end) 
 
