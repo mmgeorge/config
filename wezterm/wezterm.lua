@@ -6,7 +6,7 @@ local config = wezterm.config_builder()
 
 config.default_cwd = "D:/"
 config.set_environment_variables  = {
-  HOME = "D:/"
+  -- HOME = "D:/"
 }
 
 config.default_prog = { 
@@ -19,7 +19,7 @@ config.default_prog = {
 -- For example, changing the color scheme:
 -- config.color_scheme = "Catppuccin Mocha"
 -- config.color_scheme = 'Campbell'
-config.font = wezterm.font('CaskaydiaCove Nerd Font')
+config.font = wezterm.font('Cascadia Code NF')
 config.line_height = 1.
 
 config.colors = { 
