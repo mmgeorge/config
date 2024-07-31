@@ -12,7 +12,8 @@ config.set_environment_variables  = {
 config.default_prog = { 
   "C:/Program Files/PowerShell/7/pwsh.exe", 
   "-NoExit", 
-  "-Command", "D:/config/windows/init.ps1"
+  "-NoProfile",
+  "-File", "D:/config/windows/init.ps1"
 }
 
 -- This is where you actually apply your config choices
