@@ -1,4 +1,4 @@
-oh-my-posh init pwsh --config "D:\config\windows\tokyo.omp.json" | Invoke-Expression
+# oh-my-posh init pwsh --config "D:\config\windows\tokyo.omp.json" | Invoke-Expression
 
 Update-TypeData -PrependPath D:\config\windows\Types.ps1xml  
 
