@@ -26,7 +26,7 @@ return {
           "glsl", 
           "c_sharp"
         },
-        sync_install = true,
+        sync_install = false,
         highlight = { enable = true },
         indent = { enable = true },  
       })
