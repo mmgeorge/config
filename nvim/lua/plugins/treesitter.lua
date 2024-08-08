@@ -4,9 +4,10 @@ return {
   {
     "nvim-treesitter/nvim-treesitter",
     dependencies = {
-      "nvim-treesitter/nvim-treesitter-textobjects",
+      -- Does NOT work with c_sharp
+      -- "nvim-treesitter/nvim-treesitter-textobjects",
     },
-    build = ":TSUpdate",
+    -- build = ":TSUpdate",
     config = function () 
       local configs = require("nvim-treesitter.configs")
 
@@ -22,9 +23,10 @@ return {
           "css",
           "html", 
           "wgsl", 
-          "glsl"
+          "glsl", 
+          "c_sharp"
         },
-        sync_install = false,
+        sync_install = true,
         highlight = { enable = true },
         indent = { enable = true },  
       })

@@ -20,6 +20,7 @@ function Global:Show-Directory {
 
 Set-Alias -Name ls -Value Show-Directory -Scope "Global" 
 New-Alias -Name ll -Value Show-Directory -Scope "Global" 
+New-Alias -Name touch -Value New-Item -Scope "Global" 
 
 function Global:ChangeDirectory {
   param(
