@@ -11,6 +11,7 @@ return {
       "ryo33/nvim-cmp-rust",  
       "saadparwaiz1/cmp_luasnip", 
       "onsails/lspkind.nvim", -- pretty formatting
+      "jmederosalvarado/roslyn.nvim" 
     },
     config = function()
       local cmp = require("cmp"); 
@@ -159,6 +160,16 @@ return {
           -- }
         -- }
       -- })
+      -- require('lspconfig')['csharp_ls'].setup({
+      --   capabilities = capabilities
+      -- })
+    
+      require("roslyn").setup({
+        -- dotnet_cmd = "dotnet", -- this is the default
+        -- roslyn_version = "4.8.0-3.23475.7", -- this is the default
+        on_attach = function () end,
+        capabilities = capabilities
+      })  
 
       require('lspconfig')['lua_ls'].setup({
         capabilities = capabilities
