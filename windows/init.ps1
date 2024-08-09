@@ -18,9 +18,14 @@ function Global:Show-Directory {
   Get-ChildItem | Format-Table -Property Mode, LastWriteTime, FileSize, Name -AutoSize 
 }
 
+Function Global:Refresh-Path {
+  $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+}
+
 Set-Alias -Name ls -Value Show-Directory -Scope "Global" 
 New-Alias -Name ll -Value Show-Directory -Scope "Global" 
 New-Alias -Name touch -Value New-Item -Scope "Global" 
+New-Alias -Name refreshenv -Value Refresh-Path -Scope "Global"
 
 function Global:ChangeDirectory {
   param(
