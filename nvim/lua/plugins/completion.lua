@@ -106,7 +106,7 @@ return {
           end, {"i","s","c",}),
           ['<C-p>'] = cmp.config.disable, 
           ['<Down>'] = {
-            c = cmp.mapping.select_next_item({ behavior = cmp.SelectBehavior.Select }),
+            c = cmp.mapping.select_next_item(),
           },
           ['<Up>'] = {
             c = cmp.mapping.select_prev_item({ behavior = cmp.SelectBehavior.Select }),

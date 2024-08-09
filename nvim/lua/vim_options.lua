@@ -14,8 +14,15 @@ vim.opt.statuscolumn = "%l %=%s" -- %= means right align
 vim.opt.signcolumn = 'yes'
 vim.o.scrolloff = 0
 vim.o.swapfile = false
+vim.opt.spell = true
+vim.opt.spelllang = { "en_us" }
+vim.opt.spelloptions = "camel"
 
 vim.g.rust_recommended_style = '0' -- Otherwise will override indentation settings
+
+-- r = Continue comment on enter
+-- o = Continue comment on o
+vim.cmd('autocmd BufEnter * set formatoptions+=roj')
 
 -- Disable auto comment
 vim.cmd('autocmd BufEnter * set formatoptions-=cro')
