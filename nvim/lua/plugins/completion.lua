@@ -16,6 +16,28 @@ return {
     config = function()
       local cmp = require("cmp"); 
 
+      local mapping = cmp.mapping.preset.insert({
+        ["<Tab>"] = cmp.mapping(function(fallback)
+          local cmp = require('cmp')
+          if cmp.visible() then
+            cmp.select_next_item()
+          else
+            fallback()
+          end
+        end, {"i","s","c",}),
+        ['<C-p>'] = cmp.config.disable, 
+        ["<C-k>"] = cmp.mapping.select_prev_item(),
+        ["<C-l>"] = cmp.mapping.select_next_item(),
+        ['<C-n>'] = cmp.config.disable, 
+        ['<C-b>'] = cmp.mapping.scroll_docs(-4),
+        ['<C-f>'] = cmp.mapping.scroll_docs(4),
+        ['<C-Space>'] = cmp.mapping.complete(),
+        ['<C-k>'] = cmp.mapping.abort(),
+        -- Accept currently selected item. Set `select` to `false`
+        -- to only confirm explicitly selected items.
+        ['<CR>'] = cmp.mapping.confirm({ select = true }),
+      });
+
       cmp.setup({
         formatting = {
           format = require("lspkind").cmp_format({
@@ -40,8 +62,8 @@ return {
         },
         completion = {
           scrollbar = false,
-          completeopt = "menu, menuone, noinsert"
-          -- completeopt = "menu, menuone, preview, noselect",
+          completeopt = "menu, menuone, preview, noinsert",
+          -- completeopt = "menu, menuone, preview",
           -- keyword_length = 4, -- # of characters to trigger auto completion
         },
         window = {
@@ -57,37 +79,7 @@ return {
           -- }
           --entries = 'native'
         },
-        mapping = cmp.mapping.preset.insert({
-          -- Intellij-like mapping
-          --   If no completion is selected, insert the first one in the list.
-          --   If a completion is selected, insert this one.
-          ["<Tab>"] = cmp.mapping(function(fallback)
-            -- This little snippet will confirm with tab, and if no entry is selected,
-            -- will confirm the first item
-            if cmp.visible() then
-              local entry = cmp.get_selected_entry()
-              if not entry then
-              cmp.select_next_item({ behavior = cmp.SelectBehavior.Select })
-              end
-              -- cmp.confirm()
-            -- if require("luasnip").locally_jumpable(1) then
-              -- require("luasnip").jump(1)
-            else
-              fallback()
-            end
-          end, {"i","s","c",}),
-          ['<C-p>'] = cmp.config.disable, 
-          ["<C-k>"] = cmp.mapping.select_prev_item(),
-          ["<C-l>"] = cmp.mapping.select_next_item(),
-          ['<C-n>'] = cmp.config.disable, 
-          ['<C-b>'] = cmp.mapping.scroll_docs(-4),
-          ['<C-f>'] = cmp.mapping.scroll_docs(4),
-          ['<C-Space>'] = cmp.mapping.complete(),
-          ['<C-e>'] = cmp.mapping.abort(),
-          -- Accept currently selected item. Set `select` to `false`
-          -- to only confirm explicitly selected items.
-          ['<CR>'] = cmp.mapping.confirm({ select = true }),
-        }),
+        mapping = mapping, 
         sources = cmp.config.sources({
           -- { name = 'luasnip' },
           { name = 'nvim_lsp' },
@@ -95,17 +87,53 @@ return {
       })
 
       cmp.setup.cmdline({ '/', '?' }, {
-        mapping = cmp.mapping.preset.cmdline(),
+        mapping = mapping, 
+        -- mapping = cmp.mapping.preset.cmdline(),
         sources = {
           { name = 'buffer' }
         }
       })
 
       cmp.setup.cmdline(':', {
-        mapping = cmp.mapping.preset.cmdline(),
-        sources = cmp.config.sources({
-          { name = 'path' }
-        }, {
+        mapping = cmp.mapping.preset.insert({
+          ["<Tab>"] = cmp.mapping(function(fallback)
+            local cmp = require('cmp')
+            if cmp.visible() then
+              cmp.select_next_item()
+            else
+              fallback()
+            end
+          end, {"i","s","c",}),
+          ['<C-p>'] = cmp.config.disable, 
+          ['<Down>'] = {
+            c = cmp.mapping.select_next_item({ behavior = cmp.SelectBehavior.Select }),
+          },
+          ['<Up>'] = {
+            c = cmp.mapping.select_prev_item({ behavior = cmp.SelectBehavior.Select }),
+          }, 
+          ['<CR>'] = { 
+            c = cmp.mapping.confirm({ select = true }) 
+          },
+          ['<C-k>'] = { 
+            c = cmp.mapping.abort(), 
+          },
+          -- Accept currently selected item. Set `select` to `false`
+          -- to only confirm explicitly selected items.
+          ['<CR>'] = {
+            c = cmp.mapping.confirm({ select = true }), 
+          }
+        }),
+        -- mapping = cmp.mapping.preset.cmdline(),
+        completion = {
+          completeopt = "menu, menuone, preview, noselect, noinsert",
+        },
+        -- completeopt = "menu, menuone, preview, noselect",
+        -- mapping = mapping, 
+        sources = cmp.config.sources(
+          {
+            { name = 'path' }
+          }, 
+          {
             { name = 'cmdline' }
           }),
         matching = { disallow_symbol_nonprefix_matching = false }
