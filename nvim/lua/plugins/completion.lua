@@ -111,24 +111,14 @@ return {
           ['<Up>'] = {
             c = cmp.mapping.select_prev_item({ behavior = cmp.SelectBehavior.Select }),
           }, 
-          ['<CR>'] = { 
-            c = cmp.mapping.confirm({ select = true }) 
-          },
           ['<C-k>'] = { 
             c = cmp.mapping.abort(), 
           },
-          -- Accept currently selected item. Set `select` to `false`
-          -- to only confirm explicitly selected items.
-          ['<CR>'] = {
-            c = cmp.mapping.confirm({ select = true }), 
-          }
         }),
         -- mapping = cmp.mapping.preset.cmdline(),
         completion = {
           completeopt = "menu, menuone, preview, noselect, noinsert",
         },
-        -- completeopt = "menu, menuone, preview, noselect",
-        -- mapping = mapping, 
         sources = cmp.config.sources(
           {
             { name = 'path' }
