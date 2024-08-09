@@ -10,15 +10,15 @@
                 <GetScriptBlock>
                     switch($this.length) {
                         { $_ -gt 1tb } 
-                            { "{0:n2} TB" -f ($_ / 1tb) ; break }
+                            { "TB {0:n2}" -f ($_ / 1tb) ; break }
                         { $_ -gt 1gb } 
-                            { "{0:n2} GB" -f ($_ / 1gb) ; break }
+                            { "GB {0:n2}" -f ($_ / 1gb) ; break }
                         { $_ -gt 1mb } 
-                            { "{0:n2} MB " -f ($_ / 1mb) ; break }
+                            { "MB {0:n2}" -f ($_ / 1mb) ; break }
                         { $_ -gt 1kb } 
-                            { "{0:n2} KB " -f ($_ / 1Kb) ; break }
+                            { "KB {0:n2}" -f ($_ / 1Kb) ; break }
                         default
-                            { "{0}  B " -f $_}
+                            { " B {0}" -f $_}
                     }
                 </GetScriptBlock>
             </ScriptProperty>

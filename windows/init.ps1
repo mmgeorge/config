@@ -26,6 +26,7 @@ Set-Alias -Name ls -Value Show-Directory -Scope "Global"
 New-Alias -Name ll -Value Show-Directory -Scope "Global" 
 New-Alias -Name touch -Value New-Item -Scope "Global" 
 New-Alias -Name refreshenv -Value Refresh-Path -Scope "Global"
+New-Alias -Name htop -Value ntop -Scope "Global" 
 
 function Global:ChangeDirectory {
   param(
