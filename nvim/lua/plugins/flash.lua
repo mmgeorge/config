@@ -6,7 +6,7 @@ return {
   ---@type Flash.Config
   -- stylua: ignore
   keys = {
-    { "<Leader>" .. key("r"), mode = { "n", "x", "o" }, function() 
+    { "" .. key("r"), mode = { "n", "x", "o" }, function() 
       -- Jump ignoring casing
       local gi = vim.go.ignorecase
       local gs = vim.go.smartcase
@@ -21,7 +21,7 @@ return {
   opts = {
     -- labels = "abcdefghijklmnopqrstuvwxyz",
     -- labels = "asdfghjklqwertyuiopzxcvbnm",
-    labels = "asdfjkl;zxcvm,./qweruioptgbyhn",
+    labels = key("asdfjkl;zxcvm,./qweruioptgbyhn"),
     search = {
       -- search/jump in all windows
       multi_window = true,
