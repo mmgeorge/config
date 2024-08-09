@@ -31,3 +31,6 @@ untracked
 utf
 spl
 requery
+gitignore
+unmerged
+unmerge
