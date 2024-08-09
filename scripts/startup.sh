@@ -15,6 +15,7 @@ alias lla='ls -la --block-size=M --group-directories-first --color'
 alias ec='emacsclient -nw '
 alias kec='pkill emacs'
 alias create='$HOME/config/scripts/create-repo.sh'
+alias cls='clear' 
 
 alias wg='watch -n 1 gcloud'
 alias wk='watch -n 1 kubectl'
