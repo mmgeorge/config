@@ -66,7 +66,7 @@ return {
           scrollbar = false,
           completeopt = "menu, menuone, preview, noinsert",
           -- completeopt = "menu, menuone, preview",
-          keyword_length = 4, -- # of characters to trigger auto completion
+          keyword_length = 3, -- # of characters to trigger auto completion
         },
         window = {
           -- completion = cmp.config.window.bordered(),
