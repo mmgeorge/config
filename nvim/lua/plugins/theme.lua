@@ -88,6 +88,7 @@ return {
     vim.cmd('colorscheme github_dark_default')
     vim.cmd([[highlight DiagnosticUnderlineError cterm=undercurl ctermfg=red gui=undercurl guifg=red]])
     vim.cmd([[highlight DiagnosticUnderlineWarn cterm=undercurl ctermfg=yellow gui=undercurl guifg=yellow]])
+    vim.api.nvim_set_hl(0, "@include", { fg = colors.yellow })
     vim.api.nvim_set_hl(0, "@conditional", { fg = colors.yellow })
     vim.api.nvim_set_hl(0, "@constructor", { fg = colors.red })
     vim.api.nvim_set_hl(0, "@method", { fg = colors.red })
