@@ -106,6 +106,9 @@ k.keymap_leader({'n', 'x'}, 'd', function ()
 end
 )
 
+-- Buffer
+vim.keymap.set({'n', 'x'}, "<leader>" .. "bj", ":bd<cr>", { nowait=true, silent=false })
+
 ---- Jump quickfix
 -- keymap('n', '<leader>k', "<cmd>lnext<CR>zz") -- Paste over (don't add to clipboard)
 -- keymap('n', '<leader>j', "<cmd>lprev<CR>zz") -- Paste over (don't add to clipboard)
