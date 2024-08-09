@@ -11,7 +11,8 @@ return {
       "ryo33/nvim-cmp-rust",  
       "saadparwaiz1/cmp_luasnip", 
       "onsails/lspkind.nvim", -- pretty formatting
-      "jmederosalvarado/roslyn.nvim" 
+      "jmederosalvarado/roslyn.nvim" , 
+      "f3fora/cmp-spell"
     },
     config = function()
       local cmp = require("cmp"); 
@@ -27,6 +28,7 @@ return {
         end, {"i","s","c",}),
         ['<C-p>'] = cmp.config.disable, 
         ["<C-k>"] = cmp.mapping.select_prev_item(),
+        -- cmp.mapping.select_prev_item({ behavior = cmp.SelectBehavior.Select }),
         ["<C-l>"] = cmp.mapping.select_next_item(),
         ['<C-n>'] = cmp.config.disable, 
         ['<C-b>'] = cmp.mapping.scroll_docs(-4),
@@ -64,7 +66,7 @@ return {
           scrollbar = false,
           completeopt = "menu, menuone, preview, noinsert",
           -- completeopt = "menu, menuone, preview",
-          -- keyword_length = 4, -- # of characters to trigger auto completion
+          keyword_length = 4, -- # of characters to trigger auto completion
         },
         window = {
           -- completion = cmp.config.window.bordered(),
@@ -83,6 +85,16 @@ return {
         sources = cmp.config.sources({
           -- { name = 'luasnip' },
           { name = 'nvim_lsp' },
+          { 
+            name = 'spell', 
+            option = {
+              keep_all_entries = false,
+              enable_in_context = function(params)
+                return require('cmp.config.context').in_treesitter_capture('spell')
+              end,
+              preselect_correct_word = true,
+            },
+          }
         })
       })
 
@@ -109,7 +121,7 @@ return {
             c = cmp.mapping.select_next_item(),
           },
           ['<Up>'] = {
-            c = cmp.mapping.select_prev_item({ behavior = cmp.SelectBehavior.Select }),
+            c = cmp.mapping.select_prev_item(),
           }, 
           ['<C-k>'] = { 
             c = cmp.mapping.abort(), 

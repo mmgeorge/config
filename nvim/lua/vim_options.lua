@@ -16,7 +16,7 @@ vim.o.scrolloff = 0
 vim.o.swapfile = false
 vim.opt.spell = true
 vim.opt.spelllang = { "en_us" }
-vim.opt.spelloptions = "camel"
+vim.opt.spelloptions = "camel,noplainbuffer"
 
 vim.g.rust_recommended_style = '0' -- Otherwise will override indentation settings
 
