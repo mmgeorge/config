@@ -6,7 +6,7 @@ return {
   ---@type Flash.Config
   -- stylua: ignore
   keys = {
-    { "<Leader>" .. key("f"), mode = { "n", "x", "o" }, function() 
+    { "<Leader>" .. key("r"), mode = { "n", "x", "o" }, function() 
       -- Jump ignoring casing
       local gi = vim.go.ignorecase
       local gs = vim.go.smartcase
