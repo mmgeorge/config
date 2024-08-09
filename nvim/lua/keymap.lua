@@ -41,6 +41,7 @@ for i, v in ipairs(k.keys) do
 end
 
 vim.keymap.set({'n', 'x'}, '<iw>', '<Nop>', {})
+vim.keymap.set({'n', 'x'}, 'S', '<Nop>', {})
 
 -- Semantic keymaps
 vim.keymap.set({'n', 'x'}, '<C-a>', 'ggVG', {})
@@ -90,6 +91,21 @@ k.keymap({'n', 'x'}, 'p', 'P') -- P will paste before cursor & over in x without
 k.keymap({'i'}, '<C-p>', '<C-o>p') -- P will paste before cursor & over in x without yanking
 k.keymap({'x'}, 'u', 'ygv<Esc>') -- Yank selection and move to the end
 -- k.keymap({'n', 'x'}, 'uu', 'yy') -- Yank selection and move to the end
+
+-- Surround
+vim.keymap.set({'x'}, "'", "qqc''<Esc>Pq", { nowait=true, silent=false }) 
+vim.keymap.set({'x'}, '"', 'qqc""<Esc>Pq', { nowait=true, silent=false }) 
+vim.keymap.set({'x'}, '(', 'qqc()<Esc>Pq', { nowait=true, silent=false }) 
+vim.keymap.set({'x'}, '<', 'qqc<><Esc>Pq', { nowait=true, silent=false }) 
+vim.keymap.set({'x'}, '[', 'qqc[]<Esc>Pq', { nowait=true, silent=false }) 
+vim.keymap.set({'x'}, '{', 'qqc{}<Esc>Pq', { nowait=true, silent=false }) 
+
+vim.keymap.set({'n'}, "ls'", 'viwqqc""<Esc>Pq', { nowait=true, silent=false }) 
+vim.keymap.set({'n'}, 'lsa', 'viwqqc()<Esc>Pq', { nowait=true, silent=false }) 
+vim.keymap.set({'n'}, 'ls,', 'viwqqc<><Esc>Pq', { nowait=true, silent=false }) 
+vim.keymap.set({'n'}, 'ls[', 'viwqqc[]<Esc>Pq', { nowait=true, silent=false }) 
+vim.keymap.set({'n'}, 'ls.', 'viwqqc{}<Esc>Pq', { nowait=true, silent=false }) 
+-- vim.keymap.set({'x'}, '(', 'S)')
 
 -- Commands
 k.keymap_leader({'x', 'n'}, 'u', "\"+y") -- Copy to clipboard
