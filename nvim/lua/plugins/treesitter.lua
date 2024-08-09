@@ -24,7 +24,8 @@ return {
           "html", 
           "wgsl", 
           "glsl", 
-          "c_sharp"
+          "c_sharp",
+          "toml"
         },
         sync_install = false,
         highlight = { enable = true },
