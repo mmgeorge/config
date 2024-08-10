@@ -34,37 +34,46 @@ Write-Host 'Updating Enviornment Variables to use D:\ as home directory'
 [System.Environment]::SetEnvironmentVariable('CARGO_HOME','D:\.cargo', 'Machine')
 
 Write-Host 'Installing'
-winget install Mozilla.Firefox -h
+# Update powershell
+winget install Microsoft.Powershell -h
+
 winget install Git.Git -h
 winget install Github.cli -h
 winget install Wez.Wezterm -h
-winget install Microsoft.Powershell -h
 winget install JanDeDobbeleer.OhMyPosh -h
 winget install Neovim.Neovim -h
 winget install BurntSushi.ripgrep.MSVC -h
-winget install Microsoft.PowerToys -h
 winget install Microsoft.VisualStudio.2022.BuildTools --override "--quiet --add Microsoft.VisualStudio.Workload.VCTools"
+winget install LLVM.LLVM -h
+winget install OpenJS.NodeJS -h
 winget install Rustlang.Rustup -h
+winget install LualS.lua-language-server -h
+winget install ntop -h
+# winget install Mozilla.Firefox -h
+# winget install Microsoft.PowerToys -h
 
 Write-Host 'Downloading Cascadia Code'
-Invoke-WebRequest https://github.com/microsoft/cascadia-code/releases/download/v2404.23/CascadiaCode-2404.23.zip -OutFile $HOME/cascadia.zip
-Expand-Archive $HOME/cascadia.zip
+Invoke-WebRequest https://github.com/microsoft/cascadia-code/releases/download/v2404.23/CascadiaCode-2404.23.zip -OutFile cascadia.zip
+Expand-Archive cascadia.zip
 
-$Destination = (New-Object -ComObject Shell.Application).Namespace(0x14)
-$TempFolder  = "C:\Windows\Temp\Fonts"
-$Source      = "$HOME/cascadia/*" 
-New-Item $TempFolder -Type Directory -Force | Out-Null
-Get-ChildItem -Path $Source -Include '*.ttf','*.ttc','*.otf' -ForEach {
-  If (-not(Test-Path "C:\Windows\Fonts\$($_.Name)")) {
-    $Font = "$TempFolder\$($_.Name)"
-    # Copy font to local temporary folder
-    Copy-Item $($_.FullName) -Destination $TempFolder
-    # Install font
-    $Destination.CopyHere($Font,0x10)
-    # Delete temporary copy of font
-    Remove-Item $Font -Force
-  }
-}
+# New-Item $TempFolder -Type Directory -Force | Out-Null
+
+# $Destination = (New-Object -ComObject Shell.Application).Namespace(0x14)
+# $TempFolder  = "temp"
+# $Source      = "cascadia/*" 
+# $Files = Get-ChildItem -Path $Source -Include '*.ttf','*.ttc','*.otf' 
+# ForEach ($Name in $Files) {
+  # echo $Name
+  # If (-not(Test-Path "C:\Windows\Fonts\$($_.Name)")) {
+  #   $Font = "$TempFolder\$($_.Name)"
+  #   # Copy font to local temporary folder
+  #   Copy-Item $($_.FullName) -Destination $TempFolder
+  #   # Install font
+  #   $Destination.CopyHere($Font,0x10)
+  #   # Delete temporary copy of font
+  #   Remove-Item $Font -Force
+  # }
+# }
 
 # Refresh path
 $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User") 
