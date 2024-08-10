@@ -21,7 +21,30 @@ config.default_prog = {
 -- config.color_scheme = "Catppuccin Mocha"
 -- config.color_scheme = 'Campbell'
 config.font = wezterm.font('Cascadia Code NF')
-config.line_height = 1.
+config.font_rules = {
+--   {
+--     intensity = 'Normal',
+--     italic = true,
+--     font = wezterm.font_with_fallback {
+--       family = 'Operator Mono SSm Lig',
+--       weight = 'DemiLight',
+--       italic = true,
+--     },
+--   },
+-- {
+--     intensity = 'Half',
+--     italic = true,
+--     font = wezterm.font_with_fallback {
+--       family = 'Cascadia Mono NF',
+--       intensity = 'Half',
+--       weight = 'Light',
+--       italic = true,
+--     },
+--   },
+}
+
+config.line_height = 1.0
+config.cursor_blink_rate = 0
 
 config.colors = { 
   cursor_fg = 'red',
