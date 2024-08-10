@@ -1,5 +1,6 @@
 -- Pull in the wezterm API
 local wezterm = require 'wezterm'
+local action = wezterm.action
 
 -- This will hold the configuration.
 local config = wezterm.config_builder()
@@ -79,6 +80,11 @@ config.keys = {
   --   action = wezterm.action.ShowTabNavigator,
   --   -- action = wezterm.action.SplitHorizontal { domain = 'CurrentPaneDomain' },
   -- },
+  {
+    key = 'y',
+    mods = 'CTRL',
+    action = action.PasteFrom 'Clipboard',
+  }, 
   {
     key = 'c',
     mods = 'LEADER',
@@ -179,7 +185,240 @@ config.keys = {
       end),
     },    
   },
+  {
+    key = '.',
+    mods = 'LEADER',
+    action = wezterm.action.ActivateCopyMode,
+  },
 }
+
+config.key_tables = {
+  copy_mode = {
+    -- Navigation
+    { key = 'h', mods = 'NONE', action = action.CopyMode 'MoveForwardWordEnd' },
+    { key = 'r', mods = 'NONE', action = action.CopyMode 'MoveBackwardWord'},
+    { key = 't', mods = 'NONE', action = action.CopyMode 'MoveDown' },
+    { key = 's', mods = 'NONE', action = action.CopyMode 'MoveUp' },
+    { key = 'n', mods = 'NONE', action = action.CopyMode 'MoveLeft' },
+    { key = 'i', mods = 'NONE', action = action.CopyMode 'MoveRight' },
+    { key = 'f', mods = 'ALT', action = action.CopyMode 'MoveForwardWord' },
+    {
+      key = ';',
+      mods = 'NONE',
+      action = action.CopyMode 'MoveToStartOfLineContent',
+    },
+    -- {
+    --   key = '^',
+    --   mods = 'SHIFT',
+    --   action = action.CopyMode 'MoveToStartOfLineContent',
+    -- },
+    {
+      key = '/',
+      mods = 'NONE',
+      action = action.CopyMode 'MoveToEndOfLineContent',
+    },
+    {
+      key = 'Space',
+      mods = 'NONE',
+      action = action.CopyMode { SetSelectionMode = 'Cell' },
+    },
+        {
+      key = 'Escape',
+      mods = 'NONE',
+      action = action.Multiple {
+        { CopyMode = 'Close' },
+      },
+    },
+    { key = ',', mods = 'NONE', action = action.CopyMode 'JumpReverse' },
+    { key = '0', mods = 'NONE', action = action.CopyMode 'MoveToStartOfLine' },
+    { key = ';', mods = 'NONE', action = action.CopyMode 'JumpAgain' },
+    {
+      key = 'k',
+      mods = 'NONE',
+      action = action.CopyMode 'MoveToScrollbackTop',
+    },
+    {
+      key = 'K',
+      mods = 'NONE',
+      action = action.CopyMode 'MoveToScrollbackBottom',
+    },
+    {
+      key = 'K',
+      mods = 'SHIFT',
+      action = action.CopyMode 'MoveToScrollbackBottom',
+    },
+    {
+      key = 'p',
+      mods = 'NONE',
+      action = action.CopyMode { SetSelectionMode = 'Cell' },
+    },
+    {
+      key = 'P',
+      mods = 'NONE',
+      action = action.CopyMode { SetSelectionMode = 'Line' },
+    },
+    {
+      key = 'P',
+      mods = 'SHIFT',
+      action = action.CopyMode { SetSelectionMode = 'Line' },
+    },
+    {
+      key = 'l',
+      mods = 'NONE',
+      action = action.Multiple {
+        { CopyTo = 'ClipboardAndPrimarySelection' },
+        { CopyMode = 'ClearSelectionMode' },
+        -- { CopyMode = 'Close' },
+      },
+    },
+    {
+      key = 'e',
+      mods = 'NONE',
+      -- action = action.CopyMode { MoveByPage = -0.25 },
+      action = action.Multiple {
+        { CopyMode = 'MoveUp' },
+        { CopyMode = 'MoveUp' },
+        { CopyMode = 'MoveUp' },
+        { CopyMode = 'MoveUp' },
+      },
+    }, 
+    {
+      key = 'a',
+      mods = 'NONE',
+      -- action = action.CopyMode { MoveByPage = 0.25 },
+      action = action.Multiple {
+        { CopyMode = 'MoveDown' },
+        { CopyMode = 'MoveDown' },
+        { CopyMode = 'MoveDown' },
+        { CopyMode = 'MoveDown' },
+      },
+    },
+    -- {
+    --   key = '$',
+    --   action = action.CopyMode 'MoveToEndOfLineContent',
+    -- },
+    -- {
+    --   key = 'F',
+    --   mods = 'NONE',
+    --   action = action.CopyMode { JumpBackward = { prev_char = false } },
+    -- },
+    -- { key = 'H', mods = 'NONE', action = action.CopyMode 'MoveToViewportTop' },
+    -- {
+    --   key = 'H',
+    --   mods = 'SHIFT',
+    --   action = action.CopyMode 'MoveToViewportTop',
+    -- },
+    -- {
+    --   key = 'L',
+    --   mods = 'NONE',
+    --   action = action.CopyMode 'MoveToViewportBottom',
+    -- },
+    -- {
+    --   key = 'L',
+    --   mods = 'SHIFT',
+    --   action = action.CopyMode 'MoveToViewportBottom',
+    -- },
+    -- {
+    --   key = 'M',
+    --   mods = 'NONE',
+    --   action = action.CopyMode 'MoveToViewportMiddle',
+    -- },
+    -- {
+    --   key = 'M',
+    --   mods = 'SHIFT',
+    --   action = action.CopyMode 'MoveToViewportMiddle',
+    -- },
+    -- {
+    --   key = 'O',
+    --   mods = 'NONE',
+    --   action = action.CopyMode 'MoveToSelectionOtherEndHoriz',
+    -- },
+    -- {
+    --   key = 'O',
+    --   mods = 'SHIFT',
+    --   action = action.CopyMode 'MoveToSelectionOtherEndHoriz',
+    -- },
+    -- {
+    --   key = 'T',
+    --   mods = 'NONE',
+    --   action = action.CopyMode { JumpBackward = { prev_char = true } },
+    -- },
+    -- {
+    --   key = 'T',
+    --   mods = 'SHIFT',
+    --   action = action.CopyMode { JumpBackward = { prev_char = true } },
+    -- },
+    -- { key = 'b', mods = 'NONE', action = action.CopyMode 'MoveBackwardWord' },
+    -- { key = 'b', mods = 'ALT', action = action.CopyMode 'MoveBackwardWord' },
+    -- { key = 'b', mods = 'CTRL', action = action.CopyMode 'PageUp' },
+    -- {
+    --   key = 'c',
+    --   mods = 'CTRL',
+    --   action = action.Multiple {
+    --     { CopyMode = 'ScrollToBottom' },
+    --     { CopyMode = 'Close' },
+    --   },
+    -- },
+    -- {
+    --   key = 'e',
+    --   mods = 'NONE',
+    --   action = action.CopyMode 'MoveForwardWordEnd',
+    -- },
+    -- {
+    --   key = 'f',
+    --   mods = 'NONE',
+    --   action = action.CopyMode { JumpForward = { prev_char = false } },
+    -- },
+    -- { key = 'f', mods = 'CTRL', action = action.CopyMode 'PageDown' },
+    -- {
+    --   key = 'm',
+    --   mods = 'ALT',
+    --   action = action.CopyMode 'MoveToStartOfLineContent',
+    -- },
+    -- {
+    --   key = 'o',
+    --   mods = 'NONE',
+    --   action = action.CopyMode 'MoveToSelectionOtherEnd',
+    -- },
+    -- {
+    --   key = 't',
+    --   mods = 'NONE',
+    --   action = action.CopyMode { JumpForward = { prev_char = true } },
+    -- },
+    -- {
+    --   key = 'u',
+    --   mods = 'CTRL',
+    --   action = action.CopyMode { MoveByPage = -0.5 },
+    -- },
+    -- {
+    --   key = 'v',
+    --   mods = 'CTRL',
+    --   action = action.CopyMode { SetSelectionMode = 'Block' },
+    -- },
+    -- { key = 'w', mods = 'NONE', action = action.CopyMode 'MoveForwardWord' },
+    -- { key = 'PageUp', mods = 'NONE', action = action.CopyMode 'PageUp' },
+    -- { key = 'PageDown', mods = 'NONE', action = action.CopyMode 'PageDown' },
+    { key = 'LeftArrow', mods = 'NONE', action = action.CopyMode 'MoveLeft' },
+    {
+      key = 'LeftArrow',
+      mods = 'ALT',
+      action = action.CopyMode 'MoveBackwardWord',
+    },
+    {
+      key = 'RightArrow',
+      mods = 'NONE',
+      action = action.CopyMode 'MoveRight',
+    },
+    {
+      key = 'RightArrow',
+      mods = 'ALT',
+      action = action.CopyMode 'MoveForwardWord',
+    },
+    { key = 'UpArrow', mods = 'NONE', action = action.CopyMode 'MoveUp' },
+    { key = 'DownArrow', mods = 'NONE', action = action.CopyMode 'MoveDown' },
+  } 
+}
+
 
 -- and finally, return the configuration to wezterm
 return config

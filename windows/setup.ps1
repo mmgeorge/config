@@ -47,8 +47,11 @@ winget install Microsoft.VisualStudio.2022.BuildTools --override "--quiet --add 
 winget install LLVM.LLVM -h
 winget install OpenJS.NodeJS -h
 winget install Rustlang.Rustup -h
-winget install LualS.lua-language-server -h
 winget install ntop -h
+
+# winget install LualS.lua-language-server -h 
+# Must install through scoop instead. Bootstrap does not get setup correctly
+scoop install lua-language-server
 # winget install Mozilla.Firefox -h
 # winget install Microsoft.PowerToys -h
 
