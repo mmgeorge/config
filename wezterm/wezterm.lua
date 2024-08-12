@@ -222,8 +222,15 @@ config.key_tables = {
       mods = 'NONE',
       action = action.CopyMode { SetSelectionMode = 'Cell' },
     },
-        {
+    {
       key = 'Escape',
+      mods = 'NONE',
+      action = action.Multiple {
+        { CopyMode = 'Close' },
+      },
+    },
+    {
+      key = 'q',
       mods = 'NONE',
       action = action.Multiple {
         { CopyMode = 'Close' },
