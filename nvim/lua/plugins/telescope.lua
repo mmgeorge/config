@@ -177,8 +177,8 @@ return {
                 ["<C-x>"] = fb_actions.remove, 
                 ["<C-f>"] = fb_actions.rename, 
                 ["<CR>"] = actions.select_default, 
+                -- ["<C-p>"] = fb_actions.move, 
                 ["<C-p>"] = fb_actions.move, 
-                ["<C-m>"] = fb_actions.move, 
                 -- ["<C-g>"] = actions.close, 
                 -- your custom insert mode mappings
               },
@@ -189,7 +189,7 @@ return {
                 [key("f")] = fb_actions.change_cwd, 
                 ["<leader>f"] = fb_actions.rename, 
                 ["<C-x>"] = fb_actions.remove, 
-                ["<C-m>"] = fb_actions.move, 
+                -- ["<C-m>"] = fb_actions.move, 
                 ["<C-n>"] = fb_actions.create, 
 
                 -- your custom normal mode mappings

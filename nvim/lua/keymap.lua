@@ -32,6 +32,7 @@ local se = "<cmd>lua require('spider').motion('e')<CR>"
 local sb = "<cmd>lua require('spider').motion('b')<CR>"
 local up = '5<C-U>'
 local down = '5<C-e>'
+local forward = '<C-i>'
 local back = '<C-o>'
 
 for i, v in ipairs(k.keys) do
@@ -50,6 +51,7 @@ vim.keymap.set({'n', 'x'}, '<Tab>', '==', {})
 vim.keymap.set({'i'}, '<Tab>', '<C-f>', {})
 
 k.keymap('n', ',', back)
+k.keymap('n', '<', forward)
 k.keymap({'n', 'x'}, 'k', up)
 k.keymap({'n', 'x'}, 'l', down)
 
@@ -150,7 +152,9 @@ vim.keymap.set({'n'}, 'gks', '<CMD>close!<CR>', {})
 vim.keymap.set({'n'}, 'gkb', '<CMD>bd<CR>', {})
 
 vim.keymap.set({'n'}, 'ge', '<CMD>Trouble diagnostics filter.severity=vim.diagnostic.severity.ERROR<CR>', {})
-vim.keymap.set({'n'}, 'gd', '<CMD>Trouble diagnostics toggle focus=false filter.buf=0 <CR>', {})
+-- vim.keymap.set({'n'}, 'gd', '<CMD>Trouble diagnostics toggle focus=false filter.buf=0 <CR>', {})
+vim.keymap.set({'n'}, 'ge', '<CMD>Trouble diagnostics toggle filter.severity=vim.diagnostic.severity.ERROR focus=true <CR>', {})
+vim.keymap.set({'n'}, 'gd', '<CMD>Trouble diagnostics toggle focus=true <CR>', {})
 
 k.keymap('n', 'wq', function() require("trouble").toggle("quickfix") end) 
 

@@ -83,14 +83,29 @@ return {
     "folke/trouble.nvim",
     dependencies = { "nvim-tree/nvim-web-devicons" },
     -- branch = "dev",
-    -- keys = {
+    keys = {
       -- {
-        -- "we",
-        -- "<cmd>Trouble diagnostics toggle<cr>",
-        -- desc = "Diagnostics (Trouble)",
+      --   "<tab>",
+      --   "<cmd>Trouble diagnostics toggle<cr>",
+      --   desc = "Diagnostics (Trouble)",
       -- }
-    -- },
+    },
+    -- config = function ()
+    --   -- Open Trouble qflist when qf list opens
+    --   vim.api.nvim_create_autocmd("BufRead", {
+    --     callback = function(ev)
+    --       if vim.bo[ev.buf].buftype == "quickfix" then
+    --         vim.schedule(function()
+    --           vim.cmd([[cclose]])
+    --           vim.cmd([[Trouble qflist open]])
+    --         end)
+    --       end
+    --     end,
+    --   }) 
+    -- end,
     opts = {
+      -- warn_no_results = false,
+      -- open_no_results = true,
       auto_close = false, -- auto close when there are no items
       -- auto_open = true, -- auto open when there are items
       auto_preview = true, -- automatically open preview when on an item
@@ -100,7 +115,7 @@ return {
       follow = true, -- Follow the current item
       indent_guides = true, -- show indent guides
       max_items = 200, -- limit number of items that can be displayed per section
-      multiline = true, -- render multi-line messages
+      multiline = false, -- render multi-line messages
       pinned = false, -- When pinned, the opened trouble window will be bound to the current buffer
       ---@type trouble.Window.opts
       win = {}, -- window options for the results window. Can be a split or a floating window.
@@ -129,18 +144,18 @@ return {
         ["<esc>"] = "cancel",
         ["<cr>"] = "jump",
         ["<2-leftmouse>"] = "jump",
-        ["<c-s>"] = "jump_split",
-        ["<c-v>"] = "jump_vsplit",
+        -- ["<c-s>"] = "jump_split",
+        -- ["<c-v>"] = "jump_vsplit",
         -- go down to next item (accepts count)
         -- j = "next",
-        ["}"] = "next",
-        ["]]"] = "next",
+        -- ["]]"] = "next",
         -- go up to prev item (accepts count)
         -- k = "prev",
-        ["{"] = "prev",
-        ["[["] = "prev",
-        i = "inspect",
-        p = "preview",
+        ["s"] = "prev",
+        ["t"] = "next",
+        -- ["[["] = "prev",
+        -- i = "inspect",
+        -- p = "preview",
         P = "toggle_preview",
         zo = "fold_open",
         zO = "fold_open_recursive",
@@ -157,6 +172,24 @@ return {
         zn = "fold_disable",
         zN = "fold_enable",
         zi = "fold_toggle_enable",
+        ["F"] = { -- example of a custom action that toggles the active view filter
+          action = function(view)
+            view:filter({ buf = 0 }, { toggle = true })
+          end,
+          desc = "Toggle Current Buffer Filter",
+        },
+        ["f"] = { -- example of a custom action that toggles the severity
+          action = function(view)
+            local f = view:get_filter("severity")
+            local severity = ((f and f.filter.severity or 0) + 1) % 5
+            view:filter({ severity = severity }, {
+              id = "severity",
+              template = "{hl:Title}Filter:{hl} {severity}",
+              del = severity == 0,
+            })
+          end,
+          desc = "Toggle Severity Filter",
+        },
       },
       ---@type table<string, trouble.Mode>
       modes = {
