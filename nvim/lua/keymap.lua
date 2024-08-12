@@ -95,9 +95,8 @@ k.keymap({'i'}, '<C-p>', '<C-o>P') -- P will paste before cursor & over in x wit
 k.keymap({'x'}, 'u', 'ygv<Esc>') -- Yank selection and move to the end
 -- k.keymap({'n', 'x'}, 'uu', 'yy') -- Yank selection and move to the end
 
-vim.keymap.set({'x', 'n'}, "C", "J", { nowait=true, silent=false }) 
-
-vim.keymap.set({'n'}, "kM", ":Neogen<CR>", { nowait=true, silent=false }) 
+vim.keymap.set({'x', 'n'}, "C", "J", { nowait=true, silent=false }) -- Join lines
+vim.keymap.set({'n'}, "kM", ":Neogen<CR>", { nowait=true, silent=false }) -- Create doc
 
 -- Surround
 vim.keymap.set({'x'}, "'", "qqc''<Esc>Pq", { nowait=true, silent=false }) 
@@ -113,7 +112,8 @@ vim.keymap.set({'n'}, 'ls,', 'viwqqc<><Esc>Pq', { nowait=true, silent=false })
 vim.keymap.set({'n'}, 'ls[', 'viwqqc[]<Esc>Pq', { nowait=true, silent=false }) 
 vim.keymap.set({'n'}, 'ls.', 'viwqqc{}<Esc>Pq', { nowait=true, silent=false }) 
 
-vim.keymap.set({'n'}, 'Sa', 'zg', { nowait=true, silent=false }) 
+-- Spellcheck
+vim.keymap.set({'n'}, 'Sa', 'zg', { nowait=true, silent=false })  -- Add spell check word
 vim.keymap.set({'n'}, 'Sr', 'z=', { nowait=true, silent=false }) 
 -- vim.keymap.set({'x'}, '(', 'S)')
 
