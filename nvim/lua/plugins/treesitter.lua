@@ -5,7 +5,7 @@ return {
     "nvim-treesitter/nvim-treesitter",
     dependencies = {
       -- Does NOT work with c_sharp
-      -- "nvim-treesitter/nvim-treesitter-textobjects",
+      "nvim-treesitter/nvim-treesitter-textobjects",
     },
     -- build = ":TSUpdate",
     config = function () 

@@ -1,6 +1,6 @@
 return { 
   "danymat/neogen", 
-  version = "1.0.0",
+  version = "2.19.3",
   config = {
     languages = {
       typescript = {
