@@ -1,6 +1,16 @@
 return {
    {
     'MagicDuck/grug-far.nvim',
+    keys = {
+      {
+        "<leader>ns",
+        function ()
+          require('grug-far').with_visual_selection() 
+        end,
+        mode = { "n", "x" },
+        desc = "Oil file browser",
+      }
+    },
     config = function()
       require('grug-far').setup({
         -- debounce milliseconds for issuing search while user is typing
@@ -128,6 +138,7 @@ return {
           -- qflist = { n = '<localleader>q' },
           -- syncLocations = { n = '<localleader>s' },
           -- syncLine = { n = '<localleader>l' },
+          close = { n = 'q' },
           -- close = { n = '<localleader>c' },
           -- historyOpen = { n = '<localleader>t' },
           -- historyAdd = { n = '<localleader>a' },
@@ -135,7 +146,7 @@ return {
           -- openLocation = { n = '<localleader>o' },
           -- gotoLocation = { n = '<enter>' },
           -- pickHistoryEntry = { n = '<enter>' },
-          -- abort = { n = '<localleader>b' },
+          -- abort = { n = 'q' },
           -- help = { n = 'g?' },
           -- toggleShowCommand = { n = '<localleader>p' },
           -- swapEngine = { n = '<localleader>e' },
