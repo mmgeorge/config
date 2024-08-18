@@ -20,8 +20,8 @@ return {
   },
   opts = {
     -- labels = "abcdefghijklmnopqrstuvwxyz",
-    -- labels = "asdfghjklqwertyuiopzxcvbnm",
-    labels = key("asdfjkl;zxcvm,./qweruioptgbyhn"),
+    labels = "rsthneaiwgdluoyxcmp;,./",
+    -- labels = key("asdfjkl;zxcvm,./qweruioptgbyhn"),
     search = {
       -- search/jump in all windows
       multi_window = true,

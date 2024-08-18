@@ -122,10 +122,15 @@ k.keymap_leader({'x', 'n'}, 'u', "\"+y") -- Copy to clipboard
 k.keymap_leader({'x', 'n'}, 'U', "\"+Y") -- Copy to clipboard
 k.keymap_leader({'x', 'n'}, 'p', "\"+P") -- Paste to clipboard
 -- k.keymap_leader({'n', 'v'}, 's', ":%s/\\<<C-r><C-w>\\>/<C-r><C-w>/gI<Left><Left><Left>")
-k.keymap_leader({'n', 'v'}, 's', ":%s/\\<<C-r><C-w>\\>/<C-r><C-w>/gI<Left><Left><Left>")
+-- k.keymap_leader({'n', 'v'}, 's', ":%s/\\<<C-r><C-w>\\>/<C-r><C-w>/gI<Left><Left><Left>")
 k.keymap_leader({'n', 'v'}, 'iu', function() require("utils").insert_v4({}) end)
 k.keymap_leader({'n', 'v'}, 't', 'gg=G')
-k.keymap_leader({'n'}, 'r', vim.lsp.buf.rename) 
+
+vim.keymap.set("n", "<leader>f", function()
+  return ":IncRename " .. vim.fn.expand("<cword>")
+end, { expr = true })
+-- k.keymap_leader({'n'}, 'r', vim.lsp.buf.rename) 
+
 k.keymap_leader({'n', 'x'}, 'd', function ()
   require("telescope.builtin")
     .live_grep({ cwd = require("telescope.utils").buffer_dir() })

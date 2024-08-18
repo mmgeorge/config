@@ -43,6 +43,29 @@ return {
       -- lspconfig.eslint.setup({})
     end
   },
+  
+  {
+    "smjonas/inc-rename.nvim",
+    config = function ()
+      require("inc_rename").setup ({
+        -- the name of the command
+        cmd_name = "IncRename",
+        -- the highlight group used for highlighting the identifier's new name
+        hl_group = "Substitute",
+        -- whether an empty new name should be previewed; if false the command preview will be cancelled instead
+        preview_empty_name = false,
+        -- whether to display a `Renamed m instances in n files` message after a rename operation
+        show_message = true,
+        -- whether to save the "IncRename" command in the commandline history (set to false to prevent issues with
+        -- navigating to older entries that may arise due to the behavior of command preview)
+        save_in_cmdline_history = true,
+        -- the type of the external input buffer to use (the only supported value is currently "dressing")
+        input_buffer_type = nil,
+        -- callback to run after renaming, receives the result table (from LSP handler) as an argument
+        post_hook = nil,
+      })
+    end
+  },
 
   -- Log startup status --
   {
@@ -51,6 +74,63 @@ return {
       -- options
     },
   },
+   
+  -- Better rename UI --
+  -- {
+  --   "filipdutescu/renamer.nvim",
+  --   dependencies = { "nvim-lua/plenary.nvim" },
+  --   keys = {
+  --     {
+  --     "<leader>f",
+  --     function() require("renamer").rename() end,
+  --     mode = { "n", "x" },
+  --     desc = "Rename",
+  --
+  --     }
+  --   },
+  --   config = function ()
+  --     require("renamer").setup({
+  --       -- The popup title, shown if `border` is true
+  --       title = 'Rename',
+  --       -- The padding around the popup content
+  --       padding = {
+  --         top = 0,
+  --         left = 0,
+  --         bottom = 0,
+  --         right = 0,
+  --       },
+  --       -- The minimum width of the popup
+  --       min_width = 15,
+  --       -- The maximum width of the popup
+  --       max_width = 45,
+  --       -- Whether or not to shown a border around the popup
+  --       border = true,
+  --       -- The characters which make up the border
+  --       border_chars = { 'Ä', '³', 'Ä', '³', '?', '?', '?', '?' },
+  --       -- Whether or not to highlight the current word references through LSP
+  --       show_refs = true,
+  --       -- Whether or not to add resulting changes to the quickfix list
+  --       with_qf_list = true,
+  --       -- Whether or not to enter the new name through the UI or Neovim's `input`
+  --       -- prompt
+  --       with_popup = true,
+  --       -- The keymaps available while in the `renamer` buffer. The example below
+  --       -- overrides the default values, but you can add others as well.
+  --       mappings = {
+  --         -- ['<c-i>'] = mappings_utils.set_cursor_to_start,
+  --         -- ['<c-a>'] = mappings_utils.set_cursor_to_end,
+  --         -- ['<c-e>'] = mappings_utils.set_cursor_to_word_end,
+  --         -- ['<c-b>'] = mappings_utils.set_cursor_to_word_start,
+  --         -- ['<c-c>'] = mappings_utils.clear_line,
+  --         -- ['<c-u>'] = mappings_utils.undo,
+  --         -- ['<c-r>'] = mappings_utils.redo,
+  --       },
+  --       -- Custom handler to be run after successfully renaming the word. Receives
+  --       -- the LSP 'textDocument/rename' raw response as its parameter.
+  --       handler = nil,
+  --     })
+  --   end
+  -- },
 
   -- {
   --    "aznhe21/actions-preview.nvim",
@@ -74,11 +154,7 @@ return {
   --       require("lsp_lines").setup()
   --    end,
   -- }
-  {
-
-
-  },
-
+  
   {
     "folke/trouble.nvim",
     dependencies = { "nvim-tree/nvim-web-devicons" },
