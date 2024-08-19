@@ -94,7 +94,7 @@ return {
               end,
               preselect_correct_word = true,
             },
-          }
+          },
         })
       })
 

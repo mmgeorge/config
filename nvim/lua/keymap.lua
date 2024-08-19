@@ -160,6 +160,7 @@ vim.keymap.set({'n'}, 'ge', '<CMD>Trouble diagnostics filter.severity=vim.diagno
 -- vim.keymap.set({'n'}, 'gd', '<CMD>Trouble diagnostics toggle focus=false filter.buf=0 <CR>', {})
 vim.keymap.set({'n'}, 'ge', '<CMD>Trouble diagnostics toggle filter.severity=vim.diagnostic.severity.ERROR focus=true <CR>', {})
 vim.keymap.set({'n'}, 'gd', '<CMD>Trouble diagnostics toggle focus=true <CR>', {})
+vim.keymap.set({'n'}, 'gq', '<CMD>Trouble quickfix toggle focus=true <CR>', {})
 
 k.keymap('n', 'wq', function() require("trouble").toggle("quickfix") end) 
 
