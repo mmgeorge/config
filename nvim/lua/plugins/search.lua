@@ -134,8 +134,8 @@ return {
         -- it is recommended to use <localleader> though as that is more vim-ish
         -- see https://learnvimscriptthehardway.stevelosh.com/chapters/11.html#local-leader
         keymaps = {
-          -- replace = { n = '<localleader>r' },
-          -- qflist = { n = '<localleader>q' },
+          replace = { n = '<localleader>r' },
+          qflist = { n = '<localleader>q' },
           -- syncLocations = { n = '<localleader>s' },
           -- syncLine = { n = '<localleader>l' },
           close = { n = 'q' },
