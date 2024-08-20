@@ -225,7 +225,8 @@ return {
       -- options used for treesitter selections
       -- `require("flash").treesitter()`
       treesitter = {
-        labels = "abcdefghijklmnopqrstuvwxyz",
+        labels = "rsthneaiwgdluoyxcmp;,./",
+        -- labels = "abcdefghijklmnopqrstuvwxyz",
         jump = { pos = "range" },
         search = { incremental = false },
         label = { before = true, after = true, style = "inline" },
