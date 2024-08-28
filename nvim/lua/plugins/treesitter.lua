@@ -15,6 +15,7 @@ return {
         ensure_installed = {
           "rust",
           "typescript",
+          "tsx",
           "lua",
           "vim",
           "vimdoc",
@@ -29,7 +30,10 @@ return {
         },
         sync_install = false,
         highlight = { enable = true },
-        indent = { enable = true },  
+        indent = { enable = true }, 
+        autotag = {
+          enable = true
+        }
       })
       vim.filetype.add({extension = {frag = "frag"}})
       vim.treesitter.language.register('glsl', { 'frag' })
