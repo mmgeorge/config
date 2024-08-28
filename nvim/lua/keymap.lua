@@ -203,7 +203,8 @@ end)
 -- keymap({'n', 'v'}, 'or', require("telescope.builtin").resume, { nowait=true })
 
 -- Common
-k.keymap({'i', 'v', 'c', 't', 's', 'o', 'x'}, '<C-o>', '<Esc>') -- Cancel
+k.keymap({'i', 'v', 'c', 't', 's', 'o', 'x', 't'}, '<C-o>', '<Esc>') -- Cancel
+vim.api.nvim_command(":tnoremap <ESC> <C-\\><C-n>")
 
 k.keymap('n', '<C-_>', '<Plug>(comment_toggle_linewise_current)j') -- Comment line, maps to C-/
 
