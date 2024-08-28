@@ -213,4 +213,3 @@ k.keymap('n', '<C-q>', '<CMD>x<CR>')
 k.keymap('n', '<S-C-e>', function() vim.diagnostic.goto_prev() end)
 k.keymap('n', '<C-s>', '<CMD>w<CR>') -- Save file
 k.keymap('i', '<C-s>', '<C-o>:w<CR>') -- Save file
-
