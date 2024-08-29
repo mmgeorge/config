@@ -223,6 +223,7 @@ return {
   }, 
   {
     "chrisgrieser/nvim-rip-substitute", 
+    commit = "b66e7c4",
     keys = {
       {
         "<leader>s",
