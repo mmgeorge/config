@@ -16,6 +16,7 @@ alias ec='emacsclient -nw '
 alias kec='pkill emacs'
 alias create='$HOME/config/scripts/create-repo.sh'
 alias cls='clear' 
+alias open='explorer.exe' 
 
 alias wg='watch -n 1 gcloud'
 alias wk='watch -n 1 kubectl'
