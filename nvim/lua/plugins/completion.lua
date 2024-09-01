@@ -59,7 +59,7 @@ return {
         snippet = {
           expand = function(args)
             require'luasnip'.lsp_expand(args.body)
-            --vim.snippet.expand(args.body)
+            -- vim.snippet.expand(args.body)
           end
         },
         completion = {
@@ -83,8 +83,8 @@ return {
         },
         mapping = mapping, 
         sources = cmp.config.sources({
-          -- { name = 'luasnip' },
           { name = 'nvim_lsp' },
+          { name = 'luasnip' },
           { 
             name = 'spell', 
             option = {
