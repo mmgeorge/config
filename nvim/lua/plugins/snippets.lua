@@ -39,16 +39,15 @@ return {
       end,
     })
     -- See https://github.com/L3MON4D3/LuaSnip/blob/master/Examples/snippets.lua#L277
-
     -- require("luasnip.loaders.from_vscode").lazy_load()       
 
     local ls = require("luasnip")
-    local s = ls.snippet
+    local snippet = ls.snippet
     local sn = ls.snippet_node
     local isn = ls.indent_snippet_node
-    local t = ls.text_node
+    local text = ls.text_node
     local i = ls.insert_node
-    local f = ls.function_node
+    local func = ls.function_node
     local c = ls.choice_node
     local d = ls.dynamic_node
     local r = ls.restore_node
@@ -65,109 +64,20 @@ return {
     local fmta = require("luasnip.extras.fmt").fmta
     local conds = require("luasnip.extras.expand_conditions")
     local postfix = require("luasnip.extras.postfix").postfix
-    local treesitter_postfix = require("luasnip.extras.treesitter_postfix").treesitter_postfix
     local types = require("luasnip.util.types")
     local parse = require("luasnip.util.parser").parse_snippet
     local ms = ls.multi_snippet
     local k = require("luasnip.nodes.key_indexer").new_key
     -- See https://github.com/L3MON4D3/LuaSnip/blob/master/Examples/snippets.lua, 
     -- for example snippets
-    local function get_position_before_postfix()
-      local pos = vim.api.nvim_win_get_cursor(0) -- get current cursor position
-      local row = pos[1] - 1 -- must convert to 0 indexed
-      local line = vim.api.nvim_get_current_line()
-      local dot_position = line:find("%.") 
-
-      if dot_position then 
-        return { row, dot_position - 2 } -- Before dot + 1 based index
-      end
-     
-      return nil
-    end
-   
-    local function type_node()
-      local node = vim.treesitter.get_node({
-        pos = get_position_before_postfix()
-      })
-
-      local ty = node:type()
-      if 
-        ty == "type_identifier" or 
-        ty == "type_item" or 
-        ty == "type_arguments" 
-      then
-        return node
-      end
-
-      return nil
-    end 
-    
-    local function expr_node()
-      local node = vim.treesitter.get_node({
-        pos = get_position_before_postfix()
-      })
-
-      while node do 
-        local ty = node:type()
-        print(ty)
-       
-        if 
-          ty == "call_expression" or 
-          ty == "integer_literal" or 
-          ty == "string_literal" or 
-          ty == "float_literal" then 
-          return node
-        end 
-
-        node = node:parent()
-      end 
-
-      return nil
-    end
-
-    ls.add_snippets('rust', {
-      postfix(
-        { 
-          trig =".rccell",
-          match_pattern = "[%w%.%_%-<>%(%)%:]+$", 
-        }, 
-        {
-          f(function(_, parent)
-            return "Rc<RefCell<" .. parent.snippet.env.POSTFIX_MATCH .. ">>"
-          end, {}),
-        }, 
-        {
-          show_condition = function(line_to_cursor)
-            return type_node() ~= nil 
-          end,
-        }
-      ),
-      postfix(
-        { 
-          trig =".rccell",
-          match_pattern = "[%w%.%_%-<>%(%)%:]+$", 
-        }, 
-        {
-          f(function(_, parent)
-            return "Rc::new(RefCell::new(" .. parent.snippet.env.POSTFIX_MATCH .. "))"
-          end, {}),
-        }, 
-        {
-          show_condition = function(line_to_cursor)
-            return expr_node() ~= nil  
-          end,
-        }
-      ),
-    })
-
     luasnip.add_snippets(
       "all",
       {
-        s("la ", t"<- "),
-        s("ra ", t"-> "),
-        s("udef ", t"self.useDefaults?.(arguments)"),
-        s("sf ", {
-          t({"<script>", 
+        snippet("la ", text"<- "),
+        snippet("ra ", text"-> "),
+        snippet("udef ", text"self.useDefaults?.(arguments)"),
+        snippet("sf ", {
+          text({"<script>", 
             "  var esriConfig = {",
             "    has: {",
             "      \"esri-2d-update-debug\": 1,",
@@ -178,32 +88,32 @@ return {
             "  }",
             "</script>"}), 
         }) ,
-        s("dl ", {
-          t({"//--------------------------------------------------------------------------", 
+        snippet("dl ", {
+          text({"//--------------------------------------------------------------------------", 
             "//",
             "//  Lifecycle",
             "//",
             "//--------------------------------------------------------------------------",
           }), 
         }),
-        s("dpm ", {
-          t({"//--------------------------------------------------------------------------", 
+        snippet("dpm ", {
+          text({"//--------------------------------------------------------------------------", 
             "//",
             "//  Private Methods",
             "//",
             "//--------------------------------------------------------------------------",
           }), 
         }), 
-        s("dm ", {
-          t({"//--------------------------------------------------------------------------", 
+        snippet("dm ", {
+          text({"//--------------------------------------------------------------------------", 
             "//",
             "//  Public Methods",
             "//",
             "//--------------------------------------------------------------------------",
           }), 
         }), 
-        s("dp ", {
-          t({"//--------------------------------------------------------------------------", 
+        snippet("dp ", {
+          text({"//--------------------------------------------------------------------------", 
             "//",
             "//  Properties",
             "//",
