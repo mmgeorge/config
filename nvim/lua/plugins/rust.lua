@@ -169,15 +169,30 @@ return {
             -- you can also put keymaps in here
           end,
           default_settings = {
-            -- rust-analyzer language server configuration
             ['rust-analyzer'] = {
-              -- checkOnSave = false,
               ["cargo"] = {
                 ["extraEnv"] = {
                   ["CARGO_TARGET_DIR"] = "target/check",
                   -- ["RUSTFLAGS"] = "-Zthreads=8 -Zshare-generics=n"
                 }
-              }
+              },
+              -- Doesn't work... not supported in nvim? 
+              -- completion = {
+              --   snippets = {
+              --     custom = {
+              --       ["myprint!"] = {
+              --         ["postfix"] = "myp",
+              --         ["body"] = {
+              --           "println!(\"$0\", ${receiver});"
+              --         },
+              --         ["description"] = "println!()",
+              --         ["scope"] = "expr"
+              --       }
+              --
+              --     }
+              --   }
+              -- },
+              -- checkOnSave = false,
             },
           },
         },

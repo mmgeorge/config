@@ -40,7 +40,7 @@ return {
     })
     -- See https://github.com/L3MON4D3/LuaSnip/blob/master/Examples/snippets.lua#L277
 
-    require("luasnip.loaders.from_vscode").lazy_load()       
+    -- require("luasnip.loaders.from_vscode").lazy_load()       
 
     local ls = require("luasnip")
     local s = ls.snippet
@@ -65,68 +65,119 @@ return {
     local fmta = require("luasnip.extras.fmt").fmta
     local conds = require("luasnip.extras.expand_conditions")
     local postfix = require("luasnip.extras.postfix").postfix
+    local treesitter_postfix = require("luasnip.extras.treesitter_postfix").treesitter_postfix
     local types = require("luasnip.util.types")
     local parse = require("luasnip.util.parser").parse_snippet
     local ms = ls.multi_snippet
     local k = require("luasnip.nodes.key_indexer").new_key
-
     -- See https://github.com/L3MON4D3/LuaSnip/blob/master/Examples/snippets.lua, 
     -- for example snippets
-    luasnip.add_snippets(
-      "all",
-      {
-        s("la ", t"<- "),
-        s("ra ", t"-> "),
-        s("udef ", t"self.useDefaults?.(arguments)"),
-        s("sf ", {
-          t({"<script>", 
-            "  var esriConfig = {",
-            "    has: {",
-            "      \"esri-2d-update-debug\": 1,",
-            "      \"esri-2d-debug\": 1,",
-            "      \"esri-tiles-debug\": 1,",
-            "      \"featurelayer-pbf\": 1,",
-            "    }",
-            "  }",
-            "</script>"}), 
-        }) ,
-        s("dl ", {
-          t({"//--------------------------------------------------------------------------", 
-            "//",
-            "//  Lifecycle",
-            "//",
-            "//--------------------------------------------------------------------------",
-          }), 
-        }),
-        s("dpm ", {
-          t({"//--------------------------------------------------------------------------", 
-            "//",
-            "//  Private Methods",
-            "//",
-            "//--------------------------------------------------------------------------",
-          }), 
-        }), 
-        s("dm ", {
-          t({"//--------------------------------------------------------------------------", 
-            "//",
-            "//  Public Methods",
-            "//",
-            "//--------------------------------------------------------------------------",
-          }), 
-        }), 
-        s("dp ", {
-          t({"//--------------------------------------------------------------------------", 
-            "//",
-            "//  Properties",
-            "//",
-            "//--------------------------------------------------------------------------",
-          }), 
-        }), 
-      },
-      {
-        type = "autosnippets",
-        key = "all_auto"
-      }
-    ) 
+    local function get_position_before_cursor()
+      local pos = vim.api.nvim_win_get_cursor(0) -- get current cursor position
+      local line = pos[1] - 1 -- must convert to 0 indexed
+      local col = pos[2] - 4
+      if col < 0 then col = 0 end -- handle the case when cursor is at the beginning of the line
+      return {line, col}
+    end
+   
+    local function is_cursor_in_type_node()
+      local node = vim.treesitter.get_node({
+        pos = get_position_before_cursor()
+      })
+
+      local ty = node:type()
+
+      if node then  
+        -- vim.print(node:type()); 
+      end
+      
+      if 
+        ty == "type_identifier" --or 
+        -- ty == "type_item" or 
+        -- ty == "type_arguments" 
+      then
+        return true
+      end
+
+      return false
+    end 
+
+    ls.add_snippets('rust', {
+      postfix(
+        { 
+          trig =".rcl",
+          -- match_pattern ="[%w%.%_%-]+$",
+          match_pattern = "[%w%.%_%-<>]+$",
+        }, 
+        {
+          f(function(_, parent)
+            return "Rc<RefCell<" .. parent.snippet.env.POSTFIX_MATCH .. ">>"
+          end, {}),
+        }, 
+        {
+          show_condition = function(line_to_cursor)
+            -- optional whitespace followed by //
+            return is_cursor_in_type_node()
+          end,
+        }
+      ),
+    })
+
+    -- luasnip.add_snippets(
+    --   "all",
+    --   {
+    --     s("la ", t"<- "),
+    --     s("ra ", t"-> "),
+    --     s("udef ", t"self.useDefaults?.(arguments)"),
+    --     s("sf ", {
+    --       t({"<script>", 
+    --         "  var esriConfig = {",
+    --         "    has: {",
+    --         "      \"esri-2d-update-debug\": 1,",
+    --         "      \"esri-2d-debug\": 1,",
+    --         "      \"esri-tiles-debug\": 1,",
+    --         "      \"featurelayer-pbf\": 1,",
+    --         "    }",
+    --         "  }",
+    --         "</script>"}), 
+    --     }) ,
+    --     s("dl ", {
+    --       t({"//--------------------------------------------------------------------------", 
+    --         "//",
+    --         "//  Lifecycle",
+    --         "//",
+    --         "//--------------------------------------------------------------------------",
+    --       }), 
+    --     }),
+    --     s("dpm ", {
+    --       t({"//--------------------------------------------------------------------------", 
+    --         "//",
+    --         "//  Private Methods",
+    --         "//",
+    --         "//--------------------------------------------------------------------------",
+    --       }), 
+    --     }), 
+    --     s("dm ", {
+    --       t({"//--------------------------------------------------------------------------", 
+    --         "//",
+    --         "//  Public Methods",
+    --         "//",
+    --         "//--------------------------------------------------------------------------",
+    --       }), 
+    --     }), 
+    --     s("dp ", {
+    --       t({"//--------------------------------------------------------------------------", 
+    --         "//",
+    --         "//  Properties",
+    --         "//",
+    --         "//--------------------------------------------------------------------------",
+    --       }), 
+    --     }), 
+    --   },
+    --   {
+    --     type = "autosnippets",
+    --     key = "all_auto"
+    --   }
+    -- ) 
   end
 }
