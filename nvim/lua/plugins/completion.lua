@@ -16,7 +16,96 @@ return {
     },
     config = function()
       local cmp = require("cmp"); 
+      -----------------------------------------------------------------------------
+      --- NATIVE AUTOCMDS SNIPPETS -- 
+      -----------------------------------------------------------------------------
+        -- snippet("la ", text"<- "),
+        -- snippet("ra ", text"-> "),
+        -- snippet("udef ", text"self.useDefaults?.(arguments)"),
+        -- snippet("sf ", {
+        --   text({"<script>", 
+        --     "  var esriConfig = {",
+        --     "    has: {",
+        --     "      \"esri-2d-update-debug\": 1,",
+        --     "      \"esri-2d-debug\": 1,",
+        --     "      \"esri-tiles-debug\": 1,",
+        --     "      \"featurelayer-pbf\": 1,",
+        --     "    }",
+        --     "  }",
+        --     "</script>"}), 
+        -- }) ,
+     
+      local autosnippets = {
+        {
+          trigger = "la ", 
+          body = "<- "
+        },
+        {
+          trigger = "ra ", 
+          body = "-> "
+        },
+        {
+          trigger = "udef ", 
+          body = "self.useDefaults?.(arguments)"
+        },
+        {
+          trigger = "sf", 
+          body = [[<script> 
+var esriConfig = {
+  has: {
+    "esri-2d-update-debug": 1,
+    "esri-2d-debug": 1,
+    "esri-tiles-debug": 1,
+    "featurelayer-pbf": 1,
+  },
+},
+</script>]]
+        },
+        {
+          trigger = "hh ", 
+          body = [[//--------------------------------------------------------------------------" 
+//
+//  $1 
+//
+//--------------------------------------------------------------------------"
+]]
+        }
+      }
+      
+      vim.api.nvim_create_autocmd("TextChangedI", {
+        pattern = "*",
+        callback = function()
+          local line = vim.api.nvim_get_current_line()
+          local col = vim.api.nvim_win_get_cursor(0)[2]  -- Current column
 
+          -- Extract the last entered token
+          local start_pos, end_pos = line:sub(1, col):find("([^%s]+)%s?$")
+    
+          if start_pos and end_pos then
+            local last_token = line:sub(start_pos, end_pos)
+            
+            -- OPTIMIZE: Inefficent. Use map as snippets list grows?
+            for index, item in ipairs(autosnippets) do 
+              if last_token == item.trigger then
+                local pos = vim.api.nvim_win_get_cursor(0) -- get current cursor position
+                local row = pos[1] - 1; 
+                local buf = vim.api.nvim_get_current_buf() 
+                -- Remove match token
+                vim.api.nvim_buf_set_text(buf, row, start_pos - 1, row, end_pos, {})
+                -- Insert text at cursor
+                -- vim.api.nvim_put(vim.split(item.body, "\n"), "", true, true)
+                vim.snippet.expand(item.body)
+                break
+              end
+            end
+          end
+        end,
+      })
+
+      -----------------------------------------------------------------------------
+      --- !NATIVE AUTOCMDS SNIPPETS -- 
+      -----------------------------------------------------------------------------
+      
       -----------------------------------------------------------------------------
       --- NATIVE SNIPPETS -- 
       -----------------------------------------------------------------------------
@@ -313,8 +402,7 @@ return {
         },
         snippet = {
           expand = function(args)
-            require'luasnip'.lsp_expand(args.body)
-            -- vim.snippet.expand(args.body)
+            vim.snippet.expand(args.body)
           end
         },
         completion = {
