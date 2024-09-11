@@ -170,6 +170,13 @@ return {
               return "impl Future<Output = " .. text .. ">" 
             end 
           }),
+          postfix({ 
+            trigger = 'opt', 
+            node = type_node, 
+            body = function (text)
+              return "Option<" .. text .. ">" 
+            end 
+          }),
         }
       }
 
