@@ -221,67 +221,67 @@ return {
       });
     end
   }, 
-  {
-    "chrisgrieser/nvim-rip-substitute", 
-    commit = "b66e7c4",
-    keys = {
-      {
-        "<leader>s",
-        function() require("rip-substitute").sub() end,
-        mode = { "n", "x" },
-        desc = "? rip substitute",
-      }
-    },
-    config = function ()
-      require("rip-substitute").setup {
-        popupWin = {
-          title = "Replace",
-          border = "single",
-          matchCountHlGroup = "Keyword",
-          noMatchHlGroup = "ErrorMsg",
-          hideSearchReplaceLabels = false,
-          ---@type "top"|"bottom"
-          -- position = "bottom",
-          position = "top",
-        },
-        prefill = {
-          ---@type "cursorWord"| false
-          normal = "cursorWord", -- "cursorWord"|false
-          ---@type "selectionFirstLine"| false does not work with ex-command (see README).
-          visual = "selectionFirstLine",
-          startInReplaceLineIfPrefill = false,
-        },
-        keymaps = { -- normal & visual mode, if not stated otherwise
-          abort = "q",
-          confirm = "<CR>",
-          insertModeConfirm = "<C-CR>",
-          prevSubst = "<Up>",
-          nextSubst = "<Down>",
-          toggleFixedStrings = "<C-f>",
-          openAtRegex101 = "R",
-        },
-        incrementalPreview = {
-          matchHlGroup = "IncSearch",
-          rangeBackdrop = {
-            enabled = true,
-            blend = 50, -- between 0 and 100
-          },
-        },
-        regexOptions = {
-          -- pcre2 enables lookarounds and backreferences, but performs slower
-          pcre2 = true,
-          ---@type "case-sensitive"|"ignore-case"|"smart-case"
-          casing = "case-sensitive",
-          -- disable if you use named capture groups (see README for details)
-          autoBraceSimpleCaptureGroups = true,
-        },
-        editingBehavior = {
-          -- When typing `()` in the `search` line, automatically adds `$n` to the
-          -- `replace` line.
-          autoCaptureGroups = false,
-        },
-        notificationOnSuccess = true,
-      } 
-    end
-  }
+  -- {
+  --   "chrisgrieser/nvim-rip-substitute", 
+  --   commit = "b66e7c4",
+  --   keys = {
+  --     {
+  --       "<leader>s",
+  --       function() require("rip-substitute").sub() end,
+  --       mode = { "n", "x" },
+  --       desc = "? rip substitute",
+  --     }
+  --   },
+  --   config = function ()
+  --     require("rip-substitute").setup {
+  --       popupWin = {
+  --         title = "Replace",
+  --         border = "single",
+  --         matchCountHlGroup = "Keyword",
+  --         noMatchHlGroup = "ErrorMsg",
+  --         hideSearchReplaceLabels = false,
+  --         ---@type "top"|"bottom"
+  --         -- position = "bottom",
+  --         position = "top",
+  --       },
+  --       prefill = {
+  --         ---@type "cursorWord"| false
+  --         normal = "cursorWord", -- "cursorWord"|false
+  --         ---@type "selectionFirstLine"| false does not work with ex-command (see README).
+  --         visual = "selectionFirstLine",
+  --         startInReplaceLineIfPrefill = false,
+  --       },
+  --       keymaps = { -- normal & visual mode, if not stated otherwise
+  --         abort = "q",
+  --         confirm = "<CR>",
+  --         insertModeConfirm = "<C-CR>",
+  --         prevSubst = "<Up>",
+  --         nextSubst = "<Down>",
+  --         toggleFixedStrings = "<C-f>",
+  --         openAtRegex101 = "R",
+  --       },
+  --       incrementalPreview = {
+  --         matchHlGroup = "IncSearch",
+  --         rangeBackdrop = {
+  --           enabled = true,
+  --           blend = 50, -- between 0 and 100
+  --         },
+  --       },
+  --       regexOptions = {
+  --         -- pcre2 enables lookarounds and backreferences, but performs slower
+  --         pcre2 = true,
+  --         ---@type "case-sensitive"|"ignore-case"|"smart-case"
+  --         casing = "case-sensitive",
+  --         -- disable if you use named capture groups (see README for details)
+  --         autoBraceSimpleCaptureGroups = true,
+  --       },
+  --       editingBehavior = {
+  --         -- When typing `()` in the `search` line, automatically adds `$n` to the
+  --         -- `replace` line.
+  --         autoCaptureGroups = false,
+  --       },
+  --       notificationOnSuccess = true,
+  --     } 
+  --   end
+  -- }
 }
