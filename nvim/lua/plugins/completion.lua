@@ -9,7 +9,6 @@ return {
       "hrsh7th/cmp-cmdline", 
       "hrsh7th/cmp-nvim-lsp", 
       "ryo33/nvim-cmp-rust",  
-      "saadparwaiz1/cmp_luasnip", 
       "onsails/lspkind.nvim", -- pretty formatting
       "jmederosalvarado/roslyn.nvim" , 
       "f3fora/cmp-spell"
