@@ -29,8 +29,17 @@ return {
           "toml"
         },
         sync_install = false,
-        highlight = { enable = true },
-        indent = { enable = true }, 
+        highlight = { 
+          enable = true,
+          -- Needed to play nixe with vim-jsx-pretty (vim-polygot)
+          -- https://github.com/nvim-treesitter/nvim-treesitter/issues/1019 
+          additional_vim_regex_highlighting = true
+        },
+        indent = { 
+          enable = true, 
+          -- vim-jsx-pretty provides better indent. See typescript config
+          disable = { "tsx" }
+        }, 
         autotag = {
           enable = true
         }
@@ -91,6 +100,34 @@ return {
       })
     end
   },
+  -- {
+  --   "yioneko/nvim-yati", 
+  --   dependencies = {
+  --     "nvim-treesitter/nvim-treesitter",
+  --   },
+  --   config = function ()
+  --     require("nvim-treesitter.configs").setup {
+  --       yati = {
+  --         enable = true,
+  --         -- Disable by languages, see `Supported languages`
+  --         -- disable = { "tsx" },
+  --
+  --         -- Whether to enable lazy mode (recommend to enable this if bad indent happens frequently)
+  --         default_lazy = true,
+  --
+  --         -- Determine the fallback method used when we cannot calculate indent by tree-sitter
+  --         --   "auto": fallback to vim auto indent
+  --         --   "asis": use current indent as-is
+  --         --   "cindent": see `:h cindent()`
+  --         -- Or a custom function return the final indent result.
+  --         default_fallback = "auto"
+  --       },
+  --       indent = {
+  --         enable = false -- disable builtin indent module
+  --       }
+  --     }
+  --   end
+  -- }
   -- {
   --    "nvim-treesitter/nvim-treesitter-context",
   --    config = function()
