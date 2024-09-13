@@ -171,6 +171,7 @@ return {
           default_settings = {
             ['rust-analyzer'] = {
               ["cargo"] = {
+                ["allFeatures"] = true,
                 ["extraEnv"] = {
                   ["CARGO_TARGET_DIR"] = "target/check",
                   -- ["RUSTFLAGS"] = "-Zthreads=8 -Zshare-generics=n"
