@@ -40,6 +40,30 @@ return {
           body = "<- "
         },
         {
+          trigger = "todo: ", 
+          body = "TODO "
+        },
+        {
+          trigger = "perf: ", 
+          body = "PERF: "
+        },
+        {
+          trigger = "bug: ", 
+          body = "BUG: "
+        },
+        {
+          trigger = "warn: ", 
+          body = "WARN: "
+        },
+        {
+          trigger = "hack: ", 
+          body = "HACK: "
+        },
+        {
+          trigger = "note: ", 
+          body = "NOTE: "
+        },
+        {
           trigger = "ra ", 
           body = "-> "
         },
@@ -263,6 +287,13 @@ var esriConfig = {
             node = type_node, 
             body = function (text)
               return "Option<" .. text .. ">" 
+            end 
+          }),
+          postfix({ 
+            trigger = 'vec', 
+            node = type_node, 
+            body = function (text)
+              return "Vec<" .. text .. ">" 
             end 
           }),
         }
