@@ -94,8 +94,8 @@ k.keymap({'n', 'x'}, 'p', 'P') -- P will paste before cursor & over in x without
 k.keymap({'i'}, '<C-p>', '<C-o>P') -- P will paste before cursor & over in x without yanking
 k.keymap({'x'}, 'u', 'ygv<Esc>') -- Yank selection and move to the end
 -- k.keymap({'n', 'x'}, 'uu', 'yy') -- Yank selection and move to the end
-
-vim.keymap.set({'x', 'n'}, "C", "J", { nowait=true, silent=false }) -- Join lines
+vim.keymap.set({'n'}, "G", 
+  function () require('treesj').toggle() end, { nowait=true, silent=false }) -- Join lines vim.keymap.set({'x', 'n'}, "C", "J", { nowait=true, silent=false }) -- Join lines
 vim.keymap.set({'n'}, "kM", ":Neogen<CR>", { nowait=true, silent=false }) -- Create doc
 
 -- Surround
