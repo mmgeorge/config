@@ -171,6 +171,7 @@ k.keymap('n', 'wq', function() require("trouble").toggle("quickfix") end)
 k.keymap('n', '=', 'g;' ) -- Jump back to last change
 k.keymap('n', '{', 'g,' ) -- Jump recent change
 k.keymap({'n', 'v'}, '<Tab>', '==' ) 
+vim.keymap.set({'n'}, '<CR>', 'i<CR><ESC>' ) 
 
 k.keymap('n', '.', '<CMD>Glance definitions<CR>') 
 k.keymap('n', 'or', '<CMD>Glance references<CR>') 
