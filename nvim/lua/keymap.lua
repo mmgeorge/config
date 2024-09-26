@@ -133,11 +133,11 @@ vim.keymap.set("n", "<leader>f", function()
 end, { expr = true })
 -- k.keymap_leader({'n'}, 'r', vim.lsp.buf.rename) 
 
-k.keymap_leader({'n', 'x'}, 'd', function ()
-  require("telescope.builtin")
-    .live_grep({ cwd = require("telescope.utils").buffer_dir() })
-end
-)
+-- k.keymap_leader({'n', 'x'}, 'd', function ()
+--   require("telescope.builtin")
+--     .live_grep({ cwd = require("telescope.utils").buffer_dir() })
+-- end
+-- )
 
 -- Buffer
 -- vim.keymap.set({'n', 'x'}, "<leader>" .. "bj", ":bd<cr>", { nowait=true, silent=false })
