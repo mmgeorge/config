@@ -1,3 +1,16 @@
+local function replace_backslash_with_slash(input)
+  if type(input) == "string" then
+    return string.gsub(input, "\\", "/")
+  end
+  
+  input.text =string.gsub(input.text, "\\", "/") 
+  return input
+end
+
+local function replace_slash_with_backslash(input)
+  return string.gsub(input, "/", "\\")
+end
+
 return {
   {
     'echasnovski/mini.extra',
@@ -67,7 +80,9 @@ return {
       }, 
     },
     config = function ()
-      require"mini.pick".setup({
+      local MiniPick = require"mini.pick"
+     
+      MiniPick.setup({
         -- Delays (in ms; should be at least 1)
         delay = {
           -- Delay between forcing asynchronous behavior
@@ -93,14 +108,14 @@ return {
           delete_left       = '<C-u>',
           delete_word       = '<C-w>',
 
-          mark     = '<C-x>',
+          mark     = '<A-n>',
           mark_all = '<C-a>',
 
-          move_down  = '<C-n>',
+          move_down  = '<A-a>',
           move_start = '<C-g>',
-          move_up    = '<C-p>',
+          move_up    = '<A-e>',
 
-          paste = '<C-r>',
+          paste = '<C-y>',
 
           refine        = '<C-Space>',
           refine_marked = '<M-Space>',
@@ -131,8 +146,38 @@ return {
           name  = nil,
           cwd   = nil,
 
-          match   = nil,
-          show    = nil,
+          match  = function(stritems, inds, query, do_sync)
+            query = vim.tbl_map(function(c)
+              -- if c == "/" then 
+              --   return "\\"
+              -- end
+              if c == "/" then 
+                return "Z"
+              end
+              
+              if c == "\\" then 
+                return "Z"
+              end
+
+              return c
+            end, query)
+            
+            return MiniPick.default_match(stritems, inds, query, do_sync) 
+          end,
+          --
+          -- show = function (buf_id, items, query, opts)
+          --   -- query = vim.tbl_map(function(c)
+          --   --   if c == "/" then 
+          --   --     return "\\"
+          --   --   end
+          --   --
+          --   --   return c
+          --   -- end, query)
+          --
+          --   items = vim.tbl_map(replace_backslash_with_slash, items)
+          --   return MiniPick.default_show(buf_id, items, query, opts)
+          -- end,
+
           preview = nil,
 
           choose        = nil,
@@ -152,14 +197,14 @@ return {
           end,
 
           -- String to use as cursor in prompt
-          prompt_cursor = '',
+          -- prompt_cursor = '',
 
           -- String to use as prefix in prompt
           -- prompt_prefix = '> ',
         },
       })
 
-      require"mini.pick".registry.xbuffers = function(local_opts, opts)
+      MiniPick.registry.xbuffers = function(local_opts, opts)
         local_opts = vim.tbl_deep_extend('force', {
           include_current = true,
           include_unlisted = false,
@@ -195,6 +240,71 @@ return {
         opts = vim.tbl_deep_extend('force', default_opts, opts or {}, { source = { items = items } })
         return MiniPick.start(opts)
       end
+  
+      -- require"mini.pick".registry.xfiles = function(local_opts, opts)
+      --   local is_executable = function(tool)
+      --     if tool == 'fallback' then return true end
+      --     return vim.fn.executable(tool) == 1
+      --   end
+      --   
+      --   local files_get_tool = function()
+      --     if is_executable('rg') then return 'rg' end
+      --     if is_executable('fd') then return 'fd' end
+      --     if is_executable('git') then return 'git' end
+      --     return 'fallback'
+      --   end
+      --
+      --   local files_get_command = function(tool)
+      --     if tool == 'rg' then return { 'rg', '--files', '--no-follow', '--color=never' } end
+      --     if tool == 'fd' then return { 'fd', '--type=f', '--no-follow', '--color=never' } end
+      --     if tool == 'git' then return { 'git', 'ls-files', '--cached', '--others', '--exclude-standard' } end
+      --   end
+      --
+      --   local cli_postprocess = function(items)
+      --     while items[#items] == '' do
+      --       items[#items] = nil
+      --     end
+      --     return items
+      --   end
+      --   
+      --   -- local H = require"mini.pick"
+      --
+      --   local_opts = vim.tbl_deep_extend('force', { tool = nil }, local_opts or {})
+      --   local tool = local_opts.tool or files_get_tool()
+      --   local show = MiniPick.show_with_icons
+      --   local default_opts = { source = { name = string.format('Files (%s)', tool), show = show } }
+      --   opts = vim.tbl_deep_extend('force', default_opts, opts or {})
+      --
+      --   -- if tool == 'fallback' then
+      --     -- opts.source.items = function() H.files_fallback_items(opts.source.cwd) end
+      --     -- return MiniPick.start(opts)
+      --   -- end
+      --   local postprocess = function(lines)
+      --     local res = cli_postprocess(lines)
+      --     -- Repace all with backslash
+      --     for i = 1, #res do
+      --       res[i] = {
+      --         path = res[i],
+      --         text = replace_backslash_with_slash(res[i])  
+      --       }
+      --     end
+      --    
+      --     -- Correctly process files with `:` without sacrificing much performance
+      --     -- for i = 1, #res do
+      --     --   if res[i]:find(':') ~= nil then res[i] = {
+      --     --     path = res[i],
+      --     --     text = replace_backslash_with_slash(res[i]),
+      --     --   } end
+      --     -- end
+      --     
+      --     return res
+      --   end
+      --
+      --   return MiniPick.builtin.cli({
+      --     command = files_get_command(tool),
+      --     postprocess = postprocess,
+      --   }, opts)
+      -- end
 
       -- require"mini.pick".registry.xexplorer = function(local_opts, opts)
       --   local H = require"mini.pick"

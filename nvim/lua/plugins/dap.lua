@@ -1,7 +1,39 @@
+-- vim.keymap.set({'n', 'x'}, 'B', function () require"dap".toggle_breakpoint() end, {})
+-- vim.keymap.set({'n', 'x'}, '<A-a>', function () require"dap".step_over() end, {})
+-- vim.keymap.set({'n', 'x'}, '<A-i>', function () require"dap".step_into() end, {})
+-- vim.keymap.set({'n', 'x'}, '<A-n>', function () require"dap".step_out() end, {})
+-- vim.keymap.set({'n', 'x'}, '<A-r>', function () require"dap".restart() end, {})
+-- vim.keymap.set({'n', 'x'}, '<A-c>', function () require"dap".continue() end, {})
+
+
 return {
   {
     "mfussenegger/nvim-dap", 
     keys = {
+      -- {
+      --   "<Up>",
+      --   function ()
+      --     require"dap".step_out() 
+      --   end,
+      --   mode = { "n", "x" },
+      --   desc = "Step over",
+      -- },
+      -- {
+      --   "<Down>",
+      --   function ()
+      --     require"dap".step_over() 
+      --   end,
+      --   mode = { "n", "x" },
+      --   desc = "Step over",
+      -- },
+      -- {
+      --   "<Right>",
+      --   function ()
+      --     require"dap".step_into() 
+      --   end,
+      --   mode = { "n", "x" },
+      --   desc = "Step Into",
+      -- },
       {
         "B",
         function ()
@@ -49,7 +81,21 @@ return {
 
     },
     config = function ()
-      require("dap").defaults.fallback.terminal_win_cmd = '10split new'; 
+      local dap = require "dap"
+      local codelldb_path = vim.fn.stdpath("data") .. "\\mason\\packages\\codelldb\\extension\\adapter\\codelldb.exe" 
+      
+      dap.defaults.fallback.terminal_win_cmd = '10split new'
+      if vim.loop.os_uname().sysname == "Windows_NT" then 
+        dap.adapters.codelldb = {
+          type = 'server',
+          host = '127.0.0.1',
+          port = 13000,
+          executable = {
+            command = codelldb_path, 
+            args = { "--port", 13000 }
+          }
+        }
+      end
     end
   },
   {
