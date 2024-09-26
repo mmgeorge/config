@@ -151,6 +151,11 @@ return {
     version = '^4', -- Recommended
     lazy = false, -- This plugin is already lazy
     config = function ()
+      -- local cfg = require('rustaceanvim.config')
+      -- local codelldb_path = vim.fn.stdpath("data") .. "\\mason\\packages\\codelldb\\extension\\adapter\\codelldb" 
+      --
+      -- vim.notify(vim.inspect(codelldb_path))
+
       vim.g.rustaceanvim = {
         -- Plugin configuration
         tools = {
@@ -200,6 +205,7 @@ return {
         },
         -- DAP configuration
         dap = {
+          -- adapter = cfg.get_codelldb_adapter(codelldb_path, codelldb_path),
         },
       }
     end 

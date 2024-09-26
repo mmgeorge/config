@@ -217,17 +217,12 @@ k.keymap('n', '<S-C-e>', function() vim.diagnostic.goto_prev() end)
 k.keymap('n', '<C-s>', '<CMD>w<CR>') -- Save file
 k.keymap('i', '<C-s>', '<C-o>:w<CR>') -- Save file
 
--- vim.keymap.set({'n', 'x'}, 'B', function () require"dap".toggle_breakpoint() end, {})
--- vim.keymap.set({'n', 'x'}, 'T', function () require"dap".step_over() end, {})
--- vim.keymap.set({'n', 'x'}, 'H', function () require"dap".step_into() end, {})
--- vim.keymap.set({'n', 'x'}, 'R', function () require"dap".step_out() end, {})
 vim.keymap.set({'n', 'x'}, 'B', function () require"dap".toggle_breakpoint() end, {})
 vim.keymap.set({'n', 'x'}, '<A-a>', function () require"dap".step_over() end, {})
 vim.keymap.set({'n', 'x'}, '<A-i>', function () require"dap".step_into() end, {})
 vim.keymap.set({'n', 'x'}, '<A-n>', function () require"dap".step_out() end, {})
 vim.keymap.set({'n', 'x'}, '<A-r>', function () require"dap".restart() end, {})
 vim.keymap.set({'n', 'x'}, '<A-c>', function () require"dap".continue() end, {})
--- vim.keymap.set({'n', 'x'}, '<leader>dr', "<cmd>RustLsp debug<CR>", {})
--- vim.keymap.set({'n', 'x'}, '<leader>db', "<cmd>RustLsp debug<CR>", {})
+vim.keymap.set({'n', 'x'}, '<leader>dr', "<cmd>RustLsp debug<CR>", {})
 
 
