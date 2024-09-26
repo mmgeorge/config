@@ -7,14 +7,14 @@ return {
       'nvim-lua/plenary.nvim',
       -- "nvim-tree/nvim-web-devicons",
       -- { 'nvim-telescope/telescope-fzf-native.nvim', build = 'make' },
-      "nvim-telescope/telescope-file-browser.nvim",
+      -- "nvim-telescope/telescope-file-browser.nvim",
     },
     -- lazy = false, 
     config = function()
       local actions = require "telescope.actions"
       local sorters = require('telescope.sorters')
 
-      local fb_actions = require( "telescope").extensions.file_browser.actions
+      -- local fb_actions = require( "telescope").extensions.file_browser.actions
       local open_with_trouble = require("trouble.sources.telescope").open
       -- Sorters in telescope do more than just sorting, they perform the actual filter
       -- and search & highlight as well
@@ -77,166 +77,166 @@ return {
           }
         },
         pickers = {
-          live_grep = {
-            -- theme = "dropdown",
-            layout_config = {
-              prompt_position = "top",
-              height = .8, -- maximally available lines
-              width = .8, -- maximally available columns
-            },
-            previewer = true,
-            -- disable_coordinates=true
-          },
-          find_files = {
-            theme = "ivy",
-            previewer = false,
-            find_command = {
-              'rg',
-              '--files',
-              '--color=never',
-              '--no-heading',
-              '--line-number',
-              '--column',
-              '--smart-case',
-              '--hidden',
-              '--glob',
-              '!{.git/*,target/*,node_modules/*}',
-              '--path-separator',
-              '/',
-            },
-          },
+          -- live_grep = {
+          --   -- theme = "dropdown",
+          --   layout_config = {
+          --     prompt_position = "top",
+          --     height = .8, -- maximally available lines
+          --     width = .8, -- maximally available columns
+          --   },
+          --   previewer = true,
+          --   -- disable_coordinates=true
+          -- },
+          -- find_files = {
+          --   theme = "ivy",
+          --   previewer = false,
+          --   find_command = {
+          --     'rg',
+          --     '--files',
+          --     '--color=never',
+          --     '--no-heading',
+          --     '--line-number',
+          --     '--column',
+          --     '--smart-case',
+          --     '--hidden',
+          --     '--glob',
+          --     '!{.git/*,target/*,node_modules/*}',
+          --     '--path-separator',
+          --     '/',
+          --   },
+          -- },
           current_buffer_fuzzy_find = {
             sorter = sorters.get_substr_matcher(),
             theme = "ivy",
             previewer = false,
           },
-          buffers = {
-            -- Also includes other options, could provide a custom sorting function
-            theme = "ivy",
-            previewer = false,
-            -- sorts current and last buffer to the top and selects the lastused
-            sort_lastused = true,
-            -- Sorts all buffers after most recent used. Not just the current & last one
-            sort_mru = true,
-            -- Only show buffers in the current working directory
-            only_cwd = false,
-            ignore_current_buffer = true,
-            --select_current = false,
-          },
-          lsp_document_symbols = {
-            theme = "ivy",
-            previewer = false,
-            show_line=true,
-          },
-          lsp_workspace_symbols = {
-            theme = "ivy",
-            fname_width= 45,
-            symbol_width = 25, 
-            symbol_type_width = 8, 
-            previewer = false,
-            show_line=true,
-          }
+          -- buffers = {
+          --   -- Also includes other options, could provide a custom sorting function
+          --   theme = "ivy",
+          --   previewer = false,
+          --   -- sorts current and last buffer to the top and selects the lastused
+          --   sort_lastused = true,
+          --   -- Sorts all buffers after most recent used. Not just the current & last one
+          --   sort_mru = true,
+          --   -- Only show buffers in the current working directory
+          --   only_cwd = false,
+          --   ignore_current_buffer = true,
+          --   --select_current = false,
+          -- },
+          -- lsp_document_symbols = {
+          --   theme = "ivy",
+          --   previewer = false,
+          --   show_line=true,
+          -- },
+          -- lsp_workspace_symbols = {
+          --   theme = "ivy",
+          --   fname_width= 45,
+          --   symbol_width = 25, 
+          --   symbol_type_width = 8, 
+          --   previewer = false,
+          --   show_line=true,
+          -- }
 
         },
         extensions = {
-          file_browser = {
-            disable_devicons = false,
-            -- grouped = true, 
-            theme = "ivy",
-            -- -- File tree depth to display, false for unlimited depth
-            depth = 1,
-            auto_depth = false,
-            select_buffer = true,
-            hide_parent_dir = true,
-            hidden = {
-              file_browser = true,
-              folder_browser = true, 
-            },
-            no_ignore = false,
-            follow_symlinks = false,
-            collapse_dirs = true,
-            quiet = true,
-            dir_icon = "",
-            dir_icon_hl = "",
-            display_stat = false, 
-            -- display_stat = {
-            --    date = true,
-            --    size = false,
-            --    mode = false, 
-            -- },
-            git_status = true,
-            prompt_path = false,
-            use_fd = true, 
-            -- disables netrw and use telescope-file-browser in its place
-            hijack_netrw = true,
-            mappings = {
-              ["i"] = {
-                ["<Left>"] = fb_actions.goto_parent_dir,
-                ["<Right>"] = fb_actions.change_cwd,
-                [key("<C-p>")] = fb_actions.create_from_prompt, 
-                ["<C-x>"] = fb_actions.remove, 
-                ["<C-f>"] = fb_actions.rename, 
-                ["<CR>"] = actions.select_default, 
-                -- ["<C-p>"] = fb_actions.move, 
-                ["<C-p>"] = fb_actions.move, 
-                -- ["<C-g>"] = actions.close, 
-                -- your custom insert mode mappings
-              },
-              ["n"] = {
-                ["<CR>"] = actions.select_default,
-                ["<C-p>"] = fb_actions.move, 
-                [key("a")] = fb_actions.goto_parent_dir, 
-                [key("f")] = fb_actions.change_cwd, 
-                ["<leader>f"] = fb_actions.rename, 
-                ["<C-x>"] = fb_actions.remove, 
-                -- ["<C-m>"] = fb_actions.move, 
-                ["<C-n>"] = fb_actions.create, 
-
-                -- your custom normal mode mappings
-              },
-            },
-          },
+          -- file_browser = {
+          --   disable_devicons = false,
+          --   -- grouped = true, 
+          --   theme = "ivy",
+          --   -- -- File tree depth to display, false for unlimited depth
+          --   depth = 1,
+          --   auto_depth = false,
+          --   select_buffer = true,
+          --   hide_parent_dir = true,
+          --   hidden = {
+          --     file_browser = true,
+          --     folder_browser = true, 
+          --   },
+          --   no_ignore = false,
+          --   follow_symlinks = false,
+          --   collapse_dirs = true,
+          --   quiet = true,
+          --   dir_icon = "",
+          --   dir_icon_hl = "",
+          --   display_stat = false, 
+          --   -- display_stat = {
+          --   --    date = true,
+          --   --    size = false,
+          --   --    mode = false, 
+          --   -- },
+          --   git_status = true,
+          --   prompt_path = false,
+          --   use_fd = true, 
+          --   -- disables netrw and use telescope-file-browser in its place
+          --   hijack_netrw = true,
+          --   mappings = {
+          --     ["i"] = {
+          --       ["<Left>"] = fb_actions.goto_parent_dir,
+          --       ["<Right>"] = fb_actions.change_cwd,
+          --       [key("<C-p>")] = fb_actions.create_from_prompt, 
+          --       ["<C-x>"] = fb_actions.remove, 
+          --       ["<C-f>"] = fb_actions.rename, 
+          --       ["<CR>"] = actions.select_default, 
+          --       -- ["<C-p>"] = fb_actions.move, 
+          --       ["<C-p>"] = fb_actions.move, 
+          --       -- ["<C-g>"] = actions.close, 
+          --       -- your custom insert mode mappings
+          --     },
+          --     ["n"] = {
+          --       ["<CR>"] = actions.select_default,
+          --       ["<C-p>"] = fb_actions.move, 
+          --       [key("a")] = fb_actions.goto_parent_dir, 
+          --       [key("f")] = fb_actions.change_cwd, 
+          --       ["<leader>f"] = fb_actions.rename, 
+          --       ["<C-x>"] = fb_actions.remove, 
+          --       -- ["<C-m>"] = fb_actions.move, 
+          --       ["<C-n>"] = fb_actions.create, 
+          --
+          --       -- your custom normal mode mappings
+          --     },
+          --   },
+          -- },
         }
       })
 
       -- require('telescope').load_extension('fzf')
-      require("telescope").load_extension("file_browser")
+      -- require("telescope").load_extension("file_browser")
     end,
   },
-  {
-    "fdschmidt93/telescope-egrepify.nvim",
-    dependencies = { "nvim-telescope/telescope.nvim", "nvim-lua/plenary.nvim" }, 
-    opts = { ["#"] = {
-      -- #$REMAINDER
-      -- # is caught prefix
-      -- `input` becomes $REMAINDER
-      -- in the above example #lua,md -> input: lua,md
-      flag = "glob",
-      cb = function(input)
-        return string.format([[*.{%s}]], input)
-      end,
-    },
-      -- filter for (partial) folder names
-      -- example prompt: >conf $MY_PROMPT
-      -- searches with ripgrep prompt $MY_PROMPT in paths that have "conf" in folder
-      -- i.e. rg --glob="**/conf*/**" -- $MY_PROMPT
-      [">"] = {
-        flag = "glob",
-        cb = function(input)
-          return string.format([[**/{%s}*/**]], input)
-        end,
-      },
-      -- filter for (partial) file names
-      -- example prompt: &egrep $MY_PROMPT
-      -- searches with ripgrep prompt $MY_PROMPT in paths that have "egrep" in file name
-      -- i.e. rg --glob="*egrep*" -- $MY_PROMPT
-      ["&"] = {
-        flag = "glob",
-        cb = function(input)
-          return string.format([[*{%s}*]], input)
-        end,
-      }
-    } 
-  }
+  -- {
+  --   "fdschmidt93/telescope-egrepify.nvim",
+  --   dependencies = { "nvim-telescope/telescope.nvim", "nvim-lua/plenary.nvim" }, 
+  --   opts = { ["#"] = {
+  --     -- #$REMAINDER
+  --     -- # is caught prefix
+  --     -- `input` becomes $REMAINDER
+  --     -- in the above example #lua,md -> input: lua,md
+  --     flag = "glob",
+  --     cb = function(input)
+  --       return string.format([[*.{%s}]], input)
+  --     end,
+  --   },
+  --     -- filter for (partial) folder names
+  --     -- example prompt: >conf $MY_PROMPT
+  --     -- searches with ripgrep prompt $MY_PROMPT in paths that have "conf" in folder
+  --     -- i.e. rg --glob="**/conf*/**" -- $MY_PROMPT
+  --     [">"] = {
+  --       flag = "glob",
+  --       cb = function(input)
+  --         return string.format([[**/{%s}*/**]], input)
+  --       end,
+  --     },
+  --     -- filter for (partial) file names
+  --     -- example prompt: &egrep $MY_PROMPT
+  --     -- searches with ripgrep prompt $MY_PROMPT in paths that have "egrep" in file name
+  --     -- i.e. rg --glob="*egrep*" -- $MY_PROMPT
+  --     ["&"] = {
+  --       flag = "glob",
+  --       cb = function(input)
+  --         return string.format([[*{%s}*]], input)
+  --       end,
+  --     }
+  --   } 
+  -- }
 }
 

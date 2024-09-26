@@ -69,6 +69,16 @@ return {
         desc = "Search Functions",
       }, 
       {
+        "oy",
+        function ()
+          require"mini.pick".registry.visit_paths({
+            -- filter = "project",
+          }) 
+        end,
+        mode = { "n", "x" },
+        desc = "Search Buffer",
+      },
+      {
         "Sr",
         function ()
           require"mini.pick".registry.spellsuggest({
