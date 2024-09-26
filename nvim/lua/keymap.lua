@@ -14,6 +14,7 @@ vim.g.clipboard = {
 }
 
 -- Unmaps -
+vim.keymap.set({'n', 'x'}, 'B', '<Nop>', {})
 vim.keymap.set({'n', 'x'}, 'o', '<Nop>', {})
 vim.keymap.set({'n', 'x'}, 'q', '<Nop>', {})
 -- keymap({'n', 'v'}, 'xo', '<Nop>')
@@ -114,7 +115,7 @@ vim.keymap.set({'n'}, 'ls.', 'viwqqc{}<Esc>Pq', { nowait=true, silent=false })
 
 -- Spellcheck
 vim.keymap.set({'n'}, 'Sa', 'zg', { nowait=true, silent=false })  -- Add spell check word
-vim.keymap.set({'n'}, 'Sr', 'z=', { nowait=true, silent=false }) 
+-- vim.keymap.set({'n'}, 'Sr', 'z=', { nowait=true, silent=false }) 
 -- vim.keymap.set({'x'}, '(', 'S)')
 
 -- Commands
@@ -124,7 +125,7 @@ k.keymap_leader({'x', 'n'}, 'p', "\"+P") -- Paste to clipboard
 k.keymap_leader({'n', 'v'}, 's', ":%s/\\<<C-r><C-w>\\>/<C-r><C-w>/gI<Left><Left><Left>")
 -- k.keymap_leader({'n', 'v'}, 's', ":%s/\\<<C-r><C-w>\\>/<C-r><C-w>/gI<Left><Left><Left>")
 k.keymap_leader({'n', 'v'}, 'iu', function() require("utils").insert_v4({}) end)
-k.keymap_leader({'n', 'v'}, 't', 'gg=G')
+-- k.keymap_leader({'n', 'v'}, 't', 'gg=G')
 
 vim.keymap.set("n", "<leader>f", function()
   return ":IncRename " .. vim.fn.expand("<cword>")
@@ -138,7 +139,7 @@ end
 )
 
 -- Buffer
-vim.keymap.set({'n', 'x'}, "<leader>" .. "bj", ":bd<cr>", { nowait=true, silent=false })
+-- vim.keymap.set({'n', 'x'}, "<leader>" .. "bj", ":bd<cr>", { nowait=true, silent=false })
 
 ---- Jump quickfix
 -- keymap('n', '<leader>k', "<cmd>lnext<CR>zz") -- Paste over (don't add to clipboard)
@@ -188,18 +189,18 @@ end)
 -- k.keymap('n', 'ow', vim.lsp.buf.rename) 
 
 k.keymap({'n', 'x'}, '<C-f>', require("plugins.telescope.occur").occur_in_file)
-k.keymap({'n', 'x'}, 'of', require("telescope.builtin").find_files)
-k.keymap({'n', 'x'}, 'od', require("telescope.builtin").live_grep)
-k.keymap({'n', 'x'}, 'os', require("telescope.builtin").buffers)
-k.keymap({'n', 'x'}, 'oa', "<CMD>Telescope file_browser path=%:p:h select_buffer=true<CR>")
-k.keymap({'n', 'x'}, 'oo', require("telescope.builtin").lsp_document_symbols)
-k.keymap({'n', 'x'}, 'ows', require("telescope.builtin").lsp_workspace_symbols)
-k.keymap({'n', 'x'}, 'opp', vim.lsp.buf.list_workspace_folders)
-k.keymap({'n', 'x'}, 'oq', function()
-  vim.lsp.buf.format {
-    filter = function(client) return client.name ~= "tsserver" end
-  }
-end)
+-- k.keymap({'n', 'x'}, 'of', require("telescope.builtin").find_files)
+-- k.keymap({'n', 'x'}, 'od', require("telescope.builtin").live_grep)
+-- k.keymap({'n', 'x'}, 'os', require("telescope.builtin").buffers)
+-- k.keymap({'n', 'x'}, 'oa', "<CMD>Telescope file_browser path=%:p:h select_buffer=true<CR>")
+-- k.keymap({'n', 'x'}, 'oo', require("telescope.builtin").lsp_document_symbols)
+-- k.keymap({'n', 'x'}, 'ows', require("telescope.builtin").lsp_workspace_symbols)
+-- k.keymap({'n', 'x'}, 'opp', vim.lsp.buf.list_workspace_folders)
+-- k.keymap({'n', 'x'}, 'oq', function()
+  -- vim.lsp.buf.format {
+    -- filter = function(client) return client.name ~= "tsserver" end
+  -- }
+-- end)
 
 -- keymap({'n', 'v'}, 'or', require("telescope.builtin").resume, { nowait=true })
 
@@ -214,3 +215,18 @@ k.keymap('n', '<C-q>', '<CMD>x<CR>')
 k.keymap('n', '<S-C-e>', function() vim.diagnostic.goto_prev() end)
 k.keymap('n', '<C-s>', '<CMD>w<CR>') -- Save file
 k.keymap('i', '<C-s>', '<C-o>:w<CR>') -- Save file
+
+-- vim.keymap.set({'n', 'x'}, 'B', function () require"dap".toggle_breakpoint() end, {})
+-- vim.keymap.set({'n', 'x'}, 'T', function () require"dap".step_over() end, {})
+-- vim.keymap.set({'n', 'x'}, 'H', function () require"dap".step_into() end, {})
+-- vim.keymap.set({'n', 'x'}, 'R', function () require"dap".step_out() end, {})
+vim.keymap.set({'n', 'x'}, 'B', function () require"dap".toggle_breakpoint() end, {})
+vim.keymap.set({'n', 'x'}, '<A-a>', function () require"dap".step_over() end, {})
+vim.keymap.set({'n', 'x'}, '<A-i>', function () require"dap".step_into() end, {})
+vim.keymap.set({'n', 'x'}, '<A-n>', function () require"dap".step_out() end, {})
+vim.keymap.set({'n', 'x'}, '<A-r>', function () require"dap".restart() end, {})
+vim.keymap.set({'n', 'x'}, '<A-c>', function () require"dap".continue() end, {})
+-- vim.keymap.set({'n', 'x'}, '<leader>dr', "<cmd>RustLsp debug<CR>", {})
+-- vim.keymap.set({'n', 'x'}, '<leader>db', "<cmd>RustLsp debug<CR>", {})
+
+
