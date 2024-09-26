@@ -14,9 +14,12 @@ vim.opt.statuscolumn = "%l %=%s" -- %= means right align
 vim.opt.signcolumn = 'yes'
 vim.o.scrolloff = 0
 vim.o.swapfile = false
+vim.o.splitbelow = true
 vim.opt.spell = true
 vim.opt.spelllang = { "en_us" }
 vim.opt.spelloptions = "camel"
+vim.opt.ignorecase = true
+vim.opt.smartcase = true
 
 vim.g.rust_recommended_style = '0' -- Otherwise will override indentation settings
 

@@ -130,19 +130,26 @@ return {
         -- Configuration for the floating window in oil.open_float
         float = {
           -- Padding around the floating window
-          padding = 6,
+          padding = 0,
           max_width = 0,
-          max_height = 0,
+          max_height = 30,
           border = "rounded",
           win_options = {
             winblend = 0,
           },
           -- preview_split: Split direction: "auto", "left", "right", "above", "below".
-          preview_split = "below",
+          preview_split = "above",
           -- This is the config that will be passed to nvim_open_win.
           -- Change values here to customize the layout
           override = function(conf)
             return conf
+            -- return {
+            --   relative = "win", 
+            --   row = 3, 
+            --   col = 3, 
+            --   width = 12,
+            --   height = 12
+            -- }
           end,
         },
         -- Configuration for the actions floating preview window
@@ -150,7 +157,7 @@ return {
           -- Width dimensions can be integers or a float between 0 and 1 (e.g. 0.4 for 40%)
           -- min_width and max_width can be a single value or a list of mixed integer/float types.
           -- max_width = {100, 0.8} means "the lesser of 100 columns or 80% of total"
-          max_width = 0.9,
+          max_width = 1.,
           -- min_width = {40, 0.4} means "the greater of 40 columns or 40% of total"
           min_width = { 40, 0.4 },
           -- optionally define an integer/float for the exact width of the preview window

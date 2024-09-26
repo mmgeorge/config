@@ -154,7 +154,8 @@ return {
       vim.g.rustaceanvim = {
         -- Plugin configuration
         tools = {
-          enable_clippy = false
+          enable_clippy = false, 
+          test_executor = "background"
         },
         -- LSP configuration
         server = {
