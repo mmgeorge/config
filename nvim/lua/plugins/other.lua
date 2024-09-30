@@ -22,6 +22,11 @@ return {
             context = "screenshot" -- optional
           },
           {
+            pattern = "/esri/(.*)/([^.]*).ts$",
+            target = "/tests/performanceUnitTests/esri/%1/%2.spec.ts",
+            context = "performance" -- optional
+          },
+          {
             pattern = "/tests/.*/esri/(.*)/(.*).spec.ts$",
             target = "/esri/%1/%2.ts",
             context = "source" -- optional
