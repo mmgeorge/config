@@ -179,7 +179,7 @@ k.keymap('n', '.', '<CMD>Glance definitions<CR>')
 k.keymap('n', 'or', '<CMD>Glance references<CR>') 
 k.keymap('n', 'ot', '<CMD>Glance type_definitions<CR>') 
 -- k.keymap('n', 'oi', '<CMD>Glance implementations<CR>') 
-vim.keymap.set('n', 'oi', '<CMD>Glance implementations<CR>') 
+-- vim.keymap.set('n', 'oi', '<CMD>Glance implementations<CR>') 
 k.keymap({'n', 'x'}, 'ou', function() vim.diagnostic.open_float(nil, { focus = false }) end)
 
 
