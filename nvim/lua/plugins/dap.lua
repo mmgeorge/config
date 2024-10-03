@@ -51,7 +51,8 @@ return {
       {
         "oi",
         function ()
-          require"dap".toggle_breakpoint() 
+          -- require"dap.ui.widgets".hover() 
+          require"dap.ui.widgets".hover() 
         end,
         mode = { "n", "x" },
         desc = "Set breakpoint",
