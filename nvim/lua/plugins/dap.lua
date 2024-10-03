@@ -34,8 +34,22 @@ return {
       --   mode = { "n", "x" },
       --   desc = "Step Into",
       -- },
+      -- {
+      --   "a",
+      --   "5<C-e>",
+      --   mode = { "n", "x" },
+      --   desc = "Down (dap ovrriged)",
+      -- },
       {
         "B",
+        function ()
+          require"dap".toggle_breakpoint() 
+        end,
+        mode = { "n", "x" },
+        desc = "Set breakpoint",
+      }, 
+      {
+        "oi",
         function ()
           require"dap".toggle_breakpoint() 
         end,
@@ -82,6 +96,9 @@ return {
     },
     config = function ()
       local dap = require "dap"
+      local dapui = require"dap.ui"
+      
+      vim.api.nvim_set_keymap('n', 'a', '5<C-e>', { noremap = true, silent = true })
       local codelldb_path = vim.fn.stdpath("data") .. "\\mason\\packages\\codelldb\\extension\\adapter\\codelldb.exe" 
       
       dap.defaults.fallback.terminal_win_cmd = '10split new'
@@ -118,7 +135,28 @@ return {
         end,
         mode = { "n", "x" },
         desc = "Browse breakpoints",
-      }
+      },
+      {
+        "<leader>do",
+        function ()
+          require('dapui').toggle()        end,
+        mode = { "n", "x" },
+        desc = "Browse breakpoints",
+      },
+      -- {
+      --   "<leader>ds",
+      --   function ()
+      --     require('dapui').float_element("scopes", {
+      --       title = "Scopes",
+      --       enter = true,
+      --       height = 15, 
+      --       width = 60, 
+      --       position = "center"
+      --     }) 
+      --   end,
+      --   mode = { "n", "x" },
+      --   desc = "Browse Scopes",
+      -- },
     },
     config = function () 
       require("dapui").setup({
@@ -158,38 +196,38 @@ return {
           expanded = ""
         },
         layouts = { 
+          -- {
+          --   elements = { 
+          --     {
+          --       id = "watches",
+          --       size = 0.25
+          --     }, 
+          --     {
+          --       id = "stacks",
+          --       size = 0.25
+          --     }, 
+          --     {
+          --       id = "scopes",
+          --       size = 0.25
+          --     },
+          --     {
+          --       id = "breakpoints",
+          --       size = 0.10
+          --     }, 
+          --   },
+          --   position = "right",
+          --   size = 35
+          -- }, 
           {
             elements = { 
-              {
-                id = "watches",
-                size = 0.25
-              }, 
-              {
-                id = "stacks",
-                size = 0.25
-              }, 
               {
                 id = "scopes",
-                size = 0.25
-              },
-              {
-                id = "breakpoints",
-                size = 0.10
+                size = 1
               }, 
-            },
-            position = "right",
-            size = 35
-          }, 
-          {
-            elements = { 
-              {
-                id = "repl",
-                size = 0.5
-              }, 
-              {
-                id = "console",
-                size = 0.5
-              }
+              -- {
+              --   id = "console",
+              --   size = 0.5
+              -- }
             },
             position = "bottom",
             size = 20
@@ -198,13 +236,13 @@ return {
         mappings = {
           edit = "de",
           expand = {
-            -- "<Tab>",
-            "<2-LeftMouse>",
+            "<CR>",
+            -- "<2-LeftMouse>",
           },
-          open = "<CR>",
+          open = "<A-CR>",
           remove = "jj",
           repl = "dr",
-          toggle = "<Tab>",
+          toggle = "<S-A-CR>",
         },
         render = {
           indent = 1,
