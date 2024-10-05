@@ -1532,16 +1532,16 @@ return {
     'echasnovski/mini.pick',
     version = '*',
     keys = {
-      {
-        "or",
-        function ()
-          require"mini.pick".registry.explorer({
-            cwd = vim.fn.expand('%:p:h')
-          }) 
-        end,
-        mode = { "n", "x" },
-        desc = "Explore Files",
-      }, 
+      -- {
+      --   "or",
+      --   function ()
+      --     require"mini.pick".registry.explorer({
+      --       cwd = vim.fn.expand('%:p:h')
+      --     }) 
+      --   end,
+      --   mode = { "n", "x" },
+      --   desc = "Explore Files",
+      -- }, 
       {
         "os",
         function ()

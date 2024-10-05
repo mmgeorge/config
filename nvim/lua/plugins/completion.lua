@@ -151,17 +151,29 @@ var esriConfig = {
           pos = get_position_before_postfix()
         })
 
-        while node do 
-          local ty = node:type()
+        local function is_type(ty)
           if 
             ty == "primitive_type" or 
             ty == "scoped_type_identifier" or 
             ty == "generic_type" or 
             ty == "type_identifier"  then
-            return node
+            return true
           end 
+         
+          return false
+        end
 
-          node = node:parent()
+        while node do 
+          local ty = node:type()
+          
+          local parent = node:parent(); 
+          local parent_ty = parent and parent:type()
+
+          if is_type(ty) and not is_type(parent_ty) then
+            return node
+          end
+         
+          node = parent
         end 
 
         return nil
@@ -248,6 +260,13 @@ var esriConfig = {
             end 
           }),
           postfix({ 
+            trigger = 'arc', 
+            node = type_node, 
+            body = function (text)
+              return "Arc<" .. text .. ">" 
+            end 
+          }),
+           postfix({ 
             trigger = 'amut', 
             node = type_node, 
             body = function (text)
