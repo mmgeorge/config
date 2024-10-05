@@ -20,13 +20,16 @@ vim.opt.spelllang = { "en_us" }
 vim.opt.spelloptions = "camel"
 vim.opt.ignorecase = true
 vim.opt.smartcase = true
+vim.o.fileformat = "unix"
 -- vim.opt.shellslash = true
+
 
 vim.g.rust_recommended_style = '0' -- Otherwise will override indentation settings
 
 -- r = Continue comment on enter
 -- o = Continue comment on o
 vim.cmd('autocmd BufEnter * set formatoptions+=roj')
+vim.cmd('autocmd BufRead,BufNewFile * set fileformat=unix')
 
 -- Disable auto comment
 vim.cmd('autocmd BufEnter * set formatoptions-=cro')

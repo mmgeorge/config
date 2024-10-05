@@ -28,7 +28,7 @@ return {
           -- only if the exit code is 0.
           quit_on_exit = "never",
           -- open the toggleterm window when a task starts
-          open_on_start = true,
+          open_on_start = false,
           -- mirrors the toggleterm "hidden" parameter, and keeps the task from
           -- being rendered in the toggleable window
           hidden = false,
@@ -60,7 +60,7 @@ return {
           min_height = 8,
           height = nil,
           -- String that separates tasks
-          separator = "컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴",
+          -- separator = "컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴",
           -- Default direction. Can be "left", "right", or "bottom"
           direction = "bottom",
           -- Set keymap to false to remove default behavior

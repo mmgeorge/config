@@ -1700,52 +1700,51 @@ return {
           preview = nil,
 
           choose        = nil,
-          choose_marked = function(items, opts)
-            if not H.islist(items) then H.error('`items` should be an array') end
-            if #items == 0 then return end
-            opts = vim.tbl_deep_extend('force', { list_type = 'quickfix' }, opts or {})
-
-            -- Construct a potential quickfix/location list
-            local list = {}
-            for _, item in ipairs(items) do
-              local item_data = H.parse_item(item)
-              if item_data.type == 'file' or item_data.type == 'buffer' or item_data.type == 'uri' then
-                local is_uri, uri_path = pcall(vim.uri_to_fname, item_data.path)
-                local entry = { bufnr = item_data.buf_id, filename = is_uri and uri_path or item_data.path }
-                entry.lnum, entry.col, entry.text = item_data.lnum or 1, item_data.col or 1, item_data.text or ''
-                entry.end_lnum, entry.end_col = item_data.end_lnum, item_data.end_col
-                table.insert(list, entry)
-              end
-            end
-
-            -- Fall back to choosing first item if no quickfix list was constructed
-            local is_active = MiniPick.is_picker_active()
-            if #list == 0 then
-              if not is_active then return end
-              local choose = MiniPick.get_picker_opts().source.choose
-              return choose(items[1])
-            end
-
-            -- Set as quickfix or location list
-            local title = '<No picker>'
-            if is_active then
-              ---@diagnostic disable:param-type-mismatch
-              local source_name, prompt = MiniPick.get_picker_opts().source.name, table.concat(MiniPick.get_picker_query())
-              title = source_name .. (prompt == '' and '' or (' : ' .. prompt))
-            end
-            local list_data = { items = list, title = title, nr = '$' }
-
-            if opts.list_type == 'location' then
-              local win_target = MiniPick.get_picker_state().windows.target
-              if not H.is_valid_win(win_target) then win_target = H.get_first_valid_normal_window() end
-              vim.fn.setloclist(win_target, {}, ' ', list_data)
-              vim.schedule(function() vim.cmd('lopen') end)
-            else
-              vim.fn.setqflist({}, ' ', list_data)
-              vim.schedule(function() vim.cmd('Trouble qflist') end)
-            end
-          end
-,
+        --   choose_marked = function(items, opts)
+        --     if not H.islist(items) then H.error('`items` should be an array') end
+        --     if #items == 0 then return end
+        --     opts = vim.tbl_deep_extend('force', { list_type = 'quickfix' }, opts or {})
+        --
+        --     -- Construct a potential quickfix/location list
+        --     local list = {}
+        --     for _, item in ipairs(items) do
+        --       local item_data = H.parse_item(item)
+        --       if item_data.type == 'file' or item_data.type == 'buffer' or item_data.type == 'uri' then
+        --         local is_uri, uri_path = pcall(vim.uri_to_fname, item_data.path)
+        --         local entry = { bufnr = item_data.buf_id, filename = is_uri and uri_path or item_data.path }
+        --         entry.lnum, entry.col, entry.text = item_data.lnum or 1, item_data.col or 1, item_data.text or ''
+        --         entry.end_lnum, entry.end_col = item_data.end_lnum, item_data.end_col
+        --         table.insert(list, entry)
+        --       end
+        --     end
+        --
+        --     -- Fall back to choosing first item if no quickfix list was constructed
+        --     local is_active = MiniPick.is_picker_active()
+        --     if #list == 0 then
+        --       if not is_active then return end
+        --       local choose = MiniPick.get_picker_opts().source.choose
+        --       return choose(items[1])
+        --     end
+        --
+        --     -- Set as quickfix or location list
+        --     local title = '<No picker>'
+        --     if is_active then
+        --       ---@diagnostic disable:param-type-mismatch
+        --       local source_name, prompt = MiniPick.get_picker_opts().source.name, table.concat(MiniPick.get_picker_query())
+        --       title = source_name .. (prompt == '' and '' or (' : ' .. prompt))
+        --     end
+        --     local list_data = { items = list, title = title, nr = '$' }
+        --
+        --     if opts.list_type == 'location' then
+        --       local win_target = MiniPick.get_picker_state().windows.target
+        --       if not H.is_valid_win(win_target) then win_target = H.get_first_valid_normal_window() end
+        --       vim.fn.setloclist(win_target, {}, ' ', list_data)
+        --       vim.schedule(function() vim.cmd('lopen') end)
+        --     else
+        --       vim.fn.setqflist({}, ' ', list_data)
+        --       vim.schedule(function() vim.cmd('Trouble qflist') end)
+        --     end
+        --   end,
         },
 
         -- Window related options
