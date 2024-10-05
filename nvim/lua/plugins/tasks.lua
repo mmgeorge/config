@@ -6,7 +6,20 @@ return {
       { "rcarriga/nvim-notify" },
       { "stevearc/dressing.nvim" },
     },
-
+    keys = {
+      {
+        "<leader>tr",
+        "<cmd>OverseerRun<CR>",
+        mode = { "n", "x" },
+        desc = "Run Task",
+      }, 
+      {
+        "<leader>tt",
+        "<cmd>OverseerToggle<CR>",
+        mode = { "n", "x" },
+        desc = "Toggle Tasks",
+      }, 
+    },
     config = function ()
       require("overseer").setup({
         strategy = {
