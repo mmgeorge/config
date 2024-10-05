@@ -74,15 +74,27 @@ return {
 
         -- Priority list of preferred vim.select implementations
         -- backend = { "telescope", "fzf_lua", "fzf", "builtin", "nui" },
+        -- backend = { "telescope", "builtin", "nui"  },
         backend = { "telescope", "builtin", "nui"  },
+        -- backend = { "nui" },
 
         -- Trim trailing `:` from prompt
         trim_prompt = true,
 
         -- Options for telescope selector
         -- These are passed into the telescope picker directly. Can be used like:
-        -- telescope = require('telescope.themes').get_ivy({...})
-        telescope = nil,
+        telescope = require('telescope.themes').get_ivy({
+          layout_config = {
+            -- prompt_position = "top",
+            -- height = 15,
+          },
+        }),
+        -- telescope = require('telescope.themes').get_dropdown({
+        --   layout_config = {
+        --     prompt_position = "top",
+        --     height = 15,
+        --   },
+        -- }),
 
         -- Options for fzf selector
         fzf = {
@@ -139,11 +151,12 @@ return {
           -- These can be integers or a float between 0 and 1 (e.g. 0.4 for 40%)
           -- the min_ and max_ options can be a list of mixed types.
           -- max_width = {140, 0.8} means "the lesser of 140 columns or 80% of total"
-          width = nil,
-          max_width = { 140, 0.8 },
-          min_width = { 40, 0.2 },
+          width = ".8",
+          -- max_width = { 500, 0.8 },
+          -- max_width = { 500, 0.8 },
+          -- min_width = { 40, 0.2 },
           height = nil,
-          max_height = 0.9,
+          max_height = 0.2,
           min_height = { 10, 0.2 },
 
           -- Set to `false` to disable

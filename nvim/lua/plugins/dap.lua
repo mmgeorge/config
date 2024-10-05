@@ -41,6 +41,12 @@ return {
       --   desc = "Down (dap ovrriged)",
       -- },
       {
+        "<leader>dr",
+        "<cmd>RustLsp debug<CR>",
+        mode = { "n", "x" },
+        desc = "Run Debug",
+      }, 
+      {
         "B",
         function ()
           require"dap".toggle_breakpoint() 
@@ -98,8 +104,27 @@ return {
     config = function ()
       local dap = require "dap"
       local dapui = require"dap.ui"
+     
+      vim.api.nvim_create_autocmd("FileType", {
+        pattern = "dap-float",
+        callback = function()
+          local lhs = "a"
+          local keymaps = vim.api.nvim_buf_get_keymap(0, "n")
+          local keymap_exists = false
+          
+          for _, keymap in ipairs(keymaps) do
+            if keymap.lhs == lhs then
+              keymap_exists = true
+              break
+            end
+          end
+
+          if keymap_exists then 
+            vim.api.nvim_buf_del_keymap(0, "n", "a")
+          end
+        end,
+      })      
       
-      vim.api.nvim_set_keymap('n', 'a', '5<C-e>', { noremap = true, silent = true })
       local codelldb_path = vim.fn.stdpath("data") .. "\\mason\\packages\\codelldb\\extension\\adapter\\codelldb.exe" 
       
       dap.defaults.fallback.terminal_win_cmd = '10split new'

@@ -224,6 +224,6 @@ vim.keymap.set({'n', 'x'}, '<A-i>', function () require"dap".step_into() end, {}
 vim.keymap.set({'n', 'x'}, '<A-n>', function () require"dap".step_out() end, {})
 vim.keymap.set({'n', 'x'}, '<A-r>', function () require"dap".restart() end, {})
 vim.keymap.set({'n', 'x'}, '<A-c>', function () require"dap".continue() end, {})
-vim.keymap.set({'n', 'x'}, '<leader>dr', "<cmd>RustLsp debug<CR>", {})
+-- vim.keymap.set({'n', 'x'}, '<leader>dr', "<cmd>RustLsp debug<CR>", {})
 
 
