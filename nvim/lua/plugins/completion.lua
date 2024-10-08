@@ -266,6 +266,34 @@ var esriConfig = {
               return "Arc<" .. text .. ">" 
             end 
           }),
+          postfix({ 
+            trigger = 'rl', 
+            node = type_node, 
+            body = function (text)
+              return "RwLock<" .. text .. ">" 
+            end 
+          }),
+          postfix({ 
+            trigger = 'rl', 
+            node = expr_node, 
+            body = function (text)
+              return "RwLock::new(" .. text .. ")" 
+            end 
+          }),
+          postfix({ 
+            trigger = 'mut', 
+            node = type_node, 
+            body = function (text)
+              return "Mutex<" .. text .. ">" 
+            end 
+          }),
+          postfix({ 
+            trigger = 'mut', 
+            node = expr_node, 
+            body = function (text)
+              return "Mutex::new(" .. text .. ")" 
+            end 
+          }),
            postfix({ 
             trigger = 'amut', 
             node = type_node, 
