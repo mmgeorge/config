@@ -15,7 +15,7 @@ local keys = {
 --      *              
   'd', '',  '',  '',  '', 
 -- *    h   up  down   l                   
-  'n', '^', ',', ';', '$'
+  'z', '^', ',', ';', '$'
 --      *         *    *      (start line, back, lsp-ref, end line)
 }
 
