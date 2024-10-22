@@ -114,6 +114,8 @@ vim.keymap.set({'n'}, 'ls,', 'viwqqc<><Esc>Pq', { nowait=true, silent=false })
 vim.keymap.set({'n'}, 'ls[', 'viwqqc[]<Esc>Pq', { nowait=true, silent=false }) 
 vim.keymap.set({'n'}, 'ls.', 'viwqqc{}<Esc>Pq', { nowait=true, silent=false }) 
 
+vim.keymap.set({'n'}, 'zz', 'zf', { nowait=true, silent=false })  -- Add spell check word
+
 -- Spellcheck
 vim.keymap.set({'n'}, 'Sa', 'zg', { nowait=true, silent=false })  -- Add spell check word
 -- vim.keymap.set({'n'}, 'Sr', 'z=', { nowait=true, silent=false }) 
