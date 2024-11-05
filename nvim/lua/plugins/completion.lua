@@ -267,6 +267,20 @@ var esriConfig = {
             end 
           }),
           postfix({ 
+            trigger = 'rf', 
+            node = type_node, 
+            body = function (text)
+              return "RefCell<" .. text .. ">" 
+            end 
+          }),
+          postfix({ 
+            trigger = 'rf', 
+            node = expr_node, 
+            body = function (text)
+              return "RefCell::new(" .. text .. ")" 
+            end 
+          }),
+          postfix({ 
             trigger = 'rl', 
             node = type_node, 
             body = function (text)
@@ -294,7 +308,7 @@ var esriConfig = {
               return "Mutex::new(" .. text .. ")" 
             end 
           }),
-           postfix({ 
+          postfix({ 
             trigger = 'amut', 
             node = type_node, 
             body = function (text)
@@ -630,6 +644,14 @@ var esriConfig = {
       })  
 
       require('lspconfig')['lua_ls'].setup({
+        capabilities = capabilities
+      })
+      
+      require('lspconfig')['tailwindcss'].setup({
+        capabilities = capabilities
+      })
+      
+      require('lspconfig')['cssls'].setup({
         capabilities = capabilities
       })
 
