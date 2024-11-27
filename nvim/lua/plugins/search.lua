@@ -8,7 +8,7 @@ return {
           require('grug-far').with_visual_selection() 
         end,
         mode = { "n", "x" },
-        desc = "Oil file browser",
+        desc = "Search and replace",
       }
     },
     config = function()

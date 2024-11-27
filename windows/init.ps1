@@ -2,7 +2,7 @@
 
 Update-TypeData -PrependPath D:\config\windows\Types.ps1xml  
 
-Set-PSReadlineKeyHandler -Key Tab -Function MenuComplete
+# Set-PSReadlineKeyHandler -Key Tab -Function MenuComplete
 
 Register-ArgumentCompleter -Native -CommandName winget -ScriptBlock {
   param($wordToComplete, $commandAst, $cursorPosition)

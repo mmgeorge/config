@@ -18,9 +18,9 @@ return {
         -- Customization of shown content
         content = {
           -- Predicate for which file system entries to show
-          filter = function (fs_entry)
-            return not string.find(fs_entry.name, "%.js")
-          end,
+          -- filter = function (fs_entry)
+            -- return not string.find(fs_entry.name, "%.js")
+          -- end,
       
           -- What prefix to show to the left of file system entry
           prefix = nil,
