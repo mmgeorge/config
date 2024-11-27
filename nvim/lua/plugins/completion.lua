@@ -642,6 +642,15 @@ var esriConfig = {
         on_attach = function () end,
         capabilities = capabilities
       })  
+      
+      require("lspconfig")['terraformls'].setup({
+        on_attach = function () end,
+        capabilities = capabilities
+      })  
+      
+      require('lspconfig')['lua_ls'].setup({
+        capabilities = capabilities
+      })
 
       require('lspconfig')['lua_ls'].setup({
         capabilities = capabilities

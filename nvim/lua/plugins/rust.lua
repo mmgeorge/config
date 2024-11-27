@@ -178,6 +178,7 @@ return {
           default_settings = {
             ['rust-analyzer'] = {
               ["cargo"] = {
+                ["allTargets"] = true,
                 ["allFeatures"] = true,
                 ["extraEnv"] = {
                   ["CARGO_TARGET_DIR"] = "target/check",
