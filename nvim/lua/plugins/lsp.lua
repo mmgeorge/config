@@ -12,7 +12,15 @@ return {
     "williamboman/mason-lspconfig.nvim",
     config = function()
       require("mason-lspconfig").setup({
-        ensure_installed = { "lua_ls", "tsserver", "eslint", "rust_analyzer", "terraformls" }
+        automatic_installation = true,
+        ensure_installed = {
+          "lua_ls",
+          "ts_ls",
+          "eslint",
+          -- "rust_analyzer",
+          "terraformls",
+          "tailwindcss",
+        }
 
       })
     end
@@ -25,7 +33,7 @@ return {
       require("mason-tool-installer").setup({
         -- ensure_installed = { "stylua", "prettierd" },
         ensure_installed = { "prettierd" },
-        auto_update = false,
+        auto_update = true,
         run_on_start = true,
         debounce_hours = 5, 
       })

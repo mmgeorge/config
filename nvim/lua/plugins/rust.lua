@@ -149,7 +149,7 @@ return {
   -- },
   {
     'mrcjkb/rustaceanvim',
-    version = '^4', -- Recommended
+    version = '^5', -- Recommended
     lazy = false, -- This plugin is already lazy
     config = function ()
       -- local cfg = require('rustaceanvim.config')
@@ -177,6 +177,7 @@ return {
           end,
           default_settings = {
             ['rust-analyzer'] = {
+              -- ['checkOnSave'] = false,
               ["cargo"] = {
                 ["allTargets"] = true,
                 ["allFeatures"] = true,
