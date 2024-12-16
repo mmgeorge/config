@@ -251,7 +251,30 @@ return {
         name = "Tsc FastWatch", 
         builder = function ()
           return {
-            cmd = {"npx", "tsc", "--watch", "--assumeChangesOnlyAffectDirectDependencies" },
+            cmd = {"npx", "tsc", "--watch", "--assumeChangesOnlyAffectDirectDependencies --noEmit" },
+            components = {
+              {
+                "on_output_parse", 
+                problem_matcher = "$tsc-watch"
+              }, 
+              "default",
+              "on_result_notify",
+              "on_result_diagnostics",
+              "on_complete_restart", 
+              "on_exit_set_status", 
+            },
+            env = {
+              NODE_OPTIONS = "--max-old-space-size=8192" 
+            },
+          }
+        end
+      }) 
+      
+      require("overseer").register_template({
+        name = "Tsc Watch", 
+        builder = function ()
+          return {
+            cmd = {"npx", "tsc", "--watch", "--noEmit", "-p", "tsconfig.app.json" },
             components = {
               {
                 "on_output_parse", 
