@@ -19,7 +19,8 @@ return {
           "eslint",
           -- "rust_analyzer",
           "terraformls",
-          "tailwindcss",
+          -- "tailwind-language-server",
+          -- "tailwindcss",
         }
 
       })
