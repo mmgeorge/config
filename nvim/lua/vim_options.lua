@@ -39,7 +39,7 @@ vim.g.rust_recommended_style = '0' -- Otherwise will override indentation settin
 -- r = Continue comment on enter
 -- o = Continue comment on o
 vim.cmd('autocmd BufEnter * set formatoptions+=roj')
--- vim.cmd('autocmd BufRead,BufNewFile * set fileformat=unix')
+vim.cmd('autocmd BufRead,BufNewFile * set fileformat=unix')
 
 -- Disable auto comment
 vim.cmd('autocmd BufEnter * set formatoptions-=cro')
