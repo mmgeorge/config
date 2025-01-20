@@ -652,13 +652,9 @@ var esriConfig = {
         capabilities = capabilities
       })
 
-      require('lspconfig')['lua_ls'].setup({
+      require('lspconfig')['tailwindcss'].setup({
         capabilities = capabilities
       })
-      
-      -- require('lspconfig')['tailwindcss'].setup({
-      --   capabilities = capabilities
-      -- })
       
       require('lspconfig')['cssls'].setup({
         capabilities = capabilities
