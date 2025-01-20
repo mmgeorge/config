@@ -28,6 +28,17 @@ return {
           tsserver_file_preferences = {
             importModuleSpecifierPreference = "non-relative",
             includeCompletionsForModuleExports  = true,
+            autoImportSpecifierExcludeRegexes = {
+              "node_modules/lucide-solid",
+              "lucide-solid$",
+              "lucide-solid/icons/index",
+              "solid-js/types",
+              "solid-js/web/types",
+              "solid-js/store/types/server",
+            }
+            -- autoImportFileExcludePatterns = {
+              -- "lucide-solid"
+            -- }
           },
           -- locale of all tsserver messages, supported locales you can find here:
           -- https://github.com/microsoft/TypeScript/blob/3c221fc086be52b19801f6e8d82596d04607ede6/src/compiler/utilitiesPublic.ts#L620
