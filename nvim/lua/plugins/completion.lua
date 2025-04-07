@@ -659,6 +659,38 @@ var esriConfig = {
       require('lspconfig')['cssls'].setup({
         capabilities = capabilities
       })
+      
+      -- require('lspconfig')['slangd'].setup({
+        -- capabilities = capabilities
+      -- })
+-- require('lspconfig').slangd.setup{
+--   settings = {
+--     slang = {
+--       predefinedMacros = {"MY_VALUE_MACRO=1"},
+--       inlayHints = {
+--         deducedTypes = true,
+--         parameterNames = true,
+--       }
+--     }
+--   }
+-- }
+      local configs = require "lspconfig.configs"
+      local nvim_lsp = require "lspconfig"
+
+      if not configs.slangd then
+        configs.slangd = {
+          default_config = {
+            cmd = { "slangd", "--debug" },
+            filetypes = { "slang", "hlsl" },
+            root_dir = function(fname)
+              return nvim_lsp.util.find_git_ancestor(fname)
+            end,
+            single_file_support = true,
+          },
+        }
+        nvim_lsp.slangd.setup {}
+  end
+
 
       require('lspconfig')['eslint'].setup({
         capabilities = capabilities,

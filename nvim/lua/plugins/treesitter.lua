@@ -3,7 +3,7 @@ local key = require("../keys").key
 return {
   {
     "nvim-treesitter/nvim-treesitter",
-    tag = "v0.9.3",
+    -- tag = "v0.9.3",
     dependencies = {
       -- Does NOT work with c_sharp
       "nvim-treesitter/nvim-treesitter-textobjects",
@@ -27,7 +27,8 @@ return {
           "wgsl", 
           "glsl", 
           "c_sharp",
-          "toml"
+          "toml",
+          "slang"
         },
         sync_install = false,
         highlight = { 

@@ -47,5 +47,17 @@ vim.cmd('autocmd BufEnter * setlocal formatoptions-=cro')
 vim.cmd('autocmd FocusGained * checktime')
 vim.cmd('autocmd CursorHold * checktime')
 
+-- Slang support
+vim.filetype.add({
+  extension = {
+    slang = "slang",
+  },
+})
 
+vim.api.nvim_create_autocmd("FileType", {
+  pattern = "slang",
+  callback = function()
+    vim.bo.commentstring = "// %s"
+  end
+})
 
