@@ -6,7 +6,12 @@ return {
   ---@type Flash.Config
   -- stylua: ignore
   keys = {
-    { "" .. key("r"), mode = { "n", "x", "o" }, function() 
+    { "l", mode = { "n", "x", "o" }, function() require("flash").treesitter_search() end, desc = "Flash Treesitter" },
+
+    { "" .. "f", 
+      mode = { "n" }, 
+      -- mode = { "n", "x", "o" }, 
+      function() 
       -- Jump ignoring casing
       local gi = vim.go.ignorecase
       local gs = vim.go.smartcase
@@ -176,7 +181,6 @@ return {
         config = function(opts)
           -- autohide flash when in operator-pending mode
           opts.autohide = opts.autohide or (vim.fn.mode(true):find("no") and vim.v.operator == "y")
-
           -- disable jump labels when not enabled, when using a count,
           -- or when recording/executing registers
           opts.jump_labels = opts.jump_labels
@@ -202,14 +206,17 @@ return {
         -- to something else, e.g., { [";"] = "L", [","] = H }
         -- keys = { "f", "F", "t", "T", ";", "," },
         -- keys = {["f"] = "r"},
-        keys = {},
+        keys = {
+          ["t"] = "w",
+          -- ["T"] = "F",
+        },
         ---@alias Flash.CharActions table<string, "next" | "prev" | "right" | "left">
         -- The direction for `prev` and `next` is determined by the motion.
         -- `left` and `right` are always left and right.
         char_actions = function(motion)
           return {
-            [";"] = "next", -- set to `right` to always go right
-            [","] = "prev", -- set to `left` to always go left
+            -- ["b"] = "next", -- set to `right` to always go right
+            -- [","] = "prev", -- set to `left` to always go left
             -- clever-f style
             [motion:lower()] = "next",
             [motion:upper()] = "prev",
@@ -219,7 +226,7 @@ return {
           }
         end,
         search = { wrap = false },
-        highlight = { backdrop = true },
+        highlight = { backdrop = false },
         jump = { register = false },
       },
       -- options used for treesitter selections

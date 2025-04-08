@@ -10,8 +10,8 @@ return {
   --       -- Module mappings. Use `''` (empty string) to disable one.
   --       mappings = {
   --         -- Main textobject prefixes
-  --         around = 'wa',
-  --         inside = 'wi',
+  --         around = 'u',
+  --         inside = 'o',
   --
   --         -- Next/last variants
   --         around_next = 'wan',

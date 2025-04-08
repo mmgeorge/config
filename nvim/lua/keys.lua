@@ -4,7 +4,7 @@ local provides = {}
 local mode = 'apt3'
 
 local keys = {
-  'q', 'w', 'a', 'f', 't',
+  '', 'w', 'a', 'f', '',
 --           *    *
   '', 'gk', 'gj', '', 'g',
 --sb    *    *    se      
