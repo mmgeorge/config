@@ -29,14 +29,24 @@ return {
   --   }
   -- },
   {
+    "zbirenbaum/copilot.lua",
+    cmd = "Copilot",
+    event = "InsertEnter",
+    config = function()
+      require("copilot").setup({})
+    end,
+  },
+  {
     "yetone/avante.nvim",
     event = "VeryLazy",
     version = false, -- Never set this value to "*"! Never!
     opts = {
       -- add any opts here
       -- for example
-      provider = "gemini",
-      cursor_applying_provider = "gemini", 
+      -- provider = "gemini",
+      -- cursor_applying_provider = "gemini", 
+      provider = "copilot",
+      cursor_applying_provider = "copilot", 
       ---Specify the special dual_boost mode
       ---1. enabled: Whether to enable dual_boost mode. Default to false.
       ---2. first_provider: The first provider to generate response. Default to "openai".
@@ -93,6 +103,9 @@ return {
           normal = { "<C-c>", "<Esc>", "q" },
           insert = { "<C-c>" },
         },
+        files = {
+          add_current = "<leader>ac", -- Add current buffer to selected files
+        },
         sidebar = {
           apply_all = "A",
           apply_cursor = "a",
@@ -100,8 +113,8 @@ return {
           edit_user_request = "e",
           switch_windows = "<Tab>",
           reverse_switch_windows = "<S-Tab>",
-          remove_file = "d",
-          add_file = "@",
+          remove_file = "j",
+          add_file = "a",
           close = { "<Esc>", "q" },
           close_from_input = nil, -- e.g., { normal = "<Esc>", insert = "<C-d>" }
         },
@@ -155,10 +168,10 @@ return {
         throttle = 600,
       },
     },
-    -- build = "make BUILD_FROM_SOURCE=true",
-    -- if you want to build from source then do `make BUILD_FROM_SOURCE=true`
     -- build = "make",
-    build = "powershell -ExecutionPolicy Bypass -File Build.ps1 -BuildFromSource false", -- for windows
+    -- if you want to build from source then do `make BUILD_FROM_SOURCE=true`
+    build = "make BUILD_FROM_SOURCE=true",
+    -- build = "powershell -ExecutionPolicy Bypass -File Build.ps1 -BuildFromSource false", -- for windows
     dependencies = {
       "nvim-treesitter/nvim-treesitter",
       "stevearc/dressing.nvim",

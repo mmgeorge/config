@@ -98,7 +98,7 @@ k.keymap({'x'}, 'u', 'ygv<Esc>') -- Yank selection and move to the end
 vim.keymap.set({'n'}, "G", 
   function () require('treesj').toggle() end, { nowait=true, silent=false }) -- Join lines 
 vim.keymap.set({'x', 'n'}, "C", "J", { nowait=true, silent=false }) -- Join lines
-vim.keymap.set({'n'}, "kM", ":Neogen<CR>", { nowait=true, silent=false }) -- Create doc
+-- vim.keymap.set({'n'}, "kM", ":Neogen<CR>", { nowait=true, silent=false }) -- Create doc
 
 -- Surround
 vim.keymap.set({'x'}, "'", "qqc''<Esc>Pq", { nowait=true, silent=false }) 
@@ -108,11 +108,12 @@ vim.keymap.set({'x'}, '<', 'qqc<><Esc>Pq', { nowait=true, silent=false })
 vim.keymap.set({'x'}, '[', 'qqc[]<Esc>Pq', { nowait=true, silent=false }) 
 vim.keymap.set({'x'}, '{', 'qqc{}<Esc>Pq', { nowait=true, silent=false }) 
 
-vim.keymap.set({'n'}, "ls'", 'viwqqc""<Esc>Pq', { nowait=true, silent=false }) 
-vim.keymap.set({'n'}, 'lsa', 'viwqqc()<Esc>Pq', { nowait=true, silent=false }) 
-vim.keymap.set({'n'}, 'ls,', 'viwqqc<><Esc>Pq', { nowait=true, silent=false }) 
-vim.keymap.set({'n'}, 'ls[', 'viwqqc[]<Esc>Pq', { nowait=true, silent=false }) 
-vim.keymap.set({'n'}, 'ls.', 'viwqqc{}<Esc>Pq', { nowait=true, silent=false }) 
+-- Surround
+-- vim.keymap.set({'n'}, "ls'", 'viwqqc""<Esc>Pq', { nowait=true, silent=false }) 
+-- vim.keymap.set({'n'}, 'lsa', 'viwqqc()<Esc>Pq', { nowait=true, silent=false }) 
+-- vim.keymap.set({'n'}, 'ls,', 'viwqqc<><Esc>Pq', { nowait=true, silent=false }) 
+-- vim.keymap.set({'n'}, 'ls[', 'viwqqc[]<Esc>Pq', { nowait=true, silent=false }) 
+-- vim.keymap.set({'n'}, 'ls.', 'viwqqc{}<Esc>Pq', { nowait=true, silent=false }) 
 
 vim.keymap.set({'n'}, 'zz', 'zf', { nowait=true, silent=false })  -- Add spell check word
 
@@ -125,9 +126,9 @@ vim.keymap.set({'n'}, 'Sa', 'zg', { nowait=true, silent=false })  -- Add spell c
 k.keymap_leader({'x', 'n'}, 'u', "\"+y") -- Copy to clipboard
 k.keymap_leader({'x', 'n'}, 'U', "\"+Y") -- Copy to clipboard
 k.keymap_leader({'x', 'n'}, 'p', "\"+P") -- Paste to clipboard
+k.keymap_leader({'n', 'v'}, 's', ":%s/\\<<C-r><C-w>\\>/<C-r><C-w>/gI<Left><Left><Left>")
 -- k.keymap_leader({'n', 'v'}, 's', ":%s/\\<<C-r><C-w>\\>/<C-r><C-w>/gI<Left><Left><Left>")
--- k.keymap_leader({'n', 'v'}, 's', ":%s/\\<<C-r><C-w>\\>/<C-r><C-w>/gI<Left><Left><Left>")
-k.keymap_leader({'n', 'v'}, 'iu', function() require("utils").insert_v4({}) end)
+-- k.keymap_leader({'n', 'v'}, 'iu', function() require("utils").insert_v4({}) end)
 -- k.keymap_leader({'n', 'v'}, 't', 'gg=G')
 
 vim.keymap.set("n", "<leader>f", function()
@@ -226,6 +227,63 @@ vim.keymap.set({'n', 'x'}, '<A-i>', function () require"dap".step_into() end, {}
 vim.keymap.set({'n', 'x'}, '<A-n>', function () require"dap".step_out() end, {})
 vim.keymap.set({'n', 'x'}, '<A-r>', function () require"dap".restart() end, {})
 vim.keymap.set({'n', 'x'}, '<A-c>', function () require"dap".continue() end, {})
+
+-- Custom Motions
+
+-- Select token
+vim.keymap.set({'n'}, 'pt', 'viw', {})
+vim.keymap.set({'n'}, 'ut', 'uiw', {})
+vim.keymap.set({'n'}, 'jt', 'diw', {})
+vim.keymap.set({'n'}, 'mt', 'ciw', {})
+
+vim.keymap.set({'n'}, 'pot', 'vow', {})
+vim.keymap.set({'n'}, 'uot', 'uow', {})
+vim.keymap.set({'n'}, 'jot', 'dow', {})
+vim.keymap.set({'n'}, 'mot', 'cow', {})
+
+
+-- Select parens
+vim.keymap.set({'n'}, 'pua', 'vi(', {})
+vim.keymap.set({'n'}, 'poa', 'va(', {})
+vim.keymap.set({'n'}, 'uua', 'ui(', {})
+vim.keymap.set({'n'}, 'uoa', 'ua(', {})
+vim.keymap.set({'n'}, 'jua', 'di(', {})
+vim.keymap.set({'n'}, 'joa', 'da(', {})
+vim.keymap.set({'n'}, 'mua', 'ci(', {})
+vim.keymap.set({'n'}, 'moa', 'ca(', {})
+
+-- Select {
+vim.keymap.set({'n'}, 'pu.', 'vi{', {})
+vim.keymap.set({'n'}, 'po.', 'va{', {})
+vim.keymap.set({'n'}, 'uu.', 'ui{', {})
+vim.keymap.set({'n'}, 'uo.', 'ua{', {})
+vim.keymap.set({'n'}, 'ju.', 'di{', {})
+vim.keymap.set({'n'}, 'jo.', 'da{', {})
+vim.keymap.set({'n'}, 'mu.', 'ci{', {})
+vim.keymap.set({'n'}, 'mo.', 'ca{', {})
+
+-- Select [
+vim.keymap.set({'n'}, 'pu[', 'vi[', {})
+vim.keymap.set({'n'}, 'po[', 'va[', {})
+vim.keymap.set({'n'}, 'uu[', 'ui[', {})
+vim.keymap.set({'n'}, 'uo[', 'ua[', {})
+vim.keymap.set({'n'}, 'ju[', 'di[', {})
+vim.keymap.set({'n'}, 'jo[', 'da[', {})
+vim.keymap.set({'n'}, 'mu[', 'ci[', {})
+vim.keymap.set({'n'}, 'mo[', 'ca[', {})
+
+-- Select <
+vim.keymap.set({'n'}, 'pu,', 'vi<', {})
+vim.keymap.set({'n'}, 'po,', 'va<', {})
+vim.keymap.set({'n'}, 'uu,', 'ui<', {})
+vim.keymap.set({'n'}, 'uo,', 'ua<', {})
+vim.keymap.set({'n'}, 'ju,', 'di<', {})
+vim.keymap.set({'n'}, 'jo,', 'da<', {})
+vim.keymap.set({'n'}, 'mu,', 'ci<', {})
+vim.keymap.set({'n'}, 'mo,', 'ca<', {})
+
+vim.keymap.set({'n', 'x'}, '<A-c>', function () require"dap".continue() end, {})
 -- vim.keymap.set({'n', 'x'}, '<leader>dr', "<cmd>RustLsp debug<CR>", {})
 
-
+-- toggle fold
+-- za
