@@ -235,12 +235,22 @@ vim.keymap.set({'n'}, 'pt', 'viw', {})
 vim.keymap.set({'n'}, 'ut', 'uiw', {})
 vim.keymap.set({'n'}, 'jt', 'diw', {})
 vim.keymap.set({'n'}, 'mt', 'ciw', {})
+vim.keymap.set({'n'}, 'pot', 'vaw', {})
+vim.keymap.set({'n'}, 'uot', 'uaw', {})
+vim.keymap.set({'n'}, 'jot', 'daw', {})
+vim.keymap.set({'n'}, 'mot', 'caw', {})
 
-vim.keymap.set({'n'}, 'pot', 'vow', {})
-vim.keymap.set({'n'}, 'uot', 'uow', {})
-vim.keymap.set({'n'}, 'jot', 'dow', {})
-vim.keymap.set({'n'}, 'mot', 'cow', {})
+-- Select "
+vim.keymap.set({'n'}, 'po"', 'va"', {})
+vim.keymap.set({'n'}, 'uo"', 'ua"', {})
+vim.keymap.set({'n'}, 'jo"', 'da"', {})
+vim.keymap.set({'n'}, 'mo"', 'ca"', {})
 
+-- Select '
+vim.keymap.set({'n'}, 'po\'', 'va\'', {})
+vim.keymap.set({'n'}, 'uo\'', 'ua\'', {})
+vim.keymap.set({'n'}, 'jo\'', 'da\'', {})
+vim.keymap.set({'n'}, 'mo\'', 'ca\'', {})
 
 -- Select parens
 vim.keymap.set({'n'}, 'pua', 'vi(', {})
@@ -263,14 +273,14 @@ vim.keymap.set({'n'}, 'mu.', 'ci{', {})
 vim.keymap.set({'n'}, 'mo.', 'ca{', {})
 
 -- Select [
-vim.keymap.set({'n'}, 'pu[', 'vi[', {})
-vim.keymap.set({'n'}, 'po[', 'va[', {})
-vim.keymap.set({'n'}, 'uu[', 'ui[', {})
-vim.keymap.set({'n'}, 'uo[', 'ua[', {})
-vim.keymap.set({'n'}, 'ju[', 'di[', {})
-vim.keymap.set({'n'}, 'jo[', 'da[', {})
-vim.keymap.set({'n'}, 'mu[', 'ci[', {})
-vim.keymap.set({'n'}, 'mo[', 'ca[', {})
+vim.keymap.set({'n'}, 'pu/', 'vi[', {})
+vim.keymap.set({'n'}, 'po/', 'va[', {})
+vim.keymap.set({'n'}, 'uu/', 'ui[', {})
+vim.keymap.set({'n'}, 'uo/', 'ua[', {})
+vim.keymap.set({'n'}, 'ju/', 'di[', {})
+vim.keymap.set({'n'}, 'jo/', 'da[', {})
+vim.keymap.set({'n'}, 'mu/', 'ci[', {})
+vim.keymap.set({'n'}, 'mo/', 'ca[', {})
 
 -- Select <
 vim.keymap.set({'n'}, 'pu,', 'vi<', {})
