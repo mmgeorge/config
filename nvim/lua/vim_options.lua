@@ -36,22 +36,39 @@ vim.o.foldenable = true
 
 vim.g.rust_recommended_style = '0' -- Otherwise will override indentation settings
 
--- r = Continue comment on enter
--- o = Continue comment on o
-vim.cmd('autocmd BufEnter * set formatoptions+=roj')
-vim.cmd('autocmd BufRead,BufNewFile * set fileformat=unix')
+-- vim.cmd('autocmd BufEnter * set formatoptions+=roj')
+-- vim.cmd('autocmd BufRead,BufNewFile * set fileformat=unix')
 
--- Disable auto comment
-vim.cmd('autocmd BufEnter * set formatoptions-=cro')
-vim.cmd('autocmd BufEnter * setlocal formatoptions-=cro')
-vim.cmd('autocmd FocusGained * checktime')
-vim.cmd('autocmd CursorHold * checktime')
+vim.api.nvim_create_autocmd({'BufRead','BufNewFile'}, {
+  pattern = '*',  
+  callback = function()
+    if vim.bo.modifiable then
+      -- r = Continue comment on enter
+      -- o = Continue comment on o
+      vim.bo.formatoptions = 'roj'
+      vim.bo.fileformat = 'unix'
+    end
+  end
+})
 
--- Slang support
-vim.filetype.add({
-  extension = {
-    slang = "slang",
-  },
+vim.api.nvim_create_autocmd({'BufEnter'}, {
+  pattern = '*',  
+  callback = function()
+    if vim.bo.modifiable then
+      -- r = Continue comment on enter
+      -- o = Continue comment on o
+      vim.bo.formatoptions = 'roj'
+      
+      vim.bo.fileformat = 'unix'
+    end
+  end
+})
+
+vim.api.nvim_create_autocmd({'FocusGained', 'CursorHold'}, {
+  pattern = '*',  
+  callback = function()
+    vim.cmd('checktime')
+  end
 })
 
 vim.api.nvim_create_autocmd("FileType", {
@@ -59,5 +76,18 @@ vim.api.nvim_create_autocmd("FileType", {
   callback = function()
     vim.bo.commentstring = "// %s"
   end
+})
+
+-- Disable auto comment
+-- vim.cmd('autocmd BufEnter * set formatoptions-=cro')
+-- vim.cmd('autocmd BufEnter * setlocal formatoptions-=cro')
+-- vim.cmd('autocmd FocusGained * checktime')
+-- vim.cmd('autocmd CursorHold * checktime')
+
+-- Slang support
+vim.filetype.add({
+  extension = {
+    slang = "slang",
+  },
 })
 
