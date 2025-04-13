@@ -35,7 +35,7 @@ return {
     },
     opts = {
       opts = {
-        log_level = "TRACE",
+        -- log_level = "TRACE",
       },
       prompt_library = {
         ["Generate documentation"] = {
