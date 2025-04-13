@@ -24,6 +24,15 @@ vim.keymap.set({'n', 'x'}, 'b', '<Nop>', {})
 vim.keymap.set({'n', 'x'}, 'a%', '<Nop>', {})
 vim.keymap.set({'n', 'x'}, 'w', '<Nop>', {})
 vim.keymap.set({'n', 'x', 'i'}, '<C-z>', '<Nop>', {})
+
+vim.keymap.del("n", 'gri', {})
+vim.keymap.del("n", 'grr', {})
+vim.keymap.del({"n", "x"}, 'gra', {})
+vim.keymap.del("n", 'grn', {})
+-- vim.keymap.del({'n', 'x'}, 'grr', {})
+-- vim.keymap.del({'n', 'x'}, 'grn', {})
+-- vim.keymap.del({'n', 'x'}, 'gra', {})
+
 --keymap({'n', 'v',}, 'w', '<Nop>')
 
 vim.api.nvim_command(":unmap w")
