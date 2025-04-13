@@ -1,10 +1,4 @@
 return {
-  -- {
-  --   'junegunn/fzf', 
-  --   config = function ()
-  --     vim.fn['fzf#install']() 
-  --   end
-  -- },
   {
     'kevinhwang91/nvim-bqf', 
     config = function ()

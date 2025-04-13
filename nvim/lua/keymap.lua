@@ -1,4 +1,5 @@
 local k = require("keys")
+local utils = require("utils")
 
 vim.g.clipboard = {
   name = "wslClipboard",
@@ -235,10 +236,10 @@ vim.keymap.set({'n'}, 'pt', 'viw', {})
 vim.keymap.set({'n'}, 'lt', 'yiw', {})
 vim.keymap.set({'n'}, 'jt', 'diw', {})
 vim.keymap.set({'n'}, 'mt', 'ciw', {})
-vim.keymap.set({'n'}, 'pot', 'vaw', {})
-vim.keymap.set({'n'}, 'lot', 'yaw', {})
-vim.keymap.set({'n'}, 'jot', 'daw', {})
-vim.keymap.set({'n'}, 'mot', 'caw', {})
+-- vim.keymap.set({'n'}, 'pot', 'vaw', {})
+-- vim.keymap.set({'n'}, 'lot', 'yaw', {})
+-- vim.keymap.set({'n'}, 'jot', 'daw', {})
+-- vim.keymap.set({'n'}, 'mot', 'caw', {})
 
 -- Select "
 vim.keymap.set({'n'}, 'po"', 'va"', {})
@@ -293,7 +294,3 @@ vim.keymap.set({'n'}, 'mu,', 'ci<', {})
 vim.keymap.set({'n'}, 'mo,', 'ca<', {})
 
 vim.keymap.set({'n', 'x'}, '<A-c>', function () require"dap".continue() end, {})
--- vim.keymap.set({'n', 'x'}, '<leader>dr', "<cmd>RustLsp debug<CR>", {})
-
--- toggle fold
--- za
