@@ -13,6 +13,7 @@ return {
         -- **Needs to have something in order to show clues**.
         triggers = {
           { mode = 'n', keys = '<Leader>' },
+          { mode = 'x', keys = '<Leader>' },
           -- { mode = 'n', keys = 'o' },
         },
 
