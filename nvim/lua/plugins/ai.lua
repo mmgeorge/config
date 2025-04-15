@@ -117,28 +117,38 @@ This is the code to document:
                 local result = handle:read("*a")
                 handle:close()
 
+
                 return string.format(
-                  [[Given the diff listed below, please generate a short commit message that is only a single line. Pay attention to the gutter in the commit message that indicates what was changed. Only those lines that were changed and have a + or a - in the gutter should be considered for the commit message. The commit message should not be more than 50 characters. 
+                  [[You are an expert at following the Conventional Commit specification. Given the git diff listed below, please generate a commit message for me:
 
-The format of the message should be <type>: <description>
-- valid options for <type> are: fix, feat, build, chore, ci, docs, style, refactor, perf, test, lint, cleanup
-- <description> should be a very short summary of the changes. 
-
-Some examples commit messages might be: 
-- feat: send an email to the customer when a product is shipped 
-- chore: drop support for Node 6
-- docs: correct spelling of CHANGELOG 
-- docs: add doc for the Foo component
-
-Prefer using abbreviations like "doc" instead of "documentation" when possible to reduce the length of the commit message
-
-The first letter of <description> should be lowercase.
-
-The diff is below:
 ```diff
 %s
 ```
-]], result)
+]],
+                  vim.fn.system("git diff --no-ext-diff --staged")
+                )
+--                 return string.format(
+--                   [[Given the diff listed below, please generate a short commit message that is only a single line. Pay attention to the gutter in the commit message that indicates what was changed. Only those lines that were changed and have a + or a - in the gutter should be considered for the commit message. The commit message should not be more than 50 characters. 
+--
+-- The format of the message should be <type>: <description>
+-- - valid options for <type> are: fix, feat, build, chore, ci, docs, style, refactor, perf, test, lint, cleanup
+-- - <description> should be a very short summary of the changes. 
+--
+-- Some examples commit messages might be: 
+-- - feat: send an email to the customer when a product is shipped 
+-- - chore: drop support for Node 6
+-- - docs: correct spelling of CHANGELOG 
+-- - docs: add doc for the Foo component
+--
+-- Prefer using abbreviations like "doc" instead of "documentation" when possible to reduce the length of the commit message
+--
+-- The first letter of <description> should be lowercase.
+--
+-- The diff is below:
+-- ```diff
+-- %s
+-- ```
+-- ]], result)
               end,
               opts = {
                 contains_code = true,
