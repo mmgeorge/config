@@ -177,15 +177,26 @@ return {
           end,
           default_settings = {
             ['rust-analyzer'] = {
-              -- ['checkOnSave'] = false,
-              ["cargo"] = {
-                ["allTargets"] = true,
-                ["allFeatures"] = true,
-                ["extraEnv"] = {
+              -- checkOnSave = false,
+              cargo = {
+                -- allTargets = true,
+                -- allFeatures = true,
+                allTargets = false,
+                allFeatures = false,
+                extraEnv = {
                   ["CARGO_TARGET_DIR"] = "target/check",
                   -- ["RUSTFLAGS"] = "-Zthreads=8 -Zshare-generics=n"
-                }
+                },
+                -- noDeps = true
               },
+              check = {
+                -- Avoid re-running on all deps
+                workspace = false
+              },
+              -- numThreads = 8,
+              cachePriming = {
+                enable = false
+              }
               -- Doesn't work... not supported in nvim? 
               -- completion = {
               --   snippets = {
