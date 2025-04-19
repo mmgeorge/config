@@ -47,6 +47,11 @@
        parameters: (formal_parameters)
        body: (statement_block)) @xfunction.outer)
 
+((comment) @_start
+  (method_definition) @_end
+  (#make-range! "xfunction.outer" @_start @_end))
+
+(method_definition) @xfunction.outer
 
 
 ;; top-level functions, with comments
