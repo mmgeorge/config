@@ -142,7 +142,6 @@ This is the code to document:
 
                 return string.format(
                   [[You are an expert at following the Conventional Commit specification. Given the git diff listed below, generate a commit message for me. Do not indent the first line. The description under the description should be no more than 2 sentences. Prefer omitting this description when possible. Do not list any breaking changes:
-
 ```diff
 %s
 ```
