@@ -18,6 +18,7 @@ return {
       PERF = { icon = "? ", alt = { "OPTIM", "PERFORMANCE", "OPTIMIZE", "OPT" } },
       NOTE = { icon = "? ", color = "hint", alt = { "INFO" } },
       TEST = { icon = "? ", color = "test", alt = { "TESTING", "PASSED", "FAILED" } },
+      SANITY = { icon = "? ", color = "test", },
     },
     gui_style = {
       fg = "NONE", -- The gui style to use for the fg highlight group.

@@ -71,12 +71,13 @@ return {
                 local buffer_text = table.concat(lines, '\n') 
                 
                 return string.format(
-                  [[Document the following code. Use the folling steps: 
+                  [[Document the below code. Use the following steps: 
 1. Identify the programming language 
 2. Lookup the best style practices for adding documentation in that language. For instance, when documenting javascript or typescript, use jsdoc style. 
 3. Identify every function, method, or class in the passed code. These are the things that you will add documentation to. 
 4. If the function already has documentation, try to incorporate that into the new documentation. It is OK to remove some of it, but the content should still be there. 
-5. Be as succinct as possible in the documentation that you generate.
+5. Be as succinct as possible in the documentation that you generate (2 sentences).
+6. Do NOT document specific function parameters or the return value.
 
 Each line of the generated documentation should not be longer than 80 characters.
 
@@ -95,6 +96,27 @@ This is the code to document:
                 contains_code = true,
               },
             },
+--             {
+--               role = "user",
+--               content = function(context)
+--                 local code = require("codecompanion.helpers.actions").get_code(context.start_line, context.end_line)
+--                 -- local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
+--                 -- local buffer_text = table.concat(lines, '\n') 
+--                 
+--                 return string.format(
+--                   [[You are an expert in writing succinct technical documentation geared towards other developers already familiar with the codebase.
+-- - Lookup the best practices for documenting the specified language.
+-- - Generate concise documentation for the code below below. Each line of the generated documentation should not be longer than 80 characters. 
+--
+-- ```%s
+-- %s
+-- ```
+-- ]], context.filetype, code)
+--               end,
+--               opts = {
+--                 contains_code = true,
+--               },
+--             }
           },
         },
         ["Generate a Commit Message"] = {
@@ -119,7 +141,7 @@ This is the code to document:
 
 
                 return string.format(
-                  [[You are an expert at following the Conventional Commit specification. Given the git diff listed below, please generate a commit message for me:
+                  [[You are an expert at following the Conventional Commit specification. Given the git diff listed below, generate a commit message for me. Do not indent the first line. The description under the description should be no more than 2 sentences. Prefer omitting this description when possible. Do not list any breaking changes:
 
 ```diff
 %s
@@ -213,10 +235,10 @@ This is the code to document:
       end,
       strategies = {
         chat = {
-          adapter = "gemini",
+          adapter = "copilot",
         },
         inline = {
-          adapter = "gemini",
+          adapter = "copilot",
           keymaps = {
             accept_change = {
               modes = { n = "ga" },
@@ -229,19 +251,19 @@ This is the code to document:
           },
         },
         cmd = {
-          adapter = "gemini",
+          adapter = "copilot",
         }
       }
     }
   },
-  -- {
-  --   "zbirenbaum/copilot.lua",
-  --   cmd = "Copilot",
-  --   event = "InsertEnter",
-  --   config = function()
-  --     require("copilot").setup({})
-  --   end,
-  -- },
+  {
+    "zbirenbaum/copilot.lua",
+    cmd = "Copilot",
+    event = "InsertEnter",
+    config = function()
+      require("copilot").setup({})
+    end,
+  },
   -- {
   --   "yetone/avante.nvim",
   --   event = "VeryLazy",
