@@ -149,7 +149,7 @@ return {
   -- },
   {
     'mrcjkb/rustaceanvim',
-    version = '^5', -- Recommended
+    version = '^6', -- Recommended
     lazy = false, -- This plugin is already lazy
     config = function ()
       -- local cfg = require('rustaceanvim.config')
@@ -191,7 +191,7 @@ return {
               },
               check = {
                 -- Avoid re-running on all deps
-                workspace = false
+                workspace = true
               },
               -- numThreads = 8,
               cachePriming = {

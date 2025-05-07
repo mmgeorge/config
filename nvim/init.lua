@@ -2,6 +2,23 @@
 -- To load, modify .config/nvim/init.lua to point here, e.g, assuming we're at ~/config, then
 -- dofile(vim.fn.expand("$HOME/config/nvim/init.lua"))
 
+
+-- Silence the specific position encoding message
+local notify_original = vim.notify
+vim.notify = function(msg, ...)
+  if
+    msg
+    and (
+      msg:match 'position_encoding param is required'
+      or msg:match 'Defaulting to position encoding of the first client'
+      or msg:match 'multiple different client offset_encodings'
+    )
+  then
+    return
+  end
+  return notify_original(msg, ...)
+end
+
 vim.g.mapleader=" "
 vim.g.maplocalleader=" "
 

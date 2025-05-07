@@ -18,21 +18,6 @@ return {
       -----------------------------------------------------------------------------
       --- NATIVE AUTOCMDS SNIPPETS -- 
       -----------------------------------------------------------------------------
-        -- snippet("la ", text"<- "),
-        -- snippet("ra ", text"-> "),
-        -- snippet("udef ", text"self.useDefaults?.(arguments)"),
-        -- snippet("sf ", {
-        --   text({"<script>", 
-        --     "  var esriConfig = {",
-        --     "    has: {",
-        --     "      \"esri-2d-update-debug\": 1,",
-        --     "      \"esri-2d-debug\": 1,",
-        --     "      \"esri-tiles-debug\": 1,",
-        --     "      \"featurelayer-pbf\": 1,",
-        --     "    }",
-        --     "  }",
-        --     "</script>"}), 
-        -- }) ,
      
       local autosnippets = {
         {
@@ -67,6 +52,10 @@ return {
           trigger = "ra ", 
           body = "-> "
         },
+        {
+          trigger = "rra ", 
+          body = "=> "
+        }, 
         {
           trigger = "udef ", 
           body = "self.useDefaults?.(arguments)"
@@ -524,9 +513,8 @@ var esriConfig = {
         },
         mapping = mapping, 
         sources = cmp.config.sources({
-          { name = 'snp' },
+          { name = 'snp' }, -- how to prioritize?
           { name = 'nvim_lsp' },
-          -- { name = 'luasnip' },
           { 
             name = 'spell', 
             option = {
