@@ -125,7 +125,7 @@ return {
 
         -- by default, in visual mode, the visual selection is used to prefill the search
         -- setting this option to true disables that behaviour
-        ignoreVisualSelection = false,
+        visualSelectionUsage = "ignore",
 
         -- shortcuts for the actions you see at the top of the buffer
         -- set to '' or false to unset. Mappings with no normal mode value will be removed from the help header
