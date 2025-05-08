@@ -5,6 +5,7 @@ return {
       {
         "or",
         -- "<leader>nr",
+        -- function() require('oil').open(nil, { preview = { }, split = "horizontal" })  end,
         function() require('oil').open_float(nil, { preview = { } })  end,
         -- function() require('oil').open()  end,
         mode = { "n", "x" },
@@ -24,9 +25,9 @@ return {
         -- Id is automatically added at the beginning, and name at the end
         -- See :help oil-columns
         columns = {
+          -- "size",
           "icon",
           -- "permissions",
-          -- "size",
           -- "mtime",
         },
         -- Buffer-local options to use for oil buffers
@@ -77,8 +78,8 @@ return {
         -- See :help oil-actions for a list of all available actions
         keymaps = {
           -- ["g?"] = "actions.show_help",
-          ["<Esc>"] = "actions.close",
-          ["<CR>"] = "actions.select",
+          ["<Esc>"] = { "actions.close", mode = "n" },
+          ["<CR>"] = { "actions.select", opts = { close = false }},
           -- ["<C-s>"] = { "actions.select", opts = { vertical = true }, desc = "Open the entry in a vertical split" },
           -- ["<C-h>"] = { "actions.select", opts = { horizontal = true }, desc = "Open the entry in a horizontal split" },
           -- ["<C-t>"] = { "actions.select", opts = { tab = true }, desc = "Open the entry in new tab" },
@@ -153,7 +154,7 @@ return {
             -- return conf
             local width = vim.api.nvim_win_get_width(0)
             local height = vim.api.nvim_win_get_height(0)
-            local size = 15
+            local size = 25
             -- conf.title = "hi mom"
 --
             -- return conf

@@ -1542,14 +1542,14 @@ return {
       --   mode = { "n", "x" },
       --   desc = "Explore Files",
       -- }, 
-      {
-        "os",
-        function ()
-          require"mini.pick".registry.xbuffers() 
-        end,
-        mode = { "n", "x" },
-        desc = "Search Buffer",
-      }, 
+      -- {
+      --   "os",
+      --   function ()
+      --     require"mini.pick".registry.xbuffers() 
+      --   end,
+      --   mode = { "n", "x" },
+      --   desc = "Search Buffer",
+      -- }, 
       -- {
       --   "ot",
       --   function ()
