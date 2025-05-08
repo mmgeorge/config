@@ -138,7 +138,7 @@ return {
 
         -- by default, in visual mode, the visual selection is used to prefill the search
         -- setting this option to true disables that behaviour
-        visualSelectionUsage = "prefill-search",
+        visualSelectionUsage = 'ignore',
 
         openTargetWindow = {
           preferredLocation = "above"

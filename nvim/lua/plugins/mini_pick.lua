@@ -1558,14 +1558,14 @@ return {
       --   mode = { "n", "x" },
       --   desc = "Grep Live",
       -- }, 
-      {
-        "oh",
-        function ()
-          require"mini.pick".registry.files() 
-        end,
-        mode = { "n", "x" },
-        desc = "Search Files",
-      },
+      -- {
+      --   "oh",
+      --   function ()
+      --     require"mini.pick".registry.files() 
+      --   end,
+      --   mode = { "n", "x" },
+      --   desc = "Search Files",
+      -- },
       {
         "oo",
         function ()
