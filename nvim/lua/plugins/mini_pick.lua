@@ -1550,14 +1550,14 @@ return {
         mode = { "n", "x" },
         desc = "Search Buffer",
       }, 
-      {
-        "ot",
-        function ()
-          require"mini.pick".registry.grep_live() 
-        end,
-        mode = { "n", "x" },
-        desc = "Grep Live",
-      }, 
+      -- {
+      --   "ot",
+      --   function ()
+      --     require"mini.pick".registry.grep_live() 
+      --   end,
+      --   mode = { "n", "x" },
+      --   desc = "Grep Live",
+      -- }, 
       {
         "oh",
         function ()

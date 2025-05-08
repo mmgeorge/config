@@ -3,19 +3,32 @@ return {
     'MagicDuck/grug-far.nvim',
     keys = {
       {
-        "<leader>ns",
+        "ot",
         function ()
           require('grug-far').with_visual_selection() 
         end,
         mode = { "n", "x" },
         desc = "Search and replace",
-      }
+      }, 
+
+      -- {
+      --   "<leader>ns",
+      --   function ()
+      --     require('grug-far').with_visual_selection() 
+      --   end,
+      --   mode = { "n", "x" },
+      --   desc = "Search and replace",
+      -- }
     },
     config = function()
       require('grug-far').setup({
         -- debounce milliseconds for issuing search while user is typing
         -- prevents excessive searching
         debounceMs = 100,
+
+        helpLine = {
+          enabled = false
+        }, 
 
         -- minimum number of chars which will cause a search to happen
         -- prevents performance issues in larger dirs
@@ -92,8 +105,8 @@ return {
         -- the window in which the grug-far buffer will appear
         -- ex (horizontal bottom right split): 'botright split'
         -- ex (open new tab): 'tabnew %'
-        -- windowCreationCommand = 'vsplit',
-        windowCreationCommand = 'tabnew %',
+        windowCreationCommand = 'sp',
+        -- windowCreationCommand = 'tabnew %',
         -- windowCreationCommand = 'botright split',
 
         -- buffer line numbers + match line numbers can get a bit visually overwhelming
@@ -115,17 +128,21 @@ return {
         startInInsertMode = true,
 
         -- row in the window to position the cursor at at start
-        startCursorRow = 3,
+        startCursorRow = 2,
 
         -- whether to wrap text in the grug-far buffer
         wrap = true,
 
         -- whether or not to make a transient buffer which is both unlisted and fully deletes itself when not in use
-        transient = false,
+        transient = true,
 
         -- by default, in visual mode, the visual selection is used to prefill the search
         -- setting this option to true disables that behaviour
-        visualSelectionUsage = "ignore",
+        visualSelectionUsage = "prefill-search",
+
+        openTargetWindow = {
+          preferredLocation = "above"
+        },
 
         -- shortcuts for the actions you see at the top of the buffer
         -- set to '' or false to unset. Mappings with no normal mode value will be removed from the help header
@@ -136,9 +153,10 @@ return {
         keymaps = {
           replace = { n = '<localleader>r' },
           qflist = { n = '<localleader>q' },
+          previewLocation = { n = '<localleader>i' },
           -- syncLocations = { n = '<localleader>s' },
           -- syncLine = { n = '<localleader>l' },
-          close = { n = 'q' },
+          -- close = { n = '<Esc>' },
           -- close = { n = '<localleader>c' },
           -- historyOpen = { n = '<localleader>t' },
           -- historyAdd = { n = '<localleader>a' },
@@ -162,7 +180,19 @@ return {
         -- set individual ones to '' to disable, or set enabled = false for complete disable
         icons = {
           -- whether to show icons
-          enabled = true,
+          enabled = false,
+        },
+  
+        previewWindow = {
+          border = "rounded"
+        },
+
+        prefills = {
+          search = nil,
+          replacement = nil,
+          filesFilter = nil,
+          flags = "--ignore-case",
+          paths = nil,
         },
 
         -- strings to auto-fill in each input area at start
