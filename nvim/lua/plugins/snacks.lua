@@ -223,9 +223,9 @@ return {
             follow_file = true,
             -- focus = "list",
             focus = "input",
-            auto_close = false,
+            auto_close = true,
             jump = { close = false },
-            layout = { preset = "sidebar", preview = false },
+            -- layout = { preset = "sidebar", preview = false },
             -- to show the explorer to the right, add the below to
             -- your config under `opts.picker.sources.explorer`
             -- layout = { layout = { position = "right" } },
