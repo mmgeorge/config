@@ -203,7 +203,7 @@ end)
 -- keymap('n', 'ot', vim.lsp.buf.type_definition) 
 -- k.keymap('n', 'ow', vim.lsp.buf.rename) 
 
-k.keymap({'n', 'x'}, '<C-f>', require("plugins.telescope.occur").occur_in_file)
+-- k.keymap({'n', 'x'}, '<C-f>', require("plugins.telescope.occur").occur_in_file)
 -- k.keymap({'n', 'x'}, 'of', require("telescope.builtin").find_files)
 -- k.keymap({'n', 'x'}, 'od', require("telescope.builtin").live_grep)
 -- k.keymap({'n', 'x'}, 'os', require("telescope.builtin").buffers)

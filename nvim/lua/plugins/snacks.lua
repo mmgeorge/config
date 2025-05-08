@@ -3,6 +3,248 @@ return {
     "folke/snacks.nvim",
     priority = 1000,
     lazy = false,
+    keys = {
+      -- Top Pickers & Explorer
+      -- { "<leader><space>", function() Snacks.picker.smart() end, desc = "Smart Find Files" },
+      {
+        "oh", function ()
+          Snacks.picker.files({
+            finder = "files",
+            format = "file",
+            show_empty = true,
+            hidden = false,
+            ignored = false,
+            follow = false,
+            supports_live = true,
+          }) 
+        end,
+        desc = "Files" 
+      },
+      {
+        "Sr", function ()
+          Snacks.picker.spelling({
+            focus = "list",
+            layout = {
+              layout = {
+                box = "vertical",
+                backdrop = false,
+                row = -1,
+                width = 0,
+                height = 0.4,
+                border = "top",
+                title = " {title} {live} {flags}",
+                title_pos = "left",
+                { win = "input", height = 1, border = "bottom" },
+                {
+                  box = "horizontal",
+                  { win = "list", border = "none" },
+                },
+              },
+            },
+          }) 
+        end,
+        desc = "Spelling" 
+      },
+      -- Currently I prefer treesitter over this as we don't need to wait for the lsp 
+      -- to startup
+      -- {
+      --   "oo", 
+      --   function ()
+      --     Snacks.picker.lsp_symbols({
+      --       tree = false,
+      --       filter = {
+      --         default = {
+      --           "Class",
+      --           "Constructor",
+      --           "Enum",
+      --           "Field",
+      --           "Function",
+      --           "Interface",
+      --           "Method",
+      --           "Module",
+      --           "Namespace",
+      --           "Package",
+      --           "Property",
+      --           "Struct",
+      --           "Trait",
+      --         },
+      --         -- set to `true` to include all symbols
+      --         markdown = true,
+      --         help = true,
+      --         -- you can specify a different filter for each filetype
+      --         lua = {
+      --           "Class",
+      --           "Constructor",
+      --           "Enum",
+      --           "Field",
+      --           "Function",
+      --           "Interface",
+      --           "Method",
+      --           "Module",
+      --           "Namespace",
+      --           -- "Package", -- remove package since luals uses it for control flow structures
+      --           "Property",
+      --           "Struct",
+      --           "Trait",
+      --         },
+      --       }
+      --     }) 
+      --   end,
+      --   desc = "Symbols" 
+      -- },
+      {
+        "oo", 
+        function ()
+          Snacks.picker.treesitter({
+            finder = "treesitter_symbols",
+            format = "lsp_symbol",
+            tree = true,
+            filter = {
+              default = {
+                "Class",
+                "Enum",
+                "Field",
+                "Function",
+                "Method",
+                "Module",
+                "Namespace",
+                "Struct",
+                "Trait",
+              },
+              -- set to `true` to include all symbols
+              markdown = true,
+              help = true,
+            },
+          }) 
+        end,
+        desc = "Symbols" 
+      },
+      {
+        "<leader>h",  function ()
+          Snacks.picker.explorer({
+            finder = "explorer",
+            sort = { fields = { "sort" } },
+            supports_live = true,
+            tree = true,
+            watch = true,
+            diagnostics = true,
+            diagnostics_open = false,
+            git_status = true,
+            git_status_open = false,
+            git_untracked = true,
+            follow_file = true,
+            -- focus = "list",
+            focus = "input",
+            auto_close = true,
+            jump = { close = true },
+            -- layout = { preset = "sidebar", preview = false },
+            -- to show the explorer to the right, add the below to
+            -- your config under `opts.picker.sources.explorer`
+            -- layout = { layout = { position = "right" } },
+            formatters = {
+              file = { filename_only = true },
+              severity = { pos = "right" },
+            },
+            matcher = { sort_empty = false, fuzzy = false },
+            config = function(opts)
+              return require("snacks.picker.source.explorer").setup(opts)
+            end,
+            win = {
+              list = {
+                keys = {
+                  ["<BS>"] = "explorer_up",
+                  ["l"] = "confirm",
+                  ["h"] = "explorer_close", -- close directory
+                  ["a"] = "explorer_add",
+                  ["d"] = "explorer_del",
+                  ["r"] = "explorer_rename",
+                  ["c"] = "explorer_copy",
+                  ["m"] = "explorer_move",
+                  ["o"] = "explorer_open", -- open with system application
+                  ["P"] = "toggle_preview",
+                  ["y"] = { "explorer_yank", mode = { "n", "x" } },
+                  ["p"] = "explorer_paste",
+                  ["u"] = "explorer_update",
+                  ["<c-c>"] = "tcd",
+                  ["<leader>/"] = "picker_grep",
+                  ["<c-t>"] = "terminal",
+                  ["."] = "explorer_focus",
+                  ["I"] = "toggle_ignored",
+                  ["H"] = "toggle_hidden",
+                  ["Z"] = "explorer_close_all",
+                  ["]g"] = "explorer_git_next",
+                  ["[g"] = "explorer_git_prev",
+                  ["]d"] = "explorer_diagnostic_next",
+                  ["[d"] = "explorer_diagnostic_prev",
+                  ["]w"] = "explorer_warn_next",
+                  ["[w"] = "explorer_warn_prev",
+                  ["]e"] = "explorer_error_next",
+                  ["[e"] = "explorer_error_prev",
+                },
+              },
+            },
+          })
+        end,
+        desc = "Explorer" 
+      },
+      { 
+        "os", 
+        function()
+          Snacks.picker.buffers({
+            finder = "buffers",
+            format = "buffer",
+            hidden = false,
+            unloaded = true,
+            current = false,
+            sort_lastused = true,
+            win = {
+              input = { keys = { ["<c-x>"] = { "bufdelete", mode = { "n", "i" } } } },
+              list = { keys = { ["jj"] = "bufdelete" } },
+            },
+          })
+        end, 
+        desc = "Buffers" 
+      },
+      { 
+        "<C-h>", 
+        function()
+          Snacks.picker.lines({
+            finder = "lines",
+            format = "lines",
+            layout = {
+              layout = {
+                box = "vertical",
+                backdrop = false,
+                row = -1,
+                width = 0,
+                height = 0.4,
+                border = "top",
+                title = " {title} {live} {flags}",
+                title_pos = "left",
+                { win = "input", height = 1, border = "bottom" },
+                {
+                  box = "horizontal",
+                  { win = "list", border = "none" },
+                },
+              },
+            },
+            jump = { match = true },
+            -- allow any window to be used as the main window
+            main = { current = true },
+            ---@param picker snacks.Picker
+            on_show = function(picker)
+              local cursor = vim.api.nvim_win_get_cursor(picker.main)
+              local info = vim.api.nvim_win_call(picker.main, vim.fn.winsaveview)
+              picker.list:view(cursor[1], info.topline)
+              picker:show_preview()
+            end,
+            sort = { fields = { "idx" } },
+            -- sort = { fields = { "score:desc", "idx" } },
+          })
+        end, 
+        desc = "Search lines" 
+      }
+    },
     ---@type snacks.Config
     opts = {
       bigfile = { enabled = true },
@@ -154,7 +396,7 @@ return {
             {
               box = "horizontal",
               { win = "list", border = "none" },
-              { win = "preview", title = "{preview}", width = 0.6, border = "left" },
+              { win = "preview", title = "{preview}", width = 0.5, border = "left" },
             },
           },
         },
@@ -178,7 +420,6 @@ return {
         --     },
         --   },
         -- },
-
       },
       quickfile = { enabled = false },
       scope = { enabled = false },
@@ -190,191 +431,6 @@ return {
           -- wo = { wrap = true } -- Wrap notifications
         }
       }
-    },
-    keys = {
-      -- Top Pickers & Explorer
-      -- { "<leader><space>", function() Snacks.picker.smart() end, desc = "Smart Find Files" },
-      {
-        "oh", function ()
-          Snacks.picker.files({
-            finder = "files",
-            format = "file",
-            show_empty = true,
-            hidden = false,
-            ignored = false,
-            follow = false,
-            supports_live = true,
-          }) 
-        end
-      },
-      {
-        "<leader>h",  function ()
-          Snacks.picker.explorer({
-            finder = "explorer",
-            sort = { fields = { "sort" } },
-            supports_live = true,
-            tree = true,
-            watch = true,
-            diagnostics = true,
-            diagnostics_open = false,
-            git_status = true,
-            git_status_open = false,
-            git_untracked = true,
-            follow_file = true,
-            -- focus = "list",
-            focus = "input",
-            auto_close = true,
-            jump = { close = false },
-            -- layout = { preset = "sidebar", preview = false },
-            -- to show the explorer to the right, add the below to
-            -- your config under `opts.picker.sources.explorer`
-            -- layout = { layout = { position = "right" } },
-            formatters = {
-              file = { filename_only = true },
-              severity = { pos = "right" },
-            },
-            matcher = { sort_empty = false, fuzzy = false },
-            config = function(opts)
-              return require("snacks.picker.source.explorer").setup(opts)
-            end,
-            win = {
-              list = {
-                keys = {
-                  ["<BS>"] = "explorer_up",
-                  ["l"] = "confirm",
-                  ["h"] = "explorer_close", -- close directory
-                  ["a"] = "explorer_add",
-                  ["d"] = "explorer_del",
-                  ["r"] = "explorer_rename",
-                  ["c"] = "explorer_copy",
-                  ["m"] = "explorer_move",
-                  ["o"] = "explorer_open", -- open with system application
-                  ["P"] = "toggle_preview",
-                  ["y"] = { "explorer_yank", mode = { "n", "x" } },
-                  ["p"] = "explorer_paste",
-                  ["u"] = "explorer_update",
-                  ["<c-c>"] = "tcd",
-                  ["<leader>/"] = "picker_grep",
-                  ["<c-t>"] = "terminal",
-                  ["."] = "explorer_focus",
-                  ["I"] = "toggle_ignored",
-                  ["H"] = "toggle_hidden",
-                  ["Z"] = "explorer_close_all",
-                  ["]g"] = "explorer_git_next",
-                  ["[g"] = "explorer_git_prev",
-                  ["]d"] = "explorer_diagnostic_next",
-                  ["[d"] = "explorer_diagnostic_prev",
-                  ["]w"] = "explorer_warn_next",
-                  ["[w"] = "explorer_warn_prev",
-                  ["]e"] = "explorer_error_next",
-                  ["[e"] = "explorer_error_prev",
-                },
-              },
-            },
-          })
-        end
-      },
-      { "os", function()
-        Snacks.picker.buffers({
-          finder = "buffers",
-          format = "buffer",
-          hidden = false,
-          unloaded = true,
-          current = false,
-          sort_lastused = true,
-          win = {
-            input = { keys = { ["<c-x>"] = { "bufdelete", mode = { "n", "i" } } } },
-            list = { keys = { ["jj"] = "bufdelete" } },
-          },
-        })
-      end, desc = "Buffers" },
-      -- { "<leader>/", function() Snacks.picker.grep() end, desc = "Grep" },
-      -- { "<leader>:", function() Snacks.picker.command_history() end, desc = "Command History" },
-      -- { "<leader>n", function() Snacks.picker.notifications() end, desc = "Notification History" },
-      -- { "<leader>e", function() Snacks.explorer() end, desc = "File Explorer" },
-      -- -- find
-      -- { "<leader>fb", function() Snacks.picker.buffers() end, desc = "Buffers" },
-      -- { "<leader>fc", function() Snacks.picker.files({ cwd = vim.fn.stdpath("config") }) end, desc = "Find Config File" },
-      -- { "<leader>ff", function() Snacks.picker.files() end, desc = "Find Files" },
-      -- { "<leader>fg", function() Snacks.picker.git_files() end, desc = "Find Git Files" },
-      -- { "<leader>fp", function() Snacks.picker.projects() end, desc = "Projects" },
-      -- { "<leader>fr", function() Snacks.picker.recent() end, desc = "Recent" },
-      -- -- git
-      -- { "<leader>gb", function() Snacks.picker.git_branches() end, desc = "Git Branches" },
-      -- { "<leader>gl", function() Snacks.picker.git_log() end, desc = "Git Log" },
-      -- { "<leader>gL", function() Snacks.picker.git_log_line() end, desc = "Git Log Line" },
-      -- { "<leader>gs", function() Snacks.picker.git_status() end, desc = "Git Status" },
-      -- { "<leader>gS", function() Snacks.picker.git_stash() end, desc = "Git Stash" },
-      -- { "<leader>gd", function() Snacks.picker.git_diff() end, desc = "Git Diff (Hunks)" },
-      -- { "<leader>gf", function() Snacks.picker.git_log_file() end, desc = "Git Log File" },
-      -- -- Grep
-      -- { "<leader>sb", function() Snacks.picker.lines() end, desc = "Buffer Lines" },
-      -- { "<leader>sB", function() Snacks.picker.grep_buffers() end, desc = "Grep Open Buffers" },
-      -- { "<leader>sg", function() Snacks.picker.grep() end, desc = "Grep" },
-      -- { "<leader>sw", function() Snacks.picker.grep_word() end, desc = "Visual selection or word", mode = { "n", "x" } },
-      -- -- search
-      -- { '<leader>s"', function() Snacks.picker.registers() end, desc = "Registers" },
-      -- { '<leader>s/', function() Snacks.picker.search_history() end, desc = "Search History" },
-      -- { "<leader>sa", function() Snacks.picker.autocmds() end, desc = "Autocmds" },
-      -- { "<leader>sb", function() Snacks.picker.lines() end, desc = "Buffer Lines" },
-      -- { "<leader>sc", function() Snacks.picker.command_history() end, desc = "Command History" },
-      -- { "<leader>sC", function() Snacks.picker.commands() end, desc = "Commands" },
-      -- { "<leader>sd", function() Snacks.picker.diagnostics() end, desc = "Diagnostics" },
-      -- { "<leader>sD", function() Snacks.picker.diagnostics_buffer() end, desc = "Buffer Diagnostics" },
-      -- { "<leader>sh", function() Snacks.picker.help() end, desc = "Help Pages" },
-      -- { "<leader>sH", function() Snacks.picker.highlights() end, desc = "Highlights" },
-      -- { "<leader>si", function() Snacks.picker.icons() end, desc = "Icons" },
-      -- { "<leader>sj", function() Snacks.picker.jumps() end, desc = "Jumps" },
-      -- { "<leader>sk", function() Snacks.picker.keymaps() end, desc = "Keymaps" },
-      -- { "<leader>sl", function() Snacks.picker.loclist() end, desc = "Location List" },
-      -- { "<leader>sm", function() Snacks.picker.marks() end, desc = "Marks" },
-      -- { "<leader>sM", function() Snacks.picker.man() end, desc = "Man Pages" },
-      -- { "<leader>sp", function() Snacks.picker.lazy() end, desc = "Search for Plugin Spec" },
-      -- { "<leader>sq", function() Snacks.picker.qflist() end, desc = "Quickfix List" },
-      -- { "<leader>sR", function() Snacks.picker.resume() end, desc = "Resume" },
-      -- { "<leader>su", function() Snacks.picker.undo() end, desc = "Undo History" },
-      -- { "<leader>uC", function() Snacks.picker.colorschemes() end, desc = "Colorschemes" },
-      -- -- LSP
-      -- { "gd", function() Snacks.picker.lsp_definitions() end, desc = "Goto Definition" },
-      -- { "gD", function() Snacks.picker.lsp_declarations() end, desc = "Goto Declaration" },
-      -- { "gr", function() Snacks.picker.lsp_references() end, nowait = true, desc = "References" },
-      -- { "gI", function() Snacks.picker.lsp_implementations() end, desc = "Goto Implementation" },
-      -- { "gy", function() Snacks.picker.lsp_type_definitions() end, desc = "Goto T[y]pe Definition" },
-      -- { "<leader>ss", function() Snacks.picker.lsp_symbols() end, desc = "LSP Symbols" },
-      -- { "<leader>sS", function() Snacks.picker.lsp_workspace_symbols() end, desc = "LSP Workspace Symbols" },
-      -- -- Other
-      -- { "<leader>z",  function() Snacks.zen() end, desc = "Toggle Zen Mode" },
-      -- { "<leader>Z",  function() Snacks.zen.zoom() end, desc = "Toggle Zoom" },
-      -- { "<leader>.",  function() Snacks.scratch() end, desc = "Toggle Scratch Buffer" },
-      -- { "<leader>S",  function() Snacks.scratch.select() end, desc = "Select Scratch Buffer" },
-      -- { "<leader>n",  function() Snacks.notifier.show_history() end, desc = "Notification History" },
-      -- { "<leader>bd", function() Snacks.bufdelete() end, desc = "Delete Buffer" },
-      -- { "<leader>cR", function() Snacks.rename.rename_file() end, desc = "Rename File" },
-      -- { "<leader>gB", function() Snacks.gitbrowse() end, desc = "Git Browse", mode = { "n", "v" } },
-      -- { "<leader>gg", function() Snacks.lazygit() end, desc = "Lazygit" },
-      -- { "<leader>un", function() Snacks.notifier.hide() end, desc = "Dismiss All Notifications" },
-      -- { "<c-/>",      function() Snacks.terminal() end, desc = "Toggle Terminal" },
-      -- { "<c-_>",      function() Snacks.terminal() end, desc = "which_key_ignore" },
-      -- { "]]",         function() Snacks.words.jump(vim.v.count1) end, desc = "Next Reference", mode = { "n", "t" } },
-      -- { "[[",         function() Snacks.words.jump(-vim.v.count1) end, desc = "Prev Reference", mode = { "n", "t" } },
-      -- {
-      --   "<leader>N",
-      --   desc = "Neovim News",
-      --   function()
-      --     Snacks.win({
-      --       file = vim.api.nvim_get_runtime_file("doc/news.txt", false)[1],
-      --       width = 0.6,
-      --       height = 0.6,
-      --       wo = {
-      --         spell = false,
-      --         wrap = false,
-      --         signcolumn = "yes",
-      --         statuscolumn = " ",
-      --         conceallevel = 3,
-      --       },
-      --     })
-      --   end,
-      -- }
     },
     init = function()
       -- vim.api.nvim_create_autocmd("User", {

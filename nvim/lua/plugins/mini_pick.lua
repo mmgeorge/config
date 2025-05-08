@@ -1566,37 +1566,37 @@ return {
       --   mode = { "n", "x" },
       --   desc = "Search Files",
       -- },
-      {
-        "oo",
-        function ()
-          require"mini.pick".registry.lsp({
-            scope = "document_symbol",
-            -- symbol_query = "function" How to get this to work?
-          }) 
-        end,
-        mode = { "n", "x" },
-        desc = "Search Functions",
-      }, 
-      {
-        "oy",
-        function ()
-          require"mini.pick".registry.visit_paths({
-            -- filter = "project",
-          }) 
-        end,
-        mode = { "n", "x" },
-        desc = "Search Buffer",
-      },
-      {
-        "Sr",
-        function ()
-          require"mini.pick".registry.spellsuggest({
-            n_suggestions = 10
-          }) 
-        end,
-        mode = { "n", "x" },
-        desc = "Search Functions",
-      }, 
+      -- {
+      --   "oo",
+      --   function ()
+      --     require"mini.pick".registry.lsp({
+      --       scope = "document_symbol",
+      --       -- symbol_query = "function" How to get this to work?
+      --     }) 
+      --   end,
+      --   mode = { "n", "x" },
+      --   desc = "Search Functions",
+      -- }, 
+      -- {
+      --   "oy",
+      --   function ()
+      --     require"mini.pick".registry.visit_paths({
+      --       -- filter = "project",
+      --     }) 
+      --   end,
+      --   mode = { "n", "x" },
+      --   desc = "Search Buffer",
+      -- },
+      -- {
+      --   "Sr",
+      --   function ()
+      --     require"mini.pick".registry.spellsuggest({
+      --       n_suggestions = 10
+      --     }) 
+      --   end,
+      --   mode = { "n", "x" },
+      --   desc = "Search Functions",
+      -- }, 
     },
     config = function ()
       local MiniPick = require"mini.pick"
