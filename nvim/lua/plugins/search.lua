@@ -156,7 +156,7 @@ return {
           previewLocation = { n = '<localleader>i' },
           -- syncLocations = { n = '<localleader>s' },
           -- syncLine = { n = '<localleader>l' },
-          -- close = { n = '<Esc>' },
+          close = { n = '<Esc>' },
           -- close = { n = '<localleader>c' },
           -- historyOpen = { n = '<localleader>t' },
           -- historyAdd = { n = '<localleader>a' },
