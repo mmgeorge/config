@@ -3,9 +3,9 @@ return {
     "stevearc/oil.nvim",
     keys = {
       {
-        -- "or",
-        "<leader>nr",
-        function() require('oil').open_float(".", { preview = { } })  end,
+        "or",
+        -- "<leader>nr",
+        function() require('oil').open_float(nil, { preview = { } })  end,
         -- function() require('oil').open()  end,
         mode = { "n", "x" },
         desc = "Oil file browser",
