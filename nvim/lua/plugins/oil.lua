@@ -41,7 +41,7 @@ return {
           signcolumn = "no",
           cursorcolumn = false,
           foldcolumn = "0",
-          spell = true,
+          spell = false,
           list = true,
           conceallevel = 3,
           concealcursor = "nvic",
