@@ -3,15 +3,15 @@ return {
     'echasnovski/mini.files',
     version = '*',
     keys = {
-      {
-        "or",
-        -- "<cmd>:lua MiniFiles.open()<CR>",
-        function ()
-          require"mini.files".open(vim.api.nvim_buf_get_name(0), false) 
-        end,
-        mode = { "n", "x" },
-        desc = "Explore Files",
-      }, 
+      -- {
+      --   "or",
+      --   -- "<cmd>:lua MiniFiles.open()<CR>",
+      --   function ()
+      --     require"mini.files".open(vim.api.nvim_buf_get_name(0), false) 
+      --   end,
+      --   mode = { "n", "x" },
+      --   desc = "Explore Files",
+      -- }, 
     },
     config = function ()
       require"mini.files".setup({
