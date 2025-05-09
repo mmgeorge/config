@@ -16,11 +16,13 @@ return {
         teal = "#9dffe7" 
       }
 
+      local black = "#0d1117"  
+
       local function getColors(color) 
         return {
-          a = { bg = color, fg = "black" },
-          b = { bg = "black", fg = color },
-          c = { bg = "black", fg = color }
+          a = { bg = color, fg = black },
+          b = { bg = black, fg = color },
+          c = { bg = black, fg = color }
         }
       end 
 

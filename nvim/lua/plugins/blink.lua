@@ -9,10 +9,14 @@ return {
 
     -- use a release tag to download pre-built binaries
     version = '1.*',
-
+ 
     init = function ()
-      vim.cmd([[highlight BlinkCmpMenuSelection	 ctermbg=White guibg=White ctermfg=Black guifg=Black]])
-      vim.cmd([[highlight BlinkCmpScrollBarThumb ctermbg=White guibg=White ctermfg=Black guifg=Black]])
+      vim.cmd([[highlight BlinkCmpMenu           guibg=#242529 guifg=White]])
+      vim.cmd([[highlight BlinkCmpLabel          guibg=#242529 guifg=White]])
+      vim.cmd([[highlight BlinkCmpKind           guibg=#242529 guifg=White]])
+      vim.cmd([[highlight BlinkCmpMenuSelection	 guibg=White   guifg=Black]])
+      vim.cmd([[highlight BlinkCmpScrollBarThumb guibg=White   guifg=Black]])
+      vim.cmd([[highlight BlinkCmpMenuSelection	 guibg=White   guifg=Black]])
     end,
 
     ---@module 'blink.cmp'
@@ -93,6 +97,7 @@ return {
       -- elsewhere in your config, without redefining it, due to `opts_extend`
       sources = {
         default = { 'lsp', 'path', 'custom_snippets', 'spell' },
+        min_keyword_length = 5, 
         providers = {
           custom_snippets = {
             name = "custom_snippets", 
@@ -102,6 +107,7 @@ return {
             name = 'Spell',
             module = 'blink-cmp-spell',
             opts = {
+              use_cmp_spell_storting = true, 
               -- EXAMPLE: Only enable source in `@spell` captures, and disable it
               -- in `@nospell` captures.
               enable_in_context = function()
