@@ -23,9 +23,12 @@ return {
       {
         "ot", 
         function ()
+          -- Can use -- at then end to pass flags, eg: 
+          -- [token] -- -g=*.el    only el files
+          -- [token] -- -ig=*.el   ignore case, only el
+          -- [token] -- -ig=!*.el  ignore case, not el files
           Snacks.picker.grep_word({
             finder = "grep",
-            regex = false,
             format = "file",
             search = function(picker)
               return picker:word()
@@ -284,10 +287,16 @@ return {
       bigfile = { enabled = true },
       dashboard = { enabled = false },
       explorer = { enabled = true },
-      indent = { enabled = false },
+      indent = {
+        enabled = false,
+        only_scope = true ,
+        only_current = true
+      },
       input = { enabled = true },
       quickfile = { enabled = false },
-      scope = { enabled = false },
+      scope = {
+        enabled = false,
+      },
       scroll = { enabled = false },
       statuscolumn = { enabled = false },
       words = { enabled = false },
