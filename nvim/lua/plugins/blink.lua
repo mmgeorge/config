@@ -9,10 +9,11 @@ return {
 
     -- use a release tag to download pre-built binaries
     version = '1.*',
-    -- AND/OR build from source, requires nightly: https://rust-lang.github.io/rustup/concepts/channels.html#working-with-nightly-rust
-    -- build = 'cargo build --release',
-    -- If you use nix, you can build from source using latest nightly rust with:
-    -- build = 'nix run .#build-plugin',
+
+    init = function ()
+      vim.cmd([[highlight BlinkCmpMenuSelection	 ctermbg=White guibg=White ctermfg=Black guifg=Black]])
+      vim.cmd([[highlight BlinkCmpScrollBarThumb ctermbg=White guibg=White ctermfg=Black guifg=Black]])
+    end,
 
     ---@module 'blink.cmp'
     ---@type blink.cmp.Config
@@ -46,9 +47,19 @@ return {
         enabled = true,
         keymap = { preset = 'enter' },
         completion = {
-          trigger = { show_on_blocked_trigger_characters = {}, show_on_x_blocked_trigger_characters = {} },
-          list = { selection = { preselect = true, auto_insert = true } },
-          menu = { auto_show = true },
+          trigger = {
+            show_on_blocked_trigger_characters = {},
+            show_on_x_blocked_trigger_characters = {},
+          },
+          list = {
+            selection = {
+              preselect = false,
+              auto_insert = true,
+            },
+          },
+          menu = {
+            auto_show = true,
+          },
           ghost_text = {
             enabled = true,
           },
@@ -57,7 +68,9 @@ return {
 
       -- (Default) Only show the documentation popup when manually triggered
       completion = {
-        documentation = { auto_show = false },
+        documentation = {
+          auto_show = false,
+        },
         ghost_text = {
           enabled = true,
           show_with_menu = true
@@ -65,8 +78,8 @@ return {
         menu = {
           draw = {
             columns = {
-              { "label", "label_description", gap = 1 },
-              { "kind_icon", gap = 1, "kind" },
+              { "kind_icon", "label", "label_description", gap = 1 },
+              {  "kind" },
             }
           }
         }
