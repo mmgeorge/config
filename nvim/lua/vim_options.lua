@@ -67,7 +67,9 @@ vim.api.nvim_create_autocmd({'BufEnter'}, {
 vim.api.nvim_create_autocmd({'FocusGained', 'CursorHold'}, {
   pattern = '*',  
   callback = function()
-    vim.cmd('checktime')
+    if vim.bo.modifiable then
+      vim.cmd('checktime')
+    end
   end
 })
 
