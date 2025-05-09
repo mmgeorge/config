@@ -1,9 +1,10 @@
 return {
    {
-    'MagicDuck/grug-far.nvim',
+    "mmgeorge/grug-far.nvim",
+    -- 'MagicDuck/grug-far.nvim',
     keys = {
       {
-        "ot",
+        "<leader>nt",
         function ()
           require('grug-far').with_visual_selection() 
         end,
@@ -152,7 +153,7 @@ return {
         -- see https://learnvimscriptthehardway.stevelosh.com/chapters/11.html#local-leader
         keymaps = {
           replace = { n = '<localleader>r' },
-          qflist = { n = '<localleader>q' },
+          qflist = { n = '<C-q>' },
           previewLocation = { n = '<localleader>i' },
           -- syncLocations = { n = '<localleader>s' },
           -- syncLine = { n = '<localleader>l' },
