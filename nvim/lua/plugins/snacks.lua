@@ -21,6 +21,40 @@ return {
         desc = "Files" 
       },
       {
+        "ot", 
+        function ()
+          Snacks.picker.grep_word({
+            finder = "grep",
+            regex = false,
+            format = "file",
+            search = function(picker)
+              return picker:word()
+            end,
+            live = true,
+            supports_live = true,
+            layout = {
+              layout = {
+                box = "vertical",
+                backdrop = false,
+                row = -1,
+                width = 0,
+                height = 0.4,
+                border = "top",
+                title = " {title} {live} {flags}",
+                title_pos = "left",
+                { win = "input", height = 1, border = "bottom" },
+                {
+                  box = "horizontal",
+                  { win = "list", border = "none" },
+                },
+              },
+            },
+
+          }) 
+        end,
+        desc = "Grep" 
+      },
+      {
         "Sr", function ()
           Snacks.picker.spelling({
             focus = "list",
@@ -251,7 +285,12 @@ return {
       dashboard = { enabled = false },
       explorer = { enabled = true },
       indent = { enabled = false },
-      input = { enabled = false },
+      input = { enabled = true },
+      quickfile = { enabled = false },
+      scope = { enabled = false },
+      scroll = { enabled = false },
+      statuscolumn = { enabled = false },
+      words = { enabled = false },
       notifier = {
         enabled = false,
         timeout = 3000,
@@ -312,7 +351,7 @@ return {
               ["gg"] = "list_top",
               ["j"] = "list_down",
               ["k"] = "list_up",
-              ["q"] = "close",
+              -- ["q"] = "close",
             },
             b = {
               minipairs_disable = true,
@@ -421,11 +460,6 @@ return {
         --   },
         -- },
       },
-      quickfile = { enabled = false },
-      scope = { enabled = false },
-      scroll = { enabled = false },
-      statuscolumn = { enabled = false },
-      words = { enabled = false },
       styles = {
         notification = {
           -- wo = { wrap = true } -- Wrap notifications

@@ -7,6 +7,7 @@ return {
     local glance = require('glance')
     local actions = glance.actions
 
+    ---@diagnostic disable-next-line: missing-fields
     glance.setup({
       height = 18, -- Height of the window
       zindex = 45,
