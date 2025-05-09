@@ -97,7 +97,7 @@ return {
       -- elsewhere in your config, without redefining it, due to `opts_extend`
       sources = {
         default = { 'lsp', 'path', 'custom_snippets', 'spell' },
-        min_keyword_length = 5, 
+        -- min_keyword_length = 3, 
         providers = {
           custom_snippets = {
             name = "custom_snippets", 
@@ -105,6 +105,7 @@ return {
           }, 
           spell = {
             name = 'Spell',
+            min_keyword_length = 5,
             module = 'blink-cmp-spell',
             opts = {
               use_cmp_spell_storting = true, 
