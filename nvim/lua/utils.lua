@@ -312,6 +312,98 @@ function M.textobject_at_point(query_string, query_group, pos, bufnr, opts)
   end
 end
 
+M.get_position_before_postfix = function()
+  local pos = vim.api.nvim_win_get_cursor(0) -- get current cursor position
+  local row = pos[1] - 1 -- must convert to 0 indexed
+  local line = vim.api.nvim_get_current_line()
+  local dot_position = line:find("%.") 
+
+  if dot_position then 
+    return { row, dot_position - 2 } -- Before dot + 1 based index
+  end
+
+  return nil
+end
+
+-- Type postfix snippet
+M.type_node = function()
+  local node = vim.treesitter.get_node({
+    pos = M.get_position_before_postfix()
+  })
+
+  local function is_type(ty)
+    if 
+      ty == "primitive_type" or 
+      ty == "scoped_type_identifier" or 
+      ty == "generic_type" or 
+      ty == "type_identifier"  then
+      return true
+    end 
+
+    return false
+  end
+
+  while node do 
+    local ty = node:type()
+
+    local parent = node:parent(); 
+    local parent_ty = parent and parent:type()
+
+    if is_type(ty) and not is_type(parent_ty) then
+      return node
+    end
+
+    node = parent
+  end 
+
+  return nil
+end 
+
+-- Expression postfix snippet
+M.expr_node = function()
+  local node = vim.treesitter.get_node({
+    pos = M.get_position_before_postfix()
+  })
+
+  while node do 
+    local ty = node:type()
+    if 
+      ty == "call_expression" or 
+      ty == "integer_literal" or 
+      ty == "string_literal" or 
+      ty == "float_literal" then 
+      return node
+    end 
+
+    node = node:parent()
+  end 
+
+  return nil
+end
+
+-- Create a postfix snippet
+M.postfix = function(options)
+  return { 
+    trigger = options.trigger, 
+    execute = function ()
+      local node = options.node()
+      if node == nil then
+        return nil
+      end
+
+      local row, col = node:start()
+      local text = vim.treesitter.get_node_text(node, 0):gsub('%.%w*$', '')  -- remove postfix
+      local pos = vim.api.nvim_win_get_cursor(0)
+      return {
+        body = options.body(text), 
+        clear_region = {
+          from = { row, col },
+          to = { pos[1] - 1, pos[2] } 
+        }
+      } 
+    end, 
+  }  
+end
 
 
 return M

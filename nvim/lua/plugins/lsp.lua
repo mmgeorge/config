@@ -44,15 +44,100 @@ return {
   -- Setup servers via lspconfig --
   {
     "neovim/nvim-lspconfig",
+    dependencies = { 'saghen/blink.cmp' },
     config = function()
-      -- local lspconfig = require("lspconfig")
-      -- lspconfig.lua_ls.setup({})
-      -- lspconfig.rust_analyzer.setup({})
-      -- lspconfig.tsserver.setup({})
-      -- lspconfig.eslint.setup({})
+      local lspconfig = require("lspconfig")
+      local capabilities = require('blink.cmp').get_lsp_capabilities()
+      
+      lspconfig['terraformls'].setup({
+        capabilities = capabilities
+      })  
+      
+      lspconfig['lua_ls'].setup({
+        capabilities = capabilities
+      })
+
+      lspconfig['tailwindcss'].setup({
+        capabilities = capabilities
+      })
+      
+      lspconfig['cssls'].setup({
+        capabilities = capabilities
+      })
+
+      local configs = require "lspconfig.configs"
+      if not configs.slangd then
+        configs.slangd = {
+          default_config = {
+            cmd = { "slangd", "--debug" },
+            filetypes = { "slang", "hlsl" },
+            root_dir = function(fname)
+              return lspconfig.util.find_git_ancestor(fname)
+            end,
+            single_file_support = true,
+          },
+        }
+        lspconfig.slangd.setup {
+          capabilities = capabilities
+        }
+      end
+
+      lspconfig['eslint'].setup({
+        capabilities = capabilities,
+        on_attach = function(client, bufnr)
+          vim.api.nvim_create_autocmd("BufWritePre", {
+            buffer = bufnr,
+            command = "EslintFixAll",
+          })
+        end,
+        -- cmd = { "npx", "eslint", "--stdio" },
+        settings = {
+          codeAction = {
+            disableRuleComment = {
+              enable = true,
+              location = "separateLine"
+            },
+            showDocumentation = {
+              enable = true
+            }
+          },
+          codeActionOnSave = {
+            enable = true,
+            mode = "all"
+          },
+          -- experimental = {
+          -- useFlatConfig = true
+          -- },
+          format = true,
+          -- nodePath = "",
+          -- onIgnoredFiles = "off",
+          problems = {
+            shortenToSingleLine = false
+          },
+          -- quiet = true,
+          rulesCustomizations = {
+            {
+              rule = 'prettier/prettier',
+              severity = 'off', 
+            },
+            {
+              rule = '@typescript-eslint/no-unused-vars',
+              severity = 'warn', 
+            }
+          },
+          run = "onType",
+          -- useESLintClass = false,
+          validate = "on",
+          workingDirectory = {
+            mode = "location"
+          },
+          -- root_dir = lspconfig.util.find_git_ancestor,
+        }
+      })
+
+
     end
   },
-  
   {
     "smjonas/inc-rename.nvim",
     config = function ()
