@@ -1,3 +1,21 @@
+local no_preview =  {
+  layout = {
+    box = "vertical",
+    backdrop = false,
+    row = -1,
+    width = 0,
+    height = 0.4,
+    border = "top",
+    title = " {title} {live} {flags}",
+    title_pos = "left",
+    { win = "input", height = 1, border = "bottom" },
+    {
+      box = "horizontal",
+      { win = "list", border = "none" },
+    },
+  },
+}
+
 return {
   {
     "folke/snacks.nvim",
@@ -35,24 +53,7 @@ return {
             end,
             live = true,
             supports_live = true,
-            layout = {
-              layout = {
-                box = "vertical",
-                backdrop = false,
-                row = -1,
-                width = 0,
-                height = 0.4,
-                border = "top",
-                title = " {title} {live} {flags}",
-                title_pos = "left",
-                { win = "input", height = 1, border = "bottom" },
-                {
-                  box = "horizontal",
-                  { win = "list", border = "none" },
-                },
-              },
-            },
-
+            -- layout = no_preview,
           }) 
         end,
         desc = "Grep" 
@@ -61,23 +62,7 @@ return {
         "Sr", function ()
           Snacks.picker.spelling({
             focus = "list",
-            layout = {
-              layout = {
-                box = "vertical",
-                backdrop = false,
-                row = -1,
-                width = 0,
-                height = 0.4,
-                border = "top",
-                title = " {title} {live} {flags}",
-                title_pos = "left",
-                { win = "input", height = 1, border = "bottom" },
-                {
-                  box = "horizontal",
-                  { win = "list", border = "none" },
-                },
-              },
-            },
+            layout = no_preview,
           }) 
         end,
         desc = "Spelling" 
@@ -234,9 +219,18 @@ return {
             unloaded = true,
             current = false,
             sort_lastused = true,
+            layout = no_preview,
             win = {
-              input = { keys = { ["<c-x>"] = { "bufdelete", mode = { "n", "i" } } } },
-              list = { keys = { ["jj"] = "bufdelete" } },
+              input = {
+                keys = {
+                  ["<c-j>"] = { "bufdelete", mode = { "n", "i" } },
+                },
+              },
+              list = {
+                keys = {
+                  ["jj"] = "bufdelete",
+                },
+              },
             },
           })
         end, 
@@ -248,23 +242,7 @@ return {
           Snacks.picker.lines({
             finder = "lines",
             format = "lines",
-            layout = {
-              layout = {
-                box = "vertical",
-                backdrop = false,
-                row = -1,
-                width = 0,
-                height = 0.4,
-                border = "top",
-                title = " {title} {live} {flags}",
-                title_pos = "left",
-                { win = "input", height = 1, border = "bottom" },
-                {
-                  box = "horizontal",
-                  { win = "list", border = "none" },
-                },
-              },
-            },
+            -- layout = no_preview,
             jump = { match = true },
             -- allow any window to be used as the main window
             main = { current = true },
@@ -358,8 +336,8 @@ return {
               ["?"] = "toggle_help_input",
               ["G"] = "list_bottom",
               ["gg"] = "list_top",
-              ["j"] = "list_down",
-              ["k"] = "list_up",
+              -- ["j"] = "",
+              -- ["k"] = "list_up",
               -- ["q"] = "close",
             },
             b = {
@@ -405,13 +383,13 @@ return {
               ["?"] = "toggle_help_list",
               ["G"] = "list_bottom",
               ["gg"] = "list_top",
-              ["i"] = "focus_input",
-              ["j"] = "list_down",
-              ["k"] = "list_up",
-              ["q"] = "close",
-              ["zb"] = "list_scroll_bottom",
-              ["zt"] = "list_scroll_top",
-              ["zz"] = "list_scroll_center",
+              -- ["i"] = "focus_input",
+              -- ["j"] = "list_down",
+              -- ["k"] = "list_up",
+              -- ["q"] = "close",
+              -- ["zb"] = "list_scroll_bottom",
+              -- ["zt"] = "list_scroll_top",
+              -- ["zz"] = "list_scroll_center",
             },
             wo = {
               conceallevel = 2,
@@ -430,33 +408,13 @@ return {
         },
         -- https://github.com/folke/snacks.nvim/blob/main/docs/picker.md
         enabled = true, 
-        layout = {
-          layout = {
-            box = "vertical",
-            backdrop = false,
-            row = -1,
-            width = 0,
-            height = 0.4,
-            border = "top",
-            title = " {title} {live} {flags}",
-            title_pos = "left",
-            { win = "input", height = 1, border = "bottom" },
-            {
-              box = "horizontal",
-              { win = "list", border = "none" },
-              { win = "preview", title = "{preview}", width = 0.5, border = "left" },
-            },
-          },
-        },
         -- layout = {
-        --   -- Ivy split
-        --   preview = "main",
         --   layout = {
         --     box = "vertical",
         --     backdrop = false,
+        --     row = -1,
         --     width = 0,
         --     height = 0.4,
-        --     position = "bottom",
         --     border = "top",
         --     title = " {title} {live} {flags}",
         --     title_pos = "left",
@@ -464,10 +422,30 @@ return {
         --     {
         --       box = "horizontal",
         --       { win = "list", border = "none" },
-        --       { win = "preview", title = "{preview}", width = 0.6, border = "left" },
+        --       { win = "preview", title = "{preview}", width = 0.5, border = "left" },
         --     },
         --   },
         -- },
+        layout = {
+          -- Ivy split
+          preview = "main",
+          layout = {
+            box = "vertical",
+            backdrop = false,
+            width = 0,
+            height = 0.4,
+            position = "bottom",
+            border = "top",
+            title = " {title} {live} {flags}",
+            title_pos = "left",
+            { win = "input", height = 1, border = "bottom" },
+            {
+              box = "horizontal",
+              { win = "list", border = "none" },
+              { win = "preview", title = "{preview}", width = 0.6, border = "left" },
+            },
+          },
+        },
       },
       styles = {
         notification = {
