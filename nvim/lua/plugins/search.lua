@@ -1,7 +1,7 @@
 return {
    {
-    "mmgeorge/grug-far.nvim",
-    -- 'MagicDuck/grug-far.nvim',
+    -- "mmgeorge/grug-far.nvim",
+    'MagicDuck/grug-far.nvim',
     keys = {
       {
         "<leader>nt",
@@ -23,6 +23,8 @@ return {
     },
     config = function()
       require('grug-far').setup({
+        smartInputHandling = false, 
+        
         -- debounce milliseconds for issuing search while user is typing
         -- prevents excessive searching
         debounceMs = 100,

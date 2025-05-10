@@ -11,12 +11,13 @@ return {
     version = '1.*',
  
     init = function ()
-      vim.cmd([[highlight BlinkCmpMenu           guibg=#242529 guifg=White]])
-      vim.cmd([[highlight BlinkCmpLabel          guibg=#242529 guifg=White]])
-      vim.cmd([[highlight BlinkCmpKind           guibg=#242529 guifg=White]])
-      vim.cmd([[highlight BlinkCmpMenuSelection	 guibg=White   guifg=Black]])
-      vim.cmd([[highlight BlinkCmpScrollBarThumb guibg=White   guifg=Black]])
-      vim.cmd([[highlight BlinkCmpMenuSelection	 guibg=White   guifg=Black]])
+      vim.cmd([[highlight BlinkCmpMenu            guibg=#242529 guifg=White]])
+      vim.cmd([[highlight BlinkCmpLabel           guibg=#242529 guifg=White]])
+      vim.cmd([[highlight BlinkCmpKind            guibg=#242529 guifg=White]])
+      vim.cmd([[highlight BlinkCmpMenuSelection	  guibg=White   guifg=Black]])
+      vim.cmd([[highlight BlinkCmpScrollBarThumb  guibg=White   guifg=Black]])
+      vim.cmd([[highlight BlinkCmpScrollBarGutter guifg=White              ]])
+      vim.cmd([[highlight BlinkCmpMenuSelection	  guibg=White   guifg=Black]])
     end,
 
     ---@module 'blink.cmp'
