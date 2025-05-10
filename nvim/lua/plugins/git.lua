@@ -253,10 +253,11 @@ return {
   },
   {
     "NeogitOrg/neogit",
-    commit = "0cae7abc30cb91d661f28257c331fcb5b5198e31",
+    -- commit = "0cae7abc30cb91d661f28257c331fcb5b5198e31",
     dependencies = {
       "nvim-lua/plenary.nvim",         -- required
       "sindrets/diffview.nvim",        -- optional - Diff integration
+      "folke/snacks.nvim",  
     },
     keys = {
       {
@@ -269,7 +270,7 @@ return {
       local neogit = require("neogit")
       neogit.setup {
         disable_hint = false,
-        disable_context_highlighting = false,
+        disable_context_highlighting = true,
         disable_signs = false,
         -- Changes what mode the Commit Editor starts in. `true` will leave nvim in normal mode,
         -- `false` will change nvim to insert mode, and `"auto"` will change nvim to insert mode
@@ -308,14 +309,14 @@ return {
           "NeogitRevertPopup--no-edit",
         },
         -- Configure highlight group features
-        highlight = {
-          italic = true,
-          bold = true,
-          underline = true
-        },
+        -- highlight = {
+        --   italic = true,
+        --   bold = true,
+        --   underline = true
+        -- },
         -- Set to false if you want to be responsible for creating _ALL_ keymappings
         -- use_default_keymaps = false,
-        use_default_keymaps = true,
+        use_default_keymaps = false,
         -- Neogit refreshes its internal state after specific events, which can be
         -- expensive depending on the repository size. Disabling `auto_refresh`
         -- will make it so you have to manually refresh the status after you open it.
@@ -367,35 +368,32 @@ return {
         popup = {
           kind = "split",
         },
-        signs = {
-          -- { CLOSED, OPENED }
-          hunk = { "##", "##" },
-          item = { ">", "v" },
-          section = { ">", "v" },
-        },
+        -- signs = {
+        --   -- { CLOSED, OPENED }
+        --   hunk = { "##", "##" },
+        --   item = { ">", "v" },
+        --   section = { ">", "v" },
+        -- },
         -- Each Integration is auto-detected through plugin presence, however, it can be disabled by setting to `false`
         integrations = {
-          -- If enabled, use telescope for menu selection rather than vim.ui.select.
-          -- Allows multi-select and some things that vim.ui.select doesn't.
-          telescope = true,
-          -- Neogit only provides inline diffs. If you want a more traditional way to
-          -- look at diffs, you can use `diffview`.
-          -- The diffview integration enables the diff popup.
-          --
-          -- Requires you to have `sindrets/diffview.nvim` installed.
+          snacks = true,
           diffview = true,
-          fzf_lua = nil, -- Use telescope instead
         },
         mappings = {
           commit_editor = {
             ["q"] = "Close",
-            ["<C-k>"] = "Close",
+            ["<c-c><c-c>"] = "Submit",
+            ["<c-c><c-k>"] = "Abort",
+            ["<m-p>"] = "PrevMessage",
+            ["<m-n>"] = "NextMessage",
+            ["<m-r>"] = "ResetMessage",
+          },
+          commit_editor_I = {
             ["<c-c><c-c>"] = "Submit",
             ["<c-c><c-k>"] = "Abort",
           },
           rebase_editor = {
             ["p"] = "Pick",
-            ["<C-k>"] = "Close",
             ["r"] = "Reword",
             ["e"] = "Edit",
             ["s"] = "Squash",
@@ -409,6 +407,12 @@ return {
             ["gj"] = "MoveDown",
             ["<c-c><c-c>"] = "Submit",
             ["<c-c><c-k>"] = "Abort",
+            ["[c"] = "OpenOrScrollUp",
+            ["]c"] = "OpenOrScrollDown",
+          },
+          rebase_editor_I = {
+            ["<c-c><c-c>"] = "Submit",
+            ["<c-c><c-k>"] = "Abort",
           },
           finder = {
             ["<cr>"] = "Select",
@@ -418,20 +422,31 @@ return {
             ["<c-p>"] = "Previous",
             ["<down>"] = "Next",
             ["<up>"] = "Previous",
-            ["<tab>"] = "MultiselectToggleNext",
-            ["<s-tab>"] = "MultiselectTogglePrevious",
+            ["<tab>"] = "InsertCompletion",
+            ["<space>"] = "MultiselectToggleNext",
+            ["<s-space>"] = "MultiselectTogglePrevious",
             ["<c-j>"] = "NOP",
+            ["<ScrollWheelDown>"] = "ScrollWheelDown",
+            ["<ScrollWheelUp>"] = "ScrollWheelUp",
+            ["<ScrollWheelLeft>"] = "NOP",
+            ["<ScrollWheelRight>"] = "NOP",
+            ["<LeftMouse>"] = "MouseClick",
+            ["<2-LeftMouse>"] = "NOP",
           },
           -- Setting any of these to `false` will disable the mapping.
           popup = {
             ["?"] = "HelpPopup",
             ["A"] = "CherryPickPopup",
-            ["D"] = "DiffPopup",
+            ["d"] = "DiffPopup",
             ["M"] = "RemotePopup",
             ["P"] = "PushPopup",
             ["X"] = "ResetPopup",
             ["Z"] = "StashPopup",
+            ["i"] = "IgnorePopup",
+            ["t"] = "TagPopup",
             ["b"] = "BranchPopup",
+            ["B"] = "BisectPopup",
+            ["w"] = "WorktreePopup",
             ["c"] = "CommitPopup",
             ["f"] = "FetchPopup",
             ["l"] = "LogPopup",
@@ -439,33 +454,43 @@ return {
             ["p"] = "PullPopup",
             ["r"] = "RebasePopup",
             ["v"] = "RevertPopup",
-            ["w"] = "WorktreePopup",
           },
           status = {
+            ["j"] = "MoveDown",
+            ["k"] = "MoveUp",
+            ["o"] = "OpenTree",
             ["q"] = "Close",
-            ["<C-k>"] = "Close",
             ["I"] = "InitRepo",
             ["1"] = "Depth1",
             ["2"] = "Depth2",
             ["3"] = "Depth3",
             ["4"] = "Depth4",
+            ["Q"] = "Command",
             ["<tab>"] = "Toggle",
             ["x"] = "Discard",
             ["s"] = "Stage",
             ["S"] = "StageUnstaged",
             ["<c-s>"] = "StageAll",
             ["u"] = "Unstage",
+            ["K"] = "Untrack",
             ["U"] = "UnstageStaged",
+            ["y"] = "ShowRefs",
             ["$"] = "CommandHistory",
-            -- ["#"] = "Console",
             ["Y"] = "YankSelected",
             ["<c-r>"] = "RefreshBuffer",
-            ["<enter>"] = "GoToFile",
+            ["<cr>"] = "GoToFile",
+            ["<s-cr>"] = "PeekFile",
             ["<c-v>"] = "VSplitOpen",
             ["<c-x>"] = "SplitOpen",
             ["<c-t>"] = "TabOpen",
             ["{"] = "GoToPreviousHunkHeader",
             ["}"] = "GoToNextHunkHeader",
+            ["[c"] = "OpenOrScrollUp",
+            ["]c"] = "OpenOrScrollDown",
+            ["<c-k>"] = "PeekUp",
+            ["<c-j>"] = "PeekDown",
+            ["<c-n>"] = "NextSection",
+            ["<c-p>"] = "PreviousSection",
           },
         },
         sections = {
