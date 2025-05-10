@@ -16,6 +16,8 @@ return {
         ensure_installed = {
           "lua_ls",
           "eslint",
+          -- "ts_ls",
+          "vtsls",
           -- "rust_analyzer",
           "terraformls",
           -- "tailwind-language-server",
@@ -43,25 +45,32 @@ return {
   -- Setup servers via lspconfig --
   {
     "neovim/nvim-lspconfig",
-    dependencies = { 'saghen/blink.cmp' },
+    dependencies = {
+      'saghen/blink.cmp',
+      'yioneko/nvim-vtsls'
+    },
     config = function()
-      local lspconfig = require("lspconfig")
       local capabilities = require('blink.cmp').get_lsp_capabilities()
-      
-      lspconfig['terraformls'].setup({
-        capabilities = capabilities
-      })  
-      
-      lspconfig['lua_ls'].setup({
-        capabilities = capabilities
-      })
 
-      lspconfig['tailwindcss'].setup({
-        capabilities = capabilities
+      vim.lsp.config('terraformls', {
+        capabilities = capabilities,
       })
       
-      lspconfig['cssls'].setup({
-        capabilities = capabilities
+      vim.lsp.config('lua_ls', {
+        capabilities = capabilities,
+      })
+      
+      require("lspconfig.configs").vtsls = require("vtsls").lspconfig 
+      vim.lsp.config('vtsls', {
+        capabilities = capabilities,
+      })
+      
+      vim.lsp.config('tailwindcss', {
+        capabilities = capabilities,
+      })
+      
+      vim.lsp.config('cssls', {
+        capabilities = capabilities,
       })
 
       local configs = require "lspconfig.configs"
@@ -71,17 +80,19 @@ return {
             cmd = { "slangd", "--debug" },
             filetypes = { "slang", "hlsl" },
             root_dir = function(fname)
-              return lspconfig.util.find_git_ancestor(fname)
+              return require("lspconfig").util.find_git_ancestor(fname)
             end,
             single_file_support = true,
           },
         }
-        lspconfig.slangd.setup {
-          capabilities = capabilities
-        }
+      
+        vim.lsp.config('slangd', {
+          capabilities = capabilities,
+        })
       end
 
-      lspconfig['eslint'].setup({
+      require("lspconfig").eslint.setup({
+      -- vim.lsp.config('eslint', {
         capabilities = capabilities,
         on_attach = function(client, bufnr)
           vim.api.nvim_create_autocmd("BufWritePre", {
@@ -133,8 +144,6 @@ return {
           -- root_dir = lspconfig.util.find_git_ancestor,
         }
       })
-
-
     end
   },
   {
