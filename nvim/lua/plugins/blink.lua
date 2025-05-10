@@ -11,13 +11,14 @@ return {
     version = '1.*',
  
     init = function ()
-      vim.cmd([[highlight BlinkCmpMenu            guibg=#242529 guifg=White]])
-      vim.cmd([[highlight BlinkCmpLabel           guibg=#242529 guifg=White]])
-      vim.cmd([[highlight BlinkCmpKind            guibg=#242529 guifg=White]])
-      vim.cmd([[highlight BlinkCmpMenuSelection	  guibg=White   guifg=Black]])
-      vim.cmd([[highlight BlinkCmpScrollBarThumb  guibg=White   guifg=Black]])
-      vim.cmd([[highlight BlinkCmpScrollBarGutter guifg=White              ]])
-      vim.cmd([[highlight BlinkCmpMenuSelection	  guibg=White   guifg=Black]])
+      vim.cmd([[highlight BlinkCmpMenu             guibg=#242529 guifg=White]])
+      vim.cmd([[highlight BlinkCmpLabel            guibg=#242529 guifg=White]])
+      vim.cmd([[highlight BlinkCmpLabelDescription guibg=#242529 guifg=#3ec5ff]])
+      vim.cmd([[highlight BlinkCmpKind             guibg=#242529 guifg=White]])
+      vim.cmd([[highlight BlinkCmpMenuSelection	   guibg=White   guifg=Black]])
+      vim.cmd([[highlight BlinkCmpScrollBarThumb   guibg=White   guifg=Black]])
+      vim.cmd([[highlight BlinkCmpScrollBarGutter  guifg=White              ]])
+      vim.cmd([[highlight BlinkCmpMenuSelection	   guibg=White   guifg=Black]])
     end,
 
     ---@module 'blink.cmp'
@@ -83,15 +84,16 @@ return {
         menu = {
           draw = {
             columns = {
-              { "kind_icon", "label", "label_description", gap = 1 },
-              {  "kind" },
+              { "kind_icon" }, { "label", "label_description" },
+              -- { "kind_icon", "label", "label_description", gap = 1 },
+              -- {  "kind" },
             }
           }
         }
       },
 
       signature = {
-        enabled = true
+        enabled = false
       },
 
       -- Default list of enabled providers defined so that you can extend it
