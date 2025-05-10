@@ -339,6 +339,8 @@ return {
         },
         commit_editor = {
           kind = "auto",
+          show_staged_diff = false, 
+          spell_check = true
         },
         commit_select_view = {
           kind = "tab",
