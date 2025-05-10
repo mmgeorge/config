@@ -1,12 +1,14 @@
 return {
   {
     "stevearc/oil.nvim",
+    lazy = false, 
     keys = {
       {
         "or",
         -- "<leader>nr",
         -- function() require('oil').open(nil, { preview = { }, split = "horizontal" })  end,
-        function() require('oil').open_float(nil, { preview = { } })  end,
+        function() require('oil').open_float(nil, { })  end,
+        -- function() require('oil').open_float(nil, { preview = { } })  end,
         -- function() require('oil').open()  end,
         mode = { "n", "x" },
         desc = "Oil file browser",
@@ -147,16 +149,15 @@ return {
             winblend = 0,
           },
           -- preview_split: Split direction: "auto", "left", "right", "above", "below".
-          preview_split = "right",
+          preview_split = "none",
           -- This is the config that will be passed to nvim_open_win.
           -- Change values here to customize the layout
           override = function(conf)
             -- return conf
             local width = vim.api.nvim_win_get_width(0)
             local height = vim.api.nvim_win_get_height(0)
-            local size = 25
+            local size = 20
             -- conf.title = "hi mom"
---
             -- return conf
 
             return {
