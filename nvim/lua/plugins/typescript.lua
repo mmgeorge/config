@@ -71,11 +71,11 @@ return {
   --   end,
   --
   -- },
-  {
-    -- Provides much better indenting than treesitter
-    "https://github.com/MaxMEllon/vim-jsx-pretty",
-    config = function ()
-      -- require("vim-jsx-pretty").setup({})
-    end
-  }
+  -- {
+  --   -- Provides much better indenting than treesitter
+  --   "https://github.com/MaxMEllon/vim-jsx-pretty",
+  --   config = function ()
+  --     -- require("vim-jsx-pretty").setup({})
+  --   end
+  -- }
 }

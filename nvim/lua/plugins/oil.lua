@@ -7,7 +7,7 @@ return {
         "or",
         -- "<leader>nr",
         -- function() require('oil').open(nil, { preview = { }, split = "horizontal" })  end,
-        function() require('oil').open_float(nil, { })  end,
+        function() require('oil').open_float(nil, {})  end,
         -- function() require('oil').open_float(nil, { preview = { } })  end,
         -- function() require('oil').open()  end,
         mode = { "n", "x" },
@@ -149,7 +149,7 @@ return {
             winblend = 0,
           },
           -- preview_split: Split direction: "auto", "left", "right", "above", "below".
-          preview_split = "none",
+          -- preview_split = "none",
           -- This is the config that will be passed to nvim_open_win.
           -- Change values here to customize the layout
           override = function(conf)

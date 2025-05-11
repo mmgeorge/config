@@ -43,12 +43,12 @@ return {
           enable = true,
           -- Needed to play nixe with vim-jsx-pretty (vim-polygot)
           -- https://github.com/nvim-treesitter/nvim-treesitter/issues/1019 
-          additional_vim_regex_highlighting = true
+          -- additional_vim_regex_highlighting = true
         },
         indent = { 
           enable = true, 
           -- vim-jsx-pretty provides better indent. See typescript config
-          disable = { "tsx" }
+          -- disable = { "tsx" }
         }, 
         autotag = {
           enable = true

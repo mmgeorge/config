@@ -171,12 +171,6 @@ vim.keymap.set({'n'}, 'gko', '<CMD>only<CR>', {})
 vim.keymap.set({'n'}, 'gks', '<CMD>close!<CR>', {})
 vim.keymap.set({'n'}, 'gkb', '<CMD>bd<CR>', {})
 
-vim.keymap.set({'n'}, 'ge', '<CMD>Trouble diagnostics filter.severity=vim.diagnostic.severity.ERROR<CR>', {})
--- vim.keymap.set({'n'}, 'gd', '<CMD>Trouble diagnostics toggle focus=false filter.buf=0 <CR>', {})
-vim.keymap.set({'n'}, 'ge', '<CMD>Trouble diagnostics toggle filter.severity=vim.diagnostic.severity.ERROR focus=true <CR>', {})
-vim.keymap.set({'n'}, 'gd', '<CMD>Trouble diagnostics toggle focus=true <CR>', {})
-vim.keymap.set({'n'}, 'gq', '<CMD>Trouble quickfix toggle focus=true <CR>', {})
-
 k.keymap('n', 'wq', function() require("trouble").toggle("quickfix") end) 
 
 -- Lsp --
@@ -191,10 +185,7 @@ vim.keymap.set({'n'}, '<CR>', 'i<CR><ESC>' )
 k.keymap('n', '.', '<CMD>Glance definitions<CR>') 
 k.keymap('n', 'or', '<CMD>Glance references<CR>') 
 k.keymap('n', 'ot', '<CMD>Glance type_definitions<CR>') 
--- k.keymap('n', 'oi', '<CMD>Glance implementations<CR>') 
--- vim.keymap.set('n', 'oi', '<CMD>Glance implementations<CR>') 
 k.keymap({'n', 'x'}, 'ou', function() vim.diagnostic.open_float(nil, { focus = false }) end)
-
 
 k.keymap('n', 'ou', vim.lsp.buf.hover) 
 k.keymap('n', 'oe', function ()
