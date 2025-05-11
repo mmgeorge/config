@@ -69,78 +69,110 @@ return {
       },
       -- Currently I prefer treesitter over this as we don't need to wait for the lsp 
       -- to startup
-      -- {
-      --   "oo", 
-      --   function ()
-      --     Snacks.picker.lsp_symbols({
-      --       tree = false,
-      --       filter = {
-      --         default = {
-      --           "Class",
-      --           "Constructor",
-      --           "Enum",
-      --           "Field",
-      --           "Function",
-      --           "Interface",
-      --           "Method",
-      --           "Module",
-      --           "Namespace",
-      --           "Package",
-      --           "Property",
-      --           "Struct",
-      --           "Trait",
-      --         },
-      --         -- set to `true` to include all symbols
-      --         markdown = true,
-      --         help = true,
-      --         -- you can specify a different filter for each filetype
-      --         lua = {
-      --           "Class",
-      --           "Constructor",
-      --           "Enum",
-      --           "Field",
-      --           "Function",
-      --           "Interface",
-      --           "Method",
-      --           "Module",
-      --           "Namespace",
-      --           -- "Package", -- remove package since luals uses it for control flow structures
-      --           "Property",
-      --           "Struct",
-      --           "Trait",
-      --         },
-      --       }
-      --     }) 
-      --   end,
-      --   desc = "Symbols" 
-      -- },
       {
         "oo", 
         function ()
-          Snacks.picker.treesitter({
-            finder = "treesitter_symbols",
-            format = "lsp_symbol",
+          Snacks.picker.lsp_symbols({
             tree = true,
             filter = {
               default = {
                 "Class",
+                "Constructor",
                 "Enum",
                 "Field",
                 "Function",
+                "Interface",
                 "Method",
                 "Module",
                 "Namespace",
+                "Package",
+                "Property",
+                "Struct",
+                "Trait",
+                "Variable",
+                -- "Type", 
+                -- "Object",
+              },
+              rust = {
+                "Class",
+                "Constructor",
+                "Enum",
+                -- "Field",
+                "Function",
+                "Interface",
+                "Method",
+                "Module",
+                "Namespace",
+                "Package",
+                -- "Property",
+                "Struct",
+                "Trait",
+                "Object",
+              },
+              typescript = {
+                "Class",
+                "Constructor",
+                "Enum",
+                "Field",
+                "Function",
+                "Interface",
+                "Method",
+                "Module",
+                "Namespace",
+                "Package",
+                "Property",
                 "Struct",
                 "Trait",
               },
-              -- set to `true` to include all symbols
-              markdown = true,
-              help = true,
-            },
+              lua = {
+                "Class",
+                "Constructor",
+                "Enum",
+                "Field",
+                "Function",
+                "Interface",
+                "Method",
+                "Module",
+                "Namespace",
+                -- "Package", -- remove package since luals uses it for control flow structures
+                "Property",
+                "Struct",
+                "Trait",
+              },
+            }
           }) 
         end,
         desc = "Symbols" 
       },
+      -- {
+      --   "oo", 
+      --   function ()
+      --     Snacks.picker.treesitter({
+      --       finder = "treesitter_symbols",
+      --       format = "lsp_symbol",
+      --       tree = true,
+      --       filter = {
+      --         default = {
+      --           "Class",
+      --           "Enum",
+      --           "Field",
+      --           "Function",
+      --           "Method",
+      --           "Module",
+      --           "Namespace",
+      --           "Struct",
+      --           "Trait",
+      --           "Constant", 
+      --           "Variable"
+      --         },
+      --         -- set to `true` to include all symbols
+      --         markdown = true,
+      --         help = true,
+      --       },
+      --     }) 
+      --   end,
+      --   desc = "Symbols" 
+      -- },
       {
         "<leader>h",  function ()
           Snacks.picker.explorer({
@@ -270,7 +302,9 @@ return {
         only_scope = true ,
         only_current = true
       },
-      input = { enabled = true },
+      input = { 
+        enabled = true
+      },
       quickfile = { enabled = false },
       scope = {
         enabled = false,
@@ -314,12 +348,14 @@ return {
               ["<a-w>"] = { "cycle_win", mode = { "i", "n" } },
               ["<c-a>"] = { "select_all", mode = { "n", "i" } },
               ["<c-b>"] = { "preview_scroll_up", mode = { "i", "n" } },
-              ["<c-d>"] = { "list_scroll_down", mode = { "i", "n" } },
+              -- ["<c-d>"] = { "list_scroll_down", mode = { "i", "n" } },
               ["<c-f>"] = { "preview_scroll_down", mode = { "i", "n" } },
               ["<c-g>"] = { "toggle_live", mode = { "i", "n" } },
               ["<c-j>"] = { "list_down", mode = { "i", "n" } },
               ["s"] = { "list_up", mode = { "n" } },
               ["t"] = { "list_down", mode = { "n" } },
+              ["e"] = {"list_scroll_up", mode = { "n" }},
+              ["a"] = {"list_scroll_down", mode = { "n" }},
               ["<c-q>"] = { "qflist", mode = { "i", "n" } },
               ["<c-s>"] = { "edit_split", mode = { "i", "n" } },
               ["<c-t>"] = { "tab", mode = { "n", "i" } },
@@ -368,7 +404,8 @@ return {
               ["<a-w>"] = "cycle_win",
               ["<c-a>"] = "select_all",
               ["<c-b>"] = "preview_scroll_up",
-              ["<c-d>"] = "list_scroll_down",
+              ["e"] = {"list_scroll_up", mode = { "n" }},
+              ["a"] = {"list_scroll_down", mode = { "n" }},
               ["<c-f>"] = "preview_scroll_down",
               ["<c-j>"] = "list_down",
               ["<c-k>"] = "list_up",
@@ -377,7 +414,6 @@ return {
               ["<c-q>"] = "qflist",
               ["<c-s>"] = "edit_split",
               ["<c-t>"] = "tab",
-              ["<c-u>"] = "list_scroll_up",
               ["<c-v>"] = "edit_vsplit",
               ["<c-w>H"] = "layout_left",
               ["<c-w>J"] = "layout_bottom",
