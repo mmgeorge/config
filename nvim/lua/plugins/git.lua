@@ -271,7 +271,7 @@ return {
       neogit.setup {
         disable_hint = false,
         disable_context_highlighting = true,
-        disable_signs = false,
+        disable_signs = true,
         -- Changes what mode the Commit Editor starts in. `true` will leave nvim in normal mode,
         -- `false` will change nvim to insert mode, and `"auto"` will change nvim to insert mode
         -- IF the commit message is empty, otherwise leaving it in
