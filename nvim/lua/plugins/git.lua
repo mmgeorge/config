@@ -91,8 +91,9 @@ return {
           recent_commit_count = 10,
         },
         commit_editor = {
-          kind = "tab",
-          show_staged_diff = true, 
+          -- kind = "tab",
+          kind = "auto",
+          show_staged_diff = false, 
           spell_check = true
         },
         commit_select_view = {
@@ -197,7 +198,7 @@ return {
             ["oA"] = "CherryPickPopup",
             ["od"] = "DiffPopup",
             ["oM"] = "RemotePopup",
-            ["oP"] = "PushPopup",
+            ["op"] = "PushPopup",
             ["oX"] = "ResetPopup",
             ["oZ"] = "StashPopup",
             ["oi"] = "IgnorePopup",
@@ -209,7 +210,7 @@ return {
             ["of"] = "FetchPopup",
             ["ol"] = "LogPopup",
             ["om"] = "MergePopup",
-            ["op"] = "PullPopup",
+            ["oP"] = "PullPopup",
             ["or"] = "RebasePopup",
             ["ov"] = "RevertPopup",
           },
