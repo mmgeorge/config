@@ -20,7 +20,7 @@ vim.opt.spelllang = { "en_us" }
 vim.opt.spelloptions = "camel"
 vim.opt.ignorecase = true
 vim.opt.smartcase = true
-vim.o.fileformat = "unix"
+-- vim.o.fileformat = "unix"
 -- vim.opt.shellslash = true
 
 vim.o.foldcolumn = '1' -- '0' is not bad

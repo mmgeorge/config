@@ -61,6 +61,8 @@ vim.keymap.set({'n', 'x'}, '<C-a>', 'ggVG', {})
 vim.keymap.set({'n', 'x'}, '<Tab>', '==', {})
 vim.keymap.set({'i'}, '<Tab>', '<C-f>', {})
 
+vim.keymap.set({ 'n', 'x' }, '<C-p>', '<C-v>')
+
 k.keymap('n', ',', back)
 k.keymap('n', '<', forward)
 k.keymap({'n', 'x'}, 'k', up)
@@ -76,6 +78,7 @@ k.keymap({ 'n' }, 'cc', 'ciw')
 -- k.keymap({ 'n' }, 'vv', 'viw')
 k.keymap({ 'n', 'v' }, 'm', 'g^')
 k.keymap({ 'n', 'v' }, '/', 'g$')
+
 
 k.keymap({ 'n', 'x' }, 'gg', 'gg')
 k.keymap({ 'n', 'x' }, 'G', 'G')
