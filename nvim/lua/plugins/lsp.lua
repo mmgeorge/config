@@ -63,8 +63,17 @@ return {
       require("lspconfig.configs").vtsls = require("vtsls").lspconfig 
       vim.lsp.config('vtsls', {
         capabilities = capabilities,
+        root_markers = { '.git' },
         settings = {
           typescript = {
+            tsserver = {
+              useSyntaxServer = "never",   
+              -- To use a memory limit greater than 4 GB, use `#typescript.tsserver.nodePath#
+              maxTsServerMemory = 3072 ,   
+              experimental = {
+                enableProjectDiagnostics = false
+              }
+            },
             preferences = {
               autoImportSpecifierExcludeRegexes = {
                 "node_modules/lucide-solid",

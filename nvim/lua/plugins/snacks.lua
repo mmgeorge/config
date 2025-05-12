@@ -74,6 +74,7 @@ return {
         function ()
           Snacks.picker.lsp_symbols({
             tree = true,
+            sort = { fields = { "idx" } },
             filter = {
               default = {
                 "Class",
@@ -339,6 +340,11 @@ return {
         timeout = 3000,
       },
       picker = { 
+        formatters = {
+          file = {
+            truncate = 60
+          }
+        },
         win = {
           -- input window
           input = {
