@@ -45,12 +45,12 @@ return {
           -- [token] -- -g=*.el    only el files
           -- [token] -- -ig=*.el   ignore case, only el
           -- [token] -- -ig=!*.el  ignore case, not el files
-          Snacks.picker.grep_word({
+          Snacks.picker.grep({
             finder = "grep",
             format = "file",
-            search = function(picker)
-              return picker:word()
-            end,
+            -- search = function(picker)
+            --   return picker:word()
+            -- end,
             live = true,
             supports_live = true,
             -- layout = no_preview,
@@ -305,8 +305,8 @@ return {
               picker.list:view(cursor[1], info.topline)
               picker:show_preview()
             end,
-            sort = { fields = { "idx" } },
-            -- sort = { fields = { "score:desc", "idx" } },
+            -- sort = { fields = { "idx" } },
+            sort = { fields = { "score:desc", "idx" } },
           })
         end, 
         desc = "Search lines" 

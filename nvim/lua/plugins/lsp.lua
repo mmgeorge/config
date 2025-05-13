@@ -16,10 +16,11 @@ return {
         ensure_installed = {
           "lua_ls",
           "eslint",
-          -- "ts_ls",
+          "oxlint",
           "vtsls",
-          -- "rust_analyzer",
           "terraformls",
+          -- "ts_ls",
+          -- "rust_analyzer",
           -- "tailwind-language-server",
           -- "tailwindcss",
         }
@@ -63,10 +64,27 @@ return {
       require("lspconfig.configs").vtsls = require("vtsls").lspconfig 
       vim.lsp.config('vtsls', {
         capabilities = capabilities,
+        on_attach = function (client, buf)
+          client.server_capabilities.semanticTokensProvider = nil
+        end,
         root_markers = { '.git' },
         settings = {
+          vtsls = {
+            experimental = {
+              completion = {
+                enableServerSideFuzzyMatch = true, 
+                entriesLimit = 15
+              }
+            }
+          },
           typescript = {
+            suggest = {
+              -- This can slow things down 
+              autoImports = true
+            },
             tsserver = {
+              -- enableTracing = true,
+              -- log = "verbose",
               useSyntaxServer = "never",   
               -- To use a memory limit greater than 4 GB, use `#typescript.tsserver.nodePath#
               maxTsServerMemory = 3072 ,   
@@ -93,6 +111,10 @@ return {
       })
       
       vim.lsp.config('cssls', {
+        capabilities = capabilities,
+      })
+      
+      vim.lsp.config('oxlint', {
         capabilities = capabilities,
       })
 
