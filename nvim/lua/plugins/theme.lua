@@ -5,6 +5,8 @@ return {
   config = function()
     local colors = {
       red = "#ef3573", 
+      -- light_red = "#c3d0e0", 
+      off_white = "#ccdbed", 
       green = "#5bff94",
       yellow = "#ffe18e",
       gray = "#696969",
@@ -102,6 +104,11 @@ return {
     vim.api.nvim_set_hl(0, "@function.method.call", { fg = colors.red })
     vim.api.nvim_set_hl(0, "@function.call", { fg = colors.red })
     vim.api.nvim_set_hl(0, "@decorator", { fg = colors.red })
+    vim.api.nvim_set_hl(0, "@function.macro.rust", { fg = colors.red })
+    -- vim.api.nvim_set_hl(0, "@function.macro.rust", { fg = colors.red })
+    -- vim.api.nvim_set_hl(0, "@property.lua", { fg = colors.off_white })
+    -- vim.api.nvim_set_hl(0, "@property", { fg = colors.off_white })
+    -- vim.api.nvim_set_hl(0, "@variable.member", { fg = colors.off_white })
     
     -- vim.api.nvim_set_hl(0, "@method", { fg = colors.red })
     
