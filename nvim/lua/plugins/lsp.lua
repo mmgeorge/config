@@ -63,18 +63,54 @@ return {
       })
 
       vim.lsp.config('terraformls', {
-        -- on_attach = function (client, buf)
-        --   client.server_capabilities.semanticTokensProvider = nil
-        -- end,
         capabilities = capabilities,
       })
       
       vim.lsp.config('lua_ls', {
-        -- on_attach = function (client, buf)
-        --   client.server_capabilities.semanticTokensProvider = nil
-        -- end,
         capabilities = capabilities,
       })
+
+      
+      vim.lsp.config('rust_analyzer', {
+        -- We install this from rustup rather than Mason
+        cmd = { "rust-analyzer" },
+        -- on_attach = function(client, bufnr)
+        --   vim.api.nvim_create_autocmd("BufWritePre", {
+        --     buffer = bufnr,
+        --     callback = function() vim.lsp.buf.format() end,
+        --     group = format_sync_grp,
+        --   }) 
+        -- end,
+        capabilities = capabilities,
+        settings = {
+          ["rust-analyzer"] = {
+            -- numThreads = 8,
+            cargo = {
+              allTargets = false,
+              -- features = {},
+              -- buildScripts = {
+                -- enable = false,
+                -- rebuildOnSave = false
+              -- }
+            },
+            check = {
+              allTargets = false,
+              workspace = false,
+            },
+            cachePriming = {
+              enable = false,
+              -- numThreads = 8
+            },
+            procMacro = {
+              enable = false, 
+              ignore = {}
+            }
+
+          }
+        }
+      })
+
+      vim.lsp.enable("rust_analyzer", true)
       
       require("lspconfig.configs").vtsls = require("vtsls").lspconfig 
       vim.lsp.config('vtsls', {
