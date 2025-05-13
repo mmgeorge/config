@@ -46,7 +46,8 @@ return {
           -- additional_vim_regex_highlighting = true
         },
         indent = { 
-          enable = true, 
+          -- This does not work well
+          enable = false, 
           -- vim-jsx-pretty provides better indent. See typescript config
           -- disable = { "tsx" }
         }, 

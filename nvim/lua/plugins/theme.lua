@@ -60,13 +60,14 @@ return {
             -- bracket     = spec.fg1,                             -- Brackets and Punctuation
             builtin0    = colors.yellow,                   -- Builtin variable
             builtin1    = colors.teal,                    -- Builtin type
-            builtin2    = colors.yellow,                   -- Builtin const
+            builtin2    = colors.teal,                   -- Builtin const
             -- comment     = colors.gray,                    -- Comment
             conditional = colors.yellow,                    -- Conditional and loop
             const       = colors.white,                   -- Constants, imports and booleans
             dep         = colors.red,                     -- Deprecated
             field       = colors.white,                   -- Field
-            func        = colors.red,                     -- Functions and Titles
+            -- func        = colors.red,                     -- Functions and Titles
+            func        = colors.white,                     -- Functions and Titles
             ident       = colors.red,                             -- Identifiers
             keyword     = colors.yellow,                    -- Keywords
             number      = colors.teal,                   -- Numbers
@@ -93,9 +94,17 @@ return {
     vim.api.nvim_set_hl(0, "@include", { fg = colors.yellow })
     vim.api.nvim_set_hl(0, "@conditional", { fg = colors.yellow })
     vim.api.nvim_set_hl(0, "@constructor", { fg = colors.red })
-    vim.api.nvim_set_hl(0, "@method", { fg = colors.red })
     vim.api.nvim_set_hl(0, "@lsp.type.enumMember", { fg = colors.green })
     vim.api.nvim_set_hl(0, "@lsp.mod.declaration", { fg = colors.red })
+    vim.api.nvim_set_hl(0, "@declaration", { fg = colors.red })
+    vim.api.nvim_set_hl(0, "@primitive", { fg = colors.teal })
+    vim.api.nvim_set_hl(0, "@builtin", { fg = colors.yellow })
+    vim.api.nvim_set_hl(0, "@function.method.call", { fg = colors.red })
+    vim.api.nvim_set_hl(0, "@function.call", { fg = colors.red })
+    vim.api.nvim_set_hl(0, "@decorator", { fg = colors.red })
+    
+    -- vim.api.nvim_set_hl(0, "@method", { fg = colors.red })
+    
     -- vim.api.nvim_set_hl(0, "@lsp.type.variable", { fg = colors.green })
     -- Dropbar theming
     -- See <https://github.com/Bekaboo/dropbar.nvim?tab=readme-ov-file#highlighting>
