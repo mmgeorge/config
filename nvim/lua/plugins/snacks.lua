@@ -294,6 +294,7 @@ return {
           Snacks.picker.lines({
             finder = "lines",
             format = "lines",
+            show_empty = true, 
             -- layout = no_preview,
             jump = { match = true },
             -- allow any window to be used as the main window
@@ -305,8 +306,11 @@ return {
               picker.list:view(cursor[1], info.topline)
               picker:show_preview()
             end,
-            -- sort = { fields = { "idx" } },
-            sort = { fields = { "score:desc", "idx" } },
+            -- sort = { fields = { "score:desc", "idx" } },
+            sort = { fields = { "idx" } },
+            matcher = {
+              fuzzy = false
+            }
           })
         end, 
         desc = "Search lines" 

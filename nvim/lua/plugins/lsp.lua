@@ -16,7 +16,7 @@ return {
         ensure_installed = {
           "lua_ls",
           "eslint",
-          "oxlint",
+          -- "oxlint",
           "vtsls",
           "terraformls",
           -- "ts_ls",
@@ -74,13 +74,14 @@ return {
       vim.lsp.config('rust_analyzer', {
         -- We install this from rustup rather than Mason
         cmd = { "rust-analyzer" },
-        -- on_attach = function(client, bufnr)
-        --   vim.api.nvim_create_autocmd("BufWritePre", {
-        --     buffer = bufnr,
-        --     callback = function() vim.lsp.buf.format() end,
-        --     group = format_sync_grp,
-        --   }) 
-        -- end,
+        -- This slows down saving quite a bit
+        on_attach = function(client, bufnr)
+          vim.api.nvim_create_autocmd("BufWritePre", {
+            buffer = bufnr,
+            callback = function() vim.lsp.buf.format() end,
+            group = format_sync_grp,
+          }) 
+        end,
         capabilities = capabilities,
         settings = {
           ["rust-analyzer"] = {
@@ -165,9 +166,9 @@ return {
         capabilities = capabilities,
       })
       
-      vim.lsp.config('oxlint', {
-        capabilities = capabilities,
-      })
+      -- vim.lsp.config('oxlint', {
+        -- capabilities = capabilities,
+      -- })
 
       local configs = require "lspconfig.configs"
       if not configs.slangd then
