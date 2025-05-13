@@ -6,6 +6,9 @@
 (function_declaration
   name: (identifier) @declaration) 
 
+(generator_function_declaration
+  name: (identifier) @declaration) 
+
 (method_definition
   (override_modifier) @builtin
   name: (property_identifier) @declaration) 
