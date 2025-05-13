@@ -53,20 +53,35 @@ return {
     config = function()
       local capabilities = require('blink.cmp').get_lsp_capabilities()
 
+      -- Disable semantic tokens
+      vim.api.nvim_create_autocmd('LspAttach', {
+        group = vim.api.nvim_create_augroup('UserLspConfig', {}),
+        callback = function(ev)
+          local client = vim.lsp.get_client_by_id(ev.data.client_id)
+          client.server_capabilities.semanticTokensProvider = nil
+        end,
+      })
+
       vim.lsp.config('terraformls', {
+        -- on_attach = function (client, buf)
+        --   client.server_capabilities.semanticTokensProvider = nil
+        -- end,
         capabilities = capabilities,
       })
       
       vim.lsp.config('lua_ls', {
+        -- on_attach = function (client, buf)
+        --   client.server_capabilities.semanticTokensProvider = nil
+        -- end,
         capabilities = capabilities,
       })
       
       require("lspconfig.configs").vtsls = require("vtsls").lspconfig 
       vim.lsp.config('vtsls', {
         capabilities = capabilities,
-        on_attach = function (client, buf)
-          client.server_capabilities.semanticTokensProvider = nil
-        end,
+        -- on_attach = function (client, buf)
+        --   client.server_capabilities.semanticTokensProvider = nil
+        -- end,
         root_markers = { '.git' },
         settings = {
           vtsls = {
