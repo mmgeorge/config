@@ -346,7 +346,7 @@ return {
       picker = { 
         formatters = {
           file = {
-            truncate = 60
+            truncate = 70
           }
         },
         win = {
