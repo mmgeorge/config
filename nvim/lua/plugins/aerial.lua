@@ -111,7 +111,23 @@ return {
               local ret = {} ---@type snacks.picker.Highlight[]
               vim.list_extend(ret, Snacks.picker.format.tree(item, picker))
               table.insert(ret, { icon .. " ", icon_hl })
-              Snacks.picker.highlight.format(item, item.text, ret)
+
+              local text = item.text 
+              
+              -- local function_info = item.item.function_info
+              -- if function_info then
+              --   local params = table.concat(function_info.parameter_types, ", ")
+              --   local function_str = "(" .. params .. ")"
+              --   if function_info.return_type then
+              --     function_str = function_str .. " -> " .. function_info.return_type
+              --   end
+              --   
+              --   text = string.format("%-10s", text) .. " " .. function_str
+              -- end
+
+              Snacks.picker.highlight.format(item, text, ret)
+
+              -- print(vim.inspect(ret))
 
               return ret
             end,
@@ -299,13 +315,56 @@ return {
         --   * symbols?: specific to the lsp backend
         --   * symbol?: specific to the lsp backend
         --   * syntax_tree?: specific to the treesitter backend
-        --   * match?: specific to the treesitter backend, TS query match
-        post_parse_symbol = function(bufnr, item, ctx)
-          -- print(vim.inspect(ctx.match.symbol))
-          -- TODO: extract out function type information
-          -- item.symbol = ctx.match.symbol
-          return true
-        end,
+        --   * match?: specific to the treesitter backend, TS query matc        post_parse_symbol = function(bufnr, item, ctx) Check if node is a function type and not nil
+        -- post_parse_symbol = function(bufnr, item, ctx)
+        --   local node = ctx.match.symbol.node
+        --
+        --   local func_types = {
+        --     "function_declaration", 
+        --     "method_definition", 
+        --     -- "function_item"
+        --   }
+        --
+        --   if node and vim.tbl_contains(func_types, node:type()) then
+        --     function get_annotation_type(node)
+        --       local type = node:child(1)
+        --       if type then
+        --         return vim.treesitter.get_node_text(type, bufnr)
+        --       end
+        --     end
+        --
+        --     function get_parameter_type(node) 
+        --       local type_annotation = node:field("type")[1]
+        --       if type_annotation then
+        --         return get_annotation_type(type_annotation)
+        --       end
+        --     end
+        --
+        --     function get_parameter_types(node)
+        --       local out = {}
+        --       local params = node:field("parameters")[1]
+        --       for param, _ in params:iter_children() do
+        --         local type = get_parameter_type(param)
+        --         if type then
+        --           table.insert(out, type)
+        --         end
+        --       end
+        --       return out
+        --     end
+        --
+        --     local function_info = {}
+        --     function_info.parameter_types = get_parameter_types(node)
+        --     local ret = node:field("return_type")[1] -- 'return_type' is a common field name, check grammar
+        --     if ret then
+        --       function_info.return_type = get_annotation_type(ret)
+        --     end
+        --
+        --     item.function_info = function_info
+        --   end
+        --
+        --   return true
+        -- end,
+
 
         -- Invoked after all symbols have been parsed and post-processed,
         -- allows to modify the symbol structure before final display
