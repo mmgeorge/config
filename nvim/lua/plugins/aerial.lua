@@ -60,7 +60,7 @@ return {
                 name = "symbol_fold",
                 desc = "Symbol Fold",
                 action = function(self, item)
-                  print(vim.inspect(item.item))
+                  -- print(vim.inspect(item.item))
                   -- Iterate over items and set visible to false
                   -- for _, item in ipairs(self:items()) do
                   -- item.hidden = true
@@ -301,9 +301,9 @@ return {
         --   * syntax_tree?: specific to the treesitter backend
         --   * match?: specific to the treesitter backend, TS query match
         post_parse_symbol = function(bufnr, item, ctx)
-          print(vim.inspect(ctx.match.symbol))
+          -- print(vim.inspect(ctx.match.symbol))
           -- TODO: extract out function type information
-          item.symbol = ctx.match.symbol
+          -- item.symbol = ctx.match.symbol
           return true
         end,
 
