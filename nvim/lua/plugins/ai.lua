@@ -123,6 +123,10 @@ This is the code to document:
           strategy = "inline",
           description = "Generate a commit message",
           opts = {
+            adapter = {
+              name = "gemini", 
+              model = "gemini-2.0-flash"
+            },
             index = 10,
             is_default = true,
             is_slash_cmd = true,
@@ -180,7 +184,7 @@ This is the code to document:
       },
       display = {
         chat = {
-          auto_scroll = false,
+          auto_scroll = true,
           intro_message = "Welcome to CodeCompanion ?! Press ? for options",
           show_header_separator = true, -- Show header separators in the chat buffer? Set this to false if you're using an external markdown formatting plugin
           -- separator = "Ä", -- The separator between the different messages in the chat buffer
@@ -190,11 +194,11 @@ This is the code to document:
           start_in_insert_mode = true, -- Open the chat buffer in insert mode?
           -- Options to customize the UI of the chat buffer
           window = {
-            layout = "buffer", -- float|vertical|horizontal|buffer
+            layout = "horizontal", -- float|vertical|horizontal|buffer
             position = "bottom", -- left|right|top|bottom (nil will default depending on vim.opt.plitright|vim.opt.splitbelow)
             border = "single",
-            height = 0.8,
-            width = 0.8,
+            height = 0.5,
+            width = 0.5,
             relative = "editor",
             full_height = false, -- when set to false, vsplit will be used to open the chat buffer vs. botright/topleft vsplit
             opts = {
@@ -220,24 +224,26 @@ This is the code to document:
           provider = "mini_diff", -- default|mini_diff
         }
       },
-      gemini = function()
-        return require("codecompanion.adapters").extend("gemini", {
-          schema = {
-            env = {
-              api_key = "GEMINI_API_KEY"
-            } ,
-            model = {
-              default = "gemini-2.0-flash",
+      adapters = {
+        gemini = function()
+          return require("codecompanion.adapters").extend("gemini", {
+            schema = {
+              env = {
+                api_key = "GEMINI_API_KEY"
+              } ,
+              model = {
+                default = "gemini-2.0-flash",
+              },
             },
-          },
-        })
-      end,
+          })
+        end,
+      },
       strategies = {
         chat = {
-          adapter = "copilot",
+          adapter = "gemini",
         },
         inline = {
-          adapter = "copilot",
+          adapter = "gemini",
           keymaps = {
             accept_change = {
               modes = { n = "ga" },
@@ -250,19 +256,19 @@ This is the code to document:
           },
         },
         cmd = {
-          adapter = "copilot",
+          adapter = "gemini",
         }
       }
     }
   },
-  {
-    "zbirenbaum/copilot.lua",
-    cmd = "Copilot",
-    event = "InsertEnter",
-    config = function()
-      require("copilot").setup({})
-    end,
-  },
+  -- {
+  --   "zbirenbaum/copilot.lua",
+  --   cmd = "Copilot",
+  --   event = "InsertEnter",
+  --   config = function()
+  --     require("copilot").setup({})
+  --   end,
+  -- },
   -- {
   --   "yetone/avante.nvim",
   --   event = "VeryLazy",
