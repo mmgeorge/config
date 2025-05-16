@@ -83,7 +83,7 @@ return {
         -- Disable line numbers and relative line numbers
         disable_line_numbers = true,
         -- The time after which an output console is shown for slow running commands
-        console_timeout = 250,
+        console_timeout = 1500,
         -- Automatically show console if a command takes more than console_timeout milliseconds
         auto_show_console = true,
         auto_close_console = true, 
