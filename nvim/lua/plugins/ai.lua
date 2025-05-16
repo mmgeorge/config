@@ -1,3 +1,26 @@
+function detect_adapter()
+  if os.getenv("GEMINI_API_KEY") then 
+    return {
+      chat = "gemini", 
+      inline = "gemini", 
+      cmd = "gemini", 
+      commit = {
+        name = "gemini", 
+        model = "gemini-2.0-flash"
+      } 
+    } 
+  else 
+    return {
+      chat = "copilot", 
+      inline = "copilot", 
+      cmd = "copilot", 
+      commit = nil 
+    }
+  end 
+end
+
+local adapter = detect_adapter()
+
 return {
   {
     "olimorris/codecompanion.nvim",
@@ -37,6 +60,249 @@ return {
       opts = {
         -- log_level = "TRACE",
       },
+      adapters = {
+        gemini = function()
+          return require("codecompanion.adapters").extend("gemini", {
+            schema = {
+              env = {
+                api_key = "GEMINI_API_KEY"
+              } ,
+              model = {
+                default = "gemini-2.0-flash",
+              },
+            },
+          })
+        end,
+      },
+      strategies = {
+        chat = {
+          adapter = adapter.chat,
+          keymaps = {
+            options = {
+              modes = {
+                n = "?",
+              },
+              callback = "keymaps.options",
+              description = "Options",
+              hide = true,
+            },
+            completion = {
+              modes = {
+                i = "<C-_>",
+              },
+              index = 1,
+              callback = "keymaps.completion",
+              description = "Completion Menu",
+            },
+            send = {
+              modes = {
+                n = { "<CR>", "<C-s>" },
+                i = "<C-s>",
+              },
+              index = 2,
+              callback = "keymaps.send",
+              description = "Send",
+            },
+            regenerate = {
+              modes = {
+                n = "gr",
+              },
+              index = 3,
+              callback = "keymaps.regenerate",
+              description = "Regenerate the last response",
+            },
+            close = {
+              modes = {
+                n = "<C-c>",
+                i = "<C-c>",
+              },
+              index = 4,
+              callback = "keymaps.close",
+              description = "Close Chat",
+            },
+            stop = {
+              modes = {
+                n = "q",
+              },
+              index = 5,
+              callback = "keymaps.stop",
+              description = "Stop Request",
+            },
+            clear = {
+              modes = {
+                n = "gx",
+              },
+              index = 6,
+              callback = "keymaps.clear",
+              description = "Clear Chat",
+            },
+            codeblock = {
+              modes = {
+                n = "gc",
+              },
+              index = 7,
+              callback = "keymaps.codeblock",
+              description = "Insert Codeblock",
+            },
+            yank_code = {
+              modes = {
+                n = "gy",
+              },
+              index = 8,
+              callback = "keymaps.yank_code",
+              description = "Yank Code",
+            },
+            pin = {
+              modes = {
+                n = "gp",
+              },
+              index = 9,
+              callback = "keymaps.pin_reference",
+              description = "Pin Reference",
+            },
+            watch = {
+              modes = {
+                n = "gw",
+              },
+              index = 10,
+              callback = "keymaps.toggle_watch",
+              description = "Watch Buffer",
+            },
+            next_chat = {
+              modes = {
+                n = "}",
+              },
+              index = 11,
+              callback = "keymaps.next_chat",
+              description = "Next Chat",
+            },
+            previous_chat = {
+              modes = {
+                n = "{",
+              },
+              index = 12,
+              callback = "keymaps.previous_chat",
+              description = "Previous Chat",
+            },
+            next_header = {
+              modes = {
+                n = "]]",
+              },
+              index = 13,
+              callback = "keymaps.next_header",
+              description = "Next Header",
+            },
+            previous_header = {
+              modes = {
+                n = "[[",
+              },
+              index = 14,
+              callback = "keymaps.previous_header",
+              description = "Previous Header",
+            },
+            change_adapter = {
+              modes = {
+                n = "ga",
+              },
+              index = 15,
+              callback = "keymaps.change_adapter",
+              description = "Change adapter",
+            },
+            fold_code = {
+              modes = {
+                n = "gf",
+              },
+              index = 15,
+              callback = "keymaps.fold_code",
+              description = "Fold code",
+            },
+            debug = {
+              modes = {
+                n = "gd",
+              },
+              index = 16,
+              callback = "keymaps.debug",
+              description = "View debug info",
+            },
+            system_prompt = {
+              modes = {
+                n = "gs",
+              },
+              index = 17,
+              callback = "keymaps.toggle_system_prompt",
+              description = "Toggle the system prompt",
+            },
+            auto_tool_mode = {
+              modes = {
+                n = "gta",
+              },
+              index = 18,
+              callback = "keymaps.auto_tool_mode",
+              description = "Toggle automatic tool mode",
+            },
+          },
+        },
+        inline = {
+          adapter = adapter.inline,
+          keymaps = {
+            accept_change = {
+              modes = { n = "ga" },
+              description = "Accept the suggested change",
+            },
+            reject_change = {
+              modes = { n = "gr" },
+              description = "Reject the suggested change",
+            },
+          },
+        },
+        cmd = {
+          adapter = adapter.cmd,
+        }
+      },
+
+      display = {
+        chat = {
+          auto_scroll = true,
+          intro_message = "Welcome to CodeCompanion ?! Press ? for options",
+          show_header_separator = true, -- Show header separators in the chat buffer? Set this to false if you're using an external markdown formatting plugin
+          -- separator = "Ä", -- The separator between the different messages in the chat buffer
+          show_references = true, -- Show references (from slash commands and variables) in the chat buffer?
+          show_settings = false, -- Show LLM settings at the top of the chat buffer?
+          show_token_count = true, -- Show the token count for each response?
+          start_in_insert_mode = true, -- Open the chat buffer in insert mode?
+          -- Options to customize the UI of the chat buffer
+          window = {
+            layout = "horizontal", -- float|vertical|horizontal|buffer
+            position = "bottom", -- left|right|top|bottom (nil will default depending on vim.opt.plitright|vim.opt.splitbelow)
+            border = "single",
+            height = 0.5,
+            width = 0.5,
+            relative = "editor",
+            full_height = false, -- when set to false, vsplit will be used to open the chat buffer vs. botright/topleft vsplit
+            opts = {
+              breakindent = true,
+              cursorcolumn = false,
+              cursorline = false,
+              foldcolumn = "0",
+              linebreak = true,
+              list = false,
+              numberwidth = 1,
+              signcolumn = "no",
+              spell = false,
+              wrap = true,
+            },
+          },
+        },
+        diff = {
+          enabled = true,
+          close_chat_at = 240, -- Close an open chat buffer if the total columns of your display are less than...
+          -- with mini diff this is inline instead
+          layout = "vertical", -- vertical|horizontal split for default provider
+          opts = { "internal", "filler", "closeoff", "algorithm:patience", "followwrap", "linematch:120" },
+          provider = "mini_diff", -- default|mini_diff
+        }
+      },
+
       prompt_library = {
         ["Generate documentation"] = {
           strategy = "inline",
@@ -47,22 +313,8 @@ return {
             is_slash_cmd = true,
             short_name = "doc",
             auto_submit = true,
-            -- placement = "before|false"
-            -- stop_context_insertion = true
           },
           prompts = {
---             {
---               role = "system", 
---               content = [[When asked to document code, follow these steps: 
--- 1. Identify the programming language 
--- 2. Lookup the best style practices for adding documentation in that language. For instance, when documenting javascript or typescript, use jsdoc style. 
--- 3. Identify every function, method, or class in the passed code. These are the things that you will add documentation to. 
--- 4. Be as succinct as possible in the documentation that you generate.
---               ]], 
---               opts = {
---                 visible = false,
---               },
---             },
             {
               role = "user",
               content = function(context)
@@ -96,37 +348,13 @@ This is the code to document:
                 contains_code = true,
               },
             },
---             {
---               role = "user",
---               content = function(context)
---                 local code = require("codecompanion.helpers.actions").get_code(context.start_line, context.end_line)
---                 -- local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
---                 -- local buffer_text = table.concat(lines, '\n') 
---                 
---                 return string.format(
---                   [[You are an expert in writing succinct technical documentation geared towards other developers already familiar with the codebase.
--- - Lookup the best practices for documenting the specified language.
--- - Generate concise documentation for the code below below. Each line of the generated documentation should not be longer than 80 characters. 
---
--- ```%s
--- %s
--- ```
--- ]], context.filetype, code)
---               end,
---               opts = {
---                 contains_code = true,
---               },
---             }
           },
         },
         ["Generate a Commit Message"] = {
           strategy = "inline",
           description = "Generate a commit message",
           opts = {
-            adapter = {
-              name = "gemini", 
-              model = "gemini-2.0-flash"
-            },
+            adapter = adapter.commit,
             index = 10,
             is_default = true,
             is_slash_cmd = true,
@@ -182,83 +410,6 @@ This is the code to document:
           },
         },
       },
-      display = {
-        chat = {
-          auto_scroll = true,
-          intro_message = "Welcome to CodeCompanion ?! Press ? for options",
-          show_header_separator = true, -- Show header separators in the chat buffer? Set this to false if you're using an external markdown formatting plugin
-          -- separator = "Ä", -- The separator between the different messages in the chat buffer
-          show_references = true, -- Show references (from slash commands and variables) in the chat buffer?
-          show_settings = true, -- Show LLM settings at the top of the chat buffer?
-          show_token_count = true, -- Show the token count for each response?
-          start_in_insert_mode = true, -- Open the chat buffer in insert mode?
-          -- Options to customize the UI of the chat buffer
-          window = {
-            layout = "horizontal", -- float|vertical|horizontal|buffer
-            position = "bottom", -- left|right|top|bottom (nil will default depending on vim.opt.plitright|vim.opt.splitbelow)
-            border = "single",
-            height = 0.5,
-            width = 0.5,
-            relative = "editor",
-            full_height = false, -- when set to false, vsplit will be used to open the chat buffer vs. botright/topleft vsplit
-            opts = {
-              breakindent = true,
-              cursorcolumn = false,
-              cursorline = false,
-              foldcolumn = "0",
-              linebreak = true,
-              list = false,
-              numberwidth = 1,
-              signcolumn = "no",
-              spell = false,
-              wrap = true,
-            },
-          },
-        },
-        diff = {
-          enabled = true,
-          close_chat_at = 240, -- Close an open chat buffer if the total columns of your display are less than...
-          -- with mini diff this is inline instead
-          layout = "vertical", -- vertical|horizontal split for default provider
-          opts = { "internal", "filler", "closeoff", "algorithm:patience", "followwrap", "linematch:120" },
-          provider = "mini_diff", -- default|mini_diff
-        }
-      },
-      adapters = {
-        gemini = function()
-          return require("codecompanion.adapters").extend("gemini", {
-            schema = {
-              env = {
-                api_key = "GEMINI_API_KEY"
-              } ,
-              model = {
-                default = "gemini-2.0-flash",
-              },
-            },
-          })
-        end,
-      },
-      strategies = {
-        chat = {
-          adapter = "gemini",
-        },
-        inline = {
-          adapter = "gemini",
-          keymaps = {
-            accept_change = {
-              modes = { n = "ga" },
-              description = "Accept the suggested change",
-            },
-            reject_change = {
-              modes = { n = "gr" },
-              description = "Reject the suggested change",
-            },
-          },
-        },
-        cmd = {
-          adapter = "gemini",
-        }
-      }
     }
   },
   -- {
