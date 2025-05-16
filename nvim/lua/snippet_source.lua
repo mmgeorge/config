@@ -210,8 +210,14 @@ function source:execute(ctx, item, callback, default_implementation)
   local clear = item.clear_region 
   if clear ~= nil then
     local buf = vim.api.nvim_get_current_buf() 
-
-    vim.api.nvim_buf_set_text(buf, clear.from[1], clear.from[2], clear.to[1], clear.to[2], {})
+    vim.api.nvim_buf_set_text(
+      buf,
+      clear.from[1],
+      clear.from[2],
+      clear.to[1],
+      clear.to[2] + ctx.bounds.length,
+      {}
+    )
   end 
 
   default_implementation()
