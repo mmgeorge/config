@@ -103,7 +103,7 @@ return {
               -- numThreads = 8
             },
             procMacro = {
-              enable = false, 
+              enable = true, 
               ignore = {}
             }
 
