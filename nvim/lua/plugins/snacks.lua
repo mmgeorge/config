@@ -327,7 +327,7 @@ return {
         only_current = true
       },
       input = { 
-        enabled = true
+        enabled = false
       },
       quickfile = { enabled = false },
       scope = {
