@@ -6,8 +6,10 @@ local selected_nodes = {}
 local selecting_related_nodes_enabled = true 
 
 local related_node_types = {
-  "attribute_item", 
-  "line_comment"
+  "attribute_item",  --rust
+  "line_comment", -- rust
+  "comment", -- lua
+
 }
 
 local function is_related_node(node)
@@ -192,13 +194,7 @@ local function select_node(node)
   remember_current_selection()
 end
 
--- Lua function to select the nearest parent node based on a Tree-sitter query.
---
--- This function assumes you have a query file named 'parent.scm'
--- (e.g., queries/rust/parent.scm) that defines what a "parent" node is.
-function select_parent()
-  setup_visual_exit_autocmd()
-
+function get_closest_node(tree)
   local bufnr = vim.api.nvim_get_current_buf()
   local winid = vim.api.nvim_get_current_win()
   local cursor_pos = vim.api.nvim_win_get_cursor(winid) -- {row, col}, 1-indexed
@@ -210,61 +206,6 @@ function select_parent()
   local col = cursor_pos[2] + 1 -- Lua indices are 1-based, but Neovim columns are 0-based
   local next_non_ws = line:find("%S", col + 1)
   local cursor_col = next_non_ws and (next_non_ws - 1) or cursor_pos[2]
-
-  local lang = vim.bo[bufnr].filetype
-  if type(lang) ~= "string" or lang == "" then
-    vim.notify(
-      "Error: Buffer language (filetype) is not a valid string. Actual value: " .. vim.inspect(lang),
-      vim.log.levels.ERROR
-    )
-    return
-  end
-
-  local parser = vim.treesitter.get_parser(bufnr, lang)
-  if not parser then
-    vim.notify("Error: No Tree-sitter parser found for language: " .. lang, vim.log.levels.ERROR)
-    return
-  end
-
-  -- Parse the current buffer's content. Select the first (and usually only) tree
-  -- TODO: Handle multiple trees?
-  local tree = parser:parse()[1]
-  if not tree then
-    vim.notify("Error: Could not parse the buffer.", vim.log.levels.ERROR)
-    return
-  end
-
-  -- Load the 'parent' query for the current language.
-  -- This expects a file like 'queries/rust/parent.scm' to be in your runtimepath.
-  local query = vim.treesitter.query.get(lang, "parent")
-  if not query or query == "" then
-    vim.notify(
-      "Error: Could not load query 'parent' for language '" .. lang .. "'. " ..
-      "Ensure queries/" ..
-      lang .. "/parent.scm exists in your Neovim runtime path (e.g., ~/.config/nvim/queries/" ..
-      lang .. "/parent.scm). " ..
-      "Query content was nil or empty.",
-      vim.log.levels.ERROR
-    )
-    return
-  end
-
-  -- Find the capture ID for "@_start" as defined in the user's query.
-  local capture_start_id = -1
-  for i, name in ipairs(query.captures) do
-    if name == "_start" then
-      capture_start_id = i
-      break
-    end
-  end
-
-  if capture_start_id == -1 then
-    vim.notify(
-      "Error: The 'parent' query does not contain the '@_start' capture. " ..
-      "The query needs to identify the main node with '@_start'.",
-      vim.log.levels.ERROR)
-    return
-  end
 
   local node
   local selected_node = selected_nodes[#selected_nodes]
@@ -292,27 +233,107 @@ function select_parent()
     end
     node = first_non_related_right_sibling(desc_node)
   end
-    
-  local parent = nil
+
+  return node
+end
+
+function query_for(lang) 
+  -- Load the 'parent' query for the current language.
+  -- This expects a file like 'queries/rust/parent.scm' to be in your runtimepath.
+  local query = vim.treesitter.query.get(lang, "parent")
+  if not query or query == "" then
+    vim.notify(
+      "Error: Could not load query 'parent' for language '" .. lang .. "'. " ..
+      "Ensure queries/" ..
+      lang .. "/parent.scm exists in your Neovim runtime path (e.g., ~/.config/nvim/queries/" ..
+      lang .. "/parent.scm). " ..
+      "Query content was nil or empty.",
+      vim.log.levels.ERROR
+    )
+    return
+  end
+
+  return query
+end
+
+local function get_tree(bufnr, lang)
+  local parser = vim.treesitter.get_parser(bufnr, lang)
+  if not parser then
+    vim.notify("Error: No Tree-sitter parser found for language: " .. lang, vim.log.levels.ERROR)
+    return
+  end
+
+  -- Parse the current buffer's content. Select the first (and usually only) tree
+  -- TODO: Handle multiple trees?
+  local tree = parser:parse()[1]
+  if not tree then
+    vim.notify("Error: Could not parse the buffer.", vim.log.levels.ERROR)
+    return
+  end
+
+  return tree
+end
+
+-- Find the capture ID for "@_start" as defined in the user's query.
+local function get_capture_start_id(query)
+  local capture_start_id = -1
+  for i, name in ipairs(query.captures) do
+    if name == "_start" then
+      capture_start_id = i
+      break
+    end
+  end
+
+  if capture_start_id == -1 then
+    vim.notify(
+      "Error: The 'parent' query does not contain the '@_start' capture. " ..
+      "The query needs to identify the main node with '@_start'.",
+      vim.log.levels.ERROR)
+    return
+  end
+
+  return capture_start_id
+end
+
+-- Lua function to select the nearest parent node based on a Tree-sitter query.
+--
+-- This function assumes you have a query file named 'parent.scm'
+-- (e.g., queries/rust/parent.scm) that defines what a "parent" node is.
+function select_parent()
+  setup_visual_exit_autocmd()
+  
+  local bufnr = vim.api.nvim_get_current_buf()
+  local ftype = vim.bo[bufnr].filetype
+  local lang = require("nvim-treesitter.parsers").ft_to_lang(ftype)
+  -- local lang = vim.bo[bufnr].filetype
+  -- if type(lang) ~= "string" or lang == "" then
+    -- return
+  -- end
+
+  local query = query_for(lang)
+  local tree = get_tree(bufnr, lang)
+  local node = get_closest_node(tree)
+  local capture_start_id = get_capture_start_id(query)
+
   while node do
     for _, match in query:iter_matches(node, bufnr) do
       local matched = match[capture_start_id][1]
       if matched and matched:id() == node:id() then
-        parent = node
-        goto found_parent_node
+        if not selecting_related_nodes_enabled then
+          node = first_non_related_right_sibling(node)
+        end
+
+        -- For typescript, go up if we are in an export
+        local parent = node:parent()
+        if parent and parent:type() == "export_statement" then
+          node = node:parent() 
+        end
+
+        select_node(node)
+        return
       end
     end
     node = node:parent()
-  end
-
-  ::found_parent_node::
-
-  if parent then
-    if not selecting_related_nodes_enabled then
-      parent = first_non_related_right_sibling(parent)
-    end
-
-    select_node(parent)
   end
 end
 
