@@ -1,4 +1,17 @@
 function detect_adapter()
+  if os.getenv("OPENAI_API_KEY") then 
+    return {
+      chat = "openai", 
+      inline = "openai", 
+      cmd = "openai", 
+      commit = {
+        name = "openai", 
+        model = "gpt-4.1-mini"
+        -- model = "gpt-4o-mini"
+      } 
+    } 
+  end
+    
   if os.getenv("GEMINI_API_KEY") then 
     return {
       chat = "gemini", 
@@ -9,14 +22,14 @@ function detect_adapter()
         model = "gemini-2.0-flash"
       } 
     } 
-  else 
-    return {
-      chat = "copilot", 
-      inline = "copilot", 
-      cmd = "copilot", 
-      commit = nil 
-    }
-  end 
+  end
+  
+  return {
+    chat = "copilot", 
+    inline = "copilot", 
+    cmd = "copilot", 
+    commit = nil 
+  }
 end
 
 local adapter = detect_adapter()
@@ -69,6 +82,18 @@ return {
               } ,
               model = {
                 default = "gemini-2.0-flash",
+              },
+            },
+          })
+        end,
+        openai = function()
+          return require("codecompanion.adapters").extend("openai", {
+            schema = {
+              env = {
+                api_key = "OPENAI_API_KEY"
+              } ,
+              model = {
+                default = "gpt-4.1", 
               },
             },
           })
@@ -373,7 +398,7 @@ This is the code to document:
 
 
                 return string.format(
-                  [[You are an expert at following the Conventional Commit specification. Given the git diff listed below, generate a commit message for me. Do not indent the first line. The description under the description should be no more than 2 sentences. Prefer omitting this description when possible. Do not list any breaking changes:
+                  [[You are an expert at following the Conventional Commit specification. Given the git diff listed below, generate a commit message for me. Do not indent the first line. The description under the description should be no more than 2 sentences, with each line no more that 80 characters. Prefer omitting this description when possible. Do not list any breaking changes:
 ```diff
 %s
 ```
