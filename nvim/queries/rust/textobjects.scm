@@ -1,3 +1,5 @@
+; extends 
+
 ; Function Definition (Outer)
 ; Captures the entire 'fn foo(...) { ... }' block
 (function_item) @xfunction.outer

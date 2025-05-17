@@ -52,6 +52,8 @@ for i, v in ipairs(k.keys) do
   end
 end
 
+vim.keymap.del("v", 'p', {})
+vim.keymap.set("v", 'p', function () select_parent() end)
 vim.keymap.set({'n', 'x'}, '<iw>', '<Nop>', {})
 vim.keymap.set({'n', 'x'}, 'S', '<Nop>', {})
 
