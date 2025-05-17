@@ -55,8 +55,8 @@ end
 vim.keymap.del("v", 'p', {})
 vim.keymap.del("v", 'P', {})
 
-vim.keymap.set("v", 'p', function () select_parent() end)
-vim.keymap.set("v", 'P', function () undo_select_node() end)
+vim.keymap.set("v", 'p', function () require("treesitter_smart_select").select_parent() end)
+vim.keymap.set("v", 'P', function () require("treesitter_smart_select").undo_select_parent() end)
 
 vim.keymap.set({'n', 'x'}, '<iw>', '<Nop>', {})
 vim.keymap.set({'n', 'x'}, 'S', '<Nop>', {})
