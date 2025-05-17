@@ -1,3 +1,5 @@
+; extends
+
 ; --- Keep existing function/method captures ---
 ; (function_declaration) @function.outer
 ; (function_declaration body: (statement_block) @function.inner)
