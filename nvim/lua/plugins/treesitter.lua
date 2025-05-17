@@ -51,11 +51,12 @@ local function remember_current_selection()
   })
 end
 
+  
+local augroup_name = "ClearCursorStackOnVisualLeave"
+vim.api.nvim_create_augroup(augroup_name, { clear = true })
 
 --- Create an autocommand to clear global 'cursor_stack' on Visual mode exit, only once.
 local function setup_visual_exit_autocmd()
-  local augroup_name = "ClearCursorStackOnVisualLeave"
-  vim.api.nvim_create_augroup(augroup_name, { clear = true })
   vim.api.nvim_create_autocmd("ModeChanged", {
     group = augroup_name,
     pattern = "v:*",
@@ -167,9 +168,64 @@ function select_parent()
   end
 end
 
+local related_node_types = {
+  "attribute_item", 
+  "line_comment"
+}
+
+local function is_related_node(node)
+  for _, v in ipairs(related_node_types) do
+    if v == node:type() then
+      return true
+    end
+  end
+  return false
+end
+
+-- For the given node, get the start of the left-most relevant sibling. 
+-- Relevant siblings include comments, macros, and decorators 
+function related_leading_sibling_start(node)
+  local start_row, start_col = node:range()
+  
+  -- Traverse backwards and include leading (attribute_item) siblings
+  local parent = node:parent()
+  if parent then
+    local siblings = {}
+    for i = 0, parent:child_count() - 1 do
+      siblings[i + 1] = parent:child(i)
+    end
+
+    local i = 1
+    while i <= #siblings do
+      if siblings[i]:id() == node:id() then
+        -- scan leftwards for (attribute_item) siblings
+        local s = i - 1
+        while s >= 1 do
+          local sibling = siblings[s]
+          if is_related_node(sibling) then
+            local s_row, s_col = sibling:range()
+            start_row = s_row
+            -- start_col must be reached to the leftmost attr
+            start_col = 0
+            s = s - 1
+          else
+            break
+          end
+        end
+        break
+      end
+      i = i + 1
+    end
+  end
+
+  return start_row, start_col
+end
+
 
 function select_node(node)
-  local start_row, start_col, end_row, end_col = node:range()
+  local ts_utils = require("nvim-treesitter.ts_utils")
+  local _, _, end_row, end_col = node:range()
+  local start_row, start_col =  related_leading_sibling_start(node)
   start_col = 0
 
   -- Get buffer lines
@@ -189,6 +245,7 @@ function select_node(node)
   vim.cmd("normal! gvo")
   remember_current_selection()
 end
+
 
 
 function undo_select_node()
