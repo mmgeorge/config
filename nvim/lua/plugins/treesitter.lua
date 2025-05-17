@@ -1,12 +1,24 @@
--- Lua function to select the nearest parent node based on a Tree-sitter query.
---
--- This function assumes you have a query file named 'parent.scm'
--- (e.g., queries/rust/parent.scm) that defines what a "parent" node is.
--- The query should capture the desired node, for instance, using @_start and @_end
--- for its range, as in the example provided by the user:
--- (([ (function_item) ... ] @_start @_end) (#make-range! "parent" @_start @_end))
-
 local cursor_stack = {}
+local selected_nodes = {}
+
+-- Allows selecting lines and decorators. Otherwise, selection will automatically move 
+-- to the core node type (e.g., move to function, etc.)
+local selecting_related_nodes_enabled = false 
+
+local related_node_types = {
+  "attribute_item", 
+  "line_comment"
+}
+
+local function is_related_node(node)
+  for _, v in ipairs(related_node_types) do
+    if v == node:type() then
+      return true
+    end
+  end
+  return false
+end
+
 
 --- Push the current visual selection or cursor position onto cursor_stack
 local function remember_current_selection()
@@ -26,7 +38,6 @@ local function remember_current_selection()
       start_col = 0
       end_col = math.max(0, #vim.fn.getline(end_row+1))
     end
-    print("Push it v", start_row .. " " .. end_row)
     -- Ensure start is always before end
     if start_row > end_row or (start_row == end_row and start_col > end_col) then
       start_row, end_row = end_row, start_row
@@ -39,7 +50,6 @@ local function remember_current_selection()
     start_col = pos[2]
     end_row   = start_row
     end_col   = start_col
-    print("Push it non -v", start_row .. " " .. end_row)
   end
 
 
@@ -50,7 +60,6 @@ local function remember_current_selection()
     end_col   = end_col
   })
 end
-
   
 local augroup_name = "ClearCursorStackOnVisualLeave"
 vim.api.nvim_create_augroup(augroup_name, { clear = true })
@@ -62,13 +71,17 @@ local function setup_visual_exit_autocmd()
     pattern = "v:*",
     desc = "Clear global cursor_stack and remove self on leaving visual mode.",
     callback = function(args)
+      selected_nodes = {}
       cursor_stack = {}
     end,
     once = true, -- Ensure it triggers only once
   })
 end
   
-
+-- Lua function to select the nearest parent node based on a Tree-sitter query.
+--
+-- This function assumes you have a query file named 'parent.scm'
+-- (e.g., queries/rust/parent.scm) that defines what a "parent" node is.
 function select_parent()
   setup_visual_exit_autocmd()
 
@@ -76,7 +89,13 @@ function select_parent()
   local winid = vim.api.nvim_get_current_win()
   local cursor_pos = vim.api.nvim_win_get_cursor(winid) -- {row, col}, 1-indexed
   local cursor_row = cursor_pos[1] - 1
-  local cursor_col = cursor_pos[2]
+  
+  -- Move cursor_col to the first non-whitespace character to the right
+  -- We need this due to how we expand the selection to include leading whitespace
+  local line = vim.api.nvim_get_current_line()
+  local col = cursor_pos[2] + 1 -- Lua indices are 1-based, but Neovim columns are 0-based
+  local next_non_ws = line:find("%S", col + 1)
+  local cursor_col = next_non_ws and (next_non_ws - 1) or cursor_pos[2]
 
   local lang = vim.bo[bufnr].filetype
   if type(lang) ~= "string" or lang == "" then
@@ -98,22 +117,6 @@ function select_parent()
   local tree = parser:parse()[1]
   if not tree then
     vim.notify("Error: Could not parse the buffer.", vim.log.levels.ERROR)
-    return
-  end
-
-  local root = tree:root()
-  local node = root:named_descendant_for_range(cursor_row, cursor_col, cursor_row, cursor_col)
-  if not node then
-    -- Fallback to any descendant (named or anonymous) if no specific named one is at the exact point/range
-    node = root:descendant_for_range(cursor_row, cursor_col, cursor_row, cursor_col)
-  end
-  vim.notify("Got node")
-
-  if not node then
-    vim.notify(
-      "Error: Could not find a Tree-sitter node at the cursor position. Position: r" .. cursor_row .. " c" .. cursor_col,
-      vim.log.levels.ERROR
-    )
     return
   end
 
@@ -148,6 +151,33 @@ function select_parent()
       vim.log.levels.ERROR)
     return
   end
+
+  local node
+  local selected_node = selected_nodes[#selected_nodes]
+
+  if selected_node then
+    if is_related_node(selected_node) then
+      node = first_non_related_right_sibling(selected_node)
+    else
+      node = selected_node:parent()
+    end
+  else
+    local root = tree:root()
+    local desc_node = root:named_descendant_for_range(cursor_row, cursor_col, cursor_row, cursor_col)
+    if not desc_node then
+      -- Fallback to any descendant (named or anonymous) if no specific named one is at the exact point/range
+      desc_node = root:descendant_for_range(cursor_row, cursor_col, cursor_row, cursor_col)
+    end
+
+    if not desc_node then
+      vim.notify(
+        "Error: Could not find a Tree-sitter node at the cursor position. Position: r" .. cursor_row .. " c" .. cursor_col,
+        vim.log.levels.ERROR
+      )
+      return
+    end
+    node = first_non_related_right_sibling(desc_node)
+  end
     
   local parent = nil
   while node do
@@ -163,23 +193,13 @@ function select_parent()
 
   ::found_parent_node::
 
+  if not selecting_related_nodes_enabled then
+    parent = first_non_related_right_sibling(parent)
+  end
+
   if parent then
     select_node(parent)
   end
-end
-
-local related_node_types = {
-  "attribute_item", 
-  "line_comment"
-}
-
-local function is_related_node(node)
-  for _, v in ipairs(related_node_types) do
-    if v == node:type() then
-      return true
-    end
-  end
-  return false
 end
 
 -- For the given node, get the start of the left-most relevant sibling. 
@@ -221,16 +241,67 @@ function related_leading_sibling_start(node)
   return start_row, start_col
 end
 
+-- For the given node (should pass is_related_node), get the last rightward sibling that is not a 
+-- related node type.
+function first_non_related_right_sibling(node)
+  if not is_related_node(node) then
+    return node
+  end
+
+  local parent = node:parent()
+  if not parent then
+    return node
+  end
+
+  -- Gather all siblings
+  local siblings = {}
+  for i = 0, parent:child_count() - 1 do
+    siblings[i + 1] = parent:child(i)
+  end
+
+  -- Find the index of the given node
+  local idx = nil
+  for i, sibling in ipairs(siblings) do
+    if sibling:id() == node:id() then
+      idx = i
+      break
+    end
+  end
+
+  if not idx then
+    return node
+  end
+
+  -- Traverse rightward to find the first non-related sibling
+  for s = idx + 1, #siblings do
+    local sibling = siblings[s]
+    if not is_related_node(sibling) then
+      return sibling
+    end
+  end
+
+
+  return node
+end
+
 
 function select_node(node)
+  table.insert(selected_nodes, node)
   local ts_utils = require("nvim-treesitter.ts_utils")
   local _, _, end_row, end_col = node:range()
-  local start_row, start_col =  related_leading_sibling_start(node)
-  start_col = 0
+  local start_row, start_col = related_leading_sibling_start(node)
 
   -- Get buffer lines
   local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
   local last_buf_line = #lines
+
+  -- Extend start_col to include any leading whitespace preceding it
+  local line = lines[start_row + 1] or ""
+  local s = start_col
+  while s > 0 and line:sub(s, s):match("%s") do
+    s = s - 1
+  end
+  start_col = s
 
   -- Extend end_row to include trailing empty lines after the node
   local i = end_row + 1
@@ -241,16 +312,16 @@ function select_node(node)
   end
 
   vim.api.nvim_buf_set_mark(0, '<', start_row + 1, start_col, {})
-  vim.api.nvim_buf_set_mark(0, '>', end_row + 1, end_col, {})
+  vim.api.nvim_buf_set_mark(0, '>', end_row + 1, end_col - 1, {})
   vim.cmd("normal! gvo")
   remember_current_selection()
 end
 
 
-
 function undo_select_node()
   if #cursor_stack ~= 0 then
     local cursor = table.remove(cursor_stack)
+    table.remove(selected_nodes)
     vim.api.nvim_buf_set_mark(0, '<', cursor.start_row + 1, cursor.start_col, {})
     vim.api.nvim_buf_set_mark(0, '>', cursor.end_row + 1, cursor.end_col, {})
     vim.cmd("normal! gvo")
