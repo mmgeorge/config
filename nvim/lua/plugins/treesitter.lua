@@ -6,12 +6,20 @@
 -- for its range, as in the example provided by the user:
 -- (([ (function_item) ... ] @_start @_end) (#make-range! "parent" @_start @_end))
 
+local cursor_stack = {}
+
 function select_parent()
   local bufnr = vim.api.nvim_get_current_buf()
   local winid = vim.api.nvim_get_current_win()
   local cursor_pos = vim.api.nvim_win_get_cursor(winid) -- {row, col}, 1-indexed
   local cursor_row = cursor_pos[1] - 1
-  local cursor_col = cursor_pos[2] - 1
+  local cursor_col = cursor_pos[2]
+  table.insert(cursor_stack, {
+    start_row = cursor_row,
+    start_col= cursor_col,
+    end_row = cursor_row,
+    end_col = cursor_col,
+  })
 
   local lang = vim.bo[bufnr].filetype
   if type(lang) ~= "string" or lang == "" then
@@ -21,21 +29,21 @@ function select_parent()
     )
     return
   end
-  
+
   local parser = vim.treesitter.get_parser(bufnr, lang)
   if not parser then
     vim.notify("Error: No Tree-sitter parser found for language: " .. lang, vim.log.levels.ERROR)
     return
   end
 
-  -- Parse the current buffer's content. Select the first (and usually only) tree 
+  -- Parse the current buffer's content. Select the first (and usually only) tree
   -- TODO: Handle multiple trees?
   local tree = parser:parse()[1]
   if not tree then
     vim.notify("Error: Could not parse the buffer.", vim.log.levels.ERROR)
     return
   end
-  
+
   local root = tree:root()
   local node = root:named_descendant_for_range(cursor_row, cursor_col, cursor_row, cursor_col)
   if not node then
@@ -46,7 +54,7 @@ function select_parent()
 
   if not node then
     vim.notify(
-      "Error: Could not find a Tree-sitter node at the cursor position. Position: r" .. cursor_row .. " c" .. cursor_col, 
+      "Error: Could not find a Tree-sitter node at the cursor position. Position: r" .. cursor_row .. " c" .. cursor_col,
       vim.log.levels.ERROR
     )
     return
@@ -58,7 +66,9 @@ function select_parent()
   if not query or query == "" then
     vim.notify(
       "Error: Could not load query 'parent' for language '" .. lang .. "'. " ..
-      "Ensure queries/" .. lang .. "/parent.scm exists in your Neovim runtime path (e.g., ~/.config/nvim/queries/"..lang.."/parent.scm). " ..
+      "Ensure queries/" ..
+      lang .. "/parent.scm exists in your Neovim runtime path (e.g., ~/.config/nvim/queries/" ..
+      lang .. "/parent.scm). " ..
       "Query content was nil or empty.",
       vim.log.levels.ERROR
     )
@@ -77,11 +87,11 @@ function select_parent()
   if capture_start_id == -1 then
     vim.notify(
       "Error: The 'parent' query does not contain the '@_start' capture. " ..
-      "The query needs to identify the main node with '@_start'.", 
+      "The query needs to identify the main node with '@_start'.",
       vim.log.levels.ERROR)
     return
   end
-
+    
   local parent = nil
   while node do
     for _, match in query:iter_matches(node, bufnr) do
@@ -97,33 +107,41 @@ function select_parent()
   ::found_parent_node::
 
   if parent then
-    print(vim.inspect(parent))
-    local start_row, start_col, end_row, end_col = parent:range()
-    vim.api.nvim_buf_set_mark(0, '<', start_row + 1, start_col, {})
-    vim.api.nvim_buf_set_mark(0, '>', end_row + 1, end_col, {})
-    vim.cmd("normal! gvo")
+    select_node(parent)
+  end
+end
 
-    -- Notify the user
-    vim.notify("Selected nearest parent: " .. start_row .. "->" .. end_row, vim.log.levels.INFO)
-  else
-    vim.notify("No parent node found matching the 'parent' query.", vim.log.levels.INFO)
+
+function select_node(node)
+  local start_row, start_col, end_row, end_col = node:range()
+  start_col = 0
+
+  -- Get buffer lines
+  local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
+  local last_buf_line = #lines
+
+  -- Extend end_row to include trailing empty lines after the node
+  local i = end_row + 1
+  while i < last_buf_line and lines[i + 1]:match('^%s*$') do
+    end_row = i
+    end_col = #lines[i + 1]
+    i = i + 1
   end
 
-
+  vim.api.nvim_buf_set_mark(0, '<', start_row + 1, start_col, {})
+  vim.api.nvim_buf_set_mark(0, '>', end_row + 1, end_col, {})
+  vim.cmd("normal! gvo")
 end
 
--- Example of how to make it a command:
--- vim.api.nvim_create_user_command("SelectNearestParent", SelectNearestParent, {})
 
--- Example of how to map it to a key (e.g., <leader>ap for 'ancestor parent'):
--- vim.keymap.set("n", "<leader>ap", SelectNearestParent, { noremap = true, silent = true, desc = "Select Nearest Parent (Query)" })
+function undo_select_node()
+  if #cursor_stack ~= 0 then
+    local cursor = table.remove(cursor_stack)
+    vim.api.nvim_buf_set_mark(0, '<', cursor.start_row + 1, cursor.start_col, {})
+    vim.api.nvim_buf_set_mark(0, '>', cursor.end_row + 1, cursor.end_col, {})
+    vim.cmd("normal! gvo")
+  end
 
-function select_child()
-  
-end
-
-function select_sibling()
-  
 end
 
 
@@ -132,27 +150,33 @@ local key = require("../keys").key
 return {
   {
     "nvim-treesitter/nvim-treesitter",
-    -- tag = "v0.9.3",
     dependencies = {
-      -- Does NOT work with c_sharp
       "nvim-treesitter/nvim-treesitter-textobjects",
     },
-    keys = {
-      {
-        "<C-q>", 
-        function ()
-          select_parent()
-        end,
-        mode = { "n", "i", "v", "x", "s", "o" }
-      },
-      {
-        "P", 
-        function ()
-          select_parent()
-        end,
-        mode = { "v", "x" }
-      }
-    },
+    -- keys = {
+    --   {
+    --     "<C-q>",
+    --     function()
+    --       select_parent()
+    --     end,
+    --     mode = { "n", "i", "v", "x", "s", "o" }
+    --   },
+    --   {
+    --     "p",
+    --     function()
+    --       select_parent()
+    --     end,
+    --     mode = { "v", "x" }
+    --   },
+    --   {
+    --     "P",
+    --     function()
+    --       select_child()
+    --     end,
+    --     mode = { "v", "x" }
+    --   }
+    --
+    -- },
     -- build = ":TSUpdate",
     config = function()
       local configs = require("nvim-treesitter.configs")
