@@ -8,18 +8,74 @@
 
 local cursor_stack = {}
 
+--- Push the current visual selection or cursor position onto cursor_stack
+local function remember_current_selection()
+  local mode = vim.fn.mode()
+  local start_row, start_col, end_row, end_col
+
+  if mode == "v" or mode == "V" then
+    -- Get the start and end of the visual selection
+    local start_pos = vim.fn.getpos("'<")
+    local end_pos   = vim.fn.getpos("'>")
+    start_row = start_pos[2] - 1
+    start_col = start_pos[3] - 1
+    end_row   = end_pos[2] - 1
+    end_col   = end_pos[3] - 1
+    -- In visual-line, select all columns
+    if mode == "V" then
+      start_col = 0
+      end_col = math.max(0, #vim.fn.getline(end_row+1))
+    end
+    print("Push it v", start_row .. " " .. end_row)
+    -- Ensure start is always before end
+    if start_row > end_row or (start_row == end_row and start_col > end_col) then
+      start_row, end_row = end_row, start_row
+      start_col, end_col = end_col, start_col
+    end
+  else
+    -- If not in visual mode, push current cursor position as zero-width selection
+    local pos = vim.api.nvim_win_get_cursor(0)
+    start_row = pos[1] - 1
+    start_col = pos[2]
+    end_row   = start_row
+    end_col   = start_col
+    print("Push it non -v", start_row .. " " .. end_row)
+  end
+
+
+  table.insert(cursor_stack, {
+    start_row = start_row,
+    end_row   = end_row,
+    start_col = start_col,
+    end_col   = end_col
+  })
+end
+
+
+--- Create an autocommand to clear global 'cursor_stack' on Visual mode exit, only once.
+local function setup_visual_exit_autocmd()
+  local augroup_name = "ClearCursorStackOnVisualLeave"
+  vim.api.nvim_create_augroup(augroup_name, { clear = true })
+  vim.api.nvim_create_autocmd("ModeChanged", {
+    group = augroup_name,
+    pattern = "v:*",
+    desc = "Clear global cursor_stack and remove self on leaving visual mode.",
+    callback = function(args)
+      cursor_stack = {}
+    end,
+    once = true, -- Ensure it triggers only once
+  })
+end
+  
+
 function select_parent()
+  setup_visual_exit_autocmd()
+
   local bufnr = vim.api.nvim_get_current_buf()
   local winid = vim.api.nvim_get_current_win()
   local cursor_pos = vim.api.nvim_win_get_cursor(winid) -- {row, col}, 1-indexed
   local cursor_row = cursor_pos[1] - 1
   local cursor_col = cursor_pos[2]
-  table.insert(cursor_stack, {
-    start_row = cursor_row,
-    start_col= cursor_col,
-    end_row = cursor_row,
-    end_col = cursor_col,
-  })
 
   local lang = vim.bo[bufnr].filetype
   if type(lang) ~= "string" or lang == "" then
@@ -131,6 +187,7 @@ function select_node(node)
   vim.api.nvim_buf_set_mark(0, '<', start_row + 1, start_col, {})
   vim.api.nvim_buf_set_mark(0, '>', end_row + 1, end_col, {})
   vim.cmd("normal! gvo")
+  remember_current_selection()
 end
 
 
