@@ -20,6 +20,9 @@
    (public_field_definition)
    (pair)
    (object)
+   (template_string)
+   (string)
+   (string_fragment)
    ] @parent))
    
 (else_clause) @jump  
@@ -28,6 +31,7 @@
 ; (required_parameter) @list_arg 
 ; (optional_parameter) @list_arg 
 
+(for_statement) @list 
 (type_arguments) @list 
 (array) @list 
 (formal_parameters) @list 

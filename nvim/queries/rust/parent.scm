@@ -18,17 +18,22 @@
    (impl_item)
 
    (let_declaration)
+   (call_expression)
 
    (reference_type)
    (reference_expression)
    (lifetime)
    (trait_bounds)
+   (abstract_type) ; impl Iterator<..>
    ; (generic_type)
    ; (type_identifier)
+   (string_literal)
+   (string_content)
    ] @parent))
 
 (field_initializer_list) @list
 (token_tree) @list
+(type_arguments) @list
 (type_parameters) @list
 (arguments) @list
 (parameters) @list
