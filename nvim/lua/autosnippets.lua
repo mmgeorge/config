@@ -4,6 +4,55 @@
           body = "<- "
         },
         {
+          trigger = "ifc ", 
+          body = [[interface $1 { 
+  $2 
+}]], 
+          files = { "typescript", "typescriptreact" }
+        },
+        {
+          trigger = "eifc ", 
+          body = [[export interface $1 { 
+  $2 
+}]], 
+          files = { "typescript", "typescriptreact" }
+        },
+        {
+          trigger = "efn ", 
+          body = [[export function $1($2): $3 { 
+  $4 
+}]], 
+          files = { "typescript", "typescriptreact" }
+        },
+        {
+          trigger = "fn ", 
+          body = [[function $1($2): $3 { 
+  $4 
+}]], 
+          files = { "typescript", "typescriptreact" }
+        },
+        {
+          trigger = "ecfn ", 
+          body = [[export const $1 = (props: { $2 }) => { 
+  $4 
+}]], 
+          files = { "typescriptreact" }
+        },
+        {
+          trigger = "cfn ", 
+          body = [[const $1 = (props: { $2 }) => { 
+  $4 
+}]], 
+          files = { "typescriptreact" }
+        },
+        {
+          trigger = "fn ", 
+          body = [[fn $1($2) -> $3 { 
+  $4 
+}]], 
+          files = { "rust" }
+        },
+        {
           trigger = "todo: ", 
           body = "TODO "
         },
@@ -62,6 +111,20 @@ var esriConfig = {
 ]]
         }
       }
+
+      function valid_for_file(item, ftype)
+        if not item.file then
+          return true
+        end 
+
+        for _, v in ipairs(item.files) do
+          if v == ftype then
+            return true
+          end
+        end
+        return false 
+
+      end
       
       vim.api.nvim_create_autocmd("TextChangedI", {
         pattern = "*",
@@ -71,13 +134,14 @@ var esriConfig = {
 
           -- Extract the last entered token
           local start_pos, end_pos = line:sub(1, col):find("([^%s]+)%s?$")
+          local ftype = vim.bo.filetype
     
           if start_pos and end_pos then
             local last_token = line:sub(start_pos, end_pos)
             
             -- OPTIMIZE: Inefficent. Use map as snippets list grows?
             for index, item in ipairs(autosnippets) do 
-              if last_token == item.trigger then
+              if valid_for_file(item, ftype) and last_token == item.trigger then
                 local pos = vim.api.nvim_win_get_cursor(0) -- get current cursor position
                 local row = pos[1] - 1; 
                 local buf = vim.api.nvim_get_current_buf() 
