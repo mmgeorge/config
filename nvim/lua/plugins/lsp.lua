@@ -206,16 +206,8 @@ return {
         })
       end
 
-      require("lspconfig").eslint.setup({
-        -- vim.lsp.config('eslint', {
+      vim.lsp.config("eslint", {
         capabilities = capabilities,
-        -- on_attach = function(client, bufnr)
-        --   vim.api.nvim_create_autocmd("BufWritePre", {
-        --     buffer = bufnr,
-        --     command = "EslintFixAll",
-        --   })
-        -- end,
-        -- cmd = { "npx", "eslint", "--stdio" },
         settings = {
           codeAction = {
             disableRuleComment = {
@@ -226,16 +218,11 @@ return {
               enable = true
             }
           },
-          codeActionOnSave = {
-            enable = true,
-            mode = "all"
-          },
-          -- experimental = {
-          -- useFlatConfig = true
+          -- codeActionOnSave = {
+          --   enable = true,
+          --   mode = "all"
           -- },
-          format = true,
-          -- nodePath = "",
-          -- onIgnoredFiles = "off",
+          -- format = true,
           problems = {
             shortenToSingleLine = false
           },
@@ -251,12 +238,10 @@ return {
             }
           },
           run = "onType",
-          -- useESLintClass = false,
           validate = "on",
           workingDirectory = {
             mode = "location"
           },
-          -- root_dir = lspconfig.util.find_git_ancestor,
         }
       })
     end
