@@ -2,6 +2,11 @@
    (comment)
    (export_statement)
    (lexical_declaration)
+   (if_statement)
+   (else_clause)
+   (switch_statement)
+   (switch_case)
+   (switch_default)
 
    ; (lexical_declaration
    ;   (variable_declarator
@@ -16,7 +21,8 @@
    (interface_declaration)
    ] @parent))
    
-(export_statement) @export 
+(else_clause) @jump  
+(export_statement) @jump 
 
 (identifier) @list_arg 
 (required_parameter) @list_arg 

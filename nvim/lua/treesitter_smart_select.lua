@@ -83,85 +83,33 @@ end
 -- Relevant siblings include comments, macros, and decorators 
 local function related_leading_sibling_start(node)
   local start_row, start_col = node:range()
-  
-  -- Traverse backwards and include leading (attribute_item) siblings
-  local parent = node:parent()
-  if parent then
-    local siblings = {}
-    for i = 0, parent:child_count() - 1 do
-      siblings[i + 1] = parent:child(i)
-    end
+  local sibling = node:prev_named_sibling()
 
-    local i = 1
-    while i <= #siblings do
-      if siblings[i]:id() == node:id() then
-        -- scan leftwards for (attribute_item) siblings
-        local s = i - 1
-        while s >= 1 do
-          local sibling = siblings[s]
-          if is_related_node(sibling) then
-            local s_row, s_col = sibling:range()
-            start_row = s_row
-            -- start_col must be reached to the leftmost attr
-            start_col = 0
-            s = s - 1
-          else
-            break
-          end
-        end
-        break
-      end
-      i = i + 1
+  while sibling do
+    if is_related_node(sibling) then
+      local s_row, s_col = sibling:range()
+      start_row = s_row
+      start_col = s_col
+    else 
+      break
     end
+    sibling = sibling:prev_named_sibling()
   end
-
+  
   return start_row, start_col
 end
 
 -- For the given node (should pass is_related_node), get the last rightward sibling that is not a 
 -- related node type.
-local function first_non_related_right_sibling(node)
-  if not is_related_node(node) then
-    return node
+local function first_core_right_sibling(node)
+  local sibling = node
+
+  while sibling and is_related_node(sibling) do
+    sibling = sibling:next_named_sibling()
   end
-
-  local parent = node:parent()
-  if not parent then
-    return node
-  end
-
-  -- Gather all siblings
-  local siblings = {}
-  for i = 0, parent:child_count() - 1 do
-    siblings[i + 1] = parent:child(i)
-  end
-
-  -- Find the index of the given node
-  local idx = nil
-  for i, sibling in ipairs(siblings) do
-    if sibling:id() == node:id() then
-      idx = i
-      break
-    end
-  end
-
-  if not idx then
-    return node
-  end
-
-  -- Traverse rightward to find the first non-related sibling
-  for s = idx + 1, #siblings do
-    local sibling = siblings[s]
-    if not is_related_node(sibling) then
-      return sibling
-    end
-  end
-
-
-  return node
+    
+  return sibling
 end
-
-
 
 --- Determines if a Tree-sitter node is the last child in its parent (has no right siblings)
 ---@param node userdata TSNode
@@ -206,31 +154,33 @@ local function select_node(node, is_list_arg)
     start_col = s
 
   end
+      
 
   -- Extend end_col to include any trailing , ; . or ?
-  local end_line = lines[end_row + 1] or ""
-  local e = end_col
-  -- cover the case where end_col might be at the last char, extend if needed
-  while e <= #end_line do
-    local c = end_line:sub(e + 1, e + 1)
-    if c:match("[%s,;%.%?]") then
-      e = e + 1
-    else
-      break
-    end
-  end
-  end_col = e
-
-  -- Extend end_row to include trailing empty lines after the node
+  -- local end_line = lines[end_row + 1] or ""
+  -- local e = end_col
+  -- -- cover the case where end_col might be at the last char, extend if needed
+  -- while e <= #end_line do
+  --   local c = end_line:sub(e + 1, e + 1)
+  -- print("pad", c)
+  --   if c:match("[%s,;%.%?]") then
+  --     e = e + 1
+  --   else
+  --     break
+  --   end
+  -- end
+  -- end_col = e
+  --
+  -- Extend end_row to include trailing empty lines and newlines after the node
   local i = end_row + 1
-  while i < last_buf_line and lines[i + 1]:match('^%s*$') do
+  while i < last_buf_line and (lines[i + 1]:match('^%s*$') or lines[i + 1] == '') do
     end_row = i
     end_col = #lines[i + 1]
     i = i + 1
   end
 
   vim.api.nvim_buf_set_mark(0, '<', start_row + 1, start_col, {})
-  vim.api.nvim_buf_set_mark(0, '>', end_row + 1, end_col - 1, {})
+  vim.api.nvim_buf_set_mark(0, '>', end_row + 1, end_col, {})
   vim.cmd("normal! gvo")
   remember_current_selection()
 end
@@ -254,7 +204,7 @@ function get_closest_node(tree)
 
   if selected_node then
     if is_related_node(selected_node) then
-      node = first_non_related_right_sibling(selected_node)
+      node = first_core_right_sibling(selected_node)
     else
       node = selected_node:parent()
     end
@@ -273,7 +223,7 @@ function get_closest_node(tree)
       )
       return
     end
-    node = first_non_related_right_sibling(desc_node)
+    node = first_core_right_sibling(desc_node)
   end
 
   return node
@@ -362,11 +312,12 @@ function select_parent()
     
     if matches(query, "parent", node, bufnr) then
       if not selecting_related_nodes_enabled then
-        node = first_non_related_right_sibling(node)
+        node = first_core_right_sibling(node)
       end
 
-      -- Move up if the immediate parent is an export node
-      if matches(query, "export", parent, bufnr) then
+      -- In some cases, we perfer to always jump to the parent of the 
+      -- current node depending on the lang
+      if matches(query, "jump", parent, bufnr) then
         node = parent 
       end
 
