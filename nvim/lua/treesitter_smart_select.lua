@@ -162,23 +162,50 @@ local function first_non_related_right_sibling(node)
 end
 
 
-local function select_node(node)
+
+--- Determines if a Tree-sitter node is the last child in its parent (has no right siblings)
+---@param node userdata TSNode
+---@return boolean
+local function is_last_child(node)
+  local parent = node:parent()
+  if not parent then
+    return false
+  end
+  
+  local last_child = parent:child(parent:child_count() - 1)
+  print("last", vim.inspect(last_child:id(), node:id()))
+  return last_child:id() == node:id()
+end
+
+
+local function select_node(node, is_list_arg)
   table.insert(selected_nodes, node)
   local ts_utils = require("nvim-treesitter.ts_utils")
   local _, _, end_row, end_col = node:range()
   local start_row, start_col = related_leading_sibling_start(node)
-
+  
   -- Get buffer lines
   local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
   local last_buf_line = #lines
 
-  -- Extend start_col to include any leading whitespace preceding it
-  local line = lines[start_row + 1] or ""
-  local s = start_col
-  while s > 0 and line:sub(s, s):match("%s") do
-    s = s - 1
+  if is_list_arg and not node:next_named_sibling() then
+    -- Move starting selection left to select any leading whitespace or ,
+    local line = lines[start_row + 1] or ""
+    local s = start_col
+    while s > 0 and line:sub(s, s):match("[%s,]") do
+      s = s - 1
+    end
+    start_col = s
+  else
+    -- Extend start_col to include any leading whitespace preceding it
+    local line = lines[start_row + 1] or ""
+    local s = start_col
+    while s > 0 and line:sub(s, s):match("%s") do
+      s = s - 1
+    end
+    start_col = s
+
   end
-  start_col = s
 
   -- Extend end_col to include any trailing , ; . or ?
   local end_line = lines[end_row + 1] or ""
@@ -233,11 +260,11 @@ function get_closest_node(tree)
     end
   else
     local root = tree:root()
-    local desc_node = root:descendant_for_range(cursor_row, cursor_col, cursor_row, cursor_col)
-    -- local desc_node = root:named_descendant_for_range(cursor_row, cursor_col, cursor_row, cursor_col)
-    -- if not desc_node then
+    local desc_node = root:named_descendant_for_range(cursor_row, cursor_col, cursor_row, cursor_col)
+    if not desc_node then
       -- Fallback to any descendant (named or anonymous) if no specific named one is at the exact point/range
-    -- end
+      desc_node = root:descendant_for_range(cursor_row, cursor_col, cursor_row, cursor_col)
+    end
 
     if not desc_node then
       vim.notify(
@@ -298,6 +325,10 @@ local function get_capture_index(query, capture_name)
 end
 
 function matches(query, capture_name, node, bufnr)
+  if not node then
+    return false
+  end
+
   local index = get_capture_index(query, capture_name)
   for _, match in query:iter_matches(node, bufnr) do
     local matched_group = match[index]
@@ -318,7 +349,6 @@ function select_parent()
   local bufnr = vim.api.nvim_get_current_buf()
   local ftype = vim.bo[bufnr].filetype
   local lang = require("nvim-treesitter.parsers").ft_to_lang(ftype)
-
   local query = query_for(lang)
   local tree = get_tree(bufnr, lang)
   local node = get_closest_node(tree)
@@ -326,7 +356,7 @@ function select_parent()
   while node do
     local parent = node:parent(); 
     if matches(query, "list_arg", node, bufnr) and matches(query, "list", parent, bufnr) then
-      select_node(node)
+      select_node(node, true)
       return
     end
     
@@ -335,9 +365,9 @@ function select_parent()
         node = first_non_related_right_sibling(node)
       end
 
-      -- For typescript, go up if we are in an export
-      if parent and parent:type() == "export_statement" then
-        node = node:parent() 
+      -- Move up if the immediate parent is an export node
+      if matches(query, "export", parent, bufnr) then
+        node = parent 
       end
 
       select_node(node)
