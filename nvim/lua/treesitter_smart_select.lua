@@ -111,6 +111,17 @@ local function first_core_right_sibling(node)
   return sibling
 end
 
+local function has_leading_whitespace_only(line, s)
+  while s > 0 do
+    if not line:sub(s, s):match("%s") then
+     return false 
+    end 
+    s = s - 1
+  end
+
+  return true
+end
+
 --- Determines if a Tree-sitter node is the last child in its parent (has no right siblings)
 ---@param node userdata TSNode
 ---@return boolean
@@ -137,26 +148,24 @@ local function select_node(node, is_list_arg)
   local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
   local last_buf_line = #lines
 
-  if is_list_arg and not node:next_named_sibling() then
-    -- Move starting selection left to select any leading whitespace or ,
-    local line = lines[start_row + 1] or ""
-    local s = start_col
-    while s > 0 and line:sub(s, s):match("[%s,]") do
-      s = s - 1
-    end
-    start_col = s
-  else
-    -- Extend start_col to include any leading whitespace preceding it
-    local line = lines[start_row + 1] or ""
-    local s = start_col
-    while s > 0 and line:sub(s, s):match("%s") do
-      s = s - 1
-    end
-    start_col = s
-
+  local match = "%s";
+  if is_list_arg then
+    if not node:next_named_sibling() then
+      match = "[%s,]" 
+    else  
+      match = nil
+    end 
   end
-      
 
+  if match then
+    local line = lines[start_row + 1] or ""
+    local s = start_col
+    while s > 0 and line:sub(s, s):match(match) do
+      s = s - 1
+    end
+    start_col = s
+  end
+  
   -- Extend end_col to include any trailing , ; . or ?
   local end_line = lines[end_row + 1] or ""
   local e = end_col
@@ -179,12 +188,16 @@ local function select_node(node, is_list_arg)
     i = i + 1
   end
  
-  -- HACK: Not sure why this adjustment is needed. But if we don't adjust here, then for 
-  -- let x = [te|st, foo] will select the f?
-  -- local end_line = lines[end_row + 1] or ""
-  -- if end_col ~= #end_line then
-    end_col = end_col - 1 
-  -- end
+  -- Not sure why this adjustment is needed. Indexing? But if we don't adjust 
+  -- here, then for let x = [te|st, foo] will select the f?
+  end_col = end_col - 1 
+ 
+  -- Finally, check if we should expand the selection to remove any trailing newlines.
+  local end_line = lines[end_row + 1] or ""
+  local has_leading_whitespace_only = has_leading_whitespace_only(lines[start_row + 1], start_col) 
+  if has_leading_whitespace_only and end_col + 1 == #end_line then
+    end_col = #end_line 
+  end
 
   vim.api.nvim_buf_set_mark(0, '<', start_row + 1, start_col, {})
   vim.api.nvim_buf_set_mark(0, '>', end_row + 1, end_col, {})

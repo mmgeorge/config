@@ -7,6 +7,7 @@
    (switch_statement)
    (switch_case)
    (switch_default)
+   (array)
 
    ; (lexical_declaration
    ;   (variable_declarator
