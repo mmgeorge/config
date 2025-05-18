@@ -35,12 +35,12 @@ end
 local adapter = detect_adapter()
 
 
-vim.api.nvim_create_autocmd("FileType", {
-  pattern = "gitcommit",
-  callback = function()
-    vim.cmd(":CodeCompanion /commit")
-  end,
-})
+-- vim.api.nvim_create_autocmd("FileType", {
+--   pattern = "gitcommit",
+--   callback = function()
+--     print("Hello, World!")
+--   end,
+-- })
 
 return {
   {
