@@ -1,6 +1,5 @@
-
-local priorities = { 
-  snippets = 4, 
+local priorities = {
+  snippets = 4,
 }
 
 return {
@@ -14,8 +13,8 @@ return {
 
     -- use a release tag to download pre-built binaries
     version = '1.*',
- 
-    init = function ()
+
+    init = function()
       vim.cmd([[highlight BlinkCmpMenu             guibg=#242529 guifg=White]])
       vim.cmd([[highlight BlinkCmpLabel            guibg=#242529 guifg=White]])
       vim.cmd([[highlight BlinkCmpLabelDescription guibg=#242529 guifg=#3ec5ff]])
@@ -41,9 +40,9 @@ return {
           'score',
           'sort_text',
           -- 'label'
-        } 
+        }
       },
-      keymap = { 
+      keymap = {
         ['<C-space>'] = { 'show', 'show_documentation', 'hide_documentation' },
         ['<C-e>'] = { 'hide', 'fallback' },
         ['<CR>'] = { 'accept', 'fallback' },
@@ -125,13 +124,13 @@ return {
       sources = {
         default = { 'snippets', 'lsp', 'path', 'custom_snippets', 'spell' },
 
-        -- min_keyword_length = 3, 
+        -- min_keyword_length = 3,
         providers = {
           snippets = {
-            score_offset = 2
+            score_offset = 20
           },
           lsp = {
-            transform_items = function (ctx, items)
+            transform_items = function(ctx, items)
               local function should_filter(label)
                 -- if ctx.bounds.length < 4 and #label >= 8 then
                 --   return true
@@ -140,14 +139,14 @@ return {
                 if ctx.bounds.length < 6 and #label >= 16 then
                   return true
                 end
-              
+
                 return string.sub(label, 1, 2) == "__"
               end
 
               local out = {}
               for _, item in ipairs(items) do
                 if not should_filter(item.label) then
-                  table.insert(out, item) 
+                  table.insert(out, item)
                 end
               end
 
@@ -168,15 +167,15 @@ return {
             end
           },
           custom_snippets = {
-            name = "custom_snippets", 
-            module = "snippet_source", 
-          }, 
+            name = "custom_snippets",
+            module = "snippet_source",
+          },
           spell = {
             name = 'Spell',
             min_keyword_length = 5,
             module = 'blink-cmp-spell',
             opts = {
-              use_cmp_spell_storting = true, 
+              use_cmp_spell_storting = true,
               -- EXAMPLE: Only enable source in `@spell` captures, and disable it
               -- in `@nospell` captures.
               enable_in_context = function()
