@@ -129,6 +129,7 @@ end
 local function select_node(node, is_list_arg)
   table.insert(selected_nodes, node)
   local ts_utils = require("nvim-treesitter.ts_utils")
+  -- local start_row, start_col, end_row, end_col = node:range()
   local _, _, end_row, end_col = node:range()
   local start_row, start_col = related_leading_sibling_start(node)
   
@@ -157,20 +158,19 @@ local function select_node(node, is_list_arg)
       
 
   -- Extend end_col to include any trailing , ; . or ?
-  -- local end_line = lines[end_row + 1] or ""
-  -- local e = end_col
-  -- -- cover the case where end_col might be at the last char, extend if needed
-  -- while e <= #end_line do
-  --   local c = end_line:sub(e + 1, e + 1)
-  -- print("pad", c)
-  --   if c:match("[%s,;%.%?]") then
-  --     e = e + 1
-  --   else
-  --     break
-  --   end
-  -- end
-  -- end_col = e
-  --
+  local end_line = lines[end_row + 1] or ""
+  local e = end_col
+  -- cover the case where end_col might be at the last char, extend if needed
+  while e <= #end_line do
+    local c = end_line:sub(e + 1, e + 1)
+    if c:match("[%s,;%.%?]") then
+      e = e + 1
+    else
+      break
+    end
+  end
+  end_col = e
+  
   -- Extend end_row to include trailing empty lines and newlines after the node
   local i = end_row + 1
   while i < last_buf_line and (lines[i + 1]:match('^%s*$') or lines[i + 1] == '') do
@@ -178,6 +178,13 @@ local function select_node(node, is_list_arg)
     end_col = #lines[i + 1]
     i = i + 1
   end
+ 
+  -- HACK: Not sure why this adjustment is needed. But if we don't adjust here, then for 
+  -- let x = [te|st, foo] will select the f?
+  -- local end_line = lines[end_row + 1] or ""
+  -- if end_col ~= #end_line then
+    end_col = end_col - 1 
+  -- end
 
   vim.api.nvim_buf_set_mark(0, '<', start_row + 1, start_col, {})
   vim.api.nvim_buf_set_mark(0, '>', end_row + 1, end_col, {})
