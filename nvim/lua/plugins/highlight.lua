@@ -15,14 +15,14 @@ return {
         cancel_color_key = "<leader>" .. key("H"),
       }
     end
-  }, 
-  { 
+  },
+  {
     "RRethy/vim-illuminate",
     config = function()
       return require('illuminate').configure({
         -- providers: provider used to get references in the buffer, ordered by priority
         providers = {
-          -- 'lsp',
+          'lsp',
           'treesitter',
         },
         -- delay: delay in milliseconds
@@ -72,5 +72,6 @@ return {
         -- case_insensitive_regex: sets regex case sensitivity
         case_insensitive_regex = false,
       })
-    end, }
+    end,
+  }
 }
