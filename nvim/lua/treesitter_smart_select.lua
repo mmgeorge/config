@@ -6,10 +6,11 @@ local selected_nodes = {}
 local selecting_related_nodes_enabled = true 
 
 local related_node_types = {
-  "attribute_item",  --rust
-  "line_comment", -- rust
-  "comment", -- lua
-
+  --rust
+  "attribute_item", 
+  "line_comment",
+  -- lua
+  "comment", 
 }
 
 local function is_related_node(node)
@@ -325,7 +326,8 @@ function select_parent()
 
   while node do
     local parent = node:parent(); 
-    if matches(query, "list_arg", node, bufnr) and matches(query, "list", parent, bufnr) then
+    -- if matches(query, "list_arg", node, bufnr) and matches(query, "list", parent, bufnr) then
+    if matches(query, "list", parent, bufnr) then
       select_node(node, true)
       return
     end
