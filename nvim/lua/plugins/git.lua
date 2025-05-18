@@ -4,21 +4,21 @@ return {
   {
     'akinsho/git-conflict.nvim',
     tag = "v1.1.2",
-    config = function ()
-      require"git-conflict".setup({
-        -- disable buffer local mapping created by this plugin 
+    config = function()
+      require "git-conflict".setup({
+        -- disable buffer local mapping created by this plugin
         default_mappings = false,
-        
-      }) 
+
+      })
     end,
   },
   {
     "NeogitOrg/neogit",
     -- commit = "0cae7abc30cb91d661f28257c331fcb5b5198e31",
     dependencies = {
-      "nvim-lua/plenary.nvim",         -- required
-      "sindrets/diffview.nvim",        -- optional - Diff integration
-      "folke/snacks.nvim",  
+      "nvim-lua/plenary.nvim",  -- required
+      "sindrets/diffview.nvim", -- optional - Diff integration
+      "folke/snacks.nvim",
     },
     keys = {
       {
@@ -28,11 +28,18 @@ return {
       }
     },
     config = function()
+      vim.api.nvim_create_autocmd({ 'BufEnter' }, {
+        pattern = "COMMIT_EDITMSG",
+        callback = function()
+          require("codecompanion").prompt("commit")
+        end,
+      })
+
       local neogit = require("neogit")
       neogit.setup {
         disable_hint = false,
         disable_context_highlighting = true,
-        process_spinner = true, 
+        process_spinner = true,
         disable_signs = true,
         -- Changes what mode the Commit Editor starts in. `true` will leave nvim in normal mode,
         -- `false` will change nvim to insert mode, and `"auto"` will change nvim to insert mode
@@ -47,11 +54,12 @@ return {
         },
         -- "ascii"   is the graph the git CLI generates
         -- "unicode" is the graph like https://github.com/rbong/vim-flog
-        graph_style = "unicode", 
+        graph_style = "unicode",
         -- Used to generate URL's for branch popup action "pull request".
         git_services = {
           ["github.com"] = "https://github.com/${owner}/${repository}/compare/${branch_name}?expand=1",
         },
+        initial_branch_name = "matt9222/",
         -- Persist the values of switches/options within and across sessions
         remember_settings = true,
         -- Scope persisted settings on a per-project basis
@@ -86,14 +94,14 @@ return {
         console_timeout = 1500,
         -- Automatically show console if a command takes more than console_timeout milliseconds
         auto_show_console = true,
-        auto_close_console = true, 
+        auto_close_console = true,
         status = {
           recent_commit_count = 10,
         },
         commit_editor = {
           -- kind = "tab",
           kind = "auto",
-          show_staged_diff = false, 
+          show_staged_diff = false,
           spell_check = true
         },
         commit_select_view = {
@@ -102,8 +110,8 @@ return {
         commit_view = {
           kind = "vsplit",
           -- kind = "tab",
-          -- Can be set to true or false, otherwise we try to find the binary 
-          verify_commit = os.execute("which gpg") == 0, 
+          -- Can be set to true or false, otherwise we try to find the binary
+          verify_commit = os.execute("which gpg") == 0,
         },
         log_view = {
           kind = "tab",
@@ -268,10 +276,6 @@ return {
             folded = false,
             hidden = false,
           },
-          unstaged = {
-            folded = false,
-            hidden = false,
-          },
           staged = {
             folded = false,
             hidden = false,
@@ -306,7 +310,6 @@ return {
           },
         },
       }
-
     end
   },
 
