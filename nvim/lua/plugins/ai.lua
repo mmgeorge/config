@@ -3,7 +3,7 @@ function detect_adapter()
     return {
       chat = "openai", 
       inline = "openai", 
-      cmd = "openai", 
+
       commit = {
         name = "openai", 
         model = "gpt-4.1-mini"
