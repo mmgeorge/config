@@ -180,6 +180,20 @@ local function select_node(node)
   end
   start_col = s
 
+  -- Extend end_col to include any trailing , ; . or ?
+  local end_line = lines[end_row + 1] or ""
+  local e = end_col
+  -- cover the case where end_col might be at the last char, extend if needed
+  while e <= #end_line do
+    local c = end_line:sub(e + 1, e + 1)
+    if c:match("[%s,;%.%?]") then
+      e = e + 1
+    else
+      break
+    end
+  end
+  end_col = e
+
   -- Extend end_row to include trailing empty lines after the node
   local i = end_row + 1
   while i < last_buf_line and lines[i + 1]:match('^%s*$') do
@@ -194,6 +208,7 @@ local function select_node(node)
   remember_current_selection()
 end
 
+
 function get_closest_node(tree)
   local bufnr = vim.api.nvim_get_current_buf()
   local winid = vim.api.nvim_get_current_win()
@@ -203,7 +218,7 @@ function get_closest_node(tree)
   -- Move cursor_col to the first non-whitespace character to the right
   -- We need this due to how we expand the selection to include leading whitespace
   local line = vim.api.nvim_get_current_line()
-  local col = cursor_pos[2] + 1 -- Lua indices are 1-based, but Neovim columns are 0-based
+  local col = cursor_pos[2] -- Lua indices are 1-based, but Neovim columns are 0-based
   local next_non_ws = line:find("%S", col + 1)
   local cursor_col = next_non_ws and (next_non_ws - 1) or cursor_pos[2]
 
@@ -218,11 +233,11 @@ function get_closest_node(tree)
     end
   else
     local root = tree:root()
-    local desc_node = root:named_descendant_for_range(cursor_row, cursor_col, cursor_row, cursor_col)
-    if not desc_node then
+    local desc_node = root:descendant_for_range(cursor_row, cursor_col, cursor_row, cursor_col)
+    -- local desc_node = root:named_descendant_for_range(cursor_row, cursor_col, cursor_row, cursor_col)
+    -- if not desc_node then
       -- Fallback to any descendant (named or anonymous) if no specific named one is at the exact point/range
-      desc_node = root:descendant_for_range(cursor_row, cursor_col, cursor_row, cursor_col)
-    end
+    -- end
 
     if not desc_node then
       vim.notify(
@@ -274,25 +289,23 @@ local function get_tree(bufnr, lang)
   return tree
 end
 
--- Find the capture ID for "@_start" as defined in the user's query.
-local function get_capture_start_id(query)
-  local capture_start_id = -1
+local function get_capture_index(query, capture_name)
   for i, name in ipairs(query.captures) do
-    if name == "_start" then
-      capture_start_id = i
-      break
+    if name == capture_name then
+      return i
     end
   end
+end
 
-  if capture_start_id == -1 then
-    vim.notify(
-      "Error: The 'parent' query does not contain the '@_start' capture. " ..
-      "The query needs to identify the main node with '@_start'.",
-      vim.log.levels.ERROR)
-    return
+function matches(query, capture_name, node, bufnr)
+  local index = get_capture_index(query, capture_name)
+  for _, match in query:iter_matches(node, bufnr) do
+    local matched_group = match[index]
+    if matched_group and matched_group[1]:id() == node:id() then
+      return true
+    end
   end
-
-  return capture_start_id
+  return false
 end
 
 -- Lua function to select the nearest parent node based on a Tree-sitter query.
@@ -305,34 +318,32 @@ function select_parent()
   local bufnr = vim.api.nvim_get_current_buf()
   local ftype = vim.bo[bufnr].filetype
   local lang = require("nvim-treesitter.parsers").ft_to_lang(ftype)
-  -- local lang = vim.bo[bufnr].filetype
-  -- if type(lang) ~= "string" or lang == "" then
-    -- return
-  -- end
 
   local query = query_for(lang)
   local tree = get_tree(bufnr, lang)
   local node = get_closest_node(tree)
-  local capture_start_id = get_capture_start_id(query)
 
   while node do
-    for _, match in query:iter_matches(node, bufnr) do
-      local matched = match[capture_start_id][1]
-      if matched and matched:id() == node:id() then
-        if not selecting_related_nodes_enabled then
-          node = first_non_related_right_sibling(node)
-        end
-
-        -- For typescript, go up if we are in an export
-        local parent = node:parent()
-        if parent and parent:type() == "export_statement" then
-          node = node:parent() 
-        end
-
-        select_node(node)
-        return
-      end
+    local parent = node:parent(); 
+    if matches(query, "list_arg", node, bufnr) and matches(query, "list", parent, bufnr) then
+      select_node(node)
+      return
     end
+    
+    if matches(query, "parent", node, bufnr) then
+      if not selecting_related_nodes_enabled then
+        node = first_non_related_right_sibling(node)
+      end
+
+      -- For typescript, go up if we are in an export
+      if parent and parent:type() == "export_statement" then
+        node = node:parent() 
+      end
+
+      select_node(node)
+      return
+    end
+
     node = node:parent()
   end
 end
