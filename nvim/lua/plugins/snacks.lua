@@ -1,4 +1,4 @@
-local no_preview =  {
+local no_preview = {
   layout = {
     box = "vertical",
     backdrop = false,
@@ -25,7 +25,8 @@ return {
       -- Top Pickers & Explorer
       -- { "<leader><space>", function() Snacks.picker.smart() end, desc = "Smart Find Files" },
       {
-        "oh", function ()
+        "oh",
+        function()
           Snacks.picker.files({
             finder = "files",
             format = "file",
@@ -34,14 +35,14 @@ return {
             ignored = false,
             follow = false,
             supports_live = true,
-          }) 
+          })
         end,
-        desc = "Files" 
+        desc = "Files"
       },
       {
-        "ot", 
-        function ()
-          -- Can use -- at then end to pass flags, eg: 
+        "ot",
+        function()
+          -- Can use -- at then end to pass flags, eg:
           -- [token] -- -g=*.el    only el files
           -- [token] -- -ig=*.el   ignore case, only el
           -- [token] -- -ig=!*.el  ignore case, not el files
@@ -54,23 +55,24 @@ return {
             live = true,
             supports_live = true,
             -- layout = no_preview,
-          }) 
+          })
         end,
-        desc = "Grep" 
+        desc = "Grep"
       },
       {
-        "Sr", function ()
+        "Sr",
+        function()
           Snacks.picker.spelling({
             focus = "list",
             layout = no_preview,
-          }) 
+          })
         end,
-        desc = "Spelling" 
+        desc = "Spelling"
       },
-      -- Currently I prefer treesitter over this as we don't need to wait for the lsp 
+      -- Currently I prefer treesitter over this as we don't need to wait for the lsp
       -- to startup
       -- {
-      --   "oo", 
+      --   "oo",
       --   function ()
       --     Snacks.picker.lsp_symbols({
       --       tree = true,
@@ -91,7 +93,7 @@ return {
       --           "Struct",
       --           "Trait",
       --           "Variable",
-      --           -- "Type", 
+      --           -- "Type",
       --           -- "Object",
       --         },
       --         typescriptreact = {
@@ -109,7 +111,7 @@ return {
       --           "Struct",
       --           "Trait",
       --           "Variable",
-      --           -- "Type", 
+      --           -- "Type",
       --           -- "Object",
       --         },
       --         rust = {
@@ -159,12 +161,12 @@ return {
       --           "Trait",
       --         },
       --       }
-      --     }) 
+      --     })
       --   end,
-      --   desc = "Symbols" 
+      --   desc = "Symbols"
       -- },
       -- {
-      --   "oo", 
+      --   "oo",
       --   function ()
       --     Snacks.picker.treesitter({
       --       finder = "treesitter_symbols",
@@ -181,19 +183,20 @@ return {
       --           "Namespace",
       --           "Struct",
       --           "Trait",
-      --           "Constant", 
+      --           "Constant",
       --           "Variable"
       --         },
       --         -- set to `true` to include all symbols
       --         markdown = true,
       --         help = true,
       --       },
-      --     }) 
+      --     })
       --   end,
-      --   desc = "Symbols" 
+      --   desc = "Symbols"
       -- },
       {
-        "<leader>h",  function ()
+        "<leader>h",
+        function()
           Snacks.picker.explorer({
             finder = "explorer",
             sort = { fields = { "sort" } },
@@ -258,16 +261,16 @@ return {
             },
           })
         end,
-        desc = "Explorer" 
+        desc = "Explorer"
       },
-      { 
-        "os", 
+      {
+        "os",
         function()
           Snacks.picker.buffers({
             finder = "buffers",
             format = "buffer",
             hidden = false,
-            show_empty = true, 
+            show_empty = true,
             unloaded = true,
             current = false,
             sort_lastused = true,
@@ -285,16 +288,16 @@ return {
               },
             },
           })
-        end, 
-        desc = "Buffers" 
+        end,
+        desc = "Buffers"
       },
-      { 
-        "<C-h>", 
+      {
+        "<C-h>",
         function()
           Snacks.picker.lines({
             finder = "lines",
             format = "lines",
-            show_empty = true, 
+            show_empty = true,
             -- layout = no_preview,
             jump = { match = true },
             -- allow any window to be used as the main window
@@ -312,21 +315,21 @@ return {
               fuzzy = false
             }
           })
-        end, 
-        desc = "Search lines" 
+        end,
+        desc = "Search lines"
       }
     },
     ---@type snacks.Config
     opts = {
-      bigfile = { enabled = true },
+      bigfile = { enabled = false },
       dashboard = { enabled = false },
       explorer = { enabled = true },
       indent = {
         enabled = false,
-        only_scope = true ,
+        only_scope = true,
         only_current = true
       },
-      input = { 
+      input = {
         enabled = false
       },
       quickfile = { enabled = false },
@@ -343,7 +346,7 @@ return {
         enabled = false,
         timeout = 3000,
       },
-      picker = { 
+      picker = {
         formatters = {
           file = {
             truncate = 70
@@ -383,8 +386,8 @@ return {
               ["<c-j>"] = { "list_down", mode = { "i", "n" } },
               ["s"] = { "list_up", mode = { "n" } },
               ["t"] = { "list_down", mode = { "n" } },
-              ["e"] = {"list_scroll_up", mode = { "n" }},
-              ["a"] = {"list_scroll_down", mode = { "n" }},
+              ["e"] = { "list_scroll_up", mode = { "n" } },
+              ["a"] = { "list_scroll_down", mode = { "n" } },
               ["<c-q>"] = { "qflist", mode = { "i", "n" } },
               ["<c-s>"] = { "edit_split", mode = { "i", "n" } },
               ["<c-t>"] = { "tab", mode = { "n", "i" } },
@@ -433,8 +436,8 @@ return {
               ["<a-w>"] = "cycle_win",
               ["<c-a>"] = "select_all",
               ["<c-b>"] = "preview_scroll_up",
-              ["e"] = {"list_scroll_up", mode = { "n" }},
-              ["a"] = {"list_scroll_down", mode = { "n" }},
+              ["e"] = { "list_scroll_up", mode = { "n" } },
+              ["a"] = { "list_scroll_down", mode = { "n" } },
               ["<c-f>"] = "preview_scroll_down",
               ["<c-j>"] = "list_down",
               ["<c-k>"] = "list_up",
@@ -475,7 +478,7 @@ return {
           },
         },
         -- https://github.com/folke/snacks.nvim/blob/main/docs/picker.md
-        enabled = true, 
+        enabled = true,
         -- layout = {
         --   layout = {
         --     box = "vertical",
@@ -509,7 +512,7 @@ return {
             { win = "input", height = 1, border = "bottom" },
             {
               box = "horizontal",
-              { win = "list", border = "none" },
+              { win = "list",    border = "none" },
               { win = "preview", title = "{preview}", width = 0.6, border = "left" },
             },
           },
