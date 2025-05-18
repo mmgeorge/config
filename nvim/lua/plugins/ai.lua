@@ -58,12 +58,12 @@ return {
         ":CodeCompanion",
         desc = "Codecompanion Inline",
       },
-      {
-        "<leader>cm",
-        mode = { "n" },
-        ":CodeCompanion /commit<cr>",
-        desc = "Codecompanion Commit",
-      },
+      -- {
+      --   "<leader>cm",
+      --   mode = { "n" },
+      --   ":CodeCompanion /commit<cr>",
+      --   desc = "Codecompanion Commit",
+      -- },
       {
         "<leader>co",
         mode = { "n" },
