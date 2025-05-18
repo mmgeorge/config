@@ -5,6 +5,24 @@ local postfix = utils.postfix
 
 local global_snippets = {}
 local snippets_by_filetype = {
+  typescript = {
+    postfix({ 
+      trigger = 'pr', 
+      node = type_node, 
+      body = function (text)
+        return "Promise<" .. text .. ">" 
+      end 
+    }),
+  },
+  typescriptreact = {
+    postfix({ 
+      trigger = 'pr', 
+      node = type_node, 
+      body = function (text)
+        return "Promise<" .. text .. ">" 
+      end 
+    }),
+  },
   rust = {
     postfix({ 
       trigger = 'rcl', 
