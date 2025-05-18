@@ -2,13 +2,21 @@ return {
   {
     'stevearc/conform.nvim',
     opts = {
-      format_after_save = {
-        lsp_format = "fallback",
-      },
-      -- tsx = { "trim_whitespace" },
+      -- format_after_save = {
+      --   lsp_format = "fallback",
+      -- },
+      format_after_save = function(bufnr)
+        local ftype = vim.bo[bufnr].filetype
+        if ftype == "typescriptreact" or ftype == "typescript" then
+          vim.cmd(":LspEslintFixAll")
+          return
+        end
+
+        return { lsp_format = "fallback" }
+      end,
       -- tsx = { "trim_whitespace" },
       formatters_by_ft  = {
-        ["*"] = { lsp_format,  "trim_whitespace"  },
+        ["*"] = { lsp_format, "trim_whitespace" },
       }
       -- format_on_save = {
       --   -- These options will be passed to conform.format()
