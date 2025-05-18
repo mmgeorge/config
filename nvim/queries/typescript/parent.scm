@@ -8,24 +8,19 @@
    (switch_case)
    (switch_default)
    (array)
-
-   ; (lexical_declaration
-   ;   (variable_declarator
-   ;     value: (arrow_function)))
+   (for_statement)
    (function_declaration)
    (class_declaration)
    (method_definition)
-   ; typescript
    (type_alias_declaration)
    (interface_declaration)
    ] @parent))
    
 (else_clause) @jump  
 (export_statement) @jump 
-
-(identifier) @list_arg 
-(required_parameter) @list_arg 
-(optional_parameter) @list_arg 
+; (identifier) @list_arg 
+; (required_parameter) @list_arg 
+; (optional_parameter) @list_arg 
 
 (array) @list 
 (formal_parameters) @list 
