@@ -1,38 +1,46 @@
 function detect_adapter()
-  -- if os.getenv("OPENAI_API_KEY") then 
+  -- if os.getenv("OPENAI_API_KEY") then
   --   return {
-  --     chat = "openai", 
-  --     inline = "openai", 
+  --     chat = "openai",
+  --     inline = "openai",
   --
   --     commit = {
-  --       name = "openai", 
+  --       name = "openai",
   --       model = "gpt-4.1-mini"
   --       -- model = "gpt-4o-mini"
-  --     } 
-  --   } 
+  --     }
+  --   }
   -- end
-    
-  if os.getenv("GEMINI_API_KEY") then 
+
+  if os.getenv("GEMINI_API_KEY") then
     return {
-      chat = "gemini", 
-      inline = "gemini", 
-      cmd = "gemini", 
+      chat = "gemini",
+      inline = "gemini",
+      cmd = "gemini",
       commit = {
-        name = "gemini", 
+        name = "gemini",
         model = "gemini-2.0-flash"
-      } 
-    } 
+      }
+    }
   end
-  
+
   return {
-    chat = "copilot", 
-    inline = "copilot", 
-    cmd = "copilot", 
-    commit = nil 
+    chat = "copilot",
+    inline = "copilot",
+    cmd = "copilot",
+    commit = nil
   }
 end
 
 local adapter = detect_adapter()
+
+
+vim.api.nvim_create_autocmd("FileType", {
+  pattern = "gitcommit",
+  callback = function()
+    vim.cmd(":CodeCompanion /commit")
+  end,
+})
 
 return {
   {
@@ -41,6 +49,7 @@ return {
       "nvim-lua/plenary.nvim",
       "nvim-treesitter/nvim-treesitter",
       { "echasnovski/mini.diff", opts = {} },
+      "j-hui/fidget.nvim",
     },
     keys = {
       {
@@ -57,7 +66,7 @@ return {
       },
       {
         "<leader>co",
-        mode = { "n"},
+        mode = { "n" },
         ":CodeCompanionChat<cr>",
         desc = "Codecompanion Open",
       },
@@ -69,6 +78,9 @@ return {
       }
 
     },
+    init = function()
+      require("codecompanion_fidget"):init()
+    end,
     opts = {
       opts = {
         -- log_level = "TRACE",
@@ -79,7 +91,7 @@ return {
             schema = {
               env = {
                 api_key = "GEMINI_API_KEY"
-              } ,
+              },
               model = {
                 default = "gemini-2.0-flash",
               },
@@ -91,9 +103,9 @@ return {
             schema = {
               env = {
                 api_key = "OPENAI_API_KEY"
-              } ,
+              },
               model = {
-                default = "gpt-4.1", 
+                default = "gpt-4.1",
               },
             },
           })
@@ -291,14 +303,14 @@ return {
           intro_message = "Welcome to CodeCompanion ?! Press ? for options",
           show_header_separator = true, -- Show header separators in the chat buffer? Set this to false if you're using an external markdown formatting plugin
           -- separator = "Ä", -- The separator between the different messages in the chat buffer
-          show_references = true, -- Show references (from slash commands and variables) in the chat buffer?
-          show_settings = false, -- Show LLM settings at the top of the chat buffer?
-          show_token_count = true, -- Show the token count for each response?
-          start_in_insert_mode = true, -- Open the chat buffer in insert mode?
+          show_references = true,       -- Show references (from slash commands and variables) in the chat buffer?
+          show_settings = false,        -- Show LLM settings at the top of the chat buffer?
+          show_token_count = true,      -- Show the token count for each response?
+          start_in_insert_mode = true,  -- Open the chat buffer in insert mode?
           -- Options to customize the UI of the chat buffer
           window = {
             layout = "horizontal", -- float|vertical|horizontal|buffer
-            position = "bottom", -- left|right|top|bottom (nil will default depending on vim.opt.plitright|vim.opt.splitbelow)
+            position = "bottom",   -- left|right|top|bottom (nil will default depending on vim.opt.plitright|vim.opt.splitbelow)
             border = "single",
             height = 0.5,
             width = 0.5,
@@ -320,9 +332,9 @@ return {
         },
         diff = {
           enabled = true,
-          close_chat_at = 240, -- Close an open chat buffer if the total columns of your display are less than...
+          close_chat_at = 240,    -- Close an open chat buffer if the total columns of your display are less than...
           -- with mini diff this is inline instead
-          layout = "vertical", -- vertical|horizontal split for default provider
+          layout = "vertical",    -- vertical|horizontal split for default provider
           opts = { "internal", "filler", "closeoff", "algorithm:patience", "followwrap", "linematch:120" },
           provider = "mini_diff", -- default|mini_diff
         }
@@ -345,20 +357,20 @@ return {
               content = function(context)
                 local code = require("codecompanion.helpers.actions").get_code(context.start_line, context.end_line)
                 local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
-                local buffer_text = table.concat(lines, '\n') 
-                
+                local buffer_text = table.concat(lines, '\n')
+
                 return string.format(
-                  [[Document the below code. Use the following steps: 
-1. Identify the programming language 
-2. Lookup the best style practices for adding documentation in that language. For instance, when documenting javascript or typescript, use jsdoc style. 
-3. Identify every function, method, or class in the passed code. These are the things that you will add documentation to. 
-4. If the function already has documentation, try to incorporate that into the new documentation. It is OK to remove some of it, but the content should still be there. 
+                  [[Document the below code. Use the following steps:
+1. Identify the programming language
+2. Lookup the best style practices for adding documentation in that language. For instance, when documenting javascript or typescript, use jsdoc style.
+3. Identify every function, method, or class in the passed code. These are the things that you will add documentation to.
+4. If the function already has documentation, try to incorporate that into the new documentation. It is OK to remove some of it, but the content should still be there.
 5. Be as succinct as possible in the documentation that you generate (2 sentences).
 6. Do NOT document specific function parameters or the return value.
 
 Each line of the generated documentation should not be longer than 80 characters.
 
-For additional context, the entire file is: 
+For additional context, the entire file is:
 ```%s
 %s
 ```
@@ -405,28 +417,28 @@ This is the code to document:
 ]],
                   vim.fn.system("git diff --no-ext-diff --staged")
                 )
---                 return string.format(
---                   [[Given the diff listed below, please generate a short commit message that is only a single line. Pay attention to the gutter in the commit message that indicates what was changed. Only those lines that were changed and have a + or a - in the gutter should be considered for the commit message. The commit message should not be more than 50 characters. 
---
--- The format of the message should be <type>: <description>
--- - valid options for <type> are: fix, feat, build, chore, ci, docs, style, refactor, perf, test, lint, cleanup
--- - <description> should be a very short summary of the changes. 
---
--- Some examples commit messages might be: 
--- - feat: send an email to the customer when a product is shipped 
--- - chore: drop support for Node 6
--- - docs: correct spelling of CHANGELOG 
--- - docs: add doc for the Foo component
---
--- Prefer using abbreviations like "doc" instead of "documentation" when possible to reduce the length of the commit message
---
--- The first letter of <description> should be lowercase.
---
--- The diff is below:
--- ```diff
--- %s
--- ```
--- ]], result)
+                --                 return string.format(
+                --                   [[Given the diff listed below, please generate a short commit message that is only a single line. Pay attention to the gutter in the commit message that indicates what was changed. Only those lines that were changed and have a + or a - in the gutter should be considered for the commit message. The commit message should not be more than 50 characters.
+                --
+                -- The format of the message should be <type>: <description>
+                -- - valid options for <type> are: fix, feat, build, chore, ci, docs, style, refactor, perf, test, lint, cleanup
+                -- - <description> should be a very short summary of the changes.
+                --
+                -- Some examples commit messages might be:
+                -- - feat: send an email to the customer when a product is shipped
+                -- - chore: drop support for Node 6
+                -- - docs: correct spelling of CHANGELOG
+                -- - docs: add doc for the Foo component
+                --
+                -- Prefer using abbreviations like "doc" instead of "documentation" when possible to reduce the length of the commit message
+                --
+                -- The first letter of <description> should be lowercase.
+                --
+                -- The diff is below:
+                -- ```diff
+                -- %s
+                -- ```
+                -- ]], result)
               end,
               opts = {
                 contains_code = true,
@@ -452,21 +464,21 @@ This is the code to document:
   --   config = function ()
   --     require("avante.providers.vertex").parse_api_key = function ()
   --       -- gcloud auth application-default print-access-token
-  --       -- setx VERTEX_TOKEN [token] 
+  --       -- setx VERTEX_TOKEN [token]
   --       return vim.fn.getenv("VERTEX_TOKEN")
   --     end
   --     require"avante".setup({
   --       vertex = {
-  --         model = "gemini-2.0-flash-001", 
+  --         model = "gemini-2.0-flash-001",
   --         max_tokens = 1024,
-  --         -- location = "us-central1" 
+  --         -- location = "us-central1"
   --       },
   --       -- add any opts here
   --       -- for example
   --       provider = "vertex",
-  --       cursor_applying_provider = "vertex", 
+  --       cursor_applying_provider = "vertex",
   --       -- provider = "copilot",
-  --       -- cursor_applying_provider = "copilot", 
+  --       -- cursor_applying_provider = "copilot",
   --       ---Specify the special dual_boost mode
   --       ---1. enabled: Whether to enable dual_boost mode. Default to false.
   --       ---2. first_provider: The first provider to generate response. Default to "openai".
