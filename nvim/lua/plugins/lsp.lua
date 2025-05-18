@@ -14,22 +14,22 @@ return {
       require("mason-lspconfig").setup({
         automatic_installation = true,
         ensure_installed = {
+          "jsonls",
           "lua_ls",
           "eslint",
           -- "oxlint",
           "vtsls",
           "terraformls",
-          -- "ts_ls",
-          -- "rust_analyzer",
-          -- "tailwind-language-server",
-          -- "tailwindcss",
+          "cssls",
+          "html",
+          "tailwindcss",
         }
 
       })
     end
   },
 
-  -- Install mason tools automatically -- 
+  -- Install mason tools automatically --
   {
     "WhoIsSethDaniel/mason-tool-installer.nvim",
     config = function()
@@ -38,7 +38,7 @@ return {
         ensure_installed = { "prettierd" },
         auto_update = true,
         run_on_start = true,
-        debounce_hours = 5, 
+        debounce_hours = 5,
       })
     end
   },
@@ -65,23 +65,34 @@ return {
       vim.lsp.config('terraformls', {
         capabilities = capabilities,
       })
-      
+
       vim.lsp.config('lua_ls', {
         capabilities = capabilities,
       })
 
-      
+      vim.lsp.config('jsonls', {
+        capabilities = capabilities,
+      })
+
+      vim.lsp.enable('jsonls')
+
+      vim.lsp.config('html', {
+        capabilities = capabilities,
+      })
+
+      vim.lsp.enable('html')
+
       vim.lsp.config('rust_analyzer', {
         -- We install this from rustup rather than Mason
         cmd = { "rust-analyzer" },
         -- This slows down saving quite a bit
-        on_attach = function(client, bufnr)
-          vim.api.nvim_create_autocmd("BufWritePre", {
-            buffer = bufnr,
-            callback = function() vim.lsp.buf.format() end,
-            group = format_sync_grp,
-          }) 
-        end,
+        -- on_attach = function(client, bufnr)
+        --   vim.api.nvim_create_autocmd("BufWritePre", {
+        --     buffer = bufnr,
+        --     callback = function() vim.lsp.buf.format() end,
+        --     group = format_sync_grp,
+        --   })
+        -- end,
         capabilities = capabilities,
         settings = {
           ["rust-analyzer"] = {
@@ -90,8 +101,8 @@ return {
               allTargets = false,
               -- features = {},
               -- buildScripts = {
-                -- enable = false,
-                -- rebuildOnSave = false
+              -- enable = false,
+              -- rebuildOnSave = false
               -- }
             },
             check = {
@@ -103,7 +114,7 @@ return {
               -- numThreads = 8
             },
             procMacro = {
-              enable = true, 
+              enable = true,
               ignore = {}
             }
 
@@ -112,8 +123,8 @@ return {
       })
 
       vim.lsp.enable("rust_analyzer", true)
-      
-      require("lspconfig.configs").vtsls = require("vtsls").lspconfig 
+
+      require("lspconfig.configs").vtsls = require("vtsls").lspconfig
       vim.lsp.config('vtsls', {
         capabilities = capabilities,
         -- on_attach = function (client, buf)
@@ -124,22 +135,22 @@ return {
           vtsls = {
             experimental = {
               completion = {
-                enableServerSideFuzzyMatch = true, 
+                enableServerSideFuzzyMatch = true,
                 entriesLimit = 15
               }
             }
           },
           typescript = {
             suggest = {
-              -- This can slow things down 
+              -- This can slow things down
               autoImports = true
             },
             tsserver = {
               -- enableTracing = true,
               -- log = "verbose",
-              useSyntaxServer = "never",   
+              useSyntaxServer = "never",
               -- To use a memory limit greater than 4 GB, use `#typescript.tsserver.nodePath#
-              maxTsServerMemory = 3072 ,   
+              maxTsServerMemory = 3072,
               experimental = {
                 enableProjectDiagnostics = false
               }
@@ -157,17 +168,17 @@ return {
           }
         }
       })
-      
+
       vim.lsp.config('tailwindcss', {
         capabilities = capabilities,
       })
-      
+
       vim.lsp.config('cssls', {
         capabilities = capabilities,
       })
-      
+
       -- vim.lsp.config('oxlint', {
-        -- capabilities = capabilities,
+      -- capabilities = capabilities,
       -- })
 
       local configs = require "lspconfig.configs"
@@ -182,21 +193,21 @@ return {
             single_file_support = true,
           },
         }
-      
+
         vim.lsp.config('slangd', {
           capabilities = capabilities,
         })
       end
 
       require("lspconfig").eslint.setup({
-      -- vim.lsp.config('eslint', {
+        -- vim.lsp.config('eslint', {
         capabilities = capabilities,
-        on_attach = function(client, bufnr)
-          vim.api.nvim_create_autocmd("BufWritePre", {
-            buffer = bufnr,
-            command = "EslintFixAll",
-          })
-        end,
+        -- on_attach = function(client, bufnr)
+        --   vim.api.nvim_create_autocmd("BufWritePre", {
+        --     buffer = bufnr,
+        --     command = "EslintFixAll",
+        --   })
+        -- end,
         -- cmd = { "npx", "eslint", "--stdio" },
         settings = {
           codeAction = {
@@ -225,11 +236,11 @@ return {
           rulesCustomizations = {
             {
               rule = 'prettier/prettier',
-              severity = 'off', 
+              severity = 'off',
             },
             {
               rule = '@typescript-eslint/no-unused-vars',
-              severity = 'warn', 
+              severity = 'warn',
             }
           },
           run = "onType",
@@ -245,8 +256,8 @@ return {
   },
   {
     "smjonas/inc-rename.nvim",
-    config = function ()
-      require("inc_rename").setup ({
+    config = function()
+      require("inc_rename").setup({
         -- the name of the command
         cmd_name = "IncRename",
         -- the highlight group used for highlighting the identifier's new name

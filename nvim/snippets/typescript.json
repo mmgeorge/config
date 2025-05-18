@@ -1,0 +1,32 @@
+{
+  "class": {
+    "prefix": "class",
+    "body": [
+      "class $1 {",
+        "  ${2}",
+        "}"
+    ]
+  }, 
+  "interface": {
+    "prefix": "interface",
+    "body": [
+      "interface $1 {",
+        "  ${2}",
+        "}"
+    ]
+  }, 
+  "type": {
+    "prefix": "type",
+    "body": [
+      "type ${1} = ${2};"
+    ]
+  },
+  "constructor": {
+    "prefix": "constructor",
+    "body": [
+      "constructor(${1}) {${2}}"
+    ]
+  }
+}
+
+

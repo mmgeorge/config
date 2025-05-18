@@ -333,6 +333,10 @@ M.type_node = function()
 
   local function is_type(ty)
     if 
+      -- ts
+      ty == "type_identifier" or
+      ty == "predefined_type" or
+      -- rust
       ty == "primitive_type" or 
       ty == "scoped_type_identifier" or 
       ty == "generic_type" or 

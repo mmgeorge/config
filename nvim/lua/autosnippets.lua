@@ -4,20 +4,6 @@
           body = "<- "
         },
         {
-          trigger = "ifc ", 
-          body = [[interface $1 { 
-  $2 
-}]], 
-          files = { "typescript", "typescriptreact" }
-        },
-        {
-          trigger = "eifc ", 
-          body = [[export interface $1 { 
-  $2 
-}]], 
-          files = { "typescript", "typescriptreact" }
-        },
-        {
           trigger = "efn ", 
           body = [[export function $1($2): $3 { 
   $4 
@@ -30,13 +16,6 @@
   $4 
 }]], 
           files = { "typescript", "typescriptreact" }
-        },
-        {
-          trigger = "ecfn ", 
-          body = [[export const $1 = (props: { $2 }) => { 
-  $4 
-}]], 
-          files = { "typescriptreact" }
         },
         {
           trigger = "cfn ", 

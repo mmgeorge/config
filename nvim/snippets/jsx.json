@@ -1,0 +1,14 @@
+{
+  "createResource": {
+    "prefix": "createResource",
+    "body": [
+      "const [get${1}] = createResource(() => ${2})"
+    ]
+  }, 
+  "createSignal": {
+    "prefix": "createSignal",
+    "body": [
+      "const [get${1}, set${1}] = createSignal(() => ${2})"
+    ]
+  }
+}

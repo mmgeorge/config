@@ -1,9 +1,14 @@
+
+local priorities = { 
+  snippets = 4, 
+}
+
 return {
   {
     'saghen/blink.cmp',
     -- optional: provides snippets for the snippet source
     dependencies = {
-      'rafamadriz/friendly-snippets',
+      -- 'rafamadriz/friendly-snippets',
       'ribru17/blink-cmp-spell'
     },
 
@@ -24,6 +29,20 @@ return {
     ---@module 'blink.cmp'
     ---@type blink.cmp.Config
     opts = {
+      fuzzy = {
+        implementation = "prefer_rust_with_warning",
+        sorts = {
+          -- function(a, b)
+          --   local a_priority = priorities[a.source_id] or 0
+          --   local b_priority = priorities[b.source_id] or 0
+          --   if a_priority ~= b_priority then return a_priority > b_priority end
+          -- end,
+          -- 'exact',
+          'score',
+          'sort_text',
+          -- 'label'
+        } 
+      },
       keymap = { 
         ['<C-space>'] = { 'show', 'show_documentation', 'hide_documentation' },
         ['<C-e>'] = { 'hide', 'fallback' },
@@ -104,9 +123,50 @@ return {
       -- Default list of enabled providers defined so that you can extend it
       -- elsewhere in your config, without redefining it, due to `opts_extend`
       sources = {
-        default = { 'lsp', 'path', 'custom_snippets', 'spell' },
+        default = { 'snippets', 'lsp', 'path', 'custom_snippets', 'spell' },
+
         -- min_keyword_length = 3, 
         providers = {
+          snippets = {
+            score_offset = 2
+          },
+          lsp = {
+            transform_items = function (ctx, items)
+              local function should_filter(label)
+                -- if ctx.bounds.length < 4 and #label >= 8 then
+                --   return true
+                -- end
+
+                if ctx.bounds.length < 6 and #label >= 16 then
+                  return true
+                end
+              
+                return string.sub(label, 1, 2) == "__"
+              end
+
+              local out = {}
+              for _, item in ipairs(items) do
+                if not should_filter(item.label) then
+                  table.insert(out, item) 
+                end
+              end
+
+              -- print(vim.inspect(ctx))
+              -- local out = {}
+              -- local ftype = vim.bo.filetype
+              -- if ftype == "typescriptreact" or ftype =="typescript" then
+              --   for _, item in ipairs(items) do
+              --    if item.label ~= "class" then
+              --      table.insert(out, item)
+              --    end
+              --   end
+              -- else
+              --   out = items
+              -- end
+
+              return out
+            end
+          },
           custom_snippets = {
             name = "custom_snippets", 
             module = "snippet_source", 
@@ -141,12 +201,6 @@ return {
         }
       },
 
-      -- (Default) Rust fuzzy matcher for typo resistance and significantly better performance
-      -- You may use a lua implementation instead by using `implementation = "lua"` or fallback to the lua implementation,
-      -- when the Rust fuzzy matcher is not available, by using `implementation = "prefer_rust"`
-      --
-      -- See the fuzzy documentation for more information
-      fuzzy = { implementation = "prefer_rust_with_warning" }
     },
     opts_extend = { "sources.default" }
   }

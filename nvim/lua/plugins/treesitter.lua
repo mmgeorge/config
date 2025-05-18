@@ -25,6 +25,7 @@ return {
           "lua",
           "vim",
           "vimdoc",
+          "json",
           "query",
           "javascript",
           "css",
@@ -33,7 +34,8 @@ return {
           "glsl",
           "c_sharp",
           "toml",
-          "slang"
+          "slang",
+          "yaml"
         },
         sync_install = false,
         highlight = {
@@ -44,12 +46,9 @@ return {
         },
         indent = {
           -- This does not work well
-          enable = false,
+          enable = true,
           -- vim-jsx-pretty provides better indent. See typescript config
           -- disable = { "tsx" }
-        },
-        autotag = {
-          enable = true
         }
       })
 
@@ -78,7 +77,7 @@ return {
               ['f'] = '@xfunction.outer',
               ['ot'] = '@jsx_element.outer',
               ['ut'] = '@jsx_element.inner',
-              ['uy'] = '@parameter.inner',
+              -- ['uy'] = '@parameter.inner',
               ['oy'] = '@parameter.outer',
               -- ['ub'] = '@block.inner',
               -- ['o'] = '@xparent.outer',
@@ -110,43 +109,15 @@ return {
       })
     end
   },
+  {
+    "windwp/nvim-ts-autotag",
+    opts = {}
+  },
   -- {
-  --   "RRethy/nvim-treesitter-textsubjects",
-  --   dependencies = {
-  --     'nvim-treesitter/nvim-treesitter'
-  --   },
-  --   config = function()
-  --     require('nvim-treesitter-textsubjects').configure({
-  --       prev_selection = nil,
-  --       keymaps = {
-  --         -- ['<C-l>'] = 'textsubjects-smart',
-  --         ['<C-l>'] = 'textsubjects-container-outer',
-  --         -- ['i;'] = 'textsubjects-container-inner',
-  --       },
-  --     })
-  --   end
-  -- }
-  -- {
-  --   'mawkler/jsx-element.nvim',
-  --   dependencies = {
-  --     'nvim-treesitter/nvim-treesitter',
-  --     'nvim-treesitter/nvim-treesitter-textobjects',
-  --   },
-  --   keys = {
-  --     {
-  --       "pot",
-  --       function ()
-  --         require('treesj').toggle()
-  --       end,
-  --       mode = { "n" },
-  --       desc = "Oil file browser",
-  --     }
-  --   },
-  --   ft = { 'typescriptreact', 'javascriptreact', 'javascript' },
+  --   -- Provides much better indenting than treesitter
+  --   "https://github.com/MaxMEllon/vim-jsx-pretty",
   --   config = function ()
-  --     require"jsx-element".setup({
-  --       keymaps = false
-  --     })
+  --     require("vim-jsx-pretty").setup({})
   --   end
   -- }
 }
