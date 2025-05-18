@@ -15,7 +15,8 @@
    (type_alias_declaration)
    (interface_declaration)
    ] @parent))
-
+   
+(export_statement) @export 
 
 (identifier) @list_arg 
 (required_parameter) @list_arg 
