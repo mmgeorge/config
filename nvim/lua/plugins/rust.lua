@@ -1,24 +1,42 @@
 return {
-{
+  {
+    'saecki/crates.nvim',
+    event = { "BufRead Cargo.toml" },
+    config = function()
+      require('crates').setup({
+        lsp = {
+          enabled = true,
+          -- on_attach = function(client, bufnr)
+          --   -- the same on_attach function as for your other language servers
+          --   -- can be ommited if you're using the `LspAttach` autocmd
+          -- end,
+          actions = true,
+          completion = true,
+          hover = true,
+        },
+      })
+    end,
+  },
+  {
     'vxpm/ferris.nvim',
     opts = {
-        -- your options here
+      -- your options here
     }
-}
+  }
   -- {
   --   'mrcjkb/rustaceanvim',
   --   version = '^6', -- Recommended
   --   lazy = false, -- This plugin is already lazy
   --   config = function ()
   --     -- local cfg = require('rustaceanvim.config')
-  --     -- local codelldb_path = vim.fn.stdpath("data") .. "\\mason\\packages\\codelldb\\extension\\adapter\\codelldb" 
+  --     -- local codelldb_path = vim.fn.stdpath("data") .. "\\mason\\packages\\codelldb\\extension\\adapter\\codelldb"
   --     --
   --     -- vim.notify(vim.inspect(codelldb_path))
   --
   --     vim.g.rustaceanvim = {
   --       -- Plugin configuration
   --       tools = {
-  --         enable_clippy = false, 
+  --         enable_clippy = false,
   --         test_executor = "background"
   --       },
   --       -- LSP configuration
@@ -30,7 +48,7 @@ return {
   --           --   buffer = bufnr,
   --           --   callback = function() vim.lsp.buf.format() end,
   --           --   group = format_sync_grp,
-  --           -- }) 
+  --           -- })
   --           -- you can also put keymaps in here
   --         end,
   --         default_settings = {
@@ -55,7 +73,7 @@ return {
   --             cachePriming = {
   --               enable = false
   --             }
-  --             -- Doesn't work... not supported in nvim? 
+  --             -- Doesn't work... not supported in nvim?
   --             -- completion = {
   --             --   snippets = {
   --             --     custom = {
@@ -80,6 +98,6 @@ return {
   --         -- adapter = cfg.get_codelldb_adapter(codelldb_path, codelldb_path),
   --       },
   --     }
-  --   end 
+  --   end
   -- }
 }

@@ -23,6 +23,7 @@ return {
           "cssls",
           "html",
           "tailwindcss",
+          "taplo"
         }
 
       })
@@ -81,6 +82,12 @@ return {
       })
 
       vim.lsp.enable('html')
+
+      vim.lsp.config('taplo', {
+        capabilities = capabilities,
+      })
+
+      vim.lsp.enable('taplo')
 
       vim.lsp.config('rust_analyzer', {
         -- We install this from rustup rather than Mason
