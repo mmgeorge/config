@@ -1,6 +1,7 @@
 (([
    (comment)
    (export_statement)
+   (return_statement)
    (lexical_declaration)
    (if_statement)
    (else_clause)
@@ -25,7 +26,9 @@
 
    (array)
    (object)
-  
+   (type_parameters) 
+   (array_pattern)
+   
    ;; change padding capture for theses:
    (array_pattern)
    (generic_type)
@@ -34,6 +37,7 @@
    (identifier)
    (array_type)
    (type_identifier)
+   (predefined_type)
    ] @parent))
 
 (else_clause) @jump  
@@ -42,8 +46,9 @@
 ; (required_parameter) @list_arg 
 ; (optional_parameter) @list_arg 
 
+(array_pattern) @list
 (for_statement) @list 
 (type_arguments) @list 
 (array) @list 
 (formal_parameters) @list 
-
+(type_parameters) @list
