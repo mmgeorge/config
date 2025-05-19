@@ -3,6 +3,7 @@
   (field)
   (for_statement)
   (if_statement)
+  (while_statement)
   (else_statement)
   ; (expression_list)
   (variable_declaration)
