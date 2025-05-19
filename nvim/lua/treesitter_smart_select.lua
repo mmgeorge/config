@@ -172,8 +172,8 @@ local function select_node(node, is_list_arg)
   if is_list_arg then
     if not node:next_named_sibling() then
       match = "[%s,]"
-    else
-      match = nil
+      -- else
+      -- match = nil
     end
   end
 
