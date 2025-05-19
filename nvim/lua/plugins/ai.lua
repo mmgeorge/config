@@ -94,6 +94,11 @@ return {
               },
               model = {
                 default = "gemini-2.0-flash",
+                choices = {
+                  ["gemini-2.5-flash-preview-04-17"] = { opts = { can_reason = true } },
+                  "gemini-2.5-pro-preview-03-25",
+                  "gemini-2.0-flash",
+                }
               },
             },
           })
