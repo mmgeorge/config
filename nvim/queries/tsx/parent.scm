@@ -23,8 +23,21 @@
    (template_string)
    (string)
    (string_fragment)
-   ] @parent))
+   (call_expression)
    
+   (array)
+   (object)
+
+   ;; change padding capture for theses:
+   (array_pattern)
+   (generic_type)
+   (union_type)
+   (object_type)
+   (identifier)
+   (array_type)
+   (type_identifier)
+   ] @parent))
+
 (else_clause) @jump  
 (export_statement) @jump 
 ; (identifier) @list_arg 
