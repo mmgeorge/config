@@ -9,6 +9,7 @@
    (enum_variant)
    (expression_statement)
    (match_arm)
+   (match_pattern)
    (generic_function)
    (macro_definition)
    (function_item)
@@ -19,7 +20,9 @@
 
    (let_declaration)
    (call_expression)
+   (macro_invocation)
 
+   (scoped_identifier)
    (reference_type)
    (reference_expression)
    (lifetime)
@@ -29,6 +32,10 @@
    ; (type_identifier)
    (string_literal)
    (string_content)
+
+   ; Select inner -- all list types?
+   (array_expression)
+
    ] @parent))
 
 (field_initializer_list) @list
@@ -37,3 +44,4 @@
 (type_parameters) @list
 (arguments) @list
 (parameters) @list
+(array_expression) @list
