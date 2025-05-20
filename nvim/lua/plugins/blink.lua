@@ -137,7 +137,7 @@ return {
                 --   return true
                 -- end
 
-                if ctx.bounds.length < 6 and #label >= 16 then
+                if ctx.bounds.length < 5 and #label >= 18 then
                   return true
                 end
 
@@ -146,7 +146,7 @@ return {
 
               local out = {}
               for _, item in ipairs(items) do
-                if not should_filter(item.label) then
+                if not should_filter(item.sortText) then
                   table.insert(out, item)
                 end
               end
