@@ -1,16 +1,19 @@
 function detect_adapter()
-  -- if os.getenv("OPENAI_API_KEY") then
-  --   return {
-  --     chat = "openai",
-  --     inline = "openai",
-  --
-  --     commit = {
-  --       name = "openai",
-  --       model = "gpt-4.1-mini"
-  --       -- model = "gpt-4o-mini"
-  --     }
-  --   }
-  -- end
+  if os.getenv("OPENAI_API_KEY") then
+    return {
+      chat = "openai",
+      inline = "openai",
+      commit = {
+        name = "gemini",
+        model = "gemini-2.0-flash"
+      }
+      -- commit = {
+      --   name = "openai",
+      --   model = "gpt-4.1-mini"
+      --   -- model = "gpt-4o-mini"
+      -- }
+    }
+  end
 
   if os.getenv("GEMINI_API_KEY") then
     return {
