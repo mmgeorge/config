@@ -191,7 +191,7 @@ return {
             },
             yank_code = {
               modes = {
-                n = "gy",
+                n = "gl",
               },
               index = 8,
               callback = "keymaps.yank_code",
