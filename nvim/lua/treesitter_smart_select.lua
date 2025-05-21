@@ -1,12 +1,8 @@
 local cursor_stack = {}
 local selected_nodes = {}
 
--- Allows selecting lines and decorators. Otherwise, selection will automatically move
--- to the core node type (e.g., move to function, etc.)
-local selecting_related_nodes_enabled = true
-
 local decorator_types = {
-  --rust
+  -- rust
   "attribute_item",
 }
 
@@ -37,10 +33,10 @@ local function joinable(a, b)
   local a_start_row, _, a_end_row, _ = a:range()
   local b_start_row, _, b_end_row, _ = b:range()
 
-  if a_start_row < b_start_row then
+  if a_end_row < b_start_row then
     return b_start_row - a_end_row <= 1
   else
-    return a_end_row - b_start_row <= 1
+    return a_start_row - b_end_row <= 1
   end
 end
 
@@ -96,7 +92,7 @@ local function search_line_before(line, i, match)
 end
 
 local function search_line_after(line, i, match)
-  while i <= #line and line:sub(i, i):match('^%s*$') do
+  while i + 1 <= #line and line:sub(i + 1, i + 1):match(match) do
     i = i + 1
   end
 
@@ -178,19 +174,16 @@ local function get_selection_start(lines, node, is_list_arg)
   return start_row, start_col
 end
 
-local function get_selection_end(lines, node, at_start)
+local function get_selection_end(lines, node, at_start, is_list_arg)
   local _, _, end_row, end_col = node:range()
   local line                   = lines[end_row + 1]
 
   -- Grab punctuation immediately following the selection
-  if line:sub(end_col + 1, end_col + 1):match("[,;%.%?]") then
-    end_col = end_col + 1
+  if at_start or is_list_arg then
+    if line:sub(end_col + 1, end_col + 1):match("[,;%.%?]") then
+      end_col = end_col + 1
+    end
   end
-
-  -- Extend end_col to include any trailing spaces
-  -- if is_list_arg or has_trailing_whitespace_only(line, end_col + 1) then
-  --   end_col = search_after(line, end_col + 1, "%s")
-  -- end
 
   -- If we are at the end of the line, then include any trailing lines after
   if search_line_after(line, end_col, '^%s*$') == #line then
@@ -202,19 +195,21 @@ local function get_selection_end(lines, node, at_start)
     end
   end
 
+  -- If left of the line we have only whitespace, start at 0
+  -- end_col = search_line_after(line, end_col + 1, "%s")
+
   -- Not sure why this adjustment is needed. Indexing? But if we don't adjust
   -- here, then for let x = [te|st, foo] will select the f?
   end_col = end_col - 1
 
   -- Finally, check if we should expand the selection to remove any trailing newlines.
-  local end_line = lines[end_row + 1] or ""
-  if at_start and end_col + 1 == #end_line then
+  local end_line = lines[end_row + 1]
+  if at_start and search_line_after(end_line, end_col + 1, '^%s*$') == #end_line then
     end_col = #end_line
   end
 
   return end_row, end_col
 end
-
 
 local function select_node(node, is_list_arg, is_list)
   table.insert(selected_nodes, node)
@@ -238,7 +233,7 @@ local function select_node(node, is_list_arg, is_list)
 
   local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
   local start_row, start_col = get_selection_start(lines, start_node, is_list_arg)
-  local end_row, end_col = get_selection_end(lines, end_node, start_col == 0)
+  local end_row, end_col = get_selection_end(lines, end_node, start_col == 0, is_list_arg)
 
   vim.api.nvim_buf_set_mark(0, '<', start_row + 1, start_col, {})
   vim.api.nvim_buf_set_mark(0, '>', end_row + 1, end_col, {})
@@ -351,14 +346,6 @@ function select_parent()
   else
     local next = nil
 
-    -- If the node is a comment, try to select any attached comments
-    -- if is_comment(node) then
-    --   last = find_last_sibling_right(node, is_comment)
-    --   if node:id() ~= last:id() then
-    --     next = last
-    --   end
-    -- end
-
     -- If the previous node is an attachment type, find what it's anchored to
     if not next and is_attachment(node) then
       next = find_sibling_right(node, is_not_attachment)
@@ -398,6 +385,7 @@ function select_parent()
   end
 end
 
+-- test
 function undo_select_parent()
   if #cursor_stack ~= 0 then
     local cursor = table.remove(cursor_stack)
