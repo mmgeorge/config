@@ -8,7 +8,9 @@ return {
       format_after_save = function(bufnr)
         local ftype = vim.bo[bufnr].filetype
         if ftype == "typescriptreact" or ftype == "typescript" then
-          vim.cmd(":LspEslintFixAll")
+          if vim.fn.exists(":LspEslintFixAll") == 2 then
+            vim.cmd(":LspEslintFixAll")
+          end
           return
         end
 
