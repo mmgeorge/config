@@ -2,6 +2,86 @@ local priorities = {
   snippets = 4,
 }
 
+local completionItemPriorities = {
+  Variable = 1,
+
+  -- Text = 1,
+  -- Method = 2,
+  -- Function = 3,
+  -- Constructor = 4,
+  -- Field = 5,
+  -- Variable = 6,
+  -- Class = 7,
+  -- Interface = 8,
+  -- Module = 9,
+  -- Property = 10,
+  -- Unit = 11,
+  -- Value = 12,
+  -- Enum = 13,
+  -- Keyword = 14,
+  -- Snippet = 15,
+  -- Color = 16,
+  -- File = 17,
+  -- Reference = 18,
+  -- Folder = 19,
+  -- EnumMember = 20,
+  -- Constant = 21,
+  -- Struct = 22,
+  -- Event = 23,
+  -- Operator = 24,
+  -- TypeParameter = 25,
+}
+
+local function deprioritize_common_rust_traits(a, b)
+  local function is_common_trait(entry)
+    local labelDetails = entry.labelDetails
+    if not labelDetails then
+      return
+    end
+
+    local label = labelDetails.detail
+    if label == nil then
+      return nil
+    end
+
+    -- find `(as Trait)` in the label
+    local trait = label:match "%(as ([^)]+)%)"
+    if trait == nil then
+      return nil
+    end
+    return vim
+        .iter({
+          "Clone",
+          "Copy",
+          "Deref",
+          "DerefMut",
+          "Borrow",
+          "BorrowMut",
+          "Drop",
+          "ToString",
+          "ToOwned",
+          "PartialEq",
+          "PartialOrd",
+          "AsRef",
+          "AsMut",
+          "From",
+          "Into",
+          "TryFrom",
+          "TryInto",
+          "Default",
+        })
+        :find(function(x)
+          return x == trait
+        end)
+  end
+
+  local is_common_1 = is_common_trait(a) or false
+  local is_common_2 = is_common_trait(b) or false
+  if is_common_1 ~= is_common_2 then
+    return not is_common_1
+  end
+end
+
 return {
   {
     'saghen/blink.cmp',
@@ -29,6 +109,14 @@ return {
     ---@type blink.cmp.Config
     opts = {
       fuzzy = {
+        use_frecency = true,
+        use_proximity = true,
+        max_typos = function(str)
+          if #str < 4 then
+            return 0
+          end
+          return 2
+        end,
         implementation = "prefer_rust_with_warning",
         sorts = {
           -- function(a, b)
@@ -36,9 +124,19 @@ return {
           --   local b_priority = priorities[b.source_id] or 0
           --   if a_priority ~= b_priority then return a_priority > b_priority end
           -- end,
-          -- 'exact',
+          'exact',
+          -- function(a, b)
+          --   local a_priority = completionItemPriorities[a.kind] or 100
+          --   local b_priority = completionItemPriorities[b.kind] or 100
+          --
+          --   if a_priority ~= b_priority then return a_priority > b_priority end
+          -- end,
+          deprioritize_common_rust_traits,
           'score',
           'sort_text',
+          function(a, b)
+            return #a.label < #b.label
+          end,
           -- 'label'
         }
       },

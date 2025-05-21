@@ -26,7 +26,6 @@
   (string_fragment)
   (call_expression)
   (array)
-  (object)
   (type_parameters)
   (array_pattern)
   ; change padding capture for theses:
@@ -52,6 +51,8 @@
 (for_statement) @list
 
 (type_arguments) @list
+
+(object_type) @list
 
 (object) @list
 

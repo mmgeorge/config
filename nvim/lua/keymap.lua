@@ -206,9 +206,22 @@ k.keymap('n', '{', 'g,') -- Jump recent change
 k.keymap({ 'n', 'v' }, '<Tab>', '==')
 vim.keymap.set({ 'n' }, '<CR>', 'i<CR><ESC>')
 
-k.keymap('n', '.', '<CMD>Glance definitions<CR>')
-k.keymap('n', 'or', '<CMD>Glance references<CR>')
-k.keymap('n', 'ot', '<CMD>Glance type_definitions<CR>')
+k.keymap('n', '.', function()
+  Snacks.picker.lsp_definitions({
+    focus = "list",
+    formatters = {
+      file = {
+        -- filename_only = true,
+        truncate = 40
+      }
+    }
+  })
+end)
+
+-- k.keymap('n', '.', '<CMD>Glance definitions<CR>')
+-- k.keymap('n', 'or', '<CMD>Glance references<CR>')
+-- k.keymap('n', 'ot', '<CMD>Glance type_definitions<CR>')
+
 k.keymap({ 'n', 'x' }, 'ou', function() vim.diagnostic.open_float(nil, { focus = false }) end)
 
 k.keymap('n', 'ou', vim.lsp.buf.hover)

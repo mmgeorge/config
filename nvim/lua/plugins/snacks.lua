@@ -16,6 +16,10 @@ local no_preview = {
   },
 }
 
+-- k.keymap('n', '.', '<CMD>Glance definitions<CR>')
+-- k.keymap('n', 'or', '<CMD>Glance references<CR>')
+-- k.keymap('n', 'ot', '<CMD>Glance type_definitions<CR>')
+
 return {
   {
     "folke/snacks.nvim",
@@ -24,6 +28,36 @@ return {
     keys = {
       -- Top Pickers & Explorer
       -- { "<leader><space>", function() Snacks.picker.smart() end, desc = "Smart Find Files" },
+      -- {
+      --   '.',
+      --   function()
+      --     Snacks.picker.lsp_definitions({
+      --       focus = "list",
+      --       formatters = {
+      --         file = {
+      --           -- filename_only = true,
+      --           truncate = 40
+      --         }
+      --       }
+      --     })
+      --   end,
+      --   desc = "Lsp definitions"
+      -- },
+      {
+        'of',
+        function()
+          Snacks.picker.lsp_references({
+            focus = "list",
+            formatters = {
+              file = {
+                -- filename_only = true,
+                truncate = 40
+              }
+            }
+          })
+        end,
+        desc = "Lsp references"
+      },
       {
         "oh",
         function()
