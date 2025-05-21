@@ -11,7 +11,7 @@ return {
           if vim.fn.exists(":LspEslintFixAll") == 2 then
             vim.cmd(":LspEslintFixAll")
           end
-          return
+          return { lsp_format = "fallback" }
         end
 
         return { lsp_format = "fallback" }

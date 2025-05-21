@@ -1,4 +1,4 @@
-([
+[
   (comment)
   (field)
   (for_statement)
@@ -9,9 +9,10 @@
   (variable_declaration)
   (function_declaration)
   (function_definition)
+  (function_call)
   (table_constructor)
-  ] @parent)
+  (assignment_statement)
+] @parent
 
-; (expression_list) @list 
-(arguments) @list 
-
+; (expression_list) @list
+(arguments) @list
