@@ -33,6 +33,8 @@
    (string_literal)
    (string_content)
 
+   (field_initializer_list)   
+
    ; Select inner -- all list types?
    (array_expression)
 
