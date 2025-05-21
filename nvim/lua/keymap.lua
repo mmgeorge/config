@@ -76,6 +76,12 @@ k.keymap('n', '<', forward)
 k.keymap({ 'n', 'x' }, 'k', up)
 k.keymap({ 'n', 'x' }, 'l', down)
 
+vim.api.nvim_command(":nnoremap " .. '(' .. ' ' .. '%')
+vim.api.nvim_command(":xnoremap " .. '(' .. ' ' .. '%')
+vim.api.nvim_command(":onoremap " .. '(' .. ' ' .. '%')
+vim.keymap.set({ 'n', 'x' }, '(', '%')
+vim.keymap.set({ 'n', 'x' }, 'p(', 'v%')
+
 k.remap('f', se)
 k.remap('a', sb)
 k.remap('j', 'h') -- Left
@@ -284,7 +290,12 @@ vim.keymap.set({ 'n' }, 'lo.', 'ya{', {})
 vim.keymap.set({ 'n' }, 'ju.', 'di{', {})
 vim.keymap.set({ 'n' }, 'jo.', 'da{', {})
 vim.keymap.set({ 'n' }, 'mu.', 'ci{', {})
-vim.keymap.set({ 'n' }, 'mo.', 'ca{', {})
+
+-- vim.keymap.set({ 'n' }, 'pa', '<Cmd>call search(\'[([{<]\', \'b\')<CR>v%', {})
+vim.keymap.set({ 'n' }, 'pa', 'v%', {})
+vim.keymap.set({ 'n' }, 'la', 'y%', {})
+vim.keymap.set({ 'n' }, 'ja', 'd%', {})
+vim.keymap.set({ 'n' }, 'ma', 'c%', {})
 
 -- Select [
 vim.keymap.set({ 'n' }, 'pu/', 'vi[', {})

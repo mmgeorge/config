@@ -4,12 +4,12 @@ vim.o.cindent = false
 vim.o.autoindent = false
 vim.o.smartindent = true
 vim.o.tabstop = 2
-vim.o.shiftwidth=2
+vim.o.shiftwidth = 2
 vim.o.timeoutlen = 1500
 vim.o.ttimeoutlen = 0
-vim.o.guicursor= ""
-vim.o.number=true
-vim.o.laststatus=3
+vim.o.guicursor = ""
+vim.o.number = true
+vim.o.laststatus = 3
 vim.opt.statuscolumn = "%l %=%s" -- %= means right align
 vim.opt.signcolumn = 'yes'
 vim.o.scrolloff = 0
@@ -25,13 +25,13 @@ vim.opt.smartcase = true
 
 vim.opt.foldexpr = "nvim_treesitter#foldexpr()"
 vim.o.foldcolumn = '1' -- '0' is not bad
-vim.o.foldlevel = 99 -- Using ufo provider need a large value, feel free to decrease the value
+vim.o.foldlevel = 99   -- Using ufo provider need a large value, feel free to decrease the value
 vim.o.foldlevelstart = 99
 vim.o.foldenable = true
 -- vim.opt.foldmethod = "expr"
 -- vim.opt.nofoldenable = true
 -- vim.cmd('set nofoldenable')
-
+vim.cmd('set mps +=<:>')           -- Add <> to matchpairs (% command)
 
 vim.g.rust_recommended_style = '0' -- Otherwise will override indentation settings
 
@@ -39,12 +39,11 @@ vim.g.rust_recommended_style = '0' -- Otherwise will override indentation settin
 -- vim.cmd('autocmd BufRead,BufNewFile * set fileformat=unix')
 
 function is_special()
-  return vim.bo.buftype ~= '' or vim.bo.filetype == 'oil'  
+  return vim.bo.buftype ~= '' or vim.bo.filetype == 'oil'
 end
 
-
-vim.api.nvim_create_autocmd({'BufRead','BufNewFile'}, {
-  pattern = '*',  
+vim.api.nvim_create_autocmd({ 'BufRead', 'BufNewFile' }, {
+  pattern = '*',
   callback = function()
     if not is_special() and vim.bo.modifiable then
       -- r = Continue comment o~n enter
@@ -55,21 +54,21 @@ vim.api.nvim_create_autocmd({'BufRead','BufNewFile'}, {
   end
 })
 
-vim.api.nvim_create_autocmd({'BufEnter'}, {
-  pattern = '*',  
+vim.api.nvim_create_autocmd({ 'BufEnter' }, {
+  pattern = '*',
   callback = function()
     if not is_special() and vim.bo.modifiable then
       -- r = Continue comment on enter
       -- o = Continue comment on o
       vim.bo.formatoptions = 'roj'
-      
+
       vim.bo.fileformat = 'unix'
     end
   end
 })
 
 -- vim.api.nvim_create_autocmd({'FocusGained', 'CursorHold'}, {
---   pattern = '*',  
+--   pattern = '*',
 --   callback = function()
 --     if vim.bo.modifiable then
 --       vim.cmd('checktime')
@@ -96,4 +95,3 @@ vim.filetype.add({
     slang = "slang",
   },
 })
-
