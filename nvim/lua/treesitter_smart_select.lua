@@ -6,6 +6,9 @@
 --   Mark @decorator nodes: .
 --     On select, first see if attached to !comment and !decorator. Respect newlines.
 --     If so, select that
+--     @prop    <-|
+--     @prop <----|vs
+--     class Foo()
 --
 --   On select_node
 --     Go backwards & select all decorator or comment. Respect newlines.
