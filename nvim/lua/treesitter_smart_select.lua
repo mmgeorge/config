@@ -1,3 +1,21 @@
+-- Rules to impl:
+--   Mark @comment nodes
+--     On select, first see if attached to !comment and !decorator. Respect newlines.
+--     If so, select that
+--     Otherwise, select last attached comment
+--   Mark @decorator nodes: .
+--     On select, first see if attached to !comment and !decorator. Respect newlines.
+--     If so, select that
+--
+--   On select_node
+--     Go backwards & select all decorator or comment. Respect newlines.
+
+--   ** Maybe**? On expand, before navigating to parent, first select all siblings (respect newline)
+
+-- if @list type, select all children first
+--   set bool selected inner to true
+--   on next select, select outer
+
 local cursor_stack = {}
 local selected_nodes = {}
 
@@ -172,8 +190,6 @@ local function select_node(node, is_list_arg)
   if is_list_arg then
     if not node:next_named_sibling() then
       match = "[%s,]"
-      -- else
-      -- match = nil
     end
   end
 
