@@ -80,7 +80,14 @@ vim.api.nvim_command(":nnoremap " .. '(' .. ' ' .. '%')
 vim.api.nvim_command(":xnoremap " .. '(' .. ' ' .. '%')
 vim.api.nvim_command(":onoremap " .. '(' .. ' ' .. '%')
 vim.keymap.set({ 'n', 'x' }, '(', '%')
-vim.keymap.set({ 'n', 'x' }, 'p(', 'v%')
+
+vim.api.nvim_command(":nnoremap " .. ')' .. ' ' .. '%')
+vim.api.nvim_command(":xnoremap " .. ')' .. ' ' .. '%')
+vim.api.nvim_command(":onoremap " .. ')' .. ' ' .. '%')
+-- vim.keymap.set({ 'n', 'x' }, ')', '%')
+
+
+-- vim.keymap.set({ 'n', 'x' }, 'p(', 'v%')
 
 k.remap('f', se)
 k.remap('a', sb)
@@ -296,6 +303,7 @@ vim.keymap.set({ 'n' }, 'pa', 'v%', {})
 vim.keymap.set({ 'n' }, 'la', 'y%', {})
 vim.keymap.set({ 'n' }, 'ja', 'd%', {})
 vim.keymap.set({ 'n' }, 'ma', 'c%', {})
+vim.keymap.set({ 'n' }, 'gca', 'gc%', { remap = true })
 
 -- Select [
 vim.keymap.set({ 'n' }, 'pu/', 'vi[', {})
