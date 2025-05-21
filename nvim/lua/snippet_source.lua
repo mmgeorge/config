@@ -6,149 +6,164 @@ local postfix = utils.postfix
 local global_snippets = {}
 local snippets_by_filetype = {
   typescript = {
-    postfix({ 
-      trigger = 'pr', 
-      node = type_node, 
-      body = function (text)
-        return "Promise<" .. text .. ">" 
-      end 
+    postfix({
+      trigger = 'pr',
+      node = type_node,
+      body = function(text)
+        return "Promise<" .. text .. ">"
+      end
     }),
   },
   typescriptreact = {
-    postfix({ 
-      trigger = 'pr', 
-      node = type_node, 
-      body = function (text)
-        return "Promise<" .. text .. ">" 
-      end 
+    postfix({
+      trigger = 'pr',
+      node = type_node,
+      body = function(text)
+        return "Promise<" .. text .. ">"
+      end
     }),
   },
   rust = {
-    postfix({ 
-      trigger = 'rcl', 
-      node = type_node, 
-      body = function (text)
-        return "Rc<RefCell<" .. text .. ">>" 
-      end 
+    postfix({
+      trigger = 'trace',
+      node = expr_node,
+      body = function(text)
+        return "tracing::trace!(\"[" .. text .. "]: {:#?}\", " .. text .. ");"
+      end
     }),
-    postfix({ 
-      trigger = 'rcl', 
-      node = expr_node, 
-      body = function (text)
-        return "Rc::new(RefCell::new(" .. text .. "))" 
-      end 
+
+    postfix({
+      trigger = 'rcl',
+      node = type_node,
+      body = function(text)
+        return "Rc<RefCell<" .. text .. ">>"
+      end
     }),
-    postfix({ 
-      trigger = 'rfl', 
-      node = type_node, 
-      body = function (text)
-        return "RefCell<" .. text .. ">" 
-      end 
+    postfix({
+      trigger = 'rc',
+      node = type_node,
+      body = function(text)
+        return "Rc<" .. text .. ">"
+      end
     }),
-    postfix({ 
-      trigger = 'rfl', 
-      node = expr_node, 
-      body = function (text)
-        return "RefCell::new(" .. text .. ")" 
-      end 
+    postfix({
+      trigger = 'rcl',
+      node = expr_node,
+      body = function(text)
+        return "Rc::new(RefCell::new(" .. text .. "))"
+      end
     }),
-    postfix({ 
-      trigger = 'arc', 
-      node = type_node, 
-      body = function (text)
-        return "Arc<" .. text .. ">" 
-      end 
+    postfix({
+      trigger = 'rfl',
+      node = type_node,
+      body = function(text)
+        return "RefCell<" .. text .. ">"
+      end
     }),
-    postfix({ 
-      trigger = 'rf', 
-      node = type_node, 
-      body = function (text)
-        return "RefCell<" .. text .. ">" 
-      end 
+    postfix({
+      trigger = 'rfl',
+      node = expr_node,
+      body = function(text)
+        return "RefCell::new(" .. text .. ")"
+      end
     }),
-    postfix({ 
-      trigger = 'rf', 
-      node = expr_node, 
-      body = function (text)
-        return "RefCell::new(" .. text .. ")" 
-      end 
+    postfix({
+      trigger = 'arc',
+      node = type_node,
+      body = function(text)
+        return "Arc<" .. text .. ">"
+      end
     }),
-    postfix({ 
-      trigger = 'rl', 
-      node = type_node, 
-      body = function (text)
-        return "RwLock<" .. text .. ">" 
-      end 
+    postfix({
+      trigger = 'rf',
+      node = type_node,
+      body = function(text)
+        return "RefCell<" .. text .. ">"
+      end
     }),
-    postfix({ 
-      trigger = 'rl', 
-      node = expr_node, 
-      body = function (text)
-        return "RwLock::new(" .. text .. ")" 
-      end 
+    postfix({
+      trigger = 'rf',
+      node = expr_node,
+      body = function(text)
+        return "RefCell::new(" .. text .. ")"
+      end
     }),
-    postfix({ 
-      trigger = 'mut', 
-      node = type_node, 
-      body = function (text)
-        return "Mutex<" .. text .. ">" 
-      end 
+    postfix({
+      trigger = 'rl',
+      node = type_node,
+      body = function(text)
+        return "RwLock<" .. text .. ">"
+      end
     }),
-    postfix({ 
-      trigger = 'mut', 
-      node = expr_node, 
-      body = function (text)
-        return "Mutex::new(" .. text .. ")" 
-      end 
+    postfix({
+      trigger = 'rl',
+      node = expr_node,
+      body = function(text)
+        return "RwLock::new(" .. text .. ")"
+      end
     }),
-    postfix({ 
-      trigger = 'amut', 
-      node = type_node, 
-      body = function (text)
-        return "Arc<Mutex<" .. text .. ">>" 
-      end 
+    postfix({
+      trigger = 'mut',
+      node = type_node,
+      body = function(text)
+        return "Mutex<" .. text .. ">"
+      end
     }),
-    postfix({ 
-      trigger = 'amut', 
-      node = expr_node, 
-      body = function (text)
-        return "Arc::new(Mutex::new(" .. text .. "))" 
-      end 
+    postfix({
+      trigger = 'mut',
+      node = expr_node,
+      body = function(text)
+        return "Mutex::new(" .. text .. ")"
+      end
     }),
-    postfix({ 
-      trigger = 'lboxfut', 
-      node = type_node, 
-      body = function (text)
-        return "LocalBoxFuture<'static, " .. text .. ">" 
-      end 
+    postfix({
+      trigger = 'amut',
+      node = type_node,
+      body = function(text)
+        return "Arc<Mutex<" .. text .. ">>"
+      end
     }),
-    postfix({ 
-      trigger = 'boxfut', 
-      node = type_node, 
-      body = function (text)
-        return "BoxFuture<'static, " .. text .. ">" 
-      end 
+    postfix({
+      trigger = 'amut',
+      node = expr_node,
+      body = function(text)
+        return "Arc::new(Mutex::new(" .. text .. "))"
+      end
     }),
-    postfix({ 
-      trigger = 'ifut', 
-      node = type_node, 
-      body = function (text)
-        return "impl Future<Output = " .. text .. ">" 
-      end 
+    postfix({
+      trigger = 'lboxfut',
+      node = type_node,
+      body = function(text)
+        return "LocalBoxFuture<'static, " .. text .. ">"
+      end
     }),
-    postfix({ 
-      trigger = 'opt', 
-      node = type_node, 
-      body = function (text)
-        return "Option<" .. text .. ">" 
-      end 
+    postfix({
+      trigger = 'boxfut',
+      node = type_node,
+      body = function(text)
+        return "BoxFuture<'static, " .. text .. ">"
+      end
     }),
-    postfix({ 
-      trigger = 'vec', 
-      node = type_node, 
-      body = function (text)
-        return "Vec<" .. text .. ">" 
-      end 
+    postfix({
+      trigger = 'ifut',
+      node = type_node,
+      body = function(text)
+        return "impl Future<Output = " .. text .. ">"
+      end
+    }),
+    postfix({
+      trigger = 'opt',
+      node = type_node,
+      body = function(text)
+        return "Option<" .. text .. ">"
+      end
+    }),
+    postfix({
+      trigger = 'vec',
+      node = type_node,
+      body = function(text)
+        return "Vec<" .. text .. ">"
+      end
     }),
   }
 }
@@ -180,7 +195,6 @@ function source.new(opts)
   return self
 end
 
-
 -- (Optional) Enable the source in specific contexts only
 function source:enabled() return true end
 
@@ -192,7 +206,7 @@ function source:get_completions(ctx, callback)
   local items = {}
   local insert_item = function(snippet)
     local executed = snippet.execute();
-    if executed ~= nil then 
+    if executed ~= nil then
       ---@type lsp.CompletionItem
       local item = {
         word = snippet.trigger,
@@ -204,12 +218,12 @@ function source:get_completions(ctx, callback)
       }
       table.insert(items, item)
     end
-  end 
+  end
 
   vim.tbl_map(insert_item, get_snippets())
 
-  callback({ 
-    items = items, 
+  callback({
+    items = items,
     -- Whether blink.cmp should request items when deleting characters
     -- from the keyword (i.e. "foo|" -> "fo|")
     -- Note that any non-alphanumeric characters will always request
@@ -225,9 +239,9 @@ end
 
 -- Called immediately after applying the item's textEdit/insertText
 function source:execute(ctx, item, callback, default_implementation)
-  local clear = item.clear_region 
+  local clear = item.clear_region
   if clear ~= nil then
-    local buf = vim.api.nvim_get_current_buf() 
+    local buf = vim.api.nvim_get_current_buf()
     vim.api.nvim_buf_set_text(
       buf,
       clear.from[1],
@@ -236,7 +250,7 @@ function source:execute(ctx, item, callback, default_implementation)
       clear.to[2] + ctx.bounds.length,
       {}
     )
-  end 
+  end
 
   default_implementation()
   callback()

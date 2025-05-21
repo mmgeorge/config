@@ -186,7 +186,10 @@ local function get_selection_end(lines, node, at_start, is_list_arg)
   end
 
   -- If we are at the end of the line, then include any trailing lines after
-  if search_line_after(line, end_col, '^%s*$') == #line then
+  --
+  -- NOTE: avoid selecting newlines after comments as in the case where we don't have an
+  -- attached node, its likely because we are commenting / uncommenting code
+  if not is_comment(node) and search_line_after(line, end_col, '^%s*$') == #line then
     local i = end_row + 1
     while i < #lines and (lines[i + 1]:match('^%s*$') or lines[i + 1] == '') do
       end_row = i

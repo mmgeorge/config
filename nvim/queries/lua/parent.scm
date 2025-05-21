@@ -12,6 +12,9 @@
   (function_call)
   (table_constructor)
   (assignment_statement)
+  (dot_index_expression)
+  (string)
+  (string_content)
 ] @parent
 
 ; (expression_list) @list

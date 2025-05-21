@@ -8,9 +8,9 @@ return {
       format_after_save = function(bufnr)
         local ftype = vim.bo[bufnr].filetype
         if ftype == "typescriptreact" or ftype == "typescript" then
-          if vim.fn.exists(":LspEslintFixAll") == 2 then
-            vim.cmd(":LspEslintFixAll")
-          end
+          -- if vim.fn.exists(":LspEslintFixAll") == 2 then
+          --   vim.cmd(":LspEslintFixAll")
+          -- end
           return { lsp_format = "fallback" }
         end
 
