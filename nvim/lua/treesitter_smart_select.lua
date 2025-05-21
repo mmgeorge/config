@@ -1,24 +1,3 @@
--- Rules to impl:
---   Mark @comment nodes
---     On select, first see if attached to !comment and !decorator. Respect newlines.
---     If so, select that
---     Otherwise, select last attached comment
---   Mark @decorator nodes: .
---     On select, first see if attached to !comment and !decorator. Respect newlines.
---     If so, select that
---     @prop    <-|
---     @prop <----|vs
---     class Foo()
---
---   On select_node
---     Go backwards & select all decorator or comment. Respect newlines.
-
---   ** Maybe**? On expand, before navigating to parent, first select all siblings (respect newline)
-
--- if @list type, select all children first
---   set bool selected inner to true
---   on next select, select outer
-
 local cursor_stack = {}
 local selected_nodes = {}
 
@@ -26,21 +5,102 @@ local selected_nodes = {}
 -- to the core node type (e.g., move to function, etc.)
 local selecting_related_nodes_enabled = true
 
-local related_node_types = {
+local decorator_types = {
   --rust
   "attribute_item",
-  "line_comment",
-  -- lua
-  "comment",
 }
 
-local function is_related_node(node)
-  for _, v in ipairs(related_node_types) do
+local function is_comment(node)
+  return node:type():find("comment", 1, true) ~= nil
+end
+
+
+local function is_attachment(node)
+  if is_comment(node) then
+    return true
+  end
+
+  for _, v in ipairs(decorator_types) do
     if v == node:type() then
       return true
     end
   end
+
   return false
+end
+
+local function is_not_attachment(node)
+  return not is_attachment(node)
+end
+
+local function joinable(a, b)
+  local a_start_row, _, a_end_row, _ = a:range()
+  local b_start_row, _, b_end_row, _ = b:range()
+
+  if a_start_row < b_start_row then
+    return b_start_row - a_end_row <= 1
+  else
+    return a_end_row - b_start_row <= 1
+  end
+end
+
+local function find_sibling_left(node, predicate)
+  while node do
+    if (predicate(node)) then
+      return node
+    end
+    node = node:prev_named_sibling()
+  end
+
+  return nil
+end
+
+local function find_last_sibling_left(node, predicate)
+  local next = node:prev_named_sibling()
+
+  while next and joinable(node, next) and predicate(next) do
+    node = next
+    next = node:prev_named_sibling()
+  end
+
+  return node
+end
+
+local function find_sibling_right(node, predicate)
+  while node do
+    if (predicate(node)) then
+      return node
+    end
+    node = node:next_named_sibling()
+  end
+
+  return nil
+end
+
+local function find_last_sibling_right(node, predicate)
+  local next = node:next_named_sibling()
+
+  while next and joinable(node, next) and predicate(next) do
+    node = next
+    next = node:next_named_sibling()
+  end
+
+  return node
+end
+
+local function search_line_before(line, i, match)
+  while i > 0 and line:sub(i, i):match(match) do
+    i = i - 1
+  end
+  return i
+end
+
+local function search_line_after(line, i, match)
+  while i <= #line and line:sub(i, i):match('^%s*$') do
+    i = i + 1
+  end
+
+  return i
 end
 
 --- Push the current visual selection or cursor position onto cursor_stack
@@ -101,151 +161,41 @@ local function setup_visual_exit_autocmd()
   })
 end
 
--- For the given node, get the start of the left-most relevant sibling.
--- Relevant siblings include comments, macros, and decorators
-local function related_leading_sibling_start(node)
+local function get_selection_start(lines, node, is_list_arg)
   local start_row, start_col = node:range()
-  local sibling = node:prev_named_sibling()
+  local line = lines[start_row + 1]
 
-  while sibling do
-    if is_related_node(sibling) then
-      local s_row, s_col = sibling:range()
-      start_row = s_row
-      start_col = s_col
-    else
-      break
-    end
-    sibling = sibling:prev_named_sibling()
+  -- If are the last list arg, expand to capture any preceeding ,
+  if is_list_arg and not node:next_named_sibling() then
+    return start_row, search_line_before(line, start_col, "[%s,]")
+  end
+
+  -- If left of the line we have only whitespace, start at 0
+  if search_line_before(line, start_col, "%s") == 0 then
+    start_col = 0
   end
 
   return start_row, start_col
 end
 
--- For the given node (should pass is_related_node), get the last rightward sibling that is not a
--- related node type.
-local function first_core_right_sibling(node)
-  local sibling = node
-
-  while sibling and is_related_node(sibling) do
-    sibling = sibling:next_named_sibling()
-  end
-
-  return sibling
-end
-
-local function has_trailing_whitespace_only(line, e)
-  while e <= #line do
-    local c = line:sub(e + 1, e + 1)
-    -- if not c:match("%s") then
-    if not c:match('^%s*$') then
-      return false
-    else
-      e = e + 1
-    end
-  end
-
-  return true
-end
-
-local function has_leading_whitespace_only(line, s)
-  while s > 0 do
-    if not line:sub(s, s):match("%s") then
-      return false
-    end
-    s = s - 1
-  end
-
-  return true
-end
-
-
---- Determines if a Tree-sitter node is the last child in its parent (has no right siblings)
----@param node userdata TSNode
----@return boolean
-local function is_last_child(node)
-  local parent = node:parent()
-  if not parent then
-    return false
-  end
-
-  local last_child = parent:child(parent:child_count() - 1)
-  print("last", vim.inspect(last_child:id(), node:id()))
-  return last_child:id() == node:id()
-end
-
-
-local function select_node(node, is_list_arg)
-  table.insert(selected_nodes, node)
-  local ts_utils = require("nvim-treesitter.ts_utils")
-  -- local start_row, start_col, end_row, end_col = node:range()
+local function get_selection_end(lines, node, at_start)
   local _, _, end_row, end_col = node:range()
-  local start_row, start_col = related_leading_sibling_start(node)
-
-  -- Get buffer lines
-  local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
-  local last_buf_line = #lines
-
-  local match = nil;
-  if has_leading_whitespace_only(lines[start_row + 1], start_col) then
-    match = "%s";
-  end
-
-  if is_list_arg then
-    if not node:next_named_sibling() then
-      match = "[%s,]"
-    end
-  end
-
-  if match then
-    local line = lines[start_row + 1] or ""
-    local s = start_col
-    while s > 0 and line:sub(s, s):match(match) do
-      s = s - 1
-    end
-    start_col = s
-  end
-
-  -- Extend end_col to include any trailing , ; . or ?
-  -- local end_line = lines[end_row + 1] or ""
-  -- local e = end_col
-  -- -- -- cover the case where end_col might be at the last char, extend if needed
-  -- while e <= #end_line do
-  --   local c = end_line:sub(e + 1, e + 1)
-  --   if c:match("[%s,;%.%?]") then
-  --     e = e + 1
-  --   else
-  --     break
-  --   end
-  -- end
-  -- end_col = e
+  local line                   = lines[end_row + 1]
 
   -- Grab punctuation immediately following the selection
-  local end_line = lines[end_row + 1] or ""
-  local c = end_line:sub(end_col + 1, end_col + 1)
-  if c:match("[,;%.%?]") then
+  if line:sub(end_col + 1, end_col + 1):match("[,;%.%?]") then
     end_col = end_col + 1
   end
 
   -- Extend end_col to include any trailing spaces
-  if is_list_arg or has_trailing_whitespace_only(lines[end_row + 1], end_col + 1) then
-    local end_line = lines[end_row + 1] or ""
-    local e = end_col
-    -- -- cover the case where end_col might be at the last char, extend if needed
-    while e <= #end_line do
-      local c = end_line:sub(e + 1, e + 1)
-      if c:match("%s") then
-        e = e + 1
-      else
-        break
-      end
-    end
-    end_col = e
-  end
+  -- if is_list_arg or has_trailing_whitespace_only(line, end_col + 1) then
+  --   end_col = search_after(line, end_col + 1, "%s")
+  -- end
 
-  -- Extend end_row to include trailing empty lines and newlines after the node
-  if has_trailing_whitespace_only(lines[end_row + 1], end_col + 1) then
+  -- If we are at the end of the line, then include any trailing lines after
+  if search_line_after(line, end_col, '^%s*$') == #line then
     local i = end_row + 1
-    while i < last_buf_line and (lines[i + 1]:match('^%s*$') or lines[i + 1] == '') do
+    while i < #lines and (lines[i + 1]:match('^%s*$') or lines[i + 1] == '') do
       end_row = i
       end_col = #lines[i + 1]
       i = i + 1
@@ -258,10 +208,37 @@ local function select_node(node, is_list_arg)
 
   -- Finally, check if we should expand the selection to remove any trailing newlines.
   local end_line = lines[end_row + 1] or ""
-  local has_leading_whitespace_only = has_leading_whitespace_only(lines[start_row + 1], start_col - 1)
-  if has_leading_whitespace_only and end_col + 1 == #end_line then
+  if at_start and end_col + 1 == #end_line then
     end_col = #end_line
   end
+
+  return end_row, end_col
+end
+
+
+local function select_node(node, is_list_arg, is_list)
+  table.insert(selected_nodes, node)
+
+  local start_node = node
+  local end_node = node
+
+  -- If we have a list, select the first and last child
+  if is_list then
+    start_node = node:named_child(0)
+    end_node = node:named_child(node:named_child_count() - 1)
+  end
+
+  if is_not_attachment(start_node) then
+    -- Grab any attachments that preceed the selected node
+    start_node = find_last_sibling_left(start_node, is_attachment)
+  elseif is_comment(start_node) then
+    -- Grab any preceding comments
+    start_node = find_last_sibling_left(start_node, is_comment)
+  end
+
+  local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
+  local start_row, start_col = get_selection_start(lines, start_node, is_list_arg)
+  local end_row, end_col = get_selection_end(lines, end_node, start_col == 0)
 
   vim.api.nvim_buf_set_mark(0, '<', start_row + 1, start_col, {})
   vim.api.nvim_buf_set_mark(0, '>', end_row + 1, end_col, {})
@@ -269,8 +246,7 @@ local function select_node(node, is_list_arg)
   remember_current_selection()
 end
 
-
-function get_closest_node(tree)
+function find_closest_node(tree)
   local bufnr = vim.api.nvim_get_current_buf()
   local winid = vim.api.nvim_get_current_win()
   local cursor_pos = vim.api.nvim_win_get_cursor(winid) -- {row, col}, 1-indexed
@@ -282,33 +258,15 @@ function get_closest_node(tree)
   local col = cursor_pos[2] -- Lua indices are 1-based, but Neovim columns are 0-based
   local next_non_ws = line:find("%S", col + 1)
   local cursor_col = next_non_ws and (next_non_ws - 1) or cursor_pos[2]
-
-  local node
-  local selected_node = selected_nodes[#selected_nodes]
-
-  if selected_node then
-    if is_related_node(selected_node) then
-      node = first_core_right_sibling(selected_node)
-    else
-      node = selected_node:parent()
-    end
-  else
-    local root = tree:root()
-    local desc_node = root:named_descendant_for_range(cursor_row, cursor_col, cursor_row, cursor_col)
-    if not desc_node then
-      -- Fallback to any descendant (named or anonymous) if no specific named one is at the exact point/range
-      desc_node = root:descendant_for_range(cursor_row, cursor_col, cursor_row, cursor_col)
-    end
-
-    if not desc_node then
-      vim.notify(
-        "Error: Could not find a Tree-sitter node at the cursor position. Position: r" ..
-        cursor_row .. " c" .. cursor_col,
-        vim.log.levels.ERROR
-      )
-      return
-    end
-    node = first_core_right_sibling(desc_node)
+  local root = tree:root()
+  local node = root:named_descendant_for_range(cursor_row, cursor_col, cursor_row, cursor_col)
+  if not node then
+    vim.notify(
+      "Error: Could not find a Tree-sitter node at the cursor position. Position: r" ..
+      cursor_row .. " c" .. cursor_col,
+      vim.log.levels.ERROR
+    )
+    return
   end
 
   return node
@@ -386,29 +344,54 @@ function select_parent()
   local lang = require("nvim-treesitter.parsers").ft_to_lang(ftype)
   local query = query_for(lang)
   local tree = get_tree(bufnr, lang)
-  local node = get_closest_node(tree)
+
+  local node = selected_nodes[#selected_nodes]
+  if not node then
+    node = find_closest_node(tree)
+  else
+    local next = nil
+
+    -- If the node is a comment, try to select any attached comments
+    -- if is_comment(node) then
+    --   last = find_last_sibling_right(node, is_comment)
+    --   if node:id() ~= last:id() then
+    --     next = last
+    --   end
+    -- end
+
+    -- If the previous node is an attachment type, find what it's anchored to
+    if not next and is_attachment(node) then
+      next = find_sibling_right(node, is_not_attachment)
+    end
+
+    -- Otherwise, go up to the parent
+    node = next or node:parent()
+  end
 
   while node do
     local parent = node:parent();
-    -- if matches(query, "list_arg", node, bufnr) and matches(query, "list", parent, bufnr) then
     if matches(query, "list", parent, bufnr) then
-      select_node(node, true)
-      return
+      return select_node(node, true)
+    end
+
+    if matches(query, "list", node, bufnr) then
+      return select_node(node, false, true)
     end
 
     if matches(query, "parent", node, bufnr) then
-      if not selecting_related_nodes_enabled then
-        node = first_core_right_sibling(node)
-      end
-
-      -- In some cases, we perfer to always jump to the parent of the
+      -- In some cases, we prefer to always jump to the parent of the
       -- current node depending on the lang
       if matches(query, "jump", parent, bufnr) then
         node = parent
       end
 
-      select_node(node)
-      return
+      -- If the node is a comment, move to the last attached comment. We
+      -- will then select all of them
+      if is_comment(node) then
+        node = find_last_sibling_right(node, is_comment)
+      end
+
+      return select_node(node)
     end
 
     node = node:parent()
