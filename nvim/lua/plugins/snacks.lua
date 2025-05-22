@@ -47,7 +47,10 @@ return {
         'of',
         function()
           Snacks.picker.lsp_references({
-            focus = "list",
+            on_show = function()
+              vim.api.nvim_command('stopinsert')
+            end,
+            -- focus = "list",
             formatters = {
               file = {
                 -- filename_only = true,

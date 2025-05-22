@@ -208,7 +208,9 @@ vim.keymap.set({ 'n' }, '<CR>', 'i<CR><ESC>')
 
 k.keymap('n', '.', function()
   Snacks.picker.lsp_definitions({
-    focus = "list",
+    on_show = function()
+      vim.api.nvim_command('stopinsert')
+    end,
     formatters = {
       file = {
         -- filename_only = true,
