@@ -1,4 +1,3 @@
-
 local M = {}
 
 M.get_uuid = function(opts)
@@ -52,7 +51,7 @@ local function tbl_length(T)
 end
 
 -- See https://github.com/ibhagwan/fzf-lua/blob/6ee73fdf2a79bbd74ec56d980262e29993b46f2b/lua/fzf-lua/utils.lua
-M.get_visual_selection = function ()
+M.get_visual_selection = function()
   -- this will exit visual mode
   -- use 'gv' to reselect the text
   local _, csrow, cscol, cerow, cecol
@@ -95,7 +94,7 @@ end
 ---@param opts table lookahead and lookbehind options
 local function best_match_at_point(matches, row, col, opts)
   local ts_utils = require "nvim-treesitter.ts_utils"
-  
+
   local match_length
   local smallest_range
   local earliest_start
@@ -131,9 +130,9 @@ local function best_match_at_point(matches, row, col, opts)
       if start_line > row or start_line == row and start_col > col then
         local length = ts_utils.node_length(m.node)
         if
-          not lookahead_earliest_start
-          or lookahead_earliest_start > start_byte
-          or (lookahead_earliest_start == start_byte and lookahead_match_length < length)
+            not lookahead_earliest_start
+            or lookahead_earliest_start > start_byte
+            or (lookahead_earliest_start == start_byte and lookahead_match_length < length)
         then
           lookahead_match_length = length
           lookahead_largest_range = m
@@ -145,9 +144,9 @@ local function best_match_at_point(matches, row, col, opts)
       if start_line < row or start_line == row and start_col < col then
         local length = ts_utils.node_length(m.node)
         if
-          not lookbehind_earliest_start
-          or lookbehind_earliest_start < start_byte
-          or (lookbehind_earliest_start == start_byte and lookbehind_match_length > length)
+            not lookbehind_earliest_start
+            or lookbehind_earliest_start < start_byte
+            or (lookbehind_earliest_start == start_byte and lookbehind_match_length > length)
         then
           lookbehind_match_length = length
           lookbehind_largest_range = m
@@ -180,7 +179,7 @@ local function best_match_at_point(matches, row, col, opts)
   end
 end
 
-function M.select_textobject(query_string, query_group, keymap_mode) 
+function M.select_textobject(query_string, query_group, keymap_mode)
   local bufnr, textobject = M.textobject_at_point(query_string, query_group, nil, nil, {})
   local ts_utils = require "nvim-treesitter.ts_utils"
 
@@ -200,7 +199,7 @@ end
 
 function M.detect_selection_mode(query_string, keymap_mode)
   local configs = require "nvim-treesitter.configs"
-  
+
   -- Update selection mode with different methods based on keymapping mode
   local keymap_to_method = {
     o = "operator-pending",
@@ -238,7 +237,8 @@ function M.textobject_at_point(query_string, query_group, pos, bufnr, opts)
   local parsers = require "nvim-treesitter.parsers"
   local queries = require "nvim-treesitter.query"
   local ts_utils = require "nvim-treesitter.ts_utils"
-  local ts = require "nvim-treesitter.compat"  query_group = query_group or "textobjects"
+  local ts = require "nvim-treesitter.compat"
+  query_group = query_group or "textobjects"
 
   opts = opts or {}
   bufnr = bufnr or vim.api.nvim_get_current_buf()
@@ -314,11 +314,11 @@ end
 
 M.get_position_before_postfix = function()
   local pos = vim.api.nvim_win_get_cursor(0) -- get current cursor position
-  local row = pos[1] - 1 -- must convert to 0 indexed
+  local row = pos[1] - 1                     -- must convert to 0 indexed
   local line = vim.api.nvim_get_current_line()
-  local dot_position = line:find("%.") 
+  local dot_position = line:find("%.")
 
-  if dot_position then 
+  if dot_position then
     return { row, dot_position - 2 } -- Before dot + 1 based index
   end
 
@@ -332,25 +332,25 @@ M.type_node = function()
   })
 
   local function is_type(ty)
-    if 
-      -- ts
-      ty == "type_identifier" or
-      ty == "predefined_type" or
-      -- rust
-      ty == "primitive_type" or 
-      ty == "scoped_type_identifier" or 
-      ty == "generic_type" or 
-      ty == "type_identifier"  then
+    if
+    -- ts
+        ty == "type_identifier" or
+        ty == "predefined_type" or
+        -- rust
+        ty == "primitive_type" or
+        ty == "scoped_type_identifier" or
+        ty == "generic_type" or
+        ty == "type_identifier" then
       return true
-    end 
+    end
 
     return false
   end
 
-  while node do 
+  while node do
     local ty = node:type()
 
-    local parent = node:parent(); 
+    local parent = node:parent();
     local parent_ty = parent and parent:type()
 
     if is_type(ty) and not is_type(parent_ty) then
@@ -358,10 +358,10 @@ M.type_node = function()
     end
 
     node = parent
-  end 
+  end
 
   return nil
-end 
+end
 
 -- Expression postfix snippet
 M.expr_node = function()
@@ -369,44 +369,46 @@ M.expr_node = function()
     pos = M.get_position_before_postfix()
   })
 
-  while node do 
+  while node do
     local ty = node:type()
-    if 
-      ty == "call_expression" or 
-      ty == "integer_literal" or 
-      ty == "string_literal" or 
-      ty == "float_literal" then 
+    if
+        ty == "identifer" or
+        ty == "tuple_expression" or
+        ty == "call_expression" or
+        ty == "integer_literal" or
+        ty == "string_literal" or
+        ty == "float_literal" then
       return node
-    end 
+    end
 
     node = node:parent()
-  end 
+  end
 
   return nil
 end
 
 -- Create a postfix snippet
 M.postfix = function(options)
-  return { 
-    trigger = options.trigger, 
-    execute = function ()
+  return {
+    trigger = options.trigger,
+    execute = function()
       local node = options.node()
       if node == nil then
         return nil
       end
 
       local row, col = node:start()
-      local text = vim.treesitter.get_node_text(node, 0):gsub('%.%w*$', '')  -- remove postfix
+      local text = vim.treesitter.get_node_text(node, 0):gsub('%.%w*$', '') -- remove postfix
       local pos = vim.api.nvim_win_get_cursor(0)
       return {
-        body = options.body(text), 
+        body = options.body(text),
         clear_region = {
           from = { row, col },
-          to = { pos[1] - 1, pos[2] } 
+          to = { pos[1] - 1, pos[2] }
         }
-      } 
-    end, 
-  }  
+      }
+    end,
+  }
 end
 
 
