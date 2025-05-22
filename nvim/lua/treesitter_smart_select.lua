@@ -111,47 +111,6 @@ local function search_line_after(line, i, match)
   return i
 end
 
---- Push the current visual selection or cursor position onto cursor_stack
-local function remember_current_selection()
-  local mode = vim.fn.mode()
-  local start_row, start_col, end_row, end_col
-
-  if mode == "v" or mode == "V" then
-    -- Get the start and end of the visual selection
-    local start_pos = vim.fn.getpos("'<")
-    local end_pos   = vim.fn.getpos("'>")
-    start_row       = start_pos[2] - 1
-    start_col       = start_pos[3] - 1
-    end_row         = end_pos[2] - 1
-    end_col         = end_pos[3] - 1
-    -- In visual-line, select all columns
-    if mode == "V" then
-      start_col = 0
-      end_col = math.max(0, #vim.fn.getline(end_row + 1))
-    end
-    -- Ensure start is always before end
-    if start_row > end_row or (start_row == end_row and start_col > end_col) then
-      start_row, end_row = end_row, start_row
-      start_col, end_col = end_col, start_col
-    end
-  else
-    -- If not in visual mode, push current cursor position as zero-width selection
-    local pos = vim.api.nvim_win_get_cursor(0)
-    start_row = pos[1] - 1
-    start_col = pos[2]
-    end_row   = start_row
-    end_col   = start_col
-  end
-
-
-  table.insert(cursor_stack, {
-    start_row = start_row,
-    end_row   = end_row,
-    start_col = start_col,
-    end_col   = end_col
-  })
-end
-
 local augroup_name = "ClearCursorStackOnVisualLeave"
 vim.api.nvim_create_augroup(augroup_name, { clear = true })
 
@@ -301,13 +260,30 @@ local function select_node(bufnr, query, tree, node, is_list_arg, is_list, end_n
 end
 
 function select_region(node, start_row, start_col, end_row, end_col)
+  local last = cursor_stack[#cursor_stack]
+  if last and
+      last.start_row == start_row and
+      last.end_row == end_row and
+      last.start_col == start_col and
+      last.end_col == end_col then
+    -- Ended up wi the same selection, try again
+    return false
+  end
+
   table.insert(selected_nodes, node)
   print(node:type())
 
   vim.api.nvim_buf_set_mark(0, '<', start_row + 1, start_col, {})
   vim.api.nvim_buf_set_mark(0, '>', end_row + 1, end_col, {})
   vim.cmd("normal! gvo")
-  remember_current_selection()
+
+  table.insert(cursor_stack, {
+    start_row = start_row,
+    end_row   = end_row,
+    start_col = start_col,
+    end_col   = end_col
+  })
+
   return true
 end
 
@@ -342,16 +318,10 @@ function query_for(lang)
   -- This expects a file like 'queries/rust/parent.scm' to be in your runtimepath.
   local query = vim.treesitter.query.get(lang, "parent")
   if not query or query == "" then
-    vim.notify(
-      "Error: Could not load query 'parent' for language '" .. lang .. "'. " ..
-      "Ensure queries/" ..
-      lang .. "/parent.scm exists in your Neovim runtime path (e.g., ~/.config/nvim/queries/" ..
-      lang .. "/parent.scm). " ..
-      "Query content was nil or empty.",
-      vim.log.levels.ERROR
-    )
-    return
+    -- Create and return an empty query object if not found
+    return vim.treesitter.query.parse(lang, "")
   end
+
 
   return query
 end
@@ -514,6 +484,7 @@ function try_select_node(node, query, tree, bufnr)
     -- At root
     return false
   end
+
   local start_row, start_col, end_row, end_col = node:range()
   -- Avoid selecting nodes that are a single char
   if start_row == end_row and start_col == end_col - 1 then
@@ -526,34 +497,17 @@ function try_select_node(node, query, tree, bufnr)
     return false
   elseif matches(query, "elseif", node, bufnr) then
     local end_node = match_get(query, "end", node, bufnr)
-
     return select_node(bufnr, query, tree, node, false, false, end_node)
   elseif matches(query, "if", node, bufnr) then
     local end_node = match_get(query, "end", node, bufnr)
-
     return select_node(bufnr, query, tree, node, false, false, end_node)
+    -- Select a list arg
+  elseif matches(query, "list", parent, bufnr) then
+    return select_node(bufnr, query, tree, node, true)
+    -- Select inner list
+  elseif matches(query, "list", node, bufnr) then
+    return select_node(bufnr, query, tree, node, false, true)
   else
-    if matches(query, "list", parent, bufnr) then
-      -- If the parent is a list, check the count. If we have only a single element,
-      -- then select the parent instead (which will do a select inner)
-      if parent:named_child_count() == 1 then
-        return select_node(bufnr, query, tree, parent, false, true)
-      end
-
-      return select_node(bufnr, query, tree, node, true)
-    end
-
-    if matches(query, "list", node, bufnr) then
-      -- local last_selected = selected_nodes[#selected_nodes]
-      -- We already visually selected this region, continue
-      -- if node:named_child_count() == 1 and last_selected then
-      --   node = node:parent()
-      --   goto continue
-      -- end
-
-      return select_node(bufnr, query, tree, node, false, true)
-    end
-
     -- If the node is a comment, move to the last attached comment. We
     -- will then select all of them
     if is_comment(node) then
