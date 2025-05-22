@@ -36,6 +36,8 @@
 
 (array_expression) @list
 
+(else_clause) @else
+
 (else_clause
   (if_expression
     consequence: (block) @end)) @elseif
@@ -46,6 +48,5 @@
 (if_expression
   consequence: (block) @end) @if
 
-; (if_expression) @jump
-; (else_clause
-; (if_expression)) @jump
+(expression_statement
+  (if_expression)) @if_container
