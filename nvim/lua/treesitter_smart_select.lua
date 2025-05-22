@@ -241,6 +241,10 @@ local function select_node(bufnr, query, tree, node, is_list_arg, is_list, end_n
 
   -- If we have a list, select the first and last child
   if is_list then
+    if node:named_child_count() == 0 then
+      return false
+    end
+
     start_node = node:named_child(0)
     end_node = node:named_child(node:named_child_count() - 1)
   end
@@ -456,6 +460,16 @@ function select_parent()
     -- If the previous node is an attachment type, find what it's anchored to
     if not next and is_attachment(node) then
       next = find_sibling_right(node, is_not_attachment)
+    end
+
+    -- We picked a branch of an if_else previous. Move up to the parent of the if_else.
+    if not next and matches(query, "else", node, bufnr) then
+      local parent = node:parent()
+      while parent and not matches(query, "if_container", parent, bufnr) do
+        parent = parent:parent()
+      end
+
+      next = parent
     end
 
     -- Did we select the same node?
