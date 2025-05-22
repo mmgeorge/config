@@ -497,65 +497,63 @@ function select_parent()
   end
 
   -- At the root
-  if not node then
-    return
-  end
+  while node do
+    local parent = node:parent();
 
-  local parent = node:parent();
+    -- At the root
+    if not parent then
+      return
+    end
 
-  -- At the root
-  if not parent then
-    return
-  end
+    local start_row, start_col, end_row, end_col = node:range()
 
-  local start_row, start_col, end_row, end_col = node:range()
+    -- Avoid selecting nodes that are a single char
+    if start_row == end_row and start_col == end_col - 1 then
+      node = parent
+    elseif matches(query, "jump", node, bufnr) then
+      node = parent
+    elseif matches_in_parent(query, "jump", node, parent, bufnr) then
+      node = parent
+    elseif matches(query, "outer_only", node, bufnr) and matches_parent(query, "outer_only", node, bufnr) then
+      node = parent
+    elseif matches(query, "elseif", node, bufnr) then
+      local end_node = match_get(query, "end", node, bufnr)
 
-  -- Avoid selecting nodes that are a single char
-  if start_row == end_row and start_col == end_col - 1 then
-    node = parent
-  elseif matches(query, "jump", node, bufnr) then
-    node = parent
-  elseif matches_in_parent(query, "jump", node, parent, bufnr) then
-    node = parent
-  elseif matches(query, "outer_only", node, bufnr) and matches_parent(query, "outer_only", node, bufnr) then
-    node = parent
-  elseif matches(query, "elseif", node, bufnr) then
-    local end_node = match_get(query, "end", node, bufnr)
+      return select_node(bufnr, query, tree, node, false, false, end_node)
+    elseif matches(query, "if", node, bufnr) then
+      local end_node = match_get(query, "end", node, bufnr)
 
-    return select_node(bufnr, query, tree, node, false, false, end_node)
-  elseif matches(query, "if", node, bufnr) then
-    local end_node = match_get(query, "end", node, bufnr)
+      return select_node(bufnr, query, tree, node, false, false, end_node)
+    else
+      if matches(query, "list", parent, bufnr) then
+        -- If the parent is a list, check the count. If we have only a single element,
+        -- then select the parent instead (which will do a select inner)
+        if parent:named_child_count() == 1 then
+          return select_node(bufnr, query, tree, parent, false, true)
+        end
 
-    return select_node(bufnr, query, tree, node, false, false, end_node)
-  else
-    if matches(query, "list", parent, bufnr) then
-      -- If the parent is a list, check the count. If we have only a single element,
-      -- then select the parent instead (which will do a select inner)
-      if parent:named_child_count() == 1 then
-        return select_node(bufnr, query, tree, parent, false, true)
+        return select_node(bufnr, query, tree, node, true)
       end
 
-      return select_node(bufnr, query, tree, node, true)
+      if matches(query, "list", node, bufnr) then
+        -- local last_selected = selected_nodes[#selected_nodes]
+        -- We already visually selected this region, continue
+        -- if node:named_child_count() == 1 and last_selected then
+        --   node = node:parent()
+        --   goto continue
+        -- end
+
+        return select_node(bufnr, query, tree, node, false, true)
+      end
+
+      -- If the node is a comment, move to the last attached comment. We
+      -- will then select all of them
+      if is_comment(node) then
+        node = find_last_sibling_right(node, is_comment)
+      end
+
+      return select_node(bufnr, query, tree, node)
     end
-
-    if matches(query, "list", node, bufnr) then
-      -- local last_selected = selected_nodes[#selected_nodes]
-      -- We already visually selected this region, continue
-      -- if node:named_child_count() == 1 and last_selected then
-      --   node = node:parent()
-      --   goto continue
-      -- end
-
-      return select_node(bufnr, query, tree, node, false, true)
-    end
-
-    -- If the node is a comment, move to the last attached comment. We
-    -- will then select all of them
-    if is_comment(node) then
-      node = find_last_sibling_right(node, is_comment)
-    end
-
-    return select_node(bufnr, query, tree, node)
   end
 end
 
