@@ -23,6 +23,7 @@
   (string)
   (string_fragment)
   (call_expression)
+  (binary_expression)
   (array)
   (object)
   (type_parameters)
