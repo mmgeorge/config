@@ -270,12 +270,12 @@ local function select_chain(lines, tree, node)
   return select_region(start_row, start_col, end_row, end_col - 1)
 end
 
-local function select_node(bufnr, query, tree, node, is_list_arg, is_list)
+local function select_node(bufnr, query, tree, node, is_list_arg, is_list, end_node)
   table.insert(selected_nodes, node)
   print(node:type())
 
   local start_node = node
-  local end_node = node
+  end_node = end_node or node
   local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
 
   -- Special handling for chain arguments, e.g, bax.baz().foo()
@@ -396,6 +396,37 @@ function matches(query, capture_name, node, bufnr)
   return false
 end
 
+function match_get(query, capture_name, node, bufnr)
+  if not node then
+    return nil
+  end
+
+  local index = get_capture_index(query, capture_name)
+  for _, match in query:iter_matches(node, bufnr) do
+    local matched_group = match[index]
+    if matched_group then
+      return matched_group[1]
+    end
+  end
+
+  return nil
+end
+
+function matches_elseif(query, node, bufnr)
+  if not node then
+    return false
+  end
+
+  local index = get_capture_index(query, "elseifblock")
+  for _, match in query:iter_matches(node, bufnr) do
+    local matched_group = match[index]
+    if matched_group and matched_group[1]:id() == node:id() then
+      return true
+    end
+  end
+  return false
+end
+
 function matches_parent(query, capture_name, node, bufnr)
   node = node:parent()
 
@@ -451,7 +482,6 @@ function select_parent()
     node = find_closest_node(tree)
   else
     local next = nil
-
     -- If the previous node is an attachment type, find what it's anchored to
     if not next and is_attachment(node) then
       next = find_sibling_right(node, is_not_attachment)
@@ -466,43 +496,66 @@ function select_parent()
     node = next or node:parent()
   end
 
-  while node do
-    local parent = node:parent();
+  -- At the root
+  if not node then
+    return
+  end
 
-    -- At the root
-    if not parent then
-      return
+  local parent = node:parent();
+
+  -- At the root
+  if not parent then
+    return
+  end
+
+  local start_row, start_col, end_row, end_col = node:range()
+
+  -- Avoid selecting nodes that are a single char
+  if start_row == end_row and start_col == end_col - 1 then
+    node = parent
+  elseif matches(query, "jump", node, bufnr) then
+    node = parent
+  elseif matches_in_parent(query, "jump", node, parent, bufnr) then
+    node = parent
+  elseif matches(query, "outer_only", node, bufnr) and matches_parent(query, "outer_only", node, bufnr) then
+    node = parent
+  elseif matches(query, "elseif", node, bufnr) then
+    local end_node = match_get(query, "end", node, bufnr)
+
+    return select_node(bufnr, query, tree, node, false, false, end_node)
+  elseif matches(query, "if", node, bufnr) then
+    local end_node = match_get(query, "end", node, bufnr)
+
+    return select_node(bufnr, query, tree, node, false, false, end_node)
+  else
+    if matches(query, "list", parent, bufnr) then
+      -- If the parent is a list, check the count. If we have only a single element,
+      -- then select the parent instead (which will do a select inner)
+      if parent:named_child_count() == 1 then
+        return select_node(bufnr, query, tree, parent, false, true)
+      end
+
+      return select_node(bufnr, query, tree, node, true)
     end
 
-    if matches(query, "jump", node, bufnr) then
-      node = parent
-    elseif matches_in_parent(query, "jump", node, parent, bufnr) then
-      node = parent
-    elseif matches(query, "outer_only", node, bufnr) and matches_parent(query, "outer_only", node, bufnr) then
-      node = parent
-    else
-      if matches(query, "list", parent, bufnr) then
-        -- If the parent is a list, check the count. If we have only a single element,
-        -- then select the parent instead (which will do a select inner)
-        if parent:named_child_count() == 1 then
-          return select_node(bufnr, query, tree, parent, false, true)
-        end
+    if matches(query, "list", node, bufnr) then
+      -- local last_selected = selected_nodes[#selected_nodes]
+      -- We already visually selected this region, continue
+      -- if node:named_child_count() == 1 and last_selected then
+      --   node = node:parent()
+      --   goto continue
+      -- end
 
-        return select_node(bufnr, query, tree, node, true)
-      end
-
-      if matches(query, "list", node, bufnr) then
-        return select_node(bufnr, query, tree, node, false, true)
-      end
-
-      -- If the node is a comment, move to the last attached comment. We
-      -- will then select all of them
-      if is_comment(node) then
-        node = find_last_sibling_right(node, is_comment)
-      end
-
-      return select_node(bufnr, query, tree, node)
+      return select_node(bufnr, query, tree, node, false, true)
     end
+
+    -- If the node is a comment, move to the last attached comment. We
+    -- will then select all of them
+    if is_comment(node) then
+      node = find_last_sibling_right(node, is_comment)
+    end
+
+    return select_node(bufnr, query, tree, node)
   end
 end
 
