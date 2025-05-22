@@ -19,6 +19,8 @@
 
 (type_arguments) @list
 
+(object_pattern) @list
+
 (object) @list
 
 (array) @list

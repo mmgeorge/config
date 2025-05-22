@@ -194,11 +194,13 @@ end
 local function select_chain(lines, tree, node)
   local start_row, start_col, end_row, end_col = node:range()
   local line = lines[start_row + 1]
+  local did_capture_dot_start = false
 
   -- end_col = end_col - 1 -- node:range() is not inclusive?
 
-  if line:sub(start_col - 1, start_col - 1):match(".") then
+  if line:sub(start_col - 1, start_col - 1):match("%.") then
     start_col = start_col - 1
+    did_capture_dot_start = true
   end
 
   -- arguments case: foo.b|az()
@@ -216,6 +218,9 @@ local function select_chain(lines, tree, node)
     end
 
     return select_region(node, start_row, start_col, args_end_row, args_end_col - 1)
+    -- call(f|oo.value) select foo. if we are the first item
+  elseif not did_capture_dot_start and line:sub(end_col + 1, end_col + 1):match("%.") then
+    end_col = end_col + 1
   end
 
   -- Should we capture the entire line?

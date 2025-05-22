@@ -19,6 +19,8 @@
 
 (type_arguments) @list
 
+(object_pattern) @list
+
 (object) @list
 
 (array) @list
@@ -42,6 +44,8 @@
 (property_identifier) @chain
 
 (member_expression) @chain
+
+(identifier) @chain ; keep?
 
 (call_expression
   (member_expression)) @jump ; chain selection rules interfere with this
