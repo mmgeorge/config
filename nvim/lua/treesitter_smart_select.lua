@@ -45,7 +45,13 @@ local function find_sibling_left(node, predicate)
     if (predicate(node)) then
       return node
     end
-    node = node:prev_named_sibling()
+
+    local prev = node:prev_named_sibling()
+    if not joinable(prev, node) then
+      return node
+    end
+
+    node = prev
   end
 
   return nil
@@ -67,7 +73,13 @@ local function find_sibling_right(node, predicate)
     if (predicate(node)) then
       return node
     end
-    node = node:next_named_sibling()
+
+    local next = node:next_named_sibling()
+    if not joinable(next, node) then
+      return node
+    end
+
+    node = next
   end
 
   return nil
@@ -185,6 +197,11 @@ local function get_selection_end(lines, node, at_start, is_list_arg)
     end
   end
 
+  -- Grab other types of non-closing punctuation
+  if line:sub(end_col + 1, end_col + 1):match("[!%?]") then
+    end_col = end_col + 1
+  end
+
   -- If we are at the end of the line, then include any trailing lines after
   --
   -- NOTE: avoid selecting newlines after comments as in the case where we don't have an
@@ -214,11 +231,57 @@ local function get_selection_end(lines, node, at_start, is_list_arg)
   return end_row, end_col
 end
 
-local function select_node(node, is_list_arg, is_list)
+local function select_chain(lines, tree, node)
+  local start_row, start_col, end_row, end_col = node:range()
+  local line = lines[start_row + 1]
+
+  -- end_col = end_col - 1 -- node:range() is not inclusive?
+
+  if line:sub(start_col - 1, start_col - 1):match(".") then
+    start_col = start_col - 1
+  end
+
+  -- arguments case: foo.b|az()
+  if line:sub(end_col + 1, end_col + 1):match("%(") then
+    local root = tree:root()
+    local args = root:named_descendant_for_range(end_row, end_col, end_row, end_col)
+    local _, _, args_end_row, args_end_col = args:range()
+    local end_line = lines[args_end_row + 1]
+
+    -- Should we capture the entire line?
+    if search_line_before(line, start_col, "%s") == 0
+        and search_line_after(end_line, args_end_col, '^%s*$') == #end_line then
+      start_col = 0
+      args_end_col = #end_line + 1 -- sub below
+    end
+
+    return select_region(start_row, start_col, args_end_row, args_end_col - 1)
+  end
+
+  -- Should we capture the entire line?
+  local end_line = lines[end_row + 1]
+  if search_line_before(line, start_col, "%s") == 0
+      and search_line_after(end_line, end_col, '^%s*$') == #end_line then
+    start_col = 0
+    end_col = #end_line + 1 -- sub below
+  end
+
+  -- no arguments case: foo.in|ner.baz()
+  return select_region(start_row, start_col, end_row, end_col - 1)
+end
+
+local function select_node(bufnr, query, tree, node, is_list_arg, is_list)
   table.insert(selected_nodes, node)
+  print(node:type())
 
   local start_node = node
   local end_node = node
+  local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
+
+  -- Special handling for chain arguments, e.g, bax.baz().foo()
+  if matches(query, "chain", node, bufnr) then
+    return select_chain(lines, tree, node)
+  end
 
   -- If we have a list, select the first and last child
   if is_list then
@@ -234,10 +297,13 @@ local function select_node(node, is_list_arg, is_list)
     start_node = find_last_sibling_left(start_node, is_comment)
   end
 
-  local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
   local start_row, start_col = get_selection_start(lines, start_node, is_list_arg)
   local end_row, end_col = get_selection_end(lines, end_node, start_col == 0, is_list_arg)
 
+  return select_region(start_row, start_col, end_row, end_col)
+end
+
+function select_region(start_row, start_col, end_row, end_col)
   vim.api.nvim_buf_set_mark(0, '<', start_row + 1, start_col, {})
   vim.api.nvim_buf_set_mark(0, '>', end_row + 1, end_col, {})
   vim.cmd("normal! gvo")
@@ -330,6 +396,43 @@ function matches(query, capture_name, node, bufnr)
   return false
 end
 
+function matches_parent(query, capture_name, node, bufnr)
+  node = node:parent()
+
+  while node do
+    if not node then
+      return false
+    end
+
+    local index = get_capture_index(query, capture_name)
+    for _, match in query:iter_matches(node, bufnr) do
+      local matched_group = match[index]
+      if matched_group and matched_group[1]:id() == node:id() then
+        return true
+      end
+    end
+
+    node = node:parent()
+  end
+
+  return false
+end
+
+function matches_in_parent(query, capture_name, node, parent, bufnr)
+  if not node then
+    return false
+  end
+
+  local index = get_capture_index(query, capture_name)
+  for _, match in query:iter_matches(parent, bufnr) do
+    local matched_group = match[index]
+    if matched_group and matched_group[1]:id() == node:id() then
+      return true
+    end
+  end
+  return false
+end
+
 -- Lua function to select the nearest parent node based on a Tree-sitter query.
 --
 -- This function assumes you have a query file named 'parent.scm'
@@ -354,25 +457,42 @@ function select_parent()
       next = find_sibling_right(node, is_not_attachment)
     end
 
+    -- Did we select the same node?
+    if next and next:id() == node:id() then
+      next = nil
+    end
+
     -- Otherwise, go up to the parent
     node = next or node:parent()
   end
 
   while node do
     local parent = node:parent();
-    if matches(query, "list", parent, bufnr) then
-      return select_node(node, true)
+
+    -- At the root
+    if not parent then
+      return
     end
 
-    if matches(query, "list", node, bufnr) then
-      return select_node(node, false, true)
-    end
+    if matches(query, "jump", node, bufnr) then
+      node = parent
+    elseif matches_in_parent(query, "jump", node, parent, bufnr) then
+      node = parent
+    elseif matches(query, "outer_only", node, bufnr) and matches_parent(query, "outer_only", node, bufnr) then
+      node = parent
+    else
+      if matches(query, "list", parent, bufnr) then
+        -- If the parent is a list, check the count. If we have only a single element,
+        -- then select the parent instead (which will do a select inner)
+        if parent:named_child_count() == 1 then
+          return select_node(bufnr, query, tree, parent, false, true)
+        end
 
-    if matches(query, "parent", node, bufnr) then
-      -- In some cases, we prefer to always jump to the parent of the
-      -- current node depending on the lang
-      if matches(query, "jump", parent, bufnr) then
-        node = parent
+        return select_node(bufnr, query, tree, node, true)
+      end
+
+      if matches(query, "list", node, bufnr) then
+        return select_node(bufnr, query, tree, node, false, true)
       end
 
       -- If the node is a comment, move to the last attached comment. We
@@ -381,10 +501,8 @@ function select_parent()
         node = find_last_sibling_right(node, is_comment)
       end
 
-      return select_node(node)
+      return select_node(bufnr, query, tree, node)
     end
-
-    node = node:parent()
   end
 end
 
