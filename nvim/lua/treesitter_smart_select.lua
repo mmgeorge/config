@@ -1,5 +1,6 @@
 local cursor_stack = {}
 local selected_nodes = {}
+local last_was_expand = false
 
 local decorator_types = {
   -- rust
@@ -263,34 +264,6 @@ local function select_node(bufnr, query, tree, node, is_list_arg, is_list, end_n
   return select_region(node, start_row, start_col, end_row, end_col)
 end
 
-function select_region(node, start_row, start_col, end_row, end_col)
-  local last = cursor_stack[#cursor_stack]
-  if last and
-      last.start_row == start_row and
-      last.end_row == end_row and
-      last.start_col == start_col and
-      last.end_col == end_col then
-    -- Ended up wi the same selection, try again
-    return false
-  end
-
-  table.insert(selected_nodes, node)
-  print(node:type())
-
-  vim.api.nvim_buf_set_mark(0, '<', start_row + 1, start_col, {})
-  vim.api.nvim_buf_set_mark(0, '>', end_row + 1, end_col, {})
-  vim.cmd("normal! gvo")
-
-  table.insert(cursor_stack, {
-    start_row = start_row,
-    end_row   = end_row,
-    start_col = start_col,
-    end_col   = end_col
-  })
-
-  return true
-end
-
 function find_closest_node(tree)
   local bufnr = vim.api.nvim_get_current_buf()
   local winid = vim.api.nvim_get_current_win()
@@ -532,9 +505,51 @@ function try_select_node(node, query, tree, bufnr)
   end
 end
 
--- test
+--- Get the current visual selection (region) as start and end positions
+--- @return table {start = {line, col}, finish = {line, col}}
+-- local function get_visual_selection_region()
+--   local start_pos = vim.api.nvim_buf_get_mark(0, '<')
+--   local end_pos = vim.api.nvim_buf_get_mark(0, '>')
+--   return start_pos[1], start_pos[2], end_pos[1], end_pos[2]
+-- end
+function select_region(node, start_row, start_col, end_row, end_col)
+  local last = cursor_stack[#cursor_stack]
+  if last and
+      last.start_row == start_row and
+      last.end_row == end_row and
+      last.start_col == start_col and
+      last.end_col == end_col then
+    -- Ended up wi the same selection, try again
+    return false
+  end
+
+  table.insert(selected_nodes, node)
+  print(node:type())
+
+  vim.api.nvim_buf_set_mark(0, '<', start_row + 1, start_col, {})
+  vim.api.nvim_buf_set_mark(0, '>', end_row + 1, end_col, {})
+  vim.cmd("normal! gvo")
+
+  last_was_expand = true
+  table.insert(cursor_stack, {
+    start_row = start_row,
+    end_row   = end_row,
+    start_col = start_col,
+    end_col   = end_col
+  })
+
+  return true
+end
+
 function undo_select_parent()
   if #cursor_stack ~= 0 then
+    if last_was_expand then
+      -- Pop the last
+      last_was_expand = false
+      table.remove(cursor_stack)
+      table.remove(selected_nodes)
+    end
+
     local cursor = table.remove(cursor_stack)
     table.remove(selected_nodes)
     vim.api.nvim_buf_set_mark(0, '<', cursor.start_row + 1, cursor.start_col, {})
