@@ -255,7 +255,7 @@ local function select_chain(lines, tree, node)
       args_end_col = #end_line + 1 -- sub below
     end
 
-    return select_region(start_row, start_col, args_end_row, args_end_col - 1)
+    return select_region(node, start_row, start_col, args_end_row, args_end_col - 1)
   end
 
   -- Should we capture the entire line?
@@ -267,13 +267,10 @@ local function select_chain(lines, tree, node)
   end
 
   -- no arguments case: foo.in|ner.baz()
-  return select_region(start_row, start_col, end_row, end_col - 1)
+  return select_region(node, start_row, start_col, end_row, end_col - 1)
 end
 
 local function select_node(bufnr, query, tree, node, is_list_arg, is_list, end_node)
-  table.insert(selected_nodes, node)
-  print(node:type())
-
   local start_node = node
   end_node = end_node or node
   local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
@@ -300,14 +297,18 @@ local function select_node(bufnr, query, tree, node, is_list_arg, is_list, end_n
   local start_row, start_col = get_selection_start(lines, start_node, is_list_arg)
   local end_row, end_col = get_selection_end(lines, end_node, start_col == 0, is_list_arg)
 
-  return select_region(start_row, start_col, end_row, end_col)
+  return select_region(node, start_row, start_col, end_row, end_col)
 end
 
-function select_region(start_row, start_col, end_row, end_col)
+function select_region(node, start_row, start_col, end_row, end_col)
+  table.insert(selected_nodes, node)
+  print(node:type())
+
   vim.api.nvim_buf_set_mark(0, '<', start_row + 1, start_col, {})
   vim.api.nvim_buf_set_mark(0, '>', end_row + 1, end_col, {})
   vim.cmd("normal! gvo")
   remember_current_selection()
+  return true
 end
 
 function find_closest_node(tree)
@@ -496,64 +497,70 @@ function select_parent()
     node = next or node:parent()
   end
 
-  -- At the root
-  while node do
-    local parent = node:parent();
+  local did_select = false
 
-    -- At the root
-    if not parent then
+  while node do
+    if try_select_node(node, query, tree, bufnr) then
       return
     end
 
-    local start_row, start_col, end_row, end_col = node:range()
+    node = node:parent()
+  end
+end
 
-    -- Avoid selecting nodes that are a single char
-    if start_row == end_row and start_col == end_col - 1 then
-      node = parent
-    elseif matches(query, "jump", node, bufnr) then
-      node = parent
-    elseif matches_in_parent(query, "jump", node, parent, bufnr) then
-      node = parent
-    elseif matches(query, "outer_only", node, bufnr) and matches_parent(query, "outer_only", node, bufnr) then
-      node = parent
-    elseif matches(query, "elseif", node, bufnr) then
-      local end_node = match_get(query, "end", node, bufnr)
+function try_select_node(node, query, tree, bufnr)
+  local parent = node:parent();
+  if not parent then
+    -- At root
+    return false
+  end
+  local start_row, start_col, end_row, end_col = node:range()
+  -- Avoid selecting nodes that are a single char
+  if start_row == end_row and start_col == end_col - 1 then
+    return false
+  elseif matches(query, "jump", node, bufnr) then
+    return false
+  elseif matches_in_parent(query, "jump", node, parent, bufnr) then
+    return false
+  elseif matches(query, "outer_only", node, bufnr) and matches_parent(query, "outer_only", node, bufnr) then
+    return false
+  elseif matches(query, "elseif", node, bufnr) then
+    local end_node = match_get(query, "end", node, bufnr)
 
-      return select_node(bufnr, query, tree, node, false, false, end_node)
-    elseif matches(query, "if", node, bufnr) then
-      local end_node = match_get(query, "end", node, bufnr)
+    return select_node(bufnr, query, tree, node, false, false, end_node)
+  elseif matches(query, "if", node, bufnr) then
+    local end_node = match_get(query, "end", node, bufnr)
 
-      return select_node(bufnr, query, tree, node, false, false, end_node)
-    else
-      if matches(query, "list", parent, bufnr) then
-        -- If the parent is a list, check the count. If we have only a single element,
-        -- then select the parent instead (which will do a select inner)
-        if parent:named_child_count() == 1 then
-          return select_node(bufnr, query, tree, parent, false, true)
-        end
-
-        return select_node(bufnr, query, tree, node, true)
+    return select_node(bufnr, query, tree, node, false, false, end_node)
+  else
+    if matches(query, "list", parent, bufnr) then
+      -- If the parent is a list, check the count. If we have only a single element,
+      -- then select the parent instead (which will do a select inner)
+      if parent:named_child_count() == 1 then
+        return select_node(bufnr, query, tree, parent, false, true)
       end
 
-      if matches(query, "list", node, bufnr) then
-        -- local last_selected = selected_nodes[#selected_nodes]
-        -- We already visually selected this region, continue
-        -- if node:named_child_count() == 1 and last_selected then
-        --   node = node:parent()
-        --   goto continue
-        -- end
-
-        return select_node(bufnr, query, tree, node, false, true)
-      end
-
-      -- If the node is a comment, move to the last attached comment. We
-      -- will then select all of them
-      if is_comment(node) then
-        node = find_last_sibling_right(node, is_comment)
-      end
-
-      return select_node(bufnr, query, tree, node)
+      return select_node(bufnr, query, tree, node, true)
     end
+
+    if matches(query, "list", node, bufnr) then
+      -- local last_selected = selected_nodes[#selected_nodes]
+      -- We already visually selected this region, continue
+      -- if node:named_child_count() == 1 and last_selected then
+      --   node = node:parent()
+      --   goto continue
+      -- end
+
+      return select_node(bufnr, query, tree, node, false, true)
+    end
+
+    -- If the node is a comment, move to the last attached comment. We
+    -- will then select all of them
+    if is_comment(node) then
+      node = find_last_sibling_right(node, is_comment)
+    end
+
+    return select_node(bufnr, query, tree, node)
   end
 end
 
