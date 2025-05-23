@@ -48,7 +48,7 @@ local function find_sibling_left(node, predicate)
     end
 
     local prev = node:prev_named_sibling()
-    if not joinable(prev, node) then
+    if prev and not joinable(prev, node) then
       return node
     end
 
@@ -76,7 +76,7 @@ local function find_sibling_right(node, predicate)
     end
 
     local next = node:next_named_sibling()
-    if not joinable(next, node) then
+    if next and not joinable(next, node) then
       return node
     end
 
@@ -192,13 +192,15 @@ local function get_selection_end(lines, node, at_start, is_list_arg)
 end
 
 local function select_chain(lines, tree, node)
+  print("select_chain")
   local start_row, start_col, end_row, end_col = node:range()
   local line = lines[start_row + 1]
   local did_capture_dot_start = false
 
   -- end_col = end_col - 1 -- node:range() is not inclusive?
 
-  if line:sub(start_col - 1, start_col - 1):match("%.") then
+  if line:sub(start_col, start_col):match("%.") then
+    print("select_chain:capture_dot_left")
     start_col = start_col - 1
     did_capture_dot_start = true
   end
@@ -220,6 +222,7 @@ local function select_chain(lines, tree, node)
     return select_region(node, start_row, start_col, args_end_row, args_end_col - 1)
     -- call(f|oo.value) select foo. if we are the first item
   elseif not did_capture_dot_start and line:sub(end_col + 1, end_col + 1):match("%.") then
+    print("select_chain:capture_dot_right")
     end_col = end_col + 1
   end
 
@@ -236,6 +239,12 @@ local function select_chain(lines, tree, node)
 end
 
 local function select_node(bufnr, query, tree, node, is_list_arg, is_list, end_node)
+  -- If the node is a comment, move to the last attached comment. We
+  -- will then select all of them
+  if is_comment(node) then
+    node = find_last_sibling_right(node, is_comment)
+  end
+
   local start_node = node
   end_node = end_node or node
   local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
@@ -500,12 +509,6 @@ function try_select_node(node, query, tree, bufnr)
   elseif matches(query, "list", node, bufnr) then
     return select_node(bufnr, query, tree, node, false, true)
   else
-    -- If the node is a comment, move to the last attached comment. We
-    -- will then select all of them
-    if is_comment(node) then
-      node = find_last_sibling_right(node, is_comment)
-    end
-
     return select_node(bufnr, query, tree, node)
   end
 end
