@@ -29,9 +29,11 @@ function detect_adapter()
 
   return {
     chat = "copilot",
-    inline = "copilot",
-    cmd = "copilot",
-    commit = nil
+    inline = "copilot_4o",
+    cmd = "copilot_4o",
+    commit = {
+      name = "copilot_4o"
+    }
   }
 end
 
@@ -68,10 +70,30 @@ return {
       --   desc = "Codecompanion Commit",
       -- },
       {
+        "oc",
+        mode = { "n" },
+        function()
+          require("codecompanion").toggle()
+        end,
+        -- ":CodeCompanionChat Toggle<cr>",
+        desc = "Codecompanion Open",
+      },
+      {
         "<leader>co",
         mode = { "n" },
-        ":CodeCompanionChat<cr>",
+        function()
+          require("codecompanion").toggle()
+        end,
+        -- ":CodeCompanionChat Toggle<cr>",
         desc = "Codecompanion Open",
+      },
+      {
+        "<Esc>",
+        mode = { "n" },
+        ":CodeCompanionChat Toggle<cr>",
+        desc = "Codecompanion Open",
+        ft = "codecompanion",
+        silent = true
       },
       {
         "<leader>ca",
@@ -89,6 +111,34 @@ return {
         -- log_level = "TRACE",
       },
       adapters = {
+        copilot = function()
+          return require("codecompanion.adapters").extend("copilot", {
+            schema = {
+              model = {
+                default = "gpt-4.1",
+                -- choices = {
+                --   ["gemini-2.5-flash-preview-04-17"] = { opts = { can_reason = true } },
+                --   "gemini-2.5-pro-preview-03-25",
+                --   "gemini-2.0-flash",
+                -- }
+              },
+            },
+          })
+        end,
+        copilot_4o = function()
+          return require("codecompanion.adapters").extend("copilot", {
+            schema = {
+              model = {
+                default = "gpt-4o",
+                -- choices = {
+                --   ["gemini-2.5-flash-preview-04-17"] = { opts = { can_reason = true } },
+                --   "gemini-2.5-pro-preview-03-25",
+                --   "gemini-2.0-flash",
+                -- }
+              },
+            },
+          })
+        end,
         gemini = function()
           return require("codecompanion.adapters").extend("gemini", {
             schema = {
@@ -314,7 +364,7 @@ return {
           show_references = true,       -- Show references (from slash commands and variables) in the chat buffer?
           show_settings = false,        -- Show LLM settings at the top of the chat buffer?
           show_token_count = true,      -- Show the token count for each response?
-          start_in_insert_mode = true,  -- Open the chat buffer in insert mode?
+          start_in_insert_mode = false, -- Open the chat buffer in insert mode?
           -- Options to customize the UI of the chat buffer
           window = {
             layout = "horizontal", -- float|vertical|horizontal|buffer

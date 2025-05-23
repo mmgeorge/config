@@ -107,7 +107,7 @@ return {
           ["rust-analyzer"] = {
             -- numThreads = 8,
             cargo = {
-              allTargets = false,
+              -- allTargets = false,
               -- features = {},
               -- buildScripts = {
               -- enable = false,
@@ -115,7 +115,7 @@ return {
               -- }
             },
             check = {
-              allTargets = false,
+              allTargets = true,
               workspace = false,
             },
             cachePriming = {

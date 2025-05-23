@@ -2,6 +2,10 @@
 
 (field_expression) @jump
 
+(visibility_modifier) @jump
+
+(function_modifiers) @jump
+
 (call_expression) @outer_only
 
 (call_expression
