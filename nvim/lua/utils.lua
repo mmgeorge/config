@@ -373,6 +373,7 @@ M.expr_node = function()
     local ty = node:type()
     if
         ty == "identifer" or
+        ty == "field_expression" or
         ty == "tuple_expression" or
         ty == "call_expression" or
         ty == "integer_literal" or
