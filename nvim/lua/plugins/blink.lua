@@ -32,6 +32,35 @@ local completionItemPriorities = {
   -- TypeParameter = 25,
 }
 
+local import_blocklist = {
+  "std::arch"
+}
+
+local function is_blocklisted(entry)
+  local labelDetails = entry.labelDetails
+  if not labelDetails then
+    return
+  end
+
+  local label = labelDetails.detail
+  if label == nil then
+    return nil
+  end
+
+  local import = label:match "%(use ([^)]+)%)"
+  if import == nil then
+    return nil
+  end
+
+  for _, block in ipairs(import_blocklist) do
+    if import:find(block, 1, true) then
+      return true
+    end
+  end
+
+  return false
+end
+
 local function deprioritize_common_rust_traits(a, b)
   local function is_common_trait(entry)
     local labelDetails = entry.labelDetails
@@ -49,6 +78,7 @@ local function deprioritize_common_rust_traits(a, b)
     if trait == nil then
       return nil
     end
+
     return vim
         .iter({
           "Clone",
@@ -112,10 +142,10 @@ return {
         use_frecency = true,
         use_proximity = true,
         max_typos = function(str)
-          if #str < 4 then
-            return 0
+          if #str < 8 then
+            return 1
           end
-          return 2
+          return 1
         end,
         implementation = "prefer_rust_with_warning",
         sorts = {
@@ -229,22 +259,24 @@ return {
             score_offset = 20
           },
           lsp = {
+
             transform_items = function(ctx, items)
               local function should_filter(label)
                 -- if ctx.bounds.length < 4 and #label >= 8 then
                 --   return true
                 -- end
-
                 if ctx.bounds.length < 5 and #label >= 18 then
                   return true
                 end
 
-                return string.sub(label, 1, 2) == "__"
+                -- return string.sub(label, 1, 2) == "__"
+                return false
               end
 
               local out = {}
               for _, item in ipairs(items) do
-                if not should_filter(item.sortText) then
+                if not is_blocklisted(item) and not should_filter(item.filterText) then
+                  -- print(vim.inspect(item))
                   table.insert(out, item)
                 end
               end
