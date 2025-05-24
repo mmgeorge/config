@@ -1,6 +1,15 @@
 return {
   {
     'Bekaboo/dropbar.nvim',
+    keys = {
+      {
+        "<leader>fp",
+        function()
+          require("dropbar.api").pick()
+        end,
+        desc = "Dropbar pick"
+      },
+    },
     opts = {
       bar = {
         -- Disable all put path sources

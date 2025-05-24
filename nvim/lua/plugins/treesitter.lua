@@ -35,7 +35,7 @@ return {
           "c_sharp",
           "toml",
           "slang",
-          "yaml"
+          "yaml",
         },
         sync_install = false,
         highlight = {
