@@ -9,7 +9,7 @@ vim.o.timeoutlen = 1500
 vim.o.ttimeoutlen = 0
 vim.o.guicursor = ""
 vim.o.number = true
-vim.o.laststatus = 3
+vim.o.laststatus = 0
 vim.opt.statuscolumn = "%l %=%s" -- %= means right align
 vim.opt.signcolumn = 'yes'
 vim.o.scrolloff = 0
