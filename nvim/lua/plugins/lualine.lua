@@ -2,8 +2,8 @@ return {
   {
     'nvim-lualine/lualine.nvim',
     dependencies = {
-      'projekt0n/github-nvim-theme',
-      'nvim-tree/nvim-web-devicons' },
+      'nvim-tree/nvim-web-devicons'
+    },
     config = function()
       local colors = {
         red = "#ef3573",
@@ -16,7 +16,7 @@ return {
         teal = "#9dffe7"
       }
 
-      local black = "#0d1117"
+      local black = "#000000"
 
       local function getColors(color)
         return {
@@ -26,27 +26,20 @@ return {
         }
       end
 
-      local lualine_theme = require('github-theme.util.lualine')('github_dark_default')
-      -- lualine_theme.normal = getColors(colors.white)
-      -- lualine_theme.insert = getColors(colors.green)
-      -- lualine_theme.visual = getColors(colors.red)
-      -- lualine_theme.command = getColors(colors.yellow)
-      -- lualine_theme.replace = getColors(colors.light_blue)
-      -- lualine_theme.terminal = getColors(colors.teal)
-
-      -- Disable color change -- looks laggy
-      lualine_theme.normal = getColors(colors.white)
-      lualine_theme.insert = getColors(colors.white)
-      lualine_theme.visual = getColors(colors.white)
-      lualine_theme.command = getColors(colors.white)
-      lualine_theme.replace = getColors(colors.white)
-      lualine_theme.terminal = getColors(colors.white)
+      local theme = {
+        normal = getColors(colors.white),
+        insert = getColors(colors.white),
+        visual = getColors(colors.white),
+        command = getColors(colors.white),
+        replace = getColors(colors.white),
+        terminal = getColors(colors.white),
+        inactive = getColors(colors.gray),
+      }
 
       require('lualine').setup({
-        theme = lualine_theme,
         options = {
           icons_enabled = true,
-          theme = lualine_theme,
+          theme = theme,
           component_separators = { left = '', right = '' },
           section_separators = { left = '', right = '' },
           -- component_separators = { left = '', right = ''},
