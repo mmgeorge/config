@@ -1,11 +1,25 @@
 local key = require("../keys").key
 
+local colors = {
+  red = "#ef3573",
+  -- light_red = "#c3d0e0",
+  off_white = "#ccdbed",
+  green = "#5bff94",
+  yellow = "#ffe18e",
+  gray = "#696969",
+  light_gray = "#8a929c",
+  white = "#e9e9e9",
+  light_blue = "#3ec5ff",
+  -- light_gray = "#b4b4b4",
+  teal = "#9dffe7"
+}
+
 return {
   {
     'Mr-LLLLL/interestingwords.nvim',
     config = function()
       require("interestingwords").setup {
-        colors = { '#aeee00', '#ff0000', '#0000ff', '#b88823', '#ffa724', '#ff2c4b' },
+        colors = { colors.red, colors.green, colors.yellow, colors.light_blue },
         search_count = true,
         navigation = true,
         scroll_center = true,

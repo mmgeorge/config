@@ -39,14 +39,6 @@ end
 
 local adapter = detect_adapter()
 
-
--- vim.api.nvim_create_autocmd("FileType", {
---   pattern = "gitcommit",
---   callback = function()
---     print("Hello, World!")
---   end,
--- })
-
 return {
   {
     "olimorris/codecompanion.nvim",

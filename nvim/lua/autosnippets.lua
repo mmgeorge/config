@@ -108,7 +108,7 @@ vim.api.nvim_create_autocmd("TextChangedI", {
   pattern = "*",
   callback = function()
     local line = vim.api.nvim_get_current_line()
-    local col = vim.api.nvim_win_get_cursor(0)[2]       -- Current column
+    local col = vim.api.nvim_win_get_cursor(0)[2] -- Current column
 
     -- Extract the last entered token
     local start_pos, end_pos = line:sub(1, col):find("([^%s]+)%s?$")
@@ -120,7 +120,7 @@ vim.api.nvim_create_autocmd("TextChangedI", {
       -- OPTIMIZE: Inefficent. Use map as snippets list grows?
       for index, item in ipairs(autosnippets) do
         if valid_for_file(item, ftype) and last_token == item.trigger then
-          local pos = vim.api.nvim_win_get_cursor(0)       -- get current cursor position
+          local pos = vim.api.nvim_win_get_cursor(0) -- get current cursor position
           local row = pos[1] - 1;
           local buf = vim.api.nvim_get_current_buf()
           -- Remove match token

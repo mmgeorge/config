@@ -1,18 +1,18 @@
 -- Pull in the wezterm API
-local wezterm = require 'wezterm'
-local action = wezterm.action
+local wezterm                    = require 'wezterm'
+local action                     = wezterm.action
 
 -- This will hold the configuration.
-local config = wezterm.config_builder()
+local config                     = wezterm.config_builder()
 
-config.default_cwd = "D:/"
-config.set_environment_variables  = {
+config.default_cwd               = "D:/"
+config.set_environment_variables = {
   -- HOME = "D:/"
 }
 
-config.default_prog = { 
-  "C:/Program Files/PowerShell/7/pwsh.exe", 
-  "-NoExit", 
+config.default_prog              = {
+  "C:/Program Files/PowerShell/7/pwsh.exe",
+  "-NoExit",
   "-NoProfile",
   "-File", "D:/config/windows/init.ps1"
 }
@@ -21,45 +21,45 @@ config.default_prog = {
 -- For example, changing the color scheme:
 -- config.color_scheme = "Catppuccin Mocha"
 -- config.color_scheme = 'Campbell'
-config.font = wezterm.font('Cascadia Code NF')
-config.font_rules = {
---   {
---     intensity = 'Normal',
---     italic = true,
---     font = wezterm.font_with_fallback {
---       family = 'Operator Mono SSm Lig',
---       weight = 'DemiLight',
---       italic = true,
---     },
---   },
--- {
---     intensity = 'Half',
---     italic = true,
---     font = wezterm.font_with_fallback {
---       family = 'Cascadia Mono NF',
---       intensity = 'Half',
---       weight = 'Light',
---       italic = true,
---     },
---   },
+config.font                      = wezterm.font('Cascadia Code NF')
+config.font_rules                = {
+  --   {
+  --     intensity = 'Normal',
+  --     italic = true,
+  --     font = wezterm.font_with_fallback {
+  --       family = 'Operator Mono SSm Lig',
+  --       weight = 'DemiLight',
+  --       italic = true,
+  --     },
+  --   },
+  -- {
+  --     intensity = 'Half',
+  --     italic = true,
+  --     font = wezterm.font_with_fallback {
+  --       family = 'Cascadia Mono NF',
+  --       intensity = 'Half',
+  --       weight = 'Light',
+  --       italic = true,
+  --     },
+  --   },
 }
 
-config.line_height = 1.0
-config.cursor_blink_rate = 0
+config.line_height               = 1.0
+config.cursor_blink_rate         = 0
 
-config.colors = { 
+config.colors                    = {
   cursor_fg = 'red',
   cursor_bg = 'white',
-  cursor_border = 'white' 
+  cursor_border = 'white'
 }
 
 
--- config.window_decorations = "RESIZE" 
-config.window_decorations = "INTEGRATED_BUTTONS|RESIZE" 
+-- config.window_decorations = "RESIZE"
+config.window_decorations = "INTEGRATED_BUTTONS|RESIZE"
 
 -- config.use_fancy_tab_bar = false
 config.enable_tab_bar = true
-config.hide_tab_bar_if_only_one_tab = false
+config.hide_tab_bar_if_only_one_tab = true
 config.window_padding = {
   left = 4,
   right = 4,
@@ -68,8 +68,8 @@ config.window_padding = {
 }
 
 -- config.inactive_pane_hsb = {
-  -- saturation = 1,
-  -- brightness = 1,
+-- saturation = 1.,
+-- brightness = .6,
 -- }
 -- config.integrated_title_buttons = { 'Close' }
 config.leader = { key = 'n', mods = 'CTRL', timeout_milliseconds = 1000 }
@@ -84,7 +84,7 @@ config.keys = {
     key = 'y',
     mods = 'CTRL',
     action = action.PasteFrom 'Clipboard',
-  }, 
+  },
   {
     key = 'c',
     mods = 'LEADER',
@@ -116,12 +116,12 @@ config.keys = {
   {
     key = 'y',
     mods = 'LEADER',
-    action = wezterm.action.ActivateTabRelative(-1) ,
+    action = wezterm.action.ActivateTabRelative(-1),
   },
   {
     key = 'z',
     mods = 'LEADER',
-    action = wezterm.action.ActivateTabRelative(1) ,
+    action = wezterm.action.ActivateTabRelative(1),
   },
   { key = "n", mods = "LEADER", action = wezterm.action.ActivatePaneDirection("Left") },
   { key = "a", mods = "LEADER", action = wezterm.action.ActivatePaneDirection("Down") },
@@ -135,7 +135,7 @@ config.keys = {
   -- {
   --   key = 'o',
   --   mods = 'LEADER',
-  --   action = wezterm.action.PaneSelect { 
+  --   action = wezterm.action.PaneSelect {
   --     alphabet = 'rsthneai'
   --   },
   -- },
@@ -152,13 +152,13 @@ config.keys = {
   {
     key = 'o',
     mods = 'LEADER',
-    action = wezterm.action.ActivatePaneDirection "Next" 
+    action = wezterm.action.ActivatePaneDirection "Next"
   },
   {
     key = 'O',
     mods = 'LEADER',
-    action = wezterm.action.PaneSelect { 
-      alphabet = 'rsthneai', 
+    action = wezterm.action.PaneSelect {
+      alphabet = 'rsthneai',
       mode = "SwapWithActiveKeepFocus"
     },
   },
@@ -179,11 +179,11 @@ config.keys = {
         if line then
           wezterm.mux.rename_workspace(
             wezterm.mux.get_active_workspace(),
-            line 
+            line
           )
         end
       end),
-    },    
+    },
   },
   {
     key = '.',
@@ -196,12 +196,12 @@ config.key_tables = {
   copy_mode = {
     -- Navigation
     { key = 'h', mods = 'NONE', action = action.CopyMode 'MoveForwardWordEnd' },
-    { key = 'r', mods = 'NONE', action = action.CopyMode 'MoveBackwardWord'},
+    { key = 'r', mods = 'NONE', action = action.CopyMode 'MoveBackwardWord' },
     { key = 't', mods = 'NONE', action = action.CopyMode 'MoveDown' },
     { key = 's', mods = 'NONE', action = action.CopyMode 'MoveUp' },
     { key = 'n', mods = 'NONE', action = action.CopyMode 'MoveLeft' },
     { key = 'i', mods = 'NONE', action = action.CopyMode 'MoveRight' },
-    { key = 'f', mods = 'ALT', action = action.CopyMode 'MoveForwardWord' },
+    { key = 'f', mods = 'ALT',  action = action.CopyMode 'MoveForwardWord' },
     {
       key = ';',
       mods = 'NONE',
@@ -288,7 +288,7 @@ config.key_tables = {
         { CopyMode = 'MoveUp' },
         { CopyMode = 'MoveUp' },
       },
-    }, 
+    },
     {
       key = 'a',
       mods = 'NONE',
@@ -337,7 +337,7 @@ config.key_tables = {
         { CopyMode = 'MoveUp' },
         { CopyMode = 'MoveUp' },
       },
-    }, 
+    },
     {
       key = 'o',
       mods = 'NONE',
@@ -376,7 +376,7 @@ config.key_tables = {
         { CopyMode = 'MoveDown' },
       },
     },
--- {
+    -- {
     --   key = '$',
     --   action = action.CopyMode 'MoveToEndOfLineContent',
     -- },
@@ -497,9 +497,9 @@ config.key_tables = {
       mods = 'ALT',
       action = action.CopyMode 'MoveForwardWord',
     },
-    { key = 'UpArrow', mods = 'NONE', action = action.CopyMode 'MoveUp' },
+    { key = 'UpArrow',   mods = 'NONE', action = action.CopyMode 'MoveUp' },
     { key = 'DownArrow', mods = 'NONE', action = action.CopyMode 'MoveDown' },
-  } 
+  }
 }
 
 

@@ -19,16 +19,16 @@
 vim.diagnostic.config({
   virtual_text = {
     severity = {
-        -- vim.diagnostic.severity.WARN,
-        vim.diagnostic.severity.ERROR,
-     }
+      -- vim.diagnostic.severity.WARN,
+      vim.diagnostic.severity.ERROR,
+    }
   },
   signs = false,
   underline = {
-     severity = {
-        vim.diagnostic.severity.WARN,
-        vim.diagnostic.severity.ERROR,
-     }
+    severity = {
+      vim.diagnostic.severity.WARN,
+      vim.diagnostic.severity.ERROR,
+    }
   },
   update_in_insert = true,
   severity_sort = false,
