@@ -3,7 +3,7 @@ local key = require("../keys").key
 return {
   {
     'akinsho/git-conflict.nvim',
-    tag = "v1.1.2",
+    -- tag = "v1.1.2",
     config = function()
       require "git-conflict".setup({
         -- disable buffer local mapping created by this plugin
@@ -28,13 +28,13 @@ return {
       }
     },
     config = function()
-      vim.api.nvim_create_autocmd({ 'BufEnter' }, {
-        pattern = "COMMIT_EDITMSG",
-        callback = function()
-          require("codecompanion").prompt("commit")
-        end,
-      })
-
+      -- vim.api.nvim_create_autocmd({ 'BufEnter' }, {
+      --   pattern = "COMMIT_EDITMSG",
+      --   callback = function()
+      --     require("codecompanion").prompt("commit")
+      --   end,
+      -- })
+      --
       local neogit = require("neogit")
       neogit.setup {
         disable_hint = false,
