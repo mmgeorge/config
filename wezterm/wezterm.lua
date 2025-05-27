@@ -60,7 +60,7 @@ config.window_decorations = "INTEGRATED_BUTTONS|RESIZE"
 
 -- config.use_fancy_tab_bar = false
 config.enable_tab_bar = true
-config.hide_tab_bar_if_only_one_tab = true
+config.hide_tab_bar_if_only_one_tab = false
 config.window_padding = {
   left = 4,
   right = 4,
