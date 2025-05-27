@@ -1,16 +1,16 @@
 -- Pull in the wezterm API
-local wezterm                    = require 'wezterm'
-local action                     = wezterm.action
+local wezterm                       = require 'wezterm'
+local action                        = wezterm.action
 
 -- This will hold the configuration.
-local config                     = wezterm.config_builder()
+local config                        = wezterm.config_builder()
 
-config.default_cwd               = "D:/"
-config.set_environment_variables = {
+config.default_cwd                  = "D:/"
+config.set_environment_variables    = {
   -- HOME = "D:/"
 }
 
-config.default_prog              = {
+config.default_prog                 = {
   "C:/Program Files/PowerShell/7/pwsh.exe",
   "-NoExit",
   "-NoProfile",
@@ -21,8 +21,8 @@ config.default_prog              = {
 -- For example, changing the color scheme:
 -- config.color_scheme = "Catppuccin Mocha"
 -- config.color_scheme = 'Campbell'
-config.font                      = wezterm.font('Cascadia Code NF')
-config.font_rules                = {
+config.font                         = wezterm.font('Cascadia Code NF')
+config.font_rules                   = {
   --   {
   --     intensity = 'Normal',
   --     italic = true,
@@ -44,24 +44,23 @@ config.font_rules                = {
   --   },
 }
 
-config.line_height               = 1.0
-config.cursor_blink_rate         = 0
+config.line_height                  = 1.0
+config.cursor_blink_rate            = 0
 
-config.colors                    = {
-  cursor_fg = 'black',
+config.colors                       = {
   -- cursor_fg = 'red',
+  cursor_fg = 'black',
   cursor_bg = 'white',
   cursor_border = 'white'
 }
 
-
 -- config.window_decorations = "RESIZE"
-config.window_decorations = "INTEGRATED_BUTTONS|RESIZE"
+config.window_decorations           = "INTEGRATED_BUTTONS|RESIZE"
 
 -- config.use_fancy_tab_bar = false
-config.enable_tab_bar = true
+config.enable_tab_bar               = true
 config.hide_tab_bar_if_only_one_tab = false
-config.window_padding = {
+config.window_padding               = {
   left = 4,
   right = 4,
   top = 4,
@@ -73,8 +72,8 @@ config.window_padding = {
 -- brightness = .6,
 -- }
 -- config.integrated_title_buttons = { 'Close' }
-config.leader = { key = 'n', mods = 'CTRL', timeout_milliseconds = 1000 }
-config.keys = {
+config.leader                       = { key = 'n', mods = 'CTRL', timeout_milliseconds = 1000 }
+config.keys                         = {
   -- {
   --   key = 's',
   --   mods = 'LEADER',
@@ -193,7 +192,7 @@ config.keys = {
   },
 }
 
-config.key_tables = {
+config.key_tables                   = {
   copy_mode = {
     -- Navigation
     { key = 'h', mods = 'NONE', action = action.CopyMode 'MoveForwardWordEnd' },
