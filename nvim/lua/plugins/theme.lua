@@ -32,7 +32,7 @@ return {
           -- gray2 = colors.white,
           -- gray3 = colors.white,
           -- gray4 = colors.white,
-          gray5 = colors.light_gray,
+          gray5 = colors.light_gray, -- controls snacks text
           gray6 = colors.white,
           -- gray7 = colors.red,
           -- gray8 = colors.light_gray,
@@ -97,6 +97,9 @@ return {
       vim.api.nvim_set_hl(0, "GitSignsDelete", { fg = colors.red })
       vim.api.nvim_set_hl(0, "GitSignsChange", { fg = colors.yellow })
       vim.api.nvim_set_hl(0, "GitSignsChangedelete", { fg = colors.yellow })
+      vim.api.nvim_set_hl(0, "MiniDiffSignAdd", { fg = colors.green })
+      vim.api.nvim_set_hl(0, "MiniDiffSignDelete", { fg = colors.red })
+      vim.api.nvim_set_hl(0, "MiniDiffSignChange", { fg = colors.yellow })
       vim.api.nvim_set_hl(0, "NeogitDiffAdd", { fg = colors.green })
       vim.api.nvim_set_hl(0, "NeogitDiffDelete", { fg = colors.red })
       vim.api.nvim_set_hl(0, "NeogitDiffChange", { fg = colors.yellow })
@@ -107,6 +110,7 @@ return {
       vim.api.nvim_set_hl(0, "TabLine", { fg = colors.white })
       vim.api.nvim_set_hl(0, "TabLineSel", { fg = colors.black, bg = colors.white })
       vim.api.nvim_set_hl(0, "TabLineFill", { fg = colors.white })
+      vim.api.nvim_set_hl(0, "MatchParen", { fg = colors.black, bg = colors.white })
 
       vim.api.nvim_set_hl(0, "DiagnosticUnderlineError", {
         fg = "red",
