@@ -312,20 +312,4 @@ return {
       })
     end
   },
-
-  -- Log startup status --
-  {
-    "j-hui/fidget.nvim",
-    opts = {
-      -- options
-    },
-  },
-  -- Very cool idea, but visual distracting. Make as a toggle?
-  -- Could toggle, see: <https://github.com/ErichDonGubler/lsp_lines.nvim>
-  -- {
-  --    "https://git.sr.ht/~whynothugo/lsp_lines.nvim",
-  --    config = function()
-  --       require("lsp_lines").setup()
-  --    end,
-  -- }
 }
