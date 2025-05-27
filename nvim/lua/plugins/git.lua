@@ -3,12 +3,10 @@ local key = require("../keys").key
 return {
   {
     'akinsho/git-conflict.nvim',
-    -- tag = "v1.1.2",
     config = function()
       require "git-conflict".setup({
         -- disable buffer local mapping created by this plugin
         default_mappings = false,
-
       })
     end,
   },
@@ -313,12 +311,20 @@ return {
     end
   },
 
-  -- https://github.com/lewis6991/gitsigns.nvim
   {
-    "lewis6991/gitsigns.nvim",
-    lazy = false, -- messes up keybindings
-    config = function()
-      require('gitsigns').setup()
-    end
-  }
+    'echasnovski/mini.diff',
+    version = '*',
+    opts = {
+      view = {
+        signs = { add = '┃', change = '┃', delete = '▁' }
+      }
+    }
+  },
+  -- {
+  --   "lewis6991/gitsigns.nvim",
+  --   lazy = false, -- messes up keybindings
+  --   config = function()
+  --     require('gitsigns').setup()
+  --   end
+  -- }
 }

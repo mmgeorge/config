@@ -48,7 +48,8 @@ config.line_height               = 1.0
 config.cursor_blink_rate         = 0
 
 config.colors                    = {
-  cursor_fg = 'red',
+  cursor_fg = 'black',
+  -- cursor_fg = 'red',
   cursor_bg = 'white',
   cursor_border = 'white'
 }
