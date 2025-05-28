@@ -22,6 +22,10 @@ vim.opt.ignorecase = true
 vim.opt.smartcase = true
 -- vim.o.fileformat = "unix"
 -- vim.opt.shellslash = true
+vim.opt.fillchars = {
+  stl = "-",
+  stlnc = "-",
+}
 
 vim.opt.foldexpr = "nvim_treesitter#foldexpr()"
 vim.o.foldcolumn = '1' -- '0' is not bad

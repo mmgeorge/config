@@ -40,8 +40,11 @@ return {
         options = {
           icons_enabled = true,
           theme = theme,
-          component_separators = { left = '', right = '' },
-          section_separators = { left = '', right = '' },
+          section_separators = { left = '', right = '' },
+          component_separators = '',
+          -- component_separators = { left = '', right = '' },
+          -- component_separators = { left = '', right = '' },
+          -- section_separators = { left = '', right = '' },
           -- component_separators = { left = '', right = ''},
           -- section_separators = { left = '', right = ''},
           disabled_filetypes = {
@@ -112,11 +115,14 @@ return {
         -- },
         winbar = {
           lualine_a = {
-            -- 'filetype'
-
-          },
-          lualine_b = {
+            -- {
+            --   separator = { left = '', right = '' },
+            --   right_padding = 2,
+            --   'mode'
+            -- },
             {
+              separator = { left = '', right = '' },
+              right_padding = 2,
               'filename',
               file_status = true,    -- Displays file status (readonly status, modified status)
               newfile_status = true, -- Display new file status (new file means no write after created)
@@ -135,8 +141,17 @@ return {
                 newfile = '[New]',     -- Text to show for newly created file before first write
               }
             }
+
+          },
+          lualine_b = {
+            {
+              'diagnostics',
+              sections = { 'error', 'warn' }
+            }
+
           },
           lualine_c = {
+            '%='
           },
           lualine_x = {
             {
@@ -149,10 +164,6 @@ return {
               status = nil,       -- List of task statuses to display
               status_not = false, -- When true, invert the status search
             },
-            {
-              'diagnostics',
-              sections = { 'error', 'warn' }
-            }
 
             -- 'encoding',
             -- 'fileformat',
@@ -160,17 +171,19 @@ return {
           },
           lualine_y = {},
           lualine_z = {
-            -- 'branch',
+            {
+              'filetype',
+              separator = { left = '', right = '' },
+              left_padding = 2,
+            }
             -- 'diff',
           }
         },
         inactive_winbar = {
           lualine_a = {
-            -- 'filetype'
-
-          },
-          lualine_b = {
             {
+              separator = { left = '', right = '' },
+              right_padding = 2,
               'filename',
               file_status = true,    -- Displays file status (readonly status, modified status)
               newfile_status = true, -- Display new file status (new file means no write after created)
@@ -189,6 +202,8 @@ return {
                 newfile = '[New]',     -- Text to show for newly created file before first write
               }
             }
+          },
+          lualine_b = {
           },
           lualine_c = {
           },
@@ -214,6 +229,12 @@ return {
           },
           lualine_y = {},
           lualine_z = {
+            {
+              'filetype',
+              separator = { left = '', right = '' },
+              left_padding = 2,
+            }
+
             -- 'branch',
             -- 'diff',
           }
