@@ -86,6 +86,8 @@ return {
       vim.api.nvim_set_hl(0, "@boolean", { fg = colors.teal })
       vim.api.nvim_set_hl(0, "@primitive", { fg = colors.teal })
       vim.api.nvim_set_hl(0, "@number", { fg = colors.teal })
+      vim.api.nvim_set_hl(0, "@type.builtin", { fg = colors.teal })
+      vim.api.nvim_set_hl(0, "@number.float", { fg = colors.teal })
       vim.api.nvim_set_hl(0, "@builtin", { fg = colors.yellow })
       vim.api.nvim_set_hl(0, "@variable.builtin", { fg = colors.yellow })
       vim.api.nvim_set_hl(0, "@module.builtin", { fg = colors.yellow })
