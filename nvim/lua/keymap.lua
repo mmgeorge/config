@@ -41,6 +41,8 @@ vim.api.nvim_command(":unmap a%")
 
 local se = "<cmd>lua require('spider').motion('e')<CR>"
 local sb = "<cmd>lua require('spider').motion('b')<CR>"
+-- local se = "w"
+-- local sb = "b"
 local up = '5<C-U>'
 local down = '5<C-e>'
 local forward = '<C-i>'
