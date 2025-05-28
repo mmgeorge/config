@@ -27,13 +27,21 @@ return {
       end
 
       local theme = {
+        -- normal = getColors(colors.white),
+        -- insert = getColors(colors.green),
+        -- visual = getColors(colors.red),
+        -- command = getColors(colors.yellow),
+        -- replace = getColors(colors.white),
+        -- terminal = getColors(colors.white),
+        -- inactive = getColors(colors.gray),
         normal = getColors(colors.white),
-        insert = getColors(colors.green),
-        visual = getColors(colors.red),
-        command = getColors(colors.yellow),
+        insert = getColors(colors.white),
+        visual = getColors(colors.white),
+        command = getColors(colors.white),
         replace = getColors(colors.white),
         terminal = getColors(colors.white),
         inactive = getColors(colors.gray),
+
       }
 
       require('lualine').setup({
@@ -136,12 +144,20 @@ return {
         --
         extensions = {},
         sections = {
-          lualine_a = { 'mode' },
-          -- lualine_a = {
-          -- },
-          lualine_b = {},
+          -- lualine_a = {},
+          lualine_a = {
+          },
+          lualine_b = {
+            {
+              'mode',
+              cond = function()
+                return vim.api.nvim_get_mode().mode ~= 'n'
+              end
+            }
+
+          },
           lualine_c = {
-            'branch',
+            -- 'branch',
             -- 'diff',
             {
               'diagnostics',

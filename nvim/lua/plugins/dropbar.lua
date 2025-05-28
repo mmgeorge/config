@@ -69,8 +69,8 @@ return {
           return {
             custom_path,
             utils.source.fallback {
-              sources.lsp,
-              sources.treesitter,
+              -- sources.lsp,
+              -- sources.treesitter,
             },
           }
         end,

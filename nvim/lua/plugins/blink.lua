@@ -275,7 +275,8 @@ return {
 
               local out = {}
               for _, item in ipairs(items) do
-                if not is_blocklisted(item) and not should_filter(item.filterText) then
+                if not is_blocklisted(item) then
+                  -- and not should_filter(item.filterText) then
                   -- print(vim.inspect(item))
                   table.insert(out, item)
                 end
