@@ -9,8 +9,9 @@ vim.o.timeoutlen = 1500
 vim.o.ttimeoutlen = 0
 vim.o.guicursor = ""
 vim.o.number = true
-vim.o.laststatus = 0
+vim.o.laststatus = 3
 vim.opt.statuscolumn = "%l %=%s" -- %= means right align
+-- vim.opt.statuscolumn = "%=%l %s" -- %= means right align
 vim.opt.signcolumn = 'yes'
 vim.o.scrolloff = 0
 vim.o.swapfile = false
@@ -22,10 +23,11 @@ vim.opt.ignorecase = true
 vim.opt.smartcase = true
 -- vim.o.fileformat = "unix"
 -- vim.opt.shellslash = true
-vim.opt.fillchars = {
-  stl = "-",
-  stlnc = "-",
-}
+-- vim.opt.fillchars = {
+--   stl = "-",
+--   stlnc = "-",
+-- }
+vim.opt.numberwidth = 1
 
 vim.opt.foldexpr = "nvim_treesitter#foldexpr()"
 vim.o.foldcolumn = '1' -- '0' is not bad
