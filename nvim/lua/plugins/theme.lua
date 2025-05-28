@@ -29,10 +29,11 @@ return {
           lack = colors.white,
           luster = colors.white,
           -- black = "#000000",
-          -- gray1 = "#000000",
-          -- gray2 = colors.white,
-          -- gray3 = colors.white,
-          -- gray4 = colors.white,
+          -- gray1 = colors.gray,
+          gray2 = colors.gray,
+          gray3 = colors.gray,
+          gray4 = colors.gray,
+
           gray5 = colors.light_gray, -- controls snacks text
           gray6 = colors.white,
           -- gray7 = colors.red,
