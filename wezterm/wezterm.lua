@@ -111,7 +111,7 @@ wezterm.on(
 config.window_padding = {
   left = 4,
   right = 4,
-  top = 4,
+  top = 2,
   bottom = 0,
 }
 

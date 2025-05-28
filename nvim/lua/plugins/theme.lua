@@ -19,9 +19,9 @@ return {
     "slugbyte/lackluster.nvim",
     lazy = false,
     priority = 1000,
-    setup = function()
-      -- vim.cmd.colorscheme("lackluster")
-    end,
+    -- setup = function()
+    -- vim.cmd.colorscheme("lackluster")
+    -- end,
     init = function()
       local lackluster = require("lackluster")
       lackluster.setup({
@@ -29,7 +29,7 @@ return {
           lack = colors.white,
           luster = colors.white,
           -- black = "#000000",
-          -- gray1 = colors.gray,
+          gray1 = colors.gray,
           gray2 = colors.gray,
           gray3 = colors.gray,
           gray4 = colors.gray,
@@ -112,6 +112,10 @@ return {
       vim.api.nvim_set_hl(0, "NeogitDiffHeader", { fg = colors.black, bg = colors.light_gray })
       vim.api.nvim_set_hl(0, "NeogitHunkHeader", { fg = colors.black, bg = colors.light_gray })
       vim.api.nvim_set_hl(0, "NeogitActiveItem", { bg = "#303136" })
+      vim.api.nvim_set_hl(0, "BufferLineGroupSeparator", { bg = colors.black })
+      vim.api.nvim_set_hl(0, "StatusLine", { bg = colors.black })
+      vim.api.nvim_set_hl(0, "StatusLineTerm", { bg = colors.black })
+      vim.api.nvim_set_hl(0, "MsgSeparator", { bg = colors.black })
 
       -- Tabline
       vim.api.nvim_set_hl(0, "TabLine", { fg = colors.white })
@@ -126,6 +130,49 @@ return {
       vim.api.nvim_set_hl(0, "MatchParen", { bg = "#303136" })
       vim.api.nvim_set_hl(0, "Visual", { bg = "#303136" })
       vim.api.nvim_set_hl(0, "Substitute", { bg = "#303136" })
+
+      -- Dropbar
+      -- vim.api.nvim_set_hl(0, "DropBarKindDefault", { fg = colors.white })
+      -- vim.api.nvim_set_hl(0, "DropBarMenuHoveSymbol", { fg = colors.white })
+      -- vim.api.nvim_set_hl(0, "DropBarMenuNormalFloat", { fg = colors.white })
+      -- vim.api.nvim_set_hl(0, "DropBarKindFile", { fg = colors.white, bold = false })
+      -- vim.api.nvim_set_hl(0, "DropBarKindFileNC", { fg = colors.white })
+      -- vim.api.nvim_set_hl(0, "DropBarKindFolder", { fg = colors.white })
+      -- vim.api.nvim_set_hl(0, "DropBarKindFolderNC", { fg = colors.white })
+      -- vim.api.nvim_set_hl(0, "DropBarKindSection", { fg = colors.white })
+      -- vim.api.nvim_set_hl(0, "DropBarIconKindFolder", { fg = colors.white })
+      -- vim.api.nvim_set_hl(0, "DropBarMenuCurrentContext", { fg = colors.white })
+
+      vim.api.nvim_set_hl(0, "DropBarFileName", { fg = colors.white, italic = true, bold = false })
+      vim.api.nvim_set_hl(0, "DropBarPath", { fg = colors.white, bold = false })
+
+      vim.api.nvim_create_autocmd('ModeChanged', {
+        callback = function()
+          local new_mode = vim.v.event.new_mode
+          if new_mode == "i" then
+            vim.api.nvim_set_hl(0, "DropBarFileName", { fg = colors.green, italic = true, bold = false })
+            vim.api.nvim_set_hl(0, "DropBarPath", { fg = colors.green, bold = false })
+            vim.api.nvim_set_hl(0, "DropBarIconKindFolder", { fg = colors.green })
+          elseif new_mode == "n" then
+            vim.api.nvim_set_hl(0, "DropBarFileName", { fg = colors.white, italic = true, bold = false })
+            vim.api.nvim_set_hl(0, "DropBarPath", { fg = colors.white, bold = false })
+            vim.api.nvim_set_hl(0, "DropBarIconKindFolder", { fg = colors.white })
+          elseif new_mode == "c" then
+            vim.api.nvim_set_hl(0, "DropBarFileName", { fg = colors.yellow, italic = true, bold = false })
+            vim.api.nvim_set_hl(0, "DropBarPath", { fg = colors.yellow, bold = false })
+            vim.api.nvim_set_hl(0, "DropBarIconKindFolder", { fg = colors.yellow })
+          elseif new_mode == "v" then
+            vim.api.nvim_set_hl(0, "DropBarFileName", { fg = colors.red, italic = true, bold = false })
+            vim.api.nvim_set_hl(0, "DropBarPath", { fg = colors.red, bold = false })
+            vim.api.nvim_set_hl(0, "DropBarIconKindFolder", { fg = colors.red })
+          end
+        end
+      })
+
+
+
+      -- vim.api.nvim_set_hl(0, "DropBarKindFolderNC", { fg = colors.white })
+
 
       -- Diagnostics
       vim.api.nvim_set_hl(0, "DiagnosticUnnecessary", { fg = colors.light_gray, underline = true })
@@ -153,7 +200,8 @@ return {
   --   config = function()
   --     local colors = {
   --       red = "#ef3573",
-  --       -- light_red = "#c3d0e0",
+  --       -- light_red =
+  --       "#c3d0e0",
   --       off_white = "#ccdbed",
   --       green = "#5bff94",
   --       yellow = "#ffe18e",
