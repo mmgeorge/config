@@ -31,7 +31,8 @@ vim.o.foldenable = true
 -- vim.opt.foldmethod = "expr"
 -- vim.opt.nofoldenable = true
 -- vim.cmd('set nofoldenable')
-vim.cmd('set mps +=<:>')           -- Add <> to matchpairs (% command)
+-- vim.opt.showmatch = false
+-- vim.cmd('set mps +=<:>')           -- Add <> to matchpairs (% command)
 
 vim.g.rust_recommended_style = '0' -- Otherwise will override indentation settings
 
@@ -67,14 +68,14 @@ vim.api.nvim_create_autocmd({ 'BufEnter' }, {
   end
 })
 
--- vim.api.nvim_create_autocmd({'FocusGained', 'CursorHold'}, {
---   pattern = '*',
---   callback = function()
---     if vim.bo.modifiable then
---       vim.cmd('checktime')
---     end
---   end
--- })
+vim.api.nvim_create_autocmd({ 'FocusGained', 'CursorHold' }, {
+  pattern = '*',
+  callback = function()
+    if vim.bo.modifiable then
+      vim.cmd('checktime')
+    end
+  end
+})
 
 vim.api.nvim_create_autocmd("FileType", {
   pattern = "slang",

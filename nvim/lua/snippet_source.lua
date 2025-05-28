@@ -33,6 +33,13 @@ local snippets_by_filetype = {
     }),
 
     postfix({
+      trigger = 'once',
+      node = type_node,
+      body = function(text)
+        return "OnceCell<" .. text .. ">"
+      end
+    }),
+    postfix({
       trigger = 'rcl',
       node = type_node,
       body = function(text)
@@ -107,6 +114,13 @@ local snippets_by_filetype = {
       node = type_node,
       body = function(text)
         return "Mutex<" .. text .. ">"
+      end
+    }),
+    postfix({
+      trigger = 'once',
+      node = expr_node,
+      body = function(text)
+        return "OnceCell::new(" .. text .. ")"
       end
     }),
     postfix({

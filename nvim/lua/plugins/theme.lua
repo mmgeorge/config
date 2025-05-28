@@ -6,7 +6,8 @@ local colors = {
   yellow = "#ffe18e",
   gray = "#696969",
   light_gray = "#8a929c",
-  white = "#e9e9e9",
+  -- white = "#e9e9e9",
+  white = "#ffffff",
   light_blue = "#3ec5ff",
   -- light_gray = "#b4b4b4",
   teal = "#9dffe7",
@@ -64,6 +65,8 @@ return {
       vim.cmd.colorscheme("lackluster")
       -- vim.cmd.colorscheme("lackluster-hack") -- my favorite
       -- vim.cmd.colorscheme("lackluster-mint")
+
+      -- Semantic
       vim.api.nvim_set_hl(0, "@tag.tsx", { fg = colors.green })
       vim.api.nvim_set_hl(0, "@tag.attribute", { fg = colors.light_gray })
       vim.api.nvim_set_hl(0, "@comment", { fg = colors.light_gray })
@@ -83,16 +86,17 @@ return {
       vim.api.nvim_set_hl(0, "@primitive", { fg = colors.teal })
       vim.api.nvim_set_hl(0, "@number", { fg = colors.teal })
       vim.api.nvim_set_hl(0, "@builtin", { fg = colors.yellow })
+      vim.api.nvim_set_hl(0, "@variable.builtin", { fg = colors.yellow })
       vim.api.nvim_set_hl(0, "@module.builtin", { fg = colors.yellow })
       vim.api.nvim_set_hl(0, "@module", { fg = colors.white })
       vim.api.nvim_set_hl(0, "@keyword", { fg = colors.yellow })
       vim.api.nvim_set_hl(0, "@function.method.call", { fg = colors.red })
       vim.api.nvim_set_hl(0, "@function.call", { fg = colors.red })
       vim.api.nvim_set_hl(0, "@function", { fg = colors.red })
-      -- vim.api.nvim_set_hl(0, "@constructor", { fg = colors.white })
       vim.api.nvim_set_hl(0, "@decorator", { fg = colors.red })
       vim.api.nvim_set_hl(0, "@function.macro.rust", { fg = colors.red })
-      vim.api.nvim_set_hl(0, "Visual", { bg = "#303136" })
+
+      -- Git
       vim.api.nvim_set_hl(0, "GitSignsAdd", { fg = colors.green })
       vim.api.nvim_set_hl(0, "GitSignsDelete", { fg = colors.red })
       vim.api.nvim_set_hl(0, "GitSignsChange", { fg = colors.yellow })
@@ -107,20 +111,34 @@ return {
       vim.api.nvim_set_hl(0, "NeogitDiffHeader", { fg = colors.black, bg = colors.light_gray })
       vim.api.nvim_set_hl(0, "NeogitHunkHeader", { fg = colors.black, bg = colors.light_gray })
       vim.api.nvim_set_hl(0, "NeogitActiveItem", { bg = "#303136" })
+
+      -- Tabline
       vim.api.nvim_set_hl(0, "TabLine", { fg = colors.white })
       vim.api.nvim_set_hl(0, "TabLineSel", { fg = colors.black, bg = colors.white })
       vim.api.nvim_set_hl(0, "TabLineFill", { fg = colors.white })
-      vim.api.nvim_set_hl(0, "MatchParen", { fg = colors.black, bg = colors.white })
+
+      -- Selection
+      vim.api.nvim_set_hl(0, "SnacksPickerSearch", { bg = "#303136" })
+      vim.api.nvim_set_hl(0, "SnacksPickerPickWinCurrent", { bg = "#303136" })
+      -- vim.api.nvim_set_hl(0, "SnacksPickerPickWin", { bg = "#303136" })
+      -- vim.api.nvim_set_hl(0, "MatchParen", { fg = colors.black, bg = colors.white })
+      vim.api.nvim_set_hl(0, "MatchParen", { bg = "#303136" })
+      vim.api.nvim_set_hl(0, "Visual", { bg = "#303136" })
+      vim.api.nvim_set_hl(0, "Substitute", { bg = "#303136" })
+
+      -- Diagnostics
+      vim.api.nvim_set_hl(0, "DiagnosticUnnecessary", { fg = colors.light_gray, underline = true })
 
       vim.api.nvim_set_hl(0, "DiagnosticUnderlineError", {
         fg = "red",
-        -- undercurl = true,
         underline = true,
+        -- undercurl = true,
       })
+
       vim.api.nvim_set_hl(0, "DiagnosticUnderlineWarn", {
         fg = "yellow",
-        -- undercurl = true,
         underline = true
+        -- undercurl = true,
       })
 
       -- vim.cmd([[highlight DiagnosticUnderlineError cterm=undercurl ctermfg=red gui=undercurl guifg=red]])
