@@ -1,79 +1,135 @@
 -- Pull in the wezterm API
-local wezterm                       = require 'wezterm'
-local action                        = wezterm.action
+local wezterm                               = require 'wezterm'
+local action                                = wezterm.action
 
 -- This will hold the configuration.
-local config                        = wezterm.config_builder()
+local config                                = wezterm.config_builder()
 
-config.default_cwd                  = "D:/"
-config.set_environment_variables    = {
+config.default_cwd                          = "D:/"
+config.set_environment_variables            = {
   -- HOME = "D:/"
 }
 
-config.default_prog                 = {
+config.default_prog                         = {
   "C:/Program Files/PowerShell/7/pwsh.exe",
   "-NoExit",
   "-NoProfile",
   "-File", "D:/config/windows/init.ps1"
 }
 
--- This is where you actually apply your config choices
--- For example, changing the color scheme:
--- config.color_scheme = "Catppuccin Mocha"
--- config.color_scheme = 'Campbell'
-config.font                         = wezterm.font('Cascadia Code NF')
-config.font_rules                   = {
-  --   {
-  --     intensity = 'Normal',
-  --     italic = true,
-  --     font = wezterm.font_with_fallback {
-  --       family = 'Operator Mono SSm Lig',
-  --       weight = 'DemiLight',
-  --       italic = true,
-  --     },
-  --   },
-  -- {
-  --     intensity = 'Half',
-  --     italic = true,
-  --     font = wezterm.font_with_fallback {
-  --       family = 'Cascadia Mono NF',
-  --       intensity = 'Half',
-  --       weight = 'Light',
-  --       italic = true,
-  --     },
-  --   },
-}
+config.font                                 = wezterm.font('Cascadia Code NF')
+config.font_rules                           = {}
 
-config.line_height                  = 1.0
-config.cursor_blink_rate            = 0
+config.line_height                          = 1.0
+config.cursor_blink_rate                    = 0
 
-config.colors                       = {
+config.colors                               = {
   -- cursor_fg = 'red',
   cursor_fg = 'black',
   cursor_bg = 'white',
-  cursor_border = 'white'
+  cursor_border = 'white',
+
+  tab_bar = {
+    background = 'black',
+    active_tab = {
+      bg_color = 'black',
+      fg_color = 'white',
+    },
+    inactive_tab_edge = 'black',
+    inactive_tab = {
+      bg_color = 'black',
+      fg_color = 'gray',
+    },
+    inactive_tab_hover = {
+      bg_color = 'black',
+      fg_color = 'white',
+    },
+    new_tab = {
+      bg_color = 'black',
+      fg_color = 'black',
+    },
+    new_tab_hover = {
+      bg_color = 'black',
+      fg_color = 'black',
+    },
+  },
 }
 
--- config.window_decorations = "RESIZE"
-config.window_decorations           = "INTEGRATED_BUTTONS|RESIZE"
+config.window_decorations                   = "INTEGRATED_BUTTONS|RESIZE"
 
--- config.use_fancy_tab_bar = false
-config.enable_tab_bar               = true
-config.hide_tab_bar_if_only_one_tab = false
-config.window_padding               = {
+config.enable_tab_bar                       = true
+config.hide_tab_bar_if_only_one_tab         = false
+config.tab_and_split_indices_are_zero_based = true
+config.show_tab_index_in_tab_bar            = false
+config.show_new_tab_button_in_tab_bar       = false
+-- nightly only:
+-- config.show_close_tab_button_in_tabs        = false
+
+-- This function returns the suggested title for a tab.
+-- It prefers the title that was set via `tab:set_title()`
+-- or `wezterm cli set-tab-title`, but falls back to the
+-- title of the active pane in that tab.
+function tab_title(tab_info)
+  local title = tab_info.tab_title
+  -- if the tab title is explicitly set, take that
+  if title and #title > 0 then
+    return title
+  end
+  -- Otherwise, use the title from the active pane
+  -- in that tab
+  return tab_info.active_pane.title
+end
+
+wezterm.on(
+  'format-tab-title',
+  function(tab, tabs, panes, config, hover, max_width)
+    local title = tab_title(tab)
+    -- title = wezterm.truncate_right(title, 10)
+    -- if tab.is_active then
+    --   return {
+    --     -- { Background = { Color = 'blue' } },
+    --     { Text = '' .. title .. ' ' },
+    --     -- { Text = '' .. title .. ' ' },
+    --   }
+    -- end
+    -- if tab.is_last_active then
+    --   -- Green color and append '*' to previously active tab.
+    --   return {
+    --     -- { Background = { Color = 'green' } },
+    --     { Text = ' ' .. title .. '' },
+    --   }
+    -- end
+
+    return {
+      -- { Background = { Color = 'green' } },
+      { Text = '' .. title .. '' },
+    }
+  end
+)
+
+
+config.window_padding = {
   left = 4,
   right = 4,
   top = 4,
   bottom = 0,
 }
 
+config.window_frame   = {
+  font = wezterm.font('Cascadia Code NF'),
+  font_size = 10.0,
+  active_titlebar_bg = 'black',
+  inactive_titlebar_bg = 'black',
+}
+
 -- config.inactive_pane_hsb = {
 -- saturation = 1.,
 -- brightness = .6,
 -- }
--- config.integrated_title_buttons = { 'Close' }
-config.leader                       = { key = 'n', mods = 'CTRL', timeout_milliseconds = 1000 }
-config.keys                         = {
+-- config.integrated_title_buttons     = { 'Close' }
+
+config.leader         = { key = 'n', mods = 'CTRL', timeout_milliseconds = 1000 }
+config.keys           = {
   -- {
   --   key = 's',
   --   mods = 'LEADER',
@@ -192,7 +248,7 @@ config.keys                         = {
   },
 }
 
-config.key_tables                   = {
+config.key_tables     = {
   copy_mode = {
     -- Navigation
     { key = 'h', mods = 'NONE', action = action.CopyMode 'MoveForwardWordEnd' },
