@@ -59,7 +59,9 @@ return {
           todo_comments = true,
           trouble = true,
           git_gutter = true,
-          git_signs = true
+          git_signs = true,
+          headlines = true,
+          render_markdown = true,
         }
       })
 
@@ -148,31 +150,31 @@ return {
       vim.api.nvim_set_hl(0, "DropBarFileName", { fg = colors.white, italic = true, bold = false })
       vim.api.nvim_set_hl(0, "DropBarPath", { fg = colors.white, bold = false })
 
-      vim.api.nvim_create_autocmd('ModeChanged', {
-        callback = function()
-          local new_mode = vim.v.event.new_mode
-          if new_mode == "i" then
-            vim.api.nvim_set_hl(0, "DropBarFileName", { fg = colors.green, italic = true, bold = false })
-            vim.api.nvim_set_hl(0, "DropBarPath", { fg = colors.green, bold = false })
-            vim.api.nvim_set_hl(0, "DropBarIconKindFolder", { fg = colors.green })
-          elseif new_mode == "n" then
-            vim.api.nvim_set_hl(0, "DropBarFileName", { fg = colors.white, italic = true, bold = false })
-            vim.api.nvim_set_hl(0, "DropBarPath", { fg = colors.white, bold = false })
-            vim.api.nvim_set_hl(0, "DropBarIconKindFolder", { fg = colors.white })
-          elseif new_mode == "c" then
-            vim.api.nvim_set_hl(0, "DropBarFileName", { fg = colors.yellow, italic = true, bold = false })
-            vim.api.nvim_set_hl(0, "DropBarPath", { fg = colors.yellow, bold = false })
-            vim.api.nvim_set_hl(0, "DropBarIconKindFolder", { fg = colors.yellow })
-          elseif new_mode == "v" then
-            vim.api.nvim_set_hl(0, "DropBarFileName", { fg = colors.red, italic = true, bold = false })
-            vim.api.nvim_set_hl(0, "DropBarPath", { fg = colors.red, bold = false })
-            vim.api.nvim_set_hl(0, "DropBarIconKindFolder", { fg = colors.red })
-          end
-        end
-      })
-
-
-
+      -- vim.api.nvim_create_autocmd('ModeChanged', {
+      --   callback = function()
+      --     local new_mode = vim.v.event.new_mode
+      --     if new_mode == "i" then
+      --       vim.api.nvim_set_hl(0, "DropBarFileName", { fg = colors.green, italic = true, bold = false })
+      --       vim.api.nvim_set_hl(0, "DropBarPath", { fg = colors.green, bold = false })
+      --       vim.api.nvim_set_hl(0, "DropBarIconKindFolder", { fg = colors.green })
+      --     elseif new_mode == "n" then
+      --       vim.api.nvim_set_hl(0, "DropBarFileName", { fg = colors.white, italic = true, bold = false })
+      --       vim.api.nvim_set_hl(0, "DropBarPath", { fg = colors.white, bold = false })
+      --       vim.api.nvim_set_hl(0, "DropBarIconKindFolder", { fg = colors.white })
+      --     elseif new_mode == "c" then
+      --       vim.api.nvim_set_hl(0, "DropBarFileName", { fg = colors.yellow, italic = true, bold = false })
+      --       vim.api.nvim_set_hl(0, "DropBarPath", { fg = colors.yellow, bold = false })
+      --       vim.api.nvim_set_hl(0, "DropBarIconKindFolder", { fg = colors.yellow })
+      --     elseif new_mode == "v" then
+      --       vim.api.nvim_set_hl(0, "DropBarFileName", { fg = colors.red, italic = true, bold = false })
+      --       vim.api.nvim_set_hl(0, "DropBarPath", { fg = colors.red, bold = false })
+      --       vim.api.nvim_set_hl(0, "DropBarIconKindFolder", { fg = colors.red })
+      --     end
+      --   end
+      -- })
+      --
+      --
+      --
       -- vim.api.nvim_set_hl(0, "DropBarKindFolderNC", { fg = colors.white })
 
 
