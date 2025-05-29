@@ -81,7 +81,7 @@ local function deprioritize_common_rust_traits(a, b)
 
     return vim
         .iter({
-          "Clone",
+          -- "Clone",
           "Copy",
           "Deref",
           "DerefMut",
@@ -262,20 +262,24 @@ return {
 
             transform_items = function(ctx, items)
               local function should_filter(label)
-                -- if ctx.bounds.length < 4 and #label >= 8 then
-                --   return true
-                -- end
-                if ctx.bounds.length < 5 and #label >= 18 then
+                if string.find(label, "panic_") or string.find(label, "clone_to_") then
                   return true
                 end
 
+                -- if ctx.bounds.length < 4 and #label >= 8 then
+                --   return true
+                -- end
+                -- if ctx.bounds.length < 5 and #label >= 18 then
+                -- return true
+                -- end
+                --
                 -- return string.sub(label, 1, 2) == "__"
                 return false
               end
 
               local out = {}
               for _, item in ipairs(items) do
-                if not is_blocklisted(item) then
+                if not is_blocklisted(item) and not should_filter(item.filterText) then
                   -- and not should_filter(item.filterText) then
                   -- print(vim.inspect(item))
                   table.insert(out, item)

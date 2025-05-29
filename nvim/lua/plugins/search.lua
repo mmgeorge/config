@@ -1,37 +1,48 @@
 return {
-   {
+  {
     -- "mmgeorge/grug-far.nvim",
     'MagicDuck/grug-far.nvim',
     keys = {
       {
         "<leader>nt",
-        function ()
-          require('grug-far').with_visual_selection() 
+        function()
+          require('grug-far').with_visual_selection()
         end,
         mode = { "n", "x" },
         desc = "Search and replace",
-      }, 
+      },
 
       -- {
       --   "<leader>ns",
       --   function ()
-      --     require('grug-far').with_visual_selection() 
+      --     require('grug-far').with_visual_selection()
       --   end,
       --   mode = { "n", "x" },
       --   desc = "Search and replace",
       -- }
     },
+    init = function()
+      vim.api.nvim_create_user_command(
+        'SearchReplace',
+        function()
+          require('grug-far').with_visual_selection()
+        end,
+        {
+          desc = "Search and replace text"
+        }
+      )
+    end,
     config = function()
       require('grug-far').setup({
-        smartInputHandling = false, 
-        
+        smartInputHandling = false,
+
         -- debounce milliseconds for issuing search while user is typing
         -- prevents excessive searching
         debounceMs = 100,
 
         helpLine = {
-          enabled = false
-        }, 
+          enabled = true
+        },
 
         -- minimum number of chars which will cause a search to happen
         -- prevents performance issues in larger dirs
@@ -185,7 +196,7 @@ return {
           -- whether to show icons
           enabled = false,
         },
-  
+
         previewWindow = {
           border = "rounded"
         },
@@ -253,9 +264,9 @@ return {
         },
       });
     end
-  }, 
+  },
   -- {
-  --   "chrisgrieser/nvim-rip-substitute", 
+  --   "chrisgrieser/nvim-rip-substitute",
   --   -- commit = "*",
   --   -- commit = "b66e7c4",
   --   keys = {
@@ -315,7 +326,7 @@ return {
   --         autoCaptureGroups = false,
   --       },
   --       notificationOnSuccess = true,
-  --     } 
+  --     }
   --   end
   -- }
 }
