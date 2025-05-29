@@ -318,7 +318,7 @@ function query_for(lang)
 end
 
 local function get_tree(bufnr, lang)
-  local parser = vim.treesitter.get_parser(bufnr, lang)
+  local parser = vim.treesitter.get_parser(bufnr, lang, { error = false })
   if not parser then
     vim.notify("Error: No Tree-sitter parser found for language: " .. lang, vim.log.levels.ERROR)
     return
@@ -326,7 +326,7 @@ local function get_tree(bufnr, lang)
 
   -- Parse the current buffer's content. Select the first (and usually only) tree
   -- TODO: Handle multiple trees?
-  local tree = parser:parse()[1]
+  local tree = parser:parse(true)[1]
   if not tree then
     vim.notify("Error: Could not parse the buffer.", vim.log.levels.ERROR)
     return

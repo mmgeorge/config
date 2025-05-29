@@ -8,7 +8,7 @@ return {
       ccc.setup({
         highlighter = {
           auto_enable = true,
-          lsp = true
+          lsp = false
         },
         preserve = true,
         disable_default_mappings = true,
