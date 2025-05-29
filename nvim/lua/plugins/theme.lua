@@ -12,7 +12,8 @@ local colors = {
   -- light_gray = "#b4b4b4",
   teal = "#9dffe7",
   dark_gray = "#151515",
-  black = "#000000"
+  black = "#000000",
+  visual = "#303136",
 }
 
 return {
@@ -122,7 +123,12 @@ return {
       vim.api.nvim_set_hl(0, "NeogitDiffContext", { fg = colors.white })
       vim.api.nvim_set_hl(0, "NeogitDiffHeader", { fg = colors.black, bg = colors.light_gray })
       vim.api.nvim_set_hl(0, "NeogitHunkHeader", { fg = colors.black, bg = colors.light_gray })
-      vim.api.nvim_set_hl(0, "NeogitActiveItem", { bg = "#303136" })
+      vim.api.nvim_set_hl(0, "NeogitActiveItem", { bg = colors.visual })
+      vim.api.nvim_set_hl(0, "NeogitBranch", { fg = colors.yellow })
+      vim.api.nvim_set_hl(0, "NeogitBranchHead", { fg = colors.yellow })
+      vim.api.nvim_set_hl(0, "NeogitRemote", { fg = colors.light_blue })
+      vim.api.nvim_set_hl(0, "NeogitSectionHeader", { fg = colors.white })
+      vim.api.nvim_set_hl(0, "NeogitPopupActionKey", { fg = colors.white })
       vim.api.nvim_set_hl(0, "BufferLineGroupSeparator", { bg = colors.black })
       vim.api.nvim_set_hl(0, "StatusLine", { bg = colors.black })
       vim.api.nvim_set_hl(0, "StatusLineTerm", { bg = colors.black })
@@ -146,13 +152,13 @@ return {
       vim.api.nvim_set_hl(0, "TabLineFill", { fg = colors.white })
 
       -- Selection
-      vim.api.nvim_set_hl(0, "SnacksPickerSearch", { bg = "#303136" })
-      vim.api.nvim_set_hl(0, "SnacksPickerPickWinCurrent", { bg = "#303136" })
-      -- vim.api.nvim_set_hl(0, "SnacksPickerPickWin", { bg = "#303136" })
+      vim.api.nvim_set_hl(0, "SnacksPickerSearch", { bg = colors.visual })
+      vim.api.nvim_set_hl(0, "SnacksPickerPickWinCurrent", { bg = colors.visual })
+      -- vim.api.nvim_set_hl(0, "SnacksPickerPickWin", { bg = colors.visual })
       -- vim.api.nvim_set_hl(0, "MatchParen", { fg = colors.black, bg = colors.white })
-      vim.api.nvim_set_hl(0, "MatchParen", { bg = "#303136" })
-      vim.api.nvim_set_hl(0, "Visual", { bg = "#303136" })
-      vim.api.nvim_set_hl(0, "Substitute", { bg = "#303136" })
+      vim.api.nvim_set_hl(0, "MatchParen", { bg = colors.visual })
+      vim.api.nvim_set_hl(0, "Visual", { bg = colors.visual })
+      vim.api.nvim_set_hl(0, "Substitute", { bg = colors.visual })
 
       -- Dropbar
       -- vim.api.nvim_set_hl(0, "DropBarKindDefault", { fg = colors.white })
