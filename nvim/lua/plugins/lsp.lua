@@ -193,6 +193,13 @@ return {
       'yioneko/nvim-vtsls'
     },
     config = function()
+      -- vim.diagnostic.config({
+      --   virtual_text = {
+      --     prefix = '●', -- Could be '●', '▎', 'x', '■', , 
+      --   },
+      --   -- float = { border = border },
+      -- })
+      --
       local capabilities = require('blink.cmp').get_lsp_capabilities()
 
       -- Disable semantic tokens

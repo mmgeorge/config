@@ -220,7 +220,17 @@ function source:get_completions(ctx, callback)
   local items = {}
 
   -- WARN: This can be slow!
-  vim.treesitter.get_parser(bufnr):parse(true)
+  -- We need to do this to ensure that TS is up to date (completion will be off otherwise)
+  -- Can OPT by passing a range?
+  local parser = vim.treesitter.get_parser(bufnr, nil, { error = false })
+  if not parser then
+    callback({
+      items = items,
+      is_incomplete_backward = false,
+      is_incomplete_forward = false,
+    })
+  end
+  parser:parse(true)
 
   local insert_item = function(snippet)
     local executed = snippet.execute();

@@ -227,7 +227,6 @@ end)
 -- k.keymap('n', 'ot', '<CMD>Glance type_definitions<CR>')
 
 k.keymap({ 'n', 'x' }, 'ou', function() vim.diagnostic.open_float(nil, { focus = false }) end)
-
 k.keymap('n', 'ou', vim.lsp.buf.hover)
 k.keymap('n', 'oe', function()
   vim.diagnostic.open_float(0)

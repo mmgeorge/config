@@ -11,6 +11,7 @@ local colors = {
   light_blue = "#3ec5ff",
   -- light_gray = "#b4b4b4",
   teal = "#9dffe7",
+  dark_gray = "#151515",
   black = "#000000"
 }
 
@@ -42,8 +43,8 @@ return {
         },
         tweak_background = {
           normal = 'none',
-          menu = 'none',  -- nvim_cmp, wildmenu ... (bad idea to transparent)
-          popup = 'none', -- lazy, mason, whichkey ... (bad idea to transparent)
+          menu = colors.black,  -- nvim_cmp, wildmenu ... (bad idea to transparent)
+          popup = colors.black, -- lazy, mason, whichkey ... (bad idea to transparent)
         },
         tweak_syntax = {
           string = colors.light_blue,
@@ -62,6 +63,8 @@ return {
           git_signs = true,
           headlines = true,
           render_markdown = true,
+          cmp = true,
+          bufferline = true
         }
       })
 
@@ -70,8 +73,7 @@ return {
       -- vim.cmd.colorscheme("lackluster-mint")
 
       -- Semantic
-      vim.api.nvim_set_hl(0, "@tag.tsx", { fg = colors.green })
-      vim.api.nvim_set_hl(0, "@tag.attribute", { fg = colors.light_gray })
+      vim.api.nvim_set_hl(0, "@tag.attribute", { fg = colors.white })
       vim.api.nvim_set_hl(0, "@comment", { fg = colors.light_gray })
       vim.api.nvim_set_hl(0, "@parameter", { fg = colors.white })
       vim.api.nvim_set_hl(0, "@constant", { fg = colors.white })
@@ -81,13 +83,18 @@ return {
       vim.api.nvim_set_hl(0, "@property", { fg = colors.red })
       vim.api.nvim_set_hl(0, "@include", { fg = colors.yellow })
       vim.api.nvim_set_hl(0, "@conditional", { fg = colors.yellow })
-      -- vim.api.nvim_set_hl(0, "@constructor", { fg = colors.red })
+      vim.api.nvim_set_hl(0, "@constructor", { fg = colors.red })
+      vim.api.nvim_set_hl(0, "@constructor.lua", { fg = colors.white })
       vim.api.nvim_set_hl(0, "@lsp.type.enumMember", { fg = colors.green })
       vim.api.nvim_set_hl(0, "@lsp.mod.declaration", { fg = colors.red })
       vim.api.nvim_set_hl(0, "@declaration", { fg = colors.red })
       vim.api.nvim_set_hl(0, "@boolean", { fg = colors.teal })
       vim.api.nvim_set_hl(0, "@primitive", { fg = colors.teal })
       vim.api.nvim_set_hl(0, "@number", { fg = colors.teal })
+      vim.api.nvim_set_hl(0, "@tag", { fg = colors.white })
+      vim.api.nvim_set_hl(0, "@tag.delimiter", { fg = colors.white })
+      vim.api.nvim_set_hl(0, "@tag.builtin.tsx", { fg = colors.green })
+      vim.api.nvim_set_hl(0, "@tag.tsx", { fg = colors.green })
       vim.api.nvim_set_hl(0, "@type.builtin", { fg = colors.teal })
       vim.api.nvim_set_hl(0, "@number.float", { fg = colors.teal })
       vim.api.nvim_set_hl(0, "@builtin", { fg = colors.yellow })
@@ -120,6 +127,18 @@ return {
       vim.api.nvim_set_hl(0, "StatusLine", { bg = colors.black })
       vim.api.nvim_set_hl(0, "StatusLineTerm", { bg = colors.black })
       vim.api.nvim_set_hl(0, "MsgSeparator", { bg = colors.black })
+
+      -- Backgrounds
+      vim.api.nvim_set_hl(0, "BufferLineBackground", { bg = "none" })
+      -- vim.api.nvim_set_hl(0, "RenderMarkdownInlineHighlight", { bg = colors.dark_gray })
+      -- vim.api.nvim_set_hl(0, "RenderMarkdownCodeInline", { bg = colors.dark_gray })
+      -- vim.api.nvim_set_hl(0, "RenderMarkdownCode", { bg = colors.dark_gray })
+      -- vim.api.nvim_set_hl(0, "RenderMarkdownCodeBorder", { bg = colors.dark_gray })
+      vim.api.nvim_set_hl(0, "RenderMarkdownInlineHighlight", { bg = colors.black })
+      vim.api.nvim_set_hl(0, "RenderMarkdownCodeInline", { bg = colors.black })
+      vim.api.nvim_set_hl(0, "RenderMarkdownCode", { bg = colors.black })
+      vim.api.nvim_set_hl(0, "RenderMarkdownCodeBorder", { bg = colors.black })
+
 
       -- Tabline
       vim.api.nvim_set_hl(0, "TabLine", { fg = colors.white })

@@ -233,7 +233,9 @@ return {
           show_with_menu = true
         },
         menu = {
+          border = "none",
           draw = {
+            -- treesitter = { 'lsp' },
             columns = {
               { "kind_icon" }, { "label", "label_description", gap = 1 },
               -- { "kind_icon", "label", "label_description", gap = 1 },
