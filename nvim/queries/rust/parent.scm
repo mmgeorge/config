@@ -14,6 +14,9 @@
 (macro_invocation
   macro: (identifier) @jump)
 
+(use_declaration
+  argument: (scoped_use_list) @jump)
+
 (parenthesized_expression) @jump
 
 (expression_statement) @list ; functionally we need the skipping logic
@@ -21,6 +24,8 @@
 (field_initializer_list) @list
 
 (field_declaration_list) @list
+
+(use_list) @list
 
 (token_tree) @list
 

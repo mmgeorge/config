@@ -75,6 +75,20 @@ local snippets_by_filetype = {
       end
     }),
     postfix({
+      trigger = 'ref',
+      node = type_node,
+      body = function(text)
+        return "Ref<" .. text .. ">"
+      end
+    }),
+    postfix({
+      trigger = 'ref',
+      node = expr_node,
+      body = function(text)
+        return "Ref::map(" .. text .. ", |x| $1)"
+      end
+    }),
+    postfix({
       trigger = 'arc',
       node = type_node,
       body = function(text)
@@ -230,39 +244,41 @@ function source:get_completions(ctx, callback)
       is_incomplete_forward = false,
     })
   end
-  parser:parse(true)
 
-  local insert_item = function(snippet)
-    local executed = snippet.execute();
-    if executed ~= nil then
-      ---@type lsp.CompletionItem
-      local item = {
-        word = snippet.trigger,
-        label = snippet.trigger,
-        kind = vim.lsp.protocol.CompletionItemKind.Snippet,
-        insertText = executed.body,
-        insertTextFormat = vim.lsp.protocol.InsertTextFormat.Snippet,
-        clear_region = executed.clear_region
-      }
-      table.insert(items, item)
+  -- Passing as a callback makes parsing async
+  parser:parse(true, function()
+    local insert_item = function(snippet)
+      local executed = snippet.execute();
+      if executed ~= nil then
+        ---@type lsp.CompletionItem
+        local item = {
+          word = snippet.trigger,
+          label = snippet.trigger,
+          kind = vim.lsp.protocol.CompletionItemKind.Snippet,
+          insertText = executed.body,
+          insertTextFormat = vim.lsp.protocol.InsertTextFormat.Snippet,
+          clear_region = executed.clear_region
+        }
+        table.insert(items, item)
+      end
     end
-  end
 
-  vim.tbl_map(insert_item, get_snippets())
+    vim.tbl_map(insert_item, get_snippets())
 
-  callback({
-    items = items,
-    -- Whether blink.cmp should request items when deleting characters
-    -- from the keyword (i.e. "foo|" -> "fo|")
-    -- Note that any non-alphanumeric characters will always request
-    -- new items (excluding `-` and `_`)
-    is_incomplete_backward = false,
-    -- Whether blink.cmp should request items when adding characters
-    -- to the keyword (i.e. "fo|" -> "foo|")
-    -- Note that any non-alphanumeric characters will always request
-    -- new items (excluding `-` and `_`)
-    is_incomplete_forward = false,
-  })
+    callback({
+      items = items,
+      -- Whether blink.cmp should request items when deleting characters
+      -- from the keyword (i.e. "foo|" -> "fo|")
+      -- Note that any non-alphanumeric characters will always request
+      -- new items (excluding `-` and `_`)
+      is_incomplete_backward = false,
+      -- Whether blink.cmp should request items when adding characters
+      -- to the keyword (i.e. "fo|" -> "foo|")
+      -- Note that any non-alphanumeric characters will always request
+      -- new items (excluding `-` and `_`)
+      is_incomplete_forward = false,
+    })
+  end)
 end
 
 -- Called immediately after applying the item's textEdit/insertText

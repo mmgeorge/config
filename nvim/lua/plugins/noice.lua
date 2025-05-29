@@ -70,7 +70,10 @@ return {
       lsp = {
         progress = {
           enabled = false
-        }
+        },
+        signature = {
+          enabled = false
+        },
       }
 
     },
