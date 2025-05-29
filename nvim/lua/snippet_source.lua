@@ -218,6 +218,10 @@ function source:get_trigger_characters() return { '.' } end
 function source:get_completions(ctx, callback)
   local bufnr = vim.api.nvim_get_current_buf()
   local items = {}
+
+  -- WARN: This can be slow!
+  vim.treesitter.get_parser(bufnr):parse(true)
+
   local insert_item = function(snippet)
     local executed = snippet.execute();
     if executed ~= nil then
