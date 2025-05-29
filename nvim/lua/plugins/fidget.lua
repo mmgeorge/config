@@ -5,7 +5,7 @@ return {
       notification = {
         override_vim_notify = true,
         window = {
-          max_width = 50,
+          -- max_width = 50,
         }
 
       }

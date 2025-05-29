@@ -64,14 +64,14 @@ return {
   --         -- }
   --         multilines = {
   --           -- Enable multiline diagnostic messages
-  --           enabled = none,
+  --           enabled = true,
   --
   --           -- Always show messages on all lines for multiline diagnostics
   --           always_show = true,
   --         },
   --
   --         -- Display all diagnostic messages on the cursor line
-  --         show_all_diags_on_cursorline = false,
+  --         show_all_diags_on_cursorline = true,
   --
   --         -- Enable diagnostics in Insert mode
   --         -- If enabled, it is better to set the `throttle` option to 0 to avoid visual artifacts
@@ -86,7 +86,7 @@ return {
   --           -- "wrap" - Split long messages into multiple lines
   --           -- "none" - Do not truncate messages
   --           -- "oneline" - Keep the message on a single line, even if it's long
-  --           mode = "oneline",
+  --           mode = "wrap",
   --
   --           -- Trigger wrapping to occur this many characters earlier when mode == "wrap".
   --           -- Increase this value appropriately if you notice that the last few characters
@@ -97,7 +97,7 @@ return {
   --         -- Configuration for breaking long messages into separate lines
   --         break_line = {
   --           -- Enable the feature to break messages after a specific length
-  --           enabled = false,
+  --           enabled = true,
   --
   --           -- Number of characters after which to break the line
   --           after = 30,
@@ -193,13 +193,13 @@ return {
       'yioneko/nvim-vtsls'
     },
     config = function()
-      -- vim.diagnostic.config({
-      --   virtual_text = {
-      --     prefix = '●', -- Could be '●', '▎', 'x', '■', , 
-      --   },
-      --   -- float = { border = border },
-      -- })
-      --
+      vim.diagnostic.config({
+        virtual_text = {
+          prefix = '●', -- Could be '●', '▎', 'x', '■', , 
+        },
+        -- float = { border = border },
+      })
+
       local capabilities = require('blink.cmp').get_lsp_capabilities()
 
       -- Disable semantic tokens
@@ -298,6 +298,9 @@ return {
       --     },
       --     typescript = {
       --       suggest = {
+      --         objectLiteralMethodSnippets = {
+      --           enabled = false
+      --         },
       --         -- This can slow things down
       --         autoImports = true
       --       },
@@ -325,44 +328,41 @@ return {
       --     }
       --   }
       -- })
+      -- vim.lsp.enable("vtsls", true)
 
 
       -- vim.lsp.config('ts_ls', {
       --   capabilities = capabilities,
-      --   -- on_attach = function (client, buf)
-      --   --   client.server_capabilities.semanticTokensProvider = nil
-      --   -- end,
-      --   -- root_markers = { '.git' },
       --   root_markers = { 'tsconfig.json' },
-      --   settings = {
-      --     typescript = {
-      --       suggest = {
-      --         -- This can slow things down
-      --         autoImports = true
-      --       },
-      --       tsserver = {
-      --         -- enableTracing = true,
-      --         -- log = "verbose",
-      --         -- useSyntaxServer = "never",
-      --         -- To use a memory limit greater than 4 GB, use `#typescript.tsserver.nodePath#
-      --         maxTsServerMemory = 3072,
-      --         experimental = {
-      --           enableProjectDiagnostics = false
-      --         }
-      --       },
-      --       preferences = {
-      --         includeCompletionsForModuleExports = true,
-      --         autoImportSpecifierExcludeRegexes = {
-      --           "node_modules/lucide-solid",
-      --           "lucide-solid$",
-      --           "lucide-solid/icons/index",
-      --           "solid-js/types",
-      --           "solid-js/web/types",
-      --           "solid-js/store/types/server",
-      --         }
-      --       }
-      --     }
-      --   }
+      --   -- settings = {
+      --   --   typescript = {
+      --   --     -- suggest = {
+      --   --     --   -- This can slow things down
+      --   --     --   autoImports = true
+      --   --     -- },
+      --   --     -- tsserver = {
+      --   --     --   -- enableTracing = true,
+      --   --     --   -- log = "verbose",
+      --   --     --   -- useSyntaxServer = "never",
+      --   --     --   -- To use a memory limit greater than 4 GB, use `#typescript.tsserver.nodePath#
+      --   --     --   maxTsServerMemory = 3072,
+      --   --     --   experimental = {
+      --   --     --     enableProjectDiagnostics = false
+      --   --     --   }
+      --   --     -- },
+      --   --     preferences = {
+      --   --       includeCompletionsForModuleExports = true,
+      --   --       autoImportSpecifierExcludeRegexes = {
+      --   --         "node_modules/lucide-solid",
+      --   --         "lucide-solid$",
+      --   --         "lucide-solid/icons/index",
+      --   --         "solid-js/types",
+      --   --         "solid-js/web/types",
+      --   --         "solid-js/store/types/server",
+      --   --       }
+      --   --     }
+      --   --   }
+      --   -- }
       -- })
       -- vim.lsp.enable("ts_ls")
 
