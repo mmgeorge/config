@@ -256,10 +256,28 @@ vim.api.nvim_command(":tnoremap <ESC> <C-\\><C-n>")
 
 k.keymap('n', '<C-_>', '<Plug>(comment_toggle_linewise_current)j') -- Comment line, maps to C-/
 
-k.keymap('n', '<C-e>', function() vim.diagnostic.goto_next() end)
+k.keymap('n', '<C-e>',
+  function()
+    vim.diagnostic.jump({
+      count = 1,
+      severity = {
+        -- vim.diagnostic.severity.WARN,
+        vim.diagnostic.severity.ERROR,
+      },
+      wrap = true
+    })
+  end)
+
 -- k.keymap('n', '<C-q>', '<CMD>x<CR>')
 vim.keymap.set({ 'n' }, '<C-w>', '<CMD>qa!<CR>')
-k.keymap('n', '<S-C-e>', function() vim.diagnostic.goto_prev() end)
+-- k.keymap('n', '<S-C-e>', function()
+--   vim.diagnostic.goto_prev({
+--     severity = {
+--       vim.diagnostic.severity.WARN,
+--       vim.diagnostic.severity.ERROR,
+--     },
+--   })
+-- end)
 k.keymap('n', '<C-s>', '<CMD>w<CR>')  -- Save file
 k.keymap('i', '<C-s>', '<C-o>:w<CR>') -- Save file
 
