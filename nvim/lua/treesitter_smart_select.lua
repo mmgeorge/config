@@ -114,21 +114,31 @@ end
 
 local augroup_name = "ClearCursorStackOnVisualLeave"
 vim.api.nvim_create_augroup(augroup_name, { clear = true })
+vim.api.nvim_create_autocmd("ModeChanged", {
+  group = augroup_name,
+  pattern = "v:*",
+  desc = "Clear global cursor_stack and remove self on leaving visual mode.",
+  callback = function(args)
+    selected_nodes = {}
+    cursor_stack = {}
+  end,
+  -- once = true, -- Ensure it triggers only once
+})
 
---- Create an autocommand to clear global 'cursor_stack' on Visual mode exit, only once.
-local function setup_visual_exit_autocmd()
-  vim.api.nvim_create_autocmd("ModeChanged", {
-    group = augroup_name,
-    pattern = "v:*",
-    desc = "Clear global cursor_stack and remove self on leaving visual mode.",
-    callback = function(args)
-      selected_nodes = {}
-      cursor_stack = {}
-    end,
-    once = true, -- Ensure it triggers only once
-  })
-end
-
+-- --- Create an autocommand to clear global 'cursor_stack' on Visual mode exit, only once.
+-- local function setup_visual_exit_autocmd()
+--   vim.api.nvim_create_autocmd("ModeChanged", {
+--     group = augroup_name,
+--     pattern = "v:*",
+--     desc = "Clear global cursor_stack and remove self on leaving visual mode.",
+--     callback = function(args)
+--       selected_nodes = {}
+--       cursor_stack = {}
+--     end,
+--     once = true, -- Ensure it triggers only once
+--   })
+-- end
+--
 local function get_selection_start(lines, node, is_list_arg)
   local start_row, start_col = node:range()
   local line = lines[start_row + 1]
@@ -326,9 +336,15 @@ local function get_tree(bufnr, lang)
 
   -- Parse the current buffer's content. Select the first (and usually only) tree
   -- TODO: Handle multiple trees?
-  local tree = parser:parse(true)[1]
+  local trees = parser:parse(true)
+  local tree = trees[1]
   if not tree then
     vim.notify("Error: Could not parse the buffer.", vim.log.levels.ERROR)
+    return
+  end
+
+  if #trees ~= 1 then
+    vim.notify("Error: Unexpected tree count", vim.log.levels.ERROR)
     return
   end
 
@@ -431,7 +447,7 @@ end
 -- This function assumes you have a query file named 'parent.scm'
 -- (e.g., queries/rust/parent.scm) that defines what a "parent" node is.
 function select_parent()
-  setup_visual_exit_autocmd()
+  -- setup_visual_exit_autocmd()
 
   local bufnr = vim.api.nvim_get_current_buf()
   local ftype = vim.bo[bufnr].filetype
@@ -495,7 +511,7 @@ function try_select_node(node, query, tree, bufnr)
     return false
   elseif matches_in_parent(query, "jump", node, parent, bufnr) then
     return false
-  elseif matches(query, "outer_only", node, bufnr) and matches_parent(query, "outer_only", node, bufnr) then
+  elseif matches(query, "outer_only", node, bufnr) and parent:type() == node:type() then
     return false
   elseif matches(query, "elseif", node, bufnr) then
     local end_node = match_get(query, "end", node, bufnr)
