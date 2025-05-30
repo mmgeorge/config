@@ -35,6 +35,21 @@ return {
       "rcarriga/nvim-notify",
     },
     opts = {
+      routes = {
+        -- Redirect all messages as we display them in status line
+        {
+          filter = { event = "msg_show" },
+          -- filter = { event = "msg_show", kind = "search_count" },
+          opts = { skip = true },
+        },
+      },
+      format = {
+        -- default = { "{level} ", "{title} ", "{message}" }
+        default = { "{message}" }
+      },
+      views = {
+
+      },
       presets = {
         bottom_search = true, -- use a classic bottom cmdline for search
         command_palette = true,
@@ -62,7 +77,9 @@ return {
         enabled = false,
       },
       messages = {
-        enabled = true
+        -- We filter all messages (see above) and display them in lualine
+        enabled = true,
+        -- view = "mini",
       },
       notify = {
         enabled = false

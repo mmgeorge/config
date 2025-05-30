@@ -81,7 +81,10 @@ return {
               or vim.fn.win_gettype(win) ~= ''
               or vim.wo[win].winbar ~= ''
               or vim.bo[buf].ft == 'help'
-              or vim.bo[buf].ft == 'snacks_layout_box'
+              -- or vim.bo[buf].ft == 'snacks_layout_box'
+              -- or vim.bo[buf].ft == 'snacks_picker_list'
+              -- or vim.bo[buf].ft == 'snacks_picker_input'
+              or vim.bo[buf].ft:find('snacks')
               or vim.bo[buf].ft == 'NeogitStatus'
           then
             return false

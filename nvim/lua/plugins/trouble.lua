@@ -5,19 +5,19 @@ return {
     -- branch = "dev",
     keys = {
       {
-        "ge", 
-        '<CMD>Trouble diagnostics toggle filter.severity=vim.diagnostic.severity.ERROR focus=true <CR>', 
+        "ge",
+        '<CMD>Trouble diagnostics toggle filter.severity=vim.diagnostic.severity.ERROR focus=true <CR>',
         mode = { 'n' }
       },
       {
-        "gd", 
-        -- '<CMD>Trouble diagnostics toggle focus=true filter.buf=0 <CR>', 
-        '<CMD>Trouble diagnostics toggle focus=true<CR>', 
+        "gd",
+        -- '<CMD>Trouble diagnostics toggle focus=true filter.buf=0 <CR>',
+        '<CMD>Trouble diagnostics toggle focus=true<CR>',
         mode = { 'n' }
       },
       {
-        "gq", 
-        '<CMD>Trouble quickfix toggle focus=true <CR>', 
+        "gq",
+        '<CMD>Trouble quickfix toggle focus=true <CR>',
         mode = { 'n' }
       }
     },
@@ -32,24 +32,26 @@ return {
     --         end)
     --       end
     --     end,
-    --   }) 
+    --   })
     -- end,
     opts = {
       -- warn_no_results = false,
       -- open_no_results = true,
-      auto_close = false, -- auto close when there are no items
+      auto_close = false,   -- auto close when there are no items
       -- auto_open = true, -- auto open when there are items
-      auto_preview = true, -- automatically open preview when on an item
-      auto_refresh = true, -- auto refresh when open
-      focus = true, -- Focus the window when opened
-      restore = true, -- restores the last location in the list when opening
-      follow = true, -- Follow the current item
+      auto_preview = true,  -- automatically open preview when on an item
+      auto_refresh = true,  -- auto refresh when open
+      focus = true,         -- Focus the window when opened
+      restore = true,       -- restores the last location in the list when opening
+      follow = true,        -- Follow the current item
       indent_guides = true, -- show indent guides
-      max_items = 200, -- limit number of items that can be displayed per section
-      multiline = false, -- render multi-line messages
-      pinned = false, -- When pinned, the opened trouble window will be bound to the current buffer
+      max_items = 200,      -- limit number of items that can be displayed per section
+      multiline = false,    -- render multi-line messages
+      pinned = false,       -- When pinned, the opened trouble window will be bound to the current buffer
       ---@type trouble.Window.opts
-      win = {}, -- window options for the results window. Can be a split or a floating window.
+      win = {},             -- window options for the results window. Can be a split or a floating window.
+      warn_no_results = false,
+      open_no_results = false,
       -- Window options for the preview window. Can be a split, floating window,
       -- or `main` to show the preview in the main editor window.
       ---@type trouble.Window.opts
@@ -57,10 +59,10 @@ return {
       -- Throttle/Debounce settings. Should usually not be changed.
       ---@type table<string, number|{ms:number, debounce?:boolean}>
       throttle = {
-        refresh = 20, -- fetches new data when needed
-        update = 10, -- updates the window
-        render = 10, -- renders the window
-        follow = 10, -- follows the current item
+        refresh = 20,                            -- fetches new data when needed
+        update = 10,                             -- updates the window
+        render = 10,                             -- renders the window
+        follow = 10,                             -- follows the current item
         preview = { ms = 100, debounce = true }, -- shows the preview for the current item
       },
       -- Key mappings can be set to the name of a builtin action,
@@ -70,9 +72,10 @@ return {
         ["?"] = "help",
         r = "refresh",
         R = "toggle_refresh",
-        q = "close",
+        -- q = "close",
         o = "jump_close",
-        ["<esc>"] = "cancel",
+        -- ["<esc>"] = "cancel",
+        ["<esc>"] = "close",
         ["<cr>"] = "jump",
         ["<2-leftmouse>"] = "jump",
         -- ["<c-s>"] = "jump_split",
@@ -155,6 +158,6 @@ return {
           },
         },
       },
-    } 
+    }
   }
 }

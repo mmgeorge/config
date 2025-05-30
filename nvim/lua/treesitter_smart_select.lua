@@ -480,6 +480,7 @@ function select_parent()
 end
 
 function try_select_node(node, query, tree, bufnr)
+  print("try_select", node:type());
   local parent = node:parent();
   if not parent then
     -- At root
@@ -532,7 +533,7 @@ function select_region(node, start_row, start_col, end_row, end_col)
   end
 
   table.insert(selected_nodes, node)
-  print(node:type())
+  print("select", node:type())
 
   vim.api.nvim_buf_set_mark(0, '<', start_row + 1, start_col, {})
   vim.api.nvim_buf_set_mark(0, '>', end_row + 1, end_col, {})

@@ -153,8 +153,12 @@ return {
               cond = function()
                 return vim.api.nvim_get_mode().mode ~= 'n'
               end
+            },
+            {
+              require("noice").api.status.message.get,
+              -- require("noice").api.status.message.get_hl,
+              cond = require("noice").api.status.message.has,
             }
-
           },
           lualine_c = {
             -- 'branch',

@@ -33,7 +33,7 @@ local autosnippets = {
   --         },
   {
     trigger = "todo: ",
-    body = "TODO "
+    body = "TODO: "
   },
   {
     trigger = "perf: ",

@@ -327,8 +327,13 @@ end
 
 -- Type postfix snippet
 M.type_node = function()
+  local pos = M.get_position_before_postfix()
+  if not pos then
+    return nil
+  end
+
   local node = vim.treesitter.get_node({
-    pos = M.get_position_before_postfix()
+    pos = pos
   })
 
   local function is_type(ty)
@@ -365,8 +370,13 @@ end
 
 -- Expression postfix snippet
 M.expr_node = function()
+  local pos = M.get_position_before_postfix()
+  if not pos then
+    return nil
+  end
+
   local node = vim.treesitter.get_node({
-    pos = M.get_position_before_postfix()
+    pos = pos
   })
 
   while node do
@@ -380,7 +390,6 @@ M.expr_node = function()
         ty == "integer_literal" or
         ty == "string_literal" or
         ty == "float_literal" then
-      return node
     end
 
     node = node:parent()
