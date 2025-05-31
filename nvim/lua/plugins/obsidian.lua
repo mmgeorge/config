@@ -22,6 +22,7 @@ return {
     ---@type obsidian.config.ClientOpts
     opts = {
       completion = {
+        nvim_cmp = false,
         blink = true
       },
       workspaces = {
