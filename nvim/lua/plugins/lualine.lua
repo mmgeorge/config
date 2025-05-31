@@ -1,3 +1,6 @@
+local last_message = nil
+local last_message_start = nil
+
 return {
   {
     'nvim-lualine/lualine.nvim',
@@ -162,6 +165,15 @@ return {
                 if newline then
                   return ""
                 end
+
+                if message ~= last_message then
+                  last_message = message
+                  last_message_start = vim.loop.now()
+                elseif (vim.loop.now() - last_message_start > 2000) then
+                  return ""
+                end
+
+
 
                 return message
                 -- local message_len = #message
