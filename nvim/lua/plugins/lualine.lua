@@ -169,6 +169,8 @@ return {
                 if message ~= last_message then
                   last_message = message
                   last_message_start = vim.loop.now()
+                elseif message:find("git") and (vim.loop.now() - last_message_start > 100) then
+                  return ""
                 elseif (vim.loop.now() - last_message_start > 2000) then
                   return ""
                 end
