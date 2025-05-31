@@ -169,6 +169,7 @@ return {
                 if message ~= last_message then
                   last_message = message
                   last_message_start = vim.loop.now()
+                  -- Neogit plays an animated message that should be killed as soon as it ends
                 elseif message:find("git") and (vim.loop.now() - last_message_start > 100) then
                   return ""
                 elseif (vim.loop.now() - last_message_start > 2000) then
