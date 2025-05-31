@@ -197,7 +197,7 @@ return {
         virtual_text = {
           prefix = '●', -- Could be '●', '▎', 'x', '■', , 
         },
-        -- float = { border = border },
+        float = { border = "single" },
       })
 
       local capabilities = require('blink.cmp').get_lsp_capabilities()
