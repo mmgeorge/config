@@ -264,6 +264,10 @@ return {
 
             transform_items = function(ctx, items)
               local function should_filter(label)
+                if not label then
+                  return false;
+                end
+
                 if string.find(label, "panic_") or string.find(label, "clone_to_") then
                   return true
                 end

@@ -319,6 +319,7 @@ M.get_position_before_postfix = function()
   local dot_position = line:find("%.")
 
   if dot_position then
+    -- return { row, dot_position - 1 } -- Before dot + 1 based index
     return { row, dot_position - 2 } -- Before dot + 1 based index
   end
 
@@ -381,8 +382,7 @@ M.expr_node = function()
 
   while node do
     local ty = node:type()
-    if
-        ty == "identifer" or
+    if ty == "identifier" or
         ty == "expression_statement" or
         ty == "field_expression" or
         ty == "tuple_expression" or
@@ -390,10 +390,12 @@ M.expr_node = function()
         ty == "integer_literal" or
         ty == "string_literal" or
         ty == "float_literal" then
+      return node
     end
 
     node = node:parent()
   end
+
 
   return nil
 end

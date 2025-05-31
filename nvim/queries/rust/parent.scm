@@ -1,7 +1,6 @@
 (field_identifier) @chain
 
-(field_expression) @jump
-
+; (field_expression) @jump breaks selecting foo.x
 (visibility_modifier) @jump
 
 (function_modifiers) @jump
@@ -34,6 +33,8 @@
 (block) @list
 
 (tuple_expression) @list
+
+(tuple_pattern) @list
 
 (type_arguments) @list
 
