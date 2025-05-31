@@ -71,7 +71,6 @@ vim.api.nvim_create_autocmd({ 'BufEnter' }, {
       -- r = Continue comment on enter
       -- o = Continue comment on o
       vim.bo.formatoptions = 'roj'
-
       vim.bo.fileformat = 'unix'
     end
   end
