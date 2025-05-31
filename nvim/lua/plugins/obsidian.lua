@@ -26,9 +26,15 @@ return {
       },
       workspaces = {
         {
-          name = "personal",
-          path = "C:\\Users\\mattm\\OneDrive\\15. Vaults\\Graphics",
-        },
+          name = "buf-parent",
+          path = function()
+            return assert(vim.fs.dirname(vim.api.nvim_buf_get_name(0)))
+          end,
+        }
+        -- {
+        --   name = "personal",
+        --   path = "C:\\Users\\mattm\\OneDrive\\15. Vaults\\Graphics",
+        -- },
         -- {
         --   name = "work",
         --   path = "~/vaults/work",
