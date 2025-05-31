@@ -28,7 +28,9 @@ vim.opt.smartcase = true
 --   stlnc = "-",
 -- }
 vim.opt.numberwidth = 1
-vim.o.winborder = 'rounded'
+
+-- This sets it for everything -- ideally we just want rounded for diagnostics
+-- vim.o.winborder = 'rounded'
 
 vim.opt.foldexpr = "nvim_treesitter#foldexpr()"
 vim.o.foldcolumn = '1' -- '0' is not bad

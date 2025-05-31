@@ -254,7 +254,7 @@ return {
             -- numThreads = 8,
             cargo = {
               -- allTargets = false,
-              -- features = {},
+              features = "all",
               -- buildScripts = {
               -- enable = false,
               -- rebuildOnSave = false
