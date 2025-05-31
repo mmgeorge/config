@@ -155,8 +155,38 @@ return {
               end
             },
             {
-              require("noice").api.status.message.get,
-              -- require("noice").api.status.message.get_hl,
+              function()
+                local message = require("noice").api.status.message.get()
+                local newline = string.find(message, "\n")
+
+                if newline then
+                  return ""
+                end
+
+                return message
+                -- local message_len = #message
+                -- -- Truncate message to 80 chars or before any newline
+                -- if message then
+                --   local newline_pos = string.find(message, "\n")
+                --   local cutoff = 100
+                --   if newline_pos and newline_pos - 1 < cutoff then
+                --     cutoff = newline_pos - 1
+                --   end
+                --   if #message > cutoff then
+                --     message = string.sub(message, 1, cutoff)
+                --   end
+                -- end
+                --
+                -- if message:sub(#message, #message) == ":" then
+                --   message = message:sub(1, #message - 1)
+                -- end
+                --
+                -- if #message ~= message_len then
+                --   message = message .. "..."
+                -- end
+                --
+                -- return message
+              end,
               cond = require("noice").api.status.message.has,
             }
           },
