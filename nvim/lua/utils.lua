@@ -316,17 +316,83 @@ M.get_position_before_postfix = function()
   local pos = vim.api.nvim_win_get_cursor(0) -- get current cursor position
   local row = pos[1] - 1                     -- must convert to 0 indexed
   local line = vim.api.nvim_get_current_line()
-  local dot_position = line:find("%.")
+  local dot_position = line:reverse():find("%.")
+  if dot_position then
+    dot_position = #line - dot_position + 1
+  end
+
 
   if dot_position then
-    -- return { row, dot_position - 1 } -- Before dot + 1 based index
-    return { row, dot_position - 2 } -- Before dot + 1 based index
+    return { row, dot_position - 1 } -- Before dot + 1 based index
   end
 
   return nil
 end
 
--- Type postfix snippet
+-- -- Type postfix snippet
+-- M.type_node = function()
+--   local pos = M.get_position_before_postfix()
+--   if not pos then
+--     return nil
+--   end
+--
+--   local node = vim.treesitter.get_node({
+--     pos = pos
+--   })
+--
+--   local function is_type(ty)
+--     if
+--     -- ts
+--         ty == "type_identifier" or
+--         ty == "predefined_type" or
+--         -- rust
+--         ty == "primitive_type" or
+--         ty == "scoped_type_identifier" or
+--         ty == "generic_type" or
+--         ty == "type_identifier" then
+--       return true
+--     end
+--
+--     return false
+--   end
+--
+--   while node do
+--     local ty = node:type()
+--     print("check", ty)
+--
+--     local parent = node:parent();
+--     local parent_ty = parent and parent:type()
+--
+--     if is_type(ty) and not is_type(parent_ty) then
+--       return node
+--     end
+--
+--     node = parent
+--   end
+--
+--   return nil
+-- end
+--
+
+function is_type(ty)
+  if ty == "type_identifier" or
+      ty == "nested_type_identifier" or
+      ty == "predefined_type" or
+      ty == "array_type" or
+      ty == "object_type" or
+      -- rust
+      ty == "primitive_type" or
+      ty == "scoped_type_identifier" or
+      ty == "generic_type" or
+      ty == "type_identifier" then
+    return true
+  end
+
+  return false
+  -- return ty:find("type") ~= nil
+end
+
+-- Expression postfix snippet
 M.type_node = function()
   local pos = M.get_position_before_postfix()
   if not pos then
@@ -337,37 +403,20 @@ M.type_node = function()
     pos = pos
   })
 
-  local function is_type(ty)
-    if
-    -- ts
-        ty == "type_identifier" or
-        ty == "predefined_type" or
-        -- rust
-        ty == "primitive_type" or
-        ty == "scoped_type_identifier" or
-        ty == "generic_type" or
-        ty == "type_identifier" then
-      return true
-    end
-
-    return false
-  end
-
   while node do
     local ty = node:type()
-
-    local parent = node:parent();
-    local parent_ty = parent and parent:type()
-
-    if is_type(ty) and not is_type(parent_ty) then
+    if is_type(ty) then
       return node
     end
 
-    node = parent
+    node = node:parent()
   end
+
 
   return nil
 end
+
+
 
 -- Expression postfix snippet
 M.expr_node = function()

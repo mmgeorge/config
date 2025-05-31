@@ -575,6 +575,10 @@ function undo_select_parent()
       table.remove(selected_nodes)
     end
 
+    if #cursor_stack == 0 then
+      return
+    end
+
     local cursor = table.remove(cursor_stack)
     table.remove(selected_nodes)
     vim.api.nvim_buf_set_mark(0, '<', cursor.start_row + 1, cursor.start_col, {})
