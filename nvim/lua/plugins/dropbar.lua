@@ -94,8 +94,6 @@ return {
             return false
           end
 
-          foo()
-
           local stat = vim.uv.fs_stat(vim.api.nvim_buf_get_name(buf))
           if stat and stat.size > 1024 * 1024 then
             return false
