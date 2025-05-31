@@ -32,7 +32,13 @@ return {
           -- Only generate the commit message if the buffer is empty
           if vim.api.nvim_buf_get_lines(0, 0, -1, false)[1] == nil or
               vim.api.nvim_buf_get_lines(0, 0, -1, false)[1] == "" then
-            require("codecompanion").prompt("commit")
+            local ok, err = pcall(function()
+              require("codecompanion").prompt("commit")
+            end)
+            if not ok then
+              -- Might not have an LLM setup
+              vim.notify("Could not generate commit message" .. tostring(err), vim.log.levels.ERROR)
+            end
           end
         end,
       })
