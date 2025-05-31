@@ -75,6 +75,11 @@ return {
           }
         end,
         enable = function(buf, win, _)
+          -- Seems like with snacks this somehow gets added twice?
+          if vim.b[buf].snacks_previewed then
+            vim.wo[win].winbar = ''
+          end
+
           if
               not vim.api.nvim_buf_is_valid(buf)
               or not vim.api.nvim_win_is_valid(win)
@@ -86,6 +91,7 @@ return {
               -- or vim.bo[buf].ft == 'snacks_picker_input'
               or vim.bo[buf].ft:find('snacks')
               or vim.bo[buf].ft == 'NeogitStatus'
+          -- or vim.b[buf].snacks_previewed
           then
             return false
           end
