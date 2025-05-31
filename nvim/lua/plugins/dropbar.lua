@@ -75,26 +75,26 @@ return {
           }
         end,
         enable = function(buf, win, _)
-          -- Seems like with snacks this somehow gets added twice?
+          -- Seems like with snacks this somehow gets added twice? But only with
+          -- the lines picker. Due to how the buffer gets reused for the preview?
           if vim.b[buf].snacks_previewed then
             vim.wo[win].winbar = ''
           end
 
-          if
-              not vim.api.nvim_buf_is_valid(buf)
+          if not vim.api.nvim_buf_is_valid(buf)
               or not vim.api.nvim_win_is_valid(win)
               or vim.fn.win_gettype(win) ~= ''
               or vim.wo[win].winbar ~= ''
               or vim.bo[buf].ft == 'help'
-              -- or vim.bo[buf].ft == 'snacks_layout_box'
-              -- or vim.bo[buf].ft == 'snacks_picker_list'
-              -- or vim.bo[buf].ft == 'snacks_picker_input'
               or vim.bo[buf].ft:find('snacks')
               or vim.bo[buf].ft == 'NeogitStatus'
+          -- Winbar will completely disappear if we do this:
           -- or vim.b[buf].snacks_previewed
           then
             return false
           end
+
+          foo()
 
           local stat = vim.uv.fs_stat(vim.api.nvim_buf_get_name(buf))
           if stat and stat.size > 1024 * 1024 then
