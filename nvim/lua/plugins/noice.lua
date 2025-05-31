@@ -43,10 +43,14 @@ return {
           filter = {
             event = "msg_show",
             max_height = 1,
-            -- error = false,
             -- ["not"] = { find = { "treesitter" } }
           },
-          -- filter = { event = "msg_show", kind = "search_count" },
+          opts = { skip = true },
+        },
+        {
+          filter = {
+            error = true,
+          },
           opts = { skip = true },
         },
       },

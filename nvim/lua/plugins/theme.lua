@@ -14,6 +14,7 @@ local colors = {
   dark_gray = "#151515",
   black = "#000000",
   visual = "#303136",
+  error = "red"
 }
 
 return {
@@ -108,6 +109,9 @@ return {
       vim.api.nvim_set_hl(0, "@function", { fg = colors.red })
       vim.api.nvim_set_hl(0, "@decorator", { fg = colors.red })
       vim.api.nvim_set_hl(0, "@function.macro.rust", { fg = colors.red })
+
+      -- StatusLine
+      vim.api.nvim_set_hl(0, "StatusLineError", { fg = colors.error })
 
       -- Git
       vim.api.nvim_set_hl(0, "GitSignsAdd", { fg = colors.green })
@@ -207,7 +211,7 @@ return {
       vim.api.nvim_set_hl(0, "DiagnosticUnnecessary", { fg = colors.light_gray, underline = true })
 
       vim.api.nvim_set_hl(0, "DiagnosticUnderlineError", {
-        fg = "red",
+        fg = colors.error,
         underline = true,
         -- undercurl = true,
       })

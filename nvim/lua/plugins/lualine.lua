@@ -160,12 +160,35 @@ return {
             {
               function()
                 local message = require("noice").api.status.message.get()
+                local message_lem = #message
                 local newline = string.find(message, "\n")
 
-                if newline then
-                  return ""
+                -- Trim the message to a single line
+                if message then
+                  local newline_pos = string.find(message, "\n")
+                  local cutoff = 100
+                  if newline_pos and newline_pos - 1 < cutoff then
+                    cutoff = newline_pos - 1
+                  end
+                  if #message > cutoff then
+                    message = string.sub(message, 1, cutoff)
+                  end
                 end
 
+                if message:sub(#message, #message) == ":" then
+                  message = message:sub(1, #message - 1)
+                end
+
+                if #message ~= message_len then
+                  message = message .. "..."
+                end
+
+                -- Apply color for errors
+                if message:find("E:") or message:find("Error") then
+                  message = "%#StatusLineError#" .. message .. "%*"
+                end
+
+                -- Remove the message after some timeout
                 if message ~= last_message then
                   last_message = message
                   last_message_start = vim.loop.now()
@@ -181,24 +204,6 @@ return {
                 return message
                 -- local message_len = #message
                 -- -- Truncate message to 80 chars or before any newline
-                -- if message then
-                --   local newline_pos = string.find(message, "\n")
-                --   local cutoff = 100
-                --   if newline_pos and newline_pos - 1 < cutoff then
-                --     cutoff = newline_pos - 1
-                --   end
-                --   if #message > cutoff then
-                --     message = string.sub(message, 1, cutoff)
-                --   end
-                -- end
-                --
-                -- if message:sub(#message, #message) == ":" then
-                --   message = message:sub(1, #message - 1)
-                -- end
-                --
-                -- if #message ~= message_len then
-                --   message = message .. "..."
-                -- end
                 --
                 -- return message
               end,
