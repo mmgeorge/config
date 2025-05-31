@@ -474,4 +474,31 @@ M.postfix = function(options)
 end
 
 
+M.get_definition_location = function()
+  local params = vim.lsp.util.make_position_params()
+  vim.lsp.buf_request(0, "textDocument/definition", params, function(err, result, _, _)
+    if err then
+      vim.notify("LSP request error: " .. vim.inspect(err), vim.log.levels.ERROR)
+      return
+    end
+
+    if result and not vim.tbl_isempty(result) then
+      -- The 'result' can be a single Location or a list of Locations/LocationLinks
+      local locations
+      if result.uri then                                  -- Single Location
+        locations = { result }
+      elseif type(result) == "table" and #result > 0 then -- List of Locations or LocationLinks
+        locations = result
+      end
+
+      if locations then
+        print(vim.inspect(locations))
+      end
+    else
+      vim.notify("No definition found.", vim.log.levels.INFO)
+    end
+  end)
+end
+
+
 return M
