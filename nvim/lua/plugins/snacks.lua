@@ -56,7 +56,16 @@ return {
                 -- filename_only = true,
                 truncate = 40
               }
-            }
+            },
+            transform = function(item, ctx)
+              -- Filter out definintions
+              if item.line and item.line:find("import") then
+                -- if item.line and item.line:find("import") or item.line:find("class") or item.line:find("fn") or item.line:find("function") then
+                return false
+              end
+
+              return true
+            end
           })
         end,
         desc = "Lsp references"
