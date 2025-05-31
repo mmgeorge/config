@@ -241,52 +241,87 @@ function source:get_completions(ctx, callback)
   local bufnr = vim.api.nvim_get_current_buf()
   local items = {}
 
+  local insert_item = function(snippet)
+    local executed = snippet.execute();
+    if executed ~= nil then
+      ---@type lsp.CompletionItem
+      local item = {
+        word = snippet.trigger,
+        label = snippet.trigger,
+        kind = vim.lsp.protocol.CompletionItemKind.Snippet,
+        insertText = executed.body,
+        insertTextFormat = vim.lsp.protocol.InsertTextFormat.Snippet,
+        clear_region = executed.clear_region
+      }
+      table.insert(items, item)
+    end
+  end
+
+  vim.tbl_map(insert_item, get_snippets())
+
+  callback({
+    items = items,
+    -- Whether blink.cmp should request items when deleting characters
+    -- from the keyword (i.e. "foo|" -> "fo|")
+    -- Note that any non-alphanumeric characters will always request
+    -- new items (excluding `-` and `_`)
+    is_incomplete_backward = false,
+    -- Whether blink.cmp should request items when adding characters
+    -- to the keyword (i.e. "fo|" -> "foo|")
+    -- Note that any non-alphanumeric characters will always request
+    -- new items (excluding `-` and `_`)
+    is_incomplete_forward = false,
+  })
+
+  -- BUG: Do not force treesitter rebuild -- otherwise the . may introduct a ts error.
+  -- Is there a way to do a TS rebuild and ignore this temp syntax error? Ignore (ERROR?)
+
   -- WARN: This can be slow!
   -- We need to do this to ensure that TS is up to date (completion will be off otherwise)
   -- Can OPT by passing a range?
-  local parser = vim.treesitter.get_parser(bufnr, nil, { error = false })
-  if not parser then
-    callback({
-      items = items,
-      is_incomplete_backward = false,
-      is_incomplete_forward = false,
-    })
-  end
+  -- local parser = vim.treesitter.get_parser(bufnr, nil, { error = false })
+  -- if not parser then
+  --   callback({
+  --     items = items,
+  --     is_incomplete_backward = false,
+  --     is_incomplete_forward = false,
+  --   })
+  -- end
 
-  -- Passing as a callback makes parsing async
-  parser:parse(true, function()
-    local insert_item = function(snippet)
-      local executed = snippet.execute();
-      if executed ~= nil then
-        ---@type lsp.CompletionItem
-        local item = {
-          word = snippet.trigger,
-          label = snippet.trigger,
-          kind = vim.lsp.protocol.CompletionItemKind.Snippet,
-          insertText = executed.body,
-          insertTextFormat = vim.lsp.protocol.InsertTextFormat.Snippet,
-          clear_region = executed.clear_region
-        }
-        table.insert(items, item)
-      end
-    end
-
-    vim.tbl_map(insert_item, get_snippets())
-
-    callback({
-      items = items,
-      -- Whether blink.cmp should request items when deleting characters
-      -- from the keyword (i.e. "foo|" -> "fo|")
-      -- Note that any non-alphanumeric characters will always request
-      -- new items (excluding `-` and `_`)
-      is_incomplete_backward = false,
-      -- Whether blink.cmp should request items when adding characters
-      -- to the keyword (i.e. "fo|" -> "foo|")
-      -- Note that any non-alphanumeric characters will always request
-      -- new items (excluding `-` and `_`)
-      is_incomplete_forward = false,
-    })
-  end)
+  -- -- Passing as a callback makes parsing async
+  -- parser:parse(true, function()
+  --   local insert_item = function(snippet)
+  --     local executed = snippet.execute();
+  --     if executed ~= nil then
+  --       ---@type lsp.CompletionItem
+  --       local item = {
+  --         word = snippet.trigger,
+  --         label = snippet.trigger,
+  --         kind = vim.lsp.protocol.CompletionItemKind.Snippet,
+  --         insertText = executed.body,
+  --         insertTextFormat = vim.lsp.protocol.InsertTextFormat.Snippet,
+  --         clear_region = executed.clear_region
+  --       }
+  --       table.insert(items, item)
+  --     end
+  --   end
+  --
+  --   vim.tbl_map(insert_item, get_snippets())
+  --
+  --   callback({
+  --     items = items,
+  --     -- Whether blink.cmp should request items when deleting characters
+  --     -- from the keyword (i.e. "foo|" -> "fo|")
+  --     -- Note that any non-alphanumeric characters will always request
+  --     -- new items (excluding `-` and `_`)
+  --     is_incomplete_backward = false,
+  --     -- Whether blink.cmp should request items when adding characters
+  --     -- to the keyword (i.e. "fo|" -> "foo|")
+  --     -- Note that any non-alphanumeric characters will always request
+  --     -- new items (excluding `-` and `_`)
+  --     is_incomplete_forward = false,
+  --   })
+  -- end)
 end
 
 -- Called immediately after applying the item's textEdit/insertText
