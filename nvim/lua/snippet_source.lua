@@ -13,6 +13,14 @@ local snippets_by_filetype = {
         return "Promise<" .. text .. ">"
       end
     }),
+    postfix({
+      trigger = 'await',
+      node = expr_node,
+      body = function(text)
+        return "await " .. text
+      end
+    }),
+
   },
   typescriptreact = {
     postfix({

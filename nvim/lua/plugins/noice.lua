@@ -13,6 +13,8 @@ return {
       },
       level = 2,
       minimum_width = 20,
+      max_height = 5,
+      max_width = 80,
       render = "compact",
       stages = "static",
       time_formats = {
@@ -77,6 +79,7 @@ return {
         long_message_to_split = false, -- long messages will be sent to a split
         inc_rename = true,             -- enables an input dialog for inc-rename.nvim
         lsp_doc_border = false,        -- add a border to hover docs and signature help
+        view_history = "messages",     -- view for :messages
       },
       popupmenu = {
         enabled = false,
