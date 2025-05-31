@@ -29,7 +29,7 @@ return {
       vim.api.nvim_create_autocmd({ 'BufEnter' }, {
         pattern = "COMMIT_EDITMSG",
         callback = function()
-          -- Only call codecompanion if buffer is empty
+          -- Only generate the commit message if the buffer is empty
           if vim.api.nvim_buf_get_lines(0, 0, -1, false)[1] == nil or
               vim.api.nvim_buf_get_lines(0, 0, -1, false)[1] == "" then
             require("codecompanion").prompt("commit")
