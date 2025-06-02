@@ -13,8 +13,9 @@ function detect_adapter()
       inline = "openai",
       commit = {
         name = "gemini",
-        -- model = "gemini-2.5-flash-preview-05-20"
-        model = "gemini-2.0-flash"
+        model = "gemini-2.5-flash-preview-05-20",
+        opts = { can_reason = false }
+        -- model = "gemini-2.0-flash"
       }
       -- commit = {
       --   name = "openai",
