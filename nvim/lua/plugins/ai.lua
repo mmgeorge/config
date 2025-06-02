@@ -7,24 +7,24 @@ function filetype(context)
 end
 
 function detect_adapter()
-  -- if os.getenv("OPENAI_API_KEY") then
-  --   return {
-  --     chat = "openai",
-  --     inline = "openai",
-  --     commit = {
-  --       name = "gemini",
-  --       -- model = "gemini-2.5-flash-preview-05-20",
-  --       -- opts = { can_reason = false }
-  --       model = "gemini-2.0-flash"
-  --     }
-  --     -- commit = {
-  --     --   name = "openai",
-  --     --   model = "gpt-4.1-mini"
-  --     --   -- model = "gpt-4o-mini"
-  --     -- }
-  --   }
-  -- end
-  --
+  if os.getenv("OPENAI_API_KEY") then
+    return {
+      chat = "openai",
+      inline = "openai",
+      commit = {
+        name = "gemini",
+        -- model = "gemini-2.5-flash-preview-05-20",
+        -- opts = { can_reason = false }
+        model = "gemini-2.0-flash"
+      }
+      -- commit = {
+      --   name = "openai",
+      --   model = "gpt-4.1-mini"
+      --   -- model = "gpt-4o-mini"
+      -- }
+    }
+  end
+
   if os.getenv("GEMINI_API_KEY") then
     return {
       chat = "gemini",
@@ -64,6 +64,18 @@ return {
         mode = { "n", "x" },
         ":CodeCompanion",
         desc = "Codecompanion Inline",
+      },
+      {
+        "<leader>ae",
+        mode = { "n", "x" },
+        ":CodeCompanion /extract<cr>",
+        desc = "AI Extract Function",
+      },
+      {
+        "<leader>ad",
+        mode = { "n", "x" },
+        ":CodeCompanion /doc<cr>",
+        desc = "AI Document",
       },
       -- {
       --   "<leader>cm",
@@ -485,6 +497,8 @@ Be sure to also out move any code that is only needed in the new function you cr
                   auto_submit = true
                 },
                 content = function()
+                  -- vim.g.codecompanion_auto_tool_mode = true
+
                   return
                   "Can you apply the suggested changes to the buffer with the @editor tool? Replace the entire buffer's contents with the new ones."
                 end
