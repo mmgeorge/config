@@ -12,10 +12,11 @@ function detect_adapter()
       chat = "openai",
       inline = "openai",
       commit = {
-        name = "gemini",
+        name = "openai",
+        -- name = "gemini",
         -- model = "gemini-2.5-flash-preview-05-20",
         -- opts = { can_reason = false }
-        model = "gemini-2.0-flash"
+        -- model = "gemini-2.0-flash"
       }
       -- commit = {
       --   name = "openai",
