@@ -1,3 +1,11 @@
+function filetype(context)
+  if context.filetype == "typescriptreact" then
+    return "typescriptreact"
+  end
+
+  return context.filetype
+end
+
 function detect_adapter()
   if os.getenv("OPENAI_API_KEY") then
     return {
@@ -5,6 +13,7 @@ function detect_adapter()
       inline = "openai",
       commit = {
         name = "gemini",
+        -- model = "gemini-2.5-flash-preview-05-20"
         model = "gemini-2.0-flash"
       }
       -- commit = {
@@ -138,9 +147,9 @@ return {
                 api_key = "GEMINI_API_KEY"
               },
               model = {
-                default = "gemini-2.0-flash",
+                default = "gemini-2.5-flash-preview-04-17",
                 choices = {
-                  ["gemini-2.5-flash-preview-04-17"] = { opts = { can_reason = true } },
+                  ["gemini-2.5-flash-preview-04-17"] = { opts = { can_reason = false } },
                   "gemini-2.5-pro-preview-03-25",
                   "gemini-2.0-flash",
                 }
@@ -352,7 +361,7 @@ return {
           auto_scroll = true,
           intro_message = "Welcome to CodeCompanion ?! Press ? for options",
           show_header_separator = true, -- Show header separators in the chat buffer? Set this to false if you're using an external markdown formatting plugin
-          -- separator = "Ä", -- The separator between the different messages in the chat buffer
+          -- separator = "Ä",Th- see rapar totwben eee thffdientrent messages in the chat buff
           show_references = true,       -- Show references (from slash commands and variables) in the chat buffer?
           show_settings = false,        -- Show LLM settings at the top of the chat buffer?
           show_token_count = true,      -- Show the token count for each response?
@@ -391,10 +400,103 @@ return {
       },
 
       prompt_library = {
+        ["Extract Function"] = {
+          strategy = "workflow",
+          description = "Extract function",
+          opts = {
+            -- placement = "after",
+            index = 10,
+            is_default = true,
+            is_slash_cmd = true,
+            short_name = "extract",
+            -- auto_submit = true,
+            -- user_prompt = true,
+
+            -- adapter = adapter.commit,
+          },
+          prompts = {
+            {
+              {
+                role = "system",
+                opts = {
+                  auto_submit = true
+                },
+                content = function(context)
+                  local ft = filetype(context)
+
+                  if ft == "typescriptreact" then
+                    return
+                    [[I want you to act as a senior SolidJS frontend developer, skilled in refactoring code according to clean code principles. The user will provide you with a buffer and a code snippet from it. Take the code snippet and extract it into a new function. Use arrow functions. You are likely be extracting some subset of a component into a new one.
+
+Be sure to also out move any code that is only needed in the new function you created. Our goal is to see if we can simplify the code and remove any of the arguments you added in the new function. Pay close attention to any signals that you may now be able to move into the new function.
+]]
+                  end
+
+                  return "I want you to act as a senior " .. ft ..
+                      [[ developer, skilled in refactoring code according to clean code principles. The user will ask you to extract code, providing the snippet and buffer the snippet is from. Take the snippet, and move it to separate function below the current function. Do so in a way that minimizes the number of arguments that we need to pass to the new function.
+]]
+                end,
+              },
+              {
+                role = "user",
+                opts = {
+                  contains_code = true,
+                  auto_submit = true
+                },
+                content = function(context)
+                  local code = require("codecompanion.helpers.actions").get_code(context.start_line, context.end_line)
+                  local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
+                  -- local buffer_text = table.concat(lines, '\n')
+                  local ft = filetype(context)
+
+                  return string.format(
+                    [[#buffer{watch} Extract the code snippet below:
+```%s
+%s
+```
+]], ft, code)
+                end,
+              },
+              -- {
+              --   role = "user",
+              --   opts = {
+              --     auto_submit = true
+              --   },
+              --   content = function(context)
+              --     local ft = filetype(context)
+              --
+              --     if ft == "tsx" then
+              --       return
+              --       "Now move any code that is only needed in the new function you created. Our goal is to see if we can simplify the code and remove any of the arguments you added in the new function. Pay particular attention to any signals that you may now be able to move into the new function."
+              --     end
+              --
+              --     return
+              --     "Now move any code that is only needed in the new function you created. Our goal is to see if we can simplify the code and remove any of the arguments you added in the new function."
+              --   end
+              -- }
+
+            },
+            -- Wait until the end to submit this
+            {
+              {
+                role = "user",
+                opts = {
+                  auto_submit = true
+                },
+                content = function()
+                  return
+                  "Can you apply the suggested changes to the buffer with the @editor tool? Replace the entire buffer's contents with the new ones."
+                end
+              }
+            }
+          },
+        },
+
         ["Generate documentation"] = {
           strategy = "inline",
           description = "Generate documentation",
           opts = {
+            placement = "before",
             index = 10,
             is_default = true,
             is_slash_cmd = true,
@@ -408,6 +510,7 @@ return {
                 local code = require("codecompanion.helpers.actions").get_code(context.start_line, context.end_line)
                 local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
                 local buffer_text = table.concat(lines, '\n')
+                local ft = filetype(context)
 
                 return string.format(
                   [[Document the below code. Use the following steps:
@@ -429,7 +532,7 @@ This is the code to document:
 ```%s
 %s
 ```
-]], context.filetype, buffer_text, context.filetype, code)
+]], ft, buffer_text, ft, code)
               end,
               opts = {
                 contains_code = true,
