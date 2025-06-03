@@ -23,8 +23,8 @@ return {
         search_count = true,
         navigation = true,
         scroll_center = true,
-        search_key = nil,
-        cancel_search_key = nil,
+        search_key = "<leader>XX",
+        cancel_search_key = "<leader>XX",
         color_key = "<leader>" .. key("h"),
         cancel_color_key = "<leader>" .. key("H"),
       }
