@@ -1,3 +1,17 @@
+-- Filter open buffers by filetype matching context.filetype
+local function get_open_buffers_by_filetype(ft)
+  local bufs = vim.api.nvim_list_bufs()
+  local open_bufs = {}
+  for _, buf in ipairs(bufs) do
+    if vim.api.nvim_buf_is_loaded(buf)
+        and vim.bo[buf].buflisted
+        and vim.bo[buf].filetype == ft then
+      table.insert(open_bufs, buf)
+    end
+  end
+  return open_bufs
+end
+
 function filetype(context)
   if context.filetype == "typescriptreact" then
     return "typescriptreact"
@@ -65,6 +79,18 @@ return {
         mode = { "n", "x" },
         ":CodeCompanion",
         desc = "Codecompanion Inline",
+      },
+      {
+        "<leader>ai",
+        mode = { "n", "x" },
+        ":CodeCompanion #buffer add the following impls for the selected code: ",
+        desc = "AI Implement",
+      },
+      {
+        "<leader>ad",
+        mode = { "n", "x" },
+        ":CodeCompanion #buffer generate an enum dispatch method, which calls the following method on each underlying variant: ",
+        desc = "AI Enum Dispatch",
       },
       {
         "<leader>ae",
@@ -414,6 +440,76 @@ return {
       },
 
       prompt_library = {
+        ["Generate component"] = {
+          strategy = "chat",
+          description = "Generate component",
+          opts = {
+            index = 100,
+            is_default = true,
+            is_slash_cmd = true,
+            short_name = "comp",
+            auto_submit = true,
+            user_prompt = false,
+            stop_context_insertion = true
+          },
+          prompts = {
+            {
+              role = "system",
+              content = function(context)
+                return
+                [[**Instructions**
+Act as a senior SolidJS Typescript frontend developer, skilled in writing new code components. The user will provide you with several buffers that show what some of the code in the current code base looks like. Use this code as a reference, and try to match the style and code shown. You will then be prompted to create a new standalone component.
+
+**Guidlines**
+- Prefer using arrow functions
+- Use interfaces for props. Name in this format: IComponentNameProps
+- Make callbacks optional
+- When designing generic components, include common functionality that you think might be needed.
+- Once done, prompt the user with some additional options they might want to add to the component
+]]
+              end,
+            },
+            {
+              role = "user",
+              content = function(context)
+                local ft = context.filetype
+                local buffers = get_open_buffers_by_filetype(ft)
+                local buffer_texts = {}
+                for _, buffer in ipairs(buffers) do
+                  local buffer_name = vim.api.nvim_buf_get_name(buffer)
+                  local buffer_text = table.concat(vim.api.nvim_buf_get_lines(buffer, 0, -1, false), '\n')
+                  table.insert(buffer_texts, string.format(
+                    [[
+Buffer: %s
+```%s
+%s
+```
+]], buffer_name, ft, buffer_text))
+                end
+
+                local context = table.concat(buffer_texts, "\n")
+
+
+                return "**Context**\n" .. context .. "\n\n"
+              end,
+            },
+
+            -- {
+            --   {
+            --     role = "user",
+            --     opts = {
+            --       auto_submit = true,
+            --       user_prompt = true,
+            --     },
+            --     content = function()
+            --       return
+            --       "Please create a new component:"
+            --     end
+            --   }
+            -- }
+          },
+        },
+
         ["Extract Function"] = {
           strategy = "workflow",
           description = "Extract function",
