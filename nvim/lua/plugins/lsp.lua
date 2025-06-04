@@ -251,6 +251,11 @@ return {
         capabilities = capabilities,
         settings = {
           ["rust-analyzer"] = {
+            completion = {
+              autoself = {
+                enable = false
+              }
+            },
             -- numThreads = 8,
             cargo = {
               -- allTargets = false,
