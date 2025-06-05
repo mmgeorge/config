@@ -2,3 +2,10 @@
 *lock*
 *.spl
 google-chrome/
+.aider.*
+gh/
+.wrangler/
+lazygit/
+scoop/
+github-copilot
+
