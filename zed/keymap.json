@@ -1,0 +1,96 @@
+// Zed keymap
+//
+// For information on binding keys, see the Zed
+// documentation: https://zed.dev/docs/key-bindings
+//
+// To see the default key bindings run `zed: open default keymap`
+// from the command palette.
+[
+  {
+    // Put key bindings here if you want them to work in normal & visual mode.u
+    "context": "VimControl",
+    "bindings": {
+      // Movement
+      "h": "vim::NextSubwordEnd",
+      "s": "vim::Up",
+      "t": "vim::Down",
+      "r": "vim::PreviousSubwordStart",
+      "d": "vim::InsertAfter",
+      "n": "vim::Left",
+      "e": ["editor::MoveUpByLines", { "lines": 10 }],
+      "a": ["editor::MoveDownByLines", { "lines": 10 }],
+      "i": "vim::Right",
+      ";": "vim::FirstNonWhitespace",
+      "/": "vim::EndOfLine",
+      ",": "pane::GoBack",
+
+      // Changes
+      "q": "vim::HelixDelete",
+      "j": "vim::PushDelete",
+      "j j": ["workspace::SendKeystrokes", "V j"],
+      "J": "vim::VisualDeleteLine",
+      "c": "vim::PushReplace",
+      "m": "vim::PushChange",
+      "l": "vim::PushYank",
+      "y": "editor::Paste",
+      "u": "vim::InsertBefore",
+      "l l": ["workspace::SendKeystrokes", "V l"],
+      "p": "vim::SwitchToVisualMode",
+      "P": "vim::SwitchToVisualLineMode",
+      "E": "vim::InsertLineAbove",
+      "A": "vim::InsertLineBelow",
+      "U": "vim::InsertEmptyLineAbove",
+      "O": "vim::InsertEmptyLineBelow",
+      "x": "vim::Undo",
+      "X": "vim::Redo",
+      "K": "vim::EndOfDocument",
+      "k k": "vim::StartOfDocument",
+      "tab": "vim::Indent",
+      "C": "editor::JoinLines",
+
+      // Navigation
+      "o": null,
+      "o s": "tab_switcher::Toggle",
+      "o d": "editor::Hover",
+      "o h": "file_finder::Toggle",
+      "o o": "outline::Toggle"
+
+      //  "e": "vim::NextSubwordEnd",
+      // "g e": "vim::PreviousSubwordEnd"
+    }
+  },
+  {
+    "context": "vim_mode == visual && !menu",
+    "bindings": {
+      "l": "vim::VisualYank",
+      "j": "vim::VisualDelete",
+      "m": ["workspace::SendKeystrokes", "j u"],
+      "p": "editor::SelectLargerSyntaxNode",
+      "P": "editor::SelectSmallerSyntaxNode",
+      "S": "vim::PushAddSurrounds",
+      "\"": ["workspace::SendKeystrokes", "S \""],
+      "'": ["workspace::SendKeystrokes", "S '"],
+      "(": ["workspace::SendKeystrokes", "S ("]
+    }
+  },
+  {
+    "context": "vim_mode == normal && !menu",
+    "bindings": {
+      // "shift-y": ["workspace::SendKeystrokes", "y $"] // Use neovim's yank behavior: yank to end of line.
+    }
+  },
+  {
+    "context": "vim_mode == insert",
+    "bindings": {
+      // "j k": "vim::NormalBefore" // In insert mode, make jk escape to normal mode.
+    }
+  },
+  {
+    "context": "EmptyPane || SharedScreen",
+    "bindings": {
+      // Put key bindings here (in addition to the context above) if you want them to
+      // work when no editor exists.
+      // "space f": "file_finder::Toggle"
+    }
+  }
+]
