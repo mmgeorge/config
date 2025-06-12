@@ -267,11 +267,16 @@ return {
             },
             check = {
               allTargets = true,
-              workspace = false,
+              workspace = true,
             },
             cachePriming = {
               enable = false,
               -- numThreads = 8
+            },
+            diagnostiscs = {
+              -- For tsify
+              -- https://github.com/madonoharu/tsify/issues/42#issuecomment-2088746822
+              disabled = { "non_snake_case" }
             },
             procMacro = {
               enable = true,
