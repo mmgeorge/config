@@ -110,15 +110,15 @@ return {
       --   ":CodeCompanion /commit<cr>",
       --   desc = "Codecompanion Commit",
       -- },
-      {
-        "oc",
-        mode = { "n" },
-        function()
-          require("codecompanion").toggle()
-        end,
-        -- ":CodeCompanionChat Toggle<cr>",
-        desc = "Codecompanion Open",
-      },
+      -- {
+      --   "oc",
+      --   mode = { "n" },
+      --   function()
+      --     require("codecompanion").toggle()
+      --   end,
+      --   -- ":CodeCompanionChat Toggle<cr>",
+      --   desc = "Codecompanion Open",
+      -- },
       {
         "<leader>co",
         mode = { "n" },
