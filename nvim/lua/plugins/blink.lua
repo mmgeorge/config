@@ -139,14 +139,14 @@ return {
     ---@type blink.cmp.Config
     opts = {
       fuzzy = {
-        use_frecency = true,
-        use_proximity = true,
-        max_typos = function(str)
-          if #str < 8 then
-            return 1
-          end
-          return 1
-        end,
+        -- use_frecency = true,
+        -- use_proximity = true,
+        -- max_typos = function(str)
+        --   if #str < 8 then
+        --     return 1
+        --   end
+        --   return 1
+        -- end,
         implementation = "prefer_rust_with_warning",
         sorts = {
           -- function(a, b)
@@ -162,11 +162,11 @@ return {
           --   if a_priority ~= b_priority then return a_priority > b_priority end
           -- end,
           deprioritize_common_rust_traits,
-          'score',
-          'sort_text',
-          function(a, b)
-            return #a.label < #b.label
-          end,
+          'sort_text', -- score seems to break things quite a bit. For instance, typing
+          'score',     -- in row_g was resolving first to filter_row_groups instead of row_groups
+          -- function(a, b)
+          --   return #a.label < #b.label
+          -- end,
           -- 'label'
         }
       },
