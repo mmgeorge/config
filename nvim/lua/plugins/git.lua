@@ -226,7 +226,7 @@ return {
             ["of"] = "FetchPopup",
             ["ol"] = "LogPopup",
             ["om"] = "MergePopup",
-            ["ou"] = "PullPopup",
+            ["oP"] = "PullPopup",
             ["or"] = "RebasePopup",
             ["ov"] = "RevertPopup",
           },
