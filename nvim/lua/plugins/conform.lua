@@ -19,6 +19,7 @@ return {
       -- tsx = { "trim_whitespace" },
       formatters_by_ft  = {
         ["*"] = { lsp_format, "trim_whitespace" },
+        ["slang"] = { "trim_whitespace" },
       }
       -- format_on_save = {
       --   -- These options will be passed to conform.format()

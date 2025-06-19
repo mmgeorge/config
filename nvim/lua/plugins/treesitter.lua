@@ -7,6 +7,16 @@ return {
       "nvim-treesitter/nvim-treesitter-textobjects",
     },
     config = function()
+      local parser_config = require("nvim-treesitter.parsers").get_parser_configs()
+      parser_config.wesl = {
+        install_info = {
+          url = "https://github.com/wgsl-tooling-wg/tree-sitter-wesl",
+          files = { "src/parser.c", "src/scanner.c" },
+          branch = "main",
+        },
+        filetype = "wesl",
+      }
+
       local configs = require("nvim-treesitter.configs")
 
       vim.filetype.add({ extension = { frag = "frag" } })
@@ -16,9 +26,13 @@ return {
       vim.filetype.add({ extension = { wgslx = "wgslx" } })
       vim.treesitter.language.register('wgsl', { 'wgslx' })
 
+      vim.filetype.add({ extension = { wesl = "wesl" } })
+      -- vim.treesitter.language.register('wesl', { 'wesl' })
+
       ---@diagnostic disable-next-line: missing-fields
       configs.setup({
         ensure_installed = {
+          "wesl",
           "rust",
           "typescript",
           "tsx",
