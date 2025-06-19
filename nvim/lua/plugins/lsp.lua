@@ -193,6 +193,8 @@ return {
       'yioneko/nvim-vtsls'
     },
     config = function()
+      -- vim.lsp.set_log_level(1)
+
       vim.diagnostic.config({
         virtual_text = {
           prefix = '●', -- Could be '●', '▎', 'x', '■', , 
@@ -207,7 +209,9 @@ return {
         group = vim.api.nvim_create_augroup('UserLspConfig', {}),
         callback = function(ev)
           local client = vim.lsp.get_client_by_id(ev.data.client_id)
+          -- if client.name ~= "slangd" then
           client.server_capabilities.semanticTokensProvider = nil
+          -- end
         end,
       })
 
@@ -230,6 +234,16 @@ return {
       })
 
       vim.lsp.enable('html')
+
+      vim.lsp.config('wesl_ls', {
+        cmd = { 'wesl-ls' },
+        filetypes = { 'wesl' },
+        root_markers = { 'wesl.toml' },
+      })
+
+      vim.lsp.enable("wesl_ls")
+
+      vim.lsp.enable("wgsl_analyzer")
 
       -- vim.lsp.config('taplo', {
       --   capabilities = capabilities,
@@ -388,23 +402,43 @@ return {
       -- capabilities = capabilities,
       -- })
 
-      local configs = require "lspconfig.configs"
-      if not configs.slangd then
-        configs.slangd = {
-          default_config = {
-            cmd = { "slangd", "--debug" },
-            filetypes = { "slang", "hlsl" },
-            root_dir = function(fname)
-              return require("lspconfig").util.find_git_ancestor(fname)
-            end,
-            single_file_support = true,
-          },
-        }
+      -- local configs = require "lspconfig.configs"
+      -- if not configs.slangd then
+      --   configs.slangd = {
+      --     default_config = {
+      --       cmd = { "slangd", "--debug" },
+      --       filetypes = { "slang", "hlsl" },
+      --       root_dir = function(fname)
+      --         return require("lspconfig").util.find_git_ancestor(fname)
+      --       end,
+      --       single_file_support = true,
+      --     },
+      --   }
+      -- end
 
-        vim.lsp.config('slangd', {
-          capabilities = capabilities,
-        })
-      end
+      vim.lsp.config('slangd', {
+        capabilities = capabilities,
+        cmd = {
+          "slangd",
+          -- "--debug",
+        },
+        filetypes = { "slang", "hlsl" },
+        single_file_support = false,
+        root_markers = { 'lib.slang' },
+        settings = {
+          -- The `-style` argument to pass to clang-format
+          format = {
+            'Microsoft'
+          },
+          -- slangLanguageServer = {
+          --   trace = {
+          --     server = "messages" -- 'messages', 'verbose'
+          --   }
+          -- }
+        }
+      })
+
+      vim.lsp.enable('slangd')
 
       vim.lsp.config("eslint", {
         capabilities = capabilities,

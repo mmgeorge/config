@@ -171,7 +171,7 @@ return {
         }
       },
       keymap = {
-        ['<C-space>'] = { 'show', 'show_documentation', 'hide_documentation' },
+        ['<C-l>'] = { 'show', 'show_documentation', 'hide_documentation' },
         ['<C-e>'] = { 'hide', 'fallback' },
         ['<CR>'] = { 'accept', 'fallback' },
 
@@ -263,6 +263,9 @@ return {
           lsp = {
 
             transform_items = function(ctx, items)
+              if true then
+                return items
+              end
               local function should_filter(label)
                 if not label then
                   return false;
