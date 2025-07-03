@@ -313,6 +313,7 @@ return {
           },
           custom_snippets = {
             name = "custom_snippets",
+            min_keyword_length = 2,
             module = "snippet_source",
           },
           spell = {
