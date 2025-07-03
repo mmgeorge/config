@@ -405,7 +405,16 @@ M.type_node = function()
 
   while node do
     local ty = node:type()
+    local parent = node:parent()
     if is_type(ty) then
+      -- If we have wgpu::BufferBinding that will show up as:
+      -- (scoped_type_identifier
+      --   path: (identifier)
+      --   name: (type_identifier)))))
+      if parent and parent:type() == "scoped_type_identifier" then
+        return parent
+      end
+
       return node
     end
 

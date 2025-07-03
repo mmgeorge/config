@@ -54,6 +54,8 @@ for i, v in ipairs(k.keys) do
   end
 end
 
+vim.keymap.del("v", 'T', {}) -- IMPORTANT! Was accidently triggering a full copy of everything?
+vim.keymap.del("n", 'T', {}) -- Bound to GJ?
 vim.keymap.del("v", 'p', {})
 vim.keymap.del("v", 'P', {})
 vim.keymap.del("n", "<C-w><C-d>")

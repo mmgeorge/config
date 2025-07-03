@@ -209,9 +209,9 @@ return {
         group = vim.api.nvim_create_augroup('UserLspConfig', {}),
         callback = function(ev)
           local client = vim.lsp.get_client_by_id(ev.data.client_id)
-          -- if client.name ~= "slangd" then
-          client.server_capabilities.semanticTokensProvider = nil
-          -- end
+          if client.name ~= "slangd" then
+            client.server_capabilities.semanticTokensProvider = nil
+          end
         end,
       })
 
@@ -274,6 +274,9 @@ return {
             cargo = {
               -- allTargets = false,
               features = "all",
+              extraEnv = {
+                ["CARGO_TARGET_DIR"] = "target/check",
+              }
               -- buildScripts = {
               -- enable = false,
               -- rebuildOnSave = false
@@ -428,7 +431,8 @@ return {
         settings = {
           -- The `-style` argument to pass to clang-format
           format = {
-            'Microsoft'
+            -- 'LLVM'
+            -- 'Microsoft'
           },
           -- slangLanguageServer = {
           --   trace = {
