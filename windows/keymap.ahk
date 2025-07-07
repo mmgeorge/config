@@ -126,4 +126,4 @@ m::;
 !,::Send {=}
 !.::Send {`{}
 !/::Send {`}}
-
+!Space::Send {Space}
