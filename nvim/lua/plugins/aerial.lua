@@ -49,8 +49,8 @@ return {
             win = {
               input = {
                 keys = {
-                  ["<C-u>"] = { "symbol_toggle", mode = { "n", "i" } },
-                  ["<C-o>"] = { "level_toggle", mode = { "n", "i" } },
+                  ["<C-o>"] = { "symbol_toggle", mode = { "n", "i" } },
+                  ["<C-u>"] = { "level_toggle", mode = { "n", "i" } },
                   ["<C-l>"] = { "symbol_fold", mode = { "n", "i" } },
                 }
               }
