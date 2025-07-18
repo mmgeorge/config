@@ -28,6 +28,10 @@
   value: (arrow_function)
   (#set! "kind" "Method")) @symbol
 
+(public_field_definition
+  name: (property_identifier) @name
+  (#set! "kind" "Property")) @symbol
+
 (type_alias_declaration
   name: (type_identifier) @name
   (#set! "kind" "Variable")) @symbol
