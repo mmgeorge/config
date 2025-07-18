@@ -13,9 +13,9 @@ local kinds = {
     "Struct",
     "Property",
     "EnumMember",
-    "Variable", 
+    "Variable",
     "Constant",
-  }, 
+  },
   minimal = {
     "Class",
     "Constructor",
@@ -28,20 +28,20 @@ local kinds = {
     "Package",
     "Object",
     "Struct",
-  }, 
+  },
 }
 
 return {
   {
-    "onsails/lspkind.nvim", 
+    "onsails/lspkind.nvim",
     opts = {}
   },
   {
     "stevearc/aerial.nvim",
     keys = {
-     { 
+      {
         "oo",
-        function ()
+        function()
           local mode = "minimal"
           local level = 2
 
@@ -93,9 +93,9 @@ return {
                 end
               }
             },
-            transform = function (item, context)
+            transform = function(item, context)
               -- Check if the item's kind is in the allowed kinds array
-              local has_kind = vim.tbl_contains(kinds[mode], item.item.kind) 
+              local has_kind = vim.tbl_contains(kinds[mode], item.item.kind)
               return not item.hidden and has_kind and item.item.level < level
             end,
             format = function(item, picker)
@@ -112,8 +112,8 @@ return {
               vim.list_extend(ret, Snacks.picker.format.tree(item, picker))
               table.insert(ret, { icon .. " ", icon_hl })
 
-              local text = item.text 
-              
+              local text = item.text
+
               -- local function_info = item.item.function_info
               -- if function_info then
               --   local params = table.concat(function_info.parameter_types, ", ")
@@ -121,7 +121,7 @@ return {
               --   if function_info.return_type then
               --     function_str = function_str .. " -> " .. function_info.return_type
               --   end
-              --   
+              --
               --   text = string.format("%-10s", text) .. " " .. function_str
               -- end
 
@@ -299,156 +299,156 @@ return {
       -- Call this function when aerial first sets symbols on a buffer.
       on_first_symbols = function(bufnr) end,
 
-        open_automatic = false,
+      open_automatic = false,
 
-        -- Run this command after jumping to a symbol (false will disable)
-        post_jump_cmd = "normal! zz",
+      -- Run this command after jumping to a symbol (false will disable)
+      post_jump_cmd = "normal! zz",
 
-        -- Invoked after each symbol is parsed, can be used to modify the parsed item,
-        -- or to filter it by returning false.
-        --
-        -- bufnr: a neovim buffer number
-        -- item: of type aerial.Symbol
-        -- ctx: a record containing the following fields:
-        --   * backend_name: treesitter, lsp, man...
-        --   * lang: info about the language
-        --   * symbols?: specific to the lsp backend
-        --   * symbol?: specific to the lsp backend
-        --   * syntax_tree?: specific to the treesitter backend
-        --   * match?: specific to the treesitter backend, TS query matc        post_parse_symbol = function(bufnr, item, ctx) Check if node is a function type and not nil
-        -- post_parse_symbol = function(bufnr, item, ctx)
-        --   local node = ctx.match.symbol.node
-        --
-        --   local func_types = {
-        --     "function_declaration", 
-        --     "method_definition", 
-        --     -- "function_item"
-        --   }
-        --
-        --   if node and vim.tbl_contains(func_types, node:type()) then
-        --     function get_annotation_type(node)
-        --       local type = node:child(1)
-        --       if type then
-        --         return vim.treesitter.get_node_text(type, bufnr)
-        --       end
-        --     end
-        --
-        --     function get_parameter_type(node) 
-        --       local type_annotation = node:field("type")[1]
-        --       if type_annotation then
-        --         return get_annotation_type(type_annotation)
-        --       end
-        --     end
-        --
-        --     function get_parameter_types(node)
-        --       local out = {}
-        --       local params = node:field("parameters")[1]
-        --       for param, _ in params:iter_children() do
-        --         local type = get_parameter_type(param)
-        --         if type then
-        --           table.insert(out, type)
-        --         end
-        --       end
-        --       return out
-        --     end
-        --
-        --     local function_info = {}
-        --     function_info.parameter_types = get_parameter_types(node)
-        --     local ret = node:field("return_type")[1] -- 'return_type' is a common field name, check grammar
-        --     if ret then
-        --       function_info.return_type = get_annotation_type(ret)
-        --     end
-        --
-        --     item.function_info = function_info
-        --   end
-        --
-        --   return true
-        -- end,
-
-
-        -- Invoked after all symbols have been parsed and post-processed,
-        -- allows to modify the symbol structure before final display
-        --
-        -- bufnr: a neovim buffer number
-        -- items: a collection of aerial.Symbol items, organized in a tree,
-        --        with 'parent' and 'children' fields
-        -- ctx: a record containing the following fields:
-        --   * backend_name: treesitter, lsp, man...
-        --   * lang: info about the language
-        --   * symbols?: specific to the lsp backend
-        --   * syntax_tree?: specific to the treesitter backend
-        -- post_add_all_symbols = function(bufnr, items, ctx)
-        --   if items and type(items) == 'table' then
-        --     for _, top_level_item in ipairs(items) do
-        --       if type(top_level_item) == 'table' then
-        --         local immediate_children = top_level_item.children
-        --         if immediate_children and type(immediate_children) == 'table' then
-        --           for _, child_item in ipairs(immediate_children) do
-        --             if type(child_item) == 'table' then
-        --               child_item.children = {}
-        --             end
-        --           end
-        --         end
-        --       end
-        --     end
-        --   end
-        --
-        --   return items
-        -- end,
+      -- Invoked after each symbol is parsed, can be used to modify the parsed item,
+      -- or to filter it by returning false.
+      --
+      -- bufnr: a neovim buffer number
+      -- item: of type aerial.Symbol
+      -- ctx: a record containing the following fields:
+      --   * backend_name: treesitter, lsp, man...
+      --   * lang: info about the language
+      --   * symbols?: specific to the lsp backend
+      --   * symbol?: specific to the lsp backend
+      --   * syntax_tree?: specific to the treesitter backend
+      --   * match?: specific to the treesitter backend, TS query matc        post_parse_symbol = function(bufnr, item, ctx) Check if node is a function type and not nil
+      -- post_parse_symbol = function(bufnr, item, ctx)
+      --   local node = ctx.match.symbol.node
+      --
+      --   local func_types = {
+      --     "function_declaration",
+      --     "method_definition",
+      --     -- "function_item"
+      --   }
+      --
+      --   if node and vim.tbl_contains(func_types, node:type()) then
+      --     function get_annotation_type(node)
+      --       local type = node:child(1)
+      --       if type then
+      --         return vim.treesitter.get_node_text(type, bufnr)
+      --       end
+      --     end
+      --
+      --     function get_parameter_type(node)
+      --       local type_annotation = node:field("type")[1]
+      --       if type_annotation then
+      --         return get_annotation_type(type_annotation)
+      --       end
+      --     end
+      --
+      --     function get_parameter_types(node)
+      --       local out = {}
+      --       local params = node:field("parameters")[1]
+      --       for param, _ in params:iter_children() do
+      --         local type = get_parameter_type(param)
+      --         if type then
+      --           table.insert(out, type)
+      --         end
+      --       end
+      --       return out
+      --     end
+      --
+      --     local function_info = {}
+      --     function_info.parameter_types = get_parameter_types(node)
+      --     local ret = node:field("return_type")[1] -- 'return_type' is a common field name, check grammar
+      --     if ret then
+      --       function_info.return_type = get_annotation_type(ret)
+      --     end
+      --
+      --     item.function_info = function_info
+      --   end
+      --
+      --   return true
+      -- end,
 
 
-        -- When true, aerial will automatically close after jumping to a symbol
-        close_on_select = false,
+      -- Invoked after all symbols have been parsed and post-processed,
+      -- allows to modify the symbol structure before final display
+      --
+      -- bufnr: a neovim buffer number
+      -- items: a collection of aerial.Symbol items, organized in a tree,
+      --        with 'parent' and 'children' fields
+      -- ctx: a record containing the following fields:
+      --   * backend_name: treesitter, lsp, man...
+      --   * lang: info about the language
+      --   * symbols?: specific to the lsp backend
+      --   * syntax_tree?: specific to the treesitter backend
+      -- post_add_all_symbols = function(bufnr, items, ctx)
+      --   if items and type(items) == 'table' then
+      --     for _, top_level_item in ipairs(items) do
+      --       if type(top_level_item) == 'table' then
+      --         local immediate_children = top_level_item.children
+      --         if immediate_children and type(immediate_children) == 'table' then
+      --           for _, child_item in ipairs(immediate_children) do
+      --             if type(child_item) == 'table' then
+      --               child_item.children = {}
+      --             end
+      --           end
+      --         end
+      --       end
+      --     end
+      --   end
+      --
+      --   return items
+      -- end,
 
-        -- The autocmds that trigger symbols update (not used for LSP backend)
-        update_events = "TextChanged,InsertLeave",
 
-        -- Show box drawing characters for the tree hierarchy
-        show_guides = false,
+      -- When true, aerial will automatically close after jumping to a symbol
+      close_on_select = false,
 
-        -- Set this function to override the highlight groups for certain symbols
-        -- get_highlight = function(symbol, is_icon, is_collapsed)
-        --   -- return "MyHighlight" .. symbol.kind
-        -- end,
+      -- The autocmds that trigger symbols update (not used for LSP backend)
+      update_events = "TextChanged,InsertLeave",
 
-        lsp = {
-          -- If true, fetch document symbols when LSP diagnostics update.
-          diagnostics_trigger_update = false,
+      -- Show box drawing characters for the tree hierarchy
+      show_guides = false,
 
-          -- Set to false to not update the symbols when there are LSP errors
-          update_when_errors = true,
+      -- Set this function to override the highlight groups for certain symbols
+      -- get_highlight = function(symbol, is_icon, is_collapsed)
+      --   -- return "MyHighlight" .. symbol.kind
+      -- end,
 
-          -- How long to wait (in ms) after a buffer change before updating
-          -- Only used when diagnostics_trigger_update = false
-          update_delay = 300,
+      lsp = {
+        -- If true, fetch document symbols when LSP diagnostics update.
+        diagnostics_trigger_update = false,
 
-          -- Map of LSP client name to priority. Default value is 10.
-          -- Clients with higher (larger) priority will be used before those with lower priority.
-          -- Set to -1 to never use the client.
-          priority = {
-            -- pyright = 10,
-          },
+        -- Set to false to not update the symbols when there are LSP errors
+        update_when_errors = true,
+
+        -- How long to wait (in ms) after a buffer change before updating
+        -- Only used when diagnostics_trigger_update = false
+        update_delay = 300,
+
+        -- Map of LSP client name to priority. Default value is 10.
+        -- Clients with higher (larger) priority will be used before those with lower priority.
+        -- Set to -1 to never use the client.
+        priority = {
+          -- pyright = 10,
         },
+      },
 
-        treesitter = {
-          -- How long to wait (in ms) after a buffer change before updating
-          update_delay = 300,
-        },
+      treesitter = {
+        -- How long to wait (in ms) after a buffer change before updating
+        update_delay = 300,
+      },
 
-        markdown = {
-          -- How long to wait (in ms) after a buffer change before updating
-          update_delay = 300,
-        },
+      markdown = {
+        -- How long to wait (in ms) after a buffer change before updating
+        update_delay = 300,
+      },
 
-        asciidoc = {
-          -- How long to wait (in ms) after a buffer change before updating
-          update_delay = 300,
-        },
+      asciidoc = {
+        -- How long to wait (in ms) after a buffer change before updating
+        update_delay = 300,
+      },
 
-        man = {
-          -- How long to wait (in ms) after a buffer change before updating
-          update_delay = 300,
-        },
-      }
+      man = {
+        -- How long to wait (in ms) after a buffer change before updating
+        update_delay = 300,
+      },
+    }
   }
 }
