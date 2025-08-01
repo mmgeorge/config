@@ -65,6 +65,33 @@ end
 local adapter = detect_adapter()
 
 return {
+  -- {
+  --   "milanglacier/minuet-ai.nvim",
+  --   config = function()
+  --     require('minuet').setup {
+  --       provider = "openai"
+  --       -- provider = "gemini",
+  --       -- provider_options = {
+  --       --   openai = {
+  --       --     model = 'gpt-4.1-mini',
+  --       --     system = "see [Prompt] section for the default value",
+  --       --     few_shots = "see [Prompt] section for the default value",
+  --       --     chat_input = "See [Prompt Section for default value]",
+  --       --     stream = true,
+  --       --     api_key = 'OPENAI_API_KEY',
+  --       --     optional = {
+  --       --       -- pass any additional parameters you want to send to OpenAI request,
+  --       --       -- e.g.
+  --       --       -- stop = { 'end' },
+  --       --       -- max_tokens = 256,
+  --       --       -- top_p = 0.9,
+  --       --     },
+  --       --   },
+  --       -- }
+  --       -- Your configuration options here
+  --     }
+  --   end,
+  -- },
   {
     "olimorris/codecompanion.nvim",
     dependencies = {

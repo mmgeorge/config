@@ -220,6 +220,10 @@ return {
 
       -- (Default) Only show the documentation popup when manually triggered
       completion = {
+        trigger = {
+          -- Recommended by minuet.
+          prefetch_on_insert = false
+        },
         accept = {
           auto_brackets = {
             enabled = false
@@ -252,16 +256,24 @@ return {
       -- Default list of enabled providers defined so that you can extend it
       -- elsewhere in your config, without redefining it, due to `opts_extend`
       sources = {
-        default = { 'lsp', 'path', 'custom_snippets', 'spell' },
-        -- default = { 'snippets', 'lsp', 'path', 'custom_snippets', 'spell' },
-
+        -- default = { 'lsp', 'path', 'custom_snippets', 'spell', 'minuet' },
+        default = { 'snippets', 'lsp', 'path', 'custom_snippets', 'spell' },
         -- min_keyword_length = 3,
         providers = {
           snippets = {
             score_offset = 20
           },
+          minuet = {
+            name = 'minuet',
+            module = 'minuet.blink',
+            async = true,
+            -- Should match minuet.config.request_timeout * 1000,
+            -- since minuet.config.request_timeout is in seconds
+            timeout_ms = 3000,
+            score_offset = 50, -- Gives minuet higher priority among suggestions
+          },
           lsp = {
-
+            async = true,
             transform_items = function(ctx, items)
               if true then
                 return items
