@@ -34,11 +34,20 @@ vim.opt.numberwidth = 1
 -- This sets it for everything -- ideally we just want rounded for diagnostics
 -- vim.o.winborder = 'rounded'
 
-vim.opt.foldexpr = "nvim_treesitter#foldexpr()"
-vim.o.foldcolumn = '1' -- '0' is not bad
-vim.o.foldlevel = 99   -- Using ufo provider need a large value, feel free to decrease the value
-vim.o.foldlevelstart = 99
-vim.o.foldenable = true
+vim.opt.foldcolumn = '1' -- '0' is not bad
+vim.opt.foldlevel = 99   -- Using ufo provider need a large value, feel free to decrease the value
+vim.opt.foldlevelstart = 99
+vim.opt.foldmethod = "expr"
+vim.opt.foldexpr = "v:lua.vim.treesitter.foldexpr()"
+vim.opt.foldenable = true
+
+-- vim.o.foldmethod = "expr"
+-- vim.o.foldexpr = "nvim_treesitter#foldexpr()"
+
+
+-- vim.o.foldtext = 'v:lua.vim.treesitter.foldtext()'
+-- vim.opt.foldexpr = "v:lua.vim.treesitter.foldexpr()"
+
 -- vim.opt.foldmethod = "expr"
 -- vim.opt.nofoldenable = true
 -- vim.cmd('set nofoldenable')
