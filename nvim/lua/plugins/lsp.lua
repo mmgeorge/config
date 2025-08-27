@@ -157,7 +157,7 @@ return {
           "lua_ls",
           "eslint",
           -- "ts_ls",
-          -- "vtsls", -- imports don't work correctly...
+          "vtsls", -- imports don't work correctly...
           "ts_query_ls",
           -- "oxlint",
           "terraformls",
@@ -306,55 +306,64 @@ return {
 
       vim.lsp.enable("rust_analyzer", true)
 
-      -- require("lspconfig.configs").vtsls = require("vtsls").lspconfig
-      -- vim.lsp.config('vtsls', {
-      --   capabilities = capabilities,
-      --   -- on_attach = function (client, buf)
-      --   --   client.server_capabilities.semanticTokensProvider = nil
-      --   -- end,
-      --   root_markers = { 'tsconfig.json' },
-      --   -- root_markers = { 'package.json' },
-      --   settings = {
-      --     vtsls = {
-      --       -- experimental = {
-      --       --   completion = {
-      --       --     enableServerSideFuzzyMatch = true,
-      --       --     entriesLimit = 15
-      --       --   }
-      --       -- }
-      --     },
-      --     typescript = {
-      --       suggest = {
-      --         objectLiteralMethodSnippets = {
-      --           enabled = false
-      --         },
-      --         -- This can slow things down
-      --         autoImports = true
-      --       },
-      --       tsserver = {
-      --         -- enableTracing = true,
-      --         -- log = "verbose",
-      --         -- useSyntaxServer = "never",
-      --         -- To use a memory limit greater than 4 GB, use `#typescript.tsserver.nodePath#
-      --         maxTsServerMemory = 3072,
-      --         experimental = {
-      --           enableProjectDiagnostics = false
-      --         }
-      --       },
-      --       preferences = {
-      --         includeCompletionsForModuleExports = true,
-      --         autoImportSpecifierExcludeRegexes = {
-      --           "node_modules/lucide-solid",
-      --           "lucide-solid$",
-      --           "lucide-solid/icons/index",
-      --           "solid-js/types",
-      --           "solid-js/web/types",
-      --           "solid-js/store/types/server",
-      --         }
-      --       }
-      --     }
-      --   }
-      -- })
+      require("lspconfig.configs").vtsls = require("vtsls").lspconfig
+      vim.lsp.config('vtsls', {
+        capabilities = capabilities,
+        -- on_attach = function (client, buf)
+        --   client.server_capabilities.semanticTokensProvider = nil
+        -- end,
+        root_markers = { 'tsconfig.json' },
+        -- root_markers = { 'package.json' },
+        settings = {
+          vtsls = {
+            -- experimental = {
+            --   completion = {
+            --     enableServerSideFuzzyMatch = true,
+            --     entriesLimit = 15
+            --   }
+            -- }
+          },
+          typescript = {
+            suggest = {
+              objectLiteralMethodSnippets = {
+                enabled = false
+              },
+              -- This can slow things down
+              autoImports = true
+            },
+            tsserver = {
+              -- enableTracing = true,
+              -- log = "verbose",
+              -- useSyntaxServer = "never",
+              -- To use a memory limit greater than 4 GB, use `#typescript.tsserver.nodePath#
+              maxTsServerMemory = 3072,
+              experimental = {
+                enableProjectDiagnostics = false
+              }
+            },
+            preferences = {
+              includeCompletionsForModuleExports = true,
+              autoImportSpecifierExcludeRegexes = {
+                -- JSSDK
+                "@webgis",
+                "@amcharts",
+                "dist",
+                "3d",
+                "node_modules",
+                "mocha:",
+                "mocha",
+                "@testing-library",
+                "node_modules/lucide-solid",
+                "lucide-solid$",
+                "lucide-solid/icons/index",
+                "solid-js/types",
+                "solid-js/web/types",
+                "solid-js/store/types/server",
+              }
+            }
+          }
+        }
+      })
       -- vim.lsp.enable("vtsls", true)
 
 

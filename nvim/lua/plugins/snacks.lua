@@ -81,6 +81,18 @@ return {
             ignored = false,
             follow = false,
             supports_live = true,
+            exclude = {
+              -- For the JS SDK
+              "smartMapping",
+              "webscene",
+              "3d",
+              "3D",
+              "tests/data",
+              "dojo",
+              "pkg",
+              "mjs",
+              "widgets"
+            }
           })
         end,
         desc = "Files"
