@@ -148,27 +148,27 @@ return {
         --   return 1
         -- end,
         implementation = "prefer_rust_with_warning",
-        sorts = {
-          -- function(a, b)
-          --   local a_priority = priorities[a.source_id] or 0
-          --   local b_priority = priorities[b.source_id] or 0
-          --   if a_priority ~= b_priority then return a_priority > b_priority end
-          -- end,
-          'exact',
-          -- function(a, b)
-          --   local a_priority = completionItemPriorities[a.kind] or 100
-          --   local b_priority = completionItemPriorities[b.kind] or 100
-          --
-          --   if a_priority ~= b_priority then return a_priority > b_priority end
-          -- end,
-          deprioritize_common_rust_traits,
-          'sort_text', -- score seems to break things quite a bit. For instance, typing
-          'score',     -- in row_g was resolving first to filter_row_groups instead of row_groups
-          -- function(a, b)
-          --   return #a.label < #b.label
-          -- end,
-          -- 'label'
-        }
+        -- sorts = {
+        --   -- function(a, b)
+        --   --   local a_priority = priorities[a.source_id] or 0
+        --   --   local b_priority = priorities[b.source_id] or 0
+        --   --   if a_priority ~= b_priority then return a_priority > b_priority end
+        --   -- end,
+        --   'exact',
+        --   -- function(a, b)
+        --   --   local a_priority = completionItemPriorities[a.kind] or 100
+        --   --   local b_priority = completionItemPriorities[b.kind] or 100
+        --   --
+        --   --   if a_priority ~= b_priority then return a_priority > b_priority end
+        --   -- end,
+        --   deprioritize_common_rust_traits,
+        --   'sort_text', -- score seems to break things quite a bit. For instance, typing
+        --   'score',     -- in row_g was resolving first to filter_row_groups instead of row_groups
+        --   -- function(a, b)
+        --   --   return #a.label < #b.label
+        --   -- end,
+        --   -- 'label'
+        -- }
       },
       keymap = {
         ['<C-l>'] = { 'show', 'show_documentation', 'hide_documentation' },
@@ -257,7 +257,8 @@ return {
       -- elsewhere in your config, without redefining it, due to `opts_extend`
       sources = {
         -- default = { 'lsp', 'path', 'custom_snippets', 'spell', 'minuet' },
-        default = { 'snippets', 'lsp', 'path', 'custom_snippets', 'spell' },
+        default = { 'lsp', 'path', 'custom_snippets', 'spell' },
+        -- default = { 'snippets', 'lsp', 'path', 'custom_snippets', 'spell' },
         -- min_keyword_length = 3,
         providers = {
           snippets = {
@@ -275,9 +276,6 @@ return {
           lsp = {
             async = true,
             transform_items = function(ctx, items)
-              if true then
-                return items
-              end
               local function should_filter(label)
                 if not label then
                   return false;

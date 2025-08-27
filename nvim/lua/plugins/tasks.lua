@@ -12,15 +12,15 @@ return {
         "<cmd>OverseerRun<CR>",
         mode = { "n", "x" },
         desc = "Run Task",
-      }, 
+      },
       {
         "<leader>tt",
         "<cmd>OverseerToggle<CR>",
         mode = { "n", "x" },
         desc = "Toggle Tasks",
-      }, 
+      },
     },
-    config = function ()
+    config = function()
       require("overseer").setup({
         strategy = {
           "toggleterm",
@@ -195,7 +195,7 @@ return {
         component_aliases = {
           -- Most tasks are initialized with the default components
           default = {
-            { "display_duration", detail_level = 2 },
+            { "display_duration",    detail_level = 2 },
             "on_output_summarize",
             "on_exit_set_status",
             "on_complete_notify",
@@ -246,64 +246,89 @@ return {
           },
         },
       })
-      
+
       require("overseer").register_template({
-        name = "Tsc FastWatch", 
-        builder = function ()
+        name = "Tsc FastWatch",
+        builder = function()
           return {
-            cmd = {"npx", "tsc", "--watch", "--assumeChangesOnlyAffectDirectDependencies --noEmit" },
+            cmd = { "npx", "tsc", "--watch", "--assumeChangesOnlyAffectDirectDependencies --noEmit" },
             components = {
               {
-                "on_output_parse", 
+                "on_output_parse",
                 problem_matcher = "$tsc-watch"
-              }, 
+              },
               "default",
               "on_result_notify",
               "on_result_diagnostics",
-              "on_complete_restart", 
-              "on_exit_set_status", 
+              "on_complete_restart",
+              "on_exit_set_status",
             },
             env = {
-              NODE_OPTIONS = "--max-old-space-size=8192" 
+              NODE_OPTIONS = "--max-old-space-size=8192"
             },
           }
         end
-      }) 
-      
+      })
+
       require("overseer").register_template({
-        name = "Tsc Watch", 
-        builder = function ()
+        name = "Tsc Watch",
+        builder = function()
           return {
-            cmd = {"npx", "tsc", "--watch", "--noEmit", "-p", "tsconfig.app.json" },
+            cmd = { "npx", "tsc", "--watch", "--noEmit", "-p", "tsconfig.app.json" },
             components = {
               {
-                "on_output_parse", 
+                "on_output_parse",
                 problem_matcher = "$tsc-watch"
-              }, 
+              },
               "default",
               "on_result_notify",
               "on_result_diagnostics",
-              "on_complete_restart", 
-              "on_exit_set_status", 
+              "on_complete_restart",
+              "on_exit_set_status",
             },
             env = {
-              NODE_OPTIONS = "--max-old-space-size=8192" 
+              NODE_OPTIONS = "--max-old-space-size=8192"
             },
           }
         end
-      }) 
+      })
 
       require("overseer").register_template({
         -- Required fields
         name = "Karma start",
         builder = function(params)
           local file = vim.fn.expand '%:~:.'
+          -- return {
+          --   name = "Start karma",
+          --   strategy = {
+          --     "orchestrator",
+          --     tasks = {
+          --       {
+          --         name = "Start Karma",
+          --         cmd = { 'npx', 'karma', 'start' },
+          --         args = { "--root", file },
+          --       },
+          --       {
+          --         name = "Open Windows Chrome",
+          --         cmd = {
+          --           "powershell.exe",
+          --           "-NoProfile",
+          --           "-Command",
+          --           "Start-Process",
+          --           "chrome.exe",
+          --           "http://localhost:5137"
+          --         },
+          --         -- cmd = { "cmd.exe", "/c", "start", "chrome.exe", "http://localhost:9876/debug.html" },
+          --       }
+          --     }
+          --   }
+          -- }
           -- This must return an overseer.TaskDefinition
           return {
             -- cmd is the only required field
-            cmd = {'npx', 'karma', 'start'},
+            cmd = { 'npx', 'karma', 'start' },
             -- additional arguments for the cmd
-            args = {"--root", file},
+            args = { "--root", file },
             -- the name of the task (defaults to the cmd of the task)
             -- name = "",
             -- set the working directory for the task
@@ -333,14 +358,14 @@ return {
         condition = {
           -- A string or list of strings
           -- Only matches when current buffer is one of the listed filetypes
-          filetype = {"typescript"},
+          filetype = { "typescript" },
           -- A string or list of strings
           -- Only matches when cwd is inside one of the listed dirs
           -- dir = "/home/user/my_project",
           -- Arbitrary logic for determining if task is available
           -- callback = function(search)
-            -- print(vim.inspect(search))
-            -- return true
+          -- print(vim.inspect(search))
+          -- return true
           -- end,
         },
       });
