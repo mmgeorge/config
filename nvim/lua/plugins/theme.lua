@@ -110,6 +110,8 @@ return {
       vim.api.nvim_set_hl(0, "@decorator", { fg = colors.red })
       vim.api.nvim_set_hl(0, "@function.macro.rust", { fg = colors.red })
 
+      vim.api.nvim_set_hl(0, "SpellBad", { fg = colors.red, underline = true })
+
       -- StatusLine
       vim.api.nvim_set_hl(0, "StatusLineError", { fg = colors.error })
 
