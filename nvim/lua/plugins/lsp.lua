@@ -164,6 +164,7 @@ return {
           "cssls",
           "html",
           "tailwindcss",
+          "harper_ls"
           -- "taplo"
         }
 
@@ -203,6 +204,31 @@ return {
       })
 
       local capabilities = require('blink.cmp').get_lsp_capabilities()
+
+      vim.lsp.config("harper_ls", {
+        capabilities = capabilities,
+        settings = {
+          ["harper-ls"] = {
+            linters = {
+              SpellCheck = true,
+              SpelledNumbers = false,
+              AnA = true,
+              SentenceCapitalization = true,
+              UnclosedQuotes = true,
+              WrongQuotes = false,
+              LongSentences = true,
+              RepeatedWords = true,
+              Spaces = true,
+              Matcher = true,
+              CorrectNumberSuffix = true
+            },
+            diagnosticSeverity = "warning",
+            dialect = "American",
+          }
+        }
+      })
+
+      vim.lsp.enable('harper_ls')
 
       -- Disable semantic tokens
       vim.api.nvim_create_autocmd('LspAttach', {
