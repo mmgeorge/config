@@ -1,3 +1,4 @@
+
 return {
   -- {
   --   "rachartier/tiny-inline-diagnostic.nvim",
@@ -222,7 +223,7 @@ return {
               Matcher = true,
               CorrectNumberSuffix = true
             },
-            diagnosticSeverity = "hint",
+            -- diagnosticSeverity = "warning",
             dialect = "American",
           }
         }
