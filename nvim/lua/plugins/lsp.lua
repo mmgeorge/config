@@ -222,7 +222,7 @@ return {
               Matcher = true,
               CorrectNumberSuffix = true
             },
-            diagnosticSeverity = "warning",
+            diagnosticSeverity = "hint",
             dialect = "American",
           }
         }

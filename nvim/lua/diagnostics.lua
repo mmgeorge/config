@@ -26,6 +26,7 @@ vim.diagnostic.config({
   signs = false,
   underline = {
     severity = {
+      vim.diagnostic.severity.HINT,
       vim.diagnostic.severity.WARN,
       vim.diagnostic.severity.ERROR,
     }
