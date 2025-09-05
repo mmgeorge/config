@@ -228,6 +228,14 @@ return {
         underline = true
         -- undercurl = true,
       })
+
+      vim.api.nvim_set_hl(0, "DiagnosticUnderlineHint", {
+        -- fg = "yellow",
+        underline = true,
+      })
+
+      -- vim.cmd([[highlight DiagnosticUnderlineError cterm=undercurl ctermfg=red gui=undercurl guifg=red]])
+      -- vim.cmd([[highlight DiagnosticUnderlineWarn cterm=undercurl ctermfg=yellow gui=undercurl guifg=yellow]])
     end,
   }
 }
