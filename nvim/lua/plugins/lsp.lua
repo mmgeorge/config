@@ -25,7 +25,9 @@ return {
           "cssls",
           "html",
           "tailwindcss",
-          "harper_ls"
+          -- "harper_ls",
+          "ltex_plus",
+          "texlab"
           -- "taplo"
         }
 
@@ -52,7 +54,8 @@ return {
     "neovim/nvim-lspconfig",
     dependencies = {
       'saghen/blink.cmp',
-      'yioneko/nvim-vtsls'
+      'yioneko/nvim-vtsls',
+      'barreiroleo/ltex_extra.nvim'
     },
     config = function()
       -- vim.lsp.set_log_level(1)
@@ -66,30 +69,94 @@ return {
 
       local capabilities = require('blink.cmp').get_lsp_capabilities()
 
-      vim.lsp.config("harper_ls", {
+      -- vim.lsp.config("harper_ls", {
+      --   capabilities = capabilities,
+      --   settings = {
+      --     ["harper-ls"] = {
+      --       linters = {
+      --         SpellCheck = true,
+      --         SpelledNumbers = false,
+      --         AnA = true,
+      --         SentenceCapitalization = true,
+      --         UnclosedQuotes = true,
+      --         WrongQuotes = false,
+      --         LongSentences = true,
+      --         RepeatedWords = true,
+      --         Spaces = true,
+      --         Matcher = true,
+      --         CorrectNumberSuffix = true
+      --       },
+      --       -- diagnosticSeverity = "warning",
+      --       dialect = "American",
+      --     }
+      --   }
+      -- })
+      --
+      -- vim.lsp.enable('harper_ls')
+
+      vim.lsp.enable('texlab')
+
+      vim.lsp.config("ltex_plus", {
         capabilities = capabilities,
+        on_attach = function(client, bufnr)
+          -- rest of your on_attach process.
+          require("ltex_extra").setup {
+            path = vim.fn.stdpath("config") .. "/ltex"
+          }
+        end,
+        filetypes = {
+          "bib",
+          "context",
+          "gitcommit",
+          "html",
+          "markdown",
+          "org",
+          "pandoc",
+          "plaintex",
+          "quarto",
+          "mail",
+          "mdx",
+          "rmd",
+          "rnoweb",
+          "rst",
+          "tex",
+          "text",
+          "typst",
+          "xhtml",
+          "typescript",
+          "typescriptreact"
+        },
         settings = {
-          ["harper-ls"] = {
-            linters = {
-              SpellCheck = true,
-              SpelledNumbers = false,
-              AnA = true,
-              SentenceCapitalization = true,
-              UnclosedQuotes = true,
-              WrongQuotes = false,
-              LongSentences = true,
-              RepeatedWords = true,
-              Spaces = true,
-              Matcher = true,
-              CorrectNumberSuffix = true
+          ltex = {
+            enabled = {
+              "bibtex",
+              "context",
+              "context.tex",
+              "html",
+              "latex",
+              "markdown",
+              "mdx",
+              "typst",
+              "asciidoc",
+              "neorg",
+              "org",
+              "quarto",
+              "restructuredtext",
+              "rsweave",
+              "typescript",
+              "typescriptreact"
             },
             -- diagnosticSeverity = "warning",
-            dialect = "American",
+            diagnosticSeverity = "hint",
+            completionEnabled = true,
+            ["ltex-ls"] = {
+              logLevel = "finest"
+            }
           }
         }
       })
 
-      vim.lsp.enable('harper_ls')
+      vim.lsp.enable("ltex_plus")
 
       -- Disable semantic tokens
       vim.api.nvim_create_autocmd('LspAttach', {

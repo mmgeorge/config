@@ -46,6 +46,7 @@ return {
           "toml",
           "slang",
           "yaml",
+          "latex"
         },
         sync_install = false,
         highlight = {
