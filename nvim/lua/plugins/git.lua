@@ -64,9 +64,9 @@ return {
         -- "unicode" is the graph like https://github.com/rbong/vim-flog
         graph_style = "unicode",
         -- Used to generate URL's for branch popup action "pull request".
-        git_services = {
-          ["github.com"] = "https://github.com/${owner}/${repository}/compare/${branch_name}?expand=1",
-        },
+        -- git_services = {
+        --   ["github.com"] = "https://github.com/${owner}/${repository}/compare/${branch_name}?expand=1",
+        -- },
         initial_branch_name = "matt9222/",
         -- Persist the values of switches/options within and across sessions
         remember_settings = true,
