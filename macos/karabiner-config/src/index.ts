@@ -65,6 +65,10 @@ writeToProfile('Default profile', [
     ])
   ]),
 
+  rule("delete").manipulators([
+    map('delete_forward').to('delete_or_backspace', 'left_command')
+  ]),
+
   rule("left-command - layer").manipulators([
     withCondition({ type: "device_if", identifiers: [{ is_built_in_keyboard: true }] })([
       withModifier('left_command')([
