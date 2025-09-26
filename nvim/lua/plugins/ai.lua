@@ -197,6 +197,7 @@ return {
           return require("codecompanion.adapters").extend("copilot", {
             schema = {
               model = {
+                -- default = "gpt-5-mini",
                 default = "gpt-4.1",
                 -- default = "gpt-4o",
                 -- choices = {
@@ -742,14 +743,14 @@ This is the code to document:
       },
     }
   },
-  -- {
-  --   "zbirenbaum/copilot.lua",
-  --   cmd = "Copilot",
-  --   event = "InsertEnter",
-  --   config = function()
-  --     require("copilot").setup({})
-  --   end,
-  -- },
+  {
+    "zbirenbaum/copilot.lua",
+    cmd = "Copilot",
+    event = "InsertEnter",
+    config = function()
+      require("copilot").setup({})
+    end,
+  },
   -- {
   --   "yetone/avante.nvim",
   --   event = "VeryLazy",
