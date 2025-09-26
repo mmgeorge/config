@@ -1,18 +1,18 @@
 local k = require("keys")
 local utils = require("utils")
 
-vim.g.clipboard = {
-  name = "wslClipboard",
-  copy = {
-    ['+'] = 'clip.exe',
-    ['*'] = 'clip.exe'
-  },
-  paste = {
-    ['+'] = 'powershell.exe -c [Console]::Out.Write($(Get-Clipboard -Raw).tostring().replace("`r", ""))',
-    ['*'] = 'powershell.exe -c [Console]::Out.Write($(Get-Clipboard -Raw).tostring().replace("`r", ""))'
-  },
-  cache_enabled = 0
-}
+-- vim.g.clipboard = {
+--   name = "wslClipboard",
+--   copy = {
+--     ['+'] = 'clip.exe',
+--     ['*'] = 'clip.exe'
+--   },
+--   paste = {
+--     ['+'] = 'powershell.exe -c [Console]::Out.Write($(Get-Clipboard -Raw).tostring().replace("`r", ""))',
+--     ['*'] = 'powershell.exe -c [Console]::Out.Write($(Get-Clipboard -Raw).tostring().replace("`r", ""))'
+--   },
+--   cache_enabled = 0
+-- }
 
 -- Unmaps -
 vim.keymap.set({ 'n', 'x' }, 'B', '<Nop>', {})
@@ -256,7 +256,10 @@ end)
 k.keymap({ 'i', 'v', 'c', 't', 's', 'o', 'x', 't' }, '<C-o>', '<Esc>') -- Cancel
 vim.api.nvim_command(":tnoremap <ESC> <C-\\><C-n>")
 
+-- windows:
 k.keymap('n', '<C-_>', '<Plug>(comment_toggle_linewise_current)j') -- Comment line, maps to C-/
+-- macos:
+k.keymap('n', '<C-/>', '<Plug>(comment_toggle_linewise_current)j') -- Comment line, maps to C-/
 
 k.keymap('n', '<C-e>',
   function()
