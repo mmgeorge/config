@@ -59,9 +59,33 @@ writeToProfile('Default profile', [
       ])
   ]),
 
-  rule("caps-lock - as escape").manipulators([
-    withCondition({ type: "device_if", identifiers: [{ is_built_in_keyboard: true }] })([
-      map('caps_lock').to('escape')
+  rule("laptop option - as command").manipulators([
+    withCondition(
+      { type: "device_if", identifiers: [{ is_built_in_keyboard: true }] },
+      // { type: "frontmost_application_unless", bundle_identifiers: ["^com\\.github\\.wez\\.wezterm$"] }
+    )(
+      [
+        map('left_option').to('right_command'),
+      ])
+  ]),
+
+  rule("caps-lock - as command").manipulators([
+    withCondition(
+      { type: "device_if", identifiers: [{ is_built_in_keyboard: true }] },
+      { type: "frontmost_application_unless", bundle_identifiers: ["^com\\.github\\.wez\\.wezterm$"] }
+    )(
+      [
+        map('caps_lock').to('right_command'),
+      ])
+  ]),
+
+  rule("caps-lock - as escape-control").manipulators([
+    withCondition(
+      { type: "device_if", identifiers: [{ is_built_in_keyboard: true }] },
+      { type: "frontmost_application_if", bundle_identifiers: ["^com\\.github\\.wez\\.wezterm$"] }
+
+    )([
+      map('caps_lock').toIfHeldDown('left_control').toIfAlone('escape')
     ])
   ]),
 
@@ -70,12 +94,17 @@ writeToProfile('Default profile', [
   ]),
 
   rule("left-command - layer").manipulators([
-    withCondition({ type: "device_if", identifiers: [{ is_built_in_keyboard: true }] })([
+    withCondition(
+      { type: "device_if", identifiers: [{ is_built_in_keyboard: true }] },
+      { type: "frontmost_application_unless", bundle_identifiers: ["^com\\.apple\\.loginwindow$"] }
+    )([
       withModifier('left_command')([
-        map('q').to('w'),
+        // map('q').to('w'),
+        map('q').to('home'),
         map('w').to('page_up'),
         map('e').to('page_down'),
-        map('r').to('grave_accent_and_tilde', 'left_shift'), // ~
+        map('r').to('end'), // ~
+        // map('r').to('grave_accent_and_tilde', 'left_shift'), // ~
         map('t').to('b'),
 
         map('a').to('left_arrow'),
@@ -113,9 +142,15 @@ writeToProfile('Default profile', [
   ]),
 
   rule('Key mapping').manipulators([
-    withCondition({ type: "device_if", identifiers: [{ is_built_in_keyboard: true }] })([
+    withCondition(
+      { type: "device_if", identifiers: [{ is_built_in_keyboard: true }] },
+      { type: "frontmost_application_unless", bundle_identifiers: ["^com\\.apple\\.loginwindow$"] }
+    )([
       withMapper(aptV3AngleMod)((k, v) => map(k).to(v as ToKeyCode)),
-      withMapper(aptV3AngleMod)((k, v) => map(k, "shift").to(v as ToKeyCode, "shift"))
+      withMapper(aptV3AngleMod)((k, v) => map(k, "shift").to(v as ToKeyCode, "shift")),
+      withMapper(aptV3AngleMod)((k, v) => map(k, "right_command").to(v as ToKeyCode, "right_command")),
+      withMapper(aptV3AngleMod)((k, v) => map(k, "control").to(v as ToKeyCode, "right_control")),
+      withMapper(aptV3AngleMod)((k, v) => map(k, "option").to(v as ToKeyCode, "option"))
     ])
   ])
 ])
