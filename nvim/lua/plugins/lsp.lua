@@ -149,9 +149,9 @@ return {
             -- diagnosticSeverity = "warning",
             diagnosticSeverity = "hint",
             completionEnabled = true,
-            ["ltex-ls"] = {
-              logLevel = "finest"
-            }
+            -- ["ltex-ls"] = {
+            --   logLevel = "finest"
+            -- }
           }
         }
       })

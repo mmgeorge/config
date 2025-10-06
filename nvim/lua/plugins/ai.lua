@@ -197,8 +197,8 @@ return {
           return require("codecompanion.adapters").extend("copilot", {
             schema = {
               model = {
-                default = "gpt-5-mini",
-                -- default = "gpt-4.1",
+                -- default = "gpt-5-mini",
+                default = "gpt-4.1",
                 -- default = "gpt-4o",
                 -- choices = {
                 --   ["gemini-2.5-flash-preview-04-17"] = { opts = { can_reason = true } },
