@@ -28,12 +28,16 @@ return {
     config = function()
       vim.api.nvim_create_autocmd({ 'BufEnter' }, {
         pattern = "COMMIT_EDITMSG",
-        callback = function()
+        callback = function(args)
+          if vim.b[args.buf].ai_commit_generated then return end
+
           -- Only generate the commit message if the buffer is empty
           if vim.api.nvim_buf_get_lines(0, 0, -1, false)[1] == nil or
               vim.api.nvim_buf_get_lines(0, 0, -1, false)[1] == "" then
             local ok, err = pcall(function()
+              vim.notify("GEN MESSAGE")
               require("codecompanion").prompt("commit")
+              vim.b[args.buf].ai_commit_generated = true
             end)
             if not ok then
               -- Might not have an LLM setup
