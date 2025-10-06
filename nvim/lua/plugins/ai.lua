@@ -197,8 +197,8 @@ return {
           return require("codecompanion.adapters").extend("copilot", {
             schema = {
               model = {
-                -- default = "gpt-5-mini",
-                default = "gpt-4.1",
+                default = "gpt-5-mini",
+                -- default = "gpt-4.1",
                 -- default = "gpt-4o",
                 -- choices = {
                 --   ["gemini-2.5-flash-preview-04-17"] = { opts = { can_reason = true } },
@@ -699,12 +699,10 @@ This is the code to document:
               role = "user",
               content = function()
                 local handle = io.popen("git diff --cached")
-                local result = handle:read("*a")
-                handle:close()
-
-
+                -- local result = handle:read("*a")
+                -- handle:close()
                 return string.format(
-                  [[You are an expert at following the Conventional Commit specification. Given the git diff listed below, generate a commit message for me. Do not indent the first line. The description under the description should be no more than 2 sentences, with each line no more that 80 characters. Prefer omitting this description when possible. Do not list any breaking changes:
+                  [[Generate a single-line conventional commit without a scope that is less than or equal to 50 characters:
 ```diff
 %s
 ```

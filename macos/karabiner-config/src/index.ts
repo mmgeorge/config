@@ -56,6 +56,7 @@ writeToProfile('Default profile', [
     )(
       [
         map('left_control').to('left_command'),
+        map('left_control', 'shift').to('left_command', 'shift'),
       ])
   ]),
 
@@ -76,6 +77,7 @@ writeToProfile('Default profile', [
     )(
       [
         map('caps_lock').to('right_command'),
+        map('caps_lock', 'shift').to('right_command', 'shift'),
       ])
   ]),
 
@@ -134,8 +136,8 @@ writeToProfile('Default profile', [
 
         map('n').to('4', 'left_shift'), // $
         map('m').to('-', 'left_shift'), // _
-        map('.').to('='),
-        map(',').to('[', 'left_shift'), // {
+        map(',').to('='),
+        map('.').to('[', 'left_shift'), // {
         map('/').to(']', 'left_shift'), // }
       ])
     ])
@@ -148,9 +150,15 @@ writeToProfile('Default profile', [
     )([
       withMapper(aptV3AngleMod)((k, v) => map(k).to(v as ToKeyCode)),
       withMapper(aptV3AngleMod)((k, v) => map(k, "shift").to(v as ToKeyCode, "shift")),
+      withMapper(aptV3AngleMod)((k, v) => map(k, ["shift", "right_command"]).to(v as ToKeyCode, ["shift", "right_command"])),
       withMapper(aptV3AngleMod)((k, v) => map(k, "right_command").to(v as ToKeyCode, "right_command")),
+      withMapper(aptV3AngleMod)((k, v) => map(k, ["control", "shift"]).to(v as ToKeyCode, ["right_control", "shift"])),
       withMapper(aptV3AngleMod)((k, v) => map(k, "control").to(v as ToKeyCode, "right_control")),
       withMapper(aptV3AngleMod)((k, v) => map(k, "option").to(v as ToKeyCode, "option"))
     ])
   ])
-])
+],
+  {
+    "basic.to_if_held_down_threshold_milliseconds": 50
+
+  })
