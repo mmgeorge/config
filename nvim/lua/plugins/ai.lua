@@ -179,65 +179,67 @@ return {
         -- log_level = "TRACE",
       },
       adapters = {
-        copilot = function()
-          return require("codecompanion.adapters").extend("copilot", {
-            schema = {
-              model = {
-                default = "gpt-5",
-                -- choices = {
-                --   ["gemini-2.5-flash-preview-04-17"] = { opts = { can_reason = true } },
-                --   "gemini-2.5-pro-preview-03-25",
-                --   "gemini-2.0-flash",
-                -- }
+        http = {
+          copilot = function()
+            return require("codecompanion.adapters").extend("copilot", {
+              schema = {
+                model = {
+                  default = "gpt-5",
+                  -- choices = {
+                  --   ["gemini-2.5-flash-preview-04-17"] = { opts = { can_reason = true } },
+                  --   "gemini-2.5-pro-preview-03-25",
+                  --   "gemini-2.0-flash",
+                  -- }
+                },
               },
-            },
-          })
-        end,
-        copilot_4o = function()
-          return require("codecompanion.adapters").extend("copilot", {
-            schema = {
-              model = {
-                -- default = "gpt-5-mini",
-                default = "gpt-4.1",
-                -- default = "gpt-4o",
-                -- choices = {
-                --   ["gemini-2.5-flash-preview-04-17"] = { opts = { can_reason = true } },
-                --   "gemini-2.5-pro-preview-03-25",
-                --   "gemini-2.0-flash",
-                -- }
+            })
+          end,
+          copilot_4o = function()
+            return require("codecompanion.adapters").extend("copilot", {
+              schema = {
+                model = {
+                  -- default = "gpt-5-mini",
+                  default = "gpt-4.1",
+                  -- default = "gpt-4o",
+                  -- choices = {
+                  --   ["gemini-2.5-flash-preview-04-17"] = { opts = { can_reason = true } },
+                  --   "gemini-2.5-pro-preview-03-25",
+                  --   "gemini-2.0-flash",
+                  -- }
+                },
               },
-            },
-          })
-        end,
-        gemini = function()
-          return require("codecompanion.adapters").extend("gemini", {
-            schema = {
-              env = {
-                api_key = "GEMINI_API_KEY"
+            })
+          end,
+          gemini = function()
+            return require("codecompanion.adapters").extend("gemini", {
+              schema = {
+                env = {
+                  api_key = "GEMINI_API_KEY"
+                },
+                model = {
+                  default = "gemini-2.5-flash-preview-04-17",
+                  choices = {
+                    ["gemini-2.5-flash-preview-04-17"] = { opts = { can_reason = false } },
+                    "gemini-2.5-pro-preview-03-25",
+                    "gemini-2.0-flash",
+                  }
+                },
               },
-              model = {
-                default = "gemini-2.5-flash-preview-04-17",
-                choices = {
-                  ["gemini-2.5-flash-preview-04-17"] = { opts = { can_reason = false } },
-                  "gemini-2.5-pro-preview-03-25",
-                  "gemini-2.0-flash",
-                }
+            })
+          end,
+          openai = function()
+            return require("codecompanion.adapters").extend("openai", {
+              schema = {
+                env = {
+                  api_key = "OPENAI_API_KEY"
+                },
+                model = {
+                  default = "gpt-4.1",
+                },
               },
-            },
-          })
-        end,
-        openai = function()
-          return require("codecompanion.adapters").extend("openai", {
-            schema = {
-              env = {
-                api_key = "OPENAI_API_KEY"
-              },
-              model = {
-                default = "gpt-4.1",
-              },
-            },
-          })
-        end,
+            })
+          end,
+        }
       },
       strategies = {
         chat = {
@@ -287,7 +289,7 @@ return {
             },
             stop = {
               modes = {
-                n = "q",
+                n = "gq",
               },
               index = 5,
               callback = "keymaps.stop",

@@ -38,6 +38,8 @@ return {
               vim.notify("GEN MESSAGE")
               require("codecompanion").prompt("commit")
               vim.b[args.buf].ai_commit_generated = true
+              -- For some reason, codecompanion inline assistant map gets added?
+              vim.cmd("mapclear <buffer>")
             end)
             if not ok then
               -- Might not have an LLM setup
@@ -160,7 +162,7 @@ return {
         use_default_keymaps = false,
         mappings = {
           commit_editor = {
-            ["q"] = "Close",
+            -- ["q"] = "Close",
             ["<c-c><c-c>"] = "Submit",
             ["<c-c><c-k>"] = "Abort",
             ["<m-p>"] = "PrevMessage",
