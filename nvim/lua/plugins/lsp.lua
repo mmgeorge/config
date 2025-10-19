@@ -205,60 +205,60 @@ return {
       --
       -- vim.lsp.enable('taplo')
 
-      vim.lsp.config('rust_analyzer', {
-        -- We install this from rustup rather than Mason
-        cmd = { "rust-analyzer" },
-        -- This slows down saving quite a bit
-        -- on_attach = function(client, bufnr)
-        --   vim.api.nvim_create_autocmd("BufWritePre", {
-        --     buffer = bufnr,
-        --     callback = function() vim.lsp.buf.format() end,
-        --     group = format_sync_grp,
-        --   })
-        -- end,
-        capabilities = capabilities,
-        settings = {
-          ["rust-analyzer"] = {
-            completion = {
-              autoself = {
-                enable = false
-              }
-            },
-            -- numThreads = 8,
-            cargo = {
-              -- allTargets = false,
-              features = "all",
-              extraEnv = {
-                ["CARGO_TARGET_DIR"] = "target/check",
-              }
-              -- buildScripts = {
-              -- enable = false,
-              -- rebuildOnSave = false
-              -- }
-            },
-            check = {
-              allTargets = true,
-              workspace = true,
-            },
-            cachePriming = {
-              enable = false,
-              -- numThreads = 8
-            },
-            diagnostiscs = {
-              -- For tsify
-              -- https://github.com/madonoharu/tsify/issues/42#issuecomment-2088746822
-              disabled = { "non_snake_case" }
-            },
-            procMacro = {
-              enable = true,
-              ignore = {}
-            }
+      -- vim.lsp.config('rust_analyzer', {
+      --   -- We install this from rustup rather than Mason
+      --   cmd = { "rust-analyzer" },
+      --   -- This slows down saving quite a bit
+      --   -- on_attach = function(client, bufnr)
+      --   --   vim.api.nvim_create_autocmd("BufWritePre", {
+      --   --     buffer = bufnr,
+      --   --     callback = function() vim.lsp.buf.format() end,
+      --   --     group = format_sync_grp,
+      --   --   })
+      --   -- end,
+      --   capabilities = capabilities,
+      --   settings = {
+      --     ["rust-analyzer"] = {
+      --       completion = {
+      --         autoself = {
+      --           enable = false
+      --         }
+      --       },
+      --       -- numThreads = 8,
+      --       cargo = {
+      --         -- allTargets = false,
+      --         features = "all",
+      --         extraEnv = {
+      --           ["CARGO_TARGET_DIR"] = "target/check",
+      --         }
+      --         -- buildScripts = {
+      --         -- enable = false,
+      --         -- rebuildOnSave = false
+      --         -- }
+      --       },
+      --       check = {
+      --         allTargets = true,
+      --         workspace = true,
+      --       },
+      --       cachePriming = {
+      --         enable = false,
+      --         -- numThreads = 8
+      --       },
+      --       diagnostiscs = {
+      --         -- For tsify
+      --         -- https://github.com/madonoharu/tsify/issues/42#issuecomment-2088746822
+      --         disabled = { "non_snake_case" }
+      --       },
+      --       procMacro = {
+      --         enable = true,
+      --         ignore = {}
+      --       }
+      --
+      --     }
+      --   }
+      -- })
 
-          }
-        }
-      })
-
-      vim.lsp.enable("rust_analyzer", true)
+      -- vim.lsp.enable("rust_analyzer", true)
 
       require("lspconfig.configs").vtsls = require("vtsls").lspconfig
       vim.lsp.config('vtsls', {
