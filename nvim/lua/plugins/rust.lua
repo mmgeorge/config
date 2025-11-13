@@ -57,8 +57,8 @@ return {
               cargo = {
                 -- allTargets = true,
                 -- allFeatures = true,
-                allTargets = false,
-                allFeatures = false,
+                allTargets = true,
+                allFeatures = true,
                 extraEnv = {
                   ["CARGO_TARGET_DIR"] = "target/check",
                   -- ["RUSTFLAGS"] = "-Zthreads=8 -Zshare-generics=n"
@@ -67,7 +67,7 @@ return {
               },
               check = {
                 -- Avoid re-running on all deps
-                workspace = false
+                workspace = true
               },
               -- numThreads = 8,
               cachePriming = {
