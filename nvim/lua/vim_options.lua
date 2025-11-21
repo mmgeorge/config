@@ -2,6 +2,11 @@ vim.g._ts_force_sync_parsing = true
 
 vim.opt.shadafile = "NONE"
 
+-- "yes" means overwrite the file in place (preserves inode)
+-- "auto", the default can have issues with some file watcher
+-- implementations
+vim.opt.backupcopy = "yes"
+
 -- vim.o.termguicolors = true
 vim.o.expandtab = true;
 vim.o.cindent = false
