@@ -25,8 +25,8 @@ return {
           "cssls",
           "html",
           "tailwindcss",
-          -- "harper_ls",
-          "ltex_plus",
+          "harper_ls",
+          -- "ltex_plus",
           "texlab"
           -- "taplo"
         }
@@ -156,7 +156,7 @@ return {
         }
       })
 
-      vim.lsp.enable("ltex_plus")
+      vim.lsp.enable("ltex_plus", false)
 
       -- Disable semantic tokens
       vim.api.nvim_create_autocmd('LspAttach', {
