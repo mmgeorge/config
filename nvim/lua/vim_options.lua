@@ -59,7 +59,7 @@ vim.opt.foldenable = true
 -- vim.opt.nofoldenable = true
 -- vim.cmd('set nofoldenable')
 -- vim.opt.showmatch = false
--- vim.cmd('set mps +=<:>')           -- Add <> to matchpairs (% command)
+vim.cmd('set mps +=<:>')           -- Add <> to matchpairs (% command)
 
 vim.g.rust_recommended_style = '0' -- Otherwise will override indentation settings
 
