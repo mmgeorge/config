@@ -412,6 +412,12 @@ return {
         inline = {
           adapter = adapter.inline,
           keymaps = {
+            stop = {
+              modes = {
+                n = "<C-q>",
+              },
+              description = "Stop current prompt",
+            },
             accept_change = {
               modes = { n = "ga" },
               description = "Accept the suggested change",
