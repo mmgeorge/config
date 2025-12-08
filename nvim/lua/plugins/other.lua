@@ -1,7 +1,7 @@
 return {
   {
-    "rgroli/other.nvim", 
-    config = function ()
+    "rgroli/other.nvim",
+    config = function()
       require("other-nvim").setup({
 
         -- by default there are no mappings enabled
@@ -48,10 +48,10 @@ return {
 
         -- default transformers
         -- transformers = {
-          -- camelToKebap = transformers.camelToKebap,
-          -- kebapToCamel = transformers.kebapToCamel,
-          -- pluralize = transformers.pluralize,
-          -- singularize = transformers.singularize,
+        -- camelToKebap = transformers.camelToKebap,
+        -- kebapToCamel = transformers.kebapToCamel,
+        -- pluralize = transformers.pluralize,
+        -- singularize = transformers.singularize,
         -- },
 
         -- Should the window show files which do not exist yet based on
@@ -84,18 +84,18 @@ return {
           -- @return table | boolean When an empty table or false is returned the filepicker is not openend.
           filePickerBeforeShow = function(files)
             local out = {}
-            
-            for i = 1, #files do 
-              local exists = files[i].exists; 
-              local filename = files[i].filename; 
-              local context = files[i].context; 
 
-              if not exists then 
+            for i = 1, #files do
+              local exists = files[i].exists;
+              local filename = files[i].filename;
+              local context = files[i].context;
+
+              if not exists then
                 context = context .. "*"
               end
-              
+
               out[i] = { filename = filename, context = context, exists = exists }
-            end 
+            end
 
             return out
           end,
@@ -107,6 +107,21 @@ return {
           -- @param exists (boolean) does the file already exist
           -- @return (boolean) When true (default) the plugin takes care of opening the file, when the function returns false this indicated that opening of the file is done in the hook.
           onOpenFile = function(filename, exists)
+            if not exists then
+              -- Create parent directories if they don't exist
+              local dir = vim.fn.fnamemodify(filename, ':h')
+              if vim.fn.isdirectory(dir) == 0 then
+                vim.fn.mkdir(dir, 'p')
+              end
+              -- Create the file if it doesn't exist
+              local f = io.open(filename, 'w')
+              if f then
+                f:close()
+              else
+                vim.notify('Failed to create file: ' .. filename, vim.log.levels.ERROR)
+                return false
+              end
+            end
             return true
           end,
 
@@ -140,7 +155,7 @@ return {
           minHeight = 2,
         },
 
-      }) 
-    end 
+      })
+    end
   }
 }
