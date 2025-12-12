@@ -1,17 +1,27 @@
 local karma_task = nil
 local karma_file = nil
+local karma_grep_str = nil
 
 local function url_encode(str)
   if not str then return "" end
+
+  local suffix = str:find(" ") and "%24" or ""
   local safe = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~"
   local encoded = str:gsub(".", function(char)
-    if safe:find(char, 1, true) then
+    if char == "-" then
+      return "%5Cx2d"
+    elseif char == "(" then
+      return "%5C("
+    elseif char == ")" then
+      return "%5C)"
+    elseif safe:find(char, 1, true) then
       return char
     else
       return string.format("%%%02X", char:byte())
     end
   end)
-  return encoded
+
+  return encoded .. suffix
 end
 
 function encode_current_string()
@@ -45,7 +55,7 @@ function encode_current_string()
   end
 end
 
-function create_tab_script(include_delay)
+function create_tab_script(include_delay, grep_str)
   local delay_snippet = ''
   if include_delay then
     delay_snippet = [[
@@ -54,11 +64,10 @@ function create_tab_script(include_delay)
     ]]
   end
 
-  local grep_str = encode_current_string()
-  local url = 'http://localhost:9876/debug.html'
+  local url_base = 'http://localhost:9876/debug.html'
+  local url = url_base
   if grep_str ~= nil then
-    url = 'http://localhost:9876/debug.html?grep=' .. grep_str
-    vim.notify(url)
+    url = url_base .. '?grep=' .. grep_str
   end
 
   return [[
@@ -69,6 +78,7 @@ function create_tab_script(include_delay)
     end tell
 
     set tabIndex to 0
+    set targetURLBase to "]] .. url_base .. [["
     set targetURL to "]] .. url .. [["
 
     tell application "Google Chrome"
@@ -80,13 +90,11 @@ function create_tab_script(include_delay)
         repeat with w in windows
           set tabIndex to 1
           repeat with t in tabs of w
-            if URL of t starts with targetURL then
+            if URL of t starts with targetURLBase then
               set found to true
-              -- Bring the window containing the tab to the front
               set index of w to 1
-              -- Force the active tab to be the index we just counted
-              -- Using "window 1" is safe because we just moved "w" to position 1
               set active tab index of window 1 to tabIndex
+              set URL of t to targetURL
               exit repeat
             end if
             set tabIndex to tabIndex + 1
@@ -115,11 +123,15 @@ function create_tab_script(include_delay)
     tell application "System Events"
       set frontmost of process currentApp to true
     end tell
-
-    return "Success"
   '
 ]]
 end
+
+local components = {
+  { "on_complete_dispose", require_view = {}, timeout = 1 },
+  "default",
+  "open_output"
+}
 
 return {
   {
@@ -131,10 +143,10 @@ return {
     },
     keys = {
       {
-        "<leader>tr",
+        "<leader>tp",
         "<cmd>OverseerRun<CR>",
         mode = { "n", "x" },
-        desc = "Run Task",
+        desc = "Pick Task",
       },
       {
         "<leader>tq",
@@ -151,12 +163,10 @@ return {
         function()
           local overseer = require("overseer")
           local file = vim.fn.expand '%:~:.'
+          karma_grep_str = encode_current_string()
 
           if karma_file == file then
-            local refresh = overseer.new_task({
-              cmd = create_tab_script(false),
-            })
-            refresh:start()
+            vim.fn.jobstart(create_tab_script(false, karma_grep_str))
             return
           end
 
@@ -173,13 +183,18 @@ return {
 
           karma_task:start()
 
-          local open_browser = overseer.new_task({
-            cmd = create_tab_script(true),
-          })
-          open_browser:start()
+          vim.fn.jobstart(create_tab_script(true, karma_grep_str))
         end,
         mode = { "n", "x" },
         desc = "Run Karma",
+      },
+      {
+        "<leader>tr",
+        function()
+          vim.fn.jobstart(create_tab_script(false, karma_grep_str))
+        end,
+        mode = { "n", "x" },
+        desc = "Refresh Karma Tab",
       },
       {
         "<leader>tl",
@@ -372,7 +387,7 @@ return {
           default = {
             "on_exit_set_status",
             -- "on_complete_notify",
-            -- { "on_complete_dispose", require_view = { "SUCCESS", "FAILURE" } },
+            { "on_complete_dispose", require_view = { "SUCCESS", "FAILURE" } },
           },
           -- Tasks from tasks.json use these components
           default_vscode = {
