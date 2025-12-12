@@ -85,8 +85,8 @@ return {
               -- For the JS SDK
               "smartMapping",
               "webscene",
-              "3d",
-              "3D",
+              -- "3d",
+              -- "3D",
               "tests/data",
               "dojo",
               "pkg",
