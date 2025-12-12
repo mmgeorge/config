@@ -1,6 +1,75 @@
 local karma_task = nil
 local karma_file = nil
 
+function create_tab_script(include_delay)
+  local delay_snippet = ''
+  if include_delay then
+    delay_snippet = [[
+    -- Wait for karma to start, then refresh the tab.
+    delay 1.5
+    ]]
+  end
+
+  return [[
+  osascript -e '
+    -- Capture terminal to restore after
+    tell application "System Events"
+      set currentApp to name of first application process whose frontmost is true
+    end tell
+
+    set tabIndex to 0
+    set targetURL to "http://localhost:9876/debug.html"
+
+    tell application "Google Chrome"
+      if not running then
+        open location targetURL
+      else
+        set found to false
+
+        repeat with w in windows
+          set tabIndex to 1
+          repeat with t in tabs of w
+            if URL of t starts with targetURL then
+              set found to true
+              -- Bring the window containing the tab to the front
+              set index of w to 1
+              -- Force the active tab to be the index we just counted
+              -- Using "window 1" is safe because we just moved "w" to position 1
+              set active tab index of window 1 to tabIndex
+              exit repeat
+            end if
+            set tabIndex to tabIndex + 1
+          end repeat
+          if found then exit repeat
+        end repeat
+
+        if not found then
+          make new tab at end of window 1 with properties {URL:targetURL}
+        end if
+        activate
+      end if
+    end tell
+
+    -- Immediately return control to the terminal
+    tell application "System Events"
+      set frontmost of process currentApp to true
+    end tell
+]] .. delay_snippet .. [[
+    tell application "Google Chrome"
+      activate
+      reload active tab of window 1
+    end tell
+
+    -- Return control back to the terminal
+    tell application "System Events"
+      set frontmost of process currentApp to true
+    end tell
+
+    return "Success"
+  '
+]]
+end
+
 return {
   {
     'stevearc/overseer.nvim',
@@ -30,83 +99,31 @@ return {
         "<leader>tt",
         function()
           local overseer = require("overseer")
-          karma_file = vim.fn.expand '%:~:.'
+          local file = vim.fn.expand '%:~:.'
+
+          if karma_file == file then
+            local refresh = overseer.new_task({
+              cmd = create_tab_script(false),
+            })
+            refresh:start()
+            return
+          end
+
+          karma_file = file
 
           if karma_task ~= nil then
             karma_task:dispose(true)
           end
 
-          local open_karma_tab = [[
-      osascript -e '
-        -- Capture terminal to restore after
-        tell application "System Events"
-	        set currentApp to name of first application process whose frontmost is true
-        end tell
-
-        set tabIndex to 0
-        set targetURL to "http://localhost:9876/debug.html"
-
-        tell application "Google Chrome"
-          if not running then
-            open location targetURL
-          else
-            set found to false
-
-            repeat with w in windows
-              set tabIndex to 1
-              repeat with t in tabs of w
-                if URL of t starts with targetURL then
-                  set found to true
-                  -- Bring the window containing the tab to the front
-                  set index of w to 1
-                  -- Force the active tab to be the index we just counted
-                  -- Using "window 1" is safe because we just moved "w" to position 1
-                  set active tab index of window 1 to tabIndex
-
-                  exit repeat
-                end if
-                set tabIndex to tabIndex + 1
-              end repeat
-              if found then exit repeat
-            end repeat
-
-            if not found then
-              make new tab at end of window 1 with properties {URL:targetURL}
-            end if
-            activate
-          end if
-        end tell
-
-        -- Immediately return control to the terminal
-        tell application "System Events"
-	        set frontmost of process currentApp to true
-        end tell
-
-        -- Wait for karma to start, then refresh the tab.
-        delay 1.5
-
-        tell application "Google Chrome"
-	       activate
-	       reload active tab of window 1
-        end tell
-
-        -- Return control back to the terminal
-        tell application "System Events"
-	        set frontmost of process currentApp to true
-        end tell
-
-return "Success"
-      '
-    ]]
           karma_task = overseer.new_task({
             cmd = { 'npx', 'karma', 'start' },
-            args = { "--root", karma_file },
+            args = { "--root", file },
           })
 
           karma_task:start()
 
           local open_browser = overseer.new_task({
-            cmd = open_karma_tab,
+            cmd = create_tab_script(true),
           })
           open_browser:start()
         end,
