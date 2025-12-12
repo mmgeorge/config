@@ -1,6 +1,50 @@
 local karma_task = nil
 local karma_file = nil
 
+local function url_encode(str)
+  if not str then return "" end
+  local safe = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~"
+  local encoded = str:gsub(".", function(char)
+    if safe:find(char, 1, true) then
+      return char
+    else
+      return string.format("%%%02X", char:byte())
+    end
+  end)
+  return encoded
+end
+
+function encode_current_string()
+  local lnum, col = unpack(vim.api.nvim_win_get_cursor(0))
+  local cursor_col_1based = col + 1 -- Adjust to 1-based indexing for Lua string functions
+
+  local line = vim.api.nvim_get_current_line()
+  local pattern = '([\'"`])(.-)([\'"`])'
+  local start_col, end_col, inner_match = nil, nil, nil
+
+  local search_start = 1
+  while true do
+    local m_start, m_end, open_quote, inner, close_quote = line:find(pattern, search_start)
+    if not m_start then
+      break
+    end
+    if cursor_col_1based >= m_start and cursor_col_1based <= m_end then
+      start_col = m_start + 1 -- skip opening quote
+      end_col = m_end - 1     -- skip closing quote
+      inner_match = inner
+      break
+    end
+    search_start = m_end + 1
+  end
+
+  if inner_match then
+    local encoded_content = url_encode(inner_match)
+    return encoded_content
+  else
+    return nil
+  end
+end
+
 function create_tab_script(include_delay)
   local delay_snippet = ''
   if include_delay then
@@ -8,6 +52,13 @@ function create_tab_script(include_delay)
     -- Wait for karma to start, then refresh the tab.
     delay 1.5
     ]]
+  end
+
+  local grep_str = encode_current_string()
+  local url = 'http://localhost:9876/debug.html'
+  if grep_str ~= nil then
+    url = 'http://localhost:9876/debug.html?grep=' .. grep_str
+    vim.notify(url)
   end
 
   return [[
@@ -18,7 +69,7 @@ function create_tab_script(include_delay)
     end tell
 
     set tabIndex to 0
-    set targetURL to "http://localhost:9876/debug.html"
+    set targetURL to "]] .. url .. [["
 
     tell application "Google Chrome"
       if not running then
