@@ -1,3 +1,6 @@
+local karma_task = nil
+local karma_file = nil
+
 return {
   {
     'stevearc/overseer.nvim',
@@ -14,10 +17,114 @@ return {
         desc = "Run Task",
       },
       {
+        "<leader>tq",
+        function()
+          if karma_task ~= nil then
+            karma_task:dispose(true)
+          end
+        end,
+        mode = { "n", "x" },
+        desc = "Kill Karma Task",
+      },
+      {
         "<leader>tt",
+        function()
+          local overseer = require("overseer")
+          karma_file = vim.fn.expand '%:~:.'
+
+          if karma_task ~= nil then
+            karma_task:dispose(true)
+          end
+
+          local open_karma_tab = [[
+      osascript -e '
+        -- Capture terminal to restore after
+        tell application "System Events"
+	        set currentApp to name of first application process whose frontmost is true
+        end tell
+
+        set tabIndex to 0
+        set targetURL to "http://localhost:9876/debug.html"
+
+        tell application "Google Chrome"
+          if not running then
+            open location targetURL
+          else
+            set found to false
+
+            repeat with w in windows
+              set tabIndex to 1
+              repeat with t in tabs of w
+                if URL of t starts with targetURL then
+                  set found to true
+                  -- Bring the window containing the tab to the front
+                  set index of w to 1
+                  -- Force the active tab to be the index we just counted
+                  -- Using "window 1" is safe because we just moved "w" to position 1
+                  set active tab index of window 1 to tabIndex
+
+                  exit repeat
+                end if
+                set tabIndex to tabIndex + 1
+              end repeat
+              if found then exit repeat
+            end repeat
+
+            if not found then
+              make new tab at end of window 1 with properties {URL:targetURL}
+            end if
+            activate
+          end if
+        end tell
+
+        -- Immediately return control to the terminal
+        tell application "System Events"
+	        set frontmost of process currentApp to true
+        end tell
+
+        -- Wait for karma to start, then refresh the tab.
+        delay 1.5
+
+        tell application "Google Chrome"
+	       activate
+	       reload active tab of window 1
+        end tell
+
+        -- Return control back to the terminal
+        tell application "System Events"
+	        set frontmost of process currentApp to true
+        end tell
+
+return "Success"
+      '
+    ]]
+          karma_task = overseer.new_task({
+            cmd = { 'npx', 'karma', 'start' },
+            args = { "--root", karma_file },
+          })
+
+          karma_task:start()
+
+          local open_browser = overseer.new_task({
+            cmd = open_karma_tab,
+          })
+          open_browser:start()
+        end,
+        mode = { "n", "x" },
+        desc = "Run Karma",
+      },
+      {
+        "<leader>tl",
         "<cmd>OverseerToggle<CR>",
         mode = { "n", "x" },
-        desc = "Toggle Tasks",
+        desc = "Open Last Task",
+      },
+
+      {
+        "<leader>to",
+        "<cmd>OverseerToggle<CR>",
+        mode = { "n", "x" },
+        desc = "Open Tasks",
       },
     },
     config = function()
@@ -195,11 +302,9 @@ return {
         component_aliases = {
           -- Most tasks are initialized with the default components
           default = {
-            { "display_duration",    detail_level = 2 },
-            "on_output_summarize",
             "on_exit_set_status",
-            "on_complete_notify",
-            { "on_complete_dispose", require_view = { "SUCCESS", "FAILURE" } },
+            -- "on_complete_notify",
+            -- { "on_complete_dispose", require_view = { "SUCCESS", "FAILURE" } },
           },
           -- Tasks from tasks.json use these components
           default_vscode = {
@@ -247,52 +352,52 @@ return {
         },
       })
 
-      require("overseer").register_template({
-        name = "Tsc FastWatch",
-        builder = function()
-          return {
-            cmd = { "npx", "tsc", "--watch", "--assumeChangesOnlyAffectDirectDependencies --noEmit" },
-            components = {
-              {
-                "on_output_parse",
-                problem_matcher = "$tsc-watch"
-              },
-              "default",
-              "on_result_notify",
-              "on_result_diagnostics",
-              "on_complete_restart",
-              "on_exit_set_status",
-            },
-            env = {
-              NODE_OPTIONS = "--max-old-space-size=8192"
-            },
-          }
-        end
-      })
-
-      require("overseer").register_template({
-        name = "Tsc Watch",
-        builder = function()
-          return {
-            cmd = { "npx", "tsc", "--watch", "--noEmit", "-p", "tsconfig.app.json" },
-            components = {
-              {
-                "on_output_parse",
-                problem_matcher = "$tsc-watch"
-              },
-              "default",
-              "on_result_notify",
-              "on_result_diagnostics",
-              "on_complete_restart",
-              "on_exit_set_status",
-            },
-            env = {
-              NODE_OPTIONS = "--max-old-space-size=8192"
-            },
-          }
-        end
-      })
-
+      -- require("overseer").register_template({
+      --   name = "Tsc FastWatch",
+      --   builder = function()
+      --     return {
+      --       cmd = { "npx", "tsc", "--watch", "--assumeChangesOnlyAffectDirectDependencies --noEmit" },
+      --       components = {
+      --         {
+      --           "on_output_parse",
+      --           problem_matcher = "$tsc-watch"
+      --         },
+      --         "default",
+      --         "on_result_notify",
+      --         "on_result_diagnostics",
+      --         "on_complete_restart",
+      --         "on_exit_set_status",
+      --       },
+      --       env = {
+      --         NODE_OPTIONS = "--max-old-space-size=8192"
+      --       },
+      --     }
+      --   end
+      -- })
+      --
+      -- require("overseer").register_template({
+      --   name = "Tsc Watch",
+      --   builder = function()
+      --     return {
+      --       cmd = { "npx", "tsc", "--watch", "--noEmit", "-p", "tsconfig.app.json" },
+      --       components = {
+      --         {
+      --           "on_output_parse",
+      --           problem_matcher = "$tsc-watch"
+      --         },
+      --         "default",
+      --         "on_result_notify",
+      --         "on_result_diagnostics",
+      --         "on_complete_restart",
+      --         "on_exit_set_status",
+      --       },
+      --       env = {
+      --         NODE_OPTIONS = "--max-old-space-size=8192"
+      --       },
+      --     }
+      --   end
+      -- })
+      --
       require("overseer").register_template({
         -- Required fields
         name = "Karma start",
