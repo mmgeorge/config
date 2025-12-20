@@ -28,8 +28,10 @@ return {
           "harper_ls",
           -- "ltex_plus",
           "texlab",
-          "tsgo"
-          -- "taplo"
+          "tsgo",
+          -- "taplo",
+          "pyright",
+          "ruff"
         }
 
       })
@@ -461,6 +463,9 @@ return {
           },
         }
       })
+
+      vim.lsp.enable("pyright")
+      vim.lsp.enable("ruff")
     end
   },
   {
