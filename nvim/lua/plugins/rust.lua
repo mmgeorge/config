@@ -41,6 +41,10 @@ return {
         },
         -- LSP configuration
         server = {
+          -- cmd_env = {
+          -- CARGO_TARGET_DIR = "target/check",
+          -- CARGO_TARGET_DIR = ".rust-analyzer",
+          -- },
           on_attach = function(client, bufnr)
             local format_sync_grp = vim.api.nvim_create_augroup("RustaceanFormat", {})
 
@@ -53,21 +57,22 @@ return {
           end,
           default_settings = {
             ['rust-analyzer'] = {
-              -- checkOnSave = false,
+              checkOnSave = true,
               cargo = {
                 -- allTargets = true,
                 -- allFeatures = true,
                 allTargets = true,
                 allFeatures = true,
-                extraEnv = {
-                  ["CARGO_TARGET_DIR"] = "target/check",
-                  -- ["RUSTFLAGS"] = "-Zthreads=8 -Zshare-generics=n"
-                },
+                -- extraEnv = {
+                --   ["CARGO_TARGET_DIR"] = "target/check",
+                --   -- ["RUSTFLAGS"] = "-Zthreads=8 -Zshare-generics=n"
+                -- },
                 -- noDeps = true
               },
               check = {
                 -- Avoid re-running on all deps
-                workspace = true
+                workspace = true,
+                -- extraArgs = { "--target-dir", "target/check" },
               },
               -- numThreads = 8,
               cachePriming = {
