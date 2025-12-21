@@ -24,6 +24,8 @@ vim.opt.statuscolumn = "%l %=%s" -- %= means right align
 vim.opt.signcolumn = 'yes'
 vim.o.scrolloff = 0
 vim.o.swapfile = false
+vim.o.backup = false
+vim.o.writebackup = false
 vim.o.splitbelow = true
 vim.opt.spell = false
 vim.opt.spelllang = { "en_us" }

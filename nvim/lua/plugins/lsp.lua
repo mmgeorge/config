@@ -25,7 +25,7 @@ return {
           "cssls",
           "html",
           "tailwindcss",
-          -- "harper_ls",
+          "harper_ls",
           -- "ltex_plus",
           "texlab",
           "tsgo",
@@ -94,7 +94,7 @@ return {
           }
         }
       })
-      vim.lsp.enable('harper_ls', false)
+      vim.lsp.enable('harper_ls', true)
 
       vim.lsp.enable('texlab')
 
