@@ -25,7 +25,7 @@ return {
           "cssls",
           "html",
           "tailwindcss",
-          "harper_ls",
+          -- "harper_ls",
           -- "ltex_plus",
           "texlab",
           "tsgo",
@@ -94,7 +94,9 @@ return {
           }
         }
       })
-      vim.lsp.enable('harper_ls', true)
+
+      -- This appears to hold a file lock on rust incremental compilation directory
+      vim.lsp.enable('harper_ls', false)
 
       vim.lsp.enable('texlab')
 
@@ -408,7 +410,7 @@ return {
         },
         filetypes = { "slang", "hlsl" },
         single_file_support = false,
-        root_markers = { 'lib.slang' },
+        -- root_markers = { 'lib.slang' },
         settings = {
           -- The `-style` argument to pass to clang-format
           format = {
