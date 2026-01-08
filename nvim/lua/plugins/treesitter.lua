@@ -26,6 +26,8 @@ return {
       vim.filetype.add({ extension = { wgslx = "wgslx" } })
       vim.treesitter.language.register('wgsl', { 'wgslx' })
 
+      vim.treesitter.language.register('markdown', 'octo')
+
       ---@diagnostic disable-next-line: missing-fields
       configs.setup({
         ensure_installed = {
