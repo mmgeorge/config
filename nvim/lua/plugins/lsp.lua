@@ -98,8 +98,9 @@ return {
       -- This appears to hold a file lock on rust incremental compilation directory
       vim.lsp.enable('harper_ls', false)
 
-      vim.lsp.enable('texlab')
+      vim.lsp.enable('nushell')
 
+      vim.lsp.enable('texlab')
       vim.lsp.config("ltex_plus", {
         capabilities = capabilities,
         on_attach = function(client, bufnr)
@@ -167,9 +168,9 @@ return {
         group = vim.api.nvim_create_augroup('UserLspConfig', {}),
         callback = function(ev)
           local client = vim.lsp.get_client_by_id(ev.data.client_id)
-          if client.name ~= "slangd" then
-            client.server_capabilities.semanticTokensProvider = nil
-          end
+          -- if client.name ~= "slangd" then
+          client.server_capabilities.semanticTokensProvider = nil
+          -- end
         end,
       })
 

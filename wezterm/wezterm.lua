@@ -10,12 +10,14 @@ config.set_environment_variables            = {
   -- HOME = "D:/"
 }
 
-config.default_prog                         = {
-  "C:/Program Files/PowerShell/7/pwsh.exe",
-  "-NoExit",
-  "-NoProfile",
-  "-File", "D:/config/windows/init.ps1"
-}
+config.default_prog                         = { "nu" }
+
+-- config.default_prog                         = {
+--   "C:/Program Files/PowerShell/7/pwsh.exe",
+--   "-NoExit",
+--   "-NoProfile",
+--   "-File", "D:/config/windows/init.ps1"
+-- }
 
 config.font                                 = wezterm.font('Cascadia Code NF')
 config.font_rules                           = {}
