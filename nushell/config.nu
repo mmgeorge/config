@@ -100,10 +100,6 @@ $env.config.menus ++= [{
 #       }
 # ]
 
-# if $nu.os-info.name == "windows" {
-#
-# }
-
 def --env dev [] {
     cd "D:/code"
 }
@@ -152,3 +148,13 @@ alias dc = detect columns
 alias select = select --ignore-case 
 alias gc = gcloud
 alias tf = terraform
+
+def open [path: path = "."] {
+    if $nu.os-info.name == "windows" {
+        ^explorer $path
+    } else {
+        # Fallback for MacOS/Linux
+        ^open $path
+    }
+}
+
