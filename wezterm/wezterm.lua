@@ -16,12 +16,12 @@ config.default_prog = { "D:/config/windows/nudevcmd.bat" }
 --   "-File", "D:/config/windows/init.ps1"
 -- }
 
-config.unix_domains = {
-  {
-    name = 'unix',
-  },
-}
-config.default_domain = 'unix'
+-- config.unix_domains = {
+--   {
+--     name = 'unix',
+--   },
+-- }
+-- config.default_domain = 'unix'
 config.font                                 = wezterm.font('Cascadia Code NF')
 config.font_rules                           = {}
 
