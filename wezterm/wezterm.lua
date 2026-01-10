@@ -6,12 +6,9 @@ local action                                = wezterm.action
 local config                                = wezterm.config_builder()
 
 config.default_cwd                          = "D:/"
-config.set_environment_variables            = {
-  -- HOME = "D:/"
-}
 
-config.default_prog                         = { "nu" }
-
+config.default_prog = { "D:/config/windows/nudevcmd.bat" }
+-- config.default_prog = { "nu" }
 -- config.default_prog                         = {
 --   "C:/Program Files/PowerShell/7/pwsh.exe",
 --   "-NoExit",
@@ -19,6 +16,12 @@ config.default_prog                         = { "nu" }
 --   "-File", "D:/config/windows/init.ps1"
 -- }
 
+config.unix_domains = {
+  {
+    name = 'unix',
+  },
+}
+config.default_domain = 'unix'
 config.font                                 = wezterm.font('Cascadia Code NF')
 config.font_rules                           = {}
 

@@ -6,7 +6,40 @@ source $"($nu.cache-dir)/carapace.nu"
 
 # carapace _carapace nushell | save --force $"($nu.cache-dir)/carapace.nu"
 
-$env.PROMPT_COMMAND = { $"(pwd)" }
+def get_git_branch [] {
+    let branch_res = (do { git branch --show-current } | complete)
+    if $branch_res.exit_code != 0 or ($branch_res.stdout | str trim | is-empty) {
+        return ""
+    }
+    let branch_name = ($branch_res.stdout | str trim)
+
+    let status_res = (do { git status --porcelain } | complete)
+    let has_changes = ($status_res.stdout | str trim | is-empty | not $in)
+    let indicator = if $has_changes { "*" } else { "" }
+
+    # $"(ansi { fg: "#ef3573" })\(($branch_name)($indicator)\)(ansi reset) "
+    $"(ansi { fg: "white" })\(($branch_name)($indicator)\)(ansi reset) "
+}
+
+def create_left_prompt [] {
+    let dir = ($env.PWD | str replace $nu.home-path "~")
+    let git = (get_git_branch)
+
+    # Combined: White PWD followed by Magenta Git Branch
+    $"(ansi white_bold)($dir)(ansi reset) ($git)"
+}
+
+$env.PROMPT_COMMAND = {|| create_left_prompt }
+
+# $env.config.edit_mode = "vi"
+
+$env.PROMPT_COMMAND = {|| create_left_prompt }
+$env.PROMPT_COMMAND_RIGHT = { || "" }
+
+$env.PROMPT_INDICATOR = {|| $"(ansi white_bold)> " }
+$env.PROMPT_INDICATOR_VI_INSERT = {|| $"(ansi white_bold)> " }
+$env.PROMPT_INDICATOR_VI_NORMAL = {|| $"(ansi white_bold): " }
+
 # mkdir ($nu.data-dir | path join "vendor/autoload")
 # starship init nu | save -f ($nu.data-dir | path join "vendor/autoload/starship.nu")
 
@@ -21,8 +54,8 @@ $env.config.completions.external = {
     enable: true
     completer: $carapace_completer
 }
-$env.config.completions.algorithm = "fuzzy" 
-$env.config.completions.case_sensitive = false 
+$env.config.completions.algorithm = "fuzzy"
+$env.config.completions.case_sensitive = false
 
 # ${UserConfigDir}/nushell/config.nu
 def "trim-all" [width: int = 20] {
@@ -67,7 +100,6 @@ $env.config.color_config.datetime = "white"
 $env.config.color_config.duration = "white"
 $env.config.color_config.header = "white"
 
-
 $env.config.menus ++= [{
    name: completion_menu
    only_buffer_difference: false
@@ -82,8 +114,52 @@ $env.config.menus ++= [{
      page_size: 40
    }
    style: {
-   } 
+   }
 }]
+
+$env.config = {
+    # keybindings: [
+    #     {
+    #         name: custom_enter_insert
+    #         modifier: none
+    #         keycode: char_u
+    #         mode: vi_normal
+    #         event: {
+    #           send: ViChangeMode,
+    #           mode: Append
+    #         }
+    #     }
+    #     {
+    #         name: move_left_custom
+    #         modifier: none
+    #         keycode: char_j
+    #         mode: vi_normal
+    #         event: { edit: moveleft }
+    #     }
+    #     {
+    #         name: move_right_custom
+    #         modifier: none
+    #         keycode: char_n
+    #         mode: vi_normal
+    #         event: { edit: moveright }
+    #     }
+    #     {
+    #         name: move_up_custom
+    #         modifier: none
+    #         keycode: char_s
+    #         mode: vi_normal
+    #         event: { edit: moveright }
+    #     }
+    #     {
+    #         name: move_down_custom
+    #         modifier: none
+    #         keycode: char_t
+    #         mode: vi_normal
+    #         event: { edit: moveright }
+    #     }
+    #
+    # ]
+}
 
 # $env.config.keybindings = [
 #   {
@@ -112,40 +188,8 @@ def --env cfg [] {
     cd "D:/config"
 }
 
-
-# Place this in your config.nu
-
-# def --env fff [path?: string] {
-#     if ($path | is-empty) {
-#         # No arguments passed: Default to D:/
-#         if ("D:/" | path exists) {
-#             $env.OLDPWD = $env.PWD
-#             $env.PWD = "D:/"
-#         } else {
-#             print -e "Error: Drive D:/ not found"
-#         }
-#     } else if $path == "-" {
-#         # Handle 'cd -' (swap to previous directory)
-#         if "OLDPWD" in $env {
-#             let old = $env.PWD
-#             $env.PWD = $env.OLDPWD
-#             $env.OLDPWD = $old
-#         } else {
-#             print -e "Error: OLDPWD not set"
-#         }
-#     } else {
-#         # Standard behavior: Go to specified path
-#         let target = ($path | path expand)
-#         if ($target | path exists) {
-#             $env.OLDPWD = $env.PWD
-#             $env.PWD = $target
-#         } else {
-#             print -e $"Error: Directory not found: ($path)"
-#         }
-#     }
-# }
 alias dc = detect columns
-alias select = select --ignore-case 
+alias select = select --ignore-case
 alias gc = gcloud
 alias tf = terraform
 
@@ -157,4 +201,3 @@ def open [path: path = "."] {
         ^open $path
     }
 }
-
