@@ -94,6 +94,7 @@ return {
   -- },
   {
     "olimorris/codecompanion.nvim",
+    tag = "v17.33.0",
     dependencies = {
       "nvim-lua/plenary.nvim",
       "nvim-treesitter/nvim-treesitter",
