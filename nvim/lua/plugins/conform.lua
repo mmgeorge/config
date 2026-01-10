@@ -18,7 +18,7 @@ return {
       end,
       -- tsx = { "trim_whitespace" },
       formatters_by_ft  = {
-        ["*"] = { lsp_format, "trim_whitespace" },
+        ["*"] = { "trim_whitespace", lsp_format },
         ["slang"] = { "trim_whitespace" },
       }
       -- format_on_save = {
