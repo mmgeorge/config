@@ -4,8 +4,6 @@ $env.CARAPACE_BRIDGES = 'zsh,fish,bash' # optional
 mkdir $"($nu.cache-dir)"
 source $"($nu.cache-dir)/carapace.nu"
 
-# carapace _carapace nushell | save --force $"($nu.cache-dir)/carapace.nu"
-
 def get_git_branch [] {
     let branch_res = (do { git branch --show-current } | complete)
     if $branch_res.exit_code != 0 or ($branch_res.stdout | str trim | is-empty) {
@@ -17,28 +15,47 @@ def get_git_branch [] {
     let has_changes = ($status_res.stdout | str trim | is-empty | not $in)
     let indicator = if $has_changes { "*" } else { "" }
 
-    # $"(ansi { fg: "#ef3573" })\(($branch_name)($indicator)\)(ansi reset) "
     $"(ansi { fg: "white" })\(($branch_name)($indicator)\)(ansi reset) "
 }
 
 def create_left_prompt [] {
-    let dir = ($env.PWD | str replace $nu.home-path "~")
+    # 1. Try to get the git root path
+    let git_root_res = (do { git rev-parse --show-toplevel } | complete)
+
+    # 2. Determine the path to display
+    let dir = if $git_root_res.exit_code == 0 {
+        # We are inside a git repo
+        let root = ($git_root_res.stdout | str trim)
+        let repo_name = ($root | path basename)
+
+        # Get path relative to the git root
+        let relative = ($env.PWD | path relative-to $root)
+
+        # If we are exactly at the root, just show repo name
+        # Otherwise, join repo name + relative path
+        if ($relative | str trim | is-empty) or $relative == "." {
+            $repo_name
+        } else {
+            $repo_name | path join $relative
+        }
+    } else {
+        # Not in a git repo: Standard ~ replacement
+        ($env.PWD | str replace $nu.home-path "~")
+    }
+
     let git = (get_git_branch)
 
     # Combined: White PWD followed by Magenta Git Branch
-    $"(ansi white_bold)($dir)(ansi reset) ($git)"
+    $"(ansi white_bold)($dir)(ansi reset) ($git)\n"
 }
 
 $env.PROMPT_COMMAND = {|| create_left_prompt }
-
-# $env.config.edit_mode = "vi"
-
-$env.PROMPT_COMMAND = {|| create_left_prompt }
 $env.PROMPT_COMMAND_RIGHT = { || "" }
-
 $env.PROMPT_INDICATOR = {|| $"(ansi white_bold)> " }
 $env.PROMPT_INDICATOR_VI_INSERT = {|| $"(ansi white_bold)> " }
 $env.PROMPT_INDICATOR_VI_NORMAL = {|| $"(ansi white_bold): " }
+
+# $env.config.edit_mode = "vi"
 
 # mkdir ($nu.data-dir | path join "vendor/autoload")
 # starship init nu | save -f ($nu.data-dir | path join "vendor/autoload/starship.nu")
@@ -108,7 +125,6 @@ $env.config.menus ++= [{
      layout: ide
      columns: 1
      col_width: 25
-     # col_padding: 0
      selection_rows: 20
      description_rows: 20
      page_size: 40
@@ -188,10 +204,25 @@ def --env cfg [] {
     cd "D:/config"
 }
 
+def lst [len: int = 50] {
+    ls | update name {|f|
+        let p = ($f.name | path parse)
+        let ext = if ($p.extension | is-empty) { "" } else { $".($p.extension)" }
+
+        if ($p.stem | str length) > $len {
+            ($p.stem | str substring 0..($len - 3)) + "..." + $ext
+        } else {
+            $f.name
+        }
+    }
+}
+
 alias dc = detect columns
 alias select = select --ignore-case
 alias gc = gcloud
 alias tf = terraform
+alias cat = open
+alias top = btop
 
 def open [path: path = "."] {
     if $nu.os-info.name == "windows" {
@@ -200,4 +231,14 @@ def open [path: path = "."] {
         # Fallback for MacOS/Linux
         ^open $path
     }
+}
+
+# Extract content from multiple files in a directory for use with an LLM.
+def extract_many [director: string, out: string = "output"] {
+    marker $director --output_dir $out --redo_inline_math --disable_image_extraction --use_llm --gemini_api_key $env.GEMINI_API_KEY --gemini_model_name "gemini-3-pro-preview" --timeout 300 --max_retries 4
+}
+
+# Extract content from a single file for use with an LLM.
+def extract [file: string, out: string = "output"] {
+    marker_single $file --output_dir $out --redo_inline_math --disable_image_extraction --use_llm --gemini_api_key $env.GEMINI_API_KEY --gemini_model_name "gemini-3-pro-preview" --timeout 300 --max_retries 4
 }

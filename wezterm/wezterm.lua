@@ -74,43 +74,58 @@ config.show_new_tab_button_in_tab_bar       = false
 -- It prefers the title that was set via `tab:set_title()`
 -- or `wezterm cli set-tab-title`, but falls back to the
 -- title of the active pane in that tab.
-function tab_title(tab_info)
-  local title = tab_info.tab_title
-  -- if the tab title is explicitly set, take that
-  if title and #title > 0 then
-    return title
-  end
-  -- Otherwise, use the title from the active pane
-  -- in that tab
-  return tab_info.active_pane.title
+-- function tab_title(tab_info)
+--   local title = tab_info.tab_title
+--   -- if the tab title is explicitly set, take that
+--   if title and #title > 0 then
+--     return title
+--   end
+--   -- Otherwise, use the title from the active pane
+--   -- in that tab
+--   return tab_info.active_pane.title
+-- end
+
+function basename(s)
+  return string.gsub(s, '(.*[/\\\\])(.*)', '%2')
 end
 
-wezterm.on(
-  'format-tab-title',
-  function(tab, tabs, panes, config, hover, max_width)
-    local title = tab_title(tab)
-    -- title = wezterm.truncate_right(title, 10)
-    -- if tab.is_active then
-    --   return {
-    --     -- { Background = { Color = 'blue' } },
-    --     { Text = '' .. title .. ' ' },
-    --     -- { Text = '' .. title .. ' ' },
-    --   }
-    -- end
-    -- if tab.is_last_active then
-    --   -- Green color and append '*' to previously active tab.
-    --   return {
-    --     -- { Background = { Color = 'green' } },
-    --     { Text = ' ' .. title .. '' },
-    --   }
-    -- end
+-- wezterm.on(
+--   'format-tab-title',
+--   function(tab, tabs, panes, config, hover, max_width)
+--     local title = tab_title(tab)
+--     -- title = wezterm.truncate_right(title, 10)
+--     -- if tab.is_active then
+--     --   return {
+--     --     -- { Background = { Color = 'blue' } },
+--     --     { Text = '' .. title .. ' ' },
+--     --     -- { Text = '' .. title .. ' ' },
+--     --   }
+--     -- end
+--     -- if tab.is_last_active then
+--     --   -- Green color and append '*' to previously active tab.
+--     --   return {
+--     --     -- { Background = { Color = 'green' } },
+--     --     { Text = ' ' .. title .. '' },
+--     --   }
+--     -- end
+--
+--     return {
+--       -- { Background = { Color = 'green' } },
+--       { Text = '' .. title .. '' },
+--     }
+--   end
+-- )
 
-    return {
-      -- { Background = { Color = 'green' } },
-      { Text = '' .. title .. '' },
-    }
-  end
-)
+wezterm.on('format-tab-title', function(tab, tabs, panes, config, hover, max_width)
+  local pane = tab.active_pane
+  -- Get the name of the foreground process and use the basename function
+  local title = basename(pane.foreground_process_name)
+
+  -- Optional: add a space around the title for aesthetics
+  return {
+    { Text = ' ' .. title .. ' ' },
+  }
+end)
 
 
 config.window_padding = {
