@@ -1,5 +1,6 @@
 ## ${UserConfigDir}/nushell/env.nu
 
+$env.GEMINI_CLI_SYSTEM_DEFAULTS_PATH = $env.XDG_CONFIG_HOME | path join "gemini/settings.json"
 $env.CARAPACE_BRIDGES = 'zsh,fish,bash' # optional
 mkdir $"($nu.cache-dir)"
 source $"($nu.cache-dir)/carapace.nu"
