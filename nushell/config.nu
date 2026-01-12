@@ -221,8 +221,13 @@ alias dc = detect columns
 alias select = select --ignore-case
 alias gc = gcloud
 alias tf = terraform
-alias cat = open
+alias cat = bat
 alias top = btop
+
+def --env jp [] {
+  let path = (^fd --type d --hidden --exclude .git | ^fzf --height 40% --layout=reverse --border)
+  if ($path != "") { cd $path }
+}
 
 def open [path: path = "."] {
     if $nu.os-info.name == "windows" {
@@ -240,5 +245,7 @@ def extract_many [director: string, out: string = "output"] {
 
 # Extract content from a single file for use with an LLM.
 def extract [file: string, out: string = "output"] {
-    marker_single $file --output_dir $out --redo_inline_math --disable_image_extraction --use_llm --gemini_api_key $env.GEMINI_API_KEY --gemini_model_name "gemini-3-pro-preview" --timeout 300 --max_retries 4
+    marker_single $file --output_dir $out --redo_inline_math --disable_image_extraction --use_llm --gemini_api_key $env.GEMINI_API_KEY --gemini_model_name "gemini-3-flash-preview" --timeout 300 --max_retries 4
 }
+
+source ~/.zoxide.nu
