@@ -18,3 +18,10 @@
 # them for future reference.
 
 zoxide init nushell | save -f ~/.zoxide.nu
+
+$env.CARAPACE_BRIDGES = 'zsh,fish,bash,inshellisense' # optional
+mkdir $"($nu.cache-dir)"
+carapace _carapace nushell | save --force $"($nu.cache-dir)/carapace.nu"
+
+mkdir ($nu.config-path | path dirname | path join 'completions')
+uv generate-shell-completion nushell | save --force ($nu.config-path | path dirname | path join 'completions/uv-completions.nu')

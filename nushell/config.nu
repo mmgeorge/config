@@ -1,8 +1,36 @@
-## ${UserConfigDir}/nushell/env.nu
+# check deps
+if (which carapace | is-empty) {
+  error "carapace not installed"
+}
+if (which bat | is-empty) {
+  error "bat not installed"
+}
+if (which fnm | is-empty) {
+  error "fnm not installed"
+}
+if (which btop | is-empty) {
+  error "btop not installed"
+}
+if (which z | is-empty) {
+  error "zoxide not installed"
+}
+if (which zoxide | is-empty) {
+  error "fzf not installed"
+}
+if (which uv | is-empty) {
+  error "uv not installed"
+}
 
 $env.GEMINI_CLI_SYSTEM_DEFAULTS_PATH = $env.XDG_CONFIG_HOME | path join "gemini/settings.json"
-$env.CARAPACE_BRIDGES = 'zsh,fish,bash' # optional
-mkdir $"($nu.cache-dir)"
+
+alias cls = clear
+alias dc = detect columns
+alias select = select --ignore-case
+alias gc = gcloud
+alias tf = terraform
+alias top = btop
+alias original_open = open
+
 source $"($nu.cache-dir)/carapace.nu"
 
 def get_git_branch [] {
@@ -61,9 +89,12 @@ $env.PROMPT_INDICATOR_VI_NORMAL = {|| $"(ansi white_bold): " }
 # mkdir ($nu.data-dir | path join "vendor/autoload")
 # starship init nu | save -f ($nu.data-dir | path join "vendor/autoload/starship.nu")
 
+use ($nu.config-path | path dirname | path join 'completions/uv-completions.nu') *
+
 let carapace_completer = {|spans|
-    if $spans.0 == "gcloud" {
-      []
+    let native_commands = ["gcloud", "uv"]
+    if ($spans.0 in $native_commands) {
+        null
     } else {
         carapace $spans.0 nushell ...$spans | from json
     }
@@ -194,16 +225,25 @@ $env.config = {
 # ]
 
 def --env dev [] {
-    cd "D:/code"
+    cd $env.DEV_HOME
+}
+
+def --env cfg [] {
+    cd $env.XDG_CONFIG_HOME
+}
+
+def --env www [] {
+    cd $env.WWW_HOME
 }
 
 def --env eng [] {
     cd D:/code/ferrous/blue/
 }
 
-def --env cfg [] {
-    cd "D:/config"
+def --env sdk [] {
+    cd ($env.DEV_HOME | path join arcgis-js-api-4)
 }
+
 
 def lst [len: int = 50] {
     ls | update name {|f|
@@ -217,13 +257,6 @@ def lst [len: int = 50] {
         }
     }
 }
-
-alias dc = detect columns
-alias select = select --ignore-case
-alias gc = gcloud
-alias tf = terraform
-alias top = btop
-alias original_open = open
 
 def cat [file: path] {
     if (($file | path parse).extension | str downcase) in ["toml", "json"] {
@@ -249,12 +282,30 @@ def open [path: path = "."] {
 
 # Extract content from multiple files in a directory for use with an LLM.
 def extract_many [director: string, out: string = "output"] {
-    marker $director --output_dir $out --redo_inline_math --disable_image_extraction --use_llm --gemini_api_key $env.GEMINI_API_KEY --gemini_model_name "gemini-3-pro-preview" --timeout 300 --max_retries 4
+  if (which marker | is-empty) {
+    error "marker not installed"
+    return
+  }
+
+  marker $director --output_dir $out --redo_inline_math --disable_image_extraction --use_llm --gemini_api_key $env.GEMINI_API_KEY --gemini_model_name "gemini-3-pro-preview" --timeout 300 --max_retries 4
 }
 
 # Extract content from a single file for use with an LLM.
 def extract [file: string, out: string = "output"] {
-    marker_single $file --output_dir $out --redo_inline_math --disable_image_extraction --use_llm --gemini_api_key $env.GEMINI_API_KEY --gemini_model_name "gemini-3-flash-preview" --timeout 300 --max_retries 4
+  if (which marker | is-empty) {
+    error "marker not installed"
+    return
+  }
+
+  marker_single $file --output_dir $out --redo_inline_math --disable_image_extraction --use_llm --gemini_api_key $env.GEMINI_API_KEY --gemini_model_name "gemini-3-flash-preview" --timeout 300 --max_retries 4
 }
+
+def "error" [msg: string] {
+    print -e $"(ansi red_bold)Error:(ansi reset) ($msg)"
+}
+
+# Fnm setup
+^fnm env --json | from json | load-env
+$env.PATH = ($env.PATH | prepend ($env.FNM_MULTISHELL_PATH | path join "bin"))
 
 source ~/.zoxide.nu

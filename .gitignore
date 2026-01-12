@@ -9,5 +9,7 @@ lazygit/
 scoop/
 github-copilot
 opencode/
+btop/
 
 nushell/history.txt
+nushell/completions/
