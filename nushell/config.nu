@@ -51,7 +51,7 @@ def create_left_prompt [] {
 
 $env.PROMPT_COMMAND = {|| create_left_prompt }
 $env.PROMPT_COMMAND_RIGHT = { || "" }
-$env.PROMPT_INDICATOR = {|| $"(ansi white_bold) ╰── " }
+$env.PROMPT_INDICATOR = {|| $"(ansi white_bold) ╰─ " }
 $env.PROMPT_INDICATOR_VI_INSERT = {|| $"(ansi white_bold)> " }
 $env.PROMPT_INDICATOR_VI_NORMAL = {|| $"(ansi white_bold): " }
 
@@ -221,8 +221,16 @@ alias dc = detect columns
 alias select = select --ignore-case
 alias gc = gcloud
 alias tf = terraform
-alias cat = bat
 alias top = btop
+alias original_open = open
+
+def cat [file: path] {
+    if (($file | path parse).extension | str downcase) in ["toml", "json"] {
+        original_open $file
+    } else {
+        bat $file
+    }
+}
 
 def --env jp [] {
   let path = (^fd --type d --hidden --exclude .git | ^fzf --height 40% --layout=reverse --border)
