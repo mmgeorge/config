@@ -104,6 +104,7 @@ return {
           -- [token] -- -g=*.el    only el files
           -- [token] -- -ig=*.el   ignore case, only el
           -- [token] -- -ig=!*.el  ignore case, not el files
+          -- -F search exact
           Snacks.picker.grep({
             finder = "grep",
             format = "file",
