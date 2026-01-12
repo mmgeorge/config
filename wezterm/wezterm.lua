@@ -575,6 +575,11 @@ config.key_tables     = {
     },
     { key = 'UpArrow',   mods = 'NONE', action = action.CopyMode 'MoveUp' },
     { key = 'DownArrow', mods = 'NONE', action = action.CopyMode 'MoveDown' },
+    {
+      key = "Enter",
+      mods = "ALT",
+      action = wezterm.action.DisableDefaultAssignment,
+    },
   }
 }
 
