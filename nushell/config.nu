@@ -309,3 +309,7 @@ def "error" [msg: string] {
 $env.PATH = ($env.PATH | prepend ($env.FNM_MULTISHELL_PATH | path join "bin"))
 
 source ~/.zoxide.nu
+
+const config_path = ("~/.config.nu" | path expand)
+const optional_config = (if ($config_path | path exists) { $config_path } else { null })
+source $optional_config

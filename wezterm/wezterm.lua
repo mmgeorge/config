@@ -85,48 +85,27 @@ config.show_new_tab_button_in_tab_bar       = false
 --   return tab_info.active_pane.title
 -- end
 
-function basename(s)
-  return string.gsub(s, '(.*[/\\\\])(.*)', '%2')
-end
-
--- wezterm.on(
---   'format-tab-title',
---   function(tab, tabs, panes, config, hover, max_width)
---     local title = tab_title(tab)
---     -- title = wezterm.truncate_right(title, 10)
---     -- if tab.is_active then
---     --   return {
---     --     -- { Background = { Color = 'blue' } },
---     --     { Text = '' .. title .. ' ' },
---     --     -- { Text = '' .. title .. ' ' },
---     --   }
---     -- end
---     -- if tab.is_last_active then
---     --   -- Green color and append '*' to previously active tab.
---     --   return {
---     --     -- { Background = { Color = 'green' } },
---     --     { Text = ' ' .. title .. '' },
---     --   }
---     -- end
---
---     return {
---       -- { Background = { Color = 'green' } },
---       { Text = '' .. title .. '' },
---     }
---   end
--- )
-
 wezterm.on('format-tab-title', function(tab, tabs, panes, config, hover, max_width)
-  local pane = tab.active_pane
-  -- Get the name of the foreground process and use the basename function
-  local title = basename(pane.foreground_process_name)
+  local user_title = tab.active_pane.title
+  local pwd = tab.active_pane.current_working_dir
 
-  -- Optional: add a space around the title for aesthetics
-  return {
-    { Text = ' ' .. title .. ' ' },
-  }
+  -- If a specific title hasn't been set by a process, use the directory
+  if pwd then
+    -- Convert the URL object to a local path string
+    local path = pwd.file_path
+
+    -- Handle the special case for the home directory (~)
+    if path == wezterm.home_dir then
+      return " ~ "
+    end
+
+    -- Match everything after the last slash
+    local last_dir = path:match("([^/]+)$")
+    return " " .. last_dir .. " "
+  end
+
+  return " " .. user_title .. " "
 end)
-
 
 config.window_padding = {
   left = 4,
