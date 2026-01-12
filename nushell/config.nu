@@ -51,7 +51,7 @@ def create_left_prompt [] {
 
 $env.PROMPT_COMMAND = {|| create_left_prompt }
 $env.PROMPT_COMMAND_RIGHT = { || "" }
-$env.PROMPT_INDICATOR = {|| $"(ansi white_bold)> " }
+$env.PROMPT_INDICATOR = {|| $"(ansi white_bold) ╰── " }
 $env.PROMPT_INDICATOR_VI_INSERT = {|| $"(ansi white_bold)> " }
 $env.PROMPT_INDICATOR_VI_NORMAL = {|| $"(ansi white_bold): " }
 
