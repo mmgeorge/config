@@ -1,25 +1,29 @@
-# check deps
-if (which carapace | is-empty) {
-  error "carapace not installed"
+# Ensure that all required dependencies are installed.
+def install-required [] {
+    let required = [
+        { name: "carapace", winget: "rsteube.Carapace" },
+        { name: "bat", winget: "sharkdp.bat" },
+        { name: "fnm", winget: "Schniz.fnm" },
+        { name: "btop", winget: "aristocratos.btop4win" },
+        { name: "z", winget: "ajeetdsouza.zoxide" },
+        { name: "fzf", winget: "junegunn.fzf" },
+        { name: "rg", winget: "BurntSushi.ripgrep.MSVC" },
+        { name: "uv", winget: "astral-sh.uv" }
+    ]
+
+    let missing = $required | where {|it| (which $it.name | is-empty) }
+    if ($missing | is-not-empty) {
+      print $"Installing: ($missing.name | str join ', ')"
+
+      if $nu.os-info.name == "windows" {
+        ^winget install ...$missing.winget --accept-source-agreements --accept-package-agreements -h
+      } else {
+        ^brew install ...$missing.name
+      }
+    }
 }
-if (which bat | is-empty) {
-  error "bat not installed"
-}
-if (which fnm | is-empty) {
-  error "fnm not installed"
-}
-if (which btop | is-empty) {
-  error "btop not installed"
-}
-if (which z | is-empty) {
-  error "zoxide not installed"
-}
-if (which zoxide | is-empty) {
-  error "fzf not installed"
-}
-if (which uv | is-empty) {
-  error "uv not installed"
-}
+
+install-required
 
 $env.GEMINI_CLI_SYSTEM_DEFAULTS_PATH = $env.XDG_CONFIG_HOME | path join "gemini/settings.json"
 
