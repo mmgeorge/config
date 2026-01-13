@@ -1,14 +1,16 @@
 # Ensure that all required dependencies are installed.
 def install-required [] {
     let required = [
-        { name: "carapace", winget: "rsteube.Carapace" },
-        { name: "bat", winget: "sharkdp.bat" },
-        { name: "fnm", winget: "Schniz.fnm" },
-        { name: "btop", winget: "aristocratos.btop4win" },
-        { name: "z", winget: "ajeetdsouza.zoxide" },
-        { name: "fzf", winget: "junegunn.fzf" },
-        { name: "rg", winget: "BurntSushi.ripgrep.MSVC" },
-        { name: "uv", winget: "astral-sh.uv" }
+        { name: "carapace", winget: "rsteube.Carapace", brew: "carapace"},
+        { name: "bat", winget: "sharkdp.bat", brew: "bat" },
+        { name: "fnm", winget: "Schniz.fnm", brew: "fnm"  },
+        { name: "btop", winget: "aristocratos.btop4win", brew: "btop"  },
+        { name: "z", winget: "ajeetdsouza.zoxide", brew: "zoxide" },
+        { name: "fzf", winget: "junegunn.fzf", brew: "fzf"  },
+        { name: "rg", winget: "BurntSushi.ripgrep.MSVC", brew: "rg"   },
+        { name: "uv", winget: "astral-sh.uv", brew: "uv"   },
+        { name: "pnpm", winget: "pnpm.pnpm", brew: "pnpm"   },
+        # { name: "pass-cli", winget: "Proton.ProtonPass.CLI", brew: "protonpass/tap/pass-cli" }
     ]
 
     let missing = $required | where {|it| (which $it.name | is-empty) }
@@ -317,3 +319,4 @@ source ~/.zoxide.nu
 const config_path = ("~/.config.nu" | path expand)
 const optional_config = (if ($config_path | path exists) { $config_path } else { null })
 source $optional_config
+
