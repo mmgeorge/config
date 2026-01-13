@@ -1,28 +1,28 @@
 # Ensure that all required dependencies are installed.
 def install-required [] {
-    let required = [
-        { name: "carapace", winget: "rsteube.Carapace", brew: "carapace"},
-        { name: "bat", winget: "sharkdp.bat", brew: "bat" },
-        { name: "fnm", winget: "Schniz.fnm", brew: "fnm"  },
-        { name: "btop", winget: "aristocratos.btop4win", brew: "btop"  },
-        { name: "z", winget: "ajeetdsouza.zoxide", brew: "zoxide" },
-        { name: "fzf", winget: "junegunn.fzf", brew: "fzf"  },
-        { name: "rg", winget: "BurntSushi.ripgrep.MSVC", brew: "rg"   },
-        { name: "uv", winget: "astral-sh.uv", brew: "uv"   },
-        { name: "pnpm", winget: "pnpm.pnpm", brew: "pnpm"   },
-        # { name: "pass-cli", winget: "Proton.ProtonPass.CLI", brew: "protonpass/tap/pass-cli" }
-    ]
+  let required = [
+    { name: "carapace", winget: "rsteube.Carapace", brew: "carapace"},
+    { name: "bat", winget: "sharkdp.bat", brew: "bat" },
+    { name: "fnm", winget: "Schniz.fnm", brew: "fnm"  },
+    { name: "btop", winget: "aristocratos.btop4win", brew: "btop"  },
+    { name: "z", winget: "ajeetdsouza.zoxide", brew: "zoxide" },
+    { name: "fzf", winget: "junegunn.fzf", brew: "fzf"  },
+    { name: "rg", winget: "BurntSushi.ripgrep.MSVC", brew: "rg"   },
+    { name: "uv", winget: "astral-sh.uv", brew: "uv"   },
+    { name: "pnpm", winget: "pnpm.pnpm", brew: "pnpm"   },
+    # { name: "pass-cli", winget: "Proton.ProtonPass.CLI", brew: "protonpass/tap/pass-cli" }
+  ]
 
-    let missing = $required | where {|it| (which $it.name | is-empty) }
-    if ($missing | is-not-empty) {
-      print $"Installing: ($missing.name | str join ', ')"
+  let missing = $required | where {|it| (which $it.name | is-empty) }
+  if ($missing | is-not-empty) {
+    print $"Installing: ($missing.name | str join ', ')"
 
-      if $nu.os-info.name == "windows" {
-        ^winget install ...$missing.winget --accept-source-agreements --accept-package-agreements -h
-      } else {
-        ^brew install ...$missing.name
-      }
+    if $nu.os-info.name == "windows" {
+      ^winget install ...$missing.winget --accept-source-agreements --accept-package-agreements -h
+    } else {
+      ^brew install ...$missing.name
     }
+  }
 }
 
 install-required
@@ -40,48 +40,48 @@ alias original_open = open
 source $"($nu.cache-dir)/carapace.nu"
 
 def get_git_branch [] {
-    let branch_res = (do { git branch --show-current } | complete)
-    if $branch_res.exit_code != 0 or ($branch_res.stdout | str trim | is-empty) {
-        return ""
-    }
-    let branch_name = ($branch_res.stdout | str trim)
+  let branch_res = (do { git branch --show-current } | complete)
+  if $branch_res.exit_code != 0 or ($branch_res.stdout | str trim | is-empty) {
+    return ""
+  }
+  let branch_name = ($branch_res.stdout | str trim)
 
-    let status_res = (do { git status --porcelain } | complete)
-    let has_changes = ($status_res.stdout | str trim | is-empty | not $in)
-    let indicator = if $has_changes { "*" } else { "" }
+  let status_res = (do { git status --porcelain } | complete)
+  let has_changes = ($status_res.stdout | str trim | is-empty | not $in)
+  let indicator = if $has_changes { "*" } else { "" }
 
-    $"(ansi { fg: "white" })\(($branch_name)($indicator)\)(ansi reset) "
+  $"(ansi { fg: "white" })\(($branch_name)($indicator)\)(ansi reset) "
 }
 
 def create_left_prompt [] {
-    # 1. Try to get the git root path
-    let git_root_res = (do { git rev-parse --show-toplevel } | complete)
+  # 1. Try to get the git root path
+  let git_root_res = (do { git rev-parse --show-toplevel } | complete)
 
-    # 2. Determine the path to display
-    let dir = if $git_root_res.exit_code == 0 {
-        # We are inside a git repo
-        let root = ($git_root_res.stdout | str trim)
-        let repo_name = ($root | path basename)
+  # 2. Determine the path to display
+  let dir = if $git_root_res.exit_code == 0 {
+    # We are inside a git repo
+    let root = ($git_root_res.stdout | str trim)
+    let repo_name = ($root | path basename)
 
-        # Get path relative to the git root
-        let relative = ($env.PWD | path relative-to $root)
+    # Get path relative to the git root
+    let relative = ($env.PWD | path relative-to $root)
 
-        # If we are exactly at the root, just show repo name
-        # Otherwise, join repo name + relative path
-        if ($relative | str trim | is-empty) or $relative == "." {
-            $repo_name
-        } else {
-            $repo_name | path join $relative
-        }
+    # If we are exactly at the root, just show repo name
+    # Otherwise, join repo name + relative path
+    if ($relative | str trim | is-empty) or $relative == "." {
+      $repo_name
     } else {
-        # Not in a git repo: Standard ~ replacement
-        ($env.PWD | str replace $nu.home-path "~")
+      $repo_name | path join $relative
     }
+  } else {
+    # Not in a git repo: Standard ~ replacement
+    ($env.PWD | str replace $nu.home-path "~")
+  }
 
-    let git = (get_git_branch)
+  let git = (get_git_branch)
 
-    # Combined: White PWD followed by Magenta Git Branch
-    $"(ansi white_bold)($dir)(ansi reset) ($git)\n"
+  # Combined: White PWD followed by Magenta Git Branch
+  $"(ansi white_bold)($dir)(ansi reset) ($git)\n"
 }
 
 $env.PROMPT_COMMAND = {|| create_left_prompt }
@@ -98,16 +98,16 @@ $env.PROMPT_INDICATOR_VI_NORMAL = {|| $"(ansi white_bold): " }
 use ($nu.config-path | path dirname | path join 'completions/uv-completions.nu') *
 
 let carapace_completer = {|spans|
-    let native_commands = ["gcloud", "uv"]
-    if ($spans.0 in $native_commands) {
-        null
-    } else {
-        carapace $spans.0 nushell ...$spans | from json
-    }
+  let native_commands = ["gcloud", "uv"]
+  if ($spans.0 in $native_commands) {
+    null
+  } else {
+    carapace $spans.0 nushell ...$spans | from json
+  }
 }
 $env.config.completions.external = {
-    enable: true
-    completer: $carapace_completer
+  enable: true
+  completer: $carapace_completer
 }
 $env.config.completions.algorithm = "fuzzy"
 $env.config.completions.case_sensitive = false
@@ -156,63 +156,63 @@ $env.config.color_config.duration = "white"
 $env.config.color_config.header = "white"
 
 $env.config.menus ++= [{
-   name: completion_menu
-   only_buffer_difference: false
-   marker: "| "
-   type: {
-     layout: ide
-     columns: 1
-     col_width: 25
-     selection_rows: 20
-     description_rows: 20
-     page_size: 40
-   }
-   style: {
-   }
+  name: completion_menu
+  only_buffer_difference: false
+  marker: "| "
+  type: {
+    layout: ide
+    columns: 1
+    col_width: 25
+    selection_rows: 20
+    description_rows: 20
+    page_size: 40
+  }
+  style: {
+  }
 }]
 
 $env.config = {
-    # keybindings: [
-    #     {
-    #         name: custom_enter_insert
-    #         modifier: none
-    #         keycode: char_u
-    #         mode: vi_normal
-    #         event: {
-    #           send: ViChangeMode,
-    #           mode: Append
-    #         }
-    #     }
-    #     {
-    #         name: move_left_custom
-    #         modifier: none
-    #         keycode: char_j
-    #         mode: vi_normal
-    #         event: { edit: moveleft }
-    #     }
-    #     {
-    #         name: move_right_custom
-    #         modifier: none
-    #         keycode: char_n
-    #         mode: vi_normal
-    #         event: { edit: moveright }
-    #     }
-    #     {
-    #         name: move_up_custom
-    #         modifier: none
-    #         keycode: char_s
-    #         mode: vi_normal
-    #         event: { edit: moveright }
-    #     }
-    #     {
-    #         name: move_down_custom
-    #         modifier: none
-    #         keycode: char_t
-    #         mode: vi_normal
-    #         event: { edit: moveright }
-    #     }
-    #
-    # ]
+  # keybindings: [
+  #     {
+  #         name: custom_enter_insert
+  #         modifier: none
+  #         keycode: char_u
+  #         mode: vi_normal
+  #         event: {
+  #           send: ViChangeMode,
+  #           mode: Append
+  #         }
+  #     }
+  #     {
+  #         name: move_left_custom
+  #         modifier: none
+  #         keycode: char_j
+  #         mode: vi_normal
+  #         event: { edit: moveleft }
+  #     }
+  #     {
+  #         name: move_right_custom
+  #         modifier: none
+  #         keycode: char_n
+  #         mode: vi_normal
+  #         event: { edit: moveright }
+  #     }
+  #     {
+  #         name: move_up_custom
+  #         modifier: none
+  #         keycode: char_s
+  #         mode: vi_normal
+  #         event: { edit: moveright }
+  #     }
+  #     {
+  #         name: move_down_custom
+  #         modifier: none
+  #         keycode: char_t
+  #         mode: vi_normal
+  #         event: { edit: moveright }
+  #     }
+  #
+  # ]
 }
 
 # $env.config.keybindings = [
@@ -231,45 +231,45 @@ $env.config = {
 # ]
 
 def --env dev [] {
-    cd $env.DEV_HOME
+  cd $env.DEV_HOME
 }
 
 def --env cfg [] {
-    cd $env.XDG_CONFIG_HOME
+  cd $env.XDG_CONFIG_HOME
 }
 
 def --env www [] {
-    cd $env.WWW_HOME
+  cd $env.WWW_HOME
 }
 
 def --env eng [] {
-    cd D:/code/ferrous/blue/
+  cd D:/code/ferrous/blue/
 }
 
 def --env sdk [] {
-    cd ($env.DEV_HOME | path join arcgis-js-api-4)
+  cd ($env.DEV_HOME | path join arcgis-js-api-4)
 }
 
 
 def lst [len: int = 50] {
-    ls | update name {|f|
-        let p = ($f.name | path parse)
-        let ext = if ($p.extension | is-empty) { "" } else { $".($p.extension)" }
+  ls | update name {|f|
+    let p = ($f.name | path parse)
+    let ext = if ($p.extension | is-empty) { "" } else { $".($p.extension)" }
 
-        if ($p.stem | str length) > $len {
-            ($p.stem | str substring 0..($len - 3)) + "..." + $ext
-        } else {
-            $f.name
-        }
+    if ($p.stem | str length) > $len {
+      ($p.stem | str substring 0..($len - 3)) + "..." + $ext
+    } else {
+      $f.name
     }
+  }
 }
 
 def cat [file: path] {
-    if (($file | path parse).extension | str downcase) in ["toml", "json"] {
-        original_open $file
-    } else {
-        bat $file
-    }
+  if (($file | path parse).extension | str downcase) in ["toml", "json"] {
+    original_open $file
+  } else {
+    bat $file
+  }
 }
 
 def --env jp [] {
@@ -278,12 +278,12 @@ def --env jp [] {
 }
 
 def open [path: path = "."] {
-    if $nu.os-info.name == "windows" {
-        ^explorer $path
-    } else {
-        # Fallback for MacOS/Linux
-        ^open $path
-    }
+  if $nu.os-info.name == "windows" {
+    ^explorer $path
+  } else {
+    # Fallback for MacOS/Linux
+    ^open $path
+  }
 }
 
 # Extract content from multiple files in a directory for use with an LLM.
@@ -307,7 +307,7 @@ def extract [file: string, out: string = "output"] {
 }
 
 def "error" [msg: string] {
-    print -e $"(ansi red_bold)Error:(ansi reset) ($msg)"
+  print -e $"(ansi red_bold)Error:(ansi reset) ($msg)"
 }
 
 # Fnm setup

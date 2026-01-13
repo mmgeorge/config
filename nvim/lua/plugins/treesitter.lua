@@ -49,6 +49,7 @@ return {
           "slang",
           "yaml",
           "latex",
+          "nu"
         },
         sync_install = false,
         highlight = {
