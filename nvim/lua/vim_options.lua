@@ -1,6 +1,7 @@
 vim.g._ts_force_sync_parsing = true
 
-vim.opt.shadafile = "NONE"
+-- Shadafile keeps history accross sessions
+-- vim.opt.shadafile = "NONE"
 
 -- "yes" means overwrite the file in place (preserves inode)
 -- "auto", the default can have issues with some file watcher

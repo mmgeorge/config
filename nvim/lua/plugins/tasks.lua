@@ -138,7 +138,7 @@ return {
     'stevearc/overseer.nvim',
     dependencies = {
       { "akinsho/toggleterm.nvim" },
-      { "rcarriga/nvim-notify" },
+      -- { "rcarriga/nvim-notify" },
       { "stevearc/dressing.nvim" },
     },
     keys = {

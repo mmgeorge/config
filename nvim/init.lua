@@ -4,20 +4,20 @@
 
 
 -- Silence the specific position encoding message
-local notify_original = vim.notify
-vim.notify = function(msg, ...)
-  if
-    msg
-    and (
-      msg:match 'position_encoding param is required'
-      or msg:match 'Defaulting to position encoding of the first client'
-      or msg:match 'multiple different client offset_encodings'
-    )
-  then
-    return
-  end
-  return notify_original(msg, ...)
-end
+-- local notify_original = vim.notify
+-- vim.notify = function(msg, ...)
+--   if
+--     msg
+--     and (
+--       msg:match 'position_encoding param is required'
+--       or msg:match 'Defaulting to position encoding of the first client'
+--       or msg:match 'multiple different client offset_encodings'
+--     )
+--   then
+--     return
+--   end
+--   return notify_original(msg, ...)
+-- end
 
 vim.g.mapleader=" "
 vim.g.maplocalleader=" "
@@ -46,6 +46,6 @@ require("lazy").setup(
 )
 
 require("vim_options")
-require("keymap"); 
-require("diagnostics"); 
-require("autosnippets"); 
+require("keymap");
+require("diagnostics");
+require("autosnippets");

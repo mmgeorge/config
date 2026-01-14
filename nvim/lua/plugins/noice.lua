@@ -1,40 +1,10 @@
 return {
   {
-    "rcarriga/nvim-notify",
-    opts = {
-      background_colour = "NotifyBackground",
-      fps = 30,
-      icons = {
-        DEBUG = "",
-        ERROR = "",
-        INFO = "",
-        TRACE = "",
-        WARN = ""
-      },
-      level = 2,
-      minimum_width = 20,
-      max_height = 5,
-      max_width = 80,
-      render = "compact",
-      stages = "static",
-      time_formats = {
-        notification = "%T",
-        notification_history = "%FT%T"
-      },
-      timeout = 6000,
-      top_down = false
-    },
-  },
-  {
     "folke/noice.nvim",
     event = "VeryLazy",
     dependencies = {
       -- if you lazy-load any plugin below, make sure to add proper `module="..."` entries
       "MunifTanjim/nui.nvim",
-      -- OPTIONAL:
-      --   `nvim-notify` is only needed, if you want to use the notification view.
-      --   If not available, we use `mini` as the fallback
-      "rcarriga/nvim-notify",
     },
     opts = {
       routes = {
@@ -91,9 +61,6 @@ return {
       messages = {
         -- We filter all messages (see above) and display them in lualine
         enabled = true,
-        -- view = "mini",
-        -- view_error = "mini",
-        -- view_warn = "mini",
       },
       notify = {
         enabled = false
@@ -104,10 +71,6 @@ return {
         },
         signature = {
           enabled = false,
-          view = "notify",
-          auto_open = {
-            enabled = true,
-          }
         },
       }
     },
