@@ -35,7 +35,6 @@ alias select = select --ignore-case
 alias gc = gcloud
 alias tf = terraform
 alias top = btop
-alias original_open = open
 
 source $"($nu.cache-dir)/carapace.nu"
 
@@ -111,6 +110,84 @@ $env.config.completions.external = {
 }
 $env.config.completions.algorithm = "fuzzy"
 $env.config.completions.case_sensitive = false
+
+$env.config.history = {
+  file_format: "sqlite",
+  sync_on_enter: true, # Not sure this does anything when sqlite mode enabled.
+  isolation: true,
+  max_size: 100000
+}
+
+# Commands to avoid keeping history for.
+$env.NO_HISTORY = [ 'cd' ]
+
+$env.config.hooks = {
+  pre_execution: [
+    {
+      $env.LAST_COMMAND = (commandline);
+
+      for command in ($env.NO_HISTORY? | default []) {
+        if ((commandline) | str starts-with $command) {
+          $env.DELETE_FROM_HISTORY = $command
+        }
+      }
+    }
+  ],
+  pre_prompt: [
+    {
+      # Hide blocked commands.
+      if ($env.DELETE_FROM_HISTORY? != null) {
+        open $nu.history-path
+        | query db $"DELETE FROM history WHERE command_line LIKE '($env.DELETE_FROM_HISTORY)%'"
+        hide-env DELETE_FROM_HISTORY
+        hide-env LAST_COMMAND
+        return;
+      }
+
+      # Hide short commands.
+      if ($env.LAST_COMMAND? != null and ($env.LAST_COMMAND | str length) < 6) {
+        open $nu.history-path
+        | query db $"DELETE FROM history WHERE command_line LIKE '($env.LAST_COMMAND)%'"
+        hide-env LAST_COMMAND
+        return;
+      }
+
+      # Only keep the latest entry of a command.
+      if ($env.LAST_COMMAND? != null) {
+        let pattern = $env.LAST_COMMAND
+        let history_db = $nu.history-path
+
+        let first_match = (
+          open $history_db
+          | query db $"SELECT id FROM history WHERE command_line LIKE '($pattern)%' ORDER BY id LIMIT 1"
+          | get 0?
+        )
+
+        if ($first_match != null) {
+          let id_to_delete = $first_match.id
+
+          open $history_db
+          | query db $"DELETE FROM history WHERE command_line LIKE '($pattern)%' AND id > ($id_to_delete)"
+        }
+        hide-env LAST_COMMAND
+
+      }
+
+    }
+  ]
+  # Avoid keeping track of invalid commands
+  # command_not_found: [
+  #   {
+  #     original_open $nu.history-path
+  #     | query db $"DELETE FROM history WHERE command_line LIKE '($env.LAST_COMMAND)%'"
+  #   }
+  # ]
+}
+
+def "delete-all-history" [] {
+  open $nu.history-path | query db "DELETE FROM history WHERE 1=1"
+}
+
 
 # ${UserConfigDir}/nushell/config.nu
 def "trim-all" [width: int = 20] {
@@ -266,7 +343,7 @@ def lst [len: int = 50] {
 
 def cat [file: path] {
   if (($file | path parse).extension | str downcase) in ["toml", "json"] {
-    original_open $file
+    open $file
   } else {
     bat $file
   }
@@ -277,7 +354,7 @@ def --env jp [] {
   if ($path != "") { cd $path }
 }
 
-def open [path: path = "."] {
+def browse [path: path = "."] {
   if $nu.os-info.name == "windows" {
     ^explorer $path
   } else {
@@ -285,6 +362,8 @@ def open [path: path = "."] {
     ^open $path
   }
 }
+
+alias o = browse
 
 # Extract content from multiple files in a directory for use with an LLM.
 def extract_many [director: string, out: string = "output"] {

@@ -12,5 +12,5 @@ opencode/
 btop/
 topiary/
 
-nushell/history.txt
+nushell/history*
 nushell/completions/
