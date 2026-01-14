@@ -159,7 +159,7 @@ $env.config.hooks = {
 
         let first_match = (
           open $history_db
-          | query db $"SELECT id FROM history WHERE command_line LIKE '($pattern)%' ORDER BY id LIMIT 1"
+          | query db $"SELECT id FROM history WHERE command_line = '($pattern)' ORDER BY id DESC LIMIT 1"
           | get 0?
         )
 
@@ -167,7 +167,7 @@ $env.config.hooks = {
           let id_to_delete = $first_match.id
 
           open $history_db
-          | query db $"DELETE FROM history WHERE command_line LIKE '($pattern)%' AND id > ($id_to_delete)"
+          | query db $"DELETE FROM history WHERE command_line = '($pattern)' AND id > ($id_to_delete)"
         }
         hide-env LAST_COMMAND
 
@@ -399,3 +399,13 @@ const config_path = ("~/.config.nu" | path expand)
 const optional_config = (if ($config_path | path exists) { $config_path } else { null })
 source $optional_config
 
+def ai [prompt: string] {
+  let full_prompt = $"Output as a single line. Write a nushell script that does: ($prompt)"
+  let command = opencode run $full_prompt -m opencode/gemini-3-flash
+  | into string
+  | str trim
+
+  $command | clip.exe
+
+  print $command
+}
