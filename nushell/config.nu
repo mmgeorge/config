@@ -146,33 +146,33 @@ $env.config.hooks = {
       }
 
       # Hide short commands.
-      if ($env.LAST_COMMAND? != null and ($env.LAST_COMMAND | str length) < 6) {
-        let escaped_cmd = ($env.LAST_COMMAND | str replace --all "'" "''")
-        open $nu.history-path
-        | query db $"DELETE FROM history WHERE command_line LIKE '($escaped_cmd)%'"
-        hide-env LAST_COMMAND
-        return;
-      }
+      # if ($env.LAST_COMMAND? != null and ($env.LAST_COMMAND | str length) < 6) {
+      #   let escaped_cmd = ($env.LAST_COMMAND | str replace --all "'" "''")
+      #   open $nu.history-path
+      #   | query db $"DELETE FROM history WHERE command_line LIKE '($escaped_cmd)%'"
+      #   hide-env LAST_COMMAND
+      #   return;
+      # }
 
       # Only keep the latest entry of a command.
-      if ($env.LAST_COMMAND? != null) {
-        let pattern = ($env.LAST_COMMAND | str replace --all "'" "''")
-        let history_db = $nu.history-path
-
-        let first_match = (
-          open $history_db
-          | query db $"SELECT id FROM history WHERE command_line = '($pattern)' ORDER BY id DESC LIMIT 1"
-          | get 0?
-        )
-
-        if ($first_match != null) {
-          let id_to_delete = $first_match.id
-
-          open $history_db
-          | query db $"DELETE FROM history WHERE command_line = '($pattern)' AND id > ($id_to_delete)"
-        }
-        hide-env LAST_COMMAND
-      }
+      # if ($env.LAST_COMMAND? != null) {
+      #   let pattern = ($env.LAST_COMMAND | str replace --all "'" "''")
+      #   let history_db = $nu.history-path
+      #
+      #   let first_match = (
+      #     open $history_db
+      #     | query db $"SELECT id FROM history WHERE command_line = '($pattern)' ORDER BY id DESC LIMIT 1"
+      #     | get 0?
+      #   )
+      #
+      #   if ($first_match != null) {
+      #     let id_to_delete = $first_match.id
+      #
+      #     open $history_db
+      #     | query db $"DELETE FROM history WHERE command_line = '($pattern)' AND id > ($id_to_delete)"
+      #   }
+      #   hide-env LAST_COMMAND
+      # }
     }
   ]
   # Avoid keeping track of invalid commands
@@ -409,3 +409,5 @@ def ai [prompt: string] {
 
   print $command
 }
+
+$env.EDITOR = "nvim"
