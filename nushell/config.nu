@@ -137,8 +137,9 @@ $env.config.hooks = {
     {
       # Hide blocked commands.
       if ($env.DELETE_FROM_HISTORY? != null) {
+        let escaped_cmd = ($env.DELETE_FROM_HISTORY | str replace --all "'" "''")
         open $nu.history-path
-        | query db $"DELETE FROM history WHERE command_line LIKE '($env.DELETE_FROM_HISTORY)%'"
+        | query db $"DELETE FROM history WHERE command_line LIKE '($escaped_cmd)%'"
         hide-env DELETE_FROM_HISTORY
         hide-env LAST_COMMAND
         return;
@@ -146,15 +147,16 @@ $env.config.hooks = {
 
       # Hide short commands.
       if ($env.LAST_COMMAND? != null and ($env.LAST_COMMAND | str length) < 6) {
+        let escaped_cmd = ($env.LAST_COMMAND | str replace --all "'" "''")
         open $nu.history-path
-        | query db $"DELETE FROM history WHERE command_line LIKE '($env.LAST_COMMAND)%'"
+        | query db $"DELETE FROM history WHERE command_line LIKE '($escaped_cmd)%'"
         hide-env LAST_COMMAND
         return;
       }
 
       # Only keep the latest entry of a command.
       if ($env.LAST_COMMAND? != null) {
-        let pattern = $env.LAST_COMMAND
+        let pattern = ($env.LAST_COMMAND | str replace --all "'" "''")
         let history_db = $nu.history-path
 
         let first_match = (
@@ -170,9 +172,7 @@ $env.config.hooks = {
           | query db $"DELETE FROM history WHERE command_line = '($pattern)' AND id > ($id_to_delete)"
         }
         hide-env LAST_COMMAND
-
       }
-
     }
   ]
   # Avoid keeping track of invalid commands
