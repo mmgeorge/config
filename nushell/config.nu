@@ -411,3 +411,4 @@ def ai [prompt: string] {
 }
 
 $env.EDITOR = "nvim"
+$env.SHELL = "nu"
