@@ -10,6 +10,9 @@ def install-required [] {
     { name: "rg", winget: "BurntSushi.ripgrep.MSVC", brew: "rg"   },
     { name: "uv", winget: "astral-sh.uv", brew: "uv"   },
     { name: "pnpm", winget: "pnpm.pnpm", brew: "pnpm"   },
+    { name: "delta", winget: "dandavison.delta", brew: "git-delta" },
+    { name: "jj", winget: "jj-vcs.jj", brew: "jj" },
+    { name: "jjui", winget: "IbrahimDursun.jjui", brew: "jjui" },
     # { name: "pass-cli", winget: "Proton.ProtonPass.CLI", brew: "protonpass/tap/pass-cli" }
   ]
 
