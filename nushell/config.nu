@@ -415,4 +415,4 @@ def ai [prompt: string] {
 
 $env.EDITOR = "nvim"
 $env.SHELL = "nu"
-$env.PAGER = "delta --config $XDG_CONFIG_HOME/delta/config.toml"
+$env.PAGER = "delta"

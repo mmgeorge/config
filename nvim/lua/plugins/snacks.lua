@@ -178,6 +178,13 @@ return {
         desc = "Grep"
       },
       {
+        "og",
+        function()
+          Snacks.picker.git_diff()
+        end,
+        desc = "Git diff"
+      },
+      {
         "Sr",
         function()
           Snacks.picker.spelling({
@@ -442,11 +449,16 @@ return {
       bigfile = { enabled = false },
       dashboard = { enabled = false },
       explorer = { enabled = true },
+      image = {},
       indent = {
         enabled = false,
         only_scope = true,
         only_current = true
       },
+      gitbrowse = {
+        notify = true
+      },
+      gh = { },
       input = {
         enabled = false
       },
@@ -472,6 +484,69 @@ return {
         end
       },
       picker = {
+        sources = {
+          gh_diff = {
+            auto_close = false,
+            focus = "list",
+            win = {
+              preview = {
+                keys = {
+                  ["go"] = "focus_list",
+                }
+              },
+              input = {
+                keys = {
+                  ["<CR>"] = {"focus_preview", mode = { "n", "i" }},
+                },
+              },
+              list = {
+                keys = {
+                  ["<CR>"] = "focus_preview",
+                  ["u"] = "focus_input",
+                },
+              },
+            },
+          },
+          git_diff = {
+            auto_close = false,
+            focus = "list",
+            win = {
+              preview = {
+                keys = {
+                  ["go"] = "focus_list",
+                }
+              },
+              input = {
+                keys = {
+                  ["<CR>"] = {"focus_preview", mode = { "n", "i" }},
+                },
+              },
+              list = {
+                keys = {
+                  ["<CR>"] = "focus_preview",
+                  ["u"] = "focus_input",
+                },
+              },
+            },
+          },
+        },
+        previewers = {
+          diff = {
+            native = true,
+            -- fancy: Snacks fancy diff (borders, multi-column line numbers, syntax highlighting)
+            -- syntax: Neovim's built-in diff syntax highlighting
+            -- terminal: external command (git's pager for git commands, `cmd` for other diffs)
+            -- style = "fancy", ---@type "fancy"|"syntax"|"terminal"
+            style = "terminal", ---@type "fancy"|"syntax"|"terminal"
+            cmd = { "delta" },
+            wo = {
+              breakindent = true,
+              wrap = true,
+              linebreak = true,
+              showbreak = "",
+            },
+          },
+        },
         formatters = {
           file = {
             truncate = 70
@@ -561,6 +636,7 @@ return {
               ["<a-w>"] = "cycle_win",
               ["<c-a>"] = "select_all",
               ["<c-b>"] = "preview_scroll_up",
+              ["u"] = { "focus_input"},
               ["e"] = { "list_scroll_up", mode = { "n" } },
               ["a"] = { "list_scroll_down", mode = { "n" } },
               ["<c-f>"] = "preview_scroll_down",

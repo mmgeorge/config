@@ -3,7 +3,7 @@
   side-by-side = false
   line-numbers = true
   line-numbers-left-format = "{nm:^4}"
-  line-numbers-right-format = "{np:^4}"
+  line-numbers-right-format = "{np:^4} "
   line-numbers-left-style = red
   line-numbers-right-style = green
   minus-style = red
@@ -13,9 +13,9 @@
   hunk-header-decoration-style = none
   hunk-header-file-style = white
   hunk-header-line-number-style = white
-  hunk-label = "@hunk"
-  ; hunk-header-style = "line-number syntax"
-  hunk-header-style = none
+  hunk-label = "@@"
+  # hunk-header-style = "line-number syntax"
+  hunk-header-style = omit
   file-style = "yellow"
   file-mapping-style = yellow
   file-decoration-style = none
@@ -26,6 +26,7 @@
   file-renamed-label = "Rnamed file"
   syntax-theme = none
   max-line-distance = 0.8
-  paging = auto
+  # paging = auto
+  paging = never
 
 
