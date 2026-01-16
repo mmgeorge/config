@@ -1,0 +1,31 @@
+[delta]
+  features = plain-style
+  side-by-side = false
+  line-numbers = true
+  line-numbers-left-format = "{nm:^4}"
+  line-numbers-right-format = "{np:^4}"
+  line-numbers-left-style = red
+  line-numbers-right-style = green
+  minus-style = red
+  plus-style = green
+  decorations = false
+  file-style = plain
+  hunk-header-decoration-style = none
+  hunk-header-file-style = white
+  hunk-header-line-number-style = white
+  hunk-label = "@hunk"
+  ; hunk-header-style = "line-number syntax"
+  hunk-header-style = none
+  file-style = "yellow"
+  file-mapping-style = yellow
+  file-decoration-style = none
+  file-modified-label = "Modified file"
+  file-added-label = "Added file"
+  file-removed-label = "Removed file"
+  file-copied-label = "Copied file"
+  file-renamed-label = "Rnamed file"
+  syntax-theme = none
+  max-line-distance = 0.8
+  paging = auto
+
+

@@ -64,9 +64,6 @@ return {
   --                         vim.notify(err_resolve.code .. ": " .. err_resolve.message, vim.log.levels.ERROR)
   --                         return
   --                       end
-  --                       if resolved_action.edit then
-  --                         vim.lsp.util.apply_workspace_edit(resolved_action.edit, client.offset_encoding)
-  --                       end
   --                     end)
   --                     return
   --                   end

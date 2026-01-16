@@ -345,7 +345,7 @@ def cat [file: path] {
   if (($file | path parse).extension | str downcase) in ["toml", "json"] {
     open $file
   } else {
-    bat $file
+    bat -pP $file
   }
 }
 
@@ -412,3 +412,4 @@ def ai [prompt: string] {
 
 $env.EDITOR = "nvim"
 $env.SHELL = "nu"
+$env.PAGER = "delta --config $XDG_CONFIG_HOME/delta/config.toml"
