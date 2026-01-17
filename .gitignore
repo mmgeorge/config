@@ -3,6 +3,7 @@
 *.spl
 google-chrome/
 .aider.*
+.claude/
 gh/
 .wrangler/
 lazygit/
