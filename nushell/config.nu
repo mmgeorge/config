@@ -85,8 +85,6 @@ $env.PROMPT_INDICATOR = {|| $"(ansi white_bold) ╰─ " }
 $env.PROMPT_INDICATOR_VI_INSERT = {|| $"(ansi white_bold)> " }
 $env.PROMPT_INDICATOR_VI_NORMAL = {|| $"(ansi white_bold): " }
 
-$env.config.edit_mode = "vi"
-
 # mkdir ($nu.data-dir | path join "vendor/autoload")
 # starship init nu | save -f ($nu.data-dir | path join "vendor/autoload/starship.nu")
 
@@ -203,54 +201,100 @@ def "trim-all" [width: int = 20] {
   }
 }
 
-$env.config.keybindings ++= [{
-  name: completion_menu
-  modifier: control
-  keycode: char_t
-  mode: emacs
-  event: { send: menu name: completion_menu }
-}]
+# $env.config.keybindings ++= [
+#   {
+#     name: move_word_left
+#     modifier: none
+#     keycode: char_r
+#     mode: [vi_insert vi_normal] # Apply to both modes
+#     event: { edit: MoveWordLeft }
+#   }
+#   {
+#     name: move_word_right
+#     modifier: none
+#     keycode: char_h
+#     mode: [vi_insert vi_normal]
+#     event: { edit: MoveWordRight }
+#   }
+#   {
+#     name: move_left_one_char
+#     modifier: none
+#     keycode: char_n
+#     mode: vi_normal
+#     event: { edit: MoveLeft }
+#   }
+#   {
+#     name: move_right_one_char
+#     modifier: none
+#     keycode: char_i
+#     mode: vi_normal
+#     event: { edit: MoveRight }
+#   }
+#   # No way to set this yet.
+#   # {
+#   #   name: enter_insert_mode
+#   #   modifier: none
+#   #   keycode: char_u
+#   #   mode: vi_normal
+#   #   event: { send: EnterViInsert }
+#   #
+#   # }
+# ]
 
+$env.config.edit_mode = "emacs"
+
+# Emacs bindings
 $env.config.keybindings ++= [
   {
+    name: completion_menu
+    modifier: control
+    keycode: char_t
+    mode: emacs
+    event: { send: menu name: completion_menu }
+  }
+  {
     name: move_word_left
-    modifier: none
-    keycode: char_r
-    mode: [vi_insert vi_normal] # Apply to both modes
+    modifier: control
+    keycode: char_n
+    mode: emacs
     event: { edit: MoveWordLeft }
   }
   {
     name: move_word_right
-    modifier: none
-    keycode: char_h
-    mode: [vi_insert vi_normal]
+    modifier: control
+    keycode: char_i
+    mode: emacs
     event: { edit: MoveWordRight }
   }
   {
-    name: move_left_one_char
-    modifier: none
-    keycode: char_n
-    mode: vi_normal
-    event: { edit: MoveLeft }
+    name: move_up
+    modifier: control
+    keycode: char_e
+    mode: emacs
+    event: { send: Up }
   }
   {
-    name: move_right_one_char
-    modifier: none
-    keycode: char_i
-    mode: vi_normal
-    event: { edit: MoveRight }
+    name: move_down
+    modifier: control
+    keycode: char_a
+    mode: emacs
+    event: { send: Down }
   }
-  # No way to set this yet.
-  # {
-  #   name: enter_insert_mode
-  #   modifier: none
-  #   keycode: char_u
-  #   mode: vi_normal
-  #   event: { send: EnterViInsert }
-  #
-  # }
+  {
+    name: move_line_start
+    modifier: control
+    keycode: "char_;"
+    mode: emacs
+    event: { edit: MoveToLineStart }
+  }
+  {
+    name: move_line_end
+    modifier: control
+    keycode: char_/
+    mode: emacs
+    event: { edit: MoveToLineEnd }
+  }
 ]
-
 
 $env.config.show_banner = false
 
