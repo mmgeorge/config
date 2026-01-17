@@ -243,55 +243,61 @@ def "trim-all" [width: int = 20] {
 
 $env.config.edit_mode = "emacs"
 
-# Emacs bindings
 $env.config.keybindings ++= [
   {
-    name: completion_menu
-    modifier: control
-    keycode: char_t
-    mode: emacs
-    event: { send: menu name: completion_menu }
-  }
-  {
     name: move_word_left
-    modifier: control
-    keycode: char_n
-    mode: emacs
+    modifier: alt
+    keycode: char_r
+    mode: [emacs, vi_normal, vi_insert]
     event: { edit: MoveWordLeft }
   }
   {
     name: move_word_right
-    modifier: control
-    keycode: char_i
-    mode: emacs
+    modifier: alt
+    keycode: char_h
+    mode: [emacs, vi_normal, vi_insert]
     event: { edit: MoveWordRight }
   }
   {
+    name: move_left
+    modifier: alt
+    keycode: char_n
+    mode: [emacs, vi_normal, vi_insert]
+    event: { edit: MoveLeft }
+  }
+  {
+    name: move_right
+    modifier: alt
+    keycode: char_i
+    mode: [emacs, vi_normal, vi_insert]
+    event: { edit: MoveRight }
+  }
+  {
     name: move_up
-    modifier: control
-    keycode: char_e
-    mode: emacs
-    event: { send: Up }
+    modifier: alt
+    keycode: char_s
+    mode: [emacs, vi_normal, vi_insert]
+    event: { until: [ { send: MenuUp } { send: Up } ] }
   }
   {
     name: move_down
-    modifier: control
-    keycode: char_a
-    mode: emacs
-    event: { send: Down }
+    modifier: alt
+    keycode: char_t
+    mode: [emacs, vi_normal, vi_insert]
+    event: { until: [ { send: MenuDown } { send: Down } ] }
   }
   {
     name: move_line_start
-    modifier: control
-    keycode: "char_;"
-    mode: emacs
+    modifier: alt
+    keycode: 'char_;'
+    mode: [emacs, vi_normal, vi_insert]
     event: { edit: MoveToLineStart }
   }
   {
     name: move_line_end
-    modifier: control
-    keycode: char_/
-    mode: emacs
+    modifier: alt
+    keycode: 'char_/'
+    mode: [emacs, vi_normal, vi_insert]
     event: { edit: MoveToLineEnd }
   }
 ]
