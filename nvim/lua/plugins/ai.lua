@@ -21,24 +21,24 @@ function filetype(context)
 end
 
 function detect_adapter()
-  if os.getenv("OPENAI_API_KEY") then
-    return {
-      chat = "openai",
-      inline = "openai",
-      commit = {
-        name = "openai",
-        -- name = "gemini",
-        -- model = "gemini-2.5-flash-preview-05-20",
-        -- opts = { can_reason = false }
-        -- model = "gemini-2.0-flash"
-      }
-      -- commit = {
-      --   name = "openai",
-      --   model = "gpt-4.1-mini"
-      --   -- model = "gpt-4o-mini"
-      -- }
-    }
-  end
+  -- if os.getenv("OPENAI_API_KEY") then
+  --   return {
+  --     chat = "openai",
+  --     inline = "openai",
+  --     commit = {
+  --       name = "openai",
+  --       -- name = "gemini",
+  --       -- model = "gemini-2.5-flash-preview-05-20",
+  --       -- opts = { can_reason = false }
+  --       -- model = "gemini-2.0-flash"
+  --     }
+  --     -- commit = {
+  --     --   name = "openai",
+  --     --   model = "gpt-4.1-mini"
+  --     --   -- model = "gpt-4o-mini"
+  --     -- }
+  --   }
+  -- end
 
   if os.getenv("GEMINI_API_KEY") then
     return {

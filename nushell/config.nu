@@ -32,13 +32,6 @@ install-required
 
 $env.GEMINI_CLI_SYSTEM_DEFAULTS_PATH = $env.XDG_CONFIG_HOME | path join "gemini/settings.json"
 
-alias cls = clear
-alias dc = detect columns
-alias select = select --ignore-case
-alias gc = gcloud
-alias tf = terraform
-alias top = btop
-
 source $"($nu.cache-dir)/carapace.nu"
 
 def get_git_branch [] {
@@ -92,7 +85,7 @@ $env.PROMPT_INDICATOR = {|| $"(ansi white_bold) ╰─ " }
 $env.PROMPT_INDICATOR_VI_INSERT = {|| $"(ansi white_bold)> " }
 $env.PROMPT_INDICATOR_VI_NORMAL = {|| $"(ansi white_bold): " }
 
-# $env.config.edit_mode = "vi"
+$env.config.edit_mode = "vi"
 
 # mkdir ($nu.data-dir | path join "vendor/autoload")
 # starship init nu | save -f ($nu.data-dir | path join "vendor/autoload/starship.nu")
@@ -218,6 +211,47 @@ $env.config.keybindings ++= [{
   event: { send: menu name: completion_menu }
 }]
 
+$env.config.keybindings ++= [
+  {
+    name: move_word_left
+    modifier: none
+    keycode: char_r
+    mode: [vi_insert vi_normal] # Apply to both modes
+    event: { edit: MoveWordLeft }
+  }
+  {
+    name: move_word_right
+    modifier: none
+    keycode: char_h
+    mode: [vi_insert vi_normal]
+    event: { edit: MoveWordRight }
+  }
+  {
+    name: move_left_one_char
+    modifier: none
+    keycode: char_n
+    mode: vi_normal
+    event: { edit: MoveLeft }
+  }
+  {
+    name: move_right_one_char
+    modifier: none
+    keycode: char_i
+    mode: vi_normal
+    event: { edit: MoveRight }
+  }
+  # No way to set this yet.
+  # {
+  #   name: enter_insert_mode
+  #   modifier: none
+  #   keycode: char_u
+  #   mode: vi_normal
+  #   event: { send: EnterViInsert }
+  #
+  # }
+]
+
+
 $env.config.show_banner = false
 
 $env.config.table = {
@@ -250,65 +284,6 @@ $env.config.menus ++= [{
   style: {
   }
 }]
-
-$env.config = {
-  # keybindings: [
-  #     {
-  #         name: custom_enter_insert
-  #         modifier: none
-  #         keycode: char_u
-  #         mode: vi_normal
-  #         event: {
-  #           send: ViChangeMode,
-  #           mode: Append
-  #         }
-  #     }
-  #     {
-  #         name: move_left_custom
-  #         modifier: none
-  #         keycode: char_j
-  #         mode: vi_normal
-  #         event: { edit: moveleft }
-  #     }
-  #     {
-  #         name: move_right_custom
-  #         modifier: none
-  #         keycode: char_n
-  #         mode: vi_normal
-  #         event: { edit: moveright }
-  #     }
-  #     {
-  #         name: move_up_custom
-  #         modifier: none
-  #         keycode: char_s
-  #         mode: vi_normal
-  #         event: { edit: moveright }
-  #     }
-  #     {
-  #         name: move_down_custom
-  #         modifier: none
-  #         keycode: char_t
-  #         mode: vi_normal
-  #         event: { edit: moveright }
-  #     }
-  #
-  # ]
-}
-
-# $env.config.keybindings = [
-#   {
-#         name: accept_completion_on_right
-#         modifier: none
-#         keycode: right
-#         mode: [emacs, vi_insert, vi_normal]
-#         event: {
-#           until: [
-#             { send: Enter }     # 'Enter' confirms the menu selection if a menu is open
-#             { send: Right } # 'MoveRight' moves the cursor if no menu is open
-#           ]
-#         }
-#       }
-# ]
 
 def --env dev [] {
   cd $env.DEV_HOME
@@ -366,8 +341,6 @@ def browse [path: path = "."] {
   }
 }
 
-alias o = browse
-
 # Extract content from multiple files in a directory for use with an LLM.
 def extract_many [director: string, out: string = "output"] {
   if (which marker | is-empty) {
@@ -392,15 +365,25 @@ def "error" [msg: string] {
   print -e $"(ansi red_bold)Error:(ansi reset) ($msg)"
 }
 
-# Fnm setup
-^fnm env --json | from json | load-env
-$env.PATH = ($env.PATH | prepend ($env.FNM_MULTISHELL_PATH | path join "bin"))
+def "config git" [] {
+  let git_config = $"($env.XDG_CONFIG_HOME? | default $"($env.HOME)/.config")/git/config"
 
-source ~/.zoxide.nu
+  if ($git_config | path exists) {
+    ^$env.EDITOR $git_config
+  } else {
+    print $"Error: Could not find git config at ($git_config)"
+  }
+}
 
-const config_path = ("~/.config.nu" | path expand)
-const optional_config = (if ($config_path | path exists) { $config_path } else { null })
-source $optional_config
+def "config nvim" [] {
+  let git_config = $"($env.XDG_CONFIG_HOME? | default $"($env.HOME)/.config")/nvim/init.lua"
+
+  if ($git_config | path exists) {
+    ^$env.EDITOR $git_config
+  } else {
+    print $"Error: Could not find git config at ($git_config)"
+  }
+}
 
 def ai [prompt: string] {
   let full_prompt = $"Output as a single line. Write a nushell script that does: ($prompt)"
@@ -413,6 +396,24 @@ def ai [prompt: string] {
   print $command
 }
 
+# Fnm setup
+^fnm env --json | from json | load-env
+$env.PATH = ($env.PATH | prepend ($env.FNM_MULTISHELL_PATH | path join "bin"))
+
+source ~/.zoxide.nu
+
+const config_path = ("~/.config.nu" | path expand)
+const optional_config = (if ($config_path | path exists) { $config_path } else { null })
+source $optional_config
+
 $env.EDITOR = "nvim"
 $env.SHELL = "nu"
 $env.PAGER = "delta"
+
+alias cls = clear
+alias dc = detect columns
+alias select = select --ignore-case
+alias gc = gcloud
+alias tf = terraform
+alias top = btop
+alias o = browse

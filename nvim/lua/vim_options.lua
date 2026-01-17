@@ -66,6 +66,19 @@ vim.cmd('set mps +=<:>')           -- Add <> to matchpairs (% command)
 
 vim.g.rust_recommended_style = '0' -- Otherwise will override indentation settings
 
+-- Disable auto comment
+-- vim.cmd('autocmd BufEnter * set formatoptions-=cro')
+-- vim.cmd('autocmd BufEnter * setlocal formatoptions-=cro')
+-- vim.cmd('autocmd FocusGained * checktime')
+-- vim.cmd('autocmd CursorHold * checktime')
+
+-- Slang support
+vim.filetype.add({
+  extension = {
+    slang = "slang",
+  },
+})
+
 -- vim.cmd('autocmd BufEnter * set formatoptions+=roj')
 -- vim.cmd('autocmd BufRead,BufNewFile * set fileformat=unix')
 
@@ -113,19 +126,6 @@ vim.api.nvim_create_autocmd("FileType", {
   end
 })
 
--- Disable auto comment
--- vim.cmd('autocmd BufEnter * set formatoptions-=cro')
--- vim.cmd('autocmd BufEnter * setlocal formatoptions-=cro')
--- vim.cmd('autocmd FocusGained * checktime')
--- vim.cmd('autocmd CursorHold * checktime')
-
--- Slang support
-vim.filetype.add({
-  extension = {
-    slang = "slang",
-  },
-})
-
 vim.api.nvim_create_autocmd({ 'VimLeavePre' }, {
     group = vim.api.nvim_create_augroup('KillShada', { clear = true }),
     pattern = { '*' },
@@ -142,4 +142,23 @@ vim.api.nvim_create_autocmd({ 'VimLeavePre' }, {
         end
     end,
     desc = "Delete empty temp ShaDa files"
+})
+
+-- vim.api.nvim_create_autocmd('LspAttach', {
+--   callback = function(args)
+--     local client = vim.lsp.get_client_by_id(args.data.client_id)
+--     if client and client.root_dir then
+--       vim.fn.chdir(client.root_dir)
+--     end
+--   end,
+-- })
+
+-- Set working directory on bufenter to the git root of that file.
+vim.api.nvim_create_autocmd("BufEnter", {
+  callback = function()
+    local root = Snacks.git.get_root()
+    if root then
+      vim.fn.chdir(root)
+    end
+  end,
 })

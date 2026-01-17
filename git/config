@@ -1,3 +1,6 @@
+[alias]
+	stat = diff --stat
+
 [delta]
   features = plain-style
   side-by-side = false
