@@ -30,20 +30,69 @@ return {
         pattern = "COMMIT_EDITMSG",
         callback = function(args)
           if vim.b[args.buf].ai_commit_generated then return end
+          local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
+          if lines[1] == nil or lines[1] == "" then
+            vim.b[args.buf].ai_commit_generated = true
 
-          -- Only generate the commit message if the buffer is empty
-          if vim.api.nvim_buf_get_lines(0, 0, -1, false)[1] == nil or
-              vim.api.nvim_buf_get_lines(0, 0, -1, false)[1] == "" then
-            local ok, err = pcall(function()
-              require("codecompanion").prompt("commit")
-              vim.b[args.buf].ai_commit_generated = true
-              -- For some reason, codecompanion inline assistant map gets added?
-              vim.cmd("mapclear <buffer>")
-            end)
-            if not ok then
-              -- Might not have an LLM setup
-              vim.notify("Could not generate commit message" .. tostring(err), vim.log.levels.ERROR)
-            end
+            vim.fn.jobstart({
+              "goose",
+              "run",
+              "--recipe",
+              "commit",
+              "--output-format",
+              "json",
+              "--no-session",
+              "-q"
+            }, {
+              stdout_buffered = true,
+              on_stdout = function(_, data)
+                if data and #data > 0 then
+                  local raw = table.concat(data, "\n")
+                  local ok, parsed = pcall(vim.json.decode, raw)
+                  if not ok then
+                    vim.schedule(function()
+                      vim.notify("Failed to parse goose output as JSON", vim.log.levels.ERROR)
+                    end)
+                    return
+                  end
+
+                  -- Extract the last assistant message's text content
+                  local messages = parsed.messages or {}
+                  local commit_msg = nil
+                  for i = #messages, 1, -1 do
+                    local msg = messages[i]
+                    if msg.role == "assistant" and msg.content then
+                      for _, block in ipairs(msg.content) do
+                        if block.type == "text" and block.text then
+                          commit_msg = block.text
+                          break
+                        end
+                      end
+                      if commit_msg then break end
+                    end
+                  end
+
+                  if commit_msg then
+                    vim.schedule(function()
+                      local msg_lines = vim.split(commit_msg, "\n", { plain = true })
+                      vim.api.nvim_buf_set_lines(args.buf, 0, 0, false, msg_lines)
+                      vim.api.nvim_win_set_cursor(0, { 1, 0 })
+                    end)
+                  else
+                    vim.schedule(function()
+                      vim.notify("No commit message found in goose output", vim.log.levels.WARN)
+                    end)
+                  end
+                end
+              end,
+              on_stderr = function(_, data)
+                if data and data[1] ~= "" then
+                  vim.schedule(function()
+                    vim.notify("Commit message generation error: " .. table.concat(data, "\n"), vim.log.levels.ERROR)
+                  end)
+                end
+              end,
+            })
           end
         end,
       })

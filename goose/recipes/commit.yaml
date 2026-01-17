@@ -1,0 +1,140 @@
+version: "1.0.0"
+title: "Conventional Commit Generator"
+description: "Generates a conventional commit message based on staged git changes. Uses Google token provider and restricts tools to only git diff --staged."
+
+instructions: |
+  Do not use extended thinking or reasoning. Respond directly without chain-of-thought, internal monologue, or step-by-step reasoning blocks. Be concise and immediate.
+
+  You are a precise commit message generator following the Conventional Commits specification (conventionalcommits.org).
+
+  **Available Tool**: You have ONE tool: `git_diff_staged` - use it to see staged changes.
+
+  **Conventional Commit Format**:
+  ```
+  <type>: <description>
+
+  [body]
+
+  [footer]
+  ```
+
+  **Types** (choose most appropriate):
+  | Type     | Use for                                          |
+  |----------|--------------------------------------------------|
+  | feat     | New feature                                      |
+  | fix      | Bug fix                                          |
+  | docs     | Documentation changes only                       |
+  | style    | Formatting, whitespace (no logic change)         |
+  | refactor | Code restructuring (no bug fix or feature)       |
+  | perf     | Performance improvement                          |
+  | test     | Adding/fixing tests                              |
+  | build    | Build system or dependency changes               |
+  | ci       | CI/CD configuration                              |
+  | chore    | Maintenance tasks                                |
+  | revert   | Reverting previous commit                        |
+
+  **Description Rules**:
+  - Imperative mood: "add feature" not "added feature"
+  - Lowercase first letter
+  - No trailing period
+  - Max 50 characters
+
+  **Body** (optional): Explain *why*, not *what*. Wrap at 72 chars. Use *only* bulltes and no
+  more than three lines. Each bullet starts with capital letter.
+
+  **Footer** (optional):
+  - Breaking changes: `BREAKING CHANGE: <description>`
+  - Issue refs: `Fixes #123`, `Closes #456`
+
+  **Your Task**:
+  1. Call `git_diff_staged` to retrieve staged changes
+  2. Analyze the diff to understand the changes
+  3. Output a properly formatted conventional commit message as text with no code block.
+
+prompt: "Analyze the staged git changes and generate an appropriate conventional commit message."
+
+extensions:
+  - type: stdio
+    name: git-diff-only
+    cmd: python3
+    args:
+      - "-c"
+      - |
+        import json
+        import subprocess
+        import sys
+
+        def send(msg):
+            print(json.dumps(msg), flush=True)
+
+        for line in sys.stdin:
+            try:
+                req = json.loads(line.strip())
+            except json.JSONDecodeError:
+                continue
+
+            method = req.get("method", "")
+            req_id = req.get("id")
+
+            if method == "initialize":
+                send({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {
+                        "protocolVersion": "2024-11-05",
+                        "serverInfo": {"name": "git-diff-staged-only", "version": "1.0.0"},
+                        "capabilities": {"tools": {}}
+                    }
+                })
+
+            elif method == "notifications/initialized":
+                pass  # No response needed for notifications
+
+            elif method == "tools/list":
+                send({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {
+                        "tools": [{
+                            "name": "git_diff_staged",
+                            "description": "Returns the diff of all staged changes (git diff --staged). This is the only available tool.",
+                            "inputSchema": {"type": "object", "properties": {}, "required": []}
+                        }]
+                    }
+                })
+
+            elif method == "tools/call":
+                tool_name = req.get("params", {}).get("name", "")
+                if tool_name == "git_diff_staged":
+                    try:
+                        result = subprocess.run(
+                            ["git", "diff", "--staged"],
+                            capture_output=True,
+                            text=True,
+                            timeout=30
+                        )
+                        output = result.stdout if result.stdout else (result.stderr if result.stderr else "No staged changes found. Stage files with 'git add <file>' first.")
+                    except FileNotFoundError:
+                        output = "Error: git is not installed or not in PATH"
+                    except subprocess.TimeoutExpired:
+                        output = "Error: git diff --staged timed out"
+                    except Exception as e:
+                        output = f"Error running git diff --staged: {e}"
+
+                    send({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": {"content": [{"type": "text", "text": output}]}
+                    })
+                else:
+                    send({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "error": {"code": -32601, "message": f"Unknown tool: {tool_name}. Only git_diff_staged is available."}
+                    })
+    timeout: 10
+    description: "Minimal MCP server exposing only git diff --staged"
+
+settings:
+  goose_provider: "google"
+  goose_model: "gemini-3-flash-preview"

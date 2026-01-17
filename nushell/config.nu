@@ -483,6 +483,7 @@ source $optional_config
 $env.EDITOR = "nvim"
 $env.SHELL = "nu"
 $env.PAGER = "delta"
+$env.GOOSE_RECIPE_PATH = $"($env.XDG_CONFIG_HOME)/goose/recipes"
 
 alias cls = clear
 alias dc = detect columns
