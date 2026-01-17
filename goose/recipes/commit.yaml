@@ -39,8 +39,13 @@ instructions: |
   - No trailing period
   - Max 50 characters
 
-  **Body** (optional): Explain *why*, not *what*. Wrap at 72 chars. Use *only* bulltes and no
-  more than three lines. Each bullet starts with capital letter.
+  **Body** (optional):
+  - Avoid writing a body unless the change is significant.
+  - Never write a body for chores or reverts.
+  - Explain *why*, not *what*. Wrap at 72 chars.
+  - Use *only* bulltes
+  - No more than three lines.
+  - Each bullet starts with capital letter.
 
   **Footer** (optional):
   - Breaking changes: `BREAKING CHANGE: <description>`
