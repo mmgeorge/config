@@ -11,6 +11,7 @@ github-copilot
 opencode/
 btop/
 topiary/
+goose/
 
 nushell/history*
 nushell/completions/

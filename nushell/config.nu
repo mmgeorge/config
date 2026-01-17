@@ -269,21 +269,45 @@ $env.config.color_config.datetime = "white"
 $env.config.color_config.duration = "white"
 $env.config.color_config.header = "white"
 
-$env.config.menus ++= [{
-  name: completion_menu
-  only_buffer_difference: false
-  marker: "| "
-  type: {
-    layout: ide
-    columns: 1
-    col_width: 25
-    selection_rows: 20
-    description_rows: 20
-    page_size: 40
+$env.config.menus ++= [
+  {
+    name: completion_menu
+    only_buffer_difference: false
+    marker: "| "
+    type: {
+      layout: ide
+      columns: 1
+      col_width: 25
+      selection_rows: 20
+      description_rows: 20
+      page_size: 40
+    }
+    style: {
+    },
+
+  },
+  {
+    name: history_menu
+    only_buffer_difference: false
+    source: { |buffer, position|
+      history
+      | where command =~ $buffer
+      | where ($it.command | str length) > 10
+      | uniq-by "command"
+      | each { |it| {value: $it.command, description: ($it.start_timestamp | into datetime | format date "%Y-%m-%d")} }
+    }
+    marker: "? "
+    type: {
+      layout: list
+      page_size: 10,
+    }
+    style: {
+      text: green
+      selected_text: green_reverse
+      description_text: yellow
+    }
   }
-  style: {
-  }
-}]
+]
 
 def --env dev [] {
   cd $env.DEV_HOME
