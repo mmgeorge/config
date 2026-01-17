@@ -2,6 +2,7 @@
 *lock*
 *.spl
 google-chrome/
+.claude/
 .aider.*
 gh/
 .wrangler/
