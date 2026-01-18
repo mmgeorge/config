@@ -4,12 +4,12 @@ function adapters()
       chat = {
         name = "gemini",
         model = "gemini-3-pro-preview",
-        reasoning_effort = "low",
+        -- reasoning_effort = "low",
       },
       inline = {
         name = "gemini",
         model = "gemini-3-flash-preview",
-        reasoning_effort = "minimal",
+        -- reasoning_effort = "minimal",
       },
       cmd = "gemini",
       background = "gemini"
