@@ -233,9 +233,6 @@ return {
             cargo = {
               -- allTargets = false,
               features = "all",
-              extraEnv = {
-                ["CARGO_TARGET_DIR"] = "target/check",
-              }
               -- buildScripts = {
               -- enable = false,
               -- rebuildOnSave = false
