@@ -14,8 +14,6 @@ instructions: |
   <type>: <description>
 
   [body]
-
-  [footer]
   ```
 
   **Types** (choose most appropriate):
@@ -44,10 +42,6 @@ instructions: |
   - Avoid writing a body unless the change is significant.
   - Explain *why*, not *what*. Wrap at 72 chars.
   - No more than three lines.
-
-  **Footer** (optional):
-  - Breaking changes: `BREAKING CHANGE: <description>`
-  - Issue refs: `Fixes #123`, `Closes #456`
 
   **Your Task**:
   1. Call `git_diff_staged` to retrieve staged changes
