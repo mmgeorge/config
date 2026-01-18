@@ -17,8 +17,6 @@ return {
           "jsonls",
           "lua_ls",
           "eslint",
-          -- "ts_ls",
-          -- "vtsls", -- imports don't work correctly...
           "ts_query_ls",
           -- "oxlint",
           "terraformls",
@@ -201,42 +199,15 @@ return {
       })
 
       vim.lsp.enable("wesl_ls")
-
       vim.lsp.enable("wgsl_analyzer")
 
-      -- vim.lsp.config('taplo', {
-      --   capabilities = capabilities,
-      -- })
-      --
-      -- vim.lsp.enable('taplo')
-
       vim.lsp.config('rust_analyzer', {
-        -- We install this from rustup rather than Mason
         cmd = { "rust-analyzer" },
-        -- This slows down saving quite a bit
-        -- on_attach = function(client, bufnr)
-        --   vim.api.nvim_create_autocmd("BufWritePre", {
-        --     buffer = bufnr,
-        --     callback = function() vim.lsp.buf.format() end,
-        --     group = format_sync_grp,
-        --   })
-        -- end,
         capabilities = capabilities,
         settings = {
           ["rust-analyzer"] = {
-            -- completion = {
-            --   autoself = {
-            --     enable = false
-            --   }
-            -- },
-            -- numThreads = 8,
             cargo = {
-              -- allTargets = false,
               features = "all",
-              -- buildScripts = {
-              -- enable = false,
-              -- rebuildOnSave = false
-              -- }
             },
             check = {
               allTargets = true,
@@ -244,7 +215,6 @@ return {
             },
             cachePriming = {
               enable = true,
-              -- numThreads = 8
             },
             diagnostiscs = {
               -- For tsify
@@ -261,16 +231,6 @@ return {
       })
 
       vim.lsp.enable("rust_analyzer", true)
-
-      -- local vue_language_server_path = vim.fn.stdpath('data') ..
-      --     "/mason/packages/vue-language-server/node_modules/@vue/language-server"
-      -- local tsserver_filetypes = { 'typescript', 'javascript', 'javascriptreact', 'typescriptreact', 'vue' }
-      -- local vue_plugin = {
-      --   name = '@vue/typescript-plugin',
-      --   location = vue_language_server_path,
-      --   languages = { 'vue' },
-      --   configNamespace = 'typescript',
-      -- }
 
       -- require("lspconfig.configs").vtsls = require("vtsls").lspconfig
       vim.lsp.config('vtsls', {
