@@ -3,29 +3,16 @@ local key = require("../keys").key
 return {
   {
     "nvim-treesitter/nvim-treesitter",
-    dependencies = {
-      "nvim-treesitter/nvim-treesitter-textobjects",
-    },
+    branch = "master",
     config = function()
-      -- local parser_config = require("nvim-treesitter.parsers").get_parser_configs()
-      -- parser_config.wesl = {
-      --   install_info = {
-      --     url = "https://github.com/wgsl-tooling-wg/tree-sitter-wesl",
-      --     files = { "src/parser.c", "src/scanner.c" },
-      --     branch = "main",
-      --   },
-      --   filetype = "wesl",
-      -- }
-
       local configs = require("nvim-treesitter.configs")
 
       vim.filetype.add({ extension = { frag = "frag" } })
-      vim.treesitter.language.register('glsl', { 'frag' })
       vim.filetype.add({ extension = { vert = "vert" } })
-      vim.treesitter.language.register('glsl', { 'vert' })
       vim.filetype.add({ extension = { wgslx = "wgslx" } })
+      vim.treesitter.language.register('glsl', { 'frag' })
+      vim.treesitter.language.register('glsl', { 'vert' })
       vim.treesitter.language.register('wgsl', { 'wgslx' })
-
       vim.treesitter.language.register('markdown', 'octo')
 
       ---@diagnostic disable-next-line: missing-fields
@@ -48,7 +35,7 @@ return {
           "toml",
           "slang",
           "yaml",
-          "latex",
+          -- "latex", requires cli
           "nu"
         },
         sync_install = false,
