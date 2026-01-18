@@ -481,7 +481,8 @@ const optional_config = (if ($config_path | path exists) { $config_path } else {
 source $optional_config
 
 $env.EDITOR = "nvim"
-$env.SHELL = "nu"
+# Problem for nvim:
+# $env.SHELL = "nu"
 $env.PAGER = "delta"
 $env.GOOSE_RECIPE_PATH = $"($env.XDG_CONFIG_HOME)/goose/recipes"
 

@@ -33,8 +33,7 @@ return {
           local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
           if lines[1] == nil or lines[1] == "" then
             vim.b[args.buf].ai_commit_generated = true
-
-            vim.fn.jobstart({
+            local goose = {
               "goose",
               "run",
               "--recipe",
@@ -42,8 +41,17 @@ return {
               "--output-format",
               "json",
               "--no-session",
-              "-q"
-            }, {
+              "-q",
+            }
+
+            if not vim.fn.getenv('GEMINI_API_KEY') then
+              table.insert(goose, '--provider')
+              table.insert(goose, 'copilot')
+              table.insert(goose, '--model')
+              table.insert(goose, 'gpt-4.1')
+            end
+
+            vim.fn.jobstart(goose, {
               stdout_buffered = true,
               on_stdout = function(_, data)
                 if data and #data > 0 then
