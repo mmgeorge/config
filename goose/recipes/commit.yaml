@@ -40,8 +40,8 @@ instructions: |
   - Max 50 characters
 
   **Body** (optional):
+  - *Never* write a body if type is chore.
   - Avoid writing a body unless the change is significant.
-  - Never write a body for chores or reverts.
   - Explain *why*, not *what*. Wrap at 72 chars.
   - No more than three lines.
 
