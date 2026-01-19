@@ -6,7 +6,6 @@ $env.GOOSE_RECIPE_PATH = $"($env.XDG_CONFIG_HOME)/goose/recipes"
 $env.GEMINI_CLI_SYSTEM_DEFAULTS_PATH = $env.XDG_CONFIG_HOME | path join "gemini/settings.json"
 
 alias cls = clear
-alias core_ls = ls
 alias dc = detect columns
 alias select = select --ignore-case
 alias gc = gcloud
@@ -106,30 +105,11 @@ def lst [len: int = 50] {
   }
 }
 
-# Custom file completer with @-prefix fuzzy matching
-def file-completer [] {
-  # Return both regular files and @-prefixed files for fuzzy nested search
-  let files = fd --type f --hidden --exclude .git | lines
-  let regular = $files | each {|f| { value: $f, description: "file" } }
-  let at_prefixed = $files | each {|f| { value: $"@($f)", description: "fuzzy" } }
-  $regular | append $at_prefixed
-}
-
-def cat [file: string@file-completer] {
-  let actual_file = if ($file | str starts-with '@') { $file | str substring 1.. } else { $file }
-  if (($actual_file | path parse).extension | str downcase) in ["toml", "json"] {
-    open $actual_file
+def cat [file: path] {
+  if (($file | path parse).extension | str downcase) in ["toml", "json"] {
+    open $file
   } else {
-    bat -pP $actual_file
-  }
-}
-
-def --wrapped ls [path?: string@file-completer, ...rest] {
-  let actual_path = if ($path != null and ($path | str starts-with '@')) { $path | str substring 1.. } else { $path }
-  if ($actual_path == null) {
-    core_ls ...$rest
-  } else {
-    core_ls $actual_path ...$rest
+    bat -pP $file
   }
 }
 
@@ -493,7 +473,14 @@ let carapace_completer = {|spans|
       | sort-by {|f|
         let lower_f = ($f | str downcase)
         let basename = ($f | path basename | str downcase)
-        if ($basename | str contains $lower_pattern) { 0 } else if ($lower_f | str contains $lower_pattern) { 1 } else { 2 + ($f | str length) }
+        # Score: prefer contiguous matches in basename, then in full path, then by length
+        if ($basename | str contains $lower_pattern) {
+          0
+        } else if ($lower_f | str contains $lower_pattern) {
+          1
+        } else {
+          2 + ($f | str length)
+        }
       }
       | each {|f| { value: $f, description: "file" } }
     }
