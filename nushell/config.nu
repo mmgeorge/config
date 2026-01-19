@@ -11,6 +11,7 @@ alias select = select --ignore-case
 alias gc = gcloud
 alias tf = terraform
 alias top = btop
+alias h = yazi
 
 def get_git_branch [] {
   let branch_res = (do { git branch --show-current } | complete)
@@ -114,7 +115,7 @@ def cat [file: path] {
 }
 
 def --env jp [] {
-  let path = (^fd --type d --hidden --exclude .git | ^fzf --height 40% --layout=reverse --border)
+  let path = (^fd --type d --hidden --exclude .git | ^fzf --preview="" --height 40% --layout=reverse --border)
   if ($path != "") { cd $path }
 }
 
@@ -371,13 +372,13 @@ $env.config.keybindings ++= [
   }
   # Search directory
   {
-    name: fzf_file_search
+    name: fzf_directory_search
     modifier: control
     keycode: char_t
     mode: [emacs, vi_normal, vi_insert]
     event: {
       send: executehostcommand
-      cmd: "commandline edit --insert (^fd --type d --hidden --exclude .git | ^fzf --height 40% --layout=reverse --border | str trim)"
+      cmd: "commandline edit --insert (^fd --type d --hidden --exclude .git | ^fzf --preview=\"\" --height 40% --layout=reverse --border | str trim)"
     }
   }
 ]
