@@ -79,6 +79,55 @@ vim.cmd('set mps +=<:>')           -- Add <> to matchpairs (% command)
 
 vim.g.rust_recommended_style = '0' -- Otherwise will override indentation settings
 
+local function rustfmt_indent_settings(bufnr)
+  local bufname = vim.api.nvim_buf_get_name(bufnr)
+  if bufname == "" then
+    return { tab_spaces = 4, hard_tabs = false }
+  end
+
+  local rustfmt_path = vim.fs.find({ "rustfmt.toml", ".rustfmt.toml" }, {
+    upward = true,
+    path = vim.fs.dirname(bufname),
+  })[1]
+
+  if not rustfmt_path then
+    return { tab_spaces = 4, hard_tabs = false }
+  end
+
+  local tab_spaces
+  local hard_tabs
+  for _, line in ipairs(vim.fn.readfile(rustfmt_path)) do
+    if not tab_spaces then
+      tab_spaces = tonumber(line:match("^%s*tab_spaces%s*=%s*(%d+)"))
+    end
+    if hard_tabs == nil then
+      local raw = line:match("^%s*hard_tabs%s*=%s*([%a]+)")
+      if raw ~= nil then
+        hard_tabs = raw == "true"
+      end
+    end
+    if tab_spaces and hard_tabs ~= nil then
+      break
+    end
+  end
+
+  return {
+    tab_spaces = tab_spaces or 4,
+    hard_tabs = hard_tabs or false,
+  }
+end
+
+vim.api.nvim_create_autocmd("FileType", {
+  pattern = "rust",
+  callback = function(args)
+    local settings = rustfmt_indent_settings(args.buf)
+    vim.bo[args.buf].shiftwidth = settings.tab_spaces
+    vim.bo[args.buf].tabstop = settings.tab_spaces
+    vim.bo[args.buf].softtabstop = settings.tab_spaces
+    vim.bo[args.buf].expandtab = not settings.hard_tabs
+  end,
+})
+
 -- Disable auto comment
 -- vim.cmd('autocmd BufEnter * set formatoptions-=cro')
 -- vim.cmd('autocmd BufEnter * setlocal formatoptions-=cro')
@@ -175,4 +224,3 @@ vim.api.nvim_create_autocmd("BufEnter", {
     end
   end,
 })
-
