@@ -448,11 +448,24 @@ source $cargo_config
 
 source $"($nu.cache-dir)/carapace.nu"
 let carapace_completer = {|spans|
-  let native_commands = ["gcloud", "uv"]
-  if ($spans.0 in $native_commands) {
-    null
+  let last_arg = ($spans | last)
+
+  # Handle @-prefix file completion
+  if ($last_arg | str starts-with '@') {
+    let pattern = ($last_arg | str substring 1..)
+    let files = if ($pattern | is-empty) {
+      fd --type f --hidden --exclude .git | lines
+    } else {
+      fd --type f --hidden --exclude .git $pattern | lines
+    }
+    $files | each {|f| { value: $f, description: "file" } }
   } else {
-    carapace $spans.0 nushell ...$spans | from json
+    let native_commands = ["gcloud", "uv"]
+    if ($spans.0 in $native_commands) {
+      null
+    } else {
+      carapace $spans.0 nushell ...$spans | from json
+    }
   }
 }
 $env.config.completions.external = {
