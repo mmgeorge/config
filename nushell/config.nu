@@ -358,6 +358,16 @@ $env.config.keybindings ++= [
     mode: [emacs, vi_normal, vi_insert]
     event: { edit: MoveToLineEnd }
   }
+  {
+    name: fzf_file_search
+    modifier: control
+    keycode: char_f
+    mode: [emacs, vi_normal, vi_insert]
+    event: {
+      send: executehostcommand
+      cmd: "commandline edit --insert (fd --type f --hidden --exclude .git | fzf --height 40% --layout=reverse --border | str trim)"
+    }
+  }
 ]
 
 $env.config.show_banner = false
