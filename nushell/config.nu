@@ -109,8 +109,7 @@ def lst [len: int = 50] {
 # Custom file completer with @-prefix fuzzy matching
 def file-completer [] {
   # Return both regular files and @-prefixed files for fuzzy nested search
-  # Sort by path length so shorter paths rank higher
-  let files = fd --type f --hidden --exclude .git | lines | first 1000
+  let files = fd --type f --hidden --exclude .git | lines
   let regular = $files | each {|f| { value: $f, description: "file" } }
   let at_prefixed = $files | each {|f| { value: $"@($f)", description: "fuzzy" } }
   $regular | append $at_prefixed
@@ -474,7 +473,7 @@ let carapace_completer = {|spans|
   # Handle @-prefix file completion with fuzzy matching
   if ($last_arg | str starts-with '@') {
     let pattern = ($last_arg | str substring 1..)
-    let files = fd --type f --hidden --exclude .git | lines | first 1000
+    let files = fd --type f --hidden --exclude .git | lines
 
     if ($pattern | is-empty) {
       $files | each {|f| { value: $f, description: "file" } }
@@ -494,9 +493,7 @@ let carapace_completer = {|spans|
       | sort-by {|f|
         let lower_f = ($f | str downcase)
         let basename = ($f | path basename | str downcase)
-        let len = ($f | str length)
-        # Score: category * 1000 + length (shorter paths rank higher within category)
-        if ($basename | str contains $lower_pattern) { len } else if ($lower_f | str contains $lower_pattern) { 1000 + $len } else { 2000 + $len }
+        if ($basename | str contains $lower_pattern) { 0 } else if ($lower_f | str contains $lower_pattern) { 1 } else { 2 + ($f | str length) }
       }
       | each {|f| { value: $f, description: "file" } }
     }
