@@ -1,9 +1,17 @@
+if "XDG_BASE" not-in ($env | columns) { $env.XDG_BASE = $env.HOME }
+$env.XDG_CONFIG_HOME = $env.XDG_BASE  | path join "config"
+$env.XDG_CACHE_HOME = $env.XDG_BASE  | path join ".cache"
+$env.XDG_DATA_HOME = $env.XDG_BASE  | path join ".local/share"
+$env.XDG_STATE_HOME = $env.XDG_BASE  | path join ".local/state"
+$env.BIN_HOME = $env.XDG_BASE  | path join ".bin"
+
 # Problem for nvim:
 # $env.SHELL = "nu"
 $env.EDITOR = "nvim"
 $env.PAGER = "delta"
 $env.GOOSE_RECIPE_PATH = $"($env.XDG_CONFIG_HOME)/goose/recipes"
-$env.GEMINI_CLI_SYSTEM_DEFAULTS_PATH = $env.XDG_CONFIG_HOME | path join "gemini/settings.json"
+$env.GEMINI_CLI_SYSTEM_DEFAULTS_PATH = $env.XDG_CONFIG_HOME | path join "gemini" | path join "settings.json"
+$env.CODEX_HOME = $env.XDG_CONFIG_HOME | path join "codex"
 
 alias cls = clear
 alias dc = detect columns
