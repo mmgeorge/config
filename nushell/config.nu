@@ -450,15 +450,40 @@ source $"($nu.cache-dir)/carapace.nu"
 let carapace_completer = {|spans|
   let last_arg = ($spans | last)
 
-  # Handle @-prefix file completion
+  # Handle @-prefix file completion with fuzzy matching
   if ($last_arg | str starts-with '@') {
     let pattern = ($last_arg | str substring 1..)
-    let files = if ($pattern | is-empty) {
-      fd --type f --hidden --exclude .git | lines
+    let files = fd --type f --hidden --exclude .git | lines
+
+    if ($pattern | is-empty) {
+      $files | each {|f| { value: $f, description: "file" } }
     } else {
-      fd --type f --hidden --exclude .git $pattern | lines
+      # Convert pattern to fuzzy regex: "con.nu" -> "c.*o.*n.*\..*n.*u"
+      let regex = ($pattern | split chars | each {|c|
+        if $c in ['.', '*', '+', '?', '[', ']', '(', ')', '{', '}', '|', '^', '$', '\'] {
+          $"\\($c)"
+        } else {
+          $c
+        }
+      } | str join '.*')
+
+      let lower_pattern = ($pattern | str downcase)
+      $files
+      | where {|f| $f =~ ('(?i)' + $regex) }
+      | sort-by {|f|
+        let lower_f = ($f | str downcase)
+        let basename = ($f | path basename | str downcase)
+        # Score: prefer contiguous matches in basename, then in full path, then by length
+        if ($basename | str contains $lower_pattern) {
+          0
+        } else if ($lower_f | str contains $lower_pattern) {
+          1
+        } else {
+          2 + ($f | str length)
+        }
+      }
+      | each {|f| { value: $f, description: "file" } }
     }
-    $files | each {|f| { value: $f, description: "file" } }
   } else {
     let native_commands = ["gcloud", "uv"]
     if ($spans.0 in $native_commands) {
