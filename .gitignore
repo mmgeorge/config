@@ -12,6 +12,14 @@ github-copilot
 opencode/
 btop/
 topiary/
+codex/auth.json
+codex/version.json
+codex/history.jsonl
+codex/log
+codex/sessions
+codex/skills
+codex/tmp
 
 nushell/history*
 nushell/completions/
+codex/auth.json
