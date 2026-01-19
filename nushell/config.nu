@@ -358,14 +358,26 @@ $env.config.keybindings ++= [
     mode: [emacs, vi_normal, vi_insert]
     event: { edit: MoveToLineEnd }
   }
+  # Search file
   {
     name: fzf_file_search
     modifier: control
-    keycode: char_f
+    keycode: char_h
     mode: [emacs, vi_normal, vi_insert]
     event: {
       send: executehostcommand
       cmd: "commandline edit --insert (fd --type f --hidden --exclude .git | fzf --height 40% --layout=reverse --border | str trim)"
+    }
+  }
+  # Search directory
+  {
+    name: fzf_file_search
+    modifier: control
+    keycode: char_t
+    mode: [emacs, vi_normal, vi_insert]
+    event: {
+      send: executehostcommand
+      cmd: "commandline edit --insert (^fd --type d --hidden --exclude .git | ^fzf --height 40% --layout=reverse --border | str trim)"
     }
   }
 ]
@@ -499,3 +511,25 @@ $env.config.completions.external = {
 }
 $env.config.completions.algorithm = "fuzzy"
 $env.config.completions.case_sensitive = false
+
+let fzf_colors = [
+    "fg:#bebebe,fg+:#d0d0d0,bg:#000000,bg+:#000000"
+    "hl:#5f87af,hl+:#5fd7ff,info:#a29a9a,marker:#87ff00"
+    "prompt:#d7005f,spinner:#fcfcfc,pointer:#ffffff,header:#87afaf"
+    "border:#232323,label:#aeaeae,query:#d9d9d9"
+] | str join ","
+
+$env.FZF_DEFAULT_OPTS = [
+    $"--color=($fzf_colors)"
+    "--preview=\"bat -p --color=always {}\"",
+    "--border=\"none\""
+    "--border-label-pos=\"0\""
+    "--preview-window=\"border-rounded\""
+    "--margin=\"1\""
+    "--prompt=\"> \""
+    "--marker=\">\""
+    "--pointer=\"◆\""
+    "--separator=\"─\""
+    "--scrollbar=\"|\""
+    "--layout=\"reverse\""
+] | str join " "
