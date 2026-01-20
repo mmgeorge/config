@@ -19,6 +19,7 @@ codex/log
 codex/sessions
 codex/skills
 codex/tmp
+goose/
 
 nushell/history*
 nushell/completions/

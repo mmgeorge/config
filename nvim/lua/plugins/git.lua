@@ -44,9 +44,9 @@ return {
               "-q",
             }
 
-            if not vim.fn.getenv('GEMINI_API_KEY') then
+            if vim.fn.getenv('GEMINI_API_KEY') ~= '' then
               table.insert(goose, '--provider')
-              table.insert(goose, 'copilot')
+              table.insert(goose, 'github_copilot')
               table.insert(goose, '--model')
               table.insert(goose, 'gpt-4.1')
             end
@@ -60,12 +60,14 @@ return {
                   if not ok then
                     vim.schedule(function()
                       vim.notify("Failed to parse goose output as JSON", vim.log.levels.ERROR)
+                      vim.notify("Error: " .. raw, vim.log.levels.ERROR)
                     end)
                     return
                   end
 
                   -- Extract the last assistant message's text content
                   local messages = parsed.messages or {}
+                  vim.notify(vim.inspect(messages), vim.log.levels.INFO, { title = 'Messages' })
                   local commit_msg = nil
                   for i = #messages, 1, -1 do
                     local msg = messages[i]
