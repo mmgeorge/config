@@ -23,6 +23,7 @@ codex/auth.json
 codex/.sandbox
 codex/sandbox.log
 codex/cap_sid
+goose/
 
 nushell/history*
 nushell/completions/
