@@ -19,7 +19,10 @@ codex/log
 codex/sessions
 codex/skills
 codex/tmp
+codex/auth.json
+codex/.sandbox
+codex/sandbox.log
+codex/cap_sid
 
 nushell/history*
 nushell/completions/
-codex/auth.json
