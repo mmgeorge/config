@@ -4,3 +4,5 @@ model_reasoning_effort = "medium"
 [features]
 experimental_windows_sandbox = true
 elevated_windows_sandbox = true
+powershell_utf8 = true
+steer = true
