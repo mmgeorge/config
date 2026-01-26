@@ -44,7 +44,7 @@ return {
               "-q",
             }
 
-            if vim.fn.getenv('GEMINI_API_KEY') ~= '' then
+            if vim.fn.getenv('GEMINI_API_KEY') == '' then
               table.insert(goose, '--provider')
               table.insert(goose, 'github_copilot')
               table.insert(goose, '--model')
@@ -67,7 +67,6 @@ return {
 
                   -- Extract the last assistant message's text content
                   local messages = parsed.messages or {}
-                  vim.notify(vim.inspect(messages), vim.log.levels.INFO, { title = 'Messages' })
                   local commit_msg = nil
                   for i = #messages, 1, -1 do
                     local msg = messages[i]
@@ -106,7 +105,7 @@ return {
           end
         end,
       })
-
+      --
       local neogit = require("neogit")
       neogit.setup {
         disable_hint = false,
