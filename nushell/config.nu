@@ -196,6 +196,31 @@ def ai [prompt: string] {
   print $command
 }
 
+def hashupdate [url?: string] {
+  # Default URL from clipboard (macOS: pbpaste) if not provided
+  let url = if $url == null {
+    (^pbpaste | str trim)
+  } else {
+    $url
+  }
+
+  # Find git repo root; if not in a git repo, exit with code 1
+  let root = (try {
+    (^git rev-parse --show-toplevel | str trim)
+  } catch {
+    exit 1
+  })
+
+  if ($root | str ends-with "arcgis-web-components") {
+    ^pnpm --filter @arcgis/map-components test-update-hashes $url
+  } else if ($root | str contains "arcgis-js-api") {
+    ^pnpm updateScreenshotHashes $url
+  } else {
+    print --stderr $"Unsupported repo: ($root)"
+    exit 1
+  }
+}
+
 $env.config.history = {
   file_format: "sqlite",
   sync_on_enter: true, # Not sure this does anything when sqlite mode enabled.
