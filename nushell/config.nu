@@ -47,7 +47,7 @@ def create_left_prompt [] {
       $repo_name | path join $relative
     }
   } else {
-    ($env.PWD | str replace $nu.home-path "~")
+    $env.PWD
   }
   let git = (get_git_branch)
 
