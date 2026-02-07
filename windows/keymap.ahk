@@ -1,5 +1,10 @@
 ﻿#Requires AutoHotkey v2.0
 
+;; Suppress Alt menu activation when pressed alone
+;; ~ lets Alt pass through as a modifier; {vkE8} tricks Windows
+;; into thinking Alt was used in a combo, preventing menu activation
+~LAlt::Send "{Blind}{vkE8}"
+
 ;; Set capslock tap to escape & hold to be control
 ; $Capslock:: {
 ;   KeyWait "Capslock", "T.2"
@@ -52,11 +57,11 @@ g::k
 ; c::m
 ; v::p
 ; b::v
-; !z::Send("{^}")
-; !x::Send("{@}")
-; !c::Send("{#}")
-; !v::Send("``")
-; !b::Send("{}")
+; LAlt & z::Send("{^}")
+; LAlt & x::Send("{@}")
+; LAlt & c::Send("{#}")
+; LAlt & v::Send("``")
+; LAlt & b::Send("{}")
 
 ; Angle
 z::c
@@ -64,11 +69,11 @@ x::m
 c::p
 v::v
 b::x
-!z::Send("{@}")
-!x::Send("{#}")
-!c::Send("``")
-!v::Send("{}")
-!b::Send("{^}")
+LAlt & z::Send("{@}")
+LAlt & x::Send("{#}")
+LAlt & c::Send("``")
+LAlt & v::Send("{}")
+LAlt & b::Send("{^}")
 
 ; Angle - fat pinky
 ; $LShift:: {
@@ -97,33 +102,33 @@ l::a
 n::z
 m::;
 
-!q::Send("{}")
-!w::Send("{PgUp}")
-!e::Send("{PgDn}")
-!r::Send("{~}")
-!t::Send("{}")
+LAlt & q::Send("{}")
+LAlt & w::Send("{PgUp}")
+LAlt & e::Send("{PgDn}")
+LAlt & r::Send("{~}")
+LAlt & t::Send("{}")
 
-!a::Send("{Left}")
-!s::Send("{Up}")
-!d::Send("{Down}")
-!f::Send("{Right}")
-!g::Send("{}")
+LAlt & a::Send("{Left}")
+LAlt & s::Send("{Up}")
+LAlt & d::Send("{Down}")
+LAlt & f::Send("{Right}")
+LAlt & g::Send("{}")
 
-!y::Send("{%}")
-!u::Send("{&}")
-!i::Send("{-}")
-!o::Send("{*}")
-!p::Send("{+}")
+LAlt & y::Send("{%}")
+LAlt & u::Send("{&}")
+LAlt & i::Send("{-}")
+LAlt & o::Send("{*}")
+LAlt & p::Send("{+}")
 
-!h::Send("{!}")
-!j::Send("{Tab}")
-!k::Send("{Backspace}")
-!l::Send("{(}")
-!;::Send("{)}")
+LAlt & h::Send("{!}")
+LAlt & j::Send("{Tab}")
+LAlt & k::Send("{Backspace}")
+LAlt & l::Send("{(}")
+LAlt & `;::Send("{)}")
 
-!n::Send("{$}")
-!m::Send("{_}")
-!,::Send("{=}")
-!.::Send("{{}")
-!/::Send("{}}")
-!Space::Send("{Space}")
+LAlt & n::Send("{$}")
+LAlt & m::Send("{_}")
+LAlt & ,::Send("{=}")
+LAlt & .::Send("{{}")
+LAlt & /::Send("{}}")
+LAlt & Space::Send("{Space}")
