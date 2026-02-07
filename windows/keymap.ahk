@@ -1,39 +1,38 @@
-﻿#NoEnv  
-SendMode Input  
-SetWorkingDir %A_ScriptDir%  
+﻿#Requires AutoHotkey v2.0
 
 ;; Set capslock tap to escape & hold to be control
-; $Capslock::                
-;   KeyWait Capslock,T.2
-;   If !ErrorLevel         
-;     Send {Escape}       
-;   Else{ 
-;     Send {LControl Down}   
-;     KeyWait Capslock,T5   
-;     If ErrorLevel        
-;       MsgBox % "5 secs!" 
-;   }                     
-;   KeyWait Capslock     
-;   Send {LControl Up}  
-; Return               
-
-; $Capslock::                
-;   If (A_PriorKey = "CapsLock") {
-;     Send { Escape }
+; $Capslock:: {
+;   KeyWait "Capslock", "T.2"
+;   If !ErrorLevel
+;     Send "{Escape}"
+;   Else {
+;     Send "{LControl Down}"
+;     KeyWait "Capslock", "T5"
+;     If ErrorLevel
+;       MsgBox("5 secs!")
 ;   }
+;   KeyWait "Capslock"
+;   Send "{LControl Up}"
+; }
 
-*CapsLock::
-  Send {Blind}{Ctrl Down}
-  cDown := A_TickCount
-Return
+; $Capslock:: {
+;   If (A_PriorKey = "CapsLock") {
+;     Send "{Escape}"
+;   }
+; }
 
-*CapsLock up::
+*CapsLock:: {
+  Send "{Blind}{Ctrl Down}"
+  global cDown := A_TickCount
+}
+
+*CapsLock up:: {
+  global cDown
   If ((A_TickCount-cDown)<150)  ; Modify press time as needed
-    Send {Blind}{Ctrl Up}{Esc}
+    Send "{Blind}{Ctrl Up}{Esc}"
   Else
-    Send {Blind}{Ctrl Up}
-Return
- Return
+    Send "{Blind}{Ctrl Up}"
+}
 
 q::w
 w::g
@@ -53,11 +52,11 @@ g::k
 ; c::m
 ; v::p
 ; b::v
-; !z::Send {^}
-; !x::Send {@}
-; !c::Send {#}
-; !v::Send {``}
-; !b::Send {}
+; !z::Send("{^}")
+; !x::Send("{@}")
+; !c::Send("{#}")
+; !v::Send("``")
+; !b::Send("{}")
 
 ; Angle
 z::c
@@ -65,24 +64,24 @@ x::m
 c::p
 v::v
 b::x
-!z::Send {@}
-!x::Send {#}
-!c::Send {``}
-!v::Send {}
-!b::Send {^}
+!z::Send("{@}")
+!x::Send("{#}")
+!c::Send("``")
+!v::Send("{}")
+!b::Send("{^}")
 
-; Angle - fat pinky 
-; $LShift::                
-;   KeyWait LShift,T.15
-;   If !ErrorLevel         
-;     Send {x}       
-;   Else{ 
-;     Send {LShift Down}   
-;   }                     
-;     KeyWait LShift     
-;     Send {LShift Up}  
-; Return               
- 
+; Angle - fat pinky
+; $LShift:: {
+;   KeyWait "LShift", "T.15"
+;   If !ErrorLevel
+;     Send "{x}"
+;   Else {
+;     Send "{LShift Down}"
+;   }
+;   KeyWait "LShift"
+;   Send "{LShift Up}"
+; }
+
 y::q
 u::l
 i::u
@@ -98,33 +97,33 @@ l::a
 n::z
 m::;
 
-!q::Send {}
-!w::Send {PgUp}
-!e::Send {PgDn}
-!r::Send {~}
-!t::Send {}
+!q::Send("{}")
+!w::Send("{PgUp}")
+!e::Send("{PgDn}")
+!r::Send("{~}")
+!t::Send("{}")
 
-!a::Send {Left}
-!s::Send {Up}
-!d::Send {Down}
-!f::Send {Right}
-!g::Send {}
+!a::Send("{Left}")
+!s::Send("{Up}")
+!d::Send("{Down}")
+!f::Send("{Right}")
+!g::Send("{}")
 
-!y::Send {`%}
-!u::Send {&}
-!i::Send {-}
-!o::Send {*}
-!p::Send {+}
+!y::Send("{%}")
+!u::Send("{&}")
+!i::Send("{-}")
+!o::Send("{*}")
+!p::Send("{+}")
 
-!h::Send {!}
-!j::Send {Tab}
-!k::Send {Backspace}
-!l::Send {(}
-!;::Send {)}
+!h::Send("{!}")
+!j::Send("{Tab}")
+!k::Send("{Backspace}")
+!l::Send("{(}")
+!;::Send("{)}")
 
-!n::Send {$}
-!m::Send {_}
-!,::Send {=}
-!.::Send {`{}
-!/::Send {`}}
-!Space::Send {Space}
+!n::Send("{$}")
+!m::Send("{_}")
+!,::Send("{=}")
+!.::Send("{{}")
+!/::Send("{}}")
+!Space::Send("{Space}")
