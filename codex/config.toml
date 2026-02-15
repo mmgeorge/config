@@ -1,8 +1,16 @@
 model = "gpt-5.2-codex"
 model_reasoning_effort = "medium"
+personality = "pragmatic"
 
 [features]
 experimental_windows_sandbox = true
 elevated_windows_sandbox = true
 powershell_utf8 = true
 steer = true
+collab = true
+
+[projects.'\\?\D:\code\ferrous']
+trust_level = "trusted"
+
+[notice.model_migrations]
+"gpt-5.2-codex" = "gpt-5.3-codex"

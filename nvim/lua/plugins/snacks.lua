@@ -173,6 +173,7 @@ return {
             live = true,
             supports_live = true,
             -- layout = no_preview,
+            exclude = { "refs" },
           })
         end,
         desc = "Grep"

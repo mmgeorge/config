@@ -29,6 +29,7 @@ let required = [
   { name: "delta", winget: "dandavison.delta", brew: "git-delta" },
   { name: "jj", winget: "jj-vcs.jj", brew: "jj" },
   { name: "jjui", winget: "IbrahimDursun.jjui", brew: "jjui" },
+  { name: "jq", winget: "jqlang.jq", brew: "jq" },
   # { name: "pass-cli", winget: "Proton.ProtonPass.CLI", brew: "protonpass/tap/pass-cli" }
 ]
 
