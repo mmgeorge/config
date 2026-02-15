@@ -30,6 +30,7 @@ let required = [
   { name: "jj", winget: "jj-vcs.jj", brew: "jj" },
   { name: "jjui", winget: "IbrahimDursun.jjui", brew: "jjui" },
   { name: "jq", winget: "jqlang.jq", brew: "jq" },
+  { name: "git-lfs", winget: "GitHub.GitLFS", brew: "git-lfs" },
   # { name: "pass-cli", winget: "Proton.ProtonPass.CLI", brew: "protonpass/tap/pass-cli" }
 ]
 

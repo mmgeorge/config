@@ -60,7 +60,7 @@ function create_tab_script(include_delay, grep_str)
   if include_delay then
     delay_snippet = [[
     -- Wait for karma to start, then refresh the tab.
-    delay 2.
+    delay 2.5
     ]]
   end
 

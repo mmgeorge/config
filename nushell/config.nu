@@ -47,7 +47,7 @@ def create_left_prompt [] {
       $repo_name | path join $relative
     }
   } else {
-    ($env.PWD | str replace $nu.home-path "~")
+    $env.PWD
   }
   let git = (get_git_branch)
 
@@ -194,6 +194,31 @@ def ai [prompt: string] {
   $command | clip.exe
 
   print $command
+}
+
+def hashupdate [url?: string] {
+  # Default URL from clipboard (macOS: pbpaste) if not provided
+  let url = if $url == null {
+    (^pbpaste | str trim)
+  } else {
+    $url
+  }
+
+  # Find git repo root; if not in a git repo, exit with code 1
+  let root = (try {
+    (^git rev-parse --show-toplevel | str trim)
+  } catch {
+    exit 1
+  })
+
+  if ($root | str ends-with "arcgis-web-components") {
+    ^pnpm --filter @arcgis/map-components test-update-hashes $url
+  } else if ($root | str contains "arcgis-js-api") {
+    ^pnpm updateScreenshotHashes $url
+  } else {
+    print --stderr $"Unsupported repo: ($root)"
+    exit 1
+  }
 }
 
 $env.config.history = {
