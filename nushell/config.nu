@@ -21,6 +21,16 @@ alias tf = terraform
 alias top = btop
 alias h = yazi
 
+# $env.VSCODE_APPDATA = $"($env.XDG_CONFIG_HOME)/vscode"
+
+def code [...args] {
+    if $nu.os-info.name == "macos" {
+        ^"/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code" --user-data-dir $"($env.XDG_CONFIG_HOME)/vscode" ...$args
+    } else {
+        ^code --user-data-dir $"($env.XDG_CONFIG_HOME)/vscode" ...$args
+    }
+}
+
 def get_git_branch [] {
   let branch_res = (do { git branch --show-current } | complete)
   if $branch_res.exit_code != 0 or ($branch_res.stdout | str trim | is-empty) {
