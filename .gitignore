@@ -24,6 +24,7 @@ codex/.sandbox
 codex/sandbox.log
 codex/cap_sid
 goose/
+carapace/
 
 nushell/history*
 nushell/completions/
