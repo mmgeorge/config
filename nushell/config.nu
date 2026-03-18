@@ -13,6 +13,8 @@ $env.GOOSE_RECIPE_PATH = $"($env.XDG_CONFIG_HOME)/goose/recipes"
 $env.GEMINI_CLI_SYSTEM_DEFAULTS_PATH = $env.XDG_CONFIG_HOME | path join "gemini" | path join "settings.json"
 $env.CODEX_HOME = $env.XDG_CONFIG_HOME | path join "codex"
 
+$env.COPILOT_CUSTOM_INSTRUCTIONS_DIRS = $env.XDG_CONFIG_HOME | path join "copilot"
+
 alias cls = clear
 alias dc = detect columns
 alias select = select --ignore-case
@@ -20,6 +22,82 @@ alias gc = gcloud
 alias tf = terraform
 alias top = btop
 alias h = yazi
+alias python = python3
+
+def get_copilot_instruction_dirs [] {
+    let default_dir = ($env.XDG_CONFIG_HOME | path join "copilot")
+    let git_common_res = (do { ^git rev-parse --path-format=absolute --git-common-dir } | complete)
+
+    if $git_common_res.exit_code != 0 or ($git_common_res.stdout | str trim | is-empty) {
+        return [$default_dir]
+    }
+
+    let repo_name = ($git_common_res.stdout | str trim | path dirname | path basename)
+    let shared_agents_dir = ($env.HOME | path join "Developer" | path join "agents")
+    let repo_agents_dir = ($shared_agents_dir | path join $repo_name)
+
+    [
+        $default_dir
+        $shared_agents_dir
+        $repo_agents_dir
+    ]
+}
+
+def --wrapped co [...args] {
+    let instruction_dirs = (get_copilot_instruction_dirs)
+    let copilot_args = [
+        --allow-tool 'shell(python)'
+        --allow-tool 'shell(python:*)'
+        --allow-tool 'shell(printf)'
+        --allow-tool 'shell(printf:*)'
+        --allow-tool 'shell(echo)'
+        --allow-tool 'shell(echo:*)'
+        --allow-tool 'shell(cat)'
+        --allow-tool 'shell(cat:*)'
+        --allow-tool 'shell(ls)'
+        --allow-tool 'shell(ls:*)'
+        --allow-tool 'shell(find)'
+        --allow-tool 'shell(find:*)'
+        --allow-tool 'shell(grep)'
+        --allow-tool 'shell(grep:*)'
+        --allow-tool 'shell(rg)'
+        --allow-tool 'shell(rg:*)'
+        --allow-tool 'shell(head)'
+        --allow-tool 'shell(head:*)'
+        --allow-tool 'shell(tail)'
+        --allow-tool 'shell(tail:*)'
+        --allow-tool 'shell(sed)'
+        --allow-tool 'shell(sed:*)'
+        --allow-tool 'shell(awk)'
+        --allow-tool 'shell(awk:*)'
+        --allow-tool 'shell(sort)'
+        --allow-tool 'shell(sort:*)'
+        --allow-tool 'shell(uniq)'
+        --allow-tool 'shell(uniq:*)'
+        --allow-tool 'shell(wc)'
+        --allow-tool 'shell(wc:*)'
+        --allow-tool 'shell(jq)'
+        --allow-tool 'shell(jq:*)'
+        --allow-tool 'shell(tsgo)'
+        --allow-tool 'shell(tsgo:*)'
+        --allow-tool 'write'
+        --deny-tool 'shell(gh)'
+        --deny-tool 'shell(gh:*)'
+        --deny-tool 'shell(az)'
+        --deny-tool 'shell(az:*)'
+        --deny-tool 'shell(azcopy)'
+        --deny-tool 'shell(azcopy:*)'
+        --allow-all-urls
+        --add-dir '/Users/matt9222/Developer/agents'
+        --add-dir '/Users/matt9222/config/copilot/.github/instructions'
+    ]
+
+    with-env {
+        COPILOT_CUSTOM_INSTRUCTIONS_DIRS: ($instruction_dirs | str join ",")
+    } {
+        ^copilot ...$copilot_args ...$args
+    }
+}
 
 # $env.VSCODE_APPDATA = $"($env.XDG_CONFIG_HOME)/vscode"
 
