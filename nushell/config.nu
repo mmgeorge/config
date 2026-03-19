@@ -48,6 +48,8 @@ def --wrapped co [...args] {
     let copilot_args = [
         --allow-tool 'shell(python)'
         --allow-tool 'shell(python:*)'
+        --allow-tool 'shell(python3)'
+        --allow-tool 'shell(python3:*)'
         --allow-tool 'shell(printf)'
         --allow-tool 'shell(printf:*)'
         --allow-tool 'shell(echo)'
