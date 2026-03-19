@@ -51,6 +51,55 @@ local function filetype(context)
   return context.filetype
 end
 
+local function git_system(cmd)
+  local output = vim.fn.system(cmd)
+  if vim.v.shell_error ~= 0 then
+    return nil
+  end
+
+  return vim.trim(output)
+end
+
+local function get_pr_base_ref()
+  local upstream = git_system("git rev-parse --abbrev-ref --symbolic-full-name @{upstream} 2>/dev/null")
+  if upstream and upstream ~= "" then
+    return upstream
+  end
+
+  local origin_head = git_system("git symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null")
+  if origin_head and origin_head ~= "" then
+    return origin_head:gsub("^refs/remotes/", "")
+  end
+
+  return "origin/main"
+end
+
+local function get_pr_description_context()
+  local current_branch = git_system("git branch --show-current 2>/dev/null") or "HEAD"
+  local base_ref = get_pr_base_ref()
+  local merge_base = git_system("git merge-base HEAD " .. vim.fn.shellescape(base_ref) .. " 2>/dev/null")
+
+  local commit_range = merge_base and (merge_base .. "..HEAD") or (base_ref .. "..HEAD")
+  local commits = vim.fn.system(
+    "git log --reverse --format='%h %s' " .. vim.fn.shellescape(commit_range) .. " 2>/dev/null"
+  )
+  if vim.v.shell_error ~= 0 or vim.trim(commits) == "" then
+    commits = "No commits found between " .. base_ref .. " and HEAD."
+  end
+
+  local diff = vim.fn.system("git diff --no-ext-diff " .. vim.fn.shellescape(commit_range) .. " 2>/dev/null")
+  if vim.v.shell_error ~= 0 or vim.trim(diff) == "" then
+    diff = "No diff available for " .. commit_range .. "."
+  end
+
+  return {
+    base_ref = base_ref,
+    branch = current_branch,
+    commits = commits,
+    diff = diff,
+  }
+end
+
 
 return {
   -- {
@@ -331,6 +380,90 @@ return [[
               },
             },
           }
+        },
+        ["Generate PR Description"] = {
+          interaction = "inline",
+          description = "Generate a PR description from current branch commits",
+          opts = {
+            auto_submit = true,
+            adapter = adapters().commit,
+            is_slash_cmd = true,
+            alias = "pr",
+            placement = "replace",
+            stop_context_insertion = true,
+            diff = false,
+          },
+          prompts = {
+            {
+              role = "user",
+              content = function()
+                return [[
+Write a pull request description in Markdown based on the commits and diff for the current branch.
+
+Use the following template:
+
+```
+Related: {{ ISSUE_NUMBERS }}
+
+{{ OVERVIEW }}
+
+## Changes
+
+{{ MAJOR_CHANGES }}
+
+## Testing
+
+- [ ] Automated
+ - {{ TEST_FILE_NAME }}
+ - {{ TEST_FILE_NAME }}
+- [ ] Manual
+ - {{ MANUAL_ARCGIS_PLAY_APP_LINK }}
+```
+
+where:
+
+{{ ISSUE_NUMBERS }} is a comma separated list of issues related to the PR. E.g.: #1231,#12312
+
+{{ OVERVIEW }} is a 2-5 sentence overview of the PR.
+- What was the problem? What does it fix? How? Why this approach?
+- Avoid phrasing that sounds slogan-like, promotional, overly dramatic, or self-congratulatory. Prefer precise, grounded language that explains what the system does, why a decision was made, and how a reader should interpret the information.
+- Do *NOT* use bullets here.
+- Adopt a didactic, instructive style. Write as if you are explaining technical concepts to a senior in college who has some familiarity with the subject but does not yet have deep practical experience. Aim for clarity, structure, and substance without sounding simplistic.
+
+{{ MAJOR_CHANGES }} is a bulleted list of major changes. Mention specific classes and files.
+
+{{ TEST_FILE_NAME }} 0 or more automated tests that cover the changes in the PR. When we have these files, check the box by Automated.
+
+{{ MANUAL_ARCGIS_PLAY_APP_LINK }} 0 or more links to manual arcgis play apps.
+]]
+              end,
+            },
+            {
+              role = "user",
+              content = function()
+                local pr_context = get_pr_description_context()
+                return string.format(
+                  [[
+Base branch: %s
+Current branch: %s
+
+Commits in this branch:
+```text
+%s
+```
+
+Combined diff for this branch:
+```diff
+%s
+```
+]], pr_context.base_ref, pr_context.branch, pr_context.commits, pr_context.diff
+                )
+              end,
+              opts = {
+                contains_code = true,
+              },
+            },
+          },
         },
         ["Generate documentation"] = {
           interaction = "inline",
