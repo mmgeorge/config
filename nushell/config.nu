@@ -48,6 +48,7 @@ def --wrapped co [...args] {
     let copilot_args = [
         --allow-tool 'shell(python)'
         --allow-tool 'shell(python:*)'
+        --allow-tool 'shell(pnpm:*)'
         --allow-tool 'shell(printf)'
         --allow-tool 'shell(printf:*)'
         --allow-tool 'shell(echo)'
@@ -83,6 +84,8 @@ def --wrapped co [...args] {
         --allow-tool 'write'
         --allow-tool 'chrome-devtools'
         --allow-tool 'docs-mcp'
+        --allow-tool 'github-mcp-enterprise'
+        --allow-tool 'github-mcp-server'
         --allow-tool 'microsoft-learn'
         --deny-tool 'shell(gh)'
         --deny-tool 'shell(gh:*)'
@@ -190,6 +193,14 @@ def --env eng [] {
 
 def --env sdk [] {
   cd ($env.DEV_HOME | path join arcgis-js-api-4)
+}
+
+def --env wasm [] {
+  cd ($env.DEV_HOME | path join arcgis-maps-wasm)
+}
+
+def --env agents [] {
+  cd ($env.DEV_HOME | path join agents)
 }
 
 def lst [len: int = 50] {
