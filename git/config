@@ -7,10 +7,10 @@
   line-numbers = true
   line-numbers-left-format = "{nm:^4}"
   line-numbers-right-format = "{np:^4} "
-  line-numbers-left-style = red
-  line-numbers-right-style = green
-  minus-style = red
-  plus-style = green
+  line-numbers-left-style = "#7f5558" "#2b1618"
+  line-numbers-right-style = "#5f8a67" "#102018"
+  minus-style = syntax "#2b1618"
+  plus-style = syntax "#102018"
   decorations = false
   file-style = plain
   hunk-header-decoration-style = none
@@ -27,12 +27,14 @@
   file-removed-label = "Removed file"
   file-copied-label = "Copied file"
   file-renamed-label = "Rnamed file"
-  syntax-theme = none
+  syntax-theme = mmgeorge-treesitter
   max-line-distance = 0.8
   # paging = auto
   paging = never
 
-
 [user]
 	name = mmgeorge
 	email = mattmg412@gmail.com
+
+[push]
+	autoSetupRemote = true
