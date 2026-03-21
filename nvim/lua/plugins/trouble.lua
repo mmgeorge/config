@@ -183,8 +183,10 @@ return {
             },
             S = {
               action = function(view, ctx)
+                local dr = require("trouble.sources.diff_review")
+                local affected_file = ctx.item and ctx.item.filename
+                    or (ctx.node and ctx.node.item and ctx.node.item.filename)
                 if ctx.item then
-                  -- Hunk: stage individual hunk
                   local it = ctx.item.item
                   if it.staged then return end
                   if it.diff then
@@ -194,7 +196,6 @@ return {
                     end
                   end
                 elseif ctx.node then
-                  -- Group header (file): stage entire file and collapse
                   local filename = ctx.node.item and ctx.node.item.filename
                   if filename then
                     vim.fn.system({ "git", "add", "--", filename })
@@ -202,13 +203,19 @@ return {
                   view:fold(ctx.node, { action = "close" })
                 end
                 view:refresh()
+                -- Sync open diff buffer
+                if affected_file then
+                  dr.refresh_open_diff_buffer(affected_file)
+                end
               end,
               desc = "Stage hunk/file",
             },
             U = {
               action = function(view, ctx)
+                local dr = require("trouble.sources.diff_review")
+                local affected_file = ctx.item and ctx.item.filename
+                    or (ctx.node and ctx.node.item and ctx.node.item.filename)
                 if ctx.item then
-                  -- Hunk: unstage individual hunk
                   local it = ctx.item.item
                   if not it.staged then return end
                   if it.diff then
@@ -218,13 +225,15 @@ return {
                     end
                   end
                 elseif ctx.node then
-                  -- Group header (file): unstage entire file
                   local filename = ctx.node.item and ctx.node.item.filename
                   if filename then
                     vim.fn.system({ "git", "restore", "--staged", "--", filename })
                   end
                 end
                 view:refresh()
+                if affected_file then
+                  dr.refresh_open_diff_buffer(affected_file)
+                end
               end,
               desc = "Unstage hunk/file",
             },
