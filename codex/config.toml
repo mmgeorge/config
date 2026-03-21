@@ -1,4 +1,4 @@
-model = "gpt-5.2-codex"
+model = "gpt-5.4"
 model_reasoning_effort = "medium"
 personality = "pragmatic"
 
@@ -7,10 +7,29 @@ experimental_windows_sandbox = true
 elevated_windows_sandbox = true
 powershell_utf8 = true
 steer = true
-collab = true
+multi_agent = true
 
 [projects.'\\?\D:\code\ferrous']
 trust_level = "trusted"
 
+[projects.'D:\']
+trust_level = "trusted"
+
+[projects.'\\?\D:\config']
+trust_level = "trusted"
+
 [notice.model_migrations]
 "gpt-5.2-codex" = "gpt-5.3-codex"
+"gpt-5.3-codex" = "gpt-5.4"
+
+[mcp_servers.microsoft-learn]
+type = "http"
+url = "https://learn.microsoft.com/api/mcp"
+
+[mcp_servers.chrome-devtools]
+command = "npx"
+args = ["-y", "chrome-devtools-mcp@latest", "--channel=beta"]
+
+[mcp_servers.hf-mcp-server]
+type = "http"
+url = "https://huggingface.co/mcp?login"
