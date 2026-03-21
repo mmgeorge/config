@@ -3,6 +3,13 @@ return {
     "folke/trouble.nvim",
     dependencies = { "nvim-tree/nvim-web-devicons" },
     -- branch = "dev",
+    cmd = { "Trouble", "DiffReview" },
+    config = function(_, opts)
+      require("trouble").setup(opts)
+      vim.api.nvim_create_user_command("DiffReview", function()
+        require("trouble.sources.diff_review").open()
+      end, { desc = "Review git diff with file/hunk tree" })
+    end,
     keys = {
       {
         "ge",
@@ -163,12 +170,47 @@ return {
               end,
               desc = "Move down",
             },
-            ["<Tab>"] = "fold_toggle",
+            ["<Tab>"] = {
+              action = function(view, ctx)
+                local is_group = ctx.node and ctx.node.group ~= nil
+                if not is_group and ctx.node and ctx.node.item then
+                  -- Hunk: toggle fold in the diff buffer
+                  local dr = require("trouble.sources.diff_review")
+                  local the_item = ctx.item or ctx.node.item
+                  local filename = the_item.filename
+                  if not filename then return end
+                  local key = "diff:" .. filename
+                  dr._diff_bufs = dr._diff_bufs or {}
+                  local diff_buf = dr._diff_bufs[key]
+                  if not diff_buf or not vim.api.nvim_buf_is_valid(diff_buf) then return end
+                  local hunks = dr._buf_hunks[diff_buf]
+                  local item_diff = the_item.item and the_item.item.diff
+                  if hunks and item_diff then
+                    for _, h in ipairs(hunks) do
+                      if h.diff == item_diff then
+                        h.folded = not h.folded
+                        dr._render_with_folds(diff_buf)
+                        break
+                      end
+                    end
+                  end
+                elseif ctx.node then
+                  -- File group: toggle Trouble fold
+                  view:fold(ctx.node)
+                end
+              end,
+              desc = "Toggle fold",
+            },
             ["<cr>"] = {
               action = function(self, ctx)
                 if ctx.item then
-                  -- Hunk: jump to real file
-                  self:jump(ctx.item)
+                  -- Hunk: show diff buffer at this hunk and focus it
+                  local dr = require("trouble.sources.diff_review")
+                  dr.auto_preview(self)
+                  local win = dr.get_main_win(self)
+                  if win and vim.api.nvim_win_is_valid(win) then
+                    vim.api.nvim_set_current_win(win)
+                  end
                 elseif ctx.node and ctx.node.item then
                   -- File group header: show diff in main and focus it
                   local dr = require("trouble.sources.diff_review")
@@ -202,11 +244,21 @@ return {
                   end
                   view:fold(ctx.node, { action = "close" })
                 end
+                -- Move cursor down BEFORE refresh so it lands on the next item
+                local cursor = vim.api.nvim_win_get_cursor(view.win.win)
+                local max = vim.api.nvim_buf_line_count(view.win.buf)
+                if cursor[1] < max then
+                  vim.api.nvim_win_set_cursor(view.win.win, { cursor[1] + 1, cursor[2] })
+                end
                 view:refresh()
                 -- Sync open diff buffer
                 if affected_file then
                   dr.refresh_open_diff_buffer(affected_file)
                 end
+                -- Update preview after refresh renders
+                vim.defer_fn(function()
+                  dr.auto_preview(view)
+                end, 50)
               end,
               desc = "Stage hunk/file",
             },

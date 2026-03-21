@@ -6,6 +6,8 @@ local Item = require("trouble.item")
 
 local M = {}
 
+-- next
+
 -- Background-only highlight groups for diff lines.
 -- Pull bg from existing DiffAdd/DiffDelete so they match the gutter colors.
 local function setup_bg_highlights()
@@ -155,6 +157,23 @@ M.config = {
 }
 
 function M.setup() end
+
+--- Open the DiffReview picker. Called from the :DiffReview command.
+function M.open()
+  M._main_win = nil
+  local view = require("trouble").open("diff_review")
+  if view then
+    view.first_render:next(function()
+      view:fold_level({ level = 0 })
+      M.auto_preview(view)
+      view.win:on("WinEnter", function()
+        if not view.closed then
+          M.auto_preview(view)
+        end
+      end)
+    end)
+  end
+end
 
 ---@param cb fun(items: trouble.Item[])
 ---@param _ctx trouble.Source.ctx
@@ -361,6 +380,10 @@ end
 
 -- Per-buffer hunk metadata: maps buffer line ranges to raw diff patches
 M._buf_hunks = {}
+-- Per-buffer filename mapping
+M._buf_filename = {}
+-- Per-buffer saved cursor position (for restoring after jumping to file)
+M._buf_saved_cursor = {}
 
 --- Find which hunk the cursor is in within a diff buffer.
 --- Returns the hunk's complete diff patch (with file header) or nil.
@@ -395,16 +418,8 @@ function M.open_diff_buffer(filename)
     local short = vim.fn.fnamemodify(filename, ":t")
     vim.api.nvim_buf_set_name(buf, "diff://" .. short)
     M._diff_bufs[key] = buf
+    M._buf_filename[buf] = filename
 
-    -- Enable manual folds for <Tab> collapse
-    vim.api.nvim_create_autocmd("BufWinEnter", {
-      buffer = buf,
-      callback = function()
-        vim.wo[0].foldmethod = "manual"
-        vim.wo[0].foldenable = true
-        vim.wo[0].foldlevel = 99
-      end,
-    })
 
     local kopts = { buffer = buf, silent = true }
 
@@ -431,6 +446,72 @@ function M.open_diff_buffer(filename)
         end
       end
     end, vim.tbl_extend("force", kopts, { desc = "Prev hunk" }))
+
+    -- Jump to the corresponding line in the actual file
+    vim.keymap.set("n", "<CR>", function()
+      local target_file = M._buf_filename[buf]
+      if not target_file then return end
+
+      -- Save cursor so we can restore when returning to this diff buffer
+      M._buf_saved_cursor[buf] = vim.api.nvim_win_get_cursor(0)
+
+      local hunks = M._buf_hunks[buf]
+      if not hunks then return end
+      local cursor = M._buf_saved_cursor[buf][1]
+
+      -- Find which hunk we're in and compute file line number
+      for _, h in ipairs(hunks) do
+        if cursor >= h.start_line and cursor <= h.end_line then
+          -- Parse the @@ header to get the new-file start line
+          local new_start = h.diff:match("%+(%d+)")
+          new_start = tonumber(new_start) or 1
+
+          -- Walk diff lines to find file line at cursor position
+          -- Cursor offset within the hunk (0 = @@ line, 1 = first code line)
+          local offset_in_hunk = cursor - h.start_line
+          if offset_in_hunk == 0 then
+            -- On the @@ line itself, jump to hunk start
+            vim.cmd.edit(target_file)
+            pcall(vim.api.nvim_win_set_cursor, 0, { new_start, 0 })
+            vim.cmd("normal! zz")
+            return
+          end
+
+          -- Walk through diff code lines counting file lines
+          local diff_lines = {}
+          local found_header = false
+          for diff_line in h.diff:gmatch("[^\n]+") do
+            if found_header then
+              diff_lines[#diff_lines + 1] = diff_line
+            elseif diff_line:match("^@@") then
+              found_header = true
+            end
+          end
+
+          local file_line = new_start
+          local last_valid_line = new_start
+          for i = 1, math.min(offset_in_hunk, #diff_lines) do
+            local prefix = diff_lines[i]:sub(1, 1)
+            if prefix == " " or prefix == "+" then
+              last_valid_line = file_line
+              if i < offset_in_hunk then
+                file_line = file_line + 1
+              end
+            elseif prefix == "-" then
+              -- Deleted line: doesn't exist in new file
+              -- last_valid_line stays as-is
+            end
+          end
+
+          vim.cmd.edit(target_file)
+          local max_line = vim.api.nvim_buf_line_count(0)
+          local target_line = math.min(last_valid_line, max_line)
+          pcall(vim.api.nvim_win_set_cursor, 0, { target_line, 0 })
+          vim.cmd("normal! zz")
+          return
+        end
+      end
+    end, vim.tbl_extend("force", kopts, { desc = "Jump to file", nowait = true }))
 
     -- Stage the hunk under cursor, then jump to the next hunk
     vim.keymap.set("n", "S", function()
@@ -460,19 +541,28 @@ function M.open_diff_buffer(filename)
         vim.notify("Stage failed: " .. result, vim.log.levels.ERROR)
       else
         vim.notify("Hunk staged", vim.log.levels.INFO)
-        M._refresh_diff_buffer(buf, filename)
-        require("trouble").refresh("diff_review")
-        -- Jump to the next hunk (same index, since staged hunk is still there but folded)
-        local new_hunks = M._buf_hunks[buf]
-        if new_hunks and cur_hunk_idx then
+        -- Collapse the staged hunk, update checkbox, and jump to next
+        if hunks and cur_hunk_idx then
+          hunks[cur_hunk_idx].folded = true
+          -- Update checkbox from [ ] to [x] on the @@ line
+          local hunk_line = hunks[cur_hunk_idx].start_line - 1 -- 0-indexed
+          local line_text = vim.api.nvim_buf_get_lines(buf, hunk_line, hunk_line + 1, false)[1] or ""
+          local new_text = line_text:gsub("^%[ %]", "[x]", 1)
+          if new_text ~= line_text then
+            vim.bo[buf].modifiable = true
+            vim.api.nvim_buf_set_lines(buf, hunk_line, hunk_line + 1, false, { new_text })
+            vim.bo[buf].modifiable = false
+          end
+          M._render_with_folds(buf)
+          -- Jump to next hunk, or stay on current @@ if last
           local next_idx = cur_hunk_idx + 1
-          if next_idx <= #new_hunks then
-            pcall(vim.api.nvim_win_set_cursor, 0, { new_hunks[next_idx].start_line, 0 })
-          elseif #new_hunks > 0 then
-            -- No next hunk, stay on current (now folded)
-            pcall(vim.api.nvim_win_set_cursor, 0, { new_hunks[cur_hunk_idx].start_line, 0 })
+          if next_idx <= #hunks then
+            pcall(vim.api.nvim_win_set_cursor, 0, { hunks[next_idx].start_line, 0 })
+          else
+            pcall(vim.api.nvim_win_set_cursor, 0, { hunks[cur_hunk_idx].start_line, 0 })
           end
         end
+        require("trouble").refresh("diff_review")
       end
     end, vim.tbl_extend("force", kopts, { desc = "Stage hunk", nowait = true }))
 
@@ -492,32 +582,57 @@ function M.open_diff_buffer(filename)
         vim.notify("Unstage failed: " .. result, vim.log.levels.ERROR)
       else
         vim.notify("Hunk unstaged", vim.log.levels.INFO)
-        local cursor = vim.api.nvim_win_get_cursor(0)
-        M._refresh_diff_buffer(buf, filename)
+        -- Update checkbox from [x] to [ ] and expand
+        local hunks = M._buf_hunks[buf]
+        local cursor_line = vim.api.nvim_win_get_cursor(0)[1]
+        if hunks then
+          for _, h in ipairs(hunks) do
+            if cursor_line >= h.start_line and cursor_line <= h.end_line then
+              h.folded = false
+              local hunk_line = h.start_line - 1
+              local line_text = vim.api.nvim_buf_get_lines(buf, hunk_line, hunk_line + 1, false)[1] or ""
+              local new_text = line_text:gsub("^%[x%]", "[ ]", 1)
+              if new_text ~= line_text then
+                vim.bo[buf].modifiable = true
+                vim.api.nvim_buf_set_lines(buf, hunk_line, hunk_line + 1, false, { new_text })
+                vim.bo[buf].modifiable = false
+              end
+              M._render_with_folds(buf)
+              break
+            end
+          end
+        end
         require("trouble").refresh("diff_review")
-        pcall(vim.api.nvim_win_set_cursor, 0, cursor)
       end
     end, vim.tbl_extend("force", kopts, { desc = "Unstage hunk", nowait = true }))
 
     -- Toggle fold (collapse/expand) the hunk under cursor
     vim.keymap.set("n", "<Tab>", function()
       local hunks = M._buf_hunks[buf]
-      if not hunks then return end
+      if not hunks then
+        vim.notify("No hunk map for buffer", vim.log.levels.WARN)
+        return
+      end
       local cursor = vim.api.nvim_win_get_cursor(0)[1]
-      for _, h in ipairs(hunks) do
+      local found = false
+      for i, h in ipairs(hunks) do
         if cursor >= h.start_line and cursor <= h.end_line then
-          if h.folded then
-            -- Expand: re-render will restore it
-            h.folded = false
-          else
-            h.folded = true
-          end
-          -- Re-render with fold state
+          found = true
+          h.folded = not h.folded
+          vim.notify("Hunk " .. i .. " folded=" .. tostring(h.folded) .. " range=" .. h.start_line .. "-" .. h.end_line, vim.log.levels.INFO)
           M._render_with_folds(buf)
+          pcall(vim.api.nvim_win_set_cursor, 0, { h.start_line, 0 })
           return
         end
       end
-    end, vim.tbl_extend("force", kopts, { desc = "Toggle hunk fold" }))
+      if not found then
+        local ranges = {}
+        for i, h in ipairs(hunks) do
+          ranges[#ranges + 1] = i .. ":[" .. h.start_line .. "-" .. h.end_line .. "]"
+        end
+        vim.notify("Cursor " .. cursor .. " not in any hunk: " .. table.concat(ranges, ", "), vim.log.levels.WARN)
+      end
+    end, vim.tbl_extend("force", kopts, { desc = "Toggle hunk fold", nowait = true }))
   end
 
   return buf
@@ -534,21 +649,26 @@ function M._compute_hunk_map(diff_text)
   local rendered_line = 0
   local hunk_map = {}
   for _, h in ipairs(raw_hunks) do
-    -- Count only code lines: lines after the @@ header in the diff
-    local code_lines = 0
+    -- Count code lines the same way Snacks does: lines after @@,
+    -- stripping trailing empty/whitespace lines (Snacks parse_hunk does this)
+    local code_lines_list = {}
     local found_hunk_header = false
     for diff_line in h.diff:gmatch("[^\n]+") do
       if found_hunk_header then
-        code_lines = code_lines + 1
+        code_lines_list[#code_lines_list + 1] = diff_line
       elseif diff_line:match("^@@") then
         found_hunk_header = true
-        -- Don't count the @@ line itself as a code line;
-        -- it corresponds to our rendered @@ separator
       end
     end
+    -- Strip trailing empty lines (matching Snacks parse_hunk behavior)
+    while #code_lines_list > 0 and code_lines_list[#code_lines_list]:match("^%s*$") do
+      table.remove(code_lines_list)
+    end
+    local code_lines = #code_lines_list
     -- Rendered: 1 line (@@ separator) + code_lines
+    -- end_line is the LAST line of this hunk (exclusive of next hunk's @@)
     local start_line = rendered_line + 1
-    local end_line = rendered_line + 1 + code_lines
+    local end_line = start_line + code_lines
     hunk_map[#hunk_map + 1] = {
       start_line = start_line,
       end_line = end_line,
@@ -577,7 +697,12 @@ function M._render_with_folds(buf)
   if not win then return end
 
   local line_count = vim.api.nvim_buf_line_count(buf)
+  -- Ensure fold settings are on the correct window
+  vim.wo[win].foldmethod = "manual"
+  vim.wo[win].foldenable = true
   vim.api.nvim_win_call(win, function()
+    -- Save view to prevent jumping
+    local view = vim.fn.winsaveview()
     pcall(vim.cmd, "normal! zE") -- delete all folds
     for _, h in ipairs(hunks) do
       if h.folded then
@@ -588,6 +713,7 @@ function M._render_with_folds(buf)
         end
       end
     end
+    vim.fn.winrestview(view)
   end)
 end
 
@@ -682,21 +808,38 @@ function M.auto_preview(view)
   if not win or not vim.api.nvim_win_is_valid(win) then return end
 
   if loc and loc.item then
-    -- Hunk row: show the real file at the hunk position
+    -- Hunk row: show the diff buffer and jump to the matching hunk
     local item = loc.item
-    local path = item.filename
-    if path then
-      local buf = vim.fn.bufadd(path)
-      vim.fn.bufload(buf)
-      if vim.api.nvim_win_get_buf(win) ~= buf then
-        vim.api.nvim_win_set_buf(win, buf)
-      end
-      if item.pos and item.pos[1] > 0 then
-        local line = math.min(item.pos[1], vim.api.nvim_buf_line_count(buf))
-        pcall(vim.api.nvim_win_set_cursor, win, { line, item.pos[2] or 0 })
-        vim.api.nvim_win_call(win, function()
-          vim.cmd("normal! zz")
-        end)
+    local filename = item.filename
+    if not filename then return end
+    if not (M._file_diffs and M._file_diffs[filename]) then return end
+
+    local diff_buf = M.open_diff_buffer(filename)
+    local need_refresh = vim.api.nvim_win_get_buf(win) ~= diff_buf
+    vim.api.nvim_win_set_buf(win, diff_buf)
+    if need_refresh then
+      M._refresh_diff_buffer(diff_buf, filename)
+    end
+
+    -- Find the matching hunk in the diff buffer by comparing diff text
+    local hunks = M._buf_hunks[diff_buf]
+    local item_diff = item.item and item.item.diff
+    -- Clear previous hover highlight
+    local hover_ns = vim.api.nvim_create_namespace("diff_review_hover")
+    vim.api.nvim_buf_clear_namespace(diff_buf, hover_ns, 0, -1)
+    if hunks and item_diff then
+      for _, h in ipairs(hunks) do
+        if h.diff == item_diff then
+          -- Highlight the @@ header line (visible even when folded)
+          pcall(vim.api.nvim_buf_set_extmark, diff_buf, hover_ns, h.start_line - 1, 0, {
+            line_hl_group = "CursorLine",
+          })
+          pcall(vim.api.nvim_win_set_cursor, win, { h.start_line, 0 })
+          vim.api.nvim_win_call(win, function()
+            vim.cmd("normal! zz")
+          end)
+          break
+        end
       end
     end
     return
@@ -708,14 +851,20 @@ function M.auto_preview(view)
     if not (M._file_diffs and M._file_diffs[filename]) then return end
 
     local buf = M.open_diff_buffer(filename)
-    if vim.api.nvim_win_get_buf(win) ~= buf then
-      -- Set buffer on window BEFORE refresh so folds can be applied
-      vim.api.nvim_win_set_buf(win, buf)
-    end
+    vim.api.nvim_win_set_buf(win, buf)
     -- Always refresh to get latest staged state
     M._refresh_diff_buffer(buf, filename)
-    vim.api.nvim_win_set_cursor(win, { 1, 0 })
+    -- Restore saved cursor position, or start at line 1
+    local saved = M._buf_saved_cursor[buf]
+    if saved then
+      local max_line = vim.api.nvim_buf_line_count(buf)
+      pcall(vim.api.nvim_win_set_cursor, win, { math.min(saved[1], max_line), saved[2] or 0 })
+    else
+      vim.api.nvim_win_set_cursor(win, { 1, 0 })
+    end
   end
 end
 
 return M
+
+-- next
