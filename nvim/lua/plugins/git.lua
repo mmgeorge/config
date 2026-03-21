@@ -1,3 +1,5 @@
+-- test
+
 local key = require("../keys").key
 
 return {
@@ -10,6 +12,7 @@ return {
       })
     end,
   },
+  -- foo
   {
     "NeogitOrg/neogit",
     commit = "0f48491ae0046796841aaa97d439267982fe72db",
@@ -485,11 +488,18 @@ return {
       }
     }
   },
-  -- {
-  --   "lewis6991/gitsigns.nvim",
-  --   lazy = false, -- messes up keybindings
-  --   config = function()
-  --     require('gitsigns').setup()
-  --   end
-  -- }
+  {
+    "lewis6991/gitsigns.nvim",
+    lazy = false,
+    config = function()
+      require('gitsigns').setup({
+        signcolumn = false, -- let mini.diff handle gutter signs
+        numhl = false,
+        linehl = false,
+        word_diff = false,
+        -- gitsigns has NO default keymaps; available purely for API:
+        -- get_hunks(), stage_hunk(), preview_hunk_inline(), nav_hunk()
+      })
+    end
+  }
 }

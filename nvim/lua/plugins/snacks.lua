@@ -39,6 +39,18 @@ return {
         Snacks.notifier.show_history()
       end, { desc = 'Get notification history (on)', nargs = '*' })
 
+      vim.api.nvim_create_user_command('DiffReview', function(_opts)
+        local dr = require("trouble.sources.diff_review")
+        dr._main_win = nil -- reset so it captures the current window
+        local view = require("trouble").open("diff_review")
+        if view then
+          view.first_render:next(function()
+            view:fold_level({ level = 0 })
+            dr.auto_preview(view)
+          end)
+        end
+      end, { desc = 'Review git diff with file/hunk tree' })
+
       -- LSP notifier:
       ---@type table<number, {token:lsp.ProgressToken, msg:string, done:boolean}[]>
       local progress = vim.defaulttable()

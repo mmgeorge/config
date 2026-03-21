@@ -127,6 +127,109 @@ return {
       },
       ---@type table<string, trouble.Mode>
       modes = {
+        diff_review = {
+          desc = "Diff Review",
+          source = "diff_review",
+          events = { "BufWritePost" },
+          groups = {
+            { "filename", format = "{item.file_check} {file_icon} {basename} {item.stats}" },
+          },
+          sort = { "filename", "pos" },
+          format = "{item.check} {item.hunk_header} {item.context_text}",
+          auto_preview = false,
+          preview = { type = "main", scratch = false },
+          focus = true,
+          keys = {
+            -- Override s/t to use raw cursor movement so group headers
+            -- (file rows) are reachable, and show diff preview on file rows
+            s = {
+              action = function(self)
+                local cursor = vim.api.nvim_win_get_cursor(self.win.win)
+                if cursor[1] > 1 then
+                  vim.api.nvim_win_set_cursor(self.win.win, { cursor[1] - 1, cursor[2] })
+                end
+                require("trouble.sources.diff_review").auto_preview(self)
+              end,
+              desc = "Move up",
+            },
+            t = {
+              action = function(self)
+                local cursor = vim.api.nvim_win_get_cursor(self.win.win)
+                local max = vim.api.nvim_buf_line_count(self.win.buf)
+                if cursor[1] < max then
+                  vim.api.nvim_win_set_cursor(self.win.win, { cursor[1] + 1, cursor[2] })
+                end
+                require("trouble.sources.diff_review").auto_preview(self)
+              end,
+              desc = "Move down",
+            },
+            ["<Tab>"] = "fold_toggle",
+            ["<cr>"] = {
+              action = function(self, ctx)
+                if ctx.item then
+                  -- Hunk: jump to real file
+                  self:jump(ctx.item)
+                elseif ctx.node and ctx.node.item then
+                  -- File group header: show diff in main and focus it
+                  local dr = require("trouble.sources.diff_review")
+                  dr.auto_preview(self)
+                  local win = dr.get_main_win(self)
+                  if win and vim.api.nvim_win_is_valid(win) then
+                    vim.api.nvim_set_current_win(win)
+                  end
+                end
+              end,
+              desc = "Jump to file/hunk",
+            },
+            S = {
+              action = function(view, ctx)
+                if ctx.item then
+                  -- Hunk: stage individual hunk
+                  local it = ctx.item.item
+                  if it.staged then return end
+                  if it.diff then
+                    local result = vim.fn.system({ "git", "apply", "--cached", "--unidiff-zero", "-" }, it.diff .. "\n")
+                    if vim.v.shell_error ~= 0 then
+                      vim.notify("Stage failed: " .. result, vim.log.levels.ERROR)
+                    end
+                  end
+                elseif ctx.node then
+                  -- Group header (file): stage entire file and collapse
+                  local filename = ctx.node.item and ctx.node.item.filename
+                  if filename then
+                    vim.fn.system({ "git", "add", "--", filename })
+                  end
+                  view:fold(ctx.node, { action = "close" })
+                end
+                view:refresh()
+              end,
+              desc = "Stage hunk/file",
+            },
+            U = {
+              action = function(view, ctx)
+                if ctx.item then
+                  -- Hunk: unstage individual hunk
+                  local it = ctx.item.item
+                  if not it.staged then return end
+                  if it.diff then
+                    local result = vim.fn.system({ "git", "apply", "--cached", "--reverse", "--unidiff-zero", "-" }, it.diff .. "\n")
+                    if vim.v.shell_error ~= 0 then
+                      vim.notify("Unstage failed: " .. result, vim.log.levels.ERROR)
+                    end
+                  end
+                elseif ctx.node then
+                  -- Group header (file): unstage entire file
+                  local filename = ctx.node.item and ctx.node.item.filename
+                  if filename then
+                    vim.fn.system({ "git", "restore", "--staged", "--", filename })
+                  end
+                end
+                view:refresh()
+              end,
+              desc = "Unstage hunk/file",
+            },
+          },
+        },
         symbols = {
           desc = "document symbols",
           mode = "lsp_document_symbols",

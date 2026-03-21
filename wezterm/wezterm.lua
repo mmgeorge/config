@@ -85,6 +85,17 @@ config.show_new_tab_button_in_tab_bar       = false
 --   return tab_info.active_pane.title
 -- end
 
+-- Track workspace switches for quick toggle between last two workspaces
+wezterm.on('update-status', function(window, pane)
+  local current = window:active_workspace()
+  local last = wezterm.GLOBAL.current_workspace
+
+  if last and current ~= last then
+    wezterm.GLOBAL.previous_workspace = last
+  end
+  wezterm.GLOBAL.current_workspace = current
+end)
+
 wezterm.on('format-tab-title', function(tab, tabs, panes, config, hover, max_width)
   local user_title = tab.active_pane.title
   local pwd = tab.active_pane.current_working_dir
@@ -167,6 +178,16 @@ config.keys           = {
     key = 's',
     mods = 'LEADER',
     action = wezterm.action.ShowLauncherArgs { flags = 'FUZZY|WORKSPACES' },
+  },
+  {
+    key = 'S',
+    mods = 'LEADER',
+    action = wezterm.action_callback(function(window, pane)
+      local prev = wezterm.GLOBAL.previous_workspace
+      if prev then
+        window:perform_action(wezterm.action.SwitchToWorkspace { name = prev }, pane)
+      end
+    end),
   },
   {
     key = 'y',
