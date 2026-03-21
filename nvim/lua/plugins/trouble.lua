@@ -139,9 +139,10 @@ return {
           source = "diff_review",
           events = { "BufWritePost" },
           groups = {
+            { "item.category" },
             { "filename", format = "{item.file_check} {file_icon} {basename} {item.stats}" },
           },
-          sort = { "filename", "pos" },
+          sort = { "item.category", "filename", "pos" },
           format = "{item.check} {item.hunk_header} {item.context_text}",
           auto_preview = false,
           preview = { type = "main", scratch = false },
@@ -255,8 +256,9 @@ return {
                 if affected_file then
                   dr.refresh_open_diff_buffer(affected_file)
                 end
-                -- Update preview after refresh renders
+                -- Re-apply fold level and update preview after refresh renders
                 vim.defer_fn(function()
+                  view:fold_level({ level = 1 })
                   dr.auto_preview(view)
                 end, 50)
               end,

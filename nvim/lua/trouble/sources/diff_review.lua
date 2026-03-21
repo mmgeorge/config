@@ -15,8 +15,8 @@ local function setup_bg_highlights()
     local hl = vim.api.nvim_get_hl(0, { name = name, link = false })
     return hl.bg
   end
-  local add_bg = get_bg("DiffAdd") or "#001200"
-  local del_bg = get_bg("DiffDelete") or "#120000"
+  local add_bg = get_bg("DiffAdd") or "#002200"
+  local del_bg = get_bg("DiffDelete") or "#220000"
   vim.api.nvim_set_hl(0, "DiffReviewAddBg", { bg = add_bg })
   vim.api.nvim_set_hl(0, "DiffReviewDeleteBg", { bg = del_bg })
   vim.api.nvim_set_hl(0, "DiffReviewAddLineNr", { fg = "#50fa7b", bg = add_bg, bold = true })
@@ -164,15 +164,34 @@ function M.open()
   local view = require("trouble").open("diff_review")
   if view then
     view.first_render:next(function()
-      view:fold_level({ level = 0 })
+      view:fold_level({ level = 1 })
       M.auto_preview(view)
       view.win:on("WinEnter", function()
         if not view.closed then
           M.auto_preview(view)
         end
       end)
+      -- Clean up diff buffers when Trouble closes
+      view.win:on("WinClosed", function()
+        M._cleanup_diff_buffers()
+      end)
     end)
   end
+end
+
+--- Close and wipe all diff buffers
+function M._cleanup_diff_buffers()
+  M._diff_bufs = M._diff_bufs or {}
+  for key, buf in pairs(M._diff_bufs) do
+    if vim.api.nvim_buf_is_valid(buf) then
+      vim.api.nvim_buf_delete(buf, { force = true })
+    end
+  end
+  M._diff_bufs = {}
+  M._buf_hunks = {}
+  M._buf_filename = {}
+  M._buf_saved_cursor = {}
+  M._main_win = nil
 end
 
 ---@param cb fun(items: trouble.Item[])
@@ -193,6 +212,61 @@ function M.get(cb, _ctx)
   vim.list_extend(all_hunks, unstaged)
   vim.list_extend(all_hunks, staged)
 
+  -- Get untracked files
+  local untracked_files = {}
+  local untracked_output = vim.fn.systemlist({ "git", "-C", cwd, "ls-files", "--others", "--exclude-standard" })
+  if vim.v.shell_error == 0 then
+    for _, f in ipairs(untracked_output) do
+      if f ~= "" then
+        untracked_files[#untracked_files + 1] = f
+      end
+    end
+  end
+
+  -- Get all changed files (staged + unstaged) to catch files with no hunks
+  -- (e.g., empty new files, binary files)
+  local tracked_files_with_hunks = {}
+  for _, h in ipairs(all_hunks) do
+    tracked_files_with_hunks[h.file] = true
+  end
+  local staged_name_status = vim.fn.systemlist({ "git", "-C", cwd, "diff", "--cached", "--name-status" })
+  if vim.v.shell_error == 0 then
+    for _, line in ipairs(staged_name_status) do
+      local status, file = line:match("^(%S+)%s+(.+)$")
+      if file and not tracked_files_with_hunks[file] then
+        -- File has staged changes but no hunks (empty new file, binary, etc.)
+        all_hunks[#all_hunks + 1] = {
+          file = file,
+          pos = 1,
+          context = nil,
+          diff = nil,
+          staged = true,
+          added = 0,
+          removed = 0,
+          status = status,
+        }
+      end
+    end
+  end
+  local unstaged_name_status = vim.fn.systemlist({ "git", "-C", cwd, "diff", "--name-status" })
+  if vim.v.shell_error == 0 then
+    for _, line in ipairs(unstaged_name_status) do
+      local status, file = line:match("^(%S+)%s+(.+)$")
+      if file and not tracked_files_with_hunks[file] then
+        all_hunks[#all_hunks + 1] = {
+          file = file,
+          pos = 1,
+          context = nil,
+          diff = nil,
+          staged = false,
+          added = 0,
+          removed = 0,
+          status = status,
+        }
+      end
+    end
+  end
+
   -- Compute per-file aggregate stats and staging state
   local file_stats = {} ---@type table<string, { added: number, removed: number, total: number, staged: number }>
   for _, hunk in ipairs(all_hunks) do
@@ -212,7 +286,7 @@ function M.get(cb, _ctx)
   local items = {}
   for _, hunk in ipairs(all_hunks) do
     local context_text = hunk.context or ""
-    local header = "@@"
+    local header = hunk.status or "@@"
     if hunk.diff then
       header = hunk.diff:match("\n(@@[^@]+@@)") or hunk.diff:match("^(@@[^@]+@@)") or "@@"
     end
@@ -233,6 +307,7 @@ function M.get(cb, _ctx)
       filename = filename,
       pos = { hunk.pos, 0 },
       item = {
+        category = "Tracked Changes",
         check = hunk.staged and "[x]" or "[ ]",
         file_check = file_check,
         hunk_header = header,
@@ -241,7 +316,31 @@ function M.get(cb, _ctx)
         diff = hunk.diff,
         added = hunk.added,
         removed = hunk.removed,
-        stats = "+" .. fs.added .. " -" .. fs.removed,
+        stats = (fs.added > 0 or fs.removed > 0)
+          and ("+" .. fs.added .. " -" .. fs.removed)
+          or (hunk.status == "A" and "new" or hunk.status == "D" and "deleted" or ""),
+      },
+    })
+  end
+
+  -- Add untracked files
+  for _, f in ipairs(untracked_files) do
+    local filename = vim.fn.fnamemodify(cwd .. "/" .. f, ":p")
+    items[#items + 1] = Item.new({
+      source = "diff_review",
+      filename = filename,
+      pos = { 1, 0 },
+      item = {
+        category = "Untracked Files",
+        check = "[ ]",
+        file_check = "[ ]",
+        hunk_header = "new file",
+        context_text = "",
+        staged = false,
+        diff = nil,
+        added = 0,
+        removed = 0,
+        stats = "new",
       },
     })
   end
@@ -423,6 +522,12 @@ function M.open_diff_buffer(filename)
 
     local kopts = { buffer = buf, silent = true }
 
+    -- Close both diff buffer and trouble
+    vim.keymap.set("n", "q", function()
+      require("trouble").close("diff_review")
+      M._cleanup_diff_buffers()
+    end, vim.tbl_extend("force", kopts, { desc = "Close DiffReview", nowait = true }))
+
 
     -- Jump to next/prev hunk header
     vim.keymap.set("n", "]c", function()
@@ -456,8 +561,14 @@ function M.open_diff_buffer(filename)
       M._buf_saved_cursor[buf] = vim.api.nvim_win_get_cursor(0)
 
       local hunks = M._buf_hunks[buf]
-      if not hunks then return end
       local cursor = M._buf_saved_cursor[buf][1]
+
+      -- No hunks (e.g. "No changes" / empty new file): just open the file
+      if not hunks or #hunks == 0 then
+        vim.cmd.edit(target_file)
+        vim.cmd("normal! zz")
+        return
+      end
 
       -- Find which hunk we're in and compute file line number
       for _, h in ipairs(hunks) do
@@ -511,6 +622,9 @@ function M.open_diff_buffer(filename)
           return
         end
       end
+      -- Cursor not in any hunk: just open the file
+      vim.cmd.edit(target_file)
+      vim.cmd("normal! zz")
     end, vim.tbl_extend("force", kopts, { desc = "Jump to file", nowait = true }))
 
     -- Stage the hunk under cursor, then jump to the next hunk
