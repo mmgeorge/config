@@ -1,0 +1,63 @@
+// Place your key bindings in this file to override the defaults
+[
+  {
+    "key": "shift+cmd+. shift+cmd+.",
+    "command": "workbench.action.debug.continue",
+    "when": "debugState == 'stopped'"
+  },
+  {
+    "key": "f5",
+    "command": "-workbench.action.debug.continue",
+    "when": "debugState == 'stopped'"
+  },
+
+{
+  "key": "tab",
+  "command": "-acceptSelectedSuggestion",
+  "when": "suggestWidgetHasFocusedSuggestion && suggestWidgetVisible && textInputFocus"
+},
+{
+  "key": "tab",
+  "command": "jumpToNextSnippetPlaceholder",
+  "when": "editorTextFocus && hasNextTabstop"
+},
+{
+  "key": "shift+tab",
+  "command": "jumpToPrevSnippetPlaceholder",
+  "when": "editorTextFocus && hasPrevTabstop"
+},
+ {
+  "key": "up",
+  "command": "selectPrevSuggestion",
+  "when": "suggestWidgetVisible && textInputFocus"
+},
+{
+  "key": "down",
+  "command": "selectNextSuggestion",
+  "when": "suggestWidgetVisible && textInputFocus"
+},
+  // Accept with CR
+  { "key": "enter", "command": "acceptSelectedSuggestion", "when": "suggestWidgetVisible" },
+
+  // C-e to hide
+  { "key": "ctrl+e", "command": "hideSuggestWidget", "when": "suggestWidgetVisible" },
+
+  // C-l to trigger/show docs
+  { "key": "ctrl+l", "command": "toggleSuggestionDetails", "when": "suggestWidgetVisible" },
+  { "key": "ctrl+l", "command": "editor.action.triggerSuggest", "when": "editorTextFocus && !suggestWidgetVisible" },
+
+  // C-p / C-n navigation
+  { "key": "ctrl+p", "command": "selectPrevSuggestion", "when": "suggestWidgetMultipleSuggestions && suggestWidgetVisible" },
+  { "key": "ctrl+n", "command": "selectNextSuggestion", "when": "suggestWidgetMultipleSuggestions && suggestWidgetVisible" },
+
+  // C-b / C-f scroll docs
+  { "key": "ctrl+b", "command": "selectPrevPageSuggestion", "when": "suggestWidgetVisible" },
+  { "key": "ctrl+f", "command": "selectNextPageSuggestion", "when": "suggestWidgetVisible" },
+
+  // C-k signature help
+  { "key": "ctrl+k", "command": "editor.action.triggerParameterHints", "when": "editorTextFocus" },
+
+  // Tab for snippets
+  { "key": "tab", "command": "jumpToNextSnippetPlaceholder", "when": "editorTextFocus && inSnippetMode" },
+  { "key": "shift+tab", "command": "jumpToPrevSnippetPlaceholder", "when": "editorTextFocus && inSnippetMode" }
+]

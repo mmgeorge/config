@@ -26,6 +26,15 @@ return {
     priority = 1000,
     lazy = false,
     init = function ()
+      vim.api.nvim_create_autocmd("BufEnter", {
+        callback = function()
+          local root = Snacks.git.get_root()
+          if root then
+            vim.fn.chdir(root)
+          end
+        end,
+      })
+
       vim.api.nvim_create_user_command('Notifications', function(_opts)
         Snacks.notifier.show_history()
       end, { desc = 'Get notification history (on)', nargs = '*' })

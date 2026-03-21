@@ -1,0 +1,8 @@
+*
+
+!User/
+!User/settings.json
+!User/keybindings.json
+!User/extensions.txt
+!User/snippets/
+!User/snippets/**

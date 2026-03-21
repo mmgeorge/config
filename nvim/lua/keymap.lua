@@ -80,6 +80,34 @@ k.keymap('n', '<', forward)
 k.keymap({ 'n', 'x' }, 'k', up)
 k.keymap({ 'n', 'x' }, 'l', down)
 
+if vim.g.vscode then
+  local vscode = require('vscode')
+  k.keymap({'n', 'x'}, 'k', function()
+    vscode.action('editorScroll', { args = { to = 'up', by = 'line', value = 10 } })
+  end)
+  k.keymap({'n', 'x'}, 'l', function()
+    vscode.action('editorScroll', { args = { to = 'down', by = 'line', value = 10 } })
+  end)
+
+  vim.keymap.set('n', 'oh', function()
+    vscode.action('workbench.action.quickOpen')
+  end)
+
+  vim.keymap.set('n', 'ot', function()
+    vscode.action('swiper.swiper')
+  end)
+
+  vim.keymap.set('n', 'os', function()
+    vscode.action('quick-tab-search.showTabs')
+  end)
+
+  vim.keymap.set('n', 'or', function()
+    vscode.action('file-browser.open')
+  end)
+
+end
+
+
 vim.api.nvim_command(":nnoremap " .. '(' .. ' ' .. '%')
 vim.api.nvim_command(":xnoremap " .. '(' .. ' ' .. '%')
 vim.api.nvim_command(":onoremap " .. '(' .. ' ' .. '%')

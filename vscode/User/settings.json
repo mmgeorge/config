@@ -1,0 +1,33 @@
+{
+  "github.copilot.nextEditSuggestions.enabled": false,
+  "chat.useAgentSkills": false,
+  "editor.minimap.enabled": false,
+  "errorLens.messageBackgroundMode": "none",
+  "errorLens.enabledDiagnosticLevels": ["error", "warning"],
+  "workbench.colorCustomizations": {
+    "editorInfo.foreground": "#00000000",
+    "editorHint.foreground": "#00000000",
+    "editorInfo.border": "#00000000",
+    "editorHint.border": "#00000000"
+  },
+
+  "editor.hover.enabled": "off",
+  "editor.parameterHints.enabled": false,
+  "editor.inlineSuggest.enabled": true,
+  "editor.suggest.preview": true,
+  "editor.autoClosingBrackets": "never",
+  "editor.autoClosingQuotes": "never",
+  "editor.suggestSelection": "first",
+  "editor.suggest.localityBonus": true,
+  "extensions.experimental.affinity": {
+    "asvetliakov.vscode-neovim": 1
+  },
+  "github.copilot.enable": {
+    "*": false,
+    "plaintext": false,
+    "markdown": false,
+    "scminput": false,
+    "typescript": false
+  },
+  "jupyter.jupyterLaunchTimeout": 600000
+}

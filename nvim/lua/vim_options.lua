@@ -216,11 +216,3 @@ vim.api.nvim_create_autocmd({ 'VimLeavePre' }, {
 -- })
 
 -- Set working directory on bufenter to the git root of that file.
-vim.api.nvim_create_autocmd("BufEnter", {
-  callback = function()
-    local root = Snacks.git.get_root()
-    if root then
-      vim.fn.chdir(root)
-    end
-  end,
-})
