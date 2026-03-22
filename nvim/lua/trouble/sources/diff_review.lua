@@ -173,11 +173,6 @@ function M.open()
       end
       vim.wo[view.win.win].winbar = winbar
       M.auto_preview(view)
-      view.win:on("WinEnter", function()
-        if not view.closed then
-          M.auto_preview(view)
-        end
-      end)
       -- Clean up diff buffers when Trouble closes
       view.win:on("WinClosed", function()
         M._cleanup_diff_buffers()
@@ -537,6 +532,16 @@ function M.open_diff_buffer(filename)
     M._diff_bufs[key] = buf
     M._buf_filename[buf] = filename
 
+    -- Refresh diff content when entering the buffer (e.g., after editing the real file)
+    vim.api.nvim_create_autocmd("BufEnter", {
+      buffer = buf,
+      callback = function()
+        if vim.api.nvim_buf_is_valid(buf) and M._buf_filename[buf] then
+          M._refresh_diff_buffer(buf, M._buf_filename[buf])
+        end
+      end,
+    })
+
 
     local kopts = { buffer = buf, silent = true }
 
@@ -580,6 +585,53 @@ function M.open_diff_buffer(filename)
 
       local hunks = M._buf_hunks[buf]
       local cursor = M._buf_saved_cursor[buf][1]
+      local raw_col = M._buf_saved_cursor[buf][2] or 0
+      -- Adjust column for the Snacks diff gutter.
+      -- The gutter (line numbers + prefix) is rendered as virtual text
+      -- overlays, but the buffer text has matching spaces as padding.
+      -- The padding width = all leading spaces on a code line.
+      -- To distinguish gutter padding from code indentation, check a line
+      -- that has actual code (non-space after the gutter). The gutter width
+      -- is the same for all lines in a hunk, so find it from any code line.
+      local gutter_width = 0
+      if hunks then
+        for _, h in ipairs(hunks) do
+          if cursor >= h.start_line and cursor <= h.end_line then
+            -- Check lines in this hunk for a non-empty code line
+            for l = h.start_line + 1, h.end_line do
+              local line = vim.api.nvim_buf_get_lines(buf, l - 1, l, false)[1] or ""
+              -- The buffer line format is: [gutter spaces][code]
+              -- Gutter spaces are the overlay padding. We need to find
+              -- where the overlay ends. The overlay covers line_col + prefix_col
+              -- characters. Look for the pattern: spaces followed by code.
+              -- Since we can't distinguish gutter from indent, use the
+              -- diff line to find the code offset.
+              local diff_lines_list = {}
+              local found = false
+              for dl in h.diff:gmatch("[^\n]+") do
+                if found then
+                  diff_lines_list[#diff_lines_list + 1] = dl
+                elseif dl:match("^@@") then
+                  found = true
+                end
+              end
+              local dl_idx = l - h.start_line
+              if dl_idx >= 1 and dl_idx <= #diff_lines_list then
+                local diff_line = diff_lines_list[dl_idx]
+                -- diff_line has prefix (+/-/space) then code
+                local code = diff_line:sub(2) -- strip prefix
+                local code_pos = line:find(vim.pesc(code:sub(1, 20)), 1, true)
+                if code_pos then
+                  gutter_width = code_pos - 1
+                  break
+                end
+              end
+            end
+            break
+          end
+        end
+      end
+      local cursor_col = math.max(0, raw_col - gutter_width)
 
       -- No hunks (e.g. "No changes" / empty new file): just open the file
       if not hunks or #hunks == 0 then
@@ -601,7 +653,7 @@ function M.open_diff_buffer(filename)
           if offset_in_hunk == 0 then
             -- On the @@ line itself, jump to hunk start
             vim.cmd.edit(target_file)
-            pcall(vim.api.nvim_win_set_cursor, 0, { new_start, 0 })
+            pcall(vim.api.nvim_win_set_cursor, 0, { new_start, cursor_col })
             vim.cmd("normal! zz")
             return
           end
@@ -635,7 +687,7 @@ function M.open_diff_buffer(filename)
           vim.cmd.edit(target_file)
           local max_line = vim.api.nvim_buf_line_count(0)
           local target_line = math.min(last_valid_line, max_line)
-          pcall(vim.api.nvim_win_set_cursor, 0, { target_line, 0 })
+          pcall(vim.api.nvim_win_set_cursor, 0, { target_line, cursor_col })
           vim.cmd("normal! zz")
           return
         end
@@ -944,14 +996,10 @@ function M.auto_preview(view)
     local item = loc.item
     local filename = item.filename
     if not filename then return end
-    if not (M._file_diffs and M._file_diffs[filename]) then return end
 
     local diff_buf = M.open_diff_buffer(filename)
-    local need_refresh = vim.api.nvim_win_get_buf(win) ~= diff_buf
     vim.api.nvim_win_set_buf(win, diff_buf)
-    if need_refresh then
-      M._refresh_diff_buffer(diff_buf, filename)
-    end
+    M._refresh_diff_buffer(diff_buf, filename)
 
     -- Find the matching hunk in the diff buffer by comparing diff text
     local hunks = M._buf_hunks[diff_buf]
@@ -980,7 +1028,7 @@ function M.auto_preview(view)
   -- File group header: show the fancy diff buffer
   if loc and loc.node and loc.node.item then
     local filename = loc.node.item.filename
-    if not (M._file_diffs and M._file_diffs[filename]) then return end
+    if not filename then return end
 
     local buf = M.open_diff_buffer(filename)
     vim.api.nvim_win_set_buf(win, buf)
