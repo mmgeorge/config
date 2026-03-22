@@ -165,6 +165,13 @@ function M.open()
   if view then
     view.first_render:next(function()
       view:fold_level({ level = 1 })
+      -- Show hint + branch in the winbar
+      local branch = vim.trim(vim.fn.systemlist({ "git", "rev-parse", "--abbrev-ref", "HEAD" })[1] or "")
+      local winbar = " %#Comment#<Tab>%* toggle | %#Comment#S%* stage | %#Comment#U%* unstage | %#Comment#<CR>%* jump | %#Comment#q%* close | %#Comment#?%* help"
+      if branch ~= "" then
+        winbar = winbar .. "%=" .. "%#Keyword# " .. branch .. " %*"
+      end
+      vim.wo[view.win.win].winbar = winbar
       M.auto_preview(view)
       view.win:on("WinEnter", function()
         if not view.closed then
@@ -174,6 +181,17 @@ function M.open()
       -- Clean up diff buffers when Trouble closes
       view.win:on("WinClosed", function()
         M._cleanup_diff_buffers()
+      end)
+      view.win:on("BufWipeout", function()
+        M._cleanup_diff_buffers()
+      end)
+      -- Also watch for view.closed flag
+      view.win:on("WinLeave", function()
+        vim.defer_fn(function()
+          if view.closed then
+            M._cleanup_diff_buffers()
+          end
+        end, 100)
       end)
     end)
   end

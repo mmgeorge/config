@@ -148,6 +148,21 @@ return {
           preview = { type = "main", scratch = false },
           focus = true,
           keys = {
+            -- Close trouble and clean up diff buffers
+            q = {
+              action = function(self)
+                self:close()
+                require("trouble.sources.diff_review")._cleanup_diff_buffers()
+              end,
+              desc = "Close",
+            },
+            ["<esc>"] = {
+              action = function(self)
+                self:close()
+                require("trouble.sources.diff_review")._cleanup_diff_buffers()
+              end,
+              desc = "Close",
+            },
             -- Override s/t to use raw cursor movement so group headers
             -- (file rows) are reachable, and show diff preview on file rows
             s = {
