@@ -21,8 +21,7 @@ config.default_cwd                          = "D:/"
 config.default_prog = { "D:/config/windows/nudevcmd.bat" }
 config.animation_fps = 30
 config.scrollback_lines = 3000
-config.use_ime = false
-config.enable_kitty_keyboard = true
+-- config.enable_kitty_keyboard = true
 
 -- config.default_prog = { "nu" }
 -- config.default_prog                         = {
