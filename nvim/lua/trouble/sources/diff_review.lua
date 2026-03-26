@@ -380,6 +380,16 @@ function M.get(cb, _ctx)
 
   Item.add_text(items, { mode = "after" })
   cb(items)
+
+  -- Pre-render all diff buffers so file switching is instant
+  vim.schedule(function()
+    for filename, diff_text in pairs(M._file_diffs) do
+      if diff_text and diff_text ~= "" then
+        local buf = M.open_diff_buffer(filename)
+        M._refresh_diff_buffer(buf, filename)
+      end
+    end
+  end)
 end
 
 -- Cache of diff preview items keyed by filename
@@ -905,12 +915,21 @@ end
 --- Staged hunks get auto-folded.
 ---@param buf number
 ---@param filename string
+-- Track what was last rendered per buffer to avoid re-rendering same data
+M._buf_last_rendered = {}
+
 function M._refresh_diff_buffer(buf, filename)
   -- Use cached diff data from M.get() instead of re-running git
   local diff_text = M._file_diffs and M._file_diffs[filename]
   local staged_flags = M._file_hunk_staged and M._file_hunk_staged[filename]
 
   if diff_text and diff_text ~= "" then
+    -- Skip re-render if already rendered with the same data
+    if M._buf_last_rendered[buf] == diff_text and M._buf_hunks[buf] then
+      return
+    end
+    M._buf_last_rendered[buf] = diff_text
+
     render_fancy_diff(buf, diff_text, staged_flags)
     local hunk_map = M._compute_hunk_map(diff_text)
     -- Auto-fold staged hunks
@@ -957,10 +976,10 @@ function M.refresh_open_diff_buffer(filename)
       diffs[#diffs + 1] = h.diff; flags[#flags + 1] = true
     end
   end
-  -- Update the cache
+  -- Update the cache and invalidate render cache
   M._file_diffs[filename] = #diffs > 0 and table.concat(diffs, "\n") or nil
   M._file_hunk_staged[filename] = #flags > 0 and flags or nil
-  -- Now refresh from updated cache
+  M._buf_last_rendered[buf] = nil  -- force re-render
   M._refresh_diff_buffer(buf, filename)
 end
 

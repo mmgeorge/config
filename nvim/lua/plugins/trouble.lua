@@ -140,7 +140,7 @@ return {
           events = { "BufWritePost" },
           groups = {
             { "item.category" },
-            { "filename", format = "{item.file_check} {file_icon} {basename} {item.stats}" },
+            { "filename", format = "{item.file_check} {file_icon} {filename} {item.stats}" },
           },
           sort = { "item.category", "filename", "pos" },
           format = "{item.check} {item.hunk_header} {item.context_text}",
