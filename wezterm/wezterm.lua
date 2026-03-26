@@ -5,9 +5,25 @@ local action                                = wezterm.action
 -- This will hold the configuration.
 local config                                = wezterm.config_builder()
 
-config.default_cwd                          = "D:/"
+config.front_end = "WebGpu"
+config.webgpu_power_preference = "HighPerformance"
+-- config.webgpu_preferred_adapter = nil
+if wezterm.target_triple:find("windows") then
+  for _, gpu in ipairs(wezterm.gui.enumerate_gpus()) do
+    if gpu.backend == "Dx12" then
+      config.webgpu_preferred_adapter = gpu
+      break
+    end
+  end
+end
 
+config.default_cwd                          = "D:/"
 config.default_prog = { "D:/config/windows/nudevcmd.bat" }
+config.animation_fps = 30
+config.scrollback_lines = 3000
+config.use_ime = false
+config.enable_kitty_keyboard = true
+
 -- config.default_prog = { "nu" }
 -- config.default_prog                         = {
 --   "C:/Program Files/PowerShell/7/pwsh.exe",
@@ -112,7 +128,9 @@ wezterm.on('format-tab-title', function(tab, tabs, panes, config, hover, max_wid
 
     -- Match everything after the last slash
     local last_dir = path:match("([^/]+)$")
-    return " " .. last_dir .. " "
+    if last_dir then
+      return " " .. last_dir .. " "
+    end
   end
 
   return " " .. user_title .. " "
