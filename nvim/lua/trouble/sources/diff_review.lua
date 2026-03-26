@@ -26,6 +26,8 @@ local function setup_bg_highlights()
   -- Fg-only variants for range numbers in headers (no bg)
   vim.api.nvim_set_hl(0, "DiffReviewAddRange", { fg = "#50fa7b" })
   vim.api.nvim_set_hl(0, "DiffReviewDeleteRange", { fg = "#ff5555" })
+  -- Subtle gray bg for hunk header lines in the diff buffer
+  vim.api.nvim_set_hl(0, "SnacksDiffHunkHeader", { bg = "#1e1e1e" })
 end
 setup_bg_highlights()
 
@@ -1181,6 +1183,14 @@ function M._refresh_diff_buffer(buf, filename)
       end
     end
     M._buf_hunks[buf] = hunk_map
+    -- Highlight @@ header lines with subtle gray background
+    local header_ns = vim.api.nvim_create_namespace("diff_review_headers")
+    vim.api.nvim_buf_clear_namespace(buf, header_ns, 0, -1)
+    for _, h in ipairs(hunk_map) do
+      pcall(vim.api.nvim_buf_set_extmark, buf, header_ns, h.start_line - 1, 0, {
+        line_hl_group = "SnacksDiffHunkHeader",
+      })
+    end
     M._render_with_folds(buf)
   else
     vim.bo[buf].modifiable = true
