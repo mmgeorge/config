@@ -138,6 +138,84 @@ local function get_hunks(cwd, staged)
   return parse_diff(table.concat(result, "\n"), staged)
 end
 
+--- Compute treesitter-based scope context for a hunk at a given line.
+--- Returns a string like "MyClass.my_method" or nil if no context found.
+---@param filename string absolute path
+---@param line number 1-based line number
+---@return string?
+function M.compute_hunk_context(filename, line)
+  -- Find or load the buffer
+  local buf = vim.fn.bufnr(filename)
+  if buf == -1 then
+    buf = vim.fn.bufadd(filename)
+    if buf == -1 then return nil end
+    vim.fn.bufload(buf)
+  end
+  if not vim.api.nvim_buf_is_loaded(buf) then
+    vim.fn.bufload(buf)
+  end
+
+  -- Get treesitter language
+  local ft = vim.bo[buf].filetype
+  if ft == "" then
+    ft = vim.filetype.match({ filename = filename }) or ""
+  end
+  local lang = vim.treesitter.language.get_lang(ft)
+  if not lang then return nil end
+
+  -- Try to load our diff_context query
+  local ok, query = pcall(vim.treesitter.query.get, lang, "diff_context")
+  if not ok or not query then return nil end
+
+  -- Get parser and parse
+  local pok, parser = pcall(vim.treesitter.get_parser, buf, lang)
+  if not pok or not parser then return nil end
+  local trees = parser:parse()
+  if not trees or #trees == 0 then return nil end
+
+  -- Find all @scope nodes that contain the target line (0-indexed)
+  local target = line - 1
+  local scopes = {}
+  for id, node in query:iter_captures(trees[1]:root(), buf) do
+    if query.captures[id] == "scope" then
+      local sr, _, er, _ = node:range()
+      if sr <= target and er >= target then
+        scopes[#scopes + 1] = { node = node, sr = sr, er = er }
+      end
+    end
+  end
+
+  if #scopes == 0 then return nil end
+
+  -- Sort by start row descending (innermost scope first)
+  table.sort(scopes, function(a, b) return a.sr > b.sr end)
+
+  -- Limit to 3 levels max
+  local max_depth = math.min(#scopes, 3)
+
+  -- Collect names from outermost to innermost
+  local names = {}
+  for i = max_depth, 1, -1 do
+    local scope = scopes[i]
+    -- Find @scope.name within this scope's node
+    for cid, cnode in query:iter_captures(scope.node, buf) do
+      if query.captures[cid] == "scope.name" then
+        local name_text = vim.treesitter.get_node_text(cnode, buf)
+        if name_text and name_text ~= "" then
+          names[#names + 1] = name_text
+        end
+        break
+      end
+    end
+  end
+
+  if #names == 0 then return nil end
+  return table.concat(names, ".")
+end
+
+-- Cache for treesitter context per file (cleared on refresh)
+M._ts_context_cache = {}
+
 M.config = {
   modes = {
     diff_review = {
@@ -210,6 +288,7 @@ end
 ---@param cb fun(items: trouble.Item[])
 ---@param _ctx trouble.Source.ctx
 function M.get(cb, _ctx)
+  M._ts_context_cache = {} -- clear treesitter context cache on refresh
   local cwd = vim.fn.systemlist({ "git", "rev-parse", "--show-toplevel" })[1]
   if vim.v.shell_error ~= 0 or not cwd then
     cb({})
@@ -298,7 +377,18 @@ function M.get(cb, _ctx)
 
   local items = {}
   for _, hunk in ipairs(all_hunks) do
+    local filename = vim.fn.fnamemodify(cwd .. "/" .. hunk.file, ":p")
+    -- Use treesitter scope context if available, fall back to git's @@ context
     local context_text = hunk.context or ""
+    local cache_key = filename .. ":" .. hunk.pos
+    if not M._ts_context_cache[cache_key] then
+      local ts_ctx = M.compute_hunk_context(filename, hunk.pos)
+      M._ts_context_cache[cache_key] = ts_ctx or false -- false = no context found
+    end
+    local cached = M._ts_context_cache[cache_key]
+    if cached and cached ~= false then
+      context_text = cached
+    end
     local header = hunk.status or "@@"
     if hunk.diff then
       header = hunk.diff:match("\n(@@[^@]+@@)") or hunk.diff:match("^(@@[^@]+@@)") or "@@"
@@ -314,7 +404,6 @@ function M.get(cb, _ctx)
       file_check = "[ ]"
     end
 
-    local filename = vim.fn.fnamemodify(cwd .. "/" .. hunk.file, ":p")
     items[#items + 1] = Item.new({
       source = "diff_review",
       filename = filename,
@@ -450,7 +539,7 @@ end
 --- @param buf number
 --- @param diff_text string
 --- @param hunk_staged? boolean[] staged status per hunk (in order)
-local function render_fancy_diff(buf, diff_text, hunk_staged)
+local function render_fancy_diff(buf, diff_text, hunk_staged, filename)
   vim.bo[buf].modifiable = true
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, {})
   vim.bo[buf].modifiable = false
@@ -475,15 +564,32 @@ local function render_fancy_diff(buf, diff_text, hunk_staged)
     local block_ctx = ctx_base:extend({ block = block })
     for _, hunk in ipairs(block.hunks) do
       hunk_idx = hunk_idx + 1
-      -- Checkbox + @@ separator
+      -- Checkbox + @@ separator with treesitter context
       local range_line = hunk.diff[1] or "@@"
       local range_only = range_line:match("^(@@[^@]+@@)") or range_line
+      -- Get the new-file start line for treesitter context lookup
+      local hunk_line = tonumber(range_line:match("%+(%d+)")) or 1
+      local ts_context = nil
+      if filename then
+        local cache_key = filename .. ":" .. hunk_line
+        if M._ts_context_cache[cache_key] == nil then
+          M._ts_context_cache[cache_key] = M.compute_hunk_context(filename, hunk_line) or false
+        end
+        local cached = M._ts_context_cache[cache_key]
+        if cached and cached ~= false then
+          ts_context = cached
+        end
+      end
+      local header_text = range_only
+      if ts_context then
+        header_text = range_only .. " " .. ts_context
+      end
       local is_staged = hunk_staged and hunk_staged[hunk_idx] or false
       local check = is_staged and "[x] " or "[ ] "
       local check_hl = is_staged and "DiagnosticOk" or "Comment"
       ret[#ret + 1] = {
         { check, check_hl },
-        { range_only, "SnacksDiffHunkHeader" },
+        { header_text, "SnacksDiffHunkHeader" },
       }
 
       local hunk_ctx = block_ctx:extend({ hunk = hunk })
@@ -930,7 +1036,7 @@ function M._refresh_diff_buffer(buf, filename)
     end
     M._buf_last_rendered[buf] = diff_text
 
-    render_fancy_diff(buf, diff_text, staged_flags)
+    render_fancy_diff(buf, diff_text, staged_flags, filename)
     local hunk_map = M._compute_hunk_map(diff_text)
     -- Auto-fold staged hunks
     if staged_flags then

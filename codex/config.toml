@@ -26,7 +26,20 @@ trust_level = "trusted"
 type = "http"
 url = "https://learn.microsoft.com/api/mcp"
 
+[mcp_servers.docs-mcp]
+type = "stdio"
+command = "docs-mcp"
+args = []
+
+[mcp_servers.google-dev-knowledge]
+type = "http"
+url = "https://developerknowledge.googleapis.com/mcp"
+
+[mcp_servers.google-dev-knowledge.env_http_headers]
+"X-Goog-Api-Key" = "GOOG_MCP_API_KEY"
+
 [mcp_servers.chrome-devtools]
+type = "stdio"
 command = "npx"
 args = ["-y", "chrome-devtools-mcp@latest", "--channel=beta"]
 
