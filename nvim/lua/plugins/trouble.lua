@@ -140,10 +140,24 @@ return {
           events = { "BufWritePost" },
           groups = {
             { "item.category" },
-            { "filename", format = "{item.file_check} {file_icon} {filename} {item.stats}" },
+            { "filename", format = "{item.file_check} {file_icon} {item.file_added_pad} {item.file_removed_pad} {filename}" },
           },
           sort = { "item.category", "filename", "pos" },
-          format = "{item.check} {item.hunk_header} {item.context_text}",
+          format = "{item.check}  {item.added_pad} {item.removed_pad} {item.context_text}",
+          formatters = {
+            ["item.added_pad"] = function(ctx)
+              return { text = string.format("%3d", ctx.item.item.added_pad or 0), hl = "DiffReviewAddRange" }
+            end,
+            ["item.removed_pad"] = function(ctx)
+              return { text = string.format("%3d", ctx.item.item.removed_pad or 0), hl = "DiffReviewDeleteRange" }
+            end,
+            ["item.file_added_pad"] = function(ctx)
+              return { text = string.format("%3d", ctx.item.item.file_added or 0), hl = "DiffReviewAddRange" }
+            end,
+            ["item.file_removed_pad"] = function(ctx)
+              return { text = string.format("%3d", ctx.item.item.file_removed or 0), hl = "DiffReviewDeleteRange" }
+            end,
+          },
           auto_preview = false,
           preview = { type = "main", scratch = false },
           focus = true,
