@@ -8,14 +8,14 @@ local config                                = wezterm.config_builder()
 config.front_end = "WebGpu"
 config.webgpu_power_preference = "HighPerformance"
 -- config.webgpu_preferred_adapter = nil
-if wezterm.target_triple:find("windows") then
-  for _, gpu in ipairs(wezterm.gui.enumerate_gpus()) do
-    if gpu.backend == "Dx12" then
-      config.webgpu_preferred_adapter = gpu
-      break
-    end
-  end
-end
+-- if wezterm.target_triple:find("windows") then
+--   for _, gpu in ipairs(wezterm.gui.enumerate_gpus()) do
+--     if gpu.backend == "Dx12" then
+--       config.webgpu_preferred_adapter = gpu
+--       break
+--     end
+--   end
+-- end
 
 config.default_cwd                          = "D:/"
 config.default_prog = { "D:/config/windows/nudevcmd.bat" }
