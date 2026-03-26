@@ -36,12 +36,20 @@ type = "http"
 url = "https://developerknowledge.googleapis.com/mcp"
 
 [mcp_servers.google-dev-knowledge.env_http_headers]
-"X-Goog-Api-Key" = "GOOG_MCP_API_KEY"
+"X-Goog-Api-Key" = "GOOGLE_DEV_KNOWLEDGE_MCP_KEY"
 
 [mcp_servers.chrome-devtools]
 type = "stdio"
 command = "npx"
 args = ["-y", "chrome-devtools-mcp@latest", "--channel=beta"]
+
+[mcp_servers.github]
+type = "stdio"
+command = "github-mcp-server"
+args = ["stdio", "--toolsets=context,actions,discussions,issues,labels,notifications,orgs,projects,pull_requests,repos,users"]
+
+[mcp_servers.github.env]
+GITHUB_PERSONAL_ACCESS_TOKEN = "GITHUB_AGENT_PERSONAL_ACCESS_TOKEN"
 
 [mcp_servers.hf-mcp-server]
 type = "http"
