@@ -51,6 +51,8 @@ def get_copilot_instruction_dirs [] {
 def --wrapped co [...args] {
     let instruction_dirs = (get_copilot_instruction_dirs)
     let copilot_args = [
+        --no-auto-update
+        --yolo
         --allow-tool 'shell(python)'
         --allow-tool 'shell(python:*)'
         --allow-tool 'shell(pnpm:*)'
@@ -92,6 +94,8 @@ def --wrapped co [...args] {
         --allow-tool 'github-mcp-enterprise'
         --allow-tool 'github-mcp-server'
         --allow-tool 'microsoft-learn'
+        --deny-tool 'shell(git commit)'
+        --deny-tool 'shell(git commit:*)'
         --deny-tool 'shell(gh)'
         --deny-tool 'shell(gh:*)'
         --deny-tool 'shell(az)'
