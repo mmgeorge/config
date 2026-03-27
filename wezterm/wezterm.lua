@@ -20,6 +20,7 @@ config.webgpu_power_preference = "HighPerformance"
 config.default_cwd                          = "D:/"
 config.default_prog = { "D:/config/windows/nudevcmd.bat" }
 config.animation_fps = 30
+config.max_fps = 120
 config.scrollback_lines = 3000
 -- config.enable_kitty_keyboard = true
 

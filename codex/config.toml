@@ -9,8 +9,6 @@ disable_paste_burst = true
 service_tier = "fast"
 
 [features]
-experimental_windows_sandbox = true
-elevated_windows_sandbox = true
 powershell_utf8 = true
 steer = true
 multi_agent = true
@@ -31,33 +29,30 @@ trust_level = "trusted"
 [projects.'\\?\D:\code\papers']
 trust_level = "trusted"
 
+[projects.'D:\code']
+trust_level = "trusted"
+
 [notice.model_migrations]
 "gpt-5.2-codex" = "gpt-5.3-codex"
 "gpt-5.3-codex" = "gpt-5.4"
 
 [mcp_servers.microsoft-learn]
-type = "http"
 url = "https://learn.microsoft.com/api/mcp"
 
 [mcp_servers.docs-mcp]
-type = "stdio"
 command = "docs-mcp"
-args = []
 
 [mcp_servers.google-dev-knowledge]
-type = "http"
 url = "https://developerknowledge.googleapis.com/mcp"
 
 [mcp_servers.google-dev-knowledge.env_http_headers]
-"X-Goog-Api-Key" = "GOOGLE_DEV_KNOWLEDGE_MCP_KEY"
+X-Goog-Api-Key = "GOOGLE_DEV_KNOWLEDGE_MCP_KEY"
 
 [mcp_servers.chrome-devtools]
-type = "stdio"
 command = "npx"
 args = ["-y", "chrome-devtools-mcp@latest", "--channel=beta"]
 
 [mcp_servers.github]
-type = "stdio"
 command = "github-mcp-server"
 args = ["stdio", "--toolsets=context,actions,discussions,issues,labels,notifications,orgs,projects,pull_requests,repos,users"]
 
@@ -65,5 +60,16 @@ args = ["stdio", "--toolsets=context,actions,discussions,issues,labels,notificat
 GITHUB_PERSONAL_ACCESS_TOKEN = "GITHUB_AGENT_PERSONAL_ACCESS_TOKEN"
 
 [mcp_servers.hf-mcp-server]
-type = "http"
 url = "https://huggingface.co/mcp?login"
+
+[mcp_servers.openaiDeveloperDocs]
+url = "https://developers.openai.com/mcp"
+
+[mcp_servers.openaiDeveloperDocs.tools.search_openai_docs]
+approval_mode = "approve"
+
+[mcp_servers.openaiDeveloperDocs.tools.fetch_openai_doc]
+approval_mode = "approve"
+
+[windows]
+sandbox = "elevated"
