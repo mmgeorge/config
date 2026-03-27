@@ -1,6 +1,12 @@
 model = "gpt-5.4"
 model_reasoning_effort = "medium"
+model_reasoning_summary = "detailed"
+show_raw_agent_reasoning = true
+plan_mode_reasoning_effort = "high"
+hide_agent_reasoning = false
 personality = "pragmatic"
+disable_paste_burst = true
+service_tier = "fast"
 
 [features]
 experimental_windows_sandbox = true
@@ -8,6 +14,7 @@ elevated_windows_sandbox = true
 powershell_utf8 = true
 steer = true
 multi_agent = true
+enable_fanout = true
 
 [projects.'\\?\D:\code\ferrous']
 trust_level = "trusted"
@@ -16,6 +23,12 @@ trust_level = "trusted"
 trust_level = "trusted"
 
 [projects.'\\?\D:\config']
+trust_level = "trusted"
+
+[projects.'\\?\D:\code\codex']
+trust_level = "trusted"
+
+[projects.'\\?\D:\code\papers']
 trust_level = "trusted"
 
 [notice.model_migrations]
