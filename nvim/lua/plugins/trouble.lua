@@ -7,6 +7,10 @@ return {
     config = function(_, opts)
       require("trouble").setup(opts)
       vim.api.nvim_create_user_command("DiffReview", function()
+        local sources = require("trouble.sources")
+        package.loaded["trouble.sources.diff_review"] = nil
+        sources.sources.diff_review = nil
+        require("trouble").setup(opts)
         require("trouble.sources.diff_review").open()
       end, { desc = "Review git diff with file/hunk tree" })
     end,
@@ -140,7 +144,10 @@ return {
           events = { "BufWritePost" },
           groups = {
             { "item.category" },
-            { "filename", format = "{item.file_check} {file_icon} {item.file_added_pad} {item.file_removed_pad} {filename}" },
+            {
+              "filename",
+              format = "{item.file_check} {file_icon} {item.file_added_pad} {item.file_removed_pad} {dirname:DiffReviewDirName}{basename:DiffReviewFileName}",
+            },
           },
           sort = { "item.category", "filename", "pos" },
           format = "{item.check}  {item.added_pad} {item.removed_pad} {item.context_text}",

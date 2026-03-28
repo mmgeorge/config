@@ -17,6 +17,8 @@ local function setup_bg_highlights()
   end
   local add_bg = get_bg("DiffAdd") or "#002200"
   local del_bg = get_bg("DiffDelete") or "#220000"
+  local normal = vim.api.nvim_get_hl(0, { name = "Normal", link = false })
+  local header_fg = normal.fg or "#c0c0c0"
   vim.api.nvim_set_hl(0, "DiffReviewAddBg", { bg = add_bg })
   vim.api.nvim_set_hl(0, "DiffReviewDeleteBg", { bg = del_bg })
   vim.api.nvim_set_hl(0, "DiffReviewAddLineNr", { fg = "#50fa7b", bg = add_bg, bold = true })
@@ -26,8 +28,25 @@ local function setup_bg_highlights()
   -- Fg-only variants for range numbers in headers (no bg)
   vim.api.nvim_set_hl(0, "DiffReviewAddRange", { fg = "#50fa7b" })
   vim.api.nvim_set_hl(0, "DiffReviewDeleteRange", { fg = "#ff5555" })
+  vim.api.nvim_set_hl(0, "DiffReviewDirName", {
+    fg = "#7f8790",
+    nocombine = true,
+    ctermfg = 8,
+  })
+  vim.api.nvim_set_hl(0, "DiffReviewFileName", {
+    fg = "#ffffff",
+    nocombine = true,
+    ctermfg = 15,
+  })
   -- Subtle gray bg for hunk header lines in the diff buffer
   vim.api.nvim_set_hl(0, "SnacksDiffHunkHeader", { bg = "#1e1e1e" })
+  vim.api.nvim_set_hl(0, "DiffReviewHunkHeader", { fg = header_fg, bg = "#1e1e1e", nocombine = true })
+  vim.api.nvim_set_hl(0, "DiffReviewHunkContext", {
+    fg = header_fg,
+    bg = "#1e1e1e",
+    underline = true,
+    nocombine = true,
+  })
 end
 setup_bg_highlights()
 
@@ -243,28 +262,13 @@ end
 -- Cache for treesitter context per file (cleared on refresh)
 M._ts_context_cache = {}
 
-M.config = {
-  modes = {
-    diff_review = {
-      desc = "Diff Review",
-      source = "diff_review",
-      events = { "BufWritePost" },
-      groups = {
-        { "filename", format = "{file_icon} {basename} {item.stats}" },
-      },
-      sort = { "filename", "pos" },
-      format = "{item.check} {item.hunk_header} {item.context_text}",
-      -- Start with groups collapsed
-      auto_preview = true,
-      focus = true,
-    },
-  },
-}
-
-function M.setup() end
+function M.setup()
+  setup_bg_highlights()
+end
 
 --- Open the DiffReview picker. Called from the :DiffReview command.
 function M.open()
+  setup_bg_highlights()
   M._main_win = nil
   local view = require("trouble").open("diff_review")
   if view then
@@ -636,17 +640,18 @@ local function render_fancy_diff(buf, diff_text, hunk_staged, filename)
           counting = true
         end
       end
-      -- Format: [x] +4   -0   MyClass.method
+      -- Format: [x] @@ MyClass.method +4 -0
       local header_parts = {
         { check, check_hl },
-        { string.format("%3d", h_added), "DiffReviewAddRange" },
-        { " ", "SnacksDiffHunkHeader" },
-        { string.format("%3d", h_removed), "DiffReviewDeleteRange" },
-        { " ", "SnacksDiffHunkHeader" },
+        { "@@ ", "DiffReviewHunkHeader" },
       }
       if ts_context then
-        header_parts[#header_parts + 1] = { ts_context, "SnacksDiffHunkHeader" }
+        header_parts[#header_parts + 1] = { ts_context, "DiffReviewHunkContext" }
+        header_parts[#header_parts + 1] = { " ", "DiffReviewHunkHeader" }
       end
+      header_parts[#header_parts + 1] = { ("+%d"):format(h_added), "DiffReviewAddRange" }
+      header_parts[#header_parts + 1] = { " ", "DiffReviewHunkHeader" }
+      header_parts[#header_parts + 1] = { ("-%d"):format(h_removed), "DiffReviewDeleteRange" }
       ret[#ret + 1] = header_parts
 
       local hunk_ctx = block_ctx:extend({ hunk = hunk })
