@@ -6,7 +6,6 @@ plan_mode_reasoning_effort = "high"
 hide_agent_reasoning = false
 personality = "pragmatic"
 disable_paste_burst = true
-service_tier = "fast"
 
 [features]
 powershell_utf8 = true
