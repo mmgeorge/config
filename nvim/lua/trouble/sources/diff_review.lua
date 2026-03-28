@@ -47,6 +47,36 @@ local function count_stats(diff_text)
   return added, removed
 end
 
+---@param filename string
+---@return number?
+local function ensure_file_buffer(filename)
+  local buf = vim.fn.bufnr(filename)
+  if buf == -1 then
+    buf = vim.fn.bufadd(filename)
+    if buf == -1 then
+      return nil
+    end
+  end
+  if not vim.api.nvim_buf_is_loaded(buf) then
+    vim.fn.bufload(buf)
+  end
+  return vim.api.nvim_buf_is_loaded(buf) and buf or nil
+end
+
+---@param filename string
+---@param contents? string[]
+---@return string
+local function detect_filetype(filename, contents)
+  local args = {
+    filename = filename,
+    buf = ensure_file_buffer(filename) or 0,
+  }
+  if contents then
+    args.contents = contents
+  end
+  return vim.filetype.match(args) or ""
+end
+
 --- Parse unified diff output into structured file/hunk data
 ---@param diff_output string
 ---@param staged boolean
@@ -149,21 +179,13 @@ end
 ---@param line number 1-based line number
 ---@return string?
 function M.compute_hunk_context(filename, line)
-  -- Find or load the buffer
-  local buf = vim.fn.bufnr(filename)
-  if buf == -1 then
-    buf = vim.fn.bufadd(filename)
-    if buf == -1 then return nil end
-    vim.fn.bufload(buf)
-  end
-  if not vim.api.nvim_buf_is_loaded(buf) then
-    vim.fn.bufload(buf)
-  end
+  local buf = ensure_file_buffer(filename)
+  if not buf then return nil end
 
   -- Get treesitter language
   local ft = vim.bo[buf].filetype
   if ft == "" then
-    ft = vim.filetype.match({ filename = filename }) or ""
+    ft = detect_filetype(filename)
   end
   local lang = vim.treesitter.language.get_lang(ft)
   if not lang then return nil end
@@ -555,6 +577,10 @@ local function render_fancy_diff(buf, diff_text, hunk_staged, filename)
   vim.bo[buf].modifiable = true
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, {})
   vim.bo[buf].modifiable = false
+  local ft = filename and detect_filetype(filename) or ""
+  if ft ~= "" and vim.bo[buf].filetype ~= ft then
+    vim.bo[buf].filetype = ft
+  end
 
   local snacks_diff = require("snacks.picker.util.diff")
   local H = Snacks.picker.highlight
@@ -624,7 +650,22 @@ local function render_fancy_diff(buf, diff_text, hunk_staged, filename)
       ret[#ret + 1] = header_parts
 
       local hunk_ctx = block_ctx:extend({ hunk = hunk })
-      local hunk_lines = snacks_diff.format_hunk(hunk_ctx)
+      local block_file = block.file
+      local match = vim.filetype.match
+      vim.filetype.match = function(args)
+        if type(args) == "table" and args.buf == nil and args.filename == block_file then
+          return match(vim.tbl_extend("force", args, {
+            filename = filename or block_file,
+            buf = ensure_file_buffer(filename or block_file) or 0,
+          }))
+        end
+        return match(args)
+      end
+      local ok, hunk_lines = pcall(snacks_diff.format_hunk, hunk_ctx)
+      vim.filetype.match = match
+      if not ok then
+        error(hunk_lines)
+      end
       vim.list_extend(ret, hunk_lines)
     end
   end
