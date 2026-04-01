@@ -1,5 +1,5 @@
-model = "gpt-5.4"
-model_reasoning_effort = "medium"
+model = "gpt-5.4-mini"
+model_reasoning_effort = "high"
 model_reasoning_summary = "detailed"
 show_raw_agent_reasoning = true
 plan_mode_reasoning_effort = "high"
@@ -68,6 +68,47 @@ url = "https://developers.openai.com/mcp"
 approval_mode = "approve"
 
 [mcp_servers.openaiDeveloperDocs.tools.fetch_openai_doc]
+approval_mode = "approve"
+
+[mcp_servers.engine]
+command = "D:\\code\\ferrous\\blue\\engine-mcp\\target\\x86_64-pc-windows-msvc\\debug\\engine-mcp.exe"
+enabled_tools = [
+  "detect",
+  "capture_list",
+  "capture_details",
+  "capture_resource_find",
+  "capture_resource_inspect",
+  "capture_resource_uses_get",
+  "capture_event_find",
+  "capture_event_inspect",
+  "capture_buffer_change_events",
+  "capture_buffer_changes_at",
+  "capture_texture_image",
+  "capture_texture_change_events",
+  "capture_texture_changes_at",
+  "perf_guide_counter_search",
+  "perf_guide_category_list",
+  "capture_shader_disassemble",
+  "capture_perf_duration",
+  "capture_perf_counters",
+]
+
+[mcp_servers.engine.env]
+RUST_LOG = "info"
+
+[mcp_servers.engine.tools.detect]
+approval_mode = "approve"
+
+[mcp_servers.engine.tools.capture_list]
+approval_mode = "approve"
+
+[mcp_servers.engine.tools.capture_details]
+approval_mode = "approve"
+
+[mcp_servers.engine.tools.capture_perf_duration]
+approval_mode = "approve"
+
+[mcp_servers.engine.tools.capture_perf_counters]
 approval_mode = "approve"
 
 [windows]
