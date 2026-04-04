@@ -15,8 +15,8 @@ local function adapters()
       background = "gemini",
       commit = {
         name = "gemini",
-        model = "gemini-3-flash-preview",
-        -- reasoning_effort = "minimal",
+        model = "gemini-3.1-flash-lite-preview",
+        reasoning_effort = "none",
       }
     }
   end
@@ -134,32 +134,108 @@ return {
       }
 
     },
-    -- init = function ()
-    --   vim.api.nvim_create_autocmd({ 'BufEnter' }, {
-    --     pattern = "COMMIT_EDITMSG",
-    --     callback = function(args)
-    --       if vim.b[args.buf].ai_commit_generated then return end
-    --       -- Only generate the commit message if the buffer is empty
-    --       if vim.api.nvim_buf_get_lines(0, 0, -1, false)[1] == nil or
-    --           vim.api.nvim_buf_get_lines(0, 0, -1, false)[1] == "" then
-    --         local ok, err = pcall(function()
-    --           require("codecompanion").prompt("xcommit")
-    --           vim.b[args.buf].ai_commit_generated = true
-    --           -- For some reason, codecompanion inline assistant map gets added?
-    --           vim.cmd("mapclear <buffer>")
-    --         end)
-    --         if not ok then
-    --           -- Might not have an LLM setup
-    --           vim.notify("Could not generate commit message" .. tostring(err), vim.log.levels.ERROR)
-    --         end
-    --       end
-    --     end,
-    --   })
-    --
-    -- -- end,
-    -- -- init = function()
-    -- --   require("codecompanion_fidget"):init()
-    -- end,
+    init = function()
+      vim.api.nvim_create_autocmd({ "BufEnter" }, {
+        pattern = "COMMIT_EDITMSG",
+        callback = function(args)
+          if vim.b[args.buf].ai_commit_generated then return end
+
+          local lines = vim.api.nvim_buf_get_lines(args.buf, 0, -1, false)
+          if lines[1] and lines[1] ~= "" then return end
+
+          vim.b[args.buf].ai_commit_generated = true
+
+          local diff = vim.fn.system("git diff --no-ext-diff --staged")
+          if vim.v.shell_error ~= 0 or vim.trim(diff) == "" then return end
+
+          local Background = require("codecompanion.interactions.background")
+          local adapter_config = adapters().commit
+          local adapter_name = type(adapter_config) == "table" and adapter_config.model or adapter_config
+          local background = Background.new({ adapter = adapter_config })
+
+          local spinner = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
+          local notif_id = "commit_msg"
+
+          vim.notify("Generating commit message...", "info", {
+            id = notif_id,
+            title = "commit (" .. adapter_name .. ")",
+            opts = function(notif)
+              notif.icon = spinner[math.floor(vim.uv.hrtime() / (1e6 * 80)) % #spinner + 1]
+            end,
+          })
+
+          background:ask({
+            {
+              role = "system",
+              content = [[You are a precise commit message generator following Conventional Commits.
+Respond with ONLY the commit message — no code blocks, no explanation.
+
+Format:
+<type>: <description>
+
+[body]
+
+Types: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert
+
+Description rules:
+- Imperative mood ("add feature" not "added feature")
+- Lowercase first letter, no trailing period
+- Max 50 characters
+
+Body (optional):
+- Never write a body for chore commits
+- Only include a body for significant changes
+- Explain why, not what. Wrap at 72 chars. Max three lines.]]
+            },
+            {
+              role = "user",
+              content = "Generate a conventional commit message for these staged changes:\n```diff\n" .. diff .. "\n```",
+            },
+          }, {
+            method = "async",
+            silent = true,
+            on_done = function(result)
+              vim.schedule(function()
+                if not vim.api.nvim_buf_is_valid(args.buf) then return end
+
+                local content = result and result.output and result.output.content
+                if not content then
+                  vim.notify("No response from model", "warn", { id = notif_id, title = "commit" })
+                  return
+                end
+                local msg = vim.trim(content)
+                if msg == "" then return end
+
+                msg = msg:gsub("^```%w*\n", ""):gsub("\n```$", "")
+
+                local msg_lines = vim.split(msg, "\n", { plain = true })
+                vim.api.nvim_buf_set_lines(args.buf, 0, 0, false, msg_lines)
+
+                local winid = vim.fn.bufwinid(args.buf)
+                if winid ~= -1 then
+                  vim.api.nvim_win_set_cursor(winid, { 1, 0 })
+                end
+
+                vim.notify(msg_lines[1], "info", {
+                  id = notif_id,
+                  title = "commit (" .. adapter_name .. ")",
+                  icon = " ",
+                })
+              end)
+            end,
+            on_error = function(err)
+              vim.schedule(function()
+                vim.notify("Failed: " .. tostring(err), "error", {
+                  id = notif_id,
+                  title = "commit (" .. adapter_name .. ")",
+                  icon = " ",
+                })
+              end)
+            end,
+          })
+        end,
+      })
+    end,
     opts = {
       interactions = {
         inline = {
@@ -248,90 +324,6 @@ return {
         }
       },
       prompt_library = {
-        ["Generate a Commit Message"] = {
-          interaction = "inline",
-          description = "Generate a commit message",
-          opts = {
-            auto_submit = true,
-            adapter = adapters().commit,
-            is_slash_cmd = true,
-            alias = "xcommit",
-            placement = "replace",
-            stop_context_insertion = true,
-            diff = false
-          },
-          prompts = {
-            {
-              role = "user",
-              content = function()
-return [[
-  Do not use extended thinking or reasoning. Respond directly without chain-of-thought, internal monologue, or step-by-step reasoning blocks. Be concise and immediate.
-
-  You are a precise commit message generator following the Conventional Commits specification (conventionalcommits.org).
-
-  **Available Tool**: You have ONE tool: `git_diff_staged` - use it to see staged changes.
-
-  **Conventional Commit Format**:
-  ```
-  <type>: <description>
-
-  [body]
-  ```
-
-  **Types** (choose most appropriate):
-  | Type     | Use for                                          |
-  |----------|--------------------------------------------------|
-  | feat     | New feature                                      |
-  | fix      | Bug fix                                          |
-  | docs     | Documentation changes only                       |
-  | style    | Formatting, whitespace (no logic change)         |
-  | refactor | Code restructuring (no bug fix or feature)       |
-  | perf     | Performance improvement                          |
-  | test     | Adding/fixing tests                              |
-  | build    | Build system or dependency changes               |
-  | ci       | CI/CD configuration                              |
-  | chore    | Maintenance tasks                                |
-  | revert   | Reverting previous commit                        |
-
-  **Description Rules**:
-  - Imperative mood: "add feature" not "added feature"
-  - Lowercase first letter
-  - No trailing period
-  - Max 50 characters
-
-  **Body** (optional):
-  - *Never* write a body if type is chore.
-  - Avoid writing a body unless the change is significant.
-  - Explain *why*, not *what*. Wrap at 72 chars.
-  - No more than three lines.
-
-  **Your Task**:
-  1. Call `git_diff_staged` to retrieve staged changes
-  2. Analyze the diff to understand the changes
-  3. Output a properly formatted conventional commit message as text with no code block.
-]]
-              end,
-            },
-
-            {
-              role = "user",
-              content = function()
-                local diff = vim.fn.system("git diff --no-ext-diff --staged")
-                return string.format(
-                  [[
-                  Analyze the staged git changes and generate an appropriate conventional commit message:
-```diff
-%s
-```
-]], diff
-                )
-              end,
-              opts = {
-                contains_code = true,
-              },
-            },
-          }
-        },
         ["Generate documentation"] = {
           interaction = "inline",
           description = "Generate documentation",
