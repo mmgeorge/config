@@ -53,14 +53,14 @@ end
 
 
 return {
-  -- {
-  --   "zbirenbaum/copilot.lua",
-  --   cmd = "Copilot",
-  --   event = "InsertEnter",
-  --   config = function()
-  --     require("copilot").setup({})
-  --   end,
-  -- },
+  {
+    "zbirenbaum/copilot.lua",
+    cmd = "Copilot",
+    event = "InsertEnter",
+    config = function()
+      require("copilot").setup({})
+    end,
+  },
   -- {
   --   "azorng/goose.nvim",
   --   config = function()
@@ -138,6 +138,7 @@ return {
       vim.api.nvim_create_autocmd({ "BufEnter" }, {
         pattern = "COMMIT_EDITMSG",
         callback = function(args)
+          print("Creating commit message!")
           if vim.b[args.buf].ai_commit_generated then return end
 
           local lines = vim.api.nvim_buf_get_lines(args.buf, 0, -1, false)
