@@ -151,6 +151,11 @@ return {
             follow = false,
             supports_live = true,
             exclude = {
+              ".captures",
+              ".logs",
+              ".traces",
+              "fixtures",
+              "codegen",
               -- For the JS SDK
               "smartMapping",
               "webscene",
