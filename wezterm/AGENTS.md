@@ -38,6 +38,10 @@ end
   that invoked the callback may no longer be the right pane target.
 - For multi-step flows, prefer an explicit `Back` action over silently closing
   the flow.
+- Be careful with newer overlay fields like `PromptInputLine.initial_value`.
+  They may exist in current docs but fail on older installed WezTerm builds.
+  If compatibility matters, prefer a fallback in your workflow logic over
+  relying on prompt-field prefill support.
 
 ## Discovery and performance
 

@@ -15,7 +15,7 @@ M.settings = {
     wezterm.home_dir .. '/projects',
   },
   auto_setup_new_workspaces = true,
-  new_branch_prefix = 'matt9222/',
+  branch_prefix = 'matt9222/',
   layouts = {
     default = {
       tabs = {
@@ -24,10 +24,10 @@ M.settings = {
     },
     -- Add repo-specific layouts here, keyed by the repo directory name.
     by_repo = {
-      ['arcgis-js-api-4'] = {
+      ['maps'] = {
+        branch_prefix = 'matt9222/',
         first_run_commands = {
-          'pnpm install',
-          'pnpm run codegen',
+          'pnpm install; pnpm run codegen',
         },
       },
     },
@@ -559,11 +559,16 @@ local function pending_removals()
   return wezterm.GLOBAL.worktree_pending_removals
 end
 
+local function repo_settings(repo_name)
+  local layouts = M.settings.layouts or {}
+  local by_repo = layouts.by_repo or {}
+  return by_repo[repo_name] or {}
+end
+
 local function resolve_layout(worktree)
   local layouts = M.settings.layouts or {}
   local default_layout = layouts.default or {}
-  local by_repo = layouts.by_repo or {}
-  local repo_layout = by_repo[worktree.repo_name] or {}
+  local repo_layout = repo_settings(worktree.repo_name)
 
   return {
     tabs = repo_layout.tabs or default_layout.tabs,
@@ -672,7 +677,6 @@ local function prompt(window, pane, description, callback, opts)
   window:perform_action(
     act.PromptInputLine({
       description = description,
-      initial_value = opts.initial_value,
       action = wezterm.action_callback(callback),
     }),
     pane
@@ -719,6 +723,43 @@ local function sanitize_name(name)
   name = name:gsub('^%-+', '')
   name = name:gsub('%-+$', '')
   return name
+end
+
+local function resolve_branch_prefix(repo)
+  if repo then
+    local settings = repo_settings(repo.name)
+    if settings.branch_prefix ~= nil then
+      return settings.branch_prefix
+    end
+
+    if settings.new_branch_prefix ~= nil then
+      return settings.new_branch_prefix
+    end
+  end
+
+  if M.settings.branch_prefix ~= nil then
+    return M.settings.branch_prefix
+  end
+
+  if M.settings.new_branch_prefix ~= nil then
+    return M.settings.new_branch_prefix
+  end
+
+  return ''
+end
+
+local function qualify_branch_name(repo, name)
+  name = trim(name)
+  local prefix = resolve_branch_prefix(repo)
+  if prefix == '' then
+    return name
+  end
+
+  if name:find('/', 1, true) then
+    return name
+  end
+
+  return prefix .. name
 end
 
 local function resolve_new_worktree_path(repo, input, suggestion)
@@ -1159,9 +1200,14 @@ local function choose_new_branch(window, pane, repo)
             return
           end
 
-          local new_branch = trim(line)
+          local new_branch = qualify_branch_name(repo, line)
           if new_branch == '' then
             notify(branch_window, 'A new branch name is required')
+            return
+          end
+
+          if new_branch:sub(-1) == '/' then
+            notify(branch_window, 'A branch name is required after ' .. (resolve_branch_prefix(repo) or 'the prefix'))
             return
           end
 
@@ -1181,9 +1227,7 @@ local function choose_new_branch(window, pane, repo)
             )
           end)
         end
-      , {
-        initial_value = M.settings.new_branch_prefix,
-      })
+      )
     end)
   end)
 end
