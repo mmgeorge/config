@@ -15,6 +15,7 @@ M.settings = {
     wezterm.home_dir .. '/projects',
   },
   auto_setup_new_workspaces = true,
+  new_branch_prefix = 'matt9222/',
   layouts = {
     default = {
       tabs = {
@@ -230,6 +231,25 @@ local function path_exists(path)
   return run_command({ 'test', '-e', path }) ~= nil
 end
 
+local function directory_exists(path)
+  path = normalize_path(path)
+  if not path then
+    return false
+  end
+
+  if is_windows then
+    local stdout = run_command({
+      'cmd.exe',
+      '/S',
+      '/C',
+      'if exist "' .. path .. '\\NUL" (echo yes) else (echo no)',
+    })
+    return stdout ~= nil and trim(stdout) == 'yes'
+  end
+
+  return run_command({ 'test', '-d', path }) ~= nil
+end
+
 local function remove_directory_tree(path)
   path = normalize_path(path)
   if not path or not path_exists(path) then
@@ -361,6 +381,26 @@ local function preferred_worktree_parent(worktrees, fallback)
   return best_path
 end
 
+local function main_worktree_path(worktrees)
+  for _, worktree in ipairs(worktrees) do
+    if not worktree.bare and directory_exists(join_path(worktree.path, '.git')) then
+      return worktree.path
+    end
+  end
+
+  for _, worktree in ipairs(worktrees) do
+    if not worktree.bare then
+      return worktree.path
+    end
+  end
+
+  return worktrees[1] and worktrees[1].path or nil
+end
+
+local function should_display_worktree(worktree)
+  return worktree ~= nil and not worktree.bare
+end
+
 local function build_repo(path, common_dir)
   path = normalize_path(path)
   if not path then
@@ -380,12 +420,12 @@ local function build_repo(path, common_dir)
   local repo = {
     id = common_dir,
     name = basename(dirname(common_dir)),
-    main_path = worktrees[1].path,
+    main_path = main_worktree_path(worktrees),
     worktrees = worktrees,
   }
 
   for _, worktree in ipairs(repo.worktrees) do
-    worktree.is_main = worktree.path == repo.main_path
+    worktree.is_main = should_display_worktree(worktree) and worktree.path == repo.main_path
     worktree.repo_id = repo.id
     worktree.repo_name = repo.name
     worktree.repo_main_path = repo.main_path
@@ -476,7 +516,9 @@ local function flatten_worktrees(repos)
   local worktrees = {}
   for _, repo in ipairs(repos) do
     for _, worktree in ipairs(repo.worktrees) do
-      table.insert(worktrees, worktree)
+      if should_display_worktree(worktree) then
+        table.insert(worktrees, worktree)
+      end
     end
   end
 
@@ -625,10 +667,12 @@ local function switch_to_worktree(window, pane, worktree, opts)
   )
 end
 
-local function prompt(window, pane, description, callback)
+local function prompt(window, pane, description, callback, opts)
+  opts = opts or {}
   window:perform_action(
     act.PromptInputLine({
       description = description,
+      initial_value = opts.initial_value,
       action = wezterm.action_callback(callback),
     }),
     pane
@@ -797,14 +841,7 @@ local function create_worktree(window, pane, repo, opts)
   })
 end
 
-local function local_branches(repo)
-  local stdout = git_capture(repo.main_path, {
-    'for-each-ref',
-    '--sort=refname',
-    '--format=%(refname:short)',
-    'refs/heads',
-  })
-
+local function existing_refs(repo)
   local checked_out = {}
   for _, worktree in ipairs(repo.worktrees) do
     if worktree.branch_name then
@@ -812,79 +849,274 @@ local function local_branches(repo)
     end
   end
 
-  local branches = {}
-  for _, branch in ipairs(split_lines(stdout or '')) do
-    if branch ~= '' and not checked_out[branch] then
-      table.insert(branches, branch)
+  local local_branch_names = {}
+  local ref_records = {}
+
+  local function logical_ref_name(branch, source)
+    if source == 'remote' then
+      return branch:match('^[^/]+/(.+)$') or branch
+    end
+
+    return branch
+  end
+
+  local function add_refs(ref, source)
+    local output = git_capture(repo.main_path, {
+      'for-each-ref',
+      '--format=%(refname:short)%09%(committerdate:unix)',
+      ref,
+    }) or ''
+
+    for _, line in ipairs(split_lines(output)) do
+      local branch, timestamp = line:match('^(.-)%s+([0-9]+)$')
+      branch = branch or line
+      if branch ~= '' and not branch:match('/HEAD$') then
+        local logical_name = logical_ref_name(branch, source)
+        if source == 'local' then
+          local_branch_names[logical_name] = true
+        end
+
+        if source ~= 'local' or not checked_out[logical_name] then
+          table.insert(ref_records, {
+            committed_at = tonumber(timestamp) or 0,
+            id = branch,
+            label = source .. ': ' .. branch,
+            logical_name = logical_name,
+            source = source,
+          })
+        end
+      end
     end
   end
 
-  table.sort(branches)
-  return branches
+  add_refs('refs/heads', 'local')
+  add_refs('refs/remotes', 'remote')
+
+  table.sort(ref_records, function(left, right)
+    local left_source = left.source == 'local' and 0 or 1
+    local right_source = right.source == 'local' and 0 or 1
+    if left_source ~= right_source then
+      return left_source < right_source
+    end
+
+    local left_is_matt = left.logical_name:match('^matt9222/') ~= nil
+    local right_is_matt = right.logical_name:match('^matt9222/') ~= nil
+    if left_is_matt ~= right_is_matt then
+      return left_is_matt
+    end
+
+    if left_is_matt and left.committed_at ~= right.committed_at then
+      return left.committed_at > right.committed_at
+    end
+
+    if left.logical_name ~= right.logical_name then
+      return left.logical_name < right.logical_name
+    end
+
+    return left.id < right.id
+  end)
+
+  return ref_records, checked_out, local_branch_names
 end
 
 local function start_points(repo)
-  local points = {}
+  local point_records = {}
   local seen = {}
+  local source_branch_names = {
+    ['local'] = {},
+    ['remote'] = {},
+  }
 
-  local local_output = git_capture(repo.main_path, {
-    'for-each-ref',
-    '--sort=refname',
-    '--format=%(refname:short)',
-    'refs/heads',
-  }) or ''
+  local function logical_branch_name(branch, source)
+    if source == 'remote' then
+      return branch:match('^[^/]+/(.+)$') or branch
+    end
 
-  for _, branch in ipairs(split_lines(local_output)) do
-    if branch ~= '' and not seen[branch] then
-      seen[branch] = true
-      table.insert(points, {
-        id = branch,
-        label = 'local: ' .. branch,
-      })
+    return branch
+  end
+
+  local function parse_release_version(branch)
+    local version = branch:match('^([%d%.]+)%-release$')
+    if not version then
+      return nil
+    end
+
+    local parts = {}
+    for part in version:gmatch('[^.]+') do
+      if not part:match('^%d+$') then
+        return nil
+      end
+
+      table.insert(parts, tonumber(part))
+    end
+
+    if #parts == 0 then
+      return nil
+    end
+
+    return parts
+  end
+
+  local function compare_release_versions(left, right)
+    local limit = math.max(#left, #right)
+    for index = 1, limit do
+      local left_part = left[index] or 0
+      local right_part = right[index] or 0
+      if left_part ~= right_part then
+        return left_part > right_part
+      end
+    end
+
+    return false
+  end
+
+  local function add_ref_points(ref, source)
+    local output = git_capture(repo.main_path, {
+      'for-each-ref',
+      '--format=%(refname:short)%09%(committerdate:unix)',
+      ref,
+    }) or ''
+
+    for _, line in ipairs(split_lines(output)) do
+      local branch, timestamp = line:match('^(.-)%s+([0-9]+)$')
+      branch = branch or line
+      if branch ~= '' and not branch:match('/HEAD$') and not seen[branch] then
+        seen[branch] = true
+        local logical_name = logical_branch_name(branch, source)
+        source_branch_names[source][logical_name] = true
+        table.insert(point_records, {
+          id = branch,
+          label = source .. ': ' .. branch,
+          committed_at = tonumber(timestamp) or 0,
+          logical_name = logical_name,
+          release_version = parse_release_version(logical_name),
+          source = source,
+        })
+      end
     end
   end
 
-  local remote_output = git_capture(repo.main_path, {
-    'for-each-ref',
-    '--sort=refname',
-    '--format=%(refname:short)',
-    'refs/remotes',
-  }) or ''
-
-  for _, branch in ipairs(split_lines(remote_output)) do
-    if branch ~= '' and not branch:match('/HEAD$') and not seen[branch] then
-      seen[branch] = true
-      table.insert(points, {
-        id = branch,
-        label = 'remote: ' .. branch,
-      })
+  local function source_rank(point)
+    if point.source == 'local' then
+      return 0
     end
+
+    return 1
+  end
+
+  local function branch_group(point)
+    local names = source_branch_names[point.source]
+    if point.logical_name == 'main' then
+      return 0
+    end
+
+    if not names.main and point.logical_name == 'master' then
+      return 0
+    end
+
+    if point.release_version then
+      return 1
+    end
+
+    if point.logical_name:match('^matt9222/') then
+      return 2
+    end
+
+    return 3
+  end
+
+  add_ref_points('refs/heads', 'local')
+  add_ref_points('refs/remotes', 'remote')
+
+  table.sort(point_records, function(left, right)
+    local left_source = source_rank(left)
+    local right_source = source_rank(right)
+    if left_source ~= right_source then
+      return left_source < right_source
+    end
+
+    local left_group = branch_group(left)
+    local right_group = branch_group(right)
+    if left_group ~= right_group then
+      return left_group < right_group
+    end
+
+    if left_group == 1 then
+      if compare_release_versions(left.release_version, right.release_version) then
+        return true
+      end
+
+      if compare_release_versions(right.release_version, left.release_version) then
+        return false
+      end
+    end
+
+    if left.logical_name ~= right.logical_name then
+      return left.logical_name < right.logical_name
+    end
+
+    return left.id < right.id
+  end)
+
+  local points = {}
+  for _, point in ipairs(point_records) do
+    table.insert(points, {
+      id = point.id,
+      label = point.label,
+    })
   end
 
   return points
 end
 
 local function choose_existing_branch(window, pane, repo)
-  local branches = local_branches(repo)
-  if #branches == 0 then
-    notify(window, 'No free local branches are available for a new worktree')
+  local refs, checked_out, local_branch_names = existing_refs(repo)
+  if #refs == 0 then
+    notify(window, 'No local or remote refs are available for a new worktree')
     return
   end
 
   local choices = {}
-  for _, branch in ipairs(branches) do
+  local refs_by_id = {}
+  for _, ref in ipairs(refs) do
+    local choice_id = ref.source .. '\t' .. ref.id
+    refs_by_id[choice_id] = ref
     table.insert(choices, {
-      id = branch,
-      label = branch,
+      id = choice_id,
+      label = ref.label,
     })
   end
 
   choose(window, pane, {
     choices = choices,
-    title = 'Existing branch for ' .. repo.name,
+    title = 'Existing branch or remote for ' .. repo.name,
   }, function(inner_window, inner_pane, id)
     if not id then
       return
+    end
+
+    local ref = refs_by_id[id]
+    if not ref then
+      notify(inner_window, 'Could not resolve the selected ref')
+      return
+    end
+
+    local target_branch = ref.logical_name
+    local create_opts = {
+      start_point = ref.id,
+    }
+
+    if ref.source == 'remote' then
+      if local_branch_names[target_branch] then
+        if checked_out[target_branch] then
+          notify(inner_window, 'Local branch ' .. target_branch .. ' is already checked out; use the new-branch path instead')
+          return
+        end
+
+        create_opts.start_point = target_branch
+      else
+        create_opts.new_branch = target_branch
+      end
     end
 
     after_overlay(function()
@@ -892,12 +1124,10 @@ local function choose_existing_branch(window, pane, repo)
         inner_window,
         pane,
         repo,
-        sanitize_name(id),
+        sanitize_name(target_branch),
         function(final_window, final_pane, target_path)
-          create_worktree(final_window, pane, repo, {
-            path = target_path,
-            start_point = id,
-          })
+          create_opts.path = target_path
+          create_worktree(final_window, pane, repo, create_opts)
         end
       )
     end)
@@ -951,7 +1181,9 @@ local function choose_new_branch(window, pane, repo)
             )
           end)
         end
-      )
+      , {
+        initial_value = M.settings.new_branch_prefix,
+      })
     end)
   end)
 end
@@ -960,12 +1192,12 @@ local function start_create_flow(window, pane, repo)
   choose(window, pane, {
     choices = {
       {
-        id = 'existing',
-        label = 'Use an existing local branch',
+        id = 'new',
+        label = 'Create new branch',
       },
       {
-        id = 'new',
-        label = 'Create a new branch from a start point',
+        id = 'existing',
+        label = 'Use existing branch or remote ref',
       },
     },
     fuzzy = false,
@@ -1075,7 +1307,10 @@ local function removable_worktrees(repos, current_workspace)
   local removable = {}
   for _, repo in ipairs(repos) do
     for _, worktree in ipairs(repo.worktrees) do
-      if not worktree.is_main and worktree.workspace_name ~= current_workspace then
+      if should_display_worktree(worktree)
+        and not worktree.is_main
+        and worktree.workspace_name ~= current_workspace
+      then
         table.insert(removable, worktree)
       end
     end
@@ -1416,7 +1651,7 @@ function M.menu()
       end
     end
 
-    local repos = discover_repositories(extra_paths)
+    local repos = current_repo and { current_repo } or discover_repositories(extra_paths)
     local choices = {}
 
     if current_repo then
@@ -1433,14 +1668,21 @@ function M.menu()
       end
     end
 
-    table.insert(choices, {
-      id = 'create-repo',
-      label = '+ New worktree from repo...',
-    })
-    table.insert(choices, {
-      id = 'remove',
-      label = '- Remove worktree...',
-    })
+    if current_repo then
+      table.insert(choices, {
+        id = 'remove',
+        label = '- Remove worktree...',
+      })
+    else
+      table.insert(choices, {
+        id = 'create-repo',
+        label = '+ New worktree from repo...',
+      })
+      table.insert(choices, {
+        id = 'remove',
+        label = '- Remove worktree...',
+      })
+    end
 
     for _, worktree in ipairs(flatten_worktrees(repos)) do
       table.insert(choices, {

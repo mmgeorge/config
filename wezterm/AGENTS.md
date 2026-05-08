@@ -56,6 +56,9 @@ synchronous and blocks the UI.
   4. run `git worktree list --porcelain` once per unique repo
 - Do **not** run `git worktree list` separately for every linked worktree path
   that belongs to the same repo.
+- Do **not** assume the first `git worktree list` entry is the main worktree.
+  Detect the main worktree from the filesystem shape: the main worktree has a
+  `.git` directory, while linked worktrees usually have a `.git` file.
 
 ## Workspace vs worktree semantics
 
