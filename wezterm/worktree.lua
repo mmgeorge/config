@@ -1,0 +1,1160 @@
+local wezterm = require 'wezterm'
+local act = wezterm.action
+
+local M = {}
+
+local is_windows = wezterm.target_triple:find('windows') ~= nil
+
+M.settings = {
+  roots = {
+    wezterm.home_dir .. '/Developer',
+    wezterm.home_dir .. '/code',
+    wezterm.home_dir .. '/dev',
+    wezterm.home_dir .. '/src',
+    wezterm.home_dir .. '/worktrees',
+    wezterm.home_dir .. '/projects',
+  },
+  auto_setup_new_workspaces = true,
+  layouts = {
+    default = {
+      tabs = {
+        { title = 'main' },
+      },
+    },
+    -- Add repo-specific layouts here, keyed by the repo directory name.
+    by_repo = {
+      ['arcgis-js-api-4'] = {
+        first_run_commands = {
+          'pnpm install',
+          'pnpm run codegen',
+        },
+      },
+    },
+  },
+}
+
+local function trim(text)
+  if not text then
+    return ''
+  end
+
+  return text:gsub('^%s+', ''):gsub('%s+$', '')
+end
+
+local function normalize_path(path)
+  if not path or path == '' then
+    return nil
+  end
+
+  path = path:gsub('\\', '/')
+
+  if path ~= '/' and not path:match('^%a:/$') then
+    path = path:gsub('/+$', '')
+  end
+
+  return path
+end
+
+local function is_absolute(path)
+  return path and (path:sub(1, 1) == '/' or path:match('^%a:/'))
+end
+
+local function join_path(base, child)
+  base = normalize_path(base)
+  child = normalize_path(child)
+
+  if not base or base == '' then
+    return child
+  end
+
+  if not child or child == '' then
+    return base
+  end
+
+  if is_absolute(child) then
+    return child
+  end
+
+  if base == '/' or base:match('^%a:/$') then
+    return normalize_path(base .. child)
+  end
+
+  return normalize_path(base .. '/' .. child)
+end
+
+local function dirname(path)
+  path = normalize_path(path)
+  if not path then
+    return nil
+  end
+
+  if path == '/' or path:match('^%a:/$') then
+    return path
+  end
+
+  local parent = path:match('^(.*)/[^/]+$')
+  if not parent or parent == '' then
+    return '.'
+  end
+
+  if parent:match('^%a:$') then
+    return parent .. '/'
+  end
+
+  return parent
+end
+
+local function basename(path)
+  path = normalize_path(path)
+  if not path then
+    return nil
+  end
+
+  return path:match('([^/]+)$') or path
+end
+
+local function split_lines(text)
+  local result = {}
+  if not text then
+    return result
+  end
+
+  text = text:gsub('\r', '')
+  for line in text:gmatch('[^\n]+') do
+    table.insert(result, line)
+  end
+
+  return result
+end
+
+local function notify(window, message)
+  window:toast_notification('Worktree', message, nil, 4000)
+end
+
+local function run_command(command)
+  local success, stdout, stderr = wezterm.run_child_process(command)
+  if not success then
+    return nil, trim(stderr ~= '' and stderr or stdout)
+  end
+
+  return stdout or '', stderr or ''
+end
+
+local function git_output(cwd, args)
+  local command = { 'git' }
+
+  if cwd and cwd ~= '' then
+    table.insert(command, '-C')
+    table.insert(command, cwd)
+  end
+
+  for _, arg in ipairs(args) do
+    table.insert(command, arg)
+  end
+
+  return run_command(command)
+end
+
+local function git_capture(cwd, args)
+  local stdout, stderr = git_output(cwd, args)
+  if not stdout then
+    return nil, stderr
+  end
+
+  return trim(stdout), stderr
+end
+
+local function list_child_directories(root)
+  root = normalize_path(root)
+  if not root then
+    return {}
+  end
+
+  local stdout
+  if is_windows then
+    stdout = run_command({
+      'cmd.exe',
+      '/S',
+      '/C',
+      'dir /B /A:D "' .. root .. '"',
+    })
+  else
+    stdout = run_command({
+      'find',
+      root,
+      '-mindepth',
+      '1',
+      '-maxdepth',
+      '1',
+      '-type',
+      'd',
+    })
+  end
+
+  if not stdout then
+    return {}
+  end
+
+  local results = {}
+  for _, line in ipairs(split_lines(stdout)) do
+    if is_windows then
+      table.insert(results, join_path(root, line))
+    else
+      table.insert(results, normalize_path(line))
+    end
+  end
+
+  return results
+end
+
+local function current_pane_path(pane)
+  local cwd = pane:get_current_working_dir()
+  if not cwd or not cwd.file_path then
+    return nil
+  end
+
+  return normalize_path(cwd.file_path)
+end
+
+local function git_common_dir(path)
+  local common_dir = git_capture(path, {
+    'rev-parse',
+    '--path-format=absolute',
+    '--git-common-dir',
+  })
+
+  if not common_dir then
+    common_dir = git_capture(path, { 'rev-parse', '--git-common-dir' })
+  end
+
+  if not common_dir or common_dir == '' then
+    return nil
+  end
+
+  common_dir = normalize_path(common_dir)
+  if not is_absolute(common_dir) then
+    common_dir = join_path(path, common_dir)
+  end
+
+  return common_dir
+end
+
+local function parse_worktrees(path)
+  local stdout = git_output(path, { 'worktree', 'list', '--porcelain' })
+  if not stdout then
+    return nil
+  end
+
+  local worktrees = {}
+  local current = nil
+
+  local function flush()
+    if not current or not current.path then
+      return
+    end
+
+    current.path = normalize_path(current.path)
+    if current.branch then
+      current.branch_name = current.branch:gsub('^refs/heads/', '')
+    end
+
+    table.insert(worktrees, current)
+    current = nil
+  end
+
+  for line in (stdout .. '\n'):gmatch('(.-)\n') do
+    line = line:gsub('\r$', '')
+
+    if line == '' then
+      flush()
+    elseif line == 'bare' or line == 'detached' or line == 'locked' or line == 'prunable' then
+      current = current or {}
+      current[line] = true
+    else
+      local key, value = line:match('^(%S+)%s+(.*)$')
+      if key == 'worktree' then
+        flush()
+        current = { path = value }
+      elseif key then
+        current = current or {}
+        current[key] = value
+      end
+    end
+  end
+
+  return worktrees
+end
+
+local function worktree_workspace_name(repo_name, worktree)
+  local suffix = worktree.branch_name or basename(worktree.path) or 'worktree'
+  return repo_name .. ':' .. suffix
+end
+
+local function preferred_worktree_parent(worktrees, fallback)
+  local counts = {}
+  local best_path = fallback
+  local best_count = 0
+
+  for _, worktree in ipairs(worktrees) do
+    if not worktree.is_main then
+      local parent = dirname(worktree.path)
+      counts[parent] = (counts[parent] or 0) + 1
+      if counts[parent] > best_count then
+        best_count = counts[parent]
+        best_path = parent
+      end
+    end
+  end
+
+  return best_path
+end
+
+local function build_repo(path)
+  path = normalize_path(path)
+  if not path then
+    return nil
+  end
+
+  local common_dir = git_common_dir(path)
+  if not common_dir then
+    return nil
+  end
+
+  local worktrees = parse_worktrees(path)
+  if not worktrees or #worktrees == 0 then
+    return nil
+  end
+
+  local repo = {
+    id = common_dir,
+    name = basename(dirname(common_dir)),
+    main_path = worktrees[1].path,
+    worktrees = worktrees,
+  }
+
+  for _, worktree in ipairs(repo.worktrees) do
+    worktree.is_main = worktree.path == repo.main_path
+    worktree.repo_id = repo.id
+    worktree.repo_name = repo.name
+    worktree.repo_main_path = repo.main_path
+    worktree.workspace_name = worktree_workspace_name(repo.name, worktree)
+  end
+
+  repo.worktree_parent = preferred_worktree_parent(
+    repo.worktrees,
+    dirname(repo.main_path)
+  )
+
+  return repo
+end
+
+local function sort_repos(repos)
+  table.sort(repos, function(left, right)
+    return left.name < right.name
+  end)
+end
+
+local function sort_worktrees(worktrees)
+  table.sort(worktrees, function(left, right)
+    if left.repo_name == right.repo_name then
+      local left_key = left.branch_name or left.path
+      local right_key = right.branch_name or right.path
+      return left_key < right_key
+    end
+
+    return left.repo_name < right.repo_name
+  end)
+end
+
+local function discover_repositories(extra_paths)
+  local candidates = {}
+  local seen_candidates = {}
+
+  local function add_candidate(path)
+    path = normalize_path(path)
+    if not path or seen_candidates[path] then
+      return
+    end
+
+    seen_candidates[path] = true
+    table.insert(candidates, path)
+  end
+
+  for _, root in ipairs(M.settings.roots) do
+    add_candidate(root)
+    for _, child in ipairs(list_child_directories(root)) do
+      add_candidate(child)
+    end
+  end
+
+  for _, path in ipairs(extra_paths or {}) do
+    add_candidate(path)
+  end
+
+  local repos_by_id = {}
+  for _, candidate in ipairs(candidates) do
+    local repo = build_repo(candidate)
+    if repo and not repos_by_id[repo.id] then
+      repos_by_id[repo.id] = repo
+    end
+  end
+
+  local repos = {}
+  for _, repo in pairs(repos_by_id) do
+    table.insert(repos, repo)
+  end
+
+  sort_repos(repos)
+  return repos
+end
+
+local function repo_for_pane(pane)
+  local path = current_pane_path(pane)
+  if not path then
+    return nil
+  end
+
+  return build_repo(path)
+end
+
+local function flatten_worktrees(repos)
+  local worktrees = {}
+  for _, repo in ipairs(repos) do
+    for _, worktree in ipairs(repo.worktrees) do
+      table.insert(worktrees, worktree)
+    end
+  end
+
+  sort_worktrees(worktrees)
+  return worktrees
+end
+
+local function find_worktree_by_path(repos, path)
+  path = normalize_path(path)
+  for _, repo in ipairs(repos) do
+    for _, worktree in ipairs(repo.worktrees) do
+      if worktree.path == path then
+        return worktree, repo
+      end
+    end
+  end
+
+  return nil, nil
+end
+
+local function workspace_exists(name)
+  for _, workspace in ipairs(wezterm.mux.get_workspace_names()) do
+    if workspace == name then
+      return true
+    end
+  end
+
+  return false
+end
+
+local function pending_layouts()
+  wezterm.GLOBAL.worktree_pending_layouts = wezterm.GLOBAL.worktree_pending_layouts or {}
+  return wezterm.GLOBAL.worktree_pending_layouts
+end
+
+local function resolve_layout(worktree)
+  local layouts = M.settings.layouts or {}
+  local default_layout = layouts.default or {}
+  local by_repo = layouts.by_repo or {}
+  local repo_layout = by_repo[worktree.repo_name] or {}
+
+  return {
+    tabs = repo_layout.tabs or default_layout.tabs,
+    first_run_commands = repo_layout.first_run_commands,
+  }
+end
+
+local function resolve_layout_cwd(worktree_path, cwd)
+  cwd = cwd or '.'
+  if cwd == '.' then
+    return worktree_path
+  end
+
+  if is_absolute(cwd) then
+    return normalize_path(cwd)
+  end
+
+  return join_path(worktree_path, cwd)
+end
+
+local function apply_tab_layout(tab, pane, worktree_path, spec)
+  if spec.title and tab then
+    tab:set_title(spec.title)
+  end
+
+  for _, pane_spec in ipairs(spec.panes or {}) do
+    pane:split({
+      cwd = resolve_layout_cwd(worktree_path, pane_spec.cwd),
+      args = pane_spec.args,
+      direction = pane_spec.direction or 'Right',
+      size = pane_spec.size or 0.5,
+      top_level = pane_spec.top_level,
+    })
+  end
+end
+
+local function apply_layout(window, pane, worktree)
+  local layout = resolve_layout(worktree)
+  if not layout then
+    return pane
+  end
+
+  local tabs = layout.tabs or {}
+  if #tabs == 0 then
+    return pane
+  end
+
+  apply_tab_layout(window:active_tab(), pane, worktree.path, tabs[1])
+
+  local mux_window = window:mux_window()
+  for index = 2, #tabs do
+    local tab_spec = tabs[index]
+    local tab, tab_pane = mux_window:spawn_tab({
+      cwd = resolve_layout_cwd(worktree.path, tab_spec.cwd),
+      args = tab_spec.args,
+    })
+    apply_tab_layout(tab, tab_pane, worktree.path, tab_spec)
+  end
+
+  if #tabs > 1 then
+    window:perform_action(act.ActivateTab(0), pane)
+  end
+
+  return pane
+end
+
+local function run_first_run_commands(pane, commands)
+  if not pane or not commands or #commands == 0 then
+    return
+  end
+
+  pane:send_text(table.concat(commands, ' && ') .. '\n')
+end
+
+local function queue_layout(worktree, opts)
+  opts = opts or {}
+  pending_layouts()[worktree.workspace_name] = {
+    first_run_commands = opts.first_run_commands,
+    path = worktree.path,
+    repo_name = worktree.repo_name,
+    workspace_name = worktree.workspace_name,
+  }
+end
+
+local function switch_to_worktree(window, pane, worktree, opts)
+  opts = opts or {}
+  local exists = workspace_exists(worktree.workspace_name)
+  if not exists and M.settings.auto_setup_new_workspaces then
+    queue_layout(worktree, opts)
+  end
+
+  window:perform_action(
+    act.SwitchToWorkspace({
+      name = worktree.workspace_name,
+      spawn = {
+        cwd = worktree.path,
+        label = worktree.workspace_name,
+      },
+    }),
+    pane
+  )
+end
+
+local function prompt(window, pane, description, callback)
+  window:perform_action(
+    act.PromptInputLine({
+      description = description,
+      action = wezterm.action_callback(callback),
+    }),
+    pane
+  )
+end
+
+local function after_overlay(callback)
+  wezterm.time.call_after(0.05, callback)
+end
+
+local function choose(window, pane, opts, callback)
+  if #opts.choices == 0 then
+    return
+  end
+
+  window:perform_action(
+    act.InputSelector({
+      action = wezterm.action_callback(callback),
+      choices = opts.choices,
+      fuzzy = opts.fuzzy ~= false,
+      title = opts.title,
+    }),
+    pane
+  )
+end
+
+local function sanitize_name(name)
+  name = trim(name)
+  if name == '' then
+    return ''
+  end
+
+  name = name:gsub('^refs/remotes/', '')
+  name = name:gsub('^refs/heads/', '')
+  name = name:gsub('^[^/]+/', function(prefix)
+    if prefix == 'origin/' then
+      return ''
+    end
+
+    return prefix
+  end)
+  name = name:gsub('[^%w._-]+', '-')
+  name = name:gsub('%-+', '-')
+  name = name:gsub('^%-+', '')
+  name = name:gsub('%-+$', '')
+  return name
+end
+
+local function resolve_new_worktree_path(repo, input, suggestion)
+  local value = trim(input)
+  if value == '' then
+    value = suggestion
+  end
+
+  value = normalize_path(value)
+  if not value or value == '' then
+    return nil
+  end
+
+  if is_absolute(value) then
+    return value
+  end
+
+  return join_path(repo.worktree_parent, value)
+end
+
+local function prompt_for_worktree_path(window, pane, repo, suggestion, callback)
+  local default_name = suggestion ~= '' and suggestion or (repo.name .. '-worktree')
+  prompt(
+    window,
+    pane,
+    'Worktree directory under ' .. repo.worktree_parent .. ' (empty uses ' .. default_name .. ')',
+    function(inner_window, inner_pane, line)
+      if line == nil then
+        return
+      end
+
+      local target_path = resolve_new_worktree_path(repo, line, default_name)
+      if not target_path then
+        notify(inner_window, 'A worktree path is required')
+        return
+      end
+
+      after_overlay(function()
+        callback(inner_window, inner_pane, target_path)
+      end)
+    end
+  )
+end
+
+local function find_worktree(repo, path)
+  path = normalize_path(path)
+  for _, worktree in ipairs(repo.worktrees) do
+    if worktree.path == path then
+      return worktree
+    end
+  end
+
+  return nil
+end
+
+local function create_worktree(window, pane, repo, opts)
+  local args = { 'worktree', 'add' }
+
+  if find_worktree(repo, opts.path) then
+    notify(window, 'A worktree already exists at ' .. opts.path)
+    return
+  end
+
+  if opts.new_branch then
+    table.insert(args, '-b')
+    table.insert(args, opts.new_branch)
+  end
+
+  table.insert(args, opts.path)
+  table.insert(args, opts.start_point)
+
+  local stdout, stderr = git_output(repo.main_path, args)
+  if not stdout then
+    notify(window, stderr)
+    return
+  end
+
+  local updated_repo = build_repo(opts.path) or build_repo(repo.main_path)
+  if not updated_repo then
+    notify(window, 'Created the worktree, but could not refresh repository metadata')
+    return
+  end
+
+  local worktree = find_worktree(updated_repo, opts.path)
+  if not worktree then
+    notify(window, 'Created the worktree, but could not locate it in git worktree list')
+    return
+  end
+
+  switch_to_worktree(window, pane, worktree, {
+    first_run_commands = resolve_layout(worktree).first_run_commands,
+  })
+end
+
+local function local_branches(repo)
+  local stdout = git_capture(repo.main_path, {
+    'for-each-ref',
+    '--sort=refname',
+    '--format=%(refname:short)',
+    'refs/heads',
+  })
+
+  local checked_out = {}
+  for _, worktree in ipairs(repo.worktrees) do
+    if worktree.branch_name then
+      checked_out[worktree.branch_name] = true
+    end
+  end
+
+  local branches = {}
+  for _, branch in ipairs(split_lines(stdout or '')) do
+    if branch ~= '' and not checked_out[branch] then
+      table.insert(branches, branch)
+    end
+  end
+
+  table.sort(branches)
+  return branches
+end
+
+local function start_points(repo)
+  local points = {}
+  local seen = {}
+
+  local local_output = git_capture(repo.main_path, {
+    'for-each-ref',
+    '--sort=refname',
+    '--format=%(refname:short)',
+    'refs/heads',
+  }) or ''
+
+  for _, branch in ipairs(split_lines(local_output)) do
+    if branch ~= '' and not seen[branch] then
+      seen[branch] = true
+      table.insert(points, {
+        id = branch,
+        label = 'local: ' .. branch,
+      })
+    end
+  end
+
+  local remote_output = git_capture(repo.main_path, {
+    'for-each-ref',
+    '--sort=refname',
+    '--format=%(refname:short)',
+    'refs/remotes',
+  }) or ''
+
+  for _, branch in ipairs(split_lines(remote_output)) do
+    if branch ~= '' and not branch:match('/HEAD$') and not seen[branch] then
+      seen[branch] = true
+      table.insert(points, {
+        id = branch,
+        label = 'remote: ' .. branch,
+      })
+    end
+  end
+
+  return points
+end
+
+local function choose_existing_branch(window, pane, repo)
+  local branches = local_branches(repo)
+  if #branches == 0 then
+    notify(window, 'No free local branches are available for a new worktree')
+    return
+  end
+
+  local choices = {}
+  for _, branch in ipairs(branches) do
+    table.insert(choices, {
+      id = branch,
+      label = branch,
+    })
+  end
+
+  choose(window, pane, {
+    choices = choices,
+    title = 'Existing branch for ' .. repo.name,
+  }, function(inner_window, inner_pane, id)
+    if not id then
+      return
+    end
+
+    after_overlay(function()
+      prompt_for_worktree_path(
+        inner_window,
+        pane,
+        repo,
+        sanitize_name(id),
+        function(final_window, final_pane, target_path)
+          create_worktree(final_window, pane, repo, {
+            path = target_path,
+            start_point = id,
+          })
+        end
+      )
+    end)
+  end)
+end
+
+local function choose_new_branch(window, pane, repo)
+  local points = start_points(repo)
+  if #points == 0 then
+    notify(window, 'No local or remote branches were found for ' .. repo.name)
+    return
+  end
+
+  choose(window, pane, {
+    choices = points,
+    title = 'Start point for new branch in ' .. repo.name,
+  }, function(inner_window, inner_pane, start_point)
+    if not start_point then
+      return
+    end
+
+    after_overlay(function()
+      prompt(
+        inner_window,
+        pane,
+        'New branch name from ' .. start_point,
+        function(branch_window, branch_pane, line)
+          if line == nil then
+            return
+          end
+
+          local new_branch = trim(line)
+          if new_branch == '' then
+            notify(branch_window, 'A new branch name is required')
+            return
+          end
+
+          after_overlay(function()
+            prompt_for_worktree_path(
+              branch_window,
+              pane,
+              repo,
+              sanitize_name(new_branch),
+              function(final_window, final_pane, target_path)
+                create_worktree(final_window, pane, repo, {
+                  new_branch = new_branch,
+                  path = target_path,
+                  start_point = start_point,
+                })
+              end
+            )
+          end)
+        end
+      )
+    end)
+  end)
+end
+
+local function start_create_flow(window, pane, repo)
+  choose(window, pane, {
+    choices = {
+      {
+        id = 'existing',
+        label = 'Use an existing local branch',
+      },
+      {
+        id = 'new',
+        label = 'Create a new branch from a start point',
+      },
+    },
+    fuzzy = false,
+    title = 'Create worktree for ' .. repo.name,
+  }, function(inner_window, inner_pane, id)
+    if id == 'existing' then
+      choose_existing_branch(inner_window, inner_pane, repo)
+    elseif id == 'new' then
+      choose_new_branch(inner_window, inner_pane, repo)
+    end
+  end)
+end
+
+local function choose_repo_for_creation(window, pane, current_repo, repos)
+  if #repos == 0 then
+    prompt(
+      window,
+      pane,
+      'Repository path to use for the new worktree',
+      function(inner_window, inner_pane, line)
+        if line == nil then
+          return
+        end
+
+        local repo = build_repo(line)
+        if not repo then
+          notify(inner_window, 'That path is not inside a git repository')
+          return
+        end
+
+        start_create_flow(inner_window, inner_pane, repo)
+      end
+    )
+    return
+  end
+
+  local choices = {}
+  for _, repo in ipairs(repos) do
+    local label = repo.name .. ' (' .. repo.worktree_parent .. ')'
+    if current_repo and repo.id == current_repo.id then
+      label = label .. ' [current]'
+    end
+
+    table.insert(choices, {
+      id = repo.id,
+      label = label,
+    })
+  end
+
+  table.insert(choices, {
+    id = '__manual__',
+    label = 'Enter a repository path manually',
+  })
+
+  choose(window, pane, {
+    choices = choices,
+    title = 'Choose a repository',
+  }, function(inner_window, inner_pane, id)
+    if not id then
+      return
+    end
+
+    if id == '__manual__' then
+      prompt(
+        inner_window,
+        inner_pane,
+        'Repository path to use for the new worktree',
+        function(path_window, path_pane, line)
+          if line == nil then
+            return
+          end
+
+          local repo = build_repo(line)
+          if not repo then
+            notify(path_window, 'That path is not inside a git repository')
+            return
+          end
+
+          start_create_flow(path_window, path_pane, repo)
+        end
+      )
+      return
+    end
+
+    for _, repo in ipairs(repos) do
+      if repo.id == id then
+        start_create_flow(inner_window, inner_pane, repo)
+        return
+      end
+    end
+  end)
+end
+
+local function removable_worktrees(repos)
+  local open_workspaces = {}
+  for _, name in ipairs(wezterm.mux.get_workspace_names()) do
+    open_workspaces[name] = true
+  end
+
+  local removable = {}
+  for _, repo in ipairs(repos) do
+    for _, worktree in ipairs(repo.worktrees) do
+      if not worktree.is_main and not open_workspaces[worktree.workspace_name] then
+        table.insert(removable, worktree)
+      end
+    end
+  end
+
+  sort_worktrees(removable)
+  return removable
+end
+
+local function confirm_and_remove(window, pane, worktree)
+  choose(window, pane, {
+    choices = {
+      {
+        id = 'cancel',
+        label = 'Cancel',
+      },
+      {
+        id = 'remove',
+        label = 'Remove ' .. worktree.path,
+      },
+    },
+    fuzzy = false,
+    title = 'Remove worktree',
+  }, function(inner_window, _inner_pane, id)
+    if id ~= 'remove' then
+      return
+    end
+
+    local stdout, stderr = git_output(worktree.repo_main_path, {
+      'worktree',
+      'remove',
+      worktree.path,
+    })
+
+    if not stdout then
+      notify(inner_window, stderr)
+      return
+    end
+
+    git_output(worktree.repo_main_path, { 'worktree', 'prune' })
+    notify(inner_window, 'Removed ' .. worktree.path)
+  end)
+end
+
+local function choose_worktree_to_remove(window, pane, repos)
+  local removable = removable_worktrees(repos)
+  if #removable == 0 then
+    notify(window, 'No closed linked worktrees are available to remove')
+    return
+  end
+
+  local choices = {}
+  for _, worktree in ipairs(removable) do
+    table.insert(choices, {
+      id = worktree.path,
+      label = worktree.repo_name .. ' [' .. (worktree.branch_name or 'detached') .. '] - ' .. basename(worktree.path),
+    })
+  end
+
+  choose(window, pane, {
+    choices = choices,
+    title = 'Remove worktree',
+  }, function(inner_window, inner_pane, id)
+    if not id then
+      return
+    end
+
+    local worktree = find_worktree_by_path(repos, id)
+    if not worktree then
+      notify(inner_window, 'Could not resolve the selected worktree')
+      return
+    end
+
+    confirm_and_remove(inner_window, inner_pane, worktree)
+  end)
+end
+
+local function worktree_label(worktree, current_workspace)
+  local branch = worktree.branch_name or 'detached'
+  local target = worktree.is_main and 'main worktree' or basename(worktree.path)
+  local prefix = worktree.workspace_name == current_workspace and '* ' or '  '
+  return prefix .. worktree.repo_name .. ' [' .. branch .. '] - ' .. target
+end
+
+function M.handle_update_status(window, pane)
+  local pending = pending_layouts()[window:active_workspace()]
+  if not pending then
+    return
+  end
+
+  pending_layouts()[pending.workspace_name] = nil
+  local primary_pane = apply_layout(window, pane, pending)
+  if pending.first_run_commands then
+    after_overlay(function()
+      run_first_run_commands(primary_pane, pending.first_run_commands)
+    end)
+  end
+end
+
+function M.menu()
+  return wezterm.action_callback(function(window, pane)
+    local current_repo = repo_for_pane(pane)
+    local extra_paths = {}
+    if current_repo then
+      table.insert(extra_paths, current_repo.main_path)
+    else
+      local current_path = current_pane_path(pane)
+      if current_path then
+        table.insert(extra_paths, current_path)
+      end
+    end
+
+    local repos = discover_repositories(extra_paths)
+    local choices = {}
+
+    if current_repo then
+      table.insert(choices, {
+        id = 'create-current',
+        label = '+ New worktree from current repo (' .. current_repo.name .. ')',
+      })
+    end
+
+    table.insert(choices, {
+      id = 'create-repo',
+      label = '+ New worktree from repo...',
+    })
+    table.insert(choices, {
+      id = 'remove',
+      label = '- Remove worktree...',
+    })
+
+    for _, worktree in ipairs(flatten_worktrees(repos)) do
+      table.insert(choices, {
+        id = worktree.path,
+        label = worktree_label(worktree, window:active_workspace()),
+      })
+    end
+
+    choose(window, pane, {
+      choices = choices,
+      title = 'Worktrees',
+    }, function(inner_window, inner_pane, id)
+      if not id then
+        return
+      end
+
+      if id == 'create-current' then
+        if current_repo then
+          start_create_flow(inner_window, inner_pane, current_repo)
+        else
+          notify(inner_window, 'Current pane is not inside a git repository')
+        end
+        return
+      end
+
+      if id == 'create-repo' then
+        choose_repo_for_creation(inner_window, inner_pane, current_repo, repos)
+        return
+      end
+
+      if id == 'remove' then
+        choose_worktree_to_remove(inner_window, inner_pane, repos)
+        return
+      end
+
+      local worktree = find_worktree_by_path(repos, id)
+      if not worktree then
+        notify(inner_window, 'Could not resolve the selected worktree')
+        return
+      end
+
+      switch_to_worktree(inner_window, inner_pane, worktree)
+    end)
+  end)
+end
+
+return M

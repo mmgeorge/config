@@ -1,6 +1,7 @@
 -- Pull in the wezterm API
 local wezterm                               = require 'wezterm'
 local action                                = wezterm.action
+local worktree                              = require 'worktree'
 
 -- This will hold the configuration.
 local config                                = wezterm.config_builder()
@@ -17,8 +18,10 @@ config.webgpu_power_preference = "HighPerformance"
 --   end
 -- end
 
-config.default_cwd                          = "D:/"
-config.default_prog = { "D:/config/windows/nudevcmd.bat" }
+if wezterm.target_triple:find("windows") then
+  config.default_cwd = "D:/"
+  config.default_prog = { "D:/config/windows/nudevcmd.bat" }
+end
 config.animation_fps = 30
 config.max_fps = 120
 config.scrollback_lines = 3000
@@ -110,6 +113,7 @@ wezterm.on('update-status', function(window, pane)
     wezterm.GLOBAL.previous_workspace = last
   end
   wezterm.GLOBAL.current_workspace = current
+  worktree.handle_update_status(window, pane)
 end)
 
 wezterm.on('format-tab-title', function(tab, tabs, panes, config, hover, max_width)
@@ -196,6 +200,11 @@ config.keys           = {
     key = 's',
     mods = 'LEADER',
     action = wezterm.action.ShowLauncherArgs { flags = 'FUZZY|WORKSPACES' },
+  },
+  {
+    key = 'w',
+    mods = 'LEADER',
+    action = worktree.menu(),
   },
   {
     key = 'S',
