@@ -780,28 +780,9 @@ local function resolve_new_worktree_path(repo, input, suggestion)
   return join_path(repo.worktree_parent, value)
 end
 
-local function prompt_for_worktree_path(window, pane, repo, suggestion, callback)
+local function default_worktree_path(repo, suggestion)
   local default_name = suggestion ~= '' and suggestion or (repo.name .. '-worktree')
-  prompt(
-    window,
-    pane,
-    'Worktree directory under ' .. repo.worktree_parent .. ' (empty uses ' .. default_name .. ')',
-    function(inner_window, inner_pane, line)
-      if line == nil then
-        return
-      end
-
-      local target_path = resolve_new_worktree_path(repo, line, default_name)
-      if not target_path then
-        notify(inner_window, 'A worktree path is required')
-        return
-      end
-
-      after_overlay(function()
-        callback(inner_window, inner_pane, target_path)
-      end)
-    end
-  )
+  return resolve_new_worktree_path(repo, '', default_name)
 end
 
 local function find_worktree(repo, path)
@@ -1161,16 +1142,8 @@ local function choose_existing_branch(window, pane, repo)
     end
 
     after_overlay(function()
-      prompt_for_worktree_path(
-        inner_window,
-        pane,
-        repo,
-        sanitize_name(target_branch),
-        function(final_window, final_pane, target_path)
-          create_opts.path = target_path
-          create_worktree(final_window, pane, repo, create_opts)
-        end
-      )
+      create_opts.path = default_worktree_path(repo, sanitize_name(target_branch))
+      create_worktree(inner_window, pane, repo, create_opts)
     end)
   end)
 end
@@ -1212,19 +1185,11 @@ local function choose_new_branch(window, pane, repo)
           end
 
           after_overlay(function()
-            prompt_for_worktree_path(
-              branch_window,
-              pane,
-              repo,
-              sanitize_name(new_branch),
-              function(final_window, final_pane, target_path)
-                create_worktree(final_window, pane, repo, {
-                  new_branch = new_branch,
-                  path = target_path,
-                  start_point = start_point,
-                })
-              end
-            )
+            create_worktree(branch_window, pane, repo, {
+              new_branch = new_branch,
+              path = default_worktree_path(repo, sanitize_name(new_branch)),
+              start_point = start_point,
+            })
           end)
         end
       )
@@ -1496,38 +1461,6 @@ end
 
 local choose_worktree_to_remove
 
-local function confirm_and_remove(window, pane, worktree, repos, current_workspace)
-  after_overlay(function()
-    choose(window, pane, {
-      choices = {
-        {
-          id = 'remove',
-          label = 'Remove ' .. worktree.path,
-        },
-        {
-          id = 'back',
-          label = 'Back',
-        },
-      },
-      fuzzy = false,
-      title = 'Remove worktree',
-    }, function(inner_window, _inner_pane, id)
-      if id == 'back' then
-        after_overlay(function()
-          choose_worktree_to_remove(inner_window, pane, repos, current_workspace)
-        end)
-        return
-      end
-
-      if id ~= 'remove' then
-        return
-      end
-
-      remove_worktree(inner_window, worktree)
-    end)
-  end)
-end
-
 local function main_worktree(repo)
   for _, worktree in ipairs(repo.worktrees) do
     if worktree.is_main then
@@ -1644,7 +1577,9 @@ choose_worktree_to_remove = function(window, pane, repos, current_workspace)
       return
     end
 
-    confirm_and_remove(inner_window, pane, worktree, repos, current_workspace)
+    after_overlay(function()
+      remove_worktree(inner_window, worktree)
+    end)
   end)
 end
 
