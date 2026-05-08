@@ -704,6 +704,14 @@ local function choose(window, pane, opts, callback)
 end
 
 local function sanitize_name(name)
+  local function sanitize_component(value)
+    value = value:gsub('[^%w._-]+', '-')
+    value = value:gsub('%-+', '-')
+    value = value:gsub('^%-+', '')
+    value = value:gsub('%-+$', '')
+    return value
+  end
+
   name = trim(name)
   if name == '' then
     return ''
@@ -718,11 +726,24 @@ local function sanitize_name(name)
 
     return prefix
   end)
-  name = name:gsub('[^%w._-]+', '-')
-  name = name:gsub('%-+', '-')
-  name = name:gsub('^%-+', '')
-  name = name:gsub('%-+$', '')
-  return name
+
+  local first, rest = name:match('^([^/]+)/(.+)$')
+  if not first then
+    return sanitize_component(name)
+  end
+
+  first = sanitize_component(first)
+  rest = sanitize_component(rest:gsub('/', '-'))
+
+  if first == '' then
+    return rest
+  end
+
+  if rest == '' then
+    return first
+  end
+
+  return first .. '/' .. rest
 end
 
 local function resolve_branch_prefix(repo)
