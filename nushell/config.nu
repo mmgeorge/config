@@ -124,6 +124,45 @@ def code [...args] {
     }
 }
 
+# Set up a bare git repo with worktree-friendly structure
+def "wt init" [
+    url: string              # Git URL to clone
+    dir?: string             # Project dir name (auto-derived from URL if omitted)
+    --branch: string         # Branch for initial worktree (default: remote's HEAD)
+    --no-worktree            # Skip creating initial worktree
+] {
+    let project_dir = if $dir == null {
+        $url | path basename | str replace -r '\.git$' ''
+    } else {
+        $dir
+    }
+
+    print $"→ Cloning bare repo into ($project_dir)/.bare"
+    git clone --bare $url $"($project_dir)/.bare"
+
+    print $"→ Creating .git pointer file"
+    "gitdir: ./.bare" | save $"($project_dir)/.git"
+
+    print $"→ Fixing fetch refspec"
+    git -C $project_dir config remote.origin.fetch "+refs/heads/*:refs/remotes/origin/*"
+
+    print $"→ Fetching all branches"
+    git -C $project_dir fetch origin
+
+    if not $no_worktree {
+        let target = if $branch == null {
+            git -C $"($project_dir)/.bare" symbolic-ref --short HEAD | str trim
+        } else {
+            $branch
+        }
+        print $"→ Creating worktree for ($target)"
+        git -C $project_dir worktree add $target $target
+        print $"\n✓ Ready! → cd ($project_dir)/($target)"
+    } else {
+        print $"\n✓ Ready! Project at ($project_dir)/"
+    }
+}
+
 def get_git_branch [] {
   let branch_res = (do { git branch --show-current } | complete)
   if $branch_res.exit_code != 0 or ($branch_res.stdout | str trim | is-empty) {

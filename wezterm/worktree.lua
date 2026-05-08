@@ -164,6 +164,10 @@ local function git_capture(cwd, args)
   return trim(stdout), stderr
 end
 
+local function wezterm_executable()
+  return join_path(wezterm.executable_dir, is_windows and 'wezterm.exe' or 'wezterm')
+end
+
 local function list_child_directories(root)
   root = normalize_path(root)
   if not root then
@@ -205,6 +209,54 @@ local function list_child_directories(root)
   end
 
   return results
+end
+
+local function path_exists(path)
+  path = normalize_path(path)
+  if not path then
+    return false
+  end
+
+  if is_windows then
+    local stdout = run_command({
+      'cmd.exe',
+      '/S',
+      '/C',
+      'if exist "' .. path .. '" (echo yes) else (echo no)',
+    })
+    return stdout ~= nil and trim(stdout) == 'yes'
+  end
+
+  return run_command({ 'test', '-e', path }) ~= nil
+end
+
+local function remove_directory_tree(path)
+  path = normalize_path(path)
+  if not path or not path_exists(path) then
+    return true
+  end
+
+  local ok, err
+  if is_windows then
+    ok, err = run_command({
+      'cmd.exe',
+      '/S',
+      '/C',
+      'rmdir /S /Q "' .. path .. '"',
+    })
+  else
+    ok, err = run_command({ 'rm', '-rf', path })
+  end
+
+  if ok == nil and path_exists(path) then
+    return false, err
+  end
+
+  if path_exists(path) then
+    return false, 'Could not remove directory ' .. path
+  end
+
+  return true
 end
 
 local function current_pane_path(pane)
@@ -309,13 +361,13 @@ local function preferred_worktree_parent(worktrees, fallback)
   return best_path
 end
 
-local function build_repo(path)
+local function build_repo(path, common_dir)
   path = normalize_path(path)
   if not path then
     return nil
   end
 
-  local common_dir = git_common_dir(path)
+  common_dir = common_dir or git_common_dir(path)
   if not common_dir then
     return nil
   end
@@ -391,17 +443,20 @@ local function discover_repositories(extra_paths)
     add_candidate(path)
   end
 
-  local repos_by_id = {}
+  local repo_candidates = {}
   for _, candidate in ipairs(candidates) do
-    local repo = build_repo(candidate)
-    if repo and not repos_by_id[repo.id] then
-      repos_by_id[repo.id] = repo
+    local common_dir = git_common_dir(candidate)
+    if common_dir and not repo_candidates[common_dir] then
+      repo_candidates[common_dir] = candidate
     end
   end
 
   local repos = {}
-  for _, repo in pairs(repos_by_id) do
-    table.insert(repos, repo)
+  for common_dir, candidate in pairs(repo_candidates) do
+    local repo = build_repo(candidate, common_dir)
+    if repo then
+      table.insert(repos, repo)
+    end
   end
 
   sort_repos(repos)
@@ -455,6 +510,11 @@ end
 local function pending_layouts()
   wezterm.GLOBAL.worktree_pending_layouts = wezterm.GLOBAL.worktree_pending_layouts or {}
   return wezterm.GLOBAL.worktree_pending_layouts
+end
+
+local function pending_removals()
+  wezterm.GLOBAL.worktree_pending_removals = wezterm.GLOBAL.worktree_pending_removals or {}
+  return wezterm.GLOBAL.worktree_pending_removals
 end
 
 local function resolve_layout(worktree)
@@ -668,6 +728,34 @@ local function find_worktree(repo, path)
   end
 
   return nil
+end
+
+local function path_is_within(path, root)
+  path = normalize_path(path)
+  root = normalize_path(root)
+  if not path or not root then
+    return false
+  end
+
+  return path == root or path:sub(1, #root + 1) == (root .. '/')
+end
+
+local function current_worktree_for_path(repo, path)
+  if not repo then
+    return nil
+  end
+
+  local best_match = nil
+  local best_length = -1
+
+  for _, worktree in ipairs(repo.worktrees) do
+    if path_is_within(path, worktree.path) and #worktree.path > best_length then
+      best_match = worktree
+      best_length = #worktree.path
+    end
+  end
+
+  return best_match
 end
 
 local function create_worktree(window, pane, repo, opts)
@@ -884,9 +972,13 @@ local function start_create_flow(window, pane, repo)
     title = 'Create worktree for ' .. repo.name,
   }, function(inner_window, inner_pane, id)
     if id == 'existing' then
-      choose_existing_branch(inner_window, inner_pane, repo)
+      after_overlay(function()
+        choose_existing_branch(inner_window, pane, repo)
+      end)
     elseif id == 'new' then
-      choose_new_branch(inner_window, inner_pane, repo)
+      after_overlay(function()
+        choose_new_branch(inner_window, pane, repo)
+      end)
     end
   end)
 end
@@ -908,7 +1000,9 @@ local function choose_repo_for_creation(window, pane, current_repo, repos)
           return
         end
 
-        start_create_flow(inner_window, inner_pane, repo)
+        after_overlay(function()
+          start_create_flow(inner_window, pane, repo)
+        end)
       end
     )
     return
@@ -941,46 +1035,47 @@ local function choose_repo_for_creation(window, pane, current_repo, repos)
     end
 
     if id == '__manual__' then
-      prompt(
-        inner_window,
-        inner_pane,
-        'Repository path to use for the new worktree',
-        function(path_window, path_pane, line)
-          if line == nil then
-            return
-          end
+      after_overlay(function()
+        prompt(
+          inner_window,
+          pane,
+          'Repository path to use for the new worktree',
+          function(path_window, path_pane, line)
+            if line == nil then
+              return
+            end
 
-          local repo = build_repo(line)
-          if not repo then
-            notify(path_window, 'That path is not inside a git repository')
-            return
-          end
+            local repo = build_repo(line)
+            if not repo then
+              notify(path_window, 'That path is not inside a git repository')
+              return
+            end
 
-          start_create_flow(path_window, path_pane, repo)
-        end
-      )
+            after_overlay(function()
+              start_create_flow(path_window, pane, repo)
+            end)
+          end
+        )
+      end)
       return
     end
 
     for _, repo in ipairs(repos) do
       if repo.id == id then
-        start_create_flow(inner_window, inner_pane, repo)
+        after_overlay(function()
+          start_create_flow(inner_window, pane, repo)
+        end)
         return
       end
     end
   end)
 end
 
-local function removable_worktrees(repos)
-  local open_workspaces = {}
-  for _, name in ipairs(wezterm.mux.get_workspace_names()) do
-    open_workspaces[name] = true
-  end
-
+local function removable_worktrees(repos, current_workspace)
   local removable = {}
   for _, repo in ipairs(repos) do
     for _, worktree in ipairs(repo.worktrees) do
-      if not worktree.is_main and not open_workspaces[worktree.workspace_name] then
+      if not worktree.is_main and worktree.workspace_name ~= current_workspace then
         table.insert(removable, worktree)
       end
     end
@@ -990,53 +1085,269 @@ local function removable_worktrees(repos)
   return removable
 end
 
-local function confirm_and_remove(window, pane, worktree)
-  choose(window, pane, {
-    choices = {
-      {
-        id = 'cancel',
-        label = 'Cancel',
-      },
-      {
-        id = 'remove',
-        label = 'Remove ' .. worktree.path,
-      },
-    },
-    fuzzy = false,
-    title = 'Remove worktree',
-  }, function(inner_window, _inner_pane, id)
-    if id ~= 'remove' then
-      return
+local function workspace_panes(workspace_name)
+  local panes = {}
+  for _, mux_window in ipairs(wezterm.mux.all_windows()) do
+    if mux_window:get_workspace() == workspace_name then
+      for _, tab in ipairs(mux_window:tabs()) do
+        for _, pane in ipairs(tab:panes()) do
+          table.insert(panes, pane)
+        end
+      end
     end
+  end
 
+  return panes
+end
+
+local function close_workspace_panes(workspace_name)
+  local panes = workspace_panes(workspace_name)
+
+  for _, pane in ipairs(panes) do
+    run_command({
+      wezterm_executable(),
+      'cli',
+      'kill-pane',
+      '--pane-id',
+      tostring(pane:pane_id()),
+    })
+  end
+
+  return #panes
+end
+
+local finish_remove_worktree
+
+local function worktree_is_registered(worktree)
+  local worktrees = parse_worktrees(worktree.repo_main_path)
+  if not worktrees then
+    return nil
+  end
+
+  for _, candidate in ipairs(worktrees) do
+    if candidate.path == normalize_path(worktree.path) then
+      return true
+    end
+  end
+
+  return false
+end
+
+local function wait_for_workspace_to_close(window, worktree, workspace_name, attempts_remaining)
+  if #workspace_panes(workspace_name) == 0 then
+    return finish_remove_worktree(window, worktree)
+  end
+
+  if attempts_remaining <= 0 then
+    notify(window, 'Could not close workspace ' .. workspace_name .. ' before removal')
+    return false
+  end
+
+  close_workspace_panes(workspace_name)
+  wezterm.time.call_after(0.1, function()
+    wait_for_workspace_to_close(window, worktree, workspace_name, attempts_remaining - 1)
+  end)
+
+  return true
+end
+
+finish_remove_worktree = function(window, worktree, attempts_remaining)
+  attempts_remaining = attempts_remaining or 20
+
+  local registered = worktree_is_registered(worktree)
+  if registered == nil then
+    notify(window, 'Could not inspect worktree state for ' .. worktree.path)
+    return false
+  end
+
+  if registered then
     local stdout, stderr = git_output(worktree.repo_main_path, {
       'worktree',
       'remove',
+      '--force',
       worktree.path,
     })
 
     if not stdout then
-      notify(inner_window, stderr)
-      return
-    end
+      if attempts_remaining > 0 then
+        wezterm.time.call_after(0.2, function()
+          finish_remove_worktree(window, worktree, attempts_remaining - 1)
+        end)
+        return true
+      end
 
-    git_output(worktree.repo_main_path, { 'worktree', 'prune' })
-    notify(inner_window, 'Removed ' .. worktree.path)
+      notify(window, stderr)
+      return false
+    end
+  end
+
+  git_output(worktree.repo_main_path, { 'worktree', 'prune' })
+
+  if path_exists(worktree.path) then
+    local ok, err = remove_directory_tree(worktree.path)
+    if not ok then
+      if attempts_remaining > 0 then
+        wezterm.time.call_after(0.2, function()
+          finish_remove_worktree(window, worktree, attempts_remaining - 1)
+        end)
+        return true
+      end
+
+      notify(window, err or ('Could not remove directory ' .. worktree.path))
+      return false
+    end
+  end
+
+  notify(window, 'Removed ' .. worktree.path)
+  return true
+end
+
+local function remove_worktree(window, worktree)
+  local workspace_name = worktree.worktree_workspace_name or worktree.workspace_name
+  if workspace_name and #workspace_panes(workspace_name) > 0 then
+    close_workspace_panes(workspace_name)
+    wezterm.time.call_after(0.1, function()
+      wait_for_workspace_to_close(window, worktree, workspace_name, 20)
+    end)
+    return true
+  end
+
+  return finish_remove_worktree(window, worktree)
+end
+
+local choose_worktree_to_remove
+
+local function confirm_and_remove(window, pane, worktree, repos, current_workspace)
+  after_overlay(function()
+    choose(window, pane, {
+      choices = {
+        {
+          id = 'remove',
+          label = 'Remove ' .. worktree.path,
+        },
+        {
+          id = 'back',
+          label = 'Back',
+        },
+      },
+      fuzzy = false,
+      title = 'Remove worktree',
+    }, function(inner_window, _inner_pane, id)
+      if id == 'back' then
+        after_overlay(function()
+          choose_worktree_to_remove(inner_window, pane, repos, current_workspace)
+        end)
+        return
+      end
+
+      if id ~= 'remove' then
+        return
+      end
+
+      remove_worktree(inner_window, worktree)
+    end)
   end)
 end
 
-local function choose_worktree_to_remove(window, pane, repos)
-  local removable = removable_worktrees(repos)
+local function main_worktree(repo)
+  for _, worktree in ipairs(repo.worktrees) do
+    if worktree.is_main then
+      return worktree
+    end
+  end
+
+  return nil
+end
+
+local function choose_removal_destination(current_workspace, repo)
+  local previous = wezterm.GLOBAL.previous_workspace
+  if previous and previous ~= current_workspace then
+    return { name = previous }
+  end
+
+  for _, workspace in ipairs(wezterm.mux.get_workspace_names()) do
+    if workspace ~= current_workspace then
+      return { name = workspace }
+    end
+  end
+
+  local main = main_worktree(repo)
+  if main and main.workspace_name ~= current_workspace then
+    return {
+      cwd = main.path,
+      name = main.workspace_name,
+    }
+  end
+
+  return {
+    cwd = wezterm.home_dir,
+    name = 'default',
+  }
+end
+
+local function confirm_and_remove_current(window, pane, worktree, repo)
+  after_overlay(function()
+    choose(window, pane, {
+      choices = {
+        {
+          id = 'remove-current',
+          label = 'Remove ' .. worktree.path,
+        },
+        {
+          id = 'back',
+          label = 'Back',
+        },
+      },
+      fuzzy = false,
+      title = 'Remove current worktree',
+    }, function(inner_window, _inner_pane, id)
+      if id == 'back' then
+        after_overlay(function()
+          inner_window:perform_action(M.menu(), pane)
+        end)
+        return
+      end
+
+      if id ~= 'remove-current' then
+        return
+      end
+
+      local current_workspace = inner_window:active_workspace()
+      local target = choose_removal_destination(current_workspace, repo)
+      pending_removals()[target.name] = {
+        path = worktree.path,
+        repo_main_path = worktree.repo_main_path,
+        target_workspace_name = target.name,
+        worktree_workspace_name = worktree.workspace_name,
+      }
+
+      inner_window:perform_action(
+        act.SwitchToWorkspace({
+          name = target.name,
+          spawn = target.cwd and {
+            cwd = target.cwd,
+            label = target.name,
+          } or nil,
+        }),
+        pane
+      )
+    end)
+  end)
+end
+
+choose_worktree_to_remove = function(window, pane, repos, current_workspace)
+  local removable = removable_worktrees(repos, current_workspace)
   if #removable == 0 then
-    notify(window, 'No closed linked worktrees are available to remove')
+    notify(window, 'No linked worktrees are available to remove')
     return
   end
 
   local choices = {}
   for _, worktree in ipairs(removable) do
+    local state = workspace_exists(worktree.workspace_name) and 'open' or 'closed'
     table.insert(choices, {
       id = worktree.path,
-      label = worktree.repo_name .. ' [' .. (worktree.branch_name or 'detached') .. '] - ' .. basename(worktree.path),
+      label = worktree.repo_name .. ' [' .. (worktree.branch_name or 'detached') .. '] - ' .. basename(worktree.path) .. ' (' .. state .. ')',
     })
   end
 
@@ -1054,7 +1365,7 @@ local function choose_worktree_to_remove(window, pane, repos)
       return
     end
 
-    confirm_and_remove(inner_window, inner_pane, worktree)
+    confirm_and_remove(inner_window, pane, worktree, repos, current_workspace)
   end)
 end
 
@@ -1068,6 +1379,11 @@ end
 function M.handle_update_status(window, pane)
   local pending = pending_layouts()[window:active_workspace()]
   if not pending then
+    local pending_removal = pending_removals()[window:active_workspace()]
+    if pending_removal then
+      pending_removals()[pending_removal.target_workspace_name] = nil
+      remove_worktree(window, pending_removal)
+    end
     return
   end
 
@@ -1078,16 +1394,23 @@ function M.handle_update_status(window, pane)
       run_first_run_commands(primary_pane, pending.first_run_commands)
     end)
   end
+
+  local pending_removal = pending_removals()[window:active_workspace()]
+  if pending_removal then
+    pending_removals()[pending_removal.target_workspace_name] = nil
+    remove_worktree(window, pending_removal)
+  end
 end
 
 function M.menu()
   return wezterm.action_callback(function(window, pane)
+    local current_path = current_pane_path(pane)
     local current_repo = repo_for_pane(pane)
+    local current_worktree = current_worktree_for_path(current_repo, current_path)
     local extra_paths = {}
     if current_repo then
       table.insert(extra_paths, current_repo.main_path)
     else
-      local current_path = current_pane_path(pane)
       if current_path then
         table.insert(extra_paths, current_path)
       end
@@ -1101,6 +1424,13 @@ function M.menu()
         id = 'create-current',
         label = '+ New worktree from current repo (' .. current_repo.name .. ')',
       })
+
+      if current_worktree and not current_worktree.is_main then
+        table.insert(choices, {
+          id = 'remove-current',
+          label = '- Remove current worktree (' .. basename(current_worktree.path) .. ')',
+        })
+      end
     end
 
     table.insert(choices, {
@@ -1129,20 +1459,37 @@ function M.menu()
 
       if id == 'create-current' then
         if current_repo then
-          start_create_flow(inner_window, inner_pane, current_repo)
+          after_overlay(function()
+            start_create_flow(inner_window, pane, current_repo)
+          end)
         else
           notify(inner_window, 'Current pane is not inside a git repository')
         end
         return
       end
 
+      if id == 'remove-current' then
+        if current_repo and current_worktree and not current_worktree.is_main then
+          after_overlay(function()
+            confirm_and_remove_current(inner_window, pane, current_worktree, current_repo)
+          end)
+        else
+          notify(inner_window, 'Current pane is not in a removable linked worktree')
+        end
+        return
+      end
+
       if id == 'create-repo' then
-        choose_repo_for_creation(inner_window, inner_pane, current_repo, repos)
+        after_overlay(function()
+          choose_repo_for_creation(inner_window, pane, current_repo, repos)
+        end)
         return
       end
 
       if id == 'remove' then
-        choose_worktree_to_remove(inner_window, inner_pane, repos)
+        after_overlay(function()
+          choose_worktree_to_remove(inner_window, pane, repos, window:active_workspace())
+        end)
         return
       end
 
