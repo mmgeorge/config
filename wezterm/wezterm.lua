@@ -207,6 +207,11 @@ config.keys           = {
     action = worktree.menu(),
   },
   {
+    key = 'j',
+    mods = 'LEADER',
+    action = worktree.remove_current_session(),
+  },
+  {
     key = 'S',
     mods = 'LEADER',
     action = wezterm.action_callback(function(window, pane)

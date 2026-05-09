@@ -105,6 +105,9 @@ Keep this distinction explicit in labels and removal logic.
 
 - Removing an open worktree requires closing panes in its WezTerm workspace or
   switching away first.
+- Removing a workspace/session from the launcher follows the same pattern:
+  switch to a different workspace first, then close the panes in the old
+  workspace so it disappears from the workspace list.
 - Do **not** use `window:perform_action(CloseCurrentPane, pane)` with panes from
   another workspace. It can target the wrong GUI window and close the current
   session. For cross-workspace closure, use `wezterm cli kill-pane --pane-id`

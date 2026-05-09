@@ -51,7 +51,7 @@ M.settings = {
           { title = 'copilot',
             first_run_commands = {
               commands = {
-                'co',
+                'load-env { "COPILOT_CUSTOM_INSTRUCTIONS_DIRS": "/Users/matt9222/Developer/maps/prompts" }; co',
               },
             },
           },
@@ -585,6 +585,11 @@ end
 local function pending_removals()
   wezterm.GLOBAL.worktree_pending_removals = wezterm.GLOBAL.worktree_pending_removals or {}
   return wezterm.GLOBAL.worktree_pending_removals
+end
+
+local function pending_session_removals()
+  wezterm.GLOBAL.worktree_pending_session_removals = wezterm.GLOBAL.worktree_pending_session_removals or {}
+  return wezterm.GLOBAL.worktree_pending_session_removals
 end
 
 local function repo_settings(repo_name)
@@ -1652,19 +1657,19 @@ local function worktree_is_registered(worktree)
   return false
 end
 
-local function wait_for_workspace_to_close(window, worktree, workspace_name, attempts_remaining)
+local function wait_for_workspace_to_close(window, workspace_name, attempts_remaining, on_closed, failure_message)
   if #workspace_panes(workspace_name) == 0 then
-    return finish_remove_worktree(window, worktree)
+    return on_closed()
   end
 
   if attempts_remaining <= 0 then
-    notify(window, 'Could not close workspace ' .. workspace_name .. ' before removal')
+    notify(window, failure_message or ('Could not close workspace ' .. workspace_name))
     return false
   end
 
   close_workspace_panes(workspace_name)
   wezterm.time.call_after(0.1, function()
-    wait_for_workspace_to_close(window, worktree, workspace_name, attempts_remaining - 1)
+    wait_for_workspace_to_close(window, workspace_name, attempts_remaining - 1, on_closed, failure_message)
   end)
 
   return true
@@ -1726,7 +1731,15 @@ local function remove_worktree(window, worktree)
   if workspace_name and #workspace_panes(workspace_name) > 0 then
     close_workspace_panes(workspace_name)
     wezterm.time.call_after(0.1, function()
-      wait_for_workspace_to_close(window, worktree, workspace_name, 20)
+      wait_for_workspace_to_close(
+        window,
+        workspace_name,
+        20,
+        function()
+          return finish_remove_worktree(window, worktree)
+        end,
+        'Could not close workspace ' .. workspace_name .. ' before removal'
+      )
     end)
     return true
   end
@@ -1746,9 +1759,9 @@ local function main_worktree(repo)
   return nil
 end
 
-local function choose_removal_destination(current_workspace, repo)
+local function choose_workspace_destination(current_workspace, fallback)
   local previous = wezterm.GLOBAL.previous_workspace
-  if previous and previous ~= current_workspace then
+  if previous and previous ~= current_workspace and workspace_exists(previous) then
     return { name = previous }
   end
 
@@ -1758,18 +1771,37 @@ local function choose_removal_destination(current_workspace, repo)
     end
   end
 
-  local main = main_worktree(repo)
-  if main and main.workspace_name ~= current_workspace then
+  if fallback and fallback.name and fallback.name ~= current_workspace then
+    return fallback
+  end
+
+  if current_workspace ~= 'default' then
     return {
-      cwd = main.path,
-      name = main.workspace_name,
+      cwd = wezterm.home_dir,
+      name = 'default',
     }
   end
 
   return {
     cwd = wezterm.home_dir,
-    name = 'default',
+    name = 'home',
   }
+end
+
+local function clear_removed_workspace_references(workspace_name)
+  if wezterm.GLOBAL.previous_workspace == workspace_name then
+    wezterm.GLOBAL.previous_workspace = nil
+  end
+
+  if wezterm.GLOBAL.current_workspace == workspace_name then
+    wezterm.GLOBAL.current_workspace = nil
+  end
+end
+
+local function finish_remove_session(window, workspace_name)
+  clear_removed_workspace_references(workspace_name)
+  notify(window, 'Removed session ' .. workspace_name)
+  return true
 end
 
 local function confirm_and_remove_current(window, pane, worktree, repo)
@@ -1800,7 +1832,15 @@ local function confirm_and_remove_current(window, pane, worktree, repo)
       end
 
       local current_workspace = inner_window:active_workspace()
-      local target = choose_removal_destination(current_workspace, repo)
+      local main = main_worktree(repo)
+      local fallback = nil
+      if main and main.workspace_name ~= current_workspace then
+        fallback = {
+          cwd = main.path,
+          name = main.workspace_name,
+        }
+      end
+      local target = choose_workspace_destination(current_workspace, fallback)
       pending_removals()[target.name] = {
         path = worktree.path,
         repo_main_path = worktree.repo_main_path,
@@ -1819,6 +1859,33 @@ local function confirm_and_remove_current(window, pane, worktree, repo)
         pane
       )
     end)
+  end)
+end
+
+function M.remove_current_session()
+  return wezterm.action_callback(function(window, pane)
+    local current_workspace = window:active_workspace()
+    local target = choose_workspace_destination(current_workspace)
+    if not target or target.name == current_workspace then
+      notify(window, 'Could not determine a session to switch to before removal')
+      return
+    end
+
+    pending_session_removals()[target.name] = {
+      source_workspace_name = current_workspace,
+      target_workspace_name = target.name,
+    }
+
+    window:perform_action(
+      act.SwitchToWorkspace({
+        name = target.name,
+        spawn = target.cwd and {
+          cwd = target.cwd,
+          label = target.name,
+        } or nil,
+      }),
+      pane
+    )
   end)
 end
 
@@ -1873,6 +1940,20 @@ function M.handle_update_status(window, pane)
       pending_removals()[pending_removal.target_workspace_name] = nil
       remove_worktree(window, pending_removal)
     end
+
+    local pending_session_removal = pending_session_removals()[window:active_workspace()]
+    if pending_session_removal then
+      pending_session_removals()[pending_session_removal.target_workspace_name] = nil
+      wait_for_workspace_to_close(
+        window,
+        pending_session_removal.source_workspace_name,
+        20,
+        function()
+          return finish_remove_session(window, pending_session_removal.source_workspace_name)
+        end,
+        'Could not close session ' .. pending_session_removal.source_workspace_name
+      )
+    end
     return
   end
 
@@ -1898,6 +1979,20 @@ function M.handle_update_status(window, pane)
   if pending_removal then
     pending_removals()[pending_removal.target_workspace_name] = nil
     remove_worktree(window, pending_removal)
+  end
+
+  local pending_session_removal = pending_session_removals()[window:active_workspace()]
+  if pending_session_removal then
+    pending_session_removals()[pending_session_removal.target_workspace_name] = nil
+    wait_for_workspace_to_close(
+      window,
+      pending_session_removal.source_workspace_name,
+      20,
+      function()
+        return finish_remove_session(window, pending_session_removal.source_workspace_name)
+      end,
+      'Could not close session ' .. pending_session_removal.source_workspace_name
+    )
   end
 end
 

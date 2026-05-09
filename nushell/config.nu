@@ -29,27 +29,27 @@ alias top = btop
 alias h = yazi
 alias python = python3
 
-def get_copilot_instruction_dirs [] {
-    let default_dir = ($env.XDG_CONFIG_HOME | path join "copilot")
-    let git_common_res = (do { ^git rev-parse --path-format=absolute --git-common-dir } | complete)
-
-    if $git_common_res.exit_code != 0 or ($git_common_res.stdout | str trim | is-empty) {
-        return [$default_dir]
-    }
-
-    let repo_name = ($git_common_res.stdout | str trim | path dirname | path basename)
-    let shared_agents_dir = ($env.HOME | path join "Developer" | path join "agents")
-    let repo_agents_dir = ($shared_agents_dir | path join $repo_name)
-
-    [
-        $default_dir
-        $shared_agents_dir
-        $repo_agents_dir
-    ]
-}
-
+# def get_copilot_instruction_dirs [] {
+#     let default_dir = ($env.XDG_CONFIG_HOME | path join "copilot")
+#     let git_common_res = (do { ^git rev-parse --path-format=absolute --git-common-dir } | complete)
+#
+#     if $git_common_res.exit_code != 0 or ($git_common_res.stdout | str trim | is-empty) {
+#         return [$default_dir]
+#     }
+#
+#     let repo_name = ($git_common_res.stdout | str trim | path dirname | path basename)
+#     let shared_agents_dir = ($env.HOME | path join "Developer" | path join "agents")
+#     let repo_agents_dir = ($shared_agents_dir | path join $repo_name)
+#
+#     [
+#         $default_dir
+#         $shared_agents_dir
+#         $repo_agents_dir
+#     ]
+# }
+#
 def --wrapped co [...args] {
-    let instruction_dirs = (get_copilot_instruction_dirs)
+    # let instruction_dirs = (get_copilot_instruction_dirs)
     let copilot_args = [
         --no-auto-update
         --yolo
@@ -106,12 +106,13 @@ def --wrapped co [...args] {
         --add-dir '/Users/matt9222/Developer/agents'
         --add-dir '/Users/matt9222/config/copilot/.github/instructions'
     ]
+  ^copilot ...$copilot_args ...$args
 
-    with-env {
-        COPILOT_CUSTOM_INSTRUCTIONS_DIRS: ($instruction_dirs | str join ",")
-    } {
-        ^copilot ...$copilot_args ...$args
-    }
+    # with-env {
+    #     COPILOT_CUSTOM_INSTRUCTIONS_DIRS: ($instruction_dirs | str join ",")
+    # } {
+    #     ^copilot ...$copilot_args ...$args
+    # }
 }
 
 # $env.VSCODE_APPDATA = $"($env.XDG_CONFIG_HOME)/vscode"
