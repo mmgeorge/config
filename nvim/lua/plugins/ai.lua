@@ -26,7 +26,10 @@ local function adapters()
     inline = "copilot",
     cmd = "copilot",
     background = "copilot",
-    commit = "copilot",
+    commit = {
+      name = "copilot",
+      model = "gpt-4.1",
+    },
   }
 end
 
@@ -153,17 +156,49 @@ return {
           local adapter_config = adapters().commit
           local adapter_name = type(adapter_config) == "table" and adapter_config.model or adapter_config
           local background = Background.new({ adapter = adapter_config })
+          local inline_output = background
+              and background.adapter
+              and background.adapter.handlers
+              and background.adapter.handlers.inline_output
+
+          if type(inline_output) == "function" and not background.adapter.handlers._commit_safe_inline_output then
+            background.adapter.handlers.inline_output = function(self, data, context)
+              if type(data) == "string" then
+                data = { body = data }
+              end
+
+              return inline_output(self, data, context)
+            end
+            background.adapter.handlers._commit_safe_inline_output = true
+          end
 
           local spinner = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
           local notif_id = "commit_msg"
+          local spinner_index = 1
+          local spinner_timer = vim.uv.new_timer()
 
-          vim.notify("Generating commit message...", "info", {
-            id = notif_id,
-            title = "commit (" .. adapter_name .. ")",
-            opts = function(notif)
-              notif.icon = spinner[math.floor(vim.uv.hrtime() / (1e6 * 80)) % #spinner + 1]
-            end,
-          })
+          local function stop_spinner()
+            if spinner_timer and not spinner_timer:is_closing() then
+              spinner_timer:stop()
+              spinner_timer:close()
+            end
+          end
+
+          local function show_spinner()
+            vim.notify("Generating commit message...", "info", {
+              id = notif_id,
+              title = "commit (" .. adapter_name .. ")",
+              icon = spinner[spinner_index],
+              timeout = false,
+            })
+          end
+
+          show_spinner()
+
+          spinner_timer:start(80, 80, vim.schedule_wrap(function()
+            spinner_index = (spinner_index % #spinner) + 1
+            show_spinner()
+          end))
 
           background:ask({
             {
@@ -194,18 +229,27 @@ Body (optional):
             },
           }, {
             method = "async",
+            parse_handler = "parse_inline",
             silent = true,
             on_done = function(result)
               vim.schedule(function()
+                stop_spinner()
                 if not vim.api.nvim_buf_is_valid(args.buf) then return end
+ 
+                local content = result and result.output
+                if type(content) == "table" then
+                  content = content.content
+                end
 
-                local content = result and result.output and result.output.content
-                if not content then
-                  vim.notify("No response from model", "warn", { id = notif_id, title = "commit" })
+                if type(content) ~= "string" or vim.trim(content) == "" then
+                  local message = "No response from model"
+                  if result and result.status == "error" and type(result.output) == "string" then
+                    message = result.output
+                  end
+                  vim.notify(message, "warn", { id = notif_id, title = "commit" })
                   return
                 end
                 local msg = vim.trim(content)
-                if msg == "" then return end
 
                 msg = msg:gsub("^```%w*\n", ""):gsub("\n```$", "")
 
@@ -226,6 +270,7 @@ Body (optional):
             end,
             on_error = function(err)
               vim.schedule(function()
+                stop_spinner()
                 vim.notify("Failed: " .. tostring(err), "error", {
                   id = notif_id,
                   title = "commit (" .. adapter_name .. ")",

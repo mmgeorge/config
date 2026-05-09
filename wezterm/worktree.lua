@@ -25,10 +25,24 @@ M.settings = {
     -- Add repo-specific layouts here, keyed by the repo directory name.
     by_repo = {
       ['maps'] = {
-        branch_prefix = 'matt9222/',
-        first_run_commands = {
-          'pnpm install; pnpm run codegen',
+        tabs = {
+          { title = 'main',
+            args = { "nvim" },
+            panes = {
+              {
+                direction = 'Bottom',
+                size = 0.35,
+                first_run_commands = {
+                  commands = {
+                    'git submodule update --init --recursive; pnpm install; pnpm run codegen',
+                  },
+                },
+              },
+            },
+          },
+          { title = 'copilot' },
         },
+        branch_prefix = 'matt9222/',
       },
     },
   },
@@ -565,14 +579,67 @@ local function repo_settings(repo_name)
   return by_repo[repo_name] or {}
 end
 
+local function normalize_first_run(first_run)
+  if not first_run then
+    return nil
+  end
+
+  if type(first_run) ~= 'table' then
+    return {
+      commands = { tostring(first_run) },
+      target = nil,
+    }
+  end
+
+  if first_run.commands ~= nil or first_run.target ~= nil then
+    local commands = first_run.commands or {}
+    if type(commands) ~= 'table' then
+      commands = { tostring(commands) }
+    end
+
+    return {
+      commands = commands,
+      target = first_run.target,
+    }
+  end
+
+  return {
+    commands = first_run,
+    target = nil,
+  }
+end
+
+local function first_run_commands_for_spec(spec)
+  if not spec then
+    return nil
+  end
+
+  local normalized = normalize_first_run(spec.first_run_commands or spec.first_run)
+  if not normalized or not normalized.commands or #normalized.commands == 0 then
+    return nil
+  end
+
+  return normalized.commands
+end
+
 local function resolve_layout(worktree)
   local layouts = M.settings.layouts or {}
   local default_layout = layouts.default or {}
   local repo_layout = repo_settings(worktree.repo_name)
+  local first_run = repo_layout.first_run_commands
+  if first_run == nil then
+    first_run = repo_layout.first_run
+  end
+  if first_run == nil then
+    first_run = default_layout.first_run_commands
+  end
+  if first_run == nil then
+    first_run = default_layout.first_run
+  end
 
   return {
     tabs = repo_layout.tabs or default_layout.tabs,
-    first_run_commands = repo_layout.first_run_commands,
+    first_run = normalize_first_run(first_run),
   }
 end
 
@@ -589,64 +656,223 @@ local function resolve_layout_cwd(worktree_path, cwd)
   return join_path(worktree_path, cwd)
 end
 
+local function startup_command_for_spec(worktree_path, spec)
+  if not spec then
+    return nil
+  end
+
+  local commands = {}
+  if spec.cwd and normalize_path(resolve_layout_cwd(worktree_path, spec.cwd)) ~= normalize_path(worktree_path) then
+    table.insert(commands, wezterm.shell_join_args({ 'cd', resolve_layout_cwd(worktree_path, spec.cwd) }))
+  end
+
+  for _, command in ipairs(first_run_commands_for_spec(spec) or {}) do
+    table.insert(commands, command)
+  end
+
+  if spec.args and #spec.args > 0 then
+    table.insert(commands, 'exec ' .. wezterm.shell_join_args(spec.args))
+  end
+
+  if #commands == 0 then
+    return nil
+  end
+
+  return table.concat(commands, ' && ')
+end
+
 local function apply_tab_layout(tab, pane, worktree_path, spec)
+  local tab_state = {
+    panes = {
+      {
+        pane = pane,
+        spec = spec,
+        startup_command = startup_command_for_spec(worktree_path, spec),
+      },
+    },
+    root_pane = pane,
+    root_spec = spec,
+    title = spec.title,
+  }
+
   if spec.title and tab then
     tab:set_title(spec.title)
   end
 
   for _, pane_spec in ipairs(spec.panes or {}) do
-    pane:split({
+    local new_pane = pane:split({
       cwd = resolve_layout_cwd(worktree_path, pane_spec.cwd),
-      args = pane_spec.args,
       direction = pane_spec.direction or 'Right',
       size = pane_spec.size or 0.5,
       top_level = pane_spec.top_level,
     })
+    table.insert(tab_state.panes, {
+      pane = new_pane,
+      spec = pane_spec,
+      startup_command = startup_command_for_spec(worktree_path, pane_spec),
+    })
   end
+
+  return tab_state
+end
+
+local function first_run_target_pane(tab_state, first_run)
+  if not first_run or not first_run.commands or #first_run.commands == 0 then
+    return nil
+  end
+
+  local root_starts_program = tab_state.root_spec and tab_state.root_spec.args and #tab_state.root_spec.args > 0
+  if root_starts_program then
+    for index = 2, #tab_state.panes do
+      local pane_info = tab_state.panes[index]
+      if not pane_info.spec.args or #pane_info.spec.args == 0 then
+        return pane_info.pane
+      end
+    end
+  end
+
+  return tab_state.root_pane
+end
+
+local function find_tab_state(tab_states, target)
+  if target == nil then
+    return tab_states[1]
+  end
+
+  if type(target) == 'number' then
+    return tab_states[target]
+  end
+
+  if type(target) == 'string' then
+    for _, tab_state in ipairs(tab_states) do
+      if tab_state.title == target then
+        return tab_state
+      end
+    end
+  end
+
+  return nil
+end
+
+local function resolve_first_run_pane(tab_states, first_run)
+  if not first_run or not first_run.commands or #first_run.commands == 0 then
+    return nil, nil
+  end
+
+  local target = first_run.target
+  if not target then
+    return first_run_target_pane(tab_states[1], first_run), nil
+  end
+
+  if type(target) ~= 'table' then
+    target = { tab = target }
+  end
+
+  local tab_state = find_tab_state(tab_states, target.tab)
+  if not tab_state then
+    return first_run_target_pane(tab_states[1], first_run), 'Could not resolve first_run_commands target tab'
+  end
+
+  local pane_index = target.pane or 1
+  local pane_info = tab_state.panes[pane_index]
+  if not pane_info then
+    return first_run_target_pane(tab_state, first_run), 'Could not resolve first_run_commands target pane'
+  end
+
+  return pane_info.pane, nil
+end
+
+local function add_startup_command(startup_commands, pane, command, opts)
+  opts = opts or {}
+  if not pane or not command or command == '' then
+    return
+  end
+
+  for _, startup in ipairs(startup_commands) do
+    if startup.pane == pane then
+      if opts.prepend then
+        startup.command = command .. ' && ' .. startup.command
+      else
+        startup.command = startup.command .. ' && ' .. command
+      end
+      return
+    end
+  end
+
+  table.insert(startup_commands, {
+    pane = pane,
+    command = command,
+  })
 end
 
 local function apply_layout(window, pane, worktree)
   local layout = resolve_layout(worktree)
   if not layout then
-    return pane
+    return {
+      first_run_warning = nil,
+      startup_commands = {},
+    }
   end
 
   local tabs = layout.tabs or {}
   if #tabs == 0 then
-    return pane
+    return {
+      first_run_warning = nil,
+      startup_commands = {},
+    }
   end
 
-  apply_tab_layout(window:active_tab(), pane, worktree.path, tabs[1])
+  local first_tab_state = apply_tab_layout(window:active_tab(), pane, worktree.path, tabs[1])
+  local tab_states = { first_tab_state }
 
   local mux_window = window:mux_window()
   for index = 2, #tabs do
     local tab_spec = tabs[index]
     local tab, tab_pane = mux_window:spawn_tab({
       cwd = resolve_layout_cwd(worktree.path, tab_spec.cwd),
-      args = tab_spec.args,
     })
-    apply_tab_layout(tab, tab_pane, worktree.path, tab_spec)
+    table.insert(tab_states, apply_tab_layout(tab, tab_pane, worktree.path, tab_spec))
   end
 
   if #tabs > 1 then
     window:perform_action(act.ActivateTab(0), pane)
   end
 
-  return pane
+  local startup_commands = {}
+  for _, tab_state in ipairs(tab_states) do
+    for _, pane_info in ipairs(tab_state.panes) do
+      add_startup_command(startup_commands, pane_info.pane, pane_info.startup_command)
+    end
+  end
+
+  local first_run_pane, first_run_warning = resolve_first_run_pane(tab_states, worktree.first_run)
+  if first_run_pane and worktree.first_run and worktree.first_run.commands and #worktree.first_run.commands > 0 then
+    add_startup_command(
+      startup_commands,
+      first_run_pane,
+      table.concat(worktree.first_run.commands, ' && '),
+      { prepend = true }
+    )
+  end
+
+  return {
+    first_run_warning = first_run_warning,
+    startup_commands = startup_commands,
+  }
 end
 
-local function run_first_run_commands(pane, commands)
-  if not pane or not commands or #commands == 0 then
+local function run_shell_command_in_pane(pane, command)
+  if not pane or not command or command == '' then
     return
   end
 
-  pane:send_text(table.concat(commands, ' && ') .. '\n')
+  pane:send_text(command .. '\n')
 end
 
 local function queue_layout(worktree, opts)
   opts = opts or {}
   pending_layouts()[worktree.workspace_name] = {
-    first_run_commands = opts.first_run_commands,
+    first_run = opts.first_run,
     path = worktree.path,
     repo_name = worktree.repo_name,
     workspace_name = worktree.workspace_name,
@@ -880,7 +1106,7 @@ local function create_worktree(window, pane, repo, opts)
   end
 
   switch_to_worktree(window, pane, worktree, {
-    first_run_commands = resolve_layout(worktree).first_run_commands,
+    first_run = resolve_layout(worktree).first_run,
   })
 end
 
@@ -1623,10 +1849,16 @@ function M.handle_update_status(window, pane)
   end
 
   pending_layouts()[pending.workspace_name] = nil
-  local primary_pane = apply_layout(window, pane, pending)
-  if pending.first_run_commands then
+  local layout_state = apply_layout(window, pane, pending)
+  if #layout_state.startup_commands > 0 then
     after_overlay(function()
-      run_first_run_commands(primary_pane, pending.first_run_commands)
+      if layout_state.first_run_warning then
+        notify(window, layout_state.first_run_warning)
+      end
+
+      for _, startup in ipairs(layout_state.startup_commands) do
+        run_shell_command_in_pane(startup.pane, startup.command)
+      end
     end)
   end
 

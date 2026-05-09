@@ -90,6 +90,12 @@ Keep this distinction explicit in labels and removal logic.
   `ActivateTab(0)`.
 - Repo-specific bootstrap commands should run only on first workspace creation,
   after the layout exists, usually in the primary pane.
+- Prefer putting `first_run_commands` on the tab or pane spec that should run
+  them. Keep the older repo-level targeted form only as a fallback when you need
+  a single shared bootstrap block.
+- Pane/tab startup commands that also use `args` should be launched from a shell
+  and then `exec ...` into the program, so setup commands and editor startup can
+  share the same pane predictably.
 
 ## Safe removal
 
