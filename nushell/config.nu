@@ -240,7 +240,7 @@ def --env eng [] {
 }
 
 def --env sdk [] {
-  cd ($env.DEV_HOME | path join arcgis-js-api-4)
+  cd ($env.DEV_HOME | path join maps)
 }
 
 def --env wasm [] {
