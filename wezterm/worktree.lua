@@ -25,6 +25,9 @@ M.settings = {
     -- Add repo-specific layouts here, keyed by the repo directory name.
     by_repo = {
       ['maps'] = {
+        env = {
+          FOO = 1
+        },
         tabs = {
           { title = 'main',
             focus = true,
@@ -36,7 +39,7 @@ M.settings = {
             panes = {
               {
                 direction = 'Bottom',
-                size = 0.35,
+                size = 0.25,
                 first_run_commands = {
                   commands = {
                     'git submodule update --init --recursive; pnpm install; pnpm run codegen',
@@ -45,7 +48,13 @@ M.settings = {
               },
             },
           },
-          { title = 'copilot' },
+          { title = 'copilot',
+            first_run_commands = {
+              commands = {
+                'co',
+              },
+            },
+          },
         },
         branch_prefix = 'matt9222/',
       },
@@ -695,6 +704,7 @@ local function apply_tab_layout(tab, pane, worktree_path, spec)
         startup_command = startup_command_for_spec(worktree_path, spec),
       },
     },
+    focus_pane = spec.focus and pane or nil,
     root_pane = pane,
     root_spec = spec,
     title = spec.title,
@@ -716,6 +726,10 @@ local function apply_tab_layout(tab, pane, worktree_path, spec)
       spec = pane_spec,
       startup_command = startup_command_for_spec(worktree_path, pane_spec),
     })
+
+    if pane_spec.focus then
+      tab_state.focus_pane = new_pane
+    end
   end
 
   return tab_state
@@ -815,6 +829,7 @@ local function apply_layout(window, pane, worktree)
   if not layout then
     return {
       first_run_warning = nil,
+      focus_pane = nil,
       startup_commands = {},
     }
   end
@@ -823,6 +838,7 @@ local function apply_layout(window, pane, worktree)
   if #tabs == 0 then
     return {
       first_run_warning = nil,
+      focus_pane = nil,
       startup_commands = {},
     }
   end
@@ -839,12 +855,18 @@ local function apply_layout(window, pane, worktree)
     table.insert(tab_states, apply_tab_layout(tab, tab_pane, worktree.path, tab_spec))
   end
 
-  if #tabs > 1 then
+  local focus_pane = first_tab_state.focus_pane
+
+  if #tabs > 1 and not focus_pane then
     window:perform_action(act.ActivateTab(0), pane)
   end
 
   local startup_commands = {}
   for _, tab_state in ipairs(tab_states) do
+    if not focus_pane and tab_state.focus_pane then
+      focus_pane = tab_state.focus_pane
+    end
+
     for _, pane_info in ipairs(tab_state.panes) do
       add_startup_command(startup_commands, pane_info.pane, pane_info.startup_command)
     end
@@ -862,6 +884,7 @@ local function apply_layout(window, pane, worktree)
 
   return {
     first_run_warning = first_run_warning,
+    focus_pane = focus_pane,
     startup_commands = startup_commands,
   }
 end
@@ -1855,10 +1878,14 @@ function M.handle_update_status(window, pane)
 
   pending_layouts()[pending.workspace_name] = nil
   local layout_state = apply_layout(window, pane, pending)
-  if #layout_state.startup_commands > 0 then
+  if layout_state.focus_pane or #layout_state.startup_commands > 0 or layout_state.first_run_warning then
     after_overlay(function()
       if layout_state.first_run_warning then
         notify(window, layout_state.first_run_warning)
+      end
+
+      if layout_state.focus_pane then
+        layout_state.focus_pane:activate()
       end
 
       for _, startup in ipairs(layout_state.startup_commands) do

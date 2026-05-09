@@ -96,6 +96,10 @@ Keep this distinction explicit in labels and removal logic.
 - Pane/tab startup commands that also use `args` should be launched from a shell
   and then `exec ...` into the program, so setup commands and editor startup can
   share the same pane predictably.
+- `focus = true` can be set on a tab spec or pane spec to control initial focus.
+  Tab focus means the root pane of that tab, while pane focus is more specific.
+  If multiple specs set focus, the first focused tab in layout order wins, with
+  pane focus overriding tab-root focus within the same tab.
 
 ## Safe removal
 
