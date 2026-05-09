@@ -27,7 +27,12 @@ M.settings = {
       ['maps'] = {
         tabs = {
           { title = 'main',
-            args = { "nvim" },
+            focus = true,
+            first_run_commands = {
+              commands = {
+                'nvim',
+              },
+            },
             panes = {
               {
                 direction = 'Bottom',
