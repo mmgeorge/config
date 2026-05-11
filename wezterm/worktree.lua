@@ -51,7 +51,7 @@ M.settings = {
           { title = 'copilot',
             first_run_commands = {
               commands = {
-                'load-env { "COPILOT_CUSTOM_INSTRUCTIONS_DIRS": "/Users/matt9222/Developer/maps/prompts" }; co',
+                'load-env { "COPILOT_CUSTOM_INSTRUCTIONS_DIRS": "/Users/matt9222/Developer/maps/prompts", "COPILOT_SKILLS_DIR": "/Users/matt9222/Developer/maps/skills" }; co',
               },
             },
           },
