@@ -451,7 +451,7 @@ function select_parent()
 
   local bufnr = vim.api.nvim_get_current_buf()
   local ftype = vim.bo[bufnr].filetype
-  local lang = require("nvim-treesitter.parsers").ft_to_lang(ftype)
+  local lang = vim.treesitter.language.get_lang(ftype)
   local query = query_for(lang)
   local tree = get_tree(bufnr, lang)
 
