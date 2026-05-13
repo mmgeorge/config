@@ -29,6 +29,22 @@ alias top = btop
 alias h = yazi
 alias python = python3
 
+def test [
+  --all
+] {
+  commandline edit --insert "pnpm vitest "
+  let all_files = (^fd --type f --hidden --exclude .git --glob "*.spec.ts" | lines)
+  let files = if $all {
+    $all_files
+  } else {
+    $all_files | where {|path| $path !~ '(?i)(3d|widget)' }
+  }
+  let path = ($files | str join (char nl) | ^fzf --preview="" --height 40% --layout=reverse --border | str trim)
+  if ($path != "") {
+    commandline edit --insert $path
+  }
+}
+
 # def get_copilot_instruction_dirs [] {
 #     let default_dir = ($env.XDG_CONFIG_HOME | path join "copilot")
 #     let git_common_res = (do { ^git rev-parse --path-format=absolute --git-common-dir } | complete)
