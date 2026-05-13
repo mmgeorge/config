@@ -79,8 +79,11 @@ local function truncate_at_line(text, limit)
   return truncated, true
 end
 
-local function git_output(args)
+local function git_output(args, cwd)
   local command = { "git" }
+  if cwd and cwd ~= "" then
+    vim.list_extend(command, { "-C", cwd })
+  end
   vim.list_extend(command, args)
 
   local output = vim.fn.system(command)
@@ -91,9 +94,63 @@ local function git_output(args)
   return output
 end
 
-local function staged_commit_context()
-  local stat = git_output({ "diff", "--no-ext-diff", "--no-color", "--staged", "--stat", "--summary" })
-  local diff = git_output({ "diff", "--no-ext-diff", "--no-color", "--staged" })
+local function first_file_line(path)
+  local ok, lines = pcall(vim.fn.readfile, path, "", 1)
+  if not ok or not lines[1] then
+    return nil
+  end
+
+  local line = vim.trim(lines[1])
+  if line == "" then
+    return nil
+  end
+
+  return line
+end
+
+local function absolute_path(path, base)
+  if path:sub(1, 1) == "/" then
+    return vim.fs.normalize(path)
+  end
+
+  return vim.fs.normalize(vim.fs.joinpath(base, path))
+end
+
+local function worktree_root_from_git_dir(git_dir)
+  if not git_dir or git_dir == "" then
+    return nil
+  end
+
+  local worktree_git_file = first_file_line(vim.fs.joinpath(git_dir, "gitdir"))
+  if worktree_git_file then
+    return vim.fs.dirname(absolute_path(worktree_git_file, git_dir))
+  end
+
+  if vim.fs.basename(git_dir) == ".git" then
+    return vim.fs.dirname(git_dir)
+  end
+
+  return nil
+end
+
+local function commit_buffer_git_root(buf)
+  local name = vim.api.nvim_buf_get_name(buf)
+  if name == "" or vim.fs.basename(name) ~= "COMMIT_EDITMSG" then
+    return nil
+  end
+
+  return worktree_root_from_git_dir(vim.fs.dirname(name))
+end
+
+local function staged_commit_context(buf)
+  local cwd = commit_buffer_git_root(buf)
+  if not cwd then
+    vim.notify("Could not resolve git root for commit message", "warn", { title = "commit" })
+    return nil
+  end
+
+  local stat = git_output({ "diff", "--no-ext-diff", "--no-color", "--staged", "--stat", "--summary" }, cwd)
+  local diff = git_output({ "diff", "--no-ext-diff", "--no-color", "--staged" }, cwd)
 
   if not diff or vim.trim(diff) == "" then
     return nil
@@ -249,7 +306,7 @@ return {
 
           vim.b[args.buf].ai_commit_generated = true
 
-          local commit_context = staged_commit_context()
+          local commit_context = staged_commit_context(args.buf)
           if not commit_context then return end
 
           local Background = require("codecompanion.interactions.background")
