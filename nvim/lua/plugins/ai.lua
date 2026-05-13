@@ -55,9 +55,8 @@ local function filetype(context)
 end
 
 local commit_context_limit = {
-  name_status = 4000,
-  stat = 6000,
-  diff = 24000,
+  stat = 12000,
+  diff = 180000,
 }
 
 local function truncate_at_line(text, limit)
@@ -86,7 +85,6 @@ local function git_output(args)
 end
 
 local function staged_commit_context()
-  local name_status = git_output({ "diff", "--no-ext-diff", "--no-color", "--staged", "--name-status" })
   local stat = git_output({ "diff", "--no-ext-diff", "--no-color", "--staged", "--stat", "--summary" })
   local diff = git_output({ "diff", "--no-ext-diff", "--no-color", "--staged" })
 
@@ -94,13 +92,9 @@ local function staged_commit_context()
     return nil
   end
 
-  local truncated_name_status, name_status_truncated = truncate_at_line(
-    name_status or "",
-    commit_context_limit.name_status
-  )
   local truncated_stat, stat_truncated = truncate_at_line(stat or "", commit_context_limit.stat)
   local truncated_diff, diff_truncated = truncate_at_line(diff, commit_context_limit.diff)
-  local truncated = name_status_truncated or stat_truncated or diff_truncated
+  local truncated = stat_truncated or diff_truncated
 
   local sections = {
     "Generate a conventional commit message for these staged changes.",
@@ -110,16 +104,12 @@ local function staged_commit_context()
     table.insert(
       sections,
       "Some context is truncated to avoid exceeding the model request size. " ..
-      "Use the changed-file list and diffstat for overall scope, and visible hunks for details."
+      "Use the diff summary for overall scope, and visible hunks for details."
     )
   end
 
-  if vim.trim(truncated_name_status) ~= "" then
-    table.insert(sections, "Changed files:\n```text\n" .. truncated_name_status .. "\n```")
-  end
-
   if vim.trim(truncated_stat) ~= "" then
-    table.insert(sections, "Diffstat:\n```text\n" .. truncated_stat .. "\n```")
+    table.insert(sections, "Diff summary:\n```text\n" .. truncated_stat .. "\n```")
   end
 
   table.insert(sections, "Diff:\n```diff\n" .. truncated_diff .. "\n```")
