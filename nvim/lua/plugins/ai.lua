@@ -54,6 +54,97 @@ local function filetype(context)
   return context.filetype
 end
 
+local commit_context_limit = {
+  name_status = 4000,
+  stat = 6000,
+  diff = 24000,
+}
+
+local function truncate_at_line(text, limit)
+  if #text <= limit then
+    return text, false
+  end
+
+  local truncated = text:sub(1, limit)
+  local last_newline = truncated:match(".*()\n")
+  if last_newline and last_newline > 1 then
+    truncated = truncated:sub(1, last_newline - 1)
+  end
+  return truncated, true
+end
+
+local function git_output(args)
+  local command = { "git" }
+  vim.list_extend(command, args)
+
+  local output = vim.fn.system(command)
+  if vim.v.shell_error ~= 0 then
+    return nil
+  end
+
+  return output
+end
+
+local function staged_commit_context()
+  local name_status = git_output({ "diff", "--no-ext-diff", "--no-color", "--staged", "--name-status" })
+  local stat = git_output({ "diff", "--no-ext-diff", "--no-color", "--staged", "--stat", "--summary" })
+  local diff = git_output({ "diff", "--no-ext-diff", "--no-color", "--staged" })
+
+  if not diff or vim.trim(diff) == "" then
+    return nil
+  end
+
+  local truncated_name_status, name_status_truncated = truncate_at_line(
+    name_status or "",
+    commit_context_limit.name_status
+  )
+  local truncated_stat, stat_truncated = truncate_at_line(stat or "", commit_context_limit.stat)
+  local truncated_diff, diff_truncated = truncate_at_line(diff, commit_context_limit.diff)
+  local truncated = name_status_truncated or stat_truncated or diff_truncated
+
+  local sections = {
+    "Generate a conventional commit message for these staged changes.",
+  }
+
+  if truncated then
+    table.insert(
+      sections,
+      "Some context is truncated to avoid exceeding the model request size. " ..
+      "Use the changed-file list and diffstat for overall scope, and visible hunks for details."
+    )
+  end
+
+  if vim.trim(truncated_name_status) ~= "" then
+    table.insert(sections, "Changed files:\n```text\n" .. truncated_name_status .. "\n```")
+  end
+
+  if vim.trim(truncated_stat) ~= "" then
+    table.insert(sections, "Diffstat:\n```text\n" .. truncated_stat .. "\n```")
+  end
+
+  table.insert(sections, "Diff:\n```diff\n" .. truncated_diff .. "\n```")
+
+  return table.concat(sections, "\n\n")
+end
+
+local function format_error(err)
+  if type(err) == "string" then
+    return err
+  end
+
+  if type(err) == "table" then
+    for _, key in ipairs({ "message", "error", "stderr", "output", "reason" }) do
+      local value = err[key]
+      if type(value) == "string" and vim.trim(value) ~= "" then
+        return value
+      end
+    end
+    return vim.inspect(err)
+  end
+
+  return tostring(err)
+end
+
 
 return {
   {
@@ -149,8 +240,8 @@ return {
 
           vim.b[args.buf].ai_commit_generated = true
 
-          local diff = vim.fn.system("git diff --no-ext-diff --staged")
-          if vim.v.shell_error ~= 0 or vim.trim(diff) == "" then return end
+          local commit_context = staged_commit_context()
+          if not commit_context then return end
 
           local Background = require("codecompanion.interactions.background")
           local adapter_config = adapters().commit
@@ -225,7 +316,7 @@ Body (optional):
             },
             {
               role = "user",
-              content = "Generate a conventional commit message for these staged changes:\n```diff\n" .. diff .. "\n```",
+              content = commit_context,
             },
           }, {
             method = "async",
@@ -235,7 +326,7 @@ Body (optional):
               vim.schedule(function()
                 stop_spinner()
                 if not vim.api.nvim_buf_is_valid(args.buf) then return end
- 
+
                 local content = result and result.output
                 if type(content) == "table" then
                   content = content.content
@@ -271,7 +362,7 @@ Body (optional):
             on_error = function(err)
               vim.schedule(function()
                 stop_spinner()
-                vim.notify("Failed: " .. tostring(err), "error", {
+                vim.notify("Failed: " .. format_error(err), "error", {
                   id = notif_id,
                   title = "commit (" .. adapter_name .. ")",
                   icon = " ",
