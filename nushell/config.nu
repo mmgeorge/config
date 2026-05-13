@@ -30,9 +30,11 @@ alias h = yazi
 alias python = python3
 
 def test [
-  --all
+  mode?: string # Pass "run" to insert "pnpm vitest run --browser.headless" instead of "pnpm vitest".
+  --all # Include spec files whose paths contain "3d" or "widget"; filtered out by default.
 ] {
-  commandline edit --insert "pnpm vitest "
+  let prefix = if $mode == "run" { "pnpm vitest run --browser.headless " } else { "pnpm vitest " }
+  commandline edit --insert $prefix
   let all_files = (^fd --type f --hidden --exclude .git --glob "*.spec.ts" | lines)
   let files = if $all {
     $all_files
