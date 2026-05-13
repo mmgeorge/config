@@ -551,7 +551,7 @@ $env.config.keybindings ++= [
     mode: [emacs, vi_normal, vi_insert]
     event: {
       send: executehostcommand
-      cmd: "commandline edit --insert (fd --type f --hidden --exclude .git | fzf --height 40% --layout=reverse --border | str trim)"
+      cmd: "commandline edit --insert (fd --type f --hidden --exclude .git | fzf --preview=\"\" --height 40% --layout=reverse --border | str trim)"
     }
   }
   # Search directory
