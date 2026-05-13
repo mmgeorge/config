@@ -427,6 +427,18 @@ local function main_worktree_path(worktrees)
   end
 
   for _, worktree in ipairs(worktrees) do
+    if not worktree.bare and worktree.branch_name == 'main' then
+      return worktree.path
+    end
+  end
+
+  for _, worktree in ipairs(worktrees) do
+    if not worktree.bare and worktree.branch_name == 'master' then
+      return worktree.path
+    end
+  end
+
+  for _, worktree in ipairs(worktrees) do
     if not worktree.bare then
       return worktree.path
     end
@@ -571,6 +583,22 @@ local function find_worktree_by_path(repos, path)
   for _, repo in ipairs(repos) do
     for _, worktree in ipairs(repo.worktrees) do
       if worktree.path == path then
+        return worktree, repo
+      end
+    end
+  end
+
+  return nil, nil
+end
+
+local function find_worktree_by_workspace(repos, workspace_name)
+  if not workspace_name then
+    return nil, nil
+  end
+
+  for _, repo in ipairs(repos) do
+    for _, worktree in ipairs(repo.worktrees) do
+      if worktree.workspace_name == workspace_name then
         return worktree, repo
       end
     end
@@ -1116,6 +1144,66 @@ local function current_worktree_for_path(repo, path)
   return best_match
 end
 
+local function remote_ref_parts(ref)
+  if not ref then
+    return nil, nil
+  end
+
+  return ref:match('^([^/]+)/(.+)$')
+end
+
+local function checked_out_worktree(repo, branch)
+  for _, worktree in ipairs(repo.worktrees) do
+    if worktree.branch_name == branch then
+      return worktree
+    end
+  end
+
+  return nil
+end
+
+local function refresh_start_point(window, repo, start_point, source)
+  local remote, remote_branch = remote_ref_parts(start_point)
+  if source == 'remote' and remote and remote_branch then
+    local stdout, stderr = git_output(repo.main_path, {
+      'fetch',
+      remote,
+      remote_branch .. ':refs/remotes/' .. remote .. '/' .. remote_branch,
+    })
+    if not stdout then
+      notify(window, 'Could not update ' .. start_point .. ': ' .. stderr)
+      return false
+    end
+
+    return true
+  end
+
+  local worktree = checked_out_worktree(repo, start_point)
+  if worktree then
+    local stdout, stderr = git_output(worktree.path, { 'pull', '--ff-only' })
+    if not stdout then
+      notify(window, 'Could not pull ' .. start_point .. ': ' .. stderr)
+      return false
+    end
+
+    return true
+  end
+
+  local upstream = git_capture(repo.main_path, { 'rev-parse', '--abbrev-ref', start_point .. '@{upstream}' })
+  if upstream then
+    local upstream_remote, upstream_branch = remote_ref_parts(upstream)
+    if upstream_remote and upstream_branch then
+      local stdout, stderr = git_output(repo.main_path, { 'fetch', upstream_remote, upstream_branch .. ':' .. start_point })
+      if not stdout then
+        notify(window, 'Could not update ' .. start_point .. ': ' .. stderr)
+        return false
+      end
+    end
+  end
+
+  return true
+end
+
 local function create_worktree(window, pane, repo, opts)
   local args = { 'worktree', 'add' }
 
@@ -1375,7 +1463,7 @@ local function start_points(repo)
   local points = {}
   for _, point in ipairs(point_records) do
     table.insert(points, {
-      id = point.id,
+      id = point.source .. '\t' .. point.id,
       label = point.label,
     })
   end
@@ -1450,8 +1538,14 @@ local function choose_new_branch(window, pane, repo)
   choose(window, pane, {
     choices = points,
     title = 'Start point for new branch in ' .. repo.name,
-  }, function(inner_window, inner_pane, start_point)
-    if not start_point then
+  }, function(inner_window, inner_pane, selected_point)
+    if not selected_point then
+      return
+    end
+
+    local source, start_point = selected_point:match('^([^\t]+)\t(.+)$')
+    if not source or not start_point then
+      notify(inner_window, 'Could not resolve the selected start point')
       return
     end
 
@@ -1477,6 +1571,10 @@ local function choose_new_branch(window, pane, repo)
           end
 
           after_overlay(function()
+            if not refresh_start_point(branch_window, repo, start_point, source) then
+              return
+            end
+
             create_worktree(branch_window, pane, repo, {
               new_branch = new_branch,
               path = default_worktree_path(repo, sanitize_name(new_branch)),
@@ -2011,8 +2109,8 @@ end
 function M.menu()
   return wezterm.action_callback(function(window, pane)
     local current_path = current_pane_path(pane)
+    local current_workspace = window:active_workspace()
     local current_repo = repo_for_pane(pane)
-    local current_worktree = current_worktree_for_path(current_repo, current_path)
     local extra_paths = {}
     if current_repo then
       table.insert(extra_paths, current_repo.main_path)
@@ -2023,6 +2121,12 @@ function M.menu()
     end
 
     local repos = current_repo and { current_repo } or discover_repositories(extra_paths)
+    local workspace_worktree, workspace_repo = find_worktree_by_workspace(repos, current_workspace)
+    local current_worktree = workspace_worktree or current_worktree_for_path(current_repo, current_path)
+    if workspace_worktree then
+      current_repo = workspace_repo
+    end
+
     local choices = {}
 
     if current_repo then
@@ -2058,7 +2162,7 @@ function M.menu()
     for _, worktree in ipairs(flatten_worktrees(repos)) do
       table.insert(choices, {
         id = worktree.path,
-        label = worktree_label(worktree, window:active_workspace()),
+        label = worktree_label(worktree, current_workspace),
       })
     end
 
