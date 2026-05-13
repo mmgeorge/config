@@ -396,7 +396,7 @@ local function preferred_worktree_parent(worktrees, fallback)
   local best_count = 0
 
   for _, worktree in ipairs(worktrees) do
-    if not worktree.is_main then
+    if not worktree.bare and not worktree.is_main then
       local parent = dirname(worktree.path)
       counts[parent] = (counts[parent] or 0) + 1
       if counts[parent] > best_count then
@@ -407,6 +407,16 @@ local function preferred_worktree_parent(worktrees, fallback)
   end
 
   return best_path
+end
+
+local function default_worktree_parent(common_dir, main_path)
+  common_dir = normalize_path(common_dir)
+  local common_name = basename(common_dir)
+  if common_name == '.bare' then
+    return dirname(common_dir)
+  end
+
+  return dirname(main_path)
 end
 
 local function main_worktree_path(worktrees)
@@ -460,10 +470,12 @@ local function build_repo(path, common_dir)
     worktree.workspace_name = worktree_workspace_name(repo.name, worktree)
   end
 
-  repo.worktree_parent = preferred_worktree_parent(
-    repo.worktrees,
-    dirname(repo.main_path)
-  )
+  local default_parent = default_worktree_parent(common_dir, repo.main_path)
+  if basename(common_dir) == '.bare' then
+    repo.worktree_parent = default_parent
+  else
+    repo.worktree_parent = preferred_worktree_parent(repo.worktrees, default_parent)
+  end
 
   return repo
 end
