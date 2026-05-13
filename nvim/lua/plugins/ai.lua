@@ -303,8 +303,9 @@ return {
           background:ask({
             {
               role = "system",
-              content = [[You are a precise commit message generator following Conventional Commits.
-Respond with ONLY the commit message — no code blocks, no explanation.
+              content = [[You are a factual commit message generator following Conventional Commits.
+Respond with ONLY the commit message - no code blocks, no explanation,
+commentary, alternatives, or preface.
 
 Format:
 <type>: <description>
@@ -315,13 +316,27 @@ Types: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert
 
 Description rules:
 - Imperative mood ("add feature" not "added feature")
+- Describe the concrete code change, not intent, benefit, or motivation
 - Lowercase first letter, no trailing period
 - Max 50 characters
+- Prefer specific nouns from the diff over abstract summaries
+- Do not add subjective qualifiers or purpose phrases like "for flexibility",
+  "for extensibility", "improve", "enhance", "future-proof", or "better"
 
-Body (optional):
+Examples:
+- Bad: feat: refactor parquet data source handling for flexibility
+- Bad: refactor: improve parquet extensibility
+- Good: refactor: pass parquet data source objects
+
+Body (rare):
+- Default to no body
 - Never write a body for chore commits
-- Only include a body for significant changes
-- Explain why, not what. Wrap at 72 chars. Max three lines.]]
+- Only write a body when the subject alone is materially incomplete and
+  omits important factual changes
+- Do not write a body for benefits, motivation, or generic summary
+- If needed, include only essential factual "what changed" details from the
+  diff, such as API shape changes, behavior changes, migrations, or tests
+- Wrap at 72 chars. Max two lines.]]
             },
             {
               role = "user",

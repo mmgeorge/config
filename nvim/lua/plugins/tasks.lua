@@ -435,52 +435,29 @@ return {
         },
       })
 
-      -- require("overseer").register_template({
-      --   name = "Tsc FastWatch",
-      --   builder = function()
-      --     return {
-      --       cmd = { "npx", "tsc", "--watch", "--assumeChangesOnlyAffectDirectDependencies --noEmit" },
-      --       components = {
-      --         {
-      --           "on_output_parse",
-      --           problem_matcher = "$tsc-watch"
-      --         },
-      --         "default",
-      --         "on_result_notify",
-      --         "on_result_diagnostics",
-      --         "on_complete_restart",
-      --         "on_exit_set_status",
-      --       },
-      --       env = {
-      --         NODE_OPTIONS = "--max-old-space-size=8192"
-      --       },
-      --     }
-      --   end
-      -- })
-      --
-      -- require("overseer").register_template({
-      --   name = "Tsc Watch",
-      --   builder = function()
-      --     return {
-      --       cmd = { "npx", "tsc", "--watch", "--noEmit", "-p", "tsconfig.app.json" },
-      --       components = {
-      --         {
-      --           "on_output_parse",
-      --           problem_matcher = "$tsc-watch"
-      --         },
-      --         "default",
-      --         "on_result_notify",
-      --         "on_result_diagnostics",
-      --         "on_complete_restart",
-      --         "on_exit_set_status",
-      --       },
-      --       env = {
-      --         NODE_OPTIONS = "--max-old-space-size=8192"
-      --       },
-      --     }
-      --   end
-      -- })
-      --
+      require("overseer").register_template({
+        name = "Tsgo Watch",
+        desc = "Run tsgo --noEmit --watch and publish project diagnostics",
+        builder = function()
+          return {
+            cmd = { "npx", "tsgo" },
+            args = { "--noEmit", "--watch" },
+            components = {
+              {
+                "on_output_parse",
+                problem_matcher = "$tsc-watch",
+              },
+              "config.watch_diagnostics",
+              "on_result_notify",
+              "default",
+            },
+          }
+        end,
+        condition = {
+          filetype = { "typescript", "typescriptreact", "javascript", "javascriptreact" },
+        },
+      })
+
       require("overseer").register_template({
         -- Required fields
         name = "Karma start",
