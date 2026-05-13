@@ -59,6 +59,13 @@ local commit_context_limit = {
   diff = 180000,
 }
 
+local compact_diff_options = {
+  max_hunks = 30,
+  max_changed_lines = 800,
+  min_hunk_changed_lines = 8,
+  hunk_head_lines = 12,
+}
+
 local function truncate_at_line(text, limit)
   if #text <= limit then
     return text, false
@@ -92,13 +99,25 @@ local function staged_commit_context()
     return nil
   end
 
+  local compacted_diff, diff_compacted, diff_metrics = require("git.diff").compact(diff, compact_diff_options)
   local truncated_stat, stat_truncated = truncate_at_line(stat or "", commit_context_limit.stat)
-  local truncated_diff, diff_truncated = truncate_at_line(diff, commit_context_limit.diff)
+  local truncated_diff, diff_truncated = truncate_at_line(compacted_diff, commit_context_limit.diff)
   local truncated = stat_truncated or diff_truncated
 
   local sections = {
     "Generate a conventional commit message for these staged changes.",
   }
+
+  if diff_compacted then
+    table.insert(
+      sections,
+      ("Large diff compacted after counting %d hunks and %d changed lines. " ..
+        "The compact diff starts with an overall summary and only includes large hunks."):format(
+        diff_metrics.hunks,
+        diff_metrics.changed
+      )
+    )
+  end
 
   if truncated then
     table.insert(
