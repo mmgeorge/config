@@ -10,6 +10,9 @@
 (call_expression
   function: (identifier) @jump)
 
+(call_expression
+  function: (scoped_identifier) @jump)
+
 (macro_invocation
   macro: (identifier) @jump)
 

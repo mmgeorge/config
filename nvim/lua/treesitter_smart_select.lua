@@ -476,6 +476,13 @@ local function try_select_touching_siblings(node, query, tree, bufnr)
     return false
   end
 
+  -- Only group siblings that start on different lines (statement-level, not tokens within an expression)
+  local gs_start_row = select(1, group_start:range())
+  local ge_start_row = select(1, group_end:range())
+  if gs_start_row == ge_start_row then
+    return false
+  end
+
   local start_node = group_start
   if is_not_attachment(start_node) then
     start_node = find_last_sibling_left(start_node, is_attachment)
@@ -596,13 +603,14 @@ end
 -- end
 function select_region(node, start_row, start_col, end_row, end_col)
   local last = cursor_stack[#cursor_stack]
-  if last and
-      last.start_row == start_row and
-      last.end_row == end_row and
-      last.start_col == start_col and
-      last.end_col == end_col then
-    -- Ended up wi the same selection, try again
-    return false
+  if last then
+    local starts_inside = start_row > last.start_row or
+        (start_row == last.start_row and start_col >= last.start_col)
+    local ends_inside = end_row < last.end_row or
+        (end_row == last.end_row and end_col <= last.end_col)
+    if starts_inside and ends_inside then
+      return false
+    end
   end
 
   table.insert(selected_node_ranges, { node:range() })
