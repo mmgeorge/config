@@ -604,11 +604,16 @@ end
 function select_region(node, start_row, start_col, end_row, end_col)
   local last = cursor_stack[#cursor_stack]
   if last then
-    local starts_inside = start_row > last.start_row or
-        (start_row == last.start_row and start_col >= last.start_col)
-    local ends_inside = end_row < last.end_row or
-        (end_row == last.end_row and end_col <= last.end_col)
-    if starts_inside and ends_inside then
+    local new_starts_at_or_before =
+        start_row < last.start_row or
+        (start_row == last.start_row and start_col <= last.start_col)
+    local new_ends_at_or_after =
+        end_row > last.end_row or
+        (end_row == last.end_row and end_col >= last.end_col)
+    local is_same =
+        start_row == last.start_row and start_col == last.start_col and
+        end_row == last.end_row and end_col == last.end_col
+    if is_same or not (new_starts_at_or_before and new_ends_at_or_after) then
       return false
     end
   end

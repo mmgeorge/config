@@ -29,6 +29,30 @@ alias top = btop
 alias h = yazi
 alias python = python3
 
+def wg [
+    command?: string  # winget subcommand (install, upgrade, list, search, etc.)
+    ...rest: string   # remaining args passed through to winget
+] {
+    if $command == null {
+        winget --help
+        return
+    }
+
+    # Auto-add unattended flags only for state-changing commands
+    let auto_flags = if $command in ["install" "upgrade" "uninstall"] {
+        [
+            "--silent"
+            "--disable-interactivity"
+            "--accept-package-agreements"
+            "--accept-source-agreements"
+        ]
+    } else {
+        []
+    }
+
+    winget $command ...$auto_flags ...$rest
+}
+
 def test [
   mode?: string # Pass "run" to insert "pnpm vitest run --browser.headless" instead of "pnpm vitest".
   --all # Include spec files whose paths contain "3d" or "widget"; filtered out by default.
