@@ -2,6 +2,8 @@
 -- To load, modify .config/nvim/init.lua to point here, e.g, assuming we're at ~/config, then
 -- dofile(vim.fn.expand("$HOME/config/nvim/init.lua"))
 
+vim.deprecate = function() end
+
 
 -- Silence the specific position encoding message
 -- local notify_original = vim.notify
