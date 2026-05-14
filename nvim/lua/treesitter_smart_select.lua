@@ -456,6 +456,37 @@ local function invalidate_if_changed(bufnr)
   last_changedtick = tick
 end
 
+local function try_select_touching_siblings(node, query, tree, bufnr)
+  local group_start = node
+  local group_end = node
+
+  local prev = group_start:prev_named_sibling()
+  while prev and joinable(prev, group_start) do
+    group_start = prev
+    prev = group_start:prev_named_sibling()
+  end
+
+  local nxt = group_end:next_named_sibling()
+  while nxt and joinable(group_end, nxt) do
+    group_end = nxt
+    nxt = group_end:next_named_sibling()
+  end
+
+  if group_start:id() == node:id() and group_end:id() == node:id() then
+    return false
+  end
+
+  local start_node = group_start
+  if is_not_attachment(start_node) then
+    start_node = find_last_sibling_left(start_node, is_attachment)
+  end
+
+  local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
+  local start_row, start_col = get_selection_start(lines, start_node, false)
+  local end_row, end_col = get_selection_end(lines, group_end, start_col == 0, false)
+  return select_region(node, start_row, start_col, end_row, end_col)
+end
+
 function select_parent()
   local bufnr = vim.api.nvim_get_current_buf()
   invalidate_if_changed(bufnr)
@@ -495,12 +526,25 @@ function select_parent()
       next = nil
     end
 
+    -- Try expanding to touching siblings before going to parent
+    if not next then
+      if try_select_touching_siblings(node, query, tree, bufnr) then
+        return
+      end
+    end
+
     -- Otherwise, go up to the parent
     node = next or node:parent()
   end
 
   while node do
     if try_select_node(node, query, tree, bufnr) then
+      return
+    end
+
+    -- try_select_node failed (e.g., same range as previous selection).
+    -- Check if this node has touching siblings we can group.
+    if try_select_touching_siblings(node, query, tree, bufnr) then
       return
     end
 
