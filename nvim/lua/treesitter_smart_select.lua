@@ -1,6 +1,8 @@
 local cursor_stack = {}
-local selected_nodes = {}
+local selected_node_ranges = {}
 local last_was_expand = false
+local last_changedtick = nil
+local last_bufnr = nil
 
 local decorator_types = {
   -- rust
@@ -119,8 +121,9 @@ vim.api.nvim_create_autocmd("ModeChanged", {
   pattern = "v:*",
   desc = "Clear global cursor_stack and remove self on leaving visual mode.",
   callback = function(args)
-    selected_nodes = {}
+    selected_node_ranges = {}
     cursor_stack = {}
+    last_was_expand = false
   end,
   -- once = true, -- Ensure it triggers only once
 })
@@ -442,23 +445,35 @@ function matches_in_parent(query, capture_name, node, parent, bufnr)
   return false
 end
 
--- Lua function to select the nearest parent node based on a Tree-sitter query.
---
--- This function assumes you have a query file named 'parent.scm'
--- (e.g., queries/rust/parent.scm) that defines what a "parent" node is.
-function select_parent()
-  -- setup_visual_exit_autocmd()
+local function invalidate_if_changed(bufnr)
+  local tick = vim.b[bufnr].changedtick
+  if bufnr ~= last_bufnr or tick ~= last_changedtick then
+    selected_node_ranges = {}
+    cursor_stack = {}
+    last_was_expand = false
+  end
+  last_bufnr = bufnr
+  last_changedtick = tick
+end
 
+function select_parent()
   local bufnr = vim.api.nvim_get_current_buf()
+  invalidate_if_changed(bufnr)
+
   local ftype = vim.bo[bufnr].filetype
   local lang = vim.treesitter.language.get_lang(ftype)
   local query = query_for(lang)
   local tree = get_tree(bufnr, lang)
 
-  local node = selected_nodes[#selected_nodes]
-  if not node then
+  local node
+  local last_range = selected_node_ranges[#selected_node_ranges]
+  if not last_range then
     node = find_closest_node(tree)
   else
+    -- Re-derive node from the fresh tree instead of using stale references
+    local root = tree:root()
+    node = root:named_descendant_for_range(unpack(last_range))
+
     local next = nil
     -- If the previous node is an attachment type, find what it's anchored to
     if not next and is_attachment(node) then
@@ -483,8 +498,6 @@ function select_parent()
     -- Otherwise, go up to the parent
     node = next or node:parent()
   end
-
-  local did_select = false
 
   while node do
     if try_select_node(node, query, tree, bufnr) then
@@ -548,8 +561,7 @@ function select_region(node, start_row, start_col, end_row, end_col)
     return false
   end
 
-  table.insert(selected_nodes, node)
-  print("select", node:type())
+  table.insert(selected_node_ranges, { node:range() })
 
   vim.api.nvim_buf_set_mark(0, '<', start_row + 1, start_col, {})
   vim.api.nvim_buf_set_mark(0, '>', end_row + 1, end_col, {})
@@ -567,12 +579,14 @@ function select_region(node, start_row, start_col, end_row, end_col)
 end
 
 function undo_select_parent()
+  local bufnr = vim.api.nvim_get_current_buf()
+  invalidate_if_changed(bufnr)
+
   if #cursor_stack ~= 0 then
     if last_was_expand then
-      -- Pop the last
       last_was_expand = false
       table.remove(cursor_stack)
-      table.remove(selected_nodes)
+      table.remove(selected_node_ranges)
     end
 
     if #cursor_stack == 0 then
@@ -580,7 +594,7 @@ function undo_select_parent()
     end
 
     local cursor = table.remove(cursor_stack)
-    table.remove(selected_nodes)
+    table.remove(selected_node_ranges)
     vim.api.nvim_buf_set_mark(0, '<', cursor.start_row + 1, cursor.start_col, {})
     vim.api.nvim_buf_set_mark(0, '>', cursor.end_row + 1, cursor.end_col, {})
     vim.cmd("normal! gvo")
