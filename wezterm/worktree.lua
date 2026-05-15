@@ -1152,6 +1152,104 @@ local function remote_ref_parts(ref)
   return ref:match('^([^/]+)/(.+)$')
 end
 
+local function refresh_remotes(window, repo)
+  local stdout, stderr = git_output(repo.main_path, { 'fetch', '--all', '--prune' })
+  if not stdout then
+    notify(window, 'Could not refresh remotes for ' .. repo.name .. ': ' .. stderr)
+    return false
+  end
+
+  return true
+end
+
+local function refresh_remote_ref(window, repo, ref)
+  local remote, remote_branch = remote_ref_parts(ref)
+  if not remote or not remote_branch then
+    return true
+  end
+
+  local stdout, stderr = git_output(repo.main_path, {
+    'fetch',
+    remote,
+    remote_branch .. ':refs/remotes/' .. remote .. '/' .. remote_branch,
+  })
+  if not stdout then
+    notify(window, 'Could not update ' .. ref .. ': ' .. stderr)
+    return false
+  end
+
+  return true
+end
+
+local function remote_ref_exists(repo, ref)
+  local stdout = git_capture(repo.main_path, {
+    'show-ref',
+    '--verify',
+    '--quiet',
+    'refs/remotes/' .. ref,
+  })
+
+  return stdout ~= nil
+end
+
+local function branch_upstream(repo, branch)
+  local upstream = git_capture(repo.main_path, {
+    'rev-parse',
+    '--abbrev-ref',
+    branch .. '@{upstream}',
+  })
+
+  if upstream and upstream ~= '' then
+    return upstream
+  end
+
+  return nil
+end
+
+local function infer_branch_upstream(repo, branch)
+  if remote_ref_exists(repo, 'origin/' .. branch) then
+    return 'origin/' .. branch
+  end
+
+  local remotes = git_capture(repo.main_path, { 'remote' }) or ''
+  for _, remote in ipairs(split_lines(remotes)) do
+    if remote ~= 'origin' and remote_ref_exists(repo, remote .. '/' .. branch) then
+      return remote .. '/' .. branch
+    end
+  end
+
+  return nil
+end
+
+local function ensure_branch_upstream(repo, branch, upstream)
+  if not upstream or upstream == '' then
+    return true
+  end
+
+  if branch_upstream(repo, branch) == upstream then
+    return true
+  end
+
+  local stdout, stderr = git_output(repo.main_path, {
+    'branch',
+    '--set-upstream-to=' .. upstream,
+    branch,
+  })
+  if not stdout then
+    return false, stderr
+  end
+
+  return true
+end
+
+local function resolve_branch_upstream(repo, branch, preferred_upstream)
+  if preferred_upstream and preferred_upstream ~= '' then
+    return preferred_upstream
+  end
+
+  return branch_upstream(repo, branch) or infer_branch_upstream(repo, branch)
+end
+
 local function checked_out_worktree(repo, branch)
   for _, worktree in ipairs(repo.worktrees) do
     if worktree.branch_name == branch then
@@ -1162,24 +1260,27 @@ local function checked_out_worktree(repo, branch)
   return nil
 end
 
-local function refresh_start_point(window, repo, start_point, source)
-  local remote, remote_branch = remote_ref_parts(start_point)
-  if source == 'remote' and remote and remote_branch then
-    local stdout, stderr = git_output(repo.main_path, {
-      'fetch',
-      remote,
-      remote_branch .. ':refs/remotes/' .. remote .. '/' .. remote_branch,
-    })
-    if not stdout then
-      notify(window, 'Could not update ' .. start_point .. ': ' .. stderr)
-      return false
-    end
+local function refresh_start_point(window, repo, start_point, source, opts)
+  opts = opts or {}
 
-    return true
+  if source == 'remote' then
+    return refresh_remote_ref(window, repo, start_point)
+  end
+
+  local upstream = resolve_branch_upstream(repo, start_point, opts.upstream)
+  local upstream_ok, upstream_err = ensure_branch_upstream(repo, start_point, upstream)
+  if not upstream_ok then
+    local message = upstream_err and upstream_err ~= '' and upstream_err or ('could not set upstream to ' .. upstream)
+    notify(window, 'Could not set upstream for ' .. start_point .. ': ' .. message)
+    return false
   end
 
   local worktree = checked_out_worktree(repo, start_point)
   if worktree then
+    if not upstream then
+      return true
+    end
+
     local stdout, stderr = git_output(worktree.path, { 'pull', '--ff-only' })
     if not stdout then
       notify(window, 'Could not pull ' .. start_point .. ': ' .. stderr)
@@ -1189,11 +1290,14 @@ local function refresh_start_point(window, repo, start_point, source)
     return true
   end
 
-  local upstream = git_capture(repo.main_path, { 'rev-parse', '--abbrev-ref', start_point .. '@{upstream}' })
   if upstream then
     local upstream_remote, upstream_branch = remote_ref_parts(upstream)
     if upstream_remote and upstream_branch then
-      local stdout, stderr = git_output(repo.main_path, { 'fetch', upstream_remote, upstream_branch .. ':' .. start_point })
+      local stdout, stderr = git_output(repo.main_path, {
+        'fetch',
+        upstream_remote,
+        upstream_branch .. ':refs/heads/' .. start_point,
+      })
       if not stdout then
         notify(window, 'Could not update ' .. start_point .. ': ' .. stderr)
         return false
@@ -1224,6 +1328,17 @@ local function create_worktree(window, pane, repo, opts)
   if not stdout then
     notify(window, stderr)
     return
+  end
+
+  if opts.upstream then
+    local branch = opts.branch or opts.new_branch or opts.start_point
+    if branch then
+      local upstream_ok, upstream_err = ensure_branch_upstream(repo, branch, opts.upstream)
+      if not upstream_ok then
+        local message = upstream_err and upstream_err ~= '' and upstream_err or ('could not set upstream to ' .. opts.upstream)
+        notify(window, 'Created the worktree, but could not set upstream for ' .. branch .. ': ' .. message)
+      end
+    end
   end
 
   local updated_repo = build_repo(opts.path) or build_repo(repo.main_path)
@@ -1472,6 +1587,10 @@ local function start_points(repo)
 end
 
 local function choose_existing_branch(window, pane, repo)
+  if not refresh_remotes(window, repo) then
+    return
+  end
+
   local refs, checked_out, local_branch_names = existing_refs(repo)
   if #refs == 0 then
     notify(window, 'No local or remote refs are available for a new worktree')
@@ -1505,10 +1624,12 @@ local function choose_existing_branch(window, pane, repo)
 
     local target_branch = ref.logical_name
     local create_opts = {
+      branch = target_branch,
       start_point = ref.id,
     }
 
     if ref.source == 'remote' then
+      create_opts.upstream = ref.id
       if local_branch_names[target_branch] then
         if checked_out[target_branch] then
           notify(inner_window, 'Local branch ' .. target_branch .. ' is already checked out; use the new-branch path instead')
@@ -1523,12 +1644,24 @@ local function choose_existing_branch(window, pane, repo)
 
     after_overlay(function()
       create_opts.path = default_worktree_path(repo, sanitize_name(target_branch))
+      if ref.source == 'remote' and local_branch_names[target_branch] then
+        if not refresh_start_point(inner_window, repo, target_branch, 'local', { upstream = ref.id }) then
+          return
+        end
+      elseif not refresh_start_point(inner_window, repo, ref.id, ref.source) then
+        return
+      end
+
       create_worktree(inner_window, pane, repo, create_opts)
     end)
   end)
 end
 
 local function choose_new_branch(window, pane, repo)
+  if not refresh_remotes(window, repo) then
+    return
+  end
+
   local points = start_points(repo)
   if #points == 0 then
     notify(window, 'No local or remote branches were found for ' .. repo.name)

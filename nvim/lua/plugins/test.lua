@@ -57,7 +57,7 @@ end
 
 local function vitest_adapter()
   local adapter = require("neotest-vitest")({
-    vitestCommand = "pnpm vitest run",
+    vitestCommand = "pnpm vitest run --browser.headless",
   })
 
   local base_results = adapter.results
