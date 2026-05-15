@@ -2,6 +2,13 @@ return {
   {
     "pwntester/octo.nvim",
     cmd = "Octo",
+    init = function()
+      vim.api.nvim_create_user_command("GithubOpenPR", function()
+        require("github.open_pr").open()
+      end, {
+        desc = "Open a draft GitHub PR for the current branch",
+      })
+    end,
     opts = {
       -- or "fzf-lua" or "snacks" or "default"
       picker = "snacks",
