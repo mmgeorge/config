@@ -125,6 +125,7 @@ k.remap('f', se)
 k.remap('a', sb)
 k.remap('j', 'h') -- Left
 k.remap(';', 'l') -- Right
+vim.keymap.set('x', k.key(';'), 'l', { nowait = true, silent = false }) -- Avoid waiting on default `in` textobject.
 
 k.keymap({ 'n' }, 'c/', 'cc')
 k.keymap({ 'n' }, 'cc', 'ciw')

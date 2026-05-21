@@ -21,12 +21,36 @@ Title rules:
 - Prefer concrete nouns from the commit messages.
 
 Body rules:
-- Write a full, polished PR description in Markdown.
-- Include these sections exactly: ## Summary, ## Major Changes, ## Testing.
-- Major Changes must be a concise bullet list of the meaningful changes.
-- Use only facts found in the commit messages.
-- Do not mention files unless a commit message explicitly mentions them.
-- If testing is not evident from the commit messages, write: Not specified in commit messages.]]
+Use this template:
+
+Related <issue number list>
+
+<summary>
+
+# Changes
+<major changes>
+
+## Testing
+- [x] Automated (integration, performance, screenshot, unit)
+<test files>
+- [ ] Manual (test app)
+
+For the above template, follow these rules:
+- <issue number list>
+  - If the issue numbers are known, put them here. Otherwise just write # and the user will fill in the rest.
+- <summary>
+  - Include a brief paragraph description of the PR that is succinct an factual.
+  - The first couples senteces state what major feature was added or bug fixed, a restatement of the title.
+    - "This PR adds support for X..."
+  - Then follow up with details about what major changes were needed to add the feature or fix the bug
+    - "A new source type ParquetSourceWorker handles querying files"
+- <major changes>
+  - A bulleted list of the major changes of the PR. The new files added and structure changes.
+  - Look at all commits and then created this bulleted summary.
+  - Do *not* just restate the commit history. Look at changes as a whole and then determine aggregate changes.
+- <test files>
+  - A bulleted list of added tests.
+]]
 
 local progress = {
   id = "github_open_pr",
