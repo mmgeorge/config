@@ -1644,14 +1644,6 @@ local function choose_existing_branch(window, pane, repo)
 
     after_overlay(function()
       create_opts.path = default_worktree_path(repo, sanitize_name(target_branch))
-      if ref.source == 'remote' and local_branch_names[target_branch] then
-        if not refresh_start_point(inner_window, repo, target_branch, 'local', { upstream = ref.id }) then
-          return
-        end
-      elseif not refresh_start_point(inner_window, repo, ref.id, ref.source) then
-        return
-      end
-
       create_worktree(inner_window, pane, repo, create_opts)
     end)
   end)
