@@ -42,6 +42,7 @@ return {
       {
         "oo",
         function()
+          local bufnr = vim.api.nvim_get_current_buf()
           local mode = "minimal"
           local level = 2
 
@@ -93,7 +94,18 @@ return {
                 end
               }
             },
-            transform = function(item, context)
+            preview = function(ctx)
+              ctx.item.buf = ctx.item.buf or bufnr
+              return Snacks.picker.preview.file(ctx)
+            end,
+            transform = function(item, _context)
+              item.buf = bufnr
+              local selection = item.item.selection_range
+              if selection then
+                item.pos = { selection.lnum, selection.col }
+                item.end_pos = { selection.end_lnum, selection.end_col }
+              end
+
               -- Check if the item's kind is in the allowed kinds array
               local has_kind = vim.tbl_contains(kinds[mode], item.item.kind)
               return not item.hidden and has_kind and item.item.level < level
