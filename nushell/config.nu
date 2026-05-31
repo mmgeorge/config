@@ -15,6 +15,9 @@ $env.GOOSE_RECIPE_PATH = $"($env.XDG_CONFIG_HOME)/goose/recipes"
 $env.GEMINI_CLI_SYSTEM_DEFAULTS_PATH = $env.XDG_CONFIG_HOME | path join "gemini" | path join "settings.json"
 $env.CODEX_HOME = $env.XDG_CONFIG_HOME | path join "codex"
 $env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = 64000
+if $nu.os-info.name == "windows" {
+  $env.CLAUDE_CODE_USE_POWERSHELL_TOOL = 1
+}
 
 $env.COPILOT_CUSTOM_INSTRUCTIONS_DIRS = $env.XDG_CONFIG_HOME | path join "copilot"
 

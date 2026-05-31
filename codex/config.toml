@@ -11,8 +11,10 @@ disable_paste_burst = true
 powershell_utf8 = true
 steer = true
 multi_agent = true
-enable_fanout = true
 memories = true
+js_repl = false
+terminal_resize_reflow = true
+mentions_v2 = true
 
 [projects.'\\?\D:\code\ferrous']
 trust_level = "trusted"
@@ -36,6 +38,9 @@ trust_level = "trusted"
 trust_level = "trusted"
 
 [projects.'C:\Users\mattm']
+trust_level = "trusted"
+
+[projects.'c:\users\mattm\documents\codex\2026-05-31\any-benchmarks-comparing-gpt-5-4']
 trust_level = "trusted"
 
 [notice.model_migrations]
@@ -77,6 +82,23 @@ approval_mode = "approve"
 [mcp_servers.openaiDeveloperDocs.tools.fetch_openai_doc]
 approval_mode = "approve"
 
+[mcp_servers.node_repl]
+args = []
+command = 'C:\Users\mattm\AppData\Local\OpenAI\Codex\bin\3c238e29bbc930ff\node_repl.exe'
+startup_timeout_sec = 120
+
+[mcp_servers.node_repl.env]
+NODE_REPL_NATIVE_PIPE_CONNECT_TIMEOUT_MS = "1000"
+NODE_REPL_NODE_MODULE_DIRS = ""
+NODE_REPL_NODE_PATH = 'C:\Users\mattm\AppData\Local\OpenAI\Codex\bin\5b9024f90663758b\node.exe'
+NODE_REPL_TRUSTED_CODE_PATHS = 'D:\config\codex'
+CODEX_HOME = 'D:\config\codex'
+NODE_REPL_TRUSTED_BROWSER_CLIENT_SHA256S = "496c7b3cb95b4bc20cff49b513150606e0da0000c92bf752206bee5a6c248423"
+BROWSER_USE_AVAILABLE_BACKENDS = "chrome,iab"
+BROWSER_USE_MARKETPLACE_NAME = "openai-bundled"
+NODE_REPL_UNTRUSTED_ENV_ALLOWLIST = "BROWSER_USE_MARKETPLACE_NAME"
+CODEX_CLI_PATH = 'C:\Users\mattm\AppData\Local\OpenAI\Codex\bin\958d608b5e0546a5\codex.exe'
+
 [windows]
 sandbox = "elevated"
 
@@ -84,17 +106,14 @@ sandbox = "elevated"
 "gpt-5.5" = 4
 
 [marketplaces.openai-bundled]
-last_updated = "2026-05-01T03:01:26Z"
+last_updated = "2026-05-28T07:06:29Z"
 source_type = "local"
 source = '\\?\D:\config\codex\.tmp\bundled-marketplaces\openai-bundled'
 
 [marketplaces.openai-primary-runtime]
-last_updated = "2026-05-01T03:39:44Z"
+last_updated = "2026-05-28T16:40:03Z"
 source_type = "local"
 source = '\\?\C:\Users\mattm\.cache\codex-runtimes\codex-primary-runtime\plugins\openai-primary-runtime'
-
-[plugins."browser-use@openai-bundled"]
-enabled = true
 
 [plugins."documents@openai-primary-runtime"]
 enabled = true
@@ -104,3 +123,33 @@ enabled = true
 
 [plugins."presentations@openai-primary-runtime"]
 enabled = true
+
+[plugins."browser@openai-bundled"]
+enabled = true
+
+[desktop]
+appearanceTheme = "dark"
+appearanceLightCodeThemeId = "codex"
+sansFontSize = 16
+codeFontSize = 14
+conversationDetailMode = "STEPS_COMMANDS"
+
+[desktop.appearanceLightChromeTheme]
+accent = "#0169cc"
+contrast = 45
+ink = "#0d0d0d"
+opaqueWindows = false
+surface = "#ffffff"
+
+[desktop.appearanceLightChromeTheme.fonts]
+
+[desktop.appearanceLightChromeTheme.semanticColors]
+diffAdded = "#00a240"
+diffRemoved = "#e02e2a"
+skill = "#751ed9"
+
+[desktop.open-in-target-preferences]
+global = "fileManager"
+
+[desktop.open-in-target-preferences.perPath]
+'C:\Users\mattm\Documents\Scratch' = "fileManager"

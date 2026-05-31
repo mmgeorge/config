@@ -39,3 +39,13 @@
 
 [push]
 autoSetupRemote = true
+
+[core]
+	fsmonitor = true
+	untrackedCache = true
+
+[fetch]
+	writeCommitGraph = true
+
+[index]
+	version = 4

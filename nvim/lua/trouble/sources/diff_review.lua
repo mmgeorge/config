@@ -192,6 +192,53 @@ local function get_hunks(cwd, staged)
   return parse_diff(table.concat(result, "\n"), staged)
 end
 
+--- Order a single file's hunks by line position and split out the diff
+--- patches and their matching staged flags. Keeping line order means a hunk
+--- stays put when staged/unstaged — it only folds, never jumps to the end of
+--- the file (unstaged and staged hunks would otherwise group separately).
+---@param hunks table[] hunks for one file, each with .pos, .staged, .diff
+---@return string[] diffs, boolean[] staged_flags
+local function order_file_hunks(hunks)
+  table.sort(hunks, function(a, b)
+    if a.pos ~= b.pos then
+      return a.pos < b.pos
+    end
+    -- Same position: show the unstaged hunk before the staged one
+    return not a.staged and b.staged
+  end)
+  local diffs, flags = {}, {}
+  for _, hunk in ipairs(hunks) do
+    if hunk.diff then
+      diffs[#diffs + 1] = hunk.diff
+      flags[#flags + 1] = hunk.staged
+    end
+  end
+  return diffs, flags
+end
+
+--- Fetch one file's hunks (unstaged + staged) from git, ordered by line
+--- position. Returns the combined diff text and per-hunk staged flags, or
+--- (nil, nil) when the file has no hunks.
+---@param cwd string git root
+---@param filename string absolute path
+---@return string? diff_text, boolean[]? staged_flags
+local function file_diff_and_flags(cwd, filename)
+  local norm = vim.fs.normalize(filename)
+  local hunks = {}
+  for _, staged in ipairs({ false, true }) do
+    for _, hunk in ipairs(get_hunks(cwd, staged)) do
+      if vim.fs.normalize(vim.fn.fnamemodify(cwd .. "/" .. hunk.file, ":p")) == norm then
+        hunks[#hunks + 1] = hunk
+      end
+    end
+  end
+  local diffs, flags = order_file_hunks(hunks)
+  if #diffs == 0 then
+    return nil, nil
+  end
+  return table.concat(diffs, "\n"), flags
+end
+
 --- Compute treesitter-based scope context for a hunk at a given line.
 --- Returns a string like "MyClass.my_method" or nil if no context found.
 ---@param filename string absolute path
@@ -485,24 +532,22 @@ function M.get(cb, _ctx)
     })
   end
 
-  -- Build per-file combined diffs + staged status for file-level preview
-  local file_diffs = {}
-  local file_staged = {}
+  -- Build per-file combined diffs + staged status for file-level preview.
+  -- order_file_hunks keeps hunks in line order so staging folds a hunk in
+  -- place instead of moving it to the end of the file.
+  local file_hunks = {} ---@type table<string, table[]>
   for _, hunk in ipairs(all_hunks) do
     local f = hunk.file
-    if not file_diffs[f] then
-      file_diffs[f] = {}
-      file_staged[f] = {}
-    end
-    table.insert(file_diffs[f], hunk.diff)
-    table.insert(file_staged[f], hunk.staged)
+    file_hunks[f] = file_hunks[f] or {}
+    file_hunks[f][#file_hunks[f] + 1] = hunk
   end
   M._file_diffs = {}
   M._file_hunk_staged = {}
-  for f, diffs in pairs(file_diffs) do
+  for f, hunks in pairs(file_hunks) do
+    local diffs, flags = order_file_hunks(hunks)
     local filename = vim.fn.fnamemodify(cwd .. "/" .. f, ":p")
     M._file_diffs[filename] = table.concat(diffs, "\n")
-    M._file_hunk_staged[filename] = file_staged[f]
+    M._file_hunk_staged[filename] = flags
   end
 
   Item.add_text(items, { mode = "after" })
@@ -1023,28 +1068,32 @@ function M.open_diff_buffer(filename)
         vim.notify("Stage failed: " .. result, vim.log.levels.ERROR)
       else
         vim.notify("Hunk staged", vim.log.levels.INFO)
-        -- Collapse the staged hunk, update checkbox, and jump to next
-        if hunks and cur_hunk_idx then
-          hunks[cur_hunk_idx].folded = true
-          -- Update checkbox from [ ] to [x] on the @@ line
-          local hunk_line = hunks[cur_hunk_idx].start_line - 1 -- 0-indexed
-          local line_text = vim.api.nvim_buf_get_lines(buf, hunk_line, hunk_line + 1, false)[1] or ""
-          local new_text = line_text:gsub("^%[ %]", "[x]", 1)
-          if new_text ~= line_text then
-            vim.bo[buf].modifiable = true
-            vim.api.nvim_buf_set_lines(buf, hunk_line, hunk_line + 1, false, { new_text })
-            vim.bo[buf].modifiable = false
+        local win = vim.api.nvim_get_current_win()
+        local filename = M._buf_filename[buf]
+        -- Move to the next hunk. The staged hunk keeps its position (it only
+        -- folds), so "next" is the following index in the rebuilt hunk map.
+        local function goto_next()
+          if not vim.api.nvim_win_is_valid(win) or vim.api.nvim_win_get_buf(win) ~= buf then
+            return
           end
-          M._render_with_folds(buf)
-          -- Jump to next hunk, or stay on current @@ if last
-          local next_idx = cur_hunk_idx + 1
-          if next_idx <= #hunks then
-            pcall(vim.api.nvim_win_set_cursor, 0, { hunks[next_idx].start_line, 0 })
-          else
-            pcall(vim.api.nvim_win_set_cursor, 0, { hunks[cur_hunk_idx].start_line, 0 })
+          local new_hunks = M._buf_hunks[buf]
+          if new_hunks and cur_hunk_idx then
+            local target = new_hunks[cur_hunk_idx + 1] or new_hunks[cur_hunk_idx]
+            if target then
+              local max = vim.api.nvim_buf_line_count(buf)
+              pcall(vim.api.nvim_win_set_cursor, win, { math.min(target.start_line, max), 0 })
+            end
           end
         end
+        -- Re-render this file's diff buffer so the staged hunk folds in place.
+        if filename then
+          M.refresh_open_diff_buffer(filename)
+        end
+        goto_next()
         require("trouble").refresh("diff_review")
+        -- The async list refresh re-renders the buffer (resetting the
+        -- cursor), so re-assert the next-hunk position once it settles.
+        vim.defer_fn(goto_next, 60)
       end
     end, vim.tbl_extend("force", kopts, { desc = "Stage hunk", nowait = true }))
 
@@ -1064,27 +1113,42 @@ function M.open_diff_buffer(filename)
         vim.notify("Unstage failed: " .. result, vim.log.levels.ERROR)
       else
         vim.notify("Hunk unstaged", vim.log.levels.INFO)
-        -- Update checkbox from [x] to [ ] and expand
-        local hunks = M._buf_hunks[buf]
+        local win = vim.api.nvim_get_current_win()
+        local filename = M._buf_filename[buf]
+        -- Find the current hunk so we can stay on it after the re-render
+        -- (it expands in place; unstaging must not jump to the buffer top).
+        local cur_idx, cur_offset = nil, 0
         local cursor_line = vim.api.nvim_win_get_cursor(0)[1]
+        local hunks = M._buf_hunks[buf]
         if hunks then
-          for _, h in ipairs(hunks) do
+          for i, h in ipairs(hunks) do
             if cursor_line >= h.start_line and cursor_line <= h.end_line then
-              h.folded = false
-              local hunk_line = h.start_line - 1
-              local line_text = vim.api.nvim_buf_get_lines(buf, hunk_line, hunk_line + 1, false)[1] or ""
-              local new_text = line_text:gsub("^%[x%]", "[ ]", 1)
-              if new_text ~= line_text then
-                vim.bo[buf].modifiable = true
-                vim.api.nvim_buf_set_lines(buf, hunk_line, hunk_line + 1, false, { new_text })
-                vim.bo[buf].modifiable = false
-              end
-              M._render_with_folds(buf)
+              cur_idx = i
+              cur_offset = cursor_line - h.start_line
               break
             end
           end
         end
+        local function stay()
+          if not vim.api.nvim_win_is_valid(win) or vim.api.nvim_win_get_buf(win) ~= buf then
+            return
+          end
+          local new_hunks = M._buf_hunks[buf]
+          if new_hunks and cur_idx and new_hunks[cur_idx] then
+            local max = vim.api.nvim_buf_line_count(buf)
+            local line = math.min(new_hunks[cur_idx].start_line + cur_offset, max)
+            pcall(vim.api.nvim_win_set_cursor, win, { line, 0 })
+          end
+        end
+        -- Re-render this file's diff buffer so the hunk expands in place.
+        if filename then
+          M.refresh_open_diff_buffer(filename)
+        end
+        stay()
         require("trouble").refresh("diff_review")
+        -- The async list refresh re-renders the buffer (resetting the
+        -- cursor), so re-assert the current-hunk position once it settles.
+        vim.defer_fn(stay, 60)
       end
     end, vim.tbl_extend("force", kopts, { desc = "Unstage hunk", nowait = true }))
 
@@ -1212,8 +1276,12 @@ function M._refresh_diff_buffer(buf, filename)
   local staged_flags = M._file_hunk_staged and M._file_hunk_staged[filename]
 
   if diff_text and diff_text ~= "" then
-    -- Skip re-render if already rendered with the same data
+    -- Skip re-render if already rendered with the same data, but still
+    -- (re)apply folds: the initial pre-render happens off-screen, where
+    -- _render_with_folds is a no-op (no window shows the buffer yet), so the
+    -- staged-hunk folds must be applied once the buffer becomes visible.
     if M._buf_last_rendered[buf] == diff_text and M._buf_hunks[buf] then
+      M._render_with_folds(buf)
       return
     end
     M._buf_last_rendered[buf] = diff_text
@@ -1252,25 +1320,9 @@ end
 function M._update_file_diff_cache(filename)
   local cwd = vim.trim(vim.fn.systemlist({ "git", "rev-parse", "--show-toplevel" })[1] or "")
   if cwd == "" then return end
-  local norm = vim.fs.normalize(filename)
-  local unstaged = get_hunks(cwd, false)
-  local staged = get_hunks(cwd, true)
-  local diffs, flags = {}, {}
-  for _, h in ipairs(unstaged) do
-    if vim.fs.normalize(vim.fn.fnamemodify(cwd .. "/" .. h.file, ":p")) == norm then
-      diffs[#diffs + 1] = h.diff; flags[#flags + 1] = false
-    end
-  end
-  for _, h in ipairs(staged) do
-    if vim.fs.normalize(vim.fn.fnamemodify(cwd .. "/" .. h.file, ":p")) == norm then
-      diffs[#diffs + 1] = h.diff; flags[#flags + 1] = true
-    end
-  end
-  local new_diff = #diffs > 0 and table.concat(diffs, "\n") or nil
   M._file_diffs = M._file_diffs or {}
   M._file_hunk_staged = M._file_hunk_staged or {}
-  M._file_diffs[filename] = new_diff
-  M._file_hunk_staged[filename] = #flags > 0 and flags or nil
+  M._file_diffs[filename], M._file_hunk_staged[filename] = file_diff_and_flags(cwd, filename)
 end
 
 --- Refresh an open diff buffer for the given filename (if one exists).
@@ -1285,23 +1337,7 @@ function M.refresh_open_diff_buffer(filename)
   -- Re-fetch diff data for this file only (cache is stale after staging)
   local cwd = vim.trim(vim.fn.systemlist({ "git", "rev-parse", "--show-toplevel" })[1] or "")
   if cwd == "" then return end
-  local unstaged = get_hunks(cwd, false)
-  local staged = get_hunks(cwd, true)
-  local norm = vim.fs.normalize(filename)
-  local diffs, flags = {}, {}
-  for _, h in ipairs(unstaged) do
-    if vim.fs.normalize(vim.fn.fnamemodify(cwd .. "/" .. h.file, ":p")) == norm then
-      diffs[#diffs + 1] = h.diff; flags[#flags + 1] = false
-    end
-  end
-  for _, h in ipairs(staged) do
-    if vim.fs.normalize(vim.fn.fnamemodify(cwd .. "/" .. h.file, ":p")) == norm then
-      diffs[#diffs + 1] = h.diff; flags[#flags + 1] = true
-    end
-  end
-  -- Update the cache and invalidate render cache
-  M._file_diffs[filename] = #diffs > 0 and table.concat(diffs, "\n") or nil
-  M._file_hunk_staged[filename] = #flags > 0 and flags or nil
+  M._file_diffs[filename], M._file_hunk_staged[filename] = file_diff_and_flags(cwd, filename)
   M._buf_last_rendered[buf] = nil  -- force re-render
   M._refresh_diff_buffer(buf, filename)
 end

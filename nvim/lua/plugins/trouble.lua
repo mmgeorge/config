@@ -281,20 +281,22 @@ return {
                   end
                   view:fold(ctx.node, { action = "close" })
                 end
-                -- Move cursor down BEFORE refresh so it lands on the next item
+                -- Capture the next row so we can land on it after the refresh
+                -- re-renders the list (which would otherwise reset the cursor).
                 local cursor = vim.api.nvim_win_get_cursor(view.win.win)
-                local max = vim.api.nvim_buf_line_count(view.win.buf)
-                if cursor[1] < max then
-                  vim.api.nvim_win_set_cursor(view.win.win, { cursor[1] + 1, cursor[2] })
-                end
+                local target_line = cursor[1] + 1
                 view:refresh()
                 -- Sync open diff buffer
                 if affected_file then
                   dr.refresh_open_diff_buffer(affected_file)
                 end
-                -- Re-apply fold level and update preview after refresh renders
+                -- Move to the next hunk row and update the preview after the
+                -- refresh renders. Don't touch fold level: the renderer keeps
+                -- per-file fold state across a refresh, so resetting it here
+                -- would collapse the files the user has expanded.
                 vim.defer_fn(function()
-                  view:fold_level({ level = 1 })
+                  local max = vim.api.nvim_buf_line_count(view.win.buf)
+                  pcall(vim.api.nvim_win_set_cursor, view.win.win, { math.min(target_line, max), cursor[2] })
                   dr.auto_preview(view)
                 end, 50)
               end,

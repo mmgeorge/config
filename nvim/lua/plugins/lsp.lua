@@ -208,10 +208,11 @@ return {
           ["rust-analyzer"] = {
             cargo = {
               features = "all",
+              targetDir = true,
             },
             check = {
-              allTargets = true,
-              workspace = true,
+              allTargets = false,
+              workspace = false,
             },
             cachePriming = {
               enable = true,

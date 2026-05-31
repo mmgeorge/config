@@ -134,17 +134,24 @@ manage the window yourself.
 
 `view:refresh()` re-runs `M.get()` and re-renders. But:
 
-- It resets fold level to 99 (re-apply with `vim.defer_fn`)
 - `view:at()` returns stale data until render completes
 - Cursor position may shift; use `vim.defer_fn` for post-refresh operations
 
 ```lua
 view:refresh()
 vim.defer_fn(function()
-  view:fold_level({ level = 1 })
-  -- Now view:at() has fresh data
+  -- Now view:at() has fresh data; move the cursor / update preview here
 end, 50)
 ```
+
+**Do NOT call `view:fold_level()` after a refresh.** The renderer keeps its
+per-node fold state (`renderer._folded`, keyed by stable `node.id`) across a
+refresh — `clear()` and `render()` never touch it, and the window's
+`foldlevel = 99` is only applied once at mount. Calling `fold_level()` after a
+refresh recomputes folds purely from depth, discarding whatever the user
+manually expanded/collapsed (e.g. staging one hunk would re-collapse every open
+file). Set the initial fold level **once** in the `first_render` callback; never
+again.
 
 ### Main Window Detection
 
@@ -482,16 +489,19 @@ stale data.
 **Fix**: `vim.fn.system` is synchronous, so git state IS updated. The
 issue is usually that you're reading cached data instead of re-running git.
 
-### 5. Fold Level Reset on Refresh
+### 5. Re-applying Fold Level After Refresh Collapses Open Nodes
 
-**Bug**: `view:refresh()` re-renders with Trouble's default `foldlevel=99`.
+**Bug**: Calling `view:fold_level({ level = 1 })` after `view:refresh()` (to
+"restore" folds) actually *destroys* the user's manual fold state — staging one
+hunk re-collapses every file they had expanded.
 
-**Fix**: Re-apply fold level after refresh:
+**Fix**: Don't. The renderer persists `_folded` (keyed by stable `node.id`)
+across a refresh, so expanded/collapsed state survives on its own. Set the fold
+level only once, in `first_render`:
 ```lua
-view:refresh()
-vim.defer_fn(function()
-  view:fold_level({ level = 1 })
-end, 50)
+view.first_render:next(function()
+  view:fold_level({ level = 1 })  -- initial default; never re-apply on refresh
+end)
 ```
 
 ### 6. BufEnter for Diff Buffer Refresh
@@ -515,3 +525,17 @@ vim.api.nvim_create_autocmd("BufEnter", {
 starts with `S` (e.g., `Sa`).
 
 **Fix**: Add `nowait = true` to the keymap options.
+
+### 8. Hunks Jumping on Stage (Unstaged-then-Staged Grouping)
+
+**Bug**: `git diff` and `git diff --cached` are fetched separately, so naively
+concatenating them (`all_hunks = unstaged ++ staged`) groups every unstaged
+hunk before every staged hunk. Staging a hunk then moves it to the **end** of
+the file's diff buffer instead of leaving it in place — the list visibly
+re-sorts on every stage.
+
+**Fix**: Order each file's hunks by line position (`pos`) before building the
+per-file diff, so a staged hunk keeps its place and is merely folded (via the
+`staged_flags` auto-fold). The combined diff is built in three places
+(`M.get`, `refresh_open_diff_buffer`, `_update_file_diff_cache`) — all route
+through the shared `order_file_hunks` helper so they can't drift apart.
