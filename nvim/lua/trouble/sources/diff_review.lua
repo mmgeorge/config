@@ -353,7 +353,7 @@ function M.open()
       view:fold_level({ level = 1 })
       -- Show hint + branch in the winbar
       local branch = vim.trim(vim.fn.systemlist({ "git", "rev-parse", "--abbrev-ref", "HEAD" })[1] or "")
-      local winbar = " %#Comment#<Tab>%* toggle | %#Comment#S%* stage | %#Comment#U%* unstage | %#Comment#cc%* commit | %#Comment#<CR>%* jump | %#Comment#q%* close | %#Comment#?%* help"
+      local winbar = " %#Comment#<Tab>%* toggle | %#Comment#S%* stage | %#Comment#U%* unstage | %#Comment#j%* discard | %#Comment#cc%* commit | %#Comment#<CR>%* jump | %#Comment#q%* close | %#Comment#?%* help"
       if branch ~= "" then
         winbar = winbar .. "%=" .. "%#Keyword# " .. branch .. " %*"
       end
@@ -1506,6 +1506,100 @@ function M.prefold_into(view, node, category)
     :gsub("#Untracked Files#", "#" .. category .. "#")
     :gsub("#Tracked Changes#", "#" .. category .. "#")
   view.renderer._folded[id] = true
+end
+
+--- Small centred confirmation popup. Runs `on_yes` only if the user presses
+--- `y`; `n` / `q` / <Esc> dismiss it.
+---@param lines string[] message lines
+---@param on_yes function
+local function confirm(lines, on_yes)
+  local body = vim.list_extend({}, lines)
+  body[#body + 1] = ""
+  body[#body + 1] = "  [y] yes    [n] no"
+  local width = 32
+  for _, line in ipairs(body) do
+    width = math.max(width, #line + 4)
+  end
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, body)
+  vim.bo[buf].modifiable = false
+  vim.bo[buf].bufhidden = "wipe"
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative = "editor",
+    width = width,
+    height = #body,
+    col = math.floor((vim.o.columns - width) / 2),
+    row = math.floor((vim.o.lines - #body) / 2),
+    style = "minimal",
+    border = "rounded",
+    title = " Confirm ",
+    title_pos = "center",
+  })
+  local function close()
+    if vim.api.nvim_win_is_valid(win) then pcall(vim.api.nvim_win_close, win, true) end
+  end
+  vim.keymap.set("n", "y", function()
+    close()
+    on_yes()
+  end, { buffer = buf, nowait = true, silent = true })
+  for _, key in ipairs({ "n", "q", "<Esc>" }) do
+    vim.keymap.set("n", key, close, { buffer = buf, nowait = true, silent = true })
+  end
+end
+
+--- Discard the change under the cursor, after a y/n confirmation:
+--- a hunk is reverse-applied (`--index` too when staged), a tracked file is
+--- restored to HEAD, an untracked file is deleted from disk.
+---@param view trouble.View
+---@param ctx table Trouble action context
+function M.discard(view, ctx)
+  local node_item = ctx.node and ctx.node.item
+  local item = (ctx.item and ctx.item.item) or (node_item and node_item.item)
+  local filename = (ctx.item and ctx.item.filename) or (node_item and node_item.filename)
+  if not filename then return end
+  local untracked = item and item.category == "Untracked Files"
+  local rel = vim.fn.fnamemodify(filename, ":.")
+  local cwd = vim.trim(vim.fn.systemlist({ "git", "rev-parse", "--show-toplevel" })[1] or "")
+
+  local function after()
+    view:refresh()
+    M.refresh_open_diff_buffer(filename)
+    vim.defer_fn(function() M.auto_preview(view) end, 50)
+  end
+
+  if untracked then
+    confirm({ "Delete untracked file?", "  " .. rel }, function()
+      if vim.fn.delete(filename) ~= 0 then
+        vim.notify("Failed to delete " .. rel, vim.log.levels.ERROR)
+      end
+      after()
+    end)
+  elseif ctx.item and ctx.item.item.diff then
+    local patch = ctx.item.item.diff
+    local staged = ctx.item.item.staged
+    confirm({ "Discard this hunk?", "  " .. rel }, function()
+      local args = { "git", "-C", cwd, "apply", "--reverse", "--whitespace=nowarn" }
+      if staged then
+        args[#args + 1] = "--index"
+      end
+      args[#args + 1] = "-"
+      local result = vim.fn.system(args, patch .. "\n")
+      if vim.v.shell_error ~= 0 then
+        vim.notify("Discard failed: " .. result, vim.log.levels.ERROR)
+      end
+      after()
+    end)
+  elseif ctx.node then
+    confirm({ "Discard ALL changes to file?", "  " .. rel }, function()
+      vim.fn.system({ "git", "-C", cwd, "checkout", "HEAD", "--", filename })
+      if vim.v.shell_error ~= 0 then
+        -- Staged-new file (not in HEAD): unstage, then it is untracked again.
+        vim.fn.system({ "git", "-C", cwd, "restore", "--staged", "--", filename })
+        vim.fn.delete(filename)
+      end
+      after()
+    end)
+  end
 end
 
 --- Show the appropriate buffer in the main window when cursor moves.

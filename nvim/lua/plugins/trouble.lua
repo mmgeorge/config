@@ -354,6 +354,12 @@ return {
               end,
               desc = "Commit",
             },
+            j = {
+              action = function(view, ctx)
+                require("trouble.sources.diff_review").discard(view, ctx)
+              end,
+              desc = "Discard hunk/file",
+            },
           },
         },
         symbols = {
