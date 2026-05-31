@@ -350,6 +350,8 @@ end
 
 --- Close and wipe all diff buffers
 function M._cleanup_diff_buffers()
+  M._restore_line_numbers(M._main_win)
+  M._saved_wo = nil
   M._diff_bufs = M._diff_bufs or {}
   for key, buf in pairs(M._diff_bufs) do
     if vim.api.nvim_buf_is_valid(buf) then
@@ -823,6 +825,9 @@ function M.open_diff_buffer(filename)
       buffer = buf,
       callback = function()
         if not vim.api.nvim_buf_is_valid(buf) or not M._buf_filename[buf] then return end
+        -- Re-hide the number column: re-entering the diff buffer (e.g. a
+        -- window switch back from the real file) restores it otherwise.
+        M._hide_line_numbers(vim.api.nvim_get_current_win())
         vim.schedule(function()
           if not vim.api.nvim_buf_is_valid(buf) then return end
           -- Re-fetch diff if cache was invalidated
@@ -899,6 +904,9 @@ function M.open_diff_buffer(filename)
     vim.keymap.set("n", "<CR>", function()
       local target_file = M._buf_filename[buf]
       if not target_file then return end
+
+      -- Leaving the diff preview for the real file: restore its number column.
+      M._restore_line_numbers(vim.api.nvim_get_current_win())
 
       -- Save cursor as hunk-relative position so we can restore after re-render.
       -- Store: { hunk_index, offset_within_hunk, col, hunk_header }
@@ -1357,6 +1365,35 @@ function M.get_main_win(view)
   return M._main_win
 end
 
+-- Saved number/relativenumber of the main window, captured before we first
+-- hide them for the diff preview so they can be restored on jump/close.
+M._saved_wo = nil
+
+--- Hide the buffer's line-number column in the diff preview window. The Snacks
+--- renderer draws its own old/new line-number columns, so Neovim's number
+--- column is a redundant third set. Saves the prior state once for restoring.
+---@param win number
+function M._hide_line_numbers(win)
+  if M._saved_wo == nil then
+    M._saved_wo = {
+      number = vim.wo[win].number,
+      relativenumber = vim.wo[win].relativenumber,
+    }
+  end
+  vim.wo[win].number = false
+  vim.wo[win].relativenumber = false
+end
+
+--- Restore the line-number columns hidden by _hide_line_numbers (e.g. when
+--- jumping to a real file, where the number column is wanted again).
+---@param win? number
+function M._restore_line_numbers(win)
+  if M._saved_wo and win and vim.api.nvim_win_is_valid(win) then
+    vim.wo[win].number = M._saved_wo.number
+    vim.wo[win].relativenumber = M._saved_wo.relativenumber
+  end
+end
+
 --- Show the appropriate buffer in the main window when cursor moves.
 --- On hunk rows: show the real file at the hunk position.
 --- On file group headers: show the fancy diff buffer.
@@ -1374,6 +1411,7 @@ function M.auto_preview(view)
 
     local diff_buf = M.open_diff_buffer(filename)
     vim.api.nvim_win_set_buf(win, diff_buf)
+    M._hide_line_numbers(win)
     -- Re-fetch if cache was invalidated (e.g., after editing the real file)
     if not M._file_diffs or not M._file_diffs[filename] then
       M._update_file_diff_cache(filename)
@@ -1411,6 +1449,7 @@ function M.auto_preview(view)
 
     local buf = M.open_diff_buffer(filename)
     vim.api.nvim_win_set_buf(win, buf)
+    M._hide_line_numbers(win)
     if not M._file_diffs or not M._file_diffs[filename] then
       M._update_file_diff_cache(filename)
     end

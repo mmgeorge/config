@@ -504,20 +504,41 @@ view.first_render:next(function()
 end)
 ```
 
-### 6. BufEnter for Diff Buffer Refresh
+### 6. Per-Display State Tied to One Code Path, Not the Buffer
 
-**Bug**: Diff buffer shows stale content after editing the real file and
-switching back.
+**Bug**: Whenever a buffer is shown it needs some setup — re-render stale
+content, hide the window's `number` column (the Snacks renderer draws its own),
+set window-local options, etc. It's tempting to do that setup in the *one*
+function you wrote to display the buffer (e.g. `auto_preview`). But a buffer
+gets (re-)entered and (re-)displayed through **many** paths you don't control:
 
-**Fix**: Add `BufEnter` autocmd on the diff buffer:
+- `auto_preview` / `nvim_win_set_buf` (your preview code)
+- a window-switch keybind back from the real file (`<C-w>` motions)
+- `:b`/`:buffer`, `:bnext`, the buffer picker, session restore
+- another plugin or the user splitting/reopening the window
+
+Set up via one path and every other path leaves the buffer half-configured —
+e.g. the number column reappears after switching back from the real file.
+
+**Fix**: Attach the setup to the **buffer**, not the call site. Use a
+`BufEnter` (focus) and/or `BufWinEnter` (display) autocmd scoped to the buffer
+so it re-applies no matter how you got there. Make the callback idempotent and
+capture any to-be-restored state once:
 ```lua
 vim.api.nvim_create_autocmd("BufEnter", {
   buffer = buf,
   callback = function()
-    M._refresh_diff_buffer(buf, filename)
+    M._refresh_diff_buffer(buf, filename)            -- re-render stale content
+    M._hide_line_numbers(vim.api.nvim_get_current_win()) -- re-hide number column
   end,
 })
 ```
+
+Caveat: `BufEnter` only fires when the buffer is **focused**. For a buffer
+shown unfocused in another window (a preview), `BufEnter` won't fire there —
+still call the setup directly at your display site (`auto_preview`) as well, so
+both the focused and previewed cases are covered. The principle holds: don't
+assume a single entry path.
 
 ### 7. nowait for Single-Key Mappings
 
