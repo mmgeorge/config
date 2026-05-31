@@ -87,6 +87,31 @@ else
 end
 ```
 
+**`ctx.node.item` is only the group's FIRST item.** On a top-level header like
+"Tracked Changes" that's just the first file's first hunk — an action that reads
+`ctx.node.item.filename` silently operates on one file instead of the whole
+group. To act on everything under a header, walk the subtree to the file-level
+nodes (those whose `node.group.fields[1] == "filename"`) and loop:
+
+```lua
+-- the node itself if it's a file group, else every file group beneath it
+local function file_group_nodes(node)
+  if node.group and node.group.fields and node.group.fields[1] == "filename" then
+    return { node }
+  end
+  local out = {}
+  local function walk(n)
+    if n.group and n.group.fields and n.group.fields[1] == "filename" then
+      out[#out + 1] = n
+    else
+      for _, c in ipairs(n.children or {}) do walk(c) end
+    end
+  end
+  walk(node)
+  return out
+end
+```
+
 ### Movement: next/prev vs Raw Cursor
 
 Trouble's built-in `next`/`prev` actions **skip group headers** (they only

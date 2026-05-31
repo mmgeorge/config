@@ -1460,6 +1460,30 @@ function M.file_nodes(view)
   return ret
 end
 
+--- The file-level group nodes covered by `node`: the node itself when it is a
+--- file group, or every file group beneath it when it is a category header
+--- ("Tracked Changes" / "Untracked Files"). Lets S/U/j act on a whole group.
+---@param node trouble.Node
+---@return trouble.Node[] nodes, boolean is_group whether `node` was a category
+function M.file_group_nodes(node)
+  if not node then return {}, false end
+  if node.group and node.group.fields and node.group.fields[1] == "filename" then
+    return { node }, false
+  end
+  local nodes = {}
+  local function walk(n)
+    if n.group and n.group.fields and n.group.fields[1] == "filename" then
+      nodes[#nodes + 1] = n
+    else
+      for _, child in ipairs(n.children or {}) do
+        walk(child)
+      end
+    end
+  end
+  walk(node)
+  return nodes, true
+end
+
 --- Find the rendered file-group node (and its row) for a filename.
 ---@param view trouble.View
 ---@param filename? string
@@ -1547,59 +1571,100 @@ local function confirm(lines, on_yes)
   end
 end
 
---- Discard the change under the cursor, after a y/n confirmation:
---- a hunk is reverse-applied (`--index` too when staged), a tracked file is
---- restored to HEAD, an untracked file is deleted from disk.
+--- Discard the change under the cursor, after a y/n confirmation. A tracked
+--- hunk is reverse-applied (`--index` too when staged); a file is restored to
+--- HEAD (tracked) or deleted (untracked); a category header
+--- ("Tracked Changes" / "Untracked Files") discards every file in the group.
 ---@param view trouble.View
 ---@param ctx table Trouble action context
 function M.discard(view, ctx)
-  local node_item = ctx.node and ctx.node.item
-  local item = (ctx.item and ctx.item.item) or (node_item and node_item.item)
-  local filename = (ctx.item and ctx.item.filename) or (node_item and node_item.filename)
-  if not filename then return end
-  local untracked = item and item.category == "Untracked Files"
-  local rel = vim.fn.fnamemodify(filename, ":.")
   local cwd = vim.trim(vim.fn.systemlist({ "git", "rev-parse", "--show-toplevel" })[1] or "")
 
-  local function after()
+  local function after(files)
     view:refresh()
-    M.refresh_open_diff_buffer(filename)
+    for _, file in ipairs(files) do
+      M.refresh_open_diff_buffer(file)
+    end
     vim.defer_fn(function() M.auto_preview(view) end, 50)
   end
 
-  if untracked then
-    confirm({ "Delete untracked file?", "  " .. rel }, function()
-      if vim.fn.delete(filename) ~= 0 then
-        vim.notify("Failed to delete " .. rel, vim.log.levels.ERROR)
-      end
-      after()
-    end)
-  elseif ctx.item and ctx.item.item.diff then
-    local patch = ctx.item.item.diff
-    local staged = ctx.item.item.staged
-    confirm({ "Discard this hunk?", "  " .. rel }, function()
+  -- A single tracked hunk under the cursor: reverse-apply just that hunk.
+  if ctx.item and ctx.item.item and ctx.item.item.diff then
+    local it, filename = ctx.item.item, ctx.item.filename
+    confirm({ "Discard this hunk?", "  " .. vim.fn.fnamemodify(filename, ":.") }, function()
       local args = { "git", "-C", cwd, "apply", "--reverse", "--whitespace=nowarn" }
-      if staged then
+      if it.staged then
         args[#args + 1] = "--index"
       end
       args[#args + 1] = "-"
-      local result = vim.fn.system(args, patch .. "\n")
+      local result = vim.fn.system(args, it.diff .. "\n")
       if vim.v.shell_error ~= 0 then
         vim.notify("Discard failed: " .. result, vim.log.levels.ERROR)
       end
-      after()
+      after({ filename })
     end)
-  elseif ctx.node then
-    confirm({ "Discard ALL changes to file?", "  " .. rel }, function()
-      vim.fn.system({ "git", "-C", cwd, "checkout", "HEAD", "--", filename })
-      if vim.v.shell_error ~= 0 then
-        -- Staged-new file (not in HEAD): unstage, then it is untracked again.
-        vim.fn.system({ "git", "-C", cwd, "restore", "--staged", "--", filename })
-        vim.fn.delete(filename)
-      end
-      after()
-    end)
+    return
   end
+
+  -- Otherwise discard whole files: a single file node, an untracked leaf, or
+  -- every file under a category header.
+  local entries = {} ---@type { file: string, untracked: boolean }[]
+  if ctx.node then
+    for _, node in ipairs(M.file_group_nodes(ctx.node)) do
+      local file = node.item and node.item.filename
+      if file then
+        entries[#entries + 1] = {
+          file = file,
+          untracked = node.item.item and node.item.item.category == "Untracked Files" or false,
+        }
+      end
+    end
+  elseif ctx.item then
+    local file = ctx.item.filename
+    if file then
+      entries[#entries + 1] = {
+        file = file,
+        untracked = ctx.item.item and ctx.item.item.category == "Untracked Files" or false,
+      }
+    end
+  end
+  if #entries == 0 then return end
+
+  local all_untracked = true
+  for _, e in ipairs(entries) do
+    all_untracked = all_untracked and e.untracked
+  end
+
+  local message
+  if #entries == 1 then
+    message = {
+      entries[1].untracked and "Delete untracked file?" or "Discard ALL changes to file?",
+      "  " .. vim.fn.fnamemodify(entries[1].file, ":."),
+    }
+  else
+    message = {
+      all_untracked and ("Delete %d untracked files?"):format(#entries)
+        or ("Discard ALL changes in %d files?"):format(#entries),
+    }
+  end
+
+  confirm(message, function()
+    local files = {}
+    for _, e in ipairs(entries) do
+      files[#files + 1] = e.file
+      if e.untracked then
+        vim.fn.delete(e.file)
+      else
+        vim.fn.system({ "git", "-C", cwd, "checkout", "HEAD", "--", e.file })
+        if vim.v.shell_error ~= 0 then
+          -- Staged-new file (not in HEAD): unstage, then remove it.
+          vim.fn.system({ "git", "-C", cwd, "restore", "--staged", "--", e.file })
+          vim.fn.delete(e.file)
+        end
+      end
+    end
+    after(files)
+  end)
 end
 
 --- Show the appropriate buffer in the main window when cursor moves.

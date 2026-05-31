@@ -286,25 +286,33 @@ return {
                     dr.auto_preview(view)
                   end, 50)
                 elseif ctx.node then
-                  -- File-level stage (whole file, including untracked). Remember
-                  -- the next file now, before the staged one changes category.
-                  local filename = ctx.node.item and ctx.node.item.filename
-                  local next_file = dr.next_file(view, filename)
-                  -- Pre-fold the file's post-stage node so the refresh renders it
-                  -- collapsed in one pass (no second render / flicker).
-                  dr.prefold_into(view, ctx.node, "Tracked Changes")
-                  if filename then
-                    vim.fn.system({ "git", "add", "--", filename })
+                  -- File-level stage. On a category header this is every file in
+                  -- the group; on a file node it's just that one.
+                  local nodes, is_group = dr.file_group_nodes(ctx.node)
+                  local first = ctx.node.item and ctx.node.item.filename
+                  -- Single file: remember the next file to land on (its row moves
+                  -- once it changes category). Group: keep the cursor put.
+                  local next_file = (not is_group) and dr.next_file(view, first) or nil
+                  for _, n in ipairs(nodes) do
+                    -- Pre-fold each post-stage node so the refresh renders it
+                    -- collapsed in one pass (no second render / flicker).
+                    dr.prefold_into(view, n, "Tracked Changes")
+                    local f = n.item and n.item.filename
+                    if f then vim.fn.system({ "git", "add", "--", f }) end
                   end
                   view:refresh()
-                  if filename then dr.refresh_open_diff_buffer(filename) end
+                  for _, n in ipairs(nodes) do
+                    local f = n.item and n.item.filename
+                    if f then dr.refresh_open_diff_buffer(f) end
+                  end
                   vim.defer_fn(function()
-                    -- Land on the next file (or the staged file if it was last),
-                    -- so it reads as "moved to the next file".
-                    local _, row = dr.find_file_node(view, next_file or filename)
-                    if row then
-                      local max = vim.api.nvim_buf_line_count(view.win.buf)
-                      pcall(vim.api.nvim_win_set_cursor, view.win.win, { math.min(row, max), 0 })
+                    if not is_group then
+                      -- Land on the next file, so it reads as "moved to the next".
+                      local _, row = dr.find_file_node(view, next_file or first)
+                      if row then
+                        local max = vim.api.nvim_buf_line_count(view.win.buf)
+                        pcall(vim.api.nvim_win_set_cursor, view.win.win, { math.min(row, max), 0 })
+                      end
                     end
                     dr.auto_preview(view)
                   end, 50)
@@ -315,8 +323,7 @@ return {
             U = {
               action = function(view, ctx)
                 local dr = require("trouble.sources.diff_review")
-                local affected_file = ctx.item and ctx.item.filename
-                    or (ctx.node and ctx.node.item and ctx.node.item.filename)
+                local affected = {}
                 if ctx.item then
                   local it = ctx.item.item
                   if not it.staged then return end
@@ -326,19 +333,25 @@ return {
                       vim.notify("Unstage failed: " .. result, vim.log.levels.ERROR)
                     end
                   end
+                  if ctx.item.filename then affected[#affected + 1] = ctx.item.filename end
                 elseif ctx.node then
-                  local filename = ctx.node.item and ctx.node.item.filename
-                  -- A newly-added file unstages back to "Untracked Files", which
-                  -- must never render expanded; pre-fold its untracked node. (A
-                  -- modified file stays tracked and keeps its own fold state.)
-                  dr.prefold_into(view, ctx.node, "Untracked Files")
-                  if filename then
-                    vim.fn.system({ "git", "restore", "--staged", "--", filename })
+                  -- Unstage every file in the group (one file, or a whole
+                  -- category header). A newly-added file unstages back to
+                  -- "Untracked Files", which must never render expanded, so
+                  -- pre-fold its untracked node. (A modified file stays tracked
+                  -- and keeps its own fold state.)
+                  for _, n in ipairs(dr.file_group_nodes(ctx.node)) do
+                    dr.prefold_into(view, n, "Untracked Files")
+                    local f = n.item and n.item.filename
+                    if f then
+                      vim.fn.system({ "git", "restore", "--staged", "--", f })
+                      affected[#affected + 1] = f
+                    end
                   end
                 end
                 view:refresh()
-                if affected_file then
-                  dr.refresh_open_diff_buffer(affected_file)
+                for _, f in ipairs(affected) do
+                  dr.refresh_open_diff_buffer(f)
                 end
               end,
               desc = "Unstage hunk/file",
