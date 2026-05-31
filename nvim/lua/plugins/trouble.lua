@@ -358,12 +358,18 @@ return {
             },
             cc = {
               action = function(view)
-                require("trouble.sources.diff_review_commit").commit(function()
-                  view:refresh()
-                  vim.defer_fn(function()
-                    require("trouble.sources.diff_review").auto_preview(view)
-                  end, 50)
-                end)
+                local dr = require("trouble.sources.diff_review")
+                require("trouble.sources.diff_review_commit").commit({
+                  win = dr.get_main_win(view),
+                  list_win = view.win.win,
+                  on_done = function()
+                    if vim.api.nvim_win_is_valid(view.win.win) then
+                      pcall(vim.api.nvim_set_current_win, view.win.win)
+                    end
+                    view:refresh()
+                    vim.defer_fn(function() dr.auto_preview(view) end, 50)
+                  end,
+                })
               end,
               desc = "Commit",
             },

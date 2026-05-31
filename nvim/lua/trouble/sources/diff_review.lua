@@ -1673,6 +1673,9 @@ end
 --- Bypasses Trouble's preview system entirely to avoid overlay issues.
 ---@param view trouble.View
 function M.auto_preview(view)
+  -- The commit flow borrows the main window for its console / message buffer;
+  -- don't clobber it on cursor moves while that's running.
+  if M.suspend_preview then return end
   local loc = view:at()
   local win = M.get_main_win(view)
   if not win or not vim.api.nvim_win_is_valid(win) then return end

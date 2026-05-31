@@ -1,16 +1,16 @@
 --- Commit flow for the DiffReview Trouble pane, modelled on Neogit.
 ---
 --- `cc` runs `git commit` as a job with a headless "fake editor" wired to
---- GIT_EDITOR. Everything happens in a SINGLE floating window:
----   1. Git runs the pre-commit hook first; its output streams into the window
----      (the console buffer).
+--- GIT_EDITOR, and reuses the diff-preview window above the Trouble pane:
+---   1. Git runs the pre-commit hook first; its output streams into that window
+---      (a console buffer).
 ---   2. When git invokes the editor, the headless instance RPCs back to *this*
 ---      (parent) nvim, which swaps the same window's buffer to the commit
 ---      message buffer. `<C-c><C-c>` writes it and lets the headless editor exit
 ---      0 (git commits); `<C-q>` exits non-zero (git aborts).
----   3. On success the window closes (and the DiffReview list refreshes). On
----      failure the window closes and a fresh buffer with git's error output
----      opens in its place.
+---   3. On success/abort the window is handed back to the preview (and the list
+---      refreshes). On a real failure the window shows a buffer with git's error
+---      output until dismissed with `q`.
 ---
 --- The bridge is the same one Neogit uses: git's editor step can't be driven
 --- from the running instance, so a child nvim relays it over RPC (`sockconnect`
@@ -18,7 +18,8 @@
 
 local M = {}
 
--- Active commit session: { win, console, on_done, aborted }
+-- Active commit session.
+-- { win, list_win, prev_buf, prev_winbar, console, on_done, aborted }
 M._active = nil
 
 -- ─── fake editor command ────────────────────────────────────────────────────
@@ -70,51 +71,16 @@ function M.client()
   end
 end
 
--- ─── floating window ────────────────────────────────────────────────────────
+-- ─── helpers ────────────────────────────────────────────────────────────────
 
---- Open `buf` in a centred floating window. `o`: width/height fractions of the
---- editor, optional `enter`, `title`.
----@return number win
-local function float(buf, o)
-  local cols, lines = vim.o.columns, vim.o.lines
-  local width = math.max(20, math.floor(cols * (o.width or 0.7)))
-  local height = math.max(3, math.floor(lines * (o.height or 0.55)))
-  local win = vim.api.nvim_open_win(buf, o.enter == true, {
-    relative = "editor",
-    width = width,
-    height = height,
-    col = math.floor((cols - width) / 2),
-    row = math.floor((lines - height) / 2),
-    style = "minimal",
-    border = "rounded",
-    title = o.title,
-    title_pos = "center",
-  })
-  vim.wo[win].number = false
-  vim.wo[win].relativenumber = false
-  vim.wo[win].signcolumn = "no"
-  vim.wo[win].wrap = true
-  return win
-end
-
-local function title(win, text)
+local function winbar(win, text)
   if win and vim.api.nvim_win_is_valid(win) then
-    pcall(vim.api.nvim_win_set_config, win, { title = text, title_pos = "center" })
-  end
-end
-
---- Bind q / <C-q> / <Esc> in `buf` to close `win` (used for the read-only
---- console and error views).
-local function bind_close(buf, win)
-  for _, key in ipairs({ "q", "<C-q>", "<Esc>" }) do
-    vim.keymap.set("n", key, function()
-      if vim.api.nvim_win_is_valid(win) then pcall(vim.api.nvim_win_close, win, true) end
-    end, { buffer = buf, nowait = true, silent = true })
+    pcall(function() vim.wo[win].winbar = text end)
   end
 end
 
 --- Append job output (array of lines, possibly with a trailing partial) to the
---- console buffer and keep it scrolled to the bottom.
+--- console buffer and keep its window scrolled to the bottom.
 local function append(buf, data)
   if not vim.api.nvim_buf_is_valid(buf) then return end
   local lines = {}
@@ -137,7 +103,7 @@ end
 
 -- ─── message editor (runs in the parent) ────────────────────────────────────
 
---- Swap the commit message buffer into the existing console window and bind
+--- Swap the commit message buffer into the borrowed window and bind
 --- submit/abort. Invoked over RPC from the headless client; `client_addr` is
 --- the headless server to signal.
 ---@param target string COMMIT_EDITMSG path
@@ -153,7 +119,7 @@ function M.editor(target, client_addr)
   end
 
   if not (st and st.win and vim.api.nvim_win_is_valid(st.win)) then
-    signal(true) -- no window to take over; abort rather than hang git
+    signal(true) -- no window to host the editor; abort rather than hang git
     return
   end
 
@@ -166,7 +132,7 @@ function M.editor(target, client_addr)
   vim.bo[buf].modifiable = true
 
   vim.api.nvim_win_set_buf(st.win, buf)
-  title(st.win, " Commit  —  <C-c><C-c> commit   <C-q> abort ")
+  winbar(st.win, " %#Comment#<C-c><C-c>%* commit   %#Comment#<C-q>%* abort ")
 
   local finished = false
   local function finish(abort)
@@ -177,27 +143,34 @@ function M.editor(target, client_addr)
       vim.api.nvim_buf_call(buf, function() vim.cmd("silent! write") end)
     end
     signal(abort)
-    -- The window stays on the message buffer until git exits and M._finish
-    -- tears it down (closing the window wipes this buffer).
+    -- The window keeps the message buffer until git exits and M._finish hands
+    -- it back to the preview.
   end
 
   local map = { buffer = buf, nowait = true, silent = true }
   vim.keymap.set({ "n", "i" }, "<C-c><C-c>", function() finish(false) end, map)
   vim.keymap.set({ "n", "i" }, "<C-q>", function() finish(true) end, map)
   vim.keymap.set("n", "q", function() finish(true) end, map)
-  -- Closing the buffer any other way must still release git.
   vim.api.nvim_create_autocmd("BufWipeout", { buffer = buf, once = true, callback = function() finish(true) end })
 
   vim.api.nvim_set_current_win(st.win)
-  -- Enter in normal mode (do not startinsert): keeps <C-q>/<C-c><C-c> reliable.
-  vim.api.nvim_win_set_cursor(st.win, { 1, 0 })
+  -- Enter in normal mode (no startinsert): keeps <C-q>/<C-c><C-c> reliable.
+  pcall(vim.api.nvim_win_set_cursor, st.win, { 1, 0 })
 end
 
--- ─── console popup + running git commit ─────────────────────────────────────
+-- ─── running git commit + result ────────────────────────────────────────────
 
---- Tear down the commit window/console, then report the result: success closes
---- quietly (and refreshes), an explicit abort closes quietly, a real failure
---- opens a fresh buffer with git's output.
+--- Hand the borrowed window back to the DiffReview preview and refresh.
+local function restore_preview(st)
+  if st.prev_buf and vim.api.nvim_buf_is_valid(st.prev_buf)
+      and st.win and vim.api.nvim_win_is_valid(st.win) then
+    pcall(vim.api.nvim_win_set_buf, st.win, st.prev_buf)
+  end
+  if st.on_done then pcall(st.on_done) end
+end
+
+--- Report the result of the commit: success/abort hand the window back to the
+--- preview; a real failure shows git's output in the window until `q`.
 function M._finish(code)
   local st = M._active
   if not st then return end
@@ -206,35 +179,52 @@ function M._finish(code)
   local output = (st.console and vim.api.nvim_buf_is_valid(st.console))
       and vim.api.nvim_buf_get_lines(st.console, 0, -1, false) or {}
 
-  if st.win and vim.api.nvim_win_is_valid(st.win) then pcall(vim.api.nvim_win_close, st.win, true) end
-  if st.console and vim.api.nvim_buf_is_valid(st.console) then
-    pcall(vim.api.nvim_buf_delete, st.console, { force = true })
+  require("trouble.sources.diff_review").suspend_preview = false
+  winbar(st.win, st.prev_winbar or "")
+
+  if code == 0 or st.aborted then
+    vim.notify(code == 0 and "Commit complete" or "Commit aborted", vim.log.levels.INFO)
+    if st.console and vim.api.nvim_buf_is_valid(st.console) then
+      pcall(vim.api.nvim_buf_delete, st.console, { force = true })
+    end
+    restore_preview(st)
+    return
   end
 
-  if code == 0 then
-    vim.notify("Commit complete", vim.log.levels.INFO)
-    if st.on_done then pcall(st.on_done) end
-  elseif st.aborted then
-    vim.notify("Commit aborted", vim.log.levels.INFO)
-  else
-    -- Real failure (e.g. hook rejected, empty message): show git's output.
-    local errbuf = vim.api.nvim_create_buf(false, true)
+  -- Real failure: show git's output in the window; q hands it back.
+  local errbuf = st.console
+  if not (errbuf and vim.api.nvim_buf_is_valid(errbuf)) then
+    errbuf = vim.api.nvim_create_buf(false, true)
     vim.bo[errbuf].bufhidden = "wipe"
     vim.bo[errbuf].filetype = "git"
-    output[#output + 1] = ""
-    output[#output + 1] = ("✗ git commit exited %d   (q to close)"):format(code)
     vim.api.nvim_buf_set_lines(errbuf, 0, -1, false, output)
-    vim.bo[errbuf].modifiable = false
-    local ewin = float(errbuf, { title = " Commit failed ", height = 0.5, enter = true })
-    bind_close(errbuf, ewin)
+  end
+  append(errbuf, { "", ("✗ git commit exited %d   (q to dismiss)"):format(code) })
+  if st.win and vim.api.nvim_win_is_valid(st.win) then
+    pcall(vim.api.nvim_win_set_buf, st.win, errbuf)
+    winbar(st.win, " %#ErrorMsg# Commit failed %* — %#Comment#q%* dismiss ")
+    pcall(vim.api.nvim_set_current_win, st.win)
+  end
+  for _, key in ipairs({ "q", "<Esc>" }) do
+    vim.keymap.set("n", key, function()
+      winbar(st.win, st.prev_winbar or "")
+      if vim.api.nvim_buf_is_valid(errbuf) then pcall(vim.api.nvim_buf_delete, errbuf, { force = true }) end
+      restore_preview(st)
+    end, { buffer = errbuf, nowait = true, silent = true })
   end
 end
 
---- Run `git commit` with the fake editor in a single floating window.
---- `on_done` runs after a successful commit (e.g. to refresh the list).
----@param on_done? function
-function M.commit(on_done)
-  -- Only one session at a time.
+--- Run `git commit` with the fake editor, reusing `opts.win` (the diff-preview
+--- window). `opts.list_win` is the Trouble window; `opts.on_done` refreshes the
+--- list and restores the preview after the window is handed back.
+---@param opts { win: number, list_win?: number, on_done?: function }
+function M.commit(opts)
+  opts = opts or {}
+  local win = opts.win
+  if not (win and vim.api.nvim_win_is_valid(win)) then
+    vim.notify("No diff window to host the commit", vim.log.levels.ERROR)
+    return
+  end
   if M._active then M._finish(1) end
 
   local root = vim.fn.systemlist({ "git", "rev-parse", "--show-toplevel" })[1]
@@ -245,12 +235,25 @@ function M.commit(on_done)
   root = vim.trim(root)
 
   local console = vim.api.nvim_create_buf(false, true)
-  vim.bo[console].bufhidden = "hide" -- survive the swap to the message buffer
+  vim.bo[console].bufhidden = "hide"
   vim.bo[console].filetype = "git"
-  local win = float(console, { title = " Committing… " })
-  bind_close(console, win)
 
-  M._active = { win = win, console = console, on_done = on_done, aborted = false }
+  M._active = {
+    win = win,
+    list_win = opts.list_win,
+    prev_buf = vim.api.nvim_win_get_buf(win),
+    prev_winbar = vim.wo[win].winbar,
+    console = console,
+    on_done = opts.on_done,
+    aborted = false,
+  }
+
+  require("trouble.sources.diff_review").suspend_preview = true
+  vim.api.nvim_win_set_buf(win, console)
+  vim.wo[win].number = false
+  vim.wo[win].relativenumber = false
+  vim.wo[win].wrap = true
+  winbar(win, " Committing… ")
 
   local server = vim.v.servername
   if server == nil or server == "" then server = vim.fn.serverstart() end

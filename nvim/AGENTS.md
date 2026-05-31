@@ -472,9 +472,10 @@ from Neogit, see `diff_review_commit.lua`): point `GIT_EDITOR` at a **headless
 child nvim** that RPCs back to the parent.
 
 1. Run `git commit` via `jobstart` with `env = { GIT_EDITOR = <headless cmd>,
-   NVIM = vim.v.servername }`. Stream stdout/stderr into **one** floating window
-   (a console buffer) — this is where pre-commit hook output shows up, *before*
-   the editor opens.
+   NVIM = vim.v.servername }`. Stream stdout/stderr into a console buffer shown
+   in the **existing diff-preview window** above the Trouble pane (save its
+   buffer + winbar first to restore later) — no new float. This is where
+   pre-commit hook output shows up, *before* the editor opens.
 2. `GIT_EDITOR` is `nvim --headless --clean … -c "lua require('…').client()"`.
    Built with `vim.fn.shellescape` per token (git parses it with a shell). The
    `--clean` child needs `set runtimepath^=<config root>` to find the module.
@@ -482,17 +483,22 @@ child nvim** that RPCs back to the parent.
    `serverstart()`s its own address, and `sockconnect`s to `$NVIM` (the parent)
    to `rpcrequest("nvim_command", "lua …editor(target, child_addr)")`. Then it
    **returns and the child keeps running** — git stays blocked on it.
-4. The parent's `editor()` **swaps the same window's buffer** to the message
-   buffer (one window throughout, not a second float). On submit it writes the
-   file, `rpcnotify`s the child `qall` (exit 0 → git commits); on abort it sends
-   `cq` (exit non-zero → git aborts). A `BufWipeout` autocmd sends `cq` too, so
-   closing the buffer any other way never hangs git.
-5. The job's `on_exit` tears the window down: success closes it (and refreshes),
-   an explicit abort closes it quietly, a real failure (hook rejected, empty
-   message) opens a fresh buffer with git's captured output in its place.
-   Distinguish abort from failure with a flag — both exit non-zero, but only a
-   failure should pop the error buffer. Keep the console buffer `bufhidden=hide`
-   so it survives the swap and still has the full output to show on failure.
+4. The parent's `editor()` **swaps that same window's buffer** to the message
+   buffer (the diff window is reused throughout — console → message → back to
+   preview). On submit it writes the file, `rpcnotify`s the child `qall` (exit
+   0 → git commits); on abort it sends `cq` (exit non-zero → git aborts). A
+   `BufWipeout` autocmd sends `cq` too, so closing the buffer any other way
+   never hangs git.
+5. The job's `on_exit` hands the window back: success/abort restore the saved
+   buffer + winbar and refresh the list (so `auto_preview` repopulates it); a
+   real failure (hook rejected, empty message) shows git's captured output in
+   the window until `q`. Distinguish abort from failure with a flag — both exit
+   non-zero, but only a failure should show the error. Keep the console buffer
+   `bufhidden=hide` so it survives the swap and still has the output to show.
+
+Because the commit borrows the preview window, the cursor-move `auto_preview`
+would clobber it. Gate `auto_preview` on a module flag (`M.suspend_preview`) that
+the commit flow sets while running and clears on exit.
 
 Gotchas: set `NVIM` explicitly in the job env (don't rely on it being
 inherited); wrap the child's `client()` so any error does `cq` rather than
