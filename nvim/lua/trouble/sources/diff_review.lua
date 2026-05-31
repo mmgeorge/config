@@ -239,6 +239,36 @@ local function file_diff_and_flags(cwd, filename)
   return table.concat(diffs, "\n"), flags
 end
 
+--- Build a synthetic "new file" diff (every line an addition) for an untracked
+--- file, so it previews as a single hunk straight from disk — no git, which is
+--- both faster and the only way to show content git doesn't track yet.
+---@param filename string absolute path
+---@param relpath string path relative to the git root (forward slashes)
+---@return string? diff_text
+local function build_untracked_diff(filename, relpath)
+  local ok, lines = pcall(vim.fn.readfile, filename)
+  if not ok or type(lines) ~= "table" or #lines == 0 then
+    return nil
+  end
+  -- Skip binary files (a NUL byte in any line).
+  for _, line in ipairs(lines) do
+    if line:find("\0", 1, true) then
+      return nil
+    end
+  end
+  local out = {
+    "diff --git a/" .. relpath .. " b/" .. relpath,
+    "new file mode 100644",
+    "--- /dev/null",
+    "+++ b/" .. relpath,
+    "@@ -0,0 +1," .. #lines .. " @@",
+  }
+  for _, line in ipairs(lines) do
+    out[#out + 1] = "+" .. line
+  end
+  return table.concat(out, "\n")
+end
+
 --- Compute treesitter-based scope context for a hunk at a given line.
 --- Returns a string like "MyClass.my_method" or nil if no context found.
 ---@param filename string absolute path
@@ -369,6 +399,7 @@ end
 ---@param _ctx trouble.Source.ctx
 function M.get(cb, _ctx)
   M._ts_context_cache = {} -- clear treesitter context cache on refresh
+  M._untracked = {} -- map of absolute path -> repo-relative path for untracked files
   local cwd = vim.fn.systemlist({ "git", "rev-parse", "--show-toplevel" })[1]
   if vim.v.shell_error ~= 0 or not cwd then
     cb({})
@@ -515,6 +546,7 @@ function M.get(cb, _ctx)
   -- Add untracked files
   for _, f in ipairs(untracked_files) do
     local filename = vim.fn.fnamemodify(cwd .. "/" .. f, ":p")
+    M._untracked[filename] = f -- remember repo-relative path for the synthetic diff
     items[#items + 1] = Item.new({
       source = "diff_review",
       filename = filename,
@@ -768,7 +800,11 @@ function M.open_diff_buffer(filename)
     vim.bo[buf].buftype = "nofile"
     vim.bo[buf].swapfile = false
     local short = vim.fn.fnamemodify(filename, ":t")
-    vim.api.nvim_buf_set_name(buf, "diff://" .. short)
+    -- Basenames collide across directories (E95); fall back to a unique name.
+    local name = "diff://" .. short
+    if not pcall(vim.api.nvim_buf_set_name, buf, name) then
+      pcall(vim.api.nvim_buf_set_name, buf, name .. "#" .. buf)
+    end
     M._diff_bufs[key] = buf
     M._buf_filename[buf] = filename
 
@@ -831,7 +867,7 @@ function M.open_diff_buffer(filename)
         vim.schedule(function()
           if not vim.api.nvim_buf_is_valid(buf) then return end
           -- Re-fetch diff if cache was invalidated
-          if not M._file_diffs or not M._file_diffs[filename] then
+          if not M._file_diffs or M._file_diffs[filename] == nil then
             M._update_file_diff_cache(filename)
           end
           M._refresh_diff_buffer(buf, filename)
@@ -1326,11 +1362,23 @@ end
 --- Called before _refresh_diff_buffer to pick up file edits.
 ---@param filename string
 function M._update_file_diff_cache(filename)
-  local cwd = vim.trim(vim.fn.systemlist({ "git", "rev-parse", "--show-toplevel" })[1] or "")
-  if cwd == "" then return end
   M._file_diffs = M._file_diffs or {}
   M._file_hunk_staged = M._file_hunk_staged or {}
-  M._file_diffs[filename], M._file_hunk_staged[filename] = file_diff_and_flags(cwd, filename)
+  -- Untracked files: build the diff from disk, never from git. Cache `false`
+  -- (not nil) for empty/binary so the preview guard treats it as "checked"
+  -- and doesn't re-run this on every cursor move.
+  local relpath = M._untracked and M._untracked[filename]
+  if relpath then
+    local diff_text = build_untracked_diff(filename, relpath)
+    M._file_diffs[filename] = diff_text or false
+    M._file_hunk_staged[filename] = diff_text and { false } or nil
+    return
+  end
+  local cwd = vim.trim(vim.fn.systemlist({ "git", "rev-parse", "--show-toplevel" })[1] or "")
+  if cwd == "" then return end
+  local diff_text, flags = file_diff_and_flags(cwd, filename)
+  M._file_diffs[filename] = diff_text or false
+  M._file_hunk_staged[filename] = flags
 end
 
 --- Refresh an open diff buffer for the given filename (if one exists).
@@ -1343,9 +1391,7 @@ function M.refresh_open_diff_buffer(filename)
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
 
   -- Re-fetch diff data for this file only (cache is stale after staging)
-  local cwd = vim.trim(vim.fn.systemlist({ "git", "rev-parse", "--show-toplevel" })[1] or "")
-  if cwd == "" then return end
-  M._file_diffs[filename], M._file_hunk_staged[filename] = file_diff_and_flags(cwd, filename)
+  M._update_file_diff_cache(filename)
   M._buf_last_rendered[buf] = nil  -- force re-render
   M._refresh_diff_buffer(buf, filename)
 end
@@ -1394,6 +1440,74 @@ function M._restore_line_numbers(win)
   end
 end
 
+--- List the file-level group nodes currently rendered in the Trouble list,
+--- in display order: { { filename, row, node }, ... }. Used to drive
+--- file-to-file cursor movement and folding after a stage.
+---@param view trouble.View
+---@return table[]
+function M.file_nodes(view)
+  local locations = view.renderer and view.renderer._locations or {}
+  local ret = {}
+  for row, loc in pairs(locations) do
+    local node = loc.node
+    if node and node.group and node.group.fields
+        and node.group.fields[1] == "filename"
+        and node.item and node.item.filename then
+      ret[#ret + 1] = { filename = node.item.filename, row = row, node = node }
+    end
+  end
+  table.sort(ret, function(a, b) return a.row < b.row end)
+  return ret
+end
+
+--- Find the rendered file-group node (and its row) for a filename.
+---@param view trouble.View
+---@param filename? string
+---@return trouble.Node?, number?
+function M.find_file_node(view, filename)
+  if not filename then return nil end
+  for _, n in ipairs(M.file_nodes(view)) do
+    if n.filename == filename then
+      return n.node, n.row
+    end
+  end
+end
+
+--- The filename of the file rendered just after `filename` (or nil if last).
+---@param view trouble.View
+---@param filename? string
+---@return string?
+function M.next_file(view, filename)
+  local nodes = M.file_nodes(view)
+  for i, n in ipairs(nodes) do
+    if n.filename == filename then
+      return nodes[i + 1] and nodes[i + 1].filename or nil
+    end
+  end
+end
+
+--- Pre-fold the node a file will occupy *after* it moves to `category`, so the
+--- next refresh renders it collapsed in a single pass — no second render, no
+--- flicker. Trouble keys fold state by `node.id`, which encodes the group path
+--- (`…#<category>#<file>`); staging/unstaging only swaps that one segment, so
+--- rewrite it to the destination category and seed the fold there.
+---
+--- Directional on purpose: staging targets "Tracked Changes", unstaging targets
+--- "Untracked Files". We seed only the destination, never the current id, so a
+--- file that *stays* in its category (e.g. unstaging a modified—not new—file)
+--- keeps whatever fold state the user chose. Enforces "untracked files are
+--- never expanded" across the stage/unstage round-trip.
+---@param view trouble.View
+---@param node? trouble.Node
+---@param category "Tracked Changes"|"Untracked Files"
+function M.prefold_into(view, node, category)
+  if not (node and node.id and view.renderer) then return end
+  local id = node.id
+    :gsub("#Untracked Files#", "#" .. category .. "#")
+    :gsub("#Tracked Changes#", "#" .. category .. "#")
+  view.renderer._folded[id] = true
+end
+
 --- Show the appropriate buffer in the main window when cursor moves.
 --- On hunk rows: show the real file at the hunk position.
 --- On file group headers: show the fancy diff buffer.
@@ -1413,7 +1527,7 @@ function M.auto_preview(view)
     vim.api.nvim_win_set_buf(win, diff_buf)
     M._hide_line_numbers(win)
     -- Re-fetch if cache was invalidated (e.g., after editing the real file)
-    if not M._file_diffs or not M._file_diffs[filename] then
+    if not M._file_diffs or M._file_diffs[filename] == nil then
       M._update_file_diff_cache(filename)
     end
     M._refresh_diff_buffer(diff_buf, filename)
@@ -1450,7 +1564,7 @@ function M.auto_preview(view)
     local buf = M.open_diff_buffer(filename)
     vim.api.nvim_win_set_buf(win, buf)
     M._hide_line_numbers(win)
-    if not M._file_diffs or not M._file_diffs[filename] then
+    if not M._file_diffs or M._file_diffs[filename] == nil then
       M._update_file_diff_cache(filename)
     end
     M._refresh_diff_buffer(buf, filename)

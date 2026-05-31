@@ -400,6 +400,37 @@ for _, line in ipairs(name_status) do
 end
 ```
 
+### Untracked Files: Synthesize the Diff, Don't Ask Git
+
+Untracked files have no git diff (`git diff`/`git diff --cached` ignore them).
+Don't try to fetch one — build a synthetic "new file" patch straight from disk
+and feed it through the normal render path so the file previews as one
+all-additions hunk:
+
+```
+diff --git a/<relpath> b/<relpath>
+new file mode 100644
+--- /dev/null
++++ b/<relpath>
+@@ -0,0 +1,<N> @@
++<line 1>
+...
+```
+
+Read the contents with `vim.fn.readfile`, prefix each line with `+`, and skip
+binary files (a NUL byte in any line) so you don't dump garbage.
+
+**Perf trap that motivated this:** the per-file preview cache (`_file_diffs`)
+is keyed by filename, and the "do I need to fetch?" guard was `not
+_file_diffs[file]`. Tracked files get populated during `get()`, so they're a
+cache hit. Untracked files were never populated, so **every cursor move** over
+one re-ran two full-repo `git diff` calls — visibly laggy. Fix is two parts:
+(1) build untracked diffs from disk (no git at all), and (2) cache a `false`
+sentinel for "checked but empty/binary" and change the guard to
+`_file_diffs[file] == nil`, so a negative result is remembered instead of
+re-fetched on every move. Reserve `nil` for "invalidated, must re-fetch" (set on
+`BufLeave` to a real file).
+
 ### Path Comparison on Windows
 
 Windows uses `\` in paths, git uses `/`. Always normalize before comparing:
@@ -560,3 +591,56 @@ per-file diff, so a staged hunk keeps its place and is merely folded (via the
 `staged_flags` auto-fold). The combined diff is built in three places
 (`M.get`, `refresh_open_diff_buffer`, `_update_file_diff_cache`) — all route
 through the shared `order_file_hunks` helper so they can't drift apart.
+
+### 9. Scratch Buffer Names Collide (E95)
+
+**Bug**: Naming per-file scratch buffers by basename
+(`nvim_buf_set_name(buf, "diff://" .. fnamemodify(f, ":t"))`) throws
+`E95: Buffer with this name already exists` the moment two files share a
+basename (`a/config.lua` and `b/config.lua`). It surfaces as an unhandled
+promise rejection because the display runs inside Trouble's promise chain.
+
+**Fix**: `pcall` the name and fall back to a unique suffix:
+```lua
+local name = "diff://" .. vim.fn.fnamemodify(filename, ":t")
+if not pcall(vim.api.nvim_buf_set_name, buf, name) then
+  pcall(vim.api.nvim_buf_set_name, buf, name .. "#" .. buf)
+end
+```
+The buffer is keyed by full path internally, so the name is only cosmetic —
+never let it crash the preview.
+
+### 10. Fold State Lost When an Item Changes Group
+
+**Bug**: A file staged from the "Untracked Files" category jumps to "Tracked
+Changes" and renders **expanded**, even though every other file is collapsed.
+
+**Cause**: Trouble keys fold state (`renderer._folded`) by `node.id`, and the id
+encodes the **group path** — `…#Untracked Files#<file>` vs
+`…#Tracked Changes#<file>`. Staging changes the file's category, so it becomes a
+*different node* that never inherits the old folded state. (Bug #5 says fold
+state survives a refresh — true, but only while the id is stable.)
+
+**Fix**: **Pre-seed** the fold before the refresh, don't fold after. Folding
+after the refresh (`view:fold` → `view:render`) is a *second* render on top of
+the refresh's render — visible flicker, and the row math shifts under any cursor
+target you computed. Instead, since the node id is just a string, rewrite its
+category segment to the destination and seed the fold table directly, so the
+refresh renders it collapsed in one pass:
+```lua
+-- direction depends on the action: stage -> "Tracked Changes",
+-- unstage of a new file -> "Untracked Files"
+local id = node.id:gsub("#Untracked Files#", "#" .. category .. "#")
+                  :gsub("#Tracked Changes#",  "#" .. category .. "#")
+view.renderer._folded[id] = true          -- before view:refresh()
+```
+Seed only the *destination* id, never the current one — a file that stays in its
+category (unstaging a *modified*, not new, file) then keeps the fold state the
+user chose. This is also how "untracked files are never expanded" survives a
+stage→unstage round-trip.
+For the cursor, capture the *next* file **before** the action (its row moves
+once the staged file changes category), then after the single refresh find it by
+identity — scan `view.renderer._locations` for the file-level group node
+(`node.group.fields[1] == "filename"`, matching `node.item.filename`) and put
+the cursor on its row. Identity beats `cursor + 1`: when staging creates a brand
+new category header, `+1` lands on the header, not the next file.
