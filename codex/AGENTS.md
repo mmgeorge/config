@@ -12,7 +12,8 @@ When creating a plan, use this template. Output each section in order:
 1. **Problem** — What are we adding or fixing? Why?
 2. **Overview** — Approach summary (2–4 sentences).
 3. **Refactoring** (optional) — Only when a substantial refactor is needed before the change can land cleanly. Call out what's wrong, why it must change, and what replaces it. Skip for changes that fit existing structure.
-4. **Code flow** — ASCII diagram from the relevant entry point (not the entire system). Include file paths and data flow (input/output types) per node. Mark `*` (modified/new), `~` (removed). Changes summary below. Example:
+4. **Design patterns** — Which patterns fit the problem. Call out when existing code would benefit from a known pattern. Explain why — don't just name-drop.
+5. **Code flow** — ASCII diagram from the relevant entry point (not the entire system). Include file paths and data flow (input/output types) per node. Mark `*` (modified/new), `~` (removed). Changes summary below. Example:
    ```
    API Request (POST /documents)
      │ (DocumentRequest)
@@ -34,7 +35,7 @@ When creating a plan, use this template. Output each section in order:
      *notify()            — new: webhook notification after processing
      *dispatch()          — new: HTTP delivery with retries
    ```
-5. **Checklist** — Break the work into tasks, each with concrete steps. Steps include every function/type added, modified, or deleted (name, file, what changes). During execution, mark each step done as you complete it. Do not stop until every step is marked. Example:
+6. **Checklist** — Break the work into tasks, each with concrete steps. Steps include every function/type added, modified, or deleted (name, file, what changes). During execution, mark each step done as you complete it. Do not stop until every step is marked. Example:
    ```
    Task 1: Split save_and_respond into separate concerns
      [ ] Rename save_and_respond() → save_result() in processing/store.rs — return StoredDocument
@@ -43,7 +44,6 @@ When creating a plan, use this template. Output each section in order:
      [ ] Create notifications/mod.rs — notify(StoredDocument, WebhookConfig) → NotifyResult
      [ ] Create notifications/dispatch.rs — dispatch() → DispatchResult, HTTP delivery with retries
    ```
-6. **Design patterns** — Which patterns fit the problem. Call out when existing code would benefit from a known pattern. Explain why — don't just name-drop.
 7. **Modularity and testability review** — Clean boundaries? Narrow interfaces? Testable in isolation? Adjust the plan until yes.
 8. **Test plan** — Specific tests:
    - **Unit tests**: What to test, what to mock, what behavior each validates.
@@ -75,7 +75,6 @@ Every plan must end with these lines:
 - **Bootstrapping relaunches**: If the remote-explorer already ran on the same repo/library this conversation, pass prior findings (structure, key paths, commit hash) so it skips discovery. Only bootstrap with context relevant to the new query.
 
 # Shell and Environment
-- **Never** run PowerShell commands (`powershell`, `pwsh`, `$env:VAR`, `Set-Item`, etc.).
 - **Never** read or set environment variables via shell commands. If one is required and unset, ask the user.
 - **Never** use the `gh` CLI. Use the GitHub MCP tool for all GitHub operations.
 

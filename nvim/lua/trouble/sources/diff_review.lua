@@ -353,7 +353,7 @@ function M.open()
       view:fold_level({ level = 1 })
       -- Show hint + branch in the winbar
       local branch = vim.trim(vim.fn.systemlist({ "git", "rev-parse", "--abbrev-ref", "HEAD" })[1] or "")
-      local winbar = " %#Comment#<Tab>%* toggle | %#Comment#S%* stage | %#Comment#U%* unstage | %#Comment#<CR>%* jump | %#Comment#q%* close | %#Comment#?%* help"
+      local winbar = " %#Comment#<Tab>%* toggle | %#Comment#S%* stage | %#Comment#U%* unstage | %#Comment#cc%* commit | %#Comment#<CR>%* jump | %#Comment#q%* close | %#Comment#?%* help"
       if branch ~= "" then
         winbar = winbar .. "%=" .. "%#Keyword# " .. branch .. " %*"
       end

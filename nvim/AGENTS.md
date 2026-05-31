@@ -439,6 +439,41 @@ Windows uses `\` in paths, git uses `/`. Always normalize before comparing:
 local norm = vim.fs.normalize(path)
 ```
 
+### Driving `git commit` (the fake-editor bridge)
+
+You can't run `git commit` with an interactive editor *inside* the running
+nvim — git would block waiting for an editor it can't reach. The trick (lifted
+from Neogit, see `diff_review_commit.lua`): point `GIT_EDITOR` at a **headless
+child nvim** that RPCs back to the parent.
+
+1. Run `git commit` via `jobstart` with `env = { GIT_EDITOR = <headless cmd>,
+   NVIM = vim.v.servername }`. Stream stdout/stderr into **one** floating window
+   (a console buffer) — this is where pre-commit hook output shows up, *before*
+   the editor opens.
+2. `GIT_EDITOR` is `nvim --headless --clean … -c "lua require('…').client()"`.
+   Built with `vim.fn.shellescape` per token (git parses it with a shell). The
+   `--clean` child needs `set runtimepath^=<config root>` to find the module.
+3. In the child, `client()` reads the `COMMIT_EDITMSG` path from `argv()`,
+   `serverstart()`s its own address, and `sockconnect`s to `$NVIM` (the parent)
+   to `rpcrequest("nvim_command", "lua …editor(target, child_addr)")`. Then it
+   **returns and the child keeps running** — git stays blocked on it.
+4. The parent's `editor()` **swaps the same window's buffer** to the message
+   buffer (one window throughout, not a second float). On submit it writes the
+   file, `rpcnotify`s the child `qall` (exit 0 → git commits); on abort it sends
+   `cq` (exit non-zero → git aborts). A `BufWipeout` autocmd sends `cq` too, so
+   closing the buffer any other way never hangs git.
+5. The job's `on_exit` tears the window down: success closes it (and refreshes),
+   an explicit abort closes it quietly, a real failure (hook rejected, empty
+   message) opens a fresh buffer with git's captured output in its place.
+   Distinguish abort from failure with a flag — both exit non-zero, but only a
+   failure should pop the error buffer. Keep the console buffer `bufhidden=hide`
+   so it survives the swap and still has the full output to show on failure.
+
+Gotchas: set `NVIM` explicitly in the job env (don't rely on it being
+inherited); wrap the child's `client()` so any error does `cq` rather than
+leaving git hung; `$NVIM` only exists if the parent has a server
+(`serverstart()` if `v:servername` is empty).
+
 ---
 
 ## Highlight & Virtual Text

@@ -343,6 +343,17 @@ return {
               end,
               desc = "Unstage hunk/file",
             },
+            cc = {
+              action = function(view)
+                require("trouble.sources.diff_review_commit").commit(function()
+                  view:refresh()
+                  vim.defer_fn(function()
+                    require("trouble.sources.diff_review").auto_preview(view)
+                  end, 50)
+                end)
+              end,
+              desc = "Commit",
+            },
           },
         },
         symbols = {

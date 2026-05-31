@@ -1,11 +1,11 @@
 model = "gpt-5.5"
-model_reasoning_effort = "medium"
+model_reasoning_effort = "low"
 model_reasoning_summary = "detailed"
 show_raw_agent_reasoning = true
 plan_mode_reasoning_effort = "high"
 hide_agent_reasoning = false
 personality = "pragmatic"
-disable_paste_burst = true
+# disable_paste_burst = true
 
 [features]
 powershell_utf8 = true
@@ -41,6 +41,15 @@ trust_level = "trusted"
 trust_level = "trusted"
 
 [projects.'c:\users\mattm\documents\codex\2026-05-31\any-benchmarks-comparing-gpt-5-4']
+trust_level = "trusted"
+
+[projects.'c:\users\mattm\documents\codex\2026-05-31\antigravity-cli-can-i-prevent-auto']
+trust_level = "trusted"
+
+[projects.'c:\users\mattm\documents\scratch']
+trust_level = "trusted"
+
+[projects.'c:\users\mattm\documents\codex\2026-05-31\explain-the-rendering-equation']
 trust_level = "trusted"
 
 [notice.model_migrations]
@@ -84,7 +93,7 @@ approval_mode = "approve"
 
 [mcp_servers.node_repl]
 args = []
-command = 'C:\Users\mattm\AppData\Local\OpenAI\Codex\bin\3c238e29bbc930ff\node_repl.exe'
+command = 'C:\Users\mattm\AppData\Local\OpenAI\Codex\bin\34ab3e1324cc55b5\node_repl.exe'
 startup_timeout_sec = 120
 
 [mcp_servers.node_repl.env]
@@ -93,11 +102,12 @@ NODE_REPL_NODE_MODULE_DIRS = ""
 NODE_REPL_NODE_PATH = 'C:\Users\mattm\AppData\Local\OpenAI\Codex\bin\5b9024f90663758b\node.exe'
 NODE_REPL_TRUSTED_CODE_PATHS = 'D:\config\codex'
 CODEX_HOME = 'D:\config\codex'
-NODE_REPL_TRUSTED_BROWSER_CLIENT_SHA256S = "496c7b3cb95b4bc20cff49b513150606e0da0000c92bf752206bee5a6c248423"
+NODE_REPL_TRUSTED_BROWSER_CLIENT_SHA256S = "0b0d41e7a14a4903d2f95b0b3f427ed796b12c8edca2fa392a03df43997075ae,e13c388c2427308a68dffc803e1f28316077b719672e4518a621ae6ab56ad7cf"
 BROWSER_USE_AVAILABLE_BACKENDS = "chrome,iab"
-BROWSER_USE_MARKETPLACE_NAME = "openai-bundled"
-NODE_REPL_UNTRUSTED_ENV_ALLOWLIST = "BROWSER_USE_MARKETPLACE_NAME"
-CODEX_CLI_PATH = 'C:\Users\mattm\AppData\Local\OpenAI\Codex\bin\958d608b5e0546a5\codex.exe'
+NODE_REPL_INSTRUCTIONS_USE_CASE_BROWSER = "Control the in-app browser in conjunction with the Browser Plugin."
+NODE_REPL_INSTRUCTIONS_USE_CASE_CHROME = "Control the Chrome browser in conjunction with the Chrome Plugin. Prefer this method of controlling Chrome over alternatives (such as Computer Use) unless the user explicitly mentions an alternative."
+BROWSER_USE_CODEX_APP_BUILD_FLAVOR = "prod"
+CODEX_CLI_PATH = 'C:\Users\mattm\AppData\Local\OpenAI\Codex\bin\7dea4a003bc76627\codex.exe'
 
 [windows]
 sandbox = "elevated"
@@ -106,7 +116,7 @@ sandbox = "elevated"
 "gpt-5.5" = 4
 
 [marketplaces.openai-bundled]
-last_updated = "2026-05-28T07:06:29Z"
+last_updated = "2026-05-31T20:52:18Z"
 source_type = "local"
 source = '\\?\D:\config\codex\.tmp\bundled-marketplaces\openai-bundled'
 
@@ -133,6 +143,7 @@ appearanceLightCodeThemeId = "codex"
 sansFontSize = 16
 codeFontSize = 14
 conversationDetailMode = "STEPS_COMMANDS"
+followUpQueueMode = "steer"
 
 [desktop.appearanceLightChromeTheme]
 accent = "#0169cc"
