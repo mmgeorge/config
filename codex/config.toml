@@ -1,10 +1,14 @@
 model = "gpt-5.5"
-model_reasoning_effort = "low"
+model_reasoning_effort = "medium"
 model_reasoning_summary = "detailed"
 show_raw_agent_reasoning = true
-plan_mode_reasoning_effort = "high"
 hide_agent_reasoning = false
 personality = "pragmatic"
+developer_instructions = '''
+# Standing Multi-Agent Authorization
+
+The user explicitly authorizes Codex to use multi-agent subagents in future sessions whenever project or global instructions call for explorer/delegation workflows. '''
+# plan_mode_reasoning_effort = "high"
 # disable_paste_burst = true
 
 [features]
@@ -14,7 +18,7 @@ multi_agent = true
 memories = true
 js_repl = false
 terminal_resize_reflow = true
-mentions_v2 = true
+# mentions_v2 = true
 
 [projects.'\\?\D:\code\ferrous']
 trust_level = "trusted"
@@ -58,9 +62,11 @@ trust_level = "trusted"
 
 [mcp_servers.microsoft-learn]
 url = "https://learn.microsoft.com/api/mcp"
+default_tools_approval_mode = "approve"
 
 [mcp_servers.docs-mcp]
 command = "docs-mcp"
+default_tools_approval_mode = "approve"
 
 [mcp_servers.google-dev-knowledge]
 url = "https://developerknowledge.googleapis.com/mcp"
@@ -71,30 +77,29 @@ X-Goog-Api-Key = "GOOGLE_DEV_KNOWLEDGE_MCP_KEY"
 [mcp_servers.chrome-devtools]
 command = "npx"
 args = ["-y", "chrome-devtools-mcp@latest", "--channel=beta"]
+default_tools_approval_mode = "approve"
 
 [mcp_servers.github]
 command = "github-mcp-server"
 args = ["stdio", "--toolsets=context,actions,discussions,issues,labels,notifications,orgs,projects,pull_requests,repos,users"]
+default_tools_approval_mode = "approve"
 
 [mcp_servers.github.env]
-GITHUB_PERSONAL_ACCESS_TOKEN = "GITHUB_AGENT_PERSONAL_ACCESS_TOKEN"
+GITHUB_PERSONAL_ACCESS_TOKEN = ""
 
 [mcp_servers.hf-mcp-server]
 url = "https://huggingface.co/mcp?login"
+default_tools_approval_mode = "approve"
 
 [mcp_servers.openaiDeveloperDocs]
 url = "https://developers.openai.com/mcp"
-
-[mcp_servers.openaiDeveloperDocs.tools.search_openai_docs]
-approval_mode = "approve"
-
-[mcp_servers.openaiDeveloperDocs.tools.fetch_openai_doc]
-approval_mode = "approve"
+default_tools_approval_mode = "approve"
 
 [mcp_servers.node_repl]
 args = []
 command = 'C:\Users\mattm\AppData\Local\OpenAI\Codex\bin\34ab3e1324cc55b5\node_repl.exe'
 startup_timeout_sec = 120
+default_tools_approval_mode = "approve"
 
 [mcp_servers.node_repl.env]
 NODE_REPL_NATIVE_PIPE_CONNECT_TIMEOUT_MS = "1000"
@@ -111,6 +116,40 @@ CODEX_CLI_PATH = 'C:\Users\mattm\AppData\Local\OpenAI\Codex\bin\7dea4a003bc76627
 
 [windows]
 sandbox = "elevated"
+
+[tui]
+vim_mode_default = false
+
+[tui.keymap.vim_normal]
+move_left = "n"
+move_right = "i"
+move_up = "s"
+move_down = "t"
+move_word_backward = "r"
+move_word_end = "h"
+move_line_start = ";"
+move_line_end = "/"
+enter_insert = "u"
+append_after_cursor = "d"
+append_line_end = []
+open_line_above = "shift-e"
+open_line_below = "shift-a"
+paste_after = "y"
+start_yank_operator = "l"
+yank_line = "shift-l"
+delete_char = "j"
+start_delete_operator = []
+
+[tui.keymap.vim_operator]
+motion_left = "n"
+motion_right = "i"
+motion_up = "s"
+motion_down = "t"
+motion_word_backward = "r"
+motion_word_end = "h"
+motion_line_start = ";"
+motion_line_end = "/"
+yank_line = "l"
 
 [tui.model_availability_nux]
 "gpt-5.5" = 4

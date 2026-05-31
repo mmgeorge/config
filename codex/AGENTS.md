@@ -65,15 +65,6 @@ Every plan must end with these lines:
 - **Testing strategy**: Unit tests per module with mocks for isolation. Integration tests for end-to-end workflows with real modules — these catch boundary issues mocks hide.
 - Keep functions focused and reasonably sized. A function whose body is shorter than its signature is a smell — if it isn't doing meaningful work beyond a direct call, it shouldn't exist.
 
-# Research Workflow
-- **1–2 tool calls** (grab a file, check an issue, look up a crate): call docs-mcp / github-mcp directly.
-- **3+ tool calls** or open-ended exploration: spawn `subagent_type: "remote-explorer"`.
-- **Thoroughness** (specify when spawning):
-  - `quick` — high-level overview
-  - `medium` (default) — understanding a subsystem or API usage
-  - `thorough` — deep implementation analysis, tracing behavior through source
-- **Bootstrapping relaunches**: If the remote-explorer already ran on the same repo/library this conversation, pass prior findings (structure, key paths, commit hash) so it skips discovery. Only bootstrap with context relevant to the new query.
-
 # Shell and Environment
 - **Never** read or set environment variables via shell commands. If one is required and unset, ask the user.
 - **Never** use the `gh` CLI. Use the GitHub MCP tool for all GitHub operations.
