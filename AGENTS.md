@@ -59,6 +59,9 @@ Plans follow this structure in order:
   - `thorough` — deep implementation analysis, tracing behavior through source
 - **Bootstrapping relaunches**: If the remote-explorer already ran on the same repo/library this conversation, pass prior findings (structure, key paths, commit hash) so it skips discovery. Only bootstrap with context relevant to the new query.
 
+# Skills
+- **Neovim / Lua work** (plugin code, Trouble.nvim sources, Snacks.nvim diff UIs, or driving the running editor over RPC): read `.agents/skills/neovim-lua-dev/SKILL.md`, and `.agents/skills/neovim-lua-dev/references/plugin-patterns.md` before touching that subsystem.
+
 # Shell and Environment
 - **Never** run PowerShell commands (`powershell`, `pwsh`, `$env:VAR`, `Set-Item`, etc.).
 - **Never** read or set environment variables via shell commands. If one is required and unset, ask the user.
