@@ -83,9 +83,7 @@ default_tools_approval_mode = "approve"
 command = "github-mcp-server"
 args = ["stdio", "--toolsets=context,actions,discussions,issues,labels,notifications,orgs,projects,pull_requests,repos,users"]
 default_tools_approval_mode = "approve"
-
-[mcp_servers.github.env]
-GITHUB_PERSONAL_ACCESS_TOKEN = ""
+env_vars = ["GITHUB_PERSONAL_ACCESS_TOKEN"]
 
 [mcp_servers.hf-mcp-server]
 url = "https://huggingface.co/mcp?login"
