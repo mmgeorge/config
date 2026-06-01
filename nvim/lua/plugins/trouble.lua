@@ -166,6 +166,7 @@ return {
             end,
           },
           auto_preview = false,
+          win = { size = 15 },
           preview = { type = "main", scratch = false },
           focus = true,
           keys = {

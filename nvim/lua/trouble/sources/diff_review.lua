@@ -6,6 +6,11 @@ local Item = require("trouble.item")
 
 local M = {}
 
+M._hunk_header_ns = vim.api.nvim_create_namespace("diff_review_headers")
+M._active_hunk_header_ns = vim.api.nvim_create_namespace("diff_review_active_hunk")
+M._hunk_header_priority = 20
+M._active_hunk_header_priority = 200
+
 -- Background-only highlight groups for diff lines.
 -- Pull bg from existing DiffAdd/DiffDelete so they match the gutter colors.
 local function setup_bg_highlights()
@@ -38,6 +43,7 @@ local function setup_bg_highlights()
   })
   -- Subtle gray bg for hunk header lines in the diff buffer
   vim.api.nvim_set_hl(0, "SnacksDiffHunkHeader", { bg = "#1e1e1e" })
+  vim.api.nvim_set_hl(0, "DiffReviewActiveHunkHeader", { bg = "#303446" })
   vim.api.nvim_set_hl(0, "DiffReviewHunkHeader", { fg = header_fg, bg = "#1e1e1e", nocombine = true })
   vim.api.nvim_set_hl(0, "DiffReviewHunkContext", {
     fg = header_fg,
@@ -1539,11 +1545,11 @@ function M._refresh_diff_buffer(buf, filename)
     end
     M._buf_hunks[buf] = hunk_map
     -- Highlight @@ header lines with subtle gray background
-    local header_ns = vim.api.nvim_create_namespace("diff_review_headers")
-    vim.api.nvim_buf_clear_namespace(buf, header_ns, 0, -1)
+    vim.api.nvim_buf_clear_namespace(buf, M._hunk_header_ns, 0, -1)
     for _, h in ipairs(hunk_map) do
-      pcall(vim.api.nvim_buf_set_extmark, buf, header_ns, h.start_line - 1, 0, {
+      pcall(vim.api.nvim_buf_set_extmark, buf, M._hunk_header_ns, h.start_line - 1, 0, {
         line_hl_group = "SnacksDiffHunkHeader",
+        priority = M._hunk_header_priority,
       })
     end
     M._render_with_folds(buf)
@@ -1552,6 +1558,29 @@ function M._refresh_diff_buffer(buf, filename)
     vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "No changes" })
     vim.bo[buf].modifiable = false
     M._buf_hunks[buf] = {}
+    vim.api.nvim_buf_clear_namespace(buf, M._hunk_header_ns, 0, -1)
+    vim.api.nvim_buf_clear_namespace(buf, M._active_hunk_header_ns, 0, -1)
+  end
+end
+
+---@param buf number
+---@param item_diff string?
+---@return table?
+function M._highlight_active_hunk(buf, item_diff)
+  vim.api.nvim_buf_clear_namespace(buf, M._active_hunk_header_ns, 0, -1)
+  if not item_diff then return nil end
+
+  local hunks = M._buf_hunks[buf]
+  if not hunks then return nil end
+
+  for _, hunk in ipairs(hunks) do
+    if hunk.diff == item_diff then
+      pcall(vim.api.nvim_buf_set_extmark, buf, M._active_hunk_header_ns, hunk.start_line - 1, 0, {
+        line_hl_group = "DiffReviewActiveHunkHeader",
+        priority = M._active_hunk_header_priority,
+      })
+      return hunk
+    end
   end
 end
 
@@ -1925,26 +1954,13 @@ function M.auto_preview(view)
     end
     M._refresh_diff_buffer(diff_buf, filename)
 
-    -- Find the matching hunk in the diff buffer by comparing diff text
-    local hunks = M._buf_hunks[diff_buf]
     local item_diff = item.item and item.item.diff
-    -- Clear previous hover highlight
-    local hover_ns = vim.api.nvim_create_namespace("diff_review_hover")
-    vim.api.nvim_buf_clear_namespace(diff_buf, hover_ns, 0, -1)
-    if hunks and item_diff then
-      for _, h in ipairs(hunks) do
-        if h.diff == item_diff then
-          -- Highlight the @@ header line (visible even when folded)
-          pcall(vim.api.nvim_buf_set_extmark, diff_buf, hover_ns, h.start_line - 1, 0, {
-            line_hl_group = "CursorLine",
-          })
-          pcall(vim.api.nvim_win_set_cursor, win, { h.start_line, 0 })
-          vim.api.nvim_win_call(win, function()
-            vim.cmd("normal! zz")
-          end)
-          break
-        end
-      end
+    local active_hunk = M._highlight_active_hunk(diff_buf, item_diff)
+    if active_hunk then
+      pcall(vim.api.nvim_win_set_cursor, win, { active_hunk.start_line, 0 })
+      vim.api.nvim_win_call(win, function()
+        vim.cmd("normal! zz")
+      end)
     end
     return
   end
@@ -1961,6 +1977,7 @@ function M.auto_preview(view)
       M._update_file_diff_cache(filename)
     end
     M._refresh_diff_buffer(buf, filename)
+    M._highlight_active_hunk(buf, nil)
     -- Restore cursor to the same hunk + offset within hunk
     local saved = M._buf_saved_cursor[buf]
     local new_hunks = M._buf_hunks[buf]
