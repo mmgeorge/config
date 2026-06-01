@@ -265,21 +265,27 @@ return {
                 local dr = require("trouble.sources.diff_review")
                 if ctx.item then
                   -- Hunk-level stage: stage this hunk, advance to the next row.
-                  local it = ctx.item.item
-                  if it.staged then return end
+                  local item_data = ctx.item.item
+                  if item_data.staged then return end
                   local affected_file = ctx.item.filename
-                  if it.diff then
-                    local result = vim.fn.system({ "git", "apply", "--cached", "--unidiff-zero", "-" }, it.diff .. "\n")
-                    if vim.v.shell_error ~= 0 then
-                      vim.notify("Stage failed: " .. result, vim.log.levels.ERROR)
-                    end
-                  end
+                  if not affected_file then return end
                   -- Capture the next row so we land on it after the refresh
                   -- re-renders the list (which would otherwise reset the cursor).
                   local cursor = vim.api.nvim_win_get_cursor(view.win.win)
                   local target_line = cursor[1] + 1
+                  local staged_files
+                  if item_data.diff then
+                    if not dr.stage_patch(item_data.diff) then return end
+                    staged_files = { affected_file }
+                  else
+                    local result = dr.stage_files({ affected_file })
+                    if #result.successes == 0 then return end
+                    staged_files = result.successes
+                  end
                   view:refresh()
-                  if affected_file then dr.refresh_open_diff_buffer(affected_file) end
+                  for _, filename in ipairs(staged_files) do
+                    dr.refresh_open_diff_buffer(filename)
+                  end
                   vim.defer_fn(function()
                     local max = vim.api.nvim_buf_line_count(view.win.buf)
                     pcall(vim.api.nvim_win_set_cursor, view.win.win, { math.min(target_line, max), cursor[2] })
@@ -293,17 +299,25 @@ return {
                   -- Single file: remember the next file to land on (its row moves
                   -- once it changes category). Group: keep the cursor put.
                   local next_file = (not is_group) and dr.next_file(view, first) or nil
-                  for _, n in ipairs(nodes) do
+                  local files = {}
+                  local node_by_file = {}
+                  for _, node in ipairs(nodes) do
+                    local filename = node.item and node.item.filename
+                    if filename then
+                      files[#files + 1] = filename
+                      node_by_file[filename] = node
+                    end
+                  end
+                  local result = dr.stage_files(files)
+                  if #result.successes == 0 then return end
+                  for _, filename in ipairs(result.successes) do
                     -- Pre-fold each post-stage node so the refresh renders it
                     -- collapsed in one pass (no second render / flicker).
-                    dr.prefold_into(view, n, "Tracked Changes")
-                    local f = n.item and n.item.filename
-                    if f then vim.fn.system({ "git", "add", "--", f }) end
+                    dr.prefold_into(view, node_by_file[filename], "Tracked Changes")
                   end
                   view:refresh()
-                  for _, n in ipairs(nodes) do
-                    local f = n.item and n.item.filename
-                    if f then dr.refresh_open_diff_buffer(f) end
+                  for _, filename in ipairs(result.successes) do
+                    dr.refresh_open_diff_buffer(filename)
                   end
                   vim.defer_fn(function()
                     if not is_group then
@@ -325,34 +339,46 @@ return {
                 local dr = require("trouble.sources.diff_review")
                 local affected = {}
                 if ctx.item then
-                  local it = ctx.item.item
-                  if not it.staged then return end
-                  if it.diff then
-                    local result = vim.fn.system({ "git", "apply", "--cached", "--reverse", "--unidiff-zero", "-" }, it.diff .. "\n")
-                    if vim.v.shell_error ~= 0 then
-                      vim.notify("Unstage failed: " .. result, vim.log.levels.ERROR)
-                    end
+                  local item_data = ctx.item.item
+                  if not item_data.staged then return end
+                  local affected_file = ctx.item.filename
+                  if not affected_file then return end
+                  if item_data.diff then
+                    if not dr.unstage_patch(item_data.diff) then return end
+                    affected[#affected + 1] = affected_file
+                  else
+                    local result = dr.unstage_files({ affected_file })
+                    if #result.successes == 0 then return end
+                    affected = result.successes
                   end
-                  if ctx.item.filename then affected[#affected + 1] = ctx.item.filename end
                 elseif ctx.node then
                   -- Unstage every file in the group (one file, or a whole
                   -- category header). A newly-added file unstages back to
                   -- "Untracked Files", which must never render expanded, so
                   -- pre-fold its untracked node. (A modified file stays tracked
                   -- and keeps its own fold state.)
-                  for _, n in ipairs(dr.file_group_nodes(ctx.node)) do
-                    dr.prefold_into(view, n, "Untracked Files")
-                    local f = n.item and n.item.filename
-                    if f then
-                      vim.fn.system({ "git", "restore", "--staged", "--", f })
-                      affected[#affected + 1] = f
+                  local nodes = dr.file_group_nodes(ctx.node)
+                  local files = {}
+                  local node_by_file = {}
+                  for _, node in ipairs(nodes) do
+                    local filename = node.item and node.item.filename
+                    if filename then
+                      files[#files + 1] = filename
+                      node_by_file[filename] = node
                     end
+                  end
+                  local result = dr.unstage_files(files)
+                  if #result.successes == 0 then return end
+                  affected = result.successes
+                  for _, filename in ipairs(result.successes) do
+                    dr.prefold_into(view, node_by_file[filename], "Untracked Files")
                   end
                 end
                 view:refresh()
-                for _, f in ipairs(affected) do
-                  dr.refresh_open_diff_buffer(f)
+                for _, filename in ipairs(affected) do
+                  dr.refresh_open_diff_buffer(filename)
                 end
+                vim.defer_fn(function() dr.auto_preview(view) end, 50)
               end,
               desc = "Unstage hunk/file",
             },

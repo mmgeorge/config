@@ -76,7 +76,7 @@ X-Goog-Api-Key = "GOOGLE_DEV_KNOWLEDGE_MCP_KEY"
 
 [mcp_servers.chrome-devtools]
 command = "npx"
-args = ["-y", "chrome-devtools-mcp@latest", "--channel=beta"]
+args = ["-y", "chrome-devtools-mcp@latest", "--browserUrl", "http://127.0.0.1:9222"]
 default_tools_approval_mode = "approve"
 
 [mcp_servers.github]

@@ -6,8 +6,6 @@ local Item = require("trouble.item")
 
 local M = {}
 
--- next
-
 -- Background-only highlight groups for diff lines.
 -- Pull bg from existing DiffAdd/DiffDelete so they match the gutter colors.
 local function setup_bg_highlights()
@@ -94,6 +92,221 @@ local function detect_filetype(filename, contents)
     args.contents = contents
   end
   return vim.filetype.match(args) or ""
+end
+
+---@param message string
+---@param title? string
+local function notify_error(message, title)
+  vim.notify(message, vim.log.levels.ERROR, { title = title or "Diff Review" })
+end
+
+---@return string? root
+---@return string? err
+local function git_root()
+  local root = vim.fn.systemlist({ "git", "rev-parse", "--show-toplevel" })[1]
+  if vim.v.shell_error ~= 0 or not root or root == "" then
+    return nil, "Not a git repository"
+  end
+  return vim.trim(root), nil
+end
+
+---@param path string
+---@return string
+local function normalize_path(path)
+  return vim.fs.normalize(vim.fn.fnamemodify(path, ":p")):gsub("\\", "/"):gsub("/$", "")
+end
+
+---@param filename string
+---@param root string
+---@return string? relpath
+---@return string? err
+local function repo_relative(filename, root)
+  local absolute = normalize_path(filename)
+  local root_path = normalize_path(root)
+  local compare_absolute = absolute
+  local compare_root = root_path
+  if package.config:sub(1, 1) == "\\" then
+    compare_absolute = compare_absolute:lower()
+    compare_root = compare_root:lower()
+  end
+  if compare_absolute == compare_root then
+    return ".", nil
+  end
+  local prefix = compare_root .. "/"
+  if compare_absolute:sub(1, #prefix) ~= prefix then
+    return nil, ("Path is outside the git root: %s"):format(filename)
+  end
+  return absolute:sub(#root_path + 2), nil
+end
+
+---@param root string
+---@param args string[]
+---@param input? string
+---@return { ok: boolean, code: integer, output: string, root: string, args: string[] }
+local function run_git_at_root(root, args, input)
+  local command = { "git", "-C", root }
+  vim.list_extend(command, args)
+  local output
+  if input ~= nil then
+    output = vim.fn.system(command, input)
+  else
+    output = vim.fn.system(command)
+  end
+  return {
+    ok = vim.v.shell_error == 0,
+    code = vim.v.shell_error,
+    output = vim.trim(output or ""),
+    root = root,
+    args = args,
+  }
+end
+
+---@param args string[]
+---@param input? string
+---@return { ok: boolean, code: integer, output: string, root?: string, args: string[] }
+local function run_git(args, input)
+  local root, root_err = git_root()
+  if not root then
+    return {
+      ok = false,
+      code = -1,
+      output = root_err or "Unable to find git root",
+      args = args,
+    }
+  end
+  return run_git_at_root(root, args, input)
+end
+
+---@param failures table[]
+---@return string
+local function format_failures(failures)
+  local lines = {}
+  local max_lines = math.min(#failures, 6)
+  for index = 1, max_lines do
+    local failure = failures[index]
+    local label = failure.file and vim.fn.fnamemodify(failure.file, ":.") or "git"
+    local detail = failure.message or failure.output or "unknown error"
+    if detail == "" then
+      detail = ("git exited %d"):format(failure.code or 1)
+    end
+    detail = detail:gsub("\n+", " ")
+    lines[#lines + 1] = ("  %s: %s"):format(label, detail)
+  end
+  if #failures > max_lines then
+    lines[#lines + 1] = ("  ... %d more"):format(#failures - max_lines)
+  end
+  return table.concat(lines, "\n")
+end
+
+---@param title string
+---@param failures table[]
+function M.notify_git_failures(title, failures)
+  if #failures == 0 then return end
+  local count = #failures
+  local noun = count == 1 and "failure" or "failures"
+  notify_error(("%s: %d %s\n%s"):format(title, count, noun, format_failures(failures)))
+end
+
+---@param files string[]
+---@param args_for_file fun(relpath: string): string[]
+---@param title string
+---@return { ok: boolean, successes: string[], failures: table[] }
+local function run_file_batch(files, args_for_file, title)
+  local root, root_err = git_root()
+  if not root then
+    local failures = { { message = root_err or "Unable to find git root" } }
+    M.notify_git_failures(title, failures)
+    return { ok = false, successes = {}, failures = failures }
+  end
+
+  local successes = {}
+  local failures = {}
+  local seen = {}
+  for _, filename in ipairs(files) do
+    if filename and filename ~= "" and not seen[filename] then
+      seen[filename] = true
+      local relpath, rel_err = repo_relative(filename, root)
+      if not relpath then
+        failures[#failures + 1] = { file = filename, message = rel_err }
+      else
+        local result = run_git_at_root(root, args_for_file(relpath))
+        if result.ok then
+          successes[#successes + 1] = filename
+        else
+          result.file = filename
+          failures[#failures + 1] = result
+        end
+      end
+    end
+  end
+
+  if #failures > 0 then
+    M.notify_git_failures(title, failures)
+  end
+  return { ok = #failures == 0, successes = successes, failures = failures }
+end
+
+---@param diff string?
+---@return boolean
+function M.stage_patch(diff)
+  if not diff or diff == "" then
+    notify_error("No patch to stage")
+    return false
+  end
+  local result = run_git({ "apply", "--cached", "--whitespace=nowarn", "-" }, diff .. "\n")
+  if not result.ok then
+    notify_error("Stage failed: " .. (result.output ~= "" and result.output or ("git exited " .. result.code)))
+    return false
+  end
+  return true
+end
+
+---@param diff string?
+---@return boolean
+function M.unstage_patch(diff)
+  if not diff or diff == "" then
+    notify_error("No patch to unstage")
+    return false
+  end
+  local result = run_git({ "apply", "--cached", "--reverse", "--whitespace=nowarn", "-" }, diff .. "\n")
+  if not result.ok then
+    notify_error("Unstage failed: " .. (result.output ~= "" and result.output or ("git exited " .. result.code)))
+    return false
+  end
+  return true
+end
+
+---@param files string[]
+---@return { ok: boolean, successes: string[], failures: table[] }
+function M.stage_files(files)
+  return run_file_batch(files, function(relpath)
+    return { "add", "--", relpath }
+  end, "Stage failed")
+end
+
+---@param files string[]
+---@return { ok: boolean, successes: string[], failures: table[] }
+function M.unstage_files(files)
+  return run_file_batch(files, function(relpath)
+    return { "restore", "--staged", "--", relpath }
+  end, "Unstage failed")
+end
+
+---@param line string
+---@return string? status
+---@return string? file
+local function parse_name_status_line(line)
+  local parts = vim.split(line, "\t", { plain = true })
+  local status = parts[1]
+  local file = parts[2]
+  if status and (status:sub(1, 1) == "R" or status:sub(1, 1) == "C") then
+    file = parts[3] or file
+  end
+  if status and file then
+    return status, file
+  end
+  status, file = line:match("^(%S+)%s+(.+)$")
+  return status, file
 end
 
 --- Parse unified diff output into structured file/hunk data
@@ -400,12 +613,11 @@ end
 function M.get(cb, _ctx)
   M._ts_context_cache = {} -- clear treesitter context cache on refresh
   M._untracked = {} -- map of absolute path -> repo-relative path for untracked files
-  local cwd = vim.fn.systemlist({ "git", "rev-parse", "--show-toplevel" })[1]
-  if vim.v.shell_error ~= 0 or not cwd then
+  local cwd = git_root()
+  if not cwd then
     cb({})
     return
   end
-  cwd = vim.trim(cwd)
 
   -- Get both unstaged and staged hunks
   local unstaged = get_hunks(cwd, false)
@@ -435,7 +647,7 @@ function M.get(cb, _ctx)
   local staged_name_status = vim.fn.systemlist({ "git", "-C", cwd, "diff", "--cached", "--name-status" })
   if vim.v.shell_error == 0 then
     for _, line in ipairs(staged_name_status) do
-      local status, file = line:match("^(%S+)%s+(.+)$")
+      local status, file = parse_name_status_line(line)
       if file and not tracked_files_with_hunks[file] then
         -- File has staged changes but no hunks (empty new file, binary, etc.)
         all_hunks[#all_hunks + 1] = {
@@ -454,7 +666,7 @@ function M.get(cb, _ctx)
   local unstaged_name_status = vim.fn.systemlist({ "git", "-C", cwd, "diff", "--name-status" })
   if vim.v.shell_error == 0 then
     for _, line in ipairs(unstaged_name_status) do
-      local status, file = line:match("^(%S+)%s+(.+)$")
+      local status, file = parse_name_status_line(line)
       if file and not tracked_files_with_hunks[file] then
         all_hunks[#all_hunks + 1] = {
           file = file,
@@ -1102,15 +1314,7 @@ function M.open_diff_buffer(filename)
           end
         end
       end
-      -- Run from git root
-      local cwd = vim.trim(vim.fn.systemlist({ "git", "rev-parse", "--show-toplevel" })[1] or "")
-      local result = vim.fn.system(
-        { "git", "-C", cwd, "apply", "--cached", "--whitespace=nowarn", "-" },
-        patch .. "\n"
-      )
-      if vim.v.shell_error ~= 0 then
-        vim.notify("Stage failed: " .. result, vim.log.levels.ERROR)
-      else
+      if M.stage_patch(patch) then
         vim.notify("Hunk staged", vim.log.levels.INFO)
         local win = vim.api.nvim_get_current_win()
         local filename = M._buf_filename[buf]
@@ -1148,14 +1352,7 @@ function M.open_diff_buffer(filename)
         vim.notify("No hunk under cursor", vim.log.levels.WARN)
         return
       end
-      local cwd = vim.trim(vim.fn.systemlist({ "git", "rev-parse", "--show-toplevel" })[1] or "")
-      local result = vim.fn.system(
-        { "git", "-C", cwd, "apply", "--cached", "--reverse", "--whitespace=nowarn", "-" },
-        patch .. "\n"
-      )
-      if vim.v.shell_error ~= 0 then
-        vim.notify("Unstage failed: " .. result, vim.log.levels.ERROR)
-      else
+      if M.unstage_patch(patch) then
         vim.notify("Hunk unstaged", vim.log.levels.INFO)
         local win = vim.api.nvim_get_current_win()
         local filename = M._buf_filename[buf]
@@ -1374,8 +1571,8 @@ function M._update_file_diff_cache(filename)
     M._file_hunk_staged[filename] = diff_text and { false } or nil
     return
   end
-  local cwd = vim.trim(vim.fn.systemlist({ "git", "rev-parse", "--show-toplevel" })[1] or "")
-  if cwd == "" then return end
+  local cwd = git_root()
+  if not cwd then return end
   local diff_text, flags = file_diff_and_flags(cwd, filename)
   M._file_diffs[filename] = diff_text or false
   M._file_hunk_staged[filename] = flags
@@ -1578,7 +1775,11 @@ end
 ---@param view trouble.View
 ---@param ctx table Trouble action context
 function M.discard(view, ctx)
-  local cwd = vim.trim(vim.fn.systemlist({ "git", "rev-parse", "--show-toplevel" })[1] or "")
+  local cwd, root_err = git_root()
+  if not cwd then
+    notify_error(root_err or "Unable to find git root")
+    return
+  end
 
   local function after(files)
     view:refresh()
@@ -1592,14 +1793,15 @@ function M.discard(view, ctx)
   if ctx.item and ctx.item.item and ctx.item.item.diff then
     local it, filename = ctx.item.item, ctx.item.filename
     confirm({ "Discard this hunk?", "  " .. vim.fn.fnamemodify(filename, ":.") }, function()
-      local args = { "git", "-C", cwd, "apply", "--reverse", "--whitespace=nowarn" }
+      local args = { "apply", "--reverse", "--whitespace=nowarn" }
       if it.staged then
         args[#args + 1] = "--index"
       end
       args[#args + 1] = "-"
-      local result = vim.fn.system(args, it.diff .. "\n")
-      if vim.v.shell_error ~= 0 then
-        vim.notify("Discard failed: " .. result, vim.log.levels.ERROR)
+      local result = run_git_at_root(cwd, args, it.diff .. "\n")
+      if not result.ok then
+        notify_error("Discard failed: " .. (result.output ~= "" and result.output or ("git exited " .. result.code)))
+        return
       end
       after({ filename })
     end)
@@ -1631,8 +1833,8 @@ function M.discard(view, ctx)
   if #entries == 0 then return end
 
   local all_untracked = true
-  for _, e in ipairs(entries) do
-    all_untracked = all_untracked and e.untracked
+  for _, entry in ipairs(entries) do
+    all_untracked = all_untracked and entry.untracked
   end
 
   local message
@@ -1650,18 +1852,47 @@ function M.discard(view, ctx)
 
   confirm(message, function()
     local files = {}
-    for _, e in ipairs(entries) do
-      files[#files + 1] = e.file
-      if e.untracked then
-        vim.fn.delete(e.file)
+    local failures = {}
+    for _, entry in ipairs(entries) do
+      files[#files + 1] = entry.file
+      if entry.untracked then
+        local delete_code = vim.fn.delete(entry.file)
+        if delete_code ~= 0 then
+          failures[#failures + 1] = {
+            file = entry.file,
+            message = ("delete() failed with code %d"):format(delete_code),
+          }
+        end
       else
-        vim.fn.system({ "git", "-C", cwd, "checkout", "HEAD", "--", e.file })
-        if vim.v.shell_error ~= 0 then
-          -- Staged-new file (not in HEAD): unstage, then remove it.
-          vim.fn.system({ "git", "-C", cwd, "restore", "--staged", "--", e.file })
-          vim.fn.delete(e.file)
+        local relpath, rel_err = repo_relative(entry.file, cwd)
+        if not relpath then
+          failures[#failures + 1] = { file = entry.file, message = rel_err }
+        else
+          local checkout_result = run_git_at_root(cwd, { "checkout", "HEAD", "--", relpath })
+          if not checkout_result.ok then
+            -- Staged-new file (not in HEAD): unstage, then remove it.
+            local restore_result = run_git_at_root(cwd, { "restore", "--staged", "--", relpath })
+            if restore_result.ok then
+              local delete_code = vim.fn.delete(entry.file)
+              if delete_code ~= 0 then
+                failures[#failures + 1] = {
+                  file = entry.file,
+                  message = ("delete() failed with code %d after unstaging"):format(delete_code),
+                }
+              end
+            else
+              failures[#failures + 1] = {
+                file = entry.file,
+                output = restore_result.output ~= "" and restore_result.output or checkout_result.output,
+                code = restore_result.code,
+              }
+            end
+          end
         end
       end
+    end
+    if #failures > 0 then
+      M.notify_git_failures("Discard failed", failures)
     end
     after(files)
   end)
@@ -1770,5 +2001,3 @@ function M.auto_preview(view)
 end
 
 return M
-
--- next

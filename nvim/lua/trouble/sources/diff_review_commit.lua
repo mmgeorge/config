@@ -268,7 +268,10 @@ function M.commit(opts)
   })
 
   if job <= 0 then
-    append(console, { "Failed to start `git commit` (jobstart returned " .. job .. ")." })
+    local message = "Failed to start `git commit` (jobstart returned " .. job .. ")."
+    append(console, { message })
+    vim.notify(message, vim.log.levels.ERROR, { title = "Diff Review" })
+    M._finish(1)
   end
 end
 
