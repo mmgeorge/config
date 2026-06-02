@@ -1,9 +1,19 @@
+---@class DiffReviewNotificationsModule
+---@field error fun(message: string, title?: string)
+---@field format_failures fun(failures: DiffReviewGitFailure[]): string
+---@field git_failures fun(title: string, failures: DiffReviewGitFailure[])
+
+---@type DiffReviewNotificationsModule
 local M = {}
 
+---@param message string
+---@param title? string
 function M.error(message, title)
   vim.notify(message, vim.log.levels.ERROR, { title = title or "Diff Review" })
 end
 
+---@param failures DiffReviewGitFailure[]
+---@return string
 function M.format_failures(failures)
   local max_lines = 8
   local lines = {}
@@ -23,6 +33,8 @@ function M.format_failures(failures)
   return table.concat(lines, "\n")
 end
 
+---@param title string
+---@param failures DiffReviewGitFailure[]
 function M.git_failures(title, failures)
   if #failures == 0 then return end
   local count = #failures

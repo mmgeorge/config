@@ -1,6 +1,85 @@
 --- DiffReview standalone git review UI.
 --- Usage: :DiffReview
 
+---@alias DiffReviewGitCommand string[]
+
+---@class DiffReviewGitCommandResult
+---@field ok boolean
+---@field code integer
+---@field output string
+---@field root? string
+---@field args DiffReviewGitCommand
+
+---@class DiffReviewGitFailure
+---@field file? string
+---@field path? string
+---@field message? string
+---@field output? string
+---@field stderr? string
+---@field stdout? string
+---@field code? integer
+
+---@class DiffReviewGitBackend
+---@field systemlist? fun(command: DiffReviewGitCommand): string[]|string, integer?
+---@field system? fun(command: DiffReviewGitCommand, input?: string): string, integer?
+---@field delete? fun(path: string): integer
+---@field jobstart? fun(command: DiffReviewGitCommand, opts: table): integer
+
+---@class DiffReviewHunk
+---@field file string
+---@field filename? string
+---@field section_name? string
+---@field pos integer
+---@field context? string
+---@field context_text? string
+---@field diff string
+---@field staged boolean
+---@field added integer
+---@field removed integer
+
+---@class DiffReviewStatusFile
+---@field filename string
+---@field relpath string
+---@field section_name string
+---@field added integer
+---@field removed integer
+---@field hunks DiffReviewHunk[]
+---@field untracked boolean
+---@field status string
+
+---@class DiffReviewStatusSection
+---@field name string
+---@field title string
+---@field default_folded boolean
+---@field files DiffReviewStatusFile[]
+---@field files_by_name table<string, DiffReviewStatusFile>
+
+---@class DiffReviewStatusEntry
+---@field id? string
+---@field kind "section"|"file"|"hunk"
+---@field section? DiffReviewStatusSection
+---@field file? DiffReviewStatusFile
+---@field hunk? DiffReviewHunk
+---@field diff_line? table
+
+---@class DiffReviewModule
+---@field config DiffReviewConfig?
+---@field _git_backend DiffReviewGitBackend?
+---@field _status table?
+---@field _untracked table<string, string>?
+---@field _file_diffs table<string, string>?
+---@field _file_hunk_staged table<string, boolean[]>?
+---@field _diff_bufs table<string, integer>?
+---@field _buf_hunks table<integer, DiffReviewHunk[]>?
+---@field _buf_filename table<integer, string>?
+---@field _buf_saved_cursor table<integer, integer[]>?
+---@field _buf_last_rendered table<integer, string>?
+---@field _ts_context_cache table<string, string?>?
+---@field _main_win integer?
+---@field _saved_wo table?
+---@field suspend_preview boolean?
+
+---@type DiffReviewModule
 local M = {}
 
 M._hunk_header_ns = vim.api.nvim_create_namespace("diff_review_headers")
@@ -74,11 +153,77 @@ local function notify_error(message, title)
   notifications.error(message, title)
 end
 
+---@param backend DiffReviewGitBackend?
+function M.set_git_backend(backend)
+  M._git_backend = backend
+end
+
+function M.reset_git_backend()
+  M._git_backend = nil
+end
+
+---@param command DiffReviewGitCommand
+---@return string[] output
+---@return integer code
+local function systemlist(command)
+  local backend = M._git_backend
+  if backend and backend.systemlist then
+    local output, code = backend.systemlist(command)
+    if type(output) == "string" then
+      output = vim.split(output, "\n", { plain = true })
+    end
+    return output or {}, code or 0
+  end
+  local output = vim.fn.systemlist(command)
+  return output, vim.v.shell_error
+end
+
+---@param command DiffReviewGitCommand
+---@param input? string
+---@return string output
+---@return integer code
+local function system_text(command, input)
+  local backend = M._git_backend
+  if backend and backend.system then
+    local output, code = backend.system(command, input)
+    return tostring(output or ""), code or 0
+  end
+  local output
+  if input ~= nil then
+    output = vim.fn.system(command, input)
+  else
+    output = vim.fn.system(command)
+  end
+  return output or "", vim.v.shell_error
+end
+
+---@param path string
+---@return integer code
+local function delete_path(path)
+  local backend = M._git_backend
+  if backend and backend.delete then
+    return backend.delete(path)
+  end
+  return vim.fn.delete(path)
+end
+
+---@param command DiffReviewGitCommand
+---@param opts table
+---@return integer job_id
+local function jobstart(command, opts)
+  local backend = M._git_backend
+  if backend and backend.jobstart then
+    return backend.jobstart(command, opts)
+  end
+  return vim.fn.jobstart(command, opts)
+end
+
 ---@return string? root
 ---@return string? err
 local function git_root()
-  local root = vim.fn.systemlist({ "git", "rev-parse", "--show-toplevel" })[1]
-  if vim.v.shell_error ~= 0 or not root or root == "" then
+  local output, code = systemlist({ "git", "rev-parse", "--show-toplevel" })
+  local root = output[1]
+  if code ~= 0 or not root or root == "" then
     return nil, "Not a git repository"
   end
   return vim.trim(root), nil
@@ -116,19 +261,14 @@ end
 ---@param root string
 ---@param args string[]
 ---@param input? string
----@return { ok: boolean, code: integer, output: string, root: string, args: string[] }
+---@return DiffReviewGitCommandResult
 local function run_git_at_root(root, args, input)
   local command = { "git", "-C", root }
   vim.list_extend(command, args)
-  local output
-  if input ~= nil then
-    output = vim.fn.system(command, input)
-  else
-    output = vim.fn.system(command)
-  end
+  local output, code = system_text(command, input)
   return {
-    ok = vim.v.shell_error == 0,
-    code = vim.v.shell_error,
+    ok = code == 0,
+    code = code,
     output = vim.trim(output or ""),
     root = root,
     args = args,
@@ -137,7 +277,7 @@ end
 
 ---@param args string[]
 ---@param input? string
----@return { ok: boolean, code: integer, output: string, root?: string, args: string[] }
+---@return DiffReviewGitCommandResult
 local function run_git(args, input)
   local root, root_err = git_root()
   if not root then
@@ -152,7 +292,7 @@ local function run_git(args, input)
 end
 
 ---@param title string
----@param failures table[]
+---@param failures DiffReviewGitFailure[]
 function M.notify_git_failures(title, failures)
   notifications.git_failures(title, failures)
 end
@@ -160,7 +300,7 @@ end
 ---@param files string[]
 ---@param args_for_file fun(relpath: string): string[]
 ---@param title string
----@return { ok: boolean, successes: string[], failures: table[] }
+---@return { ok: boolean, successes: string[], failures: DiffReviewGitFailure[] }
 local function run_file_batch(files, args_for_file, title)
   local root, root_err = git_root()
   if not root then
@@ -227,7 +367,7 @@ function M.unstage_patch(diff)
 end
 
 ---@param files string[]
----@return { ok: boolean, successes: string[], failures: table[] }
+---@return { ok: boolean, successes: string[], failures: DiffReviewGitFailure[] }
 function M.stage_files(files)
   return run_file_batch(files, function(relpath)
     return { "add", "--", relpath }
@@ -235,7 +375,7 @@ function M.stage_files(files)
 end
 
 ---@param files string[]
----@return { ok: boolean, successes: string[], failures: table[] }
+---@return { ok: boolean, successes: string[], failures: DiffReviewGitFailure[] }
 function M.unstage_files(files)
   return run_file_batch(files, function(relpath)
     return { "restore", "--staged", "--", relpath }
@@ -262,7 +402,7 @@ end
 --- Parse unified diff output into structured file/hunk data
 ---@param diff_output string
 ---@param staged boolean
----@return table[] hunks
+---@return DiffReviewHunk[] hunks
 local function parse_diff(diff_output, staged)
   local hunks = {}
   local lines = vim.split(diff_output, "\n", { plain = true })
@@ -341,15 +481,15 @@ end
 --- Run git diff and return parsed hunks
 ---@param cwd string
 ---@param staged boolean
----@return table[]
+---@return DiffReviewHunk[]
 local function get_hunks(cwd, staged)
   local args = { "git", "-C", cwd, "-c", "core.quotepath=false",
     "diff", "--no-color", "--no-ext-diff" }
   if staged then
     args[#args + 1] = "--cached"
   end
-  local result = vim.fn.systemlist(args)
-  if vim.v.shell_error ~= 0 then
+  local result, code = systemlist(args)
+  if code ~= 0 then
     return {}
   end
   return parse_diff(table.concat(result, "\n"), staged)
@@ -359,7 +499,7 @@ end
 --- patches and their matching staged flags. Keeping line order means a hunk
 --- stays put when staged/unstaged — it only folds, never jumps to the end of
 --- the file (unstaged and staged hunks would otherwise group separately).
----@param hunks table[] hunks for one file, each with .pos, .staged, .diff
+---@param hunks DiffReviewHunk[] hunks for one file, each with .pos, .staged, .diff
 ---@return string[] diffs, boolean[] staged_flags
 local function order_file_hunks(hunks)
   table.sort(hunks, function(a, b)
@@ -502,6 +642,7 @@ end
 -- Cache for treesitter context per file (cleared on refresh)
 M._ts_context_cache = {}
 
+---@param opts? DiffReviewConfig
 function M.setup(opts)
   M.config = config.setup(opts)
   setup_bg_highlights()
@@ -545,8 +686,8 @@ function M.get(cb, _ctx)
 
   -- Get untracked files
   local untracked_files = {}
-  local untracked_output = vim.fn.systemlist({ "git", "-C", cwd, "ls-files", "--others", "--exclude-standard" })
-  if vim.v.shell_error == 0 then
+  local untracked_output, untracked_code = systemlist({ "git", "-C", cwd, "ls-files", "--others", "--exclude-standard" })
+  if untracked_code == 0 then
     for _, f in ipairs(untracked_output) do
       if f ~= "" then
         untracked_files[#untracked_files + 1] = f
@@ -560,8 +701,8 @@ function M.get(cb, _ctx)
   for _, h in ipairs(all_hunks) do
     tracked_files_with_hunks[h.file] = true
   end
-  local staged_name_status = vim.fn.systemlist({ "git", "-C", cwd, "diff", "--cached", "--name-status" })
-  if vim.v.shell_error == 0 then
+  local staged_name_status, staged_name_status_code = systemlist({ "git", "-C", cwd, "diff", "--cached", "--name-status" })
+  if staged_name_status_code == 0 then
     for _, line in ipairs(staged_name_status) do
       local status, file = parse_name_status_line(line)
       if file and not tracked_files_with_hunks[file] then
@@ -579,8 +720,8 @@ function M.get(cb, _ctx)
       end
     end
   end
-  local unstaged_name_status = vim.fn.systemlist({ "git", "-C", cwd, "diff", "--name-status" })
-  if vim.v.shell_error == 0 then
+  local unstaged_name_status, unstaged_name_status_code = systemlist({ "git", "-C", cwd, "diff", "--name-status" })
+  if unstaged_name_status_code == 0 then
     for _, line in ipairs(unstaged_name_status) do
       local status, file = parse_name_status_line(line)
       if file and not tracked_files_with_hunks[file] then
@@ -697,7 +838,7 @@ function M.get(cb, _ctx)
   -- Build per-file combined diffs + staged status for file-level preview.
   -- order_file_hunks keeps hunks in line order so staging folds a hunk in
   -- place instead of moving it to the end of the file.
-  local file_hunks = {} ---@type table<string, table[]>
+  local file_hunks = {} ---@type table<string, DiffReviewHunk[]>
   for _, hunk in ipairs(all_hunks) do
     local f = hunk.file
     file_hunks[f] = file_hunks[f] or {}
@@ -1568,6 +1709,12 @@ local function confirm(lines, on_yes)
   end
 end
 
+---@class DiffReviewSectionConfig
+---@field name string
+---@field title string
+---@field default_folded boolean
+
+---@type DiffReviewSectionConfig[]
 local status_section_order = {
   { name = "unstaged", title = "Unstaged changes", default_folded = false },
   { name = "untracked", title = "Untracked files", default_folded = false },
@@ -1576,6 +1723,7 @@ local status_section_order = {
 local status_file_indent = 0
 local status_hunk_indent = 0
 
+---@type table<string, DiffReviewSectionConfig>
 local status_section_by_name = {}
 for _, section in ipairs(status_section_order) do
   status_section_by_name[section.name] = section
@@ -1598,8 +1746,8 @@ end
 local function status_git_line(cwd, args)
   local command = { "git", "-C", cwd }
   vim.list_extend(command, args)
-  local result = vim.fn.systemlist(command)
-  if vim.v.shell_error ~= 0 then return nil end
+  local result, code = systemlist(command)
+  if code ~= 0 then return nil end
   return vim.trim(result[1] or "")
 end
 
@@ -1814,6 +1962,8 @@ local function status_add_fancy_row(row, entry, indent)
   end
 end
 
+---@param item table
+---@return "unstaged"|"staged"|"untracked"
 local function status_section_for_item(item)
   local data = item.item or {}
   if data.category == "Untracked Files" then return "untracked" end
@@ -1821,13 +1971,14 @@ local function status_section_for_item(item)
   return "unstaged"
 end
 
+---@return DiffReviewStatusSection[]
 local function status_collect_sections()
   local collected_items = {}
   M.get(function(items)
     collected_items = items or {}
   end, { skip_pre_render = true, skip_ts_context = true })
 
-  local sections = {}
+  local sections = {} ---@type table<string, DiffReviewStatusSection>
   for _, section_config in ipairs(status_section_order) do
     sections[section_config.name] = {
       name = section_config.name,
@@ -1877,7 +2028,7 @@ local function status_collect_sections()
     end
   end
 
-  local ordered = {}
+  local ordered = {} ---@type DiffReviewStatusSection[]
   for _, section_config in ipairs(status_section_order) do
     local section = sections[section_config.name]
     table.sort(section.files, function(left_file, right_file)
@@ -1894,6 +2045,8 @@ local function status_collect_sections()
   return ordered
 end
 
+---@param file DiffReviewStatusFile
+---@return DiffReviewHunk[]
 local function status_diff_hunks_for_file(file)
   if #file.hunks > 0 then return file.hunks end
   if not file.untracked then return {} end
@@ -1918,6 +2071,8 @@ local function status_diff_hunks_for_file(file)
   return hunks
 end
 
+---@param file DiffReviewStatusFile
+---@param hunk DiffReviewHunk
 local function status_render_hunk(file, hunk)
   local hunk_key = status_hunk_key(file.section_name, file.filename, hunk.diff)
   local hunk_folded = status_folded(hunk_key, false)
@@ -1947,6 +2102,7 @@ local function status_render_hunk(file, hunk)
   end
 end
 
+---@param file DiffReviewStatusFile
 local function status_render_file(file)
   local file_key = status_file_key(file.section_name, file.filename)
   local file_folded = status_folded(file_key, true)
@@ -1971,6 +2127,7 @@ local function status_render_file(file)
   end
 end
 
+---@param section DiffReviewStatusSection
 local function status_render_section(section)
   local section_key = status_section_key(section.name)
   local section_folded = status_folded(section_key, section.default_folded)
@@ -1983,12 +2140,15 @@ local function status_render_section(section)
   end
 end
 
+---@return DiffReviewStatusEntry?
 local function status_entry_under_cursor()
   local status = M._status
   if not status then return nil end
   return status.entries[vim.api.nvim_win_get_cursor(0)[1]]
 end
 
+---@param entry DiffReviewStatusEntry?
+---@return string[]
 local function status_files_for_entry(entry)
   if not entry then return {} end
   if entry.kind == "hunk" then return { entry.file.filename } end
@@ -2003,6 +2163,9 @@ local function status_files_for_entry(entry)
   return {}
 end
 
+---@param start_line integer
+---@param end_line integer
+---@return DiffReviewStatusEntry[]
 local function status_entries_for_lines(start_line, end_line)
   local status = M._status
   if not status then return {} end
@@ -2022,6 +2185,7 @@ local function status_entries_for_lines(start_line, end_line)
   return entries
 end
 
+---@return DiffReviewStatusEntry[]
 local function status_entries_from_visual_selection()
   local mode = vim.fn.mode()
   local in_visual_mode = mode == "v" or mode == "V" or mode:byte() == 22
@@ -2034,6 +2198,8 @@ local function status_entries_from_visual_selection()
   return status_entries_for_lines(start_pos[2], end_pos[2])
 end
 
+---@param entry DiffReviewStatusEntry?
+---@return DiffReviewStatusEntry[]
 local function status_file_entries_for_entry(entry)
   if not entry then return {} end
   if entry.kind == "section" then
@@ -2046,6 +2212,8 @@ local function status_file_entries_for_entry(entry)
   return { entry }
 end
 
+---@param entries DiffReviewStatusEntry[]
+---@return DiffReviewStatusEntry[]
 local function status_expanded_entries(entries)
   local expanded_entries = {}
   local seen = {}
@@ -2061,6 +2229,8 @@ local function status_expanded_entries(entries)
   return expanded_entries
 end
 
+---@param file_set table<string, boolean>
+---@return string[]
 local function status_files_from_set(file_set)
   local files = {}
   for filename in pairs(file_set) do
@@ -2070,6 +2240,8 @@ local function status_files_from_set(file_set)
   return files
 end
 
+---@param items table<any, any>
+---@return integer
 local function status_count_set(items)
   local count = 0
   for _ in pairs(items) do
@@ -2078,6 +2250,9 @@ local function status_count_set(items)
   return count
 end
 
+---@param action string
+---@param hunk_count integer
+---@param file_count integer
 local function status_notify_action(action, hunk_count, file_count)
   if hunk_count <= 0 and file_count <= 0 then return end
   local parts = {}
@@ -2104,6 +2279,10 @@ local function status_restore_cursor(buf, target_id, fallback_line)
   pcall(vim.api.nvim_win_set_cursor, 0, { math.max(target_line, 1), 0 })
 end
 
+---@param buf integer
+---@param target_id? string
+---@param fallback_line? integer
+---@param opts? { reuse_sections?: boolean }
 function M.render_status(buf, target_id, fallback_line, opts)
   opts = opts or {}
   setup_bg_highlights()
@@ -2176,6 +2355,10 @@ function M.render_status(buf, target_id, fallback_line, opts)
   status_restore_cursor(buf, target_id, fallback_line)
 end
 
+---@param buf integer
+---@param target_id? string
+---@param fallback_line? integer
+---@param opts? { reuse_sections?: boolean }
 local function render_status_or_notify(buf, target_id, fallback_line, opts)
   local ok, err = xpcall(function()
     M.render_status(buf, target_id, fallback_line, opts)
@@ -2185,11 +2368,14 @@ local function render_status_or_notify(buf, target_id, fallback_line, opts)
   end
 end
 
+---@param buf integer
+---@param target_id? string
 local function refresh_status_after_action(buf, target_id)
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
   render_status_or_notify(buf, target_id, vim.api.nvim_win_get_cursor(0)[1])
 end
 
+---@param entries DiffReviewStatusEntry[]
 local function status_stage_entries(entries)
   if #entries == 0 then return end
   local expanded_entries = status_expanded_entries(entries)
@@ -2221,11 +2407,13 @@ local function status_stage_entries(entries)
   end
 end
 
+---@param entry DiffReviewStatusEntry?
 local function status_stage(entry)
   if not entry then return end
   status_stage_entries({ entry })
 end
 
+---@param entries DiffReviewStatusEntry[]
 local function status_unstage_entries(entries)
   if #entries == 0 then return end
   local expanded_entries = status_expanded_entries(entries)
@@ -2257,11 +2445,14 @@ local function status_unstage_entries(entries)
   end
 end
 
+---@param entry DiffReviewStatusEntry?
 local function status_unstage(entry)
   if not entry then return end
   status_unstage_entries({ entry })
 end
 
+---@param entries DiffReviewStatusEntry[]
+---@param target_id? string
 local function status_discard_entries(entries, target_id)
   local cwd, root_err = git_root()
   if not cwd then
@@ -2280,7 +2471,7 @@ local function status_discard_entries(entries, target_id)
         failures[#failures + 1] = { file = entry.file.filename, output = result.output, code = result.code }
       end
     elseif entry.file.untracked then
-      local delete_code = vim.fn.delete(entry.file.filename)
+      local delete_code = delete_path(entry.file.filename)
       if delete_code ~= 0 then
         failures[#failures + 1] = {
           file = entry.file.filename,
@@ -2296,7 +2487,7 @@ local function status_discard_entries(entries, target_id)
         if not checkout_result.ok then
           local restore_result = run_git_at_root(cwd, { "restore", "--staged", "--", relpath })
           if restore_result.ok then
-            local delete_code = vim.fn.delete(entry.file.filename)
+            local delete_code = delete_path(entry.file.filename)
             if delete_code ~= 0 then
               failures[#failures + 1] = {
                 file = entry.file.filename,
@@ -2319,6 +2510,8 @@ local function status_discard_entries(entries, target_id)
   refresh_status_after_action(M._status.buf, target_id)
 end
 
+---@param entries DiffReviewStatusEntry[]
+---@param target_id? string
 local function status_discard_entry_list(entries, target_id)
   local discard_entries = {}
   for _, entry in ipairs(status_expanded_entries(entries)) do
@@ -2346,11 +2539,15 @@ local function status_discard_entry_list(entries, target_id)
   end)
 end
 
+---@param entry DiffReviewStatusEntry?
 local function status_discard(entry)
   if not entry then return end
   status_discard_entry_list({ entry }, entry.id)
 end
 
+---@param diff_text string
+---@param old_target_line integer
+---@return integer?
 local function closest_current_line_for_deleted_diff_line(diff_text, old_target_line)
   local old_line
   local new_line
@@ -2380,6 +2577,7 @@ local function closest_current_line_for_deleted_diff_line(diff_text, old_target_
   end
 end
 
+---@param entry DiffReviewStatusEntry?
 local function status_jump(entry)
   if not (entry and entry.file and entry.file.filename) then return end
   vim.cmd.edit(vim.fn.fnameescape(entry.file.filename))
@@ -2402,6 +2600,7 @@ local function status_jump(entry)
   end
 end
 
+---@param entry DiffReviewStatusEntry?
 local function status_toggle(entry)
   if not entry then return end
   local default = false
@@ -2415,6 +2614,7 @@ local function status_toggle(entry)
   render_status_or_notify(M._status.buf, entry.id, vim.api.nvim_win_get_cursor(0)[1], { reuse_sections = true })
 end
 
+---@param buf integer
 local function status_push(buf)
   local cwd, root_err = git_root()
   if not cwd then
@@ -2424,7 +2624,7 @@ local function status_push(buf)
 
   vim.notify("Pushing changes...", vim.log.levels.INFO, { title = "DiffReview" })
   local output = {}
-  local job_id = vim.fn.jobstart({ "git", "-C", cwd, "push" }, {
+  local job_id = jobstart({ "git", "-C", cwd, "push" }, {
     stdout_buffered = true,
     stderr_buffered = true,
     on_stdout = function(_, data)
@@ -2461,6 +2661,7 @@ local function status_push(buf)
   end
 end
 
+---@param buf integer
 local function setup_status_keymaps(buf)
   local opts = { buffer = buf, silent = true, nowait = true }
   vim.keymap.set("n", "q", function()

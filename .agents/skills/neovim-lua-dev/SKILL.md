@@ -134,6 +134,13 @@ If diagnostics still look wrong, run the linter directly (e.g. `luacheck`,
 
 - **`local` everywhere.** Global access is slower and pollutes the namespace;
   declare `local` at the top of each scope.
+- **Use LuaLS annotations for type safety.** Prefer EmmyLua/LuaLS comments:
+  `---@class` / `---@field` for table shapes, `---@alias` for semantic primitive
+  tables, `---@param` / `---@return` for public and non-trivial local functions,
+  and `---@type` for module state, callback tables, injected test seams, and
+  mocks. Use literal unions for known variants such as
+  `"section"|"file"|"hunk"`. Do not leave new public APIs or callback seams as
+  untyped `table` unless their shape is genuinely arbitrary.
 - **Tables are the one data structure** — arrays, maps, objects, modules,
   namespaces. OO via metatables + `__index`; `obj:method()` for methods needing
   `self`.

@@ -11,3 +11,8 @@ Snacks plugin patterns now live in a skill at the repo root:
   catalog of bugs with fixes.
 
 Read the relevant reference section before touching that subsystem.
+
+When editing Neovim Lua plugin code, use LuaLS/EmmyLua annotations for public
+APIs, table-shaped state, callback seams, and tests. Prefer `---@class`,
+`---@field`, `---@alias`, `---@param`, `---@return`, and `---@type` so LSP
+diagnostics, completion, and jump-to-definition stay useful.
