@@ -2096,7 +2096,7 @@ local function status_add_hint_line()
     { " discard | ", "DiffReviewStatusHint" },
     { "c", "DiffReviewStatusHintKey" },
     { " commit | ", "DiffReviewStatusHint" },
-    { "P", "DiffReviewStatusHintKey" },
+    { "pP", "DiffReviewStatusHintKey" },
     { " push | ", "DiffReviewStatusHint" },
     { "<CR>", "DiffReviewStatusHintKey" },
     { " jump | ", "DiffReviewStatusHint" },
@@ -2384,6 +2384,93 @@ local function status_files_for_entry(entry)
   return {}
 end
 
+local function status_entries_for_lines(start_line, end_line)
+  local status = M._status
+  if not status then return {} end
+  if start_line > end_line then
+    start_line, end_line = end_line, start_line
+  end
+
+  local entries = {}
+  local seen = {}
+  for line = start_line, end_line do
+    local entry = status.entries[line]
+    if entry and entry.id and not seen[entry.id] then
+      seen[entry.id] = true
+      entries[#entries + 1] = entry
+    end
+  end
+  return entries
+end
+
+local function status_entries_from_visual_selection()
+  local mode = vim.fn.mode()
+  local in_visual_mode = mode == "v" or mode == "V" or mode:byte() == 22
+  if in_visual_mode then
+    return status_entries_for_lines(vim.fn.line("v"), vim.api.nvim_win_get_cursor(0)[1])
+  end
+
+  local start_pos = vim.fn.getpos("'<")
+  local end_pos = vim.fn.getpos("'>")
+  return status_entries_for_lines(start_pos[2], end_pos[2])
+end
+
+local function status_file_entries_for_entry(entry)
+  if not entry then return {} end
+  if entry.kind == "section" then
+    local entries = {}
+    for _, file in ipairs(entry.section.files or {}) do
+      entries[#entries + 1] = { id = status_file_key(file.section_name, file.filename), kind = "file", file = file }
+    end
+    return entries
+  end
+  return { entry }
+end
+
+local function status_expanded_entries(entries)
+  local expanded_entries = {}
+  local seen = {}
+  for _, selected_entry in ipairs(entries or {}) do
+    for _, entry in ipairs(status_file_entries_for_entry(selected_entry)) do
+      local id = entry.id or ("%s:%s"):format(entry.kind or "entry", (entry.file and entry.file.filename) or "")
+      if not seen[id] then
+        seen[id] = true
+        expanded_entries[#expanded_entries + 1] = entry
+      end
+    end
+  end
+  return expanded_entries
+end
+
+local function status_files_from_set(file_set)
+  local files = {}
+  for filename in pairs(file_set) do
+    files[#files + 1] = filename
+  end
+  table.sort(files)
+  return files
+end
+
+local function status_count_set(items)
+  local count = 0
+  for _ in pairs(items) do
+    count = count + 1
+  end
+  return count
+end
+
+local function status_notify_action(action, hunk_count, file_count)
+  if hunk_count <= 0 and file_count <= 0 then return end
+  local parts = {}
+  if hunk_count > 0 then
+    parts[#parts + 1] = ("%d hunk(s)"):format(hunk_count)
+  end
+  if file_count > 0 then
+    parts[#parts + 1] = ("%d file(s)"):format(file_count)
+  end
+  vim.notify(("%s %s"):format(action, table.concat(parts, ", ")), vim.log.levels.INFO)
+end
+
 local function status_restore_cursor(buf, target_id, fallback_line)
   local target_line = nil
   if target_id then
@@ -2484,44 +2571,76 @@ local function refresh_status_after_action(buf, target_id)
   render_status_or_notify(buf, target_id, vim.api.nvim_win_get_cursor(0)[1])
 end
 
-local function status_stage(entry)
-  if not entry then return end
-  if entry.kind == "hunk" then
-    if entry.hunk.staged then return end
-    if M.stage_patch(entry.hunk.diff) then
-      vim.notify("Hunk staged", vim.log.levels.INFO)
-      refresh_status_after_action(M._status.buf, entry.id)
+local function status_stage_entries(entries)
+  if #entries == 0 then return end
+  local expanded_entries = status_expanded_entries(entries)
+  if #expanded_entries == 0 then return end
+
+  local first_id = expanded_entries[1].id
+  local files_to_stage = {}
+  local staged_hunks = 0
+  for _, entry in ipairs(expanded_entries) do
+    if entry.kind == "hunk" and not entry.hunk.staged then
+      if M.stage_patch(entry.hunk.diff) then
+        staged_hunks = staged_hunks + 1
+      end
+    elseif entry.kind == "file" and entry.file.section_name ~= "staged" then
+      files_to_stage[entry.file.filename] = true
     end
-    return
   end
 
-  if entry.kind == "section" and entry.section.name == "staged" then return end
-  if entry.kind == "file" and entry.file.section_name == "staged" then return end
-  local result = M.stage_files(status_files_for_entry(entry))
-  if #result.successes > 0 then
-    vim.notify(("Staged %d file(s)"):format(#result.successes), vim.log.levels.INFO)
-    refresh_status_after_action(M._status.buf, entry.id)
+  local staged_files = 0
+  local files = status_files_from_set(files_to_stage)
+  if #files > 0 then
+    local result = M.stage_files(files)
+    staged_files = #result.successes
+  end
+
+  if staged_hunks > 0 or staged_files > 0 then
+    status_notify_action("Staged", staged_hunks, staged_files)
+    refresh_status_after_action(M._status.buf, first_id)
+  end
+end
+
+local function status_stage(entry)
+  if not entry then return end
+  status_stage_entries({ entry })
+end
+
+local function status_unstage_entries(entries)
+  if #entries == 0 then return end
+  local expanded_entries = status_expanded_entries(entries)
+  if #expanded_entries == 0 then return end
+
+  local first_id = expanded_entries[1].id
+  local files_to_unstage = {}
+  local unstaged_hunks = 0
+  for _, entry in ipairs(expanded_entries) do
+    if entry.kind == "hunk" and entry.hunk.staged then
+      if M.unstage_patch(entry.hunk.diff) then
+        unstaged_hunks = unstaged_hunks + 1
+      end
+    elseif entry.kind == "file" and entry.file.section_name == "staged" then
+      files_to_unstage[entry.file.filename] = true
+    end
+  end
+
+  local unstaged_files = 0
+  local files = status_files_from_set(files_to_unstage)
+  if #files > 0 then
+    local result = M.unstage_files(files)
+    unstaged_files = #result.successes
+  end
+
+  if unstaged_hunks > 0 or unstaged_files > 0 then
+    status_notify_action("Unstaged", unstaged_hunks, unstaged_files)
+    refresh_status_after_action(M._status.buf, first_id)
   end
 end
 
 local function status_unstage(entry)
   if not entry then return end
-  if entry.kind == "hunk" then
-    if not entry.hunk.staged then return end
-    if M.unstage_patch(entry.hunk.diff) then
-      vim.notify("Hunk unstaged", vim.log.levels.INFO)
-      refresh_status_after_action(M._status.buf, entry.id)
-    end
-    return
-  end
-
-  if entry.kind == "section" and entry.section.name ~= "staged" then return end
-  if entry.kind == "file" and entry.file.section_name ~= "staged" then return end
-  local result = M.unstage_files(status_files_for_entry(entry))
-  if #result.successes > 0 then
-    vim.notify(("Unstaged %d file(s)"):format(#result.successes), vim.log.levels.INFO)
-    refresh_status_after_action(M._status.buf, entry.id)
-  end
+  status_unstage_entries({ entry })
 end
 
 local function status_discard_entries(entries, target_id)
@@ -2581,30 +2700,36 @@ local function status_discard_entries(entries, target_id)
   refresh_status_after_action(M._status.buf, target_id)
 end
 
-local function status_discard(entry)
-  if not entry then return end
-  local entries = {}
-  if entry.kind == "hunk" or entry.kind == "file" then
-    entries[#entries + 1] = entry
-  elseif entry.kind == "section" then
-    for _, file in ipairs(entry.section.files or {}) do
-      entries[#entries + 1] = { kind = "file", file = file }
+local function status_discard_entry_list(entries, target_id)
+  local discard_entries = {}
+  for _, entry in ipairs(status_expanded_entries(entries)) do
+    if entry.kind == "hunk" or entry.kind == "file" then
+      discard_entries[#discard_entries + 1] = entry
     end
   end
-  if #entries == 0 then return end
+  if #discard_entries == 0 then return end
 
   local message
-  if #entries == 1 then
-    local first_entry = entries[1]
+  if #discard_entries == 1 then
+    local first_entry = discard_entries[1]
     local prompt = first_entry.kind == "hunk" and "Discard this hunk?"
       or (first_entry.file.untracked and "Delete untracked file?" or "Discard ALL changes to file?")
     message = { prompt, "  " .. first_entry.file.relpath }
   else
-    message = { ("Discard changes in %d file(s)?"):format(#entries) }
+    local files = {}
+    for _, entry in ipairs(discard_entries) do
+      files[entry.file.filename] = true
+    end
+    message = { ("Discard changes in %d file(s)?"):format(status_count_set(files)) }
   end
   confirm(message, function()
-    status_discard_entries(entries, entry.id)
+    status_discard_entries(discard_entries, target_id)
   end)
+end
+
+local function status_discard(entry)
+  if not entry then return end
+  status_discard_entry_list({ entry }, entry.id)
 end
 
 local function closest_current_line_for_deleted_diff_line(diff_text, old_target_line)
@@ -2737,14 +2862,24 @@ local function setup_status_keymaps(buf)
   vim.keymap.set("n", "S", function()
     status_stage(status_entry_under_cursor())
   end, vim.tbl_extend("force", opts, { desc = "Stage hunk/file" }))
+  vim.keymap.set("x", "S", function()
+    status_stage_entries(status_entries_from_visual_selection())
+  end, vim.tbl_extend("force", opts, { desc = "Stage selection" }))
 
   vim.keymap.set("n", "U", function()
     status_unstage(status_entry_under_cursor())
   end, vim.tbl_extend("force", opts, { desc = "Unstage hunk/file" }))
+  vim.keymap.set("x", "U", function()
+    status_unstage_entries(status_entries_from_visual_selection())
+  end, vim.tbl_extend("force", opts, { desc = "Unstage selection" }))
 
   vim.keymap.set("n", "j", function()
     status_discard(status_entry_under_cursor())
   end, vim.tbl_extend("force", opts, { desc = "Discard hunk/file" }))
+  vim.keymap.set("x", "j", function()
+    local entries = status_entries_from_visual_selection()
+    status_discard_entry_list(entries, (entries[1] or {}).id)
+  end, vim.tbl_extend("force", opts, { desc = "Discard selection" }))
 
   vim.keymap.set("n", "<CR>", function()
     status_jump(status_entry_under_cursor())
@@ -2761,12 +2896,12 @@ local function setup_status_keymaps(buf)
   vim.keymap.set("n", "c", commit, vim.tbl_extend("force", opts, { desc = "Commit" }))
   vim.keymap.set("n", "cc", commit, vim.tbl_extend("force", opts, { desc = "Commit" }))
 
-  vim.keymap.set("n", "P", function()
+  vim.keymap.set("n", "pP", function()
     status_push(buf)
   end, vim.tbl_extend("force", opts, { desc = "Push" }))
 
   vim.keymap.set("n", "?", function()
-    vim.notify("<Tab> toggle | S stage | U unstage | j discard | c commit | P push | <CR> jump | r refresh | q close", vim.log.levels.INFO, {
+    vim.notify("<Tab> toggle | S stage | U unstage | j discard | c commit | pP push | <CR> jump | r refresh | q close", vim.log.levels.INFO, {
       title = "DiffReview",
     })
   end, vim.tbl_extend("force", opts, { desc = "DiffReview help" }))
