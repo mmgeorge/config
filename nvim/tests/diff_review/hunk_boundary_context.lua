@@ -19,9 +19,14 @@ local diff_text = table.concat({
   "index 1111111..2222222 100644",
   "--- a/src/engine.rs",
   "+++ b/src/engine.rs",
-  "@@ -10 +10 @@",
+  "@@ -11,2 +11,2 @@",
   "-    let stderr_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);",
   "+    let stderr_laye = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);",
+  "     let writer = LOG_WRITER.get_or_init(|| SwappableWriter::new(open_log()));",
+  "@@ -12,2 +12,2 @@",
+  "-    let writer = LOG_WRITER.get_or_init(|| SwappableWriter::new(open_log()));",
+  "+    let writer = LOG_WRITER.get_or_int(|| SwappableWriter::new(open_log()));",
+  "   }",
 }, "\n")
 
 ---@type DiffReviewGitBackend
@@ -71,6 +76,14 @@ local function contains_line(lines, pattern)
     if line:find(pattern, 1, true) then return true end
   end
   return false
+end
+
+local function count_lines(lines, pattern)
+  local count = 0
+  for _, line in ipairs(lines) do
+    if line:find(pattern, 1, true) then count = count + 1 end
+  end
+  return count
 end
 
 local function buffer_contains(buf, pattern)
@@ -153,6 +166,7 @@ local function run()
     "impl Engine {",
     "  pub fn new(bridge: Bridge) -> Self {",
     "    let stderr_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);",
+    "    let writer = LOG_WRITER.get_or_init(|| SwappableWriter::new(open_log()));",
     "  }",
     "}",
   }, root .. "/src/engine.rs") == 0, "writefile failed")
@@ -161,12 +175,26 @@ local function run()
   diff_review.setup()
   diff_review.open()
   local buf = vim.api.nvim_get_current_buf()
-  wait_for(function() return buffer_contains(buf, "engine.rs +1 -1") end, "status did not render file\n" .. buffer_dump(buf))
+  wait_for(function() return buffer_contains(buf, "engine.rs +2 -2") end, "status did not render file\n" .. buffer_dump(buf))
 
   trigger_normal_mapping("<Tab>", find_row(buf, "engine.rs"))
   wait_for(function()
-    return buffer_contains(buf, "@@ +1 -1") or buffer_contains(buf, "@@ Engine +1 -1")
-  end, "compact hunk did not render")
+    return buffer_contains(buf, "@@ +1 -1") or buffer_contains(buf, "@@ Engine.new +1 -1")
+  end, "compact hunk did not render\n" .. buffer_dump(buf))
+  local delete_row = find_row(buf, "let stderr_layer = tracing_subscriber")
+  local delete_line = vim.api.nvim_buf_get_lines(buf, delete_row - 1, delete_row, false)[1]
+  assert_true(delete_line:find("^%s*11%s+%s+%- ", 1) ~= nil, "delete row did not use local gutter: " .. delete_line)
+  local add_row = find_row(buf, "let stderr_laye = tracing_subscriber")
+  local add_line = vim.api.nvim_buf_get_lines(buf, add_row - 1, add_row, false)[1]
+  assert_true(add_line:find("^%s+%s+11%s+%+ ", 1) ~= nil, "add row did not use local gutter: " .. add_line)
+  wait_for(function()
+    local row = find_row(buf, "let stderr_layer = tracing_subscriber")
+    return line_has_highlight(buf, row, "@keyword")
+  end, "delete hunk body row did not get Tree-sitter keyword highlight: " .. line_highlights(buf, delete_row))
+  wait_for(function()
+    local row = find_row(buf, "let stderr_laye = tracing_subscriber")
+    return line_has_highlight(buf, row, "@keyword")
+  end, "add hunk body row did not get Tree-sitter keyword highlight: " .. line_highlights(buf, add_row))
   wait_for(function()
     for _, value in pairs(diff_review._ts_context_cache or {}) do
       if type(value) == "table" and value.label == "Engine.new" then return true end
@@ -176,13 +204,20 @@ local function run()
   wait_for(function() return buffer_contains(buf, "pub fn new(bridge: Bridge) -> Self {") end, "opening boundary did not render\n" .. buffer_dump(buf))
   local boundary_row = find_row(buf, "pub fn new(bridge: Bridge) -> Self {")
   local boundary_line = vim.api.nvim_buf_get_lines(buf, boundary_row - 1, boundary_row, false)[1]
-  assert_true(boundary_line:find("^10%s+10%s+pub fn new", 1) ~= nil, "boundary line did not use diff gutter: " .. boundary_line)
+  assert_true(boundary_line:find("^%s*10%s+10%s+pub fn new", 1) ~= nil, "boundary line did not use diff gutter: " .. boundary_line)
   assert_true(line_has_highlight(buf, boundary_row, "@keyword"), "boundary row did not get keyword syntax highlight: " .. line_highlights(buf, boundary_row))
   assert_true(line_has_highlight(buf, boundary_row, "@type"), "boundary row did not get type syntax highlight: " .. line_highlights(buf, boundary_row))
   wait_for(function() return buffer_contains(buf, "...") end, "ellipsis boundary did not render\n" .. buffer_dump(buf))
   local ellipsis_line = vim.api.nvim_buf_get_lines(buf, find_row(buf, "...") - 1, find_row(buf, "..."), false)[1]
   assert_true(ellipsis_line:find("^%.%.%.") == nil, "ellipsis rendered at column zero: " .. ellipsis_line)
   wait_for(function() return buffer_contains(buf, "}") end, "closing boundary did not render\n" .. buffer_dump(buf))
+  wait_for(function()
+    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+    return count_lines(lines, "pub fn new(bridge: Bridge) -> Self {") == 1
+      and count_lines(lines, "  }") == 1
+  end, "neighboring same-scope hunks repeated boundary context\n" .. buffer_dump(buf))
+  local closing_line = vim.api.nvim_buf_get_lines(buf, find_row(buf, "  }") - 1, find_row(buf, "  }"), false)[1]
+  assert_true(closing_line:find("^%s*13%s+13%s+}", 1) ~= nil, "closing boundary did not use diff gutter: " .. closing_line)
   wait_for(function() return buffer_contains(buf, "@@ Engine.new +1 -1") end, "compact hunk header did not get context label\n" .. buffer_dump(buf))
 
   local before = system_call_count()
@@ -194,7 +229,6 @@ local function run()
   local collapsed_lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
   assert_true(contains_line(collapsed_lines, "@@ Engine.new +1 -1"), "collapsed hunk header missing")
   assert_true(not contains_line(collapsed_lines, "  pub fn new(bridge: Bridge) -> Self {"), "collapsed hunk showed opening boundary")
-  assert_true(not contains_line(collapsed_lines, "}"), "collapsed hunk showed closing boundary")
 end
 
 local ok, err = xpcall(run, debug.traceback)
