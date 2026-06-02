@@ -48,6 +48,7 @@
 ---@field staged boolean
 ---@field added integer
 ---@field removed integer
+---@field git_status? string
 
 ---@class DiffReviewStatusFile
 ---@field filename string
@@ -58,6 +59,7 @@
 ---@field hunks DiffReviewHunk[]
 ---@field untracked boolean
 ---@field status string
+---@field git_status? string
 
 ---@class DiffReviewStatusSection
 ---@field name string
@@ -73,6 +75,8 @@
 ---@field file? DiffReviewStatusFile
 ---@field hunk? DiffReviewHunk
 ---@field diff_line? table
+
+---@alias DiffReviewStatusSectionName "unstaged"|"staged"|"untracked"
 
 ---@class DiffReviewTreeSitterContextPending
 ---@field pending true
@@ -292,19 +296,25 @@ end
 ---@param path string
 ---@return string
 local function normalize_path(path)
-  return vim.fs.normalize(vim.fn.fnamemodify(path, ":p")):gsub("\\", "/"):gsub("/$", "")
+  return tostring(vim.fs.normalize(vim.fn.fnamemodify(path, ":p"))):gsub("\\", "/"):gsub("/+$", "")
 end
 
----@param filename string
----@param root string
+---@param path string
+---@return string
+local function normalize_path_text(path)
+  return tostring(path or ""):gsub("\\", "/"):gsub("/+$", "")
+end
+
+---@param absolute string
+---@param root_path string
+---@param case_insensitive boolean
+---@param original_filename string
 ---@return string? relpath
 ---@return string? err
-local function repo_relative(filename, root)
-  local absolute = normalize_path(filename)
-  local root_path = normalize_path(root)
+local function repo_relative_normalized(absolute, root_path, case_insensitive, original_filename)
   local compare_absolute = absolute
   local compare_root = root_path
-  if package.config:sub(1, 1) == "\\" then
+  if case_insensitive then
     compare_absolute = compare_absolute:lower()
     compare_root = compare_root:lower()
   end
@@ -313,9 +323,31 @@ local function repo_relative(filename, root)
   end
   local prefix = compare_root .. "/"
   if compare_absolute:sub(1, #prefix) ~= prefix then
-    return nil, ("Path is outside the git root: %s"):format(filename)
+    return nil, ("Path is outside the git root: %s"):format(original_filename)
   end
   return absolute:sub(#root_path + 2), nil
+end
+
+---@param filename string
+---@param root string
+---@return string? relpath
+---@return string? err
+local function repo_relative(filename, root)
+  return repo_relative_normalized(
+    normalize_path(filename),
+    normalize_path(root),
+    package.config:sub(1, 1) == "\\",
+    filename
+  )
+end
+
+---@param filename string
+---@param root string
+---@param case_insensitive boolean?
+---@return string? relpath
+---@return string? err
+function M._repo_relative_for_test(filename, root, case_insensitive)
+  return repo_relative_normalized(normalize_path_text(filename), normalize_path_text(root), case_insensitive == true, filename)
 end
 
 ---@param root string
@@ -576,6 +608,14 @@ function M.unstage_files_async(files, cb)
 end
 
 ---@param files string[]
+---@param cb fun(result: { ok: boolean, successes: string[], failures: DiffReviewGitFailure[] })
+function M.unstage_added_files_async(files, cb)
+  run_file_batch_async(files, function(relpath)
+    return { "rm", "--cached", "--ignore-unmatch", "--", relpath }
+  end, "Unstage failed", cb)
+end
+
+---@param files string[]
 ---@return { ok: boolean, successes: string[], failures: DiffReviewGitFailure[] }
 function M.stage_files(files)
   return run_file_batch_sync_for_test_backend(files, function(relpath)
@@ -588,6 +628,14 @@ end
 function M.unstage_files(files)
   return run_file_batch_sync_for_test_backend(files, function(relpath)
     return { "restore", "--staged", "--", relpath }
+  end, "Unstage failed")
+end
+
+---@param files string[]
+---@return { ok: boolean, successes: string[], failures: DiffReviewGitFailure[] }
+function M.unstage_added_files(files)
+  return run_file_batch_sync_for_test_backend(files, function(relpath)
+    return { "rm", "--cached", "--ignore-unmatch", "--", relpath }
   end, "Unstage failed")
 end
 
@@ -606,6 +654,12 @@ local function parse_name_status_line(line)
   end
   status, file = line:match("^(%S+)%s+(.+)$")
   return status, file
+end
+
+---@param status string?
+---@return boolean
+local function git_status_is_added(status)
+  return type(status) == "string" and status:sub(1, 1) == "A"
 end
 
 --- Parse unified diff output into structured file/hunk data
@@ -986,14 +1040,32 @@ local function collect_items_from_git(cwd, cb, _ctx)
     end
 
   -- Get all changed files (staged + unstaged) to catch files with no hunks
-  -- (e.g., empty new files, binary files)
-  local tracked_files_with_hunks = {}
-  for _, h in ipairs(all_hunks) do
-    tracked_files_with_hunks[h.file] = true
-  end
+  -- (e.g., empty new files, binary files), and to preserve Git status for
+  -- textual hunks so action routing can distinguish added files from modified
+  -- tracked files.
+  local staged_status_by_file = {}
   if results.staged_name_status_code == 0 then
     for _, line in ipairs(results.staged_name_status) do
       local status, file = parse_name_status_line(line)
+      if status and file then staged_status_by_file[file] = status end
+    end
+  end
+
+  local unstaged_status_by_file = {}
+  if results.unstaged_name_status_code == 0 then
+    for _, line in ipairs(results.unstaged_name_status) do
+      local status, file = parse_name_status_line(line)
+      if status and file then unstaged_status_by_file[file] = status end
+    end
+  end
+
+  local tracked_files_with_hunks = {}
+  for _, h in ipairs(all_hunks) do
+    tracked_files_with_hunks[h.file] = true
+    h.git_status = h.staged and staged_status_by_file[h.file] or unstaged_status_by_file[h.file]
+  end
+  if results.staged_name_status_code == 0 then
+    for file, status in pairs(staged_status_by_file) do
       if file and not tracked_files_with_hunks[file] then
         -- File has staged changes but no hunks (empty new file, binary, etc.)
         all_hunks[#all_hunks + 1] = {
@@ -1005,13 +1077,13 @@ local function collect_items_from_git(cwd, cb, _ctx)
           added = 0,
           removed = 0,
           status = status,
+          git_status = status,
         }
       end
     end
   end
   if results.unstaged_name_status_code == 0 then
-    for _, line in ipairs(results.unstaged_name_status) do
-      local status, file = parse_name_status_line(line)
+    for file, status in pairs(unstaged_status_by_file) do
       if file and not tracked_files_with_hunks[file] then
         all_hunks[#all_hunks + 1] = {
           file = file,
@@ -1022,6 +1094,7 @@ local function collect_items_from_git(cwd, cb, _ctx)
           added = 0,
           removed = 0,
           status = status,
+          git_status = status,
         }
       end
     end
@@ -1092,6 +1165,7 @@ local function collect_items_from_git(cwd, cb, _ctx)
         removed_pad = hunk.removed,
         file_added = fs.added,
         file_removed = fs.removed,
+        git_status = hunk.git_status,
       },
     })
   end
@@ -1114,6 +1188,7 @@ local function collect_items_from_git(cwd, cb, _ctx)
         added = 0,
         removed = 0,
         stats = "new",
+        git_status = "??",
       },
     })
   end
@@ -2387,6 +2462,7 @@ local function status_sections_from_items(collected_items)
           hunks = {},
           untracked = section_name == "untracked",
           status = data.stats or data.hunk_header or "",
+          git_status = data.git_status,
         }
         section.files_by_name[filename] = file
         section.files[#section.files + 1] = file
@@ -2402,6 +2478,7 @@ local function status_sections_from_items(collected_items)
           diff = data.diff,
           staged = data.staged == true,
           context_text = data.context_text or "",
+          git_status = data.git_status,
           added = data.added or 0,
           removed = data.removed or 0,
         }
@@ -2424,6 +2501,188 @@ local function status_sections_from_items(collected_items)
   end
 
   return ordered
+end
+
+---@return table<DiffReviewStatusSectionName, DiffReviewStatusSection>
+local function status_empty_section_map()
+  local sections = {}
+  for _, section_config in ipairs(status_section_order) do
+    sections[section_config.name] = {
+      name = section_config.name,
+      title = section_config.title,
+      default_folded = section_config.default_folded,
+      files = {},
+      files_by_name = {},
+    }
+  end
+  return sections
+end
+
+---@param sections DiffReviewStatusSection[]?
+---@return table<DiffReviewStatusSectionName, DiffReviewStatusSection>
+local function status_section_map(sections)
+  local section_map = status_empty_section_map()
+  for _, section in ipairs(sections or {}) do
+    section_map[section.name] = section
+    section.files_by_name = {}
+    for _, file in ipairs(section.files or {}) do
+      section.files_by_name[file.filename] = file
+    end
+  end
+  return section_map
+end
+
+---@param section DiffReviewStatusSection
+local function status_reindex_section(section)
+  section.files_by_name = {}
+  for _, file in ipairs(section.files or {}) do
+    section.files_by_name[file.filename] = file
+  end
+end
+
+---@param section_map table<DiffReviewStatusSectionName, DiffReviewStatusSection>
+---@param section_name DiffReviewStatusSectionName
+---@param filename string
+---@return DiffReviewStatusFile?
+local function status_remove_file_from_section(section_map, section_name, filename)
+  local section = section_map[section_name]
+  if not section then return nil end
+  local removed_file = section.files_by_name and section.files_by_name[filename] or nil
+  if not removed_file then return nil end
+  for index = #section.files, 1, -1 do
+    if section.files[index].filename == filename then
+      table.remove(section.files, index)
+      break
+    end
+  end
+  status_reindex_section(section)
+  return removed_file
+end
+
+---@param section_map table<DiffReviewStatusSectionName, DiffReviewStatusSection>
+---@return DiffReviewStatusSection[]
+local function status_order_section_map(section_map)
+  local ordered = {}
+  for _, section_config in ipairs(status_section_order) do
+    local section = section_map[section_config.name]
+    table.sort(section.files, function(left_file, right_file)
+      return left_file.relpath < right_file.relpath
+    end)
+    for _, file in ipairs(section.files) do
+      file.section_name = section.name
+      file.untracked = section.name == "untracked"
+      if section.name == "untracked" then
+        file.git_status = "??"
+      elseif section.name == "staged" and file.git_status == "??" then
+        file.git_status = "A"
+      end
+      for _, hunk in ipairs(file.hunks or {}) do
+        hunk.section_name = section.name
+        hunk.staged = section.name == "staged"
+        hunk.git_status = file.git_status or hunk.git_status
+      end
+      table.sort(file.hunks, function(left_hunk, right_hunk)
+        return (left_hunk.pos or 0) < (right_hunk.pos or 0)
+      end)
+    end
+    status_reindex_section(section)
+    if #section.files > 0 then ordered[#ordered + 1] = section end
+  end
+  return ordered
+end
+
+---@param file DiffReviewStatusFile
+---@param section_name DiffReviewStatusSectionName
+---@return DiffReviewStatusFile
+local function status_copy_file_for_section(file, section_name)
+  local copied_file = vim.deepcopy(file)
+  copied_file.section_name = section_name
+  copied_file.untracked = section_name == "untracked"
+  if section_name == "untracked" then
+    copied_file.git_status = "??"
+  elseif section_name == "staged" and file.untracked then
+    copied_file.git_status = "A"
+  end
+  copied_file.hunks = copied_file.hunks or {}
+  for _, hunk in ipairs(copied_file.hunks) do
+    hunk.section_name = section_name
+    hunk.staged = section_name == "staged"
+    hunk.git_status = copied_file.git_status or hunk.git_status
+  end
+  return copied_file
+end
+
+---@param section_map table<DiffReviewStatusSectionName, DiffReviewStatusSection>
+---@param section_name DiffReviewStatusSectionName
+---@param file DiffReviewStatusFile
+---@return DiffReviewStatusFile
+local function status_ensure_file(section_map, section_name, file)
+  local section = section_map[section_name]
+  local existing_file = section.files_by_name[file.filename]
+  if existing_file then return existing_file end
+  existing_file = {
+    filename = file.filename,
+    relpath = file.relpath,
+    section_name = section_name,
+    added = 0,
+    removed = 0,
+    hunks = {},
+    untracked = section_name == "untracked",
+    status = file.status,
+    git_status = section_name == "untracked" and "??" or file.git_status,
+  }
+  section.files[#section.files + 1] = existing_file
+  section.files_by_name[file.filename] = existing_file
+  return existing_file
+end
+
+---@param sections DiffReviewStatusSection[]?
+---@param entries DiffReviewStatusEntry[]
+---@param target_section DiffReviewStatusSectionName
+---@return DiffReviewStatusSection[]?
+local function status_apply_optimistic_move(sections, entries, target_section)
+  if not sections then return nil end
+  local section_map = status_section_map(sections)
+  for _, entry in ipairs(entries) do
+    if entry.kind == "file" and entry.file then
+      local source_section = entry.file.section_name
+      if source_section ~= target_section then
+        status_remove_file_from_section(section_map, source_section, entry.file.filename)
+        local moved_file = status_copy_file_for_section(entry.file, target_section)
+        local section = section_map[target_section]
+        section.files[#section.files + 1] = moved_file
+        section.files_by_name[moved_file.filename] = moved_file
+      end
+    elseif entry.kind == "hunk" and entry.file and entry.hunk then
+      local source_file = entry.file
+      local source_section = source_file.section_name
+      if source_section ~= target_section then
+        local source = section_map[source_section] and section_map[source_section].files_by_name[source_file.filename]
+        if source then
+          for index = #source.hunks, 1, -1 do
+            if source.hunks[index].diff == entry.hunk.diff then
+              table.remove(source.hunks, index)
+              break
+            end
+          end
+          source.added = math.max(0, source.added - (entry.hunk.added or 0))
+          source.removed = math.max(0, source.removed - (entry.hunk.removed or 0))
+          if #source.hunks == 0 then
+            status_remove_file_from_section(section_map, source_section, source.filename)
+          end
+        end
+        local target_file = status_ensure_file(section_map, target_section, source_file)
+        local moved_hunk = vim.deepcopy(entry.hunk)
+        moved_hunk.section_name = target_section
+        moved_hunk.staged = target_section == "staged"
+        moved_hunk.git_status = target_file.git_status or moved_hunk.git_status
+        target_file.hunks[#target_file.hunks + 1] = moved_hunk
+        target_file.added = target_file.added + (moved_hunk.added or 0)
+        target_file.removed = target_file.removed + (moved_hunk.removed or 0)
+      end
+    end
+  end
+  return status_order_section_map(section_map)
 end
 
 ---@param cwd string
@@ -2576,6 +2835,8 @@ local function status_entry_under_cursor()
   return status.entries[vim.api.nvim_win_get_cursor(0)[1]]
 end
 
+local status_files_from_set
+
 ---@param entry DiffReviewStatusEntry?
 ---@return string[]
 local function status_files_for_entry(entry)
@@ -2660,7 +2921,7 @@ end
 
 ---@param file_set table<string, boolean>
 ---@return string[]
-local function status_files_from_set(file_set)
+function status_files_from_set(file_set)
   local files = {}
   for filename in pairs(file_set) do
     files[#files + 1] = filename
@@ -2796,13 +3057,18 @@ function M.render_status(buf, target_id, fallback_line, opts)
 
   M._status.request_id = (M._status.request_id or 0) + 1
   local request_id = M._status.request_id
-  status_set_plain_lines(buf, { "Loading DiffReview..." })
+  local has_existing_view = M._status.head_lines ~= nil or M._status.sections ~= nil
+  if not has_existing_view then
+    status_set_plain_lines(buf, { "Loading DiffReview..." })
+  end
 
   git_root_async(function(cwd, root_err)
     if not (M._status and M._status.request_id == request_id) then return end
     if not cwd then
       notify_error(root_err or "Unable to find git root")
-      status_set_plain_lines(buf, { "Not a git repository" })
+      if not has_existing_view then
+        status_set_plain_lines(buf, { "Not a git repository" })
+      end
       return
     end
 
@@ -2830,11 +3096,162 @@ local function render_status_or_notify(buf, target_id, fallback_line, opts)
   end
 end
 
+---@param target_id? string
+local function status_render_current_model(target_id)
+  local status = M._status
+  if not (status and status.buf and vim.api.nvim_buf_is_valid(status.buf) and status.head_lines and status.sections) then
+    return
+  end
+  status.fancy_rows = {}
+  status_render_loaded(status.buf, target_id, vim.api.nvim_win_get_cursor(0)[1], { reuse_sections = true }, status.head_lines, status.sections)
+end
+
+---@param entries DiffReviewStatusEntry[]
+---@param target_section DiffReviewStatusSectionName
+---@param target_id? string
+local function status_apply_optimistic_entries(entries, target_section, target_id)
+  local status = M._status
+  if not (status and status.sections) then return end
+  local next_sections = status_apply_optimistic_move(status.sections, entries, target_section)
+  if not next_sections then return end
+  status.sections = next_sections
+  status_render_current_model(target_id)
+end
+
 ---@param buf integer
 ---@param target_id? string
 local function refresh_status_after_action(buf, target_id)
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
   render_status_or_notify(buf, target_id, vim.api.nvim_win_get_cursor(0)[1])
+end
+
+---@param buf integer?
+---@param target_id? string
+local function status_request_reconcile(buf, target_id)
+  local status = M._status
+  if not status then return end
+  status.reconcile_buf = buf or status.buf
+  status.reconcile_target_id = target_id or status.reconcile_target_id
+  if not status.operation_running and #(status.operation_queue or {}) == 0 and status.reconcile_buf then
+    local reconcile_buf = status.reconcile_buf
+    local reconcile_target_id = status.reconcile_target_id
+    status.reconcile_buf = nil
+    status.reconcile_target_id = nil
+    refresh_status_after_action(reconcile_buf, reconcile_target_id)
+  end
+end
+
+---@param operation fun(done: fun())
+local function status_enqueue_operation(operation)
+  M._status = M._status or {}
+  local status = M._status
+  status.operation_queue = status.operation_queue or {}
+  status.operation_queue[#status.operation_queue + 1] = operation
+
+  local function run_next()
+    if status.operation_running then return end
+    local next_operation = table.remove(status.operation_queue, 1)
+    if not next_operation then
+      status_request_reconcile(status.reconcile_buf, status.reconcile_target_id)
+      return
+    end
+    status.operation_running = true
+    next_operation(function()
+      status.operation_running = false
+      run_next()
+    end)
+  end
+
+  run_next()
+end
+
+---@param entries DiffReviewStatusEntry[]
+---@param target_section DiffReviewStatusSectionName
+---@return DiffReviewStatusEntry[]
+local function status_action_entries_for_target(entries, target_section)
+  local action_entries = {}
+  for _, entry in ipairs(entries) do
+    if entry.kind == "file" and entry.file and entry.file.section_name ~= target_section then
+      action_entries[#action_entries + 1] = entry
+    elseif entry.kind == "hunk" and entry.hunk and entry.file and entry.hunk.staged ~= (target_section == "staged") then
+      action_entries[#action_entries + 1] = entry
+    end
+  end
+  return action_entries
+end
+
+---@param entries DiffReviewStatusEntry[]
+---@return string[] hunk_diffs
+---@return string[] files
+local function status_split_action_entries(entries)
+  local hunk_diffs = {}
+  local files_to_move = {}
+  for _, entry in ipairs(entries) do
+    if entry.kind == "hunk" and entry.hunk then
+      hunk_diffs[#hunk_diffs + 1] = entry.hunk.diff
+    elseif entry.kind == "file" and entry.file then
+      files_to_move[entry.file.filename] = true
+    end
+  end
+  return hunk_diffs, status_files_from_set(files_to_move)
+end
+
+---@param entry DiffReviewStatusEntry
+---@return boolean
+local function status_entry_is_added(entry)
+  return git_status_is_added((entry.file and entry.file.git_status) or (entry.hunk and entry.hunk.git_status))
+end
+
+---@param entries DiffReviewStatusEntry[]
+---@return DiffReviewStatusEntry[]
+local function status_unstage_action_entries(entries)
+  local action_entries = {}
+  for _, entry in ipairs(entries) do
+    if entry.kind == "file" and entry.file and entry.file.section_name == "staged" then
+      action_entries[#action_entries + 1] = entry
+    elseif entry.kind == "hunk" and entry.hunk and entry.hunk.staged then
+      action_entries[#action_entries + 1] = entry
+    end
+  end
+  return action_entries
+end
+
+---@param entries DiffReviewStatusEntry[]
+---@return DiffReviewStatusEntry[] tracked_entries
+---@return DiffReviewStatusEntry[] added_entries
+local function status_partition_unstage_entries(entries)
+  local tracked_entries = {}
+  local added_entries = {}
+  for _, entry in ipairs(entries) do
+    if status_entry_is_added(entry) then
+      added_entries[#added_entries + 1] = entry
+    else
+      tracked_entries[#tracked_entries + 1] = entry
+    end
+  end
+  return tracked_entries, added_entries
+end
+
+---@param entries DiffReviewStatusEntry[]
+---@return string[] hunk_diffs
+---@return string[] tracked_files
+---@return string[] added_files
+local function status_split_unstage_entries(entries)
+  local hunk_diffs = {}
+  local tracked_files = {}
+  local added_files = {}
+  for _, entry in ipairs(entries) do
+    if entry.kind == "hunk" and entry.hunk then
+      hunk_diffs[#hunk_diffs + 1] = entry.hunk.diff
+    elseif entry.kind == "file" and entry.file then
+      if status_entry_is_added(entry) then
+        added_files[entry.file.filename] = true
+      else
+        tracked_files[entry.file.filename] = true
+      end
+    end
+  end
+  return hunk_diffs, status_files_from_set(tracked_files), status_files_from_set(added_files)
 end
 
 ---@param entries DiffReviewStatusEntry[]
@@ -2843,26 +3260,22 @@ local function status_stage_entries(entries)
   local expanded_entries = status_expanded_entries(entries)
   if #expanded_entries == 0 then return end
 
-  local first_id = expanded_entries[1].id
-  local files_to_stage = {}
-  local hunk_diffs = {}
-  for _, entry in ipairs(expanded_entries) do
-    if entry.kind == "hunk" and not entry.hunk.staged then
-      hunk_diffs[#hunk_diffs + 1] = entry.hunk.diff
-    elseif entry.kind == "file" and entry.file.section_name ~= "staged" then
-      files_to_stage[entry.file.filename] = true
-    end
-  end
+  local action_entries = status_action_entries_for_target(expanded_entries, "staged")
+  if #action_entries == 0 then return end
 
+  local first_id = action_entries[1].id
+  local hunk_diffs, files = status_split_action_entries(action_entries)
   local staged_hunks = 0
   local staged_files = 0
-  local files = status_files_from_set(files_to_stage)
+  local status_buf = M._status and M._status.buf
+
+  status_apply_optimistic_entries(action_entries, "staged", first_id)
 
   local function finish()
     if staged_hunks > 0 or staged_files > 0 then
       status_notify_action("Staged", staged_hunks, staged_files)
-      refresh_status_after_action(M._status.buf, first_id)
     end
+    status_request_reconcile(status_buf, first_id)
   end
 
   local function stage_files_after_hunks()
@@ -2888,7 +3301,14 @@ local function status_stage_entries(entries)
     end)
   end
 
-  stage_hunk_at(1)
+  status_enqueue_operation(function(done)
+    local original_finish = finish
+    finish = function()
+      original_finish()
+      done()
+    end
+    stage_hunk_at(1)
+  end)
 end
 
 ---@param entry DiffReviewStatusEntry?
@@ -2903,36 +3323,48 @@ local function status_unstage_entries(entries)
   local expanded_entries = status_expanded_entries(entries)
   if #expanded_entries == 0 then return end
 
-  local first_id = expanded_entries[1].id
-  local files_to_unstage = {}
-  local hunk_diffs = {}
-  for _, entry in ipairs(expanded_entries) do
-    if entry.kind == "hunk" and entry.hunk.staged then
-      hunk_diffs[#hunk_diffs + 1] = entry.hunk.diff
-    elseif entry.kind == "file" and entry.file.section_name == "staged" then
-      files_to_unstage[entry.file.filename] = true
-    end
-  end
+  local action_entries = status_unstage_action_entries(expanded_entries)
+  if #action_entries == 0 then return end
 
+  local first_id = action_entries[1].id
+  local tracked_entries, added_entries = status_partition_unstage_entries(action_entries)
+  local hunk_diffs, files, added_files = status_split_unstage_entries(action_entries)
   local unstaged_hunks = 0
   local unstaged_files = 0
-  local files = status_files_from_set(files_to_unstage)
+  local status_buf = M._status and M._status.buf
+
+  status_apply_optimistic_entries(tracked_entries, "unstaged", first_id)
+  status_apply_optimistic_entries(added_entries, "untracked", first_id)
 
   local function finish()
     if unstaged_hunks > 0 or unstaged_files > 0 then
       status_notify_action("Unstaged", unstaged_hunks, unstaged_files)
-      refresh_status_after_action(M._status.buf, first_id)
     end
+    status_request_reconcile(status_buf, first_id)
   end
 
   local function unstage_files_after_hunks()
     if #files == 0 then
-      finish()
+      if #added_files == 0 then
+        finish()
+        return
+      end
+      M.unstage_added_files_async(added_files, function(result)
+        unstaged_files = unstaged_files + #result.successes
+        finish()
+      end)
       return
     end
     M.unstage_files_async(files, function(result)
-      unstaged_files = #result.successes
-      finish()
+      unstaged_files = unstaged_files + #result.successes
+      if #added_files == 0 then
+        finish()
+        return
+      end
+      M.unstage_added_files_async(added_files, function(added_result)
+        unstaged_files = unstaged_files + #added_result.successes
+        finish()
+      end)
     end)
   end
 
@@ -2948,7 +3380,14 @@ local function status_unstage_entries(entries)
     end)
   end
 
-  unstage_hunk_at(1)
+  status_enqueue_operation(function(done)
+    local original_finish = finish
+    finish = function()
+      original_finish()
+      done()
+    end
+    unstage_hunk_at(1)
+  end)
 end
 
 ---@param entry DiffReviewStatusEntry?
@@ -3015,7 +3454,10 @@ local function status_discard_entries(entries, target_id)
               next_entry()
               return
             end
-            run_git_at_root_async(cwd, { "restore", "--staged", "--", relpath }, nil, function(restore_result)
+            local unstage_args = git_status_is_added(entry.file.git_status)
+              and { "rm", "--cached", "--ignore-unmatch", "--", relpath }
+              or { "restore", "--staged", "--", relpath }
+            run_git_at_root_async(cwd, unstage_args, nil, function(restore_result)
               if restore_result.ok then
                 local delete_code = delete_path(entry.file.filename)
                 if delete_code ~= 0 then

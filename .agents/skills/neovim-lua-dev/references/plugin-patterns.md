@@ -449,8 +449,31 @@ end)
 ```
 
 This prevents slow callbacks from repainting stale data after a newer refresh
-has already completed. Render a cheap loading state immediately, then replace it
-when the async data is ready.
+has already completed. Design responsive UIs around an explicit UI model that is
+separate from backend state: user actions update the UI model immediately, then
+an async process updates Git/backend state and reconciles the model when it
+finishes. Render a cheap spinner or `...` loading state only for the first load
+or when there is no useful previous model; during action-triggered refreshes,
+keep the existing UI visible until async data is ready.
+
+For status/list UIs, prefer optimistic in-memory state over a loading flash:
+
+```lua
+apply_optimistic_change(state.sections, action)
+render(state.sections)
+enqueue_git_operation(function(done)
+  run_git_async(action, function(result)
+    if result.code ~= 0 then notify_failure(result) end
+    mark_needs_reconcile()
+    done()
+  end)
+end)
+```
+
+If the user stages and immediately unstages before Git finishes, the second
+action should operate on the optimistic state and the underlying Git commands
+must run FIFO. Reconcile from Git once the queue is idle, not after each command
+while later queued commands are still pending.
 
 Run Git index mutations asynchronously but sequentially inside a batch. Parallel
 `git add`, `git restore --staged`, `git checkout`, or `git apply --cached`

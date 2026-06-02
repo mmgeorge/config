@@ -1,0 +1,431 @@
+vim.loader.enable(false)
+
+local diff_review = require("diff_review")
+local original_notify = vim.notify
+
+local root = "D:/diffreview-flow-root"
+local calls = {}
+local deletes = {}
+local state = {}
+
+local function assert_true(condition, message)
+  if not condition then error(message, 2) end
+end
+
+local function command_key(command)
+  return table.concat(command, "\t")
+end
+
+local function record(kind, command, input)
+  calls[#calls + 1] = {
+    kind = kind,
+    command = vim.deepcopy(command),
+    key = command_key(command),
+    input = input,
+  }
+end
+
+local function reset_calls()
+  calls = {}
+  deletes = {}
+end
+
+local function reset_state(next_state)
+  state = {
+    modified = next_state.modified or {},
+    staged_modified = next_state.staged_modified or {},
+    untracked = next_state.untracked or {},
+    staged_added = next_state.staged_added or {},
+  }
+  reset_calls()
+end
+
+local function sorted_keys(map)
+  local keys = {}
+  for key in pairs(map) do
+    keys[#keys + 1] = key
+  end
+  table.sort(keys)
+  return keys
+end
+
+local function modified_diff(relpath)
+  return table.concat({
+    "diff --git a/" .. relpath .. " b/" .. relpath,
+    "index 1111111..2222222 100644",
+    "--- a/" .. relpath,
+    "+++ b/" .. relpath,
+    "@@ -1 +1 @@",
+    "-old",
+    "+new",
+  }, "\n")
+end
+
+local function added_diff(relpath)
+  return table.concat({
+    "diff --git a/" .. relpath .. " b/" .. relpath,
+    "new file mode 100644",
+    "index 0000000..3333333",
+    "--- /dev/null",
+    "+++ b/" .. relpath,
+    "@@ -0,0 +1 @@",
+    "+new",
+  }, "\n")
+end
+
+local function joined_diff(files, builder)
+  local diffs = {}
+  for _, relpath in ipairs(sorted_keys(files)) do
+    diffs[#diffs + 1] = builder(relpath)
+  end
+  return table.concat(diffs, "\n")
+end
+
+local function name_status(files, status)
+  local lines = {}
+  for _, relpath in ipairs(sorted_keys(files)) do
+    lines[#lines + 1] = status .. "\t" .. relpath
+  end
+  return lines
+end
+
+local function input_relpath(input)
+  return tostring(input or ""):match("diff %-%-git a/([^%s]+) b/")
+end
+
+local function output_lines(text)
+  if text == "" then return {} end
+  return vim.split(text, "\n", { plain = true })
+end
+
+---@type DiffReviewGitBackend
+local backend = {}
+
+function backend.systemlist(command)
+  record("systemlist", command)
+  local key = command_key(command)
+
+  if key == "git\trev-parse\t--show-toplevel" then
+    return { root }, 0
+  end
+  if key == "git\t-C\t" .. root .. "\trev-parse\t--short\tHEAD" then
+    return { "abc1234" }, 0
+  end
+  if key == "git\t-C\t" .. root .. "\trev-parse\t--abbrev-ref\tHEAD" then
+    return { "master" }, 0
+  end
+  if key == "git\t-C\t" .. root .. "\tlog\t-1\t--format=%s" then
+    return { "status flow test" }, 0
+  end
+  if key:find("@{upstream}", 1, true) or key:find("@{push}", 1, true) then
+    return {}, 1
+  end
+  if key == "git\t-C\t" .. root .. "\tls-files\t--others\t--exclude-standard" then
+    return sorted_keys(state.untracked), 0
+  end
+  if key == "git\t-C\t" .. root .. "\tdiff\t--name-status" then
+    return name_status(state.modified, "M"), 0
+  end
+  if key == "git\t-C\t" .. root .. "\tdiff\t--cached\t--name-status" then
+    local lines = name_status(state.staged_modified, "M")
+    vim.list_extend(lines, name_status(state.staged_added, "A"))
+    table.sort(lines)
+    return lines, 0
+  end
+  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff" then
+    return output_lines(joined_diff(state.modified, modified_diff)), 0
+  end
+  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--cached" then
+    local text = joined_diff(state.staged_modified, modified_diff)
+    local added = joined_diff(state.staged_added, added_diff)
+    if text ~= "" and added ~= "" then text = text .. "\n" .. added else text = text .. added end
+    return output_lines(text), 0
+  end
+
+  return {}, 1
+end
+
+function backend.systemlist_async(command, cb)
+  record("systemlist_async", command)
+  vim.defer_fn(function()
+    local output, code = backend.systemlist(command)
+    cb(output, code)
+  end, 5)
+end
+
+function backend.system(command, input)
+  record("system", command, input)
+  local key = command_key(command)
+  local relpath = command[#command]
+
+  if key:find("\tadd\t--\t", 1, true) then
+    if state.untracked[relpath] then
+      state.untracked[relpath] = nil
+      state.staged_added[relpath] = true
+      return "", 0
+    end
+    if state.modified[relpath] then
+      state.modified[relpath] = nil
+      state.staged_modified[relpath] = true
+      return "", 0
+    end
+    return "add failed for " .. relpath, 1
+  end
+
+  if key:find("\trestore\t--staged\t--\t", 1, true) then
+    if state.staged_modified[relpath] then
+      state.staged_modified[relpath] = nil
+      state.modified[relpath] = true
+      return "", 0
+    end
+    if state.staged_added[relpath] then
+      return "error: pathspec '" .. relpath .. "' did not match any file(s) known to git", 1
+    end
+    return "restore --staged failed for " .. relpath, 1
+  end
+
+  if key:find("\trm\t--cached\t--ignore-unmatch\t--\t", 1, true) then
+    if state.staged_added[relpath] then
+      state.staged_added[relpath] = nil
+      state.untracked[relpath] = true
+    end
+    return "", 0
+  end
+
+  if key:find("\tcheckout\tHEAD\t--\t", 1, true) then
+    if state.modified[relpath] then
+      state.modified[relpath] = nil
+      return "", 0
+    end
+    if state.staged_modified[relpath] then
+      state.staged_modified[relpath] = nil
+      return "", 0
+    end
+    return "checkout failed for " .. relpath, 1
+  end
+
+  if key:find("\tapply\t", 1, true) then
+    relpath = input_relpath(input)
+    if not relpath then return "missing patch file header", 1 end
+    local cached = key:find("\t--cached", 1, true) ~= nil
+    local reverse = key:find("\t--reverse", 1, true) ~= nil
+    local index = key:find("\t--index", 1, true) ~= nil
+    if cached and reverse then
+      state.staged_modified[relpath] = nil
+      state.modified[relpath] = true
+    elseif cached then
+      state.modified[relpath] = nil
+      state.staged_modified[relpath] = true
+    elseif reverse and index then
+      state.staged_modified[relpath] = nil
+    elseif reverse then
+      state.modified[relpath] = nil
+    end
+    return "", 0
+  end
+
+  return "unexpected command: " .. key, 1
+end
+
+function backend.system_async(command, input, cb)
+  record("system_async", command, input)
+  vim.defer_fn(function()
+    local output, code = backend.system(command, input)
+    cb({
+      code = code,
+      stdout = output,
+      stderr = "",
+      output = output,
+    })
+  end, 10)
+end
+
+function backend.delete(path)
+  deletes[#deletes + 1] = path
+  local relpath = path:gsub("\\", "/"):gsub("^" .. vim.pesc(root) .. "/", "")
+  state.untracked[relpath] = nil
+  return 0
+end
+
+local function wait_for(condition, message)
+  assert_true(vim.wait(3000, condition, 10), message)
+end
+
+local function status_lines(buf)
+  return vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+end
+
+local function buffer_contains(buf, needle)
+  for _, line in ipairs(status_lines(buf)) do
+    if line:find(needle, 1, true) then return true end
+  end
+  return false
+end
+
+local function find_row(buf, needle)
+  for index, line in ipairs(status_lines(buf)) do
+    if line:find(needle, 1, true) then return index end
+  end
+  error("missing row " .. needle .. "\n" .. table.concat(status_lines(buf), "\n"), 2)
+end
+
+local function trigger_normal_mapping(key, row)
+  vim.api.nvim_win_set_cursor(0, { row, 0 })
+  local mapping = vim.fn.maparg(key, "n", false, true)
+  assert_true(type(mapping.callback) == "function", "missing normal mapping for " .. key)
+  mapping.callback()
+end
+
+local function confirm_yes()
+  local mapping = vim.fn.maparg("y", "n", false, true)
+  assert_true(type(mapping.callback) == "function", "missing confirm yes mapping")
+  mapping.callback()
+end
+
+local function saw_system_call(expected_key)
+  for _, call in ipairs(calls) do
+    if call.kind == "system" and call.key == expected_key then return true end
+  end
+  return false
+end
+
+local function saw_system_call_containing(needle)
+  for _, call in ipairs(calls) do
+    if call.kind == "system" and call.key:find(needle, 1, true) then return true end
+  end
+  return false
+end
+
+local function render_and_wait(buf, needle)
+  diff_review.render_status(buf)
+  wait_for(function() return buffer_contains(buf, needle) end, "status did not render " .. needle)
+end
+
+local function assert_path_helpers()
+  local relpath, err = diff_review._repo_relative_for_test("D:\\Repo\\App\\src\\main.rs", "d:/repo/app", true)
+  assert_true(relpath == "src/main.rs", "windows drive/backslash path failed: " .. tostring(relpath or err))
+
+  relpath, err = diff_review._repo_relative_for_test("D:/Repo/App/src/main.rs", "D:/Repo/App", true)
+  assert_true(relpath == "src/main.rs", "windows slash path failed: " .. tostring(relpath or err))
+
+  relpath, err = diff_review._repo_relative_for_test("/home/matt/project/src/lib.lua", "/home/matt/project", false)
+  assert_true(relpath == "src/lib.lua", "linux path failed: " .. tostring(relpath or err))
+
+  relpath, err = diff_review._repo_relative_for_test("/Users/matt/Project/src/init.lua", "/Users/matt/Project", false)
+  assert_true(relpath == "src/init.lua", "macos path failed: " .. tostring(relpath or err))
+
+  relpath = diff_review._repo_relative_for_test("/Users/matt/Project/src/init.lua", "/Users/matt/project", false)
+  assert_true(relpath == nil, "case-sensitive unix-style path should reject mismatched root")
+end
+
+local function run()
+  assert_path_helpers()
+  diff_review.set_git_backend(backend)
+  vim.notify = function() end
+  diff_review.setup()
+  diff_review.open()
+  local buf = vim.api.nvim_get_current_buf()
+
+  reset_state({ modified = { ["mod.txt"] = true } })
+  render_and_wait(buf, "mod.txt +1 -1")
+  trigger_normal_mapping("S", find_row(buf, "mod.txt"))
+  wait_for(function() return saw_system_call("git\t-C\t" .. root .. "\tadd\t--\tmod.txt") end, "tracked stage did not run git add")
+  wait_for(function() return buffer_contains(buf, "Staged changes (1)") end, "tracked stage did not reconcile")
+  reset_calls()
+  trigger_normal_mapping("U", find_row(buf, "mod.txt"))
+  wait_for(function()
+    return saw_system_call("git\t-C\t" .. root .. "\trestore\t--staged\t--\tmod.txt")
+  end, "tracked unstage did not run restore --staged")
+  wait_for(function() return buffer_contains(buf, "Unstaged changes (1)") end, "tracked unstage did not reconcile")
+
+  reset_state({ modified = { ["hunk-stage.txt"] = true } })
+  render_and_wait(buf, "hunk-stage.txt +1 -1")
+  trigger_normal_mapping("<Tab>", find_row(buf, "hunk-stage.txt"))
+  wait_for(function() return buffer_contains(buf, "@@ +1 -1") end, "hunk row did not render")
+  trigger_normal_mapping("S", find_row(buf, "@@ +1 -1"))
+  wait_for(function()
+    return saw_system_call_containing("\tapply\t--cached\t--whitespace=nowarn\t-")
+  end, "hunk stage did not run cached apply")
+  wait_for(function() return buffer_contains(buf, "Staged changes (1)") end, "hunk stage did not reconcile")
+  reset_calls()
+  trigger_normal_mapping("<Tab>", find_row(buf, "hunk-stage.txt"))
+  wait_for(function() return buffer_contains(buf, "@@ +1 -1") end, "staged hunk row did not render")
+  trigger_normal_mapping("U", find_row(buf, "@@ +1 -1"))
+  wait_for(function()
+    return saw_system_call_containing("\tapply\t--cached\t--reverse\t--whitespace=nowarn\t-")
+  end, "hunk unstage did not run reverse cached apply")
+  wait_for(function() return buffer_contains(buf, "Unstaged changes (1)") end, "hunk unstage did not reconcile")
+
+  reset_state({ untracked = { ["new.txt"] = true } })
+  render_and_wait(buf, "new.txt new")
+  trigger_normal_mapping("S", find_row(buf, "new.txt"))
+  wait_for(function() return buffer_contains(buf, "Staged changes (1)") end, "untracked optimistic stage did not render")
+  reset_calls()
+  trigger_normal_mapping("U", find_row(buf, "new.txt"))
+  wait_for(function()
+    return saw_system_call("git\t-C\t" .. root .. "\trm\t--cached\t--ignore-unmatch\t--\tnew.txt")
+  end, "staged addition unstage did not run rm --cached")
+  assert_true(
+    not saw_system_call("git\t-C\t" .. root .. "\trestore\t--staged\t--\tnew.txt"),
+    "staged addition unstage used restore --staged"
+  )
+  wait_for(function() return buffer_contains(buf, "Untracked files (1)") end, "staged addition did not return to untracked")
+
+  reset_state({ untracked = { ["ignore-u.txt"] = true } })
+  render_and_wait(buf, "ignore-u.txt new")
+  reset_calls()
+  trigger_normal_mapping("U", find_row(buf, "ignore-u.txt"))
+  vim.wait(50)
+  assert_true(#calls == 0, "U on untracked file should not run git")
+
+  reset_state({ untracked = { ["delete-untracked.txt"] = true } })
+  render_and_wait(buf, "delete-untracked.txt new")
+  trigger_normal_mapping("j", find_row(buf, "delete-untracked.txt"))
+  confirm_yes()
+  wait_for(function() return #deletes == 1 end, "discard untracked did not delete the file")
+  wait_for(function() return not buffer_contains(buf, "delete-untracked.txt") end, "discard untracked did not refresh")
+
+  reset_state({ modified = { ["discard-modified.txt"] = true } })
+  render_and_wait(buf, "discard-modified.txt +1 -1")
+  trigger_normal_mapping("j", find_row(buf, "discard-modified.txt"))
+  confirm_yes()
+  wait_for(function()
+    return saw_system_call("git\t-C\t" .. root .. "\tcheckout\tHEAD\t--\tdiscard-modified.txt")
+  end, "discard tracked file did not run checkout")
+  wait_for(function() return not buffer_contains(buf, "discard-modified.txt") end, "discard tracked file did not refresh")
+
+  reset_state({ modified = { ["discard-hunk.txt"] = true } })
+  render_and_wait(buf, "discard-hunk.txt +1 -1")
+  trigger_normal_mapping("<Tab>", find_row(buf, "discard-hunk.txt"))
+  wait_for(function() return buffer_contains(buf, "@@ +1 -1") end, "discard hunk row did not render")
+  reset_calls()
+  trigger_normal_mapping("j", find_row(buf, "@@ +1 -1"))
+  confirm_yes()
+  wait_for(function()
+    return saw_system_call_containing("\tapply\t--reverse\t--whitespace=nowarn\t-")
+  end, "discard hunk did not run reverse apply")
+  wait_for(function() return not buffer_contains(buf, "discard-hunk.txt") end, "discard hunk did not refresh")
+
+  reset_state({ staged_added = { ["discard-added.txt"] = true } })
+  render_and_wait(buf, "discard-added.txt +1 -0")
+  trigger_normal_mapping("j", find_row(buf, "discard-added.txt"))
+  confirm_yes()
+  wait_for(function()
+    return saw_system_call("git\t-C\t" .. root .. "\tcheckout\tHEAD\t--\tdiscard-added.txt")
+      and saw_system_call("git\t-C\t" .. root .. "\trm\t--cached\t--ignore-unmatch\t--\tdiscard-added.txt")
+      and #deletes == 1
+  end, "discard staged addition did not unstage with rm --cached and delete")
+  assert_true(
+    not saw_system_call("git\t-C\t" .. root .. "\trestore\t--staged\t--\tdiscard-added.txt"),
+    "discard staged addition used restore --staged"
+  )
+end
+
+local ok, err = xpcall(run, debug.traceback)
+diff_review.reset_git_backend()
+vim.notify = original_notify
+if not ok then
+  vim.api.nvim_err_writeln(err)
+  vim.cmd("cquit")
+end
+vim.cmd("qa!")

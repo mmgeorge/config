@@ -93,6 +93,12 @@ non-interactive helper paths. Keep index-mutating git operations asynchronous
 but sequential within a batch so tests and production avoid `.git/index.lock`
 races.
 
+For status actions, do not replace an already-rendered status buffer with a
+generic loading line. Apply an optimistic in-memory section update immediately,
+enqueue the Git operation, and reconcile from Git after the operation queue is
+idle. This keeps rapid actions such as stage-then-unstage ordered without UI
+flashing.
+
 Tree-sitter context lookup must use async `LanguageTree:parse(range, on_parse)`
 with a cached fallback-render-then-upgrade flow. Do not call synchronous
 `parser:parse()` from DiffReview renderers, keymaps, autocmds, or preview

@@ -176,6 +176,11 @@ If diagnostics still look wrong, run the linter directly (e.g. `luacheck`,
 - **Async refresh state:** long-running refreshes need a request id or equivalent
   cancellation token. Start a new id for each refresh and ignore callbacks from
   older ids so slow Git/process results cannot repaint stale data over newer UI.
+- **Responsive async UI state:** keep an explicit UI model that can update
+  immediately when the user acts, then trigger the backend process asynchronously
+  and reconcile when it finishes. Do not replace an already-rendered status/list
+  buffer with a generic loading line during action refreshes; only show a
+  spinner/`...` state when there is no previous useful UI state to display.
 - **Git index mutations:** keep index-writing commands (`git add`,
   `git restore --staged`, `git apply --cached`, checkout/restore fallbacks)
   asynchronous but sequential within a batch. Running multiple index writers in
