@@ -390,6 +390,73 @@ creating folds.
 
 ## Git Integration Patterns
 
+### Async Tree-sitter in UI Plugins
+
+Tree-sitter parsing can be expensive enough to jank status buffers and previews.
+When parse work is needed during rendering, use `LanguageTree:parse(range,
+on_parse)` instead of synchronous `parser:parse()`. Render a cheap fallback
+first, cache a pending sentinel, and repaint only when the async parse callback
+fills the cache.
+
+```lua
+local request_id = state.request_id
+parser:parse({ row, 0, row + 1, 0 }, function(first, second)
+  local trees = type(first) == "table" and first or second
+  vim.schedule(function()
+    if state.request_id ~= request_id then return end
+    state.context_cache[key] = context_from_trees(trees) or false
+    render()
+  end)
+end)
+```
+
+Avoid synchronous parsing in renderers, previews, keymaps, cursor handlers, and
+autocmds. If the async context is optional, prefer showing the Git/parser
+fallback immediately and upgrading the label after parsing completes.
+
+### Async Git in UI Plugins
+
+Use `vim.system({ ... }, { text = true }, on_exit)` for Git/process calls from
+interactive plugin code. Avoid `vim.fn.system()`, `vim.fn.systemlist()`, and
+`vim.system(...):wait()` in render paths, keymaps, autocmds, cursor handlers, or
+anything that can run while the user is waiting for the editor.
+
+Process callbacks must schedule editor mutations back onto the main loop:
+
+```lua
+vim.system({ "git", "-C", root, "status", "--short" }, { text = true }, function(result)
+  vim.schedule(function()
+    if result.code ~= 0 then
+      vim.notify(result.stderr ~= "" and result.stderr or "git status failed", vim.log.levels.ERROR)
+      return
+    end
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.split(result.stdout, "\n", { plain = true }))
+  end)
+end)
+```
+
+Every async refresh should have a monotonically increasing request id:
+
+```lua
+state.request_id = (state.request_id or 0) + 1
+local request_id = state.request_id
+vim.system(cmd, { text = true }, function(result)
+  vim.schedule(function()
+    if state.request_id ~= request_id then return end
+    render(result)
+  end)
+end)
+```
+
+This prevents slow callbacks from repainting stale data after a newer refresh
+has already completed. Render a cheap loading state immediately, then replace it
+when the async data is ready.
+
+Run Git index mutations asynchronously but sequentially inside a batch. Parallel
+`git add`, `git restore --staged`, `git checkout`, or `git apply --cached`
+commands can race on `.git/index.lock`. Sequential callbacks keep the UI
+responsive without corrupting the batch.
+
 ### Parsing Unified Diff
 
 The `@@ -old,count +new,count @@ context` header:
@@ -400,9 +467,16 @@ The `@@ -old,count +new,count @@ context` header:
 ### Staging Individual Hunks
 
 ```lua
-vim.fn.system(
+vim.system(
   { "git", "-C", cwd, "apply", "--cached", "--whitespace=nowarn", "-" },
-  patch_text .. "\n"  -- MUST end with newline
+  { text = true, stdin = patch_text .. "\n" },
+  function(result)
+    vim.schedule(function()
+      if result.code ~= 0 then
+        vim.notify(result.stderr ~= "" and result.stderr or "stage failed", vim.log.levels.ERROR)
+      end
+    end)
+  end
 )
 ```
 
@@ -419,13 +493,17 @@ but NO `@@` hunk header. Your parser must handle this case by checking
 `git diff --name-status` for files that have no hunks:
 
 ```lua
-local name_status = vim.fn.systemlist({ "git", "-C", cwd, "diff", "--cached", "--name-status" })
-for _, line in ipairs(name_status) do
-  local status, file = line:match("^(%S+)%s+(.+)$")
-  if file and not files_with_hunks[file] then
-    -- Handle file with no hunks (empty new file, binary, etc.)
+vim.system({ "git", "-C", cwd, "diff", "--cached", "--name-status" }, { text = true }, function(result)
+  vim.schedule(function()
+    if result.code ~= 0 then return end
+    for _, line in ipairs(vim.split(result.stdout or "", "\n", { plain = true })) do
+      local status, file = line:match("^(%S+)%s+(.+)$")
+      if file and not files_with_hunks[file] then
+        -- Handle file with no hunks (empty new file, binary, etc.)
+      end
+    end
   end
-end
+end)
 ```
 
 ### Untracked Files: Synthesize the Diff, Don't Ask Git
@@ -474,11 +552,12 @@ nvim — git would block waiting for an editor it can't reach. The trick (lifted
 from Neogit, see `diff_review_commit.lua`): point `GIT_EDITOR` at a **headless
 child nvim** that RPCs back to the parent.
 
-1. Run `git commit` via `jobstart` with `env = { GIT_EDITOR = <headless cmd>,
-   NVIM = vim.v.servername }`. Stream stdout/stderr into a console buffer shown
-   in the **existing diff-preview window** above the Trouble pane (save its
-   buffer + winbar first to restore later) — no new float. This is where
-   pre-commit hook output shows up, *before* the editor opens.
+1. Run `git commit` via `vim.system({ "git", "commit" }, opts, on_exit)` with
+   `env = { GIT_EDITOR = <headless cmd>, NVIM = vim.v.servername }`. Stream
+   stdout/stderr callbacks into a console buffer shown in the **existing
+   diff-preview window** above the Trouble pane (save its buffer + winbar first
+   to restore later) — no new float. This is where pre-commit hook output shows
+   up, *before* the editor opens.
 2. `GIT_EDITOR` is `nvim --headless --clean … -c "lua require('…').client()"`.
    Built with `vim.fn.shellescape` per token (git parses it with a shell). The
    `--clean` child needs `set runtimepath^=<config root>` to find the module.

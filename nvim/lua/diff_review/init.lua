@@ -7,8 +7,19 @@
 ---@field ok boolean
 ---@field code integer
 ---@field output string
+---@field stdout? string
+---@field stderr? string
 ---@field root? string
 ---@field args DiffReviewGitCommand
+
+---@class DiffReviewGitAsyncResult
+---@field code integer
+---@field stdout string
+---@field stderr string
+---@field output string
+
+---@alias DiffReviewGitTextCallback fun(result: DiffReviewGitAsyncResult)
+---@alias DiffReviewGitListCallback fun(output: string[], code: integer, stderr?: string)
 
 ---@class DiffReviewGitFailure
 ---@field file? string
@@ -22,8 +33,9 @@
 ---@class DiffReviewGitBackend
 ---@field systemlist? fun(command: DiffReviewGitCommand): string[]|string, integer?
 ---@field system? fun(command: DiffReviewGitCommand, input?: string): string, integer?
+---@field systemlist_async? fun(command: DiffReviewGitCommand, cb: DiffReviewGitListCallback)
+---@field system_async? fun(command: DiffReviewGitCommand, input: string?, cb: DiffReviewGitTextCallback)
 ---@field delete? fun(path: string): integer
----@field jobstart? fun(command: DiffReviewGitCommand, opts: table): integer
 
 ---@class DiffReviewHunk
 ---@field file string
@@ -62,6 +74,10 @@
 ---@field hunk? DiffReviewHunk
 ---@field diff_line? table
 
+---@class DiffReviewTreeSitterContextPending
+---@field pending true
+---@field callbacks table<string, fun(context?: string)>
+
 ---@class DiffReviewModule
 ---@field config DiffReviewConfig?
 ---@field _git_backend DiffReviewGitBackend?
@@ -74,7 +90,7 @@
 ---@field _buf_filename table<integer, string>?
 ---@field _buf_saved_cursor table<integer, integer[]>?
 ---@field _buf_last_rendered table<integer, string>?
----@field _ts_context_cache table<string, string?>?
+---@field _ts_context_cache table<string, string|false|DiffReviewTreeSitterContextPending>?
 ---@field _main_win integer?
 ---@field _saved_wo table?
 ---@field suspend_preview boolean?
@@ -116,21 +132,10 @@ end
 
 ---@param filename string
 ---@return number?
-local function ensure_file_buffer(filename)
+local function loaded_file_buffer(filename)
   local buf = vim.fn.bufnr(filename)
-  if buf == -1 then
-    buf = vim.fn.bufadd(filename)
-    if buf == -1 then
-      return nil
-    end
-  end
-  if not vim.api.nvim_buf_is_loaded(buf) then
-    local ok = pcall(vim.fn.bufload, buf)
-    if not ok then
-      return nil
-    end
-  end
-  return vim.api.nvim_buf_is_loaded(buf) and buf or nil
+  if buf == -1 or not vim.api.nvim_buf_is_loaded(buf) then return nil end
+  return buf
 end
 
 ---@param filename string
@@ -139,8 +144,9 @@ end
 local function detect_filetype(filename, contents)
   local args = {
     filename = filename,
-    buf = ensure_file_buffer(filename) or 0,
   }
+  local buf = loaded_file_buffer(filename)
+  if buf then args.buf = buf end
   if contents then
     args.contents = contents
   end
@@ -163,38 +169,86 @@ function M.reset_git_backend()
 end
 
 ---@param command DiffReviewGitCommand
----@return string[] output
----@return integer code
-local function systemlist(command)
+---@param input? string
+---@param cb DiffReviewGitTextCallback
+local function system_text_async(command, input, cb)
   local backend = M._git_backend
-  if backend and backend.systemlist then
-    local output, code = backend.systemlist(command)
-    if type(output) == "string" then
-      output = vim.split(output, "\n", { plain = true })
-    end
-    return output or {}, code or 0
+  if backend and backend.system_async then
+    backend.system_async(command, input, cb)
+    return
   end
-  local output = vim.fn.systemlist(command)
-  return output, vim.v.shell_error
+  if backend and backend.system then
+    vim.schedule(function()
+      local output, code = backend.system(command, input)
+      local text = tostring(output or "")
+      cb({
+        code = code or 0,
+        stdout = text,
+        stderr = "",
+        output = text,
+      })
+    end)
+    return
+  end
+
+  local ok, process = pcall(vim.system, command, { text = true, stdin = input }, function(result)
+    vim.schedule(function()
+      local stdout = result.stdout or ""
+      local stderr = result.stderr or ""
+      cb({
+        code = result.code or 0,
+        stdout = stdout,
+        stderr = stderr,
+        output = stdout ~= "" and stdout or stderr,
+      })
+    end)
+  end)
+  if not ok then
+    vim.schedule(function()
+      local message = tostring(process)
+      cb({
+        code = -1,
+        stdout = "",
+        stderr = message,
+        output = message,
+      })
+    end)
+  end
+end
+
+---@param text string
+---@return string[]
+local function text_to_lines(text)
+  text = tostring(text or ""):gsub("\r\n", "\n")
+  if text:sub(-1) == "\n" then
+    text = text:sub(1, -2)
+  end
+  if text == "" then return {} end
+  return vim.split(text, "\n", { plain = true })
 end
 
 ---@param command DiffReviewGitCommand
----@param input? string
----@return string output
----@return integer code
-local function system_text(command, input)
+---@param cb DiffReviewGitListCallback
+local function systemlist_async(command, cb)
   local backend = M._git_backend
-  if backend and backend.system then
-    local output, code = backend.system(command, input)
-    return tostring(output or ""), code or 0
+  if backend and backend.systemlist_async then
+    backend.systemlist_async(command, cb)
+    return
   end
-  local output
-  if input ~= nil then
-    output = vim.fn.system(command, input)
-  else
-    output = vim.fn.system(command)
+  if backend and backend.systemlist then
+    vim.schedule(function()
+      local output, code = backend.systemlist(command)
+      if type(output) == "string" then
+        output = text_to_lines(output)
+      end
+      cb(output or {}, code or 0, "")
+    end)
+    return
   end
-  return output or "", vim.v.shell_error
+
+  system_text_async(command, nil, function(result)
+    cb(text_to_lines(result.stdout), result.code, result.stderr)
+  end)
 end
 
 ---@param path string
@@ -207,22 +261,28 @@ local function delete_path(path)
   return vim.fn.delete(path)
 end
 
----@param command DiffReviewGitCommand
----@param opts table
----@return integer job_id
-local function jobstart(command, opts)
-  local backend = M._git_backend
-  if backend and backend.jobstart then
-    return backend.jobstart(command, opts)
-  end
-  return vim.fn.jobstart(command, opts)
+---@param cb fun(root?: string, err?: string)
+local function git_root_async(cb)
+  systemlist_async({ "git", "rev-parse", "--show-toplevel" }, function(output, code)
+    local root = output[1]
+    if code ~= 0 or not root or root == "" then
+      cb(nil, "Not a git repository")
+      return
+    end
+    cb(vim.trim(root), nil)
+  end)
 end
 
 ---@return string? root
 ---@return string? err
-local function git_root()
-  local output, code = systemlist({ "git", "rev-parse", "--show-toplevel" })
-  local root = output[1]
+local function git_root_sync_for_test_backend()
+  local backend = M._git_backend
+  if not (backend and backend.systemlist) then
+    return nil, "Synchronous git root is unavailable"
+  end
+  local output, code = backend.systemlist({ "git", "rev-parse", "--show-toplevel" })
+  if type(output) == "string" then output = text_to_lines(output) end
+  local root = output and output[1]
   if code ~= 0 or not root or root == "" then
     return nil, "Not a git repository"
   end
@@ -261,25 +321,46 @@ end
 ---@param root string
 ---@param args string[]
 ---@param input? string
----@return DiffReviewGitCommandResult
-local function run_git_at_root(root, args, input)
+---@param cb fun(result: DiffReviewGitCommandResult)
+local function run_git_at_root_async(root, args, input, cb)
   local command = { "git", "-C", root }
   vim.list_extend(command, args)
-  local output, code = system_text(command, input)
-  return {
-    ok = code == 0,
-    code = code,
-    output = vim.trim(output or ""),
-    root = root,
-    args = args,
-  }
+  system_text_async(command, input, function(result)
+    cb({
+      ok = result.code == 0,
+      code = result.code,
+      output = vim.trim(result.output or ""),
+      stdout = result.stdout,
+      stderr = result.stderr,
+      root = root,
+      args = args,
+    })
+  end)
+end
+
+---@param args string[]
+---@param input? string
+---@param cb fun(result: DiffReviewGitCommandResult)
+local function run_git_async(args, input, cb)
+  git_root_async(function(root, root_err)
+    if not root then
+      cb({
+        ok = false,
+        code = -1,
+        output = root_err or "Unable to find git root",
+        args = args,
+      })
+      return
+    end
+    run_git_at_root_async(root, args, input, cb)
+  end)
 end
 
 ---@param args string[]
 ---@param input? string
 ---@return DiffReviewGitCommandResult
-local function run_git(args, input)
-  local root, root_err = git_root()
+local function run_git_sync_for_test_backend(args, input)
+  local root, root_err = git_root_sync_for_test_backend()
   if not root then
     return {
       ok = false,
@@ -288,7 +369,26 @@ local function run_git(args, input)
       args = args,
     }
   end
-  return run_git_at_root(root, args, input)
+  local backend = M._git_backend
+  if not (backend and backend.system) then
+    return {
+      ok = false,
+      code = -1,
+      output = "Synchronous git is unavailable",
+      root = root,
+      args = args,
+    }
+  end
+  local command = { "git", "-C", root }
+  vim.list_extend(command, args)
+  local output, code = backend.system(command, input)
+  return {
+    ok = (code or 0) == 0,
+    code = code or 0,
+    output = vim.trim(tostring(output or "")),
+    root = root,
+    args = args,
+  }
 end
 
 ---@param title string
@@ -300,9 +400,67 @@ end
 ---@param files string[]
 ---@param args_for_file fun(relpath: string): string[]
 ---@param title string
+---@param cb fun(result: { ok: boolean, successes: string[], failures: DiffReviewGitFailure[] })
+local function run_file_batch_async(files, args_for_file, title, cb)
+  git_root_async(function(root, root_err)
+  if not root then
+    local failures = { { message = root_err or "Unable to find git root" } }
+    M.notify_git_failures(title, failures)
+    cb({ ok = false, successes = {}, failures = failures })
+    return
+  end
+
+  local successes = {}
+  local failures = {}
+  local seen = {}
+  local tasks = {}
+
+  local function finish_all()
+    if #failures > 0 then
+      M.notify_git_failures(title, failures)
+    end
+    cb({ ok = #failures == 0, successes = successes, failures = failures })
+  end
+
+  local function run_next(index)
+    local task = tasks[index]
+    if not task then
+      finish_all()
+      return
+    end
+    run_git_at_root_async(root, task.args, nil, function(result)
+      if result.ok then
+        successes[#successes + 1] = task.filename
+      else
+        result.file = task.filename
+        failures[#failures + 1] = result
+      end
+      run_next(index + 1)
+    end)
+  end
+
+  for _, filename in ipairs(files) do
+    if filename and filename ~= "" and not seen[filename] then
+      seen[filename] = true
+      local relpath, rel_err = repo_relative(filename, root)
+      if not relpath then
+        failures[#failures + 1] = { file = filename, message = rel_err }
+      else
+        tasks[#tasks + 1] = { filename = filename, args = args_for_file(relpath) }
+      end
+    end
+  end
+
+  run_next(1)
+  end)
+end
+
+---@param files string[]
+---@param args_for_file fun(relpath: string): string[]
+---@param title string
 ---@return { ok: boolean, successes: string[], failures: DiffReviewGitFailure[] }
-local function run_file_batch(files, args_for_file, title)
-  local root, root_err = git_root()
+local function run_file_batch_sync_for_test_backend(files, args_for_file, title)
+  local root, root_err = git_root_sync_for_test_backend()
   if not root then
     local failures = { { message = root_err or "Unable to find git root" } }
     M.notify_git_failures(title, failures)
@@ -319,7 +477,7 @@ local function run_file_batch(files, args_for_file, title)
       if not relpath then
         failures[#failures + 1] = { file = filename, message = rel_err }
       else
-        local result = run_git_at_root(root, args_for_file(relpath))
+        local result = run_git_sync_for_test_backend(args_for_file(relpath))
         if result.ok then
           successes[#successes + 1] = filename
         else
@@ -329,11 +487,46 @@ local function run_file_batch(files, args_for_file, title)
       end
     end
   end
-
   if #failures > 0 then
     M.notify_git_failures(title, failures)
   end
   return { ok = #failures == 0, successes = successes, failures = failures }
+end
+
+---@param diff string?
+---@param cb fun(ok: boolean)
+function M.stage_patch_async(diff, cb)
+  if not diff or diff == "" then
+    notify_error("No patch to stage")
+    cb(false)
+    return
+  end
+  run_git_async({ "apply", "--cached", "--whitespace=nowarn", "-" }, diff .. "\n", function(result)
+    if not result.ok then
+      notify_error("Stage failed: " .. (result.output ~= "" and result.output or ("git exited " .. result.code)))
+      cb(false)
+      return
+    end
+    cb(true)
+  end)
+end
+
+---@param diff string?
+---@param cb fun(ok: boolean)
+function M.unstage_patch_async(diff, cb)
+  if not diff or diff == "" then
+    notify_error("No patch to unstage")
+    cb(false)
+    return
+  end
+  run_git_async({ "apply", "--cached", "--reverse", "--whitespace=nowarn", "-" }, diff .. "\n", function(result)
+    if not result.ok then
+      notify_error("Unstage failed: " .. (result.output ~= "" and result.output or ("git exited " .. result.code)))
+      cb(false)
+      return
+    end
+    cb(true)
+  end)
 end
 
 ---@param diff string?
@@ -343,7 +536,7 @@ function M.stage_patch(diff)
     notify_error("No patch to stage")
     return false
   end
-  local result = run_git({ "apply", "--cached", "--whitespace=nowarn", "-" }, diff .. "\n")
+  local result = run_git_sync_for_test_backend({ "apply", "--cached", "--whitespace=nowarn", "-" }, diff .. "\n")
   if not result.ok then
     notify_error("Stage failed: " .. (result.output ~= "" and result.output or ("git exited " .. result.code)))
     return false
@@ -358,7 +551,7 @@ function M.unstage_patch(diff)
     notify_error("No patch to unstage")
     return false
   end
-  local result = run_git({ "apply", "--cached", "--reverse", "--whitespace=nowarn", "-" }, diff .. "\n")
+  local result = run_git_sync_for_test_backend({ "apply", "--cached", "--reverse", "--whitespace=nowarn", "-" }, diff .. "\n")
   if not result.ok then
     notify_error("Unstage failed: " .. (result.output ~= "" and result.output or ("git exited " .. result.code)))
     return false
@@ -367,9 +560,25 @@ function M.unstage_patch(diff)
 end
 
 ---@param files string[]
+---@param cb fun(result: { ok: boolean, successes: string[], failures: DiffReviewGitFailure[] })
+function M.stage_files_async(files, cb)
+  run_file_batch_async(files, function(relpath)
+    return { "add", "--", relpath }
+  end, "Stage failed", cb)
+end
+
+---@param files string[]
+---@param cb fun(result: { ok: boolean, successes: string[], failures: DiffReviewGitFailure[] })
+function M.unstage_files_async(files, cb)
+  run_file_batch_async(files, function(relpath)
+    return { "restore", "--staged", "--", relpath }
+  end, "Unstage failed", cb)
+end
+
+---@param files string[]
 ---@return { ok: boolean, successes: string[], failures: DiffReviewGitFailure[] }
 function M.stage_files(files)
-  return run_file_batch(files, function(relpath)
+  return run_file_batch_sync_for_test_backend(files, function(relpath)
     return { "add", "--", relpath }
   end, "Stage failed")
 end
@@ -377,7 +586,7 @@ end
 ---@param files string[]
 ---@return { ok: boolean, successes: string[], failures: DiffReviewGitFailure[] }
 function M.unstage_files(files)
-  return run_file_batch(files, function(relpath)
+  return run_file_batch_sync_for_test_backend(files, function(relpath)
     return { "restore", "--staged", "--", relpath }
   end, "Unstage failed")
 end
@@ -481,18 +690,20 @@ end
 --- Run git diff and return parsed hunks
 ---@param cwd string
 ---@param staged boolean
----@return DiffReviewHunk[]
-local function get_hunks(cwd, staged)
+---@param cb fun(hunks: DiffReviewHunk[])
+local function get_hunks_async(cwd, staged, cb)
   local args = { "git", "-C", cwd, "-c", "core.quotepath=false",
     "diff", "--no-color", "--no-ext-diff" }
   if staged then
     args[#args + 1] = "--cached"
   end
-  local result, code = systemlist(args)
-  if code ~= 0 then
-    return {}
-  end
-  return parse_diff(table.concat(result, "\n"), staged)
+  systemlist_async(args, function(result, code)
+    if code ~= 0 then
+      cb({})
+      return
+    end
+    cb(parse_diff(table.concat(result, "\n"), staged))
+  end)
 end
 
 --- Order a single file's hunks by line position and split out the diff
@@ -524,22 +735,28 @@ end
 --- (nil, nil) when the file has no hunks.
 ---@param cwd string git root
 ---@param filename string absolute path
----@return string? diff_text, boolean[]? staged_flags
-local function file_diff_and_flags(cwd, filename)
+---@param cb fun(diff_text?: string, staged_flags?: boolean[])
+local function file_diff_and_flags_async(cwd, filename, cb)
   local norm = vim.fs.normalize(filename)
   local hunks = {}
+  local pending = 2
   for _, staged in ipairs({ false, true }) do
-    for _, hunk in ipairs(get_hunks(cwd, staged)) do
+    get_hunks_async(cwd, staged, function(result)
+      for _, hunk in ipairs(result) do
       if vim.fs.normalize(vim.fn.fnamemodify(cwd .. "/" .. hunk.file, ":p")) == norm then
         hunks[#hunks + 1] = hunk
       end
     end
+      pending = pending - 1
+      if pending > 0 then return end
+      local diffs, flags = order_file_hunks(hunks)
+      if #diffs == 0 then
+        cb(nil, nil)
+        return
+      end
+      cb(table.concat(diffs, "\n"), flags)
+    end)
   end
-  local diffs, flags = order_file_hunks(hunks)
-  if #diffs == 0 then
-    return nil, nil
-  end
-  return table.concat(diffs, "\n"), flags
 end
 
 --- Build a synthetic "new file" diff (every line an addition) for an untracked
@@ -572,35 +789,14 @@ local function build_untracked_diff(filename, relpath)
   return table.concat(out, "\n")
 end
 
---- Compute treesitter-based scope context for a hunk at a given line.
---- Returns a string like "MyClass.my_method" or nil if no context found.
----@param filename string absolute path
----@param line number 1-based line number
+---@param buf integer
+---@param query vim.treesitter.Query
+---@param trees TSTree[]
+---@param target integer 0-based row
 ---@return string?
-function M.compute_hunk_context(filename, line)
-  local buf = ensure_file_buffer(filename)
-  if not buf then return nil end
-
-  -- Get treesitter language
-  local ft = vim.bo[buf].filetype
-  if ft == "" then
-    ft = detect_filetype(filename)
-  end
-  local lang = vim.treesitter.language.get_lang(ft)
-  if not lang then return nil end
-
-  -- Try to load our diff_context query
-  local ok, query = pcall(vim.treesitter.query.get, lang, "diff_context")
-  if not ok or not query then return nil end
-
-  -- Get parser and parse
-  local pok, parser = pcall(vim.treesitter.get_parser, buf, lang)
-  if not pok or not parser then return nil end
-  local trees = parser:parse()
+local function hunk_context_from_trees(buf, query, trees, target)
   if not trees or #trees == 0 then return nil end
 
-  -- Find all @scope nodes that contain the target line (0-indexed)
-  local target = line - 1
   local scopes = {}
   for id, node in query:iter_captures(trees[1]:root(), buf) do
     if query.captures[id] == "scope" then
@@ -639,6 +835,95 @@ function M.compute_hunk_context(filename, line)
   return table.concat(names, ".")
 end
 
+--- Compute Tree-sitter scope context for a hunk without blocking UI render.
+---@param filename string absolute path
+---@param line number 1-based line number
+---@param cb fun(context?: string)
+function M.compute_hunk_context_async(filename, line, cb)
+  local buf = loaded_file_buffer(filename)
+  if not buf then
+    cb(nil)
+    return
+  end
+
+  local ft = vim.bo[buf].filetype
+  if ft == "" then
+    ft = detect_filetype(filename)
+  end
+  local lang = vim.treesitter.language.get_lang(ft)
+  if not lang then
+    cb(nil)
+    return
+  end
+
+  local ok, query = pcall(vim.treesitter.query.get, lang, "diff_context")
+  if not ok or not query then
+    cb(nil)
+    return
+  end
+
+  local parser_ok, parser = pcall(vim.treesitter.get_parser, buf, lang)
+  if not parser_ok or not parser then
+    cb(nil)
+    return
+  end
+
+  local target = math.max(line - 1, 0)
+  local done = false
+  local function finish(trees)
+    if done then return end
+    done = true
+    local context = hunk_context_from_trees(buf, query, trees, target)
+    cb(context)
+  end
+
+  local parse_ok, parsed = pcall(function()
+    return parser:parse({ target, 0, target + 1, 0 }, function(first, second)
+      local trees = type(first) == "table" and first or second
+      vim.schedule(function()
+        finish(trees)
+      end)
+    end)
+  end)
+  if not parse_ok then
+    cb(nil)
+  elseif parsed then
+    finish(parsed)
+  end
+end
+
+--- Return cached Tree-sitter context and kick off an async request if needed.
+---@param filename string
+---@param line number
+---@param callback_key string
+---@param on_update? fun(context?: string)
+---@return string?
+local function cached_hunk_context(filename, line, callback_key, on_update)
+  M._ts_context_cache = M._ts_context_cache or {}
+  local cache_key = filename .. ":" .. line
+  local cached = M._ts_context_cache[cache_key]
+  if cached == false then return nil end
+  if type(cached) == "string" then return cached end
+  if type(cached) == "table" and cached.pending then
+    if on_update then cached.callbacks[callback_key] = on_update end
+    return nil
+  end
+
+  M._ts_context_cache[cache_key] = {
+    pending = true,
+    callbacks = on_update and { [callback_key] = on_update } or {},
+  }
+  M.compute_hunk_context_async(filename, line, function(context)
+    local pending = M._ts_context_cache and M._ts_context_cache[cache_key]
+    local callbacks = type(pending) == "table" and pending.callbacks or {}
+    M._ts_context_cache[cache_key] = context or false
+    for _, callback in pairs(callbacks) do
+      pcall(callback, context)
+    end
+  end)
+  return nil
+end
+
 -- Cache for treesitter context per file (cleared on refresh)
 M._ts_context_cache = {}
 
@@ -665,35 +950,40 @@ function M._cleanup_diff_buffers()
   M._main_win = nil
 end
 
+---@param cwd string
 ---@param cb fun(items: table[])
 ---@param _ctx table?
-function M.get(cb, _ctx)
+local function collect_items_from_git(cwd, cb, _ctx)
   M._ts_context_cache = {} -- clear treesitter context cache on refresh
   M._untracked = {} -- map of absolute path -> repo-relative path for untracked files
-  local cwd = git_root()
-  if not cwd then
-    cb({})
-    return
-  end
+  local results = {
+    unstaged = {},
+    staged = {},
+    untracked_output = {},
+    staged_name_status = {},
+    unstaged_name_status = {},
+    untracked_code = 1,
+    staged_name_status_code = 1,
+    unstaged_name_status_code = 1,
+  }
+  local pending = 5
 
-  -- Get both unstaged and staged hunks
-  local unstaged = get_hunks(cwd, false)
-  local staged = get_hunks(cwd, true)
+  local function finish_one()
+    pending = pending - 1
+    if pending > 0 then return end
 
-  local all_hunks = {}
-  vim.list_extend(all_hunks, unstaged)
-  vim.list_extend(all_hunks, staged)
+    local all_hunks = {}
+    vim.list_extend(all_hunks, results.unstaged)
+    vim.list_extend(all_hunks, results.staged)
 
-  -- Get untracked files
-  local untracked_files = {}
-  local untracked_output, untracked_code = systemlist({ "git", "-C", cwd, "ls-files", "--others", "--exclude-standard" })
-  if untracked_code == 0 then
-    for _, f in ipairs(untracked_output) do
-      if f ~= "" then
-        untracked_files[#untracked_files + 1] = f
+    local untracked_files = {}
+    if results.untracked_code == 0 then
+      for _, filename in ipairs(results.untracked_output) do
+        if filename ~= "" then
+          untracked_files[#untracked_files + 1] = filename
+        end
       end
     end
-  end
 
   -- Get all changed files (staged + unstaged) to catch files with no hunks
   -- (e.g., empty new files, binary files)
@@ -701,9 +991,8 @@ function M.get(cb, _ctx)
   for _, h in ipairs(all_hunks) do
     tracked_files_with_hunks[h.file] = true
   end
-  local staged_name_status, staged_name_status_code = systemlist({ "git", "-C", cwd, "diff", "--cached", "--name-status" })
-  if staged_name_status_code == 0 then
-    for _, line in ipairs(staged_name_status) do
+  if results.staged_name_status_code == 0 then
+    for _, line in ipairs(results.staged_name_status) do
       local status, file = parse_name_status_line(line)
       if file and not tracked_files_with_hunks[file] then
         -- File has staged changes but no hunks (empty new file, binary, etc.)
@@ -720,9 +1009,8 @@ function M.get(cb, _ctx)
       end
     end
   end
-  local unstaged_name_status, unstaged_name_status_code = systemlist({ "git", "-C", cwd, "diff", "--name-status" })
-  if unstaged_name_status_code == 0 then
-    for _, line in ipairs(unstaged_name_status) do
+  if results.unstaged_name_status_code == 0 then
+    for _, line in ipairs(results.unstaged_name_status) do
       local status, file = parse_name_status_line(line)
       if file and not tracked_files_with_hunks[file] then
         all_hunks[#all_hunks + 1] = {
@@ -761,13 +1049,8 @@ function M.get(cb, _ctx)
     -- Use treesitter scope context if available, fall back to git's @@ context
     local context_text = hunk.context or ""
     if not (_ctx and _ctx.skip_ts_context) then
-      local cache_key = filename .. ":" .. hunk.pos
-      if not M._ts_context_cache[cache_key] then
-        local ts_ctx = M.compute_hunk_context(filename, hunk.pos)
-        M._ts_context_cache[cache_key] = ts_ctx or false -- false = no context found
-      end
-      local cached = M._ts_context_cache[cache_key]
-      if cached and cached ~= false then
+      local cached = cached_hunk_context(filename, hunk.pos, "items:" .. filename .. ":" .. hunk.pos)
+      if cached then
         context_text = cached
       end
     end
@@ -866,6 +1149,43 @@ function M.get(cb, _ctx)
       end
     end)
   end
+  end
+
+  get_hunks_async(cwd, false, function(hunks)
+    results.unstaged = hunks
+    finish_one()
+  end)
+  get_hunks_async(cwd, true, function(hunks)
+    results.staged = hunks
+    finish_one()
+  end)
+  systemlist_async({ "git", "-C", cwd, "ls-files", "--others", "--exclude-standard" }, function(output, code)
+    results.untracked_output = output
+    results.untracked_code = code
+    finish_one()
+  end)
+  systemlist_async({ "git", "-C", cwd, "diff", "--cached", "--name-status" }, function(output, code)
+    results.staged_name_status = output
+    results.staged_name_status_code = code
+    finish_one()
+  end)
+  systemlist_async({ "git", "-C", cwd, "diff", "--name-status" }, function(output, code)
+    results.unstaged_name_status = output
+    results.unstaged_name_status_code = code
+    finish_one()
+  end)
+end
+
+---@param cb fun(items: table[])
+---@param _ctx table?
+function M.get(cb, _ctx)
+  git_root_async(function(cwd)
+    if not cwd then
+      cb({})
+      return
+    end
+    collect_items_from_git(cwd, cb, _ctx)
+  end)
 end
 
 -- Cache of diff preview items keyed by filename
@@ -918,7 +1238,12 @@ local function rewrite_line_hls(line)
   end
 end
 
-local function build_fancy_diff_rows(diff_text, hunk_staged, filename)
+---@param diff_text string
+---@param hunk_staged? boolean[]
+---@param filename? string
+---@param context_callback_key? fun(hunk_line: number): string
+---@param on_context_update? fun()
+local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_callback_key, on_context_update)
   local snacks_diff = require("snacks.picker.util.diff")
 
   local diff = snacks_diff.get_diff(diff_text)
@@ -945,14 +1270,9 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename)
       local hunk_line = tonumber(range_line:match("%+(%d+)")) or 1
       local ts_context = nil
       if filename then
-        local cache_key = filename .. ":" .. hunk_line
-        if M._ts_context_cache[cache_key] == nil then
-          M._ts_context_cache[cache_key] = M.compute_hunk_context(filename, hunk_line) or false
-        end
-        local cached = M._ts_context_cache[cache_key]
-        if cached and cached ~= false then
-          ts_context = cached
-        end
+        local callback_key = context_callback_key and context_callback_key(hunk_line)
+          or ("diff-row:" .. filename .. ":" .. hunk_line)
+        ts_context = cached_hunk_context(filename, hunk_line, callback_key, on_context_update)
       end
       -- Parse old/new ranges: @@ -222,6 +226,34 @@
       local old_range = range_line:match("%-(%d+,?%d*)") or ""
@@ -989,7 +1309,7 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename)
         if type(args) == "table" and args.buf == nil and args.filename == block_file then
           return match(vim.tbl_extend("force", args, {
             filename = filename or block_file,
-            buf = ensure_file_buffer(filename or block_file) or 0,
+            buf = loaded_file_buffer(filename or block_file) or 0,
           }))
         end
         return match(args)
@@ -1029,7 +1349,19 @@ local function render_fancy_diff(buf, diff_text, hunk_staged, filename)
   end
 
   local H = Snacks.picker.highlight
-  H.render(buf, M._ns, build_fancy_diff_rows(diff_text, hunk_staged, filename))
+  H.render(buf, M._ns, build_fancy_diff_rows(
+    diff_text,
+    hunk_staged,
+    filename,
+    function(hunk_line)
+      return ("diff-buffer:%d:%s:%d"):format(buf, filename or "", hunk_line)
+    end,
+    function()
+      if not (buf and vim.api.nvim_buf_is_valid(buf) and filename) then return end
+      M._buf_last_rendered[buf] = nil
+      M._refresh_diff_buffer(buf, filename)
+    end
+  ))
 end
 
 -- Per-buffer hunk metadata: maps buffer line ranges to raw diff patches
@@ -1137,14 +1469,13 @@ function M.open_diff_buffer(filename)
         vim.schedule(function()
           if not vim.api.nvim_buf_is_valid(buf) then return end
           -- Re-fetch diff if cache was invalidated
-          if not M._file_diffs or M._file_diffs[filename] == nil then
-            M._update_file_diff_cache(filename)
-          end
-          M._refresh_diff_buffer(buf, filename)
-          -- Restore saved cursor
-          local saved = M._buf_saved_cursor[buf]
-          local new_hunks = M._buf_hunks[buf]
-          if saved and new_hunks then
+          local function render_and_restore()
+            if not vim.api.nvim_buf_is_valid(buf) then return end
+            M._refresh_diff_buffer(buf, filename)
+            -- Restore saved cursor
+            local saved = M._buf_saved_cursor[buf]
+            local new_hunks = M._buf_hunks[buf]
+            if not (saved and new_hunks) then return end
             local target_hunk = nil
             if saved.header and saved.header ~= "" then
               for _, h in ipairs(new_hunks) do
@@ -1169,6 +1500,11 @@ function M.open_diff_buffer(filename)
               pcall(vim.api.nvim_win_set_cursor, 0, { math.min(saved.raw_line, max), saved.col or 0 })
             end
             M._buf_saved_cursor[buf] = nil
+          end
+          if not M._file_diffs or M._file_diffs[filename] == nil then
+            M._update_file_diff_cache_async(filename, render_and_restore)
+          else
+            render_and_restore()
           end
         end)
       end,
@@ -1374,7 +1710,8 @@ function M.open_diff_buffer(filename)
           end
         end
       end
-      if M.stage_patch(patch) then
+      M.stage_patch_async(patch, function(ok)
+        if not ok then return end
         vim.notify("Hunk staged", vim.log.levels.INFO)
         local win = vim.api.nvim_get_current_win()
         local filename = M._buf_filename[buf]
@@ -1401,7 +1738,7 @@ function M.open_diff_buffer(filename)
         -- The async list refresh re-renders the buffer (resetting the
         -- cursor), so re-assert the next-hunk position once it settles.
         vim.defer_fn(goto_next, 60)
-      end
+      end)
     end, vim.tbl_extend("force", kopts, { desc = "Stage hunk", nowait = true }))
 
     -- Unstage the hunk under cursor
@@ -1411,7 +1748,8 @@ function M.open_diff_buffer(filename)
         vim.notify("No hunk under cursor", vim.log.levels.WARN)
         return
       end
-      if M.unstage_patch(patch) then
+      M.unstage_patch_async(patch, function(ok)
+        if not ok then return end
         vim.notify("Hunk unstaged", vim.log.levels.INFO)
         local win = vim.api.nvim_get_current_win()
         local filename = M._buf_filename[buf]
@@ -1448,7 +1786,7 @@ function M.open_diff_buffer(filename)
         -- The async list refresh re-renders the buffer (resetting the
         -- cursor), so re-assert the current-hunk position once it settles.
         vim.defer_fn(stay, 60)
-      end
+      end)
     end, vim.tbl_extend("force", kopts, { desc = "Unstage hunk", nowait = true }))
 
     -- Toggle fold (collapse/expand) the hunk under cursor
@@ -1639,7 +1977,8 @@ end
 --- Re-fetch the diff for a single file and update the cache.
 --- Called before _refresh_diff_buffer to pick up file edits.
 ---@param filename string
-function M._update_file_diff_cache(filename)
+---@param cb? fun()
+function M._update_file_diff_cache_async(filename, cb)
   M._file_diffs = M._file_diffs or {}
   M._file_hunk_staged = M._file_hunk_staged or {}
   -- Untracked files: build the diff from disk, never from git. Cache `false`
@@ -1650,13 +1989,20 @@ function M._update_file_diff_cache(filename)
     local diff_text = build_untracked_diff(filename, relpath)
     M._file_diffs[filename] = diff_text or false
     M._file_hunk_staged[filename] = diff_text and { false } or nil
+    if cb then cb() end
     return
   end
-  local cwd = git_root()
-  if not cwd then return end
-  local diff_text, flags = file_diff_and_flags(cwd, filename)
-  M._file_diffs[filename] = diff_text or false
-  M._file_hunk_staged[filename] = flags
+  git_root_async(function(cwd)
+    if not cwd then
+      if cb then cb() end
+      return
+    end
+    file_diff_and_flags_async(cwd, filename, function(diff_text, flags)
+      M._file_diffs[filename] = diff_text or false
+      M._file_hunk_staged[filename] = flags
+      if cb then cb() end
+    end)
+  end)
 end
 
 --- Refresh an open diff buffer for the given filename (if one exists).
@@ -1669,9 +2015,11 @@ function M.refresh_open_diff_buffer(filename)
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
 
   -- Re-fetch diff data for this file only (cache is stale after staging)
-  M._update_file_diff_cache(filename)
-  M._buf_last_rendered[buf] = nil  -- force re-render
-  M._refresh_diff_buffer(buf, filename)
+  M._update_file_diff_cache_async(filename, function()
+    if not vim.api.nvim_buf_is_valid(buf) then return end
+    M._buf_last_rendered[buf] = nil  -- force re-render
+    M._refresh_diff_buffer(buf, filename)
+  end)
 end
 
 local function confirm(lines, on_yes)
@@ -1743,12 +2091,19 @@ local function set_status_folded(key, folded)
   M._status.folds[key] = folded
 end
 
-local function status_git_line(cwd, args)
+---@param cwd string
+---@param args string[]
+---@param cb fun(line?: string)
+local function status_git_line_async(cwd, args, cb)
   local command = { "git", "-C", cwd }
   vim.list_extend(command, args)
-  local result, code = systemlist(command)
-  if code ~= 0 then return nil end
-  return vim.trim(result[1] or "")
+  systemlist_async(command, function(result, code)
+    if code ~= 0 then
+      cb(nil)
+      return
+    end
+    cb(vim.trim(result[1] or ""))
+  end)
 end
 
 local function status_head_row(name, oid, ref, ref_hl, subject)
@@ -1761,28 +2116,58 @@ local function status_head_row(name, oid, ref, ref_hl, subject)
   }
 end
 
-local function status_head_lines(cwd)
-  local lines = {}
-  local head_oid = status_git_line(cwd, { "rev-parse", "--short", "HEAD" }) or "0000000"
-  local branch = status_git_line(cwd, { "rev-parse", "--abbrev-ref", "HEAD" }) or "(detached)"
-  local subject = status_git_line(cwd, { "log", "-1", "--format=%s" }) or "(no commits)"
-  lines[#lines + 1] = status_head_row("Head", head_oid, branch, "DiffReviewStatusBranch", subject)
+---@param cwd string
+---@param cb fun(lines: table[])
+local function status_head_lines_async(cwd, cb)
+  local values = {}
+  local pending = 9
 
-  local upstream = status_git_line(cwd, { "rev-parse", "--abbrev-ref", "@{upstream}" })
-  if upstream then
-    local upstream_oid = status_git_line(cwd, { "rev-parse", "--short", "@{upstream}" }) or ""
-    local upstream_subject = status_git_line(cwd, { "log", "-1", "--format=%s", "@{upstream}" }) or ""
-    lines[#lines + 1] = status_head_row("Merge", upstream_oid, upstream, "DiffReviewStatusRemote", upstream_subject)
+  local function done(key, value)
+    values[key] = value
+    pending = pending - 1
+    if pending > 0 then return end
+
+    local lines = {}
+    lines[#lines + 1] = status_head_row(
+      "Head",
+      values.head_oid or "0000000",
+      values.branch or "(detached)",
+      "DiffReviewStatusBranch",
+      values.subject or "(no commits)"
+    )
+
+    if values.upstream then
+      lines[#lines + 1] = status_head_row(
+        "Merge",
+        values.upstream_oid or "",
+        values.upstream,
+        "DiffReviewStatusRemote",
+        values.upstream_subject or ""
+      )
+    end
+
+    if values.push_ref then
+      lines[#lines + 1] = status_head_row(
+        "Push",
+        values.push_oid or "",
+        values.push_ref,
+        "DiffReviewStatusRemote",
+        values.push_subject or ""
+      )
+    end
+
+    cb(lines)
   end
 
-  local push_ref = status_git_line(cwd, { "rev-parse", "--abbrev-ref", "@{push}" })
-  if push_ref then
-    local push_oid = status_git_line(cwd, { "rev-parse", "--short", "@{push}" }) or ""
-    local push_subject = status_git_line(cwd, { "log", "-1", "--format=%s", "@{push}" }) or ""
-    lines[#lines + 1] = status_head_row("Push", push_oid, push_ref, "DiffReviewStatusRemote", push_subject)
-  end
-
-  return lines
+  status_git_line_async(cwd, { "rev-parse", "--short", "HEAD" }, function(line) done("head_oid", line) end)
+  status_git_line_async(cwd, { "rev-parse", "--abbrev-ref", "HEAD" }, function(line) done("branch", line) end)
+  status_git_line_async(cwd, { "log", "-1", "--format=%s" }, function(line) done("subject", line) end)
+  status_git_line_async(cwd, { "rev-parse", "--abbrev-ref", "@{upstream}" }, function(line) done("upstream", line) end)
+  status_git_line_async(cwd, { "rev-parse", "--short", "@{upstream}" }, function(line) done("upstream_oid", line) end)
+  status_git_line_async(cwd, { "log", "-1", "--format=%s", "@{upstream}" }, function(line) done("upstream_subject", line) end)
+  status_git_line_async(cwd, { "rev-parse", "--abbrev-ref", "@{push}" }, function(line) done("push_ref", line) end)
+  status_git_line_async(cwd, { "rev-parse", "--short", "@{push}" }, function(line) done("push_oid", line) end)
+  status_git_line_async(cwd, { "log", "-1", "--format=%s", "@{push}" }, function(line) done("push_subject", line) end)
 end
 
 local function status_hunk_key(section_name, filename, diff)
@@ -1971,13 +2356,9 @@ local function status_section_for_item(item)
   return "unstaged"
 end
 
+---@param collected_items table[]
 ---@return DiffReviewStatusSection[]
-local function status_collect_sections()
-  local collected_items = {}
-  M.get(function(items)
-    collected_items = items or {}
-  end, { skip_pre_render = true, skip_ts_context = true })
-
+local function status_sections_from_items(collected_items)
   local sections = {} ---@type table<string, DiffReviewStatusSection>
   for _, section_config in ipairs(status_section_order) do
     sections[section_config.name] = {
@@ -2045,6 +2426,27 @@ local function status_collect_sections()
   return ordered
 end
 
+---@param cwd string
+---@param cb fun(result: { head_lines: table[], sections: DiffReviewStatusSection[] })
+local function status_load_async(cwd, cb)
+  local head_lines = nil
+  local sections = nil
+
+  local function maybe_done()
+    if not (head_lines and sections) then return end
+    cb({ head_lines = head_lines, sections = sections })
+  end
+
+  status_head_lines_async(cwd, function(lines)
+    head_lines = lines
+    maybe_done()
+  end)
+  collect_items_from_git(cwd, function(items)
+    sections = status_sections_from_items(items or {})
+    maybe_done()
+  end, { skip_pre_render = true, skip_ts_context = true })
+end
+
 ---@param file DiffReviewStatusFile
 ---@return DiffReviewHunk[]
 local function status_diff_hunks_for_file(file)
@@ -2080,15 +2482,42 @@ local function status_render_hunk(file, hunk)
   M._status.fancy_rows = M._status.fancy_rows or {}
   local rows_key = ("%s:%s"):format(hunk_key, hunk.staged and "staged" or "unstaged")
   local rows = M._status.fancy_rows[rows_key]
+  local function rerender_with_context()
+    M._status = M._status or {}
+    if M._status.fancy_rows then
+      M._status.fancy_rows[rows_key] = nil
+    end
+    local buf = M._status.buf
+    if buf and vim.api.nvim_buf_is_valid(buf) then
+      local cursor = vim.api.nvim_win_get_cursor(0)[1]
+      M.render_status(buf, hunk_key, cursor, { reuse_sections = true })
+    end
+  end
   if not rows then
-    local ok, built_rows = pcall(build_fancy_diff_rows, hunk.diff, { hunk.staged }, file.filename)
+    local ok, built_rows = pcall(
+      build_fancy_diff_rows,
+      hunk.diff,
+      { hunk.staged },
+      file.filename,
+      function(hunk_line)
+        return ("status:%s:%d"):format(rows_key, hunk_line)
+      end,
+      rerender_with_context
+    )
     if ok then
       rows = built_rows
       M._status.fancy_rows[rows_key] = rows
     end
   end
   if not rows then
-    local context = hunk.context_text ~= "" and (hunk.context_text .. " ") or ""
+    local ts_context = cached_hunk_context(
+      file.filename,
+      hunk.pos,
+      "status-fallback:" .. hunk_key,
+      rerender_with_context
+    )
+    local context_text = ts_context or hunk.context_text or ""
+    local context = context_text ~= "" and (context_text .. " ") or ""
     local header = ("%s@@ %s+%d -%d"):format(string.rep(" ", status_hunk_indent), context, hunk.added or 0, hunk.removed or 0)
     status_add_line(header, entry, hunk_folded and "DiffReviewActiveHunkHeader" or "DiffReviewHunkHeader")
     return
@@ -2280,10 +2709,22 @@ local function status_restore_cursor(buf, target_id, fallback_line)
 end
 
 ---@param buf integer
+---@param lines string[]
+local function status_set_plain_lines(buf, lines)
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_clear_namespace(buf, M._status_ns, 0, -1)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].modifiable = false
+end
+
+---@param buf integer
 ---@param target_id? string
 ---@param fallback_line? integer
 ---@param opts? { reuse_sections?: boolean }
-function M.render_status(buf, target_id, fallback_line, opts)
+---@param head_lines table[]
+---@param sections DiffReviewStatusSection[]
+local function status_render_loaded(buf, target_id, fallback_line, opts, head_lines, sections)
   opts = opts or {}
   setup_bg_highlights()
   M._status = M._status or {}
@@ -2294,30 +2735,13 @@ function M.render_status(buf, target_id, fallback_line, opts)
   M._status.line_highlights = {}
   M._status.extmarks = {}
 
-  local cwd, root_err = git_root()
-  if not cwd then
-    notify_error(root_err or "Unable to find git root")
-    return
-  end
-
   status_add_hint_line()
   status_add_line("")
-  local head_lines = opts.reuse_sections and M._status.head_lines or nil
-  if not head_lines then
-    head_lines = status_head_lines(cwd)
-    M._status.head_lines = head_lines
-  end
   for _, head_line in ipairs(head_lines) do
     status_add_segment_line(head_line)
   end
   status_add_line("")
 
-  local sections = opts.reuse_sections and M._status.sections or nil
-  if not sections then
-    sections = status_collect_sections()
-    M._status.sections = sections
-    M._status.fancy_rows = {}
-  end
   if #sections == 0 then
     status_add_line("No changes", nil, "Comment")
   else
@@ -2359,6 +2783,44 @@ end
 ---@param target_id? string
 ---@param fallback_line? integer
 ---@param opts? { reuse_sections?: boolean }
+function M.render_status(buf, target_id, fallback_line, opts)
+  opts = opts or {}
+  setup_bg_highlights()
+  M._status = M._status or {}
+  M._status.buf = buf
+
+  if opts.reuse_sections and M._status.head_lines and M._status.sections then
+    status_render_loaded(buf, target_id, fallback_line, opts, M._status.head_lines, M._status.sections)
+    return
+  end
+
+  M._status.request_id = (M._status.request_id or 0) + 1
+  local request_id = M._status.request_id
+  status_set_plain_lines(buf, { "Loading DiffReview..." })
+
+  git_root_async(function(cwd, root_err)
+    if not (M._status and M._status.request_id == request_id) then return end
+    if not cwd then
+      notify_error(root_err or "Unable to find git root")
+      status_set_plain_lines(buf, { "Not a git repository" })
+      return
+    end
+
+    status_load_async(cwd, function(result)
+      if not (M._status and M._status.request_id == request_id) then return end
+      if not vim.api.nvim_buf_is_valid(buf) then return end
+      M._status.head_lines = result.head_lines
+      M._status.sections = result.sections
+      M._status.fancy_rows = {}
+      status_render_loaded(buf, target_id, fallback_line, opts, result.head_lines, result.sections)
+    end)
+  end)
+end
+
+---@param buf integer
+---@param target_id? string
+---@param fallback_line? integer
+---@param opts? { reuse_sections?: boolean }
 local function render_status_or_notify(buf, target_id, fallback_line, opts)
   local ok, err = xpcall(function()
     M.render_status(buf, target_id, fallback_line, opts)
@@ -2383,28 +2845,50 @@ local function status_stage_entries(entries)
 
   local first_id = expanded_entries[1].id
   local files_to_stage = {}
-  local staged_hunks = 0
+  local hunk_diffs = {}
   for _, entry in ipairs(expanded_entries) do
     if entry.kind == "hunk" and not entry.hunk.staged then
-      if M.stage_patch(entry.hunk.diff) then
-        staged_hunks = staged_hunks + 1
-      end
+      hunk_diffs[#hunk_diffs + 1] = entry.hunk.diff
     elseif entry.kind == "file" and entry.file.section_name ~= "staged" then
       files_to_stage[entry.file.filename] = true
     end
   end
 
+  local staged_hunks = 0
   local staged_files = 0
   local files = status_files_from_set(files_to_stage)
-  if #files > 0 then
-    local result = M.stage_files(files)
-    staged_files = #result.successes
+
+  local function finish()
+    if staged_hunks > 0 or staged_files > 0 then
+      status_notify_action("Staged", staged_hunks, staged_files)
+      refresh_status_after_action(M._status.buf, first_id)
+    end
   end
 
-  if staged_hunks > 0 or staged_files > 0 then
-    status_notify_action("Staged", staged_hunks, staged_files)
-    refresh_status_after_action(M._status.buf, first_id)
+  local function stage_files_after_hunks()
+    if #files == 0 then
+      finish()
+      return
+    end
+    M.stage_files_async(files, function(result)
+      staged_files = #result.successes
+      finish()
+    end)
   end
+
+  local function stage_hunk_at(index)
+    local diff = hunk_diffs[index]
+    if not diff then
+      stage_files_after_hunks()
+      return
+    end
+    M.stage_patch_async(diff, function(ok)
+      if ok then staged_hunks = staged_hunks + 1 end
+      stage_hunk_at(index + 1)
+    end)
+  end
+
+  stage_hunk_at(1)
 end
 
 ---@param entry DiffReviewStatusEntry?
@@ -2421,28 +2905,50 @@ local function status_unstage_entries(entries)
 
   local first_id = expanded_entries[1].id
   local files_to_unstage = {}
-  local unstaged_hunks = 0
+  local hunk_diffs = {}
   for _, entry in ipairs(expanded_entries) do
     if entry.kind == "hunk" and entry.hunk.staged then
-      if M.unstage_patch(entry.hunk.diff) then
-        unstaged_hunks = unstaged_hunks + 1
-      end
+      hunk_diffs[#hunk_diffs + 1] = entry.hunk.diff
     elseif entry.kind == "file" and entry.file.section_name == "staged" then
       files_to_unstage[entry.file.filename] = true
     end
   end
 
+  local unstaged_hunks = 0
   local unstaged_files = 0
   local files = status_files_from_set(files_to_unstage)
-  if #files > 0 then
-    local result = M.unstage_files(files)
-    unstaged_files = #result.successes
+
+  local function finish()
+    if unstaged_hunks > 0 or unstaged_files > 0 then
+      status_notify_action("Unstaged", unstaged_hunks, unstaged_files)
+      refresh_status_after_action(M._status.buf, first_id)
+    end
   end
 
-  if unstaged_hunks > 0 or unstaged_files > 0 then
-    status_notify_action("Unstaged", unstaged_hunks, unstaged_files)
-    refresh_status_after_action(M._status.buf, first_id)
+  local function unstage_files_after_hunks()
+    if #files == 0 then
+      finish()
+      return
+    end
+    M.unstage_files_async(files, function(result)
+      unstaged_files = #result.successes
+      finish()
+    end)
   end
+
+  local function unstage_hunk_at(index)
+    local diff = hunk_diffs[index]
+    if not diff then
+      unstage_files_after_hunks()
+      return
+    end
+    M.unstage_patch_async(diff, function(ok)
+      if ok then unstaged_hunks = unstaged_hunks + 1 end
+      unstage_hunk_at(index + 1)
+    end)
+  end
+
+  unstage_hunk_at(1)
 end
 
 ---@param entry DiffReviewStatusEntry?
@@ -2454,60 +2960,86 @@ end
 ---@param entries DiffReviewStatusEntry[]
 ---@param target_id? string
 local function status_discard_entries(entries, target_id)
-  local cwd, root_err = git_root()
-  if not cwd then
-    notify_error(root_err or "Unable to find git root")
-    return
-  end
+  git_root_async(function(cwd, root_err)
+    if not cwd then
+      notify_error(root_err or "Unable to find git root")
+      return
+    end
 
-  local failures = {}
-  for _, entry in ipairs(entries) do
-    if entry.kind == "hunk" then
-      local args = { "apply", "--reverse", "--whitespace=nowarn" }
-      if entry.hunk.staged then args[#args + 1] = "--index" end
-      args[#args + 1] = "-"
-      local result = run_git_at_root(cwd, args, entry.hunk.diff .. "\n")
-      if not result.ok then
-        failures[#failures + 1] = { file = entry.file.filename, output = result.output, code = result.code }
+    local failures = {}
+    if #entries == 0 then return end
+
+    local function finish_all()
+      if #failures > 0 then M.notify_git_failures("Discard failed", failures) end
+      refresh_status_after_action(M._status.buf, target_id)
+    end
+
+    local function discard_at(index)
+      local entry = entries[index]
+      if not entry then
+        finish_all()
+        return
       end
-    elseif entry.file.untracked then
-      local delete_code = delete_path(entry.file.filename)
-      if delete_code ~= 0 then
-        failures[#failures + 1] = {
-          file = entry.file.filename,
-          message = ("delete() failed with code %d"):format(delete_code),
-        }
+
+      local function next_entry()
+        discard_at(index + 1)
       end
-    else
-      local relpath, rel_err = repo_relative(entry.file.filename, cwd)
-      if not relpath then
-        failures[#failures + 1] = { file = entry.file.filename, message = rel_err }
-      else
-        local checkout_result = run_git_at_root(cwd, { "checkout", "HEAD", "--", relpath })
-        if not checkout_result.ok then
-          local restore_result = run_git_at_root(cwd, { "restore", "--staged", "--", relpath })
-          if restore_result.ok then
-            local delete_code = delete_path(entry.file.filename)
-            if delete_code ~= 0 then
-              failures[#failures + 1] = {
-                file = entry.file.filename,
-                message = ("delete() failed with code %d after unstaging"):format(delete_code),
-              }
-            end
-          else
-            failures[#failures + 1] = {
-              file = entry.file.filename,
-              output = restore_result.output ~= "" and restore_result.output or checkout_result.output,
-              code = restore_result.code,
-            }
+
+      if entry.kind == "hunk" then
+        local args = { "apply", "--reverse", "--whitespace=nowarn" }
+        if entry.hunk.staged then args[#args + 1] = "--index" end
+        args[#args + 1] = "-"
+        run_git_at_root_async(cwd, args, entry.hunk.diff .. "\n", function(result)
+          if not result.ok then
+            failures[#failures + 1] = { file = entry.file.filename, output = result.output, code = result.code }
           end
+          next_entry()
+        end)
+      elseif entry.file.untracked then
+        local delete_code = delete_path(entry.file.filename)
+        if delete_code ~= 0 then
+          failures[#failures + 1] = {
+            file = entry.file.filename,
+            message = ("delete() failed with code %d"):format(delete_code),
+          }
+        end
+        next_entry()
+      else
+        local relpath, rel_err = repo_relative(entry.file.filename, cwd)
+        if not relpath then
+          failures[#failures + 1] = { file = entry.file.filename, message = rel_err }
+          next_entry()
+        else
+          run_git_at_root_async(cwd, { "checkout", "HEAD", "--", relpath }, nil, function(checkout_result)
+            if checkout_result.ok then
+              next_entry()
+              return
+            end
+            run_git_at_root_async(cwd, { "restore", "--staged", "--", relpath }, nil, function(restore_result)
+              if restore_result.ok then
+                local delete_code = delete_path(entry.file.filename)
+                if delete_code ~= 0 then
+                  failures[#failures + 1] = {
+                    file = entry.file.filename,
+                    message = ("delete() failed with code %d after unstaging"):format(delete_code),
+                  }
+                end
+              else
+                failures[#failures + 1] = {
+                  file = entry.file.filename,
+                  output = restore_result.output ~= "" and restore_result.output or checkout_result.output,
+                  code = restore_result.code,
+                }
+              end
+              next_entry()
+            end)
+          end)
         end
       end
     end
-  end
 
-  if #failures > 0 then M.notify_git_failures("Discard failed", failures) end
-  refresh_status_after_action(M._status.buf, target_id)
+    discard_at(1)
+  end)
 end
 
 ---@param entries DiffReviewStatusEntry[]
@@ -2616,49 +3148,30 @@ end
 
 ---@param buf integer
 local function status_push(buf)
-  local cwd, root_err = git_root()
-  if not cwd then
-    notify_error(root_err or "Unable to find git root")
-    return
-  end
+  git_root_async(function(cwd, root_err)
+    if not cwd then
+      notify_error(root_err or "Unable to find git root")
+      return
+    end
 
-  vim.notify("Pushing changes...", vim.log.levels.INFO, { title = "DiffReview" })
-  local output = {}
-  local job_id = jobstart({ "git", "-C", cwd, "push" }, {
-    stdout_buffered = true,
-    stderr_buffered = true,
-    on_stdout = function(_, data)
-      if data then
-        vim.list_extend(output, data)
+    vim.notify("Pushing changes...", vim.log.levels.INFO, { title = "DiffReview" })
+    system_text_async({ "git", "-C", cwd, "push" }, nil, function(result)
+      local compact = {}
+      for _, line in ipairs(text_to_lines((result.stdout or "") .. (result.stderr or ""))) do
+        if line ~= "" then
+          compact[#compact + 1] = line
+        end
       end
-    end,
-    on_stderr = function(_, data)
-      if data then
-        vim.list_extend(output, data)
+      if result.code == 0 then
+        vim.notify("Push complete", vim.log.levels.INFO, { title = "DiffReview" })
+      else
+        notify_error("Push failed: " .. (#compact > 0 and table.concat(compact, "\n") or ("git exited " .. result.code)))
       end
-    end,
-    on_exit = function(_, code)
-      vim.schedule(function()
-        local compact = {}
-        for _, line in ipairs(output) do
-          if line ~= "" then
-            compact[#compact + 1] = line
-          end
-        end
-        if code == 0 then
-          vim.notify("Push complete", vim.log.levels.INFO, { title = "DiffReview" })
-        else
-          notify_error("Push failed: " .. (#compact > 0 and table.concat(compact, "\n") or ("git exited " .. code)))
-        end
-        if vim.api.nvim_buf_is_valid(buf) then
-          render_status_or_notify(buf)
-        end
-      end)
-    end,
-  })
-  if job_id <= 0 then
-    notify_error("Push failed: unable to start git push")
-  end
+      if vim.api.nvim_buf_is_valid(buf) then
+        render_status_or_notify(buf)
+      end
+    end)
+  end)
 end
 
 ---@param buf integer

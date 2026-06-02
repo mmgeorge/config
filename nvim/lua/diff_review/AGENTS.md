@@ -50,6 +50,12 @@ Run the mocked integration test:
 nvim --headless -i NONE --cmd "set shadafile=NONE" -u nvim/init.lua -c "lua vim.loader.enable(false)" -S nvim/tests/diff_review/mock_backend.lua
 ```
 
+Run the async stale-refresh test:
+
+```text
+nvim --headless -i NONE --cmd "set shadafile=NONE" -u nvim/init.lua -c "lua vim.loader.enable(false)" -S nvim/tests/diff_review/async_stale.lua
+```
+
 Run the real-git visual selection integration test:
 
 ```text
@@ -75,11 +81,19 @@ require("diff_review").reset_git_backend()
 
 The backend may implement:
 
+- `systemlist_async(command, cb) -> nil`
+- `system_async(command, input, cb) -> nil`
 - `systemlist(command) -> output_lines, exit_code`
 - `system(command, input) -> output_text, exit_code`
 - `delete(path) -> exit_code`
-- `jobstart(command, opts) -> job_id`
 
-Production code should keep git access routed through this seam so rendering,
-selection actions, staging, unstaging, discarding, and push behavior can be
-tested without shelling out to a real repository.
+Production code should prefer the async methods and route process errors through
+notifications. Synchronous methods are only compatibility for tests or
+non-interactive helper paths. Keep index-mutating git operations asynchronous
+but sequential within a batch so tests and production avoid `.git/index.lock`
+races.
+
+Tree-sitter context lookup must use async `LanguageTree:parse(range, on_parse)`
+with a cached fallback-render-then-upgrade flow. Do not call synchronous
+`parser:parse()` from DiffReview renderers, keymaps, autocmds, or preview
+refresh paths.

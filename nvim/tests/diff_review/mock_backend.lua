@@ -2,6 +2,7 @@ vim.loader.enable(false)
 
 local diff_review = require("diff_review")
 local root = "D:/mock/project"
+local original_compute_hunk_context_async = diff_review.compute_hunk_context_async
 
 local function assert_true(condition, message)
   if not condition then error(message, 2) end
@@ -33,7 +34,7 @@ local staged = false
 local calls = {}
 
 ---@class DiffReviewMockCall
----@field kind "systemlist"|"system"
+---@field kind "systemlist"|"system"|"systemlist_async"|"system_async"
 ---@field command DiffReviewGitCommand
 ---@field key string
 ---@field input? string
@@ -107,6 +108,16 @@ function backend.systemlist(command)
 end
 
 ---@param command DiffReviewGitCommand
+---@param cb DiffReviewGitListCallback
+function backend.systemlist_async(command, cb)
+  record("systemlist_async", command)
+  vim.defer_fn(function()
+    local output, code = backend.systemlist(command)
+    cb(output, code)
+  end, 5)
+end
+
+---@param command DiffReviewGitCommand
 ---@param input? string
 ---@return string output
 ---@return integer code
@@ -132,6 +143,22 @@ function backend.system(command, input)
   return "unexpected command: " .. key, 1
 end
 
+---@param command DiffReviewGitCommand
+---@param input? string
+---@param cb DiffReviewGitTextCallback
+function backend.system_async(command, input, cb)
+  record("system_async", command, input)
+  vim.defer_fn(function()
+    local output, code = backend.system(command, input)
+    cb({
+      code = code,
+      stdout = output,
+      stderr = "",
+      output = output,
+    })
+  end, 5)
+end
+
 function backend.delete()
   return 0
 end
@@ -141,6 +168,14 @@ local function contains_line(lines, pattern)
     if line:find(pattern, 1, true) then return true end
   end
   return false
+end
+
+local function buffer_contains(buf, pattern)
+  return contains_line(vim.api.nvim_buf_get_lines(buf, 0, -1, false), pattern)
+end
+
+local function wait_for(condition, message)
+  assert_true(vim.wait(1000, condition, 10), message)
 end
 
 local function count_blank_lines_between(lines, first_heading, second_heading)
@@ -186,6 +221,13 @@ local function trigger_visual_mapping(key, first_row, second_row)
   mapping.callback()
 end
 
+local function trigger_normal_mapping(key, row)
+  vim.api.nvim_win_set_cursor(0, { row, 0 })
+  local mapping = vim.fn.maparg(key, "n", false, true)
+  assert_true(type(mapping.callback) == "function", "missing normal mapping for " .. key)
+  mapping.callback()
+end
+
 local function saw_system_call(expected_key)
   for _, call in ipairs(calls) do
     if call.kind == "system" and call.key == expected_key then
@@ -197,12 +239,22 @@ end
 
 local function run()
   diff_review.set_git_backend(backend)
+  local ts_requests = 0
+  diff_review.compute_hunk_context_async = function(_, _, cb)
+    ts_requests = ts_requests + 1
+    vim.defer_fn(function()
+      cb("AsyncScope")
+    end, 5)
+  end
   diff_review.setup()
   diff_review.open()
   local buf = vim.api.nvim_get_current_buf()
   assert_true(vim.bo[buf].filetype == "DiffReviewStatus", "DiffReviewStatus buffer did not open")
 
   local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  assert_true(contains_line(lines, "Loading DiffReview..."), "DiffReview did not render a loading state before async data completed")
+  wait_for(function() return buffer_contains(buf, "Head:") end, "status did not render after async load")
+  lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
   assert_true(contains_line(lines, "Head:"), "missing Head row")
   assert_true(contains_line(lines, "master"), "missing branch row")
   assert_true(contains_line(lines, "Unstaged changes (2)"), "missing unstaged heading")
@@ -213,14 +265,34 @@ local function run()
   assert_true(count_blank_lines_between(lines, "Unstaged changes", "Untracked files") == 1, "wrong heading spacing")
 
   local first_row, second_row = find_rows(lines, "a.txt +1 -1", "b.txt +1 -1")
+  trigger_normal_mapping("<Tab>", first_row)
+  lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  assert_true(contains_line(lines, "@@ +1 -1"), "missing fallback hunk header before async treesitter context")
+  wait_for(function() return buffer_contains(buf, "AsyncScope") end, "async treesitter context did not update hunk header")
+  assert_true(ts_requests > 0, "treesitter async context was not requested")
+  lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  first_row, second_row = find_rows(lines, "a.txt +1 -1", "b.txt +1 -1")
+  trigger_normal_mapping("<Tab>", first_row)
+  lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  first_row, second_row = find_rows(lines, "a.txt +1 -1", "b.txt +1 -1")
+
   trigger_visual_mapping("S", first_row, second_row)
+  wait_for(function()
+    return saw_system_call("git\t-C\t" .. root .. "\tadd\t--\ta.txt")
+      and saw_system_call("git\t-C\t" .. root .. "\tadd\t--\tb.txt")
+  end, "stage commands did not run")
   assert_true(saw_system_call("git\t-C\t" .. root .. "\tadd\t--\ta.txt"), "missing git add for a.txt")
   assert_true(saw_system_call("git\t-C\t" .. root .. "\tadd\t--\tb.txt"), "missing git add for b.txt")
 
+  wait_for(function() return buffer_contains(buf, "Staged changes (2)") end, "status did not refresh after async stage")
   lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
   assert_true(contains_line(lines, "Staged changes (2)"), "missing staged heading after S")
   first_row, second_row = find_rows(lines, "a.txt +1 -1", "b.txt +1 -1")
   trigger_visual_mapping("U", first_row, second_row)
+  wait_for(function()
+    return saw_system_call("git\t-C\t" .. root .. "\trestore\t--staged\t--\ta.txt")
+      and saw_system_call("git\t-C\t" .. root .. "\trestore\t--staged\t--\tb.txt")
+  end, "unstage commands did not run")
   assert_true(saw_system_call("git\t-C\t" .. root .. "\trestore\t--staged\t--\ta.txt"), "missing git restore for a.txt")
   assert_true(saw_system_call("git\t-C\t" .. root .. "\trestore\t--staged\t--\tb.txt"), "missing git restore for b.txt")
 
@@ -230,6 +302,7 @@ end
 
 local ok, err = xpcall(run, debug.traceback)
 diff_review.reset_git_backend()
+diff_review.compute_hunk_context_async = original_compute_hunk_context_async
 if not ok then
   vim.api.nvim_err_writeln(err)
   vim.cmd("cquit")

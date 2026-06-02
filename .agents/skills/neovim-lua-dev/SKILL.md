@@ -166,6 +166,25 @@ If diagnostics still look wrong, run the linter directly (e.g. `luacheck`,
   `vim.keymap.set(..., { desc = … })` (always set `desc`),
   `vim.api.nvim_create_user_command` (handle range/bang/complete).
 - **Messages:** `vim.notify(msg, vim.log.levels.{INFO,WARN,ERROR})`.
+- **Async processes:** prefer `vim.system({ ... }, { text = true }, cb)` for
+  plugin Git/process work. Do not call `vim.fn.system()`,
+  `vim.fn.systemlist()`, or `vim.system(...):wait()` from UI render paths,
+  keymaps, autocmds, or other interactive code. In callbacks, schedule any
+  editor API mutations with `vim.schedule()` / `vim.schedule_wrap()` and route
+  process start failures, nonzero exits, and stale-operation errors through
+  `vim.notify()` or the plugin's notification module.
+- **Async refresh state:** long-running refreshes need a request id or equivalent
+  cancellation token. Start a new id for each refresh and ignore callbacks from
+  older ids so slow Git/process results cannot repaint stale data over newer UI.
+- **Git index mutations:** keep index-writing commands (`git add`,
+  `git restore --staged`, `git apply --cached`, checkout/restore fallbacks)
+  asynchronous but sequential within a batch. Running multiple index writers in
+  parallel can race on `.git/index.lock`.
+- **Tree-sitter parsing:** use `LanguageTree:parse(range, on_parse)` when parse
+  work is needed during rendering or cursor-driven UI. Render with a cheap
+  fallback first, then update from the parse callback. Do not call
+  `parser:parse()` synchronously from status renderers, previews, keymaps, or
+  autocmds.
 - **Syntax-aware edits:** prefer `vim.treesitter` queries over regex.
 - **Window options belong to windows:** use `vim.wo[win]`, not `vim.wo[0]` — the
   "current window" inside an autocmd is often not the one you mean.

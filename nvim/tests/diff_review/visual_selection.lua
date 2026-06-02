@@ -29,6 +29,10 @@ local function contains_line(lines, needle)
   return false
 end
 
+local function wait_for(condition, message)
+  assert_true(vim.wait(3000, condition, 10), message)
+end
+
 local function find_file_rows()
   local buffer_lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
   local first_row = nil
@@ -80,17 +84,42 @@ local function run()
   assert_true(vim.v.shell_error == 0, "rev-parse failed: " .. table.concat(root_output, "\n"))
   assert_true(vim.fs.normalize(root_output[1]) == test_root, "wrong git root: " .. tostring(root_output[1]))
 
-  vim.cmd("DiffReview")
+  require("diff_review").open()
   assert_true(vim.bo.filetype == "DiffReviewStatus", "DiffReviewStatus buffer did not open")
-  require("diff_review").render_status(vim.api.nvim_get_current_buf())
+  local status_buf = vim.api.nvim_get_current_buf()
+  require("diff_review").render_status(status_buf)
+  wait_for(function()
+    local lines = vim.api.nvim_buf_get_lines(status_buf, 0, -1, false)
+    for _, line in ipairs(lines) do
+      if line:find("a.txt", 1, true) and line:find("b.txt", 1, true) == nil then
+        return true
+      end
+    end
+    return false
+  end, "DiffReview status did not render changed files")
 
   trigger_visual_mapping("S")
-  local staged_after_stage = run_git({ "diff", "--cached", "--name-only" })
+  local staged_after_stage = {}
+  wait_for(function()
+    staged_after_stage = run_git({ "diff", "--cached", "--name-only" })
+    return contains_line(staged_after_stage, "a.txt") and contains_line(staged_after_stage, "b.txt")
+  end, "visual S did not stage both selected files")
   assert_true(contains_line(staged_after_stage, "a.txt"), "a.txt was not staged")
   assert_true(contains_line(staged_after_stage, "b.txt"), "b.txt was not staged")
+  wait_for(function()
+    local lines = vim.api.nvim_buf_get_lines(status_buf, 0, -1, false)
+    for _, line in ipairs(lines) do
+      if line:find("Staged changes", 1, true) then return true end
+    end
+    return false
+  end, "DiffReview status did not refresh to staged section")
 
   trigger_visual_mapping("U")
-  local staged_after_unstage = run_git({ "diff", "--cached", "--name-only" })
+  local staged_after_unstage = {}
+  wait_for(function()
+    staged_after_unstage = run_git({ "diff", "--cached", "--name-only" })
+    return #staged_after_unstage == 0
+  end, "visual U did not clear staged diff")
   assert_true(#staged_after_unstage == 0, "staged diff was not cleared by visual U")
   local unstaged_after_unstage = run_git({ "diff", "--name-only" })
   assert_true(contains_line(unstaged_after_unstage, "a.txt"), "a.txt was not unstaged")

@@ -81,6 +81,8 @@ end
 
 --- Append job output (array of lines, possibly with a trailing partial) to the
 --- console buffer and keep its window scrolled to the bottom.
+---@param buf integer
+---@param data string[]
 local function append(buf, data)
   if not vim.api.nvim_buf_is_valid(buf) then return end
   local lines = {}
@@ -99,6 +101,13 @@ local function append(buf, data)
   for _, win in ipairs(vim.fn.win_findbuf(buf)) do
     pcall(vim.api.nvim_win_set_cursor, win, { vim.api.nvim_buf_line_count(buf), 0 })
   end
+end
+
+---@param buf integer
+---@param data string?
+local function append_text(buf, data)
+  if not data or data == "" then return end
+  append(buf, vim.split(data, "\n", { plain = true }))
 end
 
 -- ─── message editor (runs in the parent) ────────────────────────────────────
@@ -227,51 +236,69 @@ function M.commit(opts)
   end
   if M._active then M._finish(1) end
 
-  local root = vim.fn.systemlist({ "git", "rev-parse", "--show-toplevel" })[1]
-  if vim.v.shell_error ~= 0 or not root or root == "" then
-    vim.notify("Not a git repository", vim.log.levels.ERROR)
-    return
-  end
-  root = vim.trim(root)
+  local ok, process = pcall(vim.system, { "git", "rev-parse", "--show-toplevel" }, { text = true }, function(result)
+    vim.schedule(function()
+      local root = vim.trim(result.stdout or "")
+      if result.code ~= 0 or root == "" then
+        vim.notify("Not a git repository", vim.log.levels.ERROR)
+        return
+      end
 
-  local console = vim.api.nvim_create_buf(false, true)
-  vim.bo[console].bufhidden = "hide"
-  vim.bo[console].filetype = "git"
+      local console = vim.api.nvim_create_buf(false, true)
+      vim.bo[console].bufhidden = "hide"
+      vim.bo[console].filetype = "git"
 
-  M._active = {
-    win = win,
-    list_win = opts.list_win,
-    prev_buf = vim.api.nvim_win_get_buf(win),
-    prev_winbar = vim.wo[win].winbar,
-    console = console,
-    on_done = opts.on_done,
-    aborted = false,
-  }
+      M._active = {
+        win = win,
+        list_win = opts.list_win,
+        prev_buf = vim.api.nvim_win_get_buf(win),
+        prev_winbar = vim.wo[win].winbar,
+        console = console,
+        on_done = opts.on_done,
+        aborted = false,
+      }
 
-  require("diff_review").suspend_preview = true
-  vim.api.nvim_win_set_buf(win, console)
-  vim.wo[win].number = false
-  vim.wo[win].relativenumber = false
-  vim.wo[win].wrap = true
-  winbar(win, " Committing… ")
+      require("diff_review").suspend_preview = true
+      vim.api.nvim_win_set_buf(win, console)
+      vim.wo[win].number = false
+      vim.wo[win].relativenumber = false
+      vim.wo[win].wrap = true
+      winbar(win, " Committing... ")
 
-  local server = vim.v.servername
-  if server == nil or server == "" then server = vim.fn.serverstart() end
+      local server = vim.v.servername
+      if server == nil or server == "" then server = vim.fn.serverstart() end
 
-  local editor = remote_editor_cmd()
-  local job = vim.fn.jobstart({ "git", "commit" }, {
-    cwd = root,
-    env = { GIT_EDITOR = editor, GIT_SEQUENCE_EDITOR = editor, NVIM = server },
-    on_stdout = function(_, data) append(console, data) end,
-    on_stderr = function(_, data) append(console, data) end,
-    on_exit = function(_, code) M._finish(code) end,
-  })
+      local editor = remote_editor_cmd()
+      local commit_ok, commit_process = pcall(vim.system, { "git", "commit" }, {
+        cwd = root,
+        env = { GIT_EDITOR = editor, GIT_SEQUENCE_EDITOR = editor, NVIM = server },
+        text = true,
+        stdout = function(_, data)
+          vim.schedule(function()
+            append_text(console, data)
+          end)
+        end,
+        stderr = function(_, data)
+          vim.schedule(function()
+            append_text(console, data)
+          end)
+        end,
+      }, function(commit_result)
+        vim.schedule(function()
+          M._finish(commit_result.code or 0)
+        end)
+      end)
 
-  if job <= 0 then
-    local message = "Failed to start `git commit` (jobstart returned " .. job .. ")."
-    append(console, { message })
-    vim.notify(message, vim.log.levels.ERROR, { title = "Diff Review" })
-    M._finish(1)
+      if not commit_ok then
+        local message = "Failed to start `git commit`: " .. tostring(commit_process)
+        append(console, { message })
+        vim.notify(message, vim.log.levels.ERROR, { title = "Diff Review" })
+        M._finish(1)
+      end
+    end)
+  end)
+  if not ok then
+    vim.notify("Failed to start `git rev-parse`: " .. tostring(process), vim.log.levels.ERROR, { title = "Diff Review" })
   end
 end
 
