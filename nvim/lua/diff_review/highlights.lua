@@ -39,6 +39,11 @@ function M.setup()
     underline = true,
     nocombine = true,
   })
+  vim.api.nvim_set_hl(0, "DiffReviewHunkBoundary", {
+    fg = "#9ca3af",
+    italic = true,
+    nocombine = true,
+  })
 end
 
 return M

@@ -80,7 +80,20 @@
 
 ---@class DiffReviewTreeSitterContextPending
 ---@field pending true
----@field callbacks table<string, fun(context?: string)>
+---@field callbacks table<string, fun(context?: DiffReviewHunkTreeSitterContext|string)>
+
+---@class DiffReviewHunkTreeSitterContext
+---@field label string
+---@field start_row integer 0-based row
+---@field end_row integer 0-based row
+---@field start_text string
+---@field end_text string
+---@field start_segments DiffReviewHighlightSegment[]
+---@field end_segments DiffReviewHighlightSegment[]
+
+---@class DiffReviewHighlightSegment
+---@field text string
+---@field hl_group? string
 
 ---@class DiffReviewModule
 ---@field config DiffReviewConfig?
@@ -94,7 +107,8 @@
 ---@field _buf_filename table<integer, string>?
 ---@field _buf_saved_cursor table<integer, integer[]>?
 ---@field _buf_last_rendered table<integer, string>?
----@field _ts_context_cache table<string, string|false|DiffReviewTreeSitterContextPending>?
+---@field _ts_context_cache table<string, DiffReviewHunkTreeSitterContext|string|false|DiffReviewTreeSitterContextPending>?
+---@field _ts_source_bufs table<string, integer>?
 ---@field _main_win integer?
 ---@field _saved_wo table?
 ---@field suspend_preview boolean?
@@ -134,6 +148,8 @@ local function count_stats(diff_text)
   return added, removed
 end
 
+local detect_filetype
+
 ---@param filename string
 ---@return number?
 local function loaded_file_buffer(filename)
@@ -143,9 +159,109 @@ local function loaded_file_buffer(filename)
 end
 
 ---@param filename string
+---@return integer?
+local function treesitter_source_buffer(filename)
+  local loaded = loaded_file_buffer(filename)
+  if loaded then return loaded end
+
+  M._ts_source_bufs = M._ts_source_bufs or {}
+  local cached = M._ts_source_bufs[filename]
+  if cached and vim.api.nvim_buf_is_valid(cached) then return cached end
+
+  local read_ok, lines = pcall(vim.fn.readfile, filename)
+  if not read_ok or type(lines) ~= "table" then return nil end
+
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[buf].bufhidden = "wipe"
+  vim.bo[buf].buftype = "nofile"
+  vim.bo[buf].swapfile = false
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].filetype = detect_filetype(filename, lines)
+  M._ts_source_bufs[filename] = buf
+  return buf
+end
+
+local function clear_treesitter_source_buffers()
+  for _, buf in pairs(M._ts_source_bufs or {}) do
+    if vim.api.nvim_buf_is_valid(buf) then
+      pcall(vim.api.nvim_buf_delete, buf, { force = true })
+    end
+  end
+  M._ts_source_bufs = {}
+end
+
+---@param buf integer
+---@param tree TSTree
+---@param query vim.treesitter.Query?
+---@param row integer 0-based row
+---@param text string
+---@return DiffReviewHighlightSegment[]
+local function treesitter_line_segments(buf, tree, query, row, text)
+  local segments = {}
+  if text == "" then return segments end
+  if not query then
+    return { { text = text } }
+  end
+
+  local ranges = {}
+  local ok = pcall(function()
+    for id, node in query:iter_captures(tree:root(), buf, row, row + 1) do
+      local capture = query.captures[id]
+      if capture and capture ~= "" then
+        local start_row, start_col, end_row, end_col = node:range()
+        if start_row <= row and end_row >= row then
+          local range_start = start_row == row and start_col or 0
+          local range_end = end_row == row and end_col or #text
+          if range_end > range_start then
+            ranges[#ranges + 1] = {
+              start_col = math.max(range_start, 0),
+              end_col = math.min(range_end, #text),
+              hl_group = "@" .. capture,
+            }
+          end
+        end
+      end
+    end
+  end)
+  if not ok or #ranges == 0 then
+    return { { text = text } }
+  end
+
+  local segment_start = 1
+  local current_hl = nil
+  for col = 0, #text - 1 do
+    local char = text:sub(col + 1, col + 1)
+    local hl_group = nil
+    if not char:match("%s") then
+      for _, range in ipairs(ranges) do
+        if col >= range.start_col and col < range.end_col then
+          hl_group = range.hl_group
+        end
+      end
+    end
+    if col == 0 then
+      current_hl = hl_group
+    elseif hl_group ~= current_hl then
+      segments[#segments + 1] = {
+        text = text:sub(segment_start, col),
+        hl_group = current_hl,
+      }
+      segment_start = col + 1
+      current_hl = hl_group
+    end
+  end
+
+  segments[#segments + 1] = {
+    text = text:sub(segment_start),
+    hl_group = current_hl,
+  }
+  return segments
+end
+
+---@param filename string
 ---@param contents? string[]
 ---@return string
-local function detect_filetype(filename, contents)
+function detect_filetype(filename, contents)
   local args = {
     filename = filename,
   }
@@ -845,10 +961,11 @@ end
 
 ---@param buf integer
 ---@param query vim.treesitter.Query
+---@param highlight_query vim.treesitter.Query?
 ---@param trees TSTree[]
 ---@param target integer 0-based row
----@return string?
-local function hunk_context_from_trees(buf, query, trees, target)
+---@return DiffReviewHunkTreeSitterContext?
+local function hunk_context_from_trees(buf, query, highlight_query, trees, target)
   if not trees or #trees == 0 then return nil end
 
   local scopes = {}
@@ -886,15 +1003,27 @@ local function hunk_context_from_trees(buf, query, trees, target)
   end
 
   if #names == 0 then return nil end
-  return table.concat(names, ".")
+  local selected_scope = scopes[1]
+  local lines = vim.api.nvim_buf_get_lines(buf, selected_scope.sr, selected_scope.er + 1, false)
+  local start_text = lines[1] or ""
+  local end_text = lines[#lines] or start_text
+  return {
+    label = table.concat(names, "."),
+    start_row = selected_scope.sr,
+    end_row = selected_scope.er,
+    start_text = start_text,
+    end_text = end_text,
+    start_segments = treesitter_line_segments(buf, trees[1], highlight_query, selected_scope.sr, start_text),
+    end_segments = treesitter_line_segments(buf, trees[1], highlight_query, selected_scope.er, end_text),
+  }
 end
 
 --- Compute Tree-sitter scope context for a hunk without blocking UI render.
 ---@param filename string absolute path
 ---@param line number 1-based line number
----@param cb fun(context?: string)
+---@param cb fun(context?: DiffReviewHunkTreeSitterContext|string)
 function M.compute_hunk_context_async(filename, line, cb)
-  local buf = loaded_file_buffer(filename)
+  local buf = treesitter_source_buffer(filename)
   if not buf then
     cb(nil)
     return
@@ -915,6 +1044,8 @@ function M.compute_hunk_context_async(filename, line, cb)
     cb(nil)
     return
   end
+  local highlight_ok, highlight_query = pcall(vim.treesitter.query.get, lang, "highlights")
+  if not highlight_ok then highlight_query = nil end
 
   local parser_ok, parser = pcall(vim.treesitter.get_parser, buf, lang)
   if not parser_ok or not parser then
@@ -927,7 +1058,7 @@ function M.compute_hunk_context_async(filename, line, cb)
   local function finish(trees)
     if done then return end
     done = true
-    local context = hunk_context_from_trees(buf, query, trees, target)
+    local context = hunk_context_from_trees(buf, query, highlight_query, trees, target)
     cb(context)
   end
 
@@ -950,14 +1081,15 @@ end
 ---@param filename string
 ---@param line number
 ---@param callback_key string
----@param on_update? fun(context?: string)
----@return string?
+---@param on_update? fun(context?: DiffReviewHunkTreeSitterContext|string)
+---@return DiffReviewHunkTreeSitterContext|string?
 local function cached_hunk_context(filename, line, callback_key, on_update)
   M._ts_context_cache = M._ts_context_cache or {}
   local cache_key = filename .. ":" .. line
   local cached = M._ts_context_cache[cache_key]
   if cached == false then return nil end
   if type(cached) == "string" then return cached end
+  if type(cached) == "table" and not cached.pending then return cached end
   if type(cached) == "table" and cached.pending then
     if on_update then cached.callbacks[callback_key] = on_update end
     return nil
@@ -972,14 +1104,97 @@ local function cached_hunk_context(filename, line, callback_key, on_update)
     local callbacks = type(pending) == "table" and pending.callbacks or {}
     M._ts_context_cache[cache_key] = context or false
     for _, callback in pairs(callbacks) do
-      pcall(callback, context)
+      local ok, err = pcall(callback, context)
+      if not ok then notify_error("Tree-sitter context update failed: " .. tostring(err)) end
     end
   end)
   return nil
 end
 
+---@param context DiffReviewHunkTreeSitterContext|string?
+---@return string?
+local function hunk_context_label(context)
+  if type(context) == "string" then return context end
+  if type(context) == "table" then return context.label end
+  return nil
+end
+
+---@param text string?
+---@return string
+local function line_indent(text)
+  return tostring(text or ""):match("^%s*") or ""
+end
+
+---@param diff_lines string|string[]?
+---@return table<string, boolean>
+local function hunk_visible_source_lines(diff_lines)
+  local lines = type(diff_lines) == "table" and diff_lines
+    or vim.split(tostring(diff_lines or ""), "\n", { plain = true })
+  local visible = {}
+  local in_hunk = false
+  for _, diff_line in ipairs(lines) do
+    if diff_line:match("^@@") then
+      in_hunk = true
+    elseif in_hunk then
+      local prefix = diff_line:sub(1, 1)
+      if prefix == " " or prefix == "+" or prefix == "-" then
+        visible[diff_line:sub(2)] = true
+      end
+    end
+  end
+  return visible
+end
+
+---@param text string
+---@param segments? DiffReviewHighlightSegment[]
+---@param line_number? integer
+---@return table
+local function hunk_boundary_row(text, segments, line_number)
+  local row = { diff_review_boundary = true }
+  local gutter_width = 12
+  row[#row + 1] = { string.rep(" ", gutter_width) }
+  if line_number then
+    local line_text = tostring(line_number)
+    row[#row + 1] = {
+      virt_text = { { line_text, "DiffReviewContextLineNr" } },
+      virt_text_pos = "overlay",
+      col = 0,
+    }
+    row[#row + 1] = {
+      virt_text = { { line_text, "DiffReviewContextLineNr" } },
+      virt_text_pos = "overlay",
+      col = 5,
+    }
+  end
+  if segments and #segments > 0 then
+    for _, segment in ipairs(segments) do
+      row[#row + 1] = segment.hl_group and { segment.text, segment.hl_group } or { segment.text }
+    end
+  else
+    row[#row + 1] = { text, "DiffReviewHunkBoundary" }
+  end
+  return row
+end
+
+---@param reference_text string?
+---@return table
+local function hunk_boundary_ellipsis_row(reference_text)
+  return hunk_boundary_row(line_indent(reference_text) .. "...")
+end
+
+---@param row table
+---@return string
+local function highlight_row_text(row)
+  local parts = {}
+  for _, chunk in ipairs(row) do
+    if type(chunk[1]) == "string" then parts[#parts + 1] = chunk[1] end
+  end
+  return table.concat(parts)
+end
+
 -- Cache for treesitter context per file (cleared on refresh)
 M._ts_context_cache = {}
+M._ts_source_bufs = {}
 
 ---@param opts? DiffReviewConfig
 function M.setup(opts)
@@ -1009,6 +1224,7 @@ end
 ---@param _ctx table?
 local function collect_items_from_git(cwd, cb, _ctx)
   M._ts_context_cache = {} -- clear treesitter context cache on refresh
+  clear_treesitter_source_buffers()
   M._untracked = {} -- map of absolute path -> repo-relative path for untracked files
   local results = {
     unstaged = {},
@@ -1123,8 +1339,9 @@ local function collect_items_from_git(cwd, cb, _ctx)
     local context_text = hunk.context or ""
     if not (_ctx and _ctx.skip_ts_context) then
       local cached = cached_hunk_context(filename, hunk.pos, "items:" .. filename .. ":" .. hunk.pos)
-      if cached then
-        context_text = cached
+      local cached_label = hunk_context_label(cached)
+      if cached_label then
+        context_text = cached_label
       end
     end
     -- Parse range numbers from @@ header
@@ -1318,12 +1535,14 @@ end
 ---@param filename? string
 ---@param context_callback_key? fun(hunk_line: number): string
 ---@param on_context_update? fun()
-local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_callback_key, on_context_update)
+---@param opts? { context_line: integer?, boundary_context: boolean? }
+local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_callback_key, on_context_update, opts)
   local snacks_diff = require("snacks.picker.util.diff")
+  opts = opts or {}
 
   local diff = snacks_diff.get_diff(diff_text)
-  local opts = { hunk_header = false }
-  local ctx_base = setmetatable({ diff = diff, opts = opts }, { __index = function(_, k)
+  local snacks_opts = { hunk_header = false }
+  local ctx_base = setmetatable({ diff = diff, opts = snacks_opts }, { __index = function(_, k)
     if k == "extend" then
       return function(self2, t)
         return setmetatable(t, { __index = self2 })
@@ -1342,12 +1561,14 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
       local range_line = hunk.diff[1] or "@@"
       local range_only = range_line:match("^(@@[^@]+@@)") or range_line
       -- Get the new-file start line for treesitter context lookup
-      local hunk_line = tonumber(range_line:match("%+(%d+)")) or 1
+      local hunk_line = opts.context_line or tonumber(range_line:match("%+(%d+)")) or 1
+      local raw_context = nil
       local ts_context = nil
       if filename then
         local callback_key = context_callback_key and context_callback_key(hunk_line)
           or ("diff-row:" .. filename .. ":" .. hunk_line)
-        ts_context = cached_hunk_context(filename, hunk_line, callback_key, on_context_update)
+        raw_context = cached_hunk_context(filename, hunk_line, callback_key, on_context_update)
+        ts_context = hunk_context_label(raw_context)
       end
       -- Parse old/new ranges: @@ -222,6 +226,34 @@
       local old_range = range_line:match("%-(%d+,?%d*)") or ""
@@ -1377,6 +1598,18 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
       header_parts[#header_parts + 1] = { ("-%d"):format(h_removed), "DiffReviewDeleteRange" }
       ret[#ret + 1] = header_parts
 
+      local visible_hunk_lines = hunk_visible_source_lines(hunk.diff)
+      if opts.boundary_context and type(raw_context) == "table" then
+        local node_start = raw_context.start_row + 1
+        local start_text = raw_context.start_text or ""
+        if not visible_hunk_lines[start_text] then
+          ret[#ret + 1] = hunk_boundary_row(raw_context.start_text, raw_context.start_segments, node_start)
+          if node_start ~= raw_context.end_row + 1 then
+            ret[#ret + 1] = hunk_boundary_ellipsis_row(start_text)
+          end
+        end
+      end
+
       local hunk_ctx = block_ctx:extend({ hunk = hunk })
       local block_file = block.file
       local match = vim.filetype.match
@@ -1394,7 +1627,23 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
       if not ok then
         error(hunk_lines)
       end
+      if hunk_lines[1] and highlight_row_text(hunk_lines[1]):match("^%s*@@") then
+        table.remove(hunk_lines, 1)
+      end
       vim.list_extend(ret, hunk_lines)
+      if opts.boundary_context and type(raw_context) == "table" then
+        local node_start = raw_context.start_row + 1
+        local node_end = raw_context.end_row + 1
+        local end_text = raw_context.end_text or ""
+        if not visible_hunk_lines[end_text] then
+          if node_end ~= node_start then
+            ret[#ret + 1] = hunk_boundary_ellipsis_row(end_text)
+          end
+          if node_end ~= node_start then
+            ret[#ret + 1] = hunk_boundary_row(end_text, raw_context.end_segments, node_end)
+          end
+        end
+      end
     end
   end
 
@@ -2761,7 +3010,8 @@ local function status_render_hunk(file, hunk)
       function(hunk_line)
         return ("status:%s:%d"):format(rows_key, hunk_line)
       end,
-      rerender_with_context
+      rerender_with_context,
+      { context_line = hunk.pos, boundary_context = true }
     )
     if ok then
       rows = built_rows
@@ -2775,18 +3025,43 @@ local function status_render_hunk(file, hunk)
       "status-fallback:" .. hunk_key,
       rerender_with_context
     )
-    local context_text = ts_context or hunk.context_text or ""
+    local context_text = hunk_context_label(ts_context) or hunk.context_text or ""
     local context = context_text ~= "" and (context_text .. " ") or ""
     local header = ("%s@@ %s+%d -%d"):format(string.rep(" ", status_hunk_indent), context, hunk.added or 0, hunk.removed or 0)
     status_add_line(header, entry, hunk_folded and "DiffReviewActiveHunkHeader" or "DiffReviewHunkHeader")
+    if not hunk_folded and type(ts_context) == "table" then
+      local visible_hunk_lines = hunk_visible_source_lines(hunk.diff)
+      local node_start = ts_context.start_row + 1
+      local node_end = ts_context.end_row + 1
+      local start_text = ts_context.start_text or ""
+      local end_text = ts_context.end_text or ""
+      if not visible_hunk_lines[start_text] then
+        status_add_fancy_row(hunk_boundary_row(ts_context.start_text or "", ts_context.start_segments, node_start), nil, status_hunk_indent)
+        if node_start ~= node_end then
+          status_add_fancy_row(hunk_boundary_ellipsis_row(start_text), nil, status_hunk_indent)
+        end
+      end
+      if not visible_hunk_lines[end_text] then
+        if node_end ~= node_start then
+          status_add_fancy_row(hunk_boundary_ellipsis_row(end_text), nil, status_hunk_indent)
+        end
+        if node_end ~= node_start then
+          status_add_fancy_row(hunk_boundary_row(end_text, ts_context.end_segments, node_end), nil, status_hunk_indent)
+        end
+      end
+    end
     return
   end
 
-  local rendered_rows = hunk_folded and { rows[1] } or rows
-  for _, row in ipairs(rendered_rows) do
-    if row then
-      status_add_fancy_row(row, entry, status_hunk_indent)
-    end
+  if hunk_folded then
+    status_add_fancy_row(rows[1], entry, status_hunk_indent)
+    return
+  end
+
+  status_add_fancy_row(rows[1], entry, status_hunk_indent)
+  for row_index = 2, #rows do
+    local row = rows[row_index]
+    if row then status_add_fancy_row(row, row.diff_review_boundary and nil or entry, status_hunk_indent) end
   end
 end
 
