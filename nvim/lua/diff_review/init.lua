@@ -1330,12 +1330,9 @@ local function hunk_boundary_ellipsis_row(reference_text, gutter)
 end
 
 ---@param header_parts table[]
----@param gutter? DiffReviewGutterSpec
 ---@return table
-local function hunk_header_row(header_parts, gutter)
-  gutter = gutter or default_hunk_gutter_spec()
+local function hunk_header_row(header_parts)
   local row = {}
-  hunk_add_gutter(row, gutter, nil, nil, " ", nil)
   for _, part in ipairs(header_parts) do
     row[#row + 1] = part
   end
@@ -1875,7 +1872,7 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
 
       local visible_hunk_lines = hunk_visible_source_lines(hunk.diff)
       local gutter = hunk.gutter
-      ret[#ret + 1] = hunk_header_row(header_parts, gutter)
+      ret[#ret + 1] = hunk_header_row(header_parts)
       if opts.boundary_context and type(raw_context) == "table" then
         local node_start = raw_context.start_row + 1
         local start_text = raw_context.start_text or ""
@@ -2708,6 +2705,7 @@ local status_section_order = {
 }
 local status_file_indent = 0
 local status_hunk_indent = 0
+local status_reconcile_delay_ms = 120
 
 ---@type table<string, DiffReviewSectionConfig>
 local status_section_by_name = {}
@@ -3175,6 +3173,43 @@ local function status_ensure_file(section_map, section_name, file)
   return existing_file
 end
 
+---@param file DiffReviewStatusFile
+---@param hunk DiffReviewHunk
+---@return boolean
+local function status_append_hunk_to_file(file, hunk)
+  for _, existing_hunk in ipairs(file.hunks or {}) do
+    if existing_hunk.diff == hunk.diff then return false end
+  end
+  file.hunks = file.hunks or {}
+  file.hunks[#file.hunks + 1] = hunk
+  file.added = (file.added or 0) + (hunk.added or 0)
+  file.removed = (file.removed or 0) + (hunk.removed or 0)
+  return true
+end
+
+---@param section_map table<DiffReviewStatusSectionName, DiffReviewStatusSection>
+---@param section_name DiffReviewStatusSectionName
+---@param file DiffReviewStatusFile
+local function status_merge_file_into_section(section_map, section_name, file)
+  local section = section_map[section_name]
+  local existing_file = section.files_by_name[file.filename]
+  if not existing_file then
+    section.files[#section.files + 1] = file
+    section.files_by_name[file.filename] = file
+    return
+  end
+
+  local moved_hunks = file.hunks or {}
+  if #moved_hunks == 0 then
+    existing_file.added = (existing_file.added or 0) + (file.added or 0)
+    existing_file.removed = (existing_file.removed or 0) + (file.removed or 0)
+    return
+  end
+  for _, hunk in ipairs(moved_hunks) do
+    status_append_hunk_to_file(existing_file, hunk)
+  end
+end
+
 ---@param sections DiffReviewStatusSection[]?
 ---@param entries DiffReviewStatusEntry[]
 ---@param target_section DiffReviewStatusSectionName
@@ -3188,9 +3223,7 @@ local function status_apply_optimistic_move(sections, entries, target_section)
       if source_section ~= target_section then
         status_remove_file_from_section(section_map, source_section, entry.file.filename)
         local moved_file = status_copy_file_for_section(entry.file, target_section)
-        local section = section_map[target_section]
-        section.files[#section.files + 1] = moved_file
-        section.files_by_name[moved_file.filename] = moved_file
+        status_merge_file_into_section(section_map, target_section, moved_file)
       end
     elseif entry.kind == "hunk" and entry.file and entry.hunk then
       local source_file = entry.file
@@ -3215,9 +3248,7 @@ local function status_apply_optimistic_move(sections, entries, target_section)
         moved_hunk.section_name = target_section
         moved_hunk.staged = target_section == "staged"
         moved_hunk.git_status = target_file.git_status or moved_hunk.git_status
-        target_file.hunks[#target_file.hunks + 1] = moved_hunk
-        target_file.added = target_file.added + (moved_hunk.added or 0)
-        target_file.removed = target_file.removed + (moved_hunk.removed or 0)
+        status_append_hunk_to_file(target_file, moved_hunk)
       end
     end
   end
@@ -3271,6 +3302,9 @@ local function status_diff_hunks_for_file(file)
   return hunks
 end
 
+local status_cursor_target
+local status_operations_pending
+
 ---@param file DiffReviewStatusFile
 ---@param hunk DiffReviewHunk
 ---@param previous_hunk? DiffReviewHunk
@@ -3291,8 +3325,9 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk)
       M._status.fancy_rows = {}
       local buf = M._status.buf
       if buf and vim.api.nvim_buf_is_valid(buf) then
-        local cursor = vim.api.nvim_win_get_cursor(0)[1]
-        M.render_status(buf, hunk_key, cursor, { reuse_sections = true })
+        if status_operations_pending() then return end
+        local target_id, fallback_line = status_cursor_target(buf)
+        M.render_status(buf, target_id, fallback_line, { reuse_sections = true })
       end
     end)
   end
@@ -3554,6 +3589,56 @@ local function status_notify_action(action, hunk_count, file_count)
   vim.notify(("%s %s"):format(action, table.concat(parts, ", ")), vim.log.levels.INFO)
 end
 
+---@param buf integer?
+---@return string? target_id
+---@return integer? fallback_line
+status_cursor_target = function(buf)
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return nil, nil end
+  local ok_current_buf, current_buf = pcall(vim.api.nvim_get_current_buf)
+  if not ok_current_buf or current_buf ~= buf then return nil, nil end
+  local ok_cursor, cursor = pcall(vim.api.nvim_win_get_cursor, 0)
+  if not ok_cursor then return nil, nil end
+
+  local line = cursor[1]
+  local status = M._status
+  local entry = status and status.entries and status.entries[line] or nil
+  return entry and entry.id or nil, line
+end
+
+---@param entries DiffReviewStatusEntry[]
+---@return string?
+local function status_hunk_action_target_id(entries)
+  local status = M._status
+  if not (status and status.entries) then return nil end
+
+  local action_ids = {}
+  local has_hunk = false
+  for _, entry in ipairs(entries or {}) do
+    if entry.kind == "hunk" and entry.id then
+      has_hunk = true
+      action_ids[entry.id] = true
+    end
+  end
+  if not has_hunk then return nil end
+
+  local cursor_line = vim.api.nvim_win_get_cursor(0)[1]
+  if not (status.buf and vim.api.nvim_buf_is_valid(status.buf)) then return nil end
+  local max_line = vim.api.nvim_buf_line_count(status.buf)
+  for line = cursor_line + 1, max_line do
+    local entry = status.entries[line]
+    if entry and entry.kind == "hunk" and entry.id and not action_ids[entry.id] then
+      return entry.id
+    end
+  end
+  for line = cursor_line - 1, 1, -1 do
+    local entry = status.entries[line]
+    if entry and entry.kind == "hunk" and entry.id and not action_ids[entry.id] then
+      return entry.id
+    end
+  end
+  return nil
+end
+
 local function status_restore_cursor(buf, target_id, fallback_line)
   local target_line = nil
   if target_id then
@@ -3564,6 +3649,7 @@ local function status_restore_cursor(buf, target_id, fallback_line)
       end
     end
   end
+  if not target_line and not fallback_line then return end
   target_line = target_line or math.min(fallback_line or 1, vim.api.nvim_buf_line_count(buf))
   pcall(vim.api.nvim_win_set_cursor, 0, { math.max(target_line, 1), 0 })
 end
@@ -3649,6 +3735,10 @@ function M.render_status(buf, target_id, fallback_line, opts)
   setup_bg_highlights()
   M._status = M._status or {}
   M._status.buf = buf
+  M._status.reconcile_generation = (M._status.reconcile_generation or 0) + 1
+  if target_id == nil and fallback_line == nil then
+    target_id, fallback_line = status_cursor_target(buf)
+  end
 
   if opts.reuse_sections and M._status.head_lines and M._status.sections then
     status_render_loaded(buf, target_id, fallback_line, opts, M._status.head_lines, M._status.sections)
@@ -3675,6 +3765,10 @@ function M.render_status(buf, target_id, fallback_line, opts)
     status_load_async(cwd, function(result)
       if not (M._status and M._status.request_id == request_id) then return end
       if not vim.api.nvim_buf_is_valid(buf) then return end
+      if status_operations_pending() then
+        status_request_reconcile(buf, target_id)
+        return
+      end
       M._status.head_lines = result.head_lines
       M._status.sections = result.sections
       M._status.fancy_rows = {}
@@ -3725,6 +3819,11 @@ local function refresh_status_after_action(buf, target_id)
   render_status_or_notify(buf, target_id, vim.api.nvim_win_get_cursor(0)[1])
 end
 
+status_operations_pending = function()
+  local status = M._status
+  return status and (status.operation_running or #(status.operation_queue or {}) > 0) or false
+end
+
 ---@param buf integer?
 ---@param target_id? string
 local function status_request_reconcile(buf, target_id)
@@ -3732,19 +3831,27 @@ local function status_request_reconcile(buf, target_id)
   if not status then return end
   status.reconcile_buf = buf or status.buf
   status.reconcile_target_id = target_id or status.reconcile_target_id
-  if not status.operation_running and #(status.operation_queue or {}) == 0 and status.reconcile_buf then
-    local reconcile_buf = status.reconcile_buf
-    local reconcile_target_id = status.reconcile_target_id
-    status.reconcile_buf = nil
-    status.reconcile_target_id = nil
-    refresh_status_after_action(reconcile_buf, reconcile_target_id)
-  end
+  if status_operations_pending() or not status.reconcile_buf then return end
+
+  status.reconcile_generation = (status.reconcile_generation or 0) + 1
+  local generation = status.reconcile_generation
+  vim.defer_fn(function()
+    local latest_status = M._status
+    if not latest_status or latest_status.reconcile_generation ~= generation then return end
+    if status_operations_pending() then return end
+    local reconcile_buf = latest_status.reconcile_buf
+    local reconcile_target_id = latest_status.reconcile_target_id
+    latest_status.reconcile_buf = nil
+    latest_status.reconcile_target_id = nil
+    if reconcile_buf then refresh_status_after_action(reconcile_buf, reconcile_target_id) end
+  end, status_reconcile_delay_ms)
 end
 
 ---@param operation fun(done: fun())
 local function status_enqueue_operation(operation)
   M._status = M._status or {}
   local status = M._status
+  status.reconcile_generation = (status.reconcile_generation or 0) + 1
   status.operation_queue = status.operation_queue or {}
   status.operation_queue[#status.operation_queue + 1] = operation
 
@@ -3864,18 +3971,19 @@ local function status_stage_entries(entries)
   if #action_entries == 0 then return end
 
   local first_id = action_entries[1].id
+  local target_id = status_hunk_action_target_id(action_entries) or first_id
   local hunk_diffs, files = status_split_action_entries(action_entries)
   local staged_hunks = 0
   local staged_files = 0
   local status_buf = M._status and M._status.buf
 
-  status_apply_optimistic_entries(action_entries, "staged", first_id)
+  status_apply_optimistic_entries(action_entries, "staged", target_id)
 
   local function finish()
     if staged_hunks > 0 or staged_files > 0 then
       status_notify_action("Staged", staged_hunks, staged_files)
     end
-    status_request_reconcile(status_buf, first_id)
+    status_request_reconcile(status_buf, target_id)
   end
 
   local function stage_files_after_hunks()
@@ -3927,20 +4035,21 @@ local function status_unstage_entries(entries)
   if #action_entries == 0 then return end
 
   local first_id = action_entries[1].id
+  local target_id = status_hunk_action_target_id(action_entries) or first_id
   local tracked_entries, added_entries = status_partition_unstage_entries(action_entries)
   local hunk_diffs, files, added_files = status_split_unstage_entries(action_entries)
   local unstaged_hunks = 0
   local unstaged_files = 0
   local status_buf = M._status and M._status.buf
 
-  status_apply_optimistic_entries(tracked_entries, "unstaged", first_id)
-  status_apply_optimistic_entries(added_entries, "untracked", first_id)
+  status_apply_optimistic_entries(tracked_entries, "unstaged", target_id)
+  status_apply_optimistic_entries(added_entries, "untracked", target_id)
 
   local function finish()
     if unstaged_hunks > 0 or unstaged_files > 0 then
       status_notify_action("Unstaged", unstaged_hunks, unstaged_files)
     end
-    status_request_reconcile(status_buf, first_id)
+    status_request_reconcile(status_buf, target_id)
   end
 
   local function unstage_files_after_hunks()
@@ -4094,6 +4203,7 @@ local function status_discard_entry_list(entries, target_id)
     end
   end
   if #discard_entries == 0 then return end
+  local action_target_id = status_hunk_action_target_id(discard_entries) or target_id
 
   local message
   if #discard_entries == 1 then
@@ -4109,7 +4219,7 @@ local function status_discard_entry_list(entries, target_id)
     message = { ("Discard changes in %d file(s)?"):format(status_count_set(files)) }
   end
   confirm(message, function()
-    status_discard_entries(discard_entries, target_id)
+    status_discard_entries(discard_entries, action_target_id)
   end)
 end
 

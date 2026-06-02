@@ -176,6 +176,13 @@ If diagnostics still look wrong, run the linter directly (e.g. `luacheck`,
 - **Async refresh state:** long-running refreshes need a request id or equivalent
   cancellation token. Start a new id for each refresh and ignore callbacks from
   older ids so slow Git/process results cannot repaint stale data over newer UI.
+- **Cursor-preserving UI rerenders:** status/list buffers that redraw after
+  async work must snapshot the current cursor target before rendering. Prefer a
+  stable item id when the cursor is on an item, plus the raw cursor line as a
+  fallback. Async enrichment callbacks such as Tree-sitter context updates must
+  preserve the user's current target, not jump to the item whose callback just
+  completed. Treat "no explicit target" as "keep the cursor where it is," not
+  "move to top."
 - **Responsive async UI state:** keep an explicit UI model that can update
   immediately when the user acts, then trigger the backend process asynchronously
   and reconcile when it finishes. Do not replace an already-rendered status/list
@@ -184,7 +191,10 @@ If diagnostics still look wrong, run the linter directly (e.g. `luacheck`,
 - **Git index mutations:** keep index-writing commands (`git add`,
   `git restore --staged`, `git apply --cached`, checkout/restore fallbacks)
   asynchronous but sequential within a batch. Running multiple index writers in
-  parallel can race on `.git/index.lock`.
+  parallel can race on `.git/index.lock`. Reconcile status/list UI from Git only
+  after the mutation queue is idle, and use a short debounce so rapid repeated
+  keypresses can enqueue before a full backend refresh repaints an intermediate
+  state.
 - **Tree-sitter parsing:** use `LanguageTree:parse(range, on_parse)` when parse
   work is needed during rendering or cursor-driven UI. Render with a cheap
   fallback first, then update from the parse callback. Do not call

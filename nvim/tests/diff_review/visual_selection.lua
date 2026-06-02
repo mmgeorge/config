@@ -7,6 +7,10 @@ local function assert_true(condition, message)
   if not condition then error(message, 2) end
 end
 
+local function comparable_path(path)
+  return vim.fs.normalize(path):gsub("\\", "/")
+end
+
 local function run_git(arguments)
   local command = { "git", "-C", test_root }
   vim.list_extend(command, arguments)
@@ -79,10 +83,10 @@ local function run()
   write_lines(test_root .. "/b.txt", { "two" })
 
   local chdir_ok = pcall(vim.fn.chdir, test_root)
-  assert_true(chdir_ok and vim.fs.normalize(vim.fn.getcwd()) == test_root, "chdir failed: " .. test_root)
+  assert_true(chdir_ok and comparable_path(vim.fn.getcwd()) == comparable_path(test_root), "chdir failed: " .. test_root)
   local root_output = vim.fn.systemlist({ "git", "rev-parse", "--show-toplevel" })
   assert_true(vim.v.shell_error == 0, "rev-parse failed: " .. table.concat(root_output, "\n"))
-  assert_true(vim.fs.normalize(root_output[1]) == test_root, "wrong git root: " .. tostring(root_output[1]))
+  assert_true(comparable_path(root_output[1]) == comparable_path(test_root), "wrong git root: " .. tostring(root_output[1]))
 
   require("diff_review").open()
   assert_true(vim.bo.filetype == "DiffReviewStatus", "DiffReviewStatus buffer did not open")

@@ -23,7 +23,7 @@ function M.setup()
   vim.api.nvim_set_hl(0, "DiffReviewFileName", { fg = "#ffffff", nocombine = true, ctermfg = 15 })
   vim.api.nvim_set_hl(0, "SnacksDiffHunkHeader", { bg = "#1e1e1e" })
   vim.api.nvim_set_hl(0, "DiffReviewActiveHunkHeader", { bg = "#303446" })
-  vim.api.nvim_set_hl(0, "DiffReviewHunkHeader", { fg = header_fg, bg = "#1e1e1e", nocombine = true })
+  vim.api.nvim_set_hl(0, "DiffReviewHunkHeader", { fg = header_fg, nocombine = true })
   vim.api.nvim_set_hl(0, "DiffReviewStatusHeader", { fg = "#f8f8f2", bold = true })
   vim.api.nvim_set_hl(0, "DiffReviewStatusHint", { fg = "#9ca3af" })
   vim.api.nvim_set_hl(0, "DiffReviewStatusHintKey", { fg = "#f8f8f2", bold = true })
@@ -35,7 +35,6 @@ function M.setup()
   vim.api.nvim_set_hl(0, "DiffReviewStatusLabel", { fg = "#c0c0c0", bold = true })
   vim.api.nvim_set_hl(0, "DiffReviewHunkContext", {
     fg = header_fg,
-    bg = "#1e1e1e",
     underline = true,
     nocombine = true,
   })

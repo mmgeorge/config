@@ -815,3 +815,38 @@ identity — scan `view.renderer._locations` for the file-level group node
 (`node.group.fields[1] == "filename"`, matching `node.item.filename`) and put
 the cursor on its row. Identity beats `cursor + 1`: when staging creates a brand
 new category header, `+1` lands on the header, not the next file.
+
+### 11. Async Context Rerenders Steal the Cursor
+
+**Bug**: A status/list action moves the cursor correctly, then a moment later it
+jumps back to an earlier hunk or the top of the buffer.
+
+**Cause**: A delayed enrichment callback, such as Tree-sitter context or syntax
+highlighting, rerenders the list and passes the callback's item id as the
+cursor target. If that callback belongs to a different hunk than the one the
+user is now on, the late render steals the cursor. Renders with no explicit
+target are also dangerous if the generic fallback is line 1.
+
+**Fix**: Every rerender path needs a cursor snapshot. Before rendering, capture
+the current item id under the cursor plus the raw cursor line as fallback. Async
+callbacks should preserve that current target, not target the item whose async
+work just completed. A render with no explicit target should mean "preserve the
+current cursor," and only action code should intentionally provide a different
+target, such as the next hunk after stage/unstage/discard.
+
+### 12. Rapid Actions Repaint Intermediate Backend State
+
+**Bug**: Pressing an action key repeatedly, such as staging two hunks with `S S`,
+briefly flickers through an intermediate state even though optimistic UI updates
+work.
+
+**Cause**: The first async git mutation finishes and immediately starts a full
+backend reconcile before the second keypress has been processed or queued. That
+backend snapshot is technically current for only the first mutation, so it
+repaints over the optimistic UI until the second action renders.
+
+**Fix**: Keep index mutations sequential, but debounce backend reconciliation
+after the queue becomes idle. Enqueuing another mutation must cancel the pending
+reconcile. While mutations are running or queued, suppress unrelated full status
+loads and async enrichment rerenders; the final debounced reconcile refreshes
+from Git once the burst has settled.

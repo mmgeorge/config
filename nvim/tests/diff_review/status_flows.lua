@@ -262,11 +262,43 @@ local function buffer_contains(buf, needle)
   return false
 end
 
+local function count_lines_containing(buf, needle)
+  local count = 0
+  for _, line in ipairs(status_lines(buf)) do
+    if line:find(needle, 1, true) then count = count + 1 end
+  end
+  return count
+end
+
 local function find_row(buf, needle)
   for index, line in ipairs(status_lines(buf)) do
     if line:find(needle, 1, true) then return index end
   end
   error("missing row " .. needle .. "\n" .. table.concat(status_lines(buf), "\n"), 2)
+end
+
+local function find_row_after(buf, needle, start_row)
+  local lines = status_lines(buf)
+  for index = start_row + 1, #lines do
+    if lines[index]:find(needle, 1, true) then return index end
+  end
+  error("missing row after " .. start_row .. ": " .. needle .. "\n" .. table.concat(lines, "\n"), 2)
+end
+
+local function find_hunk_row_after_file(buf, file)
+  local lines = status_lines(buf)
+  local file_row = find_row(buf, file)
+  for index = file_row + 1, #lines do
+    if lines[index]:find("@@", 1, true) then return index end
+    if lines[index]:find("%.txt ", 1) or lines[index]:find("%.rs ", 1) then break end
+  end
+  error("missing hunk row after " .. file .. "\n" .. table.concat(lines, "\n"), 2)
+end
+
+local function cursor_is_on_hunk_after_file(buf, file)
+  local ok_hunk, hunk_row = pcall(find_hunk_row_after_file, buf, file)
+  if not ok_hunk then return false end
+  return vim.api.nvim_win_get_cursor(0)[1] == hunk_row
 end
 
 local function trigger_normal_mapping(key, row)
@@ -294,6 +326,16 @@ local function saw_system_call_containing(needle)
     if call.kind == "system" and call.key:find(needle, 1, true) then return true end
   end
   return false
+end
+
+local function count_calls(kind, needle)
+  local count = 0
+  for _, call in ipairs(calls) do
+    if call.kind == kind and (not needle or call.key:find(needle, 1, true)) then
+      count = count + 1
+    end
+  end
+  return count
 end
 
 local function render_and_wait(buf, needle)
@@ -356,6 +398,135 @@ local function run()
   end, "hunk unstage did not run reverse cached apply")
   wait_for(function() return buffer_contains(buf, "Unstaged changes (1)") end, "hunk unstage did not reconcile")
 
+  reset_state({ modified = { ["cursor-stage-a.txt"] = true, ["cursor-stage-b.txt"] = true } })
+  render_and_wait(buf, "cursor-stage-a.txt +1 -1")
+  trigger_normal_mapping("<Tab>", find_row(buf, "cursor-stage-a.txt"))
+  trigger_normal_mapping("<Tab>", find_row(buf, "cursor-stage-b.txt"))
+  reset_calls()
+  trigger_normal_mapping("S", find_row_after(buf, "@@ +1 -1", find_row(buf, "cursor-stage-a.txt")))
+  wait_for(function()
+    return saw_system_call_containing("\tapply\t--cached\t--whitespace=nowarn\t-")
+  end, "cursor hunk stage did not run cached apply")
+  wait_for(function()
+    return cursor_is_on_hunk_after_file(buf, "cursor-stage-b.txt")
+  end, "cursor did not move to next hunk after staging\n" .. table.concat(status_lines(buf), "\n"))
+
+  reset_state({ modified = { ["rapid-stage-a.txt"] = true, ["rapid-stage-b.txt"] = true } })
+  render_and_wait(buf, "rapid-stage-a.txt +1 -1")
+  trigger_normal_mapping("<Tab>", find_row(buf, "rapid-stage-a.txt"))
+  trigger_normal_mapping("<Tab>", find_row(buf, "rapid-stage-b.txt"))
+  reset_calls()
+  trigger_normal_mapping("S", find_hunk_row_after_file(buf, "rapid-stage-a.txt"))
+  wait_for(function()
+    return state.staged_modified["rapid-stage-a.txt"] == true
+  end, "first rapid hunk stage did not finish")
+  vim.wait(20)
+  assert_true(
+    count_calls("systemlist_async", "\tdiff") == 0,
+    "rapid first hunk stage reconciled before debounce\n" .. table.concat(status_lines(buf), "\n")
+  )
+  trigger_normal_mapping("S", find_hunk_row_after_file(buf, "rapid-stage-b.txt"))
+  wait_for(function()
+    return state.staged_modified["rapid-stage-b.txt"] == true
+  end, "second rapid hunk stage did not finish")
+  vim.wait(20)
+  assert_true(
+    count_calls("systemlist_async", "\tdiff") == 0,
+    "rapid queued hunk stages reconciled before debounce\n" .. table.concat(status_lines(buf), "\n")
+  )
+  wait_for(function()
+    return count_calls("systemlist_async", "\tdiff") > 0
+  end, "rapid hunk stages did not reconcile after debounce")
+
+  local pending_context_callbacks = {}
+  local original_compute_hunk_context_async = diff_review.compute_hunk_context_async
+  diff_review.compute_hunk_context_async = function(filename, line, cb)
+    pending_context_callbacks[#pending_context_callbacks + 1] = {
+      filename = filename,
+      line = line,
+      cb = cb,
+    }
+  end
+  diff_review._ts_context_cache = {}
+  reset_state({ modified = { ["context-stage-a.txt"] = true, ["context-stage-b.txt"] = true } })
+  render_and_wait(buf, "context-stage-a.txt +1 -1")
+  trigger_normal_mapping("<Tab>", find_row(buf, "context-stage-a.txt"))
+  trigger_normal_mapping("<Tab>", find_row(buf, "context-stage-b.txt"))
+  wait_for(function() return #pending_context_callbacks > 0 end, "status render did not request hunk context")
+  reset_calls()
+  trigger_normal_mapping("S", find_hunk_row_after_file(buf, "context-stage-a.txt"))
+  wait_for(function()
+    return saw_system_call_containing("\tapply\t--cached\t--whitespace=nowarn\t-")
+  end, "context cursor hunk stage did not run cached apply")
+  wait_for(function()
+    return cursor_is_on_hunk_after_file(buf, "context-stage-b.txt")
+  end, "cursor did not move to next hunk before delayed context callback\n" .. table.concat(status_lines(buf), "\n"))
+  for _, request in ipairs(pending_context_callbacks) do
+    if request.filename:find("context%-stage%-a%.txt") then
+      request.cb("DelayedContext")
+    end
+  end
+  vim.wait(50)
+  assert_true(
+    cursor_is_on_hunk_after_file(buf, "context-stage-b.txt"),
+    "delayed hunk context rerender stole cursor\n" .. table.concat(status_lines(buf), "\n")
+  )
+  diff_review.compute_hunk_context_async = original_compute_hunk_context_async
+  diff_review._ts_context_cache = {}
+
+  reset_state({ modified = { ["refresh-cursor-a.txt"] = true, ["refresh-cursor-b.txt"] = true } })
+  render_and_wait(buf, "refresh-cursor-a.txt +1 -1")
+  trigger_normal_mapping("<Tab>", find_row(buf, "refresh-cursor-a.txt"))
+  trigger_normal_mapping("<Tab>", find_row(buf, "refresh-cursor-b.txt"))
+  vim.api.nvim_win_set_cursor(0, { find_hunk_row_after_file(buf, "refresh-cursor-b.txt"), 0 })
+  diff_review.render_status(buf)
+  wait_for(function()
+    return cursor_is_on_hunk_after_file(buf, "refresh-cursor-b.txt")
+  end, "untargeted status refresh did not preserve cursor\n" .. table.concat(status_lines(buf), "\n"))
+
+  reset_state({ staged_modified = { ["cursor-unstage-a.txt"] = true, ["cursor-unstage-b.txt"] = true } })
+  render_and_wait(buf, "cursor-unstage-a.txt +1 -1")
+  trigger_normal_mapping("<Tab>", find_row(buf, "cursor-unstage-a.txt"))
+  trigger_normal_mapping("<Tab>", find_row(buf, "cursor-unstage-b.txt"))
+  reset_calls()
+  trigger_normal_mapping("U", find_row_after(buf, "@@ +1 -1", find_row(buf, "cursor-unstage-a.txt")))
+  wait_for(function()
+    return saw_system_call_containing("\tapply\t--cached\t--reverse\t--whitespace=nowarn\t-")
+  end, "cursor hunk unstage did not run reverse cached apply")
+  wait_for(function()
+    return cursor_is_on_hunk_after_file(buf, "cursor-unstage-b.txt")
+  end, "cursor did not move to next hunk after unstaging\n" .. table.concat(status_lines(buf), "\n"))
+
+  reset_state({ modified = { ["merge-file.txt"] = true }, staged_modified = { ["merge-file.txt"] = true } })
+  render_and_wait(buf, "merge-file.txt +1 -1")
+  trigger_normal_mapping("U", find_row_after(buf, "merge-file.txt", find_row(buf, "merge-file.txt")))
+  assert_true(
+    count_lines_containing(buf, "merge-file.txt") == 1,
+    "optimistic file unstage rendered duplicate file headings\n" .. table.concat(status_lines(buf), "\n")
+  )
+  wait_for(function()
+    return saw_system_call("git\t-C\t" .. root .. "\trestore\t--staged\t--\tmerge-file.txt")
+  end, "merge file unstage did not run restore --staged")
+
+  reset_state({ modified = { ["merge-hunk.txt"] = true }, staged_modified = { ["merge-hunk.txt"] = true } })
+  render_and_wait(buf, "merge-hunk.txt +1 -1")
+  trigger_normal_mapping("<Tab>", find_row(buf, "merge-hunk.txt"))
+  local staged_merge_hunk_file_row = find_row_after(buf, "merge-hunk.txt", find_row(buf, "merge-hunk.txt"))
+  trigger_normal_mapping("<Tab>", staged_merge_hunk_file_row)
+  reset_calls()
+  trigger_normal_mapping("U", find_row_after(buf, "@@ +1 -1", staged_merge_hunk_file_row))
+  assert_true(
+    count_lines_containing(buf, "merge-hunk.txt") == 1,
+    "optimistic hunk unstage rendered duplicate file headings\n" .. table.concat(status_lines(buf), "\n")
+  )
+  assert_true(
+    count_lines_containing(buf, "@@ +1 -1") == 1,
+    "optimistic hunk unstage rendered duplicate identical hunks\n" .. table.concat(status_lines(buf), "\n")
+  )
+  wait_for(function()
+    return saw_system_call_containing("\tapply\t--cached\t--reverse\t--whitespace=nowarn\t-")
+  end, "merge hunk unstage did not run reverse cached apply")
+
   reset_state({ untracked = { ["new.txt"] = true } })
   render_and_wait(buf, "new.txt new")
   trigger_normal_mapping("S", find_row(buf, "new.txt"))
@@ -405,6 +576,20 @@ local function run()
     return saw_system_call_containing("\tapply\t--reverse\t--whitespace=nowarn\t-")
   end, "discard hunk did not run reverse apply")
   wait_for(function() return not buffer_contains(buf, "discard-hunk.txt") end, "discard hunk did not refresh")
+
+  reset_state({ modified = { ["cursor-discard-a.txt"] = true, ["cursor-discard-b.txt"] = true } })
+  render_and_wait(buf, "cursor-discard-a.txt +1 -1")
+  trigger_normal_mapping("<Tab>", find_row(buf, "cursor-discard-a.txt"))
+  trigger_normal_mapping("<Tab>", find_row(buf, "cursor-discard-b.txt"))
+  reset_calls()
+  trigger_normal_mapping("j", find_row_after(buf, "@@ +1 -1", find_row(buf, "cursor-discard-a.txt")))
+  confirm_yes()
+  wait_for(function()
+    return saw_system_call_containing("\tapply\t--reverse\t--whitespace=nowarn\t-")
+  end, "cursor hunk discard did not run reverse apply")
+  wait_for(function()
+    return cursor_is_on_hunk_after_file(buf, "cursor-discard-b.txt")
+  end, "cursor did not move to next hunk after discarding\n" .. table.concat(status_lines(buf), "\n"))
 
   reset_state({ staged_added = { ["discard-added.txt"] = true } })
   render_and_wait(buf, "discard-added.txt +1 -0")

@@ -219,6 +219,8 @@ local function run()
   local closing_line = vim.api.nvim_buf_get_lines(buf, find_row(buf, "  }") - 1, find_row(buf, "  }"), false)[1]
   assert_true(closing_line:find("^%s*13%s+13%s+}", 1) ~= nil, "closing boundary did not use diff gutter: " .. closing_line)
   wait_for(function() return buffer_contains(buf, "@@ Engine.new +1 -1") end, "compact hunk header did not get context label\n" .. buffer_dump(buf))
+  local header_line = vim.api.nvim_buf_get_lines(buf, find_row(buf, "@@ Engine.new +1 -1") - 1, find_row(buf, "@@ Engine.new +1 -1"), false)[1]
+  assert_true(header_line:find("^@@ Engine%.new %+1 %-1", 1) ~= nil, "hunk header unexpectedly used gutter: " .. header_line)
 
   local before = system_call_count()
   trigger_normal_mapping("S", boundary_row)
