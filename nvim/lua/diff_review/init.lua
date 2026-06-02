@@ -1,8 +1,5 @@
---- Trouble source: diff_review
---- Shows git diff hunks grouped by file with staging checkboxes.
---- Usage: :Trouble diff_review
-
-local Item = require("trouble.item")
+--- DiffReview standalone git review UI.
+--- Usage: :DiffReview
 
 local M = {}
 
@@ -12,56 +9,14 @@ M._status_ns = vim.api.nvim_create_namespace("diff_review_status")
 M._hunk_header_priority = 20
 M._active_hunk_header_priority = 200
 
--- Background-only highlight groups for diff lines.
--- Pull bg from existing DiffAdd/DiffDelete so they match the gutter colors.
+local config = require("diff_review.config")
+local highlights = require("diff_review.highlights")
+local notifications = require("diff_review.notifications")
+
 local function setup_bg_highlights()
-  local function get_bg(name)
-    local hl = vim.api.nvim_get_hl(0, { name = name, link = false })
-    return hl.bg
-  end
-  local add_bg = get_bg("DiffAdd") or "#002200"
-  local del_bg = get_bg("DiffDelete") or "#220000"
-  local normal = vim.api.nvim_get_hl(0, { name = "Normal", link = false })
-  local header_fg = normal.fg or "#c0c0c0"
-  vim.api.nvim_set_hl(0, "DiffReviewAddBg", { bg = add_bg })
-  vim.api.nvim_set_hl(0, "DiffReviewDeleteBg", { bg = del_bg })
-  vim.api.nvim_set_hl(0, "DiffReviewAddLineNr", { fg = "#50fa7b", bg = add_bg, bold = true })
-  vim.api.nvim_set_hl(0, "DiffReviewDeleteLineNr", { fg = "#ff5555", bg = del_bg, bold = true })
-  vim.api.nvim_set_hl(0, "DiffReviewContextLineNr", { fg = "#555555" })
-  vim.api.nvim_set_hl(0, "DiffReviewContextBg", {})
-  -- Fg-only variants for range numbers in headers (no bg)
-  vim.api.nvim_set_hl(0, "DiffReviewAddRange", { fg = "#50fa7b" })
-  vim.api.nvim_set_hl(0, "DiffReviewDeleteRange", { fg = "#ff5555" })
-  vim.api.nvim_set_hl(0, "DiffReviewDirName", {
-    fg = "#7f8790",
-    nocombine = true,
-    ctermfg = 8,
-  })
-  vim.api.nvim_set_hl(0, "DiffReviewFileName", {
-    fg = "#ffffff",
-    nocombine = true,
-    ctermfg = 15,
-  })
-  -- Subtle gray bg for hunk header lines in the diff buffer
-  vim.api.nvim_set_hl(0, "SnacksDiffHunkHeader", { bg = "#1e1e1e" })
-  vim.api.nvim_set_hl(0, "DiffReviewActiveHunkHeader", { bg = "#303446" })
-  vim.api.nvim_set_hl(0, "DiffReviewHunkHeader", { fg = header_fg, bg = "#1e1e1e", nocombine = true })
-  vim.api.nvim_set_hl(0, "DiffReviewStatusHeader", { fg = "#f8f8f2", bold = true })
-  vim.api.nvim_set_hl(0, "DiffReviewStatusHint", { fg = "#9ca3af" })
-  vim.api.nvim_set_hl(0, "DiffReviewStatusHintKey", { fg = "#f8f8f2", bold = true })
-  vim.api.nvim_set_hl(0, "DiffReviewStatusFold", { fg = "#9ca3af" })
-  vim.api.nvim_set_hl(0, "DiffReviewStatusPath", { fg = "#d4d4d4" })
-  vim.api.nvim_set_hl(0, "DiffReviewStatusObjectId", { fg = "#6b7280" })
-  vim.api.nvim_set_hl(0, "DiffReviewStatusBranch", { fg = "#f1fa8c", bold = true })
-  vim.api.nvim_set_hl(0, "DiffReviewStatusRemote", { fg = "#00afff", bold = true })
-  vim.api.nvim_set_hl(0, "DiffReviewStatusLabel", { fg = "#c0c0c0", bold = true })
-  vim.api.nvim_set_hl(0, "DiffReviewHunkContext", {
-    fg = header_fg,
-    bg = "#1e1e1e",
-    underline = true,
-    nocombine = true,
-  })
+  highlights.setup()
 end
+
 setup_bg_highlights()
 
 --- Compute added/removed line counts from diff text
@@ -116,7 +71,7 @@ end
 ---@param message string
 ---@param title? string
 local function notify_error(message, title)
-  vim.notify(message, vim.log.levels.ERROR, { title = title or "Diff Review" })
+  notifications.error(message, title)
 end
 
 ---@return string? root
@@ -196,34 +151,10 @@ local function run_git(args, input)
   return run_git_at_root(root, args, input)
 end
 
----@param failures table[]
----@return string
-local function format_failures(failures)
-  local lines = {}
-  local max_lines = math.min(#failures, 6)
-  for index = 1, max_lines do
-    local failure = failures[index]
-    local label = failure.file and vim.fn.fnamemodify(failure.file, ":.") or "git"
-    local detail = failure.message or failure.output or "unknown error"
-    if detail == "" then
-      detail = ("git exited %d"):format(failure.code or 1)
-    end
-    detail = detail:gsub("\n+", " ")
-    lines[#lines + 1] = ("  %s: %s"):format(label, detail)
-  end
-  if #failures > max_lines then
-    lines[#lines + 1] = ("  ... %d more"):format(#failures - max_lines)
-  end
-  return table.concat(lines, "\n")
-end
-
 ---@param title string
 ---@param failures table[]
 function M.notify_git_failures(title, failures)
-  if #failures == 0 then return end
-  local count = #failures
-  local noun = count == 1 and "failure" or "failures"
-  notify_error(("%s: %d %s\n%s"):format(title, count, noun, format_failures(failures)))
+  notifications.git_failures(title, failures)
 end
 
 ---@param files string[]
@@ -571,43 +502,9 @@ end
 -- Cache for treesitter context per file (cleared on refresh)
 M._ts_context_cache = {}
 
-function M.setup()
+function M.setup(opts)
+  M.config = config.setup(opts)
   setup_bg_highlights()
-end
-
---- Open the original Trouble-backed DiffReview picker.
-function M.open_trouble()
-  setup_bg_highlights()
-  M._main_win = nil
-  local view = require("trouble").open("diff_review")
-  if view then
-    view.first_render:next(function()
-      view:fold_level({ level = 1 })
-      -- Show hint + branch in the winbar
-      local branch = vim.trim(vim.fn.systemlist({ "git", "rev-parse", "--abbrev-ref", "HEAD" })[1] or "")
-      local winbar = " %#Comment#<Tab>%* toggle | %#Comment#S%* stage | %#Comment#U%* unstage | %#Comment#j%* discard | %#Comment#cc%* commit | %#Comment#<CR>%* jump | %#Comment#q%* close | %#Comment#?%* help"
-      if branch ~= "" then
-        winbar = winbar .. "%=" .. "%#Keyword# " .. branch .. " %*"
-      end
-      vim.wo[view.win.win].winbar = winbar
-      M.auto_preview(view)
-      -- Clean up diff buffers when Trouble closes
-      view.win:on("WinClosed", function()
-        M._cleanup_diff_buffers()
-      end)
-      view.win:on("BufWipeout", function()
-        M._cleanup_diff_buffers()
-      end)
-      -- Also watch for view.closed flag
-      view.win:on("WinLeave", function()
-        vim.defer_fn(function()
-          if view.closed then
-            M._cleanup_diff_buffers()
-          end
-        end, 100)
-      end)
-    end)
-  end
 end
 
 --- Close and wipe all diff buffers
@@ -627,8 +524,8 @@ function M._cleanup_diff_buffers()
   M._main_win = nil
 end
 
----@param cb fun(items: trouble.Item[])
----@param _ctx trouble.Source.ctx
+---@param cb fun(items: table[])
+---@param _ctx table?
 function M.get(cb, _ctx)
   M._ts_context_cache = {} -- clear treesitter context cache on refresh
   M._untracked = {} -- map of absolute path -> repo-relative path for untracked files
@@ -752,8 +649,7 @@ function M.get(cb, _ctx)
       file_check = "[ ]"
     end
 
-    items[#items + 1] = Item.new({
-      source = "diff_review",
+    items[#items + 1] = ({
       filename = filename,
       pos = { hunk.pos, 0 },
       item = {
@@ -780,8 +676,7 @@ function M.get(cb, _ctx)
   for _, f in ipairs(untracked_files) do
     local filename = vim.fn.fnamemodify(cwd .. "/" .. f, ":p")
     M._untracked[filename] = f -- remember repo-relative path for the synthetic diff
-    items[#items + 1] = Item.new({
-      source = "diff_review",
+    items[#items + 1] = ({
       filename = filename,
       pos = { 1, 0 },
       item = {
@@ -817,7 +712,6 @@ function M.get(cb, _ctx)
     M._file_hunk_staged[filename] = flags
   end
 
-  Item.add_text(items, { mode = "after" })
   cb(items)
 
   -- Pre-render all diff buffers so file switching is instant
@@ -1143,7 +1037,9 @@ function M.open_diff_buffer(filename)
 
     -- Close both diff buffer and trouble
     vim.keymap.set("n", "q", function()
-      require("trouble").close("diff_review")
+      if vim.api.nvim_buf_is_valid(buf) then
+        pcall(vim.api.nvim_buf_delete, buf, { force = true })
+      end
       M._cleanup_diff_buffers()
     end, vim.tbl_extend("force", kopts, { desc = "Close DiffReview", nowait = true }))
 
@@ -1361,7 +1257,6 @@ function M.open_diff_buffer(filename)
           M.refresh_open_diff_buffer(filename)
         end
         goto_next()
-        require("trouble").refresh("diff_review")
         -- The async list refresh re-renders the buffer (resetting the
         -- cursor), so re-assert the next-hunk position once it settles.
         vim.defer_fn(goto_next, 60)
@@ -1409,7 +1304,6 @@ function M.open_diff_buffer(filename)
           M.refresh_open_diff_buffer(filename)
         end
         stay()
-        require("trouble").refresh("diff_review")
         -- The async list refresh re-renders the buffer (resetting the
         -- cursor), so re-assert the current-hunk position once it settles.
         vim.defer_fn(stay, 60)
@@ -1639,146 +1533,6 @@ function M.refresh_open_diff_buffer(filename)
   M._refresh_diff_buffer(buf, filename)
 end
 
---- Capture the main window on first call (before we replace its buffer
---- with a diff scratch buffer, which makes Trouble's main detection fail
---- because buftype="nofile" is excluded).
----@param view trouble.View
----@return number? win
-function M.get_main_win(view)
-  if not M._main_win or not vim.api.nvim_win_is_valid(M._main_win) then
-    local main = view:main()
-    if main then
-      M._main_win = main.win
-    end
-  end
-  return M._main_win
-end
-
--- Saved number/relativenumber of the main window, captured before we first
--- hide them for the diff preview so they can be restored on jump/close.
-M._saved_wo = nil
-
---- Hide the buffer's line-number column in the diff preview window. The Snacks
---- renderer draws its own old/new line-number columns, so Neovim's number
---- column is a redundant third set. Saves the prior state once for restoring.
----@param win number
-function M._hide_line_numbers(win)
-  if M._saved_wo == nil then
-    M._saved_wo = {
-      number = vim.wo[win].number,
-      relativenumber = vim.wo[win].relativenumber,
-    }
-  end
-  vim.wo[win].number = false
-  vim.wo[win].relativenumber = false
-end
-
---- Restore the line-number columns hidden by _hide_line_numbers (e.g. when
---- jumping to a real file, where the number column is wanted again).
----@param win? number
-function M._restore_line_numbers(win)
-  if M._saved_wo and win and vim.api.nvim_win_is_valid(win) then
-    vim.wo[win].number = M._saved_wo.number
-    vim.wo[win].relativenumber = M._saved_wo.relativenumber
-  end
-end
-
---- List the file-level group nodes currently rendered in the Trouble list,
---- in display order: { { filename, row, node }, ... }. Used to drive
---- file-to-file cursor movement and folding after a stage.
----@param view trouble.View
----@return table[]
-function M.file_nodes(view)
-  local locations = view.renderer and view.renderer._locations or {}
-  local ret = {}
-  for row, loc in pairs(locations) do
-    local node = loc.node
-    if node and node.group and node.group.fields
-        and node.group.fields[1] == "filename"
-        and node.item and node.item.filename then
-      ret[#ret + 1] = { filename = node.item.filename, row = row, node = node }
-    end
-  end
-  table.sort(ret, function(a, b) return a.row < b.row end)
-  return ret
-end
-
---- The file-level group nodes covered by `node`: the node itself when it is a
---- file group, or every file group beneath it when it is a category header
---- ("Tracked Changes" / "Untracked Files"). Lets S/U/j act on a whole group.
----@param node trouble.Node
----@return trouble.Node[] nodes, boolean is_group whether `node` was a category
-function M.file_group_nodes(node)
-  if not node then return {}, false end
-  if node.group and node.group.fields and node.group.fields[1] == "filename" then
-    return { node }, false
-  end
-  local nodes = {}
-  local function walk(n)
-    if n.group and n.group.fields and n.group.fields[1] == "filename" then
-      nodes[#nodes + 1] = n
-    else
-      for _, child in ipairs(n.children or {}) do
-        walk(child)
-      end
-    end
-  end
-  walk(node)
-  return nodes, true
-end
-
---- Find the rendered file-group node (and its row) for a filename.
----@param view trouble.View
----@param filename? string
----@return trouble.Node?, number?
-function M.find_file_node(view, filename)
-  if not filename then return nil end
-  for _, n in ipairs(M.file_nodes(view)) do
-    if n.filename == filename then
-      return n.node, n.row
-    end
-  end
-end
-
---- The filename of the file rendered just after `filename` (or nil if last).
----@param view trouble.View
----@param filename? string
----@return string?
-function M.next_file(view, filename)
-  local nodes = M.file_nodes(view)
-  for i, n in ipairs(nodes) do
-    if n.filename == filename then
-      return nodes[i + 1] and nodes[i + 1].filename or nil
-    end
-  end
-end
-
---- Pre-fold the node a file will occupy *after* it moves to `category`, so the
---- next refresh renders it collapsed in a single pass — no second render, no
---- flicker. Trouble keys fold state by `node.id`, which encodes the group path
---- (`…#<category>#<file>`); staging/unstaging only swaps that one segment, so
---- rewrite it to the destination category and seed the fold there.
----
---- Directional on purpose: staging targets "Tracked Changes", unstaging targets
---- "Untracked Files". We seed only the destination, never the current id, so a
---- file that *stays* in its category (e.g. unstaging a modified—not new—file)
---- keeps whatever fold state the user chose. Enforces "untracked files are
---- never expanded" across the stage/unstage round-trip.
----@param view trouble.View
----@param node? trouble.Node
----@param category "Tracked Changes"|"Untracked Files"
-function M.prefold_into(view, node, category)
-  if not (node and node.id and view.renderer) then return end
-  local id = node.id
-    :gsub("#Untracked Files#", "#" .. category .. "#")
-    :gsub("#Tracked Changes#", "#" .. category .. "#")
-  view.renderer._folded[id] = true
-end
-
---- Small centred confirmation popup. Runs `on_yes` only if the user presses
---- `y`; `n` / `q` / <Esc> dismiss it.
----@param lines string[] message lines
----@param on_yes function
 local function confirm(lines, on_yes)
   local body = vim.list_extend({}, lines)
   body[#body + 1] = ""
@@ -1812,141 +1566,6 @@ local function confirm(lines, on_yes)
   for _, key in ipairs({ "n", "q", "<Esc>" }) do
     vim.keymap.set("n", key, close, { buffer = buf, nowait = true, silent = true })
   end
-end
-
---- Discard the change under the cursor, after a y/n confirmation. A tracked
---- hunk is reverse-applied (`--index` too when staged); a file is restored to
---- HEAD (tracked) or deleted (untracked); a category header
---- ("Tracked Changes" / "Untracked Files") discards every file in the group.
----@param view trouble.View
----@param ctx table Trouble action context
-function M.discard(view, ctx)
-  local cwd = opts.reuse_sections and M._status.cwd or nil
-  local root_err = nil
-  if not cwd then
-    cwd, root_err = git_root()
-  end
-  if not cwd then
-    notify_error(root_err or "Unable to find git root")
-    return
-  end
-  M._status.cwd = cwd
-
-  local function after(files)
-    view:refresh()
-    for _, file in ipairs(files) do
-      M.refresh_open_diff_buffer(file)
-    end
-    vim.defer_fn(function() M.auto_preview(view) end, 50)
-  end
-
-  -- A single tracked hunk under the cursor: reverse-apply just that hunk.
-  if ctx.item and ctx.item.item and ctx.item.item.diff then
-    local it, filename = ctx.item.item, ctx.item.filename
-    confirm({ "Discard this hunk?", "  " .. vim.fn.fnamemodify(filename, ":.") }, function()
-      local args = { "apply", "--reverse", "--whitespace=nowarn" }
-      if it.staged then
-        args[#args + 1] = "--index"
-      end
-      args[#args + 1] = "-"
-      local result = run_git_at_root(cwd, args, it.diff .. "\n")
-      if not result.ok then
-        notify_error("Discard failed: " .. (result.output ~= "" and result.output or ("git exited " .. result.code)))
-        return
-      end
-      after({ filename })
-    end)
-    return
-  end
-
-  -- Otherwise discard whole files: a single file node, an untracked leaf, or
-  -- every file under a category header.
-  local entries = {} ---@type { file: string, untracked: boolean }[]
-  if ctx.node then
-    for _, node in ipairs(M.file_group_nodes(ctx.node)) do
-      local file = node.item and node.item.filename
-      if file then
-        entries[#entries + 1] = {
-          file = file,
-          untracked = node.item.item and node.item.item.category == "Untracked Files" or false,
-        }
-      end
-    end
-  elseif ctx.item then
-    local file = ctx.item.filename
-    if file then
-      entries[#entries + 1] = {
-        file = file,
-        untracked = ctx.item.item and ctx.item.item.category == "Untracked Files" or false,
-      }
-    end
-  end
-  if #entries == 0 then return end
-
-  local all_untracked = true
-  for _, entry in ipairs(entries) do
-    all_untracked = all_untracked and entry.untracked
-  end
-
-  local message
-  if #entries == 1 then
-    message = {
-      entries[1].untracked and "Delete untracked file?" or "Discard ALL changes to file?",
-      "  " .. vim.fn.fnamemodify(entries[1].file, ":."),
-    }
-  else
-    message = {
-      all_untracked and ("Delete %d untracked files?"):format(#entries)
-        or ("Discard ALL changes in %d files?"):format(#entries),
-    }
-  end
-
-  confirm(message, function()
-    local files = {}
-    local failures = {}
-    for _, entry in ipairs(entries) do
-      files[#files + 1] = entry.file
-      if entry.untracked then
-        local delete_code = vim.fn.delete(entry.file)
-        if delete_code ~= 0 then
-          failures[#failures + 1] = {
-            file = entry.file,
-            message = ("delete() failed with code %d"):format(delete_code),
-          }
-        end
-      else
-        local relpath, rel_err = repo_relative(entry.file, cwd)
-        if not relpath then
-          failures[#failures + 1] = { file = entry.file, message = rel_err }
-        else
-          local checkout_result = run_git_at_root(cwd, { "checkout", "HEAD", "--", relpath })
-          if not checkout_result.ok then
-            -- Staged-new file (not in HEAD): unstage, then remove it.
-            local restore_result = run_git_at_root(cwd, { "restore", "--staged", "--", relpath })
-            if restore_result.ok then
-              local delete_code = vim.fn.delete(entry.file)
-              if delete_code ~= 0 then
-                failures[#failures + 1] = {
-                  file = entry.file,
-                  message = ("delete() failed with code %d after unstaging"):format(delete_code),
-                }
-              end
-            else
-              failures[#failures + 1] = {
-                file = entry.file,
-                output = restore_result.output ~= "" and restore_result.output or checkout_result.output,
-                code = restore_result.code,
-              }
-            end
-          end
-        end
-      end
-    end
-    if #failures > 0 then
-      M.notify_git_failures("Discard failed", failures)
-    end
-    after(files)
-  end)
 end
 
 local status_section_order = {
@@ -2886,7 +2505,7 @@ local function setup_status_keymaps(buf)
   end, vim.tbl_extend("force", opts, { desc = "Jump to file" }))
 
   local function commit()
-    require("trouble.sources.diff_review_commit").commit({
+    require("diff_review.commit").commit({
       win = vim.api.nvim_get_current_win(),
       on_done = function()
         if vim.api.nvim_buf_is_valid(buf) then render_status_or_notify(buf) end
@@ -2917,7 +2536,7 @@ function M.open()
     vim.bo[buf].buftype = "nofile"
     vim.bo[buf].swapfile = false
     vim.bo[buf].filetype = "DiffReviewStatus"
-    pcall(vim.api.nvim_buf_set_name, buf, "DiffReviewStatus")
+    pcall(vim.api.nvim_buf_set_name, buf, (M.config or config.options).status_buffer_name)
     M._status = {
       buf = buf,
       folds = {},
@@ -2942,96 +2561,6 @@ function M.open()
   vim.wo[win].relativenumber = false
   vim.wo[win].foldcolumn = "0"
   render_status_or_notify(buf)
-end
-
---- Show the appropriate buffer in the main window when cursor moves.
---- On hunk rows: show the real file at the hunk position.
---- On file group headers: show the fancy diff buffer.
---- Bypasses Trouble's preview system entirely to avoid overlay issues.
----@param view trouble.View
-function M.auto_preview(view)
-  -- The commit flow borrows the main window for its console / message buffer;
-  -- don't clobber it on cursor moves while that's running.
-  if M.suspend_preview then return end
-  local loc = view:at()
-  local win = M.get_main_win(view)
-  if not win or not vim.api.nvim_win_is_valid(win) then return end
-
-  if loc and loc.item then
-    local item = loc.item
-    local filename = item.filename
-    if not filename then return end
-
-    local diff_buf = M.open_diff_buffer(filename)
-    vim.api.nvim_win_set_buf(win, diff_buf)
-    M._hide_line_numbers(win)
-    -- Re-fetch if cache was invalidated (e.g., after editing the real file)
-    if not M._file_diffs or M._file_diffs[filename] == nil then
-      M._update_file_diff_cache(filename)
-    end
-    M._refresh_diff_buffer(diff_buf, filename)
-
-    local item_diff = item.item and item.item.diff
-    local active_hunk = M._highlight_active_hunk(diff_buf, item_diff)
-    if active_hunk then
-      pcall(vim.api.nvim_win_set_cursor, win, { active_hunk.start_line, 0 })
-      vim.api.nvim_win_call(win, function()
-        vim.cmd("normal! zz")
-      end)
-    end
-    return
-  end
-
-  -- File group header: show the fancy diff buffer
-  if loc and loc.node and loc.node.item then
-    local filename = loc.node.item.filename
-    if not filename then return end
-
-    local buf = M.open_diff_buffer(filename)
-    vim.api.nvim_win_set_buf(win, buf)
-    M._hide_line_numbers(win)
-    if not M._file_diffs or M._file_diffs[filename] == nil then
-      M._update_file_diff_cache(filename)
-    end
-    M._refresh_diff_buffer(buf, filename)
-    M._highlight_active_hunk(buf, nil)
-    -- Restore cursor to the same hunk + offset within hunk
-    local saved = M._buf_saved_cursor[buf]
-    local new_hunks = M._buf_hunks[buf]
-    if saved and saved.hunk_index and new_hunks then
-      -- Try to find the same hunk by index, or by matching the @@ header
-      local target_hunk = nil
-      -- First try: match by @@ header text (survives hunk reordering)
-      if saved.header and saved.header ~= "" then
-        for _, h in ipairs(new_hunks) do
-          local h_header = h.diff and h.diff:match("(@@[^@]+@@)") or ""
-          if h_header == saved.header then
-            target_hunk = h
-            break
-          end
-        end
-      end
-      -- Fallback: use the same index if still valid
-      if not target_hunk and saved.hunk_index <= #new_hunks then
-        target_hunk = new_hunks[saved.hunk_index]
-      end
-      if target_hunk then
-        local target_line = target_hunk.start_line + (saved.offset or 0)
-        local max_line = vim.api.nvim_buf_line_count(buf)
-        target_line = math.min(target_line, max_line)
-        target_line = math.max(1, target_line)
-        pcall(vim.api.nvim_win_set_cursor, win, { target_line, saved.col or 0 })
-        vim.api.nvim_win_call(win, function()
-          vim.cmd("normal! zv") -- open fold
-        end)
-      else
-        vim.api.nvim_win_set_cursor(win, { 1, 0 })
-      end
-      M._buf_saved_cursor[buf] = nil -- consumed
-    else
-      vim.api.nvim_win_set_cursor(win, { 1, 0 })
-    end
-  end
 end
 
 return M

@@ -1,4 +1,4 @@
---- Commit flow for the DiffReview Trouble pane, modelled on Neogit.
+--- Commit flow for DiffReview, modelled on Neogit.
 ---
 --- `cc` runs `git commit` as a job with a headless "fake editor" wired to
 --- GIT_EDITOR, and reuses the diff-preview window above the Trouble pane:
@@ -28,7 +28,7 @@ M._active = nil
 --- `require` it (it has no user runtimepath otherwise).
 local function runtimepath_root()
   local source = debug.getinfo(1, "S").source:sub(2):gsub("\\", "/")
-  return (source:gsub("/lua/trouble/sources/diff_review_commit%.lua$", ""))
+  return (source:gsub("/lua/diff_review/commit%.lua$", ""))
 end
 
 --- The GIT_EDITOR command: a headless nvim that runs M.client(). Mirrors
@@ -36,7 +36,7 @@ end
 local function remote_editor_cmd()
   local nvim = vim.fn.shellescape(vim.v.progpath)
   local rtp_cmd = vim.fn.shellescape(("set runtimepath^=%s"):format(vim.fn.fnameescape(runtimepath_root())))
-  local lua_cmd = vim.fn.shellescape("lua require('trouble.sources.diff_review_commit').client()")
+  local lua_cmd = vim.fn.shellescape("lua require('diff_review.commit').client()")
   return table.concat({
     nvim, "--headless", "--clean", "--noplugin", "-n", "-R",
     "-c", rtp_cmd, "-c", lua_cmd,
@@ -59,14 +59,14 @@ function M.client()
     assert(parent and parent ~= "", "parent nvim ($NVIM) not set")
 
     local client_addr = vim.fn.serverstart()
-    local code = ("lua require('trouble.sources.diff_review_commit').editor(%q, %q)"):format(target, client_addr)
+    local code = ("lua require('diff_review.commit').editor(%q, %q)"):format(target, client_addr)
     local connected, chan = pcall(vim.fn.sockconnect, "pipe", parent, { rpc = true })
     assert(connected and chan ~= 0, "cannot reach parent nvim at " .. tostring(parent))
     vim.rpcrequest(chan, "nvim_command", code)
     pcall(vim.fn.chanclose, chan)
   end)
   if not ok then
-    pcall(vim.api.nvim_err_writeln, "diff_review_commit (client): " .. tostring(err))
+    pcall(vim.api.nvim_err_writeln, "diff_review.commit (client): " .. tostring(err))
     vim.cmd("cq")
   end
 end
@@ -179,7 +179,7 @@ function M._finish(code)
   local output = (st.console and vim.api.nvim_buf_is_valid(st.console))
       and vim.api.nvim_buf_get_lines(st.console, 0, -1, false) or {}
 
-  require("trouble.sources.diff_review").suspend_preview = false
+  require("diff_review").suspend_preview = false
   winbar(st.win, st.prev_winbar or "")
 
   if code == 0 or st.aborted then
@@ -248,7 +248,7 @@ function M.commit(opts)
     aborted = false,
   }
 
-  require("trouble.sources.diff_review").suspend_preview = true
+  require("diff_review").suspend_preview = true
   vim.api.nvim_win_set_buf(win, console)
   vim.wo[win].number = false
   vim.wo[win].relativenumber = false
