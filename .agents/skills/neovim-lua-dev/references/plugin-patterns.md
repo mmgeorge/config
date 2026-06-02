@@ -827,12 +827,36 @@ cursor target. If that callback belongs to a different hunk than the one the
 user is now on, the late render steals the cursor. Renders with no explicit
 target are also dangerous if the generic fallback is line 1.
 
-**Fix**: Every rerender path needs a cursor snapshot. Before rendering, capture
-the current item id under the cursor plus the raw cursor line as fallback. Async
-callbacks should preserve that current target, not target the item whose async
-work just completed. A render with no explicit target should mean "preserve the
-current cursor," and only action code should intentionally provide a different
-target, such as the next hunk after stage/unstage/discard.
+**Fix**: Treat cursor restore as two different flows:
+
+- **Passive async rerender:** no explicit target means "preserve wherever the
+  user is now." Capture the stable item id plus raw cursor line immediately
+  before mutating buffer lines. Do not capture when the async request starts;
+  the user may move while Git, Tree-sitter, or syntax work is in flight.
+- **Action rerender:** pass an explicit semantic target chosen by the action,
+  such as the next hunk after stage/unstage/discard or the destination
+  section/file header after a section-level action.
+
+Bad pattern:
+
+```lua
+local target_id, fallback_line = cursor_target(buf)
+load_async(function(result)
+  render_loaded(buf, result, target_id, fallback_line)
+end)
+```
+
+Good pattern:
+
+```lua
+load_async(function(result)
+  local target_id, fallback_line = cursor_target(buf)
+  render_loaded(buf, result, target_id, fallback_line)
+end)
+```
+
+Async callbacks should preserve the current target at render time, not target
+the item whose async work just completed.
 
 ### 12. Rapid Actions Repaint Intermediate Backend State
 

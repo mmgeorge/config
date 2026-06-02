@@ -7,6 +7,7 @@ local root = "D:/diffreview-flow-root"
 local calls = {}
 local deletes = {}
 local state = {}
+local held_systemlist_async = nil
 
 local function assert_true(condition, message)
   if not condition then error(message, 2) end
@@ -147,6 +148,13 @@ end
 
 function backend.systemlist_async(command, cb)
   record("systemlist_async", command)
+  if held_systemlist_async then
+    held_systemlist_async[#held_systemlist_async + 1] = function()
+      local output, code = backend.systemlist(command)
+      cb(output, code)
+    end
+    return
+  end
   vim.defer_fn(function()
     local output, code = backend.systemlist(command)
     cb(output, code)
@@ -301,6 +309,10 @@ local function cursor_is_on_hunk_after_file(buf, file)
   return vim.api.nvim_win_get_cursor(0)[1] == hunk_row
 end
 
+local function cursor_line_text(buf)
+  return status_lines(buf)[vim.api.nvim_win_get_cursor(0)[1]] or ""
+end
+
 local function trigger_normal_mapping(key, row)
   vim.api.nvim_win_set_cursor(0, { row, 0 })
   local mapping = vim.fn.maparg(key, "n", false, true)
@@ -336,6 +348,26 @@ local function count_calls(kind, needle)
     end
   end
   return count
+end
+
+local function calls_text()
+  local lines = {}
+  for _, call in ipairs(calls) do
+    lines[#lines + 1] = ("%s: %s"):format(call.kind, call.key)
+  end
+  return table.concat(lines, "\n")
+end
+
+local function hold_systemlist_async()
+  held_systemlist_async = {}
+end
+
+local function release_systemlist_async()
+  local callbacks = held_systemlist_async or {}
+  held_systemlist_async = nil
+  for _, callback in ipairs(callbacks) do
+    vim.defer_fn(callback, 0)
+  end
 end
 
 local function render_and_wait(buf, needle)
@@ -484,6 +516,22 @@ local function run()
     return cursor_is_on_hunk_after_file(buf, "refresh-cursor-b.txt")
   end, "untargeted status refresh did not preserve cursor\n" .. table.concat(status_lines(buf), "\n"))
 
+  reset_state({ modified = { ["late-cursor-a.txt"] = true, ["late-cursor-b.txt"] = true } })
+  render_and_wait(buf, "late-cursor-a.txt +1 -1")
+  local late_cursor_a_row = find_row(buf, "late-cursor-a.txt")
+  local late_cursor_b_row = find_row(buf, "late-cursor-b.txt")
+  vim.api.nvim_win_set_cursor(0, { late_cursor_a_row, 0 })
+  hold_systemlist_async()
+  diff_review.render_status(buf)
+  wait_for(function()
+    return held_systemlist_async and #held_systemlist_async > 0
+  end, "status refresh did not start held async git calls")
+  vim.api.nvim_win_set_cursor(0, { late_cursor_b_row, 0 })
+  release_systemlist_async()
+  wait_for(function()
+    return cursor_line_text(buf):find("late-cursor-b.txt", 1, true) ~= nil
+  end, "late async status refresh restored the old cursor instead of the latest cursor\n" .. table.concat(status_lines(buf), "\n"))
+
   reset_state({ staged_modified = { ["cursor-unstage-a.txt"] = true, ["cursor-unstage-b.txt"] = true } })
   render_and_wait(buf, "cursor-unstage-a.txt +1 -1")
   trigger_normal_mapping("<Tab>", find_row(buf, "cursor-unstage-a.txt"))
@@ -497,9 +545,95 @@ local function run()
     return cursor_is_on_hunk_after_file(buf, "cursor-unstage-b.txt")
   end, "cursor did not move to next hunk after unstaging\n" .. table.concat(status_lines(buf), "\n"))
 
+  reset_state({ modified = { ["header-stage-a.txt"] = true, ["header-stage-b.txt"] = true } })
+  render_and_wait(buf, "header-stage-a.txt +1 -1")
+  reset_calls()
+  trigger_normal_mapping("S", find_row(buf, "Unstaged changes (2)"))
+  assert_true(
+    cursor_line_text(buf):find("Staged changes (2)", 1, true) ~= nil,
+    "stage-all from section header did not move cursor to destination header\n" .. table.concat(status_lines(buf), "\n")
+  )
+  wait_for(function()
+    return state.staged_modified["header-stage-a.txt"] and state.staged_modified["header-stage-b.txt"]
+  end, "stage-all from section header did not finish")
+  wait_for(function()
+    return count_calls("systemlist_async", "\tdiff") > 0
+  end, "stage-all from section header did not reconcile")
+  assert_true(
+    cursor_line_text(buf):find("@@", 1, true) == nil,
+    "stage-all from section header jumped to a hunk after reconcile\n" .. table.concat(status_lines(buf), "\n")
+  )
+
+  reset_state({ staged_modified = { ["header-unstage-a.txt"] = true, ["header-unstage-b.txt"] = true } })
+  render_and_wait(buf, "header-unstage-a.txt +1 -1")
+  reset_calls()
+  trigger_normal_mapping("U", find_row(buf, "Staged changes (2)"))
+  assert_true(
+    cursor_line_text(buf):find("Unstaged changes (2)", 1, true) ~= nil,
+    "unstage-all from section header did not keep cursor on the header\n" .. table.concat(status_lines(buf), "\n")
+  )
+  assert_true(vim.wait(3000, function()
+    return state.modified["header-unstage-a.txt"] and state.modified["header-unstage-b.txt"]
+  end, 10), "unstage-all from section header did not finish\ncalls:\n" .. calls_text())
+  wait_for(function()
+    return count_calls("systemlist_async", "\tdiff") > 0
+  end, "unstage-all from section header did not reconcile")
+  assert_true(
+    cursor_line_text(buf):find("@@", 1, true) == nil,
+    "unstage-all from section header jumped to a hunk after reconcile\n" .. table.concat(status_lines(buf), "\n")
+  )
+
+  reset_state({
+    modified = { ["header-section-existing.txt"] = true },
+    staged_modified = { ["header-section-a.txt"] = true, ["header-section-b.txt"] = true },
+  })
+  render_and_wait(buf, "header-section-a.txt +1 -1")
+  reset_calls()
+  trigger_normal_mapping("U", find_row(buf, "Staged changes (2)"))
+  assert_true(
+    cursor_line_text(buf):find("Unstaged changes (3)", 1, true) ~= nil,
+    "unstage-all from section header with existing destination did not target destination header\n"
+      .. table.concat(status_lines(buf), "\n")
+  )
+  wait_for(function()
+    return state.modified["header-section-a.txt"] and state.modified["header-section-b.txt"]
+  end, "unstage-all from section header with existing destination did not finish")
+  wait_for(function()
+    return count_calls("systemlist_async", "\tdiff") > 0
+  end, "unstage-all from section header with existing destination did not reconcile")
+  assert_true(
+    cursor_line_text(buf):find("@@", 1, true) == nil,
+    "unstage-all from section header with existing destination jumped to a hunk after reconcile\n"
+      .. table.concat(status_lines(buf), "\n")
+  )
+
+  reset_state({ staged_modified = { ["header-file-unstage.txt"] = true } })
+  render_and_wait(buf, "header-file-unstage.txt +1 -1")
+  reset_calls()
+  trigger_normal_mapping("U", find_row(buf, "header-file-unstage.txt +1 -1"))
+  assert_true(
+    cursor_line_text(buf):find("header-file-unstage.txt +1 -1", 1, true) ~= nil,
+    "unstage from file header did not keep cursor on the file row\n" .. table.concat(status_lines(buf), "\n")
+  )
+  wait_for(function()
+    return state.modified["header-file-unstage.txt"] == true
+  end, "unstage from file header did not finish")
+  wait_for(function()
+    return count_calls("systemlist_async", "\tdiff") > 0
+  end, "unstage from file header did not reconcile")
+  assert_true(
+    cursor_line_text(buf):find("@@", 1, true) == nil,
+    "unstage from file header jumped to a hunk after reconcile\n" .. table.concat(status_lines(buf), "\n")
+  )
+
   reset_state({ modified = { ["merge-file.txt"] = true }, staged_modified = { ["merge-file.txt"] = true } })
   render_and_wait(buf, "merge-file.txt +1 -1")
   trigger_normal_mapping("U", find_row_after(buf, "merge-file.txt", find_row(buf, "merge-file.txt")))
+  assert_true(
+    cursor_line_text(buf):find("merge-file.txt", 1, true) ~= nil and cursor_line_text(buf):find("@@", 1, true) == nil,
+    "unstage from staged file header merged into existing file but cursor landed on a hunk\n"
+      .. table.concat(status_lines(buf), "\n")
+  )
   assert_true(
     count_lines_containing(buf, "merge-file.txt") == 1,
     "optimistic file unstage rendered duplicate file headings\n" .. table.concat(status_lines(buf), "\n")
@@ -590,6 +724,32 @@ local function run()
   wait_for(function()
     return cursor_is_on_hunk_after_file(buf, "cursor-discard-b.txt")
   end, "cursor did not move to next hunk after discarding\n" .. table.concat(status_lines(buf), "\n"))
+
+  reset_state({ modified = { ["discard-header-a.txt"] = true, ["discard-header-b.txt"] = true } })
+  render_and_wait(buf, "discard-header-a.txt +1 -1")
+  reset_calls()
+  trigger_normal_mapping("j", find_row(buf, "Unstaged changes (2)"))
+  confirm_yes()
+  wait_for(function()
+    return not buffer_contains(buf, "discard-header-a.txt") and not buffer_contains(buf, "discard-header-b.txt")
+  end, "discard from section header did not remove files")
+  assert_true(
+    cursor_line_text(buf):find("@@", 1, true) == nil,
+    "discard from section header jumped to a hunk after refresh\n" .. table.concat(status_lines(buf), "\n")
+  )
+
+  reset_state({ modified = { ["discard-file-header-a.txt"] = true, ["discard-file-header-b.txt"] = true } })
+  render_and_wait(buf, "discard-file-header-a.txt +1 -1")
+  reset_calls()
+  trigger_normal_mapping("j", find_row(buf, "discard-file-header-a.txt +1 -1"))
+  confirm_yes()
+  wait_for(function()
+    return not buffer_contains(buf, "discard-file-header-a.txt") and buffer_contains(buf, "discard-file-header-b.txt")
+  end, "discard from file header did not remove only that file")
+  assert_true(
+    cursor_line_text(buf):find("@@", 1, true) == nil,
+    "discard from file header jumped to a hunk after refresh\n" .. table.concat(status_lines(buf), "\n")
+  )
 
   reset_state({ staged_added = { ["discard-added.txt"] = true } })
   render_and_wait(buf, "discard-added.txt +1 -0")

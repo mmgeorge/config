@@ -3304,6 +3304,7 @@ end
 
 local status_cursor_target
 local status_operations_pending
+local status_request_reconcile
 
 ---@param file DiffReviewStatusFile
 ---@param hunk DiffReviewHunk
@@ -3639,6 +3640,70 @@ local function status_hunk_action_target_id(entries)
   return nil
 end
 
+---@param entries DiffReviewStatusEntry[]
+---@return boolean
+local function status_entries_are_headers(entries)
+  if #entries == 0 then return false end
+  for _, entry in ipairs(entries) do
+    if not (entry.kind == "section" or entry.kind == "file") then return false end
+  end
+  return true
+end
+
+---@param entries DiffReviewStatusEntry[]
+---@return DiffReviewStatusEntry?
+local function status_first_header_entry(entries)
+  for _, entry in ipairs(entries) do
+    if entry.kind == "section" or entry.kind == "file" then return entry end
+  end
+  return nil
+end
+
+---@param selected_entries DiffReviewStatusEntry[]
+---@param action_entries DiffReviewStatusEntry[]
+---@param target_section? DiffReviewStatusSectionName
+---@return string?
+local function status_action_target_id(selected_entries, action_entries, target_section)
+  if status_entries_are_headers(selected_entries) then
+    local selected_entry = status_first_header_entry(selected_entries)
+    if selected_entry then
+      if target_section then
+        if selected_entry.kind == "section" then return status_section_key(target_section) end
+        if selected_entry.kind == "file" and selected_entry.file then
+          return status_file_key(target_section, selected_entry.file.filename)
+        end
+      end
+      return selected_entry.id
+    end
+  end
+  return status_hunk_action_target_id(action_entries) or (action_entries[1] and action_entries[1].id or nil)
+end
+
+---@param target_id? string
+---@return boolean
+local function status_target_is_header(target_id)
+  return type(target_id) == "string" and (target_id:find("^section:") ~= nil or target_id:find("^file:") ~= nil)
+end
+
+---@param fallback_line integer
+---@return integer?
+local function status_nearest_header_line(fallback_line)
+  local status = M._status
+  if not (status and status.entries and status.buf and vim.api.nvim_buf_is_valid(status.buf)) then return nil end
+  local max_line = vim.api.nvim_buf_line_count(status.buf)
+  local line = math.min(math.max(fallback_line, 1), max_line)
+  local max_offset = math.max(line - 1, max_line - line)
+  for offset = 0, max_offset do
+    local previous_line = line - offset
+    local previous_entry = status.entries[previous_line]
+    if previous_entry and (previous_entry.kind == "section" or previous_entry.kind == "file") then return previous_line end
+    local next_line = line + offset
+    local next_entry = status.entries[next_line]
+    if offset > 0 and next_entry and (next_entry.kind == "section" or next_entry.kind == "file") then return next_line end
+  end
+  return nil
+end
+
 local function status_restore_cursor(buf, target_id, fallback_line)
   local target_line = nil
   if target_id then
@@ -3650,6 +3715,9 @@ local function status_restore_cursor(buf, target_id, fallback_line)
     end
   end
   if not target_line and not fallback_line then return end
+  if not target_line and fallback_line and status_target_is_header(target_id) then
+    target_line = status_nearest_header_line(fallback_line)
+  end
   target_line = target_line or math.min(fallback_line or 1, vim.api.nvim_buf_line_count(buf))
   pcall(vim.api.nvim_win_set_cursor, 0, { math.max(target_line, 1), 0 })
 end
@@ -3736,11 +3804,12 @@ function M.render_status(buf, target_id, fallback_line, opts)
   M._status = M._status or {}
   M._status.buf = buf
   M._status.reconcile_generation = (M._status.reconcile_generation or 0) + 1
-  if target_id == nil and fallback_line == nil then
-    target_id, fallback_line = status_cursor_target(buf)
-  end
+  local preserve_current_cursor = target_id == nil and fallback_line == nil
 
   if opts.reuse_sections and M._status.head_lines and M._status.sections then
+    if preserve_current_cursor then
+      target_id, fallback_line = status_cursor_target(buf)
+    end
     status_render_loaded(buf, target_id, fallback_line, opts, M._status.head_lines, M._status.sections)
     return
   end
@@ -3772,6 +3841,9 @@ function M.render_status(buf, target_id, fallback_line, opts)
       M._status.head_lines = result.head_lines
       M._status.sections = result.sections
       M._status.fancy_rows = {}
+      if preserve_current_cursor then
+        target_id, fallback_line = status_cursor_target(buf)
+      end
       status_render_loaded(buf, target_id, fallback_line, opts, result.head_lines, result.sections)
     end)
   end)
@@ -3826,7 +3898,7 @@ end
 
 ---@param buf integer?
 ---@param target_id? string
-local function status_request_reconcile(buf, target_id)
+status_request_reconcile = function(buf, target_id)
   local status = M._status
   if not status then return end
   status.reconcile_buf = buf or status.buf
@@ -3962,6 +4034,21 @@ local function status_split_unstage_entries(entries)
 end
 
 ---@param entries DiffReviewStatusEntry[]
+---@return DiffReviewStatusSectionName?
+local function status_unstage_target_section(entries)
+  local has_added = false
+  for _, entry in ipairs(entries) do
+    if status_entry_is_added(entry) then
+      has_added = true
+    else
+      return "unstaged"
+    end
+  end
+  if has_added then return "untracked" end
+  return nil
+end
+
+---@param entries DiffReviewStatusEntry[]
 local function status_stage_entries(entries)
   if #entries == 0 then return end
   local expanded_entries = status_expanded_entries(entries)
@@ -3970,8 +4057,7 @@ local function status_stage_entries(entries)
   local action_entries = status_action_entries_for_target(expanded_entries, "staged")
   if #action_entries == 0 then return end
 
-  local first_id = action_entries[1].id
-  local target_id = status_hunk_action_target_id(action_entries) or first_id
+  local target_id = status_action_target_id(entries, action_entries, "staged")
   local hunk_diffs, files = status_split_action_entries(action_entries)
   local staged_hunks = 0
   local staged_files = 0
@@ -4034,8 +4120,7 @@ local function status_unstage_entries(entries)
   local action_entries = status_unstage_action_entries(expanded_entries)
   if #action_entries == 0 then return end
 
-  local first_id = action_entries[1].id
-  local target_id = status_hunk_action_target_id(action_entries) or first_id
+  local target_id = status_action_target_id(entries, action_entries, status_unstage_target_section(action_entries))
   local tracked_entries, added_entries = status_partition_unstage_entries(action_entries)
   local hunk_diffs, files, added_files = status_split_unstage_entries(action_entries)
   local unstaged_hunks = 0
@@ -4203,7 +4288,7 @@ local function status_discard_entry_list(entries, target_id)
     end
   end
   if #discard_entries == 0 then return end
-  local action_target_id = status_hunk_action_target_id(discard_entries) or target_id
+  local action_target_id = status_action_target_id(entries, discard_entries) or target_id
 
   local message
   if #discard_entries == 1 then

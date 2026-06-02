@@ -176,13 +176,15 @@ If diagnostics still look wrong, run the linter directly (e.g. `luacheck`,
 - **Async refresh state:** long-running refreshes need a request id or equivalent
   cancellation token. Start a new id for each refresh and ignore callbacks from
   older ids so slow Git/process results cannot repaint stale data over newer UI.
-- **Cursor-preserving UI rerenders:** status/list buffers that redraw after
-  async work must snapshot the current cursor target before rendering. Prefer a
-  stable item id when the cursor is on an item, plus the raw cursor line as a
-  fallback. Async enrichment callbacks such as Tree-sitter context updates must
-  preserve the user's current target, not jump to the item whose callback just
-  completed. Treat "no explicit target" as "keep the cursor where it is," not
-  "move to top."
+- **Cursor-preserving UI rerenders:** separate passive refreshes from intentional
+  action movement. For passive async rerenders (Git refresh, Tree-sitter
+  enrichment, syntax enrichment), treat "no explicit target" as "preserve the
+  user's current cursor." Snapshot the current target immediately before
+  mutating buffer lines, not when the async request starts; the user may move
+  while the backend is in flight. Prefer a stable item id plus raw cursor line
+  fallback. For action-triggered renders, pass an explicit semantic target
+  chosen by the action, such as the next hunk or destination section/file
+  header.
 - **Responsive async UI state:** keep an explicit UI model that can update
   immediately when the user acts, then trigger the backend process asynchronously
   and reconcile when it finishes. Do not replace an already-rendered status/list
