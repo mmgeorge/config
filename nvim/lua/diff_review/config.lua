@@ -1,6 +1,7 @@
 ---@class DiffReviewConfig
 ---@field status_buffer_name string
 ---@field pr_buffer_name string
+---@field debug_notifications boolean
 ---@field keymaps DiffReviewKeymapConfig
 
 ---@alias DiffReviewKeymap string|string[]|false
@@ -34,6 +35,7 @@ local M = {}
 M.defaults = {
   status_buffer_name = "DiffReviewStatus",
   pr_buffer_name = "DiffReviewPR",
+  debug_notifications = false,
   keymaps = {
     status = {
       close = "q",

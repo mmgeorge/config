@@ -303,6 +303,20 @@ local function notify_error(message, title)
   notifications.error(message, title)
 end
 
+---@return boolean
+local function debug_notifications_enabled()
+  local options = M.config or config.options or config.defaults
+  return options.debug_notifications == true
+end
+
+---@param message string
+---@param level? integer
+---@param opts? table
+local function notify_debug(message, level, opts)
+  if not debug_notifications_enabled() then return end
+  vim.notify(message, level or vim.log.levels.INFO, opts)
+end
+
 ---@param backend DiffReviewGitBackend?
 function M.set_git_backend(backend)
   M._git_backend = backend
@@ -2376,7 +2390,7 @@ function M.open_diff_buffer(filename)
       end
       M.stage_patch_async(patch, function(ok)
         if not ok then return end
-        vim.notify("Hunk staged", vim.log.levels.INFO)
+        notify_debug("Hunk staged")
         local win = vim.api.nvim_get_current_win()
         local filename = M._buf_filename[buf]
         -- Move to the next hunk. The staged hunk keeps its position (it only
@@ -2414,7 +2428,7 @@ function M.open_diff_buffer(filename)
       end
       M.unstage_patch_async(patch, function(ok)
         if not ok then return end
-        vim.notify("Hunk unstaged", vim.log.levels.INFO)
+        notify_debug("Hunk unstaged")
         local win = vim.api.nvim_get_current_win()
         local filename = M._buf_filename[buf]
         -- Find the current hunk so we can stay on it after the re-render
@@ -2466,7 +2480,7 @@ function M.open_diff_buffer(filename)
         if cursor >= h.start_line and cursor <= h.end_line then
           found = true
           h.folded = not h.folded
-          vim.notify("Hunk " .. i .. " folded=" .. tostring(h.folded) .. " range=" .. h.start_line .. "-" .. h.end_line, vim.log.levels.INFO)
+          notify_debug("Hunk " .. i .. " folded=" .. tostring(h.folded) .. " range=" .. h.start_line .. "-" .. h.end_line)
           M._render_with_folds(buf)
           pcall(vim.api.nvim_win_set_cursor, 0, { h.start_line, 0 })
           return
@@ -3745,7 +3759,7 @@ local function status_notify_action(action, hunk_count, file_count)
   if file_count > 0 then
     parts[#parts + 1] = ("%d file(s)"):format(file_count)
   end
-  vim.notify(("%s %s"):format(action, table.concat(parts, ", ")), vim.log.levels.INFO)
+  notify_debug(("%s %s"):format(action, table.concat(parts, ", ")), vim.log.levels.INFO, { title = "DiffReview" })
 end
 
 ---@param buf integer?
@@ -4860,7 +4874,7 @@ local function status_remote_action(buf, action)
     end
 
     local title = action == "push" and "Push" or "Pull"
-    vim.notify(title .. "ing changes...", vim.log.levels.INFO, { title = "DiffReview" })
+    notify_debug(title .. "ing changes...", vim.log.levels.INFO, { title = "DiffReview" })
     system_text_async({ "git", "-C", cwd, action }, nil, function(result)
       local compact = {}
       for _, line in ipairs(text_to_lines((result.stdout or "") .. (result.stderr or ""))) do
@@ -4869,7 +4883,7 @@ local function status_remote_action(buf, action)
         end
       end
       if result.code == 0 then
-        vim.notify(title .. " complete", vim.log.levels.INFO, { title = "DiffReview" })
+        notify_debug(title .. " complete", vim.log.levels.INFO, { title = "DiffReview" })
       else
         notify_error(title .. " failed: " .. (#compact > 0 and table.concat(compact, "\n") or ("git exited " .. result.code)))
       end

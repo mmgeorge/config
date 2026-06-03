@@ -2,6 +2,7 @@ vim.loader.enable(false)
 
 local diff_review = require("diff_review")
 local ai_commit = require("diff_review.ai_commit")
+local commit = require("diff_review.commit")
 local gh = require("diff_review.gh")
 local original_notify = vim.notify
 
@@ -11,6 +12,8 @@ local opened_urls = {}
 local pr_mode = "ready"
 local pr_title = "Improve DiffReview"
 local generated_commit = "feat: add diff review ai summary\n\nAdd generated commit metadata."
+local has_changes = true
+local generate_count = 0
 
 local function assert_true(condition, message)
   if not condition then error(message, 2) end
@@ -47,8 +50,9 @@ function git_backend.systemlist(command)
   if key == "git\t-C\t" .. root .. "\tlog\t-1\t--format=%s\t@{push}" then return { "push subject" }, 0 end
   if key == "git\t-C\t" .. root .. "\tls-files\t--others\t--exclude-standard" then return {}, 0 end
   if key == "git\t-C\t" .. root .. "\tdiff\t--cached\t--name-status" then return {}, 0 end
-  if key == "git\t-C\t" .. root .. "\tdiff\t--name-status" then return { "M\tlua/diff_review/init.lua" }, 0 end
+  if key == "git\t-C\t" .. root .. "\tdiff\t--name-status" then return has_changes and { "M\tlua/diff_review/init.lua" } or {}, 0 end
   if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff" then
+    if not has_changes then return {}, 0 end
     return {
       "diff --git a/lua/diff_review/init.lua b/lua/diff_review/init.lua",
       "--- a/lua/diff_review/init.lua",
@@ -159,10 +163,18 @@ function ai_backend.systemlist_async(command, cb)
   local key = command_key(command)
   vim.defer_fn(function()
     if key == "git\t-C\t" .. root .. "\tdiff\t--no-ext-diff\t--no-color\tHEAD\t--stat\t--summary" then
+      if not has_changes then
+        cb({}, 0)
+        return
+      end
       cb({ " lua/diff_review/init.lua | 2 +-" }, 0)
       return
     end
     if key == "git\t-C\t" .. root .. "\tdiff\t--no-ext-diff\t--no-color\tHEAD" then
+      if not has_changes then
+        cb({}, 0)
+        return
+      end
       cb({
         "diff --git a/lua/diff_review/init.lua b/lua/diff_review/init.lua",
         "--- a/lua/diff_review/init.lua",
@@ -182,9 +194,10 @@ function ai_backend.systemlist_async(command, cb)
 end
 
 function ai_backend.generate_async(_, cb)
+  generate_count = generate_count + 1
   vim.defer_fn(function()
     cb({ ok = true, message = generated_commit })
-  end, 30)
+  end, 80)
 end
 
 local function status_lines(buf)
@@ -235,8 +248,40 @@ local function run()
 
   wait_for(function() return buffer_contains(status_buf, "PR:") and buffer_contains(status_buf, "...fetching...") end, "PR row did not show fetching state")
   wait_for(function() return buffer_contains(status_buf, "About:  ...generating...") end, "About row did not show generating state")
+
+  local commit_buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(commit_buf, 0, -1, false, { "" })
+  vim.bo[commit_buf].modifiable = true
+  ai_commit.populate_commit_buffer_when_ready(commit_buf, root)
+
   wait_for(function() return buffer_contains(status_buf, "Improve DiffReview") end, "PR row did not show fetched PR title")
   wait_for(function() return buffer_contains(status_buf, "feat: add diff review ai summary") end, "About row did not show generated commit subject")
+  wait_for(function()
+    local lines = vim.api.nvim_buf_get_lines(commit_buf, 0, -1, false)
+    return lines[1] == "feat: add diff review ai summary"
+  end, "generated commit was not applied to commit buffer after waiting")
+  assert_true(vim.bo[commit_buf].modifiable, "commit buffer modifiable state was not preserved")
+
+  local commit_host_buf = vim.api.nvim_get_current_buf()
+  local commit_console = vim.api.nvim_create_buf(false, true)
+  commit._active = {
+    win = vim.api.nvim_get_current_win(),
+    prev_buf = commit_host_buf,
+    prev_winbar = "",
+    console = commit_console,
+    root = root,
+  }
+  commit.editor(root .. "/.git/COMMIT_EDITMSG", "")
+  local editmsg_buf = vim.api.nvim_get_current_buf()
+  assert_true(vim.b[editmsg_buf].ai_commit_generated == true, "DiffReview commit buffer did not suppress global AI commit autocmd")
+  commit._active = nil
+  vim.api.nvim_win_set_buf(0, commit_host_buf)
+  if vim.api.nvim_buf_is_valid(editmsg_buf) then
+    vim.api.nvim_buf_delete(editmsg_buf, { force = true })
+  end
+  if vim.api.nvim_buf_is_valid(commit_console) then
+    vim.api.nvim_buf_delete(commit_console, { force = true })
+  end
 
   trigger_normal_mapping("<CR>", find_row(status_buf, "About:"))
   local about_buf = vim.api.nvim_get_current_buf()
@@ -244,16 +289,6 @@ local function run()
   assert_true(buffer_contains(about_buf, "feat: add diff review ai summary"), "About view missing commit subject")
   assert_true(buffer_contains(about_buf, "Add generated commit metadata."), "About view missing commit body")
   vim.api.nvim_win_set_buf(0, status_buf)
-
-  local commit_buf = vim.api.nvim_create_buf(false, true)
-  vim.api.nvim_buf_set_lines(commit_buf, 0, -1, false, { "" })
-  vim.bo[commit_buf].modifiable = true
-  ai_commit.populate_commit_buffer_when_ready(commit_buf, root)
-  wait_for(function()
-    local lines = vim.api.nvim_buf_get_lines(commit_buf, 0, -1, false)
-    return lines[1] == "feat: add diff review ai summary"
-  end, "generated commit was not applied to commit buffer")
-  assert_true(vim.bo[commit_buf].modifiable, "commit buffer modifiable state was not preserved")
 
   trigger_normal_mapping("<CR>", find_row(status_buf, "PR:"))
   local pr_buf = vim.api.nvim_get_current_buf()
@@ -331,6 +366,23 @@ local function run()
   trigger_normal_mapping("zh", find_row(override_buf, "Head:"))
   local override_help_buf = vim.api.nvim_get_current_buf()
   assert_buffer_contains_all(override_help_buf, { "zc", "zpP", "zpp", "zgp", "zh" })
+
+  if vim.api.nvim_win_is_valid(0) then
+    pcall(vim.api.nvim_win_close, 0, true)
+  end
+  if vim.api.nvim_buf_is_valid(override_buf) then
+    vim.api.nvim_buf_delete(override_buf, { force = true })
+  end
+  has_changes = false
+  local count_before_no_changes = generate_count
+  diff_review._status = nil
+  diff_review.setup({ pr_buffer_name = "DiffReviewPRTest" })
+  diff_review.open()
+  local no_changes_buf = vim.api.nvim_get_current_buf()
+  wait_for(function() return buffer_contains(no_changes_buf, "No changes") end, "no changes status did not render")
+  assert_true(buffer_contains(no_changes_buf, "About:  none"), "About row should show none with no changes")
+  vim.wait(120)
+  assert_true(generate_count == count_before_no_changes, "AI generation started despite no changes")
 end
 
 local ok, err = xpcall(run, debug.traceback)

@@ -139,6 +139,7 @@ function M.editor(target, client_addr)
   vim.bo[buf].filetype = "gitcommit"
   vim.bo[buf].bufhidden = "wipe"
   vim.bo[buf].modifiable = true
+  vim.b[buf].ai_commit_generated = true
 
   vim.api.nvim_win_set_buf(st.win, buf)
   winbar(st.win, " %#Comment#<C-c><C-c>%* commit   %#Comment#<C-q>%* abort ")

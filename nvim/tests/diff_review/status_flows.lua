@@ -9,6 +9,7 @@ local calls = {}
 local deletes = {}
 local state = {}
 local held_systemlist_async = nil
+local captured_notifications = {}
 
 ---@type DiffReviewGhBackend
 local gh_backend = {}
@@ -39,6 +40,17 @@ end
 local function reset_calls()
   calls = {}
   deletes = {}
+end
+
+local function reset_notifications()
+  captured_notifications = {}
+end
+
+local function saw_notification_containing(needle)
+  for _, notification in ipairs(captured_notifications) do
+    if notification.message:find(needle, 1, true) then return true end
+  end
+  return false
 end
 
 local function reset_state(next_state)
@@ -451,24 +463,43 @@ local function run()
   assert_path_helpers()
   diff_review.set_git_backend(backend)
   gh.set_backend(gh_backend)
-  vim.notify = function() end
+  vim.notify = function(message, level, opts)
+    captured_notifications[#captured_notifications + 1] = {
+      message = tostring(message),
+      level = level,
+      opts = opts,
+    }
+  end
   diff_review.setup()
   diff_review.open()
   local buf = vim.api.nvim_get_current_buf()
 
   reset_state({ modified = { ["mod.txt"] = true } })
   render_and_wait(buf, "mod.txt +1 -1")
+  reset_notifications()
   trigger_normal_mapping("S", find_row(buf, "mod.txt"))
   wait_for(function()
     return saw_system_call("git\t-C\t" .. root .. "\tadd\t-u\t--\tmod.txt")
   end, "tracked stage did not run git add -u")
   wait_for(function() return buffer_contains(buf, "Staged changes (1)") end, "tracked stage did not reconcile")
+  assert_true(
+    not saw_notification_containing("Staged"),
+    "stage action emitted a debug notification with debug_notifications=false"
+  )
   reset_calls()
   trigger_normal_mapping("U", find_row(buf, "mod.txt"))
   wait_for(function()
     return saw_system_call("git\t-C\t" .. root .. "\trestore\t--staged\t--\tmod.txt")
   end, "tracked unstage did not run restore --staged")
   wait_for(function() return buffer_contains(buf, "Unstaged changes (1)") end, "tracked unstage did not reconcile")
+
+  diff_review.setup({ debug_notifications = true })
+  reset_state({ modified = { ["debug-notify.txt"] = true } })
+  render_and_wait(buf, "debug-notify.txt +1 -1")
+  reset_notifications()
+  trigger_normal_mapping("S", find_row(buf, "debug-notify.txt"))
+  wait_for(function() return saw_notification_containing("Staged") end, "debug stage notification was not emitted")
+  diff_review.setup({ debug_notifications = false })
 
   reset_state({
     modified = {
