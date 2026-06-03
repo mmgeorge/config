@@ -1,5 +1,6 @@
 ---@class DiffReviewConfig
 ---@field status_buffer_name string
+---@field pr_buffer_name string
 
 ---@class DiffReviewConfigModule
 ---@field defaults DiffReviewConfig
@@ -12,6 +13,7 @@ local M = {}
 ---@type DiffReviewConfig
 M.defaults = {
   status_buffer_name = "DiffReviewStatus",
+  pr_buffer_name = "DiffReviewPR",
 }
 
 ---@type DiffReviewConfig

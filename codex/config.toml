@@ -8,6 +8,7 @@ developer_instructions = '''
 # Standing Multi-Agent Authorization
 
 The user explicitly authorizes Codex to use multi-agent subagents in future sessions whenever project or global instructions call for explorer/delegation workflows. '''
+service_tier = "default"
 # plan_mode_reasoning_effort = "high"
 # disable_paste_burst = true
 

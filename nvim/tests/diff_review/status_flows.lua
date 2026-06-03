@@ -1,6 +1,7 @@
 vim.loader.enable(false)
 
 local diff_review = require("diff_review")
+local gh = require("diff_review.gh")
 local original_notify = vim.notify
 
 local root = "D:/diffreview-flow-root"
@@ -8,6 +9,15 @@ local calls = {}
 local deletes = {}
 local state = {}
 local held_systemlist_async = nil
+
+---@type DiffReviewGhBackend
+local gh_backend = {}
+
+function gh_backend.system_async(_, _, cb)
+  vim.defer_fn(function()
+    cb({ code = 1, stdout = "", stderr = "no pull requests found", output = "no pull requests found" })
+  end, 5)
+end
 
 local function assert_true(condition, message)
   if not condition then error(message, 2) end
@@ -37,6 +47,7 @@ local function reset_state(next_state)
     staged_modified = next_state.staged_modified or {},
     untracked = next_state.untracked or {},
     staged_added = next_state.staged_added or {},
+    ignored = next_state.ignored or {},
   }
   reset_calls()
 end
@@ -166,7 +177,19 @@ function backend.system(command, input)
   local key = command_key(command)
   local relpath = command[#command]
 
+  if key:find("\tadd\t-u\t--\t", 1, true) then
+    if state.modified[relpath] then
+      state.modified[relpath] = nil
+      state.staged_modified[relpath] = true
+      return "", 0
+    end
+    return "add -u failed for " .. relpath, 1
+  end
+
   if key:find("\tadd\t--\t", 1, true) then
+    if state.ignored[relpath] then
+      return "The following paths are ignored by one of your .gitignore files: " .. relpath, 1
+    end
     if state.untracked[relpath] then
       state.untracked[relpath] = nil
       state.staged_added[relpath] = true
@@ -395,6 +418,7 @@ end
 local function run()
   assert_path_helpers()
   diff_review.set_git_backend(backend)
+  gh.set_backend(gh_backend)
   vim.notify = function() end
   diff_review.setup()
   diff_review.open()
@@ -403,7 +427,9 @@ local function run()
   reset_state({ modified = { ["mod.txt"] = true } })
   render_and_wait(buf, "mod.txt +1 -1")
   trigger_normal_mapping("S", find_row(buf, "mod.txt"))
-  wait_for(function() return saw_system_call("git\t-C\t" .. root .. "\tadd\t--\tmod.txt") end, "tracked stage did not run git add")
+  wait_for(function()
+    return saw_system_call("git\t-C\t" .. root .. "\tadd\t-u\t--\tmod.txt")
+  end, "tracked stage did not run git add -u")
   wait_for(function() return buffer_contains(buf, "Staged changes (1)") end, "tracked stage did not reconcile")
   reset_calls()
   trigger_normal_mapping("U", find_row(buf, "mod.txt"))
@@ -564,6 +590,21 @@ local function run()
     "stage-all from section header jumped to a hunk after reconcile\n" .. table.concat(status_lines(buf), "\n")
   )
 
+  reset_state({ modified = { ["codex/config.toml"] = true }, ignored = { ["codex/config.toml"] = true } })
+  render_and_wait(buf, "codex")
+  reset_calls()
+  trigger_normal_mapping("S", find_row(buf, "codex"))
+  wait_for(function()
+    return saw_system_call("git\t-C\t" .. root .. "\tadd\t-u\t--\tcodex/config.toml")
+  end, "ignored tracked file did not stage with git add -u")
+  assert_true(
+    not saw_system_call("git\t-C\t" .. root .. "\tadd\t--\tcodex/config.toml"),
+    "ignored tracked file used plain git add\n" .. calls_text()
+  )
+  wait_for(function()
+    return state.staged_modified["codex/config.toml"] == true
+  end, "ignored tracked file did not stage")
+
   reset_state({ staged_modified = { ["header-unstage-a.txt"] = true, ["header-unstage-b.txt"] = true } })
   render_and_wait(buf, "header-unstage-a.txt +1 -1")
   reset_calls()
@@ -664,6 +705,13 @@ local function run()
   reset_state({ untracked = { ["new.txt"] = true } })
   render_and_wait(buf, "new.txt new")
   trigger_normal_mapping("S", find_row(buf, "new.txt"))
+  wait_for(function()
+    return saw_system_call("git\t-C\t" .. root .. "\tadd\t--\tnew.txt")
+  end, "untracked stage did not use plain git add")
+  assert_true(
+    not saw_system_call("git\t-C\t" .. root .. "\tadd\t-u\t--\tnew.txt"),
+    "untracked stage used git add -u"
+  )
   wait_for(function() return buffer_contains(buf, "Staged changes (1)") end, "untracked optimistic stage did not render")
   reset_calls()
   trigger_normal_mapping("U", find_row(buf, "new.txt"))
@@ -768,6 +816,7 @@ end
 
 local ok, err = xpcall(run, debug.traceback)
 diff_review.reset_git_backend()
+gh.reset_backend()
 vim.notify = original_notify
 if not ok then
   vim.api.nvim_err_writeln(err)

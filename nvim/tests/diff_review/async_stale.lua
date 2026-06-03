@@ -1,6 +1,7 @@
 vim.loader.enable(false)
 
 local diff_review = require("diff_review")
+local gh = require("diff_review.gh")
 local root = "D:/mock/project"
 
 local function assert_true(condition, message)
@@ -15,6 +16,15 @@ local pending = {}
 local generation = "first"
 
 local backend = {} ---@type DiffReviewGitBackend
+
+---@type DiffReviewGhBackend
+local gh_backend = {}
+
+function gh_backend.system_async(_, _, cb)
+  vim.defer_fn(function()
+    cb({ code = 1, stdout = "", stderr = "no pull requests found", output = "no pull requests found" })
+  end, 5)
+end
 
 function backend.systemlist(command)
   local key = command_key(command)
@@ -87,6 +97,7 @@ end
 
 local function run()
   diff_review.set_git_backend(backend)
+  gh.set_backend(gh_backend)
   diff_review.setup()
 
   generation = "first"
@@ -109,6 +120,7 @@ end
 
 local ok, err = xpcall(run, debug.traceback)
 diff_review.reset_git_backend()
+gh.reset_backend()
 if not ok then
   vim.api.nvim_err_writeln(err)
   vim.cmd("cquit")

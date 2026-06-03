@@ -33,6 +33,8 @@ function M.setup()
   vim.api.nvim_set_hl(0, "DiffReviewStatusBranch", { fg = "#f1fa8c", bold = true })
   vim.api.nvim_set_hl(0, "DiffReviewStatusRemote", { fg = "#00afff", bold = true })
   vim.api.nvim_set_hl(0, "DiffReviewStatusLabel", { fg = "#c0c0c0", bold = true })
+  vim.api.nvim_set_hl(0, "DiffReviewStatusPR", { fg = "#d4d4d4" })
+  vim.api.nvim_set_hl(0, "DiffReviewStatusFetching", { fg = "#9ca3af", italic = true })
   vim.api.nvim_set_hl(0, "DiffReviewHunkContext", {
     fg = header_fg,
     underline = true,

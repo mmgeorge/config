@@ -23,7 +23,7 @@ Required patterns:
 - Type module tables with `---@type` when the module exposes state or a stable
   public API.
 - Keep test mocks typed too. If a test injects a backend, mark it with
-  `---@type DiffReviewGitBackend`.
+  `---@type DiffReviewGitBackend` or `---@type DiffReviewGhBackend`.
 - Prefer exact union literals for known variants, for example
   `"section"|"file"|"hunk"`, instead of plain `string`.
 
@@ -48,6 +48,12 @@ Run the mocked integration test:
 
 ```text
 nvim --headless -i NONE --cmd "set shadafile=NONE" -u nvim/init.lua -c "lua vim.loader.enable(false)" -S nvim/tests/diff_review/mock_backend.lua
+```
+
+Run the GitHub integration test:
+
+```text
+nvim --headless -i NONE --cmd "set shadafile=NONE" -u nvim/init.lua -c "lua vim.loader.enable(false)" -S nvim/tests/diff_review/github_integration.lua
 ```
 
 Run the async stale-refresh test:
@@ -92,6 +98,15 @@ notifications. Synchronous methods are only compatibility for tests or
 non-interactive helper paths. Keep index-mutating git operations asynchronous
 but sequential within a batch so tests and production avoid `.git/index.lock`
 races.
+
+## GitHub CLI Seam
+
+Use `diff_review.gh` for all GitHub CLI integration. Do not call `gh` directly
+from status, PRView, keymaps, renderers, or tests. The wrapper owns nonblocking
+`vim.system` calls, JSON normalization, no-PR detection, URL opening, and the
+`DiffReviewGhBackend` test seam. Tests that render status must mock this backend
+so they never depend on a real `gh` installation, auth state, network, or
+repository remote.
 
 For status actions, do not replace an already-rendered status buffer with a
 generic loading line. Apply an optimistic in-memory section update immediately,

@@ -1,6 +1,7 @@
 vim.loader.enable(false)
 
 local diff_review = require("diff_review")
+local gh = require("diff_review.gh")
 local root = "D:/mock/project"
 local original_compute_hunk_context_async = diff_review.compute_hunk_context_async
 
@@ -50,6 +51,15 @@ end
 
 ---@type DiffReviewGitBackend
 local backend = {}
+
+---@type DiffReviewGhBackend
+local gh_backend = {}
+
+function gh_backend.system_async(_, _, cb)
+  vim.defer_fn(function()
+    cb({ code = 1, stdout = "", stderr = "no pull requests found", output = "no pull requests found" })
+  end, 5)
+end
 
 ---@param command DiffReviewGitCommand
 ---@return string[] output
@@ -124,11 +134,11 @@ end
 function backend.system(command, input)
   record("system", command, input)
   local key = command_key(command)
-  if key == "git\t-C\t" .. root .. "\tadd\t--\ta.txt" then
+  if key == "git\t-C\t" .. root .. "\tadd\t-u\t--\ta.txt" then
     staged = true
     return "", 0
   end
-  if key == "git\t-C\t" .. root .. "\tadd\t--\tb.txt" then
+  if key == "git\t-C\t" .. root .. "\tadd\t-u\t--\tb.txt" then
     staged = true
     return "", 0
   end
@@ -239,6 +249,7 @@ end
 
 local function run()
   diff_review.set_git_backend(backend)
+  gh.set_backend(gh_backend)
   local ts_requests = 0
   diff_review.compute_hunk_context_async = function(_, _, cb)
     ts_requests = ts_requests + 1
@@ -287,11 +298,11 @@ local function run()
   assert_true(not contains_line(lines, "Loading DiffReview..."), "unstage action replaced status UI with loading state")
 
   wait_for(function()
-    return saw_system_call("git\t-C\t" .. root .. "\tadd\t--\ta.txt")
-      and saw_system_call("git\t-C\t" .. root .. "\tadd\t--\tb.txt")
+    return saw_system_call("git\t-C\t" .. root .. "\tadd\t-u\t--\ta.txt")
+      and saw_system_call("git\t-C\t" .. root .. "\tadd\t-u\t--\tb.txt")
   end, "stage commands did not run")
-  assert_true(saw_system_call("git\t-C\t" .. root .. "\tadd\t--\ta.txt"), "missing git add for a.txt")
-  assert_true(saw_system_call("git\t-C\t" .. root .. "\tadd\t--\tb.txt"), "missing git add for b.txt")
+  assert_true(saw_system_call("git\t-C\t" .. root .. "\tadd\t-u\t--\ta.txt"), "missing git add -u for a.txt")
+  assert_true(saw_system_call("git\t-C\t" .. root .. "\tadd\t-u\t--\tb.txt"), "missing git add -u for b.txt")
   wait_for(function()
     return saw_system_call("git\t-C\t" .. root .. "\trestore\t--staged\t--\ta.txt")
       and saw_system_call("git\t-C\t" .. root .. "\trestore\t--staged\t--\tb.txt")
@@ -306,6 +317,7 @@ end
 
 local ok, err = xpcall(run, debug.traceback)
 diff_review.reset_git_backend()
+gh.reset_backend()
 diff_review.compute_hunk_context_async = original_compute_hunk_context_async
 if not ok then
   vim.api.nvim_err_writeln(err)

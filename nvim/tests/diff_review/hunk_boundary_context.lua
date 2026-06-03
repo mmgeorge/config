@@ -1,10 +1,20 @@
 vim.loader.enable(false)
 
 local diff_review = require("diff_review")
+local gh = require("diff_review.gh")
 
 local original_cwd = vim.fs.normalize(vim.fn.getcwd())
 local root = vim.fs.normalize(original_cwd .. "/.diffreview-boundary-context-test")
 local calls = {}
+
+---@type DiffReviewGhBackend
+local gh_backend = {}
+
+function gh_backend.system_async(_, _, cb)
+  vim.defer_fn(function()
+    cb({ code = 1, stdout = "", stderr = "no pull requests found", output = "no pull requests found" })
+  end, 5)
+end
 
 local function assert_true(condition, message)
   if not condition then error(message, 2) end
@@ -171,6 +181,7 @@ local function run()
     "}",
   }, root .. "/src/engine.rs") == 0, "writefile failed")
   diff_review.set_git_backend(backend)
+  gh.set_backend(gh_backend)
 
   diff_review.setup()
   diff_review.open()
@@ -235,6 +246,7 @@ end
 
 local ok, err = xpcall(run, debug.traceback)
 diff_review.reset_git_backend()
+gh.reset_backend()
 vim.fn.delete(root, "rf")
 if not ok then
   vim.api.nvim_err_writeln(err)

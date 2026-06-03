@@ -1,7 +1,19 @@
 vim.loader.enable(false)
 
+local diff_review = require("diff_review")
+local gh = require("diff_review.gh")
+
 local original_cwd = vim.fs.normalize(vim.fn.getcwd())
 local test_root = vim.fs.normalize(original_cwd .. "/.diffreview-visual-selection-test")
+
+---@type DiffReviewGhBackend
+local gh_backend = {}
+
+function gh_backend.system_async(_, _, cb)
+  vim.defer_fn(function()
+    cb({ code = 1, stdout = "", stderr = "no pull requests found", output = "no pull requests found" })
+  end, 5)
+end
 
 local function assert_true(condition, message)
   if not condition then error(message, 2) end
@@ -88,10 +100,11 @@ local function run()
   assert_true(vim.v.shell_error == 0, "rev-parse failed: " .. table.concat(root_output, "\n"))
   assert_true(comparable_path(root_output[1]) == comparable_path(test_root), "wrong git root: " .. tostring(root_output[1]))
 
-  require("diff_review").open()
+  gh.set_backend(gh_backend)
+  diff_review.open()
   assert_true(vim.bo.filetype == "DiffReviewStatus", "DiffReviewStatus buffer did not open")
   local status_buf = vim.api.nvim_get_current_buf()
-  require("diff_review").render_status(status_buf)
+  diff_review.render_status(status_buf)
   wait_for(function()
     local lines = vim.api.nvim_buf_get_lines(status_buf, 0, -1, false)
     for _, line in ipairs(lines) do
@@ -135,6 +148,7 @@ end
 
 local ok, err = xpcall(run, debug.traceback)
 cleanup()
+gh.reset_backend()
 if not ok then
   vim.api.nvim_err_writeln(err)
   vim.cmd("cquit")

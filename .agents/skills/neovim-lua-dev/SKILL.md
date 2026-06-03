@@ -173,6 +173,12 @@ If diagnostics still look wrong, run the linter directly (e.g. `luacheck`,
   editor API mutations with `vim.schedule()` / `vim.schedule_wrap()` and route
   process start failures, nonzero exits, and stale-operation errors through
   `vim.notify()` or the plugin's notification module.
+- **External CLI wrappers:** put each external process family behind a small
+  module wrapper with typed LuaLS records and a mockable backend seam. UI modules
+  should call wrappers such as `plugin.github.current_pr_async()` instead of
+  constructing CLI commands inline. The wrapper owns argument shape, JSON
+  decoding/normalization, nonzero-exit classification, URL opening, and test
+  injection.
 - **Async refresh state:** long-running refreshes need a request id or equivalent
   cancellation token. Start a new id for each refresh and ignore callbacks from
   older ids so slow Git/process results cannot repaint stale data over newer UI.

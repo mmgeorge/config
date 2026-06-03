@@ -70,11 +70,21 @@
 
 ---@class DiffReviewStatusEntry
 ---@field id? string
----@field kind "section"|"file"|"hunk"
+---@field kind "section"|"file"|"hunk"|"pr"
 ---@field section? DiffReviewStatusSection
 ---@field file? DiffReviewStatusFile
 ---@field hunk? DiffReviewHunk
 ---@field diff_line? table
+---@field pr? DiffReviewGhPR
+
+---@class DiffReviewStatusPRState
+---@field state "fetching"|"ready"|"none"|"error"
+---@field pr? DiffReviewGhPR
+---@field message? string
+
+---@class DiffReviewStatusHeadLine
+---@field segments table[]
+---@field entry? DiffReviewStatusEntry
 
 ---@alias DiffReviewStatusSectionName "unstaged"|"staged"|"untracked"
 
@@ -133,6 +143,7 @@ M._hunk_header_priority = 20
 M._active_hunk_header_priority = 200
 
 local config = require("diff_review.config")
+local gh = require("diff_review.gh")
 local highlights = require("diff_review.highlights")
 local notifications = require("diff_review.notifications")
 
@@ -728,6 +739,14 @@ end
 
 ---@param files string[]
 ---@param cb fun(result: { ok: boolean, successes: string[], failures: DiffReviewGitFailure[] })
+function M.stage_tracked_files_async(files, cb)
+  run_file_batch_async(files, function(relpath)
+    return { "add", "-u", "--", relpath }
+  end, "Stage failed", cb)
+end
+
+---@param files string[]
+---@param cb fun(result: { ok: boolean, successes: string[], failures: DiffReviewGitFailure[] })
 function M.unstage_files_async(files, cb)
   run_file_batch_async(files, function(relpath)
     return { "restore", "--staged", "--", relpath }
@@ -747,6 +766,14 @@ end
 function M.stage_files(files)
   return run_file_batch_sync_for_test_backend(files, function(relpath)
     return { "add", "--", relpath }
+  end, "Stage failed")
+end
+
+---@param files string[]
+---@return { ok: boolean, successes: string[], failures: DiffReviewGitFailure[] }
+function M.stage_tracked_files(files)
+  return run_file_batch_sync_for_test_backend(files, function(relpath)
+    return { "add", "-u", "--", relpath }
   end, "Stage failed")
 end
 
@@ -2752,8 +2779,73 @@ local function status_head_row(name, oid, ref, ref_hl, subject)
   }
 end
 
+---@param pr_state DiffReviewStatusPRState?
+---@return DiffReviewStatusHeadLine
+local function status_pr_head_line(pr_state)
+  local segments = {
+    { ("%-8s"):format("PR:"), "DiffReviewStatusLabel" },
+  }
+  local entry = { id = "pr", kind = "pr" }
+
+  if not pr_state or pr_state.state == "fetching" then
+    segments[#segments + 1] = { "...fetching...", "DiffReviewStatusFetching" }
+  elseif pr_state.state == "ready" and pr_state.pr then
+    entry.pr = pr_state.pr
+    segments[#segments + 1] = { pr_state.pr.title ~= "" and pr_state.pr.title or ("PR #" .. tostring(pr_state.pr.number)), "DiffReviewStatusPR" }
+  elseif pr_state.state == "error" then
+    segments[#segments + 1] = { "error", "ErrorMsg" }
+  else
+    segments[#segments + 1] = { "none", "Comment" }
+  end
+
+  return { segments = segments, entry = entry }
+end
+
+---@param values table
+---@param pr_state DiffReviewStatusPRState?
+---@return DiffReviewStatusHeadLine[]
+local function status_build_head_lines(values, pr_state)
+  local lines = {}
+  lines[#lines + 1] = {
+    segments = status_head_row(
+      "Head",
+      values.head_oid or "0000000",
+      values.branch or "(detached)",
+      "DiffReviewStatusBranch",
+      values.subject or "(no commits)"
+    ),
+  }
+
+  if values.upstream then
+    lines[#lines + 1] = {
+      segments = status_head_row(
+        "Merge",
+        values.upstream_oid or "",
+        values.upstream,
+        "DiffReviewStatusRemote",
+        values.upstream_subject or ""
+      ),
+    }
+  end
+
+  if values.push_ref then
+    lines[#lines + 1] = {
+      segments = status_head_row(
+        "Push",
+        values.push_oid or "",
+        values.push_ref,
+        "DiffReviewStatusRemote",
+        values.push_subject or ""
+      ),
+    }
+  end
+
+  lines[#lines + 1] = status_pr_head_line(pr_state)
+  return lines
+end
+
 ---@param cwd string
----@param cb fun(lines: table[])
+---@param cb fun(lines: DiffReviewStatusHeadLine[], values: table)
 local function status_head_lines_async(cwd, cb)
   local values = {}
   local pending = 9
@@ -2763,36 +2855,8 @@ local function status_head_lines_async(cwd, cb)
     pending = pending - 1
     if pending > 0 then return end
 
-    local lines = {}
-    lines[#lines + 1] = status_head_row(
-      "Head",
-      values.head_oid or "0000000",
-      values.branch or "(detached)",
-      "DiffReviewStatusBranch",
-      values.subject or "(no commits)"
-    )
-
-    if values.upstream then
-      lines[#lines + 1] = status_head_row(
-        "Merge",
-        values.upstream_oid or "",
-        values.upstream,
-        "DiffReviewStatusRemote",
-        values.upstream_subject or ""
-      )
-    end
-
-    if values.push_ref then
-      lines[#lines + 1] = status_head_row(
-        "Push",
-        values.push_oid or "",
-        values.push_ref,
-        "DiffReviewStatusRemote",
-        values.push_subject or ""
-      )
-    end
-
-    cb(lines)
+    local pr_state = M._status and M._status.pr
+    cb(status_build_head_lines(values, pr_state), values)
   end
 
   status_git_line_async(cwd, { "rev-parse", "--short", "HEAD" }, function(line) done("head_oid", line) end)
@@ -2886,6 +2950,8 @@ local function status_add_hint_line()
     { " commit | ", "DiffReviewStatusHint" },
     { "pP", "DiffReviewStatusHintKey" },
     { " push | ", "DiffReviewStatusHint" },
+    { "gp", "DiffReviewStatusHintKey" },
+    { " pr | ", "DiffReviewStatusHint" },
     { "<CR>", "DiffReviewStatusHintKey" },
     { " jump | ", "DiffReviewStatusHint" },
     { "q", "DiffReviewStatusHintKey" },
@@ -3256,18 +3322,20 @@ local function status_apply_optimistic_move(sections, entries, target_section)
 end
 
 ---@param cwd string
----@param cb fun(result: { head_lines: table[], sections: DiffReviewStatusSection[] })
+---@param cb fun(result: { head_lines: DiffReviewStatusHeadLine[], head_values: table, sections: DiffReviewStatusSection[] })
 local function status_load_async(cwd, cb)
   local head_lines = nil
+  local head_values = nil
   local sections = nil
 
   local function maybe_done()
     if not (head_lines and sections) then return end
-    cb({ head_lines = head_lines, sections = sections })
+    cb({ head_lines = head_lines, head_values = head_values or {}, sections = sections })
   end
 
-  status_head_lines_async(cwd, function(lines)
+  status_head_lines_async(cwd, function(lines, values)
     head_lines = lines
+    head_values = values
     maybe_done()
   end)
   collect_items_from_git(cwd, function(items)
@@ -3753,7 +3821,11 @@ local function status_render_loaded(buf, target_id, fallback_line, opts, head_li
   status_add_hint_line()
   status_add_line("")
   for _, head_line in ipairs(head_lines) do
-    status_add_segment_line(head_line)
+    if head_line.segments then
+      status_add_segment_line(head_line.segments, head_line.entry)
+    else
+      status_add_segment_line(head_line)
+    end
   end
   status_add_line("")
 
@@ -3794,10 +3866,46 @@ local function status_render_loaded(buf, target_id, fallback_line, opts, head_li
   status_restore_cursor(buf, target_id, fallback_line)
 end
 
+---@param cwd string
+---@param buf integer
+---@param force? boolean
+local function status_ensure_pr_state(cwd, buf, force)
+  M._status = M._status or {}
+  local status = M._status
+  if not force and status.pr_root == cwd and status.pr then return end
+
+  status.pr_root = cwd
+  status.pr = { state = "fetching" }
+  status.pr_request_id = (status.pr_request_id or 0) + 1
+  local request_id = status.pr_request_id
+
+  gh.current_pr_async(cwd, function(result)
+    local latest_status = M._status
+    if not (latest_status and latest_status.pr_request_id == request_id and latest_status.pr_root == cwd) then return end
+
+    if result.ok and result.pr then
+      latest_status.pr = { state = "ready", pr = result.pr }
+    elseif result.ok then
+      latest_status.pr = { state = "none" }
+    else
+      local message = result.message or "Unable to fetch GitHub pull request"
+      latest_status.pr = { state = "error", message = message }
+      notify_error("GitHub PR lookup failed: " .. message)
+    end
+
+    if latest_status.head_values then
+      latest_status.head_lines = status_build_head_lines(latest_status.head_values, latest_status.pr)
+    end
+    if vim.api.nvim_buf_is_valid(buf) and latest_status.head_lines and latest_status.sections then
+      M.render_status(buf, nil, nil, { reuse_sections = true })
+    end
+  end)
+end
+
 ---@param buf integer
 ---@param target_id? string
 ---@param fallback_line? integer
----@param opts? { reuse_sections?: boolean }
+---@param opts? { reuse_sections?: boolean, refresh_pr?: boolean }
 function M.render_status(buf, target_id, fallback_line, opts)
   opts = opts or {}
   setup_bg_highlights()
@@ -3831,6 +3939,9 @@ function M.render_status(buf, target_id, fallback_line, opts)
       return
     end
 
+    M._status.cwd = cwd
+    status_ensure_pr_state(cwd, buf, opts.refresh_pr)
+
     status_load_async(cwd, function(result)
       if not (M._status and M._status.request_id == request_id) then return end
       if not vim.api.nvim_buf_is_valid(buf) then return end
@@ -3839,6 +3950,7 @@ function M.render_status(buf, target_id, fallback_line, opts)
         return
       end
       M._status.head_lines = result.head_lines
+      M._status.head_values = result.head_values
       M._status.sections = result.sections
       M._status.fancy_rows = {}
       if preserve_current_cursor then
@@ -3961,18 +4073,24 @@ end
 
 ---@param entries DiffReviewStatusEntry[]
 ---@return string[] hunk_diffs
----@return string[] files
+---@return string[] tracked_files
+---@return string[] untracked_files
 local function status_split_action_entries(entries)
   local hunk_diffs = {}
-  local files_to_move = {}
+  local tracked_files = {}
+  local untracked_files = {}
   for _, entry in ipairs(entries) do
     if entry.kind == "hunk" and entry.hunk then
       hunk_diffs[#hunk_diffs + 1] = entry.hunk.diff
     elseif entry.kind == "file" and entry.file then
-      files_to_move[entry.file.filename] = true
+      if entry.file.untracked then
+        untracked_files[entry.file.filename] = true
+      else
+        tracked_files[entry.file.filename] = true
+      end
     end
   end
-  return hunk_diffs, status_files_from_set(files_to_move)
+  return hunk_diffs, status_files_from_set(tracked_files), status_files_from_set(untracked_files)
 end
 
 ---@param entry DiffReviewStatusEntry
@@ -4058,7 +4176,7 @@ local function status_stage_entries(entries)
   if #action_entries == 0 then return end
 
   local target_id = status_action_target_id(entries, action_entries, "staged")
-  local hunk_diffs, files = status_split_action_entries(action_entries)
+  local hunk_diffs, tracked_files, untracked_files = status_split_action_entries(action_entries)
   local staged_hunks = 0
   local staged_files = 0
   local status_buf = M._status and M._status.buf
@@ -4072,14 +4190,25 @@ local function status_stage_entries(entries)
     status_request_reconcile(status_buf, target_id)
   end
 
-  local function stage_files_after_hunks()
-    if #files == 0 then
+  local function stage_untracked_files()
+    if #untracked_files == 0 then
       finish()
       return
     end
-    M.stage_files_async(files, function(result)
-      staged_files = #result.successes
+    M.stage_files_async(untracked_files, function(result)
+      staged_files = staged_files + #result.successes
       finish()
+    end)
+  end
+
+  local function stage_files_after_hunks()
+    if #tracked_files == 0 then
+      stage_untracked_files()
+      return
+    end
+    M.stage_tracked_files_async(tracked_files, function(result)
+      staged_files = staged_files + #result.successes
+      stage_untracked_files()
     end)
   end
 
@@ -4347,6 +4476,21 @@ local function closest_current_line_for_deleted_diff_line(diff_text, old_target_
 end
 
 ---@param entry DiffReviewStatusEntry?
+local function status_open_pr(entry)
+  local pr = entry and entry.pr
+  if not pr and M._status and M._status.pr and M._status.pr.state == "ready" then
+    pr = M._status.pr.pr
+  end
+  if not pr then
+    local state = M._status and M._status.pr and M._status.pr.state
+    local message = state == "fetching" and "GitHub PR is still loading" or "No GitHub PR for this branch"
+    vim.notify(message, vim.log.levels.INFO, { title = "DiffReview" })
+    return
+  end
+  require("diff_review.pr_view").open(pr, { cwd = M._status and M._status.cwd or nil })
+end
+
+---@param entry DiffReviewStatusEntry?
 local function status_jump(entry)
   if not (entry and entry.file and entry.file.filename) then return end
   vim.cmd.edit(vim.fn.fnameescape(entry.file.filename))
@@ -4405,7 +4549,8 @@ local function status_push(buf)
         notify_error("Push failed: " .. (#compact > 0 and table.concat(compact, "\n") or ("git exited " .. result.code)))
       end
       if vim.api.nvim_buf_is_valid(buf) then
-        render_status_or_notify(buf)
+        if M._status then M._status.pr = nil end
+        render_status_or_notify(buf, nil, nil, { refresh_pr = true })
       end
     end)
   end)
@@ -4422,7 +4567,8 @@ local function setup_status_keymaps(buf)
   end, vim.tbl_extend("force", opts, { desc = "Close DiffReview" }))
 
   vim.keymap.set("n", "r", function()
-    refresh_status_after_action(buf, (status_entry_under_cursor() or {}).id)
+    if M._status then M._status.pr = nil end
+    render_status_or_notify(buf, (status_entry_under_cursor() or {}).id, vim.api.nvim_win_get_cursor(0)[1], { refresh_pr = true })
   end, vim.tbl_extend("force", opts, { desc = "Refresh DiffReview" }))
 
   vim.keymap.set("n", "<Tab>", function()
@@ -4452,8 +4598,13 @@ local function setup_status_keymaps(buf)
   end, vim.tbl_extend("force", opts, { desc = "Discard selection" }))
 
   vim.keymap.set("n", "<CR>", function()
-    status_jump(status_entry_under_cursor())
-  end, vim.tbl_extend("force", opts, { desc = "Jump to file" }))
+    local entry = status_entry_under_cursor()
+    if entry and entry.kind == "pr" then
+      status_open_pr(entry)
+    else
+      status_jump(entry)
+    end
+  end, vim.tbl_extend("force", opts, { desc = "Open PR or jump to file" }))
 
   local function commit()
     require("diff_review.commit").commit({
@@ -4470,8 +4621,12 @@ local function setup_status_keymaps(buf)
     status_push(buf)
   end, vim.tbl_extend("force", opts, { desc = "Push" }))
 
+  vim.keymap.set("n", "gp", function()
+    status_open_pr(status_entry_under_cursor())
+  end, vim.tbl_extend("force", opts, { desc = "Open pull request" }))
+
   vim.keymap.set("n", "?", function()
-    vim.notify("<Tab> toggle | S stage | U unstage | j discard | c commit | pP push | <CR> jump | r refresh | q close", vim.log.levels.INFO, {
+    vim.notify("<Tab> toggle | S stage | U unstage | j discard | c commit | pP push | gp pr | <CR> jump/open | r refresh | q close", vim.log.levels.INFO, {
       title = "DiffReview",
     })
   end, vim.tbl_extend("force", opts, { desc = "DiffReview help" }))
