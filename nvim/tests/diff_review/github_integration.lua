@@ -17,6 +17,8 @@ local has_changes = true
 local generate_count = 0
 local notifications = {}
 local staged_mode = "same"
+local hold_push = false
+local release_push = nil
 
 local function assert_true(condition, message)
   if not condition then error(message, 2) end
@@ -85,6 +87,19 @@ function git_backend.system(command, input)
 end
 
 function git_backend.system_async(command, input, cb)
+  if command_key(command) == "git\t-C\t" .. root .. "\tpush" and hold_push then
+    local output, code = git_backend.system(command, input)
+    release_push = function()
+      cb({
+        code = code,
+        stdout = output,
+        stderr = "",
+        output = output,
+      })
+    end
+    return
+  end
+
   vim.defer_fn(function()
     local output, code = git_backend.system(command, input)
     cb({
@@ -417,14 +432,25 @@ local function run()
   wait_for(function() return buffer_contains(status_buf, "PR after manual refresh") end, "or did not force-refresh PR state")
 
   pr_title = "PR after push"
+  hold_push = true
+  release_push = nil
   trigger_normal_mapping("opp", find_row(status_buf, "Head:"))
-  wait_for(function() return buffer_contains(status_buf, "PR after push") end, "push did not refresh PR state")
+  wait_for(function() return buffer_contains(status_buf, "Push:   ...pushing...") end, "push did not render pending state")
   wait_for(function()
     for _, call in ipairs(calls) do
       if call.kind == "system" and call.key == "git\t-C\t" .. root .. "\tpush" then return true end
     end
     return false
   end, "push command did not run")
+  assert_true(buffer_contains(status_buf, "PR after manual refresh"), "push should not force-refresh PR state")
+  assert_true(not buffer_contains(status_buf, "PR after push"), "push unexpectedly refreshed PR state before completion")
+
+  hold_push = false
+  assert_true(type(release_push) == "function", "push completion was not captured")
+  release_push()
+  wait_for(function() return not buffer_contains(status_buf, "...pushing...") end, "push pending state did not clear")
+  assert_true(buffer_contains(status_buf, "PR after manual refresh"), "push completion should keep cached PR state")
+  assert_true(not buffer_contains(status_buf, "PR after push"), "push completion unexpectedly refreshed PR state")
 
   trigger_normal_mapping("opP", find_row(status_buf, "Head:"))
   wait_for(function()

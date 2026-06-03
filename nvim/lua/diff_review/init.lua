@@ -97,6 +97,10 @@
 ---@field pr? DiffReviewGhPR
 ---@field message? string
 
+---@class DiffReviewStatusRemoteActionState
+---@field action "push"|"pull"
+---@field state "running"
+
 ---@class DiffReviewStatusHeadLine
 ---@field segments table[]
 ---@field entry? DiffReviewStatusEntry
@@ -3053,6 +3057,7 @@ end
 ---@param about_state DiffReviewAICommitState?
 ---@return DiffReviewStatusHeadLine[]
 local function status_build_head_lines(values, pr_state, about_state)
+  local remote_action = M._status and M._status.remote_action
   local lines = {}
   lines[#lines + 1] = {
     segments = status_head_row(
@@ -3076,7 +3081,14 @@ local function status_build_head_lines(values, pr_state, about_state)
     }
   end
 
-  if values.push_ref then
+  if remote_action and remote_action.action == "push" then
+    lines[#lines + 1] = {
+      segments = {
+        { ("%-8s"):format("Push:"), "DiffReviewStatusLabel" },
+        { "...pushing...", "DiffReviewStatusFetching" },
+      },
+    }
+  elseif values.push_ref then
     lines[#lines + 1] = {
       segments = status_head_row(
         "Push",
@@ -5373,6 +5385,15 @@ local function status_remote_action(buf, action)
     end
 
     local title = action == "push" and "Push" or "Pull"
+    if M._status then
+      M._status.remote_action = { action = action, state = "running" }
+      if M._status.head_values then
+        M._status.head_lines = status_build_head_lines(M._status.head_values, M._status.pr, M._status.about)
+        if vim.api.nvim_buf_is_valid(buf) then
+          M.render_status(buf, nil, nil, { reuse_sections = true })
+        end
+      end
+    end
     notify_debug(title .. "ing changes...", vim.log.levels.INFO, { title = "DiffReview" })
     system_text_async({ "git", "-C", cwd, action }, nil, function(result)
       local compact = {}
@@ -5387,11 +5408,8 @@ local function status_remote_action(buf, action)
         notify_error(title .. " failed: " .. (#compact > 0 and table.concat(compact, "\n") or ("git exited " .. result.code)))
       end
       if vim.api.nvim_buf_is_valid(buf) then
-        if M._status then
-          M._status.pr = nil
-          M._status.about = nil
-        end
-        render_status_or_notify(buf, nil, nil, { refresh_pr = true, refresh_about = true })
+        if M._status then M._status.remote_action = nil end
+        render_status_or_notify(buf)
       end
     end)
   end)
