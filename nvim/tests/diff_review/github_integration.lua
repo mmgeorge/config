@@ -417,7 +417,7 @@ local function run()
   wait_for(function() return buffer_contains(status_buf, "PR after manual refresh") end, "or did not force-refresh PR state")
 
   pr_title = "PR after push"
-  trigger_normal_mapping("opP", find_row(status_buf, "Head:"))
+  trigger_normal_mapping("opp", find_row(status_buf, "Head:"))
   wait_for(function() return buffer_contains(status_buf, "PR after push") end, "push did not refresh PR state")
   wait_for(function()
     for _, call in ipairs(calls) do
@@ -426,7 +426,7 @@ local function run()
     return false
   end, "push command did not run")
 
-  trigger_normal_mapping("opp", find_row(status_buf, "Head:"))
+  trigger_normal_mapping("opP", find_row(status_buf, "Head:"))
   wait_for(function()
     for _, call in ipairs(calls) do
       if call.kind == "system" and call.key == "git\t-C\t" .. root .. "\tpull" then return true end
