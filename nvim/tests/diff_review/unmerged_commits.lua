@@ -58,6 +58,25 @@ local function find_row_after(buf, needle, start_row)
   error("missing row after " .. tostring(start_row) .. ": " .. needle .. "\n" .. table.concat(lines, "\n"), 2)
 end
 
+local function line_has_highlight_prefix(buf, row, hl_prefix)
+  local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
+  for _, mark in ipairs(marks) do
+    local details = mark[4] or {}
+    if type(details.hl_group) == "string" and details.hl_group:sub(1, #hl_prefix) == hl_prefix then return true end
+  end
+  return false
+end
+
+local function line_highlights(buf, row)
+  local groups = {}
+  local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
+  for _, mark in ipairs(marks) do
+    local details = mark[4] or {}
+    if details.hl_group then groups[#groups + 1] = details.hl_group end
+  end
+  return table.concat(groups, ",")
+end
+
 local function trigger_normal_mapping(key, row)
   vim.api.nvim_win_set_cursor(0, { row, 0 })
   local mapping = vim.fn.maparg(key, "n", false, true)
@@ -104,6 +123,13 @@ local commit_diff = table.concat({
   "@@ -2 +2 @@",
   "-left",
   "+right",
+  "diff --git a/src/commit.rs b/src/commit.rs",
+  "index 7777777..8888888 100644",
+  "--- a/src/commit.rs",
+  "+++ b/src/commit.rs",
+  "@@ -1 +1 @@",
+  "-fn old_commit() {}",
+  "+pub fn from_commit() {}",
 }, "\n")
 
 local staged_diff = table.concat({
@@ -187,6 +213,7 @@ local function run()
   trigger_normal_mapping("<Tab>", find_row_after(buf, "45806b8 master", unmerged_heading))
   wait_for(function() return buffer_contains(buf, "foo/bar.js +1 -1") end, "expanded commit did not render changed file\n" .. table.concat(status_lines(buf), "\n"))
   assert_true(buffer_contains(buf, "baz.txt +1 -1"), "expanded commit missing second changed file")
+  assert_true(buffer_contains(buf, "src/commit.rs +1 -1"), "expanded commit missing Rust changed file")
   assert_true(count_calls_containing("\tshow\t--format=\t--no-color\t--no-ext-diff\t45806b8123456789") == 2, "commit diff was not loaded exactly once through async backend")
 
   trigger_normal_mapping("<Tab>", find_row(buf, "foo/bar.js +1 -1"))
@@ -195,6 +222,13 @@ local function run()
   vim.wait(50)
   assert_true(not saw_call_containing("\tadd\t"), "stage command ran on read-only commit diff")
   assert_true(not saw_call_containing("\tapply\t--cached\t"), "stage patch ran on read-only commit hunk")
+
+  trigger_normal_mapping("<Tab>", find_row(buf, "src/commit.rs +1 -1"))
+  wait_for(function() return buffer_contains(buf, "pub fn from_commit") end, "Rust commit file did not unfold hunks")
+  wait_for(function()
+    local row = find_row(buf, "pub fn from_commit")
+    return line_has_highlight_prefix(buf, row, "@keyword")
+  end, "commit-only Rust hunk body row did not get Tree-sitter keyword highlight: " .. line_highlights(buf, find_row(buf, "pub fn from_commit")))
 end
 
 local ok, err = xpcall(run, debug.traceback)

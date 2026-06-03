@@ -12,9 +12,11 @@ local opened_urls = {}
 local pr_mode = "ready"
 local pr_title = "Improve DiffReview"
 local generated_commit = "feat: add diff review ai summary\n\nAdd generated commit metadata."
+local staged_generated_commit = "fix: update staged selection\n\nUse the staged diff."
 local has_changes = true
 local generate_count = 0
 local notifications = {}
+local staged_mode = "same"
 
 local function assert_true(condition, message)
   if not condition then error(message, 2) end
@@ -148,7 +150,7 @@ function gh_backend.system_async(command, _, cb, cwd)
       return
     end
     cb({ code = 1, stdout = "", stderr = "unexpected gh command: " .. key, output = "unexpected gh command: " .. key })
-  end, 40)
+  end, 120)
 end
 
 function gh_backend.open_url(url)
@@ -187,16 +189,50 @@ function ai_backend.systemlist_async(command, cb)
       return
     end
     if key == "git\t-C\t" .. root .. "\tdiff\t--no-ext-diff\t--no-color\t--staged\t--stat\t--summary" then
-      cb({ " lua/diff_review/init.lua | 2 +-" }, 0)
+      if staged_mode == "none" then
+        cb({}, 0)
+      elseif staged_mode == "different" then
+        cb({ " staged_only.rs | 2 +-" }, 0)
+      else
+        cb({ " lua/diff_review/init.lua | 2 +-" }, 0)
+      end
+      return
+    end
+    if key == "git\t-C\t" .. root .. "\tdiff\t--no-ext-diff\t--no-color\t--staged" then
+      if staged_mode == "none" then
+        cb({}, 0)
+      elseif staged_mode == "different" then
+        cb({
+          "diff --git a/staged_only.rs b/staged_only.rs",
+          "--- a/staged_only.rs",
+          "+++ b/staged_only.rs",
+          "@@ -1 +1 @@",
+          "-old_staged",
+          "+new_staged",
+        }, 0)
+      else
+        cb({
+          "diff --git a/lua/diff_review/init.lua b/lua/diff_review/init.lua",
+          "--- a/lua/diff_review/init.lua",
+          "+++ b/lua/diff_review/init.lua",
+          "@@ -1 +1 @@",
+          "-old",
+          "+new",
+        }, 0)
+      end
       return
     end
     cb({}, 1)
   end, 5)
 end
 
-function ai_backend.generate_async(_, cb)
+function ai_backend.generate_async(context, cb)
   generate_count = generate_count + 1
   vim.defer_fn(function()
+    if context:find("staged_only.rs", 1, true) then
+      cb({ ok = true, message = staged_generated_commit })
+      return
+    end
     cb({ ok = true, message = generated_commit })
   end, 80)
 end
@@ -362,7 +398,7 @@ local function run()
   trigger_normal_mapping("?", find_row(status_buf, "Head:"))
   local help_buf = vim.api.nvim_get_current_buf()
   assert_true(help_buf ~= status_buf, "help did not open a popup buffer")
-  assert_buffer_contains_all(help_buf, { "<Tab>", "S", "U", "j", "oc", "opP", "opp", "ogp", "<CR>", "r", "or", "q", "?" })
+  assert_buffer_contains_all(help_buf, { "<Tab>", "S", "U", "j", "cc", "opP", "opp", "ogp", "<CR>", "r", "or", "q", "?" })
   pcall(vim.api.nvim_win_close, 0, true)
 
   vim.api.nvim_win_set_buf(0, status_buf)
@@ -445,6 +481,7 @@ local function run()
   has_changes = true
   ai_commit.reset_backend()
   ai_commit.set_backend(ai_backend)
+  staged_mode = "same"
   local count_before_direct_generate = generate_count
   local direct_commit_buf = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_buf_set_lines(direct_commit_buf, 0, -1, false, { "" })
@@ -459,6 +496,31 @@ local function run()
   )
   wait_for(function() return buffer_contains(direct_commit_buf, "feat: add diff review ai summary") end, "direct commit generation did not populate buffer")
   assert_true(generate_count == count_before_direct_generate + 1, "direct commit buffer did not start exactly one AI generation")
+
+  ai_commit.reset_backend()
+  ai_commit.set_backend(ai_backend)
+  staged_mode = "same"
+  local count_before_head_generate = generate_count
+  ai_commit.ensure(root, nil, function() end)
+  wait_for(function()
+    local state = ai_commit.state()
+    return state and state.state == "ready"
+  end, "HEAD About generation did not complete before staged mismatch test")
+  assert_true(generate_count == count_before_head_generate + 1, "HEAD About generation did not start for staged mismatch test")
+
+  staged_mode = "different"
+  local mismatch_commit_buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(mismatch_commit_buf, 0, -1, false, { "" })
+  vim.bo[mismatch_commit_buf].modifiable = true
+  local mismatch_messages = {}
+  ai_commit.populate_commit_buffer_when_ready(mismatch_commit_buf, root, function(message)
+    mismatch_messages[#mismatch_messages + 1] = message
+  end)
+  wait_for(function()
+    return mismatch_messages[1] == "Generating commit message..."
+  end, "staged mismatch did not notify when replacement generation started")
+  wait_for(function() return buffer_contains(mismatch_commit_buf, "fix: update staged selection") end, "staged mismatch did not generate a staged commit message")
+  assert_true(generate_count == count_before_head_generate + 2, "staged mismatch did not start exactly one replacement generation")
 end
 
 local ok, err = xpcall(run, debug.traceback)

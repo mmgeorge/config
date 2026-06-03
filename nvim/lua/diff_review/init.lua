@@ -143,6 +143,7 @@
 ---@field _buf_last_rendered table<integer, string>?
 ---@field _ts_context_cache table<string, DiffReviewHunkTreeSitterContext|string|false|DiffReviewTreeSitterContextPending>?
 ---@field _ts_syntax_cache table<string, DiffReviewTreeSitterSyntax|false|DiffReviewTreeSitterSyntaxPending>?
+---@field _ts_diff_syntax_cache table<string, DiffReviewTreeSitterSyntax|false|DiffReviewTreeSitterSyntaxPending>?
 ---@field _ts_source_bufs table<string, integer>?
 ---@field _main_win integer?
 ---@field _saved_wo table?
@@ -150,6 +151,8 @@
 
 ---@type DiffReviewModule
 local M = {}
+local status_render_current_model
+local status_diff_hunks_for_file
 
 M._hunk_header_ns = vim.api.nvim_create_namespace("diff_review_headers")
 M._active_hunk_header_ns = vim.api.nvim_create_namespace("diff_review_active_hunk")
@@ -224,8 +227,14 @@ local function clear_treesitter_source_buffers()
       pcall(vim.api.nvim_buf_delete, buf, { force = true })
     end
   end
+  for _, cached in pairs(M._ts_diff_syntax_cache or {}) do
+    if type(cached) == "table" and cached.buf and vim.api.nvim_buf_is_valid(cached.buf) then
+      pcall(vim.api.nvim_buf_delete, cached.buf, { force = true })
+    end
+  end
   M._ts_source_bufs = {}
   M._ts_syntax_cache = {}
+  M._ts_diff_syntax_cache = {}
 end
 
 ---@param buf integer
@@ -1141,7 +1150,9 @@ function M.compute_hunk_context_async(filename, line, cb)
   if not parse_ok then
     cb(nil)
   elseif parsed then
-    finish(parsed)
+    vim.schedule(function()
+      finish(parsed)
+    end)
   end
 end
 
@@ -1201,7 +1212,78 @@ function M.compute_file_syntax_async(filename, cb)
   if not parse_ok then
     cb(nil)
   elseif parsed then
-    finish(parsed)
+    vim.schedule(function()
+      finish(parsed)
+    end)
+  end
+end
+
+---@param filename string
+---@param lines string[]
+---@param cb fun(syntax?: DiffReviewTreeSitterSyntax)
+function M.compute_diff_syntax_async(filename, lines, cb)
+  if #lines == 0 then
+    cb(nil)
+    return
+  end
+
+  local ft = detect_filetype(filename, lines)
+  local lang = vim.treesitter.language.get_lang(ft)
+  if not lang then
+    cb(nil)
+    return
+  end
+
+  local highlight_ok, highlight_query = pcall(vim.treesitter.query.get, lang, "highlights")
+  if not highlight_ok then highlight_query = nil end
+
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[buf].bufhidden = "wipe"
+  vim.bo[buf].buftype = "nofile"
+  vim.bo[buf].swapfile = false
+  vim.bo[buf].filetype = ft
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+
+  local parser_ok, parser = pcall(vim.treesitter.get_parser, buf, lang)
+  if not parser_ok or not parser then
+    pcall(vim.api.nvim_buf_delete, buf, { force = true })
+    cb(nil)
+    return
+  end
+
+  local line_count = math.max(vim.api.nvim_buf_line_count(buf), 1)
+  local done = false
+  local function finish(trees)
+    if done then return end
+    done = true
+    local tree = type(trees) == "table" and trees[1] or nil
+    if not tree then
+      pcall(vim.api.nvim_buf_delete, buf, { force = true })
+      cb(nil)
+      return
+    end
+    cb({
+      buf = buf,
+      tree = tree,
+      highlight_query = highlight_query,
+    })
+  end
+
+  local parse_ok, parsed = pcall(function()
+    return parser:parse({ 0, 0, line_count, 0 }, function(first, second)
+      local trees = type(first) == "table" and first or second
+      vim.schedule(function()
+        finish(trees)
+      end)
+    end)
+  end)
+  if not parse_ok then
+    pcall(vim.api.nvim_buf_delete, buf, { force = true })
+    cb(nil)
+  elseif parsed then
+    vim.schedule(function()
+      finish(parsed)
+    end)
   end
 end
 
@@ -1845,12 +1927,87 @@ local function parse_hunk_body(hunk)
   return hunk
 end
 
+---@param diff_text string
+---@return string[]
+local function diff_syntax_source_lines(diff_text)
+  local lines = {}
+  for _, block in ipairs(parse_unified_diff(diff_text)) do
+    for _, hunk in ipairs(block.hunks) do
+      local parsed_hunk = parse_hunk_body(hunk)
+      for _, parsed_line in ipairs(parsed_hunk.lines) do
+        lines[#lines + 1] = parsed_line.code
+      end
+    end
+  end
+  return lines
+end
+
+---@param filename string
+---@param diff_text string
+---@param callback_key string
+---@param on_update? fun(syntax?: DiffReviewTreeSitterSyntax)
+---@return DiffReviewTreeSitterSyntax? syntax
+---@return boolean pending
+local function cached_diff_syntax(filename, diff_text, callback_key, on_update)
+  M._ts_diff_syntax_cache = M._ts_diff_syntax_cache or {}
+  local cache_key = filename .. ":" .. vim.fn.sha256(diff_text or "")
+  local cached = M._ts_diff_syntax_cache[cache_key]
+  if cached == false then return nil, false end
+  if type(cached) == "table" and not cached.pending then return cached, false end
+  if type(cached) == "table" and cached.pending then
+    if on_update then cached.callbacks[callback_key] = on_update end
+    return nil, true
+  end
+
+  local lines = diff_syntax_source_lines(diff_text)
+  M._ts_diff_syntax_cache[cache_key] = {
+    pending = true,
+    callbacks = on_update and { [callback_key] = on_update } or {},
+  }
+  M.compute_diff_syntax_async(filename, lines, function(syntax)
+    local pending = M._ts_diff_syntax_cache and M._ts_diff_syntax_cache[cache_key]
+    local callbacks = type(pending) == "table" and pending.callbacks or {}
+    M._ts_diff_syntax_cache[cache_key] = syntax or false
+    for _, callback in pairs(callbacks) do
+      local ok, err = pcall(callback, syntax)
+      if not ok then notify_error("Tree-sitter diff syntax update failed: " .. tostring(err)) end
+    end
+    if syntax and status_render_current_model and M._status and M._status.buf then
+      vim.schedule(function()
+        if M._status and M._status.buf and vim.api.nvim_buf_is_valid(M._status.buf) then
+          status_render_current_model()
+        end
+      end)
+    end
+  end)
+  return nil, true
+end
+
+---@param file DiffReviewStatusFile?
+---@param callback_key_prefix string
+---@param on_update? fun(syntax?: DiffReviewTreeSitterSyntax)
+local function prewarm_file_diff_syntax(file, callback_key_prefix, on_update)
+  if not (file and file.filename) then return end
+  local hunks = status_diff_hunks_for_file(file)
+  for hunk_index, hunk in ipairs(hunks) do
+    if hunk.diff and hunk.diff ~= "" then
+      cached_diff_syntax(
+        file.filename,
+        hunk.diff,
+        ("%s:%s:%d"):format(callback_key_prefix, file.filename, hunk_index),
+        on_update
+      )
+    end
+  end
+end
+
 ---@param parsed_line DiffReviewParsedHunkLine
 ---@param gutter DiffReviewGutterSpec
 ---@param file string
 ---@param syntax? DiffReviewTreeSitterSyntax
+---@param syntax_row? integer
 ---@return table
-local function hunk_body_row(parsed_line, gutter, file, syntax)
+local function hunk_body_row(parsed_line, gutter, file, syntax, syntax_row)
   local sign_hl = nil
   local line_hl = nil
   if parsed_line.prefix == "+" then
@@ -1872,10 +2029,9 @@ local function hunk_body_row(parsed_line, gutter, file, syntax)
   }
   row[#row + 1] = { "", nil, meta = diff_meta }
   hunk_add_gutter(row, gutter, parsed_line.old_line, parsed_line.new_line, parsed_line.prefix, sign_hl)
-  local source_line = parsed_line.new_line or parsed_line.old_line
   local segments = nil
-  if syntax and source_line then
-    segments = treesitter_line_segments(syntax.buf, syntax.tree, syntax.highlight_query, source_line - 1, parsed_line.code)
+  if syntax and syntax_row then
+    segments = treesitter_line_segments(syntax.buf, syntax.tree, syntax.highlight_query, syntax_row, parsed_line.code)
   end
   if segments and #segments > 0 then
     for _, segment in ipairs(segments) do
@@ -1899,6 +2055,13 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
   local diff = parse_unified_diff(diff_text)
   local ret = {} ---@type table[]
   local hunk_idx = 0
+  local syntax = nil
+  local syntax_pending = false
+  local syntax_row = 0
+  if filename then
+    local syntax_callback_key = context_callback_key and context_callback_key(0) or ("diff-row:" .. filename .. ":0")
+    syntax, syntax_pending = cached_diff_syntax(filename, diff_text, syntax_callback_key .. ":diff-syntax", on_context_update)
+  end
 
   for _, block in ipairs(diff) do
     for _, hunk in ipairs(block.hunks) do
@@ -1909,11 +2072,9 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
         or ("diff-row:" .. (filename or block.file) .. ":" .. hunk_line)
       local raw_context = nil
       local ts_context = nil
-      local syntax = nil
       if filename then
         raw_context = cached_hunk_context(filename, hunk_line, callback_key, on_context_update)
         ts_context = hunk_context_label(raw_context)
-        syntax = cached_file_syntax(filename, callback_key .. ":syntax", on_context_update)
       end
 
       local header_parts = {
@@ -1941,7 +2102,8 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
       end
       ret[#ret + 1] = hunk_header_row(header_parts)
       for _, parsed_line in ipairs(hunk.lines) do
-        ret[#ret + 1] = hunk_body_row(parsed_line, gutter, filename or block.file, syntax)
+        ret[#ret + 1] = hunk_body_row(parsed_line, gutter, filename or block.file, syntax, syntax_row)
+        syntax_row = syntax_row + 1
       end
       if opts.boundary_context and type(raw_context) == "table" then
         local node_start = raw_context.start_row + 1
@@ -1959,6 +2121,7 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
     end
   end
 
+  ret.diff_review_syntax_pending = syntax_pending
   return ret
 end
 
@@ -3598,7 +3761,7 @@ end
 
 ---@param file DiffReviewStatusFile
 ---@return DiffReviewHunk[]
-local function status_diff_hunks_for_file(file)
+status_diff_hunks_for_file = function(file)
   if #file.hunks > 0 then return file.hunks end
   if not file.untracked then return {} end
 
@@ -3700,7 +3863,9 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_ki
     )
     if ok then
       rows = built_rows
-      M._status.fancy_rows[rows_key] = rows
+      if not rows.diff_review_syntax_pending then
+        M._status.fancy_rows[rows_key] = rows
+      end
     end
   end
   if not rows then
@@ -3930,6 +4095,21 @@ local function status_entry_under_cursor()
   return status.entries[line]
 end
 
+---@param entry DiffReviewStatusEntry?
+local function status_prewarm_entry_syntax(entry)
+  if not entry then return end
+  if (entry.kind == "file" or entry.kind == "commit_file") and entry.file then
+    prewarm_file_diff_syntax(entry.file, "status-cursor-prewarm:" .. (entry.id or entry.file.filename))
+  elseif (entry.kind == "hunk" or entry.kind == "commit_hunk") and entry.file and entry.hunk then
+    cached_diff_syntax(
+      entry.file.filename,
+      entry.hunk.diff,
+      "status-cursor-prewarm:" .. (entry.id or entry.file.filename),
+      nil
+    )
+  end
+end
+
 local status_files_from_set
 
 ---@param entry DiffReviewStatusEntry?
@@ -4109,34 +4289,6 @@ local function status_hunk_action_target_id(entries)
 end
 
 ---@param entries DiffReviewStatusEntry[]
----@return string?
-local function status_next_action_target_id(entries)
-  local status = M._status
-  if not (status and status.entries and status.buf and vim.api.nvim_buf_is_valid(status.buf)) then return nil end
-
-  local action_ids = {}
-  for _, entry in ipairs(entries or {}) do
-    if entry.id then action_ids[entry.id] = true end
-  end
-
-  local cursor_line = vim.api.nvim_win_get_cursor(0)[1]
-  local max_line = vim.api.nvim_buf_line_count(status.buf)
-  for line = cursor_line + 1, max_line do
-    local entry = status.entries[line]
-    if entry and entry.id and not action_ids[entry.id] and (entry.kind == "file" or entry.kind == "hunk") then
-      return entry.id
-    end
-  end
-  for line = cursor_line - 1, 1, -1 do
-    local entry = status.entries[line]
-    if entry and entry.id and not action_ids[entry.id] and (entry.kind == "file" or entry.kind == "hunk") then
-      return entry.id
-    end
-  end
-  return nil
-end
-
----@param entries DiffReviewStatusEntry[]
 ---@return boolean
 local function status_entries_are_headers(entries)
   if #entries == 0 then return false end
@@ -4146,57 +4298,14 @@ local function status_entries_are_headers(entries)
   return true
 end
 
----@param entries DiffReviewStatusEntry[]
----@return DiffReviewStatusEntry?
-local function status_first_header_entry(entries)
-  for _, entry in ipairs(entries) do
-    if entry.kind == "section" or entry.kind == "file" or entry.kind == "commit" or entry.kind == "commit_file" then return entry end
-  end
-  return nil
-end
-
 ---@param selected_entries DiffReviewStatusEntry[]
 ---@param action_entries DiffReviewStatusEntry[]
 ---@param target_section? DiffReviewStatusSectionName
 ---@param opts? { file_target?: "destination"|"next" }
 ---@return string?
 local function status_action_target_id(selected_entries, action_entries, target_section, opts)
-  opts = opts or {}
   if status_entries_are_headers(selected_entries) then
-    local selected_entry = status_first_header_entry(selected_entries)
-    if selected_entry then
-      if target_section then
-        if selected_entry.kind == "section" then
-          local source_section = selected_entry.section and selected_entry.section.name
-          local preferred_sections = nil
-          if target_section == "staged" and source_section == "unstaged" then
-            preferred_sections = { "untracked", "staged" }
-          elseif target_section == "staged" and source_section == "untracked" then
-            preferred_sections = { "unstaged", "staged" }
-          elseif source_section == "staged" and (target_section == "unstaged" or target_section == "untracked") then
-            preferred_sections = { "unstaged", "untracked" }
-          end
-
-          if preferred_sections and M._status and M._status.sections then
-            local projected_sections = status_apply_optimistic_move(vim.deepcopy(M._status.sections), action_entries, target_section)
-            local projected_section_map = status_section_map(projected_sections)
-            for _, preferred_section in ipairs(preferred_sections) do
-              local section = projected_section_map[preferred_section]
-              if section and #(section.files or {}) > 0 then return status_section_key(preferred_section) end
-            end
-          end
-
-          return status_section_key(target_section)
-        end
-        if selected_entry.kind == "file" and opts.file_target == "next" then
-          return status_next_action_target_id(action_entries) or selected_entry.id
-        end
-        if selected_entry.kind == "file" and selected_entry.file then
-          return status_file_key(target_section, selected_entry.file.filename)
-        end
-      end
-      return selected_entry.id
-    end
+    return nil
   end
   return status_hunk_action_target_id(action_entries) or (action_entries[1] and action_entries[1].id or nil)
 end
@@ -4490,7 +4599,7 @@ local function render_status_or_notify(buf, target_id, fallback_line, opts)
 end
 
 ---@param target_id? string
-local function status_render_current_model(target_id)
+status_render_current_model = function(target_id)
   local status = M._status
   if not (status and status.buf and vim.api.nvim_buf_is_valid(status.buf) and status.head_lines and status.sections) then
     return
@@ -4515,7 +4624,11 @@ end
 ---@param target_id? string
 local function refresh_status_after_action(buf, target_id)
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
-  render_status_or_notify(buf, target_id, vim.api.nvim_win_get_cursor(0)[1])
+  if target_id then
+    render_status_or_notify(buf, target_id, vim.api.nvim_win_get_cursor(0)[1])
+  else
+    render_status_or_notify(buf)
+  end
 end
 
 status_operations_pending = function()
@@ -5093,6 +5206,9 @@ local function status_toggle(entry)
     default = section_config and section_config.default_folded or false
   end
   local next_folded = not status_folded(entry.id, default)
+  if not next_folded then
+    status_prewarm_entry_syntax(entry)
+  end
   set_status_folded(entry.id, next_folded)
   if entry.kind == "commit" and not next_folded and entry.commit then
     status_load_commit_files(entry.commit)
@@ -5310,6 +5426,13 @@ local function setup_status_keymaps(buf)
   end)
 
   map("help", "n", status_show_help)
+
+  vim.api.nvim_create_autocmd("CursorMoved", {
+    buffer = buf,
+    callback = function()
+      status_prewarm_entry_syntax(status_entry_under_cursor())
+    end,
+  })
 end
 
 --- Open a standalone, Neogit-style DiffReview status buffer.

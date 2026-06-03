@@ -17,6 +17,7 @@
 ---@class DiffReviewAICommitState
 ---@field state "none"|"generating"|"ready"|"error"
 ---@field cwd? string
+---@field ref? string
 ---@field fingerprint? string
 ---@field message? string
 ---@field error? string
@@ -25,7 +26,9 @@
 ---@class DiffReviewAICommitModule
 ---@field _backend DiffReviewAICommitBackend?
 ---@field _state DiffReviewAICommitState?
+---@field _states table<string, DiffReviewAICommitState>?
 ---@field _request_id integer
+---@field _request_ids table<string, integer>?
 
 ---@type DiffReviewAICommitModule
 local M = {
@@ -87,7 +90,9 @@ end
 function M.reset_backend()
   M._backend = nil
   M._state = nil
+  M._states = nil
   M._request_id = 0
+  M._request_ids = nil
 end
 
 ---@param text string
@@ -347,27 +352,56 @@ local function notify_waiters(state)
 end
 
 ---@param cwd string
----@param opts? { force?: boolean }
+---@param ref string
+---@return string
+local function state_key(cwd, ref)
+  return cwd .. "\0" .. ref
+end
+
+---@param cwd string
+---@param ref string
+---@param state DiffReviewAICommitState
+local function set_state(cwd, ref, state)
+  M._states = M._states or {}
+  M._states[state_key(cwd, ref)] = state
+  if ref == "HEAD" then
+    M._state = state
+  end
+end
+
+---@param cwd string
+---@param ref string
+---@return DiffReviewAICommitState?
+local function get_state(cwd, ref)
+  local states = M._states or {}
+  return states[state_key(cwd, ref)]
+end
+
+---@param cwd string
+---@param opts? { force?: boolean, ref?: string, on_start?: fun(state: DiffReviewAICommitState) }
 ---@param cb? fun(state: DiffReviewAICommitState)
 function M.ensure(cwd, opts, cb)
   opts = opts or {}
+  local ref = opts.ref or "HEAD"
   if cwd == nil or cwd == "" then
-    local state = { state = "none", waiters = {} }
+    local state = { state = "none", ref = ref, waiters = {} }
     if cb then cb(state) end
     return
   end
 
-  changes_fingerprint_async(cwd, "HEAD", function(fingerprint)
+  changes_fingerprint_async(cwd, ref, function(fingerprint)
     if not fingerprint then
-      M._state = { state = "none", cwd = cwd, waiters = {} }
-      if cb then cb(M._state) end
+      local state = { state = "none", cwd = cwd, ref = ref, waiters = {} }
+      set_state(cwd, ref, state)
+      if cb then cb(state) end
       return
     end
 
-    local current = M._state
+    local current = get_state(cwd, ref)
     if not opts.force
       and current
       and current.cwd == cwd
+      and current.ref == ref
       and current.fingerprint == fingerprint
     then
       if current.state == "generating" and cb then
@@ -378,18 +412,35 @@ function M.ensure(cwd, opts, cb)
       return
     end
 
-    M._request_id = M._request_id + 1
-    local request_id = M._request_id
+    local reusable_head = ref ~= "HEAD" and not opts.force and get_state(cwd, "HEAD") or nil
+    if reusable_head
+      and reusable_head.cwd == cwd
+      and reusable_head.fingerprint == fingerprint
+    then
+      if reusable_head.state == "generating" and cb then
+        reusable_head.waiters[#reusable_head.waiters + 1] = cb
+      elseif cb then
+        cb(reusable_head)
+      end
+      return
+    end
+
+    M._request_ids = M._request_ids or {}
+    local key = state_key(cwd, ref)
+    M._request_ids[key] = (M._request_ids[key] or 0) + 1
+    local request_id = M._request_ids[key]
     local state = {
       state = "generating",
       cwd = cwd,
+      ref = ref,
       fingerprint = fingerprint,
       waiters = cb and { cb } or {},
     }
-    M._state = state
+    set_state(cwd, ref, state)
+    if opts.on_start then pcall(opts.on_start, state) end
 
-    build_commit_context_async(cwd, "HEAD", function(context)
-      if M._request_id ~= request_id or M._state ~= state then return end
+    build_commit_context_async(cwd, ref, function(context)
+      if not (M._request_ids and M._request_ids[key] == request_id and get_state(cwd, ref) == state) then return end
       if not context then
         state.state = "none"
         notify_waiters(state)
@@ -397,7 +448,7 @@ function M.ensure(cwd, opts, cb)
       end
 
       generate_async(context, function(result)
-        if M._request_id ~= request_id or M._state ~= state then return end
+        if not (M._request_ids and M._request_ids[key] == request_id and get_state(cwd, ref) == state) then return end
         if result.ok and result.message then
           state.state = "ready"
           state.message = result.message
@@ -412,13 +463,21 @@ function M.ensure(cwd, opts, cb)
 end
 
 ---@param cwd string
+---@param opts? { ref?: string, on_start?: fun(state: DiffReviewAICommitState) }
 ---@param cb fun(state: DiffReviewAICommitState)
-function M.wait_for_message(cwd, cb)
-  M.ensure(cwd, nil, cb)
+function M.wait_for_message(cwd, opts, cb)
+  if type(opts) == "function" then
+    cb = opts
+    opts = nil
+  end
+  M.ensure(cwd, opts, cb)
 end
 
+---@param cwd? string
+---@param ref? string
 ---@return DiffReviewAICommitState?
-function M.state()
+function M.state(cwd, ref)
+  if cwd and ref then return get_state(cwd, ref) end
   return M._state
 end
 
@@ -442,14 +501,23 @@ function M.populate_commit_buffer_when_ready(buf, cwd, notify)
   vim.b[buf].ai_commit_generated = true
   local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
   if lines[1] and lines[1] ~= "" then return end
-  local current = M.state()
-  if notify and current and current.cwd == cwd and current.state == "generating" then
+  local ref = "staged"
+  local current = M.state(cwd, ref)
+  local current_head = M.state(cwd, "HEAD")
+  local notified_generating = false
+  if notify and current and current.cwd == cwd and current.ref == ref and current.state == "generating" then
     notify("Waiting for generated commit message...", vim.log.levels.INFO)
-  elseif notify and not (current and current.cwd == cwd and current.state == "ready") then
+  elseif notify and current_head and current_head.cwd == cwd and current_head.state == "generating" then
+    notify("Waiting for generated commit message...", vim.log.levels.INFO)
+  elseif notify
+    and not (current and current.cwd == cwd and current.ref == ref and current.state == "ready")
+    and not (current_head and current_head.cwd == cwd and current_head.state == "ready")
+  then
+    notified_generating = true
     notify("Generating commit message...", vim.log.levels.INFO)
   end
 
-  local function apply_when_matching_staged(state)
+  local function apply_message(state)
     if not vim.api.nvim_buf_is_valid(buf) then return end
     if vim.b[buf].diff_review_ai_commit_populated then return end
     if state.state ~= "ready" or not state.message then
@@ -459,9 +527,19 @@ function M.populate_commit_buffer_when_ready(buf, cwd, notify)
       return
     end
 
-    changes_fingerprint_async(cwd, "staged", function(staged_fingerprint)
+    changes_fingerprint_async(cwd, ref, function(staged_fingerprint)
       if not vim.api.nvim_buf_is_valid(buf) then return end
-      if not staged_fingerprint or staged_fingerprint ~= state.fingerprint then return end
+      if not staged_fingerprint then return end
+      if staged_fingerprint ~= state.fingerprint then
+        M.ensure(cwd, {
+          ref = ref,
+          force = true,
+          on_start = function()
+            if notify then notify("Generating commit message...", vim.log.levels.INFO) end
+          end,
+        }, apply_message)
+        return
+      end
 
       local current_lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
       if current_lines[1] and current_lines[1] ~= "" then return end
@@ -479,9 +557,15 @@ function M.populate_commit_buffer_when_ready(buf, cwd, notify)
     end)
   end
 
-  M.wait_for_message(cwd, function(state)
-    apply_when_matching_staged(state)
-  end)
+  M.wait_for_message(cwd, {
+    ref = ref,
+    on_start = function()
+      if notify and not notified_generating then
+        notified_generating = true
+        notify("Generating commit message...", vim.log.levels.INFO)
+      end
+    end,
+  }, apply_message)
 end
 
 return M

@@ -4,6 +4,7 @@ local diff_review = require("diff_review")
 local gh = require("diff_review.gh")
 local root = "D:/mock/project"
 local original_compute_hunk_context_async = diff_review.compute_hunk_context_async
+local original_compute_diff_syntax_async = diff_review.compute_diff_syntax_async
 
 local function assert_true(condition, message)
   if not condition then error(message, 2) end
@@ -251,11 +252,16 @@ local function run()
   diff_review.set_git_backend(backend)
   gh.set_backend(gh_backend)
   local ts_requests = 0
+  local syntax_requests = 0
   diff_review.compute_hunk_context_async = function(_, _, cb)
     ts_requests = ts_requests + 1
     vim.defer_fn(function()
       cb("AsyncScope")
     end, 5)
+  end
+  diff_review.compute_diff_syntax_async = function(filename, lines_for_syntax, cb)
+    syntax_requests = syntax_requests + 1
+    original_compute_diff_syntax_async(filename, lines_for_syntax, cb)
   end
   diff_review.setup()
   diff_review.open()
@@ -276,6 +282,9 @@ local function run()
   assert_true(count_blank_lines_between(lines, "Unstaged changes", "Untracked files") == 1, "wrong heading spacing")
 
   local first_row, second_row = find_rows(lines, "a.txt +1 -1", "b.txt +1 -1")
+  vim.api.nvim_win_set_cursor(0, { first_row, 0 })
+  vim.cmd("doautocmd <nomodeline> CursorMoved")
+  wait_for(function() return syntax_requests > 0 end, "file row cursor movement did not prewarm diff syntax")
   trigger_normal_mapping("<Tab>", first_row)
   lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
   assert_true(contains_line(lines, "@@ +1 -1"), "missing fallback hunk header before async treesitter context")
@@ -319,6 +328,7 @@ local ok, err = xpcall(run, debug.traceback)
 diff_review.reset_git_backend()
 gh.reset_backend()
 diff_review.compute_hunk_context_async = original_compute_hunk_context_async
+diff_review.compute_diff_syntax_async = original_compute_diff_syntax_async
 if not ok then
   vim.api.nvim_err_writeln(err)
   vim.cmd("cquit")
