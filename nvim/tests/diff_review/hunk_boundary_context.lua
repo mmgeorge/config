@@ -214,6 +214,8 @@ local function run()
   end, "Tree-sitter context was not cached\n" .. buffer_dump(buf))
   wait_for(function() return buffer_contains(buf, "pub fn new(bridge: Bridge) -> Self {") end, "opening boundary did not render\n" .. buffer_dump(buf))
   local boundary_row = find_row(buf, "pub fn new(bridge: Bridge) -> Self {")
+  local first_header_row = find_row(buf, "@@ Engine.new +1 -1")
+  assert_true(boundary_row < first_header_row, "opening boundary should render before leading hunk header\n" .. buffer_dump(buf))
   local boundary_line = vim.api.nvim_buf_get_lines(buf, boundary_row - 1, boundary_row, false)[1]
   assert_true(boundary_line:find("^%s*10%s+10%s+pub fn new", 1) ~= nil, "boundary line did not use diff gutter: " .. boundary_line)
   assert_true(line_has_highlight(buf, boundary_row, "@keyword"), "boundary row did not get keyword syntax highlight: " .. line_highlights(buf, boundary_row))

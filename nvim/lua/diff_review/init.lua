@@ -1375,7 +1375,7 @@ end
 ---@param header_parts table[]
 ---@return table
 local function hunk_header_row(header_parts)
-  local row = {}
+  local row = { diff_review_hunk_header = true }
   for _, part in ipairs(header_parts) do
     row[#row + 1] = part
   end
@@ -1915,7 +1915,6 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
 
       local visible_hunk_lines = hunk_visible_source_lines(hunk.diff)
       local gutter = hunk.gutter
-      ret[#ret + 1] = hunk_header_row(header_parts)
       if opts.boundary_context and type(raw_context) == "table" then
         local node_start = raw_context.start_row + 1
         local start_text = raw_context.start_text or ""
@@ -1926,6 +1925,7 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
           end
         end
       end
+      ret[#ret + 1] = hunk_header_row(header_parts)
       for _, parsed_line in ipairs(hunk.lines) do
         ret[#ret + 1] = hunk_body_row(parsed_line, gutter, filename or block.file, syntax)
       end
@@ -3550,38 +3550,47 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk)
     local context_text = hunk_context_label(ts_context) or hunk.context_text or ""
     local context = context_text ~= "" and (context_text .. " ") or ""
     local header = ("%s@@ %s+%d -%d"):format(string.rep(" ", status_hunk_indent), context, hunk.added or 0, hunk.removed or 0)
-    status_add_line(header, entry, hunk_folded and "DiffReviewActiveHunkHeader" or "DiffReviewHunkHeader")
+    local visible_hunk_lines = nil
+    local node_start = nil
+    local node_end = nil
+    local start_text = nil
+    local end_text = nil
     if not hunk_folded and type(ts_context) == "table" then
-      local visible_hunk_lines = hunk_visible_source_lines(hunk.diff)
-      local node_start = ts_context.start_row + 1
-      local node_end = ts_context.end_row + 1
-      local start_text = ts_context.start_text or ""
-      local end_text = ts_context.end_text or ""
+      visible_hunk_lines = hunk_visible_source_lines(hunk.diff)
+      node_start = ts_context.start_row + 1
+      node_end = ts_context.end_row + 1
+      start_text = ts_context.start_text or ""
+      end_text = ts_context.end_text or ""
       if not suppress_start_boundary and not visible_hunk_lines[start_text] then
-        status_add_fancy_row(hunk_boundary_row(ts_context.start_text or "", ts_context.start_segments, node_start), nil, status_hunk_indent)
+        status_add_fancy_row(hunk_boundary_row(start_text, ts_context.start_segments, node_start), nil, status_hunk_indent)
         if node_start ~= node_end then
           status_add_fancy_row(hunk_boundary_ellipsis_row(start_text), nil, status_hunk_indent)
         end
       end
-      if not suppress_end_boundary and not visible_hunk_lines[end_text] then
-        if node_end ~= node_start then
-          status_add_fancy_row(hunk_boundary_ellipsis_row(end_text), nil, status_hunk_indent)
-        end
-        if node_end ~= node_start then
-          status_add_fancy_row(hunk_boundary_row(end_text, ts_context.end_segments, node_end), nil, status_hunk_indent)
-        end
+    end
+    status_add_line(header, entry, hunk_folded and "DiffReviewActiveHunkHeader" or "DiffReviewHunkHeader")
+    if visible_hunk_lines and node_start and node_end and end_text then
+      if not suppress_end_boundary and not visible_hunk_lines[end_text] and node_end ~= node_start then
+        status_add_fancy_row(hunk_boundary_ellipsis_row(end_text), nil, status_hunk_indent)
+        status_add_fancy_row(hunk_boundary_row(end_text, ts_context.end_segments, node_end), nil, status_hunk_indent)
       end
     end
     return
   end
 
   if hunk_folded then
-    status_add_fancy_row(rows[1], entry, status_hunk_indent)
+    local header_row = rows[1]
+    for _, row in ipairs(rows) do
+      if row.diff_review_hunk_header then
+        header_row = row
+        break
+      end
+    end
+    status_add_fancy_row(header_row, entry, status_hunk_indent)
     return
   end
 
-  status_add_fancy_row(rows[1], entry, status_hunk_indent)
-  for row_index = 2, #rows do
+  for row_index = 1, #rows do
     local row = rows[row_index]
     if row then status_add_fancy_row(row, row.diff_review_boundary and nil or entry, status_hunk_indent) end
   end
