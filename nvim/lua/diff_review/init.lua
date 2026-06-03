@@ -61,19 +61,33 @@
 ---@field status string
 ---@field git_status? string
 
+---@class DiffReviewStatusCommit
+---@field oid string
+---@field short_oid string
+---@field branch? string
+---@field subject string
+---@field upstream string
+---@field files? DiffReviewStatusFile[]
+---@field files_loaded? boolean
+---@field files_loading? boolean
+---@field files_error? string
+
 ---@class DiffReviewStatusSection
 ---@field name string
 ---@field title string
 ---@field default_folded boolean
 ---@field files DiffReviewStatusFile[]
 ---@field files_by_name table<string, DiffReviewStatusFile>
+---@field commits? DiffReviewStatusCommit[]
+---@field upstream? string
 
 ---@class DiffReviewStatusEntry
 ---@field id? string
----@field kind "section"|"file"|"hunk"|"pr"|"about"
+---@field kind "section"|"file"|"hunk"|"commit"|"commit_file"|"commit_hunk"|"pr"|"about"
 ---@field section? DiffReviewStatusSection
 ---@field file? DiffReviewStatusFile
 ---@field hunk? DiffReviewHunk
+---@field commit? DiffReviewStatusCommit
 ---@field diff_line? table
 ---@field pr? DiffReviewGhPR
 ---@field about? DiffReviewAICommitState
@@ -2956,6 +2970,28 @@ local function status_section_key(section_name)
   return "section:" .. section_name
 end
 
+---@param oid string
+---@return string
+local function status_commit_key(oid)
+  return "commit:" .. oid
+end
+
+---@param oid string
+---@param filename string
+---@return string
+local function status_commit_file_key(oid, filename)
+  return ("commit-file:%s:%s"):format(oid, filename)
+end
+
+---@param oid string
+---@param filename string
+---@param diff string?
+---@return string
+local function status_commit_hunk_key(oid, filename, diff)
+  local hash = diff and vim.fn.sha256(diff) or "file"
+  return ("commit-hunk:%s:%s:%s"):format(oid, filename, hash)
+end
+
 local function status_add_highlight(line, start_col, end_col, hl_group)
   M._status.highlights[#M._status.highlights + 1] = {
     line = line,
@@ -3202,6 +3238,113 @@ local function status_sections_from_items(collected_items)
   return ordered
 end
 
+---@param cwd string
+---@param commit DiffReviewStatusCommit
+---@param diff_text string
+---@return DiffReviewStatusFile[]
+local function status_commit_files_from_diff(cwd, commit, diff_text)
+  local files_by_name = {} ---@type table<string, DiffReviewStatusFile>
+  local files = {} ---@type DiffReviewStatusFile[]
+  local commit_section_name = status_commit_key(commit.oid)
+
+  for _, parsed_hunk in ipairs(parse_diff(diff_text or "", false)) do
+    local filename = cwd .. "/" .. parsed_hunk.file
+    local file = files_by_name[filename]
+    if not file then
+      file = {
+        filename = filename,
+        relpath = parsed_hunk.file,
+        section_name = commit_section_name,
+        added = 0,
+        removed = 0,
+        hunks = {},
+        untracked = false,
+        status = "modified",
+      }
+      files_by_name[filename] = file
+      files[#files + 1] = file
+    end
+
+    file.added = file.added + (parsed_hunk.added or 0)
+    file.removed = file.removed + (parsed_hunk.removed or 0)
+    file.hunks[#file.hunks + 1] = {
+      file = parsed_hunk.file,
+      filename = filename,
+      section_name = commit_section_name,
+      pos = parsed_hunk.pos,
+      diff = parsed_hunk.diff,
+      staged = false,
+      context_text = parsed_hunk.context or "",
+      added = parsed_hunk.added or 0,
+      removed = parsed_hunk.removed or 0,
+    }
+  end
+
+  table.sort(files, function(left_file, right_file)
+    return left_file.relpath < right_file.relpath
+  end)
+  for _, file in ipairs(files) do
+    table.sort(file.hunks, function(left_hunk, right_hunk)
+      return (left_hunk.pos or 0) < (right_hunk.pos or 0)
+    end)
+  end
+  return files
+end
+
+---@param cwd string
+---@param upstream string?
+---@param branch string?
+---@param cb fun(section?: DiffReviewStatusSection)
+local function status_unmerged_section_async(cwd, upstream, branch, cb)
+  if not upstream or upstream == "" then
+    cb(nil)
+    return
+  end
+
+  systemlist_async({
+    "git", "-C", cwd, "log", "--no-color", "--format=%H%x09%h%x09%s", upstream .. "..HEAD",
+  }, function(output, code)
+    if code ~= 0 then
+      cb(nil)
+      return
+    end
+
+    local commits = {} ---@type DiffReviewStatusCommit[]
+    for index, line in ipairs(output or {}) do
+      local oid, short_oid, subject = line:match("^([^\t]+)\t([^\t]+)\t(.*)$")
+      if oid and oid ~= "" then
+        local cache = M._status and M._status.commit_file_cache and M._status.commit_file_cache[oid] or nil
+        commits[#commits + 1] = {
+          oid = oid,
+          short_oid = short_oid or oid:sub(1, 7),
+          branch = index == 1 and branch or nil,
+          subject = subject or "",
+          upstream = upstream,
+          files = cache and cache.files or nil,
+          files_loaded = cache and cache.files_loaded or false,
+          files_loading = cache and cache.files_loading or false,
+          files_error = cache and cache.files_error or nil,
+        }
+      end
+    end
+
+    if #commits == 0 then
+      cb(nil)
+      return
+    end
+
+    cb({
+      name = "unmerged",
+      title = "Unmerged into " .. upstream,
+      default_folded = false,
+      files = {},
+      files_by_name = {},
+      commits = commits,
+      upstream = upstream,
+    })
+  end)
+end
+
 ---@return table<DiffReviewStatusSectionName, DiffReviewStatusSection>
 local function status_empty_section_map()
   local sections = {}
@@ -3286,6 +3429,9 @@ local function status_order_section_map(section_map)
     end
     status_reindex_section(section)
     if #section.files > 0 then ordered[#ordered + 1] = section end
+  end
+  if section_map.unmerged and #(section_map.unmerged.commits or {}) > 0 then
+    ordered[#ordered + 1] = section_map.unmerged
   end
   return ordered
 end
@@ -3423,15 +3569,25 @@ local function status_load_async(cwd, cb)
   local head_lines = nil
   local head_values = nil
   local sections = nil
+  local unmerged_section = nil
+  local unmerged_loaded = false
 
   local function maybe_done()
-    if not (head_lines and sections) then return end
-    cb({ head_lines = head_lines, head_values = head_values or {}, sections = sections })
+    if not (head_lines and sections and unmerged_loaded) then return end
+    local ordered_sections = {}
+    vim.list_extend(ordered_sections, sections)
+    if unmerged_section then ordered_sections[#ordered_sections + 1] = unmerged_section end
+    cb({ head_lines = head_lines, head_values = head_values or {}, sections = ordered_sections })
   end
 
   status_head_lines_async(cwd, function(lines, values)
     head_lines = lines
     head_values = values
+    status_unmerged_section_async(cwd, values.upstream, values.branch, function(section)
+      unmerged_section = section
+      unmerged_loaded = true
+      maybe_done()
+    end)
     maybe_done()
   end)
   collect_items_from_git(cwd, function(items)
@@ -3474,10 +3630,12 @@ local status_request_reconcile
 ---@param hunk DiffReviewHunk
 ---@param previous_hunk? DiffReviewHunk
 ---@param next_hunk? DiffReviewHunk
-local function status_render_hunk(file, hunk, previous_hunk, next_hunk)
-  local hunk_key = status_hunk_key(file.section_name, file.filename, hunk.diff)
+---@param entry_kind? "hunk"|"commit_hunk"
+---@param hunk_key_override? string
+local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_kind, hunk_key_override)
+  local hunk_key = hunk_key_override or status_hunk_key(file.section_name, file.filename, hunk.diff)
   local hunk_folded = status_folded(hunk_key, false)
-  local entry = { id = hunk_key, kind = "hunk", file = file, hunk = hunk }
+  local entry = { id = hunk_key, kind = entry_kind or "hunk", file = file, hunk = hunk }
   M._status.fancy_rows = M._status.fancy_rows or {}
   local rows_key
   local function rerender_with_context()
@@ -3597,12 +3755,16 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk)
 end
 
 ---@param file DiffReviewStatusFile
-local function status_render_file(file)
-  local file_key = status_file_key(file.section_name, file.filename)
+---@param entry_kind? "file"|"commit_file"
+---@param hunk_entry_kind? "hunk"|"commit_hunk"
+---@param file_key_override? string
+---@param hunk_key_builder? fun(hunk: DiffReviewHunk): string
+local function status_render_file(file, entry_kind, hunk_entry_kind, file_key_override, hunk_key_builder)
+  local file_key = file_key_override or status_file_key(file.section_name, file.filename)
   local file_folded = status_folded(file_key, true)
   local stats = file.untracked and "new" or ("+%d -%d"):format(file.added, file.removed)
   local line = ("%s%s %s"):format(string.rep(" ", status_file_indent), file.relpath, stats)
-  local entry = { id = file_key, kind = "file", file = file }
+  local entry = { id = file_key, kind = entry_kind or "file", file = file }
   local line_number = status_add_line(line, entry)
   local path_start = status_file_indent
   local stats_start = #line - #stats
@@ -3617,7 +3779,60 @@ local function status_render_file(file)
     return
   end
   for hunk_index, hunk in ipairs(hunks) do
-    status_render_hunk(file, hunk, hunks[hunk_index - 1], hunks[hunk_index + 1])
+    local hunk_key = hunk_key_builder and hunk_key_builder(hunk) or nil
+    status_render_hunk(file, hunk, hunks[hunk_index - 1], hunks[hunk_index + 1], hunk_entry_kind, hunk_key)
+  end
+end
+
+---@param commit DiffReviewStatusCommit
+local function status_render_commit(commit)
+  local commit_key = status_commit_key(commit.oid)
+  local commit_folded = status_folded(commit_key, true)
+  local line_parts = {
+    commit.short_oid,
+  }
+  if commit.branch and commit.branch ~= "" then
+    line_parts[#line_parts + 1] = commit.branch
+  end
+  line_parts[#line_parts + 1] = commit.subject
+  local line = table.concat(line_parts, " ")
+  local entry = { id = commit_key, kind = "commit", commit = commit }
+  local line_number = status_add_line(line, entry)
+  local col = 0
+  status_add_highlight(line_number, col, col + #commit.short_oid, "DiffReviewStatusObjectId")
+  col = col + #commit.short_oid + 1
+  if commit.branch and commit.branch ~= "" then
+    status_add_highlight(line_number, col, col + #commit.branch, "DiffReviewStatusBranch")
+  end
+
+  if commit_folded then return end
+  if commit.files_loading then
+    status_add_line("...loading...", entry, "DiffReviewStatusFetching")
+    return
+  end
+  if commit.files_error then
+    status_add_line(commit.files_error, entry, "ErrorMsg")
+    return
+  end
+  if not commit.files_loaded then
+    status_add_line("...loading...", entry, "DiffReviewStatusFetching")
+    return
+  end
+  if #(commit.files or {}) == 0 then
+    status_add_line("No textual diff", entry, "Comment")
+    return
+  end
+
+  for _, file in ipairs(commit.files or {}) do
+    status_render_file(
+      file,
+      "commit_file",
+      "commit_hunk",
+      status_commit_file_key(commit.oid, file.filename),
+      function(hunk)
+        return status_commit_hunk_key(commit.oid, file.filename, hunk.diff)
+      end
+    )
   end
 end
 
@@ -3625,13 +3840,85 @@ end
 local function status_render_section(section)
   local section_key = status_section_key(section.name)
   local section_folded = status_folded(section_key, section.default_folded)
-  local line = ("%s (%d)"):format(section.title, #section.files)
+  local section_count = section.commits and #section.commits or #section.files
+  local line = ("%s (%d)"):format(section.title, section_count)
   local entry = { id = section_key, kind = "section", section = section }
   status_add_line(line, entry, "DiffReviewStatusHeader")
   if section_folded then return end
+  if section.commits then
+    for _, commit in ipairs(section.commits) do
+      status_render_commit(commit)
+    end
+    return
+  end
   for _, file in ipairs(section.files) do
     status_render_file(file)
   end
+end
+
+---@param commit DiffReviewStatusCommit
+local function status_load_commit_files(commit)
+  local status = M._status
+  local cwd = status and status.cwd
+  local buf = status and status.buf
+  if not (cwd and buf and vim.api.nvim_buf_is_valid(buf)) then return end
+
+  status.commit_file_cache = status.commit_file_cache or {}
+  local cached = status.commit_file_cache[commit.oid]
+  if cached and (cached.files_loaded or cached.files_loading) then
+    commit.files = cached.files
+    commit.files_loaded = cached.files_loaded
+    commit.files_loading = cached.files_loading
+    commit.files_error = cached.files_error
+    return
+  end
+
+  local request_id = (status.commit_file_request_id or 0) + 1
+  status.commit_file_request_id = request_id
+  commit.files_loading = true
+  commit.files_error = nil
+  status.commit_file_cache[commit.oid] = {
+    files = nil,
+    files_loaded = false,
+    files_loading = true,
+    files_error = nil,
+  }
+
+  systemlist_async({
+    "git", "-C", cwd, "show", "--format=", "--no-color", "--no-ext-diff", commit.oid,
+  }, function(output, code)
+    local latest_status = M._status
+    if not (latest_status and latest_status.buf and vim.api.nvim_buf_is_valid(latest_status.buf)) then return end
+    if latest_status.cwd ~= cwd then return end
+
+    latest_status.commit_file_cache = latest_status.commit_file_cache or {}
+    local next_cache = {
+      files = nil,
+      files_loaded = true,
+      files_loading = false,
+      files_error = nil,
+    }
+    if code ~= 0 then
+      next_cache.files_loaded = false
+      next_cache.files_error = "Unable to load commit diff"
+    else
+      next_cache.files = status_commit_files_from_diff(cwd, commit, table.concat(output or {}, "\n"))
+    end
+    latest_status.commit_file_cache[commit.oid] = next_cache
+
+    for _, section in ipairs(latest_status.sections or {}) do
+      for _, current_commit in ipairs(section.commits or {}) do
+        if current_commit.oid == commit.oid then
+          current_commit.files = next_cache.files
+          current_commit.files_loaded = next_cache.files_loaded
+          current_commit.files_loading = false
+          current_commit.files_error = next_cache.files_error
+        end
+      end
+    end
+
+    M.render_status(latest_status.buf, nil, nil, { reuse_sections = true })
+  end)
 end
 
 ---@return DiffReviewStatusEntry?
@@ -3854,7 +4141,7 @@ end
 local function status_entries_are_headers(entries)
   if #entries == 0 then return false end
   for _, entry in ipairs(entries) do
-    if not (entry.kind == "section" or entry.kind == "file") then return false end
+    if not (entry.kind == "section" or entry.kind == "file" or entry.kind == "commit" or entry.kind == "commit_file") then return false end
   end
   return true
 end
@@ -3863,7 +4150,7 @@ end
 ---@return DiffReviewStatusEntry?
 local function status_first_header_entry(entries)
   for _, entry in ipairs(entries) do
-    if entry.kind == "section" or entry.kind == "file" then return entry end
+    if entry.kind == "section" or entry.kind == "file" or entry.kind == "commit" or entry.kind == "commit_file" then return entry end
   end
   return nil
 end
@@ -3917,7 +4204,13 @@ end
 ---@param target_id? string
 ---@return boolean
 local function status_target_is_header(target_id)
-  return type(target_id) == "string" and (target_id:find("^section:") ~= nil or target_id:find("^file:") ~= nil)
+  return type(target_id) == "string"
+    and (
+      target_id:find("^section:") ~= nil
+      or target_id:find("^file:") ~= nil
+      or target_id:find("^commit:") ~= nil
+      or target_id:find("^commit%-file:") ~= nil
+    )
 end
 
 ---@param fallback_line integer
@@ -3931,10 +4224,20 @@ local function status_nearest_header_line(fallback_line)
   for offset = 0, max_offset do
     local previous_line = line - offset
     local previous_entry = status.entries[previous_line]
-    if previous_entry and (previous_entry.kind == "section" or previous_entry.kind == "file") then return previous_line end
+    if previous_entry and (
+      previous_entry.kind == "section"
+      or previous_entry.kind == "file"
+      or previous_entry.kind == "commit"
+      or previous_entry.kind == "commit_file"
+    ) then return previous_line end
     local next_line = line + offset
     local next_entry = status.entries[next_line]
-    if offset > 0 and next_entry and (next_entry.kind == "section" or next_entry.kind == "file") then return next_line end
+    if offset > 0 and next_entry and (
+      next_entry.kind == "section"
+      or next_entry.kind == "file"
+      or next_entry.kind == "commit"
+      or next_entry.kind == "commit_file"
+    ) then return next_line end
   end
   return nil
 end
@@ -4783,11 +5086,17 @@ local function status_toggle(entry)
   local default = false
   if entry.kind == "file" then
     default = true
+  elseif entry.kind == "commit" or entry.kind == "commit_file" then
+    default = true
   elseif entry.kind == "section" then
     local section_config = status_section_by_name[entry.section.name]
     default = section_config and section_config.default_folded or false
   end
-  set_status_folded(entry.id, not status_folded(entry.id, default))
+  local next_folded = not status_folded(entry.id, default)
+  set_status_folded(entry.id, next_folded)
+  if entry.kind == "commit" and not next_folded and entry.commit then
+    status_load_commit_files(entry.commit)
+  end
   render_status_or_notify(M._status.buf, entry.id, vim.api.nvim_win_get_cursor(0)[1], { reuse_sections = true })
 end
 

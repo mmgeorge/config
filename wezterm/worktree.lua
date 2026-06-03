@@ -1153,7 +1153,7 @@ local function remote_ref_parts(ref)
 end
 
 local function refresh_remotes(window, repo)
-  local stdout, stderr = git_output(repo.main_path, { 'fetch', '--all', '--prune' })
+  local stdout, stderr = git_output(repo.main_path, { 'fetch', '--all' })
   if not stdout then
     notify(window, 'Could not refresh remotes for ' .. repo.name .. ': ' .. stderr)
     return false
