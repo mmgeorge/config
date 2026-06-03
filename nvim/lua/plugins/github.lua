@@ -8,6 +8,43 @@ return {
       end, {
         desc = "Open a draft GitHub PR for the current branch",
       })
+
+      vim.api.nvim_create_user_command("GithubIssuse", function()
+        require("github.pickers").issues()
+      end, {
+        desc = "Search GitHub issues involving me",
+      })
+
+      vim.api.nvim_create_user_command("GithubIssue", function()
+        require("github.pickers").issues()
+      end, {
+        desc = "Search GitHub issues involving me",
+      })
+
+      vim.api.nvim_create_user_command("GithubIssueOpen", function(opts)
+        require("github.issue_view").open_command(opts.args)
+      end, {
+        nargs = "+",
+        desc = "Open a GitHub issue buffer",
+      })
+
+      vim.api.nvim_create_user_command("GithubPR", function()
+        require("github.pickers").prs()
+      end, {
+        desc = "Search my open GitHub PRs",
+      })
+
+      vim.api.nvim_create_user_command("GithubReview", function()
+        require("github.pickers").reviews()
+      end, {
+        desc = "Search GitHub PR review requests",
+      })
+
+      vim.api.nvim_create_user_command("GithubNotifications", function()
+        require("github.notifications").open()
+      end, {
+        desc = "Open GitHub notifications",
+      })
     end,
     opts = {
       -- or "fzf-lua" or "snacks" or "default"
