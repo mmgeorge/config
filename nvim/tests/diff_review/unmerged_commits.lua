@@ -43,6 +43,14 @@ local function buffer_contains(buf, needle)
   return false
 end
 
+local function buffer_contains_after(buf, needle, start_row)
+  local lines = status_lines(buf)
+  for index = start_row + 1, #lines do
+    if lines[index]:find(needle, 1, true) then return true end
+  end
+  return false
+end
+
 local function find_row(buf, needle)
   for index, line in ipairs(status_lines(buf)) do
     if line:find(needle, 1, true) then return index end
@@ -164,6 +172,15 @@ function backend.systemlist(command)
       "c8f1018123456789\tc8f1018\tfeat: preserve cursor position during visual staging",
     }, 0
   end
+  if key == "git\t-C\t" .. root .. "\tlog\t--no-color\t--format=%H%x09%h%x09%s\t-30\torigin/master" then
+    local lines = {}
+    for index = 1, 31 do
+      local oid = ("%040d"):format(index)
+      local short_oid = ("recent%02d"):format(index)
+      lines[#lines + 1] = ("%s\t%s\tdocs: recent commit %02d"):format(oid, short_oid, index)
+    end
+    return lines, 0
+  end
   if key == "git\t-C\t" .. root .. "\tshow\t--format=\t--no-color\t--no-ext-diff\t45806b8123456789" then
     return output_lines(commit_diff), 0
   end
@@ -204,6 +221,10 @@ local function run()
 
   wait_for(function() return buffer_contains(buf, "Unmerged into origin/master (4)") end, "unmerged section did not render")
   assert_true(find_row(buf, "Unmerged into origin/master (4)") > find_row(buf, "Staged changes"), "unmerged section should render after local change sections")
+  wait_for(function() return buffer_contains(buf, "Recent Commits (30)") end, "recent commits section did not render")
+  assert_true(find_row(buf, "Recent Commits (30)") > find_row(buf, "Unmerged into origin/master (4)"), "recent commits should render below unmerged commits")
+  assert_true(saw_call_containing("\tlog\t--no-color\t--format=%H%x09%h%x09%s\t-30\torigin/master"), "recent commits did not use a 30-commit upstream git log")
+  assert_true(not buffer_contains(buf, "recent01 master docs: recent commit 01"), "recent commits should start folded")
   assert_true(buffer_contains(buf, "45806b8 master feat: add or mapping and guard ai generation"), "first unmerged commit did not include branch")
   assert_true(buffer_contains(buf, "748971a feat: add debug notifications and AI commit flag"), "second unmerged commit missing")
   assert_true(not buffer_contains(buf, "foo/bar.js +1 -1"), "commit files loaded before commit was expanded")
@@ -229,6 +250,25 @@ local function run()
     local row = find_row(buf, "pub fn from_commit")
     return line_has_highlight_prefix(buf, row, "@keyword")
   end, "commit-only Rust hunk body row did not get Tree-sitter keyword highlight: " .. line_highlights(buf, find_row(buf, "pub fn from_commit")))
+
+  local show_calls_before_recent = count_calls_containing("\tshow\t--format=\t--no-color\t--no-ext-diff")
+  trigger_normal_mapping("<Tab>", find_row(buf, "Recent Commits (30)"))
+  wait_for(function() return buffer_contains(buf, "recent01 master docs: recent commit 01") end, "recent commits did not unfold")
+  assert_true(buffer_contains(buf, "recent30 docs: recent commit 30"), "recent commits did not include the 30th commit")
+  assert_true(not buffer_contains(buf, "recent31 docs: recent commit 31"), "recent commits rendered more than 30 commits")
+  assert_true(
+    find_row_after(buf, "recent01 master docs: recent commit 01", find_row(buf, "Recent Commits (30)"))
+      > find_row(buf, "Recent Commits (30)"),
+    "recent commits did not render under the recent section"
+  )
+  assert_true(
+    not buffer_contains_after(buf, "45806b8 master feat: add or mapping and guard ai generation", find_row(buf, "Recent Commits (30)")),
+    "recent commits included an unmerged commit"
+  )
+  assert_true(
+    count_calls_containing("\tshow\t--format=\t--no-color\t--no-ext-diff") == show_calls_before_recent,
+    "expanding recent commits section loaded commit diffs eagerly"
+  )
 end
 
 local ok, err = xpcall(run, debug.traceback)

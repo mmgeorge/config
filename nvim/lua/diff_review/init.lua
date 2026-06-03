@@ -66,7 +66,7 @@
 ---@field short_oid string
 ---@field branch? string
 ---@field subject string
----@field upstream string
+---@field upstream? string
 ---@field files? DiffReviewStatusFile[]
 ---@field files_loaded? boolean
 ---@field files_loading? boolean
@@ -101,7 +101,7 @@
 ---@field segments table[]
 ---@field entry? DiffReviewStatusEntry
 
----@alias DiffReviewStatusSectionName "unstaged"|"staged"|"untracked"
+---@alias DiffReviewStatusSectionName "unstaged"|"staged"|"untracked"|"unmerged"|"recent"
 
 ---@class DiffReviewTreeSitterContextPending
 ---@field pending true
@@ -3454,6 +3454,76 @@ local function status_commit_files_from_diff(cwd, commit, diff_text)
   return files
 end
 
+---@class DiffReviewCommitLogSectionSpec
+---@field name DiffReviewStatusSectionName
+---@field title string
+---@field args string[]
+---@field branch? string
+---@field upstream? string
+---@field default_folded boolean
+---@field limit? integer
+
+---@param spec DiffReviewCommitLogSectionSpec
+---@param output string[]
+---@return DiffReviewStatusCommit[]
+local function status_commits_from_log_output(spec, output)
+  local commits = {} ---@type DiffReviewStatusCommit[]
+  for index, line in ipairs(output or {}) do
+    if spec.limit and index > spec.limit then break end
+    local oid, short_oid, subject = line:match("^([^\t]+)\t([^\t]+)\t(.*)$")
+    if oid and oid ~= "" then
+      local cache = M._status and M._status.commit_file_cache and M._status.commit_file_cache[oid] or nil
+      commits[#commits + 1] = {
+        oid = oid,
+        short_oid = short_oid or oid:sub(1, 7),
+        branch = index == 1 and spec.branch or nil,
+        subject = subject or "",
+        upstream = spec.upstream,
+        files = cache and cache.files or nil,
+        files_loaded = cache and cache.files_loaded or false,
+        files_loading = cache and cache.files_loading or false,
+        files_error = cache and cache.files_error or nil,
+      }
+    end
+  end
+  return commits
+end
+
+---@param cwd string
+---@param spec DiffReviewCommitLogSectionSpec
+---@param cb fun(section?: DiffReviewStatusSection)
+local function status_commit_log_section_async(cwd, spec, cb)
+  if #spec.args == 0 then
+    cb(nil)
+    return
+  end
+
+  local command = { "git", "-C", cwd, "log", "--no-color", "--format=%H%x09%h%x09%s" }
+  vim.list_extend(command, spec.args)
+  systemlist_async(command, function(output, code)
+    if code ~= 0 then
+      cb(nil)
+      return
+    end
+
+    local commits = status_commits_from_log_output(spec, output or {})
+    if #commits == 0 then
+      cb(nil)
+      return
+    end
+
+    cb({
+      name = spec.name,
+      title = spec.title,
+      default_folded = spec.default_folded,
+      files = {},
+      files_by_name = {},
+      commits = commits,
+      upstream = spec.upstream,
+    })
+  end)
+end
+
 ---@param cwd string
 ---@param upstream string?
 ---@param branch string?
@@ -3463,49 +3533,33 @@ local function status_unmerged_section_async(cwd, upstream, branch, cb)
     cb(nil)
     return
   end
+  status_commit_log_section_async(cwd, {
+    name = "unmerged",
+    title = "Unmerged into " .. upstream,
+    args = { upstream .. "..HEAD" },
+    branch = branch,
+    upstream = upstream,
+    default_folded = false,
+  }, cb)
+end
 
-  systemlist_async({
-    "git", "-C", cwd, "log", "--no-color", "--format=%H%x09%h%x09%s", upstream .. "..HEAD",
-  }, function(output, code)
-    if code ~= 0 then
-      cb(nil)
-      return
-    end
-
-    local commits = {} ---@type DiffReviewStatusCommit[]
-    for index, line in ipairs(output or {}) do
-      local oid, short_oid, subject = line:match("^([^\t]+)\t([^\t]+)\t(.*)$")
-      if oid and oid ~= "" then
-        local cache = M._status and M._status.commit_file_cache and M._status.commit_file_cache[oid] or nil
-        commits[#commits + 1] = {
-          oid = oid,
-          short_oid = short_oid or oid:sub(1, 7),
-          branch = index == 1 and branch or nil,
-          subject = subject or "",
-          upstream = upstream,
-          files = cache and cache.files or nil,
-          files_loaded = cache and cache.files_loaded or false,
-          files_loading = cache and cache.files_loading or false,
-          files_error = cache and cache.files_error or nil,
-        }
-      end
-    end
-
-    if #commits == 0 then
-      cb(nil)
-      return
-    end
-
-    cb({
-      name = "unmerged",
-      title = "Unmerged into " .. upstream,
-      default_folded = false,
-      files = {},
-      files_by_name = {},
-      commits = commits,
-      upstream = upstream,
-    })
-  end)
+---@param cwd string
+---@param upstream string?
+---@param branch string?
+---@param cb fun(section?: DiffReviewStatusSection)
+local function status_recent_commits_section_async(cwd, upstream, branch, cb)
+  local args = { "-30" }
+  if upstream and upstream ~= "" then
+    args[#args + 1] = upstream
+  end
+  status_commit_log_section_async(cwd, {
+    name = "recent",
+    title = "Recent Commits",
+    args = args,
+    branch = branch,
+    default_folded = true,
+    limit = 30,
+  }, cb)
 end
 
 ---@return table<DiffReviewStatusSectionName, DiffReviewStatusSection>
@@ -3595,6 +3649,9 @@ local function status_order_section_map(section_map)
   end
   if section_map.unmerged and #(section_map.unmerged.commits or {}) > 0 then
     ordered[#ordered + 1] = section_map.unmerged
+  end
+  if section_map.recent and #(section_map.recent.commits or {}) > 0 then
+    ordered[#ordered + 1] = section_map.recent
   end
   return ordered
 end
@@ -3734,12 +3791,15 @@ local function status_load_async(cwd, cb)
   local sections = nil
   local unmerged_section = nil
   local unmerged_loaded = false
+  local recent_commits_section = nil
+  local recent_commits_loaded = false
 
   local function maybe_done()
-    if not (head_lines and sections and unmerged_loaded) then return end
+    if not (head_lines and sections and unmerged_loaded and recent_commits_loaded) then return end
     local ordered_sections = {}
     vim.list_extend(ordered_sections, sections)
     if unmerged_section then ordered_sections[#ordered_sections + 1] = unmerged_section end
+    if recent_commits_section then ordered_sections[#ordered_sections + 1] = recent_commits_section end
     cb({ head_lines = head_lines, head_values = head_values or {}, sections = ordered_sections })
   end
 
@@ -3749,6 +3809,11 @@ local function status_load_async(cwd, cb)
     status_unmerged_section_async(cwd, values.upstream, values.branch, function(section)
       unmerged_section = section
       unmerged_loaded = true
+      maybe_done()
+    end)
+    status_recent_commits_section_async(cwd, values.upstream, values.branch, function(section)
+      recent_commits_section = section
+      recent_commits_loaded = true
       maybe_done()
     end)
     maybe_done()
@@ -5203,7 +5268,7 @@ local function status_toggle(entry)
     default = true
   elseif entry.kind == "section" then
     local section_config = status_section_by_name[entry.section.name]
-    default = section_config and section_config.default_folded or false
+    default = section_config and section_config.default_folded or entry.section.default_folded
   end
   local next_folded = not status_folded(entry.id, default)
   if not next_folded then
