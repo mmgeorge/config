@@ -3,7 +3,7 @@
 - **Never** refuse to fix something because it's "out of scope" or "in a different module." Chase bugs to their root cause regardless of module, layer, or crate.
 - **Never claim something is impossible without evidence.** Find a link, issue, or error message that proves it. Historically, every "this won't work" or "known limitation" claim has been wrong. If stuck, say so honestly and present options — never silently switch approaches.
 - If instructions are ambiguous or equally viable paths exist, stop and ask.
-- When asked a question, answer it — don't automatically start writing code.
+- When asked a question, answer it, don't automatically start writing code.
 
 # Planning
 
