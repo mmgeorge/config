@@ -1,0 +1,14 @@
+2026-06-03T03:27:45.841Z [INFO] Starting Copilot CLI: 0.0.384
+Commit: 0b21260
+2026-06-03T03:27:45.841Z [INFO] Node.js version: v24.11.1
+2026-06-03T03:27:46.078Z [INFO] Login status unknown
+2026-06-03T03:27:46.089Z [INFO] Remote session access enabled
+2026-06-03T03:27:46.096Z [INFO] Logged in as user: mmgeorge
+2026-06-03T03:27:46.333Z [ERROR] Starting remote MCP client for github-mcp-server with url: https://api.individual.githubcopilot.com/mcp/readonly
+2026-06-03T03:27:46.333Z [ERROR] Creating MCP client for github-mcp-server...
+2026-06-03T03:27:46.335Z [ERROR] Connecting MCP client for github-mcp-server...
+2026-06-03T03:27:47.124Z [ERROR] MCP client for github-mcp-server connected, took 789ms
+2026-06-03T03:27:47.124Z [ERROR] Started MCP client for remote server github-mcp-server
+2026-06-03T03:27:47.125Z [ERROR] GitHub MCP server configured after authentication
+2026-06-03T03:27:47.139Z [INFO] Using default model: claude-haiku-4.5
+2026-06-03T03:27:47.150Z [INFO] Using default model: claude-haiku-4.5

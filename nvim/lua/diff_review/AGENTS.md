@@ -108,6 +108,14 @@ from status, PRView, keymaps, renderers, or tests. The wrapper owns nonblocking
 so they never depend on a real `gh` installation, auth state, network, or
 repository remote.
 
+## Status Keymaps
+
+Status-buffer mappings must be defined from `config.defaults.keymaps.status` and
+the central status command spec in `init.lua`. Do not hardcode key text in the
+hint row, the `?` help popup, or tests. User config can override or disable a
+mapping, and the actual keymaps plus displayed help must stay in sync from that
+single source.
+
 For status actions, do not replace an already-rendered status buffer with a
 generic loading line. Apply an optimistic in-memory section update immediately,
 enqueue the Git operation, and reconcile from Git after the operation queue is

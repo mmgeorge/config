@@ -1,6 +1,26 @@
 ---@class DiffReviewConfig
 ---@field status_buffer_name string
 ---@field pr_buffer_name string
+---@field keymaps DiffReviewKeymapConfig
+
+---@alias DiffReviewKeymap string|string[]|false
+
+---@class DiffReviewStatusKeymapConfig
+---@field close DiffReviewKeymap
+---@field refresh DiffReviewKeymap
+---@field toggle DiffReviewKeymap
+---@field stage DiffReviewKeymap
+---@field unstage DiffReviewKeymap
+---@field discard DiffReviewKeymap
+---@field open DiffReviewKeymap
+---@field commit DiffReviewKeymap
+---@field push DiffReviewKeymap
+---@field pull DiffReviewKeymap
+---@field pr DiffReviewKeymap
+---@field help DiffReviewKeymap
+
+---@class DiffReviewKeymapConfig
+---@field status DiffReviewStatusKeymapConfig
 
 ---@class DiffReviewConfigModule
 ---@field defaults DiffReviewConfig
@@ -14,6 +34,22 @@ local M = {}
 M.defaults = {
   status_buffer_name = "DiffReviewStatus",
   pr_buffer_name = "DiffReviewPR",
+  keymaps = {
+    status = {
+      close = "q",
+      refresh = "r",
+      toggle = "<Tab>",
+      stage = "S",
+      unstage = "U",
+      discard = "j",
+      open = "<CR>",
+      commit = "oc",
+      push = "opP",
+      pull = "opp",
+      pr = "ogp",
+      help = "?",
+    },
+  },
 }
 
 ---@type DiffReviewConfig

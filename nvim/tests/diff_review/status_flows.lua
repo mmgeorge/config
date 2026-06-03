@@ -352,6 +352,29 @@ local function trigger_visual_mapping(key, first_row, second_row)
   mapping.callback()
 end
 
+local function mode_is_visual(mode)
+  return mode == "v" or mode == "V" or mode:byte() == 22
+end
+
+local function assert_visual_callback_exits_mode(key, first_row, second_row)
+  local original_get_mode = vim.api.nvim_get_mode
+  local original_feedkeys = vim.api.nvim_feedkeys
+  local exit_count = 0
+  vim.api.nvim_get_mode = function()
+    return { mode = "V", blocking = false }
+  end
+  vim.api.nvim_feedkeys = function()
+    exit_count = exit_count + 1
+  end
+  local ok, err = pcall(function()
+    trigger_visual_mapping(key, first_row, second_row)
+  end)
+  vim.api.nvim_get_mode = original_get_mode
+  vim.api.nvim_feedkeys = original_feedkeys
+  assert_true(ok, tostring(err))
+  assert_true(exit_count == 1, ("visual %s did not request visual-mode exit"):format(key))
+end
+
 local function confirm_yes()
   local mapping = vim.fn.maparg("y", "n", false, true)
   assert_true(type(mapping.callback) == "function", "missing confirm yes mapping")
@@ -484,7 +507,8 @@ local function run()
   end, "single file stage did not establish a next-file target")
   local visual_first_row = find_row(buf, "visual-stage-a.txt")
   local visual_second_row = find_row(buf, "visual-stage-b.txt")
-  trigger_visual_mapping("S", visual_first_row, visual_second_row)
+  assert_visual_callback_exits_mode("S", visual_first_row, visual_second_row)
+  assert_true(not mode_is_visual(vim.api.nvim_get_mode().mode), "visual stage left test in visual mode")
   assert_true(
     vim.api.nvim_win_get_cursor(0)[1] == visual_second_row,
     "visual stage moved cursor row during optimistic render\n" .. table.concat(status_lines(buf), "\n")
@@ -654,6 +678,42 @@ local function run()
     "stage-all from section header jumped to a hunk after reconcile\n" .. table.concat(status_lines(buf), "\n")
   )
 
+  reset_state({
+    modified = { ["header-stage-with-untracked-a.txt"] = true, ["header-stage-with-untracked-b.txt"] = true },
+    untracked = { ["header-stage-untracked-next.txt"] = true },
+  })
+  render_and_wait(buf, "header-stage-with-untracked-a.txt +1 -1")
+  reset_calls()
+  trigger_normal_mapping("S", find_row(buf, "Unstaged changes (2)"))
+  assert_true(
+    cursor_line_text(buf):find("Untracked files (1)", 1, true) ~= nil,
+    "stage-all from unstaged section did not move cursor to remaining untracked header\n"
+      .. table.concat(status_lines(buf), "\n")
+  )
+
+  reset_state({
+    modified = { ["header-untracked-stage-remaining.txt"] = true },
+    untracked = { ["header-untracked-stage-a.txt"] = true, ["header-untracked-stage-b.txt"] = true },
+  })
+  render_and_wait(buf, "header-untracked-stage-a.txt new")
+  reset_calls()
+  trigger_normal_mapping("S", find_row(buf, "Untracked files (2)"))
+  assert_true(
+    cursor_line_text(buf):find("Unstaged changes (1)", 1, true) ~= nil,
+    "stage-all from untracked section did not move cursor to remaining unstaged header\n"
+      .. table.concat(status_lines(buf), "\n")
+  )
+
+  reset_state({ untracked = { ["header-untracked-stage-only.txt"] = true } })
+  render_and_wait(buf, "header-untracked-stage-only.txt new")
+  reset_calls()
+  trigger_normal_mapping("S", find_row(buf, "Untracked files (1)"))
+  assert_true(
+    cursor_line_text(buf):find("Staged changes (1)", 1, true) ~= nil,
+    "stage-all from untracked section without unstaged changes did not move cursor to staged header\n"
+      .. table.concat(status_lines(buf), "\n")
+  )
+
   reset_state({ modified = { ["codex/config.toml"] = true }, ignored = { ["codex/config.toml"] = true } })
   render_and_wait(buf, "codex")
   reset_calls()
@@ -709,6 +769,16 @@ local function run()
   assert_true(
     cursor_line_text(buf):find("@@", 1, true) == nil,
     "unstage-all from section header with existing destination jumped to a hunk after reconcile\n"
+      .. table.concat(status_lines(buf), "\n")
+  )
+
+  reset_state({ staged_added = { ["header-staged-added.txt"] = true } })
+  render_and_wait(buf, "header-staged-added.txt +1 -0")
+  reset_calls()
+  trigger_normal_mapping("U", find_row(buf, "Staged changes (1)"))
+  assert_true(
+    cursor_line_text(buf):find("Untracked files (1)", 1, true) ~= nil,
+    "unstage-all from staged added section did not move cursor to untracked header\n"
       .. table.concat(status_lines(buf), "\n")
   )
 

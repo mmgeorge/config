@@ -1,6 +1,6 @@
 --- Commit flow for DiffReview, modelled on Neogit.
 ---
---- `cc` runs `git commit` as a job with a headless "fake editor" wired to
+--- DiffReview's commit action runs `git commit` as a job with a headless "fake editor" wired to
 --- GIT_EDITOR, and reuses the diff-preview window above the Trouble pane:
 ---   1. Git runs the pre-commit hook first; its output streams into that window
 ---      (a console buffer).
@@ -165,6 +165,9 @@ function M.editor(target, client_addr)
   vim.api.nvim_set_current_win(st.win)
   -- Enter in normal mode (no startinsert): keeps <C-q>/<C-c><C-c> reliable.
   pcall(vim.api.nvim_win_set_cursor, st.win, { 1, 0 })
+  require("diff_review.ai_commit").populate_commit_buffer_when_ready(buf, st.root or vim.fn.getcwd(), function(message, level)
+    vim.notify(message, level, { title = "DiffReview commit" })
+  end)
 end
 
 -- ─── running git commit + result ────────────────────────────────────────────
@@ -256,6 +259,7 @@ function M.commit(opts)
         console = console,
         on_done = opts.on_done,
         aborted = false,
+        root = root,
       }
 
       require("diff_review").suspend_preview = true

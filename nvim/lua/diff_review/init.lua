@@ -70,12 +70,13 @@
 
 ---@class DiffReviewStatusEntry
 ---@field id? string
----@field kind "section"|"file"|"hunk"|"pr"
+---@field kind "section"|"file"|"hunk"|"pr"|"about"
 ---@field section? DiffReviewStatusSection
 ---@field file? DiffReviewStatusFile
 ---@field hunk? DiffReviewHunk
 ---@field diff_line? table
 ---@field pr? DiffReviewGhPR
+---@field about? DiffReviewAICommitState
 
 ---@class DiffReviewStatusPRState
 ---@field state "fetching"|"ready"|"none"|"error"
@@ -143,6 +144,7 @@ M._hunk_header_priority = 20
 M._active_hunk_header_priority = 200
 
 local config = require("diff_review.config")
+local ai_commit = require("diff_review.ai_commit")
 local gh = require("diff_review.gh")
 local highlights = require("diff_review.highlights")
 local notifications = require("diff_review.notifications")
@@ -2734,6 +2736,36 @@ local status_file_indent = 0
 local status_hunk_indent = 0
 local status_reconcile_delay_ms = 120
 
+---@class DiffReviewStatusCommandSpec
+---@field id string
+---@field label string
+---@field desc string
+---@field modes string|string[]
+---@field visual? boolean
+---@field hint boolean
+
+---@type DiffReviewStatusCommandSpec[]
+local status_command_specs = {
+  { id = "toggle", label = "toggle", desc = "Toggle fold", modes = "n", hint = true },
+  { id = "stage", label = "stage", desc = "Stage hunk/file/selection", modes = { "n", "x" }, visual = true, hint = true },
+  { id = "unstage", label = "unstage", desc = "Unstage hunk/file/selection", modes = { "n", "x" }, visual = true, hint = true },
+  { id = "discard", label = "discard", desc = "Discard hunk/file/selection", modes = { "n", "x" }, visual = true, hint = true },
+  { id = "commit", label = "commit", desc = "Commit", modes = "n", hint = true },
+  { id = "push", label = "push", desc = "Push", modes = "n", hint = true },
+  { id = "pull", label = "pull", desc = "Pull", modes = "n", hint = true },
+  { id = "pr", label = "pr", desc = "Open pull request", modes = "n", hint = true },
+  { id = "open", label = "open", desc = "Open PR/about or jump to file", modes = "n", hint = true },
+  { id = "refresh", label = "refresh", desc = "Refresh DiffReview", modes = "n", hint = true },
+  { id = "close", label = "close", desc = "Close DiffReview", modes = "n", hint = true },
+  { id = "help", label = "help", desc = "Show help", modes = "n", hint = true },
+}
+
+---@type table<string, DiffReviewStatusCommandSpec>
+local status_command_specs_by_id = {}
+for _, spec in ipairs(status_command_specs) do
+  status_command_specs_by_id[spec.id] = spec
+end
+
 ---@type table<string, DiffReviewSectionConfig>
 local status_section_by_name = {}
 for _, section in ipairs(status_section_order) do
@@ -2801,10 +2833,35 @@ local function status_pr_head_line(pr_state)
   return { segments = segments, entry = entry }
 end
 
+---@param about_state DiffReviewAICommitState?
+---@return DiffReviewStatusHeadLine
+local function status_about_head_line(about_state)
+  local segments = {
+    { ("%-8s"):format("About:"), "DiffReviewStatusLabel" },
+  }
+  local entry = { id = "about", kind = "about", about = about_state }
+
+  if not about_state or about_state.state == "none" then
+    segments[#segments + 1] = { "none", "Comment" }
+  elseif about_state.state == "generating" then
+    segments[#segments + 1] = { "...generating...", "DiffReviewStatusFetching" }
+  elseif about_state.state == "ready" and about_state.message then
+    entry.about = about_state
+    segments[#segments + 1] = { ai_commit.subject(about_state.message), "DiffReviewStatusPath" }
+  elseif about_state.state == "error" then
+    segments[#segments + 1] = { "error", "ErrorMsg" }
+  else
+    segments[#segments + 1] = { "none", "Comment" }
+  end
+
+  return { segments = segments, entry = entry }
+end
+
 ---@param values table
 ---@param pr_state DiffReviewStatusPRState?
+---@param about_state DiffReviewAICommitState?
 ---@return DiffReviewStatusHeadLine[]
-local function status_build_head_lines(values, pr_state)
+local function status_build_head_lines(values, pr_state, about_state)
   local lines = {}
   lines[#lines + 1] = {
     segments = status_head_row(
@@ -2841,6 +2898,7 @@ local function status_build_head_lines(values, pr_state)
   end
 
   lines[#lines + 1] = status_pr_head_line(pr_state)
+  lines[#lines + 1] = status_about_head_line(about_state)
   return lines
 end
 
@@ -2856,7 +2914,8 @@ local function status_head_lines_async(cwd, cb)
     if pending > 0 then return end
 
     local pr_state = M._status and M._status.pr
-    cb(status_build_head_lines(values, pr_state), values)
+    local about_state = M._status and M._status.about
+    cb(status_build_head_lines(values, pr_state, about_state), values)
   end
 
   status_git_line_async(cwd, { "rev-parse", "--short", "HEAD" }, function(line) done("head_oid", line) end)
@@ -2935,30 +2994,53 @@ local function status_add_segment_line(segments, entry)
   end
 end
 
+---@return DiffReviewStatusKeymapConfig
+local function status_keymap_config()
+  local options = M.config or config.options or config.defaults
+  local keymaps = options.keymaps or config.defaults.keymaps
+  return vim.tbl_deep_extend("force", vim.deepcopy(config.defaults.keymaps.status), keymaps.status or {})
+end
+
+---@param command_id string
+---@return string[]
+local function status_keys_for(command_id)
+  local key = status_keymap_config()[command_id]
+  if key == false or key == nil then return {} end
+  if type(key) == "table" then return key end
+  return { key }
+end
+
+---@param command_id string
+---@return string
+local function status_primary_key(command_id)
+  return status_keys_for(command_id)[1] or ""
+end
+
+---@param keys string[]
+---@return string
+local function status_key_text(keys)
+  return table.concat(keys, ", ")
+end
+
 local function status_add_hint_line()
-  status_add_segment_line({
+  local segments = {
     { "Hint: ", "DiffReviewStatusHint" },
-    { "<tab>", "DiffReviewStatusHintKey" },
-    { " toggle | ", "DiffReviewStatusHint" },
-    { "S", "DiffReviewStatusHintKey" },
-    { " stage | ", "DiffReviewStatusHint" },
-    { "U", "DiffReviewStatusHintKey" },
-    { " unstage | ", "DiffReviewStatusHint" },
-    { "j", "DiffReviewStatusHintKey" },
-    { " discard | ", "DiffReviewStatusHint" },
-    { "c", "DiffReviewStatusHintKey" },
-    { " commit | ", "DiffReviewStatusHint" },
-    { "pP", "DiffReviewStatusHintKey" },
-    { " push | ", "DiffReviewStatusHint" },
-    { "gp", "DiffReviewStatusHintKey" },
-    { " pr | ", "DiffReviewStatusHint" },
-    { "<CR>", "DiffReviewStatusHintKey" },
-    { " jump | ", "DiffReviewStatusHint" },
-    { "q", "DiffReviewStatusHintKey" },
-    { " close | ", "DiffReviewStatusHint" },
-    { "?", "DiffReviewStatusHintKey" },
-    { " help", "DiffReviewStatusHint" },
-  })
+  }
+  local first = true
+  for _, spec in ipairs(status_command_specs) do
+    if spec.hint then
+      local key = status_primary_key(spec.id)
+      if key ~= "" then
+        if not first then
+          segments[#segments + 1] = { " | ", "DiffReviewStatusHint" }
+        end
+        first = false
+        segments[#segments + 1] = { key, "DiffReviewStatusHintKey" }
+        segments[#segments + 1] = { " " .. spec.label, "DiffReviewStatusHint" }
+      end
+    end
+  end
+  status_add_segment_line(segments)
 end
 
 local function status_add_fancy_row(row, entry, indent)
@@ -3591,6 +3673,14 @@ local function status_entries_from_visual_selection()
   return status_entries_for_lines(start_pos[2], end_pos[2])
 end
 
+local function status_leave_visual_mode()
+  local mode = vim.api.nvim_get_mode().mode
+  if mode == "v" or mode == "V" or mode:byte() == 22 then
+    local esc = vim.api.nvim_replace_termcodes("<Esc>", true, false, true)
+    vim.api.nvim_feedkeys(esc, "nx", false)
+  end
+end
+
 ---@param entry DiffReviewStatusEntry?
 ---@return DiffReviewStatusEntry[]
 local function status_file_entries_for_entry(entry)
@@ -3766,7 +3856,28 @@ local function status_action_target_id(selected_entries, action_entries, target_
     local selected_entry = status_first_header_entry(selected_entries)
     if selected_entry then
       if target_section then
-        if selected_entry.kind == "section" then return status_section_key(target_section) end
+        if selected_entry.kind == "section" then
+          local source_section = selected_entry.section and selected_entry.section.name
+          local preferred_sections = nil
+          if target_section == "staged" and source_section == "unstaged" then
+            preferred_sections = { "untracked", "staged" }
+          elseif target_section == "staged" and source_section == "untracked" then
+            preferred_sections = { "unstaged", "staged" }
+          elseif source_section == "staged" and (target_section == "unstaged" or target_section == "untracked") then
+            preferred_sections = { "unstaged", "untracked" }
+          end
+
+          if preferred_sections and M._status and M._status.sections then
+            local projected_sections = status_apply_optimistic_move(vim.deepcopy(M._status.sections), action_entries, target_section)
+            local projected_section_map = status_section_map(projected_sections)
+            for _, preferred_section in ipairs(preferred_sections) do
+              local section = projected_section_map[preferred_section]
+              if section and #(section.files or {}) > 0 then return status_section_key(preferred_section) end
+            end
+          end
+
+          return status_section_key(target_section)
+        end
         if selected_entry.kind == "file" and opts.file_target == "next" then
           return status_next_action_target_id(action_entries) or selected_entry.id
         end
@@ -3927,7 +4038,50 @@ local function status_ensure_pr_state(cwd, buf, force)
     end
 
     if latest_status.head_values then
-      latest_status.head_lines = status_build_head_lines(latest_status.head_values, latest_status.pr)
+      latest_status.head_lines = status_build_head_lines(latest_status.head_values, latest_status.pr, latest_status.about)
+    end
+    if vim.api.nvim_buf_is_valid(buf) and latest_status.head_lines and latest_status.sections then
+      M.render_status(buf, nil, nil, { reuse_sections = true })
+    end
+  end)
+end
+
+---@param sections DiffReviewStatusSection[]?
+---@return boolean
+local function status_has_changes(sections)
+  for _, section in ipairs(sections or {}) do
+    if #(section.files or {}) > 0 then return true end
+  end
+  return false
+end
+
+---@param cwd string
+---@param buf integer
+---@param has_changes boolean
+---@param force? boolean
+local function status_ensure_about_state(cwd, buf, has_changes, force)
+  M._status = M._status or {}
+  local status = M._status
+  if not has_changes then
+    status.about_root = cwd
+    status.about = { state = "none", waiters = {} }
+    return
+  end
+
+  local current = ai_commit.state()
+  if not force and status.about_root == cwd and status.about and current == status.about then return end
+
+  status.about_root = cwd
+  status.about = current and current.cwd == cwd and current or { state = "generating", cwd = cwd, waiters = {} }
+  status.about_request_id = (status.about_request_id or 0) + 1
+  local request_id = status.about_request_id
+
+  ai_commit.ensure(cwd, { force = force }, function(result)
+    local latest_status = M._status
+    if not (latest_status and latest_status.about_request_id == request_id and latest_status.about_root == cwd) then return end
+    latest_status.about = result
+    if latest_status.head_values then
+      latest_status.head_lines = status_build_head_lines(latest_status.head_values, latest_status.pr, latest_status.about)
     end
     if vim.api.nvim_buf_is_valid(buf) and latest_status.head_lines and latest_status.sections then
       M.render_status(buf, nil, nil, { reuse_sections = true })
@@ -3938,7 +4092,7 @@ end
 ---@param buf integer
 ---@param target_id? string
 ---@param fallback_line? integer
----@param opts? { reuse_sections?: boolean, refresh_pr?: boolean }
+---@param opts? { reuse_sections?: boolean, refresh_pr?: boolean, refresh_about?: boolean }
 function M.render_status(buf, target_id, fallback_line, opts)
   opts = opts or {}
   setup_bg_highlights()
@@ -3982,6 +4136,8 @@ function M.render_status(buf, target_id, fallback_line, opts)
         status_request_reconcile(buf, target_id)
         return
       end
+      status_ensure_about_state(cwd, buf, status_has_changes(result.sections), opts.refresh_about)
+      result.head_lines = status_build_head_lines(result.head_values or {}, M._status.pr, M._status.about)
       M._status.head_lines = result.head_lines
       M._status.head_values = result.head_values
       M._status.sections = result.sections
@@ -4455,7 +4611,9 @@ end
 
 ---@param entries DiffReviewStatusEntry[]
 ---@param target_id? string
-local function status_discard_entry_list(entries, target_id)
+---@param opts? DiffReviewStatusActionOpts
+local function status_discard_entry_list(entries, target_id, opts)
+  opts = opts or {}
   local discard_entries = {}
   for _, entry in ipairs(status_expanded_entries(entries)) do
     if entry.kind == "hunk" or entry.kind == "file" then
@@ -4463,7 +4621,10 @@ local function status_discard_entry_list(entries, target_id)
     end
   end
   if #discard_entries == 0 then return end
-  local action_target_id = status_action_target_id(entries, discard_entries) or target_id
+  local action_target_id = nil
+  if not opts.preserve_cursor then
+    action_target_id = status_action_target_id(entries, discard_entries) or target_id
+  end
 
   local message
   if #discard_entries == 1 then
@@ -4537,6 +4698,40 @@ local function status_open_pr(entry)
 end
 
 ---@param entry DiffReviewStatusEntry?
+local function status_open_about(entry)
+  local about = entry and entry.about
+  if not about and M._status then about = M._status.about end
+  if not about or about.state == "none" then
+    vim.notify("No generated commit message", vim.log.levels.INFO, { title = "DiffReview" })
+    return
+  end
+  if about.state == "generating" then
+    vim.notify("Commit message is still generating", vim.log.levels.INFO, { title = "DiffReview" })
+    return
+  end
+  if about.state == "error" then
+    vim.notify(about.error or "Commit message generation failed", vim.log.levels.WARN, { title = "DiffReview" })
+    return
+  end
+  if not about.message or about.message == "" then return end
+
+  local buf = vim.api.nvim_create_buf(true, false)
+  vim.bo[buf].bufhidden = "hide"
+  vim.bo[buf].buftype = "nofile"
+  vim.bo[buf].swapfile = false
+  vim.bo[buf].filetype = "gitcommit"
+  local name = ("DiffReviewAbout://%s"):format(vim.fn.sha256(about.message):sub(1, 8))
+  if not pcall(vim.api.nvim_buf_set_name, buf, name) then
+    pcall(vim.api.nvim_buf_set_name, buf, name .. "#" .. buf)
+  end
+
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.split(about.message, "\n", { plain = true }))
+  vim.bo[buf].modifiable = false
+  vim.api.nvim_win_set_buf(vim.api.nvim_get_current_win(), buf)
+end
+
+---@param entry DiffReviewStatusEntry?
 local function status_jump(entry)
   if not (entry and entry.file and entry.file.filename) then return end
   vim.cmd.edit(vim.fn.fnameescape(entry.file.filename))
@@ -4573,16 +4768,100 @@ local function status_toggle(entry)
   render_status_or_notify(M._status.buf, entry.id, vim.api.nvim_win_get_cursor(0)[1], { reuse_sections = true })
 end
 
+---@param title string
+---@param lines string[]
+---@return integer
+local function status_open_popup(title, lines)
+  local width = #title + 4
+  for _, line in ipairs(lines) do
+    width = math.max(width, #line + 4)
+  end
+  width = math.min(math.max(width, 44), math.max(vim.o.columns - 4, 20))
+  local height = math.min(#lines, math.max(vim.o.lines - 6, 1))
+
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[buf].bufhidden = "wipe"
+  vim.bo[buf].buftype = "nofile"
+  vim.bo[buf].filetype = "DiffReviewHelp"
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].modifiable = false
+
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative = "editor",
+    width = width,
+    height = height,
+    col = math.floor((vim.o.columns - width) / 2),
+    row = math.floor((vim.o.lines - height) / 2),
+    style = "minimal",
+    border = "rounded",
+    title = " " .. title .. " ",
+    title_pos = "center",
+  })
+
+  local function close()
+    if vim.api.nvim_win_is_valid(win) then
+      pcall(vim.api.nvim_win_close, win, true)
+    end
+  end
+  for _, key in ipairs({ "q", "<Esc>", status_primary_key("help") }) do
+    if key ~= "" then
+      vim.keymap.set("n", key, close, { buffer = buf, nowait = true, silent = true, desc = "Close help" })
+    end
+  end
+
+  local key_width = 0
+  for _, spec in ipairs(status_command_specs) do
+    key_width = math.max(key_width, #status_key_text(status_keys_for(spec.id)))
+  end
+  local line_index = 0
+  for _, spec in ipairs(status_command_specs) do
+    local key_text = status_key_text(status_keys_for(spec.id))
+    if key_text ~= "" then
+      line_index = line_index + 1
+      pcall(vim.api.nvim_buf_set_extmark, buf, M._status_ns, line_index - 1, 2, {
+        end_col = 2 + #key_text,
+        hl_group = "DiffReviewStatusHintKey",
+        priority = 90,
+      })
+      pcall(vim.api.nvim_buf_set_extmark, buf, M._status_ns, line_index - 1, key_width + 6, {
+        end_col = #lines[line_index],
+        hl_group = "DiffReviewStatusHint",
+        priority = 80,
+      })
+    end
+  end
+
+  return buf
+end
+
+local function status_show_help()
+  local key_width = 0
+  for _, spec in ipairs(status_command_specs) do
+    key_width = math.max(key_width, #status_key_text(status_keys_for(spec.id)))
+  end
+
+  local lines = {}
+  for _, spec in ipairs(status_command_specs) do
+    local key_text = status_key_text(status_keys_for(spec.id))
+    if key_text ~= "" then
+      lines[#lines + 1] = ("  %-" .. key_width .. "s  %s"):format(key_text, spec.desc)
+    end
+  end
+  status_open_popup("DiffReview Commands", lines)
+end
+
 ---@param buf integer
-local function status_push(buf)
+---@param action "push"|"pull"
+local function status_remote_action(buf, action)
   git_root_async(function(cwd, root_err)
     if not cwd then
       notify_error(root_err or "Unable to find git root")
       return
     end
 
-    vim.notify("Pushing changes...", vim.log.levels.INFO, { title = "DiffReview" })
-    system_text_async({ "git", "-C", cwd, "push" }, nil, function(result)
+    local title = action == "push" and "Push" or "Pull"
+    vim.notify(title .. "ing changes...", vim.log.levels.INFO, { title = "DiffReview" })
+    system_text_async({ "git", "-C", cwd, action }, nil, function(result)
       local compact = {}
       for _, line in ipairs(text_to_lines((result.stdout or "") .. (result.stderr or ""))) do
         if line ~= "" then
@@ -4590,13 +4869,16 @@ local function status_push(buf)
         end
       end
       if result.code == 0 then
-        vim.notify("Push complete", vim.log.levels.INFO, { title = "DiffReview" })
+        vim.notify(title .. " complete", vim.log.levels.INFO, { title = "DiffReview" })
       else
-        notify_error("Push failed: " .. (#compact > 0 and table.concat(compact, "\n") or ("git exited " .. result.code)))
+        notify_error(title .. " failed: " .. (#compact > 0 and table.concat(compact, "\n") or ("git exited " .. result.code)))
       end
       if vim.api.nvim_buf_is_valid(buf) then
-        if M._status then M._status.pr = nil end
-        render_status_or_notify(buf, nil, nil, { refresh_pr = true })
+        if M._status then
+          M._status.pr = nil
+          M._status.about = nil
+        end
+        render_status_or_notify(buf, nil, nil, { refresh_pr = true, refresh_about = true })
       end
     end)
   end)
@@ -4605,52 +4887,67 @@ end
 ---@param buf integer
 local function setup_status_keymaps(buf)
   local opts = { buffer = buf, silent = true, nowait = true }
-  vim.keymap.set("n", "q", function()
+  local function map(command_id, mode, callback, desc)
+    for _, key in ipairs(status_keys_for(command_id)) do
+      vim.keymap.set(mode, key, callback, vim.tbl_extend("force", opts, {
+        desc = desc or (status_command_specs_by_id[command_id] and status_command_specs_by_id[command_id].desc) or command_id,
+      }))
+    end
+  end
+
+  map("close", "n", function()
     if vim.api.nvim_buf_is_valid(buf) then
       pcall(vim.api.nvim_buf_delete, buf, { force = true })
     end
     M._status = nil
-  end, vim.tbl_extend("force", opts, { desc = "Close DiffReview" }))
+  end)
 
-  vim.keymap.set("n", "r", function()
+  map("refresh", "n", function()
     if M._status then M._status.pr = nil end
     render_status_or_notify(buf, (status_entry_under_cursor() or {}).id, vim.api.nvim_win_get_cursor(0)[1], { refresh_pr = true })
-  end, vim.tbl_extend("force", opts, { desc = "Refresh DiffReview" }))
+  end)
 
-  vim.keymap.set("n", "<Tab>", function()
+  map("toggle", "n", function()
     status_toggle(status_entry_under_cursor())
-  end, vim.tbl_extend("force", opts, { desc = "Toggle fold" }))
+  end)
 
-  vim.keymap.set("n", "S", function()
+  map("stage", "n", function()
     status_stage(status_entry_under_cursor())
-  end, vim.tbl_extend("force", opts, { desc = "Stage hunk/file" }))
-  vim.keymap.set("x", "S", function()
-    status_stage_entries(status_entries_from_visual_selection(), { preserve_cursor = true })
-  end, vim.tbl_extend("force", opts, { desc = "Stage selection" }))
-
-  vim.keymap.set("n", "U", function()
-    status_unstage(status_entry_under_cursor())
-  end, vim.tbl_extend("force", opts, { desc = "Unstage hunk/file" }))
-  vim.keymap.set("x", "U", function()
-    status_unstage_entries(status_entries_from_visual_selection(), { preserve_cursor = true })
-  end, vim.tbl_extend("force", opts, { desc = "Unstage selection" }))
-
-  vim.keymap.set("n", "j", function()
-    status_discard(status_entry_under_cursor())
-  end, vim.tbl_extend("force", opts, { desc = "Discard hunk/file" }))
-  vim.keymap.set("x", "j", function()
+  end, "Stage hunk/file")
+  map("stage", "x", function()
     local entries = status_entries_from_visual_selection()
-    status_discard_entry_list(entries, (entries[1] or {}).id)
-  end, vim.tbl_extend("force", opts, { desc = "Discard selection" }))
+    status_leave_visual_mode()
+    status_stage_entries(entries, { preserve_cursor = true })
+  end, "Stage selection")
 
-  vim.keymap.set("n", "<CR>", function()
+  map("unstage", "n", function()
+    status_unstage(status_entry_under_cursor())
+  end, "Unstage hunk/file")
+  map("unstage", "x", function()
+    local entries = status_entries_from_visual_selection()
+    status_leave_visual_mode()
+    status_unstage_entries(entries, { preserve_cursor = true })
+  end, "Unstage selection")
+
+  map("discard", "n", function()
+    status_discard(status_entry_under_cursor())
+  end, "Discard hunk/file")
+  map("discard", "x", function()
+    local entries = status_entries_from_visual_selection()
+    status_leave_visual_mode()
+    status_discard_entry_list(entries, nil, { preserve_cursor = true })
+  end, "Discard selection")
+
+  map("open", "n", function()
     local entry = status_entry_under_cursor()
     if entry and entry.kind == "pr" then
       status_open_pr(entry)
+    elseif entry and entry.kind == "about" then
+      status_open_about(entry)
     else
       status_jump(entry)
     end
-  end, vim.tbl_extend("force", opts, { desc = "Open PR or jump to file" }))
+  end)
 
   local function commit()
     require("diff_review.commit").commit({
@@ -4660,22 +4957,21 @@ local function setup_status_keymaps(buf)
       end,
     })
   end
-  vim.keymap.set("n", "c", commit, vim.tbl_extend("force", opts, { desc = "Commit" }))
-  vim.keymap.set("n", "cc", commit, vim.tbl_extend("force", opts, { desc = "Commit" }))
+  map("commit", "n", commit)
 
-  vim.keymap.set("n", "pP", function()
-    status_push(buf)
-  end, vim.tbl_extend("force", opts, { desc = "Push" }))
+  map("push", "n", function()
+    status_remote_action(buf, "push")
+  end)
 
-  vim.keymap.set("n", "gp", function()
+  map("pull", "n", function()
+    status_remote_action(buf, "pull")
+  end)
+
+  map("pr", "n", function()
     status_open_pr(status_entry_under_cursor())
-  end, vim.tbl_extend("force", opts, { desc = "Open pull request" }))
+  end)
 
-  vim.keymap.set("n", "?", function()
-    vim.notify("<Tab> toggle | S stage | U unstage | j discard | c commit | pP push | gp pr | <CR> jump/open | r refresh | q close", vim.log.levels.INFO, {
-      title = "DiffReview",
-    })
-  end, vim.tbl_extend("force", opts, { desc = "DiffReview help" }))
+  map("help", "n", status_show_help)
 end
 
 --- Open a standalone, Neogit-style DiffReview status buffer.
