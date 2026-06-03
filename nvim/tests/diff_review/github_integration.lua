@@ -14,6 +14,7 @@ local pr_title = "Improve DiffReview"
 local generated_commit = "feat: add diff review ai summary\n\nAdd generated commit metadata."
 local has_changes = true
 local generate_count = 0
+local notifications = {}
 
 local function assert_true(condition, message)
   if not condition then error(message, 2) end
@@ -211,6 +212,18 @@ local function buffer_contains(buf, needle)
   return false
 end
 
+local function count_lines_equal(buf, expected)
+  local count = 0
+  for _, line in ipairs(status_lines(buf)) do
+    if line == expected then count = count + 1 end
+  end
+  return count
+end
+
+local function reset_notifications()
+  notifications = {}
+end
+
 local function find_row(buf, needle)
   for index, line in ipairs(status_lines(buf)) do
     if line:find(needle, 1, true) then return index end
@@ -241,18 +254,36 @@ local function run()
   diff_review.set_git_backend(git_backend)
   ai_commit.set_backend(ai_backend)
   gh.set_backend(gh_backend)
-  vim.notify = function() end
+  vim.notify = function(message, level, opts)
+    notifications[#notifications + 1] = {
+      message = tostring(message),
+      level = level,
+      opts = opts,
+    }
+  end
   diff_review.setup({ pr_buffer_name = "DiffReviewPRTest" })
   diff_review.open()
   local status_buf = vim.api.nvim_get_current_buf()
 
   wait_for(function() return buffer_contains(status_buf, "PR:") and buffer_contains(status_buf, "...fetching...") end, "PR row did not show fetching state")
   wait_for(function() return buffer_contains(status_buf, "About:  ...generating...") end, "About row did not show generating state")
+  wait_for(function()
+    local state = ai_commit.state()
+    return state and state.state == "generating"
+  end, "AI commit generation did not enter generating state")
 
   local commit_buf = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_buf_set_lines(commit_buf, 0, -1, false, { "" })
   vim.bo[commit_buf].modifiable = true
+  local waiting_messages = {}
+  ai_commit.populate_commit_buffer_when_ready(commit_buf, root, function(message)
+    waiting_messages[#waiting_messages + 1] = message
+  end)
   ai_commit.populate_commit_buffer_when_ready(commit_buf, root)
+  assert_true(
+    waiting_messages[1] == "Waiting for generated commit message...",
+    "waiting commit buffer did not report that it joined existing About generation"
+  )
 
   wait_for(function() return buffer_contains(status_buf, "Improve DiffReview") end, "PR row did not show fetched PR title")
   wait_for(function() return buffer_contains(status_buf, "feat: add diff review ai summary") end, "About row did not show generated commit subject")
@@ -260,10 +291,23 @@ local function run()
     local lines = vim.api.nvim_buf_get_lines(commit_buf, 0, -1, false)
     return lines[1] == "feat: add diff review ai summary"
   end, "generated commit was not applied to commit buffer after waiting")
+  assert_true(count_lines_equal(commit_buf, "feat: add diff review ai summary") == 1, "generated commit duplicated in waiting buffer")
+  assert_true(generate_count == 1, "waiting commit buffer started another AI generation")
   assert_true(vim.bo[commit_buf].modifiable, "commit buffer modifiable state was not preserved")
 
   local commit_host_buf = vim.api.nvim_get_current_buf()
   local commit_console = vim.api.nvim_create_buf(false, true)
+  local saw_unmarked_editmsg = false
+  local mark_group = vim.api.nvim_create_augroup("DiffReviewCommitBufferMarkTest", { clear = true })
+  vim.api.nvim_create_autocmd({ "BufReadPost", "BufEnter" }, {
+    group = mark_group,
+    pattern = "COMMIT_EDITMSG",
+    callback = function(args)
+      if not vim.b[args.buf].diff_review_commit_buffer or not vim.b[args.buf].ai_commit_generated then
+        saw_unmarked_editmsg = true
+      end
+    end,
+  })
   commit._active = {
     win = vim.api.nvim_get_current_win(),
     prev_buf = commit_host_buf,
@@ -271,10 +315,19 @@ local function run()
     console = commit_console,
     root = root,
   }
+  reset_notifications()
   commit.editor(root .. "/.git/COMMIT_EDITMSG", "")
   local editmsg_buf = vim.api.nvim_get_current_buf()
+  pcall(vim.api.nvim_del_augroup_by_id, mark_group)
+  assert_true(not saw_unmarked_editmsg, "DiffReview commit buffer was visible to autocmds before AI opt-out marks")
+  wait_for(function() return buffer_contains(editmsg_buf, "feat: add diff review ai summary") end, "commit editor did not reuse About message")
+  assert_true(count_lines_equal(editmsg_buf, "feat: add diff review ai summary") == 1, "generated commit duplicated in editmsg buffer")
+  assert_true(generate_count == 1, "commit editor started another AI generation")
+  assert_true(#notifications == 0, "ready About message should not notify when entering commit editor")
   assert_true(vim.b[editmsg_buf].ai_commit_generated == true, "DiffReview commit buffer did not suppress global AI commit autocmd")
+  assert_true(vim.b[editmsg_buf].diff_review_commit_buffer == true, "DiffReview commit buffer did not set its opt-out marker")
   commit._active = nil
+  vim.bo[editmsg_buf].modified = false
   vim.api.nvim_win_set_buf(0, commit_host_buf)
   if vim.api.nvim_buf_is_valid(editmsg_buf) then
     vim.api.nvim_buf_delete(editmsg_buf, { force = true })
@@ -309,7 +362,7 @@ local function run()
   trigger_normal_mapping("?", find_row(status_buf, "Head:"))
   local help_buf = vim.api.nvim_get_current_buf()
   assert_true(help_buf ~= status_buf, "help did not open a popup buffer")
-  assert_buffer_contains_all(help_buf, { "<Tab>", "S", "U", "j", "oc", "opP", "opp", "ogp", "<CR>", "r", "q", "?" })
+  assert_buffer_contains_all(help_buf, { "<Tab>", "S", "U", "j", "oc", "opP", "opp", "ogp", "<CR>", "r", "or", "q", "?" })
   pcall(vim.api.nvim_win_close, 0, true)
 
   vim.api.nvim_win_set_buf(0, status_buf)
@@ -322,6 +375,11 @@ local function run()
   wait_for(function() return buffer_contains(status_buf, "PR:     none") end, "PR row did not render none state")
 
   pr_mode = "ready"
+  pr_title = "PR after manual refresh"
+  assert_true(type(vim.fn.maparg("or", "n", false, true).callback) == "function", "or refresh mapping missing")
+  trigger_normal_mapping("or", find_row(status_buf, "Head:"))
+  wait_for(function() return buffer_contains(status_buf, "PR after manual refresh") end, "or did not force-refresh PR state")
+
   pr_title = "PR after push"
   trigger_normal_mapping("opP", find_row(status_buf, "Head:"))
   wait_for(function() return buffer_contains(status_buf, "PR after push") end, "push did not refresh PR state")
@@ -383,6 +441,24 @@ local function run()
   assert_true(buffer_contains(no_changes_buf, "About:  none"), "About row should show none with no changes")
   vim.wait(120)
   assert_true(generate_count == count_before_no_changes, "AI generation started despite no changes")
+
+  has_changes = true
+  ai_commit.reset_backend()
+  ai_commit.set_backend(ai_backend)
+  local count_before_direct_generate = generate_count
+  local direct_commit_buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(direct_commit_buf, 0, -1, false, { "" })
+  vim.bo[direct_commit_buf].modifiable = true
+  local generating_messages = {}
+  ai_commit.populate_commit_buffer_when_ready(direct_commit_buf, root, function(message)
+    generating_messages[#generating_messages + 1] = message
+  end)
+  assert_true(
+    generating_messages[1] == "Generating commit message...",
+    "commit buffer did not report new AI commit generation"
+  )
+  wait_for(function() return buffer_contains(direct_commit_buf, "feat: add diff review ai summary") end, "direct commit generation did not populate buffer")
+  assert_true(generate_count == count_before_direct_generate + 1, "direct commit buffer did not start exactly one AI generation")
 end
 
 local ok, err = xpcall(run, debug.traceback)

@@ -444,6 +444,7 @@ return {
       vim.api.nvim_create_autocmd({ "BufEnter" }, {
         pattern = "COMMIT_EDITMSG",
         callback = function(args)
+          if vim.b[args.buf].diff_review_commit_buffer then return end
           if vim.b[args.buf].ai_commit_generated then return end
 
           local lines = vim.api.nvim_buf_get_lines(args.buf, 0, -1, false)

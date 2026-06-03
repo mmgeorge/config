@@ -437,11 +437,21 @@ end
 ---@param notify? fun(message: string, level: integer)
 function M.populate_commit_buffer_when_ready(buf, cwd, notify)
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  if vim.b[buf].diff_review_ai_commit_populate_started then return end
+  vim.b[buf].diff_review_ai_commit_populate_started = true
+  vim.b[buf].ai_commit_generated = true
   local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
   if lines[1] and lines[1] ~= "" then return end
+  local current = M.state()
+  if notify and current and current.cwd == cwd and current.state == "generating" then
+    notify("Waiting for generated commit message...", vim.log.levels.INFO)
+  elseif notify and not (current and current.cwd == cwd and current.state == "ready") then
+    notify("Generating commit message...", vim.log.levels.INFO)
+  end
 
   local function apply_when_matching_staged(state)
     if not vim.api.nvim_buf_is_valid(buf) then return end
+    if vim.b[buf].diff_review_ai_commit_populated then return end
     if state.state ~= "ready" or not state.message then
       if notify and state.state == "error" then
         notify(state.error or "Unable to generate commit message", vim.log.levels.WARN)
@@ -457,6 +467,7 @@ function M.populate_commit_buffer_when_ready(buf, cwd, notify)
       if current_lines[1] and current_lines[1] ~= "" then return end
       local message_lines = text_to_lines(state.message)
       if #message_lines == 0 then return end
+      vim.b[buf].diff_review_ai_commit_populated = true
       local was_modifiable = vim.bo[buf].modifiable
       vim.bo[buf].modifiable = true
       vim.api.nvim_buf_set_lines(buf, 0, 0, false, message_lines)

@@ -4917,8 +4917,14 @@ local function setup_status_keymaps(buf)
   end)
 
   map("refresh", "n", function()
-    if M._status then M._status.pr = nil end
-    render_status_or_notify(buf, (status_entry_under_cursor() or {}).id, vim.api.nvim_win_get_cursor(0)[1], { refresh_pr = true })
+    if M._status then
+      M._status.pr = nil
+      M._status.about = nil
+    end
+    render_status_or_notify(buf, (status_entry_under_cursor() or {}).id, vim.api.nvim_win_get_cursor(0)[1], {
+      refresh_pr = true,
+      refresh_about = true,
+    })
   end)
 
   map("toggle", "n", function()

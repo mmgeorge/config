@@ -133,13 +133,14 @@ function M.editor(target, client_addr)
   end
 
   local buf = vim.fn.bufadd(target)
+  vim.b[buf].diff_review_commit_buffer = true
+  vim.b[buf].ai_commit_generated = true
   vim.fn.bufload(buf)
   vim.bo[buf].buftype = ""
   vim.bo[buf].swapfile = false
   vim.bo[buf].filetype = "gitcommit"
   vim.bo[buf].bufhidden = "wipe"
   vim.bo[buf].modifiable = true
-  vim.b[buf].ai_commit_generated = true
 
   vim.api.nvim_win_set_buf(st.win, buf)
   winbar(st.win, " %#Comment#<C-c><C-c>%* commit   %#Comment#<C-q>%* abort ")
