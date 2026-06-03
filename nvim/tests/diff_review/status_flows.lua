@@ -343,6 +343,15 @@ local function trigger_normal_mapping(key, row)
   mapping.callback()
 end
 
+local function trigger_visual_mapping(key, first_row, second_row)
+  vim.api.nvim_win_set_cursor(0, { second_row, 0 })
+  vim.fn.setpos("'<", { 0, first_row, 1, 0 })
+  vim.fn.setpos("'>", { 0, second_row, 1, 0 })
+  local mapping = vim.fn.maparg(key, "x", false, true)
+  assert_true(type(mapping.callback) == "function", "missing visual mapping for " .. key)
+  mapping.callback()
+end
+
 local function confirm_yes()
   local mapping = vim.fn.maparg("y", "n", false, true)
   assert_true(type(mapping.callback) == "function", "missing confirm yes mapping")
@@ -437,6 +446,61 @@ local function run()
     return saw_system_call("git\t-C\t" .. root .. "\trestore\t--staged\t--\tmod.txt")
   end, "tracked unstage did not run restore --staged")
   wait_for(function() return buffer_contains(buf, "Unstaged changes (1)") end, "tracked unstage did not reconcile")
+
+  reset_state({
+    modified = {
+      ["folded-stage-a.txt"] = true,
+      ["folded-stage-b.txt"] = true,
+      ["folded-stage-c.txt"] = true,
+    },
+  })
+  render_and_wait(buf, "folded-stage-a.txt +1 -1")
+  reset_calls()
+  trigger_normal_mapping("S", find_row(buf, "folded-stage-b.txt"))
+  assert_true(
+    cursor_line_text(buf):find("folded-stage-c.txt", 1, true) ~= nil,
+    "folded file stage did not move cursor to the next file before reconcile\n" .. table.concat(status_lines(buf), "\n")
+  )
+  wait_for(function()
+    return state.staged_modified["folded-stage-b.txt"] == true
+  end, "folded file stage did not finish")
+  wait_for(function()
+    return cursor_line_text(buf):find("folded-stage-c.txt", 1, true) ~= nil
+  end, "folded file stage did not keep cursor on next file after reconcile\n" .. table.concat(status_lines(buf), "\n"))
+
+  reset_state({
+    modified = {
+      ["visual-stage-a.txt"] = true,
+      ["visual-stage-b.txt"] = true,
+      ["visual-stage-c.txt"] = true,
+      ["visual-stage-d.txt"] = true,
+    },
+  })
+  render_and_wait(buf, "visual-stage-a.txt +1 -1")
+  reset_calls()
+  trigger_normal_mapping("S", find_row(buf, "visual-stage-d.txt"))
+  wait_for(function()
+    return cursor_line_text(buf):find("visual-stage-c.txt", 1, true) ~= nil
+  end, "single file stage did not establish a next-file target")
+  local visual_first_row = find_row(buf, "visual-stage-a.txt")
+  local visual_second_row = find_row(buf, "visual-stage-b.txt")
+  trigger_visual_mapping("S", visual_first_row, visual_second_row)
+  assert_true(
+    vim.api.nvim_win_get_cursor(0)[1] == visual_second_row,
+    "visual stage moved cursor row during optimistic render\n" .. table.concat(status_lines(buf), "\n")
+  )
+  wait_for(function()
+    return state.staged_modified["visual-stage-a.txt"]
+      and state.staged_modified["visual-stage-b.txt"]
+      and state.staged_modified["visual-stage-d.txt"]
+  end, "visual stage queue did not finish")
+  wait_for(function()
+    return count_calls("systemlist_async", "\tdiff") > 0
+  end, "visual stage queue did not reconcile")
+  assert_true(
+    vim.api.nvim_win_get_cursor(0)[1] == visual_second_row,
+    "visual stage inherited the previous action target after reconcile\n" .. table.concat(status_lines(buf), "\n")
+  )
 
   reset_state({ modified = { ["hunk-stage.txt"] = true } })
   render_and_wait(buf, "hunk-stage.txt +1 -1")

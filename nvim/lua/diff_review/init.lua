@@ -3709,6 +3709,34 @@ local function status_hunk_action_target_id(entries)
 end
 
 ---@param entries DiffReviewStatusEntry[]
+---@return string?
+local function status_next_action_target_id(entries)
+  local status = M._status
+  if not (status and status.entries and status.buf and vim.api.nvim_buf_is_valid(status.buf)) then return nil end
+
+  local action_ids = {}
+  for _, entry in ipairs(entries or {}) do
+    if entry.id then action_ids[entry.id] = true end
+  end
+
+  local cursor_line = vim.api.nvim_win_get_cursor(0)[1]
+  local max_line = vim.api.nvim_buf_line_count(status.buf)
+  for line = cursor_line + 1, max_line do
+    local entry = status.entries[line]
+    if entry and entry.id and not action_ids[entry.id] and (entry.kind == "file" or entry.kind == "hunk") then
+      return entry.id
+    end
+  end
+  for line = cursor_line - 1, 1, -1 do
+    local entry = status.entries[line]
+    if entry and entry.id and not action_ids[entry.id] and (entry.kind == "file" or entry.kind == "hunk") then
+      return entry.id
+    end
+  end
+  return nil
+end
+
+---@param entries DiffReviewStatusEntry[]
 ---@return boolean
 local function status_entries_are_headers(entries)
   if #entries == 0 then return false end
@@ -3730,13 +3758,18 @@ end
 ---@param selected_entries DiffReviewStatusEntry[]
 ---@param action_entries DiffReviewStatusEntry[]
 ---@param target_section? DiffReviewStatusSectionName
+---@param opts? { file_target?: "destination"|"next" }
 ---@return string?
-local function status_action_target_id(selected_entries, action_entries, target_section)
+local function status_action_target_id(selected_entries, action_entries, target_section, opts)
+  opts = opts or {}
   if status_entries_are_headers(selected_entries) then
     local selected_entry = status_first_header_entry(selected_entries)
     if selected_entry then
       if target_section then
         if selected_entry.kind == "section" then return status_section_key(target_section) end
+        if selected_entry.kind == "file" and opts.file_target == "next" then
+          return status_next_action_target_id(action_entries) or selected_entry.id
+        end
         if selected_entry.kind == "file" and selected_entry.file then
           return status_file_key(target_section, selected_entry.file.filename)
         end
@@ -4014,7 +4047,7 @@ status_request_reconcile = function(buf, target_id)
   local status = M._status
   if not status then return end
   status.reconcile_buf = buf or status.buf
-  status.reconcile_target_id = target_id or status.reconcile_target_id
+  status.reconcile_target_id = target_id
   if status_operations_pending() or not status.reconcile_buf then return end
 
   status.reconcile_generation = (status.reconcile_generation or 0) + 1
@@ -4166,8 +4199,13 @@ local function status_unstage_target_section(entries)
   return nil
 end
 
+---@class DiffReviewStatusActionOpts
+---@field preserve_cursor? boolean
+
 ---@param entries DiffReviewStatusEntry[]
-local function status_stage_entries(entries)
+---@param opts? DiffReviewStatusActionOpts
+local function status_stage_entries(entries, opts)
+  opts = opts or {}
   if #entries == 0 then return end
   local expanded_entries = status_expanded_entries(entries)
   if #expanded_entries == 0 then return end
@@ -4175,7 +4213,10 @@ local function status_stage_entries(entries)
   local action_entries = status_action_entries_for_target(expanded_entries, "staged")
   if #action_entries == 0 then return end
 
-  local target_id = status_action_target_id(entries, action_entries, "staged")
+  local target_id = nil
+  if not opts.preserve_cursor then
+    target_id = status_action_target_id(entries, action_entries, "staged", { file_target = "next" })
+  end
   local hunk_diffs, tracked_files, untracked_files = status_split_action_entries(action_entries)
   local staged_hunks = 0
   local staged_files = 0
@@ -4241,7 +4282,9 @@ local function status_stage(entry)
 end
 
 ---@param entries DiffReviewStatusEntry[]
-local function status_unstage_entries(entries)
+---@param opts? DiffReviewStatusActionOpts
+local function status_unstage_entries(entries, opts)
+  opts = opts or {}
   if #entries == 0 then return end
   local expanded_entries = status_expanded_entries(entries)
   if #expanded_entries == 0 then return end
@@ -4249,7 +4292,10 @@ local function status_unstage_entries(entries)
   local action_entries = status_unstage_action_entries(expanded_entries)
   if #action_entries == 0 then return end
 
-  local target_id = status_action_target_id(entries, action_entries, status_unstage_target_section(action_entries))
+  local target_id = nil
+  if not opts.preserve_cursor then
+    target_id = status_action_target_id(entries, action_entries, status_unstage_target_section(action_entries))
+  end
   local tracked_entries, added_entries = status_partition_unstage_entries(action_entries)
   local hunk_diffs, files, added_files = status_split_unstage_entries(action_entries)
   local unstaged_hunks = 0
@@ -4579,14 +4625,14 @@ local function setup_status_keymaps(buf)
     status_stage(status_entry_under_cursor())
   end, vim.tbl_extend("force", opts, { desc = "Stage hunk/file" }))
   vim.keymap.set("x", "S", function()
-    status_stage_entries(status_entries_from_visual_selection())
+    status_stage_entries(status_entries_from_visual_selection(), { preserve_cursor = true })
   end, vim.tbl_extend("force", opts, { desc = "Stage selection" }))
 
   vim.keymap.set("n", "U", function()
     status_unstage(status_entry_under_cursor())
   end, vim.tbl_extend("force", opts, { desc = "Unstage hunk/file" }))
   vim.keymap.set("x", "U", function()
-    status_unstage_entries(status_entries_from_visual_selection())
+    status_unstage_entries(status_entries_from_visual_selection(), { preserve_cursor = true })
   end, vim.tbl_extend("force", opts, { desc = "Unstage selection" }))
 
   vim.keymap.set("n", "j", function()
