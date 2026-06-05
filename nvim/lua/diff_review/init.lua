@@ -35,6 +35,7 @@
 ---@field system? fun(command: DiffReviewGitCommand, input?: string): string, integer?
 ---@field systemlist_async? fun(command: DiffReviewGitCommand, cb: DiffReviewGitListCallback)
 ---@field system_async? fun(command: DiffReviewGitCommand, input: string?, cb: DiffReviewGitTextCallback)
+---@field system_stream_async? fun(command: DiffReviewGitCommand, input: string?, on_line: fun(line: string), cb: DiffReviewGitTextCallback)
 ---@field delete? fun(path: string): integer
 
 ---@class DiffReviewHunk
@@ -392,6 +393,108 @@ local function system_text_async(command, input, cb)
         stdout = stdout,
         stderr = stderr,
         output = stdout ~= "" and stdout or stderr,
+      })
+    end)
+  end)
+  if not ok then
+    vim.schedule(function()
+      local message = tostring(process)
+      cb({
+        code = -1,
+        stdout = "",
+        stderr = message,
+        output = message,
+      })
+    end)
+  end
+end
+
+---@param data string|string[]?
+---@return string
+local function normalize_system_chunk(data)
+  if type(data) == "table" then
+    return table.concat(data, "\n")
+  end
+  return tostring(data or "")
+end
+
+---@param command DiffReviewGitCommand
+---@param input? string
+---@param on_line fun(line: string)
+---@param cb DiffReviewGitTextCallback
+local function system_text_stream_async(command, input, on_line, cb)
+  local backend = M._git_backend
+  if backend and backend.system_stream_async then
+    backend.system_stream_async(command, input, on_line, cb)
+    return
+  end
+  if backend and backend.system_async then
+    backend.system_async(command, input, cb, on_line)
+    return
+  end
+  if backend and backend.system then
+    vim.schedule(function()
+      local output, code = backend.system(command, input)
+      local text = tostring(output or "")
+      text = text:gsub("\r\n", "\n")
+      if text:sub(-1) == "\n" then text = text:sub(1, -2) end
+      local lines = text == "" and {} or vim.split(text, "\n", { plain = true })
+      for _, line in ipairs(lines) do
+        if line ~= "" then on_line(line) end
+      end
+      cb({
+        code = code or 0,
+        stdout = text,
+        stderr = "",
+        output = text,
+      })
+    end)
+    return
+  end
+
+  local stdout = {}
+  local stderr = {}
+  local pending = { stdout = "", stderr = "" }
+
+  ---@param stream "stdout"|"stderr"
+  ---@param data string|string[]?
+  local function collect(stream, data)
+    local text = normalize_system_chunk(data)
+    if text == "" then return end
+    local chunks = stream == "stdout" and stdout or stderr
+    chunks[#chunks + 1] = text
+
+    text = pending[stream] .. text:gsub("\r", "\n")
+    local parts = vim.split(text, "\n", { plain = true })
+    pending[stream] = table.remove(parts) or ""
+    for _, line in ipairs(parts) do
+      line = vim.trim(line)
+      if line ~= "" then vim.schedule(function() on_line(line) end) end
+    end
+  end
+
+  local ok, process = pcall(vim.system, command, {
+    text = true,
+    stdin = input,
+    stdout = function(_, data)
+      collect("stdout", data)
+    end,
+    stderr = function(_, data)
+      collect("stderr", data)
+    end,
+  }, function(result)
+    vim.schedule(function()
+      for _, stream in ipairs({ "stdout", "stderr" }) do
+        local line = vim.trim(pending[stream] or "")
+        if line ~= "" then on_line(line) end
+      end
+      local stdout_text = table.concat(stdout)
+      local stderr_text = table.concat(stderr)
+      cb({
+        code = result.code or 0,
+        stdout = stdout_text,
+        stderr = stderr_text,
+        output = stdout_text ~= "" and stdout_text or stderr_text,
       })
     end)
   end)
@@ -3206,7 +3309,7 @@ local function status_build_head_lines(values, pr_state, about_state)
     lines[#lines + 1] = {
       segments = {
         { ("%-8s"):format("Push:"), "DiffReviewStatusLabel" },
-        { "...pushing...", "DiffReviewStatusFetching" },
+        { remote_action.status or "Pushing...", "DiffReviewStatusFetching" },
       },
     }
   elseif values.push_ref then
@@ -5740,8 +5843,23 @@ local function status_remote_action(buf, action)
     end
 
     local title = action == "push" and "Push" or "Pull"
+    local running_status = action == "push" and "Pushing..." or "Pulling..."
+    local function update_remote_status(line)
+      line = vim.trim(line or "")
+      if line == "" then return end
+      if M._status then
+        M._status.remote_action = M._status.remote_action or { action = action, state = "running" }
+        M._status.remote_action.status = line
+        if M._status.head_values then
+          M._status.head_lines = status_build_head_lines(M._status.head_values, M._status.pr, M._status.about)
+          if vim.api.nvim_buf_is_valid(buf) then
+            M.render_status(buf, nil, nil, { reuse_sections = true })
+          end
+        end
+      end
+    end
     if M._status then
-      M._status.remote_action = { action = action, state = "running" }
+      M._status.remote_action = { action = action, state = "running", status = running_status }
       if M._status.head_values then
         M._status.head_lines = status_build_head_lines(M._status.head_values, M._status.pr, M._status.about)
         if vim.api.nvim_buf_is_valid(buf) then
@@ -5750,7 +5868,7 @@ local function status_remote_action(buf, action)
       end
     end
     notify_debug(title .. "ing changes...", vim.log.levels.INFO, { title = "DiffReview" })
-    system_text_async({ "git", "-C", cwd, action }, nil, function(result)
+    system_text_stream_async({ "git", "-C", cwd, action }, nil, update_remote_status, function(result)
       local compact = {}
       for _, line in ipairs(text_to_lines((result.stdout or "") .. (result.stderr or ""))) do
         if line ~= "" then
