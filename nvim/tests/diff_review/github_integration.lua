@@ -161,7 +161,18 @@ function gh_backend.system_async(command, _, cb, cwd)
       return
     end
     if key == "gh\tpr\tdiff\t42\t--patch\t--color\tnever" then
-      cb({ code = 0, stdout = "diff --git a/a b/a\n", stderr = "", output = "diff --git a/a b/a\n" })
+      local diff = table.concat({
+        "diff --git a/lua/diff_review/gh.lua b/lua/diff_review/gh.lua",
+        "index 1111111..2222222 100644",
+        "--- a/lua/diff_review/gh.lua",
+        "+++ b/lua/diff_review/gh.lua",
+        "@@ -0,0 +1 @@",
+        "+new gh wrapper",
+        " .../sources/strategies/chunks/ASourceChunk.ts        | 12 ++++++++++--",
+        " .../strategies/chunks/ByReferenceTileSourceChunk.ts  |  6 +++---",
+        " 8 files changed, 37 insertions(+), 23 deletions(-)",
+      }, "\n")
+      cb({ code = 0, stdout = diff, stderr = "", output = diff })
       return
     end
     cb({ code = 1, stdout = "", stderr = "unexpected gh command: " .. key, output = "unexpected gh command: " .. key })
@@ -397,17 +408,25 @@ local function run()
   trigger_normal_mapping("<CR>", find_row(status_buf, "PR:"))
   local pr_buf = vim.api.nvim_get_current_buf()
   assert_true(pr_buf ~= status_buf, "PRView did not open a new buffer")
-  assert_true(vim.bo[pr_buf].filetype == "markdown", "PRView is not a markdown buffer")
-  assert_true(buffer_contains(pr_buf, "Hint: b browse"), "PRView missing hint")
-  assert_true(buffer_contains(pr_buf, "Title: Improve DiffReview"), "PRView missing title")
+  assert_true(vim.bo[pr_buf].filetype == "DiffReviewStatus", "PRView is not a DiffReviewStatus buffer")
+  assert_true(buffer_contains(pr_buf, "Hint:"), "PRView missing hint")
+  assert_true(buffer_contains(pr_buf, "b browse"), "PRView missing browse hint")
+  assert_true(buffer_contains(pr_buf, "q close"), "PRView missing close hint")
+  assert_true(buffer_contains(pr_buf, "Title:  Improve DiffReview"), "PRView missing title")
   assert_true(buffer_contains(pr_buf, "Description:"), "PRView missing description heading")
   assert_true(buffer_contains(pr_buf, "- status row"), "PRView missing markdown body")
   assert_true(buffer_contains(pr_buf, "Head:"), "PRView missing head row")
   assert_true(buffer_contains(pr_buf, "Changes (2)"), "PRView missing changes heading")
-  assert_true(buffer_contains(pr_buf, "lua\\diff_review\\gh.lua +100 -0"), "PRView missing file change row")
+  assert_true(buffer_contains(pr_buf, "lua/diff_review/gh.lua +100 -0"), "PRView missing file change row")
+  trigger_normal_mapping("<Tab>", find_row(pr_buf, "lua/diff_review/gh.lua"))
+  wait_for(function() return buffer_contains(pr_buf, "@@ +1 -0") or buffer_contains(pr_buf, "No textual diff") end, "PR file did not expand")
+  assert_true(not buffer_contains(pr_buf, "ASourceChunk.ts"), "PR diffstat leaked into expanded hunk")
+  assert_true(not buffer_contains(pr_buf, "files changed"), "PR diff summary leaked into expanded hunk")
 
   trigger_normal_mapping("b", 1)
   assert_true(opened_urls[#opened_urls] == "https://github.example.test/org/repo/pull/42", "browse did not open PR URL")
+  trigger_normal_mapping("q", 1)
+  assert_true(not vim.api.nvim_buf_is_valid(pr_buf), "q did not close PRView")
 
   vim.api.nvim_win_set_buf(0, status_buf)
   trigger_normal_mapping("?", find_row(status_buf, "Head:"))

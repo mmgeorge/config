@@ -12,6 +12,13 @@ end
 
 ---@param item GithubGhItem
 local function open_item(item)
+  if item.kind == "pr" then
+    require("diff_review").open_pr_number(item.number, {
+      repo = item.repo,
+      cwd = vim.fn.getcwd(),
+    })
+    return
+  end
   require("github.issue_view").open({
     kind = item.kind,
     repo = item.repo,

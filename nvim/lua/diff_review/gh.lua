@@ -28,6 +28,7 @@
 ---@field title string
 ---@field body string
 ---@field url string
+---@field repo? string
 ---@field headRefName string
 ---@field headRefOid? string
 ---@field commits DiffReviewGhPRCommit[]
@@ -114,8 +115,9 @@ local function as_integer(value)
 end
 
 ---@param raw table
+---@param repo? string
 ---@return DiffReviewGhPR
-local function normalize_pr(raw)
+local function normalize_pr(raw, repo)
   local files = {}
   for _, file in ipairs(type(raw.files) == "table" and raw.files or {}) do
     files[#files + 1] = {
@@ -140,6 +142,7 @@ local function normalize_pr(raw)
     title = tostring(raw.title or ""),
     body = tostring(raw.body or ""),
     url = tostring(raw.url or ""),
+    repo = repo,
     headRefName = tostring(raw.headRefName or ""),
     headRefOid = raw.headRefOid,
     commits = commits,
@@ -148,6 +151,19 @@ local function normalize_pr(raw)
     additions = as_integer(raw.additions),
     deletions = as_integer(raw.deletions),
   }
+end
+
+---@param number? integer|string
+---@param repo? string
+---@return DiffReviewGhCommand
+local function pr_view_command(number, repo)
+  local command = { "gh", "pr", "view" }
+  if number and tostring(number) ~= "" then
+    command[#command + 1] = tostring(number)
+  end
+  vim.list_extend(command, { "--json", pr_json_fields })
+  if repo and repo ~= "" then vim.list_extend(command, { "--repo", repo }) end
+  return command
 end
 
 ---@param text string
@@ -162,7 +178,7 @@ end
 ---@param cwd string
 ---@param cb fun(result: DiffReviewGhPRResult)
 function M.current_pr_async(cwd, cb)
-  system_text_async({ "gh", "pr", "view", "--json", pr_json_fields }, nil, cwd, function(result)
+  system_text_async(pr_view_command(nil, nil), nil, cwd, function(result)
     if result.code ~= 0 then
       local output = result.output or ""
       if is_no_pr_output(output) then
@@ -184,10 +200,38 @@ function M.current_pr_async(cwd, cb)
 end
 
 ---@param cwd string
+---@param number integer|string
+---@param repo? string
+---@param cb fun(result: DiffReviewGhPRResult)
+function M.pr_async(cwd, number, repo, cb)
+  system_text_async(pr_view_command(number, repo), nil, cwd, function(result)
+    if result.code ~= 0 then
+      cb({ ok = false, message = result.output ~= "" and result.output or ("gh exited " .. result.code), code = result.code })
+      return
+    end
+
+    local ok, decoded = pcall(vim.json.decode, result.stdout or "")
+    if not ok or type(decoded) ~= "table" then
+      cb({ ok = false, message = "gh pr view returned invalid JSON", code = result.code })
+      return
+    end
+
+    cb({ ok = true, pr = normalize_pr(decoded, repo) })
+  end)
+end
+
+---@param cwd string
 ---@param number integer
+---@param repo? string
 ---@param cb DiffReviewGhTextCallback
-function M.pr_diff_async(cwd, number, cb)
-  system_text_async({ "gh", "pr", "diff", tostring(number), "--patch", "--color", "never" }, nil, cwd, cb)
+function M.pr_diff_async(cwd, number, repo, cb)
+  if type(repo) == "function" and cb == nil then
+    cb = repo
+    repo = nil
+  end
+  local command = { "gh", "pr", "diff", tostring(number), "--patch", "--color", "never" }
+  if repo and repo ~= "" then vim.list_extend(command, { "--repo", repo }) end
+  system_text_async(command, nil, cwd, cb)
 end
 
 ---@param pr DiffReviewGhPR

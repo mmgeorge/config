@@ -80,10 +80,13 @@
 ---@field files_by_name table<string, DiffReviewStatusFile>
 ---@field commits? DiffReviewStatusCommit[]
 ---@field upstream? string
+---@field file_key_prefix? string
+---@field file_entry_kind? "file"|"commit_file"|"pr_file"
+---@field hunk_entry_kind? "hunk"|"commit_hunk"|"pr_hunk"
 
 ---@class DiffReviewStatusEntry
 ---@field id? string
----@field kind "section"|"file"|"hunk"|"commit"|"commit_file"|"commit_hunk"|"pr"|"about"
+---@field kind "section"|"file"|"hunk"|"commit"|"commit_file"|"commit_hunk"|"pr_file"|"pr_hunk"|"pr"|"about"
 ---@field section? DiffReviewStatusSection
 ---@field file? DiffReviewStatusFile
 ---@field hunk? DiffReviewHunk
@@ -91,6 +94,8 @@
 ---@field diff_line? table
 ---@field pr? DiffReviewGhPR
 ---@field about? DiffReviewAICommitState
+
+---@alias DiffReviewStatusViewKind "status"|"pr"
 
 ---@class DiffReviewStatusPRState
 ---@field state "fetching"|"ready"|"none"|"error"
@@ -137,6 +142,8 @@
 ---@field config DiffReviewConfig?
 ---@field _git_backend DiffReviewGitBackend?
 ---@field _status table?
+---@field _main_status table?
+---@field _status_states table<integer, table>?
 ---@field _untracked table<string, string>?
 ---@field _file_diffs table<string, string>?
 ---@field _file_hunk_staged table<string, boolean[]>?
@@ -484,6 +491,17 @@ end
 ---@return string
 local function normalize_path_text(path)
   return tostring(path or ""):gsub("\\", "/"):gsub("/+$", "")
+end
+
+---@param cwd string
+---@param relpath string
+---@return string
+local function repo_file_path(cwd, relpath)
+  local path = cwd:gsub("[/\\]+$", "") .. "/" .. relpath
+  if package.config:sub(1, 1) ~= "\\" and cwd:match("^%a:[/\\]") then
+    return path
+  end
+  return vim.fn.fnamemodify(path, ":p")
 end
 
 ---@param absolute string
@@ -871,6 +889,9 @@ local function parse_diff(diff_output, staged)
   local current_hunk_lines = nil ---@type string[]?
   local current_hunk_start = nil ---@type number?
   local current_hunk_context = nil ---@type string?
+  local current_hunk_old_remaining = 0
+  local current_hunk_new_remaining = 0
+  local current_hunk_complete = false
 
   local function flush_hunk()
     if current_file and current_hunk_lines and current_hunk_start then
@@ -899,6 +920,53 @@ local function parse_diff(diff_output, staged)
     current_hunk_lines = nil
     current_hunk_start = nil
     current_hunk_context = nil
+    current_hunk_old_remaining = 0
+    current_hunk_new_remaining = 0
+    current_hunk_complete = false
+  end
+
+  ---@param line string
+  ---@return integer? old_start
+  ---@return integer old_count
+  ---@return integer? new_start
+  ---@return integer new_count
+  ---@return string? context
+  local function parse_hunk_header(line)
+    local old_start, old_count, new_start, new_count, context = line:match("^@@ %-(%d+),?(%d*) %+(%d+),?(%d*) @@ ?(.*)")
+    return tonumber(old_start),
+      old_count == "" and 1 or tonumber(old_count) or 1,
+      tonumber(new_start),
+      new_count == "" and 1 or tonumber(new_count) or 1,
+      context
+  end
+
+  ---@param line string
+  local function add_hunk_body_line(line)
+    if current_hunk_complete then
+      if line:find("^\\") then
+        current_hunk_lines[#current_hunk_lines + 1] = line
+      else
+        flush_hunk()
+      end
+      return
+    end
+
+    local prefix = line:sub(1, 1)
+    if not (prefix == " " or prefix == "+" or prefix == "-" or prefix == "\\") then
+      flush_hunk()
+      return
+    end
+
+    current_hunk_lines[#current_hunk_lines + 1] = line
+    if prefix == " " then
+      current_hunk_old_remaining = current_hunk_old_remaining - 1
+      current_hunk_new_remaining = current_hunk_new_remaining - 1
+    elseif prefix == "-" then
+      current_hunk_old_remaining = current_hunk_old_remaining - 1
+    elseif prefix == "+" then
+      current_hunk_new_remaining = current_hunk_new_remaining - 1
+    end
+    current_hunk_complete = current_hunk_old_remaining <= 0 and current_hunk_new_remaining <= 0
   end
 
   for _, line in ipairs(lines) do
@@ -921,16 +989,15 @@ local function parse_diff(diff_output, staged)
       end
     elseif line:find("^@@") then
       flush_hunk()
-      -- Parse @@ -old,count +new,count @@ context
-      local new_start, context = line:match("^@@ %-%d+,?%d* %+(%d+),?%d* @@ ?(.*)")
-      if not new_start then
-        new_start = line:match("^@@ %-%d+,?%d* %+(%d+),?%d* @@")
-      end
+      local _, old_count, new_start, new_count, context = parse_hunk_header(line)
       current_hunk_start = tonumber(new_start) or 1
       current_hunk_context = (context and context ~= "") and context or nil
       current_hunk_lines = { line }
+      current_hunk_old_remaining = old_count
+      current_hunk_new_remaining = new_count
+      current_hunk_complete = current_hunk_old_remaining <= 0 and current_hunk_new_remaining <= 0
     elseif current_hunk_lines then
-      current_hunk_lines[#current_hunk_lines + 1] = line
+      add_hunk_body_line(line)
     end
   end
   flush_hunk()
@@ -994,7 +1061,7 @@ local function file_diff_and_flags_async(cwd, filename, cb)
   for _, staged in ipairs({ false, true }) do
     get_hunks_async(cwd, staged, function(result)
       for _, hunk in ipairs(result) do
-      if vim.fs.normalize(vim.fn.fnamemodify(cwd .. "/" .. hunk.file, ":p")) == norm then
+      if vim.fs.normalize(repo_file_path(cwd, hunk.file)) == norm then
         hunks[#hunks + 1] = hunk
       end
     end
@@ -1624,7 +1691,7 @@ local function collect_items_from_git(cwd, cb, _ctx)
 
   local items = {}
   for _, hunk in ipairs(all_hunks) do
-    local filename = vim.fn.fnamemodify(cwd .. "/" .. hunk.file, ":p")
+    local filename = repo_file_path(cwd, hunk.file)
     -- Use treesitter scope context if available, fall back to git's @@ context
     local context_text = hunk.context or ""
     if not (_ctx and _ctx.skip_ts_context) then
@@ -1679,7 +1746,7 @@ local function collect_items_from_git(cwd, cb, _ctx)
 
   -- Add untracked files
   for _, f in ipairs(untracked_files) do
-    local filename = vim.fn.fnamemodify(cwd .. "/" .. f, ":p")
+    local filename = repo_file_path(cwd, f)
     M._untracked[filename] = f -- remember repo-relative path for the synthetic diff
     items[#items + 1] = ({
       filename = filename,
@@ -1713,7 +1780,7 @@ local function collect_items_from_git(cwd, cb, _ctx)
   M._file_hunk_staged = {}
   for f, hunks in pairs(file_hunks) do
     local diffs, flags = order_file_hunks(hunks)
-    local filename = vim.fn.fnamemodify(cwd .. "/" .. f, ":p")
+    local filename = repo_file_path(cwd, f)
     M._file_diffs[filename] = table.concat(diffs, "\n")
     M._file_hunk_staged[filename] = flags
   end
@@ -2938,20 +3005,22 @@ local status_reconcile_delay_ms = 120
 ---@field modes string|string[]
 ---@field visual? boolean
 ---@field hint boolean
+---@field views? table<DiffReviewStatusViewKind, boolean>
 
 ---@type DiffReviewStatusCommandSpec[]
 local status_command_specs = {
-  { id = "toggle", label = "toggle", desc = "Toggle fold", modes = "n", hint = true },
-  { id = "stage", label = "stage", desc = "Stage hunk/file/selection", modes = { "n", "x" }, visual = true, hint = true },
-  { id = "unstage", label = "unstage", desc = "Unstage hunk/file/selection", modes = { "n", "x" }, visual = true, hint = true },
-  { id = "discard", label = "discard", desc = "Discard hunk/file/selection", modes = { "n", "x" }, visual = true, hint = true },
-  { id = "commit", label = "commit", desc = "Commit", modes = "n", hint = true },
-  { id = "push", label = "push", desc = "Push", modes = "n", hint = true },
-  { id = "pull", label = "pull", desc = "Pull", modes = "n", hint = true },
-  { id = "pr", label = "pr", desc = "Open pull request", modes = "n", hint = true },
+  { id = "toggle", label = "toggle", desc = "Toggle fold", modes = "n", hint = true, views = { status = true, pr = true } },
+  { id = "stage", label = "stage", desc = "Stage hunk/file/selection", modes = { "n", "x" }, visual = true, hint = true, views = { status = true } },
+  { id = "unstage", label = "unstage", desc = "Unstage hunk/file/selection", modes = { "n", "x" }, visual = true, hint = true, views = { status = true } },
+  { id = "discard", label = "discard", desc = "Discard hunk/file/selection", modes = { "n", "x" }, visual = true, hint = true, views = { status = true } },
+  { id = "commit", label = "commit", desc = "Commit", modes = "n", hint = true, views = { status = true } },
+  { id = "push", label = "push", desc = "Push", modes = "n", hint = true, views = { status = true } },
+  { id = "pull", label = "pull", desc = "Pull", modes = "n", hint = true, views = { status = true } },
+  { id = "pr", label = "pr", desc = "Open pull request", modes = "n", hint = true, views = { status = true } },
+  { id = "browse", label = "browse", desc = "Browse pull request", modes = "n", hint = true, views = { pr = true } },
   { id = "open", label = "open", desc = "Open PR/about or jump to file", modes = "n", hint = true },
   { id = "refresh", label = "refresh", desc = "Refresh DiffReview", modes = "n", hint = true },
-  { id = "close", label = "close", desc = "Close DiffReview", modes = "n", hint = true },
+  { id = "close", label = "close", desc = "Close DiffReview", modes = "n", hint = true, views = { status = true, pr = true } },
   { id = "help", label = "help", desc = "Show help", modes = "n", hint = true },
 }
 
@@ -2979,6 +3048,28 @@ local function set_status_folded(key, folded)
   M._status = M._status or {}
   M._status.folds = M._status.folds or {}
   M._status.folds[key] = folded
+end
+
+---@param buf integer
+---@param state table
+local function attach_status_state(buf, state)
+  M._status_states = M._status_states or {}
+  M._status_states[buf] = state
+  vim.api.nvim_create_autocmd("BufEnter", {
+    buffer = buf,
+    callback = function()
+      local current = M._status_states and M._status_states[buf] or nil
+      if current then M._status = current end
+    end,
+  })
+  vim.api.nvim_create_autocmd("BufWipeout", {
+    buffer = buf,
+    callback = function()
+      if M._status_states then M._status_states[buf] = nil end
+      if M._main_status == state then M._main_status = nil end
+      if M._status == state then M._status = M._main_status end
+    end,
+  })
 end
 
 ---@param cwd string
@@ -3105,6 +3196,54 @@ local function status_build_head_lines(values, pr_state, about_state)
   return lines
 end
 
+---@param text string
+---@return string[]
+local function status_markdown_lines(text)
+  text = tostring(text or ""):gsub("\r\n", "\n")
+  if text == "" then return { "_No description._" } end
+  return vim.split(text, "\n", { plain = true })
+end
+
+---@param oid string?
+---@return string
+local function status_short_oid(oid)
+  oid = tostring(oid or "")
+  if oid == "" then return "0000000" end
+  return oid:sub(1, 7)
+end
+
+---@param pr DiffReviewGhPR
+---@return string
+local function status_pr_head_subject(pr)
+  local commits = pr.commits or {}
+  local commit = commits[#commits]
+  return commit and commit.messageHeadline or ""
+end
+
+---@param pr DiffReviewGhPR
+---@return DiffReviewStatusHeadLine[]
+local function status_pr_detail_head_lines(pr)
+  local title = pr.title ~= "" and pr.title or ("PR #" .. tostring(pr.number))
+  local lines = {
+    { segments = { { "Title:  ", "DiffReviewStatusLabel" }, { title, "DiffReviewStatusPath" } } },
+  }
+  if pr.repo and pr.repo ~= "" then
+    lines[#lines + 1] = { segments = { { "Repo:   ", "DiffReviewStatusLabel" }, { pr.repo, "DiffReviewStatusRemote" } } }
+  end
+  lines[#lines + 1] = {
+    segments = status_head_row("Head", status_short_oid(pr.headRefOid), pr.headRefName or "", "DiffReviewStatusBranch", status_pr_head_subject(pr)),
+  }
+  if pr.url and pr.url ~= "" then
+    lines[#lines + 1] = { segments = { { "URL:    ", "DiffReviewStatusLabel" }, { pr.url, "DiffReviewStatusPR" } } }
+  end
+  lines[#lines + 1] = { segments = { { "" } } }
+  lines[#lines + 1] = { segments = { { "Description:", "DiffReviewStatusLabel" } } }
+  for _, line in ipairs(status_markdown_lines(pr.body)) do
+    lines[#lines + 1] = { segments = { { line } } }
+  end
+  return lines
+end
+
 ---@param cwd string
 ---@param cb fun(lines: DiffReviewStatusHeadLine[], values: table)
 local function status_head_lines_async(cwd, cb)
@@ -3167,6 +3306,22 @@ local function status_commit_hunk_key(oid, filename, diff)
   return ("commit-hunk:%s:%s:%s"):format(oid, filename, hash)
 end
 
+---@param provider_key string
+---@param filename string
+---@return string
+local function status_provider_file_key(provider_key, filename)
+  return ("provider-file:%s:%s"):format(provider_key, filename)
+end
+
+---@param provider_key string
+---@param filename string
+---@param diff string?
+---@return string
+local function status_provider_hunk_key(provider_key, filename, diff)
+  local hash = diff and vim.fn.sha256(diff) or "file"
+  return ("provider-hunk:%s:%s:%s"):format(provider_key, filename, hash)
+end
+
 local function status_add_highlight(line, start_col, end_col, hl_group)
   M._status.highlights[#M._status.highlights + 1] = {
     line = line,
@@ -3226,6 +3381,13 @@ local function status_keymap_config()
   return vim.tbl_deep_extend("force", vim.deepcopy(config.defaults.keymaps.status), keymaps.status or {})
 end
 
+---@param spec DiffReviewStatusCommandSpec
+---@return boolean
+local function status_command_visible(spec)
+  local view_kind = M._status and M._status.view_kind or "status"
+  return not spec.views or spec.views[view_kind] == true
+end
+
 ---@param command_id string
 ---@return string[]
 local function status_keys_for(command_id)
@@ -3253,7 +3415,7 @@ local function status_add_hint_line()
   }
   local first = true
   for _, spec in ipairs(status_command_specs) do
-    if spec.hint then
+    if spec.hint and status_command_visible(spec) then
       local key = status_primary_key(spec.id)
       if key ~= "" then
         if not first then
@@ -3413,39 +3575,69 @@ local function status_sections_from_items(collected_items)
   return ordered
 end
 
----@param cwd string
----@param commit DiffReviewStatusCommit
----@param diff_text string
----@return DiffReviewStatusFile[]
-local function status_commit_files_from_diff(cwd, commit, diff_text)
-  local files_by_name = {} ---@type table<string, DiffReviewStatusFile>
-  local files = {} ---@type DiffReviewStatusFile[]
-  local commit_section_name = status_commit_key(commit.oid)
+---@class DiffReviewStatusDiffProviderFile
+---@field path string
+---@field additions? integer
+---@field deletions? integer
+---@field status? string
+---@field changeType? string
 
-  for _, parsed_hunk in ipairs(parse_diff(diff_text or "", false)) do
-    local filename = cwd .. "/" .. parsed_hunk.file
+---@class DiffReviewStatusDiffProvider
+---@field section_name string
+---@field default_status string
+---@field files? DiffReviewStatusDiffProviderFile[]
+
+---@param cwd string
+---@param provider DiffReviewStatusDiffProvider
+---@param diff_text? string
+---@return DiffReviewStatusFile[]
+local function status_files_from_diff_provider(cwd, provider, diff_text)
+  local files_by_name = {} ---@type table<string, DiffReviewStatusFile>
+  local files_with_provider_stats = {} ---@type table<string, boolean>
+  local files = {} ---@type DiffReviewStatusFile[]
+
+  local function ensure_file(relpath, stats)
+    local filename = cwd .. "/" .. relpath
     local file = files_by_name[filename]
     if not file then
       file = {
         filename = filename,
-        relpath = parsed_hunk.file,
-        section_name = commit_section_name,
+        relpath = relpath,
+        section_name = provider.section_name,
         added = 0,
         removed = 0,
         hunks = {},
         untracked = false,
-        status = "modified",
+        status = provider.default_status,
       }
       files_by_name[filename] = file
       files[#files + 1] = file
     end
+    if stats then
+      files_with_provider_stats[filename] = true
+      file.added = stats.additions or file.added or 0
+      file.removed = stats.deletions or file.removed or 0
+      file.status = stats.changeType or stats.status or file.status
+      file.git_status = stats.changeType or stats.status or file.git_status
+    end
+    return file
+  end
 
-    file.added = file.added + (parsed_hunk.added or 0)
-    file.removed = file.removed + (parsed_hunk.removed or 0)
+  for _, provider_file in ipairs(provider.files or {}) do
+    if provider_file.path and provider_file.path ~= "" then ensure_file(provider_file.path, provider_file) end
+  end
+
+  for _, parsed_hunk in ipairs(parse_diff(diff_text or "", false)) do
+    local file = ensure_file(parsed_hunk.file, nil)
+    if not files_with_provider_stats[file.filename] then
+      file.added = file.added + (parsed_hunk.added or 0)
+      file.removed = file.removed + (parsed_hunk.removed or 0)
+    end
+
     file.hunks[#file.hunks + 1] = {
       file = parsed_hunk.file,
-      filename = filename,
-      section_name = commit_section_name,
+      filename = file.filename,
+      section_name = provider.section_name,
       pos = parsed_hunk.pos,
       diff = parsed_hunk.diff,
       staged = false,
@@ -3464,6 +3656,61 @@ local function status_commit_files_from_diff(cwd, commit, diff_text)
     end)
   end
   return files
+end
+
+---@param cwd string
+---@param commit DiffReviewStatusCommit
+---@param diff_text string
+---@return DiffReviewStatusFile[]
+local function status_commit_files_from_diff(cwd, commit, diff_text)
+  return status_files_from_diff_provider(cwd, {
+    section_name = status_commit_key(commit.oid),
+    default_status = "modified",
+  }, diff_text)
+end
+
+---@param title string
+---@param files DiffReviewStatusFile[]
+---@param opts? { name?: string, default_folded?: boolean, file_key_prefix?: string, file_entry_kind?: "file"|"commit_file"|"pr_file", hunk_entry_kind?: "hunk"|"commit_hunk"|"pr_hunk" }
+---@return DiffReviewStatusSection[]
+local function status_sections_from_provider_files(title, files, opts)
+  opts = opts or {}
+  if #files == 0 then return {} end
+  local files_by_name = {} ---@type table<string, DiffReviewStatusFile>
+  for _, file in ipairs(files) do
+    files_by_name[file.filename] = file
+  end
+  return {
+    {
+      name = opts.name or title,
+      title = title,
+      default_folded = opts.default_folded == true,
+      files = files,
+      files_by_name = files_by_name,
+      file_key_prefix = opts.file_key_prefix,
+      file_entry_kind = opts.file_entry_kind,
+      hunk_entry_kind = opts.hunk_entry_kind,
+    },
+  }
+end
+
+---@param cwd string
+---@param pr DiffReviewGhPR
+---@param diff_text? string
+---@return DiffReviewStatusSection[]
+local function status_pr_sections(cwd, pr, diff_text)
+  local provider_key = "pr:" .. tostring(pr.number)
+  local files = status_files_from_diff_provider(cwd, {
+    section_name = provider_key .. ":changes",
+    default_status = "",
+    files = pr.files,
+  }, diff_text)
+  return status_sections_from_provider_files("Changes", files, {
+    name = provider_key .. ":changes",
+    file_key_prefix = provider_key,
+    file_entry_kind = "pr_file",
+    hunk_entry_kind = "pr_hunk",
+  })
 end
 
 ---@class DiffReviewCommitLogSectionSpec
@@ -3870,7 +4117,7 @@ local status_request_reconcile
 ---@param hunk DiffReviewHunk
 ---@param previous_hunk? DiffReviewHunk
 ---@param next_hunk? DiffReviewHunk
----@param entry_kind? "hunk"|"commit_hunk"
+---@param entry_kind? "hunk"|"commit_hunk"|"pr_hunk"
 ---@param hunk_key_override? string
 local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_kind, hunk_key_override)
   local hunk_key = hunk_key_override or status_hunk_key(file.section_name, file.filename, hunk.diff)
@@ -3997,8 +4244,8 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_ki
 end
 
 ---@param file DiffReviewStatusFile
----@param entry_kind? "file"|"commit_file"
----@param hunk_entry_kind? "hunk"|"commit_hunk"
+---@param entry_kind? "file"|"commit_file"|"pr_file"
+---@param hunk_entry_kind? "hunk"|"commit_hunk"|"pr_hunk"
 ---@param file_key_override? string
 ---@param hunk_key_builder? fun(hunk: DiffReviewHunk): string
 local function status_render_file(file, entry_kind, hunk_entry_kind, file_key_override, hunk_key_builder)
@@ -4094,7 +4341,19 @@ local function status_render_section(section)
     return
   end
   for _, file in ipairs(section.files) do
-    status_render_file(file)
+    if section.file_key_prefix then
+      status_render_file(
+        file,
+        section.file_entry_kind or "file",
+        section.hunk_entry_kind or "hunk",
+        status_provider_file_key(section.file_key_prefix, file.filename),
+        function(hunk)
+          return status_provider_hunk_key(section.file_key_prefix, file.filename, hunk.diff)
+        end
+      )
+    else
+      status_render_file(file)
+    end
   end
 end
 
@@ -4175,9 +4434,9 @@ end
 ---@param entry DiffReviewStatusEntry?
 local function status_prewarm_entry_syntax(entry)
   if not entry then return end
-  if (entry.kind == "file" or entry.kind == "commit_file") and entry.file then
+  if (entry.kind == "file" or entry.kind == "commit_file" or entry.kind == "pr_file") and entry.file then
     prewarm_file_diff_syntax(entry.file, "status-cursor-prewarm:" .. (entry.id or entry.file.filename))
-  elseif (entry.kind == "hunk" or entry.kind == "commit_hunk") and entry.file and entry.hunk then
+  elseif (entry.kind == "hunk" or entry.kind == "commit_hunk" or entry.kind == "pr_hunk") and entry.file and entry.hunk then
     cached_diff_syntax(
       entry.file.filename,
       entry.hunk.diff,
@@ -4194,7 +4453,7 @@ local status_files_from_set
 local function status_files_for_entry(entry)
   if not entry then return {} end
   if entry.kind == "hunk" then return { entry.file.filename } end
-  if entry.kind == "file" then return { entry.file.filename } end
+  if (entry.kind == "file" or entry.kind == "pr_file") then return { entry.file.filename } end
   if entry.kind == "section" then
     local files = {}
     for _, file in ipairs(entry.section.files or {}) do
@@ -4370,7 +4629,13 @@ end
 local function status_entries_are_headers(entries)
   if #entries == 0 then return false end
   for _, entry in ipairs(entries) do
-    if not (entry.kind == "section" or entry.kind == "file" or entry.kind == "commit" or entry.kind == "commit_file") then return false end
+    if not (
+      entry.kind == "section"
+      or entry.kind == "file"
+      or entry.kind == "commit"
+      or entry.kind == "commit_file"
+      or entry.kind == "pr_file"
+    ) then return false end
   end
   return true
 end
@@ -4396,6 +4661,7 @@ local function status_target_is_header(target_id)
       or target_id:find("^file:") ~= nil
       or target_id:find("^commit:") ~= nil
       or target_id:find("^commit%-file:") ~= nil
+      or target_id:find("^provider%-file:") ~= nil
     )
 end
 
@@ -4415,6 +4681,7 @@ local function status_nearest_header_line(fallback_line)
       or previous_entry.kind == "file"
       or previous_entry.kind == "commit"
       or previous_entry.kind == "commit_file"
+      or previous_entry.kind == "pr_file"
     ) then return previous_line end
     local next_line = line + offset
     local next_entry = status.entries[next_line]
@@ -4423,6 +4690,7 @@ local function status_nearest_header_line(fallback_line)
       or next_entry.kind == "file"
       or next_entry.kind == "commit"
       or next_entry.kind == "commit_file"
+      or next_entry.kind == "pr_file"
     ) then return next_line end
   end
   return nil
@@ -4536,8 +4804,9 @@ local function status_ensure_pr_state(cwd, buf, force)
   local request_id = status.pr_request_id
 
   gh.current_pr_async(cwd, function(result)
-    local latest_status = M._status
+    local latest_status = M._status_states and M._status_states[buf] or M._status
     if not (latest_status and latest_status.pr_request_id == request_id and latest_status.pr_root == cwd) then return end
+    M._status = latest_status
 
     if result.ok and result.pr then
       latest_status.pr = { state = "ready", pr = result.pr }
@@ -4589,8 +4858,9 @@ local function status_ensure_about_state(cwd, buf, has_changes, force)
   local request_id = status.about_request_id
 
   ai_commit.ensure(cwd, { force = force }, function(result)
-    local latest_status = M._status
+    local latest_status = M._status_states and M._status_states[buf] or M._status
     if not (latest_status and latest_status.about_request_id == request_id and latest_status.about_root == cwd) then return end
+    M._status = latest_status
     latest_status.about = result
     if latest_status.head_values then
       latest_status.head_lines = status_build_head_lines(latest_status.head_values, latest_status.pr, latest_status.about)
@@ -4608,9 +4878,13 @@ end
 function M.render_status(buf, target_id, fallback_line, opts)
   opts = opts or {}
   setup_bg_highlights()
+  if M._status_states and M._status_states[buf] then
+    M._status = M._status_states[buf]
+  end
   M._status = M._status or {}
   M._status.buf = buf
   M._status.reconcile_generation = (M._status.reconcile_generation or 0) + 1
+  local render_state = M._status
   local preserve_current_cursor = target_id == nil and fallback_line == nil
 
   if opts.reuse_sections and M._status.head_lines and M._status.sections then
@@ -4629,7 +4903,9 @@ function M.render_status(buf, target_id, fallback_line, opts)
   end
 
   git_root_async(function(cwd, root_err)
-    if not (M._status and M._status.request_id == request_id) then return end
+    local latest_status = M._status_states and M._status_states[buf] or render_state
+    if not (latest_status and latest_status.request_id == request_id) then return end
+    M._status = latest_status
     if not cwd then
       notify_error(root_err or "Unable to find git root")
       if not has_existing_view then
@@ -4638,22 +4914,24 @@ function M.render_status(buf, target_id, fallback_line, opts)
       return
     end
 
-    M._status.cwd = cwd
+    latest_status.cwd = cwd
     status_ensure_pr_state(cwd, buf, opts.refresh_pr)
 
     status_load_async(cwd, function(result)
-      if not (M._status and M._status.request_id == request_id) then return end
+      local current_status = M._status_states and M._status_states[buf] or render_state
+      if not (current_status and current_status.request_id == request_id) then return end
+      M._status = current_status
       if not vim.api.nvim_buf_is_valid(buf) then return end
       if status_operations_pending() then
         status_request_reconcile(buf, target_id)
         return
       end
       status_ensure_about_state(cwd, buf, status_has_changes(result.sections), opts.refresh_about)
-      result.head_lines = status_build_head_lines(result.head_values or {}, M._status.pr, M._status.about)
-      M._status.head_lines = result.head_lines
-      M._status.head_values = result.head_values
-      M._status.sections = result.sections
-      M._status.fancy_rows = {}
+      result.head_lines = status_build_head_lines(result.head_values or {}, current_status.pr, current_status.about)
+      current_status.head_lines = result.head_lines
+      current_status.head_values = result.head_values
+      current_status.sections = result.sections
+      current_status.fancy_rows = {}
       if preserve_current_cursor then
         target_id, fallback_line = status_cursor_target(buf)
       end
@@ -4673,6 +4951,44 @@ local function render_status_or_notify(buf, target_id, fallback_line, opts)
   if not ok then
     notify_error("DiffReview render failed: " .. tostring(err))
   end
+end
+
+---@param pr DiffReviewGhPR
+---@param cwd string
+---@param buf integer
+---@param diff_text? string
+local function render_pr_status(pr, cwd, buf, diff_text)
+  local status = M._status
+  if not (status and status.buf == buf) then return end
+  status.head_lines = status_pr_detail_head_lines(pr)
+  status.sections = status_pr_sections(cwd, pr, diff_text)
+  status.fancy_rows = {}
+  status_render_loaded(buf, nil, nil, { reuse_sections = true }, status.head_lines, status.sections)
+end
+
+---@param pr DiffReviewGhPR
+---@param cwd string
+---@param buf integer
+local function load_pr_diff(pr, cwd, buf)
+  local status = M._status
+  if not (status and status.buf == buf) then return end
+  status.pr_diff_request_id = (status.pr_diff_request_id or 0) + 1
+  local request_id = status.pr_diff_request_id
+  gh.pr_diff_async(cwd, pr.number, pr.repo, function(result)
+    local latest_status = M._status_states and M._status_states[buf] or nil
+    if not (
+      latest_status
+      and latest_status.pr_diff_request_id == request_id
+      and latest_status.buf == buf
+      and vim.api.nvim_buf_is_valid(buf)
+    ) then return end
+    M._status = latest_status
+    if result.code ~= 0 then
+      notify_error("GitHub PR diff failed: " .. (result.output ~= "" and result.output or ("gh exited " .. result.code)), "DiffReview")
+      return
+    end
+    render_pr_status(pr, cwd, buf, result.stdout or "")
+  end)
 end
 
 ---@param target_id? string
@@ -5040,6 +5356,7 @@ end
 ---@param entries DiffReviewStatusEntry[]
 ---@param target_id? string
 local function status_discard_entries(entries, target_id)
+  local status_buf = M._status and M._status.buf
   git_root_async(function(cwd, root_err)
     if not cwd then
       notify_error(root_err or "Unable to find git root")
@@ -5051,7 +5368,7 @@ local function status_discard_entries(entries, target_id)
 
     local function finish_all()
       if #failures > 0 then M.notify_git_failures("Discard failed", failures) end
-      refresh_status_after_action(M._status.buf, target_id)
+      refresh_status_after_action(status_buf, target_id)
     end
 
     local function discard_at(index)
@@ -5210,7 +5527,7 @@ local function status_open_pr(entry)
     vim.notify(message, vim.log.levels.INFO, { title = "DiffReview" })
     return
   end
-  require("diff_review.pr_view").open(pr, { cwd = M._status and M._status.cwd or nil })
+  M.open_pr(pr, { cwd = M._status and M._status.cwd or nil })
 end
 
 ---@param entry DiffReviewStatusEntry?
@@ -5274,7 +5591,7 @@ end
 local function status_toggle(entry)
   if not entry then return end
   local default = false
-  if entry.kind == "file" then
+  if entry.kind == "file" or entry.kind == "pr_file" then
     default = true
   elseif entry.kind == "commit" or entry.kind == "commit_file" then
     default = true
@@ -5336,10 +5653,13 @@ local function status_open_popup(title, lines)
 
   local key_width = 0
   for _, spec in ipairs(status_command_specs) do
-    key_width = math.max(key_width, #status_key_text(status_keys_for(spec.id)))
+    if status_command_visible(spec) then
+      key_width = math.max(key_width, #status_key_text(status_keys_for(spec.id)))
+    end
   end
   local line_index = 0
   for _, spec in ipairs(status_command_specs) do
+    if not status_command_visible(spec) then goto continue end
     local key_text = status_key_text(status_keys_for(spec.id))
     if key_text ~= "" then
       line_index = line_index + 1
@@ -5354,6 +5674,7 @@ local function status_open_popup(title, lines)
         priority = 80,
       })
     end
+    ::continue::
   end
 
   return buf
@@ -5362,15 +5683,19 @@ end
 local function status_show_help()
   local key_width = 0
   for _, spec in ipairs(status_command_specs) do
-    key_width = math.max(key_width, #status_key_text(status_keys_for(spec.id)))
+    if status_command_visible(spec) then
+      key_width = math.max(key_width, #status_key_text(status_keys_for(spec.id)))
+    end
   end
 
   local lines = {}
   for _, spec in ipairs(status_command_specs) do
+    if not status_command_visible(spec) then goto continue end
     local key_text = status_key_text(status_keys_for(spec.id))
     if key_text ~= "" then
       lines[#lines + 1] = ("  %-" .. key_width .. "s  %s"):format(key_text, spec.desc)
     end
+    ::continue::
   end
   status_open_popup("DiffReview Commands", lines)
 end
@@ -5419,21 +5744,39 @@ end
 local function setup_status_keymaps(buf)
   local opts = { buffer = buf, silent = true, nowait = true }
   local function map(command_id, mode, callback, desc)
+    local spec = status_command_specs_by_id[command_id]
+    if spec and not status_command_visible(spec) then return end
     for _, key in ipairs(status_keys_for(command_id)) do
-      vim.keymap.set(mode, key, callback, vim.tbl_extend("force", opts, {
-        desc = desc or (status_command_specs_by_id[command_id] and status_command_specs_by_id[command_id].desc) or command_id,
+      vim.keymap.set(mode, key, function(...)
+        if M._status_states and M._status_states[buf] then M._status = M._status_states[buf] end
+        callback(...)
+      end, vim.tbl_extend("force", opts, {
+        desc = desc or (spec and spec.desc) or command_id,
       }))
     end
   end
+  local is_pr_view = M._status and M._status.view_kind == "pr"
 
   map("close", "n", function()
+    local state = M._status_states and M._status_states[buf] or M._status
     if vim.api.nvim_buf_is_valid(buf) then
       pcall(vim.api.nvim_buf_delete, buf, { force = true })
     end
-    M._status = nil
+    if M._status_states then M._status_states[buf] = nil end
+    if M._main_status == state then M._main_status = nil end
+    if M._status == state then M._status = M._main_status end
   end)
 
   map("refresh", "n", function()
+    if is_pr_view then
+      local status = M._status_states and M._status_states[buf] or M._status
+      if status and status.pr and status.cwd then
+        M._status = status
+        render_pr_status(status.pr, status.cwd, buf)
+        load_pr_diff(status.pr, status.cwd, buf)
+      end
+      return
+    end
     if M._status then
       M._status.pr = nil
       M._status.about = nil
@@ -5445,8 +5788,32 @@ local function setup_status_keymaps(buf)
   end)
 
   map("toggle", "n", function()
+    if M._status_states and M._status_states[buf] then M._status = M._status_states[buf] end
     status_toggle(status_entry_under_cursor())
   end)
+
+  if is_pr_view then
+    map("browse", "n", function()
+      local status = M._status_states and M._status_states[buf] or M._status
+      local pr = status and status.pr
+      if not gh.browse_pr(pr) then
+        notify_error("Unable to open PR URL", "DiffReview")
+      end
+    end)
+    map("open", "n", function()
+      if M._status_states and M._status_states[buf] then M._status = M._status_states[buf] end
+      status_jump(status_entry_under_cursor())
+    end, "Jump to file")
+    map("help", "n", status_show_help)
+    vim.api.nvim_create_autocmd("CursorMoved", {
+      buffer = buf,
+      callback = function()
+        if M._status_states and M._status_states[buf] then M._status = M._status_states[buf] end
+        status_prewarm_entry_syntax(status_entry_under_cursor())
+      end,
+    })
+    return
+  end
 
   map("stage", "n", function()
     status_stage(status_entry_under_cursor())
@@ -5518,6 +5885,82 @@ local function setup_status_keymaps(buf)
   })
 end
 
+---@class DiffReviewOpenPROptions
+---@field cwd? string
+---@field repo? string
+
+---@param pr DiffReviewGhPR
+---@param opts? DiffReviewOpenPROptions
+---@return integer? buf
+function M.open_pr(pr, opts)
+  opts = opts or {}
+  if not pr then return nil end
+  setup_bg_highlights()
+
+  if (not pr.repo or pr.repo == "") and opts.repo and opts.repo ~= "" then
+    pr = vim.tbl_extend("force", vim.deepcopy(pr), { repo = opts.repo })
+  end
+  local cwd = opts.cwd or (M._status and M._status.cwd) or vim.fn.getcwd()
+  local buf = vim.api.nvim_create_buf(true, false)
+  vim.bo[buf].bufhidden = "hide"
+  vim.bo[buf].buftype = "nofile"
+  vim.bo[buf].swapfile = false
+  vim.bo[buf].filetype = "DiffReviewStatus"
+  local options = M.config or config.options or config.defaults
+  local name = ("%s://%s"):format(options.pr_buffer_name, pr.number or "current")
+  if pr.repo and pr.repo ~= "" then name = ("%s/%s"):format(name, pr.repo:gsub("/", "%%2F")) end
+  if not pcall(vim.api.nvim_buf_set_name, buf, name) then
+    pcall(vim.api.nvim_buf_set_name, buf, name .. "#" .. buf)
+  end
+
+  local state = {
+    view_kind = "pr",
+    buf = buf,
+    cwd = cwd,
+    pr = pr,
+    folds = {},
+    lines = {},
+    entries = {},
+    highlights = {},
+    line_highlights = {},
+    extmarks = {},
+    boundary_lines = {},
+    sections = nil,
+    fancy_rows = {},
+  }
+  M._status = state
+  attach_status_state(buf, state)
+  setup_status_keymaps(buf)
+
+  local win = vim.api.nvim_get_current_win()
+  local ok, err = pcall(vim.api.nvim_win_set_buf, win, buf)
+  if not ok then
+    notify_error("DiffReview PR open failed: " .. tostring(err))
+    return nil
+  end
+  vim.wo[win].number = false
+  vim.wo[win].relativenumber = false
+  vim.wo[win].foldcolumn = "0"
+
+  render_pr_status(pr, cwd, buf)
+  load_pr_diff(pr, cwd, buf)
+  return buf
+end
+
+---@param number integer|string
+---@param opts? DiffReviewOpenPROptions
+function M.open_pr_number(number, opts)
+  opts = opts or {}
+  local cwd = opts.cwd or vim.fn.getcwd()
+  gh.pr_async(cwd, number, opts.repo, function(result)
+    if not result.ok or not result.pr then
+      notify_error(result.message or "Unable to load GitHub pull request", "DiffReview")
+      return
+    end
+    M.open_pr(result.pr, { cwd = cwd, repo = opts.repo })
+  end)
+end
+
 --- Open a standalone, Neogit-style DiffReview status buffer.
 function M.open()
   setup_bg_highlights()
@@ -5529,7 +5972,8 @@ function M.open()
     vim.bo[buf].swapfile = false
     vim.bo[buf].filetype = "DiffReviewStatus"
     pcall(vim.api.nvim_buf_set_name, buf, (M.config or config.options).status_buffer_name)
-    M._status = {
+    M._main_status = {
+      view_kind = "status",
       buf = buf,
       folds = {},
       lines = {},
@@ -5541,7 +5985,12 @@ function M.open()
       sections = nil,
       fancy_rows = {},
     }
+    M._status = M._main_status
+    attach_status_state(buf, M._main_status)
     setup_status_keymaps(buf)
+  else
+    M._main_status = M._status_states and M._status_states[buf] or M._main_status or M._status
+    M._status = M._main_status
   end
 
   local win = vim.api.nvim_get_current_win()
