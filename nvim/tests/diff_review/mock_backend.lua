@@ -264,9 +264,19 @@ local function run()
     original_compute_diff_syntax_async(filename, lines_for_syntax, cb)
   end
   diff_review.setup()
+  vim.wo.number = true
+  vim.wo.relativenumber = true
   diff_review.open()
   local buf = vim.api.nvim_get_current_buf()
   assert_true(vim.bo[buf].filetype == "DiffReviewStatus", "DiffReviewStatus buffer did not open")
+  assert_true(not vim.wo.number and not vim.wo.relativenumber, "DiffReviewStatus should hide line numbers")
+
+  local real_buf = vim.api.nvim_create_buf(true, false)
+  vim.bo[real_buf].filetype = "lua"
+  vim.api.nvim_win_set_buf(0, real_buf)
+  assert_true(vim.wo.number and vim.wo.relativenumber, "leaving DiffReviewStatus should restore line numbers")
+  vim.api.nvim_win_set_buf(0, buf)
+  assert_true(not vim.wo.number and not vim.wo.relativenumber, "re-entering DiffReviewStatus should hide line numbers")
 
   local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
   assert_true(contains_line(lines, "Loading DiffReview..."), "DiffReview did not render a loading state before async data completed")

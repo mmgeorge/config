@@ -220,7 +220,7 @@ local function build_context(branch, base_ref, commits)
   local truncated_commits, commits_truncated = truncate_at_line(commits, pr_context_limit)
   local sections = {
     "Generate metadata for a draft GitHub PR.",
-    "Base branch: " .. base_branch,
+    "Base branch: " .. base_ref:gsub("^origin/", ""),
     "Comparison ref used for commit messages: " .. base_ref,
     "Head branch: " .. branch,
   }
@@ -231,6 +231,146 @@ local function build_context(branch, base_ref, commits)
 
   table.insert(sections, "Commit messages:\n```text\n" .. truncated_commits .. "\n```")
   return table.concat(sections, "\n\n")
+end
+
+---@param raw_branch string
+---@return string?
+local function normalized_base_branch(raw_branch)
+  local branch = vim.trim(raw_branch)
+  branch = branch:gsub("^remotes/", ""):gsub("^origin/", "")
+  if branch == "" or branch == "HEAD" or branch:match("^HEAD%s*%->") then
+    return nil
+  end
+  return branch
+end
+
+---@param output string
+---@param current_branch string
+---@return string[]
+local function parse_base_branches(output, current_branch)
+  local seen = {}
+  local branches = {}
+
+  for line in output:gmatch("[^\r\n]+") do
+    local branch = normalized_base_branch(line)
+    if branch and branch ~= current_branch and not seen[branch] then
+      seen[branch] = true
+      branches[#branches + 1] = branch
+    end
+  end
+
+  table.sort(branches)
+  return branches
+end
+
+---@param lines string[]
+---@param on_yes fun()
+---@param on_no fun()
+local function confirm(lines, on_yes, on_no)
+  local body = vim.list_extend({}, lines)
+  body[#body + 1] = ""
+  body[#body + 1] = "  [y] yes    [n] no"
+  local width = 32
+  for _, line in ipairs(body) do
+    width = math.max(width, #line + 4)
+  end
+
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, body)
+  vim.bo[buf].modifiable = false
+  vim.bo[buf].bufhidden = "wipe"
+
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative = "editor",
+    width = width,
+    height = #body,
+    col = math.floor((vim.o.columns - width) / 2),
+    row = math.floor((vim.o.lines - #body) / 2),
+    style = "minimal",
+    border = "rounded",
+    title = " GithubOpenPR ",
+    title_pos = "center",
+  })
+
+  local function close()
+    if vim.api.nvim_win_is_valid(win) then pcall(vim.api.nvim_win_close, win, true) end
+  end
+
+  vim.keymap.set("n", "y", function()
+    close()
+    on_yes()
+  end, { buffer = buf, nowait = true, silent = true, desc = "Use base branch" })
+
+  vim.keymap.set("n", "n", function()
+    close()
+    on_no()
+  end, { buffer = buf, nowait = true, silent = true, desc = "Select base branch" })
+
+  for _, key in ipairs({ "q", "<Esc>" }) do
+    vim.keymap.set("n", key, close, { buffer = buf, nowait = true, silent = true, desc = "Cancel PR creation" })
+  end
+end
+
+---@param branches string[]
+---@param callback fun(branch: string?)
+local function pick_base_branch(branches, callback)
+  if #branches == 0 then
+    notify("No base branches available to select", "warn")
+    callback(nil)
+    return
+  end
+
+  if _G.Snacks and Snacks.picker and type(Snacks.picker.pick) == "function" then
+    Snacks.picker.pick({
+      title = "Select PR base branch",
+      items = vim.tbl_map(function(branch)
+        return {
+          text = branch,
+          branch = branch,
+        }
+      end, branches),
+      format = function(item)
+        return {
+          { item.text, item.branch == base_branch and "Function" or "Identifier" },
+        }
+      end,
+      confirm = function(picker, item)
+        if picker and picker.close then picker:close() end
+        callback(item and item.branch or nil)
+      end,
+    })
+    return
+  end
+
+  vim.ui.select(branches, {
+    prompt = "Select PR base branch",
+  }, callback)
+end
+
+---@param cwd string
+---@param current_branch string
+---@param callback fun(branch: string?)
+local function choose_base_branch(cwd, current_branch, callback)
+  confirm({ "Base: " .. base_branch }, function()
+    callback(base_branch)
+  end, function()
+    git({ "branch", "--list", "--all", "--format=%(refname:short)" }, cwd, function(output, branches_err)
+      if branches_err then
+        fail_progress("Could not list base branches: " .. branches_err)
+        callback(nil)
+        return
+      end
+
+      pick_base_branch(parse_base_branches(output, current_branch), function(selected)
+        if not selected or selected == "" then
+          return callback(nil)
+        end
+
+        base_branch = selected
+        callback(base_branch)
+      end)
+    end)
+  end)
 end
 
 local function generate_metadata(context, callback)
@@ -280,7 +420,7 @@ local function push_branch(cwd, branch, callback)
   end)
 end
 
-local function create_pr(cwd, branch, metadata)
+local function create_pr(cwd, branch, selected_base_branch, metadata)
   show_progress("Creating draft PR...")
   run({
     "gh",
@@ -288,7 +428,7 @@ local function create_pr(cwd, branch, metadata)
     "create",
     "--draft",
     "--base",
-    base_branch,
+    selected_base_branch,
     "--head",
     branch,
     "--title",
@@ -339,45 +479,59 @@ function M.open()
         fail_progress("Cannot create a PR from a detached HEAD")
         return
       end
-      if branch == base_branch then
-        fail_progress("Cannot create a PR from " .. base_branch)
-        return
-      end
 
-      git({ "rev-parse", "--verify", "origin/" .. base_branch }, cwd, function(_, origin_err)
-        local base_ref = origin_err and base_branch or "origin/" .. base_branch
-        git({ "log", "--reverse", "--format=%h %s%n%b%n---END-COMMIT---", base_ref .. "..HEAD" }, cwd,
-          function(commits, commits_err)
-            if commits_err then
-              fail_progress("Could not read PR commit messages: " .. commits_err)
-              return
-            end
+      choose_base_branch(cwd, branch, function(selected_base_branch)
+        if not selected_base_branch then return end
 
-            if vim.trim(commits) == "" then
-              stop_progress()
-              notify("No commits found on " .. branch .. " compared with " .. base_ref, "warn")
-              return
-            end
+        if branch == selected_base_branch then
+          fail_progress("Cannot create a PR from " .. selected_base_branch)
+          return
+        end
 
-            generate_metadata(build_context(branch, base_ref, commits), function(metadata, metadata_err)
-              if metadata_err then
-                fail_progress("Failed to generate PR metadata: " .. metadata_err)
+        git({ "rev-parse", "--verify", "origin/" .. selected_base_branch }, cwd, function(_, origin_err)
+          local base_ref = origin_err and selected_base_branch or "origin/" .. selected_base_branch
+          git({ "log", "--reverse", "--format=%h %s%n%b%n---END-COMMIT---", base_ref .. "..HEAD" }, cwd,
+            function(commits, commits_err)
+              if commits_err then
+                fail_progress("Could not read PR commit messages: " .. commits_err)
                 return
               end
 
-              push_branch(cwd, branch, function(_, push_err)
-                if push_err then
-                  fail_progress("Failed to push branch: " .. push_err)
+              if vim.trim(commits) == "" then
+                stop_progress()
+                notify("No commits found on " .. branch .. " compared with " .. base_ref, "warn")
+                return
+              end
+
+              generate_metadata(build_context(branch, base_ref, commits), function(metadata, metadata_err)
+                if metadata_err then
+                  fail_progress("Failed to generate PR metadata: " .. metadata_err)
                   return
                 end
 
-                create_pr(cwd, branch, metadata)
+                push_branch(cwd, branch, function(_, push_err)
+                  if push_err then
+                    fail_progress("Failed to push branch: " .. push_err)
+                    return
+                  end
+
+                  create_pr(cwd, branch, selected_base_branch, metadata)
+                end)
               end)
             end)
-          end)
+        end)
       end)
     end)
   end)
 end
+
+M._parse_base_branches_for_test = parse_base_branches
+M._set_base_branch_for_test = function(branch)
+  base_branch = branch
+end
+M._get_base_branch_for_test = function()
+  return base_branch
+end
+M._choose_base_branch_for_test = choose_base_branch
 
 return M

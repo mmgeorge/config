@@ -151,11 +151,21 @@ function M.editor(target, client_addr)
     finished = true
     if M._active then M._active.aborted = abort end
     if not abort and vim.api.nvim_buf_is_valid(buf) then
-      vim.api.nvim_buf_call(buf, function() vim.cmd("silent! write") end)
+      local ok, err = pcall(vim.api.nvim_buf_call, buf, function() vim.cmd("silent write") end)
+      if not ok then
+        finished = false
+        vim.notify("Failed to write commit message: " .. tostring(err), vim.log.levels.ERROR, { title = "DiffReview commit" })
+        return
+      end
+    end
+    if not abort and st.console and vim.api.nvim_buf_is_valid(st.console) and vim.api.nvim_win_is_valid(st.win) then
+      vim.api.nvim_win_set_buf(st.win, st.console)
+      append(st.console, { "Finalizing commit..." })
+      winbar(st.win, " Committing... ")
     end
     signal(abort)
-    -- The window keeps the message buffer until git exits and M._finish hands
-    -- it back to the preview.
+    -- Git still owns the process lifetime; M._finish hands the window back to
+    -- the preview when hooks/commit finalization finish.
   end
 
   local map = { buffer = buf, nowait = true, silent = true }

@@ -157,7 +157,7 @@
 ---@field _ts_diff_syntax_cache table<string, DiffReviewTreeSitterSyntax|false|DiffReviewTreeSitterSyntaxPending>?
 ---@field _ts_source_bufs table<string, integer>?
 ---@field _main_win integer?
----@field _saved_wo table?
+---@field _saved_wo table<integer, { number: boolean, relativenumber: boolean }>?
 ---@field suspend_preview boolean?
 
 ---@type DiffReviewModule
@@ -1552,6 +1552,29 @@ end
 -- Cache for treesitter context per file (cleared on refresh)
 M._ts_context_cache = {}
 M._ts_source_bufs = {}
+
+---@param win integer?
+function M._hide_line_numbers(win)
+  if not (win and vim.api.nvim_win_is_valid(win)) then return end
+  M._saved_wo = M._saved_wo or {}
+  if not M._saved_wo[win] then
+    M._saved_wo[win] = {
+      number = vim.wo[win].number,
+      relativenumber = vim.wo[win].relativenumber,
+    }
+  end
+  vim.wo[win].number = false
+  vim.wo[win].relativenumber = false
+end
+
+---@param win integer?
+function M._restore_line_numbers(win)
+  if not (win and vim.api.nvim_win_is_valid(win) and M._saved_wo and M._saved_wo[win]) then return end
+  local saved = M._saved_wo[win]
+  vim.wo[win].number = saved.number
+  vim.wo[win].relativenumber = saved.relativenumber
+  M._saved_wo[win] = nil
+end
 
 ---@param opts? DiffReviewConfig
 function M.setup(opts)
@@ -3060,6 +3083,13 @@ local function attach_status_state(buf, state)
     callback = function()
       local current = M._status_states and M._status_states[buf] or nil
       if current then M._status = current end
+      M._hide_line_numbers(vim.api.nvim_get_current_win())
+    end,
+  })
+  vim.api.nvim_create_autocmd("BufLeave", {
+    buffer = buf,
+    callback = function()
+      M._restore_line_numbers(vim.api.nvim_get_current_win())
     end,
   })
   vim.api.nvim_create_autocmd("BufWipeout", {
@@ -5938,8 +5968,7 @@ function M.open_pr(pr, opts)
     notify_error("DiffReview PR open failed: " .. tostring(err))
     return nil
   end
-  vim.wo[win].number = false
-  vim.wo[win].relativenumber = false
+  M._hide_line_numbers(win)
   vim.wo[win].foldcolumn = "0"
 
   render_pr_status(pr, cwd, buf)
@@ -5999,8 +6028,7 @@ function M.open()
     notify_error("DiffReview open failed: " .. tostring(err))
     return
   end
-  vim.wo[win].number = false
-  vim.wo[win].relativenumber = false
+  M._hide_line_numbers(win)
   vim.wo[win].foldcolumn = "0"
   render_status_or_notify(buf)
 end

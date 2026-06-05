@@ -359,6 +359,9 @@ local function run()
 
   local commit_host_buf = vim.api.nvim_get_current_buf()
   local commit_console = vim.api.nvim_create_buf(false, true)
+  local commit_tmp = vim.fn.tempname()
+  vim.fn.mkdir(commit_tmp, "p")
+  local commit_editmsg = commit_tmp .. "/COMMIT_EDITMSG"
   local saw_unmarked_editmsg = false
   local mark_group = vim.api.nvim_create_augroup("DiffReviewCommitBufferMarkTest", { clear = true })
   vim.api.nvim_create_autocmd({ "BufReadPost", "BufEnter" }, {
@@ -378,7 +381,7 @@ local function run()
     root = root,
   }
   reset_notifications()
-  commit.editor(root .. "/.git/COMMIT_EDITMSG", "")
+  commit.editor(commit_editmsg, "")
   local editmsg_buf = vim.api.nvim_get_current_buf()
   pcall(vim.api.nvim_del_augroup_by_id, mark_group)
   assert_true(not saw_unmarked_editmsg, "DiffReview commit buffer was visible to autocmds before AI opt-out marks")
@@ -388,8 +391,13 @@ local function run()
   assert_true(#notifications == 0, "ready About message should not notify when entering commit editor")
   assert_true(vim.b[editmsg_buf].ai_commit_generated == true, "DiffReview commit buffer did not suppress global AI commit autocmd")
   assert_true(vim.b[editmsg_buf].diff_review_commit_buffer == true, "DiffReview commit buffer did not set its opt-out marker")
+  local submit_mapping = vim.fn.maparg("<C-c><C-c>", "n", false, true)
+  assert_true(type(submit_mapping.callback) == "function", "commit submit mapping missing")
+  submit_mapping.callback()
+  assert_true(vim.api.nvim_get_current_buf() == commit_console, "commit submit did not immediately return to console")
+  assert_true(buffer_contains(commit_console, "Finalizing commit..."), "commit console did not show finalizing state")
   commit._active = nil
-  vim.bo[editmsg_buf].modified = false
+  if vim.api.nvim_buf_is_valid(editmsg_buf) then vim.bo[editmsg_buf].modified = false end
   vim.api.nvim_win_set_buf(0, commit_host_buf)
   if vim.api.nvim_buf_is_valid(editmsg_buf) then
     vim.api.nvim_buf_delete(editmsg_buf, { force = true })
@@ -397,6 +405,7 @@ local function run()
   if vim.api.nvim_buf_is_valid(commit_console) then
     vim.api.nvim_buf_delete(commit_console, { force = true })
   end
+  vim.fn.delete(commit_tmp, "rf")
 
   trigger_normal_mapping("<CR>", find_row(status_buf, "About:"))
   local about_buf = vim.api.nvim_get_current_buf()
