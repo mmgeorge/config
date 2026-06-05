@@ -5868,7 +5868,7 @@ local function status_remote_action(buf, action)
       end
     end
     notify_debug(title .. "ing changes...", vim.log.levels.INFO, { title = "DiffReview" })
-    system_text_stream_async({ "git", "-C", cwd, action }, nil, update_remote_status, function(result)
+    system_text_stream_async({ "git", "-C", cwd, action, "--progress" }, nil, update_remote_status, function(result)
       local compact = {}
       for _, line in ipairs(text_to_lines((result.stdout or "") .. (result.stderr or ""))) do
         if line ~= "" then

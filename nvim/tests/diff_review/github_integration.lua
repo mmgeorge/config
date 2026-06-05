@@ -81,13 +81,13 @@ end
 function git_backend.system(command, input)
   record("system", command, input)
   local key = command_key(command)
-  if key == "git\t-C\t" .. root .. "\tpush" then return "", 0 end
-  if key == "git\t-C\t" .. root .. "\tpull" then return "", 0 end
+  if key == "git\t-C\t" .. root .. "\tpush\t--progress" then return "", 0 end
+  if key == "git\t-C\t" .. root .. "\tpull\t--progress" then return "", 0 end
   return "unexpected command: " .. key, 1
 end
 
 function git_backend.system_async(command, input, cb)
-  if command_key(command) == "git\t-C\t" .. root .. "\tpush" and hold_push then
+  if command_key(command) == "git\t-C\t" .. root .. "\tpush\t--progress" and hold_push then
     local output, code = git_backend.system(command, input)
     release_push = function()
       cb({
@@ -112,7 +112,7 @@ function git_backend.system_async(command, input, cb)
 end
 
 function git_backend.system_stream_async(command, input, on_line, cb)
-  if command_key(command) == "git\t-C\t" .. root .. "\tpush" and hold_push then
+  if command_key(command) == "git\t-C\t" .. root .. "\tpush\t--progress" and hold_push then
     local output, code = git_backend.system(command, input)
     on_line("Enumerating objects: 3, done.")
     release_push = function()
@@ -495,7 +495,7 @@ local function run()
   end, "push did not render streamed git output")
   wait_for(function()
     for _, call in ipairs(calls) do
-      if call.kind == "system" and call.key == "git\t-C\t" .. root .. "\tpush" then return true end
+      if call.kind == "system" and call.key == "git\t-C\t" .. root .. "\tpush\t--progress" then return true end
     end
     return false
   end, "push command did not run")
@@ -512,7 +512,7 @@ local function run()
   trigger_normal_mapping("opP", find_row(status_buf, "Head:"))
   wait_for(function()
     for _, call in ipairs(calls) do
-      if call.kind == "system" and call.key == "git\t-C\t" .. root .. "\tpull" then return true end
+      if call.kind == "system" and call.key == "git\t-C\t" .. root .. "\tpull\t--progress" then return true end
     end
     return false
   end, "pull command did not run")
