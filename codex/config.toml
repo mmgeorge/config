@@ -1,6 +1,8 @@
-model = "gpt-5.4-mini"
-model_reasoning_effort = "low"
+model = "gpt-5.5"
+model_reasoning_effort = "medium"
 model_reasoning_summary = "detailed"
+model_context_window = 400000
+model_auto_compact_token_limit = 300000
 show_raw_agent_reasoning = true
 hide_agent_reasoning = false
 personality = "pragmatic"
@@ -83,35 +85,12 @@ default_tools_approval_mode = "approve"
 [mcp_servers.github]
 command = "github-mcp-server"
 args = ["stdio", "--toolsets=context,actions,discussions,issues,labels,notifications,orgs,projects,pull_requests,repos,users"]
-default_tools_approval_mode = "approve"
 env_vars = ["GITHUB_PERSONAL_ACCESS_TOKEN"]
-
-[mcp_servers.hf-mcp-server]
-url = "https://huggingface.co/mcp?login"
 default_tools_approval_mode = "approve"
 
 [mcp_servers.openaiDeveloperDocs]
 url = "https://developers.openai.com/mcp"
 default_tools_approval_mode = "approve"
-
-[mcp_servers.node_repl]
-args = []
-command = 'C:\Users\mattm\AppData\Local\OpenAI\Codex\bin\34ab3e1324cc55b5\node_repl.exe'
-startup_timeout_sec = 120
-default_tools_approval_mode = "approve"
-
-[mcp_servers.node_repl.env]
-NODE_REPL_NATIVE_PIPE_CONNECT_TIMEOUT_MS = "1000"
-NODE_REPL_NODE_MODULE_DIRS = ""
-NODE_REPL_NODE_PATH = 'C:\Users\mattm\AppData\Local\OpenAI\Codex\bin\5b9024f90663758b\node.exe'
-NODE_REPL_TRUSTED_CODE_PATHS = 'D:\config\codex'
-CODEX_HOME = 'D:\config\codex'
-NODE_REPL_TRUSTED_BROWSER_CLIENT_SHA256S = "0b0d41e7a14a4903d2f95b0b3f427ed796b12c8edca2fa392a03df43997075ae,e13c388c2427308a68dffc803e1f28316077b719672e4518a621ae6ab56ad7cf"
-BROWSER_USE_AVAILABLE_BACKENDS = "chrome,iab"
-NODE_REPL_INSTRUCTIONS_USE_CASE_BROWSER = "Control the in-app browser in conjunction with the Browser Plugin."
-NODE_REPL_INSTRUCTIONS_USE_CASE_CHROME = "Control the Chrome browser in conjunction with the Chrome Plugin. Prefer this method of controlling Chrome over alternatives (such as Computer Use) unless the user explicitly mentions an alternative."
-BROWSER_USE_CODEX_APP_BUILD_FLAVOR = "prod"
-CODEX_CLI_PATH = 'C:\Users\mattm\AppData\Local\OpenAI\Codex\bin\7dea4a003bc76627\codex.exe'
 
 [windows]
 sandbox = "elevated"

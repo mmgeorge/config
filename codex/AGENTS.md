@@ -5,6 +5,16 @@
 - If instructions are ambiguous or equally viable paths exist, stop and ask.
 - When asked a question, answer it — don't automatically start writing code.
 
+# Subagent Research Workflow
+- Codex only spawns subagents when the user explicitly asks for subagents, delegation, or parallel agent work. Do not treat "be thorough", "research", or "look into this" as automatic permission to spawn.
+- When subagents are requested, prefer explore agents for broad, noisy, read-heavy discovery that would otherwise pollute the main agent's context: unfamiliar local subsystems, remote repositories, crate/API docs, examples, issues, PRs, logs, or independent risk scans.
+- Use the built-in `explorer` agent for local codebase exploration. Use `remote-code-explorer` for remote source, external library, GitHub, docs, examples, issues, or PR research when that custom agent is available.
+- Do not spawn explore agents for tiny lookups, single-file reads, tightly coupled debugging, direct implementation work, or the next critical-path step when the main agent is blocked on the answer. Do that work locally.
+- Before delegating, decide the immediate local task and keep working on non-overlapping work while subagents run. Do not duplicate a subagent's assignment in the main thread.
+- Make each delegated exploration task concrete and bounded. Include the target, the question to answer, desired thoroughness (`quick`, `medium`, or `thorough`), and the expected output format.
+- Ask explore agents to return compact evidence-backed findings with exact file paths, symbols, URLs, and gaps. The main agent owns synthesis, decisions, edits, and verification.
+- Spawn multiple explore agents in parallel only when the questions are independent, such as local architecture discovery plus remote API examples plus current docs. Avoid repeated fan-out on the same unresolved question.
+
 # Planning
 
 When creating a plan, use this template. Output each section in order:
