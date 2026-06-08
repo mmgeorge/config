@@ -37,6 +37,19 @@ local diff_text = table.concat({
   "-    let writer = LOG_WRITER.get_or_init(|| SwappableWriter::new(open_log()));",
   "+    let writer = LOG_WRITER.get_or_int(|| SwappableWriter::new(open_log()));",
   "   }",
+  "diff --git a/src/tangent.rs b/src/tangent.rs",
+  "index 3333333..4444444 100644",
+  "--- a/src/tangent.rs",
+  "+++ b/src/tangent.rs",
+  "@@ -1,4 +1,8 @@",
+  " pub fn normalize(value: f32, length: f32) -> f32 {",
+  "   return value / length;",
+  " }",
+  " ",
+  "+pub struct TangentBasis {",
+  "+  pub tangent0: Vec3,",
+  "+  pub tangent1: Vec3,",
+  "+}",
 }, "\n")
 
 ---@type DiffReviewGitBackend
@@ -52,7 +65,7 @@ function backend.systemlist(command)
   if key:find("@{upstream}", 1, true) or key:find("@{push}", 1, true) then return {}, 1 end
   if key == "git\t-C\t" .. root .. "\tls-files\t--others\t--exclude-standard" then return {}, 0 end
   if key == "git\t-C\t" .. root .. "\tdiff\t--cached\t--name-status" then return {}, 0 end
-  if key == "git\t-C\t" .. root .. "\tdiff\t--name-status" then return { "M\tsrc/engine.rs" }, 0 end
+  if key == "git\t-C\t" .. root .. "\tdiff\t--name-status" then return { "M\tsrc/engine.rs", "M\tsrc/tangent.rs" }, 0 end
   if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff" then
     return vim.split(diff_text, "\n", { plain = true }), 0
   end
@@ -180,6 +193,16 @@ local function run()
     "  }",
     "}",
   }, root .. "/src/engine.rs") == 0, "writefile failed")
+  assert_true(vim.fn.writefile({
+    "pub fn normalize(value: f32, length: f32) -> f32 {",
+    "  return value / length;",
+    "}",
+    "",
+    "pub struct TangentBasis {",
+    "  pub tangent0: Vec3,",
+    "  pub tangent1: Vec3,",
+    "}",
+  }, root .. "/src/tangent.rs") == 0, "writefile failed")
   diff_review.set_git_backend(backend)
   gh.set_backend(gh_backend)
 
@@ -244,6 +267,16 @@ local function run()
   local collapsed_lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
   assert_true(contains_line(collapsed_lines, "@@ Engine.new +1 -1"), "collapsed hunk header missing")
   assert_true(not contains_line(collapsed_lines, "  pub fn new(bridge: Bridge) -> Self {"), "collapsed hunk showed opening boundary")
+
+  trigger_normal_mapping("<Tab>", find_row(buf, "tangent.rs"))
+  wait_for(function()
+    return buffer_contains(buf, "@@ TangentBasis +4 -0")
+  end, "struct hunk header did not get context label\n" .. buffer_dump(buf))
+  wait_for(function()
+    return buffer_contains(buf, "pub struct TangentBasis {")
+  end, "struct hunk did not render added scope start\n" .. buffer_dump(buf))
+  local tangent_lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  assert_true(not contains_line(tangent_lines, "return value / length;"), "struct hunk showed context from previous sibling scope\n" .. buffer_dump(buf))
 end
 
 local ok, err = xpcall(run, debug.traceback)

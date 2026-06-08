@@ -2124,6 +2124,33 @@ local function parse_hunk_body(hunk)
   return hunk
 end
 
+---@param hunk DiffReviewParsedHunk
+---@return integer
+local function hunk_first_changed_current_line(hunk)
+  local current_line = hunk.new_start
+  for _, parsed_line in ipairs(hunk.lines) do
+    if parsed_line.prefix == " " and parsed_line.new_line then
+      current_line = parsed_line.new_line + 1
+    elseif parsed_line.prefix == "+" and parsed_line.new_line then
+      return parsed_line.new_line
+    elseif parsed_line.prefix == "-" then
+      return current_line
+    end
+  end
+  return hunk.new_start
+end
+
+---@param parsed_line DiffReviewParsedHunkLine
+---@param context DiffReviewHunkTreeSitterContext|string?
+---@return boolean
+local function hunk_line_visible_in_context_scope(parsed_line, context)
+  if parsed_line.prefix ~= " " or type(context) ~= "table" then return true end
+  if not parsed_line.new_line then return true end
+  local scope_start = context.start_row + 1
+  local scope_end = context.end_row + 1
+  return parsed_line.new_line >= scope_start and parsed_line.new_line <= scope_end
+end
+
 ---@param diff_text string
 ---@return string[]
 local function diff_syntax_source_lines(diff_text)
@@ -2264,7 +2291,7 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
     for _, hunk in ipairs(block.hunks) do
       hunk_idx = hunk_idx + 1
       hunk = parse_hunk_body(hunk)
-      local hunk_line = opts.context_line or hunk.new_start or 1
+      local hunk_line = opts.context_line or hunk_first_changed_current_line(hunk)
       local callback_key = context_callback_key and context_callback_key(hunk_line)
         or ("diff-row:" .. (filename or block.file) .. ":" .. hunk_line)
       local raw_context = nil
@@ -2299,7 +2326,9 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
       end
       ret[#ret + 1] = hunk_header_row(header_parts)
       for _, parsed_line in ipairs(hunk.lines) do
-        ret[#ret + 1] = hunk_body_row(parsed_line, gutter, filename or block.file, syntax, syntax_row)
+        if hunk_line_visible_in_context_scope(parsed_line, raw_context) then
+          ret[#ret + 1] = hunk_body_row(parsed_line, gutter, filename or block.file, syntax, syntax_row)
+        end
         syntax_row = syntax_row + 1
       end
       if opts.boundary_context and type(raw_context) == "table" then
@@ -3940,7 +3969,7 @@ end
 ---@param branch string?
 ---@param cb fun(section?: DiffReviewStatusSection)
 local function status_recent_commits_section_async(cwd, upstream, branch, cb)
-  local args = { "-30" }
+  local args = { "-20" }
   if upstream and upstream ~= "" then
     args[#args + 1] = upstream
   end
@@ -3950,7 +3979,7 @@ local function status_recent_commits_section_async(cwd, upstream, branch, cb)
     args = args,
     branch = branch,
     default_folded = true,
-    limit = 30,
+    limit = 20,
   }, cb)
 end
 
