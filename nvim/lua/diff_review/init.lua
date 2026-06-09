@@ -45,7 +45,7 @@
 ---@field pos integer
 ---@field context? string
 ---@field context_text? string
----@field diff string
+---@field diff? string
 ---@field staged boolean
 ---@field added integer
 ---@field removed integer
@@ -210,11 +210,48 @@ local function loaded_file_buffer(filename)
   return buf
 end
 
+---@param lines string[]
+---@return boolean
+local function lines_contain_nul(lines)
+  for _, line in ipairs(lines) do
+    if line:find("\0", 1, true) then return true end
+  end
+  return false
+end
+
+---@param filename string
+---@return boolean
+local function file_contains_nul(filename)
+  local uv = vim.uv or vim.loop
+  local fd = uv.fs_open(filename, "r", 438)
+  if not fd then return false end
+
+  local offset = 0
+  local chunk_size = 65536
+  while true do
+    local data = uv.fs_read(fd, chunk_size, offset)
+    if not data or data == "" then break end
+    if data:find("\0", 1, true) then
+      uv.fs_close(fd)
+      return true
+    end
+    offset = offset + #data
+    if #data < chunk_size then break end
+  end
+
+  uv.fs_close(fd)
+  return false
+end
+
 ---@param filename string
 ---@return integer?
 local function treesitter_source_buffer(filename)
   local loaded = loaded_file_buffer(filename)
-  if loaded then return loaded end
+  if file_contains_nul(filename) then return nil end
+  if loaded then
+    if vim.bo[loaded].binary then return nil end
+    return loaded
+  end
 
   M._ts_source_bufs = M._ts_source_bufs or {}
   local cached = M._ts_source_bufs[filename]
@@ -222,6 +259,7 @@ local function treesitter_source_buffer(filename)
 
   local read_ok, lines = pcall(vim.fn.readfile, filename)
   if not read_ok or type(lines) ~= "table" then return nil end
+  if lines_contain_nul(lines) then return nil end
 
   local buf = vim.api.nvim_create_buf(false, true)
   vim.bo[buf].bufhidden = "wipe"
@@ -1187,16 +1225,14 @@ end
 ---@param relpath string path relative to the git root (forward slashes)
 ---@return string? diff_text
 local function build_untracked_diff(filename, relpath)
+  if file_contains_nul(filename) then return nil end
+
   local ok, lines = pcall(vim.fn.readfile, filename)
   if not ok or type(lines) ~= "table" or #lines == 0 then
     return nil
   end
   -- Skip binary files (a NUL byte in any line).
-  for _, line in ipairs(lines) do
-    if line:find("\0", 1, true) then
-      return nil
-    end
-  end
+  if lines_contain_nul(lines) then return nil end
   local out = {
     "diff --git a/" .. relpath .. " b/" .. relpath,
     "new file mode 100644",
@@ -1820,7 +1856,7 @@ local function collect_items_from_git(cwd, cb, _ctx)
     local filename = repo_file_path(cwd, hunk.file)
     -- Use treesitter scope context if available, fall back to git's @@ context
     local context_text = hunk.context or ""
-    if not (_ctx and _ctx.skip_ts_context) then
+    if hunk.diff and not (_ctx and _ctx.skip_ts_context) then
       local cached = cached_hunk_context(filename, hunk.pos, "items:" .. filename .. ":" .. hunk.pos)
       local cached_label = hunk_context_label(cached)
       if cached_label then
@@ -1907,8 +1943,8 @@ local function collect_items_from_git(cwd, cb, _ctx)
   for f, hunks in pairs(file_hunks) do
     local diffs, flags = order_file_hunks(hunks)
     local filename = repo_file_path(cwd, f)
-    M._file_diffs[filename] = table.concat(diffs, "\n")
-    M._file_hunk_staged[filename] = flags
+    M._file_diffs[filename] = #diffs > 0 and table.concat(diffs, "\n") or false
+    M._file_hunk_staged[filename] = #flags > 0 and flags or nil
   end
 
   cb(items)
@@ -3026,7 +3062,8 @@ function M._refresh_diff_buffer(buf, filename)
     M._render_with_folds(buf)
   else
     vim.bo[buf].modifiable = true
-    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "No changes" })
+    local message = diff_text == false and "No textual diff" or "No changes"
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { message })
     vim.bo[buf].modifiable = false
     M._buf_hunks[buf] = {}
     vim.api.nvim_buf_clear_namespace(buf, M._hunk_header_ns, 0, -1)
