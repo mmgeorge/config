@@ -42,6 +42,7 @@
 ---@field pr? DiffReviewGhPR
 ---@field message? string
 ---@field code? integer
+---@field unavailable? boolean
 
 ---@class DiffReviewGhModule
 ---@field _backend DiffReviewGhBackend?
@@ -175,6 +176,14 @@ local function is_no_pr_output(text)
     or normalized:find("could not find a pull request", 1, true) ~= nil
 end
 
+---@param text string
+---@return boolean
+local function is_pr_lookup_unavailable_output(text)
+  local normalized = text:lower()
+  return normalized:find("none of the git remotes configured for this repository correspond to the gh_host environment variable", 1, true) ~= nil
+    or normalized:find("try adding a matching remote or unsetting the variable", 1, true) ~= nil
+end
+
 ---@param cwd string
 ---@param cb fun(result: DiffReviewGhPRResult)
 function M.current_pr_async(cwd, cb)
@@ -183,6 +192,8 @@ function M.current_pr_async(cwd, cb)
       local output = result.output or ""
       if is_no_pr_output(output) then
         cb({ ok = true })
+      elseif is_pr_lookup_unavailable_output(output) then
+        cb({ ok = true, unavailable = true, message = output })
       else
         cb({ ok = false, message = output ~= "" and output or ("gh exited " .. result.code), code = result.code })
       end

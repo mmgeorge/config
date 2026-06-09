@@ -11,6 +11,10 @@ local calls = {}
 local opened_urls = {}
 local pr_mode = "ready"
 local pr_title = "Improve DiffReview"
+local gh_host_mismatch = table.concat({
+  "none of the git remotes configured for this repository correspond to the GH_HOST environment variable.",
+  "Try adding a matching remote or unsetting the variable",
+}, " ")
 local generated_commit = "feat: add diff review ai summary\n\nAdd generated commit metadata."
 local staged_generated_commit = "fix: update staged selection\n\nUse the staged diff."
 local has_changes = true
@@ -182,6 +186,8 @@ function gh_backend.system_async(command, _, cb, cwd)
     if key == "gh\tpr\tview\t--json\tnumber,title,body,url,headRefName,headRefOid,commits,files,changedFiles,additions,deletions" then
       if pr_mode == "none" then
         cb({ code = 1, stdout = "", stderr = "no pull requests found", output = "no pull requests found" })
+      elseif pr_mode == "unavailable" then
+        cb({ code = 1, stdout = "", stderr = gh_host_mismatch, output = gh_host_mismatch })
       else
         cb({ code = 0, stdout = pr_json(), stderr = "", output = pr_json() })
       end
@@ -479,6 +485,14 @@ local function run()
   pr_mode = "none"
   diff_review.render_status(status_buf, nil, nil, { refresh_pr = true })
   wait_for(function() return buffer_contains(status_buf, "PR:     none") end, "PR row did not render none state")
+
+  reset_notifications()
+  local count_before_unavailable = generate_count
+  pr_mode = "unavailable"
+  diff_review.render_status(status_buf, nil, nil, { refresh_pr = true })
+  wait_for(function() return buffer_contains(status_buf, "PR:     unavailable") end, "PR row did not render unavailable state")
+  assert_true(#notifications == 0, "unavailable PR lookup should not emit error notifications")
+  assert_true(generate_count == count_before_unavailable, "unavailable PR lookup should not restart AI generation")
 
   pr_mode = "ready"
   pr_title = "PR after manual refresh"

@@ -99,7 +99,7 @@
 ---@alias DiffReviewStatusViewKind "status"|"pr"
 
 ---@class DiffReviewStatusPRState
----@field state "fetching"|"ready"|"none"|"error"
+---@field state "fetching"|"ready"|"none"|"unavailable"|"error"
 ---@field pr? DiffReviewGhPR
 ---@field message? string
 
@@ -3274,6 +3274,8 @@ local function status_pr_head_line(pr_state)
     segments[#segments + 1] = { pr_state.pr.title ~= "" and pr_state.pr.title or ("PR #" .. tostring(pr_state.pr.number)), "DiffReviewStatusPR" }
   elseif pr_state.state == "error" then
     segments[#segments + 1] = { "error", "ErrorMsg" }
+  elseif pr_state.state == "unavailable" then
+    segments[#segments + 1] = { "unavailable", "Comment" }
   else
     segments[#segments + 1] = { "none", "Comment" }
   end
@@ -4972,6 +4974,8 @@ local function status_ensure_pr_state(cwd, buf, force)
 
     if result.ok and result.pr then
       latest_status.pr = { state = "ready", pr = result.pr }
+    elseif result.ok and result.unavailable then
+      latest_status.pr = { state = "unavailable", message = result.message }
     elseif result.ok then
       latest_status.pr = { state = "none" }
     else
