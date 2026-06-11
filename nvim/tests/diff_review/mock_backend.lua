@@ -263,7 +263,7 @@ local function run()
     syntax_requests = syntax_requests + 1
     original_compute_diff_syntax_async(filename, lines_for_syntax, cb)
   end
-  diff_review.setup()
+  diff_review.setup({ about_auto_generate = false })
   vim.wo.number = true
   vim.wo.relativenumber = true
   diff_review.open()

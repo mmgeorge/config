@@ -98,7 +98,7 @@ end
 local function run()
   diff_review.set_git_backend(backend)
   gh.set_backend(gh_backend)
-  diff_review.setup()
+  diff_review.setup({ about_auto_generate = false })
 
   generation = "first"
   diff_review.open()

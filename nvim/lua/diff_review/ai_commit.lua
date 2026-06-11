@@ -216,13 +216,13 @@ local function build_commit_context_async(cwd, ref, cb)
       end
 
       local stat = table.concat(stat_output or {}, "\n")
-      local diff = table.concat(diff_output or {}, "\n")
-      if vim.trim(diff) == "" then
+      diff_output = diff_output or {}
+      if #diff_output == 0 then
         cb(nil)
         return
       end
 
-      local compacted_diff, diff_compacted, diff_metrics = require("git.diff").compact(diff, compact_diff_options)
+      local compacted_diff, diff_compacted, diff_metrics = require("git.diff").compact_lines(diff_output, compact_diff_options)
       local truncated_stat, stat_truncated = truncate_at_line(stat, commit_context_limit.stat)
       local truncated_diff, diff_truncated = truncate_at_line(compacted_diff, commit_context_limit.diff)
       local truncated = stat_truncated or diff_truncated

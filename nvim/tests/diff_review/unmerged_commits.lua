@@ -215,7 +215,7 @@ end
 local function run()
   diff_review.set_git_backend(backend)
   gh.set_backend(gh_backend)
-  diff_review.setup()
+  diff_review.setup({ about_auto_generate = false })
   diff_review.open()
   local buf = vim.api.nvim_get_current_buf()
 

@@ -5187,10 +5187,12 @@ local function status_ensure_about_state(cwd, buf, has_changes, force, allow_gen
   if not allow_generation and (M.config or config.options or config.defaults).about_auto_generate == false then
     status.about_root = cwd
     status.about = { state = "none", waiters = {} }
+    status.about_pending = nil
     return
   end
 
   local current = ai_commit.state()
+  if not force and not allow_generation and status.about_root == cwd and status.about_pending and status.about then return end
   if not force and status.about_root == cwd and status.about and current == status.about then return end
 
   status.about_root = cwd
@@ -5201,20 +5203,35 @@ local function status_ensure_about_state(cwd, buf, has_changes, force, allow_gen
     M._status_patch_about_line(buf)
   end
 
-  ai_commit.ensure(cwd, { force = force }, function(result)
+  local function start_generation()
     local latest_status = M._status_states and M._status_states[buf] or M._status
     if not (latest_status and latest_status.about_request_id == request_id and latest_status.about_root == cwd) then return end
-    M._status = latest_status
-    latest_status.about = result
-    if latest_status.head_values then
-      latest_status.head_lines = status_build_head_lines(latest_status.head_values, latest_status.pr, latest_status.about)
-    end
-    if vim.api.nvim_buf_is_valid(buf) and latest_status.head_lines and latest_status.sections then
-      if not M._status_patch_about_line(buf) then
-        M.render_status(buf, nil, nil, { reuse_sections = true })
+    latest_status.about_pending = nil
+    ai_commit.ensure(cwd, { force = force }, function(result)
+      latest_status = M._status_states and M._status_states[buf] or M._status
+      if not (latest_status and latest_status.about_request_id == request_id and latest_status.about_root == cwd) then return end
+      M._status = latest_status
+      latest_status.about = result
+      latest_status.about_pending = nil
+      if latest_status.head_values then
+        latest_status.head_lines = status_build_head_lines(latest_status.head_values, latest_status.pr, latest_status.about)
       end
-    end
-  end)
+      if vim.api.nvim_buf_is_valid(buf) and latest_status.head_lines and latest_status.sections then
+        if not M._status_patch_about_line(buf) then
+          M.render_status(buf, nil, nil, { reuse_sections = true })
+        end
+      end
+    end)
+  end
+
+  local delay = allow_generation and 0 or ((M.config or config.options or config.defaults).about_auto_generate_delay_ms or 0)
+  if delay > 0 then
+    status.about_pending = true
+    vim.defer_fn(start_generation, delay)
+    return
+  end
+
+  start_generation()
 end
 
 ---@param buf integer
@@ -6400,6 +6417,66 @@ function M.open_pr_number(number, opts)
     end
     M.open_pr(result.pr, { cwd = cwd, repo = opts.repo })
   end)
+end
+
+---@class DiffReviewCompactPreviewOptions
+---@field cwd? string
+---@field staged? boolean
+
+---@param opts? DiffReviewCompactPreviewOptions
+function M.open_compact_preview(opts)
+  opts = opts or {}
+  local function open_for_root(root, err)
+    local cwd = root
+    if not cwd then
+      notify_error(err or "Not a git repository", "GitDiffCompactPreview")
+      return
+    end
+
+    local command = { "git", "-C", cwd, "-c", "core.quotepath=false", "diff", "--no-color", "--no-ext-diff" }
+    if opts.staged then command[#command + 1] = "--cached" end
+    systemlist_async(command, function(output, code, stderr)
+      if code ~= 0 then
+        local message = vim.trim(stderr or "")
+        notify_error(message ~= "" and message or "Unable to read git diff", "GitDiffCompactPreview")
+        return
+      end
+
+      local compacted, was_compacted, metrics = require("git.diff").compact_lines(output or {})
+      local lines = compacted == "" and { "No diff." } or vim.split(compacted, "\n", { plain = true })
+      local buf = vim.api.nvim_create_buf(true, true)
+      vim.bo[buf].bufhidden = "wipe"
+      vim.bo[buf].buftype = "nofile"
+      vim.bo[buf].swapfile = false
+      vim.bo[buf].filetype = "diff"
+      vim.bo[buf].modifiable = true
+      vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+      vim.bo[buf].modifiable = false
+
+      local name = ("GitDiffCompactPreview://%s/%s"):format(
+        opts.staged and "staged" or "unstaged",
+        was_compacted and "compact" or "full"
+      )
+      pcall(vim.api.nvim_buf_set_name, buf, name)
+
+      local win = vim.api.nvim_get_current_win()
+      local ok, set_err = pcall(vim.api.nvim_win_set_buf, win, buf)
+      if not ok then
+        notify_error("GitDiffCompactPreview open failed: " .. tostring(set_err), "GitDiffCompactPreview")
+        return
+      end
+      M._hide_line_numbers(win)
+      vim.wo[win].foldcolumn = "0"
+      vim.b[buf].git_diff_compact_metrics = metrics
+      vim.b[buf].git_diff_compacted = was_compacted
+    end)
+  end
+
+  if opts.cwd then
+    open_for_root(opts.cwd)
+  else
+    git_root_async(open_for_root)
+  end
 end
 
 --- Open a standalone, Neogit-style DiffReview status buffer.

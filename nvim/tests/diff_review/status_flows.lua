@@ -80,6 +80,14 @@ local function reset_state(next_state)
   reset_calls()
 end
 
+local function numbered_files(prefix, count)
+  local files = {}
+  for i = 1, count do
+    files[("%s-%02d.txt"):format(prefix, i)] = true
+  end
+  return files
+end
+
 local function sorted_keys(map)
   local keys = {}
   for key in pairs(map) do
@@ -454,6 +462,13 @@ local function saw_system_call(expected_key)
   return false
 end
 
+local function saw_systemlist_call(expected_key)
+  for _, call in ipairs(calls) do
+    if call.kind == "systemlist_async" and call.key == expected_key then return true end
+  end
+  return false
+end
+
 local function saw_system_call_containing(needle)
   for _, call in ipairs(calls) do
     if call.kind == "system" and call.key:find(needle, 1, true) then return true end
@@ -508,6 +523,16 @@ local function render_and_wait(buf, needle)
   wait_for(function() return buffer_contains(buf, needle) end, "status did not render " .. needle)
 end
 
+local function open_compact_preview_and_wait(opts, expected)
+  local previous_buf = vim.api.nvim_get_current_buf()
+  diff_review.open_compact_preview(opts)
+  wait_for(function()
+    local buf = vim.api.nvim_get_current_buf()
+    return buf ~= previous_buf and buffer_contains(buf, expected)
+  end, "compact preview did not open with " .. expected)
+  return vim.api.nvim_get_current_buf()
+end
+
 local function assert_path_helpers()
   local relpath, err = diff_review._repo_relative_for_test("D:\\Repo\\App\\src\\main.rs", "d:/repo/app", true)
   assert_true(relpath == "src/main.rs", "windows drive/backslash path failed: " .. tostring(relpath or err))
@@ -536,13 +561,39 @@ local function run()
       opts = opts,
     }
   end
-  diff_review.setup()
+  diff_review.setup({ about_auto_generate = false })
   diff_review.open()
   local buf = vim.api.nvim_get_current_buf()
 
   reset_state({ modified = { ["mod.txt"] = true } })
   render_and_wait(buf, "mod.txt +1 -1")
   wait_for(function() return gh_calls > 0 end, "initial PR lookup did not run")
+
+  reset_state({ modified = numbered_files("preview-unstaged", 31) })
+  reset_calls()
+  local preview_buf = open_compact_preview_and_wait({ cwd = root }, "Compact diff: 31 hunks, +31 -31 changed lines")
+  assert_true(vim.bo[preview_buf].filetype == "diff", "compact preview buffer should use diff filetype")
+  assert_true(vim.bo[preview_buf].buftype == "nofile", "compact preview buffer should be nofile")
+  assert_true(vim.b[preview_buf].git_diff_compacted == true, "compact preview should mark compacted output")
+  assert_true(vim.b[preview_buf].git_diff_compact_metrics.hunks == 31, "compact preview metrics missing hunk count")
+  assert_true(
+    saw_systemlist_call("git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff"),
+    "compact preview did not read unstaged diff"
+  )
+  assert_true(buffer_contains(preview_buf, "No hunks have at least 8 changed lines."), "compact preview missing no-large-hunks message")
+  assert_true(buffer_contains(preview_buf, "Skipped 31 small hunks (62 changed lines total)"), "compact preview missing skipped summary")
+  vim.api.nvim_win_set_buf(0, buf)
+  if vim.api.nvim_buf_is_valid(preview_buf) then vim.api.nvim_buf_delete(preview_buf, { force = true }) end
+
+  reset_state({ staged_modified = numbered_files("preview-staged", 31) })
+  reset_calls()
+  local staged_preview_buf = open_compact_preview_and_wait({ cwd = root, staged = true }, "Compact diff: 31 hunks, +31 -31 changed lines")
+  assert_true(
+    saw_systemlist_call("git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--cached"),
+    "compact preview did not read staged diff"
+  )
+  vim.api.nvim_win_set_buf(0, buf)
+  if vim.api.nvim_buf_is_valid(staged_preview_buf) then vim.api.nvim_buf_delete(staged_preview_buf, { force = true }) end
 
   reset_state({ modified = { ["startup-pr-delay.txt"] = true } })
   reset_gh_calls()
@@ -570,13 +621,13 @@ local function run()
 
   reset_state({ modified = { ["mock-pr-delay.txt"] = true } })
   reset_gh_calls()
-  diff_review.setup({ pr_lookup_mode = "mock-delay", pr_mock_delay_ms = 20 })
+  diff_review.setup({ pr_lookup_mode = "mock-delay", pr_mock_delay_ms = 20, about_auto_generate = false })
   diff_review.render_status(buf, nil, nil, { refresh_pr = true })
   wait_for(function() return buffer_contains(buf, "mock-pr-delay.txt +1 -1") end, "mock PR delay status did not render")
   assert_true(gh_calls == 0, "mock PR delay spawned gh before timer")
   wait_for(function() return buffer_contains(buf, "PR:     none") end, "mock PR delay did not finish as no PR")
   assert_true(gh_calls == 0, "mock PR delay spawned gh")
-  diff_review.setup()
+  diff_review.setup({ about_auto_generate = false })
 
   reset_state({ modified = { ["mod.txt"] = true } })
   render_and_wait(buf, "mod.txt +1 -1")
@@ -609,13 +660,13 @@ local function run()
   end, "tracked unstage did not run restore --staged")
   wait_for(function() return buffer_contains(buf, "Unstaged changes (1)") end, "tracked unstage did not reconcile")
 
-  diff_review.setup({ debug_notifications = true })
+  diff_review.setup({ debug_notifications = true, about_auto_generate = false })
   reset_state({ modified = { ["debug-notify.txt"] = true } })
   render_and_wait(buf, "debug-notify.txt +1 -1")
   reset_notifications()
   trigger_normal_mapping("S", find_row(buf, "debug-notify.txt"))
   wait_for(function() return saw_notification_containing("Staged") end, "debug stage notification was not emitted")
-  diff_review.setup({ debug_notifications = false })
+  diff_review.setup({ debug_notifications = false, about_auto_generate = false })
 
   reset_state({
     modified = {

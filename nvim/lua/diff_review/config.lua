@@ -6,6 +6,7 @@
 ---@field pr_mock_delay_ms? integer
 ---@field status_cursor_prewarm boolean
 ---@field about_auto_generate boolean
+---@field about_auto_generate_delay_ms integer
 ---@field keymaps DiffReviewKeymapConfig
 
 ---@alias DiffReviewKeymap string|string[]|false
@@ -44,7 +45,8 @@ M.defaults = {
   pr_lookup_mode = "real",
   pr_mock_delay_ms = 5000,
   status_cursor_prewarm = true,
-  about_auto_generate = false,
+  about_auto_generate = true,
+  about_auto_generate_delay_ms = 1000,
   keymaps = {
     status = {
       close = "q",

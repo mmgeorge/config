@@ -171,7 +171,7 @@ local function run()
     cb(nil)
   end
 
-  diff_review.setup()
+  diff_review.setup({ about_auto_generate = false })
   diff_review.open()
   local buf = vim.api.nvim_get_current_buf()
   wait_for(function() return buffer_contains(buf, "Head:") end, "status did not render")
