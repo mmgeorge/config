@@ -3232,6 +3232,7 @@ local status_reconcile_delay_ms = 120
 ---@type DiffReviewStatusCommandSpec[]
 local status_command_specs = {
   { id = "toggle", label = "toggle", desc = "Toggle fold", modes = "n", hint = true, views = { status = true, pr = true } },
+  { id = "collapse_parent", label = "Collapse Parent", desc = "Collapse Parent", modes = "n", hint = true, views = { status = true, pr = true } },
   { id = "stage", label = "stage", desc = "Stage hunk/file/selection", modes = { "n", "x" }, visual = true, hint = true, views = { status = true } },
   { id = "unstage", label = "unstage", desc = "Unstage hunk/file/selection", modes = { "n", "x" }, visual = true, hint = true, views = { status = true } },
   { id = "discard", label = "discard", desc = "Discard hunk/file/selection", modes = { "n", "x" }, visual = true, hint = true, views = { status = true } },
@@ -3559,6 +3560,19 @@ end
 local function status_provider_hunk_key(provider_key, filename, diff)
   local hash = diff and vim.fn.sha256(diff) or "file"
   return ("provider-hunk:%s:%s:%s"):format(provider_key, filename, hash)
+end
+
+---@param sections DiffReviewStatusSection[]?
+function M._status_restore_initial_folds(sections)
+  M._status = M._status or {}
+  M._status.folds = {}
+end
+
+---@param sections DiffReviewStatusSection[]?
+---@return string?
+function M._status_first_grouping_id(sections)
+  local section = sections and sections[1] or nil
+  return section and status_section_key(section.name) or nil
 end
 
 local function status_add_highlight(line, start_col, end_col, hl_group)
@@ -4718,6 +4732,52 @@ local function status_entry_under_cursor()
   return status.entries[line]
 end
 
+---@return integer? line
+---@return DiffReviewStatusEntry? entry
+function M._status_entry_line_under_cursor()
+  local status = M._status
+  if not (status and status.entries and status.buf and vim.api.nvim_buf_is_valid(status.buf)) then return nil, nil end
+  local cursor_line = vim.api.nvim_win_get_cursor(0)[1]
+  local max_line = vim.api.nvim_buf_line_count(status.buf)
+  for line = math.min(cursor_line, max_line), 1, -1 do
+    local entry = status.entries[line]
+    if entry then return line, entry end
+  end
+  return nil, nil
+end
+
+---@param entry DiffReviewStatusEntry?
+---@return boolean
+function M._status_entry_is_file_like(entry)
+  return entry ~= nil
+    and (entry.kind == "file" or entry.kind == "commit_file" or entry.kind == "pr_file")
+end
+
+---@param entry DiffReviewStatusEntry?
+---@return boolean
+function M._status_entry_is_hunk_like(entry)
+  return entry ~= nil
+    and (entry.kind == "hunk" or entry.kind == "commit_hunk" or entry.kind == "pr_hunk")
+end
+
+---@param current_line integer
+---@param entry DiffReviewStatusEntry
+---@return DiffReviewStatusEntry?
+function M._status_parent_entry(current_line, entry)
+  local status = M._status
+  if not (status and status.entries) then return nil end
+  for line = current_line - 1, 1, -1 do
+    local candidate = status.entries[line]
+    if entry.kind == "commit_hunk" and candidate and candidate.kind == "commit_file" then return candidate end
+    if M._status_entry_is_hunk_like(entry) and M._status_entry_is_file_like(candidate) then return candidate end
+    if M._status_entry_is_file_like(entry) and candidate and candidate.kind == "commit" then return candidate end
+    if (M._status_entry_is_file_like(entry) or entry.kind == "commit") and candidate and candidate.kind == "section" then
+      return candidate
+    end
+  end
+  return nil
+end
+
 ---@param entry DiffReviewStatusEntry?
 local function status_prewarm_entry_syntax(entry)
   if not entry then return end
@@ -5237,7 +5297,7 @@ end
 ---@param buf integer
 ---@param target_id? string
 ---@param fallback_line? integer
----@param opts? { reuse_sections?: boolean, refresh_pr?: boolean, refresh_about?: boolean }
+---@param opts? { reuse_sections?: boolean, refresh_pr?: boolean, refresh_about?: boolean, restore_initial_folds?: boolean }
 function M.render_status(buf, target_id, fallback_line, opts)
   opts = opts or {}
   setup_bg_highlights()
@@ -5289,13 +5349,18 @@ function M.render_status(buf, target_id, fallback_line, opts)
         status_request_reconcile(buf, target_id)
         return
       end
+      if opts.restore_initial_folds then
+        M._status_restore_initial_folds(result.sections)
+        target_id = M._status_first_grouping_id(result.sections)
+        fallback_line = nil
+      end
       status_ensure_about_state(cwd, buf, status_has_changes(result.sections), opts.refresh_about)
       result.head_lines = status_build_head_lines(result.head_values or {}, current_status.pr, current_status.about)
       current_status.head_lines = result.head_lines
       current_status.head_values = result.head_values
       current_status.sections = result.sections
       current_status.fancy_rows = {}
-      if preserve_current_cursor then
+      if preserve_current_cursor and not opts.restore_initial_folds then
         target_id, fallback_line = status_cursor_target(buf)
       end
       status_render_loaded(buf, target_id, fallback_line, opts, result.head_lines, result.sections)
@@ -5311,7 +5376,7 @@ end
 ---@param buf integer
 ---@param target_id? string
 ---@param fallback_line? integer
----@param opts? { reuse_sections?: boolean }
+---@param opts? { reuse_sections?: boolean, refresh_pr?: boolean, refresh_about?: boolean, restore_initial_folds?: boolean }
 local function render_status_or_notify(buf, target_id, fallback_line, opts)
   local ok, err = xpcall(function()
     M.render_status(buf, target_id, fallback_line, opts)
@@ -6051,6 +6116,15 @@ local function status_toggle(entry)
   render_status_or_notify(M._status.buf, entry.id, vim.api.nvim_win_get_cursor(0)[1], { reuse_sections = true })
 end
 
+function M._status_collapse_parent()
+  local line, entry = M._status_entry_line_under_cursor()
+  if not (line and entry) then return end
+  local parent = M._status_parent_entry(line, entry)
+  local target = parent or entry
+  set_status_folded(target.id, true)
+  render_status_or_notify(M._status.buf, target.id, vim.api.nvim_win_get_cursor(0)[1], { reuse_sections = true })
+end
+
 ---@param title string
 ---@param lines string[]
 ---@return integer
@@ -6237,7 +6311,8 @@ local function setup_status_keymaps(buf)
       M._status.pr = nil
       M._status.about = nil
     end
-    render_status_or_notify(buf, (status_entry_under_cursor() or {}).id, vim.api.nvim_win_get_cursor(0)[1], {
+    render_status_or_notify(buf, nil, nil, {
+      restore_initial_folds = true,
       refresh_pr = true,
       refresh_about = true,
     })
@@ -6246,6 +6321,11 @@ local function setup_status_keymaps(buf)
   map("toggle", "n", function()
     if M._status_states and M._status_states[buf] then M._status = M._status_states[buf] end
     status_toggle(status_entry_under_cursor())
+  end)
+
+  map("collapse_parent", "n", function()
+    if M._status_states and M._status_states[buf] then M._status = M._status_states[buf] end
+    M._status_collapse_parent()
   end)
 
   if is_pr_view then

@@ -142,8 +142,8 @@ local function run()
   assert_true(contains_line(unstaged_after_unstage, "a.txt"), "a.txt was not unstaged")
   assert_true(contains_line(unstaged_after_unstage, "b.txt"), "b.txt was not unstaged")
 
-  local discard_mapping = vim.fn.maparg("j", "x", false, true)
-  assert_true(type(discard_mapping.callback) == "function", "missing visual mapping for j")
+  local discard_mapping = vim.fn.maparg("D", "x", false, true)
+  assert_true(type(discard_mapping.callback) == "function", "missing visual mapping for D")
 end
 
 local ok, err = xpcall(run, debug.traceback)

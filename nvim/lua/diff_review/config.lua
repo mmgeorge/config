@@ -15,6 +15,7 @@
 ---@field close DiffReviewKeymap
 ---@field refresh DiffReviewKeymap
 ---@field toggle DiffReviewKeymap
+---@field collapse_parent DiffReviewKeymap
 ---@field stage DiffReviewKeymap
 ---@field unstage DiffReviewKeymap
 ---@field discard DiffReviewKeymap
@@ -52,9 +53,10 @@ M.defaults = {
       close = "q",
       refresh = { "r", "or" },
       toggle = "<Tab>",
+      collapse_parent = "j",
       stage = "S",
       unstage = "U",
-      discard = "j",
+      discard = "D",
       open = "<CR>",
       commit = "cc",
       push = "opp",
