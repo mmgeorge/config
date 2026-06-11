@@ -50,6 +50,9 @@
 ---@type DiffReviewGhModule
 local M = {}
 
+local default_timeout_ms = 5000
+local timeout_ms = default_timeout_ms
+
 local pr_json_fields = table.concat({
   "number",
   "title",
@@ -73,6 +76,15 @@ function M.reset_backend()
   M._backend = nil
 end
 
+---@param value integer
+function M.set_timeout_ms(value)
+  timeout_ms = math.max(1, tonumber(value) or default_timeout_ms)
+end
+
+function M.reset_timeout_ms()
+  timeout_ms = default_timeout_ms
+end
+
 ---@param command DiffReviewGhCommand
 ---@param input string?
 ---@param cwd string?
@@ -84,11 +96,22 @@ local function system_text_async(command, input, cwd, cb)
     return
   end
 
+  local completed = false
+  local process
+  local command_timeout_ms = timeout_ms
+
+  ---@param result DiffReviewGhAsyncResult
+  local function finish(result)
+    if completed then return end
+    completed = true
+    cb(result)
+  end
+
   local ok, process_or_error = pcall(vim.system, command, { text = true, stdin = input, cwd = cwd }, function(result)
     vim.schedule(function()
       local stdout = result.stdout or ""
       local stderr = result.stderr or ""
-      cb({
+      finish({
         code = result.code or 0,
         stdout = stdout,
         stderr = stderr,
@@ -96,10 +119,24 @@ local function system_text_async(command, input, cwd, cb)
       })
     end)
   end)
+  if ok then
+    process = process_or_error
+    vim.defer_fn(function()
+      if completed then return end
+      local message = "gh command timed out after " .. tostring(command_timeout_ms) .. "ms"
+      if process and process.kill then pcall(process.kill, process, 15) end
+      finish({
+        code = -1,
+        stdout = "",
+        stderr = message,
+        output = message,
+      })
+    end, command_timeout_ms)
+  end
   if not ok then
     vim.schedule(function()
       local message = tostring(process_or_error)
-      cb({
+      finish({
         code = -1,
         stdout = "",
         stderr = message,

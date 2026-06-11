@@ -5,6 +5,7 @@ local ai_commit = require("diff_review.ai_commit")
 local commit = require("diff_review.commit")
 local gh = require("diff_review.gh")
 local original_notify = vim.notify
+local original_system = vim.system
 
 local root = "D:/mock/github-project"
 local calls = {}
@@ -494,6 +495,28 @@ local function run()
   assert_true(#notifications == 0, "unavailable PR lookup should not emit error notifications")
   assert_true(generate_count == count_before_unavailable, "unavailable PR lookup should not restart AI generation")
 
+  gh.reset_backend()
+  gh.set_timeout_ms(20)
+  local timeout_result = nil
+  local killed = false
+  vim.system = function()
+    return {
+      kill = function()
+        killed = true
+      end,
+    }
+  end
+  gh.current_pr_async(root, function(result)
+    timeout_result = result
+  end)
+  wait_for(function() return timeout_result ~= nil end, "gh PR lookup did not time out")
+  assert_true(timeout_result.ok == false, "timed out PR lookup should fail")
+  assert_true((timeout_result.message or ""):find("timed out", 1, true) ~= nil, "timeout result should explain the timeout")
+  assert_true(killed, "timed out gh process should be killed")
+  vim.system = original_system
+  gh.reset_timeout_ms()
+  gh.set_backend(gh_backend)
+
   pr_mode = "ready"
   pr_title = "PR after manual refresh"
   assert_true(type(vim.fn.maparg("or", "n", false, true).callback) == "function", "or refresh mapping missing")
@@ -624,6 +647,8 @@ local ok, err = xpcall(run, debug.traceback)
 diff_review.reset_git_backend()
 ai_commit.reset_backend()
 gh.reset_backend()
+gh.reset_timeout_ms()
+vim.system = original_system
 vim.notify = original_notify
 if not ok then
   vim.api.nvim_err_writeln(err)

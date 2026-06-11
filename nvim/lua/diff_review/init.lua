@@ -50,10 +50,12 @@
 ---@field added integer
 ---@field removed integer
 ---@field git_status? string
+---@field git_original_file? string
 
 ---@class DiffReviewStatusFile
 ---@field filename string
 ---@field relpath string
+---@field original_relpath? string
 ---@field section_name string
 ---@field added integer
 ---@field removed integer
@@ -102,6 +104,7 @@
 ---@field state "fetching"|"ready"|"none"|"unavailable"|"error"
 ---@field pr? DiffReviewGhPR
 ---@field message? string
+---@field lookup_started? boolean
 
 ---@class DiffReviewStatusRemoteActionState
 ---@field action "push"|"pull"
@@ -998,15 +1001,18 @@ end
 ---@param line string
 ---@return string? status
 ---@return string? file
+---@return string? original_file
 local function parse_name_status_line(line)
   local parts = vim.split(line, "\t", { plain = true })
   local status = parts[1]
   local file = parts[2]
+  local original_file = nil
   if status and (status:sub(1, 1) == "R" or status:sub(1, 1) == "C") then
+    original_file = file
     file = parts[3] or file
   end
   if status and file then
-    return status, file
+    return status, file, original_file
   end
   status, file = line:match("^(%S+)%s+(.+)$")
   return status, file
@@ -1016,6 +1022,18 @@ end
 ---@return boolean
 local function git_status_is_added(status)
   return type(status) == "string" and status:sub(1, 1) == "A"
+end
+
+---@param status string?
+---@return boolean
+local function git_status_is_deleted(status)
+  return type(status) == "string" and status:sub(1, 1) == "D"
+end
+
+---@param status string?
+---@return boolean
+local function git_status_is_renamed(status)
+  return type(status) == "string" and status:sub(1, 1) == "R"
 end
 
 --- Parse unified diff output into structured file/hunk data
@@ -1779,18 +1797,26 @@ local function collect_items_from_git(cwd, cb, _ctx)
   -- textual hunks so action routing can distinguish added files from modified
   -- tracked files.
   local staged_status_by_file = {}
+  local staged_original_by_file = {}
   if results.staged_name_status_code == 0 then
     for _, line in ipairs(results.staged_name_status) do
-      local status, file = parse_name_status_line(line)
-      if status and file then staged_status_by_file[file] = status end
+      local status, file, original_file = parse_name_status_line(line)
+      if status and file then
+        staged_status_by_file[file] = status
+        staged_original_by_file[file] = original_file
+      end
     end
   end
 
   local unstaged_status_by_file = {}
+  local unstaged_original_by_file = {}
   if results.unstaged_name_status_code == 0 then
     for _, line in ipairs(results.unstaged_name_status) do
-      local status, file = parse_name_status_line(line)
-      if status and file then unstaged_status_by_file[file] = status end
+      local status, file, original_file = parse_name_status_line(line)
+      if status and file then
+        unstaged_status_by_file[file] = status
+        unstaged_original_by_file[file] = original_file
+      end
     end
   end
 
@@ -1798,6 +1824,7 @@ local function collect_items_from_git(cwd, cb, _ctx)
   for _, h in ipairs(all_hunks) do
     tracked_files_with_hunks[h.file] = true
     h.git_status = h.staged and staged_status_by_file[h.file] or unstaged_status_by_file[h.file]
+    h.git_original_file = h.staged and staged_original_by_file[h.file] or unstaged_original_by_file[h.file]
   end
   if results.staged_name_status_code == 0 then
     for file, status in pairs(staged_status_by_file) do
@@ -1813,6 +1840,7 @@ local function collect_items_from_git(cwd, cb, _ctx)
           removed = 0,
           status = status,
           git_status = status,
+          git_original_file = staged_original_by_file[file],
         }
       end
     end
@@ -1830,6 +1858,7 @@ local function collect_items_from_git(cwd, cb, _ctx)
           removed = 0,
           status = status,
           git_status = status,
+          git_original_file = unstaged_original_by_file[file],
         }
       end
     end
@@ -1902,6 +1931,7 @@ local function collect_items_from_git(cwd, cb, _ctx)
         file_added = fs.added,
         file_removed = fs.removed,
         git_status = hunk.git_status,
+        git_original_file = hunk.git_original_file,
       },
     })
   end
@@ -3553,7 +3583,7 @@ local function status_add_line(text, entry, line_hl_group)
   return line
 end
 
-local function status_add_segment_line(segments, entry)
+function M._status_segment_line_parts(segments)
   local parts = {}
   local col = 0
   local segment_highlights = {}
@@ -3569,10 +3599,56 @@ local function status_add_segment_line(segments, entry)
     end
     col = col + #text
   end
-  local line = status_add_line(table.concat(parts), entry)
+  return table.concat(parts), segment_highlights
+end
+
+local function status_add_segment_line(segments, entry)
+  local text, segment_highlights = M._status_segment_line_parts(segments)
+  local line = status_add_line(text, entry)
   for _, highlight in ipairs(segment_highlights) do
     status_add_highlight(line, highlight.start_col, highlight.end_col, highlight.hl_group)
   end
+end
+
+---@param buf integer
+---@param entry_id string
+---@param head_line DiffReviewStatusHeadLine
+---@return boolean
+function M._status_patch_head_line(buf, entry_id, head_line)
+  local status = M._status_states and M._status_states[buf] or M._status
+  if not (
+    status
+    and status.entries
+    and head_line
+    and head_line.segments
+    and vim.api.nvim_buf_is_valid(buf)
+  ) then return false end
+
+  local target_line = nil
+  for line, entry in pairs(status.entries) do
+    if entry and entry.id == entry_id then
+      target_line = line
+      break
+    end
+  end
+  if not target_line then return false end
+
+  local text, segment_highlights = M._status_segment_line_parts(head_line.segments)
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_set_lines(buf, target_line - 1, target_line, false, { text })
+  vim.bo[buf].modifiable = false
+  status.entries[target_line] = head_line.entry
+  if status.lines then status.lines[target_line] = text end
+
+  vim.api.nvim_buf_clear_namespace(buf, M._status_ns, target_line - 1, target_line)
+  for _, highlight in ipairs(segment_highlights) do
+    pcall(vim.api.nvim_buf_set_extmark, buf, M._status_ns, target_line - 1, highlight.start_col, {
+      end_col = highlight.end_col,
+      hl_group = highlight.hl_group,
+      priority = 90,
+    })
+  end
+  return true
 end
 
 ---@return DiffReviewStatusKeymapConfig
@@ -3736,6 +3812,7 @@ local function status_sections_from_items(collected_items)
           untracked = section_name == "untracked",
           status = data.stats or data.hunk_header or "",
           git_status = data.git_status,
+          original_relpath = data.git_original_file,
         }
         section.files_by_name[filename] = file
         section.files[#section.files + 1] = file
@@ -3752,6 +3829,7 @@ local function status_sections_from_items(collected_items)
           staged = data.staged == true,
           context_text = data.context_text or "",
           git_status = data.git_status,
+          git_original_file = data.git_original_file,
           added = data.added or 0,
           removed = data.removed or 0,
         }
@@ -4647,6 +4725,27 @@ local function status_prewarm_entry_syntax(entry)
   end
 end
 
+---@param buf integer
+local function status_defer_prewarm_under_cursor(buf)
+  local status = M._status_states and M._status_states[buf] or M._status
+  if not status then return end
+  status.cursor_prewarm_request_id = (status.cursor_prewarm_request_id or 0) + 1
+  local request_id = status.cursor_prewarm_request_id
+  local entry = status_entry_under_cursor()
+  local entry_id = entry and entry.id or nil
+
+  vim.defer_fn(function()
+    local latest_status = M._status_states and M._status_states[buf] or M._status
+    if not (latest_status and latest_status.cursor_prewarm_request_id == request_id) then return end
+    if not (buf and vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_get_current_buf() == buf) then return end
+    M._status = latest_status
+    local current_entry = status_entry_under_cursor()
+    if entry_id and current_entry and current_entry.id == entry_id then
+      status_prewarm_entry_syntax(current_entry)
+    end
+  end, 35)
+end
+
 local status_files_from_set
 
 ---@param entry DiffReviewStatusEntry?
@@ -4994,30 +5093,27 @@ end
 ---@param cwd string
 ---@param buf integer
 ---@param force? boolean
-local function status_ensure_pr_state(cwd, buf, force)
-  M._status = M._status or {}
-  local status = M._status
-  if not force and status.pr_root == cwd and status.pr then return end
+local function status_start_pr_lookup(cwd, buf, request_id)
+  if not vim.api.nvim_buf_is_valid(buf) then return end
+  local status = M._status_states and M._status_states[buf] or M._status
+  if not (status and status.pr_request_id == request_id and status.pr_root == cwd and status.pr) then return end
+  if status.pr.lookup_started then return end
+  status.pr.lookup_started = true
 
-  status.pr_root = cwd
-  status.pr = { state = "fetching" }
-  status.pr_request_id = (status.pr_request_id or 0) + 1
-  local request_id = status.pr_request_id
-
-  gh.current_pr_async(cwd, function(result)
+  local function complete_pr_lookup(result)
     local latest_status = M._status_states and M._status_states[buf] or M._status
     if not (latest_status and latest_status.pr_request_id == request_id and latest_status.pr_root == cwd) then return end
     M._status = latest_status
 
     if result.ok and result.pr then
-      latest_status.pr = { state = "ready", pr = result.pr }
+      latest_status.pr = { state = "ready", pr = result.pr, lookup_started = true }
     elseif result.ok and result.unavailable then
-      latest_status.pr = { state = "unavailable", message = result.message }
+      latest_status.pr = { state = "unavailable", message = result.message, lookup_started = true }
     elseif result.ok then
-      latest_status.pr = { state = "none" }
+      latest_status.pr = { state = "none", lookup_started = true }
     else
       local message = result.message or "Unable to fetch GitHub pull request"
-      latest_status.pr = { state = "error", message = message }
+      latest_status.pr = { state = "error", message = message, lookup_started = true }
       notify_error("GitHub PR lookup failed: " .. message)
     end
 
@@ -5025,9 +5121,36 @@ local function status_ensure_pr_state(cwd, buf, force)
       latest_status.head_lines = status_build_head_lines(latest_status.head_values, latest_status.pr, latest_status.about)
     end
     if vim.api.nvim_buf_is_valid(buf) and latest_status.head_lines and latest_status.sections then
-      M.render_status(buf, nil, nil, { reuse_sections = true })
+      if not M._status_patch_head_line(buf, "pr", status_pr_head_line(latest_status.pr)) then
+        M.render_status(buf, nil, nil, { reuse_sections = true })
+      end
     end
-  end)
+  end
+
+  local options = M.config or config.options or config.defaults
+  if options.pr_lookup_mode == "mock-delay" then
+    vim.defer_fn(function()
+      complete_pr_lookup({ ok = true })
+    end, math.max(1, tonumber(options.pr_mock_delay_ms) or 5000))
+    return
+  end
+
+  gh.current_pr_async(cwd, complete_pr_lookup)
+end
+
+---@param cwd string
+---@param buf integer
+---@param force? boolean
+---@return integer? request_id
+local function status_ensure_pr_state(cwd, buf, force)
+  M._status = M._status or {}
+  local status = M._status
+  if not force and status.pr_root == cwd and status.pr then return nil end
+
+  status.pr_root = cwd
+  status.pr = { state = "fetching" }
+  status.pr_request_id = (status.pr_request_id or 0) + 1
+  return status.pr_request_id
 end
 
 ---@param sections DiffReviewStatusSection[]?
@@ -5047,6 +5170,12 @@ local function status_ensure_about_state(cwd, buf, has_changes, force)
   M._status = M._status or {}
   local status = M._status
   if not has_changes then
+    status.about_root = cwd
+    status.about = { state = "none", waiters = {} }
+    return
+  end
+
+  if (M.config or config.options or config.defaults).about_auto_generate == false then
     status.about_root = cwd
     status.about = { state = "none", waiters = {} }
     return
@@ -5118,7 +5247,7 @@ function M.render_status(buf, target_id, fallback_line, opts)
     end
 
     latest_status.cwd = cwd
-    status_ensure_pr_state(cwd, buf, opts.refresh_pr)
+    local pr_request_id = status_ensure_pr_state(cwd, buf, opts.refresh_pr)
 
     status_load_async(cwd, function(result)
       local current_status = M._status_states and M._status_states[buf] or render_state
@@ -5139,6 +5268,11 @@ function M.render_status(buf, target_id, fallback_line, opts)
         target_id, fallback_line = status_cursor_target(buf)
       end
       status_render_loaded(buf, target_id, fallback_line, opts, result.head_lines, result.sections)
+      if pr_request_id then
+        vim.defer_fn(function()
+          status_start_pr_lookup(cwd, buf, pr_request_id)
+        end, 50)
+      end
     end)
   end)
 end
@@ -5610,33 +5744,100 @@ local function status_discard_entries(entries, target_id)
           failures[#failures + 1] = { file = entry.file.filename, message = rel_err }
           next_entry()
         else
-          run_git_at_root_async(cwd, { "checkout", "HEAD", "--", relpath }, nil, function(checkout_result)
-            if checkout_result.ok then
-              next_entry()
-              return
-            end
-            local unstage_args = git_status_is_added(entry.file.git_status)
-              and { "rm", "--cached", "--ignore-unmatch", "--", relpath }
-              or { "restore", "--staged", "--", relpath }
-            run_git_at_root_async(cwd, unstage_args, nil, function(restore_result)
-              if restore_result.ok then
-                local delete_code = delete_path(entry.file.filename)
-                if delete_code ~= 0 then
-                  failures[#failures + 1] = {
-                    file = entry.file.filename,
-                    message = ("delete() failed with code %d after unstaging"):format(delete_code),
-                  }
+          ---@param result DiffReviewGitCommandResult
+          local function add_failure(result)
+            failures[#failures + 1] = {
+              file = entry.file.filename,
+              output = result.output,
+              code = result.code,
+            }
+          end
+
+          ---@param path string
+          ---@param context string
+          ---@return boolean
+          local function delete_file(path, context)
+            local delete_code = delete_path(path)
+            if delete_code == 0 then return true end
+            failures[#failures + 1] = {
+              file = path,
+              message = ("delete() failed with code %d%s"):format(delete_code, context),
+            }
+            return false
+          end
+
+          if entry.file.section_name == "unstaged" then
+            if git_status_is_added(entry.file.git_status) then
+              run_git_at_root_async(cwd, { "restore", "--staged", "--", relpath }, nil, function(restore_result)
+                if restore_result.ok then
+                  delete_file(entry.file.filename, " after unstaging")
+                else
+                  add_failure(restore_result)
                 end
+                next_entry()
+              end)
+            else
+              run_git_at_root_async(cwd, { "checkout", "--", relpath }, nil, function(checkout_result)
+                if not checkout_result.ok then add_failure(checkout_result) end
+                next_entry()
+              end)
+            end
+          elseif git_status_is_added(entry.file.git_status) then
+            run_git_at_root_async(cwd, { "rm", "--cached", "--ignore-unmatch", "--", relpath }, nil, function(rm_result)
+              if rm_result.ok then
+                delete_file(entry.file.filename, " after unstaging")
               else
-                failures[#failures + 1] = {
-                  file = entry.file.filename,
-                  output = restore_result.output ~= "" and restore_result.output or checkout_result.output,
-                  code = restore_result.code,
-                }
+                add_failure(rm_result)
               end
               next_entry()
             end)
-          end)
+          elseif git_status_is_renamed(entry.file.git_status) then
+            local original_relpath = entry.file.original_relpath
+            if not original_relpath or original_relpath == "" then
+              failures[#failures + 1] = { file = entry.file.filename, message = "Missing original path for renamed file" }
+              next_entry()
+            else
+              run_git_at_root_async(cwd, { "restore", "--staged", "--", relpath, original_relpath }, nil, function(restore_result)
+                if not restore_result.ok then
+                  add_failure(restore_result)
+                  next_entry()
+                  return
+                end
+                run_git_at_root_async(cwd, { "checkout", "--", original_relpath }, nil, function(checkout_result)
+                  if checkout_result.ok then
+                    delete_file(entry.file.filename, " after restoring renamed file")
+                  else
+                    add_failure(checkout_result)
+                  end
+                  next_entry()
+                end)
+              end)
+            end
+          elseif git_status_is_deleted(entry.file.git_status) then
+            run_git_at_root_async(cwd, { "restore", "--staged", "--", relpath }, nil, function(restore_result)
+              if not restore_result.ok then
+                add_failure(restore_result)
+                next_entry()
+                return
+              end
+              run_git_at_root_async(cwd, { "checkout", "--", relpath }, nil, function(checkout_result)
+                if not checkout_result.ok then add_failure(checkout_result) end
+                next_entry()
+              end)
+            end)
+          else
+            run_git_at_root_async(cwd, { "restore", "--staged", "--", relpath }, nil, function(restore_result)
+              if not restore_result.ok then
+                add_failure(restore_result)
+                next_entry()
+                return
+              end
+              run_git_at_root_async(cwd, { "checkout", "--", relpath }, nil, function(checkout_result)
+                if not checkout_result.ok then add_failure(checkout_result) end
+                next_entry()
+              end)
+            end)
+          end
         end
       end
     end
@@ -6026,8 +6227,9 @@ local function setup_status_keymaps(buf)
     vim.api.nvim_create_autocmd("CursorMoved", {
       buffer = buf,
       callback = function()
+        if (M.config or config.options or config.defaults).status_cursor_prewarm == false then return end
         if M._status_states and M._status_states[buf] then M._status = M._status_states[buf] end
-        status_prewarm_entry_syntax(status_entry_under_cursor())
+        status_defer_prewarm_under_cursor(buf)
       end,
     })
     return
@@ -6098,7 +6300,9 @@ local function setup_status_keymaps(buf)
   vim.api.nvim_create_autocmd("CursorMoved", {
     buffer = buf,
     callback = function()
-      status_prewarm_entry_syntax(status_entry_under_cursor())
+      if (M.config or config.options or config.defaults).status_cursor_prewarm == false then return end
+      if M._status_states and M._status_states[buf] then M._status = M._status_states[buf] end
+      status_defer_prewarm_under_cursor(buf)
     end,
   })
 end

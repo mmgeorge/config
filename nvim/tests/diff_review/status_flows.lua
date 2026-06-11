@@ -9,12 +9,21 @@ local calls = {}
 local deletes = {}
 local state = {}
 local held_systemlist_async = nil
+local held_gh_async = nil
 local captured_notifications = {}
+local gh_calls = 0
 
 ---@type DiffReviewGhBackend
 local gh_backend = {}
 
 function gh_backend.system_async(_, _, cb)
+  gh_calls = gh_calls + 1
+  if held_gh_async then
+    held_gh_async[#held_gh_async + 1] = function()
+      cb({ code = 1, stdout = "", stderr = "no pull requests found", output = "no pull requests found" })
+    end
+    return
+  end
   vim.defer_fn(function()
     cb({ code = 1, stdout = "", stderr = "no pull requests found", output = "no pull requests found" })
   end, 5)
@@ -46,6 +55,10 @@ local function reset_notifications()
   captured_notifications = {}
 end
 
+local function reset_gh_calls()
+  gh_calls = 0
+end
+
 local function saw_notification_containing(needle)
   for _, notification in ipairs(captured_notifications) do
     if notification.message:find(needle, 1, true) then return true end
@@ -59,6 +72,9 @@ local function reset_state(next_state)
     staged_modified = next_state.staged_modified or {},
     untracked = next_state.untracked or {},
     staged_added = next_state.staged_added or {},
+    unstaged_added = next_state.unstaged_added or {},
+    staged_deleted = next_state.staged_deleted or {},
+    staged_renamed = next_state.staged_renamed or {},
     ignored = next_state.ignored or {},
   }
   reset_calls()
@@ -148,16 +164,26 @@ function backend.systemlist(command)
     return sorted_keys(state.untracked), 0
   end
   if key == "git\t-C\t" .. root .. "\tdiff\t--name-status" then
-    return name_status(state.modified, "M"), 0
+    local lines = name_status(state.modified, "M")
+    vim.list_extend(lines, name_status(state.unstaged_added, "A"))
+    table.sort(lines)
+    return lines, 0
   end
   if key == "git\t-C\t" .. root .. "\tdiff\t--cached\t--name-status" then
     local lines = name_status(state.staged_modified, "M")
     vim.list_extend(lines, name_status(state.staged_added, "A"))
+    vim.list_extend(lines, name_status(state.staged_deleted, "D"))
+    for new_path, old_path in pairs(state.staged_renamed) do
+      lines[#lines + 1] = "R100\t" .. old_path .. "\t" .. new_path
+    end
     table.sort(lines)
     return lines, 0
   end
   if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff" then
-    return output_lines(joined_diff(state.modified, modified_diff)), 0
+    local text = joined_diff(state.modified, modified_diff)
+    local added = joined_diff(state.unstaged_added, added_diff)
+    if text ~= "" and added ~= "" then text = text .. "\n" .. added else text = text .. added end
+    return output_lines(text), 0
   end
   if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--cached" then
     local text = joined_diff(state.staged_modified, modified_diff)
@@ -216,8 +242,25 @@ function backend.system(command, input)
   end
 
   if key:find("\trestore\t--staged\t--\t", 1, true) then
+    if #command >= 7 and state.staged_renamed[command[#command - 1]] == command[#command] then
+      local new_path = command[#command - 1]
+      state.staged_renamed[new_path] = nil
+      state.untracked[new_path] = true
+      state.modified[command[#command]] = true
+      return "", 0
+    end
     if state.staged_modified[relpath] then
       state.staged_modified[relpath] = nil
+      state.modified[relpath] = true
+      return "", 0
+    end
+    if state.unstaged_added[relpath] then
+      state.unstaged_added[relpath] = nil
+      state.untracked[relpath] = true
+      return "", 0
+    end
+    if state.staged_deleted[relpath] then
+      state.staged_deleted[relpath] = nil
       state.modified[relpath] = true
       return "", 0
     end
@@ -245,6 +288,17 @@ function backend.system(command, input)
       return "", 0
     end
     return "checkout failed for " .. relpath, 1
+  end
+
+  if key:find("\tcheckout\t--\t", 1, true) then
+    if state.modified[relpath] then
+      state.modified[relpath] = nil
+      return "", 0
+    end
+    if relpath ~= command[#command] then
+      return "unexpected checkout relpath mismatch", 1
+    end
+    return "worktree checkout failed for " .. relpath, 1
   end
 
   if key:find("\tapply\t", 1, true) then
@@ -437,6 +491,18 @@ local function release_systemlist_async()
   end
 end
 
+local function hold_gh_async()
+  held_gh_async = {}
+end
+
+local function release_gh_async()
+  local callbacks = held_gh_async or {}
+  held_gh_async = nil
+  for _, callback in ipairs(callbacks) do
+    vim.defer_fn(callback, 0)
+  end
+end
+
 local function render_and_wait(buf, needle)
   diff_review.render_status(buf)
   wait_for(function() return buffer_contains(buf, needle) end, "status did not render " .. needle)
@@ -476,6 +542,56 @@ local function run()
 
   reset_state({ modified = { ["mod.txt"] = true } })
   render_and_wait(buf, "mod.txt +1 -1")
+  wait_for(function() return gh_calls > 0 end, "initial PR lookup did not run")
+
+  reset_state({ modified = { ["startup-pr-delay.txt"] = true } })
+  reset_gh_calls()
+  diff_review.render_status(buf, nil, nil, { refresh_pr = true })
+  wait_for(function() return buffer_contains(buf, "startup-pr-delay.txt +1 -1") end, "status did not render before PR lookup")
+  assert_true(gh_calls == 0, "PR lookup started before initial status render")
+  wait_for(function() return gh_calls > 0 end, "deferred PR lookup did not run after status render")
+
+  reset_state({ modified = { ["pr-header-only.txt"] = true } })
+  reset_gh_calls()
+  hold_gh_async()
+  diff_review.render_status(buf, nil, nil, { refresh_pr = true })
+  wait_for(function() return buffer_contains(buf, "pr-header-only.txt +1 -1") end, "status did not render before held PR lookup")
+  wait_for(function() return gh_calls > 0 end, "held PR lookup did not start")
+  local original_render_status = diff_review.render_status
+  local pr_completion_rerendered = false
+  diff_review.render_status = function(...)
+    pr_completion_rerendered = true
+    return original_render_status(...)
+  end
+  release_gh_async()
+  wait_for(function() return buffer_contains(buf, "PR:     none") end, "PR completion did not patch header line")
+  diff_review.render_status = original_render_status
+  assert_true(not pr_completion_rerendered, "PR completion rerendered the full status buffer")
+
+  reset_state({ modified = { ["mock-pr-delay.txt"] = true } })
+  reset_gh_calls()
+  diff_review.setup({ pr_lookup_mode = "mock-delay", pr_mock_delay_ms = 20 })
+  diff_review.render_status(buf, nil, nil, { refresh_pr = true })
+  wait_for(function() return buffer_contains(buf, "mock-pr-delay.txt +1 -1") end, "mock PR delay status did not render")
+  assert_true(gh_calls == 0, "mock PR delay spawned gh before timer")
+  wait_for(function() return buffer_contains(buf, "PR:     none") end, "mock PR delay did not finish as no PR")
+  assert_true(gh_calls == 0, "mock PR delay spawned gh")
+  diff_review.setup()
+
+  reset_state({ modified = { ["mod.txt"] = true } })
+  render_and_wait(buf, "mod.txt +1 -1")
+  local original_compute_diff_syntax_async = diff_review.compute_diff_syntax_async
+  local prewarm_count = 0
+  diff_review.compute_diff_syntax_async = function(_, _, cb)
+    prewarm_count = prewarm_count + 1
+    cb(nil)
+  end
+  vim.api.nvim_win_set_cursor(0, { find_row(buf, "mod.txt"), 0 })
+  vim.api.nvim_exec_autocmds("CursorMoved", { buffer = buf })
+  assert_true(prewarm_count == 0, "CursorMoved started diff syntax prewarm synchronously")
+  wait_for(function() return prewarm_count > 0 end, "deferred cursor prewarm did not run")
+  diff_review.compute_diff_syntax_async = original_compute_diff_syntax_async
+
   reset_notifications()
   trigger_normal_mapping("S", find_row(buf, "mod.txt"))
   wait_for(function()
@@ -956,9 +1072,42 @@ local function run()
   trigger_normal_mapping("j", find_row(buf, "discard-modified.txt"))
   confirm_yes()
   wait_for(function()
-    return saw_system_call("git\t-C\t" .. root .. "\tcheckout\tHEAD\t--\tdiscard-modified.txt")
-  end, "discard tracked file did not run checkout")
+    return saw_system_call("git\t-C\t" .. root .. "\tcheckout\t--\tdiscard-modified.txt")
+  end, "discard unstaged tracked file did not run worktree-only checkout")
+  assert_true(
+    not saw_system_call("git\t-C\t" .. root .. "\tcheckout\tHEAD\t--\tdiscard-modified.txt"),
+    "discard unstaged tracked file used HEAD checkout"
+  )
   wait_for(function() return not buffer_contains(buf, "discard-modified.txt") end, "discard tracked file did not refresh")
+
+  reset_state({ modified = { ["discard-mixed.txt"] = true }, staged_modified = { ["discard-mixed.txt"] = true } })
+  render_and_wait(buf, "discard-mixed.txt +1 -1")
+  reset_calls()
+  trigger_normal_mapping("j", find_row_after(buf, "discard-mixed.txt", find_row(buf, "Unstaged changes")))
+  confirm_yes()
+  wait_for(function()
+    return saw_system_call("git\t-C\t" .. root .. "\tcheckout\t--\tdiscard-mixed.txt")
+  end, "discard unstaged file did not run worktree-only checkout")
+  assert_true(
+    not saw_system_call("git\t-C\t" .. root .. "\tcheckout\tHEAD\t--\tdiscard-mixed.txt"),
+    "discard unstaged file reset the index through HEAD checkout"
+  )
+  wait_for(function()
+    return state.modified["discard-mixed.txt"] == nil and state.staged_modified["discard-mixed.txt"] == true
+  end, "discard unstaged file did not preserve staged changes")
+  wait_for(function()
+    return buffer_contains(buf, "Staged changes (1)") and not buffer_contains(buf, "Unstaged changes")
+  end, "discard unstaged file did not leave only staged changes")
+
+  reset_state({ unstaged_added = { ["discard-intent-added.txt"] = true } })
+  render_and_wait(buf, "discard-intent-added.txt +1 -0")
+  reset_calls()
+  trigger_normal_mapping("j", find_row(buf, "discard-intent-added.txt"))
+  confirm_yes()
+  wait_for(function()
+    return saw_system_call("git\t-C\t" .. root .. "\trestore\t--staged\t--\tdiscard-intent-added.txt") and #deletes == 1
+  end, "discard unstaged added file did not unstage then delete")
+  wait_for(function() return not buffer_contains(buf, "discard-intent-added.txt") end, "discard unstaged added file did not refresh")
 
   reset_state({ modified = { ["discard-hunk.txt"] = true } })
   render_and_wait(buf, "discard-hunk.txt +1 -1")
@@ -1018,14 +1167,52 @@ local function run()
   trigger_normal_mapping("j", find_row(buf, "discard-added.txt"))
   confirm_yes()
   wait_for(function()
-    return saw_system_call("git\t-C\t" .. root .. "\tcheckout\tHEAD\t--\tdiscard-added.txt")
-      and saw_system_call("git\t-C\t" .. root .. "\trm\t--cached\t--ignore-unmatch\t--\tdiscard-added.txt")
+    return saw_system_call("git\t-C\t" .. root .. "\trm\t--cached\t--ignore-unmatch\t--\tdiscard-added.txt")
       and #deletes == 1
   end, "discard staged addition did not unstage with rm --cached and delete")
   assert_true(
     not saw_system_call("git\t-C\t" .. root .. "\trestore\t--staged\t--\tdiscard-added.txt"),
     "discard staged addition used restore --staged"
   )
+  assert_true(
+    not saw_system_call("git\t-C\t" .. root .. "\tcheckout\tHEAD\t--\tdiscard-added.txt"),
+    "discard staged addition used HEAD checkout"
+  )
+
+  reset_state({ staged_modified = { ["discard-staged-modified.txt"] = true } })
+  render_and_wait(buf, "discard-staged-modified.txt +1 -1")
+  reset_calls()
+  trigger_normal_mapping("j", find_row(buf, "discard-staged-modified.txt"))
+  confirm_yes()
+  wait_for(function()
+    return saw_system_call("git\t-C\t" .. root .. "\trestore\t--staged\t--\tdiscard-staged-modified.txt")
+      and saw_system_call("git\t-C\t" .. root .. "\tcheckout\t--\tdiscard-staged-modified.txt")
+  end, "discard staged modified file did not reset index then checkout worktree")
+  assert_true(
+    not saw_system_call("git\t-C\t" .. root .. "\tcheckout\tHEAD\t--\tdiscard-staged-modified.txt"),
+    "discard staged modified file used HEAD checkout"
+  )
+
+  reset_state({ staged_deleted = { ["discard-staged-deleted.txt"] = true } })
+  render_and_wait(buf, "discard-staged-deleted.txt +0 -0")
+  reset_calls()
+  trigger_normal_mapping("j", find_row(buf, "discard-staged-deleted.txt"))
+  confirm_yes()
+  wait_for(function()
+    return saw_system_call("git\t-C\t" .. root .. "\trestore\t--staged\t--\tdiscard-staged-deleted.txt")
+      and saw_system_call("git\t-C\t" .. root .. "\tcheckout\t--\tdiscard-staged-deleted.txt")
+  end, "discard staged deleted file did not reset index then restore worktree")
+
+  reset_state({ staged_renamed = { ["discard-staged-new.txt"] = "discard-staged-old.txt" } })
+  render_and_wait(buf, "discard-staged-new.txt +0 -0")
+  reset_calls()
+  trigger_normal_mapping("j", find_row(buf, "discard-staged-new.txt"))
+  confirm_yes()
+  wait_for(function()
+    return saw_system_call("git\t-C\t" .. root .. "\trestore\t--staged\t--\tdiscard-staged-new.txt\tdiscard-staged-old.txt")
+      and saw_system_call("git\t-C\t" .. root .. "\tcheckout\t--\tdiscard-staged-old.txt")
+      and #deletes == 1
+  end, "discard staged rename did not reset both paths, restore original, and delete new path")
 end
 
 local ok, err = xpcall(run, debug.traceback)

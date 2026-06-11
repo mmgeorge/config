@@ -2,6 +2,10 @@
 ---@field status_buffer_name string
 ---@field pr_buffer_name string
 ---@field debug_notifications boolean
+---@field pr_lookup_mode? "real"|"mock-delay"
+---@field pr_mock_delay_ms? integer
+---@field status_cursor_prewarm boolean
+---@field about_auto_generate boolean
 ---@field keymaps DiffReviewKeymapConfig
 
 ---@alias DiffReviewKeymap string|string[]|false
@@ -37,6 +41,10 @@ M.defaults = {
   status_buffer_name = "DiffReviewStatus",
   pr_buffer_name = "DiffReviewPR",
   debug_notifications = false,
+  pr_lookup_mode = "real",
+  pr_mock_delay_ms = 5000,
+  status_cursor_prewarm = true,
+  about_auto_generate = true,
   keymaps = {
     status = {
       close = "q",

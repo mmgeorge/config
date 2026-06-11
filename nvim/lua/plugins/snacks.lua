@@ -157,7 +157,7 @@ return {
               "fixtures",
               "codegen",
               -- For the JS SDK
-              "smartMapping",
+              -- "smartMapping",
               "webscene",
               -- "3d",
               -- "3D",
