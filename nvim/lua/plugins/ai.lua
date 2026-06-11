@@ -15,12 +15,77 @@ local function get_open_buffers_by_filetype(ft)
   return open_bufs
 end
 
-local function filetype(context)
-  if context.filetype == "typescriptreact" then
-    return "typescriptreact"
-  end
+-- Inline editing commands (ported from the CodeCompanion inline prompt
+-- library) on top of require("ai.inline"): the model generates complete
+-- replacement/insertion text that is spliced around the selection.
 
-  return context.filetype
+---@param cmd_args table user command callback args
+---@return AIInlineRange
+local function inline_range(cmd_args)
+  return { start_line = cmd_args.line1, end_line = cmd_args.line2 }
+end
+
+---@param buf integer
+---@return fun(selected_text: string): string
+local function doc_prompt(buf)
+  return function(selected_text)
+    local ft = vim.bo[buf].filetype
+    local buffer_text = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+    return string.format(
+      [[Write a documentation comment for the selected code. Follow these rules:
+1. Use the idiomatic documentation style for the language (for instance jsdoc for javascript and typescript, /// doc comments for rust).
+2. If the code already has documentation, incorporate its content.
+3. Be as succinct as possible (at most 2 sentences).
+4. Do NOT document specific function parameters or the return value.
+5. Keep every line under 80 characters.
+6. Respond with ONLY the comment lines that go directly above the selection.
+
+For additional context, the entire file is:
+```%s
+%s
+```
+
+The code to document:
+```%s
+%s
+```]],
+      ft, buffer_text, ft, selected_text
+    )
+  end
+end
+
+local function setup_inline_commands()
+  vim.api.nvim_create_user_command("AIDoc", function(cmd_args)
+    require("ai.inline").inline({
+      type = "before",
+      range = inline_range(cmd_args),
+      prompt = doc_prompt(vim.api.nvim_get_current_buf()),
+    })
+  end, { range = true, desc = "AI: insert documentation above the selection" })
+
+  vim.api.nvim_create_user_command("AIReplace", function(cmd_args)
+    require("ai.inline").inline({
+      type = "replace",
+      range = inline_range(cmd_args),
+      prompt = cmd_args.args,
+    })
+  end, { range = true, nargs = "+", desc = "AI: rewrite the selection per the instruction" })
+
+  vim.api.nvim_create_user_command("AIBefore", function(cmd_args)
+    require("ai.inline").inline({
+      type = "before",
+      range = inline_range(cmd_args),
+      prompt = cmd_args.args,
+    })
+  end, { range = true, nargs = "+", desc = "AI: insert generated text above the selection" })
+
+  vim.api.nvim_create_user_command("AIAfter", function(cmd_args)
+    require("ai.inline").inline({
+      type = "after",
+      range = inline_range(cmd_args),
+      prompt = cmd_args.args,
+    })
+  end, { range = true, nargs = "+", desc = "AI: insert generated text below the selection" })
 end
 
 local function first_file_line(path)
@@ -184,6 +249,7 @@ return {
 
     },
     init = function()
+      setup_inline_commands()
       vim.api.nvim_create_autocmd("User", {
         pattern = "NeogitStatusRefreshed",
         callback = function()
@@ -293,54 +359,6 @@ return {
         }
       },
       prompt_library = {
-        ["Generate documentation"] = {
-          interaction = "inline",
-          description = "Generate documentation",
-          opts = {
-            placement = "before",
-            index = 10,
-            is_default = true,
-            is_slash_cmd = true,
-            alias = "doc",
-            auto_submit = true,
-          },
-          prompts = {
-            {
-              role = "user",
-              content = function(context)
-                local code = require("codecompanion.helpers.actions").get_code(context.start_line, context.end_line)
-                local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
-                local buffer_text = table.concat(lines, '\n')
-                local ft = filetype(context)
-
-                return string.format(
-                  [[Document the below code. Use the following steps:
-1. Identify the programming language
-2. Lookup the best style practices for adding documentation in that language. For instance, when documenting javascript or typescript, use jsdoc style.
-3. Identify every function, method, or class in the passed code. These are the things that you will add documentation to.
-4. If the function already has documentation, try to incorporate that into the new documentation. It is OK to remove some of it, but the content should still be there.
-5. Be as succinct as possible in the documentation that you generate (2 sentences).
-6. Do NOT document specific function parameters or the return value.
-
-Each line of the generated documentation should not be longer than 80 characters.
-
-For additional context, the entire file is:
-```%s
-%s
-```
-
-This is the code to document:
-```%s
-%s
-```
-]], ft, buffer_text, ft, code)
-              end,
-              opts = {
-                contains_code = true,
-              },
-            },
-          },
-        },
         ["Generate component"] = {
           interaction = "chat",
           description = "Generate component",

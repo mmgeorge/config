@@ -2,9 +2,10 @@ local M = {}
 
 --- Adapter selection for AI features. `chat`, `inline`, and `cmd` are
 --- CodeCompanion adapter configs (the chat UI still runs on CodeCompanion).
---- `commit` is a model token for the local `ai` prompt library (see
---- AGENTS.md in this directory).
----@return { chat: table|string, inline: table|string, cmd: string, commit: string }
+--- `commit` and `inline_edit` are model tokens for the local `ai` prompt
+--- library (see AGENTS.md in this directory): `commit` drives commit-message
+--- generation, `inline_edit` drives require("ai.inline").
+---@return { chat: table|string, inline: table|string, cmd: string, commit: string, inline_edit: string }
 function M.get()
   if os.getenv("GEMINI_API_KEY") then
     return {
@@ -18,6 +19,7 @@ function M.get()
       },
       cmd = "gemini",
       commit = "gemini3-lite,thinking=minimal",
+      inline_edit = "gemini3,thinking=minimal",
     }
   end
 
@@ -26,6 +28,7 @@ function M.get()
     inline = "copilot",
     cmd = "copilot",
     commit = "copilot-nano",
+    inline_edit = "copilot-mini",
   }
 end
 

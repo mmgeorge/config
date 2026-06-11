@@ -11,6 +11,7 @@ developer_instructions = '''
 
 The user explicitly authorizes Codex to use multi-agent subagents in future sessions whenever project or global instructions call for explorer/delegation workflows. '''
 service_tier = "fast"
+terminal_title = ["project"]
 # plan_mode_reasoning_effort = "high"
 # disable_paste_burst = true
 
@@ -97,6 +98,8 @@ sandbox = "elevated"
 
 [tui]
 vim_mode_default = false
+animations = false
+terminal_title = ["project"]
 
 [tui.keymap.vim_normal]
 move_left = "n"

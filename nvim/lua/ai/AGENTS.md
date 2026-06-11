@@ -20,6 +20,7 @@ commit generation).
 | `require("ai").generate_with_tools(opts, cb)` | Prompt with tool calling (native tools, registry tools, MCP) |
 | `require("ai").resolve(token)` | Validate/resolve a model token without sending anything |
 | `require("ai").set_backend(backend)` / `reset_backend()` | Test seam (HTTP, file reads, clock) |
+| `require("ai.inline").inline(opts, on_done?)` | Prompt about a selection, splice the response into the buffer |
 | `require("ai.tools").get(name)` | Resolve a registry key to a callable tool |
 | `require("ai.tools").registry` | The named-tool registry table |
 | `require("ai.mcp").tools(server_names)` | mcphub servers -> AITool list (used by the `mcps` option) |
@@ -80,6 +81,47 @@ Semantics:
   arguments, a `run` that throws - are fed back to the model as the tool
   output (`"Error: ..."`) so it can recover instead of aborting.
 - Requested calls run sequentially in the order the model asked for them.
+
+### inline (inline.lua)
+
+Inline editing: run a prompt about the current selection and splice the
+model's text back into the buffer. Unlike CodeCompanion's inline interaction
+the model always generates the COMPLETE text (no diff formats - those are
+error-prone); we do the splicing.
+
+```lua
+require("ai.inline").inline({
+  type = "replace",          -- "replace" | "before" | "after"
+  prompt = function(selected_text)         -- or a plain instruction string
+    return "Make this function async:\n" .. selected_text
+  end,
+  -- model = "gpt-mini",     -- defaults to adapters().inline_edit
+  -- range = { start_line = 10, end_line = 20 },  -- defaults to the visual selection
+  -- system = "...",         -- extra guidance appended to the placement prompt
+})
+```
+
+- `replace` swaps the selected lines for the response; `before`/`after`
+  insert the response above/below the selection (documentation, trait
+  impls, tests, usage examples).
+- A string `prompt` is wrapped together with the filetype-fenced selection;
+  a function `prompt(selected_text)` builds the entire user message itself.
+- The selection is tracked with extmarks while the request is in flight, so
+  concurrent edits elsewhere in the buffer do not shift the splice target.
+- The splice is one undo step - `u` is the reject button. Code fences around
+  the response are stripped.
+- The placement-specific system prompt lives in `inline.lua`
+  (`system_prompts`); per-call `system` text is appended to it.
+
+User commands (registered in `nvim/lua/plugins/ai.lua`, all range-aware -
+select lines first):
+
+| Command | Behavior |
+| --- | --- |
+| `:'<,'>AIDoc` | Insert a documentation comment above the selection (port of the old CodeCompanion "Generate documentation" inline prompt) |
+| `:'<,'>AIReplace <instruction>` | Rewrite the selection per the instruction |
+| `:'<,'>AIBefore <instruction>` | Insert generated text above the selection |
+| `:'<,'>AIAfter <instruction>` | Insert generated text below the selection (e.g. "implement this trait for struct Foo") |
 
 ### Tool registry (tools.lua)
 
@@ -212,6 +254,7 @@ Any omitted method falls back to the real implementation. `set_backend` and
 ```text
 nvim --headless -i NONE --cmd "set shadafile=NONE" -u nvim/init.lua -c "lua vim.loader.enable(false)" -S nvim/tests/ai/generate.lua
 nvim --headless -i NONE --cmd "set shadafile=NONE" -u nvim/init.lua -c "lua vim.loader.enable(false)" -S nvim/tests/ai/tools.lua
+nvim --headless -i NONE --cmd "set shadafile=NONE" -u nvim/init.lua -c "lua vim.loader.enable(false)" -S nvim/tests/ai/inline.lua
 ```
 
 `generate.lua` covers token resolution errors, per-provider request shapes
@@ -220,9 +263,11 @@ reasoning items), HTTP errors, and the copilot token exchange/cache/refresh
 flow. `tools.lua` covers the tool loop per provider (multi-turn request
 shapes, thoughtSignature echo, parallel calls), error feedback, max_rounds,
 tool validation, registry references, and the mcps option against a fake
-mcphub injected via `package.loaded`. All against mock responses - tests
-must never need a network. New presets, providers, or tool plumbing need
-coverage there.
+mcphub injected via `package.loaded`. `inline.lua` covers splicing for all
+three placements, fence stripping, extmark tracking across concurrent
+edits, prompt wrapping, and error paths (buffer untouched on failure). All
+against mock responses - tests must never need a network. New presets,
+providers, or tool plumbing need coverage there.
 
 LuaLS annotations are required (same policy as `nvim/lua/diff_review`):
 shared classes (`AIProvider`, `AIModelSpec`, `AIGenerateOpts`, ...) live in
