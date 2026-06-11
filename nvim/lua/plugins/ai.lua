@@ -23,46 +23,6 @@ local function filetype(context)
   return context.filetype
 end
 
-local commit_context_limit = {
-  stat = 12000,
-  diff = 180000,
-}
-
-local compact_diff_options = {
-  max_hunks = 30,
-  max_changed_lines = 800,
-  min_hunk_changed_lines = 8,
-  hunk_head_lines = 12,
-}
-
-local function truncate_at_line(text, limit)
-  if #text <= limit then
-    return text, false
-  end
-
-  local truncated = text:sub(1, limit)
-  local last_newline = truncated:match(".*()\n")
-  if last_newline and last_newline > 1 then
-    truncated = truncated:sub(1, last_newline - 1)
-  end
-  return truncated, true
-end
-
-local function git_output(args, cwd)
-  local command = { "git" }
-  if cwd and cwd ~= "" then
-    vim.list_extend(command, { "-C", cwd })
-  end
-  vim.list_extend(command, args)
-
-  local output = vim.fn.system(command)
-  if vim.v.shell_error ~= 0 then
-    return nil
-  end
-
-  return output
-end
-
 local function first_file_line(path)
   local ok, lines = pcall(vim.fn.readfile, path, "", 1)
   if not ok or not lines[1] then
@@ -111,233 +71,22 @@ local function commit_buffer_git_root(buf)
   return worktree_root_from_git_dir(vim.fs.dirname(name))
 end
 
-local function build_commit_context(cwd, ref)
-  local stat_args = { "diff", "--no-ext-diff", "--no-color" }
-  local diff_args = { "diff", "--no-ext-diff", "--no-color" }
-  if ref == "staged" then
-    table.insert(stat_args, "--staged")
-    table.insert(diff_args, "--staged")
-  else
-    table.insert(stat_args, ref)
-    table.insert(diff_args, ref)
-  end
-  vim.list_extend(stat_args, { "--stat", "--summary" })
-
-  local stat = git_output(stat_args, cwd)
-  local diff = git_output(diff_args, cwd)
-
-  if not diff or vim.trim(diff) == "" then
-    return nil
-  end
-
-  local compacted_diff, diff_compacted, diff_metrics = require("git.diff").compact(diff, compact_diff_options)
-  local truncated_stat, stat_truncated = truncate_at_line(stat or "", commit_context_limit.stat)
-  local truncated_diff, diff_truncated = truncate_at_line(compacted_diff, commit_context_limit.diff)
-  local truncated = stat_truncated or diff_truncated
-
-  local sections = {
-    "Generate a conventional commit message for these staged changes.",
-  }
-
-  if diff_compacted then
-    table.insert(
-      sections,
-      ("Large diff compacted after counting %d hunks and %d changed lines. " ..
-        "The compact diff starts with an overall summary and only includes large hunks."):format(
-        diff_metrics.hunks,
-        diff_metrics.changed
-      )
-    )
-  end
-
-  if truncated then
-    table.insert(
-      sections,
-      "Some context is truncated to avoid exceeding the model request size. " ..
-      "Use the diff summary for overall scope, and visible hunks for details."
-    )
-  end
-
-  if vim.trim(truncated_stat) ~= "" then
-    table.insert(sections, "Diff summary:\n```text\n" .. truncated_stat .. "\n```")
-  end
-
-  table.insert(sections, "Diff:\n```diff\n" .. truncated_diff .. "\n```")
-
-  return table.concat(sections, "\n\n")
-end
-
-local function staged_commit_context(buf)
-  local cwd = commit_buffer_git_root(buf)
-  if not cwd then
-    vim.notify("Could not resolve git root for commit message", "warn", { title = "commit" })
-    return nil
-  end
-
-  return build_commit_context(cwd, "staged")
-end
-
-local function format_error(err)
-  if type(err) == "string" then
-    return err
-  end
-
-  if type(err) == "table" then
-    for _, key in ipairs({ "message", "error", "stderr", "output", "reason" }) do
-      local value = err[key]
-      if type(value) == "string" and vim.trim(value) ~= "" then
-        return value
-      end
-    end
-    return vim.inspect(err)
-  end
-
-  return tostring(err)
-end
-
-local commit_system_prompt = [[You are a factual commit message generator following Conventional Commits.
-Respond with ONLY the commit message - no code blocks, no explanation,
-commentary, alternatives, or preface.
-
-Format:
-<type>: <description>
-
-[body]
-
-Types: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert
-
-Description rules:
-- Imperative mood ("add feature" not "added feature")
-- Describe the concrete code change, not intent, benefit, or motivation
-- Lowercase first letter, no trailing period
-- Max 50 characters
-- Prefer specific nouns from the diff over abstract summaries
-- Do not add subjective qualifiers or purpose phrases like "for flexibility",
-  "for extensibility", "improve", "enhance", "future-proof", or "better"
-
-Examples:
-- Bad: feat: refactor parquet data source handling for flexibility
-- Bad: refactor: improve parquet extensibility
-- Good: refactor: pass parquet data source objects
-
-Body (rare):
-- Default to no body
-- Never write a body for chore commits
-- Only write a body when the subject alone is materially incomplete and
-  omits important factual changes
-- Do not write a body for benefits, motivation, or generic summary
-- If needed, include only essential factual "what changed" details from the
-  diff, such as API shape changes, behavior changes, migrations, or tests
-- Wrap at 72 chars. Max two lines.]]
-
-local pregen = nil
+-- Commit-message generation lives in diff_review.ai_commit (context building,
+-- pregeneration state, staged/HEAD fingerprint reuse) on top of the `ai`
+-- prompt library. This file only wires the global triggers: pregenerate on
+-- Neogit refresh, and populate plain COMMIT_EDITMSG buffers that DiffReview
+-- does not own.
 local pregen_debounce_timer = nil
 
-local function changes_fingerprint(cwd, ref)
-  local args = { "diff", "--no-ext-diff", "--no-color" }
-  if ref == "staged" then
-    table.insert(args, "--staged")
-  else
-    table.insert(args, ref)
-  end
-  vim.list_extend(args, { "--stat", "--summary" })
-  local output = git_output(args, cwd)
-  if not output or vim.trim(output) == "" then
-    return nil
-  end
-  return vim.trim(output)
-end
-
 local function pregenerate_commit()
-  local root = git_output({ "rev-parse", "--show-toplevel" })
-  if not root then return end
-  root = vim.trim(root)
-  if root == "" then return end
-
-  local fingerprint = changes_fingerprint(root, "HEAD")
-  if not fingerprint then return end
-
-  if pregen and pregen.fingerprint == fingerprint and pregen.cwd == root then
-    return
-  end
-
-  pregen = { fingerprint = fingerprint, cwd = root, message = nil, pending = true }
-
-  local context = build_commit_context(root, "HEAD")
-  if not context then
-    pregen = nil
-    return
-  end
-
-  local Background = require("codecompanion.interactions.background")
-  local adapter_config = adapters().commit
-  local background = Background.new({ adapter = adapter_config })
-  local inline_output = background
-      and background.adapter
-      and background.adapter.handlers
-      and background.adapter.handlers.inline_output
-
-  if type(inline_output) == "function" and not background.adapter.handlers._commit_safe_inline_output then
-    background.adapter.handlers.inline_output = function(self, data, context)
-      if type(data) == "string" then
-        data = { body = data }
-      end
-      return inline_output(self, data, context)
-    end
-    background.adapter.handlers._commit_safe_inline_output = true
-  end
-
-  background:ask({
-    { role = "system", content = commit_system_prompt },
-    { role = "user", content = context },
-  }, {
-    method = "async",
-    parse_handler = "parse_inline",
-    silent = true,
-    on_done = function(result)
-      if not pregen or pregen.fingerprint ~= fingerprint or pregen.cwd ~= root then
-        return
-      end
-
-      local content = result and result.output
-      if type(content) == "table" then
-        content = content.content
-      end
-
-      if type(content) ~= "string" or vim.trim(content) == "" then
-        local waiter = pregen.waiter
-        pregen = nil
-        if waiter then
-          vim.schedule(function()
-            waiter.on_error("No response from model")
-          end)
-        end
-        return
-      end
-
-      local msg = vim.trim(content)
-      msg = msg:gsub("^```%w*\n", ""):gsub("\n```$", "")
-      pregen.message = msg
-      pregen.pending = false
-
-      local waiter = pregen.waiter
-      if waiter then
-        pregen = nil
-        vim.schedule(function()
-          waiter.on_message(msg)
-        end)
-      end
-    end,
-    on_error = function(err)
-      local waiter = pregen and pregen.waiter
-      pregen = nil
-      if waiter then
-        vim.schedule(function()
-          waiter.on_error(format_error(err))
-        end)
-      end
-    end,
-  })
+  vim.system({ "git", "rev-parse", "--show-toplevel" }, { text = true }, function(result)
+    vim.schedule(function()
+      if result.code ~= 0 then return end
+      local root = vim.trim(result.stdout or "")
+      if root == "" then return end
+      require("diff_review.ai_commit").ensure(root, { ref = "HEAD" })
+    end)
+  end)
 end
 
 local function schedule_pregenerate()
@@ -447,203 +196,15 @@ return {
           if vim.b[args.buf].diff_review_commit_buffer then return end
           if vim.b[args.buf].ai_commit_generated then return end
 
-          local lines = vim.api.nvim_buf_get_lines(args.buf, 0, -1, false)
-          if lines[1] and lines[1] ~= "" then return end
-
-          vim.b[args.buf].ai_commit_generated = true
-
           local cwd = commit_buffer_git_root(args.buf)
-          if cwd and pregen then
-            local norm_cwd = vim.fs.normalize(cwd)
-            local norm_pregen = vim.fs.normalize(pregen.cwd)
-            if norm_cwd == norm_pregen then
-              local staged_fp = changes_fingerprint(cwd, "staged")
-              if staged_fp and staged_fp == pregen.fingerprint then
-                local adapter_config = adapters().commit
-                local adapter_name = type(adapter_config) == "table" and adapter_config.model or adapter_config
-
-                local function apply_message(msg)
-                  if not vim.api.nvim_buf_is_valid(args.buf) then return end
-                  local msg_lines = vim.split(msg, "\n", { plain = true })
-                  vim.api.nvim_buf_set_lines(args.buf, 0, 0, false, msg_lines)
-                  local winid = vim.fn.bufwinid(args.buf)
-                  if winid ~= -1 then
-                    vim.api.nvim_win_set_cursor(winid, { 1, 0 })
-                  end
-                  vim.notify(msg_lines[1], "info", {
-                    title = "commit (" .. adapter_name .. ", cached)",
-                    icon = " ",
-                  })
-                end
-
-                if pregen.message and not pregen.pending then
-                  local msg = pregen.message
-                  pregen = nil
-                  apply_message(msg)
-                  return
-                end
-
-                if pregen.pending then
-                  local spinner = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
-                  local notif_id = "commit_msg"
-                  local spinner_index = 1
-                  local spinner_timer = vim.uv.new_timer()
-
-                  local function stop_spinner()
-                    if spinner_timer and not spinner_timer:is_closing() then
-                      spinner_timer:stop()
-                      spinner_timer:close()
-                    end
-                  end
-
-                  local function show_spinner()
-                    vim.notify("Waiting for pre-generated commit message...", "info", {
-                      id = notif_id,
-                      title = "commit (" .. adapter_name .. ")",
-                      icon = spinner[spinner_index],
-                      timeout = false,
-                    })
-                  end
-
-                  show_spinner()
-                  spinner_timer:start(80, 80, vim.schedule_wrap(function()
-                    spinner_index = (spinner_index % #spinner) + 1
-                    show_spinner()
-                  end))
-
-                  pregen.waiter = {
-                    on_message = function(msg)
-                      stop_spinner()
-                      apply_message(msg)
-                    end,
-                    on_error = function(err_msg)
-                      stop_spinner()
-                      vim.notify("Pre-generation failed: " .. err_msg, "warn", {
-                        id = notif_id,
-                        title = "commit (" .. adapter_name .. ")",
-                        icon = " ",
-                      })
-                    end,
-                  }
-                  return
-                end
-              end
-            end
-          end
-          pregen = nil
-
-          local commit_context = staged_commit_context(args.buf)
-          if not commit_context then return end
-
-          local Background = require("codecompanion.interactions.background")
-          local adapter_config = adapters().commit
-          local adapter_name = type(adapter_config) == "table" and adapter_config.model or adapter_config
-          local background = Background.new({ adapter = adapter_config })
-          local inline_output = background
-              and background.adapter
-              and background.adapter.handlers
-              and background.adapter.handlers.inline_output
-
-          if type(inline_output) == "function" and not background.adapter.handlers._commit_safe_inline_output then
-            background.adapter.handlers.inline_output = function(self, data, context)
-              if type(data) == "string" then
-                data = { body = data }
-              end
-
-              return inline_output(self, data, context)
-            end
-            background.adapter.handlers._commit_safe_inline_output = true
+          if not cwd then
+            vim.notify("Could not resolve git root for commit message", vim.log.levels.WARN, { title = "commit" })
+            return
           end
 
-          local spinner = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
-          local notif_id = "commit_msg"
-          local spinner_index = 1
-          local spinner_timer = vim.uv.new_timer()
-
-          local function stop_spinner()
-            if spinner_timer and not spinner_timer:is_closing() then
-              spinner_timer:stop()
-              spinner_timer:close()
-            end
-          end
-
-          local function show_spinner()
-            vim.notify("Generating commit message...", "info", {
-              id = notif_id,
-              title = "commit (" .. adapter_name .. ")",
-              icon = spinner[spinner_index],
-              timeout = false,
-            })
-          end
-
-          show_spinner()
-
-          spinner_timer:start(80, 80, vim.schedule_wrap(function()
-            spinner_index = (spinner_index % #spinner) + 1
-            show_spinner()
-          end))
-
-          background:ask({
-            {
-              role = "system",
-              content = commit_system_prompt,
-            },
-            {
-              role = "user",
-              content = commit_context,
-            },
-          }, {
-            method = "async",
-            parse_handler = "parse_inline",
-            silent = true,
-            on_done = function(result)
-              vim.schedule(function()
-                stop_spinner()
-                if not vim.api.nvim_buf_is_valid(args.buf) then return end
-
-                local content = result and result.output
-                if type(content) == "table" then
-                  content = content.content
-                end
-
-                if type(content) ~= "string" or vim.trim(content) == "" then
-                  local message = "No response from model"
-                  if result and result.status == "error" and type(result.output) == "string" then
-                    message = result.output
-                  end
-                  vim.notify(message, "warn", { id = notif_id, title = "commit" })
-                  return
-                end
-                local msg = vim.trim(content)
-
-                msg = msg:gsub("^```%w*\n", ""):gsub("\n```$", "")
-
-                local msg_lines = vim.split(msg, "\n", { plain = true })
-                vim.api.nvim_buf_set_lines(args.buf, 0, 0, false, msg_lines)
-
-                local winid = vim.fn.bufwinid(args.buf)
-                if winid ~= -1 then
-                  vim.api.nvim_win_set_cursor(winid, { 1, 0 })
-                end
-
-                vim.notify(msg_lines[1], "info", {
-                  id = notif_id,
-                  title = "commit (" .. adapter_name .. ")",
-                  icon = " ",
-                })
-              end)
-            end,
-            on_error = function(err)
-              vim.schedule(function()
-                stop_spinner()
-                vim.notify("Failed: " .. format_error(err), "error", {
-                  id = notif_id,
-                  title = "commit (" .. adapter_name .. ")",
-                  icon = " ",
-                })
-              end)
-            end,
-          })
+          require("diff_review.ai_commit").populate_commit_buffer_when_ready(args.buf, cwd, function(message, level)
+            vim.notify(message, level, { title = "commit" })
+          end)
         end,
       })
     end,
@@ -694,9 +255,6 @@ return {
         cmd = {
           adapter = adapters().cmd,
         },
-        background = {
-          adapter = adapters().background,
-        }
       },
       display = {
         chat =  {

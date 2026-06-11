@@ -253,30 +253,9 @@ local function build_commit_context_async(cwd, ref, cb)
   end)
 end
 
----@param err any
----@return string
-local function format_error(err)
-  if type(err) == "string" then
-    return err
-  end
-  if type(err) == "table" then
-    for _, key in ipairs({ "message", "error", "stderr", "output", "reason" }) do
-      local value = err[key]
-      if type(value) == "string" and vim.trim(value) ~= "" then
-        return value
-      end
-    end
-    return vim.inspect(err)
-  end
-  return tostring(err)
-end
-
----@param content any
+---@param content string?
 ---@return string?
 local function normalize_message(content)
-  if type(content) == "table" then
-    content = content.content
-  end
   if type(content) ~= "string" or vim.trim(content) == "" then
     return nil
   end
@@ -293,53 +272,24 @@ local function generate_async(context, cb)
     return
   end
 
-  local ok_background, Background = pcall(require, "codecompanion.interactions.background")
-  if not ok_background then
-    cb({ ok = false, error = "CodeCompanion background interaction is unavailable" })
-    return
-  end
-
   local ok_adapters, adapters = pcall(require, "ai.adapters")
-  local adapter_config = ok_adapters and adapters.get().commit or "copilot"
-  local background = Background.new({ adapter = adapter_config })
-  local inline_output = background
-    and background.adapter
-    and background.adapter.handlers
-    and background.adapter.handlers.inline_output
-
-  if type(inline_output) == "function" and not background.adapter.handlers._commit_safe_inline_output then
-    background.adapter.handlers.inline_output = function(self, data, handler_context)
-      if type(data) == "string" then
-        data = { body = data }
-      end
-      return inline_output(self, data, handler_context)
+  local model = ok_adapters and adapters.get().commit or "copilot"
+  require("ai").generate({
+    model = model,
+    system = commit_system_prompt,
+    prompt = context,
+  }, function(result)
+    if not result.ok then
+      cb({ ok = false, error = result.error or "Unable to generate commit message" })
+      return
     end
-    background.adapter.handlers._commit_safe_inline_output = true
-  end
-
-  background:ask({
-    { role = "system", content = commit_system_prompt },
-    { role = "user", content = context },
-  }, {
-    method = "async",
-    parse_handler = "parse_inline",
-    silent = true,
-    on_done = function(result)
-      vim.schedule(function()
-        local message = normalize_message(result and result.output)
-        if not message then
-          cb({ ok = false, error = "No response from model" })
-          return
-        end
-        cb({ ok = true, message = message })
-      end)
-    end,
-    on_error = function(err)
-      vim.schedule(function()
-        cb({ ok = false, error = format_error(err) })
-      end)
-    end,
-  })
+    local message = normalize_message(result.content)
+    if not message then
+      cb({ ok = false, error = "No response from model" })
+      return
+    end
+    cb({ ok = true, message = message })
+  end)
 end
 
 ---@param state DiffReviewAICommitState
