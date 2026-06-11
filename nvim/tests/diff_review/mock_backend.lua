@@ -330,7 +330,7 @@ local function run()
   assert_true(saw_system_call("git\t-C\t" .. root .. "\trestore\t--staged\t--\tb.txt"), "missing git restore for b.txt")
   wait_for(function() return buffer_contains(buf, "Unstaged changes (2)") end, "status did not reconcile after queued stage/unstage")
 
-  local discard_mapping = vim.fn.maparg("D", "x", false, true)
+  local discard_mapping = vim.fn.maparg("j", "x", false, true)
   assert_true(type(discard_mapping.callback) == "function", "missing visual discard mapping")
 end
 

@@ -475,7 +475,7 @@ local function run()
   trigger_normal_mapping("?", find_row(status_buf, "Head:"))
   local help_buf = vim.api.nvim_get_current_buf()
   assert_true(help_buf ~= status_buf, "help did not open a popup buffer")
-  assert_buffer_contains_all(help_buf, { "<Tab>", "S", "U", "j", "cc", "opP", "opp", "ogp", "<CR>", "r", "or", "q", "?" })
+  assert_buffer_contains_all(help_buf, { "<Tab>", "N", "S", "U", "j", "cc", "opP", "opp", "ogp", "o", "<CR>", "r", "or", "q", "?" })
   pcall(vim.api.nvim_win_close, 0, true)
 
   vim.api.nvim_win_set_buf(0, status_buf)

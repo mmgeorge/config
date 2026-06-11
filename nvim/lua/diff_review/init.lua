@@ -3247,6 +3247,26 @@ local status_command_specs = {
   { id = "help", label = "help", desc = "Show help", modes = "n", hint = true },
 }
 
+M._status_hint_command_ids_by_view = {
+  status = {
+    "stage",
+    "unstage",
+    "discard",
+    "commit",
+    "open",
+    "refresh",
+    "close",
+    "help",
+  },
+  pr = {
+    "browse",
+    "open",
+    "refresh",
+    "close",
+    "help",
+  },
+}
+
 ---@type table<string, DiffReviewStatusCommandSpec>
 local status_command_specs_by_id = {}
 for _, spec in ipairs(status_command_specs) do
@@ -3713,8 +3733,11 @@ local function status_add_hint_line()
     { "Hint: ", "DiffReviewStatusHint" },
   }
   local first = true
-  for _, spec in ipairs(status_command_specs) do
-    if spec.hint and status_command_visible(spec) then
+  local view_kind = M._status and M._status.view_kind or "status"
+  local hint_command_ids = M._status_hint_command_ids_by_view[view_kind] or M._status_hint_command_ids_by_view.status
+  for _, command_id in ipairs(hint_command_ids) do
+    local spec = status_command_specs_by_id[command_id]
+    if spec and spec.hint and status_command_visible(spec) then
       local key = status_primary_key(spec.id)
       if key ~= "" then
         if not first then
