@@ -3,6 +3,8 @@ vim.loader.enable(false)
 local open_pr = require("github.open_pr")
 
 local root = "D:/mock/github"
+local other_root = "D:/mock/other-github"
+local state_path = vim.fn.tempname() .. ".json"
 local captured_picker = nil
 local system_calls = {}
 local original_system = vim.system
@@ -28,6 +30,7 @@ local function reset()
   system_calls = {}
 end
 
+open_pr._set_state_path_for_test(state_path)
 vim.notify = function() end
 if not _G.Snacks then _G.Snacks = {} end
 if not Snacks.picker then Snacks.picker = {} end
@@ -58,7 +61,8 @@ vim.system = function(command, opts, callback)
 end
 
 local function cleanup()
-  open_pr._set_base_branch_for_test("main")
+  open_pr._set_state_path_for_test(nil)
+  pcall(vim.fn.delete, state_path)
   if original_snacks then
     _G.Snacks = original_snacks
     if original_snacks.picker then original_snacks.picker.pick = original_picker_pick end
@@ -75,7 +79,6 @@ end
 
 local function run_tests()
   reset()
-  open_pr._set_base_branch_for_test("main")
   local selected = nil
   open_pr._choose_base_branch_for_test(root, "feature/current", function(branch)
     selected = branch
@@ -101,8 +104,23 @@ local function run_tests()
   assert_true(captured_picker.items[3].branch == "release/2026", "expected normalized release branch")
   captured_picker.confirm({ close = function() end }, captured_picker.items[1])
   wait_for(function() return selected == "develop" end, "selected branch was not returned")
-  assert_true(open_pr._get_base_branch_for_test() == "develop", "selected base was not persisted")
+  assert_true(open_pr._get_base_branch_for_test(root) == "develop", "selected base was not cached per repo")
+  open_pr._set_state_path_for_test(state_path)
+  assert_true(open_pr._get_base_branch_for_test(root) == "develop", "selected base was not persisted to state")
+  assert_true(open_pr._get_base_branch_for_test(other_root) == "main", "base selection leaked across repos")
   assert_true(system_calls[1].cwd == root, "branch picker did not list branches from repo root")
+
+  reset()
+  selected = nil
+  open_pr._choose_base_branch_for_test(root, "feature/current", function(branch)
+    selected = branch
+  end)
+  wait_for(function()
+    return vim.tbl_contains(vim.api.nvim_buf_get_lines(vim.api.nvim_get_current_buf(), 0, -1, false), "Base: develop")
+  end, "persisted base confirmation did not render")
+  press("y")
+  wait_for(function() return selected == "develop" end, "yes did not use the persisted repo base branch")
+  assert_true(#system_calls == 0, "confirming the persisted base should not list branches")
 end
 
 local ok, err = xpcall(run_tests, debug.traceback)

@@ -1,6 +1,8 @@
 local M = {}
 
-local base_branch = "main"
+local default_base_branch = "main"
+local state_cache = nil
+local state_path_for_test = nil
 local pr_context_limit = 60000
 local pr_adapter = {
   name = "copilot",
@@ -116,6 +118,97 @@ local function fail_progress(message)
     icon = "!!",
     timeout = 8000,
   })
+end
+
+local function state_path()
+  return state_path_for_test
+      or vim.fs.joinpath(vim.fn.stdpath("state"), "github-open-pr.json")
+end
+
+---@param cwd string
+---@return string
+local function repo_key(cwd)
+  local key = vim.fs.normalize(cwd)
+  if vim.fn.has("win32") == 1 then
+    key = key:lower()
+  end
+  return key
+end
+
+---@return table
+local function read_state()
+  if state_cache then
+    return state_cache
+  end
+
+  local path = state_path()
+  if vim.uv.fs_stat(path) == nil then
+    state_cache = { repos = {} }
+    return state_cache
+  end
+
+  local ok, lines = pcall(vim.fn.readfile, path)
+  if not ok then
+    state_cache = { repos = {} }
+    return state_cache
+  end
+
+  local decoded_ok, decoded = pcall(vim.json.decode, table.concat(lines, "\n"))
+  if not decoded_ok or type(decoded) ~= "table" then
+    state_cache = { repos = {} }
+    return state_cache
+  end
+
+  if type(decoded.repos) ~= "table" then
+    decoded.repos = {}
+  end
+  state_cache = decoded
+  return state_cache
+end
+
+---@param state table
+---@return string?
+local function write_state(state)
+  local path = state_path()
+  local directory = vim.fs.dirname(path)
+  local mkdir_ok, mkdir_err = pcall(vim.fn.mkdir, directory, "p")
+  if not mkdir_ok or mkdir_err == 0 then
+    return "Could not create state directory: " .. directory
+  end
+
+  local encode_ok, encoded = pcall(vim.json.encode, state)
+  if not encode_ok then
+    return "Could not encode state"
+  end
+
+  local write_ok, write_err = pcall(vim.fn.writefile, { encoded }, path)
+  if not write_ok or write_err ~= 0 then
+    return "Could not write state: " .. path
+  end
+
+  return nil
+end
+
+---@param cwd string
+---@return string
+local function get_base_branch(cwd)
+  local state = read_state()
+  local branch = state.repos[repo_key(cwd)]
+  if type(branch) == "string" and branch ~= "" then
+    return branch
+  end
+  return default_base_branch
+end
+
+---@param cwd string
+---@param branch string
+local function set_base_branch(cwd, branch)
+  local state = read_state()
+  state.repos[repo_key(cwd)] = branch
+  local err = write_state(state)
+  if err then
+    notify(err, "warn")
+  end
 end
 
 local function truncate_at_line(text, limit)
@@ -312,8 +405,9 @@ local function confirm(lines, on_yes, on_no)
 end
 
 ---@param branches string[]
+---@param current_base_branch string
 ---@param callback fun(branch: string?)
-local function pick_base_branch(branches, callback)
+local function pick_base_branch(branches, current_base_branch, callback)
   if #branches == 0 then
     notify("No base branches available to select", "warn")
     callback(nil)
@@ -331,7 +425,7 @@ local function pick_base_branch(branches, callback)
       end, branches),
       format = function(item)
         return {
-          { item.text, item.branch == base_branch and "Function" or "Identifier" },
+          { item.text, item.branch == current_base_branch and "Function" or "Identifier" },
         }
       end,
       confirm = function(picker, item)
@@ -351,8 +445,9 @@ end
 ---@param current_branch string
 ---@param callback fun(branch: string?)
 local function choose_base_branch(cwd, current_branch, callback)
-  confirm({ "Base: " .. base_branch }, function()
-    callback(base_branch)
+  local current_base_branch = get_base_branch(cwd)
+  confirm({ "Base: " .. current_base_branch }, function()
+    callback(current_base_branch)
   end, function()
     git({ "branch", "--list", "--all", "--format=%(refname:short)" }, cwd, function(output, branches_err)
       if branches_err then
@@ -361,13 +456,13 @@ local function choose_base_branch(cwd, current_branch, callback)
         return
       end
 
-      pick_base_branch(parse_base_branches(output, current_branch), function(selected)
+      pick_base_branch(parse_base_branches(output, current_branch), current_base_branch, function(selected)
         if not selected or selected == "" then
           return callback(nil)
         end
 
-        base_branch = selected
-        callback(base_branch)
+        set_base_branch(cwd, selected)
+        callback(selected)
       end)
     end)
   end)
@@ -526,11 +621,17 @@ function M.open()
 end
 
 M._parse_base_branches_for_test = parse_base_branches
-M._set_base_branch_for_test = function(branch)
-  base_branch = branch
+M._set_base_branch_for_test = function(branch, cwd)
+  if cwd then
+    set_base_branch(cwd, branch)
+  end
 end
-M._get_base_branch_for_test = function()
-  return base_branch
+M._get_base_branch_for_test = function(cwd)
+  return get_base_branch(cwd)
+end
+M._set_state_path_for_test = function(path)
+  state_path_for_test = path
+  state_cache = nil
 end
 M._choose_base_branch_for_test = choose_base_branch
 
