@@ -55,6 +55,45 @@ local function output_text(decoded)
   return vim.trim(table.concat(texts, ""))
 end
 
+---@param decoded table?
+---@return AIToolCall[] calls
+local function output_tool_calls(decoded)
+  local calls = {}
+  for _, item in ipairs(decoded and decoded.output or {}) do
+    if item.type == "function_call" then
+      local ok_args, args = pcall(vim.json.decode, item.arguments or "", { luanil = { object = true, array = true } })
+      calls[#calls + 1] = {
+        id = item.call_id,
+        name = item.name,
+        args = (ok_args and type(args) == "table") and args or {},
+        args_error = not (ok_args and type(args) == "table") and "function arguments were not valid JSON" or nil,
+      }
+    end
+  end
+  return calls
+end
+
+--- Build the input items: a fresh user message, or the prior history (which
+--- already ends with the model's output items, function_call items included
+--- verbatim) plus one function_call_output item per result. Stateless mode:
+--- the full item list and instructions are resent every round.
+---@param request AIGenerateRequest
+---@return table[] input
+local function build_input(request)
+  if not request.history then
+    return { { role = "user", content = request.prompt } }
+  end
+  local input = request.history
+  for _, tool_result in ipairs(request.tool_results or {}) do
+    input[#input + 1] = {
+      type = "function_call_output",
+      call_id = tool_result.call.id,
+      output = tool_result.output,
+    }
+  end
+  return input
+end
+
 ---@param ctx AIRequestContext
 ---@param spec AIModelSpec
 ---@param request AIGenerateRequest
@@ -66,15 +105,29 @@ function M.generate(ctx, spec, request, cb)
     return
   end
 
+  local input = build_input(request)
   local body = {
     model = spec.model,
-    input = request.prompt,
+    input = input,
   }
   if request.system then body.instructions = request.system end
   if request.temperature then body.temperature = request.temperature end
   if request.max_output_tokens then body.max_output_tokens = request.max_output_tokens end
   if spec.thinking ~= nil then
     body.reasoning = { effort = spec.thinking }
+  end
+  if request.tools and #request.tools > 0 then
+    local tools = {}
+    for _, tool in ipairs(request.tools) do
+      -- Responses API function tools are flat (no nested "function" object).
+      tools[#tools + 1] = {
+        type = "function",
+        name = tool.name,
+        description = tool.description,
+        parameters = tool.parameters,
+      }
+    end
+    body.tools = tools
   end
 
   ctx.request({
@@ -101,6 +154,16 @@ function M.generate(ctx, spec, request, cb)
       cb({ ok = false, error = "openai: incomplete response (" .. tostring(reason) .. ")" })
       return
     end
+
+    local calls = output_tool_calls(decoded)
+    if decoded and #calls > 0 then
+      -- Replay every output item verbatim (reasoning items included) ahead
+      -- of the function_call_output items the next round appends.
+      vim.list_extend(input, decoded.output)
+      cb({ ok = true, tool_calls = calls, history = input })
+      return
+    end
+
     local content = output_text(decoded)
     if not content or content == "" then
       cb({ ok = false, error = "openai: empty response" })

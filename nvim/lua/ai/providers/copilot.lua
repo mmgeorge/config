@@ -135,11 +135,23 @@ function M.generate(ctx, spec, request, cb)
       return
     end
 
-    local messages = {}
-    if request.system then
-      messages[#messages + 1] = { role = "system", content = request.system }
+    local messages
+    if request.history then
+      messages = request.history
+      for _, tool_result in ipairs(request.tool_results or {}) do
+        messages[#messages + 1] = {
+          role = "tool",
+          tool_call_id = tool_result.call.id,
+          content = tool_result.output,
+        }
+      end
+    else
+      messages = {}
+      if request.system then
+        messages[#messages + 1] = { role = "system", content = request.system }
+      end
+      messages[#messages + 1] = { role = "user", content = request.prompt }
     end
-    messages[#messages + 1] = { role = "user", content = request.prompt }
 
     local body = {
       model = spec.model,
@@ -148,18 +160,37 @@ function M.generate(ctx, spec, request, cb)
     }
     if request.temperature then body.temperature = request.temperature end
     if request.max_output_tokens then body.max_tokens = request.max_output_tokens end
+    if request.tools and #request.tools > 0 then
+      local tools = {}
+      for _, tool in ipairs(request.tools) do
+        tools[#tools + 1] = {
+          type = "function",
+          ["function"] = {
+            name = tool.name,
+            description = tool.description,
+            parameters = tool.parameters,
+          },
+        }
+      end
+      body.tools = tools
+    end
+
+    local headers = {
+      ["content-type"] = "application/json",
+      ["authorization"] = "Bearer " .. session.token,
+      ["editor-version"] = "Neovim/" .. tostring(vim.version()),
+      ["editor-plugin-version"] = "ai.nvim/1.0",
+      ["copilot-integration-id"] = "vscode-chat",
+      ["x-github-api-version"] = "2025-10-01",
+    }
+    if request.tools then
+      headers["x-initiator"] = "agent"
+    end
 
     ctx.request({
       method = "POST",
       url = session.base_url .. "/chat/completions",
-      headers = {
-        ["content-type"] = "application/json",
-        ["authorization"] = "Bearer " .. session.token,
-        ["editor-version"] = "Neovim/" .. tostring(vim.version()),
-        ["editor-plugin-version"] = "ai.nvim/1.0",
-        ["copilot-integration-id"] = "vscode-chat",
-        ["x-github-api-version"] = "2025-10-01",
-      },
+      headers = headers,
       body = vim.json.encode(body),
     }, function(err, response)
       if err then
@@ -173,7 +204,26 @@ function M.generate(ctx, spec, request, cb)
 
       local decoded = http.decode_json(response.body)
       local choice = decoded and decoded.choices and decoded.choices[1]
-      local content = choice and choice.message and choice.message.content
+      local message = choice and choice.message
+
+      if message and type(message.tool_calls) == "table" and #message.tool_calls > 0 then
+        local calls = {}
+        for _, tool_call in ipairs(message.tool_calls) do
+          local fn = tool_call["function"] or {}
+          local ok_args, args = pcall(vim.json.decode, fn.arguments or "", { luanil = { object = true, array = true } })
+          calls[#calls + 1] = {
+            id = tool_call.id,
+            name = fn.name,
+            args = (ok_args and type(args) == "table") and args or {},
+            args_error = not (ok_args and type(args) == "table") and "function arguments were not valid JSON" or nil,
+          }
+        end
+        messages[#messages + 1] = message
+        cb({ ok = true, tool_calls = calls, history = messages })
+        return
+      end
+
+      local content = message and message.content
       if type(content) ~= "string" or vim.trim(content) == "" then
         cb({ ok = false, error = "copilot: empty response" })
         return

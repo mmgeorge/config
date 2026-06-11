@@ -218,7 +218,8 @@ local function test_openai_generate()
   assert_eq(body.model, "gpt-5.4-nano", "openai preset model")
   assert_eq(body.reasoning.effort, "none", "openai thinking=minimal should map to reasoning effort none")
   assert_eq(body.instructions, "You write commit messages.", "openai instructions")
-  assert_eq(body.input, "diff content", "openai input")
+  assert_eq(body.input[1].role, "user", "openai input message role")
+  assert_eq(body.input[1].content, "diff content", "openai input")
   assert_eq(body.max_output_tokens, 300, "openai max_output_tokens")
 end
 

@@ -1,0 +1,30 @@
+{
+  "mcpServers": {
+    "microsoft-learn": {
+      "url": "https://learn.microsoft.com/api/mcp",
+      "description": "Microsoft Learn documentation search",
+      "autoApprove": true
+    },
+    "docs-mcp": {
+      "command": "docs-mcp",
+      "description": "Rust crate docs",
+      "autoApprove": true
+    },
+    "google-dev-knowledge": {
+      "url": "https://developerknowledge.googleapis.com/mcp",
+      "headers": {
+        "X-Goog-Api-Key": "${GOOGLE_DEV_KNOWLEDGE_MCP_KEY}"
+      },
+      "description": "Google developer documentation",
+      "autoApprove": true
+    },
+    "github": {
+      "command": "github-mcp-server",
+      "args": ["stdio", "--toolsets=context,actions,discussions,issues,labels,notifications,orgs,projects,pull_requests,repos,users"],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": null
+      },
+      "description": "GitHub API"
+    }
+  }
+}
