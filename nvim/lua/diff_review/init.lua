@@ -3374,6 +3374,14 @@ local function status_about_head_line(about_state)
   return { segments = segments, entry = entry }
 end
 
+---@param buf integer
+---@return boolean
+function M._status_patch_about_line(buf)
+  local status = M._status_states and M._status_states[buf] or M._status
+  if not status then return false end
+  return M._status_patch_head_line(buf, "about", status_about_head_line(status.about))
+end
+
 ---@param values table
 ---@param pr_state DiffReviewStatusPRState?
 ---@param about_state DiffReviewAICommitState?
@@ -5166,7 +5174,8 @@ end
 ---@param buf integer
 ---@param has_changes boolean
 ---@param force? boolean
-local function status_ensure_about_state(cwd, buf, has_changes, force)
+---@param allow_generation? boolean
+local function status_ensure_about_state(cwd, buf, has_changes, force, allow_generation)
   M._status = M._status or {}
   local status = M._status
   if not has_changes then
@@ -5175,7 +5184,7 @@ local function status_ensure_about_state(cwd, buf, has_changes, force)
     return
   end
 
-  if (M.config or config.options or config.defaults).about_auto_generate == false then
+  if not allow_generation and (M.config or config.options or config.defaults).about_auto_generate == false then
     status.about_root = cwd
     status.about = { state = "none", waiters = {} }
     return
@@ -5188,6 +5197,9 @@ local function status_ensure_about_state(cwd, buf, has_changes, force)
   status.about = current and current.cwd == cwd and current or { state = "generating", cwd = cwd, waiters = {} }
   status.about_request_id = (status.about_request_id or 0) + 1
   local request_id = status.about_request_id
+  if allow_generation then
+    M._status_patch_about_line(buf)
+  end
 
   ai_commit.ensure(cwd, { force = force }, function(result)
     local latest_status = M._status_states and M._status_states[buf] or M._status
@@ -5198,7 +5210,9 @@ local function status_ensure_about_state(cwd, buf, has_changes, force)
       latest_status.head_lines = status_build_head_lines(latest_status.head_values, latest_status.pr, latest_status.about)
     end
     if vim.api.nvim_buf_is_valid(buf) and latest_status.head_lines and latest_status.sections then
-      M.render_status(buf, nil, nil, { reuse_sections = true })
+      if not M._status_patch_about_line(buf) then
+        M.render_status(buf, nil, nil, { reuse_sections = true })
+      end
     end
   end)
 end
@@ -5939,6 +5953,12 @@ local function status_open_about(entry)
   local about = entry and entry.about
   if not about and M._status then about = M._status.about end
   if not about or about.state == "none" then
+    local status = M._status
+    if status and status.cwd and status.buf and status_has_changes(status.sections) then
+      status_ensure_about_state(status.cwd, status.buf, true, false, true)
+      vim.notify("Generating commit message...", vim.log.levels.INFO, { title = "DiffReview" })
+      return
+    end
     vim.notify("No generated commit message", vim.log.levels.INFO, { title = "DiffReview" })
     return
   end

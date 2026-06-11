@@ -357,7 +357,7 @@ local function run()
       opts = opts,
     }
   end
-  diff_review.setup({ pr_buffer_name = "DiffReviewPRTest" })
+  diff_review.setup({ pr_buffer_name = "DiffReviewPRTest", about_auto_generate = true })
   diff_review.open()
   local status_buf = vim.api.nvim_get_current_buf()
 
@@ -587,6 +587,26 @@ local function run()
   if vim.api.nvim_buf_is_valid(override_buf) then
     vim.api.nvim_buf_delete(override_buf, { force = true })
   end
+  has_changes = true
+  ai_commit.reset_backend()
+  ai_commit.set_backend(ai_backend)
+  local count_before_default_about = generate_count
+  diff_review._status = nil
+  diff_review.setup({ pr_buffer_name = "DiffReviewPRTest" })
+  diff_review.open()
+  local default_about_buf = vim.api.nvim_get_current_buf()
+  wait_for(function() return buffer_contains(default_about_buf, "lua/diff_review/init.lua +1 -1") end, "default status with changes did not render")
+  assert_true(buffer_contains(default_about_buf, "About:  none"), "About row should not auto-generate by default")
+  vim.wait(120)
+  assert_true(generate_count == count_before_default_about, "default status open started AI generation")
+  trigger_normal_mapping("<CR>", find_row(default_about_buf, "About:"))
+  wait_for(function() return buffer_contains(default_about_buf, "About:  ...generating...") end, "manual About open did not start generation")
+  wait_for(function() return buffer_contains(default_about_buf, "feat: add diff review ai summary") end, "manual About generation did not update status row")
+  assert_true(generate_count == count_before_default_about + 1, "manual About open did not start exactly one generation")
+  if vim.api.nvim_buf_is_valid(default_about_buf) then
+    vim.api.nvim_buf_delete(default_about_buf, { force = true })
+  end
+
   has_changes = false
   local count_before_no_changes = generate_count
   diff_review._status = nil
