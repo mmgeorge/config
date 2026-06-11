@@ -251,11 +251,16 @@ function M.commit(opts)
   end
   if M._active then M._finish(1) end
 
-  local ok, process = pcall(vim.system, { "git", "rev-parse", "--show-toplevel" }, { text = true }, function(result)
+  local ok, process = pcall(vim.system, { "git", "rev-parse", "--show-toplevel" }, {
+    text = true,
+    stdout = true,
+    stderr = true,
+  }, function(result)
     vim.schedule(function()
       local root = vim.trim(result.stdout or "")
       if result.code ~= 0 or root == "" then
-        vim.notify("Not a git repository", vim.log.levels.ERROR)
+        local message = vim.trim(result.stderr or "")
+        vim.notify(message ~= "" and message or "Not a git repository", vim.log.levels.ERROR)
         return
       end
 

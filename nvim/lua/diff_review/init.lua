@@ -402,6 +402,18 @@ function M.reset_git_backend()
   M._git_backend = nil
 end
 
+---@param stdout string?
+---@param stderr string?
+---@return string
+function M._system_output(stdout, stderr)
+  stdout = tostring(stdout or "")
+  stderr = tostring(stderr or "")
+  if stdout == "" then return stderr end
+  if stderr == "" then return stdout end
+  local separator = stdout:sub(-1) == "\n" and "" or "\n"
+  return stdout .. separator .. stderr
+end
+
 ---@param command DiffReviewGitCommand
 ---@param input? string
 ---@param cb DiffReviewGitTextCallback
@@ -425,7 +437,12 @@ local function system_text_async(command, input, cb)
     return
   end
 
-  local ok, process = pcall(vim.system, command, { text = true, stdin = input }, function(result)
+  local ok, process = pcall(vim.system, command, {
+    text = true,
+    stdin = input,
+    stdout = true,
+    stderr = true,
+  }, function(result)
     vim.schedule(function()
       local stdout = result.stdout or ""
       local stderr = result.stderr or ""
@@ -433,7 +450,7 @@ local function system_text_async(command, input, cb)
         code = result.code or 0,
         stdout = stdout,
         stderr = stderr,
-        output = stdout ~= "" and stdout or stderr,
+        output = M._system_output(stdout, stderr),
       })
     end)
   end)
@@ -535,7 +552,7 @@ local function system_text_stream_async(command, input, on_line, cb)
         code = result.code or 0,
         stdout = stdout_text,
         stderr = stderr_text,
-        output = stdout_text ~= "" and stdout_text or stderr_text,
+        output = M._system_output(stdout_text, stderr_text),
       })
     end)
   end)
@@ -583,7 +600,7 @@ local function systemlist_async(command, cb)
   end
 
   system_text_async(command, nil, function(result)
-    cb(text_to_lines(result.stdout), result.code, result.stderr)
+    cb(text_to_lines(result.stdout), result.code, result.output)
   end)
 end
 
@@ -599,10 +616,11 @@ end
 
 ---@param cb fun(root?: string, err?: string)
 local function git_root_async(cb)
-  systemlist_async({ "git", "rev-parse", "--show-toplevel" }, function(output, code)
+  systemlist_async({ "git", "rev-parse", "--show-toplevel" }, function(output, code, stderr)
     local root = output[1]
     if code ~= 0 or not root or root == "" then
-      cb(nil, "Not a git repository")
+      local message = vim.trim(stderr or "")
+      cb(nil, message ~= "" and message or "Not a git repository")
       return
     end
     cb(vim.trim(root), nil)

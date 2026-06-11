@@ -106,6 +106,18 @@ local function text_to_lines(text)
   return vim.split(text, "\n", { plain = true })
 end
 
+---@param stdout string?
+---@param stderr string?
+---@return string
+local function system_output(stdout, stderr)
+  stdout = tostring(stdout or "")
+  stderr = tostring(stderr or "")
+  if stdout == "" then return stderr end
+  if stderr == "" then return stdout end
+  local separator = stdout:sub(-1) == "\n" and "" or "\n"
+  return stdout .. separator .. stderr
+end
+
 ---@param command DiffReviewAICommitCommand
 ---@param input string?
 ---@param cb DiffReviewAICommitTextCallback
@@ -116,7 +128,12 @@ local function system_text_async(command, input, cb)
     return
   end
 
-  local ok, process = pcall(vim.system, command, { text = true, stdin = input }, function(result)
+  local ok, process = pcall(vim.system, command, {
+    text = true,
+    stdin = input,
+    stdout = true,
+    stderr = true,
+  }, function(result)
     vim.schedule(function()
       local stdout = result.stdout or ""
       local stderr = result.stderr or ""
@@ -124,7 +141,7 @@ local function system_text_async(command, input, cb)
         code = result.code or 0,
         stdout = stdout,
         stderr = stderr,
-        output = stdout ~= "" and stdout or stderr,
+        output = system_output(stdout, stderr),
       })
     end)
   end)
@@ -146,7 +163,7 @@ local function systemlist_async(command, cb)
   end
 
   system_text_async(command, nil, function(result)
-    cb(text_to_lines(result.stdout), result.code, result.stderr)
+    cb(text_to_lines(result.stdout), result.code, result.output)
   end)
 end
 

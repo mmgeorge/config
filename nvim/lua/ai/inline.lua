@@ -17,7 +17,7 @@
 
 ---@class AIInlineOpts
 ---@field type "replace"|"before"|"after"
----@field prompt string|fun(selected_text: string): string instruction; a string is wrapped together with the fenced selection, a function builds the full user message itself
+---@field prompt string|fun(selected_text: string): string instruction; a string is wrapped together with the fenced selection (and supports the #buffer token), a function builds the full user message itself
 ---@field model? string model token; defaults to adapters().inline_edit
 ---@field system? string extra system guidance appended to the built-in placement prompt
 ---@field buf? integer defaults to the current buffer
@@ -82,19 +82,51 @@ local function selection_range(buf)
   return { start_line = cursor[1], end_line = cursor[1] }
 end
 
+--- Compose the user message from a plain instruction. Section order follows
+--- provider long-context guidance (Anthropic, Gemini): context first, the
+--- specific instruction at the very end. `#buffer` in the instruction is a
+--- magic token: it is removed from the instruction and the entire buffer
+--- content is included as a leading context section.
 ---@param instruction string
+---@param buf integer
+---@param range AIInlineRange
 ---@param selected_text string
 ---@param filetype string
 ---@return string
-local function wrap_instruction(instruction, selected_text, filetype)
-  return table.concat({
-    instruction,
-    "",
-    "The selected text (from a " .. (filetype ~= "" and filetype or "plain text") .. " buffer):",
+local function wrap_instruction(instruction, buf, range, selected_text, filetype)
+  local include_buffer = false
+  instruction = instruction:gsub("#buffer%f[%W]", function()
+    include_buffer = true
+    return ""
+  end)
+  instruction = vim.trim((instruction:gsub("  +", " ")))
+
+  local sections = {}
+  if include_buffer then
+    local name = vim.api.nvim_buf_get_name(buf)
+    name = name ~= "" and vim.fn.fnamemodify(name, ":~:.") or "(unnamed buffer)"
+    local buffer_text = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+    sections[#sections + 1] = table.concat({
+      "Current buffer (" .. name .. "):",
+      "```" .. filetype,
+      buffer_text,
+      "```",
+    }, "\n")
+  end
+
+  sections[#sections + 1] = table.concat({
+    ("Selected text (lines %d-%d%s):"):format(
+      range.start_line,
+      range.end_line,
+      filetype ~= "" and (", " .. filetype) or ""
+    ),
     "```" .. filetype,
     selected_text,
     "```",
   }, "\n")
+
+  sections[#sections + 1] = instruction
+  return table.concat(sections, "\n\n")
 end
 
 --- Run a prompt about the selection and splice the response into the buffer.
@@ -136,8 +168,8 @@ function M.inline(opts, on_done)
   local prompt
   if type(opts.prompt) == "function" then
     prompt = opts.prompt(selected_text)
-  elseif type(opts.prompt) == "string" and vim.trim(opts.prompt) ~= "" then
-    prompt = wrap_instruction(opts.prompt, selected_text, filetype)
+  elseif type(opts.prompt) == "string" and vim.trim(opts.prompt:gsub("#buffer%f[%W]", "")) ~= "" then
+    prompt = wrap_instruction(opts.prompt, buf, range, selected_text, filetype)
   end
   if type(prompt) ~= "string" or vim.trim(prompt) == "" then
     fail("prompt is required (string or function returning a string)")

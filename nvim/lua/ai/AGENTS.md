@@ -105,7 +105,15 @@ require("ai.inline").inline({
   insert the response above/below the selection (documentation, trait
   impls, tests, usage examples).
 - A string `prompt` is wrapped together with the filetype-fenced selection;
-  a function `prompt(selected_text)` builds the entire user message itself.
+  a function `prompt(selected_text)` builds the entire user message itself
+  (no token expansion in that case).
+- `#buffer` in a string prompt is a magic token: it is removed from the
+  instruction and the entire buffer content is added as a leading,
+  filename-labeled context section -
+  `:'<,'>AIAfter #buffer add a debug impl for this struct`. Section order
+  follows provider long-context guidance (Anthropic, Gemini): big context
+  first, then the selection, the instruction at the very end (Anthropic
+  measured up to ~30% quality gain from query-at-the-end).
 - The selection is tracked with extmarks while the request is in flight, so
   concurrent edits elsewhere in the buffer do not shift the splice target.
 - The splice is one undo step - `u` is the reject button. Code fences around

@@ -85,6 +85,18 @@ function M.reset_timeout_ms()
   timeout_ms = default_timeout_ms
 end
 
+---@param stdout string?
+---@param stderr string?
+---@return string
+local function system_output(stdout, stderr)
+  stdout = tostring(stdout or "")
+  stderr = tostring(stderr or "")
+  if stdout == "" then return stderr end
+  if stderr == "" then return stdout end
+  local separator = stdout:sub(-1) == "\n" and "" or "\n"
+  return stdout .. separator .. stderr
+end
+
 ---@param command DiffReviewGhCommand
 ---@param input string?
 ---@param cwd string?
@@ -107,7 +119,13 @@ local function system_text_async(command, input, cwd, cb)
     cb(result)
   end
 
-  local ok, process_or_error = pcall(vim.system, command, { text = true, stdin = input, cwd = cwd }, function(result)
+  local ok, process_or_error = pcall(vim.system, command, {
+    text = true,
+    stdin = input,
+    cwd = cwd,
+    stdout = true,
+    stderr = true,
+  }, function(result)
     vim.schedule(function()
       local stdout = result.stdout or ""
       local stderr = result.stderr or ""
@@ -115,7 +133,7 @@ local function system_text_async(command, input, cwd, cb)
         code = result.code or 0,
         stdout = stdout,
         stderr = stderr,
-        output = stdout ~= "" and stdout or stderr,
+        output = system_output(stdout, stderr),
       })
     end)
   end)

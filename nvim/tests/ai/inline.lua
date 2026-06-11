@@ -156,6 +156,7 @@ local function test_concurrent_edit_tracking()
   -- Shift the target while the request is in flight.
   vim.api.nvim_buf_set_lines(buf, 0, 0, false, { "inserted 1", "inserted 2" })
   assert_true(vim.wait(2000, function() return result ~= nil end, 10), "tracked inline did not complete")
+  ---@cast result AIGenerateResult
   assert_true(result.ok, "tracked replace failed: " .. tostring(result.error))
 
   local lines = buffer_lines(buf)
@@ -164,10 +165,61 @@ local function test_concurrent_edit_tracking()
   assert_eq(lines[5], "keep me too", "later lines untouched")
 end
 
+local function test_buffer_token()
+  respond = openai_text_response("impl std::fmt::Debug for Bob {}")
+  local buf = make_buffer({ "fn helper() {}", "", "struct Bob {", "  name: String,", "}" }, "rust")
+  vim.api.nvim_buf_set_name(buf, "src/bob.rs")
+
+  requests = {}
+  local result = inline_sync({
+    type = "after",
+    buf = buf,
+    range = { start_line = 3, end_line = 5 },
+    prompt = "#buffer add the following rust impl for this codeblock: debug",
+  })
+  assert_true(result.ok, "buffer token flow failed: " .. tostring(result.error))
+
+  local prompt = decode_body(requests[1].body).input[1].content
+  assert_true(prompt:find("#buffer", 1, true) == nil, "#buffer token removed from the instruction")
+  assert_true(prompt:find("Current buffer", 1, true) ~= nil, "buffer section present")
+  assert_true(prompt:find("bob.rs", 1, true) ~= nil, "buffer section labeled with the file name")
+  assert_true(prompt:find("fn helper() {}", 1, true) ~= nil, "full buffer content included")
+
+  -- Long-context ordering: buffer first, selection second, instruction last.
+  local buffer_pos = prompt:find("Current buffer", 1, true)
+  local selection_pos = prompt:find("Selected text", 1, true)
+  local instruction_pos = prompt:find("add the following rust impl", 1, true)
+  assert_true(buffer_pos < selection_pos, "buffer section precedes the selection")
+  assert_true(selection_pos < instruction_pos, "instruction comes last")
+
+  -- Without the token there is no buffer section.
+  requests = {}
+  result = inline_sync({
+    type = "after",
+    buf = buf,
+    range = { start_line = 3, end_line = 5 },
+    prompt = "add a debug impl",
+  })
+  assert_true(result.ok, "plain instruction failed: " .. tostring(result.error))
+  prompt = decode_body(requests[1].body).input[1].content
+  assert_true(prompt:find("Current buffer", 1, true) == nil, "no buffer section without the token")
+  assert_true(prompt:find("fn helper() {}", 1, true) == nil, "buffer content not leaked without the token")
+
+  -- An instruction that is only the token is still an empty prompt.
+  result = inline_sync({
+    type = "after",
+    buf = buf,
+    range = { start_line = 3, end_line = 5 },
+    prompt = "#buffer",
+  })
+  assert_true(not result.ok and result.error:find("prompt is required", 1, true) ~= nil, "token-only prompt: " .. tostring(result.error))
+end
+
 local function test_error_paths()
   local buf = make_buffer({ "line" })
 
   notifications = {}
+  ---@diagnostic disable-next-line: assign-type-mismatch deliberately invalid type
   local result = inline_sync({ type = "sideways", buf = buf, range = { start_line = 1, end_line = 1 }, prompt = "x" })
   assert_true(not result.ok and result.error:find("invalid inline type", 1, true) ~= nil, "invalid type: " .. tostring(result.error))
 
@@ -206,6 +258,7 @@ local function run()
   test_replace()
   test_before_and_after()
   test_concurrent_edit_tracking()
+  test_buffer_token()
   test_error_paths()
 end
 
