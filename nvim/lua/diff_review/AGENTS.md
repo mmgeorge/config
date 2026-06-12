@@ -15,6 +15,13 @@ init.lua is at Lua's hard limit of 200 local variables per chunk: new
 file-scope helpers must hang off the module table (see `M._branch_diff`)
 instead of being declared `local`.
 
+The diff gutter (old/new line numbers and the `+`/`-` sign) is rendered as
+inline virtual text (`hunk_add_gutter`), not buffer text: buffer lines for
+hunk rows contain only the code content, so visual selection, yank, and
+search operate on the code alone. Tests asserting gutter content must read
+the row's inline `virt_text` extmark (see `gutter_text` in
+`tests/diff_review/hunk_boundary_context.lua`).
+
 ## LuaLS Typing
 
 Use LuaLS/EmmyLua comment annotations for plugin code. Public module functions,

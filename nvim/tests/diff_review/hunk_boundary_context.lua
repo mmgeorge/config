@@ -125,6 +125,21 @@ local function find_row(buf, pattern)
   error("missing row: " .. pattern .. "\n" .. table.concat(lines, "\n"), 2)
 end
 
+local function gutter_text(buf, row)
+  local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
+  for _, mark in ipairs(marks) do
+    local details = mark[4] or {}
+    if details.virt_text_pos == "inline" and details.virt_text then
+      local parts = {}
+      for _, chunk in ipairs(details.virt_text) do
+        parts[#parts + 1] = chunk[1]
+      end
+      return table.concat(parts)
+    end
+  end
+  return nil
+end
+
 local function line_has_highlight(buf, row, hl_group)
   local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
   for _, mark in ipairs(marks) do
@@ -216,11 +231,11 @@ local function run()
     return buffer_contains(buf, "@@ +1 -1") or buffer_contains(buf, "@@ Engine.new +1 -1")
   end, "compact hunk did not render\n" .. buffer_dump(buf))
   local delete_row = find_row(buf, "let stderr_layer = tracing_subscriber")
-  local delete_line = vim.api.nvim_buf_get_lines(buf, delete_row - 1, delete_row, false)[1]
-  assert_true(delete_line:find("^%s*11%s+%s+%- ", 1) ~= nil, "delete row did not use local gutter: " .. delete_line)
+  local delete_gutter = gutter_text(buf, delete_row) or ""
+  assert_true(delete_gutter:find("^%s*11%s+%- $", 1) ~= nil, "delete row did not use local gutter: " .. delete_gutter)
   local add_row = find_row(buf, "let stderr_laye = tracing_subscriber")
-  local add_line = vim.api.nvim_buf_get_lines(buf, add_row - 1, add_row, false)[1]
-  assert_true(add_line:find("^%s+%s+11%s+%+ ", 1) ~= nil, "add row did not use local gutter: " .. add_line)
+  local add_gutter = gutter_text(buf, add_row) or ""
+  assert_true(add_gutter:find("^%s+11%s+%+ $", 1) ~= nil, "add row did not use local gutter: " .. add_gutter)
   wait_for(function()
     local row = find_row(buf, "let stderr_layer = tracing_subscriber")
     return line_has_highlight(buf, row, "@keyword")
@@ -239,21 +254,21 @@ local function run()
   local boundary_row = find_row(buf, "pub fn new(bridge: Bridge) -> Self {")
   local first_header_row = find_row(buf, "@@ Engine.new +1 -1")
   assert_true(boundary_row < first_header_row, "opening boundary should render before leading hunk header\n" .. buffer_dump(buf))
-  local boundary_line = vim.api.nvim_buf_get_lines(buf, boundary_row - 1, boundary_row, false)[1]
-  assert_true(boundary_line:find("^%s*10%s+10%s+pub fn new", 1) ~= nil, "boundary line did not use diff gutter: " .. boundary_line)
+  local boundary_gutter = gutter_text(buf, boundary_row) or ""
+  assert_true(boundary_gutter:find("^%s*10%s+10%s+$", 1) ~= nil, "boundary line did not use diff gutter: " .. boundary_gutter)
   assert_true(line_has_highlight(buf, boundary_row, "@keyword"), "boundary row did not get keyword syntax highlight: " .. line_highlights(buf, boundary_row))
   assert_true(line_has_highlight(buf, boundary_row, "@type"), "boundary row did not get type syntax highlight: " .. line_highlights(buf, boundary_row))
   wait_for(function() return buffer_contains(buf, "...") end, "ellipsis boundary did not render\n" .. buffer_dump(buf))
-  local ellipsis_line = vim.api.nvim_buf_get_lines(buf, find_row(buf, "...") - 1, find_row(buf, "..."), false)[1]
-  assert_true(ellipsis_line:find("^%.%.%.") == nil, "ellipsis rendered at column zero: " .. ellipsis_line)
+  local ellipsis_gutter = gutter_text(buf, find_row(buf, "...")) or ""
+  assert_true(ellipsis_gutter:find("^%s+$", 1) ~= nil, "ellipsis row missing a blank gutter: " .. ellipsis_gutter)
   wait_for(function() return buffer_contains(buf, "}") end, "closing boundary did not render\n" .. buffer_dump(buf))
   wait_for(function()
     local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
     return count_lines(lines, "pub fn new(bridge: Bridge) -> Self {") == 1
       and count_lines(lines, "  }") == 1
   end, "neighboring same-scope hunks repeated boundary context\n" .. buffer_dump(buf))
-  local closing_line = vim.api.nvim_buf_get_lines(buf, find_row(buf, "  }") - 1, find_row(buf, "  }"), false)[1]
-  assert_true(closing_line:find("^%s*13%s+13%s+}", 1) ~= nil, "closing boundary did not use diff gutter: " .. closing_line)
+  local closing_gutter = gutter_text(buf, find_row(buf, "  }")) or ""
+  assert_true(closing_gutter:find("^%s*13%s+13%s+$", 1) ~= nil, "closing boundary did not use diff gutter: " .. closing_gutter)
   wait_for(function() return buffer_contains(buf, "@@ Engine.new +1 -1") end, "compact hunk header did not get context label\n" .. buffer_dump(buf))
   local header_line = vim.api.nvim_buf_get_lines(buf, find_row(buf, "@@ Engine.new +1 -1") - 1, find_row(buf, "@@ Engine.new +1 -1"), false)[1]
   assert_true(header_line:find("^@@ Engine%.new %+1 %-1", 1) ~= nil, "hunk header unexpectedly used gutter: " .. header_line)

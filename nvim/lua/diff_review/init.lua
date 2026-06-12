@@ -1661,18 +1661,19 @@ end
 ---@param new_line? integer
 ---@param sign string?
 ---@param sign_hl? string
+---@param line_hl? string
 ---@return table[]
-local function hunk_gutter_chunks(gutter, old_line, new_line, sign, sign_hl)
+local function hunk_gutter_chunks(gutter, old_line, new_line, sign, sign_hl, line_hl)
   gutter = gutter or default_hunk_gutter_spec()
   local old_text = old_line and ("%" .. tostring(gutter.old_width) .. "d"):format(old_line) or string.rep(" ", gutter.old_width)
   local new_text = new_line and ("%" .. tostring(gutter.new_width) .. "d"):format(new_line) or string.rep(" ", gutter.new_width)
   local chunks = {}
-  chunks[#chunks + 1] = { old_text, old_line and (sign == "-" and "DiffReviewDeleteLineNr" or "DiffReviewContextLineNr") or nil }
-  chunks[#chunks + 1] = { "  " }
-  chunks[#chunks + 1] = { new_text, new_line and (sign == "+" and "DiffReviewAddLineNr" or "DiffReviewContextLineNr") or nil }
-  chunks[#chunks + 1] = { "  " }
-  chunks[#chunks + 1] = { sign or " ", sign_hl }
-  chunks[#chunks + 1] = { " " }
+  chunks[#chunks + 1] = { old_text, old_line and (sign == "-" and "DiffReviewDeleteLineNr" or "DiffReviewContextLineNr") or line_hl }
+  chunks[#chunks + 1] = { "  ", line_hl }
+  chunks[#chunks + 1] = { new_text, new_line and (sign == "+" and "DiffReviewAddLineNr" or "DiffReviewContextLineNr") or line_hl }
+  chunks[#chunks + 1] = { "  ", line_hl }
+  chunks[#chunks + 1] = { sign or " ", sign_hl or line_hl }
+  chunks[#chunks + 1] = { " ", line_hl }
   return chunks
 end
 
@@ -1682,10 +1683,17 @@ end
 ---@param new_line? integer
 ---@param sign string?
 ---@param sign_hl? string
-local function hunk_add_gutter(row, gutter, old_line, new_line, sign, sign_hl)
-  for _, chunk in ipairs(hunk_gutter_chunks(gutter, old_line, new_line, sign, sign_hl)) do
-    row[#row + 1] = chunk
-  end
+---@param line_hl? string
+local function hunk_add_gutter(row, gutter, old_line, new_line, sign, sign_hl, line_hl)
+  -- Inline virtual text, not buffer text: visual selection, yank, and search
+  -- then operate on the code content only. The default hl_mode "replace"
+  -- keeps the Visual highlight from bleeding into the gutter; the row's
+  -- line background is carried explicitly on every chunk via line_hl.
+  row[#row + 1] = {
+    col = 0,
+    virt_text = hunk_gutter_chunks(gutter, old_line, new_line, sign, sign_hl, line_hl),
+    virt_text_pos = "inline",
+  }
 end
 
 ---@param text string
@@ -2336,7 +2344,7 @@ local function hunk_body_row(parsed_line, gutter, file, syntax, syntax_row)
     },
   }
   row[#row + 1] = { "", nil, meta = diff_meta }
-  hunk_add_gutter(row, gutter, parsed_line.old_line, parsed_line.new_line, parsed_line.prefix, sign_hl)
+  hunk_add_gutter(row, gutter, parsed_line.old_line, parsed_line.new_line, parsed_line.prefix, sign_hl, line_hl)
   local segments = nil
   if syntax and syntax_row then
     segments = treesitter_line_segments(syntax.buf, syntax.tree, syntax.highlight_query, syntax_row, parsed_line.code)
