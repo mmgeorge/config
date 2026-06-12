@@ -13,7 +13,7 @@
     "summary": {
       "type": "string",
       "minLength": 1,
-      "description": "High-level prose summary of the whole change set. Newlines allowed."
+      "description": "Shown before the first step: a 1-3 sentence prose overview followed by an ASCII code-flow diagram of the change (one node per function/module with its file path, * = modified/new, ~ = removed). Newlines allowed; preformatted lines are preserved verbatim by the reviewer UI."
     },
     "commit": {
       "type": "string",

@@ -98,7 +98,7 @@
 ---@field pr? DiffReviewGhPR
 ---@field about? DiffReviewAICommitState
 
----@alias DiffReviewStatusViewKind "status"|"pr"
+---@alias DiffReviewStatusViewKind "status"|"pr"|"diff"
 
 ---@class DiffReviewStatusPRState
 ---@field state "fetching"|"ready"|"none"|"unavailable"|"error"
@@ -3249,8 +3249,8 @@ local status_reconcile_delay_ms = 120
 
 ---@type DiffReviewStatusCommandSpec[]
 local status_command_specs = {
-  { id = "toggle", label = "toggle", desc = "Toggle fold", modes = "n", hint = true, views = { status = true, pr = true } },
-  { id = "collapse_parent", label = "Collapse Parent", desc = "Collapse Parent", modes = "n", hint = true, views = { status = true, pr = true } },
+  { id = "toggle", label = "toggle", desc = "Toggle fold", modes = "n", hint = true, views = { status = true, pr = true, diff = true } },
+  { id = "collapse_parent", label = "Collapse Parent", desc = "Collapse Parent", modes = "n", hint = true, views = { status = true, pr = true, diff = true } },
   { id = "stage", label = "stage", desc = "Stage hunk/file/selection", modes = { "n", "x" }, visual = true, hint = true, views = { status = true } },
   { id = "unstage", label = "unstage", desc = "Unstage hunk/file/selection", modes = { "n", "x" }, visual = true, hint = true, views = { status = true } },
   { id = "discard", label = "discard", desc = "Discard hunk/file/selection", modes = { "n", "x" }, visual = true, hint = true, views = { status = true } },
@@ -3262,7 +3262,7 @@ local status_command_specs = {
   { id = "browse", label = "browse", desc = "Browse pull request", modes = "n", hint = true, views = { pr = true } },
   { id = "open", label = "open", desc = "Open PR/about or jump to file", modes = "n", hint = true },
   { id = "refresh", label = "refresh", desc = "Refresh DiffReview", modes = "n", hint = true },
-  { id = "close", label = "close", desc = "Close DiffReview", modes = "n", hint = true, views = { status = true, pr = true } },
+  { id = "close", label = "close", desc = "Close DiffReview", modes = "n", hint = true, views = { status = true, pr = true, diff = true } },
   { id = "help", label = "help", desc = "Show help", modes = "n", hint = true },
 }
 
@@ -3279,6 +3279,12 @@ M._status_hint_command_ids_by_view = {
   },
   pr = {
     "browse",
+    "open",
+    "refresh",
+    "close",
+    "help",
+  },
+  diff = {
     "open",
     "refresh",
     "close",
@@ -5471,6 +5477,99 @@ local function load_pr_diff(pr, cwd, buf)
   end)
 end
 
+-- Branch-diff view (":GitDiff <branch>") helpers. Grouped on the module
+-- table rather than as locals: this chunk is at Lua's hard limit of 200
+-- local variables, so new file-scope `local function`s break the module.
+M._branch_diff = {}
+
+---@param branch string
+---@param file? string repo-relative path when diffing a single file
+---@return DiffReviewStatusHeadLine[]
+function M._branch_diff.head_lines(branch, file)
+  local lines = {
+    {
+      segments = {
+        { ("%-8s"):format("Diff:"), "DiffReviewStatusLabel" },
+        { branch, "DiffReviewStatusBranch" },
+        { " -> working tree", "DiffReviewStatusHint" },
+      },
+    },
+  }
+  if file then
+    lines[#lines + 1] = {
+      segments = {
+        { ("%-8s"):format("File:"), "DiffReviewStatusLabel" },
+        { file, "DiffReviewStatusPath" },
+      },
+    }
+  end
+  return lines
+end
+
+---@param cwd string
+---@param branch string
+---@param diff_text? string
+---@param file? string
+---@return DiffReviewStatusSection[]
+function M._branch_diff.sections(cwd, branch, diff_text, file)
+  local provider_key = "diff:" .. branch .. (file and (":" .. file) or "")
+  local files = status_files_from_diff_provider(cwd, {
+    section_name = provider_key .. ":changes",
+    default_status = "",
+  }, diff_text)
+  return status_sections_from_provider_files("Changes vs " .. branch, files, {
+    name = provider_key .. ":changes",
+    file_key_prefix = provider_key,
+    file_entry_kind = "pr_file",
+    hunk_entry_kind = "pr_hunk",
+  })
+end
+
+---@param branch string
+---@param cwd string
+---@param buf integer
+---@param diff_text? string
+---@param file? string
+function M._branch_diff.render(branch, cwd, buf, diff_text, file)
+  local status = M._status
+  if not (status and status.buf == buf) then return end
+  status.head_lines = M._branch_diff.head_lines(branch, file)
+  status.sections = M._branch_diff.sections(cwd, branch, diff_text, file)
+  status.fancy_rows = {}
+  status_render_loaded(buf, nil, nil, { reuse_sections = true }, status.head_lines, status.sections)
+end
+
+---@param branch string
+---@param cwd string
+---@param buf integer
+---@param file? string
+function M._branch_diff.load(branch, cwd, buf, file)
+  local status = M._status
+  if not (status and status.buf == buf) then return end
+  status.branch_diff_request_id = (status.branch_diff_request_id or 0) + 1
+  local request_id = status.branch_diff_request_id
+  local command = { "git", "-C", cwd, "-c", "core.quotepath=false", "diff", "--no-color", "--no-ext-diff", branch }
+  if file then
+    vim.list_extend(command, { "--", file })
+  end
+  systemlist_async(command, function(output, code, stderr)
+    local latest_status = M._status_states and M._status_states[buf] or nil
+    if not (
+      latest_status
+      and latest_status.branch_diff_request_id == request_id
+      and latest_status.buf == buf
+      and vim.api.nvim_buf_is_valid(buf)
+    ) then return end
+    M._status = latest_status
+    if code ~= 0 then
+      local message = vim.trim(stderr or "")
+      notify_error("Git diff failed: " .. (message ~= "" and message or ("git exited " .. code)), "GitBranchDiff")
+      return
+    end
+    M._branch_diff.render(branch, cwd, buf, table.concat(output or {}, "\n"), file)
+  end)
+end
+
 ---@param target_id? string
 status_render_current_model = function(target_id)
   local status = M._status
@@ -6356,7 +6455,8 @@ local function setup_status_keymaps(buf)
       }))
     end
   end
-  local is_pr_view = M._status and M._status.view_kind == "pr"
+  local view_kind = M._status and M._status.view_kind or "status"
+  local is_pr_view = view_kind == "pr"
 
   map("close", "n", function()
     local state = M._status_states and M._status_states[buf] or M._status
@@ -6369,6 +6469,14 @@ local function setup_status_keymaps(buf)
   end)
 
   map("refresh", "n", function()
+    if view_kind == "diff" then
+      local status = M._status_states and M._status_states[buf] or M._status
+      if status and status.diff_branch and status.cwd then
+        M._status = status
+        M._branch_diff.load(status.diff_branch, status.cwd, buf, status.diff_file)
+      end
+      return
+    end
     if is_pr_view then
       local status = M._status_states and M._status_states[buf] or M._status
       if status and status.pr and status.cwd then
@@ -6399,7 +6507,9 @@ local function setup_status_keymaps(buf)
     M._status_collapse_parent()
   end)
 
-  if is_pr_view then
+  -- Read-only diff views (PR and branch diff) only get navigation commands;
+  -- browse is gated to the PR view by its command spec.
+  if view_kind ~= "status" then
     map("browse", "n", function()
       local status = M._status_states and M._status_states[buf] or M._status
       local pr = status and status.pr
@@ -6572,6 +6682,82 @@ function M.open_pr_number(number, opts)
     end
     M.open_pr(result.pr, { cwd = cwd, repo = opts.repo })
   end)
+end
+
+---@class DiffReviewBranchDiffOptions
+---@field cwd? string
+---@field file? string limit the diff to one repo-relative file
+
+--- Open a read-only diff of the working tree against a branch or revision
+--- (":GitBranchDiff <branch>", ":GitBranchDiffFile <file> <branch>"): the
+--- diff part of the status view without staging, commit, or remote actions.
+---@param branch string
+---@param opts? DiffReviewBranchDiffOptions
+function M.open_branch_diff(branch, opts)
+  opts = opts or {}
+  branch = vim.trim(branch or "")
+  local file = opts.file and vim.trim(opts.file) or nil
+  if file == "" then file = nil end
+  if branch == "" then
+    notify_error("GitBranchDiff requires a branch or revision", "GitBranchDiff")
+    return
+  end
+  setup_bg_highlights()
+
+  local function open_for_root(root, root_err)
+    if not root then
+      notify_error(root_err or "Not a git repository", "GitBranchDiff")
+      return
+    end
+
+    local buf = vim.api.nvim_create_buf(true, false)
+    vim.bo[buf].bufhidden = "hide"
+    vim.bo[buf].buftype = "nofile"
+    vim.bo[buf].swapfile = false
+    vim.bo[buf].filetype = "GitStatus"
+    local name = "GitBranchDiff"
+    if not pcall(vim.api.nvim_buf_set_name, buf, name) then
+      pcall(vim.api.nvim_buf_set_name, buf, name .. "#" .. buf)
+    end
+
+    local state = {
+      view_kind = "diff",
+      buf = buf,
+      cwd = root,
+      diff_branch = branch,
+      diff_file = file,
+      folds = {},
+      lines = {},
+      entries = {},
+      highlights = {},
+      line_highlights = {},
+      extmarks = {},
+      boundary_lines = {},
+      sections = nil,
+      fancy_rows = {},
+    }
+    M._status = state
+    attach_status_state(buf, state)
+    setup_status_keymaps(buf)
+
+    local win = vim.api.nvim_get_current_win()
+    local ok, set_err = pcall(vim.api.nvim_win_set_buf, win, buf)
+    if not ok then
+      notify_error("GitBranchDiff open failed: " .. tostring(set_err), "GitBranchDiff")
+      return
+    end
+    M._hide_line_numbers(win)
+    vim.wo[win].foldcolumn = "0"
+
+    M._branch_diff.render(branch, root, buf, nil, file)
+    M._branch_diff.load(branch, root, buf, file)
+  end
+
+  if opts.cwd then
+    open_for_root(opts.cwd, nil)
+    return
+  end
+  git_root_async(open_for_root)
 end
 
 ---@class DiffReviewCompactPreviewOptions

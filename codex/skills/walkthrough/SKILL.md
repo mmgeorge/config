@@ -50,8 +50,23 @@ narrative — use the diff only to confirm files and line numbers.
   displays the step's file name, so do not repeat the file path in the
   comment.
 - `title` is an optional short heading (a few words).
-- `summary` is a high-level prose overview of the entire change set; it is
-  shown before the first step.
+- `summary` is shown before the first step. Open with a 1-3 sentence prose
+  overview, then include an **ASCII code-flow diagram** of the change from
+  the relevant entry point (not the entire system): one node per
+  function/module with its file path in brackets, `*` marking modified/new
+  nodes, `~` marking removed ones, and data flow (input/output types) where
+  it clarifies. Keep diagram lines under 76 characters - the reviewer UI
+  preserves preformatted lines verbatim. Example shape:
+
+  ```
+  API Request (POST /documents)
+    │ (DocumentRequest)
+    ├── validate_request() → ValidatedRequest   [api/handlers.rs]
+    ├── *process_document() → StoredDocument    [processing/mod.rs]
+    │     ├── ~save_and_respond() → Response    [processing/mod.rs]
+    │     └── *save_result() → StoredDocument   [processing/store.rs]
+    └── *notify() → NotifyResult                [notifications/mod.rs] (NEW)
+  ```
 
 ## 3. Schema
 
@@ -107,7 +122,7 @@ alongside this skill). The schema, inlined:
 ```json
 {
   "version": 1,
-  "summary": "Adds rate limiting to the public API. A new token-bucket middleware guards every /api route; configuration lives in config/rate_limit.toml and the middleware is exercised by new integration tests.",
+  "summary": "Adds rate limiting to the public API. A new token-bucket middleware guards every /api route; configuration lives in config/rate_limit.toml and the middleware is exercised by new integration tests.\n\nRequest (POST /api/*)\n  ├── *rate_limit() → Decision        [src/middleware/rate_limit.rs] (NEW)\n  │     └── *TokenBucket::take()      [src/middleware/rate_limit.rs]\n  └── handle() → Response             [src/router.rs]",
   "commit": "8f14e45fceea167a5a36dedd4bea2543c6a04c33",
   "steps": [
     {

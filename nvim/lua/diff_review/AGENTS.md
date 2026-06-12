@@ -4,8 +4,16 @@ DiffReview is a standalone local Neovim plugin. Trouble must not own this
 feature: do not place DiffReview code under `trouble/sources`, do not register a
 `diff_review` Trouble mode, and do not route `:GitStatus` through Trouble.
 
-The public command is `:GitStatus`, registered by `nvim/lua/plugins/diff_review.lua`.
-The plugin entrypoint is `require("diff_review").open()`.
+The public commands are `:GitStatus`, `:GitBranchDiff <branch>` (read-only diff
+of the working tree against a branch or revision), and
+`:GitBranchDiffFile <file> <branch>` (same, limited to one file), registered by
+`nvim/lua/plugins/diff_review.lua`. The plugin entrypoints are
+`require("diff_review").open()` and
+`require("diff_review").open_branch_diff(branch, { file = ... })`.
+
+init.lua is at Lua's hard limit of 200 local variables per chunk: new
+file-scope helpers must hang off the module table (see `M._branch_diff`)
+instead of being declared `local`.
 
 ## LuaLS Typing
 
@@ -72,6 +80,12 @@ Run the walkthrough test:
 
 ```text
 nvim --headless -i NONE --cmd "set shadafile=NONE" -u nvim/init.lua -c "lua vim.loader.enable(false)" -S nvim/tests/diff_review/walkthrough.lua
+```
+
+Run the branch-diff test:
+
+```text
+nvim --headless -i NONE --cmd "set shadafile=NONE" -u nvim/init.lua -c "lua vim.loader.enable(false)" -S nvim/tests/diff_review/branch_diff.lua
 ```
 
 Run the whitespace check:

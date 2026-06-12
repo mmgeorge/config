@@ -206,51 +206,41 @@ function M.resolve_step(state, step)
     end
   end
 
-  -- An exact match in any section wins, preferring sections in order.
-  ---@type { rows: { row: integer, new_line: integer }[], file_row: integer? }?
-  local chosen = nil
+  -- A section containing rendered rows INSIDE the step's region wins,
+  -- preferring sections in order. This finds regions that only live in
+  -- staged hunks (partially staged files), and regions split across hunk
+  -- boundaries anchor at the first hunk row that falls inside the region
+  -- even when start.line itself is not rendered.
   for _, section_name in ipairs(section_preference) do
     local section = by_section[section_name]
     if section then
+      local start_row, end_row = nil, nil
       for _, candidate in ipairs(section.rows) do
-        if candidate.new_line == step.start_pos.line then
-          chosen = section
-          break
+        if candidate.new_line >= step.start_pos.line and candidate.new_line <= step.end_pos.line then
+          start_row = math.min(start_row or candidate.row, candidate.row)
+          end_row = math.max(end_row or candidate.row, candidate.row)
         end
       end
-    end
-    if chosen then break end
-  end
-  if not chosen then
-    for _, section_name in ipairs(section_preference) do
-      local section = by_section[section_name]
-      if section and #section.rows > 0 then
-        chosen = section
-        break
+      if start_row then
+        return { match = "exact", start_row = start_row, end_row = end_row }
       end
     end
   end
 
-  if chosen and #chosen.rows > 0 then
-    local best = nil
-    for _, candidate in ipairs(chosen.rows) do
+  -- No rendered row inside the region anywhere: globally nearest row across
+  -- all sections (ties keep the preferred section's row).
+  local best = nil
+  for _, section_name in ipairs(section_preference) do
+    local section = by_section[section_name]
+    for _, candidate in ipairs(section and section.rows or {}) do
       local distance = math.abs(candidate.new_line - step.start_pos.line)
       if not best or distance < best.distance then
-        best = { row = candidate.row, new_line = candidate.new_line, distance = distance }
+        best = { row = candidate.row, distance = distance }
       end
     end
-    ---@cast best { row: integer, new_line: integer, distance: integer }
-    local end_row = best.row
-    for _, candidate in ipairs(chosen.rows) do
-      if candidate.row > end_row and candidate.new_line <= step.end_pos.line then
-        end_row = candidate.row
-      end
-    end
-    return {
-      match = best.distance == 0 and "exact" or "nearest",
-      start_row = best.row,
-      end_row = end_row,
-    }
+  end
+  if best then
+    return { match = "nearest", start_row = best.row, end_row = best.row }
   end
 
   for _, section_name in ipairs(section_preference) do
@@ -401,6 +391,25 @@ end
 
 -- ─── mode lifecycle ──────────────────────────────────────────────────────────
 
+--- Summary text mixes prose with preformatted content (ASCII code-flow
+--- diagrams): lines that fit are preserved verbatim (indentation included);
+--- only overlong lines fall back to word wrapping.
+---@param text string
+---@param width integer
+---@return string[] lines
+local function summary_lines(text, width)
+  local lines = {}
+  for _, line in ipairs(vim.split(text, "\n", { plain = true })) do
+    if vim.fn.strdisplaywidth(line) <= width then
+      lines[#lines + 1] = line
+    else
+      vim.list_extend(lines, wrap_text(line, width))
+    end
+  end
+  if #lines == 0 then lines[1] = "" end
+  return lines
+end
+
 ---@param mode DiffReviewWalkthroughMode
 ---@param target DiffReviewWalkthroughTarget
 local function apply_region_highlight(mode, target)
@@ -538,7 +547,11 @@ end
 function M._open_summary(mode, opts)
   opts = opts or {}
   local width = math.max(44, math.min(78, vim.o.columns - 8))
-  local lines = wrap_text(mode.doc.summary, width - 4)
+  -- Grow the popup to fit preformatted summary lines (e.g. flow diagrams).
+  for _, line in ipairs(vim.split(mode.doc.summary, "\n", { plain = true })) do
+    width = math.max(width, math.min(vim.fn.strdisplaywidth(line) + 6, vim.o.columns - 4))
+  end
+  local lines = summary_lines(mode.doc.summary, width - 4)
   table.insert(lines, 1, "")
   local stale_line = nil
   if mode.stale then

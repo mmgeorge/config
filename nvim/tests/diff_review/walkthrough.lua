@@ -46,6 +46,18 @@ local function modified_diff(relpath)
   }, "\n")
 end
 
+--- Same shape with a second hunk further down (new-file lines 10-12).
+local function two_hunk_diff(relpath)
+  return table.concat({
+    modified_diff(relpath),
+    "@@ -10,3 +10,3 @@",
+    " alpha2 " .. relpath,
+    "-old2 " .. relpath,
+    "+NEW2 " .. relpath,
+    " omega2 " .. relpath,
+  }, "\n")
+end
+
 ---@type DiffReviewGhBackend
 local gh_backend = {}
 
@@ -85,13 +97,13 @@ function backend.systemlist(command)
     return { "M\ta.txt", "M\tb.txt" }, 0
   end
   if key == "git\t-C\t" .. root .. "\tdiff\t--cached\t--name-status" then
-    return {}, 0
+    return { "M\tc.txt" }, 0
   end
   if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff" then
-    return vim.split(modified_diff("a.txt") .. "\n" .. modified_diff("b.txt"), "\n", { plain = true }), 0
+    return vim.split(two_hunk_diff("a.txt") .. "\n" .. modified_diff("b.txt"), "\n", { plain = true }), 0
   end
   if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--cached" then
-    return {}, 0
+    return vim.split(modified_diff("c.txt"), "\n", { plain = true }), 0
   end
   return {}, 1
 end
@@ -206,7 +218,7 @@ end
 local function valid_doc()
   return {
     version = 1,
-    summary = "Adds NEW lines to a.txt and b.txt as a walkthrough fixture.",
+    summary = "Adds NEW lines to a.txt and b.txt as a walkthrough fixture.\n\nEdit\n  ├── *change() → Result   [a.txt]\n  └── *change() → Result   [b.txt]",
     commit = head_sha,
     steps = {
       {
@@ -262,6 +274,14 @@ local function run()
 
   local summary_buf = start_walkthrough(buf)
   assert_true(not buffer_contains(summary_buf, "WARNING"), "fresh walkthrough should not warn")
+  local diagram_line = "  ├── *change() → Result   [a.txt]"
+  for _, line in ipairs(vim.api.nvim_buf_get_lines(summary_buf, 0, -1, false)) do
+    if line == diagram_line then
+      diagram_line = nil
+      break
+    end
+  end
+  assert_true(diagram_line == nil, "summary diagram line was not preserved verbatim")
   trigger_buf_mapping(summary_buf, "y")
 
   wait_for(function() return buffer_contains(buf, "NEW a.txt") end, "step 1 did not expand a.txt hunks")
@@ -344,6 +364,45 @@ local function run()
   wait_for(function() return box_contains(buf, "position approximated") end, "nearest match note missing")
   trigger_buf_mapping(buf, "y")
   wait_for(function() return box_contains(buf, "not in current diff") end, "missing file note missing")
+  trigger_buf_mapping(buf, "q")
+  close_all_floats()
+
+  -- ── partially staged file + region split across hunks ─────────────────────
+  local staged_doc = valid_doc()
+  staged_doc.steps = {
+    {
+      title = "Staged region",
+      file = "c.txt",
+      start = { line = 2, col = 1 },
+      ["end"] = { line = 2, col = 5 },
+      comment = "Lives only in the staged section.",
+    },
+    {
+      title = "Split region",
+      file = "a.txt",
+      start = { line = 5, col = 1 },
+      ["end"] = { line = 11, col = 5 },
+      comment = "Region starts between hunks and ends inside the second hunk.",
+    },
+  }
+  set_walkthrough_doc(staged_doc)
+  summary_buf = start_walkthrough(buf)
+  trigger_buf_mapping(summary_buf, "y")
+  wait_for(function() return box_contains(buf, "staged section") end, "staged step box did not render")
+  local staged_row = find_row(buf, "NEW c.txt")
+  cursor_row = vim.api.nvim_win_get_cursor(vim.fn.bufwinid(buf))[1]
+  assert_true(cursor_row == staged_row, ("cursor not on the staged hunk row (expected %d, got %d)"):format(staged_row, cursor_row))
+  assert_true(not box_contains(buf, "stale"), "staged region must not be flagged stale")
+
+  trigger_buf_mapping(buf, "y")
+  wait_for(function() return box_contains(buf, "ends inside the second hunk") end, "split-region step box did not render")
+  local second_hunk_row = find_row(buf, "alpha2 a.txt")
+  cursor_row = vim.api.nvim_win_get_cursor(vim.fn.bufwinid(buf))[1]
+  assert_true(
+    cursor_row == second_hunk_row,
+    ("split region did not anchor at the first rendered row inside the region (expected %d, got %d)"):format(second_hunk_row, cursor_row)
+  )
+  assert_true(not box_contains(buf, "approximated"), "split region must not be flagged approximated")
   trigger_buf_mapping(buf, "q")
   close_all_floats()
 
