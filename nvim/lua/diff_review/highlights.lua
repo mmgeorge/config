@@ -45,6 +45,8 @@ function M.setup()
     italic = true,
     nocombine = true,
   })
+  vim.api.nvim_set_hl(0, "DiffReviewWalkthroughRegion", { bg = "#2d3a55" })
+  vim.api.nvim_set_hl(0, "DiffReviewWalkthroughStale", { fg = "#e5c07b", italic = true })
 end
 
 return M

@@ -25,6 +25,7 @@
 ---@field pull DiffReviewKeymap
 ---@field pr DiffReviewKeymap
 ---@field browse DiffReviewKeymap
+---@field walkthrough DiffReviewKeymap
 ---@field help DiffReviewKeymap
 
 ---@class DiffReviewKeymapConfig
@@ -63,6 +64,7 @@ M.defaults = {
       pull = "opP",
       pr = "ogp",
       browse = "b",
+      walkthrough = "ow",
       help = "?",
     },
   },

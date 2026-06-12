@@ -12,7 +12,9 @@ github-copilot
 opencode/
 btop/
 topiary/
-codex/
+codex/*
+!codex/skills/
+codex/skills/.system/
 goose/
 carapace/
 

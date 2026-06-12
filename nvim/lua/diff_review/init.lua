@@ -3258,6 +3258,7 @@ local status_command_specs = {
   { id = "push", label = "push", desc = "Push", modes = "n", hint = true, views = { status = true } },
   { id = "pull", label = "pull", desc = "Pull", modes = "n", hint = true, views = { status = true } },
   { id = "pr", label = "pr", desc = "Open pull request", modes = "n", hint = true, views = { status = true } },
+  { id = "walkthrough", label = "walkthrough", desc = "Review walkthrough", modes = "n", hint = false, views = { status = true } },
   { id = "browse", label = "browse", desc = "Browse pull request", modes = "n", hint = true, views = { pr = true } },
   { id = "open", label = "open", desc = "Open PR/about or jump to file", modes = "n", hint = true },
   { id = "refresh", label = "refresh", desc = "Refresh DiffReview", modes = "n", hint = true },
@@ -5197,6 +5198,11 @@ local function status_render_loaded(buf, target_id, fallback_line, opts, head_li
   end
 
   status_restore_cursor(buf, target_id, fallback_line)
+
+  -- Re-apply walkthrough decorations after rows shift; package.loaded guard
+  -- avoids loading the module when no walkthrough has ever started.
+  local walkthrough = package.loaded["diff_review.walkthrough"]
+  if walkthrough then walkthrough.on_status_rendered(buf) end
 end
 
 ---@param cwd string
@@ -6311,6 +6317,30 @@ local function status_remote_action(buf, action)
   end)
 end
 
+--- Narrow interface handed to diff_review.walkthrough so the module never
+--- reaches into init internals.
+---@param buf integer
+---@return DiffReviewWalkthroughHost
+function M._walkthrough_host(buf)
+  return {
+    buf = buf,
+    cwd = function()
+      local state = M._status_states and M._status_states[buf] or M._status
+      return state and state.cwd
+    end,
+    get_state = function()
+      return M._status_states and M._status_states[buf] or M._status
+    end,
+    file_key = status_file_key,
+    hunk_key = status_hunk_key,
+    set_folded = set_status_folded,
+    rerender = function()
+      render_status_or_notify(buf, nil, nil, { reuse_sections = true })
+    end,
+    git_list_async = systemlist_async,
+  }
+end
+
 ---@param buf integer
 local function setup_status_keymaps(buf)
   local opts = { buffer = buf, silent = true, nowait = true }
@@ -6451,6 +6481,10 @@ local function setup_status_keymaps(buf)
 
   map("pr", "n", function()
     status_open_pr(status_entry_under_cursor())
+  end)
+
+  map("walkthrough", "n", function()
+    require("diff_review.walkthrough").start(M._walkthrough_host(buf))
   end)
 
   map("help", "n", status_show_help)

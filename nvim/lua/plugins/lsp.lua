@@ -182,6 +182,17 @@ return {
 
       vim.lsp.config('jsonls', {
         capabilities = capabilities,
+        settings = {
+          json = {
+            validate = { enable = true },
+            schemas = {
+              {
+                fileMatch = { ".walkthrough.json" },
+                url = vim.uri_from_fname(vim.fs.joinpath(vim.fn.stdpath("config"), "lua", "diff_review", "walkthrough.schema.json")),
+              },
+            },
+          },
+        },
       })
 
       vim.lsp.enable('jsonls')
