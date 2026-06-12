@@ -27,7 +27,7 @@ function M.get()
     chat = "copilot",
     inline = "copilot",
     cmd = "copilot",
-    commit = "copilot-nano",
+    commit = "copilot",
     inline_edit = "copilot-mini",
   }
 end
