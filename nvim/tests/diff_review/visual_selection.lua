@@ -102,7 +102,7 @@ local function run()
 
   gh.set_backend(gh_backend)
   diff_review.open()
-  assert_true(vim.bo.filetype == "DiffReviewStatus", "DiffReviewStatus buffer did not open")
+  assert_true(vim.bo.filetype == "GitStatus", "GitStatus buffer did not open")
   local status_buf = vim.api.nvim_get_current_buf()
   diff_review.render_status(status_buf)
   wait_for(function()

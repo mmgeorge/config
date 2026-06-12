@@ -41,7 +41,7 @@ local M = {}
 
 ---@type DiffReviewConfig
 M.defaults = {
-  status_buffer_name = "DiffReviewStatus",
+  status_buffer_name = "GitStatus",
   pr_buffer_name = "DiffReviewPR",
   debug_notifications = false,
   pr_lookup_mode = "real",

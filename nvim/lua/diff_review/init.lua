@@ -6519,7 +6519,7 @@ function M.open_pr(pr, opts)
   vim.bo[buf].bufhidden = "hide"
   vim.bo[buf].buftype = "nofile"
   vim.bo[buf].swapfile = false
-  vim.bo[buf].filetype = "DiffReviewStatus"
+  vim.bo[buf].filetype = "GitStatus"
   local options = M.config or config.options or config.defaults
   local name = ("%s://%s"):format(options.pr_buffer_name, pr.number or "current")
   if pr.repo and pr.repo ~= "" then name = ("%s/%s"):format(name, pr.repo:gsub("/", "%%2F")) end
@@ -6643,7 +6643,7 @@ function M.open()
     vim.bo[buf].bufhidden = "hide"
     vim.bo[buf].buftype = "nofile"
     vim.bo[buf].swapfile = false
-    vim.bo[buf].filetype = "DiffReviewStatus"
+    vim.bo[buf].filetype = "GitStatus"
     pcall(vim.api.nvim_buf_set_name, buf, (M.config or config.options).status_buffer_name)
     M._main_status = {
       view_kind = "status",

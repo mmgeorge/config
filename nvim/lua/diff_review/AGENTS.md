@@ -2,9 +2,9 @@
 
 DiffReview is a standalone local Neovim plugin. Trouble must not own this
 feature: do not place DiffReview code under `trouble/sources`, do not register a
-`diff_review` Trouble mode, and do not route `:DiffReview` through Trouble.
+`diff_review` Trouble mode, and do not route `:GitStatus` through Trouble.
 
-The public command is `:DiffReview`, registered by `nvim/lua/plugins/diff_review.lua`.
+The public command is `:GitStatus`, registered by `nvim/lua/plugins/diff_review.lua`.
 The plugin entrypoint is `require("diff_review").open()`.
 
 ## LuaLS Typing
@@ -41,7 +41,7 @@ nvim --headless -i NONE --cmd "set shadafile=NONE" -u nvim/init.lua -c "lua vim.
 Run the command-open check:
 
 ```text
-nvim --headless -i NONE --cmd "set shadafile=NONE" -u nvim/init.lua -c "lua vim.loader.enable(false)" -c "DiffReview" -c "lua assert(vim.bo.filetype == 'DiffReviewStatus', 'DiffReviewStatus buffer did not open')" -c "qa!"
+nvim --headless -i NONE --cmd "set shadafile=NONE" -u nvim/init.lua -c "lua vim.loader.enable(false)" -c "GitStatus" -c "lua assert(vim.bo.filetype == 'GitStatus', 'GitStatus buffer did not open')" -c "qa!"
 ```
 
 Run the mocked integration test:

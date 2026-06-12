@@ -229,7 +229,7 @@ end
 local function open_status()
   diff_review.open()
   local buf = vim.api.nvim_get_current_buf()
-  assert_true(vim.bo[buf].filetype == "DiffReviewStatus", "status buffer did not open")
+  assert_true(vim.bo[buf].filetype == "GitStatus", "status buffer did not open")
   wait_for(function() return buffer_contains(buf, "Unstaged changes (2)") end, "status did not render")
   return buf
 end

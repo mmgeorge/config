@@ -24,8 +24,8 @@ return {
     keys = {
       {
         key("og"),
-        "<cmd>DiffReview<cr>",
-        desc = "DiffReview",
+        "<cmd>GitStatus<cr>",
+        desc = "GitStatus",
       }
     },
     config = function()
