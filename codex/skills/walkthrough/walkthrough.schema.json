@@ -65,7 +65,7 @@
         "comment": {
           "type": "string",
           "minLength": 1,
-          "description": "What this step changes and why; 1-4 sentences. By convention begins with the step's repo-root-relative file path (e.g. \"src/router.rs: ...\") so the comment reads standalone."
+          "description": "What this step changes and why; 1-4 sentences. Do not repeat the file path - the reviewer UI displays the step's file name."
         },
         "title": {
           "type": "string",

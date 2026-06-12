@@ -46,9 +46,9 @@ narrative — use the diff only to confirm files and line numbers.
   stale.
 - `file` is repo-relative with forward slashes.
 - `comment` explains **why** — what the region does and why it changed,
-  1-4 sentences. The reviewer can already see the code. **Begin every
-  comment with the repo-root-relative path** (e.g.
-  `src/middleware/rate_limit.rs: ...`) so each comment reads standalone.
+  1-4 sentences. The reviewer can already see the code, and the reviewer UI
+  displays the step's file name, so do not repeat the file path in the
+  comment.
 - `title` is an optional short heading (a few words).
 - `summary` is a high-level prose overview of the entire change set; it is
   shown before the first step.
@@ -115,14 +115,14 @@ alongside this skill). The schema, inlined:
       "file": "src/middleware/rate_limit.rs",
       "start": { "line": 18, "col": 1 },
       "end": { "line": 41, "col": 2 },
-      "comment": "src/middleware/rate_limit.rs: The core token-bucket implementation. Buckets are keyed by client IP and refill lazily on access, so there is no background task; the trade-off is a small burst allowance after idle periods."
+      "comment": "The core token-bucket implementation. Buckets are keyed by client IP and refill lazily on access, so there is no background task; the trade-off is a small burst allowance after idle periods."
     },
     {
       "title": "Wire into the router",
       "file": "src/router.rs",
       "start": { "line": 41, "col": 5 },
       "end": { "line": 44, "col": 60 },
-      "comment": "src/router.rs: The middleware is layered onto the /api scope only — health checks and static assets stay unthrottled."
+      "comment": "The middleware is layered onto the /api scope only — health checks and static assets stay unthrottled."
     }
   ]
 }
@@ -135,7 +135,6 @@ alongside this skill). The schema, inlined:
   (verify against the file on disk, not the diff hunk headers).
 - Every `start.line` points at a changed (added) line, not unchanged
   context; every region is tight (~40 lines max) around the discussed code.
-- Every `comment` begins with the step's repo-root-relative file path.
 - `commit` is the full 40-character sha from `git rev-parse HEAD`.
 - The JSON is valid: no trailing commas, no comments, double-quoted keys.
 - Write to `<repo root>/.walkthrough.json`, overwriting any existing file.

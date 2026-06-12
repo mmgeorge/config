@@ -180,6 +180,24 @@ local function walkthrough_extmark_count(buf)
   return #marks
 end
 
+--- Concatenated text of the inline comment box (virt_lines extmarks).
+local function box_text(buf)
+  local marks = vim.api.nvim_buf_get_extmarks(buf, walkthrough._ns, 0, -1, { details = true })
+  local parts = {}
+  for _, mark in ipairs(marks) do
+    for _, virt_line in ipairs(mark[4].virt_lines or {}) do
+      for _, chunk in ipairs(virt_line) do
+        parts[#parts + 1] = chunk[1]
+      end
+    end
+  end
+  return table.concat(parts, "\n")
+end
+
+local function box_contains(buf, needle)
+  return box_text(buf):find(needle, 1, true) ~= nil
+end
+
 ---@param doc table
 local function set_walkthrough_doc(doc)
   fixtures[root .. "/.walkthrough.json"] = vim.json.encode(doc)
@@ -202,7 +220,7 @@ local function valid_doc()
         file = "b.txt",
         start = { line = 2, col = 1 },
         ["end"] = { line = 2, col = 9 },
-        comment = "Same rewrite applied to b.txt for symmetry.",
+        comment = "Same rewrite applied for symmetry.",
       },
     },
   }
@@ -251,18 +269,20 @@ local function run()
   local cursor_row = vim.api.nvim_win_get_cursor(vim.fn.bufwinid(buf))[1]
   assert_true(cursor_row == step_row, ("cursor not on step row (expected %d, got %d)"):format(step_row, cursor_row))
   assert_true(walkthrough_extmark_count(buf) > 0, "region extmarks missing")
-  local comment_win = find_float_with("rewritten to NEW")
-  assert_true(comment_win ~= nil, "comment float missing")
+  assert_true(box_contains(buf, "rewritten to NEW"), "inline comment box missing")
+  assert_true(box_contains(buf, "1/2 - First change"), "inline box heading missing")
+  assert_true(box_contains(buf, " a.txt "), "file basename missing from the box header")
 
   -- ── navigation: forward to step 2, back, back to summary, quit ────────────
   trigger_buf_mapping(buf, "y")
-  wait_for(function() return find_float_with("symmetry") ~= nil end, "step 2 float did not open")
+  wait_for(function() return box_contains(buf, "symmetry") end, "step 2 box did not render")
+  assert_true(box_contains(buf, " b.txt "), "step 2 basename missing from the box header")
   local step2_row = find_row(buf, "NEW b.txt")
   cursor_row = vim.api.nvim_win_get_cursor(vim.fn.bufwinid(buf))[1]
   assert_true(cursor_row == step2_row, "cursor not on step 2 row")
 
   trigger_buf_mapping(buf, "z")
-  wait_for(function() return find_float_with("rewritten to NEW") ~= nil end, "z did not return to step 1")
+  wait_for(function() return box_contains(buf, "rewritten to NEW") end, "z did not return to step 1")
 
   trigger_buf_mapping(buf, "z")
   local resume_buf
@@ -285,9 +305,9 @@ local function run()
   -- ── completion past the last step ──────────────────────────────────────────
   summary_buf = start_walkthrough(buf)
   trigger_buf_mapping(summary_buf, "y")
-  wait_for(function() return find_float_with("rewritten to NEW") ~= nil end, "restart did not show step 1")
+  wait_for(function() return box_contains(buf, "rewritten to NEW") end, "restart did not show step 1")
   trigger_buf_mapping(buf, "y")
-  wait_for(function() return find_float_with("symmetry") ~= nil end, "restart did not reach step 2")
+  wait_for(function() return box_contains(buf, "symmetry") end, "restart did not reach step 2")
   trigger_buf_mapping(buf, "y")
   wait_for(function() return saw_notification_containing("Walkthrough complete") end, "no completion notification")
   assert_true(walkthrough_extmark_count(buf) == 0, "completion did not clear extmarks")
@@ -321,9 +341,9 @@ local function run()
   set_walkthrough_doc(degraded)
   summary_buf = start_walkthrough(buf)
   trigger_buf_mapping(summary_buf, "y")
-  wait_for(function() return find_float_with("position approximated") ~= nil end, "nearest match note missing")
+  wait_for(function() return box_contains(buf, "position approximated") end, "nearest match note missing")
   trigger_buf_mapping(buf, "y")
-  wait_for(function() return find_float_with("not in current diff") ~= nil end, "missing file note missing")
+  wait_for(function() return box_contains(buf, "not in current diff") end, "missing file note missing")
   trigger_buf_mapping(buf, "q")
   close_all_floats()
 
@@ -334,7 +354,7 @@ local function run()
   wait_for(function() return walkthrough_extmark_count(buf) > 0 end, "no extmarks before re-render")
   diff_review.render_status(buf, nil, nil, { reuse_sections = true })
   wait_for(function() return walkthrough_extmark_count(buf) > 0 end, "re-render dropped walkthrough extmarks")
-  wait_for(function() return find_float_with("rewritten to NEW") ~= nil end, "re-render dropped the comment float")
+  wait_for(function() return box_contains(buf, "rewritten to NEW") end, "re-render dropped the inline comment box")
   trigger_buf_mapping(buf, "q")
   close_all_floats()
 

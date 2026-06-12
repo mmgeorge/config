@@ -2,7 +2,8 @@
 -- .walkthrough.json at the repo root (see walkthrough.schema.json next to this
 -- file); `ow` in the status buffer shows the summary, then z/y step backward/
 -- forward through the referenced regions inside the inline diff, with the
--- author's comment floating above each region. Positions refer to the NEW
+-- author's comment rendered as an inline virt_lines box above each region.
+-- Positions refer to the NEW
 -- (post-change) file; the document records the HEAD sha it was generated
 -- against so stale walkthroughs degrade to best-effort jumps with a note.
 
@@ -48,7 +49,6 @@
 ---@field index integer 0 = summary popup, 1..n = steps
 ---@field stale boolean
 ---@field head_sha? string
----@field float_win? integer
 ---@field saved_maps table<string, table> maparg dicts to restore on stop
 
 ---@class DiffReviewWalkthroughModule
@@ -319,14 +319,6 @@ local function wrap_text(text, width)
   return wrapped
 end
 
----@param mode DiffReviewWalkthroughMode
-local function close_float(mode)
-  if mode.float_win and vim.api.nvim_win_is_valid(mode.float_win) then
-    pcall(vim.api.nvim_win_close, mode.float_win, true)
-  end
-  mode.float_win = nil
-end
-
 ---@param target DiffReviewWalkthroughTarget
 ---@param stale boolean
 ---@return string? note
@@ -346,71 +338,64 @@ local function staleness_note(target, stale)
   return nil
 end
 
---- Open the per-step comment float anchored above the region (flips below it
---- when the region sits too close to the window top).
+--- Render the per-step comment as an inline virt_lines box above the region:
+--- it scrolls with the buffer and pushes real lines down instead of
+--- overlapping them. Everything lives in the walkthrough namespace, so a
+--- namespace clear removes the box together with the region highlight.
 ---@param mode DiffReviewWalkthroughMode
 ---@param step DiffReviewWalkthroughStep
 ---@param target DiffReviewWalkthroughTarget
 ---@param win integer
-local function open_comment_float(mode, step, target, win)
-  close_float(mode)
-
+local function render_comment_box(mode, step, target, win)
+  local buf = mode.host.buf
   local win_width = vim.api.nvim_win_get_width(win)
-  local width = math.max(30, math.min(72, win_width - 6))
-  local lines = wrap_text(step.comment, width)
+  local inner_width = math.max(30, math.min(72, win_width - 8))
+
+  ---@type { text: string, hl: string }[][] content rows (without borders)
+  local content = {}
+  for _, line in ipairs(wrap_text(step.comment, inner_width - 2)) do
+    content[#content + 1] = { text = line, hl = "DiffReviewWalkthroughComment" }
+  end
   local note = staleness_note(target, mode.stale)
-  local note_line = nil
   if note then
-    lines[#lines + 1] = ""
-    note_line = #lines + 1
-    lines[#lines + 1] = note
+    content[#content + 1] = { text = "", hl = "DiffReviewWalkthroughComment" }
+    content[#content + 1] = { text = note, hl = "DiffReviewWalkthroughStale" }
   end
-  lines[#lines + 1] = ""
-  lines[#lines + 1] = "[z] back  [y] next  [q] quit"
+  content[#content + 1] = { text = "", hl = "DiffReviewWalkthroughComment" }
+  content[#content + 1] = { text = "[z] back  [y] next  [q] quit", hl = "DiffReviewStatusHint" }
 
-  local float_buf = vim.api.nvim_create_buf(false, true)
-  vim.bo[float_buf].bufhidden = "wipe"
-  vim.bo[float_buf].buftype = "nofile"
-  vim.api.nvim_buf_set_lines(float_buf, 0, -1, false, lines)
-  vim.bo[float_buf].modifiable = false
-  if note_line then
-    pcall(vim.api.nvim_buf_set_extmark, float_buf, M._ns, note_line - 1, 0, {
-      end_col = #lines[note_line],
-      hl_group = "DiffReviewWalkthroughStale",
-    })
+  -- Header: "4/15 - title" left-aligned, the file's basename right-aligned.
+  local heading = (" %d/%d%s "):format(mode.index, #mode.doc.steps, step.title and (" - " .. step.title) or "")
+  local basename = " " .. (step.file:match("([^/]+)$") or step.file) .. " "
+  for _, row in ipairs(content) do
+    inner_width = math.max(inner_width, vim.fn.strdisplaywidth(row.text) + 2)
   end
-  pcall(vim.api.nvim_buf_set_extmark, float_buf, M._ns, #lines - 1, 0, {
-    end_col = #lines[#lines],
-    hl_group = "DiffReviewStatusHint",
-  })
+  local heading_width = vim.fn.strdisplaywidth(heading)
+  local basename_width = vim.fn.strdisplaywidth(basename)
+  inner_width = math.max(inner_width, heading_width + basename_width + 3)
 
-  local anchor_row = (target.start_row or 1) - 1
-  local title = (" Step %d/%d%s "):format(mode.index, #mode.doc.steps, step.title and (" - " .. step.title) or "")
-  local height = #lines
-  local anchor = "SW"
-  -- Flip below the region when there is not enough room above it.
-  local top_visible_row = vim.fn.line("w0", win)
-  if (target.start_row or 1) - top_visible_row < height + 2 then
-    anchor = "NW"
-    anchor_row = target.end_row or anchor_row + 1
+  local pad = "  "
+  local virt_lines = {}
+  virt_lines[#virt_lines + 1] = {
+    { pad .. "╭─", "FloatBorder" },
+    { heading, "Title" },
+    { ("─"):rep(math.max(inner_width - heading_width - basename_width - 2, 0)), "FloatBorder" },
+    { basename, "DiffReviewStatusPath" },
+    { "─╮", "FloatBorder" },
+  }
+  for _, row in ipairs(content) do
+    local fill = (" "):rep(math.max(inner_width - vim.fn.strdisplaywidth(row.text) - 2, 0))
+    virt_lines[#virt_lines + 1] = {
+      { pad .. "│ ", "FloatBorder" },
+      { row.text .. fill, row.hl },
+      { " │", "FloatBorder" },
+    }
   end
+  virt_lines[#virt_lines + 1] = { { pad .. "╰" .. ("─"):rep(inner_width) .. "╯", "FloatBorder" } }
 
-  mode.float_win = vim.api.nvim_open_win(float_buf, false, {
-    relative = "win",
-    win = win,
-    bufpos = { anchor_row, 0 },
-    anchor = anchor,
-    row = 0,
-    col = 2,
-    width = math.min(width + 2, win_width - 4),
-    height = height,
-    style = "minimal",
-    border = "rounded",
-    title = title,
-    title_pos = "left",
-    focusable = false,
-    zindex = 60,
-    noautocmd = true,
+  pcall(vim.api.nvim_buf_set_extmark, buf, M._ns, (target.start_row or 1) - 1, 0, {
+    virt_lines = virt_lines,
+    virt_lines_above = true,
   })
 end
 
@@ -421,7 +406,7 @@ end
 local function apply_region_highlight(mode, target)
   local buf = mode.host.buf
   vim.api.nvim_buf_clear_namespace(buf, M._ns, 0, -1)
-  if not target.start_row then return end
+  if not target.start_row or target.match == "missing" then return end
   local end_row = target.end_row or target.start_row
   for row = target.start_row, end_row do
     pcall(vim.api.nvim_buf_set_extmark, buf, M._ns, row - 1, 0, {
@@ -441,7 +426,6 @@ local function show_step(mode, index)
   end
 
   if index <= 0 then
-    close_float(mode)
     vim.api.nvim_buf_clear_namespace(buf, M._ns, 0, -1)
     mode.index = 0
     M._open_summary(mode, { resume = true })
@@ -477,15 +461,13 @@ local function show_step(mode, index)
     pcall(vim.api.nvim_win_set_cursor, win, { target.start_row, 0 })
     vim.api.nvim_win_call(win, function() vim.cmd("normal! zz") end)
   end
-  apply_region_highlight(mode, target)
-
   if target.match == "missing" then
-    -- Anchor at the cursor's current row; no region to highlight.
+    -- Anchor the box at the cursor's current row; no region to highlight.
     local cursor_row = vim.api.nvim_win_get_cursor(win)[1]
     target = { match = "missing", start_row = cursor_row, end_row = cursor_row }
-    apply_region_highlight(mode, { match = "missing" })
   end
-  open_comment_float(mode, step, target, win)
+  apply_region_highlight(mode, target)
+  render_comment_box(mode, step, target, win)
 end
 
 ---@param mode DiffReviewWalkthroughMode
@@ -530,8 +512,9 @@ function M.stop(buf)
   if not mode then return end
   M._modes[buf] = nil
 
-  close_float(mode)
   if vim.api.nvim_buf_is_valid(buf) then
+    -- The namespace clear removes the region highlight and the inline
+    -- comment box together.
     vim.api.nvim_buf_clear_namespace(buf, M._ns, 0, -1)
     for _, key in ipairs(nav_keys) do
       pcall(vim.keymap.del, "n", key, { buffer = buf })
@@ -689,12 +672,12 @@ function M.on_status_rendered(buf)
     if win == -1 then return end
     local step = active.doc.steps[active.index]
     local target = M.resolve_step(active.host.get_state(), step)
-    apply_region_highlight(active, target)
     if target.match == "missing" then
       local cursor_row = vim.api.nvim_win_get_cursor(win)[1]
       target = { match = "missing", start_row = cursor_row, end_row = cursor_row }
     end
-    open_comment_float(active, step, target, win)
+    apply_region_highlight(active, target)
+    render_comment_box(active, step, target, win)
   end)
 end
 
