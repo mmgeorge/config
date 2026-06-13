@@ -6169,6 +6169,124 @@ local function closest_current_line_for_deleted_diff_line(diff_text, old_target_
   end
 end
 
+-- File revision buffers: read-only scratch buffers holding a file's content
+-- at a git revision, named GitFileRevision://<path>@<rev>. Functions hang off
+-- the module table because init.lua is at Lua's 200-local limit.
+M._file_revision = { buffers = {} }
+
+---Resolve the revision holding the pre-change content for a deleted diff
+---line: the base of the diff the entry was rendered from, which is the only
+---revision where the old line number is exact.
+---@param entry DiffReviewStatusEntry
+---@param status table?
+---@return string? rev revision for `git show <rev>:<path>`
+---@return string? path repo-relative path in that revision
+function M._file_revision.target(entry, status)
+  if not (entry.hunk and entry.file and status and status.cwd) then return nil end
+  local relpath = repo_relative(entry.file.filename, status.cwd)
+  if not relpath then return nil end
+  local view_kind = status.view_kind or "status"
+  if view_kind == "diff" and status.diff_branch then
+    return status.diff_branch, relpath
+  end
+  if view_kind == "status" and entry.kind == "hunk" then
+    if entry.hunk.staged then
+      return "HEAD", entry.hunk.git_original_file or relpath
+    end
+    return ":0", relpath
+  end
+  return nil
+end
+
+---Open (or refresh) the read-only buffer for `path` as it exists at `rev`.
+---The buffer is named with the short sha of the underlying commit (HEAD for
+---the index revision `:0`, since the index is not a commit).
+---@param opts { rev: string, path: string, cwd: string, line: integer?, on_error: fun(message: string) }
+function M._file_revision.open(opts)
+  local label_rev = opts.rev == ":0" and "HEAD" or opts.rev
+  systemlist_async({ "git", "-C", opts.cwd, "rev-parse", "--short", label_rev }, function(label_lines, label_code)
+    local label = label_code == 0 and vim.trim(tostring(label_lines and label_lines[1] or "")) or ""
+    if label == "" then label = opts.rev end
+    M._file_revision.show(opts, label)
+  end)
+end
+
+---@param opts { rev: string, path: string, cwd: string, line: integer?, on_error: fun(message: string) }
+---@param label string short sha (or raw revision when it cannot be resolved)
+function M._file_revision.show(opts, label)
+  local command = { "git", "-C", opts.cwd, "show", ("%s:%s"):format(opts.rev, opts.path) }
+  systemlist_async(command, function(lines, code, output)
+    if code ~= 0 then
+      opts.on_error(vim.trim(tostring(output or "")))
+      return
+    end
+    local name = ("GitFileRevision://%s@%s"):format(opts.path, label)
+    local buf = M._file_revision.buffers[name]
+    if not (buf and vim.api.nvim_buf_is_valid(buf)) then
+      buf = vim.api.nvim_create_buf(true, false)
+      -- "nowrite", not "nofile": buffer pickers (e.g. snacks) hide nofile
+      -- scratch buffers, and this buffer should stay reachable like a file.
+      vim.bo[buf].buftype = "nowrite"
+      vim.bo[buf].bufhidden = "hide"
+      vim.bo[buf].swapfile = false
+      if not pcall(vim.api.nvim_buf_set_name, buf, name) then
+        pcall(vim.api.nvim_buf_set_name, buf, ("%s#%d"):format(name, buf))
+      end
+      vim.keymap.set("n", "q", function()
+        pcall(vim.api.nvim_buf_delete, buf, { force = true })
+      end, { buffer = buf, silent = true, nowait = true, desc = "Close file revision" })
+      M._file_revision.buffers[name] = buf
+    end
+    vim.bo[buf].readonly = false
+    vim.bo[buf].modifiable = true
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+    vim.bo[buf].modifiable = false
+    vim.bo[buf].readonly = true
+    local ft = detect_filetype(opts.path, lines)
+    if ft ~= "" and vim.bo[buf].filetype ~= ft then
+      vim.bo[buf].filetype = ft
+    end
+    vim.api.nvim_win_set_buf(vim.api.nvim_get_current_win(), buf)
+    if opts.line then
+      local target = math.min(math.max(opts.line, 1), vim.api.nvim_buf_line_count(buf))
+      pcall(vim.api.nvim_win_set_cursor, 0, { target, 0 })
+      vim.cmd("normal! zz")
+    end
+  end)
+end
+
+---Open a read-only buffer with `file` as it exists at git revision `rev`.
+---Entry point for :GitFileRevision.
+---@param file string
+---@param rev string
+function M.open_file_revision(file, rev)
+  file = vim.trim(tostring(file or ""))
+  rev = vim.trim(tostring(rev or ""))
+  if file == "" or rev == "" then
+    notify_error("GitFileRevision requires a file and a revision", "DiffReview")
+    return
+  end
+  git_root_async(function(root, root_err)
+    if not root then
+      notify_error(root_err or "Not a git repository", "DiffReview")
+      return
+    end
+    local relpath, rel_err = repo_relative(file, root)
+    if not relpath then
+      notify_error(rel_err or ("Path is outside the git root: " .. file), "DiffReview")
+      return
+    end
+    M._file_revision.open({
+      rev = rev,
+      path = relpath,
+      cwd = root,
+      on_error = function(message)
+        notify_error(message ~= "" and message or ("Git show failed for %s:%s"):format(rev, relpath), "DiffReview")
+      end,
+    })
+  end)
+end
+
 ---@param entry DiffReviewStatusEntry?
 local function status_open_pr(entry)
   local pr = entry and entry.pr
@@ -6225,8 +6343,24 @@ local function status_open_about(entry)
 end
 
 ---@param entry DiffReviewStatusEntry?
-local function status_jump(entry)
+---@param skip_revision boolean? open the working-tree file even for deleted lines
+local function status_jump(entry, skip_revision)
   if not (entry and entry.file and entry.file.filename) then return end
+  if not skip_revision and entry.diff_line and entry.diff_line.side == "left" and entry.diff_line.line then
+    local rev, path = M._file_revision.target(entry, M._status)
+    if rev and path then
+      M._file_revision.open({
+        rev = rev,
+        path = path,
+        cwd = M._status.cwd,
+        line = entry.diff_line.line,
+        on_error = function()
+          status_jump(entry, true)
+        end,
+      })
+      return
+    end
+  end
   vim.cmd.edit(vim.fn.fnameescape(entry.file.filename))
   local target_line
   if entry.diff_line and entry.diff_line.line then

@@ -5,11 +5,21 @@ feature: do not place DiffReview code under `trouble/sources`, do not register a
 `diff_review` Trouble mode, and do not route `:GitStatus` through Trouble.
 
 The public commands are `:GitStatus`, `:GitBranchDiff <branch>` (read-only diff
-of the working tree against a branch or revision), and
-`:GitBranchDiffFile <file> <branch>` (same, limited to one file), registered by
-`nvim/lua/plugins/diff_review.lua`. The plugin entrypoints are
-`require("diff_review").open()` and
-`require("diff_review").open_branch_diff(branch, { file = ... })`.
+of the working tree against a branch or revision),
+`:GitBranchDiffFile <file> <branch>` (same, limited to one file), and
+`:GitFileRevision <file> <commit>` (read-only buffer with the file's content at
+a revision), registered by `nvim/lua/plugins/diff_review.lua`. The plugin
+entrypoints are `require("diff_review").open()`,
+`require("diff_review").open_branch_diff(branch, { file = ... })`, and
+`require("diff_review").open_file_revision(file, rev)`.
+
+Pressing open on a deleted (left-side) diff line opens a file revision buffer
+(`GitFileRevision://<path>@<short sha>`, owned by `M._file_revision`) at the
+diff's base revision — index for unstaged hunks, HEAD for staged hunks, the
+branch for `:GitBranchDiff` views — where the old line number is exact. The
+buffer name carries the short sha of the underlying commit (HEAD's sha for the
+index, which is not a commit). If the base content cannot be fetched, it falls
+back to the working-tree jump.
 
 init.lua is at Lua's hard limit of 200 local variables per chunk: new
 file-scope helpers must hang off the module table (see `M._branch_diff`)
@@ -93,6 +103,12 @@ Run the branch-diff test:
 
 ```text
 nvim --headless -i NONE --cmd "set shadafile=NONE" -u nvim/init.lua -c "lua vim.loader.enable(false)" -S nvim/tests/diff_review/branch_diff.lua
+```
+
+Run the file-revision test:
+
+```text
+nvim --headless -i NONE --cmd "set shadafile=NONE" -u nvim/init.lua -c "lua vim.loader.enable(false)" -S nvim/tests/diff_review/file_revision.lua
 ```
 
 Run the whitespace check:

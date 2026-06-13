@@ -71,6 +71,12 @@ function backend.systemlist(command)
   if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\tmissingbranch" then
     return {}, 128
   end
+  if key == "git\t-C\t" .. root .. "\trev-parse\t--short\tsomebranch" then
+    return { "bbb2222" }, 0
+  end
+  if key == "git\t-C\t" .. root .. "\tshow\tsomebranch:src/a.txt" then
+    return { "alpha", "old line", "omega" }, 0
+  end
   return {}, 1
 end
 
@@ -158,6 +164,24 @@ local function run()
     assert_true(mapping.buffer ~= 1, ("status-only key %q must not be mapped in the diff view"):format(key))
   end
   assert_true(not buffer_contains(buf, "stage"), "hint row must not advertise staging")
+
+  -- ── open on a deleted line shows the branch revision of the file ───────────
+  trigger_buf_mapping(buf, "o", find_row(buf, "old line"))
+  wait_for(function()
+    return vim.api.nvim_buf_get_name(vim.api.nvim_get_current_buf()):find("GitFileRevision", 1, true) ~= nil
+  end, "open on deleted line did not open a revision buffer")
+  local revision_buf = vim.api.nvim_get_current_buf()
+  local revision_name = vim.api.nvim_buf_get_name(revision_buf)
+  assert_true(
+    revision_name:find("GitFileRevision://src/a.txt@bbb2222", 1, true) ~= nil,
+    "wrong revision buffer name: " .. revision_name
+  )
+  assert_true(vim.bo[revision_buf].readonly, "revision buffer must be readonly")
+  assert_true(not vim.bo[revision_buf].modifiable, "revision buffer must not be modifiable")
+  local revision_row = vim.api.nvim_win_get_cursor(0)[1]
+  local revision_line = vim.api.nvim_buf_get_lines(revision_buf, revision_row - 1, revision_row, false)[1]
+  assert_true(revision_line == "old line", "cursor not on the deleted line: " .. tostring(revision_line))
+  vim.api.nvim_win_set_buf(0, buf)
 
   -- ── refresh re-runs the branch diff ────────────────────────────────────────
   local requests_before = branch_diff_requests
