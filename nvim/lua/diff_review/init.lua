@@ -3266,6 +3266,7 @@ local status_command_specs = {
   { id = "push", label = "push", desc = "Push", modes = "n", hint = true, views = { status = true } },
   { id = "pull", label = "pull", desc = "Pull", modes = "n", hint = true, views = { status = true } },
   { id = "pr", label = "pr", desc = "Open pull request", modes = "n", hint = true, views = { status = true } },
+  { id = "github_open_pr", label = "current pr", desc = "Create current branch pull request", modes = "n", hint = false, views = { status = true } },
   { id = "branch_create", label = "branch", desc = "Create a branch", modes = "n", hint = false, views = { status = true } },
   { id = "walkthrough", label = "walkthrough", desc = "Review walkthrough", modes = "n", hint = false, views = { status = true } },
   { id = "review", label = "review", desc = "Start PR review", modes = "n", hint = true, views = { status = true, pr = true } },
@@ -5551,6 +5552,7 @@ M._review = {
   -- real UI; tests override them. Mirrors the set_backend/set_reader pattern.
   input_provider = nil, ---@type (fun(title: string, on_submit: fun(text: string)))?
   verdict_provider = nil, ---@type (fun(on_choice: fun(event: string?)))?
+  data_dir_for_test = nil,
 }
 
 ---@param buf integer
@@ -5575,6 +5577,105 @@ function M._review.keys_for(id)
   if key == false or key == nil then return {} end
   if type(key) == "table" then return key end
   return { key }
+end
+
+---@param path string?
+function M._review.set_data_dir_for_test(path)
+  M._review.data_dir_for_test = path
+end
+
+---@return string
+function M._review.data_dir()
+  return M._review.data_dir_for_test
+    or vim.fs.joinpath(vim.fn.stdpath("data"), "gitstatus", "reviews")
+end
+
+---@param state table
+---@return string
+function M._review.storage_repo(state)
+  local pr = state.pr or {}
+  local repo = type(pr.repo) == "string" and vim.trim(pr.repo) or ""
+  if repo ~= "" then return repo end
+  local url = type(pr.url) == "string" and pr.url or ""
+  local owner, name = url:match("github%.com[:/]([^/]+)/([^/]+)/pull/%d+")
+  if owner and name then return owner .. "/" .. name end
+  return "unknown/" .. vim.fn.sha256(tostring(state.cwd or ""))
+end
+
+---@param segment string|number?
+---@return string
+function M._review.storage_segment(segment)
+  local text = vim.trim(tostring(segment or ""))
+  if text == "" then text = "current" end
+  text = text:gsub("[<>:\"/\\|?*%c]", "-"):gsub("^%.+$", "-")
+  return text
+end
+
+---@param state table
+---@return string[]
+function M._review.storage_segments(state)
+  local segments = {}
+  for _, segment in ipairs(vim.split(M._review.storage_repo(state), "/", { plain = true, trimempty = true })) do
+    segments[#segments + 1] = M._review.storage_segment(segment)
+  end
+  segments[#segments + 1] = M._review.storage_segment((state.pr or {}).number)
+  return segments
+end
+
+---@param state table
+---@return string
+function M._review.storage_path(state)
+  local parts = { M._review.data_dir() }
+  vim.list_extend(parts, M._review.storage_segments(state))
+  parts[#parts + 1] = "review.json"
+  return vim.fs.joinpath(unpack(parts))
+end
+
+---@param state table
+function M._review.load_draft(state)
+  local path = M._review.storage_path(state)
+  if vim.uv.fs_stat(path) == nil then return end
+  local ok, lines = pcall(vim.fn.readfile, path)
+  if not ok then return end
+  local decoded_ok, draft = pcall(vim.json.decode, table.concat(lines, "\n"))
+  if not decoded_ok or type(draft) ~= "table" then return end
+  if type(draft.review_viewed) == "table" then state.review_viewed = draft.review_viewed end
+  if type(draft.review_comment_text) == "string" then state.review_comment_text = draft.review_comment_text end
+  if type(draft.review_comments) == "table" then state.review_comments = draft.review_comments end
+end
+
+---@param state table
+function M._review.save_draft(state)
+  local path = M._review.storage_path(state)
+  local directory = vim.fs.dirname(path) or M._review.data_dir()
+  local mkdir_ok, mkdir_err = pcall(vim.fn.mkdir, directory, "p")
+  if not mkdir_ok or mkdir_err == 0 then
+    notify_error("Could not create review draft directory: " .. directory, "DiffReview")
+    return
+  end
+  local payload = {
+    cwd = state.cwd,
+    repo = state.pr and state.pr.repo or nil,
+    number = state.pr and state.pr.number or nil,
+    commit_id = state.commit_id,
+    review_viewed = state.review_viewed or {},
+    review_comment_text = state.review_comment_text or "",
+    review_comments = state.review_comments or {},
+  }
+  local encode_ok, encoded = pcall(vim.json.encode, payload)
+  if not encode_ok then
+    notify_error("Could not encode review draft", "DiffReview")
+    return
+  end
+  local write_ok, write_err = pcall(vim.fn.writefile, { encoded }, path)
+  if not write_ok or write_err ~= 0 then
+    notify_error("Could not write review draft", "DiffReview")
+  end
+end
+
+---@param state table
+function M._review.delete_draft(state)
+  pcall(vim.fn.delete, M._review.storage_path(state))
 end
 
 function M._review.leave_visual()
@@ -5850,6 +5951,7 @@ function M._review.sync_comment_text(buf)
   local e0 = M._review.mark_row(buf, state.review_comment_end)
   if not (s0 and e0) then return end
   state.review_comment_text = table.concat(vim.api.nvim_buf_get_lines(buf, s0, e0, false), "\n")
+  M._review.save_draft(state)
 end
 
 ---@param buf integer
@@ -5862,6 +5964,7 @@ function M._review.toggle_viewed(buf, viewed)
   local file = entry and entry.file
   if not file then return end
   state.review_viewed[file.relpath] = viewed or nil
+  M._review.save_draft(state)
   M._review.render(buf)
 end
 
@@ -5954,6 +6057,8 @@ function M._review.edit_comment(buf, comment)
     text = vim.trim(text)
     if text == "" or not vim.api.nvim_buf_is_valid(buf) then return end
     comment.body = text
+    local state = M._review.state(buf)
+    if state then M._review.save_draft(state) end
     M._review.render(buf)
   end, comment.body)
 end
@@ -5984,6 +6089,7 @@ function M._review.add_comment(buf)
       start_side = payload.start_side,
       body = text,
     }
+    M._review.save_draft(state)
     M._review.render(buf)
   end)
 end
@@ -5996,6 +6102,7 @@ function M._review.delete_comment(buf)
   local comment, index = M._review.comment_under_cursor(buf)
   if not (comment and index) then return end
   table.remove(state.review_comments, index)
+  M._review.save_draft(state)
   M._review.render(buf)
 end
 
@@ -6069,6 +6176,7 @@ function M._review.submit(buf)
       end
       state.review_comments = {}
       state.review_comment_text = ""
+      M._review.delete_draft(state)
       M._review.render(buf)
       vim.notify(
         ("Review submitted (%s, %d comment%s)"):format(event, count, count == 1 and "" or "s"),
@@ -7833,6 +7941,10 @@ local function setup_status_keymaps(buf)
     status_open_pr(status_entry_under_cursor())
   end)
 
+  map("github_open_pr", "n", function()
+    vim.cmd.GithubOpenPR()
+  end)
+
   map("branch_create", "n", function()
     M._create_branch(buf)
   end)
@@ -7998,6 +8110,7 @@ function M.open_review(pr, opts)
     sections = nil,
     fancy_rows = {},
   }
+  M._review.load_draft(state)
   M._status = state
   attach_status_state(buf, state)
   setup_status_keymaps(buf)

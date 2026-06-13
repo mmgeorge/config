@@ -29,6 +29,7 @@
 ---@field push DiffReviewKeymap
 ---@field pull DiffReviewKeymap
 ---@field pr DiffReviewKeymap
+---@field github_open_pr DiffReviewKeymap
 ---@field branch_create DiffReviewKeymap
 ---@field browse DiffReviewKeymap
 ---@field walkthrough DiffReviewKeymap
@@ -82,6 +83,7 @@ M.defaults = {
       push = "opp",
       pull = "opP",
       pr = "ogp",
+      github_open_pr = "ogc",
       branch_create = "bc",
       browse = "b",
       walkthrough = "ow",

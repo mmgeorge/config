@@ -475,8 +475,17 @@ local function run()
   trigger_normal_mapping("?", find_row(status_buf, "Head:"))
   local help_buf = vim.api.nvim_get_current_buf()
   assert_true(help_buf ~= status_buf, "help did not open a popup buffer")
-  assert_buffer_contains_all(help_buf, { "<Tab>", "N", "S", "U", "j", "cc", "opP", "opp", "ogp", "o", "<CR>", "R", "or", "q", "?" })
+  assert_buffer_contains_all(help_buf, { "<Tab>", "N", "S", "U", "j", "cc", "opP", "opp", "ogp", "ogc", "o", "<CR>", "R", "or", "q", "?" })
   pcall(vim.api.nvim_win_close, 0, true)
+
+  vim.api.nvim_win_set_buf(0, status_buf)
+  assert_true(type(vim.fn.maparg("ogc", "n", false, true).callback) == "function", "ogc current PR mapping missing")
+  local github_open_pr_called = false
+  pcall(vim.api.nvim_create_user_command, "GithubOpenPR", function()
+    github_open_pr_called = true
+  end, {})
+  trigger_normal_mapping("ogc", find_row(status_buf, "Head:"))
+  assert_true(github_open_pr_called, "ogc did not call GithubOpenPR")
 
   vim.api.nvim_win_set_buf(0, status_buf)
   trigger_normal_mapping("ogp", find_row(status_buf, "Head:"))
@@ -566,6 +575,7 @@ local function run()
         push = "zpP",
         pull = "zpp",
         pr = "zgp",
+        github_open_pr = "zgc",
         help = "zh",
       },
     },
@@ -577,9 +587,10 @@ local function run()
   assert_true(type(vim.fn.maparg("zpP", "n", false, true).callback) == "function", "custom push mapping missing")
   assert_true(type(vim.fn.maparg("zpp", "n", false, true).callback) == "function", "custom pull mapping missing")
   assert_true(type(vim.fn.maparg("zgp", "n", false, true).callback) == "function", "custom PR mapping missing")
+  assert_true(type(vim.fn.maparg("zgc", "n", false, true).callback) == "function", "custom current PR mapping missing")
   trigger_normal_mapping("zh", find_row(override_buf, "Head:"))
   local override_help_buf = vim.api.nvim_get_current_buf()
-  assert_buffer_contains_all(override_help_buf, { "zc", "zpP", "zpp", "zgp", "zh" })
+  assert_buffer_contains_all(override_help_buf, { "zc", "zpP", "zpp", "zgp", "zgc", "zh" })
 
   if vim.api.nvim_win_is_valid(0) then
     pcall(vim.api.nvim_win_close, 0, true)

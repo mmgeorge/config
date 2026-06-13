@@ -1,5 +1,5 @@
-model = "gpt-5.5"
-model_reasoning_effort = "medium"
+model = "gpt-5.4-mini"
+model_reasoning_effort = "low"
 model_reasoning_summary = "detailed"
 model_context_window = 400000
 model_auto_compact_token_limit = 300000
@@ -58,6 +58,9 @@ trust_level = "trusted"
 trust_level = "trusted"
 
 [projects.'c:\users\mattm\documents\codex\2026-05-31\explain-the-rendering-equation']
+trust_level = "trusted"
+
+[projects.'d:\code\test-repo']
 trust_level = "trusted"
 
 [notice.model_migrations]
@@ -131,6 +134,12 @@ motion_word_end = "h"
 motion_line_start = ";"
 motion_line_end = "/"
 yank_line = "l"
+
+[tui.keymap.composer]
+queue = "ctrl-q"
+
+[tui.keymap.chat]
+edit_queued_message = ["alt-up", "shift-left", "alt-s"]
 
 [tui.model_availability_nux]
 "gpt-5.5" = 4

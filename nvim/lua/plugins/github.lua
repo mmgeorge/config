@@ -6,7 +6,7 @@ return {
       vim.api.nvim_create_user_command("GithubOpenPR", function()
         require("github.open_pr").open()
       end, {
-        desc = "Open a draft GitHub PR for the current branch",
+        desc = "Create a draft GitHub PR for the current branch",
       })
 
       vim.api.nvim_create_user_command("GithubIssuse", function()

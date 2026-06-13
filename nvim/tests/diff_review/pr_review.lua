@@ -9,6 +9,7 @@ end
 
 local original_notify = vim.notify
 local captured_notifications = {}
+local review_data_dir = vim.fn.tempname()
 local function capture_notify(message, level, opts)
   captured_notifications[#captured_notifications + 1] = { message = tostring(message), level = level, opts = opts }
 end
@@ -139,6 +140,7 @@ local function run()
   diff_review.set_git_backend(git_backend)
   gh.set_backend(gh_backend)
   diff_review.setup({ about_auto_generate = false })
+  diff_review._review.set_data_dir_for_test(review_data_dir)
 
   local buf = diff_review.open_review(pr, { cwd = "D:/diffreview-review-root" })
   assert_true(buf ~= nil, "open_review did not return a buffer")
@@ -208,6 +210,36 @@ local function run()
   wait_for(function() return buffer_contains(buf, "Edited comment body") end, "comment edit did not apply")
   assert_true(prefill_seen == "This rename needs a test", "edit input was not prefilled with the existing body")
   assert_true(not buffer_contains(buf, "This rename needs a test"), "old comment text still present after edit")
+  local draft_path = diff_review._review.storage_path(diff_review._review.state(buf))
+  assert_true(
+    vim.fs.normalize(draft_path):find(vim.fs.normalize(review_data_dir), 1, true) == 1,
+    "review draft path was not under the data dir"
+  )
+  assert_true(
+    vim.fs.normalize(draft_path) == vim.fs.normalize(vim.fs.joinpath(review_data_dir, "owner", "repo", "12", "review.json")),
+    "review draft path was not based on the GitHub PR identity: " .. draft_path
+  )
+  assert_true(vim.uv.fs_stat(draft_path) ~= nil, "review draft was not written")
+
+  local same_pr_buf = diff_review.open_review(pr, { cwd = "D:/diffreview-review-root" })
+  assert_true(same_pr_buf ~= nil, "same PR review did not open")
+  wait_for(function() return buffer_contains(same_pr_buf, "Edited comment body") end, "same PR review did not load draft comment")
+  assert_true(buffer_contains(same_pr_buf, "Looks good overall"), "same PR review did not load draft summary")
+
+  local other_pr = vim.deepcopy(pr)
+  other_pr.number = 13
+  other_pr.url = "https://github.com/owner/repo/pull/13"
+  local other_buf = diff_review.open_review(other_pr, { cwd = "D:/diffreview-review-root" })
+  assert_true(other_buf ~= nil, "other PR review did not open")
+  wait_for(function() return buffer_contains(other_buf, "NEW src/a.txt") end, "other PR review diff did not render")
+  assert_true(
+    vim.fs.normalize(diff_review._review.storage_path(diff_review._review.state(other_buf)))
+      == vim.fs.normalize(vim.fs.joinpath(review_data_dir, "owner", "repo", "13", "review.json")),
+    "other PR review path was not based on its PR number"
+  )
+  assert_true(not buffer_contains(other_buf, "Edited comment body"), "other PR review loaded the first PR draft")
+  assert_true(#diff_review._review.state(other_buf).review_comments == 0, "other PR review inherited draft comments")
+  vim.api.nvim_win_set_buf(0, buf)
 
   -- ── add a second comment, then J deletes the one under the cursor ──────────
   diff_review._review.input_provider = function(_, on_submit, _) on_submit("Second comment") end
@@ -240,6 +272,7 @@ local function run()
   -- comments cleared after a successful submit
   wait_for(function() return not buffer_contains(buf, "Edited comment body") end, "comments not cleared after submit")
   assert_true(#diff_review._review.state(buf).review_comments == 0, "drafts not cleared after submit")
+  assert_true(vim.uv.fs_stat(draft_path) == nil, "review draft was not deleted after submit")
 
   -- ── failed submit notifies and keeps the drafts ────────────────────────────
   diff_review._review.input_provider = function(_, on_submit, _) on_submit("Another note") end
@@ -257,8 +290,10 @@ local ok, err = xpcall(run, debug.traceback)
 vim.notify = original_notify
 diff_review._review.input_provider = nil
 diff_review._review.verdict_provider = nil
+diff_review._review.set_data_dir_for_test(nil)
 diff_review.reset_git_backend()
 gh.reset_backend()
+vim.fn.delete(review_data_dir, "rf")
 if not ok then
   vim.api.nvim_err_writeln(err)
   vim.cmd("cquit")

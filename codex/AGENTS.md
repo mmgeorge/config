@@ -79,6 +79,14 @@ Every plan must end with these lines:
 - **Never** read or set environment variables via shell commands. If one is required and unset, ask the user.
 - **Never** use the `gh` CLI. Use the GitHub MCP tool for all GitHub operations.
 
+# Searching
+- For researching or finding new Rust crates, use `docs-mcp`.
+- When you need to view the source code:
+  - For Rust or Typescript, first check locally if it already exist.
+  - Otherwise, when you need to view source code, use `github` mcp.
+- Also search issues and PR description with the `github` mcp to augment understanding.
+- For CLI tools or APIs, prefer searching the source code to get a deep understanding.
+
 # Nushell
 When working with Nushell, reference these repos via GitHub MCP:
 - **nushell/nushell** — source code, builtins, command signatures, internals.
@@ -90,11 +98,6 @@ Before returning any Nushell script, validate for parse errors:
 2. Run `nu -c 'nu-check script.nu'` (or `--as-module` for modules).
 3. Fix any errors before presenting the script.
 4. For one-liners: `"your code here" | nu-check`
-
-# Directory Access
-- **Never** access directories outside the **current working directory** (and subdirectories) or the well-known platform directories listed below.
-- If you need a path outside these, **ask first**.
-- **Never** read `~/.cargo/`. Use **docs-mcp** or **GitHub MCP** for Rust crate info.
 
 ## Well-known directories
 

@@ -4,10 +4,6 @@ local default_base_branch = "main"
 local state_cache = nil
 local state_path_for_test = nil
 local pr_context_limit = 60000
-local pr_adapter = {
-  name = "copilot",
-  model = "gpt-4.1",
-}
 
 local pr_system_prompt = [[You generate GitHub pull request metadata from git commit messages.
 Return ONLY valid JSON with this exact shape:
@@ -122,7 +118,7 @@ end
 
 local function state_path()
   return state_path_for_test
-      or vim.fs.joinpath(vim.fn.stdpath("state"), "github-open-pr.json")
+      or vim.fs.joinpath(vim.fn.stdpath("state"), "gitstatus", "github-open-pr.json")
 end
 
 ---@param cwd string
@@ -190,14 +186,14 @@ local function write_state(state)
 end
 
 ---@param cwd string
----@return string
-local function get_base_branch(cwd)
+---@return string?
+local function get_stored_base_branch(cwd)
   local state = read_state()
   local branch = state.repos[repo_key(cwd)]
   if type(branch) == "string" and branch ~= "" then
     return branch
   end
-  return default_base_branch
+  return nil
 end
 
 ---@param cwd string
@@ -255,21 +251,17 @@ local function git(args, cwd, callback)
   run(vim.list_extend({ "git" }, args), { cwd = cwd }, callback)
 end
 
-local function model_content(result)
-  local content = result and result.output
-  if type(content) == "table" then
-    content = content.content
-  end
-  if type(content) ~= "string" then
-    return nil
-  end
-
-  content = vim.trim(content)
+---@param content string?
+---@return string?
+local function normalize_pr_metadata_content(content)
+  if type(content) ~= "string" then return nil end
+  content = vim.trim(content):gsub("\r\n", "\n")
   content = content:gsub("^```%w*\n", ""):gsub("\n```$", "")
   return vim.trim(content)
 end
 
 local function decode_pr_metadata(content)
+  content = normalize_pr_metadata_content(content)
   if not content or content == "" then
     return nil, "No response from model"
   end
@@ -289,24 +281,6 @@ local function decode_pr_metadata(content)
     title = vim.trim(title:gsub("\n.*", "")),
     body = body,
   }
-end
-
-local function safe_inline_output(background)
-  local inline_output = background
-      and background.adapter
-      and background.adapter.handlers
-      and background.adapter.handlers.inline_output
-
-  if type(inline_output) == "function" and not background.adapter.handlers._commit_safe_inline_output then
-    background.adapter.handlers.inline_output = function(self, data, context)
-      if type(data) == "string" then
-        data = { body = data }
-      end
-
-      return inline_output(self, data, context)
-    end
-    background.adapter.handlers._commit_safe_inline_output = true
-  end
 end
 
 local function build_context(branch, base_ref, commits)
@@ -354,6 +328,18 @@ local function parse_base_branches(output, current_branch)
 
   table.sort(branches)
   return branches
+end
+
+---@param branches string[]
+---@return string?
+local function default_base_branch_from_branches(branches)
+  for _, branch in ipairs(branches) do
+    if branch == default_base_branch then return branch end
+  end
+  for _, branch in ipairs(branches) do
+    if branch == "master" then return branch end
+  end
+  return nil
 end
 
 ---@param lines string[]
@@ -445,18 +431,44 @@ end
 ---@param current_branch string
 ---@param callback fun(branch: string?)
 local function choose_base_branch(cwd, current_branch, callback)
-  local current_base_branch = get_base_branch(cwd)
-  confirm({ "Base: " .. current_base_branch }, function()
-    callback(current_base_branch)
-  end, function()
-    git({ "branch", "--list", "--all", "--format=%(refname:short)" }, cwd, function(output, branches_err)
-      if branches_err then
-        fail_progress("Could not list base branches: " .. branches_err)
-        callback(nil)
-        return
-      end
+  local stored_base_branch = get_stored_base_branch(cwd)
+  if stored_base_branch then
+    confirm({ "Base: " .. stored_base_branch }, function()
+      callback(stored_base_branch)
+    end, function()
+      git({ "branch", "--list", "--all", "--format=%(refname:short)" }, cwd, function(output, branches_err)
+        if branches_err then
+          fail_progress("Could not list base branches: " .. branches_err)
+          callback(nil)
+          return
+        end
 
-      pick_base_branch(parse_base_branches(output, current_branch), current_base_branch, function(selected)
+        pick_base_branch(parse_base_branches(output, current_branch), stored_base_branch, function(selected)
+          if not selected or selected == "" then
+            return callback(nil)
+          end
+
+          set_base_branch(cwd, selected)
+          callback(selected)
+        end)
+      end)
+    end)
+    return
+  end
+
+  git({ "branch", "--list", "--all", "--format=%(refname:short)" }, cwd, function(output, branches_err)
+    if branches_err then
+      fail_progress("Could not list base branches: " .. branches_err)
+      callback(nil)
+      return
+    end
+
+    local branches = parse_base_branches(output, current_branch)
+    local current_base_branch = default_base_branch_from_branches(branches)
+    confirm({ "Base: " .. (current_base_branch or "") }, function()
+      callback(current_base_branch)
+    end, function()
+      pick_base_branch(branches, current_base_branch or "", function(selected)
         if not selected or selected == "" then
           return callback(nil)
         end
@@ -469,36 +481,23 @@ local function choose_base_branch(cwd, current_branch, callback)
 end
 
 local function generate_metadata(context, callback)
-  local ok, Background = pcall(require, "codecompanion.interactions.background")
-  if not ok then
-    callback(nil, "Could not load CodeCompanion background interactions")
-    return
-  end
+  local ok_adapters, adapters = pcall(require, "ai.adapters")
+  local selected = ok_adapters and adapters.get() or {}
+  local model = selected.pr_create or selected.commit or "copilot,model=gpt-4.1"
 
-  local background = Background.new({ adapter = pr_adapter })
-  safe_inline_output(background)
-
-  show_progress("Generating PR title and description with " .. pr_adapter.model .. "...")
-  background:ask({
-    { role = "system", content = pr_system_prompt },
-    { role = "user", content = context },
-  }, {
-    method = "async",
-    parse_handler = "parse_inline",
-    silent = true,
-    on_done = function(result)
-      vim.schedule(function()
-        local metadata, err = decode_pr_metadata(model_content(result))
-        callback(metadata, err)
-      end)
-    end,
-    on_error = function(err)
-      vim.schedule(function()
-        local message = type(err) == "string" and err or vim.inspect(err)
-        callback(nil, message)
-      end)
-    end,
-  })
+  show_progress("Generating PR title and description with " .. model .. "...")
+  require("ai").generate({
+    model = model,
+    system = pr_system_prompt,
+    prompt = context,
+  }, function(result)
+    if not result.ok then
+      callback(nil, result.error or "Unable to generate PR metadata")
+      return
+    end
+    local metadata, err = decode_pr_metadata(result.content)
+    callback(metadata, err)
+  end)
 end
 
 local function push_branch(cwd, branch, callback)
@@ -536,21 +535,16 @@ local function create_pr(cwd, branch, selected_base_branch, metadata)
       return
     end
 
-    local pr_url = output:match("https?://%S+") or vim.trim(output)
-    show_progress("Opening PR in browser...")
-    run({ "gh", "pr", "view", pr_url, "--web" }, { cwd = cwd }, function(_, open_err)
-      if open_err then
-        if vim.ui and vim.ui.open then
-          vim.ui.open(pr_url)
-          complete_progress("Created draft PR: " .. pr_url)
-          return
-        end
-
-        fail_progress("Created PR, but failed to open browser: " .. open_err)
+    local pr_ref = output:match("https?://%S+") or vim.trim(output)
+    show_progress("Opening PR in nvim...")
+    require("diff_review.gh").pr_async(cwd, pr_ref, nil, function(result)
+      if not result.ok or not result.pr then
+        fail_progress("Created PR, but failed to open PR view: " .. (result.message or "Unable to load GitHub pull request"))
         return
       end
 
-      complete_progress("Created draft PR: " .. pr_url)
+      require("diff_review").open_pr(result.pr, { cwd = cwd })
+      complete_progress("Created draft PR: " .. pr_ref)
     end)
   end)
 end
@@ -627,8 +621,9 @@ M._set_base_branch_for_test = function(branch, cwd)
   end
 end
 M._get_base_branch_for_test = function(cwd)
-  return get_base_branch(cwd)
+  return get_stored_base_branch(cwd)
 end
+M._default_base_branch_from_branches_for_test = default_base_branch_from_branches
 M._set_state_path_for_test = function(path)
   state_path_for_test = path
   state_cache = nil
