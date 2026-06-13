@@ -447,6 +447,21 @@ local function run()
   assert_true(diff_review._review.state(buf).review_editing_comment == nil, "editing marker was not cleared after save")
   assert_true(not buffer_contains(buf, "This rename needs a test"), "old comment text still present after edit")
 
+  -- ── existing comment bodies edit in place like the review summary ──────────
+  local direct_edit_row = find_row(buf, "Edited comment body")
+  vim.api.nvim_win_set_cursor(0, { direct_edit_row, 0 })
+  vim.api.nvim_exec_autocmds("CursorMoved", { buffer = buf })
+  assert_true(vim.bo[buf].modifiable, "inline comment body row must be editable")
+  vim.api.nvim_buf_set_lines(buf, direct_edit_row - 1, direct_edit_row, false, { "Direct edited comment body" })
+  vim.api.nvim_exec_autocmds("TextChanged", { buffer = buf })
+  assert_true(
+    diff_review._review.state(buf).review_comments[1].body == "Direct edited comment body",
+    "inline comment body edit was not captured locally"
+  )
+  vim.api.nvim_exec_autocmds("InsertLeave", { buffer = buf })
+  wait_for(function() return buffer_contains(buf, "Direct edited comment body") end, "inline comment body edit did not re-render")
+  wait_for(function() return #comment_updates >= 2 end, "inline comment body edit did not sync")
+
   -- ── C near the comment edits it (input prefilled with existing body) ───────
   local prefill_seen
   prefill_seen = nil
@@ -456,7 +471,7 @@ local function run()
   end
   trigger(buf, "C", find_row(buf, "NEW src/a.txt"))
   wait_for(function() return buffer_contains(buf, "Edited from above") end, "C on the line above did not edit the comment")
-  assert_true(prefill_seen == "Edited comment body", "line above edit was not prefilled with existing body")
+  assert_true(prefill_seen == "Direct edited comment body", "line above edit was not prefilled with existing body")
   assert_true(#diff_review._review.state(buf).review_comments == 1, "line above comment edit added a duplicate draft")
 
   prefill_seen = nil
