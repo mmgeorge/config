@@ -42,7 +42,7 @@ Pressing `or` in the status or PR view starts PR review mode
 (`M._review`, view_kind = "review", `M.open_review(pr, opts)`): the PR title,
 an editable review summary, and the changed files split into Unviewed/Viewed
 sections (files start expanded). This is the **normal batched review flow** —
-comments are drafted locally and submitted together, not posted one at a time:
+comments are drafted locally, synced deliberately, and submitted together:
 - `S`/`U` move the hunk/file under the cursor between the sections; on
   Unviewed/Viewed section headers they move the whole section.
 - `C` on a changed (diff body) line drafts a comment (body via an input
@@ -53,7 +53,10 @@ comments are drafted locally and submitted together, not posted one at a time:
   line carrying a `review_comment` entry so the cursor can land on it.
 - `J` deletes the draft comment under the cursor; `y`/`n` jump between
   comments.
-- `b` browses the PR changes tab; the submit key (`<C-s>`) picks a verdict
+- Unsynced comment creates/edits show `*` before the username in the comment
+  header. `<C-s>` clears the marker immediately and syncs dirty comments to the
+  pending GitHub review; failures restore the marker.
+- `b` browses the PR changes tab; the submit key (`cc`) picks a verdict
   (`vim.ui.select` → APPROVE/COMMENT/REQUEST_CHANGES) and posts the summary,
   verdict, and every draft comment in ONE `gh api .../reviews` request
   (`gh.submit_pr_review_async`, `commit_id` = head SHA, `comments[]`); on

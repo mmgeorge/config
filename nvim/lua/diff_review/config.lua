@@ -42,6 +42,7 @@
 ---@field delete DiffReviewKeymap delete the comment under the cursor
 ---@field next_comment DiffReviewKeymap jump to the next comment
 ---@field prev_comment DiffReviewKeymap jump to the previous comment
+---@field sync DiffReviewKeymap sync dirty review comments to GitHub
 ---@field submit DiffReviewKeymap submit the review to GitHub
 
 ---@class DiffReviewKeymapConfig
@@ -94,7 +95,8 @@ M.defaults = {
       delete = "J",
       next_comment = "y",
       prev_comment = "n",
-      submit = "<C-s>",
+      sync = "<C-s>",
+      submit = "cc",
     },
   },
 }

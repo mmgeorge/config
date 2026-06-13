@@ -3358,6 +3358,7 @@ local status_command_specs = {
   { id = "delete", label = "delete", desc = "Delete draft comment", modes = "n", keymap = "review", pinned = true, views = { review = true } },
   { id = "next_comment", label = "next", desc = "Jump to next draft comment", modes = "n", keymap = "review", pinned = true, views = { review = true } },
   { id = "prev_comment", label = "prev", desc = "Jump to previous draft comment", modes = "n", keymap = "review", pinned = true, views = { review = true } },
+  { id = "sync", label = "sync", desc = "Sync review comments to GitHub", modes = { "n", "i" }, keymap = "review", pinned = true, views = { review = true } },
   { id = "submit", label = "submit", desc = "Submit review to GitHub", modes = "n", keymap = "review", pinned = true, views = { review = true } },
 }
 
@@ -3387,6 +3388,7 @@ M._status_hint_command_ids_by_view = {
     "unviewed",
     "comment",
     "delete",
+    "sync",
     "submit",
     "open",
     "close",
@@ -5804,6 +5806,22 @@ function M._review.load_draft(state)
 end
 
 ---@param state table
+---@return table[]
+function M._review.comments_for_storage(state)
+  local comments = {}
+  for _, comment in ipairs(state.review_comments or {}) do
+    local copy = vim.deepcopy(comment)
+    copy.syncing = nil
+    copy.review_body_start = nil
+    copy.review_body_end = nil
+    copy.review_body_line_marks = nil
+    copy.review_rendered_body_text = nil
+    comments[#comments + 1] = copy
+  end
+  return comments
+end
+
+---@param state table
 function M._review.save_draft(state)
   local path = M._review.storage_path(state)
   local directory = vim.fs.dirname(path) or M._review.data_dir()
@@ -5820,7 +5838,7 @@ function M._review.save_draft(state)
     review_viewed = state.review_viewed or {},
     review_viewed_hunks = state.review_viewed_hunks or {},
     review_comment_text = state.review_comment_text or "",
-    review_comments = state.review_comments or {},
+    review_comments = M._review.comments_for_storage(state),
     review_remote = state.review_remote or {},
   }
   local encode_ok, encoded = pcall(vim.json.encode, payload)
@@ -6073,6 +6091,15 @@ function M._review.process_sync_queue(buf)
   local function finish(ok)
     state.review_sync.running = false
     if not ok then
+      if item.op == "upsert" and item.comment then
+        item.comment.syncing = nil
+        M._review.save_draft(state)
+        if vim.api.nvim_buf_is_valid(buf) then M._review.render_preserving_inline_cursor(buf) end
+      elseif item.op == "delete" and item.comment and item.comment.local_state == "deleted" then
+        item.comment.local_state = "clean"
+        M._review.save_draft(state)
+        if vim.api.nvim_buf_is_valid(buf) then M._review.render_preserving_inline_cursor(buf) end
+      end
       local waiters = state.review_sync.waiters or {}
       state.review_sync.waiters = {}
       for _, waiter in ipairs(waiters) do waiter(false) end
@@ -6121,6 +6148,7 @@ function M._review.process_sync_queue(buf)
           comment.created_at = remote.created_at or comment.created_at
           comment.updated_at = remote.updated_at or comment.updated_at
         end
+        comment.syncing = nil
         if comment.body == queued_body then
           comment.local_state = "clean"
           comment.base_body = queued_body
@@ -6128,6 +6156,7 @@ function M._review.process_sync_queue(buf)
           comment.local_state = comment.remote_node_id and "dirty" or "new"
         end
         M._review.save_draft(state)
+        if vim.api.nvim_buf_is_valid(buf) then M._review.render_preserving_inline_cursor(buf) end
         finish(true)
       end)
       return
@@ -6159,6 +6188,7 @@ function M._review.process_sync_queue(buf)
         comment.created_at = remote.created_at or comment.created_at
         comment.updated_at = remote.updated_at or comment.updated_at
       end
+      comment.syncing = nil
       if comment.body == queued_body then
         comment.local_state = "clean"
         comment.base_body = queued_body
@@ -6166,6 +6196,7 @@ function M._review.process_sync_queue(buf)
         comment.local_state = "dirty"
       end
       M._review.save_draft(state)
+      if vim.api.nvim_buf_is_valid(buf) then M._review.render_preserving_inline_cursor(buf) end
       finish(true)
     end)
   end)
@@ -6190,16 +6221,54 @@ function M._review.enqueue_sync(buf, op, comment)
   M._review.process_sync_queue(buf)
 end
 
+---@param comment table
+---@return boolean
+function M._review.comment_needs_sync(comment)
+  if not comment or comment.syncing then return false end
+  if comment.local_state == "deleted" then return comment.remote_node_id ~= nil end
+  if comment.local_state == "new" or comment.local_state == "dirty" then return true end
+  return not comment.remote_node_id
+end
+
+---@param comment table
+---@return boolean
+function M._review.comment_has_dirty_marker(comment)
+  if not comment or comment.syncing or comment.local_state == "deleted" then return false end
+  return M._review.comment_needs_sync(comment)
+end
+
+---@param buf integer
+---@return integer count
+function M._review.enqueue_dirty_comments(buf)
+  local state = M._review.state(buf)
+  if not state then return 0 end
+  local items = {}
+  local render_marker_change = false
+  for _, comment in ipairs(state.review_comments or {}) do
+    if M._review.comment_needs_sync(comment) then
+      if comment.local_state == "deleted" then
+        items[#items + 1] = { op = "delete", comment = comment }
+      else
+        comment.syncing = true
+        render_marker_change = true
+        items[#items + 1] = { op = "upsert", comment = comment }
+      end
+    end
+  end
+  if #items == 0 then return 0 end
+  if render_marker_change then M._review.render_preserving_inline_cursor(buf) end
+  for _, item in ipairs(items) do
+    M._review.enqueue_sync(buf, item.op, item.comment)
+  end
+  return #items
+end
+
 ---@param buf integer
 ---@param cb fun(ok: boolean)
 function M._review.flush_sync(buf, cb)
   local state = M._review.state(buf)
   if not state then cb(false) return end
-  for _, comment in ipairs(state.review_comments or {}) do
-    if comment.local_state == "new" or comment.local_state == "dirty" or (not comment.remote_node_id and comment.local_state ~= "deleted") then
-      M._review.enqueue_sync(buf, "upsert", comment)
-    end
-  end
+  M._review.enqueue_dirty_comments(buf)
   state.review_sync = state.review_sync or { queue = {}, running = false, waiters = {} }
   if not state.review_sync.running and #state.review_sync.queue == 0 then
     cb(true)
@@ -6527,6 +6596,21 @@ function M._review.render(buf)
   )
 end
 
+---@param buf integer
+function M._review.render_preserving_inline_cursor(buf)
+  local comment
+  local snapshot
+  if buf and vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_get_current_buf() == buf then
+    local cursor = vim.api.nvim_win_get_cursor(0)
+    comment = M._review.comment_body_at_row(buf, cursor[1])
+    if comment then snapshot = M._review.inline_comment_cursor_snapshot(buf, comment) end
+  end
+  M._review.render(buf)
+  if comment and snapshot and comment.local_state ~= "deleted" then
+    M._review.restore_inline_comment_cursor(buf, comment, snapshot)
+  end
+end
+
 ---@param text string
 ---@param width integer
 ---@return string[]
@@ -6585,17 +6669,14 @@ end
 function M._review.wrap_body_entries(text, width)
   width = math.max(1, width or 1)
   local entries = {}
-  for paragraph_index, paragraph in ipairs(vim.split(tostring(text or ""), "\n", { plain = true })) do
+  for _, paragraph in ipairs(vim.split(tostring(text or ""), "\n", { plain = true })) do
     local wrapped = M._review.wrap(paragraph, width)
     if #wrapped == 0 then wrapped[1] = "" end
-    for line_index, line in ipairs(wrapped) do
-      entries[#entries + 1] = {
-        text = line,
-        hard_break_before = paragraph_index > 1 and line_index == 1,
-      }
+    for _, line in ipairs(wrapped) do
+      entries[#entries + 1] = { text = line }
     end
   end
-  if #entries == 0 then entries[1] = { text = "", hard_break_before = false } end
+  if #entries == 0 then entries[1] = { text = "" } end
   return entries
 end
 
@@ -6634,7 +6715,8 @@ end
 function M._review.comment_header_text(comment)
   local user = tostring(comment.user or "you")
   local datetime = M._review.format_comment_datetime(comment.updated_at or comment.created_at)
-  local left_text = (" %s | %s "):format(user, datetime)
+  local marker = M._review.comment_has_dirty_marker(comment) and "*" or ""
+  local left_text = (" %s%s | %s "):format(marker, user, datetime)
   local line_number = tonumber(comment.line)
   local right_text = line_number and (" L%d "):format(line_number) or " L? "
   return left_text, right_text
@@ -6711,7 +6793,6 @@ function M._review.emit_box(comment, index, indent)
       comment_index = index,
       review_body = true,
       review_body_prefix_width = left_width,
-      review_hard_break_before = wrapped_body_entry.hard_break_before or nil,
     }
     local fill = (" "):rep(math.max(inner - vim.fn.strdisplaywidth(line) - 1, 0))
     local rendered_line = body_prefix .. line
@@ -6789,7 +6870,6 @@ function M._review.on_render(buf)
   local state = M._review.state(buf)
   if not state then return end
   vim.api.nvim_buf_clear_namespace(buf, M._review.ns, 0, -1)
-  state.review_body_line_mark_meta = {}
   state.review_comment_start, state.review_comment_end = nil, nil
   for _, comment in ipairs(state.review_comments or {}) do
     comment.review_body_start, comment.review_body_end = nil, nil
@@ -6828,13 +6908,6 @@ function M._review.on_render(buf)
     local entry = state.entries and state.entries[row] or nil
     local comment = entry and entry.review_body and entry.review_comment or nil
     if comment then
-      comment.review_body_line_marks = comment.review_body_line_marks or {}
-      local line_mark = vim.api.nvim_buf_set_extmark(buf, M._review.ns, row - 1, 0, { right_gravity = false })
-      comment.review_body_line_marks[#comment.review_body_line_marks + 1] = line_mark
-      state.review_body_line_mark_meta[line_mark] = {
-        comment = comment,
-        hard_break_before = entry.review_hard_break_before or false,
-      }
       if comment ~= range_comment then
         close_comment_range(row - 1)
         range_comment, range_start = comment, row
@@ -6909,31 +6982,6 @@ function M._review.comment_body_prefix_width(buf, row, line)
   if border_prefix then return #border_prefix end
   local leading_spaces = text:match("^(%s*)") or ""
   return #leading_spaces
-end
-
----@param buf integer
----@param comment table
----@param row integer 1-based
----@return table? meta
-function M._review.comment_body_line_mark_at_row(buf, comment, row)
-  local state = M._review.state(buf)
-  if not (state and comment and comment.review_body_line_marks) then return nil end
-  for _, mark_id in ipairs(comment.review_body_line_marks) do
-    local mark_row0 = M._review.mark_row(buf, mark_id)
-    if mark_row0 == row - 1 then return (state.review_body_line_mark_meta or {})[mark_id] or {} end
-  end
-  return nil
-end
-
----@param buf integer
----@param row integer 1-based
----@return boolean
-function M._review.comment_body_row_has_hard_break(buf, row)
-  local state = M._review.state(buf)
-  if not state then return false end
-  local entry = state.entries and state.entries[row] or nil
-  if entry and entry.review_hard_break_before then return true end
-  return false
 end
 
 ---@param line string
@@ -7168,10 +7216,10 @@ function M._review.passthrough_mapped_key(buf, mode, key, restore)
 end
 
 ---@param buf integer
----@param command_id string
+---@param _command_id string
 ---@return boolean
-function M._review.should_passthrough_review_mapping(buf, command_id)
-  if command_id == "submit" then return false end
+function M._review.should_passthrough_review_mapping(buf, _command_id)
+  if _command_id == "sync" then return false end
   return M._review.should_passthrough_mapped_key(buf)
 end
 
@@ -7215,42 +7263,30 @@ function M._review.comment_body_text_from_buffer(buf, comment)
   local raw_lines = vim.api.nvim_buf_get_lines(buf, start_row0, end_row0, false)
   local paragraphs = {}
   local paragraph = {}
+  local saw_text = false
+  local pending_blank = false
   local function flush_paragraph()
-    if #paragraph == 0 then
+    if #paragraph == 0 then return end
+    if pending_blank and #paragraphs > 0 then
       paragraphs[#paragraphs + 1] = ""
-    else
-      paragraphs[#paragraphs + 1] = table.concat(paragraph, " ")
-      paragraph = {}
     end
+    paragraphs[#paragraphs + 1] = table.concat(paragraph, " ")
+    paragraph = {}
+    pending_blank = false
   end
   for index, line in ipairs(raw_lines) do
     local row = start_row0 + index
     local prefix_width = M._review.comment_body_prefix_width(buf, row, line)
     local body_line = M._review.comment_body_text_from_line(line, prefix_width)
-    local line_mark = M._review.comment_body_line_mark_at_row(buf, comment, row)
-    local has_line_marks = comment.review_body_line_marks and #comment.review_body_line_marks > 0
-    local inserted_line = has_line_marks and line_mark == nil
-    if inserted_line then
-      if #paragraph > 0 then flush_paragraph() end
-      if body_line == "" then
-        flush_paragraph()
-      else
-        paragraph[#paragraph + 1] = body_line
-        flush_paragraph()
-      end
+    if vim.trim(body_line) == "" then
+      flush_paragraph()
+      if saw_text then pending_blank = true end
     else
-      local hard_break_before = line_mark and line_mark.hard_break_before or M._review.comment_body_row_has_hard_break(buf, row)
-      if hard_break_before and #paragraph > 0 then
-        flush_paragraph()
-      end
-      if body_line == "" then
-        flush_paragraph()
-      else
-        paragraph[#paragraph + 1] = body_line
-      end
+      saw_text = true
+      paragraph[#paragraph + 1] = body_line
     end
   end
-  if #paragraph > 0 or #paragraphs == 0 then flush_paragraph() end
+  flush_paragraph()
   return table.concat(paragraphs, "\n")
 end
 
@@ -7357,10 +7393,10 @@ function M._review.sync_inline_comment_text(buf)
   comment.review_rendered_body_text = edited_text
   comment.updated_at = os.date("%Y-%m-%d %H:%M")
   comment.local_state = comment.remote_node_id and "dirty" or "new"
+  comment.syncing = nil
   M._review.normalize_comment(state, comment)
   M._review.save_draft(state)
   M._review.schedule_inline_comment_render(buf, comment, cursor_snapshot)
-  M._review.enqueue_sync(buf, "upsert", comment)
   return true
 end
 
@@ -7588,7 +7624,6 @@ function M._review.add_comment(buf)
     state.review_comments[#state.review_comments + 1] = comment
     M._review.save_draft(state)
     M._review.render(buf)
-    M._review.enqueue_sync(buf, "upsert", comment)
   end)
 end
 
@@ -7606,7 +7641,27 @@ function M._review.delete_comment(buf)
   end
   M._review.save_draft(state)
   M._review.render(buf)
-  if comment.remote_node_id then M._review.enqueue_sync(buf, "delete", comment) end
+end
+
+---Sync dirty inline comments to the pending GitHub review.
+---@param buf integer
+function M._review.sync(buf)
+  local state = M._review.state(buf)
+  if not state then return end
+  M._status = state
+  M._review.sync_comment_text(buf)
+  M._review.sync_inline_comment_text(buf)
+  local count = M._review.enqueue_dirty_comments(buf)
+  if count == 0 then
+    vim.notify("No review comments to sync", vim.log.levels.INFO, { title = "DiffReview" })
+    return
+  end
+  M._review.flush_sync(buf, function(ok)
+    if not vim.api.nvim_buf_is_valid(buf) then return end
+    if ok then
+      vim.notify(("Synced %d review comment%s"):format(count, count == 1 and "" or "s"), vim.log.levels.INFO, { title = "DiffReview" })
+    end
+  end)
 end
 
 ---@param buf integer
@@ -7643,7 +7698,7 @@ function M._review.navigate(buf, direction)
 end
 
 ---Submit the review. Inline comments are synced to a pending remote review as
----they are edited; the final review summary stays local-only until this call.
+---part of submission; the final review summary stays local-only until this call.
 ---@param buf integer
 function M._review.submit(buf)
   local state = M._review.state(buf)
@@ -9796,6 +9851,7 @@ function M._review.setup_keymaps(buf)
   map("delete", function() M._review.delete_comment(buf) end)
   map("next_comment", function() M._review.navigate(buf, 1) end)
   map("prev_comment", function() M._review.navigate(buf, -1) end)
+  map("sync", function() M._review.sync(buf) end)
   map("submit", function() M._review.submit(buf) end)
 end
 
