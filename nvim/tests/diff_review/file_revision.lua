@@ -190,68 +190,69 @@ local function run()
   diff_review.open()
   local status_buf = vim.api.nvim_get_current_buf()
   wait_for(function() return buffer_contains(status_buf, "Unstaged changes (2)") end, "status did not render")
-
   -- ── open on an unstaged deleted line lands in the index revision ───────────
   trigger_buf_mapping(status_buf, "<Tab>", find_row(status_buf, "a.txt +1 -1"))
   wait_for(function() return buffer_contains(status_buf, "old a.txt") end, "a.txt hunk did not expand")
-  trigger_buf_mapping(status_buf, "o", find_row(status_buf, "old a.txt"))
+  trigger_buf_mapping(status_buf, "<CR>", find_row(status_buf, "old a.txt"))
   wait_for(function()
     return vim.api.nvim_buf_get_name(vim.api.nvim_get_current_buf()):find("GitFileRevision", 1, true) ~= nil
   end, "open on unstaged deleted line did not open a revision buffer")
   local index_buf = assert_revision_buffer("GitFileRevision://a.txt@abc1234", "old a.txt")
-
+  assert_true(
+    vim.wo.winbar:find("a.txt @ abc1234", 1, true) ~= nil,
+    "revision winbar header missing: " .. vim.wo.winbar
+  )
   -- ── the buffer stays alive, loaded, and listed once hidden ─────────────────
   vim.api.nvim_win_set_buf(0, status_buf)
+  assert_true(
+    vim.wo.winbar:find("read-only revision", 1, true) == nil,
+    "winbar header must clear when leaving the revision buffer, got: " .. vim.wo.winbar
+  )
   assert_true(vim.api.nvim_buf_is_valid(index_buf), "revision buffer must stay alive when hidden")
   assert_true(vim.api.nvim_buf_is_loaded(index_buf), "revision buffer must stay loaded when hidden")
   assert_true(vim.bo[index_buf].buflisted, "revision buffer must stay listed when hidden")
-
   -- ── re-opening reuses the same buffer ──────────────────────────────────────
-  trigger_buf_mapping(status_buf, "o", find_row(status_buf, "old a.txt"))
+  trigger_buf_mapping(status_buf, "<CR>", find_row(status_buf, "old a.txt"))
   wait_for(function() return vim.api.nvim_get_current_buf() == index_buf end, "revision buffer was not reused")
-
   -- ── open on a staged deleted line lands in the HEAD revision ───────────────
   vim.api.nvim_win_set_buf(0, status_buf)
-  trigger_buf_mapping(status_buf, "<Tab>", find_row(status_buf, "Staged changes (1)"))
+  if not buffer_contains(status_buf, "c.txt +1 -1") then
+    trigger_buf_mapping(status_buf, "<Tab>", find_row(status_buf, "Staged changes (1)"))
+  end
   wait_for(function() return buffer_contains(status_buf, "c.txt +1 -1") end, "staged section did not expand")
   trigger_buf_mapping(status_buf, "<Tab>", find_row(status_buf, "c.txt +1 -1"))
   wait_for(function() return buffer_contains(status_buf, "old c.txt") end, "c.txt hunk did not expand")
-  trigger_buf_mapping(status_buf, "o", find_row(status_buf, "old c.txt"))
+  trigger_buf_mapping(status_buf, "<CR>", find_row(status_buf, "old c.txt"))
   wait_for(function()
     return vim.api.nvim_buf_get_name(vim.api.nvim_get_current_buf()):find("c.txt@", 1, true) ~= nil
   end, "open on staged deleted line did not open the HEAD revision")
   assert_revision_buffer("GitFileRevision://c.txt@abc1234", "old c.txt")
-
   -- ── added lines still jump to the working-tree file ────────────────────────
   vim.api.nvim_win_set_buf(0, status_buf)
-  trigger_buf_mapping(status_buf, "o", find_row(status_buf, "NEW a.txt"))
+  trigger_buf_mapping(status_buf, "<CR>", find_row(status_buf, "NEW a.txt"))
   wait_for(function()
     return vim.api.nvim_buf_get_name(vim.api.nvim_get_current_buf()):find("a.txt", 1, true) ~= nil
       and vim.api.nvim_buf_get_name(vim.api.nvim_get_current_buf()):find("GitFileRevision", 1, true) == nil
   end, "open on added line did not edit the working-tree file")
-
   -- ── failed base lookup falls back to the working-tree jump ─────────────────
   vim.api.nvim_win_set_buf(0, status_buf)
   trigger_buf_mapping(status_buf, "<Tab>", find_row(status_buf, "b.txt +1 -1"))
   wait_for(function() return buffer_contains(status_buf, "old b.txt") end, "b.txt hunk did not expand")
-  trigger_buf_mapping(status_buf, "o", find_row(status_buf, "old b.txt"))
+  trigger_buf_mapping(status_buf, "<CR>", find_row(status_buf, "old b.txt"))
   wait_for(function()
     local name = vim.api.nvim_buf_get_name(vim.api.nvim_get_current_buf())
     return name:find("b.txt", 1, true) ~= nil and name:find("GitFileRevision", 1, true) == nil
   end, "failed base lookup did not fall back to the working-tree file")
-
   -- ── :GitFileRevision entry point names the buffer with the short sha ───────
   diff_review.open_file_revision(root .. "/a.txt", "feature")
   wait_for(function()
     return vim.api.nvim_buf_get_name(vim.api.nvim_get_current_buf()):find("@fff5678", 1, true) ~= nil
   end, "open_file_revision did not open the requested revision")
   assert_revision_buffer("GitFileRevision://a.txt@fff5678", "alpha a.txt")
-
   -- ── q closes the revision buffer ───────────────────────────────────────────
   local q_buf = vim.api.nvim_get_current_buf()
   trigger_buf_mapping(q_buf, "q")
   assert_true(not vim.api.nvim_buf_is_valid(q_buf), "q did not close the revision buffer")
-
   -- ── command errors are reported ────────────────────────────────────────────
   captured_notifications = {}
   diff_review.open_file_revision(root .. "/a.txt", "missingrev")

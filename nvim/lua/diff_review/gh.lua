@@ -300,6 +300,67 @@ function M.pr_diff_async(cwd, number, repo, cb)
   system_text_async(command, nil, cwd, cb)
 end
 
+---@class DiffReviewGhPrEdit
+---@field title? string
+---@field body? string
+
+---Update a PR's title and/or body via `gh pr edit`. The body is passed on
+---stdin (`--body-file -`) so it needs no quoting.
+---@param cwd string
+---@param number integer|string
+---@param repo? string
+---@param edit DiffReviewGhPrEdit
+---@param cb DiffReviewGhTextCallback
+function M.update_pr_async(cwd, number, repo, edit, cb)
+  local command = { "gh", "pr", "edit", tostring(number) }
+  if repo and repo ~= "" then vim.list_extend(command, { "--repo", repo }) end
+  local input = nil
+  if edit.title then vim.list_extend(command, { "--title", edit.title }) end
+  if edit.body then
+    vim.list_extend(command, { "--body-file", "-" })
+    input = edit.body
+  end
+  system_text_async(command, input, cwd, cb)
+end
+
+---Build the `/repos/{owner}/{repo}/...` path for a PR sub-resource. When the
+---repo is known it is embedded; otherwise gh's `{owner}`/`{repo}`
+---placeholders resolve from the cwd's default repo.
+---@param number integer|string
+---@param repo? string
+---@param resource string e.g. "comments" or "reviews"
+---@return string
+local function pr_api_path(number, repo, resource)
+  local owner_repo = (repo and repo ~= "") and repo or "{owner}/{repo}"
+  return ("/repos/%s/pulls/%s/%s"):format(owner_repo, tostring(number), resource)
+end
+
+---@class DiffReviewGhReviewComment
+---@field body string
+---@field path string repo-relative file path
+---@field line integer last line of the range (new-file line for RIGHT)
+---@field side "LEFT"|"RIGHT"
+---@field start_line? integer first line when the comment spans a range
+---@field start_side? "LEFT"|"RIGHT"
+
+---Submit a complete review in one request: the summary, a verdict, and all
+---inline comments at once (`POST .../pulls/{n}/reviews`). This is the normal
+---GitHub review flow — comments are drafted locally and posted together, not
+---one standalone comment at a time. The JSON body goes on stdin via
+---`gh api --input -` so multi-line text needs no shell escaping.
+---@param cwd string
+---@param number integer|string
+---@param repo? string
+---@param opts { body: string, event: "APPROVE"|"REQUEST_CHANGES"|"COMMENT", commit_id?: string, comments?: DiffReviewGhReviewComment[] }
+---@param cb DiffReviewGhTextCallback
+function M.submit_pr_review_async(cwd, number, repo, opts, cb)
+  local command = { "gh", "api", "--method", "POST", pr_api_path(number, repo, "reviews"), "--input", "-" }
+  local payload = { body = opts.body, event = opts.event }
+  if opts.commit_id and opts.commit_id ~= "" then payload.commit_id = opts.commit_id end
+  if opts.comments and #opts.comments > 0 then payload.comments = opts.comments end
+  system_text_async(command, vim.json.encode(payload), cwd, cb)
+end
+
 ---@param pr DiffReviewGhPR
 ---@return boolean
 function M.browse_pr(pr)

@@ -18,12 +18,68 @@ Pressing open on a deleted (left-side) diff line opens a file revision buffer
 diff's base revision — index for unstaged hunks, HEAD for staged hunks, the
 branch for `:GitBranchDiff` views — where the old line number is exact. The
 buffer name carries the short sha of the underlying commit (HEAD's sha for the
-index, which is not a commit). If the base content cannot be fetched, it falls
-back to the working-tree jump.
+index, which is not a commit). The buffer is `nowrite` (not `nofile`, so
+buffer pickers list it), persists when hidden, closes on `q`, and shows a red
+winbar header while displayed. If the base content cannot be fetched, the
+jump falls back to the working-tree file.
+
+Tests must not trigger the `o` status key via `maparg().callback()` — the
+user's mini.clue config registers `o` as a prefix trigger whose callback
+blocks on a key query (hangs headless). Trigger open via `<CR>` instead.
+
+In the PR view (`ogp`), the PR title and description are editable in place
+(`M._pr_edit`): the buffer is `acwrite`, and 'modifiable' follows the cursor
+— unlocked exactly while the cursor sits on the title line or inside the
+description block (regions tracked with extmarks), locked everywhere else,
+so every native editing command works in the regions. Unsynced fields show
+an inline `*` before their label; `:w` clears the markers immediately and
+syncs via `gh pr edit` through a sequential queue (`M._pr_edit.enqueue` —
+not `status_enqueue_operation`, whose reconcile tail would rebuild the PR
+buffer as a status view). Failures notify and restore the markers.
+Re-renders are blocked while edits are unsynced.
+
+Pressing `or` in the status or PR view starts PR review mode
+(`M._review`, view_kind = "review", `M.open_review(pr, opts)`): the PR title,
+an editable review summary, and the changed files split into Unviewed/Viewed
+sections (files start expanded). This is the **normal batched review flow** —
+comments are drafted locally and submitted together, not posted one at a time:
+- `S`/`U` move the file under the cursor between the sections.
+- `C` on a changed (diff body) line drafts a comment (body via an input
+  popup); on an existing comment it edits it (input prefilled); on anything
+  else it is a no-op. Comments render as real, navigable buffer lines (a box)
+  emitted inline right below their anchor row by a renderer hook
+  (`M._status.review_after_row`, consumed in `status_add_fancy_row`), each
+  line carrying a `review_comment` entry so the cursor can land on it.
+- `J` deletes the draft comment under the cursor; `y`/`n` jump between
+  comments.
+- `b` browses the PR; the submit key (`<C-s>`) picks a verdict
+  (`vim.ui.select` → APPROVE/COMMENT/REQUEST_CHANGES) and posts the summary,
+  verdict, and every draft comment in ONE `gh api .../reviews` request
+  (`gh.submit_pr_review_async`, `commit_id` = head SHA, `comments[]`); on
+  success the drafts clear.
+
+The review summary is edited in place with the same cursor-follows-modifiable
+mechanism as `M._pr_edit`. Diff rows carry absolute paths, so comments keep
+both `path` (repo-relative, for GitHub) and `abs_file` (for matching rendered
+rows). Tests drive the comment body and verdict through the
+`M._review.input_provider` / `M._review.verdict_provider` seams. The summary
+region's end extmark uses right gravity (a left-gravity boundary mark gets
+pulled into an edit of the adjacent line). The review view's hint and action
+keys come from `config.keymaps.review`, not the shared command specs. The
+verdict chooser is a plain popup window (`M._review.pick_verdict`,
+`c`/`a`/`r`/`q`), not `vim.ui.select`/snacks.
+
+`bc` in the status view creates a branch (`M._create_branch`): it prompts for
+a name via a centered popup (`M._prompt_branch_name`, not vim.ui.input/snacks;
+prefilled with the branch prefix), then `git switch -c` and refreshes.
+The prefix comes from per-repository config — `<repo root>/.diffreview.json`
+(`{ "branch_prefix": "..." }`, read by `M._repo_config`, test seam
+`set_reader`) — falling back to `config.branch_prefix` (default `matt9222/`).
 
 init.lua is at Lua's hard limit of 200 local variables per chunk: new
-file-scope helpers must hang off the module table (see `M._branch_diff`)
-instead of being declared `local`.
+file-scope helpers must hang off the module table (see `M._branch_diff` and
+`M._review`) instead of being declared `local`. (luals's syntax check can
+over-count this; the ground truth is whether real nvim loads the file.)
 
 The diff gutter (old/new line numbers and the `+`/`-` sign) is rendered as
 inline virtual text (`hunk_add_gutter`), not buffer text: buffer lines for
@@ -109,6 +165,24 @@ Run the file-revision test:
 
 ```text
 nvim --headless -i NONE --cmd "set shadafile=NONE" -u nvim/init.lua -c "lua vim.loader.enable(false)" -S nvim/tests/diff_review/file_revision.lua
+```
+
+Run the PR-edit test:
+
+```text
+nvim --headless -i NONE --cmd "set shadafile=NONE" -u nvim/init.lua -c "lua vim.loader.enable(false)" -S nvim/tests/diff_review/pr_edit.lua
+```
+
+Run the PR-review test:
+
+```text
+nvim --headless -i NONE --cmd "set shadafile=NONE" -u nvim/init.lua -c "lua vim.loader.enable(false)" -S nvim/tests/diff_review/pr_review.lua
+```
+
+Run the branch-create test:
+
+```text
+nvim --headless -i NONE --cmd "set shadafile=NONE" -u nvim/init.lua -c "lua vim.loader.enable(false)" -S nvim/tests/diff_review/branch_create.lua
 ```
 
 Run the whitespace check:

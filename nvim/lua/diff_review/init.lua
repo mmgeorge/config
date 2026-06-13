@@ -3266,8 +3266,10 @@ local status_command_specs = {
   { id = "push", label = "push", desc = "Push", modes = "n", hint = true, views = { status = true } },
   { id = "pull", label = "pull", desc = "Pull", modes = "n", hint = true, views = { status = true } },
   { id = "pr", label = "pr", desc = "Open pull request", modes = "n", hint = true, views = { status = true } },
+  { id = "branch_create", label = "branch", desc = "Create a branch", modes = "n", hint = false, views = { status = true } },
   { id = "walkthrough", label = "walkthrough", desc = "Review walkthrough", modes = "n", hint = false, views = { status = true } },
-  { id = "browse", label = "browse", desc = "Browse pull request", modes = "n", hint = true, views = { pr = true } },
+  { id = "review", label = "review", desc = "Start PR review", modes = "n", hint = true, views = { status = true, pr = true } },
+  { id = "browse", label = "browse", desc = "Browse pull request", modes = "n", hint = true, views = { pr = true, review = true } },
   { id = "open", label = "open", desc = "Open PR/about or jump to file", modes = "n", hint = true },
   { id = "refresh", label = "refresh", desc = "Refresh DiffReview", modes = "n", hint = true },
   { id = "close", label = "close", desc = "Close DiffReview", modes = "n", hint = true, views = { status = true, pr = true, diff = true } },
@@ -3287,8 +3289,14 @@ M._status_hint_command_ids_by_view = {
   },
   pr = {
     "browse",
+    "review",
     "open",
     "refresh",
+    "close",
+    "help",
+  },
+  review = {
+    "open",
     "close",
     "help",
   },
@@ -3762,11 +3770,40 @@ local function status_key_text(keys)
 end
 
 local function status_add_hint_line()
+  local view_kind = M._status and M._status.view_kind or "status"
   local segments = {
     { "Hint: ", "DiffReviewStatusHint" },
   }
   local first = true
-  local view_kind = M._status and M._status.view_kind or "status"
+  -- The review view's action keys live in `config.keymaps.review`, not the
+  -- shared command specs, so build its hint from there.
+  if view_kind == "review" then
+    local review_pairs = {
+      { "viewed", "viewed" }, { "unviewed", "unviewed" }, { "comment", "comment" },
+      { "delete", "delete" }, { "next_comment", "next" }, { "prev_comment", "prev" },
+      { "submit", "submit" },
+    }
+    for _, entry in ipairs(review_pairs) do
+      local key = M._review.keys_for(entry[1])[1]
+      if key and key ~= "" then
+        if not first then segments[#segments + 1] = { " | ", "DiffReviewStatusHint" } end
+        first = false
+        segments[#segments + 1] = { key, "DiffReviewStatusHintKey" }
+        segments[#segments + 1] = { " " .. entry[2], "DiffReviewStatusHint" }
+      end
+    end
+    for _, spec_id in ipairs({ "browse", "open", "close", "help" }) do
+      local key = status_primary_key(spec_id)
+      if key ~= "" then
+        segments[#segments + 1] = { " | ", "DiffReviewStatusHint" }
+        segments[#segments + 1] = { key, "DiffReviewStatusHintKey" }
+        local spec = status_command_specs_by_id[spec_id]
+        segments[#segments + 1] = { " " .. (spec and spec.label or spec_id), "DiffReviewStatusHint" }
+      end
+    end
+    status_add_segment_line(segments)
+    return
+  end
   local hint_command_ids = M._status_hint_command_ids_by_view[view_kind] or M._status_hint_command_ids_by_view.status
   for _, command_id in ipairs(hint_command_ids) do
     local spec = status_command_specs_by_id[command_id]
@@ -3846,6 +3883,11 @@ local function status_add_fancy_row(row, entry, indent)
   end
   for _, extmark in ipairs(row_extmarks) do
     status_add_extmark(line, extmark.col, extmark.opts)
+  end
+  -- Review view: emit any draft comments anchored on this diff row as real
+  -- (navigable, editable) lines right below it.
+  if M._status.review_after_row and diff_line and entry then
+    M._status.review_after_row(diff_line, indent)
   end
 end
 
@@ -5156,6 +5198,7 @@ end
 ---@param sections DiffReviewStatusSection[]
 local function status_render_loaded(buf, target_id, fallback_line, opts, head_lines, sections)
   opts = opts or {}
+  if M._pr_edit.blocks_render(buf) then return end
   setup_bg_highlights()
   M._status = M._status or {}
   M._status.buf = buf
@@ -5217,6 +5260,15 @@ local function status_render_loaded(buf, target_id, fallback_line, opts, head_li
   -- avoids loading the module when no walkthrough has ever started.
   local walkthrough = package.loaded["diff_review.walkthrough"]
   if walkthrough then walkthrough.on_status_rendered(buf) end
+
+  -- Rendering wipes view-specific extmarks (PR-edit regions, review comment
+  -- boxes); re-anchor them.
+  local view_kind = M._status.view_kind or "status"
+  if view_kind == "pr" then
+    M._pr_edit.on_render(buf)
+  elseif view_kind == "review" then
+    M._review.on_render(buf)
+  end
 end
 
 ---@param cwd string
@@ -5454,6 +5506,7 @@ end
 local function render_pr_status(pr, cwd, buf, diff_text)
   local status = M._status
   if not (status and status.buf == buf) then return end
+  if M._pr_edit.blocks_render(buf) then return end
   status.head_lines = status_pr_detail_head_lines(pr)
   status.sections = status_pr_sections(cwd, pr, diff_text)
   status.fancy_rows = {}
@@ -5482,6 +5535,741 @@ local function load_pr_diff(pr, cwd, buf)
       return
     end
     render_pr_status(pr, cwd, buf, result.stdout or "")
+  end)
+end
+
+-- PR review mode (":or" in the PR/status view). A review buffer
+-- (view_kind = "review") shows the PR title, an editable review summary, and
+-- the changed files split into Unviewed/Viewed sections. `S`/`U` move a file
+-- between them, `C` posts an inline comment to GitHub at the cursor/selection,
+-- `y`/`n` jump between comments, and the submit key posts the review verdict.
+-- Everything hangs off the module table because init.lua is at Lua's
+-- 200-local limit.
+M._review = {
+  ns = vim.api.nvim_create_namespace("diff_review_review"),
+  -- Test seams: the comment-body input and the verdict picker. Defaults open
+  -- real UI; tests override them. Mirrors the set_backend/set_reader pattern.
+  input_provider = nil, ---@type (fun(title: string, on_submit: fun(text: string)))?
+  verdict_provider = nil, ---@type (fun(on_choice: fun(event: string?)))?
+}
+
+---@param buf integer
+---@return table? state the review status-state, or nil if buf is not a review
+function M._review.state(buf)
+  local status = M._status_states and M._status_states[buf] or nil
+  if status and status.view_kind == "review" then return status end
+  return nil
+end
+
+---@return DiffReviewReviewKeymapConfig
+function M._review.keymap_config()
+  local options = M.config or config.options or config.defaults
+  local keymaps = options.keymaps or config.defaults.keymaps
+  return vim.tbl_deep_extend("force", vim.deepcopy(config.defaults.keymaps.review), keymaps.review or {})
+end
+
+---@param id string
+---@return string[]
+function M._review.keys_for(id)
+  local key = M._review.keymap_config()[id]
+  if key == false or key == nil then return {} end
+  if type(key) == "table" then return key end
+  return { key }
+end
+
+function M._review.leave_visual()
+  local mode = vim.fn.mode()
+  if mode == "v" or mode == "V" or mode:byte() == 22 then
+    vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "nx", false)
+  end
+end
+
+---@param dl table diff_line meta
+---@return "LEFT"|"RIGHT"
+function M._review.side_of(dl)
+  return dl.side == "left" and "LEFT" or "RIGHT"
+end
+
+---@param state table
+---@return DiffReviewStatusHeadLine[]
+function M._review.head_lines(state)
+  local pr = state.pr
+  local title = pr.title ~= "" and pr.title or ("PR #" .. tostring(pr.number))
+  local lines = {
+    { segments = { { "Title: ", "DiffReviewStatusLabel" }, { title, "DiffReviewStatusPath" } } },
+    { segments = { { "Review Comment:", "DiffReviewReviewCommentHeader" } } },
+  }
+  local comment_lines = vim.split(state.review_comment_text or "", "\n", { plain = true })
+  if #comment_lines == 0 then comment_lines = { "" } end
+  for _, line in ipairs(comment_lines) do
+    lines[#lines + 1] = { segments = { { line, "DiffReviewReviewComment" } } }
+  end
+  return lines
+end
+
+---@param state table
+---@return DiffReviewStatusSection[]
+function M._review.sections(state)
+  local files = status_files_from_diff_provider(state.cwd, {
+    section_name = "review",
+    default_status = "",
+    files = state.pr.files,
+  }, state.diff_text or "")
+  local unviewed, viewed = {}, {}
+  for _, file in ipairs(files) do
+    if state.review_viewed[file.relpath] then
+      viewed[#viewed + 1] = file
+    else
+      unviewed[#unviewed + 1] = file
+    end
+  end
+  local function section(name, title, list)
+    local by_name = {}
+    for _, file in ipairs(list) do by_name[file.filename] = file end
+    return {
+      name = name,
+      title = title,
+      default_folded = false,
+      files = list,
+      files_by_name = by_name,
+      file_key_prefix = name,
+      file_entry_kind = "pr_file",
+      hunk_entry_kind = "pr_hunk",
+    }
+  end
+  return {
+    section("review:unviewed", "Unviewed Changes", unviewed),
+    section("review:viewed", "Viewed Changes", viewed),
+  }
+end
+
+--- Files fold by default; a review wants every diff open so the reviewer can
+--- read and comment. Expand each file once (user <Tab> toggles then persist).
+---@param state table
+function M._review.ensure_expanded(state)
+  if state.review_expanded or not state.diff_text or state.diff_text == "" then return end
+  state.review_expanded = true
+  local files = status_files_from_diff_provider(state.cwd, {
+    section_name = "review",
+    default_status = "",
+    files = state.pr.files,
+  }, state.diff_text)
+  for _, file in ipairs(files) do
+    for _, prefix in ipairs({ "review:unviewed", "review:viewed" }) do
+      set_status_folded(status_provider_file_key(prefix, file.filename), false)
+    end
+  end
+end
+
+---@param buf integer
+function M._review.render(buf)
+  local state = M._review.state(buf)
+  if not state then return end
+  M._status = state
+  M._review.ensure_expanded(state)
+  state.head_lines = M._review.head_lines(state)
+  state.sections = M._review.sections(state)
+  state.fancy_rows = {}
+  -- status_add_fancy_row consults this hook to interleave comment lines.
+  state.review_after_row = function(diff_line, indent)
+    M._review.emit_comments_for(state, diff_line, indent)
+  end
+  status_render_loaded(buf, nil, nil, { reuse_sections = true }, state.head_lines, state.sections)
+end
+
+---@param text string
+---@param width integer
+---@return string[]
+function M._review.wrap(text, width)
+  local out = {}
+  for _, paragraph in ipairs(vim.split(text, "\n", { plain = true })) do
+    if paragraph == "" then
+      out[#out + 1] = ""
+    else
+      local line = ""
+      for word in paragraph:gmatch("%S+") do
+        if line == "" then
+          line = word
+        elseif #line + 1 + #word <= width then
+          line = line .. " " .. word
+        else
+          out[#out + 1] = line
+          line = word
+        end
+      end
+      if line ~= "" then out[#out + 1] = line end
+    end
+  end
+  if #out == 0 then out[1] = "" end
+  return out
+end
+
+---Emit a draft comment as real, navigable buffer lines (a box) right below
+---its anchor diff row. Every line carries a `review_comment` entry so the
+---cursor can land on the box and `J`/`C`/`y`/`n` can act on it.
+---@param comment table
+---@param index integer comment number (1-based)
+---@param indent integer
+function M._review.emit_box(comment, index, indent)
+  indent = indent or 0
+  local pad = string.rep(" ", indent)
+  local body = M._review.wrap(comment.body, 68)
+  local heading = (" comment %d "):format(index)
+  local inner = vim.fn.strdisplaywidth(heading)
+  for _, line in ipairs(body) do
+    inner = math.max(inner, vim.fn.strdisplaywidth(line))
+  end
+  inner = inner + 2
+
+  local first_entry = { kind = "review_comment", review_comment = comment, comment_index = index, review_first = true }
+  local body_entry = { kind = "review_comment", review_comment = comment, comment_index = index }
+
+  -- Top border with the heading.
+  local lead = pad .. "╭─"
+  local trail = ("─"):rep(math.max(inner - vim.fn.strdisplaywidth(heading) - 1, 0)) .. "╮"
+  local top = lead .. heading .. trail
+  local top_line = status_add_line(top, first_entry)
+  status_add_highlight(top_line, 0, #lead, "FloatBorder")
+  status_add_highlight(top_line, #lead, #lead + #heading, "DiffReviewReviewCommentHeader")
+  status_add_highlight(top_line, #lead + #heading, #top, "FloatBorder")
+
+  -- Body lines.
+  local left = pad .. "│ "
+  for _, line in ipairs(body) do
+    local fill = (" "):rep(math.max(inner - vim.fn.strdisplaywidth(line) - 1, 0))
+    local text = left .. line .. fill .. "│"
+    local body_line = status_add_line(text, body_entry)
+    status_add_highlight(body_line, 0, #left, "FloatBorder")
+    status_add_highlight(body_line, #left, #left + #line, "DiffReviewReviewComment")
+    status_add_highlight(body_line, #text - #"│", #text, "FloatBorder")
+  end
+
+  -- Bottom border.
+  local bottom = pad .. "╰" .. ("─"):rep(inner) .. "╯"
+  local bottom_line = status_add_line(bottom, body_entry)
+  status_add_highlight(bottom_line, 0, #bottom, "FloatBorder")
+end
+
+---Renderer hook: emit any draft comments anchored on `diff_line`.
+---@param state table
+---@param diff_line table
+---@param indent integer
+function M._review.emit_comments_for(state, diff_line, indent)
+  for index, comment in ipairs(state.review_comments) do
+    if comment.abs_file == diff_line.file
+      and comment.side == M._review.side_of(diff_line)
+      and comment.line == diff_line.line then
+      M._review.emit_box(comment, index, indent)
+    end
+  end
+end
+
+---@param buf integer
+---@return table? comment
+---@return integer? index
+function M._review.comment_under_cursor(buf)
+  local state = M._review.state(buf)
+  if not state then return nil end
+  M._status = state
+  local entry = status_entry_under_cursor()
+  if entry and entry.kind == "review_comment" then
+    return entry.review_comment, entry.comment_index
+  end
+  return nil
+end
+
+---Re-anchor the editable review-summary region after a render wipes the
+---buffer. Comment boxes are emitted inline during the render itself, so this
+---only tracks the summary. Runs from the status_render_loaded tail.
+---@param buf integer
+function M._review.on_render(buf)
+  local state = M._review.state(buf)
+  if not state then return end
+  vim.api.nvim_buf_clear_namespace(buf, M._review.ns, 0, -1)
+  state.review_comment_start, state.review_comment_end = nil, nil
+
+  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  local label_row
+  for index, line in ipairs(lines) do
+    if line == "Review Comment:" then
+      label_row = index
+      break
+    end
+  end
+  if label_row then
+    local count = #vim.split(state.review_comment_text or "", "\n", { plain = true })
+    if count == 0 then count = 1 end
+    -- Start mark: left gravity so retyping the first line keeps the mark on it.
+    -- End mark: right gravity so it stays past the region and follows the
+    -- region as it grows/shrinks (a left-gravity end mark at the boundary gets
+    -- pulled into an edit of the adjacent line).
+    state.review_comment_start = vim.api.nvim_buf_set_extmark(buf, M._review.ns, label_row, 0, { right_gravity = false })
+    state.review_comment_end = vim.api.nvim_buf_set_extmark(buf, M._review.ns, label_row + count, 0, { right_gravity = true })
+  end
+  M._review.sync_modifiable(buf)
+end
+
+---@param buf integer
+---@param id integer?
+---@return integer? row0
+function M._review.mark_row(buf, id)
+  if not id then return nil end
+  local pos = vim.api.nvim_buf_get_extmark_by_id(buf, M._review.ns, id, {})
+  return pos and pos[1] or nil
+end
+
+---@param buf integer
+---@param row integer 1-based
+---@return boolean
+function M._review.in_comment_region(buf, row)
+  local state = M._review.state(buf)
+  if not state then return false end
+  local s0 = M._review.mark_row(buf, state.review_comment_start)
+  local e0 = M._review.mark_row(buf, state.review_comment_end)
+  return s0 ~= nil and e0 ~= nil and row >= s0 + 1 and row <= e0
+end
+
+---Unlock the buffer only while the cursor sits in the review-comment block.
+---@param buf integer
+function M._review.sync_modifiable(buf)
+  if not vim.api.nvim_buf_is_valid(buf) then return end
+  if vim.api.nvim_get_current_buf() ~= buf then return end
+  local row = vim.api.nvim_win_get_cursor(0)[1]
+  local wanted = M._review.in_comment_region(buf, row)
+  if vim.bo[buf].modifiable ~= wanted then
+    vim.bo[buf].modifiable = wanted
+  end
+end
+
+---Read the edited review-comment block back into the state.
+---@param buf integer
+function M._review.sync_comment_text(buf)
+  local state = M._review.state(buf)
+  if not state then return end
+  local s0 = M._review.mark_row(buf, state.review_comment_start)
+  local e0 = M._review.mark_row(buf, state.review_comment_end)
+  if not (s0 and e0) then return end
+  state.review_comment_text = table.concat(vim.api.nvim_buf_get_lines(buf, s0, e0, false), "\n")
+end
+
+---@param buf integer
+---@param viewed boolean
+function M._review.toggle_viewed(buf, viewed)
+  local state = M._review.state(buf)
+  if not state then return end
+  M._status = state
+  local entry = status_entry_under_cursor()
+  local file = entry and entry.file
+  if not file then return end
+  state.review_viewed[file.relpath] = viewed or nil
+  M._review.render(buf)
+end
+
+---Build the comment target (path/side/line range) from the visual selection
+---or the cursor line. Only changed (diff body) rows can carry a comment.
+---@param state table
+---@return table? payload
+function M._review.selection_payload(state)
+  local mode = vim.fn.mode()
+  local srow, erow
+  if mode == "v" or mode == "V" or mode:byte() == 22 then
+    srow, erow = vim.fn.line("v"), vim.fn.line(".")
+  else
+    srow = vim.fn.line(".")
+    erow = srow
+  end
+  if srow > erow then srow, erow = erow, srow end
+
+  local first, last
+  for row = srow, erow do
+    local entry = state.entries[row]
+    local dl = entry and entry.diff_line
+    if dl then
+      first = first or dl
+      last = dl
+    end
+  end
+  if not first then return nil end
+
+  -- Diff rows carry the absolute path; GitHub wants it repo-relative. Keep the
+  -- absolute path too so comment boxes can re-anchor against rendered rows.
+  local path = repo_relative(last.file, state.cwd) or last.file
+  local payload = { path = path, abs_file = last.file, side = M._review.side_of(last), line = last.line }
+  if first.file == last.file and not (first.line == last.line and first.side == last.side) then
+    payload.start_line = first.line
+    payload.start_side = M._review.side_of(first)
+    -- GitHub requires start_line < line when both endpoints are on one side.
+    if payload.start_side == payload.side and payload.start_line > payload.line then
+      payload.start_line, payload.line = payload.line, payload.start_line
+    end
+  end
+  return payload
+end
+
+---@param title string
+---@param on_submit fun(text: string)
+---@param prefill? string existing text to edit
+function M._review.open_input(title, on_submit, prefill)
+  if M._review.input_provider then
+    M._review.input_provider(title, on_submit, prefill)
+    return
+  end
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[buf].bufhidden = "wipe"
+  if prefill and prefill ~= "" then
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.split(prefill, "\n", { plain = true }))
+  end
+  local width = math.min(72, math.max(40, math.floor(vim.o.columns * 0.6)))
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative = "cursor",
+    row = 1,
+    col = 0,
+    width = width,
+    height = 6,
+    style = "minimal",
+    border = "rounded",
+    title = " " .. title .. " (Ctrl-s submit, q cancel) ",
+    title_pos = "center",
+  })
+  local function close()
+    if vim.api.nvim_win_is_valid(win) then pcall(vim.api.nvim_win_close, win, true) end
+  end
+  local function submit()
+    local text = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+    close()
+    on_submit(text)
+  end
+  vim.keymap.set({ "n", "i" }, "<C-s>", submit, { buffer = buf })
+  vim.keymap.set("n", "q", close, { buffer = buf, nowait = true })
+  vim.keymap.set("n", "<Esc>", close, { buffer = buf, nowait = true })
+  vim.cmd("startinsert")
+end
+
+---Edit the body of an existing draft comment (local only — it posts to
+---GitHub with the rest when the review is submitted).
+---@param buf integer
+---@param comment table
+function M._review.edit_comment(buf, comment)
+  M._review.open_input("Edit comment", function(text)
+    text = vim.trim(text)
+    if text == "" or not vim.api.nvim_buf_is_valid(buf) then return end
+    comment.body = text
+    M._review.render(buf)
+  end, comment.body)
+end
+
+---`C`: on an existing comment, edit it; on a changed diff line, add a draft
+---comment. On anything else it is a no-op. Comments are local until submit.
+---@param buf integer
+function M._review.add_comment(buf)
+  local state = M._review.state(buf)
+  if not state then return end
+  M._status = state
+  local existing = M._review.comment_under_cursor(buf)
+  if existing then
+    M._review.edit_comment(buf, existing)
+    return
+  end
+  local payload = M._review.selection_payload(state)
+  M._review.leave_visual()
+  if not payload then return end
+  M._review.open_input("Comment", function(text)
+    if vim.trim(text) == "" or not vim.api.nvim_buf_is_valid(buf) then return end
+    state.review_comments[#state.review_comments + 1] = {
+      path = payload.path,
+      abs_file = payload.abs_file,
+      side = payload.side,
+      line = payload.line,
+      start_line = payload.start_line,
+      start_side = payload.start_side,
+      body = text,
+    }
+    M._review.render(buf)
+  end)
+end
+
+---`J`: remove the draft comment under the cursor.
+---@param buf integer
+function M._review.delete_comment(buf)
+  local state = M._review.state(buf)
+  if not state then return end
+  local comment, index = M._review.comment_under_cursor(buf)
+  if not (comment and index) then return end
+  table.remove(state.review_comments, index)
+  M._review.render(buf)
+end
+
+---@param buf integer
+---@param direction 1|-1
+function M._review.navigate(buf, direction)
+  local state = M._review.state(buf)
+  if not state then return end
+  local rows = {}
+  for row, entry in pairs(state.entries or {}) do
+    if entry.kind == "review_comment" and entry.review_first then
+      rows[#rows + 1] = row
+    end
+  end
+  if #rows == 0 then
+    vim.notify("No comments yet", vim.log.levels.INFO, { title = "DiffReview" })
+    return
+  end
+  table.sort(rows)
+  local cursor = vim.api.nvim_win_get_cursor(0)[1]
+  local target
+  if direction == 1 then
+    for _, row in ipairs(rows) do
+      if row > cursor then target = row break end
+    end
+    target = target or rows[1]
+  else
+    for index = #rows, 1, -1 do
+      if rows[index] < cursor then target = rows[index] break end
+    end
+    target = target or rows[#rows]
+  end
+  pcall(vim.api.nvim_win_set_cursor, 0, { target, 0 })
+  vim.cmd("normal! zz")
+end
+
+---Submit the whole review at once: the summary, the verdict, and every draft
+---comment in a single GitHub request (the normal review flow).
+---@param buf integer
+function M._review.submit(buf)
+  local state = M._review.state(buf)
+  if not state then return end
+  M._status = state
+  M._review.sync_comment_text(buf)
+  local function with_event(event)
+    if not event then return end
+    if not vim.api.nvim_buf_is_valid(buf) then return end
+    local comments = {}
+    for _, comment in ipairs(state.review_comments) do
+      local item = { path = comment.path, body = comment.body, line = comment.line, side = comment.side }
+      if comment.start_line then
+        item.start_line = comment.start_line
+        item.start_side = comment.start_side
+      end
+      comments[#comments + 1] = item
+    end
+    local count = #comments
+    gh.submit_pr_review_async(state.cwd, state.pr.number, state.pr.repo, {
+      body = state.review_comment_text or "",
+      event = event,
+      commit_id = state.commit_id,
+      comments = comments,
+    }, function(result)
+      if not vim.api.nvim_buf_is_valid(buf) then return end
+      if result.code ~= 0 then
+        notify_error(
+          "PR review submit failed: " .. (result.output ~= "" and result.output or ("gh exited " .. tostring(result.code))),
+          "DiffReview"
+        )
+        return
+      end
+      state.review_comments = {}
+      state.review_comment_text = ""
+      M._review.render(buf)
+      vim.notify(
+        ("Review submitted (%s, %d comment%s)"):format(event, count, count == 1 and "" or "s"),
+        vim.log.levels.INFO,
+        { title = "DiffReview" }
+      )
+    end)
+  end
+  if M._review.verdict_provider then
+    M._review.verdict_provider(with_event)
+    return
+  end
+  M._review.pick_verdict(with_event)
+end
+
+--- Verdict chooser as a small popup window (not vim.ui.select / snacks):
+--- `c`/`a`/`r` pick, `q`/`<Esc>` cancels.
+---@param on_choice fun(event: string?)
+function M._review.pick_verdict(on_choice)
+  local options = {
+    { key = "c", event = "COMMENT", label = "Comment (no verdict)" },
+    { key = "a", event = "APPROVE", label = "Approve" },
+    { key = "r", event = "REQUEST_CHANGES", label = "Request changes" },
+  }
+  local lines = { "" }
+  for _, opt in ipairs(options) do
+    lines[#lines + 1] = ("  [%s]  %s"):format(opt.key, opt.label)
+  end
+  lines[#lines + 1] = "  [q]  cancel"
+  lines[#lines + 1] = ""
+
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[buf].bufhidden = "wipe"
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].modifiable = false
+  local width = 0
+  for _, line in ipairs(lines) do
+    width = math.max(width, #line)
+  end
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative = "cursor",
+    row = 1,
+    col = 0,
+    width = width + 2,
+    height = #lines,
+    style = "minimal",
+    border = "rounded",
+    title = " Submit review ",
+    title_pos = "center",
+  })
+  local chosen = false
+  local function close()
+    if vim.api.nvim_win_is_valid(win) then pcall(vim.api.nvim_win_close, win, true) end
+  end
+  local function choose(event)
+    if chosen then return end
+    chosen = true
+    close()
+    on_choice(event)
+  end
+  for _, opt in ipairs(options) do
+    vim.keymap.set("n", opt.key, function() choose(opt.event) end, { buffer = buf, nowait = true, silent = true })
+  end
+  vim.keymap.set("n", "q", function() choose(nil) end, { buffer = buf, nowait = true, silent = true })
+  vim.keymap.set("n", "<Esc>", function() choose(nil) end, { buffer = buf, nowait = true, silent = true })
+  vim.api.nvim_create_autocmd("BufLeave", { buffer = buf, once = true, callback = function() choose(nil) end })
+end
+
+---@param buf integer
+function M._review.attach(buf)
+  local group = vim.api.nvim_create_augroup("DiffReviewReview" .. buf, { clear = true })
+  vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI", "BufEnter" }, {
+    group = group,
+    buffer = buf,
+    callback = function()
+      M._review.sync_modifiable(buf)
+    end,
+  })
+  vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI", "InsertLeave" }, {
+    group = group,
+    buffer = buf,
+    callback = function()
+      M._review.sync_comment_text(buf)
+    end,
+  })
+end
+
+-- Per-repository config, read from `<repo root>/.diffreview.json`. Currently
+-- only `branch_prefix` (used by the `bc` branch-create action). On the module
+-- table because init.lua is at Lua's 200-local limit.
+M._repo_config = { reader = nil }
+
+---@param fn fun(path: string): string? test seam returning file contents
+function M._repo_config.set_reader(fn)
+  M._repo_config.reader = fn
+end
+
+function M._repo_config.reset_reader()
+  M._repo_config.reader = nil
+end
+
+---@param cwd string repo root
+---@return DiffReviewRepoConfig
+function M._repo_config.read(cwd)
+  local path = (cwd:gsub("[/\\]+$", "")) .. "/.diffreview.json"
+  local content
+  if M._repo_config.reader then
+    content = M._repo_config.reader(path)
+  else
+    local handle = io.open(path, "r")
+    if handle then
+      content = handle:read("*a")
+      handle:close()
+    end
+  end
+  if not content or content == "" then return {} end
+  local ok, decoded = pcall(vim.json.decode, content)
+  if ok and type(decoded) == "table" then return decoded end
+  return {}
+end
+
+---@param cwd string repo root
+---@return string
+function M._repo_config.branch_prefix(cwd)
+  local repo = M._repo_config.read(cwd)
+  if type(repo.branch_prefix) == "string" and repo.branch_prefix ~= "" then
+    return repo.branch_prefix
+  end
+  local options = M.config or config.options or config.defaults
+  return options.branch_prefix or config.defaults.branch_prefix or ""
+end
+
+--- Centered single-line input popup (not vim.ui.input / snacks). `<CR>`
+--- submits, `<Esc>`/`q` cancels (calling back with nil).
+---@param prefix string prefilled text
+---@param on_submit fun(name: string?)
+function M._prompt_branch_name(prefix, on_submit)
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[buf].bufhidden = "wipe"
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, { prefix })
+  local width = math.min(60, math.max(30, math.floor(vim.o.columns * 0.4)))
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative = "editor",
+    row = math.floor((vim.o.lines - 3) / 2),
+    col = math.floor((vim.o.columns - width) / 2),
+    width = width,
+    height = 1,
+    style = "minimal",
+    border = "rounded",
+    title = " New branch ",
+    title_pos = "center",
+  })
+  local done = false
+  local function finish(value)
+    if done then return end
+    done = true
+    if vim.api.nvim_win_is_valid(win) then pcall(vim.api.nvim_win_close, win, true) end
+    on_submit(value)
+  end
+  vim.keymap.set({ "i", "n" }, "<CR>", function()
+    vim.cmd("stopinsert")
+    finish(vim.api.nvim_buf_get_lines(buf, 0, -1, false)[1] or "")
+  end, { buffer = buf })
+  vim.keymap.set("i", "<C-c>", function() vim.cmd("stopinsert"); finish(nil) end, { buffer = buf })
+  vim.keymap.set("n", "<Esc>", function() finish(nil) end, { buffer = buf, nowait = true })
+  vim.keymap.set("n", "q", function() finish(nil) end, { buffer = buf, nowait = true })
+  vim.api.nvim_create_autocmd("BufLeave", { buffer = buf, once = true, callback = function() finish(nil) end })
+  vim.cmd("startinsert!")
+end
+
+--- `bc`: prompt for a name (prefilled with the repo's branch prefix) and
+--- create + switch to the new branch, then refresh the status view.
+---@param buf integer
+function M._create_branch(buf)
+  local status = M._status_states and M._status_states[buf] or M._status
+  local cwd = status and status.cwd
+  if not cwd then
+    notify_error("Not a git repository", "DiffReview")
+    return
+  end
+  local prefix = M._repo_config.branch_prefix(cwd)
+  M._prompt_branch_name(prefix, function(name)
+    if not name then return end
+    name = vim.trim(name)
+    if name == "" or name == prefix then return end
+    run_git_at_root_async(cwd, { "switch", "-c", name }, nil, function(result)
+      if not result.ok then
+        notify_error(
+          "Create branch failed: " .. (result.output ~= "" and result.output or ("git exited " .. tostring(result.code))),
+          "DiffReview"
+        )
+        return
+      end
+      vim.notify("Created branch " .. name, vim.log.levels.INFO, { title = "DiffReview" })
+      if vim.api.nvim_buf_is_valid(buf) then
+        M._status = status
+        status.pr = nil
+        status.about = nil
+        render_status_or_notify(buf, nil, nil, { restore_initial_folds = true, refresh_pr = true, refresh_about = true })
+      end
+    end)
   end)
 end
 
@@ -5662,6 +6450,279 @@ local function status_enqueue_operation(operation)
   end
 
   run_next()
+end
+
+-- PR title/description editing in the PR view: insert mode is gated to the
+-- title line and description block, ":w" syncs via `gh pr edit`, and a "*"
+-- marks unsynced fields. Functions hang off the module table because
+-- init.lua is at Lua's 200-local limit.
+M._pr_edit = { ns = vim.api.nvim_create_namespace("diff_review_pr_edit") }
+
+---@class DiffReviewPrEditState
+---@field queue fun(done: fun())[]
+---@field running boolean
+---@field title_mark? integer
+---@field desc_start_mark? integer
+---@field desc_end_mark? integer beyond-the-last-body-line mark (end-exclusive)
+---@field title_marker_id? integer
+---@field desc_marker_id? integer
+
+---@param buf integer
+---@param id integer?
+---@return integer? row0
+function M._pr_edit.mark_row(buf, id)
+  if not id then return nil end
+  local pos = vim.api.nvim_buf_get_extmark_by_id(buf, M._pr_edit.ns, id, {})
+  return pos and pos[1] or nil
+end
+
+---@param buf integer
+---@param status table
+---@return string? title without the "Title:" label
+---@return string? desc description block joined with newlines
+function M._pr_edit.current_values(buf, status)
+  local state = status.pr_edit
+  if not state then return nil end
+  local title_row0 = M._pr_edit.mark_row(buf, state.title_mark)
+  local first0 = M._pr_edit.mark_row(buf, state.desc_start_mark)
+  local after0 = M._pr_edit.mark_row(buf, state.desc_end_mark)
+  if not (title_row0 and first0 and after0) then return nil end
+  local title_line = vim.api.nvim_buf_get_lines(buf, title_row0, title_row0 + 1, false)[1] or ""
+  local title = vim.trim((title_line:gsub("^Title:%s*", "")))
+  local desc = table.concat(vim.api.nvim_buf_get_lines(buf, first0, after0, false), "\n")
+  return title, desc
+end
+
+---@param buf integer
+---@param status table
+---@return boolean title_dirty
+---@return boolean desc_dirty
+function M._pr_edit.dirty_flags(buf, status)
+  local title, desc = M._pr_edit.current_values(buf, status)
+  if title == nil or not status.pr then return false, false end
+  local baseline = table.concat(status_markdown_lines(status.pr.body), "\n")
+  return title ~= status.pr.title, desc ~= baseline
+end
+
+---@param buf integer
+---@param row integer 1-based cursor row
+---@return "title"|"desc"|nil
+function M._pr_edit.region_kind_at(buf, row)
+  local status = M._status_states and M._status_states[buf] or nil
+  local state = status and status.pr_edit or nil
+  if not state then return nil end
+  local title_row0 = M._pr_edit.mark_row(buf, state.title_mark)
+  local first0 = M._pr_edit.mark_row(buf, state.desc_start_mark)
+  local after0 = M._pr_edit.mark_row(buf, state.desc_end_mark)
+  if title_row0 and row == title_row0 + 1 then return "title" end
+  if first0 and after0 and row >= first0 + 1 and row <= after0 then return "desc" end
+  return nil
+end
+
+---@param buf integer
+---@param state DiffReviewPrEditState
+function M._pr_edit.clear_markers(buf, state)
+  for _, key in ipairs({ "title_marker_id", "desc_marker_id" }) do
+    if state[key] then
+      pcall(vim.api.nvim_buf_del_extmark, buf, M._pr_edit.ns, state[key])
+      state[key] = nil
+    end
+  end
+end
+
+---Show/hide the "*" out-of-sync markers on the Title/Description labels.
+---@param buf integer
+function M._pr_edit.refresh_markers(buf)
+  local status = M._status_states and M._status_states[buf] or nil
+  local state = status and status.pr_edit or nil
+  if not (state and vim.api.nvim_buf_is_valid(buf)) then return end
+  local title_dirty, desc_dirty = M._pr_edit.dirty_flags(buf, status)
+  local title_row0 = M._pr_edit.mark_row(buf, state.title_mark)
+  local first0 = M._pr_edit.mark_row(buf, state.desc_start_mark)
+
+  local function set_marker(key, wanted, row0)
+    if wanted and not state[key] and row0 then
+      state[key] = vim.api.nvim_buf_set_extmark(buf, M._pr_edit.ns, row0, 0, {
+        virt_text = { { "*", "DiffReviewPrDirty" } },
+        virt_text_pos = "inline",
+        right_gravity = false,
+      })
+    elseif not wanted and state[key] then
+      pcall(vim.api.nvim_buf_del_extmark, buf, M._pr_edit.ns, state[key])
+      state[key] = nil
+    end
+  end
+
+  set_marker("title_marker_id", title_dirty, title_row0)
+  set_marker("desc_marker_id", desc_dirty, first0 and first0 - 1 or nil)
+end
+
+---Re-renders are blocked while the buffer holds unsynced PR edits; they
+---would clobber them.
+---@param buf integer
+---@return boolean
+function M._pr_edit.blocks_render(buf)
+  local status = M._status_states and M._status_states[buf] or nil
+  local state = status and status.pr_edit or nil
+  if not (state and status.pr and vim.api.nvim_buf_is_valid(buf)) then return false end
+  local title_dirty, desc_dirty = M._pr_edit.dirty_flags(buf, status)
+  if not (title_dirty or desc_dirty) then return false end
+  vim.notify("Unsynced PR edits — :w to sync before refreshing", vim.log.levels.WARN, { title = "DiffReview" })
+  return true
+end
+
+---Locate the title/description regions after a render and re-anchor the
+---tracking extmarks. Rendering wipes the buffer, so this runs on every
+---PR-view render.
+---@param buf integer
+function M._pr_edit.on_render(buf)
+  local status = M._status_states and M._status_states[buf] or nil
+  local state = status and status.pr_edit or nil
+  if not (state and status.pr and vim.api.nvim_buf_is_valid(buf)) then return end
+  vim.api.nvim_buf_clear_namespace(buf, M._pr_edit.ns, 0, -1)
+  state.title_mark, state.desc_start_mark, state.desc_end_mark = nil, nil, nil
+  state.title_marker_id, state.desc_marker_id = nil, nil
+
+  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  local title_row, label_row
+  for index, line in ipairs(lines) do
+    if not title_row and line:match("^Title:") then title_row = index end
+    if not label_row and line == "Description:" then label_row = index end
+    if title_row and label_row then break end
+  end
+  if not (title_row and label_row) then return end
+
+  -- right_gravity=false: a mark with right gravity slides to the next line
+  -- when its own line is replaced (retyped), losing the region.
+  local body_count = #status_markdown_lines(status.pr.body)
+  state.title_mark = vim.api.nvim_buf_set_extmark(buf, M._pr_edit.ns, title_row - 1, 0, { right_gravity = false })
+  state.desc_start_mark = vim.api.nvim_buf_set_extmark(buf, M._pr_edit.ns, label_row, 0, { right_gravity = false })
+  state.desc_end_mark = vim.api.nvim_buf_set_extmark(buf, M._pr_edit.ns, label_row + body_count, 0, { right_gravity = false })
+  vim.bo[buf].modified = false
+  M._pr_edit.refresh_markers(buf)
+  M._pr_edit.sync_modifiable(buf)
+end
+
+---Sequential sync queue, mirroring status_enqueue_operation without its
+---status-view reconcile tail (which would rebuild the PR buffer as a
+---status view).
+---@param state DiffReviewPrEditState
+---@param operation fun(done: fun())
+function M._pr_edit.enqueue(state, operation)
+  state.queue[#state.queue + 1] = operation
+  local function run_next()
+    if state.running then return end
+    local next_operation = table.remove(state.queue, 1)
+    if not next_operation then return end
+    state.running = true
+    next_operation(function()
+      state.running = false
+      run_next()
+    end)
+  end
+  run_next()
+end
+
+---BufWriteCmd handler: clear the "*" markers immediately, then sync the
+---dirty fields to GitHub through the queue.
+---@param buf integer
+function M._pr_edit.sync(buf)
+  local status = M._status_states and M._status_states[buf] or nil
+  local state = status and status.pr_edit or nil
+  if not (status and state and status.pr) then return end
+  M._status = status
+  local title, desc = M._pr_edit.current_values(buf, status)
+  local title_dirty, desc_dirty = M._pr_edit.dirty_flags(buf, status)
+  vim.bo[buf].modified = false
+  if not (title_dirty or desc_dirty) then return end
+
+  M._pr_edit.clear_markers(buf, state)
+  local pr = status.pr
+  local edit = {
+    title = title_dirty and title or nil,
+    body = desc_dirty and desc or nil,
+  }
+  M._pr_edit.enqueue(state, function(done)
+    gh.update_pr_async(status.cwd, pr.number, pr.repo, edit, function(result)
+      if not vim.api.nvim_buf_is_valid(buf) then
+        done()
+        return
+      end
+      if result.code ~= 0 then
+        notify_error(
+          "GitHub PR update failed: " .. (result.output ~= "" and result.output or ("gh exited " .. tostring(result.code))),
+          "DiffReview"
+        )
+        vim.bo[buf].modified = true
+        M._pr_edit.refresh_markers(buf)
+        done()
+        return
+      end
+      if edit.title then pr.title = edit.title end
+      if edit.body then pr.body = edit.body end
+      local latest = M._status_states and M._status_states[buf] or nil
+      if latest == status then
+        M._status = status
+        status.head_lines = status_pr_detail_head_lines(pr)
+        status_render_loaded(buf, nil, nil, { reuse_sections = true }, status.head_lines, status.sections or {})
+      end
+      vim.notify(("PR #%s updated"):format(tostring(pr.number)), vim.log.levels.INFO, { title = "DiffReview" })
+      done()
+    end)
+  end)
+end
+
+---Unlock the buffer exactly when the cursor sits in an editable region, so
+---every native editing command works there and nowhere else.
+---@param buf integer
+function M._pr_edit.sync_modifiable(buf)
+  if not vim.api.nvim_buf_is_valid(buf) then return end
+  if vim.api.nvim_get_current_buf() ~= buf then return end
+  local row = vim.api.nvim_win_get_cursor(0)[1]
+  local wanted = M._pr_edit.region_kind_at(buf, row) ~= nil
+  if vim.bo[buf].modifiable ~= wanted then
+    vim.bo[buf].modifiable = wanted
+  end
+end
+
+---Wire editing into a freshly created PR-view buffer: acwrite, the
+---cursor-follows-modifiable lock, and lifecycle autocmds.
+---@param buf integer
+function M._pr_edit.attach(buf)
+  local status = M._status_states and M._status_states[buf] or nil
+  if not status then return end
+  status.pr_edit = { queue = {}, running = false }
+  vim.bo[buf].buftype = "acwrite"
+
+  -- The title is single-line: swallow newline attempts there.
+  vim.keymap.set("i", "<CR>", function()
+    local row = vim.api.nvim_win_get_cursor(0)[1]
+    if M._pr_edit.region_kind_at(buf, row) == "title" then return "" end
+    return vim.api.nvim_replace_termcodes("<CR>", true, false, true)
+  end, { buffer = buf, expr = true })
+
+  local group = vim.api.nvim_create_augroup("DiffReviewPrEdit" .. buf, { clear = true })
+  vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI", "BufEnter" }, {
+    group = group,
+    buffer = buf,
+    callback = function()
+      M._pr_edit.sync_modifiable(buf)
+    end,
+  })
+  vim.api.nvim_create_autocmd({ "InsertLeave", "TextChanged" }, {
+    group = group,
+    buffer = buf,
+    callback = function()
+      M._pr_edit.refresh_markers(buf)
+    end,
+  })
+  vim.api.nvim_create_autocmd("BufWriteCmd", {
+    group = group,
+    buffer = buf,
+    callback = function()
+      M._pr_edit.sync(buf)
+    end,
+  })
 end
 
 ---@param entries DiffReviewStatusEntry[]
@@ -6235,6 +7296,25 @@ function M._file_revision.show(opts, label)
       vim.keymap.set("n", "q", function()
         pcall(vim.api.nvim_buf_delete, buf, { force = true })
       end, { buffer = buf, silent = true, nowait = true, desc = "Close file revision" })
+      -- Sticky header: a red winbar marks the buffer as a historical revision.
+      -- Window-local, so it must be applied/cleared as windows show the
+      -- buffer; dropbar skips windows whose winbar is already set.
+      local header = ("%%#DiffReviewFileRevisionHeader# %s @ %s — read-only revision %%*"):format(
+        opts.path:gsub("%%", "%%%%"),
+        label:gsub("%%", "%%%%")
+      )
+      vim.api.nvim_create_autocmd("BufWinEnter", {
+        buffer = buf,
+        callback = function()
+          vim.wo.winbar = header
+        end,
+      })
+      vim.api.nvim_create_autocmd("BufWinLeave", {
+        buffer = buf,
+        callback = function()
+          vim.wo.winbar = ""
+        end,
+      })
       M._file_revision.buffers[name] = buf
     end
     vim.bo[buf].readonly = false
@@ -6649,8 +7729,23 @@ local function setup_status_keymaps(buf)
     M._status_collapse_parent()
   end)
 
-  -- Read-only diff views (PR and branch diff) only get navigation commands;
-  -- browse is gated to the PR view by its command spec.
+  -- The review view gets its own action set (S/U/C/y/n/submit); the read-only
+  -- PR and branch-diff views only get navigation commands.
+  if view_kind == "review" then
+    M._review.setup_keymaps(buf)
+    map("browse", "n", function()
+      local status = M._status_states and M._status_states[buf] or M._status
+      if not gh.browse_pr(status and status.pr) then
+        notify_error("Unable to open PR URL", "DiffReview")
+      end
+    end)
+    map("open", "n", function()
+      if M._status_states and M._status_states[buf] then M._status = M._status_states[buf] end
+      status_jump(status_entry_under_cursor())
+    end, "Jump to file")
+    map("help", "n", status_show_help)
+    return
+  end
   if view_kind ~= "status" then
     map("browse", "n", function()
       local status = M._status_states and M._status_states[buf] or M._status
@@ -6658,6 +7753,9 @@ local function setup_status_keymaps(buf)
       if not gh.browse_pr(pr) then
         notify_error("Unable to open PR URL", "DiffReview")
       end
+    end)
+    map("review", "n", function()
+      M._review.start(buf)
     end)
     map("open", "n", function()
       if M._status_states and M._status_states[buf] then M._status = M._status_states[buf] end
@@ -6735,8 +7833,16 @@ local function setup_status_keymaps(buf)
     status_open_pr(status_entry_under_cursor())
   end)
 
+  map("branch_create", "n", function()
+    M._create_branch(buf)
+  end)
+
   map("walkthrough", "n", function()
     require("diff_review.walkthrough").start(M._walkthrough_host(buf))
+  end)
+
+  map("review", "n", function()
+    M._review.start(buf)
   end)
 
   map("help", "n", status_show_help)
@@ -6797,6 +7903,7 @@ function M.open_pr(pr, opts)
   M._status = state
   attach_status_state(buf, state)
   setup_status_keymaps(buf)
+  M._pr_edit.attach(buf)
 
   local win = vim.api.nvim_get_current_win()
   local ok, err = pcall(vim.api.nvim_win_set_buf, win, buf)
@@ -6824,6 +7931,127 @@ function M.open_pr_number(number, opts)
     end
     M.open_pr(result.pr, { cwd = cwd, repo = opts.repo })
   end)
+end
+
+---@param pr DiffReviewGhPR
+---@param cwd string
+---@param buf integer
+function M._review.load_diff(pr, cwd, buf)
+  local state = M._review.state(buf)
+  if not state then return end
+  state.pr_diff_request_id = (state.pr_diff_request_id or 0) + 1
+  local request_id = state.pr_diff_request_id
+  gh.pr_diff_async(cwd, pr.number, pr.repo, function(result)
+    local latest = M._review.state(buf)
+    if not (latest and latest.pr_diff_request_id == request_id and vim.api.nvim_buf_is_valid(buf)) then return end
+    M._status = latest
+    if result.code ~= 0 then
+      notify_error("GitHub PR diff failed: " .. (result.output ~= "" and result.output or ("gh exited " .. result.code)), "DiffReview")
+      return
+    end
+    latest.diff_text = result.stdout or ""
+    M._review.render(buf)
+  end)
+end
+
+--- Open a PR review buffer (":or"): the PR title, an editable review summary,
+--- and the changed files split into Unviewed/Viewed sections.
+---@param pr DiffReviewGhPR
+---@param opts? DiffReviewOpenPROptions
+---@return integer? buf
+function M.open_review(pr, opts)
+  opts = opts or {}
+  if not pr then return nil end
+  setup_bg_highlights()
+  if (not pr.repo or pr.repo == "") and opts.repo and opts.repo ~= "" then
+    pr = vim.tbl_extend("force", vim.deepcopy(pr), { repo = opts.repo })
+  end
+  local cwd = opts.cwd or (M._status and M._status.cwd) or vim.fn.getcwd()
+  local buf = vim.api.nvim_create_buf(true, false)
+  vim.bo[buf].bufhidden = "hide"
+  vim.bo[buf].buftype = "nofile"
+  vim.bo[buf].swapfile = false
+  vim.bo[buf].filetype = "GitStatus"
+  local options = M.config or config.options or config.defaults
+  local name = ("%sReview://%s"):format(options.pr_buffer_name, pr.number or "current")
+  if not pcall(vim.api.nvim_buf_set_name, buf, name) then
+    pcall(vim.api.nvim_buf_set_name, buf, name .. "#" .. buf)
+  end
+
+  local state = {
+    view_kind = "review",
+    buf = buf,
+    cwd = cwd,
+    pr = pr,
+    commit_id = pr.headRefOid or "",
+    diff_text = "",
+    review_viewed = {},
+    review_comment_text = "",
+    review_comments = {},
+    folds = {},
+    lines = {},
+    entries = {},
+    highlights = {},
+    line_highlights = {},
+    extmarks = {},
+    boundary_lines = {},
+    sections = nil,
+    fancy_rows = {},
+  }
+  M._status = state
+  attach_status_state(buf, state)
+  setup_status_keymaps(buf)
+  M._review.attach(buf)
+
+  local win = vim.api.nvim_get_current_win()
+  local ok, err = pcall(vim.api.nvim_win_set_buf, win, buf)
+  if not ok then
+    notify_error("DiffReview review open failed: " .. tostring(err))
+    return nil
+  end
+  M._hide_line_numbers(win)
+  vim.wo[win].foldcolumn = "0"
+
+  M._review.render(buf)
+  M._review.load_diff(pr, cwd, buf)
+  return buf
+end
+
+--- Resolve the PR from the current status/PR buffer and open its review.
+---@param buf integer
+function M._review.start(buf)
+  local status = M._status_states and M._status_states[buf] or M._status
+  if not status then return end
+  local pr
+  if status.view_kind == "pr" then
+    pr = status.pr
+  elseif status.pr and status.pr.state == "ready" then
+    pr = status.pr.pr
+  end
+  if not pr then
+    vim.notify("No GitHub PR for this branch", vim.log.levels.INFO, { title = "DiffReview" })
+    return
+  end
+  M.open_review(pr, { cwd = status.cwd })
+end
+
+---@param buf integer
+function M._review.setup_keymaps(buf)
+  local function map(id, modes, fn)
+    for _, key in ipairs(M._review.keys_for(id)) do
+      vim.keymap.set(modes, key, function()
+        if M._status_states and M._status_states[buf] then M._status = M._status_states[buf] end
+        fn()
+      end, { buffer = buf, silent = true, nowait = true })
+    end
+  end
+  map("viewed", "n", function() M._review.toggle_viewed(buf, true) end)
+  map("unviewed", "n", function() M._review.toggle_viewed(buf, false) end)
+  map("comment", { "n", "x" }, function() M._review.add_comment(buf) end)
+  map("delete", "n", function() M._review.delete_comment(buf) end)
+  map("next_comment", "n", function() M._review.navigate(buf, 1) end)
+  map("prev_comment", "n", function() M._review.navigate(buf, -1) end)
+  map("submit", "n", function() M._review.submit(buf) end)
 end
 
 ---@class DiffReviewBranchDiffOptions

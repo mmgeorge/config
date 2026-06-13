@@ -632,7 +632,7 @@ local function run()
   reset_state({ modified = { ["mod.txt"] = true } })
   render_and_wait(buf, "mod.txt +1 -1")
   assert_true(
-    buffer_contains(buf, "Hint: S stage | U unstage | j discard | cc commit | o open | r refresh | q close | ? help"),
+    buffer_contains(buf, "Hint: S stage | U unstage | j discard | cc commit | o open | R refresh | q close | ? help"),
     "status hint row did not use the compact binding list\n" .. table.concat(status_lines(buf), "\n")
   )
   assert_true(
@@ -785,7 +785,7 @@ local function run()
   render_and_wait(buf, "refresh-collapse-a.txt +1 -1")
   trigger_normal_mapping("<Tab>", find_row(buf, "refresh-collapse-a.txt"))
   wait_for(function() return buffer_contains(buf, "@@ +1 -1") end, "refresh collapse hunk row did not render")
-  trigger_normal_mapping("r", find_hunk_row_after_file(buf, "refresh-collapse-a.txt"))
+  trigger_normal_mapping("R", find_hunk_row_after_file(buf, "refresh-collapse-a.txt"))
   wait_for(function()
     return cursor_line_text(buf):find("Unstaged changes (2)", 1, true) ~= nil
       and buffer_contains(buf, "refresh-collapse-a.txt +1 -1")

@@ -166,7 +166,7 @@ local function run()
   assert_true(not buffer_contains(buf, "stage"), "hint row must not advertise staging")
 
   -- ── open on a deleted line shows the branch revision of the file ───────────
-  trigger_buf_mapping(buf, "o", find_row(buf, "old line"))
+  trigger_buf_mapping(buf, "<CR>", find_row(buf, "old line"))
   wait_for(function()
     return vim.api.nvim_buf_get_name(vim.api.nvim_get_current_buf()):find("GitFileRevision", 1, true) ~= nil
   end, "open on deleted line did not open a revision buffer")
@@ -185,7 +185,7 @@ local function run()
 
   -- ── refresh re-runs the branch diff ────────────────────────────────────────
   local requests_before = branch_diff_requests
-  trigger_buf_mapping(buf, "r")
+  trigger_buf_mapping(buf, "R")
   wait_for(function() return branch_diff_requests > requests_before end, "refresh did not re-run the diff")
   wait_for(function() return buffer_contains(buf, "Changes vs somebranch (1)") end, "refresh did not re-render")
 

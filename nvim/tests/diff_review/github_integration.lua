@@ -475,7 +475,7 @@ local function run()
   trigger_normal_mapping("?", find_row(status_buf, "Head:"))
   local help_buf = vim.api.nvim_get_current_buf()
   assert_true(help_buf ~= status_buf, "help did not open a popup buffer")
-  assert_buffer_contains_all(help_buf, { "<Tab>", "N", "S", "U", "j", "cc", "opP", "opp", "ogp", "o", "<CR>", "r", "or", "q", "?" })
+  assert_buffer_contains_all(help_buf, { "<Tab>", "N", "S", "U", "j", "cc", "opP", "opp", "ogp", "o", "<CR>", "R", "or", "q", "?" })
   pcall(vim.api.nvim_win_close, 0, true)
 
   vim.api.nvim_win_set_buf(0, status_buf)
@@ -519,9 +519,9 @@ local function run()
 
   pr_mode = "ready"
   pr_title = "PR after manual refresh"
-  assert_true(type(vim.fn.maparg("or", "n", false, true).callback) == "function", "or refresh mapping missing")
-  trigger_normal_mapping("or", find_row(status_buf, "Head:"))
-  wait_for(function() return buffer_contains(status_buf, "PR after manual refresh") end, "or did not force-refresh PR state")
+  assert_true(type(vim.fn.maparg("R", "n", false, true).callback) == "function", "R refresh mapping missing")
+  trigger_normal_mapping("R", find_row(status_buf, "Head:"))
+  wait_for(function() return buffer_contains(status_buf, "PR after manual refresh") end, "R did not force-refresh PR state")
 
   pr_title = "PR after push"
   hold_push = true
