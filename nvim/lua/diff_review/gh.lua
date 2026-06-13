@@ -53,6 +53,8 @@
 ---@field line integer?
 ---@field position integer?
 ---@field user? string
+---@field created_at? string
+---@field updated_at? string
 
 ---@class DiffReviewGhPendingReview
 ---@field id integer
@@ -408,6 +410,8 @@ local function normalize_review_comment(raw)
     line = maybe_integer(raw.line),
     position = maybe_integer(raw.position or raw.original_position),
     user = author.login,
+    created_at = raw.createdAt or raw.created_at,
+    updated_at = raw.updatedAt or raw.updated_at,
   }
 end
 
@@ -458,7 +462,7 @@ function M.pending_review_async(cwd, number, repo, cb)
     "      } }",
     "      reviewThreads(first:100) { nodes {",
     "        comments(first:100) { nodes {",
-    "          id databaseId body path line position author { login }",
+    "          id databaseId body path line position createdAt updatedAt author { login }",
     "          pullRequestReview { id databaseId state }",
     "        } }",
     "      } }",
@@ -538,7 +542,7 @@ function M.add_pending_review_comment_async(cwd, review_node_id, opts, cb)
   local query = table.concat({
     "mutation($input:AddPullRequestReviewCommentInput!) {",
     "  addPullRequestReviewComment(input:$input) {",
-    "    comment { id databaseId body path line position author { login } }",
+    "    comment { id databaseId body path line position createdAt updatedAt author { login } }",
     "  }",
     "}",
   }, "\n")
@@ -575,7 +579,7 @@ function M.update_review_comment_async(cwd, comment_node_id, body, cb)
   local query = table.concat({
     "mutation($input:UpdatePullRequestReviewCommentInput!) {",
     "  updatePullRequestReviewComment(input:$input) {",
-    "    pullRequestReviewComment { id databaseId body path line position author { login } }",
+    "    pullRequestReviewComment { id databaseId body path line position createdAt updatedAt author { login } }",
     "  }",
     "}",
   }, "\n")
