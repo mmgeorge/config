@@ -9,6 +9,20 @@ return {
         desc = "Create a draft GitHub PR for the current branch",
       })
 
+      vim.api.nvim_create_user_command("GithubLink", function(opts)
+        require("github.link").open("blob", opts)
+      end, {
+        range = true,
+        desc = "Open the current file or selected lines on GitHub",
+      })
+
+      vim.api.nvim_create_user_command("GithubBlame", function(opts)
+        require("github.link").open("blame", opts)
+      end, {
+        range = true,
+        desc = "Open GitHub blame for the current file or selected lines",
+      })
+
       vim.api.nvim_create_user_command("GithubIssuse", function()
         require("github.pickers").issues()
       end, {
