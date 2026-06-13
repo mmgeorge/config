@@ -5857,12 +5857,27 @@ end
 ---@param indent integer
 function M._review.emit_comments_for(state, diff_line, indent)
   for index, comment in ipairs(state.review_comments) do
-    if comment.abs_file == diff_line.file
+    if comment ~= state.review_editing_comment
+      and comment.abs_file == diff_line.file
       and comment.side == M._review.side_of(diff_line)
       and comment.line == diff_line.line then
       M._review.emit_box(comment, index, indent)
     end
   end
+end
+
+---@param buf integer
+---@param row integer
+---@return table? comment
+---@return integer? index
+function M._review.comment_at_row(buf, row)
+  local state = M._review.state(buf)
+  if not state then return nil end
+  local entry = state.entries and state.entries[row] or nil
+  if entry and entry.kind == "review_comment" then
+    return entry.review_comment, entry.comment_index
+  end
+  return nil
 end
 
 ---@param buf integer
@@ -5872,9 +5887,10 @@ function M._review.comment_under_cursor(buf)
   local state = M._review.state(buf)
   if not state then return nil end
   M._status = state
-  local entry = status_entry_under_cursor()
-  if entry and entry.kind == "review_comment" then
-    return entry.review_comment, entry.comment_index
+  local cursor_row = vim.api.nvim_win_get_cursor(0)[1]
+  for _, row in ipairs({ cursor_row, cursor_row - 1, cursor_row + 1 }) do
+    local comment, index = M._review.comment_at_row(buf, row)
+    if comment then return comment, index end
   end
   return nil
 end
@@ -6012,7 +6028,8 @@ end
 ---@param title string
 ---@param on_submit fun(text: string)
 ---@param prefill? string existing text to edit
-function M._review.open_input(title, on_submit, prefill)
+---@param opts? { start_insert?: boolean, on_cancel?: fun() }
+function M._review.open_input(title, on_submit, prefill, opts)
   if M._review.input_provider then
     M._review.input_provider(title, on_submit, prefill)
     return
@@ -6034,18 +6051,30 @@ function M._review.open_input(title, on_submit, prefill)
     title = " " .. title .. " (Ctrl-s submit, q cancel) ",
     title_pos = "center",
   })
+  local done = false
   local function close()
     if vim.api.nvim_win_is_valid(win) then pcall(vim.api.nvim_win_close, win, true) end
   end
+  local function cancel()
+    if done then return end
+    done = true
+    close()
+    if opts and opts.on_cancel then opts.on_cancel() end
+  end
   local function submit()
+    if done then return end
+    done = true
+    vim.cmd("stopinsert")
     local text = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
     close()
     on_submit(text)
   end
   vim.keymap.set({ "n", "i" }, "<C-s>", submit, { buffer = buf })
-  vim.keymap.set("n", "q", close, { buffer = buf, nowait = true })
-  vim.keymap.set("n", "<Esc>", close, { buffer = buf, nowait = true })
-  vim.cmd("startinsert")
+  vim.keymap.set("n", "q", cancel, { buffer = buf, nowait = true })
+  vim.keymap.set("n", "<Esc>", cancel, { buffer = buf, nowait = true })
+  local should_start_insert = opts and opts.start_insert
+  if should_start_insert == nil then should_start_insert = prefill == nil end
+  if should_start_insert then vim.cmd("startinsert") end
 end
 
 ---Edit the body of an existing draft comment (local only — it posts to
@@ -6053,14 +6082,29 @@ end
 ---@param buf integer
 ---@param comment table
 function M._review.edit_comment(buf, comment)
+  local edit_state = M._review.state(buf)
+  if edit_state then
+    edit_state.review_editing_comment = comment
+    M._review.render(buf)
+  end
+  local function finish_edit()
+    local state = M._review.state(buf)
+    if state and state.review_editing_comment == comment then
+      state.review_editing_comment = nil
+      if vim.api.nvim_buf_is_valid(buf) then M._review.render(buf) end
+    end
+  end
   M._review.open_input("Edit comment", function(text)
     text = vim.trim(text)
-    if text == "" or not vim.api.nvim_buf_is_valid(buf) then return end
+    if text == "" or not vim.api.nvim_buf_is_valid(buf) then
+      finish_edit()
+      return
+    end
     comment.body = text
     local state = M._review.state(buf)
     if state then M._review.save_draft(state) end
-    M._review.render(buf)
-  end, comment.body)
+    finish_edit()
+  end, comment.body, { start_insert = false, on_cancel = finish_edit })
 end
 
 ---`C`: on an existing comment, edit it; on a changed diff line, add a draft
@@ -6091,7 +6135,7 @@ function M._review.add_comment(buf)
     }
     M._review.save_draft(state)
     M._review.render(buf)
-  end)
+  end, nil, { start_insert = true })
 end
 
 ---`J`: remove the draft comment under the cursor.

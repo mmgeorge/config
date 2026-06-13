@@ -107,6 +107,19 @@ local function row_after(buf, needle, after)
   error("missing row after " .. after .. ": " .. needle, 2)
 end
 
+local function with_captured_commands(callback)
+  local original_cmd = vim.cmd
+  local commands = {}
+  vim.cmd = function(command)
+    commands[#commands + 1] = command
+    return original_cmd(command)
+  end
+  local ok, result = pcall(callback)
+  vim.cmd = original_cmd
+  if not ok then error(result, 2) end
+  return commands
+end
+
 local function trigger(buf, key, row)
   vim.api.nvim_win_set_buf(0, buf)
   if row then vim.api.nvim_win_set_cursor(0, { row, 0 }) end
@@ -173,6 +186,32 @@ local function run()
   vim.api.nvim_exec_autocmds("TextChanged", { buffer = buf })
   assert_true(diff_review._review.state(buf).review_comment_text == "Looks good overall", "summary text not captured")
 
+  -- ── real comment input <C-s> saves and returns to normal mode ──────────────
+  local popup_comment
+  local create_commands = with_captured_commands(function()
+    diff_review._review.open_input("Comment", function(text) popup_comment = text end)
+  end)
+  assert_true(vim.tbl_contains(create_commands, "startinsert"), "new comment popup did not request insert mode")
+  local popup_buf = vim.api.nvim_get_current_buf()
+  vim.api.nvim_buf_set_lines(popup_buf, 0, -1, false, { "Popup comment" })
+  vim.cmd("startinsert")
+  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<C-s>", true, false, true), "x", false)
+  wait_for(function() return popup_comment == "Popup comment" end, "popup <C-s> did not submit the comment")
+  wait_for(function() return vim.fn.mode() == "n" end, "popup <C-s> did not return to normal mode")
+
+  local edited_popup_comment
+  local edit_commands = with_captured_commands(function()
+    diff_review._review.open_input("Edit comment", function(text) edited_popup_comment = text end, "Existing popup comment")
+  end)
+  assert_true(not vim.tbl_contains(edit_commands, "startinsert"), "edit comment popup requested insert mode")
+  popup_buf = vim.api.nvim_get_current_buf()
+  wait_for(function() return vim.fn.mode() == "n" end, "edit comment popup entered insert mode")
+  assert_true(lines(popup_buf)[1] == "Existing popup comment", "edit popup did not prefill the existing comment")
+  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<C-s>", true, false, true), "x", false)
+  wait_for(function() return edited_popup_comment == "Existing popup comment" end, "edit popup <C-s> did not submit")
+  wait_for(function() return vim.fn.mode() == "n" end, "edit popup <C-s> did not keep normal mode")
+  vim.api.nvim_win_set_buf(0, buf)
+
   -- ── C off a changed line is a no-op ────────────────────────────────────────
   local input_called = false
   diff_review._review.input_provider = function(_, _, _) input_called = true end
@@ -200,16 +239,47 @@ local function run()
   local comment_obj = diff_review._review.comment_under_cursor(buf)
   assert_true(comment_obj ~= nil and comment_obj.body == "This rename needs a test", "cursor not recognized as on the comment")
 
-  -- ── C on the comment edits it (input prefilled with existing body) ─────────
+  -- ── C on the comment hides it visually while the edit popup is active ──────
+  diff_review._review.input_provider = nil
+  trigger(buf, "C", find_row(buf, "This rename needs a test"))
+  wait_for(function() return not buffer_contains(buf, "This rename needs a test") end, "comment stayed visible while edit popup was open")
+  local edit_popup_buf = vim.api.nvim_get_current_buf()
+  assert_true(lines(edit_popup_buf)[1] == "This rename needs a test", "real edit popup was not prefilled")
+  assert_true(#diff_review._review.state(buf).review_comments == 1, "editing visually removed the draft from state")
+  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "x", false)
+  wait_for(function() return buffer_contains(buf, "This rename needs a test") end, "comment did not return after canceling edit")
+
+  trigger(buf, "C", find_row(buf, "This rename needs a test"))
+  wait_for(function() return not buffer_contains(buf, "This rename needs a test") end, "comment stayed visible while saving edit")
+  edit_popup_buf = vim.api.nvim_get_current_buf()
+  vim.api.nvim_buf_set_lines(edit_popup_buf, 0, -1, false, { "Edited comment body" })
+  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<C-s>", true, false, true), "x", false)
+  wait_for(function() return buffer_contains(buf, "Edited comment body") end, "comment edit did not apply")
+  assert_true(diff_review._review.state(buf).review_editing_comment == nil, "editing marker was not cleared after save")
+  assert_true(not buffer_contains(buf, "This rename needs a test"), "old comment text still present after edit")
+
+  -- ── C near the comment edits it (input prefilled with existing body) ───────
   local prefill_seen
+  prefill_seen = nil
+  diff_review._review.input_provider = function(_, on_submit, prefill)
+    prefill_seen = prefill
+    on_submit("Edited from above")
+  end
+  trigger(buf, "C", find_row(buf, "NEW src/a.txt"))
+  wait_for(function() return buffer_contains(buf, "Edited from above") end, "C on the line above did not edit the comment")
+  assert_true(prefill_seen == "Edited comment body", "line above edit was not prefilled with existing body")
+  assert_true(#diff_review._review.state(buf).review_comments == 1, "line above comment edit added a duplicate draft")
+
+  prefill_seen = nil
   diff_review._review.input_provider = function(_, on_submit, prefill)
     prefill_seen = prefill
     on_submit("Edited comment body")
   end
-  trigger(buf, "C", find_row(buf, "This rename needs a test"))
-  wait_for(function() return buffer_contains(buf, "Edited comment body") end, "comment edit did not apply")
-  assert_true(prefill_seen == "This rename needs a test", "edit input was not prefilled with the existing body")
-  assert_true(not buffer_contains(buf, "This rename needs a test"), "old comment text still present after edit")
+  trigger(buf, "C", find_row(buf, "Edited from above") + 2)
+  wait_for(function() return buffer_contains(buf, "Edited comment body") end, "C on the line below did not edit the comment")
+  assert_true(prefill_seen == "Edited from above", "line below edit was not prefilled with existing body")
+  assert_true(#diff_review._review.state(buf).review_comments == 1, "line below comment edit added a duplicate draft")
+
   local draft_path = diff_review._review.storage_path(diff_review._review.state(buf))
   assert_true(
     vim.fs.normalize(draft_path):find(vim.fs.normalize(review_data_dir), 1, true) == 1,
