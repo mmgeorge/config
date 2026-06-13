@@ -447,20 +447,22 @@ local function run()
   assert_true(diff_review._review.state(buf).review_editing_comment == nil, "editing marker was not cleared after save")
   assert_true(not buffer_contains(buf, "This rename needs a test"), "old comment text still present after edit")
 
-  -- ── existing comment bodies edit in place like the review summary ──────────
+  -- ── insert-style keys on comment bodies open the same edit popup ───────────
   local direct_edit_row = find_row(buf, "Edited comment body")
   vim.api.nvim_win_set_cursor(0, { direct_edit_row, 0 })
   vim.api.nvim_exec_autocmds("CursorMoved", { buffer = buf })
-  assert_true(vim.bo[buf].modifiable, "inline comment body row must be editable")
-  vim.api.nvim_buf_set_lines(buf, direct_edit_row - 1, direct_edit_row, false, { "Direct edited comment body" })
-  vim.api.nvim_exec_autocmds("TextChanged", { buffer = buf })
-  assert_true(
-    diff_review._review.state(buf).review_comments[1].body == "Direct edited comment body",
-    "inline comment body edit was not captured locally"
-  )
-  vim.api.nvim_exec_autocmds("InsertLeave", { buffer = buf })
-  wait_for(function() return buffer_contains(buf, "Direct edited comment body") end, "inline comment body edit did not re-render")
-  wait_for(function() return #comment_updates >= 2 end, "inline comment body edit did not sync")
+  assert_true(not vim.bo[buf].modifiable, "rendered inline comment body must stay read-only")
+  local shortcut_commands = with_captured_commands(function()
+    trigger(buf, "i", direct_edit_row)
+  end)
+  assert_true(vim.tbl_contains(shortcut_commands, "startinsert"), "inline shortcut edit popup did not enter insert mode")
+  wait_for(function() return not buffer_contains(buf, "Edited comment body") end, "comment stayed visible while shortcut popup was open")
+  edit_popup_buf = vim.api.nvim_get_current_buf()
+  assert_true(lines(edit_popup_buf)[1] == "Edited comment body", "shortcut edit popup was not prefilled")
+  vim.api.nvim_buf_set_lines(edit_popup_buf, 0, -1, false, { "Direct edited comment body" })
+  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<C-s>", true, false, true), "x", false)
+  wait_for(function() return buffer_contains(buf, "Direct edited comment body") end, "shortcut comment edit did not apply")
+  wait_for(function() return #comment_updates >= 2 end, "shortcut comment edit did not sync")
 
   -- ── C near the comment edits it (input prefilled with existing body) ───────
   local prefill_seen

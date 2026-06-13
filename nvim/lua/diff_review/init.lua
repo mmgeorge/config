@@ -6624,7 +6624,7 @@ end
 ---@param row integer 1-based
 ---@return boolean
 function M._review.in_editable_region(buf, row)
-  return M._review.in_comment_region(buf, row) or M._review.comment_body_at_row(buf, row) ~= nil
+  return M._review.in_comment_region(buf, row)
 end
 
 ---Unlock the buffer only while the cursor sits in an editable review region.
@@ -6639,58 +6639,9 @@ function M._review.sync_modifiable(buf)
   end
 end
 
----@param line string
----@return string
-function M._review.comment_body_text_from_line(line)
-  local text = tostring(line or "")
-  text = text:gsub("^%s*│ ?", "", 1)
-  text = text:gsub("%s*│$", "", 1)
-  return text
-end
-
----@param buf integer
----@param opts? { enqueue_inline?: boolean, rerender_inline?: boolean }
-function M._review.sync_inline_comment_text(buf, opts)
-  local state = M._review.state(buf)
-  if not state then return false end
-  opts = opts or {}
-  local changed = false
-  local finalized = false
-  for _, comment in ipairs(state.review_comments or {}) do
-    local start_row0 = M._review.mark_row(buf, comment.review_body_start)
-    local end_row0 = M._review.mark_row(buf, comment.review_body_end)
-    if start_row0 ~= nil and end_row0 ~= nil and end_row0 >= start_row0 then
-      local raw_lines = vim.api.nvim_buf_get_lines(buf, start_row0, end_row0, false)
-      local body_lines = {}
-      for _, line in ipairs(raw_lines) do
-        body_lines[#body_lines + 1] = M._review.comment_body_text_from_line(line)
-      end
-      local body = table.concat(body_lines, "\n")
-      if body ~= tostring(comment.body or "") then
-        comment.body = body
-        comment.local_state = comment.remote_node_id and "dirty" or "new"
-        M._review.normalize_comment(state, comment)
-        comment.review_inline_dirty = true
-        changed = true
-      end
-      if opts.enqueue_inline and comment.review_inline_dirty and vim.trim(comment.body or "") ~= "" then
-        comment.review_inline_dirty = nil
-        M._review.enqueue_sync(buf, "upsert", comment)
-        finalized = true
-      end
-    end
-  end
-  if changed or finalized then
-    M._review.save_draft(state)
-    if opts.rerender_inline and vim.api.nvim_buf_is_valid(buf) then M._review.render(buf) end
-  end
-  return changed or finalized
-end
-
 ---Read edited review text back into the state.
 ---@param buf integer
----@param opts? { enqueue_inline?: boolean, rerender_inline?: boolean }
-function M._review.sync_comment_text(buf, opts)
+function M._review.sync_comment_text(buf)
   local state = M._review.state(buf)
   if not state then return end
   local s0 = M._review.mark_row(buf, state.review_comment_start)
@@ -6703,7 +6654,6 @@ function M._review.sync_comment_text(buf, opts)
       changed = true
     end
   end
-  changed = M._review.sync_inline_comment_text(buf, opts) or changed
   if changed then M._review.save_draft(state) end
 end
 
@@ -6856,7 +6806,8 @@ end
 ---GitHub with the rest when the review is submitted).
 ---@param buf integer
 ---@param comment table
-function M._review.edit_comment(buf, comment)
+---@param opts? { start_insert?: boolean }
+function M._review.edit_comment(buf, comment, opts)
   local edit_state = M._review.state(buf)
   if edit_state then
     edit_state.review_editing_comment = comment
@@ -6884,7 +6835,19 @@ function M._review.edit_comment(buf, comment)
       M._review.enqueue_sync(buf, "upsert", comment)
     end
     finish_edit()
-  end, comment.body, { start_insert = false, on_cancel = finish_edit })
+  end, comment.body, { start_insert = opts and opts.start_insert == true, on_cancel = finish_edit })
+end
+
+---@param buf integer
+---@param key string
+function M._review.comment_body_insert_shortcut(buf, key)
+  local row = vim.api.nvim_win_get_cursor(0)[1]
+  local comment = M._review.comment_body_at_row(buf, row)
+  if comment then
+    M._review.edit_comment(buf, comment, { start_insert = true })
+    return
+  end
+  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(key, true, false, true), "n", false)
 end
 
 ---`C`: on an existing comment, edit it; on a changed diff line, add a draft
@@ -7109,13 +7072,6 @@ function M._review.attach(buf)
     buffer = buf,
     callback = function()
       M._review.sync_comment_text(buf)
-    end,
-  })
-  vim.api.nvim_create_autocmd("InsertLeave", {
-    group = group,
-    buffer = buf,
-    callback = function()
-      M._review.sync_comment_text(buf, { enqueue_inline = true, rerender_inline = true })
     end,
   })
 end
@@ -9106,6 +9062,12 @@ function M._review.setup_keymaps(buf)
   map("next_comment", function() M._review.navigate(buf, 1) end)
   map("prev_comment", function() M._review.navigate(buf, -1) end)
   map("submit", function() M._review.submit(buf) end)
+  for _, key in ipairs({ "i", "I", "a", "A", "o", "O" }) do
+    vim.keymap.set("n", key, function()
+      if M._status_states and M._status_states[buf] then M._status = M._status_states[buf] end
+      M._review.comment_body_insert_shortcut(buf, key)
+    end, { buffer = buf, silent = true, nowait = true, desc = "Edit review comment" })
+  end
 end
 
 ---@class DiffReviewBranchDiffOptions
