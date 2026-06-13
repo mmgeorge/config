@@ -49,3 +49,5 @@ autoSetupRemote = true
 
 [index]
 	version = 4
+[init]
+	defaultBranch = main
