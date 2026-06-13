@@ -475,17 +475,9 @@ local function run()
   trigger_normal_mapping("?", find_row(status_buf, "Head:"))
   local help_buf = vim.api.nvim_get_current_buf()
   assert_true(help_buf ~= status_buf, "help did not open a popup buffer")
-  assert_buffer_contains_all(help_buf, { "<Tab>", "N", "S", "U", "j", "cc", "opP", "opp", "ogp", "ogc", "o", "<CR>", "R", "or", "q", "?" })
+  assert_buffer_contains_all(help_buf, { "<Tab>", "N", "S", "U", "j", "cc", "opP", "opp", "ogp", "o", "<CR>", "R", "or", "q", "?" })
+  assert_true(not buffer_contains(help_buf, "ogc"), "help should not list removed ogc mapping")
   pcall(vim.api.nvim_win_close, 0, true)
-
-  vim.api.nvim_win_set_buf(0, status_buf)
-  assert_true(type(vim.fn.maparg("ogc", "n", false, true).callback) == "function", "ogc current PR mapping missing")
-  local github_open_pr_called = false
-  pcall(vim.api.nvim_create_user_command, "GithubOpenPR", function()
-    github_open_pr_called = true
-  end, {})
-  trigger_normal_mapping("ogc", find_row(status_buf, "Head:"))
-  assert_true(github_open_pr_called, "ogc did not call GithubOpenPR")
 
   vim.api.nvim_win_set_buf(0, status_buf)
   trigger_normal_mapping("ogp", find_row(status_buf, "Head:"))
@@ -495,6 +487,28 @@ local function run()
   pr_mode = "none"
   diff_review.render_status(status_buf, nil, nil, { refresh_pr = true })
   wait_for(function() return buffer_contains(status_buf, "PR:     none") end, "PR row did not render none state")
+
+  local open_pr = require("github.open_pr")
+  local original_open_pr = open_pr.open
+  local create_pr_count = 0
+  open_pr.open = function()
+    create_pr_count = create_pr_count + 1
+  end
+
+  vim.api.nvim_win_set_buf(0, status_buf)
+  trigger_normal_mapping("ogp", find_row(status_buf, "Head:"))
+  local create_prompt_buf = vim.api.nvim_get_current_buf()
+  assert_true(create_prompt_buf ~= status_buf, "ogp with no PR did not open create prompt")
+  assert_true(buffer_contains(create_prompt_buf, "No GitHub PR found for this branch."), "create prompt missing no-PR message")
+  assert_true(buffer_contains(create_prompt_buf, "Create a draft PR now?"), "create prompt missing create question")
+  trigger_normal_mapping("n", 1)
+  assert_true(create_pr_count == 0, "declining create prompt should not create a PR")
+
+  vim.api.nvim_win_set_buf(0, status_buf)
+  trigger_normal_mapping("ogp", find_row(status_buf, "Head:"))
+  trigger_normal_mapping("y", 1)
+  assert_true(create_pr_count == 1, "accepting create prompt should start GithubOpenPR flow")
+  open_pr.open = original_open_pr
 
   reset_notifications()
   local count_before_unavailable = generate_count
@@ -575,7 +589,6 @@ local function run()
         push = "zpP",
         pull = "zpp",
         pr = "zgp",
-        github_open_pr = "zgc",
         help = "zh",
       },
     },
@@ -587,10 +600,10 @@ local function run()
   assert_true(type(vim.fn.maparg("zpP", "n", false, true).callback) == "function", "custom push mapping missing")
   assert_true(type(vim.fn.maparg("zpp", "n", false, true).callback) == "function", "custom pull mapping missing")
   assert_true(type(vim.fn.maparg("zgp", "n", false, true).callback) == "function", "custom PR mapping missing")
-  assert_true(type(vim.fn.maparg("zgc", "n", false, true).callback) == "function", "custom current PR mapping missing")
   trigger_normal_mapping("zh", find_row(override_buf, "Head:"))
   local override_help_buf = vim.api.nvim_get_current_buf()
-  assert_buffer_contains_all(override_help_buf, { "zc", "zpP", "zpp", "zgp", "zgc", "zh" })
+  assert_buffer_contains_all(override_help_buf, { "zc", "zpP", "zpp", "zgp", "zh" })
+  assert_true(not buffer_contains(override_help_buf, "zgc"), "custom help should not list removed current PR mapping")
 
   if vim.api.nvim_win_is_valid(0) then
     pcall(vim.api.nvim_win_close, 0, true)

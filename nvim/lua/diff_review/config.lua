@@ -29,7 +29,6 @@
 ---@field push DiffReviewKeymap
 ---@field pull DiffReviewKeymap
 ---@field pr DiffReviewKeymap
----@field github_open_pr DiffReviewKeymap
 ---@field branch_create DiffReviewKeymap
 ---@field browse DiffReviewKeymap
 ---@field walkthrough DiffReviewKeymap
@@ -44,7 +43,6 @@
 ---@field next_comment DiffReviewKeymap jump to the next comment
 ---@field prev_comment DiffReviewKeymap jump to the previous comment
 ---@field submit DiffReviewKeymap submit the review to GitHub
----@field close DiffReviewKeymap
 
 ---@class DiffReviewKeymapConfig
 ---@field status DiffReviewStatusKeymapConfig
@@ -83,7 +81,6 @@ M.defaults = {
       push = "opp",
       pull = "opP",
       pr = "ogp",
-      github_open_pr = "ogc",
       branch_create = "bc",
       browse = "b",
       walkthrough = "ow",
@@ -98,7 +95,6 @@ M.defaults = {
       next_comment = "y",
       prev_comment = "n",
       submit = "<C-s>",
-      close = "q",
     },
   },
 }

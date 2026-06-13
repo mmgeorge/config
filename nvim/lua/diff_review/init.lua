@@ -3251,30 +3251,37 @@ local status_reconcile_delay_ms = 120
 ---@field label string
 ---@field desc string
 ---@field modes string|string[]
+---@field keymap? "status"|"review"
 ---@field visual? boolean
----@field hint boolean
+---@field pinned boolean
 ---@field views? table<DiffReviewStatusViewKind, boolean>
 
 ---@type DiffReviewStatusCommandSpec[]
 local status_command_specs = {
-  { id = "toggle", label = "toggle", desc = "Toggle fold", modes = "n", hint = true, views = { status = true, pr = true, diff = true } },
-  { id = "collapse_parent", label = "Collapse Parent", desc = "Collapse Parent", modes = "n", hint = true, views = { status = true, pr = true, diff = true } },
-  { id = "stage", label = "stage", desc = "Stage hunk/file/selection", modes = { "n", "x" }, visual = true, hint = true, views = { status = true } },
-  { id = "unstage", label = "unstage", desc = "Unstage hunk/file/selection", modes = { "n", "x" }, visual = true, hint = true, views = { status = true } },
-  { id = "discard", label = "discard", desc = "Discard hunk/file/selection", modes = { "n", "x" }, visual = true, hint = true, views = { status = true } },
-  { id = "commit", label = "commit", desc = "Commit", modes = "n", hint = true, views = { status = true } },
-  { id = "push", label = "push", desc = "Push", modes = "n", hint = true, views = { status = true } },
-  { id = "pull", label = "pull", desc = "Pull", modes = "n", hint = true, views = { status = true } },
-  { id = "pr", label = "pr", desc = "Open pull request", modes = "n", hint = true, views = { status = true } },
-  { id = "github_open_pr", label = "current pr", desc = "Create current branch pull request", modes = "n", hint = false, views = { status = true } },
-  { id = "branch_create", label = "branch", desc = "Create a branch", modes = "n", hint = false, views = { status = true } },
-  { id = "walkthrough", label = "walkthrough", desc = "Review walkthrough", modes = "n", hint = false, views = { status = true } },
-  { id = "review", label = "review", desc = "Start PR review", modes = "n", hint = true, views = { status = true, pr = true } },
-  { id = "browse", label = "browse", desc = "Browse pull request", modes = "n", hint = true, views = { pr = true, review = true } },
-  { id = "open", label = "open", desc = "Open PR/about or jump to file", modes = "n", hint = true },
-  { id = "refresh", label = "refresh", desc = "Refresh DiffReview", modes = "n", hint = true },
-  { id = "close", label = "close", desc = "Close DiffReview", modes = "n", hint = true, views = { status = true, pr = true, diff = true } },
-  { id = "help", label = "help", desc = "Show help", modes = "n", hint = true },
+  { id = "toggle", label = "toggle", desc = "Toggle fold", modes = "n", pinned = true, views = { status = true, pr = true, diff = true } },
+  { id = "collapse_parent", label = "Collapse Parent", desc = "Collapse Parent", modes = "n", pinned = true, views = { status = true, pr = true, diff = true } },
+  { id = "stage", label = "stage", desc = "Stage hunk/file/selection", modes = { "n", "x" }, visual = true, pinned = true, views = { status = true } },
+  { id = "unstage", label = "unstage", desc = "Unstage hunk/file/selection", modes = { "n", "x" }, visual = true, pinned = true, views = { status = true } },
+  { id = "discard", label = "discard", desc = "Discard hunk/file/selection", modes = { "n", "x" }, visual = true, pinned = true, views = { status = true } },
+  { id = "commit", label = "commit", desc = "Commit", modes = "n", pinned = true, views = { status = true } },
+  { id = "push", label = "push", desc = "Push", modes = "n", pinned = true, views = { status = true } },
+  { id = "pull", label = "pull", desc = "Pull", modes = "n", pinned = true, views = { status = true } },
+  { id = "pr", label = "pr", desc = "Open pull request", modes = "n", pinned = true, views = { status = true } },
+  { id = "branch_create", label = "branch", desc = "Create a branch", modes = "n", pinned = false, views = { status = true } },
+  { id = "walkthrough", label = "walkthrough", desc = "Review walkthrough", modes = "n", pinned = false, views = { status = true } },
+  { id = "review", label = "review", desc = "Start PR review", modes = "n", pinned = true, views = { status = true, pr = true } },
+  { id = "browse", label = "browse", desc = "Browse pull request", modes = "n", pinned = true, views = { pr = true, review = true } },
+  { id = "open", label = "open", desc = "Open PR/about or jump to file", modes = "n", pinned = true },
+  { id = "refresh", label = "refresh", desc = "Refresh DiffReview", modes = "n", pinned = true },
+  { id = "close", label = "close", desc = "Close DiffReview", modes = "n", pinned = true },
+  { id = "help", label = "help", desc = "Show help", modes = "n", pinned = true },
+  { id = "viewed", label = "viewed", desc = "Mark file as viewed", modes = "n", keymap = "review", pinned = true, views = { review = true } },
+  { id = "unviewed", label = "unviewed", desc = "Move file back to unviewed", modes = "n", keymap = "review", pinned = true, views = { review = true } },
+  { id = "comment", label = "comment", desc = "Add or edit a draft review comment", modes = { "n", "x" }, keymap = "review", visual = true, pinned = true, views = { review = true } },
+  { id = "delete", label = "delete", desc = "Delete draft comment", modes = "n", keymap = "review", pinned = true, views = { review = true } },
+  { id = "next_comment", label = "next", desc = "Jump to next draft comment", modes = "n", keymap = "review", pinned = true, views = { review = true } },
+  { id = "prev_comment", label = "prev", desc = "Jump to previous draft comment", modes = "n", keymap = "review", pinned = true, views = { review = true } },
+  { id = "submit", label = "submit", desc = "Submit review to GitHub", modes = "n", keymap = "review", pinned = true, views = { review = true } },
 }
 
 M._status_hint_command_ids_by_view = {
@@ -3297,6 +3304,14 @@ M._status_hint_command_ids_by_view = {
     "help",
   },
   review = {
+    "viewed",
+    "unviewed",
+    "comment",
+    "delete",
+    "next_comment",
+    "prev_comment",
+    "submit",
+    "browse",
     "open",
     "close",
     "help",
@@ -3752,7 +3767,9 @@ end
 ---@param command_id string
 ---@return string[]
 local function status_keys_for(command_id)
-  local key = status_keymap_config()[command_id]
+  local spec = status_command_specs_by_id[command_id]
+  local keymaps = spec and spec.keymap == "review" and M._review.keymap_config() or status_keymap_config()
+  local key = keymaps[command_id]
   if key == false or key == nil then return {} end
   if type(key) == "table" then return key end
   return { key }
@@ -3776,39 +3793,10 @@ local function status_add_hint_line()
     { "Hint: ", "DiffReviewStatusHint" },
   }
   local first = true
-  -- The review view's action keys live in `config.keymaps.review`, not the
-  -- shared command specs, so build its hint from there.
-  if view_kind == "review" then
-    local review_pairs = {
-      { "viewed", "viewed" }, { "unviewed", "unviewed" }, { "comment", "comment" },
-      { "delete", "delete" }, { "next_comment", "next" }, { "prev_comment", "prev" },
-      { "submit", "submit" },
-    }
-    for _, entry in ipairs(review_pairs) do
-      local key = M._review.keys_for(entry[1])[1]
-      if key and key ~= "" then
-        if not first then segments[#segments + 1] = { " | ", "DiffReviewStatusHint" } end
-        first = false
-        segments[#segments + 1] = { key, "DiffReviewStatusHintKey" }
-        segments[#segments + 1] = { " " .. entry[2], "DiffReviewStatusHint" }
-      end
-    end
-    for _, spec_id in ipairs({ "browse", "open", "close", "help" }) do
-      local key = status_primary_key(spec_id)
-      if key ~= "" then
-        segments[#segments + 1] = { " | ", "DiffReviewStatusHint" }
-        segments[#segments + 1] = { key, "DiffReviewStatusHintKey" }
-        local spec = status_command_specs_by_id[spec_id]
-        segments[#segments + 1] = { " " .. (spec and spec.label or spec_id), "DiffReviewStatusHint" }
-      end
-    end
-    status_add_segment_line(segments)
-    return
-  end
   local hint_command_ids = M._status_hint_command_ids_by_view[view_kind] or M._status_hint_command_ids_by_view.status
   for _, command_id in ipairs(hint_command_ids) do
     local spec = status_command_specs_by_id[command_id]
-    if spec and spec.hint and status_command_visible(spec) then
+    if spec and spec.pinned and status_command_visible(spec) then
       local key = status_primary_key(spec.id)
       if key ~= "" then
         if not first then
@@ -5573,10 +5561,7 @@ end
 ---@param id string
 ---@return string[]
 function M._review.keys_for(id)
-  local key = M._review.keymap_config()[id]
-  if key == false or key == nil then return {} end
-  if type(key) == "table" then return key end
-  return { key }
+  return status_keys_for(id)
 end
 
 ---@param path string?
@@ -7519,6 +7504,52 @@ function M.open_file_revision(file, rev)
   end)
 end
 
+---@param on_yes fun()
+function M._status_confirm_create_pr(on_yes)
+  local body = {
+    "No GitHub PR found for this branch.",
+    "",
+    "Create a draft PR now?",
+    "",
+    "  [y] yes    [n] no",
+  }
+  local width = 40
+  for _, line in ipairs(body) do
+    width = math.max(width, #line + 4)
+  end
+
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, body)
+  vim.bo[buf].modifiable = false
+  vim.bo[buf].bufhidden = "wipe"
+
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative = "editor",
+    width = width,
+    height = #body,
+    col = math.floor((vim.o.columns - width) / 2),
+    row = math.floor((vim.o.lines - #body) / 2),
+    style = "minimal",
+    border = "rounded",
+    title = " GitStatus ",
+    title_pos = "center",
+  })
+
+  local function close()
+    if vim.api.nvim_win_is_valid(win) then pcall(vim.api.nvim_win_close, win, true) end
+  end
+
+  vim.keymap.set("n", "y", function()
+    close()
+    on_yes()
+  end, { buffer = buf, nowait = true, silent = true, desc = "Create pull request" })
+
+  vim.keymap.set("n", "n", close, { buffer = buf, nowait = true, silent = true, desc = "Cancel pull request creation" })
+  for _, key in ipairs({ "q", "<Esc>" }) do
+    vim.keymap.set("n", key, close, { buffer = buf, nowait = true, silent = true, desc = "Cancel pull request creation" })
+  end
+end
+
 ---@param entry DiffReviewStatusEntry?
 local function status_open_pr(entry)
   local pr = entry and entry.pr
@@ -7526,9 +7557,22 @@ local function status_open_pr(entry)
     pr = M._status.pr.pr
   end
   if not pr then
-    local state = M._status and M._status.pr and M._status.pr.state
-    local message = state == "fetching" and "GitHub PR is still loading" or "No GitHub PR for this branch"
-    vim.notify(message, vim.log.levels.INFO, { title = "DiffReview" })
+    local pr_state = M._status and M._status.pr
+    if pr_state and pr_state.state == "fetching" then
+      vim.notify("GitHub PR is still loading", vim.log.levels.INFO, { title = "DiffReview" })
+      return
+    end
+    if pr_state and pr_state.state == "error" then
+      notify_error("GitHub PR lookup failed: " .. (pr_state.message or "Unable to fetch GitHub pull request"), "DiffReview")
+      return
+    end
+    if pr_state and pr_state.state == "unavailable" then
+      vim.notify(pr_state.message or "GitHub PR lookup is unavailable", vim.log.levels.INFO, { title = "DiffReview" })
+      return
+    end
+    M._status_confirm_create_pr(function()
+      require("github.open_pr").open()
+    end)
     return
   end
   M.open_pr(pr, { cwd = M._status and M._status.cwd or nil })
@@ -7985,10 +8029,6 @@ local function setup_status_keymaps(buf)
     status_open_pr(status_entry_under_cursor())
   end)
 
-  map("github_open_pr", "n", function()
-    vim.cmd.GithubOpenPR()
-  end)
-
   map("branch_create", "n", function()
     M._create_branch(buf)
   end)
@@ -8194,21 +8234,23 @@ end
 
 ---@param buf integer
 function M._review.setup_keymaps(buf)
-  local function map(id, modes, fn)
-    for _, key in ipairs(M._review.keys_for(id)) do
-      vim.keymap.set(modes, key, function()
+  local function map(id, fn)
+    local spec = status_command_specs_by_id[id]
+    if not (spec and status_command_visible(spec)) then return end
+    for _, key in ipairs(status_keys_for(id)) do
+      vim.keymap.set(spec.modes, key, function()
         if M._status_states and M._status_states[buf] then M._status = M._status_states[buf] end
         fn()
-      end, { buffer = buf, silent = true, nowait = true })
+      end, { buffer = buf, silent = true, nowait = true, desc = spec.desc })
     end
   end
-  map("viewed", "n", function() M._review.toggle_viewed(buf, true) end)
-  map("unviewed", "n", function() M._review.toggle_viewed(buf, false) end)
-  map("comment", { "n", "x" }, function() M._review.add_comment(buf) end)
-  map("delete", "n", function() M._review.delete_comment(buf) end)
-  map("next_comment", "n", function() M._review.navigate(buf, 1) end)
-  map("prev_comment", "n", function() M._review.navigate(buf, -1) end)
-  map("submit", "n", function() M._review.submit(buf) end)
+  map("viewed", function() M._review.toggle_viewed(buf, true) end)
+  map("unviewed", function() M._review.toggle_viewed(buf, false) end)
+  map("comment", function() M._review.add_comment(buf) end)
+  map("delete", function() M._review.delete_comment(buf) end)
+  map("next_comment", function() M._review.navigate(buf, 1) end)
+  map("prev_comment", function() M._review.navigate(buf, -1) end)
+  map("submit", function() M._review.submit(buf) end)
 end
 
 ---@class DiffReviewBranchDiffOptions

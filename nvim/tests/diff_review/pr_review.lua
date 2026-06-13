@@ -165,9 +165,37 @@ local function run()
   assert_true(buffer_contains(buf, "Unviewed Changes (2)"), "unviewed section missing both files")
   assert_true(buffer_contains(buf, "Viewed Changes (0)"), "viewed section missing")
   local hint = lines(buf)[1]
-  for _, token in ipairs({ "S viewed", "U unviewed", "C comment", "J delete", "y next", "<C-s> submit", "b browse" }) do
+  for _, token in ipairs({ "S viewed", "U unviewed", "C comment", "J delete", "y next", "<C-s> submit", "b browse", "q close", "? help" }) do
     assert_true(hint:find(token, 1, true) ~= nil, "hint missing " .. token .. ": " .. hint)
   end
+
+  -- ── ? is generated from the same command model as the Hint line ───────────
+  trigger(buf, "?")
+  local help_buf = vim.api.nvim_get_current_buf()
+  local function help_has(key, desc)
+    for _, line in ipairs(lines(help_buf)) do
+      if line:find(key, 1, true) and line:find(desc, 1, true) then return true end
+    end
+    return false
+  end
+  for _, command in ipairs({
+    { "S", "Mark file as viewed" },
+    { "U", "Move file back to unviewed" },
+    { "C", "Add or edit a draft review comment" },
+    { "J", "Delete draft comment" },
+    { "y", "Jump to next draft comment" },
+    { "n", "Jump to previous draft comment" },
+    { "<C-s>", "Submit review to GitHub" },
+    { "b", "Browse pull request" },
+    { "o, <CR>", "Open PR/about or jump to file" },
+    { "R", "Refresh DiffReview" },
+    { "q", "Close DiffReview" },
+    { "?", "Show help" },
+  }) do
+    assert_true(help_has(command[1], command[2]), "help missing " .. command[1] .. " " .. command[2])
+  end
+  pcall(vim.api.nvim_win_close, 0, true)
+  vim.api.nvim_set_current_buf(buf)
 
   -- ── S/U move a file between sections ───────────────────────────────────────
   trigger(buf, "S", find_row(buf, "src/a.txt +1 -1"))
