@@ -3361,12 +3361,28 @@ local function attach_status_state(buf, state)
       local current = M._status_states and M._status_states[buf] or nil
       if current then M._status = current end
       M._hide_line_numbers(vim.api.nvim_get_current_win())
+      M._status_apply_hint_bar(buf, vim.api.nvim_get_current_win())
+    end,
+  })
+  vim.api.nvim_create_autocmd("BufWinEnter", {
+    buffer = buf,
+    callback = function()
+      local current = M._status_states and M._status_states[buf] or nil
+      if current then M._status = current end
+      M._status_apply_hint_bar(buf, vim.api.nvim_get_current_win())
     end,
   })
   vim.api.nvim_create_autocmd("BufLeave", {
     buffer = buf,
     callback = function()
       M._restore_line_numbers(vim.api.nvim_get_current_win())
+      M._status_clear_hint_bar(vim.api.nvim_get_current_win())
+    end,
+  })
+  vim.api.nvim_create_autocmd("BufWinLeave", {
+    buffer = buf,
+    callback = function()
+      M._status_clear_hint_bar(vim.api.nvim_get_current_win())
     end,
   })
   vim.api.nvim_create_autocmd("BufWipeout", {
@@ -3761,6 +3777,13 @@ end
 ---@return boolean
 local function status_command_visible(spec)
   local view_kind = M._status and M._status.view_kind or "status"
+  return M._status_command_visible_for_view(spec, view_kind)
+end
+
+---@param spec DiffReviewStatusCommandSpec
+---@param view_kind DiffReviewStatusViewKind
+---@return boolean
+function M._status_command_visible_for_view(spec, view_kind)
   return not spec.views or spec.views[view_kind] == true
 end
 
@@ -3787,16 +3810,16 @@ local function status_key_text(keys)
   return table.concat(keys, ", ")
 end
 
-local function status_add_hint_line()
-  local view_kind = M._status and M._status.view_kind or "status"
-  local segments = {
-    { "Hint: ", "DiffReviewStatusHint" },
-  }
+---@param state? table
+---@return table[]
+function M._status_hint_segments(state)
+  local view_kind = state and state.view_kind or (M._status and M._status.view_kind) or "status"
+  local segments = {}
   local first = true
   local hint_command_ids = M._status_hint_command_ids_by_view[view_kind] or M._status_hint_command_ids_by_view.status
   for _, command_id in ipairs(hint_command_ids) do
     local spec = status_command_specs_by_id[command_id]
-    if spec and spec.pinned and status_command_visible(spec) then
+    if spec and spec.pinned and M._status_command_visible_for_view(spec, view_kind) then
       local key = status_primary_key(spec.id)
       if key ~= "" then
         if not first then
@@ -3808,7 +3831,72 @@ local function status_add_hint_line()
       end
     end
   end
-  status_add_segment_line(segments)
+  return segments
+end
+
+---@param state table
+---@return string
+function M._status_hint_title(state)
+  local view_kind = state.view_kind or "status"
+  local options = M.config or config.options or config.defaults
+  if view_kind == "pr" then
+    local number = state.pr and state.pr.number
+    return number and ("PR #" .. tostring(number)) or options.pr_buffer_name
+  end
+  if view_kind == "review" then
+    local number = state.pr and state.pr.number
+    return number and ("Review #" .. tostring(number)) or "Review"
+  end
+  if view_kind == "diff" then
+    return state.diff_file and "GitBranchDiffFile" or "GitBranchDiff"
+  end
+  return options.status_buffer_name or config.defaults.status_buffer_name or "GitStatus"
+end
+
+---@param segments table[]
+---@param title string
+---@return string
+function M._status_hint_winbar(segments, title)
+  local parts = { ("%%#DiffReviewStatusLabel#%s%%*"):format(tostring(title or ""):gsub("%%", "%%%%")) }
+  if #segments > 0 then
+    parts[#parts + 1] = "%="
+  end
+  for _, segment in ipairs(segments) do
+    local text = tostring(segment[1] or ""):gsub("%%", "%%%%")
+    local highlight = segment[2]
+    if highlight and text ~= "" then
+      parts[#parts + 1] = ("%%#%s#%s%%*"):format(highlight, text)
+    else
+      parts[#parts + 1] = text
+    end
+  end
+  return table.concat(parts)
+end
+
+---@param buf integer
+---@param win? integer
+function M._status_apply_hint_bar(buf, win)
+  local state = M._status_states and M._status_states[buf] or (M._status and M._status.buf == buf and M._status) or nil
+  if not state then return end
+  local winbar = M._status_hint_winbar(M._status_hint_segments(state), M._status_hint_title(state))
+  if win then
+    if vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == buf then
+      vim.wo[win].winbar = winbar
+    end
+    return
+  end
+  for _, status_win in ipairs(vim.fn.win_findbuf(buf)) do
+    if vim.api.nvim_win_is_valid(status_win) then
+      vim.wo[status_win].winbar = winbar
+    end
+  end
+end
+
+---@param win integer
+function M._status_clear_hint_bar(win)
+  if vim.api.nvim_win_is_valid(win) then
+    vim.wo[win].winbar = ""
+  end
 end
 
 local function status_add_fancy_row(row, entry, indent)
@@ -5177,6 +5265,7 @@ local function status_set_plain_lines(buf, lines)
   vim.api.nvim_buf_clear_namespace(buf, M._status_ns, 0, -1)
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
   vim.bo[buf].modifiable = false
+  M._status_apply_hint_bar(buf)
 end
 
 ---@param buf integer
@@ -5198,8 +5287,6 @@ local function status_render_loaded(buf, target_id, fallback_line, opts, head_li
   M._status.extmarks = {}
   M._status.boundary_lines = {}
 
-  status_add_hint_line()
-  status_add_line("")
   for _, head_line in ipairs(head_lines) do
     if head_line.segments then
       status_add_segment_line(head_line.segments, head_line.entry)
@@ -5243,6 +5330,7 @@ local function status_render_loaded(buf, target_id, fallback_line, opts, head_li
     pcall(vim.api.nvim_buf_set_extmark, buf, M._status_ns, extmark.line - 1, extmark.col, opts)
   end
 
+  M._status_apply_hint_bar(buf)
   status_restore_cursor(buf, target_id, fallback_line)
 
   -- Re-apply walkthrough decorations after rows shift; package.loaded guard

@@ -85,6 +85,10 @@ local function lines(buf)
   return vim.api.nvim_buf_get_lines(buf, 0, -1, false)
 end
 
+local function plain_winbar()
+  return (vim.wo.winbar or ""):gsub("%%#[^#]+#", ""):gsub("%%%*", ""):gsub("%%=", " "):gsub("%%%%", "%%")
+end
+
 local function buffer_contains(buf, needle)
   for _, line in ipairs(lines(buf)) do
     if line:find(needle, 1, true) then return true end
@@ -164,10 +168,12 @@ local function run()
   assert_true(buffer_contains(buf, "Review Comment:"), "review comment label missing")
   assert_true(buffer_contains(buf, "Unviewed Changes (2)"), "unviewed section missing both files")
   assert_true(buffer_contains(buf, "Viewed Changes (0)"), "viewed section missing")
-  local hint = lines(buf)[1]
+  local hint = plain_winbar()
+  assert_true(hint:find("Review #12", 1, true) ~= nil, "hint missing review title: " .. hint)
   for _, token in ipairs({ "S viewed", "U unviewed", "C comment", "J delete", "y next", "<C-s> submit", "b browse", "q close", "? help" }) do
     assert_true(hint:find(token, 1, true) ~= nil, "hint missing " .. token .. ": " .. hint)
   end
+  assert_true(not buffer_contains(buf, "Hint:"), "hint should be a sticky winbar, not buffer text")
 
   -- ── ? is generated from the same command model as the Hint line ───────────
   trigger(buf, "?")

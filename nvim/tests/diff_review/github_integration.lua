@@ -301,6 +301,10 @@ local function status_lines(buf)
   return vim.api.nvim_buf_get_lines(buf, 0, -1, false)
 end
 
+local function plain_winbar()
+  return (vim.wo.winbar or ""):gsub("%%#[^#]+#", ""):gsub("%%%*", ""):gsub("%%=", " "):gsub("%%%%", "%%")
+end
+
 local function buffer_contains(buf, needle)
   for _, line in ipairs(status_lines(buf)) do
     if line:find(needle, 1, true) then return true end
@@ -452,9 +456,11 @@ local function run()
   local pr_buf = vim.api.nvim_get_current_buf()
   assert_true(pr_buf ~= status_buf, "PRView did not open a new buffer")
   assert_true(vim.bo[pr_buf].filetype == "GitStatus", "PRView is not a GitStatus buffer")
-  assert_true(buffer_contains(pr_buf, "Hint:"), "PRView missing hint")
-  assert_true(buffer_contains(pr_buf, "b browse"), "PRView missing browse hint")
-  assert_true(buffer_contains(pr_buf, "q close"), "PRView missing close hint")
+  local pr_hint = plain_winbar()
+  assert_true(pr_hint:find("PR #42", 1, true) ~= nil, "PRView missing title: " .. pr_hint)
+  assert_true(pr_hint:find("b browse", 1, true) ~= nil, "PRView missing browse hint: " .. pr_hint)
+  assert_true(pr_hint:find("q close", 1, true) ~= nil, "PRView missing close hint: " .. pr_hint)
+  assert_true(not buffer_contains(pr_buf, "Hint:"), "PRView hint should be a sticky winbar, not buffer text")
   assert_true(buffer_contains(pr_buf, "Title:  Improve DiffReview"), "PRView missing title")
   assert_true(buffer_contains(pr_buf, "Description:"), "PRView missing description heading")
   assert_true(buffer_contains(pr_buf, "- status row"), "PRView missing markdown body")

@@ -360,6 +360,10 @@ local function status_lines(buf)
   return vim.api.nvim_buf_get_lines(buf, 0, -1, false)
 end
 
+local function plain_winbar()
+  return (vim.wo.winbar or ""):gsub("%%#[^#]+#", ""):gsub("%%%*", ""):gsub("%%=", " "):gsub("%%%%", "%%")
+end
+
 local function buffer_contains(buf, needle)
   for _, line in ipairs(status_lines(buf)) do
     if line:find(needle, 1, true) then return true end
@@ -631,14 +635,22 @@ local function run()
 
   reset_state({ modified = { ["mod.txt"] = true } })
   render_and_wait(buf, "mod.txt +1 -1")
+  local status_hint = plain_winbar()
   assert_true(
-    buffer_contains(buf, "Hint: S stage | U unstage | j discard | cc commit | o open | R refresh | q close | ? help"),
-    "status hint row did not use the compact binding list\n" .. table.concat(status_lines(buf), "\n")
+    status_hint:find("GitStatus", 1, true) ~= nil,
+    "status hint winbar did not include the buffer name\n" .. status_hint
   )
   assert_true(
-    not buffer_contains(buf, "opp push") and not buffer_contains(buf, "opP pull") and not buffer_contains(buf, "ogp pr"),
-    "status hint row included non-compact bindings\n" .. table.concat(status_lines(buf), "\n")
+    status_hint:find("S stage | U unstage | j discard | cc commit | o open | R refresh | q close | ? help", 1, true) ~= nil,
+    "status hint winbar did not use the compact binding list\n" .. status_hint
   )
+  assert_true(
+    status_hint:find("opp push", 1, true) == nil and status_hint:find("opP pull", 1, true) == nil and status_hint:find("ogp pr", 1, true) == nil,
+    "status hint winbar included non-compact bindings\n" .. status_hint
+  )
+  assert_true(not buffer_contains(buf, "Hint:"), "status hint should be a sticky winbar, not buffer text")
+  vim.api.nvim_win_set_cursor(0, { vim.api.nvim_buf_line_count(buf), 0 })
+  assert_true(plain_winbar() == status_hint, "status hint winbar changed after scrolling")
   local original_compute_diff_syntax_async = diff_review.compute_diff_syntax_async
   local prewarm_count = 0
   diff_review.compute_diff_syntax_async = function(_, _, cb)
