@@ -217,19 +217,6 @@ local function row_after(buf, needle, after)
   error("missing row after " .. after .. ": " .. needle, 2)
 end
 
-local function with_captured_commands(callback)
-  local original_cmd = vim.cmd
-  local commands = {}
-  vim.cmd = function(command)
-    commands[#commands + 1] = command
-    return original_cmd(command)
-  end
-  local ok, result = pcall(callback)
-  vim.cmd = original_cmd
-  if not ok then error(result, 2) end
-  return commands
-end
-
 local function start_command_capture()
   local original_cmd = vim.cmd
   local commands = {}
@@ -516,32 +503,54 @@ local function run()
 
   local body_line = lines(buf)[comment_body_row]
   assert_true(body_line:find("│", 1, true) == nil, "inline comment body border must be virtual, not selectable text")
+  assert_true(body_end_col == #body_line, "inline comment body must allow cursor one column after the final character")
   vim.api.nvim_win_set_cursor(0, { comment_body_row, #body_line })
   vim.api.nvim_exec_autocmds("CursorMoved", { buffer = buf })
   clamped_cursor = vim.api.nvim_win_get_cursor(0)
   assert_true(clamped_cursor[1] == comment_body_row, "cursor left comment body while clamping padding")
   assert_true(clamped_cursor[2] == body_end_col, "cursor stayed beyond inline comment text")
 
-  -- ── C on the comment hides it visually while the edit popup is active ──────
+  local empty_state = diff_review._review.state(buf)
+  local empty_original_body = empty_state.review_comments[1].body
+  empty_state.review_comments[1].body = ""
+  diff_review._review.render(buf)
+  comment_header_row = find_row(buf, " L2 ")
+  local empty_start_row, empty_end_row = diff_review._review.comment_body_rows(buf, empty_state.review_comments[1])
+  assert_true(empty_start_row == empty_end_row, "empty inline comment should render one editable body row")
+  local empty_body_line = lines(buf)[empty_start_row]
+  local empty_start_col, empty_end_col = diff_review._review.comment_body_text_bounds(empty_body_line)
+  assert_true(empty_body_line:find("│", 1, true) == nil, "empty inline comment border must be virtual")
+  assert_true(empty_start_col > 0, "empty inline comment text cell started on the virtual border")
+  assert_true(empty_start_col == empty_end_col, "empty inline comment bounds should collapse to the text cell")
+  vim.api.nvim_win_set_cursor(0, { empty_start_row, 0 })
+  vim.api.nvim_exec_autocmds("CursorMoved", { buffer = buf })
+  clamped_cursor = vim.api.nvim_win_get_cursor(0)
+  assert_true(clamped_cursor[1] == empty_start_row, "empty inline comment cursor left the body row")
+  assert_true(clamped_cursor[2] == empty_start_col, "empty inline comment cursor stayed on the virtual border")
+  empty_state.review_comments[1].body = empty_original_body
+  diff_review._review.render(buf)
+  comment_header_row = find_row(buf, " L2 ")
+  comment_body_row = find_row(buf, "This rename needs a test")
+
+  -- ── C on an existing comment focuses inline text instead of opening popup ──
   diff_review._review.input_provider = nil
-  trigger(buf, "C", find_row(buf, "This rename needs a test"))
-  wait_for(function() return not buffer_contains(buf, "This rename needs a test") end, "comment stayed visible while edit popup was open")
-  local edit_popup_buf = vim.api.nvim_get_current_buf()
-  assert_true(lines(edit_popup_buf)[1] == "This rename needs a test", "real edit popup was not prefilled")
-  assert_true(#diff_review._review.state(buf).review_comments == 1, "editing visually removed the draft from state")
-  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<C-q>", true, false, true), "x", false)
-  wait_for(function() return buffer_contains(buf, "This rename needs a test") end, "comment did not return after canceling edit")
+  trigger(buf, "C", comment_header_row)
+  wait_for(function() return vim.api.nvim_get_current_buf() == buf end, "C on comment opened a popup buffer")
+  assert_true(buffer_contains(buf, "This rename needs a test"), "C on comment hid inline comment text")
+  local focused_cursor = vim.api.nvim_win_get_cursor(0)
+  assert_true(focused_cursor[1] == comment_body_row, "C on comment did not focus the inline body")
 
-  trigger(buf, "C", find_row(buf, "This rename needs a test"))
-  wait_for(function() return not buffer_contains(buf, "This rename needs a test") end, "comment stayed visible while saving edit")
-  edit_popup_buf = vim.api.nvim_get_current_buf()
-  vim.api.nvim_buf_set_lines(edit_popup_buf, 0, -1, false, { "Edited comment body" })
-  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<C-s>", true, false, true), "x", false)
-  wait_for(function() return buffer_contains(buf, "Edited comment body") end, "comment edit did not apply")
-  assert_true(diff_review._review.state(buf).review_editing_comment == nil, "editing marker was not cleared after save")
-  assert_true(not buffer_contains(buf, "This rename needs a test"), "old comment text still present after edit")
+  vim.api.nvim_buf_set_lines(buf, comment_body_row - 1, comment_body_row, false, { "Edited comment body" })
+  vim.api.nvim_exec_autocmds("TextChanged", { buffer = buf })
+  wait_for(function()
+    return diff_review._review.state(buf).review_comments[1].body == "Edited comment body"
+  end, "inline comment edit did not update local state")
+  wait_for(function() return #comment_updates >= 1 end, "inline comment edit did not sync")
+  assert_true(vim.api.nvim_get_current_buf() == buf, "inline comment edit switched buffers")
+  assert_true(buffer_contains(buf, "Edited comment body"), "inline comment edit changed state but not visible text")
+  assert_true(not buffer_contains(buf, "This rename needs a test"), "old comment text still present after inline edit")
 
-  -- ── visual deletion must not type the popup's insert-mode fallback key ─────
+  -- ── visual deletion edits inline without opening a popup ───────────────────
   local deletion_state = diff_review._review.state(buf)
   local deletion_original_body = deletion_state.review_comments[1].body
   deletion_state.review_comments[1].body = "This is not the correct that, This is not the correct answer"
@@ -555,71 +564,178 @@ local function run()
   vim.api.nvim_buf_set_lines(buf, deletion_row - 1, deletion_row, false, { deletion_edited_line })
   vim.api.nvim_win_set_cursor(0, { deletion_row, deletion_edited_line:find("the correct", 1, true) - 1 })
   vim.api.nvim_exec_autocmds("TextChanged", { buffer = buf })
-  wait_for(function() return vim.api.nvim_get_current_buf() ~= buf end, "delete edit popup did not receive focus")
-  edit_popup_buf = vim.api.nvim_get_current_buf()
-  wait_for(function() return lines(edit_popup_buf)[1] == deletion_expected_text end, "delete edit popup text was not the edited comment")
+  wait_for(function() return deletion_state.review_comments[1].body == deletion_expected_text end, "visual deletion did not update inline body")
   vim.wait(40, function() return false end, 10)
-  assert_true(lines(edit_popup_buf)[1] == deletion_expected_text, "delete edit popup inserted an extra character")
+  assert_true(vim.api.nvim_get_current_buf() == buf, "visual deletion opened an edit popup")
   assert_true(
-    vim.api.nvim_win_get_cursor(0)[2] == deletion_expected_text:find("the correct", 1, true) - 1,
-    "delete edit popup cursor did not stay before the following word"
+    diff_review._review.comment_body_text_from_line(lines(buf)[deletion_row]) == deletion_expected_text,
+    "visual deletion inserted an extra character: " .. tostring(lines(buf)[deletion_row])
   )
-  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<C-q>", true, false, true), "x", false)
-  wait_for(function() return vim.api.nvim_get_current_buf() == buf end, "delete edit popup did not cancel")
+  assert_true(
+    vim.api.nvim_win_get_cursor(0)[2]
+      == diff_review._review.comment_body_text_bounds(lines(buf)[deletion_row])
+        + deletion_expected_text:find("the correct", 1, true) - 1,
+    "visual deletion cursor did not stay before the following word"
+  )
   deletion_state.review_comments[1].body = deletion_original_body
   diff_review._review.render(buf)
 
-  -- ── native edits on comment bodies open the same edit popup ────────────────
+  -- ── native edits on comment bodies update state and sync in place ──────────
   local direct_edit_row = find_row(buf, "Edited comment body")
   vim.api.nvim_win_set_cursor(0, { direct_edit_row, 0 })
   vim.api.nvim_exec_autocmds("CursorMoved", { buffer = buf })
   assert_true(vim.bo[buf].modifiable, "rendered inline comment body must become editable on hover")
   vim.api.nvim_buf_set_lines(buf, direct_edit_row - 1, direct_edit_row, false, { "Direct edited comment body" })
   vim.api.nvim_win_set_cursor(0, { direct_edit_row, 7 })
-  local inline_commands, restore_inline_commands = start_command_capture()
   vim.api.nvim_exec_autocmds("TextChanged", { buffer = buf })
-  wait_for(function() return vim.api.nvim_get_current_buf() ~= buf end, "inline edit popup did not receive focus")
-  wait_for(function() return vim.tbl_contains(inline_commands, "startinsert") end, "inline edit popup did not request insert mode")
-  restore_inline_commands()
-  wait_for(function() return not buffer_contains(buf, "Edited comment body") end, "comment stayed visible while shortcut popup was open")
-  edit_popup_buf = vim.api.nvim_get_current_buf()
-  assert_true(lines(edit_popup_buf)[1] == "Direct edited comment body", "inline edit popup was not prefilled with edited text")
-  assert_true(vim.api.nvim_win_get_cursor(0)[2] == 7, "inline edit popup cursor did not preserve the edited position")
-  assert_true(
-    diff_review._review.state(buf).review_comments[1].body == "Edited comment body",
-    "inline edit must not save until popup submit"
-  )
-  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<C-s>", true, false, true), "x", false)
-  wait_for(function() return buffer_contains(buf, "Direct edited comment body") end, "shortcut comment edit did not apply")
+  wait_for(function()
+    return diff_review._review.state(buf).review_comments[1].body == "Direct edited comment body"
+  end, "inline edit did not save immediately")
+  assert_true(vim.api.nvim_get_current_buf() == buf, "inline edit opened a popup")
+  assert_true(vim.api.nvim_win_get_cursor(0)[2] == 7, "inline edit did not preserve the edited position")
   wait_for(function() return #comment_updates >= 2 end, "shortcut comment edit did not sync")
 
-  local visual_change_mapping = vim.api.nvim_buf_call(buf, function()
-    return vim.fn.maparg("c", "x", false, true)
+  local normal_change_mapping = vim.api.nvim_buf_call(buf, function()
+    return vim.fn.maparg("C", "n", false, true)
   end)
-  assert_true(visual_change_mapping.desc ~= "Edit review comment", "visual c must not be a plugin edit-intent mapping")
+  assert_true(normal_change_mapping.desc == "Add or edit a draft review comment", "expected review comment mapping for C")
+  assert_true(diff_review._review.should_passthrough_comment_key(buf), "C must pass through on inline comment body")
   local second_edit_row = find_row(buf, "Direct edited comment body")
   vim.api.nvim_win_set_cursor(0, { second_edit_row, 0 })
   vim.api.nvim_exec_autocmds("CursorMoved", { buffer = buf })
   vim.api.nvim_buf_set_lines(buf, second_edit_row - 1, second_edit_row, false, { "Visual changed comment body" })
   vim.api.nvim_win_set_cursor(0, { second_edit_row, 6 })
-  local second_inline_commands, restore_second_inline_commands = start_command_capture()
   vim.api.nvim_exec_autocmds("TextChanged", { buffer = buf })
-  wait_for(function() return vim.api.nvim_get_current_buf() ~= buf end, "second inline edit popup did not receive focus")
-  wait_for(function() return vim.tbl_contains(second_inline_commands, "startinsert") end, "second inline edit popup did not request insert mode")
-  restore_second_inline_commands()
-  wait_for(function() return not buffer_contains(buf, "Direct edited comment body") end, "comment stayed visible during visual edit popup")
-  edit_popup_buf = vim.api.nvim_get_current_buf()
-  assert_true(lines(edit_popup_buf)[1] == "Visual changed comment body", "second inline edit popup was not prefilled")
-  assert_true(vim.api.nvim_win_get_cursor(0)[2] == 6, "second inline edit popup cursor did not preserve the edited position")
-  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<C-s>", true, false, true), "x", false)
-  wait_for(function() return buffer_contains(buf, "Visual changed comment body") end, "visual change comment edit did not apply")
+  wait_for(function()
+    return diff_review._review.state(buf).review_comments[1].body == "Visual changed comment body"
+  end, "second inline edit did not save immediately")
+  assert_true(vim.api.nvim_get_current_buf() == buf, "second inline edit opened a popup")
+  assert_true(vim.api.nvim_win_get_cursor(0)[2] == 6, "second inline edit did not preserve the edited position")
   wait_for(function() return #comment_updates >= 3 end, "visual change comment edit did not sync")
+
+  assert_true(
+    diff_review._review.comment_body_text_from_line("  Alpha ") == "Alpha ",
+    "inline comment body readback must preserve user-entered trailing spaces"
+  )
+  assert_true(
+    diff_review._review.comment_body_text_from_line("  Alpha     │") == "Alpha",
+    "legacy bordered inline comment readback must still trim border padding"
+  )
+  local space_state = diff_review._review.state(buf)
+  space_state.review_comments[1].body = "AlphaBeta"
+  diff_review._review.render(buf)
+  local space_row = find_row(buf, "AlphaBeta")
+  local space_line = lines(buf)[space_row]
+  local space_start_col = diff_review._review.comment_body_text_bounds(space_line)
+  local prefix = space_line:sub(1, space_start_col)
+  vim.api.nvim_win_set_cursor(0, { space_row, space_start_col + #"Alpha" })
+  vim.api.nvim_exec_autocmds("CursorMoved", { buffer = buf })
+  vim.api.nvim_buf_set_lines(buf, space_row - 1, space_row, false, { prefix .. "Alpha " })
+  vim.api.nvim_exec_autocmds("TextChangedI", { buffer = buf })
+  assert_true(
+    vim.wait(3000, function()
+      return diff_review._review.state(buf).review_comments[1].body == "Alpha "
+    end, 10),
+    "trailing space inserted in inline comment was not preserved; body="
+      .. tostring(diff_review._review.state(buf).review_comments[1].body)
+      .. " line="
+      .. tostring(lines(buf)[space_row])
+      .. " cursor="
+      .. vim.inspect(vim.api.nvim_win_get_cursor(0))
+  )
+  local spaced_body_row = find_row(buf, "Alpha")
+  local spaced_body_line = lines(buf)[spaced_body_row]
+  assert_true(
+    diff_review._review.comment_body_text_from_line(spaced_body_line) == "Alpha ",
+    "trailing space inserted in inline comment was stripped or moved: " .. tostring(spaced_body_line)
+  )
+  vim.api.nvim_buf_set_lines(buf, spaced_body_row - 1, spaced_body_row, false, { prefix .. "Alpha B" })
+  vim.api.nvim_win_set_cursor(0, { spaced_body_row, space_start_col + #"Alpha B" })
+  vim.api.nvim_exec_autocmds("TextChangedI", { buffer = buf })
+  wait_for(function()
+    return diff_review._review.state(buf).review_comments[1].body == "Alpha B"
+  end, "typing after a preserved inline comment space did not keep the separator")
+  space_state.review_comments[1].body = "Visual changed comment body"
+  diff_review._review.render(buf)
+
+  local open_line_row = find_row(buf, "Visual changed comment body")
+  local has_buffer_open_above_map = false
+  for _, keymap in ipairs(vim.api.nvim_buf_get_keymap(buf, "n")) do
+    if keymap.lhs == "O" then has_buffer_open_above_map = true end
+  end
+  assert_true(not has_buffer_open_above_map, "review must not hard-code an O mapping for inline comments")
+  trigger(buf, "o", open_line_row)
+  assert_true(
+    vim.wait(3000, function()
+      local cursor = vim.api.nvim_win_get_cursor(0)
+      return cursor[1] == open_line_row + 1
+    end, 10),
+    "o did not pass through to native insert-line-below behavior"
+  )
+  local opened_cursor = vim.api.nvim_win_get_cursor(0)
+  local opened_line = lines(buf)[opened_cursor[1]]
+  local opened_start_col = diff_review._review.comment_body_text_bounds(opened_line)
+  assert_true(opened_cursor[1] == open_line_row + 1, "o did not create a line below the inline comment row")
+  assert_true(opened_cursor[2] == opened_start_col, "o did not place the cursor in the editable comment text cell")
+  assert_true(
+    (lines(buf)[opened_cursor[1] - 1] or ""):find("Visual changed comment body", 1, true) ~= nil,
+    "o did not leave the original comment text above"
+  )
+  vim.api.nvim_buf_set_lines(
+    buf,
+    opened_cursor[1] - 1,
+    opened_cursor[1],
+    false,
+    { (" "):rep(opened_start_col) .. "Inserted below" }
+  )
+  vim.api.nvim_win_set_cursor(0, { opened_cursor[1], opened_start_col + #"Inserted below" })
+  vim.api.nvim_exec_autocmds("TextChangedI", { buffer = buf })
+  local expected_open_line_body = "Visual changed comment body\nInserted below"
+  assert_true(
+    vim.wait(3000, function()
+      return diff_review._review.state(buf).review_comments[1].body == expected_open_line_body
+    end, 10),
+    "o-created inline line did not persist as a hard comment newline: "
+      .. tostring(diff_review._review.state(buf).review_comments[1].body)
+  )
+  vim.api.nvim_exec_autocmds("TextChanged", { buffer = buf })
+  vim.wait(40, function() return false end, 10)
+  assert_true(
+    diff_review._review.state(buf).review_comments[1].body == expected_open_line_body,
+    "o-created hard newline collapsed after rerender"
+  )
+  pcall(vim.cmd, "stopinsert")
+  diff_review._review.state(buf).review_comments[1].body = "Visual changed comment body"
+  diff_review._review.render(buf)
 
   local state = diff_review._review.state(buf)
   local original_body = state.review_comments[1].body
-  state.review_comments[1].body =
-    "This is a deliberately long inline review comment body that should wrap before the rendered comment box can exceed the maximum allowed width of seventy two columns."
-  diff_review._review.render(buf)
+  local reflow_text =
+    "This is next the time for this FOOBAR thing that, thas is not the time for which the only time know this thing whiche we know.test the"
+  local reflow_row = find_row(buf, "Visual changed comment body")
+  vim.api.nvim_win_set_cursor(0, { reflow_row, 12 })
+  vim.api.nvim_exec_autocmds("CursorMoved", { buffer = buf })
+  vim.api.nvim_buf_set_lines(buf, reflow_row - 1, reflow_row, false, { reflow_text })
+  vim.api.nvim_win_set_cursor(0, { reflow_row, reflow_text:find("FOOBAR", 1, true) - 1 })
+  vim.api.nvim_exec_autocmds("TextChanged", { buffer = buf })
+  wait_for(function()
+    return state.review_comments[1].body == reflow_text
+  end, "long inline edit did not update comment body")
+  wait_for(function()
+    local start_row, end_row = diff_review._review.comment_body_rows(buf, state.review_comments[1])
+    return start_row and end_row and end_row > start_row and (lines(buf)[end_row + 1] or ""):find("╰", 1, true) ~= nil
+  end, "long inline edit did not reflow the rendered comment box")
+  vim.api.nvim_exec_autocmds("TextChanged", { buffer = buf })
+  vim.wait(40, function() return false end, 10)
+  assert_true(
+    state.review_comments[1].body == reflow_text,
+    "rendered wraps were persisted as hard line breaks: " .. tostring(state.review_comments[1].body)
+  )
+  assert_true(not state.review_comments[1].body:find("\nnot\nthe\ntime", 1, true), "overflow words were persisted as separate lines")
+  local reflow_start_row, reflow_end_row = diff_review._review.comment_body_rows(buf, state.review_comments[1])
+  assert_true(vim.api.nvim_get_current_buf() == buf, "long inline edit opened a popup")
+  assert_true(vim.api.nvim_win_get_cursor(0)[1] >= reflow_start_row, "long inline edit cursor left comment body")
+  assert_true(vim.api.nvim_win_get_cursor(0)[1] <= reflow_end_row, "long inline edit cursor left comment body after wrap")
   for row, entry in pairs(state.entries or {}) do
     if entry.kind == "review_comment" then
       assert_true(vim.fn.strdisplaywidth(lines(buf)[row] or "") <= 72, "inline comment box exceeded 72 columns")
@@ -635,7 +751,7 @@ local function run()
   diff_review._review.render(buf)
   local selection_row = find_row(buf, "This is not the time")
   local selection_line = lines(buf)[selection_row]
-  local selection_start_col, selection_end_col = diff_review._review.comment_body_text_bounds(selection_line)
+  local selection_start_col, selection_end_col = diff_review._review.comment_body_text_selection_bounds(selection_line)
   assert_true(selection_line:find("│", 1, true) == nil, "inline comment body line must not expose a selectable border")
   assert_true((lines(buf)[selection_row + 1] or ""):find("│", 1, true) == nil, "wrapped comment body line must not expose a selectable border")
   vim.api.nvim_win_set_cursor(0, { selection_row, 0 })
@@ -651,26 +767,24 @@ local function run()
   selection_state.review_comments[1].body = selection_original_body
   diff_review._review.render(buf)
 
-  -- ── C near the comment edits it (input prefilled with existing body) ───────
-  local prefill_seen
-  prefill_seen = nil
-  diff_review._review.input_provider = function(_, on_submit, prefill)
-    prefill_seen = prefill
-    on_submit("Edited from above")
-  end
+  -- ── C near the comment focuses the inline body without using a popup ───────
+  local popup_called = false
+  diff_review._review.input_provider = function(_, _, _) popup_called = true end
   trigger(buf, "C", find_row(buf, "NEW src/a.txt"))
-  wait_for(function() return buffer_contains(buf, "Edited from above") end, "C on the line above did not edit the comment")
-  assert_true(prefill_seen == "Visual changed comment body", "line above edit was not prefilled with existing body")
+  assert_true(not popup_called, "C on the line above opened a popup")
+  assert_true(vim.api.nvim_get_current_buf() == buf, "C on the line above switched buffers")
+  assert_true(vim.api.nvim_win_get_cursor(0)[1] == find_row(buf, "Visual changed comment body"), "C on the line above did not focus body")
   assert_true(#diff_review._review.state(buf).review_comments == 1, "line above comment edit added a duplicate draft")
 
-  prefill_seen = nil
-  diff_review._review.input_provider = function(_, on_submit, prefill)
-    prefill_seen = prefill
-    on_submit("Edited comment body")
-  end
-  trigger(buf, "C", find_row(buf, "Edited from above") + 2)
-  wait_for(function() return buffer_contains(buf, "Edited comment body") end, "C on the line below did not edit the comment")
-  assert_true(prefill_seen == "Edited from above", "line below edit was not prefilled with existing body")
+  popup_called = false
+  trigger(buf, "C", find_row(buf, "Visual changed comment body") + 2)
+  assert_true(not popup_called, "C on the line below opened a popup")
+  local line_below_focus = vim.api.nvim_win_get_cursor(0)[1]
+  vim.api.nvim_buf_set_lines(buf, line_below_focus - 1, line_below_focus, false, { "Edited comment body" })
+  vim.api.nvim_exec_autocmds("TextChanged", { buffer = buf })
+  wait_for(function()
+    return diff_review._review.state(buf).review_comments[1].body == "Edited comment body"
+  end, "line below inline edit did not save")
   assert_true(#diff_review._review.state(buf).review_comments == 1, "line below comment edit added a duplicate draft")
 
   local draft_path = diff_review._review.storage_path(diff_review._review.state(buf))
@@ -768,7 +882,7 @@ local function run()
   trigger(buf, "C", find_row(buf, "NEW src/b.txt"))
   wait_for(function() return buffer_contains(buf, "Second comment") end, "second comment not added")
   assert_true(#diff_review._review.state(buf).review_comments == 2, "expected two draft comments")
-  trigger(buf, "J", find_row(buf, "Second comment"))
+  trigger(buf, "J", find_row(buf, "Second comment") - 1)
   wait_for(function() return not buffer_contains(buf, "Second comment") end, "J did not delete the comment")
   assert_true(#diff_review._review.state(buf).review_comments == 1, "delete did not remove the draft")
 
