@@ -77,7 +77,8 @@ Every plan must end with these lines:
 
 # Shell and Environment
 - **Never** read or set environment variables via shell commands. If one is required and unset, ask the user.
-- **Never** use the `gh` CLI. Use the GitHub MCP tool for all GitHub operations.
+- Do **not** prefix commands with `cmd /c`, just call them.
+- Unless there are compelling performance reasons, prefer using simple commands serially instead of complex combined ones. This are more likely to be auto approved.
 
 # Searching
 - For researching or finding new Rust crates, use `docs-mcp`.
