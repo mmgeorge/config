@@ -43,7 +43,8 @@ Pressing `or` in the status or PR view starts PR review mode
 an editable review summary, and the changed files split into Unviewed/Viewed
 sections (files start expanded). This is the **normal batched review flow** —
 comments are drafted locally and submitted together, not posted one at a time:
-- `S`/`U` move the file under the cursor between the sections.
+- `S`/`U` move the hunk/file under the cursor between the sections; on
+  Unviewed/Viewed section headers they move the whole section.
 - `C` on a changed (diff body) line drafts a comment (body via an input
   popup); on an existing comment it edits it (input prefilled); on anything
   else it is a no-op. Comments render as real, navigable buffer lines (a box)
@@ -52,7 +53,7 @@ comments are drafted locally and submitted together, not posted one at a time:
   line carrying a `review_comment` entry so the cursor can land on it.
 - `J` deletes the draft comment under the cursor; `y`/`n` jump between
   comments.
-- `b` browses the PR; the submit key (`<C-s>`) picks a verdict
+- `b` browses the PR changes tab; the submit key (`<C-s>`) picks a verdict
   (`vim.ui.select` → APPROVE/COMMENT/REQUEST_CHANGES) and posts the summary,
   verdict, and every draft comment in ONE `gh api .../reviews` request
   (`gh.submit_pr_review_async`, `commit_id` = head SHA, `comments[]`); on
@@ -64,8 +65,10 @@ both `path` (repo-relative, for GitHub) and `abs_file` (for matching rendered
 rows). Tests drive the comment body and verdict through the
 `M._review.input_provider` / `M._review.verdict_provider` seams. The summary
 region's end extmark uses right gravity (a left-gravity boundary mark gets
-pulled into an edit of the adjacent line). The review view's hint and action
-keys come from `config.keymaps.review`, not the shared command specs. The
+pulled into an edit of the adjacent line). Review-specific key defaults live in
+`config.keymaps.review`, but the hint bar, `?` help, and installed mappings must
+come through the shared status command specs in `init.lua`; pin only the compact
+high-value subset in the winbar and keep the full command list in `?`. The
 verdict chooser is a plain popup window (`M._review.pick_verdict`,
 `c`/`a`/`r`/`q`), not `vim.ui.select`/snacks.
 
@@ -240,13 +243,34 @@ from status, PRView, keymaps, renderers, or tests. The wrapper owns nonblocking
 so they never depend on a real `gh` installation, auth state, network, or
 repository remote.
 
-## Status Keymaps
+## Shared Status UX Pattern
+
+GitStatus' Unstaged/Staged model is the canonical UX pattern for all
+DiffReview list-style buffers. When adding related surfaces (PR review
+Unviewed/Viewed, branch diffs, walkthroughs, or future grouped review flows),
+reuse the same concepts instead of inventing a separate interaction model:
+
+- Group content into named sections that can be toggled with `<Tab>` via
+  `status_toggle()`; section, file, and hunk folds should all flow through the
+  shared fold state (`status_folded` / `set_status_folded`).
+- Use movement actions like GitStatus stage/unstage: update the in-memory
+  section model immediately, preserve cursor/fold intent, then sync/reconcile
+  asynchronously. For review mode, `S`/`U` moving hunks or files between
+  Unviewed/Viewed should feel like GitStatus `S`/`U` moving items between
+  Unstaged/Staged. Header actions matter too: pressing `S`/`U` on a section
+  header should apply to all actionable items in that section, matching
+  GitStatus staged/unstaged header behavior.
+- Keep the same command model for mappings, hint bars, and `?` help. The winbar
+  should show only a compact pinned subset; the full command palette stays in
+  `?`.
 
 Status-buffer mappings must be defined from `config.defaults.keymaps.status` and
-the central status command spec in `init.lua`. Do not hardcode key text in the
-hint row, the `?` help popup, or tests. User config can override or disable a
-mapping, and the actual keymaps plus displayed help must stay in sync from that
-single source.
+the central status command spec in `init.lua`. Review-specific defaults may live
+under `config.defaults.keymaps.review`, but their command specs, visibility,
+hint participation, and help text still belong in the shared command model. Do
+not hardcode key text in the hint row, the `?` help popup, or tests. User config
+can override or disable a mapping, and the actual keymaps plus displayed help
+must stay in sync from that single source.
 
 For status actions, do not replace an already-rendered status buffer with a
 generic loading line. Apply an optimistic in-memory section update immediately,

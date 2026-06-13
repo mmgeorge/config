@@ -44,6 +44,31 @@
 ---@field code? integer
 ---@field unavailable? boolean
 
+---@class DiffReviewGhPendingReviewComment
+---@field remote_id integer?
+---@field remote_node_id string?
+---@field review_id integer?
+---@field body string
+---@field path string
+---@field line integer?
+---@field position integer?
+---@field user? string
+
+---@class DiffReviewGhPendingReview
+---@field id integer
+---@field node_id string
+---@field state string
+---@field body string
+---@field commit_id string?
+---@field user? string
+
+---@class DiffReviewGhPendingReviewResult
+---@field ok boolean
+---@field review? DiffReviewGhPendingReview
+---@field comments? DiffReviewGhPendingReviewComment[]
+---@field message? string
+---@field code? integer
+
 ---@class DiffReviewGhModule
 ---@field _backend DiffReviewGhBackend?
 
@@ -170,6 +195,14 @@ local function as_integer(value)
   return tonumber(value) or 0
 end
 
+---@param url? string
+---@return string?
+function M.repo_from_pr_url(url)
+  local owner, repo = tostring(url or ""):match("^https://[^/]+/([^/]+)/([^/]+)/pull/%d+")
+  if owner and repo and owner ~= "" and repo ~= "" then return owner .. "/" .. repo end
+  return nil
+end
+
 ---@param raw table
 ---@param repo? string
 ---@return DiffReviewGhPR
@@ -193,12 +226,13 @@ local function normalize_pr(raw, repo)
     }
   end
 
+  local normalized_repo = repo or M.repo_from_pr_url(raw.url)
   return {
     number = as_integer(raw.number),
     title = tostring(raw.title or ""),
     body = tostring(raw.body or ""),
     url = tostring(raw.url or ""),
-    repo = repo,
+    repo = normalized_repo,
     headRefName = tostring(raw.headRefName or ""),
     headRefOid = raw.headRefOid,
     commits = commits,
@@ -335,6 +369,255 @@ local function pr_api_path(number, repo, resource)
   return ("/repos/%s/pulls/%s/%s"):format(owner_repo, tostring(number), resource)
 end
 
+---@param text string
+---@return table?
+local function decode_json(text)
+  local ok, decoded = pcall(vim.json.decode, tostring(text or ""))
+  if ok and type(decoded) == "table" then return decoded end
+  return nil
+end
+
+---@param repo? string
+---@return string? owner
+---@return string? name
+local function split_repo(repo)
+  local owner, name = tostring(repo or ""):match("^([^/]+)/(.+)$")
+  if owner and name and owner ~= "" and name ~= "" then return owner, name end
+  return nil, nil
+end
+
+---@param value any
+---@return integer?
+local function maybe_integer(value)
+  local number = tonumber(value)
+  if number == nil then return nil end
+  return math.floor(number)
+end
+
+---@param raw table
+---@return DiffReviewGhPendingReviewComment
+local function normalize_review_comment(raw)
+  local author = raw.author or raw.user or {}
+  local review = raw.pullRequestReview or {}
+  return {
+    remote_id = maybe_integer(raw.databaseId or raw.id),
+    remote_node_id = raw.node_id or raw.id,
+    review_id = maybe_integer(raw.pull_request_review_id or review.databaseId),
+    body = tostring(raw.body or ""),
+    path = tostring(raw.path or ""),
+    line = maybe_integer(raw.line),
+    position = maybe_integer(raw.position or raw.original_position),
+    user = author.login,
+  }
+end
+
+---@param raw table
+---@return DiffReviewGhPendingReview
+local function normalize_pending_review(raw)
+  local author = raw.author or raw.user or {}
+  local commit = raw.commit or {}
+  return {
+    id = maybe_integer(raw.databaseId or raw.id) or 0,
+    node_id = tostring(raw.node_id or raw.id or ""),
+    state = tostring(raw.state or ""),
+    body = tostring(raw.body or ""),
+    commit_id = raw.commit_id or commit.oid,
+    user = author.login,
+  }
+end
+
+---@param query string
+---@param variables table
+---@param cwd string?
+---@param cb DiffReviewGhTextCallback
+local function graphql_async(query, variables, cwd, cb)
+  system_text_async({ "gh", "api", "graphql", "--input", "-" }, vim.json.encode({
+    query = query,
+    variables = variables,
+  }), cwd, cb)
+end
+
+---@param cwd string
+---@param number integer|string
+---@param repo string
+---@param cb fun(result: DiffReviewGhPendingReviewResult)
+function M.pending_review_async(cwd, number, repo, cb)
+  local owner, name = split_repo(repo)
+  if not owner then
+    cb({ ok = false, message = "PR review sync requires an owner/repo name", code = 1 })
+    return
+  end
+  local query = table.concat({
+    "query($owner:String!, $repo:String!, $number:Int!) {",
+    "  repository(owner:$owner, name:$repo) {",
+    "    pullRequest(number:$number) {",
+    "      reviews(first:100) { nodes {",
+    "        id databaseId state body viewerDidAuthor",
+    "        author { login }",
+    "        commit { oid }",
+    "      } }",
+    "      reviewThreads(first:100) { nodes {",
+    "        comments(first:100) { nodes {",
+    "          id databaseId body path line position author { login }",
+    "          pullRequestReview { id databaseId state }",
+    "        } }",
+    "      } }",
+    "    }",
+    "  }",
+    "}",
+  }, "\n")
+  graphql_async(query, { owner = owner, repo = name, number = tonumber(number) }, cwd, function(result)
+    if result.code ~= 0 then
+      cb({ ok = false, message = result.output ~= "" and result.output or ("gh exited " .. result.code), code = result.code })
+      return
+    end
+
+    local decoded = decode_json(result.stdout)
+    local pull_request = decoded
+      and decoded.data
+      and decoded.data.repository
+      and decoded.data.repository.pullRequest
+      or {}
+    local reviews = pull_request.reviews and pull_request.reviews.nodes or {}
+    local selected = nil
+    for _, review in ipairs(type(reviews) == "table" and reviews or {}) do
+      if tostring(review.state or "") == "PENDING" and review.viewerDidAuthor then
+        selected = review
+        break
+      end
+    end
+    if not selected then
+      cb({ ok = true, comments = {} })
+      return
+    end
+
+    local review = normalize_pending_review(selected)
+    local comments = {}
+    local threads = pull_request.reviewThreads and pull_request.reviewThreads.nodes or {}
+    for _, thread in ipairs(type(threads) == "table" and threads or {}) do
+      local nodes = thread.comments and thread.comments.nodes or {}
+      for _, comment in ipairs(type(nodes) == "table" and nodes or {}) do
+        local comment_review = comment.pullRequestReview or {}
+        local comment_review_id = maybe_integer(comment_review.databaseId)
+        if comment_review_id == review.id or tostring(comment_review.id or "") == review.node_id then
+          comments[#comments + 1] = normalize_review_comment(comment)
+        end
+      end
+    end
+    cb({ ok = true, review = review, comments = comments })
+  end)
+end
+
+---@param cwd string
+---@param number integer|string
+---@param repo? string
+---@param opts { commit_id?: string }
+---@param cb fun(result: DiffReviewGhPendingReviewResult)
+function M.create_pending_review_async(cwd, number, repo, opts, cb)
+  local payload = {}
+  if opts and opts.commit_id and opts.commit_id ~= "" then payload.commit_id = opts.commit_id end
+  system_text_async({ "gh", "api", "--method", "POST", pr_api_path(number, repo, "reviews"), "--input", "-" }, vim.json.encode(payload), cwd, function(result)
+    if result.code ~= 0 then
+      cb({ ok = false, message = result.output ~= "" and result.output or ("gh exited " .. result.code), code = result.code })
+      return
+    end
+    local decoded = decode_json(result.stdout)
+    if not decoded then
+      cb({ ok = false, message = "gh api returned invalid pending review JSON", code = result.code })
+      return
+    end
+    cb({ ok = true, review = normalize_pending_review(decoded), comments = {} })
+  end)
+end
+
+---@param cwd string
+---@param review_node_id string
+---@param opts { body: string, path: string, position: integer, commit_id?: string }
+---@param cb fun(result: DiffReviewGhPendingReviewResult)
+function M.add_pending_review_comment_async(cwd, review_node_id, opts, cb)
+  local query = table.concat({
+    "mutation($input:AddPullRequestReviewCommentInput!) {",
+    "  addPullRequestReviewComment(input:$input) {",
+    "    comment { id databaseId body path line position author { login } }",
+    "  }",
+    "}",
+  }, "\n")
+  local input = {
+    pullRequestReviewId = review_node_id,
+    body = opts.body,
+    path = opts.path,
+    position = opts.position,
+  }
+  if opts.commit_id and opts.commit_id ~= "" then input.commitOID = opts.commit_id end
+  graphql_async(query, { input = input }, cwd, function(result)
+    if result.code ~= 0 then
+      cb({ ok = false, message = result.output ~= "" and result.output or ("gh exited " .. result.code), code = result.code })
+      return
+    end
+    local decoded = decode_json(result.stdout)
+    local comment = decoded
+      and decoded.data
+      and decoded.data.addPullRequestReviewComment
+      and decoded.data.addPullRequestReviewComment.comment
+    if type(comment) ~= "table" then
+      cb({ ok = false, message = "gh api returned invalid review comment JSON", code = result.code })
+      return
+    end
+    cb({ ok = true, comments = { normalize_review_comment(comment) } })
+  end)
+end
+
+---@param cwd string
+---@param comment_node_id string
+---@param body string
+---@param cb fun(result: DiffReviewGhPendingReviewResult)
+function M.update_review_comment_async(cwd, comment_node_id, body, cb)
+  local query = table.concat({
+    "mutation($input:UpdatePullRequestReviewCommentInput!) {",
+    "  updatePullRequestReviewComment(input:$input) {",
+    "    pullRequestReviewComment { id databaseId body path line position author { login } }",
+    "  }",
+    "}",
+  }, "\n")
+  graphql_async(query, { input = { pullRequestReviewCommentId = comment_node_id, body = body } }, cwd, function(result)
+    if result.code ~= 0 then
+      cb({ ok = false, message = result.output ~= "" and result.output or ("gh exited " .. result.code), code = result.code })
+      return
+    end
+    local decoded = decode_json(result.stdout)
+    local comment = decoded
+      and decoded.data
+      and decoded.data.updatePullRequestReviewComment
+      and decoded.data.updatePullRequestReviewComment.pullRequestReviewComment
+    cb({ ok = true, comments = type(comment) == "table" and { normalize_review_comment(comment) } or {} })
+  end)
+end
+
+---@param cwd string
+---@param comment_node_id string
+---@param cb fun(result: DiffReviewGhPendingReviewResult)
+function M.delete_review_comment_async(cwd, comment_node_id, cb)
+  local query = "mutation($input:DeletePullRequestReviewCommentInput!) { deletePullRequestReviewComment(input:$input) { clientMutationId } }"
+  graphql_async(query, { input = { id = comment_node_id } }, cwd, function(result)
+    if result.code ~= 0 then
+      cb({ ok = false, message = result.output ~= "" and result.output or ("gh exited " .. result.code), code = result.code })
+      return
+    end
+    cb({ ok = true, comments = {} })
+  end)
+end
+
+---@param cwd string
+---@param number integer|string
+---@param repo? string
+---@param review_id integer|string
+---@param opts { body: string, event: "APPROVE"|"REQUEST_CHANGES"|"COMMENT" }
+---@param cb DiffReviewGhTextCallback
+function M.submit_pending_review_async(cwd, number, repo, review_id, opts, cb)
+  local command = { "gh", "api", "--method", "POST", pr_api_path(number, repo, ("reviews/%s/events"):format(tostring(review_id))), "--input", "-" }
+  system_text_async(command, vim.json.encode({ body = opts.body, event = opts.event }), cwd, cb)
+end
+
 ---@class DiffReviewGhReviewComment
 ---@field body string
 ---@field path string repo-relative file path
@@ -371,6 +654,24 @@ function M.browse_pr(pr)
   end
   if vim.ui and vim.ui.open then
     vim.ui.open(pr.url)
+    return true
+  end
+  return false
+end
+
+---@param pr DiffReviewGhPR
+---@param fragment? string
+---@return boolean
+function M.browse_pr_changes(pr, fragment)
+  if not (pr and pr.url and pr.url ~= "") then return false end
+  local url = pr.url:gsub("/$", "") .. "/changes"
+  if fragment and fragment ~= "" then url = url .. "#" .. fragment end
+  local backend = M._backend
+  if backend and backend.open_url then
+    return backend.open_url(url)
+  end
+  if vim.ui and vim.ui.open then
+    vim.ui.open(url)
     return true
   end
   return false

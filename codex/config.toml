@@ -63,6 +63,9 @@ trust_level = "trusted"
 [projects.'d:\code\test-repo']
 trust_level = "trusted"
 
+[notice]
+hide_rate_limit_model_nudge = true
+
 [notice.model_migrations]
 "gpt-5.2-codex" = "gpt-5.3-codex"
 "gpt-5.3-codex" = "gpt-5.4"
@@ -101,7 +104,7 @@ sandbox = "elevated"
 
 [tui]
 vim_mode_default = false
-animations = false
+# animations = false
 terminal_title = ["project"]
 
 [tui.keymap.vim_normal]

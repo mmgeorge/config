@@ -386,6 +386,7 @@ local function run()
   )
 
   wait_for(function() return buffer_contains(status_buf, "Improve DiffReview") end, "PR row did not show fetched PR title")
+  assert_true(diff_review._status.pr.pr.repo == "org/repo", "current PR repo was not normalized from its URL")
   wait_for(function() return buffer_contains(status_buf, "feat: add diff review ai summary") end, "About row did not show generated commit subject")
   wait_for(function()
     local lines = vim.api.nvim_buf_get_lines(commit_buf, 0, -1, false)

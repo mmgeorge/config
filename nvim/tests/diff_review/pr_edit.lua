@@ -188,7 +188,7 @@ local function run()
   assert_true(not vim.bo[buf].modifiable, "the Description: label itself must stay locked")
   move_cursor(buf, body_row)
   assert_true(vim.bo[buf].modifiable, "buffer must unlock on description rows")
-  move_cursor(buf, 1)
+  move_cursor(buf, find_row(buf, "URL:"))
   assert_true(not vim.bo[buf].modifiable, "buffer must relock after leaving the regions")
 
   -- ── edits flag the field with a "*" marker ──────────────────────────────────
