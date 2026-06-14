@@ -5815,6 +5815,7 @@ function M._review.comments_for_storage(state)
     copy.review_body_start = nil
     copy.review_body_end = nil
     copy.review_body_line_marks = nil
+    copy.review_body_prefix_width = nil
     copy.review_rendered_body_text = nil
     comments[#comments + 1] = copy
   end
@@ -5949,7 +5950,7 @@ function M._review.find_comment_for_remote(state, remote)
     if not comment.remote_id
       and comment.local_state ~= "deleted"
       and M._review.comment_fingerprint(comment) == remote_fingerprint
-      and tostring(comment.body or "") == tostring(remote.body or "") then
+      and M._review.comment_body_for_sync(comment.body or "") == tostring(remote.body or "") then
       return comment
     end
   end
@@ -5976,17 +5977,19 @@ function M._review.merge_remote_comments(state, remote_comments)
       local remote_body = tostring(remote.body or "")
       local base_body = tostring(comment.base_body or "")
       local local_body = tostring(comment.body or "")
+      local base_sync_body = M._review.comment_body_for_sync(base_body)
+      local local_sync_body = M._review.comment_body_for_sync(local_body)
       if comment.local_state == "dirty" or comment.local_state == "new" then
-        if remote_body == local_body then
+        if remote_body == local_sync_body then
           comment.base_body = remote_body
           comment.local_state = "clean"
           changed = true
-        elseif base_body ~= "" and remote_body ~= base_body then
+        elseif base_body ~= "" and remote_body ~= base_sync_body then
           comment.remote_body = remote_body
           comment.local_state = "conflict"
           changed = true
         end
-      elseif comment.local_state ~= "deleted" and local_body ~= remote_body then
+      elseif comment.local_state ~= "deleted" and local_sync_body ~= remote_body then
         comment.body = remote_body
         comment.base_body = remote_body
         comment.local_state = "clean"
@@ -6134,7 +6137,7 @@ function M._review.process_sync_queue(buf)
       return
     end
     if comment.local_state == "deleted" then finish(true) return end
-    local queued_body = item.body or comment.body or ""
+    local queued_body = item.body or M._review.comment_body_for_sync(comment.body or "")
     if comment.remote_node_id then
       gh.update_review_comment_async(state.cwd, comment.remote_node_id, queued_body, function(result)
         if not result.ok then
@@ -6149,7 +6152,7 @@ function M._review.process_sync_queue(buf)
           comment.updated_at = remote.updated_at or comment.updated_at
         end
         comment.syncing = nil
-        if comment.body == queued_body then
+        if M._review.comment_body_for_sync(comment.body or "") == queued_body then
           comment.local_state = "clean"
           comment.base_body = queued_body
         else
@@ -6189,7 +6192,7 @@ function M._review.process_sync_queue(buf)
         comment.updated_at = remote.updated_at or comment.updated_at
       end
       comment.syncing = nil
-      if comment.body == queued_body then
+      if M._review.comment_body_for_sync(comment.body or "") == queued_body then
         comment.local_state = "clean"
         comment.base_body = queued_body
       else
@@ -6209,15 +6212,16 @@ function M._review.enqueue_sync(buf, op, comment)
   local state = M._review.state(buf)
   if not state then return end
   state.review_sync = state.review_sync or { queue = {}, running = false, waiters = {} }
+  local sync_body = op == "upsert" and M._review.comment_body_for_sync(comment.body or "") or nil
   if op == "upsert" then
     for _, queued in ipairs(state.review_sync.queue) do
       if queued.op == "upsert" and queued.comment == comment then
-        queued.body = comment.body or ""
+        queued.body = sync_body
         return
       end
     end
   end
-  state.review_sync.queue[#state.review_sync.queue + 1] = { op = op, comment = comment, body = comment.body or "" }
+  state.review_sync.queue[#state.review_sync.queue + 1] = { op = op, comment = comment, body = sync_body }
   M._review.process_sync_queue(buf)
 end
 
@@ -6369,17 +6373,31 @@ function M._review.browse_fragment_under_cursor(buf)
   local entry = state.entries and state.entries[row] or nil
   if not entry then return nil end
 
-  if entry.kind == "review_comment" and entry.review_comment then
-    local comment = entry.review_comment
+  local function comment_fragment(comment)
+    if not comment then return nil end
     local remote_id = tonumber(comment.remote_id)
     if remote_id then return ("r%d"):format(math.floor(remote_id)) end
     return M._review.github_diff_fragment(comment.path, comment.side, comment.line)
+  end
+
+  if entry.kind == "review_comment" and entry.review_comment then
+    return comment_fragment(entry.review_comment)
+  end
+
+  local previous_comment = M._review.comment_at_row(buf, row - 1)
+  if previous_comment then
+    return comment_fragment(previous_comment)
   end
 
   local diff_line = entry.diff_line
   if diff_line then
     local path = repo_relative(diff_line.file, state.cwd) or diff_line.file
     return M._review.github_diff_fragment(path, M._review.side_of(diff_line), diff_line.line)
+  end
+
+  local next_comment = M._review.comment_at_row(buf, row + 1)
+  if next_comment then
+    return comment_fragment(next_comment)
   end
 
   return nil
@@ -6761,10 +6779,10 @@ function M._review.emit_box(comment, index, indent)
   end
 
   local first_entry = { kind = "review_comment", review_comment = comment, comment_index = index, review_first = true }
-  local left = pad .. "│ "
-  local left_width = vim.fn.strdisplaywidth(left)
-  local body_prefix = (" "):rep(left_width)
   local footer_entry = { kind = "review_comment", review_comment = comment, comment_index = index }
+  local body_prefix_width = 1
+  local body_prefix = (" "):rep(body_prefix_width)
+  comment.review_body_prefix_width = body_prefix_width
 
   -- Top border with the heading.
   local lead = pad .. "╭─"
@@ -6792,15 +6810,15 @@ function M._review.emit_box(comment, index, indent)
       review_comment = comment,
       comment_index = index,
       review_body = true,
-      review_body_prefix_width = left_width,
+      review_body_prefix_width = body_prefix_width,
     }
-    local fill = (" "):rep(math.max(inner - vim.fn.strdisplaywidth(line) - 1, 0))
     local rendered_line = body_prefix .. line
+    local fill = (" "):rep(math.max(inner - vim.fn.strdisplaywidth(rendered_line), 0))
     local body_line = status_add_line(rendered_line, body_entry)
     status_add_highlight(body_line, #body_prefix, #rendered_line, "DiffReviewReviewComment")
     status_add_extmark(body_line, 0, {
-      virt_text = { { pad, "Normal" }, { "│ ", "FloatBorder" } },
-      virt_text_pos = "overlay",
+      virt_text = { { pad, "Normal" }, { "│", "FloatBorder" } },
+      virt_text_pos = "inline",
       right_gravity = false,
     })
     status_add_extmark(body_line, #rendered_line, {
@@ -6929,6 +6947,39 @@ function M._review.mark_row(buf, id)
   return pos and pos[1] or nil
 end
 
+---@param line string
+---@return boolean
+function M._review.is_comment_footer_line(line)
+  return tostring(line or ""):match("^%s*╰─+╯%s*$") ~= nil
+end
+
+---@param buf integer
+---@param start_row0 integer
+---@param fallback_end_row0 integer
+---@return integer
+function M._review.comment_body_live_end_row0(buf, start_row0, fallback_end_row0)
+  local line_count = vim.api.nvim_buf_line_count(buf)
+  if start_row0 < 0 or start_row0 >= line_count then return fallback_end_row0 end
+  for row0 = start_row0 + 1, line_count - 1 do
+    local line = vim.api.nvim_buf_get_lines(buf, row0, row0 + 1, false)[1] or ""
+    if M._review.is_comment_footer_line(line) then return row0 end
+  end
+  return fallback_end_row0
+end
+
+---@param buf integer
+---@param comment table
+---@return integer? start_row0
+---@return integer? end_row0
+function M._review.comment_body_range0(buf, comment)
+  local start_row0 = M._review.mark_row(buf, comment.review_body_start)
+  local end_row0 = M._review.mark_row(buf, comment.review_body_end)
+  if start_row0 == nil or end_row0 == nil or end_row0 < start_row0 then return nil, nil end
+  end_row0 = M._review.comment_body_live_end_row0(buf, start_row0, end_row0)
+  if end_row0 < start_row0 then return nil, nil end
+  return start_row0, end_row0
+end
+
 ---@param buf integer
 ---@param row integer 1-based
 ---@return boolean
@@ -6948,8 +6999,7 @@ function M._review.comment_body_at_row(buf, row)
   if not state then return nil end
   for _, comment in ipairs(state.review_comments or {}) do
     if comment.local_state ~= "deleted" then
-      local start_row0 = M._review.mark_row(buf, comment.review_body_start)
-      local end_row0 = M._review.mark_row(buf, comment.review_body_end)
+      local start_row0, end_row0 = M._review.comment_body_range0(buf, comment)
       if start_row0 ~= nil and end_row0 ~= nil and row >= start_row0 + 1 and row <= end_row0 then
         return comment
       end
@@ -6963,8 +7013,7 @@ end
 ---@return integer? start_row 1-based
 ---@return integer? end_row 1-based
 function M._review.comment_body_rows(buf, comment)
-  local start_row0 = M._review.mark_row(buf, comment.review_body_start)
-  local end_row0 = M._review.mark_row(buf, comment.review_body_end)
+  local start_row0, end_row0 = M._review.comment_body_range0(buf, comment)
   if start_row0 == nil or end_row0 == nil or end_row0 < start_row0 then return nil, nil end
   return start_row0 + 1, end_row0
 end
@@ -6977,7 +7026,73 @@ function M._review.comment_body_prefix_width(buf, row, line)
   local state = M._review.state(buf)
   local entry = state and state.entries and state.entries[row] or nil
   if entry and entry.review_body_prefix_width then return entry.review_body_prefix_width end
+  local comment = state and M._review.comment_body_at_row(buf, row) or nil
   local text = tostring(line or "")
+  if comment then
+    local width = comment.review_body_prefix_width or 1
+    if width <= 0 then return 0 end
+    if text == "" then return width end
+    if #text >= width and text:sub(1, width):match("^%s*$") then
+      local next_char = text:sub(width + 1, width + 1)
+      if next_char == "" or not next_char:match("%s") then return width end
+    end
+    return 0
+  end
+  local border_prefix = text:match("^(.-│ )")
+  if border_prefix then return #border_prefix end
+  local leading_spaces = text:match("^(%s*)") or ""
+  return #leading_spaces
+end
+
+---@param prefix_width integer
+---@return string
+function M._review.comment_body_prefix(prefix_width)
+  return (" "):rep(math.max(tonumber(prefix_width) or 0, 0))
+end
+
+---@param line string
+---@param prefix_width integer
+---@return boolean
+function M._review.line_has_comment_body_prefix(line, prefix_width)
+  local width = math.max(tonumber(prefix_width) or 0, 0)
+  if width == 0 then return true end
+  local text = tostring(line or "")
+  if #text < width then return false end
+  return text:sub(1, width):match("^%s*$") ~= nil
+end
+
+---@param buf integer
+---@param row integer 1-based
+---@param line string
+---@param prefix_width integer
+---@return string
+function M._review.ensure_comment_body_prefix(buf, row, line, prefix_width)
+  local width = math.max(tonumber(prefix_width) or 0, 0)
+  local text = tostring(line or "")
+  if width == 0 or M._review.line_has_comment_body_prefix(text, width) then return text end
+
+  local prefixed
+  if text:match("^%s*$") then
+    prefixed = M._review.comment_body_prefix(width)
+  else
+    prefixed = M._review.comment_body_prefix(width) .. text
+  end
+  if prefixed ~= text and vim.bo[buf].modifiable then
+    pcall(vim.api.nvim_buf_set_lines, buf, row - 1, row, false, { prefixed })
+  end
+  return prefixed
+end
+
+---@param line string
+---@param prefix_width? integer
+---@return integer
+function M._review.comment_body_effective_prefix_width(line, prefix_width)
+  local text = tostring(line or "")
+  if prefix_width ~= nil then
+    local width = math.max(tonumber(prefix_width) or 0, 0)
+    if width > 0 and not M._review.line_has_comment_body_prefix(text, width) then return 0 end
+    return width
+  end
   local border_prefix = text:match("^(.-│ )")
   if border_prefix then return #border_prefix end
   local leading_spaces = text:match("^(%s*)") or ""
@@ -6989,9 +7104,11 @@ end
 ---@return string
 function M._review.comment_body_text_from_line(line, prefix_width)
   local text = tostring(line or "")
-  if prefix_width and prefix_width > 0 and #text >= prefix_width then
-    local prefix = text:sub(1, prefix_width)
-    if prefix:match("^%s*$") then text = text:sub(prefix_width + 1) end
+  if prefix_width ~= nil then
+    if prefix_width > 0 and #text >= prefix_width then
+      local prefix = text:sub(1, prefix_width)
+      if prefix:match("^%s*$") then text = text:sub(prefix_width + 1) end
+    end
   else
     local stripped_border = text:gsub("^%s*│ ?", "", 1)
     if stripped_border ~= text then
@@ -7008,22 +7125,171 @@ function M._review.comment_body_text_from_line(line, prefix_width)
   return text
 end
 
+---@param lines string[]
+---@return string[]
+function M._review.trim_comment_body_lines(lines)
+  local first, last = 1, #lines
+  while first <= last and vim.trim(lines[first] or "") == "" do
+    first = first + 1
+  end
+  while last >= first and vim.trim(lines[last] or "") == "" do
+    last = last - 1
+  end
+  local trimmed = {}
+  for index = first, last do
+    trimmed[#trimmed + 1] = lines[index] or ""
+  end
+  return trimmed
+end
+
+---@param lines string[]
+---@return boolean
+function M._review.comment_body_contains_markdown_fence(lines)
+  for _, line in ipairs(lines or {}) do
+    if tostring(line):match("^%s*```") or tostring(line):match("^%s*~~~") then return true end
+  end
+  return false
+end
+
+---@param lines string[]
+---@return boolean
+function M._review.comment_body_looks_like_code(lines)
+  local code_keywords = {
+    ["async"] = true,
+    ["await"] = true,
+    ["cargo"] = true,
+    ["class"] = true,
+    ["const"] = true,
+    ["curl"] = true,
+    ["def"] = true,
+    ["enum"] = true,
+    ["export"] = true,
+    ["fn"] = true,
+    ["for"] = true,
+    ["function"] = true,
+    ["gh"] = true,
+    ["git"] = true,
+    ["if"] = true,
+    ["impl"] = true,
+    ["import"] = true,
+    ["interface"] = true,
+    ["let"] = true,
+    ["local"] = true,
+    ["match"] = true,
+    ["npm"] = true,
+    ["pnpm"] = true,
+    ["pub"] = true,
+    ["return"] = true,
+    ["select"] = true,
+    ["struct"] = true,
+    ["type"] = true,
+    ["use"] = true,
+    ["var"] = true,
+    ["while"] = true,
+  }
+  local nonempty_count = 0
+  local score = 0
+  local code_like_lines = 0
+  local strong_lines = 0
+  for _, raw_line in ipairs(lines or {}) do
+    local line = tostring(raw_line or "")
+    local trimmed = vim.trim(line)
+    if trimmed ~= "" then
+      nonempty_count = nonempty_count + 1
+      local line_score = 0
+      local first_word = trimmed:match("^([%a_][%w_]*)")
+      if first_word then first_word = first_word:lower() end
+      if first_word and code_keywords[first_word] then line_score = line_score + 2 end
+      if line:match("^%s+") then line_score = line_score + 1 end
+      if trimmed:match("^[%{%}%[%]%,;]+$") then line_score = line_score + 2 end
+      if
+        trimmed:match("^[\"'][^\"']+[\"']%s*:")
+        or trimmed:match("^[%w_%.%-]+%s*=")
+        or (line:match("^%s+") and trimmed:match("^[%w_%.%-]+%s*:"))
+      then
+        line_score = line_score + 2
+      end
+      if
+        trimmed:match("[{}%[%]();=<>]")
+        or trimmed:find("=>", 1, true)
+        or trimmed:find("::", 1, true)
+      then
+        line_score = line_score + 1
+      end
+      if
+        trimmed:match("^//")
+        or trimmed:match("^#")
+        or trimmed:match("^%-%-")
+        or trimmed:match("^/%*")
+        or trimmed:match("^%*")
+      then
+        line_score = line_score + 1
+      end
+      if trimmed:match("^[$>]%s+") then line_score = line_score + 1 end
+      if line_score > 0 then code_like_lines = code_like_lines + 1 end
+      if line_score >= 2 then strong_lines = strong_lines + 1 end
+      score = score + line_score
+    end
+  end
+  if nonempty_count < 2 then return false end
+  if strong_lines >= 2 and code_like_lines >= math.ceil(nonempty_count / 2) then return true end
+  return code_like_lines == nonempty_count and score >= nonempty_count + 2
+end
+
+---@param lines string[]
+---@return string
+function M._review.fenced_comment_body(lines)
+  return "```\n" .. table.concat(lines or {}, "\n") .. "\n```"
+end
+
+---@param lines string[]
+---@return string
+function M._review.comment_body_lines_to_markdown(lines)
+  local paragraphs = {}
+  local paragraph = {}
+  local function flush_paragraph()
+    if #paragraph == 0 then return end
+    if M._review.comment_body_looks_like_code(paragraph) then
+      paragraphs[#paragraphs + 1] = M._review.fenced_comment_body(paragraph)
+    elseif #paragraph == 1 then
+      paragraphs[#paragraphs + 1] = paragraph[1]
+    else
+      local joined = {}
+      for _, line in ipairs(paragraph) do
+        joined[#joined + 1] = vim.trim(line)
+      end
+      paragraphs[#paragraphs + 1] = table.concat(joined, " ")
+    end
+    paragraph = {}
+  end
+  for _, line in ipairs(lines or {}) do
+    if vim.trim(line or "") == "" then
+      flush_paragraph()
+    else
+      paragraph[#paragraph + 1] = line
+    end
+  end
+  flush_paragraph()
+  return table.concat(paragraphs, "\n\n")
+end
+
+---@param body string
+---@return string
+function M._review.comment_body_for_sync(body)
+  local lines = M._review.trim_comment_body_lines(vim.split(tostring(body or ""), "\n", { plain = true }))
+  if #lines == 0 then return "" end
+  if M._review.comment_body_contains_markdown_fence(lines) then return table.concat(lines, "\n") end
+  if M._review.comment_body_looks_like_code(lines) then return M._review.fenced_comment_body(lines) end
+  return M._review.comment_body_lines_to_markdown(lines)
+end
+
 ---@param line string
 ---@param prefix_width? integer
 ---@return integer start_col 0-based byte column
 ---@return integer end_col 0-based byte column
 function M._review.comment_body_text_bounds(line, prefix_width)
   local text = tostring(line or "")
-  local start_col = prefix_width
-  if start_col == nil then
-    local border_prefix = text:match("^(.-│ )")
-    if border_prefix then
-      start_col = #border_prefix
-    else
-      local leading_spaces = text:match("^(%s*)") or ""
-      start_col = #leading_spaces
-    end
-  end
+  local start_col = M._review.comment_body_effective_prefix_width(text, prefix_width)
   local body_text = M._review.comment_body_text_from_line(text, start_col)
   if body_text == "" then return start_col, start_col end
   return start_col, start_col + #body_text
@@ -7071,14 +7337,17 @@ function M._review.clamped_comment_cursor_position(buf, row, col, previous_row)
   local state = M._review.state(buf)
   if not state then return row, col end
   local entry = state.entries and state.entries[row] or nil
-  local comment = entry and entry.kind == "review_comment" and entry.review_comment or M._review.comment_body_at_row(buf, row)
+  local body_comment = M._review.comment_body_at_row(buf, row)
+  local entry_comment = entry and entry.kind == "review_comment" and entry.review_comment or nil
+  local comment = body_comment or entry_comment
   if not comment then return row, col end
 
   local start_row, end_row = M._review.comment_body_rows(buf, comment)
   if not start_row or not end_row then return row, col end
   local target_row = row
   local target_is_body = true
-  if entry and entry.kind == "review_comment" and not entry.review_body then
+  local row_is_body = body_comment ~= nil or (entry and entry.kind == "review_comment" and entry.review_body)
+  if entry_comment and not row_is_body then
     if previous_row and previous_row >= start_row and previous_row <= end_row then
       if row < previous_row then
         target_row = math.max(start_row - 2, 1)
@@ -7106,6 +7375,8 @@ function M._review.clamped_comment_cursor_position(buf, row, col, previous_row)
   end
 
   local line = vim.api.nvim_buf_get_lines(buf, target_row - 1, target_row, false)[1] or ""
+  local prefix_width = M._review.comment_body_prefix_width(buf, target_row, line)
+  line = M._review.ensure_comment_body_prefix(buf, target_row, line, prefix_width)
   local start_col, end_col = M._review.comment_body_text_bounds_at_row(buf, target_row, line)
   local target_col = math.min(math.max(col or 0, start_col), end_col)
   return target_row, target_col
@@ -7120,29 +7391,15 @@ function M._review.clamp_comment_cursor(buf)
   local cursor = vim.api.nvim_win_get_cursor(0)
   local previous_row = state.review_last_cursor_row
   local row, col = M._review.clamped_comment_cursor_position(buf, cursor[1], cursor[2], previous_row)
-  if row ~= cursor[1] or col ~= cursor[2] then
+  local view = vim.fn.winsaveview()
+  local reset_virtual_column = M._review.comment_body_at_row(buf, row) ~= nil and (tonumber(view.coladd) or 0) > 0
+  if row ~= cursor[1] or col ~= cursor[2] or reset_virtual_column then
     state.review_clamping_cursor = true
     pcall(vim.api.nvim_win_set_cursor, 0, { row, col })
     state.review_clamping_cursor = nil
   end
   state.review_last_cursor_row = row
   return row
-end
-
----@param buf integer
----@return boolean selected
-function M._review.select_comment_body_line(buf)
-  if not (buf and vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_get_current_buf() == buf) then return false end
-  local cursor = vim.api.nvim_win_get_cursor(0)
-  local comment = M._review.comment_body_at_row(buf, cursor[1])
-  if not comment then return false end
-  local row, col = M._review.clamped_comment_cursor_position(buf, cursor[1], cursor[2])
-  local line = vim.api.nvim_buf_get_lines(buf, row - 1, row, false)[1] or ""
-  local start_col, end_col = M._review.comment_body_text_selection_bounds_at_row(buf, row, line)
-  pcall(vim.api.nvim_win_set_cursor, 0, { row, start_col })
-  vim.cmd("normal! v")
-  pcall(vim.api.nvim_win_set_cursor, 0, { row, math.max(start_col, end_col) })
-  return true
 end
 
 ---@param buf integer
@@ -7154,13 +7411,7 @@ end
 
 ---@param buf integer
 ---@return boolean
-function M._review.should_passthrough_close_key(buf)
-  return M._review.should_passthrough_mapped_key(buf)
-end
-
----@param buf integer
----@return boolean
-function M._review.should_passthrough_mapped_key(buf)
+function M._review.cursor_or_selection_in_editable_region(buf)
   if not (buf and vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_get_current_buf() == buf) then return false end
   local mode = vim.fn.mode()
   if mode == "v" or mode == "V" or mode:byte() == 22 then
@@ -7180,47 +7431,94 @@ function M._review.should_passthrough_mapped_key(buf)
 end
 
 ---@param buf integer
----@return boolean
-function M._review.should_passthrough_comment_key(buf)
-  return M._review.should_passthrough_mapped_key(buf)
+---@return table? state
+function M._review.command_map_state(buf)
+  local state = M._status_states and M._status_states[buf] or M._status
+  if not (state and state.view_kind == "review") then return nil end
+  state.review_command_maps = state.review_command_maps or {}
+  state.review_command_maps_by_key = state.review_command_maps_by_key or {}
+  return state
 end
 
----@return "n"|"x"
-function M._review.current_keymap_mode()
-  local mode = vim.fn.mode()
-  if mode == "v" or mode == "V" or mode:byte() == 22 then return "x" end
-  return "n"
+---@param mode string|string[]
+---@return string[]
+function M._review.keymap_modes(mode)
+  if type(mode) == "table" then return mode end
+  return { mode }
 end
 
 ---@param buf integer
----@param mode "n"|"x"
+---@param command_id string
+---@return boolean
+function M._review.command_map_should_be_active(buf, command_id)
+  if command_id == "sync" then return true end
+  return not M._review.cursor_or_selection_in_editable_region(buf)
+end
+
+---@param map table
+function M._review.install_command_map(map)
+  if map.removed then return end
+  if map.active then return end
+  vim.keymap.set(map.modes, map.key, map.callback, map.opts)
+  map.active = true
+end
+
+---@param map table
+function M._review.delete_command_map(map)
+  if not map.active then return end
+  for _, mode in ipairs(map.mode_list) do
+    pcall(vim.keymap.del, mode, map.key, { buffer = map.buf })
+  end
+  map.active = false
+end
+
+---@param buf integer
+---@param command_id string
+---@param modes string|string[]
 ---@param key string
----@param restore fun()
-function M._review.passthrough_mapped_key(buf, mode, key, restore)
-  pcall(vim.keymap.del, mode, key, { buffer = buf })
-  vim.schedule(function()
-    if vim.api.nvim_buf_is_valid(buf) then
-      local mapping = vim.fn.maparg(key, mode, false, true)
-      if type(mapping) == "table" and mapping.buffer ~= 1 and type(mapping.callback) == "function" then
-        mapping.callback()
-      elseif type(mapping) == "table" and mapping.buffer ~= 1 and type(mapping.rhs) == "string" and mapping.rhs ~= "" then
-        vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(mapping.rhs, true, false, true), "mx", false)
-      else
-        vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(key, true, false, true), "nx", false)
-      end
-    end
-    vim.schedule(function()
-      if vim.api.nvim_buf_is_valid(buf) then restore() end
-    end)
-  end)
+---@param callback function
+---@param opts table
+function M._review.register_command_map(buf, command_id, modes, key, callback, opts)
+  local state = M._review.command_map_state(buf)
+  if not state then
+    vim.keymap.set(modes, key, callback, opts)
+    return
+  end
+  local mode_list = M._review.keymap_modes(modes)
+  local signature = table.concat(mode_list, "\0") .. "\0" .. key
+  local existing = state.review_command_maps_by_key[signature]
+  if existing then
+    M._review.delete_command_map(existing)
+    existing.removed = true
+  end
+  local map = {
+    buf = buf,
+    command_id = command_id,
+    modes = modes,
+    mode_list = mode_list,
+    key = key,
+    callback = callback,
+    opts = opts,
+    active = false,
+  }
+  state.review_command_maps_by_key[signature] = map
+  state.review_command_maps[#state.review_command_maps + 1] = map
+  if M._review.command_map_should_be_active(buf, command_id) then M._review.install_command_map(map) end
 end
 
 ---@param buf integer
----@param _command_id string
----@return boolean
-function M._review.should_passthrough_review_mapping(buf, _command_id)
-  if _command_id == "sync" then return false end
-  return M._review.should_passthrough_mapped_key(buf)
+function M._review.sync_command_keymaps(buf)
+  local state = M._review.command_map_state(buf)
+  if not state then return end
+  for _, map in ipairs(state.review_command_maps or {}) do
+    if map.removed then goto continue end
+    if M._review.command_map_should_be_active(buf, map.command_id) then
+      M._review.install_command_map(map)
+    else
+      M._review.delete_command_map(map)
+    end
+    ::continue::
+  end
 end
 
 ---Unlock the buffer only while the cursor sits in an editable review region.
@@ -7233,6 +7531,7 @@ function M._review.sync_modifiable(buf)
   if vim.bo[buf].modifiable ~= wanted then
     vim.bo[buf].modifiable = wanted
   end
+  M._review.sync_command_keymaps(buf)
 end
 
 ---Read edited review text back into the state.
@@ -7257,37 +7556,20 @@ end
 ---@param comment table
 ---@return string?
 function M._review.comment_body_text_from_buffer(buf, comment)
-  local start_row0 = M._review.mark_row(buf, comment.review_body_start)
-  local end_row0 = M._review.mark_row(buf, comment.review_body_end)
+  local start_row0, end_row0 = M._review.comment_body_range0(buf, comment)
   if start_row0 == nil or end_row0 == nil or end_row0 < start_row0 then return nil end
   local raw_lines = vim.api.nvim_buf_get_lines(buf, start_row0, end_row0, false)
-  local paragraphs = {}
-  local paragraph = {}
-  local saw_text = false
-  local pending_blank = false
-  local function flush_paragraph()
-    if #paragraph == 0 then return end
-    if pending_blank and #paragraphs > 0 then
-      paragraphs[#paragraphs + 1] = ""
-    end
-    paragraphs[#paragraphs + 1] = table.concat(paragraph, " ")
-    paragraph = {}
-    pending_blank = false
-  end
+  local body_lines = {}
   for index, line in ipairs(raw_lines) do
     local row = start_row0 + index
     local prefix_width = M._review.comment_body_prefix_width(buf, row, line)
-    local body_line = M._review.comment_body_text_from_line(line, prefix_width)
-    if vim.trim(body_line) == "" then
-      flush_paragraph()
-      if saw_text then pending_blank = true end
-    else
-      saw_text = true
-      paragraph[#paragraph + 1] = body_line
-    end
+    body_lines[#body_lines + 1] = M._review.comment_body_text_from_line(line, prefix_width)
   end
-  flush_paragraph()
-  return table.concat(paragraphs, "\n")
+  body_lines = M._review.trim_comment_body_lines(body_lines)
+  if #body_lines == 0 then return "" end
+  if M._review.comment_body_contains_markdown_fence(body_lines) then return table.concat(body_lines, "\n") end
+  if M._review.comment_body_looks_like_code(body_lines) then return M._review.fenced_comment_body(body_lines) end
+  return table.concat(body_lines, "\n")
 end
 
 ---@param buf integer
@@ -7711,7 +7993,12 @@ function M._review.submit(buf)
     local comments = {}
     for _, comment in ipairs(state.review_comments) do
       if comment.local_state ~= "deleted" then
-        local item = { path = comment.path, body = comment.body, line = comment.line, side = comment.side }
+        local item = {
+          path = comment.path,
+          body = M._review.comment_body_for_sync(comment.body or ""),
+          line = comment.line,
+          side = comment.side,
+        }
         if comment.start_line then
           item.start_line = comment.start_line
           item.start_side = comment.start_side
@@ -7820,11 +8107,7 @@ end
 ---@param buf integer
 function M._review.attach(buf)
   local group = vim.api.nvim_create_augroup("DiffReviewReview" .. buf, { clear = true })
-  vim.keymap.set("n", "V", function()
-    if M._review.select_comment_body_line(buf) then return end
-    vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("V", true, false, true), "n", false)
-  end, { buffer = buf, silent = true, nowait = true, desc = "Select review comment text" })
-  vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI", "BufEnter" }, {
+  vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI", "BufEnter", "ModeChanged" }, {
     group = group,
     buffer = buf,
     callback = function()
@@ -9421,6 +9704,8 @@ end
 ---@param buf integer
 local function setup_status_keymaps(buf)
   local opts = { buffer = buf, silent = true, nowait = true }
+  local view_kind = M._status and M._status.view_kind or "status"
+  local is_pr_view = view_kind == "pr"
   local function map(command_id, mode, callback, desc)
     local spec = status_command_specs_by_id[command_id]
     if spec and not status_command_visible(spec) then return end
@@ -9430,21 +9715,16 @@ local function setup_status_keymaps(buf)
       })
       local mapped
       mapped = function(...)
-        if M._review.should_passthrough_review_mapping(buf, command_id) then
-          local map_mode = M._review.current_keymap_mode()
-          M._review.passthrough_mapped_key(buf, map_mode, key, function()
-            vim.keymap.set(mode, key, mapped, map_opts)
-          end)
-          return
-        end
         if M._status_states and M._status_states[buf] then M._status = M._status_states[buf] end
         callback(...)
       end
-      vim.keymap.set(mode, key, mapped, map_opts)
+      if view_kind == "review" then
+        M._review.register_command_map(buf, command_id, mode, key, mapped, map_opts)
+      else
+        vim.keymap.set(mode, key, mapped, map_opts)
+      end
     end
   end
-  local view_kind = M._status and M._status.view_kind or "status"
-  local is_pr_view = view_kind == "pr"
 
   map("close", "n", function()
     local state = M._status_states and M._status_states[buf] or M._status
@@ -9832,17 +10112,10 @@ function M._review.setup_keymaps(buf)
     for _, key in ipairs(status_keys_for(id)) do
       local mapped
       mapped = function()
-        if M._review.should_passthrough_review_mapping(buf, id) then
-          local map_mode = M._review.current_keymap_mode()
-          M._review.passthrough_mapped_key(buf, map_mode, key, function()
-            vim.keymap.set(spec.modes, key, mapped, { buffer = buf, silent = true, nowait = true, desc = spec.desc })
-          end)
-          return
-        end
         if M._status_states and M._status_states[buf] then M._status = M._status_states[buf] end
         fn()
       end
-      vim.keymap.set(spec.modes, key, mapped, { buffer = buf, silent = true, nowait = true, desc = spec.desc })
+      M._review.register_command_map(buf, id, spec.modes, key, mapped, { buffer = buf, silent = true, nowait = true, desc = spec.desc })
     end
   end
   map("viewed", function() M._review.toggle_viewed(buf, true) end)
