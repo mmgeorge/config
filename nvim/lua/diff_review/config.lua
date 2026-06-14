@@ -94,7 +94,7 @@ M.defaults = {
       comment = "C",
       delete = "J",
       next_comment = "y",
-      prev_comment = "n",
+      prev_comment = "z",
       sync = "<C-s>",
       submit = "cc",
     },

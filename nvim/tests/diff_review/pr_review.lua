@@ -371,7 +371,7 @@ local function run()
   for _, token in ipairs({ "<Tab> toggle", "N Collapse Parent", "S viewed", "U unviewed", "C comment", "J delete", "<C-s> sync", "cc submit", "q close", "? help" }) do
     assert_true(hint:find(token, 1, true) ~= nil, "hint missing " .. token .. ": " .. hint)
   end
-  for _, token in ipairs({ "y next", "n prev", "b browse" }) do
+  for _, token in ipairs({ "y next", "z prev", "b browse" }) do
     assert_true(hint:find(token, 1, true) == nil, "hint should not pin " .. token .. ": " .. hint)
   end
   assert_true(not buffer_contains(buf, "Hint:"), "hint should be a sticky winbar, not buffer text")
@@ -393,7 +393,7 @@ local function run()
     { "C", "Add or edit a draft review comment" },
     { "J", "Delete draft comment" },
     { "y", "Jump to next draft comment" },
-    { "n", "Jump to previous draft comment" },
+    { "z", "Jump to previous draft comment" },
     { "<C-s>", "Sync review comments to GitHub" },
     { "cc", "Submit review to GitHub" },
     { "b", "Browse pull request" },

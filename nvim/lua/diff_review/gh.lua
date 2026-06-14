@@ -44,17 +44,66 @@
 ---@field code? integer
 ---@field unavailable? boolean
 
+---@class DiffReviewGhReviewCommentReply
+---@field remote_id integer?
+---@field remote_node_id string?
+---@field review_id integer?
+---@field review_node_id string?
+---@field review_state string?
+---@field body string
+---@field user? string
+---@field created_at? string
+---@field updated_at? string
+---@field url? string
+
 ---@class DiffReviewGhPendingReviewComment
 ---@field remote_id integer?
 ---@field remote_node_id string?
 ---@field review_id integer?
+---@field review_node_id string?
+---@field review_state string?
 ---@field body string
 ---@field path string
 ---@field line integer?
+---@field start_line integer?
 ---@field position integer?
+---@field side string?
 ---@field user? string
 ---@field created_at? string
 ---@field updated_at? string
+---@field url? string
+---@field resolved? boolean
+---@field outdated? boolean
+---@field replies? DiffReviewGhReviewCommentReply[]
+
+---@class DiffReviewGhIssueComment
+---@field remote_id integer?
+---@field remote_node_id string?
+---@field body string
+---@field user? string
+---@field created_at? string
+---@field updated_at? string
+---@field url? string
+
+---@class DiffReviewGhSubmittedReview
+---@field id integer
+---@field node_id string
+---@field state string
+---@field body string
+---@field user? string
+---@field created_at? string
+---@field updated_at? string
+---@field submitted_at? string
+---@field commit_id? string
+---@field comments? DiffReviewGhPendingReviewComment[]
+
+---@class DiffReviewGhPRCommentsResult
+---@field ok boolean
+---@field reviews? DiffReviewGhSubmittedReview[]
+---@field code_comments? DiffReviewGhPendingReviewComment[]
+---@field issue_comments? DiffReviewGhIssueComment[]
+---@field message? string
+---@field code? integer
 
 ---@class DiffReviewGhPendingReview
 ---@field id integer
@@ -397,21 +446,97 @@ local function maybe_integer(value)
 end
 
 ---@param raw table
----@return DiffReviewGhPendingReviewComment
-local function normalize_review_comment(raw)
+---@return DiffReviewGhReviewCommentReply
+local function normalize_review_reply(raw)
   local author = raw.author or raw.user or {}
   local review = raw.pullRequestReview or {}
   return {
     remote_id = maybe_integer(raw.databaseId or raw.id),
     remote_node_id = raw.node_id or raw.id,
     review_id = maybe_integer(raw.pull_request_review_id or review.databaseId),
+    review_node_id = review.id,
+    review_state = review.state,
     body = tostring(raw.body or ""),
-    path = tostring(raw.path or ""),
-    line = maybe_integer(raw.line),
-    position = maybe_integer(raw.position or raw.original_position),
     user = author.login,
     created_at = raw.createdAt or raw.created_at,
     updated_at = raw.updatedAt or raw.updated_at,
+    url = raw.url or raw.html_url,
+  }
+end
+
+---@param raw table
+---@param thread? table
+---@return DiffReviewGhPendingReviewComment
+local function normalize_review_comment(raw, thread)
+  thread = thread or {}
+  local author = raw.author or raw.user or {}
+  local review = raw.pullRequestReview or {}
+  return {
+    remote_id = maybe_integer(raw.databaseId or raw.id),
+    remote_node_id = raw.node_id or raw.id,
+    review_id = maybe_integer(raw.pull_request_review_id or review.databaseId),
+    review_node_id = review.id,
+    review_state = review.state,
+    body = tostring(raw.body or ""),
+    path = tostring(raw.path or thread.path or ""),
+    line = maybe_integer(raw.line or thread.line or thread.originalLine),
+    start_line = maybe_integer(raw.startLine or raw.start_line or thread.startLine),
+    position = maybe_integer(raw.position or raw.original_position),
+    side = raw.side or raw.diffSide or thread.diffSide,
+    user = author.login,
+    created_at = raw.createdAt or raw.created_at,
+    updated_at = raw.updatedAt or raw.updated_at,
+    url = raw.url or raw.html_url,
+    resolved = thread.isResolved,
+    outdated = thread.isOutdated,
+    replies = {},
+  }
+end
+
+---@param thread table
+---@return DiffReviewGhPendingReviewComment?
+local function normalize_review_thread(thread)
+  local nodes = thread.comments and thread.comments.nodes or {}
+  if type(nodes) ~= "table" or type(nodes[1]) ~= "table" then return nil end
+  local comment = normalize_review_comment(nodes[1], thread)
+  for node_index = 2, #nodes do
+    local reply = nodes[node_index]
+    if type(reply) == "table" then comment.replies[#comment.replies + 1] = normalize_review_reply(reply) end
+  end
+  return comment
+end
+
+---@param raw table
+---@return DiffReviewGhSubmittedReview
+local function normalize_submitted_review(raw)
+  local author = raw.author or raw.user or {}
+  local commit = raw.commit or {}
+  return {
+    id = maybe_integer(raw.databaseId or raw.id) or 0,
+    node_id = tostring(raw.node_id or raw.id or ""),
+    state = tostring(raw.state or ""),
+    body = tostring(raw.body or ""),
+    user = author.login,
+    created_at = raw.createdAt or raw.created_at,
+    updated_at = raw.updatedAt or raw.updated_at,
+    submitted_at = raw.submittedAt or raw.submitted_at,
+    commit_id = raw.commit_id or commit.oid,
+    comments = {},
+  }
+end
+
+---@param raw table
+---@return DiffReviewGhIssueComment
+local function normalize_issue_comment(raw)
+  local author = raw.author or raw.user or {}
+  return {
+    remote_id = maybe_integer(raw.databaseId or raw.id),
+    remote_node_id = raw.node_id or raw.id,
+    body = tostring(raw.body or ""),
+    user = author.login,
+    created_at = raw.createdAt or raw.created_at,
+    updated_at = raw.updatedAt or raw.updated_at,
+    url = raw.url or raw.html_url,
   }
 end
 
@@ -439,6 +564,105 @@ local function graphql_async(query, variables, cwd, cb)
     query = query,
     variables = variables,
   }), cwd, cb)
+end
+
+---@param cwd string
+---@param number integer|string
+---@param repo string
+---@param cb fun(result: DiffReviewGhPRCommentsResult)
+function M.pr_comments_async(cwd, number, repo, cb)
+  local owner, name = split_repo(repo)
+  if not owner then
+    cb({ ok = false, message = "PR comments require an owner/repo name", code = 1 })
+    return
+  end
+  local query = table.concat({
+    "query($owner:String!, $repo:String!, $number:Int!) {",
+    "  repository(owner:$owner, name:$repo) {",
+    "    pullRequest(number:$number) {",
+    "      reviews(first:100) { nodes {",
+    "        id databaseId state body createdAt updatedAt submittedAt",
+    "        author { login }",
+    "        commit { oid }",
+    "      } }",
+    "      comments(first:100) { nodes {",
+    "        id databaseId body createdAt updatedAt url author { login }",
+    "      } }",
+    "      reviewThreads(first:100) { nodes {",
+    "        isResolved isOutdated path line startLine originalLine diffSide",
+    "        comments(first:100) { nodes {",
+    "          id databaseId body path line position createdAt updatedAt url author { login }",
+    "          pullRequestReview { id databaseId state }",
+    "        } }",
+    "      } }",
+    "    }",
+    "  }",
+    "}",
+  }, "\n")
+  graphql_async(query, { owner = owner, repo = name, number = tonumber(number) }, cwd, function(result)
+    if result.code ~= 0 then
+      cb({ ok = false, message = result.output ~= "" and result.output or ("gh exited " .. result.code), code = result.code })
+      return
+    end
+
+    local decoded = decode_json(result.stdout)
+    local pull_request = decoded
+      and decoded.data
+      and decoded.data.repository
+      and decoded.data.repository.pullRequest
+      or {}
+
+    local reviews = {}
+    local reviews_by_id = {}
+    local review_nodes = pull_request.reviews and pull_request.reviews.nodes or {}
+    for _, review_raw in ipairs(type(review_nodes) == "table" and review_nodes or {}) do
+      local review = normalize_submitted_review(review_raw)
+      if review.state ~= "" and review.state ~= "PENDING" then
+        reviews[#reviews + 1] = review
+        if review.id ~= 0 then reviews_by_id["db:" .. tostring(review.id)] = review end
+        if review.node_id ~= "" then reviews_by_id["node:" .. review.node_id] = review end
+      end
+    end
+
+    local issue_comments = {}
+    local issue_nodes = pull_request.comments and pull_request.comments.nodes or {}
+    for _, comment in ipairs(type(issue_nodes) == "table" and issue_nodes or {}) do
+      issue_comments[#issue_comments + 1] = normalize_issue_comment(comment)
+    end
+
+    local code_comments = {}
+    local threads = pull_request.reviewThreads and pull_request.reviewThreads.nodes or {}
+    for _, thread in ipairs(type(threads) == "table" and threads or {}) do
+      local normalized = normalize_review_thread(thread)
+      if normalized then
+        code_comments[#code_comments + 1] = normalized
+        local review = normalized.review_id and reviews_by_id["db:" .. tostring(normalized.review_id)]
+          or (normalized.review_node_id and reviews_by_id["node:" .. tostring(normalized.review_node_id)])
+        if review then
+          review.comments = review.comments or {}
+          review.comments[#review.comments + 1] = normalized
+        end
+      end
+    end
+
+    for _, review in ipairs(reviews) do
+      table.sort(review.comments or {}, function(left_comment, right_comment)
+        local left_path = tostring(left_comment.path or "")
+        local right_path = tostring(right_comment.path or "")
+        if left_path ~= right_path then return left_path < right_path end
+        local left_line = tonumber(left_comment.line or left_comment.start_line) or math.huge
+        local right_line = tonumber(right_comment.line or right_comment.start_line) or math.huge
+        if left_line ~= right_line then return left_line < right_line end
+        return tostring(left_comment.created_at or "") < tostring(right_comment.created_at or "")
+      end)
+    end
+    table.sort(reviews, function(left_review, right_review)
+      return tostring(left_review.submitted_at or left_review.updated_at or left_review.created_at or "")
+        < tostring(right_review.submitted_at or right_review.updated_at or right_review.created_at or "")
+    end)
+
+    cb({ ok = true, reviews = reviews, code_comments = code_comments, issue_comments = issue_comments })
+  end)
 end
 
 ---@param cwd string
@@ -499,12 +723,15 @@ function M.pending_review_async(cwd, number, repo, cb)
     local comments = {}
     local threads = pull_request.reviewThreads and pull_request.reviewThreads.nodes or {}
     for _, thread in ipairs(type(threads) == "table" and threads or {}) do
-      local nodes = thread.comments and thread.comments.nodes or {}
-      for _, comment in ipairs(type(nodes) == "table" and nodes or {}) do
-        local comment_review = comment.pullRequestReview or {}
+      local comment = normalize_review_thread(thread)
+      if comment then
+        local comment_review = {
+          databaseId = comment.review_id,
+          id = comment.review_node_id,
+        }
         local comment_review_id = maybe_integer(comment_review.databaseId)
         if comment_review_id == review.id or tostring(comment_review.id or "") == review.node_id then
-          comments[#comments + 1] = normalize_review_comment(comment)
+          comments[#comments + 1] = comment
         end
       end
     end

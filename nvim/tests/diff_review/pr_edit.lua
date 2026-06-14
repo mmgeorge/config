@@ -46,6 +46,93 @@ local gh_backend = {}
 function gh_backend.system_async(command, input, cb)
   local key = table.concat(command, " ")
   vim.defer_fn(function()
+    if key == "gh api graphql --input -" then
+      local stdout = vim.json.encode({
+        data = {
+          repository = {
+            pullRequest = {
+              reviews = {
+                nodes = {
+                  {
+                    id = "PRR_1",
+                    databaseId = 4493241278,
+                    state = "CHANGES_REQUESTED",
+                    body = "This requires a few changes...",
+                    createdAt = "2026-06-14T17:13:00Z",
+                    updatedAt = "2026-06-14T17:15:00Z",
+                    submittedAt = "2026-06-14T17:15:00Z",
+                    author = { login = "foo" },
+                    commit = { oid = "abc1234def5678abc1234def5678abc1234def56" },
+                  },
+                  {
+                    id = "PRR_2",
+                    databaseId = 4493241279,
+                    state = "APPROVED",
+                    body = "LGTM!",
+                    createdAt = "2026-06-14T17:16:00Z",
+                    updatedAt = "2026-06-14T17:16:00Z",
+                    submittedAt = "2026-06-14T17:16:00Z",
+                    author = { login = "mgeorge" },
+                    commit = { oid = "abc1234def5678abc1234def5678abc1234def56" },
+                  },
+                },
+              },
+              comments = {
+                nodes = {
+                  {
+                    id = "IC_1",
+                    databaseId = 4702465966,
+                    body = "This is a regular comment",
+                    createdAt = "2026-06-14T17:12:24Z",
+                    updatedAt = "2026-06-14T17:12:24Z",
+                    url = "https://github.com/owner/repo/pull/7#issuecomment-4702465966",
+                    author = { login = "me" },
+                  },
+                },
+              },
+              reviewThreads = {
+                nodes = {
+                  {
+                    isResolved = false,
+                    isOutdated = false,
+                    path = "src/a.txt",
+                    line = 2,
+                    startLine = 2,
+                    diffSide = "RIGHT",
+                    comments = {
+                      nodes = {
+                        {
+                          id = "PRRC_1",
+                          databaseId = 3409923137,
+                          body = "This is inline comment without review",
+                          createdAt = "2026-06-14T17:14:07Z",
+                          updatedAt = "2026-06-14T17:14:07Z",
+                          url = "https://github.com/owner/repo/pull/7#discussion_r3409923137",
+                          author = { login = "me" },
+                          pullRequestReview = { id = "PRR_1", databaseId = 4493241278, state = "CHANGES_REQUESTED" },
+                        },
+                        {
+                          id = "PRRC_REPLY_1",
+                          databaseId = 3409923138,
+                          body = "Oh good point! fixed",
+                          createdAt = "2026-06-14T17:00:00Z",
+                          updatedAt = "2026-06-14T17:00:00Z",
+                          url = "https://github.com/owner/repo/pull/7#discussion_r3409923138",
+                          author = { login = "foo" },
+                          pullRequestReview = { id = "PRR_1", databaseId = 4493241278, state = "CHANGES_REQUESTED" },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      })
+      cb({ code = 0, stdout = stdout, stderr = "", output = stdout })
+      return
+    end
     if key:find("gh pr diff", 1, true) then
       cb({ code = 0, stdout = pr_diff_text, stderr = "", output = pr_diff_text })
       return
@@ -107,6 +194,14 @@ local function find_row(buf, needle)
     if line:find(needle, 1, true) then return index end
   end
   error("missing row: " .. needle .. "\n" .. table.concat(lines, "\n"), 2)
+end
+
+local function find_row_after(buf, needle, after_row)
+  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  for index = after_row + 1, #lines do
+    if lines[index]:find(needle, 1, true) then return index end
+  end
+  error("missing row after " .. tostring(after_row) .. ": " .. needle .. "\n" .. table.concat(lines, "\n"), 2)
 end
 
 local function assert_cursor_clamped_to_line(buf, row, label)
@@ -185,11 +280,44 @@ local function run()
   assert_true(buf ~= nil, "open_pr did not return a buffer")
   wait_for(function() return buffer_contains(buf, "Title:  Old title") end, "PR view did not render the title")
   assert_true(buffer_contains(buf, "Line one"), "PR body did not render")
+  wait_for(function() return buffer_contains(buf, "This is a regular comment") end, "PR conversation comment did not render")
+  wait_for(function() return buffer_contains(buf, "This is inline comment without review") end, "PR inline code comment did not render")
+  wait_for(function() return buffer_contains(buf, "Oh good point! fixed") end, "PR inline reply did not render")
+  wait_for(function() return buffer_contains(buf, "Reviews:") end, "submitted reviews section did not render")
+  wait_for(function()
+    return buffer_contains(buf, "REJECTED by foo | 2026-06-14 17:15 | This requires a few changes...")
+  end, "rejected review summary did not render")
+  assert_true(buffer_contains(buf, "APPROVED by mgeorge | 2026-06-14 17:16 | LGTM!"), "approved review summary did not render")
+  assert_true(
+    find_row(buf, "This is inline comment without review") > find_row(buf, "src/a.txt +1 -1"),
+    "inline code comment did not render under its changed file"
+  )
+  assert_true(
+    find_row(buf, "Oh good point! fixed") > find_row(buf, "This is inline comment without review"),
+    "inline reply did not render under its parent comment"
+  )
+  local rejected_review_row = find_row(buf, "REJECTED by foo")
+  move_cursor(buf, rejected_review_row)
+  trigger_buf_mapping(buf, "<Tab>")
+  wait_for(function()
+    return find_row(buf, "This is inline comment without review") > find_row(buf, "REJECTED by foo")
+  end, "expanded review did not show inline comment context")
+  assert_true(
+    find_row(buf, "src/a.txt +1 -1") > rejected_review_row,
+    "expanded review did not render the commented file"
+  )
+  assert_true(buffer_contains(buf, "NEW LINE"), "expanded review did not render diff context")
+  local expanded_parent_row = find_row_after(buf, "This is inline comment without review", find_row(buf, "NEW LINE"))
+  local expanded_reply_row = find_row_after(buf, "Oh good point! fixed", expanded_parent_row)
+  assert_true(expanded_reply_row > expanded_parent_row, "expanded review reply did not render under the parent comment")
+  assert_true(expanded_reply_row < find_row_after(buf, "Changes", rejected_review_row), "expanded review reply rendered in the wrong section")
+  assert_true(buffer_contains(buf, "foo | 2026-06-14 17:00"), "expanded review reply header did not render author and timestamp")
   assert_true(vim.bo[buf].buftype == "acwrite", "PR buffer must be acwrite")
   assert_true(not vim.bo[buf].modifiable, "PR buffer must start nomodifiable")
 
   local title_row = find_row(buf, "Title:  Old title")
   local body_row = find_row(buf, "Line one")
+  local regular_comment_row = find_row(buf, "This is a regular comment")
 
   -- ── the buffer unlocks exactly on the editable regions ─────────────────────
   move_cursor(buf, find_row(buf, "URL:"))
@@ -202,6 +330,8 @@ local function run()
   move_cursor(buf, body_row)
   assert_true(vim.bo[buf].modifiable, "buffer must unlock on description rows")
   assert_cursor_clamped_to_line(buf, body_row, "PR description")
+  move_cursor(buf, regular_comment_row)
+  assert_true(not vim.bo[buf].modifiable, "regular PR comment row must not be editable as description text")
   move_cursor(buf, find_row(buf, "URL:"))
   assert_true(not vim.bo[buf].modifiable, "buffer must relock after leaving the regions")
 
