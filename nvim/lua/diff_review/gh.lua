@@ -421,6 +421,22 @@ local function pr_api_path(number, repo, resource)
   return ("/repos/%s/pulls/%s/%s"):format(owner_repo, tostring(number), resource)
 end
 
+---@param number integer|string
+---@param repo? string
+---@return string
+local function issue_comments_api_path(number, repo)
+  local owner_repo = (repo and repo ~= "") and repo or "{owner}/{repo}"
+  return ("/repos/%s/issues/%s/comments"):format(owner_repo, tostring(number))
+end
+
+---@param comment_id integer|string
+---@param repo? string
+---@return string
+local function issue_comment_api_path(comment_id, repo)
+  local owner_repo = (repo and repo ~= "") and repo or "{owner}/{repo}"
+  return ("/repos/%s/issues/comments/%s"):format(owner_repo, tostring(comment_id))
+end
+
 ---@param text string
 ---@return table?
 local function decode_json(text)
@@ -769,15 +785,58 @@ function M.create_pending_review_async(cwd, number, repo, opts, cb)
   end)
 end
 
----@param opts { body: string, commit_id?: string, path: string, line?: integer, side?: string, start_line?: integer, start_side?: string, position?: integer }
----@param include_commit boolean
----@return table
-local function review_comment_payload(opts, include_commit)
-  local payload = {
+---@param cwd string
+---@param review_node_id string
+---@param opts { body: string, path: string, position: integer, commit_id?: string }
+---@param cb fun(result: DiffReviewGhPendingReviewResult)
+function M.add_pending_review_comment_async(cwd, review_node_id, opts, cb)
+  if not review_node_id or tostring(review_node_id) == "" then
+    cb({ ok = false, message = "pending review comment requires a review node id", code = 1 })
+    return
+  end
+  local query = table.concat({
+    "mutation($input:AddPullRequestReviewCommentInput!) {",
+    "  addPullRequestReviewComment(input:$input) {",
+    "    comment { id databaseId body path line position createdAt updatedAt author { login } }",
+    "  }",
+    "}",
+  }, "\n")
+  local input = {
+    pullRequestReviewId = review_node_id,
     body = opts.body,
     path = opts.path,
+    position = opts.position,
   }
-  if include_commit then payload.commit_id = opts.commit_id end
+  if opts.commit_id and opts.commit_id ~= "" then input.commitOID = opts.commit_id end
+  graphql_async(query, { input = input }, cwd, function(result)
+    if result.code ~= 0 then
+      cb({ ok = false, message = result.output ~= "" and result.output or ("gh exited " .. result.code), code = result.code })
+      return
+    end
+    local decoded = decode_json(result.stdout)
+    local comment = decoded
+      and decoded.data
+      and decoded.data.addPullRequestReviewComment
+      and decoded.data.addPullRequestReviewComment.comment
+    if type(comment) ~= "table" then
+      cb({ ok = false, message = "gh api returned invalid review comment JSON", code = result.code })
+      return
+    end
+    cb({ ok = true, comments = { normalize_review_comment(comment) } })
+  end)
+end
+
+---@param cwd string
+---@param number integer|string
+---@param repo? string
+---@param opts { body: string, commit_id?: string, path: string, line?: integer, side?: string, start_line?: integer, start_side?: string, position?: integer }
+---@param cb fun(result: DiffReviewGhPendingReviewResult)
+function M.create_pr_review_comment_async(cwd, number, repo, opts, cb)
+  local payload = {
+    body = opts.body,
+    commit_id = opts.commit_id,
+    path = opts.path,
+  }
   if opts.line then
     payload.line = opts.line
     payload.side = opts.side or "RIGHT"
@@ -788,42 +847,7 @@ local function review_comment_payload(opts, include_commit)
   elseif opts.position then
     payload.position = opts.position
   end
-  return payload
-end
-
----@param cwd string
----@param number integer|string
----@param repo? string
----@param review_id integer|string
----@param opts { body: string, path: string, line?: integer, side?: string, start_line?: integer, start_side?: string, position?: integer }
----@param cb fun(result: DiffReviewGhPendingReviewResult)
-function M.add_pending_review_comment_async(cwd, number, repo, review_id, opts, cb)
-  if not review_id or tostring(review_id) == "" or tostring(review_id) == "0" then
-    cb({ ok = false, message = "pending review comment requires a review id", code = 1 })
-    return
-  end
-  local resource = ("reviews/%s/comments"):format(tostring(review_id))
-  system_text_async({ "gh", "api", "--method", "POST", pr_api_path(number, repo, resource), "--input", "-" }, vim.json.encode(review_comment_payload(opts, false)), cwd, function(result)
-    if result.code ~= 0 then
-      cb({ ok = false, message = result.output ~= "" and result.output or ("gh exited " .. result.code), code = result.code })
-      return
-    end
-    local decoded = decode_json(result.stdout)
-    if not decoded then
-      cb({ ok = false, message = "gh api returned invalid review comment JSON", code = result.code })
-      return
-    end
-    cb({ ok = true, comments = { normalize_review_comment(decoded) } })
-  end)
-end
-
----@param cwd string
----@param number integer|string
----@param repo? string
----@param opts { body: string, commit_id?: string, path: string, line?: integer, side?: string, start_line?: integer, start_side?: string, position?: integer }
----@param cb fun(result: DiffReviewGhPendingReviewResult)
-function M.create_pr_review_comment_async(cwd, number, repo, opts, cb)
-  system_text_async({ "gh", "api", "--method", "POST", pr_api_path(number, repo, "comments"), "--input", "-" }, vim.json.encode(review_comment_payload(opts, true)), cwd, function(result)
+  system_text_async({ "gh", "api", "--method", "POST", pr_api_path(number, repo, "comments"), "--input", "-" }, vim.json.encode(payload), cwd, function(result)
     if result.code ~= 0 then
       cb({ ok = false, message = result.output ~= "" and result.output or ("gh exited " .. result.code), code = result.code })
       return
@@ -834,6 +858,46 @@ function M.create_pr_review_comment_async(cwd, number, repo, opts, cb)
       return
     end
     cb({ ok = true, comments = { normalize_review_comment(decoded) } })
+  end)
+end
+
+---@param cwd string
+---@param number integer|string
+---@param repo? string
+---@param body string
+---@param cb fun(result: DiffReviewGhPRCommentsResult)
+function M.create_issue_comment_async(cwd, number, repo, body, cb)
+  system_text_async({ "gh", "api", "--method", "POST", issue_comments_api_path(number, repo), "--input", "-" }, vim.json.encode({ body = body }), cwd, function(result)
+    if result.code ~= 0 then
+      cb({ ok = false, message = result.output ~= "" and result.output or ("gh exited " .. result.code), code = result.code })
+      return
+    end
+    local decoded = decode_json(result.stdout)
+    if not decoded then
+      cb({ ok = false, message = "gh api returned invalid issue comment JSON", code = result.code })
+      return
+    end
+    cb({ ok = true, issue_comments = { normalize_issue_comment(decoded) } })
+  end)
+end
+
+---@param cwd string
+---@param repo? string
+---@param comment_id integer|string
+---@param body string
+---@param cb fun(result: DiffReviewGhPRCommentsResult)
+function M.update_issue_comment_async(cwd, repo, comment_id, body, cb)
+  system_text_async({ "gh", "api", "--method", "PATCH", issue_comment_api_path(comment_id, repo), "--input", "-" }, vim.json.encode({ body = body }), cwd, function(result)
+    if result.code ~= 0 then
+      cb({ ok = false, message = result.output ~= "" and result.output or ("gh exited " .. result.code), code = result.code })
+      return
+    end
+    local decoded = decode_json(result.stdout)
+    if not decoded then
+      cb({ ok = false, message = "gh api returned invalid issue comment JSON", code = result.code })
+      return
+    end
+    cb({ ok = true, issue_comments = { normalize_issue_comment(decoded) } })
   end)
 end
 
