@@ -912,21 +912,56 @@ local function run()
   end, "long inline edit did not reflow the rendered comment box")
   vim.api.nvim_exec_autocmds("TextChanged", { buffer = buf })
   vim.wait(40, function() return false end, 10)
-  local local_reflow_body = state.review_comments[1].body
   assert_true(
-    diff_review._review.comment_body_for_sync(local_reflow_body) == reflow_text,
-    "rendered wraps did not normalize back to one paragraph: " .. tostring(local_reflow_body)
+    state.review_comments[1].body == reflow_text,
+    "rendered wraps were persisted as hard local lines: " .. tostring(state.review_comments[1].body)
   )
   local reflow_start_row, reflow_end_row = diff_review._review.comment_body_rows(buf, state.review_comments[1])
   assert_true(vim.api.nvim_get_current_buf() == buf, "long inline edit opened a popup")
   assert_true(vim.api.nvim_win_get_cursor(0)[1] >= reflow_start_row, "long inline edit cursor left comment body")
   assert_true(vim.api.nvim_win_get_cursor(0)[1] <= reflow_end_row, "long inline edit cursor left comment body after wrap")
+  local flow_target_row = reflow_start_row
+  assert_true(reflow_end_row > reflow_start_row, "reflow test setup did not produce wrapped rows")
+  local rendered_flow_lines = {}
+  for row = reflow_start_row, reflow_end_row do
+    local line = lines(buf)[row]
+    local start_col = diff_review._review.comment_body_text_bounds_at_row(buf, row, line)
+    local text = diff_review._review.comment_body_text_from_line(line, start_col)
+    if row == flow_target_row then text = text .. " test" end
+    rendered_flow_lines[#rendered_flow_lines + 1] = text
+  end
+  local flow_target_line = lines(buf)[flow_target_row]
+  local flow_start_col = diff_review._review.comment_body_text_bounds_at_row(buf, flow_target_row, flow_target_line)
+  local flow_target_text = diff_review._review.comment_body_text_from_line(flow_target_line, flow_start_col)
+  vim.api.nvim_buf_set_lines(
+    buf,
+    flow_target_row - 1,
+    flow_target_row,
+    false,
+    { (" "):rep(flow_start_col) .. flow_target_text .. " test" }
+  )
+  vim.api.nvim_win_set_cursor(0, { flow_target_row, flow_start_col + #flow_target_text + #" test" })
+  vim.api.nvim_exec_autocmds("TextChanged", { buffer = buf })
+  local expected_reflow_body = table.concat(rendered_flow_lines, " ")
+  wait_for(function()
+    return state.review_comments[1].body == expected_reflow_body
+  end, "editing at a wrapped row end did not reflow the whole local paragraph: " .. tostring(state.review_comments[1].body))
+  diff_review._review.render(buf)
+  wait_for(function()
+    local start_row, end_row = diff_review._review.comment_body_rows(buf, state.review_comments[1])
+    return start_row and end_row and end_row > start_row
+  end, "wrapped-row end edit did not rerender comment body")
+  for row = reflow_start_row, reflow_end_row + 1 do
+    local line = lines(buf)[row] or ""
+    local body_text = diff_review._review.comment_body_text_from_line(line)
+    assert_true(body_text ~= "test", "wrapped-row end edit rendered the inserted word as its own line")
+  end
   local reflow_update_count = #comment_updates
   trigger(buf, "<C-s>")
   wait_for(function() return #comment_updates > reflow_update_count end, "manual sync did not update reflowed comment")
   local reflow_payload = vim.json.decode(comment_updates[#comment_updates].input)
   assert_true(
-    reflow_payload.variables.input.body == reflow_text,
+    reflow_payload.variables.input.body == expected_reflow_body,
     "manual sync sent rendered wraps as hard newlines: " .. vim.inspect(reflow_payload.variables.input.body)
   )
   assert_true(

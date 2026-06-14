@@ -5815,6 +5815,8 @@ function M._review.comments_for_storage(state)
     copy.review_body_start = nil
     copy.review_body_end = nil
     copy.review_body_line_marks = nil
+    copy.review_body_render_rows = nil
+    copy.review_body_render_row_count = nil
     copy.review_body_prefix_width = nil
     copy.review_rendered_body_text = nil
     comments[#comments + 1] = copy
@@ -6687,14 +6689,20 @@ end
 function M._review.wrap_body_entries(text, width)
   width = math.max(1, width or 1)
   local entries = {}
+  local paragraph_index = 0
   for _, paragraph in ipairs(vim.split(tostring(text or ""), "\n", { plain = true })) do
+    paragraph_index = paragraph_index + 1
     local wrapped = M._review.wrap(paragraph, width)
     if #wrapped == 0 then wrapped[1] = "" end
-    for _, line in ipairs(wrapped) do
-      entries[#entries + 1] = { text = line }
+    for wrap_index, line in ipairs(wrapped) do
+      entries[#entries + 1] = {
+        text = line,
+        paragraph_index = paragraph_index,
+        wrap_index = wrap_index,
+      }
     end
   end
-  if #entries == 0 then entries[1] = { text = "" } end
+  if #entries == 0 then entries[1] = { text = "", paragraph_index = 1, wrap_index = 1 } end
   return entries
 end
 
@@ -6811,6 +6819,8 @@ function M._review.emit_box(comment, index, indent)
       comment_index = index,
       review_body = true,
       review_body_prefix_width = body_prefix_width,
+      review_body_paragraph_index = wrapped_body_entry.paragraph_index,
+      review_body_wrap_index = wrapped_body_entry.wrap_index,
     }
     local rendered_line = body_prefix .. line
     local fill = (" "):rep(math.max(inner - vim.fn.strdisplaywidth(rendered_line), 0))
@@ -6892,6 +6902,8 @@ function M._review.on_render(buf)
   for _, comment in ipairs(state.review_comments or {}) do
     comment.review_body_start, comment.review_body_end = nil, nil
     comment.review_body_line_marks = nil
+    comment.review_body_render_rows = nil
+    comment.review_body_render_row_count = nil
   end
 
   local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
@@ -6926,6 +6938,17 @@ function M._review.on_render(buf)
     local entry = state.entries and state.entries[row] or nil
     local comment = entry and entry.review_body and entry.review_comment or nil
     if comment then
+      comment.review_body_line_marks = comment.review_body_line_marks or {}
+      comment.review_body_render_rows = comment.review_body_render_rows or {}
+      local render_info = {
+        paragraph_index = entry.review_body_paragraph_index,
+        wrap_index = entry.review_body_wrap_index,
+      }
+      local mark_id = vim.api.nvim_buf_set_extmark(buf, M._review.ns, row - 1, 0, { right_gravity = false })
+      comment.review_body_line_marks[#comment.review_body_line_marks + 1] =
+        vim.tbl_extend("force", { id = mark_id }, render_info)
+      comment.review_body_render_rows[row] = render_info
+      comment.review_body_render_row_count = (comment.review_body_render_row_count or 0) + 1
       if comment ~= range_comment then
         close_comment_range(row - 1)
         range_comment, range_start = comment, row
@@ -7125,6 +7148,35 @@ function M._review.comment_body_text_from_line(line, prefix_width)
   return text
 end
 
+---@param left string
+---@param right string
+---@return string
+function M._review.join_comment_body_wrap_lines(left, right)
+  local left_text = tostring(left or ""):gsub("%s+$", "")
+  local right_text = tostring(right or ""):gsub("^%s+", "")
+  if left_text == "" then return right_text end
+  if right_text == "" then return left_text end
+  return left_text .. " " .. right_text
+end
+
+---@param buf integer
+---@param comment table
+---@param row integer 1-based
+---@param allow_row_fallback? boolean
+---@return table?
+function M._review.comment_body_render_info_at_row(buf, comment, row, allow_row_fallback)
+  for _, mark in ipairs(comment.review_body_line_marks or {}) do
+    if mark.id then
+      local pos = vim.api.nvim_buf_get_extmark_by_id(buf, M._review.ns, mark.id, {})
+      if pos and pos[1] == row - 1 then return mark end
+    end
+  end
+  if allow_row_fallback and comment.review_body_render_rows then
+    return comment.review_body_render_rows[row]
+  end
+  return nil
+end
+
 ---@param lines string[]
 ---@return string[]
 function M._review.trim_comment_body_lines(lines)
@@ -7140,6 +7192,46 @@ function M._review.trim_comment_body_lines(lines)
     trimmed[#trimmed + 1] = lines[index] or ""
   end
   return trimmed
+end
+
+---@param rows table[]
+---@return string[]
+function M._review.comment_body_lines_from_rendered_rows(rows)
+  local body_lines = {}
+  local current_line = nil
+  local previous_info = nil
+  local function flush_current()
+    if current_line ~= nil then
+      body_lines[#body_lines + 1] = current_line
+      current_line = nil
+    end
+  end
+
+  for _, row in ipairs(rows or {}) do
+    local text = tostring(row.text or "")
+    local info = row.info
+    if vim.trim(text) == "" then
+      flush_current()
+      body_lines[#body_lines + 1] = ""
+      previous_info = nil
+    else
+      local same_rendered_paragraph = current_line ~= nil
+        and info
+        and previous_info
+        and info.paragraph_index ~= nil
+        and info.paragraph_index == previous_info.paragraph_index
+      if same_rendered_paragraph then
+        current_line = M._review.join_comment_body_wrap_lines(current_line, text)
+      else
+        flush_current()
+        current_line = text
+      end
+      previous_info = info
+    end
+  end
+
+  flush_current()
+  return M._review.trim_comment_body_lines(body_lines)
 end
 
 ---@param lines string[]
@@ -7559,13 +7651,17 @@ function M._review.comment_body_text_from_buffer(buf, comment)
   local start_row0, end_row0 = M._review.comment_body_range0(buf, comment)
   if start_row0 == nil or end_row0 == nil or end_row0 < start_row0 then return nil end
   local raw_lines = vim.api.nvim_buf_get_lines(buf, start_row0, end_row0, false)
-  local body_lines = {}
+  local body_rows = {}
+  local allow_row_fallback = #raw_lines == (tonumber(comment.review_body_render_row_count) or -1)
   for index, line in ipairs(raw_lines) do
     local row = start_row0 + index
     local prefix_width = M._review.comment_body_prefix_width(buf, row, line)
-    body_lines[#body_lines + 1] = M._review.comment_body_text_from_line(line, prefix_width)
+    body_rows[#body_rows + 1] = {
+      text = M._review.comment_body_text_from_line(line, prefix_width),
+      info = M._review.comment_body_render_info_at_row(buf, comment, row, allow_row_fallback),
+    }
   end
-  body_lines = M._review.trim_comment_body_lines(body_lines)
+  local body_lines = M._review.comment_body_lines_from_rendered_rows(body_rows)
   if #body_lines == 0 then return "" end
   if M._review.comment_body_contains_markdown_fence(body_lines) then return table.concat(body_lines, "\n") end
   if M._review.comment_body_looks_like_code(body_lines) then return M._review.fenced_comment_body(body_lines) end
