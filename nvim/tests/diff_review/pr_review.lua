@@ -114,24 +114,26 @@ function gh_backend.system_async(command, input, cb)
       pending_review_creates[#pending_review_creates + 1] = { command = command, input = input }
       local stdout = vim.json.encode({ id = 7, node_id = "PRR_7", state = "PENDING" })
       cb({ code = 0, stdout = stdout, stderr = "", output = stdout })
-    elseif key == "gh api graphql --input -" and input:find("addPullRequestReviewComment", 1, true) then
-      comment_creates[#comment_creates + 1] = { command = command, input = input }
+    elseif key:match("^gh api %-%-method POST /repos/owner/repo/pulls/%d+/reviews/%d+/comments %-%-input %-$") then
+      local matched_pr_number, review_id = key:match("^gh api %-%-method POST /repos/owner/repo/pulls/(%d+)/reviews/(%d+)/comments %-%-input %-$")
+      local payload = vim.json.decode(input or "{}")
+      comment_creates[#comment_creates + 1] = { command = command, input = input, payload = payload, pr_number = matched_pr_number }
+      local database_id = 100 + #comment_creates
       local stdout = vim.json.encode({
-        data = {
-          addPullRequestReviewComment = {
-            comment = {
-              id = "PRRC_101",
-              databaseId = 101,
-              body = "Edited comment body",
-              path = "src/a.txt",
-              line = 2,
-              position = 3,
-              createdAt = "2026-06-13T10:11:12Z",
-              updatedAt = "2026-06-13T10:11:12Z",
-              author = { login = "me" },
-            },
-          },
-        },
+        id = database_id,
+        node_id = "PRRC_" .. tostring(database_id),
+        pull_request_review_id = tonumber(review_id),
+        body = payload.body,
+        path = payload.path,
+        line = payload.line,
+        side = payload.side,
+        start_line = payload.start_line,
+        start_side = payload.start_side,
+        position = payload.position,
+        created_at = "2026-06-13T10:11:12Z",
+        updated_at = "2026-06-13T10:11:12Z",
+        html_url = "https://github.com/owner/repo/pull/12#discussion_r" .. tostring(database_id),
+        user = { login = "me" },
       })
       cb({ code = 0, stdout = stdout, stderr = "", output = stdout })
     elseif key == "gh api graphql --input -" and input:find("updatePullRequestReviewComment", 1, true) then
@@ -560,6 +562,13 @@ local function run()
   wait_for(function() return not buffer_contains(buf, "*you | ") end, "manual sync did not clear dirty marker immediately")
   wait_for(function() return #pending_review_creates == 1 end, "manual sync did not create a pending review")
   wait_for(function() return #comment_creates == 1 end, "manual sync did not create the pending review comment")
+  assert_true(
+    comment_creates[1].command[5] == "/repos/owner/repo/pulls/12/reviews/7/comments",
+    "pending review comment create did not use the REST review comments endpoint"
+  )
+  assert_true(comment_creates[1].payload.line == 2, "pending review comment create did not send line")
+  assert_true(comment_creates[1].payload.side == "RIGHT", "pending review comment create did not send side")
+  assert_true(comment_creates[1].payload.commit_id == nil, "pending review comment create should not send commit_id")
 
   -- ── cursor can land on the comment; y jumps to it ──────────────────────────
   vim.api.nvim_win_set_cursor(0, { 1, 0 })
@@ -1136,6 +1145,22 @@ local function run()
   assert_true(same_pr_buf ~= nil, "same PR review did not open")
   wait_for(function() return buffer_contains(same_pr_buf, "Edited comment body") end, "same PR review did not load draft comment")
   assert_true(buffer_contains(same_pr_buf, "Looks good overall"), "same PR review did not load draft summary")
+  wait_for(function()
+    return diff_review._review.state(same_pr_buf).review_remote == nil
+  end, "same PR review did not clear a stale cached pending review id")
+  local stale_pending_create_count = #pending_review_creates
+  local stale_pending_comment_count = #comment_creates
+  local fresh_pending_comment =
+    create_inline_comment_with_key(same_pr_buf, find_row(same_pr_buf, "NEW src/b.txt"), "C after stale cached pending review")
+  set_inline_comment_body(same_pr_buf, fresh_pending_comment, "Fresh pending review comment")
+  trigger(same_pr_buf, "<C-s>")
+  wait_for(function() return #pending_review_creates == stale_pending_create_count + 1 end, "stale cached pending review was reused")
+  wait_for(function() return #comment_creates == stale_pending_comment_count + 1 end, "fresh pending review comment was not created")
+  assert_true(
+    comment_creates[#comment_creates].command[5] == "/repos/owner/repo/pulls/12/reviews/7/comments",
+    "fresh pending review comment did not use the newly created pending review id"
+  )
+  vim.api.nvim_win_set_buf(0, buf)
 
   local other_pr = vim.deepcopy(pr)
   other_pr.number = 13

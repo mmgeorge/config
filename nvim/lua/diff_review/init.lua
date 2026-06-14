@@ -6766,6 +6766,9 @@ function M._review.apply_remote_review_result(state, result)
   if result.review then
     state.review_remote = result.review
     changed = true
+  elseif type(state.review_remote) == "table" and (state.review_remote.id or state.review_remote.node_id) then
+    state.review_remote = nil
+    changed = true
   end
   if M._review.merge_remote_comments(state, result.comments or {}) then changed = true end
   return true, changed
@@ -6908,11 +6911,14 @@ function M._review.process_sync_queue(buf)
       finish(false)
       return
     end
-    gh.add_pending_review_comment_async(state.cwd, state.review_remote.node_id, {
+    gh.add_pending_review_comment_async(state.cwd, state.pr.number, state.pr.repo, state.review_remote.id, {
       body = queued_body,
       path = comment.path,
+      line = comment.line,
+      side = comment.side,
+      start_line = comment.start_line,
+      start_side = comment.start_side,
       position = comment.position,
-      commit_id = state.commit_id,
     }, function(result)
       if not result.ok then
         notify_error("PR review comment create failed: " .. (result.message or "gh failed"), "DiffReview")
