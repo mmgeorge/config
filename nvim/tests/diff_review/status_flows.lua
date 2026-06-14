@@ -2,9 +2,11 @@ vim.loader.enable(false)
 
 local diff_review = require("diff_review")
 local gh = require("diff_review.gh")
+local repo_cache = require("github.repo_cache")
 local original_notify = vim.notify
 
 local root = "D:/diffreview-flow-root"
+local repo_cache_dir = vim.fn.tempname()
 local calls = {}
 local deletes = {}
 local state = {}
@@ -12,11 +14,33 @@ local held_systemlist_async = nil
 local held_gh_async = nil
 local captured_notifications = {}
 local gh_calls = 0
+local repo_metadata_calls = 0
 
 ---@type DiffReviewGhBackend
 local gh_backend = {}
 
-function gh_backend.system_async(_, _, cb)
+function gh_backend.system_async(command, _, cb)
+  local key = table.concat(command, "\t")
+  if key == "gh\trepo\tview\t--json\tnameWithOwner" then
+    repo_metadata_calls = repo_metadata_calls + 1
+    vim.defer_fn(function()
+      cb({ code = 0, stdout = vim.json.encode({ nameWithOwner = "owner/repo" }), stderr = "", output = "" })
+    end, 5)
+    return
+  end
+  if key == "gh\tapi\t/repos/owner/repo/contributors\t--paginate\t--slurp" then
+    repo_metadata_calls = repo_metadata_calls + 1
+    local stdout = vim.json.encode({
+      {
+        { login = "alice-dev" },
+        { login = "bobtown" },
+      },
+    })
+    vim.defer_fn(function()
+      cb({ code = 0, stdout = stdout, stderr = "", output = stdout })
+    end, 5)
+    return
+  end
   gh_calls = gh_calls + 1
   if held_gh_async then
     held_gh_async[#held_gh_async + 1] = function()
@@ -558,6 +582,7 @@ local function run()
   assert_path_helpers()
   diff_review.set_git_backend(backend)
   gh.set_backend(gh_backend)
+  repo_cache.set_data_dir_for_test(repo_cache_dir)
   vim.notify = function(message, level, opts)
     captured_notifications[#captured_notifications + 1] = {
       message = tostring(message),
@@ -572,6 +597,9 @@ local function run()
   reset_state({ modified = { ["mod.txt"] = true } })
   render_and_wait(buf, "mod.txt +1 -1")
   wait_for(function() return gh_calls > 0 end, "initial PR lookup did not run")
+  wait_for(function()
+    return repo_metadata_calls >= 2 and #repo_cache.contributors("owner/repo") == 2
+  end, "GitStatus did not load repo contributor metadata")
 
   reset_state({ modified = numbered_files("preview-unstaged", 31) })
   reset_calls()
@@ -1325,6 +1353,8 @@ end
 local ok, err = xpcall(run, debug.traceback)
 diff_review.reset_git_backend()
 gh.reset_backend()
+repo_cache.set_data_dir_for_test(nil)
+vim.fn.delete(repo_cache_dir, "rf")
 vim.notify = original_notify
 if not ok then
   vim.api.nvim_err_writeln(err)

@@ -3370,7 +3370,7 @@ function M.refresh_open_diff_buffer(filename)
   end)
 end
 
-local function confirm(lines, on_yes)
+local function confirm(lines, on_yes, on_no)
   local body = vim.list_extend({}, lines)
   body[#body + 1] = ""
   body[#body + 1] = "  [y] yes    [n] no"
@@ -3396,12 +3396,16 @@ local function confirm(lines, on_yes)
   local function close()
     if vim.api.nvim_win_is_valid(win) then pcall(vim.api.nvim_win_close, win, true) end
   end
+  local function cancel()
+    close()
+    if on_no then on_no() end
+  end
   vim.keymap.set("n", "y", function()
     close()
     on_yes()
   end, { buffer = buf, nowait = true, silent = true })
   for _, key in ipairs({ "n", "q", "<Esc>" }) do
-    vim.keymap.set("n", key, close, { buffer = buf, nowait = true, silent = true })
+    vim.keymap.set("n", key, cancel, { buffer = buf, nowait = true, silent = true })
   end
 end
 
@@ -3861,12 +3865,30 @@ local function status_pr_detail_head_lines(pr)
   if pr.url and pr.url ~= "" then
     lines[#lines + 1] = { segments = { { "URL:    ", "DiffReviewStatusLabel" }, { pr.url, "DiffReviewStatusPR" } } }
   end
+  lines[#lines + 1] = { segments = { { "Review: ", "DiffReviewStatusLabel" } } }
   lines[#lines + 1] = { segments = { { "" } } }
   lines[#lines + 1] = { segments = { { "Description:", "DiffReviewStatusHeader" } } }
   for _, line in ipairs(status_markdown_lines(pr.body)) do
     lines[#lines + 1] = { segments = { { line } } }
   end
   return lines
+end
+
+---@param cwd string?
+---@param repo string?
+function M.github_load_repo_metadata(cwd, repo)
+  local cache = require("github.repo_cache")
+  if repo and repo ~= "" then
+    cache.ensure_metadata(cwd, repo, function(done)
+      gh.repo_contributors_async(cwd, repo, done)
+    end)
+    return
+  end
+  cache.ensure_metadata_for_cwd(cwd, function(done)
+    gh.current_repo_async(cwd, done)
+  end, function(resolved_repo, done)
+    gh.repo_contributors_async(cwd, resolved_repo, done)
+  end)
 end
 
 ---@param cwd string
@@ -6557,6 +6579,16 @@ function M.render_status(buf, target_id, fallback_line, opts)
         target_id, fallback_line = status_cursor_target(buf)
       end
       status_render_loaded(buf, target_id, fallback_line, opts, result.head_lines, result.sections)
+      vim.schedule(function()
+        local metadata_status = M._status_states and M._status_states[buf] or render_state
+        if not (
+          metadata_status
+          and metadata_status.request_id == request_id
+          and metadata_status.cwd == cwd
+          and vim.api.nvim_buf_is_valid(buf)
+        ) then return end
+        M.github_load_repo_metadata(cwd, require("github.repo_cache").repo_for_cwd(cwd))
+      end)
       if pr_request_id then
         vim.defer_fn(function()
           status_start_pr_lookup(cwd, buf, pr_request_id)
@@ -6704,13 +6736,12 @@ end
 
 ---@param path string?
 function M._review.set_data_dir_for_test(path)
-  M._review.data_dir_for_test = path
+  require("github.repo_cache").set_data_dir_for_test(path)
 end
 
 ---@return string
 function M._review.data_dir()
-  return M._review.data_dir_for_test
-    or vim.fs.joinpath(vim.fn.stdpath("data"), "gitstatus", "reviews")
+  return require("github.repo_cache").base_dir()
 end
 
 ---@param state table
@@ -6748,10 +6779,7 @@ end
 ---@param state table
 ---@return string
 function M._review.storage_path(state)
-  local parts = { M._review.data_dir() }
-  vim.list_extend(parts, M._review.storage_segments(state))
-  parts[#parts + 1] = "review.json"
-  return vim.fs.joinpath(unpack(parts))
+  return require("github.repo_cache").review_path(M._review.storage_repo(state), (state.pr or {}).number)
 end
 
 ---@param state table
@@ -9796,9 +9824,11 @@ M._pr_edit = { ns = vim.api.nvim_create_namespace("diff_review_pr_edit") }
 ---@field queue fun(done: fun())[]
 ---@field running boolean
 ---@field title_mark? integer
+---@field review_mark? integer
 ---@field desc_start_mark? integer
 ---@field desc_end_mark? integer beyond-the-last-body-line mark (end-exclusive)
 ---@field title_marker_id? integer
+---@field review_marker_id? integer
 ---@field desc_marker_id? integer
 ---@field lock_initial? boolean
 ---@field initial_cursor_row? integer
@@ -9816,41 +9846,48 @@ end
 ---@param status table
 ---@return string? title without the "Title:" label
 ---@return string? desc description block joined with newlines
+---@return string? review reviewer-request field without the "Review:" label
 function M._pr_edit.current_values(buf, status)
   local state = status.pr_edit
   if not state then return nil end
   local title_row0 = M._pr_edit.mark_row(buf, state.title_mark)
+  local review_row0 = M._pr_edit.mark_row(buf, state.review_mark)
   local first0 = M._pr_edit.mark_row(buf, state.desc_start_mark)
   local after0 = M._pr_edit.mark_row(buf, state.desc_end_mark)
-  if not (title_row0 and first0 and after0) then return nil end
+  if not (title_row0 and review_row0 and first0 and after0) then return nil end
   local title_line = vim.api.nvim_buf_get_lines(buf, title_row0, title_row0 + 1, false)[1] or ""
+  local review_line = vim.api.nvim_buf_get_lines(buf, review_row0, review_row0 + 1, false)[1] or ""
   local title = vim.trim((title_line:gsub("^Title:%s*", "")))
+  local review = vim.trim((review_line:gsub("^Review:%s*", "")))
   local desc = table.concat(vim.api.nvim_buf_get_lines(buf, first0, after0, false), "\n")
-  return title, desc
+  return title, desc, review
 end
 
 ---@param buf integer
 ---@param status table
 ---@return boolean title_dirty
 ---@return boolean desc_dirty
+---@return boolean review_dirty
 function M._pr_edit.dirty_flags(buf, status)
-  local title, desc = M._pr_edit.current_values(buf, status)
-  if title == nil or not status.pr then return false, false end
+  local title, desc, review = M._pr_edit.current_values(buf, status)
+  if title == nil or not status.pr then return false, false, false end
   local baseline = table.concat(status_markdown_lines(status.pr.body), "\n")
-  return title ~= status.pr.title, desc ~= baseline
+  return title ~= status.pr.title, desc ~= baseline, vim.trim(review or "") ~= ""
 end
 
 ---@param buf integer
 ---@param row integer 1-based cursor row
----@return "title"|"desc"|nil
+---@return "title"|"review"|"desc"|nil
 function M._pr_edit.region_kind_at(buf, row)
   local status = M._status_states and M._status_states[buf] or nil
   local state = status and status.pr_edit or nil
   if not state then return nil end
   local title_row0 = M._pr_edit.mark_row(buf, state.title_mark)
+  local review_row0 = M._pr_edit.mark_row(buf, state.review_mark)
   local first0 = M._pr_edit.mark_row(buf, state.desc_start_mark)
   local after0 = M._pr_edit.mark_row(buf, state.desc_end_mark)
   if title_row0 and row == title_row0 + 1 then return "title" end
+  if review_row0 and row == review_row0 + 1 then return "review" end
   if first0 and after0 and row >= first0 + 1 and row <= after0 then return "desc" end
   return nil
 end
@@ -9858,7 +9895,7 @@ end
 ---@param buf integer
 ---@param state DiffReviewPrEditState
 function M._pr_edit.clear_markers(buf, state)
-  for _, key in ipairs({ "title_marker_id", "desc_marker_id" }) do
+  for _, key in ipairs({ "title_marker_id", "review_marker_id", "desc_marker_id" }) do
     if state[key] then
       pcall(vim.api.nvim_buf_del_extmark, buf, M._pr_edit.ns, state[key])
       state[key] = nil
@@ -9872,8 +9909,9 @@ function M._pr_edit.refresh_markers(buf)
   local status = M._status_states and M._status_states[buf] or nil
   local state = status and status.pr_edit or nil
   if not (state and vim.api.nvim_buf_is_valid(buf)) then return end
-  local title_dirty, desc_dirty = M._pr_edit.dirty_flags(buf, status)
+  local title_dirty, desc_dirty, review_dirty = M._pr_edit.dirty_flags(buf, status)
   local title_row0 = M._pr_edit.mark_row(buf, state.title_mark)
+  local review_row0 = M._pr_edit.mark_row(buf, state.review_mark)
   local first0 = M._pr_edit.mark_row(buf, state.desc_start_mark)
 
   local function set_marker(key, wanted, row0)
@@ -9890,6 +9928,7 @@ function M._pr_edit.refresh_markers(buf)
   end
 
   set_marker("title_marker_id", title_dirty, title_row0)
+  set_marker("review_marker_id", review_dirty, review_row0)
   set_marker("desc_marker_id", desc_dirty, first0 and first0 - 1 or nil)
 end
 
@@ -9901,8 +9940,8 @@ function M._pr_edit.blocks_render(buf)
   local status = M._status_states and M._status_states[buf] or nil
   local state = status and status.pr_edit or nil
   if not (state and status.pr and vim.api.nvim_buf_is_valid(buf)) then return false end
-  local title_dirty, desc_dirty = M._pr_edit.dirty_flags(buf, status)
-  if not (title_dirty or desc_dirty) then return false end
+  local title_dirty, desc_dirty, review_dirty = M._pr_edit.dirty_flags(buf, status)
+  if not (title_dirty or desc_dirty or review_dirty) then return false end
   vim.notify("Unsynced PR edits — :w to sync before refreshing", vim.log.levels.WARN, { title = "DiffReview" })
   return true
 end
@@ -9916,27 +9955,131 @@ function M._pr_edit.on_render(buf)
   local state = status and status.pr_edit or nil
   if not (state and status.pr and vim.api.nvim_buf_is_valid(buf)) then return end
   vim.api.nvim_buf_clear_namespace(buf, M._pr_edit.ns, 0, -1)
-  state.title_mark, state.desc_start_mark, state.desc_end_mark = nil, nil, nil
-  state.title_marker_id, state.desc_marker_id = nil, nil
+  state.title_mark, state.review_mark, state.desc_start_mark, state.desc_end_mark = nil, nil, nil, nil
+  state.title_marker_id, state.review_marker_id, state.desc_marker_id = nil, nil, nil
 
   local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-  local title_row, label_row
+  local title_row, review_row, label_row
   for index, line in ipairs(lines) do
     if not title_row and line:match("^Title:") then title_row = index end
+    if not review_row and line:match("^Review:") then review_row = index end
     if not label_row and line == "Description:" then label_row = index end
-    if title_row and label_row then break end
+    if title_row and review_row and label_row then break end
   end
-  if not (title_row and label_row) then return end
+  if not (title_row and review_row and label_row) then return end
 
   -- right_gravity=false: a mark with right gravity slides to the next line
   -- when its own line is replaced (retyped), losing the region.
   local body_count = #status_markdown_lines(status.pr.body)
   state.title_mark = vim.api.nvim_buf_set_extmark(buf, M._pr_edit.ns, title_row - 1, 0, { right_gravity = false })
+  state.review_mark = vim.api.nvim_buf_set_extmark(buf, M._pr_edit.ns, review_row - 1, 0, { right_gravity = false })
   state.desc_start_mark = vim.api.nvim_buf_set_extmark(buf, M._pr_edit.ns, label_row, 0, { right_gravity = false })
   state.desc_end_mark = vim.api.nvim_buf_set_extmark(buf, M._pr_edit.ns, label_row + body_count, 0, { right_gravity = false })
   vim.bo[buf].modified = false
   M._pr_edit.refresh_markers(buf)
   M._pr_edit.sync_modifiable(buf)
+end
+
+---@param text string?
+---@return string[]
+function M._pr_edit.reviewer_usernames(text)
+  local usernames = {}
+  local seen = {}
+  for token in tostring(text or ""):gmatch("@?[%w][%w_-]*") do
+    local username = token:gsub("^@", "")
+    local key = username:lower()
+    if username ~= "" and not seen[key] then
+      seen[key] = true
+      usernames[#usernames + 1] = username
+    end
+  end
+  return usernames
+end
+
+---@param usernames string[]
+---@param users? table<string, DiffReviewGhUser>
+---@return string[]
+function M._pr_edit.review_confirmation_lines(usernames, users)
+  local lines = { "Request review from:" }
+  for _, username in ipairs(usernames) do
+    local user = users and users[username:lower()] or nil
+    local name = user and vim.trim(user.name or "") or ""
+    if name ~= "" then
+      lines[#lines + 1] = ("  @%s (%s)"):format(username, name)
+    else
+      lines[#lines + 1] = ("  @%s"):format(username)
+    end
+  end
+  return lines
+end
+
+---@param buf integer
+function M._pr_edit.restore_dirty(buf)
+  if not vim.api.nvim_buf_is_valid(buf) then return end
+  vim.bo[buf].modified = true
+  M._pr_edit.refresh_markers(buf)
+end
+
+---@param buf integer
+---@param status table
+function M._pr_edit.clear_review_row(buf, status)
+  local state = status and status.pr_edit or nil
+  local review_row0 = state and M._pr_edit.mark_row(buf, state.review_mark) or nil
+  if not (review_row0 and vim.api.nvim_buf_is_valid(buf)) then return end
+  local was_modifiable = vim.bo[buf].modifiable
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_set_lines(buf, review_row0, review_row0 + 1, false, { "Review: " })
+  vim.bo[buf].modifiable = was_modifiable
+end
+
+---@param buf integer
+---@param status table
+---@param usernames string[]
+---@param done fun(ok: boolean)
+function M._pr_edit.confirm_and_request_reviewers(buf, status, usernames, done)
+  if #usernames == 0 then
+    notify_error("No valid reviewers in Review field", "DiffReview")
+    M._pr_edit.restore_dirty(buf)
+    done(false)
+    return
+  end
+
+  gh.resolve_users_async(status.cwd, usernames, function(user_result)
+    if not vim.api.nvim_buf_is_valid(buf) then
+      done(false)
+      return
+    end
+    local lines = M._pr_edit.review_confirmation_lines(usernames, user_result.users or {})
+    confirm(lines, function()
+      local latest = M._status_states and M._status_states[buf] or nil
+      if not (latest and latest.pr) then
+        done(false)
+        return
+      end
+      gh.request_reviewers_async(latest.cwd, latest.pr.number, latest.pr.repo, usernames, function(result)
+        if not vim.api.nvim_buf_is_valid(buf) then
+          done(false)
+          return
+        end
+        if not result.ok then
+          notify_error("GitHub reviewer request failed: " .. (result.message or "gh failed"), "DiffReview")
+          M._pr_edit.restore_dirty(buf)
+          done(false)
+          return
+        end
+        M._pr_edit.clear_review_row(buf, latest)
+        vim.bo[buf].modified = false
+        M._pr_edit.refresh_markers(buf)
+        vim.notify(("Requested review from %s"):format(table.concat(vim.tbl_map(function(username)
+          return "@" .. username
+        end, usernames), ", ")), vim.log.levels.INFO, { title = "DiffReview" })
+        done(true)
+      end)
+    end, function()
+      M._pr_edit.restore_dirty(buf)
+      done(false)
+    end)
+  end)
 end
 
 ---Sequential sync queue, mirroring status_enqueue_operation without its
@@ -9967,44 +10110,55 @@ function M._pr_edit.sync(buf)
   local state = status and status.pr_edit or nil
   if not (status and state and status.pr) then return end
   M._status = status
-  local title, desc = M._pr_edit.current_values(buf, status)
-  local title_dirty, desc_dirty = M._pr_edit.dirty_flags(buf, status)
+  local title, desc, review = M._pr_edit.current_values(buf, status)
+  local title_dirty, desc_dirty, review_dirty = M._pr_edit.dirty_flags(buf, status)
   vim.bo[buf].modified = false
-  if not (title_dirty or desc_dirty) then return end
+  if not (title_dirty or desc_dirty or review_dirty) then return end
 
   M._pr_edit.clear_markers(buf, state)
   local pr = status.pr
-  local edit = {
-    title = title_dirty and title or nil,
-    body = desc_dirty and desc or nil,
-  }
-  M._pr_edit.enqueue(state, function(done)
-    gh.update_pr_async(status.cwd, pr.number, pr.repo, edit, function(result)
-      if not vim.api.nvim_buf_is_valid(buf) then
+  local function sync_title_and_description()
+    if not (title_dirty or desc_dirty) then return end
+    local edit = {
+      title = title_dirty and title or nil,
+      body = desc_dirty and desc or nil,
+    }
+    M._pr_edit.enqueue(state, function(done)
+      gh.update_pr_async(status.cwd, pr.number, pr.repo, edit, function(result)
+        if not vim.api.nvim_buf_is_valid(buf) then
+          done()
+          return
+        end
+        if result.code ~= 0 then
+          notify_error(
+            "GitHub PR update failed: " .. (result.output ~= "" and result.output or ("gh exited " .. tostring(result.code))),
+            "DiffReview"
+          )
+          vim.bo[buf].modified = true
+          M._pr_edit.refresh_markers(buf)
+          done()
+          return
+        end
+        if edit.title then pr.title = edit.title end
+        if edit.body then pr.body = edit.body end
+        local latest = M._status_states and M._status_states[buf] or nil
+        if latest == status then
+          M._status = status
+          render_pr_status(pr, status.cwd, buf, status.pr_diff_text)
+        end
+        vim.notify(("PR #%s updated"):format(tostring(pr.number)), vim.log.levels.INFO, { title = "DiffReview" })
         done()
-        return
-      end
-      if result.code ~= 0 then
-        notify_error(
-          "GitHub PR update failed: " .. (result.output ~= "" and result.output or ("gh exited " .. tostring(result.code))),
-          "DiffReview"
-        )
-        vim.bo[buf].modified = true
-        M._pr_edit.refresh_markers(buf)
-        done()
-        return
-      end
-      if edit.title then pr.title = edit.title end
-      if edit.body then pr.body = edit.body end
-      local latest = M._status_states and M._status_states[buf] or nil
-      if latest == status then
-        M._status = status
-        render_pr_status(pr, status.cwd, buf, status.pr_diff_text)
-      end
-      vim.notify(("PR #%s updated"):format(tostring(pr.number)), vim.log.levels.INFO, { title = "DiffReview" })
-      done()
+      end)
     end)
-  end)
+  end
+
+  if review_dirty then
+    M._pr_edit.confirm_and_request_reviewers(buf, status, M._pr_edit.reviewer_usernames(review), function(confirmed)
+      if confirmed then sync_title_and_description() end
+    end)
+  else
+    sync_title_and_description()
+  end
 end
 
 ---Unlock the buffer exactly when the cursor sits in an editable region, so
@@ -10039,11 +10193,13 @@ function M._pr_edit.attach(buf)
   if not status then return end
   status.pr_edit = { queue = {}, running = false, lock_initial = true }
   vim.bo[buf].buftype = "acwrite"
+  vim.b[buf].diff_review_pr_reviewer_completion = true
 
-  -- The title is single-line: swallow newline attempts there.
+  -- The title and reviewer request fields are single-line: swallow newline attempts there.
   vim.keymap.set("i", "<CR>", function()
     local row = vim.api.nvim_win_get_cursor(0)[1]
-    if M._pr_edit.region_kind_at(buf, row) == "title" then return "" end
+    local region = M._pr_edit.region_kind_at(buf, row)
+    if region == "title" or region == "review" then return "" end
     return vim.api.nvim_replace_termcodes("<CR>", true, false, true)
   end, { buffer = buf, expr = true })
 
@@ -11193,7 +11349,9 @@ local function setup_status_keymaps(buf)
         M._pr_overview.add_standalone_comment(buf)
       end)
       map("sync", { "n", "i" }, function()
+        M._review.sync_inline_comment_text(buf)
         M._pr_overview.sync_standalone_comments(buf)
+        M._pr_edit.sync(buf)
       end)
     end
     map("review", "n", function()
@@ -11355,10 +11513,12 @@ function M.open_pr(pr, opts)
   state.pr_standalone_comments = {}
   state.pr_regular_comments = {}
   state.review_comments = M._pr_overview.editable_comments(state)
+  if pr.repo and pr.repo ~= "" then vim.b[buf].github_repo = pr.repo end
   M._status = state
   attach_status_state(buf, state)
   setup_status_keymaps(buf)
   M._pr_edit.attach(buf)
+  M.github_load_repo_metadata(cwd, pr.repo)
 
   local win = vim.api.nvim_get_current_win()
   local ok, err = pcall(vim.api.nvim_win_set_buf, win, buf)
@@ -11453,12 +11613,14 @@ function M.open_review(pr, opts)
     sections = nil,
     fancy_rows = {},
   }
+  if pr.repo and pr.repo ~= "" then vim.b[buf].github_repo = pr.repo end
   M._review.load_draft(state)
   M._review.normalize_comments(state)
   M._status = state
   attach_status_state(buf, state)
   setup_status_keymaps(buf)
   M._review.attach(buf)
+  M.github_load_repo_metadata(cwd, pr.repo)
 
   local win = vim.api.nvim_get_current_win()
   local ok, err = pcall(vim.api.nvim_win_set_buf, win, buf)

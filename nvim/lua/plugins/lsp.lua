@@ -59,7 +59,7 @@ return {
       'barreiroleo/ltex_extra.nvim'
     },
     config = function()
-      -- vim.lsp.set_log_level(1)
+      vim.lsp.log.set_level(vim.lsp.log.levels.OFF)
 
       vim.diagnostic.config({
         virtual_text = {

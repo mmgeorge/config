@@ -255,7 +255,7 @@ return {
       -- Default list of enabled providers defined so that you can extend it
       -- elsewhere in your config, without redefining it, due to `opts_extend`
       sources = {
-        default = { 'lsp', 'path', 'custom_snippets', 'spell' },
+        default = { 'lsp', 'path', 'custom_snippets', 'diff_review_reviewers', 'spell' },
         -- default = { 'snippets', 'lsp', 'path', 'custom_snippets', 'spell' },
         -- min_keyword_length = 3,
         providers = {
@@ -314,6 +314,11 @@ return {
             name = "custom_snippets",
             min_keyword_length = 2,
             module = "snippet_source",
+          },
+          diff_review_reviewers = {
+            name = "Reviewers",
+            min_keyword_length = 0,
+            module = "diff_review.reviewer_source",
           },
           spell = {
             name = 'Spell',

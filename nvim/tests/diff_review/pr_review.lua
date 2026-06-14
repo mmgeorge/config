@@ -1134,7 +1134,7 @@ local function run()
     "review draft path was not under the data dir"
   )
   assert_true(
-    vim.fs.normalize(draft_path) == vim.fs.normalize(vim.fs.joinpath(review_data_dir, "owner", "repo", "12", "review.json")),
+    vim.fs.normalize(draft_path) == vim.fs.normalize(vim.fs.joinpath(review_data_dir, "repos", "owner", "repo", "reviews", "12", "review.json")),
     "review draft path was not based on the GitHub PR identity: " .. draft_path
   )
   assert_true(vim.uv.fs_stat(draft_path) ~= nil, "review draft was not written")
@@ -1168,7 +1168,7 @@ local function run()
   wait_for(function() return buffer_contains(other_buf, "NEW src/a.txt") end, "other PR review diff did not render")
   assert_true(
     vim.fs.normalize(diff_review._review.storage_path(diff_review._review.state(other_buf)))
-      == vim.fs.normalize(vim.fs.joinpath(review_data_dir, "owner", "repo", "13", "review.json")),
+      == vim.fs.normalize(vim.fs.joinpath(review_data_dir, "repos", "owner", "repo", "reviews", "13", "review.json")),
     "other PR review path was not based on its PR number"
   )
   assert_true(not buffer_contains(other_buf, "Edited comment body"), "other PR review loaded the first PR draft")

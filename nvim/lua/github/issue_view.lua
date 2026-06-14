@@ -20,6 +20,15 @@ local state = {
 
 local M = {}
 
+---@param cwd string?
+---@param repo string?
+local function load_repo_metadata(cwd, repo)
+  if not (repo and repo ~= "") then return end
+  require("github.repo_cache").ensure_metadata(cwd, repo, function(done)
+    gh.repo_contributors_async(cwd, repo, done)
+  end)
+end
+
 ---@param value string
 ---@return string[]
 local function split_markdown(value)
@@ -111,6 +120,11 @@ local function on_detail(result)
     return
   end
   state.item = result.item
+  if state.item.repo and state.item.repo ~= "" then
+    state.repo = state.item.repo
+    if state.buf and vim.api.nvim_buf_is_valid(state.buf) then vim.b[state.buf].github_repo = state.item.repo end
+    load_repo_metadata(state.cwd, state.item.repo)
+  end
   set_lines(render_item(result.item))
 end
 
@@ -139,6 +153,10 @@ function M.open(opts)
   state.item = nil
 
   local buf = ensure_buffer()
+  if state.repo and state.repo ~= "" then
+    vim.b[buf].github_repo = state.repo
+    load_repo_metadata(state.cwd, state.repo)
+  end
   local name = "github://" .. state.kind .. "/" .. (state.repo or "current") .. "/" .. tostring(state.number)
   pcall(vim.api.nvim_buf_set_name, buf, name)
   vim.api.nvim_set_current_buf(buf)

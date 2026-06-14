@@ -2,6 +2,7 @@ vim.loader.enable(false)
 
 local diff_review = require("diff_review")
 local gh = require("diff_review.gh")
+local repo_cache = require("github.repo_cache")
 
 local function assert_true(condition, message)
   if not condition then error(message, 2) end
@@ -9,6 +10,7 @@ end
 
 local original_notify = vim.notify
 local captured_notifications = {}
+local repo_cache_dir = vim.fn.tempname()
 local function capture_notify(message, level, opts)
   captured_notifications[#captured_notifications + 1] = {
     message = tostring(message),
@@ -47,6 +49,11 @@ local edit_calls = {}
 local standalone_comment_calls = {}
 ---@type { command: string[], input: string?, payload: table }[]
 local issue_comment_calls = {}
+---@type { command: string[], input: string?, payload: table }[]
+local reviewer_request_calls = {}
+---@type string[]
+local user_lookup_calls = {}
+local contributor_calls = 0
 local edit_should_fail = false
 local opened_urls = {}
 
@@ -220,6 +227,34 @@ function gh_backend.system_async(command, input, cb)
       cb({ code = 0, stdout = stdout, stderr = "", output = stdout })
       return
     end
+    if key == "gh api /repos/owner/repo/contributors --paginate --slurp" then
+      contributor_calls = contributor_calls + 1
+      local stdout = vim.json.encode({
+        {
+          { login = "alice-dev" },
+          { login = "bobtown" },
+        },
+      })
+      cb({ code = 0, stdout = stdout, stderr = "", output = stdout })
+      return
+    end
+    if key == "gh api /users/alice-dev" or key == "gh api /users/bobtown" then
+      local login = key:match("/users/(.+)$")
+      user_lookup_calls[#user_lookup_calls + 1] = login
+      local stdout = vim.json.encode({
+        login = login,
+        name = login == "alice-dev" and "Alice Developer" or "Bob Town",
+      })
+      cb({ code = 0, stdout = stdout, stderr = "", output = stdout })
+      return
+    end
+    if key == "gh api --method POST /repos/owner/repo/pulls/7/requested_reviewers --input -" then
+      local payload = vim.json.decode(input or "{}")
+      reviewer_request_calls[#reviewer_request_calls + 1] = { command = command, input = input, payload = payload }
+      local stdout = vim.json.encode({ requested_reviewers = payload.reviewers })
+      cb({ code = 0, stdout = stdout, stderr = "", output = stdout })
+      return
+    end
     if key:find("gh pr edit", 1, true) then
       edit_calls[#edit_calls + 1] = { command = command, input = input }
       if edit_should_fail then
@@ -356,6 +391,12 @@ local function trigger_buf_mapping(buf, key)
   mapping.callback()
 end
 
+local function trigger_current_mapping(key)
+  local mapping = vim.fn.maparg(key, "n", false, true)
+  assert_true(type(mapping.callback) == "function", "missing current mapping for " .. key)
+  mapping.callback()
+end
+
 local function assert_browse_url(buf, row, expected, label)
   move_cursor(buf, row)
   trigger_buf_mapping(buf, "b")
@@ -370,6 +411,7 @@ local pr = {
   title = "Old title",
   body = "Line one\nLine two",
   url = "https://github.com/owner/repo/pull/7",
+  repo = "owner/repo",
   headRefName = "feature",
   headRefOid = "abc1234def5678abc1234def5678abc1234def56",
   commits = {},
@@ -384,6 +426,7 @@ local function run()
   diff_review.set_git_backend(git_backend)
   gh.set_backend(gh_backend)
   diff_review.setup({ about_auto_generate = false })
+  repo_cache.set_data_dir_for_test(repo_cache_dir)
 
   local buf = diff_review.open_pr(pr, { cwd = "D:/diffreview-pr-edit-root" })
   assert_true(buf ~= nil, "open_pr did not return a buffer")
@@ -572,7 +615,12 @@ local function run()
   assert_true(not vim.bo[buf].modifiable, "PR buffer must start nomodifiable")
 
   local title_row = find_row(buf, "Title:  Old title")
+  local review_row = find_row(buf, "Review:")
   local body_row = find_row(buf, "Line one")
+  assert_true(
+    line_has_highlight(buf, review_row, "DiffReviewStatusLabel", 0, #"Review: "),
+    "PR review request row did not use label highlight"
+  )
 
   -- ── the buffer unlocks exactly on the editable regions ─────────────────────
   move_cursor(buf, find_row(buf, "URL:"))
@@ -580,6 +628,9 @@ local function run()
   move_cursor(buf, title_row)
   assert_true(vim.bo[buf].modifiable, "buffer must unlock on the title row")
   assert_cursor_clamped_to_line(buf, title_row, "PR title")
+  move_cursor(buf, review_row)
+  assert_true(vim.bo[buf].modifiable, "buffer must unlock on the review request row")
+  assert_cursor_clamped_to_line(buf, review_row, "PR review request")
   move_cursor(buf, find_row(buf, "Description:"))
   assert_true(not vim.bo[buf].modifiable, "the Description: label itself must stay locked")
   move_cursor(buf, body_row)
@@ -590,9 +641,48 @@ local function run()
   move_cursor(buf, find_row(buf, "URL:"))
   assert_true(not vim.bo[buf].modifiable, "buffer must relock after leaving the regions")
 
+  -- ── Review: completes cached repo contributors and sends reviewer requests ──
+  wait_for(function()
+    return contributor_calls == 1 and #repo_cache.contributors("owner/repo") == 2
+  end, "repo contributors were not cached")
+  edit_line(buf, review_row, "Review: @")
+  move_cursor(buf, review_row)
+  vim.api.nvim_win_set_cursor(0, { review_row, #"Review: @" })
+  local reviewer_source = require("diff_review.reviewer_source").new({})
+  assert_true(reviewer_source:enabled(), "reviewer completion source did not enable on the Review row")
+  local completion_result
+  reviewer_source:get_completions({}, function(result) completion_result = result end)
+  local completion_labels = {}
+  for _, item in ipairs(completion_result.items or {}) do
+    completion_labels[item.label] = true
+  end
+  assert_true(completion_labels["@alice-dev"], "reviewer completion did not include @alice-dev")
+  assert_true(completion_labels["@bobtown"], "reviewer completion did not include @bobtown")
+  assert_true(not completion_labels["@foobar"], "reviewer completion still included placeholder @foobar")
+
+  edit_line(buf, review_row, "Review: @alice-dev @bobtown")
+  assert_true(vim.bo[buf].modified, "reviewer request edit must mark the PR buffer modified")
+  local rows = marker_rows(buf)
+  assert_true(#rows == 1 and rows[1] == review_row, "reviewer request edit did not mark the Review row dirty")
+  captured_notifications = {}
+  trigger_buf_mapping(buf, "<C-s>")
+  assert_true(#marker_rows(buf) == 0, "reviewer request save must clear markers before confirmation")
+  wait_for(function()
+    return #user_lookup_calls == 2
+      and buffer_contains(vim.api.nvim_get_current_buf(), "@alice-dev (Alice Developer)")
+      and buffer_contains(vim.api.nvim_get_current_buf(), "@bobtown (Bob Town)")
+  end, "reviewer request confirmation did not resolve display names")
+  trigger_current_mapping("y")
+  wait_for(function() return #reviewer_request_calls == 1 end, "reviewer request was not sent")
+  local reviewer_payload = reviewer_request_calls[1].payload
+  assert_true(vim.deep_equal(reviewer_payload.reviewers, { "alice-dev", "bobtown" }), "wrong reviewers payload: " .. vim.inspect(reviewer_payload))
+  wait_for(function() return saw_notification_containing("Requested review from @alice-dev, @bobtown") end, "successful reviewer request was not notified")
+  assert_true(vim.api.nvim_buf_get_lines(buf, review_row - 1, review_row, false)[1] == "Review: ", "Review row was not cleared after reviewer request")
+  assert_true(not vim.bo[buf].modified, "reviewer request sync must clear the modified flag")
+
   -- ── edits flag the field with a "*" marker ──────────────────────────────────
   edit_line(buf, title_row, "Title:  New title")
-  local rows = marker_rows(buf)
+  rows = marker_rows(buf)
   assert_true(#rows == 1 and rows[1] == title_row, "title edit did not add exactly one marker on the title row")
   assert_true(vim.bo[buf].modified, "title edit must mark the buffer modified")
 
@@ -648,6 +738,8 @@ local ok, err = xpcall(run, debug.traceback)
 vim.notify = original_notify
 diff_review.reset_git_backend()
 gh.reset_backend()
+repo_cache.set_data_dir_for_test(nil)
+vim.fn.delete(repo_cache_dir, "rf")
 if not ok then
   vim.api.nvim_err_writeln(err)
   vim.cmd("cquit")

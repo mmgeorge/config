@@ -390,6 +390,33 @@ end
 ---@field title? string
 ---@field body? string
 
+---@class DiffReviewGhUser
+---@field login string
+---@field name? string
+
+---@class DiffReviewGhUsersResult
+---@field ok boolean
+---@field users? table<string, DiffReviewGhUser>
+---@field message? string
+---@field code? integer
+
+---@class DiffReviewGhRequestReviewersResult
+---@field ok boolean
+---@field message? string
+---@field code? integer
+
+---@class DiffReviewGhRepoResult
+---@field ok boolean
+---@field repo? string
+---@field message? string
+---@field code? integer
+
+---@class DiffReviewGhRepoContributorsResult
+---@field ok boolean
+---@field contributors? table[]
+---@field message? string
+---@field code? integer
+
 ---Update a PR's title and/or body via `gh pr edit`. The body is passed on
 ---stdin (`--body-file -`) so it needs no quoting.
 ---@param cwd string
@@ -429,6 +456,22 @@ local function issue_comments_api_path(number, repo)
   return ("/repos/%s/issues/%s/comments"):format(owner_repo, tostring(number))
 end
 
+---@param cwd string
+---@param number integer|string
+---@param repo? string
+---@param reviewers string[]
+---@param cb fun(result: DiffReviewGhRequestReviewersResult)
+function M.request_reviewers_async(cwd, number, repo, reviewers, cb)
+  local payload = { reviewers = reviewers or {} }
+  system_text_async({ "gh", "api", "--method", "POST", pr_api_path(number, repo, "requested_reviewers"), "--input", "-" }, vim.json.encode(payload), cwd, function(result)
+    if result.code ~= 0 then
+      cb({ ok = false, message = result.output ~= "" and result.output or ("gh exited " .. tostring(result.code)), code = result.code })
+      return
+    end
+    cb({ ok = true })
+  end)
+end
+
 ---@param comment_id integer|string
 ---@param repo? string
 ---@return string
@@ -443,6 +486,89 @@ local function decode_json(text)
   local ok, decoded = pcall(vim.json.decode, tostring(text or ""))
   if ok and type(decoded) == "table" then return decoded end
   return nil
+end
+
+---@param cwd string
+---@param logins string[]
+---@param cb fun(result: DiffReviewGhUsersResult)
+function M.resolve_users_async(cwd, logins, cb)
+  local users = {}
+  local unique_logins = {}
+  local seen = {}
+  for _, login in ipairs(logins or {}) do
+    local normalized = tostring(login or ""):gsub("^@", "")
+    if normalized ~= "" and not seen[normalized:lower()] then
+      seen[normalized:lower()] = true
+      unique_logins[#unique_logins + 1] = normalized
+    end
+  end
+  local function resolve_next(index)
+    local login = unique_logins[index]
+    if not login then
+      cb({ ok = true, users = users })
+      return
+    end
+    system_text_async({ "gh", "api", "/users/" .. login }, nil, cwd, function(result)
+      local decoded = result.code == 0 and decode_json(result.stdout) or nil
+      users[login:lower()] = {
+        login = decoded and decoded.login or login,
+        name = decoded and decoded.name or nil,
+      }
+      resolve_next(index + 1)
+    end)
+  end
+  resolve_next(1)
+end
+
+---@param cwd string?
+---@param cb fun(result: DiffReviewGhRepoResult)
+function M.current_repo_async(cwd, cb)
+  system_text_async({ "gh", "repo", "view", "--json", "nameWithOwner" }, nil, cwd, function(result)
+    if result.code ~= 0 then
+      cb({ ok = false, message = result.output ~= "" and result.output or ("gh exited " .. tostring(result.code)), code = result.code })
+      return
+    end
+    local decoded = decode_json(result.stdout)
+    local repo = decoded and decoded.nameWithOwner or nil
+    if type(repo) ~= "string" or repo == "" then
+      cb({ ok = false, message = "gh repo view returned no nameWithOwner", code = result.code })
+      return
+    end
+    cb({ ok = true, repo = repo })
+  end)
+end
+
+---@param cwd string?
+---@param repo string
+---@param cb fun(result: DiffReviewGhRepoContributorsResult)
+function M.repo_contributors_async(cwd, repo, cb)
+  system_text_async({ "gh", "api", "/repos/" .. repo .. "/contributors", "--paginate", "--slurp" }, nil, cwd, function(result)
+    if result.code ~= 0 then
+      cb({ ok = false, message = result.output ~= "" and result.output or ("gh exited " .. tostring(result.code)), code = result.code })
+      return
+    end
+    local decoded = decode_json(result.stdout)
+    if type(decoded) ~= "table" then
+      cb({ ok = false, message = "gh api returned invalid contributors JSON", code = result.code })
+      return
+    end
+    local contributors = {}
+    local function collect(raw)
+      if type(raw) ~= "table" then return end
+      if type(raw.login) == "string" and raw.login ~= "" then
+        contributors[#contributors + 1] = {
+          login = raw.login,
+          name = type(raw.name) == "string" and raw.name or nil,
+        }
+        return
+      end
+      for _, item in ipairs(raw) do collect(item) end
+    end
+    for _, raw in ipairs(decoded) do
+      collect(raw)
+    end
+    cb({ ok = true, contributors = contributors })
+  end)
 end
 
 ---@param repo? string

@@ -1,4 +1,5 @@
 local M = {}
+local repo_cache = require("github.repo_cache")
 
 local default_base_branch = "main"
 local state_cache = nil
@@ -118,7 +119,6 @@ end
 
 local function state_path()
   return state_path_for_test
-      or vim.fs.joinpath(vim.fn.stdpath("state"), "gitstatus", "github-open-pr.json")
 end
 
 ---@param cwd string
@@ -138,6 +138,10 @@ local function read_state()
   end
 
   local path = state_path()
+  if not path then
+    state_cache = { repos = {} }
+    return state_cache
+  end
   if vim.uv.fs_stat(path) == nil then
     state_cache = { repos = {} }
     return state_cache
@@ -166,6 +170,7 @@ end
 ---@return string?
 local function write_state(state)
   local path = state_path()
+  if not path then return "No GitHubOpenPR test state path configured" end
   local directory = vim.fs.dirname(path)
   local mkdir_ok, mkdir_err = pcall(vim.fn.mkdir, directory, "p")
   if not mkdir_ok or mkdir_err == 0 then
@@ -188,6 +193,9 @@ end
 ---@param cwd string
 ---@return string?
 local function get_stored_base_branch(cwd)
+  if not state_path_for_test then
+    return repo_cache.get_base_branch(cwd)
+  end
   local state = read_state()
   local branch = state.repos[repo_key(cwd)]
   if type(branch) == "string" and branch ~= "" then
@@ -199,6 +207,11 @@ end
 ---@param cwd string
 ---@param branch string
 local function set_base_branch(cwd, branch)
+  if not state_path_for_test then
+    local err = repo_cache.set_base_branch(cwd, branch)
+    if err then notify(err, "warn") end
+    return
+  end
   local state = read_state()
   state.repos[repo_key(cwd)] = branch
   local err = write_state(state)

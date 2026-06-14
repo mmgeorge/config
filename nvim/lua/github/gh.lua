@@ -74,6 +74,18 @@
 ---@field message? string
 ---@field code? integer
 
+---@class GithubGhRepoResult
+---@field ok boolean
+---@field repo? string
+---@field message? string
+---@field code? integer
+
+---@class GithubGhRepoContributorsResult
+---@field ok boolean
+---@field contributors? table[]
+---@field message? string
+---@field code? integer
+
 ---@class GithubGhModule
 ---@field _backend GithubGhBackend?
 
@@ -276,6 +288,8 @@ local function normalize_detail(raw, kind, repo)
   }
 end
 
+local result_error
+
 ---@param stdout string
 ---@return table?, string?
 local function decode_json(stdout)
@@ -284,6 +298,57 @@ local function decode_json(stdout)
     return nil, "gh returned invalid JSON"
   end
   return decoded, nil
+end
+
+---@param cwd string?
+---@param callback fun(result: GithubGhRepoResult)
+function M.current_repo_async(cwd, callback)
+  system_text_async({ "gh", "repo", "view", "--json", "nameWithOwner" }, nil, cwd, function(result)
+    if result.code ~= 0 then
+      callback({ ok = false, message = result_error(result), code = result.code })
+      return
+    end
+    local decoded, err = decode_json(result.stdout)
+    local repo = decoded and decoded.nameWithOwner or nil
+    if type(repo) ~= "string" or repo == "" then
+      callback({ ok = false, message = err or "gh repo view returned no nameWithOwner", code = result.code })
+      return
+    end
+    callback({ ok = true, repo = repo })
+  end)
+end
+
+---@param cwd string?
+---@param repo string
+---@param callback fun(result: GithubGhRepoContributorsResult)
+function M.repo_contributors_async(cwd, repo, callback)
+  system_text_async({ "gh", "api", "/repos/" .. repo .. "/contributors", "--paginate", "--slurp" }, nil, cwd, function(result)
+    if result.code ~= 0 then
+      callback({ ok = false, message = result_error(result), code = result.code })
+      return
+    end
+    local decoded, err = decode_json(result.stdout)
+    if not decoded then
+      callback({ ok = false, message = err, code = result.code })
+      return
+    end
+    local contributors = {}
+    local function collect(raw)
+      if type(raw) ~= "table" then return end
+      if type(raw.login) == "string" and raw.login ~= "" then
+        contributors[#contributors + 1] = {
+          login = raw.login,
+          name = type(raw.name) == "string" and raw.name or nil,
+        }
+        return
+      end
+      for _, item in ipairs(raw) do collect(item) end
+    end
+    for _, raw in ipairs(decoded) do
+      collect(raw)
+    end
+    callback({ ok = true, contributors = contributors })
+  end)
 end
 
 ---@param stdout string
@@ -300,7 +365,7 @@ end
 
 ---@param result GithubGhAsyncResult
 ---@return string
-local function result_error(result)
+function result_error(result)
   local output = result.output or result.stderr or result.stdout or ""
   output = vim.trim(output)
   if output ~= "" then return output end

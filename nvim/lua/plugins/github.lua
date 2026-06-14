@@ -59,6 +59,30 @@ return {
       end, {
         desc = "Open GitHub notifications",
       })
+
+      vim.api.nvim_create_user_command("GithubDeleteRepoCache", function()
+        local cache = require("github.repo_cache")
+        local gh = require("github.gh")
+        local cwd = vim.fn.getcwd()
+        local repo = cache.buffer_repo(0)
+        local function delete(repo_name)
+          local deleted = cache.delete_current(repo_name, cwd)
+          vim.notify(
+            deleted > 0 and "Deleted GitHub repo cache" or "No GitHub repo cache found",
+            vim.log.levels.INFO,
+            { title = "GitHub" }
+          )
+        end
+        if repo then
+          delete(repo)
+          return
+        end
+        gh.current_repo_async(cwd, function(result)
+          delete(result.ok and result.repo or nil)
+        end)
+      end, {
+        desc = "Delete cached GitHub metadata for the current repo",
+      })
     end,
     opts = {
       -- or "fzf-lua" or "snacks" or "default"
