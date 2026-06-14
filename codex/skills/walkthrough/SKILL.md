@@ -51,21 +51,24 @@ narrative — use the diff only to confirm files and line numbers.
   comment.
 - `title` is an optional short heading (a few words).
 - `summary` is shown before the first step. Open with a 1-3 sentence prose
-  overview, then include an **ASCII code-flow diagram** of the change from
-  the relevant entry point (not the entire system): one node per
-  function/module with its file path in brackets, `*` marking modified/new
-  nodes, `~` marking removed ones, and data flow (input/output types) where
-  it clarifies. Keep diagram lines under 76 characters - the reviewer UI
-  preserves preformatted lines verbatim. Example shape:
+  overview that explains what changed and why, then include a compact ASCII
+  flow graph. Keep the graph conceptual: show the main data/control flow and
+  the modified/new/removed nodes with `*` and `~`, but do **not** include repo
+  paths or bracketed file names in the summary. The walkthrough steps already
+  carry exact file and range targets; repeating paths in the summary makes the
+  overview harder to read. Do not enumerate every changed file, helper, shader,
+  or test here; use roughly 3-6 conceptual nodes that orient the reviewer to
+  the change. Keep graph lines under 76 characters - the reviewer UI preserves
+  preformatted lines verbatim. Example shape:
 
   ```
   API Request (POST /documents)
     │ (DocumentRequest)
-    ├── validate_request() → ValidatedRequest   [api/handlers.rs]
-    ├── *process_document() → StoredDocument    [processing/mod.rs]
-    │     ├── ~save_and_respond() → Response    [processing/mod.rs]
-    │     └── *save_result() → StoredDocument   [processing/store.rs]
-    └── *notify() → NotifyResult                [notifications/mod.rs] (NEW)
+    ├── validate_request() → ValidatedRequest
+    ├── *process_document() → StoredDocument
+    │     ├── ~save_and_respond() → Response
+    │     └── *save_result() → StoredDocument
+    └── *notify() → NotifyResult (NEW)
   ```
 
 ## 3. Schema
@@ -122,7 +125,7 @@ alongside this skill). The schema, inlined:
 ```json
 {
   "version": 1,
-  "summary": "Adds rate limiting to the public API. A new token-bucket middleware guards every /api route; configuration lives in config/rate_limit.toml and the middleware is exercised by new integration tests.\n\nRequest (POST /api/*)\n  ├── *rate_limit() → Decision        [src/middleware/rate_limit.rs] (NEW)\n  │     └── *TokenBucket::take()      [src/middleware/rate_limit.rs]\n  └── handle() → Response             [src/router.rs]",
+  "summary": "Adds rate limiting to the public API. A new token-bucket middleware guards every /api route; configuration controls bucket sizing and the middleware is exercised by integration tests.\n\nRequest (POST /api/*)\n  ├── *rate_limit() → Decision (NEW)\n  │     └── *TokenBucket::take()\n  └── handle() → Response",
   "commit": "8f14e45fceea167a5a36dedd4bea2543c6a04c33",
   "steps": [
     {
@@ -150,6 +153,11 @@ alongside this skill). The schema, inlined:
   (verify against the file on disk, not the diff hunk headers).
 - Every `start.line` points at a changed (added) line, not unchanged
   context; every region is tight (~40 lines max) around the discussed code.
+- `summary` has no repo-relative paths or bracketed file names; exact locations
+  belong in `steps`.
+- `summary` is not an exhaustive inventory of changed files/functions; it
+  orients the reviewer to the main conceptual flow.
+- `summary` includes a compact ASCII flow graph after the prose overview.
 - `commit` is the full 40-character sha from `git rev-parse HEAD`.
 - The JSON is valid: no trailing commas, no comments, double-quoted keys.
 - Write to `<repo root>/.walkthrough.json`, overwriting any existing file.

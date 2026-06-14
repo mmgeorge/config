@@ -202,6 +202,13 @@ local function buffer_contains(buf, needle)
   return false
 end
 
+local function buffer_has_exact_line(buf, expected)
+  for _, line in ipairs(lines(buf)) do
+    if line == expected then return true end
+  end
+  return false
+end
+
 local function buffer_keymap(buf, mode, lhs)
   for _, keymap in ipairs(vim.api.nvim_buf_get_keymap(buf, mode)) do
     if keymap.lhs == lhs then return keymap end
@@ -541,6 +548,7 @@ local function run()
   assert_true(#comment_creates == 0, "drafting a comment synced before manual sync")
   assert_true(#review_calls == 0, "drafting a comment must not submit the review")
   assert_true(buffer_contains(buf, " L2"), "inline comment header missing")
+  assert_true(buffer_contains(buf, diff_review._review.comment_icon .. " *you | "), "inline comment header missing comment icon")
   assert_true(buffer_contains(buf, "*you | "), "dirty comment header missing * marker")
   assert_true(buffer_contains(buf, " | "), "inline comment author/date header missing")
   -- the comment lines are real and below the anchor line
@@ -575,6 +583,7 @@ local function run()
   local header_line = lines(buf)[comment_header_row] or ""
   local footer_line = lines(buf)[comment_footer_row] or ""
   local rule_width = diff_review._review.comment_rule_width()
+  assert_true(header_line:find(diff_review._review.comment_icon, 1, true) == 1, "comment header must start with the comment icon")
   assert_true(not header_line:match("^%-%-"), "comment header must not start with outer rule markers")
   assert_true(not header_line:match("%-%-$"), "comment header must not end with outer rule markers")
   assert_true(header_line:match("%sL%d+$") ~= nil, "comment header must end with the right-aligned line number")
@@ -667,6 +676,46 @@ local function run()
   assert_true(vim.api.nvim_get_current_buf() == buf, "inline comment edit switched buffers")
   assert_true(buffer_contains(buf, "Edited comment body"), "inline comment edit changed state but not visible text")
   assert_true(not buffer_contains(buf, "This rename needs a test"), "old comment text still present after inline edit")
+
+  -- ── <Tab> folds/unfolds the comment under the cursor ──────────────────────
+  local folded_comment = diff_review._review.state(buf).review_comments[1]
+  trigger(buf, "<Tab>", find_row(buf, "Edited comment body"))
+  wait_for(function() return folded_comment.review_folded == true end, "<Tab> on comment body did not fold the comment")
+  local folded_row = vim.api.nvim_win_get_cursor(0)[1]
+  local folded_line = lines(buf)[folded_row] or ""
+  assert_true(
+    folded_line:find(diff_review._review.comment_icon .. " me |", 1, true) == 1,
+    "folded comment did not start with icon/user/date: " .. folded_line
+  )
+  assert_true(
+    folded_line:find(" | Edited comment body", 1, true) ~= nil,
+    "folded comment did not include preview text: " .. folded_line
+  )
+  assert_true(not buffer_has_exact_line(buf, "Edited comment body"), "folded comment still rendered the editable body row")
+  assert_true(diff_review._review.comment_body_rows(buf, folded_comment) == nil, "folded comment kept editable body extmarks")
+  assert_true(not vim.bo[buf].modifiable, "folded comment preview must stay read-only")
+
+  trigger(buf, "<Tab>", folded_row)
+  wait_for(function()
+    local start_row = diff_review._review.comment_body_rows(buf, folded_comment)
+    return folded_comment.review_folded ~= true and start_row ~= nil and buffer_has_exact_line(buf, "Edited comment body")
+  end, "<Tab> on folded comment did not unfold it")
+
+  trigger(buf, "<Tab>", find_row(buf, "Edited comment body"))
+  wait_for(function() return folded_comment.review_folded == true end, "<Tab> on editable comment body did not stay mapped")
+  trigger(buf, "<Tab>", vim.api.nvim_win_get_cursor(0)[1])
+  wait_for(function()
+    local start_row = diff_review._review.comment_body_rows(buf, folded_comment)
+    return folded_comment.review_folded ~= true and start_row ~= nil and buffer_has_exact_line(buf, "Edited comment body")
+  end, "second folded comment toggle did not restore the body")
+
+  trigger(buf, "<Tab>", find_row(buf, " L2"))
+  wait_for(function() return folded_comment.review_folded == true end, "<Tab> on comment header did not fold the comment")
+  trigger(buf, "C", vim.api.nvim_win_get_cursor(0)[1])
+  wait_for(function()
+    local start_row = diff_review._review.comment_body_rows(buf, folded_comment)
+    return folded_comment.review_folded ~= true and start_row ~= nil and vim.api.nvim_win_get_cursor(0)[1] == start_row
+  end, "C on folded comment did not unfold and focus the body")
 
   -- ── visual deletion edits inline without opening a popup ───────────────────
   local deletion_state = diff_review._review.state(buf)
