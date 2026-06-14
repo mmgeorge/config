@@ -22,6 +22,8 @@ local has_changes = true
 local generate_count = 0
 local notifications = {}
 local staged_mode = "same"
+local hold_pr_lookup = false
+local release_pr_lookup = nil
 local hold_push = false
 local release_push = nil
 
@@ -180,18 +182,29 @@ local function pr_json()
   })
 end
 
+local function respond_current_pr_lookup(cb)
+  if pr_mode == "none" then
+    cb({ code = 1, stdout = "", stderr = "no pull requests found", output = "no pull requests found" })
+  elseif pr_mode == "unavailable" then
+    cb({ code = 1, stdout = "", stderr = gh_host_mismatch, output = gh_host_mismatch })
+  else
+    cb({ code = 0, stdout = pr_json(), stderr = "", output = pr_json() })
+  end
+end
+
 function gh_backend.system_async(command, _, cb, cwd)
   record("gh_system_async", command, cwd)
   vim.defer_fn(function()
     local key = command_key(command)
     if key == "gh\tpr\tview\t--json\tnumber,title,body,url,headRefName,headRefOid,commits,files,changedFiles,additions,deletions" then
-      if pr_mode == "none" then
-        cb({ code = 1, stdout = "", stderr = "no pull requests found", output = "no pull requests found" })
-      elseif pr_mode == "unavailable" then
-        cb({ code = 1, stdout = "", stderr = gh_host_mismatch, output = gh_host_mismatch })
-      else
-        cb({ code = 0, stdout = pr_json(), stderr = "", output = pr_json() })
+      if hold_pr_lookup then
+        release_pr_lookup = function()
+          release_pr_lookup = nil
+          respond_current_pr_lookup(cb)
+        end
+        return
       end
+      respond_current_pr_lookup(cb)
       return
     end
     if key == "gh\tpr\tdiff\t42\t--patch\t--color\tnever" then
@@ -485,6 +498,32 @@ local function run()
   assert_buffer_contains_all(help_buf, { "<Tab>", "N", "S", "U", "j", "cc", "opP", "opp", "ogp", "o", "<CR>", "R", "or", "q", "?" })
   assert_true(not buffer_contains(help_buf, "ogc"), "help should not list removed ogc mapping")
   pcall(vim.api.nvim_win_close, 0, true)
+
+  vim.api.nvim_win_set_buf(0, status_buf)
+  reset_notifications()
+  pr_mode = "ready"
+  pr_title = "PR after queued ogp"
+  hold_pr_lookup = true
+  release_pr_lookup = nil
+  diff_review.render_status(status_buf, nil, nil, { refresh_pr = true })
+  wait_for(function() return buffer_contains(status_buf, "...fetching...") end, "PR row did not refetch for queued ogp test")
+  trigger_normal_mapping("ogp", find_row(status_buf, "Head:"))
+  assert_true(vim.api.nvim_get_current_buf() == status_buf, "ogp while fetching should wait in GitStatus")
+  for _, notification in ipairs(notifications) do
+    assert_true(
+      not notification.message:find("GitHub PR is still loading", 1, true),
+      "ogp while fetching should not dead-end with a loading notification"
+    )
+  end
+  wait_for(function() return type(release_pr_lookup) == "function" end, "queued ogp test did not capture held PR lookup")
+  hold_pr_lookup = false
+  release_pr_lookup()
+  wait_for(function()
+    return vim.api.nvim_get_current_buf() ~= status_buf and buffer_contains(vim.api.nvim_get_current_buf(), "PR after queued ogp")
+  end, "queued ogp did not open PRView after PR lookup resolved")
+  local queued_pr_buf = vim.api.nvim_get_current_buf()
+  trigger_normal_mapping("q", 1)
+  assert_true(not vim.api.nvim_buf_is_valid(queued_pr_buf), "q did not close queued PRView")
 
   vim.api.nvim_win_set_buf(0, status_buf)
   trigger_normal_mapping("ogp", find_row(status_buf, "Head:"))

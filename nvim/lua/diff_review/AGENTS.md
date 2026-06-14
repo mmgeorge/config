@@ -45,14 +45,25 @@ sections (files start expanded). This is the **normal batched review flow** —
 comments are drafted locally, synced deliberately, and submitted together:
 - `S`/`U` move the hunk/file under the cursor between the sections; on
   Unviewed/Viewed section headers they move the whole section.
-- `C` on a changed (diff body) line drafts a comment (body via an input
-  popup); on an existing comment it edits it (input prefilled); on anything
-  else it is a no-op. Comments render as real, navigable buffer lines (a box)
+- `C` on a changed (diff body) line creates an empty inline editable comment
+  body and focuses it; on an existing comment, or the line immediately
+  above/below it, it focuses that comment body. Comments render as real,
+  navigable buffer lines
   emitted inline right below their anchor row by a renderer hook
-  (`M._status.review_after_row`, consumed in `status_add_fancy_row`), each
-  line carrying a `review_comment` entry so the cursor can land on it.
+  (`M._status.review_after_row`, consumed in `status_add_fancy_row`): a
+  read-only rule header, raw editable full-width body rows, and a read-only
+  rule footer. Header rules start directly with the author/date, use dashes only
+  between the left label and the right-aligned line number, and do not have
+  surrounding `--` frame markers. Size header/footer rules to the window text
+  area so they never overflow or soft-wrap, and refresh those rule rows from
+  shared display/resize handling (`WinResized`/`VimResized` plus
+  `BufWinEnter`). The review window enables soft word wrap; do not hard-wrap,
+  reflow, prefix, or draw box sides into editable body text.
 - `J` deletes the draft comment under the cursor; `y`/`n` jump between
   comments.
+- `b` on actual comment rows (header/body/footer) opens the GitHub comment
+  anchor; adjacent diff rows keep their code-line anchors instead of borrowing
+  the nearby comment.
 - Unsynced comment creates/edits show `*` before the username in the comment
   header. `<C-s>` clears the marker immediately and syncs dirty comments to the
   pending GitHub review; failures restore the marker.

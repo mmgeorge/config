@@ -109,6 +109,18 @@ local function find_row(buf, needle)
   error("missing row: " .. needle .. "\n" .. table.concat(lines, "\n"), 2)
 end
 
+local function assert_cursor_clamped_to_line(buf, row, label)
+  vim.api.nvim_win_set_buf(0, buf)
+  local line = vim.api.nvim_buf_get_lines(buf, row - 1, row, false)[1] or ""
+  vim.fn.setpos(".", { 0, row, #line + 1, 40 })
+  vim.api.nvim_exec_autocmds("CursorMoved", { buffer = buf })
+  local cursor = vim.api.nvim_win_get_cursor(0)
+  local pos = vim.fn.getcurpos()
+  assert_true(cursor[1] == row, label .. " cursor moved rows: " .. vim.inspect(cursor))
+  assert_true(cursor[2] == #line, label .. " cursor was not clamped to line end: " .. vim.inspect({ cursor = cursor, line = line }))
+  assert_true((pos[4] or 0) == 0, label .. " cursor kept virtual columns: " .. vim.inspect(pos))
+end
+
 local pr_edit_ns = vim.api.nvim_create_namespace("diff_review_pr_edit")
 
 --- 1-based rows that carry the "*" out-of-sync marker.
@@ -184,10 +196,12 @@ local function run()
   assert_true(not vim.bo[buf].modifiable, "buffer must stay locked outside the editable regions")
   move_cursor(buf, title_row)
   assert_true(vim.bo[buf].modifiable, "buffer must unlock on the title row")
+  assert_cursor_clamped_to_line(buf, title_row, "PR title")
   move_cursor(buf, find_row(buf, "Description:"))
   assert_true(not vim.bo[buf].modifiable, "the Description: label itself must stay locked")
   move_cursor(buf, body_row)
   assert_true(vim.bo[buf].modifiable, "buffer must unlock on description rows")
+  assert_cursor_clamped_to_line(buf, body_row, "PR description")
   move_cursor(buf, find_row(buf, "URL:"))
   assert_true(not vim.bo[buf].modifiable, "buffer must relock after leaving the regions")
 
