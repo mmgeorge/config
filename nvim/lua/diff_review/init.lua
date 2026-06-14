@@ -90,14 +90,16 @@
 
 ---@class DiffReviewStatusEntry
 ---@field id? string
----@field kind "section"|"file"|"hunk"|"commit"|"commit_file"|"commit_hunk"|"pr_file"|"pr_hunk"|"pr_comment"|"pr_comment_reply"|"pr_review"|"pr_review_file"|"pr_review_hunk"|"pr"|"about"
+---@field kind "section"|"file"|"hunk"|"commit"|"commit_file"|"commit_hunk"|"pr_file"|"pr_hunk"|"pr_comment"|"pr_comment_reply"|"pr_review"|"pr_review_file"|"pr_review_hunk"|"review_comment"|"pr"|"about"
 ---@field section? DiffReviewStatusSection
 ---@field file? DiffReviewStatusFile
 ---@field hunk? DiffReviewHunk
 ---@field commit? DiffReviewStatusCommit
 ---@field pr_review? DiffReviewGhSubmittedReview
----@field pr_comment? DiffReviewGhPendingReviewComment
+---@field pr_comment? DiffReviewGhPendingReviewComment|DiffReviewGhIssueComment
 ---@field pr_comment_reply? DiffReviewGhReviewCommentReply
+---@field review_comment? table
+---@field review_reply? table
 ---@field diff_line? table
 ---@field pr? DiffReviewGhPR
 ---@field about? DiffReviewAICommitState
@@ -3448,11 +3450,11 @@ local status_command_specs = {
   { id = "help", label = "help", desc = "Show help", modes = "n", pinned = true },
   { id = "viewed", label = "viewed", desc = "Mark file as viewed", modes = "n", keymap = "review", pinned = true, views = { review = true } },
   { id = "unviewed", label = "unviewed", desc = "Move file back to unviewed", modes = "n", keymap = "review", pinned = true, views = { review = true } },
-  { id = "comment", label = "comment", desc = "Add or edit a draft review comment", modes = { "n", "x" }, keymap = "review", visual = true, pinned = true, views = { review = true } },
+  { id = "comment", label = "comment", desc = "Add or edit an inline comment", modes = { "n", "x" }, keymap = "review", visual = true, pinned = true, views = { pr = true, review = true } },
   { id = "delete", label = "delete", desc = "Delete draft comment", modes = "n", keymap = "review", pinned = true, views = { review = true } },
   { id = "next_comment", label = "next", desc = "Jump to next draft comment", modes = "n", keymap = "review", pinned = true, views = { review = true } },
   { id = "prev_comment", label = "prev", desc = "Jump to previous draft comment", modes = "n", keymap = "review", pinned = true, views = { review = true } },
-  { id = "sync", label = "sync", desc = "Sync review comments to GitHub", modes = { "n", "i" }, keymap = "review", pinned = true, views = { review = true } },
+  { id = "sync", label = "sync", desc = "Sync inline comments to GitHub", modes = { "n", "i" }, keymap = "review", pinned = true, views = { pr = true, review = true } },
   { id = "submit", label = "submit", desc = "Submit review to GitHub", modes = "n", keymap = "review", pinned = true, views = { review = true } },
 }
 
@@ -3470,6 +3472,7 @@ M._status_hint_command_ids_by_view = {
   pr = {
     "browse",
     "review",
+    "comment",
     "open",
     "refresh",
     "close",
@@ -3752,6 +3755,29 @@ local function status_markdown_lines(text)
   return vim.split(text, "\n", { plain = true })
 end
 
+---@param title string
+---@param count integer
+---@return string
+function M._status_section_heading_text(title, count)
+  title = tostring(title or ""):gsub("%s*:%s*$", "")
+  return ("%s (%d):"):format(title, math.max(0, math.floor(tonumber(count) or 0)))
+end
+
+---@param title string
+---@param count integer
+---@return table[]
+function M._status_section_heading_segments(title, count)
+  return { { M._status_section_heading_text(title, count), "DiffReviewStatusHeader" } }
+end
+
+---@param section DiffReviewStatusSection
+---@return integer
+function M._status_section_count(section)
+  if type(section.reviews) == "table" then return #section.reviews end
+  if type(section.commits) == "table" then return #section.commits end
+  return #(section.files or {})
+end
+
 ---@param value any
 ---@return string
 function M._pr_overview.comment_datetime(value)
@@ -3824,7 +3850,7 @@ local function status_pr_detail_head_lines(pr, comments)
     lines[#lines + 1] = { segments = { { "URL:    ", "DiffReviewStatusLabel" }, { pr.url, "DiffReviewStatusPR" } } }
   end
   lines[#lines + 1] = { segments = { { "" } } }
-  lines[#lines + 1] = { segments = { { "Description:", "DiffReviewStatusLabel" } } }
+  lines[#lines + 1] = { segments = { { "Description:", "DiffReviewStatusHeader" } } }
   for _, line in ipairs(status_markdown_lines(pr.body)) do
     lines[#lines + 1] = { segments = { { line } } }
   end
@@ -3832,12 +3858,15 @@ local function status_pr_detail_head_lines(pr, comments)
   if type(issue_comments) == "table" and #issue_comments > 0 then
     lines[#lines + 1] = { segments = { { "" } } }
     lines[#lines + 1] = {
-      segments = {
-        { ("Comments (%d):"):format(#issue_comments), "DiffReviewStatusLabel" },
-      },
+      segments = M._status_section_heading_segments("Comments", #issue_comments),
     }
-    for _, comment in ipairs(issue_comments) do
+    for index, comment in ipairs(issue_comments) do
       lines[#lines + 1] = {
+        entry = {
+          id = ("pr-issue-comment:%s"):format(tostring(comment.remote_node_id or comment.remote_id or index)),
+          kind = "pr_comment",
+          pr_comment = comment,
+        },
         segments = {
           { M._pr_overview.issue_comment_line(comment), "DiffReviewReviewComment" },
         },
@@ -4415,40 +4444,109 @@ local function status_commit_files_from_diff(cwd, commit, diff_text)
   }, diff_text)
 end
 
----@param title string
+M._section_builder = {}
+
 ---@param files DiffReviewStatusFile[]
----@param opts? { name?: string, default_folded?: boolean, file_key_prefix?: string, file_entry_kind?: "file"|"commit_file"|"pr_file"|"pr_review_file", hunk_entry_kind?: "hunk"|"commit_hunk"|"pr_hunk"|"pr_review_hunk" }
----@return DiffReviewStatusSection[]
-local function status_sections_from_provider_files(title, files, opts)
-  opts = opts or {}
-  if #files == 0 then return {} end
+---@return table<string, DiffReviewStatusFile>
+function M._section_builder.files_by_name(files)
   local files_by_name = {} ---@type table<string, DiffReviewStatusFile>
-  for _, file in ipairs(files) do
+  for _, file in ipairs(files or {}) do
     files_by_name[file.filename] = file
   end
+  return files_by_name
+end
+
+---@param cwd string
+---@param spec { section_name: string, default_status?: string, files?: DiffReviewGhPRFile[] }
+---@param diff_text? string
+---@return DiffReviewStatusFile[]
+function M._section_builder.files_from_diff(cwd, spec, diff_text)
+  return status_files_from_diff_provider(cwd, {
+    section_name = spec.section_name,
+    default_status = spec.default_status or "",
+    files = spec.files,
+  }, diff_text)
+end
+
+---@param title string
+---@param files DiffReviewStatusFile[]
+---@param opts? { name?: string, default_folded?: boolean, file_key_prefix?: string, file_entry_kind?: "file"|"commit_file"|"pr_file"|"pr_review_file", hunk_entry_kind?: "hunk"|"commit_hunk"|"pr_hunk"|"pr_review_hunk", keep_empty?: boolean }
+---@return DiffReviewStatusSection?
+function M._section_builder.section_from_files(title, files, opts)
+  opts = opts or {}
+  files = files or {}
+  if #files == 0 and not opts.keep_empty then return nil end
   return {
-    {
-      name = opts.name or title,
-      title = title,
-      default_folded = opts.default_folded == true,
-      files = files,
-      files_by_name = files_by_name,
-      file_key_prefix = opts.file_key_prefix,
-      file_entry_kind = opts.file_entry_kind,
-      hunk_entry_kind = opts.hunk_entry_kind,
-    },
+    name = opts.name or title,
+    title = title,
+    default_folded = opts.default_folded == true,
+    files = files,
+    files_by_name = M._section_builder.files_by_name(files),
+    file_key_prefix = opts.file_key_prefix,
+    file_entry_kind = opts.file_entry_kind,
+    hunk_entry_kind = opts.hunk_entry_kind,
   }
 end
 
----@param comments? DiffReviewGhPRCommentsResult
+---@param title string
+---@param files DiffReviewStatusFile[]
+---@param opts? { name?: string, default_folded?: boolean, file_key_prefix?: string, file_entry_kind?: "file"|"commit_file"|"pr_file"|"pr_review_file", hunk_entry_kind?: "hunk"|"commit_hunk"|"pr_hunk"|"pr_review_hunk", keep_empty?: boolean }
+---@return DiffReviewStatusSection[]
+function M._section_builder.sections_from_files(title, files, opts)
+  local section = M._section_builder.section_from_files(title, files, opts)
+  return section and { section } or {}
+end
+
+---@param cwd string
+---@param spec { title: string, section_name: string, default_status?: string, files?: DiffReviewGhPRFile[], name?: string, default_folded?: boolean, file_key_prefix?: string, file_entry_kind?: "file"|"commit_file"|"pr_file"|"pr_review_file", hunk_entry_kind?: "hunk"|"commit_hunk"|"pr_hunk"|"pr_review_hunk", keep_empty?: boolean }
+---@param diff_text? string
+---@return DiffReviewStatusSection[]
+---@return DiffReviewStatusFile[]
+function M._section_builder.sections_from_diff(cwd, spec, diff_text)
+  local files = M._section_builder.files_from_diff(cwd, spec, diff_text)
+  return M._section_builder.sections_from_files(spec.title, files, spec), files
+end
+
+---@param file DiffReviewStatusFile
+---@param hunks DiffReviewHunk[]
+---@param section_name string
+---@return DiffReviewStatusFile
+function M._section_builder.file_with_hunks(file, hunks, section_name)
+  local clone = vim.deepcopy(file)
+  clone.hunks = {}
+  clone.section_name = section_name
+  clone.added = 0
+  clone.removed = 0
+  for _, hunk in ipairs(hunks or {}) do
+    local cloned_hunk = vim.deepcopy(hunk)
+    cloned_hunk.section_name = section_name
+    clone.hunks[#clone.hunks + 1] = cloned_hunk
+    clone.added = clone.added + (cloned_hunk.added or 0)
+    clone.removed = clone.removed + (cloned_hunk.removed or 0)
+  end
+  return clone
+end
+
+---@param comment table
+---@return "LEFT"|"RIGHT"
+function M._section_builder.comment_side(comment)
+  return tostring(comment and comment.side or "RIGHT") == "LEFT" and "LEFT" or "RIGHT"
+end
+
+---@param cwd string
+---@param comments table[]
 ---@return table<string, table[]>
-function M._pr_overview.code_comments_by_path(comments)
+function M._section_builder.comments_by_path(cwd, comments)
   local by_path = {}
-  for _, comment in ipairs(type(comments and comments.code_comments) == "table" and comments.code_comments or {}) do
+  for _, comment in ipairs(type(comments) == "table" and comments or {}) do
     local path = tostring(comment.path or "")
     if path ~= "" then
+      comment.abs_file = comment.abs_file or vim.fs.normalize(vim.fs.joinpath(cwd, path))
+      comment.side = M._section_builder.comment_side(comment)
+      comment.local_state = comment.local_state or "clean"
       by_path[path] = by_path[path] or {}
       by_path[path][#by_path[path] + 1] = comment
+      by_path[comment.abs_file] = by_path[comment.abs_file] or by_path[path]
     end
   end
   for _, path_comments in pairs(by_path) do
@@ -4462,12 +4560,81 @@ function M._pr_overview.code_comments_by_path(comments)
   return by_path
 end
 
+---@param cwd string
 ---@param files DiffReviewStatusFile[]
----@param comments? DiffReviewGhPRCommentsResult
-function M._pr_overview.attach_comments(files, comments)
-  local by_path = M._pr_overview.code_comments_by_path(comments)
-  for _, file in ipairs(files) do
-    file.pr_comments = by_path[file.relpath] or by_path[file.filename] or {}
+---@param comments table[]
+---@param opts? { field?: string }
+---@return table<string, table[]>
+function M._section_builder.attach_comments(cwd, files, comments, opts)
+  opts = opts or {}
+  local field = opts.field or "comments"
+  local by_path = M._section_builder.comments_by_path(cwd, comments)
+  for _, file in ipairs(files or {}) do
+    file[field] = by_path[file.relpath] or by_path[file.filename] or {}
+  end
+  return by_path
+end
+
+---@param file string?
+---@param side string?
+---@param line integer|string?
+---@return string?
+function M._section_builder.comment_anchor_key(file, side, line)
+  local line_number = tonumber(line)
+  if not (file and file ~= "" and line_number) then return nil end
+  local normalized_file = vim.fs.normalize(tostring(file))
+  return ("%s\0%s\0%d"):format(normalized_file, tostring(side or "RIGHT"), math.floor(line_number))
+end
+
+---@param comments table[]
+---@return table<string, { comment: table, index: integer }[]>
+function M._section_builder.comment_anchor_index(comments)
+  local by_anchor = {}
+  for index, comment in ipairs(type(comments) == "table" and comments or {}) do
+    local key = M._section_builder.comment_anchor_key(comment.abs_file or comment.path, M._section_builder.comment_side(comment), comment.line)
+    if key then
+      by_anchor[key] = by_anchor[key] or {}
+      by_anchor[key][#by_anchor[key] + 1] = { comment = comment, index = index }
+    end
+  end
+  return by_anchor
+end
+
+---@param sections DiffReviewStatusSection[]
+---@param opts? { field?: string }
+---@return table<string, { comment: table, index: integer }[]>
+function M._section_builder.comment_anchor_index_from_sections(sections, opts)
+  opts = opts or {}
+  local field = opts.field or "comments"
+  local by_anchor = {}
+  for _, section in ipairs(sections or {}) do
+    for _, file in ipairs(section.files or {}) do
+      for index, comment in ipairs(type(file[field]) == "table" and file[field] or {}) do
+        local key = M._section_builder.comment_anchor_key(comment.abs_file or file.filename, M._section_builder.comment_side(comment), comment.line)
+        if key then
+          by_anchor[key] = by_anchor[key] or {}
+          by_anchor[key][#by_anchor[key] + 1] = { comment = comment, index = index }
+        end
+      end
+    end
+  end
+  return by_anchor
+end
+
+---@param state table
+---@param diff_line table
+---@param indent integer
+---@param opts { index_field: string, count_field?: string, skip?: fun(comment: table): boolean }
+function M._section_builder.emit_anchored_comments(state, diff_line, indent, opts)
+  local key = M._section_builder.comment_anchor_key(diff_line.file, M._review.side_of(diff_line), diff_line.line)
+  local comments = key and state[opts.index_field] and state[opts.index_field][key] or nil
+  for _, item in ipairs(comments or {}) do
+    if item.comment
+      and item.comment.local_state ~= "deleted"
+      and not (opts.skip and opts.skip(item.comment)) then
+      if opts.count_field then state[opts.count_field] = (state[opts.count_field] or 0) + 1 end
+      M._review.emit_comment(item.comment, item.index, indent)
+    end
   end
 end
 
@@ -4513,7 +4680,7 @@ function M._pr_overview.reviews_section(comments)
   if type(reviews) ~= "table" or #reviews == 0 then return nil end
   return {
     name = "pr:reviews",
-    title = "Reviews:",
+    title = "Reviews",
     default_folded = false,
     files = {},
     files_by_name = {},
@@ -4524,7 +4691,7 @@ end
 ---@param comment table
 ---@return "LEFT"|"RIGHT"
 function M._pr_overview.comment_side(comment)
-  return tostring(comment and comment.side or "RIGHT") == "LEFT" and "LEFT" or "RIGHT"
+  return M._section_builder.comment_side(comment)
 end
 
 ---@param hunk DiffReviewHunk
@@ -4562,32 +4729,13 @@ function M._pr_overview.hunk_contains_comment(hunk, comment)
 end
 
 ---@param cwd string
----@param comments table[]
----@return table<string, table[]>
-function M._pr_overview.review_comments_by_path(cwd, comments)
-  local by_path = {}
-  for _, comment in ipairs(type(comments) == "table" and comments or {}) do
-    local path = tostring(comment.path or "")
-    if path ~= "" then
-      comment.abs_file = comment.abs_file or vim.fs.normalize(vim.fs.joinpath(cwd, path))
-      comment.side = M._pr_overview.comment_side(comment)
-      comment.local_state = comment.local_state or "clean"
-      by_path[path] = by_path[path] or {}
-      by_path[path][#by_path[path] + 1] = comment
-      by_path[comment.abs_file] = by_path[comment.abs_file] or by_path[path]
-    end
-  end
-  return by_path
-end
-
----@param cwd string
 ---@param pr DiffReviewGhPR
 ---@param diff_text? string
 ---@param review DiffReviewGhSubmittedReview
 ---@return DiffReviewStatusFile[]
 function M._pr_overview.review_context_files(cwd, pr, diff_text, review)
-  local by_path = M._pr_overview.review_comments_by_path(cwd, review.comments or {})
-  local files = status_files_from_diff_provider(cwd, {
+  local by_path = M._section_builder.comments_by_path(cwd, review.comments or {})
+  local files = M._section_builder.files_from_diff(cwd, {
     section_name = M._pr_overview.review_key(review),
     default_status = "",
     files = pr.files,
@@ -4605,8 +4753,7 @@ function M._pr_overview.review_context_files(cwd, pr, diff_text, review)
           end
         end
       end
-      local copy = vim.deepcopy(file)
-      copy.hunks = hunks
+      local copy = M._section_builder.file_with_hunks(file, hunks, file.section_name)
       copy.pr_review_comments = file_comments
       result[#result + 1] = copy
     end
@@ -4618,24 +4765,36 @@ end
 ---@param pr DiffReviewGhPR
 ---@param diff_text? string
 ---@param comments? DiffReviewGhPRCommentsResult
+---@param local_comments? table[]
 ---@return DiffReviewStatusSection[]
-local function status_pr_sections(cwd, pr, diff_text, comments)
+local function status_pr_sections(cwd, pr, diff_text, comments, local_comments)
   local provider_key = "pr:" .. tostring(pr.number)
-  local files = status_files_from_diff_provider(cwd, {
+  local change_sections, files = M._section_builder.sections_from_diff(cwd, {
+    title = "Changes",
     section_name = provider_key .. ":changes",
     default_status = "",
     files = pr.files,
-  }, diff_text)
-  M._pr_overview.attach_comments(files, comments)
-  local sections = {}
-  local reviews_section = M._pr_overview.reviews_section(comments)
-  if reviews_section then sections[#sections + 1] = reviews_section end
-  vim.list_extend(sections, status_sections_from_provider_files("Changes", files, {
     name = provider_key .. ":changes",
     file_key_prefix = provider_key,
     file_entry_kind = "pr_file",
     hunk_entry_kind = "pr_hunk",
-  }))
+  }, diff_text)
+  local code_comments = {}
+  local local_comment_keys = {}
+  for _, comment in ipairs(local_comments or {}) do
+    local key = M._pr_overview.comment_identity_key(comment)
+    if key then local_comment_keys[key] = true end
+  end
+  for _, comment in ipairs(comments and comments.code_comments or {}) do
+    local key = M._pr_overview.comment_identity_key(comment)
+    if not (key and local_comment_keys[key]) then code_comments[#code_comments + 1] = comment end
+  end
+  vim.list_extend(code_comments, local_comments or {})
+  M._section_builder.attach_comments(cwd, files, code_comments, { field = "pr_comments" })
+  local sections = {}
+  local reviews_section = M._pr_overview.reviews_section(comments)
+  if reviews_section then sections[#sections + 1] = reviews_section end
+  vim.list_extend(sections, change_sections)
   return sections
 end
 
@@ -5169,91 +5328,41 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_ki
   end
 end
 
----@param comment table
----@return string
-function M._pr_overview.code_comment_line(comment)
-  local parts = {
-    "  " .. M._comment_icon,
-    M._pr_overview.comment_author(comment),
-  }
-  local datetime = M._pr_overview.comment_datetime(comment.updated_at or comment.created_at)
-  if datetime ~= "" then parts[#parts + 1] = datetime end
-  local start_line = tonumber(comment.start_line)
-  local line = tonumber(comment.line)
-  if start_line and line and start_line ~= line then
-    parts[#parts + 1] = ("L%d-L%d"):format(start_line, line)
-  elseif line then
-    parts[#parts + 1] = ("L%d"):format(line)
-  end
-  if tostring(comment.review_state or "") == "PENDING" then
-    parts[#parts + 1] = "pending"
-  end
-  local preview = M._pr_overview.comment_preview(comment.body or "")
-  if preview ~= "" then parts[#parts + 1] = preview end
-  return table.concat(parts, " | ")
+---@param pr DiffReviewGhPR?
+---@return string?
+function M._pr_overview.pr_base_url(pr)
+  if not (pr and pr.url and pr.url ~= "") then return nil end
+  return pr.url:gsub("/$", "")
 end
 
----@param reply table
----@return string
-function M._pr_overview.code_comment_reply_line(reply)
-  local parts = {
-    "    " .. M._reply_icon,
-    M._pr_overview.comment_author(reply),
-  }
-  local datetime = M._pr_overview.comment_datetime(reply.updated_at or reply.created_at)
-  if datetime ~= "" then parts[#parts + 1] = datetime end
-  local preview = M._pr_overview.comment_preview(reply.body or "")
-  if preview ~= "" then parts[#parts + 1] = preview end
-  return table.concat(parts, " | ")
-end
+---@param pr DiffReviewGhPR?
+---@param entry DiffReviewStatusEntry?
+---@return string?
+function M._pr_overview.entry_url(pr, entry)
+  if not entry then return nil end
+  local base_url = M._pr_overview.pr_base_url(pr)
+  local reply = entry.pr_comment_reply or entry.review_reply
+  if reply then
+    if reply.url and reply.url ~= "" then return reply.url end
+    if base_url and reply.remote_id then return ("%s/changes#r%s"):format(base_url, tostring(reply.remote_id)) end
+  end
 
----@param file DiffReviewStatusFile
----@param file_key string
-function M._pr_overview.render_file_comments(file, file_key)
-  local comments = type(file.pr_comments) == "table" and file.pr_comments or {}
-  for index, comment in ipairs(comments) do
-    local line = M._pr_overview.code_comment_line(comment)
-    local entry = {
-      id = ("%s:comment:%s"):format(file_key, tostring(comment.remote_node_id or comment.remote_id or index)),
-      kind = "pr_comment",
-      file = file,
-      pr_comment = comment,
-    }
-    if comment.line then
-      entry.diff_line = {
-        file = file.filename,
-        line = comment.line,
-        side = tostring(comment.side or "RIGHT") == "LEFT" and "left" or "right",
-      }
-    end
-    local line_number = status_add_line(line, entry)
-    status_add_highlight(line_number, 0, #line, "DiffReviewReviewComment")
-    if tostring(comment.review_state or "") == "PENDING" then
-      local pending_start = line:find("pending", 1, true)
-      if pending_start then
-        status_add_highlight(line_number, pending_start - 1, pending_start + #"pending" - 1, "DiffReviewReviewPending")
-      end
-    end
-    for reply_index, reply in ipairs(type(comment.replies) == "table" and comment.replies or {}) do
-      local reply_line = M._pr_overview.code_comment_reply_line(reply)
-      local reply_entry = {
-        id = ("%s:comment:%s:reply:%s"):format(file_key, tostring(comment.remote_node_id or comment.remote_id or index), tostring(reply.remote_node_id or reply.remote_id or reply_index)),
-        kind = "pr_comment_reply",
-        file = file,
-        pr_comment = comment,
-        pr_comment_reply = reply,
-      }
-      if comment.line then
-        reply_entry.diff_line = {
-          file = file.filename,
-          line = comment.line,
-          side = tostring(comment.side or "RIGHT") == "LEFT" and "left" or "right",
-        }
-      end
-      local reply_line_number = status_add_line(reply_line, reply_entry)
-      status_add_highlight(reply_line_number, 0, #reply_line, "DiffReviewReviewComment")
+  local comment = entry.pr_comment or entry.review_comment
+  if comment then
+    if comment.url and comment.url ~= "" then return comment.url end
+    if base_url and comment.remote_id then
+      if comment.path and comment.path ~= "" then return ("%s/changes#r%s"):format(base_url, tostring(comment.remote_id)) end
+      return ("%s#issuecomment-%s"):format(base_url, tostring(comment.remote_id))
     end
   end
+
+  local review = entry.pr_review
+  if review then
+    if review.url and review.url ~= "" then return review.url end
+    if base_url and review.id and review.id ~= 0 then return ("%s#pullrequestreview-%s"):format(base_url, tostring(review.id)) end
+  end
+
+  return nil
 end
 
 ---@param file DiffReviewStatusFile
@@ -5261,7 +5370,7 @@ end
 ---@param hunk_entry_kind? "hunk"|"commit_hunk"|"pr_hunk"|"pr_review_hunk"
 ---@param file_key_override? string
 ---@param hunk_key_builder? fun(hunk: DiffReviewHunk): string
----@param opts? { force_open?: boolean, suppress_pr_comments?: boolean }
+---@param opts? { force_open?: boolean }
 local function status_render_file(file, entry_kind, hunk_entry_kind, file_key_override, hunk_key_builder, opts)
   opts = opts or {}
   local file_key = file_key_override or status_file_key(file.section_name, file.filename)
@@ -5274,8 +5383,6 @@ local function status_render_file(file, entry_kind, hunk_entry_kind, file_key_ov
   local stats_start = #line - #stats
   status_add_highlight(line_number, path_start, stats_start - 1, "DiffReviewStatusPath")
   status_add_highlight(line_number, stats_start, #line, file.untracked and "Comment" or "DiffReviewAddRange")
-
-  if entry_kind == "pr_file" and not opts.suppress_pr_comments then M._pr_overview.render_file_comments(file, file_key) end
 
   if file_folded then return end
 
@@ -5339,7 +5446,7 @@ function M._pr_overview.render_review_context(review)
         function(hunk)
           return status_provider_hunk_key(review_key, file.filename, hunk.diff)
         end,
-        { force_open = true, suppress_pr_comments = true }
+        { force_open = true }
       )
     end
   end)
@@ -5414,8 +5521,7 @@ end
 local function status_render_section(section)
   local section_key = status_section_key(section.name)
   local section_folded = status_folded(section_key, section.default_folded)
-  local section_count = section.reviews and #section.reviews or (section.commits and #section.commits or #section.files)
-  local line = section.reviews and section.title or ("%s (%d)"):format(section.title, section_count)
+  local line = M._status_section_heading_text(section.title, M._status_section_count(section))
   local entry = { id = section_key, kind = "section", section = section }
   status_add_line(line, entry, "DiffReviewStatusHeader")
   if section_folded then return end
@@ -5520,6 +5626,15 @@ local function status_entry_under_cursor()
   local line = vim.api.nvim_win_get_cursor(0)[1]
   if status.boundary_lines and status.boundary_lines[line] then return nil end
   return status.entries[line]
+end
+
+---@param buf integer
+---@return string?
+function M._pr_overview.url_under_cursor(buf)
+  if M._status_states and M._status_states[buf] then M._status = M._status_states[buf] end
+  local status = M._status
+  if not (status and status.view_kind == "pr") then return nil end
+  return M._pr_overview.entry_url(status.pr, status_entry_under_cursor())
 end
 
 ---@return integer? line
@@ -5962,6 +6077,8 @@ local function status_render_loaded(buf, target_id, fallback_line, opts, head_li
   local view_kind = M._status.view_kind or "status"
   if view_kind == "pr" then
     M._pr_edit.on_render(buf)
+    M._review.on_render(buf)
+    M._pr_edit.sync_modifiable(buf)
   elseif view_kind == "review" then
     M._review.on_render(buf)
   end
@@ -6227,9 +6344,15 @@ local function render_pr_status(pr, cwd, buf, diff_text)
   if not (status and status.buf == buf) then return end
   if M._pr_edit.blocks_render(buf) then return end
   diff_text = diff_text or status.pr_diff_text
+  status.pr_standalone_comments = status.pr_standalone_comments or {}
+  status.review_comments = status.pr_standalone_comments
   status.head_lines = status_pr_detail_head_lines(pr, status.pr_comments)
-  status.sections = status_pr_sections(cwd, pr, diff_text, status.pr_comments)
+  status.sections = status_pr_sections(cwd, pr, diff_text, status.pr_comments, status.pr_standalone_comments)
   status.fancy_rows = {}
+  status.pr_code_comments_by_anchor = M._section_builder.comment_anchor_index_from_sections(status.sections, { field = "pr_comments" })
+  status.review_after_row = function(diff_line, indent)
+    M._section_builder.emit_anchored_comments(status, diff_line, indent, { index_field = "pr_code_comments_by_anchor" })
+  end
   status_render_loaded(buf, nil, nil, { reuse_sections = true }, status.head_lines, status.sections)
 end
 
@@ -6304,10 +6427,14 @@ M._review = {
 }
 
 ---@param buf integer
----@return table? state the review status-state, or nil if buf is not a review
+---@return table? state the review-capable status-state, or nil if buf has no editable inline comments
 function M._review.state(buf)
   local status = M._status_states and M._status_states[buf] or nil
   if status and status.view_kind == "review" then return status end
+  if status and status.view_kind == "pr" and status.pr_standalone_comments then
+    status.review_comments = status.pr_standalone_comments
+    return status
+  end
   return nil
 end
 
@@ -7063,19 +7190,7 @@ end
 ---@param section_name string
 ---@return DiffReviewStatusFile
 function M._review.file_with_hunks(file, hunks, section_name)
-  local clone = vim.deepcopy(file)
-  clone.hunks = {}
-  clone.section_name = section_name
-  clone.added = 0
-  clone.removed = 0
-  for _, hunk in ipairs(hunks) do
-    local cloned_hunk = vim.deepcopy(hunk)
-    cloned_hunk.section_name = section_name
-    clone.hunks[#clone.hunks + 1] = cloned_hunk
-    clone.added = clone.added + (cloned_hunk.added or 0)
-    clone.removed = clone.removed + (cloned_hunk.removed or 0)
-  end
-  return clone
+  return M._section_builder.file_with_hunks(file, hunks, section_name)
 end
 
 ---@param state table
@@ -7113,7 +7228,7 @@ end
 ---@param state table
 ---@return DiffReviewStatusSection[]
 function M._review.sections(state)
-  local files = status_files_from_diff_provider(state.cwd, {
+  local files = M._section_builder.files_from_diff(state.cwd, {
     section_name = "review",
     default_status = "",
     files = state.pr.files,
@@ -7151,23 +7266,21 @@ function M._review.sections(state)
   if state.diff_text and state.diff_text ~= "" then
     M._review.prune_viewed_hunks(state, active_keys)
   end
-  local function section(name, title, list)
-    local by_name = {}
-    for _, file in ipairs(list) do by_name[file.filename] = file end
-    return {
-      name = name,
-      title = title,
-      default_folded = false,
-      files = list,
-      files_by_name = by_name,
-      file_key_prefix = name,
+  return {
+    M._section_builder.section_from_files("Unviewed Changes", unviewed, {
+      name = "review:unviewed",
+      keep_empty = true,
+      file_key_prefix = "review:unviewed",
       file_entry_kind = "pr_file",
       hunk_entry_kind = "pr_hunk",
-    }
-  end
-  return {
-    section("review:unviewed", "Unviewed Changes", unviewed),
-    section("review:viewed", "Viewed Changes", viewed),
+    }),
+    M._section_builder.section_from_files("Viewed Changes", viewed, {
+      name = "review:viewed",
+      keep_empty = true,
+      file_key_prefix = "review:viewed",
+      file_entry_kind = "pr_file",
+      hunk_entry_kind = "pr_hunk",
+    }),
   }
 end
 
@@ -7177,7 +7290,7 @@ end
 function M._review.ensure_expanded(state)
   if state.review_expanded or not state.diff_text or state.diff_text == "" then return end
   state.review_expanded = true
-  local files = status_files_from_diff_provider(state.cwd, {
+  local files = M._section_builder.files_from_diff(state.cwd, {
     section_name = "review",
     default_status = "",
     files = state.pr.files,
@@ -7203,6 +7316,7 @@ function M._review.render(buf)
   end
   state.fancy_rows = {}
   state.review_rendered_comment_count = 0
+  state.review_comment_anchor_index = M._section_builder.comment_anchor_index(state.review_comments)
   -- status_add_fancy_row consults this hook to interleave comment lines.
   state.review_after_row = function(diff_line, indent)
     M._review.emit_comments_for(state, diff_line, indent)
@@ -7510,16 +7624,11 @@ end
 ---@param diff_line table
 ---@param indent integer
 function M._review.emit_comments_for(state, diff_line, indent)
-  for index, comment in ipairs(state.review_comments) do
-    if comment ~= state.review_editing_comment
-      and comment.local_state ~= "deleted"
-      and comment.abs_file == diff_line.file
-      and comment.side == M._review.side_of(diff_line)
-      and comment.line == diff_line.line then
-      state.review_rendered_comment_count = (state.review_rendered_comment_count or 0) + 1
-      M._review.emit_comment(comment, index, indent)
-    end
-  end
+  M._section_builder.emit_anchored_comments(state, diff_line, indent, {
+    index_field = "review_comment_anchor_index",
+    count_field = "review_rendered_comment_count",
+    skip = function(comment) return comment == state.review_editing_comment end,
+  })
 end
 
 ---@param buf integer
@@ -7668,7 +7777,7 @@ function M._review.on_render(buf)
   end
   close_comment_range(#lines)
   state.review_comment_rule_width = M._review.comment_rule_width(nil, buf)
-  M._review.sync_modifiable(buf)
+  if state.view_kind == "review" then M._review.sync_modifiable(buf) end
 end
 
 ---@param buf integer
@@ -8246,7 +8355,11 @@ function M._review.sync_inline_comment_text(buf)
   comment.local_state = comment.remote_node_id and "dirty" or "new"
   comment.syncing = nil
   M._review.normalize_comment(state, comment)
-  M._review.save_draft(state)
+  if state.view_kind == "review" then
+    M._review.save_draft(state)
+  elseif state.view_kind == "pr" then
+    vim.bo[buf].modified = true
+  end
   M._review.refresh_inline_comment_header(buf, comment)
   return true
 end
@@ -8424,8 +8537,12 @@ function M._review.focus_inline_comment(buf, comment, opts)
   if comment.review_folded then
     local state = M._review.state(buf)
     comment.review_folded = false
-    if state then M._review.save_draft(state) end
-    M._review.render(buf)
+    if state and state.view_kind == "review" then M._review.save_draft(state) end
+    if state and state.view_kind == "pr" then
+      render_pr_status(state.pr, state.cwd, buf, state.pr_diff_text)
+    else
+      M._review.render(buf)
+    end
   end
   local start_row, end_row = M._review.comment_body_rows(buf, comment)
   if not start_row or not end_row then return end
@@ -8487,6 +8604,233 @@ function M._review.add_comment(buf)
   M._review.save_draft(state)
   M._review.render(buf)
   M._review.focus_inline_comment(buf, comment, { insert = true })
+end
+
+---@param buf integer
+---@return table? status
+function M._pr_overview.state(buf)
+  local status = M._status_states and M._status_states[buf] or nil
+  if not (status and status.view_kind == "pr" and status.pr) then return nil end
+  status.pr_standalone_comments = status.pr_standalone_comments or {}
+  status.review_comments = status.pr_standalone_comments
+  return status
+end
+
+---@param comment table?
+---@return string?
+function M._pr_overview.comment_identity_key(comment)
+  if not comment then return nil end
+  if comment.remote_node_id and comment.remote_node_id ~= "" then return "node:" .. tostring(comment.remote_node_id) end
+  if comment.remote_id then return "id:" .. tostring(comment.remote_id) end
+  return nil
+end
+
+---@param status table
+---@param comment table?
+---@return boolean
+function M._pr_overview.is_standalone_comment(status, comment)
+  if not (status and comment) then return false end
+  for _, local_comment in ipairs(status.pr_standalone_comments or {}) do
+    if M._review.same_comment(local_comment, comment) then return true end
+  end
+  return false
+end
+
+---@param buf integer
+---@return table? comment
+function M._pr_overview.standalone_comment_under_cursor(buf)
+  local status = M._pr_overview.state(buf)
+  if not status then return nil end
+  local comment = M._review.comment_under_cursor(buf)
+  if M._pr_overview.is_standalone_comment(status, comment) then return comment end
+  return nil
+end
+
+---@param buf integer
+function M._pr_overview.refresh_modified(buf)
+  local status = M._pr_overview.state(buf)
+  if not status or not vim.api.nvim_buf_is_valid(buf) then return end
+  local title_dirty, desc_dirty = M._pr_edit.dirty_flags(buf, status)
+  local comments_dirty = false
+  for _, comment in ipairs(status.pr_standalone_comments or {}) do
+    if M._review.comment_needs_sync(comment) then
+      comments_dirty = true
+      break
+    end
+  end
+  vim.bo[buf].modified = title_dirty or desc_dirty or comments_dirty
+end
+
+---@param buf integer
+function M._pr_overview.render_preserving_inline_cursor(buf)
+  local status = M._pr_overview.state(buf)
+  if not status then return end
+  local comment
+  local snapshot
+  if vim.api.nvim_get_current_buf() == buf then
+    local cursor = vim.api.nvim_win_get_cursor(0)
+    comment = M._review.comment_body_at_row(buf, cursor[1])
+    if comment then snapshot = M._review.inline_comment_cursor_snapshot(buf, comment) end
+  end
+  render_pr_status(status.pr, status.cwd, buf, status.pr_diff_text)
+  if comment and snapshot and comment.local_state ~= "deleted" then
+    M._review.restore_inline_comment_cursor(buf, comment, snapshot)
+  end
+end
+
+---@param status table
+---@param comment table
+---@param remote table?
+---@param queued_body string
+function M._pr_overview.apply_synced_standalone_comment(status, comment, remote, queued_body)
+  if remote then
+    comment.remote_id = remote.remote_id or comment.remote_id
+    comment.remote_node_id = remote.remote_node_id or comment.remote_node_id
+    comment.remote_review_id = remote.review_id or comment.remote_review_id
+    comment.review_node_id = remote.review_node_id or comment.review_node_id
+    comment.position = remote.position or comment.position
+    comment.line = remote.line or comment.line
+    if remote.path and remote.path ~= "" then comment.path = remote.path end
+    comment.side = remote.side or comment.side
+    comment.user = remote.user or comment.user
+    comment.created_at = remote.created_at or comment.created_at
+    comment.updated_at = remote.updated_at or comment.updated_at
+    comment.url = remote.url or comment.url
+    comment.replies = type(remote.replies) == "table" and vim.deepcopy(remote.replies) or (comment.replies or {})
+  end
+  if M._review.comment_body_for_sync(comment.body or "") == queued_body then
+    comment.body = queued_body
+    comment.base_body = queued_body
+    comment.local_state = "clean"
+  else
+    comment.base_body = queued_body
+    comment.local_state = "dirty"
+  end
+  comment.syncing = nil
+  M._review.normalize_comment(status, comment)
+end
+
+---@param status table
+---@param operation fun(done: fun())
+function M._pr_overview.enqueue_standalone_sync(status, operation)
+  status.pr_standalone_sync = status.pr_standalone_sync or { queue = {}, running = false }
+  status.pr_standalone_sync.queue[#status.pr_standalone_sync.queue + 1] = operation
+  local function run_next()
+    if status.pr_standalone_sync.running then return end
+    local next_operation = table.remove(status.pr_standalone_sync.queue, 1)
+    if not next_operation then return end
+    status.pr_standalone_sync.running = true
+    next_operation(function()
+      status.pr_standalone_sync.running = false
+      run_next()
+    end)
+  end
+  run_next()
+end
+
+---@param buf integer
+---@param comment table
+function M._pr_overview.sync_standalone_comment(buf, comment)
+  local status = M._pr_overview.state(buf)
+  if not (status and status.pr and comment) then return end
+  local body = M._review.comment_body_for_sync(comment.body or "")
+  if body == "" then
+    comment.syncing = nil
+    M._pr_overview.refresh_modified(buf)
+    return
+  end
+  local pr = status.pr
+  local opts = {
+    body = body,
+    commit_id = pr.headRefOid,
+    path = comment.path,
+    line = comment.line,
+    side = comment.side or "RIGHT",
+    start_line = comment.start_line,
+    start_side = comment.start_side,
+    position = comment.position,
+  }
+  local update_node_id = comment.remote_node_id
+  M._pr_overview.enqueue_standalone_sync(status, function(done)
+    local latest = M._pr_overview.state(buf)
+    if not latest then
+      done()
+      return
+    end
+    local callback = function(result)
+      latest = M._pr_overview.state(buf)
+      if not latest then
+        done()
+        return
+      end
+      if not result.ok then
+        comment.syncing = nil
+        notify_error("GitHub inline comment sync failed: " .. (result.message or "gh failed"), "DiffReview")
+        if vim.api.nvim_buf_is_valid(buf) then
+          M._pr_overview.render_preserving_inline_cursor(buf)
+          M._pr_overview.refresh_modified(buf)
+        end
+        done()
+        return
+      end
+      M._pr_overview.apply_synced_standalone_comment(latest, comment, result.comments and result.comments[1] or nil, body)
+      if vim.api.nvim_buf_is_valid(buf) then
+        M._pr_overview.render_preserving_inline_cursor(buf)
+        M._pr_overview.refresh_modified(buf)
+      end
+      vim.notify("Inline comment synced", vim.log.levels.INFO, { title = "DiffReview" })
+      done()
+    end
+    if update_node_id and update_node_id ~= "" then
+      gh.update_review_comment_async(latest.cwd, update_node_id, body, callback)
+    else
+      gh.create_pr_review_comment_async(latest.cwd, pr.number, pr.repo, opts, callback)
+    end
+  end)
+end
+
+---@param buf integer
+---@return integer count
+function M._pr_overview.sync_standalone_comments(buf)
+  local status = M._pr_overview.state(buf)
+  if not status then return 0 end
+  M._review.sync_inline_comment_text(buf)
+  local comments = {}
+  for _, comment in ipairs(status.pr_standalone_comments or {}) do
+    if M._review.comment_needs_sync(comment) then
+      comment.syncing = true
+      comments[#comments + 1] = comment
+    end
+  end
+  if #comments == 0 then return 0 end
+  for _, comment in ipairs(comments) do
+    M._review.refresh_inline_comment_header(buf, comment)
+  end
+  M._pr_overview.refresh_modified(buf)
+  for _, comment in ipairs(comments) do
+    M._pr_overview.sync_standalone_comment(buf, comment)
+  end
+  return #comments
+end
+
+---@param buf integer
+function M._pr_overview.add_standalone_comment(buf)
+  local status = M._pr_overview.state(buf)
+  if not status then return end
+  M._status = status
+  local existing = M._pr_overview.standalone_comment_under_cursor(buf)
+  if existing then
+    M._review.focus_inline_comment(buf, existing)
+    return
+  end
+  local payload = M._review.selection_payload(status)
+  M._review.leave_visual()
+  if not payload then return end
+  local comment = M._review.create_inline_comment(status, payload)
+  comment.standalone = true
+  render_pr_status(status.pr, status.cwd, buf, status.pr_diff_text)
+  M._review.focus_inline_comment(buf, comment, { insert = true })
+  M._pr_overview.refresh_modified(buf)
 end
 
 ---`J`: remove the draft comment under the cursor.
@@ -8860,16 +9204,16 @@ end
 ---@return DiffReviewStatusSection[]
 function M._branch_diff.sections(cwd, branch, diff_text, file)
   local provider_key = "diff:" .. branch .. (file and (":" .. file) or "")
-  local files = status_files_from_diff_provider(cwd, {
+  local sections = M._section_builder.sections_from_diff(cwd, {
+    title = "Changes vs " .. branch,
     section_name = provider_key .. ":changes",
     default_status = "",
-  }, diff_text)
-  return status_sections_from_provider_files("Changes vs " .. branch, files, {
     name = provider_key .. ":changes",
     file_key_prefix = provider_key,
     file_entry_kind = "pr_file",
     hunk_entry_kind = "pr_hunk",
-  })
+  }, diff_text)
+  return sections
 end
 
 ---@param branch string
@@ -9216,8 +9560,7 @@ function M._pr_edit.sync(buf)
       local latest = M._status_states and M._status_states[buf] or nil
       if latest == status then
         M._status = status
-        status.head_lines = status_pr_detail_head_lines(pr, status.pr_comments)
-        status_render_loaded(buf, nil, nil, { reuse_sections = true }, status.head_lines, status.sections or {})
+        render_pr_status(pr, status.cwd, buf, status.pr_diff_text)
       end
       vim.notify(("PR #%s updated"):format(tostring(pr.number)), vim.log.levels.INFO, { title = "DiffReview" })
       done()
@@ -9235,6 +9578,7 @@ function M._pr_edit.sync_modifiable(buf)
   local status = M._status_states and M._status_states[buf] or nil
   local state = status and status.pr_edit or nil
   local wanted = M._pr_edit.region_kind_at(buf, row) ~= nil
+    or M._review.in_editable_region(buf, row)
   if state and state.lock_initial then
     if state.initial_cursor_row == nil then state.initial_cursor_row = row end
     if row == state.initial_cursor_row then
@@ -9276,6 +9620,7 @@ function M._pr_edit.attach(buf)
     group = group,
     buffer = buf,
     callback = function()
+      M._review.sync_inline_comment_text(buf)
       M._pr_edit.refresh_markers(buf)
     end,
   })
@@ -9283,6 +9628,8 @@ function M._pr_edit.attach(buf)
     group = group,
     buffer = buf,
     callback = function()
+      M._review.sync_inline_comment_text(buf)
+      M._pr_overview.sync_standalone_comments(buf)
       M._pr_edit.sync(buf)
     end,
   })
@@ -10391,11 +10738,23 @@ local function setup_status_keymaps(buf)
   if view_kind ~= "status" then
     map("browse", "n", function()
       local status = M._status_states and M._status_states[buf] or M._status
+      if status and status.view_kind == "pr" then
+        local url = M._pr_overview.url_under_cursor(buf)
+        if url and gh.browse_url(url) then return end
+      end
       local pr = status and status.pr
       if not gh.browse_pr(pr) then
         notify_error("Unable to open PR URL", "DiffReview")
       end
     end)
+    if is_pr_view then
+      map("comment", { "n", "x" }, function()
+        M._pr_overview.add_standalone_comment(buf)
+      end)
+      map("sync", { "n", "i" }, function()
+        M._pr_overview.sync_standalone_comments(buf)
+      end)
+    end
     map("review", "n", function()
       M._review.start(buf)
     end)
@@ -10552,6 +10911,8 @@ function M.open_pr(pr, opts)
     sections = nil,
     fancy_rows = {},
   }
+  state.pr_standalone_comments = {}
+  state.review_comments = state.pr_standalone_comments
   M._status = state
   attach_status_state(buf, state)
   setup_status_keymaps(buf)

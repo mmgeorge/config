@@ -50,25 +50,72 @@ narrative — use the diff only to confirm files and line numbers.
   displays the step's file name, so do not repeat the file path in the
   comment.
 - `title` is an optional short heading (a few words).
-- `summary` is shown before the first step. Open with a 1-3 sentence prose
-  overview that explains what changed and why, then include a compact ASCII
-  flow graph. Keep the graph conceptual: show the main data/control flow and
-  the modified/new/removed nodes with `*` and `~`, but do **not** include repo
-  paths or bracketed file names in the summary. The walkthrough steps already
-  carry exact file and range targets; repeating paths in the summary makes the
-  overview harder to read. Do not enumerate every changed file, helper, shader,
-  or test here; use roughly 3-6 conceptual nodes that orient the reviewer to
-  the change. Keep graph lines under 76 characters - the reviewer UI preserves
-  preformatted lines verbatim. Example shape:
+- `summary` is shown before the first step. It is the reviewer's top-down map
+  of the change:
+  1. Open with a 1-3 sentence prose overview explaining what changed and why.
+  2. Add a compact top-level graph rooted at the major feature/fix/refactor.
+     Each child is an active author-context sentence such as `Add...`,
+     `Update...`, `Move...`, `Split...`, `Remove...`, or `Preserve...`.
+  3. Add `Major changes:` and expand each child sentence into a small graph.
+     Group nodes by top-level subsystem/module when that best explains the
+     design, and add short inline annotations that say why the important nodes
+     changed.
+  4. End with `Legend: + new, * modified, ~ removed/split, > ownership moved`.
+  The walkthrough steps already carry exact file and range targets, so do
+  **not** include repo paths or bracketed file names in the summary. Keep graph
+  lines under 76 characters - the reviewer UI preserves preformatted lines
+  verbatim. Example shape:
 
   ```
-  API Request (POST /documents)
-    │ (DocumentRequest)
-    ├── validate_request() → ValidatedRequest
-    ├── *process_document() → StoredDocument
-    │     ├── ~save_and_respond() → Response
-    │     └── *save_result() → StoredDocument
-    └── *notify() → NotifyResult (NEW)
+  Adds model-backed particle rendering while preserving billboard particles.
+  The PR separates storage/render ownership so physics, render, and model
+  plugins communicate through a narrow instance-source handoff.
+
+  Add model-backed particle rendering for live particles.
+  ├── Update particle spawns to choose between billboard and model rendering.
+  ├── Move particle GPU buffers behind a render-facing handoff.
+  └── Update model renderer to draw live particles through the PBR path.
+
+  Major changes:
+
+  1. Update particle spawns to choose between billboard and model rendering.
+     ├── Physics plugin
+     │   ├── +ParticleRenderMode
+     │   │   chooses Billboard vs Model(asset) at spawn time
+     │   ├── *ParticleSystem::run()
+     │   │   simulates particles, then publishes render instances
+     │   └── +ParticleBillboardRenderSystem::run()
+     │       preserves the legacy triangle path as a separate system
+     └── Demo/app wiring
+         └── *drop3d particle spawn
+             opts into Model(SmoothSphere) to exercise PBR particles
+
+  2. Move particle GPU buffers behind a render-facing handoff.
+     ├── Physics plugin
+     │   └── >ParticleStorage
+     │       moves GPU buffers out of the solver into shared storage
+     ├── Render plugin
+     │   └── +ParticleInstanceSources
+     │       owns the render-facing handoff for live particle buffers
+     └── Model plugin
+         └── *ModelRenderSystem::render()
+             reads the handoff before issuing particle model draws
+
+  3. Update model renderer to draw live particles through the PBR path.
+     ├── Model plugin
+     │   ├── +ParticlePbRenderPipeline
+     │   │   binds particle storage into the model render pass
+     │   ├── *model primitive draw commands
+     │   │   reuse existing primitive/material stores for particles
+     │   └── *ModelRenderSystem::render()
+     │       draws each primitive across the live particle count
+     └── Shader path
+         ├── *pbr_vertex helpers
+         │   share vertex-output construction with normal model rendering
+         └── +particle_render.entry.slang
+             turns particle positions/radii into PBR mesh instances
+
+  Legend: + new, * modified, ~ removed/split, > ownership moved
   ```
 
 ## 3. Schema
@@ -125,7 +172,7 @@ alongside this skill). The schema, inlined:
 ```json
 {
   "version": 1,
-  "summary": "Adds rate limiting to the public API. A new token-bucket middleware guards every /api route; configuration controls bucket sizing and the middleware is exercised by integration tests.\n\nRequest (POST /api/*)\n  ├── *rate_limit() → Decision (NEW)\n  │     └── *TokenBucket::take()\n  └── handle() → Response",
+  "summary": "Adds rate limiting to the public API while keeping health checks and static assets unthrottled. The change introduces a middleware boundary around API routes, stores token buckets per client, and adds configuration plus integration coverage.\n\nAdd token-bucket rate limiting to API requests.\n├── Add middleware that decides whether a request can continue.\n├── Add per-client token buckets with lazy refill.\n└── Wire rate-limit configuration into the API route stack.\n\nMajor changes:\n\n1. Add middleware that decides whether a request can continue.\n   ├── HTTP routing\n   │   └── *api route stack\n   │       wraps /api requests without throttling health/static routes\n   └── Middleware\n       └── +rate_limit()\n           returns allow/deny decisions before request handling\n\n2. Add per-client token buckets with lazy refill.\n   └── Rate-limit core\n       └── +TokenBucket::take()\n           refills on access and consumes one token per accepted request\n\n3. Wire rate-limit configuration into the API route stack.\n   ├── Configuration\n   │   └── +RateLimitConfig\n   │       controls bucket size and refill rate\n   └── Integration tests\n       └── +API throttling workflow\n           covers accepted bursts, throttled overflow, and refill behavior\n\nLegend: + new, * modified, ~ removed/split, > ownership moved",
   "commit": "8f14e45fceea167a5a36dedd4bea2543c6a04c33",
   "steps": [
     {
@@ -155,9 +202,11 @@ alongside this skill). The schema, inlined:
   context; every region is tight (~40 lines max) around the discussed code.
 - `summary` has no repo-relative paths or bracketed file names; exact locations
   belong in `steps`.
-- `summary` is not an exhaustive inventory of changed files/functions; it
-  orients the reviewer to the main conceptual flow.
-- `summary` includes a compact ASCII flow graph after the prose overview.
+- `summary` starts with prose, then a top-level graph, then `Major changes:`
+  with expanded graphs, then the legend at the end.
+- Major-change roots are active author-context sentences, not noun-only labels.
+- The expanded graphs are not exhaustive inventories of changed files/functions;
+  they explain the most important top-down design changes.
 - `commit` is the full 40-character sha from `git rev-parse HEAD`.
 - The JSON is valid: no trailing commas, no comments, double-quoted keys.
 - Write to `<repo root>/.walkthrough.json`, overwriting any existing file.

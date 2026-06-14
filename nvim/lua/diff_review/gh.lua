@@ -95,6 +95,7 @@
 ---@field updated_at? string
 ---@field submitted_at? string
 ---@field commit_id? string
+---@field url? string
 ---@field comments? DiffReviewGhPendingReviewComment[]
 
 ---@class DiffReviewGhPRCommentsResult
@@ -446,6 +447,12 @@ local function maybe_integer(value)
 end
 
 ---@param raw table
+---@return string?
+local function browser_url(raw)
+  return raw.html_url or raw.url
+end
+
+---@param raw table
 ---@return DiffReviewGhReviewCommentReply
 local function normalize_review_reply(raw)
   local author = raw.author or raw.user or {}
@@ -460,7 +467,7 @@ local function normalize_review_reply(raw)
     user = author.login,
     created_at = raw.createdAt or raw.created_at,
     updated_at = raw.updatedAt or raw.updated_at,
-    url = raw.url or raw.html_url,
+    url = browser_url(raw),
   }
 end
 
@@ -486,7 +493,7 @@ local function normalize_review_comment(raw, thread)
     user = author.login,
     created_at = raw.createdAt or raw.created_at,
     updated_at = raw.updatedAt or raw.updated_at,
-    url = raw.url or raw.html_url,
+    url = browser_url(raw),
     resolved = thread.isResolved,
     outdated = thread.isOutdated,
     replies = {},
@@ -521,6 +528,7 @@ local function normalize_submitted_review(raw)
     updated_at = raw.updatedAt or raw.updated_at,
     submitted_at = raw.submittedAt or raw.submitted_at,
     commit_id = raw.commit_id or commit.oid,
+    url = browser_url(raw),
     comments = {},
   }
 end
@@ -536,7 +544,7 @@ local function normalize_issue_comment(raw)
     user = author.login,
     created_at = raw.createdAt or raw.created_at,
     updated_at = raw.updatedAt or raw.updated_at,
-    url = raw.url or raw.html_url,
+    url = browser_url(raw),
   }
 end
 
@@ -581,7 +589,7 @@ function M.pr_comments_async(cwd, number, repo, cb)
     "  repository(owner:$owner, name:$repo) {",
     "    pullRequest(number:$number) {",
     "      reviews(first:100) { nodes {",
-    "        id databaseId state body createdAt updatedAt submittedAt",
+    "        id databaseId state body createdAt updatedAt submittedAt url",
     "        author { login }",
     "        commit { oid }",
     "      } }",
@@ -799,6 +807,41 @@ function M.add_pending_review_comment_async(cwd, review_node_id, opts, cb)
 end
 
 ---@param cwd string
+---@param number integer|string
+---@param repo? string
+---@param opts { body: string, commit_id?: string, path: string, line?: integer, side?: string, start_line?: integer, start_side?: string, position?: integer }
+---@param cb fun(result: DiffReviewGhPendingReviewResult)
+function M.create_pr_review_comment_async(cwd, number, repo, opts, cb)
+  local payload = {
+    body = opts.body,
+    commit_id = opts.commit_id,
+    path = opts.path,
+  }
+  if opts.line then
+    payload.line = opts.line
+    payload.side = opts.side or "RIGHT"
+    if opts.start_line then
+      payload.start_line = opts.start_line
+      payload.start_side = opts.start_side or payload.side
+    end
+  elseif opts.position then
+    payload.position = opts.position
+  end
+  system_text_async({ "gh", "api", "--method", "POST", pr_api_path(number, repo, "comments"), "--input", "-" }, vim.json.encode(payload), cwd, function(result)
+    if result.code ~= 0 then
+      cb({ ok = false, message = result.output ~= "" and result.output or ("gh exited " .. result.code), code = result.code })
+      return
+    end
+    local decoded = decode_json(result.stdout)
+    if not decoded then
+      cb({ ok = false, message = "gh api returned invalid standalone review comment JSON", code = result.code })
+      return
+    end
+    cb({ ok = true, comments = { normalize_review_comment(decoded) } })
+  end)
+end
+
+---@param cwd string
 ---@param comment_node_id string
 ---@param body string
 ---@param cb fun(result: DiffReviewGhPendingReviewResult)
@@ -875,28 +918,10 @@ function M.submit_pr_review_async(cwd, number, repo, opts, cb)
   system_text_async(command, vim.json.encode(payload), cwd, cb)
 end
 
----@param pr DiffReviewGhPR
+---@param url string?
 ---@return boolean
-function M.browse_pr(pr)
-  if not (pr and pr.url and pr.url ~= "") then return false end
-  local backend = M._backend
-  if backend and backend.open_url then
-    return backend.open_url(pr.url)
-  end
-  if vim.ui and vim.ui.open then
-    vim.ui.open(pr.url)
-    return true
-  end
-  return false
-end
-
----@param pr DiffReviewGhPR
----@param fragment? string
----@return boolean
-function M.browse_pr_changes(pr, fragment)
-  if not (pr and pr.url and pr.url ~= "") then return false end
-  local url = pr.url:gsub("/$", "") .. "/changes"
-  if fragment and fragment ~= "" then url = url .. "#" .. fragment end
+function M.browse_url(url)
+  if not (url and url ~= "") then return false end
   local backend = M._backend
   if backend and backend.open_url then
     return backend.open_url(url)
@@ -906,6 +931,23 @@ function M.browse_pr_changes(pr, fragment)
     return true
   end
   return false
+end
+
+---@param pr DiffReviewGhPR
+---@return boolean
+function M.browse_pr(pr)
+  if not (pr and pr.url and pr.url ~= "") then return false end
+  return M.browse_url(pr.url)
+end
+
+---@param pr DiffReviewGhPR
+---@param fragment? string
+---@return boolean
+function M.browse_pr_changes(pr, fragment)
+  if not (pr and pr.url and pr.url ~= "") then return false end
+  local url = pr.url:gsub("/$", "") .. "/changes"
+  if fragment and fragment ~= "" then url = url .. "#" .. fragment end
+  return M.browse_url(url)
 end
 
 return M

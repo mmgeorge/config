@@ -259,7 +259,16 @@ local function run()
   assert_true(line_has_highlight(buf, boundary_row, "@keyword"), "boundary row did not get keyword syntax highlight: " .. line_highlights(buf, boundary_row))
   assert_true(line_has_highlight(buf, boundary_row, "@type"), "boundary row did not get type syntax highlight: " .. line_highlights(buf, boundary_row))
   wait_for(function() return buffer_contains(buf, "...") end, "ellipsis boundary did not render\n" .. buffer_dump(buf))
-  local ellipsis_gutter = gutter_text(buf, find_row(buf, "...")) or ""
+  local ellipsis_row
+  local current_lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  for index = boundary_row + 1, #current_lines do
+    if current_lines[index]:find("...", 1, true) then
+      ellipsis_row = index
+      break
+    end
+  end
+  assert_true(ellipsis_row ~= nil, "ellipsis boundary did not render after opening boundary\n" .. buffer_dump(buf))
+  local ellipsis_gutter = gutter_text(buf, ellipsis_row) or ""
   assert_true(ellipsis_gutter:find("^%s+$", 1) ~= nil, "ellipsis row missing a blank gutter: " .. ellipsis_gutter)
   wait_for(function() return buffer_contains(buf, "}") end, "closing boundary did not render\n" .. buffer_dump(buf))
   wait_for(function()

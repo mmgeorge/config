@@ -38,7 +38,10 @@ local pr_diff_text = table.concat({
 
 ---@type { command: string[], input: string? }[]
 local edit_calls = {}
+---@type { command: string[], input: string?, payload: table }[]
+local standalone_comment_calls = {}
 local edit_should_fail = false
+local opened_urls = {}
 
 ---@type DiffReviewGhBackend
 local gh_backend = {}
@@ -61,6 +64,7 @@ function gh_backend.system_async(command, input, cb)
                     createdAt = "2026-06-14T17:13:00Z",
                     updatedAt = "2026-06-14T17:15:00Z",
                     submittedAt = "2026-06-14T17:15:00Z",
+                    url = "https://github.com/owner/repo/pull/7#pullrequestreview-4493241278",
                     author = { login = "foo" },
                     commit = { oid = "abc1234def5678abc1234def5678abc1234def56" },
                   },
@@ -72,6 +76,7 @@ function gh_backend.system_async(command, input, cb)
                     createdAt = "2026-06-14T17:16:00Z",
                     updatedAt = "2026-06-14T17:16:00Z",
                     submittedAt = "2026-06-14T17:16:00Z",
+                    url = "https://github.com/owner/repo/pull/7#pullrequestreview-4493241279",
                     author = { login = "mgeorge" },
                     commit = { oid = "abc1234def5678abc1234def5678abc1234def56" },
                   },
@@ -137,6 +142,26 @@ function gh_backend.system_async(command, input, cb)
       cb({ code = 0, stdout = pr_diff_text, stderr = "", output = pr_diff_text })
       return
     end
+    if key == "gh api --method POST /repos/owner/repo/pulls/7/comments --input -" then
+      local payload = vim.json.decode(input or "{}")
+      standalone_comment_calls[#standalone_comment_calls + 1] = { command = command, input = input, payload = payload }
+      local stdout = vim.json.encode({
+        id = 3409923999,
+        node_id = "PRRC_STANDALONE_1",
+        body = payload.body,
+        path = payload.path,
+        line = payload.line,
+        position = payload.position,
+        side = payload.side,
+        url = "https://api.github.com/repos/owner/repo/pulls/comments/3409923999",
+        created_at = "2026-06-14T18:00:00Z",
+        updated_at = "2026-06-14T18:00:00Z",
+        html_url = "https://github.com/owner/repo/pull/7#discussion_r3409923999",
+        user = { login = "me" },
+      })
+      cb({ code = 0, stdout = stdout, stderr = "", output = stdout })
+      return
+    end
     if key:find("gh pr edit", 1, true) then
       edit_calls[#edit_calls + 1] = { command = command, input = input }
       if edit_should_fail then
@@ -148,6 +173,11 @@ function gh_backend.system_async(command, input, cb)
     end
     cb({ code = 1, stdout = "", stderr = "unexpected gh command: " .. key, output = "unexpected gh command: " .. key })
   end, 3)
+end
+
+function gh_backend.open_url(url)
+  opened_urls[#opened_urls + 1] = url
+  return true
 end
 
 ---@type DiffReviewGitBackend
@@ -204,6 +234,18 @@ local function find_row_after(buf, needle, after_row)
   error("missing row after " .. tostring(after_row) .. ": " .. needle .. "\n" .. table.concat(lines, "\n"), 2)
 end
 
+local function line_has_highlight(buf, row, hl_group, start_col, end_col)
+  for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })) do
+    local details = mark[4] or {}
+    if details.hl_group == hl_group
+      and (start_col == nil or mark[3] == start_col)
+      and (end_col == nil or details.end_col == end_col) then
+      return true
+    end
+  end
+  return false
+end
+
 local function assert_cursor_clamped_to_line(buf, row, label)
   vim.api.nvim_win_set_buf(0, buf)
   local line = vim.api.nvim_buf_get_lines(buf, row - 1, row, false)[1] or ""
@@ -256,6 +298,15 @@ local function trigger_buf_mapping(buf, key)
   mapping.callback()
 end
 
+local function assert_browse_url(buf, row, expected, label)
+  move_cursor(buf, row)
+  trigger_buf_mapping(buf, "b")
+  assert_true(
+    opened_urls[#opened_urls] == expected,
+    ("%s opened %s instead of %s"):format(label, tostring(opened_urls[#opened_urls]), expected)
+  )
+end
+
 local pr = {
   number = 7,
   title = "Old title",
@@ -281,43 +332,90 @@ local function run()
   wait_for(function() return buffer_contains(buf, "Title:  Old title") end, "PR view did not render the title")
   assert_true(buffer_contains(buf, "Line one"), "PR body did not render")
   wait_for(function() return buffer_contains(buf, "This is a regular comment") end, "PR conversation comment did not render")
-  wait_for(function() return buffer_contains(buf, "This is inline comment without review") end, "PR inline code comment did not render")
-  wait_for(function() return buffer_contains(buf, "Oh good point! fixed") end, "PR inline reply did not render")
-  wait_for(function() return buffer_contains(buf, "Reviews:") end, "submitted reviews section did not render")
+  assert_true(buffer_contains(buf, "Comments (1):"), "PR comments heading did not use section heading format")
+  wait_for(function() return buffer_contains(buf, "Reviews (2):") end, "submitted reviews section did not render")
+  assert_true(buffer_contains(buf, "Changes (1):"), "PR changes heading did not use section heading format")
+  assert_true(
+    line_has_highlight(buf, find_row(buf, "Description:"), "DiffReviewStatusHeader", 0, #"Description:"),
+    "PR description heading did not use header highlight"
+  )
   wait_for(function()
     return buffer_contains(buf, "REJECTED by foo | 2026-06-14 17:15 | This requires a few changes...")
   end, "rejected review summary did not render")
   assert_true(buffer_contains(buf, "APPROVED by mgeorge | 2026-06-14 17:16 | LGTM!"), "approved review summary did not render")
+  local changes_file_row = find_row(buf, "src/a.txt +1 -1")
+  move_cursor(buf, changes_file_row)
+  trigger_buf_mapping(buf, "<Tab>")
+  wait_for(function() return buffer_contains(buf, "NEW LINE") end, "PR changed file did not expand")
+  wait_for(function() return buffer_contains(buf, "This is inline comment without review") end, "PR inline code comment did not render")
+  wait_for(function() return buffer_contains(buf, "Oh good point! fixed") end, "PR inline reply did not render")
+  local changed_code_row = find_row(buf, "NEW LINE")
+  local inline_comment_row = find_row_after(buf, "This is inline comment without review", changes_file_row)
   assert_true(
-    find_row(buf, "This is inline comment without review") > find_row(buf, "src/a.txt +1 -1"),
-    "inline code comment did not render under its changed file"
+    inline_comment_row > changed_code_row,
+    "inline code comment rendered before its code row"
   )
+  local inline_reply_row = find_row_after(buf, "Oh good point! fixed", inline_comment_row)
   assert_true(
-    find_row(buf, "Oh good point! fixed") > find_row(buf, "This is inline comment without review"),
+    inline_reply_row > inline_comment_row,
     "inline reply did not render under its parent comment"
   )
   local rejected_review_row = find_row(buf, "REJECTED by foo")
+  local regular_comment_row = find_row(buf, "This is a regular comment")
+  opened_urls = {}
+  assert_browse_url(buf, regular_comment_row, "https://github.com/owner/repo/pull/7#issuecomment-4702465966", "regular PR comment")
+  assert_browse_url(buf, rejected_review_row, "https://github.com/owner/repo/pull/7#pullrequestreview-4493241278", "review summary")
+  assert_browse_url(buf, inline_comment_row, "https://github.com/owner/repo/pull/7#discussion_r3409923137", "inline code comment")
+  assert_browse_url(buf, inline_reply_row, "https://github.com/owner/repo/pull/7#discussion_r3409923138", "inline code reply")
+
+  move_cursor(buf, changed_code_row)
+  trigger_buf_mapping(buf, "C")
+  local standalone_header_row = find_row_after(buf, "you |", changed_code_row)
+  local standalone_body_row = standalone_header_row + 1
+  edit_line(buf, standalone_body_row, "Standalone from PR overview")
+  assert_true(vim.bo[buf].modified, "standalone inline comment edit must mark the PR buffer modified")
+  trigger_buf_mapping(buf, "<C-s>")
+  wait_for(function() return #standalone_comment_calls == 1 end, "standalone inline comment was not posted")
+  local standalone_payload = standalone_comment_calls[1].payload
+  assert_true(standalone_payload.body == "Standalone from PR overview", "wrong standalone comment body: " .. vim.inspect(standalone_payload))
+  assert_true(standalone_payload.commit_id == pr.headRefOid, "standalone comment did not target the PR head commit")
+  assert_true(standalone_payload.path == "src/a.txt", "standalone comment path was wrong")
+  assert_true(standalone_payload.line == 2, "standalone comment line was wrong")
+  assert_true(standalone_payload.side == "RIGHT", "standalone comment side was wrong")
+  wait_for(function() return saw_notification_containing("Inline comment synced") end, "successful standalone sync was not notified")
+  assert_true(buffer_contains(buf, "Standalone from PR overview"), "posted standalone comment disappeared from the PR overview")
+  assert_browse_url(
+    buf,
+    find_row(buf, "Standalone from PR overview"),
+    "https://github.com/owner/repo/pull/7#discussion_r3409923999",
+    "fresh standalone inline code comment"
+  )
+
   move_cursor(buf, rejected_review_row)
   trigger_buf_mapping(buf, "<Tab>")
   wait_for(function()
-    return find_row(buf, "This is inline comment without review") > find_row(buf, "REJECTED by foo")
+    local ok, review_comment_row = pcall(find_row_after, buf, "This is inline comment without review", rejected_review_row)
+    if not ok then return false end
+    return review_comment_row < find_row_after(buf, "Changes", rejected_review_row)
   end, "expanded review did not show inline comment context")
+  local changes_heading_row = find_row_after(buf, "Changes", rejected_review_row)
+  local expanded_file_row = find_row_after(buf, "src/a.txt +1 -1", rejected_review_row)
   assert_true(
-    find_row(buf, "src/a.txt +1 -1") > rejected_review_row,
+    expanded_file_row < changes_heading_row,
     "expanded review did not render the commented file"
   )
-  assert_true(buffer_contains(buf, "NEW LINE"), "expanded review did not render diff context")
-  local expanded_parent_row = find_row_after(buf, "This is inline comment without review", find_row(buf, "NEW LINE"))
+  local expanded_code_row = find_row_after(buf, "NEW LINE", expanded_file_row)
+  assert_true(expanded_code_row < changes_heading_row, "expanded review did not render diff context")
+  local expanded_parent_row = find_row_after(buf, "This is inline comment without review", expanded_code_row)
   local expanded_reply_row = find_row_after(buf, "Oh good point! fixed", expanded_parent_row)
   assert_true(expanded_reply_row > expanded_parent_row, "expanded review reply did not render under the parent comment")
-  assert_true(expanded_reply_row < find_row_after(buf, "Changes", rejected_review_row), "expanded review reply rendered in the wrong section")
+  assert_true(expanded_reply_row < changes_heading_row, "expanded review reply rendered in the wrong section")
   assert_true(buffer_contains(buf, "foo | 2026-06-14 17:00"), "expanded review reply header did not render author and timestamp")
   assert_true(vim.bo[buf].buftype == "acwrite", "PR buffer must be acwrite")
   assert_true(not vim.bo[buf].modifiable, "PR buffer must start nomodifiable")
 
   local title_row = find_row(buf, "Title:  Old title")
   local body_row = find_row(buf, "Line one")
-  local regular_comment_row = find_row(buf, "This is a regular comment")
 
   -- ── the buffer unlocks exactly on the editable regions ─────────────────────
   move_cursor(buf, find_row(buf, "URL:"))

@@ -108,6 +108,7 @@ sandbox = "elevated"
 [tui]
 vim_mode_default = false
 # animations = false
+# terminal_resize_reflow_max_rows = 0
 terminal_title = ["project"]
 
 [tui.keymap.vim_normal]
