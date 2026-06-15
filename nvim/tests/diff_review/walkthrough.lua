@@ -6,6 +6,7 @@ local walkthrough = require("diff_review.walkthrough")
 
 local root = "D:/diffreview-flow-root"
 local head_sha = string.rep("a", 40)
+local comment_box_bottom_padding = 3
 
 local function assert_true(condition, message)
   if not condition then error(message, 2) end
@@ -58,6 +59,20 @@ local function two_hunk_diff(relpath)
   }, "\n")
 end
 
+local function long_region_diff(relpath)
+  local lines = {
+    two_hunk_diff(relpath),
+    "@@ -20,36 +20,36 @@",
+    " long context 01 " .. relpath,
+    "-old long 02 " .. relpath,
+    "+NEW long 02 " .. relpath,
+  }
+  for index = 3, 36 do
+    lines[#lines + 1] = (" long context %02d %s"):format(index, relpath)
+  end
+  return table.concat(lines, "\n")
+end
+
 ---@type DiffReviewGhBackend
 local gh_backend = {}
 
@@ -100,7 +115,7 @@ function backend.systemlist(command)
     return { "M\tc.txt" }, 0
   end
   if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff" then
-    return vim.split(two_hunk_diff("a.txt") .. "\n" .. modified_diff("b.txt"), "\n", { plain = true }), 0
+    return vim.split(long_region_diff("a.txt") .. "\n" .. modified_diff("b.txt"), "\n", { plain = true }), 0
   end
   if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--cached" then
     return vim.split(modified_diff("c.txt"), "\n", { plain = true }), 0
@@ -157,12 +172,60 @@ local function buffer_has_highlight(buf, hl_group)
   return false
 end
 
+local function buffer_has_highlight_for_text(buf, line_needle, text, hl_group)
+  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  for row, line in ipairs(lines) do
+    if line:find(line_needle, 1, true) then
+      local start_byte = line:find(text, 1, true)
+      if not start_byte then return false end
+      local start_col = start_byte - 1
+      local end_col = start_col + #text
+      local marks = vim.api.nvim_buf_get_extmarks(buf, walkthrough._ns, 0, -1, { details = true })
+      for _, mark in ipairs(marks) do
+        local details = mark[4] or {}
+        if mark[2] == row - 1
+            and details.hl_group == hl_group
+            and mark[3] <= start_col
+            and (details.end_col or mark[3]) >= end_col then
+          return true
+        end
+      end
+      return false
+    end
+  end
+  return false
+end
+
 local function find_row(buf, needle)
   local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
   for index, line in ipairs(lines) do
     if line:find(needle, 1, true) then return index end
   end
   error("missing row: " .. needle .. "\n" .. table.concat(lines, "\n"), 2)
+end
+
+local function find_line(buf, needle)
+  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  return lines[find_row(buf, needle)]
+end
+
+local function find_line_after(buf, needle, after_row)
+  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  for row_index = after_row + 1, #lines do
+    if lines[row_index]:find(needle, 1, true) then return lines[row_index] end
+  end
+  error("missing row after " .. after_row .. ": " .. needle .. "\n" .. table.concat(lines, "\n"), 2)
+end
+
+local function first_text_col(line)
+  local first_text_byte = line:find("%S")
+  return first_text_byte and (first_text_byte - 1) or 0
+end
+
+local function display_col_before(line, needle)
+  local start_byte = line:find(needle, 1, true)
+  assert_true(start_byte ~= nil, "missing text: " .. needle)
+  return vim.fn.strdisplaywidth(line:sub(1, start_byte - 1))
 end
 
 local function trigger_buf_mapping(buf, key)
@@ -203,19 +266,43 @@ end
 --- Concatenated text of the inline comment box (virt_lines extmarks).
 local function box_text(buf)
   local marks = vim.api.nvim_buf_get_extmarks(buf, walkthrough._ns, 0, -1, { details = true })
-  local parts = {}
+  local chunks = {}
   for _, mark in ipairs(marks) do
     for _, virt_line in ipairs(mark[4].virt_lines or {}) do
       for _, chunk in ipairs(virt_line) do
-        parts[#parts + 1] = chunk[1]
+        chunks[#chunks + 1] = chunk[1]
       end
     end
   end
-  return table.concat(parts, "\n")
+  return table.concat(chunks, "\n")
+end
+
+local function comment_box_mark(buf)
+  local marks = vim.api.nvim_buf_get_extmarks(buf, walkthrough._ns, 0, -1, { details = true })
+  for _, mark in ipairs(marks) do
+    if mark[4].virt_lines then return mark end
+  end
+  return nil
 end
 
 local function box_contains(buf, needle)
   return box_text(buf):find(needle, 1, true) ~= nil
+end
+
+local function box_has_highlight_for_text(buf, text, hl_group)
+  local mark = comment_box_mark(buf)
+  if not mark then return false end
+  for _, virt_line in ipairs(mark[4].virt_lines or {}) do
+    for _, chunk in ipairs(virt_line) do
+      if chunk[1]:find(text, 1, true) and chunk[2] == hl_group then return true end
+    end
+  end
+  return false
+end
+
+local function expected_comment_topline(start_row, anchor_row, line_count, win_height)
+  return math.max(1,
+    math.min(start_row, anchor_row + line_count + comment_box_bottom_padding + 1 - win_height))
 end
 
 ---@param doc table
@@ -225,24 +312,27 @@ end
 
 local function valid_doc()
   return {
-    version = 4,
-    overview = "Update walkthrough fixture files. Before, the fixture rows used the old text. Now, the structured parts drive both the summary graph and Part N.M comment labels.",
+    version = 7,
+    overview = "Update walkthrough fixture files. Before, the fixture rows used the old text. Now, the structured tasks drive both the summary graph and Task N.M comment labels.",
     root = "Update walkthrough fixture files.",
     commit = head_sha,
-    parts = {
+    tasks = {
       {
-        title = "Update a.txt through the first part.",
+        title = "Update a.txt through the first task.",
+        justification = "Reviewers need the fixture story before individual file rewrites.",
         groups = {
           {
+            type = "File",
             title = "Fixture edits",
-            items = {
+            subtasks = {
               {
-                action = "Update",
-                title = "fixture rewrite flow",
-                note = "group the concrete file rewrites under one review story",
-                children = {
+                title = "Rewrite the first fixture file.",
+                justification = "The first fixture row carries the opening example for walkthrough rendering.",
+                items = {
                   {
                     action = "Update",
+                    type = "Struct",
+                    subtype = "Resource",
                     title = "a.txt rewrite",
                     note = "rewrite the second line for the first fixture file",
                     steps = {
@@ -262,21 +352,28 @@ local function valid_doc()
         },
       },
       {
-        title = "Update b.txt through the second part.",
+        title = "Update b.txt through the second task.",
         groups = {
           {
+            type = "File",
             title = "Fixture edits",
-            items = {
+            subtasks = {
               {
-                action = "Update",
-                title = "b.txt rewrite",
-                note = "repeat the rewrite so navigation crosses parts",
-                steps = {
+                title = "Rewrite the second fixture file.",
+                items = {
                   {
-                    file = "b.txt",
-                    start = { line = 2, col = 1 },
-                    ["end"] = { line = 2, col = 9 },
-                    comment = "Same rewrite applied for symmetry.",
+                    action = "Add",
+                    type = "Function",
+                    title = "b.txt rewrite",
+                    note = "repeat the rewrite so navigation crosses tasks",
+                    steps = {
+                      {
+                        file = "b.txt",
+                        start = { line = 2, col = 1 },
+                        ["end"] = { line = 2, col = 9 },
+                        comment = "Same rewrite applied for symmetry.",
+                      },
+                    },
                   },
                 },
               },
@@ -325,15 +422,66 @@ local function run()
   local summary_buf = start_walkthrough(buf)
   assert_true(not buffer_contains(summary_buf, "WARNING"), "fresh walkthrough should not warn")
   assert_true(not buffer_contains(summary_buf, "Major changes:"), "summary should not show redundant major changes heading")
-  assert_true(not buffer_contains(summary_buf, "├── Update a.txt through the first part."), "summary should not show redundant top-level graph")
-  assert_true(buffer_contains(summary_buf, "       └── Modify fixture rewrite flow"), "summary parent action row missing")
-  assert_true(buffer_contains(summary_buf, "           └── Modify a.txt rewrite"), "summary child action row missing display verb")
+  assert_true(not buffer_contains(summary_buf, "├─ Update a.txt through the first task."), "summary should not show redundant top-level graph")
+  assert_true(buffer_has_highlight_for_text(summary_buf, "1. Update a.txt through the first task.",
+    "1. Update a.txt through the first task.", "DiffReviewWalkthroughItemTitle"),
+    "summary task title should be bold white")
+  assert_true(buffer_contains(summary_buf, "Reviewers need the fixture story before individual file rewrites."),
+    "summary task justification missing")
+  assert_true(buffer_contains(summary_buf, "The first fixture row carries the opening example for"),
+    "summary subtask justification missing")
+  assert_true(buffer_contains(summary_buf, "rendering."),
+    "summary subtask justification continuation missing")
+  assert_true(not buffer_contains(summary_buf, "why:"), "summary justification should not render a why label")
+  assert_true(buffer_contains(summary_buf, " 󰈙 file Fixture edits"), "summary group type row missing")
+  assert_true(buffer_contains(summary_buf, "    └─ Rewrite the first fixture file."), "summary subtask row missing")
+  assert_true(buffer_contains(summary_buf, "       └─ Modify 󰙅 Resource a.txt rewrite to rewrite"),
+    "summary item action row missing display verb")
+  assert_true(buffer_contains(summary_buf, "       └─ Add    󰊕 fn b.txt rewrite to repeat"),
+    "summary add action row should be padded")
+  assert_true(buffer_contains(summary_buf, "the second line"),
+    "summary item inline note prefix missing")
+  local item_row = find_row(summary_buf, "a.txt rewrite to rewrite the second line")
+  local item_line = find_line(summary_buf, "a.txt rewrite to rewrite the second line")
+  local item_note_continuation = find_line_after(summary_buf, "first fixture file", item_row)
+  assert_true(first_text_col(item_note_continuation) == display_col_before(item_line, "rewrite the second line"),
+    "summary inline note continuation should align under note")
+  assert_true(buffer_contains(summary_buf, "first fixture file"),
+    "summary item inline note missing")
   assert_true(buffer_has_highlight(summary_buf, "DiffReviewWalkthroughActionUpdate"), "summary action highlight missing")
   assert_true(buffer_has_highlight(summary_buf, "DiffReviewWalkthroughItemTitle"), "summary item title highlight missing")
+  assert_true(buffer_has_highlight_for_text(summary_buf, "Fixture edits", "󰈙 file", "DiffReviewWalkthroughType"),
+    "summary group type highlight missing")
+  assert_true(buffer_has_highlight_for_text(summary_buf, "Fixture edits", "Fixture edits",
+    "DiffReviewWalkthroughItemTitle"), "summary group title highlight missing")
+  assert_true(not buffer_contains(summary_buf, "File Fixture edits"), "summary should not show group type text")
+  assert_true(not buffer_contains(summary_buf, "Struct a.txt rewrite"), "summary should not show item type text")
+  assert_true(not buffer_contains(summary_buf, "struct a.txt rewrite"), "summary should not show fallback type keyword")
+  assert_true(buffer_contains(summary_buf, "Resource a.txt rewrite"), "summary should show item subtype text")
+  assert_true(not buffer_contains(summary_buf, "Function b.txt rewrite"), "summary should not show function type text")
+  assert_true(buffer_has_highlight_for_text(summary_buf, "a.txt rewrite", "󰙅 Resource",
+    "DiffReviewWalkthroughType"), "summary item type highlight missing")
+  assert_true(buffer_has_highlight_for_text(summary_buf, "b.txt rewrite", "󰊕 fn",
+    "DiffReviewWalkthroughType"), "summary function fallback type highlight missing")
+  assert_true(buffer_has_highlight_for_text(summary_buf, "Modify 󰙅 Resource a.txt rewrite", "Modify",
+    "DiffReviewWalkthroughActionUpdate"), "summary action icon highlight missing")
+  assert_true(buffer_has_highlight_for_text(summary_buf, "a.txt rewrite", "a.txt rewrite",
+    "DiffReviewWalkthroughItemTitle"), "summary item title highlight missing")
+  assert_true(not buffer_has_highlight_for_text(summary_buf, "a.txt rewrite to rewrite", "second",
+    "DiffReviewWalkthroughItemTitle"), "summary inline note should not be title-highlighted")
   local action_hl = vim.api.nvim_get_hl(0, { name = "DiffReviewWalkthroughActionUpdate" })
   assert_true(action_hl.italic == true, "summary action highlight should be italic")
+  local type_hl = vim.api.nvim_get_hl(0, { name = "DiffReviewWalkthroughType" })
+  assert_true(type_hl.fg == 0x5bff94, "summary type highlight should use config green")
   local title_hl = vim.api.nvim_get_hl(0, { name = "DiffReviewWalkthroughItemTitle" })
   assert_true(title_hl.bold == true and title_hl.fg == 0xffffff, "summary item title should be bold white")
+  assert_true(buffer_has_highlight_for_text(summary_buf, "Reviewers need the fixture story", "Reviewers",
+    "DiffReviewWalkthroughJustification"), "summary task justification highlight missing")
+  assert_true(buffer_has_highlight_for_text(summary_buf, "The first fixture row", "The first fixture row",
+    "DiffReviewWalkthroughJustification"), "summary subtask justification highlight missing")
+  local justification_hl = vim.api.nvim_get_hl(0, { name = "DiffReviewWalkthroughJustification" })
+  assert_true(justification_hl.fg == 0xe5c07b and justification_hl.italic == true,
+    "summary justification should be yellow italic")
   assert_true(not buffer_contains(summary_buf, "Legend:"), "summary should not show an action legend")
   trigger_buf_mapping(summary_buf, "y")
 
@@ -343,15 +491,33 @@ local function run()
   assert_true(cursor_row == step_row, ("cursor not on step row (expected %d, got %d)"):format(step_row, cursor_row))
   assert_true(walkthrough_extmark_count(buf) > 0, "region extmarks missing")
   assert_true(box_contains(buf, "rewritten to NEW"), "inline comment box missing")
-  assert_true(box_contains(buf, "Part 1.1 - First change"), "inline box heading missing")
-  assert_true(box_contains(buf, "Update a.txt through the first part."), "part context missing")
-  assert_true(box_contains(buf, "Fixture edits / Modify fixture rewrite flow / Modify a.txt rewrite"), "group/item context missing")
+  local box_mark = comment_box_mark(buf)
+  assert_true(box_mark ~= nil, "inline comment box mark missing")
+  assert_true(box_mark[2] == step_row - 1, "inline comment box should anchor below the selected row")
+  assert_true(box_mark[4].virt_lines_above ~= true, "inline comment box should render below the selected row")
+  local win = vim.fn.bufwinid(buf)
+  local view = vim.api.nvim_win_call(win, function() return vim.fn.winsaveview() end)
+  local expected_topline = expected_comment_topline(step_row, box_mark[2] + 1, #box_mark[4].virt_lines,
+    vim.api.nvim_win_get_height(win))
+  assert_true(view.topline == expected_topline,
+    ("walkthrough view not focused near lower comment box (expected topline %d, got %d)"):format(
+      expected_topline, view.topline))
+  assert_true(box_contains(buf, "Task 1.1 - First change"), "inline box heading missing")
+  assert_true(box_has_highlight_for_text(buf, "Task 1.1 - First change", "DiffReviewWalkthroughItemTitle"),
+    "inline box heading should be bold white")
+  assert_true(box_contains(buf, "Update a.txt through the first task."), "task context missing")
+  assert_true(box_contains(buf, "└─ Rewrite the first fixture file."), "subtask graph row missing")
+  assert_true(not box_contains(buf, "Fixture edits / Rewrite the first fixture file."),
+    "inline box should not show group/subtask breadcrumb")
+  assert_true(not box_contains(buf, "Modify Resource a.txt rewrite"), "inline box should not show item context")
+  assert_true(not box_contains(buf, "rewrite the second line for the first fixture file"),
+    "inline box should not show item note")
   assert_true(box_contains(buf, " a.txt "), "file basename missing from the box header")
 
   -- ── navigation: forward to step 2, back, back to summary, quit ────────────
   trigger_buf_mapping(buf, "y")
   wait_for(function() return box_contains(buf, "symmetry") end, "step 2 box did not render")
-  assert_true(box_contains(buf, "Part 2.1 - b.txt rewrite"), "step 2 part label missing")
+  assert_true(box_contains(buf, "Task 2.1 - b.txt rewrite"), "step 2 task label missing")
   assert_true(box_contains(buf, " b.txt "), "step 2 basename missing from the box header")
   local step2_row = find_row(buf, "NEW b.txt")
   cursor_row = vim.api.nvim_win_get_cursor(vim.fn.bufwinid(buf))[1]
@@ -400,36 +566,44 @@ local function run()
 
   -- ── step staleness: nearest line + missing file ───────────────────────────
   local degraded = valid_doc()
-  degraded.parts = {
+  degraded.tasks = {
     {
       title = "Resolve stale walkthrough targets.",
       groups = {
         {
+          type = "File",
           title = "Stale targets",
-          items = {
+          subtasks = {
             {
-              action = "Update",
-              title = "Stale line reference",
-              note = "fall back to the nearest rendered line",
-              steps = {
+              title = "Exercise degraded target resolution.",
+              items = {
                 {
-                  file = "a.txt",
-                  start = { line = 999, col = 1 },
-                  ["end"] = { line = 999, col = 1 },
-                  comment = "Stale line reference.",
+                  action = "Update",
+                  type = "Test",
+                  title = "Stale line reference",
+                  note = "fall back to the nearest rendered line",
+                  steps = {
+                    {
+                      file = "a.txt",
+                      start = { line = 999, col = 1 },
+                      ["end"] = { line = 999, col = 1 },
+                      comment = "Stale line reference.",
+                    },
+                  },
                 },
-              },
-            },
-            {
-              action = "Update",
-              title = "Missing file reference",
-              note = "surface a missing-file note instead of failing",
-              steps = {
                 {
-                  file = "gone.txt",
-                  start = { line = 1, col = 1 },
-                  ["end"] = { line = 1, col = 1 },
-                  comment = "File missing from the diff.",
+                  action = "Update",
+                  type = "Test",
+                  title = "Missing file reference",
+                  note = "surface a missing-file note instead of failing",
+                  steps = {
+                    {
+                      file = "gone.txt",
+                      start = { line = 1, col = 1 },
+                      ["end"] = { line = 1, col = 1 },
+                      comment = "File missing from the diff.",
+                    },
+                  },
                 },
               },
             },
@@ -449,38 +623,61 @@ local function run()
 
   -- ── partially staged file + region split across hunks ─────────────────────
   local staged_doc = valid_doc()
-  staged_doc.parts = {
+  staged_doc.tasks = {
     {
       title = "Resolve staged and split walkthrough regions.",
       groups = {
         {
+          type = "File",
           title = "Fixture diff sections",
-          items = {
+          subtasks = {
             {
-              action = "Update",
-              title = "Staged region",
-              note = "anchor a step that only appears in the staged section",
-              steps = {
+              title = "Resolve nontrivial rendered regions.",
+              items = {
                 {
+                  action = "Update",
+                  type = "Test",
                   title = "Staged region",
-                  file = "c.txt",
-                  start = { line = 2, col = 1 },
-                  ["end"] = { line = 2, col = 5 },
-                  comment = "Lives only in the staged section.",
+                  note = "anchor the staged-only section",
+                  steps = {
+                    {
+                      title = "Staged region",
+                      file = "c.txt",
+                      start = { line = 2, col = 1 },
+                      ["end"] = { line = 2, col = 5 },
+                      comment = "Lives only in the staged section.",
+                    },
+                  },
                 },
-              },
-            },
-            {
-              action = "Update",
-              title = "Split region",
-              note = "anchor at the first rendered row inside a split range",
-              steps = {
                 {
+                  action = "Update",
+                  type = "Test",
                   title = "Split region",
-                  file = "a.txt",
-                  start = { line = 5, col = 1 },
-                  ["end"] = { line = 11, col = 5 },
-                  comment = "Region starts between hunks and ends inside the second hunk.",
+                  note = "anchor the first rendered split row",
+                  steps = {
+                    {
+                      title = "Split region",
+                      file = "a.txt",
+                      start = { line = 5, col = 1 },
+                      ["end"] = { line = 11, col = 5 },
+                      comment = "Region starts between hunks and ends inside the second hunk.",
+                    },
+                  },
+                },
+                {
+                  action = "Update",
+                  type = "Test",
+                  title = "Long region",
+                  note = "keep start visible for long regions",
+                  steps = {
+                    {
+                      title = "Long region",
+                      file = "a.txt",
+                      start = { line = 20, col = 1 },
+                      ["end"] = { line = 55, col = 5 },
+                      comment = "Long selected region keeps its start visible.",
+                    },
+                  },
                 },
               },
             },
@@ -507,6 +704,36 @@ local function run()
     ("split region did not anchor at the first rendered row inside the region (expected %d, got %d)"):format(second_hunk_row, cursor_row)
   )
   assert_true(not box_contains(buf, "approximated"), "split region must not be flagged approximated")
+
+  trigger_buf_mapping(buf, "y")
+  wait_for(function() return box_contains(buf, "Long selected region keeps its start visible") end,
+    "long-region step box did not render")
+  local long_start_row = find_row(buf, "long context 01 a.txt")
+  local long_end_row = find_row(buf, "long context 36 a.txt")
+  local long_box_mark = comment_box_mark(buf)
+  assert_true(long_box_mark ~= nil, "long-region comment box mark missing")
+  local long_anchor_row = long_box_mark[2] + 1
+  assert_true(long_anchor_row > long_start_row,
+    ("long-region box should anchor after the start row (start %d, anchor %d)"):format(
+      long_start_row, long_anchor_row))
+  assert_true(long_anchor_row < long_end_row,
+    ("long-region box should anchor inside the region instead of at the end (anchor %d, end %d)"):format(
+      long_anchor_row, long_end_row))
+  win = vim.fn.bufwinid(buf)
+  view = vim.api.nvim_win_call(win, function() return vim.fn.winsaveview() end)
+  local long_win_height = vim.api.nvim_win_get_height(win)
+  local long_expected_topline = expected_comment_topline(long_start_row, long_anchor_row,
+    #long_box_mark[4].virt_lines, long_win_height)
+  assert_true(view.topline == long_expected_topline,
+    ("long-region view not focused near lower comment box (expected topline %d, got %d)"):format(
+      long_expected_topline, view.topline))
+  assert_true(view.topline <= long_start_row and long_start_row < view.topline + long_win_height,
+    ("long-region start row should stay visible (topline %d, start %d, height %d)"):format(
+      view.topline, long_start_row, long_win_height))
+  local long_box_bottom_row = long_anchor_row - view.topline + 1 + #long_box_mark[4].virt_lines
+  assert_true(long_box_bottom_row == long_win_height - comment_box_bottom_padding,
+    ("long-region comment box should sit above the lower edge (expected screen row %d, got %d)"):format(
+      long_win_height - comment_box_bottom_padding, long_box_bottom_row))
   trigger_buf_mapping(buf, "q")
   close_all_floats()
 
@@ -539,7 +766,87 @@ local function run()
   fixtures[root .. "/.walkthrough.json"] = vim.json.encode({ version = 1, summary = "x", commit = "zz", steps = {} })
   captured_notifications = {}
   trigger_buf_mapping(buf, "ow")
-  wait_for(function() return saw_notification_containing("expected 4") end, "v1 rejection notification absent")
+  wait_for(function() return saw_notification_containing("expected 7") end, "v1 rejection notification absent")
+
+  local invalid_group_type = valid_doc()
+  invalid_group_type.tasks[1].groups[1].type = "Method"
+  set_walkthrough_doc(invalid_group_type)
+  captured_notifications = {}
+  trigger_buf_mapping(buf, "ow")
+  wait_for(function() return saw_notification_containing("group 1: missing or invalid \"type\"") end,
+    "invalid group type notification absent")
+
+  local invalid_item_type = valid_doc()
+  invalid_item_type.tasks[1].groups[1].subtasks[1].items[1].type = "File"
+  set_walkthrough_doc(invalid_item_type)
+  captured_notifications = {}
+  trigger_buf_mapping(buf, "ow")
+  wait_for(function() return saw_notification_containing("item 1: missing or invalid \"type\"") end,
+    "invalid item type notification absent")
+
+  local invalid_item_subtype = valid_doc()
+  invalid_item_subtype.tasks[1].groups[1].subtasks[1].items[1].subtype = ""
+  set_walkthrough_doc(invalid_item_subtype)
+  captured_notifications = {}
+  trigger_buf_mapping(buf, "ow")
+  wait_for(function() return saw_notification_containing("item 1: invalid \"subtype\"") end,
+    "invalid item subtype notification absent")
+
+  local invalid_item_note = valid_doc()
+  invalid_item_note.tasks[1].groups[1].subtasks[1].items[1].note = string.rep("x", 51)
+  set_walkthrough_doc(invalid_item_note)
+  captured_notifications = {}
+  trigger_buf_mapping(buf, "ow")
+  wait_for(function() return saw_notification_containing("\"note\" must be 50 characters or less") end,
+    "invalid item note length notification absent")
+
+  local invalid_item_children = valid_doc()
+  invalid_item_children.tasks[1].groups[1].subtasks[1].items[1].children = {}
+  set_walkthrough_doc(invalid_item_children)
+  captured_notifications = {}
+  trigger_buf_mapping(buf, "ow")
+  wait_for(function() return saw_notification_containing("\"children\" is not supported") end,
+    "invalid item children notification absent")
+
+  local missing_item_steps = valid_doc()
+  missing_item_steps.tasks[1].groups[1].subtasks[1].items[1].steps = nil
+  set_walkthrough_doc(missing_item_steps)
+  captured_notifications = {}
+  trigger_buf_mapping(buf, "ow")
+  wait_for(function() return saw_notification_containing("missing or empty \"steps\"") end,
+    "missing item steps notification absent")
+
+  local invalid_task_justification = valid_doc()
+  invalid_task_justification.tasks[1].justification = ""
+  set_walkthrough_doc(invalid_task_justification)
+  captured_notifications = {}
+  trigger_buf_mapping(buf, "ow")
+  wait_for(function() return saw_notification_containing("task 1: invalid \"justification\"") end,
+    "invalid task justification notification absent")
+
+  local too_long_task_justification = valid_doc()
+  too_long_task_justification.tasks[1].justification = string.rep("x", 81)
+  set_walkthrough_doc(too_long_task_justification)
+  captured_notifications = {}
+  trigger_buf_mapping(buf, "ow")
+  wait_for(function() return saw_notification_containing("\"justification\" must be 80 characters or less") end,
+    "too-long task justification notification absent")
+
+  local invalid_subtask_justification = valid_doc()
+  invalid_subtask_justification.tasks[1].groups[1].subtasks[1].justification = ""
+  set_walkthrough_doc(invalid_subtask_justification)
+  captured_notifications = {}
+  trigger_buf_mapping(buf, "ow")
+  wait_for(function() return saw_notification_containing("subtask 1: invalid \"justification\"") end,
+    "invalid subtask justification notification absent")
+
+  local too_long_subtask_justification = valid_doc()
+  too_long_subtask_justification.tasks[1].groups[1].subtasks[1].justification = string.rep("x", 81)
+  set_walkthrough_doc(too_long_subtask_justification)
+  captured_notifications = {}
+  trigger_buf_mapping(buf, "ow")
+  wait_for(function() return saw_notification_containing("\"justification\" must be 80 characters or less") end,
+    "too-long subtask justification notification absent")
 end
 
 local ok, err = xpcall(run, debug.traceback)

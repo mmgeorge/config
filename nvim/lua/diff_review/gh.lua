@@ -33,6 +33,8 @@
 ---@class DiffReviewGhPRCommit
 ---@field oid string
 ---@field messageHeadline? string
+---@field committedDate? string
+---@field authoredDate? string
 
 ---@class DiffReviewGhPR
 ---@field id? string
@@ -446,6 +448,8 @@ local function normalize_pr(raw, repo)
     commits[#commits + 1] = {
       oid = tostring(commit.oid or ""),
       messageHeadline = commit.messageHeadline,
+      committedDate = commit.committedDate,
+      authoredDate = commit.authoredDate,
     }
   end
 

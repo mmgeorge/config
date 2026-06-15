@@ -62,6 +62,8 @@ local ok, err = xpcall(function()
       title = "Index all open issues",
       state = "OPEN",
       url = "https://github.com/mmgeorge/test-repo/issues/42",
+      body = "Indexed issue body",
+      updated_at = "2026-06-14T20:00:00Z",
       labels = {
         { name = "enhancement" },
       },
@@ -72,6 +74,8 @@ local ok, err = xpcall(function()
       title = "Unrelated bug",
       state = "OPEN",
       url = "https://github.com/mmgeorge/test-repo/issues/77",
+      body = "Unrelated body",
+      updated_at = "2026-06-13T20:00:00Z",
       labels = {
         { name = "bug" },
       },
@@ -81,6 +85,36 @@ local ok, err = xpcall(function()
   local matches = issue_index.search(repo, "enhance", { limit = 10 })
   assert_equals(#matches, 1, "label search should find one issue")
   assert_equals(matches[1].number, 42, "label search returned wrong issue")
+  assert_equals(matches[1].body, "Indexed issue body", "search should return synced issue body")
+
+  local listed = issue_index.list(repo, { limit = 10 })
+  assert_equals(#listed, 2, "issue list should return synced issues")
+  assert_equals(listed[1].number, 42, "issue list should preserve snapshot order")
+  assert_equals(listed[1].body, "Indexed issue body", "issue list should include synced issue body")
+
+  local stale_cwd = vim.fs.joinpath(test_root, "stale-cwd")
+  local stale_repo = "org/repo"
+  repo_cache.remember_cwd_repo(stale_cwd, stale_repo)
+  vim.fn.mkdir(repo_cache.repo_dir(stale_repo), "p")
+  local stale_fetch_count = 0
+  issue_index._set_runner_for_test(function(command, _, callback)
+    local action = command[2]
+    if action == "state" then
+      callback({ code = 0, stdout = vim.json.encode({}), stderr = "", output = "{}" })
+      return
+    end
+    callback({ code = 1, stdout = "", stderr = "unexpected action: " .. tostring(action), output = "unexpected action: " .. tostring(action) })
+  end)
+  issue_index._set_gh_runner_for_test(function(_, _, callback)
+    stale_fetch_count = stale_fetch_count + 1
+    local message = [[{"errors":[{"type":"NOT_FOUND","path":["repository"],"message":"Could not resolve to a Repository with the name 'org/repo'."}]}]]
+    callback({ code = 1, stdout = "", stderr = message, output = message })
+  end)
+  issue_index.ensure_current(stale_cwd, { manual = false })
+  assert_true(vim.wait(1000, function() return repo_cache.repo_for_cwd(stale_cwd) == nil end, 10), "stale repo mapping was not cleared")
+  assert_true(vim.uv.fs_stat(repo_cache.repo_dir(stale_repo)) == nil, "stale repo cache directory was not cleared")
+  issue_index.ensure_repo(stale_cwd, stale_repo, { manual = false })
+  assert_equals(stale_fetch_count, 1, "invalid repo should not retry automatically in the same session")
 
   local buf = vim.api.nvim_create_buf(true, true)
   vim.api.nvim_set_current_buf(buf)

@@ -32,6 +32,17 @@ local function wait_for(predicate, message)
   assert_true(vim.wait(3000, predicate, 10), message)
 end
 
+local function set_datetime_now(value)
+  local epoch = diff_review._datetime.parse(value)
+  assert_true(type(epoch) == "number", "test datetime did not parse: " .. tostring(value))
+  diff_review._datetime.now_override = function() return epoch end
+end
+
+local function recent_commit_date(index)
+  if index <= 14 then return ("2026-06-%02dT12:00:00Z"):format(15 - index) end
+  return ("2026-05-%02dT12:00:00Z"):format(46 - index)
+end
+
 local function status_lines(buf)
   return vim.api.nvim_buf_get_lines(buf, 0, -1, false)
 end
@@ -164,20 +175,20 @@ function backend.systemlist(command)
   if key == "git\t-C\t" .. root .. "\trev-parse\t--short\t@{upstream}" then return { "365f098" }, 0 end
   if key == "git\t-C\t" .. root .. "\tlog\t-1\t--format=%s\t@{upstream}" then return { "refactor: update shader types" }, 0 end
   if key:find("@{push}", 1, true) then return {}, 1 end
-  if key == "git\t-C\t" .. root .. "\tlog\t--no-color\t--format=%H%x09%h%x09%s\torigin/master..HEAD" then
+  if key == "git\t-C\t" .. root .. "\tlog\t--no-color\t--format=%H%x09%h%x09%cI%x09%s\torigin/master..HEAD" then
     return {
-      "45806b8123456789\t45806b8\tfeat: add or mapping and guard ai generation",
-      "748971a123456789\t748971a\tfeat: add debug notifications and AI commit flag",
-      "f7930f2123456789\tf7930f2\tfeat: add ai commit message generation",
-      "c8f1018123456789\tc8f1018\tfeat: preserve cursor position during visual staging",
+      "45806b8123456789\t45806b8\t2026-06-14T12:00:00Z\tfeat: add or mapping and guard ai generation",
+      "748971a123456789\t748971a\t2026-06-13T12:00:00Z\tfeat: add debug notifications and AI commit flag",
+      "f7930f2123456789\tf7930f2\t2026-06-12T12:00:00Z\tfeat: add ai commit message generation",
+      "c8f1018123456789\tc8f1018\t2026-06-11T12:00:00Z\tfeat: preserve cursor position during visual staging",
     }, 0
   end
-  if key == "git\t-C\t" .. root .. "\tlog\t--no-color\t--format=%H%x09%h%x09%s\t-20\torigin/master" then
+  if key == "git\t-C\t" .. root .. "\tlog\t--no-color\t--format=%H%x09%h%x09%cI%x09%s\t-20\torigin/master" then
     local lines = {}
     for index = 1, 21 do
       local oid = ("%040d"):format(index)
       local short_oid = ("recent%02d"):format(index)
-      lines[#lines + 1] = ("%s\t%s\tdocs: recent commit %02d"):format(oid, short_oid, index)
+      lines[#lines + 1] = ("%s\t%s\t%s\tdocs: recent commit %02d"):format(oid, short_oid, recent_commit_date(index), index)
     end
     return lines, 0
   end
@@ -216,6 +227,7 @@ local function run()
   diff_review.set_git_backend(backend)
   gh.set_backend(gh_backend)
   diff_review.setup({ about_auto_generate = false })
+  set_datetime_now("2026-06-15T12:00:00Z")
   diff_review.open()
   local buf = vim.api.nvim_get_current_buf()
 
@@ -223,15 +235,15 @@ local function run()
   assert_true(find_row(buf, "Unmerged into origin/master (4)") > find_row(buf, "Staged changes"), "unmerged section should render after local change sections")
   wait_for(function() return buffer_contains(buf, "Recent Commits (20)") end, "recent commits section did not render")
   assert_true(find_row(buf, "Recent Commits (20)") > find_row(buf, "Unmerged into origin/master (4)"), "recent commits should render below unmerged commits")
-  assert_true(saw_call_containing("\tlog\t--no-color\t--format=%H%x09%h%x09%s\t-20\torigin/master"), "recent commits did not use a 20-commit upstream git log")
-  assert_true(not buffer_contains(buf, "recent01 master docs: recent commit 01"), "recent commits should start folded")
-  assert_true(buffer_contains(buf, "45806b8 master feat: add or mapping and guard ai generation"), "first unmerged commit did not include branch")
-  assert_true(buffer_contains(buf, "748971a feat: add debug notifications and AI commit flag"), "second unmerged commit missing")
+  assert_true(saw_call_containing("\tlog\t--no-color\t--format=%H%x09%h%x09%cI%x09%s\t-20\torigin/master"), "recent commits did not use a 20-commit upstream git log")
+  assert_true(not buffer_contains(buf, "recent01 1 day ago | master docs: recent commit 01"), "recent commits should start folded")
+  assert_true(buffer_contains(buf, "45806b8 1 day ago | master feat: add or mapping and guard ai generation"), "first unmerged commit did not include branch")
+  assert_true(buffer_contains(buf, "748971a 2 days ago | feat: add debug notifications and AI commit flag"), "second unmerged commit missing")
   assert_true(not buffer_contains(buf, "foo/bar.js +1 -1"), "commit files loaded before commit was expanded")
   assert_true(count_calls_containing("\tshow\t--format=\t--no-color\t--no-ext-diff\t45806b8123456789") == 0, "commit diff loaded eagerly")
 
   local unmerged_heading = find_row(buf, "Unmerged into origin/master (4)")
-  trigger_normal_mapping("<Tab>", find_row_after(buf, "45806b8 master", unmerged_heading))
+  trigger_normal_mapping("<Tab>", find_row_after(buf, "45806b8 1 day ago | master", unmerged_heading))
   wait_for(function() return buffer_contains(buf, "foo/bar.js +1 -1") end, "expanded commit did not render changed file\n" .. table.concat(status_lines(buf), "\n"))
   assert_true(buffer_contains(buf, "baz.txt +1 -1"), "expanded commit missing second changed file")
   assert_true(buffer_contains(buf, "src/commit.rs +1 -1"), "expanded commit missing Rust changed file")
@@ -253,16 +265,16 @@ local function run()
 
   local show_calls_before_recent = count_calls_containing("\tshow\t--format=\t--no-color\t--no-ext-diff")
   trigger_normal_mapping("<Tab>", find_row(buf, "Recent Commits (20)"))
-  wait_for(function() return buffer_contains(buf, "recent01 master docs: recent commit 01") end, "recent commits did not unfold")
-  assert_true(buffer_contains(buf, "recent20 docs: recent commit 20"), "recent commits did not include the 20th commit")
-  assert_true(not buffer_contains(buf, "recent21 docs: recent commit 21"), "recent commits rendered more than 20 commits")
+  wait_for(function() return buffer_contains(buf, "recent01 1 day ago | master docs: recent commit 01") end, "recent commits did not unfold")
+  assert_true(buffer_contains(buf, "recent20 20 days ago | docs: recent commit 20"), "recent commits did not include the 20th commit")
+  assert_true(not buffer_contains(buf, "recent21 21 days ago | docs: recent commit 21"), "recent commits rendered more than 20 commits")
   assert_true(
-    find_row_after(buf, "recent01 master docs: recent commit 01", find_row(buf, "Recent Commits (20)"))
+    find_row_after(buf, "recent01 1 day ago | master docs: recent commit 01", find_row(buf, "Recent Commits (20)"))
       > find_row(buf, "Recent Commits (20)"),
     "recent commits did not render under the recent section"
   )
   assert_true(
-    not buffer_contains_after(buf, "45806b8 master feat: add or mapping and guard ai generation", find_row(buf, "Recent Commits (20)")),
+    not buffer_contains_after(buf, "45806b8 1 day ago | master feat: add or mapping and guard ai generation", find_row(buf, "Recent Commits (20)")),
     "recent commits included an unmerged commit"
   )
   assert_true(
@@ -274,6 +286,7 @@ end
 local ok, err = xpcall(run, debug.traceback)
 diff_review.reset_git_backend()
 gh.reset_backend()
+diff_review._datetime.now_override = nil
 if not ok then
   vim.api.nvim_err_writeln(err)
   vim.cmd("cquit")

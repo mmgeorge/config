@@ -486,6 +486,12 @@ local function wait_for(condition, message)
   assert_true(vim.wait(3000, condition, 10), message)
 end
 
+local function set_datetime_now(value)
+  local epoch = diff_review._datetime.parse(value)
+  assert_true(type(epoch) == "number", "test datetime did not parse: " .. tostring(value))
+  diff_review._datetime.now_override = function() return epoch end
+end
+
 local function buffer_contains(buf, needle)
   for _, line in ipairs(vim.api.nvim_buf_get_lines(buf, 0, -1, false)) do
     if line:find(needle, 1, true) then return true end
@@ -674,10 +680,12 @@ local pr = {
     {
       oid = "1111111aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       messageHeadline = "feat: base commit",
+      committedDate = "2026-06-13T03:20:00Z",
     },
     {
       oid = "abc1234def5678abc1234def5678abc1234def56",
       messageHeadline = "chore: head commit",
+      committedDate = "2026-06-14T03:20:00Z",
     },
   },
   files = { { path = "src/a.txt", additions = 1, deletions = 1 } },
@@ -696,6 +704,20 @@ local function run()
   repo_cache.set_data_dir_for_test(repo_cache_dir)
   issue_index._reset_for_test()
   issue_index._set_progress_enabled_for_test(false)
+  set_datetime_now("2026-06-15T12:00:00Z")
+  assert_true(diff_review._datetime.relative("2026-06-15T11:55:00Z") == "5 minutes ago", "minute date label failed")
+  assert_true(diff_review._datetime.relative("2026-06-15T10:00:00Z") == "2 hours ago", "hour date label failed")
+  assert_true(diff_review._datetime.relative("2026-06-14T12:00:00Z") == "Yesterday", "yesterday date label failed")
+  assert_true(diff_review._datetime.relative("2026-06-14T12:00:00Z", { yesterday = false }) == "1 day ago", "one-day date label failed")
+  assert_true(diff_review._datetime.relative("2026-06-12T12:00:00Z") == "3 days ago", "day date label failed")
+  assert_true(diff_review._datetime.relative("2026-06-07T12:00:00Z") == "Last week", "last week date label failed")
+  assert_true(diff_review._datetime.relative("2026-05-01T12:00:00Z") == "Last month", "last month date label failed")
+  assert_true(diff_review._datetime.relative("2026-04-01T12:00:00Z") == "April 1, 2026", "absolute date label failed")
+  assert_true(
+    diff_review._datetime.action_phrase("mmgeorge", "commented", "2026-06-15T11:55:00Z") == "mmgeorge commented 5 minutes ago",
+    "action phrase date label failed"
+  )
+  set_datetime_now("2026-06-15T03:20:00Z")
   issue_index._set_runner_for_test(function(command, _, callback)
     local key = table.concat(command, " ")
     if key:find(" state ", 1, true) then
@@ -752,7 +774,7 @@ local function run()
   )
   wait_for(function() return buffer_contains(buf, "Reviews (3):") end, "submitted reviews section did not render")
   assert_true(
-    not buffer_contains(buf, "COMMENTED by me | 2026-06-14 17:18"),
+    not buffer_contains(buf, "me commented 10 hours ago | Single inline review shell"),
     "single inline-comment review shell should not render in Reviews"
   )
   assert_true(buffer_contains(buf, "Changes (1):"), "PR changes heading did not use section heading format")
@@ -770,28 +792,33 @@ local function run()
   assert_true(checks_status_row < description_row, "PR checks heading did not render before Description")
   assert_true(lint_check_row < description_row, "PR check row did not render before Description")
   assert_true(
-    lint_check_line:find("✓ SUCCESS Dummy Lint | PR Dummy Checks", 1, true) ~= nil,
-    "PR check row did not render state before title: " .. lint_check_line
+    lint_check_line:find("✓ Dummy Lint | PR Dummy Checks", 1, true) ~= nil,
+    "PR check row did not render without state text: " .. lint_check_line
   )
+  assert_true(not lint_check_line:find("SUCCESS", 1, true), "PR check row should not render state text: " .. lint_check_line)
   assert_true(buffer_contains(buf, "Dummy Unit Tests"), "non-green PR check did not render")
   local unit_check_row = find_row(buf, "Dummy Unit Tests")
   local unit_check_line = vim.api.nvim_buf_get_lines(buf, unit_check_row - 1, unit_check_row, false)[1] or ""
   assert_true(
-    unit_check_line:find("✗ FAILURE Dummy Unit Tests | PR Dummy Checks", 1, true) ~= nil,
-    "failing PR check row did not render state before title: " .. unit_check_line
+    unit_check_line:find("✗ Dummy Unit Tests | PR Dummy Checks", 1, true) ~= nil,
+    "failing PR check row did not render without state text: " .. unit_check_line
   )
+  assert_true(not unit_check_line:find("FAILURE", 1, true), "failing PR check row should not render state text: " .. unit_check_line)
   assert_true(
     line_has_highlight(buf, checks_status_row, "DiffReviewStatusHeader", 0, #"Status:"),
     "PR checks heading did not use header highlight"
   )
   wait_for(function()
-    return buffer_contains(buf, "REJECTED by foo | 2026-06-14 17:15 | This requires a few changes...")
+    return buffer_contains(buf, "foo requested changes 10 hours ago | This requires a few changes...")
   end, "rejected review summary did not render")
-  assert_true(buffer_contains(buf, "APPROVED by mgeorge | 2026-06-14 17:16 | LGTM!"), "approved review summary did not render")
-  assert_true(buffer_contains(buf, "COMMENTED by mgeorge | 2026-06-14 17:19 | Needs a follow-up"), "commented review summary did not render")
-  local rejected_summary_row = find_row(buf, "REJECTED by foo")
-  local approved_summary_row = find_row(buf, "APPROVED by mgeorge")
-  local commented_summary_row = find_row(buf, "COMMENTED by mgeorge")
+  assert_true(buffer_contains(buf, "mgeorge approved 10 hours ago | LGTM!"), "approved review summary did not render")
+  assert_true(buffer_contains(buf, "mgeorge commented 10 hours ago | Needs a follow-up"), "commented review summary did not render")
+  assert_true(not buffer_contains(buf, "REJECTED by"), "review summary should not render rejected state text")
+  assert_true(not buffer_contains(buf, "APPROVED by"), "review summary should not render approved state text")
+  assert_true(not buffer_contains(buf, "COMMENTED by"), "review summary should not render commented state text")
+  local rejected_summary_row = find_row(buf, "foo requested changes 10 hours ago")
+  local approved_summary_row = find_row(buf, "mgeorge approved 10 hours ago")
+  local commented_summary_row = find_row(buf, "mgeorge commented 10 hours ago")
   for _, review_summary_row in ipairs({ rejected_summary_row, approved_summary_row, commented_summary_row }) do
     local review_summary_line = vim.api.nvim_buf_get_lines(buf, review_summary_row - 1, review_summary_row, false)[1] or ""
     assert_true(not review_summary_line:match("^%S+%s+|"), "review summary kept a pipe after the icon: " .. review_summary_line)
@@ -805,13 +832,13 @@ local function run()
   local recent_commits_row = find_row(buf, "Recent Commits (2):")
   assert_true(recent_commits_row > changes_file_row, "PR recent commits section did not render at the end")
   assert_true(
-    not pcall(find_row_after, buf, "abc1234 feature chore: head commit", recent_commits_row),
+    not pcall(find_row_after, buf, "abc1234 1 day ago | feature chore: head commit", recent_commits_row),
     "PR recent commits should start folded"
   )
   move_cursor(buf, recent_commits_row)
   trigger_buf_mapping(buf, "<Tab>")
-  local head_commit_row = find_row_after(buf, "abc1234 feature chore: head commit", recent_commits_row)
-  local base_commit_row = find_row_after(buf, "1111111 feat: base commit", head_commit_row)
+  local head_commit_row = find_row_after(buf, "abc1234 1 day ago | feature chore: head commit", recent_commits_row)
+  local base_commit_row = find_row_after(buf, "1111111 2 days ago | feat: base commit", head_commit_row)
   assert_true(head_commit_row > recent_commits_row, "PR head commit did not render under Recent Commits")
   assert_true(base_commit_row > head_commit_row, "PR commits did not render newest first")
   move_cursor(buf, changes_file_row)
@@ -833,7 +860,7 @@ local function run()
   move_cursor(buf, inline_comment_row)
   trigger_buf_mapping(buf, "<Tab>")
   local expected_folded_preview = diff_review._review.comment_icon
-    .. " me | 2026-06-14 17:14 | This is inline comment without review"
+    .. " me commented 10 hours ago | This is inline comment without review"
   wait_for(function()
     local ok, folded_row = pcall(find_row_after, buf, "This is inline comment without review", changes_file_row)
     if not ok then return false end
@@ -847,7 +874,7 @@ local function run()
   wait_for(function() return buffer_contains(buf, "Oh good point! fixed") end, "PR inline code comment did not unfold")
   inline_comment_row = find_row_after(buf, "This is inline comment without review", changes_file_row)
   inline_reply_row = find_row_after(buf, "Oh good point! fixed", inline_comment_row)
-  local rejected_review_row = find_row(buf, "REJECTED by foo")
+  local rejected_review_row = find_row(buf, "foo requested changes 10 hours ago")
   local regular_comment_row = find_row(buf, "This is a regular comment")
   local long_regular_comment_row = find_row(buf, "Lorem Ipsum is the ubiquitous placeholder")
   move_cursor(buf, long_regular_comment_row)
@@ -877,7 +904,7 @@ local function run()
   move_cursor(buf, regular_comment_row)
   trigger_buf_mapping(buf, "C")
   wait_for(function() return buffer_contains(buf, "Comments (3):") end, "regular PR comment draft did not update the comments count")
-  local regular_draft_header_row = find_row_after(buf, "you |", regular_comment_row)
+  local regular_draft_header_row = find_row_after(buf, "you commented", regular_comment_row)
   assert_true(
     not line_has_highlight(buf, regular_draft_header_row, "DiffReviewReviewCommentHeader"),
     "new regular PR comment used the blue review-comment header highlight"
@@ -911,7 +938,7 @@ local function run()
   changed_code_row = find_row(buf, "NEW LINE")
   move_cursor(buf, changed_code_row)
   trigger_buf_mapping(buf, "C")
-  local standalone_header_row = find_row_after(buf, "you |", changed_code_row)
+  local standalone_header_row = find_row_after(buf, "you commented", changed_code_row)
   local standalone_body_row = standalone_header_row + 1
   assert_issue_completion(buf, standalone_body_row, "Standalone #t")
   assert_contributor_completion(buf, standalone_body_row, "Standalone @")
@@ -934,7 +961,7 @@ local function run()
     "fresh standalone inline code comment"
   )
 
-  rejected_review_row = find_row(buf, "REJECTED by foo")
+  rejected_review_row = find_row(buf, "foo requested changes 10 hours ago")
   move_cursor(buf, rejected_review_row)
   trigger_buf_mapping(buf, "<Tab>")
   wait_for(function()
@@ -963,12 +990,12 @@ local function run()
   local expanded_reply_row = find_row_after(buf, "Oh good point! fixed", expanded_parent_row)
   assert_true(expanded_reply_row > expanded_parent_row, "expanded review reply did not render under the parent comment")
   assert_true(expanded_reply_row < changes_heading_row, "expanded review reply rendered in the wrong section")
-  assert_true(buffer_contains(buf, "foo | 2026-06-14 17:00"), "expanded review reply header did not render author and timestamp")
+  assert_true(buffer_contains(buf, "foo replied 10 hours ago"), "expanded review reply header did not render author and timestamp")
 
   move_cursor(buf, expanded_file_row)
   trigger_buf_mapping(buf, "<Tab>")
   wait_for(function()
-    local current_review_row = find_row(buf, "REJECTED by foo")
+    local current_review_row = find_row(buf, "foo requested changes 10 hours ago")
     local current_changes_row = find_row_after(buf, "Changes", current_review_row)
     local review_block = table.concat(vim.api.nvim_buf_get_lines(buf, current_review_row - 1, current_changes_row - 1, false), "\n")
     return review_block:find("src/a.txt +1 -1", 1, true)
@@ -977,7 +1004,7 @@ local function run()
       and not review_block:find("Oh good point! fixed", 1, true)
   end, "expanded review file did not fold its diff context")
 
-  rejected_review_row = find_row(buf, "REJECTED by foo")
+  rejected_review_row = find_row(buf, "foo requested changes 10 hours ago")
   expanded_file_row = find_row_after(buf, "src/a.txt +1 -1", rejected_review_row)
   move_cursor(buf, expanded_file_row)
   trigger_buf_mapping(buf, "<Tab>")
@@ -996,7 +1023,7 @@ local function run()
   move_cursor(buf, expanded_code_row)
   trigger_buf_mapping(buf, "C")
   wait_for(function() return buffer_contains(buf, "Comments (4):") end, "review-context C did not create a regular PR comment")
-  local context_regular_header_row = find_row_after(buf, "you |", find_row(buf, "Regular from PR overview"))
+  local context_regular_header_row = find_row_after(buf, "you commented", find_row(buf, "Regular from PR overview"))
   local context_regular_body_row = context_regular_header_row + 1
   edit_line(buf, context_regular_body_row, "Regular from review context")
   trigger_buf_mapping(buf, "<C-s>")
@@ -1285,6 +1312,7 @@ gh.reset_backend()
 github_gh.reset_backend()
 issue_index._reset_for_test()
 repo_cache.set_data_dir_for_test(nil)
+diff_review._datetime.now_override = nil
 vim.fn.delete(repo_cache_dir, "rf")
 if not ok then
   vim.api.nvim_err_writeln(err)

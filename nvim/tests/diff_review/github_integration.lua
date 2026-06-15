@@ -569,6 +569,13 @@ local function run()
   assert_true(buffer_contains(pr_buf, "Description:"), "PRView missing description heading")
   assert_true(buffer_contains(pr_buf, "- status row"), "PRView missing markdown body")
   wait_for(function() return buffer_contains(pr_buf, "Dummy Typecheck") end, "PRView missing check status row")
+  local typecheck_row = find_row(pr_buf, "Dummy Typecheck")
+  local typecheck_line = vim.api.nvim_buf_get_lines(pr_buf, typecheck_row - 1, typecheck_row, false)[1] or ""
+  assert_true(
+    typecheck_line:find("✓ Dummy Typecheck | PR Dummy Checks", 1, true) ~= nil,
+    "PRView check status row should render icon, name, and description only: " .. typecheck_line
+  )
+  assert_true(not typecheck_line:find("SUCCESS", 1, true), "PRView check status row should not render state text: " .. typecheck_line)
   assert_true(buffer_contains(pr_buf, "Head:"), "PRView missing head row")
   assert_true(buffer_contains(pr_buf, "Changes (2):"), "PRView missing changes heading")
   assert_true(buffer_contains(pr_buf, "lua/diff_review/gh.lua +100 -0"), "PRView missing file change row")

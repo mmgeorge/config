@@ -190,6 +190,12 @@ local function wait_for(condition, message)
   assert_true(vim.wait(3000, condition, 10), message)
 end
 
+local function set_datetime_now(value)
+  local epoch = diff_review._datetime.parse(value)
+  assert_true(type(epoch) == "number", "test datetime did not parse: " .. tostring(value))
+  diff_review._datetime.now_override = function() return epoch end
+end
+
 local function lines(buf)
   return vim.api.nvim_buf_get_lines(buf, 0, -1, false)
 end
@@ -354,6 +360,7 @@ local function run()
   gh.set_backend(gh_backend)
   diff_review.setup({ about_auto_generate = false })
   diff_review._review.set_data_dir_for_test(review_data_dir)
+  set_datetime_now("2026-06-13T10:20:12Z")
 
   local buf = diff_review.open_review(pr, { cwd = "D:/diffreview-review-root" })
   assert_true(buf ~= nil, "open_review did not return a buffer")
@@ -544,23 +551,23 @@ local function run()
 
   -- ── C on a changed line drafts locally; <C-s> syncs to GitHub ──────────────
   local first_comment = create_inline_comment_with_key(buf, find_row(buf, "NEW src/a.txt"), "C on a changed line")
-  assert_true(not buffer_contains(buf, "*you | "), "empty inline comment should not show a dirty marker")
+  assert_true(not buffer_contains(buf, "*you commented"), "empty inline comment should not show a dirty marker")
   set_inline_comment_body(buf, first_comment, "This rename needs a test")
   wait_for(function() return buffer_contains(buf, "This rename needs a test") end, "inline comment not rendered as real lines")
   assert_true(#pending_review_creates == 0, "drafting a comment created a pending review before manual sync")
   assert_true(#comment_creates == 0, "drafting a comment synced before manual sync")
   assert_true(#review_calls == 0, "drafting a comment must not submit the review")
   assert_true(buffer_contains(buf, " L2"), "inline comment header missing")
-  assert_true(buffer_contains(buf, diff_review._review.comment_icon .. " *you | "), "inline comment header missing comment icon")
-  assert_true(buffer_contains(buf, "*you | "), "dirty comment header missing * marker")
-  assert_true(buffer_contains(buf, " | "), "inline comment author/date header missing")
+  assert_true(buffer_contains(buf, diff_review._review.comment_icon .. " *you commented"), "inline comment header missing comment icon")
+  assert_true(buffer_contains(buf, "*you commented"), "dirty comment header missing * marker")
+  assert_true(buffer_contains(buf, "commented"), "inline comment author/action header missing")
   -- the comment lines are real and below the anchor line
   assert_true(
     find_row(buf, "This rename needs a test") > find_row(buf, "NEW src/a.txt"),
     "comment must render below its anchor line"
   )
   trigger(buf, "<C-s>")
-  wait_for(function() return not buffer_contains(buf, "*you | ") end, "manual sync did not clear dirty marker immediately")
+  wait_for(function() return not buffer_contains(buf, "*you commented") end, "manual sync did not clear dirty marker immediately")
   wait_for(function() return #pending_review_creates == 1 end, "manual sync did not create a pending review")
   wait_for(function() return #comment_creates == 1 end, "manual sync did not create the pending review comment")
   assert_true(comment_creates[1].command[3] == "graphql", "pending review comment create did not use GraphQL")
@@ -672,13 +679,13 @@ local function run()
     return diff_review._review.state(buf).review_comments[1].body == "Edited comment body"
   end, "inline comment edit did not update local state")
   assert_true(#comment_updates == 0, "inline comment edit synced before manual sync")
-  assert_true(buffer_contains(buf, "*me | "), "inline comment edit did not mark the header dirty")
+  assert_true(buffer_contains(buf, "*me commented"), "inline comment edit did not mark the header dirty")
   assert_true(
-    row_has_line_highlight(buf, find_row(buf, "*me | "), "DiffReviewReviewCommentHeader"),
+    row_has_line_highlight(buf, find_row(buf, "*me commented"), "DiffReviewReviewCommentHeader"),
     "dirty inline comment header lost its review-header highlight"
   )
   trigger(buf, "<C-s>")
-  wait_for(function() return not buffer_contains(buf, "*me | ") end, "manual sync did not clear dirty marker after inline edit")
+  wait_for(function() return not buffer_contains(buf, "*me commented") end, "manual sync did not clear dirty marker after inline edit")
   wait_for(function() return #comment_updates >= 1 end, "manual sync did not update the edited comment")
   assert_true(vim.api.nvim_get_current_buf() == buf, "inline comment edit switched buffers")
   assert_true(buffer_contains(buf, "Edited comment body"), "inline comment edit changed state but not visible text")
@@ -691,7 +698,7 @@ local function run()
   local folded_row = vim.api.nvim_win_get_cursor(0)[1]
   local folded_line = lines(buf)[folded_row] or ""
   assert_true(
-    folded_line:find(diff_review._review.comment_icon .. " me |", 1, true) == 1,
+    folded_line:find(diff_review._review.comment_icon .. " me commented", 1, true) == 1,
     "folded comment did not start with icon/user/date: " .. folded_line
   )
   assert_true(
@@ -770,10 +777,10 @@ local function run()
   local direct_start_col = diff_review._review.comment_body_text_bounds_at_row(buf, direct_edit_row, direct_cursor_line)
   assert_true(vim.api.nvim_win_get_cursor(0)[2] == direct_start_col + 7, "inline edit did not preserve the edited position")
   assert_true(#comment_updates == 1, "shortcut comment edit synced before manual sync")
-  assert_true(buffer_contains(buf, "*me | "), "shortcut comment edit did not mark the header dirty")
+  assert_true(buffer_contains(buf, "*me commented"), "shortcut comment edit did not mark the header dirty")
   trigger(buf, "<C-s>")
   wait_for(function() return #comment_updates >= 2 end, "manual sync did not sync shortcut comment edit")
-  wait_for(function() return not buffer_contains(buf, "*me | ") end, "shortcut comment sync did not clear dirty marker")
+  wait_for(function() return not buffer_contains(buf, "*me commented") end, "shortcut comment sync did not clear dirty marker")
 
   local normal_change_mapping = vim.api.nvim_buf_call(buf, function()
     return vim.fn.maparg("C", "n", false, true)
@@ -796,10 +803,10 @@ local function run()
   local second_start_col = diff_review._review.comment_body_text_bounds_at_row(buf, second_edit_row, second_cursor_line)
   assert_true(vim.api.nvim_win_get_cursor(0)[2] == second_start_col + 6, "second inline edit did not preserve the edited position")
   assert_true(#comment_updates == 2, "visual change comment edit synced before manual sync")
-  assert_true(buffer_contains(buf, "*me | "), "visual change comment edit did not mark the header dirty")
+  assert_true(buffer_contains(buf, "*me commented"), "visual change comment edit did not mark the header dirty")
   trigger(buf, "<C-s>")
   wait_for(function() return #comment_updates >= 3 end, "manual sync did not sync visual change comment edit")
-  wait_for(function() return not buffer_contains(buf, "*me | ") end, "visual change comment sync did not clear dirty marker")
+  wait_for(function() return not buffer_contains(buf, "*me commented") end, "visual change comment sync did not clear dirty marker")
 
   assert_true(
     diff_review._review.comment_body_text_from_line("  Alpha ") == "  Alpha ",
@@ -1079,7 +1086,7 @@ local function run()
     "manual sync did not send raw rows while preserving blank paragraphs: "
       .. vim.inspect(paragraph_payload.variables.input.body)
   )
-  wait_for(function() return not buffer_contains(buf, "*me | ") end, "normalized sync did not clear dirty marker")
+  wait_for(function() return not buffer_contains(buf, "*me commented") end, "normalized sync did not clear dirty marker")
   state.review_comments[1].body = original_body
   diff_review._review.render(buf)
 
@@ -1208,7 +1215,7 @@ local function run()
   wait_for(function() return buffer_contains(remote_buf, "Remote web note") end, "remote pending comment was not imported")
   vim.wait(40, function() return false end, 10)
   assert_true(vim.api.nvim_get_current_buf() == remote_buf, "remote pending import opened an edit popup")
-  assert_true(buffer_contains(remote_buf, "me | 2026-06-13 10:11"), "remote pending comment header missed author/date")
+  assert_true(buffer_contains(remote_buf, "me commented 9 minutes ago"), "remote pending comment header missed author/date")
   assert_true(buffer_contains(remote_buf, " L2"), "remote pending comment header missed line number")
   assert_true(diff_review._review.state(remote_buf).pr.repo == "owner/repo", "remote PR repo was not resolved from its URL")
   local first_pending_read, first_diff
@@ -1231,10 +1238,10 @@ local function run()
   set_inline_comment_body(remote_buf, remote_new_comment, "Comment on imported review")
   wait_for(function() return buffer_contains(remote_buf, "Comment on imported review") end, "comment on imported review not rendered")
   assert_true(#comment_creates == comment_creates_before_remote_add, "comment on imported review synced before manual sync")
-  assert_true(buffer_contains(remote_buf, "*you | "), "comment on imported review did not show dirty marker")
+  assert_true(buffer_contains(remote_buf, "*you commented"), "comment on imported review did not show dirty marker")
   trigger(remote_buf, "<C-s>")
   wait_for(function() return #comment_creates == comment_creates_before_remote_add + 1 end, "manual sync did not sync comment on imported review")
-  wait_for(function() return not buffer_contains(remote_buf, "*you | ") end, "manual sync did not clear imported review dirty marker")
+  wait_for(function() return not buffer_contains(remote_buf, "*you commented") end, "manual sync did not clear imported review dirty marker")
   assert_true(#pending_review_creates == creates_before_remote_add, "imported pending review was not reused")
   remote_pending_review = nil
   remote_pending_comments = {}
@@ -1328,6 +1335,7 @@ vim.notify = original_notify
 diff_review._review.input_provider = nil
 diff_review._review.verdict_provider = nil
 diff_review._review.set_data_dir_for_test(nil)
+diff_review._datetime.now_override = nil
 diff_review.reset_git_backend()
 gh.reset_backend()
 vim.fn.delete(review_data_dir, "rf")

@@ -5,6 +5,7 @@ local progress_by_repo = {}
 local in_flight = {}
 local snapshot_cache = {}
 local notified = {}
+local invalid_repos = {}
 local runner_for_test = nil
 local gh_runner_for_test = nil
 local progress_enabled = true
@@ -243,32 +244,70 @@ local function score_issue(issue, terms, raw_query)
   return score
 end
 
-function M.search(repo, query, opts)
-  repo = normalize_repo(repo)
-  if not repo then return {} end
+---@param repo string
+---@param issue table
+---@return table
+local function issue_result(repo, issue)
+  return {
+    kind = "issue",
+    repo = repo,
+    number = tonumber(issue.number) or issue.number,
+    title = tostring(issue.title or ""),
+    state = tostring(issue.state or ""),
+    url = tostring(issue.url or ""),
+    author = tostring(issue.author or ""),
+    comments_count = tonumber(issue.comments_count or issue.commentsCount or issue.comments) or 0,
+    created_at = tostring(issue.created_at or issue.createdAt or ""),
+    updated_at = tostring(issue.updated_at or issue.updatedAt or ""),
+    is_draft = false,
+    body = tostring(issue.body or ""),
+    labels = issue.labels or {},
+  }
+end
+
+---@param repo string
+---@return table[]
+local function snapshot_issues(repo)
   local snapshot = read_snapshot(repo)
   local issues = snapshot and snapshot.issues or {}
   if type(issues) ~= "table" then return {} end
+  return issues
+end
+
+---@param repo string
+---@param opts? { limit?: integer }
+---@return table[]
+function M.list(repo, opts)
+  repo = normalize_repo(repo)
+  if not repo then return {} end
+
+  local items = {}
+  local limit = opts and opts.limit or 100
+  for _, issue in ipairs(snapshot_issues(repo)) do
+    if type(issue) == "table" then
+      items[#items + 1] = issue_result(repo, issue)
+      if #items >= limit then break end
+    end
+  end
+  return items
+end
+
+function M.search(repo, query, opts)
+  repo = normalize_repo(repo)
+  if not repo then return {} end
   local raw_query = vim.trim(tostring(query or "")):lower()
   if raw_query == "" then return {} end
   local terms = token_terms(raw_query)
   if #terms == 0 then return {} end
 
   local scored = {}
-  for _, issue in ipairs(issues) do
+  for _, issue in ipairs(snapshot_issues(repo)) do
     if type(issue) == "table" then
       local score = score_issue(issue, terms, raw_query)
       if score then
         scored[#scored + 1] = {
           score = score,
-          issue = {
-            repo = repo,
-            number = issue.number,
-            title = issue.title,
-            state = issue.state,
-            url = issue.url,
-            labels = issue.labels or {},
-          },
+          issue = issue_result(repo, issue),
         }
       end
     end
@@ -439,6 +478,15 @@ local function is_rate_limit_message(message)
   return message:find("rate limit", 1, true) ~= nil or message:find("api rate limit exceeded", 1, true) ~= nil
 end
 
+local function is_repo_not_found_message(message)
+  local text = tostring(message or "")
+  return text:find("Could not resolve to a Repository", 1, true) ~= nil
+    or (
+      text:find('"type":"NOT_FOUND"', 1, true) ~= nil
+      and text:find('"path":["repository"]', 1, true) ~= nil
+    )
+end
+
 local function write_snapshot(cwd, repo, callback)
   run_sidecar_json({
     "snapshot",
@@ -500,9 +548,22 @@ local function sync_finished(repo, progress, message)
   in_flight[repo] = nil
 end
 
-local function sync_failed(repo, progress, message)
+---@param context table
+---@param message string
+local function sync_failed(context, message)
+  local repo = context.repo
+  local progress = context.progress
   update_progress(progress, { phase = "sync failed", message = message })
-  notify("GitHub issue sync failed for " .. repo .. ":\n" .. tostring(message), vim.log.levels.ERROR)
+  if is_repo_not_found_message(message) then
+    invalid_repos[repo] = os.time()
+    local repo_cache = require("github.repo_cache")
+    local cleared_cwd = repo_cache.clear_cwd_repo(context.cwd, repo)
+    repo_cache.delete_repo(repo)
+    local suffix = cleared_cwd and "\nCleared stale cached repo mapping for this cwd." or ""
+    notify_once("repo-not-found:" .. repo, "GitHub issue sync failed for " .. repo .. ":\n" .. tostring(message) .. suffix, vim.log.levels.ERROR)
+  else
+    notify("GitHub issue sync failed for " .. repo .. ":\n" .. tostring(message), vim.log.levels.ERROR)
+  end
   close_progress(repo, "sync failed", vim.log.levels.ERROR)
   in_flight[repo] = nil
 end
@@ -521,7 +582,7 @@ local function sync_pages(context)
         end, 60000)
         return
       end
-      sync_failed(repo, context.progress, result.message or "GitHub issue fetch failed")
+      sync_failed(context, result.message or "GitHub issue fetch failed")
       return
     end
 
@@ -559,12 +620,12 @@ local function sync_pages(context)
     }
     upsert_page(context.cwd, repo, context.scope, payload, function(upsert_result)
       if not upsert_result.ok then
-        sync_failed(repo, context.progress, upsert_result.message or "issue index upsert failed")
+        sync_failed(context, upsert_result.message or "issue index upsert failed")
         return
       end
       write_snapshot(context.cwd, repo, function(snapshot_result)
         if not snapshot_result.ok then
-          sync_failed(repo, context.progress, snapshot_result.message or "issue snapshot write failed")
+          sync_failed(context, snapshot_result.message or "issue snapshot write failed")
           return
         end
         if has_next_page then
@@ -594,6 +655,8 @@ function M.sync_repo(cwd, repo, opts)
   repo = normalize_repo(repo)
   if not repo then return end
   opts = opts or {}
+  if invalid_repos[repo] and opts.manual ~= true then return end
+  if opts.manual == true then invalid_repos[repo] = nil end
   local scope = opts.scope == "all" and "all" or "open"
   if in_flight[repo] then
     if opts.manual then notify("GitHub issue sync is already running for " .. repo, vim.log.levels.INFO) end
@@ -631,7 +694,8 @@ end
 function M.ensure_repo(cwd, repo, opts)
   repo = normalize_repo(repo)
   if not repo then return end
-  require("github.repo_cache").remember_cwd_repo(cwd, repo)
+  opts = opts or {}
+  if opts.remember_cwd == true then require("github.repo_cache").remember_cwd_repo(cwd, repo) end
   M.sync_repo(cwd or vim.fn.getcwd(), repo, opts or {})
 end
 
@@ -681,6 +745,7 @@ function M._reset_for_test()
   in_flight = {}
   snapshot_cache = {}
   notified = {}
+  invalid_repos = {}
   runner_for_test = nil
   gh_runner_for_test = nil
   progress_enabled = true

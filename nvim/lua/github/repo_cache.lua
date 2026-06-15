@@ -65,6 +65,13 @@ local function delete_dir(path)
   return true
 end
 
+---@param path string
+---@return boolean
+local function delete_file(path)
+  if vim.uv.fs_stat(path) == nil then return false end
+  return vim.fn.delete(path) == 0
+end
+
 ---@param path string?
 function M.set_data_dir_for_test(path)
   data_dir_for_test = path
@@ -114,6 +121,17 @@ function M.remember_cwd_repo(cwd, repo)
     repo = normalized,
     updated_at = os.time(),
   })
+end
+
+---@param cwd string?
+---@param repo? string
+---@return boolean
+function M.clear_cwd_repo(cwd, repo)
+  local mapped_repo = M.repo_for_cwd(cwd)
+  if not mapped_repo then return false end
+  local normalized = normalize_repo(repo)
+  if normalized and mapped_repo ~= normalized then return false end
+  return delete_file(M.cwd_repo_path(cwd))
 end
 
 ---@param cwd string?
@@ -219,7 +237,7 @@ end
 ---@param cwd string?
 ---@param repo string?
 ---@param fetch fun(done: fun(result: { ok: boolean, contributors?: table[], message?: string }))
----@param opts? { ttl_seconds?: integer }
+---@param opts? { ttl_seconds?: integer, remember_cwd?: boolean }
 function M.ensure_metadata(cwd, repo, fetch, opts)
   local normalized = normalize_repo(repo)
   if not normalized then return end
@@ -230,7 +248,7 @@ function M.ensure_metadata(cwd, repo, fetch, opts)
     in_flight[normalized] = nil
     if result and result.ok then
       M.write_metadata(normalized, result.contributors or {})
-      if cwd then M.remember_cwd_repo(cwd, normalized) end
+      if cwd and not (opts and opts.remember_cwd == false) then M.remember_cwd_repo(cwd, normalized) end
     end
   end)
 end
@@ -241,10 +259,11 @@ end
 ---@param opts? { ttl_seconds?: integer }
 function M.ensure_metadata_for_cwd(cwd, fetch_repo, fetch_contributors, opts)
   local cached_repo = M.repo_for_cwd(cwd)
+  local metadata_opts = vim.tbl_extend("force", opts or {}, { remember_cwd = true })
   if cached_repo then
     M.ensure_metadata(cwd, cached_repo, function(done)
       fetch_contributors(cached_repo, done)
-    end, opts)
+    end, metadata_opts)
     return
   end
   fetch_repo(function(result)
@@ -253,7 +272,7 @@ function M.ensure_metadata_for_cwd(cwd, fetch_repo, fetch_contributors, opts)
     M.remember_cwd_repo(cwd, repo)
     M.ensure_metadata(cwd, repo, function(done)
       fetch_contributors(repo, done)
-    end, opts)
+    end, metadata_opts)
   end)
 end
 

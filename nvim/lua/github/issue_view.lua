@@ -26,7 +26,7 @@ local function load_repo_metadata(cwd, repo)
   if not (repo and repo ~= "") then return end
   require("github.repo_cache").ensure_metadata(cwd, repo, function(done)
     gh.repo_contributors_async(cwd, repo, done)
-  end)
+  end, { remember_cwd = false })
   local ok, issue_index = pcall(require, "github.issue_index")
   if ok then issue_index.ensure_repo(cwd, repo, { manual = false }) end
 end
@@ -40,6 +40,7 @@ end
 ---@param value string
 ---@return string[]
 local function split_markdown(value)
+  value = tostring(value or "")
   if value == "" then return { "_No description._" } end
   return vim.split(value, "\n", { plain = true })
 end
@@ -51,9 +52,28 @@ local function add_meta(lines, label, value)
   if value and value ~= "" then lines[#lines + 1] = label .. ": " .. value end
 end
 
+---@param values any
+---@param key string
+---@return string[]
+local function names(values, key)
+  local result = {}
+  for _, value in ipairs(type(values) == "table" and values or {}) do
+    if type(value) == "table" then
+      local name = value[key] or value.name or value.login
+      if type(name) == "string" and name ~= "" then result[#result + 1] = name end
+    elseif type(value) == "string" and value ~= "" then
+      result[#result + 1] = value
+    end
+  end
+  return result
+end
+
 ---@param item GithubGhDetail
 ---@return string[]
 local function render_item(item)
+  local labels = names(item.labels, "name")
+  local assignees = names(item.assignees, "login")
+  local comments = type(item.comments) == "table" and item.comments or {}
   local lines = {
     "Hint: b browse | r refresh | q close",
     "",
@@ -66,16 +86,16 @@ local function render_item(item)
     add_meta(lines, "Base", item.base_ref_name or "")
   end
   add_meta(lines, "URL", item.url)
-  if #item.labels > 0 then add_meta(lines, "Labels", table.concat(item.labels, ", ")) end
-  if #item.assignees > 0 then add_meta(lines, "Assignees", table.concat(item.assignees, ", ")) end
+  if #labels > 0 then add_meta(lines, "Labels", table.concat(labels, ", ")) end
+  if #assignees > 0 then add_meta(lines, "Assignees", table.concat(assignees, ", ")) end
   lines[#lines + 1] = ""
   lines[#lines + 1] = "#" .. tostring(item.number) .. " " .. item.title
   lines[#lines + 1] = ""
   vim.list_extend(lines, split_markdown(item.body))
   lines[#lines + 1] = ""
-  lines[#lines + 1] = "Comments (" .. tostring(#item.comments) .. ")"
+  lines[#lines + 1] = "Comments (" .. tostring(#comments) .. ")"
 
-  for _, comment in ipairs(item.comments) do
+  for _, comment in ipairs(comments) do
     lines[#lines + 1] = ""
     lines[#lines + 1] = "--- " .. comment.author .. " commented at " .. comment.created_at
     vim.list_extend(lines, split_markdown(comment.body))
@@ -152,6 +172,7 @@ end
 ---@field number integer|string
 ---@field repo? string
 ---@field cwd? string
+---@field item? GithubGhItem|GithubGhDetail
 
 ---@param opts GithubIssueViewOpenOpts
 function M.open(opts)
@@ -159,7 +180,7 @@ function M.open(opts)
   state.kind = opts.kind or "issue"
   state.number = tonumber(opts.number) or 0
   state.repo = opts.repo
-  state.item = nil
+  state.item = opts.item
 
   local buf = ensure_buffer()
   if state.repo and state.repo ~= "" then
@@ -169,6 +190,7 @@ function M.open(opts)
   local name = "github://" .. state.kind .. "/" .. (state.repo or "current") .. "/" .. tostring(state.number)
   pcall(vim.api.nvim_buf_set_name, buf, name)
   vim.api.nvim_set_current_buf(buf)
+  if state.item then set_lines(render_item(state.item)) end
   M.refresh()
 end
 

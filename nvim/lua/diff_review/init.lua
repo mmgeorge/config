@@ -69,6 +69,8 @@
 ---@field short_oid string
 ---@field branch? string
 ---@field subject string
+---@field committed_at? string
+---@field authored_at? string
 ---@field upstream? string
 ---@field files? DiffReviewStatusFile[]
 ---@field files_loaded? boolean
@@ -184,6 +186,7 @@ M._pending_review_icon = "◷"
 M._codeowner_review_icon = "⚠"
 M._milestone_icon = "◆"
 M._pr_overview = {}
+M._datetime = {}
 
 M._hunk_header_ns = vim.api.nvim_create_namespace("diff_review_headers")
 M._active_hunk_header_ns = vim.api.nvim_create_namespace("diff_review_active_hunk")
@@ -3790,13 +3793,133 @@ function M._status_section_count(section)
 end
 
 ---@param value any
+---@return integer? epoch_seconds
+---@return table? date_parts
+function M._datetime.parse(value)
+  local text = vim.trim(tostring(value or ""))
+  if text == "" then return nil, nil end
+
+  local year, month, day, hour, minute, second, zone = text:match("^(%d%d%d%d)%-(%d%d)%-(%d%d)T(%d%d):(%d%d):?(%d*)%.?%d*([Zz]?)")
+  if not year then
+    year, month, day, hour, minute, second = text:match("^(%d%d%d%d)%-(%d%d)%-(%d%d) (%d%d):(%d%d):?(%d*)")
+  end
+  if not year then return nil, nil end
+
+  local parts = {
+    year = tonumber(year),
+    month = tonumber(month),
+    day = tonumber(day),
+    hour = tonumber(hour) or 0,
+    min = tonumber(minute) or 0,
+    sec = tonumber(second ~= "" and second or "0") or 0,
+  }
+  if not (parts.year and parts.month and parts.day) then return nil, nil end
+
+  local epoch = os.time(parts)
+  if zone and zone:lower() == "z" then
+    local now = os.time()
+    local utc_now_parts = os.date("!*t", now)
+    if type(utc_now_parts) == "table" then
+      utc_now_parts.isdst = false
+      local local_epoch_for_utc_now = os.time(utc_now_parts)
+      if local_epoch_for_utc_now then epoch = epoch + os.difftime(now, local_epoch_for_utc_now) end
+    end
+  end
+  return epoch, parts
+end
+
+---@return integer
+function M._datetime.now()
+  if type(M._datetime.now_override) == "function" then
+    local ok, value = pcall(M._datetime.now_override)
+    if ok and type(value) == "number" then return value end
+  end
+  return os.time()
+end
+
+---@param count integer
+---@param unit string
+---@return string
+function M._datetime.ago(count, unit)
+  count = math.max(1, count)
+  local suffix = count == 1 and unit or (unit .. "s")
+  return ("%d %s ago"):format(count, suffix)
+end
+
+---@param epoch integer
+---@return string
+function M._datetime.absolute_date(epoch)
+  local parts = os.date("*t", epoch)
+  if type(parts) ~= "table" then return "" end
+  local months = {
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+  }
+  return ("%s %d, %d"):format(months[parts.month] or "", parts.day or 1, parts.year or 1970)
+end
+
+---@param epoch integer
+---@param now integer
+---@return integer
+function M._datetime.calendar_day_delta(epoch, now)
+  local then_parts = os.date("*t", epoch)
+  local now_parts = os.date("*t", now)
+  if type(then_parts) ~= "table" or type(now_parts) ~= "table" then return 0 end
+  local then_midnight = os.time({ year = then_parts.year, month = then_parts.month, day = then_parts.day, hour = 0, min = 0, sec = 0 })
+  local now_midnight = os.time({ year = now_parts.year, month = now_parts.month, day = now_parts.day, hour = 0, min = 0, sec = 0 })
+  if not (then_midnight and now_midnight) then return 0 end
+  return math.floor((os.difftime(now_midnight, then_midnight) / 86400) + 0.5)
+end
+
+---@param value any
+---@param opts? { yesterday?: boolean }
+---@return string
+function M._datetime.relative(value, opts)
+  opts = opts or {}
+  local text = vim.trim(tostring(value or ""))
+  if text == "" then return "" end
+  local epoch = M._datetime.parse(text)
+  if not epoch then return text end
+
+  local now = M._datetime.now()
+  local seconds = math.floor(os.difftime(now, epoch))
+  if seconds < 60 then return "just now" end
+  if seconds < 3600 then return M._datetime.ago(math.floor(seconds / 60), "minute") end
+  if seconds < 86400 then return M._datetime.ago(math.floor(seconds / 3600), "hour") end
+
+  local days = M._datetime.calendar_day_delta(epoch, now)
+  if days == 1 and opts.yesterday ~= false then return "Yesterday" end
+  if days >= 1 and days < 7 then return M._datetime.ago(days, "day") end
+  if days >= 7 and days < 14 then return "Last week" end
+  if days >= 14 and days < 30 then return M._datetime.ago(days, "day") end
+  if days >= 30 and days < 60 then return "Last month" end
+  return M._datetime.absolute_date(epoch)
+end
+
+---@param user string
+---@param action string
+---@param value any
+---@return string
+function M._datetime.action_phrase(user, action, value)
+  local relative = M._datetime.relative(value)
+  if relative == "" then return ("%s %s"):format(user, action) end
+  return ("%s %s %s"):format(user, action, relative)
+end
+
+---@param value any
 ---@return string
 function M._pr_overview.comment_datetime(value)
-  local text = tostring(value or "")
-  local year, month, day, hour, minute = text:match("^(%d%d%d%d)%-(%d%d)%-(%d%d)T(%d%d):(%d%d)")
-  if year then return ("%s-%s-%s %s:%s"):format(year, month, day, hour, minute) end
-  if text ~= "" then return text end
-  return ""
+  return M._datetime.relative(value)
 end
 
 ---@param body string
@@ -3820,9 +3943,10 @@ end
 ---@param expanded? boolean
 ---@return string
 function M._pr_overview.issue_comment_line(comment, expanded)
-  local datetime = M._pr_overview.comment_datetime(comment.updated_at or comment.created_at)
-  local prefix = ("%s %s"):format(M._comment_icon, M._pr_overview.comment_author(comment))
-  if datetime ~= "" then prefix = prefix .. " | " .. datetime end
+  local prefix = ("%s %s"):format(
+    M._comment_icon,
+    M._datetime.action_phrase(M._pr_overview.comment_author(comment), "commented", comment.updated_at or comment.created_at)
+  )
   if not expanded then
     local preview = M._pr_overview.comment_preview(comment.body or "")
     if M._review and M._review.truncate_preview_text and M._review.comment_rule_width then
@@ -3967,21 +4091,6 @@ function M._pr_overview.status_text(pr)
 end
 
 ---@param check DiffReviewGhPRCheck
----@return string
-function M._pr_overview.check_state_text(check)
-  local state = vim.trim(tostring(check and check.state or ""))
-  if state == "" then state = "UNKNOWN" end
-  return state:gsub("_", " "):upper()
-end
-
----@param check DiffReviewGhPRCheck
----@return boolean
-function M._pr_overview.check_is_green(check)
-  local state = tostring(check and check.state or ""):lower()
-  return state == "success"
-end
-
----@param check DiffReviewGhPRCheck
 ---@return string icon
 ---@return string hl_group
 function M._pr_overview.check_icon(check)
@@ -4033,13 +4142,9 @@ function M._pr_overview.check_head_lines(pr, status)
   end
   for check_index, check in ipairs(checks) do
     local icon, icon_hl = M._pr_overview.check_icon(check)
-    local state_text = M._pr_overview.check_state_text(check)
     local workflow_suffix = M._pr_overview.check_workflow_suffix(check)
-    local state_hl = M._pr_overview.check_is_green(check) and "DiffReviewAddRange" or icon_hl
     local segments = {
       { "  " .. icon .. " ", icon_hl },
-      { state_text, state_hl },
-      { " ", "Comment" },
       { tostring(check.name or "Check"), "DiffReviewStatusPath" },
     }
     if workflow_suffix ~= "" then
@@ -4111,7 +4216,7 @@ function M.github_load_repo_metadata(cwd, repo)
   if repo and repo ~= "" then
     cache.ensure_metadata(cwd, repo, function(done)
       gh.repo_contributors_async(cwd, repo, done)
-    end)
+    end, { remember_cwd = false })
     if issue_index_ok then issue_index.ensure_repo(cwd, repo, { manual = false }) end
     return
   end
@@ -4895,33 +5000,30 @@ function M._pr_overview.review_key(review)
 end
 
 ---@param state string?
----@return string
-function M._pr_overview.review_state_label(state)
-  state = tostring(state or "")
-  if state == "CHANGES_REQUESTED" then return "REJECTED" end
-  if state == "COMMENTED" then return "COMMENTED" end
-  if state == "DISMISSED" then return "DISMISSED" end
-  if state == "APPROVED" then return "APPROVED" end
-  if state == "" then return "REVIEW" end
-  return state
-end
-
----@param state string?
 ---@return string icon
 ---@return string status_hl
 function M._pr_overview.review_state_style(state)
-  local label = M._pr_overview.review_state_label(state)
-  if label == "APPROVED" then return "✓", "DiffReviewAddRange" end
-  if label == "REJECTED" then return "✗", "DiffReviewDeleteRange" end
+  state = tostring(state or "")
+  if state == "APPROVED" then return "✓", "DiffReviewAddRange" end
+  if state == "CHANGES_REQUESTED" then return "✗", "DiffReviewDeleteRange" end
   return M._comment_icon, "DiffReviewReviewComment"
+end
+
+---@param state string?
+---@return string
+function M._pr_overview.review_action(state)
+  state = tostring(state or "")
+  if state == "APPROVED" then return "approved" end
+  if state == "CHANGES_REQUESTED" then return "requested changes" end
+  if state == "DISMISSED" then return "dismissed" end
+  if state == "COMMENTED" then return "commented" end
+  return "reviewed"
 end
 
 ---@param review DiffReviewGhSubmittedReview
 ---@return string[] tail_parts
 function M._pr_overview.review_summary_tail_parts(review)
   local tail_parts = {}
-  local datetime = M._pr_overview.comment_datetime(review.submitted_at or review.updated_at or review.created_at)
-  if datetime ~= "" then tail_parts[#tail_parts + 1] = datetime end
   local preview = M._pr_overview.comment_preview(review.body or "")
   if preview ~= "" then tail_parts[#tail_parts + 1] = preview end
   return tail_parts
@@ -4931,7 +5033,16 @@ end
 ---@return string
 function M._pr_overview.review_summary_line(review)
   local icon = M._pr_overview.review_state_style(review.state)
-  local parts = { ("%s %s by %s"):format(icon, M._pr_overview.review_state_label(review.state), tostring(review.user or "unknown")) }
+  local parts = {
+    ("%s %s"):format(
+      icon,
+      M._datetime.action_phrase(
+        tostring(review.user or "unknown"),
+        M._pr_overview.review_action(review.state),
+        review.submitted_at or review.updated_at or review.created_at
+      )
+    ),
+  }
   vim.list_extend(parts, M._pr_overview.review_summary_tail_parts(review))
   return table.concat(parts, " | ")
 end
@@ -4939,12 +5050,17 @@ end
 ---@param review DiffReviewGhSubmittedReview
 ---@return table[]
 function M._pr_overview.review_summary_segments(review)
-  local label = M._pr_overview.review_state_label(review.state)
   local icon, status_hl = M._pr_overview.review_state_style(review.state)
   local segments = {
     { icon .. " ", status_hl },
-    { label, status_hl },
-    { " by " .. tostring(review.user or "unknown"), "DiffReviewReviewComment" },
+    {
+      M._datetime.action_phrase(
+        tostring(review.user or "unknown"),
+        M._pr_overview.review_action(review.state),
+        review.submitted_at or review.updated_at or review.created_at
+      ),
+      "DiffReviewReviewComment",
+    },
   }
   for _, tail in ipairs(M._pr_overview.review_summary_tail_parts(review)) do
     segments[#segments + 1] = { " | ", "DiffReviewReviewComment" }
@@ -5275,6 +5391,8 @@ function M._pr_overview.status_commit_from_pr_commit(raw_commit, branch)
     short_oid = short_oid,
     branch = branch,
     subject = tostring(raw_commit.messageHeadline or raw_commit.subject or raw_commit.message or ""),
+    committed_at = raw_commit.committedDate or raw_commit.committed_date or raw_commit.committed_at,
+    authored_at = raw_commit.authoredDate or raw_commit.authored_date or raw_commit.authored_at,
     files = cache and cache.files or nil,
     files_loaded = cache and cache.files_loaded or false,
     files_loading = cache and cache.files_loading or false,
@@ -5361,7 +5479,11 @@ local function status_commits_from_log_output(spec, output)
   local commits = {} ---@type DiffReviewStatusCommit[]
   for index, line in ipairs(output or {}) do
     if spec.limit and index > spec.limit then break end
-    local oid, short_oid, subject = line:match("^([^\t]+)\t([^\t]+)\t(.*)$")
+    local oid, short_oid, committed_at, subject = line:match("^([^\t]+)\t([^\t]+)\t([^\t]*)\t(.*)$")
+    if not oid then
+      oid, short_oid, subject = line:match("^([^\t]+)\t([^\t]+)\t(.*)$")
+      committed_at = nil
+    end
     if oid and oid ~= "" then
       local cache = M._status and M._status.commit_file_cache and M._status.commit_file_cache[oid] or nil
       commits[#commits + 1] = {
@@ -5369,6 +5491,7 @@ local function status_commits_from_log_output(spec, output)
         short_oid = short_oid or oid:sub(1, 7),
         branch = index == 1 and spec.branch or nil,
         subject = subject or "",
+        committed_at = committed_at ~= "" and committed_at or nil,
         upstream = spec.upstream,
         files = cache and cache.files or nil,
         files_loaded = cache and cache.files_loaded or false,
@@ -5389,7 +5512,7 @@ local function status_commit_log_section_async(cwd, spec, cb)
     return
   end
 
-  local command = { "git", "-C", cwd, "log", "--no-color", "--format=%H%x09%h%x09%s" }
+  local command = { "git", "-C", cwd, "log", "--no-color", "--format=%H%x09%h%x09%cI%x09%s" }
   vim.list_extend(command, spec.args)
   systemlist_async(command, function(output, code)
     if code ~= 0 then
@@ -6049,24 +6172,37 @@ function M._pr_overview.render_issue_comments(comments)
 end
 
 ---@param commit DiffReviewStatusCommit
+---@return string?
+local function status_commit_relative_date(commit)
+  local value = commit.committed_at or commit.authored_at
+  local relative = M._datetime.relative(value, { yesterday = false })
+  if relative == "" then return nil end
+  return relative
+end
+
+---@param commit DiffReviewStatusCommit
 local function status_render_commit(commit)
   local commit_key = status_commit_key(commit.oid)
   local commit_folded = status_folded(commit_key, true)
-  local line_parts = {
-    commit.short_oid,
-  }
+  local line = commit.short_oid
+  local date_text = status_commit_relative_date(commit)
+  if date_text then line = line .. " " .. date_text .. " |" end
+  local suffix_parts = {}
   if commit.branch and commit.branch ~= "" then
-    line_parts[#line_parts + 1] = commit.branch
+    suffix_parts[#suffix_parts + 1] = commit.branch
   end
-  line_parts[#line_parts + 1] = commit.subject
-  local line = table.concat(line_parts, " ")
+  suffix_parts[#suffix_parts + 1] = commit.subject
+  local suffix = table.concat(suffix_parts, " ")
+  local suffix_start_col = nil
+  if suffix ~= "" then
+    suffix_start_col = #line + 1
+    line = line .. " " .. suffix
+  end
   local entry = { id = commit_key, kind = "commit", commit = commit }
   local line_number = status_add_line(line, entry)
-  local col = 0
-  status_add_highlight(line_number, col, col + #commit.short_oid, "DiffReviewStatusObjectId")
-  col = col + #commit.short_oid + 1
-  if commit.branch and commit.branch ~= "" then
-    status_add_highlight(line_number, col, col + #commit.branch, "DiffReviewStatusBranch")
+  status_add_highlight(line_number, 0, #commit.short_oid, "DiffReviewStatusObjectId")
+  if suffix_start_col and commit.branch and commit.branch ~= "" then
+    status_add_highlight(line_number, suffix_start_col, suffix_start_col + #commit.branch, "DiffReviewStatusBranch")
   end
 
   if commit_folded then return end
@@ -7993,11 +8129,9 @@ end
 ---@param value any
 ---@return string
 function M._review.format_comment_datetime(value)
-  local text = tostring(value or "")
-  local year, month, day, hour, minute = text:match("^(%d%d%d%d)%-(%d%d)%-(%d%d)T(%d%d):(%d%d)")
-  if year then return ("%s-%s-%s %s:%s"):format(year, month, day, hour, minute) end
-  if text ~= "" then return text end
-  return os.date("%Y-%m-%d %H:%M")
+  local relative = M._datetime.relative(value)
+  if relative ~= "" then return relative end
+  return "just now"
 end
 
 ---@param text string
@@ -8024,9 +8158,11 @@ end
 ---@return string right_text
 function M._review.comment_header_text(comment)
   local user = tostring(comment.user or "you")
-  local datetime = M._review.format_comment_datetime(comment.updated_at or comment.created_at)
   local marker = M._review.comment_has_dirty_marker(comment) and "*" or ""
-  local left_text = ("%s %s%s | %s "):format(M._review.comment_icon, marker, user, datetime)
+  local left_text = ("%s %s "):format(
+    M._review.comment_icon,
+    M._datetime.action_phrase(marker .. user, "commented", comment.updated_at or comment.created_at)
+  )
   local right_text = ""
   if not comment.pr_issue_comment then
     local line_number = tonumber(comment.line)
@@ -8040,8 +8176,10 @@ end
 ---@return string right_text
 function M._review.reply_header_text(reply)
   local user = tostring(reply.user or "unknown")
-  local datetime = M._review.format_comment_datetime(reply.updated_at or reply.created_at)
-  return ("%s %s | %s "):format(M._review.reply_icon, user, datetime), ""
+  return ("%s %s "):format(
+    M._review.reply_icon,
+    M._datetime.action_phrase(user, "replied", reply.updated_at or reply.created_at)
+  ), ""
 end
 
 ---@param win integer?
@@ -8147,9 +8285,11 @@ end
 ---@return string
 function M._review.comment_folded_line(comment, win, buf)
   local user = tostring(comment.user or "you")
-  local datetime = M._review.format_comment_datetime(comment.updated_at or comment.created_at)
   local marker = M._review.comment_has_dirty_marker(comment) and "*" or ""
-  local left_text = ("%s %s%s | %s | "):format(M._review.comment_icon, marker, user, datetime)
+  local left_text = ("%s %s | "):format(
+    M._review.comment_icon,
+    M._datetime.action_phrase(marker .. user, "commented", comment.updated_at or comment.created_at)
+  )
   local width = M._review.comment_rule_width(win, buf)
   local preview_width = math.max(0, width - vim.fn.strdisplaywidth(left_text))
   local preview = M._review.truncate_preview_text(M._review.comment_preview_text(comment.body or ""), preview_width)

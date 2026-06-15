@@ -1,9 +1,12 @@
 vim.loader.enable(false)
 
 local gh = require("github.gh")
+local issue_index = require("github.issue_index")
 local notifications = require("github.notifications")
+local repo_cache = require("github.repo_cache")
 
 local root = "D:/mock/github"
+local cache_root = vim.fs.joinpath(vim.fn.getcwd(), ".tmp-github-integration-test")
 local calls = {}
 local opened_urls = {}
 local captured_picker = nil
@@ -31,6 +34,36 @@ local function reset()
   opened_urls = {}
   captured_picker = nil
   notifications._reset_for_tests()
+  repo_cache.remember_cwd_repo(vim.fn.getcwd(), "org/repo")
+end
+
+local function write_issue_snapshot()
+  local path = issue_index.snapshot_path("org/repo")
+  vim.fn.mkdir(vim.fs.dirname(path), "p")
+  local result = vim.fn.writefile({ vim.json.encode({
+    repo = "org/repo",
+    state = "open",
+    issue_count = 1,
+    issues = {
+      {
+        repo = "org/repo",
+        number = 12,
+        title = "Fix command parser",
+        state = "OPEN",
+        url = "https://github.com/org/repo/issues/12",
+        body = "Indexed body\n\nIndexed details.",
+        updated_at = "2026-06-02T00:00:00Z",
+        labels = { { name = "bug" } },
+        comments_count = 1,
+      },
+    },
+  }) }, path)
+  assert_true(result == 0, "issue snapshot write failed")
+end
+
+local function preview_contains(preview, needle)
+  local lines = preview and preview.lines or {}
+  return table.concat(lines, "\n"):find(needle, 1, true) ~= nil
 end
 
 local function wait_for(predicate, message)
@@ -218,6 +251,25 @@ function backend.system_async(command, _, callback, cwd)
 end
 
 gh.set_backend(backend)
+vim.fn.delete(cache_root, "rf")
+repo_cache.set_data_dir_for_test(cache_root)
+issue_index._reset_for_test()
+issue_index._set_progress_enabled_for_test(false)
+issue_index._set_runner_for_test(function(command, _, callback)
+  local action = command[2]
+  if action == "state" then
+    local stdout = vim.json.encode({
+      repo = "org/repo",
+      open_historical_complete = true,
+      last_open_checked_at = os.time(),
+    })
+    callback({ code = 0, stdout = stdout, stderr = "", output = stdout })
+    return
+  end
+  callback({ code = 0, stdout = "{}", stderr = "", output = "{}" })
+end)
+repo_cache.remember_cwd_repo(vim.fn.getcwd(), "org/repo")
+write_issue_snapshot()
 vim.notify = function() end
 if not _G.Snacks then _G.Snacks = {} end
 if not Snacks.picker then Snacks.picker = {} end
@@ -239,14 +291,33 @@ local function cleanup()
   end
   vim.notify = original_notify
   gh.reset_backend()
+  issue_index._reset_for_test()
+  repo_cache.set_data_dir_for_test(nil)
+  vim.fn.delete(cache_root, "rf")
 end
 
 local function run_tests()
   reset()
   vim.cmd.GithubIssuse()
   wait_for(function() return captured_picker ~= nil end, "issue picker did not open")
-  assert_true(calls[1].key:find("gh\tsearch\tissues", 1, true) ~= nil, "issues command was not used")
+  assert_true(#calls == 0, "issue picker should use the synced index instead of gh search: " .. vim.inspect(calls))
   assert_true(#captured_picker.items == 1, "issue picker missing items")
+  assert_true(captured_picker.items[1].item.repo == "org/repo", "issue picker item was not repo scoped")
+  assert_true(captured_picker.items[1].item.body == "Indexed body\n\nIndexed details.", "issue picker did not load synced body")
+  assert_true(type(captured_picker.preview) == "function", "issue picker did not install an issue preview")
+  local preview = {}
+  function preview:set_title(title)
+    self.title = title
+  end
+  function preview:set_lines(lines)
+    self.lines = lines
+  end
+  function preview:highlight() end
+  function preview:notify(message)
+    self.lines = { tostring(message) }
+  end
+  captured_picker.preview({ item = captured_picker.items[1], preview = preview })
+  wait_for(function() return preview_contains(preview, "Issue body") end, "issue preview did not fetch the issue body")
   captured_picker.confirm({ close = function() end }, captured_picker.items[1])
   wait_for(function() return find_line("#12 Fix command parser") ~= nil end, "issue view did not render selected issue")
   assert_true(find_line("Comments (1)") ~= nil, "issue comments did not render")

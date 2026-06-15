@@ -1,13 +1,33 @@
 local gh = require("github.gh")
+local issue_index = require("github.issue_index")
+local repo_cache = require("github.repo_cache")
 
 local M = {}
+
+local issue_preview_cache = {}
+local issue_preview_request_id = 0
+
+---@param value string?
+---@return string[]
+local function markdown_lines(value)
+  value = tostring(value or "")
+  if value == "" then return { "_No description._" } end
+  return vim.split(value, "\n", { plain = true })
+end
 
 ---@param item GithubGhItem
 ---@return string
 local function item_label(item)
   local prefix = item.kind == "pr" and "PR" or "Issue"
   local draft = item.is_draft and " draft" or ""
-  return ("%s %s#%d%s %s (%d)"):format(prefix, item.repo, item.number, draft, item.title, item.comments_count)
+  return ("%s %s#%d%s %s (%d)"):format(
+    prefix,
+    item.repo,
+    item.number,
+    draft,
+    item.title,
+    tonumber(item.comments_count) or 0
+  )
 end
 
 ---@param item GithubGhItem
@@ -24,12 +44,84 @@ local function open_item(item)
     repo = item.repo,
     number = item.number,
     cwd = vim.fn.getcwd(),
+    item = item,
   })
+end
+
+---@param item GithubGhItem
+---@param body string?
+---@return string[]
+local function issue_preview_lines(item, body)
+  local lines = {
+    "#" .. tostring(item.number) .. " " .. tostring(item.title or ""),
+    "",
+    "Repo: " .. tostring(item.repo or ""),
+    "State: " .. tostring(item.state or ""),
+  }
+  if item.updated_at and item.updated_at ~= "" then lines[#lines + 1] = "Updated: " .. item.updated_at end
+  if type(item.labels) == "table" and #item.labels > 0 then
+    local labels = {}
+    for _, label in ipairs(item.labels) do
+      if type(label) == "table" and type(label.name) == "string" then
+        labels[#labels + 1] = label.name
+      elseif type(label) == "string" then
+        labels[#labels + 1] = label
+      end
+    end
+    if #labels > 0 then lines[#lines + 1] = "Labels: " .. table.concat(labels, ", ") end
+  end
+  lines[#lines + 1] = ""
+  vim.list_extend(lines, markdown_lines(body))
+  return lines
+end
+
+---@param ctx table
+---@param title string
+---@param lines string[]
+local function set_preview_lines(ctx, title, lines)
+  if not (ctx and ctx.preview) then return end
+  pcall(function()
+    if type(ctx.preview.set_title) == "function" then ctx.preview:set_title(title) end
+    if type(ctx.preview.set_lines) == "function" then ctx.preview:set_lines(lines) end
+    if type(ctx.preview.highlight) == "function" then ctx.preview:highlight({ lang = "markdown" }) end
+  end)
+end
+
+---@param ctx table
+local function preview_issue(ctx)
+  local picker_item = ctx and ctx.item
+  local item = picker_item and (picker_item.item or picker_item)
+  if not (item and item.kind == "issue") then return end
+
+  local title = "Issue #" .. tostring(item.number)
+  local cache_key = tostring(item.repo or ""):lower() .. "#" .. tostring(item.number)
+  local cached = issue_preview_cache[cache_key]
+  if cached then
+    set_preview_lines(ctx, title, issue_preview_lines(cached, cached.body))
+    return
+  end
+
+  issue_preview_request_id = issue_preview_request_id + 1
+  local request_id = issue_preview_request_id
+  set_preview_lines(ctx, title, issue_preview_lines(item, item.body ~= "" and item.body or "Loading description..."))
+
+  gh.issue_view_async(vim.fn.getcwd(), item.number, item.repo, function(result)
+    if request_id ~= issue_preview_request_id then return end
+    if not (result and result.ok and result.item) then
+      local message = result and result.message or "GitHub issue preview failed"
+      vim.notify("GitHub issue preview failed:\n" .. tostring(message), vim.log.levels.ERROR, { title = "GitHub" })
+      set_preview_lines(ctx, title, issue_preview_lines(item, tostring(message)))
+      return
+    end
+    issue_preview_cache[cache_key] = result.item
+    set_preview_lines(ctx, title, issue_preview_lines(result.item, result.item.body))
+  end)
 end
 
 ---@param title string
 ---@param items GithubGhItem[]
-local function open_picker(title, items)
+---@param opts? { preview?: fun(ctx: table) }
+local function open_picker(title, items, opts)
   if _G.Snacks and Snacks.picker and type(Snacks.picker.pick) == "function" then
     Snacks.picker.pick({
       title = title,
@@ -48,6 +140,7 @@ local function open_picker(title, items)
         if picker and picker.close then picker:close() end
         if item and item.item then open_item(item.item) end
       end,
+      preview = opts and opts.preview or nil,
     })
     return
   end
@@ -58,6 +151,22 @@ local function open_picker(title, items)
   }, function(item)
     if item then open_item(item) end
   end)
+end
+
+---@param cwd string
+---@param repo string
+local function open_synced_issue_picker(cwd, repo)
+  repo_cache.remember_cwd_repo(cwd, repo)
+  issue_index.ensure_repo(cwd, repo, { manual = false })
+  local items = issue_index.list(repo, { limit = 100 })
+  if #items == 0 then
+    vim.notify(
+      "No synced GitHub issues found for " .. repo .. ". Run :GithubIssueSync to refresh.",
+      vim.log.levels.INFO,
+      { title = "GitHub" }
+    )
+  end
+  open_picker("GitHub Issues: " .. repo, items, { preview = preview_issue })
 end
 
 ---@param title string
@@ -76,7 +185,25 @@ local function load_and_pick(title, loader)
 end
 
 function M.issues()
-  load_and_pick("GitHub Issues", gh.search_issues_async)
+  local cwd = vim.fn.getcwd()
+  local repo = repo_cache.completion_repo(0, cwd)
+  if repo then
+    open_synced_issue_picker(cwd, repo)
+    return
+  end
+
+  vim.notify("Resolving current GitHub repo...", vim.log.levels.INFO, { title = "GitHub" })
+  gh.current_repo_async(cwd, function(result)
+    if not (result and result.ok and result.repo) then
+      vim.notify(
+        "Could not resolve current GitHub repo:\n" .. tostring(result and result.message or "unknown error"),
+        vim.log.levels.ERROR,
+        { title = "GitHub" }
+      )
+      return
+    end
+    open_synced_issue_picker(cwd, result.repo)
+  end)
 end
 
 function M.prs()
