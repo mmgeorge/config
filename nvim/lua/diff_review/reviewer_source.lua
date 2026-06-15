@@ -12,11 +12,12 @@ end
 
 ---@return boolean
 function source:enabled()
-  if not vim.b.diff_review_pr_reviewer_completion then return false end
+  local repo_cache = require("github.repo_cache")
+  if not repo_cache.user_completion_enabled(0) then return false end
   local line = vim.api.nvim_get_current_line()
   local cursor_col = vim.api.nvim_win_get_cursor(0)[2]
   local before_cursor = line:sub(1, cursor_col)
-  return before_cursor:match("^Review:%s*.*@[%w_-]*$") ~= nil
+  return before_cursor:match(".*@[%w_-]*$") ~= nil
 end
 
 ---@return string[]
@@ -28,7 +29,7 @@ end
 ---@param callback fun(result: table)
 function source:get_completions(ctx, callback)
   local repo_cache = require("github.repo_cache")
-  local repo = repo_cache.buffer_repo(0)
+  local repo = repo_cache.completion_repo(0)
   local row = vim.api.nvim_win_get_cursor(0)[1] - 1
   local cursor_col = vim.api.nvim_win_get_cursor(0)[2]
   local line = vim.api.nvim_get_current_line()
@@ -36,7 +37,7 @@ function source:get_completions(ctx, callback)
   local token_start = before_cursor:match(".*()@[%w_-]*$")
   local items = {}
 
-  if token_start and before_cursor:match("^Review:%s*.*@[%w_-]*$") then
+  if token_start then
     for _, reviewer in ipairs(repo_cache.contributors(repo)) do
       local label = "@" .. reviewer.login
       items[#items + 1] = {

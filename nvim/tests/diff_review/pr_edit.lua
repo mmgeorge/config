@@ -2,6 +2,7 @@ vim.loader.enable(false)
 
 local diff_review = require("diff_review")
 local gh = require("diff_review.gh")
+local github_gh = require("github.gh")
 local repo_cache = require("github.repo_cache")
 
 local function assert_true(condition, message)
@@ -51,9 +52,20 @@ local standalone_comment_calls = {}
 local issue_comment_calls = {}
 ---@type { command: string[], input: string?, payload: table }[]
 local reviewer_request_calls = {}
+---@type { command: string[], input: string?, payload: table }[]
+local reviewer_remove_calls = {}
+---@type { command: string[], input: string?, payload: table }[]
+local milestone_create_calls = {}
+---@type { command: string[], input: string?, payload: table }[]
+local milestone_set_calls = {}
+---@type { command: string[], input: string?, payload: table }[]
+local draft_status_calls = {}
 ---@type string[]
 local user_lookup_calls = {}
 local contributor_calls = 0
+local collaborator_calls = 0
+local milestone_list_calls = 0
+local issue_reference_search_calls = {}
 local edit_should_fail = false
 local opened_urls = {}
 
@@ -64,6 +76,32 @@ function gh_backend.system_async(command, input, cb)
   local key = table.concat(command, " ")
   vim.defer_fn(function()
     if key == "gh api graphql --input -" then
+      local graphql_payload = vim.json.decode(input or "{}")
+      local query = tostring(graphql_payload.query or "")
+      if query:find("markPullRequestReadyForReview", 1, true) then
+        draft_status_calls[#draft_status_calls + 1] = { command = command, input = input, payload = graphql_payload }
+        local stdout = vim.json.encode({
+          data = {
+            markPullRequestReadyForReview = {
+              pullRequest = { id = "PR_kwTEST7", isDraft = false },
+            },
+          },
+        })
+        cb({ code = 0, stdout = stdout, stderr = "", output = stdout })
+        return
+      end
+      if query:find("convertPullRequestToDraft", 1, true) then
+        draft_status_calls[#draft_status_calls + 1] = { command = command, input = input, payload = graphql_payload }
+        local stdout = vim.json.encode({
+          data = {
+            convertPullRequestToDraft = {
+              pullRequest = { id = "PR_kwTEST7", isDraft = true },
+            },
+          },
+        })
+        cb({ code = 0, stdout = stdout, stderr = "", output = stdout })
+        return
+      end
       local stdout = vim.json.encode({
         data = {
           repository = {
@@ -117,6 +155,15 @@ function gh_backend.system_async(command, input, cb)
                     createdAt = "2026-06-14T17:12:24Z",
                     updatedAt = "2026-06-14T17:12:24Z",
                     url = "https://github.com/owner/repo/pull/7#issuecomment-4702465966",
+                    author = { login = "me" },
+                  },
+                  {
+                    id = "IC_2",
+                    databaseId = 4702465967,
+                    body = "Lorem Ipsum is the ubiquitous placeholder\nSecond full line for expansion",
+                    createdAt = "2026-06-14T22:00:00Z",
+                    updatedAt = "2026-06-14T22:00:00Z",
+                    url = "https://github.com/owner/repo/pull/7#issuecomment-4702465967",
                     author = { login = "me" },
                   },
                 },
@@ -238,12 +285,22 @@ function gh_backend.system_async(command, input, cb)
       cb({ code = 0, stdout = stdout, stderr = "", output = stdout })
       return
     end
-    if key == "gh api /users/alice-dev" or key == "gh api /users/bobtown" then
+    if key == "gh api /repos/owner/repo/collaborators --paginate --slurp" then
+      collaborator_calls = collaborator_calls + 1
+      local stdout = vim.json.encode({
+        {
+          { login = "mgeorge-esri" },
+        },
+      })
+      cb({ code = 0, stdout = stdout, stderr = "", output = stdout })
+      return
+    end
+    if key == "gh api /users/alice-dev" or key == "gh api /users/bobtown" or key == "gh api /users/mgeorge-esri" then
       local login = key:match("/users/(.+)$")
       user_lookup_calls[#user_lookup_calls + 1] = login
       local stdout = vim.json.encode({
         login = login,
-        name = login == "alice-dev" and "Alice Developer" or "Bob Town",
+        name = login == "alice-dev" and "Alice Developer" or (login == "bobtown" and "Bob Town" or "M George"),
       })
       cb({ code = 0, stdout = stdout, stderr = "", output = stdout })
       return
@@ -252,6 +309,64 @@ function gh_backend.system_async(command, input, cb)
       local payload = vim.json.decode(input or "{}")
       reviewer_request_calls[#reviewer_request_calls + 1] = { command = command, input = input, payload = payload }
       local stdout = vim.json.encode({ requested_reviewers = payload.reviewers })
+      cb({ code = 0, stdout = stdout, stderr = "", output = stdout })
+      return
+    end
+    if key == "gh api --method DELETE /repos/owner/repo/pulls/7/requested_reviewers --input -" then
+      local payload = vim.json.decode(input or "{}")
+      reviewer_remove_calls[#reviewer_remove_calls + 1] = { command = command, input = input, payload = payload }
+      cb({ code = 0, stdout = vim.json.encode({ requested_reviewers = {} }), stderr = "", output = "" })
+      return
+    end
+    if key == "gh api /repos/owner/repo/milestones?state=all&per_page=100 --paginate --slurp" then
+      milestone_list_calls = milestone_list_calls + 1
+      local stdout = vim.json.encode({
+        {
+          { number = 100, title = "Backlog", state = "open" },
+        },
+      })
+      cb({ code = 0, stdout = stdout, stderr = "", output = stdout })
+      return
+    end
+    if key == "gh api --method POST /repos/owner/repo/milestones --input -" then
+      local payload = vim.json.decode(input or "{}")
+      milestone_create_calls[#milestone_create_calls + 1] = { command = command, input = input, payload = payload }
+      local stdout = vim.json.encode({
+        number = 501,
+        title = payload.title,
+        state = "open",
+        html_url = "https://github.com/owner/repo/milestone/501",
+      })
+      cb({ code = 0, stdout = stdout, stderr = "", output = stdout })
+      return
+    end
+    if key == "gh api --method PATCH /repos/owner/repo/issues/7 --input -" then
+      local payload = vim.json.decode(input or "{}")
+      milestone_set_calls[#milestone_set_calls + 1] = { command = command, input = input, payload = payload }
+      local milestone = payload.milestone == 501 and {
+        number = 501,
+        title = "5.1",
+        state = "open",
+        html_url = "https://github.com/owner/repo/milestone/501",
+      } or vim.NIL
+      local stdout = vim.json.encode({ milestone = milestone })
+      cb({ code = 0, stdout = stdout, stderr = "", output = stdout })
+      return
+    end
+    if key:find("gh search issues", 1, true) then
+      issue_reference_search_calls[#issue_reference_search_calls + 1] = key
+      local stdout = vim.json.encode({
+        {
+          number = 42,
+          title = "Test issue match",
+          url = "https://github.com/owner/repo/issues/42",
+          repository = { nameWithOwner = "owner/repo" },
+          author = { login = "me" },
+          commentsCount = 0,
+          updatedAt = "2026-06-14T20:00:00Z",
+          state = "open",
+        },
+      })
       cb({ code = 0, stdout = stdout, stderr = "", output = stdout })
       return
     end
@@ -375,6 +490,15 @@ local function move_cursor(buf, row)
   vim.api.nvim_exec_autocmds("CursorMoved", { buffer = buf })
 end
 
+local function move_cursor_to_text(buf, row, text)
+  vim.api.nvim_win_set_buf(0, buf)
+  local line = vim.api.nvim_buf_get_lines(buf, row - 1, row, false)[1] or ""
+  local start_col = line:find(text, 1, true)
+  assert_true(start_col ~= nil, "line did not contain cursor target " .. text .. ": " .. line)
+  vim.api.nvim_win_set_cursor(0, { row, start_col - 1 })
+  vim.api.nvim_exec_autocmds("CursorMoved", { buffer = buf })
+end
+
 --- Edit one buffer line the way a gated insert would, then leave insert.
 local function edit_line(buf, row, text)
   vim.bo[buf].modifiable = true
@@ -406,7 +530,51 @@ local function assert_browse_url(buf, row, expected, label)
   )
 end
 
+local function reviewer_completion_labels(buf, row, text)
+  edit_line(buf, row, text)
+  move_cursor(buf, row)
+  vim.api.nvim_win_set_cursor(0, { row, #text })
+  local reviewer_source = require("diff_review.reviewer_source").new({})
+  assert_true(reviewer_source:enabled(), "reviewer completion source did not enable on: " .. text)
+  local completion_result
+  reviewer_source:get_completions({}, function(result) completion_result = result end)
+  local labels = {}
+  for _, item in ipairs(completion_result.items or {}) do
+    labels[item.label] = true
+  end
+  return labels
+end
+
+local function assert_contributor_completion(buf, row, text)
+  local labels = reviewer_completion_labels(buf, row, text)
+  assert_true(labels["@alice-dev"], "GitHub user completion did not include @alice-dev on: " .. text)
+  assert_true(labels["@bobtown"], "GitHub user completion did not include @bobtown on: " .. text)
+  assert_true(labels["@mgeorge-esri"], "GitHub user completion did not include collaborator @mgeorge-esri on: " .. text)
+  assert_true(not labels["@foobar"], "GitHub user completion still included placeholder @foobar")
+end
+
+local function assert_issue_completion(buf, row, text)
+  edit_line(buf, row, text)
+  move_cursor(buf, row)
+  local old_virtualedit = vim.o.virtualedit
+  vim.o.virtualedit = "onemore"
+  vim.api.nvim_win_set_cursor(0, { row, #text })
+  local issue_source = require("github.issue_source").new({ debounce_ms = 0 })
+  assert_true(issue_source:enabled(), "GitHub issue completion did not enable on: " .. text)
+  local completion_result
+  issue_source:get_completions({}, function(result) completion_result = result end)
+  assert_true(vim.wait(1000, function() return completion_result ~= nil end, 10), "GitHub issue completion did not return on: " .. text)
+  vim.o.virtualedit = old_virtualedit
+  local labels = {}
+  for _, item in ipairs(completion_result.items or {}) do
+    labels[item.label] = item
+  end
+  assert_true(labels["#42 Test issue match"] ~= nil, "GitHub issue completion did not include #42 on: " .. text)
+  assert_true(labels["#42 Test issue match"].textEdit.newText == "#42", "GitHub issue completion should insert only the issue id")
+end
+
 local pr = {
+  id = "PR_kwTEST7",
   number = 7,
   title = "Old title",
   body = "Line one\nLine two",
@@ -419,21 +587,56 @@ local pr = {
   changedFiles = 1,
   additions = 1,
   deletions = 1,
+  isDraft = true,
 }
 
 local function run()
   vim.notify = capture_notify
   diff_review.set_git_backend(git_backend)
   gh.set_backend(gh_backend)
+  github_gh.set_backend(gh_backend)
   diff_review.setup({ about_auto_generate = false })
   repo_cache.set_data_dir_for_test(repo_cache_dir)
+
+  local draft_codeowner_text = diff_review._pr_overview.pending_review_text({
+    isDraft = true,
+    requestedReviewers = {
+      { login = "codeowners", is_code_owner = true },
+      { login = "alice-dev" },
+    },
+  }, nil)
+  assert_true(
+    draft_codeowner_text == diff_review._pending_review_icon .. " " .. diff_review._codeowner_review_icon .. "@codeowners @alice-dev",
+    "draft codeowner reviewers should render with a warning icon: " .. tostring(draft_codeowner_text)
+  )
+  local ready_codeowner_text = diff_review._pr_overview.pending_review_text({
+    isDraft = false,
+    requestedReviewers = {
+      { login = "codeowners", is_code_owner = true },
+    },
+  }, nil)
+  assert_true(
+    ready_codeowner_text == diff_review._pending_review_icon .. " @codeowners",
+    "ready codeowner reviewers should render without a draft warning icon: " .. tostring(ready_codeowner_text)
+  )
 
   local buf = diff_review.open_pr(pr, { cwd = "D:/diffreview-pr-edit-root" })
   assert_true(buf ~= nil, "open_pr did not return a buffer")
   wait_for(function() return buffer_contains(buf, "Title:  Old title") end, "PR view did not render the title")
+  assert_true(vim.wo[0].wrap, "PR buffer should enable soft wrap")
+  assert_true(vim.wo[0].linebreak, "PR buffer should wrap on word boundaries")
+  assert_true(vim.wo[0].breakindent, "PR buffer should preserve indent on wrapped screen lines")
   assert_true(buffer_contains(buf, "Line one"), "PR body did not render")
   wait_for(function() return buffer_contains(buf, "This is a regular comment") end, "PR conversation comment did not render")
-  assert_true(buffer_contains(buf, "Comments (1):"), "PR comments heading did not use section heading format")
+  assert_true(buffer_contains(buf, "Comments (2):"), "PR comments heading did not use section heading format")
+  assert_true(
+    buffer_contains(buf, "Lorem Ipsum is the ubiquitous placeholder"),
+    "long PR conversation comment preview did not render"
+  )
+  assert_true(
+    not buffer_contains(buf, "Second full line for expansion"),
+    "long PR conversation comment should render collapsed by default"
+  )
   wait_for(function() return buffer_contains(buf, "Reviews (2):") end, "submitted reviews section did not render")
   assert_true(
     not buffer_contains(buf, "COMMENTED by me | 2026-06-14 17:18"),
@@ -484,6 +687,24 @@ local function run()
   inline_reply_row = find_row_after(buf, "Oh good point! fixed", inline_comment_row)
   local rejected_review_row = find_row(buf, "REJECTED by foo")
   local regular_comment_row = find_row(buf, "This is a regular comment")
+  local long_regular_comment_row = find_row(buf, "Lorem Ipsum is the ubiquitous placeholder")
+  move_cursor(buf, long_regular_comment_row)
+  trigger_buf_mapping(buf, "<Tab>")
+  wait_for(function()
+    return buffer_contains(buf, "Second full line for expansion")
+  end, "regular PR conversation comment did not expand")
+  assert_browse_url(
+    buf,
+    find_row(buf, "Second full line for expansion"),
+    "https://github.com/owner/repo/pull/7#issuecomment-4702465967",
+    "expanded regular PR comment body"
+  )
+  long_regular_comment_row = find_row(buf, "Lorem Ipsum is the ubiquitous placeholder")
+  move_cursor(buf, long_regular_comment_row)
+  trigger_buf_mapping(buf, "<Tab>")
+  wait_for(function()
+    return not buffer_contains(buf, "Second full line for expansion")
+  end, "regular PR conversation comment did not collapse")
   opened_urls = {}
   assert_browse_url(buf, regular_comment_row, "https://github.com/owner/repo/pull/7#issuecomment-4702465966", "regular PR comment")
   assert_browse_url(buf, rejected_review_row, "https://github.com/owner/repo/pull/7#pullrequestreview-4493241278", "review summary")
@@ -492,7 +713,7 @@ local function run()
 
   move_cursor(buf, regular_comment_row)
   trigger_buf_mapping(buf, "C")
-  wait_for(function() return buffer_contains(buf, "Comments (2):") end, "regular PR comment draft did not update the comments count")
+  wait_for(function() return buffer_contains(buf, "Comments (3):") end, "regular PR comment draft did not update the comments count")
   local regular_draft_header_row = find_row_after(buf, "you |", regular_comment_row)
   local regular_draft_body_row = regular_draft_header_row + 1
   edit_line(buf, regular_draft_body_row, "Regular from PR overview")
@@ -516,6 +737,8 @@ local function run()
   trigger_buf_mapping(buf, "C")
   local standalone_header_row = find_row_after(buf, "you |", changed_code_row)
   local standalone_body_row = standalone_header_row + 1
+  assert_issue_completion(buf, standalone_body_row, "Standalone #t")
+  assert_contributor_completion(buf, standalone_body_row, "Standalone @")
   edit_line(buf, standalone_body_row, "Standalone from PR overview")
   assert_true(vim.bo[buf].modified, "standalone inline comment edit must mark the PR buffer modified")
   trigger_buf_mapping(buf, "<C-s>")
@@ -596,7 +819,7 @@ local function run()
   local previous_standalone_comment_count = #standalone_comment_calls
   move_cursor(buf, expanded_code_row)
   trigger_buf_mapping(buf, "C")
-  wait_for(function() return buffer_contains(buf, "Comments (3):") end, "review-context C did not create a regular PR comment")
+  wait_for(function() return buffer_contains(buf, "Comments (4):") end, "review-context C did not create a regular PR comment")
   local context_regular_header_row = find_row_after(buf, "you |", find_row(buf, "Regular from PR overview"))
   local context_regular_body_row = context_regular_header_row + 1
   edit_line(buf, context_regular_body_row, "Regular from review context")
@@ -615,11 +838,23 @@ local function run()
   assert_true(not vim.bo[buf].modifiable, "PR buffer must start nomodifiable")
 
   local title_row = find_row(buf, "Title:  Old title")
+  local milestone_row = find_row(buf, "Milestone:")
   local review_row = find_row(buf, "Review:")
+  local status_row = find_row(buf, "Status: DRAFT")
   local body_row = find_row(buf, "Line one")
+  assert_true(milestone_row < review_row, "Milestone row should render above Review row")
+  assert_true(review_row < status_row, "Status row should render below Review row")
   assert_true(
     line_has_highlight(buf, review_row, "DiffReviewStatusLabel", 0, #"Review: "),
     "PR review request row did not use label highlight"
+  )
+  assert_true(
+    line_has_highlight(buf, milestone_row, "DiffReviewStatusLabel", 0, #"Milestone: "),
+    "PR milestone row did not use label highlight"
+  )
+  assert_true(
+    line_has_highlight(buf, status_row, "DiffReviewStatusLabel", 0, #"Status: "),
+    "PR status row did not use label highlight"
   )
 
   -- ── the buffer unlocks exactly on the editable regions ─────────────────────
@@ -631,39 +866,76 @@ local function run()
   move_cursor(buf, review_row)
   assert_true(vim.bo[buf].modifiable, "buffer must unlock on the review request row")
   assert_cursor_clamped_to_line(buf, review_row, "PR review request")
+  move_cursor(buf, milestone_row)
+  assert_true(vim.bo[buf].modifiable, "buffer must unlock on the milestone row")
+  assert_cursor_clamped_to_line(buf, milestone_row, "PR milestone")
+  move_cursor(buf, status_row)
+  assert_true(not vim.bo[buf].modifiable, "PR status row must stay locked")
   move_cursor(buf, find_row(buf, "Description:"))
   assert_true(not vim.bo[buf].modifiable, "the Description: label itself must stay locked")
   move_cursor(buf, body_row)
   assert_true(vim.bo[buf].modifiable, "buffer must unlock on description rows")
   assert_cursor_clamped_to_line(buf, body_row, "PR description")
+  issue_reference_search_calls = {}
+  assert_issue_completion(buf, body_row, "Line #z")
+  assert_true(
+    #issue_reference_search_calls == 3,
+    "PR description issue completion did not run prioritized searches: " .. vim.inspect(issue_reference_search_calls)
+  )
+  assert_true(
+    issue_reference_search_calls[1]:find("gh search issues z --repo owner/repo --assignee @me", 1, true) ~= nil,
+    "PR description issue completion did not search after one character: " .. tostring(issue_reference_search_calls[1])
+  )
+  edit_line(buf, body_row, "Line one")
+  assert_true(#marker_rows(buf) == 0, "restoring PR description after issue completion left dirty markers")
+  vim.bo[buf].modified = false
   move_cursor(buf, regular_comment_row)
   assert_true(not vim.bo[buf].modifiable, "regular PR comment row must not be editable as description text")
   move_cursor(buf, find_row(buf, "URL:"))
   assert_true(not vim.bo[buf].modifiable, "buffer must relock after leaving the regions")
 
+  -- ── Status: Enter confirms draft/ready transitions ─────────────────────────
+  move_cursor_to_text(buf, status_row, "DRAFT")
+  trigger_buf_mapping(buf, "<CR>")
+  wait_for(function()
+    return buffer_contains(vim.api.nvim_get_current_buf(), "Mark PR #7 ready for review?")
+      and buffer_contains(vim.api.nvim_get_current_buf(), "Status will change from DRAFT to READY.")
+  end, "ready-for-review confirmation did not render")
+  trigger_current_mapping("y")
+  wait_for(function() return #draft_status_calls == 1 end, "mark ready mutation was not sent")
+  assert_true(
+    draft_status_calls[1].payload.variables.input.pullRequestId == "PR_kwTEST7",
+    "mark ready mutation used wrong PR node id: " .. vim.inspect(draft_status_calls[1].payload)
+  )
+  wait_for(function() return buffer_contains(buf, "Status: READY") end, "PR status row did not switch to READY")
+  assert_true(pr.isDraft == false, "PR cache did not switch to ready")
+
+  status_row = find_row(buf, "Status: READY")
+  move_cursor_to_text(buf, status_row, "READY")
+  trigger_buf_mapping(buf, "<CR>")
+  wait_for(function()
+    return buffer_contains(vim.api.nvim_get_current_buf(), "Move PR #7 back to draft?")
+      and buffer_contains(vim.api.nvim_get_current_buf(), "Status will change from READY to DRAFT.")
+  end, "draft confirmation did not render")
+  trigger_current_mapping("y")
+  wait_for(function() return #draft_status_calls == 2 end, "convert-to-draft mutation was not sent")
+  assert_true(
+    draft_status_calls[2].payload.variables.input.pullRequestId == "PR_kwTEST7",
+    "convert draft mutation used wrong PR node id: " .. vim.inspect(draft_status_calls[2].payload)
+  )
+  wait_for(function() return buffer_contains(buf, "Status: DRAFT") end, "PR status row did not switch back to DRAFT")
+  assert_true(pr.isDraft == true, "PR cache did not switch back to draft")
+
   -- ── Review: completes cached repo contributors and sends reviewer requests ──
   wait_for(function()
-    return contributor_calls == 1 and #repo_cache.contributors("owner/repo") == 2
+    return contributor_calls == 1 and collaborator_calls == 1 and #repo_cache.contributors("owner/repo") == 3
   end, "repo contributors were not cached")
-  edit_line(buf, review_row, "Review: @")
-  move_cursor(buf, review_row)
-  vim.api.nvim_win_set_cursor(0, { review_row, #"Review: @" })
-  local reviewer_source = require("diff_review.reviewer_source").new({})
-  assert_true(reviewer_source:enabled(), "reviewer completion source did not enable on the Review row")
-  local completion_result
-  reviewer_source:get_completions({}, function(result) completion_result = result end)
-  local completion_labels = {}
-  for _, item in ipairs(completion_result.items or {}) do
-    completion_labels[item.label] = true
-  end
-  assert_true(completion_labels["@alice-dev"], "reviewer completion did not include @alice-dev")
-  assert_true(completion_labels["@bobtown"], "reviewer completion did not include @bobtown")
-  assert_true(not completion_labels["@foobar"], "reviewer completion still included placeholder @foobar")
+  assert_contributor_completion(buf, review_row, "Review: @")
 
   edit_line(buf, review_row, "Review: @alice-dev @bobtown")
   assert_true(vim.bo[buf].modified, "reviewer request edit must mark the PR buffer modified")
   local rows = marker_rows(buf)
-  assert_true(#rows == 1 and rows[1] == review_row, "reviewer request edit did not mark the Review row dirty")
+  assert_true(#rows == 1 and rows[1] == review_row, "reviewer request edit did not mark the Review row dirty: " .. vim.inspect(rows))
   captured_notifications = {}
   trigger_buf_mapping(buf, "<C-s>")
   assert_true(#marker_rows(buf) == 0, "reviewer request save must clear markers before confirmation")
@@ -676,9 +948,32 @@ local function run()
   wait_for(function() return #reviewer_request_calls == 1 end, "reviewer request was not sent")
   local reviewer_payload = reviewer_request_calls[1].payload
   assert_true(vim.deep_equal(reviewer_payload.reviewers, { "alice-dev", "bobtown" }), "wrong reviewers payload: " .. vim.inspect(reviewer_payload))
-  wait_for(function() return saw_notification_containing("Requested review from @alice-dev, @bobtown") end, "successful reviewer request was not notified")
-  assert_true(vim.api.nvim_buf_get_lines(buf, review_row - 1, review_row, false)[1] == "Review: ", "Review row was not cleared after reviewer request")
+  wait_for(function() return saw_notification_containing("Review requests updated: requested @alice-dev, @bobtown") end, "successful reviewer request was not notified")
+  assert_true(
+    vim.api.nvim_buf_get_lines(buf, review_row - 1, review_row, false)[1] == "Review: " .. diff_review._pending_review_icon .. " @alice-dev @bobtown",
+    "Review row did not show pending reviewers after reviewer request"
+  )
   assert_true(not vim.bo[buf].modified, "reviewer request sync must clear the modified flag")
+
+  edit_line(buf, review_row, "Review: " .. diff_review._pending_review_icon .. " @alice-dev")
+  assert_true(vim.bo[buf].modified, "reviewer removal edit must mark the PR buffer modified")
+  rows = marker_rows(buf)
+  assert_true(#rows == 1 and rows[1] == review_row, "reviewer removal edit did not mark the Review row dirty")
+  captured_notifications = {}
+  trigger_buf_mapping(buf, "<C-s>")
+  wait_for(function()
+    return #user_lookup_calls == 3
+      and buffer_contains(vim.api.nvim_get_current_buf(), "Confirm review request changes:")
+      and buffer_contains(vim.api.nvim_get_current_buf(), "Remove review request:")
+      and buffer_contains(vim.api.nvim_get_current_buf(), "@bobtown (Bob Town)")
+  end, "reviewer removal confirmation did not describe the pending removal")
+  trigger_current_mapping("n")
+  wait_for(function()
+    return vim.api.nvim_buf_get_lines(buf, review_row - 1, review_row, false)[1] == "Review: " .. diff_review._pending_review_icon .. " @alice-dev @bobtown"
+  end, "cancelled reviewer removal did not restore the Review row")
+  assert_true(#reviewer_remove_calls == 0, "cancelled reviewer removal still called GitHub")
+  assert_true(#marker_rows(buf) == 0, "cancelled reviewer removal did not clear the marker")
+  assert_true(not vim.bo[buf].modified, "cancelled reviewer removal did not clear modified state")
 
   -- ── edits flag the field with a "*" marker ──────────────────────────────────
   edit_line(buf, title_row, "Title:  New title")
@@ -715,11 +1010,75 @@ local function run()
   assert_true(pr.body == "Line one EDITED\nLine two", "PR cache body was not updated")
   assert_true(#marker_rows(buf) == 0, "markers must stay clear after a successful sync")
   assert_true(buffer_contains(buf, "Title:  New title"), "post-sync re-render lost the new title")
+  assert_true(
+    buffer_contains(buf, "Review: " .. diff_review._pending_review_icon .. " @alice-dev @bobtown"),
+    "post-sync re-render lost pending reviewers"
+  )
 
   -- ── unchanged save is a no-op ───────────────────────────────────────────────
   vim.api.nvim_buf_call(buf, function() vim.cmd("write") end)
   vim.wait(120, function() return false end, 10)
   assert_true(#edit_calls == 1, "no-op save must not call gh")
+
+  -- ── Review: mixed removals and new requests are confirmed together ─────────
+  edit_line(buf, review_row, "Review: " .. diff_review._pending_review_icon .. " @bobtown @mgeorge-esri")
+  assert_true(vim.bo[buf].modified, "mixed reviewer edit must mark the PR buffer modified")
+  rows = marker_rows(buf)
+  assert_true(#rows == 1 and rows[1] == review_row, "mixed reviewer edit did not mark the Review row dirty")
+  captured_notifications = {}
+  trigger_buf_mapping(buf, "<C-s>")
+  wait_for(function()
+    return #user_lookup_calls == 5
+      and buffer_contains(vim.api.nvim_get_current_buf(), "Confirm review request changes:")
+      and buffer_contains(vim.api.nvim_get_current_buf(), "Remove review request:")
+      and buffer_contains(vim.api.nvim_get_current_buf(), "@alice-dev (Alice Developer)")
+      and buffer_contains(vim.api.nvim_get_current_buf(), "Request review:")
+      and buffer_contains(vim.api.nvim_get_current_buf(), "@mgeorge-esri (M George)")
+  end, "mixed reviewer confirmation did not describe removals and requests")
+  trigger_current_mapping("y")
+  wait_for(function() return #reviewer_remove_calls == 1 and #reviewer_request_calls == 2 end, "mixed reviewer change did not call GitHub")
+  assert_true(
+    vim.deep_equal(reviewer_remove_calls[1].payload.reviewers, { "alice-dev" }),
+    "wrong reviewer removal payload: " .. vim.inspect(reviewer_remove_calls[1].payload)
+  )
+  assert_true(
+    vim.deep_equal(reviewer_request_calls[2].payload.reviewers, { "mgeorge-esri" }),
+    "wrong mixed reviewer request payload: " .. vim.inspect(reviewer_request_calls[2].payload)
+  )
+  wait_for(function() return saw_notification_containing("Review requests updated: removed @alice-dev; requested @mgeorge-esri") end, "mixed reviewer update was not notified")
+  assert_true(
+    vim.api.nvim_buf_get_lines(buf, review_row - 1, review_row, false)[1] == "Review: " .. diff_review._pending_review_icon .. " @bobtown @mgeorge-esri",
+    "mixed reviewer update did not render the desired pending reviewers"
+  )
+  assert_true(not vim.bo[buf].modified, "mixed reviewer sync must clear the modified flag")
+
+  -- ── Milestone: missing milestone is confirmed, created, then assigned ──────
+  edit_line(buf, milestone_row, "Milestone: 5.1")
+  assert_true(vim.bo[buf].modified, "milestone edit must mark the PR buffer modified")
+  rows = marker_rows(buf)
+  assert_true(#rows == 1 and rows[1] == milestone_row, "milestone edit did not mark the Milestone row dirty")
+  captured_notifications = {}
+  trigger_buf_mapping(buf, "<C-s>")
+  assert_true(#marker_rows(buf) == 0, "milestone save must clear markers before confirmation")
+  wait_for(function()
+    return milestone_list_calls == 1
+      and buffer_contains(vim.api.nvim_get_current_buf(), "Milestone not found:")
+      and buffer_contains(vim.api.nvim_get_current_buf(), "5.1")
+      and buffer_contains(vim.api.nvim_get_current_buf(), "Create it now?")
+  end, "missing milestone confirmation did not render")
+  trigger_current_mapping("y")
+  wait_for(function()
+    return #milestone_create_calls == 1 and #milestone_set_calls == 1
+  end, "missing milestone was not created and assigned")
+  assert_true(milestone_create_calls[1].payload.title == "5.1", "wrong milestone create payload: " .. vim.inspect(milestone_create_calls[1].payload))
+  assert_true(milestone_set_calls[1].payload.milestone == 501, "wrong milestone set payload: " .. vim.inspect(milestone_set_calls[1].payload))
+  wait_for(function() return saw_notification_containing("Milestone updated: " .. diff_review._milestone_icon .. " 5.1") end, "successful milestone update was not notified")
+  assert_true(
+    vim.api.nvim_buf_get_lines(buf, milestone_row - 1, milestone_row, false)[1] == "Milestone: " .. diff_review._milestone_icon .. " 5.1",
+    "Milestone row did not show the assigned milestone"
+  )
+  assert_true(pr.milestone and pr.milestone.title == "5.1", "PR cache milestone was not updated")
+  assert_true(not vim.bo[buf].modified, "milestone sync must clear the modified flag")
 
   -- ── failed sync restores the markers and notifies ───────────────────────────
   edit_should_fail = true
@@ -738,6 +1097,7 @@ local ok, err = xpcall(run, debug.traceback)
 vim.notify = original_notify
 diff_review.reset_git_backend()
 gh.reset_backend()
+github_gh.reset_backend()
 repo_cache.set_data_dir_for_test(nil)
 vim.fn.delete(repo_cache_dir, "rf")
 if not ok then

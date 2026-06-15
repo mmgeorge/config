@@ -435,6 +435,19 @@ vim.system({ "git", "-C", root, "status", "--short" }, { text = true }, function
 end)
 ```
 
+Request failures must be visible. Every UI-facing async request wrapper or
+consumer (Git, GitHub/`gh`, HTTP/API, completion sources, metadata loaders, and
+background jobs) needs an explicit error path that calls `vim.notify()` or the
+plugin notification helper with the useful stderr/API/decode message. Keep
+"request failed" distinct from "request succeeded with zero results"; do not
+cache failed requests as empty data, leave a spinner running, or silently return
+an empty list from autocomplete. Add mocked tests for the failure notification
+path whenever adding a request source.
+
+The same bias applies outside request wrappers: when plugin code catches an
+error that affects the user's visible workflow, make it loud with a notification
+instead of hiding it behind a log-only message, stale UI, or silent fallback.
+
 Every async refresh should have a monotonically increasing request id:
 
 ```lua

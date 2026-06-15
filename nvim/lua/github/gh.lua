@@ -92,7 +92,20 @@
 ---@type GithubGhModule
 local M = {}
 
-local search_fields = table.concat({
+local repo_users = require("github.repo_users")
+
+local issue_search_fields = table.concat({
+  "number",
+  "title",
+  "url",
+  "repository",
+  "author",
+  "commentsCount",
+  "updatedAt",
+  "state",
+}, ",")
+
+local pr_search_fields = table.concat({
   "number",
   "title",
   "url",
@@ -322,33 +335,14 @@ end
 ---@param repo string
 ---@param callback fun(result: GithubGhRepoContributorsResult)
 function M.repo_contributors_async(cwd, repo, callback)
-  system_text_async({ "gh", "api", "/repos/" .. repo .. "/contributors", "--paginate", "--slurp" }, nil, cwd, function(result)
-    if result.code ~= 0 then
-      callback({ ok = false, message = result_error(result), code = result.code })
-      return
-    end
-    local decoded, err = decode_json(result.stdout)
-    if not decoded then
-      callback({ ok = false, message = err, code = result.code })
-      return
-    end
-    local contributors = {}
-    local function collect(raw)
-      if type(raw) ~= "table" then return end
-      if type(raw.login) == "string" and raw.login ~= "" then
-        contributors[#contributors + 1] = {
-          login = raw.login,
-          name = type(raw.name) == "string" and raw.name or nil,
-        }
-        return
-      end
-      for _, item in ipairs(raw) do collect(item) end
-    end
-    for _, raw in ipairs(decoded) do
-      collect(raw)
-    end
-    callback({ ok = true, contributors = contributors })
-  end)
+  repo_users.fetch_async({
+    cwd = cwd,
+    repo = repo,
+    system_async = system_text_async,
+    decode_json = decode_json,
+    result_error = result_error,
+    callback = callback,
+  })
 end
 
 ---@param stdout string
@@ -409,10 +403,85 @@ function M.search_issues_async(cwd, callback)
     "--state",
     "open",
     "--json",
-    search_fields,
+    issue_search_fields,
     "-L",
     "100",
   }, "issue", callback)
+end
+
+---@param repo string?
+---@param query string?
+---@param filter string[]?
+---@param limit integer?
+---@return GithubGhCommand
+local function issue_search_command(repo, query, filter, limit)
+  local command = { "gh", "search", "issues" }
+  query = vim.trim(tostring(query or ""))
+  if query ~= "" then command[#command + 1] = query end
+  if repo and repo ~= "" then vim.list_extend(command, { "--repo", repo }) end
+  vim.list_extend(command, filter or {})
+  vim.list_extend(command, {
+    "--state",
+    "open",
+    "--json",
+    issue_search_fields,
+    "-L",
+    tostring(limit or 20),
+  })
+  return command
+end
+
+---@param items GithubGhItem[]
+---@param incoming GithubGhItem[]?
+local function append_unique_issue_items(items, incoming)
+  local seen = {}
+  for _, item in ipairs(items) do
+    seen[(item.repo or ""):lower() .. "#" .. tostring(item.number)] = true
+  end
+  for _, item in ipairs(incoming or {}) do
+    local key = (item.repo or ""):lower() .. "#" .. tostring(item.number)
+    if not seen[key] then
+      seen[key] = true
+      items[#items + 1] = item
+    end
+  end
+end
+
+---@param cwd string?
+---@param repo string
+---@param query string
+---@param callback fun(result: GithubGhListResult)
+function M.search_issue_references_async(cwd, repo, query, callback)
+  local searches = {
+    issue_search_command(repo, query, { "--assignee", "@me" }, 10),
+    issue_search_command(repo, query, { "--mentions", "@me" }, 10),
+    issue_search_command(repo, query, {}, 20),
+  }
+  local pending = #searches
+  local failures = {}
+  local results_by_priority = {}
+
+  for priority, command in ipairs(searches) do
+    search_async(cwd, command, "issue", function(result)
+      pending = pending - 1
+      if result.ok then
+        results_by_priority[priority] = result.items or {}
+      else
+        failures[#failures + 1] = result.message or "GitHub issue search failed"
+      end
+      if pending > 0 then return end
+
+      local items = {}
+      for priority_index = 1, #searches do
+        append_unique_issue_items(items, results_by_priority[priority_index])
+      end
+      if #items > 0 or #failures < #searches then
+        callback({ ok = true, items = items })
+        return
+      end
+      callback({ ok = false, items = {}, message = table.concat(failures, "\n") })
+    end)
+  end
 end
 
 ---@param cwd string?
@@ -427,7 +496,7 @@ function M.search_open_prs_async(cwd, callback)
     "--state",
     "open",
     "--json",
-    search_fields,
+    pr_search_fields,
     "-L",
     "100",
   }, "pr", callback)
@@ -445,7 +514,7 @@ function M.search_review_requests_async(cwd, callback)
     "--state",
     "open",
     "--json",
-    search_fields,
+    pr_search_fields,
     "-L",
     "100",
   }, "pr", callback)

@@ -257,6 +257,18 @@ from status, PRView, keymaps, renderers, or tests. The wrapper owns nonblocking
 so they never depend on a real `gh` installation, auth state, network, or
 repository remote.
 
+All GitHub/Git request consumers must notify request failures. Nonzero exits,
+API errors, invalid JSON, missing required repo/PR context, and failed background
+lookups should reach the user via `notify_error`, `vim.notify`, or the owning
+notification helper with the underlying stderr/API/decode message. Do not treat
+failed requests as empty comments, empty completion lists, unchanged status, or
+generic loading state. Empty-but-successful results are fine, but they must be
+distinguishable in code and tests from request failures.
+
+DiffReview error handling should be loud by default. If a caught error affects
+rendering, syncing, completion, cursor behavior, or user action handling, report
+it with a notification rather than only logging it or silently falling back.
+
 ## Shared Status UX Pattern
 
 GitStatus' Unstaged/Staged model is the canonical UX pattern for all

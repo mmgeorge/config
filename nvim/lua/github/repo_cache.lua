@@ -291,4 +291,30 @@ function M.buffer_repo(buf)
   return ok and normalize_repo(repo) or nil
 end
 
+---@param buf integer?
+---@param repo? string
+function M.enable_user_completion(buf, repo)
+  buf = buf or vim.api.nvim_get_current_buf()
+  if repo and repo ~= "" then vim.b[buf].github_repo = repo end
+  vim.b[buf].github_user_completion = true
+  vim.b[buf].diff_review_pr_reviewer_completion = true
+end
+
+---@param buf integer?
+---@return boolean
+function M.user_completion_enabled(buf)
+  buf = buf or vim.api.nvim_get_current_buf()
+  local ok, enabled = pcall(function()
+    return vim.b[buf].github_user_completion or vim.b[buf].diff_review_pr_reviewer_completion
+  end)
+  return ok and enabled == true
+end
+
+---@param buf integer?
+---@param cwd? string
+---@return string?
+function M.completion_repo(buf, cwd)
+  return M.buffer_repo(buf) or M.repo_for_cwd(cwd or vim.fn.getcwd())
+end
+
 return M

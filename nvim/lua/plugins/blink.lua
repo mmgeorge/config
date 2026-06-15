@@ -255,7 +255,7 @@ return {
       -- Default list of enabled providers defined so that you can extend it
       -- elsewhere in your config, without redefining it, due to `opts_extend`
       sources = {
-        default = { 'lsp', 'path', 'custom_snippets', 'diff_review_reviewers', 'spell' },
+        default = { 'lsp', 'path', 'custom_snippets', 'diff_review_reviewers', 'github_issues', 'spell' },
         -- default = { 'snippets', 'lsp', 'path', 'custom_snippets', 'spell' },
         -- min_keyword_length = 3,
         providers = {
@@ -319,6 +319,12 @@ return {
             name = "Reviewers",
             min_keyword_length = 0,
             module = "diff_review.reviewer_source",
+          },
+          github_issues = {
+            name = "Issues",
+            async = true,
+            min_keyword_length = 0,
+            module = "github.issue_source",
           },
           spell = {
             name = 'Spell',

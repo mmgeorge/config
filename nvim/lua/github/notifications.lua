@@ -33,6 +33,16 @@ local state = {
 
 local M = {}
 
+---@param cwd string?
+local function load_repo_metadata(cwd)
+  local repo_cache = require("github.repo_cache")
+  repo_cache.ensure_metadata_for_cwd(cwd, function(done)
+    gh.current_repo_async(cwd, done)
+  end, function(repo, done)
+    gh.repo_contributors_async(cwd, repo, done)
+  end)
+end
+
 ---@param value string
 ---@return string[]
 local function body_lines(value)
@@ -104,6 +114,7 @@ local function ensure_buffer()
   vim.bo[buf].bufhidden = "hide"
   vim.bo[buf].swapfile = false
   vim.bo[buf].filetype = "GithubNotifications"
+  require("github.repo_cache").enable_user_completion(buf)
   pcall(vim.api.nvim_buf_set_name, buf, "github://notifications")
 
   vim.keymap.set("n", "<Tab>", function()
@@ -365,6 +376,7 @@ end
 function M.open()
   state.cwd = vim.fn.getcwd()
   local buf = ensure_buffer()
+  load_repo_metadata(state.cwd)
   vim.api.nvim_set_current_buf(buf)
   set_lines({
     "Hint: <tab> expand | <cr> open | b browse | S save | U unread | D done | r refresh | q close",

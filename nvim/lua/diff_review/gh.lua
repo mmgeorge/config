@@ -19,11 +19,23 @@
 ---@field changeType? string
 ---@field status? string
 
+---@class DiffReviewGhRequestedReviewer
+---@field login string
+---@field is_code_owner? boolean
+---@field kind? string
+
+---@class DiffReviewGhMilestone
+---@field number integer
+---@field title string
+---@field state? string
+---@field url? string
+
 ---@class DiffReviewGhPRCommit
 ---@field oid string
 ---@field messageHeadline? string
 
 ---@class DiffReviewGhPR
+---@field id? string
 ---@field number integer
 ---@field title string
 ---@field body string
@@ -36,6 +48,9 @@
 ---@field changedFiles integer
 ---@field additions integer
 ---@field deletions integer
+---@field requestedReviewers? DiffReviewGhRequestedReviewer[]
+---@field milestone? DiffReviewGhMilestone
+---@field isDraft boolean
 
 ---@class DiffReviewGhPRResult
 ---@field ok boolean
@@ -121,16 +136,25 @@
 ---@field message? string
 ---@field code? integer
 
+---@class DiffReviewGhPrDraftResult
+---@field ok boolean
+---@field is_draft? boolean
+---@field message? string
+---@field code? integer
+
 ---@class DiffReviewGhModule
 ---@field _backend DiffReviewGhBackend?
 
 ---@type DiffReviewGhModule
 local M = {}
 
+local repo_users = require("github.repo_users")
+
 local default_timeout_ms = 5000
 local timeout_ms = default_timeout_ms
 
 local pr_json_fields = table.concat({
+  "id",
   "number",
   "title",
   "body",
@@ -142,6 +166,9 @@ local pr_json_fields = table.concat({
   "changedFiles",
   "additions",
   "deletions",
+  "reviewRequests",
+  "milestone",
+  "isDraft",
 }, ",")
 
 ---@param backend DiffReviewGhBackend?
@@ -255,6 +282,134 @@ function M.repo_from_pr_url(url)
   return nil
 end
 
+---@param text string
+---@return table?
+local function decode_json(text)
+  local ok, decoded = pcall(vim.json.decode, tostring(text or ""))
+  if ok and type(decoded) == "table" then return decoded end
+  return nil
+end
+
+---@param raw table
+---@param fallback? string[]
+---@return DiffReviewGhRequestedReviewer[]
+local function normalize_requested_reviewers(raw, fallback)
+  local reviewers = {}
+  local seen = {}
+
+  ---@param login any
+  ---@param metadata? table
+  local function add_login(login, metadata)
+    local username = tostring(login or ""):gsub("^@", "")
+    if username == "" then return end
+    local key = username:lower()
+    local existing_index = seen[key]
+    if existing_index then
+      local existing = reviewers[existing_index]
+      if metadata and metadata.is_code_owner then existing.is_code_owner = true end
+      if metadata and metadata.kind and not existing.kind then existing.kind = metadata.kind end
+      return
+    end
+    seen[key] = #reviewers + 1
+    reviewers[#reviewers + 1] = {
+      login = username,
+      is_code_owner = metadata and metadata.is_code_owner or nil,
+      kind = metadata and metadata.kind or nil,
+    }
+  end
+
+  ---@param value any
+  ---@param inherited? table
+  ---@return table
+  local function reviewer_metadata(value, inherited)
+    local metadata = {
+      is_code_owner = inherited and inherited.is_code_owner or nil,
+      kind = inherited and inherited.kind or nil,
+    }
+    if type(value) ~= "table" then return metadata end
+    if value.is_code_owner == true
+      or value.isCodeOwner == true
+      or value.asCodeOwner == true
+      or value.codeOwner == true
+      or tostring(value.reason or ""):upper() == "CODEOWNER"
+      or tostring(value.source or ""):upper() == "CODEOWNER"
+    then
+      metadata.is_code_owner = true
+    end
+    local kind = value.kind or value.type or value.__typename
+    if type(kind) == "string" and kind ~= "" then metadata.kind = kind end
+    return metadata
+  end
+
+  ---@param value any
+  ---@param inherited? table
+  local function collect(value, inherited)
+    local metadata = reviewer_metadata(value, inherited)
+    if type(value) == "string" then
+      add_login(value, metadata)
+      return
+    end
+    if type(value) ~= "table" then return end
+    if type(value.login) == "string" then
+      add_login(value.login, metadata)
+      return
+    end
+    if type(value.slug) == "string" then
+      add_login(value.slug, metadata)
+      return
+    end
+    if value.requestedReviewer then collect(value.requestedReviewer, metadata) end
+    if value.requested_reviewer then collect(value.requested_reviewer, metadata) end
+    if type(value.nodes) == "table" then collect(value.nodes, metadata) end
+    if type(value.edges) == "table" then collect(value.edges, metadata) end
+    if type(value.node) == "table" then collect(value.node, metadata) end
+    for _, item in ipairs(value) do
+      collect(item, metadata)
+    end
+  end
+
+  if type(raw) == "table" then
+    collect(raw.requested_reviewers)
+    collect(raw.requestedReviewers)
+    collect(raw.reviewRequests)
+  end
+  if #reviewers == 0 then collect(fallback or {}) end
+  return reviewers
+end
+
+---@param raw table?
+---@return DiffReviewGhMilestone?
+local function normalize_milestone(raw)
+  if type(raw) ~= "table" then return nil end
+  local title = tostring(raw.title or "")
+  if title == "" then return nil end
+  return {
+    number = as_integer(raw.number),
+    title = title,
+    state = raw.state,
+    url = raw.html_url or raw.url,
+  }
+end
+
+---@param decoded any
+---@return DiffReviewGhMilestone[]
+local function normalize_milestones(decoded)
+  local milestones = {}
+  local function collect(value)
+    if type(value) ~= "table" then return end
+    local milestone = normalize_milestone(value)
+    if milestone then
+      milestones[#milestones + 1] = milestone
+      return
+    end
+    for _, item in ipairs(value) do
+      collect(item)
+    end
+  end
+  collect(decoded)
+  return milestones
+end
+
 ---@param raw table
 ---@param repo? string
 ---@return DiffReviewGhPR
@@ -280,6 +435,7 @@ local function normalize_pr(raw, repo)
 
   local normalized_repo = repo or M.repo_from_pr_url(raw.url)
   return {
+    id = type(raw.id) == "string" and raw.id or nil,
     number = as_integer(raw.number),
     title = tostring(raw.title or ""),
     body = tostring(raw.body or ""),
@@ -292,6 +448,9 @@ local function normalize_pr(raw, repo)
     changedFiles = as_integer(raw.changedFiles),
     additions = as_integer(raw.additions),
     deletions = as_integer(raw.deletions),
+    requestedReviewers = normalize_requested_reviewers(raw),
+    milestone = normalize_milestone(raw.milestone),
+    isDraft = raw.isDraft == true or raw.is_draft == true,
   }
 end
 
@@ -402,6 +561,14 @@ end
 
 ---@class DiffReviewGhRequestReviewersResult
 ---@field ok boolean
+---@field reviewers? DiffReviewGhRequestedReviewer[]
+---@field message? string
+---@field code? integer
+
+---@class DiffReviewGhMilestonesResult
+---@field ok boolean
+---@field milestones? DiffReviewGhMilestone[]
+---@field milestone? DiffReviewGhMilestone
 ---@field message? string
 ---@field code? integer
 
@@ -456,6 +623,22 @@ local function issue_comments_api_path(number, repo)
   return ("/repos/%s/issues/%s/comments"):format(owner_repo, tostring(number))
 end
 
+---@param repo? string
+---@param resource string
+---@return string
+local function repo_api_path(repo, resource)
+  local owner_repo = (repo and repo ~= "") and repo or "{owner}/{repo}"
+  return ("/repos/%s/%s"):format(owner_repo, resource)
+end
+
+---@param number integer|string
+---@param repo? string
+---@return string
+local function issue_api_path(number, repo)
+  local owner_repo = (repo and repo ~= "") and repo or "{owner}/{repo}"
+  return ("/repos/%s/issues/%s"):format(owner_repo, tostring(number))
+end
+
 ---@param cwd string
 ---@param number integer|string
 ---@param repo? string
@@ -468,7 +651,78 @@ function M.request_reviewers_async(cwd, number, repo, reviewers, cb)
       cb({ ok = false, message = result.output ~= "" and result.output or ("gh exited " .. tostring(result.code)), code = result.code })
       return
     end
-    cb({ ok = true })
+    cb({ ok = true, reviewers = normalize_requested_reviewers(decode_json(result.stdout) or {}, reviewers) })
+  end)
+end
+
+---@param cwd string
+---@param number integer|string
+---@param repo? string
+---@param reviewers string[]
+---@param cb fun(result: DiffReviewGhRequestReviewersResult)
+function M.remove_reviewers_async(cwd, number, repo, reviewers, cb)
+  local payload = { reviewers = reviewers or {} }
+  system_text_async({ "gh", "api", "--method", "DELETE", pr_api_path(number, repo, "requested_reviewers"), "--input", "-" }, vim.json.encode(payload), cwd, function(result)
+    if result.code ~= 0 then
+      cb({ ok = false, message = result.output ~= "" and result.output or ("gh exited " .. tostring(result.code)), code = result.code })
+      return
+    end
+    cb({ ok = true, reviewers = normalize_requested_reviewers(decode_json(result.stdout) or {}) })
+  end)
+end
+
+---@param cwd string
+---@param repo? string
+---@param cb fun(result: DiffReviewGhMilestonesResult)
+function M.repo_milestones_async(cwd, repo, cb)
+  local command = { "gh", "api", repo_api_path(repo, "milestones?state=all&per_page=100"), "--paginate", "--slurp" }
+  system_text_async(command, nil, cwd, function(result)
+    if result.code ~= 0 then
+      cb({ ok = false, message = result.output ~= "" and result.output or ("gh exited " .. tostring(result.code)), code = result.code })
+      return
+    end
+    local decoded = decode_json(result.stdout)
+    if not decoded then
+      cb({ ok = false, message = "gh api returned invalid milestones JSON", code = result.code })
+      return
+    end
+    cb({ ok = true, milestones = normalize_milestones(decoded) })
+  end)
+end
+
+---@param cwd string
+---@param repo? string
+---@param title string
+---@param cb fun(result: DiffReviewGhMilestonesResult)
+function M.create_milestone_async(cwd, repo, title, cb)
+  system_text_async({ "gh", "api", "--method", "POST", repo_api_path(repo, "milestones"), "--input", "-" }, vim.json.encode({ title = title }), cwd, function(result)
+    if result.code ~= 0 then
+      cb({ ok = false, message = result.output ~= "" and result.output or ("gh exited " .. tostring(result.code)), code = result.code })
+      return
+    end
+    local milestone = normalize_milestone(decode_json(result.stdout))
+    if not milestone then
+      cb({ ok = false, message = "gh api returned invalid milestone JSON", code = result.code })
+      return
+    end
+    cb({ ok = true, milestone = milestone })
+  end)
+end
+
+---@param cwd string
+---@param number integer|string
+---@param repo? string
+---@param milestone_number integer?
+---@param cb fun(result: DiffReviewGhMilestonesResult)
+function M.set_pr_milestone_async(cwd, number, repo, milestone_number, cb)
+  local payload = { milestone = milestone_number or vim.NIL }
+  system_text_async({ "gh", "api", "--method", "PATCH", issue_api_path(number, repo), "--input", "-" }, vim.json.encode(payload), cwd, function(result)
+    if result.code ~= 0 then
+      cb({ ok = false, message = result.output ~= "" and result.output or ("gh exited " .. tostring(result.code)), code = result.code })
+      return
+    end
+    local decoded = decode_json(result.stdout)
+    cb({ ok = true, milestone = normalize_milestone(decoded and decoded.milestone) })
   end)
 end
 
@@ -478,14 +732,6 @@ end
 local function issue_comment_api_path(comment_id, repo)
   local owner_repo = (repo and repo ~= "") and repo or "{owner}/{repo}"
   return ("/repos/%s/issues/comments/%s"):format(owner_repo, tostring(comment_id))
-end
-
----@param text string
----@return table?
-local function decode_json(text)
-  local ok, decoded = pcall(vim.json.decode, tostring(text or ""))
-  if ok and type(decoded) == "table" then return decoded end
-  return nil
 end
 
 ---@param cwd string
@@ -542,33 +788,20 @@ end
 ---@param repo string
 ---@param cb fun(result: DiffReviewGhRepoContributorsResult)
 function M.repo_contributors_async(cwd, repo, cb)
-  system_text_async({ "gh", "api", "/repos/" .. repo .. "/contributors", "--paginate", "--slurp" }, nil, cwd, function(result)
-    if result.code ~= 0 then
-      cb({ ok = false, message = result.output ~= "" and result.output or ("gh exited " .. tostring(result.code)), code = result.code })
-      return
-    end
-    local decoded = decode_json(result.stdout)
-    if type(decoded) ~= "table" then
-      cb({ ok = false, message = "gh api returned invalid contributors JSON", code = result.code })
-      return
-    end
-    local contributors = {}
-    local function collect(raw)
-      if type(raw) ~= "table" then return end
-      if type(raw.login) == "string" and raw.login ~= "" then
-        contributors[#contributors + 1] = {
-          login = raw.login,
-          name = type(raw.name) == "string" and raw.name or nil,
-        }
-        return
-      end
-      for _, item in ipairs(raw) do collect(item) end
-    end
-    for _, raw in ipairs(decoded) do
-      collect(raw)
-    end
-    cb({ ok = true, contributors = contributors })
-  end)
+  repo_users.fetch_async({
+    cwd = cwd,
+    repo = repo,
+    system_async = system_text_async,
+    decode_json = function(stdout)
+      local decoded = decode_json(stdout)
+      if type(decoded) ~= "table" then return nil, "gh api returned invalid JSON" end
+      return decoded, nil
+    end,
+    result_error = function(result)
+      return result.output ~= "" and result.output or ("gh exited " .. tostring(result.code))
+    end,
+    callback = cb,
+  })
 end
 
 ---@param repo? string
@@ -714,6 +947,41 @@ local function graphql_async(query, variables, cwd, cb)
     query = query,
     variables = variables,
   }), cwd, cb)
+end
+
+---@param cwd string
+---@param pr_node_id string
+---@param draft boolean
+---@param cb fun(result: DiffReviewGhPrDraftResult)
+function M.set_pr_draft_async(cwd, pr_node_id, draft, cb)
+  if type(pr_node_id) ~= "string" or pr_node_id == "" then
+    cb({ ok = false, message = "PR draft status update requires a pull request node id", code = 1 })
+    return
+  end
+
+  local mutation = draft and "convertPullRequestToDraft" or "markPullRequestReadyForReview"
+  local input_type = draft and "ConvertPullRequestToDraftInput" or "MarkPullRequestReadyForReviewInput"
+  local query = table.concat({
+    ("mutation($input:%s!) {"):format(input_type),
+    ("  %s(input:$input) {"):format(mutation),
+    "    pullRequest { id isDraft }",
+    "  }",
+    "}",
+  }, "\n")
+
+  graphql_async(query, { input = { pullRequestId = pr_node_id } }, cwd, function(result)
+    if result.code ~= 0 then
+      cb({ ok = false, message = result.output ~= "" and result.output or ("gh exited " .. tostring(result.code)), code = result.code })
+      return
+    end
+    local decoded = decode_json(result.stdout)
+    local pull_request = decoded and decoded.data and decoded.data[mutation] and decoded.data[mutation].pullRequest
+    if type(pull_request) ~= "table" then
+      cb({ ok = false, message = "gh api returned invalid PR draft status JSON", code = result.code })
+      return
+    end
+    cb({ ok = true, is_draft = pull_request.isDraft == true or pull_request.is_draft == true })
+  end)
 end
 
 ---@param cwd string

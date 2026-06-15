@@ -151,8 +151,10 @@ If diagnostics still look wrong, run the linter directly (e.g. `luacheck`,
 - **Modules return a table:** `local M = {}; … return M`. `require` caches in
   `package.loaded`, so later calls get the same table.
 - **Errors:** `pcall`/`xpcall` for protected calls; return `nil, msg` from
-  fallible functions and check the first value; never silently swallow — log at
-  minimum.
+  fallible functions and check the first value. Never silently swallow errors.
+  In editor-facing code, favor loud user-visible notifications (`vim.notify()` or
+  the plugin notification helper) over quiet logs or silent fallbacks so failures
+  are obvious and diagnosable.
 - **LuaJIT hot paths (Neovim runs LuaJIT):** numeric `for` over `pairs()`, keep
   functions monomorphic, avoid creating closures in hot loops, cache `ffi.typeof`
   ctypes.
@@ -166,6 +168,14 @@ If diagnostics still look wrong, run the linter directly (e.g. `luacheck`,
   `vim.keymap.set(..., { desc = … })` (always set `desc`),
   `vim.api.nvim_create_user_command` (handle range/bang/complete).
 - **Messages:** `vim.notify(msg, vim.log.levels.{INFO,WARN,ERROR})`.
+- **Request errors:** every UI-facing request path must explicitly notify
+  failures. This includes external CLIs (`git`, `gh`, `curl`, etc.), API/network
+  calls, LSP-style requests, async metadata loads, completion sources, and
+  background processes. Route nonzero exits, invalid JSON, missing required
+  context, and stale-operation errors through `vim.notify()` or the plugin's
+  notification module with the underlying stderr/API/decode message. Never
+  silently collapse a failed request into an empty list, no-op, stale cache, or
+  endless loading state; tests should cover the notification path.
 - **Async processes:** prefer `vim.system({ ... }, { text = true }, cb)` for
   plugin Git/process work. Do not call `vim.fn.system()`,
   `vim.fn.systemlist()`, or `vim.system(...):wait()` from UI render paths,

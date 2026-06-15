@@ -61,10 +61,11 @@ diff_review.setup({ pr_buffer_name = "DiffReviewPRTest" })
 gh.set_backend({
   system_async = function(command, _, cb)
     local key = command_key(command)
-    if key == "gh\tpr\tview\t" .. created_pr_url .. "\t--json\tnumber,title,body,url,headRefName,headRefOid,commits,files,changedFiles,additions,deletions" then
+    if key == "gh\tpr\tview\t" .. created_pr_url .. "\t--json\tid,number,title,body,url,headRefName,headRefOid,commits,files,changedFiles,additions,deletions,reviewRequests,milestone,isDraft" then
       cb({
         code = 0,
         stdout = vim.json.encode({
+          id = "PR_kwTEST42",
           number = 42,
           title = "feat: create draft pr",
           body = "Created by GithubOpenPR.",
@@ -78,6 +79,9 @@ gh.set_backend({
           changedFiles = 0,
           additions = 0,
           deletions = 0,
+          reviewRequests = {},
+          milestone = vim.NIL,
+          isDraft = true,
         }),
         stderr = "",
         output = "",

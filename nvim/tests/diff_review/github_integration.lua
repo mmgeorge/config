@@ -151,6 +151,7 @@ local gh_backend = {}
 local function pr_json()
   return vim.json.encode({
     number = 42,
+    id = "PR_kwTEST42",
     title = pr_title,
     body = "This PR adds GitHub integration.\n\n- status row\n- PR view",
     url = "https://github.example.test/org/repo/pull/42",
@@ -179,6 +180,17 @@ local function pr_json()
     changedFiles = 2,
     additions = 108,
     deletions = 2,
+    reviewRequests = {
+      {
+        asCodeOwner = true,
+        requestedReviewer = {
+          login = "platform-team",
+          __typename = "Team",
+        },
+      },
+    },
+    milestone = vim.NIL,
+    isDraft = true,
   })
 end
 
@@ -196,7 +208,7 @@ function gh_backend.system_async(command, _, cb, cwd)
   record("gh_system_async", command, cwd)
   vim.defer_fn(function()
     local key = command_key(command)
-    if key == "gh\tpr\tview\t--json\tnumber,title,body,url,headRefName,headRefOid,commits,files,changedFiles,additions,deletions" then
+    if key == "gh\tpr\tview\t--json\tid,number,title,body,url,headRefName,headRefOid,commits,files,changedFiles,additions,deletions,reviewRequests,milestone,isDraft" then
       if hold_pr_lookup then
         release_pr_lookup = function()
           release_pr_lookup = nil
@@ -476,6 +488,10 @@ local function run()
   assert_true(pr_hint:find("q close", 1, true) ~= nil, "PRView missing close hint: " .. pr_hint)
   assert_true(not buffer_contains(pr_buf, "Hint:"), "PRView hint should be a sticky winbar, not buffer text")
   assert_true(buffer_contains(pr_buf, "Title:  Improve DiffReview"), "PRView missing title")
+  assert_true(
+    buffer_contains(pr_buf, "Review: " .. diff_review._pending_review_icon .. " " .. diff_review._codeowner_review_icon .. "@platform-team"),
+    "PRView missing draft codeowner reviewer warning"
+  )
   assert_true(buffer_contains(pr_buf, "Description:"), "PRView missing description heading")
   assert_true(buffer_contains(pr_buf, "- status row"), "PRView missing markdown body")
   assert_true(buffer_contains(pr_buf, "Head:"), "PRView missing head row")

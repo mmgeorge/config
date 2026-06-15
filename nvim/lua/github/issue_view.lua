@@ -29,6 +29,12 @@ local function load_repo_metadata(cwd, repo)
   end)
 end
 
+---@param buf integer
+---@param repo? string
+local function enable_user_completion(buf, repo)
+  require("github.repo_cache").enable_user_completion(buf, repo)
+end
+
 ---@param value string
 ---@return string[]
 local function split_markdown(value)
@@ -86,6 +92,7 @@ local function ensure_buffer()
   vim.bo[buf].bufhidden = "hide"
   vim.bo[buf].swapfile = false
   vim.bo[buf].filetype = "markdown"
+  enable_user_completion(buf, state.repo)
 
   vim.keymap.set("n", "b", function()
     if state.item then gh.open_url(state.item.url) end
@@ -122,7 +129,7 @@ local function on_detail(result)
   state.item = result.item
   if state.item.repo and state.item.repo ~= "" then
     state.repo = state.item.repo
-    if state.buf and vim.api.nvim_buf_is_valid(state.buf) then vim.b[state.buf].github_repo = state.item.repo end
+    if state.buf and vim.api.nvim_buf_is_valid(state.buf) then enable_user_completion(state.buf, state.item.repo) end
     load_repo_metadata(state.cwd, state.item.repo)
   end
   set_lines(render_item(result.item))
@@ -154,7 +161,7 @@ function M.open(opts)
 
   local buf = ensure_buffer()
   if state.repo and state.repo ~= "" then
-    vim.b[buf].github_repo = state.repo
+    enable_user_completion(buf, state.repo)
     load_repo_metadata(state.cwd, state.repo)
   end
   local name = "github://" .. state.kind .. "/" .. (state.repo or "current") .. "/" .. tostring(state.number)

@@ -98,6 +98,8 @@
 ---@field commit? DiffReviewStatusCommit
 ---@field pr_review? DiffReviewGhSubmittedReview
 ---@field pr_comment? DiffReviewGhPendingReviewComment|DiffReviewGhIssueComment
+---@field pr_comment_body? boolean
+---@field pr_comment_body_index? integer
 ---@field pr_comment_reply? DiffReviewGhReviewCommentReply
 ---@field review_comment? table
 ---@field review_reply? table
@@ -178,6 +180,9 @@ local status_diff_hunks_for_file
 local status_open_pr
 M._comment_icon = "󰅺"
 M._reply_icon = "↳"
+M._pending_review_icon = "◷"
+M._codeowner_review_icon = "⚠"
+M._milestone_icon = "◆"
 M._pr_overview = {}
 
 M._hunk_header_ns = vim.api.nvim_create_namespace("diff_review_headers")
@@ -1771,7 +1776,7 @@ end
 function M._apply_status_window_options(win, state)
   if not (win and vim.api.nvim_win_is_valid(win)) then return end
   M._hide_line_numbers(win)
-  local soft_wrap = state ~= nil and state.view_kind == "review"
+  local soft_wrap = state ~= nil and (state.view_kind == "review" or state.view_kind == "pr")
   vim.wo[win].wrap = soft_wrap
   vim.wo[win].linebreak = soft_wrap
   vim.wo[win].breakindent = soft_wrap
@@ -3812,13 +3817,21 @@ function M._pr_overview.comment_author(comment)
 end
 
 ---@param comment table
+---@param expanded? boolean
 ---@return string
-function M._pr_overview.issue_comment_line(comment)
+function M._pr_overview.issue_comment_line(comment, expanded)
   local datetime = M._pr_overview.comment_datetime(comment.updated_at or comment.created_at)
   local prefix = ("%s %s"):format(M._comment_icon, M._pr_overview.comment_author(comment))
   if datetime ~= "" then prefix = prefix .. " | " .. datetime end
-  local preview = M._pr_overview.comment_preview(comment.body or "")
-  if preview ~= "" then prefix = prefix .. " | " .. preview end
+  if not expanded then
+    local preview = M._pr_overview.comment_preview(comment.body or "")
+    if M._review and M._review.truncate_preview_text and M._review.comment_rule_width then
+      local preview_prefix = prefix .. " | "
+      local preview_width = math.max(0, M._review.comment_rule_width(nil, nil) - vim.fn.strdisplaywidth(preview_prefix))
+      preview = M._review.truncate_preview_text(preview, preview_width)
+    end
+    if preview ~= "" then prefix = prefix .. " | " .. preview end
+  end
   return prefix
 end
 
@@ -3849,9 +3862,114 @@ local function status_pr_head_subject(pr)
   return commit and commit.messageHeadline or ""
 end
 
+---@param username string
+---@return string
+function M._pr_overview.reviewer_token(username)
+  return "@" .. tostring(username or ""):gsub("^@", "")
+end
+
+---@param reviewer any
+---@return string
+function M._pr_overview.reviewer_login(reviewer)
+  if type(reviewer) == "table" then
+    return tostring(reviewer.login or reviewer.slug or reviewer.name or ""):gsub("^@", "")
+  end
+  return tostring(reviewer or ""):gsub("^@", "")
+end
+
+---@param reviewer any
+---@return boolean
+function M._pr_overview.reviewer_is_code_owner(reviewer)
+  return type(reviewer) == "table" and reviewer.is_code_owner == true
+end
+
+---@param login string
+---@param is_code_owner boolean?
+---@return DiffReviewGhRequestedReviewer
+function M._pr_overview.reviewer_entry(login, is_code_owner)
+  return {
+    login = tostring(login or ""):gsub("^@", ""),
+    is_code_owner = is_code_owner or nil,
+  }
+end
+
+---@param reviewers any[]?
+---@param out DiffReviewGhRequestedReviewer[]
+---@param seen table<string, boolean>
+function M._pr_overview.add_reviewers(reviewers, out, seen)
+  for _, reviewer in ipairs(reviewers or {}) do
+    local username = M._pr_overview.reviewer_login(reviewer)
+    local key = username:lower()
+    if username ~= "" and not seen[key] then
+      seen[key] = true
+      out[#out + 1] = M._pr_overview.reviewer_entry(username, M._pr_overview.reviewer_is_code_owner(reviewer))
+    elseif username ~= "" and M._pr_overview.reviewer_is_code_owner(reviewer) then
+      for _, existing in ipairs(out) do
+        if M._pr_overview.reviewer_login(existing):lower() == key then
+          existing.is_code_owner = true
+          break
+        end
+      end
+    end
+  end
+end
+
 ---@param pr DiffReviewGhPR
+---@param status table?
+---@return DiffReviewGhRequestedReviewer[]
+function M._pr_overview.pending_reviewers(pr, status)
+  local reviewers = {}
+  local seen = {}
+  M._pr_overview.add_reviewers(pr and pr.requestedReviewers or nil, reviewers, seen)
+  local edit_state = status and status.pr_edit or nil
+  M._pr_overview.add_reviewers(edit_state and edit_state.pending_reviewers or nil, reviewers, seen)
+  return reviewers
+end
+
+---@param pr DiffReviewGhPR
+---@param status table?
+---@return string
+function M._pr_overview.pending_review_text(pr, status)
+  local reviewers = M._pr_overview.pending_reviewers(pr, status)
+  if #reviewers == 0 then return "" end
+  local tokens = { M._pending_review_icon }
+  for _, reviewer in ipairs(reviewers) do
+    local token = M._pr_overview.reviewer_token(M._pr_overview.reviewer_login(reviewer))
+    if pr and pr.isDraft and M._pr_overview.reviewer_is_code_owner(reviewer) then
+      token = M._codeowner_review_icon .. token
+    end
+    tokens[#tokens + 1] = token
+  end
+  return table.concat(tokens, " ")
+end
+
+---@param pr DiffReviewGhPR?
+---@return string
+function M._pr_overview.milestone_title(pr)
+  local milestone = pr and pr.milestone or nil
+  if type(milestone) == "table" then return vim.trim(tostring(milestone.title or "")) end
+  if type(milestone) == "string" then return vim.trim(milestone) end
+  return ""
+end
+
+---@param pr DiffReviewGhPR?
+---@return string
+function M._pr_overview.milestone_text(pr)
+  local title = M._pr_overview.milestone_title(pr)
+  if title == "" then return "" end
+  return ("%s %s"):format(M._milestone_icon, title)
+end
+
+---@param pr DiffReviewGhPR?
+---@return string
+function M._pr_overview.status_text(pr)
+  return pr and pr.isDraft and "DRAFT" or "READY"
+end
+
+---@param pr DiffReviewGhPR
+---@param status table?
 ---@return DiffReviewStatusHeadLine[]
-local function status_pr_detail_head_lines(pr)
+local function status_pr_detail_head_lines(pr, status)
   local title = pr.title ~= "" and pr.title or ("PR #" .. tostring(pr.number))
   local lines = {
     { segments = { { "Title:  ", "DiffReviewStatusLabel" }, { title, "DiffReviewStatusPath" } } },
@@ -3865,7 +3983,25 @@ local function status_pr_detail_head_lines(pr)
   if pr.url and pr.url ~= "" then
     lines[#lines + 1] = { segments = { { "URL:    ", "DiffReviewStatusLabel" }, { pr.url, "DiffReviewStatusPR" } } }
   end
-  lines[#lines + 1] = { segments = { { "Review: ", "DiffReviewStatusLabel" } } }
+  lines[#lines + 1] = {
+    segments = {
+      { "Milestone: ", "DiffReviewStatusLabel" },
+      { M._pr_overview.milestone_text(pr), "DiffReviewStatusBranch" },
+    },
+  }
+  local pending_review_text = M._pr_overview.pending_review_text(pr, status)
+  lines[#lines + 1] = {
+    segments = {
+      { "Review: ", "DiffReviewStatusLabel" },
+      { pending_review_text, "DiffReviewReviewPending" },
+    },
+  }
+  lines[#lines + 1] = {
+    segments = {
+      { "Status: ", "DiffReviewStatusLabel" },
+      { M._pr_overview.status_text(pr), pr.isDraft and "DiffReviewStatusFetching" or "DiffReviewStatusBranch" },
+    },
+  }
   lines[#lines + 1] = { segments = { { "" } } }
   lines[#lines + 1] = { segments = { { "Description:", "DiffReviewStatusHeader" } } }
   for _, line in ipairs(status_markdown_lines(pr.body)) do
@@ -5710,14 +5846,29 @@ function M._pr_overview.render_issue_comment(comment, index)
     return
   end
 
-  local line = M._pr_overview.issue_comment_line(comment)
+  local entry_id = M._pr_overview.issue_comment_entry_id(comment, index)
+  local expanded = not status_folded(entry_id, true)
+  local line = M._pr_overview.issue_comment_line(comment, expanded)
   local entry = {
-    id = M._pr_overview.issue_comment_entry_id(comment, index),
+    id = entry_id,
     kind = "pr_comment",
     pr_comment = comment,
   }
   local line_number = status_add_line(line, entry, "DiffReviewReviewComment")
   status_add_highlight(line_number, 0, #line, "DiffReviewReviewComment")
+  if not expanded then return end
+
+  for body_index, body_line_text in ipairs(M._review.comment_body_lines(comment.body or "")) do
+    local body_entry = {
+      id = entry_id,
+      kind = "pr_comment",
+      pr_comment = comment,
+      pr_comment_body = true,
+      pr_comment_body_index = body_index,
+    }
+    local body_line = status_add_line(body_line_text, body_entry)
+    if body_line_text ~= "" then status_add_highlight(body_line, 0, #body_line_text, "DiffReviewReviewComment") end
+  end
 end
 
 ---@param comments table[]
@@ -6623,7 +6774,7 @@ local function render_pr_status(pr, cwd, buf, diff_text)
   status.pr_standalone_comments = status.pr_standalone_comments or {}
   status.pr_regular_comments = status.pr_regular_comments or {}
   M._pr_overview.refresh_editable_comments(status)
-  status.head_lines = status_pr_detail_head_lines(pr)
+  status.head_lines = status_pr_detail_head_lines(pr, status)
   status.sections = status_pr_sections(cwd, pr, diff_text, status.pr_comments, status.pr_standalone_comments, status.pr_regular_comments)
   status.fancy_rows = {}
   status.pr_code_comments_by_anchor = M._section_builder.comment_anchor_index_from_sections(status.sections, { field = "pr_comments" })
@@ -9004,7 +9155,7 @@ end
 function M._pr_overview.refresh_modified(buf)
   local status = M._pr_overview.state(buf)
   if not status or not vim.api.nvim_buf_is_valid(buf) then return end
-  local title_dirty, desc_dirty = M._pr_edit.dirty_flags(buf, status)
+  local title_dirty, desc_dirty, review_dirty, milestone_dirty = M._pr_edit.dirty_flags(buf, status)
   local comments_dirty = false
   for _, comment in ipairs(status.review_comments or {}) do
     if M._review.comment_needs_sync(comment) then
@@ -9012,7 +9163,7 @@ function M._pr_overview.refresh_modified(buf)
       break
     end
   end
-  vim.bo[buf].modified = title_dirty or desc_dirty or comments_dirty
+  vim.bo[buf].modified = title_dirty or desc_dirty or review_dirty or milestone_dirty or comments_dirty
 end
 
 ---@param buf integer
@@ -9825,13 +9976,17 @@ M._pr_edit = { ns = vim.api.nvim_create_namespace("diff_review_pr_edit") }
 ---@field running boolean
 ---@field title_mark? integer
 ---@field review_mark? integer
+---@field milestone_mark? integer
+---@field status_mark? integer
 ---@field desc_start_mark? integer
 ---@field desc_end_mark? integer beyond-the-last-body-line mark (end-exclusive)
 ---@field title_marker_id? integer
 ---@field review_marker_id? integer
+---@field milestone_marker_id? integer
 ---@field desc_marker_id? integer
 ---@field lock_initial? boolean
 ---@field initial_cursor_row? integer
+---@field pending_reviewers? DiffReviewGhRequestedReviewer[]
 
 ---@param buf integer
 ---@param id integer?
@@ -9843,24 +9998,47 @@ function M._pr_edit.mark_row(buf, id)
 end
 
 ---@param buf integer
+---@param label_pattern string
+---@return integer? row0
+function M._pr_edit.label_row(buf, label_pattern)
+  if not vim.api.nvim_buf_is_valid(buf) then return nil end
+  for index, line in ipairs(vim.api.nvim_buf_get_lines(buf, 0, -1, false)) do
+    if line:match(label_pattern) then return index - 1 end
+  end
+  return nil
+end
+
+---@param buf integer
+---@param id integer?
+---@param label_pattern string
+---@return integer? row0
+function M._pr_edit.field_row(buf, id, label_pattern)
+  return M._pr_edit.label_row(buf, label_pattern) or M._pr_edit.mark_row(buf, id)
+end
+
+---@param buf integer
 ---@param status table
 ---@return string? title without the "Title:" label
 ---@return string? desc description block joined with newlines
 ---@return string? review reviewer-request field without the "Review:" label
+---@return string? milestone milestone field without the "Milestone:" label or marker icon
 function M._pr_edit.current_values(buf, status)
   local state = status.pr_edit
   if not state then return nil end
-  local title_row0 = M._pr_edit.mark_row(buf, state.title_mark)
-  local review_row0 = M._pr_edit.mark_row(buf, state.review_mark)
+  local title_row0 = M._pr_edit.field_row(buf, state.title_mark, "^Title:")
+  local review_row0 = M._pr_edit.field_row(buf, state.review_mark, "^Review:")
+  local milestone_row0 = M._pr_edit.field_row(buf, state.milestone_mark, "^Milestone:")
   local first0 = M._pr_edit.mark_row(buf, state.desc_start_mark)
   local after0 = M._pr_edit.mark_row(buf, state.desc_end_mark)
-  if not (title_row0 and review_row0 and first0 and after0) then return nil end
+  if not (title_row0 and review_row0 and milestone_row0 and first0 and after0) then return nil end
   local title_line = vim.api.nvim_buf_get_lines(buf, title_row0, title_row0 + 1, false)[1] or ""
   local review_line = vim.api.nvim_buf_get_lines(buf, review_row0, review_row0 + 1, false)[1] or ""
+  local milestone_line = vim.api.nvim_buf_get_lines(buf, milestone_row0, milestone_row0 + 1, false)[1] or ""
   local title = vim.trim((title_line:gsub("^Title:%s*", "")))
   local review = vim.trim((review_line:gsub("^Review:%s*", "")))
+  local milestone = M._pr_edit.milestone_value(milestone_line)
   local desc = table.concat(vim.api.nvim_buf_get_lines(buf, first0, after0, false), "\n")
-  return title, desc, review
+  return title, desc, review, milestone
 end
 
 ---@param buf integer
@@ -9868,26 +10046,32 @@ end
 ---@return boolean title_dirty
 ---@return boolean desc_dirty
 ---@return boolean review_dirty
+---@return boolean milestone_dirty
 function M._pr_edit.dirty_flags(buf, status)
-  local title, desc, review = M._pr_edit.current_values(buf, status)
-  if title == nil or not status.pr then return false, false, false end
+  local title, desc, review, milestone = M._pr_edit.current_values(buf, status)
+  if title == nil or not status.pr then return false, false, false, false end
   local baseline = table.concat(status_markdown_lines(status.pr.body), "\n")
-  return title ~= status.pr.title, desc ~= baseline, vim.trim(review or "") ~= ""
+  return title ~= status.pr.title,
+    desc ~= baseline,
+    M._pr_edit.reviewer_change(status, review).changed,
+    M._pr_edit.milestone_change(status, milestone).changed
 end
 
 ---@param buf integer
 ---@param row integer 1-based cursor row
----@return "title"|"review"|"desc"|nil
+---@return "title"|"review"|"milestone"|"desc"|nil
 function M._pr_edit.region_kind_at(buf, row)
   local status = M._status_states and M._status_states[buf] or nil
   local state = status and status.pr_edit or nil
   if not state then return nil end
-  local title_row0 = M._pr_edit.mark_row(buf, state.title_mark)
-  local review_row0 = M._pr_edit.mark_row(buf, state.review_mark)
+  local title_row0 = M._pr_edit.field_row(buf, state.title_mark, "^Title:")
+  local review_row0 = M._pr_edit.field_row(buf, state.review_mark, "^Review:")
+  local milestone_row0 = M._pr_edit.field_row(buf, state.milestone_mark, "^Milestone:")
   local first0 = M._pr_edit.mark_row(buf, state.desc_start_mark)
   local after0 = M._pr_edit.mark_row(buf, state.desc_end_mark)
   if title_row0 and row == title_row0 + 1 then return "title" end
   if review_row0 and row == review_row0 + 1 then return "review" end
+  if milestone_row0 and row == milestone_row0 + 1 then return "milestone" end
   if first0 and after0 and row >= first0 + 1 and row <= after0 then return "desc" end
   return nil
 end
@@ -9895,7 +10079,7 @@ end
 ---@param buf integer
 ---@param state DiffReviewPrEditState
 function M._pr_edit.clear_markers(buf, state)
-  for _, key in ipairs({ "title_marker_id", "review_marker_id", "desc_marker_id" }) do
+  for _, key in ipairs({ "title_marker_id", "review_marker_id", "milestone_marker_id", "desc_marker_id" }) do
     if state[key] then
       pcall(vim.api.nvim_buf_del_extmark, buf, M._pr_edit.ns, state[key])
       state[key] = nil
@@ -9909,9 +10093,10 @@ function M._pr_edit.refresh_markers(buf)
   local status = M._status_states and M._status_states[buf] or nil
   local state = status and status.pr_edit or nil
   if not (state and vim.api.nvim_buf_is_valid(buf)) then return end
-  local title_dirty, desc_dirty, review_dirty = M._pr_edit.dirty_flags(buf, status)
-  local title_row0 = M._pr_edit.mark_row(buf, state.title_mark)
-  local review_row0 = M._pr_edit.mark_row(buf, state.review_mark)
+  local title_dirty, desc_dirty, review_dirty, milestone_dirty = M._pr_edit.dirty_flags(buf, status)
+  local title_row0 = M._pr_edit.field_row(buf, state.title_mark, "^Title:")
+  local review_row0 = M._pr_edit.field_row(buf, state.review_mark, "^Review:")
+  local milestone_row0 = M._pr_edit.field_row(buf, state.milestone_mark, "^Milestone:")
   local first0 = M._pr_edit.mark_row(buf, state.desc_start_mark)
 
   local function set_marker(key, wanted, row0)
@@ -9929,6 +10114,7 @@ function M._pr_edit.refresh_markers(buf)
 
   set_marker("title_marker_id", title_dirty, title_row0)
   set_marker("review_marker_id", review_dirty, review_row0)
+  set_marker("milestone_marker_id", milestone_dirty, milestone_row0)
   set_marker("desc_marker_id", desc_dirty, first0 and first0 - 1 or nil)
 end
 
@@ -9940,8 +10126,8 @@ function M._pr_edit.blocks_render(buf)
   local status = M._status_states and M._status_states[buf] or nil
   local state = status and status.pr_edit or nil
   if not (state and status.pr and vim.api.nvim_buf_is_valid(buf)) then return false end
-  local title_dirty, desc_dirty, review_dirty = M._pr_edit.dirty_flags(buf, status)
-  if not (title_dirty or desc_dirty or review_dirty) then return false end
+  local title_dirty, desc_dirty, review_dirty, milestone_dirty = M._pr_edit.dirty_flags(buf, status)
+  if not (title_dirty or desc_dirty or review_dirty or milestone_dirty) then return false end
   vim.notify("Unsynced PR edits — :w to sync before refreshing", vim.log.levels.WARN, { title = "DiffReview" })
   return true
 end
@@ -9955,29 +10141,67 @@ function M._pr_edit.on_render(buf)
   local state = status and status.pr_edit or nil
   if not (state and status.pr and vim.api.nvim_buf_is_valid(buf)) then return end
   vim.api.nvim_buf_clear_namespace(buf, M._pr_edit.ns, 0, -1)
-  state.title_mark, state.review_mark, state.desc_start_mark, state.desc_end_mark = nil, nil, nil, nil
-  state.title_marker_id, state.review_marker_id, state.desc_marker_id = nil, nil, nil
+  state.title_mark, state.review_mark, state.milestone_mark, state.status_mark, state.desc_start_mark, state.desc_end_mark = nil, nil, nil, nil, nil, nil
+  state.title_marker_id, state.review_marker_id, state.milestone_marker_id, state.desc_marker_id = nil, nil, nil, nil
 
   local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-  local title_row, review_row, label_row
+  local title_row, review_row, milestone_row, status_row, label_row
   for index, line in ipairs(lines) do
     if not title_row and line:match("^Title:") then title_row = index end
     if not review_row and line:match("^Review:") then review_row = index end
+    if not milestone_row and line:match("^Milestone:") then milestone_row = index end
+    if not status_row and line:match("^Status:") then status_row = index end
     if not label_row and line == "Description:" then label_row = index end
-    if title_row and review_row and label_row then break end
+    if title_row and review_row and milestone_row and status_row and label_row then break end
   end
-  if not (title_row and review_row and label_row) then return end
+  if not (title_row and review_row and milestone_row and status_row and label_row) then return end
 
   -- right_gravity=false: a mark with right gravity slides to the next line
   -- when its own line is replaced (retyped), losing the region.
   local body_count = #status_markdown_lines(status.pr.body)
   state.title_mark = vim.api.nvim_buf_set_extmark(buf, M._pr_edit.ns, title_row - 1, 0, { right_gravity = false })
   state.review_mark = vim.api.nvim_buf_set_extmark(buf, M._pr_edit.ns, review_row - 1, 0, { right_gravity = false })
+  state.milestone_mark = vim.api.nvim_buf_set_extmark(buf, M._pr_edit.ns, milestone_row - 1, 0, { right_gravity = false })
+  state.status_mark = vim.api.nvim_buf_set_extmark(buf, M._pr_edit.ns, status_row - 1, 0, { right_gravity = false })
   state.desc_start_mark = vim.api.nvim_buf_set_extmark(buf, M._pr_edit.ns, label_row, 0, { right_gravity = false })
   state.desc_end_mark = vim.api.nvim_buf_set_extmark(buf, M._pr_edit.ns, label_row + body_count, 0, { right_gravity = false })
   vim.bo[buf].modified = false
   M._pr_edit.refresh_markers(buf)
   M._pr_edit.sync_modifiable(buf)
+end
+
+---@param line string?
+---@return string
+function M._pr_edit.milestone_value(line)
+  local value = vim.trim(tostring(line or ""):gsub("^Milestone:%s*", ""))
+  value = vim.trim(value:gsub("^" .. vim.pesc(M._milestone_icon) .. "%s*", ""))
+  return value
+end
+
+---@param status table
+---@param milestone string?
+---@return { current: string, desired: string, changed: boolean }
+function M._pr_edit.milestone_change(status, milestone)
+  local current = M._pr_overview.milestone_title(status and status.pr or nil)
+  local desired = vim.trim(tostring(milestone or ""))
+  return {
+    current = current,
+    desired = desired,
+    changed = current ~= desired,
+  }
+end
+
+---@param milestones DiffReviewGhMilestone[]?
+---@param title string
+---@return DiffReviewGhMilestone?
+function M._pr_edit.find_milestone(milestones, title)
+  local desired = vim.trim(tostring(title or ""))
+  if desired == "" then return nil end
+  local desired_key = desired:lower()
+  for _, milestone in ipairs(milestones or {}) do
+    if vim.trim(tostring(milestone.title or "")):lower() == desired_key then return milestone end
+  end
+  return nil
 end
 
 ---@param text string?
@@ -9996,18 +10220,190 @@ function M._pr_edit.reviewer_usernames(text)
   return usernames
 end
 
----@param usernames string[]
+---@param reviewers any[]?
+---@return table<string, boolean>
+function M._pr_edit.reviewer_set(reviewers)
+  local set = {}
+  for _, reviewer in ipairs(reviewers or {}) do
+    local username = M._pr_overview.reviewer_login(reviewer)
+    if username ~= "" then set[username:lower()] = true end
+  end
+  return set
+end
+
+---@param status table
+---@param review string?
+---@return { current: DiffReviewGhRequestedReviewer[], desired: string[], add: string[], remove: string[], changed: boolean }
+function M._pr_edit.reviewer_change(status, review)
+  local current = status and status.pr and M._pr_overview.pending_reviewers(status.pr, status) or {}
+  local desired = M._pr_edit.reviewer_usernames(review)
+  local current_set = M._pr_edit.reviewer_set(current)
+  local desired_set = M._pr_edit.reviewer_set(desired)
+  local add = {}
+  local remove = {}
+  for _, reviewer in ipairs(desired) do
+    if not current_set[reviewer:lower()] then add[#add + 1] = reviewer end
+  end
+  for _, reviewer in ipairs(current) do
+    local username = M._pr_overview.reviewer_login(reviewer)
+    if username ~= "" and not desired_set[username:lower()] then remove[#remove + 1] = username end
+  end
+  return {
+    current = current,
+    desired = desired,
+    add = add,
+    remove = remove,
+    changed = #add > 0 or #remove > 0,
+  }
+end
+
+---@param buf integer
+---@param status table
+---@param mark_id integer?
+---@param segments table[]
+---@param label_pattern string?
+---@return integer? row0
+function M._pr_edit.patch_head_field_row(buf, status, mark_id, segments, label_pattern)
+  local state = status and status.pr_edit or nil
+  local row0 = state and M._pr_edit.mark_row(buf, mark_id) or nil
+  if label_pattern and vim.api.nvim_buf_is_valid(buf) then
+    for index, line in ipairs(vim.api.nvim_buf_get_lines(buf, 0, -1, false)) do
+      if line:match(label_pattern) then
+        row0 = index - 1
+        break
+      end
+    end
+  end
+  if not (row0 and status and status.pr and vim.api.nvim_buf_is_valid(buf)) then return end
+  local text, segment_highlights = M._status_segment_line_parts(segments)
+  local was_modifiable = vim.bo[buf].modifiable
+  local was_modified = vim.bo[buf].modified
+  local old_text = vim.api.nvim_buf_get_lines(buf, row0, row0 + 1, false)[1] or ""
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_set_text(buf, row0, 0, row0, #old_text, { text })
+  vim.bo[buf].modifiable = was_modifiable
+  vim.bo[buf].modified = was_modified
+  if status.lines then status.lines[row0 + 1] = text end
+  vim.api.nvim_buf_clear_namespace(buf, M._status_ns, row0, row0 + 1)
+  for _, highlight in ipairs(segment_highlights) do
+    pcall(vim.api.nvim_buf_set_extmark, buf, M._status_ns, row0, highlight.start_col, {
+      end_col = highlight.end_col,
+      hl_group = highlight.hl_group,
+      priority = 90,
+    })
+  end
+  return row0
+end
+
+---@param buf integer
+---@param status table
+function M._pr_edit.patch_review_row(buf, status)
+  local state = status and status.pr_edit or nil
+  local row0 = M._pr_edit.patch_head_field_row(buf, status, state and state.review_mark, {
+    { "Review: ", "DiffReviewStatusLabel" },
+    { M._pr_overview.pending_review_text(status and status.pr or nil, status), "DiffReviewReviewPending" },
+  }, "^Review:")
+  if state and row0 then
+    if state.review_mark then pcall(vim.api.nvim_buf_del_extmark, buf, M._pr_edit.ns, state.review_mark) end
+    state.review_mark = vim.api.nvim_buf_set_extmark(buf, M._pr_edit.ns, row0, 0, { right_gravity = false })
+  end
+end
+
+---@param buf integer
+---@param status table
+function M._pr_edit.patch_milestone_row(buf, status)
+  local state = status and status.pr_edit or nil
+  local row0 = M._pr_edit.patch_head_field_row(buf, status, state and state.milestone_mark, {
+    { "Milestone: ", "DiffReviewStatusLabel" },
+    { M._pr_overview.milestone_text(status and status.pr or nil), "DiffReviewStatusBranch" },
+  }, "^Milestone:")
+  if state and row0 then
+    if state.milestone_mark then pcall(vim.api.nvim_buf_del_extmark, buf, M._pr_edit.ns, state.milestone_mark) end
+    state.milestone_mark = vim.api.nvim_buf_set_extmark(buf, M._pr_edit.ns, row0, 0, { right_gravity = false })
+  end
+end
+
+---@param buf integer
+---@param status table
+function M._pr_edit.patch_status_row(buf, status)
+  local state = status and status.pr_edit or nil
+  local pr = status and status.pr or nil
+  local row0 = M._pr_edit.patch_head_field_row(buf, status, state and state.status_mark, {
+    { "Status: ", "DiffReviewStatusLabel" },
+    { M._pr_overview.status_text(pr), pr and pr.isDraft and "DiffReviewStatusFetching" or "DiffReviewStatusBranch" },
+  }, "^Status:")
+  if state and row0 then
+    if state.status_mark then pcall(vim.api.nvim_buf_del_extmark, buf, M._pr_edit.ns, state.status_mark) end
+    state.status_mark = vim.api.nvim_buf_set_extmark(buf, M._pr_edit.ns, row0, 0, { right_gravity = false })
+  end
+end
+
+---@param buf integer
+---@param status table?
+---@return integer? row0
+function M._pr_edit.status_row(buf, status)
+  local state = status and status.pr_edit or nil
+  return M._pr_edit.field_row(buf, state and state.status_mark, "^Status:")
+end
+
+---@param buf integer
+---@return boolean
+function M._pr_edit.cursor_on_status_value(buf)
+  local status = M._status_states and M._status_states[buf] or M._status
+  local row0 = M._pr_edit.status_row(buf, status)
+  if not row0 then return false end
+  local cursor = vim.api.nvim_win_get_cursor(0)
+  if cursor[1] ~= row0 + 1 then return false end
+  local line = vim.api.nvim_buf_get_lines(buf, row0, row0 + 1, false)[1] or ""
+  local value_start = line:find(M._pr_overview.status_text(status and status.pr or nil), 1, true)
+  return value_start ~= nil and cursor[2] >= value_start - 1
+end
+
+---@param change { add: string[], remove: string[] }
+---@return string[]
+function M._pr_edit.reviewer_change_usernames(change)
+  local usernames = {}
+  local seen = {}
+  for _, list in ipairs({ change.add or {}, change.remove or {} }) do
+    for _, reviewer in ipairs(list) do
+      local username = M._pr_overview.reviewer_login(reviewer)
+      local key = username:lower()
+      if username ~= "" and not seen[key] then
+        seen[key] = true
+        usernames[#usernames + 1] = username
+      end
+    end
+  end
+  return usernames
+end
+
+---@param username string
+---@param users? table<string, DiffReviewGhUser>
+---@return string
+function M._pr_edit.reviewer_display(username, users)
+  local user = users and users[username:lower()] or nil
+  local name = user and vim.trim(user.name or "") or ""
+  if name ~= "" then
+    return ("@%s (%s)"):format(username, name)
+  end
+  return "@" .. username
+end
+
+---@param change { add: string[], remove: string[] }
 ---@param users? table<string, DiffReviewGhUser>
 ---@return string[]
-function M._pr_edit.review_confirmation_lines(usernames, users)
-  local lines = { "Request review from:" }
-  for _, username in ipairs(usernames) do
-    local user = users and users[username:lower()] or nil
-    local name = user and vim.trim(user.name or "") or ""
-    if name ~= "" then
-      lines[#lines + 1] = ("  @%s (%s)"):format(username, name)
-    else
-      lines[#lines + 1] = ("  @%s"):format(username)
+function M._pr_edit.review_change_confirmation_lines(change, users)
+  local lines = { "Confirm review request changes:" }
+  if #(change.remove or {}) > 0 then
+    lines[#lines + 1] = "Remove review request:"
+    for _, username in ipairs(change.remove) do
+      lines[#lines + 1] = "  - " .. M._pr_edit.reviewer_display(username, users)
+    end
+  end
+  if #(change.add or {}) > 0 then
+    lines[#lines + 1] = "Request review:"
+    for _, username in ipairs(change.add) do
+      lines[#lines + 1] = "  + " .. M._pr_edit.reviewer_display(username, users)
     end
   end
   return lines
@@ -10020,66 +10416,339 @@ function M._pr_edit.restore_dirty(buf)
   M._pr_edit.refresh_markers(buf)
 end
 
----@param buf integer
----@param status table
-function M._pr_edit.clear_review_row(buf, status)
-  local state = status and status.pr_edit or nil
-  local review_row0 = state and M._pr_edit.mark_row(buf, state.review_mark) or nil
-  if not (review_row0 and vim.api.nvim_buf_is_valid(buf)) then return end
-  local was_modifiable = vim.bo[buf].modifiable
-  vim.bo[buf].modifiable = true
-  vim.api.nvim_buf_set_lines(buf, review_row0, review_row0 + 1, false, { "Review: " })
-  vim.bo[buf].modifiable = was_modifiable
+---@param change { desired: string[], add: string[], remove: string[] }
+---@return string
+function M._pr_edit.review_change_summary(change)
+  local parts = {}
+  if #(change.remove or {}) > 0 then
+    parts[#parts + 1] = "removed " .. table.concat(vim.tbl_map(function(username) return "@" .. username end, change.remove), ", ")
+  end
+  if #(change.add or {}) > 0 then
+    parts[#parts + 1] = "requested " .. table.concat(vim.tbl_map(function(username) return "@" .. username end, change.add), ", ")
+  end
+  return table.concat(parts, "; ")
 end
 
 ---@param buf integer
 ---@param status table
----@param usernames string[]
+function M._pr_edit.revert_review_row(buf, status)
+  if not (status and status.pr) then return end
+  M._pr_edit.patch_review_row(buf, status)
+  M._pr_edit.refresh_markers(buf)
+  local title_dirty, desc_dirty, review_dirty, milestone_dirty = M._pr_edit.dirty_flags(buf, status)
+  vim.bo[buf].modified = title_dirty or desc_dirty or review_dirty or milestone_dirty
+end
+
+---@param status table
+---@param reviewers any[]?
+function M._pr_edit.set_pending_reviewers(status, reviewers)
+  if not (status and status.pr) then return end
+  local desired = {}
+  local seen = {}
+  M._pr_overview.add_reviewers(reviewers, desired, seen)
+  status.pr.requestedReviewers = desired
+  if status.pr_edit then status.pr_edit.pending_reviewers = nil end
+end
+
+---@param buf integer
+---@param status table
+function M._pr_edit.revert_milestone_row(buf, status)
+  if not (status and status.pr) then return end
+  M._pr_edit.patch_milestone_row(buf, status)
+  M._pr_edit.refresh_markers(buf)
+  local title_dirty, desc_dirty, review_dirty, milestone_dirty = M._pr_edit.dirty_flags(buf, status)
+  vim.bo[buf].modified = title_dirty or desc_dirty or review_dirty or milestone_dirty
+end
+
+---@param status table
+---@param milestone DiffReviewGhMilestone?
+function M._pr_edit.set_pr_milestone(status, milestone)
+  if not (status and status.pr) then return end
+  status.pr.milestone = milestone
+end
+
+---@param buf integer
+---@param status table
+---@param change { desired: string[], add: string[], remove: string[] }
 ---@param done fun(ok: boolean)
-function M._pr_edit.confirm_and_request_reviewers(buf, status, usernames, done)
-  if #usernames == 0 then
-    notify_error("No valid reviewers in Review field", "DiffReview")
-    M._pr_edit.restore_dirty(buf)
+function M._pr_edit.apply_reviewer_change(buf, status, change, done)
+  local latest = M._status_states and M._status_states[buf] or status
+  if not (latest and latest.pr) then
     done(false)
     return
   end
 
+  local function fail(message)
+    notify_error(message, "DiffReview")
+    M._pr_edit.restore_dirty(buf)
+    done(false)
+  end
+
+  local function request_added()
+    if #(change.add or {}) == 0 then
+      M._pr_edit.set_pending_reviewers(latest, change.desired)
+      M._pr_edit.patch_review_row(buf, latest)
+      vim.bo[buf].modified = false
+      M._pr_edit.refresh_markers(buf)
+      vim.notify(("Review requests updated: %s"):format(M._pr_edit.review_change_summary(change)), vim.log.levels.INFO, { title = "DiffReview" })
+      done(true)
+      return
+    end
+    gh.request_reviewers_async(latest.cwd, latest.pr.number, latest.pr.repo, change.add, function(result)
+      if not vim.api.nvim_buf_is_valid(buf) then
+        done(false)
+        return
+      end
+      if not result.ok then
+        fail("GitHub reviewer request failed: " .. (result.message or "gh failed"))
+        return
+      end
+      M._pr_edit.set_pending_reviewers(latest, change.desired)
+      M._pr_edit.patch_review_row(buf, latest)
+      vim.bo[buf].modified = false
+      M._pr_edit.refresh_markers(buf)
+      vim.notify(("Review requests updated: %s"):format(M._pr_edit.review_change_summary(change)), vim.log.levels.INFO, { title = "DiffReview" })
+      done(true)
+    end)
+  end
+
+  if #(change.remove or {}) == 0 then
+    request_added()
+    return
+  end
+  gh.remove_reviewers_async(latest.cwd, latest.pr.number, latest.pr.repo, change.remove, function(result)
+    if not vim.api.nvim_buf_is_valid(buf) then
+      done(false)
+      return
+    end
+    if not result.ok then
+      fail("GitHub reviewer removal failed: " .. (result.message or "gh failed"))
+      return
+    end
+    request_added()
+  end)
+end
+
+---@param change { desired: string[], add: string[], remove: string[] }
+---@param done fun(ok: boolean)
+function M._pr_edit.confirm_and_apply_reviewer_change(buf, status, change, done)
+  if not change.changed then
+    done(false)
+    return
+  end
+
+  local usernames = M._pr_edit.reviewer_change_usernames(change)
   gh.resolve_users_async(status.cwd, usernames, function(user_result)
     if not vim.api.nvim_buf_is_valid(buf) then
       done(false)
       return
     end
-    local lines = M._pr_edit.review_confirmation_lines(usernames, user_result.users or {})
+    local lines = M._pr_edit.review_change_confirmation_lines(change, user_result.users or {})
     confirm(lines, function()
-      local latest = M._status_states and M._status_states[buf] or nil
+      M._pr_edit.apply_reviewer_change(buf, status, change, done)
+    end, function()
+      local latest = M._status_states and M._status_states[buf] or status
+      M._pr_edit.revert_review_row(buf, latest)
+      done(false)
+    end)
+  end)
+end
+
+---@param change { desired: string }
+---@return string[]
+function M._pr_edit.milestone_create_confirmation_lines(change)
+  return {
+    "Milestone not found:",
+    "  " .. change.desired,
+    "",
+    "Create it now?",
+  }
+end
+
+---@param change { desired: string }
+---@return string
+function M._pr_edit.milestone_change_summary(change)
+  if change.desired == "" then return "cleared" end
+  return M._milestone_icon .. " " .. change.desired
+end
+
+---@param buf integer
+---@param status table
+---@param milestone DiffReviewGhMilestone?
+---@param done fun(ok: boolean)
+function M._pr_edit.apply_milestone(buf, status, milestone, done)
+  local latest = M._status_states and M._status_states[buf] or status
+  if not (latest and latest.pr) then
+    done(false)
+    return
+  end
+
+  local milestone_number = milestone and tonumber(milestone.number) or nil
+  if milestone and (not milestone_number or milestone_number <= 0) then
+    notify_error("GitHub milestone is missing its number", "DiffReview")
+    M._pr_edit.restore_dirty(buf)
+    done(false)
+    return
+  end
+
+  gh.set_pr_milestone_async(latest.cwd, latest.pr.number, latest.pr.repo, milestone_number, function(result)
+    if not vim.api.nvim_buf_is_valid(buf) then
+      done(false)
+      return
+    end
+    if not result.ok then
+      notify_error("GitHub milestone update failed: " .. (result.message or "gh failed"), "DiffReview")
+      M._pr_edit.restore_dirty(buf)
+      done(false)
+      return
+    end
+    M._pr_edit.set_pr_milestone(latest, milestone or result.milestone)
+    M._pr_edit.patch_milestone_row(buf, latest)
+    vim.bo[buf].modified = false
+    M._pr_edit.refresh_markers(buf)
+    vim.notify(("Milestone updated: %s"):format(M._pr_edit.milestone_change_summary({
+      desired = M._pr_overview.milestone_title(latest.pr),
+    })), vim.log.levels.INFO, { title = "DiffReview" })
+    done(true)
+  end)
+end
+
+---@param buf integer
+---@param status table
+---@param change { current: string, desired: string, changed: boolean }
+---@param done fun(ok: boolean)
+function M._pr_edit.confirm_and_apply_milestone_change(buf, status, change, done)
+  if not change.changed then
+    done(false)
+    return
+  end
+
+  if change.desired == "" then
+    M._pr_edit.apply_milestone(buf, status, nil, done)
+    return
+  end
+
+  gh.repo_milestones_async(status.cwd, status.pr.repo, function(result)
+    if not vim.api.nvim_buf_is_valid(buf) then
+      done(false)
+      return
+    end
+    if not result.ok then
+      notify_error("GitHub milestones lookup failed: " .. (result.message or "gh failed"), "DiffReview")
+      M._pr_edit.restore_dirty(buf)
+      done(false)
+      return
+    end
+
+    local milestone = M._pr_edit.find_milestone(result.milestones or {}, change.desired)
+    if milestone then
+      M._pr_edit.apply_milestone(buf, status, milestone, done)
+      return
+    end
+
+    confirm(M._pr_edit.milestone_create_confirmation_lines(change), function()
+      local latest = M._status_states and M._status_states[buf] or status
       if not (latest and latest.pr) then
         done(false)
         return
       end
-      gh.request_reviewers_async(latest.cwd, latest.pr.number, latest.pr.repo, usernames, function(result)
+      gh.create_milestone_async(latest.cwd, latest.pr.repo, change.desired, function(create_result)
         if not vim.api.nvim_buf_is_valid(buf) then
           done(false)
           return
         end
-        if not result.ok then
-          notify_error("GitHub reviewer request failed: " .. (result.message or "gh failed"), "DiffReview")
+        if not create_result.ok or not create_result.milestone then
+          notify_error("GitHub milestone create failed: " .. (create_result.message or "gh failed"), "DiffReview")
           M._pr_edit.restore_dirty(buf)
           done(false)
           return
         end
-        M._pr_edit.clear_review_row(buf, latest)
-        vim.bo[buf].modified = false
-        M._pr_edit.refresh_markers(buf)
-        vim.notify(("Requested review from %s"):format(table.concat(vim.tbl_map(function(username)
-          return "@" .. username
-        end, usernames), ", ")), vim.log.levels.INFO, { title = "DiffReview" })
-        done(true)
+        M._pr_edit.apply_milestone(buf, latest, create_result.milestone, done)
       end)
     end, function()
-      M._pr_edit.restore_dirty(buf)
+      local latest = M._status_states and M._status_states[buf] or status
+      M._pr_edit.revert_milestone_row(buf, latest)
       done(false)
     end)
   end)
+end
+
+---@param pr DiffReviewGhPR
+---@param desired_draft boolean
+---@return string[]
+function M._pr_edit.draft_status_confirmation_lines(pr, desired_draft)
+  if desired_draft then
+    return {
+      ("Move PR #%s back to draft?"):format(tostring(pr.number)),
+      "",
+      "Status will change from READY to DRAFT.",
+    }
+  end
+  return {
+    ("Mark PR #%s ready for review?"):format(tostring(pr.number)),
+    "",
+    "Status will change from DRAFT to READY.",
+  }
+end
+
+---@param status table
+---@return string
+function M._pr_edit.pr_node_id(status)
+  local pr = status and status.pr or nil
+  return type(pr and pr.id) == "string" and pr.id or ""
+end
+
+---@param buf integer
+---@param status table
+---@param desired_draft boolean
+---@param done fun(ok: boolean)
+function M._pr_edit.apply_draft_status(buf, status, desired_draft, done)
+  local latest = M._status_states and M._status_states[buf] or status
+  if not (latest and latest.pr) then
+    done(false)
+    return
+  end
+
+  local pr_node_id = M._pr_edit.pr_node_id(latest)
+  if pr_node_id == "" then
+    notify_error("GitHub draft status update failed: missing pull request node id", "DiffReview")
+    done(false)
+    return
+  end
+
+  gh.set_pr_draft_async(latest.cwd, pr_node_id, desired_draft, function(result)
+    if not vim.api.nvim_buf_is_valid(buf) then
+      done(false)
+      return
+    end
+    if not result.ok then
+      notify_error("GitHub draft status update failed: " .. (result.message or "gh failed"), "DiffReview")
+      done(false)
+      return
+    end
+    latest.pr.isDraft = type(result.is_draft) == "boolean" and result.is_draft or desired_draft
+    M._pr_edit.patch_status_row(buf, latest)
+    vim.notify(("PR #%s status updated: %s"):format(tostring(latest.pr.number), M._pr_overview.status_text(latest.pr)), vim.log.levels.INFO, { title = "DiffReview" })
+    done(true)
+  end)
+end
+
+---@param buf integer
+---@return boolean
+function M._pr_edit.toggle_draft_status_under_cursor(buf)
+  if not M._pr_edit.cursor_on_status_value(buf) then return false end
+  local status = M._status_states and M._status_states[buf] or M._status
+  local state = status and status.pr_edit or nil
+  if not (status and status.pr and state) then return true end
+  local desired_draft = not status.pr.isDraft
+  confirm(M._pr_edit.draft_status_confirmation_lines(status.pr, desired_draft), function()
+    M._pr_edit.enqueue(state, function(done)
+      M._pr_edit.apply_draft_status(buf, status, desired_draft, function()
+        done()
+      end)
+    end)
+  end)
+  return true
 end
 
 ---Sequential sync queue, mirroring status_enqueue_operation without its
@@ -10110,10 +10779,15 @@ function M._pr_edit.sync(buf)
   local state = status and status.pr_edit or nil
   if not (status and state and status.pr) then return end
   M._status = status
-  local title, desc, review = M._pr_edit.current_values(buf, status)
-  local title_dirty, desc_dirty, review_dirty = M._pr_edit.dirty_flags(buf, status)
+  local title, desc, review, milestone = M._pr_edit.current_values(buf, status)
+  local title_dirty, desc_dirty, review_dirty, milestone_dirty = M._pr_edit.dirty_flags(buf, status)
   vim.bo[buf].modified = false
-  if not (title_dirty or desc_dirty or review_dirty) then return end
+  if not (title_dirty or desc_dirty or review_dirty or milestone_dirty) then
+    M._pr_edit.patch_review_row(buf, status)
+    M._pr_edit.patch_milestone_row(buf, status)
+    M._pr_edit.patch_status_row(buf, status)
+    return
+  end
 
   M._pr_edit.clear_markers(buf, state)
   local pr = status.pr
@@ -10152,12 +10826,24 @@ function M._pr_edit.sync(buf)
     end)
   end
 
+  local function sync_milestone_then_title_and_description()
+    if milestone_dirty then
+      M._pr_edit.confirm_and_apply_milestone_change(buf, status, M._pr_edit.milestone_change(status, milestone), function(confirmed)
+        if confirmed then sync_title_and_description() end
+      end)
+    else
+      M._pr_edit.patch_milestone_row(buf, status)
+      sync_title_and_description()
+    end
+  end
+
   if review_dirty then
-    M._pr_edit.confirm_and_request_reviewers(buf, status, M._pr_edit.reviewer_usernames(review), function(confirmed)
-      if confirmed then sync_title_and_description() end
+    M._pr_edit.confirm_and_apply_reviewer_change(buf, status, M._pr_edit.reviewer_change(status, review), function(confirmed)
+      if confirmed then sync_milestone_then_title_and_description() end
     end)
   else
-    sync_title_and_description()
+    M._pr_edit.patch_review_row(buf, status)
+    sync_milestone_then_title_and_description()
   end
 end
 
@@ -10193,13 +10879,13 @@ function M._pr_edit.attach(buf)
   if not status then return end
   status.pr_edit = { queue = {}, running = false, lock_initial = true }
   vim.bo[buf].buftype = "acwrite"
-  vim.b[buf].diff_review_pr_reviewer_completion = true
+  require("github.repo_cache").enable_user_completion(buf, status.pr and status.pr.repo or nil)
 
-  -- The title and reviewer request fields are single-line: swallow newline attempts there.
+  -- The title, reviewer request, and milestone fields are single-line: swallow newline attempts there.
   vim.keymap.set("i", "<CR>", function()
     local row = vim.api.nvim_win_get_cursor(0)[1]
     local region = M._pr_edit.region_kind_at(buf, row)
-    if region == "title" or region == "review" then return "" end
+    if region == "title" or region == "review" or region == "milestone" then return "" end
     return vim.api.nvim_replace_termcodes("<CR>", true, false, true)
   end, { buffer = buf, expr = true })
 
@@ -11034,6 +11720,8 @@ local function status_toggle(entry)
     default = true
   elseif entry.kind == "commit" or entry.kind == "commit_file" then
     default = true
+  elseif entry.kind == "pr_comment" and entry.pr_comment and not entry.pr_comment.pr_issue_comment then
+    default = true
   elseif entry.kind == "pr_review" then
     default = true
   elseif entry.kind == "pr_review_file" then
@@ -11233,6 +11921,7 @@ end
 
 ---@param buf integer
 local function setup_status_keymaps(buf)
+  require("github.repo_cache").enable_user_completion(buf)
   local opts = { buffer = buf, silent = true, nowait = true }
   local view_kind = M._status and M._status.view_kind or "status"
   local is_pr_view = view_kind == "pr"
@@ -11359,6 +12048,7 @@ local function setup_status_keymaps(buf)
     end)
     map("open", "n", function()
       if M._status_states and M._status_states[buf] then M._status = M._status_states[buf] end
+      if is_pr_view and M._pr_edit.toggle_draft_status_under_cursor(buf) then return end
       status_jump(status_entry_under_cursor())
     end, "Jump to file")
     map("help", "n", status_show_help)

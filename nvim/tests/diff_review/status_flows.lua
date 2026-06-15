@@ -41,6 +41,18 @@ function gh_backend.system_async(command, _, cb)
     end, 5)
     return
   end
+  if key == "gh\tapi\t/repos/owner/repo/collaborators\t--paginate\t--slurp" then
+    repo_metadata_calls = repo_metadata_calls + 1
+    local stdout = vim.json.encode({
+      {
+        { login = "mgeorge-esri" },
+      },
+    })
+    vim.defer_fn(function()
+      cb({ code = 0, stdout = stdout, stderr = "", output = stdout })
+    end, 5)
+    return
+  end
   gh_calls = gh_calls + 1
   if held_gh_async then
     held_gh_async[#held_gh_async + 1] = function()
@@ -598,7 +610,7 @@ local function run()
   render_and_wait(buf, "mod.txt +1 -1")
   wait_for(function() return gh_calls > 0 end, "initial PR lookup did not run")
   wait_for(function()
-    return repo_metadata_calls >= 2 and #repo_cache.contributors("owner/repo") == 2
+    return repo_metadata_calls >= 3 and #repo_cache.contributors("owner/repo") == 3
   end, "GitStatus did not load repo contributor metadata")
 
   reset_state({ modified = numbered_files("preview-unstaged", 31) })
