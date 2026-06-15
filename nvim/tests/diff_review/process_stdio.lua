@@ -3,6 +3,7 @@ vim.loader.enable(false)
 local diff_review = require("diff_review")
 local ai_commit = require("diff_review.ai_commit")
 local gh = require("diff_review.gh")
+local issue_index = require("github.issue_index")
 
 local original_system = vim.system
 local original_notify = vim.notify
@@ -55,6 +56,27 @@ local function run()
   diff_review.reset_git_backend()
   ai_commit.reset_backend()
   gh.reset_backend()
+  issue_index._reset_for_test()
+  issue_index._set_progress_enabled_for_test(false)
+  issue_index._set_runner_for_test(function(_, _, callback)
+    local stdout = vim.json.encode({})
+    callback({ code = 0, stdout = stdout, stderr = "", output = stdout })
+  end)
+  issue_index._set_gh_runner_for_test(function(_, _, callback)
+    local stdout = vim.json.encode({
+      data = {
+        rateLimit = { remaining = 5000 },
+        repository = {
+          issues = {
+            totalCount = 0,
+            pageInfo = { hasNextPage = false },
+            nodes = {},
+          },
+        },
+      },
+    })
+    callback({ code = 0, stdout = stdout, stderr = "", output = stdout })
+  end)
   vim.notify = function(message, level, opts)
     notifications[#notifications + 1] = {
       message = tostring(message),
@@ -87,7 +109,7 @@ local function run()
   diff_review.setup({
     about_auto_generate = false,
     pr_lookup_mode = "mock-delay",
-    pr_mock_delay_ms = 3000,
+    pr_mock_delay_ms = 10000,
   })
   diff_review.open()
   local buf = vim.api.nvim_get_current_buf()
@@ -103,13 +125,14 @@ local function run()
     ::continue::
   end
   assert_true(checked > 0, "status open did not spawn any DiffReview git process")
-  assert_true(#notifications == 0, "stdio status open should not notify")
+  assert_true(#notifications == 0, "stdio status open should not notify: " .. vim.inspect(notifications))
 end
 
 local ok, err = xpcall(run, debug.traceback)
 diff_review.reset_git_backend()
 ai_commit.reset_backend()
 gh.reset_backend()
+issue_index._reset_for_test()
 vim.system = original_system
 vim.notify = original_notify
 if not ok then

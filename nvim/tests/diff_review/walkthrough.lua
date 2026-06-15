@@ -433,12 +433,12 @@ local function run()
   assert_true(buffer_contains(summary_buf, "rendering."),
     "summary subtask justification continuation missing")
   assert_true(not buffer_contains(summary_buf, "why:"), "summary justification should not render a why label")
-  assert_true(buffer_contains(summary_buf, " 󰈙 file Fixture edits"), "summary group type row missing")
+  assert_true(buffer_contains(summary_buf, " file Fixture edits"), "summary group type row missing")
   assert_true(buffer_contains(summary_buf, "    └─ Rewrite the first fixture file."), "summary subtask row missing")
-  assert_true(buffer_contains(summary_buf, "       └─ Modify 󰙅 Resource a.txt rewrite to rewrite"),
+  assert_true(buffer_contains(summary_buf, "       └─ Modify Resource a.txt rewrite to rewrite"),
     "summary item action row missing display verb")
-  assert_true(buffer_contains(summary_buf, "       └─ Add    󰊕 fn b.txt rewrite to repeat"),
-    "summary add action row should be padded")
+  assert_true(buffer_contains(summary_buf, "       └─ Add fn b.txt rewrite to repeat"),
+    "summary add action row should not be padded")
   assert_true(buffer_contains(summary_buf, "the second line"),
     "summary item inline note prefix missing")
   local item_row = find_row(summary_buf, "a.txt rewrite to rewrite the second line")
@@ -450,21 +450,24 @@ local function run()
     "summary item inline note missing")
   assert_true(buffer_has_highlight(summary_buf, "DiffReviewWalkthroughActionUpdate"), "summary action highlight missing")
   assert_true(buffer_has_highlight(summary_buf, "DiffReviewWalkthroughItemTitle"), "summary item title highlight missing")
-  assert_true(buffer_has_highlight_for_text(summary_buf, "Fixture edits", "󰈙 file", "DiffReviewWalkthroughType"),
+  assert_true(buffer_has_highlight_for_text(summary_buf, "Fixture edits", "file", "DiffReviewWalkthroughType"),
     "summary group type highlight missing")
   assert_true(buffer_has_highlight_for_text(summary_buf, "Fixture edits", "Fixture edits",
     "DiffReviewWalkthroughItemTitle"), "summary group title highlight missing")
+  assert_true(not buffer_contains(summary_buf, "󰈙 file Fixture edits"), "summary should not show group type icon")
   assert_true(not buffer_contains(summary_buf, "File Fixture edits"), "summary should not show group type text")
+  assert_true(not buffer_contains(summary_buf, "󰙅 Resource a.txt rewrite"), "summary should not show item type icon")
+  assert_true(not buffer_contains(summary_buf, "󰊕 fn b.txt rewrite"), "summary should not show function type icon")
   assert_true(not buffer_contains(summary_buf, "Struct a.txt rewrite"), "summary should not show item type text")
   assert_true(not buffer_contains(summary_buf, "struct a.txt rewrite"), "summary should not show fallback type keyword")
   assert_true(buffer_contains(summary_buf, "Resource a.txt rewrite"), "summary should show item subtype text")
   assert_true(not buffer_contains(summary_buf, "Function b.txt rewrite"), "summary should not show function type text")
-  assert_true(buffer_has_highlight_for_text(summary_buf, "a.txt rewrite", "󰙅 Resource",
-    "DiffReviewWalkthroughType"), "summary item type highlight missing")
-  assert_true(buffer_has_highlight_for_text(summary_buf, "b.txt rewrite", "󰊕 fn",
-    "DiffReviewWalkthroughType"), "summary function fallback type highlight missing")
-  assert_true(buffer_has_highlight_for_text(summary_buf, "Modify 󰙅 Resource a.txt rewrite", "Modify",
-    "DiffReviewWalkthroughActionUpdate"), "summary action icon highlight missing")
+  assert_true(buffer_has_highlight_for_text(summary_buf, "a.txt rewrite", "Resource",
+    "DiffReviewWalkthroughActionUpdate"), "summary modified item type should match action highlight")
+  assert_true(buffer_has_highlight_for_text(summary_buf, "b.txt rewrite", "fn",
+    "DiffReviewWalkthroughActionAdd"), "summary added function type should match action highlight")
+  assert_true(buffer_has_highlight_for_text(summary_buf, "Modify Resource a.txt rewrite", "Modify",
+    "DiffReviewWalkthroughActionUpdate"), "summary action highlight missing")
   assert_true(buffer_has_highlight_for_text(summary_buf, "a.txt rewrite", "a.txt rewrite",
     "DiffReviewWalkthroughItemTitle"), "summary item title highlight missing")
   assert_true(not buffer_has_highlight_for_text(summary_buf, "a.txt rewrite to rewrite", "second",
@@ -472,7 +475,7 @@ local function run()
   local action_hl = vim.api.nvim_get_hl(0, { name = "DiffReviewWalkthroughActionUpdate" })
   assert_true(action_hl.italic == true, "summary action highlight should be italic")
   local type_hl = vim.api.nvim_get_hl(0, { name = "DiffReviewWalkthroughType" })
-  assert_true(type_hl.fg == 0x5bff94, "summary type highlight should use config green")
+  assert_true(type_hl.fg == 0x5bff94, "summary group type highlight should use config green")
   local title_hl = vim.api.nvim_get_hl(0, { name = "DiffReviewWalkthroughItemTitle" })
   assert_true(title_hl.bold == true and title_hl.fg == 0xffffff, "summary item title should be bold white")
   assert_true(buffer_has_highlight_for_text(summary_buf, "Reviewers need the fixture story", "Reviewers",

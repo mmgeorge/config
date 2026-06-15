@@ -101,14 +101,13 @@ narrative — use the diff only to confirm files and line numbers.
     as `Modify`.
   - `type`: one of `Class`, `Struct`, `Enum`, `Trait`, `Interface`, `Test`,
     `Config`, `Function`, `Method`, `Constant`, or `Field`.
-    Summary rows render types as an icon plus a lowercase keyword when no
-    `subtype` is set; `Function` and `Method` both render as the function icon
-    plus `fn`.
+    Summary rows render types as a lowercase keyword when no `subtype` is set;
+    `Function` and `Method` both render as `fn`.
   - `subtype`: optional narrower display label such as `Resource`, `Buffer`,
     `Pipeline`, or `Store`. Use it only when the item's base class, trait,
     interface, framework role, or semantic kind can be narrowed down from the
-    code. When present, the summary keeps the icon from `type` but displays
-    `subtype` instead of the base type keyword.
+    code. When present, the summary displays `subtype` instead of the base type
+    keyword.
   - `title`: a concrete story claim or code symbol in the graph.
   - `note`: a short imperative annotation, 50 characters or less, that renders
     after `to` and reads as part of the author's change, e.g.
@@ -136,44 +135,44 @@ narrative — use the diff only to confirm files and line numbers.
 
   1. Let particle spawns choose billboard or model rendering.
    Spawn authors need a stable way to select the rendering path before simulation hands particles to rendering.
-    module PhysicsPlugin
+   module PhysicsPlugin
       └─ Make particle render paths explicit at spawn time.
-         ├─ Add     enum ParticleRenderMode to represent billboard vs model-backed rendering at spawn time
-         └─ Modify 󰙅 struct ParticleSpawn to carry the selected render mode with spawn data
-    module AppBrowserPhysicsDemo
+         ├─ Add enum ParticleRenderMode to represent billboard vs model-backed rendering at spawn time
+         └─ Modify struct ParticleSpawn to carry the selected render mode with spawn data
+   module AppBrowserPhysicsDemo
       └─ Exercise the model-backed path in the drop3d scene.
-         └─ Modify 󰊕 fn drop3d particle spawn to switch the stress scene to SmoothSphere model particles
+         └─ Modify fn drop3d particle spawn to switch the stress scene to SmoothSphere model particles
 
   2. Move live particle data into render-facing resources.
-    module PhysicsPlugin
+   module PhysicsPlugin
       ├─ Own shared particle buffers outside the simulation loop.
-      │  ├─ Add    󰙅 Resource ParticleStorage to own particle GPU buffers and expose a render instance view
-      │  └─ Modify 󰊕 fn ParticleSystem::run() to advance simulation through shared storage and publish the current particle source
+      │  ├─ Add Resource ParticleStorage to own particle GPU buffers and expose a render instance view
+      │  └─ Modify fn ParticleSystem::run() to advance simulation through shared storage and publish the current particle source
       └─ Keep billboard rendering as the legacy render mode.
-         ├─ Modify 󰊕 fn PhysicsPlugin::install() to register shared storage and preserve billboard rendering as its own system
-         └─ Add    󰙅 struct ParticleBillboardRenderSystem to keep the legacy triangle path behind billboard mode
-    module RenderPlugin
+         ├─ Modify fn PhysicsPlugin::install() to register shared storage and preserve billboard rendering as its own system
+         └─ Add struct ParticleBillboardRenderSystem to keep the legacy triangle path behind billboard mode
+   module RenderPlugin
       └─ Publish particle instance sources for render systems.
-         └─ Add    󰙅 Resource ParticleInstanceSources to share live particle buffers and optional model metadata with render systems
+         └─ Add Resource ParticleInstanceSources to share live particle buffers and optional model metadata with render systems
 
   3. Draw the selected model once per live particle through the PBR path.
-    module ModelPlugin
+   module ModelPlugin
       ├─ Bind particle storage during model render passes.
-      │  └─ Add    󰙅 Pipeline ParticlePbRenderPipeline to create the pipeline variant for particle-instanced model draws
+      │  └─ Add Pipeline ParticlePbRenderPipeline to create the pipeline variant for particle-instanced model draws
       └─ Issue PBR draws across the live particle count.
-         ├─ Modify 󰊕 fn ModelRenderSystem::new() to initialize the particle pipeline state
-         ├─ Modify 󰊕 fn ModelRenderSystem::update_entities() to prepare particle model draw commands from the render-facing handoff
-         └─ Modify 󰊕 fn ModelRenderSystem::render() to issue indexed draws across the live particle count
-    module ModelStore
+         ├─ Modify fn ModelRenderSystem::new() to initialize the particle pipeline state
+         ├─ Modify fn ModelRenderSystem::update_entities() to prepare particle model draw commands from the render-facing handoff
+         └─ Modify fn ModelRenderSystem::render() to issue indexed draws across the live particle count
+   module ModelStore
       └─ Reuse primitive and material uploads for particle instances.
-         ├─ Add    󰙅 Command ParticleModelDrawCommand to describe one primitive/material draw for live particle instances
-         ├─ Modify 󰊕 fn ModelStore::insert_particle_model() to reuse model primitives while returning particle draw metadata
-         └─ Modify 󰙅 Store PrimitiveMeshStore to expose primitive buffers in the layout expected by the particle entry point
-   󰈙 file particle_render shaders
+         ├─ Add Command ParticleModelDrawCommand to describe one primitive/material draw for live particle instances
+         ├─ Modify fn ModelStore::insert_particle_model() to reuse model primitives while returning particle draw metadata
+         └─ Modify Store PrimitiveMeshStore to expose primitive buffers in the layout expected by the particle entry point
+   file particle_render shaders
       └─ Share PBR vertex and fragment behavior with particle instances.
-         ├─ Add    󰊕 fn particle_render entry point to draw each live particle as the selected model primitive
-         ├─ Add    󰊕 fn PBR vertex helpers to share vertex-output construction with normal model rendering
-         └─ Add    󰊕 fn PBR fragment helper to share material sampling and lighting
+         ├─ Add fn particle_render entry point to draw each live particle as the selected model primitive
+         ├─ Add fn PBR vertex helpers to share vertex-output construction with normal model rendering
+         └─ Add fn PBR fragment helper to share material sampling and lighting
   ```
 
 ## 3. Schema
@@ -298,7 +297,7 @@ alongside this skill). The schema, inlined:
         "subtype": {
           "type": "string",
           "minLength": 1,
-          "description": "Optional narrower display label such as Resource or Buffer. Use only when the item's base class, trait, interface, framework role, or semantic kind is known; the summary renders this instead of the base type keyword while keeping the icon from type."
+          "description": "Optional narrower display label such as Resource or Buffer. Use only when the item's base class, trait, interface, framework role, or semantic kind is known; the summary renders this instead of the base type keyword."
         },
         "title": {
           "type": "string",
@@ -320,7 +319,7 @@ alongside this skill). The schema, inlined:
     },
     "groupType": {
       "enum": ["Module", "File", "Package", "Directory"],
-      "description": "Broad container-level construct for group headers. The summary renders this as an icon plus a lowercase keyword before the group title."
+      "description": "Broad container-level construct for group headers. The summary renders this as a lowercase keyword before the group title."
     },
     "itemType": {
       "enum": [
@@ -336,7 +335,7 @@ alongside this skill). The schema, inlined:
         "Constant",
         "Field"
       ],
-      "description": "Broad programming construct rendered as an icon plus a lowercase keyword between the action and item title unless subtype is set. Function and Method both render as fn."
+      "description": "Broad programming construct rendered as a lowercase keyword between the action and item title unless subtype is set. Function and Method both render as fn."
     },
     "position": {
       "type": "object",

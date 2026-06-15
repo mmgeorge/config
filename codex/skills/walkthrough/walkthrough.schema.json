@@ -114,7 +114,7 @@
         "subtype": {
           "type": "string",
           "minLength": 1,
-          "description": "Optional narrower display label such as Resource or Buffer. Use only when the item's base class, trait, interface, framework role, or semantic kind is known; the summary renders this instead of the base type keyword while keeping the icon from type."
+          "description": "Optional narrower display label such as Resource or Buffer. Use only when the item's base class, trait, interface, framework role, or semantic kind is known; the summary renders this instead of the base type keyword."
         },
         "title": {
           "type": "string",
@@ -136,7 +136,7 @@
     },
     "groupType": {
       "enum": ["Module", "File", "Package", "Directory"],
-      "description": "Broad container-level construct for group headers. The summary renders this as an icon plus a lowercase keyword before the group title."
+      "description": "Broad container-level construct for group headers. The summary renders this as a lowercase keyword before the group title."
     },
     "itemType": {
       "enum": [
@@ -152,7 +152,7 @@
         "Constant",
         "Field"
       ],
-      "description": "Broad programming construct rendered as an icon plus a lowercase keyword between the action and item title unless subtype is set. Function and Method both render as fn."
+      "description": "Broad programming construct rendered as a lowercase keyword between the action and item title unless subtype is set. Function and Method both render as fn."
     },
     "position": {
       "type": "object",

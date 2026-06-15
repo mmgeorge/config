@@ -203,24 +203,6 @@ local action_highlights = {
   Remove = "DiffReviewWalkthroughActionRemove",
   Split = "DiffReviewWalkthroughActionSplit",
 }
-local type_icons = {
-  Module = "",
-  File = "󰈙",
-  Package = "󰏗",
-  Directory = "󰉋",
-  Class = "󰠱",
-  Struct = "󰙅",
-  Enum = "",
-  Trait = "󰘦",
-  Interface = "",
-  Test = "󰙨",
-  Config = "",
-  Function = "󰊕",
-  Method = "󰊕",
-  Constant = "󰏿",
-  Field = "󰜢",
-}
-
 local action_display_labels = {
   Add = "Add",
   Update = "Modify",
@@ -228,7 +210,6 @@ local action_display_labels = {
   Remove = "Remove",
   Split = "Split",
 }
-local summary_action_width = 6
 
 ---@param is_last boolean
 ---@return string
@@ -246,19 +227,6 @@ end
 ---@return string
 local function format_action(action)
   return action_display_labels[action] or action
-end
-
----@param action string
----@return string
-local function format_summary_action(action)
-  local label = format_action(action)
-  return label .. (" "):rep(math.max(summary_action_width - #label, 0))
-end
-
----@param type_name string
----@return string
-local function format_type_icon(type_name)
-  return type_icons[type_name] or "󰌗"
 end
 
 ---@param type_name string
@@ -283,9 +251,7 @@ end
 local function append_summary_item(lines, item, prefix, is_last)
   lines[#lines + 1] = prefix
     .. tree_branch(is_last)
-    .. format_summary_action(item.action)
-    .. " "
-    .. format_type_icon(item.type)
+    .. format_action(item.action)
     .. " "
     .. format_item_type_label(item.type, item.subtype)
     .. " "
@@ -313,8 +279,8 @@ local function collect_summary_item_specs(tasks)
     end
   end
   table.sort(specs, function(left, right)
-    local left_text = format_type_icon(left.type) .. " " .. left.label .. " " .. left.title
-    local right_text = format_type_icon(right.type) .. " " .. right.label .. " " .. right.title
+    local left_text = left.label .. " " .. left.title
+    local right_text = right.label .. " " .. right.title
     return #left_text > #right_text
   end)
   return specs
@@ -368,12 +334,7 @@ local function build_summary(overview, _root, tasks)
     if task.justification then lines[#lines + 1] = task_body_prefix .. task.justification end
     for _, group in ipairs(task.groups) do
       local group_prefix = task_body_prefix
-      lines[#lines + 1] = group_prefix
-        .. format_type_icon(group.type)
-        .. " "
-        .. format_type_keyword(group.type)
-        .. " "
-        .. group.title
+      lines[#lines + 1] = group_prefix .. format_type_keyword(group.type) .. " " .. group.title
       local subtask_prefix = group_prefix .. "   "
       for subtask_index, subtask in ipairs(group.subtasks) do
         local subtask_is_last = subtask_index == #group.subtasks
@@ -1048,27 +1009,23 @@ end
 ---@return string? group_type
 local function summary_group_type_range(line)
   for _, group_type in ipairs(group_type_order) do
-    local icon = format_type_icon(group_type)
     local keyword = format_type_keyword(group_type)
-    local icon_start_byte = icon ~= "" and line:find(icon, 1, true) or nil
-    local icon_prefix = icon_start_byte and line:sub(1, icon_start_byte - 1) or ""
-    local keyword_start_byte = icon_start_byte and (icon_start_byte + #icon + 1) or nil
-    if icon_start_byte
-        and icon_prefix:match("^%s*$")
-        and line:sub(keyword_start_byte, keyword_start_byte + #keyword - 1) == keyword then
-      local icon_start_col = icon_start_byte - 1
-      return icon_start_col, icon_start_col + #icon + 1 + #keyword, group_type
+    local keyword_start_byte = line:find(keyword .. " ", 1, true)
+    local keyword_prefix = keyword_start_byte and line:sub(1, keyword_start_byte - 1) or ""
+    if keyword_start_byte and keyword_prefix:match("^%s*$") then
+      local keyword_start_col = keyword_start_byte - 1
+      return keyword_start_col, keyword_start_col + #keyword, group_type
     end
   end
   return nil, nil, nil
 end
 
 ---@param line string
----@param group_type string
+---@param _group_type string
 ---@param group_type_highlight_end_col integer
 ---@return integer? start_col 0-based byte column
 ---@return integer? end_col 0-based byte column, exclusive
-local function summary_group_title_range(line, group_type, group_type_highlight_end_col)
+local function summary_group_title_range(line, _group_type, group_type_highlight_end_col)
   local title_start_col = group_type_highlight_end_col + 1
   if title_start_col >= #line then return nil, nil end
   return title_start_col, #line
@@ -1084,30 +1041,27 @@ end
 ---@return integer? type_start_col 0-based byte column
 ---@return string? type_label
 local function summary_item_type_range(line, action_start_col, action, item_specs)
-  local icon_start_byte = action_start_col + #format_summary_action(action) + 2
+  local label_start_byte = action_start_col + #format_action(action) + 2
   for _, spec in ipairs(item_specs or {}) do
-    local icon = format_type_icon(spec.type)
     local label = spec.label
-    local label_start_byte = icon_start_byte + #icon + 1
-    if icon ~= ""
-        and line:sub(icon_start_byte, icon_start_byte + #icon - 1) == icon
-        and line:sub(label_start_byte, label_start_byte + #label - 1) == label then
-      local icon_start_col = icon_start_byte - 1
-      return icon_start_col, icon_start_col + #icon + 1 + #label, spec.type, icon_start_col, label
+    if line:sub(label_start_byte, label_start_byte + #label - 1) == label
+        and line:sub(label_start_byte + #label, label_start_byte + #label) == " " then
+      local label_start_col = label_start_byte - 1
+      return label_start_col, label_start_col + #label, spec.type, label_start_col, label
     end
   end
   return nil, nil, nil, nil, nil
 end
 
 ---@param line string
----@param item_type string
+---@param _item_type string
 ---@param item_type_label string
 ---@param item_type_start_col integer 0-based byte column
 ---@param item_titles string[]
 ---@return integer? start_col 0-based byte column
 ---@return integer? end_col 0-based byte column, exclusive
-local function summary_item_title_range(line, item_type, item_type_label, item_type_start_col, item_titles)
-  local title_start_col = item_type_start_col + #format_type_icon(item_type) + 1 + #item_type_label + 1
+local function summary_item_title_range(line, _item_type, item_type_label, item_type_start_col, item_titles)
+  local title_start_col = item_type_start_col + #item_type_label + 1
   if title_start_col >= #line then return nil, nil end
   local title_and_note = line:sub(title_start_col + 1)
   for _, title in ipairs(item_titles or {}) do
@@ -1210,7 +1164,7 @@ local function apply_summary_highlights(buf, lines, doc)
       if type_start_col and type_end_col then
         pcall(vim.api.nvim_buf_set_extmark, buf, M._ns, row - 1, type_start_col, {
           end_col = type_end_col,
-          hl_group = "DiffReviewWalkthroughType",
+          hl_group = hl_group,
         })
       end
       if item_type and item_type_start_col and item_type_label then
