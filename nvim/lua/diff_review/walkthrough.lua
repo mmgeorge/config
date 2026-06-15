@@ -17,11 +17,45 @@
 ---@field end_pos DiffReviewWalkthroughPosition
 ---@field comment string
 ---@field title? string
+---@field part_index integer
+---@field step_index integer
+---@field label string
+---@field part_title string
+---@field group_title string
+---@field item_marker string
+---@field item_title string
+---@field item_note string
+
+---@class DiffReviewWalkthroughItem
+---@field marker string
+---@field title string
+---@field note string
+---@field steps DiffReviewWalkthroughStep[]
+
+---@class DiffReviewWalkthroughGroup
+---@field title string
+---@field items DiffReviewWalkthroughItem[]
+
+---@class DiffReviewWalkthroughPart
+---@field title string
+---@field groups DiffReviewWalkthroughGroup[]
+
+---@class DiffReviewWalkthroughStepContext
+---@field part_index integer
+---@field step_index integer
+---@field part_title string
+---@field group_title string
+---@field item_marker string
+---@field item_title string
+---@field item_note string
 
 ---@class DiffReviewWalkthroughDoc
 ---@field version integer
+---@field overview string
+---@field root string
 ---@field summary string
 ---@field commit string full sha the walkthrough was generated against
+---@field parts DiffReviewWalkthroughPart[]
 ---@field steps DiffReviewWalkthroughStep[]
 
 ---@alias DiffReviewWalkthroughMatch "exact"|"nearest"|"file_only"|"missing"
@@ -99,6 +133,108 @@ local function parse_position(value)
   return { line = math.floor(line), col = math.floor(col) }
 end
 
+---@param value any
+---@return boolean
+local function is_non_empty_string(value)
+  return type(value) == "string" and vim.trim(value) ~= ""
+end
+
+local walkthrough_legend = "Legend: + new, * modified, ~ removed/split, > ownership moved"
+local valid_item_markers = {
+  ["+"] = true,
+  ["*"] = true,
+  ["~"] = true,
+  [">"] = true,
+}
+
+---@param is_last boolean
+---@return string
+local function tree_branch(is_last)
+  return is_last and "└── " or "├── "
+end
+
+---@param is_last boolean
+---@return string
+local function tree_continuation(is_last)
+  return is_last and "    " or "│   "
+end
+
+---@param overview string
+---@param root string
+---@param parts DiffReviewWalkthroughPart[]
+---@return string
+local function build_summary(overview, root, parts)
+  local lines = {}
+  vim.list_extend(lines, vim.split(vim.trim(overview), "\n", { plain = true }))
+  lines[#lines + 1] = ""
+  lines[#lines + 1] = root
+  for part_index, part in ipairs(parts) do
+    lines[#lines + 1] = tree_branch(part_index == #parts) .. part.title
+  end
+
+  lines[#lines + 1] = ""
+  lines[#lines + 1] = "Major changes:"
+  for part_index, part in ipairs(parts) do
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = ("%d. %s"):format(part_index, part.title)
+    for group_index, group in ipairs(part.groups) do
+      local group_is_last = group_index == #part.groups
+      local group_prefix = "   "
+      lines[#lines + 1] = group_prefix .. tree_branch(group_is_last) .. group.title
+      local item_prefix = group_prefix .. tree_continuation(group_is_last)
+      for item_index, item in ipairs(group.items) do
+        local item_is_last = item_index == #group.items
+        lines[#lines + 1] = item_prefix .. tree_branch(item_is_last) .. item.marker .. item.title
+        lines[#lines + 1] = item_prefix .. tree_continuation(item_is_last) .. item.note
+      end
+    end
+  end
+
+  lines[#lines + 1] = ""
+  lines[#lines + 1] = walkthrough_legend
+  return table.concat(lines, "\n")
+end
+
+---@param raw_step any
+---@param error_prefix string
+---@param context DiffReviewWalkthroughStepContext
+---@return DiffReviewWalkthroughStep? step
+---@return string? error
+local function parse_step(raw_step, error_prefix, context)
+  if type(raw_step) ~= "table" or not is_non_empty_string(raw_step.file) then
+    return nil, error_prefix .. ": missing \"file\""
+  end
+  if not is_non_empty_string(raw_step.comment) then
+    return nil, error_prefix .. ": missing \"comment\""
+  end
+
+  local start_pos = parse_position(raw_step.start)
+  local end_pos = parse_position(raw_step["end"]) or start_pos
+  if not start_pos then
+    return nil, error_prefix .. ": missing or invalid \"start\" position"
+  end
+  ---@cast end_pos DiffReviewWalkthroughPosition
+  if end_pos.line < start_pos.line then
+    end_pos = start_pos
+  end
+
+  return {
+    file = (raw_step.file:gsub("\\", "/")),
+    start_pos = start_pos,
+    end_pos = end_pos,
+    comment = raw_step.comment,
+    title = type(raw_step.title) == "string" and raw_step.title or nil,
+    part_index = context.part_index,
+    step_index = context.step_index,
+    label = ("Part %d.%d"):format(context.part_index, context.step_index),
+    part_title = context.part_title,
+    group_title = context.group_title,
+    item_marker = context.item_marker,
+    item_title = context.item_title,
+    item_note = context.item_note,
+  }
+end
+
 --- Tolerantly validate and normalize a decoded walkthrough document.
 ---@param decoded any
 ---@return DiffReviewWalkthroughDoc? doc
@@ -107,47 +243,115 @@ local function parse_doc(decoded)
   if type(decoded) ~= "table" then
     return nil, "document is not a JSON object"
   end
-  if type(decoded.summary) ~= "string" or vim.trim(decoded.summary) == "" then
-    return nil, "missing or empty \"summary\""
+  if tonumber(decoded.version) ~= 2 then
+    return nil, "unsupported \"version\" (expected 2)"
   end
-  if type(decoded.commit) ~= "string" or not decoded.commit:match("^%x+$") then
+  if not is_non_empty_string(decoded.overview) then
+    return nil, "missing or empty \"overview\""
+  end
+  if not is_non_empty_string(decoded.root) then
+    return nil, "missing or empty \"root\""
+  end
+  if type(decoded.commit) ~= "string" or #decoded.commit ~= 40 or not decoded.commit:match("^%x+$") then
     return nil, "missing or invalid \"commit\" (expected the full HEAD sha)"
   end
-  if type(decoded.steps) ~= "table" or #decoded.steps == 0 then
-    return nil, "missing or empty \"steps\""
+  if type(decoded.parts) ~= "table" or #decoded.parts == 0 then
+    return nil, "missing or empty \"parts\""
   end
 
   ---@type DiffReviewWalkthroughStep[]
   local steps = {}
-  for index, raw_step in ipairs(decoded.steps) do
-    if type(raw_step) ~= "table" or type(raw_step.file) ~= "string" or raw_step.file == "" then
-      return nil, ("step %d: missing \"file\""):format(index)
+  ---@type DiffReviewWalkthroughPart[]
+  local parts = {}
+  for part_index, raw_part in ipairs(decoded.parts) do
+    local part_prefix = ("part %d"):format(part_index)
+    if type(raw_part) ~= "table" or not is_non_empty_string(raw_part.title) then
+      return nil, part_prefix .. ": missing \"title\""
     end
-    if type(raw_step.comment) ~= "string" or vim.trim(raw_step.comment) == "" then
-      return nil, ("step %d: missing \"comment\""):format(index)
+    if type(raw_part.groups) ~= "table" or #raw_part.groups == 0 then
+      return nil, part_prefix .. ": missing or empty \"groups\""
     end
-    local start_pos = parse_position(raw_step.start)
-    local end_pos = parse_position(raw_step["end"]) or start_pos
-    if not start_pos then
-      return nil, ("step %d: missing or invalid \"start\" position"):format(index)
+
+    local part_step_index = 0
+    ---@type DiffReviewWalkthroughGroup[]
+    local groups = {}
+    for group_index, raw_group in ipairs(raw_part.groups) do
+      local group_prefix = ("%s group %d"):format(part_prefix, group_index)
+      if type(raw_group) ~= "table" or not is_non_empty_string(raw_group.title) then
+        return nil, group_prefix .. ": missing \"title\""
+      end
+      if type(raw_group.items) ~= "table" or #raw_group.items == 0 then
+        return nil, group_prefix .. ": missing or empty \"items\""
+      end
+
+      ---@type DiffReviewWalkthroughItem[]
+      local items = {}
+      for item_index, raw_item in ipairs(raw_group.items) do
+        local item_prefix = ("%s item %d"):format(group_prefix, item_index)
+        if type(raw_item) ~= "table" then
+          return nil, item_prefix .. ": missing item object"
+        end
+        if type(raw_item.marker) ~= "string" or not valid_item_markers[raw_item.marker] then
+          return nil, item_prefix .. ": missing or invalid \"marker\""
+        end
+        if not is_non_empty_string(raw_item.title) then
+          return nil, item_prefix .. ": missing \"title\""
+        end
+        if not is_non_empty_string(raw_item.note) then
+          return nil, item_prefix .. ": missing \"note\""
+        end
+        if type(raw_item.steps) ~= "table" or #raw_item.steps == 0 then
+          return nil, item_prefix .. ": missing or empty \"steps\""
+        end
+
+        ---@type DiffReviewWalkthroughStep[]
+        local item_steps = {}
+        for step_offset, raw_step in ipairs(raw_item.steps) do
+          part_step_index = part_step_index + 1
+          local step, parse_error = parse_step(raw_step, ("%s step %d"):format(item_prefix, step_offset), {
+            part_index = part_index,
+            step_index = part_step_index,
+            part_title = raw_part.title,
+            group_title = raw_group.title,
+            item_marker = raw_item.marker,
+            item_title = raw_item.title,
+            item_note = raw_item.note,
+          })
+          if not step then return nil, parse_error end
+          item_steps[#item_steps + 1] = step
+          steps[#steps + 1] = step
+        end
+
+        items[#items + 1] = {
+          marker = raw_item.marker,
+          title = raw_item.title,
+          note = raw_item.note,
+          steps = item_steps,
+        }
+      end
+      groups[#groups + 1] = {
+        title = raw_group.title,
+        items = items,
+      }
     end
-    ---@cast end_pos DiffReviewWalkthroughPosition
-    if end_pos.line < start_pos.line then
-      end_pos = start_pos
+
+    if part_step_index == 0 then
+      return nil, part_prefix .. ": no walkthrough steps"
     end
-    steps[#steps + 1] = {
-      file = (raw_step.file:gsub("\\", "/")),
-      start_pos = start_pos,
-      end_pos = end_pos,
-      comment = raw_step.comment,
-      title = type(raw_step.title) == "string" and raw_step.title or nil,
+
+    parts[#parts + 1] = {
+      title = raw_part.title,
+      groups = groups,
     }
   end
 
   return {
-    version = tonumber(decoded.version) or 1,
-    summary = decoded.summary,
+    version = 2,
+    overview = decoded.overview,
+    root = decoded.root,
+    summary = build_summary(decoded.overview, decoded.root, parts),
     commit = decoded.commit,
+    parts = parts,
     steps = steps,
   }
 end
@@ -343,6 +547,17 @@ local function render_comment_box(mode, step, target, win)
 
   ---@type { text: string, hl: string }[][] content rows (without borders)
   local content = {}
+  for _, line in ipairs(wrap_text(step.part_title, inner_width - 2)) do
+    content[#content + 1] = { text = line, hl = "Title" }
+  end
+  local item_context = ("%s / %s%s"):format(step.group_title, step.item_marker, step.item_title)
+  for _, line in ipairs(wrap_text(item_context, inner_width - 2)) do
+    content[#content + 1] = { text = line, hl = "DiffReviewStatusHint" }
+  end
+  for _, line in ipairs(wrap_text(step.item_note, inner_width - 2)) do
+    content[#content + 1] = { text = line, hl = "DiffReviewStatusHint" }
+  end
+  content[#content + 1] = { text = "", hl = "DiffReviewWalkthroughComment" }
   for _, line in ipairs(wrap_text(step.comment, inner_width - 2)) do
     content[#content + 1] = { text = line, hl = "DiffReviewWalkthroughComment" }
   end
@@ -354,8 +569,9 @@ local function render_comment_box(mode, step, target, win)
   content[#content + 1] = { text = "", hl = "DiffReviewWalkthroughComment" }
   content[#content + 1] = { text = "[z] back  [y] next  [q] quit", hl = "DiffReviewStatusHint" }
 
-  -- Header: "4/15 - title" left-aligned, the file's basename right-aligned.
-  local heading = (" %d/%d%s "):format(mode.index, #mode.doc.steps, step.title and (" - " .. step.title) or "")
+  -- Header: "Part 3.1 - title" left-aligned, the file basename right-aligned.
+  local heading_title = step.title or step.item_title
+  local heading = (" %s%s "):format(step.label, heading_title and (" - " .. heading_title) or "")
   local basename = " " .. (step.file:match("([^/]+)$") or step.file) .. " "
   for _, row in ipairs(content) do
     inner_width = math.max(inner_width, vim.fn.strdisplaywidth(row.text) + 2)

@@ -217,22 +217,57 @@ end
 
 local function valid_doc()
   return {
-    version = 1,
-    summary = "Adds NEW lines to a.txt and b.txt as a walkthrough fixture.\n\nEdit\n  ├── *change() → Result   [a.txt]\n  └── *change() → Result   [b.txt]",
+    version = 2,
+    overview = "Adds NEW lines to a.txt and b.txt as a walkthrough fixture. The structured parts drive both the summary graph and Part N.M comment labels.",
+    root = "Update walkthrough fixture files.",
     commit = head_sha,
-    steps = {
+    parts = {
       {
-        title = "First change",
-        file = "a.txt",
-        start = { line = 2, col = 1 },
-        ["end"] = { line = 2, col = 9 },
-        comment = "The a.txt second line was rewritten to NEW.",
+        title = "Update a.txt through the first part.",
+        groups = {
+          {
+            title = "Fixture edits",
+            items = {
+              {
+                marker = "*",
+                title = "a.txt rewrite",
+                note = "rewrites the second line for the first fixture file",
+                steps = {
+                  {
+                    title = "First change",
+                    file = "a.txt",
+                    start = { line = 2, col = 1 },
+                    ["end"] = { line = 2, col = 9 },
+                    comment = "The a.txt second line was rewritten to NEW.",
+                  },
+                },
+              },
+            },
+          },
+        },
       },
       {
-        file = "b.txt",
-        start = { line = 2, col = 1 },
-        ["end"] = { line = 2, col = 9 },
-        comment = "Same rewrite applied for symmetry.",
+        title = "Update b.txt through the second part.",
+        groups = {
+          {
+            title = "Fixture edits",
+            items = {
+              {
+                marker = "*",
+                title = "b.txt rewrite",
+                note = "repeats the rewrite so navigation crosses parts",
+                steps = {
+                  {
+                    file = "b.txt",
+                    start = { line = 2, col = 1 },
+                    ["end"] = { line = 2, col = 9 },
+                    comment = "Same rewrite applied for symmetry.",
+                  },
+                },
+              },
+            },
+          },
+        },
       },
     },
   }
@@ -274,7 +309,7 @@ local function run()
 
   local summary_buf = start_walkthrough(buf)
   assert_true(not buffer_contains(summary_buf, "WARNING"), "fresh walkthrough should not warn")
-  local diagram_line = "  ├── *change() → Result   [a.txt]"
+  local diagram_line = "├── Update a.txt through the first part."
   for _, line in ipairs(vim.api.nvim_buf_get_lines(summary_buf, 0, -1, false)) do
     if line == diagram_line then
       diagram_line = nil
@@ -282,6 +317,8 @@ local function run()
     end
   end
   assert_true(diagram_line == nil, "summary diagram line was not preserved verbatim")
+  assert_true(buffer_contains(summary_buf, "Major changes:"), "derived summary missing major changes heading")
+  assert_true(buffer_contains(summary_buf, "Legend: + new, * modified, ~ removed/split, > ownership moved"), "derived summary missing legend")
   trigger_buf_mapping(summary_buf, "y")
 
   wait_for(function() return buffer_contains(buf, "NEW a.txt") end, "step 1 did not expand a.txt hunks")
@@ -290,12 +327,15 @@ local function run()
   assert_true(cursor_row == step_row, ("cursor not on step row (expected %d, got %d)"):format(step_row, cursor_row))
   assert_true(walkthrough_extmark_count(buf) > 0, "region extmarks missing")
   assert_true(box_contains(buf, "rewritten to NEW"), "inline comment box missing")
-  assert_true(box_contains(buf, "1/2 - First change"), "inline box heading missing")
+  assert_true(box_contains(buf, "Part 1.1 - First change"), "inline box heading missing")
+  assert_true(box_contains(buf, "Update a.txt through the first part."), "part context missing")
+  assert_true(box_contains(buf, "Fixture edits / *a.txt rewrite"), "group/item context missing")
   assert_true(box_contains(buf, " a.txt "), "file basename missing from the box header")
 
   -- ── navigation: forward to step 2, back, back to summary, quit ────────────
   trigger_buf_mapping(buf, "y")
   wait_for(function() return box_contains(buf, "symmetry") end, "step 2 box did not render")
+  assert_true(box_contains(buf, "Part 2.1 - b.txt rewrite"), "step 2 part label missing")
   assert_true(box_contains(buf, " b.txt "), "step 2 basename missing from the box header")
   local step2_row = find_row(buf, "NEW b.txt")
   cursor_row = vim.api.nvim_win_get_cursor(vim.fn.bufwinid(buf))[1]
@@ -344,18 +384,42 @@ local function run()
 
   -- ── step staleness: nearest line + missing file ───────────────────────────
   local degraded = valid_doc()
-  degraded.steps = {
+  degraded.parts = {
     {
-      file = "a.txt",
-      start = { line = 999, col = 1 },
-      ["end"] = { line = 999, col = 1 },
-      comment = "Stale line reference.",
-    },
-    {
-      file = "gone.txt",
-      start = { line = 1, col = 1 },
-      ["end"] = { line = 1, col = 1 },
-      comment = "File missing from the diff.",
+      title = "Resolve stale walkthrough targets.",
+      groups = {
+        {
+          title = "Stale targets",
+          items = {
+            {
+              marker = "*",
+              title = "Stale line reference",
+              note = "falls back to the nearest rendered line",
+              steps = {
+                {
+                  file = "a.txt",
+                  start = { line = 999, col = 1 },
+                  ["end"] = { line = 999, col = 1 },
+                  comment = "Stale line reference.",
+                },
+              },
+            },
+            {
+              marker = "*",
+              title = "Missing file reference",
+              note = "surfaces a missing-file note instead of failing",
+              steps = {
+                {
+                  file = "gone.txt",
+                  start = { line = 1, col = 1 },
+                  ["end"] = { line = 1, col = 1 },
+                  comment = "File missing from the diff.",
+                },
+              },
+            },
+          },
+        },
+      },
     },
   }
   set_walkthrough_doc(degraded)
@@ -369,20 +433,44 @@ local function run()
 
   -- ── partially staged file + region split across hunks ─────────────────────
   local staged_doc = valid_doc()
-  staged_doc.steps = {
+  staged_doc.parts = {
     {
-      title = "Staged region",
-      file = "c.txt",
-      start = { line = 2, col = 1 },
-      ["end"] = { line = 2, col = 5 },
-      comment = "Lives only in the staged section.",
-    },
-    {
-      title = "Split region",
-      file = "a.txt",
-      start = { line = 5, col = 1 },
-      ["end"] = { line = 11, col = 5 },
-      comment = "Region starts between hunks and ends inside the second hunk.",
+      title = "Resolve staged and split walkthrough regions.",
+      groups = {
+        {
+          title = "Fixture diff sections",
+          items = {
+            {
+              marker = "*",
+              title = "Staged region",
+              note = "anchors a step that only appears in the staged section",
+              steps = {
+                {
+                  title = "Staged region",
+                  file = "c.txt",
+                  start = { line = 2, col = 1 },
+                  ["end"] = { line = 2, col = 5 },
+                  comment = "Lives only in the staged section.",
+                },
+              },
+            },
+            {
+              marker = "*",
+              title = "Split region",
+              note = "anchors at the first rendered row inside a split range",
+              steps = {
+                {
+                  title = "Split region",
+                  file = "a.txt",
+                  start = { line = 5, col = 1 },
+                  ["end"] = { line = 11, col = 5 },
+                  comment = "Region starts between hunks and ends inside the second hunk.",
+                },
+              },
+            },
+          },
+        },
+      },
     },
   }
   set_walkthrough_doc(staged_doc)
@@ -435,7 +523,7 @@ local function run()
   fixtures[root .. "/.walkthrough.json"] = vim.json.encode({ version = 1, summary = "x", commit = "zz", steps = {} })
   captured_notifications = {}
   trigger_buf_mapping(buf, "ow")
-  wait_for(function() return saw_notification_containing(".walkthrough.json:") end, "schema validation notification absent")
+  wait_for(function() return saw_notification_containing("expected 2") end, "v1 rejection notification absent")
 end
 
 local ok, err = xpcall(run, debug.traceback)

@@ -50,21 +50,36 @@ narrative — use the diff only to confirm files and line numbers.
   displays the step's file name, so do not repeat the file path in the
   comment.
 - `title` is an optional short heading (a few words).
-- `summary` is shown before the first step. It is the reviewer's top-down map
-  of the change:
-  1. Open with a 1-3 sentence prose overview explaining what changed and why.
-  2. Add a compact top-level graph rooted at the major feature/fix/refactor.
-     Each child is an active author-context sentence such as `Add...`,
-     `Update...`, `Move...`, `Split...`, `Remove...`, or `Preserve...`.
-  3. Add `Major changes:` and expand each child sentence into a small graph.
-     Group nodes by top-level subsystem/module when that best explains the
-     design, and add short inline annotations that say why the important nodes
-     changed.
-  4. End with `Legend: + new, * modified, ~ removed/split, > ownership moved`.
-  The walkthrough steps already carry exact file and range targets, so do
-  **not** include repo paths or bracketed file names in the summary. Keep graph
-  lines under 76 characters - the reviewer UI preserves preformatted lines
-  verbatim. Example shape:
+- Author the top-down review map as structured `overview`, `root`, and
+  `parts[]`; the DiffReview plugin derives the displayed summary graph from
+  this structure. Do not write a `summary` field.
+- `overview` is 1-3 prose sentences explaining what changed and why.
+- `root` is one active author-context sentence for the major feature/fix/refactor.
+- Each `parts[].title` is an active author-context sentence such as `Add...`,
+  `Update...`, `Move...`, `Split...`, `Remove...`, or `Preserve...`. These
+  titles become the top-level graph children and the `Major changes:` roots.
+- Keep `parts[]` focused on the true major review claims, usually 2-4 entries.
+  Do not promote every meaningful diff cluster into a part. Supporting work
+  like demo wiring, shader helper splits, tests, docs/plans, preservation of an
+  old path, or follow-up notes belongs under the relevant major part unless it
+  is the main purpose of the change.
+- Inside each part, prefer real repo boundaries for group titles: top-level
+  modules, plugins, packages, crates, apps, or stable subsystems. In plugin
+  repos, use plugin names such as `Physics plugin`, `Render plugin`, or
+  `Model plugin` before abstract buckets like `API`, `storage`, or `renderer`.
+  Use abstract group labels only when there is no clearer module boundary.
+  Each item has:
+  - `marker`: `+` new, `*` modified, `~` removed/split, `>` ownership moved.
+  - `title`: the important module/function/concept in the graph.
+  - `note`: a short annotation explaining why it changed. Notes should be
+    descriptive fragments that render cleanly under the item; do not include
+    line breaks, tree characters, file paths, or imperative broken phrases.
+  - `steps`: one or more exact file/range walkthrough comments for that item.
+- Exact file paths and ranges belong only in nested `steps`; do **not** include
+  repo paths or bracketed file names in `overview`, `root`, part titles, group
+  titles, item titles, or item notes. The plugin displays nested steps as
+  `Part X.Y`, where `X` is the part and `Y` is the step within that part.
+  Derived summary example:
 
   ```
   Adds model-backed particle rendering while preserving billboard particles.
@@ -129,19 +144,61 @@ alongside this skill). The schema, inlined:
   "$id": "diff-review-walkthrough.schema.json",
   "title": "DiffReview Walkthrough",
   "type": "object",
-  "required": ["version", "summary", "commit", "steps"],
+  "required": ["version", "overview", "root", "commit", "parts"],
   "additionalProperties": false,
   "properties": {
-    "version": { "const": 1 },
-    "summary": { "type": "string", "minLength": 1 },
+    "version": { "const": 2 },
+    "overview": { "type": "string", "minLength": 1 },
+    "root": { "type": "string", "minLength": 1 },
     "commit": { "type": "string", "pattern": "^[0-9a-fA-F]{40}$" },
-    "steps": {
+    "parts": {
       "type": "array",
       "minItems": 1,
-      "items": { "$ref": "#/$defs/step" }
+      "items": { "$ref": "#/$defs/part" }
     }
   },
   "$defs": {
+    "part": {
+      "type": "object",
+      "required": ["title", "groups"],
+      "additionalProperties": false,
+      "properties": {
+        "title": { "type": "string", "minLength": 1 },
+        "groups": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/group" }
+        }
+      }
+    },
+    "group": {
+      "type": "object",
+      "required": ["title", "items"],
+      "additionalProperties": false,
+      "properties": {
+        "title": { "type": "string", "minLength": 1 },
+        "items": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/item" }
+        }
+      }
+    },
+    "item": {
+      "type": "object",
+      "required": ["marker", "title", "note", "steps"],
+      "additionalProperties": false,
+      "properties": {
+        "marker": { "enum": ["+", "*", "~", ">"] },
+        "title": { "type": "string", "minLength": 1 },
+        "note": { "type": "string", "minLength": 1 },
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/step" }
+        }
+      }
+    },
     "position": {
       "type": "object",
       "required": ["line", "col"],
@@ -171,23 +228,76 @@ alongside this skill). The schema, inlined:
 
 ```json
 {
-  "version": 1,
-  "summary": "Adds rate limiting to the public API while keeping health checks and static assets unthrottled. The change introduces a middleware boundary around API routes, stores token buckets per client, and adds configuration plus integration coverage.\n\nAdd token-bucket rate limiting to API requests.\n├── Add middleware that decides whether a request can continue.\n├── Add per-client token buckets with lazy refill.\n└── Wire rate-limit configuration into the API route stack.\n\nMajor changes:\n\n1. Add middleware that decides whether a request can continue.\n   ├── HTTP routing\n   │   └── *api route stack\n   │       wraps /api requests without throttling health/static routes\n   └── Middleware\n       └── +rate_limit()\n           returns allow/deny decisions before request handling\n\n2. Add per-client token buckets with lazy refill.\n   └── Rate-limit core\n       └── +TokenBucket::take()\n           refills on access and consumes one token per accepted request\n\n3. Wire rate-limit configuration into the API route stack.\n   ├── Configuration\n   │   └── +RateLimitConfig\n   │       controls bucket size and refill rate\n   └── Integration tests\n       └── +API throttling workflow\n           covers accepted bursts, throttled overflow, and refill behavior\n\nLegend: + new, * modified, ~ removed/split, > ownership moved",
+  "version": 2,
+  "overview": "Adds rate limiting to the public API while keeping health checks and static assets unthrottled. The change introduces a middleware boundary around API routes, stores token buckets per client, and adds configuration plus integration coverage.",
+  "root": "Add token-bucket rate limiting to API requests.",
   "commit": "8f14e45fceea167a5a36dedd4bea2543c6a04c33",
-  "steps": [
+  "parts": [
     {
-      "title": "Token bucket middleware",
-      "file": "src/middleware/rate_limit.rs",
-      "start": { "line": 18, "col": 1 },
-      "end": { "line": 41, "col": 2 },
-      "comment": "The core token-bucket implementation. Buckets are keyed by client IP and refill lazily on access, so there is no background task; the trade-off is a small burst allowance after idle periods."
+      "title": "Add middleware that decides whether a request can continue.",
+      "groups": [
+        {
+          "title": "API module",
+          "items": [
+            {
+              "marker": "*",
+              "title": "api route stack",
+              "note": "wraps /api requests without throttling health/static routes",
+              "steps": [
+                {
+                  "title": "Wire into the router",
+                  "file": "src/router.rs",
+                  "start": { "line": 41, "col": 5 },
+                  "end": { "line": 44, "col": 60 },
+                  "comment": "The middleware is layered onto the /api scope only; health checks and static assets stay unthrottled."
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "title": "Rate-limit module",
+          "items": [
+            {
+              "marker": "+",
+              "title": "rate_limit()",
+              "note": "returns allow/deny decisions before request handling",
+              "steps": [
+                {
+                  "title": "Token bucket middleware",
+                  "file": "src/middleware/rate_limit.rs",
+                  "start": { "line": 18, "col": 1 },
+                  "end": { "line": 41, "col": 2 },
+                  "comment": "The middleware keys buckets by client IP and refills lazily on access, so there is no background task; the trade-off is a small burst allowance after idle periods."
+                }
+              ]
+            }
+          ]
+        }
+      ]
     },
     {
-      "title": "Wire into the router",
-      "file": "src/router.rs",
-      "start": { "line": 41, "col": 5 },
-      "end": { "line": 44, "col": 60 },
-      "comment": "The middleware is layered onto the /api scope only — health checks and static assets stay unthrottled."
+      "title": "Add per-client token buckets with lazy refill.",
+      "groups": [
+        {
+          "title": "Rate-limit module",
+          "items": [
+            {
+              "marker": "+",
+              "title": "TokenBucket::take()",
+              "note": "refills on access and consumes one token per accepted request",
+              "steps": [
+                {
+                  "file": "src/middleware/rate_limit.rs",
+                  "start": { "line": 52, "col": 3 },
+                  "end": { "line": 73, "col": 4 },
+                  "comment": "The bucket implementation combines lazy refill and consumption in one operation, which keeps request-time behavior deterministic and easy to test."
+                }
+              ]
+            }
+          ]
+        }
+      ]
     }
   ]
 }
@@ -195,18 +305,28 @@ alongside this skill). The schema, inlined:
 
 ## 5. Self-check before writing
 
-- Every `step.file` appears in `git diff HEAD` or the untracked list.
-- Every `start.line`/`end.line` is within the file's current line count
+- Every nested `steps[].file` appears in `git diff HEAD` or the untracked list.
+- Every nested `start.line`/`end.line` is within the file's current line count
   (verify against the file on disk, not the diff hunk headers).
-- Every `start.line` points at a changed (added) line, not unchanged
+- Every nested `start.line` points at a changed (added) line, not unchanged
   context; every region is tight (~40 lines max) around the discussed code.
-- `summary` has no repo-relative paths or bracketed file names; exact locations
-  belong in `steps`.
-- `summary` starts with prose, then a top-level graph, then `Major changes:`
-  with expanded graphs, then the legend at the end.
-- Major-change roots are active author-context sentences, not noun-only labels.
-- The expanded graphs are not exhaustive inventories of changed files/functions;
-  they explain the most important top-down design changes.
+- The document has no `summary` field; DiffReview derives the summary from
+  `overview`, `root`, and `parts`.
+- `overview`, `root`, part titles, group titles, item titles, and item notes
+  have no repo-relative paths or bracketed file names.
+- `root` and each `parts[].title` are active author-context sentences, not
+  noun-only labels.
+- `parts[]` captures the few major top-down review claims, not every support
+  change. If there are more than four parts, merge by feature/fix/refactor
+  outcome before writing the JSON.
+- Group titles identify real module/plugin/package/app boundaries whenever
+  possible. Do not use abstract labels such as `API`, `storage`, `renderer`, or
+  `validation` when the repo has a clearer boundary such as `Physics plugin`,
+  `Model plugin`, `Render plugin`, or a named crate/package.
+- Item notes are single-line descriptive fragments that render cleanly beneath
+  the item; no tree characters, file paths, or broken imperative phrases.
+- `parts[].groups[].items[]` explain the most important top-down design changes;
+  they are not exhaustive inventories of changed files/functions.
 - `commit` is the full 40-character sha from `git rev-parse HEAD`.
 - The JSON is valid: no trailing commas, no comments, double-quoted keys.
 - Write to `<repo root>/.walkthrough.json`, overwriting any existing file.
