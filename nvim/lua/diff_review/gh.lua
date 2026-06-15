@@ -59,6 +59,22 @@
 ---@field code? integer
 ---@field unavailable? boolean
 
+---@class DiffReviewGhPRCheck
+---@field name string
+---@field status string
+---@field conclusion? string
+---@field state string
+---@field url? string
+---@field workflow_name? string
+---@field started_at? string
+---@field completed_at? string
+
+---@class DiffReviewGhPRChecksResult
+---@field ok boolean
+---@field checks? DiffReviewGhPRCheck[]
+---@field message? string
+---@field code? integer
+
 ---@class DiffReviewGhReviewCommentReply
 ---@field remote_id integer?
 ---@field remote_node_id string?
@@ -938,6 +954,45 @@ local function normalize_pending_review(raw)
   }
 end
 
+---@param raw table
+---@return DiffReviewGhPRCheck?
+local function normalize_pr_check(raw)
+  local kind = tostring(raw.__typename or "")
+  if kind == "CheckRun" then
+    local check_suite = raw.checkSuite or {}
+    local workflow_run = check_suite.workflowRun or {}
+    local workflow = workflow_run.workflow or {}
+    local name = vim.trim(tostring(raw.name or ""))
+    if name == "" then name = vim.trim(tostring(workflow.name or "")) end
+    if name == "" then name = "Check run" end
+    local status = vim.trim(tostring(raw.status or ""))
+    local conclusion = vim.trim(tostring(raw.conclusion or ""))
+    return {
+      name = name,
+      status = status,
+      conclusion = conclusion ~= "" and conclusion or nil,
+      state = conclusion ~= "" and conclusion or status,
+      url = raw.detailsUrl,
+      workflow_name = workflow.name,
+      started_at = raw.startedAt,
+      completed_at = raw.completedAt,
+    }
+  end
+  if kind == "StatusContext" then
+    local name = vim.trim(tostring(raw.context or ""))
+    if name == "" then name = "Status context" end
+    local state = vim.trim(tostring(raw.state or ""))
+    return {
+      name = name,
+      status = state,
+      conclusion = state ~= "" and state or nil,
+      state = state,
+      url = raw.targetUrl,
+    }
+  end
+  return nil
+end
+
 ---@param query string
 ---@param variables table
 ---@param cwd string?
@@ -981,6 +1036,84 @@ function M.set_pr_draft_async(cwd, pr_node_id, draft, cb)
       return
     end
     cb({ ok = true, is_draft = pull_request.isDraft == true or pull_request.is_draft == true })
+  end)
+end
+
+---@param cwd string
+---@param number integer|string
+---@param repo string
+---@param cb fun(result: DiffReviewGhPRChecksResult)
+function M.pr_checks_async(cwd, number, repo, cb)
+  local owner, name = split_repo(repo)
+  if not owner then
+    cb({ ok = false, message = "PR checks require an owner/repo name", code = 1 })
+    return
+  end
+  local query = table.concat({
+    "query($owner:String!, $repo:String!, $number:Int!) {",
+    "  repository(owner:$owner, name:$repo) {",
+    "    pullRequest(number:$number) {",
+    "      commits(last:1) { nodes {",
+    "        commit {",
+    "          statusCheckRollup {",
+    "            contexts(first:100) { nodes {",
+    "              __typename",
+    "              ... on CheckRun {",
+    "                name status conclusion detailsUrl startedAt completedAt",
+    "                checkSuite { workflowRun { workflow { name } } }",
+    "              }",
+    "              ... on StatusContext {",
+    "                context state targetUrl",
+    "              }",
+    "            } }",
+    "          }",
+    "        }",
+    "      } }",
+    "    }",
+    "  }",
+    "}",
+  }, "\n")
+  graphql_async(query, { owner = owner, repo = name, number = tonumber(number) }, cwd, function(result)
+    if result.code ~= 0 then
+      cb({ ok = false, message = result.output ~= "" and result.output or ("gh exited " .. result.code), code = result.code })
+      return
+    end
+
+    local decoded = decode_json(result.stdout)
+    if not decoded then
+      cb({ ok = false, message = "gh api returned invalid PR checks JSON", code = result.code })
+      return
+    end
+    if type(decoded.errors) == "table" and #decoded.errors > 0 then
+      cb({ ok = false, message = vim.json.encode(decoded.errors), code = result.code })
+      return
+    end
+
+    local pull_request = decoded
+      and decoded.data
+      and decoded.data.repository
+      and decoded.data.repository.pullRequest
+      or nil
+    if type(pull_request) ~= "table" then
+      cb({ ok = false, message = "gh api returned no pull request for checks", code = result.code })
+      return
+    end
+
+    local commit_node = pull_request.commits
+      and pull_request.commits.nodes
+      and pull_request.commits.nodes[1]
+      or {}
+    local contexts = commit_node.commit
+      and commit_node.commit.statusCheckRollup
+      and commit_node.commit.statusCheckRollup.contexts
+      and commit_node.commit.statusCheckRollup.contexts.nodes
+      or {}
+    local checks = {}
+    for _, raw in ipairs(type(contexts) == "table" and contexts or {}) do
+      local check = type(raw) == "table" and normalize_pr_check(raw) or nil
+      if check then checks[#checks + 1] = check end
+    end
+    cb({ ok = true, checks = checks })
   end)
 end
 

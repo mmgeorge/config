@@ -27,6 +27,8 @@ local function load_repo_metadata(cwd, repo)
   require("github.repo_cache").ensure_metadata(cwd, repo, function(done)
     gh.repo_contributors_async(cwd, repo, done)
   end)
+  local ok, issue_index = pcall(require, "github.issue_index")
+  if ok then issue_index.ensure_repo(cwd, repo, { manual = false }) end
 end
 
 ---@param buf integer

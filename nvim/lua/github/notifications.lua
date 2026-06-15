@@ -41,6 +41,8 @@ local function load_repo_metadata(cwd)
   end, function(repo, done)
     gh.repo_contributors_async(cwd, repo, done)
   end)
+  local ok, issue_index = pcall(require, "github.issue_index")
+  if ok then issue_index.ensure_current(cwd, { manual = false }) end
 end
 
 ---@param value string

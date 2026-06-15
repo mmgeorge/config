@@ -22,15 +22,17 @@
 ---@field label string
 ---@field part_title string
 ---@field group_title string
----@field item_marker string
+---@field item_action string
 ---@field item_title string
 ---@field item_note string
+---@field item_path string
 
 ---@class DiffReviewWalkthroughItem
----@field marker string
+---@field action string
 ---@field title string
 ---@field note string
 ---@field steps DiffReviewWalkthroughStep[]
+---@field children DiffReviewWalkthroughItem[]
 
 ---@class DiffReviewWalkthroughGroup
 ---@field title string
@@ -45,9 +47,10 @@
 ---@field step_index integer
 ---@field part_title string
 ---@field group_title string
----@field item_marker string
+---@field item_action string
 ---@field item_title string
 ---@field item_note string
+---@field item_path string
 
 ---@class DiffReviewWalkthroughDoc
 ---@field version integer
@@ -139,12 +142,25 @@ local function is_non_empty_string(value)
   return type(value) == "string" and vim.trim(value) ~= ""
 end
 
-local walkthrough_legend = "Legend: + new, * modified, ~ removed/split, > ownership moved"
-local valid_item_markers = {
-  ["+"] = true,
-  ["*"] = true,
-  ["~"] = true,
-  [">"] = true,
+local action_width = 6
+local action_order = { "Add", "Update", "Move", "Remove", "Split" }
+local valid_item_actions = {
+  Add = true,
+  Update = true,
+  Move = true,
+  Remove = true,
+  Split = true,
+}
+local action_highlights = {
+  Add = "DiffReviewWalkthroughActionAdd",
+  Update = "DiffReviewWalkthroughActionUpdate",
+  Move = "DiffReviewWalkthroughActionMove",
+  Remove = "DiffReviewWalkthroughActionRemove",
+  Split = "DiffReviewWalkthroughActionSplit",
+}
+
+local action_display_labels = {
+  Update = "Modify",
 }
 
 ---@param is_last boolean
@@ -159,23 +175,72 @@ local function tree_continuation(is_last)
   return is_last and "    " or "│   "
 end
 
+---@param is_last boolean
+---@return string
+local function tree_note_continuation(is_last)
+  return is_last and "      " or "│     "
+end
+
+---@param action string
+---@return string
+local function format_action(action)
+  return ("%-" .. action_width .. "s"):format(action_display_labels[action] or action)
+end
+
+---@param action string
+---@param title string
+---@return string
+local function item_context_label(action, title)
+  return ("%s %s"):format(action_display_labels[action] or action, title)
+end
+
+---@param labels string[]
+---@return string[]
+local function copy_labels(labels)
+  local copy = {}
+  for index, label in ipairs(labels) do
+    copy[index] = label
+  end
+  return copy
+end
+
+---@param labels string[]
+---@param label string
+---@return string[]
+local function append_label(labels, label)
+  local copy = copy_labels(labels)
+  copy[#copy + 1] = label
+  return copy
+end
+
+---@param lines string[]
+---@param item DiffReviewWalkthroughItem
+---@param prefix string
+---@param is_last boolean
+local function append_summary_item(lines, item, prefix, is_last)
+  lines[#lines + 1] = prefix .. tree_branch(is_last) .. format_action(item.action) .. " " .. item.title
+  local children = item.children or {}
+  local child_prefix = prefix .. tree_continuation(is_last)
+  if #children > 0 then
+    lines[#lines + 1] = child_prefix .. "│     " .. item.note
+    for child_index, child in ipairs(children) do
+      append_summary_item(lines, child, child_prefix, child_index == #children)
+    end
+  else
+    lines[#lines + 1] = prefix .. tree_note_continuation(is_last) .. item.note
+  end
+end
+
 ---@param overview string
----@param root string
+---@param _root string
 ---@param parts DiffReviewWalkthroughPart[]
 ---@return string
-local function build_summary(overview, root, parts)
+local function build_summary(overview, _root, parts)
   local lines = {}
   vim.list_extend(lines, vim.split(vim.trim(overview), "\n", { plain = true }))
   lines[#lines + 1] = ""
-  lines[#lines + 1] = root
   for part_index, part in ipairs(parts) do
-    lines[#lines + 1] = tree_branch(part_index == #parts) .. part.title
-  end
-
-  lines[#lines + 1] = ""
-  lines[#lines + 1] = "Major changes:"
-  for part_index, part in ipairs(parts) do
-    lines[#lines + 1] = ""
+    if part_index > 1 then lines[#lines + 1] = "" end
     lines[#lines + 1] = ("%d. %s"):format(part_index, part.title)
     for group_index, group in ipairs(part.groups) do
       local group_is_last = group_index == #part.groups
@@ -184,14 +249,11 @@ local function build_summary(overview, root, parts)
       local item_prefix = group_prefix .. tree_continuation(group_is_last)
       for item_index, item in ipairs(group.items) do
         local item_is_last = item_index == #group.items
-        lines[#lines + 1] = item_prefix .. tree_branch(item_is_last) .. item.marker .. item.title
-        lines[#lines + 1] = item_prefix .. tree_continuation(item_is_last) .. item.note
+        append_summary_item(lines, item, item_prefix, item_is_last)
       end
     end
   end
 
-  lines[#lines + 1] = ""
-  lines[#lines + 1] = walkthrough_legend
   return table.concat(lines, "\n")
 end
 
@@ -229,10 +291,88 @@ local function parse_step(raw_step, error_prefix, context)
     label = ("Part %d.%d"):format(context.part_index, context.step_index),
     part_title = context.part_title,
     group_title = context.group_title,
-    item_marker = context.item_marker,
+    item_action = context.item_action,
     item_title = context.item_title,
     item_note = context.item_note,
+    item_path = context.item_path,
   }
+end
+
+---@param raw_item any
+---@param error_prefix string
+---@param base_context table
+---@param parent_labels string[]
+---@param part_step_index integer
+---@param all_steps DiffReviewWalkthroughStep[]
+---@return DiffReviewWalkthroughItem? item
+---@return integer part_step_index
+---@return string? error
+local function parse_item(raw_item, error_prefix, base_context, parent_labels, part_step_index, all_steps)
+  if type(raw_item) ~= "table" then
+    return nil, part_step_index, error_prefix .. ": missing item object"
+  end
+  if type(raw_item.action) ~= "string" or not valid_item_actions[raw_item.action] then
+    return nil, part_step_index, error_prefix .. ": missing or invalid \"action\""
+  end
+  if not is_non_empty_string(raw_item.title) then
+    return nil, part_step_index, error_prefix .. ": missing \"title\""
+  end
+  if not is_non_empty_string(raw_item.note) then
+    return nil, part_step_index, error_prefix .. ": missing \"note\""
+  end
+
+  local item_labels = append_label(parent_labels, item_context_label(raw_item.action, raw_item.title))
+  ---@type DiffReviewWalkthroughStep[]
+  local item_steps = {}
+  if raw_item.steps ~= nil then
+    if type(raw_item.steps) ~= "table" or #raw_item.steps == 0 then
+      return nil, part_step_index, error_prefix .. ": \"steps\" must be a non-empty array when present"
+    end
+    for step_offset, raw_step in ipairs(raw_item.steps) do
+      part_step_index = part_step_index + 1
+      local step, parse_error = parse_step(raw_step, ("%s step %d"):format(error_prefix, step_offset), {
+        part_index = base_context.part_index,
+        step_index = part_step_index,
+        part_title = base_context.part_title,
+        group_title = base_context.group_title,
+        item_action = raw_item.action,
+        item_title = raw_item.title,
+        item_note = raw_item.note,
+        item_path = table.concat(item_labels, " / "),
+      })
+      if not step then return nil, part_step_index, parse_error end
+      item_steps[#item_steps + 1] = step
+      all_steps[#all_steps + 1] = step
+    end
+  end
+
+  ---@type DiffReviewWalkthroughItem[]
+  local children = {}
+  if raw_item.children ~= nil then
+    if type(raw_item.children) ~= "table" or #raw_item.children == 0 then
+      return nil, part_step_index, error_prefix .. ": \"children\" must be a non-empty array when present"
+    end
+    for child_index, raw_child in ipairs(raw_item.children) do
+      local child, next_step_index, child_error =
+        parse_item(raw_child, ("%s child %d"):format(error_prefix, child_index), base_context, item_labels,
+          part_step_index, all_steps)
+      if not child then return nil, next_step_index, child_error end
+      part_step_index = next_step_index
+      children[#children + 1] = child
+    end
+  end
+
+  if #item_steps == 0 and #children == 0 then
+    return nil, part_step_index, error_prefix .. ": missing \"steps\" or \"children\""
+  end
+
+  return {
+    action = raw_item.action,
+    title = raw_item.title,
+    note = raw_item.note,
+    steps = item_steps,
+    children = children,
+  }, part_step_index, nil
 end
 
 --- Tolerantly validate and normalize a decoded walkthrough document.
@@ -243,8 +383,8 @@ local function parse_doc(decoded)
   if type(decoded) ~= "table" then
     return nil, "document is not a JSON object"
   end
-  if tonumber(decoded.version) ~= 2 then
-    return nil, "unsupported \"version\" (expected 2)"
+  if tonumber(decoded.version) ~= 4 then
+    return nil, "unsupported \"version\" (expected 4)"
   end
   if not is_non_empty_string(decoded.overview) then
     return nil, "missing or empty \"overview\""
@@ -288,46 +428,14 @@ local function parse_doc(decoded)
       local items = {}
       for item_index, raw_item in ipairs(raw_group.items) do
         local item_prefix = ("%s item %d"):format(group_prefix, item_index)
-        if type(raw_item) ~= "table" then
-          return nil, item_prefix .. ": missing item object"
-        end
-        if type(raw_item.marker) ~= "string" or not valid_item_markers[raw_item.marker] then
-          return nil, item_prefix .. ": missing or invalid \"marker\""
-        end
-        if not is_non_empty_string(raw_item.title) then
-          return nil, item_prefix .. ": missing \"title\""
-        end
-        if not is_non_empty_string(raw_item.note) then
-          return nil, item_prefix .. ": missing \"note\""
-        end
-        if type(raw_item.steps) ~= "table" or #raw_item.steps == 0 then
-          return nil, item_prefix .. ": missing or empty \"steps\""
-        end
-
-        ---@type DiffReviewWalkthroughStep[]
-        local item_steps = {}
-        for step_offset, raw_step in ipairs(raw_item.steps) do
-          part_step_index = part_step_index + 1
-          local step, parse_error = parse_step(raw_step, ("%s step %d"):format(item_prefix, step_offset), {
-            part_index = part_index,
-            step_index = part_step_index,
-            part_title = raw_part.title,
-            group_title = raw_group.title,
-            item_marker = raw_item.marker,
-            item_title = raw_item.title,
-            item_note = raw_item.note,
-          })
-          if not step then return nil, parse_error end
-          item_steps[#item_steps + 1] = step
-          steps[#steps + 1] = step
-        end
-
-        items[#items + 1] = {
-          marker = raw_item.marker,
-          title = raw_item.title,
-          note = raw_item.note,
-          steps = item_steps,
-        }
+        local item, next_step_index, item_error = parse_item(raw_item, item_prefix, {
+          part_index = part_index,
+          part_title = raw_part.title,
+          group_title = raw_group.title,
+        }, {}, part_step_index, steps)
+        if not item then return nil, item_error end
+        part_step_index = next_step_index
+        items[#items + 1] = item
       end
       groups[#groups + 1] = {
         title = raw_group.title,
@@ -346,7 +454,7 @@ local function parse_doc(decoded)
   end
 
   return {
-    version = 2,
+    version = 4,
     overview = decoded.overview,
     root = decoded.root,
     summary = build_summary(decoded.overview, decoded.root, parts),
@@ -550,7 +658,10 @@ local function render_comment_box(mode, step, target, win)
   for _, line in ipairs(wrap_text(step.part_title, inner_width - 2)) do
     content[#content + 1] = { text = line, hl = "Title" }
   end
-  local item_context = ("%s / %s%s"):format(step.group_title, step.item_marker, step.item_title)
+  local item_context = ("%s / %s"):format(
+    step.group_title,
+    step.item_path ~= "" and step.item_path or item_context_label(step.item_action, step.item_title)
+  )
   for _, line in ipairs(wrap_text(item_context, inner_width - 2)) do
     content[#content + 1] = { text = line, hl = "DiffReviewStatusHint" }
   end
@@ -624,6 +735,55 @@ local function summary_lines(text, width)
   end
   if #lines == 0 then lines[1] = "" end
   return lines
+end
+
+---@param line string
+---@return integer? start_col 0-based byte column
+---@return integer? end_col 0-based byte column, exclusive
+---@return string? action
+local function summary_action_range(line)
+  for _, action in ipairs(action_order) do
+    local padded_action = format_action(action) .. " "
+    local start_byte = line:find(padded_action, 1, true)
+    local prefix = start_byte and line:sub(1, start_byte - 1) or ""
+    if start_byte and (vim.endswith(prefix, "├── ") or vim.endswith(prefix, "└── ")) then
+      local start_col = start_byte - 1
+      return start_col, start_col + #action, action
+    end
+  end
+  return nil, nil, nil
+end
+
+---@param line string
+---@param action_start_col integer
+---@return integer? start_col 0-based byte column
+---@return integer? end_col 0-based byte column, exclusive
+local function summary_item_title_range(line, action_start_col)
+  local title_start_col = action_start_col + action_width + 1
+  if title_start_col >= #line then return nil, nil end
+  return title_start_col, #line
+end
+
+---@param buf integer
+---@param lines string[]
+local function apply_summary_highlights(buf, lines)
+  for row, line in ipairs(lines) do
+    local start_col, end_col, action = summary_action_range(line)
+    local hl_group = action and action_highlights[action] or nil
+    if start_col and end_col and hl_group then
+      pcall(vim.api.nvim_buf_set_extmark, buf, M._ns, row - 1, start_col, {
+        end_col = end_col,
+        hl_group = hl_group,
+      })
+      local title_start_col, title_end_col = summary_item_title_range(line, start_col)
+      if title_start_col and title_end_col then
+        pcall(vim.api.nvim_buf_set_extmark, buf, M._ns, row - 1, title_start_col, {
+          end_col = title_end_col,
+          hl_group = "DiffReviewWalkthroughItemTitle",
+        })
+      end
+    end
+  end
 end
 
 ---@param mode DiffReviewWalkthroughMode
@@ -787,6 +947,7 @@ function M._open_summary(mode, opts)
   vim.bo[popup_buf].buftype = "nofile"
   vim.api.nvim_buf_set_lines(popup_buf, 0, -1, false, lines)
   vim.bo[popup_buf].modifiable = false
+  apply_summary_highlights(popup_buf, lines)
   if stale_line then
     pcall(vim.api.nvim_buf_set_extmark, popup_buf, M._ns, stale_line - 1, 0, {
       end_col = #lines[stale_line],

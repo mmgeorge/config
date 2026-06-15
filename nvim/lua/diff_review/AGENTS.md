@@ -269,6 +269,17 @@ DiffReview error handling should be loud by default. If a caught error affects
 rendering, syncing, completion, cursor behavior, or user action handling, report
 it with a notification rather than only logging it or silently falling back.
 
+GitStatus, PR overview, PR review, issue, and notification buffers share GitHub
+repo metadata and issue completion through `github.repo_cache` and
+`github.issue_index`; keep that ownership centralized. Repo-scoped durable data
+lives under `vim.fn.stdpath("data")/gitstatus/repos/<owner>/<repo>/`, not inside
+DiffReview module state or ad hoc temp paths. The issue index specifically uses
+`issues/issues.redb` plus `issues/open-snapshot.json`, populated by background
+GraphQL sync and the Rust redb sidecar in `nvim/rust/github-issue-index`. `#`
+completion must read the snapshot locally and must not run a live GitHub search
+per keystroke. `:GithubIssueSync [all]` owns manual refresh, and
+`:GithubDeleteRepoCache` owns repo cache cleanup.
+
 ## Shared Status UX Pattern
 
 GitStatus' Unstaged/Staged model is the canonical UX pattern for all

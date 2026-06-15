@@ -51,30 +51,41 @@ narrative — use the diff only to confirm files and line numbers.
   comment.
 - `title` is an optional short heading (a few words).
 - Author the top-down review map as structured `overview`, `root`, and
-  `parts[]`; the DiffReview plugin derives the displayed summary graph from
-  this structure. Do not write a `summary` field.
-- `overview` is 1-3 prose sentences explaining what changed and why.
+  `parts[]`; the DiffReview plugin derives the displayed walkthrough summary
+  from this structure. Do not write a `summary` field.
+- `overview` is 2-3 prose sentences that tell the story. Start with one
+  active sentence that succinctly encapsulates the whole change, such as `Add
+  support for full model-backed particle rendering.` Then use `Before...` and
+  `Now...` sentences to explain what changed in concrete terms.
 - `root` is one active author-context sentence for the major feature/fix/refactor.
 - Each `parts[].title` is an active author-context sentence such as `Add...`,
   `Update...`, `Move...`, `Split...`, `Remove...`, or `Preserve...`. These
-  titles become the top-level graph children and the `Major changes:` roots.
+  titles become the numbered review sections in the walkthrough summary.
 - Keep `parts[]` focused on the true major review claims, usually 2-4 entries.
   Do not promote every meaningful diff cluster into a part. Supporting work
   like demo wiring, shader helper splits, tests, docs/plans, preservation of an
   old path, or follow-up notes belongs under the relevant major part unless it
   is the main purpose of the change.
-- Inside each part, prefer real repo boundaries for group titles: top-level
-  modules, plugins, packages, crates, apps, or stable subsystems. In plugin
-  repos, use plugin names such as `Physics plugin`, `Render plugin`, or
-  `Model plugin` before abstract buckets like `API`, `storage`, or `renderer`.
-  Use abstract group labels only when there is no clearer module boundary.
+- Inside each part, prefer exact code boundaries for group titles: concrete
+  class/type/module/crate/package/plugin symbols such as `PhysicsPlugin`,
+  `RenderPlugin`, `ModelPlugin`, `rate_limit`, or `AppBrowserPhysicsDemo`.
+  Use humanized labels like `Physics plugin`, `Render plugin`, or abstract
+  buckets like `API`, `storage`, `renderer`, and `validation` only when there is
+  no clearer owning symbol/module in the code.
   Each item has:
-  - `marker`: `+` new, `*` modified, `~` removed/split, `>` ownership moved.
-  - `title`: the important module/function/concept in the graph.
-  - `note`: a short annotation explaining why it changed. Notes should be
-    descriptive fragments that render cleanly under the item; do not include
-    line breaks, tree characters, file paths, or imperative broken phrases.
+  - `action`: one of `Add`, `Update`, `Move`, `Remove`, or `Split`.
+  - `title`: a concrete story claim or code symbol in the graph.
+  - `note`: a short imperative annotation that reads as part of the author's
+    change, e.g. `bind particle storage during model-backed particle draws` or
+    `reuse primitive and material uploads for particle instances`. Do not use
+    third-person wording like `binds` or `reuses`.
   - `steps`: one or more exact file/range walkthrough comments for that item.
+  - `children`: optional nested subchanges under a story item.
+- Use `children` when a where-boundary contains a design move plus concrete
+  implementation symbols. The parent item should say the responsibility shift,
+  and child items should name the concrete symbols/functions that implement it.
+  Parent items may omit `steps` when their children carry the exact file ranges.
+  Do not flatten related subchanges into siblings when the relationship matters.
 - Exact file paths and ranges belong only in nested `steps`; do **not** include
   repo paths or bracketed file names in `overview`, `root`, part titles, group
   titles, item titles, or item notes. The plugin displays nested steps as
@@ -82,55 +93,69 @@ narrative — use the diff only to confirm files and line numbers.
   Derived summary example:
 
   ```
-  Adds model-backed particle rendering while preserving billboard particles.
-  The PR separates storage/render ownership so physics, render, and model
-  plugins communicate through a narrow instance-source handoff.
+  Add support for full model-backed particle rendering. Before, simulated
+  particles could only render through the legacy triangle billboard path. Now,
+  each particle spawn can choose billboard or model rendering, physics publishes
+  live particle buffers through a render-facing handoff, and the model/PBR
+  renderer draws the selected mesh once per live particle.
 
-  Add model-backed particle rendering for live particles.
-  ├── Update particle spawns to choose between billboard and model rendering.
-  ├── Move particle GPU buffers behind a render-facing handoff.
-  └── Update model renderer to draw live particles through the PBR path.
+  1. Let particle spawns choose billboard or model rendering.
+     ├── PhysicsPlugin
+     │   └── Add    selectable render mode for particle spawns
+     │       │     make the render path explicit instead of assuming billboard particles
+     │       ├── Add    ParticleRenderMode
+     │       │     represent billboard vs model-backed rendering at spawn time
+     │       └── Update ParticleSpawn
+     │             carry the selected render mode with spawn data
+     └── AppBrowserPhysicsDemo
+         └── Update drop3d particle spawn
+               switch the stress scene to SmoothSphere model particles
 
-  Major changes:
+  2. Move live particle data into render-facing resources.
+     ├── PhysicsPlugin
+     │   ├── Move   particle simulation buffers into ParticleStorage
+     │   │   │     make ParticleStorage the shared buffer owner for simulation and rendering
+     │   │   ├── Add    ParticleStorage
+     │   │   │     own particle GPU buffers and expose a render instance view
+     │   │   └── Update ParticleSystem::run()
+     │   │         advance simulation through shared storage and publish the current particle source
+     │   ├── Update PhysicsPlugin::install()
+     │   │     register shared storage and preserve billboard rendering as its own system
+     │   └── Add    ParticleBillboardRenderSystem
+     │         keep the legacy triangle path behind billboard mode
+     └── RenderPlugin
+         └── Add    ParticleInstanceSources
+               share live particle buffers and optional model metadata with render systems
 
-  1. Update particle spawns to choose between billboard and model rendering.
-     ├── Physics plugin
-     │   ├── +ParticleRenderMode
-     │   │   chooses Billboard vs Model(asset) at spawn time
-     │   ├── *ParticleSystem::run()
-     │   │   simulates particles, then publishes render instances
-     │   └── +ParticleBillboardRenderSystem::run()
-     │       preserves the legacy triangle path as a separate system
-     └── Demo/app wiring
-         └── *drop3d particle spawn
-             opts into Model(SmoothSphere) to exercise PBR particles
-
-  2. Move particle GPU buffers behind a render-facing handoff.
-     ├── Physics plugin
-     │   └── >ParticleStorage
-     │       moves GPU buffers out of the solver into shared storage
-     ├── Render plugin
-     │   └── +ParticleInstanceSources
-     │       owns the render-facing handoff for live particle buffers
-     └── Model plugin
-         └── *ModelRenderSystem::render()
-             reads the handoff before issuing particle model draws
-
-  3. Update model renderer to draw live particles through the PBR path.
-     ├── Model plugin
-     │   ├── +ParticlePbRenderPipeline
-     │   │   binds particle storage into the model render pass
-     │   ├── *model primitive draw commands
-     │   │   reuse existing primitive/material stores for particles
-     │   └── *ModelRenderSystem::render()
-     │       draws each primitive across the live particle count
-     └── Shader path
-         ├── *pbr_vertex helpers
-         │   share vertex-output construction with normal model rendering
-         └── +particle_render.entry.slang
-             turns particle positions/radii into PBR mesh instances
-
-  Legend: + new, * modified, ~ removed/split, > ownership moved
+  3. Draw the selected model once per live particle through the PBR path.
+     ├── ModelPlugin
+     │   ├── Add    particle PBR render pipeline
+     │   │   │     bind particle storage during the model render pass
+     │   │   └── Add    ParticlePbRenderPipeline
+     │   │         create the pipeline variant for particle-instanced model draws
+     │   ├── Update model renderer to issue particle model draws
+     │   │   │     load the selected model asset and draw each primitive across the live particle count
+     │   │   ├── Update ModelRenderSystem::new()
+     │   │   │     initialize the particle pipeline state
+     │   │   ├── Update ModelRenderSystem::update_entities()
+     │   │   │     prepare particle model draw commands from the render-facing handoff
+     │   │   └── Update ModelRenderSystem::render()
+     │   │         issue indexed draws across the live particle count
+     │   └── Update model stores to reuse primitive and material uploads
+     │       │     record per-primitive draw metadata for particle-instanced models
+     │       ├── Add    ParticleModelDrawCommand
+     │       │     describe one primitive/material draw for live particle instances
+     │       ├── Update ModelStore::insert_particle_model()
+     │       │     reuse model primitives while returning particle draw metadata
+     │       └── Update PrimitiveMeshStore
+     │             expose primitive buffers in the layout expected by the particle entry point
+     └── particle_render shaders
+         └── Add    particle PBR shader entry
+             │     expand particle positions and radii into lit mesh instances
+             ├── Add    particle_render entry point
+             │     draw each live particle as the selected model primitive
+             └── Add    PBR vertex helpers
+                   share vertex-output construction with normal model rendering
   ```
 
 ## 3. Schema
@@ -147,7 +172,7 @@ alongside this skill). The schema, inlined:
   "required": ["version", "overview", "root", "commit", "parts"],
   "additionalProperties": false,
   "properties": {
-    "version": { "const": 2 },
+    "version": { "const": 4 },
     "overview": { "type": "string", "minLength": 1 },
     "root": { "type": "string", "minLength": 1 },
     "commit": { "type": "string", "pattern": "^[0-9a-fA-F]{40}$" },
@@ -186,16 +211,25 @@ alongside this skill). The schema, inlined:
     },
     "item": {
       "type": "object",
-      "required": ["marker", "title", "note", "steps"],
+      "required": ["action", "title", "note"],
       "additionalProperties": false,
+      "anyOf": [
+        { "required": ["steps"] },
+        { "required": ["children"] }
+      ],
       "properties": {
-        "marker": { "enum": ["+", "*", "~", ">"] },
+        "action": { "enum": ["Add", "Update", "Move", "Remove", "Split"] },
         "title": { "type": "string", "minLength": 1 },
         "note": { "type": "string", "minLength": 1 },
         "steps": {
           "type": "array",
           "minItems": 1,
           "items": { "$ref": "#/$defs/step" }
+        },
+        "children": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/item" }
         }
       }
     },
@@ -228,8 +262,8 @@ alongside this skill). The schema, inlined:
 
 ```json
 {
-  "version": 2,
-  "overview": "Adds rate limiting to the public API while keeping health checks and static assets unthrottled. The change introduces a middleware boundary around API routes, stores token buckets per client, and adds configuration plus integration coverage.",
+  "version": 4,
+  "overview": "Add token-bucket rate limiting to public API requests. Before, API handlers accepted every request that reached the route stack. Now, API routes pass through a middleware boundary that checks per-client token buckets while health checks and static assets stay unthrottled.",
   "root": "Add token-bucket rate limiting to API requests.",
   "commit": "8f14e45fceea167a5a36dedd4bea2543c6a04c33",
   "parts": [
@@ -237,31 +271,38 @@ alongside this skill). The schema, inlined:
       "title": "Add middleware that decides whether a request can continue.",
       "groups": [
         {
-          "title": "API module",
+          "title": "Router",
           "items": [
             {
-              "marker": "*",
-              "title": "api route stack",
-              "note": "wraps /api requests without throttling health/static routes",
-              "steps": [
+              "action": "Update",
+              "title": "API route middleware boundary",
+              "note": "route public API requests through the limiter while leaving health/static paths alone",
+              "children": [
                 {
-                  "title": "Wire into the router",
-                  "file": "src/router.rs",
-                  "start": { "line": 41, "col": 5 },
-                  "end": { "line": 44, "col": 60 },
-                  "comment": "The middleware is layered onto the /api scope only; health checks and static assets stay unthrottled."
+                  "action": "Update",
+                  "title": "api route stack",
+                  "note": "wrap /api requests without throttling health/static routes",
+                  "steps": [
+                    {
+                      "title": "Wire into the router",
+                      "file": "src/router.rs",
+                      "start": { "line": 41, "col": 5 },
+                      "end": { "line": 44, "col": 60 },
+                      "comment": "The middleware is layered onto the /api scope only; health checks and static assets stay unthrottled."
+                    }
+                  ]
                 }
               ]
             }
           ]
         },
         {
-          "title": "Rate-limit module",
+          "title": "rate_limit",
           "items": [
             {
-              "marker": "+",
+              "action": "Add",
               "title": "rate_limit()",
-              "note": "returns allow/deny decisions before request handling",
+              "note": "return allow/deny decisions before request handling",
               "steps": [
                 {
                   "title": "Token bucket middleware",
@@ -280,12 +321,12 @@ alongside this skill). The schema, inlined:
       "title": "Add per-client token buckets with lazy refill.",
       "groups": [
         {
-          "title": "Rate-limit module",
+          "title": "rate_limit",
           "items": [
             {
-              "marker": "+",
+              "action": "Add",
               "title": "TokenBucket::take()",
-              "note": "refills on access and consumes one token per accepted request",
+              "note": "refill on access and consume one token per accepted request",
               "steps": [
                 {
                   "file": "src/middleware/rate_limit.rs",
@@ -319,12 +360,20 @@ alongside this skill). The schema, inlined:
 - `parts[]` captures the few major top-down review claims, not every support
   change. If there are more than four parts, merge by feature/fix/refactor
   outcome before writing the JSON.
-- Group titles identify real module/plugin/package/app boundaries whenever
-  possible. Do not use abstract labels such as `API`, `storage`, `renderer`, or
-  `validation` when the repo has a clearer boundary such as `Physics plugin`,
-  `Model plugin`, `Render plugin`, or a named crate/package.
-- Item notes are single-line descriptive fragments that render cleanly beneath
-  the item; no tree characters, file paths, or broken imperative phrases.
+- Group titles identify concrete code boundaries whenever possible: class/type
+  names, module names, plugin structs, crates, packages, or apps. Prefer
+  `PhysicsPlugin`, `RenderPlugin`, `ModelPlugin`, `Router`, or `rate_limit` over
+  humanized labels like `Physics plugin` or abstract labels such as `API`,
+  `storage`, `renderer`, and `validation`.
+- Nested item structure preserves the story inside each where-boundary: parent
+  items describe responsibility shifts or design moves; child items name the
+  concrete symbols/functions. Parent items may omit `steps` only when they have
+  `children`.
+- Item actions are title-cased verbs from the allowed set: `Add`, `Update`,
+  `Move`, `Remove`, `Split`.
+- Item notes are single-line imperative fragments that render cleanly beneath
+  the item; no third-person verbs (`binds`, `reuses`), tree characters, file
+  paths, or broken phrases.
 - `parts[].groups[].items[]` explain the most important top-down design changes;
   they are not exhaustive inventories of changed files/functions.
 - `commit` is the full 40-character sha from `git rev-parse HEAD`.

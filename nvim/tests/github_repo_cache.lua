@@ -2,6 +2,7 @@ vim.loader.enable(false)
 
 local cache = require("github.repo_cache")
 local github_gh = require("github.gh")
+local issue_index = require("github.issue_index")
 
 local function assert_true(condition, message)
   if not condition then error(message, 2) end
@@ -124,12 +125,73 @@ local function issue_completion_result(buf, text)
   return result
 end
 
+local function write_issue_snapshot(repo_name)
+  local path = issue_index.snapshot_path(repo_name)
+  vim.fn.mkdir(vim.fs.dirname(path), "p")
+  local result = vim.fn.writefile({ vim.json.encode({
+    repo = repo_name,
+    state = "open",
+    issue_count = 4,
+    issues = {
+      {
+        repo = repo_name,
+        number = 42,
+        title = "The name of issue assigned",
+        state = "OPEN",
+        url = "https://github.com/Owner/Repo/issues/42",
+        labels = { { name = "assigned" } },
+      },
+      {
+        repo = repo_name,
+        number = 50,
+        title = "The name of issue duplicate",
+        state = "OPEN",
+        url = "https://github.com/Owner/Repo/issues/50",
+        labels = { { name = "general" } },
+      },
+      {
+        repo = repo_name,
+        number = 43,
+        title = "Mentioned issue match",
+        state = "OPEN",
+        url = "https://github.com/Owner/Repo/issues/43",
+        labels = { { name = "mentioned" } },
+      },
+      {
+        repo = repo_name,
+        number = 44,
+        title = "General test issue match",
+        state = "OPEN",
+        url = "https://github.com/Owner/Repo/issues/44",
+        labels = { { name = "general" } },
+      },
+    },
+  }) }, path)
+  assert_true(result == 0, "issue snapshot write failed")
+end
+
 local function run()
   vim.notify = capture_notify
   cache.set_data_dir_for_test(cache_root)
+  issue_index._reset_for_test()
+  issue_index._set_progress_enabled_for_test(false)
+  issue_index._set_runner_for_test(function(command, _, callback)
+    local key = table.concat(command, " ")
+    if key:find(" state ", 1, true) then
+      local stdout = vim.json.encode({
+        repo = normalized_repo,
+        open_historical_complete = true,
+        last_open_checked_at = os.time(),
+      })
+      callback({ code = 0, stdout = stdout, stderr = "", output = stdout })
+      return
+    end
+    callback({ code = 0, stdout = "{}", stderr = "", output = "{}" })
+  end)
   github_gh.set_backend(github_backend)
   cache.remember_cwd_repo(cwd, normalized_repo)
   cache.set_base_branch(cwd, "master")
+  write_issue_snapshot(normalized_repo)
 
   local metadata_error = cache.write_metadata(normalized_repo, {
     { login = "bobtown" },
@@ -172,32 +234,22 @@ local function run()
   assert_true(labels["@bobtown"], "completion did not include cached contributor @bobtown")
   assert_true(labels["@mgeorge-esri"], "completion did not include cached collaborator @mgeorge-esri")
 
-  issue_search_calls = {}
   local one_char_issue_result = issue_completion_result(enabled_buf, "Comment #t")
-  assert_true(#one_char_issue_result.items == 4, "one-character issue completion did not search: " .. vim.inspect(one_char_issue_result.items))
-  assert_true(
-    issue_search_calls[1]:find("gh search issues t --repo Owner/Repo --assignee @me", 1, true) ~= nil,
-    "one-character assigned issue search was not run first: " .. issue_search_calls[1]
-  )
-  assert_issue_searches_do_not_request_pr_fields()
+  assert_true(#one_char_issue_result.items == 4, "one-character issue completion did not search local snapshot: " .. vim.inspect(one_char_issue_result.items))
+  assert_true(one_char_issue_result.items[1].label == "#42 The name of issue assigned", "local issue completion did not rank first match: " .. vim.inspect(one_char_issue_result.items))
 
   issue_search_calls = {}
   local issue_result = issue_completion_result(enabled_buf, "Comment #the name of issue")
-  assert_true(#issue_result.items == 4, "issue completion did not merge unique results: " .. vim.inspect(issue_result.items))
-  assert_true(issue_result.items[1].label == "#42 Assigned issue match", "assigned issue was not first: " .. vim.inspect(issue_result.items))
-  assert_true(issue_result.items[2].label == "#50 Duplicate general issue", "second assigned issue was not preserved before mentions")
-  assert_true(issue_result.items[3].label == "#43 Mentioned issue match", "mentioned issue was not prioritized before general results")
-  assert_true(issue_result.items[4].label == "#44 General issue match", "general issue result was not included")
+  assert_true(#issue_result.items == 2, "issue completion did not filter local snapshot: " .. vim.inspect(issue_result.items))
+  assert_true(issue_result.items[1].label == "#42 The name of issue assigned", "first local issue result was wrong: " .. vim.inspect(issue_result.items))
+  assert_true(issue_result.items[2].label == "#50 The name of issue duplicate", "second local issue result was wrong: " .. vim.inspect(issue_result.items))
   assert_true(issue_result.items[1].textEdit.newText == "#42", "issue completion must insert only the issue id")
   assert_true(issue_result.items[1].textEdit.range.start.character == #"Comment ", "issue completion range did not start at #")
   assert_true(issue_result.items[1].textEdit.range["end"].character == #"Comment #the name of issue", "issue completion range did not end at cursor")
-  assert_true(#issue_search_calls == 3, "issue completion did not run the prioritized searches")
-  assert_true(issue_search_calls[1]:find("gh search issues the name of issue --repo Owner/Repo --assignee @me", 1, true) ~= nil, "assigned issue search was not first: " .. issue_search_calls[1])
-  assert_true(issue_search_calls[2]:find("gh search issues the name of issue --repo Owner/Repo --mentions @me", 1, true) ~= nil, "mentioned issue search was not second: " .. issue_search_calls[2])
-  assert_true(issue_search_calls[3]:find("gh search issues the name of issue --repo Owner/Repo --state open", 1, true) ~= nil, "general issue search was not third: " .. issue_search_calls[3])
-  assert_issue_searches_do_not_request_pr_fields()
+  assert_true(#issue_search_calls == 0, "issue completion should not call gh search: " .. vim.inspect(issue_search_calls))
 
   local no_repo_buf = vim.api.nvim_create_buf(false, true)
+  cache.delete_cwd(vim.fn.getcwd())
   cache.enable_user_completion(no_repo_buf)
   captured_notifications = {}
   local no_repo_result = issue_completion_result(no_repo_buf, "Comment #missing")
@@ -207,31 +259,8 @@ local function run()
     "missing repo issue completion did not notify"
   )
 
-  issue_search_calls = {}
-  captured_notifications = {}
-  issue_search_empty = true
   local empty_result = issue_completion_result(enabled_buf, "Comment #1")
   assert_true(#empty_result.items == 0, "empty issue search should return no items")
-  assert_true(
-    vim.wait(1000, function() return saw_notification_containing("No open GitHub issue matched #1") end, 10),
-    "empty issue search did not notify"
-  )
-  issue_search_empty = false
-
-  issue_search_calls = {}
-  captured_notifications = {}
-  issue_search_should_fail = true
-  local failed_result = issue_completion_result(enabled_buf, "Comment #broken")
-  assert_true(#failed_result.items == 0, "failed issue search should return no items")
-  assert_true(
-    vim.wait(1000, function() return saw_notification_containing("mock issue search failure") end, 10),
-    "failed issue search did not notify with the backend message"
-  )
-  issue_search_should_fail = false
-  issue_search_calls = {}
-  local retry_result = issue_completion_result(enabled_buf, "Comment #broken")
-  assert_true(#retry_result.items == 4, "failed issue search was cached as empty instead of retrying")
-  assert_true(#issue_search_calls == 3, "retry after failed issue search did not rerun searches")
 
   local review_path = cache.review_path(normalized_repo, 2)
   vim.fn.mkdir(vim.fs.dirname(review_path), "p")
@@ -249,6 +278,7 @@ end
 local ok, err = xpcall(run, debug.traceback)
 vim.notify = original_notify
 github_gh.reset_backend()
+issue_index._reset_for_test()
 cache.set_data_dir_for_test(nil)
 vim.fn.delete(cache_root, "rf")
 if not ok then

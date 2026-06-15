@@ -53,6 +53,12 @@ function M.setup()
   vim.api.nvim_set_hl(0, "DiffReviewWalkthroughRegion", { bg = "#2d3a55" })
   vim.api.nvim_set_hl(0, "DiffReviewWalkthroughStale", { fg = "#e5c07b", italic = true })
   vim.api.nvim_set_hl(0, "DiffReviewWalkthroughComment", { fg = "#d4d4d4" })
+  vim.api.nvim_set_hl(0, "DiffReviewWalkthroughActionAdd", { fg = "#50fa7b", bold = true, italic = true })
+  vim.api.nvim_set_hl(0, "DiffReviewWalkthroughActionUpdate", { fg = "#61afef", bold = true, italic = true })
+  vim.api.nvim_set_hl(0, "DiffReviewWalkthroughActionMove", { fg = "#c678dd", bold = true, italic = true })
+  vim.api.nvim_set_hl(0, "DiffReviewWalkthroughActionRemove", { fg = "#ff5555", bold = true, italic = true })
+  vim.api.nvim_set_hl(0, "DiffReviewWalkthroughActionSplit", { fg = "#56b6c2", bold = true, italic = true })
+  vim.api.nvim_set_hl(0, "DiffReviewWalkthroughItemTitle", { fg = "#ffffff", bold = true })
 end
 
 return M

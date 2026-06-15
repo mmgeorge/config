@@ -3,6 +3,7 @@ vim.loader.enable(false)
 local diff_review = require("diff_review")
 local gh = require("diff_review.gh")
 local github_gh = require("github.gh")
+local issue_index = require("github.issue_index")
 local repo_cache = require("github.repo_cache")
 
 local function assert_true(condition, message)
@@ -102,6 +103,60 @@ function gh_backend.system_async(command, input, cb)
         cb({ code = 0, stdout = stdout, stderr = "", output = stdout })
         return
       end
+      if query:find("statusCheckRollup", 1, true) then
+        local stdout = vim.json.encode({
+          data = {
+            repository = {
+              pullRequest = {
+                commits = {
+                  nodes = {
+                    {
+                      commit = {
+                        statusCheckRollup = {
+                          contexts = {
+                            nodes = {
+                              {
+                                __typename = "CheckRun",
+                                name = "Dummy Lint",
+                                status = "COMPLETED",
+                                conclusion = "SUCCESS",
+                                detailsUrl = "https://github.com/owner/repo/actions/runs/123/job/456",
+                                startedAt = "2026-06-14T18:00:00Z",
+                                completedAt = "2026-06-14T18:01:00Z",
+                                checkSuite = {
+                                  workflowRun = {
+                                    workflow = { name = "PR Dummy Checks" },
+                                  },
+                                },
+                              },
+                              {
+                                __typename = "CheckRun",
+                                name = "Dummy Unit Tests",
+                                status = "COMPLETED",
+                                conclusion = "FAILURE",
+                                detailsUrl = "https://github.com/owner/repo/actions/runs/123/job/789",
+                                startedAt = "2026-06-14T18:00:00Z",
+                                completedAt = "2026-06-14T18:02:00Z",
+                                checkSuite = {
+                                  workflowRun = {
+                                    workflow = { name = "PR Dummy Checks" },
+                                  },
+                                },
+                              },
+                            },
+                          },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        })
+        cb({ code = 0, stdout = stdout, stderr = "", output = stdout })
+        return
+      end
       local stdout = vim.json.encode({
         data = {
           repository = {
@@ -142,6 +197,18 @@ function gh_backend.system_async(command, input, cb)
                     submittedAt = "2026-06-14T17:18:00Z",
                     url = "https://github.com/owner/repo/pull/7#pullrequestreview-4493241280",
                     author = { login = "me" },
+                    commit = { oid = "abc1234def5678abc1234def5678abc1234def56" },
+                  },
+                  {
+                    id = "PRR_4",
+                    databaseId = 4493241281,
+                    state = "COMMENTED",
+                    body = "Needs a follow-up",
+                    createdAt = "2026-06-14T17:19:00Z",
+                    updatedAt = "2026-06-14T17:19:00Z",
+                    submittedAt = "2026-06-14T17:19:00Z",
+                    url = "https://github.com/owner/repo/pull/7#pullrequestreview-4493241281",
+                    author = { login = "mgeorge" },
                     commit = { oid = "abc1234def5678abc1234def5678abc1234def56" },
                   },
                 },
@@ -573,6 +640,27 @@ local function assert_issue_completion(buf, row, text)
   assert_true(labels["#42 Test issue match"].textEdit.newText == "#42", "GitHub issue completion should insert only the issue id")
 end
 
+local function write_issue_snapshot(repo_name)
+  local path = issue_index.snapshot_path(repo_name)
+  vim.fn.mkdir(vim.fs.dirname(path), "p")
+  local result = vim.fn.writefile({ vim.json.encode({
+    repo = repo_name,
+    state = "open",
+    issue_count = 1,
+    issues = {
+      {
+        repo = repo_name,
+        number = 42,
+        title = "Test issue match",
+        state = "OPEN",
+        url = "https://github.com/owner/repo/issues/42",
+        labels = { { name = "test" }, { name = "z" } },
+      },
+    },
+  }) }, path)
+  assert_true(result == 0, "issue snapshot write failed")
+end
+
 local pr = {
   id = "PR_kwTEST7",
   number = 7,
@@ -582,7 +670,16 @@ local pr = {
   repo = "owner/repo",
   headRefName = "feature",
   headRefOid = "abc1234def5678abc1234def5678abc1234def56",
-  commits = {},
+  commits = {
+    {
+      oid = "1111111aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      messageHeadline = "feat: base commit",
+    },
+    {
+      oid = "abc1234def5678abc1234def5678abc1234def56",
+      messageHeadline = "chore: head commit",
+    },
+  },
   files = { { path = "src/a.txt", additions = 1, deletions = 1 } },
   changedFiles = 1,
   additions = 1,
@@ -597,6 +694,22 @@ local function run()
   github_gh.set_backend(gh_backend)
   diff_review.setup({ about_auto_generate = false })
   repo_cache.set_data_dir_for_test(repo_cache_dir)
+  issue_index._reset_for_test()
+  issue_index._set_progress_enabled_for_test(false)
+  issue_index._set_runner_for_test(function(command, _, callback)
+    local key = table.concat(command, " ")
+    if key:find(" state ", 1, true) then
+      local stdout = vim.json.encode({
+        repo = pr.repo,
+        open_historical_complete = true,
+        last_open_checked_at = os.time(),
+      })
+      callback({ code = 0, stdout = stdout, stderr = "", output = stdout })
+      return
+    end
+    callback({ code = 0, stdout = "{}", stderr = "", output = "{}" })
+  end)
+  write_issue_snapshot(pr.repo)
 
   local draft_codeowner_text = diff_review._pr_overview.pending_review_text({
     isDraft = true,
@@ -637,7 +750,7 @@ local function run()
     not buffer_contains(buf, "Second full line for expansion"),
     "long PR conversation comment should render collapsed by default"
   )
-  wait_for(function() return buffer_contains(buf, "Reviews (2):") end, "submitted reviews section did not render")
+  wait_for(function() return buffer_contains(buf, "Reviews (3):") end, "submitted reviews section did not render")
   assert_true(
     not buffer_contains(buf, "COMMENTED by me | 2026-06-14 17:18"),
     "single inline-comment review shell should not render in Reviews"
@@ -647,11 +760,60 @@ local function run()
     line_has_highlight(buf, find_row(buf, "Description:"), "DiffReviewStatusHeader", 0, #"Description:"),
     "PR description heading did not use header highlight"
   )
+  wait_for(function() return buffer_contains(buf, "Dummy Lint") end, "PR checks section did not render")
+  local description_row = find_row(buf, "Description:")
+  local lint_check_row = find_row(buf, "Dummy Lint")
+  local lint_check_line = vim.api.nvim_buf_get_lines(buf, lint_check_row - 1, lint_check_row, false)[1] or ""
+  local checks_status_row = lint_check_row - 1
+  local checks_status_line = vim.api.nvim_buf_get_lines(buf, checks_status_row - 1, checks_status_row, false)[1] or ""
+  assert_true(checks_status_line == "Status:", "PR checks heading did not render above the check rows")
+  assert_true(checks_status_row < description_row, "PR checks heading did not render before Description")
+  assert_true(lint_check_row < description_row, "PR check row did not render before Description")
+  assert_true(
+    lint_check_line:find("✓ SUCCESS Dummy Lint | PR Dummy Checks", 1, true) ~= nil,
+    "PR check row did not render state before title: " .. lint_check_line
+  )
+  assert_true(buffer_contains(buf, "Dummy Unit Tests"), "non-green PR check did not render")
+  local unit_check_row = find_row(buf, "Dummy Unit Tests")
+  local unit_check_line = vim.api.nvim_buf_get_lines(buf, unit_check_row - 1, unit_check_row, false)[1] or ""
+  assert_true(
+    unit_check_line:find("✗ FAILURE Dummy Unit Tests | PR Dummy Checks", 1, true) ~= nil,
+    "failing PR check row did not render state before title: " .. unit_check_line
+  )
+  assert_true(
+    line_has_highlight(buf, checks_status_row, "DiffReviewStatusHeader", 0, #"Status:"),
+    "PR checks heading did not use header highlight"
+  )
   wait_for(function()
     return buffer_contains(buf, "REJECTED by foo | 2026-06-14 17:15 | This requires a few changes...")
   end, "rejected review summary did not render")
   assert_true(buffer_contains(buf, "APPROVED by mgeorge | 2026-06-14 17:16 | LGTM!"), "approved review summary did not render")
+  assert_true(buffer_contains(buf, "COMMENTED by mgeorge | 2026-06-14 17:19 | Needs a follow-up"), "commented review summary did not render")
+  local rejected_summary_row = find_row(buf, "REJECTED by foo")
+  local approved_summary_row = find_row(buf, "APPROVED by mgeorge")
+  local commented_summary_row = find_row(buf, "COMMENTED by mgeorge")
+  for _, review_summary_row in ipairs({ rejected_summary_row, approved_summary_row, commented_summary_row }) do
+    local review_summary_line = vim.api.nvim_buf_get_lines(buf, review_summary_row - 1, review_summary_row, false)[1] or ""
+    assert_true(not review_summary_line:match("^%S+%s+|"), "review summary kept a pipe after the icon: " .. review_summary_line)
+    assert_true(not line_has_highlight(buf, review_summary_row, "DiffReviewReviewCommentHeader"), "review summary should not use blue header highlight: " .. review_summary_line)
+  end
+  assert_true(line_has_highlight(buf, rejected_summary_row, "DiffReviewDeleteRange"), "rejected review summary did not highlight status red")
+  assert_true(line_has_highlight(buf, approved_summary_row, "DiffReviewAddRange"), "approved review summary did not highlight status green")
+  assert_true(not line_has_highlight(buf, commented_summary_row, "DiffReviewAddRange"), "commented review summary should not be green")
+  assert_true(not line_has_highlight(buf, commented_summary_row, "DiffReviewDeleteRange"), "commented review summary should not be red")
   local changes_file_row = find_row(buf, "src/a.txt +1 -1")
+  local recent_commits_row = find_row(buf, "Recent Commits (2):")
+  assert_true(recent_commits_row > changes_file_row, "PR recent commits section did not render at the end")
+  assert_true(
+    not pcall(find_row_after, buf, "abc1234 feature chore: head commit", recent_commits_row),
+    "PR recent commits should start folded"
+  )
+  move_cursor(buf, recent_commits_row)
+  trigger_buf_mapping(buf, "<Tab>")
+  local head_commit_row = find_row_after(buf, "abc1234 feature chore: head commit", recent_commits_row)
+  local base_commit_row = find_row_after(buf, "1111111 feat: base commit", head_commit_row)
+  assert_true(head_commit_row > recent_commits_row, "PR head commit did not render under Recent Commits")
+  assert_true(base_commit_row > head_commit_row, "PR commits did not render newest first")
   move_cursor(buf, changes_file_row)
   trigger_buf_mapping(buf, "<Tab>")
   wait_for(function() return buffer_contains(buf, "NEW LINE") end, "PR changed file did not expand")
@@ -706,6 +868,7 @@ local function run()
     return not buffer_contains(buf, "Second full line for expansion")
   end, "regular PR conversation comment did not collapse")
   opened_urls = {}
+  assert_browse_url(buf, lint_check_row, "https://github.com/owner/repo/actions/runs/123/job/456", "PR check row")
   assert_browse_url(buf, regular_comment_row, "https://github.com/owner/repo/pull/7#issuecomment-4702465966", "regular PR comment")
   assert_browse_url(buf, rejected_review_row, "https://github.com/owner/repo/pull/7#pullrequestreview-4493241278", "review summary")
   assert_browse_url(buf, inline_comment_row, "https://github.com/owner/repo/pull/7#discussion_r3409923137", "inline code comment")
@@ -715,6 +878,14 @@ local function run()
   trigger_buf_mapping(buf, "C")
   wait_for(function() return buffer_contains(buf, "Comments (3):") end, "regular PR comment draft did not update the comments count")
   local regular_draft_header_row = find_row_after(buf, "you |", regular_comment_row)
+  assert_true(
+    not line_has_highlight(buf, regular_draft_header_row, "DiffReviewReviewCommentHeader"),
+    "new regular PR comment used the blue review-comment header highlight"
+  )
+  assert_true(
+    line_has_highlight(buf, regular_draft_header_row, "DiffReviewReviewComment"),
+    "new regular PR comment did not use the regular comment highlight"
+  )
   local regular_draft_body_row = regular_draft_header_row + 1
   edit_line(buf, regular_draft_body_row, "Regular from PR overview")
   assert_true(vim.bo[buf].modified, "regular PR comment edit must mark the PR buffer modified")
@@ -724,9 +895,14 @@ local function run()
   assert_true(issue_payload.body == "Regular from PR overview", "wrong regular PR comment body: " .. vim.inspect(issue_payload))
   wait_for(function() return saw_notification_containing("PR comment synced") end, "successful regular PR comment sync was not notified")
   assert_true(buffer_contains(buf, "Regular from PR overview"), "posted regular PR comment disappeared from the PR overview")
+  local synced_regular_row = find_row(buf, "Regular from PR overview")
+  assert_true(
+    not line_has_highlight(buf, synced_regular_row, "DiffReviewReviewCommentHeader"),
+    "synced regular PR comment used the blue review-comment header highlight"
+  )
   assert_browse_url(
     buf,
-    find_row(buf, "Regular from PR overview"),
+    synced_regular_row,
     "https://github.com/owner/repo/pull/7#issuecomment-4702465999",
     "fresh regular PR comment"
   )
@@ -879,13 +1055,22 @@ local function run()
   issue_reference_search_calls = {}
   assert_issue_completion(buf, body_row, "Line #z")
   assert_true(
-    #issue_reference_search_calls == 3,
-    "PR description issue completion did not run prioritized searches: " .. vim.inspect(issue_reference_search_calls)
+    #issue_reference_search_calls == 0,
+    "PR description issue completion should not call gh search: " .. vim.inspect(issue_reference_search_calls)
   )
+
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_set_lines(buf, body_row - 1, body_row, false, { "Line one INSERT EDIT" })
+  vim.api.nvim_exec_autocmds("TextChangedI", { buffer = buf })
+  local insert_rows = marker_rows(buf)
   assert_true(
-    issue_reference_search_calls[1]:find("gh search issues z --repo owner/repo --assignee @me", 1, true) ~= nil,
-    "PR description issue completion did not search after one character: " .. tostring(issue_reference_search_calls[1])
+    #insert_rows == 1 and insert_rows[1] == find_row(buf, "Description:"),
+    "insert-mode description edit did not immediately mark Description dirty: " .. vim.inspect(insert_rows)
   )
+  vim.api.nvim_buf_set_lines(buf, body_row - 1, body_row, false, { "Line one" })
+  vim.api.nvim_exec_autocmds("TextChangedI", { buffer = buf })
+  assert_true(#marker_rows(buf) == 0, "restoring PR description during insert mode did not clear dirty marker")
+
   edit_line(buf, body_row, "Line one")
   assert_true(#marker_rows(buf) == 0, "restoring PR description after issue completion left dirty markers")
   vim.bo[buf].modified = false
@@ -1098,6 +1283,7 @@ vim.notify = original_notify
 diff_review.reset_git_backend()
 gh.reset_backend()
 github_gh.reset_backend()
+issue_index._reset_for_test()
 repo_cache.set_data_dir_for_test(nil)
 vim.fn.delete(repo_cache_dir, "rf")
 if not ok then

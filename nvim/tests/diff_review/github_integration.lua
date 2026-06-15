@@ -4,6 +4,7 @@ local diff_review = require("diff_review")
 local ai_commit = require("diff_review.ai_commit")
 local commit = require("diff_review.commit")
 local gh = require("diff_review.gh")
+local issue_index = require("github.issue_index")
 local original_notify = vim.notify
 local original_system = vim.system
 
@@ -204,7 +205,7 @@ local function respond_current_pr_lookup(cb)
   end
 end
 
-function gh_backend.system_async(command, _, cb, cwd)
+function gh_backend.system_async(command, input, cb, cwd)
   record("gh_system_async", command, cwd)
   vim.defer_fn(function()
     local key = command_key(command)
@@ -232,6 +233,50 @@ function gh_backend.system_async(command, _, cb, cwd)
         " 8 files changed, 37 insertions(+), 23 deletions(-)",
       }, "\n")
       cb({ code = 0, stdout = diff, stderr = "", output = diff })
+      return
+    end
+    if key == "gh\tapi\tgraphql\t--input\t-" then
+      local graphql_payload = vim.json.decode(input or "{}")
+      local query = tostring(graphql_payload.query or "")
+      if query:find("statusCheckRollup", 1, true) then
+        local stdout = vim.json.encode({
+          data = {
+            repository = {
+              pullRequest = {
+                commits = {
+                  nodes = {
+                    {
+                      commit = {
+                        statusCheckRollup = {
+                          contexts = {
+                            nodes = {
+                              {
+                                __typename = "CheckRun",
+                                name = "Dummy Typecheck",
+                                status = "COMPLETED",
+                                conclusion = "SUCCESS",
+                                detailsUrl = "https://github.example.test/org/repo/actions/runs/42/job/101",
+                                checkSuite = {
+                                  workflowRun = {
+                                    workflow = { name = "PR Dummy Checks" },
+                                  },
+                                },
+                              },
+                            },
+                          },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        })
+        cb({ code = 0, stdout = stdout, stderr = "", output = stdout })
+        return
+      end
+      cb({ code = 0, stdout = vim.json.encode({ data = { repository = { pullRequest = {} } } }), stderr = "", output = "" })
       return
     end
     cb({ code = 1, stdout = "", stderr = "unexpected gh command: " .. key, output = "unexpected gh command: " .. key })
@@ -379,6 +424,35 @@ local function run()
   diff_review.set_git_backend(git_backend)
   ai_commit.set_backend(ai_backend)
   gh.set_backend(gh_backend)
+  issue_index._reset_for_test()
+  issue_index._set_progress_enabled_for_test(false)
+  issue_index._set_runner_for_test(function(command, _, callback)
+    local action = command[2]
+    if action == "state" then
+      callback({ code = 0, stdout = vim.json.encode({}), stderr = "", output = "{}" })
+      return
+    end
+    if action == "upsert-page" or action == "snapshot" then
+      callback({ code = 0, stdout = vim.json.encode({}), stderr = "", output = "{}" })
+      return
+    end
+    callback({ code = 1, stdout = "", stderr = "unexpected issue-index action: " .. tostring(action), output = "unexpected issue-index action: " .. tostring(action) })
+  end)
+  issue_index._set_gh_runner_for_test(function(_, _, callback)
+    local stdout = vim.json.encode({
+      data = {
+        rateLimit = { remaining = 5000 },
+        repository = {
+          issues = {
+            totalCount = 0,
+            pageInfo = { hasNextPage = false, endCursor = vim.NIL },
+            nodes = {},
+          },
+        },
+      },
+    })
+    callback({ code = 0, stdout = stdout, stderr = "", output = stdout })
+  end)
   vim.notify = function(message, level, opts)
     notifications[#notifications + 1] = {
       message = tostring(message),
@@ -494,9 +568,11 @@ local function run()
   )
   assert_true(buffer_contains(pr_buf, "Description:"), "PRView missing description heading")
   assert_true(buffer_contains(pr_buf, "- status row"), "PRView missing markdown body")
+  wait_for(function() return buffer_contains(pr_buf, "Dummy Typecheck") end, "PRView missing check status row")
   assert_true(buffer_contains(pr_buf, "Head:"), "PRView missing head row")
   assert_true(buffer_contains(pr_buf, "Changes (2):"), "PRView missing changes heading")
   assert_true(buffer_contains(pr_buf, "lua/diff_review/gh.lua +100 -0"), "PRView missing file change row")
+  assert_true(buffer_contains(pr_buf, "Recent Commits (1):"), "PRView missing recent commits section")
   trigger_normal_mapping("<Tab>", find_row(pr_buf, "lua/diff_review/gh.lua"))
   wait_for(function() return buffer_contains(pr_buf, "@@ +1 -0") or buffer_contains(pr_buf, "No textual diff") end, "PR file did not expand")
   assert_true(not buffer_contains(pr_buf, "ASourceChunk.ts"), "PR diffstat leaked into expanded hunk")
@@ -577,7 +653,7 @@ local function run()
   pr_mode = "unavailable"
   diff_review.render_status(status_buf, nil, nil, { refresh_pr = true })
   wait_for(function() return buffer_contains(status_buf, "PR:     unavailable") end, "PR row did not render unavailable state")
-  assert_true(#notifications == 0, "unavailable PR lookup should not emit error notifications")
+  assert_true(#notifications == 0, "unavailable PR lookup should not emit error notifications: " .. vim.inspect(notifications))
   assert_true(generate_count == count_before_unavailable, "unavailable PR lookup should not restart AI generation")
 
   gh.reset_backend()
@@ -771,6 +847,7 @@ diff_review.reset_git_backend()
 ai_commit.reset_backend()
 gh.reset_backend()
 gh.reset_timeout_ms()
+issue_index._reset_for_test()
 vim.system = original_system
 vim.notify = original_notify
 if not ok then

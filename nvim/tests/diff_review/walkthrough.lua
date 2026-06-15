@@ -149,6 +149,14 @@ local function buffer_contains(buf, needle)
   return false
 end
 
+local function buffer_has_highlight(buf, hl_group)
+  local marks = vim.api.nvim_buf_get_extmarks(buf, walkthrough._ns, 0, -1, { details = true })
+  for _, mark in ipairs(marks) do
+    if mark[4].hl_group == hl_group then return true end
+  end
+  return false
+end
+
 local function find_row(buf, needle)
   local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
   for index, line in ipairs(lines) do
@@ -217,8 +225,8 @@ end
 
 local function valid_doc()
   return {
-    version = 2,
-    overview = "Adds NEW lines to a.txt and b.txt as a walkthrough fixture. The structured parts drive both the summary graph and Part N.M comment labels.",
+    version = 4,
+    overview = "Update walkthrough fixture files. Before, the fixture rows used the old text. Now, the structured parts drive both the summary graph and Part N.M comment labels.",
     root = "Update walkthrough fixture files.",
     commit = head_sha,
     parts = {
@@ -229,16 +237,23 @@ local function valid_doc()
             title = "Fixture edits",
             items = {
               {
-                marker = "*",
-                title = "a.txt rewrite",
-                note = "rewrites the second line for the first fixture file",
-                steps = {
+                action = "Update",
+                title = "fixture rewrite flow",
+                note = "group the concrete file rewrites under one review story",
+                children = {
                   {
-                    title = "First change",
-                    file = "a.txt",
-                    start = { line = 2, col = 1 },
-                    ["end"] = { line = 2, col = 9 },
-                    comment = "The a.txt second line was rewritten to NEW.",
+                    action = "Update",
+                    title = "a.txt rewrite",
+                    note = "rewrite the second line for the first fixture file",
+                    steps = {
+                      {
+                        title = "First change",
+                        file = "a.txt",
+                        start = { line = 2, col = 1 },
+                        ["end"] = { line = 2, col = 9 },
+                        comment = "The a.txt second line was rewritten to NEW.",
+                      },
+                    },
                   },
                 },
               },
@@ -253,9 +268,9 @@ local function valid_doc()
             title = "Fixture edits",
             items = {
               {
-                marker = "*",
+                action = "Update",
                 title = "b.txt rewrite",
-                note = "repeats the rewrite so navigation crosses parts",
+                note = "repeat the rewrite so navigation crosses parts",
                 steps = {
                   {
                     file = "b.txt",
@@ -309,16 +324,17 @@ local function run()
 
   local summary_buf = start_walkthrough(buf)
   assert_true(not buffer_contains(summary_buf, "WARNING"), "fresh walkthrough should not warn")
-  local diagram_line = "├── Update a.txt through the first part."
-  for _, line in ipairs(vim.api.nvim_buf_get_lines(summary_buf, 0, -1, false)) do
-    if line == diagram_line then
-      diagram_line = nil
-      break
-    end
-  end
-  assert_true(diagram_line == nil, "summary diagram line was not preserved verbatim")
-  assert_true(buffer_contains(summary_buf, "Major changes:"), "derived summary missing major changes heading")
-  assert_true(buffer_contains(summary_buf, "Legend: + new, * modified, ~ removed/split, > ownership moved"), "derived summary missing legend")
+  assert_true(not buffer_contains(summary_buf, "Major changes:"), "summary should not show redundant major changes heading")
+  assert_true(not buffer_contains(summary_buf, "├── Update a.txt through the first part."), "summary should not show redundant top-level graph")
+  assert_true(buffer_contains(summary_buf, "       └── Modify fixture rewrite flow"), "summary parent action row missing")
+  assert_true(buffer_contains(summary_buf, "           └── Modify a.txt rewrite"), "summary child action row missing display verb")
+  assert_true(buffer_has_highlight(summary_buf, "DiffReviewWalkthroughActionUpdate"), "summary action highlight missing")
+  assert_true(buffer_has_highlight(summary_buf, "DiffReviewWalkthroughItemTitle"), "summary item title highlight missing")
+  local action_hl = vim.api.nvim_get_hl(0, { name = "DiffReviewWalkthroughActionUpdate" })
+  assert_true(action_hl.italic == true, "summary action highlight should be italic")
+  local title_hl = vim.api.nvim_get_hl(0, { name = "DiffReviewWalkthroughItemTitle" })
+  assert_true(title_hl.bold == true and title_hl.fg == 0xffffff, "summary item title should be bold white")
+  assert_true(not buffer_contains(summary_buf, "Legend:"), "summary should not show an action legend")
   trigger_buf_mapping(summary_buf, "y")
 
   wait_for(function() return buffer_contains(buf, "NEW a.txt") end, "step 1 did not expand a.txt hunks")
@@ -329,7 +345,7 @@ local function run()
   assert_true(box_contains(buf, "rewritten to NEW"), "inline comment box missing")
   assert_true(box_contains(buf, "Part 1.1 - First change"), "inline box heading missing")
   assert_true(box_contains(buf, "Update a.txt through the first part."), "part context missing")
-  assert_true(box_contains(buf, "Fixture edits / *a.txt rewrite"), "group/item context missing")
+  assert_true(box_contains(buf, "Fixture edits / Modify fixture rewrite flow / Modify a.txt rewrite"), "group/item context missing")
   assert_true(box_contains(buf, " a.txt "), "file basename missing from the box header")
 
   -- ── navigation: forward to step 2, back, back to summary, quit ────────────
@@ -392,9 +408,9 @@ local function run()
           title = "Stale targets",
           items = {
             {
-              marker = "*",
+              action = "Update",
               title = "Stale line reference",
-              note = "falls back to the nearest rendered line",
+              note = "fall back to the nearest rendered line",
               steps = {
                 {
                   file = "a.txt",
@@ -405,9 +421,9 @@ local function run()
               },
             },
             {
-              marker = "*",
+              action = "Update",
               title = "Missing file reference",
-              note = "surfaces a missing-file note instead of failing",
+              note = "surface a missing-file note instead of failing",
               steps = {
                 {
                   file = "gone.txt",
@@ -441,9 +457,9 @@ local function run()
           title = "Fixture diff sections",
           items = {
             {
-              marker = "*",
+              action = "Update",
               title = "Staged region",
-              note = "anchors a step that only appears in the staged section",
+              note = "anchor a step that only appears in the staged section",
               steps = {
                 {
                   title = "Staged region",
@@ -455,9 +471,9 @@ local function run()
               },
             },
             {
-              marker = "*",
+              action = "Update",
               title = "Split region",
-              note = "anchors at the first rendered row inside a split range",
+              note = "anchor at the first rendered row inside a split range",
               steps = {
                 {
                   title = "Split region",
@@ -523,7 +539,7 @@ local function run()
   fixtures[root .. "/.walkthrough.json"] = vim.json.encode({ version = 1, summary = "x", commit = "zz", steps = {} })
   captured_notifications = {}
   trigger_buf_mapping(buf, "ow")
-  wait_for(function() return saw_notification_containing("expected 2") end, "v1 rejection notification absent")
+  wait_for(function() return saw_notification_containing("expected 4") end, "v1 rejection notification absent")
 end
 
 local ok, err = xpcall(run, debug.traceback)

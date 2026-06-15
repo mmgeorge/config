@@ -298,6 +298,8 @@ function M.enable_user_completion(buf, repo)
   if repo and repo ~= "" then vim.b[buf].github_repo = repo end
   vim.b[buf].github_user_completion = true
   vim.b[buf].diff_review_pr_reviewer_completion = true
+  local ok, issue_index = pcall(require, "github.issue_index")
+  if ok then issue_index.ensure_for_buffer(buf, repo) end
 end
 
 ---@param buf integer?

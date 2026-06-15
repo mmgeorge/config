@@ -42,6 +42,18 @@ return {
         desc = "Open a GitHub issue buffer",
       })
 
+      vim.api.nvim_create_user_command("GithubIssueSync", function(opts)
+        require("github.issue_index").sync_current({
+          scope = vim.trim(opts.args or "") == "all" and "all" or "open",
+        })
+      end, {
+        nargs = "?",
+        complete = function()
+          return { "all" }
+        end,
+        desc = "Sync GitHub issues for the current repo into the local issue index",
+      })
+
       vim.api.nvim_create_user_command("GithubPR", function()
         require("github.pickers").prs()
       end, {

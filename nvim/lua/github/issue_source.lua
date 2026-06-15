@@ -8,9 +8,7 @@ local source = {}
 ---@field start_col integer
 ---@field query string
 
-local cache_ttl_ms = 30 * 1000
 local notification_ttl_ms = 10 * 1000
-local completion_cache = {}
 local notification_times = {}
 
 ---@param key string
@@ -133,50 +131,17 @@ function source:get_completions(ctx, callback)
     return
   end
 
-  local cache_key = table.concat({ repo:lower(), match.query:lower() }, "\n")
-  local now = vim.uv.now()
-  local cached = completion_cache[cache_key]
-  if cached and now - cached.time < cache_ttl_ms then
+  self.request_id = self.request_id + 1
+  local request_id = self.request_id
+  vim.schedule(function()
+    if request_id ~= self.request_id then return end
+    local raw_items = require("github.issue_index").search(repo, match.query, { limit = 20 })
     local items = {}
-    for index, item in ipairs(cached.items) do
+    for index, item in ipairs(raw_items) do
       items[#items + 1] = completion_item(item, match, index)
     end
     callback({ items = items, is_incomplete_backward = true, is_incomplete_forward = true })
-    return
-  end
-
-  self.request_id = self.request_id + 1
-  local request_id = self.request_id
-  vim.defer_fn(function()
-    if request_id ~= self.request_id then return end
-    require("github.gh").search_issue_references_async(vim.fn.getcwd(), repo, match.query, function(result)
-      if request_id ~= self.request_id then return end
-      local raw_items = result.ok and result.items or {}
-      if not result.ok then
-        notify_once(
-          table.concat({ "search-failed", repo:lower(), match.query:lower() }, "\n"),
-          ("GitHub issue completion failed for #%s in %s:\n%s"):format(
-            match.query,
-            repo,
-            result.message or "GitHub issue search failed"
-          ),
-          vim.log.levels.ERROR
-        )
-      elseif #raw_items == 0 then
-        notify_once(
-          table.concat({ "no-matches", repo:lower(), match.query:lower() }, "\n"),
-          ("No open GitHub issue matched #%s in %s"):format(match.query, repo),
-          vim.log.levels.INFO
-        )
-      end
-      if result.ok then completion_cache[cache_key] = { time = vim.uv.now(), items = raw_items } end
-      local items = {}
-      for index, item in ipairs(raw_items) do
-        items[#items + 1] = completion_item(item, match, index)
-      end
-      callback({ items = items, is_incomplete_backward = true, is_incomplete_forward = true })
-    end)
-  end, tonumber(self.opts.debounce_ms) or 120)
+  end)
 end
 
 return source

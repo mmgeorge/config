@@ -123,7 +123,7 @@
 ---@field segments table[]
 ---@field entry? DiffReviewStatusEntry
 
----@alias DiffReviewStatusSectionName "unstaged"|"staged"|"untracked"|"unmerged"|"recent"
+---@alias DiffReviewStatusSectionName "unstaged"|"staged"|"untracked"|"unmerged"|"recent"|"pr_commits"
 
 ---@class DiffReviewTreeSitterContextPending
 ---@field pending true
@@ -3966,6 +3966,98 @@ function M._pr_overview.status_text(pr)
   return pr and pr.isDraft and "DRAFT" or "READY"
 end
 
+---@param check DiffReviewGhPRCheck
+---@return string
+function M._pr_overview.check_state_text(check)
+  local state = vim.trim(tostring(check and check.state or ""))
+  if state == "" then state = "UNKNOWN" end
+  return state:gsub("_", " "):upper()
+end
+
+---@param check DiffReviewGhPRCheck
+---@return boolean
+function M._pr_overview.check_is_green(check)
+  local state = tostring(check and check.state or ""):lower()
+  return state == "success"
+end
+
+---@param check DiffReviewGhPRCheck
+---@return string icon
+---@return string hl_group
+function M._pr_overview.check_icon(check)
+  local state = tostring(check and check.state or ""):lower()
+  if state == "success" then return "✓", "DiffReviewAddRange" end
+  if state == "failure" or state == "error" or state == "timed_out" or state == "startup_failure" or state == "action_required" then
+    return "✗", "DiffReviewDeleteRange"
+  end
+  if state == "cancelled" or state == "skipped" or state == "neutral" then return "!", "DiffReviewStatusFetching" end
+  return "◷", "DiffReviewStatusFetching"
+end
+
+---@param check DiffReviewGhPRCheck
+---@return string
+function M._pr_overview.check_workflow_suffix(check)
+  local workflow_name = vim.trim(tostring(check and check.workflow_name or ""))
+  local name = vim.trim(tostring(check and check.name or ""))
+  if workflow_name == "" or workflow_name == name then return "" end
+  return workflow_name
+end
+
+---@param pr DiffReviewGhPR
+---@param status table?
+---@return DiffReviewStatusHeadLine[]
+function M._pr_overview.check_head_lines(pr, status)
+  local lines = {}
+  lines[#lines + 1] = { segments = { { "" } } }
+  lines[#lines + 1] = { segments = { { "Status:", "DiffReviewStatusHeader" } } }
+  if not (pr.repo and pr.repo ~= "") then
+    lines[#lines + 1] = { segments = { { "  No checks", "Comment" } } }
+    return lines
+  end
+  if status and status.pr_checks_error then
+    lines[#lines + 1] = { segments = { { "  " .. tostring(status.pr_checks_error), "ErrorMsg" } } }
+    return lines
+  end
+  if status and status.pr_checks_loading then
+    lines[#lines + 1] = { segments = { { "  ...loading checks...", "DiffReviewStatusFetching" } } }
+    return lines
+  end
+  local checks = status and status.pr_checks or nil
+  if type(checks) ~= "table" then
+    lines[#lines + 1] = { segments = { { "  ...loading checks...", "DiffReviewStatusFetching" } } }
+    return lines
+  end
+  if #checks == 0 then
+    lines[#lines + 1] = { segments = { { "  No checks", "Comment" } } }
+    return lines
+  end
+  for check_index, check in ipairs(checks) do
+    local icon, icon_hl = M._pr_overview.check_icon(check)
+    local state_text = M._pr_overview.check_state_text(check)
+    local workflow_suffix = M._pr_overview.check_workflow_suffix(check)
+    local state_hl = M._pr_overview.check_is_green(check) and "DiffReviewAddRange" or icon_hl
+    local segments = {
+      { "  " .. icon .. " ", icon_hl },
+      { state_text, state_hl },
+      { " ", "Comment" },
+      { tostring(check.name or "Check"), "DiffReviewStatusPath" },
+    }
+    if workflow_suffix ~= "" then
+      segments[#segments + 1] = { " | ", "Comment" }
+      segments[#segments + 1] = { workflow_suffix, "DiffReviewStatusRemote" }
+    end
+    lines[#lines + 1] = {
+      segments = segments,
+      entry = {
+        id = "pr:check:" .. tostring(check_index) .. ":" .. tostring(check.name or "check"),
+        kind = "pr_check",
+        pr_check = check,
+      },
+    }
+  end
+  return lines
+end
+
 ---@param pr DiffReviewGhPR
 ---@param status table?
 ---@return DiffReviewStatusHeadLine[]
@@ -4002,6 +4094,7 @@ local function status_pr_detail_head_lines(pr, status)
       { M._pr_overview.status_text(pr), pr.isDraft and "DiffReviewStatusFetching" or "DiffReviewStatusBranch" },
     },
   }
+  vim.list_extend(lines, M._pr_overview.check_head_lines(pr, status))
   lines[#lines + 1] = { segments = { { "" } } }
   lines[#lines + 1] = { segments = { { "Description:", "DiffReviewStatusHeader" } } }
   for _, line in ipairs(status_markdown_lines(pr.body)) do
@@ -4014,10 +4107,12 @@ end
 ---@param repo string?
 function M.github_load_repo_metadata(cwd, repo)
   local cache = require("github.repo_cache")
+  local issue_index_ok, issue_index = pcall(require, "github.issue_index")
   if repo and repo ~= "" then
     cache.ensure_metadata(cwd, repo, function(done)
       gh.repo_contributors_async(cwd, repo, done)
     end)
+    if issue_index_ok then issue_index.ensure_repo(cwd, repo, { manual = false }) end
     return
   end
   cache.ensure_metadata_for_cwd(cwd, function(done)
@@ -4025,6 +4120,7 @@ function M.github_load_repo_metadata(cwd, repo)
   end, function(resolved_repo, done)
     gh.repo_contributors_async(cwd, resolved_repo, done)
   end)
+  if issue_index_ok then issue_index.ensure_current(cwd, { manual = false }) end
 end
 
 ---@param cwd string
@@ -4810,18 +4906,51 @@ function M._pr_overview.review_state_label(state)
   return state
 end
 
+---@param state string?
+---@return string icon
+---@return string status_hl
+function M._pr_overview.review_state_style(state)
+  local label = M._pr_overview.review_state_label(state)
+  if label == "APPROVED" then return "✓", "DiffReviewAddRange" end
+  if label == "REJECTED" then return "✗", "DiffReviewDeleteRange" end
+  return M._comment_icon, "DiffReviewReviewComment"
+end
+
+---@param review DiffReviewGhSubmittedReview
+---@return string[] tail_parts
+function M._pr_overview.review_summary_tail_parts(review)
+  local tail_parts = {}
+  local datetime = M._pr_overview.comment_datetime(review.submitted_at or review.updated_at or review.created_at)
+  if datetime ~= "" then tail_parts[#tail_parts + 1] = datetime end
+  local preview = M._pr_overview.comment_preview(review.body or "")
+  if preview ~= "" then tail_parts[#tail_parts + 1] = preview end
+  return tail_parts
+end
+
 ---@param review DiffReviewGhSubmittedReview
 ---@return string
 function M._pr_overview.review_summary_line(review)
-  local parts = {
-    M._comment_icon,
-    ("%s by %s"):format(M._pr_overview.review_state_label(review.state), tostring(review.user or "unknown")),
-  }
-  local datetime = M._pr_overview.comment_datetime(review.submitted_at or review.updated_at or review.created_at)
-  if datetime ~= "" then parts[#parts + 1] = datetime end
-  local preview = M._pr_overview.comment_preview(review.body or "")
-  if preview ~= "" then parts[#parts + 1] = preview end
+  local icon = M._pr_overview.review_state_style(review.state)
+  local parts = { ("%s %s by %s"):format(icon, M._pr_overview.review_state_label(review.state), tostring(review.user or "unknown")) }
+  vim.list_extend(parts, M._pr_overview.review_summary_tail_parts(review))
   return table.concat(parts, " | ")
+end
+
+---@param review DiffReviewGhSubmittedReview
+---@return table[]
+function M._pr_overview.review_summary_segments(review)
+  local label = M._pr_overview.review_state_label(review.state)
+  local icon, status_hl = M._pr_overview.review_state_style(review.state)
+  local segments = {
+    { icon .. " ", status_hl },
+    { label, status_hl },
+    { " by " .. tostring(review.user or "unknown"), "DiffReviewReviewComment" },
+  }
+  for _, tail in ipairs(M._pr_overview.review_summary_tail_parts(review)) do
+    segments[#segments + 1] = { " | ", "DiffReviewReviewComment" }
+    segments[#segments + 1] = { tail, "DiffReviewReviewComment" }
+  end
+  return segments
 end
 
 ---@param comments? DiffReviewGhPRCommentsResult
@@ -5131,6 +5260,50 @@ function M._pr_overview.review_context_files(cwd, pr, diff_text, review)
   return result
 end
 
+---@param raw_commit DiffReviewGhPRCommit|table
+---@param branch? string
+---@return DiffReviewStatusCommit?
+function M._pr_overview.status_commit_from_pr_commit(raw_commit, branch)
+  if type(raw_commit) ~= "table" then return nil end
+  local oid = vim.trim(tostring(raw_commit.oid or raw_commit.sha or raw_commit.id or ""))
+  if oid == "" then return nil end
+  local cache = M._status and M._status.commit_file_cache and M._status.commit_file_cache[oid] or nil
+  local short_oid = vim.trim(tostring(raw_commit.shortOid or raw_commit.short_oid or raw_commit.abbreviatedOid or ""))
+  if short_oid == "" then short_oid = status_short_oid(oid) end
+  return {
+    oid = oid,
+    short_oid = short_oid,
+    branch = branch,
+    subject = tostring(raw_commit.messageHeadline or raw_commit.subject or raw_commit.message or ""),
+    files = cache and cache.files or nil,
+    files_loaded = cache and cache.files_loaded or false,
+    files_loading = cache and cache.files_loading or false,
+    files_error = cache and cache.files_error or nil,
+  }
+end
+
+---@param pr DiffReviewGhPR
+---@return DiffReviewStatusSection?
+function M._pr_overview.commits_section(pr)
+  local raw_commits = pr.commits or {}
+  if type(raw_commits) ~= "table" or #raw_commits == 0 then return nil end
+  local commits = {}
+  for raw_index = #raw_commits, 1, -1 do
+    local branch = #commits == 0 and pr.headRefName or nil
+    local commit = M._pr_overview.status_commit_from_pr_commit(raw_commits[raw_index], branch)
+    if commit then commits[#commits + 1] = commit end
+  end
+  if #commits == 0 then return nil end
+  return {
+    name = "pr_commits",
+    title = "Recent Commits",
+    default_folded = true,
+    files = {},
+    files_by_name = {},
+    commits = commits,
+  }
+end
+
 ---@param cwd string
 ---@param pr DiffReviewGhPR
 ---@param diff_text? string
@@ -5167,6 +5340,8 @@ local function status_pr_sections(cwd, pr, diff_text, comments, local_comments, 
   local reviews_section = M._pr_overview.reviews_section(comments)
   if reviews_section then sections[#sections + 1] = reviews_section end
   vim.list_extend(sections, change_sections)
+  local commits_section = M._pr_overview.commits_section(pr)
+  if commits_section then sections[#sections + 1] = commits_section end
   return sections
 end
 
@@ -5713,6 +5888,8 @@ end
 function M._pr_overview.entry_url(pr, entry)
   if not entry then return nil end
   local base_url = M._pr_overview.pr_base_url(pr)
+  local check = entry.pr_check
+  if check and check.url and check.url ~= "" then return check.url end
   local reply = entry.pr_comment_reply or entry.review_reply
   if reply then
     if reply.url and reply.url ~= "" then return reply.url end
@@ -5830,10 +6007,8 @@ end
 ---@param review DiffReviewGhSubmittedReview
 function M._pr_overview.render_review(review)
   local review_key = M._pr_overview.review_key(review)
-  local summary = M._pr_overview.review_summary_line(review)
   local entry = { id = review_key, kind = "pr_review", pr_review = review }
-  local line_number = status_add_line(summary, entry, "DiffReviewReviewCommentHeader")
-  status_add_highlight(line_number, 0, #summary, "DiffReviewReviewCommentHeader")
+  status_add_segment_line(M._pr_overview.review_summary_segments(review), entry)
   if status_folded(review_key, true) then return end
   M._pr_overview.render_review_context(review)
 end
@@ -5841,11 +6016,6 @@ end
 ---@param comment table
 ---@param index integer
 function M._pr_overview.render_issue_comment(comment, index)
-  if comment.pr_issue_comment then
-    M._review.emit_comment(comment, index, 0)
-    return
-  end
-
   local entry_id = M._pr_overview.issue_comment_entry_id(comment, index)
   local expanded = not status_folded(entry_id, true)
   local line = M._pr_overview.issue_comment_line(comment, expanded)
@@ -6832,6 +7002,39 @@ function M._pr_overview.load_comments(pr, cwd, buf)
       return
     end
     latest_status.pr_comments = result
+    render_pr_status(pr, cwd, buf, latest_status.pr_diff_text)
+  end)
+end
+
+---@param pr DiffReviewGhPR
+---@param cwd string
+---@param buf integer
+function M._pr_overview.load_checks(pr, cwd, buf)
+  local status = M._status
+  if not (status and status.buf == buf and pr.repo and pr.repo ~= "") then return end
+  status.pr_checks_request_id = (status.pr_checks_request_id or 0) + 1
+  status.pr_checks_loading = true
+  status.pr_checks_error = nil
+  local request_id = status.pr_checks_request_id
+  render_pr_status(pr, cwd, buf, status.pr_diff_text)
+  gh.pr_checks_async(cwd, pr.number, pr.repo, function(result)
+    local latest_status = M._status_states and M._status_states[buf] or nil
+    if not (
+      latest_status
+      and latest_status.pr_checks_request_id == request_id
+      and latest_status.buf == buf
+      and vim.api.nvim_buf_is_valid(buf)
+    ) then return end
+    M._status = latest_status
+    latest_status.pr_checks_loading = false
+    if not result.ok then
+      latest_status.pr_checks_error = result.message or "gh failed"
+      notify_error("GitHub PR checks failed: " .. latest_status.pr_checks_error, "DiffReview")
+      render_pr_status(pr, cwd, buf, latest_status.pr_diff_text)
+      return
+    end
+    latest_status.pr_checks_error = nil
+    latest_status.pr_checks = result.checks or {}
     render_pr_status(pr, cwd, buf, latest_status.pr_diff_text)
   end)
 end
@@ -8078,6 +8281,12 @@ function M._review.comment_at_row(buf, row)
   if entry and entry.kind == "review_comment" then
     return entry.review_comment, entry.comment_index
   end
+  if entry and entry.kind == "pr_comment" and entry.pr_comment then
+    for index, comment in ipairs(state.review_comments or {}) do
+      if M._review.same_comment(comment, entry.pr_comment) then return comment, index end
+    end
+    return nil
+  end
   local body_comment = M._review.comment_body_at_row(buf, row)
   if body_comment then
     for index, comment in ipairs(state.review_comments or {}) do
@@ -8184,6 +8393,12 @@ function M._review.on_render(buf)
   for row = 1, #lines do
     local entry = state.entries and state.entries[row] or nil
     if entry
+      and entry.kind == "pr_comment"
+      and entry.pr_comment
+      and not entry.pr_comment_body then
+      close_comment_range(row - 1)
+      entry.pr_comment.review_header_mark = vim.api.nvim_buf_set_extmark(buf, M._review.ns, row - 1, 0, { right_gravity = false })
+    elseif entry
       and entry.kind == "review_comment"
       and (entry.review_boundary == "header" or entry.review_boundary == "folded")
       and entry.review_comment then
@@ -8202,11 +8417,12 @@ function M._review.on_render(buf)
     elseif entry and entry.kind == "review_comment" and entry.review_boundary == "footer" and entry.review_comment then
       close_comment_range(row - 1)
       entry.review_comment.review_footer_mark = vim.api.nvim_buf_set_extmark(buf, M._review.ns, row - 1, 0, { right_gravity = true })
-    elseif entry and entry.review_body and entry.review_comment then
-      local comment = entry.review_comment
+    elseif entry and ((entry.review_body and entry.review_comment) or (entry.pr_comment_body and entry.pr_comment)) then
+      local comment = entry.review_comment or entry.pr_comment
+      local body_index = entry.review_body_index or entry.pr_comment_body_index
       comment.review_body_line_marks = comment.review_body_line_marks or {}
       local mark_id = vim.api.nvim_buf_set_extmark(buf, M._review.ns, row - 1, 0, { right_gravity = false })
-      comment.review_body_line_marks[#comment.review_body_line_marks + 1] = { id = mark_id, line_index = entry.review_body_index }
+      comment.review_body_line_marks[#comment.review_body_line_marks + 1] = { id = mark_id, line_index = body_index }
       if comment ~= range_comment then
         close_comment_range(row - 1)
         range_comment, range_start = comment, row
@@ -8252,6 +8468,11 @@ function M._review.comment_header_row0(buf, comment)
     if entry.kind == "review_comment"
       and (entry.review_boundary == "header" or entry.review_boundary == "folded")
       and M._review.same_comment(entry.review_comment, comment) then
+      return row - 1
+    elseif entry.kind == "pr_comment"
+      and entry.pr_comment
+      and not entry.pr_comment_body
+      and M._review.same_comment(entry.pr_comment, comment) then
       return row - 1
     end
   end
@@ -8800,7 +9021,10 @@ function M._review.sync_inline_comment_text(buf)
   elseif state.view_kind == "pr" then
     vim.bo[buf].modified = true
   end
-  M._review.refresh_inline_comment_header(buf, comment)
+  local is_regular_pr_comment = state.view_kind == "pr"
+    and M._pr_overview.is_regular_comment
+    and M._pr_overview.is_regular_comment(state, comment)
+  if not is_regular_pr_comment then M._review.refresh_inline_comment_header(buf, comment) end
   return true
 end
 
@@ -9094,6 +9318,24 @@ function M._pr_overview.comment_identity_key(comment)
 end
 
 ---@param status table
+---@param target table?
+---@return integer?
+function M._pr_overview.regular_comment_index(status, target)
+  if not (status and target) then return nil end
+  for index, comment in ipairs(status.pr_regular_comments or {}) do
+    if M._review.same_comment(comment, target) then return index end
+  end
+  return nil
+end
+
+---@param status table
+---@param comment table?
+---@return boolean
+function M._pr_overview.is_regular_comment(status, comment)
+  return M._pr_overview.regular_comment_index(status, comment) ~= nil
+end
+
+---@param status table
 ---@param comment table?
 ---@return boolean
 function M._pr_overview.is_standalone_comment(status, comment)
@@ -9220,7 +9462,9 @@ end
 ---@param remote table?
 ---@param queued_body string
 function M._pr_overview.apply_synced_regular_comment(status, comment, remote, queued_body)
-  comment.pr_issue_comment = true
+  local comment_index = M._pr_overview.regular_comment_index(status, comment)
+  local old_entry_id = comment_index and M._pr_overview.issue_comment_entry_id(comment, comment_index) or nil
+  local old_folded = old_entry_id and status_folded(old_entry_id, true) or nil
   if remote then
     comment.remote_id = remote.remote_id or comment.remote_id
     comment.remote_node_id = remote.remote_node_id or comment.remote_node_id
@@ -9240,6 +9484,12 @@ function M._pr_overview.apply_synced_regular_comment(status, comment, remote, qu
   comment.syncing = nil
   M._review.normalize_comment(status, comment)
   M._pr_overview.refresh_editable_comments(status)
+  if comment_index then
+    local new_entry_id = M._pr_overview.issue_comment_entry_id(comment, comment_index)
+    if old_entry_id and old_entry_id ~= new_entry_id and old_folded ~= nil then
+      set_status_folded(new_entry_id, old_folded)
+    end
+  end
 end
 
 ---@param status table
@@ -9314,12 +9564,12 @@ end
 ---@param buf integer
 ---@param comment table
 function M._pr_overview.sync_standalone_comment(buf, comment)
-  if comment and comment.pr_issue_comment then
+  local status = M._pr_overview.state(buf)
+  if not (status and status.pr and comment) then return end
+  if M._pr_overview.is_regular_comment(status, comment) or comment.pr_issue_comment then
     M._pr_overview.sync_regular_comment(buf, comment)
     return
   end
-  local status = M._pr_overview.state(buf)
-  if not (status and status.pr and comment) then return end
   local body = M._review.comment_body_for_sync(comment.body or "")
   if body == "" then
     comment.syncing = nil
@@ -9418,7 +9668,6 @@ function M._pr_overview.create_regular_comment(status)
   status.pr_regular_comments = status.pr_regular_comments or {}
   local created_at = os.date("%Y-%m-%d %H:%M")
   local comment = {
-    pr_issue_comment = true,
     body = "",
     user = "you",
     created_at = created_at,
@@ -9427,6 +9676,7 @@ function M._pr_overview.create_regular_comment(status)
   }
   M._review.normalize_comment(status, comment)
   status.pr_regular_comments[#status.pr_regular_comments + 1] = comment
+  set_status_folded(M._pr_overview.issue_comment_entry_id(comment, #status.pr_regular_comments), false)
   M._pr_overview.refresh_editable_comments(status)
   return comment
 end
@@ -10897,7 +11147,7 @@ function M._pr_edit.attach(buf)
       M._pr_edit.sync_modifiable(buf)
     end,
   })
-  vim.api.nvim_create_autocmd({ "InsertLeave", "TextChanged" }, {
+  vim.api.nvim_create_autocmd({ "InsertLeave", "TextChanged", "TextChangedI" }, {
     group = group,
     buffer = buf,
     callback = function()
@@ -11720,7 +11970,7 @@ local function status_toggle(entry)
     default = true
   elseif entry.kind == "commit" or entry.kind == "commit_file" then
     default = true
-  elseif entry.kind == "pr_comment" and entry.pr_comment and not entry.pr_comment.pr_issue_comment then
+  elseif entry.kind == "pr_comment" and entry.pr_comment then
     default = true
   elseif entry.kind == "pr_review" then
     default = true
@@ -11971,6 +12221,7 @@ local function setup_status_keymaps(buf)
         render_pr_status(status.pr, status.cwd, buf)
         load_pr_diff(status.pr, status.cwd, buf)
         M._pr_overview.load_comments(status.pr, status.cwd, buf)
+        M._pr_overview.load_checks(status.pr, status.cwd, buf)
       end
       return
     end
@@ -12222,6 +12473,7 @@ function M.open_pr(pr, opts)
   render_pr_status(pr, cwd, buf)
   load_pr_diff(pr, cwd, buf)
   M._pr_overview.load_comments(pr, cwd, buf)
+  M._pr_overview.load_checks(pr, cwd, buf)
   return buf
 end
 
