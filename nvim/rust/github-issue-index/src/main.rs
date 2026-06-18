@@ -1,9 +1,10 @@
 use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Read};
+use std::panic::{catch_unwind, set_hook, take_hook, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -260,24 +261,29 @@ fn open_database(path: &Path) -> Result<Database> {
     open_database_with_timeout(path, Duration::ZERO)
 }
 
+#[derive(Debug)]
+enum OpenDatabaseError {
+    Database(redb::DatabaseError),
+    Other(anyhow::Error),
+    Panic(String),
+}
+
 fn open_database_with_timeout(path: &Path, timeout: Duration) -> Result<Database> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     let started = Instant::now();
+    let mut recovered_corrupt_database = false;
     loop {
-        match Database::create(path) {
-            Ok(database) => {
-                initialize_tables(&database)?;
-                return Ok(database);
-            }
-            Err(error)
+        match try_open_database(path) {
+            Ok(database) => return Ok(database),
+            Err(OpenDatabaseError::Database(error))
                 if is_database_lock_error(&error)
                     && Instant::now().duration_since(started) < timeout =>
             {
                 thread::sleep(Duration::from_millis(DB_LOCK_RETRY_MS));
             }
-            Err(error) => {
+            Err(OpenDatabaseError::Database(error)) => {
                 let waited_ms = Instant::now().duration_since(started).as_millis();
                 return Err(anyhow!(error)).with_context(|| {
                     format!(
@@ -287,8 +293,79 @@ fn open_database_with_timeout(path: &Path, timeout: Duration) -> Result<Database
                     )
                 });
             }
+            Err(OpenDatabaseError::Panic(message)) if !recovered_corrupt_database => {
+                let archived = archive_corrupt_database(path, &message)?;
+                eprintln!(
+                    "Recovered corrupt issue index database by moving {} to {}: {}",
+                    path.display(),
+                    archived.display(),
+                    message
+                );
+                recovered_corrupt_database = true;
+            }
+            Err(OpenDatabaseError::Panic(message)) => {
+                return Err(anyhow!(
+                    "redb panicked while opening {} after corruption recovery: {}",
+                    path.display(),
+                    message
+                ));
+            }
+            Err(OpenDatabaseError::Other(error)) => return Err(error),
         }
     }
+}
+
+fn try_open_database(path: &Path) -> std::result::Result<Database, OpenDatabaseError> {
+    catch_unwind_silent(AssertUnwindSafe(|| {
+        let database = Database::create(path).map_err(OpenDatabaseError::Database)?;
+        initialize_tables(&database).map_err(OpenDatabaseError::Other)?;
+        Ok(database)
+    }))
+    .map_err(|payload| OpenDatabaseError::Panic(panic_payload_message(payload)))?
+}
+
+fn catch_unwind_silent<F, R>(operation: F) -> std::thread::Result<R>
+where
+    F: FnOnce() -> R + std::panic::UnwindSafe,
+{
+    let previous_hook = take_hook();
+    set_hook(Box::new(|_| {}));
+    let result = catch_unwind(operation);
+    set_hook(previous_hook);
+    result
+}
+
+fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    match payload.downcast::<String>() {
+        Ok(message) => *message,
+        Err(payload) => match payload.downcast::<&'static str>() {
+            Ok(message) => (*message).to_owned(),
+            Err(_) => "unknown panic payload".to_owned(),
+        },
+    }
+}
+
+fn archive_corrupt_database(path: &Path, reason: &str) -> Result<PathBuf> {
+    if !path.exists() {
+        return Err(anyhow!(
+            "redb panicked while opening {}, but no database file exists: {}",
+            path.display(),
+            reason
+        ));
+    }
+
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("database path has no UTF-8 file name: {}", path.display()))?;
+    let archived = path.with_file_name(format!("{file_name}.corrupt-{timestamp_ms}"));
+    fs::rename(path, &archived)
+        .with_context(|| format!("archive corrupt database {}", path.display()))?;
+    Ok(archived)
 }
 
 fn is_database_lock_error(error: &redb::DatabaseError) -> bool {
@@ -749,6 +826,39 @@ mod tests {
             .join()
             .map_err(|_| anyhow!("database opener thread panicked"))??;
         let _ = fs::remove_file(db_path);
+        Ok(())
+    }
+
+    #[test]
+    fn panic_payload_message_preserves_string_details() {
+        let result = catch_unwind_silent(|| panic!("allocator state corrupt"));
+        let payload = result.expect_err("test panic should be captured");
+        assert_eq!(panic_payload_message(payload), "allocator state corrupt");
+    }
+
+    #[test]
+    fn archive_corrupt_database_moves_only_database_file() -> Result<()> {
+        let db_path = temp_db("archive");
+        let snapshot_path = db_path.with_file_name("open-snapshot.json");
+        fs::write(&db_path, b"not a valid redb database")?;
+        fs::write(&snapshot_path, b"{\"issues\":[]}")?;
+
+        let archived = archive_corrupt_database(&db_path, "invalid allocator state")?;
+
+        assert!(!db_path.exists(), "corrupt database should be moved away");
+        assert!(archived.exists(), "archived corrupt database should exist");
+        assert!(snapshot_path.exists(), "snapshot must not be removed during database recovery");
+        assert!(
+            archived
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("")
+                .starts_with("github-issue-index-archive"),
+            "archive should keep original database file name"
+        );
+
+        let _ = fs::remove_file(archived);
+        let _ = fs::remove_file(snapshot_path);
         Ok(())
     }
 }

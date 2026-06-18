@@ -121,8 +121,9 @@ return {
       'ribru17/blink-cmp-spell'
     },
 
-    -- use a release tag to download pre-built binaries
+    -- Build the Rust fuzzy matcher locally instead of replacing a pre-built DLL.
     version = '1.*',
+    build = 'cargo build --release',
 
     init = function()
       vim.cmd([[highlight BlinkCmpMenu             guibg=#242529 guifg=White]])
@@ -147,7 +148,10 @@ return {
         --   end
         --   return 1
         -- end,
-        implementation = "prefer_rust_with_warning",
+        implementation = "rust",
+        prebuilt_binaries = {
+          download = false,
+        },
         -- sorts = {
         --   -- function(a, b)
         --   --   local a_priority = priorities[a.source_id] or 0
