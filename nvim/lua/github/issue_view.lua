@@ -16,6 +16,7 @@ local markdown_heading_hl = "GithubIssueMarkdownHeading"
 ---@field repo string?
 ---@field item GithubGhDetail?
 ---@field loading boolean
+---@field refresh_request_id integer
 ---@field title_mark integer?
 ---@field body_start_mark integer?
 ---@field body_end_mark integer?
@@ -35,6 +36,7 @@ local state = {
   kind = "issue",
   number = 0,
   loading = false,
+  refresh_request_id = 0,
   saved_title = "",
   saved_body = "",
   saved_assignees = {},
@@ -347,6 +349,16 @@ local function sync_modifiable()
     editable = row_is_editable(vim.api.nvim_win_get_cursor(win)[1] - 1)
   end
   if vim.bo[buf].modifiable ~= editable then vim.bo[buf].modifiable = editable end
+end
+
+---@param win integer?
+local function apply_window_options(win)
+  local buf = state.buf
+  if not (buf and win and vim.api.nvim_win_is_valid(win)) then return end
+  if vim.api.nvim_win_get_buf(win) ~= buf then return end
+  vim.wo[win].wrap = true
+  vim.wo[win].linebreak = true
+  vim.wo[win].breakindent = true
 end
 
 ---@return string
@@ -784,6 +796,21 @@ local function render_item(item)
   }
 end
 
+---@param item GithubGhDetail
+---@param opts? { folds?: table<string, boolean> }
+---@return GithubIssueRendered
+function M.render_item(item, opts)
+  opts = opts or {}
+  if not opts.folds then return render_item(item) end
+
+  local previous_folds = state.folds
+  state.folds = opts.folds
+  local ok, rendered = xpcall(render_item, debug.traceback, item)
+  state.folds = previous_folds
+  if not ok then error(rendered, 2) end
+  return rendered
+end
+
 ---@return table[]
 local function hint_segments()
   local segments = {}
@@ -891,6 +918,7 @@ local function setup_autocmds(buf)
     buffer = buf,
     callback = function(args)
       state.win = vim.api.nvim_get_current_win()
+      apply_window_options(state.win)
       sync_modifiable()
       apply_command_winbar(args.win)
     end,
@@ -899,6 +927,8 @@ local function setup_autocmds(buf)
     group = group,
     buffer = buf,
     callback = function(args)
+      state.win = vim.api.nvim_get_current_win()
+      apply_window_options(state.win)
       apply_command_winbar(args.win)
     end,
   })
@@ -1101,12 +1131,14 @@ function M.save()
 end
 
 ---@param result GithubGhDetailResult
-local function on_detail(result)
+---@param opts? { keep_existing?: boolean }
+local function on_detail(result, opts)
+  opts = opts or {}
   state.loading = false
   if not result.ok or not result.item then
     local message = result.message or "Unable to load GitHub item"
     vim.notify(message, vim.log.levels.ERROR, { title = "GitHub" })
-    set_plain_lines({ message })
+    if not opts.keep_existing then set_plain_lines({ message }) end
     return
   end
   state.item = result.item
@@ -1122,12 +1154,19 @@ local function on_detail(result)
 end
 
 function M.refresh()
+  local keep_existing = state.item ~= nil
   state.loading = true
-  set_plain_lines({ "Loading GitHub " .. state.kind .. "..." })
+  state.refresh_request_id = state.refresh_request_id + 1
+  local request_id = state.refresh_request_id
+  if not keep_existing then set_plain_lines({ "Loading GitHub " .. state.kind .. "..." }) end
+  local function handle_detail(result)
+    if request_id ~= state.refresh_request_id then return end
+    on_detail(result, { keep_existing = keep_existing })
+  end
   if state.kind == "pr" then
-    gh.pr_view_async(state.cwd, state.number, state.repo, on_detail)
+    gh.pr_view_async(state.cwd, state.number, state.repo, handle_detail)
   else
-    gh.issue_view_async(state.cwd, state.number, state.repo, on_detail)
+    gh.issue_view_async(state.cwd, state.number, state.repo, handle_detail)
   end
 end
 
@@ -1162,6 +1201,7 @@ function M.open(opts)
   pcall(vim.api.nvim_buf_set_name, buf, name)
   vim.api.nvim_set_current_buf(buf)
   state.win = vim.api.nvim_get_current_win()
+  apply_window_options(state.win)
   apply_command_winbar(state.win)
   if state.item then set_rendered(render_item(state.item)) end
   M.refresh()

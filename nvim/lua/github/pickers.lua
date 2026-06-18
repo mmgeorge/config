@@ -23,14 +23,6 @@ local function parse_open_args(args)
   return nil, "Usage: [owner/repo] <number>"
 end
 
----@param value string?
----@return string[]
-local function markdown_lines(value)
-  value = tostring(value or "")
-  if value == "" then return { "_No description._" } end
-  return vim.split(value, "\n", { plain = true })
-end
-
 ---@param item GithubGhItem
 ---@return string
 local function item_label(item)
@@ -68,27 +60,11 @@ end
 ---@param body string?
 ---@return string[]
 local function issue_preview_lines(item, body)
-  local lines = {
-    "#" .. tostring(item.number) .. " " .. tostring(item.title or ""),
-    "",
-    "Repo: " .. tostring(item.repo or ""),
-    "State: " .. tostring(item.state or ""),
-  }
-  if item.updated_at and item.updated_at ~= "" then lines[#lines + 1] = "Updated: " .. item.updated_at end
-  if type(item.labels) == "table" and #item.labels > 0 then
-    local labels = {}
-    for _, label in ipairs(item.labels) do
-      if type(label) == "table" and type(label.name) == "string" then
-        labels[#labels + 1] = label.name
-      elseif type(label) == "string" then
-        labels[#labels + 1] = label
-      end
-    end
-    if #labels > 0 then lines[#lines + 1] = "Labels: " .. table.concat(labels, ", ") end
-  end
-  lines[#lines + 1] = ""
-  vim.list_extend(lines, markdown_lines(body))
-  return lines
+  local preview_item = vim.deepcopy(item or {})
+  preview_item.kind = preview_item.kind or "issue"
+  if body ~= nil then preview_item.body = body end
+  local rendered = require("github.issue_view").render_item(preview_item, { folds = {} })
+  return rendered.lines
 end
 
 ---@param ctx table

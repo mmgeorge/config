@@ -12,7 +12,7 @@ local root = "D:/mock/github-project"
 local calls = {}
 local opened_urls = {}
 local pr_mode = "ready"
-local pr_title = "Improve DiffReview"
+local pr_title = "feat: Improve DiffReview"
 local gh_host_mismatch = table.concat({
   "none of the git remotes configured for this repository correspond to the GH_HOST environment variable.",
   "Try adding a matching remote or unsetting the variable",
@@ -401,6 +401,22 @@ local function find_row(buf, needle)
   error("missing row: " .. needle .. "\n" .. table.concat(status_lines(buf), "\n"), 2)
 end
 
+local function line_has_highlight(buf, row, hl_group, start_col, end_col)
+  local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
+  for _, mark in ipairs(marks) do
+    local details = mark[4] or {}
+    if mark[3] == start_col and details.end_col == end_col and details.hl_group == hl_group then return true end
+  end
+  return false
+end
+
+local function line_has_substring_highlight(buf, row, text, hl_group)
+  local line = status_lines(buf)[row] or ""
+  local start_index = line:find(text, 1, true)
+  if not start_index then return false end
+  return line_has_highlight(buf, row, hl_group, start_index - 1, start_index - 1 + #text)
+end
+
 local function wait_for(condition, message)
   assert_true(vim.wait(3000, condition, 10), message)
 end
@@ -485,8 +501,28 @@ local function run()
   )
 
   wait_for(function() return buffer_contains(status_buf, "Improve DiffReview") end, "PR row did not show fetched PR title")
+  assert_true(
+    buffer_contains(status_buf, "Head:   abc1234 feature/pr-view        mock subject"),
+    "Head row did not pad branch before subject"
+  )
+  assert_true(
+    buffer_contains(status_buf, "Merge:  def5678 origin/feature/pr-view upstream subject"),
+    "Merge row did not keep upstream subject alignment"
+  )
+  assert_true(
+    buffer_contains(status_buf, "Push:   def5678 origin/feature/pr-view push subject"),
+    "Push row did not keep push subject alignment"
+  )
   assert_true(diff_review._status.pr.pr.repo == "org/repo", "current PR repo was not normalized from its URL")
   wait_for(function() return buffer_contains(status_buf, "feat: add diff review ai summary") end, "About row did not show generated commit subject")
+  assert_true(
+    line_has_substring_highlight(status_buf, find_row(status_buf, "PR:"), "feat", "DiffReviewStatusCommitType"),
+    "PR conventional commit type was not highlighted"
+  )
+  assert_true(
+    line_has_substring_highlight(status_buf, find_row(status_buf, "About:"), "feat", "DiffReviewStatusCommitType"),
+    "About conventional commit type was not highlighted"
+  )
   wait_for(function()
     local lines = vim.api.nvim_buf_get_lines(commit_buf, 0, -1, false)
     return lines[1] == "feat: add diff review ai summary"
@@ -562,7 +598,7 @@ local function run()
   assert_true(pr_hint:find("b browse", 1, true) ~= nil, "PRView missing browse hint: " .. pr_hint)
   assert_true(pr_hint:find("q close", 1, true) ~= nil, "PRView missing close hint: " .. pr_hint)
   assert_true(not buffer_contains(pr_buf, "Hint:"), "PRView hint should be a sticky winbar, not buffer text")
-  assert_true(buffer_contains(pr_buf, "Title:  Improve DiffReview"), "PRView missing title")
+  assert_true(buffer_contains(pr_buf, "Title:  feat: Improve DiffReview"), "PRView missing title")
   assert_true(
     buffer_contains(pr_buf, "Review: " .. diff_review._pending_review_icon .. " " .. diff_review._codeowner_review_icon .. "@platform-team"),
     "PRView missing draft codeowner reviewer warning"

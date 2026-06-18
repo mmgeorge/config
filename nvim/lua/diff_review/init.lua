@@ -1088,7 +1088,7 @@ function M._status_file_change_label(file)
     return "New", "DiffReviewStatusFileNew"
   end
   if status:sub(1, 1) == "d" or status == "deleted" or status == "removed" then
-    return "Deleted", "DiffReviewStatusFileDeleted"
+    return "Removed", "DiffReviewStatusFileDeleted"
   end
   return "Modified", "DiffReviewStatusFileModified"
 end
@@ -3622,8 +3622,12 @@ local function attach_status_state(buf, state)
     buffer = buf,
     callback = function()
       M._normalize_status_cursor(buf)
+      if M._status_issues then M._status_issues.sync_modifiable(buf) end
     end,
   })
+  if state.view_kind == "status" and M._status_issues then
+    M._status_issues.attach(buf)
+  end
   vim.api.nvim_create_autocmd("BufLeave", {
     buffer = buf,
     callback = function()
@@ -3662,7 +3666,7 @@ local function status_git_line_async(cwd, args, cb)
   end)
 end
 
-local function status_head_row(name, oid, ref, ref_hl, subject, date_text)
+local function status_head_row(name, oid, ref, ref_hl, subject, date_text, ref_width)
   local segments = {
     { ("%-8s"):format(name .. ":"), "DiffReviewStatusLabel" },
     { ("%-7s"):format(oid or ""), "DiffReviewStatusObjectId" },
@@ -3671,11 +3675,18 @@ local function status_head_row(name, oid, ref, ref_hl, subject, date_text)
     segments[#segments + 1] = { " " }
     segments[#segments + 1] = { date_text, "DiffReviewStatusDate" }
   end
+  local ref_text = ref or ""
+  local ref_padding = ""
+  if ref_width and ref_width > 0 then
+    local padding_width = ref_width - vim.fn.strdisplaywidth(ref_text)
+    if padding_width > 0 then ref_padding = string.rep(" ", padding_width) end
+  end
   vim.list_extend(segments, {
     { " " },
-    { ref or "", ref_hl },
-    { " " .. (subject or "") },
+    { ref_text, ref_hl },
   })
+  if ref_padding ~= "" then segments[#segments + 1] = { ref_padding } end
+  segments[#segments + 1] = { " " .. (subject or "") }
   return segments
 end
 
@@ -3691,7 +3702,8 @@ local function status_pr_head_line(pr_state)
     segments[#segments + 1] = { "...fetching...", "DiffReviewStatusFetching" }
   elseif pr_state.state == "ready" and pr_state.pr then
     entry.pr = pr_state.pr
-    segments[#segments + 1] = { pr_state.pr.title ~= "" and pr_state.pr.title or ("PR #" .. tostring(pr_state.pr.number)), "DiffReviewStatusPR" }
+    local subject = pr_state.pr.title ~= "" and pr_state.pr.title or ("PR #" .. tostring(pr_state.pr.number))
+    vim.list_extend(segments, M._status_conventional_commit_subject_segments(subject, "DiffReviewStatusPR"))
   elseif pr_state.state == "error" then
     segments[#segments + 1] = { "error", "ErrorMsg" }
   elseif pr_state.state == "unavailable" then
@@ -3717,7 +3729,7 @@ local function status_about_head_line(about_state)
     segments[#segments + 1] = { "...generating...", "DiffReviewStatusFetching" }
   elseif about_state.state == "ready" and about_state.message then
     entry.about = about_state
-    segments[#segments + 1] = { ai_commit.subject(about_state.message), "DiffReviewStatusPath" }
+    vim.list_extend(segments, M._status_conventional_commit_subject_segments(ai_commit.subject(about_state.message), "DiffReviewStatusPath"))
   elseif about_state.state == "error" then
     segments[#segments + 1] = { "error", "ErrorMsg" }
   else
@@ -3725,6 +3737,167 @@ local function status_about_head_line(about_state)
   end
 
   return { segments = segments, entry = entry }
+end
+
+M._status_issues = M._status_issues or {}
+
+---@param cwd string?
+---@return string?
+function M._status_issues.path(cwd)
+  if not cwd or cwd == "" then return nil end
+  return vim.fs.joinpath(cwd, ".session")
+end
+
+---@param values any
+---@return integer[]
+function M._status_issues.normalize_numbers(values)
+  local numbers = {}
+  local seen = {}
+  if type(values) ~= "table" then return numbers end
+  for _, value in ipairs(values) do
+    local number = tonumber(value)
+    if number and number > 0 and math.floor(number) == number and not seen[number] then
+      seen[number] = true
+      numbers[#numbers + 1] = number
+    end
+  end
+  table.sort(numbers)
+  return numbers
+end
+
+---@param line string?
+---@return integer[]
+function M._status_issues.parse_line(line)
+  local body = tostring(line or ""):gsub("^%s*Issues:%s*", "")
+  body = vim.trim(body)
+  if body == "" or body:lower() == "none" then return {} end
+  local values = {}
+  local seen_text = {}
+  for issue_text in body:gmatch("#%s*(%d+)") do
+    if not seen_text[issue_text] then
+      seen_text[issue_text] = true
+      values[#values + 1] = issue_text
+    end
+  end
+  for issue_text in body:gmatch("%f[%d](%d+)%f[%D]") do
+    if not seen_text[issue_text] then
+      seen_text[issue_text] = true
+      values[#values + 1] = issue_text
+    end
+  end
+  return M._status_issues.normalize_numbers(values)
+end
+
+---@param numbers integer[]?
+---@return string
+function M._status_issues.text(numbers)
+  numbers = M._status_issues.normalize_numbers(numbers)
+  if #numbers == 0 then return "none" end
+  local parts = {}
+  for _, number in ipairs(numbers) do
+    parts[#parts + 1] = "#" .. tostring(number)
+  end
+  return table.concat(parts, " ")
+end
+
+---@param left integer[]?
+---@param right integer[]?
+---@return boolean
+function M._status_issues.equal(left, right)
+  left = M._status_issues.normalize_numbers(left)
+  right = M._status_issues.normalize_numbers(right)
+  if #left ~= #right then return false end
+  for index, number in ipairs(left) do
+    if number ~= right[index] then return false end
+  end
+  return true
+end
+
+---@param cwd string
+---@return table
+function M._status_issues.read_state(cwd)
+  local path = M._status_issues.path(cwd)
+  if not path or vim.fn.filereadable(path) ~= 1 then
+    return { cwd = cwd, numbers = {}, saved_numbers = {} }
+  end
+  local read_ok, lines = pcall(vim.fn.readfile, path)
+  if not read_ok then
+    vim.notify("GitStatus session read failed: " .. tostring(lines), vim.log.levels.WARN, { title = "GitStatus" })
+    return { cwd = cwd, numbers = {}, saved_numbers = {} }
+  end
+  local content = table.concat(lines or {}, "\n")
+  if vim.trim(content) == "" then
+    return { cwd = cwd, numbers = {}, saved_numbers = {} }
+  end
+  local decode_ok, decoded = pcall(vim.json.decode, content)
+  if not (decode_ok and type(decoded) == "table") then
+    vim.notify("GitStatus session read failed: invalid .session JSON", vim.log.levels.WARN, { title = "GitStatus" })
+    return { cwd = cwd, numbers = {}, saved_numbers = {} }
+  end
+  local numbers = M._status_issues.normalize_numbers(decoded.issues)
+  return { cwd = cwd, numbers = numbers, saved_numbers = vim.deepcopy(numbers), data = decoded }
+end
+
+---@param status table?
+---@param cwd string?
+---@return table?
+function M._status_issues.ensure_state(status, cwd)
+  if not (status and cwd and cwd ~= "") then return nil end
+  if status.issues and status.issues.cwd == cwd then return status.issues end
+  status.issues = M._status_issues.read_state(cwd)
+  return status.issues
+end
+
+---@param cwd string
+---@param numbers integer[]
+---@param existing table?
+---@return boolean
+---@return string?
+function M._status_issues.write(cwd, numbers, existing)
+  local path = M._status_issues.path(cwd)
+  if not path then return false, "missing git root" end
+  local data = type(existing) == "table" and vim.deepcopy(existing) or {}
+  if vim.fn.filereadable(path) == 1 and not existing then
+    local read_ok, lines = pcall(vim.fn.readfile, path)
+    if not read_ok then return false, tostring(lines) end
+    local content = table.concat(lines or {}, "\n")
+    if vim.trim(content) ~= "" then
+      local decode_ok, decoded = pcall(vim.json.decode, content)
+      if not (decode_ok and type(decoded) == "table") then return false, "invalid .session JSON" end
+      data = decoded
+    end
+  end
+  data.issues = M._status_issues.normalize_numbers(numbers)
+  local write_ok, write_result = pcall(vim.fn.writefile, { vim.json.encode(data) }, path)
+  if not write_ok then return false, tostring(write_result) end
+  if write_result ~= 0 then return false, "writefile returned " .. tostring(write_result) end
+  return true, nil
+end
+
+---@param issues_state table?
+---@return DiffReviewStatusHeadLine
+function M._status_issues.head_line(issues_state)
+  local numbers = issues_state and issues_state.numbers or {}
+  local text = M._status_issues.text(numbers)
+  return {
+    segments = {
+      { ("%-8s"):format("Issues:"), "DiffReviewStatusLabel" },
+      { text, text == "none" and "Comment" or "DiffReviewStatusPR" },
+    },
+    entry = { id = "issues", kind = "issues", issues = issues_state },
+  }
+end
+
+---@param status table
+---@param head_line DiffReviewStatusHeadLine
+function M._status_issues.replace_head_line(status, head_line)
+  if not (status and status.head_lines) then return end
+  for index, line in ipairs(status.head_lines) do
+    if line.entry and line.entry.id == "issues" then
+      status.head_lines[index] = head_line
+      return
+    end
+  end
 end
 
 ---@param buf integer
@@ -3738,9 +3911,13 @@ end
 ---@param values table
 ---@param pr_state DiffReviewStatusPRState?
 ---@param about_state DiffReviewAICommitState?
+---@param issues_state table?
 ---@return DiffReviewStatusHeadLine[]
-local function status_build_head_lines(values, pr_state, about_state)
+local function status_build_head_lines(values, pr_state, about_state, issues_state)
   local remote_action = M._status and M._status.remote_action
+  local ref_width = vim.fn.strdisplaywidth(values.branch or "(detached)")
+  if values.upstream then ref_width = math.max(ref_width, vim.fn.strdisplaywidth(values.upstream)) end
+  if values.push_ref then ref_width = math.max(ref_width, vim.fn.strdisplaywidth(values.push_ref)) end
   local lines = {}
   lines[#lines + 1] = {
     segments = status_head_row(
@@ -3748,7 +3925,9 @@ local function status_build_head_lines(values, pr_state, about_state)
       values.head_oid or "0000000",
       values.branch or "(detached)",
       "DiffReviewStatusBranch",
-      values.subject or "(no commits)"
+      values.subject or "(no commits)",
+      nil,
+      ref_width
     ),
   }
 
@@ -3759,7 +3938,9 @@ local function status_build_head_lines(values, pr_state, about_state)
         values.upstream_oid or "",
         values.upstream,
         "DiffReviewStatusRemote",
-        values.upstream_subject or ""
+        values.upstream_subject or "",
+        nil,
+        ref_width
       ),
     }
   end
@@ -3778,13 +3959,16 @@ local function status_build_head_lines(values, pr_state, about_state)
         values.push_oid or "",
         values.push_ref,
         "DiffReviewStatusRemote",
-        values.push_subject or ""
+        values.push_subject or "",
+        nil,
+        ref_width
       ),
     }
   end
 
   lines[#lines + 1] = status_pr_head_line(pr_state)
   lines[#lines + 1] = status_about_head_line(about_state)
+  lines[#lines + 1] = M._status_issues.head_line(issues_state)
   return lines
 end
 
@@ -4424,19 +4608,38 @@ end
 
 ---@param cwd string?
 ---@param repo string?
+function M._status_enable_repo_completion(cwd, repo)
+  if not (cwd and repo and repo ~= "") then return end
+  local cache = require("github.repo_cache")
+  for buf, state in pairs(M._status_states or {}) do
+    if state and state.cwd == cwd and vim.api.nvim_buf_is_valid(buf) then
+      cache.enable_user_completion(buf, repo)
+    end
+  end
+end
+
+---@param cwd string?
+---@param repo string?
 function M.github_load_repo_metadata(cwd, repo)
   local cache = require("github.repo_cache")
   local issue_index_ok, issue_index = pcall(require, "github.issue_index")
   if repo and repo ~= "" then
+    M._status_enable_repo_completion(cwd, repo)
     cache.ensure_metadata(cwd, repo, function(done)
       gh.repo_contributors_async(cwd, repo, done)
     end, { remember_cwd = false })
     if issue_index_ok then issue_index.ensure_repo(cwd, repo, { manual = false }) end
     return
   end
+  local cached_repo = cache.repo_for_cwd(cwd)
+  if cached_repo then M._status_enable_repo_completion(cwd, cached_repo) end
   cache.ensure_metadata_for_cwd(cwd, function(done)
-    gh.current_repo_async(cwd, done)
+    gh.current_repo_async(cwd, function(result)
+      if result and result.ok and result.repo then M._status_enable_repo_completion(cwd, result.repo) end
+      done(result)
+    end)
   end, function(resolved_repo, done)
+    M._status_enable_repo_completion(cwd, resolved_repo)
     gh.repo_contributors_async(cwd, resolved_repo, done)
   end)
   if issue_index_ok then issue_index.ensure_current(cwd, { manual = false }) end
@@ -4453,9 +4656,11 @@ local function status_head_lines_async(cwd, cb)
     pending = pending - 1
     if pending > 0 then return end
 
-    local pr_state = M._status and M._status.pr
-    local about_state = M._status and M._status.about
-    cb(status_build_head_lines(values, pr_state, about_state), values)
+    local status = M._status
+    local pr_state = status and status.pr
+    local about_state = status and status.about
+    local issues_state = M._status_issues.ensure_state(status, cwd)
+    cb(status_build_head_lines(values, pr_state, about_state, issues_state), values)
   end
 
   status_git_line_async(cwd, { "rev-parse", "--short", "HEAD" }, function(line) done("head_oid", line) end)
@@ -4614,9 +4819,12 @@ function M._status_patch_head_line(buf, entry_id, head_line)
   if not target_line then return false end
 
   local text, segment_highlights = M._status_segment_line_parts(head_line.segments)
+  local was_rendering = vim.b[buf].diff_review_status_rendering
+  vim.b[buf].diff_review_status_rendering = true
   vim.bo[buf].modifiable = true
   vim.api.nvim_buf_set_lines(buf, target_line - 1, target_line, false, { text })
   vim.bo[buf].modifiable = false
+  vim.b[buf].diff_review_status_rendering = was_rendering
   status.entries[target_line] = head_line.entry
   if status.lines then status.lines[target_line] = text end
 
@@ -4629,6 +4837,136 @@ function M._status_patch_head_line(buf, entry_id, head_line)
     })
   end
   return true
+end
+
+---@param buf integer
+---@return boolean
+function M._status_issues.patch_line(buf)
+  local status = M._status_states and M._status_states[buf] or M._status
+  if not status then return false end
+  local head_line = M._status_issues.head_line(status.issues)
+  M._status_issues.replace_head_line(status, head_line)
+  return M._status_patch_head_line(buf, "issues", head_line)
+end
+
+---@param buf integer
+---@return integer?
+function M._status_issues.row(buf)
+  local status = M._status_states and M._status_states[buf] or M._status
+  if status and status.entries then
+    for row, entry in pairs(status.entries) do
+      if entry and entry.id == "issues" then return row end
+    end
+  end
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return nil end
+  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  for index, line in ipairs(lines) do
+    if line:match("^Issues:%s*") then return index end
+  end
+  return nil
+end
+
+---@param buf integer
+---@return string
+function M._status_issues.current_line(buf)
+  local row = M._status_issues.row(buf)
+  if not row then return "" end
+  return vim.api.nvim_buf_get_lines(buf, row - 1, row, false)[1] or ""
+end
+
+---@param buf integer
+---@return integer[]
+function M._status_issues.current_numbers(buf)
+  return M._status_issues.parse_line(M._status_issues.current_line(buf))
+end
+
+---@param buf integer
+---@return boolean
+function M._status_issues.cursor_on_row(buf)
+  if not (buf and vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_get_current_buf() == buf) then return false end
+  local row = M._status_issues.row(buf)
+  return row ~= nil and vim.api.nvim_win_get_cursor(0)[1] == row
+end
+
+---@param buf integer
+function M._status_issues.refresh_modified(buf)
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  if vim.b[buf].diff_review_status_rendering then return end
+  local status = M._status_states and M._status_states[buf] or M._status
+  if not (status and status.view_kind == "status") then return end
+  local issues_state = status.issues or M._status_issues.ensure_state(status, status.cwd)
+  local saved_numbers = issues_state and issues_state.saved_numbers or {}
+  vim.bo[buf].modified = not M._status_issues.equal(M._status_issues.current_numbers(buf), saved_numbers)
+end
+
+---@param buf integer
+function M._status_issues.sync_modifiable(buf)
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  if vim.b[buf].diff_review_status_rendering then return end
+  local status = M._status_states and M._status_states[buf] or M._status
+  if not (status and status.view_kind == "status") then return end
+  vim.bo[buf].modifiable = M._status_issues.cursor_on_row(buf)
+end
+
+---@param buf integer
+function M._status_issues.save(buf)
+  local status = M._status_states and M._status_states[buf] or M._status
+  if not (status and status.view_kind == "status" and status.cwd) then
+    notify_error("GitStatus session save failed: not in a git status buffer", "GitStatus")
+    return
+  end
+  local issues_state = status.issues or M._status_issues.ensure_state(status, status.cwd) or {}
+  local numbers = M._status_issues.current_numbers(buf)
+  local ok, err = M._status_issues.write(status.cwd, numbers, issues_state.data)
+  if not ok then
+    notify_error("GitStatus session save failed: " .. tostring(err), "GitStatus")
+    vim.bo[buf].modified = true
+    M._status_issues.sync_modifiable(buf)
+    return
+  end
+  issues_state.cwd = status.cwd
+  issues_state.numbers = vim.deepcopy(numbers)
+  issues_state.saved_numbers = vim.deepcopy(numbers)
+  issues_state.data = issues_state.data or {}
+  issues_state.data.issues = vim.deepcopy(numbers)
+  status.issues = issues_state
+  M._status_issues.patch_line(buf)
+  vim.bo[buf].modified = false
+  M._status_issues.sync_modifiable(buf)
+end
+
+---@param buf integer
+function M._status_issues.attach(buf)
+  if vim.b[buf].diff_review_status_issues_attached then return end
+  vim.b[buf].diff_review_status_issues_attached = true
+  vim.bo[buf].buftype = "acwrite"
+  local group = vim.api.nvim_create_augroup("DiffReviewStatusIssues" .. tostring(buf), { clear = true })
+  vim.api.nvim_create_autocmd({ "BufEnter", "CursorMoved", "CursorMovedI", "ModeChanged" }, {
+    group = group,
+    buffer = buf,
+    callback = function()
+      M._status_issues.sync_modifiable(buf)
+    end,
+  })
+  vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI", "InsertLeave" }, {
+    group = group,
+    buffer = buf,
+    callback = function()
+      M._status_issues.refresh_modified(buf)
+      M._status_issues.sync_modifiable(buf)
+    end,
+  })
+  vim.api.nvim_create_autocmd("BufWriteCmd", {
+    group = group,
+    buffer = buf,
+    callback = function()
+      M._status_issues.save(buf)
+    end,
+  })
+  vim.keymap.set("i", "<CR>", function()
+    if M._status_issues.cursor_on_row(buf) then return "" end
+    return "\r"
+  end, { buffer = buf, expr = true, desc = "Keep GitStatus issue list on one line" })
 end
 
 ---@return DiffReviewStatusKeymapConfig
@@ -6461,6 +6799,18 @@ function M._status_conventional_commit_type_end(subject)
   return nil
 end
 
+---@param subject string
+---@param hl_group string
+---@return table[]
+function M._status_conventional_commit_subject_segments(subject, hl_group)
+  local conventional_type_end = M._status_conventional_commit_type_end(subject)
+  if not conventional_type_end then return { { subject, hl_group } } end
+  return {
+    { subject:sub(1, conventional_type_end), "DiffReviewStatusCommitType" },
+    { subject:sub(conventional_type_end + 1), hl_group },
+  }
+end
+
 ---@param commit DiffReviewStatusCommit
 ---@param date_width integer
 local function status_render_commit(commit, date_width)
@@ -7016,10 +7366,13 @@ end
 ---@param lines string[]
 local function status_set_plain_lines(buf, lines)
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  local was_rendering = vim.b[buf].diff_review_status_rendering
+  vim.b[buf].diff_review_status_rendering = true
   vim.bo[buf].modifiable = true
   vim.api.nvim_buf_clear_namespace(buf, M._status_ns, 0, -1)
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
   vim.bo[buf].modifiable = false
+  vim.b[buf].diff_review_status_rendering = was_rendering
   M._status_apply_hint_bar(buf)
 end
 
@@ -7069,10 +7422,13 @@ local function status_render_loaded(buf, target_id, fallback_line, opts, head_li
     end
   end
 
+  local was_rendering = vim.b[buf].diff_review_status_rendering
+  vim.b[buf].diff_review_status_rendering = true
   vim.bo[buf].modifiable = true
   vim.api.nvim_buf_clear_namespace(buf, M._status_ns, 0, -1)
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, M._status.lines)
   vim.bo[buf].modifiable = false
+  vim.b[buf].diff_review_status_rendering = was_rendering
 
   for _, line_hl in ipairs(M._status.line_highlights) do
     pcall(vim.api.nvim_buf_set_extmark, buf, M._status_ns, line_hl.line - 1, 0, {
@@ -7109,6 +7465,8 @@ local function status_render_loaded(buf, target_id, fallback_line, opts, head_li
     M._pr_edit.sync_modifiable(buf)
   elseif view_kind == "review" then
     M._review.on_render(buf)
+  elseif view_kind == "status" then
+    M._status_issues.sync_modifiable(buf)
   end
 end
 
@@ -7142,7 +7500,12 @@ local function status_start_pr_lookup(cwd, buf, request_id)
     end
 
     if latest_status.head_values then
-      latest_status.head_lines = status_build_head_lines(latest_status.head_values, latest_status.pr, latest_status.about)
+      latest_status.head_lines = status_build_head_lines(
+        latest_status.head_values,
+        latest_status.pr,
+        latest_status.about,
+        latest_status.issues
+      )
     end
     if vim.api.nvim_buf_is_valid(buf) and latest_status.head_lines and latest_status.sections then
       if not M._status_patch_head_line(buf, "pr", status_pr_head_line(latest_status.pr)) then
@@ -7251,7 +7614,12 @@ local function status_ensure_about_state(cwd, buf, has_changes, force, allow_gen
       latest_status.about = result
       latest_status.about_pending = nil
       if latest_status.head_values then
-        latest_status.head_lines = status_build_head_lines(latest_status.head_values, latest_status.pr, latest_status.about)
+        latest_status.head_lines = status_build_head_lines(
+          latest_status.head_values,
+          latest_status.pr,
+          latest_status.about,
+          latest_status.issues
+        )
       end
       if vim.api.nvim_buf_is_valid(buf) and latest_status.head_lines and latest_status.sections then
         if not M._status_patch_about_line(buf) then
@@ -7315,6 +7683,7 @@ function M.render_status(buf, target_id, fallback_line, opts)
     end
 
     latest_status.cwd = cwd
+    M._status_issues.ensure_state(latest_status, cwd)
     local pr_request_id = status_ensure_pr_state(cwd, buf, opts.refresh_pr)
 
     status_load_async(cwd, function(result)
@@ -7332,7 +7701,13 @@ function M.render_status(buf, target_id, fallback_line, opts)
         fallback_line = nil
       end
       status_ensure_about_state(cwd, buf, status_has_changes(result.sections), opts.refresh_about)
-      result.head_lines = status_build_head_lines(result.head_values or {}, current_status.pr, current_status.about)
+      M._status_issues.ensure_state(current_status, cwd)
+      result.head_lines = status_build_head_lines(
+        result.head_values or {},
+        current_status.pr,
+        current_status.about,
+        current_status.issues
+      )
       current_status.head_lines = result.head_lines
       current_status.head_values = result.head_values
       current_status.sections = result.sections
@@ -12711,7 +13086,7 @@ local function status_remote_action(buf, action)
         M._status.remote_action = M._status.remote_action or { action = action, state = "running" }
         M._status.remote_action.status = line
         if M._status.head_values then
-          M._status.head_lines = status_build_head_lines(M._status.head_values, M._status.pr, M._status.about)
+          M._status.head_lines = status_build_head_lines(M._status.head_values, M._status.pr, M._status.about, M._status.issues)
           if vim.api.nvim_buf_is_valid(buf) then
             M.render_status(buf, nil, nil, { reuse_sections = true })
           end
@@ -12721,7 +13096,7 @@ local function status_remote_action(buf, action)
     if M._status then
       M._status.remote_action = { action = action, state = "running", status = running_status }
       if M._status.head_values then
-        M._status.head_lines = status_build_head_lines(M._status.head_values, M._status.pr, M._status.about)
+        M._status.head_lines = status_build_head_lines(M._status.head_values, M._status.pr, M._status.about, M._status.issues)
         if vim.api.nvim_buf_is_valid(buf) then
           M.render_status(buf, nil, nil, { reuse_sections = true })
         end

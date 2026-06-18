@@ -136,6 +136,7 @@ keybinds clear-defaults=true {
             LaunchOrFocusPlugin "session-manager" {
                 floating true
                 move_to_focused_tab true
+                skip_plugin_cache true
             }
             SwitchToMode "normal"
         }
@@ -256,6 +257,7 @@ keybinds clear-defaults=true {
             LaunchOrFocusPlugin "session-manager" {
                 floating true
                 move_to_focused_tab true
+                skip_plugin_cache true
             }
             SwitchToMode "normal"
         }
@@ -264,6 +266,7 @@ keybinds clear-defaults=true {
             LaunchOrFocusPlugin "session-manager" {
                 floating true
                 move_to_focused_tab true
+                skip_plugin_cache true
             }
             SwitchToMode "normal"
         }

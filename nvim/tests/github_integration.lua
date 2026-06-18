@@ -11,6 +11,8 @@ local calls = {}
 local opened_urls = {}
 local captured_picker = nil
 local opened_pr_numbers = {}
+local defer_next_issue_view = false
+local deferred_issue_view_callback = nil
 local original_snacks = _G.Snacks
 local original_picker_pick = original_snacks and original_snacks.picker and original_snacks.picker.pick
 local original_notify = vim.notify
@@ -69,6 +71,8 @@ local function reset()
   opened_urls = {}
   captured_picker = nil
   opened_pr_numbers = {}
+  defer_next_issue_view = false
+  deferred_issue_view_callback = nil
   render_markdown_calls = {}
   notifications._reset_for_tests()
   repo_cache.remember_cwd_repo(vim.fn.getcwd(), "org/repo")
@@ -349,6 +353,18 @@ function backend.system_async(command, input, callback, cwd)
       not command_json_fields(command):find("viewerSubscription", 1, true),
       "issue view requested unsupported viewerSubscription field"
     )
+    if defer_next_issue_view then
+      defer_next_issue_view = false
+      deferred_issue_view_callback = function()
+        callback({
+          code = 0,
+          stdout = encoded_issue(12),
+          stderr = "",
+          output = encoded_issue(12),
+        })
+      end
+      return
+    end
     stdout = encoded_issue(12)
   elseif key:find("gh\tissue\tview\t34", 1, true) then
     assert_true(
@@ -547,9 +563,28 @@ local function run_tests()
   end
   captured_picker.preview({ item = captured_picker.items[1], preview = preview })
   wait_for(function() return preview_contains(preview, "Issue body") end, "issue preview did not fetch the issue body")
+  assert_true(preview_contains(preview, "Title:  Fix command parser"), "issue preview should use issue-view title layout")
+  assert_true(preview_contains(preview, "Author:       alice"), "issue preview should use issue-view metadata layout")
+  assert_true(preview_contains(preview, "Description:"), "issue preview should render the issue description heading")
+  assert_true(preview_contains(preview, "Comments (1):"), "issue preview should render issue comments with the shared component")
+  assert_true(not preview_contains(preview, "#12 Fix command parser"), "issue preview should not use the legacy picker-only layout")
   captured_picker.confirm({ close = function() end }, captured_picker.items[1])
   wait_for(function() return find_line("Title:  Fix command parser") ~= nil end, "issue view did not render selected issue")
   local buf = vim.api.nvim_get_current_buf()
+  assert_true(vim.wo[0].wrap, "issue buffer should enable word wrap")
+  assert_true(vim.wo[0].linebreak, "issue buffer should wrap at word boundaries")
+  assert_true(vim.wo[0].breakindent, "issue buffer should preserve indentation on wrapped lines")
+  defer_next_issue_view = true
+  require("github.issue_view").refresh()
+  assert_true(deferred_issue_view_callback ~= nil, "issue refresh did not start the deferred detail request")
+  assert_true(buffer_contains("Title:  Fix command parser"), "issue refresh should keep existing content while loading")
+  assert_true(
+    not buffer_contains("Loading GitHub issue..."),
+    "issue refresh should not replace existing content with a loading placeholder"
+  )
+  deferred_issue_view_callback()
+  deferred_issue_view_callback = nil
+  wait_for(function() return buffer_contains("Issue body") end, "issue refresh did not render the deferred response")
   assert_true(not buffer_contains("Hint:"), "issue buffer still rendered the legacy Hint line")
   local issue_winbar = plain_winbar()
   assert_true(issue_winbar:find("GitHub Issue #12", 1, true) ~= nil, "issue winbar title missing")
