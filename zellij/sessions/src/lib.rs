@@ -17,6 +17,7 @@ pub enum Row {
 pub enum Mode {
     Search,
     CreateSession,
+    RenameSession,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -28,6 +29,7 @@ pub enum SwitcherInput {
     Up,
     Escape,
     Cancel,
+    RenameCurrentSession,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -37,6 +39,7 @@ pub enum SwitcherAction {
     RefreshSessions,
     SwitchSession(String),
     CreateSession(String),
+    RenameSession(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -54,8 +57,10 @@ pub struct SessionSwitcher {
     selected_index: usize,
     mode: Mode,
     new_session_name: String,
+    rename_session_name: String,
     error: Option<String>,
     permissions_granted: bool,
+    rename_when_sessions_ready: bool,
 }
 
 impl Default for Mode {
@@ -73,8 +78,10 @@ impl Default for SessionSwitcher {
             selected_index: 0,
             mode: Mode::Search,
             new_session_name: String::new(),
+            rename_session_name: String::new(),
             error: None,
             permissions_granted: false,
+            rename_when_sessions_ready: false,
         };
         switcher.rebuild_rows();
         switcher
@@ -106,6 +113,10 @@ impl SessionSwitcher {
         &self.new_session_name
     }
 
+    pub fn rename_session_name(&self) -> &str {
+        &self.rename_session_name
+    }
+
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
     }
@@ -118,6 +129,9 @@ impl SessionSwitcher {
         self.sessions = sorted_sessions(sessions);
         self.error = None;
         self.rebuild_rows();
+        if self.rename_when_sessions_ready {
+            self.start_rename_current_session();
+        }
     }
 
     pub fn set_error(&mut self, error: impl Into<String>) {
@@ -156,6 +170,14 @@ impl SessionSwitcher {
         match self.mode {
             Mode::Search => self.handle_search_input(input),
             Mode::CreateSession => self.handle_create_input(input),
+            Mode::RenameSession => self.handle_rename_input(input),
+        }
+    }
+
+    pub fn open_rename_session_when_ready(&mut self) {
+        self.rename_when_sessions_ready = true;
+        if !self.sessions.is_empty() {
+            self.start_rename_current_session();
         }
     }
 
@@ -179,6 +201,10 @@ impl SessionSwitcher {
                 let prompt = format!("New session name: {}_", self.new_session_name);
                 push_box_line(&mut lines, row + 2, column, width, &prompt);
             },
+            Mode::RenameSession => {
+                let prompt = format!("Rename session: {}_", self.rename_session_name);
+                push_box_line(&mut lines, row + 2, column, width, &prompt);
+            },
         }
         push_box_line(&mut lines, row + 3, column, width, "");
 
@@ -195,6 +221,15 @@ impl SessionSwitcher {
                     "Enter to create, Esc to cancel",
                 );
             },
+            Mode::RenameSession => {
+                push_box_line(
+                    &mut lines,
+                    row + 4,
+                    column,
+                    width,
+                    "Enter to rename, Esc to cancel",
+                );
+            },
         }
 
         let help_row = row + height.saturating_sub(2);
@@ -204,6 +239,7 @@ impl SessionSwitcher {
             let help = match self.mode {
                 Mode::Search => "Up/Down select  Enter open  Esc close",
                 Mode::CreateSession => "Enter create  Esc back",
+                Mode::RenameSession => "Enter rename  Esc back",
             };
             push_box_line(&mut lines, help_row, column, width, help);
         }
@@ -233,6 +269,10 @@ impl SessionSwitcher {
                 Vec::new()
             },
             SwitcherInput::Enter => self.activate_selected_row(),
+            SwitcherInput::RenameCurrentSession => {
+                self.start_rename_current_session();
+                Vec::new()
+            },
             SwitcherInput::Down => {
                 self.move_selection_down();
                 Vec::new()
@@ -265,7 +305,36 @@ impl SessionSwitcher {
                 self.new_session_name.clear();
                 Vec::new()
             },
-            SwitcherInput::Down | SwitcherInput::Up => Vec::new(),
+            SwitcherInput::RenameCurrentSession | SwitcherInput::Down | SwitcherInput::Up => {
+                Vec::new()
+            },
+        }
+    }
+
+    fn handle_rename_input(&mut self, input: SwitcherInput) -> Vec<SwitcherAction> {
+        match input {
+            SwitcherInput::Character(character) => {
+                if character == '\n' {
+                    self.rename_session()
+                } else {
+                    self.rename_session_name.push(character);
+                    Vec::new()
+                }
+            },
+            SwitcherInput::Backspace => {
+                self.rename_session_name.pop();
+                Vec::new()
+            },
+            SwitcherInput::Enter => self.rename_session(),
+            SwitcherInput::Escape | SwitcherInput::Cancel => {
+                self.mode = Mode::Search;
+                self.rename_session_name.clear();
+                self.rename_when_sessions_ready = false;
+                Vec::new()
+            },
+            SwitcherInput::RenameCurrentSession | SwitcherInput::Down | SwitcherInput::Up => {
+                Vec::new()
+            },
         }
     }
 
@@ -327,7 +396,7 @@ impl SessionSwitcher {
         }
 
         let session_name = self.new_session_name.trim().to_owned();
-        if let Some(error) = validate_new_session_name(&session_name, &self.sessions) {
+        if let Some(error) = validate_session_name(&session_name, &self.sessions, None) {
             self.error = Some(error);
             return Vec::new();
         }
@@ -339,6 +408,57 @@ impl SessionSwitcher {
             SwitcherAction::CreateSession(session_name),
             SwitcherAction::Hide,
         ]
+    }
+
+    fn start_rename_current_session(&mut self) {
+        self.rename_when_sessions_ready = true;
+        match self.current_session_name() {
+            Some(current_session_name) => {
+                self.mode = Mode::RenameSession;
+                self.rename_session_name = current_session_name.to_owned();
+            },
+            None => {
+                self.set_error("Could not find current session");
+            },
+        }
+    }
+
+    fn rename_session(&mut self) -> Vec<SwitcherAction> {
+        if !self.permissions_granted {
+            self.error = Some("Session permissions are not granted yet".to_owned());
+            return Vec::new();
+        }
+
+        let Some(current_session_name) = self.current_session_name().map(str::to_owned) else {
+            self.set_error("Could not find current session");
+            return Vec::new();
+        };
+        let new_session_name = self.rename_session_name.trim().to_owned();
+        if new_session_name == current_session_name {
+            self.set_error("Session name is unchanged");
+            return Vec::new();
+        }
+        if let Some(error) = validate_session_name(
+            &new_session_name,
+            &self.sessions,
+            Some(&current_session_name),
+        ) {
+            self.error = Some(error);
+            return Vec::new();
+        }
+
+        self.mode = Mode::Search;
+        self.search_term.clear();
+        self.rename_session_name.clear();
+        self.rename_when_sessions_ready = false;
+        vec![SwitcherAction::RenameSession(new_session_name), SwitcherAction::Hide]
+    }
+
+    fn current_session_name(&self) -> Option<&str> {
+        self.sessions
+            .iter()
+            .find(|session| session.is_current_session)
+            .map(|session| session.name.as_str())
     }
 
     fn push_search_rows(
@@ -465,9 +585,14 @@ pub fn visible_rows(sessions: &[SessionEntry], search_term: &str) -> Vec<Row> {
     rows
 }
 
-pub fn validate_new_session_name(
+pub fn validate_new_session_name(session_name: &str, sessions: &[SessionEntry]) -> Option<String> {
+    validate_session_name(session_name, sessions, None)
+}
+
+pub fn validate_session_name(
     session_name: &str,
     sessions: &[SessionEntry],
+    allowed_existing_name: Option<&str>,
 ) -> Option<String> {
     if session_name.is_empty() {
         return Some("Session name cannot be empty".to_owned());
@@ -478,7 +603,9 @@ pub fn validate_new_session_name(
     if session_name.contains('/') {
         return Some("Session name cannot contain '/'".to_owned());
     }
-    if sessions.iter().any(|session| session.name == session_name) {
+    if sessions.iter().any(|session| {
+        session.name == session_name && Some(session.name.as_str()) != allowed_existing_name
+    }) {
         return Some(format!("Session '{}' already exists", session_name));
     }
     None
