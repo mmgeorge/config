@@ -3686,7 +3686,8 @@ local function status_head_row(name, oid, ref, ref_hl, subject, date_text, ref_w
     { ref_text, ref_hl },
   })
   if ref_padding ~= "" then segments[#segments + 1] = { ref_padding } end
-  segments[#segments + 1] = { " " .. (subject or "") }
+  segments[#segments + 1] = { " " }
+  vim.list_extend(segments, M._status_conventional_commit_subject_segments(subject or "", nil))
   return segments
 end
 

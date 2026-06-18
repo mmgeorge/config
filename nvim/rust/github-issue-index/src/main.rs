@@ -12,6 +12,7 @@ use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
 const ISSUES_TABLE: TableDefinition<&str, &str> = TableDefinition::new("issues");
+const ISSUE_DETAILS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("issue_details");
 const TERMS_TABLE: TableDefinition<&str, u64> = TableDefinition::new("issue_terms");
 const LABELS_TABLE: TableDefinition<&str, u64> = TableDefinition::new("issue_labels");
 const SYNC_TABLE: TableDefinition<&str, &str> = TableDefinition::new("sync_state");
@@ -54,6 +55,24 @@ enum Command {
         db: PathBuf,
         #[arg(long)]
         repo: String,
+    },
+    Detail {
+        #[arg(long)]
+        db: PathBuf,
+        #[arg(long)]
+        repo: String,
+        #[arg(long)]
+        number: u64,
+    },
+    UpsertDetail {
+        #[arg(long)]
+        db: PathBuf,
+        #[arg(long)]
+        repo: String,
+        #[arg(long)]
+        number: u64,
+        #[arg(long)]
+        input: Option<PathBuf>,
     },
 }
 
@@ -186,6 +205,25 @@ struct SnapshotOutput {
     issues: Vec<SnapshotIssueRecord>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct DetailRecord {
+    repo: String,
+    number: u64,
+    fetched_at: i64,
+    item: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+struct DetailOutput {
+    repo: String,
+    number: u64,
+    found: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fetched_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    item: Option<serde_json::Value>,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let db_lock_timeout = Duration::from_millis(cli.db_lock_timeout_ms);
@@ -223,6 +261,42 @@ fn main() -> Result<()> {
             let state = read_state(&database, &repo)?;
             print_json(&state)?;
         }
+        Command::Detail { db, repo, number } => {
+            let repo = normalize_repo(&repo)?;
+            let database = open_database_with_timeout(&db, db_lock_timeout)?;
+            let detail = read_detail(&database, &repo, number)?;
+            let output = match detail {
+                Some(detail) => DetailOutput {
+                    repo,
+                    number,
+                    found: true,
+                    fetched_at: Some(detail.fetched_at),
+                    item: Some(detail.item),
+                },
+                None => DetailOutput {
+                    repo,
+                    number,
+                    found: false,
+                    fetched_at: None,
+                    item: None,
+                },
+            };
+            print_json(&output)?;
+        }
+        Command::UpsertDetail {
+            db,
+            repo,
+            number,
+            input,
+        } => {
+            let repo = normalize_repo(&repo)?;
+            let mut detail = read_detail_input(input.as_deref())?;
+            detail.repo = repo.clone();
+            detail.number = number;
+            let database = open_database_with_timeout(&db, db_lock_timeout)?;
+            upsert_detail(&database, &repo, number, &detail)?;
+            print_json(&detail)?;
+        }
     }
     Ok(())
 }
@@ -254,6 +328,21 @@ fn read_page(path: Option<&Path>) -> Result<PageInput> {
         }
     }
     serde_json::from_str(&text).context("decode page JSON")
+}
+
+fn read_detail_input(path: Option<&Path>) -> Result<DetailRecord> {
+    let mut text = String::new();
+    match path {
+        Some(path) => {
+            text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        }
+        None => {
+            io::stdin()
+                .read_to_string(&mut text)
+                .context("read stdin")?;
+        }
+    }
+    serde_json::from_str(&text).context("decode detail JSON")
 }
 
 #[cfg(test)]
@@ -377,6 +466,7 @@ fn initialize_tables(database: &Database) -> Result<()> {
     let transaction = database.begin_write()?;
     {
         transaction.open_table(ISSUES_TABLE)?;
+        transaction.open_table(ISSUE_DETAILS_TABLE)?;
         transaction.open_table(TERMS_TABLE)?;
         transaction.open_table(LABELS_TABLE)?;
         transaction.open_table(SYNC_TABLE)?;
@@ -480,6 +570,37 @@ fn read_state(database: &Database, repo: &str) -> Result<RepoSyncState> {
     let transaction = database.begin_read()?;
     let sync = transaction.open_table(SYNC_TABLE)?;
     state_from_table(repo, &sync)
+}
+
+fn read_detail(database: &Database, repo: &str, number: u64) -> Result<Option<DetailRecord>> {
+    let transaction = database.begin_read()?;
+    let details = transaction.open_table(ISSUE_DETAILS_TABLE)?;
+    let key = issue_key(repo, number);
+    if let Some(encoded) = details.get(key.as_str())? {
+        let mut detail: DetailRecord = serde_json::from_str(encoded.value())
+            .with_context(|| format!("decode cached issue detail #{}", number))?;
+        detail.repo = repo.to_owned();
+        detail.number = number;
+        return Ok(Some(detail));
+    }
+    Ok(None)
+}
+
+fn upsert_detail(
+    database: &Database,
+    repo: &str,
+    number: u64,
+    detail: &DetailRecord,
+) -> Result<()> {
+    let transaction = database.begin_write()?;
+    {
+        let mut details = transaction.open_table(ISSUE_DETAILS_TABLE)?;
+        let key = issue_key(repo, number);
+        let encoded = serde_json::to_string(detail)?;
+        details.insert(key.as_str(), encoded.as_str())?;
+    }
+    transaction.commit()?;
+    Ok(())
 }
 
 fn state_from_table(
@@ -805,6 +926,33 @@ mod tests {
         assert_eq!(snapshot.issue_count, 1);
         assert_eq!(snapshot.issues[0].title, "New label");
         assert_eq!(snapshot.issues[0].labels[0].name, "docs");
+        let _ = fs::remove_file(db_path);
+        Ok(())
+    }
+
+    #[test]
+    fn upsert_and_read_issue_detail() -> Result<()> {
+        let db_path = temp_db("detail");
+        let database = open_database(&db_path)?;
+        let detail = DetailRecord {
+            repo: "mmgeorge/test-repo".to_owned(),
+            number: 12,
+            fetched_at: 1234,
+            item: serde_json::json!({
+                "repo": "mmgeorge/test-repo",
+                "number": 12,
+                "title": "Cached issue",
+                "body": "Cached body"
+            }),
+        };
+
+        upsert_detail(&database, "mmgeorge/test-repo", 12, &detail)?;
+
+        let cached = read_detail(&database, "mmgeorge/test-repo", 12)?
+            .ok_or_else(|| anyhow!("missing cached detail"))?;
+        assert_eq!(cached.fetched_at, 1234);
+        assert_eq!(cached.item["title"], "Cached issue");
+        assert!(read_detail(&database, "mmgeorge/test-repo", 13)?.is_none());
         let _ = fs::remove_file(db_path);
         Ok(())
     }

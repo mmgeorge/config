@@ -280,6 +280,13 @@ completion must read the snapshot locally and must not run a live GitHub search
 per keystroke. `:GithubIssueSync [all]` owns manual refresh, and
 `:GithubDeleteRepoCache` owns repo cache cleanup.
 
+Any status, picker, preview, header, or detail row that displays text starting
+with a commit subject must use the shared conventional commit formatter. In this
+module, route subject text through `M._status_conventional_commit_subject_segments(...)`
+or `M._status_conventional_commit_type_end(...)` instead of hand-building a
+plain string, so the conventional commit `<type>` prefix is colorized
+consistently across Head/Merge/Push, PR, About, and commit-list rows.
+
 ## Shared Status UX Pattern
 
 GitStatus' Unstaged/Staged model is the canonical UX pattern for all

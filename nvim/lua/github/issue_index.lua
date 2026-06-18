@@ -1,8 +1,11 @@
 local M = {}
 
 local stale_after_seconds = 10 * 60
+local detail_stale_after_seconds = 2 * 60
 local progress_by_repo = {}
 local in_flight = {}
+local detail_in_flight = {}
+local detail_waiters = {}
 local sync_locks = {}
 local snapshot_cache = {}
 local notified = {}
@@ -121,6 +124,10 @@ end
 local function issue_dir(repo)
   repo = normalize_repo(repo) or repo
   return vim.fs.joinpath(require("github.repo_cache").repo_dir(repo), "issues")
+end
+
+local function detail_key(repo, number)
+  return (normalize_repo(repo) or tostring(repo or "")) .. "#" .. tostring(number)
 end
 
 function M.db_path(repo)
@@ -674,6 +681,155 @@ function M.search(repo, query, opts)
     items[#items + 1] = scored[index].issue
   end
   return items
+end
+
+---@param repo string
+---@param number integer|string
+---@param callback fun(result: table)
+local function read_detail_async(repo, number, callback)
+  repo = normalize_repo(repo)
+  number = tonumber(number)
+  if not (repo and number) then
+    callback({ ok = false, message = "Invalid issue detail cache key" })
+    return
+  end
+  run_sidecar_json({
+    "detail",
+    "--db",
+    M.db_path(repo),
+    "--repo",
+    repo,
+    "--number",
+    tostring(number),
+  }, nil, nil, callback)
+end
+
+---@param cwd string?
+---@param repo string
+---@param number integer|string
+---@param item table
+---@param callback fun(result: table)
+local function write_detail_async(cwd, repo, number, item, callback)
+  repo = normalize_repo(repo)
+  number = tonumber(number)
+  if not (repo and number) then
+    callback({ ok = false, message = "Invalid issue detail cache key" })
+    return
+  end
+  local payload = {
+    repo = repo,
+    number = number,
+    fetched_at = os.time(),
+    item = item,
+  }
+  run_sidecar_json({
+    "upsert-detail",
+    "--db",
+    M.db_path(repo),
+    "--repo",
+    repo,
+    "--number",
+    tostring(number),
+  }, vim.json.encode(payload), cwd, callback)
+end
+
+---@param key string
+---@param result table
+local function finish_detail_fetch(key, result)
+  local waiters = detail_waiters[key] or {}
+  detail_waiters[key] = nil
+  detail_in_flight[key] = nil
+  for _, waiter in ipairs(waiters) do
+    waiter(result)
+  end
+end
+
+---@param cwd string?
+---@param repo string
+---@param number integer|string
+local function fetch_detail_async(cwd, repo, number)
+  local key = detail_key(repo, number)
+  if detail_in_flight[key] then return end
+  detail_in_flight[key] = true
+  require("github.gh").issue_view_async(cwd, number, repo, function(result)
+    if not (result and result.ok and result.item) then
+      finish_detail_fetch(key, {
+        ok = false,
+        message = result and result.message or "GitHub issue detail fetch failed",
+        code = result and result.code,
+      })
+      return
+    end
+    result.item.repo = normalize_repo(result.item.repo or repo) or result.item.repo or repo
+    write_detail_async(cwd, repo, number, result.item, function(write_result)
+      if not (write_result and write_result.ok) then
+        notify("GitHub issue detail cache update failed:\n" .. tostring(write_result and write_result.message or "unknown error"), vim.log.levels.WARN)
+      end
+      finish_detail_fetch(key, {
+        ok = true,
+        item = result.item,
+        fetched_at = os.time(),
+        cached = false,
+        cache_updated = write_result and write_result.ok == true,
+      })
+    end)
+  end)
+end
+
+---@param cwd string?
+---@param repo string
+---@param number integer|string
+---@param opts? { force?: boolean }
+---@param callback fun(result: table)
+function M.detail_async(cwd, repo, number, opts, callback)
+  opts = opts or {}
+  repo = normalize_repo(repo)
+  number = tonumber(number)
+  if not (repo and number) then
+    callback({ ok = false, message = "Issue detail cache requires an owner/repo and issue number" })
+    return
+  end
+
+  local key = detail_key(repo, number)
+  read_detail_async(repo, number, function(cache_result)
+    local should_fetch = opts.force == true
+    if cache_result and cache_result.ok and cache_result.value and cache_result.value.found == true then
+      local value = cache_result.value
+      local fetched_at = tonumber(value.fetched_at or 0) or 0
+      local age = os.time() - fetched_at
+      callback({
+        ok = true,
+        item = value.item,
+        fetched_at = fetched_at,
+        cached = true,
+        stale = age >= detail_stale_after_seconds,
+      })
+      should_fetch = should_fetch or age >= detail_stale_after_seconds
+    elseif cache_result and not cache_result.ok then
+      notify("GitHub issue detail cache read failed:\n" .. tostring(cache_result.message or "unknown error"), vim.log.levels.WARN)
+      should_fetch = true
+    else
+      should_fetch = true
+    end
+
+    if not should_fetch then return end
+    detail_waiters[key] = detail_waiters[key] or {}
+    detail_waiters[key][#detail_waiters[key] + 1] = callback
+    fetch_detail_async(cwd, repo, number)
+  end)
+end
+
+---@param cwd string?
+---@param repo string
+---@param number integer|string
+---@param item table
+---@param callback? fun(result: table)
+function M.store_detail_async(cwd, repo, number, item, callback)
+  write_detail_async(cwd, repo, number, item, callback or function(result)
+    if not (result and result.ok) then
+      notify("GitHub issue detail cache update failed:\n" .. tostring(result and result.message or "unknown error"), vim.log.levels.WARN)
+    end
+  end)
 end
 
 ---@param progress table?
@@ -1246,6 +1402,10 @@ function M._set_progress_enabled_for_test(enabled)
   progress_enabled = enabled == true
 end
 
+function M._set_detail_stale_after_seconds_for_test(seconds)
+  detail_stale_after_seconds = tonumber(seconds) or detail_stale_after_seconds
+end
+
 function M._reset_for_test()
   for _, progress in pairs(progress_by_repo) do
     stop_progress_timer(progress)
@@ -1255,6 +1415,8 @@ function M._reset_for_test()
   end
   progress_by_repo = {}
   in_flight = {}
+  detail_in_flight = {}
+  detail_waiters = {}
   sync_locks = {}
   snapshot_cache = {}
   notified = {}
@@ -1263,6 +1425,7 @@ function M._reset_for_test()
   runner_for_test = nil
   gh_runner_for_test = nil
   progress_enabled = true
+  detail_stale_after_seconds = 2 * 60
   notifier_failed = false
 end
 

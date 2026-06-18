@@ -1,5 +1,6 @@
 local gh = require("github.gh")
 local github_comment_rows = require("github.comment_rows")
+local issue_index = require("github.issue_index")
 local diff_review_ok, diff_review = pcall(require, "diff_review")
 if not diff_review_ok then diff_review = nil end
 
@@ -984,7 +985,7 @@ local function ensure_buffer()
   end, { buffer = buf, desc = "Toggle GitHub issue fold", nowait = true })
 
   vim.keymap.set("n", "R", function()
-    M.refresh()
+    M.refresh({ force = true })
   end, { buffer = buf, desc = "Refresh GitHub issue", nowait = true })
 
   vim.keymap.set({ "n", "i" }, "<C-s>", function()
@@ -1124,6 +1125,9 @@ function M.save()
       state.item.title = title
       state.item.body = body
       state.item.assignees = vim.deepcopy(assignees)
+      if state.kind == "issue" and state.item.repo and state.item.repo ~= "" then
+        issue_index.store_detail_async(state.cwd, state.item.repo, state.number, state.item)
+      end
     end
     refresh_modified()
     vim.notify("Issue #" .. tostring(state.number) .. " updated", vim.log.levels.INFO, { title = "GitHub" })
@@ -1131,7 +1135,7 @@ function M.save()
 end
 
 ---@param result GithubGhDetailResult
----@param opts? { keep_existing?: boolean }
+---@param opts? { keep_existing?: boolean, cached?: boolean, cache_updated?: boolean }
 local function on_detail(result, opts)
   opts = opts or {}
   state.loading = false
@@ -1149,11 +1153,16 @@ local function on_detail(result, opts)
     state.repo = state.item.repo
     if state.buf and vim.api.nvim_buf_is_valid(state.buf) then enable_user_completion(state.buf, state.item.repo) end
     load_repo_metadata(state.cwd, state.item.repo)
+    if state.kind == "issue" and not opts.cached and not opts.cache_updated then
+      issue_index.store_detail_async(state.cwd, state.item.repo, state.number, state.item)
+    end
   end
   set_rendered(render_item(result.item))
 end
 
-function M.refresh()
+---@param opts? { force?: boolean }
+function M.refresh(opts)
+  opts = opts or {}
   local keep_existing = state.item ~= nil
   state.loading = true
   state.refresh_request_id = state.refresh_request_id + 1
@@ -1161,9 +1170,15 @@ function M.refresh()
   if not keep_existing then set_plain_lines({ "Loading GitHub " .. state.kind .. "..." }) end
   local function handle_detail(result)
     if request_id ~= state.refresh_request_id then return end
-    on_detail(result, { keep_existing = keep_existing })
+    on_detail(result, {
+      keep_existing = keep_existing,
+      cached = result and result.cached == true,
+      cache_updated = result and result.cache_updated == true,
+    })
   end
-  if state.kind == "pr" then
+  if state.kind == "issue" and state.repo and state.repo ~= "" then
+    issue_index.detail_async(state.cwd, state.repo, state.number, { force = opts.force == true }, handle_detail)
+  elseif state.kind == "pr" then
     gh.pr_view_async(state.cwd, state.number, state.repo, handle_detail)
   else
     gh.issue_view_async(state.cwd, state.number, state.repo, handle_detail)

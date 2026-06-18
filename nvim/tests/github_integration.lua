@@ -13,6 +13,7 @@ local captured_picker = nil
 local opened_pr_numbers = {}
 local defer_next_issue_view = false
 local deferred_issue_view_callback = nil
+local issue_detail_cache = {}
 local original_snacks = _G.Snacks
 local original_picker_pick = original_snacks and original_snacks.picker and original_snacks.picker.pick
 local original_notify = vim.notify
@@ -73,6 +74,7 @@ local function reset()
   opened_pr_numbers = {}
   defer_next_issue_view = false
   deferred_issue_view_callback = nil
+  issue_detail_cache = {}
   render_markdown_calls = {}
   notifications._reset_for_tests()
   repo_cache.remember_cwd_repo(vim.fn.getcwd(), "org/repo")
@@ -238,6 +240,14 @@ local function find_call_containing(needle)
   return nil
 end
 
+local function count_calls_containing(needle)
+  local count = 0
+  for _, call in ipairs(calls) do
+    if call.key:find(needle, 1, true) then count = count + 1 end
+  end
+  return count
+end
+
 local function encoded_issue(number)
   local issue_state = number == 34 and "CLOSED" or "OPEN"
   return vim.json.encode({
@@ -272,6 +282,34 @@ local function encoded_issue(number)
     createdAt = "2026-06-01T00:00:00Z",
     updatedAt = "2026-06-10T12:00:00Z",
   })
+end
+
+local function cached_issue_detail(body, fetched_at)
+  return {
+    repo = "org/repo",
+    number = 12,
+    found = true,
+    fetched_at = fetched_at or os.time(),
+    item = {
+      kind = "issue",
+      repo = "org/repo",
+      number = 12,
+      title = "Fix command parser",
+      body = body,
+      url = "https://github.com/org/repo/issues/12",
+      state = "OPEN",
+      author = "alice",
+      comments_count = 0,
+      created_at = "2026-06-01T00:00:00Z",
+      updated_at = "2026-06-10T12:00:00Z",
+      labels = { "bug" },
+      assignees = { "bob" },
+      milestone = "v1.0",
+      projects = { "Roadmap" },
+      subscription = "Subscribed",
+      comments = {},
+    },
+  }
 end
 
 local function encoded_pr(number)
@@ -455,7 +493,7 @@ vim.fn.delete(cache_root, "rf")
 repo_cache.set_data_dir_for_test(cache_root)
 issue_index._reset_for_test()
 issue_index._set_progress_enabled_for_test(false)
-issue_index._set_runner_for_test(function(command, _, callback)
+issue_index._set_runner_for_test(function(command, input, callback)
   local action = command[2]
   if action == "state" then
     local stdout = vim.json.encode({
@@ -463,6 +501,31 @@ issue_index._set_runner_for_test(function(command, _, callback)
       open_historical_complete = true,
       last_open_checked_at = os.time(),
     })
+    callback({ code = 0, stdout = stdout, stderr = "", output = stdout })
+    return
+  end
+  if action == "detail" then
+    local number = command[#command]
+    local cached = issue_detail_cache[number]
+    local stdout = vim.json.encode(cached or {
+      repo = "org/repo",
+      number = tonumber(number),
+      found = false,
+    })
+    callback({ code = 0, stdout = stdout, stderr = "", output = stdout })
+    return
+  end
+  if action == "upsert-detail" then
+    local number = command[#command]
+    local decoded = vim.json.decode(input or "{}")
+    issue_detail_cache[number] = {
+      repo = "org/repo",
+      number = tonumber(number),
+      found = true,
+      fetched_at = decoded.fetched_at,
+      item = decoded.item,
+    }
+    local stdout = vim.json.encode(issue_detail_cache[number])
     callback({ code = 0, stdout = stdout, stderr = "", output = stdout })
     return
   end
@@ -561,8 +624,15 @@ local function run_tests()
   function preview:notify(message)
     self.lines = { tostring(message) }
   end
+  issue_detail_cache["12"] = cached_issue_detail("Cached stale body", os.time() - 180)
+  defer_next_issue_view = true
   captured_picker.preview({ item = captured_picker.items[1], preview = preview })
+  assert_true(preview_contains(preview, "Cached stale body"), "issue preview should display stale cached detail immediately")
+  assert_true(deferred_issue_view_callback ~= nil, "stale issue preview did not start a deferred detail refresh")
+  deferred_issue_view_callback()
+  deferred_issue_view_callback = nil
   wait_for(function() return preview_contains(preview, "Issue body") end, "issue preview did not fetch the issue body")
+  assert_true(count_calls_containing("gh\tissue\tview\t12") == 1, "issue preview should fetch detail exactly once")
   assert_true(preview_contains(preview, "Title:  Fix command parser"), "issue preview should use issue-view title layout")
   assert_true(preview_contains(preview, "Author:       alice"), "issue preview should use issue-view metadata layout")
   assert_true(preview_contains(preview, "Description:"), "issue preview should render the issue description heading")
@@ -570,12 +640,13 @@ local function run_tests()
   assert_true(not preview_contains(preview, "#12 Fix command parser"), "issue preview should not use the legacy picker-only layout")
   captured_picker.confirm({ close = function() end }, captured_picker.items[1])
   wait_for(function() return find_line("Title:  Fix command parser") ~= nil end, "issue view did not render selected issue")
+  assert_true(count_calls_containing("gh\tissue\tview\t12") == 1, "issue buffer open should reuse cached issue detail")
   local buf = vim.api.nvim_get_current_buf()
   assert_true(vim.wo[0].wrap, "issue buffer should enable word wrap")
   assert_true(vim.wo[0].linebreak, "issue buffer should wrap at word boundaries")
   assert_true(vim.wo[0].breakindent, "issue buffer should preserve indentation on wrapped lines")
   defer_next_issue_view = true
-  require("github.issue_view").refresh()
+  require("github.issue_view").refresh({ force = true })
   assert_true(deferred_issue_view_callback ~= nil, "issue refresh did not start the deferred detail request")
   assert_true(buffer_contains("Title:  Fix command parser"), "issue refresh should keep existing content while loading")
   assert_true(

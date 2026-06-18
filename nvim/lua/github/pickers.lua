@@ -4,7 +4,6 @@ local repo_cache = require("github.repo_cache")
 
 local M = {}
 
-local issue_preview_cache = {}
 local issue_preview_request_id = 0
 
 ---@class GithubPickerCommandTarget
@@ -86,18 +85,11 @@ local function preview_issue(ctx)
   if not (item and item.kind == "issue") then return end
 
   local title = "Issue #" .. tostring(item.number)
-  local cache_key = tostring(item.repo or ""):lower() .. "#" .. tostring(item.number)
-  local cached = issue_preview_cache[cache_key]
-  if cached then
-    set_preview_lines(ctx, title, issue_preview_lines(cached, cached.body))
-    return
-  end
-
   issue_preview_request_id = issue_preview_request_id + 1
   local request_id = issue_preview_request_id
   set_preview_lines(ctx, title, issue_preview_lines(item, item.body ~= "" and item.body or "Loading description..."))
 
-  gh.issue_view_async(vim.fn.getcwd(), item.number, item.repo, function(result)
+  issue_index.detail_async(vim.fn.getcwd(), item.repo, item.number, nil, function(result)
     if request_id ~= issue_preview_request_id then return end
     if not (result and result.ok and result.item) then
       local message = result and result.message or "GitHub issue preview failed"
@@ -105,7 +97,6 @@ local function preview_issue(ctx)
       set_preview_lines(ctx, title, issue_preview_lines(item, tostring(message)))
       return
     end
-    issue_preview_cache[cache_key] = result.item
     set_preview_lines(ctx, title, issue_preview_lines(result.item, result.item.body))
   end)
 end
