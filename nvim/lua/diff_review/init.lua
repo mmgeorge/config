@@ -191,6 +191,7 @@ M._codeowner_review_icon = "⚠"
 M._milestone_icon = "◆"
 M._pr_overview = {}
 M._datetime = {}
+M._comment_rows = require("github.comment_rows")
 
 M._hunk_header_ns = vim.api.nvim_create_namespace("diff_review_headers")
 M._active_hunk_header_ns = vim.api.nvim_create_namespace("diff_review_active_hunk")
@@ -3668,7 +3669,7 @@ local function status_head_row(name, oid, ref, ref_hl, subject, date_text)
   }
   if date_text and date_text ~= "" then
     segments[#segments + 1] = { " " }
-    segments[#segments + 1] = { date_text }
+    segments[#segments + 1] = { date_text, "DiffReviewStatusDate" }
   end
   vim.list_extend(segments, {
     { " " },
@@ -3943,6 +3944,37 @@ function M._datetime.action_phrase(user, action, value)
   return ("%s %s %s"):format(user, action, relative)
 end
 
+---@param text string
+---@return table[]
+function M._datetime.date_highlight_ranges(text)
+  text = tostring(text or "")
+  local ranges = {}
+  local patterns = {
+    "%f[%w]just now%f[%W]",
+    "%f[%w]%d+ minutes? ago%f[%W]",
+    "%f[%w]%d+ hours? ago%f[%W]",
+    "%f[%w]%d+ days? ago%f[%W]",
+    "%f[%w]Yesterday%f[%W]",
+    "%f[%w]Last week%f[%W]",
+    "%f[%w]Last month%f[%W]",
+    "%f[%a]%u%l+ %d%d?, %d%d%d%d%f[%W]",
+  }
+  for _, pattern in ipairs(patterns) do
+    local start_index = 1
+    while start_index <= #text do
+      local match_start, match_end = text:find(pattern, start_index)
+      if not match_start then break end
+      ranges[#ranges + 1] = {
+        start_col = match_start - 1,
+        end_col = match_end,
+      }
+      start_index = match_end + 1
+    end
+  end
+  table.sort(ranges, function(left, right) return left.start_col < right.start_col end)
+  return ranges
+end
+
 ---@param value any
 ---@return string
 function M._pr_overview.comment_datetime(value)
@@ -3952,45 +3984,50 @@ end
 ---@param body string
 ---@return string
 function M._pr_overview.comment_preview(body)
-  local parts = {}
-  for _, line in ipairs(vim.split(tostring(body or ""), "\n", { plain = true })) do
-    local trimmed = vim.trim(line)
-    if trimmed ~= "" then parts[#parts + 1] = trimmed end
-  end
-  return table.concat(parts, " "):gsub("%s+", " ")
+  return M._comment_rows.preview_text(body)
 end
 
 ---@param comment table
 ---@return string
 function M._pr_overview.comment_author(comment)
-  return tostring(comment and comment.user or "unknown")
+  return M._comment_rows.author(comment)
 end
 
 ---@param text any
 ---@param width integer?
 ---@return string
 function M._pr_overview.pad_display_right(text, width)
-  text = tostring(text or "")
-  local padding = (width or 0) - vim.fn.strdisplaywidth(text)
-  if padding <= 0 then return text end
-  return text .. string.rep(" ", padding)
+  return M._comment_rows.pad_right(text, width)
+end
+
+---@return GithubCommentRowsOpts
+function M._pr_overview.issue_comment_row_options()
+  return {
+    comment_icon = M._comment_icon,
+    relative_date = M._pr_overview.comment_datetime,
+    entry_id = M._pr_overview.issue_comment_entry_id,
+    preview_width = function(prefix)
+      return math.max(0, M._review.comment_rule_width(nil, nil) - vim.fn.strdisplaywidth(prefix))
+    end,
+    truncate_preview = M._review.truncate_preview_text,
+    body_lines = M._review.comment_body_lines,
+    kind = "pr_comment",
+    line_hl_group = "DiffReviewReviewComment",
+    body_hl_group = "DiffReviewReviewComment",
+    date_hl_group = "DiffReviewStatusDate",
+  }
 end
 
 ---@param comment table
 ---@return string
 function M._pr_overview.issue_comment_date(comment)
-  return M._pr_overview.comment_datetime(comment.updated_at or comment.created_at)
+  return M._comment_rows.date(comment, M._pr_overview.issue_comment_row_options())
 end
 
 ---@param comments table[]?
 ---@return { author_width: integer, date_width: integer }
 function M._pr_overview.issue_comment_alignment(comments)
-  local alignment = { author_width = 0, date_width = 0 }
-  for _, comment in ipairs(comments or {}) do
-    alignment.author_width = math.max(alignment.author_width, vim.fn.strdisplaywidth(M._pr_overview.comment_author(comment)))
-    alignment.date_width = math.max(alignment.date_width, vim.fn.strdisplaywidth(M._pr_overview.issue_comment_date(comment)))
-  end
-  return alignment
+  return M._comment_rows.alignment(comments, M._pr_overview.issue_comment_row_options())
 end
 
 ---@param comment table
@@ -3998,18 +4035,7 @@ end
 ---@param has_preview? boolean
 ---@return string
 function M._pr_overview.issue_comment_prefix(comment, alignment, has_preview)
-  alignment = alignment or {}
-  local date_text = M._pr_overview.issue_comment_date(comment)
-  local date_width = alignment.date_width or vim.fn.strdisplaywidth(date_text)
-  local prefix = ("%s %s"):format(
-    M._comment_icon,
-    M._pr_overview.pad_display_right(M._pr_overview.comment_author(comment), alignment.author_width)
-  )
-  if date_text ~= "" or date_width > 0 then
-    prefix = prefix .. " " .. M._pr_overview.pad_display_right(date_text, has_preview and date_width or 0)
-  end
-  if has_preview then return prefix end
-  return prefix:gsub("%s+$", "")
+  return M._comment_rows.prefix(comment, alignment, has_preview, M._pr_overview.issue_comment_row_options())
 end
 
 ---@param comment table
@@ -4017,17 +4043,7 @@ end
 ---@param alignment? { author_width?: integer, date_width?: integer }
 ---@return string
 function M._pr_overview.issue_comment_line(comment, expanded, alignment)
-  local prefix = M._pr_overview.issue_comment_prefix(comment, alignment, false)
-  if not expanded then
-    local preview = M._pr_overview.comment_preview(comment.body or "")
-    if M._review and M._review.truncate_preview_text and M._review.comment_rule_width then
-      local preview_prefix = M._pr_overview.issue_comment_prefix(comment, alignment, preview ~= "") .. "  "
-      local preview_width = math.max(0, M._review.comment_rule_width(nil, nil) - vim.fn.strdisplaywidth(preview_prefix))
-      preview = M._review.truncate_preview_text(preview, preview_width)
-    end
-    if preview ~= "" then prefix = M._pr_overview.issue_comment_prefix(comment, alignment, true) .. "  " .. preview end
-  end
-  return prefix
+  return M._comment_rows.line(comment, expanded, alignment, M._pr_overview.issue_comment_row_options())
 end
 
 ---@param comment table?
@@ -4383,7 +4399,7 @@ local function status_pr_detail_head_lines(pr, status)
   lines[#lines + 1] = {
     segments = {
       { "Activity: ", "DiffReviewStatusLabel" },
-      { M._pr_overview.activity_text(pr, status), "DiffReviewStatusBranch" },
+      { M._pr_overview.activity_text(pr, status), "DiffReviewStatusDate" },
     },
   }
   lines[#lines + 1] = { segments = { { "" } } }
@@ -5288,7 +5304,7 @@ function M._pr_overview.review_summary_segments(review, alignment)
     segments[#segments + 1] = { " ", "DiffReviewReviewComment" }
     segments[#segments + 1] = {
       M._pr_overview.pad_display_right(date_text, #tail_parts > 0 and alignment.date_width or 0),
-      "DiffReviewReviewComment",
+      "DiffReviewStatusDate",
     }
   end
   for _, tail in ipairs(tail_parts) do
@@ -6374,29 +6390,27 @@ end
 ---@param index integer
 ---@param alignment? { author_width?: integer, date_width?: integer }
 function M._pr_overview.render_issue_comment(comment, index, alignment)
-  local entry_id = M._pr_overview.issue_comment_entry_id(comment, index)
-  local expanded = not status_folded(entry_id, true)
-  local line = M._pr_overview.issue_comment_line(comment, expanded, alignment)
-  local entry = {
-    id = entry_id,
-    kind = "pr_comment",
-    pr_comment = comment,
-  }
-  local line_number = status_add_line(line, entry, "DiffReviewReviewComment")
-  status_add_highlight(line_number, 0, #line, "DiffReviewReviewComment")
-  if not expanded then return end
-
-  for body_index, body_line_text in ipairs(M._review.comment_body_lines(comment.body or "")) do
-    local body_entry = {
-      id = entry_id,
-      kind = "pr_comment",
-      pr_comment = comment,
-      pr_comment_body = true,
-      pr_comment_body_index = body_index,
-    }
-    local body_line = status_add_line(body_line_text, body_entry)
-    if body_line_text ~= "" then status_add_highlight(body_line, 0, #body_line_text, "DiffReviewReviewComment") end
+  for _, row in ipairs(M._pr_overview.issue_comment_rows({ comment }, { alignment = alignment, start_index = index })) do
+    local line_number = status_add_line(row.text, row.entry, row.line_hl_group)
+    for _, highlight in ipairs(row.highlights or {}) do
+      status_add_highlight(line_number, highlight.start_col, highlight.end_col, highlight.hl_group)
+    end
   end
+end
+
+---@param comments table[]
+---@param opts? { alignment?: { author_width?: integer, date_width?: integer }, start_index?: integer, is_folded?: fun(entry_id: string, default: boolean, entry: table): boolean }
+---@return table[]
+function M._pr_overview.issue_comment_rows(comments, opts)
+  opts = opts or {}
+  comments = comments or {}
+  local row_opts = M._pr_overview.issue_comment_row_options()
+  row_opts.alignment = opts.alignment or M._pr_overview.issue_comment_alignment(comments)
+  row_opts.start_index = opts.start_index
+  row_opts.is_folded = opts.is_folded or function(entry_id, default)
+    return status_folded(entry_id, default)
+  end
+  return M._comment_rows.rows(comments, row_opts)
 end
 
 ---@param comments table[]
@@ -6454,8 +6468,11 @@ local function status_render_commit(commit, date_width)
   local commit_folded = status_folded(commit_key, true)
   local line = commit.short_oid
   local date_text = status_commit_relative_date(commit)
+  local date_start_col = nil
   if date_text then
-    line = line .. "  " .. date_text
+    line = line .. "  "
+    date_start_col = #line
+    line = line .. date_text
     if date_width > #date_text then line = line .. string.rep(" ", date_width - #date_text) end
   end
   local suffix = commit.subject or ""
@@ -6467,6 +6484,9 @@ local function status_render_commit(commit, date_width)
   local entry = { id = commit_key, kind = "commit", commit = commit }
   local line_number = status_add_line(line, entry)
   status_add_highlight(line_number, 0, #commit.short_oid, "DiffReviewStatusObjectId")
+  if date_start_col then
+    status_add_highlight(line_number, date_start_col, date_start_col + #date_text, "DiffReviewStatusDate")
+  end
   local conventional_type_end = M._status_conventional_commit_type_end(suffix)
   if suffix_start_col and conventional_type_end then
     status_add_highlight(line_number, suffix_start_col, suffix_start_col + conventional_type_end, "DiffReviewStatusCommitType")
@@ -8581,6 +8601,27 @@ function M._review.comment_folded_line(comment, win, buf)
   return M._review.truncate_display(left_text .. preview, width)
 end
 
+---@param line_number integer
+---@param text string
+function M._review.add_comment_rule_date_highlights(line_number, text)
+  for _, range in ipairs(M._datetime.date_highlight_ranges(text)) do
+    status_add_highlight(line_number, range.start_col, range.end_col, "DiffReviewStatusDate")
+  end
+end
+
+---@param buf integer
+---@param row0 integer
+---@param text string
+function M._review.set_comment_rule_date_extmarks(buf, row0, text)
+  for _, range in ipairs(M._datetime.date_highlight_ranges(text)) do
+    pcall(vim.api.nvim_buf_set_extmark, buf, M._status_ns, row0, range.start_col, {
+      end_col = range.end_col,
+      hl_group = "DiffReviewStatusDate",
+      priority = 95,
+    })
+  end
+end
+
 ---@param body string
 ---@return string[]
 function M._review.comment_body_lines(body)
@@ -8605,6 +8646,7 @@ function M._review.emit_comment_reply(comment, comment_index, reply, reply_index
   local header = M._review.reply_header_line(reply)
   local header_line = status_add_line(header, header_entry, "DiffReviewReviewCommentHeader")
   status_add_highlight(header_line, 0, #header, "DiffReviewReviewCommentHeader")
+  M._review.add_comment_rule_date_highlights(header_line, header)
 
   for body_index, line in ipairs(M._review.comment_body_lines(reply.body or "")) do
     local body_entry = {
@@ -8639,6 +8681,7 @@ function M._review.emit_comment(comment, index, indent)
     local folded = M._review.comment_folded_line(comment)
     local folded_line = status_add_line(folded, folded_entry, "DiffReviewReviewCommentHeader")
     status_add_highlight(folded_line, 0, #folded, "DiffReviewReviewCommentHeader")
+    M._review.add_comment_rule_date_highlights(folded_line, folded)
     return
   end
 
@@ -8655,6 +8698,7 @@ function M._review.emit_comment(comment, index, indent)
   local header = M._review.comment_header_line(comment)
   local header_line = status_add_line(header, header_entry, "DiffReviewReviewCommentHeader")
   status_add_highlight(header_line, 0, #header, "DiffReviewReviewCommentHeader")
+  M._review.add_comment_rule_date_highlights(header_line, header)
 
   for body_index, line in ipairs(body_lines) do
     local body_entry = {
@@ -9351,6 +9395,7 @@ function M._review.replace_comment_rule_line(buf, row0, line)
       hl_group = "DiffReviewReviewCommentHeader",
       priority = 90,
     })
+    M._review.set_comment_rule_date_extmarks(buf, row0, line)
   end
   local state = M._review.state(buf)
   if state and state.lines then state.lines[row0 + 1] = line end

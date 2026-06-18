@@ -98,6 +98,8 @@
 ---@class GithubGhIssueEdit
 ---@field title? string
 ---@field body? string
+---@field add_assignees? string[]
+---@field remove_assignees? string[]
 
 ---@class GithubGhUpdateIssueResult
 ---@field ok boolean
@@ -710,6 +712,12 @@ function M.update_issue_async(cwd, number, repo, edit, callback)
   if type(edit.body) == "string" then
     vim.list_extend(command, { "--body-file", "-" })
     input = edit.body
+  end
+  for _, assignee in ipairs(edit.add_assignees or {}) do
+    vim.list_extend(command, { "--add-assignee", assignee })
+  end
+  for _, assignee in ipairs(edit.remove_assignees or {}) do
+    vim.list_extend(command, { "--remove-assignee", assignee })
   end
 
   system_text_async(command, input, cwd, function(result)

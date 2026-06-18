@@ -1,0 +1,3 @@
+[groups.cargo]
+cpu_percent = 4
+priority = "below-normal"

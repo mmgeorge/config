@@ -30,7 +30,7 @@ package.loaded["render-markdown"] = {
           virt_text = { { "rendered issue body", "Comment" } },
           virt_text_pos = "eol",
         })
-      elseif line == "Repo:         org/repo" then
+      elseif line == "Author:       alice" then
         vim.api.nvim_buf_set_extmark(ctx.buf, render_markdown_ns, row - 1, 0, {
           virt_text = { { "metadata should be pruned", "Comment" } },
           virt_text_pos = "eol",
@@ -123,8 +123,80 @@ local function buffer_contains(needle)
   return table.concat(current_lines(), "\n"):find(needle, 1, true) ~= nil
 end
 
+local function buffer_has_exact_line(needle)
+  for _, line in ipairs(current_lines()) do
+    if line == needle then return true end
+  end
+  return false
+end
+
 local function plain_winbar()
   return (vim.wo[0].winbar or ""):gsub("%%#.-#", ""):gsub("%%%*", ""):gsub("%%=", " ")
+end
+
+local function trigger_buf_mapping(buf, key)
+  local mapping = vim.api.nvim_buf_call(buf, function()
+    return vim.fn.maparg(key, "n", false, true)
+  end)
+  assert_true(type(mapping.callback) == "function", "missing current mapping for " .. key)
+  mapping.callback()
+end
+
+local function move_cursor(buf, row)
+  vim.api.nvim_win_set_buf(0, buf)
+  vim.api.nvim_win_set_cursor(0, { row, 0 })
+  vim.api.nvim_exec_autocmds("CursorMoved", { buffer = buf })
+end
+
+local function edit_line(buf, row, text)
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_set_lines(buf, row - 1, row, false, { text })
+  vim.api.nvim_exec_autocmds("TextChanged", { buffer = buf })
+end
+
+local function reviewer_completion_labels(buf, row, text)
+  edit_line(buf, row, text)
+  move_cursor(buf, row)
+  local old_virtualedit = vim.o.virtualedit
+  vim.o.virtualedit = "onemore"
+  vim.api.nvim_win_set_cursor(0, { row, #text })
+  local reviewer_source = require("diff_review.reviewer_source").new({})
+  assert_true(reviewer_source:enabled(), "reviewer completion source did not enable on: " .. text)
+  local completion_result
+  reviewer_source:get_completions({}, function(result) completion_result = result end)
+  vim.o.virtualedit = old_virtualedit
+  local labels = {}
+  for _, item in ipairs(completion_result.items or {}) do
+    labels[item.label] = item
+  end
+  return labels
+end
+
+local function assert_contributor_completion(buf, row, text)
+  local labels = reviewer_completion_labels(buf, row, text)
+  assert_true(labels["@alice"], "GitHub user completion did not include contributor @alice on: " .. text)
+  assert_true(labels["@bob"], "GitHub user completion did not include collaborator @bob on: " .. text)
+  assert_true(labels["@carol"], "GitHub user completion did not include contributor @carol on: " .. text)
+end
+
+local function assert_issue_completion(buf, row, text)
+  edit_line(buf, row, text)
+  move_cursor(buf, row)
+  local old_virtualedit = vim.o.virtualedit
+  vim.o.virtualedit = "onemore"
+  vim.api.nvim_win_set_cursor(0, { row, #text })
+  local issue_source = require("github.issue_source").new({ debounce_ms = 0 })
+  assert_true(issue_source:enabled(), "GitHub issue completion did not enable on: " .. text)
+  local completion_result
+  issue_source:get_completions({}, function(result) completion_result = result end)
+  assert_true(vim.wait(1000, function() return completion_result ~= nil end, 10), "GitHub issue completion did not return")
+  vim.o.virtualedit = old_virtualedit
+  local labels = {}
+  for _, item in ipairs(completion_result.items or {}) do
+    labels[item.label] = item
+  end
+  assert_true(labels["#12 Fix command parser"] ~= nil, "GitHub issue completion did not include #12 on: " .. text)
+  assert_true(labels["#12 Fix command parser"].textEdit.newText == "#12", "GitHub issue completion should insert only the issue id")
 end
 
 local function issue_dirty_marker_count(buf)
@@ -155,13 +227,21 @@ local function find_call(key)
   return nil
 end
 
+local function find_call_containing(needle)
+  for _, call in ipairs(calls) do
+    if call.key:find(needle, 1, true) then return call end
+  end
+  return nil
+end
+
 local function encoded_issue(number)
+  local issue_state = number == 34 and "CLOSED" or "OPEN"
   return vim.json.encode({
     number = number,
     title = "Fix command parser",
     body = "Issue body\n\n## Foobar\n\nDetails.",
     url = "https://github.com/org/repo/issues/" .. tostring(number),
-    state = "OPEN",
+    state = issue_state,
     author = { login = "alice" },
     assignees = { { login = "bob" } },
     labels = { { name = "bug" } },
@@ -178,15 +258,15 @@ local function encoded_issue(number)
     },
     comments = {
       {
-        body = "First comment",
+        body = "First comment with enough preview text to fill the collapsed row before later body content appears in the buffer\n\nSecond comment line",
         author = { login = "carol" },
         createdAt = "2026-06-01T00:00:00Z",
-        updatedAt = "2026-06-01T00:00:00Z",
+        updatedAt = "2026-06-12T12:00:00Z",
         url = "https://github.com/org/repo/issues/12#issuecomment-1",
       },
     },
     createdAt = "2026-06-01T00:00:00Z",
-    updatedAt = "2026-06-02T00:00:00Z",
+    updatedAt = "2026-06-10T12:00:00Z",
   })
 end
 
@@ -284,7 +364,7 @@ function backend.system_async(command, input, callback, cwd)
     stdout = encoded_issue(99)
   elseif key == "gh\tissue\tcreate\t--title\tCreated issue\t--body\t" then
     stdout = "https://github.com/org/repo/issues/99\n"
-  elseif key == "gh\tissue\tedit\t12\t--repo\torg/repo\t--title\tBetter parser\t--body-file\t-" then
+  elseif key:find("gh\tissue\tedit\t12\t--repo\torg/repo", 1, true) then
     stdout = ""
   elseif key:find("gh\tpr\tview\t44", 1, true) or key:find("gh\tpr\tview\t45", 1, true) then
     stdout = encoded_pr(44)
@@ -388,6 +468,42 @@ package.loaded["diff_review"] = {
       opts = opts,
     }
   end,
+  _milestone_icon = "◆",
+  _pr_overview = {
+    reviewer_token = function(username)
+      return "@" .. tostring(username or ""):gsub("^@", "")
+    end,
+    reviewer_login = function(reviewer)
+      if type(reviewer) == "table" then reviewer = reviewer.login or reviewer.slug or reviewer.name end
+      return tostring(reviewer or ""):gsub("^@", "")
+    end,
+    milestone_text = function(pr)
+      local milestone = pr and pr.milestone or nil
+      if type(milestone) == "table" then milestone = milestone.title or milestone.name end
+      milestone = vim.trim(tostring(milestone or ""))
+      return milestone ~= "" and ("◆ " .. milestone) or ""
+    end,
+    comment_datetime = function(value)
+      if value == "2026-06-12T12:00:00Z" then return "3 days ago" end
+      if value == "2026-06-10T12:00:00Z" then return "5 days ago" end
+      return tostring(value or "")
+    end,
+  },
+  _pr_edit = {
+    reviewer_usernames = function(text)
+      local usernames = {}
+      local seen = {}
+      for token in tostring(text or ""):gmatch("@?[%w][%w_-]*") do
+        local username = token:gsub("^@", "")
+        local key = username:lower()
+        if username ~= "" and not seen[key] then
+          seen[key] = true
+          usernames[#usernames + 1] = username
+        end
+      end
+      return usernames
+    end,
+  },
 }
 
 local plugin_spec = require("plugins.github")[1]
@@ -449,12 +565,36 @@ local function run_tests()
   assert_true(buffer_contains("Refresh issue"), "issue command popup missing refresh command")
   vim.api.nvim_win_close(0, true)
   vim.api.nvim_set_current_buf(buf)
-  wait_for(function() return find_line("Milestone:    v1.0") ~= nil end, "issue milestone did not render")
+  local title_line = find_line("Title:  Fix command parser")
+  local author_line = find_line("Author:       alice")
+  local state_line = find_line("State:        Open")
+  assert_true(title_line ~= nil and author_line ~= nil and state_line ~= nil, "issue header fields missing")
+  assert_true(title_line + 1 == author_line, "issue title should be followed immediately by author")
+  assert_true(author_line < state_line, "issue state should render after author")
+  local activity_line = find_line("Activity:     3 days ago")
+  assert_true(activity_line ~= nil, "issue activity row did not render latest activity")
+  assert_true(state_line < activity_line, "issue activity should render after state")
+  assert_true(
+    line_has_namespace_highlight(buf, "github.issue_view.decorations", activity_line, "DiffReviewStatusDate"),
+    "issue activity did not receive the date highlight"
+  )
+  assert_true(
+    line_has_namespace_highlight(buf, "github.issue_view.decorations", state_line, "DiffReviewStatusOpen"),
+    "open issue state did not receive the open highlight"
+  )
+  local open_hl = vim.api.nvim_get_hl(0, { name = "DiffReviewStatusOpen", link = false })
+  assert_true(open_hl.fg == 0x50fa7b, "DiffReviewStatusOpen should be green")
+  local closed_hl = vim.api.nvim_get_hl(0, { name = "DiffReviewStatusClosed", link = false })
+  assert_true(closed_hl.fg == 0x6b7280, "DiffReviewStatusClosed should be gray")
+  assert_true(not buffer_contains("Repo:"), "issue buffer should not render Repo metadata")
+  assert_true(not buffer_contains("URL:"), "issue buffer should not render URL metadata")
+  wait_for(function() return find_line("Release:      ◆ v1.0") ~= nil end, "issue release did not render")
   assert_true(find_line("Projects:     Roadmap (In progress), Backlog") ~= nil, "issue projects did not render")
   assert_true(find_line("Subscription: Subscribed") ~= nil, "issue subscription did not render")
   assert_true(find_line("Labels:       bug") ~= nil, "issue labels did not render")
-  assert_true(find_line("Assignees:    bob") ~= nil, "issue assignees did not render")
-  assert_true(find_line("Opening Comment:") ~= nil, "issue opening comment did not render")
+  assert_true(find_line("Assignees:    @bob") ~= nil, "issue assignees did not render reviewer-style tokens")
+  assert_true(find_line("Description:") ~= nil, "issue description heading did not render")
+  assert_true(not buffer_contains("Opening Comment:"), "issue buffer still rendered the old opening comment heading")
   local comments_heading_line = find_line("Comments (1):")
   assert_true(comments_heading_line ~= nil, "issue comments did not render")
   local line_after_comments_heading = current_lines()[comments_heading_line + 1] or ""
@@ -463,9 +603,25 @@ local function run_tests()
     "issue comments rendered an extra blank line after the comments heading"
   )
   assert_true(find_line("carol") ~= nil, "issue comments did not use the PR comment summary format")
+  assert_true(not buffer_has_exact_line("Second comment line"), "issue comments should reuse collapsed PR comment rendering by default")
+  vim.api.nvim_win_set_cursor(0, { comments_heading_line + 1, 0 })
+  vim.api.nvim_exec_autocmds("CursorMoved", { buffer = buf })
+  opened_urls = {}
+  trigger_buf_mapping(buf, "b")
+  assert_true(
+    opened_urls[1] == "https://github.com/org/repo/issues/12#issuecomment-1",
+    "issue comment browse did not use the comment URL"
+  )
+  trigger_buf_mapping(buf, "<Tab>")
+  wait_for(function() return buffer_has_exact_line("Second comment line") end, "issue comment fold did not expand through shared PR rows")
+  local expanded_comment_line = find_line("Second comment line")
+  assert_true(expanded_comment_line ~= nil, "expanded issue comment body did not render")
+  vim.api.nvim_win_set_cursor(0, { expanded_comment_line, 0 })
+  vim.api.nvim_exec_autocmds("CursorMoved", { buffer = buf })
+  trigger_buf_mapping(buf, "<Tab>")
+  wait_for(function() return not buffer_has_exact_line("Second comment line") end, "issue comment fold did not collapse from body row")
   wait_for(function() return #render_markdown_calls > 0 end, "issue opening comment did not invoke markdown renderer")
   assert_true(vim.bo.filetype == "GithubIssue", "issue buffer did not use the GithubIssue filetype")
-  local title_line = find_line("Title:  Fix command parser")
   local markdown_heading_line = find_line("## Foobar")
   assert_true(markdown_heading_line ~= nil, "issue markdown heading did not render")
   assert_true(
@@ -478,25 +634,42 @@ local function run_tests()
   local body_line = find_line("Details.")
   assert_true(title_line ~= nil and body_line ~= nil, "issue editable fields missing")
   assert_true(issue_dirty_marker_count(buf) == 0, "issue dirty markers were present before edits")
+  wait_for(function()
+    return #repo_cache.contributors("org/repo") == 3
+  end, "repo contributors were not cached for issue assignee completion")
+  local assignees_line = find_line("Assignees:    @bob")
+  assert_true(assignees_line ~= nil, "issue assignees row missing")
+  move_cursor(buf, assignees_line)
+  assert_true(vim.bo[buf].modifiable, "issue assignees were not editable")
+  assert_contributor_completion(buf, assignees_line, "Assignees:    @")
+  edit_line(buf, assignees_line, "Assignees:    @bob")
+  assert_issue_completion(buf, body_line, "Details. #Fi")
+  edit_line(buf, body_line, "Details.")
+  wait_for(function() return issue_dirty_marker_count(buf) == 0 end, "issue completion probes left dirty markers")
   vim.api.nvim_win_set_cursor(0, { title_line, 0 })
   vim.api.nvim_exec_autocmds("CursorMoved", { buffer = buf })
   assert_true(vim.bo[buf].modifiable, "issue title was not editable")
   vim.api.nvim_buf_set_lines(buf, title_line - 1, title_line, false, { "Title:  Better parser" })
+  edit_line(buf, assignees_line, "Assignees:    @alice @carol")
   vim.api.nvim_win_set_cursor(0, { body_line, 0 })
   vim.api.nvim_exec_autocmds("CursorMoved", { buffer = buf })
   assert_true(vim.bo[buf].modifiable, "issue body was not editable")
   vim.api.nvim_buf_set_lines(buf, body_line - 1, body_line, false, { "Updated details." })
   vim.api.nvim_exec_autocmds("TextChanged", { buffer = buf })
-  wait_for(function() return issue_dirty_marker_count(buf) == 2 end, "issue dirty markers did not render")
+  wait_for(function() return issue_dirty_marker_count(buf) == 3 end, "issue dirty markers did not render")
   vim.api.nvim_buf_call(buf, function()
     vim.cmd("write")
   end)
   local edit_key = "gh\tissue\tedit\t12\t--repo\torg/repo\t--title\tBetter parser\t--body-file\t-"
   wait_for(function()
-    return find_call(edit_key) ~= nil
+    return find_call_containing(edit_key) ~= nil
   end, "issue write did not update issue")
+  local edit_call = find_call_containing(edit_key)
+  assert_true(edit_call.key:find("--add-assignee\talice", 1, true) ~= nil, "issue write did not add alice assignee")
+  assert_true(edit_call.key:find("--add-assignee\tcarol", 1, true) ~= nil, "issue write did not add carol assignee")
+  assert_true(edit_call.key:find("--remove-assignee\tbob", 1, true) ~= nil, "issue write did not remove bob assignee")
   assert_true(
-    find_call(edit_key).input == "Issue body\n\n## Foobar\n\nUpdated details.",
+    edit_call.input == "Issue body\n\n## Foobar\n\nUpdated details.",
     "issue write sent the wrong body"
   )
   wait_for(function() return not vim.bo[buf].modified end, "issue save did not clear the modified flag")
@@ -523,6 +696,12 @@ local function run_tests()
   reset()
   vim.cmd("GithubIssue 34")
   wait_for(function() return find_line("Title:  Fix command parser") ~= nil end, "GithubIssue with a number did not open issue buffer")
+  wait_for(function() return find_line("State:        Closed") ~= nil end, "closed issue state did not render as title case")
+  local closed_state_line = find_line("State:        Closed")
+  assert_true(
+    line_has_namespace_highlight(vim.api.nvim_get_current_buf(), "github.issue_view.decorations", closed_state_line, "DiffReviewStatusClosed"),
+    "closed issue state did not receive the closed highlight"
+  )
 
   reset()
   vim.cmd("GithubIssueCreate Created issue")

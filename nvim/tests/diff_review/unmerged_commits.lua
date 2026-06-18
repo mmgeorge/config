@@ -99,6 +99,13 @@ local function line_has_highlight(buf, row, hl_group, start_col, end_col)
   return false
 end
 
+local function line_has_substring_highlight(buf, row, text, hl_group)
+  local line = status_lines(buf)[row] or ""
+  local start_index = line:find(text, 1, true)
+  if not start_index then return false end
+  return line_has_highlight(buf, row, hl_group, start_index - 1, start_index - 1 + #text)
+end
+
 local function line_highlights(buf, row)
   local groups = {}
   local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
@@ -259,6 +266,10 @@ local function run()
   assert_true(buffer_contains(buf, "748971a  2 days ago feat: add debug notifications and AI commit flag"), "second unmerged commit missing")
   local first_unmerged_row = find_row(buf, "45806b8  1 day ago  feat: add or mapping and guard ai generation")
   local first_unmerged_line = status_lines(buf)[first_unmerged_row] or ""
+  assert_true(
+    line_has_substring_highlight(buf, first_unmerged_row, "1 day ago", "DiffReviewStatusDate"),
+    "first unmerged commit date was not highlighted: " .. line_highlights(buf, first_unmerged_row)
+  )
   local feat_start = (first_unmerged_line:find("feat:", 1, true) or 1) - 1
   assert_true(
     line_has_highlight(buf, first_unmerged_row, "DiffReviewStatusCommitType", feat_start, feat_start + #"feat"),
@@ -293,6 +304,10 @@ local function run()
   wait_for(function() return buffer_contains(buf, "recent01  1 day ago   docs: recent commit 01") end, "recent commits did not unfold")
   local recent_row = find_row(buf, "recent01  1 day ago   docs: recent commit 01")
   local recent_line = status_lines(buf)[recent_row] or ""
+  assert_true(
+    line_has_substring_highlight(buf, recent_row, "1 day ago", "DiffReviewStatusDate"),
+    "recent commit date was not highlighted: " .. line_highlights(buf, recent_row)
+  )
   local docs_start = (recent_line:find("docs:", 1, true) or 1) - 1
   assert_true(
     line_has_highlight(buf, recent_row, "DiffReviewStatusCommitType", docs_start, docs_start + #"docs"),

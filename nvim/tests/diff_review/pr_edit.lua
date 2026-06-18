@@ -554,6 +554,13 @@ local function line_has_highlight(buf, row, hl_group, start_col, end_col)
   return false
 end
 
+local function line_has_substring_highlight(buf, row, text, hl_group)
+  local line = vim.api.nvim_buf_get_lines(buf, row - 1, row, false)[1] or ""
+  local start_index = line:find(text, 1, true)
+  if not start_index then return false end
+  return line_has_highlight(buf, row, hl_group, start_index - 1, start_index - 1 + #text)
+end
+
 local function assert_cursor_clamped_to_line(buf, row, label)
   vim.api.nvim_win_set_buf(0, buf)
   local line = vim.api.nvim_buf_get_lines(buf, row - 1, row, false)[1] or ""
@@ -737,6 +744,8 @@ local function run()
   gh.set_backend(gh_backend)
   github_gh.set_backend(gh_backend)
   diff_review.setup({ about_auto_generate = false })
+  local date_hl = vim.api.nvim_get_hl(0, { name = "DiffReviewStatusDate", link = true })
+  assert_true(date_hl.link == "Comment", "DiffReviewStatusDate should link to Comment")
   repo_cache.set_data_dir_for_test(repo_cache_dir)
   issue_index._reset_for_test()
   issue_index._set_progress_enabled_for_test(false)
@@ -798,12 +807,20 @@ local function run()
     buffer_contains(buf, "Head:   abc1234 1 day ago feature chore: head commit"),
     "PR head row did not render the head commit date"
   )
+  assert_true(
+    line_has_substring_highlight(buf, find_row(buf, "Head:   abc1234"), "1 day ago", "DiffReviewStatusDate"),
+    "PR head date did not use date highlight"
+  )
   assert_true(vim.wo[0].wrap, "PR buffer should enable soft wrap")
   assert_true(vim.wo[0].linebreak, "PR buffer should wrap on word boundaries")
   assert_true(vim.wo[0].breakindent, "PR buffer should preserve indent on wrapped screen lines")
   assert_true(buffer_contains(buf, "Line one"), "PR body did not render")
   wait_for(function() return buffer_contains(buf, "This is a regular comment") end, "PR conversation comment did not render")
   wait_for(function() return buffer_contains(buf, "Activity: 5 hours ago") end, "PR activity row did not use the newest comment/review activity")
+  assert_true(
+    line_has_substring_highlight(buf, find_row(buf, "Activity: 5 hours ago"), "5 hours ago", "DiffReviewStatusDate"),
+    "PR activity date did not use date highlight"
+  )
   assert_true(
     find_row(buf, "Status: DRAFT") < find_row(buf, "Activity: 5 hours ago"),
     "PR activity row should render after Status"
@@ -818,6 +835,10 @@ local function run()
   assert_true(not first_regular_comment_line:find("|", 1, true), "regular PR comment row kept a pipe: " .. first_regular_comment_line)
   assert_true(not first_regular_comment_line:find("commented", 1, true), "regular PR comment row kept action text: " .. first_regular_comment_line)
   assert_true(
+    line_has_substring_highlight(buf, first_regular_comment_row, "10 hours ago", "DiffReviewStatusDate"),
+    "regular PR comment date did not use date highlight"
+  )
+  assert_true(
     buffer_contains(buf, "Lorem Ipsum is the ubiquitous placeholder"),
     "long PR conversation comment preview did not render"
   )
@@ -826,6 +847,10 @@ local function run()
   assert_true(
     long_regular_preview_line:find("me 5 hours ago   Lorem Ipsum is the ubiquitous placeholder", 1, true) ~= nil,
     "long PR comment row did not align the shorter date column: " .. long_regular_preview_line
+  )
+  assert_true(
+    line_has_substring_highlight(buf, long_regular_preview_row, "5 hours ago", "DiffReviewStatusDate"),
+    "long PR comment date did not use date highlight"
   )
   assert_true(
     not buffer_contains(buf, "Second full line for expansion"),
@@ -943,6 +968,10 @@ local function run()
     assert_true(not review_summary_line:find("approved", 1, true), "review summary kept approved action text: " .. review_summary_line)
     assert_true(not review_summary_line:find("commented", 1, true), "review summary kept commented action text: " .. review_summary_line)
     assert_true(not line_has_highlight(buf, review_summary_row, "DiffReviewReviewCommentHeader"), "review summary should not use blue header highlight: " .. review_summary_line)
+    assert_true(
+      line_has_substring_highlight(buf, review_summary_row, "10 hours ago", "DiffReviewStatusDate"),
+      "review summary date did not use date highlight: " .. review_summary_line
+    )
   end
   assert_true(line_has_highlight(buf, rejected_summary_row, "DiffReviewDeleteRange"), "rejected review summary did not highlight status red")
   assert_true(line_has_highlight(buf, approved_summary_row, "DiffReviewAddRange"), "approved review summary did not highlight status green")
@@ -961,6 +990,14 @@ local function run()
   local base_commit_row = find_row_after(buf, "1111111  2 days ago feat: base commit", head_commit_row)
   assert_true(head_commit_row > recent_commits_row, "PR head commit did not render under Recent Commits")
   assert_true(base_commit_row > head_commit_row, "PR commits did not render newest first")
+  assert_true(
+    line_has_substring_highlight(buf, head_commit_row, "1 day ago", "DiffReviewStatusDate"),
+    "PR recent commit date did not use date highlight"
+  )
+  assert_true(
+    line_has_substring_highlight(buf, base_commit_row, "2 days ago", "DiffReviewStatusDate"),
+    "PR base commit date did not use date highlight"
+  )
   move_cursor(buf, changes_file_row)
   trigger_buf_mapping(buf, "<Tab>")
   wait_for(function() return buffer_contains(buf, "NEW LINE") end, "PR changed file did not expand")

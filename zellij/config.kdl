@@ -289,7 +289,7 @@ plugins {
         cwd "/"
     }
     plugin-manager location="zellij:plugin-manager"
-    session-manager location="zellij:session-manager"
+    session-manager location="file:D:/config/zellij/sessions/target/wasm32-wasip1/release/sessions.wasm"
     status-bar location="zellij:status-bar"
     strider location="zellij:strider"
     tab-bar location="zellij:tab-bar"
