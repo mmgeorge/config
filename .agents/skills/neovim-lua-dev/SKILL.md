@@ -194,6 +194,14 @@ If diagnostics still look wrong, run the linter directly (e.g. `luacheck`,
   constructing CLI commands inline. The wrapper owns argument shape, JSON
   decoding/normalization, nonzero-exit classification, URL opening, and test
   injection.
+- **Request schema validation:** before adding or changing fields for an
+  external request, validate the response shape against the real API/CLI contract
+  instead of inferring it from nearby code. For read-only requests, make one
+  targeted real request through the approved transport for the project; when that
+  is not safe or possible, use primary documentation, schema output, or source.
+  Tests must cover the outbound request contract as well as the renderer path:
+  assert command arguments, JSON field lists, request parameters, and unsupported
+  fields so mocks cannot accept shapes the real API rejects.
 - **Async refresh state:** long-running refreshes need a request id or equivalent
   cancellation token. Start a new id for each refresh and ignore callbacks from
   older ids so slow Git/process results cannot repaint stale data over newer UI.

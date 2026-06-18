@@ -15,6 +15,31 @@ local original_snacks = _G.Snacks
 local original_picker_pick = original_snacks and original_snacks.picker and original_snacks.picker.pick
 local original_notify = vim.notify
 local original_diff_review = package.loaded["diff_review"]
+local render_markdown_ns = vim.api.nvim_create_namespace("render-markdown.nvim")
+local render_markdown_calls = {}
+
+package.loaded["render-markdown.core.ui"] = { ns = render_markdown_ns }
+package.loaded["render-markdown"] = {
+  render = function(ctx)
+    render_markdown_calls[#render_markdown_calls + 1] = ctx
+    vim.api.nvim_buf_clear_namespace(ctx.buf, render_markdown_ns, 0, -1)
+    local lines = vim.api.nvim_buf_get_lines(ctx.buf, 0, -1, false)
+    for row, line in ipairs(lines) do
+      if line == "Issue body" then
+        vim.api.nvim_buf_set_extmark(ctx.buf, render_markdown_ns, row - 1, 0, {
+          virt_text = { { "rendered issue body", "Comment" } },
+          virt_text_pos = "eol",
+        })
+      elseif line == "Repo:         org/repo" then
+        vim.api.nvim_buf_set_extmark(ctx.buf, render_markdown_ns, row - 1, 0, {
+          virt_text = { { "metadata should be pruned", "Comment" } },
+          virt_text_pos = "eol",
+        })
+      end
+    end
+    if ctx.config and ctx.config.on and ctx.config.on.render then ctx.config.on.render({ buf = ctx.buf, win = ctx.win }) end
+  end,
+}
 
 local function assert_true(condition, message)
   if not condition then error(message, 2) end
@@ -24,10 +49,18 @@ local function command_key(command)
   return table.concat(command, "\t")
 end
 
-local function record(command)
+local function command_json_fields(command)
+  for index, value in ipairs(command) do
+    if value == "--json" then return command[index + 1] or "" end
+  end
+  return ""
+end
+
+local function record(command, input)
   calls[#calls + 1] = {
     command = vim.deepcopy(command),
     key = command_key(command),
+    input = input,
   }
 end
 
@@ -36,6 +69,7 @@ local function reset()
   opened_urls = {}
   captured_picker = nil
   opened_pr_numbers = {}
+  render_markdown_calls = {}
   notifications._reset_for_tests()
   repo_cache.remember_cwd_repo(vim.fn.getcwd(), "org/repo")
 end
@@ -70,7 +104,7 @@ local function preview_contains(preview, needle)
 end
 
 local function wait_for(predicate, message)
-  local ok = vim.wait(1000, predicate, 10)
+  local ok = vim.wait(1000, predicate, 10, false)
   assert_true(ok, message)
 end
 
@@ -85,6 +119,32 @@ local function find_line(needle)
   return nil
 end
 
+local function buffer_contains(needle)
+  return table.concat(current_lines(), "\n"):find(needle, 1, true) ~= nil
+end
+
+local function plain_winbar()
+  return (vim.wo[0].winbar or ""):gsub("%%#.-#", ""):gsub("%%%*", ""):gsub("%%=", " ")
+end
+
+local function issue_dirty_marker_count(buf)
+  local ns = vim.api.nvim_get_namespaces()["github.issue_view"]
+  local count = 0
+  for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(buf, ns, 0, -1, { details = true })) do
+    local details = mark[4] or {}
+    local virt_text = details.virt_text
+    if virt_text and virt_text[1] and virt_text[1][1] == "*" then count = count + 1 end
+  end
+  return count
+end
+
+local function find_call(key)
+  for _, call in ipairs(calls) do
+    if call.key == key then return call end
+  end
+  return nil
+end
+
 local function encoded_issue(number)
   return vim.json.encode({
     number = number,
@@ -95,6 +155,17 @@ local function encoded_issue(number)
     author = { login = "alice" },
     assignees = { { login = "bob" } },
     labels = { { name = "bug" } },
+    milestone = { title = "v1.0" },
+    viewerSubscription = "SUBSCRIBED",
+    projectItems = {
+      {
+        title = "Roadmap",
+        status = { name = "In progress" },
+      },
+      {
+        project = { title = "Backlog" },
+      },
+    },
     comments = {
       {
         body = "First comment",
@@ -136,8 +207,8 @@ function backend.open_url(url)
   return true
 end
 
-function backend.system_async(command, _, callback, cwd)
-  record(command)
+function backend.system_async(command, input, callback, cwd)
+  record(command, input)
   assert_true(cwd == root or cwd == vim.fn.getcwd() or cwd == nil, "unexpected cwd: " .. tostring(cwd))
   local key = command_key(command)
   local stdout = ""
@@ -184,13 +255,27 @@ function backend.system_async(command, _, callback, cwd)
       },
     })
   elseif key:find("gh\tissue\tview\t12", 1, true) then
+    assert_true(
+      not command_json_fields(command):find("viewerSubscription", 1, true),
+      "issue view requested unsupported viewerSubscription field"
+    )
     stdout = encoded_issue(12)
   elseif key:find("gh\tissue\tview\t34", 1, true) then
+    assert_true(
+      not command_json_fields(command):find("viewerSubscription", 1, true),
+      "issue view requested unsupported viewerSubscription field"
+    )
     stdout = encoded_issue(34)
   elseif key:find("gh\tissue\tview\t99", 1, true) then
+    assert_true(
+      not command_json_fields(command):find("viewerSubscription", 1, true),
+      "issue view requested unsupported viewerSubscription field"
+    )
     stdout = encoded_issue(99)
   elseif key == "gh\tissue\tcreate\t--title\tCreated issue\t--body\t" then
     stdout = "https://github.com/org/repo/issues/99\n"
+  elseif key == "gh\tissue\tedit\t12\t--repo\torg/repo\t--title\tBetter parser\t--body-file\t-" then
+    stdout = ""
   elseif key:find("gh\tpr\tview\t44", 1, true) or key:find("gh\tpr\tview\t45", 1, true) then
     stdout = encoded_pr(44)
   elseif key:find("gh\tapi\t/notifications", 1, true) then
@@ -232,6 +317,10 @@ function backend.system_async(command, _, callback, cwd)
       body = "Issue body",
       comments = 1,
     })
+  elseif key == "gh\tapi\t/repos/org/repo/contributors\t--paginate\t--slurp" then
+    stdout = vim.json.encode({ { login = "alice" }, { login = "carol" } })
+  elseif key == "gh\tapi\t/repos/org/repo/collaborators\t--paginate\t--slurp" then
+    stdout = vim.json.encode({ { login = "bob" } })
   elseif key == "gh\tapi\t/repos/org/repo/pulls/44" then
     stdout = vim.json.encode({
       body = "PR body",
@@ -247,14 +336,12 @@ function backend.system_async(command, _, callback, cwd)
     code = 1
   end
 
-  vim.defer_fn(function()
-    callback({
-      code = code,
-      stdout = stdout,
-      stderr = code == 0 and "" or "unexpected command: " .. key,
-      output = code == 0 and stdout or "unexpected command: " .. key,
-    })
-  end, 5)
+  callback({
+    code = code,
+    stdout = stdout,
+    stderr = code == 0 and "" or "unexpected command: " .. key,
+    output = code == 0 and stdout or "unexpected command: " .. key,
+  })
 end
 
 gh.set_backend(backend)
@@ -335,8 +422,57 @@ local function run_tests()
   captured_picker.preview({ item = captured_picker.items[1], preview = preview })
   wait_for(function() return preview_contains(preview, "Issue body") end, "issue preview did not fetch the issue body")
   captured_picker.confirm({ close = function() end }, captured_picker.items[1])
-  wait_for(function() return find_line("#12 Fix command parser") ~= nil end, "issue view did not render selected issue")
-  assert_true(find_line("Comments (1)") ~= nil, "issue comments did not render")
+  wait_for(function() return find_line("Title:  Fix command parser") ~= nil end, "issue view did not render selected issue")
+  local buf = vim.api.nvim_get_current_buf()
+  assert_true(not buffer_contains("Hint:"), "issue buffer still rendered the legacy Hint line")
+  local issue_winbar = plain_winbar()
+  assert_true(issue_winbar:find("GitHub Issue #12", 1, true) ~= nil, "issue winbar title missing")
+  assert_true(issue_winbar:find("b browse", 1, true) ~= nil, "issue winbar missing browse command")
+  assert_true(issue_winbar:find("R refresh", 1, true) ~= nil, "issue winbar missing refresh command")
+  assert_true(issue_winbar:find("<C-s> sync", 1, true) ~= nil, "issue winbar missing sync command")
+  assert_true(issue_winbar:find("q close", 1, true) ~= nil, "issue winbar missing close command")
+  assert_true(issue_winbar:find("? help", 1, true) ~= nil, "issue winbar missing help command")
+  local help_map = vim.fn.maparg("?", "n", false, true)
+  assert_true(type(help_map.callback) == "function", "issue help keymap did not install a callback")
+  help_map.callback()
+  assert_true(vim.bo.filetype == "GithubIssueHelp", "issue command popup did not open")
+  assert_true(buffer_contains("Refresh issue"), "issue command popup missing refresh command")
+  vim.api.nvim_win_close(0, true)
+  vim.api.nvim_set_current_buf(buf)
+  wait_for(function() return find_line("Milestone:    v1.0") ~= nil end, "issue milestone did not render")
+  assert_true(find_line("Projects:     Roadmap (In progress), Backlog") ~= nil, "issue projects did not render")
+  assert_true(find_line("Subscription: Subscribed") ~= nil, "issue subscription did not render")
+  assert_true(find_line("Labels:       bug") ~= nil, "issue labels did not render")
+  assert_true(find_line("Assignees:    bob") ~= nil, "issue assignees did not render")
+  assert_true(find_line("Opening Comment:") ~= nil, "issue opening comment did not render")
+  assert_true(find_line("Comments (1):") ~= nil, "issue comments did not render")
+  assert_true(find_line("carol") ~= nil, "issue comments did not use the PR comment summary format")
+  wait_for(function() return #render_markdown_calls > 0 end, "issue opening comment did not invoke markdown renderer")
+  assert_true(vim.bo.filetype == "GithubIssue", "issue buffer did not use the GithubIssue filetype")
+  local title_line = find_line("Title:  Fix command parser")
+  local body_line = find_line("Details.")
+  assert_true(title_line ~= nil and body_line ~= nil, "issue editable fields missing")
+  assert_true(issue_dirty_marker_count(buf) == 0, "issue dirty markers were present before edits")
+  vim.api.nvim_win_set_cursor(0, { title_line, 0 })
+  vim.api.nvim_exec_autocmds("CursorMoved", { buffer = buf })
+  assert_true(vim.bo[buf].modifiable, "issue title was not editable")
+  vim.api.nvim_buf_set_lines(buf, title_line - 1, title_line, false, { "Title:  Better parser" })
+  vim.api.nvim_win_set_cursor(0, { body_line, 0 })
+  vim.api.nvim_exec_autocmds("CursorMoved", { buffer = buf })
+  assert_true(vim.bo[buf].modifiable, "issue body was not editable")
+  vim.api.nvim_buf_set_lines(buf, body_line - 1, body_line, false, { "Updated details." })
+  vim.api.nvim_exec_autocmds("TextChanged", { buffer = buf })
+  wait_for(function() return issue_dirty_marker_count(buf) == 2 end, "issue dirty markers did not render")
+  vim.api.nvim_buf_call(buf, function()
+    vim.cmd("write")
+  end)
+  local edit_key = "gh\tissue\tedit\t12\t--repo\torg/repo\t--title\tBetter parser\t--body-file\t-"
+  wait_for(function()
+    return find_call(edit_key) ~= nil
+  end, "issue write did not update issue")
+  assert_true(find_call(edit_key).input == "Issue body\n\nUpdated details.", "issue write sent the wrong body")
+  wait_for(function() return not vim.bo[buf].modified end, "issue save did not clear the modified flag")
+  wait_for(function() return issue_dirty_marker_count(buf) == 0 end, "issue save did not clear dirty markers")
 
   reset()
   vim.cmd.GithubPR()
@@ -358,11 +494,11 @@ local function run_tests()
 
   reset()
   vim.cmd("GithubIssue 34")
-  wait_for(function() return find_line("#34 Fix command parser") ~= nil end, "GithubIssue with a number did not open issue buffer")
+  wait_for(function() return find_line("Title:  Fix command parser") ~= nil end, "GithubIssue with a number did not open issue buffer")
 
   reset()
   vim.cmd("GithubIssueCreate Created issue")
-  wait_for(function() return find_line("#99 Fix command parser") ~= nil end, "GithubIssueCreate did not open created issue")
+  wait_for(function() return find_line("Title:  Fix command parser") ~= nil end, "GithubIssueCreate did not open created issue")
   assert_true(calls[1].key == "gh\tissue\tcreate\t--title\tCreated issue\t--body\t", "GithubIssueCreate did not create issue")
 
   reset()

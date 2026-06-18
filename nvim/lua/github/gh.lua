@@ -40,6 +40,9 @@
 ---@field created_at string
 ---@field labels string[]
 ---@field assignees string[]
+---@field milestone string
+---@field projects string[]
+---@field subscription string
 ---@field comments GithubGhComment[]
 ---@field head_ref_name? string
 ---@field base_ref_name? string
@@ -92,6 +95,15 @@
 ---@field message? string
 ---@field code? integer
 
+---@class GithubGhIssueEdit
+---@field title? string
+---@field body? string
+
+---@class GithubGhUpdateIssueResult
+---@field ok boolean
+---@field message? string
+---@field code? integer
+
 ---@class GithubGhModule
 ---@field _backend GithubGhBackend?
 
@@ -132,6 +144,8 @@ local issue_fields = table.concat({
   "author",
   "assignees",
   "labels",
+  "milestone",
+  "projectItems",
   "comments",
   "createdAt",
   "updatedAt",
@@ -146,6 +160,9 @@ local pr_fields = table.concat({
   "author",
   "assignees",
   "labels",
+  "milestone",
+  "projectItems",
+  "viewerSubscription",
   "comments",
   "createdAt",
   "updatedAt",
@@ -264,6 +281,67 @@ local function names(values, key)
   return result
 end
 
+---@param value any
+---@return string
+local function milestone_name(value)
+  if type(value) == "table" then return as_string(value.title or value.name) end
+  return as_string(value)
+end
+
+---@param value any
+---@return string
+local function project_name(value)
+  if type(value) == "string" then return value end
+  if type(value) ~= "table" then return "" end
+
+  local project = type(value.project) == "table" and value.project or {}
+  local title = as_string(project.title or project.name or value.projectTitle or value.project_title)
+  if title == "" then title = as_string(value.title or value.name) end
+
+  local status = ""
+  if type(value.status) == "table" then
+    status = as_string(value.status.name or value.status.title)
+  else
+    status = as_string(value.status)
+  end
+
+  if title ~= "" and status ~= "" then return title .. " (" .. status .. ")" end
+  return title
+end
+
+---@param raw table
+---@return string[]
+local function project_names(raw)
+  local result = {}
+  local seen = {}
+  local sources = { raw.projectItems or raw.project_items, raw.projectCards or raw.project_cards }
+  for _, values in ipairs(sources) do
+    for _, value in ipairs(type(values) == "table" and values or {}) do
+      local name = project_name(value)
+      if name ~= "" and not seen[name] then
+        seen[name] = true
+        result[#result + 1] = name
+      end
+    end
+  end
+  return result
+end
+
+---@param raw table
+---@return string
+local function subscription_status(raw)
+  local value = raw.viewerSubscription or raw.viewer_subscription or raw.subscription
+  if type(value) == "boolean" then return value and "Subscribed" or "Unsubscribed" end
+  value = as_string(value)
+  if value == "" and type(raw.subscribed) == "boolean" then
+    return raw.subscribed and "Subscribed" or "Unsubscribed"
+  end
+  if value == "" then return "" end
+
+  value = value:gsub("_", " "):lower()
+  return (value:gsub("^%l", string.upper))
+end
+
 ---@param raw table
 ---@param kind "issue"|"pr"
 ---@return GithubGhItem
@@ -319,6 +397,9 @@ local function normalize_detail(raw, kind, repo)
     is_draft = raw.isDraft == true or raw.draft == true,
     labels = names(raw.labels, "name"),
     assignees = names(raw.assignees, "login"),
+    milestone = milestone_name(raw.milestone),
+    projects = project_names(raw),
+    subscription = subscription_status(raw),
     comments = comments,
     head_ref_name = raw.headRefName or raw.head_ref_name,
     base_ref_name = raw.baseRefName or raw.base_ref_name,
@@ -613,6 +694,30 @@ function M.create_issue_async(cwd, title, body, repo, callback)
       return
     end
     callback({ ok = true, url = url })
+  end)
+end
+
+---@param cwd string?
+---@param number integer|string
+---@param repo string?
+---@param edit GithubGhIssueEdit
+---@param callback fun(result: GithubGhUpdateIssueResult)
+function M.update_issue_async(cwd, number, repo, edit, callback)
+  local command = { "gh", "issue", "edit", tostring(number) }
+  local input = nil
+  if repo and repo ~= "" then vim.list_extend(command, { "--repo", repo }) end
+  if type(edit.title) == "string" then vim.list_extend(command, { "--title", edit.title }) end
+  if type(edit.body) == "string" then
+    vim.list_extend(command, { "--body-file", "-" })
+    input = edit.body
+  end
+
+  system_text_async(command, input, cwd, function(result)
+    if result.code ~= 0 then
+      callback({ ok = false, message = result_error(result), code = result.code })
+      return
+    end
+    callback({ ok = true })
   end)
 end
 

@@ -93,7 +93,7 @@
 
 ---@class DiffReviewStatusEntry
 ---@field id? string
----@field kind "section"|"file"|"hunk"|"commit"|"commit_file"|"commit_hunk"|"pr_file"|"pr_hunk"|"pr_comment"|"pr_comment_reply"|"pr_review"|"pr_review_file"|"pr_review_hunk"|"review_comment"|"pr"|"about"
+---@field kind "section"|"file"|"hunk"|"commit"|"commit_file"|"commit_hunk"|"pr_file"|"pr_hunk"|"pr_comment"|"pr_comment_reply"|"pr_review"|"pr_review_file"|"pr_review_hunk"|"review_comment"|"pr"|"about"|"pr_check"|"pr_head_section"|"pr_head_line"
 ---@field section? DiffReviewStatusSection
 ---@field file? DiffReviewStatusFile
 ---@field hunk? DiffReviewHunk
@@ -107,7 +107,9 @@
 ---@field review_reply? table
 ---@field diff_line? table
 ---@field pr? DiffReviewGhPR
+---@field pr_check? DiffReviewGhPRCheck
 ---@field about? DiffReviewAICommitState
+---@field fold_target_id? string
 
 ---@alias DiffReviewStatusViewKind "status"|"pr"|"diff"
 
@@ -124,6 +126,8 @@
 ---@class DiffReviewStatusHeadLine
 ---@field segments table[]
 ---@field entry? DiffReviewStatusEntry
+---@field parent_id? string
+---@field default_folded? boolean
 
 ---@alias DiffReviewStatusSectionName "unstaged"|"staged"|"untracked"|"unmerged"|"recent"|"pr_commits"
 
@@ -3498,6 +3502,7 @@ M._status_hint_command_ids_by_view = {
     "help",
   },
   pr = {
+    "toggle",
     "browse",
     "review",
     "comment",
@@ -3656,14 +3661,21 @@ local function status_git_line_async(cwd, args, cb)
   end)
 end
 
-local function status_head_row(name, oid, ref, ref_hl, subject)
-  return {
+local function status_head_row(name, oid, ref, ref_hl, subject, date_text)
+  local segments = {
     { ("%-8s"):format(name .. ":"), "DiffReviewStatusLabel" },
     { ("%-7s"):format(oid or ""), "DiffReviewStatusObjectId" },
+  }
+  if date_text and date_text ~= "" then
+    segments[#segments + 1] = { " " }
+    segments[#segments + 1] = { date_text }
+  end
+  vim.list_extend(segments, {
     { " " },
     { ref or "", ref_hl },
     { " " .. (subject or "") },
-  }
+  })
+  return segments
 end
 
 ---@param pr_state DiffReviewStatusPRState?
@@ -4029,6 +4041,60 @@ function M._pr_overview.issue_comment_entry_id(comment, index)
   return "pr-issue-comment:" .. tostring(index)
 end
 
+---@param pr DiffReviewGhPR
+---@param status table?
+---@return string
+function M._pr_overview.activity_text(pr, status)
+  local latest_epoch = nil
+  local latest_value = nil
+
+  local function consider(value)
+    local epoch = M._datetime.parse(value)
+    if epoch and (not latest_epoch or epoch > latest_epoch) then
+      latest_epoch = epoch
+      latest_value = value
+    end
+  end
+
+  local function consider_comment(comment)
+    if type(comment) ~= "table" then return end
+    consider(comment.updated_at or comment.updatedAt or comment.created_at or comment.createdAt)
+    for _, reply in ipairs(type(comment.replies) == "table" and comment.replies or {}) do
+      if type(reply) == "table" then consider(reply.updated_at or reply.updatedAt or reply.created_at or reply.createdAt) end
+    end
+  end
+
+  for _, commit in ipairs(type(pr.commits) == "table" and pr.commits or {}) do
+    if type(commit) == "table" then
+      consider(commit.committedDate or commit.committed_date or commit.committed_at or commit.authoredDate or commit.authored_date or commit.authored_at)
+    end
+  end
+
+  local comments = status and status.pr_comments or nil
+  for _, review in ipairs(type(comments and comments.reviews) == "table" and comments.reviews or {}) do
+    if type(review) == "table" then
+      consider(review.submitted_at or review.submittedAt or review.updated_at or review.updatedAt or review.created_at or review.createdAt)
+      for _, comment in ipairs(type(review.comments) == "table" and review.comments or {}) do
+        consider_comment(comment)
+      end
+    end
+  end
+  for _, comment in ipairs(type(comments and comments.code_comments) == "table" and comments.code_comments or {}) do
+    consider_comment(comment)
+  end
+  for _, comment in ipairs(type(comments and comments.issue_comments) == "table" and comments.issue_comments or {}) do
+    consider_comment(comment)
+  end
+  for _, comment in ipairs(status and status.pr_standalone_comments or {}) do
+    consider_comment(comment)
+  end
+  for _, comment in ipairs(status and status.pr_regular_comments or {}) do
+    consider_comment(comment)
+  end
+
+  return latest_value and M._datetime.relative(latest_value) or ""
+end
+
 ---@param oid string?
 ---@return string
 local function status_short_oid(oid)
@@ -4039,10 +4105,31 @@ end
 
 ---@param pr DiffReviewGhPR
 ---@return string
+---@return string date_text
 local function status_pr_head_subject(pr)
   local commits = pr.commits or {}
-  local commit = commits[#commits]
-  return commit and commit.messageHeadline or ""
+  if type(commits) ~= "table" then return "", "" end
+  local head_oid = vim.trim(tostring(pr.headRefOid or ""))
+  local commit = nil
+  if head_oid ~= "" then
+    for commit_index = #commits, 1, -1 do
+      local candidate = commits[commit_index]
+      if type(candidate) == "table" then
+        local oid = vim.trim(tostring(candidate.oid or candidate.sha or candidate.id or ""))
+        if oid == head_oid then
+          commit = candidate
+          break
+        end
+      end
+    end
+  end
+  commit = commit or commits[#commits]
+  if type(commit) ~= "table" then return "", "" end
+  local date_text = M._datetime.relative(
+    commit.committedDate or commit.committed_date or commit.committed_at or commit.authoredDate or commit.authored_date or commit.authored_at,
+    { yesterday = false }
+  )
+  return tostring(commit.messageHeadline or commit.subject or commit.message or ""), date_text
 end
 
 ---@param username string
@@ -4175,28 +4262,52 @@ end
 ---@param status table?
 ---@return DiffReviewStatusHeadLine[]
 function M._pr_overview.check_head_lines(pr, status)
+  local section_id = "pr-head-section:checks"
   local lines = {}
   lines[#lines + 1] = { segments = { { "" } } }
-  lines[#lines + 1] = { segments = { { "Status:", "DiffReviewStatusHeader" } } }
+  lines[#lines + 1] = {
+    segments = { { "Checks:", "DiffReviewStatusHeader" } },
+    entry = { id = section_id, kind = "pr_head_section" },
+  }
   if not (pr.repo and pr.repo ~= "") then
-    lines[#lines + 1] = { segments = { { "No checks", "Comment" } } }
+    lines[#lines + 1] = {
+      segments = { { "No checks", "Comment" } },
+      parent_id = section_id,
+      entry = { id = section_id .. ":message", kind = "pr_head_line", fold_target_id = section_id },
+    }
     return lines
   end
   if status and status.pr_checks_error then
-    lines[#lines + 1] = { segments = { { tostring(status.pr_checks_error), "ErrorMsg" } } }
+    lines[#lines + 1] = {
+      segments = { { tostring(status.pr_checks_error), "ErrorMsg" } },
+      parent_id = section_id,
+      entry = { id = section_id .. ":error", kind = "pr_head_line", fold_target_id = section_id },
+    }
     return lines
   end
   if status and status.pr_checks_loading then
-    lines[#lines + 1] = { segments = { { "...loading checks...", "DiffReviewStatusFetching" } } }
+    lines[#lines + 1] = {
+      segments = { { "...loading checks...", "DiffReviewStatusFetching" } },
+      parent_id = section_id,
+      entry = { id = section_id .. ":loading", kind = "pr_head_line", fold_target_id = section_id },
+    }
     return lines
   end
   local checks = status and status.pr_checks or nil
   if type(checks) ~= "table" then
-    lines[#lines + 1] = { segments = { { "...loading checks...", "DiffReviewStatusFetching" } } }
+    lines[#lines + 1] = {
+      segments = { { "...loading checks...", "DiffReviewStatusFetching" } },
+      parent_id = section_id,
+      entry = { id = section_id .. ":loading", kind = "pr_head_line", fold_target_id = section_id },
+    }
     return lines
   end
   if #checks == 0 then
-    lines[#lines + 1] = { segments = { { "No checks", "Comment" } } }
+    lines[#lines + 1] = {
+      segments = { { "No checks", "Comment" } },
+      parent_id = section_id,
+      entry = { id = section_id .. ":message", kind = "pr_head_line", fold_target_id = section_id },
+    }
     return lines
   end
   for check_index, check in ipairs(checks) do
@@ -4212,10 +4323,12 @@ function M._pr_overview.check_head_lines(pr, status)
     end
     lines[#lines + 1] = {
       segments = segments,
+      parent_id = section_id,
       entry = {
         id = "pr:check:" .. tostring(check_index) .. ":" .. tostring(check.name or "check"),
         kind = "pr_check",
         pr_check = check,
+        fold_target_id = section_id,
       },
     }
   end
@@ -4226,6 +4339,7 @@ end
 ---@param status table?
 ---@return DiffReviewStatusHeadLine[]
 local function status_pr_detail_head_lines(pr, status)
+  local description_section_id = "pr-head-section:description"
   local title = pr.title ~= "" and pr.title or ("PR #" .. tostring(pr.number))
   local lines = {
     { segments = { { "Title:  ", "DiffReviewStatusLabel" }, { title, "DiffReviewStatusPath" } } },
@@ -4233,15 +4347,23 @@ local function status_pr_detail_head_lines(pr, status)
   if pr.repo and pr.repo ~= "" then
     lines[#lines + 1] = { segments = { { "Repo:   ", "DiffReviewStatusLabel" }, { pr.repo, "DiffReviewStatusRemote" } } }
   end
+  local head_subject, head_date = status_pr_head_subject(pr)
   lines[#lines + 1] = {
-    segments = status_head_row("Head", status_short_oid(pr.headRefOid), pr.headRefName or "", "DiffReviewStatusBranch", status_pr_head_subject(pr)),
+    segments = status_head_row(
+      "Head",
+      status_short_oid(pr.headRefOid),
+      pr.headRefName or "",
+      "DiffReviewStatusBranch",
+      head_subject,
+      head_date
+    ),
   }
   if pr.url and pr.url ~= "" then
     lines[#lines + 1] = { segments = { { "URL:    ", "DiffReviewStatusLabel" }, { pr.url, "DiffReviewStatusPR" } } }
   end
   lines[#lines + 1] = {
     segments = {
-      { "Milestone: ", "DiffReviewStatusLabel" },
+      { "Release: ", "DiffReviewStatusLabel" },
       { M._pr_overview.milestone_text(pr), "DiffReviewStatusBranch" },
     },
   }
@@ -4258,12 +4380,29 @@ local function status_pr_detail_head_lines(pr, status)
       { M._pr_overview.status_text(pr), pr.isDraft and "DiffReviewStatusFetching" or "DiffReviewStatusBranch" },
     },
   }
-  vim.list_extend(lines, M._pr_overview.check_head_lines(pr, status))
+  lines[#lines + 1] = {
+    segments = {
+      { "Activity: ", "DiffReviewStatusLabel" },
+      { M._pr_overview.activity_text(pr, status), "DiffReviewStatusBranch" },
+    },
+  }
   lines[#lines + 1] = { segments = { { "" } } }
-  lines[#lines + 1] = { segments = { { "Description:", "DiffReviewStatusHeader" } } }
-  for _, line in ipairs(status_markdown_lines(pr.body)) do
-    lines[#lines + 1] = { segments = { { line } } }
+  lines[#lines + 1] = {
+    segments = { { "Description:", "DiffReviewStatusHeader" } },
+    entry = { id = description_section_id, kind = "pr_head_section" },
+  }
+  for line_index, line in ipairs(status_markdown_lines(pr.body)) do
+    lines[#lines + 1] = {
+      segments = { { line } },
+      parent_id = description_section_id,
+      entry = {
+        id = description_section_id .. ":line:" .. tostring(line_index),
+        kind = "pr_head_line",
+        fold_target_id = description_section_id,
+      },
+    }
   end
+  vim.list_extend(lines, M._pr_overview.check_head_lines(pr, status))
   return lines
 end
 
@@ -5543,10 +5682,10 @@ local function status_pr_sections(cwd, pr, diff_text, comments, local_comments, 
   vim.list_extend(code_comments, local_comments or {})
   M._section_builder.attach_comments(cwd, files, code_comments, { field = "pr_comments" })
   local sections = {}
-  local issue_comments_section = M._pr_overview.issue_comments_section(comments, local_issue_comments)
-  if issue_comments_section then sections[#sections + 1] = issue_comments_section end
   local reviews_section = M._pr_overview.reviews_section(comments)
   if reviews_section then sections[#sections + 1] = reviews_section end
+  local issue_comments_section = M._pr_overview.issue_comments_section(comments, local_issue_comments)
+  if issue_comments_section then sections[#sections + 1] = issue_comments_section end
   vim.list_extend(sections, change_sections)
   local commits_section = M._pr_overview.commits_section(pr)
   if commits_section then sections[#sections + 1] = commits_section end
@@ -6530,6 +6669,7 @@ function M._status_parent_entry(current_line, entry)
   if not (status and status.entries) then return nil end
   for line = current_line - 1, 1, -1 do
     local candidate = status.entries[line]
+    if entry.fold_target_id and candidate and candidate.id == entry.fold_target_id then return candidate end
     if entry.kind == "commit_hunk" and candidate and candidate.kind == "commit_file" then return candidate end
     if M._status_entry_is_hunk_like(entry) and M._status_entry_is_file_like(candidate) then return candidate end
     if M._status_entry_is_file_like(entry) and candidate and candidate.kind == "pr_review" then return candidate end
@@ -6766,6 +6906,7 @@ local function status_entries_are_headers(entries)
       or entry.kind == "commit"
       or entry.kind == "commit_file"
       or entry.kind == "pr_file"
+      or entry.kind == "pr_head_section"
       or entry.kind == "pr_review"
       or entry.kind == "pr_review_file"
     ) then return false end
@@ -6795,6 +6936,7 @@ local function status_target_is_header(target_id)
       or target_id:find("^commit:") ~= nil
       or target_id:find("^commit%-file:") ~= nil
       or target_id:find("^provider%-file:") ~= nil
+      or target_id:find("^pr%-head%-section:") ~= nil
       or target_id:find("^pr%-review:") ~= nil
     )
 end
@@ -6816,6 +6958,7 @@ local function status_nearest_header_line(fallback_line)
       or previous_entry.kind == "commit"
       or previous_entry.kind == "commit_file"
       or previous_entry.kind == "pr_file"
+      or previous_entry.kind == "pr_head_section"
     ) then return previous_line end
     local next_line = line + offset
     local next_entry = status.entries[next_line]
@@ -6825,6 +6968,7 @@ local function status_nearest_header_line(fallback_line)
       or next_entry.kind == "commit"
       or next_entry.kind == "commit_file"
       or next_entry.kind == "pr_file"
+      or next_entry.kind == "pr_head_section"
     ) then return next_line end
   end
   return nil
@@ -6878,11 +7022,18 @@ local function status_render_loaded(buf, target_id, fallback_line, opts, head_li
   M._status.extmarks = {}
   M._status.boundary_lines = {}
 
+  local folded_head_parents = {}
   for _, head_line in ipairs(head_lines) do
-    if head_line.segments then
-      status_add_segment_line(head_line.segments, head_line.entry)
-    else
-      status_add_segment_line(head_line)
+    if not (head_line.parent_id and folded_head_parents[head_line.parent_id]) then
+      if head_line.segments then
+        status_add_segment_line(head_line.segments, head_line.entry)
+      else
+        status_add_segment_line(head_line)
+      end
+      local entry = head_line.entry
+      if entry and entry.kind == "pr_head_section" and entry.id then
+        folded_head_parents[entry.id] = status_folded(entry.id, head_line.default_folded == true)
+      end
     end
   end
   status_add_line("")
@@ -10508,6 +10659,7 @@ M._pr_edit = { ns = vim.api.nvim_create_namespace("diff_review_pr_edit") }
 ---@field review_marker_id? integer
 ---@field milestone_marker_id? integer
 ---@field desc_marker_id? integer
+---@field description_rendered_folded? boolean
 ---@field lock_initial? boolean
 ---@field initial_cursor_row? integer
 ---@field pending_reviewers? DiffReviewGhRequestedReviewer[]
@@ -10540,18 +10692,118 @@ function M._pr_edit.field_row(buf, id, label_pattern)
   return M._pr_edit.label_row(buf, label_pattern) or M._pr_edit.mark_row(buf, id)
 end
 
+---@return integer namespace
+function M._pr_edit.markdown_namespace()
+  if M._pr_edit.render_markdown_ns then return M._pr_edit.render_markdown_ns end
+  local ok, ui = pcall(require, "render-markdown.core.ui")
+  M._pr_edit.render_markdown_ns = ok and ui and ui.ns or vim.api.nvim_create_namespace("render-markdown.nvim")
+  return M._pr_edit.render_markdown_ns
+end
+
+---@param buf integer
+---@return integer? first0
+---@return integer? after0
+function M._pr_edit.description_range0(buf)
+  local status = M._status_states and M._status_states[buf] or nil
+  local state = status and status.pr_edit or nil
+  if not state then return nil, nil end
+  return M._pr_edit.mark_row(buf, state.desc_start_mark), M._pr_edit.mark_row(buf, state.desc_end_mark)
+end
+
+---@param buf integer
+function M._pr_edit.prune_description_markdown(buf)
+  if not vim.api.nvim_buf_is_valid(buf) then return end
+  local namespace = M._pr_edit.markdown_namespace()
+  local first0, after0 = M._pr_edit.description_range0(buf)
+  if not (first0 and after0) then
+    vim.api.nvim_buf_clear_namespace(buf, namespace, 0, -1)
+    return
+  end
+  for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(buf, namespace, 0, -1, {})) do
+    local row0 = mark[2]
+    if row0 < first0 or row0 >= after0 then pcall(vim.api.nvim_buf_del_extmark, buf, namespace, mark[1]) end
+  end
+end
+
+---@param buf integer
+---@param win integer
+---@return table
+function M._pr_edit.description_markdown_config(buf, win)
+  local conceallevel = vim.api.nvim_get_option_value("conceallevel", { scope = "local", win = win })
+  local concealcursor = vim.api.nvim_get_option_value("concealcursor", { scope = "local", win = win })
+  return {
+    enabled = true,
+    render_modes = true,
+    debounce = 0,
+    sign = { enabled = false },
+    win_options = {
+      conceallevel = { default = conceallevel, rendered = conceallevel },
+      concealcursor = { default = concealcursor, rendered = concealcursor },
+    },
+    on = {
+      render = function(ctx)
+        M._pr_edit.prune_description_markdown(ctx.buf)
+      end,
+    },
+  }
+end
+
+---@param buf integer
+---@return integer?
+function M._pr_edit.description_markdown_window(buf)
+  if vim.api.nvim_get_current_buf() == buf then return vim.api.nvim_get_current_win() end
+  local wins = vim.fn.win_findbuf(buf)
+  for _, win in ipairs(wins) do
+    if vim.api.nvim_win_is_valid(win) then return win end
+  end
+  return nil
+end
+
+---@param buf integer
+function M._pr_edit.render_description_markdown(buf)
+  local status = M._status_states and M._status_states[buf] or nil
+  local state = status and status.pr_edit or nil
+  if not (state and vim.api.nvim_buf_is_valid(buf)) then return end
+
+  if M._pr_edit.render_markdown_unavailable then return end
+  local ok, render_markdown = pcall(require, "render-markdown")
+  if not ok or type(render_markdown) ~= "table" or type(render_markdown.render) ~= "function" then
+    M._pr_edit.render_markdown_unavailable = true
+    return
+  end
+
+  if not M._pr_edit.gitstatus_markdown_language_registered then
+    pcall(vim.treesitter.language.register, "markdown", "GitStatus")
+    M._pr_edit.gitstatus_markdown_language_registered = true
+  end
+
+  local win = M._pr_edit.description_markdown_window(buf)
+  if not win then return end
+  local render_ok, err = pcall(render_markdown.render, {
+    buf = buf,
+    win = win,
+    config = M._pr_edit.description_markdown_config(buf, win),
+  })
+  if render_ok then
+    M._pr_edit.prune_description_markdown(buf)
+  elseif not M._pr_edit.render_markdown_error_notified then
+    M._pr_edit.render_markdown_error_notified = true
+    vim.notify("PR description markdown render failed: " .. tostring(err), vim.log.levels.WARN, { title = "DiffReview" })
+  end
+end
+
 ---@param buf integer
 ---@param status table
 ---@return string? title without the "Title:" label
 ---@return string? desc description block joined with newlines
 ---@return string? review reviewer-request field without the "Review:" label
----@return string? milestone milestone field without the "Milestone:" label or marker icon
+---@return string? milestone milestone field without the "Release:" label or marker icon
 function M._pr_edit.current_values(buf, status)
   local state = status.pr_edit
   if not state then return nil end
   local title_row0 = M._pr_edit.field_row(buf, state.title_mark, "^Title:")
   local review_row0 = M._pr_edit.field_row(buf, state.review_mark, "^Review:")
-  local milestone_row0 = M._pr_edit.field_row(buf, state.milestone_mark, "^Milestone:")
+  local milestone_row0 = M._pr_edit.field_row(buf, state.milestone_mark, "^Release:")
   local first0 = M._pr_edit.mark_row(buf, state.desc_start_mark)
   local after0 = M._pr_edit.mark_row(buf, state.desc_end_mark)
   if not (title_row0 and review_row0 and milestone_row0 and first0 and after0) then return nil end
@@ -10561,7 +10813,9 @@ function M._pr_edit.current_values(buf, status)
   local title = vim.trim((title_line:gsub("^Title:%s*", "")))
   local review = vim.trim((review_line:gsub("^Review:%s*", "")))
   local milestone = M._pr_edit.milestone_value(milestone_line)
-  local desc = table.concat(vim.api.nvim_buf_get_lines(buf, first0, after0, false), "\n")
+  local desc = state.description_rendered_folded
+    and table.concat(status_markdown_lines(status.pr.body), "\n")
+    or table.concat(vim.api.nvim_buf_get_lines(buf, first0, after0, false), "\n")
   return title, desc, review, milestone
 end
 
@@ -10590,7 +10844,7 @@ function M._pr_edit.region_kind_at(buf, row)
   if not state then return nil end
   local title_row0 = M._pr_edit.field_row(buf, state.title_mark, "^Title:")
   local review_row0 = M._pr_edit.field_row(buf, state.review_mark, "^Review:")
-  local milestone_row0 = M._pr_edit.field_row(buf, state.milestone_mark, "^Milestone:")
+  local milestone_row0 = M._pr_edit.field_row(buf, state.milestone_mark, "^Release:")
   local first0 = M._pr_edit.mark_row(buf, state.desc_start_mark)
   local after0 = M._pr_edit.mark_row(buf, state.desc_end_mark)
   if title_row0 and row == title_row0 + 1 then return "title" end
@@ -10620,7 +10874,7 @@ function M._pr_edit.refresh_markers(buf)
   local title_dirty, desc_dirty, review_dirty, milestone_dirty = M._pr_edit.dirty_flags(buf, status)
   local title_row0 = M._pr_edit.field_row(buf, state.title_mark, "^Title:")
   local review_row0 = M._pr_edit.field_row(buf, state.review_mark, "^Review:")
-  local milestone_row0 = M._pr_edit.field_row(buf, state.milestone_mark, "^Milestone:")
+  local milestone_row0 = M._pr_edit.field_row(buf, state.milestone_mark, "^Release:")
   local first0 = M._pr_edit.mark_row(buf, state.desc_start_mark)
 
   local function set_marker(key, wanted, row0)
@@ -10673,7 +10927,7 @@ function M._pr_edit.on_render(buf)
   for index, line in ipairs(lines) do
     if not title_row and line:match("^Title:") then title_row = index end
     if not review_row and line:match("^Review:") then review_row = index end
-    if not milestone_row and line:match("^Milestone:") then milestone_row = index end
+    if not milestone_row and line:match("^Release:") then milestone_row = index end
     if not status_row and line:match("^Status:") then status_row = index end
     if not label_row and line == "Description:" then label_row = index end
     if title_row and review_row and milestone_row and status_row and label_row then break end
@@ -10682,7 +10936,9 @@ function M._pr_edit.on_render(buf)
 
   -- right_gravity=false: a mark with right gravity slides to the next line
   -- when its own line is replaced (retyped), losing the region.
-  local body_count = #status_markdown_lines(status.pr.body)
+  local description_folded = status_folded("pr-head-section:description", false)
+  state.description_rendered_folded = description_folded
+  local body_count = description_folded and 0 or #status_markdown_lines(status.pr.body)
   state.title_mark = vim.api.nvim_buf_set_extmark(buf, M._pr_edit.ns, title_row - 1, 0, { right_gravity = false })
   state.review_mark = vim.api.nvim_buf_set_extmark(buf, M._pr_edit.ns, review_row - 1, 0, { right_gravity = false })
   state.milestone_mark = vim.api.nvim_buf_set_extmark(buf, M._pr_edit.ns, milestone_row - 1, 0, { right_gravity = false })
@@ -10692,12 +10948,13 @@ function M._pr_edit.on_render(buf)
   vim.bo[buf].modified = false
   M._pr_edit.refresh_markers(buf)
   M._pr_edit.sync_modifiable(buf)
+  if vim.api.nvim_get_current_buf() ~= buf then M._pr_edit.render_description_markdown(buf) end
 end
 
 ---@param line string?
 ---@return string
 function M._pr_edit.milestone_value(line)
-  local value = vim.trim(tostring(line or ""):gsub("^Milestone:%s*", ""))
+  local value = vim.trim(tostring(line or ""):gsub("^Release:%s*", ""):gsub("^Milestone:%s*", ""))
   value = vim.trim(value:gsub("^" .. vim.pesc(M._milestone_icon) .. "%s*", ""))
   return value
 end
@@ -10838,9 +11095,9 @@ end
 function M._pr_edit.patch_milestone_row(buf, status)
   local state = status and status.pr_edit or nil
   local row0 = M._pr_edit.patch_head_field_row(buf, status, state and state.milestone_mark, {
-    { "Milestone: ", "DiffReviewStatusLabel" },
+    { "Release: ", "DiffReviewStatusLabel" },
     { M._pr_overview.milestone_text(status and status.pr or nil), "DiffReviewStatusBranch" },
-  }, "^Milestone:")
+  }, "^Release:")
   if state and row0 then
     if state.milestone_mark then pcall(vim.api.nvim_buf_del_extmark, buf, M._pr_edit.ns, state.milestone_mark) end
     state.milestone_mark = vim.api.nvim_buf_set_extmark(buf, M._pr_edit.ns, row0, 0, { right_gravity = false })
@@ -11082,7 +11339,7 @@ end
 ---@return string[]
 function M._pr_edit.milestone_create_confirmation_lines(change)
   return {
-    "Milestone not found:",
+    "Release not found:",
     "  " .. change.desired,
     "",
     "Create it now?",
@@ -11130,7 +11387,7 @@ function M._pr_edit.apply_milestone(buf, status, milestone, done)
     M._pr_edit.patch_milestone_row(buf, latest)
     vim.bo[buf].modified = false
     M._pr_edit.refresh_markers(buf)
-    vim.notify(("Milestone updated: %s"):format(M._pr_edit.milestone_change_summary({
+    vim.notify(("Release updated: %s"):format(M._pr_edit.milestone_change_summary({
       desired = M._pr_overview.milestone_title(latest.pr),
     })), vim.log.levels.INFO, { title = "DiffReview" })
     done(true)
@@ -11393,6 +11650,7 @@ function M._pr_edit.sync_modifiable(buf)
   if vim.bo[buf].modifiable ~= wanted then
     vim.bo[buf].modifiable = wanted
   end
+  M._pr_edit.render_description_markdown(buf)
 end
 
 ---Wire editing into a freshly created PR-view buffer: acwrite, the
@@ -11427,6 +11685,7 @@ function M._pr_edit.attach(buf)
     callback = function()
       M._review.sync_inline_comment_text(buf)
       M._pr_edit.refresh_markers(buf)
+      M._pr_edit.render_description_markdown(buf)
     end,
   })
   vim.api.nvim_create_autocmd("BufWriteCmd", {
@@ -12236,33 +12495,58 @@ local function status_jump(entry, skip_revision)
   end
 end
 
+---@param entry_id string?
+---@return DiffReviewStatusEntry?
+function M._status_entry_by_id(entry_id)
+  if not (entry_id and M._status and M._status.entries) then return nil end
+  for _, entry in pairs(M._status.entries) do
+    if entry and entry.id == entry_id then return entry end
+  end
+  return nil
+end
+
+---@param entry DiffReviewStatusEntry?
+---@return boolean
+function M._status_entry_default_folded(entry)
+  if not entry then return false end
+  if entry.kind == "file" or entry.kind == "pr_file" then
+    return true
+  elseif entry.kind == "commit" or entry.kind == "commit_file" then
+    return true
+  elseif entry.kind == "pr_comment" and entry.pr_comment then
+    return true
+  elseif entry.kind == "pr_review" then
+    return true
+  elseif entry.kind == "pr_review_file" then
+    return false
+  elseif entry.kind == "section" and entry.section then
+    local section_config = status_section_by_name[entry.section.name]
+    if section_config then return section_config.default_folded end
+    return entry.section.default_folded
+  end
+  return false
+end
+
 ---@param entry DiffReviewStatusEntry?
 local function status_toggle(entry)
   if not entry then return end
-  local default = false
-  if entry.kind == "file" or entry.kind == "pr_file" then
-    default = true
-  elseif entry.kind == "commit" or entry.kind == "commit_file" then
-    default = true
-  elseif entry.kind == "pr_comment" and entry.pr_comment then
-    default = true
-  elseif entry.kind == "pr_review" then
-    default = true
-  elseif entry.kind == "pr_review_file" then
-    default = false
-  elseif entry.kind == "section" then
-    local section_config = status_section_by_name[entry.section.name]
-    default = section_config and section_config.default_folded or entry.section.default_folded
+  local fold_id = entry.fold_target_id or entry.id
+  if not fold_id then return end
+  if M._status and M._status.buf and M._pr_edit.blocks_render(M._status.buf) then return end
+  local fold_entry = entry
+  if entry.fold_target_id then
+    fold_entry = M._status_entry_by_id(fold_id) or { id = fold_id, kind = "pr_head_section" }
   end
-  local next_folded = not status_folded(entry.id, default)
+  local default = M._status_entry_default_folded(fold_entry)
+  local next_folded = not status_folded(fold_id, default)
   if not next_folded then
-    status_prewarm_entry_syntax(entry)
+    status_prewarm_entry_syntax(fold_entry)
   end
-  set_status_folded(entry.id, next_folded)
-  if entry.kind == "commit" and not next_folded and entry.commit then
-    status_load_commit_files(entry.commit)
+  set_status_folded(fold_id, next_folded)
+  if fold_entry.kind == "commit" and not next_folded and fold_entry.commit then
+    status_load_commit_files(fold_entry.commit)
   end
-  render_status_or_notify(M._status.buf, entry.id, vim.api.nvim_win_get_cursor(0)[1], { reuse_sections = true })
+  render_status_or_notify(M._status.buf, fold_id, vim.api.nvim_win_get_cursor(0)[1], { reuse_sections = true })
 end
 
 function M._status_collapse_parent()

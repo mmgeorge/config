@@ -1,5 +1,32 @@
 vim.loader.enable(false)
 
+local render_markdown_ns = vim.api.nvim_create_namespace("render-markdown.nvim")
+local render_markdown_calls = {}
+package.loaded["render-markdown.core.ui"] = { ns = render_markdown_ns }
+package.loaded["render-markdown"] = {
+  render = function(ctx)
+    render_markdown_calls[#render_markdown_calls + 1] = ctx
+    vim.api.nvim_buf_clear_namespace(ctx.buf, render_markdown_ns, 0, -1)
+    pcall(vim.api.nvim_buf_set_extmark, ctx.buf, render_markdown_ns, 0, 0, {
+      virt_text = { { "outside", "Comment" } },
+      virt_text_pos = "eol",
+    })
+    local lines = vim.api.nvim_buf_get_lines(ctx.buf, 0, -1, false)
+    for row, line in ipairs(lines) do
+      if line == "Description:" then
+        local body_row = row + 1
+        local body_line = lines[body_row] or ""
+        pcall(vim.api.nvim_buf_set_extmark, ctx.buf, render_markdown_ns, body_row - 1, 0, {
+          hl_group = "RenderMarkdownParagraph",
+          end_col = #body_line,
+        })
+        break
+      end
+    end
+    if ctx.config and ctx.config.on and ctx.config.on.render then ctx.config.on.render({ buf = ctx.buf, win = ctx.win }) end
+  end,
+}
+
 local diff_review = require("diff_review")
 local gh = require("diff_review.gh")
 local github_gh = require("github.gh")
@@ -541,6 +568,15 @@ end
 
 local pr_edit_ns = vim.api.nvim_create_namespace("diff_review_pr_edit")
 
+local function render_markdown_mark_rows(buf)
+  local rows = {}
+  for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(buf, render_markdown_ns, 0, -1, {})) do
+    rows[#rows + 1] = mark[2] + 1
+  end
+  table.sort(rows)
+  return rows
+end
+
 --- 1-based rows that carry the "*" out-of-sync marker.
 ---@param buf integer
 ---@return integer[]
@@ -758,11 +794,20 @@ local function run()
   local buf = diff_review.open_pr(pr, { cwd = "D:/diffreview-pr-edit-root" })
   assert_true(buf ~= nil, "open_pr did not return a buffer")
   wait_for(function() return buffer_contains(buf, "Title:  Old title") end, "PR view did not render the title")
+  assert_true(
+    buffer_contains(buf, "Head:   abc1234 1 day ago feature chore: head commit"),
+    "PR head row did not render the head commit date"
+  )
   assert_true(vim.wo[0].wrap, "PR buffer should enable soft wrap")
   assert_true(vim.wo[0].linebreak, "PR buffer should wrap on word boundaries")
   assert_true(vim.wo[0].breakindent, "PR buffer should preserve indent on wrapped screen lines")
   assert_true(buffer_contains(buf, "Line one"), "PR body did not render")
   wait_for(function() return buffer_contains(buf, "This is a regular comment") end, "PR conversation comment did not render")
+  wait_for(function() return buffer_contains(buf, "Activity: 5 hours ago") end, "PR activity row did not use the newest comment/review activity")
+  assert_true(
+    find_row(buf, "Status: DRAFT") < find_row(buf, "Activity: 5 hours ago"),
+    "PR activity row should render after Status"
+  )
   assert_true(buffer_contains(buf, "Comments (2):"), "PR comments heading did not use section heading format")
   local first_regular_comment_row = find_row(buf, "This is a regular comment")
   local first_regular_comment_line = vim.api.nvim_buf_get_lines(buf, first_regular_comment_row - 1, first_regular_comment_row, false)[1] or ""
@@ -802,9 +847,9 @@ local function run()
   local lint_check_line = vim.api.nvim_buf_get_lines(buf, lint_check_row - 1, lint_check_row, false)[1] or ""
   local checks_status_row = lint_check_row - 1
   local checks_status_line = vim.api.nvim_buf_get_lines(buf, checks_status_row - 1, checks_status_row, false)[1] or ""
-  assert_true(checks_status_line == "Status:", "PR checks heading did not render above the check rows")
-  assert_true(checks_status_row < description_row, "PR checks heading did not render before Description")
-  assert_true(lint_check_row < description_row, "PR check row did not render before Description")
+  assert_true(checks_status_line == "Checks:", "PR checks heading did not render above the check rows")
+  assert_true(description_row < checks_status_row, "Description did not render before PR checks heading")
+  assert_true(description_row < lint_check_row, "Description did not render before PR check rows")
   assert_true(lint_check_line:match("^%S") ~= nil, "PR check row should not be indented: " .. lint_check_line)
   assert_true(
     lint_check_line:find("✓ Dummy Lint | PR Dummy Checks", 1, true) ~= nil,
@@ -821,9 +866,65 @@ local function run()
   )
   assert_true(not unit_check_line:find("FAILURE", 1, true), "failing PR check row should not render state text: " .. unit_check_line)
   assert_true(
-    line_has_highlight(buf, checks_status_row, "DiffReviewStatusHeader", 0, #"Status:"),
+    line_has_highlight(buf, checks_status_row, "DiffReviewStatusHeader", 0, #"Checks:"),
     "PR checks heading did not use header highlight"
   )
+  local reviews_heading_row = find_row(buf, "Reviews (3):")
+  local comments_heading_row = find_row(buf, "Comments (2):")
+  local changes_heading_row = find_row(buf, "Changes (1):")
+  local initial_recent_commits_row = find_row(buf, "Recent Commits (2):")
+  assert_true(
+    description_row < checks_status_row
+      and checks_status_row < reviews_heading_row
+      and reviews_heading_row < comments_heading_row
+      and comments_heading_row < changes_heading_row
+      and changes_heading_row < initial_recent_commits_row,
+    "PR overview sections did not render in requested order"
+  )
+  move_cursor(buf, checks_status_row)
+  trigger_buf_mapping(buf, "<Tab>")
+  wait_for(function()
+    return not buffer_contains(buf, "Dummy Lint") and not buffer_contains(buf, "Dummy Unit Tests")
+  end, "PR checks heading did not fold check rows")
+  assert_true(buffer_contains(buf, "Description:"), "folding PR checks hid the Description heading")
+  move_cursor(buf, checks_status_row)
+  trigger_buf_mapping(buf, "<Tab>")
+  wait_for(function() return buffer_contains(buf, "Dummy Lint") end, "PR checks heading did not unfold check rows")
+  lint_check_row = find_row(buf, "Dummy Lint")
+  checks_status_row = lint_check_row - 1
+  description_row = find_row(buf, "Description:")
+
+  move_cursor(buf, description_row)
+  trigger_buf_mapping(buf, "<Tab>")
+  wait_for(function()
+    return not buffer_contains(buf, "Line one") and not buffer_contains(buf, "Line two")
+  end, "PR Description heading did not fold the description body")
+  assert_true(#render_markdown_mark_rows(buf) == 0, "folded PR description kept markdown marks")
+  local folded_description_row = find_row(buf, "Description:")
+  local folded_description_entry = diff_review._status_states[buf].entries[folded_description_row]
+  assert_true(
+    folded_description_entry and folded_description_entry.id == "pr-head-section:description",
+    "folded Description row did not keep its fold entry: " .. vim.inspect(folded_description_entry)
+  )
+  move_cursor(buf, folded_description_row)
+  captured_notifications = {}
+  trigger_buf_mapping(buf, "<Tab>")
+  assert_true(
+    diff_review._status_states[buf].folds["pr-head-section:description"] == false,
+    "Description fold state did not reopen: " .. vim.inspect(diff_review._status_states[buf].folds)
+  )
+  assert_true(
+    not saw_notification_containing("Unsynced PR edits"),
+    "Description unfold render was blocked as dirty: " .. vim.inspect(captured_notifications)
+  )
+  wait_for(function()
+    return buffer_contains(buf, "Line one") and buffer_contains(buf, "Line two")
+  end, "PR Description heading did not unfold the description body")
+  description_row = find_row(buf, "Description:")
+  wait_for(function()
+    local rows = render_markdown_mark_rows(buf)
+    return #rows == 1 and rows[1] == find_row(buf, "Line one")
+  end, "PR description markdown marks did not return after unfolding")
   wait_for(function()
     return buffer_contains(buf, "foo     10 hours ago  This requires a few changes...")
   end, "rejected review summary did not render")
@@ -1060,19 +1161,30 @@ local function run()
   assert_true(not vim.bo[buf].modifiable, "PR buffer must start nomodifiable")
 
   local title_row = find_row(buf, "Title:  Old title")
-  local milestone_row = find_row(buf, "Milestone:")
+  local milestone_row = find_row(buf, "Release:")
   local review_row = find_row(buf, "Review:")
   local status_row = find_row(buf, "Status: DRAFT")
   local body_row = find_row(buf, "Line one")
-  assert_true(milestone_row < review_row, "Milestone row should render above Review row")
+  wait_for(function() return #render_markdown_calls > 0 end, "PR description did not invoke render-markdown")
+  local markdown_rows = render_markdown_mark_rows(buf)
+  assert_true(
+    #markdown_rows == 1 and markdown_rows[1] == body_row,
+    "PR description markdown marks should be pruned to the description body: " .. vim.inspect(markdown_rows)
+  )
+  local markdown_config = render_markdown_calls[#render_markdown_calls].config or {}
+  assert_true(
+    not (markdown_config.anti_conceal and markdown_config.anti_conceal.enabled == false),
+    "PR description markdown render should leave render-markdown anti-conceal enabled"
+  )
+  assert_true(milestone_row < review_row, "Release row should render above Review row")
   assert_true(review_row < status_row, "Status row should render below Review row")
   assert_true(
     line_has_highlight(buf, review_row, "DiffReviewStatusLabel", 0, #"Review: "),
     "PR review request row did not use label highlight"
   )
   assert_true(
-    line_has_highlight(buf, milestone_row, "DiffReviewStatusLabel", 0, #"Milestone: "),
-    "PR milestone row did not use label highlight"
+    line_has_highlight(buf, milestone_row, "DiffReviewStatusLabel", 0, #"Release: "),
+    "PR release row did not use label highlight"
   )
   assert_true(
     line_has_highlight(buf, status_row, "DiffReviewStatusLabel", 0, #"Status: "),
@@ -1089,14 +1201,19 @@ local function run()
   assert_true(vim.bo[buf].modifiable, "buffer must unlock on the review request row")
   assert_cursor_clamped_to_line(buf, review_row, "PR review request")
   move_cursor(buf, milestone_row)
-  assert_true(vim.bo[buf].modifiable, "buffer must unlock on the milestone row")
-  assert_cursor_clamped_to_line(buf, milestone_row, "PR milestone")
+  assert_true(vim.bo[buf].modifiable, "buffer must unlock on the release row")
+  assert_cursor_clamped_to_line(buf, milestone_row, "PR release")
   move_cursor(buf, status_row)
   assert_true(not vim.bo[buf].modifiable, "PR status row must stay locked")
   move_cursor(buf, find_row(buf, "Description:"))
   assert_true(not vim.bo[buf].modifiable, "the Description: label itself must stay locked")
   move_cursor(buf, body_row)
   assert_true(vim.bo[buf].modifiable, "buffer must unlock on description rows")
+  markdown_rows = render_markdown_mark_rows(buf)
+  assert_true(
+    #markdown_rows == 1 and markdown_rows[1] == body_row,
+    "PR description markdown should stay managed by render-markdown while editing the body: " .. vim.inspect(markdown_rows)
+  )
   assert_cursor_clamped_to_line(buf, body_row, "PR description")
   issue_reference_search_calls = {}
   assert_issue_completion(buf, body_row, "Line #z")
@@ -1124,6 +1241,10 @@ local function run()
   assert_true(not vim.bo[buf].modifiable, "regular PR comment row must not be editable as description text")
   move_cursor(buf, find_row(buf, "URL:"))
   assert_true(not vim.bo[buf].modifiable, "buffer must relock after leaving the regions")
+  wait_for(function()
+    local rows = render_markdown_mark_rows(buf)
+    return #rows == 1 and rows[1] == body_row
+  end, "PR description markdown did not re-render after leaving the editable body")
 
   -- ── Status: Enter confirms draft/ready transitions ─────────────────────────
   move_cursor_to_text(buf, status_row, "DRAFT")
@@ -1283,17 +1404,17 @@ local function run()
   )
   assert_true(not vim.bo[buf].modified, "mixed reviewer sync must clear the modified flag")
 
-  -- ── Milestone: missing milestone is confirmed, created, then assigned ──────
-  edit_line(buf, milestone_row, "Milestone: 5.1")
+  -- ── Release: missing milestone is confirmed, created, then assigned ────────
+  edit_line(buf, milestone_row, "Release: 5.1")
   assert_true(vim.bo[buf].modified, "milestone edit must mark the PR buffer modified")
   rows = marker_rows(buf)
-  assert_true(#rows == 1 and rows[1] == milestone_row, "milestone edit did not mark the Milestone row dirty")
+  assert_true(#rows == 1 and rows[1] == milestone_row, "milestone edit did not mark the Release row dirty")
   captured_notifications = {}
   trigger_buf_mapping(buf, "<C-s>")
   assert_true(#marker_rows(buf) == 0, "milestone save must clear markers before confirmation")
   wait_for(function()
     return milestone_list_calls == 1
-      and buffer_contains(vim.api.nvim_get_current_buf(), "Milestone not found:")
+      and buffer_contains(vim.api.nvim_get_current_buf(), "Release not found:")
       and buffer_contains(vim.api.nvim_get_current_buf(), "5.1")
       and buffer_contains(vim.api.nvim_get_current_buf(), "Create it now?")
   end, "missing milestone confirmation did not render")
@@ -1303,10 +1424,10 @@ local function run()
   end, "missing milestone was not created and assigned")
   assert_true(milestone_create_calls[1].payload.title == "5.1", "wrong milestone create payload: " .. vim.inspect(milestone_create_calls[1].payload))
   assert_true(milestone_set_calls[1].payload.milestone == 501, "wrong milestone set payload: " .. vim.inspect(milestone_set_calls[1].payload))
-  wait_for(function() return saw_notification_containing("Milestone updated: " .. diff_review._milestone_icon .. " 5.1") end, "successful milestone update was not notified")
+  wait_for(function() return saw_notification_containing("Release updated: " .. diff_review._milestone_icon .. " 5.1") end, "successful release update was not notified")
   assert_true(
-    vim.api.nvim_buf_get_lines(buf, milestone_row - 1, milestone_row, false)[1] == "Milestone: " .. diff_review._milestone_icon .. " 5.1",
-    "Milestone row did not show the assigned milestone"
+    vim.api.nvim_buf_get_lines(buf, milestone_row - 1, milestone_row, false)[1] == "Release: " .. diff_review._milestone_icon .. " 5.1",
+    "Release row did not show the assigned milestone"
   )
   assert_true(pr.milestone and pr.milestone.title == "5.1", "PR cache milestone was not updated")
   assert_true(not vim.bo[buf].modified, "milestone sync must clear the modified flag")
