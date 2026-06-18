@@ -3,6 +3,7 @@ local M = {}
 local stale_after_seconds = 10 * 60
 local progress_by_repo = {}
 local in_flight = {}
+local sync_locks = {}
 local snapshot_cache = {}
 local notified = {}
 local invalid_repos = {}
@@ -137,6 +138,11 @@ function M.log_path(repo)
   return vim.fs.joinpath(issue_dir(repo), "sync.log")
 end
 
+function M.sync_lock_path(repo)
+  repo = normalize_repo(repo) or repo
+  return vim.fs.joinpath(issue_dir(repo), "sync.lock")
+end
+
 ---@param value any
 ---@return string
 local function log_value(value)
@@ -175,6 +181,122 @@ local function log_sync(repo, event, fields)
   if not (ok_mkdir and ok_write and write_result == 0) then
     notify_once("sync-log:" .. repo, "Could not write GitHub issue sync log: " .. path, vim.log.levels.WARN)
   end
+end
+
+---@class GithubIssueIndexSyncLock
+---@field repo string
+---@field path string
+---@field token string
+
+---@return integer
+local function lock_stale_after_seconds()
+  return tonumber(vim.g.github_issue_index_lock_stale_seconds) or (30 * 60)
+end
+
+---@param stat table?
+---@return integer?
+local function stat_mtime_seconds(stat)
+  return stat and stat.mtime and stat.mtime.sec or nil
+end
+
+---@param repo string
+---@param path string
+---@param stat table?
+---@return boolean
+local function remove_stale_sync_lock(repo, path, stat)
+  local mtime = stat_mtime_seconds(stat)
+  if not mtime then return false end
+  local age_seconds = os.time() - mtime
+  if age_seconds < lock_stale_after_seconds() then return false end
+
+  log_sync(repo, "sync:lock:stale-remove", {
+    age_seconds = age_seconds,
+    path = path,
+  })
+  return vim.fn.delete(path, "rf") == 0
+end
+
+---@param repo string
+---@param path string
+---@param token string
+local function write_sync_lock_owner(repo, path, token)
+  local lines = {
+    token,
+    "pid=" .. tostring(vim.uv.os_getpid()),
+    "started_at=" .. os.date("!%Y-%m-%dT%H:%M:%SZ"),
+  }
+  local ok, result = pcall(vim.fn.writefile, lines, vim.fs.joinpath(path, "owner"))
+  if not (ok and result == 0) then
+    log_sync(repo, "sync:lock:owner-write-failed", {
+      path = path,
+      result = result or "",
+    })
+  end
+end
+
+---@param repo string
+---@return GithubIssueIndexSyncLock?
+local function acquire_sync_lock(repo)
+  local path = M.sync_lock_path(repo)
+  vim.fn.mkdir(vim.fs.dirname(path), "p")
+  local token = tostring(vim.uv.os_getpid()) .. ":" .. tostring(vim.uv.hrtime())
+
+  for _ = 1, 2 do
+    local ok, err, err_name = vim.uv.fs_mkdir(path, 448)
+    if ok then
+      write_sync_lock_owner(repo, path, token)
+      log_sync(repo, "sync:lock:acquired", { path = path })
+      return { repo = repo, path = path, token = token }
+    end
+
+    local stat = vim.uv.fs_stat(path)
+    if stat and stat.type == "directory" and remove_stale_sync_lock(repo, path, stat) then
+      -- Retry once after stale lock removal.
+    else
+      log_sync(repo, "sync:lock:busy", {
+        error = err or err_name or "",
+        path = path,
+      })
+      return nil
+    end
+  end
+
+  log_sync(repo, "sync:lock:busy", { path = path })
+  return nil
+end
+
+---@param path string
+---@return string?
+local function read_lock_token(path)
+  local owner_path = vim.fs.joinpath(path, "owner")
+  local ok, lines = pcall(vim.fn.readfile, owner_path, "", 1)
+  if ok and type(lines) == "table" then return lines[1] end
+  return nil
+end
+
+---@param lock GithubIssueIndexSyncLock?
+local function release_sync_lock(lock)
+  if not lock then return end
+  local current = read_lock_token(lock.path)
+  if current and current ~= lock.token then
+    log_sync(lock.repo, "sync:lock:release-skipped", {
+      path = lock.path,
+    })
+    return
+  end
+
+  if vim.fn.delete(lock.path, "rf") == 0 then
+    log_sync(lock.repo, "sync:lock:released", { path = lock.path })
+  else
+    log_sync(lock.repo, "sync:lock:release-failed", { path = lock.path })
+  end
+end
+
+---@param repo string
+local function release_repo_sync_lock(repo)
+  local lock = sync_locks[repo]
+  sync_locks[repo] = nil
+  release_sync_lock(lock)
 end
 
 local function executable_name()
@@ -348,7 +470,7 @@ local function run_sidecar_binary(binary, args, input, cwd, callback)
   end, {
     label = "GitHub issue indexer " .. tostring(args[1] or "request"),
     log_repo = repo,
-    timeout_ms = 60000,
+    timeout_ms = 180000,
   })
 end
 
@@ -859,6 +981,7 @@ end
 local function sync_finished(repo, progress, message)
   close_progress(repo, message or "issues synced")
   in_flight[repo] = nil
+  release_repo_sync_lock(repo)
 end
 
 ---@param context table
@@ -871,6 +994,7 @@ local function sync_failed(context, message)
     invalid_repos[repo] = os.time()
     local repo_cache = require("github.repo_cache")
     local cleared_cwd = repo_cache.clear_cwd_repo(context.cwd, repo)
+    release_repo_sync_lock(repo)
     repo_cache.delete_repo(repo)
     local suffix = cleared_cwd and "\nCleared stale cached repo mapping for this cwd." or ""
     notify_once("repo-not-found:" .. repo, "GitHub issue sync failed for " .. repo .. ":\n" .. tostring(message) .. suffix, vim.log.levels.ERROR)
@@ -879,6 +1003,7 @@ local function sync_failed(context, message)
   end
   close_progress(repo, "sync failed", vim.log.levels.ERROR)
   in_flight[repo] = nil
+  release_repo_sync_lock(repo)
 end
 
 local function sync_pages(context)
@@ -1022,13 +1147,29 @@ function M.sync_repo(cwd, repo, opts)
     return
   end
 
+  local lock = acquire_sync_lock(repo)
+  if not lock then
+    if opts.manual then
+      notify(
+        "GitHub issue sync is already running for " .. repo .. " in another Neovim instance. Using the latest local snapshot.",
+        vim.log.levels.INFO
+      )
+    end
+    return
+  end
+  sync_locks[repo] = lock
+
   run_sidecar_json({ "state", "--db", M.db_path(repo), "--repo", repo }, nil, cwd, function(state_result)
     if not state_result.ok then
+      release_repo_sync_lock(repo)
       notify_once("state:" .. repo, "GitHub issue index state failed for " .. repo .. ":\n" .. tostring(state_result.message))
       return
     end
     local state = state_result.value or {}
-    if not should_sync(repo, state, scope, opts.manual == true) then return end
+    if not should_sync(repo, state, scope, opts.manual == true) then
+      release_repo_sync_lock(repo)
+      return
+    end
 
     in_flight[repo] = true
     local progress = ensure_progress(repo, opts.manual == true)
@@ -1103,8 +1244,12 @@ function M._reset_for_test()
   for _, progress in pairs(progress_by_repo) do
     stop_progress_timer(progress)
   end
+  for _, lock in pairs(sync_locks) do
+    release_sync_lock(lock)
+  end
   progress_by_repo = {}
   in_flight = {}
+  sync_locks = {}
   snapshot_cache = {}
   notified = {}
   invalid_repos = {}

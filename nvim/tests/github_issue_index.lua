@@ -131,6 +131,49 @@ local ok, err = xpcall(function()
   issue_index.ensure_repo(stale_cwd, stale_repo, { manual = false })
   assert_equals(stale_fetch_count, 1, "invalid repo should not retry automatically in the same session")
 
+  issue_index._reset_for_test()
+  issue_index._set_progress_enabled_for_test(false)
+  local busy_repo = "mmgeorge/busy-repo"
+  local busy_lock = issue_index.sync_lock_path(busy_repo)
+  vim.fn.mkdir(busy_lock, "p")
+  local busy_sidecar_count = 0
+  local busy_notified = false
+  vim.notify = function(message)
+    if tostring(message):find("another Neovim instance", 1, true) then busy_notified = true end
+  end
+  issue_index._set_runner_for_test(function(_, _, callback)
+    busy_sidecar_count = busy_sidecar_count + 1
+    callback({ code = 0, stdout = "{}", stderr = "", output = "{}" })
+  end)
+  issue_index.sync_repo(vim.fn.getcwd(), busy_repo, { manual = true })
+  assert_equals(busy_sidecar_count, 0, "busy cross-instance lock should skip sidecar state")
+  assert_true(busy_notified, "manual busy lock should notify instead of failing state")
+  vim.notify = original_notify
+  vim.fn.delete(busy_lock, "rf")
+
+  issue_index._reset_for_test()
+  issue_index._set_progress_enabled_for_test(false)
+  local fresh_repo = "mmgeorge/fresh-repo"
+  write_snapshot(fresh_repo, {})
+  local fresh_state_count = 0
+  issue_index._set_runner_for_test(function(command, _, callback)
+    assert_equals(command[2], "state", "fresh repo should only read state")
+    fresh_state_count = fresh_state_count + 1
+    callback({
+      code = 0,
+      stdout = vim.json.encode({
+        repo = fresh_repo,
+        open_historical_complete = true,
+        last_open_checked_at = os.time(),
+      }),
+      stderr = "",
+      output = "{}",
+    })
+  end)
+  issue_index.sync_repo(vim.fn.getcwd(), fresh_repo, { manual = false })
+  assert_equals(fresh_state_count, 1, "fresh repo should check state once")
+  assert_true(vim.uv.fs_stat(issue_index.sync_lock_path(fresh_repo)) == nil, "no-op state check should release sync lock")
+
   local buf = vim.api.nvim_create_buf(true, true)
   vim.api.nvim_set_current_buf(buf)
   vim.b[buf].github_repo = repo

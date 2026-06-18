@@ -2,6 +2,8 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -12,10 +14,14 @@ const ISSUES_TABLE: TableDefinition<&str, &str> = TableDefinition::new("issues")
 const TERMS_TABLE: TableDefinition<&str, u64> = TableDefinition::new("issue_terms");
 const LABELS_TABLE: TableDefinition<&str, u64> = TableDefinition::new("issue_labels");
 const SYNC_TABLE: TableDefinition<&str, &str> = TableDefinition::new("sync_state");
+const DEFAULT_DB_LOCK_TIMEOUT_MS: u64 = 120_000;
+const DB_LOCK_RETRY_MS: u64 = 100;
 
 #[derive(Parser)]
 #[command(author, version, about)]
 struct Cli {
+    #[arg(long, default_value_t = DEFAULT_DB_LOCK_TIMEOUT_MS)]
+    db_lock_timeout_ms: u64,
     #[command(subcommand)]
     command: Command,
 }
@@ -181,6 +187,7 @@ struct SnapshotOutput {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let db_lock_timeout = Duration::from_millis(cli.db_lock_timeout_ms);
     match cli.command {
         Command::UpsertPage {
             db,
@@ -190,7 +197,7 @@ fn main() -> Result<()> {
         } => {
             let repo = normalize_repo(&repo)?;
             let page = read_page(input.as_deref())?;
-            let database = open_database(&db)?;
+            let database = open_database_with_timeout(&db, db_lock_timeout)?;
             let output = upsert_page(&database, &repo, scope, page)?;
             print_json(&output)?;
         }
@@ -201,7 +208,7 @@ fn main() -> Result<()> {
             output,
         } => {
             let repo = normalize_repo(&repo)?;
-            let database = open_database(&db)?;
+            let database = open_database_with_timeout(&db, db_lock_timeout)?;
             let snapshot = snapshot(&database, &repo, state)?;
             if let Some(path) = output {
                 write_json_file(&path, &snapshot)?;
@@ -211,7 +218,7 @@ fn main() -> Result<()> {
         }
         Command::State { db, repo } => {
             let repo = normalize_repo(&repo)?;
-            let database = open_database(&db)?;
+            let database = open_database_with_timeout(&db, db_lock_timeout)?;
             let state = read_state(&database, &repo)?;
             print_json(&state)?;
         }
@@ -248,13 +255,45 @@ fn read_page(path: Option<&Path>) -> Result<PageInput> {
     serde_json::from_str(&text).context("decode page JSON")
 }
 
+#[cfg(test)]
 fn open_database(path: &Path) -> Result<Database> {
+    open_database_with_timeout(path, Duration::ZERO)
+}
+
+fn open_database_with_timeout(path: &Path, timeout: Duration) -> Result<Database> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-    let database = Database::create(path).with_context(|| format!("open {}", path.display()))?;
-    initialize_tables(&database)?;
-    Ok(database)
+    let started = Instant::now();
+    loop {
+        match Database::create(path) {
+            Ok(database) => {
+                initialize_tables(&database)?;
+                return Ok(database);
+            }
+            Err(error)
+                if is_database_lock_error(&error)
+                    && Instant::now().duration_since(started) < timeout =>
+            {
+                thread::sleep(Duration::from_millis(DB_LOCK_RETRY_MS));
+            }
+            Err(error) => {
+                let waited_ms = Instant::now().duration_since(started).as_millis();
+                return Err(anyhow!(error)).with_context(|| {
+                    format!(
+                        "open {} after waiting {}ms for database lock",
+                        path.display(),
+                        waited_ms
+                    )
+                });
+            }
+        }
+    }
+}
+
+fn is_database_lock_error(error: &redb::DatabaseError) -> bool {
+    let message = error.to_string();
+    message.contains("Database already open") || message.contains("Cannot acquire lock")
 }
 
 fn initialize_tables(database: &Database) -> Result<()> {
@@ -383,10 +422,12 @@ fn state_from_table(
 }
 
 fn apply_page_state(state: &mut RepoSyncState, scope: SyncScope, page: &PageInput) {
-    let high_water = page
-        .high_water
-        .clone()
-        .or_else(|| page.issues.iter().filter_map(|issue| issue.updated_at.clone()).max());
+    let high_water = page.high_water.clone().or_else(|| {
+        page.issues
+            .iter()
+            .filter_map(|issue| issue.updated_at.clone())
+            .max()
+    });
     match scope {
         SyncScope::Open => {
             state.open_cursor = if page.has_next_page {
@@ -451,7 +492,11 @@ fn count_repo_issues_in_transaction(
     Ok(count)
 }
 
-fn snapshot(database: &Database, repo: &str, state_filter: SnapshotState) -> Result<SnapshotOutput> {
+fn snapshot(
+    database: &Database,
+    repo: &str,
+    state_filter: SnapshotState,
+) -> Result<SnapshotOutput> {
     let transaction = database.begin_read()?;
     let issues = transaction.open_table(ISSUES_TABLE)?;
     let prefix = repo_prefix(repo);
@@ -462,7 +507,8 @@ fn snapshot(database: &Database, repo: &str, state_filter: SnapshotState) -> Res
             break;
         }
         let issue: IssueRecord = serde_json::from_str(value.value())?;
-        if matches!(state_filter, SnapshotState::Open) && !issue.state.eq_ignore_ascii_case("open") {
+        if matches!(state_filter, SnapshotState::Open) && !issue.state.eq_ignore_ascii_case("open")
+        {
             continue;
         }
         records.push(SnapshotIssueRecord::from(issue));
@@ -682,6 +728,26 @@ mod tests {
         assert_eq!(snapshot.issue_count, 1);
         assert_eq!(snapshot.issues[0].title, "New label");
         assert_eq!(snapshot.issues[0].labels[0].name, "docs");
+        let _ = fs::remove_file(db_path);
+        Ok(())
+    }
+
+    #[test]
+    fn open_database_waits_for_existing_lock() -> Result<()> {
+        let db_path = temp_db("lock");
+        let database = open_database(&db_path)?;
+        let reopen_path = db_path.clone();
+        let opener = thread::spawn(move || {
+            open_database_with_timeout(&reopen_path, Duration::from_secs(2)).map(|database| {
+                drop(database);
+            })
+        });
+
+        thread::sleep(Duration::from_millis(250));
+        drop(database);
+        opener
+            .join()
+            .map_err(|_| anyhow!("database opener thread panicked"))??;
         let _ = fs::remove_file(db_path);
         Ok(())
     }
