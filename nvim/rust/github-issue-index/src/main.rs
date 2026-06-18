@@ -64,6 +64,14 @@ enum Command {
         #[arg(long)]
         number: u64,
     },
+    Details {
+        #[arg(long)]
+        db: PathBuf,
+        #[arg(long)]
+        repo: String,
+        #[arg(long = "number")]
+        numbers: Vec<u64>,
+    },
     UpsertDetail {
         #[arg(long)]
         db: PathBuf,
@@ -224,6 +232,12 @@ struct DetailOutput {
     item: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Serialize)]
+struct DetailsOutput {
+    repo: String,
+    details: Vec<DetailOutput>,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let db_lock_timeout = Duration::from_millis(cli.db_lock_timeout_ms);
@@ -265,21 +279,15 @@ fn main() -> Result<()> {
             let repo = normalize_repo(&repo)?;
             let database = open_database_with_timeout(&db, db_lock_timeout)?;
             let detail = read_detail(&database, &repo, number)?;
-            let output = match detail {
-                Some(detail) => DetailOutput {
-                    repo,
-                    number,
-                    found: true,
-                    fetched_at: Some(detail.fetched_at),
-                    item: Some(detail.item),
-                },
-                None => DetailOutput {
-                    repo,
-                    number,
-                    found: false,
-                    fetched_at: None,
-                    item: None,
-                },
+            let output = detail_output(&repo, number, detail);
+            print_json(&output)?;
+        }
+        Command::Details { db, repo, numbers } => {
+            let repo = normalize_repo(&repo)?;
+            let database = open_database_with_timeout(&db, db_lock_timeout)?;
+            let output = DetailsOutput {
+                repo: repo.clone(),
+                details: read_details(&database, &repo, &numbers)?,
             };
             print_json(&output)?;
         }
@@ -584,6 +592,45 @@ fn read_detail(database: &Database, repo: &str, number: u64) -> Result<Option<De
         return Ok(Some(detail));
     }
     Ok(None)
+}
+
+fn detail_output(repo: &str, number: u64, detail: Option<DetailRecord>) -> DetailOutput {
+    match detail {
+        Some(detail) => DetailOutput {
+            repo: repo.to_owned(),
+            number,
+            found: true,
+            fetched_at: Some(detail.fetched_at),
+            item: Some(detail.item),
+        },
+        None => DetailOutput {
+            repo: repo.to_owned(),
+            number,
+            found: false,
+            fetched_at: None,
+            item: None,
+        },
+    }
+}
+
+fn read_details(database: &Database, repo: &str, numbers: &[u64]) -> Result<Vec<DetailOutput>> {
+    let transaction = database.begin_read()?;
+    let details = transaction.open_table(ISSUE_DETAILS_TABLE)?;
+    let mut output = Vec::with_capacity(numbers.len());
+    for number in numbers {
+        let key = issue_key(repo, *number);
+        let detail = if let Some(encoded) = details.get(key.as_str())? {
+            let mut detail: DetailRecord = serde_json::from_str(encoded.value())
+                .with_context(|| format!("decode cached issue detail #{}", number))?;
+            detail.repo = repo.to_owned();
+            detail.number = *number;
+            Some(detail)
+        } else {
+            None
+        };
+        output.push(detail_output(repo, *number, detail));
+    }
+    Ok(output)
 }
 
 fn upsert_detail(
@@ -953,6 +1000,38 @@ mod tests {
         assert_eq!(cached.fetched_at, 1234);
         assert_eq!(cached.item["title"], "Cached issue");
         assert!(read_detail(&database, "mmgeorge/test-repo", 13)?.is_none());
+        let _ = fs::remove_file(db_path);
+        Ok(())
+    }
+
+    #[test]
+    fn read_multiple_issue_details_preserves_requested_order() -> Result<()> {
+        let db_path = temp_db("details");
+        let database = open_database(&db_path)?;
+        let detail = DetailRecord {
+            repo: "mmgeorge/test-repo".to_owned(),
+            number: 12,
+            fetched_at: 1234,
+            item: serde_json::json!({
+                "repo": "mmgeorge/test-repo",
+                "number": 12,
+                "title": "Cached issue",
+                "body": "Cached body"
+            }),
+        };
+
+        upsert_detail(&database, "mmgeorge/test-repo", 12, &detail)?;
+
+        let details = read_details(&database, "mmgeorge/test-repo", &[13, 12])?;
+        assert_eq!(details.len(), 2);
+        assert_eq!(details[0].number, 13);
+        assert!(!details[0].found);
+        assert_eq!(details[1].number, 12);
+        assert!(details[1].found);
+        assert_eq!(
+            details[1].item.as_ref().and_then(|item| item["title"].as_str()),
+            Some("Cached issue")
+        );
         let _ = fs::remove_file(db_path);
         Ok(())
     }

@@ -20,6 +20,8 @@ local original_notify = vim.notify
 local original_diff_review = package.loaded["diff_review"]
 local render_markdown_ns = vim.api.nvim_create_namespace("render-markdown.nvim")
 local render_markdown_calls = {}
+local otter_calls = {}
+local otter_rafts = {}
 
 package.loaded["render-markdown.core.ui"] = { ns = render_markdown_ns }
 package.loaded["render-markdown"] = {
@@ -41,6 +43,29 @@ package.loaded["render-markdown"] = {
       end
     end
     if ctx.config and ctx.config.on and ctx.config.on.render then ctx.config.on.render({ buf = ctx.buf, win = ctx.win }) end
+  end,
+}
+package.loaded["otter.keeper"] = { rafts = otter_rafts }
+package.loaded["otter"] = {
+  activate = function(languages, completion, diagnostics, tsquery)
+    local buf = vim.api.nvim_get_current_buf()
+    otter_calls[#otter_calls + 1] = {
+      kind = "activate",
+      buf = buf,
+      name = vim.api.nvim_buf_get_name(buf),
+      languages = languages,
+      completion = completion,
+      diagnostics = diagnostics,
+      tsquery = tsquery,
+    }
+    otter_rafts[buf] = { languages = { "typescript" } }
+  end,
+  sync_raft = function(buf)
+    otter_calls[#otter_calls + 1] = {
+      kind = "sync",
+      buf = buf,
+      name = vim.api.nvim_buf_get_name(buf),
+    }
   end,
 }
 
@@ -75,7 +100,11 @@ local function reset()
   defer_next_issue_view = false
   deferred_issue_view_callback = nil
   issue_detail_cache = {}
+  issue_index._clear_detail_memory_for_test()
   render_markdown_calls = {}
+  otter_calls = {}
+  otter_rafts = {}
+  package.loaded["otter.keeper"].rafts = otter_rafts
   notifications._reset_for_tests()
   repo_cache.remember_cwd_repo(vim.fn.getcwd(), "org/repo")
 end
@@ -107,6 +136,24 @@ end
 local function preview_contains(preview, needle)
   local lines = preview and preview.lines or {}
   return table.concat(lines, "\n"):find(needle, 1, true) ~= nil
+end
+
+local function new_preview()
+  local preview = { buf = vim.api.nvim_create_buf(false, true) }
+  function preview:set_title(title)
+    self.title = title
+  end
+  function preview:set_lines(lines)
+    self.lines = lines
+    vim.bo[self.buf].modifiable = true
+    vim.api.nvim_buf_set_lines(self.buf, 0, -1, false, lines)
+    vim.bo[self.buf].modifiable = false
+  end
+  function preview:highlight() end
+  function preview:notify(message)
+    self.lines = { tostring(message) }
+  end
+  return preview
 end
 
 local function wait_for(predicate, message)
@@ -526,6 +573,29 @@ issue_index._set_runner_for_test(function(command, input, callback)
     callback({ code = 0, stdout = stdout, stderr = "", output = stdout })
     return
   end
+  if action == "details" then
+    local details = {}
+    local index = 1
+    while index <= #command do
+      if command[index] == "--number" then
+        local number = command[index + 1]
+        details[#details + 1] = issue_detail_cache[number] or {
+          repo = "org/repo",
+          number = tonumber(number),
+          found = false,
+        }
+        index = index + 2
+      else
+        index = index + 1
+      end
+    end
+    local stdout = vim.json.encode({
+      repo = "org/repo",
+      details = details,
+    })
+    callback({ code = 0, stdout = stdout, stderr = "", output = stdout })
+    return
+  end
   if action == "upsert-detail" then
     local number = command[#command]
     local decoded = vim.json.decode(input or "{}")
@@ -617,6 +687,7 @@ end
 
 local function run_tests()
   reset()
+  issue_detail_cache["12"] = cached_issue_detail("Cached prefetch body", os.time())
   vim.cmd.GithubIssue()
   wait_for(function() return captured_picker ~= nil end, "issue picker did not open")
   assert_true(#calls == 0, "issue picker should use the synced index instead of gh search: " .. vim.inspect(calls))
@@ -624,20 +695,18 @@ local function run_tests()
   assert_true(captured_picker.items[1].item.repo == "org/repo", "issue picker item was not repo scoped")
   assert_true(captured_picker.items[1].item.body == "Indexed body\n\nIndexed details.", "issue picker did not load synced body")
   assert_true(type(captured_picker.preview) == "function", "issue picker did not install an issue preview")
-  local preview = { buf = vim.api.nvim_create_buf(false, true) }
-  function preview:set_title(title)
-    self.title = title
-  end
-  function preview:set_lines(lines)
-    self.lines = lines
-    vim.bo[self.buf].modifiable = true
-    vim.api.nvim_buf_set_lines(self.buf, 0, -1, false, lines)
-    vim.bo[self.buf].modifiable = false
-  end
-  function preview:highlight() end
-  function preview:notify(message)
-    self.lines = { tostring(message) }
-  end
+  wait_for(function() return issue_index.cached_detail("org/repo", 12) ~= nil end, "issue picker did not prefetch redb detail")
+  local preview = new_preview()
+  captured_picker.preview({ item = captured_picker.items[1], preview = preview })
+  assert_true(preview_contains(preview, "Cached prefetch body"), "issue preview should paint prefetched redb detail first")
+  assert_true(not preview_contains(preview, "Indexed details."), "issue preview should not paint the indexed fallback over prefetched detail")
+  assert_true(not preview_contains(preview, "Loading description"), "issue preview should not render the old description placeholder")
+  assert_true(count_calls_containing("gh\tissue\tview\t12") == 0, "fresh prefetched detail should not trigger a GitHub fetch")
+
+  reset()
+  vim.cmd.GithubIssue()
+  wait_for(function() return captured_picker ~= nil end, "issue picker did not open for stale preview")
+  preview = new_preview()
   issue_detail_cache["12"] = cached_issue_detail("Cached stale body", os.time() - 180)
   defer_next_issue_view = true
   captured_picker.preview({ item = captured_picker.items[1], preview = preview })
@@ -668,10 +737,15 @@ local function run_tests()
     captured_picker.items[1].item.body == "Issue body\n\n## Foobar\n\nDetails.",
     "issue preview should update the selected picker item with fetched detail before confirm"
   )
+  assert_true(#otter_calls == 0, "issue picker preview should not activate otter")
   captured_picker.confirm({ close = function() end }, captured_picker.items[1])
   wait_for(function() return find_line("Title:  Fix command parser") ~= nil end, "issue view did not render selected issue")
   assert_true(count_calls_containing("gh\tissue\tview\t12") == 1, "issue buffer open should reuse cached issue detail")
   local buf = vim.api.nvim_get_current_buf()
+  wait_for(function() return #otter_calls > 0 end, "issue buffer markdown code blocks did not activate otter")
+  assert_true(otter_calls[1].kind == "activate", "issue markdown code should activate otter before syncing")
+  assert_true(not otter_calls[1].name:find("://", 1, true), "otter activation should use a temp-backed issue buffer name")
+  assert_true(vim.api.nvim_buf_get_name(buf):find("://", 1, true) ~= nil, "issue buffer name was not restored after otter activation")
   assert_true(vim.wo[0].wrap, "issue buffer should enable word wrap")
   assert_true(vim.wo[0].linebreak, "issue buffer should wrap at word boundaries")
   assert_true(vim.wo[0].breakindent, "issue buffer should preserve indentation on wrapped lines")

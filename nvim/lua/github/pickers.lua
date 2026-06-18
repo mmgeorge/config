@@ -123,7 +123,7 @@ local function preview_issue(ctx)
   local title = "Issue #" .. tostring(item.number)
   issue_preview_request_id = issue_preview_request_id + 1
   local request_id = issue_preview_request_id
-  set_preview_rendered(ctx, title, render_issue_preview(item, item.body ~= "" and item.body or "Loading description..."))
+  local rendered_from_cache = false
 
   issue_index.detail_async(vim.fn.getcwd(), item.repo, item.number, nil, function(result)
     if request_id ~= issue_preview_request_id then return end
@@ -133,10 +133,13 @@ local function preview_issue(ctx)
       set_preview_rendered(ctx, title, render_issue_preview(item, tostring(message)))
       return
     end
+    rendered_from_cache = true
     item = result.item
     if picker_item and picker_item.item then picker_item.item = result.item end
     set_preview_rendered(ctx, title, render_issue_preview(result.item, result.item.body))
   end)
+
+  if not rendered_from_cache then set_preview_rendered(ctx, title, render_issue_preview(item, item.body)) end
 end
 
 ---@param title string
@@ -187,6 +190,7 @@ local function open_synced_issue_picker(cwd, repo)
       { title = "GitHub" }
     )
   end
+  issue_index.prefetch_details(repo, items, { limit = 100 })
   open_picker("GitHub Issues: " .. repo, items, { preview = preview_issue })
 end
 

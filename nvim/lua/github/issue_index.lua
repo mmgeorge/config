@@ -5,7 +5,9 @@ local detail_stale_after_seconds = 2 * 60
 local progress_by_repo = {}
 local in_flight = {}
 local detail_in_flight = {}
+local detail_prefetch_in_flight = {}
 local detail_waiters = {}
+local detail_memory_cache = {}
 local sync_locks = {}
 local snapshot_cache = {}
 local notified = {}
@@ -128,6 +130,62 @@ end
 
 local function detail_key(repo, number)
   return (normalize_repo(repo) or tostring(repo or "")) .. "#" .. tostring(number)
+end
+
+---@param repo string
+---@param number integer|string
+---@param item table
+---@param fetched_at integer?
+local function remember_detail(repo, number, item, fetched_at)
+  repo = normalize_repo(repo)
+  number = tonumber(number)
+  if not (repo and number and type(item) == "table") then return end
+  local cached_item = vim.deepcopy(item)
+  cached_item.kind = cached_item.kind or "issue"
+  cached_item.repo = normalize_repo(cached_item.repo or repo) or cached_item.repo or repo
+  detail_memory_cache[detail_key(repo, number)] = {
+    repo = repo,
+    number = number,
+    fetched_at = tonumber(fetched_at or os.time()) or os.time(),
+    item = cached_item,
+  }
+end
+
+---@param repo string
+---@param number integer|string
+---@param record table
+---@param source "memory"|"redb"
+---@return table?
+local function detail_result_from_record(repo, number, record, source)
+  repo = normalize_repo(repo)
+  number = tonumber(number)
+  if not (repo and number and type(record) == "table" and type(record.item) == "table") then return nil end
+  local fetched_at = tonumber(record.fetched_at or 0) or 0
+  local item = vim.deepcopy(record.item)
+  item.kind = item.kind or "issue"
+  item.repo = normalize_repo(item.repo or repo) or item.repo or repo
+  return {
+    ok = true,
+    item = item,
+    fetched_at = fetched_at,
+    cached = true,
+    memory = source == "memory",
+    redb = source == "redb",
+    stale = os.time() - fetched_at >= detail_stale_after_seconds,
+  }
+end
+
+---@param output table?
+---@param fallback_repo string
+---@param fallback_number integer|string
+---@return table?
+local function remember_detail_output(output, fallback_repo, fallback_number)
+  if not (type(output) == "table" and output.found == true and type(output.item) == "table") then return nil end
+  local repo = normalize_repo(output.repo or fallback_repo)
+  local number = tonumber(output.number or fallback_number)
+  if not (repo and number) then return nil end
+  remember_detail(repo, number, output.item, output.fetched_at)
+  return detail_result_from_record(repo, number, detail_memory_cache[detail_key(repo, number)], "redb")
 end
 
 function M.db_path(repo)
@@ -704,6 +762,29 @@ local function read_detail_async(repo, number, callback)
   }, nil, nil, callback)
 end
 
+---@param repo string
+---@param numbers integer[]
+---@param callback fun(result: table)
+local function read_details_async(repo, numbers, callback)
+  repo = normalize_repo(repo)
+  if not repo then
+    callback({ ok = false, message = "Invalid issue detail cache repo" })
+    return
+  end
+  local args = {
+    "details",
+    "--db",
+    M.db_path(repo),
+    "--repo",
+    repo,
+  }
+  for _, number in ipairs(numbers) do
+    args[#args + 1] = "--number"
+    args[#args + 1] = tostring(number)
+  end
+  run_sidecar_json(args, nil, nil, callback)
+end
+
 ---@param cwd string?
 ---@param repo string
 ---@param number integer|string
@@ -765,9 +846,10 @@ local function fetch_detail_async(cwd, repo, number)
       if not (write_result and write_result.ok) then
         notify("GitHub issue detail cache update failed:\n" .. tostring(write_result and write_result.message or "unknown error"), vim.log.levels.WARN)
       end
+      remember_detail(repo, number, result.item, os.time())
       finish_detail_fetch(key, {
         ok = true,
-        item = result.item,
+        item = vim.deepcopy(result.item),
         fetched_at = os.time(),
         cached = false,
         cache_updated = write_result and write_result.ok == true,
@@ -791,20 +873,32 @@ function M.detail_async(cwd, repo, number, opts, callback)
   end
 
   local key = detail_key(repo, number)
+  if opts.force ~= true then
+    local memory_result = detail_result_from_record(repo, number, detail_memory_cache[key], "memory")
+    if memory_result then
+      callback(memory_result)
+      if not memory_result.stale then return end
+      detail_waiters[key] = detail_waiters[key] or {}
+      detail_waiters[key][#detail_waiters[key] + 1] = callback
+      fetch_detail_async(cwd, repo, number)
+      return
+    end
+  end
+
   read_detail_async(repo, number, function(cache_result)
     local should_fetch = opts.force == true
     if cache_result and cache_result.ok and cache_result.value and cache_result.value.found == true then
       local value = cache_result.value
       local fetched_at = tonumber(value.fetched_at or 0) or 0
+      remember_detail(repo, number, value.item, fetched_at)
+      local cached_result = detail_result_from_record(repo, number, detail_memory_cache[key], "redb")
       local age = os.time() - fetched_at
-      callback({
-        ok = true,
-        item = value.item,
-        fetched_at = fetched_at,
-        cached = true,
-        stale = age >= detail_stale_after_seconds,
-      })
-      should_fetch = should_fetch or age >= detail_stale_after_seconds
+      if cached_result then
+        callback(cached_result)
+        should_fetch = should_fetch or age >= detail_stale_after_seconds
+      else
+        should_fetch = true
+      end
     elseif cache_result and not cache_result.ok then
       notify("GitHub issue detail cache read failed:\n" .. tostring(cache_result.message or "unknown error"), vim.log.levels.WARN)
       should_fetch = true
@@ -819,13 +913,92 @@ function M.detail_async(cwd, repo, number, opts, callback)
   end)
 end
 
+---@param repo string
+---@param number integer|string
+---@return table?
+function M.cached_detail(repo, number)
+  repo = normalize_repo(repo)
+  number = tonumber(number)
+  if not (repo and number) then return nil end
+  return detail_result_from_record(repo, number, detail_memory_cache[detail_key(repo, number)], "memory")
+end
+
+---@param values table[]
+---@param limit integer
+---@return integer[]
+local function detail_numbers(values, limit)
+  local numbers = {}
+  local seen = {}
+  limit = math.max(0, math.floor(tonumber(limit) or 0))
+  if limit == 0 then return numbers end
+  for _, value in ipairs(type(values) == "table" and values or {}) do
+    local number = tonumber(type(value) == "table" and value.number or value)
+    if number and not seen[number] then
+      seen[number] = true
+      numbers[#numbers + 1] = number
+      if #numbers >= limit then break end
+    end
+  end
+  return numbers
+end
+
+---@param repo string
+---@param values table[]
+---@param opts? { limit?: integer, force?: boolean }
+---@param callback? fun(result: table)
+function M.prefetch_details(repo, values, opts, callback)
+  opts = opts or {}
+  repo = normalize_repo(repo)
+  if not repo then
+    if callback then callback({ ok = false, message = "Invalid issue detail cache repo" }) end
+    return
+  end
+
+  local numbers = {}
+  for _, number in ipairs(detail_numbers(values, tonumber(opts.limit) or 100)) do
+    if opts.force == true or not detail_memory_cache[detail_key(repo, number)] then numbers[#numbers + 1] = number end
+  end
+  if #numbers == 0 then
+    if callback then callback({ ok = true, count = 0 }) end
+    return
+  end
+
+  local prefetch_key = repo .. ":" .. table.concat(numbers, ",")
+  if detail_prefetch_in_flight[prefetch_key] then
+    if callback then callback({ ok = true, count = 0, in_flight = true }) end
+    return
+  end
+  detail_prefetch_in_flight[prefetch_key] = true
+  read_details_async(repo, numbers, function(result)
+    detail_prefetch_in_flight[prefetch_key] = nil
+    if not (result and result.ok) then
+      notify("GitHub issue detail cache prefetch failed:\n" .. tostring(result and result.message or "unknown error"), vim.log.levels.WARN)
+      if callback then callback(result or { ok = false, message = "GitHub issue detail cache prefetch failed" }) end
+      return
+    end
+
+    local count = 0
+    local details = result.value and result.value.details or {}
+    for _, detail in ipairs(type(details) == "table" and details or {}) do
+      if remember_detail_output(detail, repo, detail.number) then count = count + 1 end
+    end
+    if callback then callback({ ok = true, count = count }) end
+  end)
+end
+
 ---@param cwd string?
 ---@param repo string
 ---@param number integer|string
 ---@param item table
 ---@param callback? fun(result: table)
 function M.store_detail_async(cwd, repo, number, item, callback)
-  write_detail_async(cwd, repo, number, item, callback or function(result)
+  local fetched_at = os.time()
+  write_detail_async(cwd, repo, number, item, function(result)
+    if result and result.ok then remember_detail(repo, number, item, fetched_at) end
+    if callback then
+      callback(result)
+      return
+    end
     if not (result and result.ok) then
       notify("GitHub issue detail cache update failed:\n" .. tostring(result and result.message or "unknown error"), vim.log.levels.WARN)
     end
@@ -1406,6 +1579,12 @@ function M._set_detail_stale_after_seconds_for_test(seconds)
   detail_stale_after_seconds = tonumber(seconds) or detail_stale_after_seconds
 end
 
+function M._clear_detail_memory_for_test()
+  detail_prefetch_in_flight = {}
+  detail_waiters = {}
+  detail_memory_cache = {}
+end
+
 function M._reset_for_test()
   for _, progress in pairs(progress_by_repo) do
     stop_progress_timer(progress)
@@ -1416,7 +1595,9 @@ function M._reset_for_test()
   progress_by_repo = {}
   in_flight = {}
   detail_in_flight = {}
+  detail_prefetch_in_flight = {}
   detail_waiters = {}
+  detail_memory_cache = {}
   sync_locks = {}
   snapshot_cache = {}
   notified = {}

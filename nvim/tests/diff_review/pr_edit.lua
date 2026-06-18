@@ -2,6 +2,8 @@ vim.loader.enable(false)
 
 local render_markdown_ns = vim.api.nvim_create_namespace("render-markdown.nvim")
 local render_markdown_calls = {}
+local otter_calls = {}
+local otter_rafts = {}
 package.loaded["render-markdown.core.ui"] = { ns = render_markdown_ns }
 package.loaded["render-markdown"] = {
   render = function(ctx)
@@ -24,6 +26,29 @@ package.loaded["render-markdown"] = {
       end
     end
     if ctx.config and ctx.config.on and ctx.config.on.render then ctx.config.on.render({ buf = ctx.buf, win = ctx.win }) end
+  end,
+}
+package.loaded["otter.keeper"] = { rafts = otter_rafts }
+package.loaded["otter"] = {
+  activate = function(languages, completion, diagnostics, tsquery)
+    local buf = vim.api.nvim_get_current_buf()
+    otter_calls[#otter_calls + 1] = {
+      kind = "activate",
+      buf = buf,
+      name = vim.api.nvim_buf_get_name(buf),
+      languages = languages,
+      completion = completion,
+      diagnostics = diagnostics,
+      tsquery = tsquery,
+    }
+    otter_rafts[buf] = { languages = { "typescript" } }
+  end,
+  sync_raft = function(buf)
+    otter_calls[#otter_calls + 1] = {
+      kind = "sync",
+      buf = buf,
+      name = vim.api.nvim_buf_get_name(buf),
+    }
   end,
 }
 
@@ -1203,6 +1228,10 @@ local function run()
   local status_row = find_row(buf, "Status: DRAFT")
   local body_row = find_row(buf, "Line one")
   wait_for(function() return #render_markdown_calls > 0 end, "PR description did not invoke render-markdown")
+  wait_for(function() return #otter_calls > 0 end, "PR markdown code blocks did not activate otter")
+  assert_true(otter_calls[1].kind == "activate", "PR markdown code should activate otter before syncing")
+  assert_true(not otter_calls[1].name:find("://", 1, true), "otter activation should use a temp-backed PR buffer name")
+  assert_true(vim.api.nvim_buf_get_name(buf):find("://", 1, true) ~= nil, "PR buffer name was not restored after otter activation")
   local markdown_rows = render_markdown_mark_rows(buf)
   assert_true(
     #markdown_rows == 1 and markdown_rows[1] == body_row,

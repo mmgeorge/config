@@ -506,6 +506,26 @@ local function prune_markdown()
   prune_markdown_range(state.buf, body_start, body_end)
 end
 
+local function ensure_markdown_language_registered()
+  if state.markdown_language_registered then return end
+  pcall(vim.treesitter.language.register, "markdown", "GithubIssue")
+  state.markdown_language_registered = true
+end
+
+---@param buf integer?
+local function activate_markdown_code(buf)
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  ensure_markdown_language_registered()
+  local ok, markdown_code = pcall(require, "markdown_code")
+  if ok and type(markdown_code) == "table" and type(markdown_code.activate) == "function" then
+    markdown_code.activate(buf, {
+      filetype = "GithubIssue",
+      register_as_markdown = true,
+      notify_title = "GitHub",
+    })
+  end
+end
+
 ---@param buf integer
 ---@param win integer?
 ---@param body_start integer?
@@ -522,10 +542,7 @@ local function render_markdown_range(buf, win, body_start, body_end)
     win = found ~= -1 and found or nil
   end
   if not win then return end
-  if not state.markdown_language_registered then
-    pcall(vim.treesitter.language.register, "markdown", "GithubIssue")
-    state.markdown_language_registered = true
-  end
+  ensure_markdown_language_registered()
   local conceallevel = vim.api.nvim_get_option_value("conceallevel", { scope = "local", win = win })
   local concealcursor = vim.api.nvim_get_option_value("concealcursor", { scope = "local", win = win })
   local render_ok, err = pcall(render_markdown_plugin.render, {
@@ -560,6 +577,7 @@ local function render_markdown()
   if state.kind ~= "issue" then return end
   local body_start, body_end = body_range0()
   render_markdown_range(state.buf, state.win, body_start, body_end)
+  activate_markdown_code(state.buf)
 end
 
 local function ensure_decoration_highlights()
@@ -618,7 +636,7 @@ end
 
 ---@param buf integer
 ---@param rendered GithubIssueRendered
----@param opts? { set_lines?: boolean, markdown?: boolean, win?: integer }
+---@param opts? { set_lines?: boolean, markdown?: boolean, otter?: boolean, win?: integer }
 function M.present_rendered(buf, rendered, opts)
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
   opts = opts or {}
@@ -636,6 +654,7 @@ function M.present_rendered(buf, rendered, opts)
       rendered.body_end and rendered.body_end - 1 or nil
     )
   end
+  if opts.otter then activate_markdown_code(buf) end
   M.apply_rendered_decorations(buf, rendered)
 end
 
@@ -1067,7 +1086,7 @@ local function set_rendered(rendered)
   local buf = ensure_buffer()
   clear_marks()
   vim.bo[buf].modifiable = true
-  M.present_rendered(buf, rendered, { markdown = state.kind == "issue", win = state.win })
+  M.present_rendered(buf, rendered, { markdown = state.kind == "issue", otter = state.kind == "issue", win = state.win })
   state.entries = rendered.entries or {}
   state.title_mark = rendered.title_row and vim.api.nvim_buf_set_extmark(buf, namespace, rendered.title_row - 1, 0, {})
   state.assignees_mark = rendered.assignees_row

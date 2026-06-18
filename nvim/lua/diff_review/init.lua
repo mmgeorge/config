@@ -7463,6 +7463,7 @@ local function status_render_loaded(buf, target_id, fallback_line, opts, head_li
   if view_kind == "pr" then
     M._pr_edit.on_render(buf)
     M._review.on_render(buf)
+    M._pr_edit.activate_markdown_code(buf)
     M._pr_edit.sync_modifiable(buf)
   elseif view_kind == "review" then
     M._review.on_render(buf)
@@ -11181,10 +11182,29 @@ function M._pr_edit.description_markdown_window(buf)
 end
 
 ---@param buf integer
+function M._pr_edit.activate_markdown_code(buf)
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  if not M._pr_edit.gitstatus_markdown_language_registered then
+    pcall(vim.treesitter.language.register, "markdown", "GitStatus")
+    M._pr_edit.gitstatus_markdown_language_registered = true
+  end
+  local ok, markdown_code = pcall(require, "markdown_code")
+  if ok and type(markdown_code) == "table" and type(markdown_code.activate) == "function" then
+    markdown_code.activate(buf, {
+      filetype = "GitStatus",
+      register_as_markdown = true,
+      notify_title = "DiffReview",
+    })
+  end
+end
+
+---@param buf integer
 function M._pr_edit.render_description_markdown(buf)
   local status = M._status_states and M._status_states[buf] or nil
   local state = status and status.pr_edit or nil
   if not (state and vim.api.nvim_buf_is_valid(buf)) then return end
+
+  M._pr_edit.activate_markdown_code(buf)
 
   if M._pr_edit.render_markdown_unavailable then return end
   local ok, render_markdown = pcall(require, "render-markdown")
