@@ -1073,6 +1073,21 @@ local function git_status_is_renamed(status)
   return type(status) == "string" and status:sub(1, 1) == "R"
 end
 
+---@param file DiffReviewStatusFile
+---@return string label
+---@return string hl_group
+function M._status_file_change_label(file)
+  local status = type(file.git_status) == "string" and file.git_status or file.status
+  status = type(status) == "string" and status:lower() or ""
+  if file.untracked or status:sub(1, 1) == "a" or status == "added" or status == "new" then
+    return "New", "DiffReviewStatusFileNew"
+  end
+  if status:sub(1, 1) == "d" or status == "deleted" or status == "removed" then
+    return "Deleted", "DiffReviewStatusFileDeleted"
+  end
+  return "Modified", "DiffReviewStatusFileModified"
+end
+
 --- Parse unified diff output into structured file/hunk data
 ---@param diff_output string
 ---@param staged boolean
@@ -6049,11 +6064,15 @@ local function status_render_file(file, entry_kind, hunk_entry_kind, file_key_ov
   local default_folded = not opts.default_open
   local file_folded = (not opts.force_open) and status_folded(file_key, default_folded)
   local stats = file.untracked and "new" or ("+%d -%d"):format(file.added, file.removed)
-  local line = ("%s%s %s"):format(string.rep(" ", status_file_indent), file.relpath, stats)
+  local change_label, change_label_hl = M._status_file_change_label(file)
+  local line = ("%s%s %s %s"):format(string.rep(" ", status_file_indent), change_label, file.relpath, stats)
   local entry = { id = file_key, kind = entry_kind or "file", file = file }
   local line_number = status_add_line(line, entry)
-  local path_start = status_file_indent
+  local label_start = status_file_indent
+  local label_end = label_start + #change_label
+  local path_start = label_end + 1
   local stats_start = #line - #stats
+  status_add_highlight(line_number, label_start, label_end, change_label_hl)
   status_add_highlight(line_number, path_start, stats_start - 1, "DiffReviewStatusPath")
   status_add_highlight(line_number, stats_start, #line, file.untracked and "Comment" or "DiffReviewAddRange")
 
