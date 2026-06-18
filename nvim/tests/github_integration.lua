@@ -138,6 +138,16 @@ local function issue_dirty_marker_count(buf)
   return count
 end
 
+local function line_has_namespace_highlight(buf, namespace_name, row, hl_group)
+  local ns = vim.api.nvim_get_namespaces()[namespace_name]
+  if not ns then return false end
+  for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(buf, ns, 0, -1, { details = true })) do
+    local details = mark[4] or {}
+    if mark[2] == row - 1 and details.hl_group == hl_group then return true end
+  end
+  return false
+end
+
 local function find_call(key)
   for _, call in ipairs(calls) do
     if call.key == key then return call end
@@ -149,7 +159,7 @@ local function encoded_issue(number)
   return vim.json.encode({
     number = number,
     title = "Fix command parser",
-    body = "Issue body\n\nDetails.",
+    body = "Issue body\n\n## Foobar\n\nDetails.",
     url = "https://github.com/org/repo/issues/" .. tostring(number),
     state = "OPEN",
     author = { login = "alice" },
@@ -445,11 +455,26 @@ local function run_tests()
   assert_true(find_line("Labels:       bug") ~= nil, "issue labels did not render")
   assert_true(find_line("Assignees:    bob") ~= nil, "issue assignees did not render")
   assert_true(find_line("Opening Comment:") ~= nil, "issue opening comment did not render")
-  assert_true(find_line("Comments (1):") ~= nil, "issue comments did not render")
+  local comments_heading_line = find_line("Comments (1):")
+  assert_true(comments_heading_line ~= nil, "issue comments did not render")
+  local line_after_comments_heading = current_lines()[comments_heading_line + 1] or ""
+  assert_true(
+    line_after_comments_heading:find("carol", 1, true) ~= nil,
+    "issue comments rendered an extra blank line after the comments heading"
+  )
   assert_true(find_line("carol") ~= nil, "issue comments did not use the PR comment summary format")
   wait_for(function() return #render_markdown_calls > 0 end, "issue opening comment did not invoke markdown renderer")
   assert_true(vim.bo.filetype == "GithubIssue", "issue buffer did not use the GithubIssue filetype")
   local title_line = find_line("Title:  Fix command parser")
+  local markdown_heading_line = find_line("## Foobar")
+  assert_true(markdown_heading_line ~= nil, "issue markdown heading did not render")
+  assert_true(
+    line_has_namespace_highlight(buf, "github.issue_view.decorations", markdown_heading_line, "GithubIssueMarkdownHeading"),
+    "issue markdown heading did not receive the issue heading highlight"
+  )
+  local markdown_heading_hl = vim.api.nvim_get_hl(0, { name = "GithubIssueMarkdownHeading", link = false })
+  assert_true(markdown_heading_hl.bold == true, "issue markdown heading highlight was not bold")
+  assert_true(markdown_heading_hl.fg == 0xffffff, "issue markdown heading highlight was not white")
   local body_line = find_line("Details.")
   assert_true(title_line ~= nil and body_line ~= nil, "issue editable fields missing")
   assert_true(issue_dirty_marker_count(buf) == 0, "issue dirty markers were present before edits")
@@ -470,7 +495,10 @@ local function run_tests()
   wait_for(function()
     return find_call(edit_key) ~= nil
   end, "issue write did not update issue")
-  assert_true(find_call(edit_key).input == "Issue body\n\nUpdated details.", "issue write sent the wrong body")
+  assert_true(
+    find_call(edit_key).input == "Issue body\n\n## Foobar\n\nUpdated details.",
+    "issue write sent the wrong body"
+  )
   wait_for(function() return not vim.bo[buf].modified end, "issue save did not clear the modified flag")
   wait_for(function() return issue_dirty_marker_count(buf) == 0 end, "issue save did not clear dirty markers")
 

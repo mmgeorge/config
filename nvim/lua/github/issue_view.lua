@@ -3,6 +3,8 @@ local diff_review_ok, diff_review = pcall(require, "diff_review")
 if not diff_review_ok then diff_review = nil end
 
 local namespace = vim.api.nvim_create_namespace("github.issue_view")
+local decoration_namespace = vim.api.nvim_create_namespace("github.issue_view.decorations")
+local markdown_heading_hl = "GithubIssueMarkdownHeading"
 
 ---@class GithubIssueViewState
 ---@field buf integer?
@@ -276,10 +278,60 @@ local function render_markdown()
   end
 end
 
+local function ensure_decoration_highlights()
+  vim.api.nvim_set_hl(0, markdown_heading_hl, { fg = "#ffffff", bold = true })
+end
+
+---@param buf integer
+local function clear_decorations(buf)
+  if vim.api.nvim_buf_is_valid(buf) then vim.api.nvim_buf_clear_namespace(buf, decoration_namespace, 0, -1) end
+end
+
+---@param buf integer
+---@param row integer?
+---@param line string?
+---@param hl_group string
+local function highlight_line(buf, row, line, hl_group)
+  if not (row and line) then return end
+  vim.api.nvim_buf_set_extmark(buf, decoration_namespace, row - 1, 0, {
+    end_col = #line,
+    hl_group = hl_group,
+    priority = 200,
+  })
+end
+
+---@param rendered GithubIssueRendered
+local function apply_decorations(rendered)
+  local buf = state.buf
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  clear_decorations(buf)
+  ensure_decoration_highlights()
+
+  highlight_line(buf, rendered.opening_heading_row, rendered.lines[rendered.opening_heading_row], "DiffReviewStatusHeader")
+  highlight_line(buf, rendered.comments_heading_row, rendered.lines[rendered.comments_heading_row], "DiffReviewStatusHeader")
+
+  if not (rendered.body_start and rendered.body_end) then return end
+  for row = rendered.body_start, rendered.body_end - 1 do
+    local line = rendered.lines[row] or ""
+    if line:match("^%s*#+%s+") then highlight_line(buf, row, line, markdown_heading_hl) end
+  end
+end
+
 ---@return table?
 local function pr_overview()
   if diff_review and type(diff_review._pr_overview) == "table" then return diff_review._pr_overview end
   return nil
+end
+
+---@param title string
+---@param count integer
+---@return string
+local function section_heading_text(title, count)
+  if diff_review and type(diff_review._status_section_heading_text) == "function" then
+    return diff_review._status_section_heading_text(title, count)
+  end
+  title = tostring(title or ""):gsub("%s*:%s*$", "")
+  return ("%s (%d):"):format(title, math.max(0, math.floor(tonumber(count) or 0)))
 end
 
 ---@param comment table
@@ -325,8 +377,10 @@ end
 ---@class GithubIssueRendered
 ---@field lines string[]
 ---@field title_row integer?
+---@field opening_heading_row integer?
 ---@field body_start integer?
 ---@field body_end integer?
+---@field comments_heading_row integer?
 
 ---@param item GithubGhDetail
 ---@return GithubIssueRendered
@@ -360,23 +414,26 @@ local function render_item(item)
   local title_row = #lines + 1
   lines[#lines + 1] = "Title:  " .. tostring(item.title or "")
   lines[#lines + 1] = ""
+  local opening_heading_row = #lines + 1
   lines[#lines + 1] = "Opening Comment:"
   local body_start = #lines + 1
   vim.list_extend(lines, body_lines)
   local body_end = body_start + #body_lines
   lines[#lines + 1] = ""
-  lines[#lines + 1] = "Comments (" .. tostring(#comments) .. "):"
+  local comments_heading_row = #lines + 1
+  lines[#lines + 1] = section_heading_text("Comments", #comments)
 
   for index, comment in ipairs(comments) do
-    lines[#lines + 1] = ""
     lines[#lines + 1] = comment_line(comments, index, comment_alignment)
   end
 
   return {
     lines = lines,
     title_row = title_row,
+    opening_heading_row = opening_heading_row,
     body_start = body_start,
     body_end = body_end,
+    comments_heading_row = comments_heading_row,
   }
 end
 
@@ -585,12 +642,14 @@ local function set_rendered(rendered)
   refresh_modified()
   apply_command_winbar()
   render_markdown()
+  apply_decorations(rendered)
 end
 
 ---@param lines string[]
 local function set_plain_lines(lines)
   local buf = ensure_buffer()
   clear_marks()
+  clear_decorations(buf)
   vim.bo[buf].modifiable = true
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
   vim.bo[buf].modified = false
