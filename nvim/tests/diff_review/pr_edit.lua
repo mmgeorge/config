@@ -764,9 +764,23 @@ local function run()
   assert_true(buffer_contains(buf, "Line one"), "PR body did not render")
   wait_for(function() return buffer_contains(buf, "This is a regular comment") end, "PR conversation comment did not render")
   assert_true(buffer_contains(buf, "Comments (2):"), "PR comments heading did not use section heading format")
+  local first_regular_comment_row = find_row(buf, "This is a regular comment")
+  local first_regular_comment_line = vim.api.nvim_buf_get_lines(buf, first_regular_comment_row - 1, first_regular_comment_row, false)[1] or ""
+  assert_true(
+    first_regular_comment_line:find("me 10 hours ago  This is a regular comment", 1, true) ~= nil,
+    "regular PR comment row did not align metadata without action text: " .. first_regular_comment_line
+  )
+  assert_true(not first_regular_comment_line:find("|", 1, true), "regular PR comment row kept a pipe: " .. first_regular_comment_line)
+  assert_true(not first_regular_comment_line:find("commented", 1, true), "regular PR comment row kept action text: " .. first_regular_comment_line)
   assert_true(
     buffer_contains(buf, "Lorem Ipsum is the ubiquitous placeholder"),
     "long PR conversation comment preview did not render"
+  )
+  local long_regular_preview_row = find_row(buf, "Lorem Ipsum is the ubiquitous placeholder")
+  local long_regular_preview_line = vim.api.nvim_buf_get_lines(buf, long_regular_preview_row - 1, long_regular_preview_row, false)[1] or ""
+  assert_true(
+    long_regular_preview_line:find("me 5 hours ago   Lorem Ipsum is the ubiquitous placeholder", 1, true) ~= nil,
+    "long PR comment row did not align the shorter date column: " .. long_regular_preview_line
   )
   assert_true(
     not buffer_contains(buf, "Second full line for expansion"),
@@ -774,7 +788,7 @@ local function run()
   )
   wait_for(function() return buffer_contains(buf, "Reviews (3):") end, "submitted reviews section did not render")
   assert_true(
-    not buffer_contains(buf, "me commented 10 hours ago | Single inline review shell"),
+    not buffer_contains(buf, "Single inline review shell"),
     "single inline-comment review shell should not render in Reviews"
   )
   assert_true(buffer_contains(buf, "Changes (1):"), "PR changes heading did not use section heading format")
@@ -791,6 +805,7 @@ local function run()
   assert_true(checks_status_line == "Status:", "PR checks heading did not render above the check rows")
   assert_true(checks_status_row < description_row, "PR checks heading did not render before Description")
   assert_true(lint_check_row < description_row, "PR check row did not render before Description")
+  assert_true(lint_check_line:match("^%S") ~= nil, "PR check row should not be indented: " .. lint_check_line)
   assert_true(
     lint_check_line:find("✓ Dummy Lint | PR Dummy Checks", 1, true) ~= nil,
     "PR check row did not render without state text: " .. lint_check_line
@@ -799,6 +814,7 @@ local function run()
   assert_true(buffer_contains(buf, "Dummy Unit Tests"), "non-green PR check did not render")
   local unit_check_row = find_row(buf, "Dummy Unit Tests")
   local unit_check_line = vim.api.nvim_buf_get_lines(buf, unit_check_row - 1, unit_check_row, false)[1] or ""
+  assert_true(unit_check_line:match("^%S") ~= nil, "failing PR check row should not be indented: " .. unit_check_line)
   assert_true(
     unit_check_line:find("✗ Dummy Unit Tests | PR Dummy Checks", 1, true) ~= nil,
     "failing PR check row did not render without state text: " .. unit_check_line
@@ -809,19 +825,22 @@ local function run()
     "PR checks heading did not use header highlight"
   )
   wait_for(function()
-    return buffer_contains(buf, "foo requested changes 10 hours ago | This requires a few changes...")
+    return buffer_contains(buf, "foo     10 hours ago  This requires a few changes...")
   end, "rejected review summary did not render")
-  assert_true(buffer_contains(buf, "mgeorge approved 10 hours ago | LGTM!"), "approved review summary did not render")
-  assert_true(buffer_contains(buf, "mgeorge commented 10 hours ago | Needs a follow-up"), "commented review summary did not render")
+  assert_true(buffer_contains(buf, "mgeorge 10 hours ago  LGTM!"), "approved review summary did not render")
+  assert_true(buffer_contains(buf, "mgeorge 10 hours ago  Needs a follow-up"), "commented review summary did not render")
   assert_true(not buffer_contains(buf, "REJECTED by"), "review summary should not render rejected state text")
   assert_true(not buffer_contains(buf, "APPROVED by"), "review summary should not render approved state text")
   assert_true(not buffer_contains(buf, "COMMENTED by"), "review summary should not render commented state text")
-  local rejected_summary_row = find_row(buf, "foo requested changes 10 hours ago")
-  local approved_summary_row = find_row(buf, "mgeorge approved 10 hours ago")
-  local commented_summary_row = find_row(buf, "mgeorge commented 10 hours ago")
+  local rejected_summary_row = find_row(buf, "foo     10 hours ago")
+  local approved_summary_row = find_row(buf, "mgeorge 10 hours ago  LGTM!")
+  local commented_summary_row = find_row(buf, "mgeorge 10 hours ago  Needs a follow-up")
   for _, review_summary_row in ipairs({ rejected_summary_row, approved_summary_row, commented_summary_row }) do
     local review_summary_line = vim.api.nvim_buf_get_lines(buf, review_summary_row - 1, review_summary_row, false)[1] or ""
-    assert_true(not review_summary_line:match("^%S+%s+|"), "review summary kept a pipe after the icon: " .. review_summary_line)
+    assert_true(not review_summary_line:find("|", 1, true), "review summary kept a pipe: " .. review_summary_line)
+    assert_true(not review_summary_line:find("requested changes", 1, true), "review summary kept requested-changes action text: " .. review_summary_line)
+    assert_true(not review_summary_line:find("approved", 1, true), "review summary kept approved action text: " .. review_summary_line)
+    assert_true(not review_summary_line:find("commented", 1, true), "review summary kept commented action text: " .. review_summary_line)
     assert_true(not line_has_highlight(buf, review_summary_row, "DiffReviewReviewCommentHeader"), "review summary should not use blue header highlight: " .. review_summary_line)
   end
   assert_true(line_has_highlight(buf, rejected_summary_row, "DiffReviewDeleteRange"), "rejected review summary did not highlight status red")
@@ -832,13 +851,13 @@ local function run()
   local recent_commits_row = find_row(buf, "Recent Commits (2):")
   assert_true(recent_commits_row > changes_file_row, "PR recent commits section did not render at the end")
   assert_true(
-    not pcall(find_row_after, buf, "abc1234 1 day ago | feature chore: head commit", recent_commits_row),
+    not pcall(find_row_after, buf, "abc1234  1 day ago  chore: head commit", recent_commits_row),
     "PR recent commits should start folded"
   )
   move_cursor(buf, recent_commits_row)
   trigger_buf_mapping(buf, "<Tab>")
-  local head_commit_row = find_row_after(buf, "abc1234 1 day ago | feature chore: head commit", recent_commits_row)
-  local base_commit_row = find_row_after(buf, "1111111 2 days ago | feat: base commit", head_commit_row)
+  local head_commit_row = find_row_after(buf, "abc1234  1 day ago  chore: head commit", recent_commits_row)
+  local base_commit_row = find_row_after(buf, "1111111  2 days ago feat: base commit", head_commit_row)
   assert_true(head_commit_row > recent_commits_row, "PR head commit did not render under Recent Commits")
   assert_true(base_commit_row > head_commit_row, "PR commits did not render newest first")
   move_cursor(buf, changes_file_row)
@@ -874,7 +893,7 @@ local function run()
   wait_for(function() return buffer_contains(buf, "Oh good point! fixed") end, "PR inline code comment did not unfold")
   inline_comment_row = find_row_after(buf, "This is inline comment without review", changes_file_row)
   inline_reply_row = find_row_after(buf, "Oh good point! fixed", inline_comment_row)
-  local rejected_review_row = find_row(buf, "foo requested changes 10 hours ago")
+  local rejected_review_row = find_row(buf, "foo     10 hours ago")
   local regular_comment_row = find_row(buf, "This is a regular comment")
   local long_regular_comment_row = find_row(buf, "Lorem Ipsum is the ubiquitous placeholder")
   move_cursor(buf, long_regular_comment_row)
@@ -904,7 +923,7 @@ local function run()
   move_cursor(buf, regular_comment_row)
   trigger_buf_mapping(buf, "C")
   wait_for(function() return buffer_contains(buf, "Comments (3):") end, "regular PR comment draft did not update the comments count")
-  local regular_draft_header_row = find_row_after(buf, "you commented", regular_comment_row)
+  local regular_draft_header_row = find_row_after(buf, diff_review._review.comment_icon .. " you", regular_comment_row)
   assert_true(
     not line_has_highlight(buf, regular_draft_header_row, "DiffReviewReviewCommentHeader"),
     "new regular PR comment used the blue review-comment header highlight"
@@ -961,7 +980,7 @@ local function run()
     "fresh standalone inline code comment"
   )
 
-  rejected_review_row = find_row(buf, "foo requested changes 10 hours ago")
+  rejected_review_row = find_row(buf, "foo     10 hours ago")
   move_cursor(buf, rejected_review_row)
   trigger_buf_mapping(buf, "<Tab>")
   wait_for(function()
@@ -995,7 +1014,7 @@ local function run()
   move_cursor(buf, expanded_file_row)
   trigger_buf_mapping(buf, "<Tab>")
   wait_for(function()
-    local current_review_row = find_row(buf, "foo requested changes 10 hours ago")
+    local current_review_row = find_row(buf, "foo     10 hours ago")
     local current_changes_row = find_row_after(buf, "Changes", current_review_row)
     local review_block = table.concat(vim.api.nvim_buf_get_lines(buf, current_review_row - 1, current_changes_row - 1, false), "\n")
     return review_block:find("src/a.txt +1 -1", 1, true)
@@ -1004,7 +1023,7 @@ local function run()
       and not review_block:find("Oh good point! fixed", 1, true)
   end, "expanded review file did not fold its diff context")
 
-  rejected_review_row = find_row(buf, "foo requested changes 10 hours ago")
+  rejected_review_row = find_row(buf, "foo     10 hours ago")
   expanded_file_row = find_row_after(buf, "src/a.txt +1 -1", rejected_review_row)
   move_cursor(buf, expanded_file_row)
   trigger_buf_mapping(buf, "<Tab>")
@@ -1023,7 +1042,7 @@ local function run()
   move_cursor(buf, expanded_code_row)
   trigger_buf_mapping(buf, "C")
   wait_for(function() return buffer_contains(buf, "Comments (4):") end, "review-context C did not create a regular PR comment")
-  local context_regular_header_row = find_row_after(buf, "you commented", find_row(buf, "Regular from PR overview"))
+  local context_regular_header_row = find_row_after(buf, diff_review._review.comment_icon .. " you", find_row(buf, "Regular from PR overview"))
   local context_regular_body_row = context_regular_header_row + 1
   edit_line(buf, context_regular_body_row, "Regular from review context")
   trigger_buf_mapping(buf, "<C-s>")

@@ -86,6 +86,19 @@ local function line_has_highlight_prefix(buf, row, hl_prefix)
   return false
 end
 
+local function line_has_highlight(buf, row, hl_group, start_col, end_col)
+  local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
+  for _, mark in ipairs(marks) do
+    local details = mark[4] or {}
+    if details.hl_group == hl_group
+      and (start_col == nil or mark[3] == start_col)
+      and (end_col == nil or details.end_col == end_col) then
+      return true
+    end
+  end
+  return false
+end
+
 local function line_highlights(buf, row)
   local groups = {}
   local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
@@ -227,6 +240,11 @@ local function run()
   diff_review.set_git_backend(backend)
   gh.set_backend(gh_backend)
   diff_review.setup({ about_auto_generate = false })
+  assert_true(diff_review._status_conventional_commit_type_end("feat: add row highlighting") == #"feat", "plain conventional type did not parse")
+  assert_true(diff_review._status_conventional_commit_type_end("fix(parser)!: handle bang") == #"fix", "scoped breaking conventional type did not parse")
+  assert_true(diff_review._status_conventional_commit_type_end("Fix: uppercase is ambiguous") == nil, "uppercase type should not parse")
+  assert_true(diff_review._status_conventional_commit_type_end("docs:missing space") == nil, "missing post-colon space should not parse")
+  assert_true(diff_review._status_conventional_commit_type_end("build(scope with space): no") == nil, "scope with spaces should not parse")
   set_datetime_now("2026-06-15T12:00:00Z")
   diff_review.open()
   local buf = vim.api.nvim_get_current_buf()
@@ -236,14 +254,21 @@ local function run()
   wait_for(function() return buffer_contains(buf, "Recent Commits (20)") end, "recent commits section did not render")
   assert_true(find_row(buf, "Recent Commits (20)") > find_row(buf, "Unmerged into origin/master (4)"), "recent commits should render below unmerged commits")
   assert_true(saw_call_containing("\tlog\t--no-color\t--format=%H%x09%h%x09%cI%x09%s\t-20\torigin/master"), "recent commits did not use a 20-commit upstream git log")
-  assert_true(not buffer_contains(buf, "recent01 1 day ago | master docs: recent commit 01"), "recent commits should start folded")
-  assert_true(buffer_contains(buf, "45806b8 1 day ago | master feat: add or mapping and guard ai generation"), "first unmerged commit did not include branch")
-  assert_true(buffer_contains(buf, "748971a 2 days ago | feat: add debug notifications and AI commit flag"), "second unmerged commit missing")
+  assert_true(not buffer_contains(buf, "recent01  1 day ago   docs: recent commit 01"), "recent commits should start folded")
+  assert_true(buffer_contains(buf, "45806b8  1 day ago  feat: add or mapping and guard ai generation"), "first unmerged commit missing")
+  assert_true(buffer_contains(buf, "748971a  2 days ago feat: add debug notifications and AI commit flag"), "second unmerged commit missing")
+  local first_unmerged_row = find_row(buf, "45806b8  1 day ago  feat: add or mapping and guard ai generation")
+  local first_unmerged_line = status_lines(buf)[first_unmerged_row] or ""
+  local feat_start = (first_unmerged_line:find("feat:", 1, true) or 1) - 1
+  assert_true(
+    line_has_highlight(buf, first_unmerged_row, "DiffReviewStatusCommitType", feat_start, feat_start + #"feat"),
+    "first unmerged conventional commit type was not highlighted: " .. line_highlights(buf, first_unmerged_row)
+  )
   assert_true(not buffer_contains(buf, "foo/bar.js +1 -1"), "commit files loaded before commit was expanded")
   assert_true(count_calls_containing("\tshow\t--format=\t--no-color\t--no-ext-diff\t45806b8123456789") == 0, "commit diff loaded eagerly")
 
   local unmerged_heading = find_row(buf, "Unmerged into origin/master (4)")
-  trigger_normal_mapping("<Tab>", find_row_after(buf, "45806b8 1 day ago | master", unmerged_heading))
+  trigger_normal_mapping("<Tab>", find_row_after(buf, "45806b8  1 day ago  feat", unmerged_heading))
   wait_for(function() return buffer_contains(buf, "foo/bar.js +1 -1") end, "expanded commit did not render changed file\n" .. table.concat(status_lines(buf), "\n"))
   assert_true(buffer_contains(buf, "baz.txt +1 -1"), "expanded commit missing second changed file")
   assert_true(buffer_contains(buf, "src/commit.rs +1 -1"), "expanded commit missing Rust changed file")
@@ -265,16 +290,23 @@ local function run()
 
   local show_calls_before_recent = count_calls_containing("\tshow\t--format=\t--no-color\t--no-ext-diff")
   trigger_normal_mapping("<Tab>", find_row(buf, "Recent Commits (20)"))
-  wait_for(function() return buffer_contains(buf, "recent01 1 day ago | master docs: recent commit 01") end, "recent commits did not unfold")
-  assert_true(buffer_contains(buf, "recent20 20 days ago | docs: recent commit 20"), "recent commits did not include the 20th commit")
-  assert_true(not buffer_contains(buf, "recent21 21 days ago | docs: recent commit 21"), "recent commits rendered more than 20 commits")
+  wait_for(function() return buffer_contains(buf, "recent01  1 day ago   docs: recent commit 01") end, "recent commits did not unfold")
+  local recent_row = find_row(buf, "recent01  1 day ago   docs: recent commit 01")
+  local recent_line = status_lines(buf)[recent_row] or ""
+  local docs_start = (recent_line:find("docs:", 1, true) or 1) - 1
   assert_true(
-    find_row_after(buf, "recent01 1 day ago | master docs: recent commit 01", find_row(buf, "Recent Commits (20)"))
+    line_has_highlight(buf, recent_row, "DiffReviewStatusCommitType", docs_start, docs_start + #"docs"),
+    "recent conventional commit type was not highlighted: " .. line_highlights(buf, recent_row)
+  )
+  assert_true(buffer_contains(buf, "recent20  20 days ago docs: recent commit 20"), "recent commits did not include the 20th commit")
+  assert_true(not buffer_contains(buf, "recent21  21 days ago docs: recent commit 21"), "recent commits rendered more than 20 commits")
+  assert_true(
+    find_row_after(buf, "recent01  1 day ago   docs: recent commit 01", find_row(buf, "Recent Commits (20)"))
       > find_row(buf, "Recent Commits (20)"),
     "recent commits did not render under the recent section"
   )
   assert_true(
-    not buffer_contains_after(buf, "45806b8 1 day ago | master feat: add or mapping and guard ai generation", find_row(buf, "Recent Commits (20)")),
+    not buffer_contains_after(buf, "45806b8  1 day ago  feat: add or mapping and guard ai generation", find_row(buf, "Recent Commits (20)")),
     "recent commits included an unmerged commit"
   )
   assert_true(

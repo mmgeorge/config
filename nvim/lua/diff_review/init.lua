@@ -3954,22 +3954,66 @@ function M._pr_overview.comment_author(comment)
   return tostring(comment and comment.user or "unknown")
 end
 
----@param comment table
----@param expanded? boolean
+---@param text any
+---@param width integer?
 ---@return string
-function M._pr_overview.issue_comment_line(comment, expanded)
+function M._pr_overview.pad_display_right(text, width)
+  text = tostring(text or "")
+  local padding = (width or 0) - vim.fn.strdisplaywidth(text)
+  if padding <= 0 then return text end
+  return text .. string.rep(" ", padding)
+end
+
+---@param comment table
+---@return string
+function M._pr_overview.issue_comment_date(comment)
+  return M._pr_overview.comment_datetime(comment.updated_at or comment.created_at)
+end
+
+---@param comments table[]?
+---@return { author_width: integer, date_width: integer }
+function M._pr_overview.issue_comment_alignment(comments)
+  local alignment = { author_width = 0, date_width = 0 }
+  for _, comment in ipairs(comments or {}) do
+    alignment.author_width = math.max(alignment.author_width, vim.fn.strdisplaywidth(M._pr_overview.comment_author(comment)))
+    alignment.date_width = math.max(alignment.date_width, vim.fn.strdisplaywidth(M._pr_overview.issue_comment_date(comment)))
+  end
+  return alignment
+end
+
+---@param comment table
+---@param alignment? { author_width?: integer, date_width?: integer }
+---@param has_preview? boolean
+---@return string
+function M._pr_overview.issue_comment_prefix(comment, alignment, has_preview)
+  alignment = alignment or {}
+  local date_text = M._pr_overview.issue_comment_date(comment)
+  local date_width = alignment.date_width or vim.fn.strdisplaywidth(date_text)
   local prefix = ("%s %s"):format(
     M._comment_icon,
-    M._datetime.action_phrase(M._pr_overview.comment_author(comment), "commented", comment.updated_at or comment.created_at)
+    M._pr_overview.pad_display_right(M._pr_overview.comment_author(comment), alignment.author_width)
   )
+  if date_text ~= "" or date_width > 0 then
+    prefix = prefix .. " " .. M._pr_overview.pad_display_right(date_text, has_preview and date_width or 0)
+  end
+  if has_preview then return prefix end
+  return prefix:gsub("%s+$", "")
+end
+
+---@param comment table
+---@param expanded? boolean
+---@param alignment? { author_width?: integer, date_width?: integer }
+---@return string
+function M._pr_overview.issue_comment_line(comment, expanded, alignment)
+  local prefix = M._pr_overview.issue_comment_prefix(comment, alignment, false)
   if not expanded then
     local preview = M._pr_overview.comment_preview(comment.body or "")
     if M._review and M._review.truncate_preview_text and M._review.comment_rule_width then
-      local preview_prefix = prefix .. " | "
+      local preview_prefix = M._pr_overview.issue_comment_prefix(comment, alignment, preview ~= "") .. "  "
       local preview_width = math.max(0, M._review.comment_rule_width(nil, nil) - vim.fn.strdisplaywidth(preview_prefix))
       preview = M._review.truncate_preview_text(preview, preview_width)
     end
-    if preview ~= "" then prefix = prefix .. " | " .. preview end
+    if preview ~= "" then prefix = M._pr_overview.issue_comment_prefix(comment, alignment, true) .. "  " .. preview end
   end
   return prefix
 end
@@ -4135,31 +4179,31 @@ function M._pr_overview.check_head_lines(pr, status)
   lines[#lines + 1] = { segments = { { "" } } }
   lines[#lines + 1] = { segments = { { "Status:", "DiffReviewStatusHeader" } } }
   if not (pr.repo and pr.repo ~= "") then
-    lines[#lines + 1] = { segments = { { "  No checks", "Comment" } } }
+    lines[#lines + 1] = { segments = { { "No checks", "Comment" } } }
     return lines
   end
   if status and status.pr_checks_error then
-    lines[#lines + 1] = { segments = { { "  " .. tostring(status.pr_checks_error), "ErrorMsg" } } }
+    lines[#lines + 1] = { segments = { { tostring(status.pr_checks_error), "ErrorMsg" } } }
     return lines
   end
   if status and status.pr_checks_loading then
-    lines[#lines + 1] = { segments = { { "  ...loading checks...", "DiffReviewStatusFetching" } } }
+    lines[#lines + 1] = { segments = { { "...loading checks...", "DiffReviewStatusFetching" } } }
     return lines
   end
   local checks = status and status.pr_checks or nil
   if type(checks) ~= "table" then
-    lines[#lines + 1] = { segments = { { "  ...loading checks...", "DiffReviewStatusFetching" } } }
+    lines[#lines + 1] = { segments = { { "...loading checks...", "DiffReviewStatusFetching" } } }
     return lines
   end
   if #checks == 0 then
-    lines[#lines + 1] = { segments = { { "  No checks", "Comment" } } }
+    lines[#lines + 1] = { segments = { { "No checks", "Comment" } } }
     return lines
   end
   for check_index, check in ipairs(checks) do
     local icon, icon_hl = M._pr_overview.check_icon(check)
     local workflow_suffix = M._pr_overview.check_workflow_suffix(check)
     local segments = {
-      { "  " .. icon .. " ", icon_hl },
+      { icon .. " ", icon_hl },
       { tostring(check.name or "Check"), "DiffReviewStatusPath" },
     }
     if workflow_suffix ~= "" then
@@ -5036,6 +5080,29 @@ function M._pr_overview.review_action(state)
 end
 
 ---@param review DiffReviewGhSubmittedReview
+---@return string
+function M._pr_overview.review_author(review)
+  return tostring(review.user or "unknown")
+end
+
+---@param review DiffReviewGhSubmittedReview
+---@return string
+function M._pr_overview.review_date(review)
+  return M._pr_overview.comment_datetime(review.submitted_at or review.updated_at or review.created_at)
+end
+
+---@param reviews DiffReviewGhSubmittedReview[]?
+---@return { author_width: integer, date_width: integer }
+function M._pr_overview.review_summary_alignment(reviews)
+  local alignment = { author_width = 0, date_width = 0 }
+  for _, review in ipairs(reviews or {}) do
+    alignment.author_width = math.max(alignment.author_width, vim.fn.strdisplaywidth(M._pr_overview.review_author(review)))
+    alignment.date_width = math.max(alignment.date_width, vim.fn.strdisplaywidth(M._pr_overview.review_date(review)))
+  end
+  return alignment
+end
+
+---@param review DiffReviewGhSubmittedReview
 ---@return string[] tail_parts
 function M._pr_overview.review_summary_tail_parts(review)
   local tail_parts = {}
@@ -5045,40 +5112,48 @@ function M._pr_overview.review_summary_tail_parts(review)
 end
 
 ---@param review DiffReviewGhSubmittedReview
+---@param alignment? { author_width?: integer, date_width?: integer }
 ---@return string
-function M._pr_overview.review_summary_line(review)
+function M._pr_overview.review_summary_line(review, alignment)
   local icon = M._pr_overview.review_state_style(review.state)
-  local parts = {
-    ("%s %s"):format(
-      icon,
-      M._datetime.action_phrase(
-        tostring(review.user or "unknown"),
-        M._pr_overview.review_action(review.state),
-        review.submitted_at or review.updated_at or review.created_at
-      )
-    ),
-  }
-  vim.list_extend(parts, M._pr_overview.review_summary_tail_parts(review))
-  return table.concat(parts, " | ")
+  alignment = alignment or {}
+  local tail_parts = M._pr_overview.review_summary_tail_parts(review)
+  local line = ("%s %s"):format(
+    icon,
+    M._pr_overview.pad_display_right(M._pr_overview.review_author(review), alignment.author_width)
+  )
+  local date_text = M._pr_overview.review_date(review)
+  if date_text ~= "" then
+    line = line .. " " .. M._pr_overview.pad_display_right(date_text, #tail_parts > 0 and alignment.date_width or 0)
+  end
+  if #tail_parts > 0 then line = line .. "  " .. table.concat(tail_parts, "  ") end
+  return line:gsub("%s+$", "")
 end
 
 ---@param review DiffReviewGhSubmittedReview
+---@param alignment? { author_width?: integer, date_width?: integer }
 ---@return table[]
-function M._pr_overview.review_summary_segments(review)
+function M._pr_overview.review_summary_segments(review, alignment)
   local icon, status_hl = M._pr_overview.review_state_style(review.state)
+  alignment = alignment or {}
+  local tail_parts = M._pr_overview.review_summary_tail_parts(review)
   local segments = {
     { icon .. " ", status_hl },
     {
-      M._datetime.action_phrase(
-        tostring(review.user or "unknown"),
-        M._pr_overview.review_action(review.state),
-        review.submitted_at or review.updated_at or review.created_at
-      ),
+      M._pr_overview.pad_display_right(M._pr_overview.review_author(review), alignment.author_width),
       "DiffReviewReviewComment",
     },
   }
-  for _, tail in ipairs(M._pr_overview.review_summary_tail_parts(review)) do
-    segments[#segments + 1] = { " | ", "DiffReviewReviewComment" }
+  local date_text = M._pr_overview.review_date(review)
+  if date_text ~= "" then
+    segments[#segments + 1] = { " ", "DiffReviewReviewComment" }
+    segments[#segments + 1] = {
+      M._pr_overview.pad_display_right(date_text, #tail_parts > 0 and alignment.date_width or 0),
+      "DiffReviewReviewComment",
+    }
+  end
+  for _, tail in ipairs(tail_parts) do
+    segments[#segments + 1] = { "  ", "DiffReviewReviewComment" }
     segments[#segments + 1] = { tail, "DiffReviewReviewComment" }
   end
   return segments
@@ -6147,20 +6222,22 @@ function M._pr_overview.render_review_context(review)
 end
 
 ---@param review DiffReviewGhSubmittedReview
-function M._pr_overview.render_review(review)
+---@param alignment? { author_width?: integer, date_width?: integer }
+function M._pr_overview.render_review(review, alignment)
   local review_key = M._pr_overview.review_key(review)
   local entry = { id = review_key, kind = "pr_review", pr_review = review }
-  status_add_segment_line(M._pr_overview.review_summary_segments(review), entry)
+  status_add_segment_line(M._pr_overview.review_summary_segments(review, alignment), entry)
   if status_folded(review_key, true) then return end
   M._pr_overview.render_review_context(review)
 end
 
 ---@param comment table
 ---@param index integer
-function M._pr_overview.render_issue_comment(comment, index)
+---@param alignment? { author_width?: integer, date_width?: integer }
+function M._pr_overview.render_issue_comment(comment, index, alignment)
   local entry_id = M._pr_overview.issue_comment_entry_id(comment, index)
   local expanded = not status_folded(entry_id, true)
-  local line = M._pr_overview.issue_comment_line(comment, expanded)
+  local line = M._pr_overview.issue_comment_line(comment, expanded, alignment)
   local entry = {
     id = entry_id,
     kind = "pr_comment",
@@ -6185,8 +6262,9 @@ end
 
 ---@param comments table[]
 function M._pr_overview.render_issue_comments(comments)
+  local alignment = M._pr_overview.issue_comment_alignment(comments)
   for index, comment in ipairs(comments or {}) do
-    M._pr_overview.render_issue_comment(comment, index)
+    M._pr_overview.render_issue_comment(comment, index, alignment)
   end
 end
 
@@ -6199,19 +6277,49 @@ local function status_commit_relative_date(commit)
   return relative
 end
 
+---@param subject string?
+---@return integer? type_end_col zero-based exclusive byte column within subject
+function M._status_conventional_commit_type_end(subject)
+  subject = tostring(subject or "")
+  local commit_type = subject:match("^([a-z][a-z0-9-]*)")
+  if not commit_type then return nil end
+
+  local cursor = #commit_type + 1
+  local next_char = subject:sub(cursor, cursor)
+  if next_char == "!" then
+    return subject:sub(cursor + 1, cursor + 2) == ": " and #commit_type or nil
+  end
+  if next_char == ":" then
+    return subject:sub(cursor + 1, cursor + 1) == " " and #commit_type or nil
+  end
+  if next_char ~= "(" then return nil end
+
+  local close_scope = subject:find(")", cursor + 1, true)
+  if not close_scope or close_scope == cursor + 1 then return nil end
+  local scope = subject:sub(cursor + 1, close_scope - 1)
+  if scope:find("[%c%s]") then return nil end
+  local after_scope = subject:sub(close_scope + 1, close_scope + 1)
+  if after_scope == "!" then
+    return subject:sub(close_scope + 2, close_scope + 3) == ": " and #commit_type or nil
+  end
+  if after_scope == ":" then
+    return subject:sub(close_scope + 2, close_scope + 2) == " " and #commit_type or nil
+  end
+  return nil
+end
+
 ---@param commit DiffReviewStatusCommit
-local function status_render_commit(commit)
+---@param date_width integer
+local function status_render_commit(commit, date_width)
   local commit_key = status_commit_key(commit.oid)
   local commit_folded = status_folded(commit_key, true)
   local line = commit.short_oid
   local date_text = status_commit_relative_date(commit)
-  if date_text then line = line .. " " .. date_text .. " |" end
-  local suffix_parts = {}
-  if commit.branch and commit.branch ~= "" then
-    suffix_parts[#suffix_parts + 1] = commit.branch
+  if date_text then
+    line = line .. "  " .. date_text
+    if date_width > #date_text then line = line .. string.rep(" ", date_width - #date_text) end
   end
-  suffix_parts[#suffix_parts + 1] = commit.subject
-  local suffix = table.concat(suffix_parts, " ")
+  local suffix = commit.subject or ""
   local suffix_start_col = nil
   if suffix ~= "" then
     suffix_start_col = #line + 1
@@ -6220,8 +6328,9 @@ local function status_render_commit(commit)
   local entry = { id = commit_key, kind = "commit", commit = commit }
   local line_number = status_add_line(line, entry)
   status_add_highlight(line_number, 0, #commit.short_oid, "DiffReviewStatusObjectId")
-  if suffix_start_col and commit.branch and commit.branch ~= "" then
-    status_add_highlight(line_number, suffix_start_col, suffix_start_col + #commit.branch, "DiffReviewStatusBranch")
+  local conventional_type_end = M._status_conventional_commit_type_end(suffix)
+  if suffix_start_col and conventional_type_end then
+    status_add_highlight(line_number, suffix_start_col, suffix_start_col + conventional_type_end, "DiffReviewStatusCommitType")
   end
 
   if commit_folded then return end
@@ -6268,14 +6377,20 @@ local function status_render_section(section)
     return
   end
   if section.reviews then
+    local alignment = M._pr_overview.review_summary_alignment(section.reviews)
     for _, review in ipairs(section.reviews) do
-      M._pr_overview.render_review(review)
+      M._pr_overview.render_review(review, alignment)
     end
     return
   end
   if section.commits then
+    local date_width = 0
     for _, commit in ipairs(section.commits) do
-      status_render_commit(commit)
+      local date_text = status_commit_relative_date(commit)
+      if date_text and #date_text > date_width then date_width = #date_text end
+    end
+    for _, commit in ipairs(section.commits) do
+      status_render_commit(commit, date_width)
     end
     return
   end
