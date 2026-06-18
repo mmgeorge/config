@@ -11,6 +11,11 @@ fn line_texts(lines: &[ScreenLine]) -> Vec<&str> {
     lines.iter().map(|line| line.text.as_str()).collect()
 }
 
+fn assert_no_inner_frame(texts: &[&str]) {
+    assert!(texts.iter().all(|line| !line.starts_with('+')));
+    assert!(texts.iter().all(|line| !line.starts_with('|')));
+}
+
 #[test]
 fn render_search_popup_contains_input_sessions_create_row_and_help() {
     let mut switcher = SessionSwitcher::default();
@@ -25,6 +30,7 @@ fn render_search_popup_contains_input_sessions_create_row_and_help() {
     let lines = switcher.render_lines(24, 80);
     let texts = line_texts(&lines);
 
+    assert_no_inner_frame(&texts);
     assert!(texts.iter().any(|line| line.contains("Search: f_")));
     assert!(texts.iter().any(|line| line.contains("> ferrous-main")));
     assert!(texts
@@ -47,6 +53,7 @@ fn render_create_popup_contains_new_session_prompt() {
     let lines = switcher.render_lines(24, 80);
     let texts = line_texts(&lines);
 
+    assert_no_inner_frame(&texts);
     assert!(texts
         .iter()
         .any(|line| line.contains("New session name: scratch_")));
@@ -56,4 +63,26 @@ fn render_create_popup_contains_new_session_prompt() {
     assert!(texts
         .iter()
         .any(|line| line.contains("Enter create  Esc back")));
+}
+
+#[test]
+fn render_rename_popup_contains_rename_session_prompt() {
+    let mut switcher = SessionSwitcher::default();
+    switcher.grant_permissions();
+    switcher.set_sessions(vec![session("config", true)]);
+    switcher.handle_input(SwitcherInput::RenameCurrentSession);
+
+    let lines = switcher.render_lines(24, 80);
+    let texts = line_texts(&lines);
+
+    assert_no_inner_frame(&texts);
+    assert!(texts
+        .iter()
+        .any(|line| line.contains("Rename session: config_")));
+    assert!(texts
+        .iter()
+        .any(|line| line.contains("Enter to rename, Esc to cancel")));
+    assert!(texts
+        .iter()
+        .any(|line| line.contains("Enter rename  Esc back")));
 }

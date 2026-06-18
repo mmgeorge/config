@@ -182,49 +182,50 @@ impl SessionSwitcher {
     }
 
     pub fn render_lines(&self, terminal_rows: usize, terminal_columns: usize) -> Vec<ScreenLine> {
-        let width = terminal_columns.saturating_sub(4).min(86).max(32);
-        let max_list_rows = terminal_rows.saturating_sub(9).min(14);
-        let list_rows = self.rows.len().min(max_list_rows).max(1);
-        let height = list_rows + 7;
-        let column = terminal_columns.saturating_sub(width) / 2;
-        let row = terminal_rows.saturating_sub(height) / 2;
+        let column = if terminal_columns > 4 { 2 } else { 0 };
+        let width = terminal_columns.saturating_sub(column * 2).max(1);
+        let prompt_row = if terminal_rows > 2 { 1 } else { 0 };
+        let body_row = prompt_row + 2;
+        let help_row = if terminal_rows > body_row + 2 {
+            terminal_rows - 2
+        } else {
+            body_row + 1
+        };
+        let max_list_rows = help_row.saturating_sub(body_row).saturating_sub(1).max(1).min(14);
         let mut lines = Vec::new();
 
-        push_line(&mut lines, row, column, border_top(width));
-        push_box_line(&mut lines, row + 1, column, width, "");
         match self.mode {
             Mode::Search => {
                 let prompt = format!("Search: {}_", self.search_term);
-                push_box_line(&mut lines, row + 2, column, width, &prompt);
+                push_text_line(&mut lines, prompt_row, column, width, &prompt);
             },
             Mode::CreateSession => {
                 let prompt = format!("New session name: {}_", self.new_session_name);
-                push_box_line(&mut lines, row + 2, column, width, &prompt);
+                push_text_line(&mut lines, prompt_row, column, width, &prompt);
             },
             Mode::RenameSession => {
                 let prompt = format!("Rename session: {}_", self.rename_session_name);
-                push_box_line(&mut lines, row + 2, column, width, &prompt);
+                push_text_line(&mut lines, prompt_row, column, width, &prompt);
             },
         }
-        push_box_line(&mut lines, row + 3, column, width, "");
 
         match self.mode {
             Mode::Search => {
-                self.push_search_rows(&mut lines, row + 4, column, width, max_list_rows);
+                self.push_search_rows(&mut lines, body_row, column, width, max_list_rows);
             },
             Mode::CreateSession => {
-                push_box_line(
+                push_text_line(
                     &mut lines,
-                    row + 4,
+                    body_row,
                     column,
                     width,
                     "Enter to create, Esc to cancel",
                 );
             },
             Mode::RenameSession => {
-                push_box_line(
+                push_text_line(
                     &mut lines,
-                    row + 4,
+                    body_row,
                     column,
                     width,
                     "Enter to rename, Esc to cancel",
@@ -232,23 +233,16 @@ impl SessionSwitcher {
             },
         }
 
-        let help_row = row + height.saturating_sub(2);
         if let Some(error) = &self.error {
-            push_box_line(&mut lines, help_row, column, width, error);
+            push_text_line(&mut lines, help_row, column, width, error);
         } else {
             let help = match self.mode {
                 Mode::Search => "Up/Down select  Enter open  Esc close",
                 Mode::CreateSession => "Enter create  Esc back",
                 Mode::RenameSession => "Enter rename  Esc back",
             };
-            push_box_line(&mut lines, help_row, column, width, help);
+            push_text_line(&mut lines, help_row, column, width, help);
         }
-        push_line(
-            &mut lines,
-            row + height.saturating_sub(1),
-            column,
-            border_bottom(width),
-        );
         lines
     }
 
@@ -412,10 +406,10 @@ impl SessionSwitcher {
 
     fn start_rename_current_session(&mut self) {
         self.rename_when_sessions_ready = true;
-        match self.current_session_name() {
+        match self.current_session_name().map(str::to_owned) {
             Some(current_session_name) => {
                 self.mode = Mode::RenameSession;
-                self.rename_session_name = current_session_name.to_owned();
+                self.rename_session_name = current_session_name;
             },
             None => {
                 self.set_error("Could not find current session");
@@ -470,7 +464,7 @@ impl SessionSwitcher {
         max_rows: usize,
     ) {
         if self.rows.is_empty() {
-            push_box_line(lines, first_row, column, width, "Create new session");
+            push_text_line(lines, first_row, column, width, "Create new session");
             return;
         }
 
@@ -494,7 +488,7 @@ impl SessionSwitcher {
                     format!("{marker} Create new session")
                 },
             };
-            push_box_line(lines, first_row + screen_row, column, width, &label);
+            push_text_line(lines, first_row + screen_row, column, width, &label);
         }
     }
 }
@@ -508,14 +502,6 @@ pub fn sorted_sessions(mut sessions: Vec<SessionEntry>) -> Vec<SessionEntry> {
         },
     );
     sessions
-}
-
-pub fn border_top(width: usize) -> String {
-    format!("+{}+", "-".repeat(width.saturating_sub(2)))
-}
-
-pub fn border_bottom(width: usize) -> String {
-    border_top(width)
 }
 
 pub fn truncate_to_width(text: &str, width: usize) -> String {
@@ -533,22 +519,14 @@ fn push_line(lines: &mut Vec<ScreenLine>, row: usize, column: usize, text: Strin
     lines.push(ScreenLine { row, column, text });
 }
 
-fn push_box_line(
+fn push_text_line(
     lines: &mut Vec<ScreenLine>,
     row: usize,
     column: usize,
     width: usize,
     text: &str,
 ) {
-    let inner_width = width.saturating_sub(4);
-    let text = truncate_to_width(text, inner_width);
-    let padding = inner_width.saturating_sub(text.chars().count());
-    push_line(
-        lines,
-        row,
-        column,
-        format!("| {}{} |", text, " ".repeat(padding)),
-    );
+    push_line(lines, row, column, truncate_to_width(text, width));
 }
 
 pub fn visible_rows(sessions: &[SessionEntry], search_term: &str) -> Vec<Row> {

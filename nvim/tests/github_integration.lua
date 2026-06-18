@@ -118,8 +118,19 @@ local function current_lines()
   return vim.api.nvim_buf_get_lines(vim.api.nvim_get_current_buf(), 0, -1, false)
 end
 
+local function buffer_lines(buf)
+  return vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+end
+
 local function find_line(needle)
   for index, line in ipairs(current_lines()) do
+    if line:find(needle, 1, true) then return index end
+  end
+  return nil
+end
+
+local function find_buffer_line(buf, needle)
+  for index, line in ipairs(buffer_lines(buf)) do
     if line:find(needle, 1, true) then return index end
   end
   return nil
@@ -613,12 +624,15 @@ local function run_tests()
   assert_true(captured_picker.items[1].item.repo == "org/repo", "issue picker item was not repo scoped")
   assert_true(captured_picker.items[1].item.body == "Indexed body\n\nIndexed details.", "issue picker did not load synced body")
   assert_true(type(captured_picker.preview) == "function", "issue picker did not install an issue preview")
-  local preview = {}
+  local preview = { buf = vim.api.nvim_create_buf(false, true) }
   function preview:set_title(title)
     self.title = title
   end
   function preview:set_lines(lines)
     self.lines = lines
+    vim.bo[self.buf].modifiable = true
+    vim.api.nvim_buf_set_lines(self.buf, 0, -1, false, lines)
+    vim.bo[self.buf].modifiable = false
   end
   function preview:highlight() end
   function preview:notify(message)
@@ -638,6 +652,22 @@ local function run_tests()
   assert_true(preview_contains(preview, "Description:"), "issue preview should render the issue description heading")
   assert_true(preview_contains(preview, "Comments (1):"), "issue preview should render issue comments with the shared component")
   assert_true(not preview_contains(preview, "#12 Fix command parser"), "issue preview should not use the legacy picker-only layout")
+  local preview_state_line = find_buffer_line(preview.buf, "State:        Open")
+  assert_true(preview_state_line ~= nil, "issue preview should use the shared issue metadata layout")
+  assert_true(
+    line_has_namespace_highlight(preview.buf, "github.issue_view.decorations", preview_state_line, "DiffReviewStatusOpen"),
+    "issue preview should use shared issue state highlighting"
+  )
+  local preview_heading_line = find_buffer_line(preview.buf, "## Foobar")
+  assert_true(preview_heading_line ~= nil, "issue preview should render markdown body content")
+  assert_true(
+    line_has_namespace_highlight(preview.buf, "github.issue_view.decorations", preview_heading_line, "GithubIssueMarkdownHeading"),
+    "issue preview should use shared markdown heading highlighting"
+  )
+  assert_true(
+    captured_picker.items[1].item.body == "Issue body\n\n## Foobar\n\nDetails.",
+    "issue preview should update the selected picker item with fetched detail before confirm"
+  )
   captured_picker.confirm({ close = function() end }, captured_picker.items[1])
   wait_for(function() return find_line("Title:  Fix command parser") ~= nil end, "issue view did not render selected issue")
   assert_true(count_calls_containing("gh\tissue\tview\t12") == 1, "issue buffer open should reuse cached issue detail")

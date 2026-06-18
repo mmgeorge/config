@@ -485,12 +485,13 @@ local function markdown_namespace()
   return vim.api.nvim_get_namespaces()["render-markdown.nvim"]
 end
 
-local function prune_markdown()
-  local buf = state.buf
+---@param buf integer
+---@param body_start integer?
+---@param body_end integer?
+local function prune_markdown_range(buf, body_start, body_end)
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
   local render_namespace = markdown_namespace()
   if not render_namespace then return end
-  local body_start, body_end = body_range0()
   if body_start == nil or body_end == nil then return end
   for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(buf, render_namespace, 0, -1, {})) do
     local row = mark[2]
@@ -500,15 +501,22 @@ local function prune_markdown()
   end
 end
 
-local function render_markdown()
-  local buf = state.buf
+local function prune_markdown()
+  local body_start, body_end = body_range0()
+  prune_markdown_range(state.buf, body_start, body_end)
+end
+
+---@param buf integer
+---@param win integer?
+---@param body_start integer?
+---@param body_end integer?
+local function render_markdown_range(buf, win, body_start, body_end)
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
-  if state.kind ~= "issue" then return end
+  if body_start == nil or body_end == nil then return end
   local ok, render_markdown_plugin = pcall(require, "render-markdown")
   if not ok or type(render_markdown_plugin) ~= "table" or type(render_markdown_plugin.render) ~= "function" then
     return
   end
-  local win = state.win
   if not (win and vim.api.nvim_win_is_valid(win)) then
     local found = vim.fn.bufwinid(buf)
     win = found ~= -1 and found or nil
@@ -535,17 +543,23 @@ local function render_markdown()
       },
       on = {
         render = function()
-          prune_markdown()
+          prune_markdown_range(buf, body_start, body_end)
         end,
       },
     },
   })
   if render_ok then
-    prune_markdown()
+    prune_markdown_range(buf, body_start, body_end)
   elseif not state.markdown_failed then
     state.markdown_failed = true
     vim.notify("Issue markdown rendering failed: " .. tostring(err), vim.log.levels.WARN, { title = "GitHub" })
   end
+end
+
+local function render_markdown()
+  if state.kind ~= "issue" then return end
+  local body_start, body_end = body_range0()
+  render_markdown_range(state.buf, state.win, body_start, body_end)
 end
 
 local function ensure_decoration_highlights()
@@ -573,8 +587,7 @@ local function highlight_line(buf, row, line, hl_group)
 end
 
 ---@param rendered GithubIssueRendered
-local function apply_decorations(rendered)
-  local buf = state.buf
+function M.apply_rendered_decorations(buf, rendered)
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
   clear_decorations(buf)
   ensure_decoration_highlights()
@@ -601,6 +614,29 @@ local function apply_decorations(rendered)
     local line = rendered.lines[row] or ""
     if line:match("^%s*#+%s+") then highlight_line(buf, row, line, markdown_heading_hl) end
   end
+end
+
+---@param buf integer
+---@param rendered GithubIssueRendered
+---@param opts? { set_lines?: boolean, markdown?: boolean, win?: integer }
+function M.present_rendered(buf, rendered, opts)
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  opts = opts or {}
+  if opts.set_lines ~= false then
+    local was_modifiable = vim.bo[buf].modifiable
+    if not was_modifiable then vim.bo[buf].modifiable = true end
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, rendered.lines)
+    if not was_modifiable then vim.bo[buf].modifiable = false end
+  end
+  if opts.markdown then
+    render_markdown_range(
+      buf,
+      opts.win,
+      rendered.body_start and rendered.body_start - 1 or nil,
+      rendered.body_end and rendered.body_end - 1 or nil
+    )
+  end
+  M.apply_rendered_decorations(buf, rendered)
 end
 
 ---@param item GithubGhDetail
@@ -1031,7 +1067,7 @@ local function set_rendered(rendered)
   local buf = ensure_buffer()
   clear_marks()
   vim.bo[buf].modifiable = true
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, rendered.lines)
+  M.present_rendered(buf, rendered, { markdown = state.kind == "issue", win = state.win })
   state.entries = rendered.entries or {}
   state.title_mark = rendered.title_row and vim.api.nvim_buf_set_extmark(buf, namespace, rendered.title_row - 1, 0, {})
   state.assignees_mark = rendered.assignees_row
@@ -1043,8 +1079,6 @@ local function set_rendered(rendered)
   sync_modifiable()
   refresh_modified()
   apply_command_winbar()
-  render_markdown()
-  apply_decorations(rendered)
 end
 
 toggle_fold = function()

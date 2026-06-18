@@ -270,8 +270,16 @@ keybinds clear-defaults=true {
             }
             SwitchToMode "normal"
         }
-        // Rename tab (WezTerm: LEADER + u)
-        bind "u" { SwitchToMode "renametab"; TabNameInput 0; }
+        // Rename session (WezTerm: LEADER + u)
+        bind "u" {
+            LaunchOrFocusPlugin "file:D:/config/zellij/sessions/target/wasm32-wasip1/release/sessions.wasm" {
+                floating true
+                move_to_focused_tab true
+                skip_plugin_cache true
+                rename_session true
+            }
+            SwitchToMode "normal"
+        }
         // Enter scroll/copy mode (WezTerm: LEADER + .)
         bind "." { SwitchToMode "scroll"; }
         bind "[" { SwitchToMode "scroll"; }

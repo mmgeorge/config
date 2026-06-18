@@ -1,5 +1,6 @@
 local gh = require("github.gh")
 local issue_index = require("github.issue_index")
+local issue_view = require("github.issue_view")
 local repo_cache = require("github.repo_cache")
 
 local M = {}
@@ -57,23 +58,58 @@ end
 
 ---@param item GithubGhItem
 ---@param body string?
----@return string[]
-local function issue_preview_lines(item, body)
+---@return GithubIssueRendered
+local function render_issue_preview(item, body)
   local preview_item = vim.deepcopy(item or {})
   preview_item.kind = preview_item.kind or "issue"
   if body ~= nil then preview_item.body = body end
-  local rendered = require("github.issue_view").render_item(preview_item, { folds = {} })
-  return rendered.lines
+  return issue_view.render_item(preview_item, { folds = {} })
+end
+
+---@param ctx table
+---@return integer?
+local function preview_buffer(ctx)
+  local preview = ctx and ctx.preview or nil
+  if not preview then return nil end
+  if type(preview.buf) == "number" and vim.api.nvim_buf_is_valid(preview.buf) then return preview.buf end
+  if type(preview.win) == "number" and vim.api.nvim_win_is_valid(preview.win) then return vim.api.nvim_win_get_buf(preview.win) end
+  if
+    type(preview.state) == "table"
+    and type(preview.state.buf) == "number"
+    and vim.api.nvim_buf_is_valid(preview.state.buf)
+  then
+    return preview.state.buf
+  end
+  if type(ctx.buf) == "number" and vim.api.nvim_buf_is_valid(ctx.buf) then return ctx.buf end
+  if type(ctx.win) == "number" and vim.api.nvim_win_is_valid(ctx.win) then return vim.api.nvim_win_get_buf(ctx.win) end
+  return nil
+end
+
+---@param ctx table
+---@return integer?
+local function preview_window(ctx)
+  local preview = ctx and ctx.preview or nil
+  if preview and type(preview.win) == "number" and vim.api.nvim_win_is_valid(preview.win) then return preview.win end
+  if type(ctx.win) == "number" and vim.api.nvim_win_is_valid(ctx.win) then return ctx.win end
+  return nil
 end
 
 ---@param ctx table
 ---@param title string
----@param lines string[]
-local function set_preview_lines(ctx, title, lines)
+---@param rendered GithubIssueRendered
+local function set_preview_rendered(ctx, title, rendered)
   if not (ctx and ctx.preview) then return end
   pcall(function()
     if type(ctx.preview.set_title) == "function" then ctx.preview:set_title(title) end
-    if type(ctx.preview.set_lines) == "function" then ctx.preview:set_lines(lines) end
+    if type(ctx.preview.set_lines) == "function" then
+      ctx.preview:set_lines(rendered.lines)
+    end
+    local buf = preview_buffer(ctx)
+    if buf then
+      vim.bo[buf].filetype = "GithubIssue"
+      issue_view.present_rendered(buf, rendered, { markdown = true, win = preview_window(ctx) })
+      return
+    end
     if type(ctx.preview.highlight) == "function" then ctx.preview:highlight({ lang = "markdown" }) end
   end)
 end
@@ -87,17 +123,19 @@ local function preview_issue(ctx)
   local title = "Issue #" .. tostring(item.number)
   issue_preview_request_id = issue_preview_request_id + 1
   local request_id = issue_preview_request_id
-  set_preview_lines(ctx, title, issue_preview_lines(item, item.body ~= "" and item.body or "Loading description..."))
+  set_preview_rendered(ctx, title, render_issue_preview(item, item.body ~= "" and item.body or "Loading description..."))
 
   issue_index.detail_async(vim.fn.getcwd(), item.repo, item.number, nil, function(result)
     if request_id ~= issue_preview_request_id then return end
     if not (result and result.ok and result.item) then
       local message = result and result.message or "GitHub issue preview failed"
       vim.notify("GitHub issue preview failed:\n" .. tostring(message), vim.log.levels.ERROR, { title = "GitHub" })
-      set_preview_lines(ctx, title, issue_preview_lines(item, tostring(message)))
+      set_preview_rendered(ctx, title, render_issue_preview(item, tostring(message)))
       return
     end
-    set_preview_lines(ctx, title, issue_preview_lines(result.item, result.item.body))
+    item = result.item
+    if picker_item and picker_item.item then picker_item.item = result.item end
+    set_preview_rendered(ctx, title, render_issue_preview(result.item, result.item.body))
   end)
 end
 

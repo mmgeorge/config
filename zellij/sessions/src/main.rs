@@ -17,7 +17,10 @@ register_plugin!(SessionsPlugin);
 
 #[cfg(target_arch = "wasm32")]
 impl ZellijPlugin for SessionsPlugin {
-    fn load(&mut self, _configuration: std::collections::BTreeMap<String, String>) {
+    fn load(&mut self, configuration: std::collections::BTreeMap<String, String>) {
+        if configuration.get("rename_session").is_some_and(|value| value == "true") {
+            self.switcher.open_rename_session_when_ready();
+        }
         request_permission(&[
             PermissionType::ReadApplicationState,
             PermissionType::ChangeApplicationState,
@@ -95,6 +98,9 @@ impl SessionsPlugin {
             SwitcherAction::CreateSession(session_name) => {
                 switch_session(Some(&session_name));
             },
+            SwitcherAction::RenameSession(session_name) => {
+                rename_session(&session_name);
+            },
         }
     }
 
@@ -124,6 +130,9 @@ fn input_from_key(key: KeyWithModifier) -> Option<SwitcherInput> {
         BareKey::Esc if key.has_no_modifiers() => Some(SwitcherInput::Escape),
         BareKey::Char('c') if key.has_modifiers(&[KeyModifier::Ctrl]) => {
             Some(SwitcherInput::Cancel)
+        },
+        BareKey::Char('r') if key.has_modifiers(&[KeyModifier::Ctrl]) => {
+            Some(SwitcherInput::RenameCurrentSession)
         },
         _ => None,
     }

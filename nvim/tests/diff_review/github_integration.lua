@@ -54,13 +54,13 @@ function git_backend.systemlist(command)
   if key == "git\trev-parse\t--show-toplevel" then return { root }, 0 end
   if key == "git\t-C\t" .. root .. "\trev-parse\t--short\tHEAD" then return { "abc1234" }, 0 end
   if key == "git\t-C\t" .. root .. "\trev-parse\t--abbrev-ref\tHEAD" then return { "feature/pr-view" }, 0 end
-  if key == "git\t-C\t" .. root .. "\tlog\t-1\t--format=%s" then return { "mock subject" }, 0 end
+  if key == "git\t-C\t" .. root .. "\tlog\t-1\t--format=%s" then return { "feat: mock subject" }, 0 end
   if key == "git\t-C\t" .. root .. "\trev-parse\t--abbrev-ref\t@{upstream}" then return { "origin/feature/pr-view" }, 0 end
   if key == "git\t-C\t" .. root .. "\trev-parse\t--short\t@{upstream}" then return { "def5678" }, 0 end
-  if key == "git\t-C\t" .. root .. "\tlog\t-1\t--format=%s\t@{upstream}" then return { "upstream subject" }, 0 end
+  if key == "git\t-C\t" .. root .. "\tlog\t-1\t--format=%s\t@{upstream}" then return { "feat: upstream subject" }, 0 end
   if key == "git\t-C\t" .. root .. "\trev-parse\t--abbrev-ref\t@{push}" then return { "origin/feature/pr-view" }, 0 end
   if key == "git\t-C\t" .. root .. "\trev-parse\t--short\t@{push}" then return { "def5678" }, 0 end
-  if key == "git\t-C\t" .. root .. "\tlog\t-1\t--format=%s\t@{push}" then return { "push subject" }, 0 end
+  if key == "git\t-C\t" .. root .. "\tlog\t-1\t--format=%s\t@{push}" then return { "feat: push subject" }, 0 end
   if key == "git\t-C\t" .. root .. "\tls-files\t--others\t--exclude-standard" then return {}, 0 end
   if key == "git\t-C\t" .. root .. "\tdiff\t--cached\t--name-status" then return {}, 0 end
   if key == "git\t-C\t" .. root .. "\tdiff\t--name-status" then return has_changes and { "M\tlua/diff_review/init.lua" } or {}, 0 end
@@ -417,6 +417,13 @@ local function line_has_substring_highlight(buf, row, text, hl_group)
   return line_has_highlight(buf, row, hl_group, start_index - 1, start_index - 1 + #text)
 end
 
+local function line_has_conventional_type_highlight(buf, row, commit_type)
+  local line = status_lines(buf)[row] or ""
+  local start_index = line:find(commit_type .. ":", 1, true)
+  if not start_index then return false end
+  return line_has_highlight(buf, row, "DiffReviewStatusCommitType", start_index - 1, start_index - 1 + #commit_type)
+end
+
 local function wait_for(condition, message)
   assert_true(vim.wait(3000, condition, 10), message)
 end
@@ -502,25 +509,37 @@ local function run()
 
   wait_for(function() return buffer_contains(status_buf, "Improve DiffReview") end, "PR row did not show fetched PR title")
   assert_true(
-    buffer_contains(status_buf, "Head:   abc1234 feature/pr-view        mock subject"),
+    buffer_contains(status_buf, "Head:   abc1234 feature/pr-view        feat: mock subject"),
     "Head row did not pad branch before subject"
   )
   assert_true(
-    buffer_contains(status_buf, "Merge:  def5678 origin/feature/pr-view upstream subject"),
+    buffer_contains(status_buf, "Merge:  def5678 origin/feature/pr-view feat: upstream subject"),
     "Merge row did not keep upstream subject alignment"
   )
   assert_true(
-    buffer_contains(status_buf, "Push:   def5678 origin/feature/pr-view push subject"),
+    buffer_contains(status_buf, "Push:   def5678 origin/feature/pr-view feat: push subject"),
     "Push row did not keep push subject alignment"
   )
   assert_true(diff_review._status.pr.pr.repo == "org/repo", "current PR repo was not normalized from its URL")
   wait_for(function() return buffer_contains(status_buf, "feat: add diff review ai summary") end, "About row did not show generated commit subject")
   assert_true(
-    line_has_substring_highlight(status_buf, find_row(status_buf, "PR:"), "feat", "DiffReviewStatusCommitType"),
+    line_has_conventional_type_highlight(status_buf, find_row(status_buf, "Head:"), "feat"),
+    "Head conventional commit type was not highlighted"
+  )
+  assert_true(
+    line_has_conventional_type_highlight(status_buf, find_row(status_buf, "Merge:"), "feat"),
+    "Merge conventional commit type was not highlighted"
+  )
+  assert_true(
+    line_has_conventional_type_highlight(status_buf, find_row(status_buf, "Push:"), "feat"),
+    "Push conventional commit type was not highlighted"
+  )
+  assert_true(
+    line_has_conventional_type_highlight(status_buf, find_row(status_buf, "PR:"), "feat"),
     "PR conventional commit type was not highlighted"
   )
   assert_true(
-    line_has_substring_highlight(status_buf, find_row(status_buf, "About:"), "feat", "DiffReviewStatusCommitType"),
+    line_has_conventional_type_highlight(status_buf, find_row(status_buf, "About:"), "feat"),
     "About conventional commit type was not highlighted"
   )
   wait_for(function()
