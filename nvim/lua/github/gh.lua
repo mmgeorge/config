@@ -86,6 +86,12 @@
 ---@field message? string
 ---@field code? integer
 
+---@class GithubGhCreateIssueResult
+---@field ok boolean
+---@field url? string
+---@field message? string
+---@field code? integer
+
 ---@class GithubGhModule
 ---@field _backend GithubGhBackend?
 
@@ -567,6 +573,29 @@ end
 ---@param callback fun(result: GithubGhDetailResult)
 function M.pr_view_async(cwd, number, repo, callback)
   detail_async(cwd, "pr", number, repo, callback)
+end
+
+---@param cwd string?
+---@param title string
+---@param body string
+---@param repo string?
+---@param callback fun(result: GithubGhCreateIssueResult)
+function M.create_issue_async(cwd, title, body, repo, callback)
+  local command = { "gh", "issue", "create", "--title", title, "--body", body }
+  if repo and repo ~= "" then vim.list_extend(command, { "--repo", repo }) end
+  system_text_async(command, nil, cwd, function(result)
+    if result.code ~= 0 then
+      callback({ ok = false, message = result_error(result), code = result.code })
+      return
+    end
+
+    local url = vim.trim(result.stdout or result.output or "")
+    if url == "" then
+      callback({ ok = false, message = "gh issue create returned no issue URL", code = result.code })
+      return
+    end
+    callback({ ok = true, url = url })
+  end)
 end
 
 ---@param url string

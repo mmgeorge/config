@@ -3,7 +3,7 @@ return {
     "pwntester/octo.nvim",
     cmd = "Octo",
     init = function()
-      vim.api.nvim_create_user_command("GithubOpenPR", function()
+      vim.api.nvim_create_user_command("GithubPRCreate", function()
         require("github.open_pr").open()
       end, {
         desc = "Create a draft GitHub PR for the current branch",
@@ -23,23 +23,18 @@ return {
         desc = "Open GitHub blame for the current file or selected lines",
       })
 
-      vim.api.nvim_create_user_command("GithubIssuse", function()
-        require("github.pickers").issues()
+      vim.api.nvim_create_user_command("GithubIssue", function(opts)
+        require("github.pickers").issues(opts.args)
       end, {
-        desc = "Search GitHub issues involving me",
+        nargs = "*",
+        desc = "Search GitHub issues, or open [owner/repo] <number>",
       })
 
-      vim.api.nvim_create_user_command("GithubIssue", function()
-        require("github.pickers").issues()
+      vim.api.nvim_create_user_command("GithubIssueCreate", function(opts)
+        require("github.issue_create").open(opts.args)
       end, {
-        desc = "Search GitHub issues involving me",
-      })
-
-      vim.api.nvim_create_user_command("GithubIssueOpen", function(opts)
-        require("github.issue_view").open_command(opts.args)
-      end, {
-        nargs = "+",
-        desc = "Open a GitHub issue buffer",
+        nargs = "*",
+        desc = "Create a GitHub issue in the current repo",
       })
 
       vim.api.nvim_create_user_command("GithubIssueSync", function(opts)
@@ -54,10 +49,11 @@ return {
         desc = "Sync GitHub issues for the current repo into the local issue index",
       })
 
-      vim.api.nvim_create_user_command("GithubPR", function()
-        require("github.pickers").prs()
+      vim.api.nvim_create_user_command("GithubPR", function(opts)
+        require("github.pickers").prs(opts.args)
       end, {
-        desc = "Search my open GitHub PRs",
+        nargs = "*",
+        desc = "Search my open GitHub PRs, or open [owner/repo] <number>",
       })
 
       vim.api.nvim_create_user_command("GithubReview", function()

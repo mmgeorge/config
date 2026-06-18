@@ -68,7 +68,7 @@ gh.set_backend({
           id = "PR_kwTEST42",
           number = 42,
           title = "feat: create draft pr",
-          body = "Created by GithubOpenPR.",
+          body = "Created by GithubPRCreate.",
           url = created_pr_url,
           headRefName = "feature/current",
           headRefOid = "abc123456789",
@@ -110,7 +110,7 @@ package.loaded["ai"] = {
       ok = true,
       content = "```json\n" .. vim.json.encode({
         title = "feat: create draft pr",
-        body = "Created by GithubOpenPR.",
+        body = "Created by GithubPRCreate.",
       }) .. "\n```",
     })
   end,
@@ -154,7 +154,7 @@ vim.system = function(command, opts, callback)
     callback({ code = 0, stdout = "", stderr = "" })
     return
   end
-  if key == "gh\tpr\tcreate\t--draft\t--base\tmain\t--head\tfeature/current\t--title\tfeat: create draft pr\t--body\tCreated by GithubOpenPR." then
+  if key == "gh\tpr\tcreate\t--draft\t--base\tmain\t--head\tfeature/current\t--title\tfeat: create draft pr\t--body\tCreated by GithubPRCreate." then
     callback({ code = 0, stdout = created_pr_url .. "\n", stderr = "" })
     return
   end

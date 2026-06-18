@@ -10,9 +10,11 @@ local cache_root = vim.fs.joinpath(vim.fn.getcwd(), ".tmp-github-integration-tes
 local calls = {}
 local opened_urls = {}
 local captured_picker = nil
+local opened_pr_numbers = {}
 local original_snacks = _G.Snacks
 local original_picker_pick = original_snacks and original_snacks.picker and original_snacks.picker.pick
 local original_notify = vim.notify
+local original_diff_review = package.loaded["diff_review"]
 
 local function assert_true(condition, message)
   if not condition then error(message, 2) end
@@ -33,6 +35,7 @@ local function reset()
   calls = {}
   opened_urls = {}
   captured_picker = nil
+  opened_pr_numbers = {}
   notifications._reset_for_tests()
   repo_cache.remember_cwd_repo(vim.fn.getcwd(), "org/repo")
 end
@@ -184,6 +187,10 @@ function backend.system_async(command, _, callback, cwd)
     stdout = encoded_issue(12)
   elseif key:find("gh\tissue\tview\t34", 1, true) then
     stdout = encoded_issue(34)
+  elseif key:find("gh\tissue\tview\t99", 1, true) then
+    stdout = encoded_issue(99)
+  elseif key == "gh\tissue\tcreate\t--title\tCreated issue\t--body\t" then
+    stdout = "https://github.com/org/repo/issues/99\n"
   elseif key:find("gh\tpr\tview\t44", 1, true) or key:find("gh\tpr\tview\t45", 1, true) then
     stdout = encoded_pr(44)
   elseif key:find("gh\tapi\t/notifications", 1, true) then
@@ -277,6 +284,14 @@ Snacks.picker.pick = function(opts)
   captured_picker = opts
   return opts
 end
+package.loaded["diff_review"] = {
+  open_pr_number = function(number, opts)
+    opened_pr_numbers[#opened_pr_numbers + 1] = {
+      number = number,
+      opts = opts,
+    }
+  end,
+}
 
 local plugin_spec = require("plugins.github")[1]
 plugin_spec.init()
@@ -290,6 +305,7 @@ local function cleanup()
     _G.Snacks = nil
   end
   vim.notify = original_notify
+  package.loaded["diff_review"] = original_diff_review
   gh.reset_backend()
   issue_index._reset_for_test()
   repo_cache.set_data_dir_for_test(nil)
@@ -298,7 +314,7 @@ end
 
 local function run_tests()
   reset()
-  vim.cmd.GithubIssuse()
+  vim.cmd.GithubIssue()
   wait_for(function() return captured_picker ~= nil end, "issue picker did not open")
   assert_true(#calls == 0, "issue picker should use the synced index instead of gh search: " .. vim.inspect(calls))
   assert_true(#captured_picker.items == 1, "issue picker missing items")
@@ -328,6 +344,11 @@ local function run_tests()
   assert_true(calls[1].key:find("gh\tsearch\tprs\t--author\t@me", 1, true) ~= nil, "PR author search command was not used")
 
   reset()
+  vim.cmd("GithubPR 44")
+  assert_true(#opened_pr_numbers == 1, "GithubPR with a number did not open PR by number")
+  assert_true(opened_pr_numbers[1].number == "44", "GithubPR passed the wrong PR number")
+
+  reset()
   vim.cmd.GithubReview()
   wait_for(function() return captured_picker ~= nil end, "review picker did not open")
   assert_true(
@@ -336,8 +357,13 @@ local function run_tests()
   )
 
   reset()
-  vim.cmd("GithubIssueOpen 34")
-  wait_for(function() return find_line("#34 Fix command parser") ~= nil end, "GithubIssueOpen did not open issue buffer")
+  vim.cmd("GithubIssue 34")
+  wait_for(function() return find_line("#34 Fix command parser") ~= nil end, "GithubIssue with a number did not open issue buffer")
+
+  reset()
+  vim.cmd("GithubIssueCreate Created issue")
+  wait_for(function() return find_line("#99 Fix command parser") ~= nil end, "GithubIssueCreate did not open created issue")
+  assert_true(calls[1].key == "gh\tissue\tcreate\t--title\tCreated issue\t--body\t", "GithubIssueCreate did not create issue")
 
   reset()
   vim.cmd.GithubNotifications()

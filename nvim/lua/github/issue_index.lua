@@ -6,9 +6,12 @@ local in_flight = {}
 local snapshot_cache = {}
 local notified = {}
 local invalid_repos = {}
+local spinner = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
+local hostname_by_cwd = {}
 local runner_for_test = nil
 local gh_runner_for_test = nil
 local progress_enabled = true
+local notifier_failed = false
 
 local issue_query = table.concat({
   "query($owner:String!, $name:String!, $states:[IssueState!], $cursor:String) {",
@@ -18,7 +21,7 @@ local issue_query = table.concat({
   "      totalCount",
   "      pageInfo { hasNextPage endCursor }",
   "      nodes {",
-  "        number title state url createdAt updatedAt body",
+  "          number title state url createdAt updatedAt",
   "        labels(first:50) { nodes { name color description } }",
   "      }",
   "    }",
@@ -26,8 +29,28 @@ local issue_query = table.concat({
   "}",
 }, "\n")
 
+---@param message string
+---@param level any
+---@param opts table
+---@return boolean
+local function safe_notify(message, level, opts)
+  local function run()
+    if notifier_failed then return false end
+    local ok = pcall(vim.notify, message, level, opts)
+    if not ok then notifier_failed = true end
+    return ok
+  end
+
+  if vim.in_fast_event() then
+    vim.schedule(run)
+    return true
+  end
+
+  return run()
+end
+
 local function notify(message, level)
-  vim.notify(message, level or vim.log.levels.ERROR, { title = "GitHub Issues" })
+  safe_notify(message, level or vim.log.levels.ERROR, { title = "GitHub Issues" })
 end
 
 local function notify_once(key, message, level)
@@ -51,6 +74,49 @@ local function split_repo(repo)
   return owner, name
 end
 
+---@param value any
+---@return string?
+local function optional_string(value)
+  if value == nil or value == vim.NIL then return nil end
+  value = tostring(value)
+  return value ~= "" and value or nil
+end
+
+---@param value any
+---@return table
+local function optional_table(value)
+  return type(value) == "table" and value or {}
+end
+
+---@param hostname string?
+---@return string?
+local function normalize_hostname(hostname)
+  hostname = vim.trim(tostring(hostname or ""))
+  hostname = hostname:gsub("^https?://", ""):gsub("/.*$", "")
+  return hostname ~= "" and hostname or nil
+end
+
+---@param remote_url string?
+---@return string?
+local function remote_hostname(remote_url)
+  local url = vim.trim(tostring(remote_url or "")):gsub("%.git$", "")
+  local host = url:match("^git@([^:]+):")
+    or url:match("^ssh://git@([^/]+)/")
+    or url:match("^https?://([^/]+)/")
+  return normalize_hostname(host)
+end
+
+---@param remote_text string?
+---@return string?
+local function first_remote_hostname(remote_text)
+  for line in tostring(remote_text or ""):gmatch("[^\r\n]+") do
+    local url = line:match("%s([^%s]+)%s+%(") or line:match("^%S+%s+([^%s]+)")
+    local host = remote_hostname(url or line)
+    if host then return host end
+  end
+  return nil
+end
+
 local function issue_dir(repo)
   repo = normalize_repo(repo) or repo
   return vim.fs.joinpath(require("github.repo_cache").repo_dir(repo), "issues")
@@ -64,6 +130,51 @@ end
 function M.snapshot_path(repo)
   repo = normalize_repo(repo) or repo
   return vim.fs.joinpath(issue_dir(repo), "open-snapshot.json")
+end
+
+function M.log_path(repo)
+  repo = normalize_repo(repo) or repo
+  return vim.fs.joinpath(issue_dir(repo), "sync.log")
+end
+
+---@param value any
+---@return string
+local function log_value(value)
+  if value == vim.NIL then return "" end
+  if type(value) == "boolean" then return value and "true" or "false" end
+  if type(value) == "table" then value = vim.inspect(value) end
+  return tostring(value or ""):gsub("[\r\n\t]", " ")
+end
+
+---@param repo string?
+---@param event string
+---@param fields? table<string, any>
+local function log_sync(repo, event, fields)
+  repo = normalize_repo(repo)
+  if not repo or vim.g.github_issue_index_log == false then return end
+  if vim.in_fast_event() then
+    vim.schedule(function()
+      log_sync(repo, event, fields)
+    end)
+    return
+  end
+
+  local parts = {
+    os.date("!%Y-%m-%dT%H:%M:%SZ"),
+    event,
+  }
+  local keys = vim.tbl_keys(fields or {})
+  table.sort(keys)
+  for _, key in ipairs(keys) do
+    parts[#parts + 1] = key .. "=" .. log_value(fields[key])
+  end
+
+  local path = M.log_path(repo)
+  local ok_mkdir = pcall(vim.fn.mkdir, vim.fs.dirname(path), "p")
+  local ok_write, write_result = pcall(vim.fn.writefile, { table.concat(parts, "\t") }, path, "a")
+  if not (ok_mkdir and ok_write and write_result == 0) then
+    notify_once("sync-log:" .. repo, "Could not write GitHub issue sync log: " .. path, vim.log.levels.WARN)
+  end
 end
 
 local function executable_name()
@@ -85,12 +196,40 @@ function M.sidecar_path()
   return nil
 end
 
-local function system_text_async(command, input, cwd, callback)
+---@param command string[]
+---@param input string?
+---@param cwd string?
+---@param callback fun(result: table)
+---@param opts? { timeout_ms?: integer, label?: string, log_repo?: string }
+local function system_text_async(command, input, cwd, callback, opts)
   if runner_for_test then
     runner_for_test(command, input, callback, cwd)
     return
   end
-  local ok, process_or_error = pcall(vim.system, command, { text = true, stdin = input, cwd = cwd }, function(result)
+  opts = opts or {}
+  local timeout_ms = tonumber(opts.timeout_ms or 0) or 0
+  local label = opts.label or table.concat(command, " ")
+  local finished = false
+  local timer = nil
+  local process = nil
+  local started_at = vim.uv.now()
+
+  log_sync(opts.log_repo, "process:start", {
+    command = table.concat(command, " "),
+    cwd = cwd or "",
+    label = label,
+    stdin_bytes = #(input or ""),
+    timeout_ms = timeout_ms,
+  })
+
+  local function finish(result)
+    if finished then return end
+    finished = true
+    if timer then
+      timer:stop()
+      timer:close()
+      timer = nil
+    end
     vim.schedule(function()
       callback({
         code = result.code or 0,
@@ -99,11 +238,53 @@ local function system_text_async(command, input, cwd, callback)
         output = vim.trim((result.stdout or "") .. ((result.stdout or "") ~= "" and "\n" or "") .. (result.stderr or "")),
       })
     end)
+    log_sync(opts.log_repo, "process:finish", {
+      code = result.code or 0,
+      duration_ms = vim.uv.now() - started_at,
+      label = label,
+      stderr_bytes = #(result.stderr or ""),
+      stdout_bytes = #(result.stdout or ""),
+    })
+  end
+
+  local ok, process_or_error = pcall(function()
+    process = vim.system(command, { text = true, stdin = input, cwd = cwd }, function(result)
+      finish(result)
+    end)
+    log_sync(opts.log_repo, "process:spawned", {
+      label = label,
+      pid = process and process.pid or "",
+    })
   end)
   if not ok then
+    log_sync(opts.log_repo, "process:start-failed", {
+      label = label,
+      message = tostring(process_or_error),
+    })
     vim.schedule(function()
       callback({ code = -1, stdout = "", stderr = tostring(process_or_error), output = tostring(process_or_error) })
     end)
+    return
+  end
+
+  if timeout_ms > 0 then
+    timer = vim.uv.new_timer()
+    if timer then
+      timer:start(timeout_ms, 0, vim.schedule_wrap(function()
+        if finished then return end
+        if process then pcall(function() process:kill(15) end) end
+        log_sync(opts.log_repo, "process:timeout", {
+          duration_ms = vim.uv.now() - started_at,
+          label = label,
+          timeout_ms = timeout_ms,
+        })
+        finish({
+          code = -1,
+          stdout = "",
+          stderr = ("%s timed out after %ds"):format(label, math.floor(timeout_ms / 1000)),
+        })
+      end))
+    end
   end
 end
 
@@ -112,40 +293,82 @@ local function gh_text_async(command, input, cwd, callback)
     gh_runner_for_test(command, input, callback, cwd)
     return
   end
-  local ok, process_or_error = pcall(vim.system, command, { text = true, stdin = input, cwd = cwd }, function(result)
-    vim.schedule(function()
-      callback({
-        code = result.code or 0,
-        stdout = result.stdout or "",
-        stderr = result.stderr or "",
-        output = vim.trim((result.stdout or "") .. ((result.stdout or "") ~= "" and "\n" or "") .. (result.stderr or "")),
-      })
-    end)
-  end)
-  if not ok then
-    vim.schedule(function()
-      callback({ code = -1, stdout = "", stderr = tostring(process_or_error), output = tostring(process_or_error) })
-    end)
-  end
+  system_text_async(command, input, cwd, callback, {
+    label = "GitHub issue page request",
+    timeout_ms = 120000,
+  })
 end
 
-local function run_sidecar(args, input, cwd, callback)
-  local binary = runner_for_test and "github-issue-index" or M.sidecar_path()
-  if not binary then
-    callback({
-      ok = false,
-      message = "GitHub issue indexer is not built. Run: cargo build --manifest-path nvim/rust/github-issue-index/Cargo.toml --release",
-    })
+---@param cwd string?
+---@param callback fun(hostname?: string)
+local function resolve_hostname_async(cwd, callback)
+  local configured = normalize_hostname(vim.g.github_issue_index_hostname)
+  if configured then
+    callback(configured)
     return
   end
+
+  if gh_runner_for_test then
+    callback(nil)
+    return
+  end
+
+  local key = cwd or vim.fn.getcwd()
+  if hostname_by_cwd[key] ~= nil then
+    callback(hostname_by_cwd[key] ~= false and hostname_by_cwd[key] or nil)
+    return
+  end
+
+  system_text_async({ "git", "remote", "-v" }, nil, cwd, function(result)
+    local host = result.code == 0 and first_remote_hostname(result.stdout) or nil
+    hostname_by_cwd[key] = host or false
+    callback(host)
+  end, {
+    label = "GitHub remote hostname lookup",
+    timeout_ms = 10000,
+  })
+end
+
+local function run_sidecar_binary(binary, args, input, cwd, callback)
   local command = { binary }
   vim.list_extend(command, args)
+  local repo = nil
+  for index, arg in ipairs(args) do
+    if arg == "--repo" then
+      repo = args[index + 1]
+      break
+    end
+  end
   system_text_async(command, input, cwd, function(result)
     if result.code ~= 0 then
       callback({ ok = false, message = result.output ~= "" and result.output or ("issue indexer exited " .. tostring(result.code)) })
       return
     end
     callback({ ok = true, stdout = result.stdout })
+  end, {
+    label = "GitHub issue indexer " .. tostring(args[1] or "request"),
+    log_repo = repo,
+    timeout_ms = 60000,
+  })
+end
+
+local function run_sidecar(args, input, cwd, callback)
+  local binary = runner_for_test and "github-issue-index" or M.sidecar_path()
+  if binary then
+    run_sidecar_binary(binary, args, input, cwd, callback)
+    return
+  end
+
+  require("github.issue_index_builder").ensure(function(result)
+    if not result.ok or not result.path then
+      callback({
+        ok = false,
+        message = result.message
+          or "GitHub issue indexer is not built and auto-build did not return a binary path",
+      })
+      return
+    end
+    run_sidecar_binary(result.path, args, input, cwd, callback)
   end)
 end
 
@@ -325,69 +548,101 @@ function M.search(repo, query, opts)
   return items
 end
 
-local function progress_window_config(width, height)
-  return {
-    relative = "editor",
-    width = width,
-    height = height,
-    row = math.max(0, math.floor((vim.o.lines - height) / 2)),
-    col = math.max(0, math.floor((vim.o.columns - width) / 2)),
-    style = "minimal",
-    border = "rounded",
-    title = " GitHub Issues ",
-    title_pos = "center",
-  }
+---@param progress table?
+---@return string
+local function progress_message(progress)
+  if not progress then return "" end
+  local total = tonumber(progress.total or 0) or 0
+  local fetched = tonumber(progress.fetched or 0) or 0
+  local count = total > 0 and ("%d/%d"):format(fetched, total) or tostring(fetched)
+  local suffix = ""
+  if not progress.done and progress.waiting_since then
+    local elapsed = math.floor((vim.uv.now() - progress.waiting_since) / 1000)
+    if elapsed >= 10 then suffix = (" (%s %ds)"):format(progress.waiting_label or "waiting", elapsed) end
+  end
+  local phase = progress.phase or "loading issues"
+  if phase == "indexing issues" then return "Indexing issues " .. count .. suffix end
+  if phase == "writing snapshot" then return "Writing issue snapshot " .. count .. suffix end
+  if phase == "rate limited" then
+    return "Syncing issues paused " .. count .. (progress.message and progress.message ~= "" and (" — " .. progress.message) or "")
+  end
+  if progress.done then
+    return (progress.error and "Issue sync failed " or "Issues synced ") .. count
+  end
+  return "Syncing issues " .. count .. suffix
+end
+
+local stop_progress_timer
+
+---@param progress table?
+---@param level? integer
+local function render_progress(progress, level)
+  if not (progress and progress.active) then return end
+  local ok = safe_notify(progress_message(progress), level or "info", {
+    id = progress.id,
+    title = "GitHub Issues",
+    timeout = progress.done and progress.timeout or false,
+    opts = function(notif)
+      if progress.done then
+        notif.icon = progress.error and "✗" or "✓"
+        return
+      end
+      notif.icon = spinner[math.floor(vim.uv.hrtime() / (1e6 * 80)) % #spinner + 1]
+    end,
+  })
+  if ok == false then
+    log_sync(progress.repo, "notify:failed", {
+      phase = progress.phase or "",
+    })
+    progress.active = false
+    if stop_progress_timer then stop_progress_timer(progress) end
+  end
+end
+
+local function start_progress_timer(progress)
+  if not (progress and progress.active) or progress.timer then return end
+  local timer = vim.uv.new_timer()
+  if not timer then return end
+  progress.timer = timer
+  timer:start(0, 120, vim.schedule_wrap(function()
+    render_progress(progress)
+  end))
+end
+
+function stop_progress_timer(progress)
+  if not (progress and progress.timer) then return end
+  progress.timer:stop()
+  progress.timer:close()
+  progress.timer = nil
 end
 
 local function ensure_progress(repo, manual)
   if not progress_enabled then return nil end
   if progress_by_repo[repo] then return progress_by_repo[repo] end
-  if not manual and snapshot_stat(repo) then return nil end
-  local progress = { repo = repo, fetched = 0, total = nil, phase = "loading issues" }
-  local ok, buf = pcall(vim.api.nvim_create_buf, false, true)
-  if not ok then return nil end
-  progress.buf = buf
-  vim.bo[buf].buftype = "nofile"
-  vim.bo[buf].bufhidden = "wipe"
-  vim.bo[buf].swapfile = false
-  local width = 54
-  local height = 4
-  local win_ok, win = pcall(vim.api.nvim_open_win, buf, false, progress_window_config(width, height))
-  if win_ok then progress.win = win end
+  local progress = {
+    repo = repo,
+    fetched = 0,
+    total = nil,
+    phase = "loading issues",
+    id = "github_issue_index:" .. repo,
+    active = true,
+  }
   progress_by_repo[repo] = progress
   return progress
-end
-
-local function render_progress(progress)
-  if not (progress and progress.buf and vim.api.nvim_buf_is_valid(progress.buf)) then return end
-  local width = 24
-  local total = tonumber(progress.total or 0) or 0
-  local fetched = tonumber(progress.fetched or 0) or 0
-  local filled = total > 0 and math.min(width, math.floor((fetched / total) * width)) or 0
-  local bar = string.rep("=", filled) .. string.rep("-", width - filled)
-  local count = total > 0 and ("%d/%d"):format(fetched, total) or tostring(fetched)
-  local lines = {
-    progress.repo,
-    ("%s [%s] %s"):format(progress.phase or "loading issues", bar, count),
-    progress.message or "",
-    "Completion uses the latest local snapshot while this runs.",
-  }
-  pcall(vim.api.nvim_buf_set_lines, progress.buf, 0, -1, false, lines)
 end
 
 local function close_progress(repo, message, level)
   local progress = progress_by_repo[repo]
   progress_by_repo[repo] = nil
   if not progress then return end
-  if message then
-    progress.phase = message
-    progress.message = ""
-    render_progress(progress)
-  end
-  vim.defer_fn(function()
-    if progress.win and vim.api.nvim_win_is_valid(progress.win) then pcall(vim.api.nvim_win_close, progress.win, true) end
-    if progress.buf and vim.api.nvim_buf_is_valid(progress.buf) then pcall(vim.api.nvim_buf_delete, progress.buf, { force = true }) end
-  end, level == vim.log.levels.ERROR and 4000 or 1200)
+  stop_progress_timer(progress)
+  progress.done = true
+  progress.error = level == vim.log.levels.ERROR
+  progress.phase = message or progress.phase
+  progress.message = ""
+  progress.timeout = level == vim.log.levels.ERROR and 4000 or 1200
+  render_progress(progress, level)
+  progress.active = false
 end
 
 local function update_progress(progress, values)
@@ -395,6 +650,7 @@ local function update_progress(progress, values)
   for key, value in pairs(values or {}) do
     progress[key] = value
   end
+  start_progress_timer(progress)
   render_progress(progress)
 end
 
@@ -438,9 +694,9 @@ local function parse_graphql_issues(stdout, repo)
   end
   return {
     issues = issues,
-    page_info = issue_connection.pageInfo or {},
+    page_info = optional_table(issue_connection.pageInfo),
     total_count = issue_connection.totalCount,
-    rate_limit = decoded.data and decoded.data.rateLimit or {},
+    rate_limit = optional_table(decoded.data and decoded.data.rateLimit),
   }
 end
 
@@ -450,26 +706,54 @@ local function fetch_issue_page(cwd, repo, states, cursor, callback)
     callback({ ok = false, message = "Invalid GitHub repo: " .. tostring(repo) })
     return
   end
+  cursor = optional_string(cursor)
   local variables = {
     owner = owner,
     name = name,
     states = states,
   }
   if cursor and cursor ~= "" then variables.cursor = cursor end
-  gh_text_async({ "gh", "api", "graphql", "--input", "-" }, vim.json.encode({
-    query = issue_query,
-    variables = variables,
-  }), cwd, function(result)
-    if result.code ~= 0 then
-      callback({ ok = false, message = result.output ~= "" and result.output or ("gh exited " .. tostring(result.code)) })
-      return
-    end
-    local page, err = parse_graphql_issues(result.stdout, repo)
-    if not page then
-      callback({ ok = false, message = err or "GitHub issue sync failed" })
-      return
-    end
-    callback({ ok = true, page = page })
+  local started_at = vim.uv.now()
+  log_sync(repo, "gh:page:start", {
+    cursor = cursor or "",
+    states = table.concat(states or {}, ","),
+  })
+  resolve_hostname_async(cwd, function(hostname)
+    local command = { "gh", "api" }
+    if hostname then vim.list_extend(command, { "--hostname", hostname }) end
+    vim.list_extend(command, { "graphql", "--input", "-" })
+    gh_text_async(command, vim.json.encode({
+      query = issue_query,
+      variables = variables,
+    }), cwd, function(result)
+      log_sync(repo, "gh:page:finish", {
+        code = result.code,
+        duration_ms = vim.uv.now() - started_at,
+        hostname = hostname or "",
+        stderr_bytes = #(result.stderr or ""),
+        stdout_bytes = #(result.stdout or ""),
+      })
+      if result.code ~= 0 then
+        callback({ ok = false, message = result.output ~= "" and result.output or ("gh exited " .. tostring(result.code)) })
+        return
+      end
+      local page, err = parse_graphql_issues(result.stdout, repo)
+      if not page then
+        log_sync(repo, "gh:page:parse-failed", {
+          message = err or "GitHub issue sync failed",
+        })
+        callback({ ok = false, message = err or "GitHub issue sync failed" })
+        return
+      end
+      local page_info = page.page_info or {}
+      log_sync(repo, "gh:page:parsed", {
+        end_cursor = page_info.endCursor or "",
+        has_next_page = page_info.hasNextPage == true,
+        issue_count = #page.issues,
+        total_count = page.total_count or "",
+      })
+      callback({ ok = true, page = page })
+    end)
   end)
 end
 
@@ -488,6 +772,11 @@ local function is_repo_not_found_message(message)
 end
 
 local function write_snapshot(cwd, repo, callback)
+  local started_at = vim.uv.now()
+  log_sync(repo, "sidecar:snapshot:start", {
+    db = M.db_path(repo),
+    output = M.snapshot_path(repo),
+  })
   run_sidecar_json({
     "snapshot",
     "--db",
@@ -500,11 +789,27 @@ local function write_snapshot(cwd, repo, callback)
     M.snapshot_path(repo),
   }, nil, cwd, function(result)
     if result.ok then snapshot_cache[repo] = nil end
+    local stat = snapshot_stat(repo)
+    log_sync(repo, "sidecar:snapshot:finish", {
+      duration_ms = vim.uv.now() - started_at,
+      ok = result.ok == true,
+      output_size = stat and stat.size or "",
+      message = result.message or "",
+    })
     callback(result)
   end)
 end
 
 local function upsert_page(cwd, repo, scope, payload, callback)
+  local started_at = vim.uv.now()
+  local payload_json = vim.json.encode(payload)
+  log_sync(repo, "sidecar:upsert-page:start", {
+    completed = payload.completed == true,
+    cursor = payload.cursor or "",
+    issue_count = #(payload.issues or {}),
+    payload_bytes = #payload_json,
+    scope = scope,
+  })
   run_sidecar_json({
     "upsert-page",
     "--db",
@@ -513,12 +818,20 @@ local function upsert_page(cwd, repo, scope, payload, callback)
     repo,
     "--scope",
     scope,
-  }, vim.json.encode(payload), cwd, callback)
+  }, payload_json, cwd, function(result)
+    log_sync(repo, "sidecar:upsert-page:finish", {
+      duration_ms = vim.uv.now() - started_at,
+      ok = result.ok == true,
+      message = result.message or "",
+      upserted = result.value and result.value.upserted or "",
+    })
+    callback(result)
+  end)
 end
 
 local function state_cursor(state, scope)
-  if scope == "all" then return state.all_cursor end
-  return state.open_cursor
+  if scope == "all" then return optional_string(state.all_cursor) end
+  return optional_string(state.open_cursor)
 end
 
 local function historical_complete(state, scope)
@@ -527,8 +840,8 @@ local function historical_complete(state, scope)
 end
 
 local function high_water(state, scope)
-  if scope == "all" then return state.all_high_water end
-  return state.open_high_water
+  if scope == "all" then return optional_string(state.all_high_water) end
+  return optional_string(state.open_high_water)
 end
 
 local function checked_at(state, scope)
@@ -570,9 +883,24 @@ end
 
 local function sync_pages(context)
   local repo = context.repo
+  log_sync(repo, "sync:page:start", {
+    cursor = context.cursor or "",
+    fetched = context.fetched,
+    incremental = context.incremental == true,
+    total = context.total or "",
+  })
+  update_progress(context.progress, {
+    phase = context.incremental and "refreshing issues" or "loading issues",
+    waiting_label = "waiting for GitHub",
+    waiting_since = vim.uv.now(),
+  })
   fetch_issue_page(context.cwd, repo, context.states, context.cursor, function(result)
     if not result.ok then
       if is_rate_limit_message(result.message) then
+        log_sync(repo, "sync:rate-limited", {
+          message = result.message or "",
+          retry_ms = 60000,
+        })
         update_progress(context.progress, {
           phase = "rate limited",
           message = "Retrying in 60s: " .. tostring(result.message),
@@ -596,6 +924,8 @@ local function sync_pages(context)
       fetched = context.fetched,
       total = context.total,
       message = "",
+      waiting_label = nil,
+      waiting_since = nil,
     })
 
     local reached_high_water = false
@@ -609,6 +939,13 @@ local function sync_pages(context)
       end
     end
     local has_next_page = page_info.hasNextPage == true and not reached_high_water
+    log_sync(repo, "sync:page:fetched", {
+      fetched = context.fetched,
+      has_next_page = has_next_page,
+      issue_count = #issues,
+      reached_high_water = reached_high_water,
+      total = context.total or "",
+    })
     local payload = {
       issues = issues,
       cursor = has_next_page and page_info.endCursor or nil,
@@ -618,26 +955,48 @@ local function sync_pages(context)
       high_water = issues[1] and issues[1].updated_at or nil,
       checked_at = os.time(),
     }
+    update_progress(context.progress, {
+      phase = "indexing issues",
+      message = ("Writing page with %d issues"):format(#issues),
+      waiting_label = "indexing",
+      waiting_since = vim.uv.now(),
+    })
     upsert_page(context.cwd, repo, context.scope, payload, function(upsert_result)
       if not upsert_result.ok then
         sync_failed(context, upsert_result.message or "issue index upsert failed")
         return
       end
+      update_progress(context.progress, {
+        phase = "writing snapshot",
+        message = "Refreshing local completion snapshot",
+        waiting_label = "writing snapshot",
+        waiting_since = vim.uv.now(),
+      })
       write_snapshot(context.cwd, repo, function(snapshot_result)
         if not snapshot_result.ok then
           sync_failed(context, snapshot_result.message or "issue snapshot write failed")
           return
         end
+        update_progress(context.progress, {
+          phase = context.incremental and "refreshing issues" or "loading issues",
+          message = "",
+          waiting_label = nil,
+          waiting_since = nil,
+        })
         if has_next_page then
-          context.cursor = page_info.endCursor
+          context.cursor = optional_string(page_info.endCursor)
           local delay_ms = 150
-          local remaining = tonumber(page.rate_limit and page.rate_limit.remaining or nil)
+          local rate_limit = optional_table(page.rate_limit)
+          local remaining = tonumber(rate_limit.remaining)
           if remaining == 0 then
             delay_ms = 60000
+            log_sync(repo, "sync:rate-budget-empty", {
+              reset_at = rate_limit.resetAt or "",
+              retry_ms = delay_ms,
+            })
             update_progress(context.progress, {
               phase = "rate limited",
-              message = "Retrying in 60s"
-                .. (page.rate_limit and page.rate_limit.resetAt and ("; reset at " .. page.rate_limit.resetAt) or ""),
+              message = "Retrying in 60s" .. (rate_limit.resetAt and ("; reset at " .. rate_limit.resetAt) or ""),
             })
           end
           vim.defer_fn(function()
@@ -741,18 +1100,19 @@ function M._set_progress_enabled_for_test(enabled)
 end
 
 function M._reset_for_test()
+  for _, progress in pairs(progress_by_repo) do
+    stop_progress_timer(progress)
+  end
   progress_by_repo = {}
   in_flight = {}
   snapshot_cache = {}
   notified = {}
   invalid_repos = {}
+  hostname_by_cwd = {}
   runner_for_test = nil
   gh_runner_for_test = nil
   progress_enabled = true
-end
-
-function M._progress_window_config_for_test(width, height)
-  return progress_window_config(width, height)
+  notifier_failed = false
 end
 
 return M

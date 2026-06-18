@@ -652,7 +652,7 @@ local function run()
   vim.api.nvim_win_set_buf(0, status_buf)
   trigger_normal_mapping("ogp", find_row(status_buf, "Head:"))
   trigger_normal_mapping("y", 1)
-  assert_true(create_pr_count == 1, "accepting create prompt should start GithubOpenPR flow")
+  assert_true(create_pr_count == 1, "accepting create prompt should start GithubPRCreate flow")
   open_pr.open = original_open_pr
 
   reset_notifications()

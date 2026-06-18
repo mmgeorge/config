@@ -194,21 +194,4 @@ function M.open(opts)
   M.refresh()
 end
 
----@param args string
-function M.open_command(args)
-  local parts = vim.split(vim.trim(args or ""), "%s+", { trimempty = true })
-  if #parts == 0 then
-    vim.notify("Usage: GithubIssueOpen [owner/repo] <number>", vim.log.levels.ERROR, { title = "GitHub" })
-    return
-  end
-
-  local repo
-  local number = parts[1]
-  if #parts >= 2 then
-    repo = parts[1]
-    number = parts[2]
-  end
-  M.open({ kind = "issue", repo = repo, number = number })
-end
-
 return M

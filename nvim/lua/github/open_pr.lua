@@ -69,7 +69,7 @@ local function notify(message, level, opts)
 
   opts = vim.tbl_extend("force", {
     id = progress.id,
-    title = "GithubOpenPR",
+    title = "GithubPRCreate",
   }, opts or {})
   vim.notify(message, level or vim.log.levels.INFO, opts)
 end
@@ -380,7 +380,7 @@ local function confirm(lines, on_yes, on_no)
     row = math.floor((vim.o.lines - #body) / 2),
     style = "minimal",
     border = "rounded",
-    title = " GithubOpenPR ",
+    title = " GithubPRCreate ",
     title_pos = "center",
   })
 

@@ -4,7 +4,7 @@ local M = {}
 --- CodeCompanion adapter configs (the chat UI still runs on CodeCompanion).
 --- `commit`, `pr_create`, and `inline_edit` are model tokens for the local
 --- `ai` prompt library (see AGENTS.md in this directory): `commit` drives
---- commit-message generation, `pr_create` drives GithubOpenPR metadata, and
+--- commit-message generation, `pr_create` drives GithubPRCreate metadata, and
 --- `inline_edit` drives require("ai.inline").
 ---@return { chat: table|string, inline: table|string, cmd: string, commit: string, pr_create: string, inline_edit: string }
 function M.get()

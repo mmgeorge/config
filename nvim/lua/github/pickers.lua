@@ -7,6 +7,22 @@ local M = {}
 local issue_preview_cache = {}
 local issue_preview_request_id = 0
 
+---@class GithubPickerCommandTarget
+---@field repo? string
+---@field number string
+
+---@param args string?
+---@return GithubPickerCommandTarget?, string?
+local function parse_open_args(args)
+  local parts = vim.split(vim.trim(args or ""), "%s+", { trimempty = true })
+  if #parts == 0 then return nil, nil end
+  local number = #parts == 1 and parts[1] or parts[2]
+  if not number:match("^%d+$") then return nil, "Usage: [owner/repo] <number>" end
+  if #parts == 1 then return { number = number }, nil end
+  if #parts == 2 then return { repo = parts[1], number = number }, nil end
+  return nil, "Usage: [owner/repo] <number>"
+end
+
 ---@param value string?
 ---@return string[]
 local function markdown_lines(value)
@@ -184,7 +200,23 @@ local function load_and_pick(title, loader)
   end)
 end
 
-function M.issues()
+---@param args? string
+function M.issues(args)
+  local target, err = parse_open_args(args)
+  if err then
+    vim.notify("Usage: GithubIssue [owner/repo] <number>", vim.log.levels.ERROR, { title = "GitHub" })
+    return
+  end
+  if target then
+    require("github.issue_view").open({
+      kind = "issue",
+      repo = target.repo,
+      number = target.number,
+      cwd = vim.fn.getcwd(),
+    })
+    return
+  end
+
   local cwd = vim.fn.getcwd()
   local repo = repo_cache.completion_repo(0, cwd)
   if repo then
@@ -206,7 +238,21 @@ function M.issues()
   end)
 end
 
-function M.prs()
+---@param args? string
+function M.prs(args)
+  local target, err = parse_open_args(args)
+  if err then
+    vim.notify("Usage: GithubPR [owner/repo] <number>", vim.log.levels.ERROR, { title = "GitHub" })
+    return
+  end
+  if target then
+    require("diff_review").open_pr_number(target.number, {
+      repo = target.repo,
+      cwd = vim.fn.getcwd(),
+    })
+    return
+  end
+
   load_and_pick("My Open GitHub PRs", gh.search_open_prs_async)
 end
 

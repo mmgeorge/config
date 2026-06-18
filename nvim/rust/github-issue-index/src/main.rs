@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
 const ISSUES_TABLE: TableDefinition<&str, &str> = TableDefinition::new("issues");
@@ -89,6 +89,36 @@ struct IssueRecord {
     labels: Vec<LabelRecord>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct SnapshotIssueRecord {
+    repo: String,
+    number: u64,
+    title: String,
+    state: String,
+    url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    created_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    updated_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    labels: Vec<LabelRecord>,
+}
+
+impl From<IssueRecord> for SnapshotIssueRecord {
+    fn from(issue: IssueRecord) -> Self {
+        Self {
+            repo: issue.repo,
+            number: issue.number,
+            title: issue.title,
+            state: issue.state,
+            url: issue.url,
+            created_at: issue.created_at,
+            updated_at: issue.updated_at,
+            labels: issue.labels,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct PageInput {
     #[serde(default)]
@@ -146,7 +176,7 @@ struct SnapshotOutput {
     repo: String,
     state: String,
     issue_count: usize,
-    issues: Vec<IssueRecord>,
+    issues: Vec<SnapshotIssueRecord>,
 }
 
 fn main() -> Result<()> {
@@ -435,7 +465,7 @@ fn snapshot(database: &Database, repo: &str, state_filter: SnapshotState) -> Res
         if matches!(state_filter, SnapshotState::Open) && !issue.state.eq_ignore_ascii_case("open") {
             continue;
         }
-        records.push(issue);
+        records.push(SnapshotIssueRecord::from(issue));
     }
     records.sort_by(|left, right| {
         right
@@ -599,6 +629,11 @@ mod tests {
         let snapshot = snapshot(&database, "mmgeorge/test-repo", SnapshotState::Open)?;
         assert_eq!(snapshot.issue_count, 1);
         assert_eq!(snapshot.issues[0].number, 1);
+        let snapshot_json = serde_json::to_value(&snapshot)?;
+        assert!(
+            snapshot_json["issues"][0].get("body").is_none(),
+            "completion snapshot must not include issue bodies"
+        );
         assert!(read_state(&database, "mmgeorge/test-repo")?.open_historical_complete);
         let _ = fs::remove_file(db_path);
         Ok(())
