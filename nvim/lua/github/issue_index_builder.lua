@@ -128,7 +128,12 @@ local function start_build(callback)
     return
   end
 
-  local ok, process_or_error = pcall(vim.system, M.build_command(), { text = true, cwd = M.crate_dir() }, function(result)
+  local ok, process_or_error = pcall(vim.system, M.build_command(), {
+    text = true,
+    cwd = M.crate_dir(),
+    stdout = true,
+    stderr = true,
+  }, function(result)
     vim.schedule(function()
       callback({
         code = result.code or 0,

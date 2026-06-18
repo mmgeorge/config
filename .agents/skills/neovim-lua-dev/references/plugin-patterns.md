@@ -416,15 +416,31 @@ fallback immediately and upgrading the label after parsing completes.
 
 ### Async Git in UI Plugins
 
-Use `vim.system({ ... }, { text = true }, on_exit)` for Git/process calls from
-interactive plugin code. Avoid `vim.fn.system()`, `vim.fn.systemlist()`, and
+Use `vim.system({ ... }, { text = true, stdout = true, stderr = true }, on_exit)`
+for Git/process calls from interactive plugin code. Always request explicit
+stdout/stderr capture on Windows; MSYS/Cygwin children can otherwise emit
+`dtable::stdio_init: couldn't make stderr distinct from stdout` when a status UI
+starts background work. Avoid `vim.fn.system()`, `vim.fn.systemlist()`, and
 `vim.system(...):wait()` in render paths, keymaps, autocmds, cursor handlers, or
 anything that can run while the user is waiting for the editor.
+
+For executable checks, do not shell out through `which`:
+```lua
+-- BAD: spawns `which` and can leak MSYS/Cygwin stdio errors on Windows.
+local has_gpg = os.execute("which gpg") == 0
+
+-- GOOD: Neovim checks PATH directly.
+local has_gpg = vim.fn.executable("gpg") == 1
+```
 
 Process callbacks must schedule editor mutations back onto the main loop:
 
 ```lua
-vim.system({ "git", "-C", root, "status", "--short" }, { text = true }, function(result)
+vim.system({ "git", "-C", root, "status", "--short" }, {
+  text = true,
+  stdout = true,
+  stderr = true,
+}, function(result)
   vim.schedule(function()
     if result.code ~= 0 then
       vim.notify(result.stderr ~= "" and result.stderr or "git status failed", vim.log.levels.ERROR)
@@ -453,7 +469,7 @@ Every async refresh should have a monotonically increasing request id:
 ```lua
 state.request_id = (state.request_id or 0) + 1
 local request_id = state.request_id
-vim.system(cmd, { text = true }, function(result)
+vim.system(cmd, { text = true, stdout = true, stderr = true }, function(result)
   vim.schedule(function()
     if state.request_id ~= request_id then return end
     render(result)
@@ -505,7 +521,7 @@ The `@@ -old,count +new,count @@ context` header:
 ```lua
 vim.system(
   { "git", "-C", cwd, "apply", "--cached", "--whitespace=nowarn", "-" },
-  { text = true, stdin = patch_text .. "\n" },
+  { text = true, stdin = patch_text .. "\n", stdout = true, stderr = true },
   function(result)
     vim.schedule(function()
       if result.code ~= 0 then
@@ -529,7 +545,11 @@ but NO `@@` hunk header. Your parser must handle this case by checking
 `git diff --name-status` for files that have no hunks:
 
 ```lua
-vim.system({ "git", "-C", cwd, "diff", "--cached", "--name-status" }, { text = true }, function(result)
+vim.system({ "git", "-C", cwd, "diff", "--cached", "--name-status" }, {
+  text = true,
+  stdout = true,
+  stderr = true,
+}, function(result)
   vim.schedule(function()
     if result.code ~= 0 then return end
     for _, line in ipairs(vim.split(result.stdout or "", "\n", { plain = true })) do
@@ -887,3 +907,29 @@ after the queue becomes idle. Enqueuing another mutation must cancel the pending
 reconcile. While mutations are running or queued, suppress unrelated full status
 loads and async enrichment rerenders; the final debounced reconcile refreshes
 from Git once the burst has settled.
+
+### 13. Windows MSYS/Cygwin Stdio Leak On Status Startup
+
+**Bug**: Opening a status buffer on Windows prints a message like
+`dtable::stdio_init: couldn't make stderr distinct from stdout, Win32 error 6`.
+
+**Cause**: A startup-time child process was spawned with implicit stdio handling
+(`vim.system(..., { text = true })`). This often hides in adjacent metadata
+loaders, not the row renderer itself.
+
+**Fix**: Audit every subprocess started by the buffer open path, including
+plugin-spec setup and executable probes. Replace `os.execute("which ...")` with
+`vim.fn.executable(...)`; for real child processes use explicit capture
+everywhere:
+```lua
+vim.system(command, {
+  text = true,
+  stdout = true,
+  stderr = true,
+  stdin = input,
+  cwd = cwd,
+}, callback)
+```
+Preserve combined `stdout` and `stderr` in wrapper `output` fields so
+notifications keep the actionable error text. Add or update a regression test
+that checks startup commands request `stdout == true` and `stderr == true`.

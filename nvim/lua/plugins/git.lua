@@ -105,7 +105,7 @@ return {
           kind = "vsplit",
           -- kind = "tab",
           -- Can be set to true or false, otherwise we try to find the binary
-          verify_commit = os.execute("which gpg") == 0,
+          verify_commit = vim.fn.executable("gpg") == 1,
         },
         log_view = {
           kind = "tab",

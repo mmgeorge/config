@@ -35,7 +35,12 @@ function M.request(request, cb)
   end
   command[#command + 1] = request.url
 
-  local ok, process = pcall(vim.system, command, { text = true, stdin = request.body }, function(result)
+  local ok, process = pcall(vim.system, command, {
+    text = true,
+    stdin = request.body,
+    stdout = true,
+    stderr = true,
+  }, function(result)
     vim.schedule(function()
       local stdout = result.stdout or ""
       local body, status = stdout:match("^(.*)\n" .. status_marker .. "(%d+)%s*$")

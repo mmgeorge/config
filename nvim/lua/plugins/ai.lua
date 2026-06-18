@@ -144,7 +144,11 @@ end
 local pregen_debounce_timer = nil
 
 local function pregenerate_commit()
-  vim.system({ "git", "rev-parse", "--show-toplevel" }, { text = true }, function(result)
+  vim.system({ "git", "rev-parse", "--show-toplevel" }, {
+    text = true,
+    stdout = true,
+    stderr = true,
+  }, function(result)
     vim.schedule(function()
       if result.code ~= 0 then return end
       local root = vim.trim(result.stdout or "")

@@ -370,7 +370,13 @@ local function system_text_async(command, input, cwd, callback, opts)
   end
 
   local ok, process_or_error = pcall(function()
-    process = vim.system(command, { text = true, stdin = input, cwd = cwd }, function(result)
+    process = vim.system(command, {
+      text = true,
+      stdin = input,
+      cwd = cwd,
+      stdout = true,
+      stderr = true,
+    }, function(result)
       finish(result)
     end)
     log_sync(opts.log_repo, "process:spawned", {

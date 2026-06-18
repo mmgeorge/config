@@ -176,13 +176,18 @@ If diagnostics still look wrong, run the linter directly (e.g. `luacheck`,
   notification module with the underlying stderr/API/decode message. Never
   silently collapse a failed request into an empty list, no-op, stale cache, or
   endless loading state; tests should cover the notification path.
-- **Async processes:** prefer `vim.system({ ... }, { text = true }, cb)` for
-  plugin Git/process work. Do not call `vim.fn.system()`,
-  `vim.fn.systemlist()`, or `vim.system(...):wait()` from UI render paths,
-  keymaps, autocmds, or other interactive code. In callbacks, schedule any
-  editor API mutations with `vim.schedule()` / `vim.schedule_wrap()` and route
-  process start failures, nonzero exits, and stale-operation errors through
-  `vim.notify()` or the plugin's notification module.
+- **Async processes:** prefer `vim.system({ ... }, { text = true, stdout = true,
+  stderr = true }, cb)` for plugin Git/process work. Explicitly capture both
+  streams on Windows; otherwise MSYS/Cygwin children can leak
+  `dtable::stdio_init: couldn't make stderr distinct from stdout` during startup.
+  Do not call `vim.fn.system()`, `vim.fn.systemlist()`, or
+  `vim.system(...):wait()` from UI render paths, keymaps, autocmds, or other
+  interactive code. Never use `os.execute("which ...")` to check for tools; use
+  `vim.fn.executable("tool") == 1` so no shell process is spawned. In callbacks,
+  schedule any editor API mutations with
+  `vim.schedule()` / `vim.schedule_wrap()` and route process start failures,
+  nonzero exits, and stale-operation errors through `vim.notify()` or the
+  plugin's notification module.
 - **External CLI wrappers:** put each external process family behind a small
   module wrapper with typed LuaLS records and a mockable backend seam. UI modules
   should call wrappers such as `plugin.github.current_pr_async()` instead of

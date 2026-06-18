@@ -248,6 +248,8 @@ local function run(args, opts, callback)
   vim.system(args, {
     cwd = opts and opts.cwd or nil,
     text = true,
+    stdout = true,
+    stderr = true,
   }, function(result)
     vim.schedule(function()
       if result.code ~= 0 then

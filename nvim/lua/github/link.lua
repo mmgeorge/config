@@ -39,7 +39,12 @@ end
 ---@param cwd string?
 ---@param callback fun(ok: boolean, output: string)
 local function system_text_async(command, cwd, callback)
-  local ok, process_or_error = pcall(vim.system, command, { text = true, cwd = cwd }, function(result)
+  local ok, process_or_error = pcall(vim.system, command, {
+    text = true,
+    cwd = cwd,
+    stdout = true,
+    stderr = true,
+  }, function(result)
     vim.schedule(function()
       local stdout = result.stdout or ""
       local stderr = result.stderr or ""

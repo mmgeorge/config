@@ -25,7 +25,11 @@ local M = {}
 ---@param command string[]
 ---@param done fun(output: string)
 local function system_text(command, done)
-  local ok, process = pcall(vim.system, command, { text = true }, function(result)
+  local ok, process = pcall(vim.system, command, {
+    text = true,
+    stdout = true,
+    stderr = true,
+  }, function(result)
     vim.schedule(function()
       if result.code ~= 0 then
         local stderr = vim.trim(result.stderr or "")
