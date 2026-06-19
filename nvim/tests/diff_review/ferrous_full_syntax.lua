@@ -22,8 +22,8 @@ local function git_lines(args)
   return output
 end
 
-local full_unstaged_diff = git_lines({ "-c", "core.quotepath=false", "diff", "--no-color", "--no-ext-diff", "--unified=0" })
-local full_staged_diff = git_lines({ "-c", "core.quotepath=false", "diff", "--no-color", "--no-ext-diff", "--unified=0", "--cached" })
+local full_unstaged_diff = git_lines({ "-c", "core.quotepath=false", "diff", "--no-color", "--no-ext-diff", "--unified=3" })
+local full_staged_diff = git_lines({ "-c", "core.quotepath=false", "diff", "--no-color", "--no-ext-diff", "--unified=3", "--cached" })
 local full_unstaged_name_status = git_lines({ "diff", "--name-status" })
 local full_staged_name_status = git_lines({ "diff", "--cached", "--name-status" })
 local full_untracked = git_lines({ "ls-files", "--others", "--exclude-standard" })
@@ -43,10 +43,10 @@ function backend.systemlist(command)
   if key == "git\t-C\t" .. ferrous_root .. "\tls-files\t--others\t--exclude-standard" then return full_untracked, 0 end
   if key == "git\t-C\t" .. ferrous_root .. "\tdiff\t--cached\t--name-status" then return full_staged_name_status, 0 end
   if key == "git\t-C\t" .. ferrous_root .. "\tdiff\t--name-status" then return full_unstaged_name_status, 0 end
-  if key == "git\t-C\t" .. ferrous_root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0" then
+  if key == "git\t-C\t" .. ferrous_root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=3" then
     return full_unstaged_diff, 0
   end
-  if key == "git\t-C\t" .. ferrous_root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0\t--cached" then
+  if key == "git\t-C\t" .. ferrous_root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=3\t--cached" then
     return full_staged_diff, 0
   end
   if key == "git\t-C\t" .. ferrous_root .. "\tlog\t--no-color\t--format=%H%x09%h%x09%cI%x09%s\t-20" then return {}, 0 end
@@ -220,8 +220,19 @@ local function cell_at_text(buf, row, text)
     type(screen_pos) == "table" and tonumber(screen_pos.row) and tonumber(screen_pos.row) > 0,
     ("unable to resolve screen position for %q on row %d: %s"):format(text, row, vim.inspect(screen_pos))
   )
-  local ok, cell = pcall(vim.api.nvim__inspect_cell, 1, screen_pos.row - 1, screen_pos.col - 1)
-  assert_true(ok and type(cell) == "table" and type(cell[2]) == "table", "unable to inspect rendered screen cell")
+  local inspected_cell = nil
+  local inspected_ok = false
+  local expected_char = text:sub(1, 1)
+  for offset = -8, 40 do
+    local ok, cell = pcall(vim.api.nvim__inspect_cell, 1, screen_pos.row - 1, screen_pos.col - 1 + offset)
+    if ok and type(cell) == "table" and type(cell[2]) == "table" and cell[1] == expected_char then
+      inspected_ok = true
+      inspected_cell = cell
+      break
+    end
+  end
+  assert_true(inspected_ok and inspected_cell ~= nil, "unable to inspect rendered screen cell")
+  local cell = inspected_cell
   cell[2]._inspect_cell = cell
   return cell[2]
 end
@@ -329,7 +340,7 @@ local function first_model_store_code_row_with_plain_foreground(buf)
   for row = start_row, end_row do
     local line = lines[row] or ""
     local trimmed = vim.trim(line)
-    if trimmed ~= "" and trimmed ~= "..." and not trimmed:match("^@@") then
+    if trimmed ~= "" and trimmed ~= "..." and not trimmed:match("^@@") and not trimmed:match("^//") then
       local start_col, end_col = line:find("[%a_][%w_]*")
       if start_col then
         local token = line:sub(start_col, end_col)

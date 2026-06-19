@@ -108,10 +108,10 @@ function backend.systemlist(command)
   if key == "git\t-C\t" .. root .. "\tdiff\t--name-status" then
     return staged and {} or { "M\ta.txt", "M\tb.txt" }, 0
   end
-  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0" then
+  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=3" then
     return vim.split(staged and "" or unstaged_diff, "\n", { plain = true }), 0
   end
-  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0\t--cached" then
+  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=3\t--cached" then
     return vim.split(staged and staged_diff or "", "\n", { plain = true }), 0
   end
 

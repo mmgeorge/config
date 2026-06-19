@@ -12,20 +12,22 @@ local diff_text = table.concat({
   "index 1111111..2222222 100644",
   "--- a/src/model.rs",
   "+++ b/src/model.rs",
-  "@@ -3 +3 @@",
+  "@@ -1,10 +1,10 @@",
+  " pub fn build() {",
+  "   let bind_group = BindGroup {",
   "-    color_texture: color,",
   "+    color_texture: color.clone(),",
-  "@@ -4 +4 @@",
+  "     color_sampler: color_sampler.binding(),",
   "-    normal_texture: normal.clone(),",
   "+    normal_texture: normal,",
-  "@@ -5 +5 @@",
   "-    mode: OldMode,",
   "+    mode: NewMode,",
-  "@@ -6,2 +6,2 @@",
   "-    normal_texture: normal,",
   "-    roughness_metallic_texture: metallic_roughness,",
   "+    texture: normal.clone(),",
   "+    roughness_metallic_texture: metallic_roughness.clone(),",
+  "   };",
+  " }",
 }, "\n")
 
 ---@type DiffReviewGitBackend
@@ -50,10 +52,10 @@ function backend.systemlist(command)
   if key == "git\t-C\t" .. root .. "\tls-files\t--others\t--exclude-standard" then return {}, 0 end
   if key == "git\t-C\t" .. root .. "\tdiff\t--cached\t--name-status" then return {}, 0 end
   if key == "git\t-C\t" .. root .. "\tdiff\t--name-status" then return { "M\tsrc/model.rs" }, 0 end
-  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0" then
+  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=3" then
     return vim.split(diff_text, "\n", { plain = true }), 0
   end
-  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0\t--cached" then
+  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=3\t--cached" then
     return {}, 0
   end
   if key == "git\t-C\t" .. root .. "\tlog\t--no-color\t--format=%H%x09%h%x09%cI%x09%s\t-20" then return {}, 0 end
@@ -216,6 +218,7 @@ local function run()
     "pub fn build() {",
     "  let bind_group = BindGroup {",
     "    color_texture: color.clone(),",
+    "    color_sampler: color_sampler.binding(),",
     "    normal_texture: normal,",
     "    mode: NewMode,",
     "    texture: normal.clone(),",
@@ -243,6 +246,7 @@ local function run()
   trigger_normal_mapping("<Tab>", find_row(buf, "model.rs +5 -5"))
   wait_for(function()
     return buffer_contains(buf, "color_texture: color.clone()")
+      and buffer_contains(buf, "color_sampler: color_sampler.binding()")
       and buffer_contains(buf, "normal_texture: normal.clone()")
       and buffer_contains(buf, "mode: NewMode")
       and buffer_contains(buf, "roughness_metallic_texture: metallic_roughness.clone()")
@@ -268,10 +272,13 @@ local function run()
   assert_true(background_highlight_start_col(buf, normal_row, "DiffReviewModifyBg") == 0, "compact deletion background should start at column 0")
   assert_true(line_has_highlight(buf, normal_row, "DiffReviewInlineDeleteBg"), "deleted .clone() span was not highlighted")
   assert_true(line_has_gutter_chunk(buf, normal_row, "~", "DiffReviewModifyLineNr"), "compact deletion row should show a modify sign in the gutter")
-  assert_true(line_has_padded_gutter_chunk(buf, normal_row, "4", "DiffReviewModifyLineNr"), "compact deletion row should color the old line number as modified")
+  assert_true(line_has_padded_gutter_chunk(buf, normal_row, "5", "DiffReviewModifyLineNr"), "compact deletion row should color the old line number as modified")
   local normal_entry = diff_review._status.entries[normal_row]
   assert_true(normal_entry and normal_entry.diff_line and normal_entry.diff_line.prefix == "-", "compact deletion row should keep old primary diff line")
   assert_true(type(normal_entry.diff_lines) == "table" and #normal_entry.diff_lines == 2, "compact deletion row should keep both backing lines")
+
+  local sampler_row = find_row(buf, "color_sampler: color_sampler.binding()")
+  assert_true(color_row < sampler_row and sampler_row < normal_row, "merged hunk should keep internal bridge context\n" .. buffer_dump(buf))
 
   local old_mode_row = find_row_with_highlight(buf, "mode: OldMode", "DiffReviewDeleteBg")
   local new_mode_row = find_row_with_highlight(buf, "mode: NewMode", "DiffReviewAddBg")

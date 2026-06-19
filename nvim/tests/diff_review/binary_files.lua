@@ -115,10 +115,10 @@ function backend.systemlist(command)
   if key == "git\t-C\t" .. root .. "\tdiff\t--cached\t--name-status" then
     return name_status(state.staged_binary, "M"), 0
   end
-  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0" then
+  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=3" then
     return {}, 0
   end
-  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0\t--cached" then
+  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=3\t--cached" then
     return {}, 0
   end
 

@@ -61,14 +61,14 @@ function backend.systemlist(command)
   if key == "git\trev-parse\t--show-toplevel" then
     return { root }, 0
   end
-  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0\tsomebranch" then
+  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=3\tsomebranch" then
     branch_diff_requests = branch_diff_requests + 1
     return vim.split(branch_diff_text, "\n", { plain = true }), 0
   end
-  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0\tsomebranch\t--\tsrc/a.txt" then
+  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=3\tsomebranch\t--\tsrc/a.txt" then
     return vim.split(branch_diff_text, "\n", { plain = true }), 0
   end
-  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0\tmissingbranch" then
+  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=3\tmissingbranch" then
     return {}, 128
   end
   if key == "git\t-C\t" .. root .. "\trev-parse\t--short\tsomebranch" then

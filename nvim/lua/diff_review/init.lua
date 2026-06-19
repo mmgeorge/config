@@ -202,7 +202,7 @@ function M._git_diff_command(cwd, extra_args)
   local command = {
     "git", "-C", cwd,
     "-c", "core.quotepath=false",
-    "diff", "--no-color", "--no-ext-diff", "--unified=0",
+    "diff", "--no-color", "--no-ext-diff", "--unified=3",
   }
   for _, arg in ipairs(extra_args or {}) do
     command[#command + 1] = arg
@@ -216,7 +216,7 @@ end
 function M._git_show_diff_command(cwd, commit_oid)
   return {
     "git", "-C", cwd,
-    "show", "--format=", "--no-color", "--no-ext-diff", "--unified=0", commit_oid,
+    "show", "--format=", "--no-color", "--no-ext-diff", "--unified=3", commit_oid,
   }
 end
 M._pr_overview = {}
@@ -1774,6 +1774,39 @@ local function hunk_visible_source_lines(diff_lines)
   return visible
 end
 
+---@param hunk DiffReviewParsedHunk
+---@return fun(parsed_line: DiffReviewParsedHunkLine): boolean
+function M._hunk_render_line_filter(hunk)
+  local first_changed_position = nil
+  local last_changed_position = nil
+  for _, parsed_line in ipairs(hunk.lines or {}) do
+    if parsed_line.prefix == "+" or parsed_line.prefix == "-" then
+      first_changed_position = math.min(first_changed_position or parsed_line.position, parsed_line.position)
+      last_changed_position = math.max(last_changed_position or parsed_line.position, parsed_line.position)
+    end
+  end
+  if not first_changed_position or not last_changed_position then
+    return function() return true end
+  end
+  return function(parsed_line)
+    if parsed_line.prefix ~= " " then return true end
+    return parsed_line.position >= first_changed_position and parsed_line.position <= last_changed_position
+  end
+end
+
+---@param parsed_lines DiffReviewParsedHunkLine[]
+---@param include_line? fun(parsed_line: DiffReviewParsedHunkLine): boolean
+---@return table<string, boolean>
+function M._hunk_visible_parsed_source_lines(parsed_lines, include_line)
+  local visible = {}
+  for _, parsed_line in ipairs(parsed_lines or {}) do
+    if (not include_line or include_line(parsed_line)) and (parsed_line.prefix == " " or parsed_line.prefix == "+" or parsed_line.prefix == "-") then
+      visible[parsed_line.code] = true
+    end
+  end
+  return visible
+end
+
 ---@class DiffReviewGutterSpec
 ---@field width integer
 ---@field old_width integer
@@ -2232,6 +2265,7 @@ M._diff_items = {}
 
 -- Namespace for diff preview/status rendering
 M._ns = vim.api.nvim_create_namespace("diff_review_preview")
+M._diff_gutter_visual_ns = vim.api.nvim_create_namespace("diff_review_visual_gutter")
 M._empty_diff_rows = {}
 M._diff_line_content_lengths = {}
 
@@ -2270,6 +2304,7 @@ end
 ---@field gutter_col integer 0-based buffer column where the inline gutter starts
 ---@field gutter_width integer virtual columns occupied by the inline gutter
 ---@field content_length integer real buffer text length before visual highlight padding
+---@field virt_text table[]
 
 ---@param buf integer
 ---@param row integer 1-based
@@ -2292,11 +2327,169 @@ function M._diff_gutter_cursor_bounds(buf, row, namespace)
           gutter_col = col,
           gutter_width = width,
           content_length = content_length,
+          virt_text = details.virt_text,
         }
       end
     end
   end
   return nil
+end
+
+---@param chunks table[]?
+---@return table[]
+function M._diff_gutter_visual_chunks(chunks)
+  local visual_chunks = {}
+  for _, chunk in ipairs(chunks or {}) do
+    visual_chunks[#visual_chunks + 1] = { chunk[1] or "", "Visual" }
+  end
+  return visual_chunks
+end
+
+---@param chunks table[]?
+---@return string
+function M._diff_gutter_text(chunks)
+  local parts = {}
+  for _, chunk in ipairs(chunks or {}) do
+    parts[#parts + 1] = chunk[1] or ""
+  end
+  return table.concat(parts)
+end
+
+---@param mode? string
+---@return boolean
+function M._is_visual_mode(mode)
+  mode = mode or vim.api.nvim_get_mode().mode
+  return mode == "v" or mode == "V" or mode:byte() == 22
+end
+
+---@param buf integer
+function M._clear_diff_gutter_visual_overlay(buf)
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  pcall(vim.api.nvim_buf_clear_namespace, buf, M._diff_gutter_visual_ns, 0, -1)
+end
+
+---@param buf integer
+function M._clear_diff_gutter_visual_line(buf)
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  if M._diff_gutter_visual_line_yank_maps and M._diff_gutter_visual_line_yank_maps[buf] then
+    pcall(vim.keymap.del, "x", "<Space>l", { buffer = buf })
+    M._diff_gutter_visual_line_yank_maps[buf] = nil
+  end
+  M._clear_diff_gutter_visual_overlay(buf)
+end
+
+---@param buf integer
+function M._install_diff_gutter_visual_line_yank_maps(buf)
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  M._diff_gutter_visual_line_yank_maps = M._diff_gutter_visual_line_yank_maps or {}
+  if M._diff_gutter_visual_line_yank_maps[buf] then return end
+  M._diff_gutter_visual_line_yank_maps[buf] = true
+  vim.keymap.set("x", "<Space>l", function()
+    if M._yank_diff_gutter_visual_line(buf, "+") then return end
+    M._clear_diff_gutter_visual_line(buf)
+    vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Space>l", true, false, true), "m", false)
+  end, { buffer = buf, nowait = true, silent = true, desc = "Yank selection to clipboard" })
+end
+
+---@param buf integer
+---@return boolean
+function M._diff_gutter_visual_line_active(buf)
+  local selections = M._diff_gutter_visual_line_selections
+  if not (selections and selections[buf]) then return false end
+  if selections[buf] == "starting" then return true end
+  if M._is_visual_mode() then return true end
+  selections[buf] = nil
+  M._clear_diff_gutter_visual_line(buf)
+  return false
+end
+
+---@param buf integer
+---@return integer
+function M._diff_gutter_namespace(buf)
+  local status = M._status_states and M._status_states[buf] or nil
+  return status and M._status_ns or M._ns
+end
+
+---@param buf integer
+function M._refresh_diff_gutter_visual_line(buf)
+  if not M._diff_gutter_visual_line_active(buf) then return end
+  M._clear_diff_gutter_visual_overlay(buf)
+  local cursor_row = vim.api.nvim_win_get_cursor(0)[1]
+  local start_pos = vim.fn.getpos("v")
+  local start_row = start_pos and start_pos[2] or cursor_row
+  if start_row == 0 then start_row = cursor_row end
+  local first_row = math.min(start_row, cursor_row)
+  local last_row = math.max(start_row, cursor_row)
+  local namespace = M._diff_gutter_namespace(buf)
+  for row = first_row, last_row do
+    local bounds = M._diff_gutter_cursor_bounds(buf, row, namespace)
+    if bounds and bounds.virt_text then
+      pcall(vim.api.nvim_buf_set_extmark, buf, M._diff_gutter_visual_ns, row - 1, 0, {
+        virt_text = M._diff_gutter_visual_chunks(bounds.virt_text),
+        virt_text_pos = "overlay",
+        virt_text_win_col = bounds.gutter_col,
+        hl_mode = "replace",
+        priority = 250,
+      })
+    end
+  end
+end
+
+---@param buf integer
+function M._start_diff_gutter_visual_line(buf)
+  if not (buf and vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_get_current_buf() == buf) then return end
+  M._diff_gutter_visual_line_selections = M._diff_gutter_visual_line_selections or {}
+  M._diff_gutter_visual_line_selections[buf] = "starting"
+  M._install_diff_gutter_visual_line_yank_maps(buf)
+  local row = vim.api.nvim_win_get_cursor(0)[1]
+  vim.fn.setpos(".", { 0, row, 1, 0 })
+  vim.cmd("normal! V")
+  M._diff_gutter_visual_line_selections[buf] = true
+  M._refresh_diff_gutter_visual_line(buf)
+end
+
+---@param buf integer
+---@return string[]
+function M._diff_gutter_visual_line_text(buf)
+  local cursor_row = vim.api.nvim_win_get_cursor(0)[1]
+  local start_pos = vim.fn.getpos("v")
+  local start_row = start_pos and start_pos[2] or cursor_row
+  if start_row == 0 then start_row = cursor_row end
+  local first_row = math.min(start_row, cursor_row)
+  local last_row = math.max(start_row, cursor_row)
+  local namespace = M._diff_gutter_namespace(buf)
+  local lines = {}
+  for row = first_row, last_row do
+    local line = vim.api.nvim_buf_get_lines(buf, row - 1, row, false)[1] or ""
+    local bounds = M._diff_gutter_cursor_bounds(buf, row, namespace)
+    if bounds and bounds.virt_text then
+      lines[#lines + 1] = M._diff_gutter_text(bounds.virt_text) .. line:sub(1, bounds.content_length)
+    else
+      lines[#lines + 1] = line
+    end
+  end
+  return lines
+end
+
+---@param buf integer
+---@param register? string
+---@return boolean handled
+function M._yank_diff_gutter_visual_line(buf, register)
+  if not M._diff_gutter_visual_line_active(buf) then return false end
+  local lines = M._diff_gutter_visual_line_text(buf)
+  register = register or vim.v.register
+  if register == nil or register == "" then register = '"' end
+  vim.fn.setreg(register, lines, "V")
+  if register == '"' and vim.o.clipboard:find("unnamedplus", 1, true) then
+    pcall(vim.fn.setreg, "+", lines, "V")
+  end
+  if register == '"' and vim.o.clipboard:find("unnamed", 1, true) then
+    pcall(vim.fn.setreg, "*", lines, "V")
+  end
+  M._diff_gutter_visual_line_selections[buf] = nil
+  M._clear_diff_gutter_visual_line(buf)
+  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "nx", false)
+  return true
 end
 
 ---@param buf integer
@@ -2374,6 +2567,11 @@ function M._normalize_status_cursor(buf)
   M._cursor_normalizing = M._cursor_normalizing or {}
   if M._cursor_normalizing[buf] then return vim.api.nvim_win_get_cursor(0)[1] end
   M._cursor_normalizing[buf] = true
+  if M._diff_gutter_visual_line_active(buf) then
+    M._refresh_diff_gutter_visual_line(buf)
+    M._cursor_normalizing[buf] = nil
+    return vim.api.nvim_win_get_cursor(0)[1]
+  end
   local handled = M._align_diff_cursor(buf)
   if not handled then M._clamp_buffer_text_cursor(buf) end
   M._cursor_normalizing[buf] = nil
@@ -2562,13 +2760,16 @@ local function hunk_first_changed_current_line(hunk)
 end
 
 ---@param hunk DiffReviewParsedHunk
+---@param include_line? fun(parsed_line: DiffReviewParsedHunkLine): boolean
 ---@return integer
-function M._hunk_after_current_line(hunk)
+function M._hunk_after_current_line(hunk, include_line)
   local last_new_line = nil
   local saw_removed_line = false
   for _, parsed_line in ipairs(hunk.lines) do
-    if parsed_line.new_line then last_new_line = parsed_line.new_line end
-    if parsed_line.prefix == "-" then saw_removed_line = true end
+    if not include_line or include_line(parsed_line) then
+      if parsed_line.new_line then last_new_line = parsed_line.new_line end
+      if parsed_line.prefix == "-" then saw_removed_line = true end
+    end
   end
   if last_new_line then return last_new_line + 1 end
   if saw_removed_line then return hunk.new_start end
@@ -2576,11 +2777,12 @@ function M._hunk_after_current_line(hunk)
 end
 
 ---@param hunk DiffReviewParsedHunk
+---@param include_line? fun(parsed_line: DiffReviewParsedHunkLine): boolean
 ---@return table<integer, boolean>
-function M._hunk_current_line_set(hunk)
+function M._hunk_current_line_set(hunk, include_line)
   local lines = {}
   for _, parsed_line in ipairs(hunk.lines) do
-    if parsed_line.new_line then lines[parsed_line.new_line] = true end
+    if parsed_line.new_line and (not include_line or include_line(parsed_line)) then lines[parsed_line.new_line] = true end
   end
   return lines
 end
@@ -2610,11 +2812,12 @@ end
 ---@param parsed_line DiffReviewParsedHunkLine
 ---@param previous_visible_changed boolean
 ---@param context DiffReviewHunkTreeSitterContext|string?
+---@param visible_in_hunk? boolean
 ---@return boolean
-function M._hunk_hidden_closing_boundary_after_change(parsed_line, previous_visible_changed, context)
+function M._hunk_hidden_closing_boundary_after_change(parsed_line, previous_visible_changed, context, visible_in_hunk)
   if not previous_visible_changed then return false end
   if parsed_line.prefix ~= " " or type(context) ~= "table" then return false end
-  if hunk_line_visible_in_context_scope(parsed_line, context) then return false end
+  if visible_in_hunk and hunk_line_visible_in_context_scope(parsed_line, context) then return false end
   if not parsed_line.new_line then return false end
   return parsed_line.code:match("^%s*}%s*[,;]?%s*$") ~= nil
 end
@@ -2998,15 +3201,17 @@ end
 ---@param hunk DiffReviewParsedHunk
 ---@param context DiffReviewHunkTreeSitterContext|string?
 ---@param side "before"|"after"
+---@param occupied_lines? table<integer, boolean>
+---@param include_line? fun(parsed_line: DiffReviewParsedHunkLine): boolean
 ---@return DiffReviewHunkContextPaddingLine[]
-function M._hunk_context_padding_lines(source_lines, hunk, context, side)
+function M._hunk_context_padding_lines(source_lines, hunk, context, side, occupied_lines, include_line)
   if type(source_lines) ~= "table" or #source_lines == 0 then return {} end
-  local occupied_lines = M._hunk_current_line_set(hunk)
+  occupied_lines = occupied_lines or M._hunk_current_line_set(hunk)
   local padding_lines = {}
   local padding_limit = 3
   if type(context) == "table" then
     local changed_line = hunk_first_changed_current_line(hunk)
-    local after_line = M._hunk_after_current_line(hunk)
+    local after_line = M._hunk_after_current_line(hunk, include_line)
     local path_rows = side == "before" and context.path_start_rows or context.path_end_rows
     local candidates = {}
     for _, line_number in ipairs(path_rows or {}) do
@@ -3041,7 +3246,7 @@ function M._hunk_context_padding_lines(source_lines, hunk, context, side)
     first_line = math.max(1, changed_line - padding_limit)
     last_line = changed_line - 1
   else
-    first_line = M._hunk_after_current_line(hunk)
+    first_line = M._hunk_after_current_line(hunk, include_line)
     last_line = math.min(#source_lines, first_line + padding_limit - 1)
   end
 
@@ -3117,10 +3322,12 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
         { ("-%d"):format(hunk.removed), "DiffReviewDeleteRange" },
       }
 
-      local visible_hunk_lines = hunk_visible_source_lines(hunk.diff)
+      local include_render_line = M._hunk_render_line_filter(hunk)
+      local visible_hunk_lines = M._hunk_visible_parsed_source_lines(hunk.lines, include_render_line)
       local gutter = hunk.gutter
       local previous_visible_changed = false
       local source_lines = filename and M._file_source_lines(filename) or nil
+      local occupied_lines = M._hunk_current_line_set(hunk, include_render_line)
       local emitted_context_lines = {}
       local function add_context_padding_rows(padding_lines)
         for _, padding_line in ipairs(padding_lines) do
@@ -3142,7 +3349,9 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
           end
         end
       end
-      add_context_padding_rows(M._hunk_context_padding_lines(source_lines, hunk, raw_context, "before"))
+      add_context_padding_rows(
+        M._hunk_context_padding_lines(source_lines, hunk, raw_context, "before", occupied_lines, include_render_line)
+      )
       local render_items = nil
       if opts.compact_replacements then
         render_items = M._intraline_diff.compact_hunk_lines(hunk.lines)
@@ -3188,17 +3397,18 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
         local parsed_line = item.line or item.display_line
         local row_syntax, row_syntax_row = syntax_for_line(parsed_line)
         local visible_in_scope = hunk_line_visible_in_context_scope(parsed_line, raw_context)
+        local visible_in_hunk = include_render_line(parsed_line)
         if item.kind == "replacement" then
           ret[#ret + 1] = M._hunk_replacement_row(item, gutter, filename or block.file, row_syntax, row_syntax_row)
           for _, backing_line in ipairs(item.diff_lines or {}) do
             mark_emitted_context_line(backing_line)
           end
           previous_visible_changed = true
-        elseif visible_in_scope then
+        elseif visible_in_hunk and visible_in_scope then
           ret[#ret + 1] = hunk_body_row(parsed_line, gutter, filename or block.file, row_syntax, row_syntax_row)
           mark_emitted_context_line(parsed_line)
           previous_visible_changed = parsed_line.prefix == "+" or parsed_line.prefix == "-"
-        elseif M._hunk_hidden_closing_boundary_after_change(parsed_line, previous_visible_changed, raw_context) then
+        elseif M._hunk_hidden_closing_boundary_after_change(parsed_line, previous_visible_changed, raw_context, visible_in_hunk) then
           local boundary_segments = nil
           if row_syntax and row_syntax_row then
             boundary_segments = treesitter_line_segments(row_syntax.buf, row_syntax.tree, row_syntax.highlight_query, row_syntax_row, parsed_line.code)
@@ -3216,7 +3426,9 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
           advance_syntax_rows(parsed_line)
         end
       end
-      add_context_padding_rows(M._hunk_context_padding_lines(source_lines, hunk, raw_context, "after"))
+      add_context_padding_rows(
+        M._hunk_context_padding_lines(source_lines, hunk, raw_context, "after", occupied_lines, include_render_line)
+      )
       if opts.boundary_context and type(raw_context) == "table" then
         local node_start = raw_context.start_row + 1
         local node_end = raw_context.end_row + 1
@@ -3311,6 +3523,7 @@ local function render_highlight_rows(buf, ns, rows)
   M._empty_diff_rows[buf] = empty_diff_rows
   M._diff_line_content_lengths = M._diff_line_content_lengths or {}
   M._diff_line_content_lengths[buf] = content_lengths
+  M._clear_diff_gutter_visual_line(buf)
   vim.bo[buf].modifiable = true
   vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
@@ -4094,6 +4307,7 @@ local status_reconcile_delay_ms = 120
 local status_command_specs = {
   { id = "toggle", label = "toggle", desc = "Toggle fold", modes = "n", pinned = true, views = { status = true, pr = true, diff = true, review = true } },
   { id = "collapse_parent", label = "Collapse Parent", desc = "Collapse Parent", modes = "n", pinned = true, views = { status = true, pr = true, diff = true, review = true } },
+  { id = "visual_line_with_gutter", label = "select gutter", desc = "Start visual line selection including the diff gutter", modes = "n", pinned = false, views = { status = true, pr = true, diff = true, review = true } },
   { id = "stage", label = "stage", desc = "Stage hunk/file/selection", modes = { "n", "x" }, visual = true, pinned = true, views = { status = true } },
   { id = "unstage", label = "unstage", desc = "Unstage hunk/file/selection", modes = { "n", "x" }, visual = true, pinned = true, views = { status = true } },
   { id = "discard", label = "discard", desc = "Discard hunk/file/selection", modes = { "n", "x" }, visual = true, pinned = true, views = { status = true } },
@@ -4247,6 +4461,13 @@ local function attach_status_state(buf, state)
     end,
   })
   vim.api.nvim_create_autocmd("CursorMoved", {
+    buffer = buf,
+    callback = function()
+      M._normalize_status_cursor(buf)
+      if M._status_issues then M._status_issues.sync_modifiable(buf) end
+    end,
+  })
+  vim.api.nvim_create_autocmd("ModeChanged", {
     buffer = buf,
     callback = function()
       M._normalize_status_cursor(buf)
@@ -8144,6 +8365,7 @@ end
 local function status_set_plain_lines(buf, lines)
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
   if M._diff_line_content_lengths then M._diff_line_content_lengths[buf] = nil end
+  M._clear_diff_gutter_visual_line(buf)
   local was_rendering = vim.b[buf].diff_review_status_rendering
   vim.b[buf].diff_review_status_rendering = true
   vim.bo[buf].modifiable = true
@@ -8480,6 +8702,7 @@ local function status_render_loaded(buf, target_id, fallback_line, opts, head_li
   M._status.boundary_lines = {}
   M._diff_line_content_lengths = M._diff_line_content_lengths or {}
   M._diff_line_content_lengths[buf] = {}
+  M._clear_diff_gutter_visual_line(buf)
 
   local folded_head_parents = {}
   for _, head_line in ipairs(head_lines) do
@@ -14331,6 +14554,10 @@ local function setup_status_keymaps(buf)
   map("collapse_parent", "n", function()
     if M._status_states and M._status_states[buf] then M._status = M._status_states[buf] end
     M._status_collapse_parent()
+  end)
+
+  map("visual_line_with_gutter", "n", function()
+    M._start_diff_gutter_visual_line(buf)
   end)
 
   -- The review view gets its own action set (S/U/C/y/n/submit); the read-only

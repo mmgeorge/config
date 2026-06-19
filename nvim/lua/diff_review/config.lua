@@ -21,6 +21,7 @@
 ---@field refresh DiffReviewKeymap
 ---@field toggle DiffReviewKeymap
 ---@field collapse_parent DiffReviewKeymap
+---@field visual_line_with_gutter DiffReviewKeymap
 ---@field stage DiffReviewKeymap
 ---@field unstage DiffReviewKeymap
 ---@field discard DiffReviewKeymap
@@ -74,6 +75,7 @@ M.defaults = {
       refresh = "R",
       toggle = "<Tab>",
       collapse_parent = "N",
+      visual_line_with_gutter = "W",
       stage = "S",
       unstage = "U",
       discard = "j",
