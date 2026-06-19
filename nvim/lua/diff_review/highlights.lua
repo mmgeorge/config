@@ -8,6 +8,8 @@ function M.setup()
 
   local add_bg = "#002800"
   local del_bg = "#200000"
+  local modify_bg = "#2a1f00"
+  local modify_fg = "#ffb86c"
   local inline_add_bg = "#0b7b2a"
   local inline_del_bg = "#5a1010"
   local normal = vim.api.nvim_get_hl(0, { name = "Normal", link = false })
@@ -15,10 +17,12 @@ function M.setup()
 
   vim.api.nvim_set_hl(0, "DiffReviewAddBg", { bg = add_bg })
   vim.api.nvim_set_hl(0, "DiffReviewDeleteBg", { bg = del_bg })
+  vim.api.nvim_set_hl(0, "DiffReviewModifyBg", { bg = modify_bg })
   vim.api.nvim_set_hl(0, "DiffReviewInlineAddBg", { bg = inline_add_bg, nocombine = true })
   vim.api.nvim_set_hl(0, "DiffReviewInlineDeleteBg", { bg = inline_del_bg, nocombine = true })
   vim.api.nvim_set_hl(0, "DiffReviewAddLineNr", { fg = "#50fa7b", bg = add_bg, bold = true })
   vim.api.nvim_set_hl(0, "DiffReviewDeleteLineNr", { fg = "#ff5555", bg = del_bg, bold = true })
+  vim.api.nvim_set_hl(0, "DiffReviewModifyLineNr", { fg = modify_fg, bg = modify_bg, bold = true })
   vim.api.nvim_set_hl(0, "DiffReviewContextLineNr", { fg = "#555555" })
   vim.api.nvim_set_hl(0, "DiffReviewContextBg", {})
   vim.api.nvim_set_hl(0, "DiffReviewAddRange", { fg = "#50fa7b" })

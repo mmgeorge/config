@@ -129,24 +129,16 @@ function M.compact_hunk_lines(lines, opts)
       local add_count = add_end >= add_start and (add_end - add_start + 1) or 0
 
       if add_count == delete_count and add_count > 0 and add_count <= max_group_size then
-        local replacements = {}
-        local all_compact = true
         for offset = 0, delete_count - 1 do
-          local replacement = M.compact_pair(lines[delete_start + offset], lines[add_start + offset], opts)
+          local old_line = lines[delete_start + offset]
+          local new_line = lines[add_start + offset]
+          local replacement = M.compact_pair(old_line, new_line, opts)
           if replacement then
-            replacements[#replacements + 1] = replacement
-          else
-            all_compact = false
-            break
-          end
-        end
-        if all_compact then
-          for _, replacement in ipairs(replacements) do
             items[#items + 1] = replacement
+          else
+            items[#items + 1] = { kind = "line", line = old_line }
+            items[#items + 1] = { kind = "line", line = new_line }
           end
-        else
-          append_line_items(items, lines, delete_start, delete_end)
-          append_line_items(items, lines, add_start, add_end)
         end
       else
         append_line_items(items, lines, delete_start, delete_end)

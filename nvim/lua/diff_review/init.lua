@@ -1796,10 +1796,30 @@ local function hunk_gutter_chunks(gutter, old_line, new_line, sign, sign_hl, lin
   gutter = gutter or default_hunk_gutter_spec()
   local old_text = old_line and ("%" .. tostring(gutter.old_width) .. "d"):format(old_line) or string.rep(" ", gutter.old_width)
   local new_text = new_line and ("%" .. tostring(gutter.new_width) .. "d"):format(new_line) or string.rep(" ", gutter.new_width)
+  local old_hl = line_hl
+  if old_line then
+    if sign == "-" then
+      old_hl = changed_line_hl or sign_hl or "DiffReviewDeleteLineNr"
+    elseif sign == "~" then
+      old_hl = changed_line_hl or sign_hl or "DiffReviewModifyLineNr"
+    else
+      old_hl = "DiffReviewContextLineNr"
+    end
+  end
+  local new_hl = line_hl
+  if new_line then
+    if sign == "+" then
+      new_hl = changed_line_hl or sign_hl or "DiffReviewAddLineNr"
+    elseif sign == "~" then
+      new_hl = changed_line_hl or sign_hl or "DiffReviewModifyLineNr"
+    else
+      new_hl = "DiffReviewContextLineNr"
+    end
+  end
   local chunks = {}
-  chunks[#chunks + 1] = { old_text, old_line and (sign == "-" and (changed_line_hl or "DiffReviewDeleteLineNr") or "DiffReviewContextLineNr") or line_hl }
+  chunks[#chunks + 1] = { old_text, old_hl }
   chunks[#chunks + 1] = { "  ", line_hl }
-  chunks[#chunks + 1] = { new_text, new_line and (sign == "+" and (changed_line_hl or "DiffReviewAddLineNr") or "DiffReviewContextLineNr") or line_hl }
+  chunks[#chunks + 1] = { new_text, new_hl }
   chunks[#chunks + 1] = { "  ", line_hl }
   chunks[#chunks + 1] = { sign or " ", sign_hl or line_hl }
   chunks[#chunks + 1] = { " ", line_hl }
@@ -2917,15 +2937,8 @@ end
 function M._hunk_replacement_row(replacement, gutter, file, syntax, syntax_row)
   local display_line = replacement.display_line
   local backing_lines = replacement.diff_lines or { display_line }
-  local sign_hl = nil
-  local line_hl = nil
-  if display_line.prefix == "+" then
-    sign_hl = "DiffReviewAddLineNr"
-    line_hl = "DiffReviewAddBg"
-  elseif display_line.prefix == "-" then
-    sign_hl = "DiffReviewDeleteLineNr"
-    line_hl = "DiffReviewDeleteBg"
-  end
+  local sign_hl = "DiffReviewModifyLineNr"
+  local line_hl = "DiffReviewModifyBg"
   local row = {
     diff_review_bg_hl = line_hl,
     diff_review_inline_highlights = replacement.inline_spans or {},
@@ -2940,7 +2953,7 @@ function M._hunk_replacement_row(replacement, gutter, file, syntax, syntax_row)
   }
   local old_line = replacement.old_lines and replacement.old_lines[1] and replacement.old_lines[1].old_line or display_line.old_line
   local new_line = replacement.new_lines and replacement.new_lines[1] and replacement.new_lines[1].new_line or display_line.new_line
-  hunk_add_gutter(row, gutter, old_line, new_line, display_line.prefix, sign_hl, line_hl)
+  hunk_add_gutter(row, gutter, old_line, new_line, "~", sign_hl, line_hl, sign_hl)
   local segments = nil
   if syntax and syntax_row then
     segments = treesitter_line_segments(syntax.buf, syntax.tree, syntax.highlight_query, syntax_row, display_line.code)
