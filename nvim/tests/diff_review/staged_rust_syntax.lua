@@ -539,19 +539,37 @@ local function assert_model_store_secondary_scope_boundary(buf)
   local new_header_row = find_row(buf, "@@ +13 -3")
   local new_function_row = find_row(buf, "pub fn new(context: &gpu::Context) -> Self {")
   local lines = vim.api.nvim_buf_get_lines(buf, debug_info_row, new_function_row - 1, false)
-  local saw_ellipsis = false
+  local saw_ellipsis_before_closing_brace = false
   local saw_closing_brace = false
   for _, line in ipairs(lines) do
-    if line:match("^%s*%.%.%.%s*$") then saw_ellipsis = true end
-    if line:match("^%s*}%s*$") then saw_closing_brace = true end
+    if line:match("^%s*}%s*$") then
+      saw_closing_brace = true
+      break
+    end
+    if line:match("^%s*%.%.%.%s*$") then saw_ellipsis_before_closing_brace = true end
   end
   assert_true(
-    saw_ellipsis and saw_closing_brace,
+    saw_closing_brace,
     "model_store.rs hunk cut off ParticleModelDrawCommand before ModelStore.new\n" .. buffer_dump(buf)
+  )
+  assert_true(
+    not saw_ellipsis_before_closing_brace,
+    "model_store.rs should not render an ellipsis before an adjacent closing brace\n" .. buffer_dump(buf)
   )
   assert_true(
     new_header_row < new_function_row,
     "model_store.rs should render hunk header before its scope boundary\n" .. buffer_dump(buf)
+  )
+end
+
+local function assert_model_store_same_parent_neighbor_context(buf)
+  local primitives_row = find_row(buf, "pub primitives: PrimitiveMeshStore")
+  local materials_row = find_row(buf, "pub materials: PbMaterials")
+  local bind_group_row = find_row(buf, "pub bind_group: gpu::BindGroup<shaders::model::render::BindGroup1Descriptor>")
+  local particle_bind_group_row = find_row(buf, "pub particle_bind_group: gpu::BindGroup<shaders::model::particle_render::BindGroup1Descriptor>")
+  assert_true(
+    primitives_row < materials_row and materials_row < bind_group_row and bind_group_row < particle_bind_group_row,
+    "model_store.rs should render same-parent field neighbors before the changed field\n" .. buffer_dump(buf)
   )
 end
 
@@ -922,6 +940,7 @@ local function run()
       .. buffer_dump(buf)
   end)
   assert_model_store_secondary_scope_boundary(buf)
+  assert_model_store_same_parent_neighbor_context(buf)
 
   local particle_bind_group_row = find_row(buf, "pub particle_bind_group")
   assert_true(

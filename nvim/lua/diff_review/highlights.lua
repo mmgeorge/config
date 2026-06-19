@@ -10,8 +10,8 @@ function M.setup()
   local del_bg = "#200000"
   local modify_bg = "#2a1f00"
   local modify_fg = "#ffb86c"
-  local inline_add_bg = "#0b7b2a"
-  local inline_del_bg = "#5a1010"
+  local inline_add_bg = "#0b6b2a"
+  local inline_del_bg = "#6a1010"
   local normal = vim.api.nvim_get_hl(0, { name = "Normal", link = false })
   local header_fg = normal.fg or "#c0c0c0"
 

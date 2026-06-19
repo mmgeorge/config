@@ -30,6 +30,19 @@ local diff_text = table.concat({
   " }",
 }, "\n")
 
+local old_file_lines = {
+  "pub fn build() {",
+  "  let bind_group = BindGroup {",
+  "    color_texture: color,",
+  "    color_sampler: color_sampler.binding(),",
+  "    normal_texture: normal.clone(),",
+  "    mode: OldMode,",
+  "    normal_texture: normal,",
+  "    roughness_metallic_texture: metallic_roughness,",
+  "  };",
+  "}",
+}
+
 ---@type DiffReviewGitBackend
 local backend = {}
 
@@ -59,6 +72,7 @@ function backend.systemlist(command)
     return {}, 0
   end
   if key == "git\t-C\t" .. root .. "\tlog\t--no-color\t--format=%H%x09%h%x09%cI%x09%s\t-20" then return {}, 0 end
+  if key == "git\t-C\t" .. root .. "\tshow\t:0:src/model.rs" then return old_file_lines, 0 end
   return {}, 1
 end
 
@@ -211,6 +225,42 @@ local function trigger_normal_mapping(key, row)
   mapping.callback()
 end
 
+local function column_for_text(buf, row, text)
+  local line = vim.api.nvim_buf_get_lines(buf, row - 1, row, false)[1] or ""
+  local start_col = line:find(text, 1, true)
+  assert_true(start_col ~= nil, "missing text " .. text .. " on row " .. row .. ": " .. line)
+  return start_col - 1
+end
+
+local function trigger_open_mapping_at(buf, row, text)
+  vim.api.nvim_win_set_buf(0, buf)
+  vim.api.nvim_win_set_cursor(0, { row, column_for_text(buf, row, text) })
+  local mapping = vim.fn.maparg("<CR>", "n", false, true)
+  assert_true(type(mapping.callback) == "function", "missing normal mapping for <CR>")
+  mapping.callback()
+end
+
+local function assert_current_file_opened(expected_line, expected_text)
+  local name = vim.fs.normalize(vim.api.nvim_buf_get_name(0))
+  assert_true(name == vim.fs.normalize(root .. "/src/model.rs"), "expected current file, got " .. name)
+  local cursor = vim.api.nvim_win_get_cursor(0)
+  assert_true(cursor[1] == expected_line, "expected current file line " .. expected_line .. ", got " .. cursor[1])
+  local line = vim.api.nvim_buf_get_lines(0, expected_line - 1, expected_line, false)[1] or ""
+  assert_true(line == expected_text, "expected current line text " .. expected_text .. ", got " .. line)
+end
+
+local function assert_old_revision_opened(expected_line, expected_text)
+  local name = vim.api.nvim_buf_get_name(0)
+  assert_true(
+    name:find("GitFileRevision://src/model.rs@abc1234", 1, true) ~= nil,
+    "expected old revision buffer, got " .. name
+  )
+  local cursor = vim.api.nvim_win_get_cursor(0)
+  assert_true(cursor[1] == expected_line, "expected old revision line " .. expected_line .. ", got " .. cursor[1])
+  local line = vim.api.nvim_buf_get_lines(0, expected_line - 1, expected_line, false)[1] or ""
+  assert_true(line == expected_text, "expected old line text " .. expected_text .. ", got " .. line)
+end
+
 local function run()
   vim.fn.delete(root, "rf")
   assert_true(vim.fn.mkdir(root .. "/src", "p") == 1, "mkdir failed")
@@ -266,6 +316,11 @@ local function run()
   local color_entry = diff_review._status.entries[color_row]
   assert_true(color_entry and color_entry.diff_line and color_entry.diff_line.prefix == "+", "compact insertion row should keep new primary diff line")
   assert_true(type(color_entry.diff_lines) == "table" and #color_entry.diff_lines == 2, "compact insertion row should keep both backing lines")
+  assert_true(type(color_entry.inline_jump_spans) == "table" and #color_entry.inline_jump_spans == 1, "compact insertion row should expose one inline jump span")
+  trigger_open_mapping_at(buf, color_row, ".clone")
+  assert_current_file_opened(3, "    color_texture: color.clone(),")
+  trigger_open_mapping_at(buf, color_row, "color_texture")
+  assert_old_revision_opened(3, "    color_texture: color,")
 
   local normal_row = find_row(buf, "normal_texture: normal.clone()")
   assert_true(line_has_background_highlight(buf, normal_row, "DiffReviewModifyBg"), "compact deletion row should use full modify background")
@@ -276,6 +331,11 @@ local function run()
   local normal_entry = diff_review._status.entries[normal_row]
   assert_true(normal_entry and normal_entry.diff_line and normal_entry.diff_line.prefix == "-", "compact deletion row should keep old primary diff line")
   assert_true(type(normal_entry.diff_lines) == "table" and #normal_entry.diff_lines == 2, "compact deletion row should keep both backing lines")
+  assert_true(type(normal_entry.inline_jump_spans) == "table" and #normal_entry.inline_jump_spans == 1, "compact deletion row should expose one inline jump span")
+  trigger_open_mapping_at(buf, normal_row, ".clone")
+  assert_old_revision_opened(5, "    normal_texture: normal.clone(),")
+  trigger_open_mapping_at(buf, normal_row, "normal_texture")
+  assert_current_file_opened(5, "    normal_texture: normal,")
 
   local sampler_row = find_row(buf, "color_sampler: color_sampler.binding()")
   assert_true(color_row < sampler_row and sampler_row < normal_row, "merged hunk should keep internal bridge context\n" .. buffer_dump(buf))

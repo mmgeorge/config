@@ -193,6 +193,15 @@ local function trigger_normal_mapping(key, row)
   mapping.callback()
 end
 
+local function assert_current_file_jump(expected_file, expected_line, expected_text)
+  local actual_file = vim.fs.normalize(vim.api.nvim_buf_get_name(0))
+  assert_true(actual_file == vim.fs.normalize(expected_file), "expected current file " .. expected_file .. ", got " .. actual_file)
+  local cursor = vim.api.nvim_win_get_cursor(0)
+  assert_true(cursor[1] == expected_line, "expected line " .. expected_line .. ", got " .. cursor[1])
+  local line = vim.api.nvim_buf_get_lines(0, expected_line - 1, expected_line, false)[1] or ""
+  assert_true(line == expected_text, "expected line text " .. expected_text .. ", got " .. line)
+end
+
 local function system_call_count()
   local count = 0
   for _, call in ipairs(calls) do
@@ -362,6 +371,9 @@ local function run()
   trigger_normal_mapping("S", boundary_row)
   vim.wait(50)
   assert_true(system_call_count() == before, "boundary row triggered a stage action")
+  trigger_normal_mapping("<CR>", boundary_row)
+  assert_current_file_jump(root .. "/src/engine.rs", 10, "  pub fn new(bridge: Bridge) -> Self {")
+  vim.api.nvim_win_set_buf(0, buf)
 
   trigger_normal_mapping("<Tab>", find_row(buf, "@@ +1 -1"))
   local collapsed_lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
@@ -400,6 +412,9 @@ local function run()
   assert_true(not contains_line(material_lines, "self.materials.insert"), "ancestor-path padding included a previous sibling statement")
   assert_true(not contains_line(material_lines, "use {"), "ancestor-path padding included the file root opener")
   assert_true(not contains_line(material_lines, "impl ModelStore {"), "ancestor-path padding included a parent outside the selected scope")
+  trigger_normal_mapping("<CR>", bind_group_row)
+  assert_current_file_jump(root .. "/src/material.rs", 20, "    let bind_group = context.create_bind_group(shaders::model::render::BindGroup1Descriptor {")
+  vim.api.nvim_win_set_buf(0, buf)
   trigger_normal_mapping("S", bind_group_row)
   vim.wait(50)
   assert_true(system_call_count() == before, "ancestor opener padding row triggered a stage action")
