@@ -120,6 +120,34 @@ local shifted_old_line_diff = table.concat({
 
 local unstaged_shifted_old_line_diff = shifted_old_line_diff:gsub("src/multi_hunk%.rs", "src/unstaged_multi_hunk.rs")
 
+local semantic_region_diff = table.concat({
+  "diff --git a/src/semantic_regions.rs b/src/semantic_regions.rs",
+  "index 5555555..6666666 100644",
+  "--- a/src/semantic_regions.rs",
+  "+++ b/src/semantic_regions.rs",
+  "@@ -1,12 +1,21 @@",
+  " impl ModelStore {",
+  "   pub fn new(context: &gpu::Context) -> Self {",
+  "     let bind_group = context.create_bind_group(shaders::model::render::BindGroup1Descriptor {",
+  "-      color_texture: color,",
+  "+      color_texture: color.clone(),",
+  "     });",
+  "+    let particle_bind_group =",
+  "+      context.create_bind_group(shaders::model::particle_render::BindGroup1Descriptor {",
+  "+        color_texture: color,",
+  "+      });",
+  "   }",
+  " ",
+  "   pub fn insert(&mut self, model: &Model, repository: &ModelRepository) {",
+  "+    let particle_bind_group =",
+  "+      context.create_bind_group(shaders::model::particle_render::BindGroup1Descriptor {",
+  "+        color_texture: color,",
+  "+      });",
+  "     for mesh in model.mesh_iter() {",
+  "       let _ = mesh;",
+  "     }",
+}, "\n")
+
 local ferrous_model_store_diff = table.concat({
   "diff --git a/blue/engine/plugins/model/src/pbr/model_store.rs b/blue/engine/plugins/model/src/pbr/model_store.rs",
   "index 861a6248..9c10261a 100644",
@@ -217,7 +245,7 @@ local ferrous_model_store_diff = table.concat({
 }, "\n")
 
 local staged_diff = particle_system_diff .. "\n" .. sparse_fragment_diff .. "\n" .. shifted_old_line_diff
-local unstaged_diff = ferrous_model_store_diff .. "\n" .. unstaged_shifted_old_line_diff
+local unstaged_diff = ferrous_model_store_diff .. "\n" .. unstaged_shifted_old_line_diff .. "\n" .. semantic_region_diff
 
 local ferrous_name_status_lines = {
   "M\tblue/apps/app-browser/src/physics/drop3d.rs",
@@ -241,6 +269,7 @@ local ferrous_name_status_lines = {
   "M\tblue/engine/shaders/model/lighting/material.slang",
   "M\tblue/engine/shaders/model/render.entry.slang",
   "M\tblue/engine/shaders/physics/particle.slang",
+  "M\tsrc/semantic_regions.rs",
 }
 
 ---@type DiffReviewGitBackend
@@ -311,6 +340,14 @@ local function find_row(buf, pattern)
     if line:find(pattern, 1, true) then return index end
   end
   error("missing row: " .. pattern .. "\n" .. table.concat(lines, "\n"), 2)
+end
+
+local function find_row_after(buf, pattern, after_row)
+  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  for index = after_row + 1, #lines do
+    if lines[index]:find(pattern, 1, true) then return index end
+  end
+  error("missing row after " .. tostring(after_row) .. ": " .. pattern .. "\n" .. table.concat(lines, "\n"), 2)
 end
 
 local function line_has_highlight(buf, row, hl_group)
@@ -455,6 +492,13 @@ local function wait_for(condition, message)
   error(message, 2)
 end
 
+local function semantic_context_ready()
+  for key, value in pairs(diff_review._ts_context_cache or {}) do
+    if key:find("semantic_regions.rs", 1, true) and type(value) == "table" and not value.pending then return true end
+  end
+  return false
+end
+
 local function trigger_normal_mapping(key, row)
   vim.api.nvim_win_set_cursor(0, { row, 0 })
   local mapping = vim.fn.maparg(key, "n", false, true)
@@ -570,6 +614,15 @@ local function assert_model_store_same_parent_neighbor_context(buf)
   assert_true(
     primitives_row < materials_row and materials_row < bind_group_row and bind_group_row < particle_bind_group_row,
     "model_store.rs should render same-parent field neighbors before the changed field\n" .. buffer_dump(buf)
+  )
+end
+
+local function assert_semantic_region_parent_context(buf)
+  local insert_header_row = find_row(buf, "pub fn insert(&mut self, model: &Model, repository: &ModelRepository) {")
+  local insert_particle_row = find_row_after(buf, "let particle_bind_group =", insert_header_row)
+  assert_true(
+    insert_header_row < insert_particle_row,
+    "semantic_regions.rs should render insert() parent before its changed block\n" .. buffer_dump(buf)
   )
 end
 
@@ -868,6 +921,29 @@ local function run()
     "  }",
     "}",
   }, root .. "/src/unstaged_multi_hunk.rs") == 0, "write unstaged_multi_hunk failed")
+  assert_true(vim.fn.writefile({
+    "impl ModelStore {",
+    "  pub fn new(context: &gpu::Context) -> Self {",
+    "    let bind_group = context.create_bind_group(shaders::model::render::BindGroup1Descriptor {",
+    "      color_texture: color.clone(),",
+    "    });",
+    "    let particle_bind_group =",
+    "      context.create_bind_group(shaders::model::particle_render::BindGroup1Descriptor {",
+    "        color_texture: color,",
+    "      });",
+    "  }",
+    "",
+    "  pub fn insert(&mut self, model: &Model, repository: &ModelRepository) {",
+    "    let particle_bind_group =",
+    "      context.create_bind_group(shaders::model::particle_render::BindGroup1Descriptor {",
+    "        color_texture: color,",
+    "      });",
+    "    for mesh in model.mesh_iter() {",
+    "      let _ = mesh;",
+    "    }",
+    "  }",
+    "}",
+  }, root .. "/src/semantic_regions.rs") == 0, "write semantic_regions failed")
 
   diff_review.set_git_backend(backend)
   gh.set_backend(gh_backend)
@@ -993,6 +1069,19 @@ local function run()
     line_has_highlight(buf, unstaged_shifted_row, "DiffReviewInlineAddBg"),
     "compact shifted unstaged Rust row did not highlight the inserted span: " .. line_highlights(buf, unstaged_shifted_row)
   )
+
+  trigger_normal_mapping("<Tab>", find_row(buf, "unstaged_multi_hunk.rs"))
+  trigger_normal_mapping("<Tab>", find_row(buf, "semantic_regions.rs"))
+  wait_for(function()
+    return semantic_context_ready()
+  end, function()
+    return "semantic_regions.rs Tree-sitter context did not resolve\n" .. vim.inspect(diff_review._ts_context_cache or {})
+  end)
+  wait_for(function()
+    return buffer_contains(buf, "pub fn insert(&mut self, model: &Model, repository: &ModelRepository) {")
+      and buffer_contains(buf, "context.create_bind_group(shaders::model::particle_render::BindGroup1Descriptor")
+  end, "semantic_regions.rs diff did not render\n" .. buffer_dump(buf))
+  assert_semantic_region_parent_context(buf)
 end
 
 local ok, err = xpcall(run, debug.traceback)
