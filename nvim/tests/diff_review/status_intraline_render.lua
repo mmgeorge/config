@@ -112,6 +112,7 @@ line_has_highlight = function(buf, row, hl_group)
   local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
   for _, mark in ipairs(marks) do
     local details = mark[4] or {}
+    if details.line_hl_group == hl_group then return true end
     if details.hl_group == hl_group then return true end
     if type(details.hl_group) == "table" then
       for _, group in ipairs(details.hl_group) do
@@ -126,7 +127,11 @@ local function line_has_background_highlight(buf, row, hl_group)
   local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
   for _, mark in ipairs(marks) do
     local details = mark[4] or {}
+    if details.line_hl_group == hl_group then return true end
     if details.hl_group == hl_group and details.hl_eol == true then return true end
+    if details.hl_group == hl_group and mark[3] == 0 and type(details.end_col) == "number" and details.end_col > 0 then
+      return true
+    end
   end
   return false
 end
@@ -158,7 +163,18 @@ local function background_highlight_start_col(buf, row, hl_group)
   local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
   for _, mark in ipairs(marks) do
     local details = mark[4] or {}
+    if details.line_hl_group == hl_group then return 0 end
     if details.hl_group == hl_group and details.hl_eol == true then return mark[3] end
+    if details.hl_group == hl_group and type(details.end_col) == "number" and details.end_col > mark[3] then return mark[3] end
+  end
+  return nil
+end
+
+local function highlight_priority(buf, row, hl_group)
+  local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
+  for _, mark in ipairs(marks) do
+    local details = mark[4] or {}
+    if details.hl_group == hl_group or details.line_hl_group == hl_group then return details.priority end
   end
   return nil
 end
@@ -170,11 +186,11 @@ local function assert_background_only_highlight(hl_group)
   assert_true(highlight.bold ~= true, hl_group .. " should preserve syntax style")
 end
 
-local function assert_gutter_text_only_highlight(hl_group)
+local function assert_inline_background_highlight(hl_group)
   local highlight = vim.api.nvim_get_hl(0, { name = hl_group, link = false })
-  assert_true(highlight.fg ~= nil, hl_group .. " should set a foreground")
-  assert_true(highlight.bg == nil, hl_group .. " should not set a background")
-  assert_true(highlight.bold == true, hl_group .. " should keep gutter emphasis")
+  assert_true(highlight.bg ~= nil, hl_group .. " should set a background")
+  assert_true(highlight.fg == nil, hl_group .. " should preserve syntax foreground")
+  assert_true(highlight.nocombine == true, hl_group .. " should replace the row background")
 end
 
 local function wait_for(condition, message)
@@ -206,8 +222,8 @@ local function run()
   diff_review.setup({ about_auto_generate = false })
   assert_background_only_highlight("DiffReviewAddBg")
   assert_background_only_highlight("DiffReviewDeleteBg")
-  assert_gutter_text_only_highlight("DiffReviewCompactAddLineNr")
-  assert_gutter_text_only_highlight("DiffReviewCompactDeleteLineNr")
+  assert_inline_background_highlight("DiffReviewInlineAddBg")
+  assert_inline_background_highlight("DiffReviewInlineDeleteBg")
   diff_review.open()
   local buf = vim.api.nvim_get_current_buf()
   wait_for(function()
@@ -225,19 +241,25 @@ local function run()
 
   assert_true(not buffer_contains(buf, "color_texture: color,"), "insertion pair should not render the old full line\n" .. buffer_dump(buf))
   local color_row = find_row(buf, "color_texture: color.clone()")
-  assert_true(line_has_highlight(buf, color_row, "DiffReviewAddBg"), "inserted .clone() span was not highlighted")
-  assert_true(not line_has_background_highlight(buf, color_row, "DiffReviewAddBg"), "compact insertion row should not use full add background")
-  assert_true(line_has_gutter_chunk(buf, color_row, "+", "DiffReviewCompactAddLineNr"), "compact insertion row should show an add sign in the gutter")
-  assert_true(line_has_padded_gutter_chunk(buf, color_row, "3", "DiffReviewCompactAddLineNr"), "compact insertion row should color the new line number as added")
+  assert_true(line_has_background_highlight(buf, color_row, "DiffReviewAddBg"), "compact insertion row should use full add background")
+  assert_true(background_highlight_start_col(buf, color_row, "DiffReviewAddBg") == 0, "compact insertion background should start at column 0")
+  assert_true(line_has_highlight(buf, color_row, "DiffReviewInlineAddBg"), "inserted .clone() span was not highlighted")
+  assert_true(
+    highlight_priority(buf, color_row, "DiffReviewInlineAddBg") > highlight_priority(buf, color_row, "DiffReviewAddBg"),
+    "inserted .clone() span should have higher priority than the add row background"
+  )
+  assert_true(line_has_gutter_chunk(buf, color_row, "+", "DiffReviewAddLineNr"), "compact insertion row should show an add sign in the gutter")
+  assert_true(line_has_padded_gutter_chunk(buf, color_row, "3", "DiffReviewAddLineNr"), "compact insertion row should color the new line number as added")
   local color_entry = diff_review._status.entries[color_row]
   assert_true(color_entry and color_entry.diff_line and color_entry.diff_line.prefix == "+", "compact insertion row should keep new primary diff line")
   assert_true(type(color_entry.diff_lines) == "table" and #color_entry.diff_lines == 2, "compact insertion row should keep both backing lines")
 
   local normal_row = find_row(buf, "normal_texture: normal.clone()")
-  assert_true(line_has_highlight(buf, normal_row, "DiffReviewDeleteBg"), "deleted .clone() span was not highlighted")
-  assert_true(not line_has_background_highlight(buf, normal_row, "DiffReviewDeleteBg"), "compact deletion row should not use full delete background")
-  assert_true(line_has_gutter_chunk(buf, normal_row, "-", "DiffReviewCompactDeleteLineNr"), "compact deletion row should show a delete sign in the gutter")
-  assert_true(line_has_padded_gutter_chunk(buf, normal_row, "4", "DiffReviewCompactDeleteLineNr"), "compact deletion row should color the old line number as deleted")
+  assert_true(line_has_background_highlight(buf, normal_row, "DiffReviewDeleteBg"), "compact deletion row should use full delete background")
+  assert_true(background_highlight_start_col(buf, normal_row, "DiffReviewDeleteBg") == 0, "compact deletion background should start at column 0")
+  assert_true(line_has_highlight(buf, normal_row, "DiffReviewInlineDeleteBg"), "deleted .clone() span was not highlighted")
+  assert_true(line_has_gutter_chunk(buf, normal_row, "-", "DiffReviewDeleteLineNr"), "compact deletion row should show a delete sign in the gutter")
+  assert_true(line_has_padded_gutter_chunk(buf, normal_row, "4", "DiffReviewDeleteLineNr"), "compact deletion row should color the old line number as deleted")
   local normal_entry = diff_review._status.entries[normal_row]
   assert_true(normal_entry and normal_entry.diff_line and normal_entry.diff_line.prefix == "-", "compact deletion row should keep old primary diff line")
   assert_true(type(normal_entry.diff_lines) == "table" and #normal_entry.diff_lines == 2, "compact deletion row should keep both backing lines")

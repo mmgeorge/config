@@ -1930,6 +1930,7 @@ function M._cleanup_diff_buffers()
   M._buf_filename = {}
   M._buf_saved_cursor = {}
   M._empty_diff_rows = {}
+  M._diff_line_content_lengths = {}
   M._main_win = nil
 end
 
@@ -2212,6 +2213,27 @@ M._diff_items = {}
 -- Namespace for diff preview/status rendering
 M._ns = vim.api.nvim_create_namespace("diff_review_preview")
 M._empty_diff_rows = {}
+M._diff_line_content_lengths = {}
+
+function M._diff_visual_fill_width(buf)
+  local width = vim.o.columns
+  for _, win in ipairs(vim.fn.win_findbuf(buf)) do
+    if vim.api.nvim_win_is_valid(win) then
+      width = math.max(width, vim.api.nvim_win_get_width(win))
+    end
+  end
+  return math.max(width + 8, 160)
+end
+
+function M._diff_pad_highlighted_line(line_text, buf)
+  local content_length = #line_text
+  local fill_width = M._diff_visual_fill_width(buf)
+  local display_width = vim.fn.strdisplaywidth(line_text)
+  if display_width < fill_width then
+    line_text = line_text .. string.rep(" ", fill_width - display_width)
+  end
+  return line_text, content_length
+end
 
 ---@param virt_text table[]?
 ---@return integer
@@ -2227,6 +2249,7 @@ end
 ---@field line string
 ---@field gutter_col integer 0-based buffer column where the inline gutter starts
 ---@field gutter_width integer virtual columns occupied by the inline gutter
+---@field content_length integer real buffer text length before visual highlight padding
 
 ---@param buf integer
 ---@param row integer 1-based
@@ -2235,17 +2258,20 @@ end
 function M._diff_gutter_cursor_bounds(buf, row, namespace)
   local line = vim.api.nvim_buf_get_lines(buf, row - 1, row, false)[1]
   if line == nil then return nil end
+  local content_lengths = M._diff_line_content_lengths and M._diff_line_content_lengths[buf] or nil
+  local content_length = content_lengths and content_lengths[row] or #line
   local marks = vim.api.nvim_buf_get_extmarks(buf, namespace, { row - 1, 0 }, { row - 1, -1 }, { details = true })
   for _, mark in ipairs(marks) do
     local col = mark[3] or 0
     local details = mark[4] or {}
-    if details.virt_text and details.virt_text_pos == "inline" and col <= #line then
+    if details.virt_text and details.virt_text_pos == "inline" and col <= content_length then
       local width = M._inline_virtual_text_width(details.virt_text)
       if width > 0 then
         return {
           line = line,
           gutter_col = col,
           gutter_width = width,
+          content_length = content_length,
         }
       end
     end
@@ -2265,7 +2291,7 @@ function M._normalize_diff_gutter_cursor(buf, namespace)
   local pos = vim.fn.getcurpos()
   local current_col = math.max((pos[3] or 1) - 1, 0)
   local current_coladd = pos[4] or 0
-  local line_length = #bounds.line
+  local line_length = bounds.content_length or #bounds.line
   local target_col = current_col
   local target_coladd = current_coladd
 
@@ -2309,10 +2335,12 @@ function M._clamp_buffer_text_cursor(buf)
   local row = vim.api.nvim_win_get_cursor(0)[1]
   local line = vim.api.nvim_buf_get_lines(buf, row - 1, row, false)[1]
   if line == nil then return row end
+  local content_lengths = M._diff_line_content_lengths and M._diff_line_content_lengths[buf] or nil
+  local line_length = content_lengths and content_lengths[row] or #line
   local pos = vim.fn.getcurpos()
   local current_col = math.max((pos[3] or 1) - 1, 0)
   local current_coladd = pos[4] or 0
-  local target_col = math.min(current_col, #line)
+  local target_col = math.min(current_col, line_length)
   if current_col ~= target_col or current_coladd ~= 0 then
     vim.fn.setpos(".", { 0, row, target_col + 1, 0 })
   end
@@ -2889,7 +2917,17 @@ end
 function M._hunk_replacement_row(replacement, gutter, file, syntax, syntax_row)
   local display_line = replacement.display_line
   local backing_lines = replacement.diff_lines or { display_line }
+  local sign_hl = nil
+  local line_hl = nil
+  if display_line.prefix == "+" then
+    sign_hl = "DiffReviewAddLineNr"
+    line_hl = "DiffReviewAddBg"
+  elseif display_line.prefix == "-" then
+    sign_hl = "DiffReviewDeleteLineNr"
+    line_hl = "DiffReviewDeleteBg"
+  end
   local row = {
+    diff_review_bg_hl = line_hl,
     diff_review_inline_highlights = replacement.inline_spans or {},
   }
   row[#row + 1] = {
@@ -2902,16 +2940,7 @@ function M._hunk_replacement_row(replacement, gutter, file, syntax, syntax_row)
   }
   local old_line = replacement.old_lines and replacement.old_lines[1] and replacement.old_lines[1].old_line or display_line.old_line
   local new_line = replacement.new_lines and replacement.new_lines[1] and replacement.new_lines[1].new_line or display_line.new_line
-  local sign_hl = nil
-  local changed_line_hl = nil
-  if display_line.prefix == "+" then
-    sign_hl = "DiffReviewCompactAddLineNr"
-    changed_line_hl = "DiffReviewCompactAddLineNr"
-  elseif display_line.prefix == "-" then
-    sign_hl = "DiffReviewCompactDeleteLineNr"
-    changed_line_hl = "DiffReviewCompactDeleteLineNr"
-  end
-  hunk_add_gutter(row, gutter, old_line, new_line, display_line.prefix, sign_hl, nil, changed_line_hl)
+  hunk_add_gutter(row, gutter, old_line, new_line, display_line.prefix, sign_hl, line_hl)
   local segments = nil
   if syntax and syntax_row then
     segments = treesitter_line_segments(syntax.buf, syntax.tree, syntax.highlight_query, syntax_row, display_line.code)
@@ -3204,6 +3233,7 @@ local function render_highlight_rows(buf, ns, rows)
   local line_highlights = {}
   local extmarks = {}
   local empty_diff_rows = {}
+  local content_lengths = {}
 
   for row_index, row in ipairs(rows) do
     local line_parts = {}
@@ -3239,14 +3269,16 @@ local function render_highlight_rows(buf, ns, rows)
     end
     lines[row_index] = table.concat(line_parts)
     if row.diff_review_bg_hl then
+      local content_length
+      lines[row_index], content_length = M._diff_pad_highlighted_line(lines[row_index], buf)
+      content_lengths[row_index] = content_length
       extmarks[#extmarks + 1] = {
         line = row_index,
         col = 0,
         opts = {
           end_col = #lines[row_index],
           hl_group = row.diff_review_bg_hl,
-          hl_eol = true,
-          priority = 70,
+          priority = 60,
         },
       }
     end
@@ -3264,6 +3296,8 @@ local function render_highlight_rows(buf, ns, rows)
 
   M._empty_diff_rows = M._empty_diff_rows or {}
   M._empty_diff_rows[buf] = empty_diff_rows
+  M._diff_line_content_lengths = M._diff_line_content_lengths or {}
+  M._diff_line_content_lengths[buf] = content_lengths
   vim.bo[buf].modifiable = true
   vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
@@ -3904,6 +3938,7 @@ function M._refresh_diff_buffer(buf, filename)
     vim.bo[buf].modifiable = false
     M._buf_hunks[buf] = {}
     if M._empty_diff_rows then M._empty_diff_rows[buf] = nil end
+    if M._diff_line_content_lengths then M._diff_line_content_lengths[buf] = nil end
     vim.api.nvim_buf_clear_namespace(buf, M._hunk_header_ns, 0, -1)
     vim.api.nvim_buf_clear_namespace(buf, M._active_hunk_header_ns, 0, -1)
   end
@@ -4227,6 +4262,7 @@ local function attach_status_state(buf, state)
       if M._status_states then M._status_states[buf] = nil end
       if M._main_status == state then M._main_status = nil end
       if M._status == state then M._status = M._main_status end
+      if M._diff_line_content_lengths then M._diff_line_content_lengths[buf] = nil end
     end,
   })
 end
@@ -5731,6 +5767,10 @@ local function status_add_fancy_row(row, entry, indent)
   end
 
   local line_text = table.concat(text_parts)
+  local content_length = nil
+  if row.diff_review_bg_hl then
+    line_text, content_length = M._diff_pad_highlighted_line(line_text, M._status.buf)
+  end
 
   local line_entry = entry
   if row.diff_review_boundary or row.diff_review_context_padding then
@@ -5743,11 +5783,13 @@ local function status_add_fancy_row(row, entry, indent)
   end
   local line = status_add_line(line_text, line_entry)
   if row.diff_review_bg_hl then
+    M._diff_line_content_lengths = M._diff_line_content_lengths or {}
+    M._diff_line_content_lengths[M._status.buf] = M._diff_line_content_lengths[M._status.buf] or {}
+    M._diff_line_content_lengths[M._status.buf][line] = content_length or #line_text
     status_add_extmark(line, 0, {
       end_col = #line_text,
       hl_group = row.diff_review_bg_hl,
-      hl_eol = true,
-      priority = 70,
+      priority = 60,
     })
   end
   if row.diff_review_boundary then
@@ -8088,6 +8130,7 @@ end
 ---@param lines string[]
 local function status_set_plain_lines(buf, lines)
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  if M._diff_line_content_lengths then M._diff_line_content_lengths[buf] = nil end
   local was_rendering = vim.b[buf].diff_review_status_rendering
   vim.b[buf].diff_review_status_rendering = true
   vim.bo[buf].modifiable = true
@@ -8422,6 +8465,8 @@ local function status_render_loaded(buf, target_id, fallback_line, opts, head_li
   M._status.line_highlights = {}
   M._status.extmarks = {}
   M._status.boundary_lines = {}
+  M._diff_line_content_lengths = M._diff_line_content_lengths or {}
+  M._diff_line_content_lengths[buf] = {}
 
   local folded_head_parents = {}
   for _, head_line in ipairs(head_lines) do

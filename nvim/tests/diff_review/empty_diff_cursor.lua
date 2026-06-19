@@ -97,7 +97,6 @@ local function run()
   run_git({ "commit", "-m", "init" })
   write_lines(sample, {
     "function foo()",
-    "",
     "  return 2",
     "end",
   })
@@ -127,7 +126,9 @@ local function run()
   end, "expanded diff did not render an empty diff row")
 
   local before_line = vim.api.nvim_buf_get_lines(status_buf, empty_row - 1, empty_row, false)[1]
-  assert_true(before_line == "", "empty diff row should stay empty buffer text, got: " .. vim.inspect(before_line))
+  assert_true(before_line:match("^%s*$") ~= nil, "empty diff row should contain only visual padding, got: " .. vim.inspect(before_line))
+  local content_lengths = diff_review._diff_line_content_lengths and diff_review._diff_line_content_lengths[status_buf] or nil
+  assert_true(content_lengths and content_lengths[empty_row] == 0, "empty diff row should keep real content length 0")
 
   vim.api.nvim_win_set_cursor(0, { empty_row, 0 })
   vim.api.nvim_exec_autocmds("CursorMoved", { buffer = status_buf })
@@ -137,7 +138,7 @@ local function run()
   assert_true(cursor[4] > 0, "empty diff row did not get a virtual gutter offset: " .. vim.inspect(cursor))
 
   local after_line = vim.api.nvim_buf_get_lines(status_buf, empty_row - 1, empty_row, false)[1]
-  assert_true(after_line == "", "cursor correction mutated empty diff row: " .. vim.inspect(after_line))
+  assert_true(after_line == before_line, "cursor correction mutated empty diff row: " .. vim.inspect(after_line))
 
   local code_row, diff_line = find_non_empty_diff_row(status_buf)
   assert_true(code_row ~= nil and diff_line ~= nil, "expanded diff did not render a non-empty diff row")
@@ -146,6 +147,7 @@ local function run()
   assert_true(code_start ~= nil, "diff code text missing from status row: " .. vim.inspect({ code_line, diff_line.code }))
   local code_bounds = diff_review._diff_gutter_cursor_bounds(status_buf, code_row, diff_review._status_ns)
   assert_true(code_bounds ~= nil, "non-empty diff row is missing inline gutter bounds")
+  assert_true(code_bounds.content_length == #diff_line.code, "non-empty diff row should track real code length: " .. vim.inspect(code_bounds))
 
   vim.api.nvim_win_set_cursor(0, { code_row, 0 })
   vim.api.nvim_exec_autocmds("CursorMoved", { buffer = status_buf })
@@ -164,7 +166,10 @@ local function run()
   vim.api.nvim_exec_autocmds("CursorMoved", { buffer = status_buf })
   cursor = vim.fn.getcurpos()
   assert_true(cursor[2] == code_row, "cursor moved off non-empty diff row after EOL clamp: " .. vim.inspect(cursor))
-  assert_true(cursor[3] == #code_line, "cursor was not clamped to final real text column: " .. vim.inspect({ cursor = cursor, line = code_line }))
+  assert_true(
+    cursor[3] == code_bounds.content_length,
+    "cursor was not clamped to final real text column: " .. vim.inspect({ cursor = cursor, line = code_line, bounds = code_bounds })
+  )
   assert_true(cursor[4] == 0, "cursor kept virtual columns past the diff row text: " .. vim.inspect(cursor))
 end
 

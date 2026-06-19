@@ -74,7 +74,7 @@ function M.compact_pair(old_line, new_line, opts)
         {
           start_col = new_mid_start - 1,
           end_col = new_mid_end,
-          hl_group = "DiffReviewAddBg",
+          hl_group = "DiffReviewInlineAddBg",
           kind = "add",
         },
       },
@@ -91,7 +91,7 @@ function M.compact_pair(old_line, new_line, opts)
       {
         start_col = old_mid_start - 1,
         end_col = old_mid_end,
-        hl_group = "DiffReviewDeleteBg",
+        hl_group = "DiffReviewInlineDeleteBg",
         kind = "delete",
       },
     },

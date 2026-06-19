@@ -317,6 +317,7 @@ local function line_has_highlight(buf, row, hl_group)
   local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
   for _, mark in ipairs(marks) do
     local details = mark[4] or {}
+    if details.line_hl_group == hl_group then return true end
     if details.hl_group == hl_group or tostring(details.hl_group):find("^" .. vim.pesc(hl_group) .. "%.") then return true end
     if type(details.hl_group) == "table" then
       for _, group in ipairs(details.hl_group) do
@@ -362,7 +363,11 @@ local function line_has_background_highlight(buf, row, hl_group)
   local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
   for _, mark in ipairs(marks) do
     local details = mark[4] or {}
+    if details.line_hl_group == hl_group then return true end
     if details.hl_group == hl_group and details.hl_eol == true then return true end
+    if details.hl_group == hl_group and mark[3] == 0 and type(details.end_col) == "number" and details.end_col > 0 then
+      return true
+    end
   end
   return false
 end
@@ -391,10 +396,16 @@ local function cell_at_text(buf, row, text)
   vim.api.nvim_win_set_cursor(0, { row, text_start - 1 })
   vim.cmd("normal! zt")
   vim.cmd("redraw!")
-  local screen_row = vim.fn.winline() - 1
-  local screen_col = vim.fn.wincol() - 1
+  local screen_pos = vim.fn.screenpos(vim.api.nvim_get_current_win(), row, text_start)
+  assert_true(
+    type(screen_pos) == "table" and tonumber(screen_pos.row) and tonumber(screen_pos.row) > 0,
+    ("unable to resolve screen position for %q on row %d: %s"):format(text, row, vim.inspect(screen_pos))
+  )
+  local screen_row = screen_pos.row - 1
+  local screen_col = screen_pos.col - 1
   local ok, cell = pcall(vim.api.nvim__inspect_cell, 1, screen_row, screen_col)
   assert_true(ok and type(cell) == "table" and type(cell[2]) == "table", "unable to inspect rendered screen cell")
+  cell[2]._inspect_cell = cell
   return cell[2]
 end
 
@@ -416,6 +427,22 @@ local function assert_diff_background_cell(buf, row, text)
   assert_true(
     cell.background ~= nil,
     ("%s rendered without diff background on row %d: %s"):format(text, row, vim.inspect(cell))
+  )
+end
+
+local function assert_cell_background_group(buf, row, text, hl_group)
+  local cell = cell_at_text(buf, row, text)
+  local highlight = vim.api.nvim_get_hl(0, { name = hl_group, link = false })
+  assert_true(
+    cell.background == highlight.bg,
+    ("%s rendered with wrong background on row %d: expected %s=%s, got %s cell=%s"):format(
+      text,
+      row,
+      hl_group,
+      tostring(highlight.bg),
+      tostring(cell.background),
+      vim.inspect(cell)
+    )
   )
 end
 
@@ -485,27 +512,21 @@ local function ferrous_model_store_failures(buf)
     end
 
     if type(row_info.diff_lines) == "table" and #row_info.diff_lines > 1 then
-      local inline_hl = diff_line.prefix == "-" and "DiffReviewDeleteBg" or "DiffReviewAddBg"
+      local inline_hl = diff_line.prefix == "-" and "DiffReviewInlineDeleteBg" or "DiffReviewInlineAddBg"
+      local row_hl = diff_line.prefix == "-" and "DiffReviewDeleteBg" or "DiffReviewAddBg"
       if not line_has_highlight(buf, row, inline_hl) then
         failures[#failures + 1] = ("%d missing compact inline highlight %s for %s"):format(row, inline_hl, code)
       end
-      if line_has_background_highlight(buf, row, "DiffReviewAddBg")
-        or line_has_background_highlight(buf, row, "DiffReviewDeleteBg") then
-        failures[#failures + 1] = ("%d compact row used full diff background for %s"):format(row, code)
+      if not line_has_background_highlight(buf, row, row_hl) then
+        failures[#failures + 1] = ("%d compact row missing full diff background %s for %s"):format(row, row_hl, code)
       end
     elseif diff_line.prefix == "+" then
       if not line_has_background_highlight(buf, row, "DiffReviewAddBg") then
         failures[#failures + 1] = ("%d missing add background for %s"):format(row, code)
       end
-      if line_has_line_highlight(buf, row, "DiffReviewAddBg") then
-        failures[#failures + 1] = ("%d uses add line_hl_group for %s"):format(row, code)
-      end
     elseif diff_line.prefix == "-" then
       if not line_has_background_highlight(buf, row, "DiffReviewDeleteBg") then
         failures[#failures + 1] = ("%d missing delete background for %s"):format(row, code)
-      end
-      if line_has_line_highlight(buf, row, "DiffReviewDeleteBg") then
-        failures[#failures + 1] = ("%d uses delete line_hl_group for %s"):format(row, code)
       end
     end
   end
@@ -881,7 +902,7 @@ local function run()
   end, "compact shifted staged Rust row did not get type syntax highlight: " .. line_highlights(buf, shifted_row))
   shifted_row = find_row_with_highlight(buf, "Widget::new(CameraComponent { value: value + 1 })", "DiffReviewAddBg")
   assert_true(
-    line_has_highlight(buf, shifted_row, "DiffReviewAddBg"),
+    line_has_highlight(buf, shifted_row, "DiffReviewInlineAddBg"),
     "compact shifted staged Rust row did not highlight the inserted span: " .. line_highlights(buf, shifted_row)
   )
 
@@ -929,9 +950,10 @@ local function run()
   )
   assert_syntax_cell(buf, clone_row, "clone")
   assert_true(
-    line_has_highlight(buf, clone_row, "DiffReviewAddBg"),
+    line_has_highlight(buf, clone_row, "DiffReviewInlineAddBg"),
     "Ferrous compact clone row did not get inline add highlight: " .. line_highlights(buf, clone_row)
   )
+  assert_cell_background_group(buf, clone_row, ".clone()", "DiffReviewInlineAddBg")
 
   trigger_normal_mapping("<Tab>", find_row(buf, "model_store.rs"))
   trigger_normal_mapping("<Tab>", find_row(buf, "unstaged_multi_hunk.rs"))
@@ -945,7 +967,7 @@ local function run()
   end, "compact shifted unstaged Rust row did not get type syntax highlight: " .. line_highlights(buf, unstaged_shifted_row))
   unstaged_shifted_row = find_row_with_highlight(buf, "Widget::new(CameraComponent { value: value + 1 })", "DiffReviewAddBg")
   assert_true(
-    line_has_highlight(buf, unstaged_shifted_row, "DiffReviewAddBg"),
+    line_has_highlight(buf, unstaged_shifted_row, "DiffReviewInlineAddBg"),
     "compact shifted unstaged Rust row did not highlight the inserted span: " .. line_highlights(buf, unstaged_shifted_row)
   )
 end

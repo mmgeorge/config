@@ -215,7 +215,12 @@ local function cell_at_text(buf, row, text)
   vim.api.nvim_win_set_cursor(0, { row, text_start - 1 })
   vim.cmd("normal! zt")
   vim.cmd("redraw!")
-  local ok, cell = pcall(vim.api.nvim__inspect_cell, 1, vim.fn.winline() - 1, vim.fn.wincol() - 1)
+  local screen_pos = vim.fn.screenpos(vim.api.nvim_get_current_win(), row, text_start)
+  assert_true(
+    type(screen_pos) == "table" and tonumber(screen_pos.row) and tonumber(screen_pos.row) > 0,
+    ("unable to resolve screen position for %q on row %d: %s"):format(text, row, vim.inspect(screen_pos))
+  )
+  local ok, cell = pcall(vim.api.nvim__inspect_cell, 1, screen_pos.row - 1, screen_pos.col - 1)
   assert_true(ok and type(cell) == "table" and type(cell[2]) == "table", "unable to inspect rendered screen cell")
   cell[2]._inspect_cell = cell
   return cell[2]

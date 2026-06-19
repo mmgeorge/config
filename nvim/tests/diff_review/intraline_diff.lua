@@ -29,7 +29,7 @@ local function run()
   assert_true(insertion.display_line.prefix == "+", "insertion should display the new line")
   assert_true(#insertion.inline_spans == 1, "insertion should have one inline span")
   local added = insertion.inline_spans[1]
-  assert_true(added.hl_group == "DiffReviewAddBg", "insertion should use add highlight")
+  assert_true(added.hl_group == "DiffReviewInlineAddBg", "insertion should use inline add highlight")
   assert_true(insertion.display_line.code:sub(added.start_col + 1, added.end_col) == ".clone()", "insertion span should cover .clone()")
 
   local deletion = intraline.compact_pair(
@@ -39,7 +39,7 @@ local function run()
   assert_true(deletion ~= nil, "clone deletion should compact")
   assert_true(deletion.display_line.prefix == "-", "deletion should display the old line")
   local removed = deletion.inline_spans[1]
-  assert_true(removed.hl_group == "DiffReviewDeleteBg", "deletion should use delete highlight")
+  assert_true(removed.hl_group == "DiffReviewInlineDeleteBg", "deletion should use inline delete highlight")
   assert_true(deletion.display_line.code:sub(removed.start_col + 1, removed.end_col) == ".clone()", "deletion span should cover .clone()")
 
   local substitution = intraline.compact_pair(
