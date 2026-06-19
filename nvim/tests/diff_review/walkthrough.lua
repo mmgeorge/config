@@ -262,6 +262,14 @@ local function walkthrough_extmark_count(buf)
   return #marks
 end
 
+local function row_has_line_highlight(buf, row, hl_group)
+  local marks = vim.api.nvim_buf_get_extmarks(buf, walkthrough._ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
+  for _, mark in ipairs(marks) do
+    if (mark[4] or {}).line_hl_group == hl_group then return true end
+  end
+  return false
+end
+
 --- Concatenated text of the inline comment box (virt_lines extmarks).
 local function box_text(buf)
   local marks = vim.api.nvim_buf_get_extmarks(buf, walkthrough._ns, 0, -1, { details = true })
@@ -535,6 +543,10 @@ local function run()
   local cursor_row = vim.api.nvim_win_get_cursor(vim.fn.bufwinid(buf))[1]
   assert_true(cursor_row == step_row, ("cursor not on step row (expected %d, got %d)"):format(step_row, cursor_row))
   assert_true(walkthrough_extmark_count(buf) > 0, "region extmarks missing")
+  assert_true(row_has_line_highlight(buf, step_row, "DiffReviewWalkthroughRegionAdd"),
+    "added walkthrough row should preserve add background")
+  assert_true(not row_has_line_highlight(buf, step_row, "DiffReviewWalkthroughRegion"),
+    "added walkthrough row should not use generic blue region background")
   assert_true(box_contains(buf, "concrete changed line"), "inline comment box missing")
   assert_true(box_contains(buf, "Deviation:"), "inline comment box should render the callout kind")
   assert_true(box_contains(buf, "high-priority review context"), "inline comment box should render callout text")

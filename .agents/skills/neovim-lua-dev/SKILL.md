@@ -231,6 +231,14 @@ If diagnostics still look wrong, run the linter directly (e.g. `luacheck`,
   fallback first, then update from the parse callback. Do not call
   `parser:parse()` synchronously from status renderers, previews, keymaps, or
   autocmds.
+- **Mixed-content markdown rendering:** never register a whole synthetic
+  mixed-content filetype (for example `GitStatus`) as `markdown` only to render
+  a description/comment subsection. That attaches markdown Tree-sitter syntax to
+  unrelated diff/code rows, where groups like `Special` and `@markup.*` can
+  override the language-specific extmarks. Keep markdown/otter/render-markdown
+  activation opt-in for the real markdown region or buffer, and when debugging
+  highlight issues inspect the rendered cell stack with `nvim__inspect_cell`;
+  extmark presence alone does not prove the visible highlight won.
 - **Syntax-aware edits:** prefer `vim.treesitter` queries over regex.
 - **Window options belong to windows:** use `vim.wo[win]`, not `vim.wo[0]` — the
   "current window" inside an autocmd is often not the one you mean.

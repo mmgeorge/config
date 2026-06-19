@@ -1295,6 +1295,18 @@ local function apply_summary_highlights(buf, lines, doc)
 end
 
 ---@param mode DiffReviewWalkthroughMode
+---@param row integer
+---@return string
+local function region_highlight_group(mode, row)
+  local state = mode.host.get_state()
+  local entry = state and state.entries and state.entries[row] or nil
+  local prefix = entry and entry.diff_line and entry.diff_line.prefix or nil
+  if prefix == "+" then return "DiffReviewWalkthroughRegionAdd" end
+  if prefix == "-" then return "DiffReviewWalkthroughRegionDelete" end
+  return "DiffReviewWalkthroughRegion"
+end
+
+---@param mode DiffReviewWalkthroughMode
 ---@param target DiffReviewWalkthroughTarget
 local function apply_region_highlight(mode, target)
   local buf = mode.host.buf
@@ -1303,7 +1315,7 @@ local function apply_region_highlight(mode, target)
   local end_row = target.end_row or target.start_row
   for row = target.start_row, end_row do
     pcall(vim.api.nvim_buf_set_extmark, buf, M._ns, row - 1, 0, {
-      line_hl_group = "DiffReviewWalkthroughRegion",
+      line_hl_group = region_highlight_group(mode, row),
       priority = 250,
     })
   end

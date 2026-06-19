@@ -6,6 +6,8 @@ local gh = require("diff_review.gh")
 local original_cwd = vim.fs.normalize(vim.fn.getcwd())
 local root = vim.fs.normalize(original_cwd .. "/.diffreview-boundary-context-test")
 local calls = {}
+local original_compute_diff_syntax_async = diff_review.compute_diff_syntax_async
+local original_compute_file_syntax_async = diff_review.compute_file_syntax_async
 
 ---@type DiffReviewGhBackend
 local gh_backend = {}
@@ -192,6 +194,19 @@ end
 local function run()
   vim.fn.delete(root, "rf")
   assert_true(vim.fn.mkdir(root .. "/src", "p") == 1, "mkdir failed")
+  local diff_syntax_batches = {}
+  local file_syntax_requests = {}
+  diff_review.compute_diff_syntax_async = function(filename, lines_for_syntax, cb)
+    diff_syntax_batches[#diff_syntax_batches + 1] = {
+      filename = filename,
+      lines = vim.deepcopy(lines_for_syntax),
+    }
+    original_compute_diff_syntax_async(filename, lines_for_syntax, cb)
+  end
+  diff_review.compute_file_syntax_async = function(filename, cb)
+    file_syntax_requests[filename] = (file_syntax_requests[filename] or 0) + 1
+    original_compute_file_syntax_async(filename, cb)
+  end
   assert_true(vim.fn.writefile({
     "pub struct Engine {",
     "  world: ecs::World,",
@@ -203,8 +218,8 @@ local function run()
     "",
     "impl Engine {",
     "  pub fn new(bridge: Bridge) -> Self {",
-    "    let stderr_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);",
-    "    let writer = LOG_WRITER.get_or_init(|| SwappableWriter::new(open_log()));",
+    "    let stderr_laye = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);",
+    "    let writer = LOG_WRITER.get_or_int(|| SwappableWriter::new(open_log()));",
     "  }",
     "}",
   }, root .. "/src/engine.rs") == 0, "writefile failed")
@@ -244,6 +259,20 @@ local function run()
     local row = find_row(buf, "let stderr_laye = tracing_subscriber")
     return line_has_highlight(buf, row, "@keyword")
   end, "add hunk body row did not get Tree-sitter keyword highlight: " .. line_highlights(buf, add_row))
+  wait_for(function()
+    return file_syntax_requests[root .. "/src/engine.rs"] ~= nil or #diff_syntax_batches > 0
+  end, "syntax renderer did not request any file or diff syntax")
+  for _, batch in ipairs(diff_syntax_batches) do
+    local batch_text = table.concat(batch.lines or {}, "\n")
+    assert_true(
+      not (batch_text:find("stderr_layer =", 1, true) and batch_text:find("stderr_laye =", 1, true)),
+      "diff syntax batch mixed old and new engine lines:\n" .. batch_text
+    )
+    assert_true(
+      not (batch_text:find("get_or_init(", 1, true) and batch_text:find("get_or_int(", 1, true)),
+      "diff syntax batch mixed old and new writer lines:\n" .. batch_text
+    )
+  end
   wait_for(function()
     for _, value in pairs(diff_review._ts_context_cache or {}) do
       if type(value) == "table" and value.label == "Engine.new" then return true end
@@ -306,6 +335,8 @@ end
 local ok, err = xpcall(run, debug.traceback)
 diff_review.reset_git_backend()
 gh.reset_backend()
+diff_review.compute_diff_syntax_async = original_compute_diff_syntax_async
+diff_review.compute_file_syntax_async = original_compute_file_syntax_async
 vim.fn.delete(root, "rf")
 if not ok then
   vim.api.nvim_err_writeln(err)

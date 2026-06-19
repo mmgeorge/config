@@ -326,3 +326,13 @@ Tree-sitter context lookup must use async `LanguageTree:parse(range, on_parse)`
 with a cached fallback-render-then-upgrade flow. Do not call synchronous
 `parser:parse()` from DiffReview renderers, keymaps, autocmds, or preview
 refresh paths.
+
+Do not register the whole `GitStatus` filetype as markdown to support PR/issue
+description rendering. GitStatus is a mixed buffer: status rows, editable
+markdown regions, and real diff/code rows live together. Whole-buffer markdown
+registration lets markdown Tree-sitter syntax overlay diff rows with `Special`
+or `@markup.*`, which can make Rust/Slang/etc syntax look missing even when
+DiffReview's own syntax extmarks are present. Markdown rendering and otter code
+completion must be explicit for the description/comment region or a true
+markdown-like buffer, and syntax regressions should inspect the rendered cell
+stack with `nvim__inspect_cell`, not just DiffReview extmarks.

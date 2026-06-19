@@ -1,7 +1,6 @@
 local M = {}
 
 local markdown_filetypes = {
-  GitStatus = true,
   GithubIssue = true,
   markdown = true,
 }
@@ -137,7 +136,8 @@ function M.activate(buf, opts)
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return false end
 
   local filetype = opts.filetype or vim.bo[buf].filetype
-  if opts.register_as_markdown or markdown_filetypes[filetype] then register_markdown_filetype(filetype) end
+  if not (opts.register_as_markdown or markdown_filetypes[filetype]) then return false end
+  if opts.register_as_markdown or filetype ~= "markdown" then register_markdown_filetype(filetype) end
 
   local ok, otter = pcall(require, "otter")
   if not ok or type(otter) ~= "table" then return false end

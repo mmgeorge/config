@@ -116,6 +116,13 @@ local function line_highlights(buf, row)
   return table.concat(groups, ",")
 end
 
+local function line_column(buf, row, text)
+  local line = status_lines(buf)[row] or ""
+  local column = line:find(text, 1, true)
+  assert_true(column ~= nil, "missing text in row: " .. text .. "\n" .. line)
+  return column
+end
+
 local function trigger_normal_mapping(key, row)
   vim.api.nvim_win_set_cursor(0, { row, 0 })
   local mapping = vim.fn.maparg(key, "n", false, true)
@@ -162,6 +169,22 @@ local commit_diff = table.concat({
   "@@ -2 +2 @@",
   "-left",
   "+right",
+  "diff --git a/added.txt b/added.txt",
+  "new file mode 100644",
+  "index 0000000..4444444",
+  "--- /dev/null",
+  "+++ b/added.txt",
+  "@@ -0,0 +1,2 @@",
+  "+first",
+  "+second",
+  "diff --git a/removed.txt b/removed.txt",
+  "deleted file mode 100644",
+  "index 5555555..0000000",
+  "--- a/removed.txt",
+  "+++ /dev/null",
+  "@@ -1,2 +0,0 @@",
+  "-gone",
+  "-away",
   "diff --git a/src/commit.rs b/src/commit.rs",
   "index 7777777..8888888 100644",
   "--- a/src/commit.rs",
@@ -169,6 +192,23 @@ local commit_diff = table.concat({
   "@@ -1 +1 @@",
   "-fn old_commit() {}",
   "+pub fn from_commit() {}",
+}, "\n")
+
+local recent_commit_diff = table.concat({
+  "diff --git a/recent/added.txt b/recent/added.txt",
+  "new file mode 100644",
+  "index 0000000..1111111",
+  "--- /dev/null",
+  "+++ b/recent/added.txt",
+  "@@ -0,0 +1 @@",
+  "+recent",
+  "diff --git a/recent/removed.txt b/recent/removed.txt",
+  "deleted file mode 100644",
+  "index 2222222..0000000",
+  "--- a/recent/removed.txt",
+  "+++ /dev/null",
+  "@@ -1 +0,0 @@",
+  "-recent",
 }, "\n")
 
 local staged_diff = table.concat({
@@ -214,6 +254,9 @@ function backend.systemlist(command)
   end
   if key == "git\t-C\t" .. root .. "\tshow\t--format=\t--no-color\t--no-ext-diff\t45806b8123456789" then
     return output_lines(commit_diff), 0
+  end
+  if key == "git\t-C\t" .. root .. "\tshow\t--format=\t--no-color\t--no-ext-diff\t0000000000000000000000000000000000000001" then
+    return output_lines(recent_commit_diff), 0
   end
   if key == "git\t-C\t" .. root .. "\tls-files\t--others\t--exclude-standard" then return {}, 0 end
   if key == "git\t-C\t" .. root .. "\tdiff\t--cached\t--name-status" then return { "M\tstaged.txt" }, 0 end
@@ -280,9 +323,17 @@ local function run()
 
   local unmerged_heading = find_row(buf, "Unmerged into origin/master (4)")
   trigger_normal_mapping("<Tab>", find_row_after(buf, "45806b8  1 day ago  feat", unmerged_heading))
-  wait_for(function() return buffer_contains(buf, "foo/bar.js +1 -1") end, "expanded commit did not render changed file\n" .. table.concat(status_lines(buf), "\n"))
-  assert_true(buffer_contains(buf, "baz.txt +1 -1"), "expanded commit missing second changed file")
-  assert_true(buffer_contains(buf, "src/commit.rs +1 -1"), "expanded commit missing Rust changed file")
+  wait_for(function() return buffer_contains(buf, "Modified foo/bar.js +1 -1") end, "expanded commit did not render modified file\n" .. table.concat(status_lines(buf), "\n"))
+  assert_true(buffer_contains(buf, "Modified baz.txt +1 -1"), "expanded commit missing second modified file")
+  assert_true(buffer_contains(buf, "New      added.txt +2 -0"), "expanded commit did not label new file")
+  assert_true(buffer_contains(buf, "Removed  removed.txt +0 -2"), "expanded commit did not label removed file")
+  assert_true(buffer_contains(buf, "Modified src/commit.rs +1 -1"), "expanded commit missing Rust modified file")
+  local modified_file_row = find_row(buf, "Modified foo/bar.js +1 -1")
+  local added_file_row = find_row(buf, "New      added.txt +2 -0")
+  local removed_file_row = find_row(buf, "Removed  removed.txt +0 -2")
+  local file_path_column = line_column(buf, modified_file_row, "foo/bar.js")
+  assert_true(line_column(buf, added_file_row, "added.txt") == file_path_column, "new commit file path was not aligned")
+  assert_true(line_column(buf, removed_file_row, "removed.txt") == file_path_column, "removed commit file path was not aligned")
   assert_true(count_calls_containing("\tshow\t--format=\t--no-color\t--no-ext-diff\t45806b8123456789") == 2, "commit diff was not loaded exactly once through async backend")
 
   trigger_normal_mapping("<Tab>", find_row(buf, "foo/bar.js +1 -1"))
@@ -327,6 +378,24 @@ local function run()
   assert_true(
     count_calls_containing("\tshow\t--format=\t--no-color\t--no-ext-diff") == show_calls_before_recent,
     "expanding recent commits section loaded commit diffs eagerly"
+  )
+  trigger_normal_mapping("<Tab>", recent_row)
+  wait_for(function()
+    return buffer_contains_after(buf, "New      recent/added.txt +1 -0", find_row(buf, "Recent Commits (20)"))
+  end, "expanded recent commit did not label new file\n" .. table.concat(status_lines(buf), "\n"))
+  assert_true(
+    buffer_contains_after(buf, "Removed  recent/removed.txt +0 -1", find_row(buf, "Recent Commits (20)")),
+    "expanded recent commit did not label removed file"
+  )
+  local recent_added_file_row = find_row(buf, "New      recent/added.txt +1 -0")
+  local recent_removed_file_row = find_row(buf, "Removed  recent/removed.txt +0 -1")
+  assert_true(
+    line_column(buf, recent_added_file_row, "recent/added.txt") == line_column(buf, recent_removed_file_row, "recent/removed.txt"),
+    "recent commit file paths were not aligned"
+  )
+  assert_true(
+    count_calls_containing("\tshow\t--format=\t--no-color\t--no-ext-diff\t0000000000000000000000000000000000000001") == 2,
+    "recent commit diff was not loaded exactly once through async backend"
   )
 end
 

@@ -175,6 +175,8 @@
 ---@field _ts_syntax_cache table<string, DiffReviewTreeSitterSyntax|false|DiffReviewTreeSitterSyntaxPending>?
 ---@field _ts_diff_syntax_cache table<string, DiffReviewTreeSitterSyntax|false|DiffReviewTreeSitterSyntaxPending>?
 ---@field _ts_source_bufs table<string, integer>?
+---@field _diff_uses_file_syntax fun(hunk_staged?: boolean[], opts?: table): boolean
+---@field _prewarm_diff_syntax fun(filename: string, diff_text: string, hunk_staged?: boolean[], callback_key: string, on_update?: fun(syntax?: DiffReviewTreeSitterSyntax), opts?: table)
 ---@field _main_win integer?
 ---@field _saved_wo table<integer, { number: boolean, relativenumber: boolean }>?
 ---@field suspend_preview boolean?
@@ -271,10 +273,25 @@ local function file_contains_nul(filename)
 end
 
 ---@param filename string
+---@return string[]?
+function M._file_source_lines(filename)
+  if file_contains_nul(filename) then return nil end
+  local loaded = loaded_file_buffer(filename)
+  if loaded then
+    if vim.bo[loaded].binary then return nil end
+    return vim.api.nvim_buf_get_lines(loaded, 0, -1, false)
+  end
+  local read_ok, lines = pcall(vim.fn.readfile, filename)
+  if not read_ok or type(lines) ~= "table" then return nil end
+  if lines_contain_nul(lines) then return nil end
+  return lines
+end
+
+---@param filename string
 ---@return integer?
 local function treesitter_source_buffer(filename)
-  local loaded = loaded_file_buffer(filename)
   if file_contains_nul(filename) then return nil end
+  local loaded = loaded_file_buffer(filename)
   if loaded then
     if vim.bo[loaded].binary then return nil end
     return loaded
@@ -284,9 +301,8 @@ local function treesitter_source_buffer(filename)
   local cached = M._ts_source_bufs[filename]
   if cached and vim.api.nvim_buf_is_valid(cached) then return cached end
 
-  local read_ok, lines = pcall(vim.fn.readfile, filename)
-  if not read_ok or type(lines) ~= "table" then return nil end
-  if lines_contain_nul(lines) then return nil end
+  local lines = M._file_source_lines(filename)
+  if not lines then return nil end
 
   local buf = vim.api.nvim_create_buf(false, true)
   vim.bo[buf].bufhidden = "wipe"
@@ -1609,15 +1625,16 @@ end
 ---@param filename string
 ---@param callback_key string
 ---@param on_update? fun(syntax?: DiffReviewTreeSitterSyntax)
----@return DiffReviewTreeSitterSyntax?
+---@return DiffReviewTreeSitterSyntax? syntax
+---@return boolean pending
 local function cached_file_syntax(filename, callback_key, on_update)
   M._ts_syntax_cache = M._ts_syntax_cache or {}
   local cached = M._ts_syntax_cache[filename]
-  if cached == false then return nil end
-  if type(cached) == "table" and not cached.pending then return cached end
+  if cached == false then return nil, false end
+  if type(cached) == "table" and not cached.pending then return cached, false end
   if type(cached) == "table" and cached.pending then
     if on_update then cached.callbacks[callback_key] = on_update end
-    return nil
+    return nil, true
   end
 
   M._ts_syntax_cache[filename] = {
@@ -1633,7 +1650,7 @@ local function cached_file_syntax(filename, callback_key, on_update)
       if not ok then notify_error("Tree-sitter syntax update failed: " .. tostring(err)) end
     end
   end)
-  return nil
+  return nil, true
 end
 
 ---@param context DiffReviewHunkTreeSitterContext|string?
@@ -2361,10 +2378,14 @@ local function line_number_width(value)
 end
 
 ---@param hunk DiffReviewParsedHunk
+---@param opts? { preserve_trailing_blank?: boolean }
 ---@return DiffReviewParsedHunk
-local function parse_hunk_body(hunk)
-  while #hunk.body > 0 and hunk.body[#hunk.body]:match("^%s*$") do
-    hunk.body[#hunk.body] = nil
+local function parse_hunk_body(hunk, opts)
+  opts = opts or {}
+  if not opts.preserve_trailing_blank then
+    while #hunk.body > 0 and hunk.body[#hunk.body]:match("^%s*$") do
+      hunk.body[#hunk.body] = nil
+    end
   end
 
   local old_line = hunk.old_start
@@ -2429,15 +2450,22 @@ local function hunk_line_visible_in_context_scope(parsed_line, context)
   return parsed_line.new_line >= scope_start and parsed_line.new_line <= scope_end
 end
 
+---@alias DiffReviewDiffSyntaxSide "old"|"new"
+
 ---@param diff_text string
+---@param side DiffReviewDiffSyntaxSide
 ---@return string[]
-local function diff_syntax_source_lines(diff_text)
+local function diff_syntax_source_lines(diff_text, side)
   local lines = {}
   for _, block in ipairs(parse_unified_diff(diff_text)) do
     for _, hunk in ipairs(block.hunks) do
       local parsed_hunk = parse_hunk_body(hunk)
       for _, parsed_line in ipairs(parsed_hunk.lines) do
-        lines[#lines + 1] = parsed_line.code
+        if parsed_line.prefix == " "
+          or (side == "old" and parsed_line.prefix == "-")
+          or (side == "new" and parsed_line.prefix == "+") then
+          lines[#lines + 1] = parsed_line.code
+        end
       end
     end
   end
@@ -2446,13 +2474,14 @@ end
 
 ---@param filename string
 ---@param diff_text string
+---@param side DiffReviewDiffSyntaxSide
 ---@param callback_key string
 ---@param on_update? fun(syntax?: DiffReviewTreeSitterSyntax)
 ---@return DiffReviewTreeSitterSyntax? syntax
 ---@return boolean pending
-local function cached_diff_syntax(filename, diff_text, callback_key, on_update)
+local function cached_diff_syntax(filename, diff_text, side, callback_key, on_update)
   M._ts_diff_syntax_cache = M._ts_diff_syntax_cache or {}
-  local cache_key = filename .. ":" .. vim.fn.sha256(diff_text or "")
+  local cache_key = ("%s:%s:%s"):format(filename, side, vim.fn.sha256(diff_text or ""))
   local cached = M._ts_diff_syntax_cache[cache_key]
   if cached == false then return nil, false end
   if type(cached) == "table" and not cached.pending then return cached, false end
@@ -2461,7 +2490,8 @@ local function cached_diff_syntax(filename, diff_text, callback_key, on_update)
     return nil, true
   end
 
-  local lines = diff_syntax_source_lines(diff_text)
+  local lines = diff_syntax_source_lines(diff_text, side)
+  if #lines == 0 then return nil, false end
   M._ts_diff_syntax_cache[cache_key] = {
     pending = true,
     callbacks = on_update and { [callback_key] = on_update } or {},
@@ -2485,20 +2515,184 @@ local function cached_diff_syntax(filename, diff_text, callback_key, on_update)
   return nil, true
 end
 
+---@param filename string
+---@param diff_text string
+---@return string[]?
+function M._old_file_syntax_source_lines(filename, diff_text)
+  local lines = M._file_source_lines(filename)
+  if not lines then return nil end
+
+  local hunks = {}
+  for _, block in ipairs(parse_unified_diff(diff_text)) do
+    for _, hunk in ipairs(block.hunks) do
+      hunks[#hunks + 1] = parse_hunk_body(hunk, { preserve_trailing_blank = true })
+    end
+  end
+  if #hunks == 0 then return nil end
+
+  local old_lines = vim.deepcopy(lines)
+  for hunk_index = #hunks, 1, -1 do
+    local hunk = hunks[hunk_index]
+    local replacement = {}
+    for _, parsed_line in ipairs(hunk.lines) do
+      if parsed_line.prefix == " " or parsed_line.prefix == "-" then
+        replacement[#replacement + 1] = parsed_line.code
+      end
+    end
+
+    local start_index = math.max(tonumber(hunk.new_start) or 1, 1)
+    local remove_count = math.max(tonumber(hunk.new_count) or 0, 0)
+    if start_index > #old_lines + 1 then return nil end
+    if remove_count > 0 and (start_index + remove_count - 1) > #old_lines then return nil end
+    for _ = 1, remove_count do
+      if start_index <= #old_lines then
+        table.remove(old_lines, start_index)
+      end
+    end
+    for replacement_index = #replacement, 1, -1 do
+      table.insert(old_lines, start_index, replacement[replacement_index])
+    end
+  end
+
+  return old_lines
+end
+
+---@param filename string
+---@param diff_text string
+---@return boolean
+function M._diff_new_side_matches_file(filename, diff_text)
+  local lines = M._file_source_lines(filename)
+  if not lines then return false end
+
+  for _, block in ipairs(parse_unified_diff(diff_text)) do
+    for _, hunk in ipairs(block.hunks) do
+      local parsed_hunk = parse_hunk_body(hunk, { preserve_trailing_blank = true })
+      local expected = {}
+      for _, parsed_line in ipairs(parsed_hunk.lines) do
+        if parsed_line.prefix == " " or parsed_line.prefix == "+" then
+          expected[#expected + 1] = parsed_line.code
+        end
+      end
+      local start_index = math.max(tonumber(parsed_hunk.new_start) or 1, 1)
+      if start_index > #lines + 1 then return false end
+      if #expected > 0 and (start_index + #expected - 1) > #lines then return false end
+      for offset, expected_line in ipairs(expected) do
+        if lines[start_index + offset - 1] ~= expected_line then return false end
+      end
+    end
+  end
+
+  return true
+end
+
+---@param filename string
+---@param diff_text string
+---@param callback_key string
+---@param on_update? fun(syntax?: DiffReviewTreeSitterSyntax)
+---@return DiffReviewTreeSitterSyntax? syntax
+---@return boolean pending
+function M._cached_old_file_syntax(filename, diff_text, callback_key, on_update)
+  M._ts_diff_syntax_cache = M._ts_diff_syntax_cache or {}
+  local cache_key = ("%s:old-file:%s"):format(filename, vim.fn.sha256(diff_text or ""))
+  local cached = M._ts_diff_syntax_cache[cache_key]
+  if cached == false then return nil, false end
+  if type(cached) == "table" and not cached.pending then return cached, false end
+  if type(cached) == "table" and cached.pending then
+    if on_update then cached.callbacks[callback_key] = on_update end
+    return nil, true
+  end
+
+  local lines = M._old_file_syntax_source_lines(filename, diff_text)
+  if not lines or #lines == 0 then return nil, false end
+  M._ts_diff_syntax_cache[cache_key] = {
+    pending = true,
+    callbacks = on_update and { [callback_key] = on_update } or {},
+  }
+  M.compute_diff_syntax_async(filename, lines, function(syntax)
+    local pending = M._ts_diff_syntax_cache and M._ts_diff_syntax_cache[cache_key]
+    local callbacks = type(pending) == "table" and pending.callbacks or {}
+    M._ts_diff_syntax_cache[cache_key] = syntax or false
+    for _, callback in pairs(callbacks) do
+      local ok, err = pcall(callback, syntax)
+      if not ok then notify_error("Tree-sitter old file syntax update failed: " .. tostring(err)) end
+    end
+    if syntax and status_render_current_model and M._status and M._status.buf then
+      vim.schedule(function()
+        if M._status and M._status.buf and vim.api.nvim_buf_is_valid(M._status.buf) then
+          status_render_current_model()
+        end
+      end)
+    end
+  end)
+  return nil, true
+end
+
+---@param hunk_staged? boolean[]
+---@param opts? table
+---@return boolean
+function M._diff_uses_file_syntax(hunk_staged, opts)
+  opts = opts or {}
+  if opts.syntax_source == "file" then return true end
+  if opts.syntax_source == "diff" then return false end
+  for _, staged in ipairs(hunk_staged or {}) do
+    if staged then return false end
+  end
+  return true
+end
+
+---@param filename string
+---@param diff_text string
+---@param hunk_staged? boolean[]
+---@param callback_key string
+---@param on_update? fun(syntax?: DiffReviewTreeSitterSyntax)
+---@param opts? table
+function M._prewarm_diff_syntax(filename, diff_text, hunk_staged, callback_key, on_update, opts)
+  opts = opts or {}
+  local syntax_diff_text = opts.syntax_diff_text or diff_text
+  if M._diff_uses_file_syntax(hunk_staged, opts) and M._diff_new_side_matches_file(filename, syntax_diff_text) then
+    local old_syntax, old_pending = M._cached_old_file_syntax(filename, syntax_diff_text, callback_key .. ":old-file", on_update)
+    if not old_syntax and not old_pending then
+      cached_diff_syntax(filename, diff_text, "old", callback_key .. ":old", on_update)
+    end
+    local syntax, pending = cached_file_syntax(filename, callback_key .. ":file", on_update)
+    if not syntax and not pending then
+      cached_diff_syntax(filename, diff_text, "new", callback_key .. ":new", on_update)
+    end
+  else
+    cached_diff_syntax(filename, diff_text, "old", callback_key .. ":old", on_update)
+    cached_diff_syntax(filename, diff_text, "new", callback_key .. ":new", on_update)
+  end
+end
+
+---@param file DiffReviewStatusFile?
+---@return string?
+function M._status_file_syntax_diff_text(file)
+  if not file then return nil end
+  local hunks = status_diff_hunks_for_file(file)
+  local diffs = {}
+  for _, hunk in ipairs(hunks) do
+    if hunk.diff and hunk.diff ~= "" then diffs[#diffs + 1] = hunk.diff end
+  end
+  if #diffs == 0 then return nil end
+  return table.concat(diffs, "\n")
+end
+
 ---@param file DiffReviewStatusFile?
 ---@param callback_key_prefix string
 ---@param on_update? fun(syntax?: DiffReviewTreeSitterSyntax)
-local function prewarm_file_diff_syntax(file, callback_key_prefix, on_update)
+---@param opts? { syntax_source?: "file"|"diff" }
+local function prewarm_file_diff_syntax(file, callback_key_prefix, on_update, opts)
   if not (file and file.filename) then return end
+  opts = opts or {}
+  local combined_diff = opts.syntax_source == "file" and M._status_file_syntax_diff_text(file) or nil
+  if type(combined_diff) == "string" and combined_diff ~= "" then
+    opts = vim.tbl_extend("force", opts, { syntax_diff_text = combined_diff })
+  end
   local hunks = status_diff_hunks_for_file(file)
   for hunk_index, hunk in ipairs(hunks) do
     if hunk.diff and hunk.diff ~= "" then
-      cached_diff_syntax(
-        file.filename,
-        hunk.diff,
-        ("%s:%s:%d"):format(callback_key_prefix, file.filename, hunk_index),
-        on_update
-      )
+      local callback_key = ("%s:%s:%d"):format(callback_key_prefix, file.filename, hunk_index)
+      M._prewarm_diff_syntax(file.filename, hunk.diff, { hunk.staged }, callback_key, on_update, opts)
     end
   end
 end
@@ -2520,7 +2714,7 @@ local function hunk_body_row(parsed_line, gutter, file, syntax, syntax_row)
     line_hl = "DiffReviewDeleteBg"
   end
 
-  local row = { diff_review_line_hl = line_hl }
+  local row = { diff_review_bg_hl = line_hl }
   local diff_meta = {
     diff = {
       side = parsed_line.new_line and "right" or "left",
@@ -2528,6 +2722,7 @@ local function hunk_body_row(parsed_line, gutter, file, syntax, syntax_row)
       line = parsed_line.new_line or parsed_line.old_line,
       position = parsed_line.position,
       code = parsed_line.code,
+      prefix = parsed_line.prefix,
     },
   }
   row[#row + 1] = { "", nil, meta = diff_meta }
@@ -2551,19 +2746,41 @@ end
 ---@param filename? string
 ---@param context_callback_key? fun(hunk_line: number): string
 ---@param on_context_update? fun()
----@param opts? { context_line: integer?, boundary_context: boolean?, suppress_start_boundary: boolean?, suppress_end_boundary: boolean? }
+---@param opts? { context_line: integer?, boundary_context: boolean?, suppress_start_boundary: boolean?, suppress_end_boundary: boolean?, syntax_source?: "file"|"diff", syntax_diff_text?: string }
 local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_callback_key, on_context_update, opts)
   opts = opts or {}
 
   local diff = parse_unified_diff(diff_text)
+  local syntax_diff_text = opts.syntax_diff_text or diff_text
   local ret = {} ---@type table[]
   local hunk_idx = 0
-  local syntax = nil
+  local old_syntax = nil
+  local old_file_syntax = nil
+  local new_syntax = nil
+  local file_syntax = nil
   local syntax_pending = false
-  local syntax_row = 0
+  local old_syntax_row = 0
+  local new_syntax_row = 0
   if filename then
     local syntax_callback_key = context_callback_key and context_callback_key(0) or ("diff-row:" .. filename .. ":0")
-    syntax, syntax_pending = cached_diff_syntax(filename, diff_text, syntax_callback_key .. ":diff-syntax", on_context_update)
+    local old_pending = false
+    local old_file_pending = false
+    local new_pending = false
+    local file_pending = false
+    if M._diff_uses_file_syntax(hunk_staged, opts) and M._diff_new_side_matches_file(filename, syntax_diff_text) then
+      old_file_syntax, old_file_pending = M._cached_old_file_syntax(filename, syntax_diff_text, syntax_callback_key .. ":old-file-syntax", on_context_update)
+      if not old_file_syntax and not old_file_pending then
+        old_syntax, old_pending = cached_diff_syntax(filename, diff_text, "old", syntax_callback_key .. ":old-diff-syntax", on_context_update)
+      end
+      file_syntax, file_pending = cached_file_syntax(filename, syntax_callback_key .. ":file-syntax", on_context_update)
+      if not file_syntax and not file_pending then
+        new_syntax, new_pending = cached_diff_syntax(filename, diff_text, "new", syntax_callback_key .. ":new-diff-syntax", on_context_update)
+      end
+    else
+      old_syntax, old_pending = cached_diff_syntax(filename, diff_text, "old", syntax_callback_key .. ":old-diff-syntax", on_context_update)
+      new_syntax, new_pending = cached_diff_syntax(filename, diff_text, "new", syntax_callback_key .. ":new-diff-syntax", on_context_update)
+    end
+    syntax_pending = old_pending or old_file_pending or new_pending or file_pending
   end
 
   for _, block in ipairs(diff) do
@@ -2605,10 +2822,29 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
       end
       ret[#ret + 1] = hunk_header_row(header_parts)
       for _, parsed_line in ipairs(hunk.lines) do
-        if hunk_line_visible_in_context_scope(parsed_line, raw_context) then
-          ret[#ret + 1] = hunk_body_row(parsed_line, gutter, filename or block.file, syntax, syntax_row)
+        local row_syntax = nil
+        local row_syntax_row = nil
+        if parsed_line.prefix == "-" then
+          row_syntax = old_file_syntax or old_syntax
+          row_syntax_row = old_file_syntax and parsed_line.old_line and (parsed_line.old_line - 1) or old_syntax_row
+        elseif file_syntax and parsed_line.new_line then
+          row_syntax = file_syntax
+          row_syntax_row = parsed_line.new_line - 1
+        else
+          row_syntax = new_syntax
+          row_syntax_row = new_syntax_row
         end
-        syntax_row = syntax_row + 1
+        if hunk_line_visible_in_context_scope(parsed_line, raw_context) then
+          ret[#ret + 1] = hunk_body_row(parsed_line, gutter, filename or block.file, row_syntax, row_syntax_row)
+        end
+        if parsed_line.prefix == " " then
+          old_syntax_row = old_syntax_row + 1
+          new_syntax_row = new_syntax_row + 1
+        elseif parsed_line.prefix == "-" then
+          old_syntax_row = old_syntax_row + 1
+        elseif parsed_line.prefix == "+" then
+          new_syntax_row = new_syntax_row + 1
+        end
       end
       if opts.boundary_context and type(raw_context) == "table" then
         local node_start = raw_context.start_row + 1
@@ -2673,10 +2909,16 @@ local function render_highlight_rows(buf, ns, rows)
       end
     end
     lines[row_index] = table.concat(line_parts)
-    if row.diff_review_line_hl then
-      line_highlights[#line_highlights + 1] = {
+    if row.diff_review_bg_hl then
+      extmarks[#extmarks + 1] = {
         line = row_index,
-        hl_group = row.diff_review_line_hl,
+        col = 0,
+        opts = {
+          end_col = #lines[row_index],
+          hl_group = row.diff_review_bg_hl,
+          hl_eol = true,
+          priority = 70,
+        },
       }
     end
     if empty_diff_row then empty_diff_rows[row_index] = true end
@@ -5154,7 +5396,15 @@ local function status_add_fancy_row(row, entry, indent)
   if diff_line and entry then
     line_entry = vim.tbl_extend("force", entry, { diff_line = diff_line })
   end
-  local line = status_add_line(line_text, line_entry, row.diff_review_line_hl)
+  local line = status_add_line(line_text, line_entry)
+  if row.diff_review_bg_hl then
+    status_add_extmark(line, 0, {
+      end_col = #line_text,
+      hl_group = row.diff_review_bg_hl,
+      hl_eol = true,
+      priority = 70,
+    })
+  end
   if row.diff_review_boundary then
     M._status.boundary_lines = M._status.boundary_lines or {}
     M._status.boundary_lines[line] = true
@@ -5262,10 +5512,92 @@ end
 ---@field status? string
 ---@field changeType? string
 
+---@class DiffReviewDiffFileStatus
+---@field relpath string
+---@field status string
+---@field original_relpath? string
+
 ---@class DiffReviewStatusDiffProvider
 ---@field section_name string
 ---@field default_status string
 ---@field files? DiffReviewStatusDiffProviderFile[]
+
+---@param diff_text string
+---@return table<string, DiffReviewDiffFileStatus>
+function M._diff_file_statuses(diff_text)
+  local statuses = {} ---@type table<string, DiffReviewDiffFileStatus>
+  local current = nil ---@type { old_path?: string, new_path?: string, status?: string }?
+
+  local function clean_path(value)
+    if not value or value == "" or value == "/dev/null" then return nil end
+    local path = value
+    local tab_index = path:find("\t", 1, true)
+    if tab_index then path = path:sub(1, tab_index - 1) end
+    if path:sub(1, 2) == "a/" or path:sub(1, 2) == "b/" then
+      path = path:sub(3)
+    end
+    return path ~= "" and path or nil
+  end
+
+  local function flush_current()
+    if not current then return end
+    local relpath = current.new_path or current.old_path
+    if not relpath then
+      current = nil
+      return
+    end
+
+    local status = current.status
+    if not status then
+      if current.old_path == nil and current.new_path ~= nil then
+        status = "A"
+      elseif current.old_path ~= nil and current.new_path == nil then
+        status = "D"
+      else
+        status = "M"
+      end
+    end
+
+    statuses[relpath] = {
+      relpath = relpath,
+      status = status,
+      original_relpath = current.old_path and current.old_path ~= relpath and current.old_path or nil,
+    }
+    current = nil
+  end
+
+  for _, line in ipairs(vim.split(diff_text or "", "\n", { plain = true })) do
+    if line:find("^diff %-%-git ") then
+      flush_current()
+      current = {}
+    elseif current then
+      if line:find("^new file mode") then
+        current.status = "A"
+      elseif line:find("^deleted file mode") then
+        current.status = "D"
+      elseif line:find("^rename from ") then
+        current.status = "R"
+        current.old_path = clean_path(line:sub(13))
+      elseif line:find("^rename to ") then
+        current.status = "R"
+        current.new_path = clean_path(line:sub(11))
+      elseif line:find("^copy from ") then
+        current.status = "C"
+        current.old_path = clean_path(line:sub(11))
+      elseif line:find("^copy to ") then
+        current.status = "C"
+        current.new_path = clean_path(line:sub(9))
+      elseif line:find("^%-%-%- ") then
+        current.old_path = clean_path(line:sub(5))
+      elseif line:find("^%+%+%+ ") then
+        current.new_path = clean_path(line:sub(5))
+      end
+    end
+  end
+  flush_current()
+
+  return statuses
+end
 
 ---@param cwd string
 ---@param provider DiffReviewStatusDiffProvider
@@ -5274,6 +5606,7 @@ end
 local function status_files_from_diff_provider(cwd, provider, diff_text)
   local files_by_name = {} ---@type table<string, DiffReviewStatusFile>
   local files_with_provider_stats = {} ---@type table<string, boolean>
+  local diff_file_statuses = M._diff_file_statuses(diff_text or "")
   local files = {} ---@type DiffReviewStatusFile[]
 
   local function ensure_file(relpath, stats)
@@ -5299,12 +5632,23 @@ local function status_files_from_diff_provider(cwd, provider, diff_text)
       file.removed = stats.deletions or file.removed or 0
       file.status = stats.changeType or stats.status or file.status
       file.git_status = stats.changeType or stats.status or file.git_status
+    elseif not files_with_provider_stats[filename] then
+      local diff_file_status = diff_file_statuses[relpath]
+      if diff_file_status then
+        file.status = diff_file_status.status or file.status
+        file.git_status = diff_file_status.status or file.git_status
+        file.original_relpath = diff_file_status.original_relpath or file.original_relpath
+      end
     end
     return file
   end
 
   for _, provider_file in ipairs(provider.files or {}) do
     if provider_file.path and provider_file.path ~= "" then ensure_file(provider_file.path, provider_file) end
+  end
+
+  for relpath in pairs(diff_file_statuses) do
+    ensure_file(relpath, nil)
   end
 
   for _, parsed_hunk in ipairs(parse_diff(diff_text or "", false)) do
@@ -6500,11 +6844,17 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_ki
   ) or nil
   local suppress_start_boundary = same_hunk_context_scope(previous_context, current_context)
   local suppress_end_boundary = same_hunk_context_scope(current_context, next_context)
-  rows_key = ("%s:%s:%s:%s"):format(
+  local syntax_source = (entry_kind == nil or entry_kind == "hunk") and "file" or "diff"
+  local syntax_diff_text = nil
+  if syntax_source == "file" then
+    syntax_diff_text = M._status_file_syntax_diff_text(file)
+  end
+  rows_key = ("%s:%s:%s:%s:%s"):format(
     hunk_key,
     hunk.staged and "staged" or "unstaged",
     suppress_start_boundary and "no-start" or "start",
-    suppress_end_boundary and "no-end" or "end"
+    suppress_end_boundary and "no-end" or "end",
+    syntax_source .. ":" .. vim.fn.sha256(syntax_diff_text or hunk.diff or "")
   )
   local rows = M._status.fancy_rows[rows_key]
   if not rows then
@@ -6522,6 +6872,8 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_ki
         boundary_context = true,
         suppress_start_boundary = suppress_start_boundary,
         suppress_end_boundary = suppress_end_boundary,
+        syntax_source = syntax_source,
+        syntax_diff_text = syntax_diff_text,
       }
     )
     if ok then
@@ -6634,12 +6986,14 @@ local function status_render_file(file, entry_kind, hunk_entry_kind, file_key_ov
   local file_folded = (not opts.force_open) and status_folded(file_key, default_folded)
   local stats = file.untracked and "new" or ("+%d -%d"):format(file.added, file.removed)
   local change_label, change_label_hl = M._status_file_change_label(file)
-  local line = ("%s%s %s %s"):format(string.rep(" ", status_file_indent), change_label, file.relpath, stats)
+  local change_label_width = #"Modified"
+  local padded_change_label = change_label .. string.rep(" ", math.max(0, change_label_width - #change_label))
+  local line = ("%s%s %s %s"):format(string.rep(" ", status_file_indent), padded_change_label, file.relpath, stats)
   local entry = { id = file_key, kind = entry_kind or "file", file = file }
   local line_number = status_add_line(line, entry)
   local label_start = status_file_indent
   local label_end = label_start + #change_label
-  local path_start = label_end + 1
+  local path_start = label_start + #padded_change_label + 1
   local stats_start = #line - #stats
   status_add_highlight(line_number, label_start, label_end, change_label_hl)
   status_add_highlight(line_number, path_start, stats_start - 1, "DiffReviewStatusPath")
@@ -7056,14 +7410,19 @@ end
 local function status_prewarm_entry_syntax(entry)
   if not entry then return end
   if M._status_entry_is_file_like(entry) and entry.file then
-    prewarm_file_diff_syntax(entry.file, "status-cursor-prewarm:" .. (entry.id or entry.file.filename))
+    local syntax_source = entry.kind == "file" and "file" or "diff"
+    prewarm_file_diff_syntax(entry.file, "status-cursor-prewarm:" .. (entry.id or entry.file.filename), nil, { syntax_source = syntax_source })
   elseif M._status_entry_is_hunk_like(entry) and entry.file and entry.hunk then
-    cached_diff_syntax(
-      entry.file.filename,
-      entry.hunk.diff,
-      "status-cursor-prewarm:" .. (entry.id or entry.file.filename),
-      nil
-    )
+    local callback_key = "status-cursor-prewarm:" .. (entry.id or entry.file.filename)
+    local syntax_source = entry.kind == "hunk" and "file" or "diff"
+    local syntax_diff_text = nil
+    if syntax_source == "file" then
+      syntax_diff_text = M._status_file_syntax_diff_text(entry.file)
+    end
+    M._prewarm_diff_syntax(entry.file.filename, entry.hunk.diff, { entry.hunk.staged }, callback_key, nil, {
+      syntax_source = syntax_source,
+      syntax_diff_text = syntax_diff_text,
+    })
   end
 end
 
@@ -7377,6 +7736,304 @@ local function status_set_plain_lines(buf, lines)
   M._status_apply_hint_bar(buf)
 end
 
+---@return string
+function M._gitstatus_debug_log_path()
+  local dir = (vim.fn.stdpath("state") or ".") .. "/diff_review"
+  pcall(vim.fn.mkdir, dir, "p")
+  return dir .. "/gitstatus-debug.log"
+end
+
+M._gitstatus_debug = M._gitstatus_debug or {}
+
+---@param value any
+---@return string
+function M._gitstatus_debug.one_line(value)
+  return vim.inspect(value):gsub("\r", "\\r"):gsub("\n", "\\n")
+end
+
+---@param value any
+---@return string
+function M._gitstatus_debug.text(value)
+  return tostring(value or ""):gsub("\r", "\\r"):gsub("\n", "\\n")
+end
+
+---@param cache any
+---@return string
+function M._gitstatus_debug.cache_state(cache)
+  if cache == nil then return "nil" end
+  if cache == false then return "false" end
+  if type(cache) == "table" then
+    if cache.pending then return "pending" end
+    local parts = { "ready" }
+    if cache.buf then parts[#parts + 1] = "buf=" .. tostring(cache.buf) end
+    if cache.tree then parts[#parts + 1] = "tree=true" end
+    if cache.highlight_query then parts[#parts + 1] = "query=true" end
+    return table.concat(parts, " ")
+  end
+  return type(cache)
+end
+
+---@param details table
+---@return string
+function M._gitstatus_debug.extmark_details(details)
+  local parts = {}
+  if details.hl_group ~= nil then parts[#parts + 1] = "hl=" .. M._gitstatus_debug.one_line(details.hl_group) end
+  if details.line_hl_group ~= nil then parts[#parts + 1] = "line_hl=" .. M._gitstatus_debug.one_line(details.line_hl_group) end
+  if details.hl_eol ~= nil then parts[#parts + 1] = "eol=" .. tostring(details.hl_eol) end
+  if details.priority ~= nil then parts[#parts + 1] = "prio=" .. tostring(details.priority) end
+  if details.end_col ~= nil then parts[#parts + 1] = "end=" .. tostring(details.end_col) end
+  if details.virt_text ~= nil then parts[#parts + 1] = "virt=" .. M._gitstatus_debug.one_line(details.virt_text) end
+  if details.conceal ~= nil then parts[#parts + 1] = "conceal=" .. M._gitstatus_debug.one_line(details.conceal) end
+  if details.url ~= nil then parts[#parts + 1] = "url=" .. M._gitstatus_debug.one_line(details.url) end
+  return table.concat(parts, " ")
+end
+
+---@param buf integer
+---@param row integer 1-based
+---@return string[]
+function M._gitstatus_debug.extmarks_for_row(buf, row)
+  local lines = {}
+  local namespaces = vim.api.nvim_get_namespaces()
+  local namespace_items = {}
+  for name, namespace in pairs(namespaces) do
+    namespace_items[#namespace_items + 1] = { name = name, namespace = namespace }
+  end
+  table.sort(namespace_items, function(left, right)
+    return left.name < right.name
+  end)
+
+  for _, item in ipairs(namespace_items) do
+    local ok, marks = pcall(
+      vim.api.nvim_buf_get_extmarks,
+      buf,
+      item.namespace,
+      { row - 1, 0 },
+      { row - 1, -1 },
+      { details = true, overlap = true }
+    )
+    if ok and type(marks) == "table" and #marks > 0 then
+      for _, mark in ipairs(marks) do
+        local details = mark[4] or {}
+        lines[#lines + 1] = ("    ns=%s(%d) col=%s %s"):format(
+          item.name,
+          item.namespace,
+          tostring(mark[3]),
+          M._gitstatus_debug.extmark_details(details)
+        )
+      end
+    end
+  end
+  return lines
+end
+
+---@param win integer
+---@param row integer 1-based
+---@param line string
+---@return string
+function M._gitstatus_debug.first_token_cell(win, row, line)
+  local start_col, end_col = line:find("[%a_][%w_]*")
+  if not start_col then return "token=<none>" end
+  local token = line:sub(start_col, end_col)
+  local screen_ok, screen_pos = pcall(vim.fn.screenpos, win, row, start_col)
+  if not (screen_ok and type(screen_pos) == "table" and tonumber(screen_pos.row) and tonumber(screen_pos.row) > 0) then
+    return ("token=%s screen=<not-visible>"):format(M._gitstatus_debug.one_line(token))
+  end
+  local cell_ok, cell = pcall(vim.api.nvim__inspect_cell, 1, screen_pos.row - 1, screen_pos.col - 1)
+  if not cell_ok then
+    return ("token=%s screen=%s cell_error=%s"):format(
+      M._gitstatus_debug.one_line(token),
+      M._gitstatus_debug.one_line(screen_pos),
+      M._gitstatus_debug.text(cell)
+    )
+  end
+  return ("token=%s screen=%s cell=%s"):format(
+    M._gitstatus_debug.one_line(token),
+    M._gitstatus_debug.one_line(screen_pos),
+    M._gitstatus_debug.one_line(cell)
+  )
+end
+
+---@param entry DiffReviewStatusEntry?
+---@return string
+function M._gitstatus_debug.entry(entry)
+  if not entry then return "entry=nil" end
+  local parts = {
+    "kind=" .. tostring(entry.kind),
+    "id=" .. tostring(entry.id),
+  }
+  if entry.file then
+    parts[#parts + 1] = "file=" .. tostring(entry.file.filename)
+    parts[#parts + 1] = "relpath=" .. tostring(entry.file.relpath)
+    parts[#parts + 1] = "file_status=" .. tostring(entry.file.git_status or entry.file.status)
+  end
+  if entry.hunk then
+    parts[#parts + 1] = "hunk_pos=" .. tostring(entry.hunk.pos)
+    parts[#parts + 1] = "hunk_staged=" .. tostring(entry.hunk.staged)
+  end
+  if entry.diff_line then
+    parts[#parts + 1] = "diff=" .. M._gitstatus_debug.one_line(entry.diff_line)
+  end
+  return table.concat(parts, " ")
+end
+
+---@param state table
+---@param filename string
+---@return string[]
+function M._gitstatus_debug.file_syntax(state, filename)
+  local lines = {}
+  if not filename or filename == "" then return lines end
+  if state.gitstatus_debug_seen_files[filename] then return lines end
+  state.gitstatus_debug_seen_files[filename] = true
+
+  lines[#lines + 1] = "  syntax file=" .. filename
+  local file_entry = nil
+  for _, section in ipairs(state.sections or {}) do
+    for _, file in ipairs(section.files or {}) do
+      if file.filename == filename then
+        file_entry = file
+        break
+      end
+    end
+    if file_entry then break end
+  end
+  if file_entry then
+    local diff_text = M._status_file_syntax_diff_text(file_entry)
+    lines[#lines + 1] = "    combined_diff_len=" .. tostring(diff_text and #diff_text or 0)
+    lines[#lines + 1] = "    new_side_matches_file=" .. tostring(diff_text and M._diff_new_side_matches_file(filename, diff_text) or nil)
+  else
+    lines[#lines + 1] = "    status_file=<not-found>"
+  end
+  local source_lines = M._file_source_lines(filename)
+  lines[#lines + 1] = "    source_lines=" .. tostring(source_lines and #source_lines or nil)
+  lines[#lines + 1] = "    file_syntax_cache=" .. M._gitstatus_debug.cache_state(M._ts_syntax_cache and M._ts_syntax_cache[filename])
+  return lines
+end
+
+---@param buf integer
+---@param reason string
+function M._gitstatus_debug.dump(buf, reason)
+  if not M._gitstatus_debug_force and #vim.api.nvim_list_uis() == 0 then return end
+  local state = M._status_states and M._status_states[buf] or (M._status and M._status.buf == buf and M._status) or nil
+  if not (state and state.view_kind == "status" and vim.api.nvim_buf_is_valid(buf)) then return end
+  state.gitstatus_debug_dump_reason = reason
+  if state.gitstatus_debug_dump_pending then return end
+  state.gitstatus_debug_dump_pending = true
+
+  vim.defer_fn(function()
+    state = M._status_states and M._status_states[buf] or (M._status and M._status.buf == buf and M._status) or nil
+    if state then state.gitstatus_debug_dump_pending = false end
+    if not M._gitstatus_debug_force and #vim.api.nvim_list_uis() == 0 then return end
+    if not (state and state.view_kind == "status" and vim.api.nvim_buf_is_valid(buf)) then return end
+    reason = state.gitstatus_debug_dump_reason or reason
+    local win = vim.fn.win_findbuf(buf)[1]
+    local lines = {
+      "GitStatus debug dump",
+      "reason=" .. tostring(reason),
+      "time=" .. os.date("%Y-%m-%d %H:%M:%S"),
+      "buf=" .. tostring(buf),
+      "win=" .. tostring(win),
+      "cwd=" .. tostring(state.cwd),
+      "view_kind=" .. tostring(state.view_kind),
+      "request_id=" .. tostring(state.request_id),
+      "reconcile_generation=" .. tostring(state.reconcile_generation),
+      "line_count=" .. tostring(vim.api.nvim_buf_line_count(buf)),
+      "filetype=" .. tostring(vim.bo[buf].filetype),
+      "buftype=" .. tostring(vim.bo[buf].buftype),
+    }
+
+    if win and vim.api.nvim_win_is_valid(win) then
+      lines[#lines + 1] = "window_options=" .. M._gitstatus_debug.one_line({
+        conceallevel = vim.wo[win].conceallevel,
+        concealcursor = vim.wo[win].concealcursor,
+        foldenable = vim.wo[win].foldenable,
+        foldlevel = vim.wo[win].foldlevel,
+        foldmethod = vim.wo[win].foldmethod,
+        linebreak = vim.wo[win].linebreak,
+        wrap = vim.wo[win].wrap,
+        winbar = vim.wo[win].winbar,
+      })
+    else
+      lines[#lines + 1] = "window_options=<no-valid-window>"
+    end
+
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "syntax caches:"
+    state.gitstatus_debug_seen_files = {}
+    for _, entry in pairs(state.entries or {}) do
+      if entry and entry.file and entry.file.filename then
+        vim.list_extend(lines, M._gitstatus_debug.file_syntax(state, entry.file.filename))
+      end
+    end
+    state.gitstatus_debug_seen_files = nil
+
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "visible rows:"
+    local start_row = 1
+    local end_row = vim.api.nvim_buf_line_count(buf)
+    if win and vim.api.nvim_win_is_valid(win) then
+      vim.api.nvim_win_call(win, function()
+        start_row = vim.fn.line("w0")
+        end_row = vim.fn.line("w$")
+      end)
+    end
+    local buffer_lines = vim.api.nvim_buf_get_lines(buf, start_row - 1, end_row, false)
+    for offset, line in ipairs(buffer_lines) do
+      local row = start_row + offset - 1
+      local entry = state.entries and state.entries[row] or nil
+      lines[#lines + 1] = ("%4d | %s"):format(row, M._gitstatus_debug.text(line))
+      lines[#lines + 1] = "    " .. M._gitstatus_debug.entry(entry)
+      if win and vim.api.nvim_win_is_valid(win) then
+        lines[#lines + 1] = "    " .. M._gitstatus_debug.first_token_cell(win, row, line)
+      end
+      vim.list_extend(lines, M._gitstatus_debug.extmarks_for_row(buf, row))
+    end
+
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "diff rows missing Tree-sitter extmarks:"
+    local missing_count = 0
+    for row, entry in pairs(state.entries or {}) do
+      local diff_line = entry and entry.diff_line or nil
+      if diff_line and diff_line.code and diff_line.code:match("%S") then
+        local has_treesitter = false
+        for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(buf, M._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })) do
+          local details = mark[4] or {}
+          if type(details.hl_group) == "string" and details.hl_group:sub(1, 1) == "@" then
+            has_treesitter = true
+            break
+          elseif type(details.hl_group) == "table" then
+            for _, group in ipairs(details.hl_group) do
+              if tostring(group):sub(1, 1) == "@" then
+                has_treesitter = true
+                break
+              end
+            end
+            if has_treesitter then break end
+          end
+        end
+        if not has_treesitter then
+          missing_count = missing_count + 1
+          lines[#lines + 1] = ("%4d | %s | %s"):format(row, M._gitstatus_debug.text(diff_line.code), M._gitstatus_debug.entry(entry))
+        end
+      end
+    end
+    if missing_count == 0 then lines[#lines + 1] = "  none" end
+
+    local ok, err = pcall(vim.fn.writefile, lines, M._gitstatus_debug_log_path())
+    if not ok then
+      notify_debug("GitStatus debug dump failed: " .. tostring(err), vim.log.levels.WARN, { title = "GitStatus" })
+    end
+  end, 250)
+end
+
+---@param buf integer
+function M._status_stop_markdown_highlighter(buf)
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  if vim.bo[buf].filetype ~= "GitStatus" then return end
+  if vim.treesitter and type(vim.treesitter.stop) == "function" then
+    pcall(vim.treesitter.stop, buf, "markdown")
+  end
+end
+
 ---@param buf integer
 ---@param target_id? string
 ---@param fallback_line? integer
@@ -7468,8 +8125,10 @@ local function status_render_loaded(buf, target_id, fallback_line, opts, head_li
   elseif view_kind == "review" then
     M._review.on_render(buf)
   elseif view_kind == "status" then
+    M._status_stop_markdown_highlighter(buf)
     M._status_issues.sync_modifiable(buf)
   end
+  M._gitstatus_debug.dump(buf, "status_render_loaded")
 end
 
 ---@param cwd string
