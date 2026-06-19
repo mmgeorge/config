@@ -3491,6 +3491,15 @@ end
 ---@field new_line? integer
 ---@field text string
 
+---@param text string?
+---@return boolean
+function M._hunk_context_padding_line_is_useful(text)
+  if type(text) ~= "string" then return false end
+  if text:match("^%s*$") then return false end
+  if text:match("^%s*[})%]]+[,;]?%s*$") then return false end
+  return true
+end
+
 ---@param source_lines string[]?
 ---@param hunk DiffReviewParsedHunk
 ---@param context DiffReviewHunkTreeSitterContext|string?
@@ -3554,7 +3563,10 @@ function M._hunk_context_padding_lines(source_lines, hunk, context, side, occupi
       end
       for line_number = first_line, last_line do
         local is_scope_boundary = line_number == scope_start or line_number == scope_end
-        if not is_scope_boundary and not occupied_lines[line_number] and not seen_candidates[line_number] then
+        if not is_scope_boundary
+          and not occupied_lines[line_number]
+          and not seen_candidates[line_number]
+          and M._hunk_context_padding_line_is_useful(source_lines[line_number]) then
           seen_candidates[line_number] = true
           candidates[#candidates + 1] = line_number
         end

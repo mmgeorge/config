@@ -193,6 +193,63 @@ local function trigger_normal_mapping(key, row)
   mapping.callback()
 end
 
+local function assert_padding_omits_trailing_delimiters()
+  local padding_source_lines = {}
+  for line_number = 1, 90 do
+    padding_source_lines[line_number] = ("// filler %d"):format(line_number)
+  end
+  padding_source_lines[72] = "        }"
+  padding_source_lines[73] = "      }"
+  padding_source_lines[74] = ""
+  padding_source_lines[75] = "      if let Some(source) = &particle_source"
+
+  local hunk = {
+    lines = {
+      {
+        prefix = "+",
+        new_line = 75,
+        code = padding_source_lines[75],
+      },
+    },
+  }
+  local context = {
+    start_row = 56,
+    end_row = 89,
+    path_start_rows = {},
+    path_end_rows = {},
+    sibling_before_rows = {},
+    sibling_after_rows = {},
+  }
+
+  local padding = diff_review._hunk_context_padding_lines(
+    padding_source_lines,
+    hunk,
+    context,
+    "before",
+    { [75] = true },
+    nil,
+    { changed_line = 75, after_line = 83 }
+  )
+  assert_true(#padding == 0, "trailing delimiter padding should be omitted")
+  assert_true(not diff_review._hunk_context_padding_line_is_useful("        }"), "closing delimiter padding should not be useful")
+  assert_true(not diff_review._hunk_context_padding_line_is_useful(""), "blank padding should not be useful")
+
+  padding_source_lines[74] = "      let previous_particle = particle_source.clone();"
+  padding = diff_review._hunk_context_padding_lines(
+    padding_source_lines,
+    hunk,
+    context,
+    "before",
+    { [75] = true },
+    nil,
+    { changed_line = 75, after_line = 83 }
+  )
+  assert_true(
+    #padding == 1 and padding[1].line_number == 74,
+    "useful same-scope padding should still render before a changed line"
+  )
+end
+
 local function assert_current_file_jump(expected_file, expected_line, expected_text)
   local actual_file = vim.fs.normalize(vim.api.nvim_buf_get_name(0))
   assert_true(actual_file == vim.fs.normalize(expected_file), "expected current file " .. expected_file .. ", got " .. actual_file)
@@ -211,6 +268,8 @@ local function system_call_count()
 end
 
 local function run()
+  assert_padding_omits_trailing_delimiters()
+
   vim.fn.delete(root, "rf")
   assert_true(vim.fn.mkdir(root .. "/src", "p") == 1, "mkdir failed")
   local diff_syntax_batches = {}
