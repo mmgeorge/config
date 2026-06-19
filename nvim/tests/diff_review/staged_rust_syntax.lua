@@ -327,6 +327,14 @@ local function line_has_highlight(buf, row, hl_group)
   return false
 end
 
+local function find_row_with_highlight(buf, pattern, hl_group)
+  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  for index, line in ipairs(lines) do
+    if line:find(pattern, 1, true) and line_has_highlight(buf, index, hl_group) then return index end
+  end
+  error("missing highlighted row: " .. pattern .. " [" .. hl_group .. "]\n" .. table.concat(lines, "\n"), 2)
+end
+
 local function line_has_treesitter_highlight(buf, row)
   local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
   for _, mark in ipairs(marks) do
@@ -444,6 +452,7 @@ local function diff_rows_for_file(file_suffix)
       rows[#rows + 1] = {
         row = row_number,
         diff_line = diff_line,
+        diff_lines = entry.diff_lines,
       }
     end
   end
@@ -475,7 +484,16 @@ local function ferrous_model_store_failures(buf)
       )
     end
 
-    if diff_line.prefix == "+" then
+    if type(row_info.diff_lines) == "table" and #row_info.diff_lines > 1 then
+      local inline_hl = diff_line.prefix == "-" and "DiffReviewDeleteBg" or "DiffReviewAddBg"
+      if not line_has_highlight(buf, row, inline_hl) then
+        failures[#failures + 1] = ("%d missing compact inline highlight %s for %s"):format(row, inline_hl, code)
+      end
+      if line_has_background_highlight(buf, row, "DiffReviewAddBg")
+        or line_has_background_highlight(buf, row, "DiffReviewDeleteBg") then
+        failures[#failures + 1] = ("%d compact row used full diff background for %s"):format(row, code)
+      end
+    elseif diff_line.prefix == "+" then
       if not line_has_background_highlight(buf, row, "DiffReviewAddBg") then
         failures[#failures + 1] = ("%d missing add background for %s"):format(row, code)
       end
@@ -854,13 +872,18 @@ local function run()
     return buffer_contains(buf, "let removed_a = CameraComponent")
   end, "multi-hunk staged Rust file did not render first hunk\n" .. buffer_dump(buf))
   wait_for(function()
-    return buffer_contains(buf, "Widget::new(CameraComponent { value })")
-  end, "multi-hunk staged Rust file did not render shifted old row\n" .. buffer_dump(buf))
-  local shifted_row = find_row(buf, "Widget::new(CameraComponent { value })")
+    return buffer_contains(buf, "Widget::new(CameraComponent { value: value + 1 })")
+  end, "multi-hunk staged Rust file did not render compact shifted row\n" .. buffer_dump(buf))
+  local shifted_row = find_row_with_highlight(buf, "Widget::new(CameraComponent { value: value + 1 })", "DiffReviewAddBg")
   wait_for(function()
-    local row = find_row(buf, "Widget::new(CameraComponent { value })")
+    local row = find_row_with_highlight(buf, "Widget::new(CameraComponent { value: value + 1 })", "DiffReviewAddBg")
     return line_has_highlight(buf, row, "@type")
-  end, "shifted old-line staged Rust row did not get type syntax highlight: " .. line_highlights(buf, shifted_row))
+  end, "compact shifted staged Rust row did not get type syntax highlight: " .. line_highlights(buf, shifted_row))
+  shifted_row = find_row_with_highlight(buf, "Widget::new(CameraComponent { value: value + 1 })", "DiffReviewAddBg")
+  assert_true(
+    line_has_highlight(buf, shifted_row, "DiffReviewAddBg"),
+    "compact shifted staged Rust row did not highlight the inserted span: " .. line_highlights(buf, shifted_row)
+  )
 
   trigger_normal_mapping("<Tab>", find_row(buf, "multi_hunk.rs"))
   trigger_normal_mapping("<Tab>", find_row(buf, "model_store.rs"))
@@ -905,18 +928,26 @@ local function run()
     "Ferrous clone row did not get function syntax highlight: " .. line_highlights(buf, clone_row)
   )
   assert_syntax_cell(buf, clone_row, "clone")
-  assert_diff_background_cell(buf, clone_row, "clone")
+  assert_true(
+    line_has_highlight(buf, clone_row, "DiffReviewAddBg"),
+    "Ferrous compact clone row did not get inline add highlight: " .. line_highlights(buf, clone_row)
+  )
 
   trigger_normal_mapping("<Tab>", find_row(buf, "model_store.rs"))
   trigger_normal_mapping("<Tab>", find_row(buf, "unstaged_multi_hunk.rs"))
   wait_for(function()
-    return buffer_contains(buf, "Widget::new(CameraComponent { value })")
-  end, "multi-hunk unstaged Rust file did not render shifted old row\n" .. buffer_dump(buf))
-  local unstaged_shifted_row = find_row(buf, "Widget::new(CameraComponent { value })")
+    return buffer_contains(buf, "Widget::new(CameraComponent { value: value + 1 })")
+  end, "multi-hunk unstaged Rust file did not render compact shifted row\n" .. buffer_dump(buf))
+  local unstaged_shifted_row = find_row_with_highlight(buf, "Widget::new(CameraComponent { value: value + 1 })", "DiffReviewAddBg")
   wait_for(function()
-    local row = find_row(buf, "Widget::new(CameraComponent { value })")
+    local row = find_row_with_highlight(buf, "Widget::new(CameraComponent { value: value + 1 })", "DiffReviewAddBg")
     return line_has_highlight(buf, row, "@type")
-  end, "shifted old-line unstaged Rust row did not get type syntax highlight: " .. line_highlights(buf, unstaged_shifted_row))
+  end, "compact shifted unstaged Rust row did not get type syntax highlight: " .. line_highlights(buf, unstaged_shifted_row))
+  unstaged_shifted_row = find_row_with_highlight(buf, "Widget::new(CameraComponent { value: value + 1 })", "DiffReviewAddBg")
+  assert_true(
+    line_has_highlight(buf, unstaged_shifted_row, "DiffReviewAddBg"),
+    "compact shifted unstaged Rust row did not highlight the inserted span: " .. line_highlights(buf, unstaged_shifted_row)
+  )
 end
 
 local ok, err = xpcall(run, debug.traceback)
