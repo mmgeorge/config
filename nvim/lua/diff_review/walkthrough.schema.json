@@ -171,6 +171,23 @@
         }
       }
     },
+    "callout": {
+      "type": "object",
+      "required": ["kind", "text"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": ["important", "limitation", "temporary", "risk", "followup", "deviation", "workaround"],
+          "description": "Reviewer-critical callout kind. Deviation is for departures from the original plan; workaround is for a temporary or indirect fix for an issue not fully solved here."
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 180,
+          "description": "Compact reviewer-critical context, 180 characters or less. Do not restate the title or comment."
+        }
+      }
+    },
     "step": {
       "type": "object",
       "required": ["file", "start", "end", "comment"],
@@ -192,11 +209,15 @@
         "comment": {
           "type": "string",
           "minLength": 1,
-          "description": "What this step changes and why; 1-4 sentences. Do not repeat the file path - the reviewer UI displays the step's file name."
+          "description": "Mini justification for this step: problem or pressure first, then the solution/change and why it addresses that problem; 1-4 sentences, aiming for roughly 180-200 characters. Do not repeat the file path."
         },
         "title": {
           "type": "string",
-          "description": "Optional short step heading"
+          "description": "Succinct active action sentence for the inline step header, e.g. Route API requests through the limiter."
+        },
+        "callout": {
+          "$ref": "#/$defs/callout",
+          "description": "Optional singular callout for reviewer-critical context. Most steps omit it."
         }
       }
     }

@@ -45,11 +45,26 @@ narrative — use the diff only to confirm files and line numbers.
   unchanged context line lands the jump approximately and gets flagged as
   stale.
 - `file` is repo-relative with forward slashes.
-- `comment` explains **why** — what the region does and why it changed,
-  1-4 sentences. The reviewer can already see the code, and the reviewer UI
-  displays the step's file name, so do not repeat the file path in the
-  comment.
-- `title` is an optional short heading (a few words).
+- `title` should be present for every step. Write it as a succinct active
+  action sentence that states what this region does, such as `Route API
+  requests through the limiter.` Do not use noun-only headings like `Router
+  wiring` or `Token bucket middleware`.
+- `comment` is the step's mini justification: first state the problem,
+  limitation, risk, or review pressure; then state the solution, what changed,
+  and why that addresses it. Use 1-4 prose sentences without `Problem:` or
+  `Solution:` labels, aiming for roughly 180-200 characters when clarity allows.
+  The reviewer can already see the code, and the reviewer UI displays the step's
+  file name, so do not repeat the file path in the comment.
+- `callout` is optional, singular, and exceptional. Most steps should omit it.
+  Use it only for reviewer-critical context that would be easy to miss while
+  jumping between blocks: `important`, `limitation`, `temporary`, `risk`,
+  `followup`, `deviation`, or `workaround`.
+  Always use `deviation` when the implementation departs from the original plan;
+  this is high-priority review context. Use `workaround` when the change works
+  around a deeper issue that is not fully fixed here because the full fix would
+  be broader. Do not use `callouts` plural, do not add more than one callout,
+  and do not restate the step title or comment. Keep `callout.text` compact,
+  usually 120-180 characters.
 - Author the top-down review map as structured `overview`, `root`, and
   `tasks[]`; the DiffReview plugin derives the displayed walkthrough summary
   from this structure. Do not write a `summary` field.
@@ -122,8 +137,8 @@ narrative — use the diff only to confirm files and line numbers.
 - Exact file paths and ranges belong only in nested `steps`; do **not** include
   repo paths or bracketed file names in `overview`, `root`, task titles, group
   titles, subtask titles, item titles, or item notes. The plugin displays
-  nested steps as `Task X.Y`, where `X` is the task and `Y` is the step within
-  that task.
+  nested steps as `X.Y - <step title>`, where `X` is the task and `Y` is the
+  step within that task.
   Derived summary example:
 
   ```
@@ -354,6 +369,23 @@ alongside this skill). The schema, inlined:
         }
       }
     },
+    "callout": {
+      "type": "object",
+      "required": ["kind", "text"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": ["important", "limitation", "temporary", "risk", "followup", "deviation", "workaround"],
+          "description": "Reviewer-critical callout kind. Deviation is for departures from the original plan; workaround is for a temporary or indirect fix for an issue not fully solved here."
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 180,
+          "description": "Compact reviewer-critical context, 180 characters or less. Do not restate the title or comment."
+        }
+      }
+    },
     "step": {
       "type": "object",
       "required": ["file", "start", "end", "comment"],
@@ -375,11 +407,15 @@ alongside this skill). The schema, inlined:
         "comment": {
           "type": "string",
           "minLength": 1,
-          "description": "What this step changes and why; 1-4 sentences. Do not repeat the file path - the reviewer UI displays the step's file name."
+          "description": "Mini justification for this step: problem or pressure first, then the solution/change and why it addresses that problem; 1-4 sentences, aiming for roughly 180-200 characters. Do not repeat the file path."
         },
         "title": {
           "type": "string",
-          "description": "Optional short step heading"
+          "description": "Succinct active action sentence for the inline step header, e.g. Route API requests through the limiter."
+        },
+        "callout": {
+          "$ref": "#/$defs/callout",
+          "description": "Optional singular callout for reviewer-critical context. Most steps omit it."
         }
       }
     }
@@ -414,11 +450,11 @@ alongside this skill). The schema, inlined:
                   "note": "wrap /api without throttling health routes",
                   "steps": [
                     {
-                      "title": "Wire into the router",
+                      "title": "Route API requests through the limiter.",
                       "file": "src/router.rs",
                       "start": { "line": 41, "col": 5 },
                       "end": { "line": 44, "col": 60 },
-                      "comment": "The middleware is layered onto the /api scope only; health checks and static assets stay unthrottled."
+                      "comment": "API requests currently bypass throttling, so one client can monopolize backend work. Layering the middleware onto the /api scope gates those requests while leaving health checks and static assets unthrottled."
                     }
                   ]
                 }
@@ -441,11 +477,15 @@ alongside this skill). The schema, inlined:
                   "note": "return allow/deny before request handling",
                   "steps": [
                     {
-                      "title": "Token bucket middleware",
+                      "title": "Decide whether each request may continue.",
                       "file": "src/middleware/rate_limit.rs",
                       "start": { "line": 18, "col": 1 },
                       "end": { "line": 41, "col": 2 },
-                      "comment": "The middleware keys buckets by client IP and refills lazily on access, so there is no background task; the trade-off is a small burst allowance after idle periods."
+                      "comment": "Request handling previously had no per-client gate before the handler ran. Keyed buckets let the middleware allow or deny each request before backend work starts.",
+                      "callout": {
+                        "kind": "risk",
+                        "text": "Lazy refill allows a small burst after idle periods; review the configured burst size against expected client traffic."
+                      }
                     }
                   ]
                 }
@@ -473,10 +513,11 @@ alongside this skill). The schema, inlined:
                   "note": "refill on access and consume one token",
                   "steps": [
                     {
+                      "title": "Refill and spend tokens in one operation.",
                       "file": "src/middleware/rate_limit.rs",
                       "start": { "line": 52, "col": 3 },
                       "end": { "line": 73, "col": 4 },
-                      "comment": "The bucket implementation combines lazy refill and consumption in one operation, which keeps request-time behavior deterministic and easy to test."
+                      "comment": "A separate refill path would make request-time behavior harder to reason about and test. Combining lazy refill and consumption in one operation keeps each decision deterministic."
                     }
                   ]
                 }
@@ -497,6 +538,16 @@ alongside this skill). The schema, inlined:
   (verify against the file on disk, not the diff hunk headers).
 - Every nested `start.line` points at a changed (added) line, not unchanged
   context; every region is tight (~40 lines max) around the discussed code.
+- Every nested `steps[].title` is present and reads as a short active action
+  sentence, not a noun phrase.
+- Every nested `steps[].comment` is a mini justification: problem/current
+  pressure first, then solution/change and why it addresses the problem. Aim for
+  roughly 180-200 characters, but prefer clarity over exact length.
+- Every optional `steps[].callout` is singular, uses one of the allowed kinds,
+  and is reserved for reviewer-critical context. Most steps omit it. Always use
+  `deviation` when the implementation departs from the original plan, and use
+  `workaround` when this change works around a deeper issue that remains
+  unfixed.
 - The document has no `summary` field; DiffReview derives the summary from
   `overview`, `root`, and `tasks`.
 - `overview`, `root`, task titles, group titles, subtask titles, item titles,

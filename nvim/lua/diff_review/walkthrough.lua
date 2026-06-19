@@ -17,12 +17,18 @@
 ---@field end_pos DiffReviewWalkthroughPosition
 ---@field comment string
 ---@field title? string
+---@field callout? DiffReviewWalkthroughCallout
 ---@field task_index integer
 ---@field step_index integer
+---@field task_step_total integer
 ---@field label string
 ---@field task_title string
 ---@field subtask_title string
 ---@field item_title string
+
+---@class DiffReviewWalkthroughCallout
+---@field kind string
+---@field text string
 
 ---@class DiffReviewWalkthroughItem
 ---@field action string
@@ -104,7 +110,7 @@ local M = {
 }
 
 local nav_keys = { "z", "y", "q", "<Esc>" }
-local comment_box_bottom_padding = 3
+local comment_box_max_inner_width = 84
 
 ---@param reader DiffReviewWalkthroughReader?
 function M.set_reader(reader)
@@ -168,6 +174,7 @@ end
 
 local action_order = { "Add", "Update", "Move", "Remove", "Split" }
 local group_type_order = { "Module", "File", "Package", "Directory" }
+local callout_text_max_length = 180
 local valid_item_actions = {
   Add = true,
   Update = true,
@@ -182,6 +189,15 @@ local valid_group_types = {
   File = true,
   Package = true,
   Directory = true,
+}
+local valid_callout_kinds = {
+  important = true,
+  limitation = true,
+  temporary = true,
+  risk = true,
+  followup = true,
+  deviation = true,
+  workaround = true,
 }
 local valid_item_types = {
   Class = true,
@@ -202,6 +218,24 @@ local action_highlights = {
   Move = "DiffReviewWalkthroughActionMove",
   Remove = "DiffReviewWalkthroughActionRemove",
   Split = "DiffReviewWalkthroughActionSplit",
+}
+local callout_labels = {
+  important = "Important",
+  limitation = "Limitation",
+  temporary = "Temporary",
+  risk = "Risk",
+  followup = "Follow-up",
+  deviation = "Deviation",
+  workaround = "Workaround",
+}
+local callout_highlights = {
+  important = "DiffReviewWalkthroughCalloutImportant",
+  limitation = "DiffReviewWalkthroughCalloutLimitation",
+  temporary = "DiffReviewWalkthroughCalloutTemporary",
+  risk = "DiffReviewWalkthroughCalloutRisk",
+  followup = "DiffReviewWalkthroughCalloutFollowup",
+  deviation = "DiffReviewWalkthroughCalloutDeviation",
+  workaround = "DiffReviewWalkthroughCalloutWorkaround",
 }
 local action_display_labels = {
   Add = "Add",
@@ -375,12 +409,37 @@ local function parse_step(raw_step, error_prefix, context)
     end_pos = start_pos
   end
 
+  if raw_step.callouts ~= nil then
+    return nil, error_prefix .. ": \"callouts\" is not supported; use singular \"callout\""
+  end
+  local callout = nil
+  if raw_step.callout ~= nil then
+    if type(raw_step.callout) ~= "table" then
+      return nil, error_prefix .. ": invalid \"callout\""
+    end
+    if type(raw_step.callout.kind) ~= "string" or not valid_callout_kinds[raw_step.callout.kind] then
+      return nil, error_prefix .. ": callout has invalid \"kind\""
+    end
+    if not is_non_empty_string(raw_step.callout.text) then
+      return nil, error_prefix .. ": callout has missing \"text\""
+    end
+    if vim.fn.strchars(raw_step.callout.text) > callout_text_max_length then
+      return nil, ("%s: callout \"text\" must be %d characters or less"):format(error_prefix,
+        callout_text_max_length)
+    end
+    callout = {
+      kind = raw_step.callout.kind,
+      text = raw_step.callout.text,
+    }
+  end
+
   return {
     file = (raw_step.file:gsub("\\", "/")),
     start_pos = start_pos,
     end_pos = end_pos,
     comment = raw_step.comment,
     title = type(raw_step.title) == "string" and raw_step.title or nil,
+    callout = callout,
     task_index = context.task_index,
     step_index = context.step_index,
     label = ("Task %d.%d"):format(context.task_index, context.step_index),
@@ -535,6 +594,7 @@ local function parse_doc(decoded)
     if task_justification_error then return nil, task_justification_error end
 
     local task_step_index = 0
+    local task_first_step_offset = #steps + 1
     ---@type DiffReviewWalkthroughGroup[]
     local groups = {}
     for group_index, raw_group in ipairs(raw_task.groups) do
@@ -570,6 +630,9 @@ local function parse_doc(decoded)
 
     if task_step_index == 0 then
       return nil, task_prefix .. ": no walkthrough steps"
+    end
+    for step_offset = task_first_step_offset, #steps do
+      steps[step_offset].task_step_total = task_step_index
     end
 
     tasks[#tasks + 1] = {
@@ -830,6 +893,61 @@ local function staleness_note(target, stale)
   return nil
 end
 
+---@param content { text: string, hl: string, chunks?: { text: string, hl: string }[] }[]
+---@param text string
+---@param hl string
+local function append_comment_row(content, text, hl)
+  content[#content + 1] = { text = text, hl = hl }
+end
+
+---@param content { text: string, hl: string, chunks?: { text: string, hl: string }[] }[]
+---@param callout DiffReviewWalkthroughCallout
+---@param inner_width integer
+local function append_callout_rows(content, callout, inner_width)
+  local label = (callout_labels[callout.kind] or callout.kind) .. ": "
+  local label_width = vim.fn.strdisplaywidth(label)
+  local text_width = math.max(inner_width - 2 - label_width, 8)
+  local label_hl = callout_highlights[callout.kind] or "DiffReviewWalkthroughCalloutImportant"
+  for index, line in ipairs(wrap_text(callout.text, text_width)) do
+    if index == 1 then
+      content[#content + 1] = {
+        text = label .. line,
+        hl = "DiffReviewWalkthroughComment",
+        chunks = {
+          { text = label, hl = label_hl },
+          { text = line, hl = "DiffReviewWalkthroughComment" },
+        },
+      }
+    else
+      local prefix = (" "):rep(label_width)
+      content[#content + 1] = {
+        text = prefix .. line,
+        hl = "DiffReviewWalkthroughComment",
+        chunks = {
+          { text = prefix, hl = "DiffReviewWalkthroughComment" },
+          { text = line, hl = "DiffReviewWalkthroughComment" },
+        },
+      }
+    end
+  end
+end
+
+---@param step DiffReviewWalkthroughStep
+---@return string
+local function format_step_heading_label(step)
+  local task_step_total = step.task_step_total or step.step_index
+  return ("%d.%d-%d"):format(step.task_index, step.step_index, task_step_total)
+end
+
+---@param win_height integer
+---@param line_count integer
+---@return integer screen_row
+local function comment_box_start_screen_row(win_height, line_count)
+  local one_third_from_bottom = win_height - math.floor(win_height / 3)
+  local latest_start_with_box_visible = math.max(1, win_height - line_count + 1)
+  return math.max(1, math.min(one_third_from_bottom, latest_start_with_box_visible))
+end
+
 ---@param target DiffReviewWalkthroughTarget
 ---@param win_height integer
 ---@param comment_line_count integer
@@ -839,7 +957,8 @@ local function comment_box_anchor_row(target, win_height, comment_line_count)
   local end_row = target.end_row or start_row
   if end_row < start_row then end_row = start_row end
 
-  local max_anchor_offset = math.max(win_height - comment_line_count - comment_box_bottom_padding - 1, 0)
+  local target_screen_row = comment_box_start_screen_row(win_height, comment_line_count)
+  local max_anchor_offset = math.max(target_screen_row - 2, 0)
   local latest_anchor_with_start_visible = start_row + max_anchor_offset
   return math.max(start_row, math.min(end_row, latest_anchor_with_start_visible))
 end
@@ -856,60 +975,53 @@ end
 local function render_comment_box(mode, step, target, win)
   local buf = mode.host.buf
   local win_width = vim.api.nvim_win_get_width(win)
-  local inner_width = math.max(30, math.min(72, win_width - 8))
+  local inner_width = math.max(30, math.min(comment_box_max_inner_width, win_width - 8))
 
-  ---@type { text: string, hl: string }[][] content rows (without borders)
+  ---@type { text: string, hl: string, chunks?: { text: string, hl: string }[] }[] content rows (without borders)
   local content = {}
-  for _, line in ipairs(wrap_text(step.task_title, inner_width - 2)) do
-    content[#content + 1] = { text = line, hl = "Title" }
-  end
-  local subtask_prefix = " └─ "
-  local subtask_width = math.max(inner_width - 2 - vim.fn.strdisplaywidth(subtask_prefix), 8)
-  for index, line in ipairs(wrap_text(step.subtask_title, subtask_width)) do
-    content[#content + 1] = {
-      text = (index == 1 and subtask_prefix or (" "):rep(vim.fn.strdisplaywidth(subtask_prefix))) .. line,
-      hl = "DiffReviewStatusHint",
-    }
-  end
-  content[#content + 1] = { text = "", hl = "DiffReviewWalkthroughComment" }
   for _, line in ipairs(wrap_text(step.comment, inner_width - 2)) do
-    content[#content + 1] = { text = line, hl = "DiffReviewWalkthroughComment" }
+    append_comment_row(content, line, "DiffReviewWalkthroughComment")
+  end
+  if step.callout then
+    append_comment_row(content, "", "DiffReviewWalkthroughComment")
+    append_callout_rows(content, step.callout, inner_width)
   end
   local note = staleness_note(target, mode.stale)
   if note then
-    content[#content + 1] = { text = "", hl = "DiffReviewWalkthroughComment" }
-    content[#content + 1] = { text = note, hl = "DiffReviewWalkthroughStale" }
+    append_comment_row(content, "", "DiffReviewWalkthroughComment")
+    append_comment_row(content, note, "DiffReviewWalkthroughStale")
   end
-  content[#content + 1] = { text = "", hl = "DiffReviewWalkthroughComment" }
-  content[#content + 1] = { text = "[z] back  [y] next  [q] quit", hl = "DiffReviewStatusHint" }
-
-  -- Header: "Task 3.1 - title" left-aligned, the file basename right-aligned.
+  -- Header: "3.1-4 title" left-aligned; the body carries the mini-justification.
   local heading_title = step.title or step.item_title
-  local heading = (" %s%s "):format(step.label, heading_title and (" - " .. heading_title) or "")
-  local basename = " " .. (step.file:match("([^/]+)$") or step.file) .. " "
+  local heading_label = format_step_heading_label(step)
+  local heading = (" %s%s "):format(heading_label, heading_title and (" " .. heading_title) or "")
   for _, row in ipairs(content) do
     inner_width = math.max(inner_width, vim.fn.strdisplaywidth(row.text) + 2)
   end
   local heading_width = vim.fn.strdisplaywidth(heading)
-  local basename_width = vim.fn.strdisplaywidth(basename)
-  inner_width = math.max(inner_width, heading_width + basename_width + 3)
+  inner_width = math.max(inner_width, heading_width + 3)
 
   local pad = "  "
   local virt_lines = {}
   virt_lines[#virt_lines + 1] = {
     { pad .. "╭─", "FloatBorder" },
     { heading, "DiffReviewWalkthroughItemTitle" },
-    { ("─"):rep(math.max(inner_width - heading_width - basename_width - 2, 0)), "FloatBorder" },
-    { basename, "DiffReviewStatusPath" },
+    { ("─"):rep(math.max(inner_width - heading_width - 2, 0)), "FloatBorder" },
     { "─╮", "FloatBorder" },
   }
   for _, row in ipairs(content) do
     local fill = (" "):rep(math.max(inner_width - vim.fn.strdisplaywidth(row.text) - 2, 0))
-    virt_lines[#virt_lines + 1] = {
-      { pad .. "│ ", "FloatBorder" },
-      { row.text .. fill, row.hl },
-      { " │", "FloatBorder" },
-    }
+    local virt_line = { { pad .. "│ ", "FloatBorder" } }
+    if row.chunks then
+      for _, chunk in ipairs(row.chunks) do
+        virt_line[#virt_line + 1] = { chunk.text, chunk.hl }
+      end
+      virt_line[#virt_line + 1] = { fill, row.hl }
+    else
+      virt_line[#virt_line + 1] = { row.text .. fill, row.hl }
+    end
+    virt_line[#virt_line + 1] = { " │", "FloatBorder" }
+    virt_lines[#virt_lines + 1] = virt_line
   end
   virt_lines[#virt_lines + 1] = { { pad .. "╰" .. ("─"):rep(inner_width) .. "╯", "FloatBorder" } }
 
@@ -931,7 +1043,8 @@ local function focus_comment_box_below(win, target, placement)
   if not start_row then return end
 
   local win_height = vim.api.nvim_win_get_height(win)
-  local desired_topline = placement.anchor_row + placement.line_count + comment_box_bottom_padding + 1 - win_height
+  local target_screen_row = comment_box_start_screen_row(win_height, placement.line_count)
+  local desired_topline = placement.anchor_row + 2 - target_screen_row
   desired_topline = math.max(1, math.min(desired_topline, start_row))
 
   vim.api.nvim_win_call(win, function()

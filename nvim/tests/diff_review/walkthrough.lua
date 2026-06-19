@@ -6,7 +6,6 @@ local walkthrough = require("diff_review.walkthrough")
 
 local root = "D:/diffreview-flow-root"
 local head_sha = string.rep("a", 40)
-local comment_box_bottom_padding = 3
 
 local function assert_true(condition, message)
   if not condition then error(message, 2) end
@@ -285,6 +284,25 @@ local function comment_box_mark(buf)
   return nil
 end
 
+local function comment_box_inner_width(mark)
+  local virt_lines = mark and mark[4] and mark[4].virt_lines or {}
+  local bottom = virt_lines[#virt_lines]
+  local width = 0
+  for _, chunk in ipairs(bottom or {}) do
+    width = width + vim.fn.strdisplaywidth(chunk[1])
+  end
+  return math.max(width - 4, 0)
+end
+
+local function comment_box_header_text(mark)
+  local virt_lines = mark and mark[4] and mark[4].virt_lines or {}
+  local chunks = {}
+  for _, chunk in ipairs(virt_lines[1] or {}) do
+    chunks[#chunks + 1] = chunk[1]
+  end
+  return table.concat(chunks, "")
+end
+
 local function box_contains(buf, needle)
   return box_text(buf):find(needle, 1, true) ~= nil
 end
@@ -300,9 +318,20 @@ local function box_has_highlight_for_text(buf, text, hl_group)
   return false
 end
 
+local function expected_comment_start_screen_row(line_count, win_height)
+  local one_third_from_bottom = win_height - math.floor(win_height / 3)
+  local latest_start_with_box_visible = math.max(1, win_height - line_count + 1)
+  return math.max(1, math.min(one_third_from_bottom, latest_start_with_box_visible))
+end
+
 local function expected_comment_topline(start_row, anchor_row, line_count, win_height)
-  return math.max(1,
-    math.min(start_row, anchor_row + line_count + comment_box_bottom_padding + 1 - win_height))
+  local target_screen_row = expected_comment_start_screen_row(line_count, win_height)
+  return math.max(1, math.min(start_row, anchor_row + 2 - target_screen_row))
+end
+
+local function expected_comment_screen_row(start_row, anchor_row, line_count, win_height)
+  local topline = expected_comment_topline(start_row, anchor_row, line_count, win_height)
+  return anchor_row - topline + 2
 end
 
 ---@param doc table
@@ -313,7 +342,7 @@ end
 local function valid_doc()
   return {
     version = 7,
-    overview = "Update walkthrough fixture files. Before, the fixture rows used the old text. Now, the structured tasks drive both the summary graph and Task N.M comment labels.",
+    overview = "Update walkthrough fixture files. Before, the fixture rows used the old text. Now, the structured tasks drive both the summary graph and Task N.M-total comment labels.",
     root = "Update walkthrough fixture files.",
     commit = head_sha,
     tasks = {
@@ -337,11 +366,22 @@ local function valid_doc()
                     note = "rewrite the second line for the first fixture file",
                     steps = {
                       {
-                        title = "First change",
+                        title = "Rewrite the fixture line to NEW.",
                         file = "a.txt",
                         start = { line = 2, col = 1 },
                         ["end"] = { line = 2, col = 9 },
-                        comment = "The a.txt second line was rewritten to NEW.",
+                        comment = "The fixture row previously used OLD, so the walkthrough had no fresh changed target. Rewriting it to NEW gives the renderer a concrete changed line to anchor.",
+                        callout = {
+                          kind = "deviation",
+                          text = "This fixture intentionally uses a deviation callout so the renderer proves high-priority review context is visible.",
+                        },
+                      },
+                      {
+                        title = "Check the total marker on the next comment.",
+                        file = "a.txt",
+                        start = { line = 2, col = 1 },
+                        ["end"] = { line = 2, col = 9 },
+                        comment = "The first task now has a second walkthrough comment, so the inline header can show both the step number and the task total.",
                       },
                     },
                   },
@@ -368,10 +408,11 @@ local function valid_doc()
                     note = "repeat the rewrite so navigation crosses tasks",
                     steps = {
                       {
+                        title = "Mirror the rewrite in the second fixture.",
                         file = "b.txt",
                         start = { line = 2, col = 1 },
                         ["end"] = { line = 2, col = 9 },
-                        comment = "Same rewrite applied for symmetry.",
+                        comment = "The second fixture previously did not exercise cross-task navigation. Applying the same rewrite verifies that forward navigation reaches another task.",
                       },
                     },
                   },
@@ -486,6 +527,7 @@ local function run()
   assert_true(justification_hl.fg == 0xe5c07b and justification_hl.italic == true,
     "summary justification should be yellow italic")
   assert_true(not buffer_contains(summary_buf, "Legend:"), "summary should not show an action legend")
+  vim.o.columns = 120
   trigger_buf_mapping(summary_buf, "y")
 
   wait_for(function() return buffer_contains(buf, "NEW a.txt") end, "step 1 did not expand a.txt hunks")
@@ -493,7 +535,14 @@ local function run()
   local cursor_row = vim.api.nvim_win_get_cursor(vim.fn.bufwinid(buf))[1]
   assert_true(cursor_row == step_row, ("cursor not on step row (expected %d, got %d)"):format(step_row, cursor_row))
   assert_true(walkthrough_extmark_count(buf) > 0, "region extmarks missing")
-  assert_true(box_contains(buf, "rewritten to NEW"), "inline comment box missing")
+  assert_true(box_contains(buf, "concrete changed line"), "inline comment box missing")
+  assert_true(box_contains(buf, "Deviation:"), "inline comment box should render the callout kind")
+  assert_true(box_contains(buf, "high-priority review context"), "inline comment box should render callout text")
+  assert_true(box_has_highlight_for_text(buf, "Deviation:", "DiffReviewWalkthroughCalloutDeviation"),
+    "inline callout kind should use deviation highlight")
+  local deviation_hl = vim.api.nvim_get_hl(0, { name = "DiffReviewWalkthroughCalloutDeviation" })
+  assert_true(deviation_hl.fg == 0xff5555 and deviation_hl.bold == true,
+    "deviation callout should be red and bold")
   local box_mark = comment_box_mark(buf)
   assert_true(box_mark ~= nil, "inline comment box mark missing")
   assert_true(box_mark[2] == step_row - 1, "inline comment box should anchor below the selected row")
@@ -505,29 +554,63 @@ local function run()
   assert_true(view.topline == expected_topline,
     ("walkthrough view not focused near lower comment box (expected topline %d, got %d)"):format(
       expected_topline, view.topline))
-  assert_true(box_contains(buf, "Task 1.1 - First change"), "inline box heading missing")
-  assert_true(box_has_highlight_for_text(buf, "Task 1.1 - First change", "DiffReviewWalkthroughItemTitle"),
+  local expected_box_screen_row = expected_comment_screen_row(step_row, box_mark[2] + 1, #box_mark[4].virt_lines,
+    vim.api.nvim_win_get_height(win))
+  local box_screen_row = (box_mark[2] + 1) - view.topline + 2
+  assert_true(box_screen_row == expected_box_screen_row,
+    ("inline comment box should start one third from the bottom (expected screen row %d, got %d)"):format(
+      expected_box_screen_row, box_screen_row))
+  assert_true(box_contains(buf, "1.1-2 Rewrite the fixture line to NEW."), "inline box heading missing")
+  assert_true(not box_contains(buf, "Task 1.1-2 Rewrite the fixture line to NEW."),
+    "inline box heading should not include Task")
+  assert_true(not box_contains(buf, "1.1 - Rewrite the fixture line to NEW."),
+    "inline box heading should not use the old title separator")
+  assert_true(box_has_highlight_for_text(buf, "1.1-2 Rewrite the fixture line to NEW.",
+    "DiffReviewWalkthroughItemTitle"),
     "inline box heading should be bold white")
-  assert_true(box_contains(buf, "Update a.txt through the first task."), "task context missing")
-  assert_true(box_contains(buf, "└─ Rewrite the first fixture file."), "subtask graph row missing")
+  assert_true(comment_box_inner_width(box_mark) == 84, "inline comment box should use the widened max width")
+  local box_header = comment_box_header_text(box_mark)
+  assert_true(box_header:find("Rewrite the fixture line to NEW.", 1, true) ~= nil,
+    "inline box header should show only the step title")
+  assert_true(box_header:find("Rewrite the first fixture file.", 1, true) == nil,
+    "inline box header should not show subtask context")
+  assert_true(box_header:find(" a.txt ", 1, true) == nil, "inline box header should not show file basename")
+  assert_true(not box_contains(buf, "Update a.txt through the first task."), "inline box should not show task context")
+  assert_true(not box_contains(buf, "└─ Rewrite the first fixture file."), "inline box should not show subtask graph")
   assert_true(not box_contains(buf, "Fixture edits / Rewrite the first fixture file."),
     "inline box should not show group/subtask breadcrumb")
   assert_true(not box_contains(buf, "Modify Resource a.txt rewrite"), "inline box should not show item context")
   assert_true(not box_contains(buf, "rewrite the second line for the first fixture file"),
     "inline box should not show item note")
-  assert_true(box_contains(buf, " a.txt "), "file basename missing from the box header")
+  assert_true(not box_contains(buf, "[z] back"), "inline box should not show command footer")
 
-  -- ── navigation: forward to step 2, back, back to summary, quit ────────────
+  -- ── navigation: forward through steps, back, back to summary, quit ─────────
   trigger_buf_mapping(buf, "y")
-  wait_for(function() return box_contains(buf, "symmetry") end, "step 2 box did not render")
-  assert_true(box_contains(buf, "Task 2.1 - b.txt rewrite"), "step 2 task label missing")
-  assert_true(box_contains(buf, " b.txt "), "step 2 basename missing from the box header")
-  local step2_row = find_row(buf, "NEW b.txt")
+  wait_for(function() return box_contains(buf, "task total") end, "step 2 box did not render")
+  assert_true(box_contains(buf, "1.2-2 Check the total marker on the next comment."),
+    "step 2 task total label missing")
+  assert_true(not box_contains(buf, "Deviation:"), "step 2 should not inherit step 1 callout")
+  local task1_step2_row = find_row(buf, "NEW a.txt")
   cursor_row = vim.api.nvim_win_get_cursor(vim.fn.bufwinid(buf))[1]
-  assert_true(cursor_row == step2_row, "cursor not on step 2 row")
+  assert_true(cursor_row == task1_step2_row, "cursor not on task 1 step 2 row")
+
+  trigger_buf_mapping(buf, "y")
+  wait_for(function() return box_contains(buf, "forward navigation") end, "step 3 box did not render")
+  assert_true(box_contains(buf, "2.1-1 Mirror the rewrite in the second fixture."), "step 3 task label missing")
+  assert_true(not box_contains(buf, "Task 2.1-1 Mirror the rewrite in the second fixture."),
+    "step 2 task label should not include Task")
+  local step3_box_mark = comment_box_mark(buf)
+  assert_true(comment_box_header_text(step3_box_mark):find("Rewrite the second fixture file.", 1, true) == nil,
+    "step 3 header should not show subtask context")
+  local step3_row = find_row(buf, "NEW b.txt")
+  cursor_row = vim.api.nvim_win_get_cursor(vim.fn.bufwinid(buf))[1]
+  assert_true(cursor_row == step3_row, "cursor not on step 3 row")
 
   trigger_buf_mapping(buf, "z")
-  wait_for(function() return box_contains(buf, "rewritten to NEW") end, "z did not return to step 1")
+  wait_for(function() return box_contains(buf, "task total") end, "z did not return to step 2")
+
+  trigger_buf_mapping(buf, "z")
+  wait_for(function() return box_contains(buf, "concrete changed line") end, "z did not return to step 1")
 
   trigger_buf_mapping(buf, "z")
   local resume_buf
@@ -550,9 +633,11 @@ local function run()
   -- ── completion past the last step ──────────────────────────────────────────
   summary_buf = start_walkthrough(buf)
   trigger_buf_mapping(summary_buf, "y")
-  wait_for(function() return box_contains(buf, "rewritten to NEW") end, "restart did not show step 1")
+  wait_for(function() return box_contains(buf, "concrete changed line") end, "restart did not show step 1")
   trigger_buf_mapping(buf, "y")
-  wait_for(function() return box_contains(buf, "symmetry") end, "restart did not reach step 2")
+  wait_for(function() return box_contains(buf, "task total") end, "restart did not reach step 2")
+  trigger_buf_mapping(buf, "y")
+  wait_for(function() return box_contains(buf, "forward navigation") end, "restart did not reach step 3")
   trigger_buf_mapping(buf, "y")
   wait_for(function() return saw_notification_containing("Walkthrough complete") end, "no completion notification")
   assert_true(walkthrough_extmark_count(buf) == 0, "completion did not clear extmarks")
@@ -733,10 +818,12 @@ local function run()
   assert_true(view.topline <= long_start_row and long_start_row < view.topline + long_win_height,
     ("long-region start row should stay visible (topline %d, start %d, height %d)"):format(
       view.topline, long_start_row, long_win_height))
-  local long_box_bottom_row = long_anchor_row - view.topline + 1 + #long_box_mark[4].virt_lines
-  assert_true(long_box_bottom_row == long_win_height - comment_box_bottom_padding,
-    ("long-region comment box should sit above the lower edge (expected screen row %d, got %d)"):format(
-      long_win_height - comment_box_bottom_padding, long_box_bottom_row))
+  local long_expected_box_screen_row = expected_comment_screen_row(long_start_row, long_anchor_row,
+    #long_box_mark[4].virt_lines, long_win_height)
+  local long_box_screen_row = long_anchor_row - view.topline + 2
+  assert_true(long_box_screen_row == long_expected_box_screen_row,
+    ("long-region comment box should start one third from the bottom (expected screen row %d, got %d)"):format(
+      long_expected_box_screen_row, long_box_screen_row))
   trigger_buf_mapping(buf, "q")
   close_all_floats()
 
@@ -747,7 +834,7 @@ local function run()
   wait_for(function() return walkthrough_extmark_count(buf) > 0 end, "no extmarks before re-render")
   diff_review.render_status(buf, nil, nil, { reuse_sections = true })
   wait_for(function() return walkthrough_extmark_count(buf) > 0 end, "re-render dropped walkthrough extmarks")
-  wait_for(function() return box_contains(buf, "rewritten to NEW") end, "re-render dropped the inline comment box")
+  wait_for(function() return box_contains(buf, "concrete changed line") end, "re-render dropped the inline comment box")
   trigger_buf_mapping(buf, "q")
   close_all_floats()
 
@@ -818,6 +905,30 @@ local function run()
   trigger_buf_mapping(buf, "ow")
   wait_for(function() return saw_notification_containing("missing or empty \"steps\"") end,
     "missing item steps notification absent")
+
+  local invalid_callout_kind = valid_doc()
+  invalid_callout_kind.tasks[1].groups[1].subtasks[1].items[1].steps[1].callout.kind = "note"
+  set_walkthrough_doc(invalid_callout_kind)
+  captured_notifications = {}
+  trigger_buf_mapping(buf, "ow")
+  wait_for(function() return saw_notification_containing("callout has invalid \"kind\"") end,
+    "invalid callout kind notification absent")
+
+  local plural_callouts = valid_doc()
+  plural_callouts.tasks[1].groups[1].subtasks[1].items[1].steps[1].callouts = {}
+  set_walkthrough_doc(plural_callouts)
+  captured_notifications = {}
+  trigger_buf_mapping(buf, "ow")
+  wait_for(function() return saw_notification_containing("\"callouts\" is not supported") end,
+    "plural callouts notification absent")
+
+  local too_long_callout = valid_doc()
+  too_long_callout.tasks[1].groups[1].subtasks[1].items[1].steps[1].callout.text = string.rep("x", 181)
+  set_walkthrough_doc(too_long_callout)
+  captured_notifications = {}
+  trigger_buf_mapping(buf, "ow")
+  wait_for(function() return saw_notification_containing("callout \"text\" must be 180 characters or less") end,
+    "too-long callout notification absent")
 
   local invalid_task_justification = valid_doc()
   invalid_task_justification.tasks[1].justification = ""
