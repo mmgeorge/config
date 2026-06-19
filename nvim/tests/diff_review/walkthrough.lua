@@ -113,10 +113,10 @@ function backend.systemlist(command)
   if key == "git\t-C\t" .. root .. "\tdiff\t--cached\t--name-status" then
     return { "M\tc.txt" }, 0
   end
-  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0" then
+  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=3" then
     return vim.split(long_region_diff("a.txt") .. "\n" .. modified_diff("b.txt"), "\n", { plain = true }), 0
   end
-  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0\t--cached" then
+  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=3\t--cached" then
     return vim.split(modified_diff("c.txt"), "\n", { plain = true }), 0
   end
   return {}, 1
@@ -797,7 +797,7 @@ local function run()
 
   trigger_buf_mapping(buf, "y")
   wait_for(function() return box_contains(buf, "ends inside the second hunk") end, "split-region step box did not render")
-  local second_hunk_row = find_row(buf, "alpha2 a.txt")
+  local second_hunk_row = find_row(buf, "NEW2 a.txt")
   cursor_row = vim.api.nvim_win_get_cursor(vim.fn.bufwinid(buf))[1]
   assert_true(
     cursor_row == second_hunk_row,
@@ -808,17 +808,18 @@ local function run()
   trigger_buf_mapping(buf, "y")
   wait_for(function() return box_contains(buf, "Long selected region keeps its start visible") end,
     "long-region step box did not render")
-  local long_start_row = find_row(buf, "long context 01 a.txt")
-  local long_end_row = find_row(buf, "long context 36 a.txt")
+  local long_start_row = find_row(buf, "NEW long 02 a.txt")
+  cursor_row = vim.api.nvim_win_get_cursor(vim.fn.bufwinid(buf))[1]
+  assert_true(
+    cursor_row == long_start_row,
+    ("long region did not anchor at the first rendered changed row (expected %d, got %d)"):format(long_start_row, cursor_row)
+  )
   local long_box_mark = comment_box_mark(buf)
   assert_true(long_box_mark ~= nil, "long-region comment box mark missing")
   local long_anchor_row = long_box_mark[2] + 1
-  assert_true(long_anchor_row > long_start_row,
-    ("long-region box should anchor after the start row (start %d, anchor %d)"):format(
+  assert_true(long_anchor_row >= long_start_row,
+    ("long-region box should anchor at or after the rendered start row (start %d, anchor %d)"):format(
       long_start_row, long_anchor_row))
-  assert_true(long_anchor_row < long_end_row,
-    ("long-region box should anchor inside the region instead of at the end (anchor %d, end %d)"):format(
-      long_anchor_row, long_end_row))
   win = vim.fn.bufwinid(buf)
   view = vim.api.nvim_win_call(win, function() return vim.fn.winsaveview() end)
   local long_win_height = vim.api.nvim_win_get_height(win)

@@ -252,17 +252,17 @@ function backend.systemlist(command)
     end
     return lines, 0
   end
-  if key == "git\t-C\t" .. root .. "\tshow\t--format=\t--no-color\t--no-ext-diff\t--unified=0\t45806b8123456789" then
+  if key == "git\t-C\t" .. root .. "\tshow\t--format=\t--no-color\t--no-ext-diff\t--unified=3\t45806b8123456789" then
     return output_lines(commit_diff), 0
   end
-  if key == "git\t-C\t" .. root .. "\tshow\t--format=\t--no-color\t--no-ext-diff\t--unified=0\t0000000000000000000000000000000000000001" then
+  if key == "git\t-C\t" .. root .. "\tshow\t--format=\t--no-color\t--no-ext-diff\t--unified=3\t0000000000000000000000000000000000000001" then
     return output_lines(recent_commit_diff), 0
   end
   if key == "git\t-C\t" .. root .. "\tls-files\t--others\t--exclude-standard" then return {}, 0 end
   if key == "git\t-C\t" .. root .. "\tdiff\t--cached\t--name-status" then return { "M\tstaged.txt" }, 0 end
   if key == "git\t-C\t" .. root .. "\tdiff\t--name-status" then return {}, 0 end
-  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0" then return {}, 0 end
-  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0\t--cached" then return output_lines(staged_diff), 0 end
+  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=3" then return {}, 0 end
+  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=3\t--cached" then return output_lines(staged_diff), 0 end
   return {}, 1
 end
 
@@ -319,7 +319,7 @@ local function run()
     "first unmerged conventional commit type was not highlighted: " .. line_highlights(buf, first_unmerged_row)
   )
   assert_true(not buffer_contains(buf, "foo/bar.js +1 -1"), "commit files loaded before commit was expanded")
-  assert_true(count_calls_containing("\tshow\t--format=\t--no-color\t--no-ext-diff\t--unified=0\t45806b8123456789") == 0, "commit diff loaded eagerly")
+  assert_true(count_calls_containing("\tshow\t--format=\t--no-color\t--no-ext-diff\t--unified=3\t45806b8123456789") == 0, "commit diff loaded eagerly")
 
   local unmerged_heading = find_row(buf, "Unmerged into origin/master (4)")
   trigger_normal_mapping("<Tab>", find_row_after(buf, "45806b8  1 day ago  feat", unmerged_heading))
@@ -334,7 +334,7 @@ local function run()
   local file_path_column = line_column(buf, modified_file_row, "foo/bar.js")
   assert_true(line_column(buf, added_file_row, "added.txt") == file_path_column, "new commit file path was not aligned")
   assert_true(line_column(buf, removed_file_row, "removed.txt") == file_path_column, "removed commit file path was not aligned")
-  assert_true(count_calls_containing("\tshow\t--format=\t--no-color\t--no-ext-diff\t--unified=0\t45806b8123456789") == 2, "commit diff was not loaded exactly once through async backend")
+  assert_true(count_calls_containing("\tshow\t--format=\t--no-color\t--no-ext-diff\t--unified=3\t45806b8123456789") == 2, "commit diff was not loaded exactly once through async backend")
 
   trigger_normal_mapping("<Tab>", find_row(buf, "foo/bar.js +1 -1"))
   wait_for(function() return buffer_contains(buf, "@@ +1 -1") end, "commit file did not unfold hunks")
@@ -350,7 +350,7 @@ local function run()
     return line_has_highlight_prefix(buf, row, "@keyword")
   end, "commit-only Rust hunk body row did not get Tree-sitter keyword highlight: " .. line_highlights(buf, find_row(buf, "pub fn from_commit")))
 
-  local show_calls_before_recent = count_calls_containing("\tshow\t--format=\t--no-color\t--no-ext-diff\t--unified=0")
+  local show_calls_before_recent = count_calls_containing("\tshow\t--format=\t--no-color\t--no-ext-diff\t--unified=3")
   trigger_normal_mapping("<Tab>", find_row(buf, "Recent Commits (20)"))
   wait_for(function() return buffer_contains(buf, "recent01  1 day ago   docs: recent commit 01") end, "recent commits did not unfold")
   local recent_row = find_row(buf, "recent01  1 day ago   docs: recent commit 01")
@@ -376,7 +376,7 @@ local function run()
     "recent commits included an unmerged commit"
   )
   assert_true(
-    count_calls_containing("\tshow\t--format=\t--no-color\t--no-ext-diff\t--unified=0") == show_calls_before_recent,
+    count_calls_containing("\tshow\t--format=\t--no-color\t--no-ext-diff\t--unified=3") == show_calls_before_recent,
     "expanding recent commits section loaded commit diffs eagerly"
   )
   trigger_normal_mapping("<Tab>", recent_row)
@@ -394,7 +394,7 @@ local function run()
     "recent commit file paths were not aligned"
   )
   assert_true(
-    count_calls_containing("\tshow\t--format=\t--no-color\t--no-ext-diff\t--unified=0\t0000000000000000000000000000000000000001") == 2,
+    count_calls_containing("\tshow\t--format=\t--no-color\t--no-ext-diff\t--unified=3\t0000000000000000000000000000000000000001") == 2,
     "recent commit diff was not loaded exactly once through async backend"
   )
 end
