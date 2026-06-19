@@ -31,27 +31,35 @@ local diff_text = table.concat({
   "index 1111111..2222222 100644",
   "--- a/src/engine.rs",
   "+++ b/src/engine.rs",
-  "@@ -11,2 +11,2 @@",
+  "@@ -11 +11 @@",
   "-    let stderr_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);",
   "+    let stderr_laye = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);",
-  "     let writer = LOG_WRITER.get_or_init(|| SwappableWriter::new(open_log()));",
-  "@@ -12,2 +12,2 @@",
+  "@@ -12 +12 @@",
   "-    let writer = LOG_WRITER.get_or_init(|| SwappableWriter::new(open_log()));",
   "+    let writer = LOG_WRITER.get_or_int(|| SwappableWriter::new(open_log()));",
-  "   }",
   "diff --git a/src/tangent.rs b/src/tangent.rs",
   "index 3333333..4444444 100644",
   "--- a/src/tangent.rs",
   "+++ b/src/tangent.rs",
-  "@@ -1,4 +1,8 @@",
-  " pub fn normalize(value: f32, length: f32) -> f32 {",
-  "   return value / length;",
-  " }",
-  " ",
+  "@@ -4,0 +5,4 @@",
   "+pub struct TangentBasis {",
   "+  pub tangent0: Vec3,",
   "+  pub tangent1: Vec3,",
   "+}",
+  "diff --git a/src/material.rs b/src/material.rs",
+  "index 7777777..8888888 100644",
+  "--- a/src/material.rs",
+  "+++ b/src/material.rs",
+  "@@ -21 +21 @@",
+  "-      color_texture: color,",
+  "+      color_texture: color.clone(),",
+  "diff --git a/src/notes.txt b/src/notes.txt",
+  "index 5555555..6666666 100644",
+  "--- a/src/notes.txt",
+  "+++ b/src/notes.txt",
+  "@@ -5 +5 @@",
+  "-old target",
+  "+new target",
 }, "\n")
 
 ---@type DiffReviewGitBackend
@@ -67,7 +75,7 @@ function backend.systemlist(command)
   if key:find("@{upstream}", 1, true) or key:find("@{push}", 1, true) then return {}, 1 end
   if key == "git\t-C\t" .. root .. "\tls-files\t--others\t--exclude-standard" then return {}, 0 end
   if key == "git\t-C\t" .. root .. "\tdiff\t--cached\t--name-status" then return {}, 0 end
-  if key == "git\t-C\t" .. root .. "\tdiff\t--name-status" then return { "M\tsrc/engine.rs", "M\tsrc/tangent.rs" }, 0 end
+  if key == "git\t-C\t" .. root .. "\tdiff\t--name-status" then return { "M\tsrc/engine.rs", "M\tsrc/tangent.rs", "M\tsrc/material.rs", "M\tsrc/notes.txt" }, 0 end
   if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0" then
     return vim.split(diff_text, "\n", { plain = true }), 0
   end
@@ -101,14 +109,6 @@ local function contains_line(lines, pattern)
     if line:find(pattern, 1, true) then return true end
   end
   return false
-end
-
-local function count_lines(lines, pattern)
-  local count = 0
-  for _, line in ipairs(lines) do
-    if line:find(pattern, 1, true) then count = count + 1 end
-  end
-  return count
 end
 
 local function buffer_contains(buf, pattern)
@@ -172,6 +172,16 @@ local function line_highlights(buf, row)
   return table.concat(groups, ",")
 end
 
+local function count_boundary_rows(buf, pattern)
+  local count = 0
+  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  local boundary_lines = (diff_review._status and diff_review._status.boundary_lines) or {}
+  for index, line in ipairs(lines) do
+    if boundary_lines[index] and line:find(pattern, 1, true) then count = count + 1 end
+  end
+  return count
+end
+
 local function wait_for(condition, message)
   assert_true(vim.wait(3000, condition, 10), message)
 end
@@ -233,6 +243,46 @@ local function run()
     "  pub tangent1: Vec3,",
     "}",
   }, root .. "/src/tangent.rs") == 0, "writefile failed")
+  assert_true(vim.fn.writefile({
+    "use {",
+    "  crate::{Model, ModelRepository},",
+    "  engine::sys::gpu,",
+    "};",
+    "",
+    "pub struct ModelStore {",
+    "  pub bind_group: gpu::BindGroup<shaders::model::render::BindGroup1Descriptor>,",
+    "}",
+    "",
+    "impl ModelStore {",
+    "  pub fn new(context: &gpu::Context) -> Self {",
+    "    let color = context.color();",
+    "    let normal = context.normal();",
+    "    let metallic_roughness = context.metallic_roughness();",
+    "",
+    "    self.materials.insert(shaders::model::render::Material {",
+    "      color_texture: color,",
+    "    });",
+    "",
+    "    let bind_group = context.create_bind_group(shaders::model::render::BindGroup1Descriptor {",
+    "      color_texture: color.clone(),",
+    "      color_sampler: color_sampler.binding(),",
+    "      normal_texture: normal.clone(),",
+    "      roughness_metallic_texture: metallic_roughness.clone(),",
+    "    });",
+    "  }",
+    "}",
+  }, root .. "/src/material.rs") == 0, "writefile failed")
+  assert_true(vim.fn.writefile({
+    "alpha",
+    "beta",
+    "gamma",
+    "delta",
+    "new target",
+    "zeta",
+    "eta",
+    "theta",
+    "iota",
+  }, root .. "/src/notes.txt") == 0, "writefile failed")
   diff_review.set_git_backend(backend)
   gh.set_backend(gh_backend)
 
@@ -305,10 +355,8 @@ local function run()
   assert_true(ellipsis_gutter:find("^%s+$", 1) ~= nil, "ellipsis row missing a blank gutter: " .. ellipsis_gutter)
   wait_for(function() return buffer_contains(buf, "}") end, "closing boundary did not render\n" .. buffer_dump(buf))
   wait_for(function()
-    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-    return count_lines(lines, "pub fn new(bridge: Bridge) -> Self {") == 1
-      and count_lines(lines, "  }") == 1
-  end, "neighboring same-scope hunks repeated boundary context\n" .. buffer_dump(buf))
+    return count_boundary_rows(buf, "pub fn new(bridge: Bridge) -> Self {") == 1
+  end, "neighboring same-scope hunks repeated boundary rows\n" .. buffer_dump(buf))
   local closing_gutter = gutter_text(buf, find_row(buf, "  }")) or ""
   assert_true(closing_gutter:find("^%s*13%s+13%s+$", 1) ~= nil, "closing boundary did not use diff gutter: " .. closing_gutter)
   wait_for(function() return buffer_contains(buf, "@@ +1 -1") end, "compact hunk header did not render\n" .. buffer_dump(buf))
@@ -324,7 +372,7 @@ local function run()
   trigger_normal_mapping("<Tab>", find_row(buf, "@@ +1 -1"))
   local collapsed_lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
   assert_true(contains_line(collapsed_lines, "@@ +1 -1"), "collapsed hunk header missing")
-  assert_true(not contains_line(collapsed_lines, "  pub fn new(bridge: Bridge) -> Self {"), "collapsed hunk showed opening boundary")
+  assert_true(not contains_line(collapsed_lines, "let stderr_layer = tracing_subscriber"), "collapsed hunk showed body")
 
   trigger_normal_mapping("<Tab>", find_row(buf, "tangent.rs"))
   wait_for(function()
@@ -337,6 +385,44 @@ local function run()
     local tangent_lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
     return not contains_line(tangent_lines, "return value / length;")
   end, "struct hunk showed context from previous sibling scope\n" .. buffer_dump(buf))
+
+  trigger_normal_mapping("<Tab>", find_row(buf, "material.rs"))
+  wait_for(function()
+    local ok_bind, bind_group_row = pcall(find_row, buf, "let bind_group = context.create_bind_group")
+    local ok_add, material_add_row = pcall(find_row, buf, "color_texture: color.clone()")
+    local ok_close, material_close_row = pcall(find_row, buf, "    });")
+    if not (ok_bind and ok_add and ok_close) then return false end
+    local material_lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+    return bind_group_row < material_add_row
+      and material_add_row < material_close_row
+      and not contains_line(material_lines, "self.materials.insert")
+  end, "material hunk did not render ancestor-path padding\n" .. buffer_dump(buf))
+  local bind_group_row = find_row(buf, "let bind_group = context.create_bind_group")
+  local material_add_row = find_row(buf, "color_texture: color.clone()")
+  local material_close_row = find_row(buf, "    });")
+  assert_true(bind_group_row < material_add_row, "ancestor opener should render before the changed line\n" .. buffer_dump(buf))
+  assert_true(material_add_row < material_close_row, "first rendered closer should belong to the changed line ancestor path\n" .. buffer_dump(buf))
+  local material_lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  assert_true(not contains_line(material_lines, "self.materials.insert"), "ancestor-path padding included a previous sibling statement")
+  assert_true(not contains_line(material_lines, "use {"), "ancestor-path padding included the file root opener")
+  assert_true(not contains_line(material_lines, "impl ModelStore {"), "ancestor-path padding included a parent outside the selected scope")
+  trigger_normal_mapping("S", bind_group_row)
+  vim.wait(50)
+  assert_true(system_call_count() == before, "ancestor opener padding row triggered a stage action")
+  trigger_normal_mapping("S", material_close_row)
+  vim.wait(50)
+  assert_true(system_call_count() == before, "ancestor closer padding row triggered a stage action")
+
+  trigger_normal_mapping("<Tab>", find_row(buf, "notes.txt"))
+  wait_for(function()
+    return buffer_contains(buf, "gamma")
+      and buffer_contains(buf, "delta")
+      and buffer_contains(buf, "zeta")
+      and buffer_contains(buf, "theta")
+  end, "plain text hunk did not render fallback padding\n" .. buffer_dump(buf))
+  local notes_lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  assert_true(not contains_line(notes_lines, "alpha"), "fallback padding rendered more than three lines before the hunk")
+  assert_true(not contains_line(notes_lines, "iota"), "fallback padding rendered more than three lines after the hunk")
 end
 
 local ok, err = xpcall(run, debug.traceback)

@@ -152,6 +152,8 @@
 ---@field end_text string
 ---@field start_segments DiffReviewHighlightSegment[]
 ---@field end_segments DiffReviewHighlightSegment[]
+---@field path_start_rows integer[] 1-based rows from the target node path
+---@field path_end_rows integer[] 1-based rows from the target node path
 
 ---@class DiffReviewHighlightSegment
 ---@field text string
@@ -1406,6 +1408,51 @@ local function hunk_context_from_trees(buf, query, highlight_query, trees, targe
   local lines = vim.api.nvim_buf_get_lines(buf, selected_scope.sr, selected_scope.er + 1, false)
   local start_text = lines[1] or ""
   local end_text = lines[#lines] or start_text
+
+  local function same_node(left, right)
+    if not left or not right then return false end
+    local left_start_row, left_start_col, left_end_row, left_end_col = left:range()
+    local right_start_row, right_start_col, right_end_row, right_end_col = right:range()
+    return left:type() == right:type()
+      and left_start_row == right_start_row
+      and left_start_col == right_start_col
+      and left_end_row == right_end_row
+      and left_end_col == right_end_col
+  end
+
+  local function sorted_row_set(row_set)
+    local rows = {}
+    for row in pairs(row_set) do
+      rows[#rows + 1] = row
+    end
+    table.sort(rows)
+    return rows
+  end
+
+  local path_start_rows = {}
+  local path_end_rows = {}
+  local target_text = vim.api.nvim_buf_get_lines(buf, target, target + 1, false)[1] or ""
+  local root = trees[1]:root()
+  local target_node = nil
+  local node_ok, node = pcall(function()
+    return root:named_descendant_for_range(target, 0, target, #target_text)
+  end)
+  if node_ok then target_node = node end
+  if not target_node then
+    node_ok, node = pcall(function()
+      return root:descendant_for_range(target, 0, target, #target_text)
+    end)
+    if node_ok then target_node = node end
+  end
+  while target_node do
+    local node_start_row, _, node_end_row, _ = target_node:range()
+    if node_start_row < selected_scope.sr or node_end_row > selected_scope.er then break end
+    if node_start_row < target then path_start_rows[node_start_row + 1] = true end
+    if node_end_row > target then path_end_rows[node_end_row + 1] = true end
+    if same_node(target_node, selected_scope.node) then break end
+    target_node = target_node:parent()
+  end
+
   return {
     label = table.concat(names, "."),
     start_row = selected_scope.sr,
@@ -1414,6 +1461,8 @@ local function hunk_context_from_trees(buf, query, highlight_query, trees, targe
     end_text = end_text,
     start_segments = treesitter_line_segments(buf, trees[1], highlight_query, selected_scope.sr, start_text),
     end_segments = treesitter_line_segments(buf, trees[1], highlight_query, selected_scope.er, end_text),
+    path_start_rows = sorted_row_set(path_start_rows),
+    path_end_rows = sorted_row_set(path_end_rows),
   }
 end
 
@@ -2460,6 +2509,30 @@ local function hunk_first_changed_current_line(hunk)
   return hunk.new_start
 end
 
+---@param hunk DiffReviewParsedHunk
+---@return integer
+function M._hunk_after_current_line(hunk)
+  local last_new_line = nil
+  local saw_removed_line = false
+  for _, parsed_line in ipairs(hunk.lines) do
+    if parsed_line.new_line then last_new_line = parsed_line.new_line end
+    if parsed_line.prefix == "-" then saw_removed_line = true end
+  end
+  if last_new_line then return last_new_line + 1 end
+  if saw_removed_line then return hunk.new_start end
+  return hunk.new_start
+end
+
+---@param hunk DiffReviewParsedHunk
+---@return table<integer, boolean>
+function M._hunk_current_line_set(hunk)
+  local lines = {}
+  for _, parsed_line in ipairs(hunk.lines) do
+    if parsed_line.new_line then lines[parsed_line.new_line] = true end
+  end
+  return lines
+end
+
 ---@param hunk DiffReviewHunk?
 ---@return integer?
 function M._status_hunk_context_line(hunk)
@@ -2785,6 +2858,94 @@ local function hunk_body_row(parsed_line, gutter, file, syntax, syntax_row)
   return row
 end
 
+---@param line_number integer
+---@param text string
+---@param gutter DiffReviewGutterSpec
+---@param syntax? DiffReviewTreeSitterSyntax
+---@return table
+function M._hunk_context_padding_row(line_number, text, gutter, syntax)
+  local row = { diff_review_context_padding = true }
+  hunk_add_gutter(row, gutter, line_number, line_number, " ", nil)
+  local segments = nil
+  if syntax then
+    segments = treesitter_line_segments(syntax.buf, syntax.tree, syntax.highlight_query, line_number - 1, text)
+  end
+  if segments and #segments > 0 then
+    for _, segment in ipairs(segments) do
+      row[#row + 1] = segment.hl_group and { segment.text, segment.hl_group } or { segment.text }
+    end
+  else
+    row[#row + 1] = { text }
+  end
+  return row
+end
+
+---@class DiffReviewHunkContextPaddingLine
+---@field line_number integer
+---@field text string
+
+---@param source_lines string[]?
+---@param hunk DiffReviewParsedHunk
+---@param context DiffReviewHunkTreeSitterContext|string?
+---@param side "before"|"after"
+---@return DiffReviewHunkContextPaddingLine[]
+function M._hunk_context_padding_lines(source_lines, hunk, context, side)
+  if type(source_lines) ~= "table" or #source_lines == 0 then return {} end
+  local occupied_lines = M._hunk_current_line_set(hunk)
+  local padding_lines = {}
+  local padding_limit = 3
+  if type(context) == "table" then
+    local changed_line = hunk_first_changed_current_line(hunk)
+    local after_line = M._hunk_after_current_line(hunk)
+    local path_rows = side == "before" and context.path_start_rows or context.path_end_rows
+    local candidates = {}
+    for _, line_number in ipairs(path_rows or {}) do
+      local is_scope_boundary = line_number == (context.start_row + 1) or line_number == (context.end_row + 1)
+      local eligible_before = side == "before" and line_number < changed_line
+      local eligible_after = side == "after" and line_number >= after_line
+      if not is_scope_boundary and not occupied_lines[line_number] and (eligible_before or eligible_after) then
+        candidates[#candidates + 1] = line_number
+      end
+    end
+    table.sort(candidates, function(left, right)
+      if side == "before" then return left > right end
+      return left < right
+    end)
+    while #candidates > padding_limit do
+      table.remove(candidates)
+    end
+    table.sort(candidates)
+    for _, line_number in ipairs(candidates) do
+      padding_lines[#padding_lines + 1] = {
+        line_number = line_number,
+        text = source_lines[line_number] or "",
+      }
+    end
+    return padding_lines
+  end
+
+  local first_line = nil
+  local last_line = nil
+  if side == "before" then
+    local changed_line = hunk_first_changed_current_line(hunk)
+    first_line = math.max(1, changed_line - padding_limit)
+    last_line = changed_line - 1
+  else
+    first_line = M._hunk_after_current_line(hunk)
+    last_line = math.min(#source_lines, first_line + padding_limit - 1)
+  end
+
+  for line_number = first_line, last_line do
+    if not occupied_lines[line_number] then
+      padding_lines[#padding_lines + 1] = {
+        line_number = line_number,
+        text = source_lines[line_number] or "",
+      }
+    end
+  end
+  return padding_lines
+end
+
 ---@param diff_text string
 ---@param hunk_staged? boolean[]
 ---@param filename? string
@@ -2849,17 +3010,29 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
       local visible_hunk_lines = hunk_visible_source_lines(hunk.diff)
       local gutter = hunk.gutter
       local previous_visible_changed = false
+      local source_lines = filename and M._file_source_lines(filename) or nil
+      local emitted_context_lines = {}
+      local function add_context_padding_rows(padding_lines)
+        for _, padding_line in ipairs(padding_lines) do
+          if not emitted_context_lines[padding_line.line_number] then
+            ret[#ret + 1] = M._hunk_context_padding_row(padding_line.line_number, padding_line.text, gutter, file_syntax)
+            emitted_context_lines[padding_line.line_number] = true
+          end
+        end
+      end
       ret[#ret + 1] = hunk_header_row(header_parts)
       if opts.boundary_context and type(raw_context) == "table" then
         local node_start = raw_context.start_row + 1
         local start_text = raw_context.start_text or ""
         if not opts.suppress_start_boundary and not visible_hunk_lines[start_text] then
           ret[#ret + 1] = hunk_boundary_row(raw_context.start_text, raw_context.start_segments, node_start, gutter)
+          emitted_context_lines[node_start] = true
           if node_start ~= raw_context.end_row + 1 then
             ret[#ret + 1] = hunk_boundary_ellipsis_row(start_text, gutter)
           end
         end
       end
+      add_context_padding_rows(M._hunk_context_padding_lines(source_lines, hunk, raw_context, "before"))
       for _, parsed_line in ipairs(hunk.lines) do
         local row_syntax = nil
         local row_syntax_row = nil
@@ -2876,6 +3049,7 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
         local visible_in_scope = hunk_line_visible_in_context_scope(parsed_line, raw_context)
         if visible_in_scope then
           ret[#ret + 1] = hunk_body_row(parsed_line, gutter, filename or block.file, row_syntax, row_syntax_row)
+          if parsed_line.new_line then emitted_context_lines[parsed_line.new_line] = true end
           previous_visible_changed = parsed_line.prefix == "+" or parsed_line.prefix == "-"
         elseif M._hunk_hidden_closing_boundary_after_change(parsed_line, previous_visible_changed, raw_context) then
           local boundary_segments = nil
@@ -2884,6 +3058,7 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
           end
           ret[#ret + 1] = hunk_boundary_ellipsis_row(parsed_line.code, gutter)
           ret[#ret + 1] = hunk_boundary_row(parsed_line.code, boundary_segments, parsed_line.new_line or parsed_line.old_line, gutter)
+          if parsed_line.new_line then emitted_context_lines[parsed_line.new_line] = true end
           previous_visible_changed = false
         end
         if parsed_line.prefix == " " then
@@ -2895,11 +3070,12 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
           new_syntax_row = new_syntax_row + 1
         end
       end
+      add_context_padding_rows(M._hunk_context_padding_lines(source_lines, hunk, raw_context, "after"))
       if opts.boundary_context and type(raw_context) == "table" then
         local node_start = raw_context.start_row + 1
         local node_end = raw_context.end_row + 1
         local end_text = raw_context.end_text or ""
-        if not opts.suppress_end_boundary and not visible_hunk_lines[end_text] then
+        if not opts.suppress_end_boundary and not visible_hunk_lines[end_text] and not emitted_context_lines[node_end] then
           if node_end ~= node_start then
             ret[#ret + 1] = hunk_boundary_ellipsis_row(end_text, gutter)
           end
@@ -5439,7 +5615,7 @@ local function status_add_fancy_row(row, entry, indent)
   local line_text = table.concat(text_parts)
 
   local line_entry = entry
-  if row.diff_review_boundary then
+  if row.diff_review_boundary or row.diff_review_context_padding then
     line_entry = nil
   end
   if diff_line and entry then
