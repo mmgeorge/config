@@ -513,7 +513,7 @@ local function ferrous_model_store_failures(buf)
 
     if type(row_info.diff_lines) == "table" and #row_info.diff_lines > 1 then
       local inline_hl = diff_line.prefix == "-" and "DiffReviewInlineDeleteBg" or "DiffReviewInlineAddBg"
-      local row_hl = diff_line.prefix == "-" and "DiffReviewDeleteBg" or "DiffReviewAddBg"
+      local row_hl = "DiffReviewModifyBg"
       if not line_has_highlight(buf, row, inline_hl) then
         failures[#failures + 1] = ("%d missing compact inline highlight %s for %s"):format(row, inline_hl, code)
       end
@@ -895,12 +895,12 @@ local function run()
   wait_for(function()
     return buffer_contains(buf, "Widget::new(CameraComponent { value: value + 1 })")
   end, "multi-hunk staged Rust file did not render compact shifted row\n" .. buffer_dump(buf))
-  local shifted_row = find_row_with_highlight(buf, "Widget::new(CameraComponent { value: value + 1 })", "DiffReviewAddBg")
+  local shifted_row = find_row_with_highlight(buf, "Widget::new(CameraComponent { value: value + 1 })", "DiffReviewModifyBg")
   wait_for(function()
-    local row = find_row_with_highlight(buf, "Widget::new(CameraComponent { value: value + 1 })", "DiffReviewAddBg")
+    local row = find_row_with_highlight(buf, "Widget::new(CameraComponent { value: value + 1 })", "DiffReviewModifyBg")
     return line_has_highlight(buf, row, "@type")
   end, "compact shifted staged Rust row did not get type syntax highlight: " .. line_highlights(buf, shifted_row))
-  shifted_row = find_row_with_highlight(buf, "Widget::new(CameraComponent { value: value + 1 })", "DiffReviewAddBg")
+  shifted_row = find_row_with_highlight(buf, "Widget::new(CameraComponent { value: value + 1 })", "DiffReviewModifyBg")
   assert_true(
     line_has_highlight(buf, shifted_row, "DiffReviewInlineAddBg"),
     "compact shifted staged Rust row did not highlight the inserted span: " .. line_highlights(buf, shifted_row)
@@ -953,6 +953,10 @@ local function run()
     line_has_highlight(buf, clone_row, "DiffReviewInlineAddBg"),
     "Ferrous compact clone row did not get inline add highlight: " .. line_highlights(buf, clone_row)
   )
+  assert_true(
+    line_has_background_highlight(buf, clone_row, "DiffReviewModifyBg"),
+    "Ferrous compact clone row did not get modify background: " .. line_highlights(buf, clone_row)
+  )
   assert_cell_background_group(buf, clone_row, ".clone()", "DiffReviewInlineAddBg")
 
   trigger_normal_mapping("<Tab>", find_row(buf, "model_store.rs"))
@@ -960,12 +964,12 @@ local function run()
   wait_for(function()
     return buffer_contains(buf, "Widget::new(CameraComponent { value: value + 1 })")
   end, "multi-hunk unstaged Rust file did not render compact shifted row\n" .. buffer_dump(buf))
-  local unstaged_shifted_row = find_row_with_highlight(buf, "Widget::new(CameraComponent { value: value + 1 })", "DiffReviewAddBg")
+  local unstaged_shifted_row = find_row_with_highlight(buf, "Widget::new(CameraComponent { value: value + 1 })", "DiffReviewModifyBg")
   wait_for(function()
-    local row = find_row_with_highlight(buf, "Widget::new(CameraComponent { value: value + 1 })", "DiffReviewAddBg")
+    local row = find_row_with_highlight(buf, "Widget::new(CameraComponent { value: value + 1 })", "DiffReviewModifyBg")
     return line_has_highlight(buf, row, "@type")
   end, "compact shifted unstaged Rust row did not get type syntax highlight: " .. line_highlights(buf, unstaged_shifted_row))
-  unstaged_shifted_row = find_row_with_highlight(buf, "Widget::new(CameraComponent { value: value + 1 })", "DiffReviewAddBg")
+  unstaged_shifted_row = find_row_with_highlight(buf, "Widget::new(CameraComponent { value: value + 1 })", "DiffReviewModifyBg")
   assert_true(
     line_has_highlight(buf, unstaged_shifted_row, "DiffReviewInlineAddBg"),
     "compact shifted unstaged Rust row did not highlight the inserted span: " .. line_highlights(buf, unstaged_shifted_row)

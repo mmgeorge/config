@@ -21,6 +21,11 @@ local diff_text = table.concat({
   "@@ -5 +5 @@",
   "-    mode: OldMode,",
   "+    mode: NewMode,",
+  "@@ -6,2 +6,2 @@",
+  "-    normal_texture: normal,",
+  "-    roughness_metallic_texture: metallic_roughness,",
+  "+    texture: normal.clone(),",
+  "+    roughness_metallic_texture: metallic_roughness.clone(),",
 }, "\n")
 
 ---@type DiffReviewGitBackend
@@ -213,6 +218,8 @@ local function run()
     "    color_texture: color.clone(),",
     "    normal_texture: normal,",
     "    mode: NewMode,",
+    "    texture: normal.clone(),",
+    "    roughness_metallic_texture: metallic_roughness.clone(),",
     "  };",
     "}",
   }, root .. "/src/model.rs") == 0, "writefile failed")
@@ -222,44 +229,46 @@ local function run()
   diff_review.setup({ about_auto_generate = false })
   assert_background_only_highlight("DiffReviewAddBg")
   assert_background_only_highlight("DiffReviewDeleteBg")
+  assert_background_only_highlight("DiffReviewModifyBg")
   assert_inline_background_highlight("DiffReviewInlineAddBg")
   assert_inline_background_highlight("DiffReviewInlineDeleteBg")
   diff_review.open()
   local buf = vim.api.nvim_get_current_buf()
   wait_for(function()
-    return buffer_contains(buf, "model.rs +3 -3")
+    return buffer_contains(buf, "model.rs +5 -5")
   end, "status did not render file\n" .. buffer_dump(buf)
     .. "\n\ncalls:\n" .. table.concat(calls, "\n")
     .. "\n\nmessages:\n" .. vim.fn.execute("messages"))
 
-  trigger_normal_mapping("<Tab>", find_row(buf, "model.rs +3 -3"))
+  trigger_normal_mapping("<Tab>", find_row(buf, "model.rs +5 -5"))
   wait_for(function()
     return buffer_contains(buf, "color_texture: color.clone()")
       and buffer_contains(buf, "normal_texture: normal.clone()")
       and buffer_contains(buf, "mode: NewMode")
+      and buffer_contains(buf, "roughness_metallic_texture: metallic_roughness.clone()")
   end, "expanded hunk did not render\n" .. buffer_dump(buf))
 
   assert_true(not buffer_contains(buf, "color_texture: color,"), "insertion pair should not render the old full line\n" .. buffer_dump(buf))
   local color_row = find_row(buf, "color_texture: color.clone()")
-  assert_true(line_has_background_highlight(buf, color_row, "DiffReviewAddBg"), "compact insertion row should use full add background")
-  assert_true(background_highlight_start_col(buf, color_row, "DiffReviewAddBg") == 0, "compact insertion background should start at column 0")
+  assert_true(line_has_background_highlight(buf, color_row, "DiffReviewModifyBg"), "compact insertion row should use full modify background")
+  assert_true(background_highlight_start_col(buf, color_row, "DiffReviewModifyBg") == 0, "compact insertion background should start at column 0")
   assert_true(line_has_highlight(buf, color_row, "DiffReviewInlineAddBg"), "inserted .clone() span was not highlighted")
   assert_true(
-    highlight_priority(buf, color_row, "DiffReviewInlineAddBg") > highlight_priority(buf, color_row, "DiffReviewAddBg"),
-    "inserted .clone() span should have higher priority than the add row background"
+    highlight_priority(buf, color_row, "DiffReviewInlineAddBg") > highlight_priority(buf, color_row, "DiffReviewModifyBg"),
+    "inserted .clone() span should have higher priority than the modify row background"
   )
-  assert_true(line_has_gutter_chunk(buf, color_row, "+", "DiffReviewAddLineNr"), "compact insertion row should show an add sign in the gutter")
-  assert_true(line_has_padded_gutter_chunk(buf, color_row, "3", "DiffReviewAddLineNr"), "compact insertion row should color the new line number as added")
+  assert_true(line_has_gutter_chunk(buf, color_row, "~", "DiffReviewModifyLineNr"), "compact insertion row should show a modify sign in the gutter")
+  assert_true(line_has_padded_gutter_chunk(buf, color_row, "3", "DiffReviewModifyLineNr"), "compact insertion row should color the new line number as modified")
   local color_entry = diff_review._status.entries[color_row]
   assert_true(color_entry and color_entry.diff_line and color_entry.diff_line.prefix == "+", "compact insertion row should keep new primary diff line")
   assert_true(type(color_entry.diff_lines) == "table" and #color_entry.diff_lines == 2, "compact insertion row should keep both backing lines")
 
   local normal_row = find_row(buf, "normal_texture: normal.clone()")
-  assert_true(line_has_background_highlight(buf, normal_row, "DiffReviewDeleteBg"), "compact deletion row should use full delete background")
-  assert_true(background_highlight_start_col(buf, normal_row, "DiffReviewDeleteBg") == 0, "compact deletion background should start at column 0")
+  assert_true(line_has_background_highlight(buf, normal_row, "DiffReviewModifyBg"), "compact deletion row should use full modify background")
+  assert_true(background_highlight_start_col(buf, normal_row, "DiffReviewModifyBg") == 0, "compact deletion background should start at column 0")
   assert_true(line_has_highlight(buf, normal_row, "DiffReviewInlineDeleteBg"), "deleted .clone() span was not highlighted")
-  assert_true(line_has_gutter_chunk(buf, normal_row, "-", "DiffReviewDeleteLineNr"), "compact deletion row should show a delete sign in the gutter")
-  assert_true(line_has_padded_gutter_chunk(buf, normal_row, "4", "DiffReviewDeleteLineNr"), "compact deletion row should color the old line number as deleted")
+  assert_true(line_has_gutter_chunk(buf, normal_row, "~", "DiffReviewModifyLineNr"), "compact deletion row should show a modify sign in the gutter")
+  assert_true(line_has_padded_gutter_chunk(buf, normal_row, "4", "DiffReviewModifyLineNr"), "compact deletion row should color the old line number as modified")
   local normal_entry = diff_review._status.entries[normal_row]
   assert_true(normal_entry and normal_entry.diff_line and normal_entry.diff_line.prefix == "-", "compact deletion row should keep old primary diff line")
   assert_true(type(normal_entry.diff_lines) == "table" and #normal_entry.diff_lines == 2, "compact deletion row should keep both backing lines")
@@ -275,6 +284,40 @@ local function run()
   assert_true(
     background_highlight_start_col(buf, new_mode_row, "DiffReviewAddBg") == 0,
     "add background should start at column 0"
+  )
+
+  local renamed_delete_row = find_row_with_highlight(buf, "normal_texture: normal,", "DiffReviewDeleteBg")
+  local renamed_add_row = find_row_with_highlight(buf, "    texture: normal.clone()", "DiffReviewAddBg")
+  assert_true(
+    line_has_background_highlight(buf, renamed_delete_row, "DiffReviewDeleteBg"),
+    "substitution delete should stay a full delete row"
+  )
+  assert_true(
+    line_has_background_highlight(buf, renamed_add_row, "DiffReviewAddBg"),
+    "substitution add should stay a full add row"
+  )
+
+  local roughness_row = find_row_with_highlight(buf, "roughness_metallic_texture: metallic_roughness.clone()", "DiffReviewModifyBg")
+  assert_true(
+    line_has_background_highlight(buf, roughness_row, "DiffReviewModifyBg"),
+    "neighboring clone-only pair should compact even when previous pair falls back"
+  )
+  assert_true(
+    line_has_highlight(buf, roughness_row, "DiffReviewInlineAddBg"),
+    "neighboring clone-only pair should keep inline add highlight"
+  )
+  assert_true(
+    line_has_gutter_chunk(buf, roughness_row, "~", "DiffReviewModifyLineNr"),
+    "neighboring clone-only pair should show a modify sign in the gutter"
+  )
+  local roughness_entry = diff_review._status.entries[roughness_row]
+  assert_true(
+    roughness_entry and roughness_entry.diff_line and roughness_entry.diff_line.prefix == "+",
+    "neighboring compact row should keep new primary diff line"
+  )
+  assert_true(
+    type(roughness_entry.diff_lines) == "table" and #roughness_entry.diff_lines == 2,
+    "neighboring compact row should keep both backing lines"
   )
 end
 

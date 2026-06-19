@@ -58,13 +58,19 @@ local function run()
   assert_true(hunk_items[1].kind == "replacement" and hunk_items[2].kind == "replacement", "collapsed items should be replacements")
 
   local fallback_items = intraline.compact_hunk_lines({
-    line("-", "      value: old_name,", 10, nil, 1),
-    line("-", "      other: keep,", 11, nil, 2),
-    line("+", "      value: new_name,", nil, 10, 3),
-    line("+", "      other: keep.clone(),", nil, 11, 4),
+    line("-", "      normal_texture: normal,", 10, nil, 1),
+    line("-", "      roughness_metallic_texture: metallic_roughness,", 11, nil, 2),
+    line("+", "      texture: normal.clone(),", nil, 10, 3),
+    line("+", "      roughness_metallic_texture: metallic_roughness.clone(),", nil, 11, 4),
   })
-  assert_true(#fallback_items == 4, "mixed substitution groups should stay canonical")
-  assert_true(fallback_items[1].kind == "line" and fallback_items[4].kind == "line", "fallback should return normal line items")
+  assert_true(#fallback_items == 3, "mixed substitution groups should compact successful neighboring pairs")
+  assert_true(fallback_items[1].kind == "line" and fallback_items[1].line.prefix == "-", "substitution delete should stay a normal line")
+  assert_true(fallback_items[2].kind == "line" and fallback_items[2].line.prefix == "+", "substitution add should stay a normal line")
+  assert_true(fallback_items[3].kind == "replacement", "clone-only neighboring pair should compact")
+  assert_true(
+    fallback_items[3].display_line.code:find("roughness_metallic_texture", 1, true) ~= nil,
+    "compacted neighboring pair should be the roughness texture line"
+  )
 end
 
 local ok, err = xpcall(run, debug.traceback)
