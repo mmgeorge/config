@@ -22,8 +22,8 @@ local function git_lines(args)
   return output
 end
 
-local full_unstaged_diff = git_lines({ "-c", "core.quotepath=false", "diff", "--no-color", "--no-ext-diff", "--unified=3" })
-local full_staged_diff = git_lines({ "-c", "core.quotepath=false", "diff", "--no-color", "--no-ext-diff", "--unified=3", "--cached" })
+local full_unstaged_diff = git_lines({ "-c", "core.quotepath=false", "diff", "--no-color", "--no-ext-diff", "--unified=0" })
+local full_staged_diff = git_lines({ "-c", "core.quotepath=false", "diff", "--no-color", "--no-ext-diff", "--unified=0", "--cached" })
 local full_unstaged_name_status = git_lines({ "diff", "--name-status" })
 local full_staged_name_status = git_lines({ "diff", "--cached", "--name-status" })
 local full_untracked = git_lines({ "ls-files", "--others", "--exclude-standard" })
@@ -43,10 +43,10 @@ function backend.systemlist(command)
   if key == "git\t-C\t" .. ferrous_root .. "\tls-files\t--others\t--exclude-standard" then return full_untracked, 0 end
   if key == "git\t-C\t" .. ferrous_root .. "\tdiff\t--cached\t--name-status" then return full_staged_name_status, 0 end
   if key == "git\t-C\t" .. ferrous_root .. "\tdiff\t--name-status" then return full_unstaged_name_status, 0 end
-  if key == "git\t-C\t" .. ferrous_root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=3" then
+  if key == "git\t-C\t" .. ferrous_root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0" then
     return full_unstaged_diff, 0
   end
-  if key == "git\t-C\t" .. ferrous_root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=3\t--cached" then
+  if key == "git\t-C\t" .. ferrous_root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0\t--cached" then
     return full_staged_diff, 0
   end
   if key == "git\t-C\t" .. ferrous_root .. "\tlog\t--no-color\t--format=%H%x09%h%x09%cI%x09%s\t-20" then return {}, 0 end

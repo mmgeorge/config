@@ -12,22 +12,20 @@ local diff_text = table.concat({
   "index 1111111..2222222 100644",
   "--- a/src/model.rs",
   "+++ b/src/model.rs",
-  "@@ -1,10 +1,10 @@",
-  " pub fn build() {",
-  "   let bind_group = BindGroup {",
+  "@@ -3 +3 @@",
   "-    color_texture: color,",
   "+    color_texture: color.clone(),",
-  "     color_sampler: color_sampler.binding(),",
+  "@@ -5 +5 @@",
   "-    normal_texture: normal.clone(),",
   "+    normal_texture: normal,",
+  "@@ -6 +6 @@",
   "-    mode: OldMode,",
   "+    mode: NewMode,",
+  "@@ -7,2 +7,2 @@",
   "-    normal_texture: normal,",
   "-    roughness_metallic_texture: metallic_roughness,",
   "+    texture: normal.clone(),",
   "+    roughness_metallic_texture: metallic_roughness.clone(),",
-  "   };",
-  " }",
 }, "\n")
 
 local old_file_lines = {
@@ -65,10 +63,10 @@ function backend.systemlist(command)
   if key == "git\t-C\t" .. root .. "\tls-files\t--others\t--exclude-standard" then return {}, 0 end
   if key == "git\t-C\t" .. root .. "\tdiff\t--cached\t--name-status" then return {}, 0 end
   if key == "git\t-C\t" .. root .. "\tdiff\t--name-status" then return { "M\tsrc/model.rs" }, 0 end
-  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=3" then
+  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0" then
     return vim.split(diff_text, "\n", { plain = true }), 0
   end
-  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=3\t--cached" then
+  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0\t--cached" then
     return {}, 0
   end
   if key == "git\t-C\t" .. root .. "\tlog\t--no-color\t--format=%H%x09%h%x09%cI%x09%s\t-20" then return {}, 0 end
@@ -261,6 +259,13 @@ local function assert_old_revision_opened(expected_line, expected_text)
   assert_true(line == expected_text, "expected old line text " .. expected_text .. ", got " .. line)
 end
 
+local function assert_no_hunk_header_between(buf, start_row, end_row)
+  for row = start_row + 1, end_row - 1 do
+    local line = vim.api.nvim_buf_get_lines(buf, row - 1, row, false)[1] or ""
+    assert_true(not line:find("@@ ", 1, true), "unexpected hunk header inside merged display group\n" .. buffer_dump(buf))
+  end
+end
+
 local function run()
   vim.fn.delete(root, "rf")
   assert_true(vim.fn.mkdir(root .. "/src", "p") == 1, "mkdir failed")
@@ -365,6 +370,7 @@ local function run()
   )
 
   local roughness_row = find_row_with_highlight(buf, "roughness_metallic_texture: metallic_roughness.clone()", "DiffReviewModifyBg")
+  assert_no_hunk_header_between(buf, color_row, roughness_row)
   assert_true(
     line_has_background_highlight(buf, roughness_row, "DiffReviewModifyBg"),
     "neighboring clone-only pair should compact even when previous pair falls back"

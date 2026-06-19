@@ -223,13 +223,13 @@ function backend.systemlist(command)
     table.sort(lines)
     return lines, 0
   end
-  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=3" then
+  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0" then
     local text = joined_diff(state.modified, modified_diff)
     local added = joined_diff(state.unstaged_added, added_diff)
     if text ~= "" and added ~= "" then text = text .. "\n" .. added else text = text .. added end
     return output_lines(text), 0
   end
-  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=3\t--cached" then
+  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0\t--cached" then
     local text = joined_diff(state.staged_modified, modified_diff)
     local added = joined_diff(state.staged_added, added_diff)
     if text ~= "" and added ~= "" then text = text .. "\n" .. added else text = text .. added end
@@ -640,7 +640,7 @@ local function run()
   assert_true(vim.b[preview_buf].git_diff_compacted == true, "compact preview should mark compacted output")
   assert_true(vim.b[preview_buf].git_diff_compact_metrics.hunks == 31, "compact preview metrics missing hunk count")
   assert_true(
-    saw_systemlist_call("git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=3"),
+    saw_systemlist_call("git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0"),
     "compact preview did not read unstaged diff"
   )
   assert_true(buffer_contains(preview_buf, "No hunks have at least 8 changed lines."), "compact preview missing no-large-hunks message")
@@ -652,7 +652,7 @@ local function run()
   reset_calls()
   local staged_preview_buf = open_compact_preview_and_wait({ cwd = root, staged = true }, "Compact diff: 31 hunks, +31 -31 changed lines")
   assert_true(
-    saw_systemlist_call("git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=3\t--cached"),
+    saw_systemlist_call("git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0\t--cached"),
     "compact preview did not read staged diff"
   )
   vim.api.nvim_win_set_buf(0, buf)

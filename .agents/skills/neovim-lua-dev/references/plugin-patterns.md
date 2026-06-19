@@ -516,6 +516,26 @@ The `@@ -old,count +new,count @@ context` header:
 - This points to where **context lines start**, not the first change
 - The first actual change is `new + (number of leading context lines)`
 
+### Virtual Hunk Display vs Raw Hunk Actions
+
+For review/status UIs, keep raw hunks and displayed hunks as separate models.
+Raw hunks should be fetched with zero context (`--unified=0`) whenever the UI
+will inject its own semantic context. They are the source of truth for patches,
+line mappings, staging, unstaging, discard, viewed state, comments, jumps, and
+future line-level operations.
+
+The display layer can then build virtual render plans around those raw hunks:
+add bounded syntax-aware context, compact obvious replacement lines, and merge
+adjacent or overlapping visible windows into one displayed hunk. That merge is
+only presentation. Preserve the raw hunks on the display group, and expand them
+again before any operation that writes git state or durable review state.
+
+Do not feed a virtual `@@ +N -N` display header back to git. It may summarize
+multiple zero-context hunks and omit or synthesize context. Tests should cover
+both sides: raw action tests assert the original hunk diff/line mapping, while
+UI tests assert that adjacent raw changes render without duplicate headers or
+repeated context.
+
 ### Staging Individual Hunks
 
 ```lua

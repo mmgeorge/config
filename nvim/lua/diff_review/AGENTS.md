@@ -105,6 +105,34 @@ search operate on the code alone. Tests asserting gutter content must read
 the row's inline `virt_text` extmark (see `gutter_text` in
 `tests/diff_review/hunk_boundary_context.lua`).
 
+Diff rendering uses two layers:
+
+- Raw hunks are the data/action model. Git diff/show commands should request
+  zero-context hunks (`--unified=0`) so each raw hunk maps tightly to actual
+  changed lines. Stage/unstage/discard, viewed/unviewed state, comments, jumps,
+  and future line-level actions must use the raw hunk metadata and line mapping,
+  not whatever rows happen to be visible after presentation merging.
+- Virtual display hunks are the presentation model. `build_fancy_diff_rows()`
+  builds render plans from raw hunks, injects bounded Tree-sitter-aware context,
+  and merges adjacent or overlapping display windows so the user does not see
+  duplicate `@@` headers or repeated context. A displayed hunk may therefore
+  contain multiple raw hunks; carry them in `raw_hunks` and expand them again
+  before any action that writes state or talks to git.
+
+GitStatus has an additional status-level grouping step before each hunk is
+handed to `build_fancy_diff_rows()`. That grouping must use the same effective
+display-window idea: expand each raw hunk by the shared context padding limit and
+merge hunks whose padded ranges touch. If status renders the raw hunks one at a
+time, the row builder cannot merge across them and bridge context such as
+`Self {` can be duplicated or split under separate headers. Keep
+`tests/diff_review/status_virtual_hunk_merge.lua` covering this edge case.
+
+The `@@ +N -N` header in GitStatus/DiffReview is a display summary for the
+merged virtual group, not a patch header to feed back to git. If a test or
+feature needs the original patch, assert against the raw hunk diff. If a test
+needs the visible UI, assert that nearby zero-context changes render under one
+header without duplicated semantic context.
+
 ## LuaLS Typing
 
 Use LuaLS/EmmyLua comment annotations for plugin code. Public module functions,

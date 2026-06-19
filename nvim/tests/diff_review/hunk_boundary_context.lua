@@ -76,10 +76,10 @@ function backend.systemlist(command)
   if key == "git\t-C\t" .. root .. "\tls-files\t--others\t--exclude-standard" then return {}, 0 end
   if key == "git\t-C\t" .. root .. "\tdiff\t--cached\t--name-status" then return {}, 0 end
   if key == "git\t-C\t" .. root .. "\tdiff\t--name-status" then return { "M\tsrc/engine.rs", "M\tsrc/tangent.rs", "M\tsrc/material.rs", "M\tsrc/notes.txt" }, 0 end
-  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=3" then
+  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0" then
     return vim.split(diff_text, "\n", { plain = true }), 0
   end
-  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=3\t--cached" then
+  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0\t--cached" then
     return {}, 0
   end
   return {}, 1
@@ -301,8 +301,9 @@ local function run()
   wait_for(function() return buffer_contains(buf, "engine.rs +2 -2") end, "status did not render file\n" .. buffer_dump(buf))
 
   trigger_normal_mapping("<Tab>", find_row(buf, "engine.rs"))
+  local engine_header = "@@ +2 -2"
   wait_for(function()
-    return buffer_contains(buf, "@@ +1 -1")
+    return buffer_contains(buf, engine_header)
   end, "compact hunk did not render\n" .. buffer_dump(buf))
   local delete_row = find_row(buf, "let stderr_layer = tracing_subscriber")
   local delete_gutter = gutter_text(buf, delete_row) or ""
@@ -334,7 +335,7 @@ local function run()
   end, "Tree-sitter context was not cached\n" .. buffer_dump(buf))
   wait_for(function() return buffer_contains(buf, "pub fn new(bridge: Bridge) -> Self {") end, "opening boundary did not render\n" .. buffer_dump(buf))
   local boundary_row = find_row(buf, "pub fn new(bridge: Bridge) -> Self {")
-  local first_header_row = find_row(buf, "@@ +1 -1")
+  local first_header_row = find_row(buf, engine_header)
   local updated_delete_row = find_row(buf, "let stderr_layer = tracing_subscriber")
   assert_true(
     first_header_row < boundary_row and boundary_row < updated_delete_row,
@@ -362,10 +363,10 @@ local function run()
   end, "neighboring same-scope hunks repeated boundary rows\n" .. buffer_dump(buf))
   local closing_gutter = gutter_text(buf, find_row(buf, "  }")) or ""
   assert_true(closing_gutter:find("^%s*13%s+13%s+$", 1) ~= nil, "closing boundary did not use diff gutter: " .. closing_gutter)
-  wait_for(function() return buffer_contains(buf, "@@ +1 -1") end, "compact hunk header did not render\n" .. buffer_dump(buf))
-  local header_row = find_row(buf, "@@ +1 -1")
+  wait_for(function() return buffer_contains(buf, engine_header) end, "compact hunk header did not render\n" .. buffer_dump(buf))
+  local header_row = find_row(buf, engine_header)
   local header_line = vim.api.nvim_buf_get_lines(buf, header_row - 1, header_row, false)[1]
-  assert_true(header_line:find("^@@ %+1 %-1", 1) ~= nil, "hunk header unexpectedly included context or gutter: " .. header_line)
+  assert_true(header_line:find("^@@ %+2 %-2", 1) ~= nil, "hunk header unexpectedly included context or gutter: " .. header_line)
 
   local before = system_call_count()
   trigger_normal_mapping("S", boundary_row)
@@ -375,9 +376,9 @@ local function run()
   assert_current_file_jump(root .. "/src/engine.rs", 10, "  pub fn new(bridge: Bridge) -> Self {")
   vim.api.nvim_win_set_buf(0, buf)
 
-  trigger_normal_mapping("<Tab>", find_row(buf, "@@ +1 -1"))
+  trigger_normal_mapping("<Tab>", find_row(buf, engine_header))
   local collapsed_lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-  assert_true(contains_line(collapsed_lines, "@@ +1 -1"), "collapsed hunk header missing")
+  assert_true(contains_line(collapsed_lines, engine_header), "collapsed hunk header missing")
   assert_true(not contains_line(collapsed_lines, "let stderr_layer = tracing_subscriber"), "collapsed hunk showed body")
 
   trigger_normal_mapping("<Tab>", find_row(buf, "tangent.rs"))
