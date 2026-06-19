@@ -41,7 +41,11 @@ source_lines[88] = "      bind_group,"
 source_lines[89] = "      particle_bind_group,"
 source_lines[90] = "    }"
 source_lines[91] = "  }"
-source_lines[92] = "}"
+source_lines[92] = ""
+source_lines[93] = "  pub fn insert(&mut self, model: &Model, repository: &ModelRepository) {"
+source_lines[94] = "    for mesh in model.mesh_iter() {}"
+source_lines[95] = "  }"
+source_lines[96] = "}"
 
 local diff_text = table.concat({
   "diff --git a/src/model_store.rs b/src/model_store.rs",
@@ -60,6 +64,16 @@ local diff_text = table.concat({
   "+      });",
   "@@ -88,0 +89 @@",
   "+      particle_bind_group,",
+  "@@ -74,9 +93,0 @@",
+  "-    let particle_bind_group =",
+  "-      context.create_bind_group(shaders::model::particle_render::BindGroup1Descriptor {",
+  "-        color_texture: color,",
+  "-        color_sampler: color_sampler.binding(),",
+  "-        normal_texture: normal,",
+  "-        roughness_metallic_texture: metallic_roughness,",
+  "-        primitive_material: materials.materials.binding(),",
+  "-        primitive_transform: primitive_transforms.binding(),",
+  "-      });",
 }, "\n")
 
 ---@type DiffReviewGitBackend
@@ -147,6 +161,21 @@ local function count_rows(buf, pattern)
   return count
 end
 
+local function gutter_text(buf, row)
+  local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
+  for _, mark in ipairs(marks) do
+    local details = mark[4] or {}
+    if details.virt_text_pos == "inline" and details.virt_text then
+      local parts = {}
+      for _, chunk in ipairs(details.virt_text) do
+        parts[#parts + 1] = chunk[1]
+      end
+      return table.concat(parts)
+    end
+  end
+  return ""
+end
+
 local function wait_for(condition, message)
   assert_true(vim.wait(3000, condition, 10), message)
 end
@@ -170,18 +199,52 @@ local function run()
 
   local buf = vim.api.nvim_get_current_buf()
   wait_for(function()
-    return buffer_contains(buf, "model_store.rs +10 -0")
+    return buffer_contains(buf, "model_store.rs +10 -9")
   end, "status did not render file\n" .. buffer_dump(buf)
     .. "\n\ncalls:\n" .. table.concat(calls, "\n")
     .. "\n\nmessages:\n" .. vim.fn.execute("messages"))
 
-  trigger_normal_mapping("<Tab>", find_row(buf, "model_store.rs +10 -0"))
+  trigger_normal_mapping("<Tab>", find_row(buf, "model_store.rs +10 -9"))
   wait_for(function()
     return buffer_contains(buf, "particle_bind_group,")
   end, "expanded hunk did not render\n" .. buffer_dump(buf))
 
   assert_true(count_rows(buf, "@@ ") == 1, "adjacent virtual hunks should render under one header\n" .. buffer_dump(buf))
   assert_true(count_rows(buf, "Self {") == 1, "semantic bridge context should not be duplicated\n" .. buffer_dump(buf))
+  local self_row = find_row(buf, "Self {")
+  local self_gutter = gutter_text(buf, self_row)
+  assert_true(self_gutter:find("^%s*76%s+85%s+$", 1) ~= nil, "semantic context gutter should map old/new line numbers: " .. self_gutter)
+  local insert_old_line = diff_review._hunk_old_line_for_new_line({
+    { old_start = 73, old_count = 0, new_start = 74, new_count = 9 },
+    { old_start = 88, old_count = 0, new_start = 89, new_count = 1 },
+    { old_start = 74, old_count = 9, new_start = 93, new_count = 0 },
+  }, 93)
+  assert_true(
+    insert_old_line == 73,
+    "pure deletion parent context should use old_start - 1 with current new line, got " .. tostring(insert_old_line)
+  )
+  assert_true(
+    diff_review._hunk_render_coords_adjacent(73, 93, 74, nil),
+    "boundary parent and first deletion row should be adjacent on the old side"
+  )
+  local for_mesh_old_line = diff_review._hunk_old_line_for_new_line({
+    { old_start = 73, old_count = 0, new_start = 74, new_count = 9 },
+    { old_start = 88, old_count = 0, new_start = 89, new_count = 1 },
+    { old_start = 74, old_count = 9, new_start = 93, new_count = 0 },
+  }, 94)
+  local enumerate_old_line = diff_review._hunk_old_line_for_new_line({
+    { old_start = 73, old_count = 0, new_start = 74, new_count = 9 },
+    { old_start = 88, old_count = 0, new_start = 89, new_count = 1 },
+    { old_start = 74, old_count = 9, new_start = 93, new_count = 0 },
+  }, 95)
+  local material_old_line = diff_review._hunk_old_line_for_new_line({
+    { old_start = 73, old_count = 0, new_start = 74, new_count = 9 },
+    { old_start = 88, old_count = 0, new_start = 89, new_count = 1 },
+    { old_start = 74, old_count = 9, new_start = 93, new_count = 0 },
+  }, 96)
+  assert_true(for_mesh_old_line == 83, "post-deletion context line 94 should map to old line 83, got " .. tostring(for_mesh_old_line))
+  assert_true(enumerate_old_line == 84, "post-deletion context line 95 should map to old line 84, got " .. tostring(enumerate_old_line))
+  assert_true(material_old_line == 85, "post-deletion context line 96 should map to old line 85, got " .. tostring(material_old_line))
 end
 
 local ok, err = xpcall(run, debug.traceback)

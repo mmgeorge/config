@@ -113,6 +113,13 @@ local function find_row(buf, pattern)
   error("missing row: " .. pattern .. "\n" .. buffer_dump(buf), 2)
 end
 
+local function maybe_find_row(buf, pattern)
+  for index, line in ipairs(buffer_lines(buf)) do
+    if line:find(pattern, 1, true) then return index end
+  end
+  return nil
+end
+
 local function find_row_with_highlight(buf, pattern, hl_group)
   for index, line in ipairs(buffer_lines(buf)) do
     if line:find(pattern, 1, true) and line_has_highlight(buf, index, hl_group) then return index end
@@ -371,6 +378,10 @@ local function run()
 
   local roughness_row = find_row_with_highlight(buf, "roughness_metallic_texture: metallic_roughness.clone()", "DiffReviewModifyBg")
   assert_no_hunk_header_between(buf, color_row, roughness_row)
+  local closing_row = maybe_find_row(buf, "  };")
+  if closing_row then
+    assert_true(roughness_row < closing_row, "trailing context should not split compact replacement rows\n" .. buffer_dump(buf))
+  end
   assert_true(
     line_has_background_highlight(buf, roughness_row, "DiffReviewModifyBg"),
     "neighboring clone-only pair should compact even when previous pair falls back"
