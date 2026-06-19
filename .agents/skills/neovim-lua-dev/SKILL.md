@@ -239,6 +239,13 @@ If diagnostics still look wrong, run the linter directly (e.g. `luacheck`,
   activation opt-in for the real markdown region or buffer, and when debugging
   highlight issues inspect the rendered cell stack with `nvim__inspect_cell`;
   extmark presence alone does not prove the visible highlight won.
+- **Stuck-issue instrumentation:** when repeated fixes/tests fail to reproduce a
+  user-visible bug, add temporary or opt-in logging instead of continuing to
+  infer. First prove the logs can see the bad input/state exactly: buffer/window
+  ids, cwd, request id, source payload, row text, extmarks/namespaces, rendered
+  cell stack, API response, or whatever data controls the failure. Keep that
+  logging disabled by default, and remove it or leave it behind an explicit
+  debug flag once the issue is understood.
 - **Syntax-aware edits:** prefer `vim.treesitter` queries over regex.
 - **Window options belong to windows:** use `vim.wo[win]`, not `vim.wo[0]` — the
   "current window" inside an autocmd is often not the one you mean.

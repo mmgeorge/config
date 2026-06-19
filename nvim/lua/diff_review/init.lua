@@ -7745,6 +7745,14 @@ end
 
 M._gitstatus_debug = M._gitstatus_debug or {}
 
+function M._gitstatus_debug.enabled()
+  local global_enabled = vim.g.diff_review_gitstatus_debug
+  return M._gitstatus_debug_force == true
+    or M._gitstatus_debug_enabled == true
+    or global_enabled == true
+    or global_enabled == 1
+end
+
 ---@param value any
 ---@return string
 function M._gitstatus_debug.one_line(value)
@@ -7912,7 +7920,7 @@ end
 ---@param buf integer
 ---@param reason string
 function M._gitstatus_debug.dump(buf, reason)
-  if not M._gitstatus_debug_force and #vim.api.nvim_list_uis() == 0 then return end
+  if not M._gitstatus_debug.enabled() then return end
   local state = M._status_states and M._status_states[buf] or (M._status and M._status.buf == buf and M._status) or nil
   if not (state and state.view_kind == "status" and vim.api.nvim_buf_is_valid(buf)) then return end
   state.gitstatus_debug_dump_reason = reason
@@ -7922,7 +7930,7 @@ function M._gitstatus_debug.dump(buf, reason)
   vim.defer_fn(function()
     state = M._status_states and M._status_states[buf] or (M._status and M._status.buf == buf and M._status) or nil
     if state then state.gitstatus_debug_dump_pending = false end
-    if not M._gitstatus_debug_force and #vim.api.nvim_list_uis() == 0 then return end
+    if not M._gitstatus_debug.enabled() then return end
     if not (state and state.view_kind == "status" and vim.api.nvim_buf_is_valid(buf)) then return end
     reason = state.gitstatus_debug_dump_reason or reason
     local win = vim.fn.win_findbuf(buf)[1]

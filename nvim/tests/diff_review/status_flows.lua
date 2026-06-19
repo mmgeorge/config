@@ -613,6 +613,25 @@ local function run()
     return repo_metadata_calls >= 3 and #repo_cache.contributors("owner/repo") == 3
   end, "GitStatus did not load repo contributor metadata")
 
+  local original_debug_log_path = diff_review._gitstatus_debug_log_path
+  local original_gitstatus_debug = vim.g.diff_review_gitstatus_debug
+  local debug_log_path = vim.fn.tempname()
+  vim.fn.delete(debug_log_path)
+  diff_review._gitstatus_debug_log_path = function() return debug_log_path end
+  diff_review._gitstatus_debug_enabled = nil
+  diff_review._gitstatus_debug_force = nil
+  vim.g.diff_review_gitstatus_debug = nil
+  diff_review._gitstatus_debug.dump(buf, "disabled-test")
+  vim.wait(350)
+  assert_true(vim.fn.filereadable(debug_log_path) == 0, "GitStatus debug dump should be disabled by default")
+  diff_review._gitstatus_debug_force = true
+  diff_review._gitstatus_debug.dump(buf, "enabled-test")
+  wait_for(function() return vim.fn.filereadable(debug_log_path) == 1 end, "GitStatus debug dump did not write when enabled")
+  diff_review._gitstatus_debug_force = nil
+  vim.g.diff_review_gitstatus_debug = original_gitstatus_debug
+  diff_review._gitstatus_debug_log_path = original_debug_log_path
+  vim.fn.delete(debug_log_path)
+
   reset_state({ modified = numbered_files("preview-unstaged", 31) })
   reset_calls()
   local preview_buf = open_compact_preview_and_wait({ cwd = root }, "Compact diff: 31 hunks, +31 -31 changed lines")
