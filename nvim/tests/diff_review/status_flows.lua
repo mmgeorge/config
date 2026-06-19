@@ -223,13 +223,13 @@ function backend.systemlist(command)
     table.sort(lines)
     return lines, 0
   end
-  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff" then
+  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0" then
     local text = joined_diff(state.modified, modified_diff)
     local added = joined_diff(state.unstaged_added, added_diff)
     if text ~= "" and added ~= "" then text = text .. "\n" .. added else text = text .. added end
     return output_lines(text), 0
   end
-  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--cached" then
+  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0\t--cached" then
     local text = joined_diff(state.staged_modified, modified_diff)
     local added = joined_diff(state.staged_added, added_diff)
     if text ~= "" and added ~= "" then text = text .. "\n" .. added else text = text .. added end
@@ -640,7 +640,7 @@ local function run()
   assert_true(vim.b[preview_buf].git_diff_compacted == true, "compact preview should mark compacted output")
   assert_true(vim.b[preview_buf].git_diff_compact_metrics.hunks == 31, "compact preview metrics missing hunk count")
   assert_true(
-    saw_systemlist_call("git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff"),
+    saw_systemlist_call("git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0"),
     "compact preview did not read unstaged diff"
   )
   assert_true(buffer_contains(preview_buf, "No hunks have at least 8 changed lines."), "compact preview missing no-large-hunks message")
@@ -652,7 +652,7 @@ local function run()
   reset_calls()
   local staged_preview_buf = open_compact_preview_and_wait({ cwd = root, staged = true }, "Compact diff: 31 hunks, +31 -31 changed lines")
   assert_true(
-    saw_systemlist_call("git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--cached"),
+    saw_systemlist_call("git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0\t--cached"),
     "compact preview did not read staged diff"
   )
   vim.api.nvim_win_set_buf(0, buf)
@@ -816,7 +816,7 @@ local function run()
   wait_for(function() return buffer_contains(buf, "@@ +1 -1") end, "hunk row did not render")
   trigger_normal_mapping("S", find_row(buf, "@@ +1 -1"))
   wait_for(function()
-    return saw_system_call_containing("\tapply\t--cached\t--whitespace=nowarn\t-")
+    return saw_system_call_containing("\tapply\t--cached\t--whitespace=nowarn\t--unidiff-zero\t-")
   end, "hunk stage did not run cached apply")
   wait_for(function() return buffer_contains(buf, "Staged changes (1)") end, "hunk stage did not reconcile")
   reset_calls()
@@ -824,7 +824,7 @@ local function run()
   wait_for(function() return buffer_contains(buf, "@@ +1 -1") end, "staged hunk row did not render")
   trigger_normal_mapping("U", find_row(buf, "@@ +1 -1"))
   wait_for(function()
-    return saw_system_call_containing("\tapply\t--cached\t--reverse\t--whitespace=nowarn\t-")
+    return saw_system_call_containing("\tapply\t--cached\t--reverse\t--whitespace=nowarn\t--unidiff-zero\t-")
   end, "hunk unstage did not run reverse cached apply")
   wait_for(function() return buffer_contains(buf, "Unstaged changes (1)") end, "hunk unstage did not reconcile")
 
@@ -871,7 +871,7 @@ local function run()
   reset_calls()
   trigger_normal_mapping("S", find_row_after(buf, "@@ +1 -1", find_row(buf, "cursor-stage-a.txt")))
   wait_for(function()
-    return saw_system_call_containing("\tapply\t--cached\t--whitespace=nowarn\t-")
+    return saw_system_call_containing("\tapply\t--cached\t--whitespace=nowarn\t--unidiff-zero\t-")
   end, "cursor hunk stage did not run cached apply")
   wait_for(function()
     return cursor_is_on_hunk_after_file(buf, "cursor-stage-b.txt")
@@ -922,7 +922,7 @@ local function run()
   reset_calls()
   trigger_normal_mapping("S", find_hunk_row_after_file(buf, "context-stage-a.txt"))
   wait_for(function()
-    return saw_system_call_containing("\tapply\t--cached\t--whitespace=nowarn\t-")
+    return saw_system_call_containing("\tapply\t--cached\t--whitespace=nowarn\t--unidiff-zero\t-")
   end, "context cursor hunk stage did not run cached apply")
   wait_for(function()
     return cursor_is_on_hunk_after_file(buf, "context-stage-b.txt")
@@ -973,7 +973,7 @@ local function run()
   reset_calls()
   trigger_normal_mapping("U", find_row_after(buf, "@@ +1 -1", find_row(buf, "cursor-unstage-a.txt")))
   wait_for(function()
-    return saw_system_call_containing("\tapply\t--cached\t--reverse\t--whitespace=nowarn\t-")
+    return saw_system_call_containing("\tapply\t--cached\t--reverse\t--whitespace=nowarn\t--unidiff-zero\t-")
   end, "cursor hunk unstage did not run reverse cached apply")
   wait_for(function()
     return cursor_is_on_hunk_after_file(buf, "cursor-unstage-b.txt")
@@ -1194,7 +1194,7 @@ local function run()
     "optimistic hunk unstage rendered duplicate identical hunks\n" .. table.concat(status_lines(buf), "\n")
   )
   wait_for(function()
-    return saw_system_call_containing("\tapply\t--cached\t--reverse\t--whitespace=nowarn\t-")
+    return saw_system_call_containing("\tapply\t--cached\t--reverse\t--whitespace=nowarn\t--unidiff-zero\t-")
   end, "merge hunk unstage did not run reverse cached apply")
 
   reset_state({ untracked = { ["new.txt"] = true } })
@@ -1283,7 +1283,7 @@ local function run()
   trigger_normal_mapping("j", find_row(buf, "@@ +1 -1"))
   confirm_yes()
   wait_for(function()
-    return saw_system_call_containing("\tapply\t--reverse\t--whitespace=nowarn\t-")
+    return saw_system_call_containing("\tapply\t--reverse\t--whitespace=nowarn\t--unidiff-zero\t-")
   end, "discard hunk did not run reverse apply")
   wait_for(function() return not buffer_contains(buf, "discard-hunk.txt") end, "discard hunk did not refresh")
 
@@ -1295,7 +1295,7 @@ local function run()
   trigger_normal_mapping("j", find_row_after(buf, "@@ +1 -1", find_row(buf, "cursor-discard-a.txt")))
   confirm_yes()
   wait_for(function()
-    return saw_system_call_containing("\tapply\t--reverse\t--whitespace=nowarn\t-")
+    return saw_system_call_containing("\tapply\t--reverse\t--whitespace=nowarn\t--unidiff-zero\t-")
   end, "cursor hunk discard did not run reverse apply")
   wait_for(function()
     return cursor_is_on_hunk_after_file(buf, "cursor-discard-b.txt")

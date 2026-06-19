@@ -91,10 +91,10 @@ function backend.systemlist(command)
   if key == "git\t-C\t" .. root .. "\tdiff\t--cached\t--name-status" then
     return { "M\tc.txt" }, 0
   end
-  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff" then
+  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0" then
     return vim.split(modified_diff("a.txt") .. "\n" .. modified_diff("b.txt"), "\n", { plain = true }), 0
   end
-  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--cached" then
+  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0\t--cached" then
     return vim.split(modified_diff("c.txt"), "\n", { plain = true }), 0
   end
   if key == "git\t-C\t" .. root .. "\tshow\t:0:a.txt" then

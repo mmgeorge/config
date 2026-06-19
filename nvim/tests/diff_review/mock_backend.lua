@@ -108,10 +108,10 @@ function backend.systemlist(command)
   if key == "git\t-C\t" .. root .. "\tdiff\t--name-status" then
     return staged and {} or { "M\ta.txt", "M\tb.txt" }, 0
   end
-  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff" then
+  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0" then
     return vim.split(staged and "" or unstaged_diff, "\n", { plain = true }), 0
   end
-  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--cached" then
+  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0\t--cached" then
     return vim.split(staged and staged_diff or "", "\n", { plain = true }), 0
   end
 
@@ -256,7 +256,13 @@ local function run()
   diff_review.compute_hunk_context_async = function(_, _, cb)
     ts_requests = ts_requests + 1
     vim.defer_fn(function()
-      cb("AsyncScope")
+      cb({
+        label = "AsyncScope",
+        start_row = 0,
+        end_row = 0,
+        start_text = "AsyncScope",
+        end_text = "AsyncScope",
+      })
     end, 5)
   end
   diff_review.compute_diff_syntax_async = function(filename, lines_for_syntax, cb)
@@ -302,7 +308,7 @@ local function run()
   trigger_normal_mapping("<Tab>", first_row)
   lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
   assert_true(contains_line(lines, "@@ +1 -1"), "missing fallback hunk header before async treesitter context")
-  wait_for(function() return buffer_contains(buf, "AsyncScope") end, "async treesitter context did not update hunk header")
+  wait_for(function() return buffer_contains(buf, "AsyncScope") end, "async treesitter context did not render boundary row")
   assert_true(ts_requests > 0, "treesitter async context was not requested")
   lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
   first_row, second_row = find_rows(lines, "a.txt +1 -1", "b.txt +1 -1")

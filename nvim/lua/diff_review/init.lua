@@ -191,6 +191,31 @@ M._reply_icon = "↳"
 M._pending_review_icon = "◷"
 M._codeowner_review_icon = "⚠"
 M._milestone_icon = "◆"
+
+---@param cwd string
+---@param extra_args? string[]
+---@return string[]
+function M._git_diff_command(cwd, extra_args)
+  local command = {
+    "git", "-C", cwd,
+    "-c", "core.quotepath=false",
+    "diff", "--no-color", "--no-ext-diff", "--unified=0",
+  }
+  for _, arg in ipairs(extra_args or {}) do
+    command[#command + 1] = arg
+  end
+  return command
+end
+
+---@param cwd string
+---@param commit_oid string
+---@return string[]
+function M._git_show_diff_command(cwd, commit_oid)
+  return {
+    "git", "-C", cwd,
+    "show", "--format=", "--no-color", "--no-ext-diff", "--unified=0", commit_oid,
+  }
+end
 M._pr_overview = {}
 M._datetime = {}
 M._comment_rows = require("github.comment_rows")
@@ -934,7 +959,7 @@ function M.stage_patch_async(diff, cb)
     cb(false)
     return
   end
-  run_git_async({ "apply", "--cached", "--whitespace=nowarn", "-" }, diff .. "\n", function(result)
+  run_git_async({ "apply", "--cached", "--whitespace=nowarn", "--unidiff-zero", "-" }, diff .. "\n", function(result)
     if not result.ok then
       notify_error("Stage failed: " .. (result.output ~= "" and result.output or ("git exited " .. result.code)))
       cb(false)
@@ -952,7 +977,7 @@ function M.unstage_patch_async(diff, cb)
     cb(false)
     return
   end
-  run_git_async({ "apply", "--cached", "--reverse", "--whitespace=nowarn", "-" }, diff .. "\n", function(result)
+  run_git_async({ "apply", "--cached", "--reverse", "--whitespace=nowarn", "--unidiff-zero", "-" }, diff .. "\n", function(result)
     if not result.ok then
       notify_error("Unstage failed: " .. (result.output ~= "" and result.output or ("git exited " .. result.code)))
       cb(false)
@@ -969,7 +994,7 @@ function M.stage_patch(diff)
     notify_error("No patch to stage")
     return false
   end
-  local result = run_git_sync_for_test_backend({ "apply", "--cached", "--whitespace=nowarn", "-" }, diff .. "\n")
+  local result = run_git_sync_for_test_backend({ "apply", "--cached", "--whitespace=nowarn", "--unidiff-zero", "-" }, diff .. "\n")
   if not result.ok then
     notify_error("Stage failed: " .. (result.output ~= "" and result.output or ("git exited " .. result.code)))
     return false
@@ -984,7 +1009,7 @@ function M.unstage_patch(diff)
     notify_error("No patch to unstage")
     return false
   end
-  local result = run_git_sync_for_test_backend({ "apply", "--cached", "--reverse", "--whitespace=nowarn", "-" }, diff .. "\n")
+  local result = run_git_sync_for_test_backend({ "apply", "--cached", "--reverse", "--whitespace=nowarn", "--unidiff-zero", "-" }, diff .. "\n")
   if not result.ok then
     notify_error("Unstage failed: " .. (result.output ~= "" and result.output or ("git exited " .. result.code)))
     return false
@@ -1242,11 +1267,7 @@ end
 ---@param staged boolean
 ---@param cb fun(hunks: DiffReviewHunk[])
 local function get_hunks_async(cwd, staged, cb)
-  local args = { "git", "-C", cwd, "-c", "core.quotepath=false",
-    "diff", "--no-color", "--no-ext-diff" }
-  if staged then
-    args[#args + 1] = "--cached"
-  end
+  local args = M._git_diff_command(cwd, staged and { "--cached" } or nil)
   systemlist_async(args, function(result, code)
     if code ~= 0 then
       cb({})
@@ -2439,6 +2460,17 @@ local function hunk_first_changed_current_line(hunk)
   return hunk.new_start
 end
 
+---@param hunk DiffReviewHunk?
+---@return integer?
+function M._status_hunk_context_line(hunk)
+  if not hunk then return nil end
+  local diff = tostring(hunk.diff or "")
+  local blocks = parse_unified_diff(diff)
+  local parsed_hunk = blocks[1] and blocks[1].hunks and blocks[1].hunks[1] or nil
+  if not parsed_hunk then return hunk.pos end
+  return hunk_first_changed_current_line(parse_hunk_body(parsed_hunk))
+end
+
 ---@param parsed_line DiffReviewParsedHunkLine
 ---@param context DiffReviewHunkTreeSitterContext|string?
 ---@return boolean
@@ -2448,6 +2480,18 @@ local function hunk_line_visible_in_context_scope(parsed_line, context)
   local scope_start = context.start_row + 1
   local scope_end = context.end_row + 1
   return parsed_line.new_line >= scope_start and parsed_line.new_line <= scope_end
+end
+
+---@param parsed_line DiffReviewParsedHunkLine
+---@param previous_visible_changed boolean
+---@param context DiffReviewHunkTreeSitterContext|string?
+---@return boolean
+function M._hunk_hidden_closing_boundary_after_change(parsed_line, previous_visible_changed, context)
+  if not previous_visible_changed then return false end
+  if parsed_line.prefix ~= " " or type(context) ~= "table" then return false end
+  if hunk_line_visible_in_context_scope(parsed_line, context) then return false end
+  if not parsed_line.new_line then return false end
+  return parsed_line.code:match("^%s*}%s*[,;]?%s*$") ~= nil
 end
 
 ---@alias DiffReviewDiffSyntaxSide "old"|"new"
@@ -2791,25 +2835,21 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
       local callback_key = context_callback_key and context_callback_key(hunk_line)
         or ("diff-row:" .. (filename or block.file) .. ":" .. hunk_line)
       local raw_context = nil
-      local ts_context = nil
       if filename then
         raw_context = cached_hunk_context(filename, hunk_line, callback_key, on_context_update)
-        ts_context = hunk_context_label(raw_context)
       end
 
       local header_parts = {
         { "@@ ", "DiffReviewHunkHeader" },
+        { ("+%d"):format(hunk.added), "DiffReviewAddRange" },
+        { " ", "DiffReviewHunkHeader" },
+        { ("-%d"):format(hunk.removed), "DiffReviewDeleteRange" },
       }
-      if ts_context then
-        header_parts[#header_parts + 1] = { ts_context, "DiffReviewHunkContext" }
-        header_parts[#header_parts + 1] = { " ", "DiffReviewHunkHeader" }
-      end
-      header_parts[#header_parts + 1] = { ("+%d"):format(hunk.added), "DiffReviewAddRange" }
-      header_parts[#header_parts + 1] = { " ", "DiffReviewHunkHeader" }
-      header_parts[#header_parts + 1] = { ("-%d"):format(hunk.removed), "DiffReviewDeleteRange" }
 
       local visible_hunk_lines = hunk_visible_source_lines(hunk.diff)
       local gutter = hunk.gutter
+      local previous_visible_changed = false
+      ret[#ret + 1] = hunk_header_row(header_parts)
       if opts.boundary_context and type(raw_context) == "table" then
         local node_start = raw_context.start_row + 1
         local start_text = raw_context.start_text or ""
@@ -2820,7 +2860,6 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
           end
         end
       end
-      ret[#ret + 1] = hunk_header_row(header_parts)
       for _, parsed_line in ipairs(hunk.lines) do
         local row_syntax = nil
         local row_syntax_row = nil
@@ -2834,8 +2873,18 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
           row_syntax = new_syntax
           row_syntax_row = new_syntax_row
         end
-        if hunk_line_visible_in_context_scope(parsed_line, raw_context) then
+        local visible_in_scope = hunk_line_visible_in_context_scope(parsed_line, raw_context)
+        if visible_in_scope then
           ret[#ret + 1] = hunk_body_row(parsed_line, gutter, filename or block.file, row_syntax, row_syntax_row)
+          previous_visible_changed = parsed_line.prefix == "+" or parsed_line.prefix == "-"
+        elseif M._hunk_hidden_closing_boundary_after_change(parsed_line, previous_visible_changed, raw_context) then
+          local boundary_segments = nil
+          if row_syntax and row_syntax_row then
+            boundary_segments = treesitter_line_segments(row_syntax.buf, row_syntax.tree, row_syntax.highlight_query, row_syntax_row, parsed_line.code)
+          end
+          ret[#ret + 1] = hunk_boundary_ellipsis_row(parsed_line.code, gutter)
+          ret[#ret + 1] = hunk_boundary_row(parsed_line.code, boundary_segments, parsed_line.new_line or parsed_line.old_line, gutter)
+          previous_visible_changed = false
         end
         if parsed_line.prefix == " " then
           old_syntax_row = old_syntax_row + 1
@@ -6808,6 +6857,9 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_ki
   local entry = { id = hunk_key, kind = entry_kind or "hunk", file = file, hunk = hunk }
   M._status.fancy_rows = M._status.fancy_rows or {}
   local rows_key
+  local context_line = M._status_hunk_context_line(hunk) or hunk.pos
+  local previous_context_line = previous_hunk and M._status_hunk_context_line(previous_hunk) or nil
+  local next_context_line = next_hunk and M._status_hunk_context_line(next_hunk) or nil
   local function rerender_with_context()
     M._status = M._status or {}
     if M._status.context_rerender_pending then return end
@@ -6826,19 +6878,19 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_ki
   end
   local current_context = cached_hunk_context(
     file.filename,
-    hunk.pos,
+    context_line,
     "status-neighbor:" .. hunk_key .. ":current",
     rerender_with_context
   )
   local previous_context = previous_hunk and cached_hunk_context(
     file.filename,
-    previous_hunk.pos,
+    previous_context_line or previous_hunk.pos,
     "status-neighbor:" .. hunk_key .. ":previous",
     rerender_with_context
   ) or nil
   local next_context = next_hunk and cached_hunk_context(
     file.filename,
-    next_hunk.pos,
+    next_context_line or next_hunk.pos,
     "status-neighbor:" .. hunk_key .. ":next",
     rerender_with_context
   ) or nil
@@ -6868,7 +6920,7 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_ki
       end,
       rerender_with_context,
       {
-        context_line = hunk.pos,
+        context_line = context_line,
         boundary_context = true,
         suppress_start_boundary = suppress_start_boundary,
         suppress_end_boundary = suppress_end_boundary,
@@ -6884,10 +6936,8 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_ki
     end
   end
   if not rows then
-    local ts_context = current_context or cached_hunk_context(file.filename, hunk.pos, "status-fallback:" .. hunk_key, rerender_with_context)
-    local context_text = hunk_context_label(ts_context) or hunk.context_text or ""
-    local context = context_text ~= "" and (context_text .. " ") or ""
-    local header = ("%s@@ %s+%d -%d"):format(string.rep(" ", status_hunk_indent), context, hunk.added or 0, hunk.removed or 0)
+    local ts_context = current_context or cached_hunk_context(file.filename, context_line, "status-fallback:" .. hunk_key, rerender_with_context)
+    local header = ("%s@@ +%d -%d"):format(string.rep(" ", status_hunk_indent), hunk.added or 0, hunk.removed or 0)
     local visible_hunk_lines = nil
     local node_start = nil
     local node_end = nil
@@ -6899,15 +6949,15 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_ki
       node_end = ts_context.end_row + 1
       start_text = ts_context.start_text or ""
       end_text = ts_context.end_text or ""
+    end
+    status_add_line(header, entry, hunk_folded and "DiffReviewActiveHunkHeader" or "DiffReviewHunkHeader")
+    if visible_hunk_lines and node_start and node_end and end_text then
       if not suppress_start_boundary and not visible_hunk_lines[start_text] then
         status_add_fancy_row(hunk_boundary_row(start_text, ts_context.start_segments, node_start), nil, status_hunk_indent)
         if node_start ~= node_end then
           status_add_fancy_row(hunk_boundary_ellipsis_row(start_text), nil, status_hunk_indent)
         end
       end
-    end
-    status_add_line(header, entry, hunk_folded and "DiffReviewActiveHunkHeader" or "DiffReviewHunkHeader")
-    if visible_hunk_lines and node_start and node_end and end_text then
       if not suppress_end_boundary and not visible_hunk_lines[end_text] and node_end ~= node_start then
         status_add_fancy_row(hunk_boundary_ellipsis_row(end_text), nil, status_hunk_indent)
         status_add_fancy_row(hunk_boundary_row(end_text, ts_context.end_segments, node_end), nil, status_hunk_indent)
@@ -7303,9 +7353,7 @@ local function status_load_commit_files(commit)
     files_error = nil,
   }
 
-  systemlist_async({
-    "git", "-C", cwd, "show", "--format=", "--no-color", "--no-ext-diff", commit.oid,
-  }, function(output, code)
+  systemlist_async(M._git_show_diff_command(cwd, commit.oid), function(output, code)
     local latest_status = M._status
     if not (latest_status and latest_status.buf and vim.api.nvim_buf_is_valid(latest_status.buf)) then return end
     if latest_status.cwd ~= cwd then return end
@@ -11621,7 +11669,7 @@ function M._branch_diff.load(branch, cwd, buf, file)
   if not (status and status.buf == buf) then return end
   status.branch_diff_request_id = (status.branch_diff_request_id or 0) + 1
   local request_id = status.branch_diff_request_id
-  local command = { "git", "-C", cwd, "-c", "core.quotepath=false", "diff", "--no-color", "--no-ext-diff", branch }
+  local command = M._git_diff_command(cwd, { branch })
   if file then
     vim.list_extend(command, { "--", file })
   end
@@ -13113,7 +13161,7 @@ local function status_discard_entries(entries, target_id)
       end
 
       if entry.kind == "hunk" then
-        local args = { "apply", "--reverse", "--whitespace=nowarn" }
+        local args = { "apply", "--reverse", "--whitespace=nowarn", "--unidiff-zero" }
         if entry.hunk.staged then args[#args + 1] = "--index" end
         args[#args + 1] = "-"
         run_git_at_root_async(cwd, args, entry.hunk.diff .. "\n", function(result)
@@ -14380,7 +14428,7 @@ function M.open_compact_preview(opts)
       return
     end
 
-    local command = { "git", "-C", cwd, "-c", "core.quotepath=false", "diff", "--no-color", "--no-ext-diff" }
+    local command = M._git_diff_command(cwd)
     if opts.staged then command[#command + 1] = "--cached" end
     systemlist_async(command, function(output, code, stderr)
       if code ~= 0 then

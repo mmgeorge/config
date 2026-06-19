@@ -266,10 +266,10 @@ function backend.systemlist(command)
     lines[#lines + 1] = "M\tsrc/unstaged_multi_hunk.rs"
     return lines, 0
   end
-  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff" then
+  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0" then
     return vim.split(unstaged_diff, "\n", { plain = true }), 0
   end
-  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--cached" then
+  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0\t--cached" then
     return vim.split(staged_diff, "\n", { plain = true }), 0
   end
   if key == "git\t-C\t" .. root .. "\tlog\t--no-color\t--format=%H%x09%h%x09%cI%x09%s\t-20" then return {}, 0 end
@@ -493,6 +493,27 @@ local function ferrous_model_store_failures(buf)
   end
 
   return failures
+end
+
+local function assert_model_store_secondary_scope_boundary(buf)
+  local debug_info_row = find_row(buf, "pub debug_info: String")
+  local new_header_row = find_row(buf, "@@ +13 -3")
+  local new_function_row = find_row(buf, "pub fn new(context: &gpu::Context) -> Self {")
+  local lines = vim.api.nvim_buf_get_lines(buf, debug_info_row, new_function_row - 1, false)
+  local saw_ellipsis = false
+  local saw_closing_brace = false
+  for _, line in ipairs(lines) do
+    if line:match("^%s*%.%.%.%s*$") then saw_ellipsis = true end
+    if line:match("^%s*}%s*$") then saw_closing_brace = true end
+  end
+  assert_true(
+    saw_ellipsis and saw_closing_brace,
+    "model_store.rs hunk cut off ParticleModelDrawCommand before ModelStore.new\n" .. buffer_dump(buf)
+  )
+  assert_true(
+    new_header_row < new_function_row,
+    "model_store.rs should render hunk header before its scope boundary\n" .. buffer_dump(buf)
+  )
 end
 
 local function run()
@@ -856,6 +877,7 @@ local function run()
       .. "\n\n"
       .. buffer_dump(buf)
   end)
+  assert_model_store_secondary_scope_boundary(buf)
 
   local particle_bind_group_row = find_row(buf, "pub particle_bind_group")
   assert_true(

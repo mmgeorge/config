@@ -43,7 +43,7 @@ function git_backend.systemlist(command)
   if key == "git\t-C\t" .. root .. "\tls-files\t--others\t--exclude-standard" then return {}, 0 end
   if key == "git\t-C\t" .. root .. "\tdiff\t--cached\t--name-status" then return {}, 0 end
   if key == "git\t-C\t" .. root .. "\tdiff\t--name-status" then return { "M\tlua/diff_review/init.lua" }, 0 end
-  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff" then
+  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0" then
     return {
       "diff --git a/lua/diff_review/init.lua b/lua/diff_review/init.lua",
       "--- a/lua/diff_review/init.lua",
@@ -53,7 +53,7 @@ function git_backend.systemlist(command)
       "+new",
     }, 0
   end
-  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--cached" then return {}, 0 end
+  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0\t--cached" then return {}, 0 end
   if key:find("\tlog\t--no%-color\t", 1, false) then return {}, 1 end
   return {}, 1
 end
