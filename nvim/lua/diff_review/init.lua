@@ -94,7 +94,7 @@
 
 ---@class DiffReviewStatusEntry
 ---@field id? string
----@field kind "section"|"file"|"hunk"|"context_line"|"commit"|"commit_file"|"commit_hunk"|"pr_file"|"pr_hunk"|"pr_comment"|"pr_comment_reply"|"pr_review"|"pr_review_file"|"pr_review_hunk"|"review_comment"|"pr"|"about"|"pr_check"|"pr_head_section"|"pr_head_line"
+---@field kind "section"|"file"|"hunk"|"context_line"|"commit"|"commit_message"|"commit_file"|"commit_hunk"|"pr_file"|"pr_hunk"|"pr_comment"|"pr_comment_reply"|"pr_review"|"pr_review_file"|"pr_review_hunk"|"review_comment"|"pr"|"about"|"pr_check"|"pr_head_section"|"pr_head_line"
 ---@field section? DiffReviewStatusSection
 ---@field file? DiffReviewStatusFile
 ---@field hunk? DiffReviewHunk
@@ -113,6 +113,8 @@
 ---@field fold_target_id? string
 ---@field diff_lines? table[]
 ---@field inline_jump_spans? table[]
+---@field commit_subject_start_col? integer
+---@field commit_subject_end_col? integer
 
 ---@alias DiffReviewStatusViewKind "status"|"pr"|"diff"
 
@@ -5590,13 +5592,19 @@ local function status_git_line_async(cwd, args, cb)
 end
 
 local function status_head_row(name, oid, ref, ref_hl, subject, date_text, ref_width)
-  local segments = {
-    { ("%-8s"):format(name .. ":"), "DiffReviewStatusLabel" },
-    { ("%-7s"):format(oid or ""), "DiffReviewStatusObjectId" },
-  }
+  local segments = {}
+  local byte_col = 0
+  local function add_segment(text, hl_group)
+    text = tostring(text or "")
+    segments[#segments + 1] = { text, hl_group }
+    byte_col = byte_col + #text
+  end
+
+  add_segment(("%-8s"):format(name .. ":"), "DiffReviewStatusLabel")
+  add_segment(("%-7s"):format(oid or ""), "DiffReviewStatusObjectId")
   if date_text and date_text ~= "" then
-    segments[#segments + 1] = { " " }
-    segments[#segments + 1] = { date_text, "DiffReviewStatusDate" }
+    add_segment(" ")
+    add_segment(date_text, "DiffReviewStatusDate")
   end
   local ref_text = ref or ""
   local ref_padding = ""
@@ -5604,14 +5612,39 @@ local function status_head_row(name, oid, ref, ref_hl, subject, date_text, ref_w
     local padding_width = ref_width - vim.fn.strdisplaywidth(ref_text)
     if padding_width > 0 then ref_padding = string.rep(" ", padding_width) end
   end
-  vim.list_extend(segments, {
-    { " " },
-    { ref_text, ref_hl },
-  })
-  if ref_padding ~= "" then segments[#segments + 1] = { ref_padding } end
-  segments[#segments + 1] = { " " }
-  vim.list_extend(segments, M._status_conventional_commit_subject_segments(subject or "", nil))
-  return segments
+  add_segment(" ")
+  add_segment(ref_text, ref_hl)
+  if ref_padding ~= "" then add_segment(ref_padding) end
+  add_segment(" ")
+
+  local subject_start_col = byte_col
+  for _, segment in ipairs(M._status_conventional_commit_subject_segments(subject or "", nil)) do
+    add_segment(segment[1], segment[2])
+  end
+  local subject_end_col = byte_col
+  return segments, subject_start_col, subject_end_col
+end
+
+function M._status_commit_message_entry(commit, source, start_col, end_col)
+  if type(commit) ~= "table" then return nil end
+  local oid = vim.trim(tostring(commit.oid or commit.sha or commit.id or ""))
+  local subject = tostring(commit.subject or commit.messageHeadline or commit.message or "")
+  if oid == "" and subject == "" then return nil end
+  return {
+    id = ("commit-message:%s:%s"):format(tostring(source or "commit"), oid ~= "" and oid or vim.fn.sha256(subject):sub(1, 12)),
+    kind = "commit_message",
+    commit = commit,
+    commit_subject_start_col = start_col,
+    commit_subject_end_col = end_col,
+  }
+end
+
+function M._status_head_commit_line(name, oid, ref, ref_hl, subject, date_text, ref_width, commit)
+  local segments, subject_start_col, subject_end_col = status_head_row(name, oid, ref, ref_hl, subject, date_text, ref_width)
+  return {
+    segments = segments,
+    entry = M._status_commit_message_entry(commit, name, subject_start_col, subject_end_col),
+  }
 end
 
 ---@param pr_state DiffReviewStatusPRState?
@@ -5843,30 +5876,36 @@ local function status_build_head_lines(values, pr_state, about_state, issues_sta
   if values.upstream then ref_width = math.max(ref_width, vim.fn.strdisplaywidth(values.upstream)) end
   if values.push_ref then ref_width = math.max(ref_width, vim.fn.strdisplaywidth(values.push_ref)) end
   local lines = {}
-  lines[#lines + 1] = {
-    segments = status_head_row(
-      "Head",
-      values.head_oid or "0000000",
-      values.branch or "(detached)",
-      "DiffReviewStatusBranch",
-      values.subject or "(no commits)",
-      nil,
-      ref_width
-    ),
-  }
+  lines[#lines + 1] = M._status_head_commit_line(
+    "Head",
+    values.head_oid or "0000000",
+    values.branch or "(detached)",
+    "DiffReviewStatusBranch",
+    values.subject or "(no commits)",
+    nil,
+    ref_width,
+    {
+      oid = "HEAD",
+      short_oid = values.head_oid or "0000000",
+      subject = values.subject or "(no commits)",
+    }
+  )
 
   if values.upstream then
-    lines[#lines + 1] = {
-      segments = status_head_row(
-        "Merge",
-        values.upstream_oid or "",
-        values.upstream,
-        "DiffReviewStatusRemote",
-        values.upstream_subject or "",
-        nil,
-        ref_width
-      ),
-    }
+    lines[#lines + 1] = M._status_head_commit_line(
+      "Merge",
+      values.upstream_oid or "",
+      values.upstream,
+      "DiffReviewStatusRemote",
+      values.upstream_subject or "",
+      nil,
+      ref_width,
+      {
+        oid = values.upstream,
+        short_oid = values.upstream_oid or "",
+        subject = values.upstream_subject or "",
+      }
+    )
   end
 
   if remote_action and remote_action.action == "push" then
@@ -5877,17 +5916,20 @@ local function status_build_head_lines(values, pr_state, about_state, issues_sta
       },
     }
   elseif values.push_ref then
-    lines[#lines + 1] = {
-      segments = status_head_row(
-        "Push",
-        values.push_oid or "",
-        values.push_ref,
-        "DiffReviewStatusRemote",
-        values.push_subject or "",
-        nil,
-        ref_width
-      ),
-    }
+    lines[#lines + 1] = M._status_head_commit_line(
+      "Push",
+      values.push_oid or "",
+      values.push_ref,
+      "DiffReviewStatusRemote",
+      values.push_subject or "",
+      nil,
+      ref_width,
+      {
+        oid = values.push_ref,
+        short_oid = values.push_oid or "",
+        subject = values.push_subject or "",
+      }
+    )
   end
 
   lines[#lines + 1] = status_pr_head_line(pr_state)
@@ -6230,9 +6272,10 @@ end
 ---@param pr DiffReviewGhPR
 ---@return string
 ---@return string date_text
+---@return table? commit
 local function status_pr_head_subject(pr)
   local commits = pr.commits or {}
-  if type(commits) ~= "table" then return "", "" end
+  if type(commits) ~= "table" then return "", "", nil end
   local head_oid = vim.trim(tostring(pr.headRefOid or ""))
   local commit = nil
   if head_oid ~= "" then
@@ -6248,12 +6291,12 @@ local function status_pr_head_subject(pr)
     end
   end
   commit = commit or commits[#commits]
-  if type(commit) ~= "table" then return "", "" end
+  if type(commit) ~= "table" then return "", "", nil end
   local date_text = M._datetime.relative(
     commit.committedDate or commit.committed_date or commit.committed_at or commit.authoredDate or commit.authored_date or commit.authored_at,
     { yesterday = false }
   )
-  return tostring(commit.messageHeadline or commit.subject or commit.message or ""), date_text
+  return tostring(commit.messageHeadline or commit.subject or commit.message or ""), date_text, commit
 end
 
 ---@param username string
@@ -6471,17 +6514,23 @@ local function status_pr_detail_head_lines(pr, status)
   if pr.repo and pr.repo ~= "" then
     lines[#lines + 1] = { segments = { { "Repo:   ", "DiffReviewStatusLabel" }, { pr.repo, "DiffReviewStatusRemote" } } }
   end
-  local head_subject, head_date = status_pr_head_subject(pr)
-  lines[#lines + 1] = {
-    segments = status_head_row(
-      "Head",
-      status_short_oid(pr.headRefOid),
-      pr.headRefName or "",
-      "DiffReviewStatusBranch",
-      head_subject,
-      head_date
-    ),
-  }
+  local head_subject, head_date, head_commit = status_pr_head_subject(pr)
+  local status_commit = M._pr_overview.status_commit_from_pr_commit(head_commit, pr.headRefName)
+    or {
+      oid = pr.headRefOid,
+      short_oid = status_short_oid(pr.headRefOid),
+      subject = head_subject,
+    }
+  lines[#lines + 1] = M._status_head_commit_line(
+    "Head",
+    status_short_oid(pr.headRefOid),
+    pr.headRefName or "",
+    "DiffReviewStatusBranch",
+    head_subject,
+    head_date,
+    nil,
+    status_commit
+  )
   if pr.url and pr.url ~= "" then
     lines[#lines + 1] = { segments = { { "URL:    ", "DiffReviewStatusLabel" }, { pr.url, "DiffReviewStatusPR" } } }
   end
@@ -8218,7 +8267,7 @@ end
 ---@param branch string?
 ---@param cb fun(section?: DiffReviewStatusSection)
 local function status_recent_commits_section_async(cwd, upstream, branch, cb)
-  local args = { "-20" }
+  local args = { "-30" }
   if upstream and upstream ~= "" then
     args[#args + 1] = upstream
   end
@@ -8228,7 +8277,7 @@ local function status_recent_commits_section_async(cwd, upstream, branch, cb)
     args = args,
     branch = branch,
     default_folded = true,
-    limit = 20,
+    limit = 30,
   }, cb)
 end
 
@@ -9050,7 +9099,13 @@ local function status_render_commit(commit, date_width)
     suffix_start_col = #line + 1
     line = line .. " " .. suffix
   end
-  local entry = { id = commit_key, kind = "commit", commit = commit }
+  local entry = {
+    id = commit_key,
+    kind = "commit",
+    commit = commit,
+    commit_subject_start_col = suffix_start_col,
+    commit_subject_end_col = suffix_start_col and (suffix_start_col + #suffix) or nil,
+  }
   local line_number = status_add_line(line, entry)
   status_add_highlight(line_number, 0, #commit.short_oid, "DiffReviewStatusObjectId")
   if date_start_col then
@@ -9927,6 +9982,11 @@ local function status_render_loaded(buf, target_id, fallback_line, opts, head_li
   M._diff_line_content_lengths[buf] = {}
   M._clear_diff_gutter_visual_line(buf)
 
+  local walkthrough = package.loaded["diff_review.walkthrough"]
+  if walkthrough and walkthrough.status_head_lines then
+    head_lines = walkthrough.status_head_lines(buf, head_lines)
+  end
+
   local folded_head_parents = {}
   for _, head_line in ipairs(head_lines) do
     if not (head_line.parent_id and folded_head_parents[head_line.parent_id]) then
@@ -9985,7 +10045,6 @@ local function status_render_loaded(buf, target_id, fallback_line, opts, head_li
 
   -- Re-apply walkthrough decorations after rows shift; package.loaded guard
   -- avoids loading the module when no walkthrough has ever started.
-  local walkthrough = package.loaded["diff_review.walkthrough"]
   if walkthrough then walkthrough.on_status_rendered(buf) end
 
   -- Rendering wipes view-specific extmarks (PR-edit regions, review comment
@@ -15432,6 +15491,80 @@ local function status_open_about(entry)
   vim.api.nvim_win_set_buf(vim.api.nvim_get_current_win(), buf)
 end
 
+function M._status_commit_message_target(entry, cursor_col)
+  if not (entry and (entry.kind == "commit" or entry.kind == "commit_message") and entry.commit) then return nil end
+  local start_col = entry.commit_subject_start_col
+  local end_col = entry.commit_subject_end_col
+  if type(start_col) == "number" and type(end_col) == "number" then
+    if start_col >= end_col then return nil end
+    if type(cursor_col) ~= "number" or cursor_col < start_col or cursor_col >= end_col then return nil end
+  end
+  return entry.commit
+end
+
+function M._status_commit_message_fallback_lines(commit)
+  local message = tostring(commit and (commit.full_message or commit.messageBody or commit.message_body or commit.body or commit.message) or "")
+  if message == "" then message = tostring(commit and (commit.subject or commit.messageHeadline) or "") end
+  if message == "" then return { "No commit message." } end
+  return vim.split(message:gsub("\r\n", "\n"), "\n", { plain = true })
+end
+
+function M._status_open_commit_message(commit, cwd)
+  if type(commit) ~= "table" then return false end
+  local oid = vim.trim(tostring(commit.oid or commit.sha or commit.id or ""))
+  local short_oid = vim.trim(tostring(commit.short_oid or commit.shortOid or commit.abbreviatedOid or ""))
+  if short_oid == "" then short_oid = status_short_oid(oid) end
+  local title_id = short_oid ~= "" and short_oid or vim.fn.sha256(tostring(commit.subject or commit.messageHeadline or "")):sub(1, 8)
+
+  local buf = vim.api.nvim_create_buf(true, false)
+  vim.bo[buf].bufhidden = "hide"
+  vim.bo[buf].buftype = "nofile"
+  vim.bo[buf].swapfile = false
+  vim.bo[buf].filetype = "gitcommit"
+  local name = ("GitCommit://%s"):format(title_id)
+  if not pcall(vim.api.nvim_buf_set_name, buf, name) then
+    pcall(vim.api.nvim_buf_set_name, buf, name .. "#" .. buf)
+  end
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "Loading commit message..." })
+  vim.bo[buf].modifiable = false
+  vim.keymap.set("n", "q", function()
+    if vim.api.nvim_buf_is_valid(buf) then pcall(vim.api.nvim_buf_delete, buf, { force = true }) end
+  end, { buffer = buf, nowait = true, silent = true, desc = "Close commit message" })
+  vim.api.nvim_win_set_buf(vim.api.nvim_get_current_win(), buf)
+
+  local function set_lines(lines)
+    if not vim.api.nvim_buf_is_valid(buf) then return end
+    if type(lines) ~= "table" or #lines == 0 then lines = M._status_commit_message_fallback_lines(commit) end
+    vim.bo[buf].modifiable = true
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+    vim.bo[buf].modifiable = false
+  end
+
+  if oid == "" or not (cwd and cwd ~= "") then
+    set_lines(M._status_commit_message_fallback_lines(commit))
+    return true
+  end
+
+  systemlist_async({ "git", "-C", cwd, "show", "-s", "--format=%B", oid }, function(output, code, stderr)
+    if code ~= 0 then
+      local message = vim.trim(stderr or "")
+      notify_error("Commit message failed: " .. (message ~= "" and message or ("git exited " .. tostring(code))), "DiffReview")
+      set_lines(M._status_commit_message_fallback_lines(commit))
+      return
+    end
+    set_lines(output or {})
+  end)
+  return true
+end
+
+function M._status_open_commit_message_under_cursor(entry)
+  local cursor = vim.api.nvim_win_get_cursor(0)
+  local commit = M._status_commit_message_target(entry, cursor and cursor[2])
+  if not commit then return false end
+  return M._status_open_commit_message(commit, M._status and M._status.cwd)
+end
+
 ---@param span table
 ---@return "add"|"delete"|nil
 function M._status_inline_span_kind(span)
@@ -15854,7 +15987,9 @@ local function setup_status_keymaps(buf)
     end)
     local function review_open_action()
       if M._status_states and M._status_states[buf] then M._status = M._status_states[buf] end
-      status_jump(status_entry_under_cursor())
+      local entry = status_entry_under_cursor()
+      if M._status_open_commit_message_under_cursor(entry) then return end
+      status_jump(entry)
     end
     map("open", "n", review_open_action, "Jump to file")
     vim.schedule(function()
@@ -15893,7 +16028,9 @@ local function setup_status_keymaps(buf)
     map("open", "n", function()
       if M._status_states and M._status_states[buf] then M._status = M._status_states[buf] end
       if is_pr_view and M._pr_edit.toggle_draft_status_under_cursor(buf) then return end
-      status_jump(status_entry_under_cursor())
+      local entry = status_entry_under_cursor()
+      if M._status_open_commit_message_under_cursor(entry) then return end
+      status_jump(entry)
     end, "Jump to file")
     map("help", "n", status_show_help)
     vim.api.nvim_create_autocmd("CursorMoved", {
@@ -15936,7 +16073,9 @@ local function setup_status_keymaps(buf)
 
   map("open", "n", function()
     local entry = status_entry_under_cursor()
-    if entry and entry.kind == "pr" then
+    if M._status_open_commit_message_under_cursor(entry) then
+      return
+    elseif entry and entry.kind == "pr" then
       status_open_pr(entry)
     elseif entry and entry.kind == "about" then
       status_open_about(entry)

@@ -123,11 +123,20 @@ local function line_column(buf, row, text)
   return column
 end
 
-local function trigger_normal_mapping(key, row)
-  vim.api.nvim_win_set_cursor(0, { row, 0 })
+local function trigger_normal_mapping(key, row, col)
+  vim.api.nvim_win_set_cursor(0, { row, col or 0 })
   local mapping = vim.fn.maparg(key, "n", false, true)
   assert_true(type(mapping.callback) == "function", "missing normal mapping for " .. key)
   mapping.callback()
+end
+
+local function open_commit_message_from_subject(status_buf, row, subject, expected_body)
+  trigger_normal_mapping("<CR>", row, line_column(status_buf, row, subject) - 1)
+  wait_for(function()
+    local current_buf = vim.api.nvim_get_current_buf()
+    return current_buf ~= status_buf and buffer_contains(current_buf, expected_body)
+  end, "commit message buffer did not open with body: " .. expected_body)
+  vim.api.nvim_set_current_buf(status_buf)
 end
 
 local function saw_call_containing(needle)
@@ -243,14 +252,23 @@ function backend.systemlist(command)
       "c8f1018123456789\tc8f1018\t2026-06-11T12:00:00Z\tfeat: preserve cursor position during visual staging",
     }, 0
   end
-  if key == "git\t-C\t" .. root .. "\tlog\t--no-color\t--format=%H%x09%h%x09%cI%x09%s\t-20\torigin/master" then
+  if key == "git\t-C\t" .. root .. "\tlog\t--no-color\t--format=%H%x09%h%x09%cI%x09%s\t-30\torigin/master" then
     local lines = {}
-    for index = 1, 21 do
+    for index = 1, 31 do
       local oid = ("%040d"):format(index)
       local short_oid = ("recent%02d"):format(index)
       lines[#lines + 1] = ("%s\t%s\t%s\tdocs: recent commit %02d"):format(oid, short_oid, recent_commit_date(index), index)
     end
     return lines, 0
+  end
+  if key == "git\t-C\t" .. root .. "\tshow\t-s\t--format=%B\tHEAD" then
+    return { "feat: add or mapping and guard ai generation", "", "Head commit body." }, 0
+  end
+  if key == "git\t-C\t" .. root .. "\tshow\t-s\t--format=%B\t45806b8123456789" then
+    return { "feat: add or mapping and guard ai generation", "", "Unmerged commit body." }, 0
+  end
+  if key == "git\t-C\t" .. root .. "\tshow\t-s\t--format=%B\t0000000000000000000000000000000000000001" then
+    return { "docs: recent commit 01", "", "Recent commit body." }, 0
   end
   if key == "git\t-C\t" .. root .. "\tshow\t--format=\t--no-color\t--no-ext-diff\t--unified=0\t45806b8123456789" then
     return output_lines(commit_diff), 0
@@ -301,12 +319,18 @@ local function run()
 
   wait_for(function() return buffer_contains(buf, "Unmerged into origin/master (4)") end, "unmerged section did not render")
   assert_true(find_row(buf, "Unmerged into origin/master (4)") > find_row(buf, "Staged changes"), "unmerged section should render after local change sections")
-  wait_for(function() return buffer_contains(buf, "Recent Commits (20)") end, "recent commits section did not render")
-  assert_true(find_row(buf, "Recent Commits (20)") > find_row(buf, "Unmerged into origin/master (4)"), "recent commits should render below unmerged commits")
-  assert_true(saw_call_containing("\tlog\t--no-color\t--format=%H%x09%h%x09%cI%x09%s\t-20\torigin/master"), "recent commits did not use a 20-commit upstream git log")
+  wait_for(function() return buffer_contains(buf, "Recent Commits (30)") end, "recent commits section did not render")
+  assert_true(find_row(buf, "Recent Commits (30)") > find_row(buf, "Unmerged into origin/master (4)"), "recent commits should render below unmerged commits")
+  assert_true(saw_call_containing("\tlog\t--no-color\t--format=%H%x09%h%x09%cI%x09%s\t-30\torigin/master"), "recent commits did not use a 30-commit upstream git log")
   assert_true(not buffer_contains(buf, "recent01  1 day ago   docs: recent commit 01"), "recent commits should start folded")
   assert_true(buffer_contains(buf, "45806b8  1 day ago  feat: add or mapping and guard ai generation"), "first unmerged commit missing")
   assert_true(buffer_contains(buf, "748971a  2 days ago feat: add debug notifications and AI commit flag"), "second unmerged commit missing")
+  open_commit_message_from_subject(
+    buf,
+    find_row(buf, "Head:"),
+    "feat: add or mapping and guard ai generation",
+    "Head commit body."
+  )
   local first_unmerged_row = find_row(buf, "45806b8  1 day ago  feat: add or mapping and guard ai generation")
   local first_unmerged_line = status_lines(buf)[first_unmerged_row] or ""
   assert_true(
@@ -320,6 +344,12 @@ local function run()
   )
   assert_true(not buffer_contains(buf, "foo/bar.js +1 -1"), "commit files loaded before commit was expanded")
   assert_true(count_calls_containing("\tshow\t--format=\t--no-color\t--no-ext-diff\t--unified=0\t45806b8123456789") == 0, "commit diff loaded eagerly")
+  open_commit_message_from_subject(
+    buf,
+    first_unmerged_row,
+    "feat: add or mapping and guard ai generation",
+    "Unmerged commit body."
+  )
 
   local unmerged_heading = find_row(buf, "Unmerged into origin/master (4)")
   trigger_normal_mapping("<Tab>", find_row_after(buf, "45806b8  1 day ago  feat", unmerged_heading))
@@ -351,7 +381,7 @@ local function run()
   end, "commit-only Rust hunk body row did not get Tree-sitter keyword highlight: " .. line_highlights(buf, find_row(buf, "pub fn from_commit")))
 
   local show_calls_before_recent = count_calls_containing("\tshow\t--format=\t--no-color\t--no-ext-diff\t--unified=0")
-  trigger_normal_mapping("<Tab>", find_row(buf, "Recent Commits (20)"))
+  trigger_normal_mapping("<Tab>", find_row(buf, "Recent Commits (30)"))
   wait_for(function() return buffer_contains(buf, "recent01  1 day ago   docs: recent commit 01") end, "recent commits did not unfold")
   local recent_row = find_row(buf, "recent01  1 day ago   docs: recent commit 01")
   local recent_line = status_lines(buf)[recent_row] or ""
@@ -364,15 +394,18 @@ local function run()
     line_has_highlight(buf, recent_row, "DiffReviewStatusCommitType", docs_start, docs_start + #"docs"),
     "recent conventional commit type was not highlighted: " .. line_highlights(buf, recent_row)
   )
-  assert_true(buffer_contains(buf, "recent20  20 days ago docs: recent commit 20"), "recent commits did not include the 20th commit")
-  assert_true(not buffer_contains(buf, "recent21  21 days ago docs: recent commit 21"), "recent commits rendered more than 20 commits")
+  open_commit_message_from_subject(buf, recent_row, "docs: recent commit 01", "Recent commit body.")
+  assert_true(buffer_contains(buf, "recent30"), "recent commits did not include the 30th commit")
+  assert_true(buffer_contains(buf, "docs: recent commit 30"), "recent commits did not include the 30th commit subject")
+  assert_true(not buffer_contains(buf, "recent31"), "recent commits rendered more than 30 commits")
+  assert_true(not buffer_contains(buf, "docs: recent commit 31"), "recent commits rendered the 31st commit subject")
   assert_true(
-    find_row_after(buf, "recent01  1 day ago   docs: recent commit 01", find_row(buf, "Recent Commits (20)"))
-      > find_row(buf, "Recent Commits (20)"),
+    find_row_after(buf, "recent01  1 day ago   docs: recent commit 01", find_row(buf, "Recent Commits (30)"))
+      > find_row(buf, "Recent Commits (30)"),
     "recent commits did not render under the recent section"
   )
   assert_true(
-    not buffer_contains_after(buf, "45806b8  1 day ago  feat: add or mapping and guard ai generation", find_row(buf, "Recent Commits (20)")),
+    not buffer_contains_after(buf, "45806b8  1 day ago  feat: add or mapping and guard ai generation", find_row(buf, "Recent Commits (30)")),
     "recent commits included an unmerged commit"
   )
   assert_true(
@@ -381,10 +414,10 @@ local function run()
   )
   trigger_normal_mapping("<Tab>", recent_row)
   wait_for(function()
-    return buffer_contains_after(buf, "New      recent/added.txt +1 -0", find_row(buf, "Recent Commits (20)"))
+    return buffer_contains_after(buf, "New      recent/added.txt +1 -0", find_row(buf, "Recent Commits (30)"))
   end, "expanded recent commit did not label new file\n" .. table.concat(status_lines(buf), "\n"))
   assert_true(
-    buffer_contains_after(buf, "Removed  recent/removed.txt +0 -1", find_row(buf, "Recent Commits (20)")),
+    buffer_contains_after(buf, "Removed  recent/removed.txt +0 -1", find_row(buf, "Recent Commits (30)")),
     "expanded recent commit did not label removed file"
   )
   local recent_added_file_row = find_row(buf, "New      recent/added.txt +1 -0")

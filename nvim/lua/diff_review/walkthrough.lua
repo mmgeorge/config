@@ -1,8 +1,8 @@
 -- Guided review walkthrough for the DiffReviewStatus buffer. An LLM writes
 -- .walkthrough.json at the repo root (see walkthrough.schema.json next to this
--- file); `ow` in the status buffer shows the summary, then z/y step backward/
--- forward through the referenced regions inside the inline diff, with the
--- author's comment rendered as an inline virt_lines box below each region.
+-- file); `ow` in the status buffer adds a foldable summary section and renders
+-- the author's comment boxes below visible referenced regions inside the inline
+-- diff.
 -- Positions refer to the NEW
 -- (post-change) file; the document records the HEAD sha it was generated
 -- against so stale walkthroughs degrade to best-effort jumps with a note.
@@ -91,7 +91,7 @@
 ---@class DiffReviewWalkthroughMode
 ---@field host DiffReviewWalkthroughHost
 ---@field doc DiffReviewWalkthroughDoc
----@field index integer 0 = summary popup, 1..n = steps
+---@field index integer 0 = status-integrated walkthrough, 1..n = focused step
 ---@field stale boolean
 ---@field head_sha? string
 ---@field saved_maps table<string, table> maparg dicts to restore on stop
@@ -111,6 +111,7 @@ local M = {
 
 local nav_keys = { "z", "y", "q", "<Esc>" }
 local comment_box_max_inner_width = 84
+local status_section_id = "walkthrough:section"
 
 ---@param reader DiffReviewWalkthroughReader?
 function M.set_reader(reader)
@@ -700,9 +701,11 @@ function M.resolve_step(state, step)
       if entry.kind == "file" and not section.file_row then
         section.file_row = row
       end
-      local diff_line = entry.diff_line
-      if diff_line and diff_line.side == "right" and type(diff_line.line) == "number" then
-        section.rows[#section.rows + 1] = { row = row, new_line = diff_line.line }
+      local diff_lines = type(entry.diff_lines) == "table" and entry.diff_lines or { entry.diff_line }
+      for _, diff_line in ipairs(diff_lines) do
+        if diff_line and diff_line.side == "right" and type(diff_line.line) == "number" then
+          section.rows[#section.rows + 1] = { row = row, new_line = diff_line.line }
+        end
       end
     end
   end
@@ -971,8 +974,10 @@ end
 ---@param step DiffReviewWalkthroughStep
 ---@param target DiffReviewWalkthroughTarget
 ---@param win integer
+---@param opts? { anchor?: "viewport"|"end" }
 ---@return DiffReviewWalkthroughCommentBoxPlacement placement
-local function render_comment_box(mode, step, target, win)
+local function render_comment_box(mode, step, target, win, opts)
+  opts = opts or {}
   local buf = mode.host.buf
   local win_width = vim.api.nvim_win_get_width(win)
   local inner_width = math.max(30, math.min(comment_box_max_inner_width, win_width - 8))
@@ -1025,7 +1030,10 @@ local function render_comment_box(mode, step, target, win)
   end
   virt_lines[#virt_lines + 1] = { { pad .. "╰" .. ("─"):rep(inner_width) .. "╯", "FloatBorder" } }
 
-  local anchor_row = comment_box_anchor_row(target, vim.api.nvim_win_get_height(win), #virt_lines)
+  local anchor_row = target.end_row or target.start_row or 1
+  if opts.anchor ~= "end" then
+    anchor_row = comment_box_anchor_row(target, vim.api.nvim_win_get_height(win), #virt_lines)
+  end
   pcall(vim.api.nvim_buf_set_extmark, buf, M._ns, anchor_row - 1, 0, {
     virt_lines = virt_lines,
     virt_lines_above = false,
@@ -1230,13 +1238,15 @@ end
 ---@param buf integer
 ---@param lines string[]
 ---@param doc DiffReviewWalkthroughDoc
-local function apply_summary_highlights(buf, lines, doc)
+---@param row_offset? integer
+local function apply_summary_highlights(buf, lines, doc, row_offset)
+  row_offset = row_offset or 0
   local item_titles = collect_summary_item_titles(doc.tasks)
   local item_specs = collect_summary_item_specs(doc.tasks)
   local justifications = collect_summary_justifications(doc.tasks)
   for row, line in ipairs(lines) do
     if summary_is_task_line(line) then
-      pcall(vim.api.nvim_buf_set_extmark, buf, M._ns, row - 1, 0, {
+      pcall(vim.api.nvim_buf_set_extmark, buf, M._ns, row_offset + row - 1, 0, {
         end_col = #line,
         hl_group = "DiffReviewWalkthroughItemTitle",
       })
@@ -1244,7 +1254,7 @@ local function apply_summary_highlights(buf, lines, doc)
 
     if summary_is_justification_line(line, justifications) then
       local start_col = summary_line_prose(line)
-      pcall(vim.api.nvim_buf_set_extmark, buf, M._ns, row - 1, start_col, {
+      pcall(vim.api.nvim_buf_set_extmark, buf, M._ns, row_offset + row - 1, start_col, {
         end_col = #line,
         hl_group = "DiffReviewWalkthroughJustification",
       })
@@ -1252,13 +1262,13 @@ local function apply_summary_highlights(buf, lines, doc)
 
     local group_type_start_col, group_type_end_col, group_type = summary_group_type_range(line)
     if group_type_start_col and group_type_end_col then
-      pcall(vim.api.nvim_buf_set_extmark, buf, M._ns, row - 1, group_type_start_col, {
+      pcall(vim.api.nvim_buf_set_extmark, buf, M._ns, row_offset + row - 1, group_type_start_col, {
         end_col = group_type_end_col,
         hl_group = "DiffReviewWalkthroughType",
       })
       local group_title_start_col, group_title_end_col = summary_group_title_range(line, group_type, group_type_end_col)
       if group_title_start_col and group_title_end_col then
-        pcall(vim.api.nvim_buf_set_extmark, buf, M._ns, row - 1, group_title_start_col, {
+        pcall(vim.api.nvim_buf_set_extmark, buf, M._ns, row_offset + row - 1, group_title_start_col, {
           end_col = group_title_end_col,
           hl_group = "DiffReviewWalkthroughItemTitle",
         })
@@ -1268,14 +1278,14 @@ local function apply_summary_highlights(buf, lines, doc)
     local start_col, end_col, action = summary_action_range(line)
     local hl_group = action and action_highlights[action] or nil
     if start_col and end_col and hl_group then
-      pcall(vim.api.nvim_buf_set_extmark, buf, M._ns, row - 1, start_col, {
+      pcall(vim.api.nvim_buf_set_extmark, buf, M._ns, row_offset + row - 1, start_col, {
         end_col = end_col,
         hl_group = hl_group,
       })
       local type_start_col, type_end_col, item_type, item_type_start_col, item_type_label =
         summary_item_type_range(line, start_col, action, item_specs)
       if type_start_col and type_end_col then
-        pcall(vim.api.nvim_buf_set_extmark, buf, M._ns, row - 1, type_start_col, {
+        pcall(vim.api.nvim_buf_set_extmark, buf, M._ns, row_offset + row - 1, type_start_col, {
           end_col = type_end_col,
           hl_group = hl_group,
         })
@@ -1284,12 +1294,98 @@ local function apply_summary_highlights(buf, lines, doc)
         local title_start_col, title_end_col =
           summary_item_title_range(line, item_type, item_type_label, item_type_start_col, item_titles)
         if title_start_col and title_end_col then
-          pcall(vim.api.nvim_buf_set_extmark, buf, M._ns, row - 1, title_start_col, {
+          pcall(vim.api.nvim_buf_set_extmark, buf, M._ns, row_offset + row - 1, title_start_col, {
             end_col = title_end_col,
             hl_group = "DiffReviewWalkthroughItemTitle",
           })
         end
       end
+    end
+  end
+end
+
+---@param mode DiffReviewWalkthroughMode
+---@return string[] lines
+local function status_summary_lines(mode)
+  local width = math.max(40, vim.o.columns - 4)
+  return summary_lines(mode.doc.summary, width, collect_summary_item_titles(mode.doc.tasks))
+end
+
+---@param buf integer
+---@param head_lines table[]
+---@return table[]
+function M.status_head_lines(buf, head_lines)
+  local mode = M._modes[buf]
+  if not mode then return head_lines end
+
+  local lines = {}
+  vim.list_extend(lines, head_lines or {})
+  lines[#lines + 1] = { segments = { { "" } } }
+  lines[#lines + 1] = {
+    segments = { { "Walkthrough:", "DiffReviewStatusHeader" } },
+    default_folded = false,
+    entry = { id = status_section_id, kind = "pr_head_section" },
+  }
+
+  local summary_index = 0
+  local child_index = 0
+  local function append_child(text, segments, id)
+    child_index = child_index + 1
+    lines[#lines + 1] = {
+      segments = segments or { { text } },
+      parent_id = status_section_id,
+      entry = {
+        id = id or ("walkthrough:child:%d"):format(child_index),
+        kind = "pr_head_line",
+        fold_target_id = status_section_id,
+      },
+    }
+  end
+
+  if mode.stale then
+    append_child("", { { ("WARNING: generated against %s, HEAD is now %s"):format(
+      mode.doc.commit:sub(1, 7),
+      mode.head_sha and mode.head_sha:sub(1, 7) or "unknown"
+    ), "DiffReviewWalkthroughStale" } }, "walkthrough:stale")
+  end
+  for _, line in ipairs(status_summary_lines(mode)) do
+    summary_index = summary_index + 1
+    append_child(line, nil, ("walkthrough:summary:%d"):format(summary_index))
+  end
+  return lines
+end
+
+---@param mode DiffReviewWalkthroughMode
+---@param state table?
+local function apply_status_summary_highlights(mode, state)
+  local entries = state and state.entries or {}
+  local lines = status_summary_lines(mode)
+  local first_row = nil
+  for row, entry in pairs(entries) do
+    if entry and entry.id == "walkthrough:summary:1" then
+      first_row = row
+      break
+    end
+  end
+  if first_row then
+    apply_summary_highlights(mode.host.buf, lines, mode.doc, first_row - 1)
+  end
+end
+
+---@param target DiffReviewWalkthroughTarget
+---@return boolean
+local function target_has_visible_diff_rows(target)
+  return target.match == "exact" or target.match == "nearest"
+end
+
+---@param mode DiffReviewWalkthroughMode
+---@param state table?
+---@param win integer
+local function render_visible_comment_boxes(mode, state, win)
+  for _, step in ipairs(mode.doc.steps or {}) do
+    local target = M.resolve_step(state, step)
+    if target_has_visible_diff_rows(target) then
+      render_comment_box(mode, step, target, win, { anchor = "end" })
     end
   end
 end
@@ -1412,7 +1508,9 @@ end
 --- Exit the walkthrough: clear decorations, close the float, restore the
 --- original buffer-local mappings (q is the status close mapping).
 ---@param buf integer
-function M.stop(buf)
+---@param opts? { rerender?: boolean }
+function M.stop(buf, opts)
+  opts = opts or {}
   local mode = M._modes[buf]
   if not mode then return end
   M._modes[buf] = nil
@@ -1431,6 +1529,9 @@ function M.stop(buf)
         end)
       end
     end
+  end
+  if opts.rerender and mode.host and vim.api.nvim_buf_is_valid(buf) then
+    mode.host.rerender()
   end
 end
 
@@ -1522,11 +1623,12 @@ end
 -- ─── entry points ────────────────────────────────────────────────────────────
 
 --- Start the walkthrough for a status buffer: load .walkthrough.json from the
---- repo root, check staleness against HEAD, and show the summary popup.
+--- repo root, check staleness against HEAD, and rerender the integrated summary.
 ---@param host DiffReviewWalkthroughHost
 function M.start(host)
   if M._modes[host.buf] then
-    M.stop(host.buf)
+    M.stop(host.buf, { rerender = true })
+    return
   end
 
   local cwd = host.cwd()
@@ -1565,7 +1667,8 @@ function M.start(host)
       stale = not head_sha or head_sha:lower() ~= doc.commit:lower(),
       saved_maps = {},
     }
-    M._open_summary(mode)
+    M._modes[host.buf] = mode
+    host.rerender()
   end)
 end
 
@@ -1574,15 +1677,22 @@ end
 ---@param buf integer
 function M.on_status_rendered(buf)
   local mode = M._modes[buf]
-  if not mode or mode.index < 1 then return end
+  if not mode then return end
   vim.schedule(function()
     local active = M._modes[buf]
-    if not active or active.index < 1 then return end
+    if not active then return end
     if not vim.api.nvim_buf_is_valid(buf) then return end
     local win = vim.fn.bufwinid(buf)
     if win == -1 then return end
+    vim.api.nvim_buf_clear_namespace(buf, M._ns, 0, -1)
+    local state = active.host.get_state()
+    apply_status_summary_highlights(active, state)
+    if active.index == 0 then
+      render_visible_comment_boxes(active, state, win)
+      return
+    end
     local step = active.doc.steps[active.index]
-    local target = M.resolve_step(active.host.get_state(), step)
+    local target = M.resolve_step(state, step)
     if target.match == "missing" then
       local cursor_row = vim.api.nvim_win_get_cursor(win)[1]
       target = { match = "missing", start_row = cursor_row, end_row = cursor_row }

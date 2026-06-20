@@ -292,6 +292,20 @@ local function comment_box_mark(buf)
   return nil
 end
 
+local function comment_box_mark_containing(buf, needle)
+  local marks = vim.api.nvim_buf_get_extmarks(buf, walkthrough._ns, 0, -1, { details = true })
+  for _, mark in ipairs(marks) do
+    local chunks = {}
+    for _, virt_line in ipairs(mark[4].virt_lines or {}) do
+      for _, chunk in ipairs(virt_line) do
+        chunks[#chunks + 1] = chunk[1]
+      end
+    end
+    if table.concat(chunks, "\n"):find(needle, 1, true) then return mark end
+  end
+  return nil
+end
+
 local function comment_box_inner_width(mark)
   local virt_lines = mark and mark[4] and mark[4].virt_lines or {}
   local bottom = virt_lines[#virt_lines]
@@ -316,11 +330,12 @@ local function box_contains(buf, needle)
 end
 
 local function box_has_highlight_for_text(buf, text, hl_group)
-  local mark = comment_box_mark(buf)
-  if not mark then return false end
-  for _, virt_line in ipairs(mark[4].virt_lines or {}) do
-    for _, chunk in ipairs(virt_line) do
-      if chunk[1]:find(text, 1, true) and chunk[2] == hl_group then return true end
+  local marks = vim.api.nvim_buf_get_extmarks(buf, walkthrough._ns, 0, -1, { details = true })
+  for _, mark in ipairs(marks) do
+    for _, virt_line in ipairs(mark[4].virt_lines or {}) do
+      for _, chunk in ipairs(virt_line) do
+        if chunk[1]:find(text, 1, true) and chunk[2] == hl_group then return true end
+      end
     end
   end
   return false
@@ -445,13 +460,22 @@ end
 local function start_walkthrough(buf)
   captured_notifications = {}
   trigger_buf_mapping(buf, "ow")
-  local summary_buf
-  wait_for(function()
-    local _, float_buf = find_float_with("walkthrough fixture")
-    summary_buf = float_buf
-    return float_buf ~= nil
-  end, "summary popup did not open")
-  return summary_buf
+  wait_for(function() return buffer_contains(buf, "Walkthrough:") end, "walkthrough section did not render")
+  return buf
+end
+
+local function toggle_row(buf, needle)
+  local row = find_row(buf, needle)
+  local win = vim.fn.bufwinid(buf)
+  assert_true(win ~= -1, "status window missing")
+  vim.api.nvim_win_set_cursor(win, { row, 0 })
+  trigger_buf_mapping(buf, "<Tab>")
+end
+
+local function expand_row_if_needed(buf, row_needle, visible_needle)
+  if buffer_contains(buf, visible_needle) then return end
+  toggle_row(buf, row_needle)
+  wait_for(function() return buffer_contains(buf, visible_needle) end, row_needle .. " did not expand")
 end
 
 local function run()
@@ -461,14 +485,17 @@ local function run()
   walkthrough.set_reader(fixture_reader)
   diff_review.setup({ about_auto_generate = false })
 
-  -- ── happy path: summary, exact step, region highlight, comment float ──────
+  -- ── integrated status summary + lazy inline comment boxes ─────────────────
   set_walkthrough_doc(valid_doc())
   local buf = open_status()
   local original_q_desc = vim.api.nvim_buf_call(buf, function()
     return vim.fn.maparg("q", "n", false, true).desc
   end)
 
+  vim.o.columns = 120
   local summary_buf = start_walkthrough(buf)
+  local float_win = find_float_with("walkthrough fixture")
+  assert_true(float_win == nil, "walkthrough should not open a summary popup")
   assert_true(not buffer_contains(summary_buf, "WARNING"), "fresh walkthrough should not warn")
   assert_true(not buffer_contains(summary_buf, "Major changes:"), "summary should not show redundant major changes heading")
   assert_true(not buffer_contains(summary_buf, "├─ Update a.txt through the first task."), "summary should not show redundant top-level graph")
@@ -490,11 +517,6 @@ local function run()
     "summary add action row should not be padded")
   assert_true(buffer_contains(summary_buf, "the second line"),
     "summary item inline note prefix missing")
-  local item_row = find_row(summary_buf, "a.txt rewrite to rewrite the second line")
-  local item_line = find_line(summary_buf, "a.txt rewrite to rewrite the second line")
-  local item_note_continuation = find_line_after(summary_buf, "first fixture file", item_row)
-  assert_true(first_text_col(item_note_continuation) == display_col_before(item_line, "rewrite the second line"),
-    "summary inline note continuation should align under note")
   assert_true(buffer_contains(summary_buf, "first fixture file"),
     "summary item inline note missing")
   assert_true(buffer_has_highlight(summary_buf, "DiffReviewWalkthroughActionUpdate"), "summary action highlight missing")
@@ -535,19 +557,19 @@ local function run()
   assert_true(justification_hl.fg == 0xe5c07b and justification_hl.italic == true,
     "summary justification should be yellow italic")
   assert_true(not buffer_contains(summary_buf, "Legend:"), "summary should not show an action legend")
-  vim.o.columns = 120
-  trigger_buf_mapping(summary_buf, "y")
+  assert_true(not box_contains(buf, "concrete"), "collapsed files should not render walkthrough boxes")
 
-  wait_for(function() return buffer_contains(buf, "NEW a.txt") end, "step 1 did not expand a.txt hunks")
+  expand_row_if_needed(buf, "a.txt +", "NEW a.txt")
+  wait_for(function() return box_contains(buf, "concrete") end, "visible a.txt comment box missing")
+  wait_for(function() return box_contains(buf, "task total") end, "second visible a.txt comment box missing")
   local step_row = find_row(buf, "NEW a.txt")
   local cursor_row = vim.api.nvim_win_get_cursor(vim.fn.bufwinid(buf))[1]
-  assert_true(cursor_row == step_row, ("cursor not on step row (expected %d, got %d)"):format(step_row, cursor_row))
-  assert_true(walkthrough_extmark_count(buf) > 0, "region extmarks missing")
-  assert_true(row_has_line_highlight(buf, step_row, "DiffReviewWalkthroughRegionAdd"),
-    "added walkthrough row should preserve add background")
+  assert_true(cursor_row == find_row(buf, "a.txt +"), "expanding a file should not jump to the walkthrough step")
+  assert_true(walkthrough_extmark_count(buf) > 0, "walkthrough extmarks missing")
+  assert_true(not row_has_line_highlight(buf, step_row, "DiffReviewWalkthroughRegionAdd"),
+    "automatic walkthrough comments should not highlight selected regions")
   assert_true(not row_has_line_highlight(buf, step_row, "DiffReviewWalkthroughRegion"),
-    "added walkthrough row should not use generic blue region background")
-  assert_true(box_contains(buf, "concrete changed line"), "inline comment box missing")
+    "automatic walkthrough comments should not use generic blue region background")
   assert_true(box_contains(buf, "Deviation:"), "inline comment box should render the callout kind")
   assert_true(box_contains(buf, "high-priority review context"), "inline comment box should render callout text")
   assert_true(box_has_highlight_for_text(buf, "Deviation:", "DiffReviewWalkthroughCalloutDeviation"),
@@ -555,24 +577,13 @@ local function run()
   local deviation_hl = vim.api.nvim_get_hl(0, { name = "DiffReviewWalkthroughCalloutDeviation" })
   assert_true(deviation_hl.fg == 0xff5555 and deviation_hl.bold == true,
     "deviation callout should be red and bold")
-  local box_mark = comment_box_mark(buf)
+  local box_mark = comment_box_mark_containing(buf, "concrete")
   assert_true(box_mark ~= nil, "inline comment box mark missing")
   assert_true(box_mark[2] == step_row - 1, "inline comment box should anchor below the selected row")
   assert_true(box_mark[4].virt_lines_above ~= true, "inline comment box should render below the selected row")
-  local win = vim.fn.bufwinid(buf)
-  local view = vim.api.nvim_win_call(win, function() return vim.fn.winsaveview() end)
-  local expected_topline = expected_comment_topline(step_row, box_mark[2] + 1, #box_mark[4].virt_lines,
-    vim.api.nvim_win_get_height(win))
-  assert_true(view.topline == expected_topline,
-    ("walkthrough view not focused near lower comment box (expected topline %d, got %d)"):format(
-      expected_topline, view.topline))
-  local expected_box_screen_row = expected_comment_screen_row(step_row, box_mark[2] + 1, #box_mark[4].virt_lines,
-    vim.api.nvim_win_get_height(win))
-  local box_screen_row = (box_mark[2] + 1) - view.topline + 2
-  assert_true(box_screen_row == expected_box_screen_row,
-    ("inline comment box should start one third from the bottom (expected screen row %d, got %d)"):format(
-      expected_box_screen_row, box_screen_row))
   assert_true(box_contains(buf, "1.1-2 Rewrite the fixture line to NEW."), "inline box heading missing")
+  assert_true(box_contains(buf, "1.2-2 Check the total marker on the next comment."),
+    "automatic mode should render all visible comments")
   assert_true(not box_contains(buf, "Task 1.1-2 Rewrite the fixture line to NEW."),
     "inline box heading should not include Task")
   assert_true(not box_contains(buf, "1.1 - Rewrite the fixture line to NEW."),
@@ -596,64 +607,42 @@ local function run()
     "inline box should not show item note")
   assert_true(not box_contains(buf, "[z] back"), "inline box should not show command footer")
 
-  -- ── navigation: forward through steps, back, back to summary, quit ─────────
-  trigger_buf_mapping(buf, "y")
-  wait_for(function() return box_contains(buf, "task total") end, "step 2 box did not render")
-  assert_true(box_contains(buf, "1.2-2 Check the total marker on the next comment."),
-    "step 2 task total label missing")
-  assert_true(not box_contains(buf, "Deviation:"), "step 2 should not inherit step 1 callout")
-  local task1_step2_row = find_row(buf, "NEW a.txt")
-  cursor_row = vim.api.nvim_win_get_cursor(vim.fn.bufwinid(buf))[1]
-  assert_true(cursor_row == task1_step2_row, "cursor not on task 1 step 2 row")
-
-  trigger_buf_mapping(buf, "y")
+  expand_row_if_needed(buf, "b.txt +", "NEW b.txt")
   wait_for(function() return box_contains(buf, "forward navigation") end, "step 3 box did not render")
   assert_true(box_contains(buf, "2.1-1 Mirror the rewrite in the second fixture."), "step 3 task label missing")
   assert_true(not box_contains(buf, "Task 2.1-1 Mirror the rewrite in the second fixture."),
     "step 2 task label should not include Task")
-  local step3_box_mark = comment_box_mark(buf)
+  local step3_box_mark = comment_box_mark_containing(buf, "forward navigation")
   assert_true(comment_box_header_text(step3_box_mark):find("Rewrite the second fixture file.", 1, true) == nil,
     "step 3 header should not show subtask context")
-  local step3_row = find_row(buf, "NEW b.txt")
-  cursor_row = vim.api.nvim_win_get_cursor(vim.fn.bufwinid(buf))[1]
-  assert_true(cursor_row == step3_row, "cursor not on step 3 row")
-
-  trigger_buf_mapping(buf, "z")
-  wait_for(function() return box_contains(buf, "task total") end, "z did not return to step 2")
-
-  trigger_buf_mapping(buf, "z")
-  wait_for(function() return box_contains(buf, "concrete changed line") end, "z did not return to step 1")
-
-  trigger_buf_mapping(buf, "z")
-  local resume_buf
-  wait_for(function()
-    local _, float_buf = find_float_with("walkthrough fixture")
-    resume_buf = float_buf
-    return float_buf ~= nil
-  end, "z past step 1 did not reopen the summary")
-  trigger_buf_mapping(resume_buf, "q")
-  wait_for(function() return walkthrough_extmark_count(buf) == 0 end, "quit did not clear extmarks")
   local restored_q_desc = vim.api.nvim_buf_call(buf, function()
     return vim.fn.maparg("q", "n", false, true).desc
   end)
-  assert_true(restored_q_desc == original_q_desc, "q mapping not restored: " .. tostring(restored_q_desc))
+  assert_true(restored_q_desc == original_q_desc, "q mapping should not be overridden: " .. tostring(restored_q_desc))
   local z_map = vim.api.nvim_buf_call(buf, function()
     return vim.fn.maparg("z", "n", false, true)
   end)
-  assert_true(z_map.buffer ~= 1, "z should not remain buffer-mapped after quit")
+  assert_true(z_map.buffer ~= 1, "z should not be buffer-mapped by integrated walkthrough")
 
-  -- ── completion past the last step ──────────────────────────────────────────
-  summary_buf = start_walkthrough(buf)
-  trigger_buf_mapping(summary_buf, "y")
-  wait_for(function() return box_contains(buf, "concrete changed line") end, "restart did not show step 1")
-  trigger_buf_mapping(buf, "y")
-  wait_for(function() return box_contains(buf, "task total") end, "restart did not reach step 2")
-  trigger_buf_mapping(buf, "y")
-  wait_for(function() return box_contains(buf, "forward navigation") end, "restart did not reach step 3")
-  trigger_buf_mapping(buf, "y")
-  wait_for(function() return saw_notification_containing("Walkthrough complete") end, "no completion notification")
-  assert_true(walkthrough_extmark_count(buf) == 0, "completion did not clear extmarks")
-  close_all_floats()
+  toggle_row(buf, "a.txt +")
+  wait_for(function() return not box_contains(buf, "concrete") end,
+    "folding a.txt should remove its visible walkthrough boxes")
+  assert_true(box_contains(buf, "forward navigation"), "folding a.txt should keep b.txt's visible box")
+
+  toggle_row(buf, "Walkthrough:")
+  wait_for(function()
+    return buffer_contains(buf, "Walkthrough:") and not buffer_contains(buf, "Reviewers need the fixture story")
+  end, "walkthrough summary did not fold")
+  toggle_row(buf, "Walkthrough:")
+  wait_for(function() return buffer_contains(buf, "Reviewers need the fixture story") end,
+    "walkthrough summary did not unfold")
+
+  diff_review.render_status(buf, nil, nil, { reuse_sections = true })
+  wait_for(function() return box_contains(buf, "forward navigation") end, "re-render dropped visible walkthrough boxes")
+
+  trigger_buf_mapping(buf, "ow")
+  wait_for(function() return not buffer_contains(buf, "Walkthrough:") end, "walkthrough did not toggle off")
+  wait_for(function() return walkthrough_extmark_count(buf) == 0 end, "toggle off did not clear walkthrough extmarks")
 
   -- ── document staleness warning ─────────────────────────────────────────────
   local stale_doc = valid_doc()
@@ -661,10 +650,9 @@ local function run()
   set_walkthrough_doc(stale_doc)
   summary_buf = start_walkthrough(buf)
   assert_true(buffer_contains(summary_buf, "WARNING"), "stale walkthrough should warn in the summary")
-  trigger_buf_mapping(summary_buf, "q")
-  close_all_floats()
+  trigger_buf_mapping(buf, "ow")
 
-  -- ── step staleness: nearest line + missing file ───────────────────────────
+  -- ── step staleness: nearest visible line ──────────────────────────────────
   local degraded = valid_doc()
   degraded.tasks = {
     {
@@ -714,14 +702,12 @@ local function run()
   }
   set_walkthrough_doc(degraded)
   summary_buf = start_walkthrough(buf)
-  trigger_buf_mapping(summary_buf, "y")
+  expand_row_if_needed(buf, "a.txt +", "NEW a.txt")
   wait_for(function() return box_contains(buf, "position approximated") end, "nearest match note missing")
-  trigger_buf_mapping(buf, "y")
-  wait_for(function() return box_contains(buf, "not in current diff") end, "missing file note missing")
-  trigger_buf_mapping(buf, "q")
-  close_all_floats()
+  assert_true(not box_contains(buf, "not in current diff"), "missing files should not render comment boxes in status mode")
+  trigger_buf_mapping(buf, "ow")
 
-  -- ── partially staged file + region split across hunks ─────────────────────
+  -- ── partially staged file + visible region split across hunks ─────────────
   local staged_doc = valid_doc()
   staged_doc.tasks = {
     {
@@ -788,68 +774,25 @@ local function run()
   }
   set_walkthrough_doc(staged_doc)
   summary_buf = start_walkthrough(buf)
-  trigger_buf_mapping(summary_buf, "y")
+  expand_row_if_needed(buf, "c.txt +", "NEW c.txt")
   wait_for(function() return box_contains(buf, "staged section") end, "staged step box did not render")
-  local staged_row = find_row(buf, "NEW c.txt")
-  cursor_row = vim.api.nvim_win_get_cursor(vim.fn.bufwinid(buf))[1]
-  assert_true(cursor_row == staged_row, ("cursor not on the staged hunk row (expected %d, got %d)"):format(staged_row, cursor_row))
   assert_true(not box_contains(buf, "stale"), "staged region must not be flagged stale")
 
-  trigger_buf_mapping(buf, "y")
+  expand_row_if_needed(buf, "a.txt +", "NEW a.txt")
   wait_for(function() return box_contains(buf, "ends inside the second hunk") end, "split-region step box did not render")
   local second_hunk_row = find_row(buf, "NEW2 a.txt")
-  cursor_row = vim.api.nvim_win_get_cursor(vim.fn.bufwinid(buf))[1]
-  assert_true(
-    cursor_row == second_hunk_row,
-    ("split region did not anchor at the first rendered row inside the region (expected %d, got %d)"):format(second_hunk_row, cursor_row)
-  )
   assert_true(not box_contains(buf, "approximated"), "split region must not be flagged approximated")
 
-  trigger_buf_mapping(buf, "y")
   wait_for(function() return box_contains(buf, "Long selected region keeps its start visible") end,
     "long-region step box did not render")
   local long_start_row = find_row(buf, "NEW long 02 a.txt")
-  cursor_row = vim.api.nvim_win_get_cursor(vim.fn.bufwinid(buf))[1]
-  assert_true(
-    cursor_row == long_start_row,
-    ("long region did not anchor at the first rendered changed row (expected %d, got %d)"):format(long_start_row, cursor_row)
-  )
-  local long_box_mark = comment_box_mark(buf)
+  local long_box_mark = comment_box_mark_containing(buf, "Long selected region")
   assert_true(long_box_mark ~= nil, "long-region comment box mark missing")
   local long_anchor_row = long_box_mark[2] + 1
   assert_true(long_anchor_row >= long_start_row,
     ("long-region box should anchor at or after the rendered start row (start %d, anchor %d)"):format(
       long_start_row, long_anchor_row))
-  win = vim.fn.bufwinid(buf)
-  view = vim.api.nvim_win_call(win, function() return vim.fn.winsaveview() end)
-  local long_win_height = vim.api.nvim_win_get_height(win)
-  local long_expected_topline = expected_comment_topline(long_start_row, long_anchor_row,
-    #long_box_mark[4].virt_lines, long_win_height)
-  assert_true(view.topline == long_expected_topline,
-    ("long-region view not focused near lower comment box (expected topline %d, got %d)"):format(
-      long_expected_topline, view.topline))
-  assert_true(view.topline <= long_start_row and long_start_row < view.topline + long_win_height,
-    ("long-region start row should stay visible (topline %d, start %d, height %d)"):format(
-      view.topline, long_start_row, long_win_height))
-  local long_expected_box_screen_row = expected_comment_screen_row(long_start_row, long_anchor_row,
-    #long_box_mark[4].virt_lines, long_win_height)
-  local long_box_screen_row = long_anchor_row - view.topline + 2
-  assert_true(long_box_screen_row == long_expected_box_screen_row,
-    ("long-region comment box should start one third from the bottom (expected screen row %d, got %d)"):format(
-      long_expected_box_screen_row, long_box_screen_row))
-  trigger_buf_mapping(buf, "q")
-  close_all_floats()
-
-  -- ── re-render while active re-applies decorations ──────────────────────────
-  set_walkthrough_doc(valid_doc())
-  summary_buf = start_walkthrough(buf)
-  trigger_buf_mapping(summary_buf, "y")
-  wait_for(function() return walkthrough_extmark_count(buf) > 0 end, "no extmarks before re-render")
-  diff_review.render_status(buf, nil, nil, { reuse_sections = true })
-  wait_for(function() return walkthrough_extmark_count(buf) > 0 end, "re-render dropped walkthrough extmarks")
-  wait_for(function() return box_contains(buf, "concrete changed line") end, "re-render dropped the inline comment box")
-  trigger_buf_mapping(buf, "q")
-  close_all_floats()
+  trigger_buf_mapping(buf, "ow")
 
   -- ── error paths: missing file and invalid JSON ─────────────────────────────
   fixtures[root .. "/.walkthrough.json"] = nil
