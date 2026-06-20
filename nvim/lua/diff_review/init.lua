@@ -1152,7 +1152,30 @@ function M._status_file_change_label(file)
   return "Modified", "DiffReviewStatusFileModified"
 end
 
---- Parse unified diff output into structured file/hunk data
+---@class DiffReviewStatusFileStatSegment
+---@field start_col integer
+---@field end_col integer
+---@field hl_group string
+
+---@param file DiffReviewStatusFile
+---@return string
+---@return DiffReviewStatusFileStatSegment[]
+function M._status_file_stat_text_and_segments(file)
+  if file.untracked then
+    return "new", {
+      { start_col = 0, end_col = 3, hl_group = "Comment" },
+    }
+  end
+
+  local added_text = ("+%d"):format(file.added or 0)
+  local removed_text = ("-%d"):format(file.removed or 0)
+  return added_text .. " " .. removed_text, {
+    { start_col = 0, end_col = #added_text, hl_group = "DiffReviewAddRange" },
+    { start_col = #added_text + 1, end_col = #added_text + 1 + #removed_text, hl_group = "DiffReviewDeleteRange" },
+  }
+end
+
+-- Parse unified diff output into structured file/hunk data
 ---@param diff_output string
 ---@param staged boolean
 ---@return DiffReviewHunk[] hunks
@@ -8817,7 +8840,7 @@ local function status_render_file(file, entry_kind, hunk_entry_kind, file_key_ov
   local file_key = file_key_override or status_file_key(file.section_name, file.filename)
   local default_folded = not opts.default_open
   local file_folded = (not opts.force_open) and status_folded(file_key, default_folded)
-  local stats = file.untracked and "new" or ("+%d -%d"):format(file.added, file.removed)
+  local stats, stat_segments = M._status_file_stat_text_and_segments(file)
   local change_label, change_label_hl = M._status_file_change_label(file)
   local change_label_width = #"Modified"
   local padded_change_label = change_label .. string.rep(" ", math.max(0, change_label_width - #change_label))
@@ -8830,7 +8853,14 @@ local function status_render_file(file, entry_kind, hunk_entry_kind, file_key_ov
   local stats_start = #line - #stats
   status_add_highlight(line_number, label_start, label_end, change_label_hl)
   status_add_highlight(line_number, path_start, stats_start - 1, "DiffReviewStatusPath")
-  status_add_highlight(line_number, stats_start, #line, file.untracked and "Comment" or "DiffReviewAddRange")
+  for _, stat_segment in ipairs(stat_segments) do
+    status_add_highlight(
+      line_number,
+      stats_start + stat_segment.start_col,
+      stats_start + stat_segment.end_col,
+      stat_segment.hl_group
+    )
+  end
 
   if file_folded then return end
 

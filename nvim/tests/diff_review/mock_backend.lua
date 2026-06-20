@@ -185,6 +185,31 @@ local function buffer_contains(buf, pattern)
   return contains_line(vim.api.nvim_buf_get_lines(buf, 0, -1, false), pattern)
 end
 
+local function find_row(lines, pattern)
+  for index, line in ipairs(lines) do
+    if line:find(pattern, 1, true) then return index end
+  end
+  error("missing row: " .. pattern .. "\n" .. table.concat(lines, "\n"), 2)
+end
+
+local function row_substring_range(lines, row, text, start_after)
+  local line = lines[row] or ""
+  local start_index = line:find(text, start_after or 1, true)
+  assert_true(start_index ~= nil, "missing substring " .. text .. " in row: " .. line)
+  return start_index - 1, start_index - 1 + #text
+end
+
+local function row_range_has_highlight(buf, row, start_col, end_col, hl_group)
+  local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
+  for _, mark in ipairs(marks) do
+    local details = mark[4] or {}
+    if details.hl_group == hl_group and mark[3] <= start_col and (details.end_col or mark[3]) >= end_col then
+      return true
+    end
+  end
+  return false
+end
+
 local function wait_for(condition, message)
   assert_true(vim.wait(1000, condition, 10), message)
 end
@@ -296,6 +321,21 @@ local function run()
   assert_true(contains_line(lines, "Modified " .. root .. "/b.txt +1 -1"), "missing modified b.txt prefix")
   assert_true(contains_line(lines, "New      " .. root .. "/c.txt new"), "missing new c.txt prefix")
   assert_true(diff_review._status_file_change_label({ git_status = "D" }) == "Removed", "deleted file label should render as Removed")
+  local modified_a_row = find_row(lines, "Modified " .. root .. "/a.txt +1 -1")
+  local add_start, add_end = row_substring_range(lines, modified_a_row, "+1")
+  local delete_start, delete_end = row_substring_range(lines, modified_a_row, "-1", add_end + 1)
+  assert_true(
+    row_range_has_highlight(buf, modified_a_row, add_start, add_end, "DiffReviewAddRange"),
+    "added file stat should be green"
+  )
+  assert_true(
+    row_range_has_highlight(buf, modified_a_row, delete_start, delete_end, "DiffReviewDeleteRange"),
+    "deleted file stat should be red"
+  )
+  assert_true(
+    not row_range_has_highlight(buf, modified_a_row, delete_start, delete_end, "DiffReviewAddRange"),
+    "deleted file stat should not be green"
+  )
   assert_true(contains_line(lines, "a.txt +1 -1"), "missing a.txt file row")
   assert_true(contains_line(lines, "b.txt +1 -1"), "missing b.txt file row")
   assert_true(contains_line(lines, "c.txt new"), "missing untracked file row")
