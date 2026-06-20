@@ -1,8 +1,9 @@
 -- Guided review walkthrough for the DiffReviewStatus buffer. An LLM writes
 -- .walkthrough.json at the repo root (see walkthrough.schema.json next to this
--- file); `ow` in the status buffer shows the summary, then z/y step backward/
--- forward through the referenced regions inside the inline diff, with the
--- author's comment rendered as an inline virt_lines box below each region.
+-- file); `ow` in the status buffer embeds the walkthrough presentation, then
+-- z/y step backward/forward through the referenced regions inside the inline
+-- diff, with the author's comment rendered as an inline virt_lines box below
+-- each region.
 -- Positions refer to the NEW
 -- (post-change) file; the document records the HEAD sha it was generated
 -- against so stale walkthroughs degrade to best-effort jumps with a note.
@@ -85,16 +86,19 @@
 ---@field set_folded fun(key: string, folded: boolean)
 ---@field rerender fun() synchronous reuse_sections re-render
 ---@field git_list_async fun(command: string[], cb: fun(output: string[], code: integer))
+---@field set_walkthrough_presentation? fun(doc: DiffReviewWalkthroughDoc, stale: boolean, head_sha?: string)
+---@field clear_walkthrough_presentation? fun()
 
 ---@alias DiffReviewWalkthroughReader fun(path: string): string?
 
 ---@class DiffReviewWalkthroughMode
 ---@field host DiffReviewWalkthroughHost
 ---@field doc DiffReviewWalkthroughDoc
----@field index integer 0 = summary popup, 1..n = steps
+---@field index integer current step index, 1..n after navigation starts
 ---@field stale boolean
 ---@field head_sha? string
 ---@field saved_maps table<string, table> maparg dicts to restore on stop
+---@field nav_started? boolean
 
 ---@class DiffReviewWalkthroughCommentBoxPlacement
 ---@field anchor_row integer
@@ -292,6 +296,61 @@ local function append_summary_item(lines, item, prefix, is_last)
     .. item.title
     .. " to "
     .. item.note
+end
+
+---@param item DiffReviewWalkthroughItem
+---@param prefix string
+---@param is_last boolean
+---@return table[] segments
+local function task_item_segments(item, prefix, is_last)
+  local action_hl = action_highlights[item.action] or "DiffReviewWalkthroughActionUpdate"
+  return {
+    { prefix .. tree_branch(is_last) },
+    { format_action(item.action), action_hl },
+    { " " },
+    { format_item_type_label(item.type, item.subtype), action_hl },
+    { " " },
+    { item.title, "DiffReviewWalkthroughItemTitle" },
+    { " to " .. item.note },
+  }
+end
+
+---@param task DiffReviewWalkthroughTask
+---@return table[] rows
+function M.task_presentation_rows(task)
+  local rows = {}
+  if task.justification then
+    rows[#rows + 1] = { segments = { { " " .. task.justification, "Comment" } } }
+  end
+  for _, group in ipairs(task.groups or {}) do
+    rows[#rows + 1] = {
+      segments = {
+        { " " },
+        { format_type_keyword(group.type), "DiffReviewWalkthroughType" },
+        { " " },
+        { group.title, "DiffReviewWalkthroughItemTitle" },
+      },
+    }
+    local subtask_prefix = "    "
+    for subtask_index, subtask in ipairs(group.subtasks or {}) do
+      local subtask_is_last = subtask_index == #(group.subtasks or {})
+      rows[#rows + 1] = {
+        segments = {
+          { subtask_prefix .. tree_branch(subtask_is_last) },
+          { subtask.title, "DiffReviewWalkthroughItemTitle" },
+        },
+      }
+      local item_prefix = subtask_prefix .. tree_continuation(subtask_is_last)
+      if subtask.justification then
+        rows[#rows + 1] = { segments = { { item_prefix .. subtask.justification, "Comment" } } }
+      end
+      for item_index, item in ipairs(subtask.items or {}) do
+        local item_is_last = item_index == #(subtask.items or {})
+        rows[#rows + 1] = { segments = task_item_segments(item, item_prefix, item_is_last) }
+      end
+    end
+  end
+  return rows
 end
 
 ---@param tasks DiffReviewWalkthroughTask[]
@@ -655,7 +714,7 @@ end
 
 -- ─── step -> rendered row resolution ─────────────────────────────────────────
 
-local section_preference = { "unstaged", "untracked", "staged" }
+local section_preference = { "unstaged", "staged" }
 
 --- Whether a rendered file path refers to the step's repo-relative file.
 --- Status entries may carry absolute paths, so match on a path-boundary
@@ -763,6 +822,20 @@ local function ensure_expanded(mode, step)
   local state = mode.host.get_state()
   local sections = state and state.sections or {}
   local expanded = false
+  for _, entry in pairs(state and state.entries or {}) do
+    if entry_matches_file(entry, step.file) then
+      if entry.kind == "section" and entry.id then
+        mode.host.set_folded(entry.id, false)
+        expanded = true
+      elseif entry.kind == "file" and entry.id then
+        mode.host.set_folded(entry.id, false)
+        expanded = true
+      elseif entry.kind == "hunk" and entry.id then
+        mode.host.set_folded(entry.id, false)
+        expanded = true
+      end
+    end
+  end
   for _, section in ipairs(sections) do
     for _, file in ipairs(section.files or {}) do
       if matches_file(file.relpath, step.file) or matches_file(file.filename, step.file) then
@@ -1330,12 +1403,7 @@ local function show_step(mode, index)
     return
   end
 
-  if index <= 0 then
-    vim.api.nvim_buf_clear_namespace(buf, M._ns, 0, -1)
-    mode.index = 0
-    M._open_summary(mode, { resume = true })
-    return
-  end
+  if index <= 0 then index = 1 end
   if index > #mode.doc.steps then
     M.stop(buf)
     notify("Walkthrough complete", vim.log.levels.INFO)
@@ -1362,9 +1430,13 @@ local function show_step(mode, index)
     return
   end
 
-  if target.start_row then
-    pcall(vim.api.nvim_win_set_cursor, win, { target.start_row, 0 })
+  local function place_cursor()
+    if M._modes[buf] ~= mode or mode.index ~= index then return end
+    if not (target.start_row and vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == buf) then return end
+    local line = math.min(math.max(target.start_row, 1), vim.api.nvim_buf_line_count(buf))
+    pcall(vim.api.nvim_win_set_cursor, win, { line, 0 })
   end
+  place_cursor()
   if target.match == "missing" then
     -- Anchor the box at the cursor's current row; no region to highlight.
     local cursor_row = vim.api.nvim_win_get_cursor(win)[1]
@@ -1373,12 +1445,19 @@ local function show_step(mode, index)
   apply_region_highlight(mode, target)
   local placement = render_comment_box(mode, step, target, win)
   focus_comment_box_below(win, target, placement)
+  place_cursor()
+  vim.schedule(place_cursor)
 end
 
 ---@param mode DiffReviewWalkthroughMode
 local function begin(mode)
   local buf = mode.host.buf
   M._modes[buf] = mode
+  if mode.nav_started then
+    show_step(mode, 1)
+    return
+  end
+  mode.nav_started = true
 
   for _, key in ipairs(nav_keys) do
     mode.saved_maps[key] = vim.api.nvim_buf_call(buf, function()
@@ -1409,7 +1488,7 @@ local function begin(mode)
   show_step(mode, 1)
 end
 
---- Exit the walkthrough: clear decorations, close the float, restore the
+--- Exit the walkthrough: clear decorations, clear presentation, restore the
 --- original buffer-local mappings (q is the status close mapping).
 ---@param buf integer
 function M.stop(buf)
@@ -1431,102 +1510,23 @@ function M.stop(buf)
         end)
       end
     end
-  end
-end
-
--- ─── summary popup ───────────────────────────────────────────────────────────
-
---- Open the centered summary popup. With opts.resume (navigated back from
---- step 1), q/<Esc> exits the whole walkthrough instead of cancelling entry.
----@param mode DiffReviewWalkthroughMode
----@param opts? { resume?: boolean }
-function M._open_summary(mode, opts)
-  opts = opts or {}
-  local width = math.max(44, math.min(78, vim.o.columns - 8))
-  -- Grow the popup to fit preformatted summary lines (e.g. flow diagrams).
-  for _, line in ipairs(vim.split(mode.doc.summary, "\n", { plain = true })) do
-    width = math.max(width, math.min(vim.fn.strdisplaywidth(line) + 6, vim.o.columns - 4))
-  end
-  local item_titles = collect_summary_item_titles(mode.doc.tasks)
-  local lines = summary_lines(mode.doc.summary, width - 4, item_titles)
-  table.insert(lines, 1, "")
-  local stale_line = nil
-  if mode.stale then
-    lines[#lines + 1] = ""
-    stale_line = #lines + 1
-    lines[#lines + 1] = ("WARNING: generated against %s, HEAD is now %s"):format(
-      mode.doc.commit:sub(1, 7),
-      mode.head_sha and mode.head_sha:sub(1, 7) or "unknown"
-    )
-  end
-  lines[#lines + 1] = ""
-  lines[#lines + 1] = ("  %d steps    [y/<CR>] start    [q/<Esc>] %s"):format(
-    #mode.doc.steps, opts.resume and "quit" or "cancel")
-
-  local popup_buf = vim.api.nvim_create_buf(false, true)
-  vim.bo[popup_buf].bufhidden = "wipe"
-  vim.bo[popup_buf].buftype = "nofile"
-  vim.api.nvim_buf_set_lines(popup_buf, 0, -1, false, lines)
-  vim.bo[popup_buf].modifiable = false
-  apply_summary_highlights(popup_buf, lines, mode.doc)
-  if stale_line then
-    pcall(vim.api.nvim_buf_set_extmark, popup_buf, M._ns, stale_line - 1, 0, {
-      end_col = #lines[stale_line],
-      hl_group = "DiffReviewWalkthroughStale",
-    })
-  end
-  pcall(vim.api.nvim_buf_set_extmark, popup_buf, M._ns, #lines - 1, 0, {
-    end_col = #lines[#lines],
-    hl_group = "DiffReviewStatusHint",
-  })
-
-  local height = math.min(#lines, math.max(vim.o.lines - 6, 1))
-  local win = vim.api.nvim_open_win(popup_buf, true, {
-    relative = "editor",
-    width = width,
-    height = height,
-    col = math.floor((vim.o.columns - width) / 2),
-    row = math.floor((vim.o.lines - height) / 2),
-    style = "minimal",
-    border = "rounded",
-    title = " Walkthrough ",
-    title_pos = "center",
-  })
-
-  local function close_popup()
-    if vim.api.nvim_win_is_valid(win) then
-      pcall(vim.api.nvim_win_close, win, true)
+    if mode.host.clear_walkthrough_presentation then
+      pcall(mode.host.clear_walkthrough_presentation)
     end
-  end
-  local popup_opts = { buffer = popup_buf, nowait = true, silent = true }
-  for _, key in ipairs({ "y", "<CR>" }) do
-    vim.keymap.set("n", key, function()
-      close_popup()
-      if opts.resume then
-        show_step(mode, 1)
-      else
-        begin(mode)
-      end
-    end, vim.tbl_extend("force", popup_opts, { desc = "Start walkthrough" }))
-  end
-  for _, key in ipairs({ "q", "<Esc>" }) do
-    vim.keymap.set("n", key, function()
-      close_popup()
-      if opts.resume then
-        M.stop(mode.host.buf)
-      end
-    end, vim.tbl_extend("force", popup_opts, { desc = "Close walkthrough summary" }))
+    pcall(mode.host.rerender)
   end
 end
 
 -- ─── entry points ────────────────────────────────────────────────────────────
 
 --- Start the walkthrough for a status buffer: load .walkthrough.json from the
---- repo root, check staleness against HEAD, and show the summary popup.
+--- repo root, check staleness against HEAD, embed the presentation, and show
+--- the first step.
 ---@param host DiffReviewWalkthroughHost
 function M.start(host)
   if M._modes[host.buf] then
     M.stop(host.buf)
+    return
   end
 
   local cwd = host.cwd()
@@ -1565,7 +1565,21 @@ function M.start(host)
       stale = not head_sha or head_sha:lower() ~= doc.commit:lower(),
       saved_maps = {},
     }
-    M._open_summary(mode)
+    M._modes[host.buf] = mode
+    if host.set_walkthrough_presentation then
+      host.set_walkthrough_presentation(doc, mode.stale, head_sha)
+    end
+    host.rerender()
+    vim.schedule(function()
+      if M._modes[host.buf] ~= mode or not vim.api.nvim_buf_is_valid(host.buf) then return end
+      if mode.stale then
+        notify(("Walkthrough generated against %s, HEAD is now %s"):format(
+          mode.doc.commit:sub(1, 7),
+          mode.head_sha and mode.head_sha:sub(1, 7) or "unknown"
+        ), vim.log.levels.WARN)
+      end
+      begin(mode)
+    end)
   end)
 end
 

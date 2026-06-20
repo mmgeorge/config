@@ -64,6 +64,9 @@
 ---@field untracked boolean
 ---@field status string
 ---@field git_status? string
+---@field walkthrough_action_hunks_only? boolean
+---@field walkthrough_key_prefix? string
+---@field walkthrough_order? integer
 
 ---@class DiffReviewStatusCommit
 ---@field oid string
@@ -91,6 +94,8 @@
 ---@field file_key_prefix? string
 ---@field file_entry_kind? "file"|"commit_file"|"pr_file"|"pr_review_file"
 ---@field hunk_entry_kind? "hunk"|"commit_hunk"|"pr_hunk"|"pr_review_hunk"
+---@field walkthrough_task_index? integer
+---@field walkthrough_child_sections? DiffReviewStatusSection[]
 
 ---@class DiffReviewStatusEntry
 ---@field id? string
@@ -132,7 +137,7 @@
 ---@field parent_id? string
 ---@field default_folded? boolean
 
----@alias DiffReviewStatusSectionName "unstaged"|"staged"|"untracked"|"unmerged"|"recent"|"pr_commits"
+---@alias DiffReviewStatusSectionName "unstaged"|"staged"|"unmerged"|"recent"|"pr_commits"
 
 ---@class DiffReviewTreeSitterContextPending
 ---@field pending true
@@ -202,6 +207,7 @@
 local M = {}
 local status_render_current_model
 local status_diff_hunks_for_file
+local status_append_hunk_to_file
 local status_open_pr
 M._comment_icon = "󰅺"
 M._reply_icon = "↳"
@@ -5359,7 +5365,6 @@ end
 ---@type DiffReviewSectionConfig[]
 local status_section_order = {
   { name = "unstaged", title = "Unstaged changes", default_folded = false },
-  { name = "untracked", title = "Untracked files", default_folded = false },
   { name = "staged", title = "Staged changes", default_folded = false },
 }
 local status_file_indent = 0
@@ -7151,12 +7156,17 @@ local function status_add_fancy_row(row, entry, indent)
 end
 
 ---@param item table
----@return "unstaged"|"staged"|"untracked"
+---@return "unstaged"|"staged"
 local function status_section_for_item(item)
   local data = item.item or {}
-  if data.category == "Untracked Files" then return "untracked" end
   if data.staged then return "staged" end
   return "unstaged"
+end
+
+---@param data table
+---@return boolean
+function M._status_item_is_untracked(data)
+  return data.category == "Untracked Files" or data.git_status == "??"
 end
 
 ---@param collected_items table[]
@@ -7178,6 +7188,7 @@ local function status_sections_from_items(collected_items)
     local data = item.item or {}
     if filename then
       local section_name = status_section_for_item(item)
+      local is_untracked = M._status_item_is_untracked(data)
       local section = sections[section_name]
       local file = section.files_by_name[filename]
       if not file then
@@ -7188,13 +7199,16 @@ local function status_sections_from_items(collected_items)
           added = 0,
           removed = 0,
           hunks = {},
-          untracked = section_name == "untracked",
+          untracked = is_untracked,
           status = data.stats or data.hunk_header or "",
-          git_status = data.git_status,
+          git_status = data.git_status or (is_untracked and "??" or nil),
           original_relpath = data.git_original_file,
         }
         section.files_by_name[filename] = file
         section.files[#section.files + 1] = file
+      elseif is_untracked then
+        file.untracked = true
+        file.git_status = "??"
       end
 
       file.added = file.added + (data.added or 0)
@@ -7207,7 +7221,7 @@ local function status_sections_from_items(collected_items)
           diff = data.diff,
           staged = data.staged == true,
           context_text = data.context_text or "",
-          git_status = data.git_status,
+          git_status = data.git_status or (is_untracked and "??" or nil),
           git_original_file = data.git_original_file,
           added = data.added or 0,
           removed = data.removed or 0,
@@ -8288,6 +8302,27 @@ local function status_remove_file_from_section(section_map, section_name, filena
   return removed_file
 end
 
+---@param file DiffReviewStatusFile
+---@param section_name DiffReviewStatusSectionName
+---@param source_section? DiffReviewStatusSectionName|string
+---@return DiffReviewStatusFile
+function M._status_prepare_file_for_section(file, section_name, source_section)
+  source_section = source_section or file.section_name
+  file.section_name = section_name
+  if section_name == "staged" and (file.untracked or file.git_status == "??") then
+    file.git_status = "A"
+    file.untracked = false
+  elseif section_name == "unstaged" and (
+    file.untracked
+    or source_section == "untracked"
+    or (source_section == "staged" and git_status_is_added(file.git_status))
+  ) then
+    file.git_status = "??"
+    file.untracked = true
+  end
+  return file
+end
+
 ---@param section_map table<DiffReviewStatusSectionName, DiffReviewStatusSection>
 ---@return DiffReviewStatusSection[]
 local function status_order_section_map(section_map)
@@ -8298,13 +8333,7 @@ local function status_order_section_map(section_map)
       return left_file.relpath < right_file.relpath
     end)
     for _, file in ipairs(section.files) do
-      file.section_name = section.name
-      file.untracked = section.name == "untracked"
-      if section.name == "untracked" then
-        file.git_status = "??"
-      elseif section.name == "staged" and file.git_status == "??" then
-        file.git_status = "A"
-      end
+      M._status_prepare_file_for_section(file, section.name, file.section_name)
       for _, hunk in ipairs(file.hunks or {}) do
         hunk.section_name = section.name
         hunk.staged = section.name == "staged"
@@ -8331,13 +8360,8 @@ end
 ---@return DiffReviewStatusFile
 local function status_copy_file_for_section(file, section_name)
   local copied_file = vim.deepcopy(file)
-  copied_file.section_name = section_name
-  copied_file.untracked = section_name == "untracked"
-  if section_name == "untracked" then
-    copied_file.git_status = "??"
-  elseif section_name == "staged" and file.untracked then
-    copied_file.git_status = "A"
-  end
+  local source_section = copied_file.section_name
+  M._status_prepare_file_for_section(copied_file, section_name, source_section)
   copied_file.hunks = copied_file.hunks or {}
   for _, hunk in ipairs(copied_file.hunks) do
     hunk.section_name = section_name
@@ -8362,10 +8386,11 @@ local function status_ensure_file(section_map, section_name, file)
     added = 0,
     removed = 0,
     hunks = {},
-    untracked = section_name == "untracked",
+    untracked = file.untracked,
     status = file.status,
-    git_status = section_name == "untracked" and "??" or file.git_status,
+    git_status = file.git_status,
   }
+  M._status_prepare_file_for_section(existing_file, section_name, file.section_name)
   section.files[#section.files + 1] = existing_file
   section.files_by_name[file.filename] = existing_file
   return existing_file
@@ -8374,7 +8399,7 @@ end
 ---@param file DiffReviewStatusFile
 ---@param hunk DiffReviewHunk
 ---@return boolean
-local function status_append_hunk_to_file(file, hunk)
+status_append_hunk_to_file = function(file, hunk)
   for _, existing_hunk in ipairs(file.hunks or {}) do
     if existing_hunk.diff == hunk.diff then return false end
   end
@@ -8518,6 +8543,352 @@ status_diff_hunks_for_file = function(file)
     }
   end
   return hunks
+end
+
+---@return table?
+function M._status_walkthrough_presentation()
+  local status = M._status
+  if not (status and status.view_kind == "status") then return nil end
+  local presentation = status.walkthrough_presentation
+  if type(presentation) == "table" and presentation.doc then return presentation end
+  return nil
+end
+
+---@param value any
+---@return string
+function M._status_walkthrough_normalize_path(value)
+  return tostring(value or ""):gsub("\\", "/"):gsub("^%./", "")
+end
+
+---@param candidate any
+---@param target string
+---@return boolean
+function M._status_walkthrough_path_matches(candidate, target)
+  local normalized = M._status_walkthrough_normalize_path(candidate)
+  return normalized == target or normalized:sub(-(#target + 1)) == "/" .. target
+end
+
+---@param file DiffReviewStatusFile
+---@param target string
+---@return boolean
+function M._status_walkthrough_file_matches(file, target)
+  return M._status_walkthrough_path_matches(file.relpath, target)
+    or M._status_walkthrough_path_matches(file.filename, target)
+end
+
+---@param doc table
+---@return table[]
+function M._status_walkthrough_step_records(doc)
+  local records = {}
+  for step_order, step in ipairs(doc and doc.steps or {}) do
+    local start_pos = step.start_pos or step.start or {}
+    local end_pos = step.end_pos or step["end"] or start_pos
+    local start_line = tonumber(start_pos.line)
+    local end_line = tonumber(end_pos.line) or start_line
+    local task_index = tonumber(step.task_index)
+    if step.file and start_line and task_index then
+      if end_line < start_line then end_line = start_line end
+      records[#records + 1] = {
+        file = M._status_walkthrough_normalize_path(step.file),
+        start_line = start_line,
+        end_line = end_line,
+        task_index = task_index,
+        step_order = step_order,
+      }
+    end
+  end
+  return records
+end
+
+---@param left_start integer
+---@param left_end integer
+---@param right_start integer
+---@param right_end integer
+---@return integer
+function M._status_walkthrough_overlap(left_start, left_end, right_start, right_end)
+  local first = math.max(left_start, right_start)
+  local last = math.min(left_end, right_end)
+  if last < first then return 0 end
+  return last - first + 1
+end
+
+---@param file DiffReviewStatusFile
+---@param hunk DiffReviewHunk
+---@param records table[]
+---@return table?
+function M._status_walkthrough_assignment_for_hunk(file, hunk, records)
+  local first_line, last_line = M._status_hunk_changed_current_range(hunk)
+  if not (first_line and last_line) then return nil end
+  local best = nil
+  for _, record in ipairs(records or {}) do
+    if M._status_walkthrough_file_matches(file, record.file) then
+      local overlap = M._status_walkthrough_overlap(first_line, last_line, record.start_line, record.end_line)
+      if overlap > 0 then
+        local span = record.end_line - record.start_line
+        if not best
+          or overlap > best.overlap
+          or (overlap == best.overlap and span < best.span)
+          or (overlap == best.overlap and span == best.span and record.step_order < best.step_order) then
+          best = {
+            overlap = overlap,
+            span = span,
+            step_order = record.step_order,
+            task_index = record.task_index,
+          }
+        end
+      end
+    end
+  end
+  return best
+end
+
+---@param file DiffReviewStatusFile
+---@param hunk DiffReviewHunk
+---@param records table[]
+---@return integer?
+function M._status_walkthrough_task_for_hunk(file, hunk, records)
+  local assignment = M._status_walkthrough_assignment_for_hunk(file, hunk, records)
+  return assignment and assignment.task_index or nil
+end
+
+---@param file DiffReviewStatusFile
+---@param records table[]
+---@return table?
+function M._status_walkthrough_assignment_for_file(file, records)
+  for _, record in ipairs(records or {}) do
+    if M._status_walkthrough_file_matches(file, record.file) then
+      return {
+        task_index = record.task_index,
+        step_order = record.step_order,
+      }
+    end
+  end
+  return nil
+end
+
+---@param file DiffReviewStatusFile
+---@param records table[]
+---@return integer?
+function M._status_walkthrough_task_for_file(file, records)
+  local assignment = M._status_walkthrough_assignment_for_file(file, records)
+  return assignment and assignment.task_index or nil
+end
+
+---@param section_name string
+---@param filename string
+---@return string
+function M._status_walkthrough_file_bucket_key(section_name, filename)
+  return tostring(section_name or "") .. "\0" .. tostring(filename or "")
+end
+
+---@param name string
+---@param title string
+---@param source_section? string
+---@param task_index? integer
+---@return DiffReviewStatusSection
+function M._status_walkthrough_empty_section(name, title, source_section, task_index)
+  return {
+    name = name,
+    title = title,
+    default_folded = false,
+    files = {},
+    files_by_name = {},
+    file_key_prefix = name,
+    file_entry_kind = "file",
+    hunk_entry_kind = "hunk",
+    walkthrough_task_index = task_index,
+    walkthrough_source_section = source_section,
+  }
+end
+
+---@param section DiffReviewStatusSection
+---@param file DiffReviewStatusFile
+---@param hunks DiffReviewHunk[]?
+---@param action_hunks_only boolean?
+---@param walkthrough_order? integer
+---@return DiffReviewStatusFile
+function M._status_walkthrough_add_file(section, file, hunks, action_hunks_only, walkthrough_order)
+  local bucket_key = M._status_walkthrough_file_bucket_key(file.section_name, file.filename)
+  local existing = section.files_by_name[bucket_key]
+  if not existing then
+    existing = vim.deepcopy(file)
+    existing.section_name = file.section_name
+    existing.walkthrough_key_prefix = section.file_key_prefix
+    existing.walkthrough_action_hunks_only = action_hunks_only == true and not existing.untracked
+    existing.hunks = {}
+    existing.added = 0
+    existing.removed = 0
+    section.files_by_name[bucket_key] = existing
+    section.files[#section.files + 1] = existing
+  end
+  walkthrough_order = tonumber(walkthrough_order)
+  if walkthrough_order then
+    existing.walkthrough_order = math.min(existing.walkthrough_order or walkthrough_order, walkthrough_order)
+  end
+
+  if hunks and #hunks > 0 then
+    existing.walkthrough_action_hunks_only = action_hunks_only == true and not existing.untracked
+    for _, hunk in ipairs(hunks) do
+      local copied_hunk = vim.deepcopy(hunk)
+      copied_hunk.section_name = file.section_name
+      copied_hunk.staged = file.section_name == "staged"
+      copied_hunk.git_status = file.git_status or copied_hunk.git_status
+      if status_append_hunk_to_file(existing, copied_hunk) then
+        existing.status = existing.status or ""
+      end
+    end
+  elseif not existing.walkthrough_action_hunks_only then
+    existing.added = (file.added or 0)
+    existing.removed = (file.removed or 0)
+  end
+
+  return existing
+end
+
+---@param section DiffReviewStatusSection
+function M._status_walkthrough_sort_section(section)
+  table.sort(section.files or {}, function(left_file, right_file)
+    local left_order = tonumber(left_file.walkthrough_order) or math.huge
+    local right_order = tonumber(right_file.walkthrough_order) or math.huge
+    if left_order ~= right_order then return left_order < right_order end
+    local left_key = (left_file.section_name or "") .. "\0" .. (left_file.relpath or left_file.filename or "")
+    local right_key = (right_file.section_name or "") .. "\0" .. (right_file.relpath or right_file.filename or "")
+    return left_key < right_key
+  end)
+  for _, file in ipairs(section.files or {}) do
+    table.sort(file.hunks or {}, function(left_hunk, right_hunk)
+      return (left_hunk.pos or 0) < (right_hunk.pos or 0)
+    end)
+  end
+end
+
+---@param item table
+---@param source_section DiffReviewStatusSection
+---@param file DiffReviewStatusFile
+---@param hunks DiffReviewHunk[]?
+---@param action_hunks_only boolean?
+---@param walkthrough_order? integer
+function M._status_walkthrough_add_to_item(item, source_section, file, hunks, action_hunks_only, walkthrough_order)
+  local source_name = source_section.name
+  local child_section = item.child_by_source[source_name]
+  if not child_section then return end
+  M._status_walkthrough_add_file(child_section, file, hunks, action_hunks_only, walkthrough_order)
+  M._status_walkthrough_add_file(item.section, file, hunks, action_hunks_only, walkthrough_order)
+end
+
+---@param name string
+---@param title string
+---@param task_index? integer
+---@return table
+function M._status_walkthrough_item(name, title, task_index)
+  local item = {
+    section = M._status_walkthrough_empty_section(name, title, nil, task_index),
+    child_sections = {},
+    child_by_source = {},
+  }
+  for _, section_config in ipairs(status_section_order) do
+    local child_name = ("%s:%s"):format(name, section_config.name)
+    local child_title = section_config.name == "staged" and "Staged Changes" or "Unstaged Changes"
+    local child = M._status_walkthrough_empty_section(child_name, child_title, section_config.name, task_index)
+    item.child_sections[#item.child_sections + 1] = child
+    item.child_by_source[section_config.name] = child
+  end
+  item.section.walkthrough_child_sections = item.child_sections
+  return item
+end
+
+---@param section DiffReviewStatusSection
+---@return boolean
+function M._status_walkthrough_is_file_section(section)
+  return section and section.files and status_section_by_name[section.name] ~= nil
+end
+
+---@param item table
+---@return boolean
+function M._status_walkthrough_item_has_files(item)
+  return item and item.section and #(item.section.files or {}) > 0
+end
+
+---@param sections DiffReviewStatusSection[]
+---@return table?
+function M._status_walkthrough_model(sections)
+  local presentation = M._status_walkthrough_presentation()
+  if not presentation then return nil end
+  local doc = presentation.doc
+  local records = M._status_walkthrough_step_records(doc)
+  local task_items = {}
+  for task_index, task in ipairs(doc.tasks or {}) do
+    local title = ("%d. %s"):format(task_index, task.title or "")
+    task_items[task_index] = vim.tbl_extend("force",
+      M._status_walkthrough_item(("walkthrough:task:%d"):format(task_index), title, task_index),
+      { task = task, task_index = task_index })
+  end
+  local other_item = M._status_walkthrough_item("walkthrough:other", "Other Changes", nil)
+  local tail_sections = {}
+
+  for _, source_section in ipairs(sections or {}) do
+    if M._status_walkthrough_is_file_section(source_section) then
+      for _, file in ipairs(source_section.files or {}) do
+        local hunks = status_diff_hunks_for_file(file)
+        if #hunks == 0 then
+          local assignment = M._status_walkthrough_assignment_for_file(file, records)
+          local item = task_items[assignment and assignment.task_index] or other_item
+          M._status_walkthrough_add_to_item(item, source_section, file, nil, false,
+            assignment and assignment.step_order or nil)
+        else
+          local hunks_by_task = {}
+          local ordered_task_keys = {}
+          for _, hunk in ipairs(hunks) do
+            local assignment = M._status_walkthrough_assignment_for_hunk(file, hunk, records)
+            local task_key = assignment and assignment.task_index or 0
+            if not hunks_by_task[task_key] then
+              hunks_by_task[task_key] = { hunks = {}, order = nil }
+              ordered_task_keys[#ordered_task_keys + 1] = task_key
+            end
+            local bucket = hunks_by_task[task_key]
+            bucket.hunks[#bucket.hunks + 1] = hunk
+            if assignment and assignment.step_order then
+              bucket.order = math.min(bucket.order or assignment.step_order, assignment.step_order)
+            end
+          end
+          table.sort(ordered_task_keys)
+          for _, task_key in ipairs(ordered_task_keys) do
+            local item = task_key ~= 0 and task_items[task_key] or other_item
+            if item then
+              local bucket = hunks_by_task[task_key]
+              M._status_walkthrough_add_to_item(item, source_section, file, bucket.hunks, true, bucket.order)
+            end
+          end
+        end
+      end
+    elseif M._status_section_count(source_section) > 0 then
+      tail_sections[#tail_sections + 1] = source_section
+    end
+  end
+
+  for _, item in ipairs(task_items) do
+    M._status_walkthrough_sort_section(item.section)
+    for _, child in ipairs(item.child_sections) do
+      M._status_walkthrough_sort_section(child)
+    end
+  end
+  M._status_walkthrough_sort_section(other_item.section)
+  for _, child in ipairs(other_item.child_sections) do
+    M._status_walkthrough_sort_section(child)
+  end
+
+  local overview = {}
+  for _, line in ipairs(vim.split(vim.trim(tostring(doc.overview or "")), "\n", { plain = true })) do
+    overview[#overview + 1] = line
+  end
+
+  return {
+    presentation = presentation,
+    overview = overview,
+    tasks = task_items,
+    other = other_item,
+    tail_sections = tail_sections,
+  }
 end
 
 ---@param hunk DiffReviewHunk
@@ -9139,6 +9510,70 @@ local function status_render_section(section)
   end
 end
 
+---@param item table
+function M._status_render_walkthrough_child_sections(item)
+  for _, child in ipairs(item.child_sections or {}) do
+    if #(child.files or {}) > 0 then
+      status_add_line("")
+      status_render_section(child)
+    end
+  end
+end
+
+---@param item table
+function M._status_render_walkthrough_task(item)
+  local section = item.section
+  local section_key = status_section_key(section.name)
+  local folded = status_folded(section_key, section.default_folded)
+  local entry = { id = section_key, kind = "section", section = section }
+  local header_line = status_add_line(section.title, entry, "DiffReviewStatusHeader")
+  status_add_highlight(header_line, 0, #section.title, "DiffReviewWalkthroughItemTitle")
+  if folded then return end
+
+  local ok, walkthrough = pcall(require, "diff_review.walkthrough")
+  local rows = ok and item.task and walkthrough.task_presentation_rows(item.task) or {}
+  for _, row in ipairs(rows or {}) do
+    status_add_segment_line(row.segments or { { "" } })
+  end
+  M._status_render_walkthrough_child_sections(item)
+end
+
+---@param item table
+function M._status_render_walkthrough_other(item)
+  if not M._status_walkthrough_item_has_files(item) then return end
+  local section = item.section
+  local section_key = status_section_key(section.name)
+  local folded = status_folded(section_key, section.default_folded)
+  local line = M._status_section_heading_text(section.title, M._status_section_count(section))
+  local entry = { id = section_key, kind = "section", section = section }
+  status_add_line(line, entry, "DiffReviewStatusHeader")
+  if folded then return end
+  M._status_render_walkthrough_child_sections(item)
+end
+
+---@param model table
+function M._status_render_walkthrough_model(model)
+  status_add_line("Overview:", nil, "DiffReviewStatusHeader")
+  for _, line in ipairs(model.overview or {}) do
+    status_add_line(line)
+  end
+
+  for _, item in ipairs(model.tasks or {}) do
+    status_add_line("")
+    M._status_render_walkthrough_task(item)
+  end
+
+  if M._status_walkthrough_item_has_files(model.other) then
+    status_add_line("")
+    M._status_render_walkthrough_other(model.other)
+  end
+
+  for _, section in ipairs(model.tail_sections or {}) do
+    status_add_line("")
+    status_render_section(section)
+  end
+end
+
 ---@param commit DiffReviewStatusCommit
 local function status_load_commit_files(commit)
   local status = M._status
@@ -9369,6 +9804,39 @@ local function status_leave_visual_mode()
   end
 end
 
+---@param file DiffReviewStatusFile
+---@return string
+function M._status_action_file_key(file)
+  if file.walkthrough_key_prefix then return status_provider_file_key(file.walkthrough_key_prefix, file.filename) end
+  return status_file_key(file.section_name, file.filename)
+end
+
+---@param file DiffReviewStatusFile
+---@param hunk DiffReviewHunk
+---@return string
+function M._status_action_hunk_key(file, hunk)
+  if file.walkthrough_key_prefix then return status_provider_hunk_key(file.walkthrough_key_prefix, file.filename, hunk.diff) end
+  return status_hunk_key(file.section_name, file.filename, hunk.diff)
+end
+
+---@param file DiffReviewStatusFile
+---@return DiffReviewStatusEntry[]
+function M._status_action_entries_for_file(file)
+  if file.walkthrough_action_hunks_only then
+    local hunk_entries = {}
+    for _, hunk in ipairs(status_diff_hunks_for_file(file)) do
+      hunk_entries[#hunk_entries + 1] = {
+        id = M._status_action_hunk_key(file, hunk),
+        kind = "hunk",
+        file = file,
+        hunk = hunk,
+      }
+    end
+    return hunk_entries
+  end
+  return { { id = M._status_action_file_key(file), kind = "file", file = file } }
+end
+
 ---@param entry DiffReviewStatusEntry?
 ---@return DiffReviewStatusEntry[]
 local function status_file_entries_for_entry(entry)
@@ -9376,9 +9844,12 @@ local function status_file_entries_for_entry(entry)
   if entry.kind == "section" then
     local entries = {}
     for _, file in ipairs(entry.section.files or {}) do
-      entries[#entries + 1] = { id = status_file_key(file.section_name, file.filename), kind = "file", file = file }
+      vim.list_extend(entries, M._status_action_entries_for_file(file))
     end
     return entries
+  end
+  if entry.kind == "file" and entry.file then
+    return M._status_action_entries_for_file(entry.file)
   end
   return { entry }
 end
@@ -9943,7 +10414,10 @@ local function status_render_loaded(buf, target_id, fallback_line, opts, head_li
   end
   status_add_line("")
 
-  if #sections == 0 then
+  local walkthrough_model = M._status_walkthrough_model(sections)
+  if walkthrough_model then
+    M._status_render_walkthrough_model(walkthrough_model)
+  elseif #sections == 0 then
     status_add_line("No changes", nil, "Comment")
   else
     for index, section in ipairs(sections) do
@@ -14773,15 +15247,9 @@ end
 ---@param entries DiffReviewStatusEntry[]
 ---@return DiffReviewStatusSectionName?
 local function status_unstage_target_section(entries)
-  local has_added = false
   for _, entry in ipairs(entries) do
-    if status_entry_is_added(entry) then
-      has_added = true
-    else
-      return "unstaged"
-    end
+    if entry.kind == "file" or entry.kind == "hunk" then return "unstaged" end
   end
-  if has_added then return "untracked" end
   return nil
 end
 
@@ -14889,7 +15357,7 @@ local function status_unstage_entries(entries, opts)
   local status_buf = M._status and M._status.buf
 
   status_apply_optimistic_entries(tracked_entries, "unstaged", target_id)
-  status_apply_optimistic_entries(added_entries, "untracked", target_id)
+  status_apply_optimistic_entries(added_entries, "unstaged", target_id)
 
   local function finish()
     if unstaged_hunks > 0 or unstaged_files > 0 then
@@ -15755,6 +16223,21 @@ function M._walkthrough_host(buf)
       render_status_or_notify(buf, nil, nil, { reuse_sections = true })
     end,
     git_list_async = systemlist_async,
+    set_walkthrough_presentation = function(doc, stale, head_sha)
+      local state = M._status_states and M._status_states[buf] or M._status
+      if not state then return end
+      state.walkthrough_presentation = {
+        doc = doc,
+        stale = stale,
+        head_sha = head_sha,
+      }
+    end,
+    clear_walkthrough_presentation = function()
+      local state = M._status_states and M._status_states[buf] or M._status
+      if not state then return end
+      state.walkthrough_presentation = nil
+      state.fancy_rows = {}
+    end,
   }
 end
 
