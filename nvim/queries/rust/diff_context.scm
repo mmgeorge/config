@@ -19,3 +19,6 @@
 
 (mod_item
   name: (identifier) @scope.name) @scope
+
+(use_declaration
+  "use" @scope.name) @scope

@@ -53,6 +53,51 @@ local diff_text = table.concat({
   "@@ -21 +21 @@",
   "-      color_texture: color,",
   "+      color_texture: color.clone(),",
+  "diff --git a/src/model_store.rs b/src/model_store.rs",
+  "index 8888888..9999999 100644",
+  "--- a/src/model_store.rs",
+  "+++ b/src/model_store.rs",
+  "@@ -16,0 +17 @@",
+  "+  pub particle_bind_group: gpu::BindGroup<shaders::model::particle_render::BindGroup1Descriptor>,",
+  "@@ -17,0 +19,9 @@",
+  "+",
+  "+#[derive(Debug)]",
+  "+pub struct ParticleModelDrawCommand {",
+  "+  pub first_index: u32,",
+  "+  pub index_count: u32,",
+  "+  pub base_vertex: u32,",
+  "+  pub primitive_instance: u32,",
+  "+  pub debug_info: String,",
+  "+}",
+  "diff --git a/src/render_system.rs b/src/render_system.rs",
+  "index 9999999..aaaaaaa 100644",
+  "--- a/src/render_system.rs",
+  "+++ b/src/render_system.rs",
+  "@@ -5 +5,2 @@",
+  "-      CameraBuffer, ModelStore, TransformBuffer, model_store::InstructionBundleBuilder,",
+  "+      CameraBuffer, ModelStore, ParticleModelDrawParams, ParticlePbRenderPipeline, TransformBuffer,",
+  "+      model_store::{InstructionBundleBuilder, ParticleModelDrawCommand},",
+  "@@ -11 +12 @@",
+  "-  render::GpuState,",
+  "+  render::{GpuState, ParticleInstanceSources},",
+  "diff --git a/src/struct_gap.rs b/src/struct_gap.rs",
+  "index bbbbbbb..ccccccc 100644",
+  "--- a/src/struct_gap.rs",
+  "+++ b/src/struct_gap.rs",
+  "@@ -17 +17 @@",
+  "-  transforms: (),",
+  "+  transforms: TransformBuffer,",
+  "diff --git a/src/render_barrier.rs b/src/render_barrier.rs",
+  "index ddddddd..eeeeeee 100644",
+  "--- a/src/render_barrier.rs",
+  "+++ b/src/render_barrier.rs",
+  "@@ -164,0 +165,6 @@",
+  "+    let particle_source = engine.get::<ParticleInstanceSources>().get();",
+  "+    if let Some(source) = particle_source",
+  "+      && source.count > 0",
+  "+      && source.model_asset.is_some()",
+  "+      && !self.particle_commands.is_empty()",
+  "+    {",
   "diff --git a/src/notes.txt b/src/notes.txt",
   "index 5555555..6666666 100644",
   "--- a/src/notes.txt",
@@ -75,7 +120,7 @@ function backend.systemlist(command)
   if key:find("@{upstream}", 1, true) or key:find("@{push}", 1, true) then return {}, 1 end
   if key == "git\t-C\t" .. root .. "\tls-files\t--others\t--exclude-standard" then return {}, 0 end
   if key == "git\t-C\t" .. root .. "\tdiff\t--cached\t--name-status" then return {}, 0 end
-  if key == "git\t-C\t" .. root .. "\tdiff\t--name-status" then return { "M\tsrc/engine.rs", "M\tsrc/tangent.rs", "M\tsrc/material.rs", "M\tsrc/notes.txt" }, 0 end
+  if key == "git\t-C\t" .. root .. "\tdiff\t--name-status" then return { "M\tsrc/engine.rs", "M\tsrc/tangent.rs", "M\tsrc/material.rs", "M\tsrc/model_store.rs", "M\tsrc/render_system.rs", "M\tsrc/struct_gap.rs", "M\tsrc/render_barrier.rs", "M\tsrc/notes.txt" }, 0 end
   if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0" then
     return vim.split(diff_text, "\n", { plain = true }), 0
   end
@@ -194,6 +239,9 @@ local function trigger_normal_mapping(key, row)
 end
 
 local function assert_padding_omits_trailing_delimiters()
+  assert_true(diff_review._hunk_single_hidden_new_line(15, 17) == 16, "single hidden line should be detected")
+  assert_true(diff_review._hunk_single_hidden_new_line(15, 18) == nil, "multi-line gaps should stay collapsed")
+
   local padding_source_lines = {}
   for line_number = 1, 90 do
     padding_source_lines[line_number] = ("// filler %d"):format(line_number)
@@ -248,6 +296,41 @@ local function assert_padding_omits_trailing_delimiters()
     #padding == 1 and padding[1].line_number == 74,
     "useful same-scope padding should still render before a changed line"
   )
+
+  for line_number = 91, 180 do
+    padding_source_lines[line_number] = ("// filler %d"):format(line_number)
+  end
+  padding_source_lines[162] = "      binding.draw_indexed(indices, command.base_vertex, instances)"
+  padding_source_lines[163] = "    }"
+  padding_source_lines[164] = ""
+  padding_source_lines[165] = "    let particle_source = engine.get::<ParticleInstanceSources>().get();"
+  hunk = {
+    lines = {
+      {
+        prefix = "+",
+        new_line = 165,
+        code = padding_source_lines[165],
+      },
+    },
+  }
+  context = {
+    start_row = 114,
+    end_row = 179,
+    path_start_rows = {},
+    path_end_rows = {},
+    sibling_before_rows = {},
+    sibling_after_rows = {},
+  }
+  padding = diff_review._hunk_context_padding_lines(
+    padding_source_lines,
+    hunk,
+    context,
+    "before",
+    { [165] = true },
+    nil,
+    { changed_line = 165, after_line = 171 }
+  )
+  assert_true(#padding == 0, "fallback padding should not skip over blank or delimiter barriers")
 end
 
 local function assert_current_file_jump(expected_file, expected_line, expected_text)
@@ -340,6 +423,100 @@ local function run()
     "  }",
     "}",
   }, root .. "/src/material.rs") == 0, "writefile failed")
+  assert_true(vim.fn.writefile({
+    "use {",
+    "  crate::{",
+    "    ModelComponent, ModelRepository,",
+    "    pbr::{",
+    "      CameraBuffer, ModelStore, ParticleModelDrawParams, ParticlePbRenderPipeline, TransformBuffer,",
+    "      model_store::{InstructionBundleBuilder, ParticleModelDrawCommand},",
+    "      pb_render_instructions::InstructionBundle, pb_render_pipeline::PbRenderPipeline,",
+    "    },",
+    "  },",
+    "  base::{CameraComponent, TransformComponent},",
+    "  engine::{Engine, ecs, sys::gpu},",
+    "  render::{GpuState, ParticleInstanceSources},",
+    "};",
+    "",
+    "pub struct ModelRenderSystem {",
+    "}",
+  }, root .. "/src/render_system.rs") == 0, "writefile failed")
+  assert_true(vim.fn.writefile({
+    "use {",
+    "  crate::{",
+    "    Model, ModelRepository, Primitive,",
+    "    pbr::{",
+    "      pb_materials::PbMaterials, pb_render_instructions::EntityIndex,",
+    "      primitive_mesh_store::PrimitiveMeshStore,",
+    "    },",
+    "  },",
+    "  engine::sys::gpu,",
+    "  std::collections::HashMap,",
+    "};",
+    "",
+    "pub struct ModelStore {",
+    "  pub primitives: PrimitiveMeshStore,",
+    "  pub materials: PbMaterials,",
+    "  pub bind_group: gpu::BindGroup<shaders::model::render::BindGroup1Descriptor>,",
+    "  pub particle_bind_group: gpu::BindGroup<shaders::model::particle_render::BindGroup1Descriptor>,",
+    "}",
+    "",
+    "#[derive(Debug)]",
+    "pub struct ParticleModelDrawCommand {",
+    "  pub first_index: u32,",
+    "  pub index_count: u32,",
+    "  pub base_vertex: u32,",
+    "  pub primitive_instance: u32,",
+    "  pub debug_info: String,",
+    "}",
+    "",
+    "impl ModelStore {",
+    "}",
+  }, root .. "/src/model_store.rs") == 0, "writefile failed")
+  assert_true(vim.fn.writefile({
+    "// 1",
+    "// 2",
+    "// 3",
+    "// 4",
+    "// 5",
+    "// 6",
+    "// 7",
+    "// 8",
+    "// 9",
+    "// 10",
+    "// 11",
+    "// 12",
+    "// 13",
+    "// 14",
+    "pub struct ModelRenderSystem {",
+    "  camera: CameraBuffer,",
+    "  transforms: TransformBuffer,",
+    "}",
+  }, root .. "/src/struct_gap.rs") == 0, "writefile failed")
+  local render_barrier_lines = {}
+  for line_number = 1, 180 do
+    render_barrier_lines[line_number] = ("// filler %d"):format(line_number)
+  end
+  render_barrier_lines[1] = "struct Engine;"
+  render_barrier_lines[2] = "struct Renderer { particle_commands: Vec<()> }"
+  render_barrier_lines[3] = "struct ParticleInstanceSources;"
+  render_barrier_lines[114] = "impl Renderer {"
+  render_barrier_lines[115] = "  fn render(&mut self, engine: &Engine) {"
+  render_barrier_lines[160] = "    for command in commands {"
+  render_barrier_lines[161] = "      binding.insert_debug_marker(command_debug);"
+  render_barrier_lines[162] = "      binding.draw_indexed(indices, command.base_vertex, instances)"
+  render_barrier_lines[163] = "    }"
+  render_barrier_lines[164] = ""
+  render_barrier_lines[165] = "    let particle_source = engine.get::<ParticleInstanceSources>().get();"
+  render_barrier_lines[166] = "    if let Some(source) = particle_source"
+  render_barrier_lines[167] = "      && source.count > 0"
+  render_barrier_lines[168] = "      && source.model_asset.is_some()"
+  render_barrier_lines[169] = "      && !self.particle_commands.is_empty()"
+  render_barrier_lines[170] = "    {"
+  render_barrier_lines[171] = "    }"
+  render_barrier_lines[172] = "  }"
+  render_barrier_lines[173] = "}"
+  assert_true(vim.fn.writefile(render_barrier_lines, root .. "/src/render_barrier.rs") == 0, "writefile failed")
   assert_true(vim.fn.writefile({
     "alpha",
     "beta",
@@ -476,6 +653,55 @@ local function run()
   trigger_normal_mapping("S", material_close_row)
   vim.wait(50)
   assert_true(system_call_count() == before, "ancestor closer padding row triggered a stage action")
+
+  trigger_normal_mapping("<Tab>", find_row(buf, "model_store.rs"))
+  wait_for(function()
+    return buffer_contains(buf, "@@ +10 -0")
+      and buffer_contains(buf, "pub struct ParticleModelDrawCommand")
+  end, "model store hunk did not render\n" .. buffer_dump(buf))
+  local model_store_header_row = find_row(buf, "@@ +10 -0")
+  local particle_command_row = find_row(buf, "pub struct ParticleModelDrawCommand")
+  local model_store_impl_row = nil
+  pcall(function()
+    model_store_impl_row = find_row(buf, "impl ModelStore")
+  end)
+  assert_true(
+    model_store_header_row < particle_command_row,
+    "new sibling struct should render inside the model store display hunk\n" .. buffer_dump(buf)
+  )
+  assert_true(
+    model_store_impl_row == nil,
+    "trailing context crossed into the next top-level sibling scope\n" .. buffer_dump(buf)
+  )
+
+  trigger_normal_mapping("<Tab>", find_row(buf, "render_system.rs"))
+  wait_for(function()
+    return buffer_contains(buf, "@@ +3 -2")
+      and buffer_contains(buf, "render::{GpuState, ParticleInstanceSources}")
+      and buffer_contains(buf, "};")
+      and not buffer_contains(buf, "pub struct ModelRenderSystem")
+  end, "rust use hunk did not render with scoped import context\n" .. buffer_dump(buf))
+
+  trigger_normal_mapping("<Tab>", find_row(buf, "struct_gap.rs"))
+  wait_for(function()
+    return buffer_contains(buf, "pub struct ModelRenderSystem")
+      and buffer_contains(buf, "camera: CameraBuffer")
+      and buffer_contains(buf, "transforms: TransformBuffer")
+  end, "single-line boundary gap did not render concrete context\n" .. buffer_dump(buf))
+  local struct_row = find_row(buf, "pub struct ModelRenderSystem")
+  local camera_row = find_row(buf, "camera: CameraBuffer")
+  local transforms_row = find_row(buf, "transforms: TransformBuffer")
+  assert_true(struct_row < camera_row and camera_row < transforms_row, "single hidden context line should replace ellipsis\n" .. buffer_dump(buf))
+  local struct_gap_lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  for row = struct_row + 1, transforms_row - 1 do
+    assert_true(not struct_gap_lines[row]:find("...", 1, true), "single-line gap should not render ellipsis\n" .. buffer_dump(buf))
+  end
+
+  trigger_normal_mapping("<Tab>", find_row(buf, "render_barrier.rs"))
+  wait_for(function()
+    return buffer_contains(buf, "let particle_source = engine.get::<ParticleInstanceSources>().get()")
+      and not buffer_contains(buf, "binding.draw_indexed")
+  end, "fallback padding crossed a closed block boundary\n" .. buffer_dump(buf))
 
   trigger_normal_mapping("<Tab>", find_row(buf, "notes.txt"))
   wait_for(function()

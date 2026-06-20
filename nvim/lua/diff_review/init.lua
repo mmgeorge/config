@@ -2989,7 +2989,8 @@ function M._hunk_change_regions(render_items, line_by_position, context_for_line
     if M._hunk_render_item_changed(item) then
       local context_line = M._hunk_render_item_context_line(item, line_by_position)
       local item_context = nil
-      if current_region and M._hunk_context_contains_line(current_region.context, context_line) then
+      if type(current_region and current_region.context) == "table"
+        and M._hunk_context_contains_line(current_region.context, context_line) then
         item_context = current_region.context
       else
         item_context = context_line and context_for_line(context_line) or nil
@@ -3500,6 +3501,25 @@ function M._hunk_context_padding_line_is_useful(text)
   return true
 end
 
+---@param text string?
+---@return boolean
+function M._hunk_context_padding_line_starts_scope(text)
+  if type(text) ~= "string" then return false end
+  return text:match("^%s*#%[") ~= nil
+    or text:match("^%s*pub%s+struct%s+") ~= nil
+    or text:match("^%s*struct%s+") ~= nil
+    or text:match("^%s*pub%s+enum%s+") ~= nil
+    or text:match("^%s*enum%s+") ~= nil
+    or text:match("^%s*pub%s+trait%s+") ~= nil
+    or text:match("^%s*trait%s+") ~= nil
+    or text:match("^%s*impl%s+") ~= nil
+    or text:match("^%s*pub%s+fn%s+") ~= nil
+    or text:match("^%s*fn%s+") ~= nil
+    or text:match("^%s*pub%s+mod%s+") ~= nil
+    or text:match("^%s*mod%s+") ~= nil
+    or text:match("^%s*use%s+") ~= nil
+end
+
 ---@param source_lines string[]?
 ---@param hunk DiffReviewParsedHunk
 ---@param context DiffReviewHunkTreeSitterContext|string?
@@ -3552,23 +3572,25 @@ function M._hunk_context_padding_lines(source_lines, hunk, context, side, occupi
     if #candidates == 0 then
       local scope_start = context.start_row + 1
       local scope_end = context.end_row + 1
-      local first_line = nil
-      local last_line = nil
       if side == "before" then
-        first_line = math.max(scope_start + 1, changed_line - padding_limit)
-        last_line = changed_line - 1
+        local first_line = math.max(scope_start + 1, changed_line - padding_limit)
+        for line_number = changed_line - 1, first_line, -1 do
+          local is_scope_boundary = line_number == scope_start or line_number == scope_end
+          if is_scope_boundary or not M._hunk_context_padding_line_is_useful(source_lines[line_number]) then break end
+          if not occupied_lines[line_number] and not seen_candidates[line_number] then
+            seen_candidates[line_number] = true
+            candidates[#candidates + 1] = line_number
+          end
+        end
       else
-        first_line = after_line
-        last_line = math.min(scope_end - 1, after_line + padding_limit - 1)
-      end
-      for line_number = first_line, last_line do
-        local is_scope_boundary = line_number == scope_start or line_number == scope_end
-        if not is_scope_boundary
-          and not occupied_lines[line_number]
-          and not seen_candidates[line_number]
-          and M._hunk_context_padding_line_is_useful(source_lines[line_number]) then
-          seen_candidates[line_number] = true
-          candidates[#candidates + 1] = line_number
+        local last_line = math.min(scope_end - 1, after_line + padding_limit - 1)
+        for line_number = after_line, last_line do
+          local is_scope_boundary = line_number == scope_start or line_number == scope_end
+          if is_scope_boundary or not M._hunk_context_padding_line_is_useful(source_lines[line_number]) then break end
+          if not occupied_lines[line_number] and not seen_candidates[line_number] then
+            seen_candidates[line_number] = true
+            candidates[#candidates + 1] = line_number
+          end
         end
       end
     end
@@ -3594,6 +3616,11 @@ function M._hunk_context_padding_lines(source_lines, hunk, context, side, occupi
   end
 
   for line_number = first_line, last_line do
+    if side == "after"
+      and line_number > first_line
+      and M._hunk_context_padding_line_starts_scope(source_lines[line_number]) then
+      break
+    end
     if not occupied_lines[line_number] then
       padding_lines[#padding_lines + 1] = {
         line_number = line_number,
@@ -3776,12 +3803,10 @@ function M._hunk_render_plans_should_merge(previous_plan, next_plan)
   if previous_plan.display_end and next_plan.display_start and next_plan.display_start <= previous_plan.display_end + 1 then
     return true
   end
-  if same_hunk_context_scope(previous_plan.region.context, next_plan.region.context) then
-    local previous_after_line = previous_plan.region.after_line or previous_plan.display_end
-    local next_changed_line = next_plan.region.changed_line or next_plan.display_start
-    return previous_after_line ~= nil and next_changed_line ~= nil and next_changed_line <= previous_after_line + 3
-  end
-  return false
+  if not M._hunk_contexts_related(previous_plan.region.context, next_plan.region.context) then return false end
+  local gap = M._hunk_visible_plan_gap(previous_plan, next_plan)
+  if gap and gap > 0 and type(previous_plan.source_lines) ~= "table" then return false end
+  return gap ~= nil and gap >= 0 and gap <= M._hunk_context_bridge_limit()
 end
 
 ---@param plans DiffReviewHunkRenderPlan[]
@@ -3817,6 +3842,80 @@ function M._hunk_render_coords_adjacent(left_old, left_new, right_old, right_new
   return false
 end
 
+---@param left DiffReviewHunkTreeSitterContext|string?
+---@param right DiffReviewHunkTreeSitterContext|string?
+---@return boolean
+function M._hunk_contexts_related(left, right)
+  if same_hunk_context_scope(left, right) then return true end
+  if type(left) ~= "table" or type(right) ~= "table" then return false end
+  local left_start = left.start_row + 1
+  local left_end = left.end_row + 1
+  local right_start = right.start_row + 1
+  local right_end = right.end_row + 1
+  return (right_start >= left_start and right_end <= left_end)
+    or (left_start >= right_start and left_end <= right_end)
+end
+
+---@return integer
+function M._hunk_context_bridge_limit()
+  return M._hunk_context_padding_limit() * 2
+end
+
+---@param left_old integer?
+---@param left_new integer?
+---@param right_old integer?
+---@param right_new integer?
+---@return integer?
+function M._hunk_render_coord_gap(left_old, left_new, right_old, right_new)
+  local gap = nil
+  local function include_gap(left, right)
+    if not (left and right) then return end
+    local candidate = right - left - 1
+    if gap == nil or candidate > gap then gap = candidate end
+  end
+  include_gap(left_new, right_new)
+  include_gap(left_old, right_old)
+  return gap
+end
+
+---@param left_new integer?
+---@param right_new integer?
+---@return integer?
+function M._hunk_single_hidden_new_line(left_new, right_new)
+  if left_new and right_new and right_new == left_new + 2 then return left_new + 1 end
+  return nil
+end
+
+---@param source_lines string[]?
+---@param block DiffReviewParsedBlock
+---@param line_number integer?
+---@param gutter DiffReviewGutterSpec
+---@param file string?
+---@param syntax? DiffReviewTreeSitterSyntax
+---@return table?
+function M._hunk_single_hidden_context_row(source_lines, block, line_number, gutter, file, syntax)
+  if not line_number or type(source_lines) ~= "table" or not source_lines[line_number] then return nil end
+  local old_line = M._hunk_old_line_for_new_line(block and block.hunks or {}, line_number)
+  return M._hunk_context_padding_row(line_number, source_lines[line_number], gutter, file, syntax, old_line, line_number)
+end
+
+---@param source_lines string[]?
+---@param block DiffReviewParsedBlock
+---@param left_new integer?
+---@param right_new integer?
+---@param changed_lines table<integer, boolean>
+---@param emitted_context_lines table<integer, boolean>
+---@param gutter DiffReviewGutterSpec
+---@param file string?
+---@param syntax? DiffReviewTreeSitterSyntax
+---@return table? row
+---@return integer? line_number
+function M._hunk_single_hidden_context_gap_row(source_lines, block, left_new, right_new, changed_lines, emitted_context_lines, gutter, file, syntax)
+  local hidden_line = M._hunk_single_hidden_new_line(left_new, right_new)
+  if not hidden_line or emitted_context_lines[hidden_line] or changed_lines[hidden_line] then return nil, nil end
+  return M._hunk_single_hidden_context_row(source_lines, block, hidden_line, gutter, file, syntax), hidden_line
+end
+
 ---@param plan DiffReviewHunkRenderPlan
 ---@param raw_context DiffReviewHunkTreeSitterContext|string?
 ---@return integer? old_line
@@ -3849,6 +3948,15 @@ function M._hunk_last_visible_plan_coords(plan, raw_context)
     end
   end
   return nil, nil
+end
+
+---@param previous_plan DiffReviewHunkRenderPlan
+---@param next_plan DiffReviewHunkRenderPlan
+---@return integer?
+function M._hunk_visible_plan_gap(previous_plan, next_plan)
+  local previous_old_line, previous_new_line = M._hunk_last_visible_plan_coords(previous_plan, previous_plan.region.context)
+  local next_old_line, next_new_line = M._hunk_first_visible_plan_coords(next_plan, next_plan.region.context)
+  return M._hunk_render_coord_gap(previous_old_line, previous_new_line, next_old_line, next_new_line)
 end
 
 ---@param diff_text string
@@ -4018,7 +4126,9 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
   end
 
   local display_groups = M._merge_hunk_render_plans(plans)
+  local emitted_start_scope_keys = {}
   for group_index, group in ipairs(display_groups) do
+    local next_group = display_groups[group_index + 1]
     ret[#ret + 1] = hunk_header_row(M._hunk_virtual_header_parts(group, group.plans[1] and group.plans[1].hunk or nil))
     local emitted_context_lines = {}
 
@@ -4043,15 +4153,43 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
       if parsed_line.new_line then emitted_context_lines[parsed_line.new_line] = true end
     end
 
+    local function add_context_bridge_rows(plan, next_plan)
+      if not (plan and next_plan and type(source_lines) == "table") then return end
+      local previous_old_line, previous_new_line = M._hunk_last_visible_plan_coords(plan, plan.region.context)
+      local next_old_line, next_new_line = M._hunk_first_visible_plan_coords(next_plan, next_plan.region.context)
+      local gap = M._hunk_render_coord_gap(previous_old_line, previous_new_line, next_old_line, next_new_line)
+      if not (gap and gap > 0 and gap <= M._hunk_context_bridge_limit()) then return end
+      if not (previous_new_line and next_new_line and next_new_line > previous_new_line + 1) then return end
+      for line_number = previous_new_line + 1, next_new_line - 1 do
+        if not group.changed_lines[line_number] and not emitted_context_lines[line_number] then
+          ret[#ret + 1] = M._hunk_context_padding_row(
+            line_number,
+            source_lines[line_number] or "",
+            group.gutter,
+            filename or plan.block.file,
+            file_syntax,
+            M._hunk_old_line_for_new_line(plan.block.hunks, line_number),
+            line_number
+          )
+          emitted_context_lines[line_number] = true
+        end
+      end
+    end
+
     for plan_index, plan in ipairs(group.plans) do
       local raw_context = plan.region.context
       if opts.boundary_context and type(raw_context) == "table" then
         local node_start = raw_context.start_row + 1
         local start_text = raw_context.start_text or ""
+        local start_scope_key = hunk_context_scope_key(raw_context)
+        local start_scope_seen = start_scope_key and emitted_start_scope_keys[start_scope_key] == true
         local previous_plan = group.plans[plan_index - 1]
         local suppress_start_boundary = (group_index == 1 and plan_index == 1 and opts.suppress_start_boundary)
           or same_hunk_context_scope(previous_plan and previous_plan.region.context, raw_context)
-        if not suppress_start_boundary and not plan.visible_source_lines[start_text] and not emitted_context_lines[node_start] then
+          or start_scope_seen
+        local start_boundary_visible = plan.visible_source_lines[start_text] == true
+        local start_boundary_rendered = false
+        if not suppress_start_boundary and not start_boundary_visible and not emitted_context_lines[node_start] then
           local boundary_old_line = M._hunk_old_line_for_new_line(plan.block.hunks, node_start)
           local boundary_new_line = node_start
           ret[#ret + 1] = hunk_boundary_row(
@@ -4063,17 +4201,38 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
             boundary_old_line,
             boundary_new_line
           )
+          start_boundary_rendered = true
           emitted_context_lines[node_start] = true
           local next_old_line, next_new_line = M._hunk_first_visible_plan_coords(plan, raw_context)
           local adjacent_to_next = M._hunk_render_coords_adjacent(boundary_old_line, boundary_new_line, next_old_line, next_new_line)
           if node_start ~= raw_context.end_row + 1 and not adjacent_to_next then
-            ret[#ret + 1] = hunk_boundary_ellipsis_row(start_text, group.gutter)
+            local hidden_row, hidden_line = M._hunk_single_hidden_context_gap_row(
+              source_lines,
+              plan.block,
+              boundary_new_line,
+              next_new_line,
+              group.changed_lines,
+              emitted_context_lines,
+              group.gutter,
+              filename or plan.block.file,
+              file_syntax
+            )
+            if hidden_row then
+              ret[#ret + 1] = hidden_row
+              emitted_context_lines[hidden_line] = true
+            else
+              ret[#ret + 1] = hunk_boundary_ellipsis_row(start_text, group.gutter)
+            end
           end
+        end
+        if start_scope_key and not start_scope_seen and (start_boundary_rendered or start_boundary_visible) then
+          emitted_start_scope_keys[start_scope_key] = true
         end
       end
       add_context_padding_rows(plan.before_padding_lines, group.gutter, plan.block.file)
 
       local previous_visible_changed = false
+      local last_visible_new_line = nil
       for item_index = plan.region.first_item, plan.region.last_item do
         local item = plan.render_items[item_index]
         local parsed_line = M._hunk_render_item_line(item)
@@ -4088,10 +4247,12 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
           for _, backing_line in ipairs(item.diff_lines or {}) do
             mark_emitted_context_line(backing_line)
           end
+          last_visible_new_line = parsed_line.new_line
           previous_visible_changed = true
         elseif visible_in_hunk and visible_in_scope and not context_already_emitted then
           ret[#ret + 1] = hunk_body_row(parsed_line, group.gutter, filename or plan.block.file, row_syntax, row_syntax_row)
           mark_emitted_context_line(parsed_line)
+          last_visible_new_line = parsed_line.new_line
           previous_visible_changed = parsed_line.prefix == "+" or parsed_line.prefix == "-"
         elseif M._hunk_hidden_closing_boundary_after_change(parsed_line, previous_visible_changed, raw_context, visible_in_hunk) then
           local boundary_segments = nil
@@ -4100,7 +4261,23 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
           end
           local previous_line_emitted = parsed_line.new_line and emitted_context_lines[parsed_line.new_line - 1] == true
           if not previous_line_emitted then
-            ret[#ret + 1] = hunk_boundary_ellipsis_row(parsed_line.code, group.gutter)
+            local hidden_row, hidden_line = M._hunk_single_hidden_context_gap_row(
+              source_lines,
+              plan.block,
+              last_visible_new_line,
+              parsed_line.new_line,
+              group.changed_lines,
+              emitted_context_lines,
+              group.gutter,
+              filename or plan.block.file,
+              file_syntax
+            )
+            if hidden_row then
+              ret[#ret + 1] = hidden_row
+              emitted_context_lines[hidden_line] = true
+            else
+              ret[#ret + 1] = hunk_boundary_ellipsis_row(parsed_line.code, group.gutter)
+            end
           end
           ret[#ret + 1] = hunk_boundary_row(
             parsed_line.code,
@@ -4112,6 +4289,7 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
             parsed_line.new_line
           )
           mark_emitted_context_line(parsed_line)
+          last_visible_new_line = parsed_line.new_line
           previous_visible_changed = false
         end
       end
@@ -4125,20 +4303,39 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
         end
       end
       add_context_padding_rows(after_padding_lines, group.gutter, plan.block.file)
+      add_context_bridge_rows(plan, next_plan)
       if opts.boundary_context and type(raw_context) == "table" then
         local node_start = raw_context.start_row + 1
         local node_end = raw_context.end_row + 1
         local end_text = raw_context.end_text or ""
+        local next_group_plan = next_plan == nil and next_group and next_group.plans and next_group.plans[1] or nil
         local suppress_end_boundary = next_plan ~= nil
           or (group_index == #display_groups and plan_index == #group.plans and opts.suppress_end_boundary)
           or same_hunk_context_scope(raw_context, next_plan and next_plan.region.context)
+          or same_hunk_context_scope(raw_context, next_group_plan and next_group_plan.region.context)
         if not suppress_end_boundary and not plan.visible_source_lines[end_text] and not emitted_context_lines[node_end] then
           local boundary_old_line = M._hunk_old_line_for_new_line(plan.block.hunks, node_end)
           local boundary_new_line = node_end
           local previous_old_line, previous_new_line = M._hunk_last_visible_plan_coords(plan, raw_context)
           local adjacent_to_previous = M._hunk_render_coords_adjacent(previous_old_line, previous_new_line, boundary_old_line, boundary_new_line)
           if node_end ~= node_start and not adjacent_to_previous then
-            ret[#ret + 1] = hunk_boundary_ellipsis_row(end_text, group.gutter)
+            local hidden_row, hidden_line = M._hunk_single_hidden_context_gap_row(
+              source_lines,
+              plan.block,
+              previous_new_line,
+              boundary_new_line,
+              group.changed_lines,
+              emitted_context_lines,
+              group.gutter,
+              filename or plan.block.file,
+              file_syntax
+            )
+            if hidden_row then
+              ret[#ret + 1] = hidden_row
+              emitted_context_lines[hidden_line] = true
+            else
+              ret[#ret + 1] = hunk_boundary_ellipsis_row(end_text, group.gutter)
+            end
           end
           if node_end ~= node_start then
             ret[#ret + 1] = hunk_boundary_row(
