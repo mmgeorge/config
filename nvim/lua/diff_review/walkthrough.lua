@@ -81,6 +81,9 @@
 ---@field buf integer
 ---@field cwd fun(): string?
 ---@field get_state fun(): table? current status state (lines, entries, sections)
+---@field file_key fun(section_name: string, filename: string): string
+---@field hunk_key fun(section_name: string, filename: string, diff?: string): string
+---@field set_folded fun(key: string, folded: boolean)
 ---@field rerender fun() synchronous reuse_sections re-render
 ---@field git_list_async fun(command: string[], cb: fun(output: string[], code: integer))
 ---@field set_walkthrough_presentation? fun(doc: DiffReviewWalkthroughDoc, stale: boolean, head_sha?: string)
@@ -105,11 +108,9 @@
 ---@field _modes table<integer, DiffReviewWalkthroughMode>
 ---@field _reader DiffReviewWalkthroughReader?
 ---@field _ns integer
----@field _active_ns integer
 local M = {
   _modes = {},
   _ns = vim.api.nvim_create_namespace("diff_review_walkthrough"),
-  _active_ns = vim.api.nvim_create_namespace("diff_review_walkthrough_active"),
 }
 
 local nav_keys = { "z", "y", "q", "<Esc>" }
@@ -297,65 +298,20 @@ local function append_summary_item(lines, item, prefix, is_last)
     .. item.note
 end
 
----@param text string
----@return integer
-local function display_width(text)
-  return vim.fn.strdisplaywidth(tostring(text or ""))
-end
-
----@param text string
----@param width integer
----@return string
-local function pad_right(text, width)
-  text = tostring(text or "")
-  return text .. string.rep(" ", math.max(0, width - display_width(text)))
-end
-
----@class DiffReviewWalkthroughTaskTableRow
----@field action string
----@field raw_action string
----@field type_label string
----@field title string
----@field note string
-
----@param task DiffReviewWalkthroughTask
----@return DiffReviewWalkthroughTaskTableRow[] rows
----@return { action: integer, type_label: integer } widths
-local function task_table_rows(task)
-  local rows = {}
-  local widths = { action = 0, type_label = 0 }
-  for _, group in ipairs(task.groups or {}) do
-    for _, subtask in ipairs(group.subtasks or {}) do
-      for _, item in ipairs(subtask.items or {}) do
-        local row = {
-          action = format_action(item.action),
-          raw_action = item.action,
-          type_label = format_item_type_label(item.type, item.subtype),
-          title = item.title,
-          note = item.note,
-        }
-        widths.action = math.max(widths.action, display_width(row.action))
-        widths.type_label = math.max(widths.type_label, display_width(row.type_label))
-        rows[#rows + 1] = row
-      end
-    end
-  end
-  return rows, widths
-end
-
----@param row DiffReviewWalkthroughTaskTableRow
----@param widths { action: integer, type_label: integer }
+---@param item DiffReviewWalkthroughItem
+---@param prefix string
+---@param is_last boolean
 ---@return table[] segments
-local function task_table_row_segments(row, widths)
-  local action_hl = action_highlights[row.raw_action] or "DiffReviewWalkthroughActionUpdate"
+local function task_item_segments(item, prefix, is_last)
+  local action_hl = action_highlights[item.action] or "DiffReviewWalkthroughActionUpdate"
   return {
-    { "- " },
-    { pad_right(row.action, widths.action), action_hl },
+    { prefix .. tree_branch(is_last) },
+    { format_action(item.action), action_hl },
     { " " },
-    { pad_right(row.type_label, widths.type_label), action_hl },
+    { format_item_type_label(item.type, item.subtype), action_hl },
     { " " },
-    { row.title, "DiffReviewWalkthroughItemTitle" },
-    { " to " .. row.note },
+    { item.title, "DiffReviewWalkthroughItemTitle" },
+    { " to " .. item.note },
   }
 end
 
@@ -363,12 +319,36 @@ end
 ---@return table[] rows
 function M.task_presentation_rows(task)
   local rows = {}
-  local table_rows, widths = task_table_rows(task)
-  if #table_rows > 0 then
-    rows[#rows + 1] = { segments = { { "" } } }
+  if task.justification then
+    rows[#rows + 1] = { segments = { { " " .. task.justification, "Comment" } } }
   end
-  for _, row in ipairs(table_rows) do
-    rows[#rows + 1] = { segments = task_table_row_segments(row, widths) }
+  for _, group in ipairs(task.groups or {}) do
+    rows[#rows + 1] = {
+      segments = {
+        { " " },
+        { format_type_keyword(group.type), "DiffReviewWalkthroughType" },
+        { " " },
+        { group.title, "DiffReviewWalkthroughItemTitle" },
+      },
+    }
+    local subtask_prefix = "    "
+    for subtask_index, subtask in ipairs(group.subtasks or {}) do
+      local subtask_is_last = subtask_index == #(group.subtasks or {})
+      rows[#rows + 1] = {
+        segments = {
+          { subtask_prefix .. tree_branch(subtask_is_last) },
+          { subtask.title, "DiffReviewWalkthroughItemTitle" },
+        },
+      }
+      local item_prefix = subtask_prefix .. tree_continuation(subtask_is_last)
+      if subtask.justification then
+        rows[#rows + 1] = { segments = { { item_prefix .. subtask.justification, "Comment" } } }
+      end
+      for item_index, item in ipairs(subtask.items or {}) do
+        local item_is_last = item_index == #(subtask.items or {})
+        rows[#rows + 1] = { segments = task_item_segments(item, item_prefix, item_is_last) }
+      end
+    end
   end
   return rows
 end
@@ -833,36 +813,53 @@ function M.resolve_step(state, step)
   return { match = "missing" }
 end
 
+--- Unfold the step's file (and its hunks) when no diff rows are rendered yet,
+--- then re-render synchronously so resolution can retry once.
+---@param mode DiffReviewWalkthroughMode
+---@param step DiffReviewWalkthroughStep
+---@return boolean expanded whether anything was unfolded
+local function ensure_expanded(mode, step)
+  local state = mode.host.get_state()
+  local sections = state and state.sections or {}
+  local expanded = false
+  for _, entry in pairs(state and state.entries or {}) do
+    if entry_matches_file(entry, step.file) then
+      if entry.kind == "section" and entry.id then
+        mode.host.set_folded(entry.id, false)
+        expanded = true
+      elseif entry.kind == "file" and entry.id then
+        mode.host.set_folded(entry.id, false)
+        expanded = true
+      elseif entry.kind == "hunk" and entry.id then
+        mode.host.set_folded(entry.id, false)
+        expanded = true
+      end
+    end
+  end
+  for _, section in ipairs(sections) do
+    for _, file in ipairs(section.files or {}) do
+      if matches_file(file.relpath, step.file) or matches_file(file.filename, step.file) then
+        mode.host.set_folded("section:" .. (file.section_name or section.name), false)
+        mode.host.set_folded(mode.host.file_key(file.section_name, file.filename), false)
+        for _, hunk in ipairs(file.hunks or {}) do
+          mode.host.set_folded(mode.host.hunk_key(file.section_name, file.filename, hunk.diff), false)
+        end
+        expanded = true
+      end
+    end
+  end
+  if expanded then
+    mode.host.rerender()
+  end
+  return expanded
+end
+
 -- ─── floats ──────────────────────────────────────────────────────────────────
 
 ---@param text string
 ---@param width integer
 ---@return string[] lines
-function M.wrap_text(text, width)
-  width = math.max(1, math.floor(tonumber(width) or 1))
-
-  ---@param word string
-  ---@return string[]
-  local function split_long_word(word)
-    local chunks = {}
-    local chunk = ""
-    local chunk_width = 0
-    for char_index = 0, vim.fn.strchars(word) - 1 do
-      local char = vim.fn.strcharpart(word, char_index, 1)
-      local char_width = vim.fn.strdisplaywidth(char)
-      if chunk ~= "" and chunk_width + char_width > width then
-        chunks[#chunks + 1] = chunk
-        chunk = char
-        chunk_width = char_width
-      else
-        chunk = chunk .. char
-        chunk_width = chunk_width + char_width
-      end
-    end
-    if chunk ~= "" then chunks[#chunks + 1] = chunk end
-    return chunks
-  end
-
+local function wrap_text(text, width)
   local wrapped = {}
   for _, paragraph in ipairs(vim.split(text, "\n", { plain = true })) do
     if vim.trim(paragraph) == "" then
@@ -870,20 +867,13 @@ function M.wrap_text(text, width)
     else
       local line = ""
       for word in paragraph:gmatch("%S+") do
-        local candidate = line == "" and word or (line .. " " .. word)
-        if vim.fn.strdisplaywidth(candidate) <= width then
-          line = candidate
+        if line == "" then
+          line = word
+        elseif #line + 1 + #word <= width then
+          line = line .. " " .. word
         else
-          if line ~= "" then wrapped[#wrapped + 1] = line end
-          if vim.fn.strdisplaywidth(word) > width then
-            local chunks = split_long_word(word)
-            for chunk_index = 1, #chunks - 1 do
-              wrapped[#wrapped + 1] = chunks[chunk_index]
-            end
-            line = chunks[#chunks] or ""
-          else
-            line = word
-          end
+          wrapped[#wrapped + 1] = line
+          line = word
         end
       end
       if line ~= "" then wrapped[#wrapped + 1] = line end
@@ -891,13 +881,6 @@ function M.wrap_text(text, width)
   end
   if #wrapped == 0 then wrapped[1] = "" end
   return wrapped
-end
-
----@param text string
----@param width integer
----@return string[] lines
-local function wrap_text(text, width)
-  return M.wrap_text(text, width)
 end
 
 ---@param line string
@@ -1055,16 +1038,15 @@ end
 
 --- Render the per-step comment as an inline virt_lines box below the region:
 --- it scrolls with the buffer and pushes following lines down instead of
---- overlapping them.
+--- overlapping them. Everything lives in the walkthrough namespace, so a
+--- namespace clear removes the box together with the region highlight.
 ---@param mode DiffReviewWalkthroughMode
 ---@param step DiffReviewWalkthroughStep
 ---@param target DiffReviewWalkthroughTarget
 ---@param win integer
----@param namespace? integer
 ---@return DiffReviewWalkthroughCommentBoxPlacement placement
-local function render_comment_box(mode, step, target, win, namespace)
+local function render_comment_box(mode, step, target, win)
   local buf = mode.host.buf
-  namespace = namespace or M._ns
   local win_width = vim.api.nvim_win_get_width(win)
   local inner_width = math.max(30, math.min(comment_box_max_inner_width, win_width - 8))
 
@@ -1117,28 +1099,11 @@ local function render_comment_box(mode, step, target, win, namespace)
   virt_lines[#virt_lines + 1] = { { pad .. "╰" .. ("─"):rep(inner_width) .. "╯", "FloatBorder" } }
 
   local anchor_row = comment_box_anchor_row(target, vim.api.nvim_win_get_height(win), #virt_lines)
-  pcall(vim.api.nvim_buf_set_extmark, buf, namespace, anchor_row - 1, 0, {
+  pcall(vim.api.nvim_buf_set_extmark, buf, M._ns, anchor_row - 1, 0, {
     virt_lines = virt_lines,
     virt_lines_above = false,
   })
   return { anchor_row = anchor_row, line_count = #virt_lines }
-end
-
----@param mode DiffReviewWalkthroughMode
----@param win integer
----@return table<integer, DiffReviewWalkthroughCommentBoxPlacement> placements
-local function render_all_comment_boxes(mode, win)
-  local buf = mode.host.buf
-  vim.api.nvim_buf_clear_namespace(buf, M._ns, 0, -1)
-  local placements = {}
-  local state = mode.host.get_state()
-  for step_index, step in ipairs(mode.doc.steps or {}) do
-    local target = M.resolve_step(state, step)
-    if target.start_row and (target.match == "exact" or target.match == "nearest") then
-      placements[step_index] = render_comment_box(mode, step, target, win, M._ns)
-    end
-  end
-  return placements
 end
 
 -- ─── mode lifecycle ──────────────────────────────────────────────────────────
@@ -1403,9 +1368,30 @@ local function apply_summary_highlights(buf, lines, doc)
 end
 
 ---@param mode DiffReviewWalkthroughMode
-local function clear_region_highlight(mode)
+---@param row integer
+---@return string
+local function region_highlight_group(mode, row)
+  local state = mode.host.get_state()
+  local entry = state and state.entries and state.entries[row] or nil
+  local prefix = entry and entry.diff_line and entry.diff_line.prefix or nil
+  if prefix == "+" then return "DiffReviewWalkthroughRegionAdd" end
+  if prefix == "-" then return "DiffReviewWalkthroughRegionDelete" end
+  return "DiffReviewWalkthroughRegion"
+end
+
+---@param mode DiffReviewWalkthroughMode
+---@param target DiffReviewWalkthroughTarget
+local function apply_region_highlight(mode, target)
   local buf = mode.host.buf
-  vim.api.nvim_buf_clear_namespace(buf, M._active_ns, 0, -1)
+  vim.api.nvim_buf_clear_namespace(buf, M._ns, 0, -1)
+  if not target.start_row or target.match == "missing" then return end
+  local end_row = target.end_row or target.start_row
+  for row = target.start_row, end_row do
+    pcall(vim.api.nvim_buf_set_extmark, buf, M._ns, row - 1, 0, {
+      line_hl_group = region_highlight_group(mode, row),
+      priority = 250,
+    })
+  end
 end
 
 ---@param mode DiffReviewWalkthroughMode
@@ -1429,6 +1415,13 @@ local function show_step(mode, index)
 
   local state = mode.host.get_state()
   local target = M.resolve_step(state, step)
+  -- Only unfold + re-render when no diff rows are rendered at all; a
+  -- "nearest" match means the hunks are visible and just don't contain the
+  -- exact line (TS-context scoping, deletions, staleness).
+  if (target.match == "file_only" or target.match == "missing") and ensure_expanded(mode, step) then
+    state = mode.host.get_state()
+    target = M.resolve_step(state, step)
+  end
 
   local win = vim.fn.bufwinid(buf)
   if win == -1 then
@@ -1444,12 +1437,14 @@ local function show_step(mode, index)
     pcall(vim.api.nvim_win_set_cursor, win, { line, 0 })
   end
   place_cursor()
-  local placements = render_all_comment_boxes(mode, win)
-  clear_region_highlight(mode)
-  local placement = placements[index]
-  if placement then
-    focus_comment_box_below(win, target, placement)
+  if target.match == "missing" then
+    -- Anchor the box at the cursor's current row; no region to highlight.
+    local cursor_row = vim.api.nvim_win_get_cursor(win)[1]
+    target = { match = "missing", start_row = cursor_row, end_row = cursor_row }
   end
+  apply_region_highlight(mode, target)
+  local placement = render_comment_box(mode, step, target, win)
+  focus_comment_box_below(win, target, placement)
   place_cursor()
   vim.schedule(place_cursor)
 end
@@ -1502,10 +1497,9 @@ function M.stop(buf)
   M._modes[buf] = nil
 
   if vim.api.nvim_buf_is_valid(buf) then
-    -- The namespace clears remove persistent comment boxes and any stale
-    -- active-region highlight left by older sessions.
+    -- The namespace clear removes the region highlight and the inline
+    -- comment box together.
     vim.api.nvim_buf_clear_namespace(buf, M._ns, 0, -1)
-    vim.api.nvim_buf_clear_namespace(buf, M._active_ns, 0, -1)
     for _, key in ipairs(nav_keys) do
       pcall(vim.keymap.del, "n", key, { buffer = buf })
       local saved = mode.saved_maps[key]
@@ -1601,18 +1595,14 @@ function M.on_status_rendered(buf)
     if not vim.api.nvim_buf_is_valid(buf) then return end
     local win = vim.fn.bufwinid(buf)
     if win == -1 then return end
-    local placements = render_all_comment_boxes(active, win)
-    clear_region_highlight(active)
     local step = active.doc.steps[active.index]
-    local target = step and M.resolve_step(active.host.get_state(), step) or nil
-    local placement = placements[active.index]
-    if placement and target then
-      focus_comment_box_below(win, target, placement)
-      if target.start_row and vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == buf then
-        local line = math.min(math.max(target.start_row, 1), vim.api.nvim_buf_line_count(buf))
-        pcall(vim.api.nvim_win_set_cursor, win, { line, 0 })
-      end
+    local target = M.resolve_step(active.host.get_state(), step)
+    if target.match == "missing" then
+      local cursor_row = vim.api.nvim_win_get_cursor(win)[1]
+      target = { match = "missing", start_row = cursor_row, end_row = cursor_row }
     end
+    apply_region_highlight(active, target)
+    render_comment_box(active, step, target, win)
   end)
 end
 

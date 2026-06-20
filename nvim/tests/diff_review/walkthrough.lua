@@ -269,30 +269,22 @@ local function close_all_floats()
 end
 
 local function walkthrough_extmark_count(buf)
-  local count = 0
-  for _, namespace in ipairs({ walkthrough._ns, walkthrough._active_ns }) do
-    local marks = vim.api.nvim_buf_get_extmarks(buf, namespace, 0, -1, {})
-    count = count + #marks
-  end
-  return count
+  local marks = vim.api.nvim_buf_get_extmarks(buf, walkthrough._ns, 0, -1, {})
+  return #marks
 end
 
 local function row_has_line_highlight(buf, row, hl_group)
-  for _, namespace in ipairs({ walkthrough._ns, walkthrough._active_ns }) do
-    local marks = vim.api.nvim_buf_get_extmarks(buf, namespace, { row - 1, 0 }, { row - 1, -1 }, { details = true })
-    for _, mark in ipairs(marks) do
-      if (mark[4] or {}).line_hl_group == hl_group then return true end
-    end
+  local marks = vim.api.nvim_buf_get_extmarks(buf, walkthrough._ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
+  for _, mark in ipairs(marks) do
+    if (mark[4] or {}).line_hl_group == hl_group then return true end
   end
   return false
 end
 
 local function first_row_with_line_highlight(buf, hl_group)
-  for _, namespace in ipairs({ walkthrough._ns, walkthrough._active_ns }) do
-    local marks = vim.api.nvim_buf_get_extmarks(buf, namespace, 0, -1, { details = true })
-    for _, mark in ipairs(marks) do
-      if (mark[4] or {}).line_hl_group == hl_group then return mark[2] + 1 end
-    end
+  local marks = vim.api.nvim_buf_get_extmarks(buf, walkthrough._ns, 0, -1, { details = true })
+  for _, mark in ipairs(marks) do
+    if (mark[4] or {}).line_hl_group == hl_group then return mark[2] + 1 end
   end
   return nil
 end
@@ -315,24 +307,6 @@ local function comment_box_mark(buf)
   local marks = vim.api.nvim_buf_get_extmarks(buf, walkthrough._ns, 0, -1, { details = true })
   for _, mark in ipairs(marks) do
     if mark[4].virt_lines then return mark end
-  end
-  return nil
-end
-
-local function comment_box_mark_text(mark)
-  local chunks = {}
-  for _, virt_line in ipairs(mark and mark[4] and mark[4].virt_lines or {}) do
-    for _, chunk in ipairs(virt_line) do
-      chunks[#chunks + 1] = chunk[1]
-    end
-  end
-  return table.concat(chunks, "\n")
-end
-
-local function comment_box_mark_containing(buf, needle)
-  local marks = vim.api.nvim_buf_get_extmarks(buf, walkthrough._ns, 0, -1, { details = true })
-  for _, mark in ipairs(marks) do
-    if mark[4].virt_lines and comment_box_mark_text(mark):find(needle, 1, true) then return mark end
   end
   return nil
 end
@@ -361,23 +335,14 @@ local function box_contains(buf, needle)
 end
 
 local function box_has_highlight_for_text(buf, text, hl_group)
-  local marks = vim.api.nvim_buf_get_extmarks(buf, walkthrough._ns, 0, -1, { details = true })
-  for _, mark in ipairs(marks) do
-    for _, virt_line in ipairs(mark[4].virt_lines or {}) do
-      for _, chunk in ipairs(virt_line) do
-        if chunk[1]:find(text, 1, true) and chunk[2] == hl_group then return true end
-      end
+  local mark = comment_box_mark(buf)
+  if not mark then return false end
+  for _, virt_line in ipairs(mark[4].virt_lines or {}) do
+    for _, chunk in ipairs(virt_line) do
+      if chunk[1]:find(text, 1, true) and chunk[2] == hl_group then return true end
     end
   end
   return false
-end
-
-local function segment_line_text(row)
-  local chunks = {}
-  for _, segment in ipairs(row.segments or {}) do
-    chunks[#chunks + 1] = segment[1] or ""
-  end
-  return table.concat(chunks)
 end
 
 local function expected_comment_start_screen_row(line_count, win_height)
@@ -493,10 +458,6 @@ local function open_status()
   local buf = vim.api.nvim_get_current_buf()
   assert_true(vim.bo[buf].filetype == "GitStatus", "status buffer did not open")
   wait_for(function() return buffer_contains(buf, "Unstaged changes (2)") end, "status did not render")
-  local win = vim.fn.bufwinid(buf)
-  assert_true(win ~= -1 and vim.wo[win].wrap == false, "GitStatus window should not soft-wrap diff rows")
-  assert_true(vim.wo[win].linebreak == false, "GitStatus window should not set linebreak for diff rows")
-  assert_true(vim.wo[win].breakindent == false, "GitStatus window should not set breakindent for diff rows")
   return buf
 end
 
@@ -504,75 +465,11 @@ local function start_walkthrough(buf)
   captured_notifications = {}
   trigger_buf_mapping(buf, "ow")
   wait_for(function()
-    return buffer_contains(buf, "Overview:")
+    return buffer_contains(buf, "Overview:") and comment_box_mark(buf) ~= nil
   end, "walkthrough did not start")
   local _, float_buf = find_float_with("walkthrough fixture")
   assert_true(float_buf == nil, "walkthrough should not open a summary popup")
   return buf
-end
-
-local function walkthrough_file_row(buf, suffix, key_fragment)
-  local status = diff_review._status_states and diff_review._status_states[buf] or diff_review._status
-  local seen = {}
-  for row, entry in pairs(status and status.entries or {}) do
-    if entry.kind == "file" and file_entry_matches(entry, suffix) then
-      local key = tostring(entry.file and entry.file.walkthrough_key_prefix or "")
-      if not key_fragment or key:find(key_fragment, 1, true) then return row end
-    end
-    if entry.kind == "file" and entry.file then
-      seen[#seen + 1] = ("%s|%s"):format(tostring(entry.file.relpath or entry.file.filename), tostring(entry.file.walkthrough_key_prefix))
-    end
-  end
-  error(("missing walkthrough file row for %s (wanted %s; saw %s)"):format(
-    suffix,
-    tostring(key_fragment),
-    table.concat(seen, ", ")
-  ), 2)
-end
-
-local function walkthrough_hunk_row(buf, suffix, key_fragment)
-  local status = diff_review._status_states and diff_review._status_states[buf] or diff_review._status
-  local seen = {}
-  for row, entry in pairs(status and status.entries or {}) do
-    if entry.kind == "hunk" and file_entry_matches(entry, suffix) then
-      local key = tostring(entry.file and entry.file.walkthrough_key_prefix or "")
-      if not key_fragment or key:find(key_fragment, 1, true) then return row end
-    end
-    if entry.kind == "hunk" and entry.file then
-      seen[#seen + 1] = ("%s|%s"):format(tostring(entry.file.relpath or entry.file.filename), tostring(entry.file.walkthrough_key_prefix))
-    end
-  end
-  error(("missing walkthrough hunk row for %s (wanted %s; saw %s)"):format(
-    suffix,
-    tostring(key_fragment),
-    table.concat(seen, ", ")
-  ), 2)
-end
-
-local function set_cursor_row(buf, row)
-  local win = vim.fn.bufwinid(buf)
-  assert_true(win ~= -1, "status window missing")
-  vim.api.nvim_win_set_cursor(win, { row, 0 })
-end
-
-local function ensure_walkthrough_file_expanded(buf, suffix, key_fragment, visible_text)
-  if visible_text and buffer_contains(buf, visible_text) then return end
-  set_cursor_row(buf, walkthrough_file_row(buf, suffix, key_fragment))
-  trigger_buf_mapping(buf, "<Tab>")
-  if visible_text then
-    wait_for(function() return buffer_contains(buf, visible_text) end,
-      "walkthrough file did not expand: " .. suffix)
-  end
-end
-
-local function ensure_walkthrough_file_folded(buf, suffix, key_fragment, hidden_text)
-  if hidden_text and not buffer_contains(buf, hidden_text) then return end
-  set_cursor_row(buf, walkthrough_file_row(buf, suffix, key_fragment))
-  trigger_buf_mapping(buf, "<Tab>")
-  if hidden_text then
-    wait_for(function() return not buffer_contains(buf, hidden_text) end,
-      "walkthrough file did not fold: " .. suffix)
-  end
 end
 
 local function run()
@@ -582,134 +479,18 @@ local function run()
   walkthrough.set_reader(fixture_reader)
   diff_review.setup({ about_auto_generate = false })
 
-  -- ── compact task presentation table ────────────────────────────────────────
-  local compact_rows = walkthrough.task_presentation_rows({
-    title = "Let particle spawns select their render path.",
-    justification = "Spawn data needs to choose the visual path before render handoff.",
-    groups = {
-      {
-        type = "Module",
-        title = "PhysicsPlugin",
-        subtasks = {
-          {
-            title = "Make particle render modes explicit at spawn time.",
-            items = {
-              {
-                action = "Add",
-                type = "Enum",
-                title = "ParticleRenderMode",
-                note = "select billboard or model rendering",
-                steps = {},
-              },
-              {
-                action = "Update",
-                type = "Struct",
-                title = "ParticleSpawn",
-                note = "carry render mode with spawn data",
-                steps = {},
-              },
-            },
-          },
-        },
-      },
-      {
-        type = "Module",
-        title = "ParticleDrop3d",
-        subtasks = {
-          {
-            title = "Exercise the model-backed path in the 3D drop scene.",
-            items = {
-              {
-                action = "Update",
-                type = "Function",
-                title = "ParticleDrop3d::setup()",
-                note = "spawn SmoothSphere model particles",
-                steps = {},
-              },
-            },
-          },
-        },
-      },
-    },
-  })
-  assert_true(segment_line_text(compact_rows[1]) == "", "compact table should start after a blank spacer")
-  assert_true(segment_line_text(compact_rows[2])
-      == "- Add    enum   ParticleRenderMode to select billboard or model rendering",
-    "compact table first item row did not align action/type columns")
-  assert_true(segment_line_text(compact_rows[3])
-      == "- Modify struct ParticleSpawn to carry render mode with spawn data",
-    "compact table continuation row should render as a bullet")
-  assert_true(segment_line_text(compact_rows[4])
-      == "- Modify fn     ParticleDrop3d::setup() to spawn SmoothSphere model particles",
-    "compact table should flatten later group items into the same bullet list")
-  local compact_text = table.concat({
-    segment_line_text(compact_rows[1]),
-    segment_line_text(compact_rows[2]),
-    segment_line_text(compact_rows[3]),
-    segment_line_text(compact_rows[4]),
-  }, "\n")
-  assert_true(not compact_text:find("└─", 1, true), "compact table should not render tree glyphs")
-  assert_true(not compact_text:find("PhysicsPlugin", 1, true), "compact table should not render group headings")
-  for _, row in ipairs(compact_rows) do
-    assert_true(segment_line_text(row) ~= "ParticleDrop3d", "compact table should not render later group headings")
-  end
-  assert_true(compact_rows[2].segments[2][2] == "DiffReviewWalkthroughActionAdd",
-    "compact table action should use action highlight")
-  assert_true(compact_rows[2].segments[4][2] == "DiffReviewWalkthroughActionAdd",
-    "compact table type should use action highlight")
-
   -- ── happy path: presentation, exact step, region highlight, comment box ───
   set_walkthrough_doc(valid_doc())
   local buf = open_status()
   local original_q_desc = vim.api.nvim_buf_call(buf, function()
     return vim.fn.maparg("q", "n", false, true).desc
   end)
-  local task1_title =
-    "1. Update a.txt through the first task. Reviewers need the fixture story before individual file rewrites."
-
-  vim.o.columns = 80
-  start_walkthrough(buf)
-  wait_for(function() return buffer_contains(buf, "Overview:") end, "narrow walkthrough presentation overview missing")
-  local win = vim.fn.bufwinid(buf)
-  assert_true(win ~= -1 and vim.wo[win].wrap == false, "GitStatus walkthrough should keep diff rows unwrapped")
-  assert_true(vim.wo[win].linebreak == false, "GitStatus walkthrough should not enable window linebreak")
-  assert_true(vim.wo[win].breakindent == false, "GitStatus walkthrough should not enable window breakindent")
-  local narrow_wininfo = vim.fn.getwininfo(win)[1]
-  local narrow_width = math.max(20,
-    vim.api.nvim_win_get_width(win) - (tonumber(narrow_wininfo and narrow_wininfo.textoff) or 0) - 1)
-  local narrow_heading_lines = walkthrough.wrap_text(task1_title, narrow_width)
-  assert_true(#narrow_heading_lines > 1, "walkthrough task heading should hard-wrap in narrow status window")
-  for _, heading_line in ipairs(narrow_heading_lines) do
-    assert_true(buffer_contains(buf, heading_line),
-      ("walkthrough task heading wrapped line missing from buffer: %s"):format(heading_line))
-  end
-  assert_true(not buffer_contains(buf, task1_title), "narrow walkthrough should not keep long task heading on one row")
-  trigger_buf_mapping(buf, "q")
-  wait_for(function() return buffer_contains(buf, "Unstaged changes (2):") end,
-    "narrow walkthrough quit should restore the flat GitStatus presentation")
 
   vim.o.columns = 120
   start_walkthrough(buf)
   wait_for(function() return buffer_contains(buf, "Overview:") end, "walkthrough presentation overview missing")
-  win = vim.fn.bufwinid(buf)
-  assert_true(win ~= -1 and vim.wo[win].wrap == false, "GitStatus walkthrough should keep diff rows unwrapped")
-  assert_true(vim.wo[win].linebreak == false, "GitStatus walkthrough should not enable window linebreak")
-  assert_true(vim.wo[win].breakindent == false, "GitStatus walkthrough should not enable window breakindent")
-  assert_true(buffer_contains(buf, task1_title), "walkthrough presentation task 1 missing")
-  local overview_row = find_row(buf, "Overview:")
-  local first_task_row = find_row(buf, "1. Update a.txt through the first task.")
-  local overview_lines = vim.api.nvim_buf_get_lines(buf, overview_row, first_task_row - 1, false)
-  local nonblank_overview_lines = 0
-  local wininfo = vim.fn.getwininfo(win)[1]
-  local overview_width = math.max(20, vim.api.nvim_win_get_width(win) - (tonumber(wininfo and wininfo.textoff) or 0) - 1)
-  for _, line in ipairs(overview_lines) do
-    if vim.trim(line) ~= "" then
-      nonblank_overview_lines = nonblank_overview_lines + 1
-      assert_true(vim.fn.strdisplaywidth(line) <= overview_width,
-        ("walkthrough overview line exceeds status width %d: %s"):format(overview_width, line))
-    end
-  end
-  assert_true(nonblank_overview_lines > 1, "walkthrough overview should wrap into multiple lines")
+  assert_true(buffer_contains(buf, "1. Update a.txt through the first task."),
+    "walkthrough presentation task 1 missing")
   assert_true(buffer_contains(buf, "2. Update b.txt through the second task."),
     "walkthrough presentation task 2 missing")
   assert_true(buffer_contains(buf, "Unstaged Changes (1):"),
@@ -739,18 +520,15 @@ local function run()
   assert_true(not saw_notification_containing("Walkthrough generated against"), "fresh walkthrough should not warn")
   assert_true(not buffer_contains(buf, "Major changes:"),
     "walkthrough presentation should not show redundant major changes heading")
-  for _, rendered_line in ipairs(vim.api.nvim_buf_get_lines(buf, 0, -1, false)) do
-    assert_true(rendered_line ~= " Reviewers need the fixture story before individual file rewrites.",
-      "walkthrough presentation should not render task justification on a separate row")
-  end
-  assert_true(not buffer_contains(buf, " file Fixture edits"), "walkthrough presentation should not show group type row")
-  assert_true(not buffer_contains(buf, "    └─ Rewrite the first fixture file."),
-    "walkthrough presentation should not show subtask tree rows")
-  assert_true(not buffer_contains(buf, "Fixture edits"), "walkthrough presentation should not show group headings")
-  assert_true(buffer_contains(buf, "- Modify Resource a.txt rewrite to rewrite"),
-    "walkthrough presentation compact table row missing display verb")
-  assert_true(buffer_contains(buf, "- Add fn b.txt rewrite to repeat"),
-    "walkthrough presentation compact add row missing")
+  assert_true(buffer_contains(buf, " Reviewers need the fixture story before individual file rewrites."),
+    "walkthrough presentation task justification missing")
+  assert_true(buffer_contains(buf, " file Fixture edits"), "walkthrough presentation group type row missing")
+  assert_true(buffer_contains(buf, "    └─ Rewrite the first fixture file."),
+    "walkthrough presentation subtask row missing")
+  assert_true(buffer_contains(buf, "       └─ Modify Resource a.txt rewrite to rewrite"),
+    "walkthrough presentation item action row missing display verb")
+  assert_true(buffer_contains(buf, "       └─ Add fn b.txt rewrite to repeat"),
+    "walkthrough presentation add action row should not be padded")
   assert_true(buffer_contains(buf, "the second line"),
     "walkthrough presentation item inline note prefix missing")
   local action_hl = vim.api.nvim_get_hl(0, { name = "DiffReviewWalkthroughActionUpdate" })
@@ -763,41 +541,16 @@ local function run()
   assert_true(justification_hl.fg == 0xe5c07b and justification_hl.italic == true,
     "walkthrough justification should be yellow italic")
   assert_true(not buffer_contains(buf, "Legend:"), "walkthrough presentation should not show an action legend")
-  assert_true(comment_box_mark(buf) == nil, "folded walkthrough files should not render comment boxes")
-  ensure_walkthrough_file_expanded(buf, "a.txt", "walkthrough:task:1:unstaged", "NEW a.txt")
-  wait_for(function() return box_contains(buf, "task total") end,
-    "expanding a walkthrough file should render its comment blocks")
-  assert_true(not box_contains(buf, "forward navigation"),
-    "folded b.txt should not render a comment block yet")
-  local a_hunk_row = walkthrough_hunk_row(buf, "a.txt", "walkthrough:task:1:unstaged")
-  set_cursor_row(buf, a_hunk_row)
-  trigger_buf_mapping(buf, "<Tab>")
-  wait_for(function() return not buffer_contains(buf, "NEW a.txt") end,
-    "folding a walkthrough hunk should hide its diff rows")
-  wait_for(function() return not box_contains(buf, "concrete changed line") end,
-    "folding a walkthrough hunk should clear its comment blocks")
-  set_cursor_row(buf, a_hunk_row)
-  trigger_buf_mapping(buf, "<Tab>")
-  wait_for(function() return buffer_contains(buf, "NEW a.txt") end,
-    "re-expanding a walkthrough hunk should restore its diff rows")
-  wait_for(function() return box_contains(buf, "concrete changed line") end,
-    "re-expanding a walkthrough hunk should recreate its comment blocks")
-  ensure_walkthrough_file_folded(buf, "a.txt", "walkthrough:task:1:unstaged", "NEW a.txt")
-  wait_for(function() return not box_contains(buf, "concrete changed line") end,
-    "folding a walkthrough file should clear its comment blocks")
-  ensure_walkthrough_file_expanded(buf, "a.txt", "walkthrough:task:1:unstaged", "NEW a.txt")
-  wait_for(function() return box_contains(buf, "concrete changed line") end,
-    "re-expanding a walkthrough file should recreate its comment blocks")
 
-  local step_row = find_row(buf, "NEW a.txt")
   wait_for(function()
-    return vim.api.nvim_win_get_cursor(vim.fn.bufwinid(buf))[1] == step_row
-  end, "step 1 did not move to the changed a.txt row")
+    return first_row_with_line_highlight(buf, "DiffReviewWalkthroughRegionAdd") ~= nil
+  end, "step 1 did not highlight the changed a.txt row")
+  local step_row = first_row_with_line_highlight(buf, "DiffReviewWalkthroughRegionAdd")
   local cursor_row = vim.api.nvim_win_get_cursor(vim.fn.bufwinid(buf))[1]
   assert_true(cursor_row == step_row, ("cursor not on step row (expected %d, got %d)"):format(step_row, cursor_row))
-  assert_true(walkthrough_extmark_count(buf) > 0, "comment box extmarks missing")
-  assert_true(first_row_with_line_highlight(buf, "DiffReviewWalkthroughRegionAdd") == nil,
-    "walkthrough should not highlight the selected diff region")
+  assert_true(walkthrough_extmark_count(buf) > 0, "region extmarks missing")
+  assert_true(row_has_line_highlight(buf, step_row, "DiffReviewWalkthroughRegionAdd"),
+    "added walkthrough row should preserve add background")
   assert_true(not row_has_line_highlight(buf, step_row, "DiffReviewWalkthroughRegion"),
     "added walkthrough row should not use generic blue region background")
   assert_true(box_contains(buf, "concrete changed line"), "inline comment box missing")
@@ -808,7 +561,7 @@ local function run()
   local deviation_hl = vim.api.nvim_get_hl(0, { name = "DiffReviewWalkthroughCalloutDeviation" })
   assert_true(deviation_hl.fg == 0xff5555 and deviation_hl.bold == true,
     "deviation callout should be red and bold")
-  local box_mark = comment_box_mark_containing(buf, "concrete changed line")
+  local box_mark = comment_box_mark(buf)
   assert_true(box_mark ~= nil, "inline comment box mark missing")
   assert_true(box_mark[2] == step_row - 1, "inline comment box should anchor below the selected row")
   assert_true(box_mark[4].virt_lines_above ~= true, "inline comment box should render below the selected row")
@@ -854,18 +607,17 @@ local function run()
   wait_for(function() return box_contains(buf, "task total") end, "step 2 box did not render")
   assert_true(box_contains(buf, "1.2-2 Check the total marker on the next comment."),
     "step 2 task total label missing")
-  assert_true(box_contains(buf, "Deviation:"), "step 1 callout should stay visible while on step 2")
+  assert_true(not box_contains(buf, "Deviation:"), "step 2 should not inherit step 1 callout")
   local task1_step2_row = find_row(buf, "NEW a.txt")
   cursor_row = vim.api.nvim_win_get_cursor(vim.fn.bufwinid(buf))[1]
   assert_true(cursor_row == task1_step2_row, "cursor not on task 1 step 2 row")
 
-  ensure_walkthrough_file_expanded(buf, "b.txt", "walkthrough:task:2:unstaged", "NEW b.txt")
   trigger_buf_mapping(buf, "y")
   wait_for(function() return box_contains(buf, "forward navigation") end, "step 3 box did not render")
   assert_true(box_contains(buf, "2.1-1 Mirror the rewrite in the second fixture."), "step 3 task label missing")
   assert_true(not box_contains(buf, "Task 2.1-1 Mirror the rewrite in the second fixture."),
     "step 2 task label should not include Task")
-  local step3_box_mark = comment_box_mark_containing(buf, "forward navigation")
+  local step3_box_mark = comment_box_mark(buf)
   assert_true(comment_box_header_text(step3_box_mark):find("Rewrite the second fixture file.", 1, true) == nil,
     "step 3 header should not show subtask context")
   local step3_row = find_row(buf, "NEW b.txt")
@@ -1043,11 +795,9 @@ local function run()
   }
   set_walkthrough_doc(degraded)
   start_walkthrough(buf)
-  ensure_walkthrough_file_expanded(buf, "a.txt", nil, "NEW a.txt")
   wait_for(function() return box_contains(buf, "position approximated") end, "nearest match note missing")
   trigger_buf_mapping(buf, "y")
-  assert_true(not box_contains(buf, "not in current diff"),
-    "missing walkthrough targets should not render comment boxes without visible diff rows")
+  wait_for(function() return box_contains(buf, "not in current diff") end, "missing file note missing")
   trigger_buf_mapping(buf, "q")
   close_all_floats()
 
@@ -1118,14 +868,12 @@ local function run()
   }
   set_walkthrough_doc(staged_doc)
   start_walkthrough(buf)
-  ensure_walkthrough_file_expanded(buf, "c.txt", "walkthrough:task:1:staged", "NEW c.txt")
   wait_for(function() return box_contains(buf, "staged section") end, "staged step box did not render")
   local staged_row = find_row(buf, "NEW c.txt")
   cursor_row = vim.api.nvim_win_get_cursor(vim.fn.bufwinid(buf))[1]
   assert_true(cursor_row == staged_row, ("cursor not on the staged hunk row (expected %d, got %d)"):format(staged_row, cursor_row))
   assert_true(not box_contains(buf, "stale"), "staged region must not be flagged stale")
 
-  ensure_walkthrough_file_expanded(buf, "a.txt", "walkthrough:task:1:unstaged", "NEW2 a.txt")
   trigger_buf_mapping(buf, "y")
   wait_for(function() return box_contains(buf, "ends inside the second hunk") end, "split-region step box did not render")
   local second_hunk_row = find_row(buf, "NEW2 a.txt")
@@ -1145,7 +893,7 @@ local function run()
     cursor_row == long_start_row,
     ("long region did not anchor at the first rendered changed row (expected %d, got %d)"):format(long_start_row, cursor_row)
   )
-  local long_box_mark = comment_box_mark_containing(buf, "Long selected region keeps its start visible")
+  local long_box_mark = comment_box_mark(buf)
   assert_true(long_box_mark ~= nil, "long-region comment box mark missing")
   local long_anchor_row = long_box_mark[2] + 1
   assert_true(long_anchor_row >= long_start_row,
@@ -1174,7 +922,6 @@ local function run()
   -- ── re-render while active re-applies decorations ──────────────────────────
   set_walkthrough_doc(valid_doc())
   start_walkthrough(buf)
-  ensure_walkthrough_file_expanded(buf, "a.txt", "walkthrough:task:1:unstaged", "NEW a.txt")
   wait_for(function() return walkthrough_extmark_count(buf) > 0 end, "no extmarks before re-render")
   diff_review.render_status(buf, nil, nil, { reuse_sections = true })
   wait_for(function() return walkthrough_extmark_count(buf) > 0 end, "re-render dropped walkthrough extmarks")
