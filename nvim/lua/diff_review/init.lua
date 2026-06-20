@@ -2103,6 +2103,9 @@ function M._apply_status_window_options(win, state)
   vim.wo[win].wrap = soft_wrap
   vim.wo[win].linebreak = soft_wrap
   vim.wo[win].breakindent = soft_wrap
+  if M._gitstatus_debug and M._gitstatus_debug.enabled and M._gitstatus_debug.enabled() then
+    M._gitstatus_debug.dump(vim.api.nvim_win_get_buf(win), "apply_status_window_options")
+  end
 end
 
 ---@param win integer?
@@ -8818,7 +8821,12 @@ function M._status_walkthrough_model(sections)
   local records = M._status_walkthrough_step_records(doc)
   local task_items = {}
   for task_index, task in ipairs(doc.tasks or {}) do
-    local title = ("%d. %s"):format(task_index, task.title or "")
+    local title_text = tostring(task.title or "")
+    local justification = vim.trim(tostring(task.justification or ""))
+    if justification ~= "" then
+      title_text = vim.trim(title_text .. " " .. justification)
+    end
+    local title = ("%d. %s"):format(task_index, title_text)
     task_items[task_index] = vim.tbl_extend("force",
       M._status_walkthrough_item(("walkthrough:task:%d"):format(task_index), title, task_index),
       { task = task, task_index = task_index })
@@ -9520,17 +9528,39 @@ function M._status_render_walkthrough_child_sections(item)
   end
 end
 
+---@return integer
+function M._status_window_content_width()
+  local width = vim.o.columns
+  local buf = M._status and M._status.buf or nil
+  if buf and vim.api.nvim_buf_is_valid(buf) then
+    local win = vim.fn.bufwinid(buf)
+    if win ~= -1 and vim.api.nvim_win_is_valid(win) then
+      width = vim.api.nvim_win_get_width(win)
+      local wininfo = vim.fn.getwininfo(win)[1]
+      width = width - (tonumber(wininfo and wininfo.textoff) or 0)
+    end
+  end
+  return math.max(20, width - 1)
+end
+
 ---@param item table
-function M._status_render_walkthrough_task(item)
+---@param content_width integer
+function M._status_render_walkthrough_task(item, content_width)
   local section = item.section
   local section_key = status_section_key(section.name)
   local folded = status_folded(section_key, section.default_folded)
   local entry = { id = section_key, kind = "section", section = section }
-  local header_line = status_add_line(section.title, entry, "DiffReviewStatusHeader")
-  status_add_highlight(header_line, 0, #section.title, "DiffReviewWalkthroughItemTitle")
-  if folded then return end
 
   local ok, walkthrough = pcall(require, "diff_review.walkthrough")
+  local header_lines = ok and type(walkthrough.wrap_text) == "function"
+      and walkthrough.wrap_text(section.title, content_width)
+    or { section.title }
+  for _, header_text in ipairs(header_lines) do
+    local header_line = status_add_line(header_text, entry, "DiffReviewStatusHeader")
+    status_add_highlight(header_line, 0, #header_text, "DiffReviewWalkthroughItemTitle")
+  end
+  if folded then return end
+
   local rows = ok and item.task and walkthrough.task_presentation_rows(item.task) or {}
   for _, row in ipairs(rows or {}) do
     status_add_segment_line(row.segments or { { "" } })
@@ -9554,13 +9584,19 @@ end
 ---@param model table
 function M._status_render_walkthrough_model(model)
   status_add_line("Overview:", nil, "DiffReviewStatusHeader")
+  local content_width = M._status_window_content_width()
+  local ok, walkthrough = pcall(require, "diff_review.walkthrough")
   for _, line in ipairs(model.overview or {}) do
-    status_add_line(line)
+    local wrapped_lines = ok and type(walkthrough.wrap_text) == "function" and walkthrough.wrap_text(line, content_width)
+      or { line }
+    for _, wrapped_line in ipairs(wrapped_lines) do
+      status_add_line(wrapped_line)
+    end
   end
 
   for _, item in ipairs(model.tasks or {}) do
     status_add_line("")
-    M._status_render_walkthrough_task(item)
+    M._status_render_walkthrough_task(item, content_width)
   end
 
   if M._status_walkthrough_item_has_files(model.other) then
@@ -10284,13 +10320,21 @@ function M._gitstatus_debug.dump(buf, reason)
     }
 
     if win and vim.api.nvim_win_is_valid(win) then
+      local wininfo = vim.fn.getwininfo(win)[1] or {}
+      local textoff = tonumber(wininfo.textoff) or 0
+      local width = vim.api.nvim_win_get_width(win)
+      local usable_width = math.max(1, width - textoff - 1)
       lines[#lines + 1] = "window_options=" .. M._gitstatus_debug.one_line({
+        breakindent = vim.wo[win].breakindent,
         conceallevel = vim.wo[win].conceallevel,
         concealcursor = vim.wo[win].concealcursor,
         foldenable = vim.wo[win].foldenable,
         foldlevel = vim.wo[win].foldlevel,
         foldmethod = vim.wo[win].foldmethod,
         linebreak = vim.wo[win].linebreak,
+        textoff = textoff,
+        usable_width = usable_width,
+        width = width,
         wrap = vim.wo[win].wrap,
         winbar = vim.wo[win].winbar,
       })
@@ -10329,6 +10373,33 @@ function M._gitstatus_debug.dump(buf, reason)
       end
       vim.list_extend(lines, M._gitstatus_debug.extmarks_for_row(buf, row))
     end
+
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "long rows:"
+    local long_row_count = 0
+    local usable_width = nil
+    if win and vim.api.nvim_win_is_valid(win) then
+      local wininfo = vim.fn.getwininfo(win)[1] or {}
+      local textoff = tonumber(wininfo.textoff) or 0
+      usable_width = math.max(1, vim.api.nvim_win_get_width(win) - textoff - 1)
+    end
+    for row, line in ipairs(vim.api.nvim_buf_get_lines(buf, 0, -1, false)) do
+      local display_width = vim.fn.strdisplaywidth(line)
+      if not usable_width or display_width > usable_width then
+        long_row_count = long_row_count + 1
+        local screen_rows = usable_width and math.max(1, math.ceil(display_width / usable_width)) or nil
+        lines[#lines + 1] = ("%4d | width=%d usable=%s screen_rows=%s | %s"):format(
+          row,
+          display_width,
+          tostring(usable_width),
+          tostring(screen_rows),
+          M._gitstatus_debug.text(line)
+        )
+        local entry = state.entries and state.entries[row] or nil
+        lines[#lines + 1] = "    " .. M._gitstatus_debug.entry(entry)
+      end
+    end
+    if long_row_count == 0 then lines[#lines + 1] = "  none" end
 
     lines[#lines + 1] = ""
     lines[#lines + 1] = "diff rows missing Tree-sitter extmarks:"
@@ -16216,9 +16287,6 @@ function M._walkthrough_host(buf)
     get_state = function()
       return M._status_states and M._status_states[buf] or M._status
     end,
-    file_key = status_file_key,
-    hunk_key = status_hunk_key,
-    set_folded = set_status_folded,
     rerender = function()
       render_status_or_notify(buf, nil, nil, { reuse_sections = true })
     end,
@@ -16874,6 +16942,7 @@ function M.open()
     notify_error("DiffReview open failed: " .. tostring(err))
     return
   end
+  local state = M._main_status or (M._status_states and M._status_states[buf]) or M._status
   M._apply_status_window_options(win, state)
   vim.wo[win].foldcolumn = "0"
   render_status_or_notify(buf)
