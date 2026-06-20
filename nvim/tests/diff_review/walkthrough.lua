@@ -203,6 +203,17 @@ local function find_row(buf, needle)
   error("missing row: " .. needle .. "\n" .. table.concat(lines, "\n"), 2)
 end
 
+local function assert_row_before(buf, first_needle, second_needle, message)
+  local first_row = find_row(buf, first_needle)
+  local second_row = find_row(buf, second_needle)
+  assert_true(first_row < second_row, message .. (" (%s row %d, %s row %d)"):format(
+    first_needle,
+    first_row,
+    second_needle,
+    second_row
+  ))
+end
+
 local function find_line(buf, needle)
   local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
   return lines[find_row(buf, needle)]
@@ -503,7 +514,18 @@ local function run()
     "1. Update a.txt through the first task.", "DiffReviewWalkthroughItemTitle"),
     "summary task title should be bold white")
   assert_true(buffer_contains(summary_buf, "Reviewers need the fixture story before individual file rewrites."),
-    "summary task justification missing")
+    "summary task justification missing from folded task row")
+  assert_true(buffer_has_highlight_for_text(summary_buf, "Reviewers need the fixture story", "Reviewers",
+    "DiffReviewWalkthroughJustification"), "summary task justification highlight missing")
+  assert_true(not buffer_contains(summary_buf, "The first fixture row carries the opening example for"),
+    "folded task should hide subtask justification")
+  assert_true(not buffer_contains(summary_buf, " file Fixture edits"), "folded task should hide group rows")
+  toggle_row(buf, "1. Update a.txt through the first task.")
+  wait_for(function() return buffer_contains(summary_buf, " file Fixture edits") end,
+    "expanding first walkthrough task did not show group rows")
+  toggle_row(buf, "2. Update b.txt through the second task.")
+  wait_for(function() return buffer_contains(summary_buf, "       └─ Add fn b.txt rewrite to repeat") end,
+    "expanding second walkthrough task did not show item rows")
   assert_true(buffer_contains(summary_buf, "The first fixture row carries the opening example for"),
     "summary subtask justification missing")
   assert_true(buffer_contains(summary_buf, "rendering."),
@@ -519,6 +541,8 @@ local function run()
     "summary item inline note prefix missing")
   assert_true(buffer_contains(summary_buf, "first fixture file"),
     "summary item inline note missing")
+  wait_for(function() return buffer_has_highlight(summary_buf, "DiffReviewWalkthroughActionUpdate") end,
+    "summary action highlight missing")
   assert_true(buffer_has_highlight(summary_buf, "DiffReviewWalkthroughActionUpdate"), "summary action highlight missing")
   assert_true(buffer_has_highlight(summary_buf, "DiffReviewWalkthroughItemTitle"), "summary item title highlight missing")
   assert_true(buffer_has_highlight_for_text(summary_buf, "Fixture edits", "file", "DiffReviewWalkthroughType"),
@@ -643,6 +667,16 @@ local function run()
   trigger_buf_mapping(buf, "ow")
   wait_for(function() return not buffer_contains(buf, "Walkthrough:") end, "walkthrough did not toggle off")
   wait_for(function() return walkthrough_extmark_count(buf) == 0 end, "toggle off did not clear walkthrough extmarks")
+  assert_row_before(buf, "a.txt +", "b.txt +", "inactive status should use path order")
+
+  local reversed_doc = valid_doc()
+  reversed_doc.tasks = { reversed_doc.tasks[2], reversed_doc.tasks[1] }
+  set_walkthrough_doc(reversed_doc)
+  summary_buf = start_walkthrough(buf)
+  assert_row_before(buf, "b.txt +", "a.txt +", "active walkthrough should sort files by comment order")
+  trigger_buf_mapping(buf, "ow")
+  wait_for(function() return not buffer_contains(buf, "Walkthrough:") end, "reversed walkthrough did not toggle off")
+  assert_row_before(buf, "a.txt +", "b.txt +", "turning off walkthrough should restore path order")
 
   -- ── document staleness warning ─────────────────────────────────────────────
   local stale_doc = valid_doc()

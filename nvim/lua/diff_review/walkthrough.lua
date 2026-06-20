@@ -95,6 +95,7 @@
 ---@field stale boolean
 ---@field head_sha? string
 ---@field saved_maps table<string, table> maparg dicts to restore on stop
+---@field file_order? table<string, integer> first walkthrough step index by normalized repo-relative file
 
 ---@class DiffReviewWalkthroughCommentBoxPlacement
 ---@field anchor_row integer
@@ -295,6 +296,38 @@ local function append_summary_item(lines, item, prefix, is_last)
     .. item.note
 end
 
+---@param task_index integer
+---@param task DiffReviewWalkthroughTask
+---@return string
+local function task_summary_title(task_index, task)
+  local line = ("%d. %s"):format(task_index, task.title)
+  if task.justification and task.justification ~= "" then
+    line = line .. " " .. task.justification
+  end
+  return line
+end
+
+---@param lines string[]
+---@param task DiffReviewWalkthroughTask
+local function append_task_summary_body(lines, task)
+  local task_body_prefix = " "
+  for _, group in ipairs(task.groups) do
+    local group_prefix = task_body_prefix
+    lines[#lines + 1] = group_prefix .. format_type_keyword(group.type) .. " " .. group.title
+    local subtask_prefix = group_prefix .. "   "
+    for subtask_index, subtask in ipairs(group.subtasks) do
+      local subtask_is_last = subtask_index == #group.subtasks
+      lines[#lines + 1] = subtask_prefix .. tree_branch(subtask_is_last) .. subtask.title
+      local item_prefix = subtask_prefix .. tree_continuation(subtask_is_last)
+      if subtask.justification then lines[#lines + 1] = item_prefix .. subtask.justification end
+      for item_index, item in ipairs(subtask.items) do
+        local item_is_last = item_index == #subtask.items
+        append_summary_item(lines, item, item_prefix, item_is_last)
+      end
+    end
+  end
+end
+
 ---@param tasks DiffReviewWalkthroughTask[]
 ---@return { type: string, subtype: string?, label: string, title: string }[] specs
 local function collect_summary_item_specs(tasks)
@@ -364,24 +397,8 @@ local function build_summary(overview, _root, tasks)
   lines[#lines + 1] = ""
   for task_index, task in ipairs(tasks) do
     if task_index > 1 then lines[#lines + 1] = "" end
-    lines[#lines + 1] = ("%d. %s"):format(task_index, task.title)
-    local task_body_prefix = " "
-    if task.justification then lines[#lines + 1] = task_body_prefix .. task.justification end
-    for _, group in ipairs(task.groups) do
-      local group_prefix = task_body_prefix
-      lines[#lines + 1] = group_prefix .. format_type_keyword(group.type) .. " " .. group.title
-      local subtask_prefix = group_prefix .. "   "
-      for subtask_index, subtask in ipairs(group.subtasks) do
-        local subtask_is_last = subtask_index == #group.subtasks
-        lines[#lines + 1] = subtask_prefix .. tree_branch(subtask_is_last) .. subtask.title
-        local item_prefix = subtask_prefix .. tree_continuation(subtask_is_last)
-        if subtask.justification then lines[#lines + 1] = item_prefix .. subtask.justification end
-        for item_index, item in ipairs(subtask.items) do
-          local item_is_last = item_index == #subtask.items
-          append_summary_item(lines, item, item_prefix, item_is_last)
-        end
-      end
-    end
+    lines[#lines + 1] = task_summary_title(task_index, task)
+    append_task_summary_body(lines, task)
   end
 
   return table.concat(lines, "\n")
@@ -656,7 +673,7 @@ end
 
 -- ─── step -> rendered row resolution ─────────────────────────────────────────
 
-local section_preference = { "unstaged", "untracked", "staged" }
+local section_preference = { "unstaged", "staged" }
 
 --- Whether a rendered file path refers to the step's repo-relative file.
 --- Status entries may carry absolute paths, so match on a path-boundary
@@ -668,6 +685,47 @@ local function matches_file(candidate, step_file)
   if type(candidate) ~= "string" then return false end
   candidate = candidate:gsub("\\", "/")
   return candidate == step_file or candidate:sub(-(#step_file + 1)) == "/" .. step_file
+end
+
+---@param mode DiffReviewWalkthroughMode
+---@return table<string, integer>
+local function file_order_for_mode(mode)
+  if mode.file_order then return mode.file_order end
+  local file_order = {}
+  for index, step in ipairs(mode.doc.steps or {}) do
+    local step_file = tostring(step.file or ""):gsub("\\", "/")
+    if step_file ~= "" and file_order[step_file] == nil then
+      file_order[step_file] = index
+    end
+  end
+  mode.file_order = file_order
+  return file_order
+end
+
+---@param buf integer
+---@param file table?
+---@return integer?
+function M.file_sort_rank(buf, file)
+  local mode = M._modes[buf]
+  if not mode then return nil end
+
+  local file_order = file_order_for_mode(mode)
+  local best_rank = nil
+  for _, candidate in ipairs({ file and file.relpath, file and file.filename, file and file.original_relpath }) do
+    if type(candidate) == "string" then
+      candidate = candidate:gsub("\\", "/")
+      local direct_rank = file_order[candidate]
+      if direct_rank and (not best_rank or direct_rank < best_rank) then
+        best_rank = direct_rank
+      end
+      for step_file, rank in pairs(file_order) do
+        if (not best_rank or rank < best_rank) and matches_file(candidate, step_file) then
+          best_rank = rank
+        end
+      end
+    end
+  end
+  return best_rank
 end
 
 ---@param entry table?
@@ -1235,6 +1293,29 @@ local function summary_is_task_line(line)
   return line:match("^%d+%.%s+") ~= nil
 end
 
+---@param line string
+---@param tasks DiffReviewWalkthroughTask[]
+---@return integer? title_start_col
+---@return integer? title_end_col
+---@return integer? justification_start_col
+---@return integer? justification_end_col
+local function summary_task_ranges(line, tasks)
+  for task_index, task in ipairs(tasks or {}) do
+    local title = ("%d. %s"):format(task_index, task.title)
+    if vim.startswith(line, title) then
+      local justification_start = nil
+      if task.justification and line:sub(#title + 1, #title + 1) == " " then
+        justification_start = #title + 1
+      end
+      return 0, #title, justification_start, justification_start and #line or nil
+    end
+    if vim.startswith(title, line) then
+      return 0, #line, nil, nil
+    end
+  end
+  return nil, nil, nil, nil
+end
+
 ---@param buf integer
 ---@param lines string[]
 ---@param doc DiffReviewWalkthroughDoc
@@ -1245,7 +1326,20 @@ local function apply_summary_highlights(buf, lines, doc, row_offset)
   local item_specs = collect_summary_item_specs(doc.tasks)
   local justifications = collect_summary_justifications(doc.tasks)
   for row, line in ipairs(lines) do
-    if summary_is_task_line(line) then
+    local task_title_start_col, task_title_end_col, task_justification_start_col, task_justification_end_col =
+      summary_task_ranges(line, doc.tasks)
+    if task_title_start_col and task_title_end_col then
+      pcall(vim.api.nvim_buf_set_extmark, buf, M._ns, row_offset + row - 1, 0, {
+        end_col = task_title_end_col,
+        hl_group = "DiffReviewWalkthroughItemTitle",
+      })
+      if task_justification_start_col and task_justification_end_col then
+        pcall(vim.api.nvim_buf_set_extmark, buf, M._ns, row_offset + row - 1, task_justification_start_col, {
+          end_col = task_justification_end_col,
+          hl_group = "DiffReviewWalkthroughJustification",
+        })
+      end
+    elseif summary_is_task_line(line) then
       pcall(vim.api.nvim_buf_set_extmark, buf, M._ns, row_offset + row - 1, 0, {
         end_col = #line,
         hl_group = "DiffReviewWalkthroughItemTitle",
@@ -1311,6 +1405,110 @@ local function status_summary_lines(mode)
   return summary_lines(mode.doc.summary, width, collect_summary_item_titles(mode.doc.tasks))
 end
 
+---@param text string
+---@param width integer
+---@return string first_line
+---@return string rest
+local function split_first_wrapped_line(text, width)
+  local current = ""
+  for start_byte, word in text:gmatch("()(%S+)") do
+    local candidate = current == "" and word or (current .. " " .. word)
+    if current ~= "" and vim.fn.strdisplaywidth(candidate) > width then
+      return current, vim.trim(text:sub(start_byte))
+    end
+    current = candidate
+  end
+  return current, ""
+end
+
+---@param task_index integer
+---@param task DiffReviewWalkthroughTask
+---@param width integer
+---@return { text: string, segments: table[] }[]
+local function status_task_heading_rows(task_index, task, width)
+  local title = ("%d. %s"):format(task_index, task.title)
+  if not (task.justification and task.justification ~= "") then
+    local rows = {}
+    for _, line in ipairs(summary_lines(title, width, {})) do
+      rows[#rows + 1] = { text = line, segments = { { line, "DiffReviewWalkthroughItemTitle" } } }
+    end
+    return rows
+  end
+
+  local rows = {}
+  local title_width = vim.fn.strdisplaywidth(title)
+  if title_width + 2 >= width then
+    for _, line in ipairs(summary_lines(title, width, {})) do
+      rows[#rows + 1] = { text = line, segments = { { line, "DiffReviewWalkthroughItemTitle" } } }
+    end
+    for _, line in ipairs(wrap_text(task.justification, width)) do
+      rows[#rows + 1] = { text = line, segments = { { line, "DiffReviewWalkthroughJustification" } } }
+    end
+    return rows
+  end
+
+  local first_justification, rest = split_first_wrapped_line(task.justification, width - title_width - 1)
+  local first_line = first_justification ~= "" and (title .. " " .. first_justification) or title
+  local first_segments = { { title, "DiffReviewWalkthroughItemTitle" } }
+  if first_justification ~= "" then
+    first_segments[#first_segments + 1] = { " " }
+    first_segments[#first_segments + 1] = { first_justification, "DiffReviewWalkthroughJustification" }
+  end
+  rows[#rows + 1] = { text = first_line, segments = first_segments }
+  for _, line in ipairs(wrap_text(rest, width)) do
+    rows[#rows + 1] = { text = line, segments = { { line, "DiffReviewWalkthroughJustification" } } }
+  end
+  return rows
+end
+
+---@param mode DiffReviewWalkthroughMode
+---@return table[] rows
+local function status_summary_rows(mode)
+  local width = math.max(40, vim.o.columns - 4)
+  local item_titles = collect_summary_item_titles(mode.doc.tasks)
+  local rows = {}
+
+  for _, line in ipairs(summary_lines(vim.trim(mode.doc.overview or ""), width, item_titles)) do
+    rows[#rows + 1] = { text = line, parent_id = status_section_id }
+  end
+  if #rows > 0 and #(mode.doc.tasks or {}) > 0 then
+    rows[#rows + 1] = { text = "", parent_id = status_section_id }
+  end
+
+  for task_index, task in ipairs(mode.doc.tasks or {}) do
+    local task_id = ("walkthrough:task:%d"):format(task_index)
+    for heading_index, heading_row in ipairs(status_task_heading_rows(task_index, task, width)) do
+      rows[#rows + 1] = {
+        text = heading_row.text,
+        segments = heading_row.segments,
+        id = heading_index == 1 and task_id or ("%s:heading:%d"):format(task_id, heading_index),
+        parent_id = status_section_id,
+        kind = heading_index == 1 and "pr_head_section" or "pr_head_line",
+        fold_target_id = heading_index == 1 and false or task_id,
+        default_folded = heading_index == 1,
+      }
+    end
+
+    local body_lines = {}
+    append_task_summary_body(body_lines, task)
+    local body_text = table.concat(body_lines, "\n")
+    local body_index = 0
+    if body_text ~= "" then
+      for _, line in ipairs(summary_lines(body_text, width, item_titles)) do
+        body_index = body_index + 1
+        rows[#rows + 1] = {
+          text = line,
+          id = ("%s:body:%d"):format(task_id, body_index),
+          parent_id = task_id,
+          fold_target_id = task_id,
+        }
+      end
+    end
+  end
+
+  return rows
+end
+
 ---@param buf integer
 ---@param head_lines table[]
 ---@return table[]
@@ -1329,15 +1527,18 @@ function M.status_head_lines(buf, head_lines)
 
   local summary_index = 0
   local child_index = 0
-  local function append_child(text, segments, id)
+  local function append_child(text, segments, id, parent_id, fold_target_id, kind, default_folded)
     child_index = child_index + 1
     lines[#lines + 1] = {
       segments = segments or { { text } },
-      parent_id = status_section_id,
+      parent_id = parent_id or status_section_id,
+      default_folded = default_folded == true,
       entry = {
         id = id or ("walkthrough:child:%d"):format(child_index),
-        kind = "pr_head_line",
-        fold_target_id = status_section_id,
+        kind = kind or "pr_head_line",
+        fold_target_id = fold_target_id == false and nil or (fold_target_id or status_section_id),
+        default_folded = default_folded == true,
+        walkthrough_summary_line = text,
       },
     }
   end
@@ -1348,9 +1549,17 @@ function M.status_head_lines(buf, head_lines)
       mode.head_sha and mode.head_sha:sub(1, 7) or "unknown"
     ), "DiffReviewWalkthroughStale" } }, "walkthrough:stale")
   end
-  for _, line in ipairs(status_summary_lines(mode)) do
+  for _, row in ipairs(status_summary_rows(mode)) do
     summary_index = summary_index + 1
-    append_child(line, nil, ("walkthrough:summary:%d"):format(summary_index))
+    append_child(
+      row.text,
+      row.segments,
+      row.id or ("walkthrough:summary:%d"):format(summary_index),
+      row.parent_id,
+      row.fold_target_id,
+      row.kind,
+      row.default_folded
+    )
   end
   return lines
 end
@@ -1359,16 +1568,10 @@ end
 ---@param state table?
 local function apply_status_summary_highlights(mode, state)
   local entries = state and state.entries or {}
-  local lines = status_summary_lines(mode)
-  local first_row = nil
   for row, entry in pairs(entries) do
-    if entry and entry.id == "walkthrough:summary:1" then
-      first_row = row
-      break
+    if entry and entry.walkthrough_summary_line then
+      apply_summary_highlights(mode.host.buf, { entry.walkthrough_summary_line }, mode.doc, row - 1)
     end
-  end
-  if first_row then
-    apply_summary_highlights(mode.host.buf, lines, mode.doc, first_row - 1)
   end
 end
 
@@ -1667,6 +1870,9 @@ function M.start(host)
       stale = not head_sha or head_sha:lower() ~= doc.commit:lower(),
       saved_maps = {},
     }
+    for task_index, _ in ipairs(doc.tasks or {}) do
+      host.set_folded(("walkthrough:task:%d"):format(task_index), true)
+    end
     M._modes[host.buf] = mode
     host.rerender()
   end)

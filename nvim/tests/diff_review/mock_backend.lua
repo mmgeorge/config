@@ -214,26 +214,6 @@ local function wait_for(condition, message)
   assert_true(vim.wait(1000, condition, 10), message)
 end
 
-local function count_blank_lines_between(lines, first_heading, second_heading)
-  local first_index = nil
-  local second_index = nil
-  for index, line in ipairs(lines) do
-    if line:find(first_heading, 1, true) then
-      first_index = index
-    elseif line:find(second_heading, 1, true) then
-      second_index = index
-      break
-    end
-  end
-  assert_true(first_index ~= nil, "missing heading: " .. first_heading)
-  assert_true(second_index ~= nil, "missing heading: " .. second_heading)
-  local blanks = 0
-  for index = first_index + 1, second_index - 1 do
-    if lines[index] == "" then blanks = blanks + 1 end
-  end
-  return blanks
-end
-
 local function find_rows(lines, first_pattern, second_pattern)
   local first_row = nil
   local second_row = nil
@@ -297,17 +277,25 @@ local function run()
   diff_review.setup({ about_auto_generate = false })
   vim.wo.number = true
   vim.wo.relativenumber = true
+  vim.wo.signcolumn = "yes"
+  vim.wo.foldcolumn = "2"
   diff_review.open()
   local buf = vim.api.nvim_get_current_buf()
   assert_true(vim.bo[buf].filetype == "GitStatus", "GitStatus buffer did not open")
   assert_true(not vim.wo.number and not vim.wo.relativenumber, "GitStatus buffer should hide line numbers")
+  assert_true(vim.wo.signcolumn == "no", "GitStatus buffer should hide sign column")
+  assert_true(vim.wo.foldcolumn == "0", "GitStatus buffer should hide fold column")
 
   local real_buf = vim.api.nvim_create_buf(true, false)
   vim.bo[real_buf].filetype = "lua"
   vim.api.nvim_win_set_buf(0, real_buf)
   assert_true(vim.wo.number and vim.wo.relativenumber, "leaving GitStatus buffer should restore line numbers")
+  assert_true(vim.wo.signcolumn == "yes", "leaving GitStatus buffer should restore sign column")
+  assert_true(vim.wo.foldcolumn == "2", "leaving GitStatus buffer should restore fold column")
   vim.api.nvim_win_set_buf(0, buf)
   assert_true(not vim.wo.number and not vim.wo.relativenumber, "re-entering GitStatus buffer should hide line numbers")
+  assert_true(vim.wo.signcolumn == "no", "re-entering GitStatus buffer should hide sign column")
+  assert_true(vim.wo.foldcolumn == "0", "re-entering GitStatus buffer should hide fold column")
 
   local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
   assert_true(contains_line(lines, "Loading DiffReview..."), "DiffReview did not render a loading state before async data completed")
@@ -315,8 +303,8 @@ local function run()
   lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
   assert_true(contains_line(lines, "Head:"), "missing Head row")
   assert_true(contains_line(lines, "master"), "missing branch row")
-  assert_true(contains_line(lines, "Unstaged changes (2)"), "missing unstaged heading")
-  assert_true(contains_line(lines, "Untracked files (1)"), "missing untracked heading")
+  assert_true(contains_line(lines, "Unstaged changes (3)"), "missing merged unstaged heading")
+  assert_true(not contains_line(lines, "Untracked files (1)"), "untracked files should be merged into unstaged heading")
   assert_true(contains_line(lines, "Modified " .. root .. "/a.txt +1 -1"), "missing modified a.txt prefix")
   assert_true(contains_line(lines, "Modified " .. root .. "/b.txt +1 -1"), "missing modified b.txt prefix")
   assert_true(contains_line(lines, "New      " .. root .. "/c.txt new"), "missing new c.txt prefix")
@@ -339,7 +327,6 @@ local function run()
   assert_true(contains_line(lines, "a.txt +1 -1"), "missing a.txt file row")
   assert_true(contains_line(lines, "b.txt +1 -1"), "missing b.txt file row")
   assert_true(contains_line(lines, "c.txt new"), "missing untracked file row")
-  assert_true(count_blank_lines_between(lines, "Unstaged changes", "Untracked files") == 1, "wrong heading spacing")
 
   local first_row, second_row = find_rows(lines, "a.txt +1 -1", "b.txt +1 -1")
   vim.api.nvim_win_set_cursor(0, { first_row, 0 })
@@ -363,7 +350,7 @@ local function run()
   first_row, second_row = find_rows(lines, "a.txt +1 -1", "b.txt +1 -1")
   trigger_visual_mapping("U", first_row, second_row)
   lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-  assert_true(contains_line(lines, "Unstaged changes (2)"), "optimistic unstage did not update status immediately")
+  assert_true(contains_line(lines, "Unstaged changes (3)"), "optimistic unstage did not update status immediately")
   assert_true(not contains_line(lines, "Loading DiffReview..."), "unstage action replaced status UI with loading state")
 
   wait_for(function()
@@ -378,7 +365,7 @@ local function run()
   end, "unstage commands did not run")
   assert_true(saw_system_call("git\t-C\t" .. root .. "\trestore\t--staged\t--\ta.txt"), "missing git restore for a.txt")
   assert_true(saw_system_call("git\t-C\t" .. root .. "\trestore\t--staged\t--\tb.txt"), "missing git restore for b.txt")
-  wait_for(function() return buffer_contains(buf, "Unstaged changes (2)") end, "status did not reconcile after queued stage/unstage")
+  wait_for(function() return buffer_contains(buf, "Unstaged changes (3)") end, "status did not reconcile after queued stage/unstage")
 
   local discard_mapping = vim.fn.maparg("j", "x", false, true)
   assert_true(type(discard_mapping.callback) == "function", "missing visual discard mapping")

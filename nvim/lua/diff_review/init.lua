@@ -134,7 +134,7 @@
 ---@field parent_id? string
 ---@field default_folded? boolean
 
----@alias DiffReviewStatusSectionName "unstaged"|"staged"|"untracked"|"unmerged"|"recent"|"pr_commits"
+---@alias DiffReviewStatusSectionName "unstaged"|"staged"|"unmerged"|"recent"|"pr_commits"
 
 ---@class DiffReviewTreeSitterContextPending
 ---@field pending true
@@ -2079,6 +2079,8 @@ function M._hide_line_numbers(win)
     M._saved_wo[win] = {
       number = vim.wo[win].number,
       relativenumber = vim.wo[win].relativenumber,
+      signcolumn = vim.wo[win].signcolumn,
+      foldcolumn = vim.wo[win].foldcolumn,
       virtualedit = vim.wo[win].virtualedit,
       wrap = vim.wo[win].wrap,
       linebreak = vim.wo[win].linebreak,
@@ -2087,6 +2089,8 @@ function M._hide_line_numbers(win)
   end
   vim.wo[win].number = false
   vim.wo[win].relativenumber = false
+  vim.wo[win].signcolumn = "no"
+  vim.wo[win].foldcolumn = "0"
   vim.wo[win].virtualedit = "all"
 end
 
@@ -2107,6 +2111,8 @@ function M._restore_line_numbers(win)
   local saved = M._saved_wo[win]
   vim.wo[win].number = saved.number
   vim.wo[win].relativenumber = saved.relativenumber
+  vim.wo[win].signcolumn = saved.signcolumn or "auto"
+  vim.wo[win].foldcolumn = saved.foldcolumn or "0"
   vim.wo[win].virtualedit = saved.virtualedit or ""
   vim.wo[win].wrap = saved.wrap
   vim.wo[win].linebreak = saved.linebreak
@@ -5361,7 +5367,6 @@ end
 ---@type DiffReviewSectionConfig[]
 local status_section_order = {
   { name = "unstaged", title = "Unstaged changes", default_folded = false },
-  { name = "untracked", title = "Untracked files", default_folded = false },
   { name = "staged", title = "Staged changes", default_folded = false },
 }
 local status_file_indent = 0
@@ -7200,12 +7205,53 @@ local function status_add_fancy_row(row, entry, indent)
 end
 
 ---@param item table
----@return "unstaged"|"staged"|"untracked"
+---@return "unstaged"|"staged"
 local function status_section_for_item(item)
   local data = item.item or {}
-  if data.category == "Untracked Files" then return "untracked" end
   if data.staged then return "staged" end
   return "unstaged"
+end
+
+---@param buf integer?
+---@param file DiffReviewStatusFile
+---@return integer?
+function M._status_walkthrough_file_rank(buf, file)
+  if not buf then return nil end
+  local walkthrough = package.loaded["diff_review.walkthrough"]
+  if not (walkthrough and type(walkthrough.file_sort_rank) == "function") then return nil end
+  local ok, rank = pcall(walkthrough.file_sort_rank, buf, file)
+  if ok and type(rank) == "number" then return rank end
+  return nil
+end
+
+---@param file DiffReviewStatusFile
+---@return string
+function M._status_file_path_sort_key(file)
+  return tostring((file and (file.relpath or file.filename)) or "")
+end
+
+---@param buf integer?
+---@param section DiffReviewStatusSection
+function M._status_sort_section_files(buf, section)
+  if not (section and type(section.files) == "table") then return end
+  local ranks = {}
+  for _, file in ipairs(section.files) do
+    ranks[file] = M._status_walkthrough_file_rank(buf, file) or math.huge
+  end
+  table.sort(section.files, function(left_file, right_file)
+    local left_rank = ranks[left_file] or math.huge
+    local right_rank = ranks[right_file] or math.huge
+    if left_rank ~= right_rank then return left_rank < right_rank end
+    return M._status_file_path_sort_key(left_file) < M._status_file_path_sort_key(right_file)
+  end)
+end
+
+---@param buf integer?
+---@param sections DiffReviewStatusSection[]
+function M._status_sort_sections_for_render(buf, sections)
+  for _, section in ipairs(sections or {}) do
+    M._status_sort_section_files(buf, section)
+  end
 end
 
 ---@param collected_items table[]
@@ -7228,6 +7274,7 @@ local function status_sections_from_items(collected_items)
     if filename then
       local section_name = status_section_for_item(item)
       local section = sections[section_name]
+      local is_untracked = data.category == "Untracked Files" or data.git_status == "??"
       local file = section.files_by_name[filename]
       if not file then
         file = {
@@ -7237,13 +7284,16 @@ local function status_sections_from_items(collected_items)
           added = 0,
           removed = 0,
           hunks = {},
-          untracked = section_name == "untracked",
+          untracked = section_name ~= "staged" and is_untracked,
           status = data.stats or data.hunk_header or "",
           git_status = data.git_status,
           original_relpath = data.git_original_file,
         }
         section.files_by_name[filename] = file
         section.files[#section.files + 1] = file
+      elseif section_name ~= "staged" and is_untracked then
+        file.untracked = true
+        file.git_status = "??"
       end
 
       file.added = file.added + (data.added or 0)
@@ -7268,9 +7318,7 @@ local function status_sections_from_items(collected_items)
   local ordered = {} ---@type DiffReviewStatusSection[]
   for _, section_config in ipairs(status_section_order) do
     local section = sections[section_config.name]
-    table.sort(section.files, function(left_file, right_file)
-      return left_file.relpath < right_file.relpath
-    end)
+    M._status_sort_section_files(M._status and M._status.buf or nil, section)
     for _, file in ipairs(section.files) do
       table.sort(file.hunks, function(left_hunk, right_hunk)
         return (left_hunk.pos or 0) < (right_hunk.pos or 0)
@@ -8343,13 +8391,11 @@ local function status_order_section_map(section_map)
   local ordered = {}
   for _, section_config in ipairs(status_section_order) do
     local section = section_map[section_config.name]
-    table.sort(section.files, function(left_file, right_file)
-      return left_file.relpath < right_file.relpath
-    end)
+    M._status_sort_section_files(M._status and M._status.buf or nil, section)
     for _, file in ipairs(section.files) do
       file.section_name = section.name
-      file.untracked = section.name == "untracked"
-      if section.name == "untracked" then
+      file.untracked = section.name ~= "staged" and file.untracked == true
+      if file.untracked then
         file.git_status = "??"
       elseif section.name == "staged" and file.git_status == "??" then
         file.git_status = "A"
@@ -8381,8 +8427,8 @@ end
 local function status_copy_file_for_section(file, section_name)
   local copied_file = vim.deepcopy(file)
   copied_file.section_name = section_name
-  copied_file.untracked = section_name == "untracked"
-  if section_name == "untracked" then
+  copied_file.untracked = section_name ~= "staged" and file.untracked == true
+  if copied_file.untracked then
     copied_file.git_status = "??"
   elseif section_name == "staged" and file.untracked then
     copied_file.git_status = "A"
@@ -8404,6 +8450,13 @@ local function status_ensure_file(section_map, section_name, file)
   local section = section_map[section_name]
   local existing_file = section.files_by_name[file.filename]
   if existing_file then return existing_file end
+  local is_untracked = section_name ~= "staged" and file.untracked == true
+  local git_status = file.git_status
+  if is_untracked then
+    git_status = "??"
+  elseif section_name == "staged" and file.untracked then
+    git_status = "A"
+  end
   existing_file = {
     filename = file.filename,
     relpath = file.relpath,
@@ -8411,9 +8464,9 @@ local function status_ensure_file(section_map, section_name, file)
     added = 0,
     removed = 0,
     hunks = {},
-    untracked = section_name == "untracked",
+    untracked = is_untracked,
     status = file.status,
-    git_status = section_name == "untracked" and "??" or file.git_status,
+    git_status = git_status,
   }
   section.files[#section.files + 1] = existing_file
   section.files_by_name[file.filename] = existing_file
@@ -9986,6 +10039,7 @@ local function status_render_loaded(buf, target_id, fallback_line, opts, head_li
   if walkthrough and walkthrough.status_head_lines then
     head_lines = walkthrough.status_head_lines(buf, head_lines)
   end
+  M._status_sort_sections_for_render(buf, sections)
 
   local folded_head_parents = {}
   for _, head_line in ipairs(head_lines) do
@@ -14840,7 +14894,7 @@ local function status_unstage_target_section(entries)
       return "unstaged"
     end
   end
-  if has_added then return "untracked" end
+  if has_added then return "unstaged" end
   return nil
 end
 
@@ -14948,7 +15002,7 @@ local function status_unstage_entries(entries, opts)
   local status_buf = M._status and M._status.buf
 
   status_apply_optimistic_entries(tracked_entries, "unstaged", target_id)
-  status_apply_optimistic_entries(added_entries, "untracked", target_id)
+  status_apply_optimistic_entries(added_entries, "unstaged", target_id)
 
   local function finish()
     if unstaged_hunks > 0 or unstaged_files > 0 then
@@ -15673,6 +15727,7 @@ end
 ---@return boolean
 function M._status_entry_default_folded(entry)
   if not entry then return false end
+  if entry.default_folded ~= nil then return entry.default_folded == true end
   if entry.kind == "file" or entry.kind == "pr_file" then
     return true
   elseif entry.kind == "commit" or entry.kind == "commit_file" then
