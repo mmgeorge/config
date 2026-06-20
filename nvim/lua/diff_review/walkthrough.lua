@@ -185,7 +185,7 @@ local valid_item_actions = {
   Split = true,
 }
 local item_note_max_length = 50
-local justification_max_length = 80
+local justification_max_length = 170
 local valid_group_types = {
   Module = true,
   File = true,
@@ -217,7 +217,6 @@ local valid_item_types = {
 local action_highlights = {
   Add = "DiffReviewWalkthroughActionAdd",
   Update = "DiffReviewWalkthroughActionUpdate",
-  Move = "DiffReviewWalkthroughActionMove",
   Remove = "DiffReviewWalkthroughActionRemove",
   Split = "DiffReviewWalkthroughActionSplit",
 }
@@ -280,12 +279,12 @@ local function format_item_type_label(item_type, item_subtype)
   return format_type_keyword(item_type)
 end
 
----@param lines string[]
 ---@param item DiffReviewWalkthroughItem
 ---@param prefix string
 ---@param is_last boolean
-local function append_summary_item(lines, item, prefix, is_last)
-  lines[#lines + 1] = prefix
+---@return string
+local function summary_item_text(item, prefix, is_last)
+  return prefix
     .. tree_branch(is_last)
     .. format_action(item.action)
     .. " "
@@ -294,6 +293,14 @@ local function append_summary_item(lines, item, prefix, is_last)
     .. item.title
     .. " to "
     .. item.note
+end
+
+---@param lines string[]
+---@param item DiffReviewWalkthroughItem
+---@param prefix string
+---@param is_last boolean
+local function append_summary_item(lines, item, prefix, is_last)
+  lines[#lines + 1] = summary_item_text(item, prefix, is_last)
 end
 
 ---@param task_index integer
@@ -310,7 +317,7 @@ end
 ---@param lines string[]
 ---@param task DiffReviewWalkthroughTask
 local function append_task_summary_body(lines, task)
-  local task_body_prefix = " "
+  local task_body_prefix = ""
   for _, group in ipairs(task.groups) do
     local group_prefix = task_body_prefix
     lines[#lines + 1] = group_prefix .. format_type_keyword(group.type) .. " " .. group.title
@@ -376,7 +383,6 @@ end
 local function collect_summary_justifications(tasks)
   local justifications = {}
   for _, task in ipairs(tasks) do
-    if task.justification then justifications[#justifications + 1] = task.justification end
     for _, group in ipairs(task.groups) do
       for _, subtask in ipairs(group.subtasks) do
         if subtask.justification then justifications[#justifications + 1] = subtask.justification end
@@ -1297,23 +1303,17 @@ end
 ---@param tasks DiffReviewWalkthroughTask[]
 ---@return integer? title_start_col
 ---@return integer? title_end_col
----@return integer? justification_start_col
----@return integer? justification_end_col
 local function summary_task_ranges(line, tasks)
   for task_index, task in ipairs(tasks or {}) do
     local title = ("%d. %s"):format(task_index, task.title)
     if vim.startswith(line, title) then
-      local justification_start = nil
-      if task.justification and line:sub(#title + 1, #title + 1) == " " then
-        justification_start = #title + 1
-      end
-      return 0, #title, justification_start, justification_start and #line or nil
+      return 0, #title
     end
     if vim.startswith(title, line) then
-      return 0, #line, nil, nil
+      return 0, #line
     end
   end
-  return nil, nil, nil, nil
+  return nil, nil
 end
 
 ---@param buf integer
@@ -1326,19 +1326,12 @@ local function apply_summary_highlights(buf, lines, doc, row_offset)
   local item_specs = collect_summary_item_specs(doc.tasks)
   local justifications = collect_summary_justifications(doc.tasks)
   for row, line in ipairs(lines) do
-    local task_title_start_col, task_title_end_col, task_justification_start_col, task_justification_end_col =
-      summary_task_ranges(line, doc.tasks)
+    local task_title_start_col, task_title_end_col = summary_task_ranges(line, doc.tasks)
     if task_title_start_col and task_title_end_col then
       pcall(vim.api.nvim_buf_set_extmark, buf, M._ns, row_offset + row - 1, 0, {
         end_col = task_title_end_col,
         hl_group = "DiffReviewWalkthroughItemTitle",
       })
-      if task_justification_start_col and task_justification_end_col then
-        pcall(vim.api.nvim_buf_set_extmark, buf, M._ns, row_offset + row - 1, task_justification_start_col, {
-          end_col = task_justification_end_col,
-          hl_group = "DiffReviewWalkthroughJustification",
-        })
-      end
     elseif summary_is_task_line(line) then
       pcall(vim.api.nvim_buf_set_extmark, buf, M._ns, row_offset + row - 1, 0, {
         end_col = #line,
@@ -1371,14 +1364,16 @@ local function apply_summary_highlights(buf, lines, doc, row_offset)
 
     local start_col, end_col, action = summary_action_range(line)
     local hl_group = action and action_highlights[action] or nil
-    if start_col and end_col and hl_group then
-      pcall(vim.api.nvim_buf_set_extmark, buf, M._ns, row_offset + row - 1, start_col, {
-        end_col = end_col,
-        hl_group = hl_group,
-      })
+    if start_col and end_col then
+      if hl_group then
+        pcall(vim.api.nvim_buf_set_extmark, buf, M._ns, row_offset + row - 1, start_col, {
+          end_col = end_col,
+          hl_group = hl_group,
+        })
+      end
       local type_start_col, type_end_col, item_type, item_type_start_col, item_type_label =
         summary_item_type_range(line, start_col, action, item_specs)
-      if type_start_col and type_end_col then
+      if type_start_col and type_end_col and hl_group then
         pcall(vim.api.nvim_buf_set_extmark, buf, M._ns, row_offset + row - 1, type_start_col, {
           end_col = type_end_col,
           hl_group = hl_group,
@@ -1442,7 +1437,7 @@ local function status_task_heading_rows(task_index, task, width)
       rows[#rows + 1] = { text = line, segments = { { line, "DiffReviewWalkthroughItemTitle" } } }
     end
     for _, line in ipairs(wrap_text(task.justification, width)) do
-      rows[#rows + 1] = { text = line, segments = { { line, "DiffReviewWalkthroughJustification" } } }
+      rows[#rows + 1] = { text = line, segments = { { line } } }
     end
     return rows
   end
@@ -1452,13 +1447,153 @@ local function status_task_heading_rows(task_index, task, width)
   local first_segments = { { title, "DiffReviewWalkthroughItemTitle" } }
   if first_justification ~= "" then
     first_segments[#first_segments + 1] = { " " }
-    first_segments[#first_segments + 1] = { first_justification, "DiffReviewWalkthroughJustification" }
+    first_segments[#first_segments + 1] = { first_justification }
   end
   rows[#rows + 1] = { text = first_line, segments = first_segments }
   for _, line in ipairs(wrap_text(rest, width)) do
-    rows[#rows + 1] = { text = line, segments = { { line, "DiffReviewWalkthroughJustification" } } }
+    rows[#rows + 1] = { text = line, segments = { { line } } }
   end
   return rows
+end
+
+---@param rows table[]
+---@param text string
+---@param opts { id: string, parent_id: string, kind?: string, fold_target_id?: string|false, default_folded?: boolean, segments?: table[] }
+---@param width integer
+---@param item_titles string[]
+local function append_status_summary_rows(rows, text, opts, width, item_titles)
+  local wrapped_lines = summary_lines(text, width, item_titles)
+  for wrapped_index, wrapped_line in ipairs(wrapped_lines) do
+    local is_primary = wrapped_index == 1
+    local id = is_primary and opts.id or ("%s:line:%d"):format(opts.id, wrapped_index)
+    local kind = is_primary and (opts.kind or "pr_head_line") or "pr_head_line"
+    local fold_target_id = opts.fold_target_id
+    if is_primary and opts.kind == "pr_head_section" and fold_target_id == nil then
+      fold_target_id = false
+    elseif not is_primary and opts.kind == "pr_head_section" then
+      fold_target_id = opts.id
+    end
+    rows[#rows + 1] = {
+      text = wrapped_line,
+      segments = is_primary and #wrapped_lines == 1 and opts.segments or nil,
+      id = id,
+      parent_id = opts.parent_id,
+      kind = kind,
+      fold_target_id = fold_target_id,
+      default_folded = is_primary and opts.default_folded == true,
+    }
+  end
+end
+
+---@param path string?
+---@return string
+local function basename(path)
+  local normalized = tostring(path or ""):gsub("\\", "/")
+  return normalized:match("([^/]+)$") or normalized
+end
+
+---@param step DiffReviewWalkthroughStep
+---@return string
+local function status_step_location_label(step)
+  local file = basename(step.file)
+  local line = tonumber(step.start_pos and step.start_pos.line) or 1
+  return ("%s:%d:"):format(file, line)
+end
+
+---@param tasks DiffReviewWalkthroughTask[]
+---@return integer
+local function status_step_location_label_width(tasks)
+  local max_width = 0
+  for _, task in ipairs(tasks or {}) do
+    for _, group in ipairs(task.groups or {}) do
+      for _, subtask in ipairs(group.subtasks or {}) do
+        for _, item in ipairs(subtask.items or {}) do
+          for _, step in ipairs(item.steps or {}) do
+            max_width = math.max(max_width, vim.fn.strdisplaywidth(status_step_location_label(step)))
+          end
+        end
+      end
+    end
+  end
+  return max_width
+end
+
+---@param step DiffReviewWalkthroughStep
+---@param prefix string
+---@param max_location_label_width integer
+---@return string
+---@return table[] segments
+local function status_step_location_text(step, prefix, max_location_label_width)
+  local title = step.title or step.item_title or step.subtask_title or "Walkthrough comment"
+  local location_label = status_step_location_label(step)
+  local padding_width = math.max(1, max_location_label_width - vim.fn.strdisplaywidth(location_label) + 1)
+  local padding = string.rep(" ", padding_width)
+  local text = ("%s%s%s%s"):format(prefix, location_label, padding, title)
+  return text, {
+    { prefix },
+    { location_label, "DiffReviewStatusPath" },
+    { padding },
+    { title },
+  }
+end
+
+---@param rows table[]
+---@param task DiffReviewWalkthroughTask
+---@param task_id string
+---@param width integer
+---@param item_titles string[]
+---@param max_location_label_width integer
+local function append_status_task_body_rows(rows, task, task_id, width, item_titles, max_location_label_width)
+  for group_index, group in ipairs(task.groups) do
+    local group_id = ("%s:group:%d"):format(task_id, group_index)
+    append_status_summary_rows(rows, format_type_keyword(group.type) .. " " .. group.title, {
+      id = group_id,
+      parent_id = task_id,
+      kind = "pr_head_section",
+    }, width, item_titles)
+
+    local subtask_prefix = ""
+    for subtask_index, subtask in ipairs(group.subtasks) do
+      local subtask_id = ("%s:subtask:%d"):format(group_id, subtask_index)
+      local subtask_is_last = subtask_index == #group.subtasks
+      append_status_summary_rows(rows, subtask_prefix .. tree_branch(subtask_is_last) .. subtask.title, {
+        id = subtask_id,
+        parent_id = group_id,
+        kind = "pr_head_section",
+      }, width, item_titles)
+
+      local item_prefix = subtask_prefix .. tree_continuation(subtask_is_last)
+      if subtask.justification then
+        append_status_summary_rows(rows, item_prefix .. subtask.justification, {
+          id = ("%s:justification"):format(subtask_id),
+          parent_id = subtask_id,
+          fold_target_id = subtask_id,
+        }, width, item_titles)
+      end
+      for item_index, item in ipairs(subtask.items) do
+        local item_id = ("%s:item:%d"):format(subtask_id, item_index)
+        local item_is_last = item_index == #subtask.items
+        append_status_summary_rows(rows, summary_item_text(item, item_prefix, item_is_last), {
+          id = item_id,
+          parent_id = subtask_id,
+          kind = "pr_head_section",
+          default_folded = true,
+        }, width, item_titles)
+        local step_prefix = item_prefix .. tree_continuation(item_is_last)
+        local item_steps = item.steps or {}
+        for step_index, step in ipairs(item_steps) do
+          local step_id = ("%s:step:%d"):format(item_id, step_index)
+          local step_text, step_segments = status_step_location_text(step, step_prefix, max_location_label_width)
+          append_status_summary_rows(rows, step_text, {
+            id = step_id,
+            parent_id = item_id,
+            fold_target_id = item_id,
+            segments = step_segments,
+          }, width, item_titles)
+        end
+      end
+    end
+  end
 end
 
 ---@param mode DiffReviewWalkthroughMode
@@ -1466,6 +1601,7 @@ end
 local function status_summary_rows(mode)
   local width = math.max(40, vim.o.columns - 4)
   local item_titles = collect_summary_item_titles(mode.doc.tasks)
+  local max_location_label_width = status_step_location_label_width(mode.doc.tasks)
   local rows = {}
 
   for _, line in ipairs(summary_lines(vim.trim(mode.doc.overview or ""), width, item_titles)) do
@@ -1489,21 +1625,7 @@ local function status_summary_rows(mode)
       }
     end
 
-    local body_lines = {}
-    append_task_summary_body(body_lines, task)
-    local body_text = table.concat(body_lines, "\n")
-    local body_index = 0
-    if body_text ~= "" then
-      for _, line in ipairs(summary_lines(body_text, width, item_titles)) do
-        body_index = body_index + 1
-        rows[#rows + 1] = {
-          text = line,
-          id = ("%s:body:%d"):format(task_id, body_index),
-          parent_id = task_id,
-          fold_target_id = task_id,
-        }
-      end
-    end
+    append_status_task_body_rows(rows, task, task_id, width, item_titles, max_location_label_width)
   end
 
   return rows
@@ -1529,14 +1651,22 @@ function M.status_head_lines(buf, head_lines)
   local child_index = 0
   local function append_child(text, segments, id, parent_id, fold_target_id, kind, default_folded)
     child_index = child_index + 1
+    local entry_kind = kind or "pr_head_line"
+    local entry_fold_target_id = nil
+    if fold_target_id ~= false then
+      entry_fold_target_id = fold_target_id
+      if entry_fold_target_id == nil and entry_kind ~= "pr_head_section" then
+        entry_fold_target_id = status_section_id
+      end
+    end
     lines[#lines + 1] = {
       segments = segments or { { text } },
       parent_id = parent_id or status_section_id,
       default_folded = default_folded == true,
       entry = {
         id = id or ("walkthrough:child:%d"):format(child_index),
-        kind = kind or "pr_head_line",
-        fold_target_id = fold_target_id == false and nil or (fold_target_id or status_section_id),
+        kind = entry_kind,
+        fold_target_id = entry_fold_target_id,
         default_folded = default_folded == true,
         walkthrough_summary_line = text,
       },

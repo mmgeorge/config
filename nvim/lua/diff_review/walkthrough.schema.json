@@ -46,8 +46,8 @@
         "justification": {
           "type": "string",
           "minLength": 1,
-          "maxLength": 80,
-          "description": "Optional intent/rationale shown as yellow italic text directly under the task title; 80 characters or less."
+          "maxLength": 170,
+          "description": "Optional intent/rationale shown under the task title; aim for 90-140 characters, hard cap 170. Prefer explaining what is now different and why the change follows."
         },
         "groups": {
           "type": "array",
@@ -89,8 +89,8 @@
         "justification": {
           "type": "string",
           "minLength": 1,
-          "maxLength": 80,
-          "description": "Optional intent/rationale shown as yellow italic text directly under the subtask title; 80 characters or less."
+          "maxLength": 170,
+          "description": "Optional intent/rationale shown under the subtask title; aim for 90-140 characters, hard cap 170. Use only for non-obvious local rationale."
         },
         "items": {
           "type": "array",
@@ -200,7 +200,7 @@
         },
         "start": {
           "$ref": "#/$defs/position",
-          "description": "Start of the referenced region. The line should be a CHANGED (added) line, not unchanged context - reviewers are jumped to it inside the diff."
+          "description": "Start of the referenced region. Prefer a CHANGED (added) line, not unchanged context; for deletion-only comments, use the closest surviving new-side line at the deletion boundary."
         },
         "end": {
           "$ref": "#/$defs/position",

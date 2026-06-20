@@ -29,9 +29,16 @@ narrative — use the diff only to confirm files and line numbers.
 - **Order tells the story.** Sequence steps as a narrative: entry point or
   API surface first, then core logic, then call sites, then tests/config.
   Not file order, not diff order.
-- **One logical idea per step.** A step covers one cohesive region; aim for
-  3-15 steps total. Skip mechanical churn (renames, lockfiles, formatting)
-  unless it is the point of the change.
+- **Summary stays compact; comments guide the file-by-file review.** The
+  `tasks[]` summary should stay top-down and focused, but `steps[]` are the
+  inline code comments a reviewer sees while expanding files. Produce enough
+  comment blocks that each meaningful changed file or semantic region has local
+  context. Prefer several tight steps over one sparse comment for a whole task.
+- **One logical idea per step.** A step covers one cohesive region. For
+  multi-file changes, expect roughly 1-3 comment steps per important file or
+  changed cluster, and more when a large deletion, replacement, migration, or
+  subtle behavior change needs explanation. Skip purely mechanical churn
+  (renames, lockfiles, formatting) unless it is the point of the change.
 - **Positions describe the file as it exists on disk right now** (the NEW,
   post-change content): 1-based `line` and `col`, `start` to `end`
   inclusive, `end` >= `start`.
@@ -44,11 +51,26 @@ narrative — use the diff only to confirm files and line numbers.
   reviewer is jumped to that exact line inside the diff; anchoring on an
   unchanged context line lands the jump approximately and gets flagged as
   stale.
+- **Comment meaningful removals too.** When a large or important block is
+  deleted, add a `Remove` item/step that explains what was removed and why. For
+  replacement deletions, anchor the step to the added replacement line. For
+  deletion-only hunks, anchor to the closest surviving post-change line at the
+  deletion boundary and keep the range small; the comment should name the
+  deleted concept, e.g. `Remove the inline billboard render pass because model
+  and billboard rendering now live in separate systems.`
 - `file` is repo-relative with forward slashes.
-- `title` should be present for every step. Write it as a succinct active
-  action sentence that states what this region does, such as `Route API
-  requests through the limiter.` Do not use noun-only headings like `Router
-  wiring` or `Token bucket middleware`.
+- `title` should be present for every step. Write it as a succinct, concrete
+  local code action sentence that states what this region does, such as `Define
+  particle render modes.`, `Set triangle billboards as the default mode.`, or
+  `Store render mode on ParticleSpawn.` Prefer concrete code verbs such as
+  `Define`, `Set`, `Store`, `Remove`, `Configure`, `Bind`, `Load`, `Register`,
+  `Guard`, `Validate`, `Split`, `Merge`, `Extract`, `Inline`, `Read`, `Write`,
+  `Allocate`, or `Clear`. Avoid abstract or vague verbs such as `Represent`,
+  `Carry`, `Handle`, `Support`, `Exercise`, `Improve`, or `Update`. Do not use
+  noun-only headings like `Router wiring` or `Token bucket middleware`. Use
+  `Store` when data is persisted or kept on a struct/resource/cache/state
+  object. Use `Set` when assigning a runtime value, default, flag, option, or
+  configuration.
 - `comment` is the step's mini justification: first state the problem,
   limitation, risk, or review pressure; then state the solution, what changed,
   and why that addresses it. Use 1-4 prose sentences without `Problem:` or
@@ -75,12 +97,19 @@ narrative — use the diff only to confirm files and line numbers.
 - `root` is one active author-context sentence for the major feature/fix/refactor.
 - Each `tasks[].title` is an active author-context sentence such as `Add...`,
   `Update...`, `Move...`, `Split...`, `Remove...`, or `Preserve...`. These
-  titles become the numbered review sections in the walkthrough summary.
+  titles become the numbered review sections in the walkthrough summary. Name
+  the concrete capability or structure introduced by the change. Avoid abstract
+  capability phrasing such as `Let X choose Y`, `Enable X`, or `Support X` when
+  the diff introduces a specific data/control boundary; prefer wording like
+  `Introduce billboard and model particle render modes.` or
+  `Move live particle buffers into shared resources.`
 - `tasks[].justification` is optional in the schema but generally expected.
-  Include one unless the task title already makes the reason very obvious. Omit
+  Include one unless the task title already makes the reason very obvious. Use
+  it to explain what is now different from before and why the task follows from
+  that change; prefer `now ... so ...` justifications when they read naturally.
+  Aim for 90-140 characters, with 170 characters as the hard schema cap. Omit
   it for very obvious/mechanical tasks or when it would only restate the title.
-  Keep it 80 characters or less. It renders directly under the task title as
-  yellow italic text, without a `why:` label.
+  It renders as rationale text without a `why:` label.
 - Keep `tasks[]` focused on the true major review claims, usually 2-4 entries.
   Do not promote every meaningful diff cluster into a task. Supporting work
   like demo wiring, shader helper splits, tests, docs/plans, preservation of an
@@ -99,21 +128,45 @@ narrative — use the diff only to confirm files and line numbers.
     `Struct`, `Enum`, `Trait`, `Interface`, `Type`, `Test`, `Config`, `Method`,
     `Function`, `Field`, or `Constant` at the group level.
   - `title`: the concrete owning code boundary.
-- Each group has one or more `subtasks[]`. A subtask is the missing intent layer
-  between a container and concrete code items:
-  - `title`: an active prose sentence or fragment describing what this group
-    does in service of the parent task, such as `Publish live particle buffers
-    for render systems.` Do not attach a type or action to a subtask.
+- Each group has one or more `subtasks[]`. A subtask is the high-level code
+  action between a container and concrete code items:
+  - `title`: an active prose sentence or fragment describing the design move
+    this group makes in service of the parent task, such as `Move particle
+    buffers into a shared storage resource.` Do not attach a type or item action
+    to a subtask. Subtask titles must use one of the high-level verbs in this
+    verb bank. If none seems to fit, rewrite the subtask around the closest
+    listed responsibility, ownership, lifecycle, data-flow, behavior, reuse, or
+    structure change instead of inventing a different leading verb:
+    - Boundary / ownership: `Expose`, `Encapsulate`, `Move`, `Centralize`,
+      `Distribute`
+    - Structure: `Extract`, `Inline`, `Split`, `Merge`, `Compose`, `Embed`
+    - Lifecycle: `Create`, `Destroy`, `Register`, `Unregister`, `Attach`,
+      `Detach`, `Start`, `Stop`
+    - Data / control flow: `Route`, `Resolve`, `Defer`
+    - Behavior rules: `Configure`, `Relax`, `Enable`, `Disable`
+    - Reuse / variants: `Reuse`, `Generalize`, `Specialize`
+    Avoid vague or overloaded verbs such as `exercise`, `handle`, `support`,
+    `make`, `keep`, or `publish` unless `publish` is literally the public API
+    concept in the code. When responsibility moves, name the concrete destination
+    or source. Good non-domain-specific examples: `Configure retry policy for
+    background sync.`, `Expose cached metadata to picker previews.`, `Extract
+    request validation into middleware.`, `Route uploads through the size
+    guard.`, `Generalize markdown rendering across editable text blocks.`, and
+    `Specialize the cache refresh path for stale records.`
   - `justification`: optional and exceptional. Use it only when the subtask has
     non-obvious rationale, tradeoff, or sequencing context that the title cannot
-    carry. Otherwise omit it. Keep it 80 characters or less. It renders directly
-    under the subtask title as yellow italic text, without a `why:` label.
+    carry. Otherwise omit it. Aim for 90-140 characters, with 170 characters as
+    the hard schema cap. It renders as rationale text without a `why:` label.
   - `items`: one or more typed code items that implement the subtask.
   Each item has:
   - `action`: one of `Add`, `Update`, `Move`, `Remove`, or `Split`.
     These render in the summary as `Add`, `Modify`, `Move`, `Remove`, and
-    `Split` respectively. Use `Update` in JSON for changes that should display
-    as `Modify`.
+    `Split` respectively. For newly-authored walkthroughs, use only `Add`,
+    `Update`, or `Remove` for item action rows; use `Update` in JSON for rows
+    that should display as `Modify`. Do not use `Move` or `Split` as item
+    actions unless preserving an older walkthrough shape; describe moves and
+    splits in the subtask title, then express the concrete leaf rows as
+    `Add`/`Update`/`Remove` items.
   - `type`: one of `Class`, `Struct`, `Enum`, `Trait`, `Interface`, `Test`,
     `Config`, `Function`, `Method`, `Constant`, or `Field`.
     Summary rows render types as a lowercase keyword when no `subtype` is set;
@@ -133,7 +186,9 @@ narrative — use the diff only to confirm files and line numbers.
 - Items are leaf nodes. Do not use `children`, and do not create action items as
   grouping rows. Put grouping/intent in the subtask title; reserve subtask
   justification for exceptional non-obvious context. Put concrete implementation
-  symbols as sibling items under that subtask. Every item must have `steps`.
+  symbols as sibling items under that subtask. Every item must have `steps`, and
+  one item may have multiple steps when the same semantic item changes several
+  important regions or removes a substantial block.
 - Exact file paths and ranges belong only in nested `steps`; do **not** include
   repo paths or bracketed file names in `overview`, `root`, task titles, group
   titles, subtask titles, item titles, or item notes. The plugin displays
@@ -143,38 +198,40 @@ narrative — use the diff only to confirm files and line numbers.
 
   ```
   Add support for full model-backed particle rendering. Before, simulated
-  particles could only render through the legacy triangle billboard path. Now,
+  particles could only render through the triangle billboard path. Now,
   each particle spawn can choose billboard or model rendering, physics publishes
   live particle buffers through a render-facing handoff, and the model/PBR
   renderer draws the selected mesh once per live particle.
 
-  1. Let particle spawns choose billboard or model rendering.
-   Spawn authors need a stable way to select the rendering path before simulation hands particles to rendering.
+  1. Introduce billboard and model particle render modes.
+   Rendering now has multiple paths, so each spawn declares its mode before render handoff.
    module PhysicsPlugin
-      └─ Make particle render paths explicit at spawn time.
-         ├─ Add enum ParticleRenderMode to represent billboard vs model-backed rendering at spawn time
-         └─ Modify struct ParticleSpawn to carry the selected render mode with spawn data
+      └─ Configure particle spawns with a render-mode choice.
+         ├─ Add enum ParticleRenderMode to select billboard or model-backed rendering at spawn time
+         └─ Modify struct ParticleSpawn to store the selected render mode with spawn data
    module AppBrowserPhysicsDemo
-      └─ Exercise the model-backed path in the drop3d scene.
+      └─ Configure the drop3d scene to spawn model particles.
          └─ Modify fn drop3d particle spawn to switch the stress scene to SmoothSphere model particles
 
-  2. Move live particle data into render-facing resources.
+  2. Move live particle buffers into shared resources.
+   Physics now feeds simulation and render systems, so particle buffers need an owner outside ParticleSystem.
    module PhysicsPlugin
-      ├─ Own shared particle buffers outside the simulation loop.
-      │  ├─ Add Resource ParticleStorage to own particle GPU buffers and expose a render instance view
-      │  └─ Modify fn ParticleSystem::run() to advance simulation through shared storage and publish the current particle source
-      └─ Keep billboard rendering as the legacy render mode.
-         ├─ Modify fn PhysicsPlugin::install() to register shared storage and preserve billboard rendering as its own system
-         └─ Add struct ParticleBillboardRenderSystem to keep the legacy triangle path behind billboard mode
+      ├─ Move particle buffers into a shared storage resource.
+      │  ├─ Add Resource ParticleStorage to store live particle GPU buffers and expose a render instance view
+      │  └─ Modify fn ParticleSystem::run() to advance simulation through shared storage and expose the current particle source
+      └─ Move triangle billboard drawing into ParticleBillboardRenderSystem.
+         ├─ Modify fn PhysicsPlugin::install() to register shared storage and billboard rendering
+         └─ Add struct ParticleBillboardRenderSystem to preserve triangle billboard draws
    module RenderPlugin
-      └─ Publish particle instance sources for render systems.
+      └─ Expose particle instance sources to render systems.
          └─ Add Resource ParticleInstanceSources to share live particle buffers and optional model metadata with render systems
 
-  3. Draw the selected model once per live particle through the PBR path.
+  3. Draw selected particle models through the PBR renderer.
+   Particles can now render as model instances, so the model path reuses existing mesh and material uploads.
    module ModelPlugin
-      ├─ Bind particle storage during model render passes.
+      ├─ Specialize the PBR pipeline for particle instance draws.
       │  └─ Add Pipeline ParticlePbRenderPipeline to create the pipeline variant for particle-instanced model draws
-      └─ Issue PBR draws across the live particle count.
+      └─ Compose particle draw commands with live particle instances.
          ├─ Modify fn ModelRenderSystem::new() to initialize the particle pipeline state
          ├─ Modify fn ModelRenderSystem::update_entities() to prepare particle model draw commands from the render-facing handoff
          └─ Modify fn ModelRenderSystem::render() to issue indexed draws across the live particle count
@@ -184,7 +241,7 @@ narrative — use the diff only to confirm files and line numbers.
          ├─ Modify fn ModelStore::insert_particle_model() to reuse model primitives while returning particle draw metadata
          └─ Modify Store PrimitiveMeshStore to expose primitive buffers in the layout expected by the particle entry point
    file particle_render shaders
-      └─ Share PBR vertex and fragment behavior with particle instances.
+      └─ Generalize PBR shader helpers across entity and particle draws.
          ├─ Add fn particle_render entry point to draw each live particle as the selected model primitive
          ├─ Add fn PBR vertex helpers to share vertex-output construction with normal model rendering
          └─ Add fn PBR fragment helper to share material sampling and lighting
@@ -244,8 +301,8 @@ alongside this skill). The schema, inlined:
         "justification": {
           "type": "string",
           "minLength": 1,
-          "maxLength": 80,
-          "description": "Optional intent/rationale shown as yellow italic text directly under the task title; 80 characters or less."
+          "maxLength": 170,
+          "description": "Optional intent/rationale shown under the task title; aim for 90-140 characters, hard cap 170. Prefer explaining what is now different and why the change follows."
         },
         "groups": {
           "type": "array",
@@ -287,8 +344,8 @@ alongside this skill). The schema, inlined:
         "justification": {
           "type": "string",
           "minLength": 1,
-          "maxLength": 80,
-          "description": "Optional intent/rationale shown as yellow italic text directly under the subtask title; 80 characters or less."
+          "maxLength": 170,
+          "description": "Optional intent/rationale shown under the subtask title; aim for 90-140 characters, hard cap 170. Use only for non-obvious local rationale."
         },
         "items": {
           "type": "array",
@@ -398,7 +455,7 @@ alongside this skill). The schema, inlined:
         },
         "start": {
           "$ref": "#/$defs/position",
-          "description": "Start of the referenced region. The line should be a CHANGED (added) line, not unchanged context - reviewers are jumped to it inside the diff."
+          "description": "Start of the referenced region. Prefer a CHANGED (added) line, not unchanged context; for deletion-only comments, use the closest surviving new-side line at the deletion boundary."
         },
         "end": {
           "$ref": "#/$defs/position",
@@ -434,7 +491,7 @@ alongside this skill). The schema, inlined:
   "tasks": [
     {
       "title": "Add middleware that decides whether a request can continue.",
-      "justification": "Public API handlers need one shared gate before route-specific work starts.",
+      "justification": "Public API requests now share one route gate, so throttling runs before route-specific handler work starts.",
       "groups": [
         {
           "type": "Module",
@@ -497,7 +554,7 @@ alongside this skill). The schema, inlined:
     },
     {
       "title": "Add per-client token buckets with lazy refill.",
-      "justification": "Buckets need deterministic refill without background work.",
+      "justification": "Requests now refill buckets on access, so rate checks stay deterministic without background work.",
       "groups": [
         {
           "type": "Module",
@@ -536,10 +593,19 @@ alongside this skill). The schema, inlined:
 - Every nested `steps[].file` appears in `git diff HEAD` or the untracked list.
 - Every nested `start.line`/`end.line` is within the file's current line count
   (verify against the file on disk, not the diff hunk headers).
-- Every nested `start.line` points at a changed (added) line, not unchanged
-  context; every region is tight (~40 lines max) around the discussed code.
-- Every nested `steps[].title` is present and reads as a short active action
-  sentence, not a noun phrase.
+- Every nested `start.line` points at a changed (added) line whenever possible,
+  not unchanged context. For deletion-only steps, it points at the closest
+  surviving new-side line at the deletion boundary. Every region is tight
+  (~40 lines max) around the discussed code.
+- Important deleted blocks have their own `Remove` item/step. The comment names
+  what was removed and explains why that deletion matters to the design.
+- Every nested `steps[].title` is present and reads as a short concrete local
+  code action sentence, not a noun phrase. Prefer precise verbs like `Define`,
+  `Set`, `Store`, `Remove`, `Configure`, `Bind`, `Load`, `Register`, `Guard`,
+  or `Validate`; avoid vague or abstract verbs like `Represent`, `Carry`,
+  `Handle`, `Support`, `Exercise`, `Improve`, or `Update`. Use `Store` for
+  data kept on a struct/resource/cache/state object; use `Set` for assigning a
+  value, default, flag, option, or configuration.
 - Every nested `steps[].comment` is a mini justification: problem/current
   pressure first, then solution/change and why it addresses the problem. Aim for
   roughly 180-200 characters, but prefer clarity over exact length.
@@ -555,10 +621,13 @@ alongside this skill). The schema, inlined:
 - `root` and each `tasks[].title` are active author-context sentences, not
   noun-only labels.
 - Task `justification` fields are generally present unless the title makes the
-  reason very obvious. Subtask justifications are exceptional; use them only for
-  non-obvious rationale, tradeoffs, or sequencing context. Use single-sentence
-  rationale lines of 80 characters or less. They do not start with `why:`
-  because the UI renders them as yellow italic text.
+  reason very obvious. They explain what is now different from before and why
+  the task follows from that change; prefer `now ... so ...` when natural.
+  Subtask justifications are exceptional; use them only for non-obvious
+  rationale, tradeoffs, or sequencing context. Use single-sentence rationale
+  lines, aim for 90-140 characters, and stay within the 170-character schema
+  cap. They do not start with `why:` because the UI renders them as rationale
+  text.
 - `tasks[]` captures the few major top-down review claims, not every support
   change. If there are more than four tasks, merge by feature/fix/refactor
   outcome before writing the JSON.
@@ -575,14 +644,18 @@ alongside this skill). The schema, inlined:
 - Optional item `subtype` values are narrow semantic labels like `Resource`,
   `Buffer`, or `Middleware`; omit `subtype` unless the code clearly supports
   that narrower label.
-- Each group has `subtasks[]`; each subtask has a prose `title` and concrete
-  `items[]`.
+- Each group has `subtasks[]`; each subtask has a prose high-level code-action
+  `title` and concrete `items[]`. The title's leading verb must come from the
+  grouped architectural verb bank in the authoring instructions.
 - Items are leaf nodes: every item has `steps`, and no item has `children`.
   When a change needs grouping, use the subtask title and sibling items instead
   of nesting action items; add subtask justification only for exceptional
-  non-obvious context.
-- Item actions are title-cased verbs from the allowed set: `Add`, `Update`,
-  `Move`, `Remove`, `Split`.
+  non-obvious context. Use multiple steps on one item when that item has several
+  review-worthy regions.
+- Item actions are title-cased verbs from the schema set, but newly-authored
+  action rows use only `Add`, `Update`, or `Remove`; `Update` displays as
+  `Modify` in the summary. Avoid `Move` and `Split` as item actions; put that
+  design intent in the subtask title instead.
 - Item notes are single-line imperative fragments of 50 characters or less that
   render cleanly after the summary's inserted `to`; no third-person verbs
   (`binds`, `reuses`), tree characters, file paths, or broken phrases.

@@ -10042,8 +10042,16 @@ local function status_render_loaded(buf, target_id, fallback_line, opts, head_li
   M._status_sort_sections_for_render(buf, sections)
 
   local folded_head_parents = {}
+  local hidden_head_parents = {}
   for _, head_line in ipairs(head_lines) do
-    if not (head_line.parent_id and folded_head_parents[head_line.parent_id]) then
+    local parent_id = head_line.parent_id
+    local parent_hidden = parent_id and (folded_head_parents[parent_id] or hidden_head_parents[parent_id])
+    if parent_hidden then
+      local entry = head_line.entry
+      if entry and entry.id then
+        hidden_head_parents[entry.id] = true
+      end
+    else
       if head_line.segments then
         status_add_segment_line(head_line.segments, head_line.entry)
       else
