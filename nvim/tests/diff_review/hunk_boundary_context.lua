@@ -172,6 +172,24 @@ local function find_row(buf, pattern)
   error("missing row: " .. pattern .. "\n" .. table.concat(lines, "\n"), 2)
 end
 
+local function find_row_in_file_section(buf, file_pattern, pattern)
+  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  local start_row = nil
+  for index, line in ipairs(lines) do
+    if line:find(file_pattern, 1, true) then
+      start_row = index
+      break
+    end
+  end
+  if not start_row then return nil end
+  for index = start_row + 1, #lines do
+    local line = lines[index]
+    if line:find("^Modified ") and not line:find(file_pattern, 1, true) then break end
+    if line:find(pattern, 1, true) then return index end
+  end
+  return nil
+end
+
 local function gutter_text(buf, row)
   local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
   for _, mark in ipairs(marks) do
@@ -643,7 +661,12 @@ local function run()
   local material_lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
   assert_true(not contains_line(material_lines, "self.materials.insert"), "ancestor-path padding included a previous sibling statement")
   assert_true(not contains_line(material_lines, "use {"), "ancestor-path padding included the file root opener")
-  assert_true(not contains_line(material_lines, "impl ModelStore {"), "ancestor-path padding included a parent outside the selected scope")
+  local material_impl_row = find_row(buf, "impl ModelStore {")
+  local material_fn_row = find_row(buf, "pub fn new(context: &gpu::Context) -> Self {")
+  assert_true(
+    material_impl_row < material_fn_row and material_fn_row < bind_group_row,
+    "nearest semantic parent should render before selected function context\n" .. buffer_dump(buf)
+  )
   trigger_normal_mapping("<CR>", bind_group_row)
   assert_current_file_jump(root .. "/src/material.rs", 20, "    let bind_group = context.create_bind_group(shaders::model::render::BindGroup1Descriptor {")
   vim.api.nvim_win_set_buf(0, buf)
@@ -661,10 +684,7 @@ local function run()
   end, "model store hunk did not render\n" .. buffer_dump(buf))
   local model_store_header_row = find_row(buf, "@@ +10 -0")
   local particle_command_row = find_row(buf, "pub struct ParticleModelDrawCommand")
-  local model_store_impl_row = nil
-  pcall(function()
-    model_store_impl_row = find_row(buf, "impl ModelStore")
-  end)
+  local model_store_impl_row = find_row_in_file_section(buf, "model_store.rs", "impl ModelStore")
   assert_true(
     model_store_header_row < particle_command_row,
     "new sibling struct should render inside the model store display hunk\n" .. buffer_dump(buf)

@@ -155,10 +155,20 @@
 ---@field end_text string
 ---@field start_segments DiffReviewHighlightSegment[]
 ---@field end_segments DiffReviewHighlightSegment[]
+---@field ancestor_boundaries DiffReviewHunkBoundaryContext[]
 ---@field path_start_rows integer[] 1-based rows from the target node path
 ---@field path_end_rows integer[] 1-based rows from the target node path
 ---@field sibling_before_rows integer[] 1-based same-parent rows before the target row
 ---@field sibling_after_rows integer[] 1-based same-parent rows after the target row
+
+---@class DiffReviewHunkBoundaryContext
+---@field key string
+---@field row integer 1-based row
+---@field text string
+---@field segments DiffReviewHighlightSegment[]
+---@field end_row integer 1-based row
+---@field end_text string
+---@field end_segments DiffReviewHighlightSegment[]
 
 ---@class DiffReviewHighlightSegment
 ---@field text string
@@ -1387,26 +1397,42 @@ local function hunk_context_from_trees(buf, query, highlight_query, trees, targe
 
   if #scopes == 0 then return nil end
 
-  -- Sort by start row descending (innermost scope first)
-  table.sort(scopes, function(a, b) return a.sr > b.sr end)
+  -- Sort by start row descending (innermost scope first). If two captures start
+  -- on the same row, prefer the shorter range as the inner scope.
+  table.sort(scopes, function(a, b)
+    if a.sr ~= b.sr then return a.sr > b.sr end
+    return a.er < b.er
+  end)
 
   -- Limit to 3 levels max
   local max_depth = math.min(#scopes, 3)
+
+  local function scope_name(scope)
+    if scope.name ~= nil then return scope.name end
+    for cid, cnode in query:iter_captures(scope.node, buf) do
+      if query.captures[cid] == "scope.name" then
+        local name_text = vim.treesitter.get_node_text(cnode, buf)
+        if name_text and name_text ~= "" then
+          scope.name = name_text
+          return scope.name
+        end
+        break
+      end
+    end
+    scope.name = false
+    return nil
+  end
+
+  local function scope_key(scope)
+    return ("%s:%d:%d"):format(scope_name(scope) or scope.node:type(), scope.sr, scope.er)
+  end
 
   -- Collect names from outermost to innermost
   local names = {}
   for i = max_depth, 1, -1 do
     local scope = scopes[i]
-    -- Find @scope.name within this scope's node
-    for cid, cnode in query:iter_captures(scope.node, buf) do
-      if query.captures[cid] == "scope.name" then
-        local name_text = vim.treesitter.get_node_text(cnode, buf)
-        if name_text and name_text ~= "" then
-          names[#names + 1] = name_text
-        end
-        break
-      end
-    end
+    local name_text = scope_name(scope)
+    if name_text then names[#names + 1] = name_text end
   end
 
   if #names == 0 then return nil end
@@ -1496,6 +1522,22 @@ local function hunk_context_from_trees(buf, query, highlight_query, trees, targe
     return rows
   end
 
+  local ancestor_boundaries = {}
+  local ancestor_scope = scopes[2]
+  if ancestor_scope and ancestor_scope.sr < selected_scope.sr then
+    local ancestor_text = vim.api.nvim_buf_get_lines(buf, ancestor_scope.sr, ancestor_scope.sr + 1, false)[1] or ""
+    local ancestor_end_text = vim.api.nvim_buf_get_lines(buf, ancestor_scope.er, ancestor_scope.er + 1, false)[1] or ""
+    ancestor_boundaries[#ancestor_boundaries + 1] = {
+      key = scope_key(ancestor_scope),
+      row = ancestor_scope.sr + 1,
+      text = ancestor_text,
+      segments = treesitter_line_segments(buf, trees[1], highlight_query, ancestor_scope.sr, ancestor_text),
+      end_row = ancestor_scope.er + 1,
+      end_text = ancestor_end_text,
+      end_segments = treesitter_line_segments(buf, trees[1], highlight_query, ancestor_scope.er, ancestor_end_text),
+    }
+  end
+
   return {
     label = table.concat(names, "."),
     start_row = selected_scope.sr,
@@ -1504,6 +1546,7 @@ local function hunk_context_from_trees(buf, query, highlight_query, trees, targe
     end_text = end_text,
     start_segments = treesitter_line_segments(buf, trees[1], highlight_query, selected_scope.sr, start_text),
     end_segments = treesitter_line_segments(buf, trees[1], highlight_query, selected_scope.er, end_text),
+    ancestor_boundaries = ancestor_boundaries,
     path_start_rows = sorted_row_set(path_start_rows),
     path_end_rows = sorted_row_set(path_end_rows),
     sibling_before_rows = sorted_row_set(same_parent_neighbor_rows(-1)),
@@ -1789,6 +1832,28 @@ end
 local function same_hunk_context_scope(left, right)
   local left_key = hunk_context_scope_key(left)
   return left_key ~= nil and left_key == hunk_context_scope_key(right)
+end
+
+---@param context DiffReviewHunkTreeSitterContext|string?
+---@return DiffReviewHunkBoundaryContext?
+function M._hunk_context_ancestor_boundary(context)
+  if type(context) ~= "table" or type(context.ancestor_boundaries) ~= "table" then return nil end
+  return context.ancestor_boundaries[#context.ancestor_boundaries]
+end
+
+---@param context DiffReviewHunkTreeSitterContext|string?
+---@return string?
+function M._hunk_context_ancestor_key(context)
+  local boundary = M._hunk_context_ancestor_boundary(context)
+  return boundary and boundary.key or nil
+end
+
+---@param left DiffReviewHunkTreeSitterContext|string?
+---@param right DiffReviewHunkTreeSitterContext|string?
+---@return boolean
+function M._same_hunk_ancestor_scope(left, right)
+  local left_key = M._hunk_context_ancestor_key(left)
+  return left_key ~= nil and left_key == M._hunk_context_ancestor_key(right)
 end
 
 ---@param text string?
@@ -3964,7 +4029,7 @@ end
 ---@param filename? string
 ---@param context_callback_key? fun(hunk_line: number): string
 ---@param on_context_update? fun()
----@param opts? { context_line: integer?, boundary_context: boolean?, suppress_start_boundary: boolean?, suppress_end_boundary: boolean?, syntax_source?: "file"|"diff", syntax_diff_text?: string, compact_replacements?: boolean }
+---@param opts? { context_line: integer?, boundary_context: boolean?, suppress_start_boundary: boolean?, suppress_end_boundary: boolean?, suppress_start_boundary_keys?: table<string, boolean>, suppress_end_boundary_keys?: table<string, boolean>, syntax_source?: "file"|"diff", syntax_diff_text?: string, compact_replacements?: boolean }
 local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_callback_key, on_context_update, opts)
   opts = opts or {}
 
@@ -4181,52 +4246,83 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
       if opts.boundary_context and type(raw_context) == "table" then
         local node_start = raw_context.start_row + 1
         local start_text = raw_context.start_text or ""
-        local start_scope_key = hunk_context_scope_key(raw_context)
-        local start_scope_seen = start_scope_key and emitted_start_scope_keys[start_scope_key] == true
         local previous_plan = group.plans[plan_index - 1]
-        local suppress_start_boundary = (group_index == 1 and plan_index == 1 and opts.suppress_start_boundary)
-          or same_hunk_context_scope(previous_plan and previous_plan.region.context, raw_context)
-          or start_scope_seen
-        local start_boundary_visible = plan.visible_source_lines[start_text] == true
-        local start_boundary_rendered = false
-        if not suppress_start_boundary and not start_boundary_visible and not emitted_context_lines[node_start] then
-          local boundary_old_line = M._hunk_old_line_for_new_line(plan.block.hunks, node_start)
-          local boundary_new_line = node_start
-          ret[#ret + 1] = hunk_boundary_row(
-            raw_context.start_text,
-            raw_context.start_segments,
-            node_start,
-            group.gutter,
-            filename or plan.block.file,
-            boundary_old_line,
-            boundary_new_line
-          )
-          start_boundary_rendered = true
-          emitted_context_lines[node_start] = true
-          local next_old_line, next_new_line = M._hunk_first_visible_plan_coords(plan, raw_context)
-          local adjacent_to_next = M._hunk_render_coords_adjacent(boundary_old_line, boundary_new_line, next_old_line, next_new_line)
-          if node_start ~= raw_context.end_row + 1 and not adjacent_to_next then
-            local hidden_row, hidden_line = M._hunk_single_hidden_context_gap_row(
-              source_lines,
-              plan.block,
-              boundary_new_line,
-              next_new_line,
-              group.changed_lines,
-              emitted_context_lines,
+        local start_boundaries = {}
+        for _, boundary in ipairs(raw_context.ancestor_boundaries or {}) do
+          start_boundaries[#start_boundaries + 1] = boundary
+        end
+        start_boundaries[#start_boundaries + 1] = {
+          key = hunk_context_scope_key(raw_context),
+          row = node_start,
+          text = start_text,
+          segments = raw_context.start_segments,
+          selected = true,
+        }
+        for boundary_index, boundary in ipairs(start_boundaries) do
+          local boundary_key = boundary.key
+          local boundary_seen = boundary_key and emitted_start_scope_keys[boundary_key] == true
+          local suppress_boundary_key = boundary_key
+            and opts.suppress_start_boundary_keys
+            and opts.suppress_start_boundary_keys[boundary_key] == true
+          local suppress_start_boundary = (group_index == 1 and plan_index == 1 and opts.suppress_start_boundary)
+            or same_hunk_context_scope(previous_plan and previous_plan.region.context, raw_context)
+            or boundary_seen
+            or suppress_boundary_key
+          local boundary_visible = plan.visible_source_lines[boundary.text] == true
+          local boundary_rendered = false
+          if not suppress_start_boundary
+            and not boundary_visible
+            and not emitted_context_lines[boundary.row] then
+            local boundary_old_line = M._hunk_old_line_for_new_line(plan.block.hunks, boundary.row)
+            local boundary_new_line = boundary.row
+            ret[#ret + 1] = hunk_boundary_row(
+              boundary.text,
+              boundary.segments,
+              boundary.row,
               group.gutter,
               filename or plan.block.file,
-              file_syntax
+              boundary_old_line,
+              boundary_new_line
             )
-            if hidden_row then
-              ret[#ret + 1] = hidden_row
-              emitted_context_lines[hidden_line] = true
+            boundary_rendered = true
+            emitted_context_lines[boundary.row] = true
+            local next_old_line = nil
+            local next_new_line = nil
+            local next_boundary = start_boundaries[boundary_index + 1]
+            if next_boundary then
+              next_old_line = M._hunk_old_line_for_new_line(plan.block.hunks, next_boundary.row)
+              next_new_line = next_boundary.row
             else
-              ret[#ret + 1] = hunk_boundary_ellipsis_row(start_text, group.gutter)
+              next_old_line, next_new_line = M._hunk_first_visible_plan_coords(plan, raw_context)
+            end
+            local adjacent_to_next = M._hunk_render_coords_adjacent(boundary_old_line, boundary_new_line, next_old_line, next_new_line)
+            if not adjacent_to_next then
+              if boundary.selected then
+                local hidden_row, hidden_line = M._hunk_single_hidden_context_gap_row(
+                  source_lines,
+                  plan.block,
+                  boundary_new_line,
+                  next_new_line,
+                  group.changed_lines,
+                  emitted_context_lines,
+                  group.gutter,
+                  filename or plan.block.file,
+                  file_syntax
+                )
+                if hidden_row then
+                  ret[#ret + 1] = hidden_row
+                  emitted_context_lines[hidden_line] = true
+                else
+                  ret[#ret + 1] = hunk_boundary_ellipsis_row(boundary.text, group.gutter)
+                end
+              else
+                ret[#ret + 1] = hunk_boundary_ellipsis_row(boundary.text, group.gutter)
+              end
             end
           end
-        end
-        if start_scope_key and not start_scope_seen and (start_boundary_rendered or start_boundary_visible) then
-          emitted_start_scope_keys[start_scope_key] = true
+          if boundary_key and not boundary_seen and (boundary_rendered or boundary_visible) then
+            emitted_start_scope_keys[boundary_key] = true
+          end
         end
       end
       add_context_padding_rows(plan.before_padding_lines, group.gutter, plan.block.file)
@@ -4347,6 +4443,51 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
               boundary_old_line,
               boundary_new_line
             )
+          end
+        end
+        local ancestor_boundary = M._hunk_context_ancestor_boundary(raw_context)
+        if ancestor_boundary
+          and ancestor_boundary.end_row
+          and ancestor_boundary.end_row ~= node_end then
+          local suppress_ancestor_end = (ancestor_boundary.key ~= nil
+              and opts.suppress_end_boundary_keys
+              and opts.suppress_end_boundary_keys[ancestor_boundary.key] == true)
+            or (next_plan ~= nil and M._hunk_context_ancestor_key(next_plan.region.context) == ancestor_boundary.key)
+            or (next_group_plan ~= nil and M._hunk_context_ancestor_key(next_group_plan.region.context) == ancestor_boundary.key)
+          if not suppress_ancestor_end and not emitted_context_lines[ancestor_boundary.end_row] then
+            local boundary_old_line = M._hunk_old_line_for_new_line(plan.block.hunks, ancestor_boundary.end_row)
+            local boundary_new_line = ancestor_boundary.end_row
+            local previous_old_line, previous_new_line = M._hunk_last_visible_plan_coords(plan, raw_context)
+            local adjacent_to_previous = M._hunk_render_coords_adjacent(previous_old_line, previous_new_line, boundary_old_line, boundary_new_line)
+            if not adjacent_to_previous then
+              local hidden_row, hidden_line = M._hunk_single_hidden_context_gap_row(
+                source_lines,
+                plan.block,
+                previous_new_line,
+                boundary_new_line,
+                group.changed_lines,
+                emitted_context_lines,
+                group.gutter,
+                filename or plan.block.file,
+                file_syntax
+              )
+              if hidden_row then
+                ret[#ret + 1] = hidden_row
+                emitted_context_lines[hidden_line] = true
+              else
+                ret[#ret + 1] = hunk_boundary_ellipsis_row(ancestor_boundary.end_text, group.gutter)
+              end
+            end
+            ret[#ret + 1] = hunk_boundary_row(
+              ancestor_boundary.end_text,
+              ancestor_boundary.end_segments,
+              ancestor_boundary.end_row,
+              group.gutter,
+              filename or plan.block.file,
+              boundary_old_line,
+              boundary_new_line
+            )
+            emitted_context_lines[ancestor_boundary.end_row] = true
           end
         end
       end
@@ -8528,16 +8669,23 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_ki
   ) or nil
   local suppress_start_boundary = same_hunk_context_scope(previous_context, current_context)
   local suppress_end_boundary = same_hunk_context_scope(current_context, next_context)
+  local current_ancestor_key = M._hunk_context_ancestor_key(current_context)
+  local suppress_ancestor_start = current_ancestor_key ~= nil and M._same_hunk_ancestor_scope(previous_context, current_context)
+  local suppress_ancestor_end = current_ancestor_key ~= nil and M._same_hunk_ancestor_scope(current_context, next_context)
+  local suppress_start_boundary_keys = suppress_ancestor_start and { [current_ancestor_key] = true } or nil
+  local suppress_end_boundary_keys = suppress_ancestor_end and { [current_ancestor_key] = true } or nil
   local syntax_source = (entry_kind == nil or entry_kind == "hunk") and "file" or "diff"
   local syntax_diff_text = nil
   if syntax_source == "file" then
     syntax_diff_text = M._status_file_syntax_diff_text(file)
   end
-  rows_key = ("%s:%s:%s:%s:%s"):format(
+  rows_key = ("%s:%s:%s:%s:%s:%s:%s"):format(
     hunk_key,
     hunk.staged and "staged" or "unstaged",
     suppress_start_boundary and "no-start" or "start",
     suppress_end_boundary and "no-end" or "end",
+    suppress_ancestor_start and "no-ancestor-start" or "ancestor-start",
+    suppress_ancestor_end and "no-ancestor-end" or "ancestor-end",
     syntax_source .. ":compact:" .. vim.fn.sha256(syntax_diff_text or hunk.diff or "")
   )
   local rows = M._status.fancy_rows[rows_key]
@@ -8556,6 +8704,8 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_ki
         boundary_context = true,
         suppress_start_boundary = suppress_start_boundary,
         suppress_end_boundary = suppress_end_boundary,
+        suppress_start_boundary_keys = suppress_start_boundary_keys,
+        suppress_end_boundary_keys = suppress_end_boundary_keys,
         syntax_source = syntax_source,
         syntax_diff_text = syntax_diff_text,
         compact_replacements = true,

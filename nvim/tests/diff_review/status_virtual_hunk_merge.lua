@@ -18,7 +18,8 @@ source_lines[4] = "  primitives: (),"
 source_lines[5] = "  materials: (),"
 source_lines[6] = "  bind_group: (),"
 source_lines[7] = "}"
-source_lines[8] = "impl ModelStore {"
+source_lines[8] = "// pre-impl filler"
+source_lines[69] = "impl ModelStore {"
 source_lines[70] = "  pub fn new(context: &gpu::Context) -> Self {"
 source_lines[71] = "    let primitives = ();"
 source_lines[72] = "    let materials = ();"
@@ -120,6 +121,31 @@ compact_neighbor_lines[94] = "    for mesh in model.mesh_iter() {}"
 compact_neighbor_lines[95] = "  }"
 compact_neighbor_lines[96] = "}"
 
+local typescript_lines = {
+  "class Widget {",
+  "  render() {",
+  "    const value = 2;",
+  "    return value;",
+  "  }",
+  "}",
+}
+
+local multi_function_lines = {
+  "impl MultiFunction {",
+  "  fn first(&self) {",
+  "    let first_value = 2;",
+  "  }",
+  "",
+  "  fn second(&self) {",
+  "    let second_value = 2;",
+  "  }",
+  "",
+  "  fn third(&self) {",
+  "    let third_value = 2;",
+  "  }",
+  "} // impl MultiFunction",
+}
+
 local diff_text = table.concat({
   "diff --git a/src/model_store.rs b/src/model_store.rs",
   "index 1111111..2222222 100644",
@@ -197,6 +223,26 @@ local diff_text = table.concat({
   "-        primitive_material: materials.materials.binding(),",
   "-        primitive_transform: primitive_transforms.binding(),",
   "-      });",
+  "diff --git a/src/widget.ts b/src/widget.ts",
+  "index 7777777..8888888 100644",
+  "--- a/src/widget.ts",
+  "+++ b/src/widget.ts",
+  "@@ -3 +3 @@",
+  "-    const value = 1;",
+  "+    const value = 2;",
+  "diff --git a/src/multi_function.rs b/src/multi_function.rs",
+  "index 9999999..aaaaaaa 100644",
+  "--- a/src/multi_function.rs",
+  "+++ b/src/multi_function.rs",
+  "@@ -3 +3 @@",
+  "-    let first_value = 1;",
+  "+    let first_value = 2;",
+  "@@ -7 +7 @@",
+  "-    let second_value = 1;",
+  "+    let second_value = 2;",
+  "@@ -11 +11 @@",
+  "-    let third_value = 1;",
+  "+    let third_value = 2;",
 }, "\n")
 
 ---@type DiffReviewGitBackend
@@ -220,7 +266,7 @@ function backend.systemlist(command)
   if key:find("@{upstream}", 1, true) or key:find("@{push}", 1, true) then return {}, 1 end
   if key == "git\t-C\t" .. root .. "\tls-files\t--others\t--exclude-standard" then return {}, 0 end
   if key == "git\t-C\t" .. root .. "\tdiff\t--cached\t--name-status" then return {}, 0 end
-  if key == "git\t-C\t" .. root .. "\tdiff\t--name-status" then return { "M\tsrc/model_store.rs", "M\tsrc/repeated_context.rs", "M\tsrc/compact_neighbor.rs" }, 0 end
+  if key == "git\t-C\t" .. root .. "\tdiff\t--name-status" then return { "M\tsrc/model_store.rs", "M\tsrc/repeated_context.rs", "M\tsrc/compact_neighbor.rs", "M\tsrc/widget.ts", "M\tsrc/multi_function.rs" }, 0 end
   if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0" then
     return vim.split(diff_text, "\n", { plain = true }), 0
   end
@@ -231,6 +277,8 @@ function backend.systemlist(command)
   if key == "git\t-C\t" .. root .. "\tshow\t:0:src/model_store.rs" then return source_lines, 0 end
   if key == "git\t-C\t" .. root .. "\tshow\t:0:src/repeated_context.rs" then return repeated_context_lines, 0 end
   if key == "git\t-C\t" .. root .. "\tshow\t:0:src/compact_neighbor.rs" then return compact_neighbor_lines, 0 end
+  if key == "git\t-C\t" .. root .. "\tshow\t:0:src/widget.ts" then return typescript_lines, 0 end
+  if key == "git\t-C\t" .. root .. "\tshow\t:0:src/multi_function.rs" then return multi_function_lines, 0 end
   return {}, 1
 end
 
@@ -324,6 +372,17 @@ local function find_row_in_file_section_after(buf, file_pattern, pattern, after_
   error("missing row in " .. file_pattern .. ": " .. pattern .. "\n" .. table.concat(lines, "\n"), 2)
 end
 
+local function section_has_pattern_between(buf, file_pattern, pattern, start_row, end_row)
+  local lines = buffer_lines(buf)
+  assert_true(start_row < end_row, "invalid row range for " .. file_pattern)
+  for index = start_row + 1, end_row - 1 do
+    local line = lines[index] or ""
+    if line:find("^Modified ") and not line:find(file_pattern, 1, true) then break end
+    if line:find(pattern, 1, true) then return true end
+  end
+  return false
+end
+
 local function gutter_text(buf, row)
   local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
   for _, mark in ipairs(marks) do
@@ -356,6 +415,8 @@ local function run()
   assert_true(vim.fn.writefile(source_lines, root .. "/src/model_store.rs") == 0, "writefile failed")
   assert_true(vim.fn.writefile(repeated_context_lines, root .. "/src/repeated_context.rs") == 0, "writefile failed")
   assert_true(vim.fn.writefile(compact_neighbor_lines, root .. "/src/compact_neighbor.rs") == 0, "writefile failed")
+  assert_true(vim.fn.writefile(typescript_lines, root .. "/src/widget.ts") == 0, "writefile failed")
+  assert_true(vim.fn.writefile(multi_function_lines, root .. "/src/multi_function.rs") == 0, "writefile failed")
 
   diff_review.set_git_backend(backend)
   gh.set_backend(gh_backend)
@@ -412,6 +473,16 @@ local function run()
   wait_for(function()
     return count_rows(buf, "pub fn new(context: &gpu::Context) -> Self {") == 1
   end, "same-scope neighboring display groups should render the function opener once\n" .. buffer_dump(buf))
+  local model_impl_row = find_row_in_file_section_after(buf, "model_store.rs", "impl ModelStore {", nil)
+  local model_new_row = find_row_in_file_section_after(buf, "model_store.rs", "pub fn new(context: &gpu::Context) -> Self {", model_impl_row)
+  assert_true(
+    model_new_row == model_impl_row + 1,
+    "adjacent Rust impl/function ancestors should render without an ellipsis\n" .. buffer_dump(buf)
+  )
+  assert_true(
+    count_rows_in_file_section(buf, "model_store.rs", "impl ModelStore {") == 1,
+    "Rust impl ancestor should render once for neighboring hunks\n" .. buffer_dump(buf)
+  )
   assert_true(
     count_rows(buf, "@@ +1 -0") == 0,
     "nested Self insertion should not render as a standalone +1 hunk\n" .. buffer_dump(buf)
@@ -426,6 +497,16 @@ local function run()
   assert_true(
     count_rows(buf, "build_repeated_context") == 1,
     "same-scope display groups should not repeat the function opener\n" .. buffer_dump(buf)
+  )
+  local repeated_impl_row = find_row_in_file_section_after(buf, "repeated_context.rs", "impl RepeatedContext {", nil)
+  local repeated_fn_row = find_row_in_file_section_after(buf, "repeated_context.rs", "pub fn build_repeated_context", repeated_impl_row)
+  assert_true(
+    section_has_pattern_between(buf, "repeated_context.rs", "...", repeated_impl_row, repeated_fn_row),
+    "distant Rust impl/function ancestors should render an ellipsis between boundary rows\n" .. buffer_dump(buf)
+  )
+  assert_true(
+    count_rows_in_file_section(buf, "repeated_context.rs", "impl RepeatedContext {") == 1,
+    "distant Rust impl ancestor should render once\n" .. buffer_dump(buf)
   )
   assert_true(
     count_rows_in_file_section(buf, "repeated_context.rs", "@@ +1 -0") >= 1,
@@ -453,6 +534,43 @@ local function run()
   assert_true(
     particle_close_row < todo_row and todo_row < compact_self_row,
     "small-gap merged hunks should render bridge context instead of jumping from the add block to Self\n" .. buffer_dump(buf)
+  )
+
+  trigger_normal_mapping("<Tab>", find_row(buf, "widget.ts"))
+  wait_for(function()
+    return buffer_contains(buf, "class Widget {")
+      and buffer_contains(buf, "render() {")
+      and buffer_contains(buf, "const value = 2;")
+  end, "TypeScript class/method ancestor context did not render\n" .. buffer_dump(buf))
+  local class_row = find_row_in_file_section_after(buf, "widget.ts", "class Widget {", nil)
+  local method_row = find_row_in_file_section_after(buf, "widget.ts", "render() {", class_row)
+  assert_true(
+    method_row == class_row + 1,
+    "adjacent TypeScript class/method ancestors should render without an ellipsis\n" .. buffer_dump(buf)
+  )
+
+  trigger_normal_mapping("<Tab>", find_row(buf, "multi_function.rs"))
+  wait_for(function()
+    return buffer_contains(buf, "impl MultiFunction {")
+      and buffer_contains(buf, "let first_value = 2;")
+      and buffer_contains(buf, "let third_value = 2;")
+      and buffer_contains(buf, "} // impl MultiFunction")
+  end, "multi-function ancestor context did not render\n" .. buffer_dump(buf))
+  assert_true(
+    count_rows_in_file_section(buf, "multi_function.rs", "impl MultiFunction {") == 1,
+    "same-impl hunks should render the ancestor opener only on the first displayed hunk\n" .. buffer_dump(buf)
+  )
+  assert_true(
+    count_rows_in_file_section(buf, "multi_function.rs", "} // impl MultiFunction") == 1,
+    "same-impl hunks should render the ancestor closer only on the last displayed hunk\n" .. buffer_dump(buf)
+  )
+  local multi_impl_row = find_row_in_file_section_after(buf, "multi_function.rs", "impl MultiFunction {", nil)
+  local multi_first_row = find_row_in_file_section_after(buf, "multi_function.rs", "fn first", multi_impl_row)
+  local multi_third_row = find_row_in_file_section_after(buf, "multi_function.rs", "let third_value = 2;", multi_first_row)
+  local multi_close_row = find_row_in_file_section_after(buf, "multi_function.rs", "} // impl MultiFunction", multi_third_row)
+  assert_true(
+    multi_impl_row < multi_first_row and multi_third_row < multi_close_row,
+    "same-impl ancestor opener/closer should bracket the displayed hunk run\n" .. buffer_dump(buf)
   )
 end
 
