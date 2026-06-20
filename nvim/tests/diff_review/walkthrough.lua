@@ -163,17 +163,6 @@ local function buffer_contains(buf, needle)
   return false
 end
 
-local function file_entry_matches(entry, suffix)
-  local file = entry and entry.file or nil
-  if not file then return false end
-  suffix = suffix:gsub("\\", "/")
-  for _, value in ipairs({ file.relpath, file.filename }) do
-    local path = tostring(value or ""):gsub("\\", "/")
-    if path == suffix or path:sub(-(#suffix + 1)) == "/" .. suffix then return true end
-  end
-  return false
-end
-
 local function buffer_has_highlight(buf, hl_group)
   local marks = vim.api.nvim_buf_get_extmarks(buf, walkthrough._ns, 0, -1, { details = true })
   for _, mark in ipairs(marks) do
@@ -279,14 +268,6 @@ local function row_has_line_highlight(buf, row, hl_group)
     if (mark[4] or {}).line_hl_group == hl_group then return true end
   end
   return false
-end
-
-local function first_row_with_line_highlight(buf, hl_group)
-  local marks = vim.api.nvim_buf_get_extmarks(buf, walkthrough._ns, 0, -1, { details = true })
-  for _, mark in ipairs(marks) do
-    if (mark[4] or {}).line_hl_group == hl_group then return mark[2] + 1 end
-  end
-  return nil
 end
 
 --- Concatenated text of the inline comment box (virt_lines extmarks).
@@ -464,12 +445,13 @@ end
 local function start_walkthrough(buf)
   captured_notifications = {}
   trigger_buf_mapping(buf, "ow")
+  local summary_buf
   wait_for(function()
-    return buffer_contains(buf, "Overview:") and comment_box_mark(buf) ~= nil
-  end, "walkthrough did not start")
-  local _, float_buf = find_float_with("walkthrough fixture")
-  assert_true(float_buf == nil, "walkthrough should not open a summary popup")
-  return buf
+    local _, float_buf = find_float_with("walkthrough fixture")
+    summary_buf = float_buf
+    return float_buf ~= nil
+  end, "summary popup did not open")
+  return summary_buf
 end
 
 local function run()
@@ -479,73 +461,85 @@ local function run()
   walkthrough.set_reader(fixture_reader)
   diff_review.setup({ about_auto_generate = false })
 
-  -- ── happy path: presentation, exact step, region highlight, comment box ───
+  -- ── happy path: summary, exact step, region highlight, comment float ──────
   set_walkthrough_doc(valid_doc())
   local buf = open_status()
   local original_q_desc = vim.api.nvim_buf_call(buf, function()
     return vim.fn.maparg("q", "n", false, true).desc
   end)
 
-  vim.o.columns = 120
-  start_walkthrough(buf)
-  wait_for(function() return buffer_contains(buf, "Overview:") end, "walkthrough presentation overview missing")
-  assert_true(buffer_contains(buf, "1. Update a.txt through the first task."),
-    "walkthrough presentation task 1 missing")
-  assert_true(buffer_contains(buf, "2. Update b.txt through the second task."),
-    "walkthrough presentation task 2 missing")
-  assert_true(buffer_contains(buf, "Unstaged Changes (1):"),
-    "walkthrough presentation should group matching unstaged files per task")
-  assert_true(not buffer_contains(buf, "Unstaged changes (2):"),
-    "walkthrough presentation should replace the flat unstaged section")
-  local task_file_entry = nil
-  local second_task_file_entry = nil
-  for _, entry in pairs(diff_review._status.entries or {}) do
-    if entry.kind == "file"
-      and file_entry_matches(entry, "a.txt")
-      and entry.file.walkthrough_action_hunks_only
-      and tostring(entry.file.walkthrough_key_prefix or ""):find("walkthrough:task:1", 1, true) then
-      task_file_entry = entry
-    elseif entry.kind == "file"
-      and file_entry_matches(entry, "b.txt")
-      and entry.file.walkthrough_action_hunks_only
-      and tostring(entry.file.walkthrough_key_prefix or ""):find("walkthrough:task:2", 1, true) then
-      second_task_file_entry = entry
-    end
-  end
-  assert_true(task_file_entry ~= nil, "walkthrough task file row should mark partial hunk actions")
-  assert_true(second_task_file_entry ~= nil, "walkthrough task 2 file row missing")
-  local action_entries = diff_review._status_action_entries_for_file(task_file_entry.file)
-  assert_true(#action_entries == 1 and action_entries[1].kind == "hunk",
-    "partial walkthrough file row should expand to hunk action entries")
-  assert_true(not saw_notification_containing("Walkthrough generated against"), "fresh walkthrough should not warn")
-  assert_true(not buffer_contains(buf, "Major changes:"),
-    "walkthrough presentation should not show redundant major changes heading")
-  assert_true(buffer_contains(buf, " Reviewers need the fixture story before individual file rewrites."),
-    "walkthrough presentation task justification missing")
-  assert_true(buffer_contains(buf, " file Fixture edits"), "walkthrough presentation group type row missing")
-  assert_true(buffer_contains(buf, "    └─ Rewrite the first fixture file."),
-    "walkthrough presentation subtask row missing")
-  assert_true(buffer_contains(buf, "       └─ Modify Resource a.txt rewrite to rewrite"),
-    "walkthrough presentation item action row missing display verb")
-  assert_true(buffer_contains(buf, "       └─ Add fn b.txt rewrite to repeat"),
-    "walkthrough presentation add action row should not be padded")
-  assert_true(buffer_contains(buf, "the second line"),
-    "walkthrough presentation item inline note prefix missing")
+  local summary_buf = start_walkthrough(buf)
+  assert_true(not buffer_contains(summary_buf, "WARNING"), "fresh walkthrough should not warn")
+  assert_true(not buffer_contains(summary_buf, "Major changes:"), "summary should not show redundant major changes heading")
+  assert_true(not buffer_contains(summary_buf, "├─ Update a.txt through the first task."), "summary should not show redundant top-level graph")
+  assert_true(buffer_has_highlight_for_text(summary_buf, "1. Update a.txt through the first task.",
+    "1. Update a.txt through the first task.", "DiffReviewWalkthroughItemTitle"),
+    "summary task title should be bold white")
+  assert_true(buffer_contains(summary_buf, "Reviewers need the fixture story before individual file rewrites."),
+    "summary task justification missing")
+  assert_true(buffer_contains(summary_buf, "The first fixture row carries the opening example for"),
+    "summary subtask justification missing")
+  assert_true(buffer_contains(summary_buf, "rendering."),
+    "summary subtask justification continuation missing")
+  assert_true(not buffer_contains(summary_buf, "why:"), "summary justification should not render a why label")
+  assert_true(buffer_contains(summary_buf, " file Fixture edits"), "summary group type row missing")
+  assert_true(buffer_contains(summary_buf, "    └─ Rewrite the first fixture file."), "summary subtask row missing")
+  assert_true(buffer_contains(summary_buf, "       └─ Modify Resource a.txt rewrite to rewrite"),
+    "summary item action row missing display verb")
+  assert_true(buffer_contains(summary_buf, "       └─ Add fn b.txt rewrite to repeat"),
+    "summary add action row should not be padded")
+  assert_true(buffer_contains(summary_buf, "the second line"),
+    "summary item inline note prefix missing")
+  local item_row = find_row(summary_buf, "a.txt rewrite to rewrite the second line")
+  local item_line = find_line(summary_buf, "a.txt rewrite to rewrite the second line")
+  local item_note_continuation = find_line_after(summary_buf, "first fixture file", item_row)
+  assert_true(first_text_col(item_note_continuation) == display_col_before(item_line, "rewrite the second line"),
+    "summary inline note continuation should align under note")
+  assert_true(buffer_contains(summary_buf, "first fixture file"),
+    "summary item inline note missing")
+  assert_true(buffer_has_highlight(summary_buf, "DiffReviewWalkthroughActionUpdate"), "summary action highlight missing")
+  assert_true(buffer_has_highlight(summary_buf, "DiffReviewWalkthroughItemTitle"), "summary item title highlight missing")
+  assert_true(buffer_has_highlight_for_text(summary_buf, "Fixture edits", "file", "DiffReviewWalkthroughType"),
+    "summary group type highlight missing")
+  assert_true(buffer_has_highlight_for_text(summary_buf, "Fixture edits", "Fixture edits",
+    "DiffReviewWalkthroughItemTitle"), "summary group title highlight missing")
+  assert_true(not buffer_contains(summary_buf, "󰈙 file Fixture edits"), "summary should not show group type icon")
+  assert_true(not buffer_contains(summary_buf, "File Fixture edits"), "summary should not show group type text")
+  assert_true(not buffer_contains(summary_buf, "󰙅 Resource a.txt rewrite"), "summary should not show item type icon")
+  assert_true(not buffer_contains(summary_buf, "󰊕 fn b.txt rewrite"), "summary should not show function type icon")
+  assert_true(not buffer_contains(summary_buf, "Struct a.txt rewrite"), "summary should not show item type text")
+  assert_true(not buffer_contains(summary_buf, "struct a.txt rewrite"), "summary should not show fallback type keyword")
+  assert_true(buffer_contains(summary_buf, "Resource a.txt rewrite"), "summary should show item subtype text")
+  assert_true(not buffer_contains(summary_buf, "Function b.txt rewrite"), "summary should not show function type text")
+  assert_true(buffer_has_highlight_for_text(summary_buf, "a.txt rewrite", "Resource",
+    "DiffReviewWalkthroughActionUpdate"), "summary modified item type should match action highlight")
+  assert_true(buffer_has_highlight_for_text(summary_buf, "b.txt rewrite", "fn",
+    "DiffReviewWalkthroughActionAdd"), "summary added function type should match action highlight")
+  assert_true(buffer_has_highlight_for_text(summary_buf, "Modify Resource a.txt rewrite", "Modify",
+    "DiffReviewWalkthroughActionUpdate"), "summary action highlight missing")
+  assert_true(buffer_has_highlight_for_text(summary_buf, "a.txt rewrite", "a.txt rewrite",
+    "DiffReviewWalkthroughItemTitle"), "summary item title highlight missing")
+  assert_true(not buffer_has_highlight_for_text(summary_buf, "a.txt rewrite to rewrite", "second",
+    "DiffReviewWalkthroughItemTitle"), "summary inline note should not be title-highlighted")
   local action_hl = vim.api.nvim_get_hl(0, { name = "DiffReviewWalkthroughActionUpdate" })
-  assert_true(action_hl.italic == true, "walkthrough action highlight should be italic")
+  assert_true(action_hl.italic == true, "summary action highlight should be italic")
   local type_hl = vim.api.nvim_get_hl(0, { name = "DiffReviewWalkthroughType" })
-  assert_true(type_hl.fg == 0x5bff94, "walkthrough group type highlight should use config green")
+  assert_true(type_hl.fg == 0x5bff94, "summary group type highlight should use config green")
   local title_hl = vim.api.nvim_get_hl(0, { name = "DiffReviewWalkthroughItemTitle" })
-  assert_true(title_hl.bold == true and title_hl.fg == 0xffffff, "walkthrough item title should be bold white")
+  assert_true(title_hl.bold == true and title_hl.fg == 0xffffff, "summary item title should be bold white")
+  assert_true(buffer_has_highlight_for_text(summary_buf, "Reviewers need the fixture story", "Reviewers",
+    "DiffReviewWalkthroughJustification"), "summary task justification highlight missing")
+  assert_true(buffer_has_highlight_for_text(summary_buf, "The first fixture row", "The first fixture row",
+    "DiffReviewWalkthroughJustification"), "summary subtask justification highlight missing")
   local justification_hl = vim.api.nvim_get_hl(0, { name = "DiffReviewWalkthroughJustification" })
   assert_true(justification_hl.fg == 0xe5c07b and justification_hl.italic == true,
-    "walkthrough justification should be yellow italic")
-  assert_true(not buffer_contains(buf, "Legend:"), "walkthrough presentation should not show an action legend")
+    "summary justification should be yellow italic")
+  assert_true(not buffer_contains(summary_buf, "Legend:"), "summary should not show an action legend")
+  vim.o.columns = 120
+  trigger_buf_mapping(summary_buf, "y")
 
-  wait_for(function()
-    return first_row_with_line_highlight(buf, "DiffReviewWalkthroughRegionAdd") ~= nil
-  end, "step 1 did not highlight the changed a.txt row")
-  local step_row = first_row_with_line_highlight(buf, "DiffReviewWalkthroughRegionAdd")
+  wait_for(function() return buffer_contains(buf, "NEW a.txt") end, "step 1 did not expand a.txt hunks")
+  local step_row = find_row(buf, "NEW a.txt")
   local cursor_row = vim.api.nvim_win_get_cursor(vim.fn.bufwinid(buf))[1]
   assert_true(cursor_row == step_row, ("cursor not on step row (expected %d, got %d)"):format(step_row, cursor_row))
   assert_true(walkthrough_extmark_count(buf) > 0, "region extmarks missing")
@@ -631,9 +625,13 @@ local function run()
   wait_for(function() return box_contains(buf, "concrete changed line") end, "z did not return to step 1")
 
   trigger_buf_mapping(buf, "z")
-  wait_for(function() return box_contains(buf, "concrete changed line") end,
-    "z at step 1 should stay on the first step")
-  trigger_buf_mapping(buf, "q")
+  local resume_buf
+  wait_for(function()
+    local _, float_buf = find_float_with("walkthrough fixture")
+    resume_buf = float_buf
+    return float_buf ~= nil
+  end, "z past step 1 did not reopen the summary")
+  trigger_buf_mapping(resume_buf, "q")
   wait_for(function() return walkthrough_extmark_count(buf) == 0 end, "quit did not clear extmarks")
   local restored_q_desc = vim.api.nvim_buf_call(buf, function()
     return vim.fn.maparg("q", "n", false, true).desc
@@ -643,12 +641,10 @@ local function run()
     return vim.fn.maparg("z", "n", false, true)
   end)
   assert_true(z_map.buffer ~= 1, "z should not remain buffer-mapped after quit")
-  wait_for(function() return buffer_contains(buf, "Unstaged changes (2):") end,
-    "quit should restore the flat GitStatus presentation")
-  assert_true(not buffer_contains(buf, "Overview:"), "quit should clear walkthrough presentation")
 
   -- ── completion past the last step ──────────────────────────────────────────
-  start_walkthrough(buf)
+  summary_buf = start_walkthrough(buf)
+  trigger_buf_mapping(summary_buf, "y")
   wait_for(function() return box_contains(buf, "concrete changed line") end, "restart did not show step 1")
   trigger_buf_mapping(buf, "y")
   wait_for(function() return box_contains(buf, "task total") end, "restart did not reach step 2")
@@ -657,92 +653,15 @@ local function run()
   trigger_buf_mapping(buf, "y")
   wait_for(function() return saw_notification_containing("Walkthrough complete") end, "no completion notification")
   assert_true(walkthrough_extmark_count(buf) == 0, "completion did not clear extmarks")
-  wait_for(function() return buffer_contains(buf, "Unstaged changes (2):") end,
-    "completion should restore the flat GitStatus presentation")
-  close_all_floats()
-
-  -- ── task file rows sort by walkthrough block order ─────────────────────────
-  local ordered_doc = valid_doc()
-  ordered_doc.tasks = {
-    {
-      title = "Order file rows by walkthrough comments.",
-      groups = {
-        {
-          type = "File",
-          title = "Ordered fixtures",
-          subtasks = {
-            {
-              title = "Put b before a.",
-              items = {
-                {
-                  action = "Update",
-                  type = "Test",
-                  title = "b.txt first",
-                  note = "drive presentation order from comment blocks",
-                  steps = {
-                    {
-                      title = "Visit b.txt first.",
-                      file = "b.txt",
-                      start = { line = 2, col = 1 },
-                      ["end"] = { line = 2, col = 9 },
-                      comment = "The first walkthrough block belongs to b.txt.",
-                    },
-                  },
-                },
-                {
-                  action = "Update",
-                  type = "Test",
-                  title = "a.txt second",
-                  note = "keep later files lower in the task section",
-                  steps = {
-                    {
-                      title = "Visit a.txt second.",
-                      file = "a.txt",
-                      start = { line = 2, col = 1 },
-                      ["end"] = { line = 2, col = 9 },
-                      comment = "The second walkthrough block belongs to a.txt.",
-                    },
-                  },
-                },
-              },
-            },
-          },
-        },
-      },
-    },
-  }
-  set_walkthrough_doc(ordered_doc)
-  start_walkthrough(buf)
-  local ordered_a_row = nil
-  local ordered_b_row = nil
-  for row, entry in pairs(diff_review._status.entries or {}) do
-    if entry.kind == "file"
-        and tostring(entry.file and entry.file.walkthrough_key_prefix or ""):find("walkthrough:task:1:unstaged", 1, true) then
-      if file_entry_matches(entry, "a.txt") then
-        ordered_a_row = row
-      elseif file_entry_matches(entry, "b.txt") then
-        ordered_b_row = row
-      end
-    end
-  end
-  assert_true(ordered_a_row ~= nil and ordered_b_row ~= nil,
-    "ordered walkthrough task should render both fixture file rows")
-  assert_true(ordered_b_row < ordered_a_row, "b.txt should render before a.txt by walkthrough step order")
-  trigger_buf_mapping(buf, "q")
-  wait_for(function() return buffer_contains(buf, "Unstaged changes (2):") end,
-    "ordered walkthrough quit should restore the flat GitStatus presentation")
   close_all_floats()
 
   -- ── document staleness warning ─────────────────────────────────────────────
   local stale_doc = valid_doc()
   stale_doc.commit = string.rep("b", 40)
   set_walkthrough_doc(stale_doc)
-  start_walkthrough(buf)
-  wait_for(function() return saw_notification_containing("Walkthrough generated against") end,
-    "stale walkthrough should warn via notification")
-  trigger_buf_mapping(buf, "q")
-  wait_for(function() return buffer_contains(buf, "Unstaged changes (2):") end,
-    "closing stale walkthrough should restore the flat GitStatus presentation")
+  summary_buf = start_walkthrough(buf)
+  assert_true(buffer_contains(summary_buf, "WARNING"), "stale walkthrough should warn in the summary")
+  trigger_buf_mapping(summary_buf, "q")
   close_all_floats()
 
   -- ── step staleness: nearest line + missing file ───────────────────────────
@@ -794,7 +713,8 @@ local function run()
     },
   }
   set_walkthrough_doc(degraded)
-  start_walkthrough(buf)
+  summary_buf = start_walkthrough(buf)
+  trigger_buf_mapping(summary_buf, "y")
   wait_for(function() return box_contains(buf, "position approximated") end, "nearest match note missing")
   trigger_buf_mapping(buf, "y")
   wait_for(function() return box_contains(buf, "not in current diff") end, "missing file note missing")
@@ -867,7 +787,8 @@ local function run()
     },
   }
   set_walkthrough_doc(staged_doc)
-  start_walkthrough(buf)
+  summary_buf = start_walkthrough(buf)
+  trigger_buf_mapping(summary_buf, "y")
   wait_for(function() return box_contains(buf, "staged section") end, "staged step box did not render")
   local staged_row = find_row(buf, "NEW c.txt")
   cursor_row = vim.api.nvim_win_get_cursor(vim.fn.bufwinid(buf))[1]
@@ -921,7 +842,8 @@ local function run()
 
   -- ── re-render while active re-applies decorations ──────────────────────────
   set_walkthrough_doc(valid_doc())
-  start_walkthrough(buf)
+  summary_buf = start_walkthrough(buf)
+  trigger_buf_mapping(summary_buf, "y")
   wait_for(function() return walkthrough_extmark_count(buf) > 0 end, "no extmarks before re-render")
   diff_review.render_status(buf, nil, nil, { reuse_sections = true })
   wait_for(function() return walkthrough_extmark_count(buf) > 0 end, "re-render dropped walkthrough extmarks")

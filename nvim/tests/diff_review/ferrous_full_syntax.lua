@@ -308,7 +308,8 @@ local function model_store_block_range(buf)
   for row = start_row + 1, #lines do
     if lines[row]:match("^Modified ")
       or lines[row]:match("^New%s+")
-      or lines[row]:match("^Removed ") then
+      or lines[row]:match("^Removed ")
+      or lines[row]:match("^Untracked files") then
       return start_row + 1, row - 1
     end
   end
