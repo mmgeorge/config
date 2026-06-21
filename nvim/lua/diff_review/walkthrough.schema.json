@@ -41,7 +41,7 @@
         "title": {
           "type": "string",
           "minLength": 1,
-          "description": "Active author-context sentence, e.g. Add..., Update..., Move..., Split..., Remove..., Preserve..."
+          "description": "Active author-context sentence, e.g. Add..., Modify..., Remove..., Preserve..."
         },
         "justification": {
           "type": "string",
@@ -105,8 +105,8 @@
       "additionalProperties": false,
       "properties": {
         "action": {
-          "enum": ["Add", "Update", "Move", "Remove", "Split"],
-          "description": "Title-cased action verb. Update displays as Modify in the summary."
+          "enum": ["Add", "Modify", "Remove"],
+          "description": "Title-cased action verb."
         },
         "type": {
           "$ref": "#/$defs/itemType"
@@ -146,13 +146,16 @@
         "Trait",
         "Interface",
         "Test",
+        "Doc",
+        "Plan",
+        "App",
         "Config",
         "Function",
         "Method",
         "Constant",
         "Field"
       ],
-      "description": "Broad programming construct rendered as a lowercase keyword between the action and item title unless subtype is set. Function and Method both render as fn."
+      "description": "Broad programming or review artifact rendered as a lowercase keyword between the action and item title unless subtype is set. Function and Method both render as fn."
     },
     "position": {
       "type": "object",

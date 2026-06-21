@@ -174,15 +174,13 @@ local function parse_optional_string_field(value, error_prefix, field, max_lengt
   return value, nil
 end
 
-local action_order = { "Add", "Update", "Move", "Remove", "Split" }
+local action_order = { "Add", "Modify", "Remove" }
 local group_type_order = { "Module", "File", "Package", "Directory" }
 local callout_text_max_length = 180
 local valid_item_actions = {
   Add = true,
-  Update = true,
-  Move = true,
+  Modify = true,
   Remove = true,
-  Split = true,
 }
 local item_note_max_length = 50
 local justification_max_length = 170
@@ -212,13 +210,15 @@ local valid_item_types = {
   Method = true,
   Constant = true,
   Test = true,
+  Doc = true,
+  Plan = true,
+  App = true,
   Config = true,
 }
 local action_highlights = {
   Add = "DiffReviewWalkthroughActionAdd",
-  Update = "DiffReviewWalkthroughActionUpdate",
+  Modify = "DiffReviewWalkthroughActionModify",
   Remove = "DiffReviewWalkthroughActionRemove",
-  Split = "DiffReviewWalkthroughActionSplit",
 }
 local callout_labels = {
   important = "Important",
@@ -238,14 +238,6 @@ local callout_highlights = {
   deviation = "DiffReviewWalkthroughCalloutDeviation",
   workaround = "DiffReviewWalkthroughCalloutWorkaround",
 }
-local action_display_labels = {
-  Add = "Add",
-  Update = "Modify",
-  Move = "Move",
-  Remove = "Remove",
-  Split = "Split",
-}
-
 ---@param is_last boolean
 ---@return string
 local function tree_branch(is_last)
@@ -261,7 +253,7 @@ end
 ---@param action string
 ---@return string
 local function format_action(action)
-  return action_display_labels[action] or action
+  return action
 end
 
 ---@param type_name string
@@ -1494,48 +1486,137 @@ local function basename(path)
 end
 
 ---@param step DiffReviewWalkthroughStep
+---@param stats {added: integer, removed: integer}|nil
 ---@return string
-local function status_step_location_label(step)
+local function status_step_location_label(step, stats)
   local file = basename(step.file)
   local line = tonumber(step.start_pos and step.start_pos.line) or 1
-  return ("%s:%d:"):format(file, line)
+  if stats then
+    return ("%s:%d +%d -%d"):format(file, line, stats.added, stats.removed)
+  end
+  return ("%s:%d"):format(file, line)
 end
 
----@param tasks DiffReviewWalkthroughTask[]
----@return integer
-local function status_step_location_label_width(tasks)
-  local max_width = 0
-  for _, task in ipairs(tasks or {}) do
-    for _, group in ipairs(task.groups or {}) do
-      for _, subtask in ipairs(group.subtasks or {}) do
-        for _, item in ipairs(subtask.items or {}) do
-          for _, step in ipairs(item.steps or {}) do
-            max_width = math.max(max_width, vim.fn.strdisplaywidth(status_step_location_label(step)))
+---@param line string
+---@return integer|nil
+---@return integer|nil
+local function parse_unified_header_positions(line)
+  local old_start, new_start = line:match("^@@ %-(%d+),?%d* %+(%d+),?%d* @@")
+  return tonumber(old_start), tonumber(new_start)
+end
+
+---@param step DiffReviewWalkthroughStep
+---@param line integer?
+---@return boolean
+local function step_contains_line(step, line)
+  if not line then return false end
+  local start_line = tonumber(step.start_pos and step.start_pos.line) or 1
+  local end_line = tonumber(step.end_pos and step.end_pos.line) or start_line
+  if end_line < start_line then
+    start_line, end_line = end_line, start_line
+  end
+  return line >= start_line and line <= end_line
+end
+
+---@param diff_text string
+---@param step DiffReviewWalkthroughStep
+---@return integer added
+---@return integer removed
+local function status_step_stats_from_diff(diff_text, step)
+  local added = 0
+  local removed = 0
+  local old_line = nil
+  local new_line = nil
+
+  for _, line in ipairs(vim.split(tostring(diff_text or ""), "\n", { plain = true })) do
+    line = line:gsub("\r$", "")
+    local header_old, header_new = parse_unified_header_positions(line)
+    if header_old and header_new then
+      old_line = header_old
+      new_line = header_new
+    elseif old_line and new_line then
+      local prefix = line:sub(1, 1)
+      if prefix == "+" then
+        if step_contains_line(step, new_line) then
+          added = added + 1
+        end
+        new_line = new_line + 1
+      elseif prefix == "-" then
+        local current_line = math.max(new_line, 1)
+        if step_contains_line(step, current_line) then
+          removed = removed + 1
+        end
+        old_line = old_line + 1
+      elseif prefix == " " then
+        old_line = old_line + 1
+        new_line = new_line + 1
+      end
+    end
+  end
+
+  return added, removed
+end
+
+---@param state table|nil
+---@param step DiffReviewWalkthroughStep
+---@return {added: integer, removed: integer}|nil
+local function status_step_stats(state, step)
+  if type(state) ~= "table" or type(step.file) ~= "string" then
+    return nil
+  end
+
+  local added = 0
+  local removed = 0
+  local matched = false
+
+  for _, section in ipairs(state.sections or {}) do
+    for _, file in ipairs(section.files or {}) do
+      if matches_file(file.relpath or file.filename, step.file) then
+        matched = true
+        for _, hunk in ipairs(file.hunks or {}) do
+          local raw_hunks = type(hunk.raw_hunks) == "table" and hunk.raw_hunks or { hunk }
+          for _, raw_hunk in ipairs(raw_hunks) do
+            local hunk_added, hunk_removed = status_step_stats_from_diff(raw_hunk.diff, step)
+            added = added + hunk_added
+            removed = removed + hunk_removed
           end
         end
       end
     end
   end
-  return max_width
+
+  if not matched then
+    return nil
+  end
+  return { added = added, removed = removed }
 end
 
 ---@param step DiffReviewWalkthroughStep
 ---@param prefix string
----@param max_location_label_width integer
+---@param stats {added: integer, removed: integer}|nil
+---@param title_width integer?
 ---@return string
 ---@return table[] segments
-local function status_step_location_text(step, prefix, max_location_label_width)
+local function status_step_location_text(step, prefix, stats, title_width)
   local title = step.title or step.item_title or step.subtask_title or "Walkthrough comment"
-  local location_label = status_step_location_label(step)
-  local padding_width = math.max(1, max_location_label_width - vim.fn.strdisplaywidth(location_label) + 1)
-  local padding = string.rep(" ", padding_width)
-  local text = ("%s%s%s%s"):format(prefix, location_label, padding, title)
-  return text, {
+  local location_label = status_step_location_label(step, stats)
+  local file = basename(step.file)
+  local line = tonumber(step.start_pos and step.start_pos.line) or 1
+  local file_label = ("%s:%d"):format(file, line)
+  local padding = (" "):rep(math.max(1, (title_width or vim.fn.strdisplaywidth(title)) - vim.fn.strdisplaywidth(title) + 1))
+  local text = ("%s%s%s[%s]"):format(prefix, title, padding, location_label)
+  local segments = {
     { prefix },
-    { location_label, "DiffReviewStatusPath" },
-    { padding },
     { title },
+    { padding .. "[" },
+    { file_label, "DiffReviewStatusPath" },
   }
+  if stats then
+    segments[#segments + 1] = { (" +%d"):format(stats.added), "DiffReviewAddRange" }
+    segments[#segments + 1] = { (" -%d"):format(stats.removed), "DiffReviewDeleteRange" }
+  end
+  segments[#segments + 1] = { "]" }
+  return text, segments
 end
 
 ---@param rows table[]
@@ -1543,8 +1624,8 @@ end
 ---@param task_id string
 ---@param width integer
 ---@param item_titles string[]
----@param max_location_label_width integer
-local function append_status_task_body_rows(rows, task, task_id, width, item_titles, max_location_label_width)
+---@param state table|nil
+local function append_status_task_body_rows(rows, task, task_id, width, item_titles, state)
   for group_index, group in ipairs(task.groups) do
     local group_id = ("%s:group:%d"):format(task_id, group_index)
     append_status_summary_rows(rows, format_type_keyword(group.type) .. " " .. group.title, {
@@ -1582,9 +1663,15 @@ local function append_status_task_body_rows(rows, task, task_id, width, item_tit
         }, width, item_titles)
         local step_prefix = item_prefix .. tree_continuation(item_is_last)
         local item_steps = item.steps or {}
+        local step_title_width = 0
+        for _, step in ipairs(item_steps) do
+          local title = step.title or step.item_title or step.subtask_title or "Walkthrough comment"
+          step_title_width = math.max(step_title_width, vim.fn.strdisplaywidth(title))
+        end
         for step_index, step in ipairs(item_steps) do
           local step_id = ("%s:step:%d"):format(item_id, step_index)
-          local step_text, step_segments = status_step_location_text(step, step_prefix, max_location_label_width)
+          local step_text, step_segments = status_step_location_text(step, step_prefix, status_step_stats(state, step),
+            step_title_width)
           append_status_summary_rows(rows, step_text, {
             id = step_id,
             parent_id = item_id,
@@ -1603,7 +1690,7 @@ end
 local function status_summary_rows(mode)
   local width = math.max(40, vim.o.columns - 4)
   local item_titles = collect_summary_item_titles(mode.doc.tasks)
-  local max_location_label_width = status_step_location_label_width(mode.doc.tasks)
+  local state = mode.host.get_state()
   local rows = {}
 
   for _, line in ipairs(summary_lines(vim.trim(mode.doc.overview or ""), width, item_titles)) do
@@ -1627,7 +1714,16 @@ local function status_summary_rows(mode)
       }
     end
 
-    append_status_task_body_rows(rows, task, task_id, width, item_titles, max_location_label_width)
+    append_status_task_body_rows(rows, task, task_id, width, item_titles, state)
+    if task_index < #(mode.doc.tasks or {}) then
+      rows[#rows + 1] = {
+        text = "",
+        id = ("%s:separator"):format(task_id),
+        parent_id = task_id,
+        kind = "pr_head_line",
+        fold_target_id = task_id,
+      }
+    end
   end
 
   return rows
