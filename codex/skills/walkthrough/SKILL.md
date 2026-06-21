@@ -30,8 +30,12 @@ file when exact enum values or required fields are unclear.
 Required top-level shape:
 
 ```text
-version: 7
+version: 9
+narrative:
+  type: data_flow | capability | ownership_boundary | runtime_layer | risk_contract
+  justification: why this frame fits the current diff
 overview: 2-3 sentence before/now story with precise, accessible prose
+root: active author-context sentence for the overall change
 commit: full HEAD sha
 tasks[]:
   title: architectural review claim, often a plain-language role
@@ -42,13 +46,13 @@ tasks[]:
     subtasks[]:
       title: high-level local design move
       justification?: exceptional local rationale
-      items[]:
+      changes[]:
         action: Add | Modify | Remove
-        type: Class | Struct | Enum | Trait | Interface | Test | Doc | Plan | App | Config | Function | Method | Constant | Field
-        subtype?: narrow semantic codebase-specific label, such a specific subclass or interface.
-        title: concrete code construct, symbol, or story node
+        kind: Class | Struct | Enum | Trait | Interface | Test | Doc | Plan | App | Config | Function | Method | Constant | Field
+        role?: optional code-proven role label, such as Cache or Adapter
+        target: concrete code construct, symbol, or story node
         note: imperative fragment, 50 chars or less
-        steps[]:
+        annotations[]:
           title: local code action sentence
           file: repo-relative path with forward slashes
           start/end: current file positions, 1-based line and column
@@ -58,12 +62,27 @@ tasks[]:
 
 ## 3. Writing Rules
 
-**Story order**
-- Sequence tasks by review narrative, not raw file or diff order: public
-  surface, core logic, call sites, then tests/config.
-- Keep `tasks[]` to the major review claims, usually 2-4. Place demos, docs,
-  tests, and follow-up plans into the feature they validate or explain
-  unless they are the main change.
+**Narrative frame**
+- Set top-level `narrative.type` to the chosen frame and
+  `narrative.justification` to a short explanation of why that frame fits this
+  diff. Keep task order consistent with the selected frame. Prefer `data_flow`
+  when the change can be explained as state, requests, events, buffers, records,
+  or artifacts moving through the system.
+- The task list must visibly follow the selected narrative. Each top-level task
+  should advance that frame's review sequence instead of switching to unrelated
+  file, layer, artifact-type, or implementation buckets.
+- Allowed frames:
+  - `data_flow`: follow the main state, request, event, buffer, record, or
+    artifact through producers, transforms/stores, and consumers.
+  - `capability`: explain the responsibilities required to deliver a new
+    user-facing or developer-facing capability when no single data object is the
+    clearest guide.
+  - `ownership_boundary`: follow responsibility as it moves between constructs
+    or layers, especially when the change reduces coupling or centralizes state.
+  - `runtime_layer`: explain work split across runtime layers or lifecycle
+    phases, such as API surface, coordinator, worker, storage, and UI.
+  - `risk_contract`: organize around invariants, compatibility, migrations,
+    security, data integrity, performance, or regression risk.
 
 **Prose**
 - Use precise, accessible language: concrete nouns, plain verbs, short
@@ -72,6 +91,9 @@ tasks[]:
   or subscription-style publication. Prefer `stores`, `writes`, `updates`,
   `provides`, or `reads` when data is kept in a resource, assigned into shared
   state, refreshed for consumers, exposed through an accessor, or consumed.
+- Be precise about ownership. Do not infer ownership from the package/module
+  name or primary consumer. Use `shared`, `written by`, `read by`, or `updated
+  by` when state crosses systems.
 - Before writing final prose, check each architecture noun phrase. If a reviewer
   could ask "what is that?" because the phrase is new, generic, or project-local,
   either replace it with a clearer role or explain it in the same sentence. For
@@ -99,23 +121,29 @@ tasks[]:
   overview. Put those in tasks, groups, and items.
 
 **Tasks**
-- Tasks are major review claims, not every changed file or artifact type. Use
-  them to split the overview into the few responsibilities a reviewer needs to
-  understand.
-- Task titles and justifications must not center demos, notes, docs, generated
-  bindings, tests, or follow-up plans. Nest those artifacts under the feature or
-  boundary they demonstrate, validate, document, or generate.
-- Do not use demos, tests, docs, or plans as the reason for a feature task. When
-  those artifacts exercise a change, describe the actual API, behavior, or
-  boundary they exercise.
+- Tasks are the major review responsibilities in the chosen narrative, usually
+  3-5. They are not one row per file, artifact type, or implementation step.
+- Use tasks to split the overview into what a reviewer should understand before
+  reading groups and changes.
 - Task titles use this shape: `<Active verb> <domain object> <with|through|in|across> <architectural role>.`
-- Task justifications use this shape: `<Same subject> now <new capability>, so <old limitation or reason> no longer applies.`
+- Task justifications use this shape: `<Same subject> now <new behavior/capability>, so <old limitation or review concern> is resolved.`
 - Keep titles active and reviewer-facing. Prefer `Share particle GPU buffers across render paths.` over `Move particle buffers into a shared storage resource.`
-- Keep justifications concrete but not item-level. They may name the central construct responsible for the task, but only after explaining the role in plain language.
+- Keep justifications concrete but not change-level. They may name the central construct responsible for the task, but only after explaining the role in plain language.
 - Titles should read as what the change makes true for the codebase, not as a
   description of the implementation route. Use the domain object as the subject
   and a concrete architectural role as the destination so the reviewer knows
-  what changed before reading item details.
+  what changed before reading change details.
+- Do not create top-level tasks for generated bindings, generated code, demos,
+  tests, docs, or follow-up plans when they support another feature. Nest them
+  under the feature, boundary, or behavior they enable, validate, demonstrate,
+  document, or generate from.
+- Promote generated/codegen work to a top-level task only when the generator,
+  binding contract, or generated API surface is the primary change being
+  reviewed. Regenerated output for a new endpoint, schema, or config belongs
+  under that endpoint, schema, or config task.
+- Example: do not write `Regenerate API client types for invoice exports.` as a
+  task when invoice export is the feature. Nest a `Generated client types` group
+  under `Export invoices through the billing API.` instead.
 - Example: `Share draft state through the sync cache.` plus `The sync cache now
   stores pending edits, so editor buffers and background sync use the same
   recovery point.`
@@ -126,8 +154,8 @@ tasks[]:
   `Directory`.
 
 **Subtasks**
-- Subtasks are high-level local design moves between a group and concrete items.
-  Do not attach a type or item action to a subtask.
+- Subtasks are high-level local design moves between a group and concrete changes.
+  Do not attach a kind or change action to a subtask.
 - Start subtask titles with one of these verbs: `Expose`, `Encapsulate`, `Move`,
   `Centralize`, `Distribute`, `Extract`, `Inline`, `Split`, `Merge`, `Compose`,
   `Embed`, `Create`, `Destroy`, `Register`, `Unregister`, `Attach`, `Detach`,
@@ -137,34 +165,36 @@ tasks[]:
 - Use subtask `justification` only for non-obvious rationale, tradeoff, or
   sequencing context. Otherwise omit it.
 
-**Items**
-- Items are concrete leaf rows.
-- Item `action` must be one of `Add`, `Modify`, or `Remove`.
-- Use `Test`, `Doc`, `Plan`, or `App` as the item `type` when the artifact
+**Changes**
+- Changes are concrete changed constructs or artifacts.
+- Change `action` must be one of `Add`, `Modify`, or `Remove`.
+- Use `Test`, `Doc`, `Plan`, or `App` as the change `kind` when the artifact
   belongs to that repo convention. `Doc` means `docs/` or a stronger repo
   documentation convention; `Plan` means `plans/` or a stronger planning/design
   convention.
-- Use `subtype` only for clear narrower roles, such as a base class or interface
-  the type implements.
+- Use `role` only for a narrower role proven by the code: an implemented
+  trait/interface, base class, framework registration, or strong repo
+  convention. If no code evidence proves the role, omit it so the renderer uses
+  `kind`.
 - `note` is a short imperative fragment that reads after `to`, such as `emit
   draft changes before save`.
 
-**Steps**
-- Create enough steps that each meaningful changed file or semantic region has
-  local review context. Use more steps for large deletions, replacements,
+**Annotations**
+- Create enough annotations that each meaningful changed file or semantic region
+  has local review context. Use more annotations for large deletions, replacements,
   migrations, or subtle behavior changes.
 - Keep ranges tight around changed lines, roughly 40 lines at most. `start.line`
   should point at an added line when possible; deletion-only steps anchor to the
   closest surviving post-change line.
-- Step `title` is required by convention. Use concrete local action verbs such
+- Annotation `title` is required by convention. Use concrete local action verbs such
   as `Define`, `Set`, `Store`, `Remove`, `Configure`, `Bind`, `Load`,
   `Register`, `Guard`, `Validate`, `Split`, `Merge`, `Extract`, `Inline`,
   `Read`, `Write`, `Allocate`, or `Clear`. Avoid `Represent`, `Carry`,
   `Handle`, `Support`, `Exercise`, `Improve`, or `Update`.
 - Use `Store` for data kept on a struct/resource/cache/state object. Use `Set`
   for assigning a runtime value, default, flag, option, or configuration.
-- Step `comment` is a mini justification: state the problem, limitation, risk,
-  or review pressure first, then the solution and why it addresses the problem.
+- Annotation `comment` is a mini justification: state the problem, limitation,
+  risk, or review pressure first, then the solution and why it addresses the problem.
   Aim for roughly 150-180 characters when clarity allows.
 - `callout` is optional, singular, and exceptional. Use only `important`,
   `limitation`, `temporary`, `risk`, `followup`, `deviation`, or `workaround`.
@@ -175,34 +205,38 @@ tasks[]:
 
 ```json
 {
-  "version": 7,
-  "overview": "Add offline draft sync so document edits survive closed editor sessions. Before, edits lived only in the active editor buffer. Now, draft state moves into a sync cache so editor buffers and background sync share one recovery point.",
+  "version": 9,
+  "narrative": {
+    "type": "data_flow",
+    "justification": "The review follows draft edits from the editor into durable storage, then from storage into background sync."
+  },
+  "overview": "Add offline draft sync so document edits survive closed editor sessions. Before, unsaved edits lived only in the active editor buffer. Now, the editor writes draft changes into a cache and the sync worker drains that cache for retry.",
+  "root": "Add offline draft sync.",
   "commit": "8f14e45fceea167a5a36dedd4bea2543c6a04c33",
   "tasks": [
     {
-      "title": "Share draft state through a sync cache.",
-      "justification": "The new DraftCache stores pending edits, so closing the editor no longer drops unsynced work.",
+      "title": "Write editor changes into durable draft state.",
+      "justification": "The editor now records draft changes before save, so closing the buffer no longer drops unsynced work.",
       "groups": [
         {
           "type": "Module",
-          "title": "DraftSync",
+          "title": "DocumentEditor",
           "subtasks": [
             {
-              "title": "Create the sync cache for editor drafts.",
-              "items": [
+              "title": "Route draft changes out of the editor session.",
+              "changes": [
                 {
-                  "action": "Add",
-                  "type": "Struct",
-                  "subtype": "Resource",
-                  "title": "DraftCache",
-                  "note": "store pending editor drafts",
-                  "steps": [
+                  "action": "Modify",
+                  "kind": "Function",
+                  "target": "edit pipeline",
+                  "note": "write edits to DraftCache",
+                  "annotations": [
                     {
-                      "title": "Store pending drafts for retry.",
-                      "file": "src/sync/draft_cache.rs",
-                      "start": { "line": 12, "col": 1 },
-                      "end": { "line": 34, "col": 2 },
-                      "comment": "Draft state previously lived only inside the open editor. The new DraftCache stores pending edits and retry metadata so recovery does not depend on the buffer staying open."
+                      "title": "Write draft changes before persistence.",
+                      "file": "src/editor/document.rs",
+                      "start": { "line": 38, "col": 3 },
+                      "end": { "line": 45, "col": 4 },
+                      "comment": "Edits previously stayed in local buffer state until save completed. Writing each draft change to DraftCache gives recovery a durable record before persistence runs."
                     }
                   ]
                 }
@@ -212,23 +246,56 @@ tasks[]:
         },
         {
           "type": "Module",
-          "title": "DocumentEditor",
+          "title": "DraftSync",
           "subtasks": [
             {
-              "title": "Route draft changes out of the editor session.",
-              "items": [
+              "title": "Create the cache that carries drafts to sync.",
+              "changes": [
+                {
+                  "action": "Add",
+                  "kind": "Struct",
+                  "role": "Cache",
+                  "target": "DraftCache",
+                  "note": "store pending editor drafts",
+                  "annotations": [
+                    {
+                      "title": "Store pending drafts for retry.",
+                      "file": "src/sync/draft_cache.rs",
+                      "start": { "line": 12, "col": 1 },
+                      "end": { "line": 34, "col": 2 },
+                      "comment": "Background sync previously had no durable source after an editor closed. DraftCache stores pending edits and retry metadata so the worker can resume later."
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "title": "Drain cached drafts through background sync.",
+      "justification": "The sync worker now reads DraftCache entries, so failed saves can retry without reopening the editor.",
+      "groups": [
+        {
+          "type": "Module",
+          "title": "DraftSync",
+          "subtasks": [
+            {
+              "title": "Resolve queued drafts into sync attempts.",
+              "changes": [
                 {
                   "action": "Modify",
-                  "type": "Function",
-                  "title": "edit pipeline",
-                  "note": "send edits to DraftCache",
-                  "steps": [
+                  "kind": "Function",
+                  "target": "sync worker",
+                  "note": "retry cached draft edits",
+                  "annotations": [
                     {
-                      "title": "Write draft changes before persistence.",
-                      "file": "src/editor/document.rs",
-                      "start": { "line": 38, "col": 3 },
-                      "end": { "line": 45, "col": 4 },
-                      "comment": "The editor previously kept unsaved changes in local buffer state. Sending each edit to the DraftCache gives sync and recovery one durable handoff before persistence runs."
+                      "title": "Read cached drafts before sync.",
+                      "file": "src/sync/worker.rs",
+                      "start": { "line": 57, "col": 3 },
+                      "end": { "line": 72, "col": 4 },
+                      "comment": "The worker previously only saw edits from live editor sessions. Reading DraftCache first lets failed saves move back into the normal sync path."
                     }
                   ]
                 }
@@ -244,15 +311,18 @@ tasks[]:
 
 ## 5. Validate Before Writing
 
-- Diff coverage: every step file is changed or untracked, ranges exist in the
-  current file, added-line anchors are used when possible, and important
-  deletions have `Remove` steps.
+- Diff coverage: every annotation file is changed or untracked, ranges exist in
+  the current file, added-line anchors are used when possible, and important
+  deletions have `Remove` annotations.
 - Narrative quality: prose has no repo paths, bracketed file names, or
   semicolons; tasks are architectural claims; named constructs are explained;
   subtasks use the verb bank.
-- Schema contract: `commit` is the full HEAD sha, item actions are only `Add`,
-  `Modify`, or `Remove`, notes are imperative fragments of 50 characters or
-  less, and JSON has no comments or trailing commas.
+- Schema contract: `version` is 9, `narrative.type` is one of the allowed
+  frames, `narrative.justification` explains the choice, `commit` is the full
+  HEAD sha, change actions are only `Add`, `Modify`, or `Remove`, notes are
+  imperative fragments of 50 characters or less, and JSON has no comments or
+  trailing commas.
+- Are all ownership claims correct?
 
 Write `<repo root>/.walkthrough.json` with LF (`\n`) line endings, overwriting
 any existing file. If

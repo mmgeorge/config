@@ -6,6 +6,7 @@ local walkthrough = require("diff_review.walkthrough")
 
 local root = "D:/diffreview-flow-root"
 local head_sha = string.rep("a", 40)
+local untracked_files = {}
 
 local function assert_true(condition, message)
   if not condition then error(message, 2) end
@@ -119,7 +120,7 @@ function backend.systemlist(command)
     return {}, 1
   end
   if key == "git\t-C\t" .. root .. "\tls-files\t--others\t--exclude-standard" then
-    return {}, 0
+    return untracked_files, 0
   end
   if key == "git\t-C\t" .. root .. "\tdiff\t--name-status" then
     return { "M\ta.txt", "M\tb.txt", "A\tnew.txt" }, 0
@@ -415,7 +416,8 @@ end
 
 local function valid_doc()
   return {
-    version = 7,
+    version = 9,
+    narrative = { type = "data_flow", justification = "Changes flow from JSON into rendered annotations." },
     overview = "Update walkthrough fixture files. Before, the fixture rows used the old text. Now, the structured tasks drive both the summary graph and Task N.M-total comment labels.",
     root = "Update walkthrough fixture files.",
     commit = head_sha,
@@ -431,14 +433,14 @@ local function valid_doc()
               {
                 title = "Rewrite the first fixture file.",
                 justification = "The first fixture row carries the opening example for walkthrough rendering.",
-                items = {
+                changes = {
                   {
                     action = "Modify",
-                    type = "Struct",
-                    subtype = "Resource",
-                    title = "a.txt rewrite",
+                    kind = "Struct",
+                    role = "Cache",
+                    target = "a.txt rewrite",
                     note = "rewrite the second line for the first fixture file",
-                    steps = {
+                    annotations = {
                       {
                         title = "Rewrite the fixture line to NEW.",
                         file = "a.txt",
@@ -474,13 +476,13 @@ local function valid_doc()
             subtasks = {
               {
                 title = "Rewrite the second fixture file.",
-                items = {
+                changes = {
                   {
                     action = "Add",
-                    type = "Function",
-                    title = "b.txt rewrite",
+                    kind = "Function",
+                    target = "b.txt rewrite",
                     note = "repeat the rewrite so navigation crosses tasks",
-                    steps = {
+                    annotations = {
                       {
                         title = "Mirror the rewrite in the second fixture.",
                         file = "b.txt",
@@ -550,6 +552,9 @@ local function run()
   assert_true(not buffer_contains(summary_buf, "WARNING"), "fresh walkthrough should not warn")
   assert_true(not buffer_contains(summary_buf, "Major changes:"), "summary should not show redundant major changes heading")
   assert_true(not buffer_contains(summary_buf, "├─ Update a.txt through the first task."), "summary should not show redundant top-level graph")
+  assert_true(buffer_contains(summary_buf,
+    "Data flow narrative selected. Changes flow from JSON into rendered annotations."),
+    "summary should show the selected walkthrough narrative")
   assert_true(buffer_has_highlight_for_text(summary_buf, "1. Update a.txt through the first task.",
     "1. Update a.txt through the first task.", "DiffReviewWalkthroughItemTitle"),
     "summary task title should be bold white")
@@ -570,20 +575,21 @@ local function run()
   wait_for(function() return buffer_contains(summary_buf, "Rewrite the first fixture file.") end,
     "unfolding a walkthrough group should show its subtasks")
   toggle_row(buf, "└─ Rewrite the first fixture file.")
-  wait_for(function() return not buffer_contains(summary_buf, "Modify Resource a.txt rewrite") end,
+  wait_for(function() return not buffer_contains(summary_buf, "Modify Cache a.txt rewrite") end,
     "folding a walkthrough subtask should hide its items")
   toggle_row(buf, "└─ Rewrite the first fixture file.")
-  wait_for(function() return buffer_contains(summary_buf, "Modify Resource a.txt rewrite") end,
+  wait_for(function() return buffer_contains(summary_buf, "Modify Cache a.txt rewrite") end,
     "unfolding a walkthrough subtask should show its items")
-  local rewrite_location = "Rewrite the fixture line to NEW.            [a.txt:2 +1 -1]"
-  local total_marker_location = "Check the total marker on the next comment. [a.txt:2 +1 -1]"
+  local rewrite_location = "◦ Rewrite the fixture line to NEW.            [a.txt:2 +1 -1]"
+  local total_marker_location = "◦ Check the total marker on the next comment. [a.txt:2 +1 -1]"
   assert_true(not buffer_contains(summary_buf, rewrite_location),
     "folded walkthrough action should hide comment-location rows")
-  toggle_row(buf, "Modify Resource a.txt rewrite")
+  toggle_row(buf, "Modify Cache a.txt rewrite")
   wait_for(function() return buffer_contains(summary_buf, rewrite_location) end,
     "expanding a walkthrough action should show the first comment-location row")
   assert_true(buffer_has_status_highlight_for_text(summary_buf, rewrite_location,
-    "a.txt:2", "DiffReviewStatusPath"), "comment-location row should highlight the location with a status path highlight")
+    "a.txt:2", "DiffReviewWalkthroughLocation"),
+    "comment-location row should highlight the file location with the walkthrough location highlight")
   assert_true(buffer_has_status_highlight_for_text(summary_buf, rewrite_location,
     "+1", "DiffReviewAddRange"), "comment-location row should highlight added count")
   assert_true(buffer_has_status_highlight_for_text(summary_buf, rewrite_location,
@@ -601,12 +607,17 @@ local function run()
   trigger_buf_mapping(summary_buf, "<CR>")
   wait_for(function() return buffer_contains(summary_buf, "NEW a.txt") end,
     "pressing enter on a walkthrough location should expand the target diff")
+  local previous_mark = vim.api.nvim_buf_call(summary_buf, function()
+    return vim.fn.getpos("''")
+  end)
+  assert_true(previous_mark[2] == location_row,
+    "pressing enter on a walkthrough location should set the previous context mark")
   assert_true(vim.api.nvim_win_get_cursor(vim.fn.bufwinid(summary_buf))[1] == find_row(summary_buf, "NEW a.txt"),
     "pressing enter on a walkthrough location should jump to the target diff row")
   toggle_row(buf, "a.txt +")
   wait_for(function() return not buffer_contains(summary_buf, "NEW a.txt") end,
     "folding target file after location jump should hide its diff again")
-  toggle_row(buf, "Modify Resource a.txt rewrite")
+  toggle_row(buf, "Modify Cache a.txt rewrite")
   wait_for(function() return not buffer_contains(summary_buf, rewrite_location) end,
     "folding a walkthrough action should hide comment-location rows again")
   local expanded_second_task_row = find_row(summary_buf, "2. Update b.txt through the second task.")
@@ -623,7 +634,7 @@ local function run()
   assert_true(not buffer_contains(summary_buf, "why:"), "summary justification should not render a why label")
   assert_true(buffer_contains(summary_buf, "file Fixture edits"), "summary group type row missing")
   assert_true(buffer_contains(summary_buf, "└─ Rewrite the first fixture file."), "summary subtask row missing")
-  assert_true(buffer_contains(summary_buf, "   └─ Modify Resource a.txt rewrite to rewrite"),
+  assert_true(buffer_contains(summary_buf, "   └─ Modify Cache a.txt rewrite to rewrite"),
     "summary item action row missing display verb")
   assert_true(buffer_contains(summary_buf, "   └─ Add fn b.txt rewrite to repeat"),
     "summary add action row should not be padded")
@@ -641,17 +652,17 @@ local function run()
     "DiffReviewWalkthroughItemTitle"), "summary group title highlight missing")
   assert_true(not buffer_contains(summary_buf, "󰈙 file Fixture edits"), "summary should not show group type icon")
   assert_true(not buffer_contains(summary_buf, "File Fixture edits"), "summary should not show group type text")
-  assert_true(not buffer_contains(summary_buf, "󰙅 Resource a.txt rewrite"), "summary should not show item type icon")
+  assert_true(not buffer_contains(summary_buf, "󰙅 Cache a.txt rewrite"), "summary should not show change kind icon")
   assert_true(not buffer_contains(summary_buf, "󰊕 fn b.txt rewrite"), "summary should not show function type icon")
-  assert_true(not buffer_contains(summary_buf, "Struct a.txt rewrite"), "summary should not show item type text")
+  assert_true(not buffer_contains(summary_buf, "Struct a.txt rewrite"), "summary should not show change kind text")
   assert_true(not buffer_contains(summary_buf, "struct a.txt rewrite"), "summary should not show fallback type keyword")
-  assert_true(buffer_contains(summary_buf, "Resource a.txt rewrite"), "summary should show item subtype text")
+  assert_true(buffer_contains(summary_buf, "Cache a.txt rewrite"), "summary should show change role text")
   assert_true(not buffer_contains(summary_buf, "Function b.txt rewrite"), "summary should not show function type text")
-  assert_true(buffer_has_highlight_for_text(summary_buf, "a.txt rewrite", "Resource",
-    "DiffReviewWalkthroughActionModify"), "summary modified item type should match action highlight")
+  assert_true(buffer_has_highlight_for_text(summary_buf, "a.txt rewrite", "Cache",
+    "DiffReviewWalkthroughActionModify"), "summary modified change kind should match action highlight")
   assert_true(buffer_has_highlight_for_text(summary_buf, "b.txt rewrite", "fn",
     "DiffReviewWalkthroughActionAdd"), "summary added function type should match action highlight")
-  assert_true(buffer_has_highlight_for_text(summary_buf, "Modify Resource a.txt rewrite", "Modify",
+  assert_true(buffer_has_highlight_for_text(summary_buf, "Modify Cache a.txt rewrite", "Modify",
     "DiffReviewWalkthroughActionModify"), "summary action highlight missing")
   assert_true(buffer_has_highlight_for_text(summary_buf, "a.txt rewrite", "a.txt rewrite",
     "DiffReviewWalkthroughItemTitle"), "summary item title highlight missing")
@@ -716,9 +727,9 @@ local function run()
   assert_true(not box_contains(buf, "└─ Rewrite the first fixture file."), "inline box should not show subtask graph")
   assert_true(not box_contains(buf, "Fixture edits / Rewrite the first fixture file."),
     "inline box should not show group/subtask breadcrumb")
-  assert_true(not box_contains(buf, "Modify Resource a.txt rewrite"), "inline box should not show item context")
+  assert_true(not box_contains(buf, "Modify Cache a.txt rewrite"), "inline box should not show item context")
   assert_true(not box_contains(buf, "rewrite the second line for the first fixture file"),
-    "inline box should not show item note")
+    "inline box should not show change note")
   assert_true(not box_contains(buf, "[z] back"), "inline box should not show command footer")
 
   expand_row_if_needed(buf, "b.txt +", "NEW b.txt")
@@ -760,13 +771,13 @@ local function run()
   assert_row_before(buf, "a.txt +", "b.txt +", "inactive status should use path order")
 
   local graph_doc = valid_doc()
-  graph_doc.tasks[1].groups[1].subtasks[1].items[#graph_doc.tasks[1].groups[1].subtasks[1].items + 1] = {
+  graph_doc.tasks[1].groups[1].subtasks[1].changes[#graph_doc.tasks[1].groups[1].subtasks[1].changes + 1] = {
     action = "Modify",
-    type = "Struct",
-    subtype = "Resource",
-    title = "a.txt follow-up",
+    kind = "Struct",
+    role = "Cache",
+    target = "a.txt follow-up",
     note = "keep the summary graph connected",
-    steps = {
+    annotations = {
       {
         title = "Second action comment.",
         file = "a.txt",
@@ -780,28 +791,28 @@ local function run()
   summary_buf = start_walkthrough(buf)
   expand_row_if_needed(buf, "1. Update a.txt through the first task.", "file Fixture edits")
   expand_row_if_needed(buf, "file Fixture edits", "└─ Rewrite the first fixture file.")
-  expand_row_if_needed(buf, "└─ Rewrite the first fixture file.", "Modify Resource a.txt rewrite")
-  expand_row_if_needed(buf, "Modify Resource a.txt rewrite",
-    "   │  Rewrite the fixture line to NEW.            [a.txt:2 +1 -1]")
-  assert_true(buffer_contains(summary_buf, "   │  Check the total marker on the next comment. [a.txt:2 +1 -1]"),
+  expand_row_if_needed(buf, "└─ Rewrite the first fixture file.", "Modify Cache a.txt rewrite")
+  expand_row_if_needed(buf, "Modify Cache a.txt rewrite",
+    "   │  ◦ Rewrite the fixture line to NEW.            [a.txt:2 +1 -1]")
+  assert_true(buffer_contains(summary_buf, "   │  ◦ Check the total marker on the next comment. [a.txt:2 +1 -1]"),
     "non-last action detail rows should keep the vertical tree guide")
-  assert_row_before(buf, "   │  Check the total marker on the next comment. [a.txt:2 +1 -1]",
-    "   └─ Modify Resource a.txt follow-up", "detail rows should remain visually connected before the next action")
+  assert_row_before(buf, "   │  ◦ Check the total marker on the next comment. [a.txt:2 +1 -1]",
+    "   └─ Modify Cache a.txt follow-up", "detail rows should remain visually connected before the next action")
   trigger_buf_mapping(buf, "ow")
   wait_for(function() return not buffer_contains(buf, "Walkthrough:") end, "graph walkthrough did not toggle off")
 
   local basename_doc = valid_doc()
-  basename_doc.tasks[1].groups[1].subtasks[1].items[1].steps[1].file =
+  basename_doc.tasks[1].groups[1].subtasks[1].changes[1].annotations[1].file =
     "blue/engine/plugins/physics/src/particle_render.rs"
   set_walkthrough_doc(basename_doc)
   summary_buf = start_walkthrough(buf)
   expand_row_if_needed(buf, "1. Update a.txt through the first task.", "file Fixture edits")
   expand_row_if_needed(buf, "file Fixture edits", "└─ Rewrite the first fixture file.")
-  expand_row_if_needed(buf, "└─ Rewrite the first fixture file.", "Modify Resource a.txt rewrite")
-  expand_row_if_needed(buf, "Modify Resource a.txt rewrite",
-    "Rewrite the fixture line to NEW.            [particle_render.rs:2]")
+  expand_row_if_needed(buf, "└─ Rewrite the first fixture file.", "Modify Cache a.txt rewrite")
+  expand_row_if_needed(buf, "Modify Cache a.txt rewrite",
+    "◦ Rewrite the fixture line to NEW.            [particle_render.rs:2]")
   wait_for(function()
-    return buffer_contains(summary_buf, "Rewrite the fixture line to NEW.            [particle_render.rs:2]")
+    return buffer_contains(summary_buf, "◦ Rewrite the fixture line to NEW.            [particle_render.rs:2]")
   end,
     "comment-location row should render nested paths as basenames")
   assert_true(not buffer_contains(summary_buf, "blue/engine/plugins/physics/src/particle_render.rs:2"),
@@ -810,7 +821,7 @@ local function run()
   wait_for(function() return not buffer_contains(buf, "Walkthrough:") end, "basename walkthrough did not toggle off")
 
   local added_span_doc = valid_doc()
-  added_span_doc.tasks[1].groups[1].subtasks[1].items[1].steps = {
+  added_span_doc.tasks[1].groups[1].subtasks[1].changes[1].annotations = {
     {
       title = "Store solver buffers on a resource.",
       file = "new.txt",
@@ -830,9 +841,9 @@ local function run()
   summary_buf = start_walkthrough(buf)
   expand_row_if_needed(buf, "1. Update a.txt through the first task.", "file Fixture edits")
   expand_row_if_needed(buf, "file Fixture edits", "└─ Rewrite the first fixture file.")
-  expand_row_if_needed(buf, "└─ Rewrite the first fixture file.", "Modify Resource a.txt rewrite")
-  local added_span_location = "Store solver buffers on a resource.     [new.txt:2 +3 -0]"
-  local added_span_second_location = "Expose a render-facing buffer snapshot. [new.txt:2 +3 -0]"
+  expand_row_if_needed(buf, "└─ Rewrite the first fixture file.", "Modify Cache a.txt rewrite")
+  local added_span_location = "◦ Store solver buffers on a resource.       [new.txt:2 +3 -0]"
+  local added_span_second_location = "◦ Expose a render-facing buffer snapshot.   [new.txt:2 +3 -0]"
   wait_for(function() return buffer_contains(summary_buf, added_span_location) end,
     "comment-location row should count added lines from the selected walkthrough span")
   assert_true(buffer_contains(summary_buf, added_span_second_location),
@@ -850,8 +861,90 @@ local function run()
   trigger_buf_mapping(buf, "ow")
   wait_for(function() return not buffer_contains(buf, "Walkthrough:") end, "added-span walkthrough did not toggle off")
 
+  untracked_files = { "untracked.txt" }
+  local untracked_doc = valid_doc()
+  untracked_doc.tasks[1].groups[1].subtasks[1].changes[1].annotations = {
+    {
+      title = "Store untracked buffer rows.",
+      file = "untracked.txt",
+      start = { line = 2, col = 1 },
+      ["end"] = { line = 4, col = 1 },
+      comment = "The selected span belongs to a new untracked file before its synthetic diff has loaded.",
+    },
+  }
+  set_walkthrough_doc(untracked_doc)
+  buf = open_status()
+  summary_buf = start_walkthrough(buf)
+  expand_row_if_needed(buf, "1. Update a.txt through the first task.", "file Fixture edits")
+  expand_row_if_needed(buf, "file Fixture edits", "└─ Rewrite the first fixture file.")
+  expand_row_if_needed(buf, "└─ Rewrite the first fixture file.", "Modify Cache a.txt rewrite")
+  local untracked_location = "◦ Store untracked buffer rows.              [untracked.txt:2 +3 -0]"
+  wait_for(function() return buffer_contains(summary_buf, untracked_location) end,
+    "comment-location row should count selected lines for untracked files without loaded hunks")
+  assert_true(not buffer_contains(summary_buf, "untracked.txt:2 +0 -0"),
+    "untracked walkthrough locations should not collapse to zero stats before diff load")
+  trigger_buf_mapping(buf, "ow")
+  wait_for(function() return not buffer_contains(buf, "Walkthrough:") end,
+    "untracked walkthrough did not toggle off")
+  untracked_files = {}
+
+  untracked_files = { "particle_storage.rs" }
+  local count_alignment_doc = valid_doc()
+  count_alignment_doc.tasks[1].groups[1].subtasks[1].changes[1].annotations = {
+    {
+      title = "Store solver buffers outside the system.",
+      file = "particle_storage.rs",
+      start = { line = 12, col = 1 },
+      ["end"] = { line = 20, col = 1 },
+      comment = "The selected span proves short added counts still align with wider neighboring added counts.",
+    },
+    {
+      title = "Allocate compute storage from one capacity.",
+      file = "particle_storage.rs",
+      start = { line = 22, col = 1 },
+      ["end"] = { line = 73, col = 1 },
+      comment = "The wider added count sets the adjacent numeric column without padding the file label.",
+    },
+    {
+      title = "Write spawn batches into shared buffers.",
+      file = "particle_storage.rs",
+      start = { line = 88, col = 1 },
+      ["end"] = { line = 114, col = 1 },
+      comment = "The selected span keeps the count alignment stable for another two-digit added count.",
+    },
+    {
+      title = "Expose renderable particle buffers.",
+      file = "particle_storage.rs",
+      start = { line = 116, col = 1 },
+      ["end"] = { line = 124, col = 1 },
+      comment = "The longer line number should reduce count padding instead of padding the file label.",
+    },
+  }
+  set_walkthrough_doc(count_alignment_doc)
+  buf = open_status()
+  summary_buf = start_walkthrough(buf)
+  expand_row_if_needed(buf, "1. Update a.txt through the first task.", "file Fixture edits")
+  expand_row_if_needed(buf, "file Fixture edits", "└─ Rewrite the first fixture file.")
+  expand_row_if_needed(buf, "└─ Rewrite the first fixture file.", "Modify Cache a.txt rewrite")
+  local storage_location = "◦ Store solver buffers outside the system.    [particle_storage.rs:12 +9  -0]"
+  local allocate_location = "◦ Allocate compute storage from one capacity. [particle_storage.rs:22 +52 -0]"
+  local write_location = "◦ Write spawn batches into shared buffers.    [particle_storage.rs:88 +27 -0]"
+  local expose_location = "◦ Expose renderable particle buffers.         [particle_storage.rs:116 +9 -0]"
+  wait_for(function() return buffer_contains(summary_buf, storage_location) end,
+    "comment-location row should pad short added counts before the removed count")
+  assert_true(buffer_contains(summary_buf, allocate_location),
+    "comment-location row should keep wider added counts tight")
+  assert_true(buffer_contains(summary_buf, write_location),
+    "comment-location row should align another two-digit added count")
+  assert_true(buffer_contains(summary_buf, expose_location),
+    "comment-location row should not pad longer file line labels")
+  trigger_buf_mapping(buf, "ow")
+  wait_for(function() return not buffer_contains(buf, "Walkthrough:") end,
+    "count-alignment walkthrough did not toggle off")
+  untracked_files = {}
+
   local padded_location_doc = valid_doc()
-  padded_location_doc.tasks[1].groups[1].subtasks[1].items[1].steps = {
+  padded_location_doc.tasks[1].groups[1].subtasks[1].changes[1].annotations = {
     {
       title = "Define particle render modes.",
       file = "blue/engine/plugins/physics/src/particle_render.rs",
@@ -885,13 +978,13 @@ local function run()
   summary_buf = start_walkthrough(buf)
   expand_row_if_needed(buf, "1. Update a.txt through the first task.", "file Fixture edits")
   expand_row_if_needed(buf, "file Fixture edits", "└─ Rewrite the first fixture file.")
-  expand_row_if_needed(buf, "└─ Rewrite the first fixture file.", "Modify Resource a.txt rewrite")
-  expand_row_if_needed(buf, "Modify Resource a.txt rewrite",
-    "Remove direct billboard rendering from simulation. [particle_system.rs:120]")
-  local define_location = "Define particle render modes.                      [particle_render.rs:3]"
-  local default_location = "Set triangle billboard as the default mode.        [particle_render.rs:19]"
-  local store_location = "Store render mode on ParticleSpawn.                [particle_spawn.rs:18]"
-  local remove_location = "Remove direct billboard rendering from simulation. [particle_system.rs:120]"
+  expand_row_if_needed(buf, "└─ Rewrite the first fixture file.", "Modify Cache a.txt rewrite")
+  expand_row_if_needed(buf, "Modify Cache a.txt rewrite",
+    "◦ Remove direct billboard rendering from simulation. [particle_system.rs:120]")
+  local define_location = "◦ Define particle render modes.                      [particle_render.rs:3]"
+  local default_location = "◦ Set triangle billboard as the default mode.        [particle_render.rs:19]"
+  local store_location = "◦ Store render mode on ParticleSpawn.                [particle_spawn.rs:18]"
+  local remove_location = "◦ Remove direct billboard rendering from simulation. [particle_system.rs:120]"
   assert_true(buffer_contains(summary_buf, define_location),
     "comment-location row should render the title before the bracketed location")
   assert_true(buffer_contains(summary_buf, default_location),
@@ -907,6 +1000,57 @@ local function run()
     "comment-location rows should align bracketed file labels across the item")
   trigger_buf_mapping(buf, "ow")
   wait_for(function() return not buffer_contains(buf, "Walkthrough:") end, "padded-location walkthrough did not toggle off")
+
+  local global_location_doc = valid_doc()
+  global_location_doc.tasks[1].groups[1].subtasks[1].changes[1].annotations = {
+    {
+      title = "Short local step.",
+      file = "a.txt",
+      start = { line = 2, col = 1 },
+      ["end"] = { line = 2, col = 1 },
+      comment = "The short title should still align with the longest walkthrough location in the summary.",
+    },
+  }
+  global_location_doc.tasks[1].groups[1].subtasks[1].changes[2] = {
+    action = "Add",
+    kind = "Function",
+    target = "b.txt rewrite",
+    note = "repeat the rewrite with a longer location row",
+    annotations = {
+      {
+        title = "Longer walkthrough location title across tasks.",
+        file = "b.txt",
+        start = { line = 2, col = 1 },
+        ["end"] = { line = 2, col = 1 },
+        comment = "The long title in another action should set the shared location column for every step row.",
+      },
+    },
+  }
+  global_location_doc.tasks[2].groups[1].subtasks[1].changes[1].annotations = {
+    {
+      title = "Mirror the rewrite in the second fixture.",
+      file = "b.txt",
+      start = { line = 2, col = 1 },
+      ["end"] = { line = 2, col = 1 },
+      comment = "The second task remains part of the document but is not needed for this fold regression.",
+    },
+  }
+  set_walkthrough_doc(global_location_doc)
+  buf = open_status()
+  captured_notifications = {}
+  summary_buf = start_walkthrough(buf)
+  expand_row_if_needed(buf, "1. Update a.txt through the first task.", "file Fixture edits")
+  expand_row_if_needed(buf, "file Fixture edits", "└─ Rewrite the first fixture file.")
+  expand_row_if_needed(buf, "└─ Rewrite the first fixture file.", "Modify Cache a.txt rewrite")
+  expand_row_if_needed(buf, "Modify Cache a.txt rewrite", "◦ Short local step.")
+  expand_row_if_needed(buf, "Add fn b.txt rewrite", "◦ Longer walkthrough location title across tasks.")
+  local short_global_location = find_line(summary_buf, "◦ Short local step.")
+  local long_global_location = find_line(summary_buf, "◦ Longer walkthrough location title across tasks.")
+  assert_true(display_col_before(short_global_location, "[") == display_col_before(long_global_location, "["),
+    "comment-location rows should align bracketed file labels across the whole walkthrough")
+  trigger_buf_mapping(buf, "ow")
+  wait_for(function() return not buffer_contains(buf, "Walkthrough:") end,
+    "global-location walkthrough did not toggle off")
 
   local reversed_doc = valid_doc()
   reversed_doc.tasks = { reversed_doc.tasks[2], reversed_doc.tasks[1] }
@@ -937,13 +1081,13 @@ local function run()
           subtasks = {
             {
               title = "Exercise degraded target resolution.",
-              items = {
+              changes = {
                 {
                   action = "Modify",
-                  type = "Test",
-                  title = "Stale line reference",
+                  kind = "Test",
+                  target = "Stale line reference",
                   note = "fall back to the nearest rendered line",
-                  steps = {
+                  annotations = {
                     {
                       file = "a.txt",
                       start = { line = 999, col = 1 },
@@ -954,10 +1098,10 @@ local function run()
                 },
                 {
                   action = "Modify",
-                  type = "Test",
-                  title = "Missing file reference",
+                  kind = "Test",
+                  target = "Missing file reference",
                   note = "surface a missing-file note instead of failing",
-                  steps = {
+                  annotations = {
                     {
                       file = "gone.txt",
                       start = { line = 1, col = 1 },
@@ -992,13 +1136,13 @@ local function run()
           subtasks = {
             {
               title = "Resolve nontrivial rendered regions.",
-              items = {
+              changes = {
                 {
                   action = "Modify",
-                  type = "Test",
-                  title = "Staged region",
+                  kind = "Test",
+                  target = "Staged region",
                   note = "anchor the staged-only section",
-                  steps = {
+                  annotations = {
                     {
                       title = "Staged region",
                       file = "c.txt",
@@ -1010,10 +1154,10 @@ local function run()
                 },
                 {
                   action = "Modify",
-                  type = "Test",
-                  title = "Split region",
+                  kind = "Test",
+                  target = "Split region",
                   note = "anchor the first rendered split row",
-                  steps = {
+                  annotations = {
                     {
                       title = "Split region",
                       file = "a.txt",
@@ -1025,10 +1169,10 @@ local function run()
                 },
                 {
                   action = "Modify",
-                  type = "Test",
-                  title = "Long region",
+                  kind = "Test",
+                  target = "Long region",
                   note = "keep start visible for long regions",
-                  steps = {
+                  annotations = {
                     {
                       title = "Long region",
                       file = "a.txt",
@@ -1082,28 +1226,60 @@ local function run()
   trigger_buf_mapping(buf, "ow")
   wait_for(function() return saw_notification_containing("not valid JSON") end, "invalid JSON notification absent")
 
-  fixtures[root .. "/.walkthrough.json"] = vim.json.encode({ version = 1, summary = "x", commit = "zz", steps = {} })
+  fixtures[root .. "/.walkthrough.json"] = vim.json.encode({ version = 1, summary = "x", commit = "zz", annotations = {} })
   captured_notifications = {}
   trigger_buf_mapping(buf, "ow")
-  wait_for(function() return saw_notification_containing("expected 7") end, "v1 rejection notification absent")
+  wait_for(function() return saw_notification_containing("expected 9") end, "v1 rejection notification absent")
+
+  local missing_narrative = valid_doc()
+  missing_narrative.narrative = nil
+  set_walkthrough_doc(missing_narrative)
+  captured_notifications = {}
+  trigger_buf_mapping(buf, "ow")
+  wait_for(function() return saw_notification_containing("missing or invalid \"narrative\"") end,
+    "missing narrative notification absent")
+
+  local invalid_narrative = valid_doc()
+  invalid_narrative.narrative = "source_map"
+  set_walkthrough_doc(invalid_narrative)
+  captured_notifications = {}
+  trigger_buf_mapping(buf, "ow")
+  wait_for(function() return saw_notification_containing("missing or invalid \"narrative\"") end,
+    "invalid narrative notification absent")
+
+  local invalid_narrative_type = valid_doc()
+  invalid_narrative_type.narrative.type = "source_map"
+  set_walkthrough_doc(invalid_narrative_type)
+  captured_notifications = {}
+  trigger_buf_mapping(buf, "ow")
+  wait_for(function() return saw_notification_containing("missing or invalid \"narrative.type\"") end,
+    "invalid narrative type notification absent")
+
+  local missing_narrative_justification = valid_doc()
+  missing_narrative_justification.narrative.justification = ""
+  set_walkthrough_doc(missing_narrative_justification)
+  captured_notifications = {}
+  trigger_buf_mapping(buf, "ow")
+  wait_for(function() return saw_notification_containing("missing or empty \"narrative.justification\"") end,
+    "missing narrative justification notification absent")
 
   local artifact_type_doc = valid_doc()
-  local artifact_items = artifact_type_doc.tasks[1].groups[1].subtasks[1].items
-  artifact_items[1].type = "Doc"
-  artifact_items[1].subtype = nil
-  artifact_items[1].title = "doc artifact"
-  artifact_items[1].note = "document the changed behavior"
-  local plan_item = vim.deepcopy(artifact_items[1])
-  plan_item.action = "Add"
-  plan_item.type = "Plan"
-  plan_item.title = "plan artifact"
-  plan_item.note = "record the follow up plan"
-  local app_item = vim.deepcopy(artifact_items[1])
-  app_item.type = "App"
-  app_item.title = "app artifact"
-  app_item.note = "configure the app scenario"
-  artifact_items[#artifact_items + 1] = plan_item
-  artifact_items[#artifact_items + 1] = app_item
+  local artifact_changes = artifact_type_doc.tasks[1].groups[1].subtasks[1].changes
+  artifact_changes[1].kind = "Doc"
+  artifact_changes[1].role = nil
+  artifact_changes[1].target = "doc artifact"
+  artifact_changes[1].note = "document the changed behavior"
+  local plan_change = vim.deepcopy(artifact_changes[1])
+  plan_change.action = "Add"
+  plan_change.kind = "Plan"
+  plan_change.target = "plan artifact"
+  plan_change.note = "record the follow up plan"
+  local app_change = vim.deepcopy(artifact_changes[1])
+  app_change.kind = "App"
+  app_change.target = "app artifact"
+  app_change.note = "configure the app scenario"
+  artifact_changes[#artifact_changes + 1] = plan_change
+  artifact_changes[#artifact_changes + 1] = app_change
   set_walkthrough_doc(artifact_type_doc)
   summary_buf = start_walkthrough(buf)
   expand_row_if_needed(buf, "1. Update a.txt through the first task.", "file Fixture edits")
@@ -1112,7 +1288,7 @@ local function run()
     return buffer_contains(summary_buf, "Modify doc doc artifact")
       and buffer_contains(summary_buf, "Add plan plan artifact")
       and buffer_contains(summary_buf, "Modify app app artifact")
-  end, "Doc, Plan, and App item types should be accepted and rendered")
+  end, "Doc, Plan, and App change kinds should be accepted and rendered")
   trigger_buf_mapping(buf, "ow")
   wait_for(function() return not buffer_contains(buf, "Walkthrough:") end, "artifact-type walkthrough did not toggle off")
 
@@ -1124,48 +1300,48 @@ local function run()
   wait_for(function() return saw_notification_containing("group 1: missing or invalid \"type\"") end,
     "invalid group type notification absent")
 
-  local invalid_item_type = valid_doc()
-  invalid_item_type.tasks[1].groups[1].subtasks[1].items[1].type = "File"
-  set_walkthrough_doc(invalid_item_type)
+  local invalid_change_kind = valid_doc()
+  invalid_change_kind.tasks[1].groups[1].subtasks[1].changes[1].kind = "File"
+  set_walkthrough_doc(invalid_change_kind)
   captured_notifications = {}
   trigger_buf_mapping(buf, "ow")
-  wait_for(function() return saw_notification_containing("item 1: missing or invalid \"type\"") end,
-    "invalid item type notification absent")
+  wait_for(function() return saw_notification_containing("change 1: missing or invalid \"kind\"") end,
+    "invalid change kind notification absent")
 
-  local invalid_item_subtype = valid_doc()
-  invalid_item_subtype.tasks[1].groups[1].subtasks[1].items[1].subtype = ""
-  set_walkthrough_doc(invalid_item_subtype)
+  local invalid_change_role = valid_doc()
+  invalid_change_role.tasks[1].groups[1].subtasks[1].changes[1].role = ""
+  set_walkthrough_doc(invalid_change_role)
   captured_notifications = {}
   trigger_buf_mapping(buf, "ow")
-  wait_for(function() return saw_notification_containing("item 1: invalid \"subtype\"") end,
-    "invalid item subtype notification absent")
+  wait_for(function() return saw_notification_containing("change 1: invalid \"role\"") end,
+    "invalid change role notification absent")
 
-  local invalid_item_note = valid_doc()
-  invalid_item_note.tasks[1].groups[1].subtasks[1].items[1].note = string.rep("x", 51)
-  set_walkthrough_doc(invalid_item_note)
+  local invalid_change_note = valid_doc()
+  invalid_change_note.tasks[1].groups[1].subtasks[1].changes[1].note = string.rep("x", 51)
+  set_walkthrough_doc(invalid_change_note)
   captured_notifications = {}
   trigger_buf_mapping(buf, "ow")
   wait_for(function() return saw_notification_containing("\"note\" must be 50 characters or less") end,
-    "invalid item note length notification absent")
+    "invalid change note length notification absent")
 
-  local invalid_item_children = valid_doc()
-  invalid_item_children.tasks[1].groups[1].subtasks[1].items[1].children = {}
-  set_walkthrough_doc(invalid_item_children)
+  local invalid_change_children = valid_doc()
+  invalid_change_children.tasks[1].groups[1].subtasks[1].changes[1].children = {}
+  set_walkthrough_doc(invalid_change_children)
   captured_notifications = {}
   trigger_buf_mapping(buf, "ow")
   wait_for(function() return saw_notification_containing("\"children\" is not supported") end,
-    "invalid item children notification absent")
+    "invalid change children notification absent")
 
-  local missing_item_steps = valid_doc()
-  missing_item_steps.tasks[1].groups[1].subtasks[1].items[1].steps = nil
-  set_walkthrough_doc(missing_item_steps)
+  local missing_change_annotations = valid_doc()
+  missing_change_annotations.tasks[1].groups[1].subtasks[1].changes[1].annotations = nil
+  set_walkthrough_doc(missing_change_annotations)
   captured_notifications = {}
   trigger_buf_mapping(buf, "ow")
-  wait_for(function() return saw_notification_containing("missing or empty \"steps\"") end,
-    "missing item steps notification absent")
+  wait_for(function() return saw_notification_containing("missing or empty \"annotations\"") end,
+    "missing change annotations notification absent")
 
   local invalid_callout_kind = valid_doc()
-  invalid_callout_kind.tasks[1].groups[1].subtasks[1].items[1].steps[1].callout.kind = "note"
+  invalid_callout_kind.tasks[1].groups[1].subtasks[1].changes[1].annotations[1].callout.kind = "note"
   set_walkthrough_doc(invalid_callout_kind)
   captured_notifications = {}
   trigger_buf_mapping(buf, "ow")
@@ -1173,7 +1349,7 @@ local function run()
     "invalid callout kind notification absent")
 
   local plural_callouts = valid_doc()
-  plural_callouts.tasks[1].groups[1].subtasks[1].items[1].steps[1].callouts = {}
+  plural_callouts.tasks[1].groups[1].subtasks[1].changes[1].annotations[1].callouts = {}
   set_walkthrough_doc(plural_callouts)
   captured_notifications = {}
   trigger_buf_mapping(buf, "ow")
@@ -1181,7 +1357,7 @@ local function run()
     "plural callouts notification absent")
 
   local too_long_callout = valid_doc()
-  too_long_callout.tasks[1].groups[1].subtasks[1].items[1].steps[1].callout.text = string.rep("x", 181)
+  too_long_callout.tasks[1].groups[1].subtasks[1].changes[1].annotations[1].callout.text = string.rep("x", 181)
   set_walkthrough_doc(too_long_callout)
   captured_notifications = {}
   trigger_buf_mapping(buf, "ow")

@@ -4,11 +4,14 @@
   "title": "DiffReview Walkthrough",
   "description": "Guided review walkthrough of a set of changes, consumed by the DiffReview Neovim plugin. Lives at the repository root as .walkthrough.json.",
   "type": "object",
-  "required": ["version", "overview", "root", "commit", "tasks"],
+  "required": ["version", "narrative", "overview", "root", "commit", "tasks"],
   "additionalProperties": false,
   "properties": {
     "version": {
-      "const": 7
+      "const": 9
+    },
+    "narrative": {
+      "$ref": "#/$defs/narrative"
     },
     "overview": {
       "type": "string",
@@ -33,6 +36,22 @@
     }
   },
   "$defs": {
+    "narrative": {
+      "type": "object",
+      "required": ["type", "justification"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "enum": ["data_flow", "capability", "ownership_boundary", "runtime_layer", "risk_contract"],
+          "description": "Narrative frame selected for task ordering and grouping."
+        },
+        "justification": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Short explanation of why this narrative frame fits the current diff."
+        }
+      }
+    },
     "task": {
       "type": "object",
       "required": ["title", "groups"],
@@ -78,13 +97,13 @@
     },
     "subtask": {
       "type": "object",
-      "required": ["title", "items"],
+      "required": ["title", "changes"],
       "additionalProperties": false,
       "properties": {
         "title": {
           "type": "string",
           "minLength": 1,
-          "description": "Prose intent row under a group; explains the local purpose served by the concrete items."
+          "description": "Prose intent row under a group; explains the local purpose served by the concrete changes."
         },
         "justification": {
           "type": "string",
@@ -92,31 +111,31 @@
           "maxLength": 170,
           "description": "Optional intent/rationale shown under the subtask title; aim for 90-140 characters, hard cap 170. Use only for non-obvious local rationale."
         },
-        "items": {
+        "changes": {
           "type": "array",
           "minItems": 1,
-          "items": { "$ref": "#/$defs/item" }
+          "items": { "$ref": "#/$defs/change" }
         }
       }
     },
-    "item": {
+    "change": {
       "type": "object",
-      "required": ["action", "type", "title", "note", "steps"],
+      "required": ["action", "kind", "target", "note", "annotations"],
       "additionalProperties": false,
       "properties": {
         "action": {
           "enum": ["Add", "Modify", "Remove"],
           "description": "Title-cased action verb."
         },
-        "type": {
-          "$ref": "#/$defs/itemType"
+        "kind": {
+          "$ref": "#/$defs/changeKind"
         },
-        "subtype": {
+        "role": {
           "type": "string",
           "minLength": 1,
-          "description": "Optional narrower display label such as Resource or Buffer. Use only when the item's base class, trait, interface, framework role, or semantic kind is known; the summary renders this instead of the base type keyword."
+          "description": "Optional code-proven role label such as Cache, Adapter, or Middleware. Use only when an implemented trait/interface, base class, framework registration, or strong repo convention proves the role; the summary renders this instead of the broad kind keyword."
         },
-        "title": {
+        "target": {
           "type": "string",
           "minLength": 1,
           "description": "Story node or concrete code symbol in the expanded graph."
@@ -127,10 +146,10 @@
           "maxLength": 50,
           "description": "Short imperative annotation explaining what this node does in the change; 50 characters or less."
         },
-        "steps": {
+        "annotations": {
           "type": "array",
           "minItems": 1,
-          "items": { "$ref": "#/$defs/step" }
+          "items": { "$ref": "#/$defs/annotation" }
         }
       }
     },
@@ -138,7 +157,7 @@
       "enum": ["Module", "File", "Package", "Directory"],
       "description": "Broad container-level construct for group headers. The summary renders this as a lowercase keyword before the group title."
     },
-    "itemType": {
+    "changeKind": {
       "enum": [
         "Class",
         "Struct",
@@ -155,7 +174,7 @@
         "Constant",
         "Field"
       ],
-      "description": "Broad programming or review artifact rendered as a lowercase keyword between the action and item title unless subtype is set. Function and Method both render as fn."
+      "description": "Broad programming or review artifact rendered as a lowercase keyword between the action and change target unless role is set. Function and Method both render as fn."
     },
     "position": {
       "type": "object",
@@ -191,7 +210,7 @@
         }
       }
     },
-    "step": {
+    "annotation": {
       "type": "object",
       "required": ["file", "start", "end", "comment"],
       "additionalProperties": false,
@@ -212,15 +231,15 @@
         "comment": {
           "type": "string",
           "minLength": 1,
-          "description": "Mini justification for this step: problem or pressure first, then the solution/change and why it addresses that problem; 1-4 sentences, aiming for roughly 180-200 characters. Do not repeat the file path."
+          "description": "Mini justification for this annotation: problem or pressure first, then the solution/change and why it addresses that problem; 1-4 sentences, aiming for roughly 180-200 characters. Do not repeat the file path."
         },
         "title": {
           "type": "string",
-          "description": "Succinct active action sentence for the inline step header, e.g. Emit draft changes before persistence."
+          "description": "Succinct active action sentence for the inline annotation header, e.g. Emit draft changes before persistence."
         },
         "callout": {
           "$ref": "#/$defs/callout",
-          "description": "Optional singular callout for reviewer-critical context. Most steps omit it."
+          "description": "Optional singular callout for reviewer-critical context. Most annotations omit it."
         }
       }
     }
