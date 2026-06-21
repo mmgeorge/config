@@ -252,6 +252,7 @@ local gh = require("diff_review.gh")
 local highlights = require("diff_review.highlights")
 local notifications = require("diff_review.notifications")
 M._intraline_diff = require("diff_review.intraline_diff")
+M._inventory = require("diff_review.inventory")
 
 local function setup_bg_highlights()
   highlights.setup()
@@ -15952,6 +15953,28 @@ function M._walkthrough_host(buf)
       render_status_or_notify(buf, nil, nil, { reuse_sections = true })
     end,
     git_list_async = systemlist_async,
+    inventory_async = function(cb)
+      local state = M._status_states and M._status_states[buf] or M._status
+      local cwd = state and state.cwd
+      if not cwd or cwd == "" then
+        cb({ rows = {} })
+        return
+      end
+      M._inventory.compute_async({
+        cwd = cwd,
+        sections = state.sections or {},
+        git_list_async = systemlist_async,
+        read_file_lines = M._file_source_lines,
+        repo_relative = function(filename)
+          return repo_relative(filename, cwd)
+        end,
+      }, function(result)
+        if result and result.error and result.error ~= "" then
+          notify_error("Walkthrough inventory failed: " .. result.error, "DiffReview")
+        end
+        cb(result or { rows = {} })
+      end)
+    end,
   }
 end
 

@@ -1,6 +1,6 @@
 ---
 name: walkthrough
-description: Generate .walkthrough.json at the git repo root - a guided, ordered review walkthrough of the current changes (staged + unstaged vs HEAD, plus untracked files) for the DiffReview Neovim plugin. Use after finishing a multi-file change, or when asked to create a review walkthrough from the current diff.
+description: Generate .walkthrough.json at the git repo root - a guided, ordered review walkthrough of the current non-excluded changes (staged + unstaged vs HEAD, plus untracked files) for the DiffReview Neovim plugin. Use after finishing a multi-file change, or when asked to create a review walkthrough from the current diff.
 ---
 
 # Generate a Review Walkthrough
@@ -15,12 +15,24 @@ Run from the target repository:
 
 - `git rev-parse --show-toplevel` - where `.walkthrough.json` must be written.
 - `git rev-parse HEAD` - full 40-character sha for `commit`.
-- `git diff HEAD` - staged and unstaged changes together.
-- `git ls-files --others --exclude-standard` - untracked files are part of the
-  review set; read relevant ones.
+- `git diff --name-only HEAD` - tracked paths with staged or unstaged changes.
+- `git ls-files --others --exclude-standard` - untracked paths.
+
+Exclude low-value artifact paths before reading or planning. Do not inspect,
+summarize, group, annotate, or validate changes whose repo-relative path:
+
+- ends in `.md` or `.txt`
+- has a path segment named `docs`, `plans`, or `codegen`
+
+Treat excluded files as if they are not part of the change. They do not need
+diff coverage, tasks, groups, changes, annotations, or validation.
+
+After applying exclusions, run the diff only for the remaining tracked paths and
+read only remaining untracked files. Do not run or inspect an unrestricted full
+diff before filtering.
 
 If you made the changes yourself, use your implementation knowledge for the
-narrative and the diff only to verify files and line numbers.
+narrative and the filtered diff only to verify files and line numbers.
 
 ## 2. Output Shape
 
@@ -32,7 +44,7 @@ Required top-level shape:
 ```text
 version: 9
 narrative:
-  type: data_flow | capability | ownership_boundary | runtime_layer | risk_contract
+  type: data_flow | capability | ownership_boundary | risk_contract
   justification: why this frame fits the current diff
 overview: 2-3 sentence before/now story with precise, accessible prose
 root: active author-context sentence for the overall change
@@ -48,7 +60,7 @@ tasks[]:
       justification?: exceptional local rationale
       changes[]:
         action: Add | Modify | Remove
-        kind: Class | Struct | Enum | Trait | Interface | Test | Doc | Plan | App | Config | Function | Method | Constant | Field
+        kind: Class | Struct | Enum | Trait | Interface | Test | App | Config | Function | Method | Constant | Field
         role?: optional code-proven role label, such as Cache or Adapter
         target: concrete code construct, symbol, or story node
         note: imperative fragment, 50 chars or less
@@ -79,8 +91,6 @@ tasks[]:
     clearest guide.
   - `ownership_boundary`: follow responsibility as it moves between constructs
     or layers, especially when the change reduces coupling or centralizes state.
-  - `runtime_layer`: explain work split across runtime layers or lifecycle
-    phases, such as API surface, coordinator, worker, storage, and UI.
   - `risk_contract`: organize around invariants, compatibility, migrations,
     security, data integrity, performance, or regression risk.
 
@@ -133,17 +143,9 @@ tasks[]:
   description of the implementation route. Use the domain object as the subject
   and a concrete architectural role as the destination so the reviewer knows
   what changed before reading change details.
-- Do not create top-level tasks for generated bindings, generated code, demos,
-  tests, docs, or follow-up plans when they support another feature. Nest them
-  under the feature, boundary, or behavior they enable, validate, demonstrate,
-  document, or generate from.
-- Promote generated/codegen work to a top-level task only when the generator,
-  binding contract, or generated API surface is the primary change being
-  reviewed. Regenerated output for a new endpoint, schema, or config belongs
-  under that endpoint, schema, or config task.
-- Example: do not write `Regenerate API client types for invoice exports.` as a
-  task when invoice export is the feature. Nest a `Generated client types` group
-  under `Export invoices through the billing API.` instead.
+- Do not create top-level tasks for excluded artifact paths or for supporting
+  demos and tests. Demos and tests belong under the feature, boundary, behavior,
+  or contract they validate or demonstrate.
 - Example: `Share draft state through the sync cache.` plus `The sync cache now
   stores pending edits, so editor buffers and background sync use the same
   recovery point.`
@@ -168,10 +170,6 @@ tasks[]:
 **Changes**
 - Changes are concrete changed constructs or artifacts.
 - Change `action` must be one of `Add`, `Modify`, or `Remove`.
-- Use `Test`, `Doc`, `Plan`, or `App` as the change `kind` when the artifact
-  belongs to that repo convention. `Doc` means `docs/` or a stronger repo
-  documentation convention; `Plan` means `plans/` or a stronger planning/design
-  convention.
 - Use `role` only for a narrower role proven by the code: an implemented
   trait/interface, base class, framework registration, or strong repo
   convention. If no code evidence proves the role, omit it so the renderer uses
@@ -311,9 +309,9 @@ tasks[]:
 
 ## 5. Validate Before Writing
 
-- Diff coverage: every annotation file is changed or untracked, ranges exist in
-  the current file, added-line anchors are used when possible, and important
-  deletions have `Remove` annotations.
+- Diff coverage: every annotation file is in the filtered review set, ranges
+  exist in the current file, added-line anchors are used when possible, and
+  important deletions have `Remove` annotations.
 - Narrative quality: prose has no repo paths, bracketed file names, or
   semicolons; tasks are architectural claims; named constructs are explained;
   subtasks use the verb bank.

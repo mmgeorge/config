@@ -86,6 +86,7 @@
 ---@field set_folded fun(key: string, folded: boolean)
 ---@field rerender fun() synchronous reuse_sections re-render
 ---@field git_list_async fun(command: string[], cb: fun(output: string[], code: integer))
+---@field inventory_async? fun(cb: fun(result: DiffReviewInventoryResult))
 
 ---@alias DiffReviewWalkthroughReader fun(path: string): string?
 
@@ -97,6 +98,9 @@
 ---@field head_sha? string
 ---@field saved_maps table<string, table> maparg dicts to restore on stop
 ---@field file_order? table<string, integer> first walkthrough step index by normalized repo-relative file
+---@field inventory? DiffReviewInventoryResult
+---@field inventory_signature? string
+---@field inventory_pending_signature? string
 
 ---@class DiffReviewWalkthroughCommentBoxPlacement
 ---@field anchor_row integer
@@ -1487,7 +1491,7 @@ end
 
 ---@param rows table[]
 ---@param text string
----@param opts { id: string, parent_id: string, kind?: string, fold_target_id?: string|false, default_folded?: boolean, segments?: table[], walkthrough_step?: DiffReviewWalkthroughStep }
+---@param opts { id: string, parent_id: string, kind?: string, fold_target_id?: string|false, default_folded?: boolean, segments?: table[], walkthrough_step?: DiffReviewWalkthroughStep, inventory_cells?: table[] }
 ---@param width integer
 ---@param item_titles string[]
 local function append_status_summary_rows(rows, text, opts, width, item_titles)
@@ -1511,6 +1515,7 @@ local function append_status_summary_rows(rows, text, opts, width, item_titles)
       fold_target_id = fold_target_id,
       default_folded = is_primary and opts.default_folded == true,
       walkthrough_step = is_primary and opts.walkthrough_step or nil,
+      inventory_cells = is_primary and opts.inventory_cells or nil,
     }
   end
 end
@@ -1807,19 +1812,473 @@ local function append_status_task_body_rows(rows, task, task_id, width, item_tit
   end
 end
 
+---@param state table|nil
+---@return string?
+local function status_inventory_signature(state)
+  if type(state) ~= "table" or type(state.sections) ~= "table" then return nil end
+  local parts = {}
+  for _, section in ipairs(state.sections or {}) do
+    parts[#parts + 1] = tostring(section.name or "")
+    for _, file in ipairs(section.files or {}) do
+      parts[#parts + 1] = table.concat({
+        tostring(file.filename or ""),
+        tostring(file.relpath or ""),
+        tostring(file.original_relpath or ""),
+        tostring(file.git_status or ""),
+        tostring(file.untracked == true),
+        tostring(file.added or 0),
+        tostring(file.removed or 0),
+      }, "\t")
+      for _, hunk in ipairs(file.hunks or {}) do
+        parts[#parts + 1] = tostring(hunk.diff or "")
+      end
+    end
+  end
+  return vim.fn.sha256(table.concat(parts, "\n"))
+end
+
+---@param mode DiffReviewWalkthroughMode
+---@param state table|nil
+local function ensure_status_inventory(mode, state)
+  if type(mode.host.inventory_async) ~= "function" then return end
+  local signature = status_inventory_signature(state)
+  if not signature or signature == mode.inventory_signature or signature == mode.inventory_pending_signature then
+    return
+  end
+
+  mode.inventory_pending_signature = signature
+  mode.host.inventory_async(function(result)
+    vim.schedule(function()
+      local active = M._modes[mode.host.buf]
+      if not active or active.inventory_pending_signature ~= signature then return end
+      active.inventory_pending_signature = nil
+      active.inventory_signature = signature
+      active.inventory = result or { rows = {} }
+      if vim.api.nvim_buf_is_valid(active.host.buf) then
+        active.host.rerender()
+      end
+    end)
+  end)
+end
+
+---@param value integer
+---@param prefix string
+---@return string
+local function inventory_count_text(value, prefix)
+  value = tonumber(value) or 0
+  if value == 0 then return "0" end
+  return prefix .. tostring(value)
+end
+
+---@param rows DiffReviewInventoryRow[]
+---@return { label: integer, added: integer, removed: integer, modified: integer }
+local function inventory_layout(rows)
+  local layout = { label = 0, added = 0, removed = 0, modified = 0 }
+  for _, row in ipairs(rows or {}) do
+    layout.label = math.max(layout.label, vim.fn.strdisplaywidth(row.label or ""))
+    layout.added = math.max(layout.added, #inventory_count_text(row.added, "+"))
+    layout.removed = math.max(layout.removed, #inventory_count_text(row.removed, "-"))
+    layout.modified = math.max(layout.modified, #inventory_count_text(row.modified, "~"))
+  end
+  return layout
+end
+
+---@param text string
+---@param width integer
+---@return string
+local function pad_right(text, width)
+  return text .. (" "):rep(math.max(0, width - vim.fn.strdisplaywidth(text)))
+end
+
+---@param row DiffReviewInventoryRow
+---@param layout { label: integer, added: integer, removed: integer, modified: integer }
+---@return string
+---@return table[] segments
+local function status_inventory_cell_text(row, layout)
+  local label = pad_right(row.label or "", layout.label)
+  local added = inventory_count_text(row.added, "+")
+  local removed = inventory_count_text(row.removed, "-")
+  local modified = inventory_count_text(row.modified, "~")
+  local added_cell = pad_right(added, layout.added)
+  local removed_cell = pad_right(removed, layout.removed)
+  local modified_cell = pad_right(modified, layout.modified)
+  local text = ("%s %s %s %s"):format(label, added_cell, removed_cell, modified_cell)
+  local segments = {
+    { label },
+    { " " },
+    { added, (tonumber(row.added) or 0) ~= 0 and "DiffReviewAddRange" or nil },
+    { added_cell:sub(#added + 1) },
+    { " " },
+    { removed, (tonumber(row.removed) or 0) ~= 0 and "DiffReviewDeleteRange" or nil },
+    { removed_cell:sub(#removed + 1) },
+    { " " },
+    { modified, (tonumber(row.modified) or 0) ~= 0 and "DiffReviewModifyRange" or nil },
+    { modified_cell:sub(#modified + 1) },
+  }
+  return text, segments
+end
+
+---@param rows DiffReviewInventoryRow[]
+---@param layout { label: integer, added: integer, removed: integer, modified: integer }
+---@return integer
+local function inventory_cell_width(rows, layout)
+  local width = 0
+  for _, row in ipairs(rows or {}) do
+    local text = status_inventory_cell_text(row, layout)
+    width = math.max(width, vim.fn.strdisplaywidth(text))
+  end
+  return width
+end
+
+---@param segments table[]
+---@param extra table[]
+local function extend_segments(segments, extra)
+  for _, segment in ipairs(extra or {}) do
+    segments[#segments + 1] = segment
+  end
+end
+
+local documentation_inventory_labels = {
+  docs = true,
+  plans = true,
+}
+
+---@param rows DiffReviewInventoryRow[]
+---@param split_index integer
+---@return DiffReviewInventoryRow[] left_rows
+---@return DiffReviewInventoryRow[] right_rows
+local function split_inventory_column_rows(rows, split_index)
+  local left_rows = {}
+  local right_rows = {}
+  for index, row in ipairs(rows or {}) do
+    if index <= split_index then
+      left_rows[#left_rows + 1] = row
+    else
+      right_rows[#right_rows + 1] = row
+    end
+  end
+  return left_rows, right_rows
+end
+
+---@param inventory_rows DiffReviewInventoryRow[]
+---@return { rows: DiffReviewInventoryRow[], layout: table }[]
+local function status_inventory_columns(inventory_rows)
+  local regular_rows = {}
+  local document_rows = {}
+  for _, row in ipairs(inventory_rows or {}) do
+    if documentation_inventory_labels[row.label] then
+      document_rows[#document_rows + 1] = row
+    else
+      regular_rows[#regular_rows + 1] = row
+    end
+  end
+
+  if #document_rows > 0 and #regular_rows > 0 then
+    local split_index = math.ceil(#regular_rows / 2)
+    local left_rows, right_rows = split_inventory_column_rows(regular_rows, split_index)
+    local regular_layout = inventory_layout(regular_rows)
+    local columns = {
+      { rows = left_rows, layout = regular_layout },
+    }
+    if #right_rows > 0 then
+      columns[#columns + 1] = { rows = right_rows, layout = regular_layout }
+    end
+    columns[#columns + 1] = { rows = document_rows, layout = inventory_layout(document_rows) }
+    return columns
+  end
+
+  local split_index = math.ceil(#inventory_rows / 2)
+  local left_rows, right_rows = split_inventory_column_rows(inventory_rows, split_index)
+  local layout = inventory_layout(inventory_rows)
+  local columns = {
+    { rows = left_rows, layout = layout },
+  }
+  if #right_rows > 0 then
+    columns[#columns + 1] = { rows = right_rows, layout = layout }
+  end
+  return columns
+end
+
+---@param columns { rows: DiffReviewInventoryRow[], layout: table }[]
+---@return integer[]
+local function inventory_column_widths(columns)
+  local widths = {}
+  for index, column in ipairs(columns or {}) do
+    widths[index] = inventory_cell_width(column.rows, column.layout)
+  end
+  return widths
+end
+
+---@param columns { rows: DiffReviewInventoryRow[], layout: table }[]
+---@return integer
+local function inventory_display_row_count(columns)
+  local count = 0
+  for _, column in ipairs(columns or {}) do
+    count = math.max(count, #(column.rows or {}))
+  end
+  return count
+end
+
+---@param widths integer[]
+---@param column_index integer
+---@return integer
+local function inventory_column_start(widths, column_index)
+  local start_col = 0
+  for index = 1, column_index - 1 do
+    start_col = start_col + (widths[index] or 0) + 2
+  end
+  return start_col
+end
+
+---@param inventory_rows DiffReviewInventoryRow[]
+---@return { text: string, segments: table[], cells: table[] }[]
+local function status_inventory_display_rows(inventory_rows)
+  local columns = status_inventory_columns(inventory_rows)
+  local widths = inventory_column_widths(columns)
+  local display_rows = {}
+  for row_index = 1, inventory_display_row_count(columns) do
+    local text = ""
+    local segments = {}
+    local cells = {}
+    for column_index, column in ipairs(columns) do
+      local row = column.rows[row_index]
+      if row then
+        local target_col = inventory_column_start(widths, column_index)
+        local padding = (" "):rep(math.max(0, target_col - vim.fn.strdisplaywidth(text)))
+        if padding ~= "" then
+          text = text .. padding
+          segments[#segments + 1] = { padding }
+        end
+
+        local cell_text, cell_segments = status_inventory_cell_text(row, column.layout)
+        local start_col = #text
+        text = text .. cell_text
+        extend_segments(segments, cell_segments)
+        cells[#cells + 1] = {
+          label = row.label,
+          start_col = start_col,
+          end_col = start_col + #cell_text,
+        }
+      end
+    end
+
+    if text ~= "" then
+      display_rows[#display_rows + 1] = {
+        text = text,
+        segments = segments,
+        cells = cells,
+      }
+    end
+  end
+  return display_rows
+end
+
+---@param rows table[]
+---@param inventory DiffReviewInventoryResult?
+---@return boolean appended
+local function append_status_inventory_rows(rows, inventory)
+  local inventory_rows = inventory and inventory.rows or {}
+  if #inventory_rows == 0 then return false end
+  rows[#rows + 1] = {
+    text = "Inventory:",
+    segments = { { "Inventory:", "DiffReviewStatusHeader" } },
+    id = "walkthrough:inventory",
+    parent_id = status_section_id,
+    kind = "pr_head_line",
+  }
+  for index, row in ipairs(status_inventory_display_rows(inventory_rows)) do
+    rows[#rows + 1] = {
+      text = row.text,
+      segments = row.segments,
+      id = ("walkthrough:inventory:%d"):format(index),
+      parent_id = status_section_id,
+      kind = "pr_head_line",
+      inventory_cells = row.cells,
+    }
+  end
+  return true
+end
+
+---@param inventory_rows DiffReviewInventoryRow[]
+---@return { text: string, segments: table[], cells: table[] }[]
+function M._status_inventory_display_rows_for_test(inventory_rows)
+  return status_inventory_display_rows(inventory_rows)
+end
+
+local inventory_titles = {
+  ["function"] = "Functions changed",
+  struct = "Structs changed",
+  class = "Classes changed",
+  interface = "Interfaces changed",
+  enum = "Enums changed",
+  trait = "Traits changed",
+  type = "Types changed",
+  module = "Modules changed",
+  docs = "Docs changed",
+  plans = "Plans changed",
+  files = "Files changed",
+}
+
+---@param label string
+---@return string
+local function inventory_detail_title(label)
+  return inventory_titles[label] or ((label:sub(1, 1):upper() .. label:sub(2)) .. " changed")
+end
+
+---@param left DiffReviewInventoryChange
+---@param right DiffReviewInventoryChange
+---@return boolean
+local function inventory_change_less(left, right)
+  local left_path = tostring(left.relpath or "")
+  local right_path = tostring(right.relpath or "")
+  if left_path ~= right_path then return left_path < right_path end
+  local left_line = tonumber(left.line) or math.huge
+  local right_line = tonumber(right.line) or math.huge
+  if left_line ~= right_line then return left_line < right_line end
+  return tostring(left.name or "") < tostring(right.name or "")
+end
+
+---@param change DiffReviewInventoryChange
+---@return string
+local function inventory_change_line(change)
+  local name = tostring(change.name or "")
+  local relpath = tostring(change.relpath or "")
+  local line = tonumber(change.line)
+  if relpath == "" then return name end
+  local file = basename(relpath)
+  local location = line and ("%s:%d"):format(file, line) or file
+  if name == "" or name == relpath then return location end
+  return ("%s  [%s]"):format(name, location)
+end
+
+---@param label string
+---@param details table<string, DiffReviewInventoryChangeSet>?
+---@return string[]
+---@return table[] folds
+local function inventory_detail_lines(label, details)
+  local row = details and details[label] or nil
+  local lines = { inventory_detail_title(label), "" }
+  local folds = {}
+  local sections = {
+    { key = "added", title = "Added:" },
+    { key = "removed", title = "Removed:" },
+    { key = "modified", title = "Updated:" },
+  }
+  for section_index, section in ipairs(sections) do
+    local start_line = #lines + 1
+    lines[#lines + 1] = section.title
+    local changes = vim.deepcopy(row and row[section.key] or {}) or {}
+    table.sort(changes, inventory_change_less)
+    if #changes == 0 then
+      lines[#lines + 1] = "  none"
+    else
+      for _, change in ipairs(changes) do
+        lines[#lines + 1] = "  " .. inventory_change_line(change)
+      end
+    end
+    folds[#folds + 1] = { start_line = start_line, end_line = #lines }
+    if section_index < #sections then lines[#lines + 1] = "" end
+  end
+  return lines, folds
+end
+
+---@param label string
+---@param details table<string, DiffReviewInventoryChangeSet>?
+---@return string[]
+function M._inventory_detail_lines_for_test(label, details)
+  local lines = inventory_detail_lines(label, details)
+  return lines
+end
+
+---@param buf integer
+---@param folds table[]
+local function apply_inventory_detail_folds(buf, folds)
+  local win = vim.fn.bufwinid(buf)
+  if win == -1 then return end
+  vim.wo[win].foldmethod = "manual"
+  vim.wo[win].foldenable = true
+  vim.api.nvim_win_call(win, function()
+    vim.cmd("silent! normal! zE")
+    for _, fold in ipairs(folds or {}) do
+      if fold.end_line > fold.start_line then
+        vim.cmd(("silent! %d,%dfold"):format(fold.start_line, fold.end_line))
+      end
+    end
+    vim.cmd("silent! normal! zR")
+  end)
+end
+
+---@param label string
+---@param details table<string, DiffReviewInventoryChangeSet>?
+local function open_inventory_detail_buffer(label, details)
+  local lines, folds = inventory_detail_lines(label, details)
+  local buf = vim.api.nvim_create_buf(true, false)
+  vim.bo[buf].bufhidden = "wipe"
+  vim.bo[buf].buftype = "nofile"
+  vim.bo[buf].swapfile = false
+  vim.bo[buf].filetype = "DiffReviewInventory"
+  local name = ("GitInventory://%s"):format(label)
+  if not pcall(vim.api.nvim_buf_set_name, buf, name) then
+    pcall(vim.api.nvim_buf_set_name, buf, name .. "#" .. buf)
+  end
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].modifiable = false
+  vim.keymap.set("n", "q", function()
+    if vim.api.nvim_buf_is_valid(buf) then pcall(vim.api.nvim_buf_delete, buf, { force = true }) end
+  end, { buffer = buf, nowait = true, silent = true, desc = "Close inventory detail" })
+  vim.keymap.set("n", "<Esc>", function()
+    if vim.api.nvim_buf_is_valid(buf) then pcall(vim.api.nvim_buf_delete, buf, { force = true }) end
+  end, { buffer = buf, nowait = true, silent = true, desc = "Close inventory detail" })
+  local win = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_buf(win, buf)
+  pcall(vim.api.nvim_buf_add_highlight, buf, M._ns, "DiffReviewStatusHeader", 0, 0, -1)
+  for row_index, line in ipairs(lines) do
+    if line == "Added:" then
+      pcall(vim.api.nvim_buf_add_highlight, buf, M._ns, "DiffReviewAddRange", row_index - 1, 0, -1)
+    elseif line == "Removed:" then
+      pcall(vim.api.nvim_buf_add_highlight, buf, M._ns, "DiffReviewDeleteRange", row_index - 1, 0, -1)
+    elseif line == "Updated:" then
+      pcall(vim.api.nvim_buf_add_highlight, buf, M._ns, "DiffReviewModifyRange", row_index - 1, 0, -1)
+    end
+  end
+  apply_inventory_detail_folds(buf, folds)
+end
+
+---@param entry table
+---@param cursor_col integer
+---@return string?
+local function inventory_label_at_cursor(entry, cursor_col)
+  for _, cell in ipairs(entry.inventory_cells or {}) do
+    if cursor_col >= (cell.start_col or 0) and cursor_col < (cell.end_col or 0) then
+      return cell.label
+    end
+  end
+  return nil
+end
+
 ---@param mode DiffReviewWalkthroughMode
 ---@return table[] rows
 local function status_summary_rows(mode)
   local width = math.max(40, vim.o.columns - 4)
   local item_titles = collect_summary_item_titles(mode.doc.tasks)
   local state = mode.host.get_state()
+  ensure_status_inventory(mode, state)
   local step_layout = status_step_layout(state, mode.doc.tasks)
   local rows = {}
 
   for _, line in ipairs(summary_lines(vim.trim(mode.doc.overview or ""), width, item_titles)) do
     rows[#rows + 1] = { text = line, parent_id = status_section_id }
   end
-  if #rows > 0 and #(mode.doc.tasks or {}) > 0 then
+  local has_overview = #rows > 0
+  local has_inventory = mode.inventory and #(mode.inventory.rows or {}) > 0
+  if has_inventory then
+    if has_overview then
+      rows[#rows + 1] = { text = "", parent_id = status_section_id }
+    end
+    append_status_inventory_rows(rows, mode.inventory)
+  end
+  if (has_overview or has_inventory) and #(mode.doc.tasks or {}) > 0 then
     rows[#rows + 1] = { text = "", parent_id = status_section_id }
   end
 
@@ -1887,7 +2346,7 @@ function M.status_head_lines(buf, head_lines)
 
   local summary_index = 0
   local child_index = 0
-  local function append_child(text, segments, id, parent_id, fold_target_id, kind, default_folded, walkthrough_step)
+  local function append_child(text, segments, id, parent_id, fold_target_id, kind, default_folded, walkthrough_step, inventory_cells)
     child_index = child_index + 1
     local entry_kind = kind or "pr_head_line"
     local entry_fold_target_id = nil
@@ -1908,6 +2367,7 @@ function M.status_head_lines(buf, head_lines)
         default_folded = default_folded == true,
         walkthrough_summary_line = text,
         walkthrough_step = walkthrough_step,
+        inventory_cells = inventory_cells,
       },
     }
   end
@@ -1928,7 +2388,8 @@ function M.status_head_lines(buf, head_lines)
       row.fold_target_id,
       row.kind,
       row.default_folded,
-      row.walkthrough_step
+      row.walkthrough_step,
+      row.inventory_cells
     )
   end
   return lines
@@ -1974,10 +2435,17 @@ function M.jump_status_step(buf, row)
 
   local cursor_row = row or vim.api.nvim_win_get_cursor(win)[1]
   local entry = state.entries[cursor_row]
+  local cursor = vim.api.nvim_win_get_cursor(win)
+  local inventory_label = entry and inventory_label_at_cursor(entry, cursor[2])
+  if inventory_label then
+    open_inventory_detail_buffer(inventory_label, mode.inventory and mode.inventory.details or nil)
+    return true
+  end
+
   local step = entry and entry.walkthrough_step or nil
   if not step then return false end
 
-  local source_cursor = vim.api.nvim_win_get_cursor(win)
+  local source_cursor = cursor
   local target = resolve_visible_step_target(mode, step)
   if target.start_row then
     pcall(vim.api.nvim_win_call, win, function()

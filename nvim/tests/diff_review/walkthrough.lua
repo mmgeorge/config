@@ -555,6 +555,65 @@ local function run()
   assert_true(buffer_contains(summary_buf,
     "Data flow narrative selected. Changes flow from JSON into rendered annotations."),
     "summary should show the selected walkthrough narrative")
+  wait_for(function() return buffer_contains(summary_buf, "Inventory:") end,
+    "walkthrough inventory did not render")
+  assert_row_before(summary_buf, "Inventory:", "1. Update a.txt through the first task.",
+    "inventory should render before walkthrough tasks")
+  local inventory_file_row = "files +1 0 ~3"
+  assert_true(buffer_contains(summary_buf, inventory_file_row),
+    "walkthrough inventory should count changed files")
+  assert_true(buffer_has_status_highlight_for_text(summary_buf, inventory_file_row,
+    "+1", "DiffReviewAddRange"), "inventory added count should be green")
+  assert_true(buffer_has_status_highlight_for_text(summary_buf, inventory_file_row,
+    "~3", "DiffReviewModifyRange"), "inventory modified count should use modify highlight")
+  local display_rows = walkthrough._status_inventory_display_rows_for_test({
+    { label = "function", added = 37, removed = 0, modified = 27 },
+    { label = "struct", added = 16, removed = 0, modified = 6 },
+    { label = "enum", added = 2, removed = 0, modified = 0 },
+    { label = "type", added = 2, removed = 0, modified = 1 },
+    { label = "module", added = 6, removed = 0, modified = 0 },
+    { label = "files", added = 13, removed = 0, modified = 21 },
+    { label = "docs", added = 2, removed = 0, modified = 1 },
+    { label = "plans", added = 2, removed = 0, modified = 0 },
+  })
+  assert_true(display_rows[1].text == "function +37 0 ~27  type     +2  0 ~1   docs  +2 0 ~1",
+    "inventory should render docs in a third column")
+  assert_true(display_rows[2].text == "struct   +16 0 ~6   module   +6  0 0    plans +2 0 0 ",
+    "inventory should align plans in the third column")
+  assert_true(display_rows[3].text == "enum     +2  0 0    files    +13 0 ~21",
+    "inventory should align the final inventory row")
+  assert_true(display_rows[1].cells[1].label == "function"
+      and display_rows[1].cells[2].label == "type"
+      and display_rows[1].cells[3].label == "docs",
+    "inventory display rows should expose left, middle, and right cell targets")
+  local detail_lines = walkthrough._inventory_detail_lines_for_test("function", {
+    ["function"] = {
+      added = {
+        { name = "DeepModule.build", relpath = "src/deep/module.ts", line = 42 },
+      },
+      removed = {},
+      modified = {},
+    },
+  })
+  local detail_text = table.concat(detail_lines, "\n")
+  assert_true(detail_text:find("DeepModule.build  %[module.ts:42%]") ~= nil,
+    "inventory detail locations should show only basename and line")
+  assert_true(detail_text:find("src/deep/module.ts", 1, true) == nil,
+    "inventory detail locations should not show full repo-relative paths")
+  local inventory_row = find_row(summary_buf, inventory_file_row)
+  local inventory_col = display_col_before(find_line(summary_buf, inventory_file_row), "files")
+  vim.api.nvim_win_set_cursor(vim.fn.bufwinid(summary_buf), { inventory_row, inventory_col })
+  trigger_buf_mapping(summary_buf, "<CR>")
+  local detail_buf = vim.api.nvim_get_current_buf()
+  wait_for(function() return detail_buf ~= summary_buf and buffer_contains(detail_buf, "Files changed") end,
+    "pressing enter on inventory row should open detail buffer")
+  assert_true(buffer_contains(detail_buf, "Added:"), "inventory detail should include added section")
+  assert_true(buffer_contains(detail_buf, "Updated:"), "inventory detail should include updated section")
+  assert_true(buffer_contains(detail_buf, "new.txt"), "inventory detail should list added files")
+  assert_true(buffer_contains(detail_buf, "a.txt"), "inventory detail should list updated files")
+  trigger_buf_mapping(detail_buf, "q")
+  wait_for(function() return vim.api.nvim_get_current_buf() == summary_buf end,
+    "closing inventory detail should return to status buffer")
   assert_true(buffer_has_highlight_for_text(summary_buf, "1. Update a.txt through the first task.",
     "1. Update a.txt through the first task.", "DiffReviewWalkthroughItemTitle"),
     "summary task title should be bold white")
