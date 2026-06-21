@@ -1458,7 +1458,7 @@ end
 
 ---@param rows table[]
 ---@param text string
----@param opts { id: string, parent_id: string, kind?: string, fold_target_id?: string|false, default_folded?: boolean, segments?: table[] }
+---@param opts { id: string, parent_id: string, kind?: string, fold_target_id?: string|false, default_folded?: boolean, segments?: table[], walkthrough_step?: DiffReviewWalkthroughStep }
 ---@param width integer
 ---@param item_titles string[]
 local function append_status_summary_rows(rows, text, opts, width, item_titles)
@@ -1481,6 +1481,7 @@ local function append_status_summary_rows(rows, text, opts, width, item_titles)
       kind = kind,
       fold_target_id = fold_target_id,
       default_folded = is_primary and opts.default_folded == true,
+      walkthrough_step = is_primary and opts.walkthrough_step or nil,
     }
   end
 end
@@ -1589,6 +1590,7 @@ local function append_status_task_body_rows(rows, task, task_id, width, item_tit
             parent_id = item_id,
             fold_target_id = item_id,
             segments = step_segments,
+            walkthrough_step = step,
           }, width, item_titles)
         end
       end
@@ -1649,7 +1651,7 @@ function M.status_head_lines(buf, head_lines)
 
   local summary_index = 0
   local child_index = 0
-  local function append_child(text, segments, id, parent_id, fold_target_id, kind, default_folded)
+  local function append_child(text, segments, id, parent_id, fold_target_id, kind, default_folded, walkthrough_step)
     child_index = child_index + 1
     local entry_kind = kind or "pr_head_line"
     local entry_fold_target_id = nil
@@ -1669,6 +1671,7 @@ function M.status_head_lines(buf, head_lines)
         fold_target_id = entry_fold_target_id,
         default_folded = default_folded == true,
         walkthrough_summary_line = text,
+        walkthrough_step = walkthrough_step,
       },
     }
   end
@@ -1688,7 +1691,8 @@ function M.status_head_lines(buf, head_lines)
       row.parent_id,
       row.fold_target_id,
       row.kind,
-      row.default_folded
+      row.default_folded,
+      row.walkthrough_step
     )
   end
   return lines
@@ -1703,6 +1707,50 @@ local function apply_status_summary_highlights(mode, state)
       apply_summary_highlights(mode.host.buf, { entry.walkthrough_summary_line }, mode.doc, row - 1)
     end
   end
+end
+
+---@param mode DiffReviewWalkthroughMode
+---@param step DiffReviewWalkthroughStep
+---@return DiffReviewWalkthroughTarget target
+local function resolve_visible_step_target(mode, step)
+  local state = mode.host.get_state()
+  local target = M.resolve_step(state, step)
+  -- Only unfold + re-render when no diff rows are rendered at all; a
+  -- "nearest" match means the hunks are visible and just don't contain the
+  -- exact line (TS-context scoping, deletions, staleness).
+  if (target.match == "file_only" or target.match == "missing") and ensure_expanded(mode, step) then
+    state = mode.host.get_state()
+    target = M.resolve_step(state, step)
+  end
+  return target
+end
+
+---@param buf integer
+---@param row? integer
+---@return boolean handled
+function M.jump_status_step(buf, row)
+  local mode = M._modes[buf]
+  if not mode then return false end
+  local state = mode.host.get_state()
+  if not (state and state.entries) then return false end
+  local win = vim.fn.bufwinid(buf)
+  if win == -1 then return false end
+
+  local cursor_row = row or vim.api.nvim_win_get_cursor(win)[1]
+  local entry = state.entries[cursor_row]
+  local step = entry and entry.walkthrough_step or nil
+  if not step then return false end
+
+  local target = resolve_visible_step_target(mode, step)
+  if target.start_row then
+    pcall(vim.api.nvim_win_set_cursor, win, { target.start_row, 0 })
+    pcall(vim.api.nvim_win_call, win, function()
+      vim.cmd("normal! zz")
+    end)
+  else
+    notify("Walkthrough target is not in the current diff", vim.log.levels.WARN)
+  end
+  return true
 end
 
 ---@param target DiffReviewWalkthroughTarget
@@ -1773,16 +1821,7 @@ local function show_step(mode, index)
 
   mode.index = index
   local step = mode.doc.steps[index]
-
-  local state = mode.host.get_state()
-  local target = M.resolve_step(state, step)
-  -- Only unfold + re-render when no diff rows are rendered at all; a
-  -- "nearest" match means the hunks are visible and just don't contain the
-  -- exact line (TS-context scoping, deletions, staleness).
-  if (target.match == "file_only" or target.match == "missing") and ensure_expanded(mode, step) then
-    state = mode.host.get_state()
-    target = M.resolve_step(state, step)
-  end
+  local target = resolve_visible_step_target(mode, step)
 
   local win = vim.fn.bufwinid(buf)
   if win == -1 then

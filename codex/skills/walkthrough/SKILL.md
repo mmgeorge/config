@@ -56,13 +56,13 @@ narrative — use the diff only to confirm files and line numbers.
   replacement deletions, anchor the step to the added replacement line. For
   deletion-only hunks, anchor to the closest surviving post-change line at the
   deletion boundary and keep the range small; the comment should name the
-  deleted concept, e.g. `Remove the inline billboard render pass because model
-  and billboard rendering now live in separate systems.`
+  deleted concept, e.g. `Remove the legacy retry loop because request retries
+  now run through the shared backoff policy.`
 - `file` is repo-relative with forward slashes.
 - `title` should be present for every step. Write it as a succinct, concrete
   local code action sentence that states what this region does, such as `Define
-  particle render modes.`, `Set triangle billboards as the default mode.`, or
-  `Store render mode on ParticleSpawn.` Prefer concrete code verbs such as
+  cache eviction modes.`, `Set bounded retries as the default policy.`, or
+  `Store sync state on JobRecord.` Prefer concrete code verbs such as
   `Define`, `Set`, `Store`, `Remove`, `Configure`, `Bind`, `Load`, `Register`,
   `Guard`, `Validate`, `Split`, `Merge`, `Extract`, `Inline`, `Read`, `Write`,
   `Allocate`, or `Clear`. Avoid abstract or vague verbs such as `Represent`,
@@ -92,17 +92,18 @@ narrative — use the diff only to confirm files and line numbers.
   from this structure. Do not write a `summary` field.
 - `overview` is 2-3 prose sentences that tell the story. Start with one
   active sentence that succinctly encapsulates the whole change, such as `Add
-  support for full model-backed particle rendering.` Then use `Before...` and
+  offline draft sync for document editing.` Then use `Before...` and
   `Now...` sentences to explain what changed in concrete terms.
 - `root` is one active author-context sentence for the major feature/fix/refactor.
-- Each `tasks[].title` is an active author-context sentence such as `Add...`,
-  `Update...`, `Move...`, `Split...`, `Remove...`, or `Preserve...`. These
-  titles become the numbered review sections in the walkthrough summary. Name
-  the concrete capability or structure introduced by the change. Avoid abstract
-  capability phrasing such as `Let X choose Y`, `Enable X`, or `Support X` when
-  the diff introduces a specific data/control boundary; prefer wording like
-  `Introduce billboard and model particle render modes.` or
-  `Move live particle buffers into shared resources.`
+- Each `tasks[].title` is an active architectural review claim, not an
+  implementation row. These titles become the numbered review sections in the
+  walkthrough summary, so they should name the responsibility shift, boundary,
+  or capability a reviewer should understand before reading module and item
+  details. Avoid abstract capability phrasing such as `Let X choose Y`,
+  `Enable X`, or `Support X`, but also avoid restating concrete implementation
+  rows that will appear below. Prefer theoretical examples like `Separate
+  document editing from sync transport.`, `Expose draft state beyond the editor
+  session.`, or `Preserve edit order across offline retries.`
 - `tasks[].justification` is optional in the schema but generally expected.
   Include one unless the task title already makes the reason very obvious. Use
   it to explain what is now different from before and why the task follows from
@@ -112,16 +113,15 @@ narrative — use the diff only to confirm files and line numbers.
   It renders as rationale text without a `why:` label.
 - Keep `tasks[]` focused on the true major review claims, usually 2-4 entries.
   Do not promote every meaningful diff cluster into a task. Supporting work
-  like demo wiring, shader helper splits, tests, docs/plans, preservation of an
+  like demo wiring, helper splits, tests, docs/plans, preservation of an
   old path, or follow-up notes belongs under the relevant major task unless it
   is the main purpose of the change.
 - Inside each task, prefer exact code boundaries for group titles: concrete
   module, file, package, directory, crate, or app boundaries such as
-  `PhysicsPlugin`, `RenderPlugin`, `ModelPlugin`, `rate_limit`, or
-  `AppBrowserPhysicsDemo`.
-  Use humanized labels like `Physics plugin`, `Render plugin`, or abstract
-  buckets like `API`, `storage`, `renderer`, and `validation` only when there is
-  no clearer owning symbol/module in the code.
+  `DocumentEditor`, `DraftSync`, `SearchIndexer`, or `ExportScheduler`.
+  Use humanized labels like `editor layer`, `background worker`, or abstract
+  buckets like `sync`, `storage`, `renderer`, and `validation` only when there
+  is no clearer owning symbol/module in the code.
   Each group has:
   - `type`: one of `Module`, `File`, `Package`, or `Directory`. Group types are
     restricted to container-level programming constructs; do not use `Class`,
@@ -131,8 +131,8 @@ narrative — use the diff only to confirm files and line numbers.
 - Each group has one or more `subtasks[]`. A subtask is the high-level code
   action between a container and concrete code items:
   - `title`: an active prose sentence or fragment describing the design move
-    this group makes in service of the parent task, such as `Move particle
-    buffers into a shared storage resource.` Do not attach a type or item action
+    this group makes in service of the parent task, such as `Route draft
+    changes through the sync queue.` Do not attach a type or item action
     to a subtask. Subtask titles must use one of the high-level verbs in this
     verb bank. If none seems to fit, rewrite the subtask around the closest
     listed responsibility, ownership, lifecycle, data-flow, behavior, reuse, or
@@ -148,11 +148,11 @@ narrative — use the diff only to confirm files and line numbers.
     Avoid vague or overloaded verbs such as `exercise`, `handle`, `support`,
     `make`, `keep`, or `publish` unless `publish` is literally the public API
     concept in the code. When responsibility moves, name the concrete destination
-    or source. Good non-domain-specific examples: `Configure retry policy for
-    background sync.`, `Expose cached metadata to picker previews.`, `Extract
-    request validation into middleware.`, `Route uploads through the size
-    guard.`, `Generalize markdown rendering across editable text blocks.`, and
-    `Specialize the cache refresh path for stale records.`
+    or source. Good non-domain-specific examples: `Configure export presets
+    for scheduled reports.`, `Expose cached metadata to picker previews.`,
+    `Extract attachment validation into a shared gate.`, `Route draft changes
+    through the sync queue.`, `Generalize markdown rendering across editable
+    text blocks.`, and `Specialize the cache refresh path for stale records.`
   - `justification`: optional and exceptional. Use it only when the subtask has
     non-obvious rationale, tradeoff, or sequencing context that the title cannot
     carry. Otherwise omit it. Aim for 90-140 characters, with 170 characters as
@@ -179,8 +179,8 @@ narrative — use the diff only to confirm files and line numbers.
   - `title`: a concrete story claim or code symbol in the graph.
   - `note`: a short imperative annotation, 50 characters or less, that renders
     after `to` and reads as part of the author's change, e.g.
-    `bind particle storage during model draws` or
-    `reuse primitive and material uploads`. Do not use third-person wording
+    `bind retry policy before handlers` or
+    `reuse cached search snapshots`. Do not use third-person wording
     like `binds` or `reuses`.
   - `steps`: one or more exact file/range walkthrough comments for that item.
 - Items are leaf nodes. Do not use `children`, and do not create action items as
@@ -194,58 +194,6 @@ narrative — use the diff only to confirm files and line numbers.
   titles, subtask titles, item titles, or item notes. The plugin displays
   nested steps as `X.Y - <step title>`, where `X` is the task and `Y` is the
   step within that task.
-  Derived summary example:
-
-  ```
-  Add support for full model-backed particle rendering. Before, simulated
-  particles could only render through the triangle billboard path. Now,
-  each particle spawn can choose billboard or model rendering, physics publishes
-  live particle buffers through a render-facing handoff, and the model/PBR
-  renderer draws the selected mesh once per live particle.
-
-  1. Introduce billboard and model particle render modes.
-   Rendering now has multiple paths, so each spawn declares its mode before render handoff.
-   module PhysicsPlugin
-      └─ Configure particle spawns with a render-mode choice.
-         ├─ Add enum ParticleRenderMode to select billboard or model-backed rendering at spawn time
-         └─ Modify struct ParticleSpawn to store the selected render mode with spawn data
-   module AppBrowserPhysicsDemo
-      └─ Configure the drop3d scene to spawn model particles.
-         └─ Modify fn drop3d particle spawn to switch the stress scene to SmoothSphere model particles
-
-  2. Move live particle buffers into shared resources.
-   Physics now feeds simulation and render systems, so particle buffers need an owner outside ParticleSystem.
-   module PhysicsPlugin
-      ├─ Move particle buffers into a shared storage resource.
-      │  ├─ Add Resource ParticleStorage to store live particle GPU buffers and expose a render instance view
-      │  └─ Modify fn ParticleSystem::run() to advance simulation through shared storage and expose the current particle source
-      └─ Move triangle billboard drawing into ParticleBillboardRenderSystem.
-         ├─ Modify fn PhysicsPlugin::install() to register shared storage and billboard rendering
-         └─ Add struct ParticleBillboardRenderSystem to preserve triangle billboard draws
-   module RenderPlugin
-      └─ Expose particle instance sources to render systems.
-         └─ Add Resource ParticleInstanceSources to share live particle buffers and optional model metadata with render systems
-
-  3. Draw selected particle models through the PBR renderer.
-   Particles can now render as model instances, so the model path reuses existing mesh and material uploads.
-   module ModelPlugin
-      ├─ Specialize the PBR pipeline for particle instance draws.
-      │  └─ Add Pipeline ParticlePbRenderPipeline to create the pipeline variant for particle-instanced model draws
-      └─ Compose particle draw commands with live particle instances.
-         ├─ Modify fn ModelRenderSystem::new() to initialize the particle pipeline state
-         ├─ Modify fn ModelRenderSystem::update_entities() to prepare particle model draw commands from the render-facing handoff
-         └─ Modify fn ModelRenderSystem::render() to issue indexed draws across the live particle count
-   module ModelStore
-      └─ Reuse primitive and material uploads for particle instances.
-         ├─ Add Command ParticleModelDrawCommand to describe one primitive/material draw for live particle instances
-         ├─ Modify fn ModelStore::insert_particle_model() to reuse model primitives while returning particle draw metadata
-         └─ Modify Store PrimitiveMeshStore to expose primitive buffers in the layout expected by the particle entry point
-   file particle_render shaders
-      └─ Generalize PBR shader helpers across entity and particle draws.
-         ├─ Add fn particle_render entry point to draw each live particle as the selected model primitive
-         ├─ Add fn PBR vertex helpers to share vertex-output construction with normal model rendering
-         └─ Add fn PBR fragment helper to share material sampling and lighting
-  ```
 
 ## 3. Schema
 
@@ -283,7 +231,7 @@ alongside this skill). The schema, inlined:
     "tasks": {
       "type": "array",
       "minItems": 1,
-      "description": "Major review tasks. Each task title becomes a numbered review section and Task N.* navigation context.",
+      "description": "Major architectural review claims. Each task title becomes a numbered review section and Task N.* navigation context.",
       "items": { "$ref": "#/$defs/task" }
     }
   },
@@ -296,7 +244,7 @@ alongside this skill). The schema, inlined:
         "title": {
           "type": "string",
           "minLength": 1,
-          "description": "Active author-context sentence, e.g. Add..., Update..., Move..., Split..., Remove..., Preserve..."
+          "description": "Active architectural review claim naming the responsibility shift, boundary, or capability being reviewed."
         },
         "justification": {
           "type": "string",
@@ -468,7 +416,7 @@ alongside this skill). The schema, inlined:
         },
         "title": {
           "type": "string",
-          "description": "Succinct active action sentence for the inline step header, e.g. Route API requests through the limiter."
+          "description": "Succinct active action sentence for the inline step header, e.g. Emit draft changes before persistence."
         },
         "callout": {
           "$ref": "#/$defs/callout",
@@ -485,33 +433,33 @@ alongside this skill). The schema, inlined:
 ```json
 {
   "version": 7,
-  "overview": "Add token-bucket rate limiting to public API requests. Before, API handlers accepted every request that reached the route stack. Now, API routes pass through a middleware boundary that checks per-client token buckets while health checks and static assets stay unthrottled.",
-  "root": "Add token-bucket rate limiting to API requests.",
+  "overview": "Add offline draft sync for document editing. Before, edits stayed tied to one open editor session. Now, drafts are stored outside the editor buffer, queued through a sync boundary, and replayed in order when transport is available.",
+  "root": "Add offline draft sync for document editing.",
   "commit": "8f14e45fceea167a5a36dedd4bea2543c6a04c33",
   "tasks": [
     {
-      "title": "Add middleware that decides whether a request can continue.",
-      "justification": "Public API requests now share one route gate, so throttling runs before route-specific handler work starts.",
+      "title": "Separate document editing from sync transport.",
+      "justification": "Edits now outlive one editor session, so local drafting and remote sync need a stable handoff boundary.",
       "groups": [
         {
           "type": "Module",
-          "title": "Router",
+          "title": "DocumentEditor",
           "subtasks": [
             {
-              "title": "Route public API requests through the limiter.",
+              "title": "Expose draft changes outside the editor session.",
               "items": [
                 {
                   "action": "Update",
                   "type": "Function",
-                  "title": "api route stack",
-                  "note": "wrap /api without throttling health routes",
+                  "title": "edit pipeline",
+                  "note": "emit draft changes before save",
                   "steps": [
                     {
-                      "title": "Route API requests through the limiter.",
-                      "file": "src/router.rs",
-                      "start": { "line": 41, "col": 5 },
-                      "end": { "line": 44, "col": 60 },
-                      "comment": "API requests currently bypass throttling, so one client can monopolize backend work. Layering the middleware onto the /api scope gates those requests while leaving health checks and static assets unthrottled."
+                      "title": "Emit draft changes before persistence.",
+                      "file": "src/editor/document.rs",
+                      "start": { "line": 38, "col": 3 },
+                      "end": { "line": 45, "col": 4 },
+                      "comment": "Edits previously stayed inside the active editor buffer, so closing the document dropped unsynced state. Emitting draft changes creates a stable handoff for sync and recovery."
                     }
                   ]
                 }
@@ -521,27 +469,27 @@ alongside this skill). The schema, inlined:
         },
         {
           "type": "Module",
-          "title": "rate_limit",
+          "title": "DraftSync",
           "subtasks": [
             {
-              "title": "Return allow and deny decisions before request handling.",
+              "title": "Route draft changes through the sync queue.",
               "items": [
                 {
                   "action": "Add",
-                  "type": "Function",
-                  "subtype": "Middleware",
-                  "title": "rate_limit()",
-                  "note": "return allow/deny before request handling",
+                  "type": "Struct",
+                  "subtype": "Queue",
+                  "title": "DraftSyncQueue",
+                  "note": "buffer drafts until transport is ready",
                   "steps": [
                     {
-                      "title": "Decide whether each request may continue.",
-                      "file": "src/middleware/rate_limit.rs",
-                      "start": { "line": 18, "col": 1 },
-                      "end": { "line": 41, "col": 2 },
-                      "comment": "Request handling previously had no per-client gate before the handler ran. Keyed buckets let the middleware allow or deny each request before backend work starts.",
+                      "title": "Buffer draft changes before transport.",
+                      "file": "src/sync/draft_queue.rs",
+                      "start": { "line": 12, "col": 1 },
+                      "end": { "line": 34, "col": 2 },
+                      "comment": "Network transport can be unavailable while users keep editing. A local queue preserves draft order until sync can send changes without coupling editor code to transport state.",
                       "callout": {
                         "kind": "risk",
-                        "text": "Lazy refill allows a small burst after idle periods; review the configured burst size against expected client traffic."
+                        "text": "Queue ordering is now part of correctness; review conflict handling before changing replay semantics."
                       }
                     }
                   ]
@@ -553,28 +501,28 @@ alongside this skill). The schema, inlined:
       ]
     },
     {
-      "title": "Add per-client token buckets with lazy refill.",
-      "justification": "Requests now refill buckets on access, so rate checks stay deterministic without background work.",
+      "title": "Preserve edit order across offline retries.",
+      "justification": "Offline edits can replay after reconnect, so queued drafts need deterministic ordering before conflict checks run.",
       "groups": [
         {
           "type": "Module",
-          "title": "rate_limit",
+          "title": "DraftSync",
           "subtasks": [
             {
-              "title": "Refill buckets lazily as requests arrive.",
+              "title": "Resolve queued drafts before remote writes.",
               "items": [
                 {
                   "action": "Add",
                   "type": "Method",
-                  "title": "TokenBucket::take()",
-                  "note": "refill on access and consume one token",
+                  "title": "DraftSyncQueue::drain_ready()",
+                  "note": "replay drafts in sequence",
                   "steps": [
                     {
-                      "title": "Refill and spend tokens in one operation.",
-                      "file": "src/middleware/rate_limit.rs",
-                      "start": { "line": 52, "col": 3 },
+                      "title": "Replay drafts in stored order.",
+                      "file": "src/sync/draft_queue.rs",
+                      "start": { "line": 51, "col": 3 },
                       "end": { "line": 73, "col": 4 },
-                      "comment": "A separate refill path would make request-time behavior harder to reason about and test. Combining lazy refill and consumption in one operation keeps each decision deterministic."
+                      "comment": "Reconnect can expose several pending drafts at once, and conflict checks depend on the user's edit order. Draining the queue in sequence keeps replay deterministic before remote writes begin."
                     }
                   ]
                 }
@@ -618,8 +566,10 @@ alongside this skill). The schema, inlined:
   `overview`, `root`, and `tasks`.
 - `overview`, `root`, task titles, group titles, subtask titles, item titles,
   and item notes have no repo-relative paths or bracketed file names.
-- `root` and each `tasks[].title` are active author-context sentences, not
-  noun-only labels.
+- `root` is an active author-context sentence. Each `tasks[].title` is an active
+  architectural review claim, not a noun-only label or implementation summary.
+  Task titles should be higher level than their groups, subtasks, and items, and
+  should not simply repeat a concrete row that follows.
 - Task `justification` fields are generally present unless the title makes the
   reason very obvious. They explain what is now different from before and why
   the task follows from that change; prefer `now ... so ...` when natural.
@@ -633,9 +583,9 @@ alongside this skill). The schema, inlined:
   outcome before writing the JSON.
 - Group titles identify concrete code boundaries whenever possible: module
   names, files, crates, packages, directories, or apps. Prefer
-  `PhysicsPlugin`, `RenderPlugin`, `ModelPlugin`, `Router`, or `rate_limit` over
-  humanized labels like `Physics plugin` or abstract labels such as `API`,
-  `storage`, `renderer`, and `validation`.
+  `DocumentEditor`, `DraftSync`, `SearchIndexer`, `ExportScheduler`, or
+  `Router` over humanized labels like `editor layer` or abstract labels such as
+  `sync`, `storage`, `renderer`, and `validation`.
 - Group `type` values are restricted to container-level programming constructs:
   `Module`, `File`, `Package`, or `Directory`.
 - Item `type` values use common programming constructs: `Class`, `Struct`,

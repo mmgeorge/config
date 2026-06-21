@@ -568,6 +568,16 @@ local function run()
     "comment-location row should not use box-drawing detail prefixes")
   assert_true(buffer_contains(summary_buf, "a.txt:2: Check the total marker on the next comment."),
     "expanding a walkthrough action should show all associated comment-location rows")
+  local location_row = find_row(summary_buf, "a.txt:2: Rewrite the fixture line to NEW.")
+  vim.api.nvim_win_set_cursor(vim.fn.bufwinid(summary_buf), { location_row, 0 })
+  trigger_buf_mapping(summary_buf, "<CR>")
+  wait_for(function() return buffer_contains(summary_buf, "NEW a.txt") end,
+    "pressing enter on a walkthrough location should expand the target diff")
+  assert_true(vim.api.nvim_win_get_cursor(vim.fn.bufwinid(summary_buf))[1] == find_row(summary_buf, "NEW a.txt"),
+    "pressing enter on a walkthrough location should jump to the target diff row")
+  toggle_row(buf, "a.txt +")
+  wait_for(function() return not buffer_contains(summary_buf, "NEW a.txt") end,
+    "folding target file after location jump should hide its diff again")
   toggle_row(buf, "Modify Resource a.txt rewrite")
   wait_for(function() return not buffer_contains(summary_buf, "a.txt:2: Rewrite the fixture line to NEW.") end,
     "folding a walkthrough action should hide comment-location rows again")

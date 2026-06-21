@@ -115,6 +115,7 @@
 ---@field inline_jump_spans? table[]
 ---@field commit_subject_start_col? integer
 ---@field commit_subject_end_col? integer
+---@field walkthrough_step? table
 
 ---@alias DiffReviewStatusViewKind "status"|"pr"|"diff"
 
@@ -16136,7 +16137,9 @@ local function setup_status_keymaps(buf)
 
   map("open", "n", function()
     local entry = status_entry_under_cursor()
-    if M._status_open_commit_message_under_cursor(entry) then
+    if require("diff_review.walkthrough").jump_status_step(buf) then
+      return
+    elseif M._status_open_commit_message_under_cursor(entry) then
       return
     elseif entry and entry.kind == "pr" then
       status_open_pr(entry)

@@ -28,7 +28,7 @@
     "tasks": {
       "type": "array",
       "minItems": 1,
-      "description": "Major review tasks. Each task title becomes a numbered review section and Task N.* navigation context.",
+      "description": "Major architectural review claims. Each task title becomes a numbered review section and Task N.* navigation context.",
       "items": { "$ref": "#/$defs/task" }
     }
   },
@@ -41,7 +41,7 @@
         "title": {
           "type": "string",
           "minLength": 1,
-          "description": "Active author-context sentence, e.g. Add..., Update..., Move..., Split..., Remove..., Preserve..."
+          "description": "Active architectural review claim naming the responsibility shift, boundary, or capability being reviewed."
         },
         "justification": {
           "type": "string",
@@ -213,7 +213,7 @@
         },
         "title": {
           "type": "string",
-          "description": "Succinct active action sentence for the inline step header, e.g. Route API requests through the limiter."
+          "description": "Succinct active action sentence for the inline step header, e.g. Emit draft changes before persistence."
         },
         "callout": {
           "$ref": "#/$defs/callout",
