@@ -15,9 +15,6 @@ topiary/
 codex/*
 !codex/agents/
 !codex/agents/**
-!codex/hooks.json
-!codex/hooks/
-!codex/hooks/**
 !codex/skills/
 codex/skills/.system/
 goose/

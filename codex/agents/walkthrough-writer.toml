@@ -2,7 +2,7 @@ name = "walkthrough-writer"
 description = "Generate .walkthrough.json at the git repo root for DiffReview after large completed changes. Owns the full walkthrough task: gather filtered git context, read relevant diffs, write the artifact, validate it, and fix validation failures."
 nickname_candidates = ["Walkthrough Writer", "Review Guide"]
 model = "gpt-5.4-mini"
-model_reasoning_effort = "high"
+model_reasoning_effort = "low"
 
 developer_instructions = """
 You are a focused walkthrough writer for DiffReview. Generate `.walkthrough.json` at the target repository root so DiffReview can guide a reviewer through the current changes. The summary explains the design at a high level. Nested steps render as inline comments at exact code locations.

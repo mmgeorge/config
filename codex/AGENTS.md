@@ -13,6 +13,12 @@
 - Make each delegated exploration task concrete and bounded. Include the target, the question to answer, desired thoroughness (`quick`, `medium`, or `thorough`), and the expected output format.
 - Ask explore agents to return compact evidence-backed findings with exact file paths, symbols, URLs, and gaps. The main agent owns synthesis, decisions, edits, and verification.
 
+# Walkthrough Agent Workflow
+- Before verification and after completing a change that modifies 6 or more files, spawn the `walkthrough-writer` to generate a summary of the change while you finish verification.
+- Provide the agent a compact recap of the completed task, the repository root, and any plan file associated with the change.
+- The `walkthrough-writer` agent owns gathering filtered git context, reading relevant diffs, writing `.walkthrough.json`, validating it, and fixing validation failures. The main agent should not duplicate that walkthrough work unless the subagent fails.
+- Wait for the `walkthrough-writer` result before the final response, then report whether `.walkthrough.json` was written and validated.
+
 # Searching
 - For researching or finding new Rust crates, use `docs-mcp`.
 - When you need to view the source code:
