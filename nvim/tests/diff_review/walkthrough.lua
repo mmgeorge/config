@@ -1077,6 +1077,10 @@ local function run()
   set_walkthrough_doc(stale_doc)
   summary_buf = start_walkthrough(buf)
   assert_true(buffer_contains(summary_buf, "WARNING"), "stale walkthrough should warn in the summary")
+  expand_row_if_needed(buf, "a.txt +", "NEW a.txt")
+  wait_for(function() return box_contains(buf, "concrete") end, "stale walkthrough comment box missing")
+  assert_true(not box_contains(buf, "walkthrough predates HEAD"),
+    "stale walkthrough comment boxes should not repeat the top-level warning")
   trigger_buf_mapping(buf, "ow")
 
   -- ── step staleness: nearest visible line ──────────────────────────────────

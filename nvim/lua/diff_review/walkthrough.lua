@@ -1210,9 +1210,6 @@ local function staleness_note(target, stale)
   if target.match == "missing" then
     return "(stale: file not in current diff)"
   end
-  if stale then
-    return "(walkthrough predates HEAD - positions may be stale)"
-  end
   return nil
 end
 
