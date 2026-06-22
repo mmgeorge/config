@@ -210,3 +210,8 @@ global = "fileManager"
 
 [desktop.open-in-target-preferences.perPath]
 'C:\Users\mattm\Documents\Scratch' = "fileManager"
+
+[hooks.state]
+
+[hooks.state.'D:\config\codex\hooks.json:stop:0:0']
+trusted_hash = "sha256:20817dd0e012b13dcbbd08056c35c66c2130170acf550b689c75ca496432d644"
