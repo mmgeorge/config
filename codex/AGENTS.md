@@ -45,4 +45,3 @@
 - **Never** read or set environment variables via shell commands. If one is required and unset, ask the user.
 - Do **not** prefix commands with `cmd /c`, just call them.
 - Unless there are compelling performance reasons, prefer using simple commands serially instead of complex combined ones. This are more likely to be auto approved.
-
