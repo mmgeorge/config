@@ -445,9 +445,19 @@ local function set_walkthrough_doc(doc)
   fixtures[root .. "/.walkthrough.json"] = vim.json.encode(doc)
 end
 
+local function set_change_annotation(change, file, line, title, comment)
+  change.file = file
+  change.line = line
+  change.annotation = {
+    title = title,
+    comment = comment,
+  }
+  return change
+end
+
 local function valid_doc()
   return {
-    version = 10,
+    version = 12,
     flow = {
       {
         text = "Walkthrough fixture JSON",
@@ -474,42 +484,35 @@ local function valid_doc()
       {
         title = "Update a.txt through the first task.",
         justification = "Reviewers need the fixture story before individual file rewrites.",
-        groups = {
+        subtasks = {
           {
-            type = "File",
-            title = "Fixture edits",
-            subtasks = {
+            title = "Rewrite the first fixture file.",
+            justification = "The first fixture row carries the opening example for walkthrough rendering.",
+            changes = {
               {
-                title = "Rewrite the first fixture file.",
-                justification = "The first fixture row carries the opening example for walkthrough rendering.",
-                changes = {
-                  {
-                    action = "Modify",
-                    kind = "Struct",
-                    role = "Cache",
-                    target = "a.txt rewrite",
-                    note = "rewrite the second line for the first fixture file",
-                    annotations = {
-                      {
-                        title = "Rewrite the fixture line to NEW.",
-                        file = "a.txt",
-                        start = { line = 2, col = 1 },
-                        ["end"] = { line = 2, col = 9 },
-                        comment = "The fixture row previously used OLD, so the walkthrough had no fresh changed target. Rewriting it to NEW gives the renderer a concrete changed line to anchor.",
-                        callout = {
-                          kind = "deviation",
-                          text = "This fixture intentionally uses a deviation callout so the renderer proves high-priority review context is visible.",
-                        },
-                      },
-                      {
-                        title = "Check the total marker on the next comment.",
-                        file = "a.txt",
-                        start = { line = 2, col = 1 },
-                        ["end"] = { line = 2, col = 9 },
-                        comment = "The first task now has a second walkthrough comment, so the inline header can show both the step number and the task total.",
-                      },
-                    },
-                  },
+                action = "Modify",
+                kind = "Struct",
+                role = "Cache",
+                target = "a.txt rewrite",
+                note = "rewrite the second line for the first fixture file",
+                file = "a.txt",
+                line = 2,
+                annotation = {
+                  title = "Rewrite the fixture line to NEW.",
+                  comment = "The fixture row previously used OLD, so the walkthrough had no fresh changed target. Rewriting it to NEW gives the renderer a concrete changed line to anchor.",
+                },
+              },
+              {
+                action = "Modify",
+                kind = "Struct",
+                role = "Cache",
+                target = "a.txt total marker",
+                note = "check the total marker on the next comment",
+                file = "a.txt",
+                line = 2,
+                annotation = {
+                  title = "Check the total marker on the next comment.",
+                  comment = "The first task now has a second walkthrough comment, so the inline header can show both the step number and the task total.",
                 },
               },
             },
@@ -518,29 +521,20 @@ local function valid_doc()
       },
       {
         title = "Update b.txt through the second task.",
-        groups = {
+        subtasks = {
           {
-            type = "File",
-            title = "Fixture edits",
-            subtasks = {
+            title = "Rewrite the second fixture file.",
+            changes = {
               {
-                title = "Rewrite the second fixture file.",
-                changes = {
-                  {
-                    action = "Add",
-                    kind = "Function",
-                    target = "b.txt rewrite",
-                    note = "repeat the rewrite so navigation crosses tasks",
-                    annotations = {
-                      {
-                        title = "Mirror the rewrite in the second fixture.",
-                        file = "b.txt",
-                        start = { line = 2, col = 1 },
-                        ["end"] = { line = 2, col = 9 },
-                        comment = "The second fixture previously did not exercise cross-task navigation. Applying the same rewrite verifies that forward navigation reaches another task.",
-                      },
-                    },
-                  },
+                action = "Add",
+                kind = "Function",
+                target = "b.txt rewrite",
+                note = "repeat the rewrite so navigation crosses tasks",
+                file = "b.txt",
+                line = 2,
+                annotation = {
+                  title = "Mirror the rewrite in the second fixture.",
+                  comment = "The second fixture previously did not exercise cross-task navigation. Applying the same rewrite verifies that forward navigation reaches another task.",
                 },
               },
             },
@@ -836,16 +830,11 @@ local function run()
     "DiffReviewWalkthroughJustification"), "summary task justification should use normal highlight")
   assert_true(not buffer_contains(summary_buf, "The first fixture row carries the opening example for"),
     "folded task should hide subtask justification")
-  assert_true(not buffer_contains(summary_buf, "file Fixture edits"), "folded task should hide group rows")
+  assert_true(not buffer_contains(summary_buf, "Rewrite the first fixture file."),
+    "folded task should hide subtask rows")
   toggle_row(buf, "1. Update a.txt through the first task.")
-  wait_for(function() return buffer_contains(summary_buf, "file Fixture edits") end,
-    "expanding first walkthrough task did not show group rows")
-  toggle_row(buf, "file Fixture edits")
-  wait_for(function() return not buffer_contains(summary_buf, "Rewrite the first fixture file.") end,
-    "folding a walkthrough group should hide its subtasks")
-  toggle_row(buf, "file Fixture edits")
   wait_for(function() return buffer_contains(summary_buf, "Rewrite the first fixture file.") end,
-    "unfolding a walkthrough group should show its subtasks")
+    "expanding first walkthrough task did not show subtask rows")
   toggle_row(buf, "└─ Rewrite the first fixture file.")
   wait_for(function() return not buffer_contains(summary_buf, "Modify Cache a.txt rewrite") end,
     "folding a walkthrough subtask should hide its items")
@@ -869,10 +858,13 @@ local function run()
     "DiffReviewDeleteRange"), "comment-location row should highlight removed count")
   assert_true(not buffer_contains(summary_buf, "─── a.txt:2"),
     "comment-location row should not use box-drawing detail prefixes")
-  assert_true(buffer_contains(summary_buf, total_marker_location),
-    "expanding a walkthrough action should show all associated comment-location rows")
-  assert_true(find_line(summary_buf, rewrite_location):find("[", 1, true)
-    == find_line(summary_buf, total_marker_location):find("[", 1, true),
+  assert_true(not buffer_contains(summary_buf, total_marker_location),
+    "separate annotated changes should keep their own folded location rows")
+  toggle_row(buf, "Modify Cache a.txt total marker")
+  wait_for(function() return buffer_contains(summary_buf, total_marker_location) end,
+    "expanding the second annotated change should show its comment-location row")
+  assert_true(display_col_before(find_line(summary_buf, rewrite_location), "[")
+    == display_col_before(find_line(summary_buf, total_marker_location), "["),
     "comment-location rows should align bracketed file labels")
   local location_row = find_row(summary_buf, rewrite_location)
   local location_source_view = set_cursor_with_view(summary_buf, location_row, 0, location_row - 3)
@@ -911,15 +903,12 @@ local function run()
   assert_true(buffer_contains(summary_buf, "rendering."),
     "summary subtask justification continuation missing")
   assert_true(not buffer_contains(summary_buf, "why:"), "summary justification should not render a why label")
-  assert_true(buffer_contains(summary_buf, "file Fixture edits"), "summary group type row missing")
-  assert_true((find_line(summary_buf, "file Fixture edits") or ""):match("^  file ") ~= nil,
-    "expanded walkthrough group rows should be indented under the task")
   assert_true(buffer_contains(summary_buf, "└─ Rewrite the first fixture file."), "summary subtask row missing")
   assert_true((find_line(summary_buf, "└─ Rewrite the first fixture file.") or ""):match("^  └─ ") ~= nil,
     "expanded walkthrough subtask rows should be indented under the task")
-  assert_true(buffer_contains(summary_buf, "   └─ Modify Cache a.txt rewrite to rewrite"),
+  assert_true(buffer_contains(summary_buf, "   ├─ Modify Cache a.txt rewrite to rewrite"),
     "summary item action row missing display verb")
-  assert_true((find_line(summary_buf, "Modify Cache a.txt rewrite") or ""):match("^     └─ ") ~= nil,
+  assert_true((find_line(summary_buf, "Modify Cache a.txt rewrite") or ""):match("^     ├─ ") ~= nil,
     "expanded walkthrough action rows should preserve tree indentation under the task")
   assert_true(buffer_contains(summary_buf, "   └─ Add fn b.txt rewrite to repeat"),
     "summary add action row should not be padded")
@@ -931,10 +920,6 @@ local function run()
     "summary action highlight missing")
   assert_true(buffer_has_highlight(summary_buf, "DiffReviewWalkthroughActionModify"), "summary action highlight missing")
   assert_true(buffer_has_highlight(summary_buf, "DiffReviewWalkthroughItemTitle"), "summary item title highlight missing")
-  assert_true(buffer_has_highlight_for_text(summary_buf, "Fixture edits", "file", "DiffReviewWalkthroughType"),
-    "summary group type highlight missing")
-  assert_true(buffer_has_highlight_for_text(summary_buf, "Fixture edits", "Fixture edits",
-    "DiffReviewWalkthroughItemTitle"), "summary group title highlight missing")
   assert_true(not buffer_contains(summary_buf, "󰈙 file Fixture edits"), "summary should not show group type icon")
   assert_true(not buffer_contains(summary_buf, "File Fixture edits"), "summary should not show group type text")
   assert_true(not buffer_contains(summary_buf, "󰙅 Cache a.txt rewrite"), "summary should not show change kind icon")
@@ -955,8 +940,6 @@ local function run()
     "DiffReviewWalkthroughItemTitle"), "summary inline note should not be title-highlighted")
   local action_hl = vim.api.nvim_get_hl(0, { name = "DiffReviewWalkthroughActionModify" })
   assert_true(action_hl.italic == true, "summary action highlight should be italic")
-  local type_hl = vim.api.nvim_get_hl(0, { name = "DiffReviewWalkthroughType" })
-  assert_true(type_hl.fg == 0x5bff94, "summary group type highlight should use config green")
   local title_hl = vim.api.nvim_get_hl(0, { name = "DiffReviewWalkthroughItemTitle" })
   assert_true(title_hl.bold == true and title_hl.fg == 0xffffff, "summary item title should be bold white")
   assert_true(not buffer_has_highlight_for_text(summary_buf, "Reviewers need the fixture story", "Reviewers",
@@ -980,13 +963,6 @@ local function run()
     "automatic walkthrough comments should not highlight selected regions")
   assert_true(not row_has_line_highlight(buf, step_row, "DiffReviewWalkthroughRegion"),
     "automatic walkthrough comments should not use generic blue region background")
-  assert_true(box_contains(buf, "Deviation:"), "inline comment box should render the callout kind")
-  assert_true(box_contains(buf, "high-priority review context"), "inline comment box should render callout text")
-  assert_true(box_has_highlight_for_text(buf, "Deviation:", "DiffReviewWalkthroughCalloutDeviation"),
-    "inline callout kind should use deviation highlight")
-  local deviation_hl = vim.api.nvim_get_hl(0, { name = "DiffReviewWalkthroughCalloutDeviation" })
-  assert_true(deviation_hl.fg == 0xff5555 and deviation_hl.bold == true,
-    "deviation callout should be red and bold")
   local box_mark = comment_box_mark_containing(buf, "concrete")
   assert_true(box_mark ~= nil, "inline comment box mark missing")
   assert_true(box_mark[2] == step_row - 1, "inline comment box should anchor below the selected row")
@@ -1056,43 +1032,35 @@ local function run()
   assert_row_before(buf, "a.txt +", "b.txt +", "inactive status should use path order")
 
   local graph_doc = valid_doc()
-  graph_doc.tasks[1].groups[1].subtasks[1].changes[#graph_doc.tasks[1].groups[1].subtasks[1].changes + 1] = {
+  graph_doc.tasks[1].subtasks[1].changes[#graph_doc.tasks[1].subtasks[1].changes + 1] = {
     action = "Modify",
     kind = "Struct",
     role = "Cache",
     target = "a.txt follow-up",
     note = "keep the summary graph connected",
-    annotations = {
-      {
-        title = "Second action comment.",
-        file = "a.txt",
-        start = { line = 2, col = 1 },
-        ["end"] = { line = 2, col = 9 },
-        comment = "The second action keeps the first action from being the last sibling.",
-      },
+    file = "a.txt",
+    line = 2,
+    annotation = {
+      title = "Second action comment.",
+      comment = "The second action keeps the first action from being the last sibling.",
     },
   }
   set_walkthrough_doc(graph_doc)
   summary_buf = start_walkthrough(buf)
-  expand_row_if_needed(buf, "1. Update a.txt through the first task.", "file Fixture edits")
-  expand_row_if_needed(buf, "file Fixture edits", "└─ Rewrite the first fixture file.")
+  expand_row_if_needed(buf, "1. Update a.txt through the first task.", "└─ Rewrite the first fixture file.")
   expand_row_if_needed(buf, "└─ Rewrite the first fixture file.", "Modify Cache a.txt rewrite")
   expand_row_if_needed(buf, "Modify Cache a.txt rewrite",
     "   │  ◦ Rewrite the fixture line to NEW.            [a.txt:2 +1 -1]")
-  assert_true(buffer_contains(summary_buf, "   │  ◦ Check the total marker on the next comment. [a.txt:2 +1 -1]"),
-    "non-last action detail rows should keep the vertical tree guide")
-  assert_row_before(buf, "   │  ◦ Check the total marker on the next comment. [a.txt:2 +1 -1]",
-    "   └─ Modify Cache a.txt follow-up", "detail rows should remain visually connected before the next action")
+  assert_row_before(buf, "   │  ◦ Rewrite the fixture line to NEW.            [a.txt:2 +1 -1]",
+    "   ├─ Modify Cache a.txt total marker", "detail rows should remain visually connected before the next action")
   trigger_buf_mapping(buf, "ow")
   wait_for(function() return not buffer_contains(buf, "Walkthrough:") end, "graph walkthrough did not toggle off")
 
   local basename_doc = valid_doc()
-  basename_doc.tasks[1].groups[1].subtasks[1].changes[1].annotations[1].file =
-    "blue/engine/plugins/physics/src/particle_render.rs"
+  basename_doc.tasks[1].subtasks[1].changes[1].file = "blue/engine/plugins/physics/src/particle_render.rs"
   set_walkthrough_doc(basename_doc)
   summary_buf = start_walkthrough(buf)
-  expand_row_if_needed(buf, "1. Update a.txt through the first task.", "file Fixture edits")
-  expand_row_if_needed(buf, "file Fixture edits", "└─ Rewrite the first fixture file.")
+  expand_row_if_needed(buf, "1. Update a.txt through the first task.", "└─ Rewrite the first fixture file.")
   expand_row_if_needed(buf, "└─ Rewrite the first fixture file.", "Modify Cache a.txt rewrite")
   expand_row_if_needed(buf, "Modify Cache a.txt rewrite",
     "◦ Rewrite the fixture line to NEW.            [particle_render.rs:2]")
@@ -1106,66 +1074,56 @@ local function run()
   wait_for(function() return not buffer_contains(buf, "Walkthrough:") end, "basename walkthrough did not toggle off")
 
   local added_span_doc = valid_doc()
-  added_span_doc.tasks[1].groups[1].subtasks[1].changes[1].annotations = {
-    {
-      title = "Store solver buffers on a resource.",
-      file = "new.txt",
-      start = { line = 2, col = 1 },
-      ["end"] = { line = 4, col = 1 },
-      comment = "The selected span covers only the added buffer lines that belong to this explanation.",
-    },
-    {
-      title = "Expose a render-facing buffer snapshot.",
-      file = "new.txt",
-      start = { line = 2, col = 1 },
-      ["end"] = { line = 4, col = 1 },
-      comment = "The second row keeps the location label aligned while sharing the same selected span.",
-    },
-  }
+  local added_span_changes = added_span_doc.tasks[1].subtasks[1].changes
+  set_change_annotation(added_span_changes[1], "new.txt", 2, "Store solver buffers on a resource.",
+    "The anchor line marks the added buffer row that belongs to this explanation.")
+  added_span_changes[2] = set_change_annotation({
+    action = "Modify",
+    kind = "Struct",
+    role = "Cache",
+    target = "a.txt render snapshot",
+    note = "expose a render-facing buffer snapshot",
+  }, "new.txt", 2, "Expose a render-facing buffer snapshot.",
+    "The second row keeps the location label aligned while sharing the same anchor line.")
   set_walkthrough_doc(added_span_doc)
   summary_buf = start_walkthrough(buf)
-  expand_row_if_needed(buf, "1. Update a.txt through the first task.", "file Fixture edits")
-  expand_row_if_needed(buf, "file Fixture edits", "└─ Rewrite the first fixture file.")
+  expand_row_if_needed(buf, "1. Update a.txt through the first task.", "└─ Rewrite the first fixture file.")
   expand_row_if_needed(buf, "└─ Rewrite the first fixture file.", "Modify Cache a.txt rewrite")
-  local added_span_location = "◦ Store solver buffers on a resource.       [new.txt:2 +3 -0]"
-  local added_span_second_location = "◦ Expose a render-facing buffer snapshot.   [new.txt:2 +3 -0]"
+  local added_span_location = "◦ Store solver buffers on a resource.       [new.txt:2 +1 -0]"
+  local added_span_second_location = "◦ Expose a render-facing buffer snapshot.   [new.txt:2 +1 -0]"
   wait_for(function() return buffer_contains(summary_buf, added_span_location) end,
-    "comment-location row should count added lines from the selected walkthrough span")
+    "comment-location row should count the selected walkthrough line")
+  expand_row_if_needed(buf, "Modify Cache a.txt render snapshot", added_span_second_location)
   assert_true(buffer_contains(summary_buf, added_span_second_location),
-    "comment-location row should keep aligned labels for repeated selected spans")
-  assert_true(find_line(summary_buf, added_span_location):find("[", 1, true)
-    == find_line(summary_buf, added_span_second_location):find("[", 1, true),
-    "selected-span location rows should align bracketed file labels")
+    "comment-location row should keep aligned labels for repeated selected lines")
+  assert_true(display_col_before(find_line(summary_buf, added_span_location), "[")
+    == display_col_before(find_line(summary_buf, added_span_second_location), "["),
+    "selected-line location rows should align bracketed file labels")
   local added_span_row = find_row(summary_buf, added_span_location)
   vim.api.nvim_win_set_cursor(vim.fn.bufwinid(summary_buf), { added_span_row, 0 })
   trigger_buf_mapping(summary_buf, "<CR>")
   wait_for(function() return buffer_contains(summary_buf, "line two new.txt") end,
-    "pressing enter on a selected-span walkthrough location should expand the target diff")
+    "pressing enter on a selected-line walkthrough location should expand the target diff")
   assert_true(vim.api.nvim_win_get_cursor(vim.fn.bufwinid(summary_buf))[1] == find_row(summary_buf, "line two new.txt"),
-    "pressing enter on a selected-span walkthrough location should jump to the selected diff row")
+    "pressing enter on a selected-line walkthrough location should jump to the selected diff row")
   trigger_buf_mapping(buf, "ow")
   wait_for(function() return not buffer_contains(buf, "Walkthrough:") end, "added-span walkthrough did not toggle off")
 
   untracked_files = { "untracked.txt" }
   local untracked_doc = valid_doc()
-  untracked_doc.tasks[1].groups[1].subtasks[1].changes[1].annotations = {
-    {
-      title = "Store untracked buffer rows.",
-      file = "untracked.txt",
-      start = { line = 2, col = 1 },
-      ["end"] = { line = 4, col = 1 },
-      comment = "The selected span belongs to a new untracked file before its synthetic diff has loaded.",
-    },
-  }
+  set_change_annotation(untracked_doc.tasks[1].subtasks[1].changes[1], "untracked.txt", 2,
+    "Store untracked buffer rows.",
+    "The selected line belongs to a new untracked file before its synthetic diff has loaded.")
   set_walkthrough_doc(untracked_doc)
   buf = open_status()
   summary_buf = start_walkthrough(buf)
-  expand_row_if_needed(buf, "1. Update a.txt through the first task.", "file Fixture edits")
-  expand_row_if_needed(buf, "file Fixture edits", "└─ Rewrite the first fixture file.")
+  expand_row_if_needed(buf, "1. Update a.txt through the first task.", "└─ Rewrite the first fixture file.")
   expand_row_if_needed(buf, "└─ Rewrite the first fixture file.", "Modify Cache a.txt rewrite")
-  local untracked_location = "◦ Store untracked buffer rows.              [untracked.txt:2 +3 -0]"
-  wait_for(function() return buffer_contains(summary_buf, untracked_location) end,
-    "comment-location row should count selected lines for untracked files without loaded hunks")
+  wait_for(function()
+    return buffer_contains(summary_buf, "◦ Store untracked buffer rows.")
+      and buffer_contains(summary_buf, "[untracked.txt:2 +1 -0]")
+  end,
+    "comment-location row should count the selected line for untracked files without loaded hunks")
   assert_true(not buffer_contains(summary_buf, "untracked.txt:2 +0 -0"),
     "untracked walkthrough locations should not collapse to zero stats before diff load")
   trigger_buf_mapping(buf, "ow")
@@ -1175,52 +1133,52 @@ local function run()
 
   untracked_files = { "particle_storage.rs" }
   local count_alignment_doc = valid_doc()
-  count_alignment_doc.tasks[1].groups[1].subtasks[1].changes[1].annotations = {
-    {
-      title = "Store solver buffers outside the system.",
-      file = "particle_storage.rs",
-      start = { line = 12, col = 1 },
-      ["end"] = { line = 20, col = 1 },
-      comment = "The selected span proves short added counts still align with wider neighboring added counts.",
-    },
-    {
-      title = "Allocate compute storage from one capacity.",
-      file = "particle_storage.rs",
-      start = { line = 22, col = 1 },
-      ["end"] = { line = 73, col = 1 },
-      comment = "The wider added count should stay compact inside the bracketed location label.",
-    },
-    {
-      title = "Write spawn batches into shared buffers.",
-      file = "particle_storage.rs",
-      start = { line = 88, col = 1 },
-      ["end"] = { line = 114, col = 1 },
-      comment = "The selected span keeps a compact bracketed location for another two-digit added count.",
-    },
-    {
-      title = "Expose renderable particle buffers.",
-      file = "particle_storage.rs",
-      start = { line = 116, col = 1 },
-      ["end"] = { line = 124, col = 1 },
-      comment = "The longer line number should not add padding between the plus and minus counts.",
-    },
-  }
+  local count_alignment_changes = count_alignment_doc.tasks[1].subtasks[1].changes
+  set_change_annotation(count_alignment_changes[1], "particle_storage.rs", 12,
+    "Store solver buffers outside the system.",
+    "The selected line proves short added counts still align across neighboring rows.")
+  count_alignment_changes[2] = set_change_annotation({
+    action = "Modify",
+    kind = "Struct",
+    role = "Cache",
+    target = "particle storage allocator",
+    note = "allocate compute storage from one capacity",
+  }, "particle_storage.rs", 22, "Allocate compute storage from one capacity.",
+    "The wider added count should stay compact inside the bracketed location label.")
+  count_alignment_changes[3] = set_change_annotation({
+    action = "Modify",
+    kind = "Struct",
+    role = "Cache",
+    target = "particle storage writes",
+    note = "write spawn batches into shared buffers",
+  }, "particle_storage.rs", 88, "Write spawn batches into shared buffers.",
+    "The selected line keeps a compact bracketed location for another row.")
+  count_alignment_changes[4] = set_change_annotation({
+    action = "Modify",
+    kind = "Struct",
+    role = "Cache",
+    target = "particle render buffers",
+    note = "expose renderable particle buffers",
+  }, "particle_storage.rs", 116, "Expose renderable particle buffers.",
+    "The longer line number should not add padding between the plus and minus counts.")
   set_walkthrough_doc(count_alignment_doc)
   buf = open_status()
   summary_buf = start_walkthrough(buf)
-  expand_row_if_needed(buf, "1. Update a.txt through the first task.", "file Fixture edits")
-  expand_row_if_needed(buf, "file Fixture edits", "└─ Rewrite the first fixture file.")
+  expand_row_if_needed(buf, "1. Update a.txt through the first task.", "└─ Rewrite the first fixture file.")
   expand_row_if_needed(buf, "└─ Rewrite the first fixture file.", "Modify Cache a.txt rewrite")
-  local storage_location = "◦ Store solver buffers outside the system.    [particle_storage.rs:12 +9 -0]"
-  local allocate_location = "◦ Allocate compute storage from one capacity. [particle_storage.rs:22 +52 -0]"
-  local write_location = "◦ Write spawn batches into shared buffers.    [particle_storage.rs:88 +27 -0]"
-  local expose_location = "◦ Expose renderable particle buffers.         [particle_storage.rs:116 +9 -0]"
+  local storage_location = "◦ Store solver buffers outside the system.    [particle_storage.rs:12 +1 -0]"
+  local allocate_location = "◦ Allocate compute storage from one capacity. [particle_storage.rs:22 +1 -0]"
+  local write_location = "◦ Write spawn batches into shared buffers.    [particle_storage.rs:88 +1 -0]"
+  local expose_location = "◦ Expose renderable particle buffers.         [particle_storage.rs:116 +1 -0]"
   wait_for(function() return buffer_contains(summary_buf, storage_location) end,
     "comment-location row should keep short added counts compact before the removed count")
+  expand_row_if_needed(buf, "Modify Cache particle storage allocator", allocate_location)
   assert_true(buffer_contains(summary_buf, allocate_location),
-    "comment-location row should keep wider added counts compact")
+    "comment-location row should keep repeated single-line counts compact")
+  expand_row_if_needed(buf, "Modify Cache particle storage writes", write_location)
   assert_true(buffer_contains(summary_buf, write_location),
-    "comment-location row should keep another two-digit added count compact")
+    "comment-location row should keep another single-line count compact")
+  expand_row_if_needed(buf, "Modify Cache particle render buffers", expose_location)
   assert_true(buffer_contains(summary_buf, expose_location),
     "comment-location row should not pad longer file line labels")
   trigger_buf_mapping(buf, "ow")
@@ -1229,103 +1187,79 @@ local function run()
   untracked_files = {}
 
   local padded_location_doc = valid_doc()
-  padded_location_doc.tasks[1].groups[1].subtasks[1].changes[1].annotations = {
-    {
-      title = "Define particle render modes.",
-      file = "blue/engine/plugins/physics/src/particle_render.rs",
-      start = { line = 3, col = 1 },
-      ["end"] = { line = 3, col = 1 },
-      comment = "Render mode definitions give spawn data an explicit choice before the render handoff.",
-    },
-    {
-      title = "Set triangle billboard as the default mode.",
-      file = "blue/engine/plugins/physics/src/particle_render.rs",
-      start = { line = 19, col = 1 },
-      ["end"] = { line = 19, col = 1 },
-      comment = "Existing particle spawns keep their old visual behavior unless they opt into model rendering.",
-    },
-    {
-      title = "Store render mode on ParticleSpawn.",
-      file = "blue/engine/plugins/physics/src/particle_spawn.rs",
-      start = { line = 18, col = 1 },
-      ["end"] = { line = 18, col = 1 },
-      comment = "Spawn data now carries the selected rendering path beside the simulation inputs.",
-    },
-    {
-      title = "Remove direct billboard rendering from simulation.",
-      file = "blue/engine/plugins/physics/src/particle_system.rs",
-      start = { line = 120, col = 1 },
-      ["end"] = { line = 120, col = 1 },
-      comment = "Billboard rendering moves out of the simulation loop so compute ownership stays separate from visuals.",
-    },
-  }
+  local padded_location_changes = padded_location_doc.tasks[1].subtasks[1].changes
+  set_change_annotation(padded_location_changes[1], "blue/engine/plugins/physics/src/particle_render.rs", 3,
+    "Define particle render modes.",
+    "Render mode definitions give spawn data an explicit choice before the render handoff.")
+  padded_location_changes[2] = set_change_annotation({
+    action = "Modify",
+    kind = "Field",
+    target = "particle default mode",
+    note = "set triangle billboard as the default mode",
+  }, "blue/engine/plugins/physics/src/particle_render.rs", 19,
+    "Set triangle billboard as the default mode.",
+    "Existing particle spawns keep their old visual behavior unless they opt into model rendering.")
+  padded_location_changes[3] = set_change_annotation({
+    action = "Add",
+    kind = "Field",
+    target = "ParticleSpawn render mode",
+    note = "store render mode on ParticleSpawn",
+  }, "blue/engine/plugins/physics/src/particle_spawn.rs", 18, "Store render mode on ParticleSpawn.",
+    "Spawn data now carries the selected rendering path beside the simulation inputs.")
+  padded_location_changes[4] = set_change_annotation({
+    action = "Remove",
+    kind = "Function",
+    target = "particle billboard renderer",
+    note = "remove direct billboard rendering from simulation",
+  }, "blue/engine/plugins/physics/src/particle_system.rs", 120,
+    "Remove direct billboard rendering from simulation.",
+    "Billboard rendering moves out of the simulation loop so compute ownership stays separate from visuals.")
   set_walkthrough_doc(padded_location_doc)
   summary_buf = start_walkthrough(buf)
-  expand_row_if_needed(buf, "1. Update a.txt through the first task.", "file Fixture edits")
-  expand_row_if_needed(buf, "file Fixture edits", "└─ Rewrite the first fixture file.")
+  expand_row_if_needed(buf, "1. Update a.txt through the first task.", "└─ Rewrite the first fixture file.")
   expand_row_if_needed(buf, "└─ Rewrite the first fixture file.", "Modify Cache a.txt rewrite")
-  expand_row_if_needed(buf, "Modify Cache a.txt rewrite",
-    "◦ Remove direct billboard rendering from simulation. [particle_system.rs:120]")
   local define_location = "◦ Define particle render modes.                      [particle_render.rs:3]"
   local default_location = "◦ Set triangle billboard as the default mode.        [particle_render.rs:19]"
   local store_location = "◦ Store render mode on ParticleSpawn.                [particle_spawn.rs:18]"
   local remove_location = "◦ Remove direct billboard rendering from simulation. [particle_system.rs:120]"
   assert_true(buffer_contains(summary_buf, define_location),
     "comment-location row should render the title before the bracketed location")
+  expand_row_if_needed(buf, "Modify field particle default mode", default_location)
   assert_true(buffer_contains(summary_buf, default_location),
     "comment-location row should not pad one-digit and two-digit line numbers")
+  expand_row_if_needed(buf, "Add field ParticleSpawn render mode", store_location)
   assert_true(buffer_contains(summary_buf, store_location),
     "comment-location row should not pad shorter filenames")
+  expand_row_if_needed(buf, "Remove fn particle billboard renderer", remove_location)
   assert_true(buffer_contains(summary_buf, remove_location),
     "comment-location row should keep the longest label bracketed after the title")
-  local bracket_col = find_line(summary_buf, define_location):find("[", 1, true)
-  assert_true(bracket_col == find_line(summary_buf, default_location):find("[", 1, true)
-    and bracket_col == find_line(summary_buf, store_location):find("[", 1, true)
-    and bracket_col == find_line(summary_buf, remove_location):find("[", 1, true),
+  local bracket_col = display_col_before(find_line(summary_buf, define_location), "[")
+  assert_true(bracket_col == display_col_before(find_line(summary_buf, default_location), "[")
+    and bracket_col == display_col_before(find_line(summary_buf, store_location), "[")
+    and bracket_col == display_col_before(find_line(summary_buf, remove_location), "["),
     "comment-location rows should align bracketed file labels across the item")
   trigger_buf_mapping(buf, "ow")
   wait_for(function() return not buffer_contains(buf, "Walkthrough:") end, "padded-location walkthrough did not toggle off")
 
   local global_location_doc = valid_doc()
-  global_location_doc.tasks[1].groups[1].subtasks[1].changes[1].annotations = {
-    {
-      title = "Short local step.",
-      file = "a.txt",
-      start = { line = 2, col = 1 },
-      ["end"] = { line = 2, col = 1 },
-      comment = "The short title should still align with the longest walkthrough location in the summary.",
-    },
-  }
-  global_location_doc.tasks[1].groups[1].subtasks[1].changes[2] = {
+  set_change_annotation(global_location_doc.tasks[1].subtasks[1].changes[1], "a.txt", 2,
+    "Short local step.",
+    "The short title should still align with the longest walkthrough location in the summary.")
+  global_location_doc.tasks[1].subtasks[1].changes[2] = set_change_annotation({
     action = "Add",
     kind = "Function",
     target = "b.txt rewrite",
     note = "repeat the rewrite with a longer location row",
-    annotations = {
-      {
-        title = "Longer walkthrough location title across tasks.",
-        file = "b.txt",
-        start = { line = 2, col = 1 },
-        ["end"] = { line = 2, col = 1 },
-        comment = "The long title in another action should set the shared location column for every step row.",
-      },
-    },
-  }
-  global_location_doc.tasks[2].groups[1].subtasks[1].changes[1].annotations = {
-    {
-      title = "Mirror the rewrite in the second fixture.",
-      file = "b.txt",
-      start = { line = 2, col = 1 },
-      ["end"] = { line = 2, col = 1 },
-      comment = "The second task remains part of the document but is not needed for this fold regression.",
-    },
-  }
+  }, "b.txt", 2, "Longer walkthrough location title across tasks.",
+    "The long title in another action should set the shared location column for every step row.")
+  set_change_annotation(global_location_doc.tasks[2].subtasks[1].changes[1], "b.txt", 2,
+    "Mirror the rewrite in the second fixture.",
+    "The second task remains part of the document but is not needed for this fold regression.")
   set_walkthrough_doc(global_location_doc)
   buf = open_status()
   captured_notifications = {}
   summary_buf = start_walkthrough(buf)
-  expand_row_if_needed(buf, "1. Update a.txt through the first task.", "file Fixture edits")
-  expand_row_if_needed(buf, "file Fixture edits", "└─ Rewrite the first fixture file.")
+  expand_row_if_needed(buf, "1. Update a.txt through the first task.", "└─ Rewrite the first fixture file.")
   expand_row_if_needed(buf, "└─ Rewrite the first fixture file.", "Modify Cache a.txt rewrite")
   expand_row_if_needed(buf, "Modify Cache a.txt rewrite", "◦ Short local step.")
   expand_row_if_needed(buf, "Add fn b.txt rewrite", "◦ Longer walkthrough location title across tasks.")
@@ -1359,42 +1293,32 @@ local function run()
   degraded.tasks = {
     {
       title = "Resolve stale walkthrough targets.",
-      groups = {
+      subtasks = {
         {
-          type = "File",
-          title = "Stale targets",
-          subtasks = {
+          title = "Exercise degraded target resolution.",
+          changes = {
             {
-              title = "Exercise degraded target resolution.",
-              changes = {
-                {
-                  action = "Modify",
-                  kind = "Test",
-                  target = "Stale line reference",
-                  note = "fall back to the nearest rendered line",
-                  annotations = {
-                    {
-                      file = "a.txt",
-                      start = { line = 999, col = 1 },
-                      ["end"] = { line = 999, col = 1 },
-                      comment = "Stale line reference.",
-                    },
-                  },
-                },
-                {
-                  action = "Modify",
-                  kind = "Test",
-                  target = "Missing file reference",
-                  note = "surface a missing-file note instead of failing",
-                  annotations = {
-                    {
-                      file = "gone.txt",
-                      start = { line = 1, col = 1 },
-                      ["end"] = { line = 1, col = 1 },
-                      comment = "File missing from the diff.",
-                    },
-                  },
-                },
+              action = "Modify",
+              kind = "Test",
+              target = "Stale line reference",
+              note = "fall back to the nearest rendered line",
+              file = "a.txt",
+              line = 999,
+              annotation = {
+                title = "Stale line reference.",
+                comment = "Stale line reference.",
+              },
+            },
+            {
+              action = "Modify",
+              kind = "Test",
+              target = "Missing file reference",
+              note = "surface a missing-file note instead of failing",
+              file = "gone.txt",
+              line = 1,
+              annotation = {
+                title = "Missing file reference.",
+                comment = "File missing from the diff.",
               },
             },
           },
@@ -1408,65 +1332,54 @@ local function run()
   wait_for(function() return box_contains(buf, "position approximated") end, "nearest match note missing")
   assert_true(not box_contains(buf, "not in current diff"), "missing files should not render comment boxes in status mode")
   trigger_buf_mapping(buf, "ow")
+  wait_for(function() return not buffer_contains(buf, "Walkthrough:") end,
+    "stale-target walkthrough did not toggle off")
+  wait_for(function() return walkthrough_extmark_count(buf) == 0 end,
+    "stale-target walkthrough did not clear extmarks")
 
   -- ── partially staged file + visible region split across hunks ─────────────
   local staged_doc = valid_doc()
   staged_doc.tasks = {
     {
       title = "Resolve staged and split walkthrough regions.",
-      groups = {
+      subtasks = {
         {
-          type = "File",
-          title = "Fixture diff sections",
-          subtasks = {
+          title = "Resolve nontrivial rendered regions.",
+          changes = {
             {
-              title = "Resolve nontrivial rendered regions.",
-              changes = {
-                {
-                  action = "Modify",
-                  kind = "Test",
-                  target = "Staged region",
-                  note = "anchor the staged-only section",
-                  annotations = {
-                    {
-                      title = "Staged region",
-                      file = "c.txt",
-                      start = { line = 2, col = 1 },
-                      ["end"] = { line = 2, col = 5 },
-                      comment = "Lives only in the staged section.",
-                    },
-                  },
-                },
-                {
-                  action = "Modify",
-                  kind = "Test",
-                  target = "Split region",
-                  note = "anchor the first rendered split row",
-                  annotations = {
-                    {
-                      title = "Split region",
-                      file = "a.txt",
-                      start = { line = 5, col = 1 },
-                      ["end"] = { line = 11, col = 5 },
-                      comment = "Region starts between hunks and ends inside the second hunk.",
-                    },
-                  },
-                },
-                {
-                  action = "Modify",
-                  kind = "Test",
-                  target = "Long region",
-                  note = "keep start visible for long regions",
-                  annotations = {
-                    {
-                      title = "Long region",
-                      file = "a.txt",
-                      start = { line = 20, col = 1 },
-                      ["end"] = { line = 55, col = 5 },
-                      comment = "Long selected region keeps its start visible.",
-                    },
-                  },
-                },
+              action = "Modify",
+              kind = "Test",
+              target = "Staged region",
+              note = "anchor the staged-only section",
+              file = "c.txt",
+              line = 2,
+              annotation = {
+                title = "Staged region",
+                comment = "Lives only in the staged section.",
+              },
+            },
+            {
+              action = "Modify",
+              kind = "Test",
+              target = "Split anchor",
+              note = "anchor a rendered follow-up row",
+              file = "a.txt",
+              line = 11,
+              annotation = {
+                title = "Split anchor",
+                comment = "The single-line anchor lands inside the second hunk.",
+              },
+            },
+            {
+              action = "Modify",
+              kind = "Test",
+              target = "Long anchor",
+              note = "keep the selected line visible",
+              file = "a.txt",
+              line = 21,
+              annotation = {
+                title = "Long anchor",
+                comment = "The selected line remains visible when the comment box opens.",
               },
             },
           },
@@ -1481,15 +1394,15 @@ local function run()
   assert_true(not box_contains(buf, "stale"), "staged region must not be flagged stale")
 
   expand_row_if_needed(buf, "a.txt +", "NEW a.txt")
-  wait_for(function() return box_contains(buf, "ends inside the second hunk") end, "split-region step box did not render")
+  wait_for(function() return box_contains(buf, "inside the second hunk") end, "split-anchor step box did not render")
   local second_hunk_row = find_row(buf, "NEW2 a.txt")
   assert_true(not box_contains(buf, "approximated"), "split region must not be flagged approximated")
 
-  wait_for(function() return box_contains(buf, "Long selected region keeps its start visible") end,
-    "long-region step box did not render")
+  wait_for(function() return box_contains(buf, "selected line remains visible") end,
+    "long-anchor step box did not render")
   local long_start_row = find_row(buf, "NEW long 02 a.txt")
-  local long_box_mark = comment_box_mark_containing(buf, "Long selected region")
-  assert_true(long_box_mark ~= nil, "long-region comment box mark missing")
+  local long_box_mark = comment_box_mark_containing(buf, "selected line remains visible")
+  assert_true(long_box_mark ~= nil, "long-anchor comment box mark missing")
   local long_anchor_row = long_box_mark[2] + 1
   assert_true(long_anchor_row >= long_start_row,
     ("long-region box should anchor at or after the rendered start row (start %d, anchor %d)"):format(
@@ -1511,10 +1424,10 @@ local function run()
   trigger_buf_mapping(buf, "ow")
   wait_for(function() return saw_notification_containing("not valid JSON") end, "invalid JSON notification absent")
 
-  fixtures[root .. "/.walkthrough.json"] = vim.json.encode({ version = 1, summary = "x", commit = "zz", annotations = {} })
+  fixtures[root .. "/.walkthrough.json"] = vim.json.encode({ version = 1, summary = "x", commit = "zz" })
   captured_notifications = {}
   trigger_buf_mapping(buf, "ow")
-  wait_for(function() return saw_notification_containing("expected 10") end, "v1 rejection notification absent")
+  wait_for(function() return saw_notification_containing("expected 12") end, "v1 rejection notification absent")
 
   local missing_flow = valid_doc()
   missing_flow.flow = nil
@@ -1532,16 +1445,16 @@ local function run()
   wait_for(function() return saw_notification_containing("flow 1: missing \"text\"") end,
     "invalid flow node notification absent")
 
-  local invalid_group_type = valid_doc()
-  invalid_group_type.tasks[1].groups[1].type = "Method"
-  set_walkthrough_doc(invalid_group_type)
+  local missing_subtasks = valid_doc()
+  missing_subtasks.tasks[1].subtasks = {}
+  set_walkthrough_doc(missing_subtasks)
   captured_notifications = {}
   trigger_buf_mapping(buf, "ow")
-  wait_for(function() return saw_notification_containing("group 1: missing or invalid \"type\"") end,
-    "invalid group type notification absent")
+  wait_for(function() return saw_notification_containing("task 1: missing or empty \"subtasks\"") end,
+    "missing subtasks notification absent")
 
   local invalid_change_kind = valid_doc()
-  invalid_change_kind.tasks[1].groups[1].subtasks[1].changes[1].kind = "Doc"
+  invalid_change_kind.tasks[1].subtasks[1].changes[1].kind = "Doc"
   set_walkthrough_doc(invalid_change_kind)
   captured_notifications = {}
   trigger_buf_mapping(buf, "ow")
@@ -1549,7 +1462,7 @@ local function run()
     "invalid change kind notification absent")
 
   local invalid_app_change_kind = valid_doc()
-  invalid_app_change_kind.tasks[1].groups[1].subtasks[1].changes[1].kind = "App"
+  invalid_app_change_kind.tasks[1].subtasks[1].changes[1].kind = "App"
   set_walkthrough_doc(invalid_app_change_kind)
   captured_notifications = {}
   trigger_buf_mapping(buf, "ow")
@@ -1557,76 +1470,98 @@ local function run()
     "App change kind rejection notification absent")
 
   local invalid_change_role = valid_doc()
-  invalid_change_role.tasks[1].groups[1].subtasks[1].changes[1].role = ""
+  invalid_change_role.tasks[1].subtasks[1].changes[1].role = ""
   set_walkthrough_doc(invalid_change_role)
   captured_notifications = {}
   trigger_buf_mapping(buf, "ow")
   wait_for(function() return saw_notification_containing("change 1: invalid \"role\"") end,
     "invalid change role notification absent")
 
-  local invalid_change_note = valid_doc()
-  invalid_change_note.tasks[1].groups[1].subtasks[1].changes[1].note = string.rep("x", 51)
-  set_walkthrough_doc(invalid_change_note)
+  local long_text_doc = valid_doc()
+  long_text_doc.tasks[1].justification = string.rep("task justification ", 14)
+  long_text_doc.tasks[1].subtasks[1].justification = string.rep("subtask justification ", 14)
+  long_text_doc.tasks[1].subtasks[1].changes[1].note = string.rep("long note ", 14)
+  long_text_doc.tasks[1].subtasks[1].changes[1].annotation.comment = string.rep("long annotation text ", 14)
+  set_walkthrough_doc(long_text_doc)
   captured_notifications = {}
+  summary_buf = start_walkthrough(buf)
+  wait_for(function() return buffer_contains(summary_buf, "Walkthrough:") end,
+    "long walkthrough text should enter walkthrough mode")
   trigger_buf_mapping(buf, "ow")
-  wait_for(function() return saw_notification_containing("\"note\" must be 50 characters or less") end,
-    "invalid change note length notification absent")
+  wait_for(function() return not buffer_contains(buf, "Walkthrough:") end,
+    "long walkthrough text mode did not toggle off")
 
   local invalid_change_children = valid_doc()
-  invalid_change_children.tasks[1].groups[1].subtasks[1].changes[1].children = {}
+  invalid_change_children.tasks[1].subtasks[1].changes[1].children = {}
   set_walkthrough_doc(invalid_change_children)
   captured_notifications = {}
   trigger_buf_mapping(buf, "ow")
   wait_for(function() return saw_notification_containing("\"children\" is not supported") end,
     "invalid change children notification absent")
 
-  local missing_change_annotations = valid_doc()
-  missing_change_annotations.tasks[1].groups[1].subtasks[1].changes[1].annotations = nil
-  set_walkthrough_doc(missing_change_annotations)
+  local optional_change_annotation = valid_doc()
+  local anchored_change = optional_change_annotation.tasks[1].subtasks[1].changes[1]
+  optional_change_annotation.tasks[1].subtasks[1].changes = {
+    {
+      action = "Modify",
+      kind = "Struct",
+      role = "Cache",
+      target = "a.txt summary-only rewrite",
+      note = "summarize the rewrite without a local anchor",
+    },
+    anchored_change,
+  }
+  set_walkthrough_doc(optional_change_annotation)
   captured_notifications = {}
-  trigger_buf_mapping(buf, "ow")
-  wait_for(function() return saw_notification_containing("missing or empty \"annotations\"") end,
-    "missing change annotations notification absent")
-
-  local invalid_callout_kind = valid_doc()
-  invalid_callout_kind.tasks[1].groups[1].subtasks[1].changes[1].annotations[1].callout.kind = "note"
-  set_walkthrough_doc(invalid_callout_kind)
-  captured_notifications = {}
-  trigger_buf_mapping(buf, "ow")
-  wait_for(function() return saw_notification_containing("callout has invalid \"kind\"") end,
-    "invalid callout kind notification absent")
-
-  local plural_callouts = valid_doc()
-  plural_callouts.tasks[1].groups[1].subtasks[1].changes[1].annotations[1].callouts = {}
-  set_walkthrough_doc(plural_callouts)
-  captured_notifications = {}
-  trigger_buf_mapping(buf, "ow")
-  wait_for(function() return saw_notification_containing("\"callouts\" is not supported") end,
-    "plural callouts notification absent")
-
-  local too_long_callout = valid_doc()
-  too_long_callout.tasks[1].groups[1].subtasks[1].changes[1].annotations[1].callout.text = string.rep("x", 181)
-  set_walkthrough_doc(too_long_callout)
-  captured_notifications = {}
-  trigger_buf_mapping(buf, "ow")
-  wait_for(function() return saw_notification_containing("callout \"text\" must be 180 characters or less") end,
-    "too-long callout notification absent")
-
-  local long_allowed_justification = valid_doc()
-  long_allowed_justification.tasks[1].justification =
-    "Rendering now has multiple paths, so each spawn declares its mode before render handoff."
-  long_allowed_justification.tasks[1].groups[1].subtasks[1].justification =
-    "The fixture now has a longer local rationale, so walkthrough validation must accept more than eighty characters."
-  set_walkthrough_doc(long_allowed_justification)
-  captured_notifications = {}
-  trigger_buf_mapping(buf, "ow")
-  wait_for(function() return buffer_contains(buf, "Walkthrough:") end,
-    "long allowed justification should enter walkthrough mode")
-  assert_true(not saw_notification_containing("\"justification\" must be"),
-    "allowed long justification should not emit a length notification")
+  summary_buf = start_walkthrough(buf)
+  expand_row_if_needed(buf, "1. Update a.txt through the first task.", "└─ Rewrite the first fixture file.")
+  wait_for(function() return buffer_contains(summary_buf, "Modify Cache a.txt summary-only rewrite") end,
+    "summary-only change without annotation should render")
+  assert_true(not saw_notification_containing("invalid \"annotation\""),
+    "optional change annotation should not emit a validation notification")
   trigger_buf_mapping(buf, "ow")
   wait_for(function() return not buffer_contains(buf, "Walkthrough:") end,
-    "long allowed justification walkthrough did not toggle off")
+    "optional annotation walkthrough did not toggle off")
+
+  local plural_annotations = valid_doc()
+  plural_annotations.tasks[1].subtasks[1].changes[1].annotations = {}
+  set_walkthrough_doc(plural_annotations)
+  captured_notifications = {}
+  trigger_buf_mapping(buf, "ow")
+  wait_for(function() return saw_notification_containing("\"annotations\" is not supported") end,
+    "plural annotations rejection notification absent")
+
+  local old_range_annotation = valid_doc()
+  old_range_annotation.tasks[1].subtasks[1].changes[1].annotation.start = { line = 2, col = 1 }
+  set_walkthrough_doc(old_range_annotation)
+  captured_notifications = {}
+  trigger_buf_mapping(buf, "ow")
+  wait_for(function() return saw_notification_containing("unsupported \"start\"") end,
+    "old range annotation rejection notification absent")
+
+  local missing_annotation_line = valid_doc()
+  missing_annotation_line.tasks[1].subtasks[1].changes[1].line = nil
+  set_walkthrough_doc(missing_annotation_line)
+  captured_notifications = {}
+  trigger_buf_mapping(buf, "ow")
+  wait_for(function() return saw_notification_containing("missing or invalid \"line\"") end,
+    "missing annotation line notification absent")
+
+  local annotation_file_field = valid_doc()
+  annotation_file_field.tasks[1].subtasks[1].changes[1].annotation.file = "a.txt"
+  set_walkthrough_doc(annotation_file_field)
+  captured_notifications = {}
+  trigger_buf_mapping(buf, "ow")
+  wait_for(function() return saw_notification_containing("unsupported \"file\"") end,
+    "annotation file field rejection notification absent")
+
+  local annotation_callout = valid_doc()
+  annotation_callout.tasks[1].subtasks[1].changes[1].annotation.callout = {}
+  set_walkthrough_doc(annotation_callout)
+  captured_notifications = {}
+  trigger_buf_mapping(buf, "ow")
+  wait_for(function() return saw_notification_containing("unsupported \"callout\"") end,
+    "annotation callout rejection notification absent")
 
   local invalid_task_justification = valid_doc()
   invalid_task_justification.tasks[1].justification = ""
@@ -1636,29 +1571,14 @@ local function run()
   wait_for(function() return saw_notification_containing("task 1: invalid \"justification\"") end,
     "invalid task justification notification absent")
 
-  local too_long_task_justification = valid_doc()
-  too_long_task_justification.tasks[1].justification = string.rep("x", 171)
-  set_walkthrough_doc(too_long_task_justification)
-  captured_notifications = {}
-  trigger_buf_mapping(buf, "ow")
-  wait_for(function() return saw_notification_containing("\"justification\" must be 170 characters or less") end,
-    "too-long task justification notification absent")
-
   local invalid_subtask_justification = valid_doc()
-  invalid_subtask_justification.tasks[1].groups[1].subtasks[1].justification = ""
+  invalid_subtask_justification.tasks[1].subtasks[1].justification = ""
   set_walkthrough_doc(invalid_subtask_justification)
   captured_notifications = {}
   trigger_buf_mapping(buf, "ow")
   wait_for(function() return saw_notification_containing("subtask 1: invalid \"justification\"") end,
     "invalid subtask justification notification absent")
 
-  local too_long_subtask_justification = valid_doc()
-  too_long_subtask_justification.tasks[1].groups[1].subtasks[1].justification = string.rep("x", 171)
-  set_walkthrough_doc(too_long_subtask_justification)
-  captured_notifications = {}
-  trigger_buf_mapping(buf, "ow")
-  wait_for(function() return saw_notification_containing("\"justification\" must be 170 characters or less") end,
-    "too-long subtask justification notification absent")
 end
 
 local ok, err = xpcall(run, debug.traceback)

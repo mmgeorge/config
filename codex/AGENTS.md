@@ -8,6 +8,7 @@
 
 # Subagent Research Workflow
 - Use the built-in `explorer` agent for local codebase exploration. Use `remote-code-explorer` for remote source, external library, GitHub, docs, examples, issues, or PR research when that custom agent is available.
+- For local codebase exploration, use the `sem` MCP tools first when they are available. Prefer `sem_entities` for file and directory maps, `sem_impact` for dependency and affected-test checks, `sem_context` for focused code packets, and `sem_blame` or `sem_log` when ownership or history matters.
 - Do not spawn explore agents for tiny lookups, single-file reads, tightly coupled debugging, direct implementation work, or the next critical-path step when the main agent is blocked on the answer. Do that work locally.
 - Before delegating, decide the immediate local task and keep working on non-overlapping work while subagents run. Do not duplicate a subagent's assignment in the main thread.
 - Make each delegated exploration task concrete and bounded. Include the target, the question to answer, desired thoroughness (`quick`, `medium`, or `thorough`), and the expected output format.
@@ -15,12 +16,15 @@
 
 # Walkthrough Agent Workflow
 - Before verification and after completing a change that modifies 6 or more files, spawn the `walkthrough-writer` to generate a summary of the change while you finish verification.
-- Provide the agent a compact recap of the completed task, the repository root, and any plan file associated with the change.
-- The `walkthrough-writer` agent owns gathering filtered git context, reading relevant diffs, writing `.walkthrough.json`, validating it, and fixing validation failures. The main agent should not duplicate that walkthrough work unless the subagent fails.
+- Spawn `walkthrough-writer` as a standalone task with its own explicit prompt. Do not use a full-history fork when selecting this custom agent role.
+- Provide the agent a compact recap of the completed task, the repository root, changed-file context, and any plan file associated with the change.
+- Tell the `walkthrough-writer` to use `sem_diff` or `sem diff` first for entity-level change context. Use raw git diffs afterward only for exact patch details, line ranges, whitespace, and validation.
+- The `walkthrough-writer` agent owns gathering filtered semantic change context, reading relevant raw diffs where needed, writing `.walkthrough.json`, validating it, and fixing validation failures. The main agent should not duplicate that walkthrough work unless the subagent fails.
 - Wait for the `walkthrough-writer` result before the final response, then report whether `.walkthrough.json` was written and validated.
 
 # Searching
 - For researching or finding new Rust crates, use `docs-mcp`.
+- For local diffs, use `sem_diff` or `sem diff` when available to identify entity-level changes before reviewing raw hunks. Use raw git diffs afterward for exact patch details, whitespace, and line-level verification.
 - When you need to view the source code:
   - For Rust or Typescript, first check locally if it already exist.
   - Otherwise, when you need to view source code, use `github` mcp.

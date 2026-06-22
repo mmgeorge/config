@@ -9,7 +9,7 @@
 
 ---@class DiffReviewWalkthroughPosition
 ---@field line integer 1-based line in the new file
----@field col integer 1-based column
+---@field col integer 1-based column, normalized to 1 for walkthrough anchors
 
 ---@class DiffReviewWalkthroughStep
 ---@field file string repo-relative path, forward slashes
@@ -17,7 +17,6 @@
 ---@field end_pos DiffReviewWalkthroughPosition
 ---@field comment string
 ---@field title? string
----@field callout? DiffReviewWalkthroughCallout
 ---@field task_index integer
 ---@field step_index integer
 ---@field task_step_total integer
@@ -25,10 +24,6 @@
 ---@field task_title string
 ---@field subtask_title string
 ---@field item_title string
-
----@class DiffReviewWalkthroughCallout
----@field kind string
----@field text string
 
 ---@class DiffReviewWalkthroughItem
 ---@field action string
@@ -43,15 +38,10 @@
 ---@field justification? string
 ---@field items DiffReviewWalkthroughItem[]
 
----@class DiffReviewWalkthroughGroup
----@field type string
----@field title string
----@field subtasks DiffReviewWalkthroughSubtask[]
-
 ---@class DiffReviewWalkthroughTask
 ---@field title string
 ---@field justification? string
----@field groups DiffReviewWalkthroughGroup[]
+---@field subtasks DiffReviewWalkthroughSubtask[]
 
 ---@class DiffReviewWalkthroughFlowNode
 ---@field text string
@@ -225,12 +215,10 @@ end
 
 ---@param value any
 ---@return DiffReviewWalkthroughPosition?
-local function parse_position(value)
-  if type(value) ~= "table" then return nil end
-  local line = tonumber(value.line)
-  local col = tonumber(value.col)
-  if not line or line < 1 or not col or col < 1 then return nil end
-  return { line = math.floor(line), col = math.floor(col) }
+local function parse_anchor_line(value)
+  local line = tonumber(value)
+  if not line or line < 1 then return nil end
+  return { line = math.floor(line), col = 1 }
 end
 
 ---@param value any
@@ -242,44 +230,21 @@ end
 ---@param value any
 ---@param error_prefix string
 ---@param field string
----@param max_length? integer
 ---@return string? parsed
 ---@return string? error
-local function parse_optional_string_field(value, error_prefix, field, max_length)
+local function parse_optional_string_field(value, error_prefix, field)
   if value == nil then return nil, nil end
   if not is_non_empty_string(value) then
     return nil, ("%s: invalid \"%s\""):format(error_prefix, field)
-  end
-  if max_length and vim.fn.strchars(value) > max_length then
-    return nil, ("%s: \"%s\" must be %d characters or less"):format(error_prefix, field, max_length)
   end
   return value, nil
 end
 
 local action_order = { "Add", "Modify", "Remove" }
-local group_type_order = { "Module", "File", "Package", "Directory" }
-local callout_text_max_length = 180
 local valid_item_actions = {
   Add = true,
   Modify = true,
   Remove = true,
-}
-local item_note_max_length = 50
-local justification_max_length = 170
-local valid_group_types = {
-  Module = true,
-  File = true,
-  Package = true,
-  Directory = true,
-}
-local valid_callout_kinds = {
-  important = true,
-  limitation = true,
-  temporary = true,
-  risk = true,
-  followup = true,
-  deviation = true,
-  workaround = true,
 }
 local valid_item_types = {
   Class = true,
@@ -298,24 +263,6 @@ local action_highlights = {
   Add = "DiffReviewWalkthroughActionAdd",
   Modify = "DiffReviewWalkthroughActionModify",
   Remove = "DiffReviewWalkthroughActionRemove",
-}
-local callout_labels = {
-  important = "Important",
-  limitation = "Limitation",
-  temporary = "Temporary",
-  risk = "Risk",
-  followup = "Follow-up",
-  deviation = "Deviation",
-  workaround = "Workaround",
-}
-local callout_highlights = {
-  important = "DiffReviewWalkthroughCalloutImportant",
-  limitation = "DiffReviewWalkthroughCalloutLimitation",
-  temporary = "DiffReviewWalkthroughCalloutTemporary",
-  risk = "DiffReviewWalkthroughCalloutRisk",
-  followup = "DiffReviewWalkthroughCalloutFollowup",
-  deviation = "DiffReviewWalkthroughCalloutDeviation",
-  workaround = "DiffReviewWalkthroughCalloutWorkaround",
 }
 ---@param is_last boolean
 ---@return string
@@ -627,20 +574,15 @@ end
 ---@param lines string[]
 ---@param task DiffReviewWalkthroughTask
 local function append_task_summary_body(lines, task)
-  local task_body_prefix = ""
-  for _, group in ipairs(task.groups) do
-    local group_prefix = task_body_prefix
-    lines[#lines + 1] = group_prefix .. format_type_keyword(group.type) .. " " .. group.title
-    local subtask_prefix = group_prefix .. "   "
-    for subtask_index, subtask in ipairs(group.subtasks) do
-      local subtask_is_last = subtask_index == #group.subtasks
-      lines[#lines + 1] = subtask_prefix .. tree_branch(subtask_is_last) .. subtask.title
-      local item_prefix = subtask_prefix .. tree_continuation(subtask_is_last)
-      if subtask.justification then lines[#lines + 1] = item_prefix .. subtask.justification end
-      for item_index, item in ipairs(subtask.items) do
-        local item_is_last = item_index == #subtask.items
-        append_summary_item(lines, item, item_prefix, item_is_last)
-      end
+  local subtask_prefix = ""
+  for subtask_index, subtask in ipairs(task.subtasks) do
+    local subtask_is_last = subtask_index == #task.subtasks
+    lines[#lines + 1] = subtask_prefix .. tree_branch(subtask_is_last) .. subtask.title
+    local item_prefix = subtask_prefix .. tree_continuation(subtask_is_last)
+    if subtask.justification then lines[#lines + 1] = item_prefix .. subtask.justification end
+    for item_index, item in ipairs(subtask.items) do
+      local item_is_last = item_index == #subtask.items
+      append_summary_item(lines, item, item_prefix, item_is_last)
     end
   end
 end
@@ -650,16 +592,14 @@ end
 local function collect_summary_item_specs(tasks)
   local specs = {}
   for _, task in ipairs(tasks) do
-    for _, group in ipairs(task.groups) do
-      for _, subtask in ipairs(group.subtasks) do
-        for _, item in ipairs(subtask.items) do
-          specs[#specs + 1] = {
-            type = item.type,
-            subtype = item.subtype,
-            label = format_item_type_label(item.type, item.subtype),
-            title = item.title,
-          }
-        end
+    for _, subtask in ipairs(task.subtasks) do
+      for _, item in ipairs(subtask.items) do
+        specs[#specs + 1] = {
+          type = item.type,
+          subtype = item.subtype,
+          label = format_item_type_label(item.type, item.subtype),
+          title = item.title,
+        }
       end
     end
   end
@@ -676,11 +616,9 @@ end
 local function collect_summary_item_titles(tasks)
   local titles = {}
   for _, task in ipairs(tasks) do
-    for _, group in ipairs(task.groups) do
-      for _, subtask in ipairs(group.subtasks) do
-        for _, item in ipairs(subtask.items) do
-          titles[#titles + 1] = item.title
-        end
+    for _, subtask in ipairs(task.subtasks) do
+      for _, item in ipairs(subtask.items) do
+        titles[#titles + 1] = item.title
       end
     end
   end
@@ -693,10 +631,8 @@ end
 local function collect_summary_justifications(tasks)
   local justifications = {}
   for _, task in ipairs(tasks) do
-    for _, group in ipairs(task.groups) do
-      for _, subtask in ipairs(group.subtasks) do
-        if subtask.justification then justifications[#justifications + 1] = subtask.justification end
-      end
+    for _, subtask in ipairs(task.subtasks) do
+      if subtask.justification then justifications[#justifications + 1] = subtask.justification end
     end
   end
   table.sort(justifications, function(left, right) return #left > #right end)
@@ -723,60 +659,47 @@ local function build_summary(overview, _root, flow, tasks)
   return table.concat(lines, "\n")
 end
 
----@param raw_step any
+local annotation_allowed_fields = {
+  title = true,
+  comment = true,
+}
+
+---@param raw_change any
+---@param raw_annotation any
 ---@param error_prefix string
 ---@param context DiffReviewWalkthroughStepContext
 ---@return DiffReviewWalkthroughStep? step
 ---@return string? error
-local function parse_step(raw_step, error_prefix, context)
-  if type(raw_step) ~= "table" or not is_non_empty_string(raw_step.file) then
-    return nil, error_prefix .. ": missing \"file\""
+local function parse_step(raw_change, raw_annotation, error_prefix, context)
+  if type(raw_annotation) ~= "table" then
+    return nil, error_prefix .. ": invalid \"annotation\""
   end
-  if not is_non_empty_string(raw_step.comment) then
+  for field in pairs(raw_annotation) do
+    if not annotation_allowed_fields[field] then
+      return nil, ("%s: unsupported \"%s\""):format(error_prefix, field)
+    end
+  end
+  if not is_non_empty_string(raw_annotation.title) then
+    return nil, error_prefix .. ": missing \"title\""
+  end
+  if not is_non_empty_string(raw_annotation.comment) then
     return nil, error_prefix .. ": missing \"comment\""
   end
+  if not is_non_empty_string(raw_change.file) then
+    return nil, error_prefix .. ": missing \"file\""
+  end
 
-  local start_pos = parse_position(raw_step.start)
-  local end_pos = parse_position(raw_step["end"]) or start_pos
+  local start_pos = parse_anchor_line(raw_change.line)
   if not start_pos then
-    return nil, error_prefix .. ": missing or invalid \"start\" position"
-  end
-  ---@cast end_pos DiffReviewWalkthroughPosition
-  if end_pos.line < start_pos.line then
-    end_pos = start_pos
-  end
-
-  if raw_step.callouts ~= nil then
-    return nil, error_prefix .. ": \"callouts\" is not supported; use singular \"callout\""
-  end
-  local callout = nil
-  if raw_step.callout ~= nil then
-    if type(raw_step.callout) ~= "table" then
-      return nil, error_prefix .. ": invalid \"callout\""
-    end
-    if type(raw_step.callout.kind) ~= "string" or not valid_callout_kinds[raw_step.callout.kind] then
-      return nil, error_prefix .. ": callout has invalid \"kind\""
-    end
-    if not is_non_empty_string(raw_step.callout.text) then
-      return nil, error_prefix .. ": callout has missing \"text\""
-    end
-    if vim.fn.strchars(raw_step.callout.text) > callout_text_max_length then
-      return nil, ("%s: callout \"text\" must be %d characters or less"):format(error_prefix,
-        callout_text_max_length)
-    end
-    callout = {
-      kind = raw_step.callout.kind,
-      text = raw_step.callout.text,
-    }
+    return nil, error_prefix .. ": missing or invalid \"line\""
   end
 
   return {
-    file = (raw_step.file:gsub("\\", "/")),
+    file = (raw_change.file:gsub("\\", "/")),
     start_pos = start_pos,
-    end_pos = end_pos,
-    comment = raw_step.comment,
-    title = type(raw_step.title) == "string" and raw_step.title or nil,
-    callout = callout,
+    end_pos = start_pos,
+    comment = raw_annotation.comment,
+    title = raw_annotation.title,
     task_index = context.task_index,
     step_index = context.step_index,
     label = ("Task %d.%d"):format(context.task_index, context.step_index),
@@ -807,10 +730,6 @@ local function parse_change(raw_change, error_prefix, base_context, task_step_in
   if not is_non_empty_string(raw_change.note) then
     return nil, task_step_index, error_prefix .. ": missing \"note\""
   end
-  if vim.fn.strchars(raw_change.note) > item_note_max_length then
-    return nil, task_step_index, ("%s: \"note\" must be %d characters or less"):format(error_prefix,
-      item_note_max_length)
-  end
 
   if type(raw_change.kind) ~= "string" or not valid_item_types[raw_change.kind] then
     return nil, task_step_index, error_prefix .. ": missing or invalid \"kind\""
@@ -820,15 +739,15 @@ local function parse_change(raw_change, error_prefix, base_context, task_step_in
   if raw_change.children ~= nil then
     return nil, task_step_index, error_prefix .. ": \"children\" is not supported; use a subtask or sibling change"
   end
-  if type(raw_change.annotations) ~= "table" or #raw_change.annotations == 0 then
-    return nil, task_step_index, error_prefix .. ": missing or empty \"annotations\""
+  if raw_change.annotations ~= nil then
+    return nil, task_step_index, error_prefix .. ": \"annotations\" is not supported; use singular \"annotation\""
   end
 
   ---@type DiffReviewWalkthroughStep[]
   local item_steps = {}
-  for annotation_offset, raw_step in ipairs(raw_change.annotations) do
+  if raw_change.annotation ~= nil then
     task_step_index = task_step_index + 1
-    local step, parse_error = parse_step(raw_step, ("%s annotation %d"):format(error_prefix, annotation_offset), {
+    local step, parse_error = parse_step(raw_change, raw_change.annotation, ("%s annotation"):format(error_prefix), {
       task_index = base_context.task_index,
       step_index = task_step_index,
       task_title = base_context.task_title,
@@ -838,6 +757,8 @@ local function parse_change(raw_change, error_prefix, base_context, task_step_in
     if not step then return nil, task_step_index, parse_error end
     item_steps[#item_steps + 1] = step
     all_steps[#all_steps + 1] = step
+  elseif raw_change.file ~= nil or raw_change.line ~= nil then
+    return nil, task_step_index, error_prefix .. ": \"file\" and \"line\" require \"annotation\""
   end
 
   return {
@@ -866,7 +787,7 @@ local function parse_subtask(raw_subtask, error_prefix, base_context, task_step_
     return nil, task_step_index, error_prefix .. ": missing or empty \"changes\""
   end
   local justification, justification_error = parse_optional_string_field(raw_subtask.justification, error_prefix,
-    "justification", justification_max_length)
+    "justification")
   if justification_error then return nil, task_step_index, justification_error end
 
   ---@type DiffReviewWalkthroughItem[]
@@ -929,8 +850,8 @@ local function parse_doc(decoded)
   if type(decoded) ~= "table" then
     return nil, "document is not a JSON object"
   end
-  if tonumber(decoded.version) ~= 10 then
-    return nil, "unsupported \"version\" (expected 10)"
+  if tonumber(decoded.version) ~= 12 then
+    return nil, "unsupported \"version\" (expected 12)"
   end
   if type(decoded.flow) ~= "table" or #decoded.flow == 0 then
     return nil, "missing or empty \"flow\""
@@ -964,46 +885,26 @@ local function parse_doc(decoded)
     if type(raw_task) ~= "table" or not is_non_empty_string(raw_task.title) then
       return nil, task_prefix .. ": missing \"title\""
     end
-    if type(raw_task.groups) ~= "table" or #raw_task.groups == 0 then
-      return nil, task_prefix .. ": missing or empty \"groups\""
+    if type(raw_task.subtasks) ~= "table" or #raw_task.subtasks == 0 then
+      return nil, task_prefix .. ": missing or empty \"subtasks\""
     end
     local task_justification, task_justification_error = parse_optional_string_field(raw_task.justification,
-      task_prefix, "justification", justification_max_length)
+      task_prefix, "justification")
     if task_justification_error then return nil, task_justification_error end
 
     local task_step_index = 0
     local task_first_step_offset = #steps + 1
-    ---@type DiffReviewWalkthroughGroup[]
-    local groups = {}
-    for group_index, raw_group in ipairs(raw_task.groups) do
-      local group_prefix = ("%s group %d"):format(task_prefix, group_index)
-      if type(raw_group) ~= "table" or not is_non_empty_string(raw_group.title) then
-        return nil, group_prefix .. ": missing \"title\""
-      end
-      if type(raw_group.type) ~= "string" or not valid_group_types[raw_group.type] then
-        return nil, group_prefix .. ": missing or invalid \"type\""
-      end
-      if type(raw_group.subtasks) ~= "table" or #raw_group.subtasks == 0 then
-        return nil, group_prefix .. ": missing or empty \"subtasks\""
-      end
-
-      ---@type DiffReviewWalkthroughSubtask[]
-      local subtasks = {}
-      for subtask_index, raw_subtask in ipairs(raw_group.subtasks) do
-        local subtask_prefix = ("%s subtask %d"):format(group_prefix, subtask_index)
-        local subtask, next_step_index, subtask_error = parse_subtask(raw_subtask, subtask_prefix, {
-          task_index = task_index,
-          task_title = raw_task.title,
-        }, task_step_index, steps)
-        if not subtask then return nil, subtask_error end
-        task_step_index = next_step_index
-        subtasks[#subtasks + 1] = subtask
-      end
-      groups[#groups + 1] = {
-        type = raw_group.type,
-        title = raw_group.title,
-        subtasks = subtasks,
-      }
+    ---@type DiffReviewWalkthroughSubtask[]
+    local subtasks = {}
+    for subtask_index, raw_subtask in ipairs(raw_task.subtasks) do
+      local subtask_prefix = ("%s subtask %d"):format(task_prefix, subtask_index)
+      local subtask, next_step_index, subtask_error = parse_subtask(raw_subtask, subtask_prefix, {
+        task_index = task_index,
+        task_title = raw_task.title,
+      }, task_step_index, steps)
+      if not subtask then return nil, subtask_error end
+      task_step_index = next_step_index
+      subtasks[#subtasks + 1] = subtask
     end
 
     if task_step_index == 0 then
@@ -1016,12 +917,12 @@ local function parse_doc(decoded)
     tasks[#tasks + 1] = {
       title = raw_task.title,
       justification = task_justification,
-      groups = groups,
+      subtasks = subtasks,
     }
   end
 
   return {
-    version = 10,
+    version = 12,
     flow = flow,
     overview = decoded.overview,
     root = decoded.root,
@@ -1322,38 +1223,6 @@ local function append_comment_row(content, text, hl)
   content[#content + 1] = { text = text, hl = hl }
 end
 
----@param content { text: string, hl: string, chunks?: { text: string, hl: string }[] }[]
----@param callout DiffReviewWalkthroughCallout
----@param inner_width integer
-local function append_callout_rows(content, callout, inner_width)
-  local label = (callout_labels[callout.kind] or callout.kind) .. ": "
-  local label_width = vim.fn.strdisplaywidth(label)
-  local text_width = math.max(inner_width - 2 - label_width, 8)
-  local label_hl = callout_highlights[callout.kind] or "DiffReviewWalkthroughCalloutImportant"
-  for index, line in ipairs(wrap_text(callout.text, text_width)) do
-    if index == 1 then
-      content[#content + 1] = {
-        text = label .. line,
-        hl = "DiffReviewWalkthroughComment",
-        chunks = {
-          { text = label, hl = label_hl },
-          { text = line, hl = "DiffReviewWalkthroughComment" },
-        },
-      }
-    else
-      local prefix = (" "):rep(label_width)
-      content[#content + 1] = {
-        text = prefix .. line,
-        hl = "DiffReviewWalkthroughComment",
-        chunks = {
-          { text = prefix, hl = "DiffReviewWalkthroughComment" },
-          { text = line, hl = "DiffReviewWalkthroughComment" },
-        },
-      }
-    end
-  end
-end
-
 ---@param step DiffReviewWalkthroughStep
 ---@return string
 local function format_step_heading_label(step)
@@ -1405,10 +1274,6 @@ local function render_comment_box(mode, step, target, win, opts)
   local content = {}
   for _, line in ipairs(wrap_text(step.comment, inner_width - 2)) do
     append_comment_row(content, line, "DiffReviewWalkthroughComment")
-  end
-  if step.callout then
-    append_comment_row(content, "", "DiffReviewWalkthroughComment")
-    append_callout_rows(content, step.callout, inner_width)
   end
   local note = staleness_note(target, mode.stale)
   if note then
@@ -1544,34 +1409,6 @@ local function summary_action_range(line)
 end
 
 ---@param line string
----@return integer? start_col 0-based byte column
----@return integer? end_col 0-based byte column, exclusive
----@return string? group_type
-local function summary_group_type_range(line)
-  for _, group_type in ipairs(group_type_order) do
-    local keyword = format_type_keyword(group_type)
-    local keyword_start_byte = line:find(keyword .. " ", 1, true)
-    local keyword_prefix = keyword_start_byte and line:sub(1, keyword_start_byte - 1) or ""
-    if keyword_start_byte and keyword_prefix:match("^%s*$") then
-      local keyword_start_col = keyword_start_byte - 1
-      return keyword_start_col, keyword_start_col + #keyword, group_type
-    end
-  end
-  return nil, nil, nil
-end
-
----@param line string
----@param _group_type string
----@param group_type_highlight_end_col integer
----@return integer? start_col 0-based byte column
----@return integer? end_col 0-based byte column, exclusive
-local function summary_group_title_range(line, _group_type, group_type_highlight_end_col)
-  local title_start_col = group_type_highlight_end_col + 1
-  if title_start_col >= #line then return nil, nil end
-  return title_start_col, #line
-end
-
----@param line string
 ---@param action_start_col integer
 ---@param action string
 ---@param item_specs { type: string, subtype: string?, label: string, title: string }[]
@@ -1700,21 +1537,6 @@ local function apply_summary_highlights(buf, lines, doc, row_offset)
         end_col = #line,
         hl_group = "DiffReviewWalkthroughJustification",
       })
-    end
-
-    local group_type_start_col, group_type_end_col, group_type = summary_group_type_range(line)
-    if group_type_start_col and group_type_end_col then
-      pcall(vim.api.nvim_buf_set_extmark, buf, M._ns, row_offset + row - 1, group_type_start_col, {
-        end_col = group_type_end_col,
-        hl_group = "DiffReviewWalkthroughType",
-      })
-      local group_title_start_col, group_title_end_col = summary_group_title_range(line, group_type, group_type_end_col)
-      if group_title_start_col and group_title_end_col then
-        pcall(vim.api.nvim_buf_set_extmark, buf, M._ns, row_offset + row - 1, group_title_start_col, {
-          end_col = group_title_end_col,
-          hl_group = "DiffReviewWalkthroughItemTitle",
-        })
-      end
     end
 
     local start_col, end_col, action = summary_action_range(line)
@@ -1987,20 +1809,18 @@ local function status_step_layout(state, tasks)
   }
 
   for _, task in ipairs(tasks or {}) do
-    for _, group in ipairs(task.groups or {}) do
-      local subtask_prefix = walkthrough_status_body_prefix
-      for subtask_index, subtask in ipairs(group.subtasks or {}) do
-        local subtask_is_last = subtask_index == #(group.subtasks or {})
-        local item_prefix = subtask_prefix .. tree_continuation(subtask_is_last)
-        for item_index, item in ipairs(subtask.items or {}) do
-          local item_is_last = item_index == #(subtask.items or {})
-          local step_prefix = item_prefix .. tree_continuation(item_is_last)
-          for _, step in ipairs(item.steps or {}) do
-            local title = step.title or step.item_title or step.subtask_title or "Walkthrough comment"
-            local file_label = ("%s:%d"):format(basename(step.file), tonumber(step.start_pos and step.start_pos.line) or 1)
-            layout.title_column_width = math.max(layout.title_column_width,
-              vim.fn.strdisplaywidth(step_prefix) + vim.fn.strdisplaywidth("◦ ") + vim.fn.strdisplaywidth(title))
-          end
+    local subtask_prefix = walkthrough_status_body_prefix
+    for subtask_index, subtask in ipairs(task.subtasks or {}) do
+      local subtask_is_last = subtask_index == #(task.subtasks or {})
+      local item_prefix = subtask_prefix .. tree_continuation(subtask_is_last)
+      for item_index, item in ipairs(subtask.items or {}) do
+        local item_is_last = item_index == #(subtask.items or {})
+        local step_prefix = item_prefix .. tree_continuation(item_is_last)
+        for _, step in ipairs(item.steps or {}) do
+          local title = step.title or step.item_title or step.subtask_title or "Walkthrough comment"
+          local file_label = ("%s:%d"):format(basename(step.file), tonumber(step.start_pos and step.start_pos.line) or 1)
+          layout.title_column_width = math.max(layout.title_column_width,
+            vim.fn.strdisplaywidth(step_prefix) + vim.fn.strdisplaywidth("◦ ") + vim.fn.strdisplaywidth(title))
         end
       end
     end
@@ -2059,55 +1879,46 @@ end
 ---@param state table|nil
 ---@param layout DiffReviewWalkthroughStatusStepLayout
 local function append_status_task_body_rows(rows, task, task_id, width, item_titles, state, layout)
-  for group_index, group in ipairs(task.groups) do
-    local group_id = ("%s:group:%d"):format(task_id, group_index)
-    append_status_summary_rows(rows, walkthrough_status_body_prefix .. format_type_keyword(group.type) .. " " .. group.title, {
-      id = group_id,
+  local subtask_prefix = walkthrough_status_body_prefix
+  for subtask_index, subtask in ipairs(task.subtasks) do
+    local subtask_id = ("%s:subtask:%d"):format(task_id, subtask_index)
+    local subtask_is_last = subtask_index == #task.subtasks
+    append_status_summary_rows(rows, subtask_prefix .. tree_branch(subtask_is_last) .. subtask.title, {
+      id = subtask_id,
       parent_id = task_id,
       kind = "pr_head_section",
     }, width, item_titles)
 
-    local subtask_prefix = walkthrough_status_body_prefix
-    for subtask_index, subtask in ipairs(group.subtasks) do
-      local subtask_id = ("%s:subtask:%d"):format(group_id, subtask_index)
-      local subtask_is_last = subtask_index == #group.subtasks
-      append_status_summary_rows(rows, subtask_prefix .. tree_branch(subtask_is_last) .. subtask.title, {
-        id = subtask_id,
-        parent_id = group_id,
-        kind = "pr_head_section",
+    local item_prefix = subtask_prefix .. tree_continuation(subtask_is_last)
+    if subtask.justification then
+      append_status_summary_rows(rows, item_prefix .. subtask.justification, {
+        id = ("%s:justification"):format(subtask_id),
+        parent_id = subtask_id,
+        fold_target_id = subtask_id,
       }, width, item_titles)
-
-      local item_prefix = subtask_prefix .. tree_continuation(subtask_is_last)
-      if subtask.justification then
-        append_status_summary_rows(rows, item_prefix .. subtask.justification, {
-          id = ("%s:justification"):format(subtask_id),
-          parent_id = subtask_id,
-          fold_target_id = subtask_id,
+    end
+    for item_index, item in ipairs(subtask.items) do
+      local item_id = ("%s:item:%d"):format(subtask_id, item_index)
+      local item_is_last = item_index == #subtask.items
+      append_status_summary_rows(rows, summary_item_text(item, item_prefix, item_is_last), {
+        id = item_id,
+        parent_id = subtask_id,
+        kind = "pr_head_section",
+        default_folded = true,
+      }, width, item_titles)
+      local step_prefix = item_prefix .. tree_continuation(item_is_last)
+      local item_steps = item.steps or {}
+      for step_index, step in ipairs(item_steps) do
+        local step_id = ("%s:step:%d"):format(item_id, step_index)
+        local step_text, step_segments = status_step_location_text(step, step_prefix, status_step_stats(state, step),
+          layout)
+        append_status_summary_rows(rows, step_text, {
+          id = step_id,
+          parent_id = item_id,
+          fold_target_id = item_id,
+          segments = step_segments,
+          walkthrough_step = step,
         }, width, item_titles)
-      end
-      for item_index, item in ipairs(subtask.items) do
-        local item_id = ("%s:item:%d"):format(subtask_id, item_index)
-        local item_is_last = item_index == #subtask.items
-        append_status_summary_rows(rows, summary_item_text(item, item_prefix, item_is_last), {
-          id = item_id,
-          parent_id = subtask_id,
-          kind = "pr_head_section",
-          default_folded = true,
-        }, width, item_titles)
-        local step_prefix = item_prefix .. tree_continuation(item_is_last)
-        local item_steps = item.steps or {}
-        for step_index, step in ipairs(item_steps) do
-          local step_id = ("%s:step:%d"):format(item_id, step_index)
-          local step_text, step_segments = status_step_location_text(step, step_prefix, status_step_stats(state, step),
-            layout)
-          append_status_summary_rows(rows, step_text, {
-            id = step_id,
-            parent_id = item_id,
-            fold_target_id = item_id,
-            segments = step_segments,
-            walkthrough_step = step,
-          }, width, item_titles)
-        end
       end
     end
   end
