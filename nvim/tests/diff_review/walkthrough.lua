@@ -260,6 +260,13 @@ local function find_line(buf, needle)
   return lines[find_row(buf, needle)]
 end
 
+local function find_list_row(lines, needle)
+  for index, line in ipairs(lines) do
+    if line:find(needle, 1, true) then return index end
+  end
+  error("missing row: " .. needle .. "\n" .. table.concat(lines, "\n"), 2)
+end
+
 local function find_line_after(buf, needle, after_row)
   local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
   for row_index = after_row + 1, #lines do
@@ -285,6 +292,30 @@ local function trigger_buf_mapping(buf, key)
   end)
   assert_true(type(mapping.callback) == "function", "missing buffer mapping for " .. key)
   mapping.callback()
+end
+
+local function current_win_view(buf)
+  local win = vim.fn.bufwinid(buf)
+  assert_true(win ~= -1, "buffer has no window: " .. tostring(buf))
+  return vim.api.nvim_win_call(win, function()
+    return vim.fn.winsaveview()
+  end)
+end
+
+local function set_cursor_with_view(buf, row, col, topline)
+  local win = vim.fn.bufwinid(buf)
+  assert_true(win ~= -1, "buffer has no window: " .. tostring(buf))
+  vim.api.nvim_win_call(win, function()
+    vim.api.nvim_win_set_cursor(0, { row, col or 0 })
+    vim.fn.winrestview({
+      lnum = row,
+      col = col or 0,
+      curswant = col or 0,
+      leftcol = 0,
+      topline = math.max(1, topline or row),
+    })
+  end)
+  return current_win_view(buf)
 end
 
 --- Find a floating window whose buffer contains needle; returns win, buf.
@@ -416,8 +447,26 @@ end
 
 local function valid_doc()
   return {
-    version = 9,
-    narrative = { type = "data_flow", justification = "Changes flow from JSON into rendered annotations." },
+    version = 10,
+    flow = {
+      {
+        text = "Walkthrough fixture JSON",
+        children = {
+          {
+            text = "DiffReviewWalkthrough parser",
+            children = {
+              {
+                text = "status summary rows",
+                children = {
+                  { text = "Inventory counts" },
+                  { text = "Inline comment boxes" },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
     overview = "Update walkthrough fixture files. Before, the fixture rows used the old text. Now, the structured tasks drive both the summary graph and Task N.M-total comment labels.",
     root = "Update walkthrough fixture files.",
     commit = head_sha,
@@ -538,6 +587,97 @@ local function run()
   walkthrough.set_reader(fixture_reader)
   diff_review.setup({ about_auto_generate = false })
 
+  local wide_flow = walkthrough._flow_summary_lines_for_test(valid_doc().flow, 120)
+  assert_true(wide_flow[1] == "Walkthrough fixture JSON → DiffReviewWalkthrough parser → status summary rows",
+    "wide flow should compact the single-child chain before rendering branches")
+  assert_true(wide_flow[2] == "  ├→ Inventory counts",
+    "wide flow should render the first branch without an inline connector gap")
+  assert_true(wide_flow[3] == "  └→ Inline comment boxes",
+    "wide flow should render sibling branches in a compact branch block")
+
+  local narrow_flow = walkthrough._flow_summary_lines_for_test(valid_doc().flow, 40)
+  assert_true(narrow_flow[1] == "• Walkthrough fixture JSON",
+    "narrow flow should fall back to the vertical root line instead of overflowing")
+  assert_true(narrow_flow[2] == "    → DiffReviewWalkthrough parser",
+    "narrow flow should keep vertical chain continuation")
+  assert_true(narrow_flow[4] == "    ├→ Inventory counts",
+    "narrow flow should keep vertical branch markers")
+
+  local particle_flow = {
+    {
+      text = "ParticleSpawn",
+      children = {
+        {
+          text = "ParticleRenderMode",
+          children = {
+            {
+              text = "ParticleStorage",
+              children = {
+                {
+                  text = "ParticleInstanceSources",
+                  children = {
+                    { text = "ParticleBillboardRenderSystem" },
+                    {
+                      text = "ModelRenderSystem",
+                      children = {
+                        {
+                          text = "ParticlePbRenderPipeline",
+                          children = {
+                            { text = "shared PBR shader path" },
+                          },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  }
+  local particle_lines = walkthrough._flow_summary_lines_for_test(particle_flow, 100)
+  assert_true(#particle_lines == 3, "particle flow should use a compact detached branch without overflowing")
+  for _, line in ipairs(particle_lines) do
+    assert_true(vim.fn.strdisplaywidth(line) <= 100, "particle flow line should fit available width: " .. line)
+  end
+  assert_true(particle_lines[1] == "ParticleSpawn → ParticleRenderMode → ParticleStorage → ParticleInstanceSources",
+    "particle flow should keep the trunk horizontal")
+  assert_true(particle_lines[2] == "  ├→ ParticleBillboardRenderSystem",
+    "particle flow should render the first branch without trunk overflow")
+  assert_true(particle_lines[3] == "  └→ ModelRenderSystem → ParticlePbRenderPipeline → shared PBR shader path",
+    "particle flow should keep the model renderer chain horizontal")
+
+  local branched_particle_flow = {
+    {
+      text = "ParticleSpawn",
+      children = {
+        particle_flow[1].children[1],
+        {
+          text = "ParticleFastRenderMode",
+          children = {
+            {
+              text = "FastParticleStorage",
+              children = {
+                { text = "FastParticleRenderSystem" },
+              },
+            },
+          },
+        },
+      },
+    },
+  }
+  local branched_particle_lines = walkthrough._flow_summary_lines_for_test(branched_particle_flow, 100)
+  assert_true(branched_particle_lines[1] == "ParticleSpawn",
+    "branched particle flow should not inline the first root branch")
+  assert_true(branched_particle_lines[2] ==
+      "  ├→ ParticleRenderMode → ParticleStorage → ParticleInstanceSources",
+    "branched particle flow should render the first branch as a compact block")
+  assert_true(branched_particle_lines[5] ==
+      "  └→ ParticleFastRenderMode → FastParticleStorage → FastParticleRenderSystem",
+    "branched particle flow should render the second root branch without a large connector gap")
+
   -- ── integrated status summary + lazy inline comment boxes ─────────────────
   set_walkthrough_doc(valid_doc())
   local buf = open_status()
@@ -553,12 +693,20 @@ local function run()
   assert_true(not buffer_contains(summary_buf, "Major changes:"), "summary should not show redundant major changes heading")
   assert_true(not buffer_contains(summary_buf, "├─ Update a.txt through the first task."), "summary should not show redundant top-level graph")
   assert_true(buffer_contains(summary_buf,
-    "Data flow narrative selected. Changes flow from JSON into rendered annotations."),
-    "summary should show the selected walkthrough narrative")
+    "Walkthrough fixture JSON → DiffReviewWalkthrough parser → status summary rows"),
+    "summary should render the compact flow graph chain")
+  assert_true(buffer_contains(summary_buf, "├→ Inventory counts"),
+    "summary should render a branch flow graph edge")
+  assert_true(buffer_contains(summary_buf, "└→ Inline comment boxes"),
+    "summary should render the final branch flow graph edge")
   wait_for(function() return buffer_contains(summary_buf, "Inventory:") end,
     "walkthrough inventory did not render")
-  assert_row_before(summary_buf, "Inventory:", "1. Update a.txt through the first task.",
-    "inventory should render before walkthrough tasks")
+  assert_row_before(summary_buf, "Walkthrough fixture JSON → DiffReviewWalkthrough parser",
+    "1. Update a.txt through the first task.", "flow graph should render before walkthrough tasks")
+  assert_row_before(summary_buf, "1. Update a.txt through the first task.", "Inventory:",
+    "walkthrough tasks should render before inventory")
+  assert_row_before(summary_buf, "Inventory:", "Unstaged changes",
+    "inventory should render before status change sections")
   local inventory_file_row = "files +1 0 ~3"
   assert_true(buffer_contains(summary_buf, inventory_file_row),
     "walkthrough inventory should count changed files")
@@ -586,20 +734,52 @@ local function run()
       and display_rows[1].cells[2].label == "type"
       and display_rows[1].cells[3].label == "docs",
     "inventory display rows should expose left, middle, and right cell targets")
-  local detail_lines = walkthrough._inventory_detail_lines_for_test("function", {
+  local detail_lines, _, detail_targets = walkthrough._inventory_detail_lines_for_test("function", {
+    ["function"] = {
+      added = {
+        { name = "DeepModule.build", relpath = "src/deep/module.ts", line = 42 },
+        { name = "Other.run", relpath = "src/other.ts", line = 7 },
+      },
+      modified = {
+        { name = "DeepModule.update", relpath = "src/deep/module.ts", line = 58 },
+      },
+      removed = {
+        { name = "OldModule.remove", relpath = "src/old.ts", line = 12 },
+      },
+    },
+  })
+  local detail_text = table.concat(detail_lines, "\n")
+  assert_true(detail_text:find("Added:\nmodule.ts\n  DeepModule.build", 1, true) ~= nil,
+    "inventory detail should group added symbols by basename")
+  assert_true(detail_text:find("other.ts\n  Other.run", 1, true) ~= nil,
+    "inventory detail should include later files in the added section")
+  assert_true(find_list_row(detail_lines, "Added:") < find_list_row(detail_lines, "Modified:"),
+    "inventory detail should list modified symbols after added symbols")
+  assert_true(find_list_row(detail_lines, "Modified:") < find_list_row(detail_lines, "Deleted:"),
+    "inventory detail should list deleted symbols after modified symbols")
+  assert_true(detail_text:find("Modified:\nmodule.ts\n  DeepModule.update", 1, true) ~= nil,
+    "inventory detail should render modified symbols in a Modified section")
+  assert_true(detail_text:find("Deleted:\nold.ts\n  OldModule.remove", 1, true) ~= nil,
+    "inventory detail should render removed symbols in a Deleted section")
+  local deep_row = find_list_row(detail_lines, "  DeepModule.build")
+  assert_true(detail_targets[deep_row].relpath == "src/deep/module.ts" and detail_targets[deep_row].line == 42,
+    "inventory detail symbol rows should expose jump targets")
+  assert_true(detail_text:find("src/deep/module.ts", 1, true) == nil,
+    "inventory detail locations should not show full repo-relative paths")
+  local added_only_detail = walkthrough._inventory_detail_lines_for_test("function", {
     ["function"] = {
       added = {
         { name = "DeepModule.build", relpath = "src/deep/module.ts", line = 42 },
       },
-      removed = {},
       modified = {},
+      removed = {},
     },
   })
-  local detail_text = table.concat(detail_lines, "\n")
-  assert_true(detail_text:find("DeepModule.build  %[module.ts:42%]") ~= nil,
-    "inventory detail locations should show only basename and line")
-  assert_true(detail_text:find("src/deep/module.ts", 1, true) == nil,
-    "inventory detail locations should not show full repo-relative paths")
+  local added_only_text = table.concat(added_only_detail, "\n")
+  assert_true(added_only_text:find("Modified:", 1, true) == nil,
+    "inventory detail should omit empty modified sections")
+  assert_true(added_only_text:find("Deleted:", 1, true) == nil,
+    "inventory detail should omit empty deleted sections")
   local inventory_row = find_row(summary_buf, inventory_file_row)
   local inventory_col = display_col_before(find_line(summary_buf, inventory_file_row), "files")
   vim.api.nvim_win_set_cursor(vim.fn.bufwinid(summary_buf), { inventory_row, inventory_col })
@@ -608,12 +788,45 @@ local function run()
   wait_for(function() return detail_buf ~= summary_buf and buffer_contains(detail_buf, "Files changed") end,
     "pressing enter on inventory row should open detail buffer")
   assert_true(buffer_contains(detail_buf, "Added:"), "inventory detail should include added section")
-  assert_true(buffer_contains(detail_buf, "Updated:"), "inventory detail should include updated section")
+  assert_true(buffer_contains(detail_buf, "Modified:"), "inventory detail should include modified section")
+  assert_true(not buffer_contains(detail_buf, "Deleted:"), "inventory detail should omit empty deleted section")
   assert_true(buffer_contains(detail_buf, "new.txt"), "inventory detail should list added files")
   assert_true(buffer_contains(detail_buf, "a.txt"), "inventory detail should list updated files")
   trigger_buf_mapping(detail_buf, "q")
   wait_for(function() return vim.api.nvim_get_current_buf() == summary_buf end,
     "closing inventory detail should return to status buffer")
+  local inventory_source_view = set_cursor_with_view(summary_buf, inventory_row, inventory_col, inventory_row - 2)
+  trigger_buf_mapping(summary_buf, ".")
+  detail_buf = vim.api.nvim_get_current_buf()
+  wait_for(function() return detail_buf ~= summary_buf and buffer_contains(detail_buf, "Files changed") end,
+    "pressing dot on inventory row should reopen detail buffer")
+  vim.cmd("normal! \15")
+  wait_for(function()
+    local view = current_win_view(summary_buf)
+    return vim.api.nvim_get_current_buf() == summary_buf
+      and vim.api.nvim_win_get_cursor(vim.fn.bufwinid(summary_buf))[1] == inventory_row
+      and view.topline == inventory_source_view.topline
+      and view.leftcol == inventory_source_view.leftcol
+  end, "inventory row detail jump should save a native jump-list return location and view")
+  trigger_buf_mapping(summary_buf, ".")
+  detail_buf = vim.api.nvim_get_current_buf()
+  wait_for(function() return detail_buf ~= summary_buf and buffer_contains(detail_buf, "Files changed") end,
+    "pressing dot on inventory row should reopen detail buffer after jumpback")
+  local new_file_row = find_row(detail_buf, "  new.txt")
+  vim.api.nvim_win_set_cursor(vim.fn.bufwinid(detail_buf), { new_file_row, 0 })
+  trigger_buf_mapping(detail_buf, ".")
+  wait_for(function()
+    return vim.api.nvim_get_current_buf() ~= detail_buf
+      and vim.api.nvim_buf_get_name(0):gsub("\\", "/"):find("D:/diffreview-flow-root/new.txt", 1, true) ~= nil
+  end, "pressing dot on an inventory detail row should open the target file")
+  assert_true(vim.api.nvim_win_get_cursor(0)[1] == 1,
+    "inventory detail jump should move to the target line")
+  vim.cmd("normal! \15")
+  wait_for(function()
+    return vim.api.nvim_get_current_buf() == detail_buf
+      and vim.api.nvim_win_get_cursor(0)[1] == new_file_row
+  end, "inventory detail jump should save a jump-list location back to the detail row")
+  vim.api.nvim_win_set_buf(vim.api.nvim_get_current_win(), summary_buf)
   assert_true(buffer_has_highlight_for_text(summary_buf, "1. Update a.txt through the first task.",
     "1. Update a.txt through the first task.", "DiffReviewWalkthroughItemTitle"),
     "summary task title should be bold white")
@@ -662,17 +875,24 @@ local function run()
     == find_line(summary_buf, total_marker_location):find("[", 1, true),
     "comment-location rows should align bracketed file labels")
   local location_row = find_row(summary_buf, rewrite_location)
-  vim.api.nvim_win_set_cursor(vim.fn.bufwinid(summary_buf), { location_row, 0 })
-  trigger_buf_mapping(summary_buf, "<CR>")
+  local location_source_view = set_cursor_with_view(summary_buf, location_row, 0, location_row - 3)
+  trigger_buf_mapping(summary_buf, ".")
   wait_for(function() return buffer_contains(summary_buf, "NEW a.txt") end,
-    "pressing enter on a walkthrough location should expand the target diff")
+    "pressing dot on a walkthrough location should expand the target diff")
   local previous_mark = vim.api.nvim_buf_call(summary_buf, function()
     return vim.fn.getpos("''")
   end)
   assert_true(previous_mark[2] == location_row,
-    "pressing enter on a walkthrough location should set the previous context mark")
+    "pressing dot on a walkthrough location should set the previous context mark")
   assert_true(vim.api.nvim_win_get_cursor(vim.fn.bufwinid(summary_buf))[1] == find_row(summary_buf, "NEW a.txt"),
-    "pressing enter on a walkthrough location should jump to the target diff row")
+    "pressing dot on a walkthrough location should jump to the target diff row")
+  trigger_buf_mapping(summary_buf, ",")
+  wait_for(function()
+    local view = current_win_view(summary_buf)
+    return vim.api.nvim_win_get_cursor(vim.fn.bufwinid(summary_buf))[1] == location_row
+      and view.topline == location_source_view.topline
+      and view.leftcol == location_source_view.leftcol
+  end, "walkthrough location jump should save a native jump-list return location and view")
   toggle_row(buf, "a.txt +")
   wait_for(function() return not buffer_contains(summary_buf, "NEW a.txt") end,
     "folding target file after location jump should hide its diff again")
@@ -692,9 +912,15 @@ local function run()
     "summary subtask justification continuation missing")
   assert_true(not buffer_contains(summary_buf, "why:"), "summary justification should not render a why label")
   assert_true(buffer_contains(summary_buf, "file Fixture edits"), "summary group type row missing")
+  assert_true((find_line(summary_buf, "file Fixture edits") or ""):match("^  file ") ~= nil,
+    "expanded walkthrough group rows should be indented under the task")
   assert_true(buffer_contains(summary_buf, "└─ Rewrite the first fixture file."), "summary subtask row missing")
+  assert_true((find_line(summary_buf, "└─ Rewrite the first fixture file.") or ""):match("^  └─ ") ~= nil,
+    "expanded walkthrough subtask rows should be indented under the task")
   assert_true(buffer_contains(summary_buf, "   └─ Modify Cache a.txt rewrite to rewrite"),
     "summary item action row missing display verb")
+  assert_true((find_line(summary_buf, "Modify Cache a.txt rewrite") or ""):match("^     └─ ") ~= nil,
+    "expanded walkthrough action rows should preserve tree indentation under the task")
   assert_true(buffer_contains(summary_buf, "   └─ Add fn b.txt rewrite to repeat"),
     "summary add action row should not be padded")
   assert_true(buffer_contains(summary_buf, "the second line"),
@@ -1288,66 +1514,37 @@ local function run()
   fixtures[root .. "/.walkthrough.json"] = vim.json.encode({ version = 1, summary = "x", commit = "zz", annotations = {} })
   captured_notifications = {}
   trigger_buf_mapping(buf, "ow")
-  wait_for(function() return saw_notification_containing("expected 9") end, "v1 rejection notification absent")
+  wait_for(function() return saw_notification_containing("expected 10") end, "v1 rejection notification absent")
 
-  local missing_narrative = valid_doc()
-  missing_narrative.narrative = nil
-  set_walkthrough_doc(missing_narrative)
+  local missing_flow = valid_doc()
+  missing_flow.flow = nil
+  set_walkthrough_doc(missing_flow)
   captured_notifications = {}
   trigger_buf_mapping(buf, "ow")
-  wait_for(function() return saw_notification_containing("missing or invalid \"narrative\"") end,
-    "missing narrative notification absent")
+  wait_for(function() return saw_notification_containing("missing or empty \"flow\"") end,
+    "missing flow notification absent")
 
-  local invalid_narrative = valid_doc()
-  invalid_narrative.narrative = "source_map"
-  set_walkthrough_doc(invalid_narrative)
+  local invalid_flow_node = valid_doc()
+  invalid_flow_node.flow[1].text = ""
+  set_walkthrough_doc(invalid_flow_node)
   captured_notifications = {}
   trigger_buf_mapping(buf, "ow")
-  wait_for(function() return saw_notification_containing("missing or invalid \"narrative\"") end,
-    "invalid narrative notification absent")
-
-  local invalid_narrative_type = valid_doc()
-  invalid_narrative_type.narrative.type = "source_map"
-  set_walkthrough_doc(invalid_narrative_type)
-  captured_notifications = {}
-  trigger_buf_mapping(buf, "ow")
-  wait_for(function() return saw_notification_containing("missing or invalid \"narrative.type\"") end,
-    "invalid narrative type notification absent")
-
-  local missing_narrative_justification = valid_doc()
-  missing_narrative_justification.narrative.justification = ""
-  set_walkthrough_doc(missing_narrative_justification)
-  captured_notifications = {}
-  trigger_buf_mapping(buf, "ow")
-  wait_for(function() return saw_notification_containing("missing or empty \"narrative.justification\"") end,
-    "missing narrative justification notification absent")
+  wait_for(function() return saw_notification_containing("flow 1: missing \"text\"") end,
+    "invalid flow node notification absent")
 
   local artifact_type_doc = valid_doc()
   local artifact_changes = artifact_type_doc.tasks[1].groups[1].subtasks[1].changes
-  artifact_changes[1].kind = "Doc"
+  artifact_changes[1].kind = "App"
   artifact_changes[1].role = nil
-  artifact_changes[1].target = "doc artifact"
-  artifact_changes[1].note = "document the changed behavior"
-  local plan_change = vim.deepcopy(artifact_changes[1])
-  plan_change.action = "Add"
-  plan_change.kind = "Plan"
-  plan_change.target = "plan artifact"
-  plan_change.note = "record the follow up plan"
-  local app_change = vim.deepcopy(artifact_changes[1])
-  app_change.kind = "App"
-  app_change.target = "app artifact"
-  app_change.note = "configure the app scenario"
-  artifact_changes[#artifact_changes + 1] = plan_change
-  artifact_changes[#artifact_changes + 1] = app_change
+  artifact_changes[1].target = "app artifact"
+  artifact_changes[1].note = "configure the app scenario"
   set_walkthrough_doc(artifact_type_doc)
   summary_buf = start_walkthrough(buf)
   expand_row_if_needed(buf, "1. Update a.txt through the first task.", "file Fixture edits")
   expand_row_if_needed(buf, "file Fixture edits", "└─ Rewrite the first fixture file.")
   wait_for(function()
-    return buffer_contains(summary_buf, "Modify doc doc artifact")
-      and buffer_contains(summary_buf, "Add plan plan artifact")
-      and buffer_contains(summary_buf, "Modify app app artifact")
-  end, "Doc, Plan, and App change kinds should be accepted and rendered")
+    return buffer_contains(summary_buf, "Modify app app artifact")
+  end, "App change kind should be accepted and rendered")
   trigger_buf_mapping(buf, "ow")
   wait_for(function() return not buffer_contains(buf, "Walkthrough:") end, "artifact-type walkthrough did not toggle off")
 
@@ -1360,7 +1557,7 @@ local function run()
     "invalid group type notification absent")
 
   local invalid_change_kind = valid_doc()
-  invalid_change_kind.tasks[1].groups[1].subtasks[1].changes[1].kind = "File"
+  invalid_change_kind.tasks[1].groups[1].subtasks[1].changes[1].kind = "Doc"
   set_walkthrough_doc(invalid_change_kind)
   captured_notifications = {}
   trigger_buf_mapping(buf, "ow")

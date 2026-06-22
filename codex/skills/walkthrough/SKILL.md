@@ -32,7 +32,7 @@ read only remaining untracked files. Do not run or inspect an unrestricted full
 diff before filtering.
 
 If you made the changes yourself, use your implementation knowledge for the
-narrative and the filtered diff only to verify files and line numbers.
+review story and the filtered diff only to verify files and line numbers.
 
 ## 2. Output Shape
 
@@ -42,10 +42,10 @@ file when exact enum values or required fields are unclear.
 Required top-level shape:
 
 ```text
-version: 9
-narrative:
-  type: data_flow | capability | ownership_boundary | risk_contract
-  justification: why this frame fits the current diff
+version: 10
+flow[]:
+  text: compact data-flow node label, without file paths
+  children?: next flow nodes or branch consumers
 overview: 2-3 sentence before/now story with precise, accessible prose
 root: active author-context sentence for the overall change
 commit: full HEAD sha
@@ -74,25 +74,19 @@ tasks[]:
 
 ## 3. Writing Rules
 
-**Narrative frame**
-- Set top-level `narrative.type` to the chosen frame and
-  `narrative.justification` to a short explanation of why that frame fits this
-  diff. Keep task order consistent with the selected frame. Prefer `data_flow`
-  when the change can be explained as state, requests, events, buffers, records,
-  or artifacts moving through the system.
-- The task list must visibly follow the selected narrative. Each top-level task
-  should advance that frame's review sequence instead of switching to unrelated
-  file, layer, artifact-type, or implementation buckets.
-- Allowed frames:
-  - `data_flow`: follow the main state, request, event, buffer, record, or
-    artifact through producers, transforms/stores, and consumers.
-  - `capability`: explain the responsibilities required to deliver a new
-    user-facing or developer-facing capability when no single data object is the
-    clearest guide.
-  - `ownership_boundary`: follow responsibility as it moves between constructs
-    or layers, especially when the change reduces coupling or centralizes state.
-  - `risk_contract`: organize around invariants, compatibility, migrations,
-    security, data integrity, performance, or regression risk.
+**Data flow**
+- Always organize the walkthrough as a data-flow review. Pick the state,
+  request, event, buffer, record, or artifact the review follows and use that
+  path to order the graph and task list.
+- The task list must visibly follow that flow from producer or entry point,
+  through transforms/stores, to consumers. Do not switch to unrelated file,
+  layer, artifact-type, or implementation buckets.
+- Add a top-level `flow` tree that can be rendered as a compact graph in
+  Neovim. Use one primary root when possible, then branch only where the data
+  splits to multiple consumers. Keep labels short and concrete, and do not
+  include file paths.
+- The `flow` tree and tasks must agree. The graph is the quick orientation; the
+  tasks are the same path expanded into review responsibilities.
 
 **Prose**
 - Use precise, accessible language: concrete nouns, plain verbs, short
@@ -131,7 +125,7 @@ tasks[]:
   overview. Put those in tasks, groups, and items.
 
 **Tasks**
-- Tasks are the major review responsibilities in the chosen narrative, usually
+- Tasks are the major review responsibilities in the data-flow review, usually
   3-5. They are not one row per file, artifact type, or implementation step.
 - Use tasks to split the overview into what a reviewer should understand before
   reading groups and changes.
@@ -203,11 +197,31 @@ tasks[]:
 
 ```json
 {
-  "version": 9,
-  "narrative": {
-    "type": "data_flow",
-    "justification": "The review follows draft edits from the editor into durable storage, then from storage into background sync."
-  },
+  "version": 10,
+  "flow": [
+    {
+      "text": "DocumentEditor::apply_edit()",
+      "children": [
+        {
+          "text": "DraftChange",
+          "children": [
+            {
+              "text": "DraftCache",
+              "children": [
+                { "text": "editor recovery" },
+                {
+                  "text": "SyncWorker::drain_cache()",
+                  "children": [
+                    { "text": "retry save request" }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ],
   "overview": "Add offline draft sync so document edits survive closed editor sessions. Before, unsaved edits lived only in the active editor buffer. Now, the editor writes draft changes into a cache and the sync worker drains that cache for retry.",
   "root": "Add offline draft sync.",
   "commit": "8f14e45fceea167a5a36dedd4bea2543c6a04c33",
@@ -315,8 +329,7 @@ tasks[]:
 - Narrative quality: prose has no repo paths, bracketed file names, or
   semicolons; tasks are architectural claims; named constructs are explained;
   subtasks use the verb bank.
-- Schema contract: `version` is 9, `narrative.type` is one of the allowed
-  frames, `narrative.justification` explains the choice, `commit` is the full
+- Schema contract: `version` is 10, `flow` is non-empty, `commit` is the full
   HEAD sha, change actions are only `Add`, `Modify`, or `Remove`, notes are
   imperative fragments of 50 characters or less, and JSON has no comments or
   trailing commas.

@@ -53,6 +53,10 @@
 ---@field justification? string
 ---@field groups DiffReviewWalkthroughGroup[]
 
+---@class DiffReviewWalkthroughFlowNode
+---@field text string
+---@field children DiffReviewWalkthroughFlowNode[]
+
 ---@class DiffReviewWalkthroughStepContext
 ---@field task_index integer
 ---@field step_index integer
@@ -62,7 +66,7 @@
 
 ---@class DiffReviewWalkthroughDoc
 ---@field version integer
----@field narrative { type: "data_flow"|"capability"|"ownership_boundary"|"runtime_layer"|"risk_contract", justification: string }
+---@field flow DiffReviewWalkthroughFlowNode[]
 ---@field overview string
 ---@field root string
 ---@field summary string
@@ -110,14 +114,19 @@
 ---@field _modes table<integer, DiffReviewWalkthroughMode>
 ---@field _reader DiffReviewWalkthroughReader?
 ---@field _ns integer
+---@field _jump_return_views table<integer, table>?
+---@field _jump_return_autocmds table<integer, boolean>?
 local M = {
   _modes = {},
   _ns = vim.api.nvim_create_namespace("diff_review_walkthrough"),
+  _jump_return_views = {},
+  _jump_return_autocmds = {},
 }
 
 local nav_keys = { "z", "y", "q", "<Esc>" }
 local comment_box_max_inner_width = 84
 local status_section_id = "walkthrough:section"
+local jump_return_group = vim.api.nvim_create_augroup("DiffReviewWalkthroughJumpReturn", { clear = false })
 
 ---@param reader DiffReviewWalkthroughReader?
 function M.set_reader(reader)
@@ -187,20 +196,6 @@ local valid_item_actions = {
   Modify = true,
   Remove = true,
 }
-local valid_narratives = {
-  data_flow = true,
-  capability = true,
-  ownership_boundary = true,
-  runtime_layer = true,
-  risk_contract = true,
-}
-local narrative_type_labels = {
-  data_flow = "Data flow",
-  capability = "Capability",
-  ownership_boundary = "Ownership boundary",
-  runtime_layer = "Runtime layer",
-  risk_contract = "Risk contract",
-}
 local item_note_max_length = 50
 local justification_max_length = 170
 local valid_group_types = {
@@ -229,8 +224,6 @@ local valid_item_types = {
   Method = true,
   Constant = true,
   Test = true,
-  Doc = true,
-  Plan = true,
   App = true,
   Config = true,
 }
@@ -268,6 +261,8 @@ end
 local function tree_continuation(is_last)
   return is_last and "   " or "│  "
 end
+
+local walkthrough_status_body_prefix = "  "
 
 ---@param action string
 ---@return string
@@ -325,13 +320,241 @@ local function task_summary_title(task_index, task)
   return line
 end
 
----@param narrative { type: string, justification: string }?
----@return string?
-local function narrative_summary_text(narrative)
-  if type(narrative) ~= "table" then return nil end
-  local label = narrative_type_labels[narrative.type]
-  if not label or not is_non_empty_string(narrative.justification) then return nil end
-  return ("%s narrative selected. %s"):format(label, narrative.justification)
+local flow_arrow = " → "
+
+---@class DiffReviewWalkthroughFlowLayout
+---@field lines string[]
+---@field penalty integer
+
+---@param text string
+---@return integer
+local function text_width(text)
+  return vim.fn.strdisplaywidth(text or "")
+end
+
+---@param line string
+---@return integer
+local function leading_indent_width(line)
+  local indent = line:match("^%s*") or ""
+  return #indent
+end
+
+---@param nodes DiffReviewWalkthroughFlowNode[]
+---@return string
+local function flow_chain_text(nodes)
+  local labels = {}
+  for _, node in ipairs(nodes or {}) do
+    labels[#labels + 1] = node.text
+  end
+  return table.concat(labels, flow_arrow)
+end
+
+---@param node DiffReviewWalkthroughFlowNode
+---@return DiffReviewWalkthroughFlowNode[] chain
+---@return DiffReviewWalkthroughFlowNode[] children
+local function collect_flow_chain(node)
+  local chain = {}
+  local current = node
+  while current do
+    chain[#chain + 1] = current
+    local children = current.children or {}
+    if #children ~= 1 then
+      return chain, children
+    end
+    current = children[1]
+  end
+  return chain, {}
+end
+
+---@param lines string[]
+---@param node DiffReviewWalkthroughFlowNode
+---@param prefix string
+---@param marker string
+---@param child_prefix string
+local function append_vertical_flow_node(lines, node, prefix, marker, child_prefix)
+  lines[#lines + 1] = prefix .. marker .. node.text
+  local children = node.children or {}
+  if #children == 1 then
+    append_vertical_flow_node(lines, children[1], child_prefix, "→ ", child_prefix)
+    return
+  end
+
+  for child_index, child in ipairs(children) do
+    local is_last = child_index == #children
+    append_vertical_flow_node(lines, child, child_prefix, is_last and "└→ " or "├→ ", child_prefix .. "    ")
+  end
+end
+
+---@param node DiffReviewWalkthroughFlowNode
+---@param root_marker string
+---@return string[]
+local function vertical_flow_lines(node, root_marker)
+  local lines = {}
+  append_vertical_flow_node(lines, node, "", root_marker, "    ")
+  return lines
+end
+
+---@param node DiffReviewWalkthroughFlowNode
+---@return string[]
+local function wrapped_flow_lines(node)
+  local chain, children = collect_flow_chain(node)
+  local lines = {}
+  if #chain == 0 then return lines end
+
+  lines[#lines + 1] = chain[1].text
+  for index = 2, #chain do
+    lines[#lines + 1] = "→ " .. chain[index].text
+  end
+
+  if #children == 0 then return lines end
+  local branch_prefix = "    "
+  for child_index, child in ipairs(children) do
+    local is_last = child_index == #children
+    local child_lines = wrapped_flow_lines(child)
+    if #child_lines > 0 then
+      lines[#lines + 1] = branch_prefix .. (is_last and "└→ " or "├→ ") .. child_lines[1]
+      local continuation = branch_prefix .. (is_last and "    " or "│   ")
+      for line_index = 2, #child_lines do
+        lines[#lines + 1] = continuation .. child_lines[line_index]
+      end
+    end
+  end
+  return lines
+end
+
+---@param lines string[]
+---@param branch_prefix string
+---@param marker string
+---@param is_last boolean
+---@param child_lines string[]
+local function append_branch_child_lines(lines, branch_prefix, marker, is_last, child_lines)
+  if #child_lines == 0 then return end
+  lines[#lines + 1] = branch_prefix .. marker .. child_lines[1]
+  local continuation = branch_prefix .. (is_last and "   " or "│  ")
+  for line_index = 2, #child_lines do
+    local child_line = child_lines[line_index]
+    if child_line:sub(1, 2) == "  " then child_line = child_line:sub(3) end
+    lines[#lines + 1] = continuation .. child_line
+  end
+end
+
+---@param layout DiffReviewWalkthroughFlowLayout
+---@param width integer
+---@return number
+local function flow_layout_score(layout, width)
+  local overflow = 0
+  local max_indent = 0
+  local max_width = 0
+  for _, line in ipairs(layout.lines or {}) do
+    local line_width = text_width(line)
+    max_width = math.max(max_width, line_width)
+    if line_width > width then
+      overflow = overflow + line_width - width
+    end
+    max_indent = math.max(max_indent, leading_indent_width(line))
+  end
+
+  local overflow_penalty = overflow == 0 and 0 or 1000000 + overflow * 1000 + max_width
+  return overflow_penalty + #layout.lines * 100 + layout.penalty + max_width / 100 + max_indent / 100
+end
+
+---@param candidates DiffReviewWalkthroughFlowLayout[]
+---@param width integer
+---@return string[]
+local function choose_flow_layout(candidates, width)
+  local best = candidates[1]
+  local best_score = best and flow_layout_score(best, width) or math.huge
+  for index = 2, #candidates do
+    local score = flow_layout_score(candidates[index], width)
+    if score < best_score then
+      best = candidates[index]
+      best_score = score
+    end
+  end
+  return best and best.lines or {}
+end
+
+---@param node DiffReviewWalkthroughFlowNode
+---@param width integer
+---@param root_marker string
+---@return string[]
+local function layout_flow_node(node, width, root_marker)
+  local chain, children = collect_flow_chain(node)
+  local chain_text = flow_chain_text(chain)
+  ---@type DiffReviewWalkthroughFlowLayout[]
+  local candidates = {}
+
+  if #children == 0 then
+    candidates[#candidates + 1] = { lines = { chain_text }, penalty = 0 }
+  end
+
+  if #children > 0 then
+    local branch_prefix = (" "):rep(text_width(chain_text) + 1)
+    local branch_width = math.max(20, width - text_width(branch_prefix) - text_width("└→ "))
+
+    local detached_branch_prefix = "  "
+    local detached_branch_width = math.max(20, width - text_width(detached_branch_prefix) - text_width("└→ "))
+    local detached_lines = { chain_text }
+    for child_index, child in ipairs(children) do
+      local is_last = child_index == #children
+      local child_lines = layout_flow_node(child, detached_branch_width, "")
+      append_branch_child_lines(detached_lines, detached_branch_prefix, is_last and "└→ " or "├→ ", is_last, child_lines)
+    end
+    candidates[#candidates + 1] = { lines = detached_lines, penalty = 0 }
+
+    local horizontal_lines = { chain_text }
+    for child_index, child in ipairs(children) do
+      local is_last = child_index == #children
+      local child_lines = layout_flow_node(child, branch_width, "")
+      append_branch_child_lines(horizontal_lines, branch_prefix, is_last and "└→ " or "├→ ", is_last, child_lines)
+    end
+    candidates[#candidates + 1] = { lines = horizontal_lines, penalty = 2 }
+
+    local wrapped_lines = { chain_text }
+    for child_index, child in ipairs(children) do
+      local is_last = child_index == #children
+      local child_lines = wrapped_flow_lines(child)
+      append_branch_child_lines(wrapped_lines, branch_prefix, is_last and "└→ " or "├→ ", is_last, child_lines)
+    end
+    candidates[#candidates + 1] = { lines = wrapped_lines, penalty = 6 }
+  end
+
+  candidates[#candidates + 1] = { lines = vertical_flow_lines(node, root_marker), penalty = 20 }
+  return choose_flow_layout(candidates, width)
+end
+
+---@param flow DiffReviewWalkthroughFlowNode[]
+---@param width? integer
+---@return string[]
+local function flow_summary_lines(flow, width)
+  width = width or math.max(40, math.min(100, vim.o.columns - 8))
+  local lines = {}
+  for node_index, node in ipairs(flow or {}) do
+    if node_index > 1 then lines[#lines + 1] = "" end
+    vim.list_extend(lines, layout_flow_node(node, width, "• "))
+  end
+  return lines
+end
+
+---@param flow DiffReviewWalkthroughFlowNode[]
+---@param width integer
+---@return string[]
+function M._flow_summary_lines_for_test(flow, width)
+  return flow_summary_lines(flow, width)
+end
+
+---@param mode DiffReviewWalkthroughMode
+---@return integer
+local function status_render_width(mode)
+  local win = mode and mode.host and mode.host.buf and vim.fn.bufwinid(mode.host.buf) or -1
+  local columns = vim.o.columns
+  if win ~= -1 then
+    local ok, win_width = pcall(vim.api.nvim_win_get_width, win)
+    if ok and type(win_width) == "number" and win_width > 0 then
+      columns = win_width
+    end
+  end
+  return math.max(40, columns - 4)
 end
 
 ---@param lines string[]
@@ -415,11 +638,14 @@ end
 
 ---@param overview string
 ---@param _root string
+---@param flow DiffReviewWalkthroughFlowNode[]
 ---@param tasks DiffReviewWalkthroughTask[]
 ---@return string
-local function build_summary(overview, _root, tasks)
+local function build_summary(overview, _root, flow, tasks)
   local lines = {}
   vim.list_extend(lines, vim.split(vim.trim(overview), "\n", { plain = true }))
+  lines[#lines + 1] = ""
+  vim.list_extend(lines, flow_summary_lines(flow))
   lines[#lines + 1] = ""
   for task_index, task in ipairs(tasks) do
     if task_index > 1 then lines[#lines + 1] = "" end
@@ -597,6 +823,37 @@ local function parse_subtask(raw_subtask, error_prefix, base_context, task_step_
   }, task_step_index, nil
 end
 
+---@param raw_node any
+---@param error_prefix string
+---@return DiffReviewWalkthroughFlowNode? node
+---@return string? error
+local function parse_flow_node(raw_node, error_prefix)
+  if type(raw_node) ~= "table" then
+    return nil, error_prefix .. ": invalid flow node"
+  end
+  if not is_non_empty_string(raw_node.text) then
+    return nil, error_prefix .. ": missing \"text\""
+  end
+
+  ---@type DiffReviewWalkthroughFlowNode[]
+  local children = {}
+  if raw_node.children ~= nil then
+    if type(raw_node.children) ~= "table" then
+      return nil, error_prefix .. ": invalid \"children\""
+    end
+    for child_index, raw_child in ipairs(raw_node.children) do
+      local child, child_error = parse_flow_node(raw_child, ("%s child %d"):format(error_prefix, child_index))
+      if not child then return nil, child_error end
+      children[#children + 1] = child
+    end
+  end
+
+  return {
+    text = raw_node.text,
+    children = children,
+  }, nil
+end
+
 --- Tolerantly validate and normalize a decoded walkthrough document.
 ---@param decoded any
 ---@return DiffReviewWalkthroughDoc? doc
@@ -605,17 +862,18 @@ local function parse_doc(decoded)
   if type(decoded) ~= "table" then
     return nil, "document is not a JSON object"
   end
-  if tonumber(decoded.version) ~= 9 then
-    return nil, "unsupported \"version\" (expected 9)"
+  if tonumber(decoded.version) ~= 10 then
+    return nil, "unsupported \"version\" (expected 10)"
   end
-  if type(decoded.narrative) ~= "table" then
-    return nil, "missing or invalid \"narrative\""
+  if type(decoded.flow) ~= "table" or #decoded.flow == 0 then
+    return nil, "missing or empty \"flow\""
   end
-  if type(decoded.narrative.type) ~= "string" or not valid_narratives[decoded.narrative.type] then
-    return nil, "missing or invalid \"narrative.type\""
-  end
-  if not is_non_empty_string(decoded.narrative.justification) then
-    return nil, "missing or empty \"narrative.justification\""
+  ---@type DiffReviewWalkthroughFlowNode[]
+  local flow = {}
+  for flow_index, raw_flow_node in ipairs(decoded.flow) do
+    local flow_node, flow_error = parse_flow_node(raw_flow_node, ("flow %d"):format(flow_index))
+    if not flow_node then return nil, flow_error end
+    flow[#flow + 1] = flow_node
   end
   if not is_non_empty_string(decoded.overview) then
     return nil, "missing or empty \"overview\""
@@ -696,14 +954,11 @@ local function parse_doc(decoded)
   end
 
   return {
-    version = 9,
-    narrative = {
-      type = decoded.narrative.type,
-      justification = decoded.narrative.justification,
-    },
+    version = 10,
+    flow = flow,
     overview = decoded.overview,
     root = decoded.root,
-    summary = build_summary(decoded.overview, decoded.root, tasks),
+    summary = build_summary(decoded.overview, decoded.root, flow, tasks),
     commit = decoded.commit,
     tasks = tasks,
     steps = steps,
@@ -1429,7 +1684,7 @@ end
 ---@param mode DiffReviewWalkthroughMode
 ---@return string[] lines
 local function status_summary_lines(mode)
-  local width = math.max(40, vim.o.columns - 4)
+  local width = status_render_width(mode)
   return summary_lines(mode.doc.summary, width, collect_summary_item_titles(mode.doc.tasks))
 end
 
@@ -1670,7 +1925,7 @@ local function status_step_layout(state, tasks)
 
   for _, task in ipairs(tasks or {}) do
     for _, group in ipairs(task.groups or {}) do
-      local subtask_prefix = ""
+      local subtask_prefix = walkthrough_status_body_prefix
       for subtask_index, subtask in ipairs(group.subtasks or {}) do
         local subtask_is_last = subtask_index == #(group.subtasks or {})
         local item_prefix = subtask_prefix .. tree_continuation(subtask_is_last)
@@ -1760,13 +2015,13 @@ end
 local function append_status_task_body_rows(rows, task, task_id, width, item_titles, state, layout)
   for group_index, group in ipairs(task.groups) do
     local group_id = ("%s:group:%d"):format(task_id, group_index)
-    append_status_summary_rows(rows, format_type_keyword(group.type) .. " " .. group.title, {
+    append_status_summary_rows(rows, walkthrough_status_body_prefix .. format_type_keyword(group.type) .. " " .. group.title, {
       id = group_id,
       parent_id = task_id,
       kind = "pr_head_section",
     }, width, item_titles)
 
-    local subtask_prefix = ""
+    local subtask_prefix = walkthrough_status_body_prefix
     for subtask_index, subtask in ipairs(group.subtasks) do
       local subtask_id = ("%s:subtask:%d"):format(group_id, subtask_index)
       local subtask_is_last = subtask_index == #group.subtasks
@@ -2142,52 +2397,178 @@ end
 ---@return string
 local function inventory_change_line(change)
   local name = tostring(change.name or "")
-  local relpath = tostring(change.relpath or "")
-  local line = tonumber(change.line)
-  if relpath == "" then return name end
-  local file = basename(relpath)
-  local location = line and ("%s:%d"):format(file, line) or file
-  if name == "" or name == relpath then return location end
-  return ("%s  [%s]"):format(name, location)
+  return name ~= "" and name or basename(change.relpath)
+end
+
+---@param changes DiffReviewInventoryChange[]
+---@return table<string, DiffReviewInventoryChange[]>
+---@return string[]
+local function inventory_changes_by_file(changes)
+  local by_file = {}
+  local relpaths = {}
+  for _, change in ipairs(changes or {}) do
+    local relpath = tostring(change.relpath or "")
+    if relpath == "" then relpath = tostring(change.name or "") end
+    if relpath == "" then relpath = "(unknown)" end
+    if not by_file[relpath] then
+      by_file[relpath] = {}
+      relpaths[#relpaths + 1] = relpath
+    end
+    by_file[relpath][#by_file[relpath] + 1] = change
+  end
+  table.sort(relpaths)
+  for _, relpath in ipairs(relpaths) do
+    table.sort(by_file[relpath], inventory_change_less)
+  end
+  return by_file, relpaths
+end
+
+---@param cwd string?
+---@param relpath string?
+---@return string?
+local function inventory_target_path(cwd, relpath)
+  relpath = tostring(relpath or "")
+  if relpath == "" then return nil end
+  if relpath:match("^%a:[/\\]") or relpath:sub(1, 1) == "/" then return relpath end
+  local root = tostring(cwd or ""):gsub("[/\\]+$", "")
+  if root == "" then return relpath end
+  return root .. "/" .. relpath
+end
+
+---@param buf integer
+---@param force? boolean
+---@return boolean restored
+function M.restore_jump_return_view(buf, force)
+  local saved = M._jump_return_views and M._jump_return_views[buf] or nil
+  if not saved then return false end
+  local win = vim.fn.bufwinid(buf)
+  if win == -1 or not vim.api.nvim_win_is_valid(win) then return false end
+  local ok, cursor = pcall(vim.api.nvim_win_get_cursor, win)
+  if not ok or cursor[1] ~= saved.row then return false end
+  if not (force or saved.active) then return false end
+  M._jump_return_views[buf] = nil
+  pcall(vim.api.nvim_win_call, win, function()
+    vim.fn.winrestview(saved.view)
+  end)
+  return true
+end
+
+---@param buf integer
+local function ensure_jump_return_autocmds(buf)
+  if M._jump_return_autocmds and M._jump_return_autocmds[buf] then return end
+  M._jump_return_autocmds = M._jump_return_autocmds or {}
+  M._jump_return_autocmds[buf] = true
+  local function restore_when_ready()
+    local saved = M._jump_return_views and M._jump_return_views[buf] or nil
+    if saved and not saved.active then
+      local win = vim.fn.bufwinid(buf)
+      if win ~= -1 and vim.api.nvim_win_is_valid(win) then
+        local ok, cursor = pcall(vim.api.nvim_win_get_cursor, win)
+        if ok and cursor[1] ~= saved.row then saved.active = true end
+      end
+    end
+    M.restore_jump_return_view(buf)
+  end
+  vim.api.nvim_create_autocmd({ "BufEnter", "CursorMoved", "WinEnter" }, {
+    buffer = buf,
+    group = jump_return_group,
+    callback = function()
+      restore_when_ready()
+      vim.schedule(function()
+        if vim.api.nvim_buf_is_valid(buf) then restore_when_ready() end
+      end)
+    end,
+  })
+  vim.api.nvim_create_autocmd("BufLeave", {
+    buffer = buf,
+    group = jump_return_group,
+    callback = function()
+      local saved = M._jump_return_views and M._jump_return_views[buf] or nil
+      if saved then saved.active = true end
+    end,
+  })
+  vim.api.nvim_create_autocmd("BufWipeout", {
+    buffer = buf,
+    group = jump_return_group,
+    callback = function()
+      if M._jump_return_views then M._jump_return_views[buf] = nil end
+      if M._jump_return_autocmds then M._jump_return_autocmds[buf] = nil end
+    end,
+  })
+end
+
+---@param win integer
+---@param buf integer
+---@param cursor? integer[]
+---@return boolean saved
+local function save_jump_return_location(win, buf, cursor)
+  if win == -1 or not vim.api.nvim_win_is_valid(win) or not vim.api.nvim_buf_is_valid(buf) then
+    return false
+  end
+  local ok, source_cursor = pcall(vim.api.nvim_win_get_cursor, win)
+  if not ok then return false end
+  cursor = cursor or source_cursor
+  pcall(vim.api.nvim_win_call, win, function()
+    M._jump_return_views = M._jump_return_views or {}
+    M._jump_return_views[buf] = {
+      row = cursor[1],
+      col = cursor[2] or 0,
+      view = vim.fn.winsaveview(),
+      active = false,
+    }
+    ensure_jump_return_autocmds(buf)
+    pcall(vim.cmd, "normal! m'")
+    pcall(function()
+      vim.fn.setpos("''", { 0, cursor[1], (cursor[2] or 0) + 1, 0 })
+    end)
+  end)
+  return true
 end
 
 ---@param label string
 ---@param details table<string, DiffReviewInventoryChangeSet>?
 ---@return string[]
 ---@return table[] folds
+---@return table<integer, DiffReviewInventoryChange> row_targets
 local function inventory_detail_lines(label, details)
   local row = details and details[label] or nil
   local lines = { inventory_detail_title(label), "" }
   local folds = {}
+  local row_targets = {}
   local sections = {
     { key = "added", title = "Added:" },
-    { key = "removed", title = "Removed:" },
-    { key = "modified", title = "Updated:" },
+    { key = "modified", title = "Modified:" },
+    { key = "removed", title = "Deleted:" },
   }
-  for section_index, section in ipairs(sections) do
-    local start_line = #lines + 1
-    lines[#lines + 1] = section.title
+  for _, section in ipairs(sections) do
     local changes = vim.deepcopy(row and row[section.key] or {}) or {}
-    table.sort(changes, inventory_change_less)
-    if #changes == 0 then
-      lines[#lines + 1] = "  none"
-    else
-      for _, change in ipairs(changes) do
-        lines[#lines + 1] = "  " .. inventory_change_line(change)
+    if #changes > 0 then
+      if #lines > 2 then lines[#lines + 1] = "" end
+      local start_line = #lines + 1
+      lines[#lines + 1] = section.title
+      local by_file, relpaths = inventory_changes_by_file(changes)
+      for _, relpath in ipairs(relpaths) do
+        lines[#lines + 1] = basename(relpath)
+        local file_changes = by_file[relpath] or {}
+        for _, change in ipairs(file_changes) do
+          lines[#lines + 1] = "  " .. inventory_change_line(change)
+          row_targets[#lines] = change
+        end
       end
+      folds[#folds + 1] = { start_line = start_line, end_line = #lines }
     end
-    folds[#folds + 1] = { start_line = start_line, end_line = #lines }
-    if section_index < #sections then lines[#lines + 1] = "" end
   end
-  return lines, folds
+  if #lines == 2 then
+    lines[#lines + 1] = "No changes"
+  end
+  return lines, folds, row_targets
 end
 
 ---@param label string
 ---@param details table<string, DiffReviewInventoryChangeSet>?
 ---@return string[]
 function M._inventory_detail_lines_for_test(label, details)
-  local lines = inventory_detail_lines(label, details)
-  return lines
+  return inventory_detail_lines(label, details)
 end
 
 ---@param buf integer
@@ -2208,12 +2589,34 @@ local function apply_inventory_detail_folds(buf, folds)
   end)
 end
 
+---@param buf integer
+---@param cwd string?
+---@param row_targets table<integer, DiffReviewInventoryChange>
+---@return boolean handled
+local function jump_inventory_detail_target(buf, cwd, row_targets)
+  local win = vim.fn.bufwinid(buf)
+  if win == -1 then return false end
+  local cursor = vim.api.nvim_win_get_cursor(win)
+  local target = row_targets[cursor[1]]
+  if not target then return false end
+  local path = inventory_target_path(cwd, target.relpath)
+  if not path then return false end
+  save_jump_return_location(win, buf, cursor)
+  pcall(vim.api.nvim_win_call, win, function()
+    vim.cmd.edit(vim.fn.fnameescape(path))
+    local line = math.max(1, tonumber(target.line) or 1)
+    pcall(vim.api.nvim_win_set_cursor, 0, { line, 0 })
+  end)
+  return true
+end
+
 ---@param label string
 ---@param details table<string, DiffReviewInventoryChangeSet>?
-local function open_inventory_detail_buffer(label, details)
-  local lines, folds = inventory_detail_lines(label, details)
+---@param cwd string?
+local function open_inventory_detail_buffer(label, details, cwd)
+  local lines, folds, row_targets = inventory_detail_lines(label, details)
   local buf = vim.api.nvim_create_buf(true, false)
-  vim.bo[buf].bufhidden = "wipe"
+  vim.bo[buf].bufhidden = "hide"
   vim.bo[buf].buftype = "nofile"
   vim.bo[buf].swapfile = false
   vim.bo[buf].filetype = "DiffReviewInventory"
@@ -2230,16 +2633,18 @@ local function open_inventory_detail_buffer(label, details)
   vim.keymap.set("n", "<Esc>", function()
     if vim.api.nvim_buf_is_valid(buf) then pcall(vim.api.nvim_buf_delete, buf, { force = true }) end
   end, { buffer = buf, nowait = true, silent = true, desc = "Close inventory detail" })
-  local win = vim.api.nvim_get_current_win()
-  vim.api.nvim_win_set_buf(win, buf)
+  vim.keymap.set("n", ".", function()
+    jump_inventory_detail_target(buf, cwd, row_targets or {})
+  end, { buffer = buf, nowait = true, silent = true, desc = "Open inventory item" })
+  vim.cmd(("buffer %d"):format(buf))
   pcall(vim.api.nvim_buf_add_highlight, buf, M._ns, "DiffReviewStatusHeader", 0, 0, -1)
   for row_index, line in ipairs(lines) do
     if line == "Added:" then
       pcall(vim.api.nvim_buf_add_highlight, buf, M._ns, "DiffReviewAddRange", row_index - 1, 0, -1)
-    elseif line == "Removed:" then
-      pcall(vim.api.nvim_buf_add_highlight, buf, M._ns, "DiffReviewDeleteRange", row_index - 1, 0, -1)
-    elseif line == "Updated:" then
+    elseif line == "Modified:" then
       pcall(vim.api.nvim_buf_add_highlight, buf, M._ns, "DiffReviewModifyRange", row_index - 1, 0, -1)
+    elseif line == "Deleted:" then
+      pcall(vim.api.nvim_buf_add_highlight, buf, M._ns, "DiffReviewDeleteRange", row_index - 1, 0, -1)
     end
   end
   apply_inventory_detail_folds(buf, folds)
@@ -2257,10 +2662,24 @@ local function inventory_label_at_cursor(entry, cursor_col)
   return nil
 end
 
+---@param rows table[]
+---@param flow DiffReviewWalkthroughFlowNode[]
+---@param width integer
+local function append_status_flow_rows(rows, flow, width)
+  for index, line in ipairs(flow_summary_lines(flow, width)) do
+    rows[#rows + 1] = {
+      text = line,
+      id = ("walkthrough:flow:%d"):format(index),
+      parent_id = status_section_id,
+      kind = "pr_head_line",
+    }
+  end
+end
+
 ---@param mode DiffReviewWalkthroughMode
 ---@return table[] rows
 local function status_summary_rows(mode)
-  local width = math.max(40, vim.o.columns - 4)
+  local width = status_render_width(mode)
   local item_titles = collect_summary_item_titles(mode.doc.tasks)
   local state = mode.host.get_state()
   ensure_status_inventory(mode, state)
@@ -2271,14 +2690,16 @@ local function status_summary_rows(mode)
     rows[#rows + 1] = { text = line, parent_id = status_section_id }
   end
   local has_overview = #rows > 0
-  local has_inventory = mode.inventory and #(mode.inventory.rows or {}) > 0
-  if has_inventory then
+  local has_flow = mode.doc.flow and #mode.doc.flow > 0
+  if has_flow then
     if has_overview then
       rows[#rows + 1] = { text = "", parent_id = status_section_id }
     end
-    append_status_inventory_rows(rows, mode.inventory)
+    append_status_flow_rows(rows, mode.doc.flow, width)
   end
-  if (has_overview or has_inventory) and #(mode.doc.tasks or {}) > 0 then
+
+  local has_inventory = mode.inventory and #(mode.inventory.rows or {}) > 0
+  if (has_overview or has_flow) and #(mode.doc.tasks or {}) > 0 then
     rows[#rows + 1] = { text = "", parent_id = status_section_id }
   end
 
@@ -2308,21 +2729,11 @@ local function status_summary_rows(mode)
     end
   end
 
-  local narrative_text = narrative_summary_text(mode.doc.narrative)
-  if narrative_text then
+  if has_inventory then
     if #rows > 0 then
-      rows[#rows + 1] = {
-        text = "",
-        id = "walkthrough:narrative:separator",
-        parent_id = status_section_id,
-        kind = "pr_head_line",
-      }
+      rows[#rows + 1] = { text = "", parent_id = status_section_id }
     end
-    append_status_summary_rows(rows, narrative_text, {
-      id = "walkthrough:narrative",
-      parent_id = status_section_id,
-      kind = "pr_head_line",
-    }, width, item_titles)
+    append_status_inventory_rows(rows, mode.inventory)
   end
 
   return rows
@@ -2438,7 +2849,8 @@ function M.jump_status_step(buf, row)
   local cursor = vim.api.nvim_win_get_cursor(win)
   local inventory_label = entry and inventory_label_at_cursor(entry, cursor[2])
   if inventory_label then
-    open_inventory_detail_buffer(inventory_label, mode.inventory and mode.inventory.details or nil)
+    save_jump_return_location(win, buf, cursor)
+    open_inventory_detail_buffer(inventory_label, mode.inventory and mode.inventory.details or nil, mode.host.cwd())
     return true
   end
 
@@ -2448,11 +2860,9 @@ function M.jump_status_step(buf, row)
   local source_cursor = cursor
   local target = resolve_visible_step_target(mode, step)
   if target.start_row then
+    save_jump_return_location(win, buf, source_cursor)
     pcall(vim.api.nvim_win_call, win, function()
-      vim.fn.setpos("''", { buf, source_cursor[1], source_cursor[2] + 1, 0 })
-    end)
-    pcall(vim.api.nvim_win_set_cursor, win, { target.start_row, 0 })
-    pcall(vim.api.nvim_win_call, win, function()
+      vim.cmd(("normal! %dG0"):format(target.start_row))
       vim.cmd("normal! zz")
     end)
   else

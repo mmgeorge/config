@@ -4,14 +4,17 @@
   "title": "DiffReview Walkthrough",
   "description": "Guided review walkthrough of a set of changes, consumed by the DiffReview Neovim plugin. Lives at the repository root as .walkthrough.json.",
   "type": "object",
-  "required": ["version", "narrative", "overview", "root", "commit", "tasks"],
+  "required": ["version", "flow", "overview", "root", "commit", "tasks"],
   "additionalProperties": false,
   "properties": {
     "version": {
-      "const": 9
+      "const": 10
     },
-    "narrative": {
-      "$ref": "#/$defs/narrative"
+    "flow": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Compact data-flow graph rendered in the walkthrough summary. Use one primary root when possible and branch only where data splits to multiple consumers.",
+      "items": { "$ref": "#/$defs/flowNode" }
     },
     "overview": {
       "type": "string",
@@ -36,19 +39,20 @@
     }
   },
   "$defs": {
-    "narrative": {
+    "flowNode": {
       "type": "object",
-      "required": ["type", "justification"],
+      "required": ["text"],
       "additionalProperties": false,
       "properties": {
-        "type": {
-          "enum": ["data_flow", "capability", "ownership_boundary", "runtime_layer", "risk_contract"],
-          "description": "Narrative frame selected for task ordering and grouping."
-        },
-        "justification": {
+        "text": {
           "type": "string",
           "minLength": 1,
-          "description": "Short explanation of why this narrative frame fits the current diff."
+          "description": "One compact runtime/data-flow node label. Do not include a file path."
+        },
+        "children": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/flowNode" },
+          "description": "Next data-flow nodes or branch consumers."
         }
       }
     },

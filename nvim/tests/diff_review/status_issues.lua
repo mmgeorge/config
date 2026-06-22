@@ -8,7 +8,7 @@ local repo_cache = require("github.repo_cache")
 
 local original_notify = vim.notify
 local original_cwd = vim.fn.getcwd():gsub("\\", "/")
-local root = vim.fs.joinpath(original_cwd, ".tmp-gitstatus-session-test"):gsub("\\", "/")
+local root = vim.fs.joinpath(original_cwd, ".tmp-gitstatus-file-test"):gsub("\\", "/")
 local cache_root = vim.fn.tempname()
 local notifications = {}
 local calls = {}
@@ -200,14 +200,14 @@ local function run()
   assert_true(not vim.bo[buf].modified, "saving GitStatus issues must clear the modified flag")
   assert_true(buffer_contains(buf, "Issues: #42 #44"), "GitStatus issues row did not normalize after save")
 
-  local session_path = vim.fs.joinpath(root, ".session")
-  assert_true(vim.fn.filereadable(session_path) == 1, "GitStatus save did not create .session")
-  local session = vim.json.decode(table.concat(vim.fn.readfile(session_path), "\n"))
-  assert_true(vim.deep_equal(session.issues, { 42, 44 }), "GitStatus .session issues were wrong: " .. vim.inspect(session))
+  local gitstatus_path = vim.fs.joinpath(root, ".gitstatus")
+  assert_true(vim.fn.filereadable(gitstatus_path) == 1, "GitStatus save did not create .gitstatus")
+  local gitstatus = vim.json.decode(table.concat(vim.fn.readfile(gitstatus_path), "\n"))
+  assert_true(vim.deep_equal(gitstatus.issues, { 42, 44 }), "GitStatus .gitstatus issues were wrong: " .. vim.inspect(gitstatus))
 
   diff_review._status_states[buf].issues = nil
   diff_review.render_status(buf)
-  wait_for(function() return buffer_contains(buf, "Issues: #42 #44") end, "GitStatus did not reload issues from .session")
+  wait_for(function() return buffer_contains(buf, "Issues: #42 #44") end, "GitStatus did not reload issues from .gitstatus")
 end
 
 local ok, err = xpcall(run, debug.traceback)

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Nushell"
+  short_description: "Validate and research Nushell scripts"
+  default_prompt: "Use $nushell to validate this Nushell script."

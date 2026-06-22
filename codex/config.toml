@@ -22,7 +22,7 @@ multi_agent = true
 memories = true
 js_repl = false
 terminal_resize_reflow = true
-# mentions_v2 = true
+mentions_v2 = false
 
 [projects.'\\?\D:\code\ferrous']
 trust_level = "trusted"

@@ -5709,7 +5709,7 @@ M._status_issues = M._status_issues or {}
 ---@return string?
 function M._status_issues.path(cwd)
   if not cwd or cwd == "" then return nil end
-  return vim.fs.joinpath(cwd, ".session")
+  return vim.fs.joinpath(cwd, ".gitstatus")
 end
 
 ---@param values any
@@ -5786,7 +5786,7 @@ function M._status_issues.read_state(cwd)
   end
   local read_ok, lines = pcall(vim.fn.readfile, path)
   if not read_ok then
-    vim.notify("GitStatus session read failed: " .. tostring(lines), vim.log.levels.WARN, { title = "GitStatus" })
+    vim.notify("GitStatus state read failed: " .. tostring(lines), vim.log.levels.WARN, { title = "GitStatus" })
     return { cwd = cwd, numbers = {}, saved_numbers = {} }
   end
   local content = table.concat(lines or {}, "\n")
@@ -5795,7 +5795,7 @@ function M._status_issues.read_state(cwd)
   end
   local decode_ok, decoded = pcall(vim.json.decode, content)
   if not (decode_ok and type(decoded) == "table") then
-    vim.notify("GitStatus session read failed: invalid .session JSON", vim.log.levels.WARN, { title = "GitStatus" })
+    vim.notify("GitStatus state read failed: invalid .gitstatus JSON", vim.log.levels.WARN, { title = "GitStatus" })
     return { cwd = cwd, numbers = {}, saved_numbers = {} }
   end
   local numbers = M._status_issues.normalize_numbers(decoded.issues)
@@ -5827,7 +5827,7 @@ function M._status_issues.write(cwd, numbers, existing)
     local content = table.concat(lines or {}, "\n")
     if vim.trim(content) ~= "" then
       local decode_ok, decoded = pcall(vim.json.decode, content)
-      if not (decode_ok and type(decoded) == "table") then return false, "invalid .session JSON" end
+      if not (decode_ok and type(decoded) == "table") then return false, "invalid .gitstatus JSON" end
       data = decoded
     end
   end
@@ -6893,14 +6893,14 @@ end
 function M._status_issues.save(buf)
   local status = M._status_states and M._status_states[buf] or M._status
   if not (status and status.view_kind == "status" and status.cwd) then
-    notify_error("GitStatus session save failed: not in a git status buffer", "GitStatus")
+    notify_error("GitStatus state save failed: not in a git status buffer", "GitStatus")
     return
   end
   local issues_state = status.issues or M._status_issues.ensure_state(status, status.cwd) or {}
   local numbers = M._status_issues.current_numbers(buf)
   local ok, err = M._status_issues.write(status.cwd, numbers, issues_state.data)
   if not ok then
-    notify_error("GitStatus session save failed: " .. tostring(err), "GitStatus")
+    notify_error("GitStatus state save failed: " .. tostring(err), "GitStatus")
     vim.bo[buf].modified = true
     M._status_issues.sync_modifiable(buf)
     return
@@ -16172,6 +16172,19 @@ local function setup_status_keymaps(buf)
       status_jump(entry)
     end
   end)
+
+  local function jump_back_with_saved_view()
+    vim.cmd("normal! \15")
+    local walkthrough = require("diff_review.walkthrough")
+    walkthrough.restore_jump_return_view(buf, true)
+    vim.schedule(function()
+      if vim.api.nvim_buf_is_valid(buf) then walkthrough.restore_jump_return_view(buf, true) end
+    end)
+  end
+  for _, key in ipairs({ ",", "<C-o>" }) do
+    vim.keymap.set("n", key, jump_back_with_saved_view,
+      vim.tbl_extend("force", opts, { desc = "Jump back" }))
+  end
 
   local function commit()
     require("diff_review.commit").commit({

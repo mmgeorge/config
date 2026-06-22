@@ -4,66 +4,14 @@
 - **Never claim something is impossible without evidence.** Find a link, issue, or error message that proves it. Historically, every "this won't work" or "known limitation" claim has been wrong. If stuck, say so honestly and present options — never silently switch approaches.
 - If instructions are ambiguous or equally viable paths exist, stop and ask.
 - When asked a question, answer it — don't automatically start writing code.
+- Never use semicolons. Split sentences instead.
 
 # Subagent Research Workflow
-- Codex only spawns subagents when the user explicitly asks for subagents, delegation, or parallel agent work. Do not treat "be thorough", "research", or "look into this" as automatic permission to spawn.
-- When subagents are requested, prefer explore agents for broad, noisy, read-heavy discovery that would otherwise pollute the main agent's context: unfamiliar local subsystems, remote repositories, crate/API docs, examples, issues, PRs, logs, or independent risk scans.
 - Use the built-in `explorer` agent for local codebase exploration. Use `remote-code-explorer` for remote source, external library, GitHub, docs, examples, issues, or PR research when that custom agent is available.
 - Do not spawn explore agents for tiny lookups, single-file reads, tightly coupled debugging, direct implementation work, or the next critical-path step when the main agent is blocked on the answer. Do that work locally.
 - Before delegating, decide the immediate local task and keep working on non-overlapping work while subagents run. Do not duplicate a subagent's assignment in the main thread.
 - Make each delegated exploration task concrete and bounded. Include the target, the question to answer, desired thoroughness (`quick`, `medium`, or `thorough`), and the expected output format.
 - Ask explore agents to return compact evidence-backed findings with exact file paths, symbols, URLs, and gaps. The main agent owns synthesis, decisions, edits, and verification.
-- Spawn multiple explore agents in parallel only when the questions are independent, such as local architecture discovery plus remote API examples plus current docs. Avoid repeated fan-out on the same unresolved question.
-
-# Planning
-
-When creating a plan, use this template. Output each section in order:
-
-1. **Problem** — What are we adding or fixing? Why?
-2. **Overview** — Approach summary (2–4 sentences).
-3. **Refactoring** (optional) — Only when a substantial refactor is needed before the change can land cleanly. Call out what's wrong, why it must change, and what replaces it. Skip for changes that fit existing structure.
-4. **Design patterns** — Which patterns fit the problem. Call out when existing code would benefit from a known pattern. Explain why — don't just name-drop.
-5. **Code flow** — ASCII diagram from the relevant entry point (not the entire system). Include file paths and data flow (input/output types) per node. Mark `*` (modified/new), `~` (removed). Changes summary below. Example:
-   ```
-   API Request (POST /documents)
-     │ (DocumentRequest)
-     ├── validate_request() → ValidatedRequest        [api/handlers.rs]
-     ├── *process_document() → StoredDocument          [processing/mod.rs]
-     │     │ (ValidatedRequest)
-     │     ├── extract_text() → ExtractedText          [processing/extract.rs]
-     │     ├── ~save_and_respond() → Response          [processing/mod.rs]
-     │     └── *save_result() → StoredDocument         [processing/store.rs]
-     ├── *notify() → NotifyResult                      [notifications/mod.rs] (NEW)
-     │     │ (StoredDocument, WebhookConfig)
-     │     └── *dispatch() → DispatchResult            [notifications/dispatch.rs] (NEW)
-     └── respond() → ApiResponse                      [api/handlers.rs]
-
-   Changes:
-     *process_document()  — return StoredDocument instead of Response
-     ~save_and_respond()  — split into save_result() + respond()
-     *save_result()       — extracted from save_and_respond
-     *notify()            — new: webhook notification after processing
-     *dispatch()          — new: HTTP delivery with retries
-   ```
-6. **Checklist** — Break the work into tasks, each with concrete steps. Steps include every function/type added, modified, or deleted (name, file, what changes). During execution, mark each step done as you complete it. Do not stop until every step is marked. Example:
-   ```
-   Task 1: Split save_and_respond into separate concerns
-     [ ] Rename save_and_respond() → save_result() in processing/store.rs — return StoredDocument
-     [ ] Update process_document() in processing/mod.rs — call save_result(), return StoredDocument
-   Task 2: Add webhook notifications
-     [ ] Create notifications/mod.rs — notify(StoredDocument, WebhookConfig) → NotifyResult
-     [ ] Create notifications/dispatch.rs — dispatch() → DispatchResult, HTTP delivery with retries
-   ```
-7. **Modularity and testability review** — Clean boundaries? Narrow interfaces? Testable in isolation? Adjust the plan until yes.
-8. **Test plan** — Specific tests:
-   - **Unit tests**: What to test, what to mock, what behavior each validates.
-   - **Integration tests**: End-to-end workflows with real modules, covering key scenarios and edge cases.
-
-Every plan must end with these lines:
-```
-+After completing each task, output a status line ([3/7 tasks complete — next: Task 4: ...]) and immediately proceed. Do not pause, summarize progress, or ask to continue.
-+Finish the entire plan. No partial completions. Output DONE when all phases pass.
-```
 
 # Programming
 - **Engineering over hacking.** When you spot a design issue, stop and refactor — fix the real problem even if it's substantial. Duplicated code should be shared. Minimize accumulated tech debt.
@@ -71,6 +19,16 @@ Every plan must end with these lines:
 - **No shortcuts or workarounds.** Never use serde rename, compatibility shims, adapter layers, or similar hacks to avoid real restructuring. Rename everywhere. Refactor if the structure doesn't support the change. Leave surrounding code better than you found it.
 - **Think like a computer scientist.** Apply design patterns (strategy, builder, observer, etc.) when they fit naturally. Recognize implicit patterns — GoF, data-driven design, or other established paradigms — and make them explicit in the code's structure. When code reinvents a known pattern poorly, refactor to the proper one. Don't force patterns where they add complexity without clarity.
 - **Modularity and encapsulation.** Keep concerns separated, interfaces narrow, internals hidden. If adding a feature requires touching many unrelated files, the boundaries are wrong — fix them.
+- **Documentation templates.** Use these templates when adding docs or comments.
+  - **Class/struct/trait docs**: Use third-person present tense with the type as the implied subject.
+    Template: `<Stores|Owns|Coordinates|Tracks|Represents|Defines|Provides|Resolves> <state, responsibility, or capability> for <consumer or boundary> [<because|so|when|before|after|while|without|by|for|to> <justification>] [, <-ing phrase describing outcome or reason>].`
+    Optional newline + second paragraph: `<Preserves|Enforces|Maintains> <invariant or lifecycle contract>.`
+  - **Method/function docs**: Use imperative action wording with implied subject "you". Add these docs only when behavior is not obvious. Keep them to at most two lines.
+    Template: `<Build|Split|Merge|Resolve|Route|Validate|Load|Write> <result or action> from <input or source> [<because|so|when|before|after|while|without|by|for|to> <justification>] [, <-ing phrase describing outcome or reason>].`
+    Optional second line: `<Preserve|Enforce|Maintain|Validate|Avoid> <invariant, boundary, or edge case>.`
+  - **Inline comments**: Use imperative action wording for non-obvious local constraints, ordering requirements, edge cases, external API quirks, or invariants. Inline comments should usually be one line. Use a block comment only when a local invariant needs multiple related facts.
+    Template: `// <Keep|Avoid|Preserve|Defer|Normalize|Clamp|Cache|Skip|Retry|Guard> <local action or constraint> [<because|when|before|after|while|without|by|for|to> <reason>] [, <-ing phrase describing outcome or reason>].`
+  - Do not add comments that merely restate the code. Do not write "this is non-trivial" or similar labels.
 - **Naming.** Never use single-letter variable names. Avoid abbreviations unless widely understood (e.g., `url`, `id`, `config`). Long type names can be shortened to a clear word — e.g., `FoundationalVectorStore` → `store` — but never to a letter like `r` or `s`.
 - **Testing strategy**: Unit tests per module with mocks for isolation. Integration tests for end-to-end workflows with real modules — these catch boundary issues mocks hide.
 - Keep functions focused and reasonably sized. A function whose body is shorter than its signature is a smell — if it isn't doing meaningful work beyond a direct call, it shouldn't exist.
@@ -87,28 +45,3 @@ Every plan must end with these lines:
   - Otherwise, when you need to view source code, use `github` mcp.
 - Also search issues and PR description with the `github` mcp to augment understanding.
 - For CLI tools or APIs, prefer searching the source code to get a deep understanding.
-
-# Nushell
-When working with Nushell, reference these repos via GitHub MCP:
-- **nushell/nushell** — source code, builtins, command signatures, internals.
-- **nushell/nushell.github.io** — user-facing docs, cookbook, migration guides, language reference.
-
-## Script Validation
-Before returning any Nushell script, validate for parse errors:
-1. Ensure `nu` is installed.
-2. Run `nu -c 'nu-check script.nu'` (or `--as-module` for modules).
-3. Fix any errors before presenting the script.
-4. For one-liners: `"your code here" | nu-check`
-
-## Well-known directories
-
-### Linux / FreeBSD (XDG)
-- `$XDG_CONFIG_HOME` (`~/.config/`), `$XDG_DATA_HOME` (`~/.local/share/`), `$XDG_STATE_HOME` (`~/.local/state/`), `$XDG_CACHE_HOME` (`~/.cache/`), `$XDG_RUNTIME_DIR` (`/run/user/$UID/`)
-- System: `/etc/`, `/usr/share/`, `/usr/local/share/`
-
-### macOS
-- `~/Library/Application Support/`, `~/Library/Preferences/`, `~/Library/Caches/`, `~/Library/Logs/`
-- `/Library/Application Support/`, `/Library/Preferences/`, `/Library/Caches/`
-
-### Windows
-- `%APPDATA%`, `%LOCALAPPDATA%`, `%TEMP%`/`%TMP%`, `%PROGRAMDATA%`, `%USERPROFILE%\.config\`
