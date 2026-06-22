@@ -16174,11 +16174,31 @@ local function setup_status_keymaps(buf)
   end)
 
   local function jump_back_with_saved_view()
-    vim.cmd("normal! \15")
     local walkthrough = require("diff_review.walkthrough")
-    walkthrough.restore_jump_return_view(buf, true)
+    walkthrough._debug_jump_event("status_jump_back_start", {
+      buf = buf,
+      view = walkthrough._jump_debug_snapshot(vim.fn.bufwinid(buf), buf),
+    })
+    vim.cmd("normal! \15")
+    walkthrough._debug_jump_event("status_jump_back_after_ctrl_o", {
+      buf = buf,
+      view = walkthrough._jump_debug_snapshot(vim.fn.bufwinid(buf), buf),
+    })
+    local restored = walkthrough.restore_jump_return_view(buf, true)
+    walkthrough._debug_jump_event("status_jump_back_after_restore", {
+      buf = buf,
+      restored = restored,
+      view = walkthrough._jump_debug_snapshot(vim.fn.bufwinid(buf), buf),
+    })
     vim.schedule(function()
-      if vim.api.nvim_buf_is_valid(buf) then walkthrough.restore_jump_return_view(buf, true) end
+      if vim.api.nvim_buf_is_valid(buf) then
+        local scheduled_restored = walkthrough.restore_jump_return_view(buf, true)
+        walkthrough._debug_jump_event("status_jump_back_scheduled_restore", {
+          buf = buf,
+          restored = scheduled_restored,
+          view = walkthrough._jump_debug_snapshot(vim.fn.bufwinid(buf), buf),
+        })
+      end
     end)
   end
   for _, key in ipairs({ ",", "<C-o>" }) do

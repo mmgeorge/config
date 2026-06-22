@@ -1188,21 +1188,21 @@ local function run()
       file = "particle_storage.rs",
       start = { line = 22, col = 1 },
       ["end"] = { line = 73, col = 1 },
-      comment = "The wider added count sets the adjacent numeric column without padding the file label.",
+      comment = "The wider added count should stay compact inside the bracketed location label.",
     },
     {
       title = "Write spawn batches into shared buffers.",
       file = "particle_storage.rs",
       start = { line = 88, col = 1 },
       ["end"] = { line = 114, col = 1 },
-      comment = "The selected span keeps the count alignment stable for another two-digit added count.",
+      comment = "The selected span keeps a compact bracketed location for another two-digit added count.",
     },
     {
       title = "Expose renderable particle buffers.",
       file = "particle_storage.rs",
       start = { line = 116, col = 1 },
       ["end"] = { line = 124, col = 1 },
-      comment = "The longer line number should reduce count padding instead of padding the file label.",
+      comment = "The longer line number should not add padding between the plus and minus counts.",
     },
   }
   set_walkthrough_doc(count_alignment_doc)
@@ -1211,16 +1211,16 @@ local function run()
   expand_row_if_needed(buf, "1. Update a.txt through the first task.", "file Fixture edits")
   expand_row_if_needed(buf, "file Fixture edits", "└─ Rewrite the first fixture file.")
   expand_row_if_needed(buf, "└─ Rewrite the first fixture file.", "Modify Cache a.txt rewrite")
-  local storage_location = "◦ Store solver buffers outside the system.    [particle_storage.rs:12 +9  -0]"
+  local storage_location = "◦ Store solver buffers outside the system.    [particle_storage.rs:12 +9 -0]"
   local allocate_location = "◦ Allocate compute storage from one capacity. [particle_storage.rs:22 +52 -0]"
   local write_location = "◦ Write spawn batches into shared buffers.    [particle_storage.rs:88 +27 -0]"
   local expose_location = "◦ Expose renderable particle buffers.         [particle_storage.rs:116 +9 -0]"
   wait_for(function() return buffer_contains(summary_buf, storage_location) end,
-    "comment-location row should pad short added counts before the removed count")
+    "comment-location row should keep short added counts compact before the removed count")
   assert_true(buffer_contains(summary_buf, allocate_location),
-    "comment-location row should keep wider added counts tight")
+    "comment-location row should keep wider added counts compact")
   assert_true(buffer_contains(summary_buf, write_location),
-    "comment-location row should align another two-digit added count")
+    "comment-location row should keep another two-digit added count compact")
   assert_true(buffer_contains(summary_buf, expose_location),
     "comment-location row should not pad longer file line labels")
   trigger_buf_mapping(buf, "ow")

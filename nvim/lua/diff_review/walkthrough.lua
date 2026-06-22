@@ -116,6 +116,7 @@
 ---@field _ns integer
 ---@field _jump_return_views table<integer, table>?
 ---@field _jump_return_autocmds table<integer, boolean>?
+---@field _jump_debug_force? boolean
 local M = {
   _modes = {},
   _ns = vim.api.nvim_create_namespace("diff_review_walkthrough"),
@@ -151,6 +152,73 @@ end
 ---@param level integer
 local function notify(message, level)
   vim.notify(message, level, { title = "DiffReview walkthrough" })
+end
+
+local function jump_debug_enabled()
+  local walkthrough_enabled = vim.g.diff_review_walkthrough_jump_debug
+  local gitstatus_enabled = vim.g.diff_review_gitstatus_debug
+  return M._jump_debug_force == true
+    or walkthrough_enabled == true
+    or walkthrough_enabled == 1
+    or gitstatus_enabled == true
+    or gitstatus_enabled == 1
+end
+
+local function jump_debug_log_path()
+  local dir = (vim.fn.stdpath("state") or ".") .. "/diff_review"
+  pcall(vim.fn.mkdir, dir, "p")
+  return dir .. "/gitstatus-debug.log"
+end
+
+local function jump_debug_one_line(value)
+  return vim.inspect(value):gsub("\r", "\\r"):gsub("\n", "\\n")
+end
+
+---@param win integer
+---@param buf integer
+---@return table
+local function jump_debug_snapshot(win, buf)
+  local snapshot = {
+    win = win,
+    buf = buf,
+    win_valid = win ~= -1 and vim.api.nvim_win_is_valid(win),
+    buf_valid = vim.api.nvim_buf_is_valid(buf),
+  }
+  if not (snapshot.win_valid and snapshot.buf_valid) then return snapshot end
+
+  local ok_cursor, cursor = pcall(vim.api.nvim_win_get_cursor, win)
+  if ok_cursor then snapshot.cursor = cursor end
+  pcall(vim.api.nvim_win_call, win, function()
+    snapshot.view = vim.fn.winsaveview()
+    snapshot.window_top = vim.fn.line("w0")
+    snapshot.window_bottom = vim.fn.line("w$")
+  end)
+  if ok_cursor and cursor and cursor[1] then
+    local ok_line, line = pcall(vim.api.nvim_buf_get_lines, buf, cursor[1] - 1, cursor[1], false)
+    if ok_line and line and line[1] then snapshot.cursor_line = line[1] end
+  end
+  return snapshot
+end
+
+---@param event string
+---@param payload? table
+local function jump_debug_event(event, payload)
+  if not jump_debug_enabled() then return end
+  local line = ("walkthrough_jump %s %s"):format(event, jump_debug_one_line(payload or {}))
+  pcall(vim.fn.writefile, { line }, jump_debug_log_path(), "a")
+end
+
+---@param win integer
+---@param buf integer
+---@return table
+function M._jump_debug_snapshot(win, buf)
+  return jump_debug_snapshot(win, buf)
+end
+
+---@param event string
+---@param payload? table
+function M._debug_jump_event(event, payload)
+  jump_debug_event(event, payload)
 end
 
 -- ─── document loading ────────────────────────────────────────────────────────
@@ -1910,8 +1978,6 @@ end
 
 ---@class DiffReviewWalkthroughStatusStepLayout
 ---@field title_column_width integer
----@field minus_column_width integer
----@field close_column_width integer
 
 ---@param state table|nil
 ---@param tasks DiffReviewWalkthroughTask[]
@@ -1919,8 +1985,6 @@ end
 local function status_step_layout(state, tasks)
   local layout = {
     title_column_width = 0,
-    minus_column_width = 0,
-    close_column_width = 0,
   }
 
   for _, task in ipairs(tasks or {}) do
@@ -1937,14 +2001,6 @@ local function status_step_layout(state, tasks)
             local file_label = ("%s:%d"):format(basename(step.file), tonumber(step.start_pos and step.start_pos.line) or 1)
             layout.title_column_width = math.max(layout.title_column_width,
               vim.fn.strdisplaywidth(step_prefix) + vim.fn.strdisplaywidth("◦ ") + vim.fn.strdisplaywidth(title))
-            local stats = status_step_stats(state, step)
-            if stats then
-              local plus_text = ("+%d"):format(stats.added)
-              local minus_text = ("-%d"):format(stats.removed)
-              local minus_column_width = vim.fn.strdisplaywidth(file_label) + 1 + #plus_text + 1
-              layout.minus_column_width = math.max(layout.minus_column_width, minus_column_width)
-              layout.close_column_width = math.max(layout.close_column_width, minus_column_width + #minus_text)
-            end
           end
         end
       end
@@ -1967,18 +2023,13 @@ local function status_step_location_text(step, prefix, stats, layout)
   local file_label = ("%s:%d"):format(file, line)
   local title_column_width = layout and layout.title_column_width or
       (vim.fn.strdisplaywidth(prefix) + vim.fn.strdisplaywidth(bullet) + vim.fn.strdisplaywidth(title))
-  local minus_column_width = layout and layout.minus_column_width or 0
-  local close_column_width = layout and layout.close_column_width or 0
   local current_title_width = vim.fn.strdisplaywidth(prefix) + vim.fn.strdisplaywidth(bullet) + vim.fn.strdisplaywidth(title)
   local title_padding = (" "):rep(math.max(1, title_column_width - current_title_width + 1))
   local count_label = ""
   if stats then
     local plus_text = ("+%d"):format(stats.added)
     local minus_text = ("-%d"):format(stats.removed)
-    local spaces_before_minus = (" "):rep(math.max(1,
-      minus_column_width - (vim.fn.strdisplaywidth(file_label) + 1 + #plus_text)))
-    local spaces_before_close = (" "):rep(math.max(0, close_column_width - (minus_column_width + #minus_text)))
-    count_label = (" %s%s%s%s"):format(plus_text, spaces_before_minus, minus_text, spaces_before_close)
+    count_label = (" %s %s"):format(plus_text, minus_text)
   end
   local text = ("%s%s%s%s[%s%s]"):format(prefix, bullet, title, title_padding, file_label, count_label)
   local segments = {
@@ -1992,14 +2043,10 @@ local function status_step_location_text(step, prefix, stats, layout)
   if stats then
     local plus_text = ("+%d"):format(stats.added)
     local minus_text = ("-%d"):format(stats.removed)
-    local spaces_before_minus = (" "):rep(math.max(1,
-      minus_column_width - (vim.fn.strdisplaywidth(file_label) + 1 + #plus_text)))
-    local spaces_before_close = (" "):rep(math.max(0, close_column_width - (minus_column_width + #minus_text)))
     segments[#segments + 1] = { " " }
     segments[#segments + 1] = { plus_text, "DiffReviewAddRange" }
-    segments[#segments + 1] = { spaces_before_minus }
+    segments[#segments + 1] = { " " }
     segments[#segments + 1] = { minus_text, "DiffReviewDeleteRange" }
-    segments[#segments + 1] = { spaces_before_close }
   end
   segments[#segments + 1] = { "]", "DiffReviewWalkthroughLocation" }
   return text, segments
@@ -2440,16 +2487,50 @@ end
 ---@return boolean restored
 function M.restore_jump_return_view(buf, force)
   local saved = M._jump_return_views and M._jump_return_views[buf] or nil
-  if not saved then return false end
+  if not saved then
+    jump_debug_event("restore_skip_no_saved", { buf = buf, force = force })
+    return false
+  end
   local win = vim.fn.bufwinid(buf)
-  if win == -1 or not vim.api.nvim_win_is_valid(win) then return false end
+  if win == -1 or not vim.api.nvim_win_is_valid(win) then
+    jump_debug_event("restore_skip_no_window", { buf = buf, force = force, saved = saved })
+    return false
+  end
   local ok, cursor = pcall(vim.api.nvim_win_get_cursor, win)
-  if not ok or cursor[1] ~= saved.row then return false end
-  if not (force or saved.active) then return false end
+  if not ok or cursor[1] ~= saved.row then
+    jump_debug_event("restore_skip_cursor_mismatch", {
+      buf = buf,
+      force = force,
+      saved = saved,
+      cursor = ok and cursor or nil,
+      view = jump_debug_snapshot(win, buf),
+    })
+    return false
+  end
+  if not (force or saved.active) then
+    jump_debug_event("restore_skip_inactive", {
+      buf = buf,
+      force = force,
+      saved = saved,
+      view = jump_debug_snapshot(win, buf),
+    })
+    return false
+  end
+  jump_debug_event("restore_before", {
+    buf = buf,
+    force = force,
+    saved = saved,
+    view = jump_debug_snapshot(win, buf),
+  })
   M._jump_return_views[buf] = nil
   pcall(vim.api.nvim_win_call, win, function()
     vim.fn.winrestview(saved.view)
   end)
+  jump_debug_event("restore_after", {
+    buf = buf,
+    force = force,
+    view = jump_debug_snapshot(win, buf),
+  })
   return true
 end
 
@@ -2503,11 +2584,22 @@ end
 ---@return boolean saved
 local function save_jump_return_location(win, buf, cursor)
   if win == -1 or not vim.api.nvim_win_is_valid(win) or not vim.api.nvim_buf_is_valid(buf) then
+    jump_debug_event("save_skip_invalid", { win = win, buf = buf, cursor = cursor })
     return false
   end
   local ok, source_cursor = pcall(vim.api.nvim_win_get_cursor, win)
-  if not ok then return false end
+  if not ok then
+    jump_debug_event("save_skip_no_cursor", { win = win, buf = buf, cursor = cursor })
+    return false
+  end
   cursor = cursor or source_cursor
+  jump_debug_event("save_before", {
+    win = win,
+    buf = buf,
+    passed_cursor = cursor,
+    source_cursor = source_cursor,
+    view = jump_debug_snapshot(win, buf),
+  })
   pcall(vim.api.nvim_win_call, win, function()
     M._jump_return_views = M._jump_return_views or {}
     M._jump_return_views[buf] = {
@@ -2522,6 +2614,12 @@ local function save_jump_return_location(win, buf, cursor)
       vim.fn.setpos("''", { 0, cursor[1], (cursor[2] or 0) + 1, 0 })
     end)
   end)
+  jump_debug_event("save_after", {
+    win = win,
+    buf = buf,
+    saved = M._jump_return_views and M._jump_return_views[buf] or nil,
+    view = jump_debug_snapshot(win, buf),
+  })
   return true
 end
 
@@ -2823,13 +2921,34 @@ end
 local function resolve_visible_step_target(mode, step)
   local state = mode.host.get_state()
   local target = M.resolve_step(state, step)
+  jump_debug_event("resolve_initial", {
+    buf = mode.host.buf,
+    step = {
+      file = step.file,
+      title = step.title,
+      start_line = step.start_pos and step.start_pos.line or nil,
+      end_line = step.end_pos and step.end_pos.line or nil,
+    },
+    target = target,
+    view = jump_debug_snapshot(vim.fn.bufwinid(mode.host.buf), mode.host.buf),
+  })
   -- Only unfold + re-render when no diff rows are rendered at all; a
   -- "nearest" match means the hunks are visible and just don't contain the
   -- exact line (TS-context scoping, deletions, staleness).
   if (target.match == "file_only" or target.match == "missing") and ensure_expanded(mode, step) then
+    jump_debug_event("resolve_after_expand", {
+      buf = mode.host.buf,
+      previous_target = target,
+      view = jump_debug_snapshot(vim.fn.bufwinid(mode.host.buf), mode.host.buf),
+    })
     state = mode.host.get_state()
     target = M.resolve_step(state, step)
   end
+  jump_debug_event("resolve_final", {
+    buf = mode.host.buf,
+    target = target,
+    view = jump_debug_snapshot(vim.fn.bufwinid(mode.host.buf), mode.host.buf),
+  })
   return target
 end
 
@@ -2847,8 +2966,21 @@ function M.jump_status_step(buf, row)
   local cursor_row = row or vim.api.nvim_win_get_cursor(win)[1]
   local entry = state.entries[cursor_row]
   local cursor = vim.api.nvim_win_get_cursor(win)
+  jump_debug_event("jump_status_start", {
+    buf = buf,
+    row = cursor_row,
+    cursor = cursor,
+    entry = entry and {
+      id = entry.id,
+      kind = entry.kind,
+      has_step = entry.walkthrough_step ~= nil,
+      has_inventory = entry.inventory_cells ~= nil,
+    } or nil,
+    view = jump_debug_snapshot(win, buf),
+  })
   local inventory_label = entry and inventory_label_at_cursor(entry, cursor[2])
   if inventory_label then
+    jump_debug_event("jump_status_inventory", { buf = buf, label = inventory_label, cursor = cursor })
     save_jump_return_location(win, buf, cursor)
     open_inventory_detail_buffer(inventory_label, mode.inventory and mode.inventory.details or nil, mode.host.cwd())
     return true
@@ -2859,14 +2991,26 @@ function M.jump_status_step(buf, row)
 
   local source_cursor = cursor
   local target = resolve_visible_step_target(mode, step)
+  jump_debug_event("jump_status_target", {
+    buf = buf,
+    source_cursor = source_cursor,
+    target = target,
+    view = jump_debug_snapshot(win, buf),
+  })
   if target.start_row then
     save_jump_return_location(win, buf, source_cursor)
     pcall(vim.api.nvim_win_call, win, function()
       vim.cmd(("normal! %dG0"):format(target.start_row))
       vim.cmd("normal! zz")
     end)
+    jump_debug_event("jump_status_after_move", {
+      buf = buf,
+      target = target,
+      view = jump_debug_snapshot(win, buf),
+    })
   else
     notify("Walkthrough target is not in the current diff", vim.log.levels.WARN)
+    jump_debug_event("jump_status_missing", { buf = buf, target = target })
   end
   return true
 end
