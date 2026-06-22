@@ -56,6 +56,9 @@
     Template: `// <Keep|Avoid|Preserve|Defer|Normalize|Clamp|Cache|Skip|Retry|Guard> <local action or constraint> [<because|when|before|after|while|without|by|for|to> <reason>] [, <-ing phrase describing outcome or reason>].`
   - Do not add comments that merely restate the code. Do not write "this is non-trivial" or similar labels.
 - **Naming.** Never use single-letter variable names. Avoid abbreviations unless widely understood (e.g., `url`, `id`, `config`). Long type names can be shortened to a clear word — e.g., `FoundationalVectorStore` → `store` — but never to a letter like `r` or `s`.
+  - Never use plural names or names ending in `s` for structs, classes, traits, enums, interfaces, or other type names. Type names must name one role, owner, collection abstraction, or capability.
+  - For a type that stores many values, use a singular collection role such as `TaskStore`, `TaskRegistry`, `TaskSet`, `TaskMap`, `TaskIndex`, `TaskTable`, `TaskCache`, `TaskPool`, or `TaskList`.
+  - Rename plural type names at the source instead of adding aliases or compatibility wrappers. For example, use `TaskStore` instead of `Tasks`.
 - **Testing strategy**: Unit tests per module with mocks for isolation. Integration tests for end-to-end workflows with real modules — these catch boundary issues mocks hide.
 - Keep functions focused and reasonably sized. A function whose body is shorter than its signature is a smell — if it isn't doing meaningful work beyond a direct call, it shouldn't exist.
 
