@@ -841,56 +841,32 @@ local function run()
   toggle_row(buf, "└─ Rewrite the first fixture file.")
   wait_for(function() return buffer_contains(summary_buf, "Modify Cache a.txt rewrite") end,
     "unfolding a walkthrough subtask should show its items")
-  local rewrite_location = "◦ Rewrite the fixture line to NEW.            [a.txt:2 +1 -1]"
-  local total_marker_location = "◦ Check the total marker on the next comment. [a.txt:2 +1 -1]"
-  assert_true(not buffer_contains(summary_buf, rewrite_location),
-    "folded walkthrough action should hide comment-location rows")
-  toggle_row(buf, "Modify Cache a.txt rewrite")
-  wait_for(function() return buffer_contains(summary_buf, rewrite_location) end,
-    "expanding a walkthrough action should show the first comment-location row")
-  assert_true(buffer_has_status_highlight_for_text(summary_buf, rewrite_location,
-    "a.txt:2", "DiffReviewWalkthroughLocation"),
-    "comment-location row should highlight the file location with the walkthrough location highlight")
-  assert_true(buffer_has_status_highlight_for_text(summary_buf, rewrite_location,
-    "+1", "DiffReviewAddRange"), "comment-location row should highlight added count")
-  assert_true(buffer_has_status_highlight_for_text(summary_buf, rewrite_location,
-    "-1",
-    "DiffReviewDeleteRange"), "comment-location row should highlight removed count")
-  assert_true(not buffer_contains(summary_buf, "─── a.txt:2"),
-    "comment-location row should not use box-drawing detail prefixes")
-  assert_true(not buffer_contains(summary_buf, total_marker_location),
-    "separate annotated changes should keep their own folded location rows")
-  toggle_row(buf, "Modify Cache a.txt total marker")
-  wait_for(function() return buffer_contains(summary_buf, total_marker_location) end,
-    "expanding the second annotated change should show its comment-location row")
-  assert_true(display_col_before(find_line(summary_buf, rewrite_location), "[")
-    == display_col_before(find_line(summary_buf, total_marker_location), "["),
-    "comment-location rows should align bracketed file labels")
-  local location_row = find_row(summary_buf, rewrite_location)
-  local location_source_view = set_cursor_with_view(summary_buf, location_row, 0, location_row - 3)
+  assert_true(not buffer_contains(summary_buf, "◦ Rewrite the fixture line to NEW."),
+    "walkthrough summary should not render annotation title rows")
+  assert_true(not buffer_contains(summary_buf, "◦ Check the total marker on the next comment."),
+    "walkthrough summary should hide each annotation title")
+  local change_row = find_row(summary_buf, "Modify Cache a.txt rewrite")
+  local location_source_view = set_cursor_with_view(summary_buf, change_row, 0, change_row - 3)
   trigger_buf_mapping(summary_buf, ".")
   wait_for(function() return buffer_contains(summary_buf, "NEW a.txt") end,
-    "pressing dot on a walkthrough location should expand the target diff")
+    "pressing dot on a walkthrough change row should expand the target diff")
   local previous_mark = vim.api.nvim_buf_call(summary_buf, function()
     return vim.fn.getpos("''")
   end)
-  assert_true(previous_mark[2] == location_row,
-    "pressing dot on a walkthrough location should set the previous context mark")
+  assert_true(previous_mark[2] == change_row,
+    "pressing dot on a walkthrough change row should set the previous context mark")
   assert_true(vim.api.nvim_win_get_cursor(vim.fn.bufwinid(summary_buf))[1] == find_row(summary_buf, "NEW a.txt"),
-    "pressing dot on a walkthrough location should jump to the target diff row")
+    "pressing dot on a walkthrough change row should jump to the target diff row")
   trigger_buf_mapping(summary_buf, ",")
   wait_for(function()
     local view = current_win_view(summary_buf)
-    return vim.api.nvim_win_get_cursor(vim.fn.bufwinid(summary_buf))[1] == location_row
+    return vim.api.nvim_win_get_cursor(vim.fn.bufwinid(summary_buf))[1] == change_row
       and view.topline == location_source_view.topline
       and view.leftcol == location_source_view.leftcol
-  end, "walkthrough location jump should save a native jump-list return location and view")
+  end, "walkthrough change row jump should save a native jump-list return location and view")
   toggle_row(buf, "a.txt +")
   wait_for(function() return not buffer_contains(summary_buf, "NEW a.txt") end,
     "folding target file after location jump should hide its diff again")
-  toggle_row(buf, "Modify Cache a.txt rewrite")
-  wait_for(function() return not buffer_contains(summary_buf, rewrite_location) end,
-    "folding a walkthrough action should hide comment-location rows again")
   local expanded_second_task_row = find_row(summary_buf, "2. Update b.txt through the second task.")
   local expanded_lines = vim.api.nvim_buf_get_lines(summary_buf, 0, -1, false)
   assert_true(expanded_lines[expanded_second_task_row - 1] == "",
@@ -1048,30 +1024,12 @@ local function run()
   set_walkthrough_doc(graph_doc)
   summary_buf = start_walkthrough(buf)
   expand_row_if_needed(buf, "1. Update a.txt through the first task.", "└─ Rewrite the first fixture file.")
-  expand_row_if_needed(buf, "└─ Rewrite the first fixture file.", "Modify Cache a.txt rewrite")
-  expand_row_if_needed(buf, "Modify Cache a.txt rewrite",
-    "   │  ◦ Rewrite the fixture line to NEW.            [a.txt:2 +1 -1]")
-  assert_row_before(buf, "   │  ◦ Rewrite the fixture line to NEW.            [a.txt:2 +1 -1]",
-    "   ├─ Modify Cache a.txt total marker", "detail rows should remain visually connected before the next action")
+  assert_row_before(buf, "Modify Cache a.txt rewrite", "Modify Cache a.txt total marker",
+    "walkthrough change rows should remain visually connected before the next action")
+  assert_true(not buffer_contains(summary_buf, "◦ Second action comment."),
+    "walkthrough summary should not render added sibling annotation title rows")
   trigger_buf_mapping(buf, "ow")
   wait_for(function() return not buffer_contains(buf, "Walkthrough:") end, "graph walkthrough did not toggle off")
-
-  local basename_doc = valid_doc()
-  basename_doc.tasks[1].subtasks[1].changes[1].file = "blue/engine/plugins/physics/src/particle_render.rs"
-  set_walkthrough_doc(basename_doc)
-  summary_buf = start_walkthrough(buf)
-  expand_row_if_needed(buf, "1. Update a.txt through the first task.", "└─ Rewrite the first fixture file.")
-  expand_row_if_needed(buf, "└─ Rewrite the first fixture file.", "Modify Cache a.txt rewrite")
-  expand_row_if_needed(buf, "Modify Cache a.txt rewrite",
-    "◦ Rewrite the fixture line to NEW.            [particle_render.rs:2]")
-  wait_for(function()
-    return buffer_contains(summary_buf, "◦ Rewrite the fixture line to NEW.            [particle_render.rs:2]")
-  end,
-    "comment-location row should render nested paths as basenames")
-  assert_true(not buffer_contains(summary_buf, "blue/engine/plugins/physics/src/particle_render.rs:2"),
-    "comment-location row should not render full walkthrough paths")
-  trigger_buf_mapping(buf, "ow")
-  wait_for(function() return not buffer_contains(buf, "Walkthrough:") end, "basename walkthrough did not toggle off")
 
   local added_span_doc = valid_doc()
   local added_span_changes = added_span_doc.tasks[1].subtasks[1].changes
@@ -1088,188 +1046,21 @@ local function run()
   set_walkthrough_doc(added_span_doc)
   summary_buf = start_walkthrough(buf)
   expand_row_if_needed(buf, "1. Update a.txt through the first task.", "└─ Rewrite the first fixture file.")
-  expand_row_if_needed(buf, "└─ Rewrite the first fixture file.", "Modify Cache a.txt rewrite")
-  local added_span_location = "◦ Store solver buffers on a resource.       [new.txt:2 +1 -0]"
-  local added_span_second_location = "◦ Expose a render-facing buffer snapshot.   [new.txt:2 +1 -0]"
-  wait_for(function() return buffer_contains(summary_buf, added_span_location) end,
-    "comment-location row should count the selected walkthrough line")
-  expand_row_if_needed(buf, "Modify Cache a.txt render snapshot", added_span_second_location)
-  assert_true(buffer_contains(summary_buf, added_span_second_location),
-    "comment-location row should keep aligned labels for repeated selected lines")
-  assert_true(display_col_before(find_line(summary_buf, added_span_location), "[")
-    == display_col_before(find_line(summary_buf, added_span_second_location), "["),
-    "selected-line location rows should align bracketed file labels")
-  local added_span_row = find_row(summary_buf, added_span_location)
+  wait_for(function() return buffer_contains(summary_buf, "Modify Cache a.txt render snapshot") end,
+    "expanding walkthrough subtask should show sibling change rows")
+  assert_true(not buffer_contains(summary_buf, "◦ Store solver buffers on a resource."),
+    "selected-line annotation title should not render in the summary")
+  assert_true(not buffer_contains(summary_buf, "◦ Expose a render-facing buffer snapshot."),
+    "sibling selected-line annotation title should not render in the summary")
+  local added_span_row = find_row(summary_buf, "Modify Cache a.txt rewrite")
   vim.api.nvim_win_set_cursor(vim.fn.bufwinid(summary_buf), { added_span_row, 0 })
-  trigger_buf_mapping(summary_buf, "<CR>")
+  trigger_buf_mapping(summary_buf, ".")
   wait_for(function() return buffer_contains(summary_buf, "line two new.txt") end,
-    "pressing enter on a selected-line walkthrough location should expand the target diff")
+    "pressing dot on a selected-line walkthrough change should expand the target diff")
   assert_true(vim.api.nvim_win_get_cursor(vim.fn.bufwinid(summary_buf))[1] == find_row(summary_buf, "line two new.txt"),
-    "pressing enter on a selected-line walkthrough location should jump to the selected diff row")
+    "pressing dot on a selected-line walkthrough change should jump to the selected diff row")
   trigger_buf_mapping(buf, "ow")
   wait_for(function() return not buffer_contains(buf, "Walkthrough:") end, "added-span walkthrough did not toggle off")
-
-  untracked_files = { "untracked.txt" }
-  local untracked_doc = valid_doc()
-  set_change_annotation(untracked_doc.tasks[1].subtasks[1].changes[1], "untracked.txt", 2,
-    "Store untracked buffer rows.",
-    "The selected line belongs to a new untracked file before its synthetic diff has loaded.")
-  set_walkthrough_doc(untracked_doc)
-  buf = open_status()
-  summary_buf = start_walkthrough(buf)
-  expand_row_if_needed(buf, "1. Update a.txt through the first task.", "└─ Rewrite the first fixture file.")
-  expand_row_if_needed(buf, "└─ Rewrite the first fixture file.", "Modify Cache a.txt rewrite")
-  wait_for(function()
-    return buffer_contains(summary_buf, "◦ Store untracked buffer rows.")
-      and buffer_contains(summary_buf, "[untracked.txt:2 +1 -0]")
-  end,
-    "comment-location row should count the selected line for untracked files without loaded hunks")
-  assert_true(not buffer_contains(summary_buf, "untracked.txt:2 +0 -0"),
-    "untracked walkthrough locations should not collapse to zero stats before diff load")
-  trigger_buf_mapping(buf, "ow")
-  wait_for(function() return not buffer_contains(buf, "Walkthrough:") end,
-    "untracked walkthrough did not toggle off")
-  untracked_files = {}
-
-  untracked_files = { "particle_storage.rs" }
-  local count_alignment_doc = valid_doc()
-  local count_alignment_changes = count_alignment_doc.tasks[1].subtasks[1].changes
-  set_change_annotation(count_alignment_changes[1], "particle_storage.rs", 12,
-    "Store solver buffers outside the system.",
-    "The selected line proves short added counts still align across neighboring rows.")
-  count_alignment_changes[2] = set_change_annotation({
-    action = "Modify",
-    kind = "Struct",
-    role = "Cache",
-    target = "particle storage allocator",
-    note = "allocate compute storage from one capacity",
-  }, "particle_storage.rs", 22, "Allocate compute storage from one capacity.",
-    "The wider added count should stay compact inside the bracketed location label.")
-  count_alignment_changes[3] = set_change_annotation({
-    action = "Modify",
-    kind = "Struct",
-    role = "Cache",
-    target = "particle storage writes",
-    note = "write spawn batches into shared buffers",
-  }, "particle_storage.rs", 88, "Write spawn batches into shared buffers.",
-    "The selected line keeps a compact bracketed location for another row.")
-  count_alignment_changes[4] = set_change_annotation({
-    action = "Modify",
-    kind = "Struct",
-    role = "Cache",
-    target = "particle render buffers",
-    note = "expose renderable particle buffers",
-  }, "particle_storage.rs", 116, "Expose renderable particle buffers.",
-    "The longer line number should not add padding between the plus and minus counts.")
-  set_walkthrough_doc(count_alignment_doc)
-  buf = open_status()
-  summary_buf = start_walkthrough(buf)
-  expand_row_if_needed(buf, "1. Update a.txt through the first task.", "└─ Rewrite the first fixture file.")
-  expand_row_if_needed(buf, "└─ Rewrite the first fixture file.", "Modify Cache a.txt rewrite")
-  local storage_location = "◦ Store solver buffers outside the system.    [particle_storage.rs:12 +1 -0]"
-  local allocate_location = "◦ Allocate compute storage from one capacity. [particle_storage.rs:22 +1 -0]"
-  local write_location = "◦ Write spawn batches into shared buffers.    [particle_storage.rs:88 +1 -0]"
-  local expose_location = "◦ Expose renderable particle buffers.         [particle_storage.rs:116 +1 -0]"
-  wait_for(function() return buffer_contains(summary_buf, storage_location) end,
-    "comment-location row should keep short added counts compact before the removed count")
-  expand_row_if_needed(buf, "Modify Cache particle storage allocator", allocate_location)
-  assert_true(buffer_contains(summary_buf, allocate_location),
-    "comment-location row should keep repeated single-line counts compact")
-  expand_row_if_needed(buf, "Modify Cache particle storage writes", write_location)
-  assert_true(buffer_contains(summary_buf, write_location),
-    "comment-location row should keep another single-line count compact")
-  expand_row_if_needed(buf, "Modify Cache particle render buffers", expose_location)
-  assert_true(buffer_contains(summary_buf, expose_location),
-    "comment-location row should not pad longer file line labels")
-  trigger_buf_mapping(buf, "ow")
-  wait_for(function() return not buffer_contains(buf, "Walkthrough:") end,
-    "count-alignment walkthrough did not toggle off")
-  untracked_files = {}
-
-  local padded_location_doc = valid_doc()
-  local padded_location_changes = padded_location_doc.tasks[1].subtasks[1].changes
-  set_change_annotation(padded_location_changes[1], "blue/engine/plugins/physics/src/particle_render.rs", 3,
-    "Define particle render modes.",
-    "Render mode definitions give spawn data an explicit choice before the render handoff.")
-  padded_location_changes[2] = set_change_annotation({
-    action = "Modify",
-    kind = "Field",
-    target = "particle default mode",
-    note = "set triangle billboard as the default mode",
-  }, "blue/engine/plugins/physics/src/particle_render.rs", 19,
-    "Set triangle billboard as the default mode.",
-    "Existing particle spawns keep their old visual behavior unless they opt into model rendering.")
-  padded_location_changes[3] = set_change_annotation({
-    action = "Add",
-    kind = "Field",
-    target = "ParticleSpawn render mode",
-    note = "store render mode on ParticleSpawn",
-  }, "blue/engine/plugins/physics/src/particle_spawn.rs", 18, "Store render mode on ParticleSpawn.",
-    "Spawn data now carries the selected rendering path beside the simulation inputs.")
-  padded_location_changes[4] = set_change_annotation({
-    action = "Remove",
-    kind = "Function",
-    target = "particle billboard renderer",
-    note = "remove direct billboard rendering from simulation",
-  }, "blue/engine/plugins/physics/src/particle_system.rs", 120,
-    "Remove direct billboard rendering from simulation.",
-    "Billboard rendering moves out of the simulation loop so compute ownership stays separate from visuals.")
-  set_walkthrough_doc(padded_location_doc)
-  summary_buf = start_walkthrough(buf)
-  expand_row_if_needed(buf, "1. Update a.txt through the first task.", "└─ Rewrite the first fixture file.")
-  expand_row_if_needed(buf, "└─ Rewrite the first fixture file.", "Modify Cache a.txt rewrite")
-  local define_location = "◦ Define particle render modes.                      [particle_render.rs:3]"
-  local default_location = "◦ Set triangle billboard as the default mode.        [particle_render.rs:19]"
-  local store_location = "◦ Store render mode on ParticleSpawn.                [particle_spawn.rs:18]"
-  local remove_location = "◦ Remove direct billboard rendering from simulation. [particle_system.rs:120]"
-  assert_true(buffer_contains(summary_buf, define_location),
-    "comment-location row should render the title before the bracketed location")
-  expand_row_if_needed(buf, "Modify field particle default mode", default_location)
-  assert_true(buffer_contains(summary_buf, default_location),
-    "comment-location row should not pad one-digit and two-digit line numbers")
-  expand_row_if_needed(buf, "Add field ParticleSpawn render mode", store_location)
-  assert_true(buffer_contains(summary_buf, store_location),
-    "comment-location row should not pad shorter filenames")
-  expand_row_if_needed(buf, "Remove fn particle billboard renderer", remove_location)
-  assert_true(buffer_contains(summary_buf, remove_location),
-    "comment-location row should keep the longest label bracketed after the title")
-  local bracket_col = display_col_before(find_line(summary_buf, define_location), "[")
-  assert_true(bracket_col == display_col_before(find_line(summary_buf, default_location), "[")
-    and bracket_col == display_col_before(find_line(summary_buf, store_location), "[")
-    and bracket_col == display_col_before(find_line(summary_buf, remove_location), "["),
-    "comment-location rows should align bracketed file labels across the item")
-  trigger_buf_mapping(buf, "ow")
-  wait_for(function() return not buffer_contains(buf, "Walkthrough:") end, "padded-location walkthrough did not toggle off")
-
-  local global_location_doc = valid_doc()
-  set_change_annotation(global_location_doc.tasks[1].subtasks[1].changes[1], "a.txt", 2,
-    "Short local step.",
-    "The short title should still align with the longest walkthrough location in the summary.")
-  global_location_doc.tasks[1].subtasks[1].changes[2] = set_change_annotation({
-    action = "Add",
-    kind = "Function",
-    target = "b.txt rewrite",
-    note = "repeat the rewrite with a longer location row",
-  }, "b.txt", 2, "Longer walkthrough location title across tasks.",
-    "The long title in another action should set the shared location column for every step row.")
-  set_change_annotation(global_location_doc.tasks[2].subtasks[1].changes[1], "b.txt", 2,
-    "Mirror the rewrite in the second fixture.",
-    "The second task remains part of the document but is not needed for this fold regression.")
-  set_walkthrough_doc(global_location_doc)
-  buf = open_status()
-  captured_notifications = {}
-  summary_buf = start_walkthrough(buf)
-  expand_row_if_needed(buf, "1. Update a.txt through the first task.", "└─ Rewrite the first fixture file.")
-  expand_row_if_needed(buf, "└─ Rewrite the first fixture file.", "Modify Cache a.txt rewrite")
-  expand_row_if_needed(buf, "Modify Cache a.txt rewrite", "◦ Short local step.")
-  expand_row_if_needed(buf, "Add fn b.txt rewrite", "◦ Longer walkthrough location title across tasks.")
-  local short_global_location = find_line(summary_buf, "◦ Short local step.")
-  local long_global_location = find_line(summary_buf, "◦ Longer walkthrough location title across tasks.")
-  assert_true(display_col_before(short_global_location, "[") == display_col_before(long_global_location, "["),
-    "comment-location rows should align bracketed file labels across the whole walkthrough")
-  trigger_buf_mapping(buf, "ow")
-  wait_for(function() return not buffer_contains(buf, "Walkthrough:") end,
-    "global-location walkthrough did not toggle off")
 
   local reversed_doc = valid_doc()
   reversed_doc.tasks = { reversed_doc.tasks[2], reversed_doc.tasks[1] }

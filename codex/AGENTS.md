@@ -6,30 +6,38 @@
 - Do *NOT* make code changes until asked. When asked a question, answer it — don't automatically start writing code. Often the user will want to bounce and iterate on an idea before moving to coding.
 - Never use semicolons. Split sentences instead.
 
+# Semantic Local Search
+- Prefer the `sem` MCP tools for local code understanding before raw file reads, broad `rg`, or git diff commands.
+- Prefer MCP `sem_context` over shell file reads, file-prefix reads, editor buffer dumps, broad `rg`, and other raw file-content methods when you need to understand local code.
+- Use MCP `sem_entities` to map files, directories, sibling symbols, parent constructs, and stable annotation targets.
+- Use MCP `sem_context` as the default way to read code context for a changed entity or selected symbol. It should replace raw file-content reads unless it omits a specific import, module-level glue, schema detail, generated output, or exact current line anchor.
+- Use MCP `sem_impact` when a change may affect dependencies, dependents, transitive callers, or tests.
+- Use MCP `sem_blame` and MCP `sem_log` when ownership, churn, or entity history matters to the answer or review.
+- Read raw file snippets only after `sem_entities` or `sem_context` selects the file, entity, or line anchor that needs verification.
+- Use `rg` only after semantic lookup leaves a concrete gap. Keep the search bounded to files, symbols, or paths identified by `sem`.
+- For local diffs, use MCP `sem_diff` as the tracked change inventory. Build tracked review sets from `sem_diff.changes[].filePath` and `sem_diff.changes[].oldFilePath`, not from `git diff --name-only` or `git status`.
+- Use raw git diffs only for exact patch details, whitespace, and line-level verification after `sem_diff` has selected the relevant files.
+
+# Remote Search
+- For researching or finding new Rust crates, use `docs-mcp`.
+- For local diffs, use MCP `sem_diff` when available to identify entity-level changes before reviewing raw hunks. Use raw git diffs afterward for exact patch details, whitespace, and line-level verification, not for tracked-file discovery.
+- When you need to view the source code:
+  - For Rust or Typescript, first check locally if it already exist.
+  - Otherwise, when you need to view source code, use `github` mcp.
+- Also search issues and PR description with the `github` mcp to augment understanding.
+- For CLI tools or APIs, prefer searching the source code to get a deep understanding.
+
 # Subagent Research Workflow
-- Use the built-in `explorer` agent for local codebase exploration. Use `remote-code-explorer` for remote source, external library, GitHub, docs, examples, issues, or PR research when that custom agent is available.
-- For local codebase exploration, use the `sem` MCP tools first when they are available. Prefer `sem_entities` for file and directory maps, `sem_impact` for dependency and affected-test checks, `sem_context` for focused code packets, and `sem_blame` or `sem_log` when ownership or history matters.
+- Use `local-code-explorer` for local codebase exploration that needs semantic maps, entity context, impact checks, local diff review, or repository maps. Use `remote-code-explorer` for remote source, external library, GitHub, docs, examples, issues, or PR research when that custom agent is available.
 - Do not spawn explore agents for tiny lookups, single-file reads, tightly coupled debugging, direct implementation work, or the next critical-path step when the main agent is blocked on the answer. Do that work locally.
-- Before delegating, decide the immediate local task and keep working on non-overlapping work while subagents run. Do not duplicate a subagent's assignment in the main thread.
 - Make each delegated exploration task concrete and bounded. Include the target, the question to answer, desired thoroughness (`quick`, `medium`, or `thorough`), and the expected output format.
 - Ask explore agents to return compact evidence-backed findings with exact file paths, symbols, URLs, and gaps. The main agent owns synthesis, decisions, edits, and verification.
 
 # Walkthrough Agent Workflow
 - Before verification and after completing a change that modifies 6 or more files, spawn the `walkthrough-writer` to generate a summary of the change while you finish verification.
 - Spawn `walkthrough-writer` as a standalone task with its own explicit prompt. Do not use a full-history fork when selecting this custom agent role.
-- Provide the agent a compact recap of the completed task, the repository root, changed-file context, and any plan file associated with the change.
-- Tell the `walkthrough-writer` to use `sem_diff` or `sem diff` first for entity-level change context. Use raw git diffs afterward only for exact patch details, line ranges, whitespace, and validation.
-- The `walkthrough-writer` agent owns gathering filtered semantic change context, reading relevant raw diffs where needed, writing `.walkthrough.json`, validating it, and fixing validation failures. The main agent should not duplicate that walkthrough work unless the subagent fails.
+- Provide the agent a compact recap of the completed task, the repository root, and any plan file associated with the change.
 - Wait for the `walkthrough-writer` result before the final response, then report whether `.walkthrough.json` was written and validated.
-
-# Searching
-- For researching or finding new Rust crates, use `docs-mcp`.
-- For local diffs, use `sem_diff` or `sem diff` when available to identify entity-level changes before reviewing raw hunks. Use raw git diffs afterward for exact patch details, whitespace, and line-level verification.
-- When you need to view the source code:
-  - For Rust or Typescript, first check locally if it already exist.
-  - Otherwise, when you need to view source code, use `github` mcp.
-- Also search issues and PR description with the `github` mcp to augment understanding.
-- For CLI tools or APIs, prefer searching the source code to get a deep understanding.
 
 # Programming
 - **Engineering over hacking.** When you spot a design issue, stop and refactor — fix the real problem even if it's substantial. Duplicated code should be shared. Minimize accumulated tech debt.

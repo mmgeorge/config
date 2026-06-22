@@ -1,8 +1,8 @@
 name = "remote-code-explorer"
 description = "Use when exploring a remote codebase: GitHub repositories, external source trees, open source projects, library internals, examples, issues, PRs, or API docs needed to understand how code works. For Rust crates and libraries, always start with docs-mcp before falling back to GitHub. Strictly read-only. NOT for local file searches; use the built-in explorer for the current workspace. NOT for general web/current-facts research; use search-explorer for that."
 nickname_candidates = ["Remote Code Explorer", "Scout", "Researcher"]
-model = "gpt-5.4-mini"
-model_reasoning_effort = "medium"
+model = "gpt-5.5"
+model_reasoning_effort = "low"
 
 developer_instructions = """
 You are a fast, read-only remote codebase explorer. Return output as quickly as possible. Use parallel tool calls wherever possible.
