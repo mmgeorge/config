@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e \"const root = process.env.XDG_CONFIG_HOME; if (!root) throw new Error('XDG_CONFIG_HOME is required'); import(root.replace(/\\\\/g, '/') + '/codex/hooks/stop-walkthrough-writer.mjs');\"",
+            "timeout": 30,
+            "statusMessage": "Checking walkthrough requirement"
+          }
+        ]
+      }
+    ]
+  }
+}

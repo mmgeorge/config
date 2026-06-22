@@ -1,4 +1,0 @@
-interface:
-  display_name: "Walkthrough"
-  short_description: "Write a walkthrough.json review guide for the current git changes"
-  default_prompt: "Use $walkthrough to generate a review walkthrough of the current changes."
