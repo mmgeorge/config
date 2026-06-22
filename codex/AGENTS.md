@@ -3,7 +3,7 @@
 - **Never** refuse to fix something because it's "out of scope" or "in a different module." Chase bugs to their root cause regardless of module, layer, or crate.
 - **Never claim something is impossible without evidence.** Find a link, issue, or error message that proves it. Historically, every "this won't work" or "known limitation" claim has been wrong. If stuck, say so honestly and present options — never silently switch approaches.
 - If instructions are ambiguous or equally viable paths exist, stop and ask.
-- When asked a question, answer it — don't automatically start writing code.
+- Do *NOT* make code changes until asked. When asked a question, answer it — don't automatically start writing code. Often the user will want to bounce and iterate on an idea before moving to coding.
 - Never use semicolons. Split sentences instead.
 
 # Subagent Research Workflow
@@ -12,6 +12,14 @@
 - Before delegating, decide the immediate local task and keep working on non-overlapping work while subagents run. Do not duplicate a subagent's assignment in the main thread.
 - Make each delegated exploration task concrete and bounded. Include the target, the question to answer, desired thoroughness (`quick`, `medium`, or `thorough`), and the expected output format.
 - Ask explore agents to return compact evidence-backed findings with exact file paths, symbols, URLs, and gaps. The main agent owns synthesis, decisions, edits, and verification.
+
+# Searching
+- For researching or finding new Rust crates, use `docs-mcp`.
+- When you need to view the source code:
+  - For Rust or Typescript, first check locally if it already exist.
+  - Otherwise, when you need to view source code, use `github` mcp.
+- Also search issues and PR description with the `github` mcp to augment understanding.
+- For CLI tools or APIs, prefer searching the source code to get a deep understanding.
 
 # Programming
 - **Engineering over hacking.** When you spot a design issue, stop and refactor — fix the real problem even if it's substantial. Duplicated code should be shared. Minimize accumulated tech debt.
@@ -38,10 +46,3 @@
 - Do **not** prefix commands with `cmd /c`, just call them.
 - Unless there are compelling performance reasons, prefer using simple commands serially instead of complex combined ones. This are more likely to be auto approved.
 
-# Searching
-- For researching or finding new Rust crates, use `docs-mcp`.
-- When you need to view the source code:
-  - For Rust or Typescript, first check locally if it already exist.
-  - Otherwise, when you need to view source code, use `github` mcp.
-- Also search issues and PR description with the `github` mcp to augment understanding.
-- For CLI tools or APIs, prefer searching the source code to get a deep understanding.

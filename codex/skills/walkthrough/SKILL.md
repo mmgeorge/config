@@ -60,7 +60,7 @@ tasks[]:
       justification?: exceptional local rationale
       changes[]:
         action: Add | Modify | Remove
-        kind: Class | Struct | Enum | Trait | Interface | Test | App | Config | Function | Method | Constant | Field
+        kind: Class | Struct | Enum | Trait | Interface | Test | Config | Function | Method | Constant | Field
         role?: optional code-proven role label, such as Cache or Adapter
         target: concrete code construct, symbol, or story node
         note: imperative fragment, 50 chars or less

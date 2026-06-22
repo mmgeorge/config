@@ -1532,22 +1532,6 @@ local function run()
   wait_for(function() return saw_notification_containing("flow 1: missing \"text\"") end,
     "invalid flow node notification absent")
 
-  local artifact_type_doc = valid_doc()
-  local artifact_changes = artifact_type_doc.tasks[1].groups[1].subtasks[1].changes
-  artifact_changes[1].kind = "App"
-  artifact_changes[1].role = nil
-  artifact_changes[1].target = "app artifact"
-  artifact_changes[1].note = "configure the app scenario"
-  set_walkthrough_doc(artifact_type_doc)
-  summary_buf = start_walkthrough(buf)
-  expand_row_if_needed(buf, "1. Update a.txt through the first task.", "file Fixture edits")
-  expand_row_if_needed(buf, "file Fixture edits", "└─ Rewrite the first fixture file.")
-  wait_for(function()
-    return buffer_contains(summary_buf, "Modify app app artifact")
-  end, "App change kind should be accepted and rendered")
-  trigger_buf_mapping(buf, "ow")
-  wait_for(function() return not buffer_contains(buf, "Walkthrough:") end, "artifact-type walkthrough did not toggle off")
-
   local invalid_group_type = valid_doc()
   invalid_group_type.tasks[1].groups[1].type = "Method"
   set_walkthrough_doc(invalid_group_type)
@@ -1563,6 +1547,14 @@ local function run()
   trigger_buf_mapping(buf, "ow")
   wait_for(function() return saw_notification_containing("change 1: missing or invalid \"kind\"") end,
     "invalid change kind notification absent")
+
+  local invalid_app_change_kind = valid_doc()
+  invalid_app_change_kind.tasks[1].groups[1].subtasks[1].changes[1].kind = "App"
+  set_walkthrough_doc(invalid_app_change_kind)
+  captured_notifications = {}
+  trigger_buf_mapping(buf, "ow")
+  wait_for(function() return saw_notification_containing("change 1: missing or invalid \"kind\"") end,
+    "App change kind rejection notification absent")
 
   local invalid_change_role = valid_doc()
   invalid_change_role.tasks[1].groups[1].subtasks[1].changes[1].role = ""

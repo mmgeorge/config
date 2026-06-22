@@ -292,7 +292,6 @@ local valid_item_types = {
   Method = true,
   Constant = true,
   Test = true,
-  App = true,
   Config = true,
 }
 local action_highlights = {
