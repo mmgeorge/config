@@ -94,9 +94,9 @@ tasks[]:
       role?: optional code-proven role label, such as Cache or Adapter
       target: concrete code construct, symbol, or story node
       note: concise imperative fragment
-      file?: repo-relative path with forward slashes, required when annotation is present
-      line?: current file line, 1-based, required when annotation is present
-      annotation?: optional reviewer comment for non-summary-only changes
+      file: repo-relative path with forward slashes, required for every concrete change
+      line: current file line, 1-based, required for every concrete change
+      annotation: reviewer comment for the concrete change
         title: local code action sentence
         comment: mini justification in problem/solution form
 ```
@@ -152,18 +152,18 @@ tasks[]:
 
 - Changes are concrete changed constructs or artifacts.
 - Prefer 1-3 changes per subtask.
+- Every concrete code change must include `file`, `line`, and `annotation`.
+- Omit `file`, `line`, and `annotation` only for rare non-code summary rows that cannot be anchored to a current file. Avoid summary rows when a concrete changed construct exists.
 - Change `action` must be one of `Add`, `Modify`, or `Remove`.
 - Use `role` only for a narrower role proven by the code: an implemented trait or interface, base class, framework registration, or strong repo convention. If no code evidence proves the role, omit it so the renderer uses `kind`.
 - `note` is a short imperative fragment that reads after `to`, such as `emit draft changes before save`.
 
 ### Annotations
 
-- Annotate only the highest-value review anchors. Choose changes and lines that explain why the change matters, clarify a new boundary, reveal ownership, or prevent a likely reviewer misread.
-- Use no more than 1 annotated change per file.
-- Add `file`, `line`, and `annotation` together on the change. Omit all three for summary-only changes.
+- Add `file`, `line`, and `annotation` to every concrete change.
+- Keep annotations concise and useful. Explain why the change matters, clarify the new boundary, reveal ownership, or prevent a likely reviewer misread.
 - `file` and `line` identify the single current file line where DiffReview should place the comment block. Prefer the first changed line for the relevant construct. For deletion-only changes, use the closest surviving line.
 - Use `sem_diff.startLine` / `sem_diff.endLine` and `sem_entities` locations as the default annotation lines. Use `rg` only when sem does not provide a precise enough current line.
-- Skip `annotation` for mechanical rewrites, repeated call sites, generated output, formatting-only edits, and tests that merely mirror the main behavior unless they are the clearest place to explain the review concern.
 - Annotation `title` is required by convention. Use concrete local action verbs such as `Define`, `Set`, `Store`, `Remove`, `Configure`, `Bind`, `Load`, `Register`, `Guard`, `Validate`, `Split`, `Merge`, `Extract`, `Inline`, `Read`, `Write`, `Allocate`, or `Clear`. Avoid `Represent`, `Carry`, `Handle`, `Support`, `Exercise`, `Improve`, or `Update`.
 - Use `Store` for data kept on a struct, resource, cache, or state object. Use `Set` for assigning a runtime value, default, flag, option, or configuration.
 - Annotation `comment` is a mini justification: state the problem, limitation, risk, or review pressure first, then the solution and why it addresses the problem. Keep it concise when clarity allows.
