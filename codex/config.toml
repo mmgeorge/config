@@ -118,6 +118,21 @@ default_tools_approval_mode = "approve"
 url = "https://developers.openai.com/mcp"
 default_tools_approval_mode = "approve"
 
+[mcp_servers.terminal]
+command = "terminal-mcp"
+
+[mcp_servers.terminal.tools.takeScreenshot]
+approval_mode = "approve"
+
+[mcp_servers.terminal.tools.getContent]
+approval_mode = "approve"
+
+[mcp_servers.terminal.tools.sendKey]
+approval_mode = "approve"
+
+[mcp_servers.terminal.tools.type]
+approval_mode = "approve"
+
 [windows]
 sandbox = "elevated"
 

@@ -2097,11 +2097,11 @@ function M._hide_line_numbers(win)
 end
 
 ---@param win integer?
----@param state? table
-function M._apply_status_window_options(win, state)
+---@param _state? table
+function M._apply_status_window_options(win, _state)
   if not (win and vim.api.nvim_win_is_valid(win)) then return end
   M._hide_line_numbers(win)
-  local soft_wrap = state ~= nil and (state.view_kind == "review" or state.view_kind == "pr")
+  local soft_wrap = _state ~= nil and _state.view_kind == "review"
   vim.wo[win].wrap = soft_wrap
   vim.wo[win].linebreak = soft_wrap
   vim.wo[win].breakindent = soft_wrap
@@ -4062,12 +4062,13 @@ end
 ---@param filename? string
 ---@param context_callback_key? fun(hunk_line: number): string
 ---@param on_context_update? fun()
----@param opts? { context_line: integer?, boundary_context: boolean?, suppress_start_boundary: boolean?, suppress_end_boundary: boolean?, suppress_start_boundary_keys?: table<string, boolean>, suppress_end_boundary_keys?: table<string, boolean>, syntax_source?: "file"|"diff", syntax_diff_text?: string, compact_replacements?: boolean }
+---@param opts? { context_line: integer?, boundary_context: boolean?, suppress_start_boundary: boolean?, suppress_end_boundary: boolean?, suppress_start_boundary_keys?: table<string, boolean>, suppress_end_boundary_keys?: table<string, boolean>, syntax_source?: "file"|"diff", syntax_diff_text?: string, compact_replacements?: boolean, debug_context?: table }
 local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_callback_key, on_context_update, opts)
   opts = opts or {}
 
   local diff = parse_unified_diff(diff_text)
   local syntax_diff_text = opts.syntax_diff_text or diff_text
+  local debug_context = opts.debug_context
   local ret = {} ---@type table[]
   local hunk_idx = 0
   local old_syntax = nil
@@ -4078,13 +4079,29 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
   local context_pending = false
   local old_syntax_row = 0
   local new_syntax_row = 0
+  local source_matches_file = false
   if filename then
     local syntax_callback_key = context_callback_key and context_callback_key(0) or ("diff-row:" .. filename .. ":0")
     local old_pending = false
     local old_file_pending = false
     local new_pending = false
     local file_pending = false
-    if M._diff_uses_file_syntax(hunk_staged, opts) and M._diff_new_side_matches_file(filename, syntax_diff_text) then
+    local uses_file_syntax = M._diff_uses_file_syntax(hunk_staged, opts)
+    local new_side_matches_file = M._diff_new_side_matches_file(filename, syntax_diff_text)
+    source_matches_file = new_side_matches_file
+    if debug_context then
+      M._gitstatus_debug.event("build_fancy_diff_rows.syntax", {
+        context = debug_context,
+        filename = filename,
+        syntax_source = opts.syntax_source,
+        uses_file_syntax = uses_file_syntax,
+        new_side_matches_file = new_side_matches_file,
+        source_context_enabled = source_matches_file,
+        diff_len = #(diff_text or ""),
+        syntax_diff_len = #(syntax_diff_text or ""),
+      })
+    end
+    if uses_file_syntax and new_side_matches_file then
       old_file_syntax, old_file_pending = M._cached_old_file_syntax(filename, syntax_diff_text, syntax_callback_key .. ":old-file-syntax", on_context_update)
       if not old_file_syntax and not old_file_pending then
         old_syntax, old_pending = cached_diff_syntax(filename, diff_text, "old", syntax_callback_key .. ":old-diff-syntax", on_context_update)
@@ -4100,11 +4117,11 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
     syntax_pending = old_pending or old_file_pending or new_pending or file_pending
   end
 
-  local source_lines = filename and M._file_source_lines(filename) or nil
+  local source_lines = source_matches_file and filename and M._file_source_lines(filename) or nil
   local plans = {} ---@type DiffReviewHunkRenderPlan[]
 
   local function context_for_line(block, line)
-    if not (filename and line) then return nil end
+    if not (source_matches_file and filename and line) then return nil end
     local callback_key = context_callback_key and context_callback_key(line)
       or ("diff-row:" .. (filename or block.file) .. ":" .. line)
     local context = cached_hunk_context(filename, line, callback_key, on_context_update)
@@ -4145,6 +4162,9 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
       hunk_idx = hunk_idx + 1
       hunk = parse_hunk_body(hunk)
       local include_render_line = M._hunk_render_line_filter(hunk)
+      if type(source_lines) ~= "table" then
+        include_render_line = function() return true end
+      end
       local line_by_position = M._hunk_current_line_by_position(hunk)
       local occupied_lines = M._hunk_changed_current_line_set(hunk, line_by_position)
       local render_items = nil
@@ -4160,6 +4180,12 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
       local regions = M._hunk_change_regions(render_items, line_by_position, function(line)
         return context_for_line(block, line)
       end)
+      if type(source_lines) ~= "table" then
+        for _, region in ipairs(regions) do
+          region.first_item = 1
+          region.last_item = #render_items
+        end
+      end
       local syntax_by_item = {}
       for item_index, item in ipairs(render_items) do
         local parsed_line = M._hunk_render_item_line(item)
@@ -8745,11 +8771,24 @@ local status_cursor_target
 local status_operations_pending
 local status_request_reconcile
 
+---@param entry_kind? string
+---@return "file"|"diff"
+function M._status_syntax_source_for_entry_kind(entry_kind)
+  if entry_kind == nil
+    or entry_kind == "file"
+    or entry_kind == "hunk"
+    or entry_kind == "pr_file"
+    or entry_kind == "pr_hunk" then
+    return "file"
+  end
+  return "diff"
+end
+
 ---@param file DiffReviewStatusFile
 ---@param hunk DiffReviewHunk
 ---@param previous_hunk? DiffReviewHunk
 ---@param next_hunk? DiffReviewHunk
----@param entry_kind? "hunk"|"commit_hunk"|"pr_hunk"
+---@param entry_kind? "hunk"|"commit_hunk"|"pr_hunk"|"pr_review_hunk"
 ---@param hunk_key_override? string
 local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_kind, hunk_key_override)
   local hunk_key = hunk_key_override or status_hunk_key(file.section_name, file.filename, hunk.diff)
@@ -8760,6 +8799,12 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_ki
   local context_line = M._status_hunk_context_line(hunk) or hunk.pos
   local previous_context_line = previous_hunk and M._status_hunk_context_line(previous_hunk) or nil
   local next_context_line = next_hunk and M._status_hunk_context_line(next_hunk) or nil
+  local syntax_source = M._status_syntax_source_for_entry_kind(entry_kind)
+  local syntax_diff_text = nil
+  if syntax_source == "file" then
+    syntax_diff_text = M._status_file_syntax_diff_text(file)
+  end
+  local semantic_context_enabled = syntax_diff_text ~= nil and M._diff_new_side_matches_file(file.filename, syntax_diff_text)
   local function rerender_with_context()
     M._status = M._status or {}
     if M._status.context_rerender_pending then return end
@@ -8776,24 +8821,29 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_ki
       end
     end)
   end
-  local current_context = cached_hunk_context(
-    file.filename,
-    context_line,
-    "status-neighbor:" .. hunk_key .. ":current",
-    rerender_with_context
-  )
-  local previous_context = previous_hunk and cached_hunk_context(
-    file.filename,
-    previous_context_line or previous_hunk.pos,
-    "status-neighbor:" .. hunk_key .. ":previous",
-    rerender_with_context
-  ) or nil
-  local next_context = next_hunk and cached_hunk_context(
-    file.filename,
-    next_context_line or next_hunk.pos,
-    "status-neighbor:" .. hunk_key .. ":next",
-    rerender_with_context
-  ) or nil
+  local current_context = nil
+  local previous_context = nil
+  local next_context = nil
+  if semantic_context_enabled then
+    current_context = cached_hunk_context(
+      file.filename,
+      context_line,
+      "status-neighbor:" .. hunk_key .. ":current",
+      rerender_with_context
+    )
+    previous_context = previous_hunk and cached_hunk_context(
+      file.filename,
+      previous_context_line or previous_hunk.pos,
+      "status-neighbor:" .. hunk_key .. ":previous",
+      rerender_with_context
+    ) or nil
+    next_context = next_hunk and cached_hunk_context(
+      file.filename,
+      next_context_line or next_hunk.pos,
+      "status-neighbor:" .. hunk_key .. ":next",
+      rerender_with_context
+    ) or nil
+  end
   local suppress_start_boundary = same_hunk_context_scope(previous_context, current_context)
   local suppress_end_boundary = same_hunk_context_scope(current_context, next_context)
   local current_ancestor_key = M._hunk_context_ancestor_key(current_context)
@@ -8801,11 +8851,6 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_ki
   local suppress_ancestor_end = current_ancestor_key ~= nil and M._same_hunk_ancestor_scope(current_context, next_context)
   local suppress_start_boundary_keys = suppress_ancestor_start and { [current_ancestor_key] = true } or nil
   local suppress_end_boundary_keys = suppress_ancestor_end and { [current_ancestor_key] = true } or nil
-  local syntax_source = (entry_kind == nil or entry_kind == "hunk") and "file" or "diff"
-  local syntax_diff_text = nil
-  if syntax_source == "file" then
-    syntax_diff_text = M._status_file_syntax_diff_text(file)
-  end
   rows_key = ("%s:%s:%s:%s:%s:%s:%s"):format(
     hunk_key,
     hunk.staged and "staged" or "unstaged",
@@ -8815,7 +8860,56 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_ki
     suppress_ancestor_end and "no-ancestor-end" or "ancestor-end",
     syntax_source .. ":compact:" .. vim.fn.sha256(syntax_diff_text or hunk.diff or "")
   )
+  local debug_context = nil
+  if M._gitstatus_debug.enabled() then
+    local view_kind = M._status and M._status.view_kind or nil
+    if view_kind == "pr" or entry_kind == "pr_hunk" or entry_kind == "pr_review_hunk" then
+      local source_lines = M._file_source_lines(file.filename)
+      local new_side_matches_file = nil
+      if syntax_diff_text then
+        new_side_matches_file = semantic_context_enabled
+      end
+      debug_context = {
+        view_kind = view_kind,
+        entry_kind = entry_kind or "hunk",
+        buf = M._status and M._status.buf or nil,
+        file = file.filename,
+        relpath = file.relpath,
+        section = file.section_name,
+        hunk_key = hunk_key,
+        rows_key = rows_key,
+        hunk_pos = hunk.pos,
+        hunk_added = hunk.added,
+        hunk_removed = hunk.removed,
+        hunk_staged = hunk.staged,
+        hunk_len = #(hunk.diff or ""),
+        syntax_source = syntax_source,
+        syntax_diff_len = syntax_diff_text and #syntax_diff_text or nil,
+        new_side_matches_file = new_side_matches_file,
+        semantic_context_enabled = semantic_context_enabled,
+        source_line_count = type(source_lines) == "table" and #source_lines or nil,
+        source_readable = vim.fn.filereadable(file.filename) == 1,
+        context_line = context_line,
+        previous_context_line = previous_context_line,
+        next_context_line = next_context_line,
+        suppress_start_boundary = suppress_start_boundary,
+        suppress_end_boundary = suppress_end_boundary,
+        suppress_ancestor_start = suppress_ancestor_start,
+        suppress_ancestor_end = suppress_ancestor_end,
+      }
+      M._gitstatus_debug.event("status_render_hunk.before", debug_context)
+    end
+  end
   local rows = M._status.fancy_rows[rows_key]
+  if rows and debug_context then
+    M._gitstatus_debug.event("status_render_hunk.cache_hit", {
+      context = debug_context,
+      row_count = #rows,
+      syntax_pending = rows.diff_review_syntax_pending,
+      context_pending = rows.diff_review_context_pending,
+      preview = M._gitstatus_debug.row_preview(rows, 8),
+    })
+  end
   if not rows then
     local ok, built_rows = pcall(
       build_fancy_diff_rows,
@@ -8836,8 +8930,20 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_ki
         syntax_source = syntax_source,
         syntax_diff_text = syntax_diff_text,
         compact_replacements = true,
+        debug_context = debug_context,
       }
     )
+    if debug_context then
+      M._gitstatus_debug.event("status_render_hunk.built", {
+        context = debug_context,
+        ok = ok,
+        error = ok and nil or tostring(built_rows),
+        row_count = ok and type(built_rows) == "table" and #built_rows or nil,
+        syntax_pending = ok and type(built_rows) == "table" and built_rows.diff_review_syntax_pending or nil,
+        context_pending = ok and type(built_rows) == "table" and built_rows.diff_review_context_pending or nil,
+        preview = ok and M._gitstatus_debug.row_preview(built_rows, 8) or nil,
+      })
+    end
     if ok then
       rows = built_rows
       if not rows.diff_review_syntax_pending and not rows.diff_review_context_pending then
@@ -8846,7 +8952,15 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_ki
     end
   end
   if not rows then
-    local ts_context = current_context or cached_hunk_context(file.filename, context_line, "status-fallback:" .. hunk_key, rerender_with_context)
+    if debug_context then
+      M._gitstatus_debug.event("status_render_hunk.fallback", {
+        context = debug_context,
+      })
+    end
+    local ts_context = current_context
+    if semantic_context_enabled and not ts_context then
+      ts_context = cached_hunk_context(file.filename, context_line, "status-fallback:" .. hunk_key, rerender_with_context)
+    end
     local header = ("%s@@ +%d -%d"):format(string.rep(" ", status_hunk_indent), hunk.added or 0, hunk.removed or 0)
     local visible_hunk_lines = nil
     local node_start = nil
@@ -9381,11 +9495,11 @@ end
 local function status_prewarm_entry_syntax(entry)
   if not entry then return end
   if M._status_entry_is_file_like(entry) and entry.file then
-    local syntax_source = entry.kind == "file" and "file" or "diff"
+    local syntax_source = M._status_syntax_source_for_entry_kind(entry.kind)
     prewarm_file_diff_syntax(entry.file, "status-cursor-prewarm:" .. (entry.id or entry.file.filename), nil, { syntax_source = syntax_source })
   elseif M._status_entry_is_hunk_like(entry) and entry.file and entry.hunk then
     local callback_key = "status-cursor-prewarm:" .. (entry.id or entry.file.filename)
-    local syntax_source = entry.kind == "hunk" and "file" or "diff"
+    local syntax_source = M._status_syntax_source_for_entry_kind(entry.kind)
     local syntax_diff_text = nil
     if syntax_source == "file" then
       syntax_diff_text = M._status_file_syntax_diff_text(entry.file)
@@ -9738,6 +9852,63 @@ function M._gitstatus_debug.text(value)
   return tostring(value or ""):gsub("\r", "\\r"):gsub("\n", "\\n")
 end
 
+---@param event string
+---@param payload? table
+function M._gitstatus_debug.event(event, payload)
+  if not M._gitstatus_debug.enabled() then return end
+  local line = ("GitStatus debug event time=%s event=%s payload=%s"):format(
+    os.date("%Y-%m-%d %H:%M:%S"),
+    tostring(event),
+    M._gitstatus_debug.one_line(payload or {})
+  )
+  local ok, err = pcall(vim.fn.writefile, { line }, M._gitstatus_debug_log_path(), "a")
+  if not ok then
+    notify_debug("GitStatus debug event failed: " .. tostring(err), vim.log.levels.WARN, { title = "GitStatus" })
+  end
+end
+
+---@param row table
+---@return string
+function M._gitstatus_debug.row_text(row)
+  if type(row) ~= "table" then return M._gitstatus_debug.text(row) end
+  local parts = {}
+  for _, chunk in ipairs(row) do
+    if type(chunk) == "string" then
+      parts[#parts + 1] = chunk
+    elseif type(chunk) == "table" then
+      if type(chunk[1]) == "string" then parts[#parts + 1] = chunk[1] end
+      if type(chunk.virt_text) == "table" then
+        local virtual_parts = {}
+        for _, virtual_chunk in ipairs(chunk.virt_text) do
+          if type(virtual_chunk) == "table" and type(virtual_chunk[1]) == "string" then
+            virtual_parts[#virtual_parts + 1] = virtual_chunk[1]
+          end
+        end
+        if #virtual_parts > 0 then parts[#parts + 1] = "<virt:" .. table.concat(virtual_parts, "") .. ">" end
+      end
+    end
+  end
+  return table.concat(parts, "")
+end
+
+---@param rows table?
+---@param limit integer
+---@return table[]
+function M._gitstatus_debug.row_preview(rows, limit)
+  local preview = {}
+  if type(rows) ~= "table" then return preview end
+  for row_index = 1, math.min(#rows, limit) do
+    local row = rows[row_index]
+    preview[#preview + 1] = {
+      index = row_index,
+      text = M._gitstatus_debug.row_text(row),
+      hunk_header = type(row) == "table" and row.diff_review_hunk_header == true or nil,
+      boundary = type(row) == "table" and row.diff_review_boundary == true or nil,
+    }
+  end
+  return preview
+end
+
 ---@param cache any
 ---@return string
 function M._gitstatus_debug.cache_state(cache)
@@ -9895,7 +10066,7 @@ end
 function M._gitstatus_debug.dump(buf, reason)
   if not M._gitstatus_debug.enabled() then return end
   local state = M._status_states and M._status_states[buf] or (M._status and M._status.buf == buf and M._status) or nil
-  if not (state and state.view_kind == "status" and vim.api.nvim_buf_is_valid(buf)) then return end
+  if not (state and (state.view_kind == "status" or state.view_kind == "pr" or state.view_kind == "review") and vim.api.nvim_buf_is_valid(buf)) then return end
   state.gitstatus_debug_dump_reason = reason
   if state.gitstatus_debug_dump_pending then return end
   state.gitstatus_debug_dump_pending = true
@@ -9904,10 +10075,11 @@ function M._gitstatus_debug.dump(buf, reason)
     state = M._status_states and M._status_states[buf] or (M._status and M._status.buf == buf and M._status) or nil
     if state then state.gitstatus_debug_dump_pending = false end
     if not M._gitstatus_debug.enabled() then return end
-    if not (state and state.view_kind == "status" and vim.api.nvim_buf_is_valid(buf)) then return end
+    if not (state and (state.view_kind == "status" or state.view_kind == "pr" or state.view_kind == "review") and vim.api.nvim_buf_is_valid(buf)) then return end
     reason = state.gitstatus_debug_dump_reason or reason
     local win = vim.fn.win_findbuf(buf)[1]
     local lines = {
+      "",
       "GitStatus debug dump",
       "reason=" .. tostring(reason),
       "time=" .. os.date("%Y-%m-%d %H:%M:%S"),
@@ -9999,7 +10171,7 @@ function M._gitstatus_debug.dump(buf, reason)
     end
     if missing_count == 0 then lines[#lines + 1] = "  none" end
 
-    local ok, err = pcall(vim.fn.writefile, lines, M._gitstatus_debug_log_path())
+    local ok, err = pcall(vim.fn.writefile, lines, M._gitstatus_debug_log_path(), "a")
     if not ok then
       notify_debug("GitStatus debug dump failed: " .. tostring(err), vim.log.levels.WARN, { title = "GitStatus" })
     end
@@ -10415,11 +10587,31 @@ local function render_pr_status(pr, cwd, buf, diff_text)
   if not (status and status.buf == buf) then return end
   if M._pr_edit.blocks_render(buf) then return end
   diff_text = diff_text or status.pr_diff_text
+  M._gitstatus_debug.event("render_pr_status.start", {
+    buf = buf,
+    cwd = cwd,
+    pr_number = pr and pr.number or nil,
+    repo = pr and pr.repo or nil,
+    diff_len = #(diff_text or ""),
+    comment_count = status.pr_comments and #status.pr_comments or nil,
+    standalone_comment_count = status.pr_standalone_comments and #status.pr_standalone_comments or nil,
+    regular_comment_count = status.pr_regular_comments and #status.pr_regular_comments or nil,
+  })
   status.pr_standalone_comments = status.pr_standalone_comments or {}
   status.pr_regular_comments = status.pr_regular_comments or {}
   M._pr_overview.refresh_editable_comments(status)
   status.head_lines = status_pr_detail_head_lines(pr, status)
   status.sections = status_pr_sections(cwd, pr, diff_text, status.pr_comments, status.pr_standalone_comments, status.pr_regular_comments)
+  local section_file_count = 0
+  for _, section in ipairs(status.sections or {}) do
+    section_file_count = section_file_count + #(section.files or {})
+  end
+  M._gitstatus_debug.event("render_pr_status.sections", {
+    buf = buf,
+    pr_number = pr and pr.number or nil,
+    section_count = status.sections and #status.sections or nil,
+    file_count = section_file_count,
+  })
   status.fancy_rows = {}
   status.pr_code_comments_by_anchor = M._section_builder.comment_anchor_index_from_sections(status.sections, { field = "pr_comments" })
   status.review_after_row = function(diff_line, indent)
@@ -10436,6 +10628,13 @@ local function load_pr_diff(pr, cwd, buf)
   if not (status and status.buf == buf) then return end
   status.pr_diff_request_id = (status.pr_diff_request_id or 0) + 1
   local request_id = status.pr_diff_request_id
+  M._gitstatus_debug.event("load_pr_diff.start", {
+    buf = buf,
+    cwd = cwd,
+    request_id = request_id,
+    pr_number = pr and pr.number or nil,
+    repo = pr and pr.repo or nil,
+  })
   gh.pr_diff_async(cwd, pr.number, pr.repo, function(result)
     local latest_status = M._status_states and M._status_states[buf] or nil
     if not (
@@ -10445,6 +10644,18 @@ local function load_pr_diff(pr, cwd, buf)
       and vim.api.nvim_buf_is_valid(buf)
     ) then return end
     M._status = latest_status
+    M._gitstatus_debug.event("load_pr_diff.done", {
+      buf = buf,
+      cwd = cwd,
+      request_id = request_id,
+      pr_number = pr and pr.number or nil,
+      repo = pr and pr.repo or nil,
+      code = result and result.code or nil,
+      stdout_len = result and result.stdout and #result.stdout or nil,
+      stdout_preview = result and result.stdout and result.stdout:sub(1, 800) or nil,
+      stderr = result and result.stderr ~= "" and result.stderr or nil,
+      output = result and result.code ~= 0 and result.output or nil,
+    })
     if result.code ~= 0 then
       notify_error("GitHub PR diff failed: " .. (result.output ~= "" and result.output or ("gh exited " .. result.code)), "DiffReview")
       return
@@ -11381,15 +11592,15 @@ function M._review.sections(state)
       name = "review:unviewed",
       keep_empty = true,
       file_key_prefix = "review:unviewed",
-      file_entry_kind = "pr_file",
-      hunk_entry_kind = "pr_hunk",
+      file_entry_kind = "pr_review_file",
+      hunk_entry_kind = "pr_review_hunk",
     }),
     M._section_builder.section_from_files("Viewed Changes", viewed, {
       name = "review:viewed",
       keep_empty = true,
       file_key_prefix = "review:viewed",
-      file_entry_kind = "pr_file",
-      hunk_entry_kind = "pr_hunk",
+      file_entry_kind = "pr_review_file",
+      hunk_entry_kind = "pr_review_hunk",
     }),
   }
 end

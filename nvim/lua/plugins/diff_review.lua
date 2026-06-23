@@ -5,6 +5,7 @@ return {
     dependencies = { "folke/snacks.nvim" },
     cmd = { "GitStatus", "GitBranchDiff", "GitBranchDiffFile", "GitFileRevision", "GitDiffCompactPreview" },
     config = function(_, opts)
+      vim.g.diff_review_gitstatus_debug = 1
       local diff_review = require("diff_review")
       diff_review.setup(opts)
       vim.api.nvim_create_user_command("GitStatus", function()
