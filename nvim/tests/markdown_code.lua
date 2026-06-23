@@ -174,3 +174,4 @@ if not ok then
 end
 
 print("markdown_code: ok")
+vim.cmd("qa!")

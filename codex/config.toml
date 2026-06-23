@@ -133,6 +133,12 @@ approval_mode = "approve"
 [mcp_servers.terminal.tools.type]
 approval_mode = "approve"
 
+[mcp_servers.terminal.tools.startRecording]
+approval_mode = "approve"
+
+[mcp_servers.terminal.tools.stopRecording]
+approval_mode = "approve"
+
 [windows]
 sandbox = "elevated"
 

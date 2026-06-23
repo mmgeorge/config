@@ -2,17 +2,43 @@ vim.loader.enable(false)
 
 local render_markdown_ns = vim.api.nvim_create_namespace("render-markdown.nvim")
 local render_markdown_calls = {}
+local render_markdown_parser_results = {}
+local render_markdown_outside_rows_during_render = {}
 local otter_calls = {}
 local otter_rafts = {}
+local language_register_calls = {}
+local original_language_register = vim.treesitter.language.register
+vim.treesitter.language.register = function(language, filetype)
+  language_register_calls[#language_register_calls + 1] = {
+    language = language,
+    filetype = filetype,
+  }
+end
 package.loaded["render-markdown.core.ui"] = { ns = render_markdown_ns }
 package.loaded["render-markdown"] = {
   render = function(ctx)
     render_markdown_calls[#render_markdown_calls + 1] = ctx
+    local parser_ok, parser_or_err = pcall(vim.treesitter.get_parser, ctx.buf)
+    render_markdown_parser_results[#render_markdown_parser_results + 1] = {
+      ok = parser_ok,
+      value = parser_or_err,
+      filetype = vim.bo[ctx.buf].filetype,
+      included_regions = parser_ok
+        and type(parser_or_err) == "table"
+        and type(parser_or_err.included_regions) == "function"
+        and parser_or_err:included_regions()
+        or nil,
+    }
     vim.api.nvim_buf_clear_namespace(ctx.buf, render_markdown_ns, 0, -1)
     pcall(vim.api.nvim_buf_set_extmark, ctx.buf, render_markdown_ns, 0, 0, {
       virt_text = { { "outside", "Comment" } },
       virt_text_pos = "eol",
     })
+    local saw_outside_row = false
+    for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(ctx.buf, render_markdown_ns, 0, -1, {})) do
+      if mark[2] == 0 then saw_outside_row = true end
+    end
+    render_markdown_outside_rows_during_render[#render_markdown_outside_rows_during_render + 1] = saw_outside_row
     local lines = vim.api.nvim_buf_get_lines(ctx.buf, 0, -1, false)
     for row, line in ipairs(lines) do
       if line == "Description:" then
@@ -23,6 +49,14 @@ package.loaded["render-markdown"] = {
           end_col = #body_line,
         })
         break
+      end
+    end
+    for row, line in ipairs(lines) do
+      if line == "```ts" or line == "interface CommentBlock {" or line == "```" then
+        pcall(vim.api.nvim_buf_set_extmark, ctx.buf, render_markdown_ns, row - 1, 0, {
+          hl_group = "RenderMarkdownCode",
+          end_col = #line,
+        })
       end
     end
     if ctx.config and ctx.config.on and ctx.config.on.render then ctx.config.on.render({ buf = ctx.buf, win = ctx.win }) end
@@ -103,6 +137,8 @@ local edit_calls = {}
 local standalone_comment_calls = {}
 ---@type { command: string[], input: string?, payload: table }[]
 local issue_comment_calls = {}
+---@type { command: string[], input: string?, payload: table }[]
+local issue_comment_update_calls = {}
 ---@type { command: string[], input: string?, payload: table }[]
 local reviewer_request_calls = {}
 ---@type { command: string[], input: string?, payload: table }[]
@@ -279,7 +315,8 @@ function gh_backend.system_async(command, input, cb)
                   {
                     id = "IC_2",
                     databaseId = 4702465967,
-                    body = "Lorem Ipsum is the ubiquitous placeholder\nSecond full line for expansion",
+                    body = "Lorem Ipsum is the ubiquitous placeholder\r\n```ts\r\ninterface CommentBlock {\r\n  value: number;\r\n}\r\n```\r\nSecond full line for expansion",
+                    viewerDidAuthor = true,
                     createdAt = "2026-06-14T22:00:00Z",
                     updatedAt = "2026-06-14T22:00:00Z",
                     url = "https://github.com/owner/repo/pull/7#issuecomment-4702465967",
@@ -302,6 +339,7 @@ function gh_backend.system_async(command, input, cb)
                           id = "PRRC_1",
                           databaseId = 3409923137,
                           body = "This is inline comment without review",
+                          viewerDidAuthor = true,
                           createdAt = "2026-06-14T17:14:07Z",
                           updatedAt = "2026-06-14T17:14:07Z",
                           url = "https://github.com/owner/repo/pull/7#discussion_r3409923137",
@@ -388,6 +426,21 @@ function gh_backend.system_async(command, input, cb)
         html_url = "https://github.com/owner/repo/pull/7#issuecomment-" .. tostring(remote_id),
         created_at = "2026-06-14T18:30:00Z",
         updated_at = "2026-06-14T18:30:00Z",
+        user = { login = "me" },
+      })
+      cb({ code = 0, stdout = stdout, stderr = "", output = stdout })
+      return
+    end
+    if key == "gh api --method PATCH /repos/owner/repo/issues/comments/4702465967 --input -" then
+      local payload = vim.json.decode(input or "{}")
+      issue_comment_update_calls[#issue_comment_update_calls + 1] = { command = command, input = input, payload = payload }
+      local stdout = vim.json.encode({
+        id = 4702465967,
+        node_id = "IC_2",
+        body = payload.body,
+        html_url = "https://github.com/owner/repo/pull/7#issuecomment-4702465967",
+        created_at = "2026-06-14T22:00:00Z",
+        updated_at = "2026-06-14T23:00:00Z",
         user = { login = "me" },
       })
       cb({ code = 0, stdout = stdout, stderr = "", output = stdout })
@@ -551,6 +604,13 @@ local function buffer_contains(buf, needle)
   return false
 end
 
+local function buffer_has_carriage_return(buf)
+  for _, line in ipairs(vim.api.nvim_buf_get_lines(buf, 0, -1, false)) do
+    if line:find("\r", 1, true) then return true end
+  end
+  return false
+end
+
 local function find_row(buf, needle)
   local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
   for index, line in ipairs(lines) do
@@ -607,6 +667,13 @@ local function render_markdown_mark_rows(buf)
   end
   table.sort(rows)
   return rows
+end
+
+local function row_list_contains(rows, row)
+  for _, value in ipairs(rows) do
+    if value == row then return true end
+  end
+  return false
 end
 
 --- 1-based rows that carry the "*" out-of-sync marker.
@@ -836,9 +903,10 @@ local function run()
     line_has_substring_highlight(buf, find_row(buf, "Head:   abc1234"), "1 day ago", "DiffReviewStatusDate"),
     "PR head date did not use date highlight"
   )
-  assert_true(vim.wo[0].wrap, "PR buffer should enable soft wrap")
-  assert_true(vim.wo[0].linebreak, "PR buffer should wrap on word boundaries")
-  assert_true(vim.wo[0].breakindent, "PR buffer should preserve indent on wrapped screen lines")
+  assert_true(not vim.wo[0].wrap, "PR overview should reuse GitStatus no-wrap formatting")
+  assert_true(not vim.wo[0].linebreak, "PR overview should not enable linebreak")
+  assert_true(not vim.wo[0].breakindent, "PR overview should not enable breakindent")
+  assert_true(vim.wo[0].conceallevel == 0, "PR overview should not conceal code rows")
   assert_true(buffer_contains(buf, "Line one"), "PR body did not render")
   wait_for(function() return buffer_contains(buf, "This is a regular comment") end, "PR conversation comment did not render")
   wait_for(function() return buffer_contains(buf, "Activity: 5 hours ago") end, "PR activity row did not use the newest comment/review activity")
@@ -867,6 +935,7 @@ local function run()
     buffer_contains(buf, "Lorem Ipsum is the ubiquitous placeholder"),
     "long PR conversation comment preview did not render"
   )
+  assert_true(not buffer_has_carriage_return(buf), "PR comments rendered raw carriage returns")
   local long_regular_preview_row = find_row(buf, "Lorem Ipsum is the ubiquitous placeholder")
   local long_regular_preview_line = vim.api.nvim_buf_get_lines(buf, long_regular_preview_row - 1, long_regular_preview_row, false)[1] or ""
   assert_true(
@@ -880,6 +949,10 @@ local function run()
   assert_true(
     not buffer_contains(buf, "Second full line for expansion"),
     "long PR conversation comment should render collapsed by default"
+  )
+  assert_true(
+    not buffer_contains(buf, "```ts"),
+    "long PR conversation comment code block should stay collapsed by default"
   )
   wait_for(function() return buffer_contains(buf, "Reviews (3):") end, "submitted reviews section did not render")
   assert_true(
@@ -1062,8 +1135,24 @@ local function run()
   move_cursor(buf, long_regular_comment_row)
   trigger_buf_mapping(buf, "<Tab>")
   wait_for(function()
-    return buffer_contains(buf, "Second full line for expansion")
+    return buffer_contains(buf, "```ts")
+      and buffer_contains(buf, "interface CommentBlock {")
+      and buffer_contains(buf, "Second full line for expansion")
   end, "regular PR conversation comment did not expand")
+  assert_true(not buffer_has_carriage_return(buf), "expanded PR comment rendered raw carriage returns")
+  local comment_code_fence_row = find_row(buf, "```ts")
+  local comment_code_row = find_row(buf, "interface CommentBlock {")
+  wait_for(function()
+    local mark_rows = render_markdown_mark_rows(buf)
+    return row_list_contains(mark_rows, find_row(buf, "Line one"))
+      and row_list_contains(mark_rows, comment_code_fence_row)
+      and row_list_contains(mark_rows, comment_code_row)
+  end, "expanded regular PR comment code block was not kept as a markdown region")
+  wait_for(function()
+    return otter_rafts[buf]
+      and otter_rafts[buf].languages
+      and otter_rafts[buf].languages[1] == "typescript"
+  end, "expanded regular PR comment code block did not activate markdown_code")
   assert_browse_url(
     buf,
     find_row(buf, "Second full line for expansion"),
@@ -1076,6 +1165,35 @@ local function run()
   wait_for(function()
     return not buffer_contains(buf, "Second full line for expansion")
   end, "regular PR conversation comment did not collapse")
+  assert_true(not buffer_contains(buf, "```ts"), "collapsed regular PR comment kept its code block")
+  long_regular_comment_row = find_row(buf, "Lorem Ipsum is the ubiquitous placeholder")
+  move_cursor(buf, long_regular_comment_row)
+  trigger_buf_mapping(buf, "C")
+  wait_for(function()
+    return buffer_contains(buf, "Second full line for expansion")
+  end, "viewer-authored regular PR comment did not open for editing")
+  local long_regular_comment_body_row = find_row(buf, "Second full line for expansion")
+  move_cursor(buf, long_regular_comment_body_row)
+  assert_true(vim.bo[buf].modifiable, "viewer-authored regular PR comment body must be editable")
+  edit_line(buf, long_regular_comment_body_row, "Edited existing regular comment")
+  assert_true(vim.bo[buf].modified, "editing an existing regular PR comment must mark the PR buffer modified")
+  local previous_issue_comment_update_count = #issue_comment_update_calls
+  trigger_buf_mapping(buf, "<C-s>")
+  wait_for(function()
+    return #issue_comment_update_calls == previous_issue_comment_update_count + 1
+  end, "viewer-authored regular PR comment was not updated")
+  local issue_update_payload = issue_comment_update_calls[#issue_comment_update_calls].payload
+  assert_true(
+    issue_update_payload.body == "Lorem Ipsum is the ubiquitous placeholder\n```ts\ninterface CommentBlock {\n  value: number;\n}\n```\nEdited existing regular comment",
+    "wrong regular PR comment update body: " .. vim.inspect(issue_update_payload)
+  )
+  wait_for(function() return saw_notification_containing("PR comment synced") end, "successful regular PR comment update was not notified")
+  assert_true(buffer_contains(buf, "Edited existing regular comment"), "updated regular PR comment disappeared from the PR overview")
+  regular_comment_row = find_row(buf, "This is a regular comment")
+  changes_file_row = find_row(buf, "src/a.txt +1 -1")
+  inline_comment_row = find_row_after(buf, "This is inline comment without review", changes_file_row)
+  inline_reply_row = find_row_after(buf, "Oh good point! fixed", inline_comment_row)
+  rejected_review_row = find_row(buf, "foo     10 hours ago")
   opened_urls = {}
   assert_browse_url(buf, lint_check_row, "https://github.com/owner/repo/actions/runs/123/job/456", "PR check row")
   assert_browse_url(buf, regular_comment_row, "https://github.com/owner/repo/pull/7#issuecomment-4702465966", "regular PR comment")
@@ -1228,14 +1346,43 @@ local function run()
   local status_row = find_row(buf, "Status: DRAFT")
   local body_row = find_row(buf, "Line one")
   wait_for(function() return #render_markdown_calls > 0 end, "PR description did not invoke render-markdown")
+  wait_for(function() return #render_markdown_parser_results > 0 end, "PR description did not ask for a markdown parser")
+  assert_true(
+    render_markdown_parser_results[1].ok,
+    "PR description render-markdown could not get a parser: " .. tostring(render_markdown_parser_results[1].value)
+  )
+  assert_true(
+    render_markdown_parser_results[1].filetype == "GitStatus",
+    "PR description parser shim changed the buffer filetype: " .. tostring(render_markdown_parser_results[1].filetype)
+  )
+  local included_regions = render_markdown_parser_results[1].included_regions or {}
+  local body_region_seen = false
+  local first_row_region_seen = false
+  for _, region in ipairs(included_regions) do
+    for _, range in ipairs(region) do
+      local first_row = range[1]
+      local after_row = #range == 6 and range[4] or range[3]
+      if first_row and after_row and first_row <= body_row - 1 and after_row > body_row - 1 then body_region_seen = true end
+      if first_row and after_row and first_row <= 0 and after_row > 0 then first_row_region_seen = true end
+    end
+  end
+  assert_true(body_region_seen, "PR markdown parser regions did not include the description body")
+  assert_true(not first_row_region_seen, "PR markdown parser regions included non-markdown header rows")
+  assert_true(
+    render_markdown_outside_rows_during_render[1] == false,
+    "PR markdown placed marks outside the registered markdown ranges during render"
+  )
   wait_for(function() return #otter_calls > 0 end, "PR markdown code blocks did not activate otter")
   assert_true(otter_calls[1].kind == "activate", "PR markdown code should activate otter before syncing")
+  for _, call in ipairs(language_register_calls) do
+    assert_true(call.filetype ~= "GitStatus", "PR description must not register GitStatus as markdown")
+  end
   assert_true(not otter_calls[1].name:find("://", 1, true), "otter activation should use a temp-backed PR buffer name")
   assert_true(vim.api.nvim_buf_get_name(buf):find("://", 1, true) ~= nil, "PR buffer name was not restored after otter activation")
   local markdown_rows = render_markdown_mark_rows(buf)
   assert_true(
-    #markdown_rows == 1 and markdown_rows[1] == body_row,
-    "PR description markdown marks should be pruned to the description body: " .. vim.inspect(markdown_rows)
+    row_list_contains(markdown_rows, body_row) and not row_list_contains(markdown_rows, 1),
+    "PR markdown marks should include the description body and prune outside marks: " .. vim.inspect(markdown_rows)
   )
   local markdown_config = render_markdown_calls[#render_markdown_calls].config or {}
   assert_true(
@@ -1277,8 +1424,8 @@ local function run()
   assert_true(vim.bo[buf].modifiable, "buffer must unlock on description rows")
   markdown_rows = render_markdown_mark_rows(buf)
   assert_true(
-    #markdown_rows == 1 and markdown_rows[1] == body_row,
-    "PR description markdown should stay managed by render-markdown while editing the body: " .. vim.inspect(markdown_rows)
+    row_list_contains(markdown_rows, body_row) and not row_list_contains(markdown_rows, 1),
+    "PR markdown should stay managed by render-markdown while editing the body: " .. vim.inspect(markdown_rows)
   )
   assert_cursor_clamped_to_line(buf, body_row, "PR description")
   issue_reference_search_calls = {}
@@ -1309,7 +1456,7 @@ local function run()
   assert_true(not vim.bo[buf].modifiable, "buffer must relock after leaving the regions")
   wait_for(function()
     local rows = render_markdown_mark_rows(buf)
-    return #rows == 1 and rows[1] == body_row
+    return row_list_contains(rows, body_row) and not row_list_contains(rows, 1)
   end, "PR description markdown did not re-render after leaving the editable body")
 
   -- ── Status: Enter confirms draft/ready transitions ─────────────────────────
@@ -1513,6 +1660,7 @@ end
 
 local ok, err = xpcall(run, debug.traceback)
 vim.notify = original_notify
+vim.treesitter.language.register = original_language_register
 diff_review.reset_git_backend()
 gh.reset_backend()
 github_gh.reset_backend()

@@ -365,9 +365,10 @@ local function run()
   local buf = diff_review.open_review(pr, { cwd = "D:/diffreview-review-root" })
   assert_true(buf ~= nil, "open_review did not return a buffer")
   wait_for(function() return buffer_contains(buf, "NEW src/a.txt") end, "review diff did not render")
-  assert_true(vim.wo[0].wrap, "review buffer should enable soft wrap")
-  assert_true(vim.wo[0].linebreak, "review buffer should wrap on word boundaries")
-  assert_true(vim.wo[0].breakindent, "review buffer should preserve indent on wrapped screen lines")
+  assert_true(not vim.wo[0].wrap, "review buffer should reuse GitStatus no-wrap formatting")
+  assert_true(not vim.wo[0].linebreak, "review buffer should not enable linebreak")
+  assert_true(not vim.wo[0].breakindent, "review buffer should not enable breakindent")
+  assert_true(vim.wo[0].conceallevel == 0, "review buffer should not conceal diff code rows")
 
   -- ── layout + hint shows the review commands ────────────────────────────────
   assert_true(buffer_contains(buf, "Title: Add the thing"), "title missing")

@@ -84,6 +84,7 @@
 ---@field review_node_id string?
 ---@field review_state string?
 ---@field body string
+---@field viewer_did_author? boolean
 ---@field user? string
 ---@field created_at? string
 ---@field updated_at? string
@@ -96,6 +97,7 @@
 ---@field review_node_id string?
 ---@field review_state string?
 ---@field body string
+---@field viewer_did_author? boolean
 ---@field path string
 ---@field line integer?
 ---@field start_line integer?
@@ -113,6 +115,7 @@
 ---@field remote_id integer?
 ---@field remote_node_id string?
 ---@field body string
+---@field viewer_did_author? boolean
 ---@field user? string
 ---@field created_at? string
 ---@field updated_at? string
@@ -123,6 +126,7 @@
 ---@field node_id string
 ---@field state string
 ---@field body string
+---@field viewer_did_author? boolean
 ---@field user? string
 ---@field created_at? string
 ---@field updated_at? string
@@ -144,6 +148,7 @@
 ---@field node_id string
 ---@field state string
 ---@field body string
+---@field viewer_did_author? boolean
 ---@field commit_id string?
 ---@field user? string
 
@@ -428,6 +433,12 @@ local function normalize_milestones(decoded)
   return milestones
 end
 
+---@param value any
+---@return string
+local function normalize_body_text(value)
+  return tostring(value or ""):gsub("\r\n", "\n"):gsub("\r", "\n")
+end
+
 ---@param raw table
 ---@param repo? string
 ---@return DiffReviewGhPR
@@ -458,7 +469,7 @@ local function normalize_pr(raw, repo)
     id = type(raw.id) == "string" and raw.id or nil,
     number = as_integer(raw.number),
     title = tostring(raw.title or ""),
-    body = tostring(raw.body or ""),
+    body = normalize_body_text(raw.body),
     url = tostring(raw.url or ""),
     repo = normalized_repo,
     headRefName = tostring(raw.headRefName or ""),
@@ -848,6 +859,12 @@ local function browser_url(raw)
 end
 
 ---@param raw table
+---@return boolean
+local function viewer_did_author(raw)
+  return raw.viewerDidAuthor == true or raw.viewer_did_author == true
+end
+
+---@param raw table
 ---@return DiffReviewGhReviewCommentReply
 local function normalize_review_reply(raw)
   local author = raw.author or raw.user or {}
@@ -858,7 +875,8 @@ local function normalize_review_reply(raw)
     review_id = maybe_integer(raw.pull_request_review_id or review.databaseId),
     review_node_id = review.id,
     review_state = review.state,
-    body = tostring(raw.body or ""),
+    body = normalize_body_text(raw.body),
+    viewer_did_author = viewer_did_author(raw),
     user = author.login,
     created_at = raw.createdAt or raw.created_at,
     updated_at = raw.updatedAt or raw.updated_at,
@@ -879,7 +897,8 @@ local function normalize_review_comment(raw, thread)
     review_id = maybe_integer(raw.pull_request_review_id or review.databaseId),
     review_node_id = review.id,
     review_state = review.state,
-    body = tostring(raw.body or ""),
+    body = normalize_body_text(raw.body),
+    viewer_did_author = viewer_did_author(raw),
     path = tostring(raw.path or thread.path or ""),
     line = maybe_integer(raw.line or thread.line or thread.originalLine),
     start_line = maybe_integer(raw.startLine or raw.start_line or thread.startLine),
@@ -917,7 +936,8 @@ local function normalize_submitted_review(raw)
     id = maybe_integer(raw.databaseId or raw.id) or 0,
     node_id = tostring(raw.node_id or raw.id or ""),
     state = tostring(raw.state or ""),
-    body = tostring(raw.body or ""),
+    body = normalize_body_text(raw.body),
+    viewer_did_author = viewer_did_author(raw),
     user = author.login,
     created_at = raw.createdAt or raw.created_at,
     updated_at = raw.updatedAt or raw.updated_at,
@@ -935,7 +955,8 @@ local function normalize_issue_comment(raw)
   return {
     remote_id = maybe_integer(raw.databaseId or raw.id),
     remote_node_id = raw.node_id or raw.id,
-    body = tostring(raw.body or ""),
+    body = normalize_body_text(raw.body),
+    viewer_did_author = viewer_did_author(raw),
     user = author.login,
     created_at = raw.createdAt or raw.created_at,
     updated_at = raw.updatedAt or raw.updated_at,
@@ -952,7 +973,8 @@ local function normalize_pending_review(raw)
     id = maybe_integer(raw.databaseId or raw.id) or 0,
     node_id = tostring(raw.node_id or raw.id or ""),
     state = tostring(raw.state or ""),
-    body = tostring(raw.body or ""),
+    body = normalize_body_text(raw.body),
+    viewer_did_author = viewer_did_author(raw),
     commit_id = raw.commit_id or commit.oid,
     user = author.login,
   }
@@ -1136,17 +1158,17 @@ function M.pr_comments_async(cwd, number, repo, cb)
     "  repository(owner:$owner, name:$repo) {",
     "    pullRequest(number:$number) {",
     "      reviews(first:100) { nodes {",
-    "        id databaseId state body createdAt updatedAt submittedAt url",
+    "        id databaseId state body viewerDidAuthor createdAt updatedAt submittedAt url",
     "        author { login }",
     "        commit { oid }",
     "      } }",
     "      comments(first:100) { nodes {",
-    "        id databaseId body createdAt updatedAt url author { login }",
+    "        id databaseId body viewerDidAuthor createdAt updatedAt url author { login }",
     "      } }",
     "      reviewThreads(first:100) { nodes {",
     "        isResolved isOutdated path line startLine originalLine diffSide",
     "        comments(first:100) { nodes {",
-    "          id databaseId body path line position createdAt updatedAt url author { login }",
+    "          id databaseId body viewerDidAuthor path line position createdAt updatedAt url author { login }",
     "          pullRequestReview { id databaseId state }",
     "        } }",
     "      } }",
@@ -1241,7 +1263,7 @@ function M.pending_review_async(cwd, number, repo, cb)
     "      } }",
     "      reviewThreads(first:100) { nodes {",
     "        comments(first:100) { nodes {",
-    "          id databaseId body path line position createdAt updatedAt author { login }",
+    "          id databaseId body viewerDidAuthor path line position createdAt updatedAt author { login }",
     "          pullRequestReview { id databaseId state }",
     "        } }",
     "      } }",
@@ -1328,7 +1350,7 @@ function M.add_pending_review_comment_async(cwd, review_node_id, opts, cb)
   local query = table.concat({
     "mutation($input:AddPullRequestReviewCommentInput!) {",
     "  addPullRequestReviewComment(input:$input) {",
-    "    comment { id databaseId body path line position createdAt updatedAt author { login } }",
+    "    comment { id databaseId body viewerDidAuthor path line position createdAt updatedAt author { login } }",
     "  }",
     "}",
   }, "\n")
@@ -1440,7 +1462,7 @@ function M.update_review_comment_async(cwd, comment_node_id, body, cb)
   local query = table.concat({
     "mutation($input:UpdatePullRequestReviewCommentInput!) {",
     "  updatePullRequestReviewComment(input:$input) {",
-    "    pullRequestReviewComment { id databaseId body path line position createdAt updatedAt author { login } }",
+    "    pullRequestReviewComment { id databaseId body viewerDidAuthor path line position createdAt updatedAt author { login } }",
     "  }",
     "}",
   }, "\n")

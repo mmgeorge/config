@@ -32,13 +32,26 @@ function M.pad_right(text, width)
   return text .. string.rep(" ", padding)
 end
 
+---@param value any
+---@return string
+function M.body_text(value)
+  return tostring(value or ""):gsub("\r\n", "\n"):gsub("\r", "\n")
+end
+
 ---@param body string?
 ---@return string
 function M.preview_text(body)
   local parts = {}
-  for _, line in ipairs(vim.split(tostring(body or ""), "\n", { plain = true })) do
+  local in_fence = false
+  for _, line in ipairs(vim.split(M.body_text(body), "\n", { plain = true })) do
     local trimmed = vim.trim(line)
+    if trimmed:match("^```") then
+      in_fence = not in_fence
+      goto continue
+    end
+    if in_fence then goto continue end
     if trimmed ~= "" then parts[#parts + 1] = trimmed end
+    ::continue::
   end
   return table.concat(parts, " "):gsub("%s+", " ")
 end
@@ -46,7 +59,7 @@ end
 ---@param body string?
 ---@return string[]
 function M.body_lines(body)
-  local lines = vim.split(tostring(body or ""), "\n", { plain = true })
+  local lines = vim.split(M.body_text(body), "\n", { plain = true })
   if #lines == 0 then lines = { "" } end
   return lines
 end

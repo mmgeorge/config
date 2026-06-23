@@ -2087,6 +2087,8 @@ function M._hide_line_numbers(win)
       wrap = vim.wo[win].wrap,
       linebreak = vim.wo[win].linebreak,
       breakindent = vim.wo[win].breakindent,
+      conceallevel = vim.wo[win].conceallevel,
+      concealcursor = vim.wo[win].concealcursor,
     }
   end
   vim.wo[win].number = false
@@ -2101,10 +2103,11 @@ end
 function M._apply_status_window_options(win, _state)
   if not (win and vim.api.nvim_win_is_valid(win)) then return end
   M._hide_line_numbers(win)
-  local soft_wrap = _state ~= nil and _state.view_kind == "review"
-  vim.wo[win].wrap = soft_wrap
-  vim.wo[win].linebreak = soft_wrap
-  vim.wo[win].breakindent = soft_wrap
+  vim.wo[win].wrap = false
+  vim.wo[win].linebreak = false
+  vim.wo[win].breakindent = false
+  vim.wo[win].conceallevel = 0
+  vim.wo[win].concealcursor = ""
 end
 
 ---@param win integer?
@@ -2119,6 +2122,8 @@ function M._restore_line_numbers(win)
   vim.wo[win].wrap = saved.wrap
   vim.wo[win].linebreak = saved.linebreak
   vim.wo[win].breakindent = saved.breakindent
+  vim.wo[win].conceallevel = saved.conceallevel or 0
+  vim.wo[win].concealcursor = saved.concealcursor or ""
   M._saved_wo[win] = nil
 end
 
@@ -4062,7 +4067,7 @@ end
 ---@param filename? string
 ---@param context_callback_key? fun(hunk_line: number): string
 ---@param on_context_update? fun()
----@param opts? { context_line: integer?, boundary_context: boolean?, suppress_start_boundary: boolean?, suppress_end_boundary: boolean?, suppress_start_boundary_keys?: table<string, boolean>, suppress_end_boundary_keys?: table<string, boolean>, syntax_source?: "file"|"diff", syntax_diff_text?: string, compact_replacements?: boolean, debug_context?: table }
+---@param opts? { context_line: integer?, boundary_context: boolean?, suppress_start_boundary: boolean?, suppress_end_boundary: boolean?, suppress_start_boundary_keys?: table<string, boolean>, suppress_end_boundary_keys?: table<string, boolean>, syntax_source?: "file"|"diff", syntax_diff_text?: string, compact_replacements?: boolean, require_file_match_for_context?: boolean, debug_context?: table }
 local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_callback_key, on_context_update, opts)
   opts = opts or {}
 
@@ -4079,7 +4084,8 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
   local context_pending = false
   local old_syntax_row = 0
   local new_syntax_row = 0
-  local source_matches_file = false
+  local require_file_match_for_context = opts.require_file_match_for_context == true
+  local source_matches_file = not require_file_match_for_context
   if filename then
     local syntax_callback_key = context_callback_key and context_callback_key(0) or ("diff-row:" .. filename .. ":0")
     local old_pending = false
@@ -4088,7 +4094,7 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
     local file_pending = false
     local uses_file_syntax = M._diff_uses_file_syntax(hunk_staged, opts)
     local new_side_matches_file = M._diff_new_side_matches_file(filename, syntax_diff_text)
-    source_matches_file = new_side_matches_file
+    source_matches_file = (not require_file_match_for_context) or new_side_matches_file
     if debug_context then
       M._gitstatus_debug.event("build_fancy_diff_rows.syntax", {
         context = debug_context,
@@ -8804,7 +8810,11 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_ki
   if syntax_source == "file" then
     syntax_diff_text = M._status_file_syntax_diff_text(file)
   end
-  local semantic_context_enabled = syntax_diff_text ~= nil and M._diff_new_side_matches_file(file.filename, syntax_diff_text)
+  local require_file_match_for_context = entry_kind == "pr_hunk" or entry_kind == "pr_review_hunk"
+  local semantic_context_enabled = true
+  if require_file_match_for_context then
+    semantic_context_enabled = syntax_diff_text ~= nil and M._diff_new_side_matches_file(file.filename, syntax_diff_text)
+  end
   local function rerender_with_context()
     M._status = M._status or {}
     if M._status.context_rerender_pending then return end
@@ -8930,6 +8940,7 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_ki
         syntax_source = syntax_source,
         syntax_diff_text = syntax_diff_text,
         compact_replacements = true,
+        require_file_match_for_context = require_file_match_for_context,
         debug_context = debug_context,
       }
     )
@@ -10289,10 +10300,11 @@ local function status_render_loaded(buf, target_id, fallback_line, opts, head_li
   if view_kind == "pr" then
     M._pr_edit.on_render(buf)
     M._review.on_render(buf)
-    M._pr_edit.activate_markdown_code(buf)
+    M._pr_edit.render_markdown_regions(buf)
     M._pr_edit.sync_modifiable(buf)
   elseif view_kind == "review" then
     M._review.on_render(buf)
+    M._pr_edit.render_markdown_regions(buf)
   elseif view_kind == "status" then
     M._status_stop_markdown_highlighter(buf)
     M._status_issues.sync_modifiable(buf)
@@ -10687,6 +10699,7 @@ function M._pr_overview.load_comments(pr, cwd, buf)
       return
     end
     latest_status.pr_comments = result
+    M._pr_overview.import_viewer_authored_comments(latest_status, result)
     render_pr_status(pr, cwd, buf, latest_status.pr_diff_text)
   end)
 end
@@ -10853,6 +10866,7 @@ function M._review.comments_for_storage(state)
     copy.review_body_render_rows = nil
     copy.review_body_render_row_count = nil
     copy.review_body_prefix_width = nil
+    copy.review_markdown_ranges = nil
     copy.review_rendered_body_text = nil
     comments[#comments + 1] = copy
   end
@@ -10895,10 +10909,19 @@ function M._review.delete_draft(state)
   pcall(vim.fn.delete, M._review.storage_path(state))
 end
 
+---@param value any
+---@return string
+function M._review.normalize_comment_body_text(value)
+  return tostring(value or ""):gsub("\r\n", "\n"):gsub("\r", "\n")
+end
+
 ---@param state table
 ---@param comment table
 ---@return table
 function M._review.normalize_comment(state, comment)
+  comment.body = M._review.normalize_comment_body_text(comment.body)
+  if comment.base_body ~= nil then comment.base_body = M._review.normalize_comment_body_text(comment.base_body) end
+  if comment.remote_body ~= nil then comment.remote_body = M._review.normalize_comment_body_text(comment.remote_body) end
   if not comment.local_id or comment.local_id == "" then
     local seed = table.concat({
       tostring(state.pr and state.pr.repo or ""),
@@ -10928,6 +10951,7 @@ function M._review.normalize_comment(state, comment)
   local replies = {}
   for _, reply in ipairs(type(comment.replies) == "table" and comment.replies or {}) do
     if type(reply) == "table" then
+      reply.body = M._review.normalize_comment_body_text(reply.body)
       if type(reply.user) == "table" then reply.user = reply.user.login end
       if not reply.user or reply.user == "" then
         local reply_author = type(reply.author) == "table" and reply.author or nil
@@ -10953,21 +10977,30 @@ end
 ---@param remote table
 ---@return table
 function M._review.comment_from_remote(state, remote)
+  local remote_body = M._review.normalize_comment_body_text(remote.body)
   return M._review.normalize_comment(state, {
     local_id = remote.remote_node_id or ("remote:" .. tostring(remote.remote_id or "")),
     remote_id = remote.remote_id,
     remote_node_id = remote.remote_node_id,
     remote_review_id = remote.review_id or (state.review_remote and state.review_remote.id),
+    review_node_id = remote.review_node_id,
+    review_state = remote.review_state,
     path = remote.path,
     abs_file = remote.path and vim.fs.normalize(vim.fs.joinpath(state.cwd, remote.path)) or nil,
     side = "RIGHT",
     line = remote.line,
+    start_line = remote.start_line,
+    start_side = remote.start_side,
     position = remote.position,
-    body = remote.body or "",
-    base_body = remote.body or "",
+    body = remote_body,
+    base_body = remote_body,
+    viewer_did_author = remote.viewer_did_author,
     user = remote.user,
     created_at = remote.created_at,
     updated_at = remote.updated_at,
+    url = remote.url,
+    resolved = remote.resolved,
+    outdated = remote.outdated,
     replies = type(remote.replies) == "table" and vim.deepcopy(remote.replies) or {},
     local_state = "clean",
   })
@@ -11002,7 +11035,7 @@ function M._review.find_comment_for_remote(state, remote)
     if not comment.remote_id
       and comment.local_state ~= "deleted"
       and M._review.comment_fingerprint(comment) == remote_fingerprint
-      and M._review.comment_body_for_sync(comment.body or "") == tostring(remote.body or "") then
+      and M._review.comment_body_for_sync(comment.body or "") == M._review.comment_body_for_sync(remote.body or "") then
       return comment
     end
   end
@@ -11026,14 +11059,15 @@ function M._review.merge_remote_comments(state, remote_comments)
       comment.user = remote.user or comment.user
       comment.created_at = remote.created_at or comment.created_at
       comment.updated_at = remote.updated_at or comment.updated_at
+      comment.viewer_did_author = remote.viewer_did_author
       local remote_replies = type(remote.replies) == "table" and vim.deepcopy(remote.replies) or {}
       if not vim.deep_equal(comment.replies or {}, remote_replies) then
         comment.replies = remote_replies
         changed = true
       end
-      local remote_body = tostring(remote.body or "")
-      local base_body = tostring(comment.base_body or "")
-      local local_body = tostring(comment.body or "")
+      local remote_body = M._review.normalize_comment_body_text(remote.body)
+      local base_body = M._review.normalize_comment_body_text(comment.base_body)
+      local local_body = M._review.normalize_comment_body_text(comment.body)
       local base_sync_body = M._review.comment_body_for_sync(base_body)
       local local_sync_body = M._review.comment_body_for_sync(local_body)
       if comment.local_state == "dirty" or comment.local_state == "new" then
@@ -11808,13 +11842,7 @@ end
 ---@param body string
 ---@return string
 function M._review.comment_preview_text(body)
-  local parts = {}
-  for _, line in ipairs(vim.split(tostring(body or ""), "\n", { plain = true })) do
-    local trimmed = vim.trim(line)
-    if trimmed ~= "" then parts[#parts + 1] = trimmed end
-  end
-  if #parts == 0 then return "" end
-  return table.concat(parts, " "):gsub("%s+", " ")
+  return M._comment_rows.preview_text(body)
 end
 
 ---@param text string
@@ -11869,7 +11897,7 @@ end
 ---@param body string
 ---@return string[]
 function M._review.comment_body_lines(body)
-  local lines = vim.split(tostring(body or ""), "\n", { plain = true })
+  local lines = vim.split(M._review.normalize_comment_body_text(body), "\n", { plain = true })
   if #lines == 0 then lines = { "" } end
   return lines
 end
@@ -12040,6 +12068,15 @@ function M._review.toggle_comment_fold(buf)
   if not state then return false end
   M._status = state
   M._review.sync_inline_comment_text(buf)
+  if state.view_kind == "pr" then
+    local row = vim.api.nvim_win_get_cursor(0)[1]
+    local entry = state.entries and state.entries[row] or nil
+    if entry and entry.kind == "pr_comment" and entry.id and entry.pr_comment then
+      set_status_folded(entry.id, not status_folded(entry.id, true))
+      render_pr_status(state.pr, state.cwd, buf, state.pr_diff_text)
+      return true
+    end
+  end
   local comment = M._review.comment_at_cursor(buf)
   if not comment then return false end
   comment.review_folded = not comment.review_folded
@@ -12073,6 +12110,7 @@ function M._review.on_render(buf)
     comment.review_body_line_marks = nil
     comment.review_body_render_rows = nil
     comment.review_body_render_row_count = nil
+    comment.review_markdown_ranges = nil
   end
 
   local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
@@ -12102,6 +12140,17 @@ function M._review.on_render(buf)
     end
     range_comment, range_start = nil, nil
   end
+  local markdown_range_comment, markdown_range_start
+  local function close_markdown_range(end_row)
+    if markdown_range_comment and markdown_range_start and end_row >= markdown_range_start then
+      markdown_range_comment.review_markdown_ranges = markdown_range_comment.review_markdown_ranges or {}
+      markdown_range_comment.review_markdown_ranges[#markdown_range_comment.review_markdown_ranges + 1] = {
+        start_mark = vim.api.nvim_buf_set_extmark(buf, M._review.ns, markdown_range_start - 1, 0, { right_gravity = false }),
+        end_mark = vim.api.nvim_buf_set_extmark(buf, M._review.ns, end_row, 0, { right_gravity = true }),
+      }
+    end
+    markdown_range_comment, markdown_range_start = nil, nil
+  end
 
   for row = 1, #lines do
     local entry = state.entries and state.entries[row] or nil
@@ -12110,18 +12159,21 @@ function M._review.on_render(buf)
       and entry.pr_comment
       and not entry.pr_comment_body then
       close_comment_range(row - 1)
+      close_markdown_range(row - 1)
       entry.pr_comment.review_header_mark = vim.api.nvim_buf_set_extmark(buf, M._review.ns, row - 1, 0, { right_gravity = false })
     elseif entry
       and entry.kind == "review_comment"
       and (entry.review_boundary == "header" or entry.review_boundary == "folded")
       and entry.review_comment then
       close_comment_range(row - 1)
+      close_markdown_range(row - 1)
       entry.review_comment.review_header_mark = vim.api.nvim_buf_set_extmark(buf, M._review.ns, row - 1, 0, { right_gravity = false })
     elseif entry
       and entry.kind == "review_comment"
       and entry.review_boundary == "reply_header"
       and entry.review_comment then
       close_comment_range(row - 1)
+      close_markdown_range(row - 1)
       local comment = entry.review_comment
       comment.review_reply_header_marks = comment.review_reply_header_marks or {}
       if entry.review_reply_index then
@@ -12129,8 +12181,10 @@ function M._review.on_render(buf)
       end
     elseif entry and entry.kind == "review_comment" and entry.review_boundary == "footer" and entry.review_comment then
       close_comment_range(row - 1)
+      close_markdown_range(row - 1)
       entry.review_comment.review_footer_mark = vim.api.nvim_buf_set_extmark(buf, M._review.ns, row - 1, 0, { right_gravity = true })
     elseif entry and ((entry.review_body and entry.review_comment) or (entry.pr_comment_body and entry.pr_comment)) then
+      close_markdown_range(row - 1)
       local comment = entry.review_comment or entry.pr_comment
       local body_index = entry.review_body_index or entry.pr_comment_body_index
       comment.review_body_line_marks = comment.review_body_line_marks or {}
@@ -12140,11 +12194,19 @@ function M._review.on_render(buf)
         close_comment_range(row - 1)
         range_comment, range_start = comment, row
       end
+    elseif entry and entry.kind == "review_comment" and entry.review_reply_body and entry.review_comment then
+      close_comment_range(row - 1)
+      if entry.review_comment ~= markdown_range_comment then
+        close_markdown_range(row - 1)
+        markdown_range_comment, markdown_range_start = entry.review_comment, row
+      end
     else
       close_comment_range(row - 1)
+      close_markdown_range(row - 1)
     end
   end
   close_comment_range(#lines)
+  close_markdown_range(#lines)
   state.review_comment_rule_width = M._review.comment_rule_width(nil, buf)
   if state.view_kind == "review" then M._review.sync_modifiable(buf) end
 end
@@ -12326,7 +12388,7 @@ end
 ---@param body string
 ---@return string
 function M._review.comment_body_for_sync(body)
-  local lines = M._review.trim_comment_body_lines(vim.split(tostring(body or ""), "\n", { plain = true }))
+  local lines = M._review.trim_comment_body_lines(vim.split(M._review.normalize_comment_body_text(body), "\n", { plain = true }))
   return table.concat(lines, "\n")
 end
 
@@ -12546,7 +12608,7 @@ function M._review.comment_body_text_from_buffer(buf, comment)
   local start_row0, end_row0 = M._review.comment_body_range0(buf, comment)
   if start_row0 == nil or end_row0 == nil or end_row0 < start_row0 then return nil end
   local raw_lines = vim.api.nvim_buf_get_lines(buf, start_row0, end_row0, false)
-  return table.concat(M._review.trim_comment_body_lines(raw_lines), "\n")
+  return M._review.normalize_comment_body_text(table.concat(M._review.trim_comment_body_lines(raw_lines), "\n"))
 end
 
 ---@param buf integer
@@ -12709,7 +12771,7 @@ function M._review.changed_inline_comment_body(buf)
   for _, comment in ipairs(state.review_comments or {}) do
     if comment.local_state ~= "deleted" then
       local edited_text = M._review.comment_body_text_from_buffer(buf, comment)
-      local rendered_text = tostring(comment.body or "")
+      local rendered_text = M._review.normalize_comment_body_text(comment.body)
       if edited_text and edited_text ~= rendered_text then return comment, edited_text end
     end
   end
@@ -12724,6 +12786,7 @@ function M._review.sync_inline_comment_text(buf)
   if not state or state.review_rendering or state.review_editing_comment then return false end
   local comment, edited_text = M._review.changed_inline_comment_body(buf)
   if not (comment and edited_text) then return false end
+  edited_text = M._review.normalize_comment_body_text(edited_text)
   comment.body = edited_text
   comment.review_rendered_body_text = edited_text
   comment.updated_at = os.date("%Y-%m-%d %H:%M")
@@ -13033,6 +13096,98 @@ function M._pr_overview.comment_identity_key(comment)
   return nil
 end
 
+---@param target table
+---@param remote table
+function M._pr_overview.merge_remote_editable_comment(target, remote)
+  target.remote_id = remote.remote_id or target.remote_id
+  target.remote_node_id = remote.remote_node_id or target.remote_node_id
+  target.remote_review_id = remote.review_id or target.remote_review_id
+  target.review_node_id = remote.review_node_id or target.review_node_id
+  target.review_state = remote.review_state or target.review_state
+  target.position = remote.position or target.position
+  target.line = remote.line or target.line
+  target.start_line = remote.start_line or target.start_line
+  target.start_side = remote.start_side or target.start_side
+  if remote.path and remote.path ~= "" then target.path = remote.path end
+  target.side = remote.side or target.side
+  target.user = remote.user or target.user
+  target.created_at = remote.created_at or target.created_at
+  target.updated_at = remote.updated_at or target.updated_at
+  target.url = remote.url or target.url
+  target.resolved = remote.resolved
+  target.outdated = remote.outdated
+  target.viewer_did_author = remote.viewer_did_author
+  target.replies = type(remote.replies) == "table" and vim.deepcopy(remote.replies) or (target.replies or {})
+
+  local remote_body = M._review.normalize_comment_body_text(remote.body)
+  local base_body = M._review.normalize_comment_body_text(target.base_body)
+  local local_body = M._review.normalize_comment_body_text(target.body)
+  local base_sync_body = M._review.comment_body_for_sync(base_body)
+  local local_sync_body = M._review.comment_body_for_sync(local_body)
+  if target.local_state == "dirty" or target.local_state == "new" then
+    if remote_body == local_sync_body then
+      target.base_body = remote_body
+      target.local_state = "clean"
+    elseif base_body ~= "" and remote_body ~= base_sync_body then
+      target.remote_body = remote_body
+      target.local_state = "conflict"
+    end
+  elseif target.local_state ~= "deleted" then
+    target.body = remote_body
+    target.base_body = remote_body
+    target.remote_body = nil
+    target.local_state = "clean"
+  end
+end
+
+---@param status table
+---@param list table[]
+---@param remote table
+---@param opts? { regular?: boolean }
+function M._pr_overview.merge_viewer_authored_comment_into_list(status, list, remote, opts)
+  if not (remote and remote.viewer_did_author == true) then return end
+  local key = M._pr_overview.comment_identity_key(remote)
+  if not key then return end
+  for _, comment in ipairs(list) do
+    if M._pr_overview.comment_identity_key(comment) == key then
+      M._pr_overview.merge_remote_editable_comment(comment, remote)
+      if opts and opts.regular then comment.pr_issue_comment = true else comment.standalone = true end
+      M._review.normalize_comment(status, comment)
+      return
+    end
+  end
+
+  local comment
+  if opts and opts.regular then
+    comment = vim.deepcopy(remote)
+    comment.local_id = remote.remote_node_id or ("remote:" .. tostring(remote.remote_id or ""))
+    comment.pr_issue_comment = true
+    comment.local_state = "clean"
+    comment.base_body = remote.body
+    comment.replies = type(remote.replies) == "table" and vim.deepcopy(remote.replies) or {}
+    M._review.normalize_comment(status, comment)
+  else
+    comment = M._review.comment_from_remote(status, remote)
+    comment.standalone = true
+  end
+  list[#list + 1] = comment
+end
+
+---@param status table
+---@param comments DiffReviewGhPRCommentsResult?
+function M._pr_overview.import_viewer_authored_comments(status, comments)
+  if not (status and comments) then return end
+  status.pr_standalone_comments = status.pr_standalone_comments or {}
+  status.pr_regular_comments = status.pr_regular_comments or {}
+  for _, comment in ipairs(comments.code_comments or {}) do
+    M._pr_overview.merge_viewer_authored_comment_into_list(status, status.pr_standalone_comments, comment)
+  end
+  for _, comment in ipairs(comments.issue_comments or {}) do
+    M._pr_overview.merge_viewer_authored_comment_into_list(status, status.pr_regular_comments, comment, { regular = true })
+  end
+  M._pr_overview.refresh_editable_comments(status)
+end
+
 ---@param status table
 ---@param target table?
 ---@return integer?
@@ -13066,11 +13221,34 @@ function M._pr_overview.is_standalone_comment(status, comment)
 end
 
 ---@param buf integer
+---@param status table
+---@param comment table
+---@return boolean opened
+function M._pr_overview.open_pr_comment_body(buf, status, comment)
+  if not (buf and status and comment and vim.api.nvim_buf_is_valid(buf)) then return false end
+  local cursor_row = vim.api.nvim_win_get_cursor(0)[1]
+  for _, row in ipairs({ cursor_row, cursor_row - 1, cursor_row + 1 }) do
+    local entry = status.entries and status.entries[row] or nil
+    if entry
+      and entry.kind == "pr_comment"
+      and entry.id
+      and entry.pr_comment
+      and M._review.same_comment(entry.pr_comment, comment)
+      and status_folded(entry.id, true) then
+      set_status_folded(entry.id, false)
+      render_pr_status(status.pr, status.cwd, buf, status.pr_diff_text)
+      return true
+    end
+  end
+  return false
+end
+
+---@param buf integer
 ---@return table? comment
 function M._pr_overview.standalone_comment_under_cursor(buf)
   local status = M._pr_overview.state(buf)
   if not status then return nil end
-  local comment = M._review.comment_under_cursor(buf)
+  local comment = M._review.comment_at_cursor(buf)
   if M._pr_overview.is_standalone_comment(status, comment) then return comment end
   return nil
 end
@@ -13404,6 +13582,7 @@ function M._pr_overview.add_standalone_comment(buf)
   M._status = status
   local existing = M._pr_overview.standalone_comment_under_cursor(buf)
   if existing then
+    M._pr_overview.open_pr_comment_body(buf, status, existing)
     M._review.focus_inline_comment(buf, existing)
     return
   end
@@ -13631,6 +13810,7 @@ function M._review.attach(buf)
     callback = function()
       M._review.sync_comment_text(buf)
       M._review.sync_inline_comment_text(buf)
+      M._pr_edit.render_markdown_regions(buf)
     end,
   })
 end
@@ -14002,30 +14182,178 @@ function M._pr_edit.description_range0(buf)
 end
 
 ---@param buf integer
-function M._pr_edit.prune_description_markdown(buf)
+---@param ranges table[]
+function M._pr_edit.prune_markdown_ranges(buf, ranges)
   if not vim.api.nvim_buf_is_valid(buf) then return end
   local namespace = M._pr_edit.markdown_namespace()
-  local first0, after0 = M._pr_edit.description_range0(buf)
-  if not (first0 and after0) then
+  if type(ranges) ~= "table" or #ranges == 0 then
     vim.api.nvim_buf_clear_namespace(buf, namespace, 0, -1)
     return
   end
+  local function row_in_range(row0)
+    for _, range in ipairs(ranges) do
+      if row0 >= range.first0 and row0 < range.after0 then return true end
+    end
+    return false
+  end
   for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(buf, namespace, 0, -1, {})) do
     local row0 = mark[2]
-    if row0 < first0 or row0 >= after0 then pcall(vim.api.nvim_buf_del_extmark, buf, namespace, mark[1]) end
+    if not row_in_range(row0) then pcall(vim.api.nvim_buf_del_extmark, buf, namespace, mark[1]) end
+  end
+end
+
+---@param row0 integer
+---@param ranges table[]
+---@return boolean
+function M._pr_edit.row_in_markdown_range(row0, ranges)
+  for _, range in ipairs(ranges or {}) do
+    if row0 >= range.first0 and row0 < range.after0 then return true end
+  end
+  return false
+end
+
+---@param ranges table[]
+---@return table[]
+function M._pr_edit.markdown_parser_regions(ranges)
+  local region = {}
+  for _, range in ipairs(ranges or {}) do
+    if range.first0 and range.after0 and range.after0 > range.first0 then
+      region[#region + 1] = { range.first0, 0, range.after0, 0 }
+    end
+  end
+  return #region > 0 and { region } or {}
+end
+
+---@param parser table
+---@param ranges table[]
+function M._pr_edit.apply_markdown_parser_regions(parser, ranges)
+  if type(parser) ~= "table" or type(parser.set_included_regions) ~= "function" then return end
+  pcall(parser.set_included_regions, parser, M._pr_edit.markdown_parser_regions(ranges))
+end
+
+---@param buf integer
+function M._pr_edit.prune_description_markdown(buf)
+  local first0, after0 = M._pr_edit.description_range0(buf)
+  if first0 == nil or after0 == nil or after0 <= first0 then
+    M._pr_edit.prune_markdown_ranges(buf, {})
+    return
+  end
+  M._pr_edit.prune_markdown_ranges(buf, { { first0 = first0, after0 = after0 } })
+end
+
+---@param ranges table[]?
+---@return table[]
+function M._pr_edit.normalized_markdown_ranges(ranges)
+  local normalized = {}
+  for _, range in ipairs(ranges or {}) do
+    local first0 = tonumber(range and range.first0)
+    local after0 = tonumber(range and range.after0)
+    if first0 and after0 and after0 > first0 then
+      normalized[#normalized + 1] = { first0 = first0, after0 = after0 }
+    end
+  end
+  table.sort(normalized, function(left, right)
+    if left.first0 == right.first0 then return left.after0 < right.after0 end
+    return left.first0 < right.first0
+  end)
+  local merged = {}
+  for _, range in ipairs(normalized) do
+    local previous = merged[#merged]
+    if previous and range.first0 <= previous.after0 then
+      previous.after0 = math.max(previous.after0, range.after0)
+    else
+      merged[#merged + 1] = range
+    end
+  end
+  return merged
+end
+
+---@param buf integer
+---@return table[]
+function M._pr_edit.markdown_ranges0(buf)
+  local ranges = {}
+  local function add_range(first0, after0)
+    if first0 ~= nil and after0 ~= nil and after0 > first0 then
+      ranges[#ranges + 1] = { first0 = first0, after0 = after0 }
+    end
+  end
+
+  local first0, after0 = M._pr_edit.description_range0(buf)
+  add_range(first0, after0)
+
+  local state = M._review.state(buf)
+  if state then
+    add_range(M._review.mark_row(buf, state.review_comment_start), M._review.mark_row(buf, state.review_comment_end))
+    for _, comment in ipairs(state.review_comments or {}) do
+      add_range(M._review.comment_body_range0(buf, comment))
+      for _, range in ipairs(comment.review_markdown_ranges or {}) do
+        add_range(M._review.mark_row(buf, range.start_mark), M._review.mark_row(buf, range.end_mark))
+      end
+    end
+  end
+
+  return M._pr_edit.normalized_markdown_ranges(ranges)
+end
+
+---@param buf integer
+---@param ranges table[]
+---@return fun()
+function M._pr_edit.begin_markdown_extmark_scope(buf, ranges)
+  M._pr_edit.markdown_extmark_scopes = M._pr_edit.markdown_extmark_scopes or {}
+  local scope = M._pr_edit.markdown_extmark_scopes[buf] or { count = 0, ranges = {} }
+  scope.count = scope.count + 1
+  scope.ranges = M._pr_edit.normalized_markdown_ranges(ranges)
+  M._pr_edit.markdown_extmark_scopes[buf] = scope
+
+  if not M._pr_edit.markdown_extmark_set_extmark then
+    local original_set_extmark = vim.api.nvim_buf_set_extmark
+    M._pr_edit.markdown_extmark_original_set_extmark = original_set_extmark
+    M._pr_edit.markdown_extmark_set_extmark = function(mark_buf, namespace, row0, col0, opts)
+      local active_scope = M._pr_edit.markdown_extmark_scopes and M._pr_edit.markdown_extmark_scopes[mark_buf] or nil
+      if active_scope and active_scope.count > 0 and namespace == M._pr_edit.markdown_namespace() then
+        local mark_row0 = tonumber(row0)
+        if mark_row0 and not M._pr_edit.row_in_markdown_range(mark_row0, active_scope.ranges) then return nil end
+      end
+      return original_set_extmark(mark_buf, namespace, row0, col0, opts)
+    end
+    vim.api.nvim_buf_set_extmark = M._pr_edit.markdown_extmark_set_extmark
+  end
+
+  local restored = false
+  return function()
+    if restored then return end
+    restored = true
+    local current_scope = M._pr_edit.markdown_extmark_scopes and M._pr_edit.markdown_extmark_scopes[buf] or nil
+    if current_scope then
+      current_scope.count = current_scope.count - 1
+      if current_scope.count > 0 then
+        M._pr_edit.markdown_extmark_scopes[buf] = current_scope
+      else
+        M._pr_edit.markdown_extmark_scopes[buf] = nil
+      end
+    end
+    if M._pr_edit.markdown_extmark_scopes and next(M._pr_edit.markdown_extmark_scopes) == nil then
+      if vim.api.nvim_buf_set_extmark == M._pr_edit.markdown_extmark_set_extmark then
+        vim.api.nvim_buf_set_extmark = M._pr_edit.markdown_extmark_original_set_extmark
+      end
+      M._pr_edit.markdown_extmark_set_extmark = nil
+      M._pr_edit.markdown_extmark_original_set_extmark = nil
+    end
   end
 end
 
 ---@param buf integer
 ---@param win integer
+---@param ranges table[]
 ---@return table
-function M._pr_edit.description_markdown_config(buf, win)
+function M._pr_edit.markdown_region_config(buf, win, ranges)
   local conceallevel = vim.api.nvim_get_option_value("conceallevel", { scope = "local", win = win })
   local concealcursor = vim.api.nvim_get_option_value("concealcursor", { scope = "local", win = win })
   return {
     enabled = true,
     render_modes = true,
     debounce = 0,
+    completions = { lsp = { enabled = false } },
     sign = { enabled = false },
     win_options = {
       conceallevel = { default = conceallevel, rendered = conceallevel },
@@ -14033,15 +14361,76 @@ function M._pr_edit.description_markdown_config(buf, win)
     },
     on = {
       render = function(ctx)
-        M._pr_edit.prune_description_markdown(ctx.buf)
+        M._pr_edit.prune_markdown_ranges(ctx.buf, ranges)
       end,
     },
   }
 end
 
 ---@param buf integer
+function M._pr_edit.reset_render_markdown_config(buf)
+  local ok, state = pcall(require, "render-markdown.state")
+  if ok and type(state) == "table" and type(state.cache) == "table" then
+    state.cache[buf] = nil
+  end
+end
+
+---@param buf integer
+---@param ranges table[]
+---@return fun()
+function M._pr_edit.begin_markdown_parser_scope(buf, ranges)
+  M._pr_edit.markdown_parser_scopes = M._pr_edit.markdown_parser_scopes or {}
+  M._pr_edit.markdown_parser_ranges = M._pr_edit.markdown_parser_ranges or {}
+  M._pr_edit.markdown_parser_scopes[buf] = (M._pr_edit.markdown_parser_scopes[buf] or 0) + 1
+  M._pr_edit.markdown_parser_ranges[buf] = M._pr_edit.normalized_markdown_ranges(ranges)
+  if M._pr_edit.markdown_parser_get_parser then
+    local restored = false
+    return function()
+      if restored then return end
+      restored = true
+      local count = (M._pr_edit.markdown_parser_scopes[buf] or 1) - 1
+      M._pr_edit.markdown_parser_scopes[buf] = count > 0 and count or nil
+      if count <= 0 and M._pr_edit.markdown_parser_ranges then M._pr_edit.markdown_parser_ranges[buf] = nil end
+    end
+  end
+
+  local original_get_parser = vim.treesitter.get_parser
+  M._pr_edit.markdown_parser_original_get_parser = original_get_parser
+  M._pr_edit.markdown_parser_get_parser = function(parser_buf, lang, opts)
+    local scopes = M._pr_edit.markdown_parser_scopes or {}
+    if lang == nil and (scopes[parser_buf] or 0) > 0 then
+      local parser = original_get_parser(parser_buf, "markdown", opts)
+      local parser_ranges = M._pr_edit.markdown_parser_ranges and M._pr_edit.markdown_parser_ranges[parser_buf] or {}
+      M._pr_edit.apply_markdown_parser_regions(parser, parser_ranges)
+      return parser
+    end
+    return original_get_parser(parser_buf, lang, opts)
+  end
+  vim.treesitter.get_parser = M._pr_edit.markdown_parser_get_parser
+
+  local restored = false
+  return function()
+    if restored then return end
+    restored = true
+    local count = (M._pr_edit.markdown_parser_scopes[buf] or 1) - 1
+    M._pr_edit.markdown_parser_scopes[buf] = count > 0 and count or nil
+    if count <= 0 and M._pr_edit.markdown_parser_ranges then M._pr_edit.markdown_parser_ranges[buf] = nil end
+  end
+end
+
+---@param buf integer
+---@param win integer
+---@return table
+function M._pr_edit.description_markdown_config(buf, win)
+  local first0, after0 = M._pr_edit.description_range0(buf)
+  return M._pr_edit.markdown_region_config(buf, win, M._pr_edit.normalized_markdown_ranges({
+    { first0 = first0, after0 = after0 },
+  }))
+end
+
+---@param buf integer
 ---@return integer?
-function M._pr_edit.description_markdown_window(buf)
+function M._pr_edit.markdown_window(buf)
   if vim.api.nvim_get_current_buf() == buf then return vim.api.nvim_get_current_win() end
   local wins = vim.fn.win_findbuf(buf)
   for _, win in ipairs(wins) do
@@ -14053,27 +14442,27 @@ end
 ---@param buf integer
 function M._pr_edit.activate_markdown_code(buf)
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
-  if not M._pr_edit.gitstatus_markdown_language_registered then
-    pcall(vim.treesitter.language.register, "markdown", "GitStatus")
-    M._pr_edit.gitstatus_markdown_language_registered = true
-  end
   local ok, markdown_code = pcall(require, "markdown_code")
   if ok and type(markdown_code) == "table" and type(markdown_code.activate) == "function" then
     markdown_code.activate(buf, {
-      filetype = "GitStatus",
-      register_as_markdown = true,
+      filetype = "markdown",
       notify_title = "DiffReview",
     })
   end
 end
 
 ---@param buf integer
-function M._pr_edit.render_description_markdown(buf)
-  local status = M._status_states and M._status_states[buf] or nil
-  local state = status and status.pr_edit or nil
-  if not (state and vim.api.nvim_buf_is_valid(buf)) then return end
+function M._pr_edit.render_markdown_regions(buf)
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
 
   M._pr_edit.activate_markdown_code(buf)
+
+  local ranges = M._pr_edit.markdown_ranges0(buf)
+  if #ranges == 0 then
+    M._pr_edit.prune_markdown_ranges(buf, ranges)
+    M._status_stop_markdown_highlighter(buf)
+    return
+  end
 
   if M._pr_edit.render_markdown_unavailable then return end
   local ok, render_markdown = pcall(require, "render-markdown")
@@ -14082,24 +14471,44 @@ function M._pr_edit.render_description_markdown(buf)
     return
   end
 
-  if not M._pr_edit.gitstatus_markdown_language_registered then
-    pcall(vim.treesitter.language.register, "markdown", "GitStatus")
-    M._pr_edit.gitstatus_markdown_language_registered = true
-  end
-
-  local win = M._pr_edit.description_markdown_window(buf)
+  local win = M._pr_edit.markdown_window(buf)
   if not win then return end
+  M._pr_edit.reset_render_markdown_config(buf)
+  local restore_parser = M._pr_edit.begin_markdown_parser_scope(buf, ranges)
+  local restore_extmarks = M._pr_edit.begin_markdown_extmark_scope(buf, ranges)
+  local function restore_scope()
+    restore_extmarks()
+    restore_parser()
+  end
+  local config = M._pr_edit.markdown_region_config(buf, win, ranges)
+  local on_render = config.on.render
+  config.on.render = function(ctx)
+    if on_render then on_render(ctx) end
+    restore_scope()
+  end
   local render_ok, err = pcall(render_markdown.render, {
     buf = buf,
     win = win,
-    config = M._pr_edit.description_markdown_config(buf, win),
+    config = config,
   })
   if render_ok then
-    M._pr_edit.prune_description_markdown(buf)
-  elseif not M._pr_edit.render_markdown_error_notified then
-    M._pr_edit.render_markdown_error_notified = true
-    vim.notify("PR description markdown render failed: " .. tostring(err), vim.log.levels.WARN, { title = "DiffReview" })
+    vim.defer_fn(function()
+      M._pr_edit.prune_markdown_ranges(buf, M._pr_edit.markdown_ranges0(buf))
+      restore_scope()
+    end, 100)
+    M._status_stop_markdown_highlighter(buf)
+  else
+    restore_scope()
+    if not M._pr_edit.render_markdown_error_notified then
+      M._pr_edit.render_markdown_error_notified = true
+      vim.notify("DiffReview markdown render failed: " .. tostring(err), vim.log.levels.WARN, { title = "DiffReview" })
+    end
   end
+end
+
+---@param buf integer
+function M._pr_edit.render_description_markdown(buf)
+  M._pr_edit.render_markdown_regions(buf)
 end
 
 ---@param buf integer
