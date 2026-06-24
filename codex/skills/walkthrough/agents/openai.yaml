@@ -1,4 +1,0 @@
-interface:
-  display_name: "Walkthrough"
-  short_description: "Generate DiffReview walkthroughs"
-  default_prompt: "Use $walkthrough to generate and validate a DiffReview walkthrough."

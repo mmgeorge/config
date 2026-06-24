@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "diff-review-walkthrough.schema.json",
   "title": "DiffReview Walkthrough",
-  "description": "Guided review walkthrough of a set of changes, consumed by the DiffReview Neovim plugin. Lives at the repository root as .walkthrough.json.",
+  "description": "Guided review walkthrough for repository changes, consumed by the DiffReview Neovim plugin. Lives at the repository root as .walkthrough.json.",
   "type": "object",
   "required": ["version", "flow", "overview", "root", "commit", "tasks"],
   "additionalProperties": false,

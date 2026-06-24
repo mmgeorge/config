@@ -1,4 +1,0 @@
-interface:
-  display_name: "Planning"
-  short_description: "Reviewer-readable implementation plans"
-  default_prompt: "Use $planning to draft a reviewer-readable implementation plan."
