@@ -123,7 +123,9 @@ return {
 
     -- Build the Rust fuzzy matcher locally instead of replacing a pre-built DLL.
     version = '1.*',
-    build = 'cargo build --release',
+    build = function()
+      require('blink.cmp').build():wait(60000)
+    end,
 
     init = function()
       vim.cmd([[highlight BlinkCmpMenu             guibg=#242529 guifg=White]])
@@ -148,7 +150,7 @@ return {
         --   end
         --   return 1
         -- end,
-        implementation = "rust",
+        implementation = "prefer_rust_with_warning",
         prebuilt_binaries = {
           download = false,
         },
