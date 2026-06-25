@@ -26,6 +26,7 @@
 ---@field _main_win integer?
 ---@field suspend_preview boolean?
 ---@field _collect_items_from_git fun(cwd: string, cb: fun(items: table[]), ctx?: table)
+---@field [string] any Re-export functions wired onto M by the `for _, fn in pairs(module)` loops below are invisible to static analysis; this index keeps `dr()._x` seam reads from flagging undefined-field.
 local M = {}
 
 -- Register the plugin's bundled treesitter queries on the runtimepath (see query_runtime).
@@ -297,7 +298,6 @@ local status_section_order = {
   { name = "unstaged", title = "Unstaged changes", default_folded = false },
   { name = "staged", title = "Staged changes", default_folded = false },
 }
-local status_reconcile_delay_ms = 120
 
 ---@class DiffReviewStatusCommandSpec
 ---@field id string
@@ -310,7 +310,6 @@ local status_reconcile_delay_ms = 120
 ---@field views? table<DiffReviewStatusViewKind, boolean>
 
 ---@type DiffReviewStatusCommandSpec[]
-local status_command_specs = require("diff_review.shared.command_specs").specs
 
 M._status_hint_command_ids_by_view = require("diff_review.shared.command_specs").hint_command_ids_by_view
 

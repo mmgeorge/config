@@ -853,8 +853,7 @@ function M.new_walkthrough_source(handle, opts)
   opts = opts or {}
   handle = vim.deepcopy(handle or { id = "walkthrough", kind = "walkthrough" })
   handle.kind = "walkthrough"
-  ---@type DiffReviewWalkthroughDiffSource
-  local source = M.new_source(handle)
+  local source = M.new_source(handle) --[[@as DiffReviewWalkthroughDiffSource]]
   source.base_source_ids = opts.base_source_ids or {}
   source.file_order = opts.file_order or {}
   source.step_annotations = opts.step_annotations or {}
