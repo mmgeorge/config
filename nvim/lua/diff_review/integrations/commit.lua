@@ -28,7 +28,9 @@ M._active = nil
 --- `require` it (it has no user runtimepath otherwise).
 local function runtimepath_root()
   local source = debug.getinfo(1, "S").source:sub(2):gsub("\\", "/")
-  return (source:gsub("/lua/diff_review/commit%.lua$", ""))
+  -- Strip /lua/diff_review/... to the config root holding lua/, depth-agnostic so the
+  -- module can move within the plugin without breaking the headless editor's require path.
+  return (source:gsub("/lua/diff_review/.*$", ""))
 end
 
 --- The GIT_EDITOR command: a headless nvim that runs M.client(). Mirrors
