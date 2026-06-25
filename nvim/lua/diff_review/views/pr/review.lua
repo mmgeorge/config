@@ -2662,7 +2662,7 @@ function M.start(buf)
     vim.notify("No GitHub PR for this branch", vim.log.levels.INFO, { title = "DiffReview" })
     return
   end
-  M.open_review(pr, { cwd = status.cwd })
+  dr().open_review(pr, { cwd = status.cwd })
 end
 
 ---@param buf integer
