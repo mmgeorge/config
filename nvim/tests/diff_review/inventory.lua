@@ -1,4 +1,4 @@
-local inventory = require("diff_review.inventory")
+local inventory = require("diff_review.infra.inventory")
 
 local root = "D:/diffreview-inventory-root"
 

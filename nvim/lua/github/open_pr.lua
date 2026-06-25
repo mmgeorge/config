@@ -552,7 +552,7 @@ local function create_pr(cwd, branch, selected_base_branch, metadata)
 
     local pr_ref = output:match("https?://%S+") or vim.trim(output)
     show_progress("Opening PR in nvim...")
-    require("diff_review.gh").pr_async(cwd, pr_ref, nil, function(result)
+    require("diff_review.integrations.gh").pr_async(cwd, pr_ref, nil, function(result)
       if not result.ok or not result.pr then
         fail_progress("Created PR, but failed to open PR view: " .. (result.message or "Unable to load GitHub pull request"))
         return

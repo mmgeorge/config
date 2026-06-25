@@ -1,7 +1,7 @@
 vim.loader.enable(false)
 
 local diff_review = require("diff_review")
-local gh = require("diff_review.gh")
+local gh = require("diff_review.integrations.gh")
 local root = "D:/mock/project"
 local original_compute_hunk_context_async = diff_review.compute_hunk_context_async
 local original_compute_diff_syntax_async = diff_review.compute_diff_syntax_async

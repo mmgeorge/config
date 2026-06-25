@@ -324,7 +324,7 @@ return {
           diff_review_reviewers = {
             name = "Reviewers",
             min_keyword_length = 0,
-            module = "diff_review.reviewer_source",
+            module = "diff_review.views.pr.reviewer_source",
           },
           github_issues = {
             name = "Issues",

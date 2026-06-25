@@ -1,7 +1,7 @@
 vim.loader.enable(false)
 
 local diff_review = require("diff_review")
-local gh = require("diff_review.gh")
+local gh = require("diff_review.integrations.gh")
 
 local original_cwd = vim.fs.normalize(vim.fn.getcwd())
 local test_root = vim.fs.normalize(original_cwd .. "/.diffreview-empty-diff-cursor-test")

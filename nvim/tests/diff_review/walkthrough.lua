@@ -1,8 +1,8 @@
 vim.loader.enable(false)
 
 local diff_review = require("diff_review")
-local gh = require("diff_review.gh")
-local walkthrough = require("diff_review.walkthrough")
+local gh = require("diff_review.integrations.gh")
+local walkthrough = require("diff_review.views.walkthrough")
 
 local root = "D:/diffreview-flow-root"
 local head_sha = string.rep("a", 40)

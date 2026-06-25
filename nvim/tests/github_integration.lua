@@ -224,7 +224,7 @@ local function reviewer_completion_labels(buf, row, text)
   local old_virtualedit = vim.o.virtualedit
   vim.o.virtualedit = "onemore"
   vim.api.nvim_win_set_cursor(0, { row, #text })
-  local reviewer_source = require("diff_review.reviewer_source").new({})
+  local reviewer_source = require("diff_review.views.pr.reviewer_source").new({})
   assert_true(reviewer_source:enabled(), "reviewer completion source did not enable on: " .. text)
   local completion_result
   reviewer_source:get_completions({}, function(result) completion_result = result end)

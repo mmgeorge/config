@@ -1,7 +1,7 @@
 vim.loader.enable(false)
 
 local diff_review = require("diff_review")
-local gh = require("diff_review.gh")
+local gh = require("diff_review.integrations.gh")
 
 -- Diff-body syntax/background/intraline live in the decoration span store and are
 -- emitted by the provider; drive the test seam to apply them into the decorate

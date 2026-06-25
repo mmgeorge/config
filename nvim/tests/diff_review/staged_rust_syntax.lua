@@ -1,7 +1,7 @@
 vim.loader.enable(false)
 
 local diff_review = require("diff_review")
-local gh = require("diff_review.gh")
+local gh = require("diff_review.integrations.gh")
 
 -- Diff-body syntax/background/intraline live in the decoration span store and are
 -- emitted by the provider; drive the test seam to apply them into the decorate
@@ -959,7 +959,7 @@ local function run()
 
   diff_review.set_git_backend(backend)
   gh.set_backend(gh_backend)
-  assert_true(require("diff_review.git_backend").current == backend, "git backend was not installed")
+  assert_true(require("diff_review.git.git_backend").current == backend, "git backend was not installed")
   diff_review.setup({ about_auto_generate = false })
   diff_review.open()
   local buf = vim.api.nvim_get_current_buf()

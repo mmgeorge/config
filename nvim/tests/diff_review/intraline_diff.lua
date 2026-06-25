@@ -1,6 +1,6 @@
 vim.loader.enable(false)
 
-local intraline = require("diff_review.intraline_diff")
+local intraline = require("diff_review.render.intraline_diff")
 
 local function assert_true(condition, message)
   if not condition then error(message, 2) end

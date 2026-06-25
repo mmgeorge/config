@@ -1,8 +1,8 @@
 vim.loader.enable(false)
 
 local diff_review = require("diff_review")
-local ai_commit = require("diff_review.ai_commit")
-local gh = require("diff_review.gh")
+local ai_commit = require("diff_review.integrations.ai_commit")
+local gh = require("diff_review.integrations.gh")
 local github_gh = require("github.gh")
 local issue_index = require("github.issue_index")
 

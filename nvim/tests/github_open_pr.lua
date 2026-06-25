@@ -2,7 +2,7 @@ vim.loader.enable(false)
 
 local open_pr = require("github.open_pr")
 local diff_review = require("diff_review")
-local gh = require("diff_review.gh")
+local gh = require("diff_review.integrations.gh")
 
 local root = "D:/mock/github"
 local other_root = "D:/mock/other-github"

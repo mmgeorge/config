@@ -153,7 +153,7 @@ local function pregenerate_commit()
       if result.code ~= 0 then return end
       local root = vim.trim(result.stdout or "")
       if root == "" then return end
-      require("diff_review.ai_commit").ensure(root, { ref = "HEAD" })
+      require("diff_review.integrations.ai_commit").ensure(root, { ref = "HEAD" })
     end)
   end)
 end
@@ -272,7 +272,7 @@ return {
             return
           end
 
-          require("diff_review.ai_commit").populate_commit_buffer_when_ready(args.buf, cwd, function(message, level)
+          require("diff_review.integrations.ai_commit").populate_commit_buffer_when_ready(args.buf, cwd, function(message, level)
             vim.notify(message, level, { title = "commit" })
           end)
         end,

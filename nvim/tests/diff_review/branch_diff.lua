@@ -1,7 +1,7 @@
 vim.loader.enable(false)
 
 local diff_review = require("diff_review")
-local gh = require("diff_review.gh")
+local gh = require("diff_review.integrations.gh")
 
 local root = "D:/diffreview-flow-root"
 

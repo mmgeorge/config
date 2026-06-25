@@ -161,7 +161,7 @@ shape is genuinely arbitrary.
 Run the load check:
 
 ```text
-nvim --headless -i NONE --cmd "set shadafile=NONE" -u nvim/init.lua -c "lua vim.loader.enable(false); require('diff_review').setup(); require('diff_review.commit'); require('plugins.diff_review')" -c "qa!"
+nvim --headless -i NONE --cmd "set shadafile=NONE" -u nvim/init.lua -c "lua vim.loader.enable(false); require('diff_review').setup(); require('diff_review.integrations.commit'); require('plugins.diff_review')" -c "qa!"
 ```
 
 Run the command-open check:
@@ -270,8 +270,8 @@ internals - init hands it a `DiffReviewWalkthroughHost` of closures via
 `M._walkthrough_host(buf)`. Tests inject the JSON with:
 
 ```lua
-require("diff_review.walkthrough").set_reader(function(path) return fixtures[path] end)
-require("diff_review.walkthrough").reset_reader()
+require("diff_review.views.walkthrough").set_reader(function(path) return fixtures[path] end)
+require("diff_review.views.walkthrough").reset_reader()
 ```
 
 HEAD-sha staleness lookups ride the git backend seam (`rev-parse HEAD`).

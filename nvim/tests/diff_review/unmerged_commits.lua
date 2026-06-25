@@ -1,7 +1,7 @@
 vim.loader.enable(false)
 
 local diff_review = require("diff_review")
-local gh = require("diff_review.gh")
+local gh = require("diff_review.integrations.gh")
 
 -- Diff-body syntax/background/intraline live in the decoration span store and are
 -- emitted by the provider; drive the test seam to apply them into the decorate
@@ -352,7 +352,7 @@ local function run()
   local staged_old_line = nil
   diff_review._diff_source_model.ensure_text(staged_file, "old", function(ok, snapshot)
     assert_true(ok, "staged file old text loader failed")
-    staged_old_line = require("diff_review.text_snapshot").line_text(snapshot, 1)
+    staged_old_line = require("diff_review.render.text_snapshot").line_text(snapshot, 1)
   end)
   wait_for(function() return staged_old_line == "before" end, "staged file old text did not load lazily")
   assert_true(registry.handle_by_id["commit:45806b8123456789"] ~= nil, "unmerged commit handle missing")

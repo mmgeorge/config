@@ -87,7 +87,7 @@ package.loaded["otter"] = {
 }
 
 local diff_review = require("diff_review")
-local gh = require("diff_review.gh")
+local gh = require("diff_review.integrations.gh")
 local github_gh = require("github.gh")
 local issue_index = require("github.issue_index")
 local repo_cache = require("github.repo_cache")
@@ -680,7 +680,7 @@ local function assert_cursor_clamped_to_line(buf, row, label)
   assert_true((pos[4] or 0) == 0, label .. " cursor kept virtual columns: " .. vim.inspect(pos))
 end
 
-local pr_edit_ns = vim.api.nvim_create_namespace("diff_review_pr_edit")
+local pr_edit_ns = vim.api.nvim_create_namespace("diff_review.views.pr.pr_edit")
 
 local function render_markdown_mark_rows(buf)
   local rows = {}
@@ -764,7 +764,7 @@ local function reviewer_completion_labels(buf, row, text)
   edit_line(buf, row, text)
   move_cursor(buf, row)
   vim.api.nvim_win_set_cursor(0, { row, #text })
-  local reviewer_source = require("diff_review.reviewer_source").new({})
+  local reviewer_source = require("diff_review.views.pr.reviewer_source").new({})
   assert_true(reviewer_source:enabled(), "reviewer completion source did not enable on: " .. text)
   local completion_result
   reviewer_source:get_completions({}, function(result) completion_result = result end)

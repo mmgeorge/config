@@ -25,7 +25,7 @@ $pass = 0; $fail = 0; $failures = @()
 
 if ($Filter -eq "") {
   Write-Host "== load check ==" -ForegroundColor Cyan
-  $r = Invoke-Nvim @("-c", "lua vim.loader.enable(false); require('diff_review').setup(); require('diff_review.commit'); require('plugins.diff_review')", "-c", "qa!")
+  $r = Invoke-Nvim @("-c", "lua vim.loader.enable(false); require('diff_review').setup(); require('diff_review.integrations.commit'); require('plugins.diff_review')", "-c", "qa!")
   if ($r.Code -eq 0) { $pass++; Write-Host "PASS load" -ForegroundColor Green }
   else { $fail++; $failures += "load"; Write-Host "FAIL load ($($r.Code)): $($r.Err)" -ForegroundColor Red }
 
