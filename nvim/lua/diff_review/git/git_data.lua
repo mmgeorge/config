@@ -541,13 +541,6 @@ local function build_untracked_diff(filename, relpath)
   return table.concat(out, "\n")
 end
 
----@param buf integer
----@param query vim.treesitter.Query
----@param highlight_query vim.treesitter.Query?
----@param trees TSTree[]
----@param target integer 0-based row
----@return DiffReviewHunkTreeSitterContext?
-
 --- Compute Tree-sitter scope context for a hunk without blocking UI render.
 ---@param filename string absolute path
 ---@param line number 1-based line number

@@ -3,6 +3,9 @@
 ---@class DiffReviewPrOverviewModule
 local M = {}
 
+--- Number of context lines kept around a change when rendering inline review comments.
+M.review_context_radius = 2
+
 local status_buffer = require("diff_review.views.status.status_buffer")
 local notifications = require("diff_review.infra.notifications")
 local gh = require("diff_review.integrations.gh")
@@ -193,9 +196,9 @@ end
 ---@return string
 function M.reviewer_login(reviewer)
   if type(reviewer) == "table" then
-    return tostring(reviewer.login or reviewer.slug or reviewer.name or ""):gsub("^@", "")
+    return (tostring(reviewer.login or reviewer.slug or reviewer.name or ""):gsub("^@", ""))
   end
-  return tostring(reviewer or ""):gsub("^@", "")
+  return (tostring(reviewer or ""):gsub("^@", ""))
 end
 
 ---@param reviewer any
@@ -465,7 +468,7 @@ function M.review_summary_line(review, alignment)
     line = line .. " " .. M.pad_display_right(date_text, #tail_parts > 0 and alignment.date_width or 0)
   end
   if #tail_parts > 0 then line = line .. "  " .. table.concat(tail_parts, "  ") end
-  return line:gsub("%s+$", "")
+  return (line:gsub("%s+$", ""))
 end
 
 ---@param review DiffReviewGhSubmittedReview
@@ -839,7 +842,7 @@ end
 ---@return string?
 function M.pr_base_url(pr)
   if not (pr and pr.url and pr.url ~= "") then return nil end
-  return pr.url:gsub("/$", "")
+  return (pr.url:gsub("/$", ""))
 end
 
 ---@param pr DiffReviewGhPR?

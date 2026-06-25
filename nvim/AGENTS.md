@@ -17,6 +17,16 @@ APIs, table-shaped state, callback seams, and tests. Prefer `---@class`,
 `---@field`, `---@alias`, `---@param`, `---@return`, and `---@type` so LSP
 diagnostics, completion, and jump-to-definition stay useful.
 
+Diagnostics come from `lua-language-server`. Check the whole plugin from the CLI
+with `lua-language-server --check nvim/lua/diff_review --logpath <scratch-outside-repo>`
+(use the scoop build; the Mason build crashes `--check` on a locale bug). Config is
+`nvim/.luarc.json` (LuaJIT, `vim` global, `checkThirdParty = false`); lazydev supplies
+the real `vim` runtime types in-editor. Most `undefined-field` / `inject-field` volume is
+the dynamic `dr()` seam pattern (init injects hundreds of `M._x` via `for pairs` loops that
+lua-ls cannot see statically), not real bugs. After a `git mv`-heavy refactor, run
+`:LspRestart` to clear stale-index duplicate warnings (lua-ls merges the old and new paths).
+See `lua/diff_review/AGENTS.md` → Linting for triage and the actionable codes worth fixing.
+
 Every Neovim request path must surface request failures with notifications:
 external CLI calls, Git/GitHub/API requests, async metadata loads, completion
 sources, and background processes must report nonzero exits, invalid JSON,

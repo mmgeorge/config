@@ -31,7 +31,7 @@ end
 ---@param value any
 ---@return string
 function M.text(value)
-  return tostring(value or ""):gsub("\r", "\\r"):gsub("\n", "\\n")
+  return (tostring(value or ""):gsub("\r", "\\r"):gsub("\n", "\\n"))
 end
 
 ---@param event string
@@ -148,7 +148,7 @@ function M.perf_span(event, payload, callback)
     error(results[2], 0)
   end
   M.perf_event(event, next_payload)
-  local unpack_values = table.unpack or unpack
+  local unpack_values = table.unpack or _G.unpack
   return unpack_values(results, 2, results.n)
 end
 function M.row_text(row)

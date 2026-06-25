@@ -36,6 +36,13 @@ local function notify_error(message, title)
 end
 local function notify_debug(...) return dr()._notify_debug(...) end
 
+--- One queued comment sync operation: the GitHub op, the target comment, and the
+--- normalized body captured at enqueue time so later edits cannot mutate it in flight.
+---@class DiffReviewCommentSyncItem
+---@field op "upsert"|"delete"
+---@field comment table
+---@field body string?
+
 -- Seams to init-owned helpers the review view shares.
 local function render_pr_status(...) return dr()._render_pr_status(...) end
 local function status_command_visible(...) return dr()._status_command_visible(...) end
@@ -50,7 +57,7 @@ local M = {
   reply_icon = nil,
   -- Test seams: the comment-body input and the verdict picker. Defaults open
   -- real UI; tests override them. Mirrors the set_backend/set_reader pattern.
-  input_provider = nil, ---@type (fun(title: string, on_submit: fun(text: string)))?
+  input_provider = nil, ---@type (fun(title: string, on_submit: fun(text: string), prefill: string?))?
   verdict_provider = nil, ---@type (fun(on_choice: fun(event: string?)))?
   data_dir_for_test = nil,
 }
@@ -211,7 +218,7 @@ end
 ---@param value any
 ---@return string
 function M.normalize_comment_body_text(value)
-  return tostring(value or ""):gsub("\r\n", "\n"):gsub("\r", "\n")
+  return (tostring(value or ""):gsub("\r\n", "\n"):gsub("\r", "\n"))
 end
 
 ---@param state table
@@ -470,11 +477,10 @@ function M.ensure_remote_review(state, cb)
   end)
 end
 
----@param buf integer
 ---Run one queued comment sync operation against GitHub (create/update/delete), restoring
 ---local comment state on failure. Calls cb(ok) when the operation settles.
 ---@param buf integer
----@param item { op: "upsert"|"delete", comment: table, body: string? }
+---@param item DiffReviewCommentSyncItem
 ---@param cb fun(ok: boolean)
 function M.run_sync_item(buf, item, cb)
   local state = M.state(buf)
@@ -619,16 +625,17 @@ function M.enqueue_sync(buf, op, comment)
   local state = M.state(buf)
   if not state then return end
   local queue = M.ensure_sync_queue(buf, state)
+  local pending = queue.pending --[[@as DiffReviewCommentSyncItem[] ]]
   local sync_body = op == "upsert" and M.comment_body_for_sync(comment.body or "") or nil
   if op == "upsert" then
-    for _, queued in ipairs(queue.pending) do
+    for _, queued in ipairs(pending) do
       if queued.op == "upsert" and queued.comment == comment then
         queued.body = sync_body
         return
       end
     end
   end
-  queue.pending[#queue.pending + 1] = { op = op, comment = comment, body = sync_body }
+  pending[#pending + 1] = { op = op, comment = comment, body = sync_body }
   annotations.drain_sync_queue(queue)
 end
 

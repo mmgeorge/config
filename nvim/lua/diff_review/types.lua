@@ -36,7 +36,7 @@
 ---@field systemlist? fun(command: DiffReviewGitCommand): string[]|string, integer?
 ---@field system? fun(command: DiffReviewGitCommand, input?: string): string, integer?
 ---@field systemlist_async? fun(command: DiffReviewGitCommand, cb: DiffReviewGitListCallback)
----@field system_async? fun(command: DiffReviewGitCommand, input: string?, cb: DiffReviewGitTextCallback)
+---@field system_async? fun(command: DiffReviewGitCommand, input: string?, cb: DiffReviewGitTextCallback, on_line: fun(line: string)?)
 ---@field system_stream_async? fun(command: DiffReviewGitCommand, input: string?, on_line: fun(line: string), cb: DiffReviewGitTextCallback)
 ---@field delete? fun(path: string): integer
 

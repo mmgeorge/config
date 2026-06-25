@@ -224,13 +224,13 @@ end
 function M._status_diff_file_path(file, status)
   if file and status and status.cwd and file.filename then
     local relative = paths.repo_relative(file.filename, status.cwd)
-    if relative and relative ~= "" then return relative:gsub("\\", "/") end
+    if relative and relative ~= "" then return (relative:gsub("\\", "/")) end
   end
   local relpath = file and file.relpath or nil
   if relpath and relpath ~= "" and not relpath:match("^%a:[/\\]") and not relpath:match("^/") then
-    return relpath:gsub("\\", "/")
+    return (relpath:gsub("\\", "/"))
   end
-  return tostring((file and (file.filename or file.relpath)) or ""):gsub("\\", "/")
+  return (tostring((file and (file.filename or file.relpath)) or ""):gsub("\\", "/"))
 end
 
 ---@param file_state DiffReviewDiffFileState

@@ -30,7 +30,7 @@ local function status_hunk_key(...) return dr()._status_hunk_key(...) end
 local function status_provider_hunk_key(...) return dr()._status_provider_hunk_key(...) end
 local function status_provider_file_key(...) return dr()._status_provider_file_key(...) end
 local function status_prewarm_entry_syntax(...) return dr()._status_prewarm_entry_syntax(...) end
-local function setup_bg_highlights(...) return dr()._setup_bg_highlights(...) end
+local function setup_bg_highlights() return dr()._setup_bg_highlights() end
 local function status_restore_cursor(...) return dr()._status_restore_cursor(...) end
 local function status_commit_key(...) return dr()._status_commit_key(...) end
 local function status_commit_hunk_key(...) return dr()._status_commit_hunk_key(...) end

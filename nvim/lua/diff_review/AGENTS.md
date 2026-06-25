@@ -156,6 +156,44 @@ Required patterns:
 Do not leave new public tables or callback seams as untyped `table` unless the
 shape is genuinely arbitrary.
 
+## Linting
+
+Editor diagnostics come from `lua-language-server` (lua-ls). Run it in batch mode to
+check the whole plugin from the command line (no editor required):
+
+```text
+lua-language-server --check nvim/lua/diff_review --checklevel=Warning --logpath ./.luals
+```
+
+It writes `<logpath>/check.json` listing every diagnostic with `file`, `range`, and `code`.
+Notes:
+
+- Use the **scoop** build (`~/scoop/shims/lua-language-server.exe`). The Mason build crashes
+  on `--check` with a `script/locale-loader.lua` error (works fine as the in-editor LSP).
+- Config is `nvim/.luarc.json` (`runtime.version = "LuaJIT"`, `diagnostics.globals = ["vim"]`,
+  `workspace.checkThirdParty = false`). It silences `undefined-global vim`. In the editor,
+  **lazydev** additionally supplies the real `vim` runtime types.
+
+Triage — most of the raw count is NOT real bugs:
+
+- `undefined-global` (`vim`) — config noise; the `.luarc.json` / lazydev handle it.
+- `undefined-field` / `inject-field` — mostly the dynamic `dr()` seam pattern. `init.lua` injects
+  hundreds of `M._x` fields via `for _, fn in pairs(module) do M[name] = fn end` loops that lua-ls
+  cannot see statically, so reads of those fields look "undefined". This is a false positive for the
+  architecture, not a bug. (`init`'s `M` is annotated `---@class DiffReviewModule`, not `---@type`,
+  so the explicit `M._x = mod.fn` seam lines ARE seen and assignment is allowed; only the
+  `for pairs` loop injections are invisible.)
+- Genuinely fixable, and worth keeping clean: `redundant-return-value` (usually
+  `return s:gsub(pat, rep)` returning string + replacement-count — wrap the expression in parens to
+  return one value), `undefined-doc-param` (a `---@param` that names a parameter the function does not
+  have — delete the stale line), `duplicate-doc-param`, `redundant-parameter`, `*-type-mismatch`,
+  `missing-fields` / `missing-return-value`.
+
+After a large refactor that moves files with `git mv`, the in-editor lua-ls can hold a STALE index of
+BOTH the old and new paths, producing spurious `duplicate-set-field` and duplicate-`---@class`
+warnings (it merges the two copies). `:LspRestart` (or reopening nvim) re-indexes from disk and
+clears them — there is nothing to fix in the code.
+
 ## Testing
 
 Run the load check:

@@ -3,7 +3,7 @@
 ---@field log_path string?
 ---@field slow_threshold_ms number
 ---@field sample_rate number
----@field flush_delay_ms integer
+---@field flush_delay_ms? integer
 
 ---@class DiffReviewPerfModule
 ---@field options DiffReviewPerfConfig
@@ -146,6 +146,7 @@ function M.span(event, payload, callback)
   elseif (tonumber(M.options.sample_rate) or 1) >= 1 then
     M.event(event, next_payload)
   end
+  ---@diagnostic disable-next-line: deprecated
   local unpack_value = table.unpack or unpack
   return unpack_value(result, 2, result.n)
 end

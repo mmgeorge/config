@@ -6,13 +6,13 @@ local M = {}
 ---@param path string
 ---@return string
 function M.normalize_path(path)
-  return tostring(vim.fs.normalize(vim.fn.fnamemodify(path, ":p"))):gsub("\\", "/"):gsub("/+$", "")
+  return (tostring(vim.fs.normalize(vim.fn.fnamemodify(path, ":p"))):gsub("\\", "/"):gsub("/+$", ""))
 end
 
 ---@param path string
 ---@return string
 function M.normalize_path_text(path)
-  return tostring(path or ""):gsub("\\", "/"):gsub("/+$", "")
+  return (tostring(path or ""):gsub("\\", "/"):gsub("/+$", ""))
 end
 
 ---@param cwd string

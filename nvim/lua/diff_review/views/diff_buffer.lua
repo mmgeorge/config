@@ -674,7 +674,7 @@ function M.open_diff_buffer(filename)
           end
         end
       end
-      M.stage_patch_async(patch, function(ok)
+      dr().stage_patch_async(patch, function(ok)
         if not ok then return end
         notify_debug("Hunk staged")
         local win = vim.api.nvim_get_current_win()
@@ -712,7 +712,7 @@ function M.open_diff_buffer(filename)
         vim.notify("No hunk under cursor", vim.log.levels.WARN)
         return
       end
-      M.unstage_patch_async(patch, function(ok)
+      dr().unstage_patch_async(patch, function(ok)
         if not ok then return end
         notify_debug("Hunk unstaged")
         local win = vim.api.nvim_get_current_win()
@@ -807,7 +807,7 @@ function M._compute_hunk_map(diff_text)
         found_hunk_header = true
       end
     end
-    -- Strip trailing empty lines to match dr()._parse_hunk_body().
+    -- Strip trailing empty lines to match render.diff_parse.parse_hunk_body().
     while #code_lines_list > 0 and code_lines_list[#code_lines_list]:match("^%s*$") do
       table.remove(code_lines_list)
     end
@@ -951,6 +951,8 @@ function M._update_file_diff_cache_async(filename, cb)
   local relpath = dr()._untracked and dr()._untracked[filename]
   if relpath then
     local diff_text = dr()._build_untracked_diff(filename, relpath)
+    -- Cache `false` (not nil) as a "checked, no diff" sentinel; cast to satisfy the
+    -- string-valued field type while preserving the boolean sentinel at runtime.
     dr()._file_diffs[filename] = diff_text or false
     dr()._file_hunk_staged[filename] = diff_text and { false } or nil
     if cb then cb() end

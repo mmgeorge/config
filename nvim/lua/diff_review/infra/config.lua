@@ -63,8 +63,6 @@
 ---@field defaults DiffReviewConfig
 ---@field options DiffReviewConfig
 ---@field setup fun(opts?: DiffReviewConfig): DiffReviewConfig
-
----@type DiffReviewConfigModule
 local M = {}
 
 ---@type DiffReviewConfig

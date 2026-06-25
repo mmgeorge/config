@@ -436,7 +436,7 @@ end
 ---@param value any
 ---@return string
 local function normalize_body_text(value)
-  return tostring(value or ""):gsub("\r\n", "\n"):gsub("\r", "\n")
+  return (tostring(value or ""):gsub("\r\n", "\n"):gsub("\r", "\n"))
 end
 
 ---@param raw table

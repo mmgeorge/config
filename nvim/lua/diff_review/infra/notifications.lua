@@ -2,8 +2,6 @@
 ---@field error fun(message: string, title?: string)
 ---@field format_failures fun(failures: DiffReviewGitFailure[]): string
 ---@field git_failures fun(title: string, failures: DiffReviewGitFailure[])
-
----@type DiffReviewNotificationsModule
 local M = {}
 
 ---@param message string

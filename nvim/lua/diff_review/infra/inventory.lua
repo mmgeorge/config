@@ -111,10 +111,9 @@ end
 ---@param path string?
 ---@return string
 local function normalize_relpath(path)
-  return tostring(path or ""):gsub("\\", "/"):gsub("^%./", "")
+  return (tostring(path or ""):gsub("\\", "/"):gsub("^%./", ""))
 end
 
----@param relpath string
 ---@return "added"|"removed"|"modified"
 local function artifact_action_for_status(status, untracked)
   status = tostring(status or "")

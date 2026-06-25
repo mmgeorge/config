@@ -108,6 +108,7 @@ local function status_sections_from_items(collected_items)
       file.added = file.added + (data.added or 0)
       file.removed = file.removed + (data.removed or 0)
       if data.diff then
+        ---@diagnostic disable-next-line: missing-fields
         file.hunks[#file.hunks + 1] = {
           filename = filename,
           section_name = section_name,

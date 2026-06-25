@@ -155,9 +155,6 @@ end
 
 --- Prewarm Tree-sitter syntax for the file and hunk entries visible in a row range.
 --- Scope syntax work to the viewport so off-screen hunks of a large diff stay cheap.
----@param buf integer
----@param first_row integer 1-based
----@param last_row integer 1-based
 
 --- Debounce a visible-window syntax prewarm so the redraw callback never works inline.
 ---@param buf integer
@@ -182,19 +179,10 @@ end
 --- Place one diff row's cached decoration spans into a namespace.
 --- Pass ephemeral=true for the decoration provider's on_line; omit it (persistent)
 --- for the test seam so headless tests can read the marks back.
----@param buf integer
----@param namespace integer
----@param row integer 0-based buffer row
----@param spans DiffReviewRowSpans?
----@param ephemeral boolean?
 
 --- Apply a buffer row range's diff decoration into the decorate namespace as
 --- persistent marks, for the test seam and non-redraw refreshes.
 --- Returns the spans it applied so callers can assert per-row decoration.
----@param buf integer
----@param first_row integer? 1-based inclusive
----@param last_row integer? 1-based inclusive
----@return table<integer, DiffReviewRowSpans>
 
 --- Register the global diff decoration provider once so diff-body decoration
 --- (syntax/gutter/intraline/bg) is emitted ephemerally for visible rows only.

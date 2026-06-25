@@ -101,8 +101,6 @@ function M._walkthrough_host(buf)
   }
 end
 
----@param buf integer
-
 ---@class DiffReviewOpenPROptions
 ---@field cwd? string
 ---@field repo? string

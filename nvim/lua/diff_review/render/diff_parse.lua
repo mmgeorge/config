@@ -16,7 +16,7 @@ end
 ---@field code string
 ---@field old_line? integer
 ---@field new_line? integer
----@field position integer
+---@field position? integer
 
 ---@class DiffReviewParsedHunk
 ---@field header string

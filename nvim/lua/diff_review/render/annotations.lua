@@ -224,8 +224,6 @@ function M.body_from_buffer_lines(line)
   return text
 end
 
----@param handler fun(annotation: DiffReviewDiffAnnotation, done: fun(ok: boolean, err?: string))
----@return DiffReviewAnnotationSyncQueue
 --- Build a serial sync queue with op-id stale rejection. By default it applies results via
 --- on_sync_success/on_sync_failure (the DiffAnnotation model); pass opts.on_success/on_failure
 --- to apply a different annotation model in place, opts.on_idle to react when the queue drains

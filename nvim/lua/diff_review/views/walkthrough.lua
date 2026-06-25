@@ -295,7 +295,7 @@ end
 ---@param item_subtype? string
 ---@return string
 local function format_item_type_label(item_type, item_subtype)
-  if is_non_empty_string(item_subtype) then return item_subtype end
+  if is_non_empty_string(item_subtype) then return item_subtype --[[@as string]] end
   return format_type_keyword(item_type)
 end
 
@@ -2278,6 +2278,8 @@ end
 ---@param label string
 ---@param details table<string, DiffReviewInventoryChangeSet>?
 ---@return string[]
+---@return table[] folds
+---@return table<integer, DiffReviewInventoryChange> row_targets
 function M._inventory_detail_lines_for_test(label, details)
   return inventory_detail_lines(label, details)
 end

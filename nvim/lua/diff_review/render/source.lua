@@ -100,7 +100,7 @@ local M = {}
 ---@param path string?
 ---@return string
 function M.normalize_path(path)
-  return tostring(path or ""):gsub("\\", "/")
+  return (tostring(path or ""):gsub("\\", "/"))
 end
 
 ---@param source_id string
@@ -853,6 +853,7 @@ function M.new_walkthrough_source(handle, opts)
   opts = opts or {}
   handle = vim.deepcopy(handle or { id = "walkthrough", kind = "walkthrough" })
   handle.kind = "walkthrough"
+  ---@type DiffReviewWalkthroughDiffSource
   local source = M.new_source(handle)
   source.base_source_ids = opts.base_source_ids or {}
   source.file_order = opts.file_order or {}
