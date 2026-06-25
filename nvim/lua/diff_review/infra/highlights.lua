@@ -1,3 +1,7 @@
+--- Defines every DiffReview highlight group (add/delete/modify backgrounds, gutter,
+--- inline change, fold, status file-state, header, hunk context, and review/walkthrough
+--- groups) at setup time, deriving backgrounds from the active colorscheme.
+
 local M = {}
 
 function M.setup()

@@ -1,3 +1,10 @@
+--- Owns the diff-annotation (review comment) model: the by-id and by-anchor index, the
+--- per-comment sync state machine, and a serial sync queue that drains dirty annotations
+--- to the remote one at a time.
+---
+--- Rejects stale completions by operation id, so an out-of-order async result never
+--- overwrites a newer local edit.
+
 local source = require("diff_review.render.source")
 
 ---@alias DiffReviewAnnotationSide "LEFT"|"RIGHT"|"BOTH"|"old"|"new"|"both"|"file"

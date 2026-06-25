@@ -1,3 +1,7 @@
+--- Resolves a registry, source, and file in one call and replaces a file's hunks from
+--- fresh diff text, so callers mutate the source model without threading the three
+--- handles through every callsite.
+
 local source = require("diff_review.render.source")
 
 ---@class DiffReviewSourceLoader

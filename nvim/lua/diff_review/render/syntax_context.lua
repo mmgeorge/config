@@ -1,3 +1,10 @@
+--- Holds per-file treesitter parse state for both diff sides: the source snapshot,
+--- parser, parsed tree, and highlight query, and resolves per-row highlight spans from
+--- the tree's captures.
+---
+--- Clears the cached tree whenever a side's snapshot changes, so highlights never paint
+--- against stale source text.
+
 local text_snapshot = require("diff_review.render.text_snapshot")
 
 ---@alias DiffReviewSyntaxSide "old"|"new"

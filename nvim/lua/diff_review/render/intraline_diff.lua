@@ -1,3 +1,7 @@
+--- Detects visually-similar deleted/added line pairs and compacts them into a single
+--- replacement row with character-level inline highlights, so a small edit reads as one
+--- changed line instead of a full delete-plus-add.
+
 local M = {}
 
 local defaults = {

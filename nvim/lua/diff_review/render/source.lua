@@ -1,3 +1,10 @@
+--- Owns the diff-source data model: the source registry, per-source state, and the
+--- per-file hunk, annotation, syntax-context, and text-snapshot records the render
+--- pipeline reads from for git, commit, PR, review, and walkthrough diffs.
+---
+--- Loads file text lazily through per-side loaders and invalidates or reloads paths in
+--- place, so a status refresh re-diffs only the files that actually changed.
+
 local hunk_index = require("diff_review.render.hunk_index")
 local syntax_context = require("diff_review.render.syntax_context")
 local text_snapshot = require("diff_review.render.text_snapshot")

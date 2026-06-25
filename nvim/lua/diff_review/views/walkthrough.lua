@@ -1,11 +1,11 @@
--- Guided review walkthrough for the DiffReviewStatus buffer. An LLM writes
--- .walkthrough.json at the repo root (see walkthrough.schema.json next to this
--- file); `ow` in the status buffer adds a foldable summary section and renders
--- the author's comment boxes below visible referenced regions inside the inline
--- diff.
--- Positions refer to the NEW
--- (post-change) file; the document records the HEAD sha it was generated
--- against so stale walkthroughs degrade to best-effort jumps with a note.
+--- Drives the guided code-review walkthrough rendered into the DiffReviewStatus buffer:
+--- an LLM writes `.walkthrough.json` at the repo root (schema in
+--- `walkthrough.schema.json` beside this file), and `ow` adds a foldable summary section
+--- plus the author's comment boxes anchored below the referenced regions in the inline diff.
+---
+--- Resolves each step against the NEW (post-change) file and records the HEAD sha the
+--- document was generated against, so a stale walkthrough degrades to best-effort jumps
+--- with a visible note rather than wrong anchors.
 
 ---@class DiffReviewWalkthroughPosition
 ---@field line integer 1-based line in the new file

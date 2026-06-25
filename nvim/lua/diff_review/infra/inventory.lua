@@ -1,3 +1,10 @@
+--- Computes the per-diff change inventory: the added, removed, and modified code symbols
+--- (functions, structs, classes, traits, types, modules) a changeset touches, via the
+--- bundled `diff_inventory` treesitter queries.
+---
+--- Caches old and new source lines per repo-relative path, so symbol extraction never
+--- re-reads a file or re-runs git for the same path.
+
 local M = {}
 require("diff_review.query_runtime")
 

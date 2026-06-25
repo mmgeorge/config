@@ -1,3 +1,7 @@
+--- Aggregates rendered diff output into a logical tree of nodes (hunks, padding,
+--- annotations) and keeps each node's buffer-row span in sync through the layout index,
+--- so navigation and re-render can map a buffer row back to its entry.
+
 local layout = require("diff_review.render.layout")
 
 ---@class DiffReviewRowTreeNode
