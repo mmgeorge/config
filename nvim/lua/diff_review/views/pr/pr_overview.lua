@@ -13,25 +13,26 @@ local gh = require("diff_review.integrations.gh")
 local function dr()
   return require("diff_review")
 end
+local session = require("diff_review.session")
 
 -- Render-core shims: thread the active status into the state-passing buffer core so the
 -- view's accumulator calls render into the live buffer unchanged.
 local function status_add_line(text, entry, hl)
-  return status_buffer.add_line(dr()._status, text, entry, hl)
+  return status_buffer.add_line(session.status, text, entry, hl)
 end
 local function status_add_highlight(line, start_col, end_col, hl_group, priority)
-  return status_buffer.add_highlight(dr()._status, line, start_col, end_col, hl_group, priority)
+  return status_buffer.add_highlight(session.status, line, start_col, end_col, hl_group, priority)
 end
 local function status_add_segment_line(segments, entry)
-  return status_buffer.add_segment_line(dr()._status, segments, entry)
+  return status_buffer.add_segment_line(session.status, segments, entry)
 end
 local function status_folded(key, default, state)
-  return status_buffer.folded(state or dr()._status or {}, key, default)
+  return status_buffer.folded(state or session.status or {}, key, default)
 end
 local function set_status_folded(key, folded, state)
   if not state then
-    dr()._status = dr()._status or {}
-    state = dr()._status
+    session.status = session.status or {}
+    state = session.status
   end
   return status_buffer.set_folded(state, key, folded)
 end
@@ -799,7 +800,7 @@ function M.status_commit_from_pr_commit(raw_commit, branch)
   if type(raw_commit) ~= "table" then return nil end
   local oid = vim.trim(tostring(raw_commit.oid or raw_commit.sha or raw_commit.id or ""))
   if oid == "" then return nil end
-  local cache = dr()._status and dr()._status.commit_file_cache and dr()._status.commit_file_cache[oid] or nil
+  local cache = session.status and session.status.commit_file_cache and session.status.commit_file_cache[oid] or nil
   local short_oid = vim.trim(tostring(raw_commit.shortOid or raw_commit.short_oid or raw_commit.abbreviatedOid or ""))
   if short_oid == "" then short_oid = status_short_oid(oid) end
   return {
@@ -893,7 +894,7 @@ end
 
 ---@param review DiffReviewGhSubmittedReview
 function M.render_review_context(review)
-  local status = dr()._status
+  local status = session.status
   if not (status and status.cwd and status.pr) then return end
   local comments = type(review.comments) == "table" and review.comments or {}
   if #comments == 0 then
@@ -941,11 +942,11 @@ function M.render_review(review, alignment)
   local entry = { id = review_key, kind = "pr_review", pr_review = review, default_folded = true }
   local line_number = status_add_segment_line(M.review_summary_segments(review, alignment), entry)
   if status_folded(review_key, true) then
-    dr()._status_register_fold_range(review_key, line_number, #dr()._status.lines, true, dr()._status.lines[line_number])
+    dr()._status_register_fold_range(review_key, line_number, #session.status.lines, true, session.status.lines[line_number])
     return
   end
   M.render_review_context(review)
-  dr()._status_register_fold_range(review_key, line_number, #dr()._status.lines, true, dr()._status.lines[line_number])
+  dr()._status_register_fold_range(review_key, line_number, #session.status.lines, true, session.status.lines[line_number])
 end
 
 ---@param comment table
@@ -953,7 +954,7 @@ end
 ---@param alignment? { author_width?: integer, date_width?: integer }
 function M.render_issue_comment(comment, index, alignment)
   local entry_id = M.issue_comment_entry_id(comment, index)
-  local start_line = #dr()._status.lines + 1
+  local start_line = #session.status.lines + 1
   local fold_text = function()
     return M.issue_comment_line(comment, false, alignment)
   end
@@ -968,7 +969,7 @@ function M.render_issue_comment(comment, index, alignment)
       status_add_highlight(line_number, highlight.start_col, highlight.end_col, highlight.hl_group)
     end
   end
-  dr()._status_register_fold_range(entry_id, start_line, #dr()._status.lines, true, fold_text)
+  dr()._status_register_fold_range(entry_id, start_line, #session.status.lines, true, fold_text)
 end
 
 ---@param comments table[]
@@ -997,8 +998,8 @@ end
 ---@param buf integer
 ---@return string?
 function M.url_under_cursor(buf)
-  if dr()._status_states and dr()._status_states[buf] then dr()._status = dr()._status_states[buf] end
-  local status = dr()._status
+  if session.states and session.states[buf] then session.status = session.states[buf] end
+  local status = session.status
   if not (status and status.view_kind == "pr") then return nil end
   return M.entry_url(status.pr, status_entry_under_cursor())
 end
@@ -1007,19 +1008,19 @@ end
 ---@param cwd string
 ---@param buf integer
 function M.load_comments(pr, cwd, buf)
-  local status = dr()._status
+  local status = session.status
   if not (status and status.buf == buf and pr.repo and pr.repo ~= "") then return end
   status.pr_comments_request_id = (status.pr_comments_request_id or 0) + 1
   local request_id = status.pr_comments_request_id
   gh.pr_comments_async(cwd, pr.number, pr.repo, function(result)
-    local latest_status = dr()._status_states and dr()._status_states[buf] or nil
+    local latest_status = session.states and session.states[buf] or nil
     if not (
       latest_status
       and latest_status.pr_comments_request_id == request_id
       and latest_status.buf == buf
       and vim.api.nvim_buf_is_valid(buf)
     ) then return end
-    dr()._status = latest_status
+    session.status = latest_status
     if not result.ok then
       notify_error("GitHub PR comments failed: " .. (result.message or "gh failed"), "DiffReview")
       return
@@ -1034,7 +1035,7 @@ end
 ---@param cwd string
 ---@param buf integer
 function M.load_checks(pr, cwd, buf)
-  local status = dr()._status
+  local status = session.status
   if not (status and status.buf == buf and pr.repo and pr.repo ~= "") then return end
   status.pr_checks_request_id = (status.pr_checks_request_id or 0) + 1
   status.pr_checks_loading = true
@@ -1042,14 +1043,14 @@ function M.load_checks(pr, cwd, buf)
   local request_id = status.pr_checks_request_id
   render_pr_status(pr, cwd, buf, status.pr_diff_text)
   gh.pr_checks_async(cwd, pr.number, pr.repo, function(result)
-    local latest_status = dr()._status_states and dr()._status_states[buf] or nil
+    local latest_status = session.states and session.states[buf] or nil
     if not (
       latest_status
       and latest_status.pr_checks_request_id == request_id
       and latest_status.buf == buf
       and vim.api.nvim_buf_is_valid(buf)
     ) then return end
-    dr()._status = latest_status
+    session.status = latest_status
     latest_status.pr_checks_loading = false
     if not result.ok then
       latest_status.pr_checks_error = result.message or "gh failed"
@@ -1088,7 +1089,7 @@ end
 ---@param buf integer
 ---@return table? status
 function M.state(buf)
-  local status = dr()._status_states and dr()._status_states[buf] or nil
+  local status = session.states and session.states[buf] or nil
   if not (status and status.view_kind == "pr" and status.pr) then return nil end
   M.refresh_editable_comments(status)
   return status
@@ -1588,7 +1589,7 @@ end
 function M.add_standalone_comment(buf)
   local status = M.state(buf)
   if not status then return end
-  dr()._status = status
+  session.status = status
   local existing = M.standalone_comment_under_cursor(buf)
   if existing then
     M.open_pr_comment_body(buf, status, existing)

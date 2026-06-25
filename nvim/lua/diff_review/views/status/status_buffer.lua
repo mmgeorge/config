@@ -7,6 +7,8 @@
 ---@class DiffReviewStatusBufferModule
 local M = {}
 
+local session = require("diff_review.session")
+
 ---@param state DiffReviewStatusState
 ---@param line integer
 ---@param start_col integer
@@ -205,9 +207,9 @@ function M.add_fancy_row(state, row, entry, indent)
   -- Chrome rows (commits/sections/headers) keep using the persistent accumulators.
   local spans = nil
   if row.diff_review_bg_hl then
-    diff_review._diff_line_content_lengths = diff_review._diff_line_content_lengths or {}
-    diff_review._diff_line_content_lengths[state.buf] = diff_review._diff_line_content_lengths[state.buf] or {}
-    diff_review._diff_line_content_lengths[state.buf][line] = content_length or #line_text
+    session.diff_line_content_lengths = session.diff_line_content_lengths or {}
+    session.diff_line_content_lengths[state.buf] = session.diff_line_content_lengths[state.buf] or {}
+    session.diff_line_content_lengths[state.buf][line] = content_length or #line_text
     spans = spans or { highlights = {} }
     spans.bg = { end_col = #line_text, hl_group = row.diff_review_bg_hl, priority = 60 }
   end

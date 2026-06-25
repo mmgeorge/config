@@ -14,6 +14,7 @@ local status_command_specs = require("diff_review.shared.command_specs").specs
 local function dr()
   return require("diff_review")
 end
+local session = require("diff_review.session")
 
 local M = {}
 
@@ -64,9 +65,9 @@ end
 ---@param entry DiffReviewStatusEntry?
 local function status_open_about(entry)
   local about = entry and entry.about
-  if not about and dr()._status then about = dr()._status.about end
+  if not about and session.status then about = session.status.about end
   if not about or about.state == "none" then
-    local status = dr()._status
+    local status = session.status
     if status and status.cwd and status.buf and dr()._status_has_changes(status.sections) then
       dr()._status_ensure_about_state(status.cwd, status.buf, true, false, true)
       vim.notify("Generating commit message...", vim.log.levels.INFO, { title = "DiffReview" })
@@ -172,7 +173,7 @@ function M._status_open_commit_message_under_cursor(entry)
   local cursor = vim.api.nvim_win_get_cursor(0)
   local commit = dr()._status_commit_message_target(entry, cursor and cursor[2])
   if not commit then return false end
-  return dr()._status_open_commit_message(commit, dr()._status and dr()._status.cwd)
+  return dr()._status_open_commit_message(commit, session.status and session.status.cwd)
 end
 
 ---@param span table
@@ -235,12 +236,12 @@ local function status_jump(entry, skip_revision, selected_diff_line)
   local cursor = vim.api.nvim_win_get_cursor(0)
   local jump_diff_line = selected_diff_line or dr()._status_jump_diff_line(entry, cursor and cursor[2])
   if not skip_revision and jump_diff_line and jump_diff_line.side == "left" and jump_diff_line.line then
-    local rev, path = dr()._file_revision.target(entry, dr()._status)
+    local rev, path = dr()._file_revision.target(entry, session.status)
     if rev and path then
       dr()._file_revision.open({
         rev = rev,
         path = path,
-        cwd = dr()._status.cwd,
+        cwd = session.status.cwd,
         line = jump_diff_line.line,
         on_error = function()
           status_jump(entry, true, jump_diff_line)
@@ -272,14 +273,14 @@ end
 ---@param entry_id string?
 ---@return DiffReviewStatusEntry?
 function M._status_entry_by_id(entry_id)
-  if not (entry_id and dr()._status and dr()._status.entries) then return nil end
-  local viewport = dr()._status.diff_viewport
+  if not (entry_id and session.status and session.status.entries) then return nil end
+  local viewport = session.status.diff_viewport
   if viewport and viewport.enabled and viewport.logical_entries then
     for _, entry in pairs(viewport.logical_entries) do
       if entry and entry.id == entry_id then return entry end
     end
   end
-  for _, entry in pairs(dr()._status.entries) do
+  for _, entry in pairs(session.status.entries) do
     if entry and entry.id == entry_id then return entry end
   end
   return nil
@@ -290,7 +291,7 @@ end
 function M._status_entry_default_folded(entry)
   if not entry then return false end
   if entry.default_folded ~= nil then return entry.default_folded == true end
-  local ranges = dr()._status_fold_ranges_for_id(dr()._status, entry.id)
+  local ranges = dr()._status_fold_ranges_for_id(session.status, entry.id)
   local range = ranges[1]
   if range and range.default_folded ~= nil then return range.default_folded == true end
   if entry.kind == "file" or entry.kind == "pr_file" then
@@ -314,7 +315,7 @@ end
 ---@param entry DiffReviewStatusEntry?
 ---@param state? table
 local function status_toggle(entry, state)
-  state = state or dr()._status
+  state = state or session.status
   if not state then return end
   if not entry then return end
   local fold_id = entry.fold_target_id or entry.id
@@ -356,11 +357,11 @@ function M._status_collapse_parent()
   local parent = dr()._status_parent_entry(line, entry)
   local target = parent or entry
   dr()._set_status_folded(target.id, true)
-  if not dr()._status_set_native_fold_state(dr()._status.buf, target.id, true) then
-    dr()._render_status_or_notify(dr()._status.buf, target.id, vim.api.nvim_win_get_cursor(0)[1], { reuse_sections = true })
-  elseif dr()._status.view_kind == "status" then
+  if not dr()._status_set_native_fold_state(session.status.buf, target.id, true) then
+    dr()._render_status_or_notify(session.status.buf, target.id, vim.api.nvim_win_get_cursor(0)[1], { reuse_sections = true })
+  elseif session.status.view_kind == "status" then
     local walkthrough = package.loaded["diff_review.views.walkthrough"]
-    if walkthrough and walkthrough.on_status_rendered then walkthrough.on_status_rendered(dr()._status.buf) end
+    if walkthrough and walkthrough.on_status_rendered then walkthrough.on_status_rendered(session.status.buf) end
   end
 end
 
@@ -468,21 +469,21 @@ local function status_remote_action(buf, action)
     local function update_remote_status(line)
       line = vim.trim(line or "")
       if line == "" then return end
-      if dr()._status then
-        dr()._status.remote_action = dr()._status.remote_action or { action = action, state = "running" }
-        dr()._status.remote_action.status = line
-        if dr()._status.head_values then
-          dr()._status.head_lines = dr()._status_build_head_lines(dr()._status.head_values, dr()._status.pr, dr()._status.about, dr()._status.issues)
+      if session.status then
+        session.status.remote_action = session.status.remote_action or { action = action, state = "running" }
+        session.status.remote_action.status = line
+        if session.status.head_values then
+          session.status.head_lines = dr()._status_build_head_lines(session.status.head_values, session.status.pr, session.status.about, session.status.issues)
           if vim.api.nvim_buf_is_valid(buf) then
             dr().render_status(buf, nil, nil, { reuse_sections = true })
           end
         end
       end
     end
-    if dr()._status then
-      dr()._status.remote_action = { action = action, state = "running", status = running_status }
-      if dr()._status.head_values then
-        dr()._status.head_lines = dr()._status_build_head_lines(dr()._status.head_values, dr()._status.pr, dr()._status.about, dr()._status.issues)
+    if session.status then
+      session.status.remote_action = { action = action, state = "running", status = running_status }
+      if session.status.head_values then
+        session.status.head_lines = dr()._status_build_head_lines(session.status.head_values, session.status.pr, session.status.about, session.status.issues)
         if vim.api.nvim_buf_is_valid(buf) then
           dr().render_status(buf, nil, nil, { reuse_sections = true })
         end
@@ -502,7 +503,7 @@ local function status_remote_action(buf, action)
         dr()._notify_error(title .. " failed: " .. (#compact > 0 and table.concat(compact, "\n") or ("git exited " .. result.code)))
       end
       if vim.api.nvim_buf_is_valid(buf) then
-        if dr()._status then dr()._status.remote_action = nil end
+        if session.status then session.status.remote_action = nil end
         dr()._render_status_or_notify(buf)
       end
     end)

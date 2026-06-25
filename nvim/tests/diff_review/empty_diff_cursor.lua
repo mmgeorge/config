@@ -1,6 +1,7 @@
 vim.loader.enable(false)
 
 local diff_review = require("diff_review")
+local session = require("diff_review.session")
 local gh = require("diff_review.integrations.gh")
 
 local original_cwd = vim.fs.normalize(vim.fn.getcwd())
@@ -59,7 +60,7 @@ local function maybe_file_row(filename)
 end
 
 local function find_empty_diff_row(status_buf)
-  local status = diff_review._status_states and diff_review._status_states[status_buf] or diff_review._status
+  local status = session.states and session.states[status_buf] or session.status
   for row, entry in pairs(status and status.entries or {}) do
     if entry.diff_line and entry.diff_line.code == "" then return row end
   end
@@ -67,7 +68,7 @@ local function find_empty_diff_row(status_buf)
 end
 
 local function find_non_empty_diff_row(status_buf)
-  local status = diff_review._status_states and diff_review._status_states[status_buf] or diff_review._status
+  local status = session.states and session.states[status_buf] or session.status
   for row, entry in pairs(status and status.entries or {}) do
     if entry.diff_line and entry.diff_line.code and entry.diff_line.code ~= "" then return row, entry.diff_line end
   end
@@ -147,7 +148,7 @@ local function run()
 
   local before_line = vim.api.nvim_buf_get_lines(status_buf, empty_row - 1, empty_row, false)[1]
   assert_true(before_line:match("^%s*$") ~= nil, "empty diff row should contain only visual padding, got: " .. vim.inspect(before_line))
-  local content_lengths = diff_review._diff_line_content_lengths and diff_review._diff_line_content_lengths[status_buf] or nil
+  local content_lengths = session.diff_line_content_lengths and session.diff_line_content_lengths[status_buf] or nil
   assert_true(content_lengths and content_lengths[empty_row] == 0, "empty diff row should keep real content length 0")
 
   vim.api.nvim_win_set_cursor(0, { empty_row, 0 })

@@ -12,6 +12,7 @@ local util = require("diff_review.infra.util")
 local function dr()
   return require("diff_review")
 end
+local session = require("diff_review.session")
 
 -- Seams to init-owned helpers the syntax engine shares.
 local parse_unified_diff = diff_parse.parse_unified_diff
@@ -25,8 +26,42 @@ local hunk_first_changed_current_line = diff_parse.hunk_first_changed_current_li
 local detect_filetype = util.detect_filetype
 local function notify_error(message, title) return notifications.error(message, title) end
 
+-- Tree-sitter caches owned by the render engine, reset together on a status refresh.
+-- `context` keyed "<file>:<line>", `file_syntax` by filename, `diff_syntax` by
+-- "<file>:<side>:<sha>", `source_bufs` by filename. The functions below capture these
+-- as upvalues, so a clear_* reassignment is visible to every reader at once.
+local ts_context_cache = {}
+local ts_syntax_cache = {}
+local ts_diff_syntax_cache = {}
+local ts_source_bufs = {}
+
+--- Clear the per-line hunk-context cache before a status refresh re-resolves scopes.
+function M.clear_context_cache()
+  ts_context_cache = {}
+end
+
+--- Clear the per-diff-side syntax cache, forcing a re-parse.
+function M.clear_diff_syntax_cache()
+  ts_diff_syntax_cache = {}
+end
+
+--- Read a cached hunk-context entry by "<file>:<line>" key, or nil when unresolved.
+function M.context_cache_entry(key)
+  return ts_context_cache[key]
+end
+
+--- Expose the live hunk-context cache for inspection by the debug dump and tests.
+function M.context_cache()
+  return ts_context_cache
+end
+
+--- Read the cached file-syntax entry for a filename, or nil when absent.
+function M.file_syntax_cache_entry(filename)
+  return ts_syntax_cache[filename]
+end
+
 local function file_source_lines(filename)
-  return dr()._status_perf_span("source.file_lines", dr()._status and dr()._status.buf or nil, {
+  return dr()._status_perf_span("source.file_lines", session.status and session.status.buf or nil, {
     file = filename,
   }, function()
     if file_contains_nul(filename) then return nil end
@@ -43,7 +78,7 @@ local function file_source_lines(filename)
 end
 
 local function treesitter_source_buffer(filename)
-  return dr()._status_perf_span("treesitter.source_buffer", dr()._status and dr()._status.buf or nil, {
+  return dr()._status_perf_span("treesitter.source_buffer", session.status and session.status.buf or nil, {
     file = filename,
   }, function()
     if file_contains_nul(filename) then return nil end
@@ -53,8 +88,8 @@ local function treesitter_source_buffer(filename)
       return loaded
     end
 
-    dr()._ts_source_bufs = dr()._ts_source_bufs or {}
-    local cached = dr()._ts_source_bufs[filename]
+    ts_source_bufs = ts_source_bufs or {}
+    local cached = ts_source_bufs[filename]
     if cached and vim.api.nvim_buf_is_valid(cached) then return cached end
 
     local lines = file_source_lines(filename)
@@ -64,32 +99,32 @@ local function treesitter_source_buffer(filename)
     vim.bo[buf].bufhidden = "wipe"
     vim.bo[buf].buftype = "nofile"
     vim.bo[buf].swapfile = false
-    dr()._status_perf_span("treesitter.source_buffer.set_lines", dr()._status and dr()._status.buf or nil, {
+    dr()._status_perf_span("treesitter.source_buffer.set_lines", session.status and session.status.buf or nil, {
       file = filename,
       source_line_count = #lines,
     }, function()
       vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
     end)
     vim.bo[buf].filetype = detect_filetype(filename, lines)
-    dr()._ts_source_bufs[filename] = buf
+    ts_source_bufs[filename] = buf
     return buf
   end)
 end
 
 local function clear_treesitter_source_buffers()
-  for _, buf in pairs(dr()._ts_source_bufs or {}) do
+  for _, buf in pairs(ts_source_bufs or {}) do
     if vim.api.nvim_buf_is_valid(buf) then
       pcall(vim.api.nvim_buf_delete, buf, { force = true })
     end
   end
-  for _, cached in pairs(dr()._ts_diff_syntax_cache or {}) do
+  for _, cached in pairs(ts_diff_syntax_cache or {}) do
     if type(cached) == "table" and cached.buf and vim.api.nvim_buf_is_valid(cached.buf) then
       pcall(vim.api.nvim_buf_delete, cached.buf, { force = true })
     end
   end
-  dr()._ts_source_bufs = {}
-  dr()._ts_syntax_cache = {}
-  dr()._ts_diff_syntax_cache = {}
+  ts_source_bufs = {}
+  ts_syntax_cache = {}
+  ts_diff_syntax_cache = {}
 end
 
 local function treesitter_line_segments(buf, tree, query, row, text)
@@ -327,9 +362,9 @@ local function hunk_context_from_trees(buf, query, highlight_query, trees, targe
 end
 
 local function cached_hunk_context(filename, line, callback_key, on_update)
-  dr()._ts_context_cache = dr()._ts_context_cache or {}
+  ts_context_cache = ts_context_cache or {}
   local cache_key = filename .. ":" .. line
-  local cached = dr()._ts_context_cache[cache_key]
+  local cached = ts_context_cache[cache_key]
   if cached == false then return nil end
   if type(cached) == "string" then return cached end
   if type(cached) == "table" and not cached.pending then return cached end
@@ -338,14 +373,14 @@ local function cached_hunk_context(filename, line, callback_key, on_update)
     return nil
   end
 
-  dr()._ts_context_cache[cache_key] = {
+  ts_context_cache[cache_key] = {
     pending = true,
     callbacks = on_update and { [callback_key] = on_update } or {},
   }
   dr().compute_hunk_context_async(filename, line, function(context)
-    local pending = dr()._ts_context_cache and dr()._ts_context_cache[cache_key]
+    local pending = ts_context_cache and ts_context_cache[cache_key]
     local callbacks = type(pending) == "table" and pending.callbacks or {}
-    dr()._ts_context_cache[cache_key] = context or false
+    ts_context_cache[cache_key] = context or false
     for _, callback in pairs(callbacks) do
       local ok, err = pcall(callback, context)
       if not ok then notify_error("Tree-sitter context update failed: " .. tostring(err)) end
@@ -355,13 +390,13 @@ local function cached_hunk_context(filename, line, callback_key, on_update)
 end
 
 local function cached_file_syntax(filename, callback_key, on_update)
-  local status_buf = dr()._status and dr()._status.buf or nil
+  local status_buf = session.status and session.status.buf or nil
   return dr()._status_perf_span("syntax.cached_file_syntax", status_buf, {
     file = filename,
     callback_key = callback_key,
   }, function()
-    dr()._ts_syntax_cache = dr()._ts_syntax_cache or {}
-    local cached = dr()._ts_syntax_cache[filename]
+    ts_syntax_cache = ts_syntax_cache or {}
+    local cached = ts_syntax_cache[filename]
     if cached == false then return nil, false end
     if type(cached) == "table" and not cached.pending then return cached, false end
     if type(cached) == "table" and cached.pending then
@@ -369,7 +404,7 @@ local function cached_file_syntax(filename, callback_key, on_update)
       return nil, true
     end
 
-    dr()._ts_syntax_cache[filename] = {
+    ts_syntax_cache[filename] = {
       pending = true,
       callbacks = on_update and { [callback_key] = on_update } or {},
     }
@@ -378,9 +413,9 @@ local function cached_file_syntax(filename, callback_key, on_update)
       callback_key = callback_key,
     }, function()
       dr().compute_file_syntax_async(filename, function(syntax)
-        local pending = dr()._ts_syntax_cache and dr()._ts_syntax_cache[filename]
+        local pending = ts_syntax_cache and ts_syntax_cache[filename]
         local callbacks = type(pending) == "table" and pending.callbacks or {}
-        dr()._ts_syntax_cache[filename] = syntax or false
+        ts_syntax_cache[filename] = syntax or false
         for _, callback in pairs(callbacks) do
           local ok, err = pcall(callback, syntax)
           if not ok then notify_error("Tree-sitter syntax update failed: " .. tostring(err)) end
@@ -452,7 +487,7 @@ local function hunk_line_visible_in_context_scope(parsed_line, context)
 end
 
 local function diff_syntax_source_lines(diff_text, side)
-  return dr()._status_perf_span("syntax.diff_source_lines", dr()._status and dr()._status.buf or nil, {
+  return dr()._status_perf_span("syntax.diff_source_lines", session.status and session.status.buf or nil, {
     side = side,
     diff_len = #(diff_text or ""),
   }, function()
@@ -474,14 +509,14 @@ local function diff_syntax_source_lines(diff_text, side)
 end
 
 local function cached_diff_syntax(filename, diff_text, side, callback_key, on_update)
-  local status_buf = dr()._status and dr()._status.buf or nil
+  local status_buf = session.status and session.status.buf or nil
   return dr()._status_perf_span("syntax.cached_diff_syntax", status_buf, {
     file = filename,
     side = side,
     callback_key = callback_key,
     diff_len = #(diff_text or ""),
   }, function()
-    dr()._ts_diff_syntax_cache = dr()._ts_diff_syntax_cache or {}
+    ts_diff_syntax_cache = ts_diff_syntax_cache or {}
     local diff_hash = dr()._status_perf_span("syntax.cached_diff_syntax.sha256", status_buf, {
       file = filename,
       side = side,
@@ -490,7 +525,7 @@ local function cached_diff_syntax(filename, diff_text, side, callback_key, on_up
       return vim.fn.sha256(diff_text or "")
     end)
     local cache_key = ("%s:%s:%s"):format(filename, side, diff_hash)
-    local cached = dr()._ts_diff_syntax_cache[cache_key]
+    local cached = ts_diff_syntax_cache[cache_key]
     if cached == false then return nil, false end
     if type(cached) == "table" and not cached.pending then return cached, false end
     if type(cached) == "table" and cached.pending then
@@ -506,7 +541,7 @@ local function cached_diff_syntax(filename, diff_text, side, callback_key, on_up
       return diff_syntax_source_lines(diff_text, side)
     end)
     if #lines == 0 then return nil, false end
-    dr()._ts_diff_syntax_cache[cache_key] = {
+    ts_diff_syntax_cache[cache_key] = {
       pending = true,
       callbacks = on_update and { [callback_key] = on_update } or {},
     }
@@ -517,16 +552,16 @@ local function cached_diff_syntax(filename, diff_text, side, callback_key, on_up
       source_line_count = #lines,
     }, function()
       dr().compute_diff_syntax_async(filename, lines, function(syntax)
-        local pending = dr()._ts_diff_syntax_cache and dr()._ts_diff_syntax_cache[cache_key]
+        local pending = ts_diff_syntax_cache and ts_diff_syntax_cache[cache_key]
         local callbacks = type(pending) == "table" and pending.callbacks or {}
-        dr()._ts_diff_syntax_cache[cache_key] = syntax or false
+        ts_diff_syntax_cache[cache_key] = syntax or false
         for _, callback in pairs(callbacks) do
           local ok, err = pcall(callback, syntax)
           if not ok then notify_error("Tree-sitter diff syntax update failed: " .. tostring(err)) end
         end
-        if syntax and status_render_current_model and dr()._status and dr()._status.buf then
+        if syntax and status_render_current_model and session.status and session.status.buf then
           vim.schedule(function()
-            if dr()._status and dr()._status.buf and vim.api.nvim_buf_is_valid(dr()._status.buf) then
+            if session.status and session.status.buf and vim.api.nvim_buf_is_valid(session.status.buf) then
               status_render_current_model()
             end
           end)
@@ -538,7 +573,7 @@ local function cached_diff_syntax(filename, diff_text, side, callback_key, on_up
 end
 
 local function old_file_syntax_source_lines(filename, diff_text)
-  return dr()._status_perf_span("syntax.old_file_source_lines", dr()._status and dr()._status.buf or nil, {
+  return dr()._status_perf_span("syntax.old_file_source_lines", session.status and session.status.buf or nil, {
     file = filename,
     diff_len = #(diff_text or ""),
   }, function()
@@ -546,7 +581,7 @@ local function old_file_syntax_source_lines(filename, diff_text)
     if not lines then return nil end
 
     local hunks = {}
-    dr()._status_perf_span("syntax.old_file_source_lines.parse", dr()._status and dr()._status.buf or nil, {
+    dr()._status_perf_span("syntax.old_file_source_lines.parse", session.status and session.status.buf or nil, {
       file = filename,
       diff_len = #(diff_text or ""),
     }, function()
@@ -559,7 +594,7 @@ local function old_file_syntax_source_lines(filename, diff_text)
     if #hunks == 0 then return nil end
 
     local old_lines = vim.deepcopy(lines)
-    local rewrite_ok = dr()._status_perf_span("syntax.old_file_source_lines.rewrite", dr()._status and dr()._status.buf or nil, {
+    local rewrite_ok = dr()._status_perf_span("syntax.old_file_source_lines.rewrite", session.status and session.status.buf or nil, {
       file = filename,
       source_line_count = #lines,
       hunk_count = #hunks,
@@ -595,7 +630,7 @@ local function old_file_syntax_source_lines(filename, diff_text)
 end
 
 local function diff_new_side_matches_file(filename, diff_text)
-  return dr()._status_perf_span("syntax.diff_new_side_matches_file", dr()._status and dr()._status.buf or nil, {
+  return dr()._status_perf_span("syntax.diff_new_side_matches_file", session.status and session.status.buf or nil, {
     file = filename,
     diff_len = #(diff_text or ""),
   }, function()
@@ -625,13 +660,13 @@ local function diff_new_side_matches_file(filename, diff_text)
 end
 
 local function cached_old_file_syntax(filename, diff_text, callback_key, on_update)
-  local status_buf = dr()._status and dr()._status.buf or nil
+  local status_buf = session.status and session.status.buf or nil
   return dr()._status_perf_span("syntax.cached_old_file_syntax", status_buf, {
     file = filename,
     callback_key = callback_key,
     diff_len = #(diff_text or ""),
   }, function()
-    dr()._ts_diff_syntax_cache = dr()._ts_diff_syntax_cache or {}
+    ts_diff_syntax_cache = ts_diff_syntax_cache or {}
     local diff_hash = dr()._status_perf_span("syntax.cached_old_file_syntax.sha256", status_buf, {
       file = filename,
       diff_len = #(diff_text or ""),
@@ -639,7 +674,7 @@ local function cached_old_file_syntax(filename, diff_text, callback_key, on_upda
       return vim.fn.sha256(diff_text or "")
     end)
     local cache_key = ("%s:old-file:%s"):format(filename, diff_hash)
-    local cached = dr()._ts_diff_syntax_cache[cache_key]
+    local cached = ts_diff_syntax_cache[cache_key]
     if cached == false then return nil, false end
     if type(cached) == "table" and not cached.pending then return cached, false end
     if type(cached) == "table" and cached.pending then
@@ -654,7 +689,7 @@ local function cached_old_file_syntax(filename, diff_text, callback_key, on_upda
       return old_file_syntax_source_lines(filename, diff_text)
     end)
     if not lines or #lines == 0 then return nil, false end
-    dr()._ts_diff_syntax_cache[cache_key] = {
+    ts_diff_syntax_cache[cache_key] = {
       pending = true,
       callbacks = on_update and { [callback_key] = on_update } or {},
     }
@@ -664,16 +699,16 @@ local function cached_old_file_syntax(filename, diff_text, callback_key, on_upda
       source_line_count = #lines,
     }, function()
       dr().compute_diff_syntax_async(filename, lines, function(syntax)
-        local pending = dr()._ts_diff_syntax_cache and dr()._ts_diff_syntax_cache[cache_key]
+        local pending = ts_diff_syntax_cache and ts_diff_syntax_cache[cache_key]
         local callbacks = type(pending) == "table" and pending.callbacks or {}
-        dr()._ts_diff_syntax_cache[cache_key] = syntax or false
+        ts_diff_syntax_cache[cache_key] = syntax or false
         for _, callback in pairs(callbacks) do
           local ok, err = pcall(callback, syntax)
           if not ok then notify_error("Tree-sitter old file syntax update failed: " .. tostring(err)) end
         end
-        if syntax and status_render_current_model and dr()._status and dr()._status.buf then
+        if syntax and status_render_current_model and session.status and session.status.buf then
           vim.schedule(function()
-            if dr()._status and dr()._status.buf and vim.api.nvim_buf_is_valid(dr()._status.buf) then
+            if session.status and session.status.buf and vim.api.nvim_buf_is_valid(session.status.buf) then
               status_render_current_model()
             end
           end)
@@ -695,7 +730,7 @@ local function diff_uses_file_syntax(hunk_staged, opts)
 end
 
 local function prewarm_diff_syntax(filename, diff_text, hunk_staged, callback_key, on_update, opts)
-  local status_buf = dr()._status and dr()._status.buf or nil
+  local status_buf = session.status and session.status.buf or nil
   return dr()._status_perf_span("syntax.prewarm_diff_syntax", status_buf, {
     file = filename,
     callback_key = callback_key,
@@ -783,11 +818,11 @@ local function prewarm_diff_syntax(filename, diff_text, hunk_staged, callback_ke
 end
 
 local function status_file_syntax_diff_text(file)
-  return dr()._status_perf_span("syntax.status_file_syntax_diff_text", dr()._status and dr()._status.buf or nil, {
+  return dr()._status_perf_span("syntax.status_file_syntax_diff_text", session.status and session.status.buf or nil, {
     file = file and file.filename or nil,
   }, function()
     if not file then return nil end
-    local hunks = dr()._status_perf_span("syntax.status_file_syntax_diff_text.hunks", dr()._status and dr()._status.buf or nil, {
+    local hunks = dr()._status_perf_span("syntax.status_file_syntax_diff_text.hunks", session.status and session.status.buf or nil, {
       file = file.filename,
     }, function()
       return status_diff_hunks_for_file(file)
@@ -798,7 +833,7 @@ local function status_file_syntax_diff_text(file)
     end
     if #diffs == 0 then return nil end
     local diff_text = table.concat(diffs, "\n")
-    dr()._status_perf_event("syntax.status_file_syntax_diff_text.result", dr()._status and dr()._status.buf or nil, {
+    dr()._status_perf_event("syntax.status_file_syntax_diff_text.result", session.status and session.status.buf or nil, {
       file = file.filename,
       hunk_count = #hunks,
       diff_count = #diffs,
@@ -819,7 +854,7 @@ local function status_prewarm_hunk_budget(hunk_count, options)
 end
 
 local function prewarm_file_diff_syntax(file, callback_key_prefix, on_update, opts)
-  return dr()._status_perf_span("syntax.prewarm_file_diff_syntax", dr()._status and dr()._status.buf or nil, {
+  return dr()._status_perf_span("syntax.prewarm_file_diff_syntax", session.status and session.status.buf or nil, {
     file = file and file.filename or nil,
     callback_key_prefix = callback_key_prefix,
     syntax_source = opts and opts.syntax_source or nil,
@@ -828,7 +863,7 @@ local function prewarm_file_diff_syntax(file, callback_key_prefix, on_update, op
     opts = opts or {}
     local combined_diff = nil
     if opts.syntax_source == "file" then
-      combined_diff = dr()._status_perf_span("syntax.prewarm_file_diff_syntax.combined_diff", dr()._status and dr()._status.buf or nil, {
+      combined_diff = dr()._status_perf_span("syntax.prewarm_file_diff_syntax.combined_diff", session.status and session.status.buf or nil, {
         file = file.filename,
         callback_key_prefix = callback_key_prefix,
       }, function()
@@ -838,14 +873,14 @@ local function prewarm_file_diff_syntax(file, callback_key_prefix, on_update, op
     if type(combined_diff) == "string" and combined_diff ~= "" then
       opts = vim.tbl_extend("force", opts, { syntax_diff_text = combined_diff })
     end
-    local hunks = dr()._status_perf_span("syntax.prewarm_file_diff_syntax.hunks", dr()._status and dr()._status.buf or nil, {
+    local hunks = dr()._status_perf_span("syntax.prewarm_file_diff_syntax.hunks", session.status and session.status.buf or nil, {
       file = file.filename,
       callback_key_prefix = callback_key_prefix,
     }, function()
       return status_diff_hunks_for_file(file)
     end)
     local hunk_budget = status_prewarm_hunk_budget(#hunks)
-    dr()._status_perf_event("syntax.prewarm_file_diff_syntax.start_hunks", dr()._status and dr()._status.buf or nil, {
+    dr()._status_perf_event("syntax.prewarm_file_diff_syntax.start_hunks", session.status and session.status.buf or nil, {
       file = file.filename,
       callback_key_prefix = callback_key_prefix,
       hunk_count = #hunks,

@@ -11,6 +11,8 @@ local config = require("diff_review.infra.config")
 local function dr()
   return require("diff_review")
 end
+local session = require("diff_review.session")
+local syntax_engine = require("diff_review.render.syntax_engine")
 
 local M = {}
 
@@ -339,7 +341,7 @@ function M.file_syntax(state, filename)
   end
   local source_lines = dr()._file_source_lines(filename)
   lines[#lines + 1] = "    source_lines=" .. tostring(source_lines and #source_lines or nil)
-  lines[#lines + 1] = "    file_syntax_cache=" .. M.cache_state(dr()._ts_syntax_cache and dr()._ts_syntax_cache[filename])
+  lines[#lines + 1] = "    file_syntax_cache=" .. M.cache_state(syntax_engine.file_syntax_cache_entry(filename))
   return lines
 end
 
@@ -347,14 +349,14 @@ end
 ---@param reason string
 function M.dump(buf, reason)
   if not M.enabled() then return end
-  local state = dr()._status_states and dr()._status_states[buf] or (dr()._status and dr()._status.buf == buf and dr()._status) or nil
+  local state = session.states and session.states[buf] or (session.status and session.status.buf == buf and session.status) or nil
   if not (state and (state.view_kind == "status" or state.view_kind == "pr" or state.view_kind == "review") and vim.api.nvim_buf_is_valid(buf)) then return end
   state.gitstatus_debug_dump_reason = reason
   if state.gitstatus_debug_dump_pending then return end
   state.gitstatus_debug_dump_pending = true
 
   vim.defer_fn(function()
-    state = dr()._status_states and dr()._status_states[buf] or (dr()._status and dr()._status.buf == buf and dr()._status) or nil
+    state = session.states and session.states[buf] or (session.status and session.status.buf == buf and session.status) or nil
     if state then state.gitstatus_debug_dump_pending = false end
     if not M.enabled() then return end
     if not (state and (state.view_kind == "status" or state.view_kind == "pr" or state.view_kind == "review") and vim.api.nvim_buf_is_valid(buf)) then return end

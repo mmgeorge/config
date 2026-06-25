@@ -51,9 +51,12 @@ would blow past Lua's hard cap of 200 locals. So every submodule is attached as 
 **field on the module table** (`M._git_data = require(...)`), never as a bare local.
 
 **Constraint two — circular requires.** Views, render, and git all need shared state
-(the current status buffer, the diff caches). That state lives on `init.lua`. But
-`init.lua` requires those same modules at load time, so they cannot `require` it back
-at the top level without a cycle. The solution is the **`dr()` seam** (Section 3).
+(the current status buffer, the diff caches). That state lives in a dedicated
+**`session.lua`** store that `require`s nothing, so every layer imports it directly with
+no cycle. A narrower need remains for shared *functions*: `init.lua` re-exports the
+package's functions and requires those same modules at load time, so they cannot
+`require` it back at the top level without a cycle. The **`dr()` seam** (Section 3)
+resolves that lazily.
 
 ---
 
@@ -61,7 +64,8 @@ at the top level without a cycle. The solution is the **`dr()` seam** (Section 3
 
 ```
 diff_review/
-├── init.lua                  Star-hub facade: wires every submodule, owns shared state, exposes open*/setup/get
+├── init.lua                  Star-hub facade: wires every submodule, re-exports functions, exposes open*/setup/get
+├── session.lua               Shared session-state store: active status state, per-buffer registry, per-session diff caches
 ├── types.lua                 Shared LuaCATS (---@class/---@alias) catalog — annotation only, never required at runtime
 ├── query_runtime.lua         Puts the plugin root on the runtimepath so bundled queries resolve
 ├── architecture.md           This document
@@ -153,38 +157,46 @@ diff_review/
 
 ---
 
-## 3. The `dr()` seam — how modules reach shared state
+## 3. Shared state (`session.lua`) and the `dr()` seam
 
-Every module that needs init-owned state opens the same lazy back-reference at the top:
+Cross-cutting mutable state — the active status state, the per-buffer registry, and the
+per-session diff caches — lives in **`session.lua`**, a store that `require`s nothing.
+Because it has no dependencies, every layer imports it directly, with no cycle risk:
 
 ```lua
-local function dr()
-  return require("diff_review")
-end
+local session = require("diff_review.session")
+session.status              -- the active status state
+session.states[buf]         -- the per-buffer state registry
+session.file_diffs          -- per-file diff cache (git layer writes, views read)
 ```
 
-Because `require` is memoized, `dr()` is a cheap table lookup after first load. It
-resolves the **fully-wired `init.lua` module table at call time**, not load time, which
-sidesteps the circular-require problem. A module can read and write shared state through
-it:
+`session` is the **single explicit owner of shared session state**. The git layer
+produces it, views and render consume it, and the status teardown resets it — all through
+one table, instead of state hidden on the facade. Its fields are fully typed, so reads are
+statically checked (unlike the `dr()` function seams below).
+
+**The `dr()` seam** solves the second, narrower problem: reaching init-owned *functions*.
+`init.lua` re-exports the package's functions under flat `_x` names, and it requires those
+modules at load time, so they cannot `require` it back at the top level without a cycle.
+The lazy back-reference resolves the fully-wired facade at call time instead:
 
 ```lua
-dr()._status                 -- the active status state
-dr()._status_states[buf]     -- the per-buffer state registry
-dr()._collect_items_from_git(cwd, cb)
+local function dr() return require("diff_review") end
+dr()._collect_items_from_git(cwd, cb)   -- a function re-exported on the facade
 dr()._status_stage_entries(...)
 ```
 
-`init.lua` is the **single owner of mutable cross-cutting state** and the **single
-re-export point**. Three wiring idioms appear in it:
+Because `require` is memoized, `dr()` is a cheap table lookup after first load. `init.lua`
+is now purely the **function re-export point**, not a state owner. Three wiring idioms
+appear in it:
 
 - **Module attach:** `M._git_data = require("diff_review.git.git_data")` — a submodule
   table parked on a field.
 - **Function re-export loop:** `for name, fn in pairs(mod) do M["_" .. name] = fn end`
   — flattens a module's functions onto `M` under their old names so existing `dr()._x`
   callsites keep working after an extraction.
-- **State pointers:** bare fields like `M._status`, `M._status_states`,
-  `M._file_diffs`, `M._buf_hunks` that modules mutate in place.
+- **Selective re-export:** `M._setup_bg_highlights = status_helpers.setup_bg_highlights`
+  — lifts one function onto the facade under its canonical name.
 
 **The one rule that matters for correctness:** if a function can be overridden by a test
 through `dr()._x` (a test seam), intra-module callers must invoke it through `dr()._x`,
@@ -256,21 +268,22 @@ Core fields:
 - `highlights`, `extmarks` — accumulated decoration, applied after the lines are written.
 - view-specific state — PR data, review comments, walkthrough mode, diff source handles.
 
-`init.lua` keeps three pointers into this world:
+The active-state pointers live in **`session.lua`** (Section 3):
 
-- `_status` — the **active** state (the one the current buffer renders into).
-- `_status_states` — the registry `{ [buf] → state }` so multiple status-like buffers
+- `session.status` — the **active** state (the one the current buffer renders into).
+- `session.states` — the registry `{ [buf] → state }` so multiple status-like buffers
   coexist.
-- `_main_status` — the primary `:GitStatus` buffer.
+- `session.main_status` — the primary `:GitStatus` buffer.
 
-**The autocmd state machine (`views/status/state.lua`).** A single `_status` pointer is
-convenient but dangerous when several status buffers are open. `attach_status_state(buf,
-state)` registers the state in `_status_states[buf]` and installs a
-`BufEnter/BufWinEnter/CursorMoved/ModeChanged/BufWipeout` autocmd group that **swaps
-`dr()._status = dr()._status_states[buf]` whenever the buffer becomes current.** This way
-render, navigation, and action code can read a single `_status` and always get the right
-buffer's state. `cleanup_diff_buffers()` and the `BufWipeout` hook tear down the diff
-caches when a buffer dies.
+**The autocmd state machine (`views/status/state.lua`).** A single `session.status`
+pointer is convenient but dangerous when several status buffers are open.
+`attach_status_state(buf, state)` registers the state in `session.states[buf]` and installs
+a `BufEnter/BufWinEnter/CursorMoved/ModeChanged/BufWipeout` autocmd group that **swaps
+`session.status = session.states[buf]` whenever the buffer becomes current.** This way
+render, navigation, and action code can read a single `session.status` and always get the
+right buffer's state. On teardown it calls `diff_buffer.cleanup_diff_buffers()` — the diff
+buffer owns its per-buffer caches (`_buf_hunks`, saved cursors, the `diff://` registry) and
+clears them itself.
 
 ---
 
@@ -334,13 +347,18 @@ This is the only async part of the engine. Diff bodies are not real buffers, so 
 have no syntax. To color them, the engine parses the underlying file (or the diff's
 synthetic body) with tree-sitter off the main path and caches the result.
 
-`syntax_engine.lua` owns three caches, all parked on `init.lua` so they survive across
-renders:
+`syntax_engine.lua` owns four caches as **module-local tables** (private to the render
+engine) that survive across renders:
 
-- `_ts_source_bufs` — transient, hidden scratch buffers used to host a parse.
-- `_ts_syntax_cache` — per-file syntax keyed by filename.
-- `_ts_diff_syntax_cache` — per-diff-side syntax keyed by `filename:side:sha256(diff)`.
-- `_ts_context_cache` — per-line scope context (the "in function `foo`" label).
+- `ts_source_bufs` — transient, hidden scratch buffers used to host a parse.
+- `ts_syntax_cache` — per-file syntax keyed by filename.
+- `ts_diff_syntax_cache` — per-diff-side syntax keyed by `filename:side:sha256(diff)`.
+- `ts_context_cache` — per-line scope context (the "in function `foo`" label).
+
+The three callers outside the engine (the git refresh, the row builder, the debug dump)
+reach these only through a narrow read/clear API — `clear_context_cache()`,
+`context_cache_entry(key)`, `file_syntax_cache_entry(filename)` — never the raw tables, so
+the caches stay encapsulated.
 
 The async pattern is uniform: on a cache miss the caller schedules
 `dr().compute_*_async(...)`, gets back a *pending* marker, and re-renders when the
@@ -734,5 +752,5 @@ never shows them). See [`AGENTS.md` → Linting](AGENTS.md) for the full triage.
 - **Working on PRs/reviews?** Start at `views/pr/review.lua` and `pr_overview.lua`, with
   `integrations/gh.lua` for the data.
 - **Changing git behavior?** Start at `git/git_data.lua` over `git/git_backend.lua`.
-- **Anything cross-cutting?** Find the state owner on `init.lua` and follow the `dr()`
-  seam outward.
+- **Anything cross-cutting?** Shared state lives in `session.lua`; a module's own caches
+  live in that module; `init.lua` only re-exports functions reached through the `dr()` seam.

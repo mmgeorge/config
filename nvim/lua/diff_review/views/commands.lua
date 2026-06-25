@@ -13,6 +13,7 @@ local paths = require("diff_review.infra.paths")
 local function dr()
   return require("diff_review")
 end
+local session = require("diff_review.session")
 
 local function notify_error(message, title)
   return notifications.error(message, title)
@@ -59,17 +60,17 @@ function M._walkthrough_host(buf)
   return {
     buf = buf,
     cwd = function()
-      local state = dr()._status_states and dr()._status_states[buf] or dr()._status
+      local state = session.states and session.states[buf] or session.status
       return state and state.cwd
     end,
     get_state = function()
-      return dr()._status_states and dr()._status_states[buf] or dr()._status
+      return session.states and session.states[buf] or session.status
     end,
     file_key = dr()._status_keys.file_key,
     hunk_key = dr()._status_keys.hunk_key,
     set_folded = function(key, folded)
-      local state = dr()._status_states and dr()._status_states[buf] or dr()._status
-      if state then dr()._status = state end
+      local state = session.states and session.states[buf] or session.status
+      if state then session.status = state end
       dr()._set_status_folded(key, folded, state)
     end,
     rerender = function(target_id, fallback_line)
@@ -77,7 +78,7 @@ function M._walkthrough_host(buf)
     end,
     git_list_async = git_backend.systemlist_async,
     inventory_async = function(cb)
-      local state = dr()._status_states and dr()._status_states[buf] or dr()._status
+      local state = session.states and session.states[buf] or session.status
       local cwd = state and state.cwd
       if not cwd or cwd == "" then
         cb({ rows = {} })
@@ -126,7 +127,7 @@ function M.open_pr(pr, opts)
   dr()._setup_bg_highlights()
 
   pr = pr_with_resolved_repo(pr, opts)
-  local cwd = opts.cwd or (dr()._status and dr()._status.cwd) or vim.fn.getcwd()
+  local cwd = opts.cwd or (session.status and session.status.cwd) or vim.fn.getcwd()
   local buf = vim.api.nvim_create_buf(true, false)
   vim.bo[buf].bufhidden = "hide"
   vim.bo[buf].buftype = "nofile"
@@ -158,7 +159,7 @@ function M.open_pr(pr, opts)
   state.pr_regular_comments = {}
   state.review_comments = dr()._pr_overview.editable_comments(state)
   if pr.repo and pr.repo ~= "" then vim.b[buf].github_repo = pr.repo end
-  dr()._status = state
+  session.status = state
   dr()._attach_status_state(buf, state)
   keymaps.setup_status_keymaps(buf)
   dr()._pr_edit.attach(buf)
@@ -205,7 +206,7 @@ function M.open_review(pr, opts)
   if not pr then return nil end
   dr()._setup_bg_highlights()
   pr = pr_with_resolved_repo(pr, opts)
-  local cwd = opts.cwd or (dr()._status and dr()._status.cwd) or vim.fn.getcwd()
+  local cwd = opts.cwd or (session.status and session.status.cwd) or vim.fn.getcwd()
   local buf = vim.api.nvim_create_buf(true, false)
   vim.bo[buf].bufhidden = "hide"
   vim.bo[buf].buftype = "nofile"
@@ -241,7 +242,7 @@ function M.open_review(pr, opts)
   if pr.repo and pr.repo ~= "" then vim.b[buf].github_repo = pr.repo end
   dr()._review.load_draft(state)
   dr()._review.normalize_comments(state)
-  dr()._status = state
+  session.status = state
   dr()._attach_status_state(buf, state)
   keymaps.setup_status_keymaps(buf)
   dr()._review.attach(buf)
@@ -319,7 +320,7 @@ function M.open_branch_diff(branch, opts)
       sections = nil,
       fancy_rows = {},
     }
-    dr()._status = state
+    session.status = state
     dr()._attach_status_state(buf, state)
     keymaps.setup_status_keymaps(buf)
 
@@ -406,7 +407,7 @@ end
 --- Open a standalone, Neogit-style DiffReview status buffer.
 function M.open()
   dr()._setup_bg_highlights()
-  local buf = dr()._status and dr()._status.buf
+  local buf = session.status and session.status.buf
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then
     buf = vim.api.nvim_create_buf(true, false)
     vim.bo[buf].bufhidden = "hide"
@@ -414,7 +415,7 @@ function M.open()
     vim.bo[buf].swapfile = false
     vim.bo[buf].filetype = "GitStatus"
     pcall(vim.api.nvim_buf_set_name, buf, (dr().config or config.options).status_buffer_name)
-    dr()._main_status = {
+    session.main_status = {
       view_kind = "status",
       buf = buf,
       folds = {},
@@ -427,12 +428,12 @@ function M.open()
       sections = nil,
       fancy_rows = {},
     }
-    dr()._status = dr()._main_status
-    dr()._attach_status_state(buf, dr()._main_status)
+    session.status = session.main_status
+    dr()._attach_status_state(buf, session.main_status)
     keymaps.setup_status_keymaps(buf)
   else
-    dr()._main_status = dr()._status_states and dr()._status_states[buf] or dr()._main_status or dr()._status
-    dr()._status = dr()._main_status
+    session.main_status = session.states and session.states[buf] or session.main_status or session.status
+    session.status = session.main_status
   end
 
   local win = vim.api.nvim_get_current_win()
@@ -441,7 +442,7 @@ function M.open()
     notify_error("DiffReview open failed: " .. tostring(err))
     return
   end
-  dr()._apply_status_window_options(win, dr()._main_status)
+  dr()._apply_status_window_options(win, session.main_status)
   vim.wo[win].foldcolumn = "0"
   dr()._render_status_or_notify(buf)
 end

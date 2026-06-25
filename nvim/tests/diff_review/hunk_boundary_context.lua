@@ -1,6 +1,8 @@
 vim.loader.enable(false)
 
 local diff_review = require("diff_review")
+local session = require("diff_review.session")
+local syntax_engine = require("diff_review.render.syntax_engine")
 local gh = require("diff_review.integrations.gh")
 
 local original_cwd = vim.fs.normalize(vim.fn.getcwd())
@@ -251,7 +253,7 @@ end
 local function count_boundary_rows(buf, pattern)
   local count = 0
   local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-  local boundary_lines = (diff_review._status and diff_review._status.boundary_lines) or {}
+  local boundary_lines = (session.status and session.status.boundary_lines) or {}
   for index, line in ipairs(lines) do
     if boundary_lines[index] and line:find(pattern, 1, true) then count = count + 1 end
   end
@@ -595,7 +597,7 @@ local function run()
     )
   end
   wait_for(function()
-    for _, value in pairs(diff_review._ts_context_cache or {}) do
+    for _, value in pairs(syntax_engine.context_cache()) do
       if type(value) == "table" and value.label == "Engine.new" then return true end
     end
     return false

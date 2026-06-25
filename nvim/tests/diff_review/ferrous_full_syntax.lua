@@ -1,6 +1,8 @@
 vim.loader.enable(false)
 
 local diff_review = require("diff_review")
+local session = require("diff_review.session")
+local syntax_engine = require("diff_review.render.syntax_engine")
 local gh = require("diff_review.integrations.gh")
 
 -- Diff-body syntax/background/intraline live in the decoration span store and are
@@ -179,7 +181,7 @@ local function first_diff_match_mismatch(filename, diff_text)
 end
 
 local function syntax_debug_for_row(buf, row)
-  local status = diff_review._status or {}
+  local status = session.status or {}
   local entry = status.entries and status.entries[row] or nil
   if not (entry and entry.file and entry.hunk) then return "no status entry for row " .. tostring(row) end
   local file = entry.file
@@ -189,7 +191,7 @@ local function syntax_debug_for_row(buf, row)
   local source_lines = diff_review._file_source_lines(file.filename)
   local diff_line = entry.diff_line or {}
   local current_line = diff_line.line and source_lines and source_lines[diff_line.line] or nil
-  local cache = diff_review._ts_syntax_cache and diff_review._ts_syntax_cache[file.filename] or nil
+  local cache = syntax_engine.file_syntax_cache_entry(file.filename)
   local cache_state = type(cache) == "table" and (cache.pending and "pending" or "ready") or tostring(cache)
   local lines = buffer_lines(buf)
   local neighbors = {}

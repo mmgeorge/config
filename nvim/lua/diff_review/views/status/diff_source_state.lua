@@ -13,6 +13,7 @@ local paths = require("diff_review.infra.paths")
 local function dr()
   return require("diff_review")
 end
+local session = require("diff_review.session")
 
 local M = {}
 
@@ -20,7 +21,7 @@ function M._status_diff_source_kind(file, entry_kind, hunk_entry_kind)
   if entry_kind == "commit_file" or hunk_entry_kind == "commit_hunk" then return "commit" end
   if entry_kind == "pr_review_file" or hunk_entry_kind == "pr_review_hunk" then return "review" end
   if entry_kind == "pr_file" or hunk_entry_kind == "pr_hunk" then return "pr" end
-  if dr()._status and dr()._status.view_kind == "diff" then return "branch" end
+  if session.status and session.status.view_kind == "diff" then return "branch" end
   if file and file.section_name == "staged" then return "staged" end
   return "unstaged"
 end
@@ -136,7 +137,7 @@ end
 
 ---@param commit DiffReviewStatusCommit
 function M._status_register_commit_source_handle(commit)
-  local status = dr()._status
+  local status = session.status
   if not (status and status.diff_source_registry and commit and commit.oid) then return end
   local handle = dr()._status_commit_source_handle(commit, status)
   if not handle then return end
@@ -147,7 +148,7 @@ end
 ---@param commit DiffReviewStatusCommit
 ---@return DiffReviewDiffSourceState?
 function M._status_ensure_commit_source_state(commit)
-  local status = dr()._status
+  local status = session.status
   if not (status and status.diff_source_registry and commit and commit.oid) then return nil end
   local handle = dr()._status_commit_source_handle(commit, status)
   if not handle then return nil end
@@ -298,7 +299,7 @@ end
 ---@param file_key string
 ---@return DiffReviewDiffFileState?
 function M._status_ensure_diff_file_state(file, entry_kind, hunk_entry_kind, file_key)
-  local status = dr()._status
+  local status = session.status
   if not (status and file) then return nil end
   local source_id = dr()._status_diff_source_id(file, entry_kind, hunk_entry_kind)
   local source_kind = dr()._status_diff_source_kind(file, entry_kind, hunk_entry_kind)
@@ -354,7 +355,7 @@ end
 ---@param file DiffReviewStatusFile
 ---@param hunks DiffReviewHunk[]
 function M._status_populate_diff_file_hunks(file_state, file, hunks)
-  local file_path = dr()._status_diff_file_path(file, dr()._status)
+  local file_path = dr()._status_diff_file_path(file, session.status)
   for hunk_index, hunk in ipairs(hunks or {}) do
     hunk.source_id = file_state.source_id
     hunk.file_key = file_state.key
@@ -532,7 +533,7 @@ end
 ---@param file_state DiffReviewDiffFileState
 ---@param file DiffReviewStatusFile
 function M._status_populate_diff_file_annotations(file_state, file)
-  local status = dr()._status
+  local status = session.status
   for _, comment in ipairs(type(file.pr_comments) == "table" and file.pr_comments or {}) do
     dr()._status_add_diff_file_annotation(file_state, comment, "pr_comment")
   end

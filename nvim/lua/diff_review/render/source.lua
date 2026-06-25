@@ -468,7 +468,9 @@ function M.reload_paths(registry, source_ids, paths, done)
       source.loading = true
       source.handle.reload_paths(source, paths, function(ok, err)
         if source.revision ~= revision then
-          finish_one(false, "Stale diff source reload ignored")
+          -- A newer reload superseded this one and will settle the source; this
+          -- callback is a harmless no-op, not a failure — don't poison the batch.
+          finish_one(true)
           return
         end
         source.loading = false

@@ -10,9 +10,21 @@ local paths = require("diff_review.infra.paths")
 local function dr()
   return require("diff_review")
 end
+local session = require("diff_review.session")
 
 local function notify_error(message, title)
   return notifications.error(message, title)
+end
+
+--- Block index-mutating actions while a commit is composing: `git commit` holds
+--- `.git/index.lock` for the whole time the commit screen is open (commit.lua sets
+--- session.suspend_preview), so a stage/unstage/discard would collide with the lock.
+---@param action string
+---@return boolean blocked
+local function blocked_by_active_commit(action)
+  if not session.suspend_preview then return false end
+  notify_error(action .. " is unavailable while a commit is in progress", "DiffReview")
+  return true
 end
 
 local repo_relative = paths.repo_relative
@@ -24,7 +36,7 @@ local status_reconcile_delay_ms = 120
 ---@param target_section DiffReviewStatusSectionName
 ---@param target_id? string
 local function status_apply_optimistic_entries(entries, target_section, target_id)
-  local status = dr()._status
+  local status = session.status
   if not (status and status.sections) then return end
   local next_sections = dr()._status_apply_optimistic_move(status.sections, entries, target_section)
   if not next_sections then return end
@@ -44,7 +56,7 @@ local function refresh_status_after_action(buf, target_id)
 end
 
 local function status_operations_pending()
-  local status = dr()._status
+  local status = session.status
   if not status then return false end
   if status.operation_queue_model then
     return dr()._diff_mutation_queue_model.pending(status.operation_queue_model)
@@ -93,7 +105,7 @@ end
 ---@param buf integer?
 ---@param target_id? string
 local function status_request_reconcile(buf, target_id)
-  local status = dr()._status
+  local status = session.status
   if not status then return end
   status.reconcile_buf = buf or status.buf
   status.reconcile_target_id = target_id
@@ -102,7 +114,7 @@ local function status_request_reconcile(buf, target_id)
   status.reconcile_generation = (status.reconcile_generation or 0) + 1
   local generation = status.reconcile_generation
   vim.defer_fn(function()
-    local latest_status = dr()._status
+    local latest_status = session.status
     if not latest_status or latest_status.reconcile_generation ~= generation then return end
     if status_operations_pending() then return end
     local reconcile_buf = latest_status.reconcile_buf
@@ -117,8 +129,8 @@ end
 
 ---@param operation fun(done: fun())
 local function status_enqueue_operation(operation)
-  dr()._status = dr()._status or {}
-  local status = dr()._status
+  session.status = session.status or {}
+  local status = session.status
   status.reconcile_generation = (status.reconcile_generation or 0) + 1
   status.operation_queue_model = status.operation_queue_model or dr()._diff_mutation_queue_model.new()
   dr()._diff_mutation_queue_model.enqueue(status.operation_queue_model, operation)
@@ -144,7 +156,7 @@ end
 ---@param entry DiffReviewStatusEntry
 ---@return string?
 local function status_entry_source_path(entry)
-  local status = dr()._status
+  local status = session.status
   if not (entry and entry.file and status) then return nil end
   return dr()._status_diff_file_path(entry.file, status)
 end
@@ -152,7 +164,7 @@ end
 ---@param entries DiffReviewStatusEntry[]
 ---@param source_ids string[]
 local function status_mark_diff_paths_pending(entries, source_ids)
-  local status = dr()._status
+  local status = session.status
   if not (status and status.diff_source_registry) then return end
   local path_set = {}
   for _, entry in ipairs(entries or {}) do
@@ -271,6 +283,7 @@ end
 local function status_stage_entries(entries, opts)
   opts = opts or {}
   if #entries == 0 then return end
+  if blocked_by_active_commit("Stage") then return end
   local expanded_entries = dr()._status_expanded_entries(entries)
   if #expanded_entries == 0 then return end
 
@@ -284,7 +297,7 @@ local function status_stage_entries(entries, opts)
   local hunk_diffs, tracked_files, untracked_files = status_split_action_entries(action_entries)
   local staged_hunks = 0
   local staged_files = 0
-  local status_buf = dr()._status and dr()._status.buf
+  local status_buf = session.status and session.status.buf
 
   status_mark_diff_paths_pending(action_entries, { "unstaged", "staged" })
   status_apply_optimistic_entries(action_entries, "staged", target_id)
@@ -351,6 +364,7 @@ end
 local function status_unstage_entries(entries, opts)
   opts = opts or {}
   if #entries == 0 then return end
+  if blocked_by_active_commit("Unstage") then return end
   local expanded_entries = dr()._status_expanded_entries(entries)
   if #expanded_entries == 0 then return end
 
@@ -365,7 +379,7 @@ local function status_unstage_entries(entries, opts)
   local hunk_diffs, files, added_files = status_split_unstage_entries(action_entries)
   local unstaged_hunks = 0
   local unstaged_files = 0
-  local status_buf = dr()._status and dr()._status.buf
+  local status_buf = session.status and session.status.buf
 
   status_mark_diff_paths_pending(action_entries, { "staged", "unstaged" })
   status_apply_optimistic_entries(tracked_entries, "unstaged", target_id)
@@ -434,7 +448,8 @@ end
 ---@param entries DiffReviewStatusEntry[]
 ---@param target_id? string
 local function status_discard_entries(entries, target_id)
-  local status_buf = dr()._status and dr()._status.buf
+  if blocked_by_active_commit("Discard") then return end
+  local status_buf = session.status and session.status.buf
   git_backend.git_root_async(function(cwd, root_err)
     if not cwd then
       notify_error(root_err or "Unable to find git root")

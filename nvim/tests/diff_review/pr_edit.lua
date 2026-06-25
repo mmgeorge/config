@@ -87,6 +87,7 @@ package.loaded["otter"] = {
 }
 
 local diff_review = require("diff_review")
+local session = require("diff_review.session")
 local gh = require("diff_review.integrations.gh")
 local github_gh = require("github.gh")
 local issue_index = require("github.issue_index")
@@ -640,7 +641,7 @@ local function fold_text_at(buf, row)
 end
 
 local function find_status_entry_row(buf, predicate, label)
-  local state = diff_review._status_states and diff_review._status_states[buf] or nil
+  local state = session.states and session.states[buf] or nil
   assert_true(state ~= nil, "missing status state for " .. tostring(label))
   for row = 1, vim.api.nvim_buf_line_count(buf) do
     local entry = state.entries and state.entries[row] or nil
@@ -1052,7 +1053,7 @@ local function run()
     return row_is_folded(buf, find_row(buf, "Line one")) and row_is_folded(buf, find_row(buf, "Line two"))
   end, "PR Description heading did not fold the description body")
   local folded_description_row = find_row(buf, "Description:")
-  local folded_description_entry = diff_review._status_states[buf].entries[folded_description_row]
+  local folded_description_entry = session.states[buf].entries[folded_description_row]
   assert_true(
     folded_description_entry and folded_description_entry.id == "pr-head-section:description",
     "folded Description row did not keep its fold entry: " .. vim.inspect(folded_description_entry)
@@ -1061,8 +1062,8 @@ local function run()
   captured_notifications = {}
   trigger_buf_mapping(buf, "<Tab>")
   assert_true(
-    diff_review._status_states[buf].folds["pr-head-section:description"] == false,
-    "Description fold state did not reopen: " .. vim.inspect(diff_review._status_states[buf].folds)
+    session.states[buf].folds["pr-head-section:description"] == false,
+    "Description fold state did not reopen: " .. vim.inspect(session.states[buf].folds)
   )
   assert_true(
     not saw_notification_containing("Unsynced PR edits"),

@@ -12,6 +12,7 @@ local datetime = require("diff_review.integrations.datetime")
 local git_backend = require("diff_review.git.git_backend")
 
 local function dr() return require("diff_review") end
+local session = require("diff_review.session")
 
 local function setup_bg_highlights()
   highlights.setup()
@@ -73,7 +74,7 @@ end
 ---@param head_line DiffReviewStatusHeadLine
 ---@return boolean
 local function status_patch_head_line(buf, entry_id, head_line)
-  local status = dr()._status_states and dr()._status_states[buf] or dr()._status
+  local status = session.states and session.states[buf] or session.status
   if not (
     status
     and status.entries
@@ -123,7 +124,7 @@ end
 
 ---@param commit DiffReviewStatusCommit
 local function status_load_commit_files(commit)
-  local status = dr()._status
+  local status = session.status
   local cwd = status and status.cwd
   local buf = status and status.buf
   if not (cwd and buf and vim.api.nvim_buf_is_valid(buf)) then return end
@@ -153,7 +154,7 @@ local function status_load_commit_files(commit)
   }
 
   dr()._diff_source_model.ensure_loaded(source_state, function(ok, err)
-    local latest_status = dr()._status
+    local latest_status = session.status
     if not (latest_status and latest_status.buf and vim.api.nvim_buf_is_valid(latest_status.buf)) then return end
     if latest_status.cwd ~= cwd then return end
 
@@ -271,7 +272,7 @@ end
 --- create + switch to the new branch, then refresh the status view.
 ---@param buf integer
 local function create_branch(buf)
-  local status = dr()._status_states and dr()._status_states[buf] or dr()._status
+  local status = session.states and session.states[buf] or session.status
   local cwd = status and status.cwd
   if not cwd then
     notify_error("Not a git repository", "DiffReview")
@@ -292,7 +293,7 @@ local function create_branch(buf)
       end
       vim.notify("Created branch " .. name, vim.log.levels.INFO, { title = "DiffReview" })
       if vim.api.nvim_buf_is_valid(buf) then
-        dr()._status = status
+        session.status = status
         status.pr = nil
         status.about = nil
         dr()._render_status_or_notify(buf, nil, nil, { restore_initial_folds = true, refresh_pr = true, refresh_about = true })

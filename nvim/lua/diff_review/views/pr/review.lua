@@ -13,21 +13,22 @@ local repo_relative = require("diff_review.infra.paths").repo_relative
 local function dr()
   return require("diff_review")
 end
+local session = require("diff_review.session")
 
 -- Render-core shims: thread the active status into the state-passing buffer core.
 local function status_add_line(text, entry, hl)
-  return status_buffer.add_line(dr()._status, text, entry, hl)
+  return status_buffer.add_line(session.status, text, entry, hl)
 end
 local function status_add_highlight(line, start_col, end_col, hl_group, priority)
-  return status_buffer.add_highlight(dr()._status, line, start_col, end_col, hl_group, priority)
+  return status_buffer.add_highlight(session.status, line, start_col, end_col, hl_group, priority)
 end
 local function status_folded(key, default, state)
-  return status_buffer.folded(state or dr()._status or {}, key, default)
+  return status_buffer.folded(state or session.status or {}, key, default)
 end
 local function set_status_folded(key, folded, state)
   if not state then
-    dr()._status = dr()._status or {}
-    state = dr()._status
+    session.status = session.status or {}
+    state = session.status
   end
   return status_buffer.set_folded(state, key, folded)
 end
@@ -65,7 +66,7 @@ local M = {
 ---@param buf integer
 ---@return table? state the review-capable status-state, or nil if buf has no inline comment rows
 function M.state(buf)
-  local status = dr()._status_states and dr()._status_states[buf] or nil
+  local status = session.states and session.states[buf] or nil
   if status and status.view_kind == "review" then return status end
   if status and status.view_kind == "pr" then
     status.pr_standalone_comments = status.pr_standalone_comments or {}
@@ -981,7 +982,7 @@ end
 function M.render(buf)
   local state = M.state(buf)
   if not state then return end
-  dr()._status = state
+  session.status = state
   M.ensure_expanded(state)
   state.head_lines = M.head_lines(state)
   state.sections = M.sections(state)
@@ -1096,7 +1097,7 @@ function M.comment_rule_width(win, buf)
     local textoff = tonumber(wininfo and wininfo.textoff) or 0
     width = width - textoff
   else
-    local status = dr()._status
+    local status = session.status
     buf = buf or (status and status.buf) or nil
     if buf and vim.api.nvim_buf_is_valid(buf) then
       local displayed_win = vim.fn.bufwinid(buf)
@@ -1278,7 +1279,7 @@ function M.emit_comment(comment, index, indent)
   comment.review_rendered_body_text = table.concat(body_lines, "\n")
   local fold_id = M.comment_fold_id(comment, index)
   comment.review_fold_id = fold_id
-  local start_line = #dr()._status.lines + 1
+  local start_line = #session.status.lines + 1
   if comment.review_folded == true then
     local folded_entry = {
       id = fold_id,
@@ -1385,7 +1386,7 @@ end
 function M.comment_under_cursor(buf)
   local state = M.state(buf)
   if not state then return nil end
-  dr()._status = state
+  session.status = state
   local cursor_row = vim.api.nvim_win_get_cursor(0)[1]
   for _, row in ipairs({ cursor_row, cursor_row - 1, cursor_row + 1 }) do
     local comment, index = M.comment_at_row(buf, row)
@@ -1408,7 +1409,7 @@ end
 function M.toggle_comment_fold(buf)
   local state = M.state(buf)
   if not state then return false end
-  dr()._status = state
+  session.status = state
   M.sync_inline_comment_text(buf)
   if state.view_kind == "pr" then
     local row = vim.api.nvim_win_get_cursor(0)[1]
@@ -1829,7 +1830,7 @@ end
 ---@param buf integer
 ---@return table? state
 function M.command_map_state(buf)
-  local state = dr()._status_states and dr()._status_states[buf] or dr()._status
+  local state = session.states and session.states[buf] or session.status
   if not (state and state.view_kind == "review") then return nil end
   state.review_command_maps = state.review_command_maps or {}
   state.review_command_maps_by_key = state.review_command_maps_by_key or {}
@@ -2159,7 +2160,7 @@ end
 function M.toggle_viewed(buf, viewed)
   local state = M.state(buf)
   if not state then return end
-  dr()._status = state
+  session.status = state
   local entry = status_entry_under_cursor()
   if not entry then return end
   state.review_viewed_hunks = state.review_viewed_hunks or {}
@@ -2394,7 +2395,7 @@ end
 function M.add_comment(buf)
   local state = M.state(buf)
   if not state then return end
-  dr()._status = state
+  session.status = state
   local existing = M.comment_under_cursor(buf)
   if existing then
     M.focus_inline_comment(buf, existing)
@@ -2431,7 +2432,7 @@ end
 function M.sync(buf)
   local state = M.state(buf)
   if not state then return end
-  dr()._status = state
+  session.status = state
   M.sync_comment_text(buf)
   M.sync_inline_comment_text(buf)
   local count = M.enqueue_dirty_comments(buf)
@@ -2486,7 +2487,7 @@ end
 function M.submit(buf)
   local state = M.state(buf)
   if not state then return end
-  dr()._status = state
+  session.status = state
   M.sync_comment_text(buf)
   local function with_event(event)
     if not event then return end
@@ -2644,7 +2645,7 @@ function M.load_diff(pr, cwd, buf)
   gh.pr_diff_async(cwd, pr.number, pr.repo, function(result)
     local latest = M.state(buf)
     if not (latest and latest.pr_diff_request_id == request_id and vim.api.nvim_buf_is_valid(buf)) then return end
-    dr()._status = latest
+    session.status = latest
     if result.code ~= 0 then
       notify_error("GitHub PR diff failed: " .. (result.output ~= "" and result.output or ("gh exited " .. result.code)), "DiffReview")
       return
@@ -2657,7 +2658,7 @@ end
 --- Resolve the PR from the current status/PR buffer and open its review.
 ---@param buf integer
 function M.start(buf)
-  local status = dr()._status_states and dr()._status_states[buf] or dr()._status
+  local status = session.states and session.states[buf] or session.status
   if not status then return end
   local pr
   if status.view_kind == "pr" then
@@ -2680,7 +2681,7 @@ function M.setup_keymaps(buf)
     for _, key in ipairs(status_keys_for(id)) do
       local mapped
       mapped = function()
-        if dr()._status_states and dr()._status_states[buf] then dr()._status = dr()._status_states[buf] end
+        if session.states and session.states[buf] then session.status = session.states[buf] end
         fn()
       end
       M.register_command_map(buf, id, spec.modes, key, mapped, { buffer = buf, silent = true, nowait = true, desc = spec.desc })

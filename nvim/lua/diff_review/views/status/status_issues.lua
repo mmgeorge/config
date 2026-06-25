@@ -7,6 +7,7 @@
 ---@class DiffReviewStatusIssuesModule
 local M = {}
 
+local session = require("diff_review.session")
 local notifications = require("diff_review.infra.notifications")
 
 --- Resolve the status state for a buffer from the active registry, falling back to the
@@ -14,8 +15,7 @@ local notifications = require("diff_review.infra.notifications")
 ---@param buf integer
 ---@return table?
 local function status_for_buf(buf)
-  local diff_review = require("diff_review")
-  return diff_review._status_states and diff_review._status_states[buf] or diff_review._status
+  return session.states and session.states[buf] or session.status
 end
 
 ---@param cwd string?

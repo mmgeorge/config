@@ -18,6 +18,8 @@
 
 local M = {}
 
+local session = require("diff_review.session")
+
 -- Active commit session.
 -- { win, list_win, prev_buf, prev_winbar, console, on_done, aborted }
 M._active = nil
@@ -205,7 +207,7 @@ function M._finish(code)
   local output = (st.console and vim.api.nvim_buf_is_valid(st.console))
       and vim.api.nvim_buf_get_lines(st.console, 0, -1, false) or {}
 
-  require("diff_review").suspend_preview = false
+  session.suspend_preview = false
   winbar(st.win, st.prev_winbar or "")
 
   if code == 0 or st.aborted then
@@ -281,7 +283,7 @@ function M.commit(opts)
         root = root,
       }
 
-      require("diff_review").suspend_preview = true
+      session.suspend_preview = true
       vim.api.nvim_win_set_buf(win, console)
       vim.wo[win].number = false
       vim.wo[win].relativenumber = false

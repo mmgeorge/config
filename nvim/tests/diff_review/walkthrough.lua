@@ -1,6 +1,7 @@
 vim.loader.enable(false)
 
 local diff_review = require("diff_review")
+local session = require("diff_review.session")
 local gh = require("diff_review.integrations.gh")
 local walkthrough = require("diff_review.views.walkthrough")
 
@@ -222,7 +223,7 @@ local function buffer_has_status_highlight_for_text(buf, line_needle, text, hl_g
       if not start_byte then return false end
       local start_col = start_byte - 1
       local end_col = start_col + #text
-      for _, highlight in ipairs(diff_review._status and diff_review._status.highlights or {}) do
+      for _, highlight in ipairs(session.status and session.status.highlights or {}) do
         if highlight.line == row
             and highlight.hl_group == hl_group
             and highlight.start_col <= start_col

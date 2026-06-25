@@ -9,21 +9,22 @@ local gh = require("diff_review.integrations.gh")
 local M = {}
 
 local function dr() return require("diff_review") end
+local session = require("diff_review.session")
 
 -- Forward-declare so status_start_pr_lookup can capture the open action as an upvalue.
 local status_open_pr
 
 local function status_start_pr_lookup(cwd, buf, request_id)
   if not vim.api.nvim_buf_is_valid(buf) then return end
-  local status = dr()._status_states and dr()._status_states[buf] or dr()._status
+  local status = session.states and session.states[buf] or session.status
   if not (status and status.pr_request_id == request_id and status.pr_root == cwd and status.pr) then return end
   if status.pr.lookup_started then return end
   status.pr.lookup_started = true
 
   local function complete_pr_lookup(result)
-    local latest_status = dr()._status_states and dr()._status_states[buf] or dr()._status
+    local latest_status = session.states and session.states[buf] or session.status
     if not (latest_status and latest_status.pr_request_id == request_id and latest_status.pr_root == cwd) then return end
-    dr()._status = latest_status
+    session.status = latest_status
     local pending_open = latest_status.pr and latest_status.pr.open_when_ready
     local pending_open_win = latest_status.pr and latest_status.pr.open_when_ready_win
 
@@ -55,9 +56,9 @@ local function status_start_pr_lookup(cwd, buf, request_id)
     if pending_open then
       vim.schedule(function()
         if not (status_open_pr and vim.api.nvim_buf_is_valid(buf)) then return end
-        local current_status = dr()._status_states and dr()._status_states[buf] or dr()._status
+        local current_status = session.states and session.states[buf] or session.status
         if not (current_status and current_status.pr_request_id == request_id and current_status.pr_root == cwd) then return end
-        dr()._status = current_status
+        session.status = current_status
 
         local function open_pending_pr()
           status_open_pr(nil)
@@ -91,8 +92,8 @@ end
 ---@param force? boolean
 ---@return integer? request_id
 local function status_ensure_pr_state(cwd, buf, force)
-  dr()._status = dr()._status or {}
-  local status = dr()._status
+  session.status = session.status or {}
+  local status = session.status
   if not force and status.pr_root == cwd and status.pr then return nil end
 
   status.pr_root = cwd
@@ -116,8 +117,8 @@ end
 ---@param force? boolean
 ---@param allow_generation? boolean
 local function status_ensure_about_state(cwd, buf, has_changes, force, allow_generation)
-  dr()._status = dr()._status or {}
-  local status = dr()._status
+  session.status = session.status or {}
+  local status = session.status
   if not has_changes then
     status.about_root = cwd
     status.about = { state = "none", waiters = {} }
@@ -144,13 +145,13 @@ local function status_ensure_about_state(cwd, buf, has_changes, force, allow_gen
   end
 
   local function start_generation()
-    local latest_status = dr()._status_states and dr()._status_states[buf] or dr()._status
+    local latest_status = session.states and session.states[buf] or session.status
     if not (latest_status and latest_status.about_request_id == request_id and latest_status.about_root == cwd) then return end
     latest_status.about_pending = nil
     ai_commit.ensure(cwd, { force = force }, function(result)
-      latest_status = dr()._status_states and dr()._status_states[buf] or dr()._status
+      latest_status = session.states and session.states[buf] or session.status
       if not (latest_status and latest_status.about_request_id == request_id and latest_status.about_root == cwd) then return end
-      dr()._status = latest_status
+      session.status = latest_status
       latest_status.about = result
       latest_status.about_pending = nil
       if latest_status.head_values then
@@ -181,11 +182,11 @@ end
 
 status_open_pr = function(entry)
   local pr = entry and entry.pr
-  if not pr and dr()._status and dr()._status.pr and dr()._status.pr.state == "ready" then
-    pr = dr()._status.pr.pr
+  if not pr and session.status and session.status.pr and session.status.pr.state == "ready" then
+    pr = session.status.pr.pr
   end
   if not pr then
-    local pr_state = dr()._status and dr()._status.pr
+    local pr_state = session.status and session.status.pr
     if pr_state and pr_state.state == "fetching" then
       pr_state.open_when_ready = true
       pr_state.open_when_ready_win = vim.api.nvim_get_current_win()
@@ -204,7 +205,7 @@ status_open_pr = function(entry)
     end)
     return
   end
-  dr().open_pr(pr, { cwd = dr()._status and dr()._status.cwd or nil })
+  dr().open_pr(pr, { cwd = session.status and session.status.cwd or nil })
 end
 
 M.status_start_pr_lookup = status_start_pr_lookup

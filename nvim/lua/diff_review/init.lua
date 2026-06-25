@@ -4,27 +4,10 @@
 ---@class DiffReviewModule
 ---@field config DiffReviewConfig?
 ---@field _git_backend DiffReviewGitBackend?
----@field _status table?
----@field _main_status table?
----@field _status_states table<integer, table>?
----@field _untracked table<string, string>?
----@field _file_diffs table<string, string|false>?
----@field _file_hunk_staged table<string, boolean[]>?
----@field _diff_bufs table<string, integer>?
----@field _buf_hunks table<integer, DiffReviewHunk[]>?
----@field _buf_filename table<integer, string>?
----@field _buf_saved_cursor table<integer, integer[]>?
----@field _buf_last_rendered table<integer, string>?
----@field _ts_context_cache table<string, DiffReviewHunkTreeSitterContext|string|false|DiffReviewTreeSitterContextPending>?
----@field _ts_syntax_cache table<string, DiffReviewTreeSitterSyntax|false|DiffReviewTreeSitterSyntaxPending>?
----@field _ts_diff_syntax_cache table<string, DiffReviewTreeSitterSyntax|false|DiffReviewTreeSitterSyntaxPending>?
----@field _ts_source_bufs table<string, integer>?
 ---@field _diff_uses_file_syntax fun(hunk_staged?: boolean[], opts?: table): boolean
 ---@field _prewarm_diff_syntax fun(filename: string, diff_text: string, hunk_staged?: boolean[], callback_key: string, on_update?: fun(syntax?: DiffReviewTreeSitterSyntax), opts?: table)
 ---@field _status_prewarm_hunk_budget fun(hunk_count: integer, options?: DiffReviewConfig): integer
 ---@field _diff_mutation_queue_model table
----@field _main_win integer?
----@field suspend_preview boolean?
 ---@field _collect_items_from_git fun(cwd: string, cb: fun(items: table[]), ctx?: table)
 ---@field [string] any Re-export functions wired onto M by the `for _, fn in pairs(module)` loops below are invisible to static analysis; this index keeps `dr()._x` seam reads from flagging undefined-field.
 local M = {}
@@ -192,9 +175,6 @@ M._status_buffer = status_buffer
 ---@field old_width integer
 ---@field new_width integer
 
--- Cache for treesitter context per file (cleared on refresh)
-M._ts_context_cache = {}
-M._ts_source_bufs = {}
 
 -- Window option save/restore now lives in diff_review.window_options (M._window_options),
 -- re-exposed as M._hide_line_numbers / M._apply_status_window_options / M._restore_line_numbers.
@@ -222,14 +202,9 @@ function M.get(cb, _ctx)
   end)
 end
 
--- Cache of diff preview items keyed by filename
-M._diff_items = {}
-
 -- Namespace for diff preview/status rendering
 M._ns = vim.api.nvim_create_namespace("diff_review_preview")
 M._diff_gutter_visual_ns = vim.api.nvim_create_namespace("diff_review_visual_gutter")
-M._empty_diff_rows = {}
-M._diff_line_content_lengths = {}
 
 ---@class DiffReviewHunkChangeRegion
 ---@field first_item integer
@@ -279,14 +254,6 @@ M._diff_line_content_lengths = {}
 ---@field display_end integer?
 ---@field changed_lines table<integer, boolean>
 
--- Per-buffer hunk metadata: maps buffer line ranges to raw diff patches
-M._buf_hunks = {}
--- Per-buffer filename mapping
-M._buf_filename = {}
--- Per-buffer saved cursor position (for restoring after jumping to file)
-M._buf_saved_cursor = {}
--- Track what was last rendered per buffer to avoid re-rendering same data (diff_buffer view state)
-M._buf_last_rendered = {}
 
 ---@class DiffReviewSectionConfig
 ---@field name string

@@ -15,6 +15,7 @@ local util = require("diff_review.infra.util")
 local function dr()
   return require("diff_review")
 end
+local session = require("diff_review.session")
 
 local M = {}
 require("diff_review.query_runtime")
@@ -605,7 +606,7 @@ end
 ---@param filename string
 ---@param cb fun(syntax?: DiffReviewTreeSitterSyntax)
 function M.compute_file_syntax_async(filename, cb)
-  return dr()._status_perf_span("treesitter.compute_file_syntax_async", dr()._status and dr()._status.buf or nil, {
+  return dr()._status_perf_span("treesitter.compute_file_syntax_async", session.status and session.status.buf or nil, {
     file = filename,
   }, function()
     local buf = syntax_engine.treesitter_source_buffer(filename)
@@ -627,7 +628,7 @@ function M.compute_file_syntax_async(filename, cb)
     local highlight_ok, highlight_query = pcall(vim.treesitter.query.get, lang, "highlights")
     if not highlight_ok then highlight_query = nil end
 
-    local parser_ok, parser = dr()._status_perf_span("treesitter.compute_file_syntax_async.get_parser", dr()._status and dr()._status.buf or nil, {
+    local parser_ok, parser = dr()._status_perf_span("treesitter.compute_file_syntax_async.get_parser", session.status and session.status.buf or nil, {
       file = filename,
       lang = lang,
     }, function()
@@ -655,7 +656,7 @@ function M.compute_file_syntax_async(filename, cb)
       })
     end
 
-    local parse_ok, parsed = dr()._status_perf_span("treesitter.compute_file_syntax_async.parse_call", dr()._status and dr()._status.buf or nil, {
+    local parse_ok, parsed = dr()._status_perf_span("treesitter.compute_file_syntax_async.parse_call", session.status and session.status.buf or nil, {
       file = filename,
       lang = lang,
       source_line_count = line_count,
@@ -683,7 +684,7 @@ end
 ---@param lines string[]
 ---@param cb fun(syntax?: DiffReviewTreeSitterSyntax)
 function M.compute_diff_syntax_async(filename, lines, cb)
-  return dr()._status_perf_span("treesitter.compute_diff_syntax_async", dr()._status and dr()._status.buf or nil, {
+  return dr()._status_perf_span("treesitter.compute_diff_syntax_async", session.status and session.status.buf or nil, {
     file = filename,
     source_line_count = #lines,
   }, function()
@@ -707,7 +708,7 @@ function M.compute_diff_syntax_async(filename, lines, cb)
     vim.bo[buf].buftype = "nofile"
     vim.bo[buf].swapfile = false
     vim.bo[buf].filetype = ft
-    dr()._status_perf_span("treesitter.compute_diff_syntax_async.set_lines", dr()._status and dr()._status.buf or nil, {
+    dr()._status_perf_span("treesitter.compute_diff_syntax_async.set_lines", session.status and session.status.buf or nil, {
       file = filename,
       lang = lang,
       source_line_count = #lines,
@@ -715,7 +716,7 @@ function M.compute_diff_syntax_async(filename, lines, cb)
       vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
     end)
 
-    local parser_ok, parser = dr()._status_perf_span("treesitter.compute_diff_syntax_async.get_parser", dr()._status and dr()._status.buf or nil, {
+    local parser_ok, parser = dr()._status_perf_span("treesitter.compute_diff_syntax_async.get_parser", session.status and session.status.buf or nil, {
       file = filename,
       lang = lang,
     }, function()
@@ -745,7 +746,7 @@ function M.compute_diff_syntax_async(filename, lines, cb)
       })
     end
 
-    local parse_ok, parsed = dr()._status_perf_span("treesitter.compute_diff_syntax_async.parse_call", dr()._status and dr()._status.buf or nil, {
+    local parse_ok, parsed = dr()._status_perf_span("treesitter.compute_diff_syntax_async.parse_call", session.status and session.status.buf or nil, {
       file = filename,
       lang = lang,
       source_line_count = line_count,
@@ -770,9 +771,9 @@ function M.compute_diff_syntax_async(filename, lines, cb)
   end)
 end
 local function collect_items_from_git(cwd, cb, _ctx)
-  dr()._ts_context_cache = {} -- clear treesitter context cache on refresh
+  syntax_engine.clear_context_cache() -- clear treesitter context cache on refresh
   syntax_engine.clear_treesitter_source_buffers()
-  dr()._untracked = {} -- map of absolute path -> repo-relative path for untracked files
+  session.untracked = {} -- map of absolute path -> repo-relative path for untracked files
   local results = {
     unstaged = {},
     staged = {},
@@ -949,7 +950,7 @@ local function collect_items_from_git(cwd, cb, _ctx)
   -- Add untracked files
   for _, f in ipairs(untracked_files) do
     local filename = paths.repo_file_path(cwd, f)
-    dr()._untracked[filename] = f -- remember repo-relative path for the synthetic diff
+    session.untracked[filename] = f -- remember repo-relative path for the synthetic diff
     items[#items + 1] = ({
       filename = filename,
       pos = { 1, 0 },
@@ -978,13 +979,13 @@ local function collect_items_from_git(cwd, cb, _ctx)
     file_hunks[f] = file_hunks[f] or {}
     file_hunks[f][#file_hunks[f] + 1] = hunk
   end
-  dr()._file_diffs = {}
-  dr()._file_hunk_staged = {}
+  session.file_diffs = {}
+  session.file_hunk_staged = {}
   for f, hunks in pairs(file_hunks) do
     local diffs, flags = order_file_hunks(hunks)
     local filename = paths.repo_file_path(cwd, f)
-    dr()._file_diffs[filename] = #diffs > 0 and table.concat(diffs, "\n") or false
-    dr()._file_hunk_staged[filename] = #flags > 0 and flags or nil
+    session.file_diffs[filename] = #diffs > 0 and table.concat(diffs, "\n") or false
+    session.file_hunk_staged[filename] = #flags > 0 and flags or nil
   end
 
   cb(items)
@@ -992,7 +993,7 @@ local function collect_items_from_git(cwd, cb, _ctx)
   -- Pre-render all diff buffers so file switching is instant
   if not (_ctx and _ctx.skip_pre_render) then
     vim.schedule(function()
-      for filename, diff_text in pairs(dr()._file_diffs) do
+      for filename, diff_text in pairs(session.file_diffs) do
         if diff_text and diff_text ~= "" then
           local buf = dr().open_diff_buffer(filename)
           dr()._refresh_diff_buffer(buf, filename)

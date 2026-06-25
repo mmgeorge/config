@@ -1,6 +1,8 @@
 vim.loader.enable(false)
 
 local diff_review = require("diff_review")
+local session = require("diff_review.session")
+local syntax_engine = require("diff_review.render.syntax_engine")
 local gh = require("diff_review.integrations.gh")
 
 -- Diff-body syntax/background/intraline live in the decoration span store and are
@@ -505,7 +507,7 @@ local function wait_for(condition, message)
 end
 
 local function semantic_context_ready()
-  for key, value in pairs(diff_review._ts_context_cache or {}) do
+  for key, value in pairs(syntax_engine.context_cache()) do
     if key:find("semantic_regions.rs", 1, true) and type(value) == "table" and not value.pending then return true end
   end
   return false
@@ -529,7 +531,7 @@ end
 
 local function diff_rows_for_file(file_suffix)
   local rows = {}
-  for row_number, entry in pairs(diff_review._status.entries or {}) do
+  for row_number, entry in pairs(session.status.entries or {}) do
     local diff_line = entry and entry.diff_line
     if diff_line and path_ends_with(diff_line.file, file_suffix) then
       rows[#rows + 1] = {
@@ -1087,7 +1089,7 @@ local function run()
   wait_for(function()
     return semantic_context_ready()
   end, function()
-    return "semantic_regions.rs Tree-sitter context did not resolve\n" .. vim.inspect(diff_review._ts_context_cache or {})
+    return "semantic_regions.rs Tree-sitter context did not resolve\n" .. vim.inspect(syntax_engine.context_cache())
   end)
   wait_for(function()
     return buffer_contains(buf, "pub fn insert(&mut self, model: &Model, repository: &ModelRepository) {")

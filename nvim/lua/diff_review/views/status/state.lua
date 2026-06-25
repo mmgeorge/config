@@ -12,6 +12,8 @@ local config = require("diff_review.infra.config")
 local function dr()
   return require("diff_review")
 end
+local session = require("diff_review.session")
+local diff_buffer = require("diff_review.views.diff_buffer")
 
 local M = {}
 
@@ -21,8 +23,8 @@ local M = {}
 ---@param extra? table
 ---@return table
 local function perf_payload(buf, extra)
-  local state = buf and dr()._status_states and dr()._status_states[buf] or nil
-  if not state and dr()._status and (not buf or dr()._status.buf == buf) then state = dr()._status end
+  local state = buf and session.states and session.states[buf] or nil
+  if not state and session.status and (not buf or session.status.buf == buf) then state = session.status end
   local payload = vim.deepcopy(extra or {})
   payload.buf = buf
   payload.view_kind = state and state.view_kind or nil
@@ -102,35 +104,26 @@ end
 
 --- Close and wipe all diff buffers
 local function cleanup_diff_buffers()
-  dr()._restore_line_numbers(dr()._main_win)
+  dr()._restore_line_numbers(session.main_win)
   dr()._window_options.reset()
-  dr()._diff_bufs = dr()._diff_bufs or {}
-  for _, buf in pairs(dr()._diff_bufs) do
-    if vim.api.nvim_buf_is_valid(buf) then
-      vim.api.nvim_buf_delete(buf, { force = true })
-    end
-  end
-  dr()._diff_bufs = {}
-  dr()._buf_hunks = {}
-  dr()._buf_filename = {}
-  dr()._buf_saved_cursor = {}
-  dr()._empty_diff_rows = {}
-  dr()._diff_line_content_lengths = {}
-  dr()._main_win = nil
+  diff_buffer.cleanup_diff_buffers()
+  session.empty_diff_rows = {}
+  session.diff_line_content_lengths = {}
+  session.main_win = nil
 end
 
 ---@param buf integer
 ---@param state table
 local function attach_status_state(buf, state)
   dr()._ensure_status_resize_autocmd()
-  dr()._status_states = dr()._status_states or {}
-  dr()._status_states[buf] = state
+  session.states = session.states or {}
+  session.states[buf] = state
   vim.api.nvim_create_autocmd("BufEnter", {
     buffer = buf,
     callback = function()
       perf_span("status.autocmd_buf_enter", buf, nil, function()
-        local current = dr()._status_states and dr()._status_states[buf] or nil
-        if current then dr()._status = current end
+        local current = session.states and session.states[buf] or nil
+        if current then session.status = current end
         dr()._apply_status_window_options(vim.api.nvim_get_current_win(), current)
         dr()._status_apply_native_folds(buf)
         dr()._status_apply_hint_bar(buf, vim.api.nvim_get_current_win())
@@ -141,8 +134,8 @@ local function attach_status_state(buf, state)
     buffer = buf,
     callback = function()
       perf_span("status.autocmd_buf_win_enter", buf, nil, function()
-        local current = dr()._status_states and dr()._status_states[buf] or nil
-        if current then dr()._status = current end
+        local current = session.states and session.states[buf] or nil
+        if current then session.status = current end
         dr()._apply_status_window_options(vim.api.nvim_get_current_win(), current)
         dr()._status_apply_native_folds(buf)
         if current and current.view_kind == "review" and dr()._review and dr()._review.refresh_inline_comment_rules then
@@ -189,18 +182,18 @@ local function attach_status_state(buf, state)
   vim.api.nvim_create_autocmd("BufWipeout", {
     buffer = buf,
     callback = function()
-      if dr()._status_states then dr()._status_states[buf] = nil end
-      if dr()._main_status == state then dr()._main_status = nil end
-      if dr()._status == state then dr()._status = dr()._main_status end
-      if dr()._diff_line_content_lengths then dr()._diff_line_content_lengths[buf] = nil end
+      if session.states then session.states[buf] = nil end
+      if session.main_status == state then session.main_status = nil end
+      if session.status == state then session.status = session.main_status end
+      if session.diff_line_content_lengths then session.diff_line_content_lengths[buf] = nil end
     end,
   })
 end
 
 ---@param sections DiffReviewStatusSection[]?
 local function restore_initial_folds(sections)
-  dr()._status = dr()._status or {}
-  dr()._status.folds = {}
+  session.status = session.status or {}
+  session.status.folds = {}
 end
 
 ---@param sections DiffReviewStatusSection[]?

@@ -11,6 +11,7 @@ local util = require("diff_review.infra.util")
 local function dr()
   return require("diff_review")
 end
+local session = require("diff_review.session")
 
 -- Seams to init-owned helpers the builders share.
 local detect_filetype = util.detect_filetype
@@ -248,7 +249,7 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
     local callback_key = context_callback_key and context_callback_key(line)
       or ("diff-row:" .. (filename or block.file) .. ":" .. line)
     local context = syntax_engine.cached_hunk_context(filename, line, callback_key, on_context_update)
-    local cached_context = dr()._ts_context_cache and dr()._ts_context_cache[filename .. ":" .. line] or nil
+    local cached_context = syntax_engine.context_cache_entry(filename .. ":" .. line)
     if type(cached_context) == "table" and cached_context.pending then context_pending = true end
     return context
   end
@@ -748,10 +749,10 @@ local function render_highlight_rows(buf, ns, rows)
     if empty_diff_row then empty_diff_rows[row_index] = true end
   end
 
-  dr()._empty_diff_rows = dr()._empty_diff_rows or {}
-  dr()._empty_diff_rows[buf] = empty_diff_rows
-  dr()._diff_line_content_lengths = dr()._diff_line_content_lengths or {}
-  dr()._diff_line_content_lengths[buf] = content_lengths
+  session.empty_diff_rows = session.empty_diff_rows or {}
+  session.empty_diff_rows[buf] = empty_diff_rows
+  session.diff_line_content_lengths = session.diff_line_content_lengths or {}
+  session.diff_line_content_lengths[buf] = content_lengths
   dr()._clear_diff_gutter_visual_line(buf)
   vim.bo[buf].modifiable = true
   vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
@@ -792,7 +793,7 @@ local function render_fancy_diff(buf, diff_text, hunk_staged, filename)
     end,
     function()
       if not (buf and vim.api.nvim_buf_is_valid(buf) and filename) then return end
-      dr()._buf_last_rendered[buf] = nil
+      session.buf_last_rendered[buf] = nil
       dr()._refresh_diff_buffer(buf, filename)
     end
   ))

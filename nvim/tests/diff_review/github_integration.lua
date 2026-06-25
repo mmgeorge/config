@@ -1,6 +1,7 @@
 vim.loader.enable(false)
 
 local diff_review = require("diff_review")
+local session = require("diff_review.session")
 local ai_commit = require("diff_review.integrations.ai_commit")
 local commit = require("diff_review.integrations.commit")
 local gh = require("diff_review.integrations.gh")
@@ -520,7 +521,7 @@ local function run()
     buffer_contains(status_buf, "Push:   def5678 origin/feature/pr-view feat: push subject"),
     "Push row did not keep push subject alignment"
   )
-  assert_true(diff_review._status.pr.pr.repo == "org/repo", "current PR repo was not normalized from its URL")
+  assert_true(session.status.pr.pr.repo == "org/repo", "current PR repo was not normalized from its URL")
   wait_for(function() return buffer_contains(status_buf, "feat: add diff review ai summary") end, "About row did not show generated commit subject")
   assert_true(
     line_has_conventional_type_highlight(status_buf, find_row(status_buf, "Head:"), "feat"),
@@ -788,7 +789,7 @@ local function run()
   if vim.api.nvim_buf_is_valid(status_buf) then
     vim.api.nvim_buf_delete(status_buf, { force = true })
   end
-  diff_review._status = nil
+  session.status = nil
   diff_review.setup({
     pr_buffer_name = "DiffReviewPRTest",
     keymaps = {
@@ -823,7 +824,7 @@ local function run()
   ai_commit.reset_backend()
   ai_commit.set_backend(ai_backend)
   local count_before_default_about = generate_count
-  diff_review._status = nil
+  session.status = nil
   diff_review.setup({ pr_buffer_name = "DiffReviewPRTest" })
   diff_review.open()
   local default_about_buf = vim.api.nvim_get_current_buf()
@@ -840,7 +841,7 @@ local function run()
   ai_commit.reset_backend()
   ai_commit.set_backend(ai_backend)
   local count_before_opt_out_about = generate_count
-  diff_review._status = nil
+  session.status = nil
   diff_review.setup({ pr_buffer_name = "DiffReviewPRTest", about_auto_generate = false })
   diff_review.open()
   local opt_out_about_buf = vim.api.nvim_get_current_buf()
@@ -858,7 +859,7 @@ local function run()
 
   has_changes = false
   local count_before_no_changes = generate_count
-  diff_review._status = nil
+  session.status = nil
   diff_review.setup({ pr_buffer_name = "DiffReviewPRTest" })
   diff_review.open()
   local no_changes_buf = vim.api.nvim_get_current_buf()

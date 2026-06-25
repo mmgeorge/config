@@ -2,8 +2,9 @@
 --- unified diff, plus the gutter visual-line yank overlay and the cursor normalization that keeps
 --- the caret off the inline gutter virtual text in both diff and status buffers.
 ---
---- Reads and writes the diff-buffer state (registries, per-buffer hunks, saved cursor) through the
---- init module via dr(), so the orchestrator still owns lifecycle while this module owns behavior.
+--- Owns the per-buffer diff caches (the diff:// registry, per-buffer hunks, and saved cursors) as
+--- module-locals and reads the shared per-session caches from session.lua, so this module keeps its
+--- own view state while reaching render/parse seams and orchestrator functions through dr().
 
 local diff_render = require("diff_review.render.diff_render")
 local git_backend = require("diff_review.git.git_backend")
@@ -13,8 +14,30 @@ local git_backend = require("diff_review.git.git_backend")
 local function dr()
   return require("diff_review")
 end
+local session = require("diff_review.session")
+
+-- Per-diff-buffer view caches, owned here and keyed by buffer handle (diff_bufs by
+-- "diff:"..filename). Cleared together by cleanup_diff_buffers on session teardown.
+local diff_bufs = {}
+local buf_hunks = {}
+local buf_filename = {}
+local buf_saved_cursor = {}
 
 local M = {}
+
+--- Delete every open diff:// buffer and clear the per-buffer caches, called by the
+--- status state teardown when a review session ends.
+function M.cleanup_diff_buffers()
+  for _, buf in pairs(diff_bufs) do
+    if vim.api.nvim_buf_is_valid(buf) then
+      vim.api.nvim_buf_delete(buf, { force = true })
+    end
+  end
+  diff_bufs = {}
+  buf_hunks = {}
+  buf_filename = {}
+  buf_saved_cursor = {}
+end
 
 function M._diff_visual_fill_width(buf)
   local width = vim.o.columns
@@ -60,7 +83,7 @@ end
 function M._diff_gutter_cursor_bounds(buf, row, namespace)
   local line = vim.api.nvim_buf_get_lines(buf, row - 1, row, false)[1]
   if line == nil then return nil end
-  local content_lengths = dr()._diff_line_content_lengths and dr()._diff_line_content_lengths[buf] or nil
+  local content_lengths = session.diff_line_content_lengths and session.diff_line_content_lengths[buf] or nil
   local content_length = content_lengths and content_lengths[row] or #line
   local marks = vim.api.nvim_buf_get_extmarks(buf, namespace, { row - 1, 0 }, { row - 1, -1 }, { details = true })
   for _, mark in ipairs(marks) do
@@ -153,7 +176,7 @@ end
 ---@param buf integer
 ---@return integer
 function M._diff_gutter_namespace(buf)
-  local status = dr()._status_states and dr()._status_states[buf] or nil
+  local status = session.states and session.states[buf] or nil
   return status and dr()._status_ns or dr()._ns
 end
 
@@ -281,7 +304,7 @@ end
 ---@param buf integer
 ---@return boolean handled
 function M._align_diff_cursor(buf)
-  local status = dr()._status_states and dr()._status_states[buf] or nil
+  local status = session.states and session.states[buf] or nil
   if status then
     return dr()._normalize_diff_gutter_cursor(buf, dr()._status_ns)
   end
@@ -295,7 +318,7 @@ function M._clamp_buffer_text_cursor(buf)
   local row = vim.api.nvim_win_get_cursor(0)[1]
   local line = vim.api.nvim_buf_get_lines(buf, row - 1, row, false)[1]
   if line == nil then return row end
-  local content_lengths = dr()._diff_line_content_lengths and dr()._diff_line_content_lengths[buf] or nil
+  local content_lengths = session.diff_line_content_lengths and session.diff_line_content_lengths[buf] or nil
   local line_length = content_lengths and content_lengths[row] or #line
   local pos = vim.fn.getcurpos()
   local current_col = math.max((pos[3] or 1) - 1, 0)
@@ -335,7 +358,7 @@ end
 ---@return string? diff_patch
 ---@return number? hunk_start_line
 local function get_hunk_at_cursor(buf)
-  local hunks = dr()._buf_hunks[buf]
+  local hunks = buf_hunks[buf]
   if not hunks then return end
   local cursor = vim.api.nvim_win_get_cursor(0)[1]
   for _, h in ipairs(hunks) do
@@ -351,8 +374,8 @@ end
 ---@return number buf
 function M.open_diff_buffer(filename)
   local key = "diff:" .. filename
-  dr()._diff_bufs = dr()._diff_bufs or {}
-  local buf = dr()._diff_bufs[key]
+  diff_bufs = diff_bufs or {}
+  local buf = diff_bufs[key]
 
   if not buf or not vim.api.nvim_buf_is_valid(buf) then
     buf = vim.api.nvim_create_buf(true, false)
@@ -365,8 +388,8 @@ function M.open_diff_buffer(filename)
     if not pcall(vim.api.nvim_buf_set_name, buf, name) then
       pcall(vim.api.nvim_buf_set_name, buf, name .. "#" .. buf)
     end
-    dr()._diff_bufs[key] = buf
-    dr()._buf_filename[buf] = filename
+    diff_bufs[key] = buf
+    buf_filename[buf] = filename
 
     -- Save cursor + invalidate caches on leaving the diff buffer
     vim.api.nvim_create_autocmd("BufLeave", {
@@ -382,17 +405,17 @@ function M.open_diff_buffer(filename)
           local ft = vim.bo[cur_win_buf].filetype
           local bt = vim.bo[cur_win_buf].buftype
           if ft ~= "trouble" and bt ~= "nofile" then
-            dr()._buf_last_rendered[buf] = nil
-            if dr()._file_diffs then dr()._file_diffs[filename] = nil end
+            session.buf_last_rendered[buf] = nil
+            if session.file_diffs then session.file_diffs[filename] = nil end
           end
         end)
         local cur = vim.api.nvim_win_get_cursor(0)
-        local hunks = dr()._buf_hunks[buf]
+        local hunks = buf_hunks[buf]
         if hunks then
           for si, sh in ipairs(hunks) do
             if cur[1] >= sh.start_line and cur[1] <= sh.end_line then
               local header = sh.diff and sh.diff:match("(@@[^@]+@@)") or ""
-              dr()._buf_saved_cursor[buf] = {
+              buf_saved_cursor[buf] = {
                 hunk_index = si,
                 offset = cur[1] - sh.start_line,
                 col = cur[2],
@@ -403,7 +426,7 @@ function M.open_diff_buffer(filename)
           end
         end
         -- Not in any hunk, save raw position as fallback
-        dr()._buf_saved_cursor[buf] = {
+        buf_saved_cursor[buf] = {
           hunk_index = 1,
           offset = 0,
           col = cur[2],
@@ -420,7 +443,7 @@ function M.open_diff_buffer(filename)
     vim.api.nvim_create_autocmd("BufEnter", {
       buffer = buf,
       callback = function()
-        if not vim.api.nvim_buf_is_valid(buf) or not dr()._buf_filename[buf] then return end
+        if not vim.api.nvim_buf_is_valid(buf) or not buf_filename[buf] then return end
         -- Re-hide the number column: re-entering the diff buffer (e.g. a
         -- window switch back from the real file) restores it otherwise.
         dr()._hide_line_numbers(vim.api.nvim_get_current_win())
@@ -431,8 +454,8 @@ function M.open_diff_buffer(filename)
             if not vim.api.nvim_buf_is_valid(buf) then return end
             dr()._refresh_diff_buffer(buf, filename)
             -- Restore saved cursor
-            local saved = dr()._buf_saved_cursor[buf]
-            local new_hunks = dr()._buf_hunks[buf]
+            local saved = buf_saved_cursor[buf]
+            local new_hunks = buf_hunks[buf]
             if not (saved and new_hunks) then return end
             local target_hunk = nil
             if saved.header and saved.header ~= "" then
@@ -457,9 +480,9 @@ function M.open_diff_buffer(filename)
               local max = vim.api.nvim_buf_line_count(buf)
               pcall(vim.api.nvim_win_set_cursor, 0, { math.min(saved.raw_line, max), saved.col or 0 })
             end
-            dr()._buf_saved_cursor[buf] = nil
+            buf_saved_cursor[buf] = nil
           end
-          if not dr()._file_diffs or dr()._file_diffs[filename] == nil then
+          if not session.file_diffs or session.file_diffs[filename] == nil then
             dr()._update_file_diff_cache_async(filename, render_and_restore)
           else
             render_and_restore()
@@ -512,7 +535,7 @@ function M.open_diff_buffer(filename)
 
     -- Jump to the corresponding line in the actual file
     vim.keymap.set("n", "<CR>", function()
-      local target_file = dr()._buf_filename[buf]
+      local target_file = buf_filename[buf]
       if not target_file then return end
 
       -- Leaving the diff preview for the real file: restore its number column.
@@ -521,12 +544,12 @@ function M.open_diff_buffer(filename)
       -- Save cursor as hunk-relative position so we can restore after re-render.
       -- Store: { hunk_index, offset_within_hunk, col, hunk_header }
       local save_cursor = vim.api.nvim_win_get_cursor(0)
-      local save_hunks = dr()._buf_hunks[buf]
+      local save_hunks = buf_hunks[buf]
       if save_hunks then
         for si, sh in ipairs(save_hunks) do
           if save_cursor[1] >= sh.start_line and save_cursor[1] <= sh.end_line then
             local header = sh.diff and sh.diff:match("(@@[^@]+@@)") or ""
-            dr()._buf_saved_cursor[buf] = {
+            buf_saved_cursor[buf] = {
               hunk_index = si,
               offset = save_cursor[1] - sh.start_line,
               col = save_cursor[2],
@@ -536,11 +559,11 @@ function M.open_diff_buffer(filename)
           end
         end
       end
-      if not dr()._buf_saved_cursor[buf] or type(dr()._buf_saved_cursor[buf]) ~= "table" or not dr()._buf_saved_cursor[buf].hunk_index then
-        dr()._buf_saved_cursor[buf] = { hunk_index = 1, offset = 0, col = 0, header = "" }
+      if not buf_saved_cursor[buf] or type(buf_saved_cursor[buf]) ~= "table" or not buf_saved_cursor[buf].hunk_index then
+        buf_saved_cursor[buf] = { hunk_index = 1, offset = 0, col = 0, header = "" }
       end
 
-      local hunks = dr()._buf_hunks[buf]
+      local hunks = buf_hunks[buf]
       local cursor = save_cursor[1]
       local raw_col = save_cursor[2] or 0
       -- Adjust column for the rendered diff gutter.
@@ -665,7 +688,7 @@ function M.open_diff_buffer(filename)
       end
       -- Find the index of the current hunk so we can jump to the next one
       local cur_hunk_idx = nil
-      local hunks = dr()._buf_hunks[buf]
+      local hunks = buf_hunks[buf]
       if hunks and hunk_start then
         for i, h in ipairs(hunks) do
           if h.start_line == hunk_start then
@@ -678,14 +701,14 @@ function M.open_diff_buffer(filename)
         if not ok then return end
         notify_debug("Hunk staged")
         local win = vim.api.nvim_get_current_win()
-        local filename = dr()._buf_filename[buf]
+        local filename = buf_filename[buf]
         -- Move to the next hunk. The staged hunk keeps its position (it only
         -- folds), so "next" is the following index in the rebuilt hunk map.
         local function goto_next()
           if not vim.api.nvim_win_is_valid(win) or vim.api.nvim_win_get_buf(win) ~= buf then
             return
           end
-          local new_hunks = dr()._buf_hunks[buf]
+          local new_hunks = buf_hunks[buf]
           if new_hunks and cur_hunk_idx then
             local target = new_hunks[cur_hunk_idx + 1] or new_hunks[cur_hunk_idx]
             if target then
@@ -716,12 +739,12 @@ function M.open_diff_buffer(filename)
         if not ok then return end
         notify_debug("Hunk unstaged")
         local win = vim.api.nvim_get_current_win()
-        local filename = dr()._buf_filename[buf]
+        local filename = buf_filename[buf]
         -- Find the current hunk so we can stay on it after the re-render
         -- (it expands in place; unstaging must not jump to the buffer top).
         local cur_idx, cur_offset = nil, 0
         local cursor_line = vim.api.nvim_win_get_cursor(0)[1]
-        local hunks = dr()._buf_hunks[buf]
+        local hunks = buf_hunks[buf]
         if hunks then
           for i, h in ipairs(hunks) do
             if cursor_line >= h.start_line and cursor_line <= h.end_line then
@@ -735,7 +758,7 @@ function M.open_diff_buffer(filename)
           if not vim.api.nvim_win_is_valid(win) or vim.api.nvim_win_get_buf(win) ~= buf then
             return
           end
-          local new_hunks = dr()._buf_hunks[buf]
+          local new_hunks = buf_hunks[buf]
           if new_hunks and cur_idx and new_hunks[cur_idx] then
             local max = vim.api.nvim_buf_line_count(buf)
             local line = math.min(new_hunks[cur_idx].start_line + cur_offset, max)
@@ -755,7 +778,7 @@ function M.open_diff_buffer(filename)
 
     -- Toggle fold (collapse/expand) the hunk under cursor
     vim.keymap.set("n", "<Tab>", function()
-      local hunks = dr()._buf_hunks[buf]
+      local hunks = buf_hunks[buf]
       if not hunks then
         vim.notify("No hunk map for buffer", vim.log.levels.WARN)
         return
@@ -830,7 +853,7 @@ end
 --- Re-render buffer respecting fold state (placeholder — full fold
 --- support would need tracking which hunks to hide/show)
 function M._render_with_folds(buf)
-  local hunks = dr()._buf_hunks[buf]
+  local hunks = buf_hunks[buf]
   if not hunks then return end
 
   -- Find the window showing this buffer
@@ -870,19 +893,19 @@ end
 ---@param filename string
 function M._refresh_diff_buffer(buf, filename)
   -- Use cached diff data from M.get() instead of re-running git
-  local diff_text = dr()._file_diffs and dr()._file_diffs[filename]
-  local staged_flags = dr()._file_hunk_staged and dr()._file_hunk_staged[filename]
+  local diff_text = session.file_diffs and session.file_diffs[filename]
+  local staged_flags = session.file_hunk_staged and session.file_hunk_staged[filename]
 
   if diff_text and diff_text ~= "" then
     -- Skip re-render if already rendered with the same data, but still
     -- (re)apply folds: the initial pre-render happens off-screen, where
     -- _render_with_folds is a no-op (no window shows the buffer yet), so the
     -- staged-hunk folds must be applied once the buffer becomes visible.
-    if dr()._buf_last_rendered[buf] == diff_text and dr()._buf_hunks[buf] then
+    if session.buf_last_rendered[buf] == diff_text and buf_hunks[buf] then
       dr()._render_with_folds(buf)
       return
     end
-    dr()._buf_last_rendered[buf] = diff_text
+    session.buf_last_rendered[buf] = diff_text
 
     diff_render.render_fancy_diff(buf, diff_text, staged_flags, filename)
     local hunk_map = dr()._compute_hunk_map(diff_text)
@@ -894,7 +917,7 @@ function M._refresh_diff_buffer(buf, filename)
         end
       end
     end
-    dr()._buf_hunks[buf] = hunk_map
+    buf_hunks[buf] = hunk_map
     -- Highlight @@ header lines with subtle gray background
     vim.api.nvim_buf_clear_namespace(buf, dr()._hunk_header_ns, 0, -1)
     for _, h in ipairs(hunk_map) do
@@ -909,9 +932,9 @@ function M._refresh_diff_buffer(buf, filename)
     local message = diff_text == false and "No textual diff" or "No changes"
     vim.api.nvim_buf_set_lines(buf, 0, -1, false, { message })
     vim.bo[buf].modifiable = false
-    dr()._buf_hunks[buf] = {}
-    if dr()._empty_diff_rows then dr()._empty_diff_rows[buf] = nil end
-    if dr()._diff_line_content_lengths then dr()._diff_line_content_lengths[buf] = nil end
+    buf_hunks[buf] = {}
+    if session.empty_diff_rows then session.empty_diff_rows[buf] = nil end
+    if session.diff_line_content_lengths then session.diff_line_content_lengths[buf] = nil end
     vim.api.nvim_buf_clear_namespace(buf, dr()._hunk_header_ns, 0, -1)
     vim.api.nvim_buf_clear_namespace(buf, dr()._active_hunk_header_ns, 0, -1)
   end
@@ -924,7 +947,7 @@ function M._highlight_active_hunk(buf, item_diff)
   vim.api.nvim_buf_clear_namespace(buf, dr()._active_hunk_header_ns, 0, -1)
   if not item_diff then return nil end
 
-  local hunks = dr()._buf_hunks[buf]
+  local hunks = buf_hunks[buf]
   if not hunks then return nil end
 
   for _, hunk in ipairs(hunks) do
@@ -943,18 +966,18 @@ end
 ---@param filename string
 ---@param cb? fun()
 function M._update_file_diff_cache_async(filename, cb)
-  dr()._file_diffs = dr()._file_diffs or {}
-  dr()._file_hunk_staged = dr()._file_hunk_staged or {}
+  session.file_diffs = session.file_diffs or {}
+  session.file_hunk_staged = session.file_hunk_staged or {}
   -- Untracked files: build the diff from disk, never from git. Cache `false`
   -- (not nil) for empty/binary so the preview guard treats it as "checked"
   -- and doesn't re-run this on every cursor move.
-  local relpath = dr()._untracked and dr()._untracked[filename]
+  local relpath = session.untracked and session.untracked[filename]
   if relpath then
     local diff_text = dr()._build_untracked_diff(filename, relpath)
     -- Cache `false` (not nil) as a "checked, no diff" sentinel; cast to satisfy the
     -- string-valued field type while preserving the boolean sentinel at runtime.
-    dr()._file_diffs[filename] = diff_text or false
-    dr()._file_hunk_staged[filename] = diff_text and { false } or nil
+    session.file_diffs[filename] = diff_text or false
+    session.file_hunk_staged[filename] = diff_text and { false } or nil
     if cb then cb() end
     return
   end
@@ -964,8 +987,8 @@ function M._update_file_diff_cache_async(filename, cb)
       return
     end
     dr()._file_diff_and_flags_async(cwd, filename, function(diff_text, flags)
-      dr()._file_diffs[filename] = diff_text or false
-      dr()._file_hunk_staged[filename] = flags
+      session.file_diffs[filename] = diff_text or false
+      session.file_hunk_staged[filename] = flags
       if cb then cb() end
     end)
   end)
@@ -976,14 +999,14 @@ end
 ---@param filename string
 function M.refresh_open_diff_buffer(filename)
   local key = "diff:" .. filename
-  dr()._diff_bufs = dr()._diff_bufs or {}
-  local buf = dr()._diff_bufs[key]
+  diff_bufs = diff_bufs or {}
+  local buf = diff_bufs[key]
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
 
   -- Re-fetch diff data for this file only (cache is stale after staging)
   dr()._update_file_diff_cache_async(filename, function()
     if not vim.api.nvim_buf_is_valid(buf) then return end
-    dr()._buf_last_rendered[buf] = nil  -- force re-render
+    session.buf_last_rendered[buf] = nil  -- force re-render
     dr()._refresh_diff_buffer(buf, filename)
   end)
 end

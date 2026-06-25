@@ -1,6 +1,7 @@
 vim.loader.enable(false)
 
 local diff_review = require("diff_review")
+local session = require("diff_review.session")
 local gh = require("diff_review.integrations.gh")
 
 -- Diff-body syntax/background/intraline live in the decoration span store and are
@@ -337,7 +338,7 @@ local function run()
   )
   assert_true(line_has_gutter_chunk(buf, color_row, "~", "DiffReviewModifyLineNr"), "compact insertion row should show a modify sign in the gutter")
   assert_true(line_has_padded_gutter_chunk(buf, color_row, "3", "DiffReviewModifyLineNr"), "compact insertion row should color the new line number as modified")
-  local color_entry = diff_review._status.entries[color_row]
+  local color_entry = session.status.entries[color_row]
   assert_true(color_entry and color_entry.diff_line and color_entry.diff_line.prefix == "+", "compact insertion row should keep new primary diff line")
   assert_true(type(color_entry.diff_lines) == "table" and #color_entry.diff_lines == 2, "compact insertion row should keep both backing lines")
   assert_true(type(color_entry.inline_jump_spans) == "table" and #color_entry.inline_jump_spans == 1, "compact insertion row should expose one inline jump span")
@@ -352,7 +353,7 @@ local function run()
   assert_true(line_has_highlight(buf, normal_row, "DiffReviewInlineDeleteBg"), "deleted .clone() span was not highlighted")
   assert_true(line_has_gutter_chunk(buf, normal_row, "~", "DiffReviewModifyLineNr"), "compact deletion row should show a modify sign in the gutter")
   assert_true(line_has_padded_gutter_chunk(buf, normal_row, "5", "DiffReviewModifyLineNr"), "compact deletion row should color the old line number as modified")
-  local normal_entry = diff_review._status.entries[normal_row]
+  local normal_entry = session.status.entries[normal_row]
   assert_true(normal_entry and normal_entry.diff_line and normal_entry.diff_line.prefix == "-", "compact deletion row should keep old primary diff line")
   assert_true(type(normal_entry.diff_lines) == "table" and #normal_entry.diff_lines == 2, "compact deletion row should keep both backing lines")
   assert_true(type(normal_entry.inline_jump_spans) == "table" and #normal_entry.inline_jump_spans == 1, "compact deletion row should expose one inline jump span")
@@ -406,7 +407,7 @@ local function run()
     line_has_gutter_chunk(buf, roughness_row, "~", "DiffReviewModifyLineNr"),
     "neighboring clone-only pair should show a modify sign in the gutter"
   )
-  local roughness_entry = diff_review._status.entries[roughness_row]
+  local roughness_entry = session.status.entries[roughness_row]
   assert_true(
     roughness_entry and roughness_entry.diff_line and roughness_entry.diff_line.prefix == "+",
     "neighboring compact row should keep new primary diff line"

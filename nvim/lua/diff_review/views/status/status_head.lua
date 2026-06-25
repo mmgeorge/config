@@ -15,6 +15,7 @@ local git_backend = require("diff_review.git.git_backend")
 local function dr()
   return require("diff_review")
 end
+local session = require("diff_review.session")
 
 local M = {}
 
@@ -138,7 +139,7 @@ end
 ---@param buf integer
 ---@return boolean
 function M._status_patch_about_line(buf)
-  local status = dr()._status_states and dr()._status_states[buf] or dr()._status
+  local status = session.states and session.states[buf] or session.status
   if not status then return false end
   return dr()._status_patch_head_line(buf, "about", status_about_head_line(status.about))
 end
@@ -149,7 +150,7 @@ end
 ---@param issues_state table?
 ---@return DiffReviewStatusHeadLine[]
 local function status_build_head_lines(values, pr_state, about_state, issues_state)
-  local remote_action = dr()._status and dr()._status.remote_action
+  local remote_action = session.status and session.status.remote_action
   local ref_width = vim.fn.strdisplaywidth(values.branch or "(detached)")
   if values.upstream then ref_width = math.max(ref_width, vim.fn.strdisplaywidth(values.upstream)) end
   if values.push_ref then ref_width = math.max(ref_width, vim.fn.strdisplaywidth(values.push_ref)) end
@@ -395,7 +396,7 @@ end
 function M._status_enable_repo_completion(cwd, repo)
   if not (cwd and repo and repo ~= "") then return end
   local cache = require("github.repo_cache")
-  for buf, state in pairs(dr()._status_states or {}) do
+  for buf, state in pairs(session.states or {}) do
     if state and state.cwd == cwd and vim.api.nvim_buf_is_valid(buf) then
       cache.enable_user_completion(buf, repo)
     end
@@ -440,7 +441,7 @@ local function status_head_lines_async(cwd, cb)
     pending = pending - 1
     if pending > 0 then return end
 
-    local status = dr()._status
+    local status = session.status
     local pr_state = status and status.pr
     local about_state = status and status.about
     local issues_state = dr()._status_issues.ensure_state(status, cwd)

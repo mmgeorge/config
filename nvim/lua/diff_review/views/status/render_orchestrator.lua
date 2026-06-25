@@ -14,6 +14,7 @@ local status_render = require("diff_review.views.status.status_render")
 local function dr()
   return require("diff_review")
 end
+local session = require("diff_review.session")
 
 local M = {}
 
@@ -28,7 +29,7 @@ local function cursor_target(buf)
   if not ok_cursor then return nil, nil end
 
   local line = cursor[1]
-  local status = dr()._status
+  local status = session.status
   local entry = status and status.entries and status.entries[line] or nil
   return entry and entry.id or nil, line
 end
@@ -36,7 +37,7 @@ end
 ---@param file DiffReviewStatusFile
 ---@return DiffReviewHunk[]
 local function diff_hunks_for_file(file)
-  return dr()._status_perf_span("status.diff_hunks_for_file", dr()._status and dr()._status.buf or nil, {
+  return dr()._status_perf_span("status.diff_hunks_for_file", session.status and session.status.buf or nil, {
     file = file and file.filename or nil,
     relpath = file and file.relpath or nil,
     existing_hunk_count = file and file.hunks and #file.hunks or nil,
@@ -45,7 +46,7 @@ local function diff_hunks_for_file(file)
     if #file.hunks > 0 then return file.hunks end
     if not file.untracked then return {} end
 
-    local relpath = dr()._untracked and dr()._untracked[file.filename]
+    local relpath = session.untracked and session.untracked[file.filename]
     local diff_text = relpath and dr()._build_untracked_diff(file.filename, relpath) or nil
     if not diff_text then return {} end
 
@@ -113,34 +114,34 @@ end
 function M.render_status(buf, target_id, fallback_line, opts)
   opts = opts or {}
   dr()._setup_bg_highlights()
-  if dr()._status_states and dr()._status_states[buf] then
-    dr()._status = dr()._status_states[buf]
+  if session.states and session.states[buf] then
+    session.status = session.states[buf]
   end
-  dr()._status = dr()._status or {}
-  dr()._status.buf = buf
-  dr()._status.reconcile_generation = (dr()._status.reconcile_generation or 0) + 1
-  local render_state = dr()._status
+  session.status = session.status or {}
+  session.status.buf = buf
+  session.status.reconcile_generation = (session.status.reconcile_generation or 0) + 1
+  local render_state = session.status
   local preserve_current_cursor = target_id == nil and fallback_line == nil
 
-  if opts.reuse_sections and dr()._status.head_lines and dr()._status.sections then
+  if opts.reuse_sections and session.status.head_lines and session.status.sections then
     if preserve_current_cursor then
       target_id, fallback_line = cursor_target(buf)
     end
-    status_render.status_render_loaded(buf, target_id, fallback_line, opts, dr()._status.head_lines, dr()._status.sections)
+    status_render.status_render_loaded(buf, target_id, fallback_line, opts, session.status.head_lines, session.status.sections)
     return
   end
 
-  dr()._status.request_id = (dr()._status.request_id or 0) + 1
-  local request_id = dr()._status.request_id
-  local has_existing_view = dr()._status.head_lines ~= nil or dr()._status.sections ~= nil
+  session.status.request_id = (session.status.request_id or 0) + 1
+  local request_id = session.status.request_id
+  local has_existing_view = session.status.head_lines ~= nil or session.status.sections ~= nil
   if not has_existing_view then
     dr()._status_set_plain_lines(buf, { "Loading DiffReview..." })
   end
 
   git_backend.git_root_async(function(cwd, root_err)
-    local latest_status = dr()._status_states and dr()._status_states[buf] or render_state
+    local latest_status = session.states and session.states[buf] or render_state
     if not (latest_status and latest_status.request_id == request_id) then return end
-    dr()._status = latest_status
+    session.status = latest_status
     if not cwd then
       dr()._notify_error(root_err or "Unable to find git root")
       if not has_existing_view then
@@ -154,9 +155,9 @@ function M.render_status(buf, target_id, fallback_line, opts)
     local pr_request_id = dr()._status_ensure_pr_state(cwd, buf, opts.refresh_pr)
 
     dr()._status_load_async(cwd, function(result)
-      local current_status = dr()._status_states and dr()._status_states[buf] or render_state
+      local current_status = session.states and session.states[buf] or render_state
       if not (current_status and current_status.request_id == request_id) then return end
-      dr()._status = current_status
+      session.status = current_status
       if not vim.api.nvim_buf_is_valid(buf) then return end
       if dr()._status_operations_pending() then
         dr()._status_request_reconcile(buf, target_id)
@@ -184,7 +185,7 @@ function M.render_status(buf, target_id, fallback_line, opts)
       end
       status_render.status_render_loaded(buf, target_id, fallback_line, opts, result.head_lines, result.sections)
       vim.schedule(function()
-        local metadata_status = dr()._status_states and dr()._status_states[buf] or render_state
+        local metadata_status = session.states and session.states[buf] or render_state
         if not (
           metadata_status
           and metadata_status.request_id == request_id
@@ -220,7 +221,7 @@ end
 ---@param buf integer
 ---@param diff_text? string
 local function render_pr_status(pr, cwd, buf, diff_text)
-  local status = dr()._status
+  local status = session.status
   if not (status and status.buf == buf) then return end
   if dr()._pr_edit.blocks_render(buf) then return end
   diff_text = diff_text or status.pr_diff_text
@@ -261,7 +262,7 @@ end
 ---@param cwd string
 ---@param buf integer
 local function load_pr_diff(pr, cwd, buf)
-  local status = dr()._status
+  local status = session.status
   if not (status and status.buf == buf) then return end
   status.pr_diff_request_id = (status.pr_diff_request_id or 0) + 1
   local request_id = status.pr_diff_request_id
@@ -273,14 +274,14 @@ local function load_pr_diff(pr, cwd, buf)
     repo = pr and pr.repo or nil,
   })
   gh.pr_diff_async(cwd, pr.number, pr.repo, function(result)
-    local latest_status = dr()._status_states and dr()._status_states[buf] or nil
+    local latest_status = session.states and session.states[buf] or nil
     if not (
       latest_status
       and latest_status.pr_diff_request_id == request_id
       and latest_status.buf == buf
       and vim.api.nvim_buf_is_valid(buf)
     ) then return end
-    dr()._status = latest_status
+    session.status = latest_status
     dr()._gitstatus_debug.event("load_pr_diff.done", {
       buf = buf,
       cwd = cwd,

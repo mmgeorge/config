@@ -12,6 +12,7 @@ local config = require("diff_review.infra.config")
 local function dr()
   return require("diff_review")
 end
+local session = require("diff_review.session")
 
 local diff_parse = require("diff_review.render.diff_parse")
 
@@ -114,7 +115,7 @@ end
 ---@param hunks DiffReviewHunk[]
 ---@return DiffReviewHunk[]
 function M._status_display_hunks(hunks)
-  return dr()._status_perf_span("status.display_hunks", dr()._status and dr()._status.buf or nil, {
+  return dr()._status_perf_span("status.display_hunks", session.status and session.status.buf or nil, {
     hunk_count = #(hunks or {}),
   }, function()
     local display_hunks = {}
@@ -191,7 +192,7 @@ function M._status_lazy_hunk_comment_estimate(file, hunk)
   local sources = {
     file and file.pr_comments or {},
     file and file.pr_review_comments or {},
-    dr()._status and dr()._status.review_comments or {},
+    session.status and session.status.review_comments or {},
   }
   for _, comments in ipairs(sources) do
     for _, comment in ipairs(type(comments) == "table" and comments or {}) do
@@ -243,7 +244,7 @@ end
 ---@param file_key string
 ---@return integer
 function M._status_file_forced_hunk_count(file_key)
-  return (dr()._status and dr()._status.file_render_limits and dr()._status.file_render_limits[file_key]) or 0
+  return (session.status and session.status.file_render_limits and session.status.file_render_limits[file_key]) or 0
 end
 
 --- Decide whether the size gate should defer the next hunk behind a load-more row.

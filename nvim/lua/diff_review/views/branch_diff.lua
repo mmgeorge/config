@@ -11,6 +11,7 @@ local notifications = require("diff_review.infra.notifications")
 local function dr()
   return require("diff_review")
 end
+local session = require("diff_review.session")
 
 
 ---@param branch string
@@ -62,7 +63,7 @@ end
 ---@param diff_text? string
 ---@param file? string
 function M.render(branch, cwd, buf, diff_text, file)
-  local status = dr()._status
+  local status = session.status
   if not (status and status.buf == buf) then return end
   status.head_lines = M.head_lines(branch, file)
   status.sections = M.sections(cwd, branch, diff_text, file)
@@ -75,7 +76,7 @@ end
 ---@param buf integer
 ---@param file? string
 function M.load(branch, cwd, buf, file)
-  local status = dr()._status
+  local status = session.status
   if not (status and status.buf == buf) then return end
   status.branch_diff_request_id = (status.branch_diff_request_id or 0) + 1
   local request_id = status.branch_diff_request_id
@@ -84,14 +85,14 @@ function M.load(branch, cwd, buf, file)
     vim.list_extend(command, { "--", file })
   end
   git_backend.systemlist_async(command, function(output, code, stderr)
-    local latest_status = dr()._status_states and dr()._status_states[buf] or nil
+    local latest_status = session.states and session.states[buf] or nil
     if not (
       latest_status
       and latest_status.branch_diff_request_id == request_id
       and latest_status.buf == buf
       and vim.api.nvim_buf_is_valid(buf)
     ) then return end
-    dr()._status = latest_status
+    session.status = latest_status
     if code ~= 0 then
       local message = vim.trim(stderr or "")
       notifications.error("Git diff failed: " .. (message ~= "" and message or ("git exited " .. code)), "GitBranchDiff")

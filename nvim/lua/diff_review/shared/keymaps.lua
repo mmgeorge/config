@@ -14,6 +14,7 @@ local status_command_specs_by_id = command_specs.by_id
 local function dr()
   return require("diff_review")
 end
+local session = require("diff_review.session")
 
 local function notify_error(message, title) return notifications.error(message, title) end
 local function status_entry_under_cursor(...) return dr()._status_entry_under_cursor(...) end
@@ -47,7 +48,7 @@ local function status_keymap_config()
 end
 
 local function status_command_visible(spec)
-  local view_kind = dr()._status and dr()._status.view_kind or "status"
+  local view_kind = session.status and session.status.view_kind or "status"
   return status_command_visible_for_view(spec, view_kind)
 end
 
@@ -65,7 +66,7 @@ local function status_keys_for(command_id)
 end
 
 local function status_hint_segments(state)
-  local view_kind = state and state.view_kind or (dr()._status and dr()._status.view_kind) or "status"
+  local view_kind = state and state.view_kind or (session.status and session.status.view_kind) or "status"
   local segments = {}
   local first = true
   local hint_command_ids = dr()._status_hint_command_ids_by_view[view_kind] or dr()._status_hint_command_ids_by_view.status
@@ -121,7 +122,7 @@ local function status_hint_winbar(segments, title)
 end
 
 local function status_apply_hint_bar(buf, win)
-  local state = dr()._status_states and dr()._status_states[buf] or (dr()._status and dr()._status.buf == buf and dr()._status) or nil
+  local state = session.states and session.states[buf] or (session.status and session.status.buf == buf and session.status) or nil
   if not state then return end
   local winbar = status_hint_winbar(status_hint_segments(state), status_hint_title(state))
   if win then
@@ -146,7 +147,7 @@ end
 local function setup_status_keymaps(buf)
   require("github.repo_cache").enable_user_completion(buf)
   local opts = { buffer = buf, silent = true, nowait = true }
-  local view_kind = dr()._status and dr()._status.view_kind or "status"
+  local view_kind = session.status and session.status.view_kind or "status"
   local is_pr_view = view_kind == "pr"
   local function map(command_id, mode, callback, desc)
     local spec = status_command_specs_by_id[command_id]
@@ -157,7 +158,7 @@ local function setup_status_keymaps(buf)
       })
       local mapped
       mapped = function(...)
-        if dr()._status_states and dr()._status_states[buf] then dr()._status = dr()._status_states[buf] end
+        if session.states and session.states[buf] then session.status = session.states[buf] end
         callback(...)
       end
       if view_kind == "review" then
@@ -170,28 +171,28 @@ local function setup_status_keymaps(buf)
 
 
   map("close", "n", function()
-    local state = dr()._status_states and dr()._status_states[buf] or dr()._status
+    local state = session.states and session.states[buf] or session.status
     if vim.api.nvim_buf_is_valid(buf) then
       pcall(vim.api.nvim_buf_delete, buf, { force = true })
     end
-    if dr()._status_states then dr()._status_states[buf] = nil end
-    if dr()._main_status == state then dr()._main_status = nil end
-    if dr()._status == state then dr()._status = dr()._main_status end
+    if session.states then session.states[buf] = nil end
+    if session.main_status == state then session.main_status = nil end
+    if session.status == state then session.status = session.main_status end
   end)
 
   map("refresh", "n", function()
     if view_kind == "diff" then
-      local status = dr()._status_states and dr()._status_states[buf] or dr()._status
+      local status = session.states and session.states[buf] or session.status
       if status and status.diff_branch and status.cwd then
-        dr()._status = status
+        session.status = status
         dr()._branch_diff.load(status.diff_branch, status.cwd, buf, status.diff_file)
       end
       return
     end
     if is_pr_view then
-      local status = dr()._status_states and dr()._status_states[buf] or dr()._status
+      local status = session.states and session.states[buf] or session.status
       if status and status.pr and status.cwd then
-        dr()._status = status
+        session.status = status
         render_pr_status(status.pr, status.cwd, buf)
         load_pr_diff(status.pr, status.cwd, buf)
         dr()._pr_overview.load_comments(status.pr, status.cwd, buf)
@@ -199,9 +200,9 @@ local function setup_status_keymaps(buf)
       end
       return
     end
-    if dr()._status then
-      dr()._status.pr = nil
-      dr()._status.about = nil
+    if session.status then
+      session.status.pr = nil
+      session.status.about = nil
     end
     render_status_or_notify(buf, nil, nil, {
       restore_initial_folds = true,
@@ -211,14 +212,14 @@ local function setup_status_keymaps(buf)
   end)
 
   map("toggle", "n", function()
-    local status = dr()._status_states and dr()._status_states[buf] or dr()._status
-    if status then dr()._status = status end
+    local status = session.states and session.states[buf] or session.status
+    if status then session.status = status end
     if dr()._review.toggle_comment_fold(buf) then return end
     status_toggle(status_entry_under_cursor(status), status)
   end)
 
   map("collapse_parent", "n", function()
-    if dr()._status_states and dr()._status_states[buf] then dr()._status = dr()._status_states[buf] end
+    if session.states and session.states[buf] then session.status = session.states[buf] end
     dr()._status_collapse_parent()
   end)
 
@@ -231,7 +232,7 @@ local function setup_status_keymaps(buf)
   if view_kind == "review" then
     dr()._review.setup_keymaps(buf)
     map("browse", { "n", "x" }, function()
-      local status = dr()._status_states and dr()._status_states[buf] or dr()._status
+      local status = session.states and session.states[buf] or session.status
       local fragment = dr()._review.browse_fragment_under_cursor(buf)
       dr()._review.leave_visual()
       if not gh.browse_pr_changes(status and status.pr, fragment) then
@@ -239,7 +240,7 @@ local function setup_status_keymaps(buf)
       end
     end)
     local function review_open_action()
-      if dr()._status_states and dr()._status_states[buf] then dr()._status = dr()._status_states[buf] end
+      if session.states and session.states[buf] then session.status = session.states[buf] end
       local entry = status_entry_under_cursor()
       if dr()._status_open_commit_message_under_cursor(entry) then return end
       status_jump(entry)
@@ -247,7 +248,7 @@ local function setup_status_keymaps(buf)
     map("open", "n", review_open_action, "Jump to file")
     vim.schedule(function()
       if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
-      if dr()._status_states and dr()._status_states[buf] then dr()._status = dr()._status_states[buf] end
+      if session.states and session.states[buf] then session.status = session.states[buf] end
       map("open", "n", review_open_action, "Jump to file")
     end)
     map("help", "n", status_show_help)
@@ -255,7 +256,7 @@ local function setup_status_keymaps(buf)
   end
   if view_kind ~= "status" then
     map("browse", "n", function()
-      local status = dr()._status_states and dr()._status_states[buf] or dr()._status
+      local status = session.states and session.states[buf] or session.status
       if status and status.view_kind == "pr" then
         local url = dr()._pr_overview.url_under_cursor(buf)
         if url and gh.browse_url(url) then return end
@@ -279,7 +280,7 @@ local function setup_status_keymaps(buf)
       dr()._review.start(buf)
     end)
     map("open", "n", function()
-      if dr()._status_states and dr()._status_states[buf] then dr()._status = dr()._status_states[buf] end
+      if session.states and session.states[buf] then session.status = session.states[buf] end
       if is_pr_view and dr()._pr_edit.toggle_draft_status_under_cursor(buf) then return end
       local entry = status_entry_under_cursor()
       if dr()._status_open_commit_message_under_cursor(entry) then return end
@@ -291,7 +292,7 @@ local function setup_status_keymaps(buf)
       callback = function()
         dr()._status_perf_span("status.autocmd_cursor_prewarm", buf, nil, function()
           if (M.config or config.options or config.defaults).status_cursor_prewarm == false then return end
-          if dr()._status_states and dr()._status_states[buf] then dr()._status = dr()._status_states[buf] end
+          if session.states and session.states[buf] then session.status = session.states[buf] end
           status_defer_prewarm_under_cursor(buf)
         end)
       end,
@@ -337,7 +338,7 @@ local function setup_status_keymaps(buf)
     elseif entry and entry.kind == "about" then
       status_open_about(entry)
     elseif entry and entry.kind == "load_more" then
-      local status = dr()._status_states and dr()._status_states[buf] or dr()._status
+      local status = session.states and session.states[buf] or session.status
       if status then
         -- Force-render the next chunk of deferred hunks from where the gate stopped, so
         -- each activation always reveals more even when a single hunk exceeds the budget.
@@ -345,7 +346,7 @@ local function setup_status_keymaps(buf)
         local target = (tonumber(entry.load_more_from) or 1) + chunk - 1
         status.file_render_limits = status.file_render_limits or {}
         status.file_render_limits[entry.file_key] = math.max(status.file_render_limits[entry.file_key] or 0, target)
-        dr()._status = status
+        session.status = status
         render_status_or_notify(buf, nil, vim.api.nvim_win_get_cursor(0)[1], { reuse_sections = true })
       end
     else
@@ -427,7 +428,7 @@ local function setup_status_keymaps(buf)
     callback = function()
       dr()._status_perf_span("status.autocmd_cursor_prewarm", buf, nil, function()
         if (M.config or config.options or config.defaults).status_cursor_prewarm == false then return end
-        if dr()._status_states and dr()._status_states[buf] then dr()._status = dr()._status_states[buf] end
+        if session.states and session.states[buf] then session.status = session.states[buf] end
         status_defer_prewarm_under_cursor(buf)
       end)
     end,

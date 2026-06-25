@@ -12,11 +12,12 @@ local syntax_engine = require("diff_review.render.syntax_engine")
 local function dr()
   return require("diff_review")
 end
+local session = require("diff_review.session")
 
 local M = {}
 
 local function status_entry_under_cursor(state)
-  local status = state or dr()._status
+  local status = state or session.status
   if not status then return nil end
   local line = vim.api.nvim_win_get_cursor(0)[1]
   return status.entries[line]
@@ -26,7 +27,7 @@ end
 ---@return integer? line
 ---@return DiffReviewStatusEntry? entry
 function M._status_entry_line_under_cursor()
-  local status = dr()._status
+  local status = session.status
   if not (status and status.entries and status.buf and vim.api.nvim_buf_is_valid(status.buf)) then return nil, nil end
   local cursor_line = vim.api.nvim_win_get_cursor(0)[1]
   local entries = status.entries
@@ -81,7 +82,7 @@ end
 ---@param entry DiffReviewStatusEntry
 ---@return DiffReviewStatusEntry?
 function M._status_parent_entry(current_line, entry)
-  local status = dr()._status
+  local status = session.status
   if not (status and status.entries) then return nil end
   local viewport = status.diff_viewport
   local entries = viewport and viewport.enabled and viewport.logical_entries or status.entries
@@ -101,7 +102,7 @@ end
 
 ---@param entry DiffReviewStatusEntry?
 local function status_prewarm_entry_syntax(entry)
-  return dr()._status_perf_span("status.prewarm_entry_syntax", dr()._status and dr()._status.buf or nil, {
+  return dr()._status_perf_span("status.prewarm_entry_syntax", session.status and session.status.buf or nil, {
     entry_id = entry and entry.id or nil,
     entry_kind = entry and entry.kind or nil,
     file = entry and entry.file and entry.file.filename or nil,
@@ -115,7 +116,7 @@ local function status_prewarm_entry_syntax(entry)
       local syntax_source = dr()._status_syntax_source_for_entry_kind(entry.kind)
       local syntax_diff_text = nil
       if syntax_source == "file" then
-        syntax_diff_text = dr()._status_perf_span("status.prewarm_entry_syntax.hunk_combined_diff", dr()._status and dr()._status.buf or nil, {
+        syntax_diff_text = dr()._status_perf_span("status.prewarm_entry_syntax.hunk_combined_diff", session.status and session.status.buf or nil, {
           entry_id = entry.id,
           entry_kind = entry.kind,
           file = entry.file.filename,
@@ -136,7 +137,7 @@ end
 ---@param row integer 1-based buffer line
 ---@return DiffReviewRowDecorationRequest?
 function M._status_resolve_decoration_row(buf, row)
-  local status = dr()._status_states and dr()._status_states[buf] or nil
+  local status = session.states and session.states[buf] or nil
   if not (status and status.entries) then return nil end
   local entry = status.entries[row]
   if not entry then return nil end
@@ -161,7 +162,7 @@ end
 ---@param first_row integer 1-based
 ---@param last_row integer 1-based
 function M._status_schedule_decorate_visible(buf, first_row, last_row)
-  local status = dr()._status_states and dr()._status_states[buf] or nil
+  local status = session.states and session.states[buf] or nil
   if not status then return end
   if status.decorate_first == first_row and status.decorate_last == last_row then return end
   status.decorate_first = first_row
@@ -169,7 +170,7 @@ function M._status_schedule_decorate_visible(buf, first_row, last_row)
   status.decorate_request_id = (status.decorate_request_id or 0) + 1
   local request_id = status.decorate_request_id
   vim.defer_fn(function()
-    local current = dr()._status_states and dr()._status_states[buf] or nil
+    local current = session.states and session.states[buf] or nil
     if not (current and current.decorate_request_id == request_id) then return end
     if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
     dr()._status_decorate_visible(buf, first_row, last_row)
@@ -190,7 +191,7 @@ end
 
 ---@param buf integer
 local function status_defer_prewarm_under_cursor(buf)
-  local status = dr()._status_states and dr()._status_states[buf] or dr()._status
+  local status = session.states and session.states[buf] or session.status
   if not status then return end
   status.cursor_prewarm_request_id = (status.cursor_prewarm_request_id or 0) + 1
   local request_id = status.cursor_prewarm_request_id
@@ -203,14 +204,14 @@ local function status_defer_prewarm_under_cursor(buf)
   })
 
   vim.defer_fn(function()
-    local latest_status = dr()._status_states and dr()._status_states[buf] or dr()._status
+    local latest_status = session.states and session.states[buf] or session.status
     if not (latest_status and latest_status.cursor_prewarm_request_id == request_id) then return end
     if not (buf and vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_get_current_buf() == buf) then return end
     dr()._status_perf_span("status.cursor_prewarm_run", buf, {
       request_id = request_id,
       scheduled_entry_id = entry_id,
     }, function()
-      dr()._status = latest_status
+      session.status = latest_status
       local current_entry = status_entry_under_cursor()
       if entry_id and current_entry and current_entry.id == entry_id then
         status_prewarm_entry_syntax(current_entry)
@@ -226,7 +227,7 @@ local status_files_from_set
 ---@param end_line integer
 ---@return DiffReviewStatusEntry[]
 local function status_entries_for_lines(start_line, end_line)
-  local status = dr()._status
+  local status = session.status
   if not status then return {} end
   if start_line > end_line then
     start_line, end_line = end_line, start_line
@@ -337,7 +338,7 @@ end
 ---@param entries DiffReviewStatusEntry[]
 ---@return string?
 local function status_hunk_action_target_id(entries)
-  local status = dr()._status
+  local status = session.status
   if not (status and status.entries) then return nil end
 
   local action_ids = {}
@@ -417,7 +418,7 @@ end
 ---@param fallback_line integer
 ---@return integer?
 local function status_nearest_header_line(fallback_line)
-  local status = dr()._status
+  local status = session.status
   local viewport = status and status.diff_viewport or nil
   local entries = viewport and viewport.enabled and viewport.logical_entries or (status and status.entries)
   if not (status and entries and status.buf and vim.api.nvim_buf_is_valid(status.buf)) then return nil end
@@ -492,7 +493,7 @@ end
 
 local function status_restore_cursor(buf, target_id, fallback_line)
   local target_line = nil
-  local entries = dr()._status and dr()._status.entries
+  local entries = session.status and session.status.entries
   if target_id then
     target_line = dr()._status_find_entry_line(entries, target_id, fallback_line)
   end
@@ -509,8 +510,8 @@ end
 ---@param lines string[]
 local function status_set_plain_lines(buf, lines)
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
-  if dr()._diff_line_content_lengths then dr()._diff_line_content_lengths[buf] = nil end
-  local state = dr()._status_states and dr()._status_states[buf] or (dr()._status and dr()._status.buf == buf and dr()._status) or nil
+  if session.diff_line_content_lengths then session.diff_line_content_lengths[buf] = nil end
+  local state = session.states and session.states[buf] or (session.status and session.status.buf == buf and session.status) or nil
   if state then state.diff_viewport = nil end
   dr()._clear_diff_gutter_visual_line(buf)
   local was_rendering = vim.b[buf].diff_review_status_rendering

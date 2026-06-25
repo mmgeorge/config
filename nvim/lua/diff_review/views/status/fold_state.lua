@@ -12,17 +12,18 @@ local status_buffer = require("diff_review.views.status.status_buffer")
 local function dr()
   return require("diff_review")
 end
+local session = require("diff_review.session")
 
 local M = {}
 
 local function status_folded(key, default, state)
-  return status_buffer.folded(state or dr()._status or {}, key, default)
+  return status_buffer.folded(state or session.status or {}, key, default)
 end
 
 local function set_status_folded(key, folded, state)
   if not state then
-    dr()._status = dr()._status or {}
-    state = dr()._status
+    session.status = session.status or {}
+    state = session.status
   end
   return status_buffer.set_folded(state, key, folded)
 end
@@ -42,7 +43,7 @@ end
 
 function _G.diff_review_status_foldtext()
   local buf = vim.api.nvim_get_current_buf()
-  local state = dr()._status_states and dr()._status_states[buf] or dr()._status
+  local state = session.states and session.states[buf] or session.status
   local fold_start = tonumber(vim.v.foldstart) or vim.fn.line(".")
   local value = state and state.fold_text_by_start_line and state.fold_text_by_start_line[fold_start] or nil
   return dr()._status_fold_text(value)
@@ -55,7 +56,7 @@ end
 ---@param fold_text any
 function M._status_register_fold_range(fold_id, start_line, end_line, default_folded, fold_text)
   if not (fold_id and start_line and end_line and end_line > start_line) then return end
-  local status = dr()._status
+  local status = session.status
   if not status then return end
   status.fold_ranges_by_id = status.fold_ranges_by_id or {}
   status.fold_range_order = status.fold_range_order or {}
@@ -121,7 +122,7 @@ end
 ---@param _folded boolean
 ---@return boolean
 function M._status_set_native_fold_state(buf, fold_id, _folded)
-  local state = dr()._status_states and dr()._status_states[buf] or dr()._status
+  local state = session.states and session.states[buf] or session.status
   if type(fold_id) == "string"
     and (fold_id:find("^hunk:")
       or fold_id:find("^commit%-hunk:")
@@ -161,7 +162,7 @@ end
 
 ---@param buf integer
 function M._status_apply_native_folds(buf)
-  local state = dr()._status_states and dr()._status_states[buf] or dr()._status
+  local state = session.states and session.states[buf] or session.status
   if not (state and state.fold_range_order and vim.api.nvim_buf_is_valid(buf)) then return end
   return dr()._status_perf_span("status.apply_native_folds", buf, {
     fold_ranges = #(state.fold_range_order or {}),
@@ -201,7 +202,7 @@ end
 
 ---@param buf integer
 function M._status_sync_after_native_folds(buf)
-  local state = dr()._status_states and dr()._status_states[buf] or dr()._status
+  local state = session.states and session.states[buf] or session.status
   if not state then return end
   return dr()._status_perf_span("status.sync_after_native_folds", buf, nil, function()
     if state.view_kind == "pr" then
@@ -222,15 +223,15 @@ end
 
 ---@param buf integer
 function M._status_schedule_native_folds(buf)
-  local state = dr()._status_states and dr()._status_states[buf] or dr()._status
+  local state = session.states and session.states[buf] or session.status
   if not (state and vim.api.nvim_buf_is_valid(buf)) then return end
   state.native_fold_generation = (state.native_fold_generation or 0) + 1
   local generation = state.native_fold_generation
   vim.defer_fn(function()
-    local latest = dr()._status_states and dr()._status_states[buf] or dr()._status
+    local latest = session.states and session.states[buf] or session.status
     if not (latest and latest.native_fold_generation == generation and vim.api.nvim_buf_is_valid(buf)) then return end
     dr()._status_perf_span("status.native_folds_deferred", buf, { generation = generation }, function()
-      dr()._status = latest
+      session.status = latest
       dr()._status_apply_native_folds(buf)
       dr()._status_sync_after_native_folds(buf)
     end)
@@ -238,11 +239,11 @@ function M._status_schedule_native_folds(buf)
 end
 
 function M._refresh_status_windows_after_resize()
-  if not dr()._status_states then return end
+  if not session.states then return end
   for _, win in ipairs(vim.api.nvim_list_wins()) do
     if vim.api.nvim_win_is_valid(win) then
       local buf = vim.api.nvim_win_get_buf(win)
-      local state = dr()._status_states[buf]
+      local state = session.states[buf]
       if state then
         dr()._apply_status_window_options(win, state)
         dr()._status_apply_hint_bar(buf, win)

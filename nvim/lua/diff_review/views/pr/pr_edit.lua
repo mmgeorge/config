@@ -17,6 +17,7 @@ local region = require("diff_review.render.region")
 local function dr()
   return require("diff_review")
 end
+local session = require("diff_review.session")
 
 
 ---@class DiffReviewPrEditState
@@ -75,7 +76,7 @@ end
 ---@return integer? first0
 ---@return integer? after0
 function M.description_range0(buf)
-  local status = dr()._status_states and dr()._status_states[buf] or nil
+  local status = session.states and session.states[buf] or nil
   local state = status and status.pr_edit or nil
   if not (state and state.desc_region) then return nil, nil end
   return region.bounds(state.desc_region)
@@ -482,7 +483,7 @@ end
 ---@param row integer 1-based cursor row
 ---@return "title"|"review"|"milestone"|"desc"|nil
 function M.region_kind_at(buf, row)
-  local status = dr()._status_states and dr()._status_states[buf] or nil
+  local status = session.states and session.states[buf] or nil
   local state = status and status.pr_edit or nil
   if not state then return nil end
   local title_row0 = M.field_row(buf, state.title_mark, "^Title:")
@@ -510,7 +511,7 @@ end
 ---Show/hide the "*" out-of-sync markers on the Title/Description labels.
 ---@param buf integer
 function M.refresh_markers(buf)
-  local status = dr()._status_states and dr()._status_states[buf] or nil
+  local status = session.states and session.states[buf] or nil
   local state = status and status.pr_edit or nil
   if not (state and vim.api.nvim_buf_is_valid(buf)) then return end
   local title_dirty, desc_dirty, review_dirty, milestone_dirty = M.dirty_flags(buf, status)
@@ -543,7 +544,7 @@ end
 ---@param buf integer
 ---@return boolean
 function M.blocks_render(buf)
-  local status = dr()._status_states and dr()._status_states[buf] or nil
+  local status = session.states and session.states[buf] or nil
   local state = status and status.pr_edit or nil
   if not (state and status.pr and vim.api.nvim_buf_is_valid(buf)) then return false end
   local title_dirty, desc_dirty, review_dirty, milestone_dirty = M.dirty_flags(buf, status)
@@ -557,7 +558,7 @@ end
 ---PR-view render.
 ---@param buf integer
 function M.on_render(buf)
-  local status = dr()._status_states and dr()._status_states[buf] or nil
+  local status = session.states and session.states[buf] or nil
   local state = status and status.pr_edit or nil
   if not (state and status.pr and vim.api.nvim_buf_is_valid(buf)) then return end
   vim.api.nvim_buf_clear_namespace(buf, M.ns, 0, -1)
@@ -770,7 +771,7 @@ end
 ---@param buf integer
 ---@return boolean
 function M.cursor_on_status_value(buf)
-  local status = dr()._status_states and dr()._status_states[buf] or dr()._status
+  local status = session.states and session.states[buf] or session.status
   local row0 = M.status_row(buf, status)
   if not row0 then return false end
   local cursor = vim.api.nvim_win_get_cursor(0)
@@ -893,7 +894,7 @@ end
 ---@param change { desired: string[], add: string[], remove: string[] }
 ---@param done fun(ok: boolean)
 function M.apply_reviewer_change(buf, status, change, done)
-  local latest = dr()._status_states and dr()._status_states[buf] or status
+  local latest = session.states and session.states[buf] or status
   if not (latest and latest.pr) then
     done(false)
     return
@@ -968,7 +969,7 @@ function M.confirm_and_apply_reviewer_change(buf, status, change, done)
     dr()._confirm(lines, function()
       M.apply_reviewer_change(buf, status, change, done)
     end, function()
-      local latest = dr()._status_states and dr()._status_states[buf] or status
+      local latest = session.states and session.states[buf] or status
       M.revert_review_row(buf, latest)
       done(false)
     end)
@@ -998,7 +999,7 @@ end
 ---@param milestone DiffReviewGhMilestone?
 ---@param done fun(ok: boolean)
 function M.apply_milestone(buf, status, milestone, done)
-  local latest = dr()._status_states and dr()._status_states[buf] or status
+  local latest = session.states and session.states[buf] or status
   if not (latest and latest.pr) then
     done(false)
     return
@@ -1068,7 +1069,7 @@ function M.confirm_and_apply_milestone_change(buf, status, change, done)
     end
 
     dr()._confirm(M.milestone_create_confirmation_lines(change), function()
-      local latest = dr()._status_states and dr()._status_states[buf] or status
+      local latest = session.states and session.states[buf] or status
       if not (latest and latest.pr) then
         done(false)
         return
@@ -1087,7 +1088,7 @@ function M.confirm_and_apply_milestone_change(buf, status, change, done)
         M.apply_milestone(buf, latest, create_result.milestone, done)
       end)
     end, function()
-      local latest = dr()._status_states and dr()._status_states[buf] or status
+      local latest = session.states and session.states[buf] or status
       M.revert_milestone_row(buf, latest)
       done(false)
     end)
@@ -1124,7 +1125,7 @@ end
 ---@param desired_draft boolean
 ---@param done fun(ok: boolean)
 function M.apply_draft_status(buf, status, desired_draft, done)
-  local latest = dr()._status_states and dr()._status_states[buf] or status
+  local latest = session.states and session.states[buf] or status
   if not (latest and latest.pr) then
     done(false)
     return
@@ -1158,7 +1159,7 @@ end
 ---@return boolean
 function M.toggle_draft_status_under_cursor(buf)
   if not M.cursor_on_status_value(buf) then return false end
-  local status = dr()._status_states and dr()._status_states[buf] or dr()._status
+  local status = session.states and session.states[buf] or session.status
   local state = status and status.pr_edit or nil
   if not (status and status.pr and state) then return true end
   local desired_draft = not status.pr.isDraft
@@ -1196,10 +1197,10 @@ end
 ---dirty fields to GitHub through the queue.
 ---@param buf integer
 function M.sync(buf)
-  local status = dr()._status_states and dr()._status_states[buf] or nil
+  local status = session.states and session.states[buf] or nil
   local state = status and status.pr_edit or nil
   if not (status and state and status.pr) then return end
-  dr()._status = status
+  session.status = status
   local title, desc, review, milestone = M.current_values(buf, status)
   local title_dirty, desc_dirty, review_dirty, milestone_dirty = M.dirty_flags(buf, status)
   vim.bo[buf].modified = false
@@ -1236,9 +1237,9 @@ function M.sync(buf)
         end
         if edit.title then pr.title = edit.title end
         if edit.body then pr.body = edit.body end
-        local latest = dr()._status_states and dr()._status_states[buf] or nil
+        local latest = session.states and session.states[buf] or nil
         if latest == status then
-          dr()._status = status
+          session.status = status
           dr()._render_pr_status(pr, status.cwd, buf, status.pr_diff_text)
         end
         vim.notify(("PR #%s updated"):format(tostring(pr.number)), vim.log.levels.INFO, { title = "DiffReview" })
@@ -1278,7 +1279,7 @@ function M.sync_modifiable(buf)
     local row = dr()._status_perf_span("pr_edit.normalize_status_cursor", buf, nil, function()
       return dr()._normalize_status_cursor(buf)
     end) or vim.api.nvim_win_get_cursor(0)[1]
-    local status = dr()._status_states and dr()._status_states[buf] or nil
+    local status = session.states and session.states[buf] or nil
     local state = status and status.pr_edit or nil
     local region_kind = dr()._status_perf_span("pr_edit.region_kind_at", buf, { row = row }, function()
       return M.region_kind_at(buf, row)
@@ -1312,7 +1313,7 @@ end
 ---cursor-follows-modifiable lock, and lifecycle autocmds.
 ---@param buf integer
 function M.attach(buf)
-  local status = dr()._status_states and dr()._status_states[buf] or nil
+  local status = session.states and session.states[buf] or nil
   if not status then return end
   status.pr_edit = { queue = {}, running = false, lock_initial = true }
   vim.bo[buf].buftype = "acwrite"

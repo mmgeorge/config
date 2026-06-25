@@ -12,6 +12,7 @@ local git_backend = require("diff_review.git.git_backend")
 local function dr()
   return require("diff_review")
 end
+local session = require("diff_review.session")
 
 local M = {}
 
@@ -128,7 +129,7 @@ local function status_sections_from_items(collected_items)
   local ordered = {} ---@type DiffReviewStatusSection[]
   for _, section_config in ipairs(dr()._status_section_order) do
     local section = sections[section_config.name]
-    dr()._status_sort_section_files(dr()._status and dr()._status.buf or nil, section)
+    dr()._status_sort_section_files(session.status and session.status.buf or nil, section)
     for _, file in ipairs(section.files) do
       table.sort(file.hunks, function(left_hunk, right_hunk)
         return (left_hunk.pos or 0) < (right_hunk.pos or 0)
@@ -412,7 +413,7 @@ local function status_commits_from_log_output(spec, output)
       committed_at = nil
     end
     if oid and oid ~= "" then
-      local cache = dr()._status and dr()._status.commit_file_cache and dr()._status.commit_file_cache[oid] or nil
+      local cache = session.status and session.status.commit_file_cache and session.status.commit_file_cache[oid] or nil
       commits[#commits + 1] = {
         oid = oid,
         short_oid = short_oid or oid:sub(1, 7),
@@ -565,7 +566,7 @@ local function status_order_section_map(section_map)
   local ordered = {}
   for _, section_config in ipairs(dr()._status_section_order) do
     local section = section_map[section_config.name]
-    dr()._status_sort_section_files(dr()._status and dr()._status.buf or nil, section)
+    dr()._status_sort_section_files(session.status and session.status.buf or nil, section)
     for _, file in ipairs(section.files) do
       file.section_name = section.name
       file.untracked = section.name ~= "staged" and file.untracked == true

@@ -1,6 +1,7 @@
 vim.loader.enable(false)
 
 local diff_review = require("diff_review")
+local session = require("diff_review.session")
 local ai_commit = require("diff_review.integrations.ai_commit")
 local gh = require("diff_review.integrations.gh")
 local issue_index = require("github.issue_index")
@@ -205,7 +206,7 @@ local function run()
   local gitstatus = vim.json.decode(table.concat(vim.fn.readfile(gitstatus_path), "\n"))
   assert_true(vim.deep_equal(gitstatus.issues, { 42, 44 }), "GitStatus .gitstatus issues were wrong: " .. vim.inspect(gitstatus))
 
-  diff_review._status_states[buf].issues = nil
+  session.states[buf].issues = nil
   diff_review.render_status(buf)
   wait_for(function() return buffer_contains(buf, "Issues: #42 #44") end, "GitStatus did not reload issues from .gitstatus")
 end

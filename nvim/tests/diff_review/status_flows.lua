@@ -1,6 +1,8 @@
 vim.loader.enable(false)
 
 local diff_review = require("diff_review")
+local session = require("diff_review.session")
+local syntax_engine = require("diff_review.render.syntax_engine")
 local gh = require("diff_review.integrations.gh")
 local repo_cache = require("github.repo_cache")
 local original_notify = vim.notify
@@ -722,7 +724,7 @@ local function run()
   assert_true(not buffer_contains(buf, "Hint:"), "status hint should be a sticky winbar, not buffer text")
   vim.api.nvim_win_set_cursor(0, { vim.api.nvim_buf_line_count(buf), 0 })
   assert_true(plain_winbar() == status_hint, "status hint winbar changed after scrolling")
-  diff_review._ts_diff_syntax_cache = {}
+  syntax_engine.clear_diff_syntax_cache()
   local original_compute_diff_syntax_async = diff_review.compute_diff_syntax_async
   local prewarm_count = 0
   diff_review.compute_diff_syntax_async = function(_, _, cb)
@@ -873,7 +875,7 @@ local function run()
     row_is_folded(buf, find_row(buf, "collapse-parent-a.txt +1 -1")),
     "Collapse Parent from file did not fold the section\n" .. table.concat(status_lines(buf), "\n")
   )
-  diff_review._status.folds = {}
+  session.status.folds = {}
 
   reset_state({ modified = { ["refresh-collapse-a.txt"] = true, ["refresh-collapse-b.txt"] = true } })
   render_and_wait(buf, "refresh-collapse-a.txt +1 -1")
@@ -886,7 +888,7 @@ local function run()
       and buffer_contains(buf, "refresh-collapse-a.txt +1 -1")
       and not has_hunk_row
   end, "refresh did not restore the lazy file-level view\n" .. table.concat(status_lines(buf), "\n"))
-  diff_review._status.folds = {}
+  session.status.folds = {}
 
   reset_state({ modified = { ["cursor-stage-a.txt"] = true, ["cursor-stage-b.txt"] = true } })
   render_and_wait(buf, "cursor-stage-a.txt +1 -1")
@@ -937,7 +939,7 @@ local function run()
       cb = cb,
     }
   end
-  diff_review._ts_context_cache = {}
+  syntax_engine.clear_context_cache()
   reset_state({ modified = { ["context-stage-a.txt"] = true, ["context-stage-b.txt"] = true } })
   render_and_wait(buf, "context-stage-a.txt +1 -1")
   trigger_normal_mapping("<Tab>", find_row(buf, "context-stage-a.txt"))
@@ -962,7 +964,7 @@ local function run()
     "delayed hunk context rerender stole cursor\n" .. table.concat(status_lines(buf), "\n")
   )
   diff_review.compute_hunk_context_async = original_compute_hunk_context_async
-  diff_review._ts_context_cache = {}
+  syntax_engine.clear_context_cache()
 
   reset_state({ modified = { ["refresh-cursor-a.txt"] = true, ["refresh-cursor-b.txt"] = true } })
   render_and_wait(buf, "refresh-cursor-a.txt +1 -1")
