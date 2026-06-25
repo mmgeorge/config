@@ -119,7 +119,7 @@ url = "https://developers.openai.com/mcp"
 default_tools_approval_mode = "approve"
 
 [mcp_servers.terminal]
-command = "terminal-mcp"
+command = "terminal-mcp --headless"
 
 [mcp_servers.terminal.tools.takeScreenshot]
 approval_mode = "approve"

@@ -11,8 +11,7 @@ $env.ZELLIJ_CONFIG_FILE = $env.XDG_BASE  | path join "config" "zellij" "config.k
 # $env.SHELL = "nu"
 $env.EDITOR = "nvim"
 $env.PAGER = "delta"
-$env.GOOSE_RECIPE_PATH = $"($env.XDG_CONFIG_HOME)/goose/recipes"
-$env.GEMINI_CLI_SYSTEM_DEFAULTS_PATH = $env.XDG_CONFIG_HOME | path join "gemini" | path join "settings.json"
+$env.GEMINI_CONFIG_DIR = $env.XDG_CONFIG_HOME | path join "gemini"
 $env.CODEX_HOME = $env.XDG_CONFIG_HOME | path join "codex"
 $env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = 64000
 if $nu.os-info.name == "windows" {
