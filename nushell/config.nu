@@ -4,24 +4,19 @@ $env.XDG_CACHE_HOME = $env.XDG_BASE  | path join ".cache"
 $env.XDG_DATA_HOME = $env.XDG_BASE  | path join ".local/share"
 $env.XDG_STATE_HOME = $env.XDG_BASE  | path join ".local/state"
 $env.BIN_HOME = $env.XDG_BASE  | path join ".bin"
-# error on windows?
-$env.ZELLIJ_CONFIG_FILE = $env.XDG_BASE  | path join "config" "zellij" "config.kdl"
-
 # Problem for nvim:
 # $env.SHELL = "nu"
 $env.EDITOR = "nvim"
 $env.PAGER = "delta"
-$env.GEMINI_CONFIG_DIR = $env.XDG_CONFIG_HOME | path join "gemini"
+$env.ZELLIJ_CONFIG_FILE = $env.XDG_BASE  | path join "config" "zellij" "config.kdl"
 $env.CODEX_HOME = $env.XDG_CONFIG_HOME | path join "codex"
 $env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = 64000
 if $nu.os-info.name == "windows" {
   $env.CLAUDE_CODE_USE_POWERSHELL_TOOL = 1
 }
-
 $env.COPILOT_CUSTOM_INSTRUCTIONS_DIRS = $env.XDG_CONFIG_HOME | path join "copilot"
 
 alias mux = zellij
-
 alias cls = clear
 alias dc = detect columns
 alias select = select --ignore-case
