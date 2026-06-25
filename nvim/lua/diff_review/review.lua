@@ -3,6 +3,8 @@
 ---@class DiffReviewReviewModule
 
 local status_buffer = require("diff_review.status_buffer")
+local region = require("diff_review.region")
+local annotations = require("diff_review.annotations")
 local notifications = require("diff_review.notifications")
 local gh = require("diff_review.gh")
 local config = require("diff_review.config")
@@ -155,8 +157,7 @@ function M.comments_for_storage(state)
   for _, comment in ipairs(state.review_comments or {}) do
     local copy = vim.deepcopy(comment)
     copy.syncing = nil
-    copy.review_body_start = nil
-    copy.review_body_end = nil
+    copy.review_body_region = nil
     copy.review_header_mark = nil
     copy.review_footer_mark = nil
     copy.review_reply_header_marks = nil
@@ -470,21 +471,15 @@ function M.ensure_remote_review(state, cb)
 end
 
 ---@param buf integer
-function M.process_sync_queue(buf)
+---Run one queued comment sync operation against GitHub (create/update/delete), restoring
+---local comment state on failure. Calls cb(ok) when the operation settles.
+---@param buf integer
+---@param item { op: "upsert"|"delete", comment: table, body: string? }
+---@param cb fun(ok: boolean)
+function M.run_sync_item(buf, item, cb)
   local state = M.state(buf)
-  if not state then return end
-  state.review_sync = state.review_sync or { queue = {}, running = false, waiters = {} }
-  if state.review_sync.running then return end
-  local item = table.remove(state.review_sync.queue, 1)
-  if not item then
-    local waiters = state.review_sync.waiters or {}
-    state.review_sync.waiters = {}
-    for _, waiter in ipairs(waiters) do waiter(true) end
-    return
-  end
-  state.review_sync.running = true
+  if not state then cb(false) return end
   local function finish(ok)
-    state.review_sync.running = false
     if not ok then
       if item.op == "upsert" and item.comment then
         item.comment.syncing = nil
@@ -495,32 +490,21 @@ function M.process_sync_queue(buf)
         M.save_draft(state)
         if vim.api.nvim_buf_is_valid(buf) then M.render_preserving_inline_cursor(buf) end
       end
-      local waiters = state.review_sync.waiters or {}
-      state.review_sync.waiters = {}
-      for _, waiter in ipairs(waiters) do waiter(false) end
-      return
     end
-    M.process_sync_queue(buf)
+    cb(ok)
   end
   M.ensure_remote_review(state, function(ok)
     if not ok then finish(false) return end
     local comment = item.comment
     if item.op == "delete" then
-      if not comment.remote_node_id then
-        finish(true)
-        return
-      end
+      if not comment.remote_node_id then finish(true) return end
       gh.delete_review_comment_async(state.cwd, comment.remote_node_id, function(result)
         if not result.ok then
           notify_error("PR review comment delete failed: " .. (result.message or "gh failed"), "DiffReview")
-          finish(false)
-          return
+          finish(false) return
         end
         for index, existing in ipairs(state.review_comments or {}) do
-          if existing == comment then
-            table.remove(state.review_comments, index)
-            break
-          end
+          if existing == comment then table.remove(state.review_comments, index) break end
         end
         M.save_draft(state)
         if vim.api.nvim_buf_is_valid(buf) then M.render(buf) end
@@ -534,8 +518,7 @@ function M.process_sync_queue(buf)
       gh.update_review_comment_async(state.cwd, comment.remote_node_id, queued_body, function(result)
         if not result.ok then
           notify_error("PR review comment update failed: " .. (result.message or "gh failed"), "DiffReview")
-          finish(false)
-          return
+          finish(false) return
         end
         local remote = result.comments and result.comments[1] or nil
         if remote then
@@ -558,8 +541,7 @@ function M.process_sync_queue(buf)
     end
     if not comment.position then
       notify_error("PR review comment sync failed: missing diff position for " .. tostring(comment.path or ""), "DiffReview")
-      finish(false)
-      return
+      finish(false) return
     end
     gh.add_pending_review_comment_async(state.cwd, state.review_remote.node_id, {
       body = queued_body,
@@ -569,8 +551,7 @@ function M.process_sync_queue(buf)
     }, function(result)
       if not result.ok then
         notify_error("PR review comment create failed: " .. (result.message or "gh failed"), "DiffReview")
-        finish(false)
-        return
+        finish(false) return
       end
       local remote = result.comments and result.comments[1] or nil
       if remote then
@@ -597,24 +578,58 @@ function M.process_sync_queue(buf)
   end)
 end
 
+---Build (once) the per-buffer comment sync queue backed by the canonical annotation sync
+---drain: serial execution, op-id stale rejection, and stop-on-failure with draft waiters.
+---@param buf integer
+---@param state table
+---@return DiffReviewAnnotationSyncQueue
+function M.ensure_sync_queue(buf, state)
+  if state.review_sync then return state.review_sync end
+  state.review_sync_waiters = {}
+  local function resolve_waiters(ok)
+    local waiters = state.review_sync_waiters or {}
+    state.review_sync_waiters = {}
+    for _, waiter in ipairs(waiters) do waiter(ok) end
+  end
+  state.review_sync = annotations.new_sync_queue(function(item, done)
+    M.run_sync_item(buf, item, function(ok)
+      if not ok then resolve_waiters(false) end
+      done(ok)
+    end)
+  end, {
+    on_success = function() end,
+    on_failure = function() end,
+    stop_on_failure = true,
+    on_idle = function() resolve_waiters(true) end,
+  })
+  return state.review_sync
+end
+
+---@param buf integer
+function M.process_sync_queue(buf)
+  local state = M.state(buf)
+  if not state then return end
+  annotations.drain_sync_queue(M.ensure_sync_queue(buf, state))
+end
+
 ---@param buf integer
 ---@param op "upsert"|"delete"
 ---@param comment table
 function M.enqueue_sync(buf, op, comment)
   local state = M.state(buf)
   if not state then return end
-  state.review_sync = state.review_sync or { queue = {}, running = false, waiters = {} }
+  local queue = M.ensure_sync_queue(buf, state)
   local sync_body = op == "upsert" and M.comment_body_for_sync(comment.body or "") or nil
   if op == "upsert" then
-    for _, queued in ipairs(state.review_sync.queue) do
+    for _, queued in ipairs(queue.pending) do
       if queued.op == "upsert" and queued.comment == comment then
         queued.body = sync_body
         return
       end
     end
   end
-  state.review_sync.queue[#state.review_sync.queue + 1] = { op = op, comment = comment, body = sync_body }
-  M.process_sync_queue(buf)
+  queue.pending[#queue.pending + 1] = { op = op, comment = comment, body = sync_body }
+  annotations.drain_sync_queue(queue)
 end
 
 ---@param comment table
@@ -666,12 +681,12 @@ function M.flush_sync(buf, cb)
   local state = M.state(buf)
   if not state then cb(false) return end
   M.enqueue_dirty_comments(buf)
-  state.review_sync = state.review_sync or { queue = {}, running = false, waiters = {} }
-  if not state.review_sync.running and #state.review_sync.queue == 0 then
+  local queue = M.ensure_sync_queue(buf, state)
+  if not queue.running and #queue.pending == 0 then
     cb(true)
     return
   end
-  state.review_sync.waiters[#state.review_sync.waiters + 1] = cb
+  state.review_sync_waiters[#state.review_sync_waiters + 1] = cb
 end
 
 ---@param buf integer
@@ -1430,10 +1445,10 @@ function M.on_render(buf)
   local state = M.state(buf)
   if not state then return end
   vim.api.nvim_buf_clear_namespace(buf, M.ns, 0, -1)
-  state.review_comment_start, state.review_comment_end = nil, nil
+  state.review_comment_region = nil
   for _, comment in ipairs(state.review_comments or {}) do
     comment.review_header_mark = nil
-    comment.review_body_start, comment.review_body_end = nil, nil
+    comment.review_body_region = nil
     comment.review_footer_mark = nil
     comment.review_reply_header_marks = nil
     comment.review_body_line_marks = nil
@@ -1457,15 +1472,13 @@ function M.on_render(buf)
     -- End mark: right gravity so it stays past the region and follows the
     -- region as it grows/shrinks (a left-gravity end mark at the boundary gets
     -- pulled into an edit of the adjacent line).
-    state.review_comment_start = vim.api.nvim_buf_set_extmark(buf, M.ns, label_row, 0, { right_gravity = false })
-    state.review_comment_end = vim.api.nvim_buf_set_extmark(buf, M.ns, label_row + count, 0, { right_gravity = true })
+    state.review_comment_region = region.new(buf, M.ns, label_row, label_row + count, { region_kind = "review_comment", editable = true })
   end
 
   local range_comment, range_start
   local function close_comment_range(end_row)
     if range_comment and range_start and end_row >= range_start then
-      range_comment.review_body_start = vim.api.nvim_buf_set_extmark(buf, M.ns, range_start - 1, 0, { right_gravity = false })
-      range_comment.review_body_end = vim.api.nvim_buf_set_extmark(buf, M.ns, end_row, 0, { right_gravity = true })
+      range_comment.review_body_region = region.new(buf, M.ns, range_start - 1, end_row, { region_kind = "review_body", editable = true })
     end
     range_comment, range_start = nil, nil
   end
@@ -1603,8 +1616,8 @@ end
 ---@return integer? start_row0
 ---@return integer? end_row0
 function M.comment_body_range0(buf, comment)
-  local start_row0 = M.mark_row(buf, comment.review_body_start)
-  local end_row0 = M.mark_row(buf, comment.review_body_end)
+  if not comment.review_body_region then return nil, nil end
+  local start_row0, end_row0 = region.bounds(comment.review_body_region)
   if start_row0 == nil or end_row0 == nil or end_row0 < start_row0 then return nil, nil end
   return start_row0, end_row0
 end
@@ -1615,8 +1628,8 @@ end
 function M.in_comment_region(buf, row)
   local state = M.state(buf)
   if not state then return false end
-  local s0 = M.mark_row(buf, state.review_comment_start)
-  local e0 = M.mark_row(buf, state.review_comment_end)
+  local s0, e0
+  if state.review_comment_region then s0, e0 = region.bounds(state.review_comment_region) end
   return s0 ~= nil and e0 ~= nil and row >= s0 + 1 and row <= e0
 end
 
@@ -1925,8 +1938,8 @@ end
 function M.sync_comment_text(buf)
   local state = M.state(buf)
   if not state then return end
-  local s0 = M.mark_row(buf, state.review_comment_start)
-  local e0 = M.mark_row(buf, state.review_comment_end)
+  local s0, e0
+  if state.review_comment_region then s0, e0 = region.bounds(state.review_comment_region) end
   local changed = false
   if s0 and e0 then
     local review_comment_text = table.concat(vim.api.nvim_buf_get_lines(buf, s0, e0, false), "\n")

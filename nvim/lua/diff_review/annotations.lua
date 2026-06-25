@@ -226,13 +226,25 @@ end
 
 ---@param handler fun(annotation: DiffReviewDiffAnnotation, done: fun(ok: boolean, err?: string))
 ---@return DiffReviewAnnotationSyncQueue
-function M.new_sync_queue(handler)
+--- Build a serial sync queue with op-id stale rejection. By default it applies results via
+--- on_sync_success/on_sync_failure (the DiffAnnotation model); pass opts.on_success/on_failure
+--- to apply a different annotation model in place, opts.on_idle to react when the queue drains
+--- empty, and opts.stop_on_failure to halt the drain after a failed item.
+---@param handler fun(annotation: table, done: fun(ok: boolean, remote_payload?: table, err?: string))
+---@param opts? { on_success?: fun(annotation: table, remote_payload?: table), on_failure?: fun(annotation: table, err?: string), on_idle?: fun(), stop_on_failure?: boolean }
+---@return DiffReviewAnnotationSyncQueue
+function M.new_sync_queue(handler, opts)
+  opts = opts or {}
   return {
     pending = {},
     queued_by_id = {},
     running = false,
     next_operation_id = 0,
     handler = handler,
+    on_success = opts.on_success or M.on_sync_success,
+    on_failure = opts.on_failure or M.on_sync_failure,
+    on_idle = opts.on_idle,
+    stop_on_failure = opts.stop_on_failure == true,
   }
 end
 
@@ -263,8 +275,11 @@ end
 function M.drain_sync_queue(queue)
   if queue.running then return end
   local annotation = table.remove(queue.pending, 1)
-  if not annotation then return end
-  queue.queued_by_id[annotation.id] = nil
+  if not annotation then
+    if queue.on_idle then queue.on_idle() end
+    return
+  end
+  if annotation.id ~= nil then queue.queued_by_id[annotation.id] = nil end
   queue.running = true
   queue.next_operation_id = (queue.next_operation_id or 0) + 1
   local operation_id = queue.next_operation_id
@@ -274,13 +289,18 @@ function M.drain_sync_queue(queue)
     -- Ignore a completion that a newer sync of the same annotation superseded.
     if annotation.sync_operation_id == operation_id then
       if ok then
-        M.on_sync_success(annotation, remote_payload)
+        (queue.on_success or M.on_sync_success)(annotation, remote_payload)
       else
-        M.on_sync_failure(annotation, err)
+        (queue.on_failure or M.on_sync_failure)(annotation, err)
       end
     end
     queue.running = false
-    M.drain_sync_queue(queue)
+    -- Stop-on-failure queues halt the drain after a failed item and let callers requeue.
+    if not (ok == false and queue.stop_on_failure) then
+      M.drain_sync_queue(queue)
+    elseif queue.on_idle then
+      queue.on_idle()
+    end
   end)
 end
 

@@ -205,7 +205,6 @@
 
 ---@type DiffReviewModule
 local M = {}
-local status_render_current_model
 local status_diff_hunks_for_file
 local status_open_pr
 M._comment_icon = "󰅺"
@@ -257,6 +256,10 @@ local ai_commit = require("diff_review.ai_commit")
 local gh = require("diff_review.gh")
 local highlights = require("diff_review.highlights")
 local notifications = require("diff_review.notifications")
+local syntax_engine = require("diff_review.syntax_engine")
+local diff_render = require("diff_review.diff_render")
+local status_render = require("diff_review.status_render")
+local keymaps = require("diff_review.keymaps")
 local hunk_model = require("diff_review.hunk_model")
 -- Re-expose the pure hunk model under its original M._hunk_* names so init render
 -- helpers and tests reach it unchanged.
@@ -343,74 +346,10 @@ end
 
 ---@param filename string
 ---@return string[]?
-function M._file_source_lines(filename)
-  return M._status_perf_span("source.file_lines", M._status and M._status.buf or nil, {
-    file = filename,
-  }, function()
-    if file_contains_nul(filename) then return nil end
-    local loaded = loaded_file_buffer(filename)
-    if loaded then
-      if vim.bo[loaded].binary then return nil end
-      return vim.api.nvim_buf_get_lines(loaded, 0, -1, false)
-    end
-    local read_ok, lines = pcall(vim.fn.readfile, filename)
-    if not read_ok or type(lines) ~= "table" then return nil end
-    if lines_contain_nul(lines) then return nil end
-    return lines
-  end)
-end
 
 ---@param filename string
 ---@return integer?
-local function treesitter_source_buffer(filename)
-  return M._status_perf_span("treesitter.source_buffer", M._status and M._status.buf or nil, {
-    file = filename,
-  }, function()
-    if file_contains_nul(filename) then return nil end
-    local loaded = loaded_file_buffer(filename)
-    if loaded then
-      if vim.bo[loaded].binary then return nil end
-      return loaded
-    end
 
-    M._ts_source_bufs = M._ts_source_bufs or {}
-    local cached = M._ts_source_bufs[filename]
-    if cached and vim.api.nvim_buf_is_valid(cached) then return cached end
-
-    local lines = M._file_source_lines(filename)
-    if not lines then return nil end
-
-    local buf = vim.api.nvim_create_buf(false, true)
-    vim.bo[buf].bufhidden = "wipe"
-    vim.bo[buf].buftype = "nofile"
-    vim.bo[buf].swapfile = false
-    M._status_perf_span("treesitter.source_buffer.set_lines", M._status and M._status.buf or nil, {
-      file = filename,
-      source_line_count = #lines,
-    }, function()
-      vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-    end)
-    vim.bo[buf].filetype = detect_filetype(filename, lines)
-    M._ts_source_bufs[filename] = buf
-    return buf
-  end)
-end
-
-local function clear_treesitter_source_buffers()
-  for _, buf in pairs(M._ts_source_bufs or {}) do
-    if vim.api.nvim_buf_is_valid(buf) then
-      pcall(vim.api.nvim_buf_delete, buf, { force = true })
-    end
-  end
-  for _, cached in pairs(M._ts_diff_syntax_cache or {}) do
-    if type(cached) == "table" and cached.buf and vim.api.nvim_buf_is_valid(cached.buf) then
-      pcall(vim.api.nvim_buf_delete, cached.buf, { force = true })
-    end
-  end
-  M._ts_source_bufs = {}
-  M._ts_syntax_cache = {}
-  M._ts_diff_syntax_cache = {}
-end
 
 ---@param buf integer
 ---@param tree TSTree
@@ -418,67 +357,6 @@ end
 ---@param row integer 0-based row
 ---@param text string
 ---@return DiffReviewHighlightSegment[]
-local function treesitter_line_segments(buf, tree, query, row, text)
-  local segments = {}
-  if text == "" then return segments end
-  if not query then
-    return { { text = text } }
-  end
-
-  local ranges = {}
-  local ok = pcall(function()
-    for id, node in query:iter_captures(tree:root(), buf, row, row + 1) do
-      local capture = query.captures[id]
-      if capture and capture ~= "" then
-        local start_row, start_col, end_row, end_col = node:range()
-        if start_row <= row and end_row >= row then
-          local range_start = start_row == row and start_col or 0
-          local range_end = end_row == row and end_col or #text
-          if range_end > range_start then
-            ranges[#ranges + 1] = {
-              start_col = math.max(range_start, 0),
-              end_col = math.min(range_end, #text),
-              hl_group = "@" .. capture,
-            }
-          end
-        end
-      end
-    end
-  end)
-  if not ok or #ranges == 0 then
-    return { { text = text } }
-  end
-
-  local segment_start = 1
-  local current_hl = nil
-  for col = 0, #text - 1 do
-    local char = text:sub(col + 1, col + 1)
-    local hl_group = nil
-    if not char:match("%s") then
-      for _, range in ipairs(ranges) do
-        if col >= range.start_col and col < range.end_col then
-          hl_group = range.hl_group
-        end
-      end
-    end
-    if col == 0 then
-      current_hl = hl_group
-    elseif hl_group ~= current_hl then
-      segments[#segments + 1] = {
-        text = text:sub(segment_start, col),
-        hl_group = current_hl,
-      }
-      segment_start = col + 1
-      current_hl = hl_group
-    end
-  end
-
-  segments[#segments + 1] = {
-    text = text:sub(segment_start),
-    hl_group = current_hl,
-  }
-  return segments
-end
 
 ---@param filename string
 ---@param contents? string[]
@@ -1073,184 +951,13 @@ end
 ---@param trees TSTree[]
 ---@param target integer 0-based row
 ---@return DiffReviewHunkTreeSitterContext?
-local function hunk_context_from_trees(buf, query, highlight_query, trees, target)
-  if not trees or #trees == 0 then return nil end
-
-  local scopes = {}
-  for id, node in query:iter_captures(trees[1]:root(), buf) do
-    if query.captures[id] == "scope" then
-      local sr, _, er, _ = node:range()
-      if sr <= target and er >= target then
-        scopes[#scopes + 1] = { node = node, sr = sr, er = er }
-      end
-    end
-  end
-
-  if #scopes == 0 then return nil end
-
-  -- Sort by start row descending (innermost scope first). If two captures start
-  -- on the same row, prefer the shorter range as the inner scope.
-  table.sort(scopes, function(a, b)
-    if a.sr ~= b.sr then return a.sr > b.sr end
-    return a.er < b.er
-  end)
-
-  -- Limit to 3 levels max
-  local max_depth = math.min(#scopes, 3)
-
-  local function scope_name(scope)
-    if scope.name ~= nil then return scope.name end
-    for cid, cnode in query:iter_captures(scope.node, buf) do
-      if query.captures[cid] == "scope.name" then
-        local name_text = vim.treesitter.get_node_text(cnode, buf)
-        if name_text and name_text ~= "" then
-          scope.name = name_text
-          return scope.name
-        end
-        break
-      end
-    end
-    scope.name = false
-    return nil
-  end
-
-  local function scope_key(scope)
-    return ("%s:%d:%d"):format(scope_name(scope) or scope.node:type(), scope.sr, scope.er)
-  end
-
-  -- Collect names from outermost to innermost
-  local names = {}
-  for i = max_depth, 1, -1 do
-    local scope = scopes[i]
-    local name_text = scope_name(scope)
-    if name_text then names[#names + 1] = name_text end
-  end
-
-  if #names == 0 then return nil end
-  local selected_scope = scopes[1]
-  local lines = vim.api.nvim_buf_get_lines(buf, selected_scope.sr, selected_scope.er + 1, false)
-  local start_text = lines[1] or ""
-  local end_text = lines[#lines] or start_text
-
-  local function same_node(left, right)
-    if not left or not right then return false end
-    local left_start_row, left_start_col, left_end_row, left_end_col = left:range()
-    local right_start_row, right_start_col, right_end_row, right_end_col = right:range()
-    return left:type() == right:type()
-      and left_start_row == right_start_row
-      and left_start_col == right_start_col
-      and left_end_row == right_end_row
-      and left_end_col == right_end_col
-  end
-
-  local function sorted_row_set(row_set)
-    local rows = {}
-    for row in pairs(row_set) do
-      rows[#rows + 1] = row
-    end
-    table.sort(rows)
-    return rows
-  end
-
-  local root = trees[1]:root()
-  local function row_node_for_context(row)
-    local row_text = vim.api.nvim_buf_get_lines(buf, row, row + 1, false)[1] or ""
-    local row_node = nil
-    local node_ok, node = pcall(function()
-      return root:named_descendant_for_range(row, 0, row, #row_text)
-    end)
-    if node_ok then row_node = node end
-    if not row_node then
-      node_ok, node = pcall(function()
-        return root:descendant_for_range(row, 0, row, #row_text)
-      end)
-      if node_ok then row_node = node end
-    end
-    while row_node do
-      local parent = row_node:parent()
-      if not parent then break end
-      local parent_start_row, _, parent_end_row, _ = parent:range()
-      if parent_start_row == row
-        and parent_end_row == row
-        and parent_start_row >= selected_scope.sr
-        and parent_end_row <= selected_scope.er
-        and not same_node(parent, selected_scope.node) then
-        row_node = parent
-      else
-        break
-      end
-    end
-    return row_node
-  end
-
-  local path_start_rows = {}
-  local path_end_rows = {}
-  local target_node = row_node_for_context(target)
-  local target_row_node = target_node
-  while target_node do
-    local node_start_row, _, node_end_row, _ = target_node:range()
-    if node_start_row < selected_scope.sr or node_end_row > selected_scope.er then break end
-    if node_start_row < target then path_start_rows[node_start_row + 1] = true end
-    if node_end_row > target then path_end_rows[node_end_row + 1] = true end
-    if same_node(target_node, selected_scope.node) then break end
-    target_node = target_node:parent()
-  end
-
-  local function same_parent_neighbor_rows(direction)
-    local rows = {}
-    local target_parent = target_row_node and target_row_node:parent() or nil
-    if not target_parent then return rows end
-    for offset = 1, 3 do
-      local row = target + (direction * offset)
-      if row < selected_scope.sr or row > selected_scope.er then break end
-      local row_text = vim.api.nvim_buf_get_lines(buf, row, row + 1, false)[1] or ""
-      if vim.trim(row_text) == "" then break end
-      local neighbor_node = row_node_for_context(row)
-      local neighbor_parent = neighbor_node and neighbor_node:parent() or nil
-      if not same_node(neighbor_parent, target_parent) then break end
-      rows[row + 1] = true
-    end
-    return rows
-  end
-
-  local ancestor_boundaries = {}
-  local ancestor_scope = scopes[2]
-  if ancestor_scope and ancestor_scope.sr < selected_scope.sr then
-    local ancestor_text = vim.api.nvim_buf_get_lines(buf, ancestor_scope.sr, ancestor_scope.sr + 1, false)[1] or ""
-    local ancestor_end_text = vim.api.nvim_buf_get_lines(buf, ancestor_scope.er, ancestor_scope.er + 1, false)[1] or ""
-    ancestor_boundaries[#ancestor_boundaries + 1] = {
-      key = scope_key(ancestor_scope),
-      row = ancestor_scope.sr + 1,
-      text = ancestor_text,
-      segments = treesitter_line_segments(buf, trees[1], highlight_query, ancestor_scope.sr, ancestor_text),
-      end_row = ancestor_scope.er + 1,
-      end_text = ancestor_end_text,
-      end_segments = treesitter_line_segments(buf, trees[1], highlight_query, ancestor_scope.er, ancestor_end_text),
-    }
-  end
-
-  return {
-    label = table.concat(names, "."),
-    start_row = selected_scope.sr,
-    end_row = selected_scope.er,
-    start_text = start_text,
-    end_text = end_text,
-    start_segments = treesitter_line_segments(buf, trees[1], highlight_query, selected_scope.sr, start_text),
-    end_segments = treesitter_line_segments(buf, trees[1], highlight_query, selected_scope.er, end_text),
-    ancestor_boundaries = ancestor_boundaries,
-    path_start_rows = sorted_row_set(path_start_rows),
-    path_end_rows = sorted_row_set(path_end_rows),
-    sibling_before_rows = sorted_row_set(same_parent_neighbor_rows(-1)),
-    sibling_after_rows = sorted_row_set(same_parent_neighbor_rows(1)),
-  }
-end
 
 --- Compute Tree-sitter scope context for a hunk without blocking UI render.
 ---@param filename string absolute path
 ---@param line number 1-based line number
 ---@param cb fun(context?: DiffReviewHunkTreeSitterContext|string)
 function M.compute_hunk_context_async(filename, line, cb)
-  local buf = treesitter_source_buffer(filename)
+  local buf = syntax_engine.treesitter_source_buffer(filename)
   if not buf then
     cb(nil)
     return
@@ -1285,7 +992,7 @@ function M.compute_hunk_context_async(filename, line, cb)
   local function finish(trees)
     if done then return end
     done = true
-    local context = hunk_context_from_trees(buf, query, highlight_query, trees, target)
+    local context = syntax_engine.hunk_context_from_trees(buf, query, highlight_query, trees, target)
     cb(context)
   end
 
@@ -1312,7 +1019,7 @@ function M.compute_file_syntax_async(filename, cb)
   return M._status_perf_span("treesitter.compute_file_syntax_async", M._status and M._status.buf or nil, {
     file = filename,
   }, function()
-    local buf = treesitter_source_buffer(filename)
+    local buf = syntax_engine.treesitter_source_buffer(filename)
     if not buf then
       cb(nil)
       return
@@ -1480,134 +1187,34 @@ end
 ---@param callback_key string
 ---@param on_update? fun(context?: DiffReviewHunkTreeSitterContext|string)
 ---@return DiffReviewHunkTreeSitterContext|string?
-local function cached_hunk_context(filename, line, callback_key, on_update)
-  M._ts_context_cache = M._ts_context_cache or {}
-  local cache_key = filename .. ":" .. line
-  local cached = M._ts_context_cache[cache_key]
-  if cached == false then return nil end
-  if type(cached) == "string" then return cached end
-  if type(cached) == "table" and not cached.pending then return cached end
-  if type(cached) == "table" and cached.pending then
-    if on_update then cached.callbacks[callback_key] = on_update end
-    return nil
-  end
-
-  M._ts_context_cache[cache_key] = {
-    pending = true,
-    callbacks = on_update and { [callback_key] = on_update } or {},
-  }
-  M.compute_hunk_context_async(filename, line, function(context)
-    local pending = M._ts_context_cache and M._ts_context_cache[cache_key]
-    local callbacks = type(pending) == "table" and pending.callbacks or {}
-    M._ts_context_cache[cache_key] = context or false
-    for _, callback in pairs(callbacks) do
-      local ok, err = pcall(callback, context)
-      if not ok then notify_error("Tree-sitter context update failed: " .. tostring(err)) end
-    end
-  end)
-  return nil
-end
 
 ---@param filename string
 ---@param callback_key string
 ---@param on_update? fun(syntax?: DiffReviewTreeSitterSyntax)
 ---@return DiffReviewTreeSitterSyntax? syntax
 ---@return boolean pending
-local function cached_file_syntax(filename, callback_key, on_update)
-  local status_buf = M._status and M._status.buf or nil
-  return M._status_perf_span("syntax.cached_file_syntax", status_buf, {
-    file = filename,
-    callback_key = callback_key,
-  }, function()
-    M._ts_syntax_cache = M._ts_syntax_cache or {}
-    local cached = M._ts_syntax_cache[filename]
-    if cached == false then return nil, false end
-    if type(cached) == "table" and not cached.pending then return cached, false end
-    if type(cached) == "table" and cached.pending then
-      if on_update then cached.callbacks[callback_key] = on_update end
-      return nil, true
-    end
-
-    M._ts_syntax_cache[filename] = {
-      pending = true,
-      callbacks = on_update and { [callback_key] = on_update } or {},
-    }
-    M._status_perf_span("syntax.cached_file_syntax.compute", status_buf, {
-      file = filename,
-      callback_key = callback_key,
-    }, function()
-      M.compute_file_syntax_async(filename, function(syntax)
-        local pending = M._ts_syntax_cache and M._ts_syntax_cache[filename]
-        local callbacks = type(pending) == "table" and pending.callbacks or {}
-        M._ts_syntax_cache[filename] = syntax or false
-        for _, callback in pairs(callbacks) do
-          local ok, err = pcall(callback, syntax)
-          if not ok then notify_error("Tree-sitter syntax update failed: " .. tostring(err)) end
-        end
-      end)
-    end)
-    return nil, true
-  end)
-end
 
 ---@param context DiffReviewHunkTreeSitterContext|string?
 ---@return string?
-local function hunk_context_label(context)
-  if type(context) == "string" then return context end
-  if type(context) == "table" then return context.label end
-  return nil
-end
 
 ---@param context DiffReviewHunkTreeSitterContext|string?
 ---@return string?
-local function hunk_context_scope_key(context)
-  if type(context) ~= "table" then return nil end
-  return ("%s:%d:%d"):format(context.label, context.start_row, context.end_row)
-end
 
 ---@param left DiffReviewHunkTreeSitterContext|string?
 ---@param right DiffReviewHunkTreeSitterContext|string?
 ---@return boolean
-local function same_hunk_context_scope(left, right)
-  local left_key = hunk_context_scope_key(left)
-  return left_key ~= nil and left_key == hunk_context_scope_key(right)
-end
 
 
 
 ---@param left DiffReviewHunkTreeSitterContext|string?
 ---@param right DiffReviewHunkTreeSitterContext|string?
 ---@return boolean
-function M._same_hunk_ancestor_scope(left, right)
-  local left_key = M._hunk_context_ancestor_key(left)
-  return left_key ~= nil and left_key == M._hunk_context_ancestor_key(right)
-end
 
 ---@param text string?
 ---@return string
-local function line_indent(text)
-  return tostring(text or ""):match("^%s*") or ""
-end
 
 ---@param diff_lines string|string[]?
 ---@return table<string, boolean>
-local function hunk_visible_source_lines(diff_lines)
-  local lines = type(diff_lines) == "table" and diff_lines
-    or vim.split(tostring(diff_lines or ""), "\n", { plain = true })
-  local visible = {}
-  local in_hunk = false
-  for _, diff_line in ipairs(lines) do
-    if diff_line:match("^@@") then
-      in_hunk = true
-    elseif in_hunk then
-      local prefix = diff_line:sub(1, 1)
-      if prefix == " " or prefix == "+" or prefix == "-" then
-        visible[diff_line:sub(2)] = true
-      end
-    end
-  end
-  return visible
-end
 
 
 
@@ -1617,9 +1224,6 @@ end
 ---@field new_width integer
 
 ---@return DiffReviewGutterSpec
-local function default_hunk_gutter_spec()
-  return { width = 12, old_width = 3, new_width = 3 }
-end
 
 ---@param gutter DiffReviewGutterSpec
 ---@param old_line? integer
@@ -1629,39 +1233,6 @@ end
 ---@param line_hl? string
 ---@param changed_line_hl? string
 ---@return table[]
-local function hunk_gutter_chunks(gutter, old_line, new_line, sign, sign_hl, line_hl, changed_line_hl)
-  gutter = gutter or default_hunk_gutter_spec()
-  local old_text = old_line and ("%" .. tostring(gutter.old_width) .. "d"):format(old_line) or string.rep(" ", gutter.old_width)
-  local new_text = new_line and ("%" .. tostring(gutter.new_width) .. "d"):format(new_line) or string.rep(" ", gutter.new_width)
-  local old_hl = line_hl
-  if old_line then
-    if sign == "-" then
-      old_hl = changed_line_hl or sign_hl or "DiffReviewDeleteLineNr"
-    elseif sign == "~" then
-      old_hl = changed_line_hl or sign_hl or "DiffReviewModifyLineNr"
-    else
-      old_hl = "DiffReviewContextLineNr"
-    end
-  end
-  local new_hl = line_hl
-  if new_line then
-    if sign == "+" then
-      new_hl = changed_line_hl or sign_hl or "DiffReviewAddLineNr"
-    elseif sign == "~" then
-      new_hl = changed_line_hl or sign_hl or "DiffReviewModifyLineNr"
-    else
-      new_hl = "DiffReviewContextLineNr"
-    end
-  end
-  local chunks = {}
-  chunks[#chunks + 1] = { old_text, old_hl }
-  chunks[#chunks + 1] = { "  ", line_hl }
-  chunks[#chunks + 1] = { new_text, new_hl }
-  chunks[#chunks + 1] = { "  ", line_hl }
-  chunks[#chunks + 1] = { sign or " ", sign_hl or line_hl }
-  chunks[#chunks + 1] = { " ", line_hl }
-  return chunks
-end
 
 ---@param row table
 ---@param gutter DiffReviewGutterSpec
@@ -1671,17 +1242,6 @@ end
 ---@param sign_hl? string
 ---@param line_hl? string
 ---@param changed_line_hl? string
-local function hunk_add_gutter(row, gutter, old_line, new_line, sign, sign_hl, line_hl, changed_line_hl)
-  -- Inline virtual text, not buffer text: visual selection, yank, and search
-  -- then operate on the code content only. The default hl_mode "replace"
-  -- keeps the Visual highlight from bleeding into the gutter; the row's
-  -- line background is carried explicitly on every chunk via line_hl.
-  row[#row + 1] = {
-    col = 0,
-    virt_text = hunk_gutter_chunks(gutter, old_line, new_line, sign, sign_hl, line_hl, changed_line_hl),
-    virt_text_pos = "inline",
-  }
-end
 
 ---@param text string
 ---@param segments? DiffReviewHighlightSegment[]
@@ -1691,52 +1251,13 @@ end
 ---@param old_line? integer
 ---@param new_line? integer
 ---@return table
-local function hunk_boundary_row(text, segments, line_number, gutter, file, old_line, new_line)
-  local row = { diff_review_boundary = true }
-  gutter = gutter or default_hunk_gutter_spec()
-  old_line = old_line or line_number
-  new_line = new_line or line_number
-  if file and line_number then
-    row[#row + 1] = {
-      "",
-      nil,
-      meta = {
-        diff = M._hunk_diff_line_meta({
-          prefix = " ",
-          old_line = old_line,
-          new_line = new_line,
-          code = text,
-        }, file),
-      },
-    }
-  end
-  hunk_add_gutter(row, gutter, old_line, new_line, " ", nil)
-  if segments and #segments > 0 then
-    for _, segment in ipairs(segments) do
-      row[#row + 1] = segment.hl_group and { segment.text, segment.hl_group } or { segment.text }
-    end
-  else
-    row[#row + 1] = { text, "DiffReviewHunkBoundary" }
-  end
-  return row
-end
 
 ---@param reference_text string?
 ---@param gutter? DiffReviewGutterSpec
 ---@return table
-local function hunk_boundary_ellipsis_row(reference_text, gutter)
-  return hunk_boundary_row(line_indent(reference_text) .. "...", nil, nil, gutter)
-end
 
 ---@param header_parts table[]
 ---@return table
-local function hunk_header_row(header_parts)
-  local row = { diff_review_hunk_header = true }
-  for _, part in ipairs(header_parts) do
-    row[#row + 1] = part
-  end
-  return row
-end
 
 -- Cache for treesitter context per file (cleared on refresh)
 M._ts_context_cache = {}
@@ -1896,7 +1417,7 @@ end
 ---@param _ctx table?
 local function collect_items_from_git(cwd, cb, _ctx)
   M._ts_context_cache = {} -- clear treesitter context cache on refresh
-  clear_treesitter_source_buffers()
+  syntax_engine.clear_treesitter_source_buffers()
   M._untracked = {} -- map of absolute path -> repo-relative path for untracked files
   local results = {
     unstaged = {},
@@ -2021,8 +1542,8 @@ local function collect_items_from_git(cwd, cb, _ctx)
     -- Use treesitter scope context if available, fall back to git's @@ context
     local context_text = hunk.context or ""
     if hunk.diff and not (_ctx and _ctx.skip_ts_context) then
-      local cached = cached_hunk_context(filename, hunk.pos, "items:" .. filename .. ":" .. hunk.pos)
-      local cached_label = hunk_context_label(cached)
+      local cached = syntax_engine.cached_hunk_context(filename, hunk.pos, "items:" .. filename .. ":" .. hunk.pos)
+      local cached_label = syntax_engine.hunk_context_label(cached)
       if cached_label then
         context_text = cached_label
       end
@@ -2583,7 +2104,7 @@ local function parse_unified_diff(diff_text)
         lines = {},
         added = 0,
         removed = 0,
-        gutter = default_hunk_gutter_spec(),
+        gutter = diff_render.default_hunk_gutter_spec(),
       }
       current_block.hunks[#current_block.hunks + 1] = current_hunk
     elseif current_hunk then
@@ -2690,25 +2211,10 @@ end
 
 ---@param hunk DiffReviewHunk?
 ---@return integer?
-function M._status_hunk_context_line(hunk)
-  if not hunk then return nil end
-  local diff = tostring(hunk.diff or "")
-  local blocks = parse_unified_diff(diff)
-  local parsed_hunk = blocks[1] and blocks[1].hunks and blocks[1].hunks[1] or nil
-  if not parsed_hunk then return hunk.pos end
-  return hunk_first_changed_current_line(parse_hunk_body(parsed_hunk))
-end
 
 ---@param parsed_line DiffReviewParsedHunkLine
 ---@param context DiffReviewHunkTreeSitterContext|string?
 ---@return boolean
-local function hunk_line_visible_in_context_scope(parsed_line, context)
-  if parsed_line.prefix ~= " " or type(context) ~= "table" then return true end
-  if not parsed_line.new_line then return true end
-  local scope_start = context.start_row + 1
-  local scope_end = context.end_row + 1
-  return parsed_line.new_line >= scope_start and parsed_line.new_line <= scope_end
-end
 
 
 ---@alias DiffReviewDiffSyntaxSide "old"|"new"
@@ -2716,27 +2222,6 @@ end
 ---@param diff_text string
 ---@param side DiffReviewDiffSyntaxSide
 ---@return string[]
-local function diff_syntax_source_lines(diff_text, side)
-  return M._status_perf_span("syntax.diff_source_lines", M._status and M._status.buf or nil, {
-    side = side,
-    diff_len = #(diff_text or ""),
-  }, function()
-    local lines = {}
-    for _, block in ipairs(parse_unified_diff(diff_text)) do
-      for _, hunk in ipairs(block.hunks) do
-        local parsed_hunk = parse_hunk_body(hunk)
-        for _, parsed_line in ipairs(parsed_hunk.lines) do
-          if parsed_line.prefix == " "
-            or (side == "old" and parsed_line.prefix == "-")
-            or (side == "new" and parsed_line.prefix == "+") then
-            lines[#lines + 1] = parsed_line.code
-          end
-        end
-      end
-    end
-    return lines
-  end)
-end
 
 ---@param filename string
 ---@param diff_text string
@@ -2745,162 +2230,14 @@ end
 ---@param on_update? fun(syntax?: DiffReviewTreeSitterSyntax)
 ---@return DiffReviewTreeSitterSyntax? syntax
 ---@return boolean pending
-local function cached_diff_syntax(filename, diff_text, side, callback_key, on_update)
-  local status_buf = M._status and M._status.buf or nil
-  return M._status_perf_span("syntax.cached_diff_syntax", status_buf, {
-    file = filename,
-    side = side,
-    callback_key = callback_key,
-    diff_len = #(diff_text or ""),
-  }, function()
-    M._ts_diff_syntax_cache = M._ts_diff_syntax_cache or {}
-    local diff_hash = M._status_perf_span("syntax.cached_diff_syntax.sha256", status_buf, {
-      file = filename,
-      side = side,
-      diff_len = #(diff_text or ""),
-    }, function()
-      return vim.fn.sha256(diff_text or "")
-    end)
-    local cache_key = ("%s:%s:%s"):format(filename, side, diff_hash)
-    local cached = M._ts_diff_syntax_cache[cache_key]
-    if cached == false then return nil, false end
-    if type(cached) == "table" and not cached.pending then return cached, false end
-    if type(cached) == "table" and cached.pending then
-      if on_update then cached.callbacks[callback_key] = on_update end
-      return nil, true
-    end
-
-    local lines = M._status_perf_span("syntax.cached_diff_syntax.source_lines", status_buf, {
-      file = filename,
-      side = side,
-      diff_len = #(diff_text or ""),
-    }, function()
-      return diff_syntax_source_lines(diff_text, side)
-    end)
-    if #lines == 0 then return nil, false end
-    M._ts_diff_syntax_cache[cache_key] = {
-      pending = true,
-      callbacks = on_update and { [callback_key] = on_update } or {},
-    }
-    M._status_perf_span("syntax.cached_diff_syntax.compute", status_buf, {
-      file = filename,
-      side = side,
-      callback_key = callback_key,
-      source_line_count = #lines,
-    }, function()
-      M.compute_diff_syntax_async(filename, lines, function(syntax)
-        local pending = M._ts_diff_syntax_cache and M._ts_diff_syntax_cache[cache_key]
-        local callbacks = type(pending) == "table" and pending.callbacks or {}
-        M._ts_diff_syntax_cache[cache_key] = syntax or false
-        for _, callback in pairs(callbacks) do
-          local ok, err = pcall(callback, syntax)
-          if not ok then notify_error("Tree-sitter diff syntax update failed: " .. tostring(err)) end
-        end
-        if syntax and status_render_current_model and M._status and M._status.buf then
-          vim.schedule(function()
-            if M._status and M._status.buf and vim.api.nvim_buf_is_valid(M._status.buf) then
-              status_render_current_model()
-            end
-          end)
-        end
-      end)
-    end)
-    return nil, true
-  end)
-end
 
 ---@param filename string
 ---@param diff_text string
 ---@return string[]?
-function M._old_file_syntax_source_lines(filename, diff_text)
-  return M._status_perf_span("syntax.old_file_source_lines", M._status and M._status.buf or nil, {
-    file = filename,
-    diff_len = #(diff_text or ""),
-  }, function()
-    local lines = M._file_source_lines(filename)
-    if not lines then return nil end
-
-    local hunks = {}
-    M._status_perf_span("syntax.old_file_source_lines.parse", M._status and M._status.buf or nil, {
-      file = filename,
-      diff_len = #(diff_text or ""),
-    }, function()
-      for _, block in ipairs(parse_unified_diff(diff_text)) do
-        for _, hunk in ipairs(block.hunks) do
-          hunks[#hunks + 1] = parse_hunk_body(hunk, { preserve_trailing_blank = true })
-        end
-      end
-    end)
-    if #hunks == 0 then return nil end
-
-    local old_lines = vim.deepcopy(lines)
-    local rewrite_ok = M._status_perf_span("syntax.old_file_source_lines.rewrite", M._status and M._status.buf or nil, {
-      file = filename,
-      source_line_count = #lines,
-      hunk_count = #hunks,
-    }, function()
-      for hunk_index = #hunks, 1, -1 do
-        local hunk = hunks[hunk_index]
-        local replacement = {}
-        for _, parsed_line in ipairs(hunk.lines) do
-          if parsed_line.prefix == " " or parsed_line.prefix == "-" then
-            replacement[#replacement + 1] = parsed_line.code
-          end
-        end
-
-        local start_index = math.max(tonumber(hunk.new_start) or 1, 1)
-        local remove_count = math.max(tonumber(hunk.new_count) or 0, 0)
-        if start_index > #old_lines + 1 then return false end
-        if remove_count > 0 and (start_index + remove_count - 1) > #old_lines then return false end
-        for _ = 1, remove_count do
-          if start_index <= #old_lines then
-            table.remove(old_lines, start_index)
-          end
-        end
-        for replacement_index = #replacement, 1, -1 do
-          table.insert(old_lines, start_index, replacement[replacement_index])
-        end
-      end
-      return true
-    end)
-    if not rewrite_ok then return nil end
-
-    return old_lines
-  end)
-end
 
 ---@param filename string
 ---@param diff_text string
 ---@return boolean
-function M._diff_new_side_matches_file(filename, diff_text)
-  return M._status_perf_span("syntax.diff_new_side_matches_file", M._status and M._status.buf or nil, {
-    file = filename,
-    diff_len = #(diff_text or ""),
-  }, function()
-    local lines = M._file_source_lines(filename)
-    if not lines then return false end
-
-    for _, block in ipairs(parse_unified_diff(diff_text)) do
-      for _, hunk in ipairs(block.hunks) do
-        local parsed_hunk = parse_hunk_body(hunk, { preserve_trailing_blank = true })
-        local expected = {}
-        for _, parsed_line in ipairs(parsed_hunk.lines) do
-          if parsed_line.prefix == " " or parsed_line.prefix == "+" then
-            expected[#expected + 1] = parsed_line.code
-          end
-        end
-        local start_index = math.max(tonumber(parsed_hunk.new_start) or 1, 1)
-        if start_index > #lines + 1 then return false end
-        if #expected > 0 and (start_index + #expected - 1) > #lines then return false end
-        for offset, expected_line in ipairs(expected) do
-          if lines[start_index + offset - 1] ~= expected_line then return false end
-        end
-      end
-    end
-
-    return true
-  end)
-end
 
 ---@param filename string
 ---@param diff_text string
@@ -2908,78 +2245,10 @@ end
 ---@param on_update? fun(syntax?: DiffReviewTreeSitterSyntax)
 ---@return DiffReviewTreeSitterSyntax? syntax
 ---@return boolean pending
-function M._cached_old_file_syntax(filename, diff_text, callback_key, on_update)
-  local status_buf = M._status and M._status.buf or nil
-  return M._status_perf_span("syntax.cached_old_file_syntax", status_buf, {
-    file = filename,
-    callback_key = callback_key,
-    diff_len = #(diff_text or ""),
-  }, function()
-    M._ts_diff_syntax_cache = M._ts_diff_syntax_cache or {}
-    local diff_hash = M._status_perf_span("syntax.cached_old_file_syntax.sha256", status_buf, {
-      file = filename,
-      diff_len = #(diff_text or ""),
-    }, function()
-      return vim.fn.sha256(diff_text or "")
-    end)
-    local cache_key = ("%s:old-file:%s"):format(filename, diff_hash)
-    local cached = M._ts_diff_syntax_cache[cache_key]
-    if cached == false then return nil, false end
-    if type(cached) == "table" and not cached.pending then return cached, false end
-    if type(cached) == "table" and cached.pending then
-      if on_update then cached.callbacks[callback_key] = on_update end
-      return nil, true
-    end
-
-    local lines = M._status_perf_span("syntax.cached_old_file_syntax.source_lines", status_buf, {
-      file = filename,
-      diff_len = #(diff_text or ""),
-    }, function()
-      return M._old_file_syntax_source_lines(filename, diff_text)
-    end)
-    if not lines or #lines == 0 then return nil, false end
-    M._ts_diff_syntax_cache[cache_key] = {
-      pending = true,
-      callbacks = on_update and { [callback_key] = on_update } or {},
-    }
-    M._status_perf_span("syntax.cached_old_file_syntax.compute", status_buf, {
-      file = filename,
-      callback_key = callback_key,
-      source_line_count = #lines,
-    }, function()
-      M.compute_diff_syntax_async(filename, lines, function(syntax)
-        local pending = M._ts_diff_syntax_cache and M._ts_diff_syntax_cache[cache_key]
-        local callbacks = type(pending) == "table" and pending.callbacks or {}
-        M._ts_diff_syntax_cache[cache_key] = syntax or false
-        for _, callback in pairs(callbacks) do
-          local ok, err = pcall(callback, syntax)
-          if not ok then notify_error("Tree-sitter old file syntax update failed: " .. tostring(err)) end
-        end
-        if syntax and status_render_current_model and M._status and M._status.buf then
-          vim.schedule(function()
-            if M._status and M._status.buf and vim.api.nvim_buf_is_valid(M._status.buf) then
-              status_render_current_model()
-            end
-          end)
-        end
-      end)
-    end)
-    return nil, true
-  end)
-end
 
 ---@param hunk_staged? boolean[]
 ---@param opts? table
 ---@return boolean
-function M._diff_uses_file_syntax(hunk_staged, opts)
-  opts = opts or {}
-  if opts.syntax_source == "file" then return true end
-  if opts.syntax_source == "diff" then return false end
-  for _, staged in ipairs(hunk_staged or {}) do
-    if staged then return false end
-  end
-  return true
-end
 
 ---@param filename string
 ---@param diff_text string
@@ -2987,187 +2256,18 @@ end
 ---@param callback_key string
 ---@param on_update? fun(syntax?: DiffReviewTreeSitterSyntax)
 ---@param opts? table
-function M._prewarm_diff_syntax(filename, diff_text, hunk_staged, callback_key, on_update, opts)
-  local status_buf = M._status and M._status.buf or nil
-  return M._status_perf_span("syntax.prewarm_diff_syntax", status_buf, {
-    file = filename,
-    callback_key = callback_key,
-    diff_len = #(diff_text or ""),
-    staged_count = #(hunk_staged or {}),
-    syntax_source = opts and opts.syntax_source or nil,
-  }, function()
-    opts = opts or {}
-    local syntax_diff_text = opts.syntax_diff_text or diff_text
-    local use_file_syntax = M._status_perf_span("syntax.prewarm_diff_syntax.uses_file_syntax", status_buf, {
-      file = filename,
-      callback_key = callback_key,
-      syntax_source = opts.syntax_source,
-      staged_count = #(hunk_staged or {}),
-    }, function()
-      return M._diff_uses_file_syntax(hunk_staged, opts)
-    end)
-    local new_side_matches_file = false
-    if use_file_syntax then
-      new_side_matches_file = M._status_perf_span("syntax.prewarm_diff_syntax.new_side_matches_file", status_buf, {
-        file = filename,
-        callback_key = callback_key,
-        diff_len = #(syntax_diff_text or ""),
-      }, function()
-        return M._diff_new_side_matches_file(filename, syntax_diff_text)
-      end)
-    end
-    M._status_perf_event("syntax.prewarm_diff_syntax.route", status_buf, {
-      file = filename,
-      callback_key = callback_key,
-      use_file_syntax = use_file_syntax,
-      new_side_matches_file = new_side_matches_file,
-      diff_len = #(diff_text or ""),
-      syntax_diff_len = #(syntax_diff_text or ""),
-    })
-    if use_file_syntax and new_side_matches_file then
-      local old_syntax, old_pending = M._status_perf_span("syntax.prewarm_diff_syntax.cached_old_file", status_buf, {
-        file = filename,
-        callback_key = callback_key,
-        diff_len = #(syntax_diff_text or ""),
-      }, function()
-        return M._cached_old_file_syntax(filename, syntax_diff_text, callback_key .. ":old-file", on_update)
-      end)
-      if not old_syntax and not old_pending then
-        M._status_perf_span("syntax.prewarm_diff_syntax.fallback_old_diff", status_buf, {
-          file = filename,
-          callback_key = callback_key,
-          diff_len = #(diff_text or ""),
-        }, function()
-          cached_diff_syntax(filename, diff_text, "old", callback_key .. ":old", on_update)
-        end)
-      end
-      local syntax, pending = M._status_perf_span("syntax.prewarm_diff_syntax.cached_file", status_buf, {
-        file = filename,
-        callback_key = callback_key,
-      }, function()
-        return cached_file_syntax(filename, callback_key .. ":file", on_update)
-      end)
-      if not syntax and not pending then
-        M._status_perf_span("syntax.prewarm_diff_syntax.fallback_new_diff", status_buf, {
-          file = filename,
-          callback_key = callback_key,
-          diff_len = #(diff_text or ""),
-        }, function()
-          cached_diff_syntax(filename, diff_text, "new", callback_key .. ":new", on_update)
-        end)
-      end
-    else
-      M._status_perf_span("syntax.prewarm_diff_syntax.diff_old", status_buf, {
-        file = filename,
-        callback_key = callback_key,
-        diff_len = #(diff_text or ""),
-      }, function()
-        cached_diff_syntax(filename, diff_text, "old", callback_key .. ":old", on_update)
-      end)
-      M._status_perf_span("syntax.prewarm_diff_syntax.diff_new", status_buf, {
-        file = filename,
-        callback_key = callback_key,
-        diff_len = #(diff_text or ""),
-      }, function()
-        cached_diff_syntax(filename, diff_text, "new", callback_key .. ":new", on_update)
-      end)
-    end
-  end)
-end
 
 ---@param file DiffReviewStatusFile?
 ---@return string?
-function M._status_file_syntax_diff_text(file)
-  return M._status_perf_span("syntax.status_file_syntax_diff_text", M._status and M._status.buf or nil, {
-    file = file and file.filename or nil,
-  }, function()
-    if not file then return nil end
-    local hunks = M._status_perf_span("syntax.status_file_syntax_diff_text.hunks", M._status and M._status.buf or nil, {
-      file = file.filename,
-    }, function()
-      return status_diff_hunks_for_file(file)
-    end)
-    local diffs = {}
-    for _, hunk in ipairs(hunks) do
-      if hunk.diff and hunk.diff ~= "" then diffs[#diffs + 1] = hunk.diff end
-    end
-    if #diffs == 0 then return nil end
-    local diff_text = table.concat(diffs, "\n")
-    M._status_perf_event("syntax.status_file_syntax_diff_text.result", M._status and M._status.buf or nil, {
-      file = file.filename,
-      hunk_count = #hunks,
-      diff_count = #diffs,
-      diff_len = #diff_text,
-    })
-    return diff_text
-  end)
-end
 
 ---@param hunk_count integer
 ---@param options? DiffReviewConfig
 ---@return integer
-function M._status_prewarm_hunk_budget(hunk_count, options)
-  options = options or M.config or config.options or config.defaults
-  hunk_count = math.max(0, math.floor(tonumber(hunk_count) or 0))
-  local max_hunks = tonumber(options and options.status_cursor_prewarm_max_hunks)
-  if max_hunks == nil then max_hunks = tonumber(config.defaults.status_cursor_prewarm_max_hunks) or 12 end
-  -- A non-positive budget disables cursor-driven file prewarm entirely.
-  if max_hunks <= 0 then return 0 end
-  return math.min(hunk_count, math.floor(max_hunks))
-end
 
 ---@param file DiffReviewStatusFile?
 ---@param callback_key_prefix string
 ---@param on_update? fun(syntax?: DiffReviewTreeSitterSyntax)
 ---@param opts? { syntax_source?: "file"|"diff" }
-local function prewarm_file_diff_syntax(file, callback_key_prefix, on_update, opts)
-  return M._status_perf_span("syntax.prewarm_file_diff_syntax", M._status and M._status.buf or nil, {
-    file = file and file.filename or nil,
-    callback_key_prefix = callback_key_prefix,
-    syntax_source = opts and opts.syntax_source or nil,
-  }, function()
-    if not (file and file.filename) then return end
-    opts = opts or {}
-    local combined_diff = nil
-    if opts.syntax_source == "file" then
-      combined_diff = M._status_perf_span("syntax.prewarm_file_diff_syntax.combined_diff", M._status and M._status.buf or nil, {
-        file = file.filename,
-        callback_key_prefix = callback_key_prefix,
-      }, function()
-        return M._status_file_syntax_diff_text(file)
-      end)
-    end
-    if type(combined_diff) == "string" and combined_diff ~= "" then
-      opts = vim.tbl_extend("force", opts, { syntax_diff_text = combined_diff })
-    end
-    local hunks = M._status_perf_span("syntax.prewarm_file_diff_syntax.hunks", M._status and M._status.buf or nil, {
-      file = file.filename,
-      callback_key_prefix = callback_key_prefix,
-    }, function()
-      return status_diff_hunks_for_file(file)
-    end)
-    local hunk_budget = M._status_prewarm_hunk_budget(#hunks)
-    M._status_perf_event("syntax.prewarm_file_diff_syntax.start_hunks", M._status and M._status.buf or nil, {
-      file = file.filename,
-      callback_key_prefix = callback_key_prefix,
-      hunk_count = #hunks,
-      prewarm_budget = hunk_budget,
-      capped = hunk_budget < #hunks,
-      combined_diff_len = type(combined_diff) == "string" and #combined_diff or nil,
-    })
-    -- Bound cursor-driven prewarm: hovering a many-hunk file must not fan out into
-    -- hundreds of Tree-sitter parses, which froze the editor on large diffs.
-    local warmed = 0
-    for hunk_index, hunk in ipairs(hunks) do
-      if warmed >= hunk_budget then break end
-      if hunk.diff and hunk.diff ~= "" then
-        local callback_key = ("%s:%s:%d"):format(callback_key_prefix, file.filename, hunk_index)
-        M._prewarm_diff_syntax(file.filename, hunk.diff, { hunk.staged }, callback_key, on_update, opts)
-        warmed = warmed + 1
-      end
-    end
-  end)
-end
 
 
 
@@ -3177,36 +2277,6 @@ end
 ---@param syntax? DiffReviewTreeSitterSyntax
 ---@param syntax_row? integer
 ---@return table
-local function hunk_body_row(parsed_line, gutter, file, syntax, syntax_row)
-  local sign_hl = nil
-  local line_hl = nil
-  if parsed_line.prefix == "+" then
-    sign_hl = "DiffReviewAddLineNr"
-    line_hl = "DiffReviewAddBg"
-  elseif parsed_line.prefix == "-" then
-    sign_hl = "DiffReviewDeleteLineNr"
-    line_hl = "DiffReviewDeleteBg"
-  end
-
-  local row = { diff_review_bg_hl = line_hl }
-  local diff_meta = {
-    diff = M._hunk_diff_line_meta(parsed_line, file),
-  }
-  row[#row + 1] = { "", nil, meta = diff_meta }
-  hunk_add_gutter(row, gutter, parsed_line.old_line, parsed_line.new_line, parsed_line.prefix, sign_hl, line_hl)
-  local segments = nil
-  if syntax and syntax_row then
-    segments = treesitter_line_segments(syntax.buf, syntax.tree, syntax.highlight_query, syntax_row, parsed_line.code)
-  end
-  if segments and #segments > 0 then
-    for _, segment in ipairs(segments) do
-      row[#row + 1] = segment.hl_group and { segment.text, segment.hl_group } or { segment.text }
-    end
-  else
-    row[#row + 1] = { parsed_line.code }
-  end
-  return row
-end
 
 
 
@@ -3257,54 +2327,13 @@ end
 ---@param left DiffReviewGutterSpec?
 ---@param right DiffReviewGutterSpec?
 ---@return DiffReviewGutterSpec
-function M._merge_hunk_gutter_specs(left, right)
-  left = left or default_hunk_gutter_spec()
-  right = right or default_hunk_gutter_spec()
-  local old_width = math.max(left.old_width or 0, right.old_width or 0)
-  local new_width = math.max(left.new_width or 0, right.new_width or 0)
-  return {
-    old_width = old_width,
-    new_width = new_width,
-    width = old_width + 2 + new_width + 2 + 1 + 1,
-  }
-end
 
 ---@param group DiffReviewHunkDisplayGroup
 ---@param plan DiffReviewHunkRenderPlan
-function M._add_plan_to_hunk_display_group(group, plan)
-  group.plans[#group.plans + 1] = plan
-  group.gutter = M._merge_hunk_gutter_specs(group.gutter, plan.gutter)
-  group.added = (group.added or 0) + (plan.region.added or 0)
-  group.removed = (group.removed or 0) + (plan.region.removed or 0)
-  if plan.display_start then group.display_start = math.min(group.display_start or plan.display_start, plan.display_start) end
-  if plan.display_end then group.display_end = math.max(group.display_end or plan.display_end, plan.display_end) end
-  for line_number in pairs(plan.changed_lines or {}) do
-    group.changed_lines[line_number] = true
-  end
-end
 
 
 ---@param plans DiffReviewHunkRenderPlan[]
 ---@return DiffReviewHunkDisplayGroup[]
-function M._merge_hunk_render_plans(plans)
-  local groups = {}
-  local current_group = nil ---@type DiffReviewHunkDisplayGroup?
-  for _, plan in ipairs(plans) do
-    local previous_plan = current_group and current_group.plans[#current_group.plans] or nil
-    if not (current_group and previous_plan and M._hunk_render_plans_should_merge(previous_plan, plan)) then
-      current_group = {
-        plans = {},
-        gutter = plan.gutter,
-        added = 0,
-        removed = 0,
-        changed_lines = {},
-      }
-      groups[#groups + 1] = current_group
-    end
-    M._add_plan_to_hunk_display_group(current_group, plan)
-  end
-  return groups
-end
 
 
 
@@ -3322,627 +2351,16 @@ end
 ---@param context_callback_key? fun(hunk_line: number): string
 ---@param on_context_update? fun()
 ---@param opts? { context_line: integer?, boundary_context: boolean?, suppress_start_boundary: boolean?, suppress_end_boundary: boolean?, suppress_start_boundary_keys?: table<string, boolean>, suppress_end_boundary_keys?: table<string, boolean>, syntax_source?: "file"|"diff", syntax_diff_text?: string, fallback_syntax_diff_text?: string, old_syntax_row_offset?: integer, new_syntax_row_offset?: integer, compact_replacements?: boolean, require_file_match_for_context?: boolean, debug_context?: table }
-local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_callback_key, on_context_update, opts)
-  opts = opts or {}
-
-  local diff = parse_unified_diff(diff_text)
-  local syntax_diff_text = opts.syntax_diff_text or diff_text
-  local debug_context = opts.debug_context
-  local ret = {} ---@type table[]
-  local hunk_idx = 0
-  local old_syntax = nil
-  local old_file_syntax = nil
-  local new_syntax = nil
-  local file_syntax = nil
-  local syntax_pending = false
-  local context_pending = false
-  local old_syntax_row = tonumber(opts.old_syntax_row_offset) or 0
-  local new_syntax_row = tonumber(opts.new_syntax_row_offset) or 0
-  local require_file_match_for_context = opts.require_file_match_for_context == true
-  local source_matches_file = not require_file_match_for_context
-  if filename then
-    local syntax_callback_key = context_callback_key and context_callback_key(0) or ("diff-row:" .. filename .. ":0")
-    local old_pending = false
-    local old_file_pending = false
-    local new_pending = false
-    local file_pending = false
-    local uses_file_syntax = M._diff_uses_file_syntax(hunk_staged, opts)
-    local new_side_matches_file = M._diff_new_side_matches_file(filename, syntax_diff_text)
-    source_matches_file = (not require_file_match_for_context) or new_side_matches_file
-    if debug_context then
-      M._gitstatus_debug.event("build_fancy_diff_rows.syntax", {
-        context = debug_context,
-        filename = filename,
-        syntax_source = opts.syntax_source,
-        uses_file_syntax = uses_file_syntax,
-        new_side_matches_file = new_side_matches_file,
-        source_context_enabled = source_matches_file,
-        diff_len = #(diff_text or ""),
-        syntax_diff_len = #(syntax_diff_text or ""),
-      })
-    end
-    local fallback_syntax_diff_text = opts.fallback_syntax_diff_text or diff_text
-    if uses_file_syntax and new_side_matches_file then
-      old_file_syntax, old_file_pending = M._cached_old_file_syntax(filename, syntax_diff_text, syntax_callback_key .. ":old-file-syntax", on_context_update)
-      if not old_file_syntax and not old_file_pending then
-        old_syntax, old_pending = cached_diff_syntax(filename, fallback_syntax_diff_text, "old", syntax_callback_key .. ":old-diff-syntax", on_context_update)
-      end
-      file_syntax, file_pending = cached_file_syntax(filename, syntax_callback_key .. ":file-syntax", on_context_update)
-      if not file_syntax and not file_pending then
-        new_syntax, new_pending = cached_diff_syntax(filename, fallback_syntax_diff_text, "new", syntax_callback_key .. ":new-diff-syntax", on_context_update)
-      end
-    else
-      old_syntax, old_pending = cached_diff_syntax(filename, fallback_syntax_diff_text, "old", syntax_callback_key .. ":old-diff-syntax", on_context_update)
-      new_syntax, new_pending = cached_diff_syntax(filename, fallback_syntax_diff_text, "new", syntax_callback_key .. ":new-diff-syntax", on_context_update)
-    end
-    syntax_pending = old_pending or old_file_pending or new_pending or file_pending
-  end
-
-  local source_lines = source_matches_file and filename and M._file_source_lines(filename) or nil
-  local plans = {} ---@type DiffReviewHunkRenderPlan[]
-
-  local function context_for_line(block, line)
-    if not (source_matches_file and filename and line) then return nil end
-    local callback_key = context_callback_key and context_callback_key(line)
-      or ("diff-row:" .. (filename or block.file) .. ":" .. line)
-    local context = cached_hunk_context(filename, line, callback_key, on_context_update)
-    local cached_context = M._ts_context_cache and M._ts_context_cache[filename .. ":" .. line] or nil
-    if type(cached_context) == "table" and cached_context.pending then context_pending = true end
-    return context
-  end
-
-  local function syntax_for_line(parsed_line)
-    local row_syntax = nil
-    local row_syntax_row = nil
-    if parsed_line.prefix == "-" then
-      row_syntax = old_file_syntax or old_syntax
-      row_syntax_row = old_file_syntax and parsed_line.old_line and (parsed_line.old_line - 1) or old_syntax_row
-    elseif file_syntax and parsed_line.new_line then
-      row_syntax = file_syntax
-      row_syntax_row = parsed_line.new_line - 1
-    else
-      row_syntax = new_syntax
-      row_syntax_row = new_syntax_row
-    end
-    return row_syntax, row_syntax_row
-  end
-
-  local function advance_syntax_rows(parsed_line)
-    if parsed_line.prefix == " " then
-      old_syntax_row = old_syntax_row + 1
-      new_syntax_row = new_syntax_row + 1
-    elseif parsed_line.prefix == "-" then
-      old_syntax_row = old_syntax_row + 1
-    elseif parsed_line.prefix == "+" then
-      new_syntax_row = new_syntax_row + 1
-    end
-  end
-
-  for _, block in ipairs(diff) do
-    for _, hunk in ipairs(block.hunks) do
-      hunk_idx = hunk_idx + 1
-      hunk = parse_hunk_body(hunk)
-      local include_render_line = M._hunk_render_line_filter(hunk)
-      if type(source_lines) ~= "table" then
-        include_render_line = function() return true end
-      end
-      local line_by_position = M._hunk_current_line_by_position(hunk)
-      local occupied_lines = M._hunk_changed_current_line_set(hunk, line_by_position)
-      local render_items = nil
-      if opts.compact_replacements then
-        render_items = M._intraline_diff.compact_hunk_lines(hunk.lines)
-      else
-        render_items = {}
-        for _, parsed_line in ipairs(hunk.lines) do
-          render_items[#render_items + 1] = { kind = "line", line = parsed_line }
-        end
-      end
-
-      local regions = M._hunk_change_regions(render_items, line_by_position, function(line)
-        return context_for_line(block, line)
-      end)
-      if type(source_lines) ~= "table" then
-        for _, region in ipairs(regions) do
-          region.first_item = 1
-          region.last_item = #render_items
-        end
-      end
-      local syntax_by_item = {}
-      for item_index, item in ipairs(render_items) do
-        local parsed_line = M._hunk_render_item_line(item)
-        local row_syntax, row_syntax_row = syntax_for_line(parsed_line)
-        syntax_by_item[item_index] = {
-          syntax = row_syntax,
-          row = row_syntax_row,
-        }
-        for _, backing_line in ipairs(M._hunk_render_item_backing_lines(item)) do
-          advance_syntax_rows(backing_line)
-        end
-      end
-
-      for region_index, region in ipairs(regions) do
-        local region_bounds = {
-          changed_line = region.changed_line,
-          after_line = region.after_line,
-        }
-        local before_padding_lines = M._hunk_context_padding_lines(
-          source_lines,
-          hunk,
-          region.context,
-          "before",
-          occupied_lines,
-          include_render_line,
-          region_bounds
-        )
-        M._hunk_annotate_padding_line_numbers(before_padding_lines, block)
-        local after_padding_lines = M._hunk_context_padding_lines(
-          source_lines,
-          hunk,
-          region.context,
-          "after",
-          occupied_lines,
-          include_render_line,
-          region_bounds
-        )
-        M._hunk_annotate_padding_line_numbers(after_padding_lines, block)
-        local display_start, display_end = M._hunk_region_display_window(region, before_padding_lines, after_padding_lines)
-        plans[#plans + 1] = {
-          block = block,
-          hunk = hunk,
-          hunk_index = hunk_idx,
-          region = region,
-          region_index = region_index,
-          region_count = #regions,
-          render_items = render_items,
-          include_render_line = include_render_line,
-          gutter = hunk.gutter,
-          source_lines = source_lines,
-          occupied_lines = occupied_lines,
-          syntax_by_item = syntax_by_item,
-          visible_source_lines = M._hunk_region_visible_source_lines(region, render_items, include_render_line),
-          before_padding_lines = before_padding_lines,
-          after_padding_lines = after_padding_lines,
-          changed_lines = M._hunk_region_changed_current_lines(region, render_items, line_by_position),
-          display_start = display_start,
-          display_end = display_end,
-        }
-      end
-    end
-  end
-
-  local display_groups = M._merge_hunk_render_plans(plans)
-  local emitted_start_scope_keys = {}
-  for group_index, group in ipairs(display_groups) do
-    local next_group = display_groups[group_index + 1]
-    ret[#ret + 1] = hunk_header_row(M._hunk_virtual_header_parts(group, group.plans[1] and group.plans[1].hunk or nil))
-    local emitted_context_lines = {}
-
-    local function add_context_padding_rows(padding_lines, gutter, block_file)
-      for _, padding_line in ipairs(padding_lines or {}) do
-        if not group.changed_lines[padding_line.line_number] and not emitted_context_lines[padding_line.line_number] then
-          ret[#ret + 1] = M._hunk_context_padding_row(
-            padding_line.line_number,
-            padding_line.text,
-            gutter,
-            filename or block_file,
-            file_syntax,
-            padding_line.old_line,
-            padding_line.new_line
-          )
-          emitted_context_lines[padding_line.line_number] = true
-        end
-      end
-    end
-
-    local function mark_emitted_context_line(parsed_line)
-      if parsed_line.new_line then emitted_context_lines[parsed_line.new_line] = true end
-    end
-
-    local function add_context_bridge_rows(plan, next_plan)
-      if not (plan and next_plan and type(source_lines) == "table") then return end
-      local previous_old_line, previous_new_line = M._hunk_last_visible_plan_coords(plan, plan.region.context)
-      local next_old_line, next_new_line = M._hunk_first_visible_plan_coords(next_plan, next_plan.region.context)
-      local gap = M._hunk_render_coord_gap(previous_old_line, previous_new_line, next_old_line, next_new_line)
-      if not (gap and gap > 0 and gap <= M._hunk_context_bridge_limit()) then return end
-      if not (previous_new_line and next_new_line and next_new_line > previous_new_line + 1) then return end
-      for line_number = previous_new_line + 1, next_new_line - 1 do
-        if not group.changed_lines[line_number] and not emitted_context_lines[line_number] then
-          ret[#ret + 1] = M._hunk_context_padding_row(
-            line_number,
-            source_lines[line_number] or "",
-            group.gutter,
-            filename or plan.block.file,
-            file_syntax,
-            M._hunk_old_line_for_new_line(plan.block.hunks, line_number),
-            line_number
-          )
-          emitted_context_lines[line_number] = true
-        end
-      end
-    end
-
-    for plan_index, plan in ipairs(group.plans) do
-      local raw_context = plan.region.context
-      if opts.boundary_context and type(raw_context) == "table" then
-        local node_start = raw_context.start_row + 1
-        local start_text = raw_context.start_text or ""
-        local previous_plan = group.plans[plan_index - 1]
-        local start_boundaries = {}
-        for _, boundary in ipairs(raw_context.ancestor_boundaries or {}) do
-          start_boundaries[#start_boundaries + 1] = boundary
-        end
-        start_boundaries[#start_boundaries + 1] = {
-          key = hunk_context_scope_key(raw_context),
-          row = node_start,
-          text = start_text,
-          segments = raw_context.start_segments,
-          selected = true,
-        }
-        for boundary_index, boundary in ipairs(start_boundaries) do
-          local boundary_key = boundary.key
-          local boundary_seen = boundary_key and emitted_start_scope_keys[boundary_key] == true
-          local suppress_boundary_key = boundary_key
-            and opts.suppress_start_boundary_keys
-            and opts.suppress_start_boundary_keys[boundary_key] == true
-          local suppress_start_boundary = (group_index == 1 and plan_index == 1 and opts.suppress_start_boundary)
-            or same_hunk_context_scope(previous_plan and previous_plan.region.context, raw_context)
-            or boundary_seen
-            or suppress_boundary_key
-          local boundary_visible = plan.visible_source_lines[boundary.text] == true
-          local boundary_rendered = false
-          if not suppress_start_boundary
-            and not boundary_visible
-            and not emitted_context_lines[boundary.row] then
-            local boundary_old_line = M._hunk_old_line_for_new_line(plan.block.hunks, boundary.row)
-            local boundary_new_line = boundary.row
-            ret[#ret + 1] = hunk_boundary_row(
-              boundary.text,
-              boundary.segments,
-              boundary.row,
-              group.gutter,
-              filename or plan.block.file,
-              boundary_old_line,
-              boundary_new_line
-            )
-            boundary_rendered = true
-            emitted_context_lines[boundary.row] = true
-            local next_old_line = nil
-            local next_new_line = nil
-            local next_boundary = start_boundaries[boundary_index + 1]
-            if next_boundary then
-              next_old_line = M._hunk_old_line_for_new_line(plan.block.hunks, next_boundary.row)
-              next_new_line = next_boundary.row
-            else
-              next_old_line, next_new_line = M._hunk_first_visible_plan_coords(plan, raw_context)
-            end
-            local adjacent_to_next = M._hunk_render_coords_adjacent(boundary_old_line, boundary_new_line, next_old_line, next_new_line)
-            if not adjacent_to_next then
-              if boundary.selected then
-                local hidden_row, hidden_line = M._hunk_single_hidden_context_gap_row(
-                  source_lines,
-                  plan.block,
-                  boundary_new_line,
-                  next_new_line,
-                  group.changed_lines,
-                  emitted_context_lines,
-                  group.gutter,
-                  filename or plan.block.file,
-                  file_syntax
-                )
-                if hidden_row then
-                  ret[#ret + 1] = hidden_row
-                  emitted_context_lines[hidden_line] = true
-                else
-                  ret[#ret + 1] = hunk_boundary_ellipsis_row(boundary.text, group.gutter)
-                end
-              else
-                ret[#ret + 1] = hunk_boundary_ellipsis_row(boundary.text, group.gutter)
-              end
-            end
-          end
-          if boundary_key and not boundary_seen and (boundary_rendered or boundary_visible) then
-            emitted_start_scope_keys[boundary_key] = true
-          end
-        end
-      end
-      add_context_padding_rows(plan.before_padding_lines, group.gutter, plan.block.file)
-
-      local previous_visible_changed = false
-      local last_visible_new_line = nil
-      for item_index = plan.region.first_item, plan.region.last_item do
-        local item = plan.render_items[item_index]
-        local parsed_line = M._hunk_render_item_line(item)
-        local syntax_entry = plan.syntax_by_item[item_index] or {}
-        local row_syntax = syntax_entry.syntax
-        local row_syntax_row = syntax_entry.row
-        local visible_in_scope = hunk_line_visible_in_context_scope(parsed_line, raw_context)
-        local visible_in_hunk = plan.include_render_line(parsed_line)
-        local context_already_emitted = parsed_line.prefix == " " and parsed_line.new_line and emitted_context_lines[parsed_line.new_line]
-        if item.kind == "replacement" then
-          ret[#ret + 1] = M._hunk_replacement_row(item, group.gutter, filename or plan.block.file, row_syntax, row_syntax_row)
-          for _, backing_line in ipairs(item.diff_lines or {}) do
-            mark_emitted_context_line(backing_line)
-          end
-          last_visible_new_line = parsed_line.new_line
-          previous_visible_changed = true
-        elseif visible_in_hunk and visible_in_scope and not context_already_emitted then
-          ret[#ret + 1] = hunk_body_row(parsed_line, group.gutter, filename or plan.block.file, row_syntax, row_syntax_row)
-          mark_emitted_context_line(parsed_line)
-          last_visible_new_line = parsed_line.new_line
-          previous_visible_changed = parsed_line.prefix == "+" or parsed_line.prefix == "-"
-        elseif M._hunk_hidden_closing_boundary_after_change(parsed_line, previous_visible_changed, raw_context, visible_in_hunk) then
-          local boundary_segments = nil
-          if row_syntax and row_syntax_row then
-            boundary_segments = treesitter_line_segments(row_syntax.buf, row_syntax.tree, row_syntax.highlight_query, row_syntax_row, parsed_line.code)
-          end
-          local previous_line_emitted = parsed_line.new_line and emitted_context_lines[parsed_line.new_line - 1] == true
-          if not previous_line_emitted then
-            local hidden_row, hidden_line = M._hunk_single_hidden_context_gap_row(
-              source_lines,
-              plan.block,
-              last_visible_new_line,
-              parsed_line.new_line,
-              group.changed_lines,
-              emitted_context_lines,
-              group.gutter,
-              filename or plan.block.file,
-              file_syntax
-            )
-            if hidden_row then
-              ret[#ret + 1] = hidden_row
-              emitted_context_lines[hidden_line] = true
-            else
-              ret[#ret + 1] = hunk_boundary_ellipsis_row(parsed_line.code, group.gutter)
-            end
-          end
-          ret[#ret + 1] = hunk_boundary_row(
-            parsed_line.code,
-            boundary_segments,
-            parsed_line.new_line or parsed_line.old_line,
-            group.gutter,
-            filename or plan.block.file,
-            parsed_line.old_line,
-            parsed_line.new_line
-          )
-          mark_emitted_context_line(parsed_line)
-          last_visible_new_line = parsed_line.new_line
-          previous_visible_changed = false
-        end
-      end
-
-      local next_plan = group.plans[plan_index + 1]
-      local after_padding_lines = plan.after_padding_lines
-      if next_plan and next_plan.region.changed_line then
-        after_padding_lines = {}
-        for _, padding_line in ipairs(plan.after_padding_lines or {}) do
-          if padding_line.line_number < next_plan.region.changed_line then after_padding_lines[#after_padding_lines + 1] = padding_line end
-        end
-      end
-      add_context_padding_rows(after_padding_lines, group.gutter, plan.block.file)
-      add_context_bridge_rows(plan, next_plan)
-      if opts.boundary_context and type(raw_context) == "table" then
-        local node_start = raw_context.start_row + 1
-        local node_end = raw_context.end_row + 1
-        local end_text = raw_context.end_text or ""
-        local next_group_plan = next_plan == nil and next_group and next_group.plans and next_group.plans[1] or nil
-        local suppress_end_boundary = next_plan ~= nil
-          or (group_index == #display_groups and plan_index == #group.plans and opts.suppress_end_boundary)
-          or same_hunk_context_scope(raw_context, next_plan and next_plan.region.context)
-          or same_hunk_context_scope(raw_context, next_group_plan and next_group_plan.region.context)
-        if not suppress_end_boundary and not plan.visible_source_lines[end_text] and not emitted_context_lines[node_end] then
-          local boundary_old_line = M._hunk_old_line_for_new_line(plan.block.hunks, node_end)
-          local boundary_new_line = node_end
-          local previous_old_line, previous_new_line = M._hunk_last_visible_plan_coords(plan, raw_context)
-          local adjacent_to_previous = M._hunk_render_coords_adjacent(previous_old_line, previous_new_line, boundary_old_line, boundary_new_line)
-          if node_end ~= node_start and not adjacent_to_previous then
-            local hidden_row, hidden_line = M._hunk_single_hidden_context_gap_row(
-              source_lines,
-              plan.block,
-              previous_new_line,
-              boundary_new_line,
-              group.changed_lines,
-              emitted_context_lines,
-              group.gutter,
-              filename or plan.block.file,
-              file_syntax
-            )
-            if hidden_row then
-              ret[#ret + 1] = hidden_row
-              emitted_context_lines[hidden_line] = true
-            else
-              ret[#ret + 1] = hunk_boundary_ellipsis_row(end_text, group.gutter)
-            end
-          end
-          if node_end ~= node_start then
-            ret[#ret + 1] = hunk_boundary_row(
-              end_text,
-              raw_context.end_segments,
-              node_end,
-              group.gutter,
-              filename or plan.block.file,
-              boundary_old_line,
-              boundary_new_line
-            )
-          end
-        end
-        local ancestor_boundary = M._hunk_context_ancestor_boundary(raw_context)
-        if ancestor_boundary
-          and ancestor_boundary.end_row
-          and ancestor_boundary.end_row ~= node_end then
-          local suppress_ancestor_end = (ancestor_boundary.key ~= nil
-              and opts.suppress_end_boundary_keys
-              and opts.suppress_end_boundary_keys[ancestor_boundary.key] == true)
-            or (next_plan ~= nil and M._hunk_context_ancestor_key(next_plan.region.context) == ancestor_boundary.key)
-            or (next_group_plan ~= nil and M._hunk_context_ancestor_key(next_group_plan.region.context) == ancestor_boundary.key)
-          if not suppress_ancestor_end and not emitted_context_lines[ancestor_boundary.end_row] then
-            local boundary_old_line = M._hunk_old_line_for_new_line(plan.block.hunks, ancestor_boundary.end_row)
-            local boundary_new_line = ancestor_boundary.end_row
-            local previous_old_line, previous_new_line = M._hunk_last_visible_plan_coords(plan, raw_context)
-            local adjacent_to_previous = M._hunk_render_coords_adjacent(previous_old_line, previous_new_line, boundary_old_line, boundary_new_line)
-            if not adjacent_to_previous then
-              local hidden_row, hidden_line = M._hunk_single_hidden_context_gap_row(
-                source_lines,
-                plan.block,
-                previous_new_line,
-                boundary_new_line,
-                group.changed_lines,
-                emitted_context_lines,
-                group.gutter,
-                filename or plan.block.file,
-                file_syntax
-              )
-              if hidden_row then
-                ret[#ret + 1] = hidden_row
-                emitted_context_lines[hidden_line] = true
-              else
-                ret[#ret + 1] = hunk_boundary_ellipsis_row(ancestor_boundary.end_text, group.gutter)
-              end
-            end
-            ret[#ret + 1] = hunk_boundary_row(
-              ancestor_boundary.end_text,
-              ancestor_boundary.end_segments,
-              ancestor_boundary.end_row,
-              group.gutter,
-              filename or plan.block.file,
-              boundary_old_line,
-              boundary_new_line
-            )
-            emitted_context_lines[ancestor_boundary.end_row] = true
-          end
-        end
-      end
-    end
-  end
-
-  ret.diff_review_syntax_pending = syntax_pending
-  ret.diff_review_context_pending = context_pending
-  return ret
-end
 
 ---@param buf integer
 ---@param ns integer
 ---@param rows table[]
-local function render_highlight_rows(buf, ns, rows)
-  local lines = {}
-  local highlights = {}
-  local line_highlights = {}
-  local extmarks = {}
-  local empty_diff_rows = {}
-  local content_lengths = {}
-
-  for row_index, row in ipairs(rows) do
-    local line_parts = {}
-    local col = 0
-    local empty_diff_row = false
-    for _, chunk in ipairs(row) do
-      if chunk.meta and chunk.meta.diff and chunk.meta.diff.code == "" then
-        empty_diff_row = true
-      end
-      if type(chunk[1]) == "string" then
-        local text = chunk[1]
-        line_parts[#line_parts + 1] = text
-        if chunk[2] and text ~= "" then
-          highlights[#highlights + 1] = {
-            line = row_index,
-            start_col = col,
-            end_col = col + #text,
-            hl_group = chunk[2],
-          }
-        end
-        col = col + #text
-      elseif chunk.virt_text then
-        local opts = {}
-        for key, value in pairs(chunk) do
-          if key ~= "col" then opts[key] = value end
-        end
-        extmarks[#extmarks + 1] = {
-          line = row_index,
-          col = chunk.col or 0,
-          opts = opts,
-        }
-      end
-    end
-    lines[row_index] = table.concat(line_parts)
-    if row.diff_review_bg_hl then
-      local content_length
-      lines[row_index], content_length = M._diff_pad_highlighted_line(lines[row_index], buf)
-      content_lengths[row_index] = content_length
-      extmarks[#extmarks + 1] = {
-        line = row_index,
-        col = 0,
-        opts = {
-          end_col = #lines[row_index],
-          hl_group = row.diff_review_bg_hl,
-          priority = 60,
-        },
-      }
-    end
-    for _, inline_highlight in ipairs(row.diff_review_inline_highlights or {}) do
-      highlights[#highlights + 1] = {
-        line = row_index,
-        start_col = inline_highlight.start_col,
-        end_col = inline_highlight.end_col,
-        hl_group = inline_highlight.hl_group,
-        priority = inline_highlight.priority or 110,
-      }
-    end
-    if empty_diff_row then empty_diff_rows[row_index] = true end
-  end
-
-  M._empty_diff_rows = M._empty_diff_rows or {}
-  M._empty_diff_rows[buf] = empty_diff_rows
-  M._diff_line_content_lengths = M._diff_line_content_lengths or {}
-  M._diff_line_content_lengths[buf] = content_lengths
-  M._clear_diff_gutter_visual_line(buf)
-  vim.bo[buf].modifiable = true
-  vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-  vim.bo[buf].modifiable = false
-
-  for _, line_hl in ipairs(line_highlights) do
-    pcall(vim.api.nvim_buf_set_extmark, buf, ns, line_hl.line - 1, 0, {
-      line_hl_group = line_hl.hl_group,
-      priority = 80,
-    })
-  end
-  for _, highlight in ipairs(highlights) do
-    pcall(vim.api.nvim_buf_set_extmark, buf, ns, highlight.line - 1, highlight.start_col, {
-      end_col = highlight.end_col,
-      hl_group = highlight.hl_group,
-      priority = highlight.priority or 90,
-    })
-  end
-  for _, extmark in ipairs(extmarks) do
-    local opts = vim.tbl_extend("force", { priority = 95 }, extmark.opts)
-    pcall(vim.api.nvim_buf_set_extmark, buf, ns, extmark.line - 1, extmark.col, opts)
-  end
-end
 
 --- Render a formatted diff into a buffer using DiffReview's local formatter.
 ---@param buf number
 ---@param diff_text string
 ---@param hunk_staged? boolean[] staged status per hunk (in order)
 ---@param filename? string
-local function render_fancy_diff(buf, diff_text, hunk_staged, filename)
-  local ft = filename and detect_filetype(filename) or ""
-  if ft ~= "" and vim.bo[buf].filetype ~= ft then
-    vim.bo[buf].filetype = ft
-  end
-
-  render_highlight_rows(buf, M._ns, build_fancy_diff_rows(
-    diff_text,
-    hunk_staged,
-    filename,
-    function(hunk_line)
-      return ("diff-buffer:%d:%s:%d"):format(buf, filename or "", hunk_line)
-    end,
-    function()
-      if not (buf and vim.api.nvim_buf_is_valid(buf) and filename) then return end
-      M._buf_last_rendered[buf] = nil
-      M._refresh_diff_buffer(buf, filename)
-    end
-  ))
-end
 
 -- Per-buffer hunk metadata: maps buffer line ranges to raw diff patches
 M._buf_hunks = {}
@@ -4509,7 +2927,7 @@ function M._refresh_diff_buffer(buf, filename)
     end
     M._buf_last_rendered[buf] = diff_text
 
-    render_fancy_diff(buf, diff_text, staged_flags, filename)
+    diff_render.render_fancy_diff(buf, diff_text, staged_flags, filename)
     local hunk_map = M._compute_hunk_map(diff_text)
     -- Auto-fold staged hunks
     if staged_flags then
@@ -5592,41 +4010,21 @@ end
 
 
 ---@return DiffReviewStatusKeymapConfig
-local function status_keymap_config()
-  local options = M.config or config.options or config.defaults
-  local keymaps = options.keymaps or config.defaults.keymaps
-  return vim.tbl_deep_extend("force", vim.deepcopy(config.defaults.keymaps.status), keymaps.status or {})
-end
 
 ---@param spec DiffReviewStatusCommandSpec
 ---@return boolean
-local function status_command_visible(spec)
-  local view_kind = M._status and M._status.view_kind or "status"
-  return M._status_command_visible_for_view(spec, view_kind)
-end
 
 ---@param spec DiffReviewStatusCommandSpec
 ---@param view_kind DiffReviewStatusViewKind
 ---@return boolean
-function M._status_command_visible_for_view(spec, view_kind)
-  return not spec.views or spec.views[view_kind] == true
-end
 
 ---@param command_id string
 ---@return string[]
-local function status_keys_for(command_id)
-  local spec = status_command_specs_by_id[command_id]
-  local keymaps = spec and spec.keymap == "review" and M._review.keymap_config() or status_keymap_config()
-  local key = keymaps[command_id]
-  if key == false or key == nil then return {} end
-  if type(key) == "table" then return key end
-  return { key }
-end
 
 ---@param command_id string
 ---@return string
 local function status_primary_key(command_id)
-  return status_keys_for(command_id)[1] or ""
+  return keymaps.status_keys_for(command_id)[1] or ""
 end
 
 ---@param keys string[]
@@ -5637,92 +4035,18 @@ end
 
 ---@param state? table
 ---@return table[]
-function M._status_hint_segments(state)
-  local view_kind = state and state.view_kind or (M._status and M._status.view_kind) or "status"
-  local segments = {}
-  local first = true
-  local hint_command_ids = M._status_hint_command_ids_by_view[view_kind] or M._status_hint_command_ids_by_view.status
-  for _, command_id in ipairs(hint_command_ids) do
-    local spec = status_command_specs_by_id[command_id]
-    if spec and spec.pinned and M._status_command_visible_for_view(spec, view_kind) then
-      local key = status_primary_key(spec.id)
-      if key ~= "" then
-        if not first then
-          segments[#segments + 1] = { " | ", "DiffReviewStatusHint" }
-        end
-        first = false
-        segments[#segments + 1] = { key, "DiffReviewStatusHintKey" }
-        segments[#segments + 1] = { " " .. spec.label, "DiffReviewStatusHint" }
-      end
-    end
-  end
-  return segments
-end
 
 ---@param state table
 ---@return string
-function M._status_hint_title(state)
-  local view_kind = state.view_kind or "status"
-  local options = M.config or config.options or config.defaults
-  if view_kind == "pr" then
-    local number = state.pr and state.pr.number
-    return number and ("PR #" .. tostring(number)) or options.pr_buffer_name
-  end
-  if view_kind == "review" then
-    local number = state.pr and state.pr.number
-    return number and ("Review #" .. tostring(number)) or "Review"
-  end
-  if view_kind == "diff" then
-    return state.diff_file and "GitBranchDiffFile" or "GitBranchDiff"
-  end
-  return options.status_buffer_name or config.defaults.status_buffer_name or "GitStatus"
-end
 
 ---@param segments table[]
 ---@param title string
 ---@return string
-function M._status_hint_winbar(segments, title)
-  local parts = { ("%%#DiffReviewStatusLabel#%s%%*"):format(tostring(title or ""):gsub("%%", "%%%%")) }
-  if #segments > 0 then
-    parts[#parts + 1] = "%="
-  end
-  for _, segment in ipairs(segments) do
-    local text = tostring(segment[1] or ""):gsub("%%", "%%%%")
-    local highlight = segment[2]
-    if highlight and text ~= "" then
-      parts[#parts + 1] = ("%%#%s#%s%%*"):format(highlight, text)
-    else
-      parts[#parts + 1] = text
-    end
-  end
-  return table.concat(parts)
-end
 
 ---@param buf integer
 ---@param win? integer
-function M._status_apply_hint_bar(buf, win)
-  local state = M._status_states and M._status_states[buf] or (M._status and M._status.buf == buf and M._status) or nil
-  if not state then return end
-  local winbar = M._status_hint_winbar(M._status_hint_segments(state), M._status_hint_title(state))
-  if win then
-    if vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == buf then
-      vim.wo[win].winbar = winbar
-    end
-    return
-  end
-  for _, status_win in ipairs(vim.fn.win_findbuf(buf)) do
-    if vim.api.nvim_win_is_valid(status_win) then
-      vim.wo[status_win].winbar = winbar
-    end
-  end
-end
 
 ---@param win integer
-function M._status_clear_hint_bar(win)
-  if vim.api.nvim_win_is_valid(win) then
-    vim.wo[win].winbar = ""
-  end
-end
 
 local function status_add_fancy_row(row, entry, indent)
   return status_buffer.add_fancy_row(M._status, row, entry, indent)
@@ -6665,16 +4989,6 @@ local status_request_reconcile
 
 ---@param entry_kind? string
 ---@return "file"|"diff"
-function M._status_syntax_source_for_entry_kind(entry_kind)
-  if entry_kind == nil
-    or entry_kind == "file"
-    or entry_kind == "hunk"
-    or entry_kind == "pr_file"
-    or entry_kind == "pr_hunk" then
-    return "file"
-  end
-  return "diff"
-end
 
 ---@param file DiffReviewStatusFile
 ---@param hunk DiffReviewHunk
@@ -6682,292 +4996,6 @@ end
 ---@param next_hunk? DiffReviewHunk
 ---@param entry_kind? "hunk"|"commit_hunk"|"pr_hunk"|"pr_review_hunk"
 ---@param hunk_key_override? string
-local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_kind, hunk_key_override)
-  return M._status_perf_span("status.render_hunk", M._status and M._status.buf or nil, {
-    file = file and file.filename or nil,
-    relpath = file and file.relpath or nil,
-    entry_kind = entry_kind,
-    hunk_pos = hunk and hunk.pos or nil,
-    hunk_added = hunk and hunk.added or nil,
-    hunk_removed = hunk and hunk.removed or nil,
-    diff_len = hunk and #(hunk.diff or "") or nil,
-  }, function()
-  local hunk_key = hunk_key_override or status_hunk_key(file.section_name, file.filename, hunk.diff)
-  local hunk_folded = status_folded(hunk_key, false)
-  local entry = { id = hunk_key, kind = entry_kind or "hunk", file = file, hunk = hunk, default_folded = false }
-  if hunk_folded then
-    local header = ("%s@@ +%d -%d"):format(string.rep(" ", status_hunk_indent), hunk.added or 0, hunk.removed or 0)
-    local start_line = status_add_line(header, entry, "DiffReviewActiveHunkHeader")
-    M._status_register_fold_range(hunk_key, start_line, #M._status.lines, false, M._status.lines[start_line])
-    return
-  end
-  M._status.fancy_rows = M._status.fancy_rows or {}
-  local rows_key
-  local context_line = M._status_hunk_context_line(hunk) or hunk.pos
-  local previous_context_line = previous_hunk and M._status_hunk_context_line(previous_hunk) or nil
-  local next_context_line = next_hunk and M._status_hunk_context_line(next_hunk) or nil
-  local syntax_source = M._status_syntax_source_for_entry_kind(entry_kind)
-  local syntax_diff_text = nil
-  if syntax_source == "file" then
-    syntax_diff_text = M._status_perf_span("status.render_hunk.syntax_diff_text", M._status and M._status.buf or nil, {
-      file = file.filename,
-      hunk_key = hunk_key,
-      entry_kind = entry_kind,
-    }, function()
-      return M._status_file_syntax_diff_text(file)
-    end)
-  end
-  local require_file_match_for_context = entry_kind == "pr_hunk" or entry_kind == "pr_review_hunk"
-  local semantic_context_enabled = true
-  if require_file_match_for_context then
-    semantic_context_enabled = syntax_diff_text ~= nil and M._status_perf_span("status.render_hunk.new_side_matches_file", M._status and M._status.buf or nil, {
-      file = file.filename,
-      hunk_key = hunk_key,
-      entry_kind = entry_kind,
-      diff_len = #(syntax_diff_text or ""),
-    }, function()
-      return M._diff_new_side_matches_file(file.filename, syntax_diff_text)
-    end)
-  end
-  local function rerender_with_context()
-    M._status = M._status or {}
-    if M._status.context_rerender_pending then return end
-    M._status.context_rerender_pending = true
-    vim.schedule(function()
-      if not M._status then return end
-      M._status.context_rerender_pending = false
-      M._status.fancy_rows = {}
-      local buf = M._status.buf
-      if buf and vim.api.nvim_buf_is_valid(buf) then
-        if status_operations_pending() then return end
-        local target_id, fallback_line = status_cursor_target(buf)
-        M.render_status(buf, target_id, fallback_line, { reuse_sections = true })
-      end
-    end)
-  end
-  local current_context = nil
-  local previous_context = nil
-  local next_context = nil
-  if semantic_context_enabled then
-    M._status_perf_span("status.render_hunk.context_lookup", M._status and M._status.buf or nil, {
-      file = file.filename,
-      hunk_key = hunk_key,
-      context_line = context_line,
-      previous_context_line = previous_context_line,
-      next_context_line = next_context_line,
-    }, function()
-      current_context = cached_hunk_context(
-        file.filename,
-        context_line,
-        "status-neighbor:" .. hunk_key .. ":current",
-        rerender_with_context
-      )
-      previous_context = previous_hunk and cached_hunk_context(
-        file.filename,
-        previous_context_line or previous_hunk.pos,
-        "status-neighbor:" .. hunk_key .. ":previous",
-        rerender_with_context
-      ) or nil
-      next_context = next_hunk and cached_hunk_context(
-        file.filename,
-        next_context_line or next_hunk.pos,
-        "status-neighbor:" .. hunk_key .. ":next",
-        rerender_with_context
-      ) or nil
-    end)
-  end
-  local suppress_start_boundary = same_hunk_context_scope(previous_context, current_context)
-  local suppress_end_boundary = same_hunk_context_scope(current_context, next_context)
-  local current_ancestor_key = M._hunk_context_ancestor_key(current_context)
-  local suppress_ancestor_start = current_ancestor_key ~= nil and M._same_hunk_ancestor_scope(previous_context, current_context)
-  local suppress_ancestor_end = current_ancestor_key ~= nil and M._same_hunk_ancestor_scope(current_context, next_context)
-  local suppress_start_boundary_keys = suppress_ancestor_start and { [current_ancestor_key] = true } or nil
-  local suppress_end_boundary_keys = suppress_ancestor_end and { [current_ancestor_key] = true } or nil
-  local syntax_hash = M._status_perf_span("status.render_hunk.rows_key_sha256", M._status and M._status.buf or nil, {
-    file = file.filename,
-    hunk_key = hunk_key,
-    diff_len = #(syntax_diff_text or hunk.diff or ""),
-  }, function()
-    return vim.fn.sha256(syntax_diff_text or hunk.diff or "")
-  end)
-  rows_key = ("%s:%s:%s:%s:%s:%s:%s"):format(
-    hunk_key,
-    hunk.staged and "staged" or "unstaged",
-    suppress_start_boundary and "no-start" or "start",
-    suppress_end_boundary and "no-end" or "end",
-    suppress_ancestor_start and "no-ancestor-start" or "ancestor-start",
-    suppress_ancestor_end and "no-ancestor-end" or "ancestor-end",
-    syntax_source .. ":compact:" .. syntax_hash
-  )
-  local debug_context = nil
-  if M._gitstatus_debug.enabled() then
-    local view_kind = M._status and M._status.view_kind or nil
-    if view_kind == "pr" or entry_kind == "pr_hunk" or entry_kind == "pr_review_hunk" then
-      local source_lines = M._file_source_lines(file.filename)
-      local new_side_matches_file = nil
-      if syntax_diff_text then
-        new_side_matches_file = semantic_context_enabled
-      end
-      debug_context = {
-        view_kind = view_kind,
-        entry_kind = entry_kind or "hunk",
-        buf = M._status and M._status.buf or nil,
-        file = file.filename,
-        relpath = file.relpath,
-        section = file.section_name,
-        hunk_key = hunk_key,
-        rows_key = rows_key,
-        hunk_pos = hunk.pos,
-        hunk_added = hunk.added,
-        hunk_removed = hunk.removed,
-        hunk_staged = hunk.staged,
-        hunk_len = #(hunk.diff or ""),
-        syntax_source = syntax_source,
-        syntax_diff_len = syntax_diff_text and #syntax_diff_text or nil,
-        new_side_matches_file = new_side_matches_file,
-        semantic_context_enabled = semantic_context_enabled,
-        source_line_count = type(source_lines) == "table" and #source_lines or nil,
-        source_readable = vim.fn.filereadable(file.filename) == 1,
-        context_line = context_line,
-        previous_context_line = previous_context_line,
-        next_context_line = next_context_line,
-        suppress_start_boundary = suppress_start_boundary,
-        suppress_end_boundary = suppress_end_boundary,
-        suppress_ancestor_start = suppress_ancestor_start,
-        suppress_ancestor_end = suppress_ancestor_end,
-      }
-      M._gitstatus_debug.event("status_render_hunk.before", debug_context)
-    end
-  end
-  local rows = M._status.fancy_rows[rows_key]
-  if rows and debug_context then
-    M._gitstatus_debug.event("status_render_hunk.cache_hit", {
-      context = debug_context,
-      row_count = #rows,
-      syntax_pending = rows.diff_review_syntax_pending,
-      context_pending = rows.diff_review_context_pending,
-      preview = M._gitstatus_debug.row_preview(rows, 8),
-    })
-  end
-  if not rows then
-    local ok, built_rows = M._status_perf_span("status.render_hunk.build_fancy_rows", M._status and M._status.buf or nil, {
-      file = file.filename,
-      hunk_key = hunk_key,
-      rows_key = rows_key,
-      diff_len = #(hunk.diff or ""),
-      syntax_source = syntax_source,
-      syntax_diff_len = syntax_diff_text and #syntax_diff_text or nil,
-    }, function()
-      return pcall(
-        build_fancy_diff_rows,
-        hunk.diff,
-        { hunk.staged },
-        file.filename,
-        function(hunk_line)
-          return ("status:%s:%d"):format(rows_key, hunk_line)
-        end,
-        rerender_with_context,
-        {
-          context_line = context_line,
-          boundary_context = true,
-          suppress_start_boundary = suppress_start_boundary,
-          suppress_end_boundary = suppress_end_boundary,
-          suppress_start_boundary_keys = suppress_start_boundary_keys,
-          suppress_end_boundary_keys = suppress_end_boundary_keys,
-          syntax_source = syntax_source,
-          syntax_diff_text = syntax_diff_text,
-          fallback_syntax_diff_text = hunk.fallback_syntax_diff_text,
-          old_syntax_row_offset = hunk.old_syntax_row_offset,
-          new_syntax_row_offset = hunk.new_syntax_row_offset,
-          compact_replacements = true,
-          require_file_match_for_context = require_file_match_for_context,
-          debug_context = debug_context,
-        }
-      )
-    end)
-    if debug_context then
-      M._gitstatus_debug.event("status_render_hunk.built", {
-        context = debug_context,
-        ok = ok,
-        error = ok and nil or tostring(built_rows),
-        row_count = ok and type(built_rows) == "table" and #built_rows or nil,
-        syntax_pending = ok and type(built_rows) == "table" and built_rows.diff_review_syntax_pending or nil,
-        context_pending = ok and type(built_rows) == "table" and built_rows.diff_review_context_pending or nil,
-        preview = ok and M._gitstatus_debug.row_preview(built_rows, 8) or nil,
-      })
-    end
-    if ok then
-      rows = built_rows
-      M._status.lazy_hunk_render_pending = rows.diff_review_syntax_pending or rows.diff_review_context_pending or nil
-      if not rows.diff_review_syntax_pending and not rows.diff_review_context_pending then
-        M._status.fancy_rows[rows_key] = rows
-      end
-    end
-  end
-  if not rows then
-    if debug_context then
-      M._gitstatus_debug.event("status_render_hunk.fallback", {
-        context = debug_context,
-      })
-    end
-    local ts_context = current_context
-    if semantic_context_enabled and not ts_context then
-      ts_context = cached_hunk_context(file.filename, context_line, "status-fallback:" .. hunk_key, rerender_with_context)
-    end
-    local header = ("%s@@ +%d -%d"):format(string.rep(" ", status_hunk_indent), hunk.added or 0, hunk.removed or 0)
-    local visible_hunk_lines = nil
-    local node_start = nil
-    local node_end = nil
-    local start_text = nil
-    local end_text = nil
-    if type(ts_context) == "table" then
-      visible_hunk_lines = M._status_perf_span("status.render_hunk.visible_source_lines", M._status and M._status.buf or nil, {
-        file = file.filename,
-        hunk_key = hunk_key,
-        diff_len = #(hunk.diff or ""),
-      }, function()
-        return hunk_visible_source_lines(hunk.diff)
-      end)
-      node_start = ts_context.start_row + 1
-      node_end = ts_context.end_row + 1
-      start_text = ts_context.start_text or ""
-      end_text = ts_context.end_text or ""
-    end
-    local start_line = status_add_line(header, entry, hunk_folded and "DiffReviewActiveHunkHeader" or "DiffReviewHunkHeader")
-    if visible_hunk_lines and node_start and node_end and end_text then
-      if not suppress_start_boundary and not visible_hunk_lines[start_text] then
-        status_add_fancy_row(hunk_boundary_row(start_text, ts_context.start_segments, node_start), nil, status_hunk_indent)
-        if node_start ~= node_end then
-          status_add_fancy_row(hunk_boundary_ellipsis_row(start_text), nil, status_hunk_indent)
-        end
-      end
-      if not suppress_end_boundary and not visible_hunk_lines[end_text] and node_end ~= node_start then
-        status_add_fancy_row(hunk_boundary_ellipsis_row(end_text), nil, status_hunk_indent)
-        status_add_fancy_row(hunk_boundary_row(end_text, ts_context.end_segments, node_end), nil, status_hunk_indent)
-      end
-    end
-    M._status_register_fold_range(hunk_key, start_line, #M._status.lines, false, M._status.lines[start_line])
-    return
-  end
-
-  local start_line = #M._status.lines + 1
-  local fold_text = nil
-  M._status_perf_span("status.render_hunk.emit_rows", M._status and M._status.buf or nil, {
-    file = file.filename,
-    hunk_key = hunk_key,
-    row_count = #rows,
-  }, function()
-    for row_index = 1, #rows do
-      local row = rows[row_index]
-      if row then
-        local line = status_add_fancy_row(row, entry, status_hunk_indent)
-        if row.diff_review_hunk_header then fold_text = M._status.lines[line] end
-      end
-    end
-  end)
-  M._status_register_fold_range(hunk_key, start_line, #M._status.lines, false, fold_text or M._status.lines[start_line])
-  end)
-end
 
 ---@param diff_line string?
 ---@return boolean
@@ -7738,112 +5766,6 @@ end
 ---@param file_key_override? string
 ---@param hunk_key_builder? fun(hunk: DiffReviewHunk): string
 ---@param opts? { force_open?: boolean, default_open?: boolean }
-local function status_render_file(file, entry_kind, hunk_entry_kind, file_key_override, hunk_key_builder, opts)
-  return M._status_perf_span("status.render_file", M._status and M._status.buf or nil, {
-    file = file and file.filename or nil,
-    relpath = file and file.relpath or nil,
-    entry_kind = entry_kind,
-    hunk_entry_kind = hunk_entry_kind,
-    force_open = opts and opts.force_open or nil,
-    default_open = opts and opts.default_open or nil,
-  }, function()
-  opts = opts or {}
-  local file_key = file_key_override or status_file_key(file.section_name, file.filename)
-  local default_folded = not (opts.default_open or opts.force_open)
-  local stats, stat_segments = M._status_file_stat_text_and_segments(file)
-  local change_label, change_label_hl = M._status_file_change_label(file)
-  local change_label_width = #"Modified"
-  local padded_change_label = change_label .. string.rep(" ", math.max(0, change_label_width - #change_label))
-  local line = ("%s%s %s %s"):format(string.rep(" ", status_file_indent), padded_change_label, file.relpath, stats)
-  local entry = { id = file_key, kind = entry_kind or "file", file = file, default_folded = default_folded }
-  local line_number = status_add_line(line, entry)
-  local label_start = status_file_indent
-  local label_end = label_start + #change_label
-  local path_start = label_start + #padded_change_label + 1
-  local stats_start = #line - #stats
-  status_add_highlight(line_number, label_start, label_end, change_label_hl)
-  status_add_highlight(line_number, path_start, stats_start - 1, "DiffReviewStatusPath")
-  for _, stat_segment in ipairs(stat_segments) do
-    status_add_highlight(
-      line_number,
-      stats_start + stat_segment.start_col,
-      stats_start + stat_segment.end_col,
-      stat_segment.hl_group
-    )
-  end
-
-  local file_folded = (not opts.force_open) and status_folded(file_key, default_folded)
-  local render_folded_file_body = false
-  if file_folded and M._status and M._status.view_kind == "status" then
-    local walkthrough = package.loaded["diff_review.walkthrough"]
-    render_folded_file_body = walkthrough and walkthrough._modes and walkthrough._modes[M._status.buf] ~= nil
-  end
-  M._status_record_diff_file_header_state(file, entry_kind, hunk_entry_kind, file_key)
-  if file_folded and not render_folded_file_body then
-    M._status_register_fold_range(file_key, line_number, #M._status.lines, default_folded, M._status.lines[line_number])
-    return
-  end
-
-  local hunks = M._status_perf_span("status.render_file.hunks", M._status and M._status.buf or nil, {
-    file = file.filename,
-    relpath = file.relpath,
-    entry_kind = entry_kind,
-  }, function()
-    return status_diff_hunks_for_file(file)
-  end)
-  if #hunks == 0 then
-    status_add_line(string.rep(" ", status_hunk_indent) .. "No textual diff", entry, "Comment")
-    M._status_register_fold_range(file_key, line_number, #M._status.lines, default_folded, M._status.lines[line_number])
-    return
-  end
-  local display_hunks = M._status_perf_span("status.render_file.display_hunks", M._status and M._status.buf or nil, {
-    file = file.filename,
-    relpath = file.relpath,
-    hunk_count = #hunks,
-  }, function()
-    return M._status_display_hunks(hunks)
-  end)
-  M._status_record_diff_file_state(file, hunks, display_hunks, entry_kind, hunk_entry_kind, file_key)
-  M._status_perf_span("status.render_file.render_hunks", M._status and M._status.buf or nil, {
-    file = file.filename,
-    relpath = file.relpath,
-    hunk_count = #hunks,
-    display_hunk_count = #display_hunks,
-  }, function()
-    local render_budget = M._status_file_render_row_budget()
-    local forced_hunks = M._status_file_forced_hunk_count(file_key)
-    local body_start_line = #M._status.lines
-    for hunk_index, hunk in ipairs(display_hunks) do
-      -- Size gate: keep the first hunk and any force-loaded hunks, then stop once the
-      -- budget is reached or the next hunk would overshoot it, so one giant merged hunk
-      -- cannot freeze the render. The deferred hunks load through the load-more row.
-      if render_budget then
-        local rendered_rows = #M._status.lines - body_start_line
-        local next_estimate = M._status_lazy_hunk_estimate(file, hunk)
-        if M._status_size_gate_should_defer(rendered_rows, next_estimate, hunk_index, forced_hunks, render_budget) then
-          local remaining = #display_hunks - hunk_index + 1
-          status_add_line(
-            string.rep(" ", status_hunk_indent) .. ("… %d more change blocks — press <CR>/o to load"):format(remaining),
-            {
-              kind = "load_more",
-              file = file,
-              file_key = file_key,
-              load_more_from = hunk_index,
-              entry_kind = entry_kind,
-              hunk_entry_kind = hunk_entry_kind,
-            },
-            "DiffReviewStatusFetching"
-          )
-          break
-        end
-      end
-      local hunk_key = hunk_key_builder and hunk_key_builder(hunk) or status_hunk_key(file.section_name, file.filename, hunk.diff)
-      status_render_hunk(file, hunk, display_hunks[hunk_index - 1], display_hunks[hunk_index + 1], hunk_entry_kind, hunk_key)
-    end
-  end)
-  M._status_register_fold_range(file_key, line_number, #M._status.lines, default_folded, M._status.lines[line_number])
-  end)
-end
 
 
 
@@ -7863,146 +5785,8 @@ end
 
 ---@param commit DiffReviewStatusCommit
 ---@param date_width integer
-local function status_render_commit(commit, date_width)
-  local commit_key = status_commit_key(commit.oid)
-  local line = commit.short_oid
-  local date_text = status_commit_relative_date(commit)
-  local date_start_col = nil
-  if date_text then
-    line = line .. "  "
-    date_start_col = #line
-    line = line .. date_text
-    if date_width > #date_text then line = line .. string.rep(" ", date_width - #date_text) end
-  end
-  local suffix = commit.subject or ""
-  local suffix_start_col = nil
-  if suffix ~= "" then
-    suffix_start_col = #line + 1
-    line = line .. " " .. suffix
-  end
-  local entry = {
-    id = commit_key,
-    kind = "commit",
-    commit = commit,
-    default_folded = true,
-    commit_subject_start_col = suffix_start_col,
-    commit_subject_end_col = suffix_start_col and (suffix_start_col + #suffix) or nil,
-  }
-  M._status_register_commit_source_handle(commit)
-  local line_number = status_add_line(line, entry)
-  status_add_highlight(line_number, 0, #commit.short_oid, "DiffReviewStatusObjectId")
-  if date_start_col then
-    status_add_highlight(line_number, date_start_col, date_start_col + #date_text, "DiffReviewStatusDate")
-  end
-  local conventional_type_end = M._status_conventional_commit_type_end(suffix)
-  if suffix_start_col and conventional_type_end then
-    status_add_highlight(line_number, suffix_start_col, suffix_start_col + conventional_type_end, "DiffReviewStatusCommitType")
-  end
-
-  if status_folded(commit_key, true) then
-    M._status_register_fold_range(commit_key, line_number, #M._status.lines, true, M._status.lines[line_number])
-    return
-  end
-
-  if commit.files_loading then
-    status_add_line("...loading...", entry, "DiffReviewStatusFetching")
-    M._status_register_fold_range(commit_key, line_number, #M._status.lines, true, M._status.lines[line_number])
-    return
-  end
-  if commit.files_error then
-    status_add_line(commit.files_error, entry, "ErrorMsg")
-    M._status_register_fold_range(commit_key, line_number, #M._status.lines, true, M._status.lines[line_number])
-    return
-  end
-  if not commit.files_loaded then
-    status_add_line("...loading...", entry, "DiffReviewStatusFetching")
-    M._status_register_fold_range(commit_key, line_number, #M._status.lines, true, M._status.lines[line_number])
-    return
-  end
-  if #(commit.files or {}) == 0 then
-    status_add_line("No textual diff", entry, "Comment")
-    M._status_register_fold_range(commit_key, line_number, #M._status.lines, true, M._status.lines[line_number])
-    return
-  end
-
-  for _, file in ipairs(commit.files or {}) do
-    status_render_file(
-      file,
-      "commit_file",
-      "commit_hunk",
-      status_commit_file_key(commit.oid, file.filename),
-      function(hunk)
-        return status_commit_hunk_key(commit.oid, file.filename, hunk.diff)
-      end
-    )
-  end
-  M._status_register_fold_range(commit_key, line_number, #M._status.lines, true, M._status.lines[line_number])
-end
 
 ---@param section DiffReviewStatusSection
-local function status_render_section(section)
-  return M._status_perf_span("status.render_section", M._status and M._status.buf or nil, {
-    section = section and section.name or nil,
-    title = section and section.title or nil,
-    file_count = section and section.files and #section.files or nil,
-    commit_count = section and section.commits and #section.commits or nil,
-    review_count = section and section.reviews and #section.reviews or nil,
-    issue_comment_count = section and section.issue_comments and #section.issue_comments or nil,
-  }, function()
-  local section_key = status_section_key(section.name)
-  local line = M._status_section_heading_text(section.title, M._status_section_count(section))
-  local section_default_folded = section.default_folded
-  local entry = { id = section_key, kind = "section", section = section, default_folded = section_default_folded }
-  local line_number = status_add_line(line, entry, "DiffReviewStatusHeader")
-  local section_folded = status_folded(section_key, section_default_folded)
-  local render_folded_commit_headers = M._status and M._status.view_kind == "status"
-  if section.commits and (not section_folded or render_folded_commit_headers) then
-    local date_width = 0
-    for _, commit in ipairs(section.commits) do
-      local date_text = status_commit_relative_date(commit)
-      if date_text and #date_text > date_width then date_width = #date_text end
-    end
-    for _, commit in ipairs(section.commits) do
-      status_render_commit(commit, date_width)
-    end
-    M._status_register_fold_range(section_key, line_number, #M._status.lines, section_default_folded, M._status.lines[line_number])
-    return
-  end
-  if section_folded then
-    M._status_register_fold_range(section_key, line_number, #M._status.lines, section_default_folded, M._status.lines[line_number])
-    return
-  end
-  if section.issue_comments then
-    M._pr_overview.render_issue_comments(section.issue_comments)
-    M._status_register_fold_range(section_key, line_number, #M._status.lines, section.default_folded, M._status.lines[line_number])
-    return
-  end
-  if section.reviews then
-    local alignment = M._pr_overview.review_summary_alignment(section.reviews)
-    for _, review in ipairs(section.reviews) do
-      M._pr_overview.render_review(review, alignment)
-    end
-    M._status_register_fold_range(section_key, line_number, #M._status.lines, section.default_folded, M._status.lines[line_number])
-    return
-  end
-  for _, file in ipairs(section.files) do
-    if section.file_key_prefix then
-      status_render_file(
-        file,
-        section.file_entry_kind or "file",
-        section.hunk_entry_kind or "hunk",
-        status_provider_file_key(section.file_key_prefix, file.filename),
-        function(hunk)
-          return status_provider_hunk_key(section.file_key_prefix, file.filename, hunk.diff)
-        end
-      )
-    else
-      status_render_file(file)
-    end
-  end
-  M._status_register_fold_range(section_key, line_number, #M._status.lines, section.default_folded, M._status.lines[line_number])
-  end)
-end
 
 ---@param commit DiffReviewStatusCommit
 local function status_load_commit_files(commit)
@@ -8169,7 +5953,7 @@ local function status_prewarm_entry_syntax(entry)
     if not entry then return end
     if M._status_entry_is_file_like(entry) and entry.file then
       local syntax_source = M._status_syntax_source_for_entry_kind(entry.kind)
-      prewarm_file_diff_syntax(entry.file, "status-cursor-prewarm:" .. (entry.id or entry.file.filename), nil, { syntax_source = syntax_source })
+      syntax_engine.prewarm_file_diff_syntax(entry.file, "status-cursor-prewarm:" .. (entry.id or entry.file.filename), nil, { syntax_source = syntax_source })
     elseif M._status_entry_is_hunk_like(entry) and entry.file and entry.hunk then
       local callback_key = "status-cursor-prewarm:" .. (entry.id or entry.file.filename)
       local syntax_source = M._status_syntax_source_for_entry_kind(entry.kind)
@@ -8218,27 +6002,6 @@ end
 ---@param buf integer
 ---@param first_row integer 1-based
 ---@param last_row integer 1-based
-function M._status_decorate_visible(buf, first_row, last_row)
-  local status = M._status_states and M._status_states[buf] or nil
-  if not (status and status.entries) then return end
-  if (M.config or config.options or config.defaults).status_cursor_prewarm == false then return end
-  first_row = math.max(1, math.floor(tonumber(first_row) or 1))
-  last_row = math.max(first_row, math.floor(tonumber(last_row) or first_row))
-  local saved = M._status
-  M._status = status
-  local seen = {}
-  for row = first_row, last_row do
-    local entry = status.entries[row]
-    if entry and (M._status_entry_is_file_like(entry) or M._status_entry_is_hunk_like(entry)) then
-      local key = entry.id or (entry.file and entry.file.filename) or tostring(row)
-      if not seen[key] then
-        seen[key] = true
-        status_prewarm_entry_syntax(entry)
-      end
-    end
-  end
-  M._status = saved
-end
 
 --- Debounce a visible-window syntax prewarm so the redraw callback never works inline.
 ---@param buf integer
@@ -8268,25 +6031,6 @@ end
 ---@param row integer 0-based buffer row
 ---@param spans DiffReviewRowSpans?
 ---@param ephemeral boolean?
-function M._status_emit_row_spans(buf, namespace, row, spans, ephemeral)
-  if not spans then return end
-  if spans.bg then
-    pcall(vim.api.nvim_buf_set_extmark, buf, namespace, row, 0, {
-      end_col = spans.bg.end_col,
-      hl_group = spans.bg.hl_group,
-      priority = spans.bg.priority or 60,
-      ephemeral = ephemeral or nil,
-    })
-  end
-  for _, highlight in ipairs(spans.highlights or {}) do
-    pcall(vim.api.nvim_buf_set_extmark, buf, namespace, row, highlight.start_col, {
-      end_col = highlight.end_col,
-      hl_group = highlight.hl_group,
-      priority = highlight.priority or 90,
-      ephemeral = ephemeral or nil,
-    })
-  end
-end
 
 --- Apply a buffer row range's diff decoration into the decorate namespace as
 --- persistent marks, for the test seam and non-redraw refreshes.
@@ -8295,46 +6039,10 @@ end
 ---@param first_row integer? 1-based inclusive
 ---@param last_row integer? 1-based inclusive
 ---@return table<integer, DiffReviewRowSpans>
-function M._status_decorate_rows(buf, first_row, last_row)
-  local status = M._status_states and M._status_states[buf] or M._status
-  local applied = {}
-  if not (status and status.diff_row_spans) then return applied end
-  local count = vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_buf_line_count(buf) or 0
-  first_row = math.max(1, math.floor(tonumber(first_row) or 1))
-  last_row = math.min(count > 0 and count or last_row or first_row, math.floor(tonumber(last_row) or count))
-  pcall(vim.api.nvim_buf_clear_namespace, buf, M._status_decorate_ns, first_row - 1, last_row)
-  for line = first_row, last_row do
-    local spans = status.diff_row_spans[line]
-    if spans then
-      M._status_emit_row_spans(buf, M._status_decorate_ns, line - 1, spans, false)
-      applied[line] = spans
-    end
-  end
-  return applied
-end
 
 --- Register the global diff decoration provider once so diff-body decoration
 --- (syntax/gutter/intraline/bg) is emitted ephemerally for visible rows only.
 --- Skip non-status windows so unrelated redraws stay cheap.
-function M._status_register_decoration_provider()
-  if M._status_decoration_registered then return end
-  M._status_decoration_registered = true
-  vim.api.nvim_set_decoration_provider(M._status_decorate_ns, {
-    on_win = function(_, _, win_buf, toprow, botrow)
-      local status = M._status_states and M._status_states[win_buf] or nil
-      if not status then return false end
-      M._status_schedule_decorate_visible(win_buf, toprow + 1, botrow + 1)
-      return true
-    end,
-    on_line = function(_, _, win_buf, row)
-      local status = M._status_states and M._status_states[win_buf] or nil
-      local spans = status and status.diff_row_spans and status.diff_row_spans[row + 1] or nil
-      if spans then
-        M._status_emit_row_spans(win_buf, M._status_decorate_ns, row, spans, true)
-      end
-    end,
-  })
-end
 
 ---@param buf integer
 local function status_defer_prewarm_under_cursor(buf)
@@ -8369,21 +6077,6 @@ end
 
 local status_files_from_set
 
----@param entry DiffReviewStatusEntry?
----@return string[]
-local function status_files_for_entry(entry)
-  if not entry then return {} end
-  if M._status_entry_is_hunk_like(entry) and entry.file then return { entry.file.filename } end
-  if M._status_entry_is_file_like(entry) and entry.file then return { entry.file.filename } end
-  if entry.kind == "section" then
-    local files = {}
-    for _, file in ipairs(entry.section.files or {}) do
-      files[#files + 1] = file.filename
-    end
-    return files
-  end
-  return {}
-end
 
 ---@param start_line integer
 ---@param end_line integer
@@ -9229,39 +6922,8 @@ end
 
 
 ---@param buf integer
-function M._status_write_rendered_buffer(buf)
-  local was_rendering = vim.b[buf].diff_review_status_rendering
-  vim.b[buf].diff_review_status_rendering = true
-  vim.bo[buf].modifiable = true
-  vim.api.nvim_buf_clear_namespace(buf, M._status_ns, 0, -1)
-  for index, line in ipairs(M._status.lines or {}) do
-    if type(line) ~= "string" then M._status.lines[index] = tostring(line or "") end
-  end
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, M._status.lines)
-  vim.bo[buf].modifiable = false
-  vim.b[buf].diff_review_status_rendering = was_rendering
-end
 
 ---@param buf integer
-function M._status_apply_rendered_extmarks(buf)
-  for _, line_hl in ipairs(M._status.line_highlights or {}) do
-    pcall(vim.api.nvim_buf_set_extmark, buf, M._status_ns, line_hl.line - 1, 0, {
-      line_hl_group = line_hl.hl_group,
-      priority = 80,
-    })
-  end
-  for _, highlight in ipairs(M._status.highlights or {}) do
-    pcall(vim.api.nvim_buf_set_extmark, buf, M._status_ns, highlight.line - 1, highlight.start_col, {
-      end_col = highlight.end_col,
-      hl_group = highlight.hl_group,
-      priority = highlight.priority or 90,
-    })
-  end
-  for _, extmark in ipairs(M._status.extmarks or {}) do
-    local extmark_opts = vim.tbl_extend("force", { priority = 95 }, extmark.opts)
-    pcall(vim.api.nvim_buf_set_extmark, buf, M._status_ns, extmark.line - 1, extmark.col, extmark_opts)
-  end
-end
 
 --- Run the PR overview view's after-render work (its view controller's after_render hook).
 ---@param buf integer
@@ -9300,27 +6962,6 @@ end
 
 ---@param buf integer
 ---@param walkthrough table?
-function M._status_after_buffer_render(buf, walkthrough)
-  return M._status_perf_span("status.after_buffer_render", buf, nil, function()
-    M._status_register_decoration_provider()
-    M._status_perf_span("status.after_render.hint_bar", buf, nil, function()
-      M._status_apply_hint_bar(buf)
-    end)
-    if walkthrough then
-      M._status_perf_span("status.after_render.walkthrough", buf, nil, function()
-        walkthrough.on_status_rendered(buf)
-      end)
-    end
-
-    -- Resolve per-view after-render behavior through the registered view controller,
-    -- falling back to the default (folds only) for unregistered/branch-diff views.
-    local view_kind = M._status.view_kind or "status"
-    if not M._diff_view_controller_model.run_hook(view_kind, "after_render", { buf = buf }) then
-      M._status_after_render_default(buf)
-    end
-    M._gitstatus_debug.dump(buf, "status_render_loaded")
-  end)
-end
 
 
 ---@param buf integer
@@ -9329,137 +6970,6 @@ end
 ---@param opts? { reuse_sections?: boolean }
 ---@param head_lines table[]
 ---@param sections DiffReviewStatusSection[]
-local function status_render_loaded(buf, target_id, fallback_line, opts, head_lines, sections)
-  return M._status_perf_span("status.render_loaded", buf, {
-    target_id = target_id,
-    fallback_line = fallback_line,
-    reuse_sections = opts and opts.reuse_sections or nil,
-    head_line_count = head_lines and #head_lines or nil,
-    section_count = sections and #sections or nil,
-  }, function()
-  opts = opts or {}
-  if M._pr_edit.blocks_render(buf) then return end
-  setup_bg_highlights()
-  local previous_registry = M._status and M._status.diff_source_registry or nil
-  M._status = M._status or {}
-  M._status.buf = buf
-  M._status.lines = {}
-  M._status.entries = {}
-  M._status.highlights = {}
-  M._status.line_highlights = {}
-  M._status.extmarks = {}
-  M._status.diff_row_spans = {}
-  M._status.boundary_lines = {}
-  M._status.fold_ranges_by_id = {}
-  M._status.fold_range_order = {}
-  M._status.fold_text_by_start_line = {}
-  M._status.diff_source_registry = (opts.reuse_sections and previous_registry) or M._diff_source_model.new_registry()
-  M._status_configure_diff_source_policies(M._status.diff_source_registry)
-  M._diff_line_content_lengths = M._diff_line_content_lengths or {}
-  M._diff_line_content_lengths[buf] = {}
-  M._clear_diff_gutter_visual_line(buf)
-
-  local walkthrough = package.loaded["diff_review.walkthrough"]
-  if walkthrough and walkthrough.status_head_lines then
-    head_lines = walkthrough.status_head_lines(buf, head_lines)
-  end
-  M._status_sort_sections_for_render(buf, sections)
-
-  local active_head_stack = {}
-  local function close_active_head_parent(parent, end_line)
-    if parent then
-      M._status_register_fold_range(
-        parent.id,
-        parent.start_line,
-        end_line,
-        parent.default_folded,
-        parent.fold_text
-      )
-    end
-  end
-  local function close_head_stack_to(parent_id, end_line)
-    while #active_head_stack > 0 and active_head_stack[#active_head_stack].id ~= parent_id do
-      close_active_head_parent(table.remove(active_head_stack), end_line)
-    end
-  end
-  local function close_all_head_parents(end_line)
-    while #active_head_stack > 0 do
-      close_active_head_parent(table.remove(active_head_stack), end_line)
-    end
-  end
-
-  M._status_perf_span("status.render_loaded.head_rows", buf, {
-    head_line_count = #head_lines,
-  }, function()
-    for _, head_line in ipairs(head_lines) do
-      local parent_id = head_line.parent_id
-      if parent_id then
-        close_head_stack_to(parent_id, #M._status.lines)
-      else
-        close_all_head_parents(#M._status.lines)
-      end
-      local entry = head_line.entry
-      if entry and entry.kind == "pr_head_section" then
-        entry.default_folded = head_line.default_folded == true
-      end
-      local line_number
-      if head_line.segments then
-        line_number = status_add_segment_line(head_line.segments, entry)
-      else
-        line_number = status_add_segment_line(head_line)
-      end
-      if entry and entry.kind == "pr_head_section" and entry.id then
-        active_head_stack[#active_head_stack + 1] = {
-          id = entry.id,
-          start_line = line_number,
-          default_folded = head_line.default_folded == true,
-          fold_text = M._status.lines[line_number],
-        }
-      end
-    end
-    close_all_head_parents(#M._status.lines)
-    status_add_line("")
-  end)
-
-  M._status_perf_span("status.render_loaded.sections", buf, {
-    section_count = #sections,
-  }, function()
-    if #sections == 0 then
-      status_add_line("No changes", nil, "Comment")
-    else
-      for index, section in ipairs(sections) do
-        if index > 1 then
-          status_add_line("")
-        end
-        status_render_section(section)
-      end
-    end
-  end)
-
-  M._status_perf_span("status.render_loaded.write_buffer", buf, {
-    line_count = #M._status.lines,
-  }, function()
-    M._status_write_rendered_buffer(buf)
-  end)
-  M._status_perf_span("status.render_loaded.apply_extmarks", buf, {
-    highlight_count = #(M._status.highlights or {}),
-    line_highlight_count = #(M._status.line_highlights or {}),
-    extmark_count = #(M._status.extmarks or {}),
-  }, function()
-    M._status_apply_rendered_extmarks(buf)
-  end)
-  M._status_perf_span("status.render_loaded.restore_cursor", buf, {
-    target_id = target_id,
-    fallback_line = fallback_line,
-  }, function()
-    status_restore_cursor(buf, target_id, fallback_line)
-  end)
-
-  M._status_perf_span("status.render_loaded.after_render", buf, nil, function()
-    M._status_after_buffer_render(buf, walkthrough)
-  end)
-  end)
-end
 
 ---@param cwd string
 ---@param buf integer
@@ -9650,7 +7160,7 @@ function M.render_status(buf, target_id, fallback_line, opts)
     if preserve_current_cursor then
       target_id, fallback_line = status_cursor_target(buf)
     end
-    status_render_loaded(buf, target_id, fallback_line, opts, M._status.head_lines, M._status.sections)
+    status_render.status_render_loaded(buf, target_id, fallback_line, opts, M._status.head_lines, M._status.sections)
     return
   end
 
@@ -9706,7 +7216,7 @@ function M.render_status(buf, target_id, fallback_line, opts)
       if preserve_current_cursor and not opts.restore_initial_folds then
         target_id, fallback_line = status_cursor_target(buf)
       end
-      status_render_loaded(buf, target_id, fallback_line, opts, result.head_lines, result.sections)
+      status_render.status_render_loaded(buf, target_id, fallback_line, opts, result.head_lines, result.sections)
       vim.schedule(function()
         local metadata_status = M._status_states and M._status_states[buf] or render_state
         if not (
@@ -9778,7 +7288,7 @@ local function render_pr_status(pr, cwd, buf, diff_text)
   status.review_after_row = function(diff_line, indent)
     M._section_builder.emit_anchored_comments(status, diff_line, indent, { index_field = "pr_code_comments_by_anchor" })
   end
-  status_render_loaded(buf, nil, nil, { reuse_sections = true }, status.head_lines, status.sections)
+  status_render.status_render_loaded(buf, nil, nil, { reuse_sections = true }, status.head_lines, status.sections)
 end
 
 ---@param pr DiffReviewGhPR
@@ -10069,18 +7579,10 @@ end
 -- table rather than as locals: this chunk is at Lua's hard limit of 200
 -- local variables, so new file-scope `local function`s break the module.
 -- Seam: expose the render orchestrator for the extracted branch_diff module.
-M._status_render_loaded = status_render_loaded
+M._status_render_loaded = status_render.status_render_loaded
 M._branch_diff = require("diff_review.branch_diff")
 
 ---@param target_id? string
-status_render_current_model = function(target_id)
-  local status = M._status
-  if not (status and status.buf and vim.api.nvim_buf_is_valid(status.buf) and status.head_lines and status.sections) then
-    return
-  end
-  status.fancy_rows = {}
-  status_render_loaded(status.buf, target_id, vim.api.nvim_win_get_cursor(0)[1], { reuse_sections = true }, status.head_lines, status.sections)
-end
 
 ---@param entries DiffReviewStatusEntry[]
 ---@param target_section DiffReviewStatusSectionName
@@ -10091,7 +7593,7 @@ local function status_apply_optimistic_entries(entries, target_section, target_i
   local next_sections = status_apply_optimistic_move(status.sections, entries, target_section)
   if not next_sections then return end
   status.sections = next_sections
-  status_render_current_model(target_id)
+  status_render.status_render_current_model(target_id)
 end
 
 ---@param buf integer
@@ -10203,21 +7705,62 @@ M._status_short_oid = status_short_oid
 M._status_provider_file_key = status_provider_file_key
 M._status_provider_hunk_key = status_provider_hunk_key
 M._status_entry_under_cursor = status_entry_under_cursor
-M._status_render_file = status_render_file
+M._status_render_file = status_render.status_render_file
 -- Seams shared with the extracted review module.
-M._status_command_visible = status_command_visible
-M._status_keys_for = status_keys_for
+M._status_command_visible = keymaps.status_command_visible
+M._status_keys_for = keymaps.status_keys_for
 M._notify_debug = notify_debug
 M._status_command_specs_by_id = status_command_specs_by_id
 M._status_diff_hunks_for_file = status_diff_hunks_for_file
+M._status_cursor_target = status_cursor_target
+M._status_operations_pending = status_operations_pending
+-- Seams for the extracted syntax_engine module.
+M._file_source_lines = syntax_engine.file_source_lines
+M._same_hunk_ancestor_scope = syntax_engine.same_hunk_ancestor_scope
+M._status_hunk_context_line = syntax_engine.status_hunk_context_line
+M._old_file_syntax_source_lines = syntax_engine.old_file_syntax_source_lines
+M._diff_new_side_matches_file = syntax_engine.diff_new_side_matches_file
+M._cached_old_file_syntax = syntax_engine.cached_old_file_syntax
+M._diff_uses_file_syntax = syntax_engine.diff_uses_file_syntax
+M._prewarm_diff_syntax = syntax_engine.prewarm_diff_syntax
+M._status_file_syntax_diff_text = syntax_engine.status_file_syntax_diff_text
+M._status_prewarm_hunk_budget = syntax_engine.status_prewarm_hunk_budget
+M._status_syntax_source_for_entry_kind = syntax_engine.status_syntax_source_for_entry_kind
+M._parse_unified_diff = parse_unified_diff
+M._loaded_file_buffer = loaded_file_buffer
+M._file_contains_nul = file_contains_nul
+M._lines_contain_nul = lines_contain_nul
+M._status_render_current_model = status_render.status_render_current_model
+-- Seams for the extracted diff_render module.
+M._merge_hunk_gutter_specs = diff_render.merge_hunk_gutter_specs
+M._add_plan_to_hunk_display_group = diff_render.add_plan_to_hunk_display_group
+M._merge_hunk_render_plans = diff_render.merge_hunk_render_plans
+-- Seams for the extracted status_render module.
+M._status_decorate_visible = status_render.status_decorate_visible
+M._status_emit_row_spans = status_render.status_emit_row_spans
+M._status_decorate_rows = status_render.status_decorate_rows
+M._status_register_decoration_provider = status_render.status_register_decoration_provider
+M._status_write_rendered_buffer = status_render.status_write_rendered_buffer
+M._status_apply_rendered_extmarks = status_render.status_apply_rendered_extmarks
+M._status_after_buffer_render = status_render.status_after_buffer_render
+M._status_commit_relative_date = status_commit_relative_date
+M._status_hunk_key = status_hunk_key
+M._status_prewarm_entry_syntax = status_prewarm_entry_syntax
+M._setup_bg_highlights = setup_bg_highlights
+M._status_restore_cursor = status_restore_cursor
+M._status_commit_key = status_commit_key
+M._status_commit_hunk_key = status_commit_hunk_key
+M._status_commit_file_key = status_commit_file_key
+M._status_file_key = status_file_key
+M._status_section_key = status_section_key
 -- Seams shared with the extracted hunk_model module.
 M._parse_hunk_body = parse_hunk_body
-M._hunk_add_gutter = hunk_add_gutter
-M._treesitter_line_segments = treesitter_line_segments
-M._hunk_context_scope_key = hunk_context_scope_key
-M._same_hunk_context_scope = same_hunk_context_scope
+M._hunk_add_gutter = diff_render.hunk_add_gutter
+M._treesitter_line_segments = syntax_engine.treesitter_line_segments
+M._hunk_context_scope_key = syntax_engine.hunk_context_scope_key
+M._same_hunk_context_scope = syntax_engine.same_hunk_context_scope
 M._hunk_first_changed_current_line = hunk_first_changed_current_line
-M._hunk_line_visible_in_context_scope = hunk_line_visible_in_context_scope
+M._hunk_line_visible_in_context_scope = syntax_engine.hunk_line_visible_in_context_scope
 M._pr_edit = require("diff_review.pr_edit")
 
 ---@param entries DiffReviewStatusEntry[]
@@ -11210,14 +8753,14 @@ local function status_open_popup(title, lines)
 
   local key_width = 0
   for _, spec in ipairs(status_command_specs) do
-    if status_command_visible(spec) then
-      key_width = math.max(key_width, #status_key_text(status_keys_for(spec.id)))
+    if keymaps.status_command_visible(spec) then
+      key_width = math.max(key_width, #status_key_text(keymaps.status_keys_for(spec.id)))
     end
   end
   local line_index = 0
   for _, spec in ipairs(status_command_specs) do
-    if not status_command_visible(spec) then goto continue end
-    local key_text = status_key_text(status_keys_for(spec.id))
+    if not keymaps.status_command_visible(spec) then goto continue end
+    local key_text = status_key_text(keymaps.status_keys_for(spec.id))
     if key_text ~= "" then
       line_index = line_index + 1
       pcall(vim.api.nvim_buf_set_extmark, buf, M._status_ns, line_index - 1, 2, {
@@ -11240,15 +8783,15 @@ end
 local function status_show_help()
   local key_width = 0
   for _, spec in ipairs(status_command_specs) do
-    if status_command_visible(spec) then
-      key_width = math.max(key_width, #status_key_text(status_keys_for(spec.id)))
+    if keymaps.status_command_visible(spec) then
+      key_width = math.max(key_width, #status_key_text(keymaps.status_keys_for(spec.id)))
     end
   end
 
   local lines = {}
   for _, spec in ipairs(status_command_specs) do
-    if not status_command_visible(spec) then goto continue end
-    local key_text = status_key_text(status_keys_for(spec.id))
+    if not keymaps.status_command_visible(spec) then goto continue end
+    local key_text = status_key_text(keymaps.status_keys_for(spec.id))
     if key_text ~= "" then
       lines[#lines + 1] = ("  %-" .. key_width .. "s  %s"):format(key_text, spec.desc)
     end
@@ -11363,296 +8906,6 @@ function M._walkthrough_host(buf)
 end
 
 ---@param buf integer
-local function setup_status_keymaps(buf)
-  require("github.repo_cache").enable_user_completion(buf)
-  local opts = { buffer = buf, silent = true, nowait = true }
-  local view_kind = M._status and M._status.view_kind or "status"
-  local is_pr_view = view_kind == "pr"
-  local function map(command_id, mode, callback, desc)
-    local spec = status_command_specs_by_id[command_id]
-    if spec and not status_command_visible(spec) then return end
-    for _, key in ipairs(status_keys_for(command_id)) do
-      local map_opts = vim.tbl_extend("force", opts, {
-        desc = desc or (spec and spec.desc) or command_id,
-      })
-      local mapped
-      mapped = function(...)
-        if M._status_states and M._status_states[buf] then M._status = M._status_states[buf] end
-        callback(...)
-      end
-      if view_kind == "review" then
-        M._review.register_command_map(buf, command_id, mode, key, mapped, map_opts)
-      else
-        vim.keymap.set(mode, key, mapped, map_opts)
-      end
-    end
-  end
-
-
-  map("close", "n", function()
-    local state = M._status_states and M._status_states[buf] or M._status
-    if vim.api.nvim_buf_is_valid(buf) then
-      pcall(vim.api.nvim_buf_delete, buf, { force = true })
-    end
-    if M._status_states then M._status_states[buf] = nil end
-    if M._main_status == state then M._main_status = nil end
-    if M._status == state then M._status = M._main_status end
-  end)
-
-  map("refresh", "n", function()
-    if view_kind == "diff" then
-      local status = M._status_states and M._status_states[buf] or M._status
-      if status and status.diff_branch and status.cwd then
-        M._status = status
-        M._branch_diff.load(status.diff_branch, status.cwd, buf, status.diff_file)
-      end
-      return
-    end
-    if is_pr_view then
-      local status = M._status_states and M._status_states[buf] or M._status
-      if status and status.pr and status.cwd then
-        M._status = status
-        render_pr_status(status.pr, status.cwd, buf)
-        load_pr_diff(status.pr, status.cwd, buf)
-        M._pr_overview.load_comments(status.pr, status.cwd, buf)
-        M._pr_overview.load_checks(status.pr, status.cwd, buf)
-      end
-      return
-    end
-    if M._status then
-      M._status.pr = nil
-      M._status.about = nil
-    end
-    render_status_or_notify(buf, nil, nil, {
-      restore_initial_folds = true,
-      refresh_pr = true,
-      refresh_about = true,
-    })
-  end)
-
-  map("toggle", "n", function()
-    local status = M._status_states and M._status_states[buf] or M._status
-    if status then M._status = status end
-    if M._review.toggle_comment_fold(buf) then return end
-    status_toggle(status_entry_under_cursor(status), status)
-  end)
-
-  map("collapse_parent", "n", function()
-    if M._status_states and M._status_states[buf] then M._status = M._status_states[buf] end
-    M._status_collapse_parent()
-  end)
-
-  map("visual_line_with_gutter", "n", function()
-    M._start_diff_gutter_visual_line(buf)
-  end)
-
-  -- The review view gets its own action set (S/U/C/y/n/submit); the read-only
-  -- PR and branch-diff views only get navigation commands.
-  if view_kind == "review" then
-    M._review.setup_keymaps(buf)
-    map("browse", { "n", "x" }, function()
-      local status = M._status_states and M._status_states[buf] or M._status
-      local fragment = M._review.browse_fragment_under_cursor(buf)
-      M._review.leave_visual()
-      if not gh.browse_pr_changes(status and status.pr, fragment) then
-        notify_error("Unable to open PR URL", "DiffReview")
-      end
-    end)
-    local function review_open_action()
-      if M._status_states and M._status_states[buf] then M._status = M._status_states[buf] end
-      local entry = status_entry_under_cursor()
-      if M._status_open_commit_message_under_cursor(entry) then return end
-      status_jump(entry)
-    end
-    map("open", "n", review_open_action, "Jump to file")
-    vim.schedule(function()
-      if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
-      if M._status_states and M._status_states[buf] then M._status = M._status_states[buf] end
-      map("open", "n", review_open_action, "Jump to file")
-    end)
-    map("help", "n", status_show_help)
-    return
-  end
-  if view_kind ~= "status" then
-    map("browse", "n", function()
-      local status = M._status_states and M._status_states[buf] or M._status
-      if status and status.view_kind == "pr" then
-        local url = M._pr_overview.url_under_cursor(buf)
-        if url and gh.browse_url(url) then return end
-      end
-      local pr = status and status.pr
-      if not gh.browse_pr(pr) then
-        notify_error("Unable to open PR URL", "DiffReview")
-      end
-    end)
-    if is_pr_view then
-      map("comment", { "n", "x" }, function()
-        M._pr_overview.add_standalone_comment(buf)
-      end)
-      map("sync", { "n", "i" }, function()
-        M._review.sync_inline_comment_text(buf)
-        M._pr_overview.sync_standalone_comments(buf)
-        M._pr_edit.sync(buf)
-      end)
-    end
-    map("review", "n", function()
-      M._review.start(buf)
-    end)
-    map("open", "n", function()
-      if M._status_states and M._status_states[buf] then M._status = M._status_states[buf] end
-      if is_pr_view and M._pr_edit.toggle_draft_status_under_cursor(buf) then return end
-      local entry = status_entry_under_cursor()
-      if M._status_open_commit_message_under_cursor(entry) then return end
-      status_jump(entry)
-    end, "Jump to file")
-    map("help", "n", status_show_help)
-    vim.api.nvim_create_autocmd("CursorMoved", {
-      buffer = buf,
-      callback = function()
-        M._status_perf_span("status.autocmd_cursor_prewarm", buf, nil, function()
-          if (M.config or config.options or config.defaults).status_cursor_prewarm == false then return end
-          if M._status_states and M._status_states[buf] then M._status = M._status_states[buf] end
-          status_defer_prewarm_under_cursor(buf)
-        end)
-      end,
-    })
-    return
-  end
-
-  map("stage", "n", function()
-    status_stage(status_entry_under_cursor())
-  end, "Stage hunk/file")
-  map("stage", "x", function()
-    local entries = status_entries_from_visual_selection()
-    status_leave_visual_mode()
-    status_stage_entries(entries, { preserve_cursor = true })
-  end, "Stage selection")
-
-  map("unstage", "n", function()
-    status_unstage(status_entry_under_cursor())
-  end, "Unstage hunk/file")
-  map("unstage", "x", function()
-    local entries = status_entries_from_visual_selection()
-    status_leave_visual_mode()
-    status_unstage_entries(entries, { preserve_cursor = true })
-  end, "Unstage selection")
-
-  map("discard", "n", function()
-    status_discard(status_entry_under_cursor())
-  end, "Discard hunk/file")
-  map("discard", "x", function()
-    local entries = status_entries_from_visual_selection()
-    status_leave_visual_mode()
-    status_discard_entry_list(entries, nil, { preserve_cursor = true })
-  end, "Discard selection")
-
-  map("open", "n", function()
-    local entry = status_entry_under_cursor()
-    if require("diff_review.walkthrough").jump_status_step(buf) then
-      return
-    elseif M._status_open_commit_message_under_cursor(entry) then
-      return
-    elseif entry and entry.kind == "pr" then
-      status_open_pr(entry)
-    elseif entry and entry.kind == "about" then
-      status_open_about(entry)
-    elseif entry and entry.kind == "load_more" then
-      local status = M._status_states and M._status_states[buf] or M._status
-      if status then
-        -- Force-render the next chunk of deferred hunks from where the gate stopped, so
-        -- each activation always reveals more even when a single hunk exceeds the budget.
-        local chunk = 6
-        local target = (tonumber(entry.load_more_from) or 1) + chunk - 1
-        status.file_render_limits = status.file_render_limits or {}
-        status.file_render_limits[entry.file_key] = math.max(status.file_render_limits[entry.file_key] or 0, target)
-        M._status = status
-        render_status_or_notify(buf, nil, vim.api.nvim_win_get_cursor(0)[1], { reuse_sections = true })
-      end
-    else
-      status_jump(entry)
-    end
-  end)
-
-  local function jump_back_with_saved_view()
-    local walkthrough = require("diff_review.walkthrough")
-    walkthrough._debug_jump_event("status_jump_back_start", {
-      buf = buf,
-      view = walkthrough._jump_debug_snapshot(vim.fn.bufwinid(buf), buf),
-    })
-    vim.cmd("normal! \15")
-    walkthrough._debug_jump_event("status_jump_back_after_ctrl_o", {
-      buf = buf,
-      view = walkthrough._jump_debug_snapshot(vim.fn.bufwinid(buf), buf),
-    })
-    local restored = walkthrough.restore_jump_return_view(buf, true)
-    walkthrough._debug_jump_event("status_jump_back_after_restore", {
-      buf = buf,
-      restored = restored,
-      view = walkthrough._jump_debug_snapshot(vim.fn.bufwinid(buf), buf),
-    })
-    vim.schedule(function()
-      if vim.api.nvim_buf_is_valid(buf) then
-        local scheduled_restored = walkthrough.restore_jump_return_view(buf, true)
-        walkthrough._debug_jump_event("status_jump_back_scheduled_restore", {
-          buf = buf,
-          restored = scheduled_restored,
-          view = walkthrough._jump_debug_snapshot(vim.fn.bufwinid(buf), buf),
-        })
-      end
-    end)
-  end
-  for _, key in ipairs({ ",", "<C-o>" }) do
-    vim.keymap.set("n", key, jump_back_with_saved_view,
-      vim.tbl_extend("force", opts, { desc = "Jump back" }))
-  end
-
-  local function commit()
-    require("diff_review.commit").commit({
-      win = vim.api.nvim_get_current_win(),
-      on_done = function()
-        if vim.api.nvim_buf_is_valid(buf) then render_status_or_notify(buf) end
-      end,
-    })
-  end
-  map("commit", "n", commit)
-
-  map("push", "n", function()
-    status_remote_action(buf, "push")
-  end)
-
-  map("pull", "n", function()
-    status_remote_action(buf, "pull")
-  end)
-
-  map("pr", "n", function()
-    status_open_pr(status_entry_under_cursor())
-  end)
-
-  map("branch_create", "n", function()
-    M._create_branch(buf)
-  end)
-
-  map("walkthrough", "n", function()
-    require("diff_review.walkthrough").start(M._walkthrough_host(buf))
-  end)
-
-  map("review", "n", function()
-    M._review.start(buf)
-  end)
-
-  map("help", "n", status_show_help)
-
-  vim.api.nvim_create_autocmd("CursorMoved", {
-    buffer = buf,
-    callback = function()
-      M._status_perf_span("status.autocmd_cursor_prewarm", buf, nil, function()
-        if (M.config or config.options or config.defaults).status_cursor_prewarm == false then return end
-        if M._status_states and M._status_states[buf] then M._status = M._status_states[buf] end
-        status_defer_prewarm_under_cursor(buf)
-      end)
-    end,
-  })
-end
 
 ---@class DiffReviewOpenPROptions
 ---@field cwd? string
@@ -11713,7 +8966,7 @@ function M.open_pr(pr, opts)
   if pr.repo and pr.repo ~= "" then vim.b[buf].github_repo = pr.repo end
   M._status = state
   attach_status_state(buf, state)
-  setup_status_keymaps(buf)
+  keymaps.setup_status_keymaps(buf)
   M._pr_edit.attach(buf)
   M.github_load_repo_metadata(cwd, pr.repo)
 
@@ -11796,7 +9049,7 @@ function M.open_review(pr, opts)
   M._review.normalize_comments(state)
   M._status = state
   attach_status_state(buf, state)
-  setup_status_keymaps(buf)
+  keymaps.setup_status_keymaps(buf)
   M._review.attach(buf)
   M.github_load_repo_metadata(cwd, pr.repo)
 
@@ -11874,7 +9127,7 @@ function M.open_branch_diff(branch, opts)
     }
     M._status = state
     attach_status_state(buf, state)
-    setup_status_keymaps(buf)
+    keymaps.setup_status_keymaps(buf)
 
     local win = vim.api.nvim_get_current_win()
     local ok, set_err = pcall(vim.api.nvim_win_set_buf, win, buf)
@@ -11982,7 +9235,7 @@ function M.open()
     }
     M._status = M._main_status
     attach_status_state(buf, M._main_status)
-    setup_status_keymaps(buf)
+    keymaps.setup_status_keymaps(buf)
   else
     M._main_status = M._status_states and M._status_states[buf] or M._main_status or M._status
     M._status = M._main_status
@@ -11998,5 +9251,31 @@ function M.open()
   vim.wo[win].foldcolumn = "0"
   render_status_or_notify(buf)
 end
+
+-- Seams for the extracted keymaps module.
+M._status_open_pr = status_open_pr
+M._status_show_help = status_show_help
+M._render_status_or_notify = render_status_or_notify
+M._status_leave_visual_mode = status_leave_visual_mode
+M._status_entries_from_visual_selection = status_entries_from_visual_selection
+M._status_jump = status_jump
+M._status_remote_action = status_remote_action
+M._status_defer_prewarm_under_cursor = status_defer_prewarm_under_cursor
+M._status_toggle = status_toggle
+M._status_stage_entries = status_stage_entries
+M._status_stage = status_stage
+M._status_primary_key = status_primary_key
+M._status_open_about = status_open_about
+M._status_discard_entry_list = status_discard_entry_list
+M._status_discard = status_discard
+M._load_pr_diff = load_pr_diff
+M._status_unstage = status_unstage
+M._status_unstage_entries = status_unstage_entries
+M._status_command_visible_for_view = keymaps.status_command_visible_for_view
+M._status_hint_segments = keymaps.status_hint_segments
+M._status_hint_title = keymaps.status_hint_title
+M._status_hint_winbar = keymaps.status_hint_winbar
+M._status_apply_hint_bar = keymaps.status_apply_hint_bar
+M._status_clear_hint_bar = keymaps.status_clear_hint_bar
 
 return M

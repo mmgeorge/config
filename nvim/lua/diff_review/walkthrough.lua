@@ -958,16 +958,28 @@ end
 ---@param mode DiffReviewWalkthroughMode
 ---@return table<string, integer>
 local function file_order_for_mode(mode)
-  if mode.file_order then return mode.file_order end
+  if mode.walkthrough_source and mode.walkthrough_source.file_rank then
+    return mode.walkthrough_source.file_rank
+  end
+  local file_rank = {}
   local file_order = {}
   for index, step in ipairs(mode.doc.steps or {}) do
     local step_file = tostring(step.file or ""):gsub("\\", "/")
-    if step_file ~= "" and file_order[step_file] == nil then
-      file_order[step_file] = index
+    if step_file ~= "" and file_rank[step_file] == nil then
+      file_rank[step_file] = index
+      file_order[#file_order + 1] = step_file
     end
   end
-  mode.file_order = file_order
-  return file_order
+  -- Build the canonical walkthrough diff source so step ordering, annotations, and
+  -- navigation live in one model layered over the base Git sources.
+  local source_module = require("diff_review.source")
+  local host_buf = mode.host and mode.host.buf or "walkthrough"
+  mode.walkthrough_source = source_module.new_walkthrough_source(
+    { id = "walkthrough:" .. tostring(host_buf), kind = "walkthrough" },
+    { file_order = file_order, step_annotations = mode.doc.steps or {} }
+  )
+  mode.walkthrough_source.file_rank = file_rank
+  return file_rank
 end
 
 ---@param buf integer

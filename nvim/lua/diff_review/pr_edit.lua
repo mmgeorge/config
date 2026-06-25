@@ -10,6 +10,7 @@ local M = { ns = vim.api.nvim_create_namespace("diff_review_pr_edit") }
 local gh = require("diff_review.gh")
 local config = require("diff_review.config")
 local notifications = require("diff_review.notifications")
+local region = require("diff_review.region")
 
 --- Resolve the diff_review root module lazily, avoiding a load-time require cycle while
 --- letting pr_edit reach status state, perf spans, and sibling views at call time.
@@ -25,8 +26,7 @@ end
 ---@field review_mark? integer
 ---@field milestone_mark? integer
 ---@field status_mark? integer
----@field desc_start_mark? integer
----@field desc_end_mark? integer beyond-the-last-body-line mark (end-exclusive)
+---@field desc_region? DiffReviewRenderedRegion description body region (end-exclusive bounds)
 ---@field title_marker_id? integer
 ---@field review_marker_id? integer
 ---@field milestone_marker_id? integer
@@ -77,8 +77,8 @@ end
 function M.description_range0(buf)
   local status = dr()._status_states and dr()._status_states[buf] or nil
   local state = status and status.pr_edit or nil
-  if not state then return nil, nil end
-  return M.mark_row(buf, state.desc_start_mark), M.mark_row(buf, state.desc_end_mark)
+  if not (state and state.desc_region) then return nil, nil end
+  return region.bounds(state.desc_region)
 end
 
 ---@param buf integer
@@ -450,8 +450,7 @@ function M.current_values(buf, status)
   local title_row0 = M.field_row(buf, state.title_mark, "^Title:")
   local review_row0 = M.field_row(buf, state.review_mark, "^Review:")
   local milestone_row0 = M.field_row(buf, state.milestone_mark, "^Release:")
-  local first0 = M.mark_row(buf, state.desc_start_mark)
-  local after0 = M.mark_row(buf, state.desc_end_mark)
+  local first0, after0 = M.description_range0(buf)
   if not (title_row0 and review_row0 and milestone_row0 and first0 and after0) then return nil end
   local title_line = vim.api.nvim_buf_get_lines(buf, title_row0, title_row0 + 1, false)[1] or ""
   local review_line = vim.api.nvim_buf_get_lines(buf, review_row0, review_row0 + 1, false)[1] or ""
@@ -489,8 +488,7 @@ function M.region_kind_at(buf, row)
   local title_row0 = M.field_row(buf, state.title_mark, "^Title:")
   local review_row0 = M.field_row(buf, state.review_mark, "^Review:")
   local milestone_row0 = M.field_row(buf, state.milestone_mark, "^Release:")
-  local first0 = M.mark_row(buf, state.desc_start_mark)
-  local after0 = M.mark_row(buf, state.desc_end_mark)
+  local first0, after0 = M.description_range0(buf)
   if title_row0 and row == title_row0 + 1 then return "title" end
   if review_row0 and row == review_row0 + 1 then return "review" end
   if milestone_row0 and row == milestone_row0 + 1 then return "milestone" end
@@ -519,7 +517,7 @@ function M.refresh_markers(buf)
   local title_row0 = M.field_row(buf, state.title_mark, "^Title:")
   local review_row0 = M.field_row(buf, state.review_mark, "^Review:")
   local milestone_row0 = M.field_row(buf, state.milestone_mark, "^Release:")
-  local first0 = M.mark_row(buf, state.desc_start_mark)
+  local first0 = M.description_range0(buf)
 
   local function set_marker(key, wanted, row0)
     if wanted and not state[key] and row0 then
@@ -563,7 +561,8 @@ function M.on_render(buf)
   local state = status and status.pr_edit or nil
   if not (state and status.pr and vim.api.nvim_buf_is_valid(buf)) then return end
   vim.api.nvim_buf_clear_namespace(buf, M.ns, 0, -1)
-  state.title_mark, state.review_mark, state.milestone_mark, state.status_mark, state.desc_start_mark, state.desc_end_mark = nil, nil, nil, nil, nil, nil
+  if state.desc_region then region.clear(state.desc_region) end
+  state.title_mark, state.review_mark, state.milestone_mark, state.status_mark, state.desc_region = nil, nil, nil, nil, nil
   state.title_marker_id, state.review_marker_id, state.milestone_marker_id, state.desc_marker_id = nil, nil, nil, nil
 
   local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
@@ -585,8 +584,7 @@ function M.on_render(buf)
   state.review_mark = vim.api.nvim_buf_set_extmark(buf, M.ns, review_row - 1, 0, { right_gravity = false })
   state.milestone_mark = vim.api.nvim_buf_set_extmark(buf, M.ns, milestone_row - 1, 0, { right_gravity = false })
   state.status_mark = vim.api.nvim_buf_set_extmark(buf, M.ns, status_row - 1, 0, { right_gravity = false })
-  state.desc_start_mark = vim.api.nvim_buf_set_extmark(buf, M.ns, label_row, 0, { right_gravity = false })
-  state.desc_end_mark = vim.api.nvim_buf_set_extmark(buf, M.ns, label_row + body_count, 0, { right_gravity = false })
+  state.desc_region = region.new(buf, M.ns, label_row, label_row + body_count, { end_exclusive = true, region_kind = "markdown", editable = true })
   vim.bo[buf].modified = false
   M.refresh_markers(buf)
   M.sync_modifiable(buf)
