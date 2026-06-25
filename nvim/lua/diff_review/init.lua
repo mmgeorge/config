@@ -117,7 +117,7 @@
 ---@field commit_subject_end_col? integer
 ---@field walkthrough_step? table
 
----@alias DiffReviewStatusViewKind "status"|"pr"|"diff"
+---@alias DiffReviewStatusViewKind "status"|"pr"|"diff"|"review"
 
 ---@class DiffReviewStatusPRState
 ---@field state "fetching"|"ready"|"none"|"unavailable"|"error"
@@ -197,6 +197,8 @@
 ---@field _ts_source_bufs table<string, integer>?
 ---@field _diff_uses_file_syntax fun(hunk_staged?: boolean[], opts?: table): boolean
 ---@field _prewarm_diff_syntax fun(filename: string, diff_text: string, hunk_staged?: boolean[], callback_key: string, on_update?: fun(syntax?: DiffReviewTreeSitterSyntax), opts?: table)
+---@field _status_prewarm_hunk_budget fun(hunk_count: integer, options?: DiffReviewConfig): integer
+---@field _diff_mutation_queue_model table
 ---@field _main_win integer?
 ---@field _saved_wo table<integer, { number: boolean, relativenumber: boolean }>?
 ---@field suspend_preview boolean?
@@ -236,13 +238,17 @@ function M._git_show_diff_command(cwd, commit_oid)
     "show", "--format=", "--no-color", "--no-ext-diff", "--unified=0", commit_oid,
   }
 end
-M._pr_overview = {}
-M._datetime = {}
+M._pr_overview = require("diff_review.pr_overview")
+M._datetime = require("diff_review.datetime")
+M._conventional_commit = require("diff_review.conventional_commit")
+M._status_conventional_commit_type_end = M._conventional_commit.type_end
+M._status_conventional_commit_subject_segments = M._conventional_commit.subject_segments
 M._comment_rows = require("github.comment_rows")
 
 M._hunk_header_ns = vim.api.nvim_create_namespace("diff_review_headers")
 M._active_hunk_header_ns = vim.api.nvim_create_namespace("diff_review_active_hunk")
 M._status_ns = vim.api.nvim_create_namespace("diff_review_status")
+M._status_decorate_ns = vim.api.nvim_create_namespace("diff_review_status_decorate")
 M._hunk_header_priority = 20
 M._active_hunk_header_priority = 200
 
@@ -251,6 +257,22 @@ local ai_commit = require("diff_review.ai_commit")
 local gh = require("diff_review.gh")
 local highlights = require("diff_review.highlights")
 local notifications = require("diff_review.notifications")
+local hunk_model = require("diff_review.hunk_model")
+-- Re-expose the pure hunk model under its original M._hunk_* names so init render
+-- helpers and tests reach it unchanged.
+for _hunk_name, _hunk_fn in pairs(hunk_model) do M["_hunk_" .. _hunk_name] = _hunk_fn end
+M._diff_perf = require("diff_review.perf")
+M._diff_source_model = require("diff_review.source")
+M._diff_annotation_model = require("diff_review.annotations")
+M._diff_layout_model = require("diff_review.layout")
+M._diff_mutation_queue_model = require("diff_review.mutation_queue")
+M._diff_hunk_index_model = require("diff_review.hunk_index")
+M._diff_row_tree_model = require("diff_review.row_tree")
+M._diff_source_loader_model = require("diff_review.source_loader")
+M._diff_syntax_context_model = require("diff_review.syntax_context")
+M._diff_decoration_model = require("diff_review.decoration")
+M._diff_view_controller_model = require("diff_review.view_controller")
+M._diff_view_command_set_model = require("diff_review.view_command_set")
 M._intraline_diff = require("diff_review.intraline_diff")
 M._inventory = require("diff_review.inventory")
 
@@ -322,43 +344,56 @@ end
 ---@param filename string
 ---@return string[]?
 function M._file_source_lines(filename)
-  if file_contains_nul(filename) then return nil end
-  local loaded = loaded_file_buffer(filename)
-  if loaded then
-    if vim.bo[loaded].binary then return nil end
-    return vim.api.nvim_buf_get_lines(loaded, 0, -1, false)
-  end
-  local read_ok, lines = pcall(vim.fn.readfile, filename)
-  if not read_ok or type(lines) ~= "table" then return nil end
-  if lines_contain_nul(lines) then return nil end
-  return lines
+  return M._status_perf_span("source.file_lines", M._status and M._status.buf or nil, {
+    file = filename,
+  }, function()
+    if file_contains_nul(filename) then return nil end
+    local loaded = loaded_file_buffer(filename)
+    if loaded then
+      if vim.bo[loaded].binary then return nil end
+      return vim.api.nvim_buf_get_lines(loaded, 0, -1, false)
+    end
+    local read_ok, lines = pcall(vim.fn.readfile, filename)
+    if not read_ok or type(lines) ~= "table" then return nil end
+    if lines_contain_nul(lines) then return nil end
+    return lines
+  end)
 end
 
 ---@param filename string
 ---@return integer?
 local function treesitter_source_buffer(filename)
-  if file_contains_nul(filename) then return nil end
-  local loaded = loaded_file_buffer(filename)
-  if loaded then
-    if vim.bo[loaded].binary then return nil end
-    return loaded
-  end
+  return M._status_perf_span("treesitter.source_buffer", M._status and M._status.buf or nil, {
+    file = filename,
+  }, function()
+    if file_contains_nul(filename) then return nil end
+    local loaded = loaded_file_buffer(filename)
+    if loaded then
+      if vim.bo[loaded].binary then return nil end
+      return loaded
+    end
 
-  M._ts_source_bufs = M._ts_source_bufs or {}
-  local cached = M._ts_source_bufs[filename]
-  if cached and vim.api.nvim_buf_is_valid(cached) then return cached end
+    M._ts_source_bufs = M._ts_source_bufs or {}
+    local cached = M._ts_source_bufs[filename]
+    if cached and vim.api.nvim_buf_is_valid(cached) then return cached end
 
-  local lines = M._file_source_lines(filename)
-  if not lines then return nil end
+    local lines = M._file_source_lines(filename)
+    if not lines then return nil end
 
-  local buf = vim.api.nvim_create_buf(false, true)
-  vim.bo[buf].bufhidden = "wipe"
-  vim.bo[buf].buftype = "nofile"
-  vim.bo[buf].swapfile = false
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-  vim.bo[buf].filetype = detect_filetype(filename, lines)
-  M._ts_source_bufs[filename] = buf
-  return buf
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.bo[buf].bufhidden = "wipe"
+    vim.bo[buf].buftype = "nofile"
+    vim.bo[buf].swapfile = false
+    M._status_perf_span("treesitter.source_buffer.set_lines", M._status and M._status.buf or nil, {
+      file = filename,
+      source_line_count = #lines,
+    }, function()
+      vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+    end)
+    vim.bo[buf].filetype = detect_filetype(filename, lines)
+    M._ts_source_bufs[filename] = buf
+    return buf
+  end)
 end
 
 local function clear_treesitter_source_buffers()
@@ -459,6 +494,9 @@ function detect_filetype(filename, contents)
   end
   return vim.filetype.match(args) or ""
 end
+-- Expose the shared filetype resolver so extracted view modules (file_revision)
+-- can reuse it without re-implementing buffer/contents detection.
+M._detect_filetype = detect_filetype
 
 ---@param message string
 ---@param title? string
@@ -480,396 +518,22 @@ local function notify_debug(message, level, opts)
   vim.notify(message, level or vim.log.levels.INFO, opts)
 end
 
----@param backend DiffReviewGitBackend?
-function M.set_git_backend(backend)
-  M._git_backend = backend
-end
+local git_backend = require("diff_review.git_backend")
+M.set_git_backend = git_backend.set_backend
+M.reset_git_backend = git_backend.reset_backend
+M._system_output = git_backend.system_output
 
-function M.reset_git_backend()
-  M._git_backend = nil
-end
+local paths = require("diff_review.paths")
+local repo_file_path = paths.repo_file_path
+local repo_relative = paths.repo_relative
+M._repo_relative_for_test = paths.repo_relative_for_test
 
----@param stdout string?
----@param stderr string?
----@return string
-function M._system_output(stdout, stderr)
-  stdout = tostring(stdout or "")
-  stderr = tostring(stderr or "")
-  if stdout == "" then return stderr end
-  if stderr == "" then return stdout end
-  local separator = stdout:sub(-1) == "\n" and "" or "\n"
-  return stdout .. separator .. stderr
-end
+-- Render accumulators live in status_buffer (state-passing). The locals below stay as
+-- thin orchestration wrappers that thread the active M._status into each module call,
+-- so existing call sites render into the active buffer's state unchanged.
+local status_buffer = require("diff_review.status_buffer")
+M._status_buffer = status_buffer
 
----@param command DiffReviewGitCommand
----@param input? string
----@param cb DiffReviewGitTextCallback
-local function system_text_async(command, input, cb)
-  local backend = M._git_backend
-  if backend and backend.system_async then
-    backend.system_async(command, input, cb)
-    return
-  end
-  if backend and backend.system then
-    vim.schedule(function()
-      local output, code = backend.system(command, input)
-      local text = tostring(output or "")
-      cb({
-        code = code or 0,
-        stdout = text,
-        stderr = "",
-        output = text,
-      })
-    end)
-    return
-  end
-
-  local ok, process = pcall(vim.system, command, {
-    text = true,
-    stdin = input,
-    stdout = true,
-    stderr = true,
-  }, function(result)
-    vim.schedule(function()
-      local stdout = result.stdout or ""
-      local stderr = result.stderr or ""
-      cb({
-        code = result.code or 0,
-        stdout = stdout,
-        stderr = stderr,
-        output = M._system_output(stdout, stderr),
-      })
-    end)
-  end)
-  if not ok then
-    vim.schedule(function()
-      local message = tostring(process)
-      cb({
-        code = -1,
-        stdout = "",
-        stderr = message,
-        output = message,
-      })
-    end)
-  end
-end
-
----@param data string|string[]?
----@return string
-local function normalize_system_chunk(data)
-  if type(data) == "table" then
-    return table.concat(data, "\n")
-  end
-  return tostring(data or "")
-end
-
----@param command DiffReviewGitCommand
----@param input? string
----@param on_line fun(line: string)
----@param cb DiffReviewGitTextCallback
-local function system_text_stream_async(command, input, on_line, cb)
-  local backend = M._git_backend
-  if backend and backend.system_stream_async then
-    backend.system_stream_async(command, input, on_line, cb)
-    return
-  end
-  if backend and backend.system_async then
-    backend.system_async(command, input, cb, on_line)
-    return
-  end
-  if backend and backend.system then
-    vim.schedule(function()
-      local output, code = backend.system(command, input)
-      local text = tostring(output or "")
-      text = text:gsub("\r\n", "\n")
-      if text:sub(-1) == "\n" then text = text:sub(1, -2) end
-      local lines = text == "" and {} or vim.split(text, "\n", { plain = true })
-      for _, line in ipairs(lines) do
-        if line ~= "" then on_line(line) end
-      end
-      cb({
-        code = code or 0,
-        stdout = text,
-        stderr = "",
-        output = text,
-      })
-    end)
-    return
-  end
-
-  local stdout = {}
-  local stderr = {}
-  local pending = { stdout = "", stderr = "" }
-
-  ---@param stream "stdout"|"stderr"
-  ---@param data string|string[]?
-  local function collect(stream, data)
-    local text = normalize_system_chunk(data)
-    if text == "" then return end
-    local chunks = stream == "stdout" and stdout or stderr
-    chunks[#chunks + 1] = text
-
-    text = pending[stream] .. text:gsub("\r", "\n")
-    local parts = vim.split(text, "\n", { plain = true })
-    pending[stream] = table.remove(parts) or ""
-    for _, line in ipairs(parts) do
-      line = vim.trim(line)
-      if line ~= "" then vim.schedule(function() on_line(line) end) end
-    end
-  end
-
-  local ok, process = pcall(vim.system, command, {
-    text = true,
-    stdin = input,
-    stdout = function(_, data)
-      collect("stdout", data)
-    end,
-    stderr = function(_, data)
-      collect("stderr", data)
-    end,
-  }, function(result)
-    vim.schedule(function()
-      for _, stream in ipairs({ "stdout", "stderr" }) do
-        local line = vim.trim(pending[stream] or "")
-        if line ~= "" then on_line(line) end
-      end
-      local stdout_text = table.concat(stdout)
-      local stderr_text = table.concat(stderr)
-      cb({
-        code = result.code or 0,
-        stdout = stdout_text,
-        stderr = stderr_text,
-        output = M._system_output(stdout_text, stderr_text),
-      })
-    end)
-  end)
-  if not ok then
-    vim.schedule(function()
-      local message = tostring(process)
-      cb({
-        code = -1,
-        stdout = "",
-        stderr = message,
-        output = message,
-      })
-    end)
-  end
-end
-
----@param text string
----@return string[]
-local function text_to_lines(text)
-  text = tostring(text or ""):gsub("\r\n", "\n")
-  if text:sub(-1) == "\n" then
-    text = text:sub(1, -2)
-  end
-  if text == "" then return {} end
-  return vim.split(text, "\n", { plain = true })
-end
-
----@param command DiffReviewGitCommand
----@param cb DiffReviewGitListCallback
-local function systemlist_async(command, cb)
-  local backend = M._git_backend
-  if backend and backend.systemlist_async then
-    backend.systemlist_async(command, cb)
-    return
-  end
-  if backend and backend.systemlist then
-    vim.schedule(function()
-      local output, code = backend.systemlist(command)
-      if type(output) == "string" then
-        output = text_to_lines(output)
-      end
-      cb(output or {}, code or 0, "")
-    end)
-    return
-  end
-
-  system_text_async(command, nil, function(result)
-    cb(text_to_lines(result.stdout), result.code, result.output)
-  end)
-end
-
----@param path string
----@return integer code
-local function delete_path(path)
-  local backend = M._git_backend
-  if backend and backend.delete then
-    return backend.delete(path)
-  end
-  return vim.fn.delete(path)
-end
-
----@param cb fun(root?: string, err?: string)
-local function git_root_async(cb)
-  systemlist_async({ "git", "rev-parse", "--show-toplevel" }, function(output, code, stderr)
-    local root = output[1]
-    if code ~= 0 or not root or root == "" then
-      local message = vim.trim(stderr or "")
-      cb(nil, message ~= "" and message or "Not a git repository")
-      return
-    end
-    cb(vim.trim(root), nil)
-  end)
-end
-
----@return string? root
----@return string? err
-local function git_root_sync_for_test_backend()
-  local backend = M._git_backend
-  if not (backend and backend.systemlist) then
-    return nil, "Synchronous git root is unavailable"
-  end
-  local output, code = backend.systemlist({ "git", "rev-parse", "--show-toplevel" })
-  if type(output) == "string" then output = text_to_lines(output) end
-  local root = output and output[1]
-  if code ~= 0 or not root or root == "" then
-    return nil, "Not a git repository"
-  end
-  return vim.trim(root), nil
-end
-
----@param path string
----@return string
-local function normalize_path(path)
-  return tostring(vim.fs.normalize(vim.fn.fnamemodify(path, ":p"))):gsub("\\", "/"):gsub("/+$", "")
-end
-
----@param path string
----@return string
-local function normalize_path_text(path)
-  return tostring(path or ""):gsub("\\", "/"):gsub("/+$", "")
-end
-
----@param cwd string
----@param relpath string
----@return string
-local function repo_file_path(cwd, relpath)
-  local path = cwd:gsub("[/\\]+$", "") .. "/" .. relpath
-  if package.config:sub(1, 1) ~= "\\" and cwd:match("^%a:[/\\]") then
-    return path
-  end
-  return vim.fn.fnamemodify(path, ":p")
-end
-
----@param absolute string
----@param root_path string
----@param case_insensitive boolean
----@param original_filename string
----@return string? relpath
----@return string? err
-local function repo_relative_normalized(absolute, root_path, case_insensitive, original_filename)
-  local compare_absolute = absolute
-  local compare_root = root_path
-  if case_insensitive then
-    compare_absolute = compare_absolute:lower()
-    compare_root = compare_root:lower()
-  end
-  if compare_absolute == compare_root then
-    return ".", nil
-  end
-  local prefix = compare_root .. "/"
-  if compare_absolute:sub(1, #prefix) ~= prefix then
-    return nil, ("Path is outside the git root: %s"):format(original_filename)
-  end
-  return absolute:sub(#root_path + 2), nil
-end
-
----@param filename string
----@param root string
----@return string? relpath
----@return string? err
-local function repo_relative(filename, root)
-  return repo_relative_normalized(
-    normalize_path(filename),
-    normalize_path(root),
-    package.config:sub(1, 1) == "\\",
-    filename
-  )
-end
-
----@param filename string
----@param root string
----@param case_insensitive boolean?
----@return string? relpath
----@return string? err
-function M._repo_relative_for_test(filename, root, case_insensitive)
-  return repo_relative_normalized(normalize_path_text(filename), normalize_path_text(root), case_insensitive == true, filename)
-end
-
----@param root string
----@param args string[]
----@param input? string
----@param cb fun(result: DiffReviewGitCommandResult)
-local function run_git_at_root_async(root, args, input, cb)
-  local command = { "git", "-C", root }
-  vim.list_extend(command, args)
-  system_text_async(command, input, function(result)
-    cb({
-      ok = result.code == 0,
-      code = result.code,
-      output = vim.trim(result.output or ""),
-      stdout = result.stdout,
-      stderr = result.stderr,
-      root = root,
-      args = args,
-    })
-  end)
-end
-
----@param args string[]
----@param input? string
----@param cb fun(result: DiffReviewGitCommandResult)
-local function run_git_async(args, input, cb)
-  git_root_async(function(root, root_err)
-    if not root then
-      cb({
-        ok = false,
-        code = -1,
-        output = root_err or "Unable to find git root",
-        args = args,
-      })
-      return
-    end
-    run_git_at_root_async(root, args, input, cb)
-  end)
-end
-
----@param args string[]
----@param input? string
----@return DiffReviewGitCommandResult
-local function run_git_sync_for_test_backend(args, input)
-  local root, root_err = git_root_sync_for_test_backend()
-  if not root then
-    return {
-      ok = false,
-      code = -1,
-      output = root_err or "Unable to find git root",
-      args = args,
-    }
-  end
-  local backend = M._git_backend
-  if not (backend and backend.system) then
-    return {
-      ok = false,
-      code = -1,
-      output = "Synchronous git is unavailable",
-      root = root,
-      args = args,
-    }
-  end
-  local command = { "git", "-C", root }
-  vim.list_extend(command, args)
-  local output, code = backend.system(command, input)
-  return {
-    ok = (code or 0) == 0,
-    code = code or 0,
-    output = vim.trim(tostring(output or "")),
-    root = root,
-    args = args,
-  }
-end
 
 ---@param title string
 ---@param failures DiffReviewGitFailure[]
@@ -882,7 +546,7 @@ end
 ---@param title string
 ---@param cb fun(result: { ok: boolean, successes: string[], failures: DiffReviewGitFailure[] })
 local function run_file_batch_async(files, args_for_file, title, cb)
-  git_root_async(function(root, root_err)
+  git_backend.git_root_async(function(root, root_err)
   if not root then
     local failures = { { message = root_err or "Unable to find git root" } }
     M.notify_git_failures(title, failures)
@@ -908,7 +572,7 @@ local function run_file_batch_async(files, args_for_file, title, cb)
       finish_all()
       return
     end
-    run_git_at_root_async(root, task.args, nil, function(result)
+    git_backend.run_git_at_root_async(root, task.args, nil, function(result)
       if result.ok then
         successes[#successes + 1] = task.filename
       else
@@ -940,7 +604,7 @@ end
 ---@param title string
 ---@return { ok: boolean, successes: string[], failures: DiffReviewGitFailure[] }
 local function run_file_batch_sync_for_test_backend(files, args_for_file, title)
-  local root, root_err = git_root_sync_for_test_backend()
+  local root, root_err = git_backend.git_root_sync_for_test_backend()
   if not root then
     local failures = { { message = root_err or "Unable to find git root" } }
     M.notify_git_failures(title, failures)
@@ -957,7 +621,7 @@ local function run_file_batch_sync_for_test_backend(files, args_for_file, title)
       if not relpath then
         failures[#failures + 1] = { file = filename, message = rel_err }
       else
-        local result = run_git_sync_for_test_backend(args_for_file(relpath))
+        local result = git_backend.run_git_sync_for_test_backend(args_for_file(relpath))
         if result.ok then
           successes[#successes + 1] = filename
         else
@@ -981,7 +645,7 @@ function M.stage_patch_async(diff, cb)
     cb(false)
     return
   end
-  run_git_async({ "apply", "--cached", "--whitespace=nowarn", "--unidiff-zero", "-" }, diff .. "\n", function(result)
+  git_backend.run_git_async({ "apply", "--cached", "--whitespace=nowarn", "--unidiff-zero", "-" }, diff .. "\n", function(result)
     if not result.ok then
       notify_error("Stage failed: " .. (result.output ~= "" and result.output or ("git exited " .. result.code)))
       cb(false)
@@ -999,7 +663,7 @@ function M.unstage_patch_async(diff, cb)
     cb(false)
     return
   end
-  run_git_async({ "apply", "--cached", "--reverse", "--whitespace=nowarn", "--unidiff-zero", "-" }, diff .. "\n", function(result)
+  git_backend.run_git_async({ "apply", "--cached", "--reverse", "--whitespace=nowarn", "--unidiff-zero", "-" }, diff .. "\n", function(result)
     if not result.ok then
       notify_error("Unstage failed: " .. (result.output ~= "" and result.output or ("git exited " .. result.code)))
       cb(false)
@@ -1016,7 +680,7 @@ function M.stage_patch(diff)
     notify_error("No patch to stage")
     return false
   end
-  local result = run_git_sync_for_test_backend({ "apply", "--cached", "--whitespace=nowarn", "--unidiff-zero", "-" }, diff .. "\n")
+  local result = git_backend.run_git_sync_for_test_backend({ "apply", "--cached", "--whitespace=nowarn", "--unidiff-zero", "-" }, diff .. "\n")
   if not result.ok then
     notify_error("Stage failed: " .. (result.output ~= "" and result.output or ("git exited " .. result.code)))
     return false
@@ -1031,7 +695,7 @@ function M.unstage_patch(diff)
     notify_error("No patch to unstage")
     return false
   end
-  local result = run_git_sync_for_test_backend({ "apply", "--cached", "--reverse", "--whitespace=nowarn", "--unidiff-zero", "-" }, diff .. "\n")
+  local result = git_backend.run_git_sync_for_test_backend({ "apply", "--cached", "--reverse", "--whitespace=nowarn", "--unidiff-zero", "-" }, diff .. "\n")
   if not result.ok then
     notify_error("Unstage failed: " .. (result.output ~= "" and result.output or ("git exited " .. result.code)))
     return false
@@ -1313,7 +977,7 @@ end
 ---@param cb fun(hunks: DiffReviewHunk[])
 local function get_hunks_async(cwd, staged, cb)
   local args = M._git_diff_command(cwd, staged and { "--cached" } or nil)
-  systemlist_async(args, function(result, code)
+  git_backend.systemlist_async(args, function(result, code)
     if code ~= 0 then
       cb({})
       return
@@ -1645,132 +1309,169 @@ end
 ---@param filename string
 ---@param cb fun(syntax?: DiffReviewTreeSitterSyntax)
 function M.compute_file_syntax_async(filename, cb)
-  local buf = treesitter_source_buffer(filename)
-  if not buf then
-    cb(nil)
-    return
-  end
-
-  local ft = vim.bo[buf].filetype
-  if ft == "" then
-    ft = detect_filetype(filename)
-  end
-  local lang = vim.treesitter.language.get_lang(ft)
-  if not lang then
-    cb(nil)
-    return
-  end
-
-  local highlight_ok, highlight_query = pcall(vim.treesitter.query.get, lang, "highlights")
-  if not highlight_ok then highlight_query = nil end
-
-  local parser_ok, parser = pcall(vim.treesitter.get_parser, buf, lang)
-  if not parser_ok or not parser then
-    cb(nil)
-    return
-  end
-
-  local line_count = math.max(vim.api.nvim_buf_line_count(buf), 1)
-  local done = false
-  local function finish(trees)
-    if done then return end
-    done = true
-    local tree = type(trees) == "table" and trees[1] or nil
-    if not tree then
+  return M._status_perf_span("treesitter.compute_file_syntax_async", M._status and M._status.buf or nil, {
+    file = filename,
+  }, function()
+    local buf = treesitter_source_buffer(filename)
+    if not buf then
       cb(nil)
       return
     end
-    cb({
-      buf = buf,
-      tree = tree,
-      highlight_query = highlight_query,
-    })
-  end
 
-  local parse_ok, parsed = pcall(function()
-    return parser:parse({ 0, 0, line_count, 0 }, function(first, second)
-      local trees = type(first) == "table" and first or second
-      vim.schedule(function()
-        finish(trees)
+    local ft = vim.bo[buf].filetype
+    if ft == "" then
+      ft = detect_filetype(filename)
+    end
+    local lang = vim.treesitter.language.get_lang(ft)
+    if not lang then
+      cb(nil)
+      return
+    end
+
+    local highlight_ok, highlight_query = pcall(vim.treesitter.query.get, lang, "highlights")
+    if not highlight_ok then highlight_query = nil end
+
+    local parser_ok, parser = M._status_perf_span("treesitter.compute_file_syntax_async.get_parser", M._status and M._status.buf or nil, {
+      file = filename,
+      lang = lang,
+    }, function()
+      return pcall(vim.treesitter.get_parser, buf, lang)
+    end)
+    if not parser_ok or not parser then
+      cb(nil)
+      return
+    end
+
+    local line_count = math.max(vim.api.nvim_buf_line_count(buf), 1)
+    local done = false
+    local function finish(trees)
+      if done then return end
+      done = true
+      local tree = type(trees) == "table" and trees[1] or nil
+      if not tree then
+        cb(nil)
+        return
+      end
+      cb({
+        buf = buf,
+        tree = tree,
+        highlight_query = highlight_query,
+      })
+    end
+
+    local parse_ok, parsed = M._status_perf_span("treesitter.compute_file_syntax_async.parse_call", M._status and M._status.buf or nil, {
+      file = filename,
+      lang = lang,
+      source_line_count = line_count,
+    }, function()
+      return pcall(function()
+        return parser:parse({ 0, 0, line_count, 0 }, function(first, second)
+          local trees = type(first) == "table" and first or second
+          vim.schedule(function()
+            finish(trees)
+          end)
+        end)
       end)
     end)
+    if not parse_ok then
+      cb(nil)
+    elseif parsed then
+      vim.schedule(function()
+        finish(parsed)
+      end)
+    end
   end)
-  if not parse_ok then
-    cb(nil)
-  elseif parsed then
-    vim.schedule(function()
-      finish(parsed)
-    end)
-  end
 end
 
 ---@param filename string
 ---@param lines string[]
 ---@param cb fun(syntax?: DiffReviewTreeSitterSyntax)
 function M.compute_diff_syntax_async(filename, lines, cb)
-  if #lines == 0 then
-    cb(nil)
-    return
-  end
+  return M._status_perf_span("treesitter.compute_diff_syntax_async", M._status and M._status.buf or nil, {
+    file = filename,
+    source_line_count = #lines,
+  }, function()
+    if #lines == 0 then
+      cb(nil)
+      return
+    end
 
-  local ft = detect_filetype(filename, lines)
-  local lang = vim.treesitter.language.get_lang(ft)
-  if not lang then
-    cb(nil)
-    return
-  end
+    local ft = detect_filetype(filename, lines)
+    local lang = vim.treesitter.language.get_lang(ft)
+    if not lang then
+      cb(nil)
+      return
+    end
 
-  local highlight_ok, highlight_query = pcall(vim.treesitter.query.get, lang, "highlights")
-  if not highlight_ok then highlight_query = nil end
+    local highlight_ok, highlight_query = pcall(vim.treesitter.query.get, lang, "highlights")
+    if not highlight_ok then highlight_query = nil end
 
-  local buf = vim.api.nvim_create_buf(false, true)
-  vim.bo[buf].bufhidden = "wipe"
-  vim.bo[buf].buftype = "nofile"
-  vim.bo[buf].swapfile = false
-  vim.bo[buf].filetype = ft
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.bo[buf].bufhidden = "wipe"
+    vim.bo[buf].buftype = "nofile"
+    vim.bo[buf].swapfile = false
+    vim.bo[buf].filetype = ft
+    M._status_perf_span("treesitter.compute_diff_syntax_async.set_lines", M._status and M._status.buf or nil, {
+      file = filename,
+      lang = lang,
+      source_line_count = #lines,
+    }, function()
+      vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+    end)
 
-  local parser_ok, parser = pcall(vim.treesitter.get_parser, buf, lang)
-  if not parser_ok or not parser then
-    pcall(vim.api.nvim_buf_delete, buf, { force = true })
-    cb(nil)
-    return
-  end
-
-  local line_count = math.max(vim.api.nvim_buf_line_count(buf), 1)
-  local done = false
-  local function finish(trees)
-    if done then return end
-    done = true
-    local tree = type(trees) == "table" and trees[1] or nil
-    if not tree then
+    local parser_ok, parser = M._status_perf_span("treesitter.compute_diff_syntax_async.get_parser", M._status and M._status.buf or nil, {
+      file = filename,
+      lang = lang,
+    }, function()
+      return pcall(vim.treesitter.get_parser, buf, lang)
+    end)
+    if not parser_ok or not parser then
       pcall(vim.api.nvim_buf_delete, buf, { force = true })
       cb(nil)
       return
     end
-    cb({
-      buf = buf,
-      tree = tree,
-      highlight_query = highlight_query,
-    })
-  end
 
-  local parse_ok, parsed = pcall(function()
-    return parser:parse({ 0, 0, line_count, 0 }, function(first, second)
-      local trees = type(first) == "table" and first or second
-      vim.schedule(function()
-        finish(trees)
+    local line_count = math.max(vim.api.nvim_buf_line_count(buf), 1)
+    local done = false
+    local function finish(trees)
+      if done then return end
+      done = true
+      local tree = type(trees) == "table" and trees[1] or nil
+      if not tree then
+        pcall(vim.api.nvim_buf_delete, buf, { force = true })
+        cb(nil)
+        return
+      end
+      cb({
+        buf = buf,
+        tree = tree,
+        highlight_query = highlight_query,
+      })
+    end
+
+    local parse_ok, parsed = M._status_perf_span("treesitter.compute_diff_syntax_async.parse_call", M._status and M._status.buf or nil, {
+      file = filename,
+      lang = lang,
+      source_line_count = line_count,
+    }, function()
+      return pcall(function()
+        return parser:parse({ 0, 0, line_count, 0 }, function(first, second)
+          local trees = type(first) == "table" and first or second
+          vim.schedule(function()
+            finish(trees)
+          end)
+        end)
       end)
     end)
+    if not parse_ok then
+      pcall(vim.api.nvim_buf_delete, buf, { force = true })
+      cb(nil)
+    elseif parsed then
+      vim.schedule(function()
+        finish(parsed)
+      end)
+    end
   end)
-  if not parse_ok then
-    pcall(vim.api.nvim_buf_delete, buf, { force = true })
-    cb(nil)
-  elseif parsed then
-    vim.schedule(function()
-      finish(parsed)
-    end)
-  end
 end
 
 --- Return cached Tree-sitter context and kick off an async request if needed.
@@ -1813,29 +1514,40 @@ end
 ---@return DiffReviewTreeSitterSyntax? syntax
 ---@return boolean pending
 local function cached_file_syntax(filename, callback_key, on_update)
-  M._ts_syntax_cache = M._ts_syntax_cache or {}
-  local cached = M._ts_syntax_cache[filename]
-  if cached == false then return nil, false end
-  if type(cached) == "table" and not cached.pending then return cached, false end
-  if type(cached) == "table" and cached.pending then
-    if on_update then cached.callbacks[callback_key] = on_update end
-    return nil, true
-  end
-
-  M._ts_syntax_cache[filename] = {
-    pending = true,
-    callbacks = on_update and { [callback_key] = on_update } or {},
-  }
-  M.compute_file_syntax_async(filename, function(syntax)
-    local pending = M._ts_syntax_cache and M._ts_syntax_cache[filename]
-    local callbacks = type(pending) == "table" and pending.callbacks or {}
-    M._ts_syntax_cache[filename] = syntax or false
-    for _, callback in pairs(callbacks) do
-      local ok, err = pcall(callback, syntax)
-      if not ok then notify_error("Tree-sitter syntax update failed: " .. tostring(err)) end
+  local status_buf = M._status and M._status.buf or nil
+  return M._status_perf_span("syntax.cached_file_syntax", status_buf, {
+    file = filename,
+    callback_key = callback_key,
+  }, function()
+    M._ts_syntax_cache = M._ts_syntax_cache or {}
+    local cached = M._ts_syntax_cache[filename]
+    if cached == false then return nil, false end
+    if type(cached) == "table" and not cached.pending then return cached, false end
+    if type(cached) == "table" and cached.pending then
+      if on_update then cached.callbacks[callback_key] = on_update end
+      return nil, true
     end
+
+    M._ts_syntax_cache[filename] = {
+      pending = true,
+      callbacks = on_update and { [callback_key] = on_update } or {},
+    }
+    M._status_perf_span("syntax.cached_file_syntax.compute", status_buf, {
+      file = filename,
+      callback_key = callback_key,
+    }, function()
+      M.compute_file_syntax_async(filename, function(syntax)
+        local pending = M._ts_syntax_cache and M._ts_syntax_cache[filename]
+        local callbacks = type(pending) == "table" and pending.callbacks or {}
+        M._ts_syntax_cache[filename] = syntax or false
+        for _, callback in pairs(callbacks) do
+          local ok, err = pcall(callback, syntax)
+          if not ok then notify_error("Tree-sitter syntax update failed: " .. tostring(err)) end
+        end
+      end)
+    end)
+    return nil, true
   end)
-  return nil, true
 end
 
 ---@param context DiffReviewHunkTreeSitterContext|string?
@@ -1861,19 +1573,7 @@ local function same_hunk_context_scope(left, right)
   return left_key ~= nil and left_key == hunk_context_scope_key(right)
 end
 
----@param context DiffReviewHunkTreeSitterContext|string?
----@return DiffReviewHunkBoundaryContext?
-function M._hunk_context_ancestor_boundary(context)
-  if type(context) ~= "table" or type(context.ancestor_boundaries) ~= "table" then return nil end
-  return context.ancestor_boundaries[#context.ancestor_boundaries]
-end
 
----@param context DiffReviewHunkTreeSitterContext|string?
----@return string?
-function M._hunk_context_ancestor_key(context)
-  local boundary = M._hunk_context_ancestor_boundary(context)
-  return boundary and boundary.key or nil
-end
 
 ---@param left DiffReviewHunkTreeSitterContext|string?
 ---@param right DiffReviewHunkTreeSitterContext|string?
@@ -1909,38 +1609,7 @@ local function hunk_visible_source_lines(diff_lines)
   return visible
 end
 
----@param hunk DiffReviewParsedHunk
----@return fun(parsed_line: DiffReviewParsedHunkLine): boolean
-function M._hunk_render_line_filter(hunk)
-  local first_changed_position = nil
-  local last_changed_position = nil
-  for _, parsed_line in ipairs(hunk.lines or {}) do
-    if parsed_line.prefix == "+" or parsed_line.prefix == "-" then
-      first_changed_position = math.min(first_changed_position or parsed_line.position, parsed_line.position)
-      last_changed_position = math.max(last_changed_position or parsed_line.position, parsed_line.position)
-    end
-  end
-  if not first_changed_position or not last_changed_position then
-    return function() return true end
-  end
-  return function(parsed_line)
-    if parsed_line.prefix ~= " " then return true end
-    return parsed_line.position >= first_changed_position and parsed_line.position <= last_changed_position
-  end
-end
 
----@param parsed_lines DiffReviewParsedHunkLine[]
----@param include_line? fun(parsed_line: DiffReviewParsedHunkLine): boolean
----@return table<string, boolean>
-function M._hunk_visible_parsed_source_lines(parsed_lines, include_line)
-  local visible = {}
-  for _, parsed_line in ipairs(parsed_lines or {}) do
-    if (not include_line or include_line(parsed_line)) and (parsed_line.prefix == " " or parsed_line.prefix == "+" or parsed_line.prefix == "-") then
-      visible[parsed_line.code] = true
-    end
-  end
-  return visible
-end
 
 ---@class DiffReviewGutterSpec
 ---@field width integer
@@ -2073,6 +1742,29 @@ end
 M._ts_context_cache = {}
 M._ts_source_bufs = {}
 
+---@param value string?
+---@param key string
+---@param replacement string
+---@return string
+function M._status_window_option_with_pair(value, key, replacement)
+  local option_by_key = {}
+  local option_order = {}
+  for option in tostring(value or ""):gmatch("[^,]+") do
+    local option_key, option_value = option:match("^([^:]+):(.*)$")
+    if option_key and option_key ~= "" then
+      if option_by_key[option_key] == nil then option_order[#option_order + 1] = option_key end
+      option_by_key[option_key] = option_value
+    end
+  end
+  if option_by_key[key] == nil then option_order[#option_order + 1] = key end
+  option_by_key[key] = replacement
+  local parts = {}
+  for _, option_key in ipairs(option_order) do
+    parts[#parts + 1] = option_key .. ":" .. option_by_key[option_key]
+  end
+  return table.concat(parts, ",")
+end
+
 ---@param win integer?
 function M._hide_line_numbers(win)
   if not (win and vim.api.nvim_win_is_valid(win)) then return end
@@ -2083,6 +1775,12 @@ function M._hide_line_numbers(win)
       relativenumber = vim.wo[win].relativenumber,
       signcolumn = vim.wo[win].signcolumn,
       foldcolumn = vim.wo[win].foldcolumn,
+      foldenable = vim.wo[win].foldenable,
+      foldlevel = vim.wo[win].foldlevel,
+      foldmethod = vim.wo[win].foldmethod,
+      foldtext = vim.wo[win].foldtext,
+      fillchars = vim.wo[win].fillchars,
+      winhighlight = vim.wo[win].winhighlight,
       virtualedit = vim.wo[win].virtualedit,
       wrap = vim.wo[win].wrap,
       linebreak = vim.wo[win].linebreak,
@@ -2108,6 +1806,12 @@ function M._apply_status_window_options(win, _state)
   vim.wo[win].breakindent = false
   vim.wo[win].conceallevel = 0
   vim.wo[win].concealcursor = ""
+  vim.wo[win].foldenable = true
+  vim.wo[win].foldlevel = 99
+  vim.wo[win].foldmethod = "manual"
+  vim.wo[win].foldtext = "v:lua.diff_review_status_foldtext()"
+  vim.wo[win].fillchars = M._status_window_option_with_pair(vim.wo[win].fillchars, "fold", " ")
+  vim.wo[win].winhighlight = M._status_window_option_with_pair(vim.wo[win].winhighlight, "Folded", "Normal")
 end
 
 ---@param win integer?
@@ -2118,6 +1822,12 @@ function M._restore_line_numbers(win)
   vim.wo[win].relativenumber = saved.relativenumber
   vim.wo[win].signcolumn = saved.signcolumn or "auto"
   vim.wo[win].foldcolumn = saved.foldcolumn or "0"
+  vim.wo[win].foldenable = saved.foldenable
+  vim.wo[win].foldlevel = saved.foldlevel or 0
+  vim.wo[win].foldmethod = saved.foldmethod or "manual"
+  vim.wo[win].foldtext = saved.foldtext or "foldtext()"
+  vim.wo[win].fillchars = saved.fillchars or ""
+  vim.wo[win].winhighlight = saved.winhighlight or ""
   vim.wo[win].virtualedit = saved.virtualedit or ""
   vim.wo[win].wrap = saved.wrap
   vim.wo[win].linebreak = saved.linebreak
@@ -2127,10 +1837,39 @@ function M._restore_line_numbers(win)
   M._saved_wo[win] = nil
 end
 
+--- Register a view controller per status-like view kind so command vocabulary and
+--- render hooks resolve through a narrow per-view boundary instead of inline branches.
+function M._status_register_view_controllers()
+  local controllers = M._diff_view_controller_model
+  local command_sets = M._diff_view_command_set_model
+  controllers.reset()
+  local keymaps = (M.config or config.options or config.defaults).keymaps or {}
+  local after_render_by_kind = {
+    status = M._status_after_render_status,
+    pr = M._status_after_render_pr,
+    review = M._status_after_render_review,
+  }
+  for _, view_kind in ipairs({ "status", "pr", "review", "diff" }) do
+    local command_keys = (view_kind == "review" and keymaps.review) or keymaps.status or {}
+    local set = command_sets.new()
+    for command_id in pairs(command_keys) do
+      command_sets.register(set, command_id, function() end)
+    end
+    local after_render = after_render_by_kind[view_kind]
+    controllers.register(controllers.new({
+      view_kind = view_kind,
+      command_set = function() return set end,
+      after_render = after_render and function(state) after_render(state.buf) end or nil,
+    }))
+  end
+end
+
 ---@param opts? DiffReviewConfig
 function M.setup(opts)
   M.config = config.setup(opts)
+  M._diff_perf.configure_from_diff_review_options(M.config)
   setup_bg_highlights()
+  M._status_register_view_controllers()
 end
 
 --- Close and wipe all diff buffers
@@ -2396,17 +2135,17 @@ local function collect_items_from_git(cwd, cb, _ctx)
     results.staged = hunks
     finish_one()
   end)
-  systemlist_async({ "git", "-C", cwd, "ls-files", "--others", "--exclude-standard" }, function(output, code)
+  git_backend.systemlist_async({ "git", "-C", cwd, "ls-files", "--others", "--exclude-standard" }, function(output, code)
     results.untracked_output = output
     results.untracked_code = code
     finish_one()
   end)
-  systemlist_async({ "git", "-C", cwd, "diff", "--cached", "--name-status" }, function(output, code)
+  git_backend.systemlist_async({ "git", "-C", cwd, "diff", "--cached", "--name-status" }, function(output, code)
     results.staged_name_status = output
     results.staged_name_status_code = code
     finish_one()
   end)
-  systemlist_async({ "git", "-C", cwd, "diff", "--name-status" }, function(output, code)
+  git_backend.systemlist_async({ "git", "-C", cwd, "diff", "--name-status" }, function(output, code)
     results.unstaged_name_status = output
     results.unstaged_name_status_code = code
     finish_one()
@@ -2416,7 +2155,7 @@ end
 ---@param cb fun(items: table[])
 ---@param _ctx table?
 function M.get(cb, _ctx)
-  git_root_async(function(cwd)
+  git_backend.git_root_async(function(cwd)
     if not cwd then
       cb({})
       return
@@ -2924,135 +2663,16 @@ local function hunk_first_changed_current_line(hunk)
   return hunk.new_start
 end
 
----@param hunk DiffReviewParsedHunk
----@param include_line? fun(parsed_line: DiffReviewParsedHunkLine): boolean
----@return integer
-function M._hunk_after_current_line(hunk, include_line)
-  local last_new_line = nil
-  local saw_removed_line = false
-  for _, parsed_line in ipairs(hunk.lines) do
-    if not include_line or include_line(parsed_line) then
-      if parsed_line.new_line then last_new_line = parsed_line.new_line end
-      if parsed_line.prefix == "-" then saw_removed_line = true end
-    end
-  end
-  if last_new_line then return last_new_line + 1 end
-  if saw_removed_line then return hunk.new_start end
-  return hunk.new_start
-end
 
----@param hunk DiffReviewParsedHunk
----@param include_line? fun(parsed_line: DiffReviewParsedHunkLine): boolean
----@return table<integer, boolean>
-function M._hunk_current_line_set(hunk, include_line)
-  local lines = {}
-  for _, parsed_line in ipairs(hunk.lines) do
-    if parsed_line.new_line and (not include_line or include_line(parsed_line)) then lines[parsed_line.new_line] = true end
-  end
-  return lines
-end
 
----@param item table
----@return DiffReviewParsedHunkLine
-function M._hunk_render_item_line(item)
-  return item.line or item.display_line
-end
 
----@param item table
----@return DiffReviewParsedHunkLine[]
-function M._hunk_render_item_backing_lines(item)
-  if item.kind == "replacement" then return item.diff_lines or { item.display_line } end
-  return { item.line }
-end
 
----@param item table
----@return boolean
-function M._hunk_render_item_changed(item)
-  if item.kind == "replacement" then return true end
-  local parsed_line = M._hunk_render_item_line(item)
-  return parsed_line.prefix == "+" or parsed_line.prefix == "-"
-end
 
----@param hunk DiffReviewParsedHunk
----@return table<integer, integer>
-function M._hunk_current_line_by_position(hunk)
-  local by_position = {}
-  local current_line = hunk.new_start
-  for _, parsed_line in ipairs(hunk.lines or {}) do
-    if parsed_line.prefix == " " then
-      if parsed_line.position and parsed_line.new_line then by_position[parsed_line.position] = parsed_line.new_line end
-      if parsed_line.new_line then current_line = parsed_line.new_line + 1 end
-    elseif parsed_line.prefix == "+" then
-      if parsed_line.position and parsed_line.new_line then by_position[parsed_line.position] = parsed_line.new_line end
-      if parsed_line.new_line then current_line = parsed_line.new_line + 1 end
-    elseif parsed_line.prefix == "-" then
-      if parsed_line.position then by_position[parsed_line.position] = current_line end
-    end
-  end
-  return by_position
-end
 
----@param parsed_line DiffReviewParsedHunkLine?
----@param line_by_position table<integer, integer>
----@return integer?
-function M._hunk_parsed_line_current_line(parsed_line, line_by_position)
-  if not parsed_line then return nil end
-  return parsed_line.new_line or (parsed_line.position and line_by_position[parsed_line.position]) or parsed_line.old_line
-end
 
----@param item table
----@param line_by_position table<integer, integer>
----@return integer?
-function M._hunk_render_item_context_line(item, line_by_position)
-  if item.kind == "replacement" then
-    for _, parsed_line in ipairs(item.new_lines or {}) do
-      if parsed_line.new_line then return parsed_line.new_line end
-    end
-  end
-  return M._hunk_parsed_line_current_line(M._hunk_render_item_line(item), line_by_position)
-end
 
----@param item table
----@param line_by_position table<integer, integer>
----@return integer?
----@return integer?
-function M._hunk_render_item_changed_line_range(item, line_by_position)
-  local first_line = nil
-  local last_line = nil
-  for _, parsed_line in ipairs(M._hunk_render_item_backing_lines(item)) do
-    if parsed_line.prefix == "+" or parsed_line.prefix == "-" then
-      local current_line = M._hunk_parsed_line_current_line(parsed_line, line_by_position)
-      if current_line then
-        first_line = math.min(first_line or current_line, current_line)
-        last_line = math.max(last_line or current_line, current_line)
-      end
-    end
-  end
-  return first_line, last_line
-end
 
----@param context DiffReviewHunkTreeSitterContext|string?
----@param line integer?
----@return boolean
-function M._hunk_context_contains_line(context, line)
-  if type(context) ~= "table" or not line then return true end
-  return line >= context.start_row + 1 and line <= context.end_row + 1
-end
 
----@param hunk DiffReviewParsedHunk
----@param line_by_position? table<integer, integer>
----@return table<integer, boolean>
-function M._hunk_changed_current_line_set(hunk, line_by_position)
-  line_by_position = line_by_position or M._hunk_current_line_by_position(hunk)
-  local lines = {}
-  for _, parsed_line in ipairs(hunk.lines or {}) do
-    if parsed_line.prefix == "+" or parsed_line.prefix == "-" then
-      local current_line = M._hunk_parsed_line_current_line(parsed_line, line_by_position)
-      if current_line then lines[current_line] = true end
-    end
-  end
-  return lines
-end
 
 ---@class DiffReviewHunkChangeRegion
 ---@field first_item integer
@@ -3065,104 +2685,8 @@ end
 ---@field added integer
 ---@field removed integer
 
----@param item table
----@return integer added
----@return integer removed
-function M._hunk_render_item_stats(item)
-  local added = 0
-  local removed = 0
-  for _, parsed_line in ipairs(M._hunk_render_item_backing_lines(item)) do
-    if parsed_line.prefix == "+" then
-      added = added + 1
-    elseif parsed_line.prefix == "-" then
-      removed = removed + 1
-    end
-  end
-  return added, removed
-end
 
----@param render_items table[]
----@param line_by_position table<integer, integer>
----@param context_for_line fun(line: integer): DiffReviewHunkTreeSitterContext|string?
----@return DiffReviewHunkChangeRegion[]
-function M._hunk_change_regions(render_items, line_by_position, context_for_line)
-  local regions = {}
-  local current_region = nil
-  for item_index, item in ipairs(render_items or {}) do
-    if M._hunk_render_item_changed(item) then
-      local context_line = M._hunk_render_item_context_line(item, line_by_position)
-      local item_context = nil
-      if type(current_region and current_region.context) == "table"
-        and M._hunk_context_contains_line(current_region.context, context_line) then
-        item_context = current_region.context
-      else
-        item_context = context_line and context_for_line(context_line) or nil
-      end
-      local context_key = hunk_context_scope_key(item_context)
-      local changed_line, last_changed_line = M._hunk_render_item_changed_line_range(item, line_by_position)
-      local added, removed = M._hunk_render_item_stats(item)
-      local can_merge = current_region ~= nil
-        and (
-          (
-            context_key ~= nil
-            and current_region.context_key == context_key
-            and M._hunk_context_contains_line(current_region.context, context_line)
-          )
-          or (
-            context_key == nil
-            and current_region.context_key == nil
-            and type(current_region.context) ~= "table"
-            and type(item_context) ~= "table"
-          )
-        )
-      if not can_merge then
-        current_region = {
-          first_item = item_index,
-          last_item = item_index,
-          context_line = context_line,
-          context = item_context,
-          context_key = context_key,
-          changed_line = changed_line or context_line,
-          after_line = last_changed_line and (last_changed_line + 1) or context_line,
-          added = added,
-          removed = removed,
-        }
-        regions[#regions + 1] = current_region
-      else
-        current_region.last_item = item_index
-        if changed_line then current_region.changed_line = math.min(current_region.changed_line or changed_line, changed_line) end
-        if last_changed_line then current_region.after_line = math.max(current_region.after_line or last_changed_line + 1, last_changed_line + 1) end
-        current_region.added = (current_region.added or 0) + added
-        current_region.removed = (current_region.removed or 0) + removed
-      end
-    end
-  end
-  if #regions == 0 and #render_items > 0 then
-    regions[1] = {
-      first_item = 1,
-      last_item = #render_items,
-      added = 0,
-      removed = 0,
-    }
-  end
-  return regions
-end
 
----@param region DiffReviewHunkChangeRegion
----@param fallback_hunk? DiffReviewParsedHunk
----@return table[]
-function M._hunk_virtual_header_parts(region, fallback_hunk)
-  local added = region.added
-  local removed = region.removed
-  if added == nil and fallback_hunk then added = fallback_hunk.added end
-  if removed == nil and fallback_hunk then removed = fallback_hunk.removed end
-  return {
-    { "@@ ", "DiffReviewHunkHeader" },
-    { ("+%d"):format(added or 0), "DiffReviewAddRange" },
-    { " ", "DiffReviewHunkHeader" },
-    { ("-%d"):format(removed or 0), "DiffReviewDeleteRange" },
-  }
-end
 
 ---@param hunk DiffReviewHunk?
 ---@return integer?
@@ -3186,18 +2710,6 @@ local function hunk_line_visible_in_context_scope(parsed_line, context)
   return parsed_line.new_line >= scope_start and parsed_line.new_line <= scope_end
 end
 
----@param parsed_line DiffReviewParsedHunkLine
----@param previous_visible_changed boolean
----@param context DiffReviewHunkTreeSitterContext|string?
----@param visible_in_hunk? boolean
----@return boolean
-function M._hunk_hidden_closing_boundary_after_change(parsed_line, previous_visible_changed, context, visible_in_hunk)
-  if not previous_visible_changed then return false end
-  if parsed_line.prefix ~= " " or type(context) ~= "table" then return false end
-  if visible_in_hunk and hunk_line_visible_in_context_scope(parsed_line, context) then return false end
-  if not parsed_line.new_line then return false end
-  return parsed_line.code:match("^%s*[})%]]+[,;]?%s*$") ~= nil
-end
 
 ---@alias DiffReviewDiffSyntaxSide "old"|"new"
 
@@ -3205,20 +2717,25 @@ end
 ---@param side DiffReviewDiffSyntaxSide
 ---@return string[]
 local function diff_syntax_source_lines(diff_text, side)
-  local lines = {}
-  for _, block in ipairs(parse_unified_diff(diff_text)) do
-    for _, hunk in ipairs(block.hunks) do
-      local parsed_hunk = parse_hunk_body(hunk)
-      for _, parsed_line in ipairs(parsed_hunk.lines) do
-        if parsed_line.prefix == " "
-          or (side == "old" and parsed_line.prefix == "-")
-          or (side == "new" and parsed_line.prefix == "+") then
-          lines[#lines + 1] = parsed_line.code
+  return M._status_perf_span("syntax.diff_source_lines", M._status and M._status.buf or nil, {
+    side = side,
+    diff_len = #(diff_text or ""),
+  }, function()
+    local lines = {}
+    for _, block in ipairs(parse_unified_diff(diff_text)) do
+      for _, hunk in ipairs(block.hunks) do
+        local parsed_hunk = parse_hunk_body(hunk)
+        for _, parsed_line in ipairs(parsed_hunk.lines) do
+          if parsed_line.prefix == " "
+            or (side == "old" and parsed_line.prefix == "-")
+            or (side == "new" and parsed_line.prefix == "+") then
+            lines[#lines + 1] = parsed_line.code
+          end
         end
       end
     end
-  end
-  return lines
+    return lines
+  end)
 end
 
 ---@param filename string
@@ -3229,109 +2746,160 @@ end
 ---@return DiffReviewTreeSitterSyntax? syntax
 ---@return boolean pending
 local function cached_diff_syntax(filename, diff_text, side, callback_key, on_update)
-  M._ts_diff_syntax_cache = M._ts_diff_syntax_cache or {}
-  local cache_key = ("%s:%s:%s"):format(filename, side, vim.fn.sha256(diff_text or ""))
-  local cached = M._ts_diff_syntax_cache[cache_key]
-  if cached == false then return nil, false end
-  if type(cached) == "table" and not cached.pending then return cached, false end
-  if type(cached) == "table" and cached.pending then
-    if on_update then cached.callbacks[callback_key] = on_update end
-    return nil, true
-  end
-
-  local lines = diff_syntax_source_lines(diff_text, side)
-  if #lines == 0 then return nil, false end
-  M._ts_diff_syntax_cache[cache_key] = {
-    pending = true,
-    callbacks = on_update and { [callback_key] = on_update } or {},
-  }
-  M.compute_diff_syntax_async(filename, lines, function(syntax)
-    local pending = M._ts_diff_syntax_cache and M._ts_diff_syntax_cache[cache_key]
-    local callbacks = type(pending) == "table" and pending.callbacks or {}
-    M._ts_diff_syntax_cache[cache_key] = syntax or false
-    for _, callback in pairs(callbacks) do
-      local ok, err = pcall(callback, syntax)
-      if not ok then notify_error("Tree-sitter diff syntax update failed: " .. tostring(err)) end
+  local status_buf = M._status and M._status.buf or nil
+  return M._status_perf_span("syntax.cached_diff_syntax", status_buf, {
+    file = filename,
+    side = side,
+    callback_key = callback_key,
+    diff_len = #(diff_text or ""),
+  }, function()
+    M._ts_diff_syntax_cache = M._ts_diff_syntax_cache or {}
+    local diff_hash = M._status_perf_span("syntax.cached_diff_syntax.sha256", status_buf, {
+      file = filename,
+      side = side,
+      diff_len = #(diff_text or ""),
+    }, function()
+      return vim.fn.sha256(diff_text or "")
+    end)
+    local cache_key = ("%s:%s:%s"):format(filename, side, diff_hash)
+    local cached = M._ts_diff_syntax_cache[cache_key]
+    if cached == false then return nil, false end
+    if type(cached) == "table" and not cached.pending then return cached, false end
+    if type(cached) == "table" and cached.pending then
+      if on_update then cached.callbacks[callback_key] = on_update end
+      return nil, true
     end
-    if syntax and status_render_current_model and M._status and M._status.buf then
-      vim.schedule(function()
-        if M._status and M._status.buf and vim.api.nvim_buf_is_valid(M._status.buf) then
-          status_render_current_model()
+
+    local lines = M._status_perf_span("syntax.cached_diff_syntax.source_lines", status_buf, {
+      file = filename,
+      side = side,
+      diff_len = #(diff_text or ""),
+    }, function()
+      return diff_syntax_source_lines(diff_text, side)
+    end)
+    if #lines == 0 then return nil, false end
+    M._ts_diff_syntax_cache[cache_key] = {
+      pending = true,
+      callbacks = on_update and { [callback_key] = on_update } or {},
+    }
+    M._status_perf_span("syntax.cached_diff_syntax.compute", status_buf, {
+      file = filename,
+      side = side,
+      callback_key = callback_key,
+      source_line_count = #lines,
+    }, function()
+      M.compute_diff_syntax_async(filename, lines, function(syntax)
+        local pending = M._ts_diff_syntax_cache and M._ts_diff_syntax_cache[cache_key]
+        local callbacks = type(pending) == "table" and pending.callbacks or {}
+        M._ts_diff_syntax_cache[cache_key] = syntax or false
+        for _, callback in pairs(callbacks) do
+          local ok, err = pcall(callback, syntax)
+          if not ok then notify_error("Tree-sitter diff syntax update failed: " .. tostring(err)) end
+        end
+        if syntax and status_render_current_model and M._status and M._status.buf then
+          vim.schedule(function()
+            if M._status and M._status.buf and vim.api.nvim_buf_is_valid(M._status.buf) then
+              status_render_current_model()
+            end
+          end)
         end
       end)
-    end
+    end)
+    return nil, true
   end)
-  return nil, true
 end
 
 ---@param filename string
 ---@param diff_text string
 ---@return string[]?
 function M._old_file_syntax_source_lines(filename, diff_text)
-  local lines = M._file_source_lines(filename)
-  if not lines then return nil end
+  return M._status_perf_span("syntax.old_file_source_lines", M._status and M._status.buf or nil, {
+    file = filename,
+    diff_len = #(diff_text or ""),
+  }, function()
+    local lines = M._file_source_lines(filename)
+    if not lines then return nil end
 
-  local hunks = {}
-  for _, block in ipairs(parse_unified_diff(diff_text)) do
-    for _, hunk in ipairs(block.hunks) do
-      hunks[#hunks + 1] = parse_hunk_body(hunk, { preserve_trailing_blank = true })
-    end
-  end
-  if #hunks == 0 then return nil end
-
-  local old_lines = vim.deepcopy(lines)
-  for hunk_index = #hunks, 1, -1 do
-    local hunk = hunks[hunk_index]
-    local replacement = {}
-    for _, parsed_line in ipairs(hunk.lines) do
-      if parsed_line.prefix == " " or parsed_line.prefix == "-" then
-        replacement[#replacement + 1] = parsed_line.code
+    local hunks = {}
+    M._status_perf_span("syntax.old_file_source_lines.parse", M._status and M._status.buf or nil, {
+      file = filename,
+      diff_len = #(diff_text or ""),
+    }, function()
+      for _, block in ipairs(parse_unified_diff(diff_text)) do
+        for _, hunk in ipairs(block.hunks) do
+          hunks[#hunks + 1] = parse_hunk_body(hunk, { preserve_trailing_blank = true })
+        end
       end
-    end
+    end)
+    if #hunks == 0 then return nil end
 
-    local start_index = math.max(tonumber(hunk.new_start) or 1, 1)
-    local remove_count = math.max(tonumber(hunk.new_count) or 0, 0)
-    if start_index > #old_lines + 1 then return nil end
-    if remove_count > 0 and (start_index + remove_count - 1) > #old_lines then return nil end
-    for _ = 1, remove_count do
-      if start_index <= #old_lines then
-        table.remove(old_lines, start_index)
+    local old_lines = vim.deepcopy(lines)
+    local rewrite_ok = M._status_perf_span("syntax.old_file_source_lines.rewrite", M._status and M._status.buf or nil, {
+      file = filename,
+      source_line_count = #lines,
+      hunk_count = #hunks,
+    }, function()
+      for hunk_index = #hunks, 1, -1 do
+        local hunk = hunks[hunk_index]
+        local replacement = {}
+        for _, parsed_line in ipairs(hunk.lines) do
+          if parsed_line.prefix == " " or parsed_line.prefix == "-" then
+            replacement[#replacement + 1] = parsed_line.code
+          end
+        end
+
+        local start_index = math.max(tonumber(hunk.new_start) or 1, 1)
+        local remove_count = math.max(tonumber(hunk.new_count) or 0, 0)
+        if start_index > #old_lines + 1 then return false end
+        if remove_count > 0 and (start_index + remove_count - 1) > #old_lines then return false end
+        for _ = 1, remove_count do
+          if start_index <= #old_lines then
+            table.remove(old_lines, start_index)
+          end
+        end
+        for replacement_index = #replacement, 1, -1 do
+          table.insert(old_lines, start_index, replacement[replacement_index])
+        end
       end
-    end
-    for replacement_index = #replacement, 1, -1 do
-      table.insert(old_lines, start_index, replacement[replacement_index])
-    end
-  end
+      return true
+    end)
+    if not rewrite_ok then return nil end
 
-  return old_lines
+    return old_lines
+  end)
 end
 
 ---@param filename string
 ---@param diff_text string
 ---@return boolean
 function M._diff_new_side_matches_file(filename, diff_text)
-  local lines = M._file_source_lines(filename)
-  if not lines then return false end
+  return M._status_perf_span("syntax.diff_new_side_matches_file", M._status and M._status.buf or nil, {
+    file = filename,
+    diff_len = #(diff_text or ""),
+  }, function()
+    local lines = M._file_source_lines(filename)
+    if not lines then return false end
 
-  for _, block in ipairs(parse_unified_diff(diff_text)) do
-    for _, hunk in ipairs(block.hunks) do
-      local parsed_hunk = parse_hunk_body(hunk, { preserve_trailing_blank = true })
-      local expected = {}
-      for _, parsed_line in ipairs(parsed_hunk.lines) do
-        if parsed_line.prefix == " " or parsed_line.prefix == "+" then
-          expected[#expected + 1] = parsed_line.code
+    for _, block in ipairs(parse_unified_diff(diff_text)) do
+      for _, hunk in ipairs(block.hunks) do
+        local parsed_hunk = parse_hunk_body(hunk, { preserve_trailing_blank = true })
+        local expected = {}
+        for _, parsed_line in ipairs(parsed_hunk.lines) do
+          if parsed_line.prefix == " " or parsed_line.prefix == "+" then
+            expected[#expected + 1] = parsed_line.code
+          end
+        end
+        local start_index = math.max(tonumber(parsed_hunk.new_start) or 1, 1)
+        if start_index > #lines + 1 then return false end
+        if #expected > 0 and (start_index + #expected - 1) > #lines then return false end
+        for offset, expected_line in ipairs(expected) do
+          if lines[start_index + offset - 1] ~= expected_line then return false end
         end
       end
-      local start_index = math.max(tonumber(parsed_hunk.new_start) or 1, 1)
-      if start_index > #lines + 1 then return false end
-      if #expected > 0 and (start_index + #expected - 1) > #lines then return false end
-      for offset, expected_line in ipairs(expected) do
-        if lines[start_index + offset - 1] ~= expected_line then return false end
-      end
     end
-  end
 
-  return true
+    return true
+  end)
 end
 
 ---@param filename string
@@ -3341,39 +2909,63 @@ end
 ---@return DiffReviewTreeSitterSyntax? syntax
 ---@return boolean pending
 function M._cached_old_file_syntax(filename, diff_text, callback_key, on_update)
-  M._ts_diff_syntax_cache = M._ts_diff_syntax_cache or {}
-  local cache_key = ("%s:old-file:%s"):format(filename, vim.fn.sha256(diff_text or ""))
-  local cached = M._ts_diff_syntax_cache[cache_key]
-  if cached == false then return nil, false end
-  if type(cached) == "table" and not cached.pending then return cached, false end
-  if type(cached) == "table" and cached.pending then
-    if on_update then cached.callbacks[callback_key] = on_update end
-    return nil, true
-  end
-
-  local lines = M._old_file_syntax_source_lines(filename, diff_text)
-  if not lines or #lines == 0 then return nil, false end
-  M._ts_diff_syntax_cache[cache_key] = {
-    pending = true,
-    callbacks = on_update and { [callback_key] = on_update } or {},
-  }
-  M.compute_diff_syntax_async(filename, lines, function(syntax)
-    local pending = M._ts_diff_syntax_cache and M._ts_diff_syntax_cache[cache_key]
-    local callbacks = type(pending) == "table" and pending.callbacks or {}
-    M._ts_diff_syntax_cache[cache_key] = syntax or false
-    for _, callback in pairs(callbacks) do
-      local ok, err = pcall(callback, syntax)
-      if not ok then notify_error("Tree-sitter old file syntax update failed: " .. tostring(err)) end
+  local status_buf = M._status and M._status.buf or nil
+  return M._status_perf_span("syntax.cached_old_file_syntax", status_buf, {
+    file = filename,
+    callback_key = callback_key,
+    diff_len = #(diff_text or ""),
+  }, function()
+    M._ts_diff_syntax_cache = M._ts_diff_syntax_cache or {}
+    local diff_hash = M._status_perf_span("syntax.cached_old_file_syntax.sha256", status_buf, {
+      file = filename,
+      diff_len = #(diff_text or ""),
+    }, function()
+      return vim.fn.sha256(diff_text or "")
+    end)
+    local cache_key = ("%s:old-file:%s"):format(filename, diff_hash)
+    local cached = M._ts_diff_syntax_cache[cache_key]
+    if cached == false then return nil, false end
+    if type(cached) == "table" and not cached.pending then return cached, false end
+    if type(cached) == "table" and cached.pending then
+      if on_update then cached.callbacks[callback_key] = on_update end
+      return nil, true
     end
-    if syntax and status_render_current_model and M._status and M._status.buf then
-      vim.schedule(function()
-        if M._status and M._status.buf and vim.api.nvim_buf_is_valid(M._status.buf) then
-          status_render_current_model()
+
+    local lines = M._status_perf_span("syntax.cached_old_file_syntax.source_lines", status_buf, {
+      file = filename,
+      diff_len = #(diff_text or ""),
+    }, function()
+      return M._old_file_syntax_source_lines(filename, diff_text)
+    end)
+    if not lines or #lines == 0 then return nil, false end
+    M._ts_diff_syntax_cache[cache_key] = {
+      pending = true,
+      callbacks = on_update and { [callback_key] = on_update } or {},
+    }
+    M._status_perf_span("syntax.cached_old_file_syntax.compute", status_buf, {
+      file = filename,
+      callback_key = callback_key,
+      source_line_count = #lines,
+    }, function()
+      M.compute_diff_syntax_async(filename, lines, function(syntax)
+        local pending = M._ts_diff_syntax_cache and M._ts_diff_syntax_cache[cache_key]
+        local callbacks = type(pending) == "table" and pending.callbacks or {}
+        M._ts_diff_syntax_cache[cache_key] = syntax or false
+        for _, callback in pairs(callbacks) do
+          local ok, err = pcall(callback, syntax)
+          if not ok then notify_error("Tree-sitter old file syntax update failed: " .. tostring(err)) end
+        end
+        if syntax and status_render_current_model and M._status and M._status.buf then
+          vim.schedule(function()
+            if M._status and M._status.buf and vim.api.nvim_buf_is_valid(M._status.buf) then
+              status_render_current_model()
+            end
+          end)
         end
       end)
-    end
+    end)
+    return nil, true
   end)
-  return nil, true
 end
 
 ---@param hunk_staged? boolean[]
@@ -3396,34 +2988,132 @@ end
 ---@param on_update? fun(syntax?: DiffReviewTreeSitterSyntax)
 ---@param opts? table
 function M._prewarm_diff_syntax(filename, diff_text, hunk_staged, callback_key, on_update, opts)
-  opts = opts or {}
-  local syntax_diff_text = opts.syntax_diff_text or diff_text
-  if M._diff_uses_file_syntax(hunk_staged, opts) and M._diff_new_side_matches_file(filename, syntax_diff_text) then
-    local old_syntax, old_pending = M._cached_old_file_syntax(filename, syntax_diff_text, callback_key .. ":old-file", on_update)
-    if not old_syntax and not old_pending then
-      cached_diff_syntax(filename, diff_text, "old", callback_key .. ":old", on_update)
+  local status_buf = M._status and M._status.buf or nil
+  return M._status_perf_span("syntax.prewarm_diff_syntax", status_buf, {
+    file = filename,
+    callback_key = callback_key,
+    diff_len = #(diff_text or ""),
+    staged_count = #(hunk_staged or {}),
+    syntax_source = opts and opts.syntax_source or nil,
+  }, function()
+    opts = opts or {}
+    local syntax_diff_text = opts.syntax_diff_text or diff_text
+    local use_file_syntax = M._status_perf_span("syntax.prewarm_diff_syntax.uses_file_syntax", status_buf, {
+      file = filename,
+      callback_key = callback_key,
+      syntax_source = opts.syntax_source,
+      staged_count = #(hunk_staged or {}),
+    }, function()
+      return M._diff_uses_file_syntax(hunk_staged, opts)
+    end)
+    local new_side_matches_file = false
+    if use_file_syntax then
+      new_side_matches_file = M._status_perf_span("syntax.prewarm_diff_syntax.new_side_matches_file", status_buf, {
+        file = filename,
+        callback_key = callback_key,
+        diff_len = #(syntax_diff_text or ""),
+      }, function()
+        return M._diff_new_side_matches_file(filename, syntax_diff_text)
+      end)
     end
-    local syntax, pending = cached_file_syntax(filename, callback_key .. ":file", on_update)
-    if not syntax and not pending then
-      cached_diff_syntax(filename, diff_text, "new", callback_key .. ":new", on_update)
+    M._status_perf_event("syntax.prewarm_diff_syntax.route", status_buf, {
+      file = filename,
+      callback_key = callback_key,
+      use_file_syntax = use_file_syntax,
+      new_side_matches_file = new_side_matches_file,
+      diff_len = #(diff_text or ""),
+      syntax_diff_len = #(syntax_diff_text or ""),
+    })
+    if use_file_syntax and new_side_matches_file then
+      local old_syntax, old_pending = M._status_perf_span("syntax.prewarm_diff_syntax.cached_old_file", status_buf, {
+        file = filename,
+        callback_key = callback_key,
+        diff_len = #(syntax_diff_text or ""),
+      }, function()
+        return M._cached_old_file_syntax(filename, syntax_diff_text, callback_key .. ":old-file", on_update)
+      end)
+      if not old_syntax and not old_pending then
+        M._status_perf_span("syntax.prewarm_diff_syntax.fallback_old_diff", status_buf, {
+          file = filename,
+          callback_key = callback_key,
+          diff_len = #(diff_text or ""),
+        }, function()
+          cached_diff_syntax(filename, diff_text, "old", callback_key .. ":old", on_update)
+        end)
+      end
+      local syntax, pending = M._status_perf_span("syntax.prewarm_diff_syntax.cached_file", status_buf, {
+        file = filename,
+        callback_key = callback_key,
+      }, function()
+        return cached_file_syntax(filename, callback_key .. ":file", on_update)
+      end)
+      if not syntax and not pending then
+        M._status_perf_span("syntax.prewarm_diff_syntax.fallback_new_diff", status_buf, {
+          file = filename,
+          callback_key = callback_key,
+          diff_len = #(diff_text or ""),
+        }, function()
+          cached_diff_syntax(filename, diff_text, "new", callback_key .. ":new", on_update)
+        end)
+      end
+    else
+      M._status_perf_span("syntax.prewarm_diff_syntax.diff_old", status_buf, {
+        file = filename,
+        callback_key = callback_key,
+        diff_len = #(diff_text or ""),
+      }, function()
+        cached_diff_syntax(filename, diff_text, "old", callback_key .. ":old", on_update)
+      end)
+      M._status_perf_span("syntax.prewarm_diff_syntax.diff_new", status_buf, {
+        file = filename,
+        callback_key = callback_key,
+        diff_len = #(diff_text or ""),
+      }, function()
+        cached_diff_syntax(filename, diff_text, "new", callback_key .. ":new", on_update)
+      end)
     end
-  else
-    cached_diff_syntax(filename, diff_text, "old", callback_key .. ":old", on_update)
-    cached_diff_syntax(filename, diff_text, "new", callback_key .. ":new", on_update)
-  end
+  end)
 end
 
 ---@param file DiffReviewStatusFile?
 ---@return string?
 function M._status_file_syntax_diff_text(file)
-  if not file then return nil end
-  local hunks = status_diff_hunks_for_file(file)
-  local diffs = {}
-  for _, hunk in ipairs(hunks) do
-    if hunk.diff and hunk.diff ~= "" then diffs[#diffs + 1] = hunk.diff end
-  end
-  if #diffs == 0 then return nil end
-  return table.concat(diffs, "\n")
+  return M._status_perf_span("syntax.status_file_syntax_diff_text", M._status and M._status.buf or nil, {
+    file = file and file.filename or nil,
+  }, function()
+    if not file then return nil end
+    local hunks = M._status_perf_span("syntax.status_file_syntax_diff_text.hunks", M._status and M._status.buf or nil, {
+      file = file.filename,
+    }, function()
+      return status_diff_hunks_for_file(file)
+    end)
+    local diffs = {}
+    for _, hunk in ipairs(hunks) do
+      if hunk.diff and hunk.diff ~= "" then diffs[#diffs + 1] = hunk.diff end
+    end
+    if #diffs == 0 then return nil end
+    local diff_text = table.concat(diffs, "\n")
+    M._status_perf_event("syntax.status_file_syntax_diff_text.result", M._status and M._status.buf or nil, {
+      file = file.filename,
+      hunk_count = #hunks,
+      diff_count = #diffs,
+      diff_len = #diff_text,
+    })
+    return diff_text
+  end)
+end
+
+---@param hunk_count integer
+---@param options? DiffReviewConfig
+---@return integer
+function M._status_prewarm_hunk_budget(hunk_count, options)
+  options = options or M.config or config.options or config.defaults
+  hunk_count = math.max(0, math.floor(tonumber(hunk_count) or 0))
+  local max_hunks = tonumber(options and options.status_cursor_prewarm_max_hunks)
+  if max_hunks == nil then max_hunks = tonumber(config.defaults.status_cursor_prewarm_max_hunks) or 12 end
+  -- A non-positive budget disables cursor-driven file prewarm entirely.
+  if max_hunks <= 0 then return 0 end
+  return math.min(hunk_count, math.floor(max_hunks))
 end
 
 ---@param file DiffReviewStatusFile?
@@ -3431,45 +3121,55 @@ end
 ---@param on_update? fun(syntax?: DiffReviewTreeSitterSyntax)
 ---@param opts? { syntax_source?: "file"|"diff" }
 local function prewarm_file_diff_syntax(file, callback_key_prefix, on_update, opts)
-  if not (file and file.filename) then return end
-  opts = opts or {}
-  local combined_diff = opts.syntax_source == "file" and M._status_file_syntax_diff_text(file) or nil
-  if type(combined_diff) == "string" and combined_diff ~= "" then
-    opts = vim.tbl_extend("force", opts, { syntax_diff_text = combined_diff })
-  end
-  local hunks = status_diff_hunks_for_file(file)
-  for hunk_index, hunk in ipairs(hunks) do
-    if hunk.diff and hunk.diff ~= "" then
-      local callback_key = ("%s:%s:%d"):format(callback_key_prefix, file.filename, hunk_index)
-      M._prewarm_diff_syntax(file.filename, hunk.diff, { hunk.staged }, callback_key, on_update, opts)
+  return M._status_perf_span("syntax.prewarm_file_diff_syntax", M._status and M._status.buf or nil, {
+    file = file and file.filename or nil,
+    callback_key_prefix = callback_key_prefix,
+    syntax_source = opts and opts.syntax_source or nil,
+  }, function()
+    if not (file and file.filename) then return end
+    opts = opts or {}
+    local combined_diff = nil
+    if opts.syntax_source == "file" then
+      combined_diff = M._status_perf_span("syntax.prewarm_file_diff_syntax.combined_diff", M._status and M._status.buf or nil, {
+        file = file.filename,
+        callback_key_prefix = callback_key_prefix,
+      }, function()
+        return M._status_file_syntax_diff_text(file)
+      end)
     end
-  end
+    if type(combined_diff) == "string" and combined_diff ~= "" then
+      opts = vim.tbl_extend("force", opts, { syntax_diff_text = combined_diff })
+    end
+    local hunks = M._status_perf_span("syntax.prewarm_file_diff_syntax.hunks", M._status and M._status.buf or nil, {
+      file = file.filename,
+      callback_key_prefix = callback_key_prefix,
+    }, function()
+      return status_diff_hunks_for_file(file)
+    end)
+    local hunk_budget = M._status_prewarm_hunk_budget(#hunks)
+    M._status_perf_event("syntax.prewarm_file_diff_syntax.start_hunks", M._status and M._status.buf or nil, {
+      file = file.filename,
+      callback_key_prefix = callback_key_prefix,
+      hunk_count = #hunks,
+      prewarm_budget = hunk_budget,
+      capped = hunk_budget < #hunks,
+      combined_diff_len = type(combined_diff) == "string" and #combined_diff or nil,
+    })
+    -- Bound cursor-driven prewarm: hovering a many-hunk file must not fan out into
+    -- hundreds of Tree-sitter parses, which froze the editor on large diffs.
+    local warmed = 0
+    for hunk_index, hunk in ipairs(hunks) do
+      if warmed >= hunk_budget then break end
+      if hunk.diff and hunk.diff ~= "" then
+        local callback_key = ("%s:%s:%d"):format(callback_key_prefix, file.filename, hunk_index)
+        M._prewarm_diff_syntax(file.filename, hunk.diff, { hunk.staged }, callback_key, on_update, opts)
+        warmed = warmed + 1
+      end
+    end
+  end)
 end
 
----@param parsed_line DiffReviewParsedHunkLine
----@param file string
----@return table
-function M._hunk_diff_line_meta(parsed_line, file)
-  return {
-    side = parsed_line.new_line and "right" or "left",
-    file = file,
-    line = parsed_line.new_line or parsed_line.old_line,
-    position = parsed_line.position,
-    code = parsed_line.code,
-    prefix = parsed_line.prefix,
-  }
-end
 
----@param parsed_lines DiffReviewParsedHunkLine[]?
----@param file string
----@return table[]
-function M._hunk_diff_lines_meta(parsed_lines, file)
-  local diff_lines = {}
-  for _, parsed_line in ipairs(parsed_lines or {}) do
-    diff_lines[#diff_lines + 1] = M._hunk_diff_line_meta(parsed_line, file)
-  end
-  return diff_lines
-end
 
 ---@param parsed_line DiffReviewParsedHunkLine
 ---@param gutter DiffReviewGutterSpec
@@ -3508,86 +3208,7 @@ local function hunk_body_row(parsed_line, gutter, file, syntax, syntax_row)
   return row
 end
 
----@param replacement table
----@param gutter DiffReviewGutterSpec
----@param file string
----@param syntax? DiffReviewTreeSitterSyntax
----@param syntax_row? integer
----@return table
-function M._hunk_replacement_row(replacement, gutter, file, syntax, syntax_row)
-  local display_line = replacement.display_line
-  local backing_lines = replacement.diff_lines or { display_line }
-  local sign_hl = "DiffReviewModifyLineNr"
-  local line_hl = "DiffReviewModifyBg"
-  local row = {
-    diff_review_bg_hl = line_hl,
-    diff_review_inline_highlights = replacement.inline_spans or {},
-  }
-  row[#row + 1] = {
-    "",
-    nil,
-    meta = {
-      diff = M._hunk_diff_line_meta(display_line, file),
-      diff_lines = M._hunk_diff_lines_meta(backing_lines, file),
-    },
-  }
-  local old_line = replacement.old_lines and replacement.old_lines[1] and replacement.old_lines[1].old_line or display_line.old_line
-  local new_line = replacement.new_lines and replacement.new_lines[1] and replacement.new_lines[1].new_line or display_line.new_line
-  hunk_add_gutter(row, gutter, old_line, new_line, "~", sign_hl, line_hl, sign_hl)
-  local segments = nil
-  if syntax and syntax_row then
-    segments = treesitter_line_segments(syntax.buf, syntax.tree, syntax.highlight_query, syntax_row, display_line.code)
-  end
-  if segments and #segments > 0 then
-    for _, segment in ipairs(segments) do
-      row[#row + 1] = segment.hl_group and { segment.text, segment.hl_group } or { segment.text }
-    end
-  else
-    row[#row + 1] = { display_line.code }
-  end
-  return row
-end
 
----@param line_number integer
----@param text string
----@param gutter DiffReviewGutterSpec
----@param file? string
----@param syntax? DiffReviewTreeSitterSyntax
----@param old_line? integer
----@param new_line? integer
----@return table
-function M._hunk_context_padding_row(line_number, text, gutter, file, syntax, old_line, new_line)
-  local row = { diff_review_context_padding = true }
-  old_line = old_line or line_number
-  new_line = new_line or line_number
-  if file then
-    row[#row + 1] = {
-      "",
-      nil,
-      meta = {
-        diff = M._hunk_diff_line_meta({
-          prefix = " ",
-          old_line = old_line,
-          new_line = new_line,
-          code = text,
-        }, file),
-      },
-    }
-  end
-  hunk_add_gutter(row, gutter, old_line, new_line, " ", nil)
-  local segments = nil
-  if syntax then
-    segments = treesitter_line_segments(syntax.buf, syntax.tree, syntax.highlight_query, line_number - 1, text)
-  end
-  if segments and #segments > 0 then
-    for _, segment in ipairs(segments) do
-      row[#row + 1] = segment.hl_group and { segment.text, segment.hl_group } or { segment.text }
-    end
-  else
-    row[#row + 1] = { text }
-  end
-  return row
-end
 
 ---@class DiffReviewHunkContextPaddingLine
 ---@field line_number integer
@@ -3595,190 +3216,11 @@ end
 ---@field new_line? integer
 ---@field text string
 
----@param text string?
----@return boolean
-function M._hunk_context_padding_line_is_useful(text)
-  if type(text) ~= "string" then return false end
-  if text:match("^%s*$") then return false end
-  if text:match("^%s*[})%]]+[,;]?%s*$") then return false end
-  return true
-end
 
----@param text string?
----@return boolean
-function M._hunk_context_padding_line_starts_scope(text)
-  if type(text) ~= "string" then return false end
-  return text:match("^%s*#%[") ~= nil
-    or text:match("^%s*pub%s+struct%s+") ~= nil
-    or text:match("^%s*struct%s+") ~= nil
-    or text:match("^%s*pub%s+enum%s+") ~= nil
-    or text:match("^%s*enum%s+") ~= nil
-    or text:match("^%s*pub%s+trait%s+") ~= nil
-    or text:match("^%s*trait%s+") ~= nil
-    or text:match("^%s*impl%s+") ~= nil
-    or text:match("^%s*pub%s+fn%s+") ~= nil
-    or text:match("^%s*fn%s+") ~= nil
-    or text:match("^%s*pub%s+mod%s+") ~= nil
-    or text:match("^%s*mod%s+") ~= nil
-    or text:match("^%s*use%s+") ~= nil
-end
 
----@param source_lines string[]?
----@param hunk DiffReviewParsedHunk
----@param context DiffReviewHunkTreeSitterContext|string?
----@param side "before"|"after"
----@param occupied_lines? table<integer, boolean>
----@param include_line? fun(parsed_line: DiffReviewParsedHunkLine): boolean
----@param bounds? { changed_line?: integer, after_line?: integer }
----@return DiffReviewHunkContextPaddingLine[]
-function M._hunk_context_padding_lines(source_lines, hunk, context, side, occupied_lines, include_line, bounds)
-  if type(source_lines) ~= "table" or #source_lines == 0 then return {} end
-  occupied_lines = occupied_lines or M._hunk_current_line_set(hunk)
-  bounds = bounds or {}
-  local padding_lines = {}
-  local padding_limit = M._hunk_context_padding_limit()
-  if type(context) == "table" then
-    local changed_line = bounds.changed_line or hunk_first_changed_current_line(hunk)
-    local after_line = bounds.after_line or M._hunk_after_current_line(hunk, include_line)
-    local path_rows = side == "before" and context.path_start_rows or context.path_end_rows
-    local sibling_rows = side == "before" and context.sibling_before_rows or context.sibling_after_rows
-    local seen_candidates = {}
-    local function collect_candidates(rows)
-      local candidates = {}
-      for _, line_number in ipairs(rows or {}) do
-        local is_scope_boundary = line_number == (context.start_row + 1) or line_number == (context.end_row + 1)
-        local eligible_before = side == "before" and line_number < changed_line
-        local eligible_after = side == "after" and line_number >= after_line
-        if not is_scope_boundary
-          and not occupied_lines[line_number]
-          and not seen_candidates[line_number]
-          and (eligible_before or eligible_after) then
-          seen_candidates[line_number] = true
-          candidates[#candidates + 1] = line_number
-        end
-      end
-      table.sort(candidates, function(left, right)
-        if side == "before" then return left > right end
-        return left < right
-      end)
-      return candidates
-    end
-    local candidates = {}
-    for _, line_number in ipairs(collect_candidates(path_rows)) do
-      if #candidates >= padding_limit then break end
-      candidates[#candidates + 1] = line_number
-    end
-    for _, line_number in ipairs(collect_candidates(sibling_rows)) do
-      if #candidates >= padding_limit then break end
-      candidates[#candidates + 1] = line_number
-    end
-    if #candidates == 0 then
-      local scope_start = context.start_row + 1
-      local scope_end = context.end_row + 1
-      if side == "before" then
-        local first_line = math.max(scope_start + 1, changed_line - padding_limit)
-        for line_number = changed_line - 1, first_line, -1 do
-          local is_scope_boundary = line_number == scope_start or line_number == scope_end
-          if is_scope_boundary or not M._hunk_context_padding_line_is_useful(source_lines[line_number]) then break end
-          if not occupied_lines[line_number] and not seen_candidates[line_number] then
-            seen_candidates[line_number] = true
-            candidates[#candidates + 1] = line_number
-          end
-        end
-      else
-        local last_line = math.min(scope_end - 1, after_line + padding_limit - 1)
-        for line_number = after_line, last_line do
-          local is_scope_boundary = line_number == scope_start or line_number == scope_end
-          if is_scope_boundary or not M._hunk_context_padding_line_is_useful(source_lines[line_number]) then break end
-          if not occupied_lines[line_number] and not seen_candidates[line_number] then
-            seen_candidates[line_number] = true
-            candidates[#candidates + 1] = line_number
-          end
-        end
-      end
-    end
-    table.sort(candidates)
-    for _, line_number in ipairs(candidates) do
-      padding_lines[#padding_lines + 1] = {
-        line_number = line_number,
-        text = source_lines[line_number] or "",
-      }
-    end
-    return padding_lines
-  end
 
-  local first_line = nil
-  local last_line = nil
-  if side == "before" then
-    local changed_line = bounds.changed_line or hunk_first_changed_current_line(hunk)
-    first_line = math.max(1, changed_line - padding_limit)
-    last_line = changed_line - 1
-  else
-    first_line = bounds.after_line or M._hunk_after_current_line(hunk, include_line)
-    last_line = math.min(#source_lines, first_line + padding_limit - 1)
-  end
 
-  for line_number = first_line, last_line do
-    if side == "after"
-      and line_number > first_line
-      and M._hunk_context_padding_line_starts_scope(source_lines[line_number]) then
-      break
-    end
-    if not occupied_lines[line_number] then
-      padding_lines[#padding_lines + 1] = {
-        line_number = line_number,
-        text = source_lines[line_number] or "",
-      }
-    end
-  end
-  return padding_lines
-end
 
----@return integer
-function M._hunk_context_padding_limit()
-  return 3
-end
-
----@param hunks DiffReviewParsedHunk[]
----@param new_line integer?
----@return integer?
-function M._hunk_old_line_for_new_line(hunks, new_line)
-  if not new_line then return nil end
-  local delta = 0
-  for _, hunk in ipairs(hunks or {}) do
-    local old_start = hunk.old_start or 0
-    local old_count = hunk.old_count or 0
-    local new_start = hunk.new_start or 0
-    local new_count = hunk.new_count or 0
-    if new_line < new_start then return new_line + delta end
-    if old_count > 0 and new_count == 0 then
-      if new_line == new_start then return math.max(1, old_start - 1) end
-      delta = old_start + old_count - new_start - 1
-    else
-      delta = delta + old_count - new_count
-    end
-    if new_count > 0 and new_line <= new_start + new_count - 1 then
-      local parsed_hunk = hunk.lines and #hunk.lines > 0 and hunk or parse_hunk_body(vim.deepcopy(hunk))
-      for _, parsed_line in ipairs(parsed_hunk.lines or {}) do
-        if parsed_line.new_line == new_line and parsed_line.old_line then return parsed_line.old_line end
-      end
-      if old_count == new_count then return old_start + (new_line - new_start) end
-      return nil
-    end
-  end
-  return new_line + delta
-end
-
----@param padding_lines DiffReviewHunkContextPaddingLine[]
----@param block DiffReviewParsedBlock
----@return DiffReviewHunkContextPaddingLine[]
-function M._hunk_annotate_padding_line_numbers(padding_lines, block)
-  for _, padding_line in ipairs(padding_lines or {}) do
-    padding_line.new_line = padding_line.line_number
-    padding_line.old_line = M._hunk_old_line_for_new_line(block and block.hunks or {}, padding_line.line_number)
-  end
-  return padding_lines
-end
 
 ---@class DiffReviewHunkRenderPlan
 ---@field block DiffReviewParsedBlock
@@ -3809,65 +3251,8 @@ end
 ---@field display_end integer?
 ---@field changed_lines table<integer, boolean>
 
----@param region DiffReviewHunkChangeRegion
----@param render_items table[]
----@param include_render_line fun(parsed_line: DiffReviewParsedHunkLine): boolean
----@return table<string, boolean>
-function M._hunk_region_visible_source_lines(region, render_items, include_render_line)
-  local visible = {}
-  for item_index = region.first_item, region.last_item do
-    local item = render_items[item_index]
-    if item then
-      for _, parsed_line in ipairs(M._hunk_render_item_backing_lines(item)) do
-        if (not include_render_line or include_render_line(parsed_line))
-          and (parsed_line.prefix == " " or parsed_line.prefix == "+" or parsed_line.prefix == "-") then
-          visible[parsed_line.code] = true
-        end
-      end
-      if item.kind == "replacement" and item.display_line then visible[item.display_line.code] = true end
-    end
-  end
-  return visible
-end
 
----@param region DiffReviewHunkChangeRegion
----@param render_items table[]
----@param line_by_position table<integer, integer>
----@return table<integer, boolean>
-function M._hunk_region_changed_current_lines(region, render_items, line_by_position)
-  local changed_lines = {}
-  for item_index = region.first_item, region.last_item do
-    local item = render_items[item_index]
-    if item then
-      for _, parsed_line in ipairs(M._hunk_render_item_backing_lines(item)) do
-        if parsed_line.prefix == "+" or parsed_line.prefix == "-" then
-          local current_line = M._hunk_parsed_line_current_line(parsed_line, line_by_position)
-          if current_line then changed_lines[current_line] = true end
-        end
-      end
-    end
-  end
-  return changed_lines
-end
 
----@param region DiffReviewHunkChangeRegion
----@param before_padding_lines DiffReviewHunkContextPaddingLine[]
----@param after_padding_lines DiffReviewHunkContextPaddingLine[]
----@return integer? display_start
----@return integer? display_end
-function M._hunk_region_display_window(region, before_padding_lines, after_padding_lines)
-  local display_start = region.changed_line or region.context_line
-  local display_end = region.after_line and (region.after_line - 1) or display_start
-  for _, padding_line in ipairs(before_padding_lines or {}) do
-    display_start = math.min(display_start or padding_line.line_number, padding_line.line_number)
-    display_end = math.max(display_end or padding_line.line_number, padding_line.line_number)
-  end
-  for _, padding_line in ipairs(after_padding_lines or {}) do
-    display_start = math.min(display_start or padding_line.line_number, padding_line.line_number)
-    display_end = math.max(display_end or padding_line.line_number, padding_line.line_number)
-  end
-  return display_start, display_end
-end
 
 ---@param left DiffReviewGutterSpec?
 ---@param right DiffReviewGutterSpec?
@@ -3898,19 +3283,6 @@ function M._add_plan_to_hunk_display_group(group, plan)
   end
 end
 
----@param previous_plan DiffReviewHunkRenderPlan
----@param next_plan DiffReviewHunkRenderPlan
----@return boolean
-function M._hunk_render_plans_should_merge(previous_plan, next_plan)
-  if previous_plan.block.file ~= next_plan.block.file then return false end
-  if previous_plan.display_end and next_plan.display_start and next_plan.display_start <= previous_plan.display_end + 1 then
-    return true
-  end
-  if not M._hunk_contexts_related(previous_plan.region.context, next_plan.region.context) then return false end
-  local gap = M._hunk_visible_plan_gap(previous_plan, next_plan)
-  if gap and gap > 0 and type(previous_plan.source_lines) ~= "table" then return false end
-  return gap ~= nil and gap >= 0 and gap <= M._hunk_context_bridge_limit()
-end
 
 ---@param plans DiffReviewHunkRenderPlan[]
 ---@return DiffReviewHunkDisplayGroup[]
@@ -3934,140 +3306,22 @@ function M._merge_hunk_render_plans(plans)
   return groups
 end
 
----@param left_old integer?
----@param left_new integer?
----@param right_old integer?
----@param right_new integer?
----@return boolean
-function M._hunk_render_coords_adjacent(left_old, left_new, right_old, right_new)
-  if left_old and right_old and right_old == left_old + 1 then return true end
-  if left_new and right_new and right_new == left_new + 1 then return true end
-  return false
-end
 
----@param left DiffReviewHunkTreeSitterContext|string?
----@param right DiffReviewHunkTreeSitterContext|string?
----@return boolean
-function M._hunk_contexts_related(left, right)
-  if same_hunk_context_scope(left, right) then return true end
-  if type(left) ~= "table" or type(right) ~= "table" then return false end
-  local left_start = left.start_row + 1
-  local left_end = left.end_row + 1
-  local right_start = right.start_row + 1
-  local right_end = right.end_row + 1
-  return (right_start >= left_start and right_end <= left_end)
-    or (left_start >= right_start and left_end <= right_end)
-end
 
----@return integer
-function M._hunk_context_bridge_limit()
-  return M._hunk_context_padding_limit() * 2
-end
 
----@param left_old integer?
----@param left_new integer?
----@param right_old integer?
----@param right_new integer?
----@return integer?
-function M._hunk_render_coord_gap(left_old, left_new, right_old, right_new)
-  local gap = nil
-  local function include_gap(left, right)
-    if not (left and right) then return end
-    local candidate = right - left - 1
-    if gap == nil or candidate > gap then gap = candidate end
-  end
-  include_gap(left_new, right_new)
-  include_gap(left_old, right_old)
-  return gap
-end
 
----@param left_new integer?
----@param right_new integer?
----@return integer?
-function M._hunk_single_hidden_new_line(left_new, right_new)
-  if left_new and right_new and right_new == left_new + 2 then return left_new + 1 end
-  return nil
-end
 
----@param source_lines string[]?
----@param block DiffReviewParsedBlock
----@param line_number integer?
----@param gutter DiffReviewGutterSpec
----@param file string?
----@param syntax? DiffReviewTreeSitterSyntax
----@return table?
-function M._hunk_single_hidden_context_row(source_lines, block, line_number, gutter, file, syntax)
-  if not line_number or type(source_lines) ~= "table" or not source_lines[line_number] then return nil end
-  local old_line = M._hunk_old_line_for_new_line(block and block.hunks or {}, line_number)
-  return M._hunk_context_padding_row(line_number, source_lines[line_number], gutter, file, syntax, old_line, line_number)
-end
 
----@param source_lines string[]?
----@param block DiffReviewParsedBlock
----@param left_new integer?
----@param right_new integer?
----@param changed_lines table<integer, boolean>
----@param emitted_context_lines table<integer, boolean>
----@param gutter DiffReviewGutterSpec
----@param file string?
----@param syntax? DiffReviewTreeSitterSyntax
----@return table? row
----@return integer? line_number
-function M._hunk_single_hidden_context_gap_row(source_lines, block, left_new, right_new, changed_lines, emitted_context_lines, gutter, file, syntax)
-  local hidden_line = M._hunk_single_hidden_new_line(left_new, right_new)
-  if not hidden_line or emitted_context_lines[hidden_line] or changed_lines[hidden_line] then return nil, nil end
-  return M._hunk_single_hidden_context_row(source_lines, block, hidden_line, gutter, file, syntax), hidden_line
-end
 
----@param plan DiffReviewHunkRenderPlan
----@param raw_context DiffReviewHunkTreeSitterContext|string?
----@return integer? old_line
----@return integer? new_line
-function M._hunk_first_visible_plan_coords(plan, raw_context)
-  local padding_line = plan.before_padding_lines and plan.before_padding_lines[1] or nil
-  if padding_line then return padding_line.old_line, padding_line.new_line end
-  for item_index = plan.region.first_item, plan.region.last_item do
-    local item = plan.render_items[item_index]
-    local parsed_line = M._hunk_render_item_line(item)
-    if item.kind == "replacement" or (plan.include_render_line(parsed_line) and hunk_line_visible_in_context_scope(parsed_line, raw_context)) then
-      return parsed_line.old_line, parsed_line.new_line
-    end
-  end
-  return nil, nil
-end
 
----@param plan DiffReviewHunkRenderPlan
----@param raw_context DiffReviewHunkTreeSitterContext|string?
----@return integer? old_line
----@return integer? new_line
-function M._hunk_last_visible_plan_coords(plan, raw_context)
-  local padding_line = plan.after_padding_lines and plan.after_padding_lines[#plan.after_padding_lines] or nil
-  if padding_line then return padding_line.old_line, padding_line.new_line end
-  for item_index = plan.region.last_item, plan.region.first_item, -1 do
-    local item = plan.render_items[item_index]
-    local parsed_line = M._hunk_render_item_line(item)
-    if item.kind == "replacement" or (plan.include_render_line(parsed_line) and hunk_line_visible_in_context_scope(parsed_line, raw_context)) then
-      return parsed_line.old_line, parsed_line.new_line
-    end
-  end
-  return nil, nil
-end
 
----@param previous_plan DiffReviewHunkRenderPlan
----@param next_plan DiffReviewHunkRenderPlan
----@return integer?
-function M._hunk_visible_plan_gap(previous_plan, next_plan)
-  local previous_old_line, previous_new_line = M._hunk_last_visible_plan_coords(previous_plan, previous_plan.region.context)
-  local next_old_line, next_new_line = M._hunk_first_visible_plan_coords(next_plan, next_plan.region.context)
-  return M._hunk_render_coord_gap(previous_old_line, previous_new_line, next_old_line, next_new_line)
-end
 
 ---@param diff_text string
 ---@param hunk_staged? boolean[]
 ---@param filename? string
 ---@param context_callback_key? fun(hunk_line: number): string
 ---@param on_context_update? fun()
----@param opts? { context_line: integer?, boundary_context: boolean?, suppress_start_boundary: boolean?, suppress_end_boundary: boolean?, suppress_start_boundary_keys?: table<string, boolean>, suppress_end_boundary_keys?: table<string, boolean>, syntax_source?: "file"|"diff", syntax_diff_text?: string, compact_replacements?: boolean, require_file_match_for_context?: boolean, debug_context?: table }
+---@param opts? { context_line: integer?, boundary_context: boolean?, suppress_start_boundary: boolean?, suppress_end_boundary: boolean?, suppress_start_boundary_keys?: table<string, boolean>, suppress_end_boundary_keys?: table<string, boolean>, syntax_source?: "file"|"diff", syntax_diff_text?: string, fallback_syntax_diff_text?: string, old_syntax_row_offset?: integer, new_syntax_row_offset?: integer, compact_replacements?: boolean, require_file_match_for_context?: boolean, debug_context?: table }
 local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_callback_key, on_context_update, opts)
   opts = opts or {}
 
@@ -4082,8 +3336,8 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
   local file_syntax = nil
   local syntax_pending = false
   local context_pending = false
-  local old_syntax_row = 0
-  local new_syntax_row = 0
+  local old_syntax_row = tonumber(opts.old_syntax_row_offset) or 0
+  local new_syntax_row = tonumber(opts.new_syntax_row_offset) or 0
   local require_file_match_for_context = opts.require_file_match_for_context == true
   local source_matches_file = not require_file_match_for_context
   if filename then
@@ -4107,18 +3361,19 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
         syntax_diff_len = #(syntax_diff_text or ""),
       })
     end
+    local fallback_syntax_diff_text = opts.fallback_syntax_diff_text or diff_text
     if uses_file_syntax and new_side_matches_file then
       old_file_syntax, old_file_pending = M._cached_old_file_syntax(filename, syntax_diff_text, syntax_callback_key .. ":old-file-syntax", on_context_update)
       if not old_file_syntax and not old_file_pending then
-        old_syntax, old_pending = cached_diff_syntax(filename, diff_text, "old", syntax_callback_key .. ":old-diff-syntax", on_context_update)
+        old_syntax, old_pending = cached_diff_syntax(filename, fallback_syntax_diff_text, "old", syntax_callback_key .. ":old-diff-syntax", on_context_update)
       end
       file_syntax, file_pending = cached_file_syntax(filename, syntax_callback_key .. ":file-syntax", on_context_update)
       if not file_syntax and not file_pending then
-        new_syntax, new_pending = cached_diff_syntax(filename, diff_text, "new", syntax_callback_key .. ":new-diff-syntax", on_context_update)
+        new_syntax, new_pending = cached_diff_syntax(filename, fallback_syntax_diff_text, "new", syntax_callback_key .. ":new-diff-syntax", on_context_update)
       end
     else
-      old_syntax, old_pending = cached_diff_syntax(filename, diff_text, "old", syntax_callback_key .. ":old-diff-syntax", on_context_update)
-      new_syntax, new_pending = cached_diff_syntax(filename, diff_text, "new", syntax_callback_key .. ":new-diff-syntax", on_context_update)
+      old_syntax, old_pending = cached_diff_syntax(filename, fallback_syntax_diff_text, "old", syntax_callback_key .. ":old-diff-syntax", on_context_update)
+      new_syntax, new_pending = cached_diff_syntax(filename, fallback_syntax_diff_text, "new", syntax_callback_key .. ":new-diff-syntax", on_context_update)
     end
     syntax_pending = old_pending or old_file_pending or new_pending or file_pending
   end
@@ -4837,7 +4092,9 @@ function M.open_diff_buffer(filename)
     vim.api.nvim_create_autocmd("CursorMoved", {
       buffer = buf,
       callback = function()
-        M._normalize_status_cursor(buf)
+        M._status_perf_span("diff.autocmd_cursor_moved", buf, nil, function()
+          M._normalize_status_cursor(buf)
+        end)
       end,
     })
 
@@ -5324,7 +4581,7 @@ function M._update_file_diff_cache_async(filename, cb)
     if cb then cb() end
     return
   end
-  git_root_async(function(cwd)
+  git_backend.git_root_async(function(cwd)
     if not cwd then
       if cb then cb() end
       return
@@ -5418,82 +4675,11 @@ local status_reconcile_delay_ms = 120
 ---@field views? table<DiffReviewStatusViewKind, boolean>
 
 ---@type DiffReviewStatusCommandSpec[]
-local status_command_specs = {
-  { id = "toggle", label = "toggle", desc = "Toggle fold", modes = "n", pinned = true, views = { status = true, pr = true, diff = true, review = true } },
-  { id = "collapse_parent", label = "Collapse Parent", desc = "Collapse Parent", modes = "n", pinned = true, views = { status = true, pr = true, diff = true, review = true } },
-  { id = "visual_line_with_gutter", label = "select gutter", desc = "Start visual line selection including the diff gutter", modes = "n", pinned = false, views = { status = true, pr = true, diff = true, review = true } },
-  { id = "stage", label = "stage", desc = "Stage hunk/file/selection", modes = { "n", "x" }, visual = true, pinned = true, views = { status = true } },
-  { id = "unstage", label = "unstage", desc = "Unstage hunk/file/selection", modes = { "n", "x" }, visual = true, pinned = true, views = { status = true } },
-  { id = "discard", label = "discard", desc = "Discard hunk/file/selection", modes = { "n", "x" }, visual = true, pinned = true, views = { status = true } },
-  { id = "commit", label = "commit", desc = "Commit", modes = "n", pinned = true, views = { status = true } },
-  { id = "push", label = "push", desc = "Push", modes = "n", pinned = true, views = { status = true } },
-  { id = "pull", label = "pull", desc = "Pull", modes = "n", pinned = true, views = { status = true } },
-  { id = "pr", label = "pr", desc = "Open pull request", modes = "n", pinned = true, views = { status = true } },
-  { id = "branch_create", label = "branch", desc = "Create a branch", modes = "n", pinned = false, views = { status = true } },
-  { id = "walkthrough", label = "walkthrough", desc = "Review walkthrough", modes = "n", pinned = false, views = { status = true } },
-  { id = "review", label = "review", desc = "Start PR review", modes = "n", pinned = true, views = { status = true, pr = true } },
-  { id = "browse", label = "browse", desc = "Browse pull request", modes = { "n", "x" }, visual = true, pinned = true, views = { pr = true, review = true } },
-  { id = "open", label = "open", desc = "Open PR/about or jump to file", modes = "n", pinned = true },
-  { id = "refresh", label = "refresh", desc = "Refresh DiffReview", modes = "n", pinned = true },
-  { id = "close", label = "close", desc = "Close DiffReview", modes = "n", pinned = true },
-  { id = "help", label = "help", desc = "Show help", modes = "n", pinned = true },
-  { id = "viewed", label = "viewed", desc = "Mark file as viewed", modes = "n", keymap = "review", pinned = true, views = { review = true } },
-  { id = "unviewed", label = "unviewed", desc = "Move file back to unviewed", modes = "n", keymap = "review", pinned = true, views = { review = true } },
-  { id = "comment", label = "comment", desc = "Add or edit an inline comment", modes = { "n", "x" }, keymap = "review", visual = true, pinned = true, views = { pr = true, review = true } },
-  { id = "delete", label = "delete", desc = "Delete draft comment", modes = "n", keymap = "review", pinned = true, views = { review = true } },
-  { id = "next_comment", label = "next", desc = "Jump to next draft comment", modes = "n", keymap = "review", pinned = true, views = { review = true } },
-  { id = "prev_comment", label = "prev", desc = "Jump to previous draft comment", modes = "n", keymap = "review", pinned = true, views = { review = true } },
-  { id = "sync", label = "sync", desc = "Sync inline comments to GitHub", modes = { "n", "i" }, keymap = "review", pinned = true, views = { pr = true, review = true } },
-  { id = "submit", label = "submit", desc = "Submit review to GitHub", modes = "n", keymap = "review", pinned = true, views = { review = true } },
-}
+local status_command_specs = require("diff_review.command_specs").specs
 
-M._status_hint_command_ids_by_view = {
-  status = {
-    "stage",
-    "unstage",
-    "discard",
-    "commit",
-    "open",
-    "refresh",
-    "close",
-    "help",
-  },
-  pr = {
-    "toggle",
-    "browse",
-    "review",
-    "comment",
-    "open",
-    "refresh",
-    "close",
-    "help",
-  },
-  review = {
-    "toggle",
-    "collapse_parent",
-    "viewed",
-    "unviewed",
-    "comment",
-    "delete",
-    "sync",
-    "submit",
-    "open",
-    "close",
-    "help",
-  },
-  diff = {
-    "open",
-    "refresh",
-    "close",
-    "help",
-  },
-}
+M._status_hint_command_ids_by_view = require("diff_review.command_specs").hint_command_ids_by_view
 
----@type table<string, DiffReviewStatusCommandSpec>
-local status_command_specs_by_id = {}
-for _, spec in ipairs(status_command_specs) do
-  status_command_specs_by_id[spec.id] = spec
-end
+local status_command_specs_by_id = require("diff_review.command_specs").by_id
 
 ---@type table<string, DiffReviewSectionConfig>
 local status_section_by_name = {}
@@ -5501,18 +4687,226 @@ for _, section in ipairs(status_section_order) do
   status_section_by_name[section.name] = section
 end
 
-local function status_folded(key, default)
-  M._status = M._status or {}
-  M._status.folds = M._status.folds or {}
-  local folded = M._status.folds[key]
-  if folded == nil then return default end
-  return folded
+local function status_folded(key, default, state)
+  return status_buffer.folded(state or M._status or {}, key, default)
 end
 
-local function set_status_folded(key, folded)
-  M._status = M._status or {}
-  M._status.folds = M._status.folds or {}
-  M._status.folds[key] = folded
+local function set_status_folded(key, folded, state)
+  if not state then
+    M._status = M._status or {}
+    state = M._status
+  end
+  return status_buffer.set_folded(state, key, folded)
+end
+
+---@param value any
+---@return string
+function M._status_fold_text(value)
+  if type(value) == "function" then
+    local ok, text = pcall(value)
+    if ok then return tostring(text or "") end
+  elseif value ~= nil then
+    return tostring(value)
+  end
+  local fold_start = tonumber(vim.v.foldstart) or vim.fn.line(".")
+  return vim.fn.getline(fold_start)
+end
+
+function _G.diff_review_status_foldtext()
+  local buf = vim.api.nvim_get_current_buf()
+  local state = M._status_states and M._status_states[buf] or M._status
+  local fold_start = tonumber(vim.v.foldstart) or vim.fn.line(".")
+  local value = state and state.fold_text_by_start_line and state.fold_text_by_start_line[fold_start] or nil
+  return M._status_fold_text(value)
+end
+
+---@param fold_id string?
+---@param start_line integer?
+---@param end_line integer?
+---@param default_folded boolean?
+---@param fold_text any
+function M._status_register_fold_range(fold_id, start_line, end_line, default_folded, fold_text)
+  if not (fold_id and start_line and end_line and end_line > start_line) then return end
+  local status = M._status
+  if not status then return end
+  status.fold_ranges_by_id = status.fold_ranges_by_id or {}
+  status.fold_range_order = status.fold_range_order or {}
+  status.fold_text_by_start_line = status.fold_text_by_start_line or {}
+  local range = {
+    id = fold_id,
+    start_line = start_line,
+    end_line = end_line,
+    default_folded = default_folded == true,
+    fold_text = fold_text,
+  }
+  local existing = status.fold_ranges_by_id[fold_id]
+  if not existing then
+    status.fold_ranges_by_id[fold_id] = { range }
+  elseif existing.start_line then
+    status.fold_ranges_by_id[fold_id] = { existing, range }
+  else
+    existing[#existing + 1] = range
+  end
+  status.fold_range_order[#status.fold_range_order + 1] = range
+  status.fold_text_by_start_line[start_line] = fold_text
+end
+
+---@param state table?
+---@param fold_id string?
+---@return table[]
+function M._status_fold_ranges_for_id(state, fold_id)
+  local value = state and state.fold_ranges_by_id and fold_id and state.fold_ranges_by_id[fold_id] or nil
+  if not value then return {} end
+  if value.start_line then return { value } end
+  return value
+end
+
+---@param range table
+---@return integer
+function M._status_fold_range_span(range)
+  return (tonumber(range.end_line) or 0) - (tonumber(range.start_line) or 0)
+end
+
+---@param view table
+---@param ranges table[]
+---@param state table?
+---@return table
+function M._status_view_for_fold_restore(view, ranges, state)
+  local line = view and tonumber(view.lnum) or nil
+  if not line then return view end
+  local adjusted = nil
+  for _, range in ipairs(ranges or {}) do
+    local start_line = range and range.start_line or nil
+    local end_line = range and range.end_line or nil
+    if start_line and end_line and line > start_line and line <= end_line and status_folded(range.id, range.default_folded, state) then
+      adjusted = adjusted or vim.deepcopy(view)
+      adjusted.lnum = start_line
+      adjusted.col = 0
+      adjusted.curswant = 0
+    end
+  end
+  return adjusted or view
+end
+
+---@param buf integer
+---@param fold_id string
+---@param _folded boolean
+---@return boolean
+function M._status_set_native_fold_state(buf, fold_id, _folded)
+  local state = M._status_states and M._status_states[buf] or M._status
+  if type(fold_id) == "string"
+    and (fold_id:find("^hunk:")
+      or fold_id:find("^commit%-hunk:")
+      or fold_id:find("^provider%-hunk:")) then
+    return false
+  end
+  local ranges = M._status_fold_ranges_for_id(state, fold_id)
+  if #ranges == 0 then return false end
+  local has_native_range = false
+  for _, range in ipairs(ranges) do
+    if M._status_fold_range_span(range) > 0 then
+      has_native_range = true
+      break
+    end
+  end
+  if not has_native_range then return false end
+  M._status_apply_native_folds(buf)
+  return true
+end
+
+---@param buf integer?
+---@param ranges table[]
+---@param win integer?
+---@return boolean?
+function M._status_native_folded(buf, ranges, win)
+  if not (buf and vim.api.nvim_buf_is_valid(buf) and ranges and ranges[1]) then return nil end
+  if not (win and vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == buf) then
+    win = vim.fn.bufwinid(buf)
+  end
+  if win == -1 or not vim.api.nvim_win_is_valid(win) then return nil end
+  local range = ranges[1]
+  if not (range.start_line and range.end_line and range.end_line > range.start_line) then return nil end
+  return vim.api.nvim_win_call(win, function()
+    return vim.fn.foldclosed(range.start_line) ~= -1
+  end)
+end
+
+---@param buf integer
+function M._status_apply_native_folds(buf)
+  local state = M._status_states and M._status_states[buf] or M._status
+  if not (state and state.fold_range_order and vim.api.nvim_buf_is_valid(buf)) then return end
+  return M._status_perf_span("status.apply_native_folds", buf, {
+    fold_ranges = #(state.fold_range_order or {}),
+  }, function()
+    local max_line = vim.api.nvim_buf_line_count(buf)
+    local ranges = {}
+    for _, range in ipairs(state.fold_range_order) do
+      ranges[#ranges + 1] = range
+    end
+    table.sort(ranges, function(left, right)
+      local left_span = M._status_fold_range_span(left)
+      local right_span = M._status_fold_range_span(right)
+      if left_span == right_span then return (left.start_line or 0) > (right.start_line or 0) end
+      return left_span < right_span
+    end)
+    for _, win in ipairs(vim.fn.win_findbuf(buf)) do
+      if vim.api.nvim_win_is_valid(win) then
+        M._apply_status_window_options(win, state)
+        vim.api.nvim_win_call(win, function()
+          local view = vim.fn.winsaveview()
+          pcall(vim.cmd, "normal! zE")
+          for range_index = #ranges, 1, -1 do
+            local range = ranges[range_index]
+            if range.start_line >= 1
+              and range.end_line <= max_line
+              and range.end_line > range.start_line
+              and status_folded(range.id, range.default_folded, state) then
+              pcall(vim.cmd, ("%d,%dfold"):format(range.start_line, range.end_line))
+            end
+          end
+          vim.fn.winrestview(M._status_view_for_fold_restore(view, ranges, state))
+        end)
+      end
+    end
+  end)
+end
+
+---@param buf integer
+function M._status_sync_after_native_folds(buf)
+  local state = M._status_states and M._status_states[buf] or M._status
+  if not state then return end
+  return M._status_perf_span("status.sync_after_native_folds", buf, nil, function()
+    if state.view_kind == "pr" then
+      M._status_perf_span("status.native_folds.pr_sync_modifiable", buf, nil, function()
+        M._pr_edit.sync_modifiable(buf)
+      end)
+    elseif state.view_kind == "review" then
+      M._status_perf_span("status.native_folds.review_sync_modifiable", buf, nil, function()
+        M._review.sync_modifiable(buf)
+      end)
+    elseif state.view_kind == "status" then
+      M._status_perf_span("status.native_folds.issues_sync_modifiable", buf, nil, function()
+        M._status_issues.sync_modifiable(buf)
+      end)
+    end
+  end)
+end
+
+---@param buf integer
+function M._status_schedule_native_folds(buf)
+  local state = M._status_states and M._status_states[buf] or M._status
+  if not (state and vim.api.nvim_buf_is_valid(buf)) then return end
+  state.native_fold_generation = (state.native_fold_generation or 0) + 1
+  local generation = state.native_fold_generation
+  vim.defer_fn(function()
+    local latest = M._status_states and M._status_states[buf] or M._status
+    if not (latest and latest.native_fold_generation == generation and vim.api.nvim_buf_is_valid(buf)) then return end
+    M._status_perf_span("status.native_folds_deferred", buf, { generation = generation }, function()
+      M._status = latest
+      M._status_apply_native_folds(buf)
+      M._status_sync_after_native_folds(buf)
+    end)
+  end, 20)
 end
 
 function M._refresh_status_windows_after_resize()
@@ -5556,36 +4950,46 @@ local function attach_status_state(buf, state)
   vim.api.nvim_create_autocmd("BufEnter", {
     buffer = buf,
     callback = function()
-      local current = M._status_states and M._status_states[buf] or nil
-      if current then M._status = current end
-      M._apply_status_window_options(vim.api.nvim_get_current_win(), current)
-      M._status_apply_hint_bar(buf, vim.api.nvim_get_current_win())
+      M._status_perf_span("status.autocmd_buf_enter", buf, nil, function()
+        local current = M._status_states and M._status_states[buf] or nil
+        if current then M._status = current end
+        M._apply_status_window_options(vim.api.nvim_get_current_win(), current)
+        M._status_apply_native_folds(buf)
+        M._status_apply_hint_bar(buf, vim.api.nvim_get_current_win())
+      end)
     end,
   })
   vim.api.nvim_create_autocmd("BufWinEnter", {
     buffer = buf,
     callback = function()
-      local current = M._status_states and M._status_states[buf] or nil
-      if current then M._status = current end
-      M._apply_status_window_options(vim.api.nvim_get_current_win(), current)
-      if current and current.view_kind == "review" and M._review and M._review.refresh_inline_comment_rules then
-        M._review.refresh_inline_comment_rules(buf, vim.api.nvim_get_current_win())
-      end
-      M._status_apply_hint_bar(buf, vim.api.nvim_get_current_win())
+      M._status_perf_span("status.autocmd_buf_win_enter", buf, nil, function()
+        local current = M._status_states and M._status_states[buf] or nil
+        if current then M._status = current end
+        M._apply_status_window_options(vim.api.nvim_get_current_win(), current)
+        M._status_apply_native_folds(buf)
+        if current and current.view_kind == "review" and M._review and M._review.refresh_inline_comment_rules then
+          M._review.refresh_inline_comment_rules(buf, vim.api.nvim_get_current_win())
+        end
+        M._status_apply_hint_bar(buf, vim.api.nvim_get_current_win())
+      end)
     end,
   })
   vim.api.nvim_create_autocmd("CursorMoved", {
     buffer = buf,
     callback = function()
-      M._normalize_status_cursor(buf)
-      if M._status_issues then M._status_issues.sync_modifiable(buf) end
+      M._status_perf_span("status.autocmd_cursor_moved", buf, nil, function()
+        M._normalize_status_cursor(buf)
+        if M._status_issues then M._status_issues.sync_modifiable(buf) end
+      end)
     end,
   })
   vim.api.nvim_create_autocmd("ModeChanged", {
     buffer = buf,
     callback = function()
-      M._normalize_status_cursor(buf)
-      if M._status_issues then M._status_issues.sync_modifiable(buf) end
+      M._status_perf_span("status.autocmd_mode_changed", buf, nil, function()
+        M._normalize_status_cursor(buf)
+        if M._status_issues then M._status_issues.sync_modifiable(buf) end
+      end)
     end,
   })
   if state.view_kind == "status" and M._status_issues then
@@ -5621,7 +5025,7 @@ end
 local function status_git_line_async(cwd, args, cb)
   local command = { "git", "-C", cwd }
   vim.list_extend(command, args)
-  systemlist_async(command, function(result, code)
+  git_backend.systemlist_async(command, function(result, code)
     if code ~= 0 then
       cb(nil)
       return
@@ -5735,166 +5139,7 @@ local function status_about_head_line(about_state)
   return { segments = segments, entry = entry }
 end
 
-M._status_issues = M._status_issues or {}
-
----@param cwd string?
----@return string?
-function M._status_issues.path(cwd)
-  if not cwd or cwd == "" then return nil end
-  return vim.fs.joinpath(cwd, ".gitstatus")
-end
-
----@param values any
----@return integer[]
-function M._status_issues.normalize_numbers(values)
-  local numbers = {}
-  local seen = {}
-  if type(values) ~= "table" then return numbers end
-  for _, value in ipairs(values) do
-    local number = tonumber(value)
-    if number and number > 0 and math.floor(number) == number and not seen[number] then
-      seen[number] = true
-      numbers[#numbers + 1] = number
-    end
-  end
-  table.sort(numbers)
-  return numbers
-end
-
----@param line string?
----@return integer[]
-function M._status_issues.parse_line(line)
-  local body = tostring(line or ""):gsub("^%s*Issues:%s*", "")
-  body = vim.trim(body)
-  if body == "" or body:lower() == "none" then return {} end
-  local values = {}
-  local seen_text = {}
-  for issue_text in body:gmatch("#%s*(%d+)") do
-    if not seen_text[issue_text] then
-      seen_text[issue_text] = true
-      values[#values + 1] = issue_text
-    end
-  end
-  for issue_text in body:gmatch("%f[%d](%d+)%f[%D]") do
-    if not seen_text[issue_text] then
-      seen_text[issue_text] = true
-      values[#values + 1] = issue_text
-    end
-  end
-  return M._status_issues.normalize_numbers(values)
-end
-
----@param numbers integer[]?
----@return string
-function M._status_issues.text(numbers)
-  numbers = M._status_issues.normalize_numbers(numbers)
-  if #numbers == 0 then return "none" end
-  local parts = {}
-  for _, number in ipairs(numbers) do
-    parts[#parts + 1] = "#" .. tostring(number)
-  end
-  return table.concat(parts, " ")
-end
-
----@param left integer[]?
----@param right integer[]?
----@return boolean
-function M._status_issues.equal(left, right)
-  left = M._status_issues.normalize_numbers(left)
-  right = M._status_issues.normalize_numbers(right)
-  if #left ~= #right then return false end
-  for index, number in ipairs(left) do
-    if number ~= right[index] then return false end
-  end
-  return true
-end
-
----@param cwd string
----@return table
-function M._status_issues.read_state(cwd)
-  local path = M._status_issues.path(cwd)
-  if not path or vim.fn.filereadable(path) ~= 1 then
-    return { cwd = cwd, numbers = {}, saved_numbers = {} }
-  end
-  local read_ok, lines = pcall(vim.fn.readfile, path)
-  if not read_ok then
-    vim.notify("GitStatus state read failed: " .. tostring(lines), vim.log.levels.WARN, { title = "GitStatus" })
-    return { cwd = cwd, numbers = {}, saved_numbers = {} }
-  end
-  local content = table.concat(lines or {}, "\n")
-  if vim.trim(content) == "" then
-    return { cwd = cwd, numbers = {}, saved_numbers = {} }
-  end
-  local decode_ok, decoded = pcall(vim.json.decode, content)
-  if not (decode_ok and type(decoded) == "table") then
-    vim.notify("GitStatus state read failed: invalid .gitstatus JSON", vim.log.levels.WARN, { title = "GitStatus" })
-    return { cwd = cwd, numbers = {}, saved_numbers = {} }
-  end
-  local numbers = M._status_issues.normalize_numbers(decoded.issues)
-  return { cwd = cwd, numbers = numbers, saved_numbers = vim.deepcopy(numbers), data = decoded }
-end
-
----@param status table?
----@param cwd string?
----@return table?
-function M._status_issues.ensure_state(status, cwd)
-  if not (status and cwd and cwd ~= "") then return nil end
-  if status.issues and status.issues.cwd == cwd then return status.issues end
-  status.issues = M._status_issues.read_state(cwd)
-  return status.issues
-end
-
----@param cwd string
----@param numbers integer[]
----@param existing table?
----@return boolean
----@return string?
-function M._status_issues.write(cwd, numbers, existing)
-  local path = M._status_issues.path(cwd)
-  if not path then return false, "missing git root" end
-  local data = type(existing) == "table" and vim.deepcopy(existing) or {}
-  if vim.fn.filereadable(path) == 1 and not existing then
-    local read_ok, lines = pcall(vim.fn.readfile, path)
-    if not read_ok then return false, tostring(lines) end
-    local content = table.concat(lines or {}, "\n")
-    if vim.trim(content) ~= "" then
-      local decode_ok, decoded = pcall(vim.json.decode, content)
-      if not (decode_ok and type(decoded) == "table") then return false, "invalid .gitstatus JSON" end
-      data = decoded
-    end
-  end
-  data.issues = M._status_issues.normalize_numbers(numbers)
-  local write_ok, write_result = pcall(vim.fn.writefile, { vim.json.encode(data) }, path)
-  if not write_ok then return false, tostring(write_result) end
-  if write_result ~= 0 then return false, "writefile returned " .. tostring(write_result) end
-  return true, nil
-end
-
----@param issues_state table?
----@return DiffReviewStatusHeadLine
-function M._status_issues.head_line(issues_state)
-  local numbers = issues_state and issues_state.numbers or {}
-  local text = M._status_issues.text(numbers)
-  return {
-    segments = {
-      { ("%-8s"):format("Issues:"), "DiffReviewStatusLabel" },
-      { text, text == "none" and "Comment" or "DiffReviewStatusPR" },
-    },
-    entry = { id = "issues", kind = "issues", issues = issues_state },
-  }
-end
-
----@param status table
----@param head_line DiffReviewStatusHeadLine
-function M._status_issues.replace_head_line(status, head_line)
-  if not (status and status.head_lines) then return end
-  for index, line in ipairs(status.head_lines) do
-    if line.entry and line.entry.id == "issues" then
-      status.head_lines[index] = head_line
-      return
-    end
-  end
-end
+M._status_issues = require("diff_review.status_issues")
 
 ---@param buf integer
 ---@return boolean
@@ -6009,296 +5254,17 @@ function M._status_section_count(section)
   return #(section.files or {})
 end
 
----@param value any
----@return integer? epoch_seconds
----@return table? date_parts
-function M._datetime.parse(value)
-  local text = vim.trim(tostring(value or ""))
-  if text == "" then return nil, nil end
 
-  local year, month, day, hour, minute, second, zone = text:match("^(%d%d%d%d)%-(%d%d)%-(%d%d)T(%d%d):(%d%d):?(%d*)%.?%d*([Zz]?)")
-  if not year then
-    year, month, day, hour, minute, second = text:match("^(%d%d%d%d)%-(%d%d)%-(%d%d) (%d%d):(%d%d):?(%d*)")
-  end
-  if not year then return nil, nil end
 
-  local parts = {
-    year = tonumber(year),
-    month = tonumber(month),
-    day = tonumber(day),
-    hour = tonumber(hour) or 0,
-    min = tonumber(minute) or 0,
-    sec = tonumber(second ~= "" and second or "0") or 0,
-  }
-  if not (parts.year and parts.month and parts.day) then return nil, nil end
 
-  local epoch = os.time(parts)
-  if zone and zone:lower() == "z" then
-    local now = os.time()
-    local utc_now_parts = os.date("!*t", now)
-    if type(utc_now_parts) == "table" then
-      utc_now_parts.isdst = false
-      local local_epoch_for_utc_now = os.time(utc_now_parts)
-      if local_epoch_for_utc_now then epoch = epoch + os.difftime(now, local_epoch_for_utc_now) end
-    end
-  end
-  return epoch, parts
-end
 
----@return integer
-function M._datetime.now()
-  if type(M._datetime.now_override) == "function" then
-    local ok, value = pcall(M._datetime.now_override)
-    if ok and type(value) == "number" then return value end
-  end
-  return os.time()
-end
 
----@param count integer
----@param unit string
----@return string
-function M._datetime.ago(count, unit)
-  count = math.max(1, count)
-  local suffix = count == 1 and unit or (unit .. "s")
-  return ("%d %s ago"):format(count, suffix)
-end
 
----@param epoch integer
----@return string
-function M._datetime.absolute_date(epoch)
-  local parts = os.date("*t", epoch)
-  if type(parts) ~= "table" then return "" end
-  local months = {
-    "January",
-    "February",
-    "March",
-    "April",
-    "May",
-    "June",
-    "July",
-    "August",
-    "September",
-    "October",
-    "November",
-    "December",
-  }
-  return ("%s %d, %d"):format(months[parts.month] or "", parts.day or 1, parts.year or 1970)
-end
 
----@param epoch integer
----@param now integer
----@return integer
-function M._datetime.calendar_day_delta(epoch, now)
-  local then_parts = os.date("*t", epoch)
-  local now_parts = os.date("*t", now)
-  if type(then_parts) ~= "table" or type(now_parts) ~= "table" then return 0 end
-  local then_midnight = os.time({ year = then_parts.year, month = then_parts.month, day = then_parts.day, hour = 0, min = 0, sec = 0 })
-  local now_midnight = os.time({ year = now_parts.year, month = now_parts.month, day = now_parts.day, hour = 0, min = 0, sec = 0 })
-  if not (then_midnight and now_midnight) then return 0 end
-  return math.floor((os.difftime(now_midnight, then_midnight) / 86400) + 0.5)
-end
 
----@param value any
----@param opts? { yesterday?: boolean }
----@return string
-function M._datetime.relative(value, opts)
-  opts = opts or {}
-  local text = vim.trim(tostring(value or ""))
-  if text == "" then return "" end
-  local epoch = M._datetime.parse(text)
-  if not epoch then return text end
 
-  local now = M._datetime.now()
-  local seconds = math.floor(os.difftime(now, epoch))
-  if seconds < 60 then return "just now" end
-  if seconds < 3600 then return M._datetime.ago(math.floor(seconds / 60), "minute") end
-  if seconds < 86400 then return M._datetime.ago(math.floor(seconds / 3600), "hour") end
 
-  local days = M._datetime.calendar_day_delta(epoch, now)
-  if days == 1 and opts.yesterday ~= false then return "Yesterday" end
-  if days >= 1 and days < 7 then return M._datetime.ago(days, "day") end
-  if days >= 7 and days < 14 then return "Last week" end
-  if days >= 14 and days < 30 then return M._datetime.ago(days, "day") end
-  if days >= 30 and days < 60 then return "Last month" end
-  return M._datetime.absolute_date(epoch)
-end
 
----@param user string
----@param action string
----@param value any
----@return string
-function M._datetime.action_phrase(user, action, value)
-  local relative = M._datetime.relative(value)
-  if relative == "" then return ("%s %s"):format(user, action) end
-  return ("%s %s %s"):format(user, action, relative)
-end
-
----@param text string
----@return table[]
-function M._datetime.date_highlight_ranges(text)
-  text = tostring(text or "")
-  local ranges = {}
-  local patterns = {
-    "%f[%w]just now%f[%W]",
-    "%f[%w]%d+ minutes? ago%f[%W]",
-    "%f[%w]%d+ hours? ago%f[%W]",
-    "%f[%w]%d+ days? ago%f[%W]",
-    "%f[%w]Yesterday%f[%W]",
-    "%f[%w]Last week%f[%W]",
-    "%f[%w]Last month%f[%W]",
-    "%f[%a]%u%l+ %d%d?, %d%d%d%d%f[%W]",
-  }
-  for _, pattern in ipairs(patterns) do
-    local start_index = 1
-    while start_index <= #text do
-      local match_start, match_end = text:find(pattern, start_index)
-      if not match_start then break end
-      ranges[#ranges + 1] = {
-        start_col = match_start - 1,
-        end_col = match_end,
-      }
-      start_index = match_end + 1
-    end
-  end
-  table.sort(ranges, function(left, right) return left.start_col < right.start_col end)
-  return ranges
-end
-
----@param value any
----@return string
-function M._pr_overview.comment_datetime(value)
-  return M._datetime.relative(value)
-end
-
----@param body string
----@return string
-function M._pr_overview.comment_preview(body)
-  return M._comment_rows.preview_text(body)
-end
-
----@param comment table
----@return string
-function M._pr_overview.comment_author(comment)
-  return M._comment_rows.author(comment)
-end
-
----@param text any
----@param width integer?
----@return string
-function M._pr_overview.pad_display_right(text, width)
-  return M._comment_rows.pad_right(text, width)
-end
-
----@return GithubCommentRowsOpts
-function M._pr_overview.issue_comment_row_options()
-  return {
-    comment_icon = M._comment_icon,
-    relative_date = M._pr_overview.comment_datetime,
-    entry_id = M._pr_overview.issue_comment_entry_id,
-    preview_width = function(prefix)
-      return math.max(0, M._review.comment_rule_width(nil, nil) - vim.fn.strdisplaywidth(prefix))
-    end,
-    truncate_preview = M._review.truncate_preview_text,
-    body_lines = M._review.comment_body_lines,
-    kind = "pr_comment",
-    line_hl_group = "DiffReviewReviewComment",
-    body_hl_group = "DiffReviewReviewComment",
-    date_hl_group = "DiffReviewStatusDate",
-  }
-end
-
----@param comment table
----@return string
-function M._pr_overview.issue_comment_date(comment)
-  return M._comment_rows.date(comment, M._pr_overview.issue_comment_row_options())
-end
-
----@param comments table[]?
----@return { author_width: integer, date_width: integer }
-function M._pr_overview.issue_comment_alignment(comments)
-  return M._comment_rows.alignment(comments, M._pr_overview.issue_comment_row_options())
-end
-
----@param comment table
----@param alignment? { author_width?: integer, date_width?: integer }
----@param has_preview? boolean
----@return string
-function M._pr_overview.issue_comment_prefix(comment, alignment, has_preview)
-  return M._comment_rows.prefix(comment, alignment, has_preview, M._pr_overview.issue_comment_row_options())
-end
-
----@param comment table
----@param expanded? boolean
----@param alignment? { author_width?: integer, date_width?: integer }
----@return string
-function M._pr_overview.issue_comment_line(comment, expanded, alignment)
-  return M._comment_rows.line(comment, expanded, alignment, M._pr_overview.issue_comment_row_options())
-end
-
----@param comment table?
----@param index integer
----@return string
-function M._pr_overview.issue_comment_entry_id(comment, index)
-  local key = M._pr_overview.comment_identity_key(comment)
-  if key then return "pr-issue-comment:" .. key end
-  local local_id = comment and comment.local_id or nil
-  if local_id and local_id ~= "" then return "pr-issue-comment:local:" .. tostring(local_id) end
-  return "pr-issue-comment:" .. tostring(index)
-end
-
----@param pr DiffReviewGhPR
----@param status table?
----@return string
-function M._pr_overview.activity_text(pr, status)
-  local latest_epoch = nil
-  local latest_value = nil
-
-  local function consider(value)
-    local epoch = M._datetime.parse(value)
-    if epoch and (not latest_epoch or epoch > latest_epoch) then
-      latest_epoch = epoch
-      latest_value = value
-    end
-  end
-
-  local function consider_comment(comment)
-    if type(comment) ~= "table" then return end
-    consider(comment.updated_at or comment.updatedAt or comment.created_at or comment.createdAt)
-    for _, reply in ipairs(type(comment.replies) == "table" and comment.replies or {}) do
-      if type(reply) == "table" then consider(reply.updated_at or reply.updatedAt or reply.created_at or reply.createdAt) end
-    end
-  end
-
-  for _, commit in ipairs(type(pr.commits) == "table" and pr.commits or {}) do
-    if type(commit) == "table" then
-      consider(commit.committedDate or commit.committed_date or commit.committed_at or commit.authoredDate or commit.authored_date or commit.authored_at)
-    end
-  end
-
-  local comments = status and status.pr_comments or nil
-  for _, review in ipairs(type(comments and comments.reviews) == "table" and comments.reviews or {}) do
-    if type(review) == "table" then
-      consider(review.submitted_at or review.submittedAt or review.updated_at or review.updatedAt or review.created_at or review.createdAt)
-      for _, comment in ipairs(type(review.comments) == "table" and review.comments or {}) do
-        consider_comment(comment)
-      end
-    end
-  end
-  for _, comment in ipairs(type(comments and comments.code_comments) == "table" and comments.code_comments or {}) do
-    consider_comment(comment)
-  end
-  for _, comment in ipairs(type(comments and comments.issue_comments) == "table" and comments.issue_comments or {}) do
-    consider_comment(comment)
-  end
-  for _, comment in ipairs(status and status.pr_standalone_comments or {}) do
-    consider_comment(comment)
-  end
-  for _, comment in ipairs(status and status.pr_regular_comments or {}) do
-    consider_comment(comment)
-  end
-
-  return latest_value and M._datetime.relative(latest_value) or ""
-end
 
 ---@param oid string?
 ---@return string
@@ -6338,208 +5304,18 @@ local function status_pr_head_subject(pr)
   return tostring(commit.messageHeadline or commit.subject or commit.message or ""), date_text, commit
 end
 
----@param username string
----@return string
-function M._pr_overview.reviewer_token(username)
-  return "@" .. tostring(username or ""):gsub("^@", "")
-end
 
----@param reviewer any
----@return string
-function M._pr_overview.reviewer_login(reviewer)
-  if type(reviewer) == "table" then
-    return tostring(reviewer.login or reviewer.slug or reviewer.name or ""):gsub("^@", "")
-  end
-  return tostring(reviewer or ""):gsub("^@", "")
-end
 
----@param reviewer any
----@return boolean
-function M._pr_overview.reviewer_is_code_owner(reviewer)
-  return type(reviewer) == "table" and reviewer.is_code_owner == true
-end
 
----@param login string
----@param is_code_owner boolean?
----@return DiffReviewGhRequestedReviewer
-function M._pr_overview.reviewer_entry(login, is_code_owner)
-  return {
-    login = tostring(login or ""):gsub("^@", ""),
-    is_code_owner = is_code_owner or nil,
-  }
-end
 
----@param reviewers any[]?
----@param out DiffReviewGhRequestedReviewer[]
----@param seen table<string, boolean>
-function M._pr_overview.add_reviewers(reviewers, out, seen)
-  for _, reviewer in ipairs(reviewers or {}) do
-    local username = M._pr_overview.reviewer_login(reviewer)
-    local key = username:lower()
-    if username ~= "" and not seen[key] then
-      seen[key] = true
-      out[#out + 1] = M._pr_overview.reviewer_entry(username, M._pr_overview.reviewer_is_code_owner(reviewer))
-    elseif username ~= "" and M._pr_overview.reviewer_is_code_owner(reviewer) then
-      for _, existing in ipairs(out) do
-        if M._pr_overview.reviewer_login(existing):lower() == key then
-          existing.is_code_owner = true
-          break
-        end
-      end
-    end
-  end
-end
 
----@param pr DiffReviewGhPR
----@param status table?
----@return DiffReviewGhRequestedReviewer[]
-function M._pr_overview.pending_reviewers(pr, status)
-  local reviewers = {}
-  local seen = {}
-  M._pr_overview.add_reviewers(pr and pr.requestedReviewers or nil, reviewers, seen)
-  local edit_state = status and status.pr_edit or nil
-  M._pr_overview.add_reviewers(edit_state and edit_state.pending_reviewers or nil, reviewers, seen)
-  return reviewers
-end
 
----@param pr DiffReviewGhPR
----@param status table?
----@return string
-function M._pr_overview.pending_review_text(pr, status)
-  local reviewers = M._pr_overview.pending_reviewers(pr, status)
-  if #reviewers == 0 then return "" end
-  local tokens = { M._pending_review_icon }
-  for _, reviewer in ipairs(reviewers) do
-    local token = M._pr_overview.reviewer_token(M._pr_overview.reviewer_login(reviewer))
-    if pr and pr.isDraft and M._pr_overview.reviewer_is_code_owner(reviewer) then
-      token = M._codeowner_review_icon .. token
-    end
-    tokens[#tokens + 1] = token
-  end
-  return table.concat(tokens, " ")
-end
 
----@param pr DiffReviewGhPR?
----@return string
-function M._pr_overview.milestone_title(pr)
-  local milestone = pr and pr.milestone or nil
-  if type(milestone) == "table" then return vim.trim(tostring(milestone.title or "")) end
-  if type(milestone) == "string" then return vim.trim(milestone) end
-  return ""
-end
 
----@param pr DiffReviewGhPR?
----@return string
-function M._pr_overview.milestone_text(pr)
-  local title = M._pr_overview.milestone_title(pr)
-  if title == "" then return "" end
-  return ("%s %s"):format(M._milestone_icon, title)
-end
 
----@param pr DiffReviewGhPR?
----@return string
-function M._pr_overview.status_text(pr)
-  return pr and pr.isDraft and "DRAFT" or "READY"
-end
 
----@param check DiffReviewGhPRCheck
----@return string icon
----@return string hl_group
-function M._pr_overview.check_icon(check)
-  local state = tostring(check and check.state or ""):lower()
-  if state == "success" then return "✓", "DiffReviewAddRange" end
-  if state == "failure" or state == "error" or state == "timed_out" or state == "startup_failure" or state == "action_required" then
-    return "✗", "DiffReviewDeleteRange"
-  end
-  if state == "cancelled" or state == "skipped" or state == "neutral" then return "!", "DiffReviewStatusFetching" end
-  return "◷", "DiffReviewStatusFetching"
-end
 
----@param check DiffReviewGhPRCheck
----@return string
-function M._pr_overview.check_workflow_suffix(check)
-  local workflow_name = vim.trim(tostring(check and check.workflow_name or ""))
-  local name = vim.trim(tostring(check and check.name or ""))
-  if workflow_name == "" or workflow_name == name then return "" end
-  return workflow_name
-end
 
----@param pr DiffReviewGhPR
----@param status table?
----@return DiffReviewStatusHeadLine[]
-function M._pr_overview.check_head_lines(pr, status)
-  local section_id = "pr-head-section:checks"
-  local lines = {}
-  lines[#lines + 1] = { segments = { { "" } } }
-  lines[#lines + 1] = {
-    segments = { { "Checks:", "DiffReviewStatusHeader" } },
-    entry = { id = section_id, kind = "pr_head_section" },
-  }
-  if not (pr.repo and pr.repo ~= "") then
-    lines[#lines + 1] = {
-      segments = { { "No checks", "Comment" } },
-      parent_id = section_id,
-      entry = { id = section_id .. ":message", kind = "pr_head_line", fold_target_id = section_id },
-    }
-    return lines
-  end
-  if status and status.pr_checks_error then
-    lines[#lines + 1] = {
-      segments = { { tostring(status.pr_checks_error), "ErrorMsg" } },
-      parent_id = section_id,
-      entry = { id = section_id .. ":error", kind = "pr_head_line", fold_target_id = section_id },
-    }
-    return lines
-  end
-  if status and status.pr_checks_loading then
-    lines[#lines + 1] = {
-      segments = { { "...loading checks...", "DiffReviewStatusFetching" } },
-      parent_id = section_id,
-      entry = { id = section_id .. ":loading", kind = "pr_head_line", fold_target_id = section_id },
-    }
-    return lines
-  end
-  local checks = status and status.pr_checks or nil
-  if type(checks) ~= "table" then
-    lines[#lines + 1] = {
-      segments = { { "...loading checks...", "DiffReviewStatusFetching" } },
-      parent_id = section_id,
-      entry = { id = section_id .. ":loading", kind = "pr_head_line", fold_target_id = section_id },
-    }
-    return lines
-  end
-  if #checks == 0 then
-    lines[#lines + 1] = {
-      segments = { { "No checks", "Comment" } },
-      parent_id = section_id,
-      entry = { id = section_id .. ":message", kind = "pr_head_line", fold_target_id = section_id },
-    }
-    return lines
-  end
-  for check_index, check in ipairs(checks) do
-    local icon, icon_hl = M._pr_overview.check_icon(check)
-    local workflow_suffix = M._pr_overview.check_workflow_suffix(check)
-    local segments = {
-      { icon .. " ", icon_hl },
-      { tostring(check.name or "Check"), "DiffReviewStatusPath" },
-    }
-    if workflow_suffix ~= "" then
-      segments[#segments + 1] = { " | ", "Comment" }
-      segments[#segments + 1] = { workflow_suffix, "DiffReviewStatusRemote" }
-    end
-    lines[#lines + 1] = {
-      segments = segments,
-      parent_id = section_id,
-      entry = {
-        id = "pr:check:" .. tostring(check_index) .. ":" .. tostring(check.name or "check"),
-        kind = "pr_check",
-        pr_check = check,
-        fold_target_id = section_id,
-      },
-    }
-  end
-  return lines
-end
 
 ---@param pr DiffReviewGhPR
 ---@param status table?
@@ -6601,18 +5377,20 @@ local function status_pr_detail_head_lines(pr, status)
   lines[#lines + 1] = { segments = { { "" } } }
   lines[#lines + 1] = {
     segments = { { "Description:", "DiffReviewStatusHeader" } },
-    entry = { id = description_section_id, kind = "pr_head_section" },
+    entry = { id = description_section_id, kind = "pr_head_section", default_folded = false },
   }
-  for line_index, line in ipairs(status_markdown_lines(pr.body)) do
-    lines[#lines + 1] = {
-      segments = { { line } },
-      parent_id = description_section_id,
-      entry = {
-        id = description_section_id .. ":line:" .. tostring(line_index),
-        kind = "pr_head_line",
-        fold_target_id = description_section_id,
-      },
-    }
+  if not status_folded(description_section_id, false, status) then
+    for line_index, line in ipairs(status_markdown_lines(pr.body)) do
+      lines[#lines + 1] = {
+        segments = { { line } },
+        parent_id = description_section_id,
+        entry = {
+          id = description_section_id .. ":line:" .. tostring(line_index),
+          kind = "pr_head_line",
+          fold_target_id = description_section_id,
+        },
+      }
+    end
   end
   vim.list_extend(lines, M._pr_overview.check_head_lines(pr, status))
   return lines
@@ -6751,61 +5529,21 @@ function M._status_first_grouping_id(sections)
 end
 
 local function status_add_highlight(line, start_col, end_col, hl_group, priority)
-  M._status.highlights[#M._status.highlights + 1] = {
-    line = line,
-    start_col = start_col,
-    end_col = end_col,
-    hl_group = hl_group,
-    priority = priority,
-  }
+  return status_buffer.add_highlight(M._status, line, start_col, end_col, hl_group, priority)
 end
 
 local function status_add_extmark(line, col, opts)
-  M._status.extmarks[#M._status.extmarks + 1] = {
-    line = line,
-    col = col,
-    opts = opts,
-  }
+  return status_buffer.add_extmark(M._status, line, col, opts)
 end
 
 local function status_add_line(text, entry, line_hl_group)
-  M._status.lines[#M._status.lines + 1] = text
-  local line = #M._status.lines
-  if entry then M._status.entries[line] = entry end
-  if line_hl_group then
-    M._status.line_highlights[#M._status.line_highlights + 1] = {
-      line = line,
-      hl_group = line_hl_group,
-    }
-  end
-  return line
+  return status_buffer.add_line(M._status, text, entry, line_hl_group)
 end
 
-function M._status_segment_line_parts(segments)
-  local parts = {}
-  local col = 0
-  local segment_highlights = {}
-  for _, segment in ipairs(segments) do
-    local text = segment[1] or ""
-    parts[#parts + 1] = text
-    if segment[2] and text ~= "" then
-      segment_highlights[#segment_highlights + 1] = {
-        start_col = col,
-        end_col = col + #text,
-        hl_group = segment[2],
-      }
-    end
-    col = col + #text
-  end
-  return table.concat(parts), segment_highlights
-end
+M._status_segment_line_parts = status_buffer.segment_line_parts
 
 local function status_add_segment_line(segments, entry)
-  local text, segment_highlights = M._status_segment_line_parts(segments)
-  local line = status_add_line(text, entry)
-  for _, highlight in ipairs(segment_highlights) do
-    status_add_highlight(line, highlight.start_col, highlight.end_col, highlight.hl_group)
-  end
+  return status_buffer.add_segment_line(M._status, segments, entry)
 end
 
 ---@param buf integer
@@ -6852,135 +5590,6 @@ function M._status_patch_head_line(buf, entry_id, head_line)
   return true
 end
 
----@param buf integer
----@return boolean
-function M._status_issues.patch_line(buf)
-  local status = M._status_states and M._status_states[buf] or M._status
-  if not status then return false end
-  local head_line = M._status_issues.head_line(status.issues)
-  M._status_issues.replace_head_line(status, head_line)
-  return M._status_patch_head_line(buf, "issues", head_line)
-end
-
----@param buf integer
----@return integer?
-function M._status_issues.row(buf)
-  local status = M._status_states and M._status_states[buf] or M._status
-  if status and status.entries then
-    for row, entry in pairs(status.entries) do
-      if entry and entry.id == "issues" then return row end
-    end
-  end
-  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return nil end
-  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-  for index, line in ipairs(lines) do
-    if line:match("^Issues:%s*") then return index end
-  end
-  return nil
-end
-
----@param buf integer
----@return string
-function M._status_issues.current_line(buf)
-  local row = M._status_issues.row(buf)
-  if not row then return "" end
-  return vim.api.nvim_buf_get_lines(buf, row - 1, row, false)[1] or ""
-end
-
----@param buf integer
----@return integer[]
-function M._status_issues.current_numbers(buf)
-  return M._status_issues.parse_line(M._status_issues.current_line(buf))
-end
-
----@param buf integer
----@return boolean
-function M._status_issues.cursor_on_row(buf)
-  if not (buf and vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_get_current_buf() == buf) then return false end
-  local row = M._status_issues.row(buf)
-  return row ~= nil and vim.api.nvim_win_get_cursor(0)[1] == row
-end
-
----@param buf integer
-function M._status_issues.refresh_modified(buf)
-  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
-  if vim.b[buf].diff_review_status_rendering then return end
-  local status = M._status_states and M._status_states[buf] or M._status
-  if not (status and status.view_kind == "status") then return end
-  local issues_state = status.issues or M._status_issues.ensure_state(status, status.cwd)
-  local saved_numbers = issues_state and issues_state.saved_numbers or {}
-  vim.bo[buf].modified = not M._status_issues.equal(M._status_issues.current_numbers(buf), saved_numbers)
-end
-
----@param buf integer
-function M._status_issues.sync_modifiable(buf)
-  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
-  if vim.b[buf].diff_review_status_rendering then return end
-  local status = M._status_states and M._status_states[buf] or M._status
-  if not (status and status.view_kind == "status") then return end
-  vim.bo[buf].modifiable = M._status_issues.cursor_on_row(buf)
-end
-
----@param buf integer
-function M._status_issues.save(buf)
-  local status = M._status_states and M._status_states[buf] or M._status
-  if not (status and status.view_kind == "status" and status.cwd) then
-    notify_error("GitStatus state save failed: not in a git status buffer", "GitStatus")
-    return
-  end
-  local issues_state = status.issues or M._status_issues.ensure_state(status, status.cwd) or {}
-  local numbers = M._status_issues.current_numbers(buf)
-  local ok, err = M._status_issues.write(status.cwd, numbers, issues_state.data)
-  if not ok then
-    notify_error("GitStatus state save failed: " .. tostring(err), "GitStatus")
-    vim.bo[buf].modified = true
-    M._status_issues.sync_modifiable(buf)
-    return
-  end
-  issues_state.cwd = status.cwd
-  issues_state.numbers = vim.deepcopy(numbers)
-  issues_state.saved_numbers = vim.deepcopy(numbers)
-  issues_state.data = issues_state.data or {}
-  issues_state.data.issues = vim.deepcopy(numbers)
-  status.issues = issues_state
-  M._status_issues.patch_line(buf)
-  vim.bo[buf].modified = false
-  M._status_issues.sync_modifiable(buf)
-end
-
----@param buf integer
-function M._status_issues.attach(buf)
-  if vim.b[buf].diff_review_status_issues_attached then return end
-  vim.b[buf].diff_review_status_issues_attached = true
-  vim.bo[buf].buftype = "acwrite"
-  local group = vim.api.nvim_create_augroup("DiffReviewStatusIssues" .. tostring(buf), { clear = true })
-  vim.api.nvim_create_autocmd({ "BufEnter", "CursorMoved", "CursorMovedI", "ModeChanged" }, {
-    group = group,
-    buffer = buf,
-    callback = function()
-      M._status_issues.sync_modifiable(buf)
-    end,
-  })
-  vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI", "InsertLeave" }, {
-    group = group,
-    buffer = buf,
-    callback = function()
-      M._status_issues.refresh_modified(buf)
-      M._status_issues.sync_modifiable(buf)
-    end,
-  })
-  vim.api.nvim_create_autocmd("BufWriteCmd", {
-    group = group,
-    buffer = buf,
-    callback = function()
-      M._status_issues.save(buf)
-    end,
-  })
-  vim.keymap.set("i", "<CR>", function()
-    if M._status_issues.cursor_on_row(buf) then return "" end
-    return "\r"
-  end, { buffer = buf, expr = true, desc = "Keep GitStatus issue list on one line" })
-end
 
 ---@return DiffReviewStatusKeymapConfig
 local function status_keymap_config()
@@ -7116,126 +5725,7 @@ function M._status_clear_hint_bar(win)
 end
 
 local function status_add_fancy_row(row, entry, indent)
-  indent = indent or 0
-  local text_parts = {}
-  if indent > 0 then
-    text_parts[#text_parts + 1] = string.rep(" ", indent)
-  end
-
-  local col = indent
-  local row_highlights = {}
-  local row_extmarks = {}
-  local diff_line = nil
-  local diff_lines = nil
-  for _, chunk in ipairs(row) do
-    if chunk.meta and chunk.meta.diff then
-      diff_line = chunk.meta.diff
-    end
-    if chunk.meta and chunk.meta.diff_lines then
-      diff_lines = chunk.meta.diff_lines
-    end
-    if type(chunk[1]) == "string" then
-      local text = chunk[1]
-      if text ~= "" then
-        text_parts[#text_parts + 1] = text
-        if chunk[2] then
-          row_highlights[#row_highlights + 1] = {
-            start_col = col,
-            end_col = col + #text,
-            hl_group = chunk[2],
-          }
-        end
-        col = col + #text
-      end
-    elseif chunk.virt_text then
-      local opts = {}
-      for key, value in pairs(chunk) do
-        if key ~= "col" then
-          opts[key] = value
-        end
-      end
-      row_extmarks[#row_extmarks + 1] = {
-        col = (chunk.col or 0) + indent,
-        opts = opts,
-      }
-    end
-  end
-
-  local line_text = table.concat(text_parts)
-  local content_length = nil
-  if row.diff_review_bg_hl then
-    line_text, content_length = M._diff_pad_highlighted_line(line_text, M._status.buf)
-  end
-
-  local line_entry = entry
-  if row.diff_review_boundary or row.diff_review_context_padding then
-    line_entry = nil
-  end
-  if diff_line and entry and (row.diff_review_boundary or row.diff_review_context_padding) then
-    line_entry = {
-      kind = "context_line",
-      file = entry.file,
-      diff_line = diff_line,
-    }
-    if diff_lines then line_entry.diff_lines = diff_lines end
-  elseif diff_line and entry then
-    local diff_entry = { diff_line = diff_line }
-    if diff_lines then diff_entry.diff_lines = diff_lines end
-    local inline_jump_spans = {}
-    for _, inline_highlight in ipairs(row.diff_review_inline_highlights or {}) do
-      inline_jump_spans[#inline_jump_spans + 1] = {
-        start_col = indent + inline_highlight.start_col,
-        end_col = indent + inline_highlight.end_col,
-        hl_group = inline_highlight.hl_group,
-        kind = inline_highlight.kind,
-      }
-    end
-    if #inline_jump_spans > 0 then diff_entry.inline_jump_spans = inline_jump_spans end
-    line_entry = vim.tbl_extend("force", entry, diff_entry)
-  end
-  local line = status_add_line(line_text, line_entry)
-  if row.diff_review_bg_hl then
-    M._diff_line_content_lengths = M._diff_line_content_lengths or {}
-    M._diff_line_content_lengths[M._status.buf] = M._diff_line_content_lengths[M._status.buf] or {}
-    M._diff_line_content_lengths[M._status.buf][line] = content_length or #line_text
-    status_add_extmark(line, 0, {
-      end_col = #line_text,
-      hl_group = row.diff_review_bg_hl,
-      priority = 60,
-    })
-  end
-  if row.diff_review_boundary then
-    M._status.boundary_lines = M._status.boundary_lines or {}
-    M._status.boundary_lines[line] = true
-  end
-  for _, highlight in ipairs(row_highlights) do
-    status_add_highlight(line, highlight.start_col, highlight.end_col, highlight.hl_group)
-  end
-  for _, inline_highlight in ipairs(row.diff_review_inline_highlights or {}) do
-    status_add_highlight(
-      line,
-      indent + inline_highlight.start_col,
-      indent + inline_highlight.end_col,
-      inline_highlight.hl_group,
-      inline_highlight.priority or 110
-    )
-  end
-  for _, extmark in ipairs(row_extmarks) do
-    status_add_extmark(line, extmark.col, extmark.opts)
-  end
-  -- Review view: emit any draft comments anchored on this diff row as real
-  -- (navigable, editable) lines right below it.
-  if M._status.review_after_row and diff_line and entry and not (row.diff_review_boundary or row.diff_review_context_padding) then
-    local emitted = {}
-    local targets = diff_lines or { diff_line }
-    for _, target_line in ipairs(targets) do
-      local key = ("%s\0%s\0%s"):format(tostring(target_line.file), tostring(target_line.side), tostring(target_line.line))
-      if not emitted[key] then
-        emitted[key] = true
-        M._status.review_after_row(target_line, indent)
-      end
-    end
-  end
+  return status_buffer.add_fancy_row(M._status, row, entry, indent)
 end
 
 ---@param item table
@@ -7552,404 +6042,23 @@ local function status_commit_files_from_diff(cwd, commit, diff_text)
   }, diff_text)
 end
 
-M._section_builder = {}
+-- Expose the diff-to-files provider so section_builder can assemble sections without
+-- pulling the diff parser out of init.
+M._status_files_from_diff_provider = status_files_from_diff_provider
+M._section_builder = require("diff_review.section_builder")
 
----@param files DiffReviewStatusFile[]
----@return table<string, DiffReviewStatusFile>
-function M._section_builder.files_by_name(files)
-  local files_by_name = {} ---@type table<string, DiffReviewStatusFile>
-  for _, file in ipairs(files or {}) do
-    files_by_name[file.filename] = file
-  end
-  return files_by_name
-end
 
----@param cwd string
----@param spec { section_name: string, default_status?: string, files?: DiffReviewGhPRFile[] }
----@param diff_text? string
----@return DiffReviewStatusFile[]
-function M._section_builder.files_from_diff(cwd, spec, diff_text)
-  return status_files_from_diff_provider(cwd, {
-    section_name = spec.section_name,
-    default_status = spec.default_status or "",
-    files = spec.files,
-  }, diff_text)
-end
 
----@param title string
----@param files DiffReviewStatusFile[]
----@param opts? { name?: string, default_folded?: boolean, file_key_prefix?: string, file_entry_kind?: "file"|"commit_file"|"pr_file"|"pr_review_file", hunk_entry_kind?: "hunk"|"commit_hunk"|"pr_hunk"|"pr_review_hunk", keep_empty?: boolean }
----@return DiffReviewStatusSection?
-function M._section_builder.section_from_files(title, files, opts)
-  opts = opts or {}
-  files = files or {}
-  if #files == 0 and not opts.keep_empty then return nil end
-  return {
-    name = opts.name or title,
-    title = title,
-    default_folded = opts.default_folded == true,
-    files = files,
-    files_by_name = M._section_builder.files_by_name(files),
-    file_key_prefix = opts.file_key_prefix,
-    file_entry_kind = opts.file_entry_kind,
-    hunk_entry_kind = opts.hunk_entry_kind,
-  }
-end
 
----@param title string
----@param files DiffReviewStatusFile[]
----@param opts? { name?: string, default_folded?: boolean, file_key_prefix?: string, file_entry_kind?: "file"|"commit_file"|"pr_file"|"pr_review_file", hunk_entry_kind?: "hunk"|"commit_hunk"|"pr_hunk"|"pr_review_hunk", keep_empty?: boolean }
----@return DiffReviewStatusSection[]
-function M._section_builder.sections_from_files(title, files, opts)
-  local section = M._section_builder.section_from_files(title, files, opts)
-  return section and { section } or {}
-end
 
----@param cwd string
----@param spec { title: string, section_name: string, default_status?: string, files?: DiffReviewGhPRFile[], name?: string, default_folded?: boolean, file_key_prefix?: string, file_entry_kind?: "file"|"commit_file"|"pr_file"|"pr_review_file", hunk_entry_kind?: "hunk"|"commit_hunk"|"pr_hunk"|"pr_review_hunk", keep_empty?: boolean }
----@param diff_text? string
----@return DiffReviewStatusSection[]
----@return DiffReviewStatusFile[]
-function M._section_builder.sections_from_diff(cwd, spec, diff_text)
-  local files = M._section_builder.files_from_diff(cwd, spec, diff_text)
-  return M._section_builder.sections_from_files(spec.title, files, spec), files
-end
 
----@param file DiffReviewStatusFile
----@param hunks DiffReviewHunk[]
----@param section_name string
----@return DiffReviewStatusFile
-function M._section_builder.file_with_hunks(file, hunks, section_name)
-  local clone = vim.deepcopy(file)
-  clone.hunks = {}
-  clone.section_name = section_name
-  clone.added = 0
-  clone.removed = 0
-  for _, hunk in ipairs(hunks or {}) do
-    local cloned_hunk = vim.deepcopy(hunk)
-    cloned_hunk.section_name = section_name
-    clone.hunks[#clone.hunks + 1] = cloned_hunk
-    clone.added = clone.added + (cloned_hunk.added or 0)
-    clone.removed = clone.removed + (cloned_hunk.removed or 0)
-  end
-  return clone
-end
 
----@param comment table
----@return "LEFT"|"RIGHT"
-function M._section_builder.comment_side(comment)
-  return tostring(comment and comment.side or "RIGHT") == "LEFT" and "LEFT" or "RIGHT"
-end
 
----@param cwd string
----@param comments table[]
----@return table<string, table[]>
-function M._section_builder.comments_by_path(cwd, comments)
-  local by_path = {}
-  for _, comment in ipairs(type(comments) == "table" and comments or {}) do
-    local path = tostring(comment.path or "")
-    if path ~= "" then
-      comment.abs_file = comment.abs_file or vim.fs.normalize(vim.fs.joinpath(cwd, path))
-      comment.side = M._section_builder.comment_side(comment)
-      comment.local_state = comment.local_state or "clean"
-      by_path[path] = by_path[path] or {}
-      by_path[path][#by_path[path] + 1] = comment
-      by_path[comment.abs_file] = by_path[comment.abs_file] or by_path[path]
-    end
-  end
-  for _, path_comments in pairs(by_path) do
-    table.sort(path_comments, function(left_comment, right_comment)
-      local left_line = tonumber(left_comment.line or left_comment.start_line) or math.huge
-      local right_line = tonumber(right_comment.line or right_comment.start_line) or math.huge
-      if left_line ~= right_line then return left_line < right_line end
-      return tostring(left_comment.created_at or "") < tostring(right_comment.created_at or "")
-    end)
-  end
-  return by_path
-end
 
----@param cwd string
----@param files DiffReviewStatusFile[]
----@param comments table[]
----@param opts? { field?: string }
----@return table<string, table[]>
-function M._section_builder.attach_comments(cwd, files, comments, opts)
-  opts = opts or {}
-  local field = opts.field or "comments"
-  local by_path = M._section_builder.comments_by_path(cwd, comments)
-  for _, file in ipairs(files or {}) do
-    file[field] = by_path[file.relpath] or by_path[file.filename] or {}
-  end
-  return by_path
-end
 
----@param file string?
----@param side string?
----@param line integer|string?
----@return string?
-function M._section_builder.comment_anchor_key(file, side, line)
-  local line_number = tonumber(line)
-  if not (file and file ~= "" and line_number) then return nil end
-  local normalized_file = vim.fs.normalize(tostring(file))
-  return ("%s\0%s\0%d"):format(normalized_file, tostring(side or "RIGHT"), math.floor(line_number))
-end
 
----@param comments table[]
----@return table<string, { comment: table, index: integer }[]>
-function M._section_builder.comment_anchor_index(comments)
-  local by_anchor = {}
-  for index, comment in ipairs(type(comments) == "table" and comments or {}) do
-    local key = M._section_builder.comment_anchor_key(comment.abs_file or comment.path, M._section_builder.comment_side(comment), comment.line)
-    if key then
-      by_anchor[key] = by_anchor[key] or {}
-      by_anchor[key][#by_anchor[key] + 1] = { comment = comment, index = index }
-    end
-  end
-  return by_anchor
-end
 
----@param sections DiffReviewStatusSection[]
----@param opts? { field?: string }
----@return table<string, { comment: table, index: integer }[]>
-function M._section_builder.comment_anchor_index_from_sections(sections, opts)
-  opts = opts or {}
-  local field = opts.field or "comments"
-  local by_anchor = {}
-  for _, section in ipairs(sections or {}) do
-    for _, file in ipairs(section.files or {}) do
-      for index, comment in ipairs(type(file[field]) == "table" and file[field] or {}) do
-        local key = M._section_builder.comment_anchor_key(comment.abs_file or file.filename, M._section_builder.comment_side(comment), comment.line)
-        if key then
-          by_anchor[key] = by_anchor[key] or {}
-          by_anchor[key][#by_anchor[key] + 1] = { comment = comment, index = index }
-        end
-      end
-    end
-  end
-  return by_anchor
-end
 
----@param state table
----@param diff_line table
----@param indent integer
----@param opts { index_field: string, count_field?: string, skip?: fun(comment: table): boolean }
-function M._section_builder.emit_anchored_comments(state, diff_line, indent, opts)
-  local key = M._section_builder.comment_anchor_key(diff_line.file, M._review.side_of(diff_line), diff_line.line)
-  local comments = key and state[opts.index_field] and state[opts.index_field][key] or nil
-  for _, item in ipairs(comments or {}) do
-    if item.comment
-      and item.comment.local_state ~= "deleted"
-      and not (opts.skip and opts.skip(item.comment)) then
-      if opts.count_field then state[opts.count_field] = (state[opts.count_field] or 0) + 1 end
-      M._review.emit_comment(item.comment, item.index, indent)
-    end
-  end
-end
-
----@param review DiffReviewGhSubmittedReview
----@return string
-function M._pr_overview.review_key(review)
-  local id = tostring(review.node_id or "")
-  if id == "" then id = tostring(review.id or "") end
-  if id == "" then id = vim.fn.sha256(tostring(review.user or "") .. tostring(review.submitted_at or "") .. tostring(review.body or "")) end
-  return "pr-review:" .. id
-end
-
----@param state string?
----@return string icon
----@return string status_hl
-function M._pr_overview.review_state_style(state)
-  state = tostring(state or "")
-  if state == "APPROVED" then return "✓", "DiffReviewAddRange" end
-  if state == "CHANGES_REQUESTED" then return "✗", "DiffReviewDeleteRange" end
-  return M._comment_icon, "DiffReviewReviewComment"
-end
-
----@param state string?
----@return string
-function M._pr_overview.review_action(state)
-  state = tostring(state or "")
-  if state == "APPROVED" then return "approved" end
-  if state == "CHANGES_REQUESTED" then return "requested changes" end
-  if state == "DISMISSED" then return "dismissed" end
-  if state == "COMMENTED" then return "commented" end
-  return "reviewed"
-end
-
----@param review DiffReviewGhSubmittedReview
----@return string
-function M._pr_overview.review_author(review)
-  return tostring(review.user or "unknown")
-end
-
----@param review DiffReviewGhSubmittedReview
----@return string
-function M._pr_overview.review_date(review)
-  return M._pr_overview.comment_datetime(review.submitted_at or review.updated_at or review.created_at)
-end
-
----@param reviews DiffReviewGhSubmittedReview[]?
----@return { author_width: integer, date_width: integer }
-function M._pr_overview.review_summary_alignment(reviews)
-  local alignment = { author_width = 0, date_width = 0 }
-  for _, review in ipairs(reviews or {}) do
-    alignment.author_width = math.max(alignment.author_width, vim.fn.strdisplaywidth(M._pr_overview.review_author(review)))
-    alignment.date_width = math.max(alignment.date_width, vim.fn.strdisplaywidth(M._pr_overview.review_date(review)))
-  end
-  return alignment
-end
-
----@param review DiffReviewGhSubmittedReview
----@return string[] tail_parts
-function M._pr_overview.review_summary_tail_parts(review)
-  local tail_parts = {}
-  local preview = M._pr_overview.comment_preview(review.body or "")
-  if preview ~= "" then tail_parts[#tail_parts + 1] = preview end
-  return tail_parts
-end
-
----@param review DiffReviewGhSubmittedReview
----@param alignment? { author_width?: integer, date_width?: integer }
----@return string
-function M._pr_overview.review_summary_line(review, alignment)
-  local icon = M._pr_overview.review_state_style(review.state)
-  alignment = alignment or {}
-  local tail_parts = M._pr_overview.review_summary_tail_parts(review)
-  local line = ("%s %s"):format(
-    icon,
-    M._pr_overview.pad_display_right(M._pr_overview.review_author(review), alignment.author_width)
-  )
-  local date_text = M._pr_overview.review_date(review)
-  if date_text ~= "" then
-    line = line .. " " .. M._pr_overview.pad_display_right(date_text, #tail_parts > 0 and alignment.date_width or 0)
-  end
-  if #tail_parts > 0 then line = line .. "  " .. table.concat(tail_parts, "  ") end
-  return line:gsub("%s+$", "")
-end
-
----@param review DiffReviewGhSubmittedReview
----@param alignment? { author_width?: integer, date_width?: integer }
----@return table[]
-function M._pr_overview.review_summary_segments(review, alignment)
-  local icon, status_hl = M._pr_overview.review_state_style(review.state)
-  alignment = alignment or {}
-  local tail_parts = M._pr_overview.review_summary_tail_parts(review)
-  local segments = {
-    { icon .. " ", status_hl },
-    {
-      M._pr_overview.pad_display_right(M._pr_overview.review_author(review), alignment.author_width),
-      "DiffReviewReviewComment",
-    },
-  }
-  local date_text = M._pr_overview.review_date(review)
-  if date_text ~= "" then
-    segments[#segments + 1] = { " ", "DiffReviewReviewComment" }
-    segments[#segments + 1] = {
-      M._pr_overview.pad_display_right(date_text, #tail_parts > 0 and alignment.date_width or 0),
-      "DiffReviewStatusDate",
-    }
-  end
-  for _, tail in ipairs(tail_parts) do
-    segments[#segments + 1] = { "  ", "DiffReviewReviewComment" }
-    segments[#segments + 1] = { tail, "DiffReviewReviewComment" }
-  end
-  return segments
-end
-
----@param comments? DiffReviewGhPRCommentsResult
----@return DiffReviewStatusSection?
-function M._pr_overview.reviews_section(comments)
-  local reviews = comments and comments.reviews or nil
-  if type(reviews) ~= "table" or #reviews == 0 then return nil end
-  local visible_reviews = {}
-  for _, review in ipairs(reviews) do
-    local is_empty_single_comment_shell = tostring(review.state or "") == "COMMENTED"
-      and vim.trim(tostring(review.body or "")) == ""
-      and #(review.comments or {}) <= 1
-    if not is_empty_single_comment_shell then visible_reviews[#visible_reviews + 1] = review end
-  end
-  if #visible_reviews == 0 then return nil end
-  return {
-    name = "pr:reviews",
-    title = "Reviews",
-    default_folded = false,
-    files = {},
-    files_by_name = {},
-    reviews = visible_reviews,
-  }
-end
-
----@param comments? DiffReviewGhPRCommentsResult
----@param local_comments? table[]
----@return DiffReviewStatusSection?
-function M._pr_overview.issue_comments_section(comments, local_comments)
-  local remote_comments = comments and comments.issue_comments or nil
-  if type(remote_comments) ~= "table" then remote_comments = {} end
-  local local_keys = {}
-  for _, comment in ipairs(local_comments or {}) do
-    local key = M._pr_overview.comment_identity_key(comment)
-    if key then local_keys[key] = true end
-  end
-
-  local issue_comments = {}
-  for _, comment in ipairs(remote_comments) do
-    local key = M._pr_overview.comment_identity_key(comment)
-    if not (key and local_keys[key]) then issue_comments[#issue_comments + 1] = comment end
-  end
-  for _, comment in ipairs(local_comments or {}) do
-    issue_comments[#issue_comments + 1] = comment
-  end
-  if #issue_comments == 0 then return nil end
-
-  return {
-    name = "pr:comments",
-    title = "Comments",
-    default_folded = false,
-    files = {},
-    files_by_name = {},
-    issue_comments = issue_comments,
-  }
-end
-
----@param comment table
----@return "LEFT"|"RIGHT"
-function M._pr_overview.comment_side(comment)
-  return M._section_builder.comment_side(comment)
-end
-
----@param hunk DiffReviewHunk
----@param comment table
----@return boolean
-function M._pr_overview.hunk_contains_comment(hunk, comment)
-  local target_line = tonumber(comment and comment.line)
-  if not target_line then return false end
-  local start_line = tonumber(comment.start_line) or target_line
-  if start_line > target_line then start_line, target_line = target_line, start_line end
-  local wanted_side = M._pr_overview.comment_side(comment)
-  local old_line, new_line
-  for diff_line in tostring(hunk.diff or ""):gmatch("[^\n]+") do
-    local old_start, new_start = diff_line:match("^@@ %-(%d+),?%d* %+(%d+),?%d* @@")
-    if old_start and new_start then
-      old_line = tonumber(old_start)
-      new_line = tonumber(new_start)
-    elseif old_line and new_line then
-      local prefix = diff_line:sub(1, 1)
-      if prefix == " " then
-        if wanted_side == "LEFT" and old_line >= start_line and old_line <= target_line then return true end
-        if wanted_side == "RIGHT" and new_line >= start_line and new_line <= target_line then return true end
-        old_line = old_line + 1
-        new_line = new_line + 1
-      elseif prefix == "-" then
-        if wanted_side == "LEFT" and old_line >= start_line and old_line <= target_line then return true end
-        old_line = old_line + 1
-      elseif prefix == "+" then
-        if wanted_side == "RIGHT" and new_line >= start_line and new_line <= target_line then return true end
-        new_line = new_line + 1
-      end
-    end
-  end
-  return false
-end
 
 M._pr_overview.review_context_radius = 2
 
@@ -7966,248 +6075,13 @@ M._pr_overview.review_context_radius = 2
 ---@field context string
 ---@field records DiffReviewReviewContextRecord[]
 
----@param hunk DiffReviewHunk
----@return DiffReviewReviewContextHunk?
-function M._pr_overview.review_context_hunk(hunk)
-  local header = nil
-  local body = {}
-  for _, line in ipairs(vim.split(tostring(hunk.diff or ""), "\n", { plain = true })) do
-    if not header and line:match("^@@ ") then
-      header = line
-    elseif header then
-      body[#body + 1] = line
-    end
-  end
-  if not header then return nil end
 
-  local old_line, _, new_line, _, context = parse_hunk_header(header)
-  local records = {}
-  for position, raw in ipairs(body) do
-    local prefix = raw:sub(1, 1)
-    if prefix == " " or prefix == "-" or prefix == "+" then
-      local record = {
-        raw = raw,
-        prefix = prefix,
-        old_before = old_line,
-        new_before = new_line,
-        position = position,
-      }
-      if prefix == " " then
-        record.old_line = old_line
-        record.new_line = new_line
-        old_line = old_line + 1
-        new_line = new_line + 1
-      elseif prefix == "-" then
-        record.old_line = old_line
-        old_line = old_line + 1
-      elseif prefix == "+" then
-        record.new_line = new_line
-        new_line = new_line + 1
-      end
-      records[#records + 1] = record
-    end
-  end
-  return { context = context, records = records }
-end
 
----@param context_hunk DiffReviewReviewContextHunk
----@param comment table
----@param radius integer
----@return table?
-function M._pr_overview.review_comment_context_window(context_hunk, comment, radius)
-  local target_line = tonumber(comment and comment.line)
-  if not target_line then return nil end
-  local start_line = tonumber(comment.start_line) or target_line
-  if start_line > target_line then start_line, target_line = target_line, start_line end
-  start_line = math.max(0, start_line - radius)
-  target_line = target_line + radius
 
-  local side = M._pr_overview.comment_side(comment)
-  local start_index, end_index
-  for index, record in ipairs(context_hunk.records or {}) do
-    local line = side == "LEFT" and record.old_line or record.new_line
-    if line and line >= start_line and line <= target_line then
-      start_index = start_index or index
-      end_index = index
-    end
-  end
-  if not start_index and comment.position then
-    local position = tonumber(comment.position)
-    for index, record in ipairs(context_hunk.records or {}) do
-      if position and record.position == position then
-        start_index = math.max(1, index - radius)
-        end_index = math.min(#context_hunk.records, index + radius)
-        break
-      end
-    end
-  end
-  if not start_index then return nil end
-  return { start_index = start_index, end_index = end_index }
-end
 
----@param windows table[]
----@return table[]
-function M._pr_overview.merge_context_windows(windows)
-  table.sort(windows, function(left, right)
-    return (left.start_index or 0) < (right.start_index or 0)
-  end)
-  local merged = {}
-  for _, window in ipairs(windows) do
-    local previous = merged[#merged]
-    if previous and (window.start_index or 0) <= (previous.end_index or 0) + 1 then
-      previous.end_index = math.max(previous.end_index or 0, window.end_index or 0)
-    else
-      merged[#merged + 1] = {
-        start_index = window.start_index,
-        end_index = window.end_index,
-      }
-    end
-  end
-  return merged
-end
 
----@param file DiffReviewStatusFile
----@param hunk DiffReviewHunk
----@param context_hunk DiffReviewReviewContextHunk
----@param window table
----@return DiffReviewHunk?
-function M._pr_overview.context_window_hunk(file, hunk, context_hunk, window)
-  local records = context_hunk.records or {}
-  local first = records[window.start_index]
-  if not first then return nil end
 
-  local old_count, new_count = 0, 0
-  local added, removed = 0, 0
-  local body = {}
-  for index = window.start_index, window.end_index do
-    local record = records[index]
-    if record then
-      body[#body + 1] = record.raw
-      if record.prefix ~= "+" then old_count = old_count + 1 end
-      if record.prefix ~= "-" then new_count = new_count + 1 end
-      if record.prefix == "+" then
-        added = added + 1
-      elseif record.prefix == "-" then
-        removed = removed + 1
-      end
-    end
-  end
-  if #body == 0 then return nil end
 
-  local suffix = context_hunk.context ~= "" and (" " .. context_hunk.context) or ""
-  local lines = {
-    ("@@ -%d,%d +%d,%d @@%s"):format(first.old_before or 0, old_count, first.new_before or 0, new_count, suffix),
-  }
-  vim.list_extend(lines, body)
-  return {
-    filename = file.filename,
-    section_name = file.section_name,
-    pos = first.new_before and first.new_before > 0 and first.new_before or first.old_before,
-    diff = table.concat(lines, "\n"),
-    staged = hunk.staged,
-    context_text = hunk.context_text,
-    added = added,
-    removed = removed,
-  }
-end
-
----@param file DiffReviewStatusFile
----@param hunk DiffReviewHunk
----@param comments table[]
----@return DiffReviewHunk[]
-function M._pr_overview.review_context_hunks_for_hunk(file, hunk, comments)
-  local context_hunk = M._pr_overview.review_context_hunk(hunk)
-  if not context_hunk then return {} end
-  local windows = {}
-  for _, comment in ipairs(comments or {}) do
-    if M._pr_overview.hunk_contains_comment(hunk, comment) then
-      local window = M._pr_overview.review_comment_context_window(context_hunk, comment, M._pr_overview.review_context_radius)
-      if window then windows[#windows + 1] = window end
-    end
-  end
-  local hunks = {}
-  for _, window in ipairs(M._pr_overview.merge_context_windows(windows)) do
-    local context_hunk_copy = M._pr_overview.context_window_hunk(file, hunk, context_hunk, window)
-    if context_hunk_copy then hunks[#hunks + 1] = context_hunk_copy end
-  end
-  return hunks
-end
-
----@param cwd string
----@param pr DiffReviewGhPR
----@param diff_text? string
----@param review DiffReviewGhSubmittedReview
----@return DiffReviewStatusFile[]
-function M._pr_overview.review_context_files(cwd, pr, diff_text, review)
-  local by_path = M._section_builder.comments_by_path(cwd, review.comments or {})
-  local files = M._section_builder.files_from_diff(cwd, {
-    section_name = M._pr_overview.review_key(review),
-    default_status = "",
-    files = pr.files,
-  }, diff_text)
-  local result = {}
-  for _, file in ipairs(files) do
-    local file_comments = by_path[file.relpath] or by_path[file.filename] or {}
-    if #file_comments > 0 then
-      local hunks = {}
-      for _, hunk in ipairs(file.hunks or {}) do
-        vim.list_extend(hunks, M._pr_overview.review_context_hunks_for_hunk(file, hunk, file_comments))
-      end
-      local copy = M._section_builder.file_with_hunks(file, hunks, file.section_name)
-      copy.added = file.added
-      copy.removed = file.removed
-      copy.pr_review_comments = file_comments
-      if #copy.hunks > 0 then result[#result + 1] = copy end
-    end
-  end
-  return result
-end
-
----@param raw_commit DiffReviewGhPRCommit|table
----@param branch? string
----@return DiffReviewStatusCommit?
-function M._pr_overview.status_commit_from_pr_commit(raw_commit, branch)
-  if type(raw_commit) ~= "table" then return nil end
-  local oid = vim.trim(tostring(raw_commit.oid or raw_commit.sha or raw_commit.id or ""))
-  if oid == "" then return nil end
-  local cache = M._status and M._status.commit_file_cache and M._status.commit_file_cache[oid] or nil
-  local short_oid = vim.trim(tostring(raw_commit.shortOid or raw_commit.short_oid or raw_commit.abbreviatedOid or ""))
-  if short_oid == "" then short_oid = status_short_oid(oid) end
-  return {
-    oid = oid,
-    short_oid = short_oid,
-    branch = branch,
-    subject = tostring(raw_commit.messageHeadline or raw_commit.subject or raw_commit.message or ""),
-    committed_at = raw_commit.committedDate or raw_commit.committed_date or raw_commit.committed_at,
-    authored_at = raw_commit.authoredDate or raw_commit.authored_date or raw_commit.authored_at,
-    files = cache and cache.files or nil,
-    files_loaded = cache and cache.files_loaded or false,
-    files_loading = cache and cache.files_loading or false,
-    files_error = cache and cache.files_error or nil,
-  }
-end
-
----@param pr DiffReviewGhPR
----@return DiffReviewStatusSection?
-function M._pr_overview.commits_section(pr)
-  local raw_commits = pr.commits or {}
-  if type(raw_commits) ~= "table" or #raw_commits == 0 then return nil end
-  local commits = {}
-  for raw_index = #raw_commits, 1, -1 do
-    local branch = #commits == 0 and pr.headRefName or nil
-    local commit = M._pr_overview.status_commit_from_pr_commit(raw_commits[raw_index], branch)
-    if commit then commits[#commits + 1] = commit end
-  end
-  if #commits == 0 then return nil end
-  return {
-    name = "pr_commits",
-    title = "Recent Commits",
-    default_folded = true,
-    files = {},
-    files_by_name = {},
-    commits = commits,
-  }
-end
 
 ---@param cwd string
 ---@param pr DiffReviewGhPR
@@ -8301,7 +6175,7 @@ local function status_commit_log_section_async(cwd, spec, cb)
 
   local command = { "git", "-C", cwd, "log", "--no-color", "--format=%H%x09%h%x09%cI%x09%s" }
   vim.list_extend(command, spec.args)
-  systemlist_async(command, function(output, code)
+  git_backend.systemlist_async(command, function(output, code)
     if code ~= 0 then
       cb(nil)
       return
@@ -8633,27 +6507,34 @@ end
 ---@param file DiffReviewStatusFile
 ---@return DiffReviewHunk[]
 status_diff_hunks_for_file = function(file)
-  if #file.hunks > 0 then return file.hunks end
-  if not file.untracked then return {} end
+  return M._status_perf_span("status.diff_hunks_for_file", M._status and M._status.buf or nil, {
+    file = file and file.filename or nil,
+    relpath = file and file.relpath or nil,
+    existing_hunk_count = file and file.hunks and #file.hunks or nil,
+    untracked = file and file.untracked or nil,
+  }, function()
+    if #file.hunks > 0 then return file.hunks end
+    if not file.untracked then return {} end
 
-  local relpath = M._untracked and M._untracked[file.filename]
-  local diff_text = relpath and build_untracked_diff(file.filename, relpath) or nil
-  if not diff_text then return {} end
+    local relpath = M._untracked and M._untracked[file.filename]
+    local diff_text = relpath and build_untracked_diff(file.filename, relpath) or nil
+    if not diff_text then return {} end
 
-  local hunks = {}
-  for _, parsed_hunk in ipairs(parse_diff(diff_text, false)) do
-    hunks[#hunks + 1] = {
-      filename = file.filename,
-      section_name = file.section_name,
-      pos = parsed_hunk.pos,
-      diff = parsed_hunk.diff,
-      staged = false,
-      context_text = parsed_hunk.context or "",
-      added = parsed_hunk.added or 0,
-      removed = parsed_hunk.removed or 0,
-    }
-  end
-  return hunks
+    local hunks = {}
+    for _, parsed_hunk in ipairs(parse_diff(diff_text, false)) do
+      hunks[#hunks + 1] = {
+        filename = file.filename,
+        section_name = file.section_name,
+        pos = parsed_hunk.pos,
+        diff = parsed_hunk.diff,
+        staged = false,
+        context_text = parsed_hunk.context or "",
+        added = parsed_hunk.added or 0,
+        removed = parsed_hunk.removed or 0,
+      }
+    end
+    return hunks
+  end)
 end
 
 ---@param hunk DiffReviewHunk
@@ -8753,25 +6634,30 @@ end
 ---@param hunks DiffReviewHunk[]
 ---@return DiffReviewHunk[]
 function M._status_display_hunks(hunks)
-  local display_hunks = {}
-  local current_group = {} ---@type DiffReviewHunk[]
-  local function flush_group()
-    if #current_group == 0 then return end
-    display_hunks[#display_hunks + 1] = M._status_combine_display_hunks(current_group)
-    current_group = {}
-  end
-
-  for _, hunk in ipairs(hunks or {}) do
-    if #current_group == 0 or M._status_hunks_should_display_together(current_group[#current_group], hunk) then
-      current_group[#current_group + 1] = hunk
-    else
-      flush_group()
-      current_group[#current_group + 1] = hunk
+  return M._status_perf_span("status.display_hunks", M._status and M._status.buf or nil, {
+    hunk_count = #(hunks or {}),
+  }, function()
+    local display_hunks = {}
+    local current_group = {} ---@type DiffReviewHunk[]
+    local function flush_group()
+      if #current_group == 0 then return end
+      display_hunks[#display_hunks + 1] = M._status_combine_display_hunks(current_group)
+      current_group = {}
     end
-  end
-  flush_group()
-  return display_hunks
+
+    for _, hunk in ipairs(hunks or {}) do
+      if #current_group == 0 or M._status_hunks_should_display_together(current_group[#current_group], hunk) then
+        current_group[#current_group + 1] = hunk
+      else
+        flush_group()
+        current_group[#current_group + 1] = hunk
+      end
+    end
+    flush_group()
+    return display_hunks
+  end)
 end
+
 
 local status_cursor_target
 local status_operations_pending
@@ -8797,9 +6683,24 @@ end
 ---@param entry_kind? "hunk"|"commit_hunk"|"pr_hunk"|"pr_review_hunk"
 ---@param hunk_key_override? string
 local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_kind, hunk_key_override)
+  return M._status_perf_span("status.render_hunk", M._status and M._status.buf or nil, {
+    file = file and file.filename or nil,
+    relpath = file and file.relpath or nil,
+    entry_kind = entry_kind,
+    hunk_pos = hunk and hunk.pos or nil,
+    hunk_added = hunk and hunk.added or nil,
+    hunk_removed = hunk and hunk.removed or nil,
+    diff_len = hunk and #(hunk.diff or "") or nil,
+  }, function()
   local hunk_key = hunk_key_override or status_hunk_key(file.section_name, file.filename, hunk.diff)
   local hunk_folded = status_folded(hunk_key, false)
-  local entry = { id = hunk_key, kind = entry_kind or "hunk", file = file, hunk = hunk }
+  local entry = { id = hunk_key, kind = entry_kind or "hunk", file = file, hunk = hunk, default_folded = false }
+  if hunk_folded then
+    local header = ("%s@@ +%d -%d"):format(string.rep(" ", status_hunk_indent), hunk.added or 0, hunk.removed or 0)
+    local start_line = status_add_line(header, entry, "DiffReviewActiveHunkHeader")
+    M._status_register_fold_range(hunk_key, start_line, #M._status.lines, false, M._status.lines[start_line])
+    return
+  end
   M._status.fancy_rows = M._status.fancy_rows or {}
   local rows_key
   local context_line = M._status_hunk_context_line(hunk) or hunk.pos
@@ -8808,12 +6709,25 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_ki
   local syntax_source = M._status_syntax_source_for_entry_kind(entry_kind)
   local syntax_diff_text = nil
   if syntax_source == "file" then
-    syntax_diff_text = M._status_file_syntax_diff_text(file)
+    syntax_diff_text = M._status_perf_span("status.render_hunk.syntax_diff_text", M._status and M._status.buf or nil, {
+      file = file.filename,
+      hunk_key = hunk_key,
+      entry_kind = entry_kind,
+    }, function()
+      return M._status_file_syntax_diff_text(file)
+    end)
   end
   local require_file_match_for_context = entry_kind == "pr_hunk" or entry_kind == "pr_review_hunk"
   local semantic_context_enabled = true
   if require_file_match_for_context then
-    semantic_context_enabled = syntax_diff_text ~= nil and M._diff_new_side_matches_file(file.filename, syntax_diff_text)
+    semantic_context_enabled = syntax_diff_text ~= nil and M._status_perf_span("status.render_hunk.new_side_matches_file", M._status and M._status.buf or nil, {
+      file = file.filename,
+      hunk_key = hunk_key,
+      entry_kind = entry_kind,
+      diff_len = #(syntax_diff_text or ""),
+    }, function()
+      return M._diff_new_side_matches_file(file.filename, syntax_diff_text)
+    end)
   end
   local function rerender_with_context()
     M._status = M._status or {}
@@ -8835,24 +6749,32 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_ki
   local previous_context = nil
   local next_context = nil
   if semantic_context_enabled then
-    current_context = cached_hunk_context(
-      file.filename,
-      context_line,
-      "status-neighbor:" .. hunk_key .. ":current",
-      rerender_with_context
-    )
-    previous_context = previous_hunk and cached_hunk_context(
-      file.filename,
-      previous_context_line or previous_hunk.pos,
-      "status-neighbor:" .. hunk_key .. ":previous",
-      rerender_with_context
-    ) or nil
-    next_context = next_hunk and cached_hunk_context(
-      file.filename,
-      next_context_line or next_hunk.pos,
-      "status-neighbor:" .. hunk_key .. ":next",
-      rerender_with_context
-    ) or nil
+    M._status_perf_span("status.render_hunk.context_lookup", M._status and M._status.buf or nil, {
+      file = file.filename,
+      hunk_key = hunk_key,
+      context_line = context_line,
+      previous_context_line = previous_context_line,
+      next_context_line = next_context_line,
+    }, function()
+      current_context = cached_hunk_context(
+        file.filename,
+        context_line,
+        "status-neighbor:" .. hunk_key .. ":current",
+        rerender_with_context
+      )
+      previous_context = previous_hunk and cached_hunk_context(
+        file.filename,
+        previous_context_line or previous_hunk.pos,
+        "status-neighbor:" .. hunk_key .. ":previous",
+        rerender_with_context
+      ) or nil
+      next_context = next_hunk and cached_hunk_context(
+        file.filename,
+        next_context_line or next_hunk.pos,
+        "status-neighbor:" .. hunk_key .. ":next",
+        rerender_with_context
+      ) or nil
+    end)
   end
   local suppress_start_boundary = same_hunk_context_scope(previous_context, current_context)
   local suppress_end_boundary = same_hunk_context_scope(current_context, next_context)
@@ -8861,6 +6783,13 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_ki
   local suppress_ancestor_end = current_ancestor_key ~= nil and M._same_hunk_ancestor_scope(current_context, next_context)
   local suppress_start_boundary_keys = suppress_ancestor_start and { [current_ancestor_key] = true } or nil
   local suppress_end_boundary_keys = suppress_ancestor_end and { [current_ancestor_key] = true } or nil
+  local syntax_hash = M._status_perf_span("status.render_hunk.rows_key_sha256", M._status and M._status.buf or nil, {
+    file = file.filename,
+    hunk_key = hunk_key,
+    diff_len = #(syntax_diff_text or hunk.diff or ""),
+  }, function()
+    return vim.fn.sha256(syntax_diff_text or hunk.diff or "")
+  end)
   rows_key = ("%s:%s:%s:%s:%s:%s:%s"):format(
     hunk_key,
     hunk.staged and "staged" or "unstaged",
@@ -8868,7 +6797,7 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_ki
     suppress_end_boundary and "no-end" or "end",
     suppress_ancestor_start and "no-ancestor-start" or "ancestor-start",
     suppress_ancestor_end and "no-ancestor-end" or "ancestor-end",
-    syntax_source .. ":compact:" .. vim.fn.sha256(syntax_diff_text or hunk.diff or "")
+    syntax_source .. ":compact:" .. syntax_hash
   )
   local debug_context = nil
   if M._gitstatus_debug.enabled() then
@@ -8921,29 +6850,41 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_ki
     })
   end
   if not rows then
-    local ok, built_rows = pcall(
-      build_fancy_diff_rows,
-      hunk.diff,
-      { hunk.staged },
-      file.filename,
-      function(hunk_line)
-        return ("status:%s:%d"):format(rows_key, hunk_line)
-      end,
-      rerender_with_context,
-      {
-        context_line = context_line,
-        boundary_context = true,
-        suppress_start_boundary = suppress_start_boundary,
-        suppress_end_boundary = suppress_end_boundary,
-        suppress_start_boundary_keys = suppress_start_boundary_keys,
-        suppress_end_boundary_keys = suppress_end_boundary_keys,
-        syntax_source = syntax_source,
-        syntax_diff_text = syntax_diff_text,
-        compact_replacements = true,
-        require_file_match_for_context = require_file_match_for_context,
-        debug_context = debug_context,
-      }
-    )
+    local ok, built_rows = M._status_perf_span("status.render_hunk.build_fancy_rows", M._status and M._status.buf or nil, {
+      file = file.filename,
+      hunk_key = hunk_key,
+      rows_key = rows_key,
+      diff_len = #(hunk.diff or ""),
+      syntax_source = syntax_source,
+      syntax_diff_len = syntax_diff_text and #syntax_diff_text or nil,
+    }, function()
+      return pcall(
+        build_fancy_diff_rows,
+        hunk.diff,
+        { hunk.staged },
+        file.filename,
+        function(hunk_line)
+          return ("status:%s:%d"):format(rows_key, hunk_line)
+        end,
+        rerender_with_context,
+        {
+          context_line = context_line,
+          boundary_context = true,
+          suppress_start_boundary = suppress_start_boundary,
+          suppress_end_boundary = suppress_end_boundary,
+          suppress_start_boundary_keys = suppress_start_boundary_keys,
+          suppress_end_boundary_keys = suppress_end_boundary_keys,
+          syntax_source = syntax_source,
+          syntax_diff_text = syntax_diff_text,
+          fallback_syntax_diff_text = hunk.fallback_syntax_diff_text,
+          old_syntax_row_offset = hunk.old_syntax_row_offset,
+          new_syntax_row_offset = hunk.new_syntax_row_offset,
+          compact_replacements = true,
+          require_file_match_for_context = require_file_match_for_context,
+          debug_context = debug_context,
+        }
+      )
+    end)
     if debug_context then
       M._gitstatus_debug.event("status_render_hunk.built", {
         context = debug_context,
@@ -8957,6 +6898,7 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_ki
     end
     if ok then
       rows = built_rows
+      M._status.lazy_hunk_render_pending = rows.diff_review_syntax_pending or rows.diff_review_context_pending or nil
       if not rows.diff_review_syntax_pending and not rows.diff_review_context_pending then
         M._status.fancy_rows[rows_key] = rows
       end
@@ -8978,14 +6920,20 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_ki
     local node_end = nil
     local start_text = nil
     local end_text = nil
-    if not hunk_folded and type(ts_context) == "table" then
-      visible_hunk_lines = hunk_visible_source_lines(hunk.diff)
+    if type(ts_context) == "table" then
+      visible_hunk_lines = M._status_perf_span("status.render_hunk.visible_source_lines", M._status and M._status.buf or nil, {
+        file = file.filename,
+        hunk_key = hunk_key,
+        diff_len = #(hunk.diff or ""),
+      }, function()
+        return hunk_visible_source_lines(hunk.diff)
+      end)
       node_start = ts_context.start_row + 1
       node_end = ts_context.end_row + 1
       start_text = ts_context.start_text or ""
       end_text = ts_context.end_text or ""
     end
-    status_add_line(header, entry, hunk_folded and "DiffReviewActiveHunkHeader" or "DiffReviewHunkHeader")
+    local start_line = status_add_line(header, entry, hunk_folded and "DiffReviewActiveHunkHeader" or "DiffReviewHunkHeader")
     if visible_hunk_lines and node_start and node_end and end_text then
       if not suppress_start_boundary and not visible_hunk_lines[start_text] then
         status_add_fancy_row(hunk_boundary_row(start_text, ts_context.start_segments, node_start), nil, status_hunk_indent)
@@ -8998,65 +6946,791 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_ki
         status_add_fancy_row(hunk_boundary_row(end_text, ts_context.end_segments, node_end), nil, status_hunk_indent)
       end
     end
+    M._status_register_fold_range(hunk_key, start_line, #M._status.lines, false, M._status.lines[start_line])
     return
   end
 
-  if hunk_folded then
-    local header_row = rows[1]
-    for _, row in ipairs(rows) do
-      if row.diff_review_hunk_header then
-        header_row = row
-        break
+  local start_line = #M._status.lines + 1
+  local fold_text = nil
+  M._status_perf_span("status.render_hunk.emit_rows", M._status and M._status.buf or nil, {
+    file = file.filename,
+    hunk_key = hunk_key,
+    row_count = #rows,
+  }, function()
+    for row_index = 1, #rows do
+      local row = rows[row_index]
+      if row then
+        local line = status_add_fancy_row(row, entry, status_hunk_indent)
+        if row.diff_review_hunk_header then fold_text = M._status.lines[line] end
       end
     end
-    status_add_fancy_row(header_row, entry, status_hunk_indent)
-    return
-  end
-
-  for row_index = 1, #rows do
-    local row = rows[row_index]
-    if row then status_add_fancy_row(row, entry, status_hunk_indent) end
-  end
+  end)
+  M._status_register_fold_range(hunk_key, start_line, #M._status.lines, false, fold_text or M._status.lines[start_line])
+  end)
 end
 
----@param pr DiffReviewGhPR?
----@return string?
-function M._pr_overview.pr_base_url(pr)
-  if not (pr and pr.url and pr.url ~= "") then return nil end
-  return pr.url:gsub("/$", "")
+---@param diff_line string?
+---@return boolean
+function M._status_lazy_diff_body_line(diff_line)
+  return M._diff_source_model.diff_body_line(diff_line)
 end
 
----@param pr DiffReviewGhPR?
----@param entry DiffReviewStatusEntry?
----@return string?
-function M._pr_overview.entry_url(pr, entry)
-  if not entry then return nil end
-  local base_url = M._pr_overview.pr_base_url(pr)
-  local check = entry.pr_check
-  if check and check.url and check.url ~= "" then return check.url end
-  local reply = entry.pr_comment_reply or entry.review_reply
-  if reply then
-    if reply.url and reply.url ~= "" then return reply.url end
-    if base_url and reply.remote_id then return ("%s/changes#r%s"):format(base_url, tostring(reply.remote_id)) end
-  end
+---@param lines string[]
+---@return integer added
+---@return integer removed
+function M._status_lazy_diff_stats(lines)
+  return M._diff_source_model.diff_stats(lines)
+end
 
-  local comment = entry.pr_comment or entry.review_comment
-  if comment then
-    if comment.url and comment.url ~= "" then return comment.url end
-    if base_url and comment.remote_id then
-      if comment.path and comment.path ~= "" then return ("%s/changes#r%s"):format(base_url, tostring(comment.remote_id)) end
-      return ("%s#issuecomment-%s"):format(base_url, tostring(comment.remote_id))
+---@param file DiffReviewStatusFile
+---@param comment table
+---@return boolean
+function M._status_lazy_comment_matches_file(file, comment)
+  if not (file and comment) then return false end
+  local targets = {
+    comment.abs_file,
+    comment.path,
+  }
+  for _, target in ipairs(targets) do
+    if target and target ~= "" then
+      local normalized = vim.fs.normalize(tostring(target))
+      if normalized == vim.fs.normalize(tostring(file.filename or "")) then return true end
+      if normalized == vim.fs.normalize(tostring(file.relpath or "")) then return true end
     end
   end
+  return false
+end
 
-  local review = entry.pr_review
-  if review then
-    if review.url and review.url ~= "" then return review.url end
-    if base_url and review.id and review.id ~= 0 then return ("%s#pullrequestreview-%s"):format(base_url, tostring(review.id)) end
+---@param comment table
+---@return integer
+function M._status_lazy_comment_row_estimate(comment)
+  if not comment or comment.local_state == "deleted" then return 0 end
+  if comment.review_folded == true then return 1 end
+  local body_count = #M._review.comment_body_lines(comment.body or "")
+  local reply_count = 0
+  for _, reply in ipairs(type(comment.replies) == "table" and comment.replies or {}) do
+    reply_count = reply_count + 1 + #M._review.comment_body_lines(reply.body or "")
   end
+  return 2 + body_count + reply_count
+end
 
+---@param file DiffReviewStatusFile
+---@param hunk DiffReviewHunk
+---@return integer
+function M._status_lazy_hunk_comment_estimate(file, hunk)
+  local total = 0
+  local seen = {}
+  local sources = {
+    file and file.pr_comments or {},
+    file and file.pr_review_comments or {},
+    M._status and M._status.review_comments or {},
+  }
+  for _, comments in ipairs(sources) do
+    for _, comment in ipairs(type(comments) == "table" and comments or {}) do
+      local key = comment.local_id or comment.remote_node_id or comment.remote_id or comment.id or comment
+      if not seen[key]
+        and M._status_lazy_comment_matches_file(file, comment)
+        and M._pr_overview.hunk_contains_comment(hunk, comment) then
+        seen[key] = true
+        total = total + M._status_lazy_comment_row_estimate(comment)
+      end
+    end
+  end
+  return total
+end
+
+---@param file DiffReviewStatusFile
+---@param hunk DiffReviewHunk
+---@return integer
+function M._status_lazy_hunk_estimate(file, hunk)
+  local lazy_estimate = tonumber(hunk and hunk.lazy_estimate)
+  if lazy_estimate then return math.max(1, lazy_estimate + M._status_lazy_hunk_comment_estimate(file, hunk)) end
+  local count = 0
+  local in_hunk = false
+  for _, line in ipairs(vim.split(tostring(hunk and hunk.diff or ""), "\n", { plain = true })) do
+    if line:match("^@@ ") then
+      count = count + 1
+      in_hunk = true
+    elseif in_hunk and M._status_lazy_diff_body_line(line) then
+      count = count + 1
+    end
+  end
+  return math.max(1, count + M._status_lazy_hunk_comment_estimate(file, hunk))
+end
+
+
+--- Resolve the per-file diff-body row budget for the size gate, or nil when disabled.
+--- Bounds how many real rows a single file body renders up front so a huge diff does
+--- not freeze the render; the rest loads on demand through its load-more row.
+---@return integer?
+function M._status_file_render_row_budget()
+  local options = M.config or config.options or config.defaults
+  local base = tonumber(options.status_diff_viewport_threshold) or 0
+  if base <= 0 then return nil end
+  return base
+end
+
+--- Count the leading display hunks a file body must render regardless of the row
+--- budget, so activating its load-more row always reveals more of a huge diff.
+---@param file_key string
+---@return integer
+function M._status_file_forced_hunk_count(file_key)
+  return (M._status and M._status.file_render_limits and M._status.file_render_limits[file_key]) or 0
+end
+
+--- Decide whether the size gate should defer the next hunk behind a load-more row.
+--- Always render the first hunk and any force-loaded hunks, then stop once the budget
+--- is reached or the next hunk would overshoot it, so one giant hunk cannot freeze the
+--- render while load-more still guarantees progress.
+---@param rendered_rows integer rows already emitted for this file body
+---@param next_estimate integer estimated rendered rows of the next hunk
+---@param hunk_index integer 1-based index of the next hunk
+---@param forced_hunks integer leading hunks to render regardless of the budget
+---@param budget integer? row budget, or nil when the gate is disabled
+---@return boolean
+function M._status_size_gate_should_defer(rendered_rows, next_estimate, hunk_index, forced_hunks, budget)
+  if not budget then return false end
+  if hunk_index <= 1 or hunk_index <= forced_hunks then return false end
+  return rendered_rows >= budget or (rendered_rows + (next_estimate or 0)) > budget
+end
+
+
+---@param file? DiffReviewStatusFile
+---@param entry_kind? string
+---@param hunk_entry_kind? string
+---@return DiffReviewDiffSourceKind
+function M._status_diff_source_kind(file, entry_kind, hunk_entry_kind)
+  if entry_kind == "commit_file" or hunk_entry_kind == "commit_hunk" then return "commit" end
+  if entry_kind == "pr_review_file" or hunk_entry_kind == "pr_review_hunk" then return "review" end
+  if entry_kind == "pr_file" or hunk_entry_kind == "pr_hunk" then return "pr" end
+  if M._status and M._status.view_kind == "diff" then return "branch" end
+  if file and file.section_name == "staged" then return "staged" end
+  return "unstaged"
+end
+
+---@param file DiffReviewStatusFile
+---@param entry_kind? string
+---@param hunk_entry_kind? string
+---@return string
+function M._status_diff_source_id(file, entry_kind, hunk_entry_kind)
+  if file and file.diff_source_id then return file.diff_source_id end
+  local section_name = file and file.section_name or nil
+  if section_name and section_name ~= "" then return section_name end
+  return M._status_diff_source_kind(file, entry_kind, hunk_entry_kind)
+end
+
+---@param status table
+---@return DiffReviewDiffSourceRegistry
+function M._status_diff_source_registry(status)
+  status.diff_source_registry = status.diff_source_registry or M._diff_source_model.new_registry()
+  return status.diff_source_registry
+end
+
+---@param registry DiffReviewDiffSourceRegistry
+function M._status_configure_diff_source_policies(registry)
+  if not registry then return end
+  M._diff_source_model.set_kind_policy(registry, "unstaged", {
+    stage = true,
+    discard = true,
+    jump = true,
+  })
+  M._diff_source_model.set_kind_policy(registry, "staged", {
+    unstage = true,
+    discard = true,
+    jump = true,
+  })
+  M._diff_source_model.set_kind_policy(registry, "pr", {
+    comment = true,
+    jump = true,
+  })
+  M._diff_source_model.set_kind_policy(registry, "review", {
+    comment = true,
+    viewed = true,
+    unviewed = true,
+    jump = true,
+  })
+  M._diff_source_model.set_kind_policy(registry, "commit", {
+    jump = true,
+  })
+  M._diff_source_model.set_kind_policy(registry, "branch", {
+    jump = true,
+  })
+  M._diff_source_model.set_kind_policy(registry, "walkthrough", {
+    jump = true,
+  })
+end
+
+---@param commit DiffReviewStatusCommit
+---@return string?
+function M._status_commit_source_id(commit)
+  if not (commit and commit.oid) then return nil end
+  return "commit:" .. tostring(commit.oid)
+end
+
+---@param commit DiffReviewStatusCommit
+---@param status table
+---@return DiffReviewDiffSourceHandle?
+function M._status_commit_source_handle(commit, status)
+  local source_id = M._status_commit_source_id(commit)
+  if not (source_id and status and status.cwd) then return nil end
+  local cwd = status.cwd
+  return {
+    id = source_id,
+    kind = "commit",
+    label = commit.short_oid or commit.oid,
+    cwd = cwd,
+    commit_oid = commit.oid,
+    lazy = true,
+    metadata = {
+      view_kind = status.view_kind,
+      subject = commit.subject,
+    },
+    load = function(source_state, done)
+      M._status_perf_event("source.commit.load.start", status.buf, {
+        source_id = source_id,
+        commit_oid = commit.oid,
+      })
+      git_backend.systemlist_async(M._git_show_diff_command(cwd, commit.oid), function(output, code, stderr)
+        if code ~= 0 then
+          local message = vim.trim(tostring(stderr or ""))
+          done(false, message ~= "" and message or "Unable to load commit diff")
+          return
+        end
+        local diff_text = table.concat(output or {}, "\n")
+        local files = M._status_perf_span("source.commit.parse", status.buf, {
+          source_id = source_id,
+          diff_len = #diff_text,
+        }, function()
+          return status_commit_files_from_diff(cwd, commit, diff_text)
+        end)
+        M._status_populate_commit_source_files(source_state, commit, files, status)
+        source_state.metadata = source_state.metadata or {}
+        source_state.metadata.files = files
+        source_state.metadata.diff_len = #diff_text
+        M._status_perf_event("source.commit.load.done", status.buf, {
+          source_id = source_id,
+          file_count = #files,
+        })
+        done(true)
+      end)
+    end,
+  }
+end
+
+---@param commit DiffReviewStatusCommit
+function M._status_register_commit_source_handle(commit)
+  local status = M._status
+  if not (status and status.diff_source_registry and commit and commit.oid) then return end
+  local handle = M._status_commit_source_handle(commit, status)
+  if not handle then return end
+  M._diff_source_model.ensure_handle(status.diff_source_registry, handle)
+  commit.diff_source_id = handle.id
+end
+
+---@param commit DiffReviewStatusCommit
+---@return DiffReviewDiffSourceState?
+function M._status_ensure_commit_source_state(commit)
+  local status = M._status
+  if not (status and status.diff_source_registry and commit and commit.oid) then return nil end
+  local handle = M._status_commit_source_handle(commit, status)
+  if not handle then return nil end
+  local loader = M._diff_source_loader_model.ensure(status.diff_source_registry, handle)
+  commit.diff_source_id = handle.id
+  return loader.source
+end
+
+---@param comment table
+---@return string?
+function M._status_annotation_id(comment)
+  if not comment then return nil end
+  local id = comment.local_id or comment.remote_node_id or comment.remote_id or comment.id
+  if id then return tostring(id) end
   return nil
 end
+
+---@param comment table
+---@return DiffReviewAnnotationState
+function M._status_annotation_state(comment)
+  if not comment then return "clean" end
+  if comment.local_state == "deleted" then return "deleted" end
+  if comment.local_state == "error" then return "error" end
+  if comment.local_state == "new" then return "new" end
+  if comment.local_state == "dirty" then return "dirty" end
+  if comment.local_state == "syncing" then return "syncing" end
+  if comment.dirty == true then return "dirty" end
+  return "clean"
+end
+
+---@param file_state DiffReviewDiffFileState
+---@param comment table
+---@param kind string
+function M._status_add_diff_file_annotation(file_state, comment, kind)
+  local id = M._status_annotation_id(comment)
+  if not id then return end
+  local annotation = M._diff_annotation_model.upsert(file_state.annotation_index, {
+    id = id,
+    kind = kind,
+    source_id = file_state.source_id,
+    file_key = file_state.key,
+    path = file_state.path,
+    side = comment.side or comment.original_side or comment.start_side or "RIGHT",
+    line = tonumber(comment.line or comment.original_line or comment.start_line) or 0,
+    end_line = tonumber(comment.end_line) or nil,
+    body = comment.body or "",
+    base_body = comment.base_body or comment.body or "",
+    remote_body = comment.remote_body or comment.body or "",
+    author = comment.author,
+    remote_id = comment.remote_node_id or comment.remote_id or comment.id,
+    editable = comment.editable == true,
+    state = M._status_annotation_state(comment),
+    metadata = {
+      comment = comment,
+      renderer = kind,
+    },
+  })
+  M._diff_source_model.add_annotation(file_state, annotation)
+end
+
+---@param file DiffReviewStatusFile
+---@param source_kind DiffReviewDiffSourceKind
+---@return DiffReviewDiffFileStageState
+function M._status_diff_stage_state(file, source_kind)
+  if source_kind == "review" then return "unviewed" end
+  if source_kind == "commit" or source_kind == "pr" or source_kind == "branch" then return "readonly" end
+  if file and file.section_name == "staged" then return "staged" end
+  return "unstaged"
+end
+
+---@param file DiffReviewStatusFile
+---@param status table?
+---@return string
+function M._status_diff_file_path(file, status)
+  if file and status and status.cwd and file.filename then
+    local relative = repo_relative(file.filename, status.cwd)
+    if relative and relative ~= "" then return relative:gsub("\\", "/") end
+  end
+  local relpath = file and file.relpath or nil
+  if relpath and relpath ~= "" and not relpath:match("^%a:[/\\]") and not relpath:match("^/") then
+    return relpath:gsub("\\", "/")
+  end
+  return tostring((file and (file.filename or file.relpath)) or ""):gsub("\\", "/")
+end
+
+---@param file_state DiffReviewDiffFileState
+---@param file DiffReviewStatusFile
+---@param status table
+---@param source_kind string
+function M._status_set_diff_file_text_loaders(file_state, file, status, source_kind)
+  if not (file_state and file and status and status.cwd) then return end
+  local relpath = M._status_diff_file_path(file, status)
+  if source_kind == "commit" and file.diff_source_id then
+    local commit_oid = tostring(file.diff_source_id):gsub("^commit:", "")
+    M._diff_source_model.set_text_loader(file_state, "new", function(done)
+      git_backend.systemlist_async({ "git", "-C", status.cwd, "show", ("%s:%s"):format(commit_oid, relpath) }, function(lines, code, output)
+        if code ~= 0 then
+          done(false, nil, nil, vim.trim(tostring(output or "")))
+          return
+        end
+        done(true, table.concat(lines or {}, "\n"), commit_oid)
+      end)
+    end)
+    M._diff_source_model.set_text_loader(file_state, "old", function(done)
+      git_backend.systemlist_async({ "git", "-C", status.cwd, "show", ("%s^:%s"):format(commit_oid, file.original_relpath or relpath) }, function(lines, code, output)
+        if code ~= 0 then
+          done(false, nil, nil, vim.trim(tostring(output or "")))
+          return
+        end
+        done(true, table.concat(lines or {}, "\n"), commit_oid .. "^")
+      end)
+    end)
+    return
+  end
+  M._diff_source_model.set_text_loader(file_state, "new", function(done)
+    local ok, lines = pcall(vim.fn.readfile, file.filename)
+    if not ok then
+      done(false, nil, nil, tostring(lines))
+      return
+    end
+    done(true, table.concat(lines or {}, "\n"), "worktree")
+  end)
+  local old_revision = nil
+  if source_kind == "unstaged" then
+    old_revision = ":0"
+  elseif source_kind == "staged" then
+    old_revision = "HEAD"
+  elseif source_kind == "branch" and status.diff_branch then
+    old_revision = status.diff_branch
+  elseif source_kind == "commit" and file.diff_source_id then
+    old_revision = tostring(file.diff_source_id):gsub("^commit:", "")
+  end
+  if not old_revision or old_revision == "" then return end
+  M._diff_source_model.set_text_loader(file_state, "old", function(done)
+    git_backend.systemlist_async({ "git", "-C", status.cwd, "show", ("%s:%s"):format(old_revision, relpath) }, function(lines, code, output)
+      if code ~= 0 then
+        done(false, nil, nil, vim.trim(tostring(output or "")))
+        return
+      end
+      done(true, table.concat(lines or {}, "\n"), old_revision)
+    end)
+  end)
+end
+
+---@param file DiffReviewStatusFile
+---@param entry_kind? string
+---@param hunk_entry_kind? string
+---@param file_key string
+---@return DiffReviewDiffFileState?
+function M._status_ensure_diff_file_state(file, entry_kind, hunk_entry_kind, file_key)
+  local status = M._status
+  if not (status and file) then return nil end
+  local source_id = M._status_diff_source_id(file, entry_kind, hunk_entry_kind)
+  local source_kind = M._status_diff_source_kind(file, entry_kind, hunk_entry_kind)
+  local source_handle = {
+    id = source_id,
+    kind = source_kind,
+    label = file.section_name,
+    cwd = status.cwd,
+    lazy = false,
+    metadata = {
+      view_kind = status.view_kind,
+      section_name = file.section_name,
+    },
+  }
+  if (source_kind == "unstaged" or source_kind == "staged") and M._status_source_reload_paths_loader then
+    source_handle.reload_paths = M._status_source_reload_paths_loader(source_kind, source_id, status)
+  end
+  local registry = M._status_diff_source_registry(status)
+  local file_path = M._status_diff_file_path(file, status)
+  local file_state = M._diff_source_loader_model.ensure_file(registry, source_handle, file_path, {
+    original_path = file.original_relpath,
+    status = file.git_status or file.status,
+    stage_state = M._status_diff_stage_state(file, source_kind),
+    added = file.added,
+    removed = file.removed,
+    expanded = status_folded(file_key, false) == false,
+    metadata = {
+      status_file = file,
+      file_key = file_key,
+      entry_kind = entry_kind,
+      hunk_entry_kind = hunk_entry_kind,
+    },
+  })
+  file_state.source_id = source_id
+  file_state.status = file.git_status or file.status
+  file_state.stage_state = M._status_diff_stage_state(file, source_kind)
+  file_state.added = file.added
+  file_state.removed = file.removed
+  file_state.expanded = status_folded(file_key, false) == false
+  file_state.metadata = file_state.metadata or {}
+  file_state.metadata.status_file = file
+  file_state.metadata.file_key = file_key
+  file_state.metadata.entry_kind = entry_kind
+  file_state.metadata.hunk_entry_kind = hunk_entry_kind
+  file.diff_source_id = source_id
+  file.diff_file_key = file_state.key
+  file_state.syntax_context = M._diff_syntax_context_model.ensure_context(file_state.syntax_context, file_state.key)
+  M._status_set_diff_file_text_loaders(file_state, file, status, source_kind)
+  return file_state
+end
+
+---@param file_state DiffReviewDiffFileState
+---@param file DiffReviewStatusFile
+---@param hunks DiffReviewHunk[]
+function M._status_populate_diff_file_hunks(file_state, file, hunks)
+  local file_path = M._status_diff_file_path(file, M._status)
+  for hunk_index, hunk in ipairs(hunks or {}) do
+    hunk.source_id = file_state.source_id
+    hunk.file_key = file_state.key
+    hunk.raw_hunks = hunk.raw_hunks or M._diff_source_model.raw_hunks_from_diff(hunk.diff or "", {
+      id_prefix = ("%s:%s:%d"):format(file_state.source_id, file_path, hunk_index),
+      source_id = file_state.source_id,
+      file_key = file_state.key,
+      staged = hunk.staged,
+      metadata = {
+        status_hunk = hunk,
+      },
+    })
+    for _, raw_hunk in ipairs(hunk.raw_hunks or {}) do
+      M._diff_source_model.add_raw_hunk(file_state, raw_hunk)
+    end
+  end
+end
+
+---@param source_state DiffReviewDiffSourceState
+---@param commit DiffReviewStatusCommit
+---@param files DiffReviewStatusFile[]
+---@param status table
+function M._status_populate_commit_source_files(source_state, commit, files, status)
+  if not (source_state and commit and status) then return end
+  source_state.file_by_key = {}
+  source_state.file_order = {}
+  source_state.revision = (source_state.revision or 0) + 1
+  for _, file in ipairs(files or {}) do
+    file.diff_source_id = source_state.handle.id
+    local file_key = status_commit_file_key(commit.oid, file.filename)
+    local file_path = M._status_diff_file_path(file, status)
+    local file_state = M._diff_source_model.ensure_file(source_state, file_path, {
+      original_path = file.original_relpath,
+      status = file.git_status or file.status,
+      stage_state = "readonly",
+      added = file.added,
+      removed = file.removed,
+      expanded = status_folded(file_key, true) == false,
+      metadata = {
+        status_file = file,
+        file_key = file_key,
+        entry_kind = "commit_file",
+        hunk_entry_kind = "commit_hunk",
+        commit_oid = commit.oid,
+      },
+    })
+    file.diff_file_key = file_state.key
+    file_state.hunks = {}
+    file_state.hunk_index_by_id = {}
+    file_state.annotations = {}
+    file_state.annotation_index = M._diff_annotation_model.new_index()
+    file_state.layout = nil
+    file_state.body_layout = nil
+    file_state.layout_dirty = true
+    file_state.status = file.git_status or file.status
+    file_state.stage_state = "readonly"
+    file_state.added = file.added
+    file_state.removed = file.removed
+    file_state.expanded = status_folded(file_key, true) == false
+    file_state.metadata = file_state.metadata or {}
+    file_state.metadata.status_file = file
+    file_state.metadata.file_key = file_key
+    file_state.metadata.entry_kind = "commit_file"
+    file_state.metadata.hunk_entry_kind = "commit_hunk"
+    file_state.metadata.commit_oid = commit.oid
+    file_state.syntax_context = M._diff_syntax_context_model.ensure_context(file_state.syntax_context, file_state.key)
+    M._status_set_diff_file_text_loaders(file_state, file, status, "commit")
+    M._status_populate_diff_file_hunks(file_state, file, file.hunks or {})
+  end
+end
+
+---@param source_state DiffReviewDiffSourceState
+---@param files DiffReviewStatusFile[]
+---@param status table
+---@param source_kind DiffReviewDiffSourceKind
+---@param source_id string
+function M._status_populate_reloaded_source_files(source_state, files, status, source_kind, source_id)
+  if not (source_state and status and source_kind and source_id) then return end
+  for _, file in ipairs(files or {}) do
+    file.diff_source_id = source_id
+    local file_key = status_file_key(source_kind, file.filename)
+    local file_path = M._status_diff_file_path(file, status)
+    local file_state = M._diff_source_model.ensure_file(source_state, file_path, {
+      original_path = file.original_relpath,
+      status = file.git_status or file.status,
+      stage_state = M._status_diff_stage_state(file, source_kind),
+      added = file.added,
+      removed = file.removed,
+      expanded = status_folded(file_key, true) == false,
+      metadata = {
+        status_file = file,
+        file_key = file_key,
+        entry_kind = "file",
+        hunk_entry_kind = "hunk",
+      },
+    })
+    file.diff_file_key = file_state.key
+    file_state.hunks = {}
+    file_state.hunk_index_by_id = {}
+    file_state.annotations = {}
+    file_state.annotation_index = M._diff_annotation_model.new_index()
+    file_state.layout = nil
+    file_state.body_layout = nil
+    file_state.layout_dirty = true
+    file_state.pending = false
+    file_state.stale = false
+    file_state.status = file.git_status or file.status
+    file_state.stage_state = M._status_diff_stage_state(file, source_kind)
+    file_state.added = file.added
+    file_state.removed = file.removed
+    file_state.expanded = status_folded(file_key, true) == false
+    file_state.metadata = file_state.metadata or {}
+    file_state.metadata.status_file = file
+    file_state.metadata.file_key = file_key
+    file_state.metadata.entry_kind = "file"
+    file_state.metadata.hunk_entry_kind = "hunk"
+    file_state.syntax_context = M._diff_syntax_context_model.ensure_context(file_state.syntax_context, file_state.key)
+    M._status_set_diff_file_text_loaders(file_state, file, status, source_kind)
+    M._status_populate_diff_file_hunks(file_state, file, file.hunks or {})
+  end
+end
+
+---@param source_kind DiffReviewDiffSourceKind
+---@param source_id string
+---@param status table
+---@return fun(source_state: DiffReviewDiffSourceState, paths: string[], done: fun(ok: boolean, err?: string))
+function M._status_source_reload_paths_loader(source_kind, source_id, status)
+  return function(source_state, paths, done)
+    local cwd = status and status.cwd
+    if not cwd then
+      done(false, "missing git root")
+      return
+    end
+    local extra_args = {}
+    if source_kind == "staged" then extra_args[#extra_args + 1] = "--cached" end
+    if #(paths or {}) > 0 then
+      extra_args[#extra_args + 1] = "--"
+      for _, path in ipairs(paths or {}) do
+        extra_args[#extra_args + 1] = path
+      end
+    end
+    M._status_perf_event("source.reload_paths.start", status.buf, {
+      source_id = source_id,
+      source_kind = source_kind,
+      paths = paths,
+    })
+    git_backend.systemlist_async(M._git_diff_command(cwd, extra_args), function(output, code, stderr)
+      if code ~= 0 then
+        local message = vim.trim(tostring(stderr or ""))
+        done(false, message ~= "" and message or "git diff failed")
+        return
+      end
+      for _, path in ipairs(paths or {}) do
+        M._diff_source_model.remove_file(source_state, path)
+      end
+      local diff_text = table.concat(output or {}, "\n")
+      local files = status_files_from_diff_provider(cwd, {
+        section_name = source_id,
+        default_status = "modified",
+      }, diff_text)
+      M._status_populate_reloaded_source_files(source_state, files, status, source_kind, source_id)
+      source_state.metadata = source_state.metadata or {}
+      source_state.metadata.last_reload_paths = vim.deepcopy(paths or {})
+      M._status_perf_event("source.reload_paths.done", status.buf, {
+        source_id = source_id,
+        source_kind = source_kind,
+        path_count = #(paths or {}),
+        file_count = #files,
+      })
+      done(true)
+    end)
+  end
+end
+
+---@param file_state DiffReviewDiffFileState
+---@param file DiffReviewStatusFile
+function M._status_populate_diff_file_annotations(file_state, file)
+  local status = M._status
+  for _, comment in ipairs(type(file.pr_comments) == "table" and file.pr_comments or {}) do
+    M._status_add_diff_file_annotation(file_state, comment, "pr_comment")
+  end
+  for _, comment in ipairs(type(file.pr_review_comments) == "table" and file.pr_review_comments or {}) do
+    M._status_add_diff_file_annotation(file_state, comment, "pr_review_comment")
+  end
+  for _, comment in ipairs(type(status and status.review_comments) == "table" and status.review_comments or {}) do
+    if M._status_lazy_comment_matches_file(file, comment) then
+      M._status_add_diff_file_annotation(file_state, comment, "draft_comment")
+    end
+  end
+end
+
+---@param file_state DiffReviewDiffFileState
+---@param file DiffReviewStatusFile
+---@param hunk DiffReviewHunk
+---@return string[]
+function M._status_diff_hunk_annotation_ids(file_state, file, hunk)
+  local ids = {}
+  for _, annotation in ipairs(file_state.annotations or {}) do
+    local comment = annotation.metadata and annotation.metadata.comment or nil
+    if comment and M._status_lazy_comment_matches_file(file, comment) and M._pr_overview.hunk_contains_comment(hunk, comment) then
+      ids[#ids + 1] = annotation.id
+    end
+  end
+  return ids
+end
+
+---@param file_state DiffReviewDiffFileState
+---@param file DiffReviewStatusFile
+---@param display_hunks DiffReviewHunk[]
+function M._status_build_diff_file_layout(file_state, file, display_hunks)
+  local key_by_item = {}
+  local body_blocks = {}
+  for hunk_index, hunk in ipairs(display_hunks or {}) do
+    local key = hunk.display_id or ("%s:display:%d"):format(file_state.key, hunk_index)
+    key_by_item[#key_by_item + 1] = key
+    local height = M._status_lazy_hunk_estimate(file, hunk)
+    body_blocks[#body_blocks + 1] = {
+      key = key,
+      kind = "hunk",
+      height = height,
+      metadata = {
+        kind = "hunk",
+        hunk = hunk,
+        raw_hunks = hunk.raw_hunks or {},
+        annotation_ids = M._status_diff_hunk_annotation_ids(file_state, file, hunk),
+      },
+    }
+  end
+
+  file_state.body_layout = M._diff_layout_model.new_file_body_layout(body_blocks)
+  file_state.layout = file_state.body_layout.view
+  for hunk_index, _ in ipairs(display_hunks or {}) do
+    local key = key_by_item[hunk_index]
+    local span = file_state.layout.span_by_key[key]
+    local block = file_state.body_layout.block_by_key[key]
+    if span then
+      span.metadata = block and block.metadata or span.metadata
+    end
+  end
+  file_state.layout_dirty = false
+  file_state.layout_revision = (file_state.layout_revision or 0) + 1
+end
+
+---@param file DiffReviewStatusFile
+---@param entry_kind? string
+---@param hunk_entry_kind? string
+---@param file_key string
+---@return DiffReviewDiffFileState?
+function M._status_record_diff_file_header_state(file, entry_kind, hunk_entry_kind, file_key)
+  local file_state = M._status_ensure_diff_file_state(file, entry_kind, hunk_entry_kind, file_key)
+  if not file_state then return nil end
+  file_state.hunks = {}
+  file_state.hunk_index_by_id = {}
+  file_state.annotations = {}
+  file_state.annotation_index = M._diff_annotation_model.new_index()
+  file_state.layout = nil
+  file_state.layout_dirty = true
+  M._status_populate_diff_file_hunks(file_state, file, file.hunks or {})
+  M._status_populate_diff_file_annotations(file_state, file)
+  return file_state
+end
+
+---@param file DiffReviewStatusFile
+---@param hunks DiffReviewHunk[]
+---@param display_hunks DiffReviewHunk[]
+---@param entry_kind? string
+---@param hunk_entry_kind? string
+---@param file_key string
+---@return DiffReviewDiffFileState?
+function M._status_record_diff_file_state(file, hunks, display_hunks, entry_kind, hunk_entry_kind, file_key)
+  local file_state = M._status_ensure_diff_file_state(file, entry_kind, hunk_entry_kind, file_key)
+  if not file_state then return nil end
+  file_state.hunks = {}
+  file_state.hunk_index_by_id = {}
+  file_state.annotations = {}
+  file_state.annotation_index = M._diff_annotation_model.new_index()
+  file_state.layout_dirty = true
+  M._status_populate_diff_file_hunks(file_state, file, hunks)
+  for hunk_index, hunk in ipairs(display_hunks or {}) do
+    hunk.source_id = file_state.source_id
+    hunk.file_key = file_state.key
+    hunk.display_id = hunk.display_id or ("%s:display:%d"):format(file_state.key, hunk_index)
+    hunk.diff_review_hunk_index = hunk.diff_review_hunk_index or M._diff_hunk_index_model.from_hunk(hunk)
+    file_state.hunk_index_by_id = file_state.hunk_index_by_id or {}
+    file_state.hunk_index_by_id[hunk.display_id] = hunk.diff_review_hunk_index
+  end
+  M._status_populate_diff_file_annotations(file_state, file)
+  M._status_build_diff_file_layout(file_state, file, display_hunks)
+  return file_state
+end
+
+
+
 
 ---@param file DiffReviewStatusFile
 ---@param entry_kind? "file"|"commit_file"|"pr_file"|"pr_review_file"
@@ -9065,16 +7739,23 @@ end
 ---@param hunk_key_builder? fun(hunk: DiffReviewHunk): string
 ---@param opts? { force_open?: boolean, default_open?: boolean }
 local function status_render_file(file, entry_kind, hunk_entry_kind, file_key_override, hunk_key_builder, opts)
+  return M._status_perf_span("status.render_file", M._status and M._status.buf or nil, {
+    file = file and file.filename or nil,
+    relpath = file and file.relpath or nil,
+    entry_kind = entry_kind,
+    hunk_entry_kind = hunk_entry_kind,
+    force_open = opts and opts.force_open or nil,
+    default_open = opts and opts.default_open or nil,
+  }, function()
   opts = opts or {}
   local file_key = file_key_override or status_file_key(file.section_name, file.filename)
-  local default_folded = not opts.default_open
-  local file_folded = (not opts.force_open) and status_folded(file_key, default_folded)
+  local default_folded = not (opts.default_open or opts.force_open)
   local stats, stat_segments = M._status_file_stat_text_and_segments(file)
   local change_label, change_label_hl = M._status_file_change_label(file)
   local change_label_width = #"Modified"
   local padded_change_label = change_label .. string.rep(" ", math.max(0, change_label_width - #change_label))
   local line = ("%s%s %s %s"):format(string.rep(" ", status_file_indent), padded_change_label, file.relpath, stats)
-  local entry = { id = file_key, kind = entry_kind or "file", file = file }
+  local entry = { id = file_key, kind = entry_kind or "file", file = file, default_folded = default_folded }
   local line_number = status_add_line(line, entry)
   local label_start = status_file_indent
   local label_end = label_start + #change_label
@@ -9091,121 +7772,84 @@ local function status_render_file(file, entry_kind, hunk_entry_kind, file_key_ov
     )
   end
 
-  if file_folded then return end
+  local file_folded = (not opts.force_open) and status_folded(file_key, default_folded)
+  local render_folded_file_body = false
+  if file_folded and M._status and M._status.view_kind == "status" then
+    local walkthrough = package.loaded["diff_review.walkthrough"]
+    render_folded_file_body = walkthrough and walkthrough._modes and walkthrough._modes[M._status.buf] ~= nil
+  end
+  M._status_record_diff_file_header_state(file, entry_kind, hunk_entry_kind, file_key)
+  if file_folded and not render_folded_file_body then
+    M._status_register_fold_range(file_key, line_number, #M._status.lines, default_folded, M._status.lines[line_number])
+    return
+  end
 
-  local hunks = status_diff_hunks_for_file(file)
+  local hunks = M._status_perf_span("status.render_file.hunks", M._status and M._status.buf or nil, {
+    file = file.filename,
+    relpath = file.relpath,
+    entry_kind = entry_kind,
+  }, function()
+    return status_diff_hunks_for_file(file)
+  end)
   if #hunks == 0 then
     status_add_line(string.rep(" ", status_hunk_indent) .. "No textual diff", entry, "Comment")
+    M._status_register_fold_range(file_key, line_number, #M._status.lines, default_folded, M._status.lines[line_number])
     return
   end
-  local display_hunks = M._status_display_hunks(hunks)
-  for hunk_index, hunk in ipairs(display_hunks) do
-    local hunk_key = hunk_key_builder and hunk_key_builder(hunk) or nil
-    status_render_hunk(file, hunk, display_hunks[hunk_index - 1], display_hunks[hunk_index + 1], hunk_entry_kind, hunk_key)
-  end
-end
-
----@param review DiffReviewGhSubmittedReview
----@param diff_line table
----@param indent integer
-function M._pr_overview.emit_review_comments_for(review, diff_line, indent)
-  for index, comment in ipairs(review.comments or {}) do
-    if comment.local_state ~= "deleted"
-      and comment.abs_file == diff_line.file
-      and M._pr_overview.comment_side(comment) == M._review.side_of(diff_line)
-      and tonumber(comment.line) == tonumber(diff_line.line) then
-      M._review.emit_comment(comment, index, indent)
-    end
-  end
-end
-
----@param review DiffReviewGhSubmittedReview
-function M._pr_overview.render_review_context(review)
-  local status = M._status
-  if not (status and status.cwd and status.pr) then return end
-  local comments = type(review.comments) == "table" and review.comments or {}
-  if #comments == 0 then
-    status_add_line("  No inline comments", { kind = "pr_review", pr_review = review }, "Comment")
-    return
-  end
-  if not status.pr_diff_text or status.pr_diff_text == "" then
-    status_add_line("  ...loading diff context...", { kind = "pr_review", pr_review = review }, "DiffReviewStatusFetching")
-    return
-  end
-
-  local files = M._pr_overview.review_context_files(status.cwd, status.pr, status.pr_diff_text, review)
-  if #files == 0 then
-    status_add_line("  No matching diff context", { kind = "pr_review", pr_review = review }, "Comment")
-    return
-  end
-
-  local review_key = M._pr_overview.review_key(review)
-  local previous_hook = status.review_after_row
-  status.review_after_row = function(diff_line, indent)
-    M._pr_overview.emit_review_comments_for(review, diff_line, indent)
-  end
-  local ok, err = pcall(function()
-    for _, file in ipairs(files) do
-      status_render_file(
-        file,
-        "pr_review_file",
-        "pr_review_hunk",
-        status_provider_file_key(review_key, file.filename),
-        function(hunk)
-          return status_provider_hunk_key(review_key, file.filename, hunk.diff)
-        end,
-        { default_open = true }
-      )
+  local display_hunks = M._status_perf_span("status.render_file.display_hunks", M._status and M._status.buf or nil, {
+    file = file.filename,
+    relpath = file.relpath,
+    hunk_count = #hunks,
+  }, function()
+    return M._status_display_hunks(hunks)
+  end)
+  M._status_record_diff_file_state(file, hunks, display_hunks, entry_kind, hunk_entry_kind, file_key)
+  M._status_perf_span("status.render_file.render_hunks", M._status and M._status.buf or nil, {
+    file = file.filename,
+    relpath = file.relpath,
+    hunk_count = #hunks,
+    display_hunk_count = #display_hunks,
+  }, function()
+    local render_budget = M._status_file_render_row_budget()
+    local forced_hunks = M._status_file_forced_hunk_count(file_key)
+    local body_start_line = #M._status.lines
+    for hunk_index, hunk in ipairs(display_hunks) do
+      -- Size gate: keep the first hunk and any force-loaded hunks, then stop once the
+      -- budget is reached or the next hunk would overshoot it, so one giant merged hunk
+      -- cannot freeze the render. The deferred hunks load through the load-more row.
+      if render_budget then
+        local rendered_rows = #M._status.lines - body_start_line
+        local next_estimate = M._status_lazy_hunk_estimate(file, hunk)
+        if M._status_size_gate_should_defer(rendered_rows, next_estimate, hunk_index, forced_hunks, render_budget) then
+          local remaining = #display_hunks - hunk_index + 1
+          status_add_line(
+            string.rep(" ", status_hunk_indent) .. ("… %d more change blocks — press <CR>/o to load"):format(remaining),
+            {
+              kind = "load_more",
+              file = file,
+              file_key = file_key,
+              load_more_from = hunk_index,
+              entry_kind = entry_kind,
+              hunk_entry_kind = hunk_entry_kind,
+            },
+            "DiffReviewStatusFetching"
+          )
+          break
+        end
+      end
+      local hunk_key = hunk_key_builder and hunk_key_builder(hunk) or status_hunk_key(file.section_name, file.filename, hunk.diff)
+      status_render_hunk(file, hunk, display_hunks[hunk_index - 1], display_hunks[hunk_index + 1], hunk_entry_kind, hunk_key)
     end
   end)
-  status.review_after_row = previous_hook
-  if not ok then error(err) end
+  M._status_register_fold_range(file_key, line_number, #M._status.lines, default_folded, M._status.lines[line_number])
+  end)
 end
 
----@param review DiffReviewGhSubmittedReview
----@param alignment? { author_width?: integer, date_width?: integer }
-function M._pr_overview.render_review(review, alignment)
-  local review_key = M._pr_overview.review_key(review)
-  local entry = { id = review_key, kind = "pr_review", pr_review = review }
-  status_add_segment_line(M._pr_overview.review_summary_segments(review, alignment), entry)
-  if status_folded(review_key, true) then return end
-  M._pr_overview.render_review_context(review)
-end
 
----@param comment table
----@param index integer
----@param alignment? { author_width?: integer, date_width?: integer }
-function M._pr_overview.render_issue_comment(comment, index, alignment)
-  for _, row in ipairs(M._pr_overview.issue_comment_rows({ comment }, { alignment = alignment, start_index = index })) do
-    local line_number = status_add_line(row.text, row.entry, row.line_hl_group)
-    for _, highlight in ipairs(row.highlights or {}) do
-      status_add_highlight(line_number, highlight.start_col, highlight.end_col, highlight.hl_group)
-    end
-  end
-end
 
----@param comments table[]
----@param opts? { alignment?: { author_width?: integer, date_width?: integer }, start_index?: integer, is_folded?: fun(entry_id: string, default: boolean, entry: table): boolean }
----@return table[]
-function M._pr_overview.issue_comment_rows(comments, opts)
-  opts = opts or {}
-  comments = comments or {}
-  local row_opts = M._pr_overview.issue_comment_row_options()
-  row_opts.alignment = opts.alignment or M._pr_overview.issue_comment_alignment(comments)
-  row_opts.start_index = opts.start_index
-  row_opts.is_folded = opts.is_folded or function(entry_id, default)
-    return status_folded(entry_id, default)
-  end
-  return M._comment_rows.rows(comments, row_opts)
-end
 
----@param comments table[]
-function M._pr_overview.render_issue_comments(comments)
-  local alignment = M._pr_overview.issue_comment_alignment(comments)
-  for index, comment in ipairs(comments or {}) do
-    M._pr_overview.render_issue_comment(comment, index, alignment)
-  end
-end
+
+
 
 ---@param commit DiffReviewStatusCommit
 ---@return string?
@@ -9216,54 +7860,11 @@ local function status_commit_relative_date(commit)
   return relative
 end
 
----@param subject string?
----@return integer? type_end_col zero-based exclusive byte column within subject
-function M._status_conventional_commit_type_end(subject)
-  subject = tostring(subject or "")
-  local commit_type = subject:match("^([a-z][a-z0-9-]*)")
-  if not commit_type then return nil end
-
-  local cursor = #commit_type + 1
-  local next_char = subject:sub(cursor, cursor)
-  if next_char == "!" then
-    return subject:sub(cursor + 1, cursor + 2) == ": " and #commit_type or nil
-  end
-  if next_char == ":" then
-    return subject:sub(cursor + 1, cursor + 1) == " " and #commit_type or nil
-  end
-  if next_char ~= "(" then return nil end
-
-  local close_scope = subject:find(")", cursor + 1, true)
-  if not close_scope or close_scope == cursor + 1 then return nil end
-  local scope = subject:sub(cursor + 1, close_scope - 1)
-  if scope:find("[%c%s]") then return nil end
-  local after_scope = subject:sub(close_scope + 1, close_scope + 1)
-  if after_scope == "!" then
-    return subject:sub(close_scope + 2, close_scope + 3) == ": " and #commit_type or nil
-  end
-  if after_scope == ":" then
-    return subject:sub(close_scope + 2, close_scope + 2) == " " and #commit_type or nil
-  end
-  return nil
-end
-
----@param subject string
----@param hl_group string
----@return table[]
-function M._status_conventional_commit_subject_segments(subject, hl_group)
-  local conventional_type_end = M._status_conventional_commit_type_end(subject)
-  if not conventional_type_end then return { { subject, hl_group } } end
-  return {
-    { subject:sub(1, conventional_type_end), "DiffReviewStatusCommitType" },
-    { subject:sub(conventional_type_end + 1), hl_group },
-  }
-end
 
 ---@param commit DiffReviewStatusCommit
 ---@param date_width integer
 local function status_render_commit(commit, date_width)
   local commit_key = status_commit_key(commit.oid)
-  local commit_folded = status_folded(commit_key, true)
   local line = commit.short_oid
   local date_text = status_commit_relative_date(commit)
   local date_start_col = nil
@@ -9283,9 +7884,11 @@ local function status_render_commit(commit, date_width)
     id = commit_key,
     kind = "commit",
     commit = commit,
+    default_folded = true,
     commit_subject_start_col = suffix_start_col,
     commit_subject_end_col = suffix_start_col and (suffix_start_col + #suffix) or nil,
   }
+  M._status_register_commit_source_handle(commit)
   local line_number = status_add_line(line, entry)
   status_add_highlight(line_number, 0, #commit.short_oid, "DiffReviewStatusObjectId")
   if date_start_col then
@@ -9296,21 +7899,29 @@ local function status_render_commit(commit, date_width)
     status_add_highlight(line_number, suffix_start_col, suffix_start_col + conventional_type_end, "DiffReviewStatusCommitType")
   end
 
-  if commit_folded then return end
+  if status_folded(commit_key, true) then
+    M._status_register_fold_range(commit_key, line_number, #M._status.lines, true, M._status.lines[line_number])
+    return
+  end
+
   if commit.files_loading then
     status_add_line("...loading...", entry, "DiffReviewStatusFetching")
+    M._status_register_fold_range(commit_key, line_number, #M._status.lines, true, M._status.lines[line_number])
     return
   end
   if commit.files_error then
     status_add_line(commit.files_error, entry, "ErrorMsg")
+    M._status_register_fold_range(commit_key, line_number, #M._status.lines, true, M._status.lines[line_number])
     return
   end
   if not commit.files_loaded then
     status_add_line("...loading...", entry, "DiffReviewStatusFetching")
+    M._status_register_fold_range(commit_key, line_number, #M._status.lines, true, M._status.lines[line_number])
     return
   end
   if #(commit.files or {}) == 0 then
     status_add_line("No textual diff", entry, "Comment")
+    M._status_register_fold_range(commit_key, line_number, #M._status.lines, true, M._status.lines[line_number])
     return
   end
 
@@ -9325,28 +7936,27 @@ local function status_render_commit(commit, date_width)
       end
     )
   end
+  M._status_register_fold_range(commit_key, line_number, #M._status.lines, true, M._status.lines[line_number])
 end
 
 ---@param section DiffReviewStatusSection
 local function status_render_section(section)
+  return M._status_perf_span("status.render_section", M._status and M._status.buf or nil, {
+    section = section and section.name or nil,
+    title = section and section.title or nil,
+    file_count = section and section.files and #section.files or nil,
+    commit_count = section and section.commits and #section.commits or nil,
+    review_count = section and section.reviews and #section.reviews or nil,
+    issue_comment_count = section and section.issue_comments and #section.issue_comments or nil,
+  }, function()
   local section_key = status_section_key(section.name)
-  local section_folded = status_folded(section_key, section.default_folded)
   local line = M._status_section_heading_text(section.title, M._status_section_count(section))
-  local entry = { id = section_key, kind = "section", section = section }
-  status_add_line(line, entry, "DiffReviewStatusHeader")
-  if section_folded then return end
-  if section.issue_comments then
-    M._pr_overview.render_issue_comments(section.issue_comments)
-    return
-  end
-  if section.reviews then
-    local alignment = M._pr_overview.review_summary_alignment(section.reviews)
-    for _, review in ipairs(section.reviews) do
-      M._pr_overview.render_review(review, alignment)
-    end
-    return
-  end
-  if section.commits then
+  local section_default_folded = section.default_folded
+  local entry = { id = section_key, kind = "section", section = section, default_folded = section_default_folded }
+  local line_number = status_add_line(line, entry, "DiffReviewStatusHeader")
+  local section_folded = status_folded(section_key, section_default_folded)
+  local render_folded_commit_headers = M._status and M._status.view_kind == "status"
+  if section.commits and (not section_folded or render_folded_commit_headers) then
     local date_width = 0
     for _, commit in ipairs(section.commits) do
       local date_text = status_commit_relative_date(commit)
@@ -9355,6 +7965,24 @@ local function status_render_section(section)
     for _, commit in ipairs(section.commits) do
       status_render_commit(commit, date_width)
     end
+    M._status_register_fold_range(section_key, line_number, #M._status.lines, section_default_folded, M._status.lines[line_number])
+    return
+  end
+  if section_folded then
+    M._status_register_fold_range(section_key, line_number, #M._status.lines, section_default_folded, M._status.lines[line_number])
+    return
+  end
+  if section.issue_comments then
+    M._pr_overview.render_issue_comments(section.issue_comments)
+    M._status_register_fold_range(section_key, line_number, #M._status.lines, section.default_folded, M._status.lines[line_number])
+    return
+  end
+  if section.reviews then
+    local alignment = M._pr_overview.review_summary_alignment(section.reviews)
+    for _, review in ipairs(section.reviews) do
+      M._pr_overview.render_review(review, alignment)
+    end
+    M._status_register_fold_range(section_key, line_number, #M._status.lines, section.default_folded, M._status.lines[line_number])
     return
   end
   for _, file in ipairs(section.files) do
@@ -9372,6 +8000,8 @@ local function status_render_section(section)
       status_render_file(file)
     end
   end
+  M._status_register_fold_range(section_key, line_number, #M._status.lines, section.default_folded, M._status.lines[line_number])
+  end)
 end
 
 ---@param commit DiffReviewStatusCommit
@@ -9381,6 +8011,9 @@ local function status_load_commit_files(commit)
   local buf = status and status.buf
   if not (cwd and buf and vim.api.nvim_buf_is_valid(buf)) then return end
 
+  local source_state = M._status_ensure_commit_source_state(commit)
+  if not source_state then return end
+  local source_id = source_state.handle.id
   status.commit_file_cache = status.commit_file_cache or {}
   local cached = status.commit_file_cache[commit.oid]
   if cached and (cached.files_loaded or cached.files_loading) then
@@ -9402,7 +8035,7 @@ local function status_load_commit_files(commit)
     files_error = nil,
   }
 
-  systemlist_async(M._git_show_diff_command(cwd, commit.oid), function(output, code)
+  M._diff_source_model.ensure_loaded(source_state, function(ok, err)
     local latest_status = M._status
     if not (latest_status and latest_status.buf and vim.api.nvim_buf_is_valid(latest_status.buf)) then return end
     if latest_status.cwd ~= cwd then return end
@@ -9410,15 +8043,18 @@ local function status_load_commit_files(commit)
     latest_status.commit_file_cache = latest_status.commit_file_cache or {}
     local next_cache = {
       files = nil,
-      files_loaded = true,
+      files_loaded = ok == true,
       files_loading = false,
       files_error = nil,
     }
-    if code ~= 0 then
-      next_cache.files_loaded = false
-      next_cache.files_error = "Unable to load commit diff"
+    local latest_source = latest_status.diff_source_registry
+      and latest_status.diff_source_registry.source_by_id
+      and latest_status.diff_source_registry.source_by_id[source_id]
+      or source_state
+    if not ok then
+      next_cache.files_error = "Unable to load commit diff" .. (err and err ~= "" and (": " .. tostring(err)) or "")
     else
-      next_cache.files = status_commit_files_from_diff(cwd, commit, table.concat(output or {}, "\n"))
+      next_cache.files = latest_source.metadata and latest_source.metadata.files or {}
     end
     latest_status.commit_file_cache[commit.oid] = next_cache
 
@@ -9437,22 +8073,15 @@ local function status_load_commit_files(commit)
   end)
 end
 
+---@param state? table
 ---@return DiffReviewStatusEntry?
-local function status_entry_under_cursor()
-  local status = M._status
+local function status_entry_under_cursor(state)
+  local status = state or M._status
   if not status then return nil end
   local line = vim.api.nvim_win_get_cursor(0)[1]
   return status.entries[line]
 end
 
----@param buf integer
----@return string?
-function M._pr_overview.url_under_cursor(buf)
-  if M._status_states and M._status_states[buf] then M._status = M._status_states[buf] end
-  local status = M._status
-  if not (status and status.view_kind == "pr") then return nil end
-  return M._pr_overview.entry_url(status.pr, status_entry_under_cursor())
-end
 
 ---@return integer? line
 ---@return DiffReviewStatusEntry? entry
@@ -9460,12 +8089,38 @@ function M._status_entry_line_under_cursor()
   local status = M._status
   if not (status and status.entries and status.buf and vim.api.nvim_buf_is_valid(status.buf)) then return nil, nil end
   local cursor_line = vim.api.nvim_win_get_cursor(0)[1]
+  local entries = status.entries
   local max_line = vim.api.nvim_buf_line_count(status.buf)
   for line = math.min(cursor_line, max_line), 1, -1 do
-    local entry = status.entries[line]
+    local entry = entries[line]
     if entry then return line, entry end
   end
   return nil, nil
+end
+
+---@param status table?
+---@param entry DiffReviewStatusEntry?
+---@return table?
+function M._status_source_policy_for_entry(status, entry)
+  if not (status and status.diff_source_registry and entry) then return nil end
+  local file = entry.file
+  local source_id = file and file.diff_source_id or nil
+  if not source_id and entry.hunk and entry.hunk.section_name then source_id = entry.hunk.section_name end
+  if not source_id and entry.kind == "pr_hunk" and status.pr then source_id = "pr:" .. tostring(status.pr.number) .. ":changes" end
+  if not source_id and entry.kind == "pr_review_hunk" then source_id = "review:unviewed" end
+  if not source_id then return nil end
+  return M._diff_source_model.policy(status.diff_source_registry, source_id)
+end
+
+---@param status table?
+---@param command string
+---@return boolean
+function M._status_source_policy_allows_cursor(status, command)
+  if not (status and status.entries) then return true end
+  local _, entry = M._status_entry_line_under_cursor()
+  local policy = M._status_source_policy_for_entry(status, entry)
+  if not policy then return true end
+  return policy[command] == true
 end
 
 ---@param entry DiffReviewStatusEntry?
@@ -9488,8 +8143,10 @@ end
 function M._status_parent_entry(current_line, entry)
   local status = M._status
   if not (status and status.entries) then return nil end
+  local viewport = status.diff_viewport
+  local entries = viewport and viewport.enabled and viewport.logical_entries or status.entries
   for line = current_line - 1, 1, -1 do
-    local candidate = status.entries[line]
+    local candidate = entries[line]
     if entry.fold_target_id and candidate and candidate.id == entry.fold_target_id then return candidate end
     if entry.kind == "commit_hunk" and candidate and candidate.kind == "commit_file" then return candidate end
     if M._status_entry_is_hunk_like(entry) and M._status_entry_is_file_like(candidate) then return candidate end
@@ -9504,22 +8161,179 @@ end
 
 ---@param entry DiffReviewStatusEntry?
 local function status_prewarm_entry_syntax(entry)
-  if not entry then return end
-  if M._status_entry_is_file_like(entry) and entry.file then
-    local syntax_source = M._status_syntax_source_for_entry_kind(entry.kind)
-    prewarm_file_diff_syntax(entry.file, "status-cursor-prewarm:" .. (entry.id or entry.file.filename), nil, { syntax_source = syntax_source })
-  elseif M._status_entry_is_hunk_like(entry) and entry.file and entry.hunk then
-    local callback_key = "status-cursor-prewarm:" .. (entry.id or entry.file.filename)
-    local syntax_source = M._status_syntax_source_for_entry_kind(entry.kind)
-    local syntax_diff_text = nil
-    if syntax_source == "file" then
-      syntax_diff_text = M._status_file_syntax_diff_text(entry.file)
+  return M._status_perf_span("status.prewarm_entry_syntax", M._status and M._status.buf or nil, {
+    entry_id = entry and entry.id or nil,
+    entry_kind = entry and entry.kind or nil,
+    file = entry and entry.file and entry.file.filename or nil,
+  }, function()
+    if not entry then return end
+    if M._status_entry_is_file_like(entry) and entry.file then
+      local syntax_source = M._status_syntax_source_for_entry_kind(entry.kind)
+      prewarm_file_diff_syntax(entry.file, "status-cursor-prewarm:" .. (entry.id or entry.file.filename), nil, { syntax_source = syntax_source })
+    elseif M._status_entry_is_hunk_like(entry) and entry.file and entry.hunk then
+      local callback_key = "status-cursor-prewarm:" .. (entry.id or entry.file.filename)
+      local syntax_source = M._status_syntax_source_for_entry_kind(entry.kind)
+      local syntax_diff_text = nil
+      if syntax_source == "file" then
+        syntax_diff_text = M._status_perf_span("status.prewarm_entry_syntax.hunk_combined_diff", M._status and M._status.buf or nil, {
+          entry_id = entry.id,
+          entry_kind = entry.kind,
+          file = entry.file.filename,
+        }, function()
+          return M._status_file_syntax_diff_text(entry.file)
+        end)
+      end
+      M._prewarm_diff_syntax(entry.file.filename, entry.hunk.diff, { entry.hunk.staged }, callback_key, nil, {
+        syntax_source = syntax_source,
+        syntax_diff_text = syntax_diff_text,
+      })
     end
-    M._prewarm_diff_syntax(entry.file.filename, entry.hunk.diff, { entry.hunk.staged }, callback_key, nil, {
-      syntax_source = syntax_source,
-      syntax_diff_text = syntax_diff_text,
+  end)
+end
+
+--- Map a 1-based status buffer row to a decoration request, or nil for chrome rows.
+---@param buf integer
+---@param row integer 1-based buffer line
+---@return DiffReviewRowDecorationRequest?
+function M._status_resolve_decoration_row(buf, row)
+  local status = M._status_states and M._status_states[buf] or nil
+  if not (status and status.entries) then return nil end
+  local entry = status.entries[row]
+  if not entry then return nil end
+  local diff_line = (entry.diff_lines and entry.diff_lines[1]) or entry.diff_line
+  local file = entry.file
+  if not (diff_line and file) then return nil end
+  local source_id = M._status_diff_source_id(file, entry.kind)
+  return {
+    file_key = M._diff_source_model.file_key(source_id, file.relpath or file.filename),
+    revision = status.render_revision or 0,
+    line = diff_line.line,
+    side = diff_line.side == "left" and "old" or "new",
+    kind = entry.kind,
+  }
+end
+
+--- Prewarm Tree-sitter syntax for the file and hunk entries visible in a row range.
+--- Scope syntax work to the viewport so off-screen hunks of a large diff stay cheap.
+---@param buf integer
+---@param first_row integer 1-based
+---@param last_row integer 1-based
+function M._status_decorate_visible(buf, first_row, last_row)
+  local status = M._status_states and M._status_states[buf] or nil
+  if not (status and status.entries) then return end
+  if (M.config or config.options or config.defaults).status_cursor_prewarm == false then return end
+  first_row = math.max(1, math.floor(tonumber(first_row) or 1))
+  last_row = math.max(first_row, math.floor(tonumber(last_row) or first_row))
+  local saved = M._status
+  M._status = status
+  local seen = {}
+  for row = first_row, last_row do
+    local entry = status.entries[row]
+    if entry and (M._status_entry_is_file_like(entry) or M._status_entry_is_hunk_like(entry)) then
+      local key = entry.id or (entry.file and entry.file.filename) or tostring(row)
+      if not seen[key] then
+        seen[key] = true
+        status_prewarm_entry_syntax(entry)
+      end
+    end
+  end
+  M._status = saved
+end
+
+--- Debounce a visible-window syntax prewarm so the redraw callback never works inline.
+---@param buf integer
+---@param first_row integer 1-based
+---@param last_row integer 1-based
+function M._status_schedule_decorate_visible(buf, first_row, last_row)
+  local status = M._status_states and M._status_states[buf] or nil
+  if not status then return end
+  if status.decorate_first == first_row and status.decorate_last == last_row then return end
+  status.decorate_first = first_row
+  status.decorate_last = last_row
+  status.decorate_request_id = (status.decorate_request_id or 0) + 1
+  local request_id = status.decorate_request_id
+  vim.defer_fn(function()
+    local current = M._status_states and M._status_states[buf] or nil
+    if not (current and current.decorate_request_id == request_id) then return end
+    if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+    M._status_decorate_visible(buf, first_row, last_row)
+  end, 30)
+end
+
+--- Place one diff row's cached decoration spans into a namespace.
+--- Pass ephemeral=true for the decoration provider's on_line; omit it (persistent)
+--- for the test seam so headless tests can read the marks back.
+---@param buf integer
+---@param namespace integer
+---@param row integer 0-based buffer row
+---@param spans DiffReviewRowSpans?
+---@param ephemeral boolean?
+function M._status_emit_row_spans(buf, namespace, row, spans, ephemeral)
+  if not spans then return end
+  if spans.bg then
+    pcall(vim.api.nvim_buf_set_extmark, buf, namespace, row, 0, {
+      end_col = spans.bg.end_col,
+      hl_group = spans.bg.hl_group,
+      priority = spans.bg.priority or 60,
+      ephemeral = ephemeral or nil,
     })
   end
+  for _, highlight in ipairs(spans.highlights or {}) do
+    pcall(vim.api.nvim_buf_set_extmark, buf, namespace, row, highlight.start_col, {
+      end_col = highlight.end_col,
+      hl_group = highlight.hl_group,
+      priority = highlight.priority or 90,
+      ephemeral = ephemeral or nil,
+    })
+  end
+end
+
+--- Apply a buffer row range's diff decoration into the decorate namespace as
+--- persistent marks, for the test seam and non-redraw refreshes.
+--- Returns the spans it applied so callers can assert per-row decoration.
+---@param buf integer
+---@param first_row integer? 1-based inclusive
+---@param last_row integer? 1-based inclusive
+---@return table<integer, DiffReviewRowSpans>
+function M._status_decorate_rows(buf, first_row, last_row)
+  local status = M._status_states and M._status_states[buf] or M._status
+  local applied = {}
+  if not (status and status.diff_row_spans) then return applied end
+  local count = vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_buf_line_count(buf) or 0
+  first_row = math.max(1, math.floor(tonumber(first_row) or 1))
+  last_row = math.min(count > 0 and count or last_row or first_row, math.floor(tonumber(last_row) or count))
+  pcall(vim.api.nvim_buf_clear_namespace, buf, M._status_decorate_ns, first_row - 1, last_row)
+  for line = first_row, last_row do
+    local spans = status.diff_row_spans[line]
+    if spans then
+      M._status_emit_row_spans(buf, M._status_decorate_ns, line - 1, spans, false)
+      applied[line] = spans
+    end
+  end
+  return applied
+end
+
+--- Register the global diff decoration provider once so diff-body decoration
+--- (syntax/gutter/intraline/bg) is emitted ephemerally for visible rows only.
+--- Skip non-status windows so unrelated redraws stay cheap.
+function M._status_register_decoration_provider()
+  if M._status_decoration_registered then return end
+  M._status_decoration_registered = true
+  vim.api.nvim_set_decoration_provider(M._status_decorate_ns, {
+    on_win = function(_, _, win_buf, toprow, botrow)
+      local status = M._status_states and M._status_states[win_buf] or nil
+      if not status then return false end
+      M._status_schedule_decorate_visible(win_buf, toprow + 1, botrow + 1)
+      return true
+    end,
+    on_line = function(_, _, win_buf, row)
+      local status = M._status_states and M._status_states[win_buf] or nil
+      local spans = status and status.diff_row_spans and status.diff_row_spans[row + 1] or nil
+      if spans then
+        M._status_emit_row_spans(win_buf, M._status_decorate_ns, row, spans, true)
+      end
+    end,
+  })
 end
 
 ---@param buf integer
@@ -9530,16 +8344,26 @@ local function status_defer_prewarm_under_cursor(buf)
   local request_id = status.cursor_prewarm_request_id
   local entry = status_entry_under_cursor()
   local entry_id = entry and entry.id or nil
+  M._status_perf_event("status.cursor_prewarm_schedule", buf, {
+    request_id = request_id,
+    entry_id = entry_id,
+    entry_kind = entry and entry.kind or nil,
+  })
 
   vim.defer_fn(function()
     local latest_status = M._status_states and M._status_states[buf] or M._status
     if not (latest_status and latest_status.cursor_prewarm_request_id == request_id) then return end
     if not (buf and vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_get_current_buf() == buf) then return end
-    M._status = latest_status
-    local current_entry = status_entry_under_cursor()
-    if entry_id and current_entry and current_entry.id == entry_id then
-      status_prewarm_entry_syntax(current_entry)
-    end
+    M._status_perf_span("status.cursor_prewarm_run", buf, {
+      request_id = request_id,
+      scheduled_entry_id = entry_id,
+    }, function()
+      M._status = latest_status
+      local current_entry = status_entry_under_cursor()
+      if entry_id and current_entry and current_entry.id == entry_id then
+        status_prewarm_entry_syntax(current_entry)
+      end
+    end)
   end, 35)
 end
 
@@ -9571,10 +8395,12 @@ local function status_entries_for_lines(start_line, end_line)
     start_line, end_line = end_line, start_line
   end
 
+  local entries_by_line = status.entries
+
   local entries = {}
   local seen = {}
   for line = start_line, end_line do
-    local entry = status.entries[line]
+    local entry = entries_by_line[line]
     if entry and entry.id and not seen[entry.id] then
       seen[entry.id] = true
       entries[#entries + 1] = entry
@@ -9771,13 +8597,37 @@ end
 ---@return integer?
 local function status_nearest_header_line(fallback_line)
   local status = M._status
-  if not (status and status.entries and status.buf and vim.api.nvim_buf_is_valid(status.buf)) then return nil end
-  local max_line = vim.api.nvim_buf_line_count(status.buf)
+  local viewport = status and status.diff_viewport or nil
+  local entries = viewport and viewport.enabled and viewport.logical_entries or (status and status.entries)
+  if not (status and entries and status.buf and vim.api.nvim_buf_is_valid(status.buf)) then return nil end
+  if viewport and viewport.enabled and viewport.logical_entry_line_by_id then
+    local best_line = nil
+    local best_distance = nil
+    for entry_id, line in pairs(viewport.logical_entry_line_by_id) do
+      local entry = M._status_entry_by_id(entry_id)
+      if entry and (
+        entry.kind == "section"
+        or entry.kind == "file"
+        or entry.kind == "commit"
+        or entry.kind == "commit_file"
+        or entry.kind == "pr_file"
+        or entry.kind == "pr_head_section"
+      ) then
+        local distance = math.abs((tonumber(line) or 0) - fallback_line)
+        if not best_distance or distance < best_distance then
+          best_distance = distance
+          best_line = line
+        end
+      end
+    end
+    if best_line then return best_line end
+  end
+  local max_line = viewport and viewport.enabled and viewport.total or vim.api.nvim_buf_line_count(status.buf)
   local line = math.min(math.max(fallback_line, 1), max_line)
   local max_offset = math.max(line - 1, max_line - line)
   for offset = 0, max_offset do
     local previous_line = line - offset
-    local previous_entry = status.entries[previous_line]
+    local previous_entry = entries[previous_line]
     if previous_entry and (
       previous_entry.kind == "section"
       or previous_entry.kind == "file"
@@ -9787,7 +8637,7 @@ local function status_nearest_header_line(fallback_line)
       or previous_entry.kind == "pr_head_section"
     ) then return previous_line end
     local next_line = line + offset
-    local next_entry = status.entries[next_line]
+    local next_entry = entries[next_line]
     if offset > 0 and next_entry and (
       next_entry.kind == "section"
       or next_entry.kind == "file"
@@ -9800,21 +8650,37 @@ local function status_nearest_header_line(fallback_line)
   return nil
 end
 
+--- Find the buffer line of a status entry by id, preferring the fallback line.
+---@param entries table<integer, DiffReviewStatusEntry>?
+---@param entry_id string?
+---@param fallback_line integer?
+---@return integer?
+function M._status_find_entry_line(entries, entry_id, fallback_line)
+  if not entries then return fallback_line end
+  if entry_id and fallback_line then
+    local fallback_entry = entries[fallback_line]
+    if fallback_entry and fallback_entry.id == entry_id then return fallback_line end
+  end
+  if entry_id then
+    for line, entry in pairs(entries) do
+      if entry and entry.id == entry_id then return line end
+    end
+  end
+  return fallback_line
+end
+
 local function status_restore_cursor(buf, target_id, fallback_line)
   local target_line = nil
+  local entries = M._status and M._status.entries
   if target_id then
-    for line, entry in pairs(M._status.entries or {}) do
-      if entry.id == target_id then
-        target_line = line
-        break
-      end
-    end
+    target_line = M._status_find_entry_line(entries, target_id, fallback_line)
   end
   if not target_line and not fallback_line then return end
   if not target_line and fallback_line and status_target_is_header(target_id) then
     target_line = status_nearest_header_line(fallback_line)
   end
-  target_line = target_line or math.min(fallback_line or 1, vim.api.nvim_buf_line_count(buf))
+  target_line = target_line or fallback_line or 1
+  target_line = math.min(target_line, vim.api.nvim_buf_line_count(buf))
   pcall(vim.api.nvim_win_set_cursor, 0, { math.max(target_line, 1), 0 })
 end
 
@@ -9823,6 +8689,8 @@ end
 local function status_set_plain_lines(buf, lines)
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
   if M._diff_line_content_lengths then M._diff_line_content_lengths[buf] = nil end
+  local state = M._status_states and M._status_states[buf] or (M._status and M._status.buf == buf and M._status) or nil
+  if state then state.diff_viewport = nil end
   M._clear_diff_gutter_visual_line(buf)
   local was_rendering = vim.b[buf].diff_review_status_rendering
   vim.b[buf].diff_review_status_rendering = true
@@ -9836,9 +8704,11 @@ end
 
 ---@return string
 function M._gitstatus_debug_log_path()
+  if M._gitstatus_debug_log_file then return M._gitstatus_debug_log_file end
   local dir = (vim.fn.stdpath("state") or ".") .. "/diff_review"
   pcall(vim.fn.mkdir, dir, "p")
-  return dir .. "/gitstatus-debug.log"
+  M._gitstatus_debug_log_file = dir .. "/gitstatus-debug.log"
+  return M._gitstatus_debug_log_file
 end
 
 M._gitstatus_debug = M._gitstatus_debug or {}
@@ -9876,6 +8746,165 @@ function M._gitstatus_debug.event(event, payload)
   if not ok then
     notify_debug("GitStatus debug event failed: " .. tostring(err), vim.log.levels.WARN, { title = "GitStatus" })
   end
+end
+
+function M._gitstatus_debug.perf_enabled()
+  local options = M.config or config.options or config.defaults
+  local global_enabled = vim.g.diff_review_gitstatus_perf
+  return M._gitstatus_debug_perf_force == true
+    or M._gitstatus_debug_perf_enabled == true
+    or global_enabled == true
+    or global_enabled == 1
+    or (options and options.status_perf_logging == true)
+    or M._gitstatus_debug.enabled()
+end
+
+---@return integer
+function M._gitstatus_debug.perf_now()
+  local uv = vim.uv or vim.loop
+  if uv and uv.hrtime then return uv.hrtime() end
+  return math.floor(vim.fn.reltimefloat(vim.fn.reltime()) * 1000000000)
+end
+
+---@param started integer
+---@return number
+function M._gitstatus_debug.perf_elapsed_ms(started)
+  local elapsed = M._gitstatus_debug.perf_now() - started
+  return math.floor((elapsed / 1000000) * 1000 + 0.5) / 1000
+end
+
+function M._gitstatus_debug.flush_perf()
+  local lines = M._gitstatus_debug_perf_queue
+  M._gitstatus_debug_perf_queue = nil
+  M._gitstatus_debug_perf_flush_pending = false
+  if not (lines and #lines > 0) then return end
+  local path = M._gitstatus_debug_log_path()
+  local text = table.concat(lines, "\n") .. "\n"
+  local uv = vim.uv or vim.loop
+  local function report_error(err)
+    if not err then return end
+    pcall(vim.schedule, function()
+      notify_debug("GitStatus perf log failed: " .. tostring(err), vim.log.levels.WARN, { title = "GitStatus" })
+    end)
+  end
+  if uv and uv.fs_open and uv.fs_write and uv.fs_close then
+    uv.fs_open(path, "a", 438, function(open_err, fd)
+      if open_err or not fd then
+        report_error(open_err or "open failed")
+        return
+      end
+      uv.fs_write(fd, text, -1, function(write_err)
+        uv.fs_close(fd, function(close_err)
+          report_error(write_err or close_err)
+        end)
+      end)
+    end)
+    return
+  end
+  local ok, err = pcall(vim.fn.writefile, lines, M._gitstatus_debug_log_path(), "a")
+  if not ok then
+    notify_debug("GitStatus perf log failed: " .. tostring(err), vim.log.levels.WARN, { title = "GitStatus" })
+  end
+end
+
+---@param event string
+---@param payload? table
+function M._gitstatus_debug.perf_event(event, payload)
+  if not M._gitstatus_debug.perf_enabled() then return end
+  M._gitstatus_debug_perf_sequence = (M._gitstatus_debug_perf_sequence or 0) + 1
+  local line = ("GitStatus perf seq=%d time=%s event=%s payload=%s"):format(
+    M._gitstatus_debug_perf_sequence,
+    os.date("%Y-%m-%d %H:%M:%S"),
+    tostring(event),
+    M._gitstatus_debug.one_line(payload or {})
+  )
+  M._gitstatus_debug_perf_queue = M._gitstatus_debug_perf_queue or {}
+  M._gitstatus_debug_perf_queue[#M._gitstatus_debug_perf_queue + 1] = line
+  if M._gitstatus_debug_perf_flush_pending then return end
+  M._gitstatus_debug_perf_flush_pending = true
+  vim.defer_fn(function()
+    M._gitstatus_debug.flush_perf()
+  end, 25)
+end
+
+---@param event string
+---@param payload table?
+---@param callback fun(): any
+---@return any
+function M._gitstatus_debug.perf_span(event, payload, callback)
+  if not M._gitstatus_debug.perf_enabled() then return callback() end
+  local started = M._gitstatus_debug.perf_now()
+  local function pack_results(...)
+    return { n = select("#", ...), ... }
+  end
+  local results = pack_results(pcall(callback))
+  local ok = results[1]
+  local next_payload = vim.deepcopy(payload or {})
+  next_payload.ms = M._gitstatus_debug.perf_elapsed_ms(started)
+  if not ok then
+    next_payload.error = tostring(results[2])
+    M._gitstatus_debug.perf_event(event .. ".error", next_payload)
+    error(results[2], 0)
+  end
+  M._gitstatus_debug.perf_event(event, next_payload)
+  local unpack_values = table.unpack or unpack
+  return unpack_values(results, 2, results.n)
+end
+
+---@param buf integer?
+---@param extra? table
+---@return table
+function M._status_perf_payload(buf, extra)
+  local state = buf and M._status_states and M._status_states[buf] or nil
+  if not state and M._status and (not buf or M._status.buf == buf) then state = M._status end
+  local payload = vim.deepcopy(extra or {})
+  payload.buf = buf
+  payload.view_kind = state and state.view_kind or nil
+  if buf and vim.api.nvim_buf_is_valid(buf) then
+    payload.line_count = vim.api.nvim_buf_line_count(buf)
+  end
+  if buf and vim.api.nvim_get_current_buf() == buf then
+    local cursor = vim.api.nvim_win_get_cursor(0)
+    payload.cursor_row = cursor[1]
+    payload.cursor_col = cursor[2]
+  end
+  local viewport = state and state.diff_viewport or nil
+  if viewport and viewport.enabled then
+    payload.viewport_top = viewport.top
+    payload.viewport_total = viewport.total
+    payload.viewport_logical_total = viewport.logical_total
+    payload.viewport_render_count = viewport.render_count
+  end
+  return payload
+end
+
+---@param event string
+---@param buf integer?
+---@param extra table?
+function M._status_perf_event(event, buf, extra)
+  local debug = M._gitstatus_debug
+  local payload = M._status_perf_payload(buf, extra)
+  if M._diff_perf and M._diff_perf.enabled() then M._diff_perf.event(event, payload) end
+  if not (debug and debug.perf_event) then return end
+  debug.perf_event(event, payload)
+end
+
+---@param event string
+---@param buf integer?
+---@param extra table?
+---@param callback fun(): any
+---@return any
+function M._status_perf_span(event, buf, extra, callback)
+  local debug = M._gitstatus_debug
+  local payload = M._status_perf_payload(buf, extra)
+  if M._diff_perf and M._diff_perf.enabled() then
+    return M._diff_perf.span(event, payload, function()
+      if not (debug and debug.perf_span and debug.perf_enabled and debug.perf_enabled()) then return callback() end
+      return debug.perf_span(event, payload, callback)
+    end)
+  end
+  if not (debug and debug.perf_span and debug.perf_enabled and debug.perf_enabled()) then return callback() end
+  return debug.perf_span(event, payload, callback)
 end
 
 ---@param row table
@@ -10198,6 +9227,102 @@ function M._status_stop_markdown_highlighter(buf)
   end
 end
 
+
+---@param buf integer
+function M._status_write_rendered_buffer(buf)
+  local was_rendering = vim.b[buf].diff_review_status_rendering
+  vim.b[buf].diff_review_status_rendering = true
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_clear_namespace(buf, M._status_ns, 0, -1)
+  for index, line in ipairs(M._status.lines or {}) do
+    if type(line) ~= "string" then M._status.lines[index] = tostring(line or "") end
+  end
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, M._status.lines)
+  vim.bo[buf].modifiable = false
+  vim.b[buf].diff_review_status_rendering = was_rendering
+end
+
+---@param buf integer
+function M._status_apply_rendered_extmarks(buf)
+  for _, line_hl in ipairs(M._status.line_highlights or {}) do
+    pcall(vim.api.nvim_buf_set_extmark, buf, M._status_ns, line_hl.line - 1, 0, {
+      line_hl_group = line_hl.hl_group,
+      priority = 80,
+    })
+  end
+  for _, highlight in ipairs(M._status.highlights or {}) do
+    pcall(vim.api.nvim_buf_set_extmark, buf, M._status_ns, highlight.line - 1, highlight.start_col, {
+      end_col = highlight.end_col,
+      hl_group = highlight.hl_group,
+      priority = highlight.priority or 90,
+    })
+  end
+  for _, extmark in ipairs(M._status.extmarks or {}) do
+    local extmark_opts = vim.tbl_extend("force", { priority = 95 }, extmark.opts)
+    pcall(vim.api.nvim_buf_set_extmark, buf, M._status_ns, extmark.line - 1, extmark.col, extmark_opts)
+  end
+end
+
+--- Run the PR overview view's after-render work (its view controller's after_render hook).
+---@param buf integer
+function M._status_after_render_pr(buf)
+  M._status_perf_span("status.after_render.pr_edit_on_render", buf, nil, function() M._pr_edit.on_render(buf) end)
+  M._status_perf_span("status.after_render.review_on_render", buf, nil, function() M._review.on_render(buf) end)
+  M._status_perf_span("status.after_render.markdown", buf, nil, function() M._pr_edit.render_markdown_regions(buf) end)
+  M._status_perf_span("status.after_render.native_folds", buf, nil, function() M._status_apply_native_folds(buf) end)
+  M._status_perf_span("status.after_render.pr_sync_modifiable", buf, nil, function() M._pr_edit.sync_modifiable(buf) end)
+  M._status_perf_span("status.after_render.schedule_native_folds", buf, nil, function() M._status_schedule_native_folds(buf) end)
+end
+
+--- Run the PR review view's after-render work.
+---@param buf integer
+function M._status_after_render_review(buf)
+  M._status_perf_span("status.after_render.review_on_render", buf, nil, function() M._review.on_render(buf) end)
+  M._status_perf_span("status.after_render.markdown", buf, nil, function() M._pr_edit.render_markdown_regions(buf) end)
+  M._status_perf_span("status.after_render.native_folds", buf, nil, function() M._status_apply_native_folds(buf) end)
+  M._status_perf_span("status.after_render.review_sync_modifiable", buf, nil, function() M._review.sync_modifiable(buf) end)
+  M._status_perf_span("status.after_render.schedule_native_folds", buf, nil, function() M._status_schedule_native_folds(buf) end)
+end
+
+--- Run the GitStatus view's after-render work.
+---@param buf integer
+function M._status_after_render_status(buf)
+  M._status_perf_span("status.after_render.stop_markdown", buf, nil, function() M._status_stop_markdown_highlighter(buf) end)
+  M._status_perf_span("status.after_render.native_folds", buf, nil, function() M._status_apply_native_folds(buf) end)
+  M._status_perf_span("status.after_render.issues_sync_modifiable", buf, nil, function() M._status_issues.sync_modifiable(buf) end)
+end
+
+--- Run the after-render work for branch diff and any other status-like view.
+---@param buf integer
+function M._status_after_render_default(buf)
+  M._status_perf_span("status.after_render.native_folds", buf, nil, function() M._status_apply_native_folds(buf) end)
+end
+
+---@param buf integer
+---@param walkthrough table?
+function M._status_after_buffer_render(buf, walkthrough)
+  return M._status_perf_span("status.after_buffer_render", buf, nil, function()
+    M._status_register_decoration_provider()
+    M._status_perf_span("status.after_render.hint_bar", buf, nil, function()
+      M._status_apply_hint_bar(buf)
+    end)
+    if walkthrough then
+      M._status_perf_span("status.after_render.walkthrough", buf, nil, function()
+        walkthrough.on_status_rendered(buf)
+      end)
+    end
+
+    -- Resolve per-view after-render behavior through the registered view controller,
+    -- falling back to the default (folds only) for unregistered/branch-diff views.
+    local view_kind = M._status.view_kind or "status"
+    if not M._diff_view_controller_model.run_hook(view_kind, "after_render", { buf = buf }) then
+      M._status_after_render_default(buf)
+    end
+    M._gitstatus_debug.dump(buf, "status_render_loaded")
+  end)
+end
+
+
 ---@param buf integer
 ---@param target_id? string
 ---@param fallback_line? integer
@@ -10205,9 +9330,17 @@ end
 ---@param head_lines table[]
 ---@param sections DiffReviewStatusSection[]
 local function status_render_loaded(buf, target_id, fallback_line, opts, head_lines, sections)
+  return M._status_perf_span("status.render_loaded", buf, {
+    target_id = target_id,
+    fallback_line = fallback_line,
+    reuse_sections = opts and opts.reuse_sections or nil,
+    head_line_count = head_lines and #head_lines or nil,
+    section_count = sections and #sections or nil,
+  }, function()
   opts = opts or {}
   if M._pr_edit.blocks_render(buf) then return end
   setup_bg_highlights()
+  local previous_registry = M._status and M._status.diff_source_registry or nil
   M._status = M._status or {}
   M._status.buf = buf
   M._status.lines = {}
@@ -10215,7 +9348,13 @@ local function status_render_loaded(buf, target_id, fallback_line, opts, head_li
   M._status.highlights = {}
   M._status.line_highlights = {}
   M._status.extmarks = {}
+  M._status.diff_row_spans = {}
   M._status.boundary_lines = {}
+  M._status.fold_ranges_by_id = {}
+  M._status.fold_range_order = {}
+  M._status.fold_text_by_start_line = {}
+  M._status.diff_source_registry = (opts.reuse_sections and previous_registry) or M._diff_source_model.new_registry()
+  M._status_configure_diff_source_policies(M._status.diff_source_registry)
   M._diff_line_content_lengths = M._diff_line_content_lengths or {}
   M._diff_line_content_lengths[buf] = {}
   M._clear_diff_gutter_visual_line(buf)
@@ -10226,90 +9365,100 @@ local function status_render_loaded(buf, target_id, fallback_line, opts, head_li
   end
   M._status_sort_sections_for_render(buf, sections)
 
-  local folded_head_parents = {}
-  local hidden_head_parents = {}
-  for _, head_line in ipairs(head_lines) do
-    local parent_id = head_line.parent_id
-    local parent_hidden = parent_id and (folded_head_parents[parent_id] or hidden_head_parents[parent_id])
-    if parent_hidden then
-      local entry = head_line.entry
-      if entry and entry.id then
-        hidden_head_parents[entry.id] = true
-      end
-    else
-      if head_line.segments then
-        status_add_segment_line(head_line.segments, head_line.entry)
+  local active_head_stack = {}
+  local function close_active_head_parent(parent, end_line)
+    if parent then
+      M._status_register_fold_range(
+        parent.id,
+        parent.start_line,
+        end_line,
+        parent.default_folded,
+        parent.fold_text
+      )
+    end
+  end
+  local function close_head_stack_to(parent_id, end_line)
+    while #active_head_stack > 0 and active_head_stack[#active_head_stack].id ~= parent_id do
+      close_active_head_parent(table.remove(active_head_stack), end_line)
+    end
+  end
+  local function close_all_head_parents(end_line)
+    while #active_head_stack > 0 do
+      close_active_head_parent(table.remove(active_head_stack), end_line)
+    end
+  end
+
+  M._status_perf_span("status.render_loaded.head_rows", buf, {
+    head_line_count = #head_lines,
+  }, function()
+    for _, head_line in ipairs(head_lines) do
+      local parent_id = head_line.parent_id
+      if parent_id then
+        close_head_stack_to(parent_id, #M._status.lines)
       else
-        status_add_segment_line(head_line)
+        close_all_head_parents(#M._status.lines)
       end
       local entry = head_line.entry
+      if entry and entry.kind == "pr_head_section" then
+        entry.default_folded = head_line.default_folded == true
+      end
+      local line_number
+      if head_line.segments then
+        line_number = status_add_segment_line(head_line.segments, entry)
+      else
+        line_number = status_add_segment_line(head_line)
+      end
       if entry and entry.kind == "pr_head_section" and entry.id then
-        folded_head_parents[entry.id] = status_folded(entry.id, head_line.default_folded == true)
+        active_head_stack[#active_head_stack + 1] = {
+          id = entry.id,
+          start_line = line_number,
+          default_folded = head_line.default_folded == true,
+          fold_text = M._status.lines[line_number],
+        }
       end
     end
-  end
-  status_add_line("")
+    close_all_head_parents(#M._status.lines)
+    status_add_line("")
+  end)
 
-  if #sections == 0 then
-    status_add_line("No changes", nil, "Comment")
-  else
-    for index, section in ipairs(sections) do
-      if index > 1 then
-        status_add_line("")
+  M._status_perf_span("status.render_loaded.sections", buf, {
+    section_count = #sections,
+  }, function()
+    if #sections == 0 then
+      status_add_line("No changes", nil, "Comment")
+    else
+      for index, section in ipairs(sections) do
+        if index > 1 then
+          status_add_line("")
+        end
+        status_render_section(section)
       end
-      status_render_section(section)
     end
-  end
+  end)
 
-  local was_rendering = vim.b[buf].diff_review_status_rendering
-  vim.b[buf].diff_review_status_rendering = true
-  vim.bo[buf].modifiable = true
-  vim.api.nvim_buf_clear_namespace(buf, M._status_ns, 0, -1)
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, M._status.lines)
-  vim.bo[buf].modifiable = false
-  vim.b[buf].diff_review_status_rendering = was_rendering
+  M._status_perf_span("status.render_loaded.write_buffer", buf, {
+    line_count = #M._status.lines,
+  }, function()
+    M._status_write_rendered_buffer(buf)
+  end)
+  M._status_perf_span("status.render_loaded.apply_extmarks", buf, {
+    highlight_count = #(M._status.highlights or {}),
+    line_highlight_count = #(M._status.line_highlights or {}),
+    extmark_count = #(M._status.extmarks or {}),
+  }, function()
+    M._status_apply_rendered_extmarks(buf)
+  end)
+  M._status_perf_span("status.render_loaded.restore_cursor", buf, {
+    target_id = target_id,
+    fallback_line = fallback_line,
+  }, function()
+    status_restore_cursor(buf, target_id, fallback_line)
+  end)
 
-  for _, line_hl in ipairs(M._status.line_highlights) do
-    pcall(vim.api.nvim_buf_set_extmark, buf, M._status_ns, line_hl.line - 1, 0, {
-      line_hl_group = line_hl.hl_group,
-      priority = 80,
-    })
-  end
-  for _, highlight in ipairs(M._status.highlights) do
-    pcall(vim.api.nvim_buf_set_extmark, buf, M._status_ns, highlight.line - 1, highlight.start_col, {
-      end_col = highlight.end_col,
-      hl_group = highlight.hl_group,
-      priority = highlight.priority or 90,
-    })
-  end
-  for _, extmark in ipairs(M._status.extmarks) do
-    local opts = vim.tbl_extend("force", { priority = 95 }, extmark.opts)
-    pcall(vim.api.nvim_buf_set_extmark, buf, M._status_ns, extmark.line - 1, extmark.col, opts)
-  end
-
-  M._status_apply_hint_bar(buf)
-  status_restore_cursor(buf, target_id, fallback_line)
-
-  -- Re-apply walkthrough decorations after rows shift; package.loaded guard
-  -- avoids loading the module when no walkthrough has ever started.
-  if walkthrough then walkthrough.on_status_rendered(buf) end
-
-  -- Rendering wipes view-specific extmarks (PR-edit regions, review comment
-  -- regions); re-anchor them.
-  local view_kind = M._status.view_kind or "status"
-  if view_kind == "pr" then
-    M._pr_edit.on_render(buf)
-    M._review.on_render(buf)
-    M._pr_edit.render_markdown_regions(buf)
-    M._pr_edit.sync_modifiable(buf)
-  elseif view_kind == "review" then
-    M._review.on_render(buf)
-    M._pr_edit.render_markdown_regions(buf)
-  elseif view_kind == "status" then
-    M._status_stop_markdown_highlighter(buf)
-    M._status_issues.sync_modifiable(buf)
-  end
-  M._gitstatus_debug.dump(buf, "status_render_loaded")
+  M._status_perf_span("status.render_loaded.after_render", buf, nil, function()
+    M._status_after_buffer_render(buf, walkthrough)
+  end)
+  end)
 end
 
 ---@param cwd string
@@ -10512,7 +9661,7 @@ function M.render_status(buf, target_id, fallback_line, opts)
     status_set_plain_lines(buf, { "Loading DiffReview..." })
   end
 
-  git_root_async(function(cwd, root_err)
+  git_backend.git_root_async(function(cwd, root_err)
     local latest_status = M._status_states and M._status_states[buf] or render_state
     if not (latest_status and latest_status.request_id == request_id) then return end
     M._status = latest_status
@@ -10677,65 +9826,7 @@ local function load_pr_diff(pr, cwd, buf)
   end)
 end
 
----@param pr DiffReviewGhPR
----@param cwd string
----@param buf integer
-function M._pr_overview.load_comments(pr, cwd, buf)
-  local status = M._status
-  if not (status and status.buf == buf and pr.repo and pr.repo ~= "") then return end
-  status.pr_comments_request_id = (status.pr_comments_request_id or 0) + 1
-  local request_id = status.pr_comments_request_id
-  gh.pr_comments_async(cwd, pr.number, pr.repo, function(result)
-    local latest_status = M._status_states and M._status_states[buf] or nil
-    if not (
-      latest_status
-      and latest_status.pr_comments_request_id == request_id
-      and latest_status.buf == buf
-      and vim.api.nvim_buf_is_valid(buf)
-    ) then return end
-    M._status = latest_status
-    if not result.ok then
-      notify_error("GitHub PR comments failed: " .. (result.message or "gh failed"), "DiffReview")
-      return
-    end
-    latest_status.pr_comments = result
-    M._pr_overview.import_viewer_authored_comments(latest_status, result)
-    render_pr_status(pr, cwd, buf, latest_status.pr_diff_text)
-  end)
-end
 
----@param pr DiffReviewGhPR
----@param cwd string
----@param buf integer
-function M._pr_overview.load_checks(pr, cwd, buf)
-  local status = M._status
-  if not (status and status.buf == buf and pr.repo and pr.repo ~= "") then return end
-  status.pr_checks_request_id = (status.pr_checks_request_id or 0) + 1
-  status.pr_checks_loading = true
-  status.pr_checks_error = nil
-  local request_id = status.pr_checks_request_id
-  render_pr_status(pr, cwd, buf, status.pr_diff_text)
-  gh.pr_checks_async(cwd, pr.number, pr.repo, function(result)
-    local latest_status = M._status_states and M._status_states[buf] or nil
-    if not (
-      latest_status
-      and latest_status.pr_checks_request_id == request_id
-      and latest_status.buf == buf
-      and vim.api.nvim_buf_is_valid(buf)
-    ) then return end
-    M._status = latest_status
-    latest_status.pr_checks_loading = false
-    if not result.ok then
-      latest_status.pr_checks_error = result.message or "gh failed"
-      notify_error("GitHub PR checks failed: " .. latest_status.pr_checks_error, "DiffReview")
-      render_pr_status(pr, cwd, buf, latest_status.pr_diff_text)
-      return
-    end
-    latest_status.pr_checks_error = nil
-    latest_status.pr_checks = result.checks or {}
-    render_pr_status(pr, cwd, buf, latest_status.pr_diff_text)
-  end)
-end
 
 -- PR review mode (":or" in the PR/status view). A review buffer
 -- (view_kind = "review") shows the PR title, an editable review summary, and
@@ -10744,3121 +9835,163 @@ end
 -- `y`/`n` jump between comments, and the submit key posts the review verdict.
 -- Everything hangs off the module table because init.lua is at Lua's
 -- 200-local limit.
-M._review = {
-  ns = vim.api.nvim_create_namespace("diff_review_review"),
-  comment_icon = M._comment_icon,
-  reply_icon = M._reply_icon,
-  -- Test seams: the comment-body input and the verdict picker. Defaults open
-  -- real UI; tests override them. Mirrors the set_backend/set_reader pattern.
-  input_provider = nil, ---@type (fun(title: string, on_submit: fun(text: string)))?
-  verdict_provider = nil, ---@type (fun(on_choice: fun(event: string?)))?
-  data_dir_for_test = nil,
-}
-
----@param buf integer
----@return table? state the review-capable status-state, or nil if buf has no inline comment rows
-function M._review.state(buf)
-  local status = M._status_states and M._status_states[buf] or nil
-  if status and status.view_kind == "review" then return status end
-  if status and status.view_kind == "pr" then
-    status.pr_standalone_comments = status.pr_standalone_comments or {}
-    status.pr_regular_comments = status.pr_regular_comments or {}
-    if M._pr_overview.editable_comments then
-      status.review_comments = M._pr_overview.editable_comments(status)
-    else
-      status.review_comments = status.pr_standalone_comments
-    end
-    return status
-  end
-  return nil
-end
-
----@return DiffReviewReviewKeymapConfig
-function M._review.keymap_config()
-  local options = M.config or config.options or config.defaults
-  local keymaps = options.keymaps or config.defaults.keymaps
-  return vim.tbl_deep_extend("force", vim.deepcopy(config.defaults.keymaps.review), keymaps.review or {})
-end
-
----@param id string
----@return string[]
-function M._review.keys_for(id)
-  return status_keys_for(id)
-end
-
----@param path string?
-function M._review.set_data_dir_for_test(path)
-  require("github.repo_cache").set_data_dir_for_test(path)
-end
-
----@return string
-function M._review.data_dir()
-  return require("github.repo_cache").base_dir()
-end
-
----@param state table
----@return string
-function M._review.storage_repo(state)
-  local pr = state.pr or {}
-  local repo = type(pr.repo) == "string" and vim.trim(pr.repo) or ""
-  if repo ~= "" then return repo end
-  local url = type(pr.url) == "string" and pr.url or ""
-  local owner, name = url:match("github%.com[:/]([^/]+)/([^/]+)/pull/%d+")
-  if owner and name then return owner .. "/" .. name end
-  return "unknown/" .. vim.fn.sha256(tostring(state.cwd or ""))
-end
-
----@param segment string|number?
----@return string
-function M._review.storage_segment(segment)
-  local text = vim.trim(tostring(segment or ""))
-  if text == "" then text = "current" end
-  text = text:gsub("[<>:\"/\\|?*%c]", "-"):gsub("^%.+$", "-")
-  return text
-end
-
----@param state table
----@return string[]
-function M._review.storage_segments(state)
-  local segments = {}
-  for _, segment in ipairs(vim.split(M._review.storage_repo(state), "/", { plain = true, trimempty = true })) do
-    segments[#segments + 1] = M._review.storage_segment(segment)
-  end
-  segments[#segments + 1] = M._review.storage_segment((state.pr or {}).number)
-  return segments
-end
-
----@param state table
----@return string
-function M._review.storage_path(state)
-  return require("github.repo_cache").review_path(M._review.storage_repo(state), (state.pr or {}).number)
-end
-
----@param state table
-function M._review.load_draft(state)
-  local path = M._review.storage_path(state)
-  if vim.uv.fs_stat(path) == nil then return end
-  local ok, lines = pcall(vim.fn.readfile, path)
-  if not ok then return end
-  local decoded_ok, draft = pcall(vim.json.decode, table.concat(lines, "\n"))
-  if not decoded_ok or type(draft) ~= "table" then return end
-  if type(draft.commit_id) == "string" then state.review_draft_commit_id = draft.commit_id end
-  if type(draft.review_viewed) == "table" then state.review_viewed = draft.review_viewed end
-  if type(draft.review_viewed_hunks) == "table" then state.review_viewed_hunks = draft.review_viewed_hunks end
-  if type(draft.review_comment_text) == "string" then state.review_comment_text = draft.review_comment_text end
-  if type(draft.review_comments) == "table" then state.review_comments = draft.review_comments end
-  if type(draft.review_remote) == "table" then state.review_remote = draft.review_remote end
-end
-
----@param state table
----@return table[]
-function M._review.comments_for_storage(state)
-  local comments = {}
-  for _, comment in ipairs(state.review_comments or {}) do
-    local copy = vim.deepcopy(comment)
-    copy.syncing = nil
-    copy.review_body_start = nil
-    copy.review_body_end = nil
-    copy.review_header_mark = nil
-    copy.review_footer_mark = nil
-    copy.review_reply_header_marks = nil
-    copy.review_body_line_marks = nil
-    copy.review_body_render_rows = nil
-    copy.review_body_render_row_count = nil
-    copy.review_body_prefix_width = nil
-    copy.review_markdown_ranges = nil
-    copy.review_rendered_body_text = nil
-    comments[#comments + 1] = copy
-  end
-  return comments
-end
-
----@param state table
-function M._review.save_draft(state)
-  local path = M._review.storage_path(state)
-  local directory = vim.fs.dirname(path) or M._review.data_dir()
-  local mkdir_ok, mkdir_err = pcall(vim.fn.mkdir, directory, "p")
-  if not mkdir_ok or mkdir_err == 0 then
-    notify_error("Could not create review draft directory: " .. directory, "DiffReview")
-    return
-  end
-  local payload = {
-    cwd = state.cwd,
-    repo = state.pr and state.pr.repo or nil,
-    number = state.pr and state.pr.number or nil,
-    commit_id = state.commit_id,
-    review_viewed = state.review_viewed or {},
-    review_viewed_hunks = state.review_viewed_hunks or {},
-    review_comment_text = state.review_comment_text or "",
-    review_comments = M._review.comments_for_storage(state),
-    review_remote = state.review_remote or {},
-  }
-  local encode_ok, encoded = pcall(vim.json.encode, payload)
-  if not encode_ok then
-    notify_error("Could not encode review draft", "DiffReview")
-    return
-  end
-  local write_ok, write_err = pcall(vim.fn.writefile, { encoded }, path)
-  if not write_ok or write_err ~= 0 then
-    notify_error("Could not write review draft", "DiffReview")
-  end
-end
-
----@param state table
-function M._review.delete_draft(state)
-  pcall(vim.fn.delete, M._review.storage_path(state))
-end
-
----@param value any
----@return string
-function M._review.normalize_comment_body_text(value)
-  return tostring(value or ""):gsub("\r\n", "\n"):gsub("\r", "\n")
-end
-
----@param state table
----@param comment table
----@return table
-function M._review.normalize_comment(state, comment)
-  comment.body = M._review.normalize_comment_body_text(comment.body)
-  if comment.base_body ~= nil then comment.base_body = M._review.normalize_comment_body_text(comment.base_body) end
-  if comment.remote_body ~= nil then comment.remote_body = M._review.normalize_comment_body_text(comment.remote_body) end
-  if not comment.local_id or comment.local_id == "" then
-    local seed = table.concat({
-      tostring(state.pr and state.pr.repo or ""),
-      tostring(state.pr and state.pr.number or ""),
-      tostring(comment.path or ""),
-      tostring(comment.line or ""),
-      tostring(comment.position or ""),
-      tostring(comment.body or ""),
-      tostring(vim.uv.hrtime()),
-    }, "\n")
-    comment.local_id = vim.fn.sha256(seed):sub(1, 16)
-  end
-  if (not comment.abs_file or comment.abs_file == "") and comment.path and comment.path ~= "" then
-    comment.abs_file = vim.fs.normalize(vim.fs.joinpath(state.cwd, comment.path))
-  end
-  comment.side = comment.side or "RIGHT"
-  comment.local_state = comment.local_state or (comment.remote_id and "clean" or "new")
-  if comment.base_body == nil then comment.base_body = comment.remote_id and comment.body or "" end
-  if type(comment.user) == "table" then comment.user = comment.user.login end
-  if not comment.user or comment.user == "" then
-    local author = type(comment.author) == "table" and comment.author or nil
-    local remote_user = type(state.review_remote) == "table" and state.review_remote.user or nil
-    comment.user = comment.author_login or (author and author.login) or (remote_user and remote_user.login) or "you"
-  end
-  comment.created_at = comment.created_at or comment.createdAt or os.date("%Y-%m-%d %H:%M")
-  comment.updated_at = comment.updated_at or comment.updatedAt or comment.created_at
-  local replies = {}
-  for _, reply in ipairs(type(comment.replies) == "table" and comment.replies or {}) do
-    if type(reply) == "table" then
-      reply.body = M._review.normalize_comment_body_text(reply.body)
-      if type(reply.user) == "table" then reply.user = reply.user.login end
-      if not reply.user or reply.user == "" then
-        local reply_author = type(reply.author) == "table" and reply.author or nil
-        reply.user = reply.author_login or (reply_author and reply_author.login) or "unknown"
-      end
-      reply.created_at = reply.created_at or reply.createdAt or comment.created_at
-      reply.updated_at = reply.updated_at or reply.updatedAt or reply.created_at
-      replies[#replies + 1] = reply
-    end
-  end
-  comment.replies = replies
-  return comment
-end
-
----@param state table
-function M._review.normalize_comments(state)
-  for _, comment in ipairs(state.review_comments or {}) do
-    M._review.normalize_comment(state, comment)
-  end
-end
-
----@param state table
----@param remote table
----@return table
-function M._review.comment_from_remote(state, remote)
-  local remote_body = M._review.normalize_comment_body_text(remote.body)
-  return M._review.normalize_comment(state, {
-    local_id = remote.remote_node_id or ("remote:" .. tostring(remote.remote_id or "")),
-    remote_id = remote.remote_id,
-    remote_node_id = remote.remote_node_id,
-    remote_review_id = remote.review_id or (state.review_remote and state.review_remote.id),
-    review_node_id = remote.review_node_id,
-    review_state = remote.review_state,
-    path = remote.path,
-    abs_file = remote.path and vim.fs.normalize(vim.fs.joinpath(state.cwd, remote.path)) or nil,
-    side = "RIGHT",
-    line = remote.line,
-    start_line = remote.start_line,
-    start_side = remote.start_side,
-    position = remote.position,
-    body = remote_body,
-    base_body = remote_body,
-    viewer_did_author = remote.viewer_did_author,
-    user = remote.user,
-    created_at = remote.created_at,
-    updated_at = remote.updated_at,
-    url = remote.url,
-    resolved = remote.resolved,
-    outdated = remote.outdated,
-    replies = type(remote.replies) == "table" and vim.deepcopy(remote.replies) or {},
-    local_state = "clean",
-  })
-end
-
----@param comment table
----@return string
-function M._review.comment_fingerprint(comment)
-  return table.concat({
-    tostring(comment.path or ""),
-    tostring(comment.side or ""),
-    tostring(comment.line or ""),
-    tostring(comment.position or ""),
-  }, "\t")
-end
-
----@param state table
----@param remote table
----@return table?
-function M._review.find_comment_for_remote(state, remote)
-  for _, comment in ipairs(state.review_comments or {}) do
-    if remote.remote_node_id and comment.remote_node_id == remote.remote_node_id then return comment end
-    if remote.remote_id and tonumber(comment.remote_id) == tonumber(remote.remote_id) then return comment end
-  end
-  local remote_fingerprint = M._review.comment_fingerprint({
-    path = remote.path,
-    side = "RIGHT",
-    line = remote.line,
-    position = remote.position,
-  })
-  for _, comment in ipairs(state.review_comments or {}) do
-    if not comment.remote_id
-      and comment.local_state ~= "deleted"
-      and M._review.comment_fingerprint(comment) == remote_fingerprint
-      and M._review.comment_body_for_sync(comment.body or "") == M._review.comment_body_for_sync(remote.body or "") then
-      return comment
-    end
-  end
-  return nil
-end
-
----@param state table
----@param remote_comments table[]
----@return boolean changed
-function M._review.merge_remote_comments(state, remote_comments)
-  M._review.normalize_comments(state)
-  local changed = false
-  for _, remote in ipairs(remote_comments or {}) do
-    local comment = M._review.find_comment_for_remote(state, remote)
-    if comment then
-      comment.remote_id = remote.remote_id or comment.remote_id
-      comment.remote_node_id = remote.remote_node_id or comment.remote_node_id
-      comment.remote_review_id = remote.review_id or comment.remote_review_id
-      comment.position = remote.position or comment.position
-      comment.line = remote.line or comment.line
-      comment.user = remote.user or comment.user
-      comment.created_at = remote.created_at or comment.created_at
-      comment.updated_at = remote.updated_at or comment.updated_at
-      comment.viewer_did_author = remote.viewer_did_author
-      local remote_replies = type(remote.replies) == "table" and vim.deepcopy(remote.replies) or {}
-      if not vim.deep_equal(comment.replies or {}, remote_replies) then
-        comment.replies = remote_replies
-        changed = true
-      end
-      local remote_body = M._review.normalize_comment_body_text(remote.body)
-      local base_body = M._review.normalize_comment_body_text(comment.base_body)
-      local local_body = M._review.normalize_comment_body_text(comment.body)
-      local base_sync_body = M._review.comment_body_for_sync(base_body)
-      local local_sync_body = M._review.comment_body_for_sync(local_body)
-      if comment.local_state == "dirty" or comment.local_state == "new" then
-        if remote_body == local_sync_body then
-          comment.base_body = remote_body
-          comment.local_state = "clean"
-          changed = true
-        elseif base_body ~= "" and remote_body ~= base_sync_body then
-          comment.remote_body = remote_body
-          comment.local_state = "conflict"
-          changed = true
-        end
-      elseif comment.local_state ~= "deleted" and local_sync_body ~= remote_body then
-        comment.body = remote_body
-        comment.base_body = remote_body
-        comment.local_state = "clean"
-        changed = true
-      end
-    else
-      state.review_comments[#state.review_comments + 1] = M._review.comment_from_remote(state, remote)
-      changed = true
-    end
-  end
-  return changed
-end
-
----@param state table
----@param result table
----@return boolean ok
----@return boolean changed
-function M._review.apply_remote_review_result(state, result)
-  if not result.ok then return false, false end
-  local comment_count = type(result.comments) == "table" and #result.comments or 0
-  if result.review then
-    notify_debug(
-      ("Pending review %s found; importing %d comment%s"):format(
-        tostring(result.review.id or result.review.node_id or "?"),
-        comment_count,
-        comment_count == 1 and "" or "s"
-      ),
-      vim.log.levels.INFO,
-      { title = "DiffReview" }
-    )
-  else
-    notify_debug("No pending review found", vim.log.levels.INFO, { title = "DiffReview" })
-  end
-  local changed = false
-  if result.review then
-    state.review_remote = result.review
-    changed = true
-  elseif type(state.review_remote) == "table" and (state.review_remote.id or state.review_remote.node_id) then
-    state.review_remote = nil
-    changed = true
-  end
-  if M._review.merge_remote_comments(state, result.comments or {}) then changed = true end
-  return true, changed
-end
-
----@param buf integer
----@param cb fun(ok: boolean)
-function M._review.load_remote_before_open(buf, cb)
-  local state = M._review.state(buf)
-  if not (state and state.pr and state.pr.repo and state.pr.repo ~= "") then
-    notify_debug("PR review sync skipped: missing owner/repo", vim.log.levels.WARN, { title = "DiffReview" })
-    cb(true)
-    return
-  end
-  state.review_sync_request_id = (state.review_sync_request_id or 0) + 1
-  local request_id = state.review_sync_request_id
-  gh.pending_review_async(state.cwd, state.pr.number, state.pr.repo, function(result)
-    local latest = M._review.state(buf)
-    if not (latest and latest.review_sync_request_id == request_id and vim.api.nvim_buf_is_valid(buf)) then return end
-    local ok, changed = M._review.apply_remote_review_result(latest, result)
-    if not ok then
-      notify_error("PR review sync failed: " .. (result.message or "gh failed"), "DiffReview")
-      cb(false)
-      return
-    end
-    if changed then M._review.save_draft(latest) end
-    cb(true)
-  end)
-end
-
----@param state table
----@param cb fun(ok: boolean)
-function M._review.ensure_remote_review(state, cb)
-  local remote = state.review_remote or {}
-  if remote.id and remote.node_id and remote.node_id ~= "" then
-    cb(true)
-    return
-  end
-  gh.create_pending_review_async(state.cwd, state.pr.number, state.pr.repo, { commit_id = state.commit_id }, function(result)
-    if result.ok and result.review then
-      state.review_remote = result.review
-      M._review.save_draft(state)
-      cb(true)
-      return
-    end
-    notify_error("PR review sync failed: " .. (result.message or "could not create pending review"), "DiffReview")
-    cb(false)
-  end)
-end
-
----@param buf integer
-function M._review.process_sync_queue(buf)
-  local state = M._review.state(buf)
-  if not state then return end
-  state.review_sync = state.review_sync or { queue = {}, running = false, waiters = {} }
-  if state.review_sync.running then return end
-  local item = table.remove(state.review_sync.queue, 1)
-  if not item then
-    local waiters = state.review_sync.waiters or {}
-    state.review_sync.waiters = {}
-    for _, waiter in ipairs(waiters) do waiter(true) end
-    return
-  end
-  state.review_sync.running = true
-  local function finish(ok)
-    state.review_sync.running = false
-    if not ok then
-      if item.op == "upsert" and item.comment then
-        item.comment.syncing = nil
-        M._review.save_draft(state)
-        if vim.api.nvim_buf_is_valid(buf) then M._review.render_preserving_inline_cursor(buf) end
-      elseif item.op == "delete" and item.comment and item.comment.local_state == "deleted" then
-        item.comment.local_state = "clean"
-        M._review.save_draft(state)
-        if vim.api.nvim_buf_is_valid(buf) then M._review.render_preserving_inline_cursor(buf) end
-      end
-      local waiters = state.review_sync.waiters or {}
-      state.review_sync.waiters = {}
-      for _, waiter in ipairs(waiters) do waiter(false) end
-      return
-    end
-    M._review.process_sync_queue(buf)
-  end
-  M._review.ensure_remote_review(state, function(ok)
-    if not ok then finish(false) return end
-    local comment = item.comment
-    if item.op == "delete" then
-      if not comment.remote_node_id then
-        finish(true)
-        return
-      end
-      gh.delete_review_comment_async(state.cwd, comment.remote_node_id, function(result)
-        if not result.ok then
-          notify_error("PR review comment delete failed: " .. (result.message or "gh failed"), "DiffReview")
-          finish(false)
-          return
-        end
-        for index, existing in ipairs(state.review_comments or {}) do
-          if existing == comment then
-            table.remove(state.review_comments, index)
-            break
-          end
-        end
-        M._review.save_draft(state)
-        if vim.api.nvim_buf_is_valid(buf) then M._review.render(buf) end
-        finish(true)
-      end)
-      return
-    end
-    if comment.local_state == "deleted" then finish(true) return end
-    local queued_body = item.body or M._review.comment_body_for_sync(comment.body or "")
-    if comment.remote_node_id then
-      gh.update_review_comment_async(state.cwd, comment.remote_node_id, queued_body, function(result)
-        if not result.ok then
-          notify_error("PR review comment update failed: " .. (result.message or "gh failed"), "DiffReview")
-          finish(false)
-          return
-        end
-        local remote = result.comments and result.comments[1] or nil
-        if remote then
-          comment.user = remote.user or comment.user
-          comment.created_at = remote.created_at or comment.created_at
-          comment.updated_at = remote.updated_at or comment.updated_at
-        end
-        comment.syncing = nil
-        if M._review.comment_body_for_sync(comment.body or "") == queued_body then
-          comment.local_state = "clean"
-          comment.base_body = queued_body
-        else
-          comment.local_state = comment.remote_node_id and "dirty" or "new"
-        end
-        M._review.save_draft(state)
-        if vim.api.nvim_buf_is_valid(buf) then M._review.render_preserving_inline_cursor(buf) end
-        finish(true)
-      end)
-      return
-    end
-    if not comment.position then
-      notify_error("PR review comment sync failed: missing diff position for " .. tostring(comment.path or ""), "DiffReview")
-      finish(false)
-      return
-    end
-    gh.add_pending_review_comment_async(state.cwd, state.review_remote.node_id, {
-      body = queued_body,
-      path = comment.path,
-      position = comment.position,
-      commit_id = state.commit_id,
-    }, function(result)
-      if not result.ok then
-        notify_error("PR review comment create failed: " .. (result.message or "gh failed"), "DiffReview")
-        finish(false)
-        return
-      end
-      local remote = result.comments and result.comments[1] or nil
-      if remote then
-        comment.remote_id = remote.remote_id
-        comment.remote_node_id = remote.remote_node_id
-        comment.remote_review_id = state.review_remote.id
-        comment.line = remote.line or comment.line
-        comment.position = remote.position or comment.position
-        comment.user = remote.user or comment.user
-        comment.created_at = remote.created_at or comment.created_at
-        comment.updated_at = remote.updated_at or comment.updated_at
-      end
-      comment.syncing = nil
-      if M._review.comment_body_for_sync(comment.body or "") == queued_body then
-        comment.local_state = "clean"
-        comment.base_body = queued_body
-      else
-        comment.local_state = "dirty"
-      end
-      M._review.save_draft(state)
-      if vim.api.nvim_buf_is_valid(buf) then M._review.render_preserving_inline_cursor(buf) end
-      finish(true)
-    end)
-  end)
-end
-
----@param buf integer
----@param op "upsert"|"delete"
----@param comment table
-function M._review.enqueue_sync(buf, op, comment)
-  local state = M._review.state(buf)
-  if not state then return end
-  state.review_sync = state.review_sync or { queue = {}, running = false, waiters = {} }
-  local sync_body = op == "upsert" and M._review.comment_body_for_sync(comment.body or "") or nil
-  if op == "upsert" then
-    for _, queued in ipairs(state.review_sync.queue) do
-      if queued.op == "upsert" and queued.comment == comment then
-        queued.body = sync_body
-        return
-      end
-    end
-  end
-  state.review_sync.queue[#state.review_sync.queue + 1] = { op = op, comment = comment, body = sync_body }
-  M._review.process_sync_queue(buf)
-end
-
----@param comment table
----@return boolean
-function M._review.comment_needs_sync(comment)
-  if not comment or comment.syncing then return false end
-  if comment.local_state == "deleted" then return comment.remote_node_id ~= nil end
-  if not comment.remote_node_id and M._review.comment_body_for_sync(comment.body or "") == "" then return false end
-  if comment.local_state == "new" or comment.local_state == "dirty" then return true end
-  return not comment.remote_node_id
-end
-
----@param comment table
----@return boolean
-function M._review.comment_has_dirty_marker(comment)
-  if not comment or comment.syncing or comment.local_state == "deleted" then return false end
-  return M._review.comment_needs_sync(comment)
-end
-
----@param buf integer
----@return integer count
-function M._review.enqueue_dirty_comments(buf)
-  local state = M._review.state(buf)
-  if not state then return 0 end
-  local items = {}
-  local render_marker_change = false
-  for _, comment in ipairs(state.review_comments or {}) do
-    if M._review.comment_needs_sync(comment) then
-      if comment.local_state == "deleted" then
-        items[#items + 1] = { op = "delete", comment = comment }
-      else
-        comment.syncing = true
-        render_marker_change = true
-        items[#items + 1] = { op = "upsert", comment = comment }
-      end
-    end
-  end
-  if #items == 0 then return 0 end
-  if render_marker_change then M._review.render_preserving_inline_cursor(buf) end
-  for _, item in ipairs(items) do
-    M._review.enqueue_sync(buf, item.op, item.comment)
-  end
-  return #items
-end
-
----@param buf integer
----@param cb fun(ok: boolean)
-function M._review.flush_sync(buf, cb)
-  local state = M._review.state(buf)
-  if not state then cb(false) return end
-  M._review.enqueue_dirty_comments(buf)
-  state.review_sync = state.review_sync or { queue = {}, running = false, waiters = {} }
-  if not state.review_sync.running and #state.review_sync.queue == 0 then
-    cb(true)
-    return
-  end
-  state.review_sync.waiters[#state.review_sync.waiters + 1] = cb
-end
-
----@param buf integer
-function M._review.sync_remote(buf)
-  local state = M._review.state(buf)
-  if not (state and state.pr and state.pr.repo and state.pr.repo ~= "") then return end
-  state.review_sync_request_id = (state.review_sync_request_id or 0) + 1
-  local request_id = state.review_sync_request_id
-  gh.pending_review_async(state.cwd, state.pr.number, state.pr.repo, function(result)
-    local latest = M._review.state(buf)
-    if not (latest and latest.review_sync_request_id == request_id and vim.api.nvim_buf_is_valid(buf)) then return end
-    if not result.ok then
-      notify_error("PR review sync failed: " .. (result.message or "gh failed"), "DiffReview")
-      return
-    end
-    local _, changed = M._review.apply_remote_review_result(latest, result)
-    if changed then
-      M._review.save_draft(latest)
-      M._review.render(buf)
-    end
-  end)
-end
-
-function M._review.leave_visual()
-  local mode = vim.fn.mode()
-  if mode == "v" or mode == "V" or mode:byte() == 22 then
-    vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "nx", false)
-  end
-end
-
----@param dl table diff_line meta
----@return "LEFT"|"RIGHT"
-function M._review.side_of(dl)
-  return dl.side == "left" and "LEFT" or "RIGHT"
-end
-
----@param path? string
----@param side? string
----@param line? integer|string
----@param end_line? integer|string
----@return string?
-function M._review.github_diff_fragment(path, side, line, end_line)
-  local line_number = tonumber(line)
-  if not (path and path ~= "" and line_number) then return nil end
-  local normalized_path = tostring(path):gsub("\\", "/")
-  local side_prefix = side == "LEFT" and "L" or "R"
-  local start_number = math.floor(line_number)
-  local stop_number = tonumber(end_line)
-  if stop_number then
-    local finish_number = math.floor(stop_number)
-    if finish_number ~= start_number then
-      if finish_number < start_number then start_number, finish_number = finish_number, start_number end
-      return ("diff-%s%s%d-%s%d"):format(vim.fn.sha256(normalized_path), side_prefix, start_number, side_prefix, finish_number)
-    end
-  end
-  return ("diff-%s%s%d"):format(vim.fn.sha256(normalized_path), side_prefix, start_number)
-end
-
----@param state table
----@return string?
-function M._review.visual_browse_fragment(state)
-  local mode = vim.fn.mode()
-  if not (mode == "v" or mode == "V" or mode:byte() == 22) then return nil end
-
-  local start_row, end_row = vim.fn.line("v"), vim.fn.line(".")
-  if start_row > end_row then start_row, end_row = end_row, start_row end
-
-  local first, last
-  for row = start_row, end_row do
-    local entry = state.entries and state.entries[row] or nil
-    local diff_line = entry and entry.diff_line or nil
-    if diff_line then
-      first = first or diff_line
-      last = diff_line
-    end
-  end
-  if not (first and last and first.file == last.file and first.side == last.side) then return nil end
-
-  local path = repo_relative(first.file, state.cwd) or first.file
-  return M._review.github_diff_fragment(path, M._review.side_of(first), first.line, last.line)
-end
-
----@param buf integer
----@return string?
-function M._review.browse_fragment_under_cursor(buf)
-  local state = M._review.state(buf)
-  if not state then return nil end
-  local visual_fragment = M._review.visual_browse_fragment(state)
-  if visual_fragment then return visual_fragment end
-
-  local row = vim.api.nvim_win_get_cursor(0)[1]
-  local entry = state.entries and state.entries[row] or nil
-
-  local function comment_fragment(comment)
-    if not comment then return nil end
-    local remote_id = tonumber(comment.remote_id)
-    if remote_id then return ("r%d"):format(math.floor(remote_id)) end
-    return M._review.github_diff_fragment(comment.path, comment.side, comment.line)
-  end
-
-  local body_comment = M._review.comment_body_at_row(buf, row)
-  if body_comment then return comment_fragment(body_comment) end
-
-  if not entry then return nil end
-
-  if entry.kind == "review_comment" and entry.review_reply then
-    return comment_fragment(entry.review_reply)
-  end
-
-  if entry.kind == "review_comment" and entry.review_comment then
-    return comment_fragment(entry.review_comment)
-  end
-
-  local diff_line = entry.diff_line
-  if diff_line then
-    local path = repo_relative(diff_line.file, state.cwd) or diff_line.file
-    return M._review.github_diff_fragment(path, M._review.side_of(diff_line), diff_line.line)
-  end
-
-  return nil
-end
-
----@param state table
----@return DiffReviewStatusHeadLine[]
-function M._review.head_lines(state)
-  local pr = state.pr
-  local title = pr.title ~= "" and pr.title or ("PR #" .. tostring(pr.number))
-  local lines = {
-    { segments = { { "Title: ", "DiffReviewStatusLabel" }, { title, "DiffReviewStatusPath" } } },
-    { segments = { { "Review Comment:", "DiffReviewReviewCommentHeader" } } },
-  }
-  local comment_lines = vim.split(state.review_comment_text or "", "\n", { plain = true })
-  if #comment_lines == 0 then comment_lines = { "" } end
-  for _, line in ipairs(comment_lines) do
-    lines[#lines + 1] = { segments = { { line, "DiffReviewReviewComment" } } }
-  end
-  return lines
-end
-
----@param diff string?
----@return string
-function M._review.normalized_hunk_diff(diff)
-  local body = {}
-  local in_hunk = false
-  for line in tostring(diff or ""):gmatch("[^\n]+") do
-    if line:match("^@@") then
-      local context = line:match("^@@.-@@%s*(.*)$") or ""
-      body[#body + 1] = "@@ " .. context
-      in_hunk = true
-    elseif in_hunk and line:match("^[ +%-]") then
-      body[#body + 1] = line
-    end
-  end
-  if #body == 0 then return tostring(diff or "") end
-  return table.concat(body, "\n")
-end
-
----@param state table
----@param file DiffReviewStatusFile
----@param hunk DiffReviewHunk
----@return string
-function M._review.hunk_view_key(state, file, hunk)
-  local relpath = file.relpath or hunk.file or repo_relative(file.filename, state.cwd) or file.filename
-  return "hunk:" .. vim.fn.sha256(relpath .. "\n" .. M._review.normalized_hunk_diff(hunk.diff))
-end
-
----@param file DiffReviewStatusFile
----@param hunks DiffReviewHunk[]
----@param section_name string
----@return DiffReviewStatusFile
-function M._review.file_with_hunks(file, hunks, section_name)
-  return M._section_builder.file_with_hunks(file, hunks, section_name)
-end
-
----@param state table
----@param file DiffReviewStatusFile
----@param hunk DiffReviewHunk
----@param key string
----@return boolean
-function M._review.hunk_is_viewed(state, file, hunk, key)
-  state.review_viewed_hunks = state.review_viewed_hunks or {}
-  if state.review_viewed_hunks[key] ~= nil then return true end
-  local relpath = file.relpath or hunk.file or repo_relative(file.filename, state.cwd) or file.filename
-  if state.review_viewed[relpath] and state.review_draft_commit_id == state.commit_id then
-    state.review_viewed_hunks[key] = {
-      file = relpath,
-      commit_id = state.commit_id,
-    }
-    state.review_viewed_dirty = true
-    return true
-  end
-  return false
-end
-
----@param state table
----@param active_keys table<string, boolean>
-function M._review.prune_viewed_hunks(state, active_keys)
-  state.review_viewed_hunks = state.review_viewed_hunks or {}
-  for key in pairs(state.review_viewed_hunks) do
-    if not active_keys[key] then
-      state.review_viewed_hunks[key] = nil
-      state.review_viewed_dirty = true
-    end
-  end
-end
-
----@param state table
----@return DiffReviewStatusSection[]
-function M._review.sections(state)
-  local files = M._section_builder.files_from_diff(state.cwd, {
-    section_name = "review",
-    default_status = "",
-    files = state.pr.files,
-  }, state.diff_text or "")
-  local unviewed, viewed = {}, {}
-  local active_keys = {}
-  for _, file in ipairs(files) do
-    local file_viewed_hunks = {}
-    local file_unviewed_hunks = {}
-    local hunks = file.hunks or {}
-    if #hunks == 0 then
-      if state.review_viewed[file.relpath] then
-        viewed[#viewed + 1] = file
-      else
-        unviewed[#unviewed + 1] = file
-      end
-    else
-      for _, hunk in ipairs(hunks) do
-        local key = M._review.hunk_view_key(state, file, hunk)
-        active_keys[key] = true
-        if M._review.hunk_is_viewed(state, file, hunk, key) then
-          file_viewed_hunks[#file_viewed_hunks + 1] = hunk
-        else
-          file_unviewed_hunks[#file_unviewed_hunks + 1] = hunk
-        end
-      end
-      if #file_unviewed_hunks > 0 then
-        unviewed[#unviewed + 1] = M._review.file_with_hunks(file, file_unviewed_hunks, "review:unviewed")
-      end
-      if #file_viewed_hunks > 0 then
-        viewed[#viewed + 1] = M._review.file_with_hunks(file, file_viewed_hunks, "review:viewed")
-      end
-    end
-  end
-  if state.diff_text and state.diff_text ~= "" then
-    M._review.prune_viewed_hunks(state, active_keys)
-  end
-  return {
-    M._section_builder.section_from_files("Unviewed Changes", unviewed, {
-      name = "review:unviewed",
-      keep_empty = true,
-      file_key_prefix = "review:unviewed",
-      file_entry_kind = "pr_review_file",
-      hunk_entry_kind = "pr_review_hunk",
-    }),
-    M._section_builder.section_from_files("Viewed Changes", viewed, {
-      name = "review:viewed",
-      keep_empty = true,
-      file_key_prefix = "review:viewed",
-      file_entry_kind = "pr_review_file",
-      hunk_entry_kind = "pr_review_hunk",
-    }),
-  }
-end
-
---- Files fold by default; a review wants every diff open so the reviewer can
---- read and comment. Expand each file once (user <Tab> toggles then persist).
----@param state table
-function M._review.ensure_expanded(state)
-  if state.review_expanded or not state.diff_text or state.diff_text == "" then return end
-  state.review_expanded = true
-  local files = M._section_builder.files_from_diff(state.cwd, {
-    section_name = "review",
-    default_status = "",
-    files = state.pr.files,
-  }, state.diff_text)
-  for _, file in ipairs(files) do
-    for _, prefix in ipairs({ "review:unviewed", "review:viewed" }) do
-      set_status_folded(status_provider_file_key(prefix, file.filename), false)
-    end
-  end
-end
-
----@param buf integer
-function M._review.render(buf)
-  local state = M._review.state(buf)
-  if not state then return end
-  M._status = state
-  M._review.ensure_expanded(state)
-  state.head_lines = M._review.head_lines(state)
-  state.sections = M._review.sections(state)
-  if state.review_viewed_dirty then
-    state.review_viewed_dirty = nil
-    M._review.save_draft(state)
-  end
-  state.fancy_rows = {}
-  state.review_rendered_comment_count = 0
-  state.review_comment_anchor_index = M._section_builder.comment_anchor_index(state.review_comments)
-  -- status_add_fancy_row consults this hook to interleave comment lines.
-  state.review_after_row = function(diff_line, indent)
-    M._review.emit_comments_for(state, diff_line, indent)
-  end
-  state.review_rendering = true
-  status_render_loaded(buf, nil, nil, { reuse_sections = true }, state.head_lines, state.sections)
-  state.review_rendering = nil
-  local total_comments = 0
-  for _, comment in ipairs(state.review_comments or {}) do
-    if comment.local_state ~= "deleted" then total_comments = total_comments + 1 end
-  end
-  notify_debug(
-    ("Rendered %d/%d review comment%s"):format(
-      state.review_rendered_comment_count or 0,
-      total_comments,
-      total_comments == 1 and "" or "s"
-    ),
-    vim.log.levels.INFO,
-    { title = "DiffReview" }
-  )
-end
-
----@param buf integer
-function M._review.render_preserving_inline_cursor(buf)
-  local comment
-  local snapshot
-  if buf and vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_get_current_buf() == buf then
-    local cursor = vim.api.nvim_win_get_cursor(0)
-    comment = M._review.comment_body_at_row(buf, cursor[1])
-    if comment then snapshot = M._review.inline_comment_cursor_snapshot(buf, comment) end
-  end
-  M._review.render(buf)
-  if comment and snapshot and comment.local_state ~= "deleted" then
-    M._review.restore_inline_comment_cursor(buf, comment, snapshot)
-  end
-end
-
----@param value any
----@return string
-function M._review.format_comment_datetime(value)
-  local relative = M._datetime.relative(value)
-  if relative ~= "" then return relative end
-  return "just now"
-end
-
----@param text string
----@param width integer
----@return string
-function M._review.truncate_display(text, width)
-  if width <= 0 then return "" end
-  if vim.fn.strdisplaywidth(text) <= width then return text end
-  local output = ""
-  local output_width = 0
-  local char_count = vim.fn.strchars(text)
-  for char_index = 0, char_count - 1 do
-    local char = vim.fn.strcharpart(text, char_index, 1)
-    local char_width = vim.fn.strdisplaywidth(char)
-    if output_width + char_width > width then break end
-    output = output .. char
-    output_width = output_width + char_width
-  end
-  return output
-end
-
----@param comment table
----@return string left_text
----@return string right_text
-function M._review.comment_header_text(comment)
-  local user = tostring(comment.user or "you")
-  local marker = M._review.comment_has_dirty_marker(comment) and "*" or ""
-  local left_text = ("%s %s "):format(
-    M._review.comment_icon,
-    M._datetime.action_phrase(marker .. user, "commented", comment.updated_at or comment.created_at)
-  )
-  local right_text = ""
-  if not comment.pr_issue_comment then
-    local line_number = tonumber(comment.line)
-    right_text = line_number and (" L%d"):format(line_number) or " L?"
-  end
-  return left_text, right_text
-end
-
----@param reply table
----@return string left_text
----@return string right_text
-function M._review.reply_header_text(reply)
-  local user = tostring(reply.user or "unknown")
-  return ("%s %s "):format(
-    M._review.reply_icon,
-    M._datetime.action_phrase(user, "replied", reply.updated_at or reply.created_at)
-  ), ""
-end
-
----@param win integer?
----@param buf integer?
----@return integer
-function M._review.comment_rule_width(win, buf)
-  local width = tonumber(vim.o.columns) or 80
-  if win and win > 0 and vim.api.nvim_win_is_valid(win) then
-    width = vim.api.nvim_win_get_width(win)
-    local wininfo = vim.fn.getwininfo(win)[1]
-    local textoff = tonumber(wininfo and wininfo.textoff) or 0
-    width = width - textoff
-  else
-    local status = M._status
-    buf = buf or (status and status.buf) or nil
-    if buf and vim.api.nvim_buf_is_valid(buf) then
-      local displayed_win = vim.fn.bufwinid(buf)
-      if displayed_win and displayed_win > 0 and vim.api.nvim_win_is_valid(displayed_win) then
-        width = vim.api.nvim_win_get_width(displayed_win)
-        local wininfo = vim.fn.getwininfo(displayed_win)[1]
-        local textoff = tonumber(wininfo and wininfo.textoff) or 0
-        width = width - textoff
-      end
-    end
-  end
-  return math.max(40, width - 1)
-end
-
----@param left_text string
----@param right_text string
----@param win integer?
----@param buf integer?
----@return string
-function M._review.comment_rule_line(left_text, right_text, win, buf)
-  local width = M._review.comment_rule_width(win, buf)
-  left_text = tostring(left_text or "")
-  right_text = tostring(right_text or "")
-  local fixed_width = vim.fn.strdisplaywidth(left_text .. right_text)
-  if fixed_width > width then
-    local available_left_width = math.max(0, width - vim.fn.strdisplaywidth(right_text))
-    left_text = M._review.truncate_display(left_text, available_left_width)
-    fixed_width = vim.fn.strdisplaywidth(left_text .. right_text)
-  end
-  if fixed_width > width then
-    right_text = M._review.truncate_display(right_text, math.max(0, width - vim.fn.strdisplaywidth(left_text)))
-    fixed_width = vim.fn.strdisplaywidth(left_text .. right_text)
-  end
-  return left_text .. ("-"):rep(math.max(width - fixed_width, 0)) .. right_text
-end
-
----@param comment table
----@param win integer?
----@param buf integer?
----@return string
-function M._review.comment_header_line(comment, win, buf)
-  local left_text, right_text = M._review.comment_header_text(comment)
-  return M._review.comment_rule_line(left_text, right_text, win, buf)
-end
-
----@param reply table
----@param win integer?
----@param buf integer?
----@return string
-function M._review.reply_header_line(reply, win, buf)
-  local left_text, right_text = M._review.reply_header_text(reply)
-  return M._review.comment_rule_line(left_text, right_text, win, buf)
-end
-
----@param win integer?
----@param buf integer?
----@return string
-function M._review.comment_footer_line(win, buf)
-  local width = M._review.comment_rule_width(win, buf)
-  return ("-"):rep(width)
-end
-
----@param body string
----@return string
-function M._review.comment_preview_text(body)
-  return M._comment_rows.preview_text(body)
-end
-
----@param text string
----@param width integer
----@return string
-function M._review.truncate_preview_text(text, width)
-  text = tostring(text or "")
-  if width <= 0 then return "" end
-  if vim.fn.strdisplaywidth(text) <= width then return text end
-  if width <= 4 then return M._review.truncate_display(text, width) end
-  return M._review.truncate_display(text, width - 4) .. " ..."
-end
-
----@param comment table
----@param win integer?
----@param buf integer?
----@return string
-function M._review.comment_folded_line(comment, win, buf)
-  local user = tostring(comment.user or "you")
-  local marker = M._review.comment_has_dirty_marker(comment) and "*" or ""
-  local left_text = ("%s %s | "):format(
-    M._review.comment_icon,
-    M._datetime.action_phrase(marker .. user, "commented", comment.updated_at or comment.created_at)
-  )
-  local width = M._review.comment_rule_width(win, buf)
-  local preview_width = math.max(0, width - vim.fn.strdisplaywidth(left_text))
-  local preview = M._review.truncate_preview_text(M._review.comment_preview_text(comment.body or ""), preview_width)
-  return M._review.truncate_display(left_text .. preview, width)
-end
-
----@param line_number integer
----@param text string
-function M._review.add_comment_rule_date_highlights(line_number, text)
-  for _, range in ipairs(M._datetime.date_highlight_ranges(text)) do
-    status_add_highlight(line_number, range.start_col, range.end_col, "DiffReviewStatusDate")
-  end
-end
-
----@param buf integer
----@param row0 integer
----@param text string
-function M._review.set_comment_rule_date_extmarks(buf, row0, text)
-  for _, range in ipairs(M._datetime.date_highlight_ranges(text)) do
-    pcall(vim.api.nvim_buf_set_extmark, buf, M._status_ns, row0, range.start_col, {
-      end_col = range.end_col,
-      hl_group = "DiffReviewStatusDate",
-      priority = 95,
-    })
-  end
-end
-
----@param body string
----@return string[]
-function M._review.comment_body_lines(body)
-  local lines = vim.split(M._review.normalize_comment_body_text(body), "\n", { plain = true })
-  if #lines == 0 then lines = { "" } end
-  return lines
-end
-
----@param comment table
----@param comment_index integer
----@param reply table
----@param reply_index integer
-function M._review.emit_comment_reply(comment, comment_index, reply, reply_index)
-  local header_entry = {
-    kind = "review_comment",
-    review_comment = comment,
-    comment_index = comment_index,
-    review_reply = reply,
-    review_reply_index = reply_index,
-    review_boundary = "reply_header",
-  }
-  local header = M._review.reply_header_line(reply)
-  local header_line = status_add_line(header, header_entry, "DiffReviewReviewCommentHeader")
-  status_add_highlight(header_line, 0, #header, "DiffReviewReviewCommentHeader")
-  M._review.add_comment_rule_date_highlights(header_line, header)
-
-  for body_index, line in ipairs(M._review.comment_body_lines(reply.body or "")) do
-    local body_entry = {
-      kind = "review_comment",
-      review_comment = comment,
-      comment_index = comment_index,
-      review_reply = reply,
-      review_reply_index = reply_index,
-      review_reply_body = true,
-      review_reply_body_index = body_index,
-    }
-    local body_line = status_add_line(line, body_entry)
-    if line ~= "" then status_add_highlight(body_line, 0, #line, "DiffReviewReviewComment") end
-  end
-end
-
----Emit a draft comment as plain, navigable buffer lines below its anchor diff
----row. Header/footer are read-only rule rows; body rows are full-width editable
----buffer lines with no prefixes, virtual borders, or render wrapping.
----@param comment table
----@param index integer comment number (1-based)
----@param indent integer unused; retained for the review_after_row hook shape
-function M._review.emit_comment(comment, index, indent)
-  if comment.review_folded then
-    local folded_entry = {
-      kind = "review_comment",
-      review_comment = comment,
-      comment_index = index,
-      review_first = true,
-      review_boundary = "folded",
-    }
-    local folded = M._review.comment_folded_line(comment)
-    local folded_line = status_add_line(folded, folded_entry, "DiffReviewReviewCommentHeader")
-    status_add_highlight(folded_line, 0, #folded, "DiffReviewReviewCommentHeader")
-    M._review.add_comment_rule_date_highlights(folded_line, folded)
-    return
-  end
-
-  local body_lines = M._review.comment_body_lines(comment.body or "")
-  comment.review_rendered_body_text = table.concat(body_lines, "\n")
-
-  local header_entry = {
-    kind = "review_comment",
-    review_comment = comment,
-    comment_index = index,
-    review_first = true,
-    review_boundary = "header",
-  }
-  local header = M._review.comment_header_line(comment)
-  local header_line = status_add_line(header, header_entry, "DiffReviewReviewCommentHeader")
-  status_add_highlight(header_line, 0, #header, "DiffReviewReviewCommentHeader")
-  M._review.add_comment_rule_date_highlights(header_line, header)
-
-  for body_index, line in ipairs(body_lines) do
-    local body_entry = {
-      kind = "review_comment",
-      review_comment = comment,
-      comment_index = index,
-      review_body = true,
-      review_body_index = body_index,
-    }
-    local body_line = status_add_line(line, body_entry)
-    if line ~= "" then status_add_highlight(body_line, 0, #line, "DiffReviewReviewComment") end
-  end
-
-  for reply_index, reply in ipairs(type(comment.replies) == "table" and comment.replies or {}) do
-    if type(reply) == "table" then M._review.emit_comment_reply(comment, index, reply, reply_index) end
-  end
-
-  local footer_entry = {
-    kind = "review_comment",
-    review_comment = comment,
-    comment_index = index,
-    review_boundary = "footer",
-  }
-  local footer = M._review.comment_footer_line()
-  local footer_line = status_add_line(footer, footer_entry, "DiffReviewReviewCommentHeader")
-  status_add_highlight(footer_line, 0, #footer, "DiffReviewReviewCommentHeader")
-end
-
----Renderer hook: emit any draft comments anchored on `diff_line`.
----@param state table
----@param diff_line table
----@param indent integer
-function M._review.emit_comments_for(state, diff_line, indent)
-  M._section_builder.emit_anchored_comments(state, diff_line, indent, {
-    index_field = "review_comment_anchor_index",
-    count_field = "review_rendered_comment_count",
-    skip = function(comment) return comment == state.review_editing_comment end,
-  })
-end
-
----@param buf integer
----@param row integer
----@return table? comment
----@return integer? index
-function M._review.comment_at_row(buf, row)
-  local state = M._review.state(buf)
-  if not state then return nil end
-  local entry = state.entries and state.entries[row] or nil
-  if entry and entry.kind == "review_comment" then
-    return entry.review_comment, entry.comment_index
-  end
-  if entry and entry.kind == "pr_comment" and entry.pr_comment then
-    for index, comment in ipairs(state.review_comments or {}) do
-      if M._review.same_comment(comment, entry.pr_comment) then return comment, index end
-    end
-    return nil
-  end
-  local body_comment = M._review.comment_body_at_row(buf, row)
-  if body_comment then
-    for index, comment in ipairs(state.review_comments or {}) do
-      if M._review.same_comment(comment, body_comment) then return comment, index end
-    end
-  end
-  return nil
-end
-
----@param buf integer
----@return table? comment
----@return integer? index
-function M._review.comment_under_cursor(buf)
-  local state = M._review.state(buf)
-  if not state then return nil end
-  M._status = state
-  local cursor_row = vim.api.nvim_win_get_cursor(0)[1]
-  for _, row in ipairs({ cursor_row, cursor_row - 1, cursor_row + 1 }) do
-    local comment, index = M._review.comment_at_row(buf, row)
-    if comment then return comment, index end
-  end
-  return nil
-end
-
----@param buf integer
----@return table? comment
----@return integer? index
-function M._review.comment_at_cursor(buf)
-  if not (buf and vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_get_current_buf() == buf) then return nil end
-  local row = vim.api.nvim_win_get_cursor(0)[1]
-  return M._review.comment_at_row(buf, row)
-end
-
----@param buf integer
----@return boolean toggled
-function M._review.toggle_comment_fold(buf)
-  local state = M._review.state(buf)
-  if not state then return false end
-  M._status = state
-  M._review.sync_inline_comment_text(buf)
-  if state.view_kind == "pr" then
-    local row = vim.api.nvim_win_get_cursor(0)[1]
-    local entry = state.entries and state.entries[row] or nil
-    if entry and entry.kind == "pr_comment" and entry.id and entry.pr_comment then
-      set_status_folded(entry.id, not status_folded(entry.id, true))
-      render_pr_status(state.pr, state.cwd, buf, state.pr_diff_text)
-      return true
-    end
-  end
-  local comment = M._review.comment_at_cursor(buf)
-  if not comment then return false end
-  comment.review_folded = not comment.review_folded
-  if state.view_kind == "pr" then
-    render_pr_status(state.pr, state.cwd, buf, state.pr_diff_text)
-  else
-    M._review.save_draft(state)
-    M._review.render(buf)
-  end
-  local header_row0 = M._review.comment_header_row0(buf, comment)
-  if header_row0 ~= nil and vim.api.nvim_get_current_buf() == buf then
-    pcall(vim.api.nvim_win_set_cursor, 0, { header_row0 + 1, 0 })
-    M._review.sync_modifiable(buf)
-  end
-  return true
-end
-
----Re-anchor editable review regions after a render wipes the buffer. Inline
----comment body rows are emitted during the render and tracked with extmarks.
----@param buf integer
-function M._review.on_render(buf)
-  local state = M._review.state(buf)
-  if not state then return end
-  vim.api.nvim_buf_clear_namespace(buf, M._review.ns, 0, -1)
-  state.review_comment_start, state.review_comment_end = nil, nil
-  for _, comment in ipairs(state.review_comments or {}) do
-    comment.review_header_mark = nil
-    comment.review_body_start, comment.review_body_end = nil, nil
-    comment.review_footer_mark = nil
-    comment.review_reply_header_marks = nil
-    comment.review_body_line_marks = nil
-    comment.review_body_render_rows = nil
-    comment.review_body_render_row_count = nil
-    comment.review_markdown_ranges = nil
-  end
-
-  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-  local label_row
-  for index, line in ipairs(lines) do
-    if line == "Review Comment:" then
-      label_row = index
-      break
-    end
-  end
-  if label_row then
-    local count = #vim.split(state.review_comment_text or "", "\n", { plain = true })
-    if count == 0 then count = 1 end
-    -- Start mark: left gravity so retyping the first line keeps the mark on it.
-    -- End mark: right gravity so it stays past the region and follows the
-    -- region as it grows/shrinks (a left-gravity end mark at the boundary gets
-    -- pulled into an edit of the adjacent line).
-    state.review_comment_start = vim.api.nvim_buf_set_extmark(buf, M._review.ns, label_row, 0, { right_gravity = false })
-    state.review_comment_end = vim.api.nvim_buf_set_extmark(buf, M._review.ns, label_row + count, 0, { right_gravity = true })
-  end
-
-  local range_comment, range_start
-  local function close_comment_range(end_row)
-    if range_comment and range_start and end_row >= range_start then
-      range_comment.review_body_start = vim.api.nvim_buf_set_extmark(buf, M._review.ns, range_start - 1, 0, { right_gravity = false })
-      range_comment.review_body_end = vim.api.nvim_buf_set_extmark(buf, M._review.ns, end_row, 0, { right_gravity = true })
-    end
-    range_comment, range_start = nil, nil
-  end
-  local markdown_range_comment, markdown_range_start
-  local function close_markdown_range(end_row)
-    if markdown_range_comment and markdown_range_start and end_row >= markdown_range_start then
-      markdown_range_comment.review_markdown_ranges = markdown_range_comment.review_markdown_ranges or {}
-      markdown_range_comment.review_markdown_ranges[#markdown_range_comment.review_markdown_ranges + 1] = {
-        start_mark = vim.api.nvim_buf_set_extmark(buf, M._review.ns, markdown_range_start - 1, 0, { right_gravity = false }),
-        end_mark = vim.api.nvim_buf_set_extmark(buf, M._review.ns, end_row, 0, { right_gravity = true }),
-      }
-    end
-    markdown_range_comment, markdown_range_start = nil, nil
-  end
-
-  for row = 1, #lines do
-    local entry = state.entries and state.entries[row] or nil
-    if entry
-      and entry.kind == "pr_comment"
-      and entry.pr_comment
-      and not entry.pr_comment_body then
-      close_comment_range(row - 1)
-      close_markdown_range(row - 1)
-      entry.pr_comment.review_header_mark = vim.api.nvim_buf_set_extmark(buf, M._review.ns, row - 1, 0, { right_gravity = false })
-    elseif entry
-      and entry.kind == "review_comment"
-      and (entry.review_boundary == "header" or entry.review_boundary == "folded")
-      and entry.review_comment then
-      close_comment_range(row - 1)
-      close_markdown_range(row - 1)
-      entry.review_comment.review_header_mark = vim.api.nvim_buf_set_extmark(buf, M._review.ns, row - 1, 0, { right_gravity = false })
-    elseif entry
-      and entry.kind == "review_comment"
-      and entry.review_boundary == "reply_header"
-      and entry.review_comment then
-      close_comment_range(row - 1)
-      close_markdown_range(row - 1)
-      local comment = entry.review_comment
-      comment.review_reply_header_marks = comment.review_reply_header_marks or {}
-      if entry.review_reply_index then
-        comment.review_reply_header_marks[entry.review_reply_index] = vim.api.nvim_buf_set_extmark(buf, M._review.ns, row - 1, 0, { right_gravity = false })
-      end
-    elseif entry and entry.kind == "review_comment" and entry.review_boundary == "footer" and entry.review_comment then
-      close_comment_range(row - 1)
-      close_markdown_range(row - 1)
-      entry.review_comment.review_footer_mark = vim.api.nvim_buf_set_extmark(buf, M._review.ns, row - 1, 0, { right_gravity = true })
-    elseif entry and ((entry.review_body and entry.review_comment) or (entry.pr_comment_body and entry.pr_comment)) then
-      close_markdown_range(row - 1)
-      local comment = entry.review_comment or entry.pr_comment
-      local body_index = entry.review_body_index or entry.pr_comment_body_index
-      comment.review_body_line_marks = comment.review_body_line_marks or {}
-      local mark_id = vim.api.nvim_buf_set_extmark(buf, M._review.ns, row - 1, 0, { right_gravity = false })
-      comment.review_body_line_marks[#comment.review_body_line_marks + 1] = { id = mark_id, line_index = body_index }
-      if comment ~= range_comment then
-        close_comment_range(row - 1)
-        range_comment, range_start = comment, row
-      end
-    elseif entry and entry.kind == "review_comment" and entry.review_reply_body and entry.review_comment then
-      close_comment_range(row - 1)
-      if entry.review_comment ~= markdown_range_comment then
-        close_markdown_range(row - 1)
-        markdown_range_comment, markdown_range_start = entry.review_comment, row
-      end
-    else
-      close_comment_range(row - 1)
-      close_markdown_range(row - 1)
-    end
-  end
-  close_comment_range(#lines)
-  close_markdown_range(#lines)
-  state.review_comment_rule_width = M._review.comment_rule_width(nil, buf)
-  if state.view_kind == "review" then M._review.sync_modifiable(buf) end
-end
-
----@param buf integer
----@param id integer?
----@return integer? row0
-function M._review.mark_row(buf, id)
-  if not id then return nil end
-  local pos = vim.api.nvim_buf_get_extmark_by_id(buf, M._review.ns, id, {})
-  return pos and pos[1] or nil
-end
-
----@param left table?
----@param right table?
----@return boolean
-function M._review.same_comment(left, right)
-  if not (left and right) then return false end
-  if left == right then return true end
-  if left.local_id and right.local_id and left.local_id == right.local_id then return true end
-  if left.remote_node_id and right.remote_node_id and left.remote_node_id == right.remote_node_id then return true end
-  if left.remote_id and right.remote_id and tonumber(left.remote_id) == tonumber(right.remote_id) then return true end
-  return false
-end
-
----@param buf integer
----@param comment table
----@return integer? row0
-function M._review.comment_header_row0(buf, comment)
-  local mark_row = M._review.mark_row(buf, comment.review_header_mark)
-  if mark_row ~= nil then return mark_row end
-  local state = M._review.state(buf)
-  for row, entry in pairs((state and state.entries) or {}) do
-    if entry.kind == "review_comment"
-      and (entry.review_boundary == "header" or entry.review_boundary == "folded")
-      and M._review.same_comment(entry.review_comment, comment) then
-      return row - 1
-    elseif entry.kind == "pr_comment"
-      and entry.pr_comment
-      and not entry.pr_comment_body
-      and M._review.same_comment(entry.pr_comment, comment) then
-      return row - 1
-    end
-  end
-  return nil
-end
-
----@param buf integer
----@param comment table
----@return integer? row0
-function M._review.comment_footer_row0(buf, comment)
-  local mark_row = M._review.mark_row(buf, comment.review_footer_mark)
-  if mark_row ~= nil then return mark_row end
-  local state = M._review.state(buf)
-  for row, entry in pairs((state and state.entries) or {}) do
-    if entry.kind == "review_comment" and entry.review_boundary == "footer" and M._review.same_comment(entry.review_comment, comment) then
-      return row - 1
-    end
-  end
-  return nil
-end
-
----@param buf integer
----@param comment table
----@return integer? start_row0
----@return integer? end_row0
-function M._review.comment_body_range0(buf, comment)
-  local start_row0 = M._review.mark_row(buf, comment.review_body_start)
-  local end_row0 = M._review.mark_row(buf, comment.review_body_end)
-  if start_row0 == nil or end_row0 == nil or end_row0 < start_row0 then return nil, nil end
-  return start_row0, end_row0
-end
-
----@param buf integer
----@param row integer 1-based
----@return boolean
-function M._review.in_comment_region(buf, row)
-  local state = M._review.state(buf)
-  if not state then return false end
-  local s0 = M._review.mark_row(buf, state.review_comment_start)
-  local e0 = M._review.mark_row(buf, state.review_comment_end)
-  return s0 ~= nil and e0 ~= nil and row >= s0 + 1 and row <= e0
-end
-
----@param buf integer
----@param row integer 1-based
----@return table? comment
-function M._review.comment_body_at_row(buf, row)
-  local state = M._review.state(buf)
-  if not state then return nil end
-  for _, comment in ipairs(state.review_comments or {}) do
-    if comment.local_state ~= "deleted" then
-      local start_row0, end_row0 = M._review.comment_body_range0(buf, comment)
-      if start_row0 ~= nil and end_row0 ~= nil and row >= start_row0 + 1 and row <= end_row0 then
-        return comment
-      end
-    end
-  end
-  return nil
-end
-
----@param buf integer
----@param comment table
----@return integer? start_row 1-based
----@return integer? end_row 1-based
-function M._review.comment_body_rows(buf, comment)
-  local start_row0, end_row0 = M._review.comment_body_range0(buf, comment)
-  if start_row0 == nil or end_row0 == nil or end_row0 < start_row0 then return nil, nil end
-  return start_row0 + 1, end_row0
-end
-
----@param buf integer
----@param row integer 1-based
----@param line? string
----@return integer
-function M._review.comment_body_prefix_width(buf, row, line)
-  return 0
-end
-
----@param prefix_width integer
----@return string
-function M._review.comment_body_prefix(prefix_width)
-  return ""
-end
-
----@param line string
----@param prefix_width integer
----@return boolean
-function M._review.line_has_comment_body_prefix(line, prefix_width)
-  return true
-end
-
----@param buf integer
----@param row integer 1-based
----@param line string
----@param prefix_width integer
----@return string
-function M._review.ensure_comment_body_prefix(buf, row, line, prefix_width)
-  return tostring(line or "")
-end
-
----@param line string
----@param prefix_width? integer
----@return integer
-function M._review.comment_body_effective_prefix_width(line, prefix_width)
-  return math.max(tonumber(prefix_width) or 0, 0)
-end
-
----@param line string
----@param prefix_width? integer
----@return string
-function M._review.comment_body_text_from_line(line, prefix_width)
-  local text = tostring(line or "")
-  local width = math.max(tonumber(prefix_width) or 0, 0)
-  if width > 0 and #text >= width then
-    local prefix = text:sub(1, width)
-    if prefix:match("^%s*$") then text = text:sub(width + 1) end
-  end
-  return text
-end
-
----@param lines string[]
----@return string[]
-function M._review.trim_comment_body_lines(lines)
-  local first, last = 1, #lines
-  while first <= last and vim.trim(lines[first] or "") == "" do
-    first = first + 1
-  end
-  while last >= first and vim.trim(lines[last] or "") == "" do
-    last = last - 1
-  end
-  local trimmed = {}
-  for index = first, last do
-    trimmed[#trimmed + 1] = lines[index] or ""
-  end
-  return trimmed
-end
-
----@param body string
----@return string
-function M._review.comment_body_for_sync(body)
-  local lines = M._review.trim_comment_body_lines(vim.split(M._review.normalize_comment_body_text(body), "\n", { plain = true }))
-  return table.concat(lines, "\n")
-end
-
----@param line string
----@param prefix_width? integer
----@return integer start_col 0-based byte column
----@return integer end_col 0-based byte column
-function M._review.comment_body_text_bounds(line, prefix_width)
-  local text = tostring(line or "")
-  local start_col = M._review.comment_body_effective_prefix_width(text, prefix_width)
-  local body_text = M._review.comment_body_text_from_line(text, start_col)
-  if body_text == "" then return start_col, start_col end
-  return start_col, start_col + #body_text
-end
-
----@param line string
----@param prefix_width? integer
----@return integer start_col 0-based byte column
----@return integer end_col 0-based byte column
-function M._review.comment_body_text_selection_bounds(line, prefix_width)
-  local start_col, end_col = M._review.comment_body_text_bounds(line, prefix_width)
-  if end_col > start_col then end_col = end_col - 1 end
-  return start_col, end_col
-end
-
----@param buf integer
----@param row integer 1-based
----@param line? string
----@return integer start_col 0-based byte column
----@return integer end_col 0-based byte column
-function M._review.comment_body_text_selection_bounds_at_row(buf, row, line)
-  local text = line or vim.api.nvim_buf_get_lines(buf, row - 1, row, false)[1] or ""
-  local prefix_width = M._review.comment_body_prefix_width(buf, row, text)
-  return M._review.comment_body_text_selection_bounds(text, prefix_width)
-end
-
----@param buf integer
----@param row integer 1-based
----@param line? string
----@return integer start_col 0-based byte column
----@return integer end_col 0-based byte column
-function M._review.comment_body_text_bounds_at_row(buf, row, line)
-  local text = line or vim.api.nvim_buf_get_lines(buf, row - 1, row, false)[1] or ""
-  local prefix_width = M._review.comment_body_prefix_width(buf, row, text)
-  return M._review.comment_body_text_bounds(text, prefix_width)
-end
-
----@param buf integer
----@return integer? row 1-based current row after clamping
-function M._review.clamp_comment_cursor(buf)
-  if not (buf and vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_get_current_buf() == buf) then return nil end
-  local state = M._review.state(buf)
-  if not state or state.review_clamping_cursor then return nil end
-  state.review_clamping_cursor = true
-  local row = M._normalize_status_cursor(buf) or vim.api.nvim_win_get_cursor(0)[1]
-  state.review_clamping_cursor = nil
-  state.review_last_cursor_row = row
-  return row
-end
-
----@param buf integer
----@param row integer 1-based
----@return boolean
-function M._review.in_editable_region(buf, row)
-  return M._review.in_comment_region(buf, row) or M._review.comment_body_at_row(buf, row) ~= nil
-end
-
----@param buf integer
----@return boolean
-function M._review.cursor_or_selection_in_editable_region(buf)
-  if not (buf and vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_get_current_buf() == buf) then return false end
-  local mode = vim.fn.mode()
-  if mode == "v" or mode == "V" or mode:byte() == 22 then
-    local start_row, end_row = vim.fn.line("v"), vim.fn.line(".")
-    if start_row > end_row then start_row, end_row = end_row, start_row end
-    local found_editable = false
-    for row = start_row, end_row do
-      if M._review.in_editable_region(buf, row) then
-        found_editable = true
-      else
-        return false
-      end
-    end
-    return found_editable
-  end
-  return M._review.in_editable_region(buf, vim.api.nvim_win_get_cursor(0)[1])
-end
-
----@param buf integer
----@return table? state
-function M._review.command_map_state(buf)
-  local state = M._status_states and M._status_states[buf] or M._status
-  if not (state and state.view_kind == "review") then return nil end
-  state.review_command_maps = state.review_command_maps or {}
-  state.review_command_maps_by_key = state.review_command_maps_by_key or {}
-  return state
-end
-
----@param mode string|string[]
----@return string[]
-function M._review.keymap_modes(mode)
-  if type(mode) == "table" then return mode end
-  return { mode }
-end
-
----@param buf integer
----@param command_id string
----@return boolean
-function M._review.command_map_should_be_active(buf, command_id)
-  if command_id == "sync" then return true end
-  if command_id == "browse" and vim.fn.mode():sub(1, 1) == "n" then return true end
-  if command_id == "toggle" and vim.fn.mode():sub(1, 1) == "n" then return true end
-  return not M._review.cursor_or_selection_in_editable_region(buf)
-end
-
----@param map table
-function M._review.install_command_map(map)
-  if map.removed then return end
-  if map.active then return end
-  vim.keymap.set(map.modes, map.key, map.callback, map.opts)
-  map.active = true
-end
-
----@param map table
-function M._review.delete_command_map(map)
-  if not map.active then return end
-  for _, mode in ipairs(map.mode_list) do
-    pcall(vim.keymap.del, mode, map.key, { buffer = map.buf })
-  end
-  map.active = false
-end
-
----@param buf integer
----@param command_id string
----@param modes string|string[]
----@param key string
----@param callback function
----@param opts table
-function M._review.register_command_map(buf, command_id, modes, key, callback, opts)
-  local state = M._review.command_map_state(buf)
-  if not state then
-    vim.keymap.set(modes, key, callback, opts)
-    return
-  end
-  local mode_list = M._review.keymap_modes(modes)
-  local signature = table.concat(mode_list, "\0") .. "\0" .. key
-  local existing = state.review_command_maps_by_key[signature]
-  if existing then
-    M._review.delete_command_map(existing)
-    existing.removed = true
-  end
-  local map = {
-    buf = buf,
-    command_id = command_id,
-    modes = modes,
-    mode_list = mode_list,
-    key = key,
-    callback = callback,
-    opts = opts,
-    active = false,
-  }
-  state.review_command_maps_by_key[signature] = map
-  state.review_command_maps[#state.review_command_maps + 1] = map
-  if M._review.command_map_should_be_active(buf, command_id) then M._review.install_command_map(map) end
-end
-
----@param buf integer
-function M._review.sync_command_keymaps(buf)
-  local state = M._review.command_map_state(buf)
-  if not state then return end
-  for _, map in ipairs(state.review_command_maps or {}) do
-    if map.removed then goto continue end
-    if M._review.command_map_should_be_active(buf, map.command_id) then
-      M._review.install_command_map(map)
-    else
-      M._review.delete_command_map(map)
-    end
-    ::continue::
-  end
-end
-
----Unlock the buffer only while the cursor sits in an editable review region.
----@param buf integer
-function M._review.sync_modifiable(buf)
-  if not vim.api.nvim_buf_is_valid(buf) then return end
-  if vim.api.nvim_get_current_buf() ~= buf then return end
-  local row = M._review.clamp_comment_cursor(buf) or vim.api.nvim_win_get_cursor(0)[1]
-  local wanted = M._review.in_editable_region(buf, row)
-  if vim.bo[buf].modifiable ~= wanted then
-    vim.bo[buf].modifiable = wanted
-  end
-  M._review.sync_command_keymaps(buf)
-end
-
----Read edited review text back into the state.
----@param buf integer
-function M._review.sync_comment_text(buf)
-  local state = M._review.state(buf)
-  if not state then return end
-  local s0 = M._review.mark_row(buf, state.review_comment_start)
-  local e0 = M._review.mark_row(buf, state.review_comment_end)
-  local changed = false
-  if s0 and e0 then
-    local review_comment_text = table.concat(vim.api.nvim_buf_get_lines(buf, s0, e0, false), "\n")
-    if review_comment_text ~= state.review_comment_text then
-      state.review_comment_text = review_comment_text
-      changed = true
-    end
-  end
-  if changed then M._review.save_draft(state) end
-end
-
----@param buf integer
----@param comment table
----@return string?
-function M._review.comment_body_text_from_buffer(buf, comment)
-  local start_row0, end_row0 = M._review.comment_body_range0(buf, comment)
-  if start_row0 == nil or end_row0 == nil or end_row0 < start_row0 then return nil end
-  local raw_lines = vim.api.nvim_buf_get_lines(buf, start_row0, end_row0, false)
-  return M._review.normalize_comment_body_text(table.concat(M._review.trim_comment_body_lines(raw_lines), "\n"))
-end
-
----@param buf integer
----@param comment table
----@return table? snapshot
-function M._review.inline_comment_cursor_snapshot(buf, comment)
-  if not (buf and vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_get_current_buf() == buf) then return nil end
-  local start_row, end_row = M._review.comment_body_rows(buf, comment)
-  if not start_row or not end_row then return nil end
-  local cursor = vim.api.nvim_win_get_cursor(0)
-  if cursor[1] < start_row or cursor[1] > end_row then return nil end
-
-  local offset = 0
-  local raw_lines = vim.api.nvim_buf_get_lines(buf, start_row - 1, end_row, false)
-  for index, raw_line in ipairs(raw_lines) do
-    local row = start_row + index - 1
-    local body_text = tostring(raw_line or "")
-    if row == cursor[1] then
-      return {
-        offset = offset + math.min(math.max(cursor[2] or 0, 0), #body_text),
-        insert = vim.api.nvim_get_mode().mode:sub(1, 1) == "i",
-      }
-    end
-    offset = offset + #body_text + 1
-  end
-  return nil
-end
-
----@param buf integer
----@param comment table
----@param snapshot table?
-function M._review.restore_inline_comment_cursor(buf, comment, snapshot)
-  if not (snapshot and buf and vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_get_current_buf() == buf) then return end
-  local start_row, end_row = M._review.comment_body_rows(buf, comment)
-  if not start_row or not end_row then return end
-
-  local remaining = math.max(tonumber(snapshot.offset) or 0, 0)
-  local target_row, target_col = start_row, 0
-  local raw_lines = vim.api.nvim_buf_get_lines(buf, start_row - 1, end_row, false)
-  for index, raw_line in ipairs(raw_lines) do
-    target_row = start_row + index - 1
-    local body_text = tostring(raw_line or "")
-    target_col = math.min(remaining, #body_text)
-    if remaining <= #body_text then break end
-    remaining = remaining - #body_text - 1
-  end
-  pcall(vim.api.nvim_win_set_cursor, 0, { target_row, target_col })
-  M._review.sync_modifiable(buf)
-  if snapshot.insert then
-    vim.schedule(function()
-      if vim.api.nvim_get_current_buf() == buf then pcall(vim.cmd, "startinsert") end
-    end)
-  end
-end
-
----@param buf integer
----@param comment table
----@param snapshot table?
-function M._review.schedule_inline_comment_render(buf, comment, snapshot)
-  local state = M._review.state(buf)
-  if not state or state.review_inline_render_pending then
-    if state then state.review_inline_render_pending = { comment = comment, snapshot = snapshot } end
-    return
-  end
-  state.review_inline_render_pending = { comment = comment, snapshot = snapshot }
-  local pending = state.review_inline_render_pending
-  state.review_inline_render_pending = nil
-  if not (pending and pending.comment and pending.comment.local_state ~= "deleted") then return end
-  M._review.render(buf)
-  M._review.restore_inline_comment_cursor(buf, pending.comment, pending.snapshot)
-end
-
----@param buf integer
----@param row0 integer?
----@param line string
----@return boolean changed
-function M._review.replace_comment_rule_line(buf, row0, line)
-  if row0 == nil or row0 < 0 then return false end
-  local old_line = vim.api.nvim_buf_get_lines(buf, row0, row0 + 1, false)[1]
-  if old_line == nil or old_line == line then return false end
-  pcall(vim.api.nvim_buf_clear_namespace, buf, M._status_ns, row0, row0 + 1)
-  pcall(vim.api.nvim_buf_set_text, buf, row0, 0, row0, #old_line, { line })
-  if line ~= "" then
-    pcall(vim.api.nvim_buf_set_extmark, buf, M._status_ns, row0, 0, {
-      line_hl_group = "DiffReviewReviewCommentHeader",
-      priority = 80,
-    })
-    pcall(vim.api.nvim_buf_set_extmark, buf, M._status_ns, row0, 0, {
-      end_col = #line,
-      hl_group = "DiffReviewReviewCommentHeader",
-      priority = 90,
-    })
-    M._review.set_comment_rule_date_extmarks(buf, row0, line)
-  end
-  local state = M._review.state(buf)
-  if state and state.lines then state.lines[row0 + 1] = line end
-  return true
-end
-
----@param buf integer
----@param win integer?
----@param target_comment table?
-function M._review.refresh_inline_comment_rules(buf, win, target_comment)
-  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
-  local state = M._review.state(buf)
-  if not state then return end
-
-  local was_modifiable = vim.bo[buf].modifiable
-  vim.bo[buf].modifiable = true
-  for _, comment in ipairs(state.review_comments or {}) do
-    if (not target_comment or M._review.same_comment(comment, target_comment)) and comment.local_state ~= "deleted" then
-      local header_row0 = M._review.comment_header_row0(buf, comment)
-      if comment.review_folded then
-        local folded = M._review.comment_folded_line(comment, win, buf)
-        if M._review.replace_comment_rule_line(buf, header_row0, folded) and header_row0 ~= nil then
-          pcall(vim.api.nvim_buf_del_extmark, buf, M._review.ns, comment.review_header_mark)
-          comment.review_header_mark = vim.api.nvim_buf_set_extmark(buf, M._review.ns, header_row0, 0, { right_gravity = false })
-        end
-        goto continue
-      end
-      local footer_row0 = M._review.comment_footer_row0(buf, comment)
-      local header = M._review.comment_header_line(comment, win, buf)
-      local footer = M._review.comment_footer_line(win, buf)
-      if M._review.replace_comment_rule_line(buf, header_row0, header) and header_row0 ~= nil then
-        pcall(vim.api.nvim_buf_del_extmark, buf, M._review.ns, comment.review_header_mark)
-        comment.review_header_mark = vim.api.nvim_buf_set_extmark(buf, M._review.ns, header_row0, 0, { right_gravity = false })
-      end
-      if M._review.replace_comment_rule_line(buf, footer_row0, footer) and footer_row0 ~= nil then
-        pcall(vim.api.nvim_buf_del_extmark, buf, M._review.ns, comment.review_footer_mark)
-        comment.review_footer_mark = vim.api.nvim_buf_set_extmark(buf, M._review.ns, footer_row0, 0, { right_gravity = true })
-      end
-      for reply_index, reply in ipairs(type(comment.replies) == "table" and comment.replies or {}) do
-        local reply_mark_id = comment.review_reply_header_marks and comment.review_reply_header_marks[reply_index] or nil
-        local reply_row0 = M._review.mark_row(buf, reply_mark_id)
-        local reply_header = M._review.reply_header_line(reply, win, buf)
-        if M._review.replace_comment_rule_line(buf, reply_row0, reply_header) and reply_row0 ~= nil then
-          pcall(vim.api.nvim_buf_del_extmark, buf, M._review.ns, reply_mark_id)
-          comment.review_reply_header_marks = comment.review_reply_header_marks or {}
-          comment.review_reply_header_marks[reply_index] = vim.api.nvim_buf_set_extmark(buf, M._review.ns, reply_row0, 0, { right_gravity = false })
-        end
-      end
-    end
-    ::continue::
-  end
-  vim.bo[buf].modifiable = was_modifiable
-end
-
----@param buf integer
----@param comment table
-function M._review.refresh_inline_comment_header(buf, comment)
-  M._review.refresh_inline_comment_rules(buf, nil, comment)
-end
-
----@param buf integer
----@return table? comment
----@return string? edited_text
-function M._review.changed_inline_comment_body(buf)
-  local state = M._review.state(buf)
-  if not state or state.review_rendering or state.review_editing_comment then return nil end
-  for _, comment in ipairs(state.review_comments or {}) do
-    if comment.local_state ~= "deleted" then
-      local edited_text = M._review.comment_body_text_from_buffer(buf, comment)
-      local rendered_text = M._review.normalize_comment_body_text(comment.body)
-      if edited_text and edited_text ~= rendered_text then return comment, edited_text end
-    end
-  end
-  return nil
-end
-
----@param buf integer
----@return boolean changed
-function M._review.sync_inline_comment_text(buf)
-  if not vim.api.nvim_buf_is_valid(buf) then return false end
-  local state = M._review.state(buf)
-  if not state or state.review_rendering or state.review_editing_comment then return false end
-  local comment, edited_text = M._review.changed_inline_comment_body(buf)
-  if not (comment and edited_text) then return false end
-  edited_text = M._review.normalize_comment_body_text(edited_text)
-  comment.body = edited_text
-  comment.review_rendered_body_text = edited_text
-  comment.updated_at = os.date("%Y-%m-%d %H:%M")
-  comment.local_state = comment.remote_node_id and "dirty" or "new"
-  comment.syncing = nil
-  M._review.normalize_comment(state, comment)
-  if state.view_kind == "review" then
-    M._review.save_draft(state)
-  elseif state.view_kind == "pr" then
-    vim.bo[buf].modified = true
-  end
-  local is_regular_pr_comment = state.view_kind == "pr"
-    and M._pr_overview.is_regular_comment
-    and M._pr_overview.is_regular_comment(state, comment)
-  if not is_regular_pr_comment then M._review.refresh_inline_comment_header(buf, comment) end
-  return true
-end
-
----@param buf integer
----@param viewed boolean
-function M._review.toggle_viewed(buf, viewed)
-  local state = M._review.state(buf)
-  if not state then return end
-  M._status = state
-  local entry = status_entry_under_cursor()
-  if not entry then return end
-  state.review_viewed_hunks = state.review_viewed_hunks or {}
-
-  local function apply_file(file, selected_hunk)
-    local hunks = {}
-    if selected_hunk then
-      for _, hunk in ipairs(selected_hunk.raw_hunks or { selected_hunk }) do
-        hunks[#hunks + 1] = hunk
-      end
-    else
-      for _, hunk in ipairs(status_diff_hunks_for_file(file)) do
-        hunks[#hunks + 1] = hunk
-      end
-    end
-    if #hunks == 0 then
-      state.review_viewed[file.relpath] = viewed or nil
-    else
-      state.review_viewed[file.relpath] = nil
-      for _, hunk in ipairs(hunks) do
-        local key = M._review.hunk_view_key(state, file, hunk)
-        if viewed then
-          state.review_viewed_hunks[key] = {
-            file = file.relpath or hunk.file or repo_relative(file.filename, state.cwd) or file.filename,
-            commit_id = state.commit_id,
-          }
-        else
-          state.review_viewed_hunks[key] = nil
-        end
-      end
-    end
-  end
-
-  if entry.file then
-    apply_file(entry.file, entry.hunk)
-  elseif entry.kind == "section" and entry.section then
-    for _, file in ipairs(entry.section.files or {}) do
-      apply_file(file)
-    end
-  else
-    return
-  end
-
-  M._review.save_draft(state)
-  M._review.render(buf)
-end
-
----Build the comment target (path/side/line range) from the visual selection
----or the cursor line. Only changed (diff body) rows can carry a comment.
----@param state table
----@return table? payload
-function M._review.selection_payload(state)
-  local mode = vim.fn.mode()
-  local srow, erow
-  if mode == "v" or mode == "V" or mode:byte() == 22 then
-    srow, erow = vim.fn.line("v"), vim.fn.line(".")
-  else
-    srow = vim.fn.line(".")
-    erow = srow
-  end
-  if srow > erow then srow, erow = erow, srow end
-
-  local first, last
-  for row = srow, erow do
-    local entry = state.entries[row]
-    local dl = entry and entry.diff_line
-    if dl then
-      first = first or dl
-      last = dl
-    end
-  end
-  if not first then return nil end
-
-  -- Diff rows carry the absolute path; GitHub wants it repo-relative. Keep the
-  -- absolute path too so inline comments can re-anchor against rendered rows.
-  local path = repo_relative(last.file, state.cwd) or last.file
-  local payload = { path = path, abs_file = last.file, side = M._review.side_of(last), line = last.line, position = last.position }
-  if first.file == last.file and not (first.line == last.line and first.side == last.side) then
-    payload.start_line = first.line
-    payload.start_side = M._review.side_of(first)
-    payload.start_position = first.position
-    -- GitHub requires start_line < line when both endpoints are on one side.
-    if payload.start_side == payload.side and payload.start_line > payload.line then
-      payload.start_line, payload.line = payload.line, payload.start_line
-    end
-  end
-  return payload
-end
-
----@param title string
----@param on_submit fun(text: string)
----@param prefill? string existing text to edit
----@param opts? { on_cancel?: fun(), cursor?: integer[] }
-function M._review.open_input(title, on_submit, prefill, opts)
-  if M._review.input_provider then
-    M._review.input_provider(title, on_submit, prefill)
-    return
-  end
-  local buf = vim.api.nvim_create_buf(false, true)
-  vim.bo[buf].bufhidden = "wipe"
-  if prefill and prefill ~= "" then
-    vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.split(prefill, "\n", { plain = true }))
-  end
-  local width = math.min(72, math.max(40, math.floor(vim.o.columns * 0.6)))
-  local content_height = math.max(1, #vim.api.nvim_buf_get_lines(buf, 0, -1, false))
-  local max_height = math.max(1, vim.o.lines - 6)
-  local height = math.min(content_height, max_height)
-  local win = vim.api.nvim_open_win(buf, true, {
-    relative = "cursor",
-    row = 1,
-    col = 0,
-    width = width,
-    height = height,
-    style = "minimal",
-    border = "rounded",
-    title = " " .. title .. " (Ctrl-s submit, Ctrl-q cancel) ",
-    title_pos = "center",
-  })
-  pcall(vim.api.nvim_set_current_win, win)
-  if opts and opts.cursor then
-    local popup_lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-    local target_row = math.min(math.max(opts.cursor[1] or 1, 1), math.max(#popup_lines, 1))
-    local line = popup_lines[target_row] or ""
-    local target_col = math.min(math.max(opts.cursor[2] or 0, 0), #line)
-    pcall(vim.api.nvim_win_set_cursor, win, { target_row, target_col })
-  end
-  local done = false
-  local function enter_insert()
-    if done or not vim.api.nvim_win_is_valid(win) then return end
-    pcall(vim.api.nvim_set_current_win, win)
-    pcall(vim.cmd, "startinsert")
-    vim.defer_fn(function()
-      if done or not vim.api.nvim_win_is_valid(win) then return end
-      pcall(vim.api.nvim_set_current_win, win)
-      pcall(vim.cmd, "startinsert")
-    end, 10)
-  end
-  local function close()
-    if vim.api.nvim_win_is_valid(win) then pcall(vim.api.nvim_win_close, win, true) end
-  end
-  local function cancel()
-    if done then return end
-    done = true
-    close()
-    if opts and opts.on_cancel then opts.on_cancel() end
-  end
-  local function submit()
-    if done then return end
-    done = true
-    vim.cmd("stopinsert")
-    local text = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
-    close()
-    on_submit(text)
-  end
-  vim.keymap.set({ "n", "i" }, "<C-s>", submit, { buffer = buf })
-  vim.keymap.set({ "n", "i" }, "<C-q>", cancel, { buffer = buf, nowait = true })
-  vim.keymap.set("n", "<Esc>", cancel, { buffer = buf, nowait = true })
-  enter_insert()
-  vim.schedule(enter_insert)
-end
-
----@param buf integer
----@param comment table
----@param opts? { insert?: boolean }
-function M._review.focus_inline_comment(buf, comment, opts)
-  if not (buf and vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_get_current_buf() == buf) then return end
-  if comment.review_folded then
-    local state = M._review.state(buf)
-    comment.review_folded = false
-    if state and state.view_kind == "review" then M._review.save_draft(state) end
-    if state and state.view_kind == "pr" then
-      render_pr_status(state.pr, state.cwd, buf, state.pr_diff_text)
-    else
-      M._review.render(buf)
-    end
-  end
-  local start_row, end_row = M._review.comment_body_rows(buf, comment)
-  if not start_row or not end_row then return end
-  local cursor = vim.api.nvim_win_get_cursor(0)
-  local target_row = cursor[1]
-  if target_row < start_row or target_row > end_row then target_row = start_row end
-  local line = vim.api.nvim_buf_get_lines(buf, target_row - 1, target_row, false)[1] or ""
-  local target_col = math.min(math.max(cursor[2] or 0, 0), #line)
-  pcall(vim.api.nvim_win_set_cursor, 0, { target_row, target_col })
-  M._review.sync_modifiable(buf)
-  if opts and opts.insert then
-    vim.schedule(function()
-      if vim.api.nvim_get_current_buf() == buf then pcall(vim.cmd, "startinsert") end
-    end)
-  end
-end
-
----@param state table
----@param payload table
----@return table comment
-function M._review.inline_comment_from_payload(state, payload)
-  local created_at = os.date("%Y-%m-%d %H:%M")
-  local comment = {
-    path = payload.path,
-    abs_file = payload.abs_file,
-    side = payload.side,
-    line = payload.line,
-    position = payload.position,
-    start_line = payload.start_line,
-    start_side = payload.start_side,
-    start_position = payload.start_position,
-    body = "",
-    user = "you",
-    created_at = created_at,
-    updated_at = created_at,
-    local_state = "new",
-  }
-  return M._review.normalize_comment(state, comment)
-end
-
----@param state table
----@param payload table
----@return table comment
-function M._review.create_inline_comment(state, payload)
-  local comment = M._review.inline_comment_from_payload(state, payload)
-  state.review_comments[#state.review_comments + 1] = comment
-  return comment
-end
-
----`C`: on an existing comment, focus its inline editable body; on a changed diff line, add a draft
----comment. On anything else it is a no-op. Comments are local until submit.
----@param buf integer
-function M._review.add_comment(buf)
-  local state = M._review.state(buf)
-  if not state then return end
-  M._status = state
-  local existing = M._review.comment_under_cursor(buf)
-  if existing then
-    M._review.focus_inline_comment(buf, existing)
-    return
-  end
-  local payload = M._review.selection_payload(state)
-  M._review.leave_visual()
-  if not payload then return end
-  local comment = M._review.create_inline_comment(state, payload)
-  M._review.save_draft(state)
-  M._review.render(buf)
-  M._review.focus_inline_comment(buf, comment, { insert = true })
-end
-
----@param status table
----@return table[]
-function M._pr_overview.editable_comments(status)
-  local comments = {}
-  for _, comment in ipairs(status.pr_standalone_comments or {}) do
-    comments[#comments + 1] = comment
-  end
-  for _, comment in ipairs(status.pr_regular_comments or {}) do
-    comments[#comments + 1] = comment
-  end
-  return comments
-end
-
----@param status table
----@return table[]
-function M._pr_overview.refresh_editable_comments(status)
-  status.pr_standalone_comments = status.pr_standalone_comments or {}
-  status.pr_regular_comments = status.pr_regular_comments or {}
-  status.review_comments = M._pr_overview.editable_comments(status)
-  return status.review_comments
-end
-
----@param buf integer
----@return table? status
-function M._pr_overview.state(buf)
-  local status = M._status_states and M._status_states[buf] or nil
-  if not (status and status.view_kind == "pr" and status.pr) then return nil end
-  M._pr_overview.refresh_editable_comments(status)
-  return status
-end
-
----@param comment table?
----@return string?
-function M._pr_overview.comment_identity_key(comment)
-  if not comment then return nil end
-  if comment.remote_node_id and comment.remote_node_id ~= "" then return "node:" .. tostring(comment.remote_node_id) end
-  if comment.remote_id then return "id:" .. tostring(comment.remote_id) end
-  return nil
-end
-
----@param target table
----@param remote table
-function M._pr_overview.merge_remote_editable_comment(target, remote)
-  target.remote_id = remote.remote_id or target.remote_id
-  target.remote_node_id = remote.remote_node_id or target.remote_node_id
-  target.remote_review_id = remote.review_id or target.remote_review_id
-  target.review_node_id = remote.review_node_id or target.review_node_id
-  target.review_state = remote.review_state or target.review_state
-  target.position = remote.position or target.position
-  target.line = remote.line or target.line
-  target.start_line = remote.start_line or target.start_line
-  target.start_side = remote.start_side or target.start_side
-  if remote.path and remote.path ~= "" then target.path = remote.path end
-  target.side = remote.side or target.side
-  target.user = remote.user or target.user
-  target.created_at = remote.created_at or target.created_at
-  target.updated_at = remote.updated_at or target.updated_at
-  target.url = remote.url or target.url
-  target.resolved = remote.resolved
-  target.outdated = remote.outdated
-  target.viewer_did_author = remote.viewer_did_author
-  target.replies = type(remote.replies) == "table" and vim.deepcopy(remote.replies) or (target.replies or {})
-
-  local remote_body = M._review.normalize_comment_body_text(remote.body)
-  local base_body = M._review.normalize_comment_body_text(target.base_body)
-  local local_body = M._review.normalize_comment_body_text(target.body)
-  local base_sync_body = M._review.comment_body_for_sync(base_body)
-  local local_sync_body = M._review.comment_body_for_sync(local_body)
-  if target.local_state == "dirty" or target.local_state == "new" then
-    if remote_body == local_sync_body then
-      target.base_body = remote_body
-      target.local_state = "clean"
-    elseif base_body ~= "" and remote_body ~= base_sync_body then
-      target.remote_body = remote_body
-      target.local_state = "conflict"
-    end
-  elseif target.local_state ~= "deleted" then
-    target.body = remote_body
-    target.base_body = remote_body
-    target.remote_body = nil
-    target.local_state = "clean"
-  end
-end
-
----@param status table
----@param list table[]
----@param remote table
----@param opts? { regular?: boolean }
-function M._pr_overview.merge_viewer_authored_comment_into_list(status, list, remote, opts)
-  if not (remote and remote.viewer_did_author == true) then return end
-  local key = M._pr_overview.comment_identity_key(remote)
-  if not key then return end
-  for _, comment in ipairs(list) do
-    if M._pr_overview.comment_identity_key(comment) == key then
-      M._pr_overview.merge_remote_editable_comment(comment, remote)
-      if opts and opts.regular then comment.pr_issue_comment = true else comment.standalone = true end
-      M._review.normalize_comment(status, comment)
-      return
-    end
-  end
-
-  local comment
-  if opts and opts.regular then
-    comment = vim.deepcopy(remote)
-    comment.local_id = remote.remote_node_id or ("remote:" .. tostring(remote.remote_id or ""))
-    comment.pr_issue_comment = true
-    comment.local_state = "clean"
-    comment.base_body = remote.body
-    comment.replies = type(remote.replies) == "table" and vim.deepcopy(remote.replies) or {}
-    M._review.normalize_comment(status, comment)
-  else
-    comment = M._review.comment_from_remote(status, remote)
-    comment.standalone = true
-  end
-  list[#list + 1] = comment
-end
-
----@param status table
----@param comments DiffReviewGhPRCommentsResult?
-function M._pr_overview.import_viewer_authored_comments(status, comments)
-  if not (status and comments) then return end
-  status.pr_standalone_comments = status.pr_standalone_comments or {}
-  status.pr_regular_comments = status.pr_regular_comments or {}
-  for _, comment in ipairs(comments.code_comments or {}) do
-    M._pr_overview.merge_viewer_authored_comment_into_list(status, status.pr_standalone_comments, comment)
-  end
-  for _, comment in ipairs(comments.issue_comments or {}) do
-    M._pr_overview.merge_viewer_authored_comment_into_list(status, status.pr_regular_comments, comment, { regular = true })
-  end
-  M._pr_overview.refresh_editable_comments(status)
-end
-
----@param status table
----@param target table?
----@return integer?
-function M._pr_overview.regular_comment_index(status, target)
-  if not (status and target) then return nil end
-  for index, comment in ipairs(status.pr_regular_comments or {}) do
-    if M._review.same_comment(comment, target) then return index end
-  end
-  return nil
-end
-
----@param status table
----@param comment table?
----@return boolean
-function M._pr_overview.is_regular_comment(status, comment)
-  return M._pr_overview.regular_comment_index(status, comment) ~= nil
-end
-
----@param status table
----@param comment table?
----@return boolean
-function M._pr_overview.is_standalone_comment(status, comment)
-  if not (status and comment) then return false end
-  for _, local_comment in ipairs(status.pr_standalone_comments or {}) do
-    if M._review.same_comment(local_comment, comment) then return true end
-  end
-  for _, local_comment in ipairs(status.pr_regular_comments or {}) do
-    if M._review.same_comment(local_comment, comment) then return true end
-  end
-  return false
-end
-
----@param buf integer
----@param status table
----@param comment table
----@return boolean opened
-function M._pr_overview.open_pr_comment_body(buf, status, comment)
-  if not (buf and status and comment and vim.api.nvim_buf_is_valid(buf)) then return false end
-  local cursor_row = vim.api.nvim_win_get_cursor(0)[1]
-  for _, row in ipairs({ cursor_row, cursor_row - 1, cursor_row + 1 }) do
-    local entry = status.entries and status.entries[row] or nil
-    if entry
-      and entry.kind == "pr_comment"
-      and entry.id
-      and entry.pr_comment
-      and M._review.same_comment(entry.pr_comment, comment)
-      and status_folded(entry.id, true) then
-      set_status_folded(entry.id, false)
-      render_pr_status(status.pr, status.cwd, buf, status.pr_diff_text)
-      return true
-    end
-  end
-  return false
-end
-
----@param buf integer
----@return table? comment
-function M._pr_overview.standalone_comment_under_cursor(buf)
-  local status = M._pr_overview.state(buf)
-  if not status then return nil end
-  local comment = M._review.comment_at_cursor(buf)
-  if M._pr_overview.is_standalone_comment(status, comment) then return comment end
-  return nil
-end
-
----@param status table
----@return boolean
-function M._pr_overview.selection_is_in_changes(status)
-  local mode = vim.fn.mode()
-  local start_row, end_row
-  if mode == "v" or mode == "V" or mode:byte() == 22 then
-    start_row, end_row = vim.fn.line("v"), vim.fn.line(".")
-  else
-    start_row = vim.fn.line(".")
-    end_row = start_row
-  end
-  if start_row > end_row then start_row, end_row = end_row, start_row end
-
-  local changes_section_name = "pr:" .. tostring(status.pr and status.pr.number or "") .. ":changes"
-  local found_diff_row = false
-  for row = start_row, end_row do
-    local entry = status.entries and status.entries[row] or nil
-    if entry and entry.diff_line then
-      if not (entry.kind == "pr_hunk" and entry.hunk and entry.hunk.section_name == changes_section_name) then
-        return false
-      end
-      found_diff_row = true
-    end
-  end
-  return found_diff_row
-end
-
----@param status table
----@return table? payload
-function M._pr_overview.selection_payload(status)
-  if not M._pr_overview.selection_is_in_changes(status) then return nil end
-  return M._review.selection_payload(status)
-end
-
----@param buf integer
-function M._pr_overview.refresh_modified(buf)
-  local status = M._pr_overview.state(buf)
-  if not status or not vim.api.nvim_buf_is_valid(buf) then return end
-  local title_dirty, desc_dirty, review_dirty, milestone_dirty = M._pr_edit.dirty_flags(buf, status)
-  local comments_dirty = false
-  for _, comment in ipairs(status.review_comments or {}) do
-    if M._review.comment_needs_sync(comment) then
-      comments_dirty = true
-      break
-    end
-  end
-  vim.bo[buf].modified = title_dirty or desc_dirty or review_dirty or milestone_dirty or comments_dirty
-end
-
----@param buf integer
-function M._pr_overview.render_preserving_inline_cursor(buf)
-  local status = M._pr_overview.state(buf)
-  if not status then return end
-  local comment
-  local snapshot
-  if vim.api.nvim_get_current_buf() == buf then
-    local cursor = vim.api.nvim_win_get_cursor(0)
-    comment = M._review.comment_body_at_row(buf, cursor[1])
-    if comment then snapshot = M._review.inline_comment_cursor_snapshot(buf, comment) end
-  end
-  render_pr_status(status.pr, status.cwd, buf, status.pr_diff_text)
-  if comment and snapshot and comment.local_state ~= "deleted" then
-    M._review.restore_inline_comment_cursor(buf, comment, snapshot)
-  end
-end
-
----@param status table
----@param comment table
----@param remote table?
----@param queued_body string
-function M._pr_overview.apply_synced_standalone_comment(status, comment, remote, queued_body)
-  if remote then
-    comment.remote_id = remote.remote_id or comment.remote_id
-    comment.remote_node_id = remote.remote_node_id or comment.remote_node_id
-    comment.remote_review_id = remote.review_id or comment.remote_review_id
-    comment.review_node_id = remote.review_node_id or comment.review_node_id
-    comment.position = remote.position or comment.position
-    comment.line = remote.line or comment.line
-    if remote.path and remote.path ~= "" then comment.path = remote.path end
-    comment.side = remote.side or comment.side
-    comment.user = remote.user or comment.user
-    comment.created_at = remote.created_at or comment.created_at
-    comment.updated_at = remote.updated_at or comment.updated_at
-    comment.url = remote.url or comment.url
-    comment.replies = type(remote.replies) == "table" and vim.deepcopy(remote.replies) or (comment.replies or {})
-  end
-  if M._review.comment_body_for_sync(comment.body or "") == queued_body then
-    comment.body = queued_body
-    comment.base_body = queued_body
-    comment.local_state = "clean"
-  else
-    comment.base_body = queued_body
-    comment.local_state = "dirty"
-  end
-  comment.syncing = nil
-  M._review.normalize_comment(status, comment)
-end
-
----@param status table
----@param comment table
----@param remote table?
----@param queued_body string
-function M._pr_overview.apply_synced_regular_comment(status, comment, remote, queued_body)
-  local comment_index = M._pr_overview.regular_comment_index(status, comment)
-  local old_entry_id = comment_index and M._pr_overview.issue_comment_entry_id(comment, comment_index) or nil
-  local old_folded = old_entry_id and status_folded(old_entry_id, true) or nil
-  if remote then
-    comment.remote_id = remote.remote_id or comment.remote_id
-    comment.remote_node_id = remote.remote_node_id or comment.remote_node_id
-    comment.user = remote.user or comment.user
-    comment.created_at = remote.created_at or comment.created_at
-    comment.updated_at = remote.updated_at or comment.updated_at
-    comment.url = remote.url or comment.url
-  end
-  if M._review.comment_body_for_sync(comment.body or "") == queued_body then
-    comment.body = queued_body
-    comment.base_body = queued_body
-    comment.local_state = "clean"
-  else
-    comment.base_body = queued_body
-    comment.local_state = "dirty"
-  end
-  comment.syncing = nil
-  M._review.normalize_comment(status, comment)
-  M._pr_overview.refresh_editable_comments(status)
-  if comment_index then
-    local new_entry_id = M._pr_overview.issue_comment_entry_id(comment, comment_index)
-    if old_entry_id and old_entry_id ~= new_entry_id and old_folded ~= nil then
-      set_status_folded(new_entry_id, old_folded)
-    end
-  end
-end
-
----@param status table
----@param operation fun(done: fun())
-function M._pr_overview.enqueue_standalone_sync(status, operation)
-  status.pr_standalone_sync = status.pr_standalone_sync or { queue = {}, running = false }
-  status.pr_standalone_sync.queue[#status.pr_standalone_sync.queue + 1] = operation
-  local function run_next()
-    if status.pr_standalone_sync.running then return end
-    local next_operation = table.remove(status.pr_standalone_sync.queue, 1)
-    if not next_operation then return end
-    status.pr_standalone_sync.running = true
-    next_operation(function()
-      status.pr_standalone_sync.running = false
-      run_next()
-    end)
-  end
-  run_next()
-end
-
----@param buf integer
----@param comment table
-function M._pr_overview.sync_regular_comment(buf, comment)
-  local status = M._pr_overview.state(buf)
-  if not (status and status.pr and comment) then return end
-  local body = M._review.comment_body_for_sync(comment.body or "")
-  if body == "" then
-    comment.syncing = nil
-    M._pr_overview.refresh_modified(buf)
-    return
-  end
-  local pr = status.pr
-  local update_id = comment.remote_id
-  M._pr_overview.enqueue_standalone_sync(status, function(done)
-    local latest = M._pr_overview.state(buf)
-    if not latest then
-      done()
-      return
-    end
-    local callback = function(result)
-      latest = M._pr_overview.state(buf)
-      if not latest then
-        done()
-        return
-      end
-      if not result.ok then
-        comment.syncing = nil
-        notify_error("GitHub PR comment sync failed: " .. (result.message or "gh failed"), "DiffReview")
-        if vim.api.nvim_buf_is_valid(buf) then
-          M._pr_overview.render_preserving_inline_cursor(buf)
-          M._pr_overview.refresh_modified(buf)
-        end
-        done()
-        return
-      end
-      M._pr_overview.apply_synced_regular_comment(latest, comment, result.issue_comments and result.issue_comments[1] or nil, body)
-      if vim.api.nvim_buf_is_valid(buf) then
-        M._pr_overview.render_preserving_inline_cursor(buf)
-        M._pr_overview.refresh_modified(buf)
-      end
-      vim.notify("PR comment synced", vim.log.levels.INFO, { title = "DiffReview" })
-      done()
-    end
-    if update_id then
-      gh.update_issue_comment_async(latest.cwd, pr.repo, update_id, body, callback)
-    else
-      gh.create_issue_comment_async(latest.cwd, pr.number, pr.repo, body, callback)
-    end
-  end)
-end
-
----@param buf integer
----@param comment table
-function M._pr_overview.sync_standalone_comment(buf, comment)
-  local status = M._pr_overview.state(buf)
-  if not (status and status.pr and comment) then return end
-  if M._pr_overview.is_regular_comment(status, comment) or comment.pr_issue_comment then
-    M._pr_overview.sync_regular_comment(buf, comment)
-    return
-  end
-  local body = M._review.comment_body_for_sync(comment.body or "")
-  if body == "" then
-    comment.syncing = nil
-    M._pr_overview.refresh_modified(buf)
-    return
-  end
-  local pr = status.pr
-  local opts = {
-    body = body,
-    commit_id = pr.headRefOid,
-    path = comment.path,
-    line = comment.line,
-    side = comment.side or "RIGHT",
-    start_line = comment.start_line,
-    start_side = comment.start_side,
-    position = comment.position,
-  }
-  local update_node_id = comment.remote_node_id
-  M._pr_overview.enqueue_standalone_sync(status, function(done)
-    local latest = M._pr_overview.state(buf)
-    if not latest then
-      done()
-      return
-    end
-    local callback = function(result)
-      latest = M._pr_overview.state(buf)
-      if not latest then
-        done()
-        return
-      end
-      if not result.ok then
-        comment.syncing = nil
-        notify_error("GitHub inline comment sync failed: " .. (result.message or "gh failed"), "DiffReview")
-        if vim.api.nvim_buf_is_valid(buf) then
-          M._pr_overview.render_preserving_inline_cursor(buf)
-          M._pr_overview.refresh_modified(buf)
-        end
-        done()
-        return
-      end
-      M._pr_overview.apply_synced_standalone_comment(latest, comment, result.comments and result.comments[1] or nil, body)
-      if vim.api.nvim_buf_is_valid(buf) then
-        M._pr_overview.render_preserving_inline_cursor(buf)
-        M._pr_overview.refresh_modified(buf)
-      end
-      vim.notify("Inline comment synced", vim.log.levels.INFO, { title = "DiffReview" })
-      done()
-    end
-    if update_node_id and update_node_id ~= "" then
-      gh.update_review_comment_async(latest.cwd, update_node_id, body, callback)
-    else
-      gh.create_pr_review_comment_async(latest.cwd, pr.number, pr.repo, opts, callback)
-    end
-  end)
-end
-
----@param buf integer
----@return integer count
-function M._pr_overview.sync_standalone_comments(buf)
-  local status = M._pr_overview.state(buf)
-  if not status then return 0 end
-  M._review.sync_inline_comment_text(buf)
-  local comments = {}
-  for _, comment in ipairs(status.review_comments or {}) do
-    if M._review.comment_needs_sync(comment) then
-      comment.syncing = true
-      comments[#comments + 1] = comment
-    end
-  end
-  if #comments == 0 then return 0 end
-  for _, comment in ipairs(comments) do
-    M._review.refresh_inline_comment_header(buf, comment)
-  end
-  M._pr_overview.refresh_modified(buf)
-  for _, comment in ipairs(comments) do
-    M._pr_overview.sync_standalone_comment(buf, comment)
-  end
-  return #comments
-end
-
----@param status table
----@param payload table
----@return table comment
-function M._pr_overview.create_inline_comment(status, payload)
-  status.pr_standalone_comments = status.pr_standalone_comments or {}
-  local comment = M._review.inline_comment_from_payload(status, payload)
-  comment.standalone = true
-  status.pr_standalone_comments[#status.pr_standalone_comments + 1] = comment
-  M._pr_overview.refresh_editable_comments(status)
-  return comment
-end
-
----@param status table
----@return table comment
-function M._pr_overview.create_regular_comment(status)
-  status.pr_regular_comments = status.pr_regular_comments or {}
-  local created_at = os.date("%Y-%m-%d %H:%M")
-  local comment = {
-    body = "",
-    user = "you",
-    created_at = created_at,
-    updated_at = created_at,
-    local_state = "new",
-  }
-  M._review.normalize_comment(status, comment)
-  status.pr_regular_comments[#status.pr_regular_comments + 1] = comment
-  set_status_folded(M._pr_overview.issue_comment_entry_id(comment, #status.pr_regular_comments), false)
-  M._pr_overview.refresh_editable_comments(status)
-  return comment
-end
-
----@param buf integer
-function M._pr_overview.add_standalone_comment(buf)
-  local status = M._pr_overview.state(buf)
-  if not status then return end
-  M._status = status
-  local existing = M._pr_overview.standalone_comment_under_cursor(buf)
-  if existing then
-    M._pr_overview.open_pr_comment_body(buf, status, existing)
-    M._review.focus_inline_comment(buf, existing)
-    return
-  end
-  local payload = M._pr_overview.selection_payload(status)
-  M._review.leave_visual()
-  local comment = payload
-    and M._pr_overview.create_inline_comment(status, payload)
-    or M._pr_overview.create_regular_comment(status)
-  render_pr_status(status.pr, status.cwd, buf, status.pr_diff_text)
-  M._review.focus_inline_comment(buf, comment, { insert = true })
-  M._pr_overview.refresh_modified(buf)
-end
-
----`J`: remove the draft comment under the cursor.
----@param buf integer
-function M._review.delete_comment(buf)
-  local state = M._review.state(buf)
-  if not state then return end
-  local comment, index = M._review.comment_under_cursor(buf)
-  if not (comment and index) then return end
-  if comment.remote_node_id then
-    comment.local_state = "deleted"
-  else
-    table.remove(state.review_comments, index)
-  end
-  M._review.save_draft(state)
-  M._review.render(buf)
-end
-
----Sync dirty inline comments to the pending GitHub review.
----@param buf integer
-function M._review.sync(buf)
-  local state = M._review.state(buf)
-  if not state then return end
-  M._status = state
-  M._review.sync_comment_text(buf)
-  M._review.sync_inline_comment_text(buf)
-  local count = M._review.enqueue_dirty_comments(buf)
-  if count == 0 then
-    vim.notify("No review comments to sync", vim.log.levels.INFO, { title = "DiffReview" })
-    return
-  end
-  M._review.flush_sync(buf, function(ok)
-    if not vim.api.nvim_buf_is_valid(buf) then return end
-    if ok then
-      vim.notify(("Synced %d review comment%s"):format(count, count == 1 and "" or "s"), vim.log.levels.INFO, { title = "DiffReview" })
-    end
-  end)
-end
-
----@param buf integer
----@param direction 1|-1
-function M._review.navigate(buf, direction)
-  local state = M._review.state(buf)
-  if not state then return end
-  local rows = {}
-  for row, entry in pairs(state.entries or {}) do
-    if entry.kind == "review_comment" and entry.review_first then
-      rows[#rows + 1] = row
-    end
-  end
-  if #rows == 0 then
-    vim.notify("No comments yet", vim.log.levels.INFO, { title = "DiffReview" })
-    return
-  end
-  table.sort(rows)
-  local cursor = vim.api.nvim_win_get_cursor(0)[1]
-  local target
-  if direction == 1 then
-    for _, row in ipairs(rows) do
-      if row > cursor then target = row break end
-    end
-    target = target or rows[1]
-  else
-    for index = #rows, 1, -1 do
-      if rows[index] < cursor then target = rows[index] break end
-    end
-    target = target or rows[#rows]
-  end
-  pcall(vim.api.nvim_win_set_cursor, 0, { target, 0 })
-  vim.cmd("normal! zz")
-end
-
----Submit the review. Inline comments are synced to a pending remote review as
----part of submission; the final review summary stays local-only until this call.
----@param buf integer
-function M._review.submit(buf)
-  local state = M._review.state(buf)
-  if not state then return end
-  M._status = state
-  M._review.sync_comment_text(buf)
-  local function with_event(event)
-    if not event then return end
-    if not vim.api.nvim_buf_is_valid(buf) then return end
-    local comments = {}
-    for _, comment in ipairs(state.review_comments) do
-      if comment.local_state ~= "deleted" then
-        local body = M._review.comment_body_for_sync(comment.body or "")
-        local item = {
-          path = comment.path,
-          body = body,
-          line = comment.line,
-          side = comment.side,
-        }
-        if body ~= "" then
-          if comment.start_line then
-            item.start_line = comment.start_line
-            item.start_side = comment.start_side
-          end
-          comments[#comments + 1] = item
-        end
-      end
-    end
-    local count = #comments
-    local function handle_submit_result(result)
-      if not vim.api.nvim_buf_is_valid(buf) then return end
-      if result.code ~= 0 then
-        notify_error(
-          "PR review submit failed: " .. (result.output ~= "" and result.output or ("gh exited " .. tostring(result.code))),
-          "DiffReview"
-        )
-        return
-      end
-      state.review_comments = {}
-      state.review_comment_text = ""
-      state.review_remote = nil
-      M._review.delete_draft(state)
-      M._review.render(buf)
-      vim.notify(
-        ("Review submitted (%s, %d comment%s)"):format(event, count, count == 1 and "" or "s"),
-        vim.log.levels.INFO,
-        { title = "DiffReview" }
-      )
-    end
-    M._review.flush_sync(buf, function(ok)
-      if not ok then return end
-      if state.review_remote and state.review_remote.id then
-        gh.submit_pending_review_async(state.cwd, state.pr.number, state.pr.repo, state.review_remote.id, {
-          body = state.review_comment_text or "",
-          event = event,
-        }, handle_submit_result)
-      else
-        gh.submit_pr_review_async(state.cwd, state.pr.number, state.pr.repo, {
-          body = state.review_comment_text or "",
-          event = event,
-          commit_id = state.commit_id,
-          comments = comments,
-        }, handle_submit_result)
-      end
-    end)
-  end
-  if M._review.verdict_provider then
-    M._review.verdict_provider(with_event)
-    return
-  end
-  M._review.pick_verdict(with_event)
-end
-
---- Verdict chooser as a small popup window (not vim.ui.select / snacks):
---- `c`/`a`/`r` pick, `q`/`<Esc>` cancels.
----@param on_choice fun(event: string?)
-function M._review.pick_verdict(on_choice)
-  local options = {
-    { key = "c", event = "COMMENT", label = "Comment (no verdict)" },
-    { key = "a", event = "APPROVE", label = "Approve" },
-    { key = "r", event = "REQUEST_CHANGES", label = "Request changes" },
-  }
-  local lines = { "" }
-  for _, opt in ipairs(options) do
-    lines[#lines + 1] = ("  [%s]  %s"):format(opt.key, opt.label)
-  end
-  lines[#lines + 1] = "  [q]  cancel"
-  lines[#lines + 1] = ""
-
-  local buf = vim.api.nvim_create_buf(false, true)
-  vim.bo[buf].bufhidden = "wipe"
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-  vim.bo[buf].modifiable = false
-  local width = 0
-  for _, line in ipairs(lines) do
-    width = math.max(width, #line)
-  end
-  local win = vim.api.nvim_open_win(buf, true, {
-    relative = "cursor",
-    row = 1,
-    col = 0,
-    width = width + 2,
-    height = #lines,
-    style = "minimal",
-    border = "rounded",
-    title = " Submit review ",
-    title_pos = "center",
-  })
-  local chosen = false
-  local function close()
-    if vim.api.nvim_win_is_valid(win) then pcall(vim.api.nvim_win_close, win, true) end
-  end
-  local function choose(event)
-    if chosen then return end
-    chosen = true
-    close()
-    on_choice(event)
-  end
-  for _, opt in ipairs(options) do
-    vim.keymap.set("n", opt.key, function() choose(opt.event) end, { buffer = buf, nowait = true, silent = true })
-  end
-  vim.keymap.set("n", "q", function() choose(nil) end, { buffer = buf, nowait = true, silent = true })
-  vim.keymap.set("n", "<Esc>", function() choose(nil) end, { buffer = buf, nowait = true, silent = true })
-  vim.api.nvim_create_autocmd("BufLeave", { buffer = buf, once = true, callback = function() choose(nil) end })
-end
-
----@param buf integer
-function M._review.attach(buf)
-  local group = vim.api.nvim_create_augroup("DiffReviewReview" .. buf, { clear = true })
-  vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI", "BufEnter", "ModeChanged" }, {
-    group = group,
-    buffer = buf,
-    callback = function()
-      M._review.sync_modifiable(buf)
-    end,
-  })
-  vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI", "InsertLeave" }, {
-    group = group,
-    buffer = buf,
-    callback = function()
-      M._review.sync_comment_text(buf)
-      M._review.sync_inline_comment_text(buf)
-      M._pr_edit.render_markdown_regions(buf)
-    end,
-  })
-end
+M._review = require("diff_review.review")
+M._review.comment_icon = M._comment_icon
+M._review.reply_icon = M._reply_icon
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 -- Per-repository config, read from `<repo root>/.diffreview.json`. Currently
 -- only `branch_prefix` (used by the `bc` branch-create action). On the module
 -- table because init.lua is at Lua's 200-local limit.
-M._repo_config = { reader = nil }
+M._repo_config = require("diff_review.repo_config")
 
----@param fn fun(path: string): string? test seam returning file contents
-function M._repo_config.set_reader(fn)
-  M._repo_config.reader = fn
-end
-
-function M._repo_config.reset_reader()
-  M._repo_config.reader = nil
-end
-
----@param cwd string repo root
----@return DiffReviewRepoConfig
-function M._repo_config.read(cwd)
-  local path = (cwd:gsub("[/\\]+$", "")) .. "/.diffreview.json"
-  local content
-  if M._repo_config.reader then
-    content = M._repo_config.reader(path)
-  else
-    local handle = io.open(path, "r")
-    if handle then
-      content = handle:read("*a")
-      handle:close()
-    end
-  end
-  if not content or content == "" then return {} end
-  local ok, decoded = pcall(vim.json.decode, content)
-  if ok and type(decoded) == "table" then return decoded end
-  return {}
-end
-
----@param cwd string repo root
----@return string
-function M._repo_config.branch_prefix(cwd)
-  local repo = M._repo_config.read(cwd)
-  if type(repo.branch_prefix) == "string" and repo.branch_prefix ~= "" then
-    return repo.branch_prefix
-  end
-  local options = M.config or config.options or config.defaults
-  return options.branch_prefix or config.defaults.branch_prefix or ""
-end
 
 --- Centered single-line input popup (not vim.ui.input / snacks). `<CR>`
 --- submits, `<Esc>`/`q` cancels (calling back with nil).
@@ -13913,7 +10046,7 @@ function M._create_branch(buf)
     if not name then return end
     name = vim.trim(name)
     if name == "" or name == prefix then return end
-    run_git_at_root_async(cwd, { "switch", "-c", name }, nil, function(result)
+    git_backend.run_git_at_root_async(cwd, { "switch", "-c", name }, nil, function(result)
       if not result.ok then
         notify_error(
           "Create branch failed: " .. (result.output ~= "" and result.output or ("git exited " .. tostring(result.code))),
@@ -13935,95 +10068,9 @@ end
 -- Branch-diff view (":GitDiff <branch>") helpers. Grouped on the module
 -- table rather than as locals: this chunk is at Lua's hard limit of 200
 -- local variables, so new file-scope `local function`s break the module.
-M._branch_diff = {}
-
----@param branch string
----@param file? string repo-relative path when diffing a single file
----@return DiffReviewStatusHeadLine[]
-function M._branch_diff.head_lines(branch, file)
-  local lines = {
-    {
-      segments = {
-        { ("%-8s"):format("Diff:"), "DiffReviewStatusLabel" },
-        { branch, "DiffReviewStatusBranch" },
-        { " -> working tree", "DiffReviewStatusHint" },
-      },
-    },
-  }
-  if file then
-    lines[#lines + 1] = {
-      segments = {
-        { ("%-8s"):format("File:"), "DiffReviewStatusLabel" },
-        { file, "DiffReviewStatusPath" },
-      },
-    }
-  end
-  return lines
-end
-
----@param cwd string
----@param branch string
----@param diff_text? string
----@param file? string
----@return DiffReviewStatusSection[]
-function M._branch_diff.sections(cwd, branch, diff_text, file)
-  local provider_key = "diff:" .. branch .. (file and (":" .. file) or "")
-  local sections = M._section_builder.sections_from_diff(cwd, {
-    title = "Changes vs " .. branch,
-    section_name = provider_key .. ":changes",
-    default_status = "",
-    name = provider_key .. ":changes",
-    file_key_prefix = provider_key,
-    file_entry_kind = "pr_file",
-    hunk_entry_kind = "pr_hunk",
-  }, diff_text)
-  return sections
-end
-
----@param branch string
----@param cwd string
----@param buf integer
----@param diff_text? string
----@param file? string
-function M._branch_diff.render(branch, cwd, buf, diff_text, file)
-  local status = M._status
-  if not (status and status.buf == buf) then return end
-  status.head_lines = M._branch_diff.head_lines(branch, file)
-  status.sections = M._branch_diff.sections(cwd, branch, diff_text, file)
-  status.fancy_rows = {}
-  status_render_loaded(buf, nil, nil, { reuse_sections = true }, status.head_lines, status.sections)
-end
-
----@param branch string
----@param cwd string
----@param buf integer
----@param file? string
-function M._branch_diff.load(branch, cwd, buf, file)
-  local status = M._status
-  if not (status and status.buf == buf) then return end
-  status.branch_diff_request_id = (status.branch_diff_request_id or 0) + 1
-  local request_id = status.branch_diff_request_id
-  local command = M._git_diff_command(cwd, { branch })
-  if file then
-    vim.list_extend(command, { "--", file })
-  end
-  systemlist_async(command, function(output, code, stderr)
-    local latest_status = M._status_states and M._status_states[buf] or nil
-    if not (
-      latest_status
-      and latest_status.branch_diff_request_id == request_id
-      and latest_status.buf == buf
-      and vim.api.nvim_buf_is_valid(buf)
-    ) then return end
-    M._status = latest_status
-    if code ~= 0 then
-      local message = vim.trim(stderr or "")
-      notify_error("Git diff failed: " .. (message ~= "" and message or ("git exited " .. code)), "GitBranchDiff")
-      return
-    end
-    M._branch_diff.render(branch, cwd, buf, table.concat(output or {}, "\n"), file)
-  end)
-end
+-- Seam: expose the render orchestrator for the extracted branch_diff module.
+M._status_render_loaded = status_render_loaded
+M._branch_diff = require("diff_review.branch_diff")
 
 ---@param target_id? string
 status_render_current_model = function(target_id)
@@ -14060,7 +10107,49 @@ end
 
 status_operations_pending = function()
   local status = M._status
-  return status and (status.operation_running or #(status.operation_queue or {}) > 0) or false
+  if not status then return false end
+  if status.operation_queue_model then
+    return M._diff_mutation_queue_model.pending(status.operation_queue_model)
+  end
+  return status.operation_running or #(status.operation_queue or {}) > 0
+end
+
+---@param status table
+---@param done fun()
+function M._status_reload_invalidated_diff_sources(status, done)
+  local registry = status and status.diff_source_registry or nil
+  if not registry then
+    done()
+    return
+  end
+  local source_ids = {}
+  local path_set = {}
+  for source_id, invalidated in pairs(registry.invalidation_by_source or {}) do
+    source_ids[#source_ids + 1] = source_id
+    for path in pairs(invalidated or {}) do
+      path_set[path] = true
+    end
+  end
+  local paths = status_files_from_set(path_set)
+  if #source_ids == 0 or #paths == 0 then
+    done()
+    return
+  end
+  M._status_perf_event("source.reload_invalidated.start", status.buf, {
+    source_ids = source_ids,
+    paths = paths,
+  })
+  M._diff_source_model.reload_paths(registry, source_ids, paths, function(ok, err)
+    if not ok then
+      notify_error("Diff source reload failed: " .. tostring(err or "unknown error"), "DiffReview")
+    end
+    M._status_perf_event("source.reload_invalidated.done", status.buf, {
+      ok = ok,
+      source_ids = source_ids,
+      paths = paths,
+    })
+    done()
+  end)
 end
 
 ---@param buf integer?
@@ -14082,7 +10171,9 @@ status_request_reconcile = function(buf, target_id)
     local reconcile_target_id = latest_status.reconcile_target_id
     latest_status.reconcile_buf = nil
     latest_status.reconcile_target_id = nil
-    if reconcile_buf then refresh_status_after_action(reconcile_buf, reconcile_target_id) end
+    M._status_reload_invalidated_diff_sources(latest_status, function()
+      if reconcile_buf then refresh_status_after_action(reconcile_buf, reconcile_target_id) end
+    end)
   end, status_reconcile_delay_ms)
 end
 
@@ -14091,1332 +10182,43 @@ local function status_enqueue_operation(operation)
   M._status = M._status or {}
   local status = M._status
   status.reconcile_generation = (status.reconcile_generation or 0) + 1
-  status.operation_queue = status.operation_queue or {}
-  status.operation_queue[#status.operation_queue + 1] = operation
-
-  local function run_next()
-    if status.operation_running then return end
-    local next_operation = table.remove(status.operation_queue, 1)
-    if not next_operation then
-      status_request_reconcile(status.reconcile_buf, status.reconcile_target_id)
-      return
-    end
-    status.operation_running = true
-    next_operation(function()
-      status.operation_running = false
-      run_next()
-    end)
-  end
-
-  run_next()
+  status.operation_queue_model = status.operation_queue_model or M._diff_mutation_queue_model.new()
+  M._diff_mutation_queue_model.enqueue(status.operation_queue_model, operation)
+  M._diff_mutation_queue_model.on_idle(status.operation_queue_model, function()
+    status_request_reconcile(status.reconcile_buf, status.reconcile_target_id)
+  end)
 end
 
 -- PR title/description editing in the PR view: insert mode is gated to the
 -- title line and description block, ":w" syncs via `gh pr edit`, and a "*"
 -- marks unsynced fields. Functions hang off the module table because
 -- init.lua is at Lua's 200-local limit.
-M._pr_edit = { ns = vim.api.nvim_create_namespace("diff_review_pr_edit") }
-
----@class DiffReviewPrEditState
----@field queue fun(done: fun())[]
----@field running boolean
----@field title_mark? integer
----@field review_mark? integer
----@field milestone_mark? integer
----@field status_mark? integer
----@field desc_start_mark? integer
----@field desc_end_mark? integer beyond-the-last-body-line mark (end-exclusive)
----@field title_marker_id? integer
----@field review_marker_id? integer
----@field milestone_marker_id? integer
----@field desc_marker_id? integer
----@field description_rendered_folded? boolean
----@field lock_initial? boolean
----@field initial_cursor_row? integer
----@field pending_reviewers? DiffReviewGhRequestedReviewer[]
-
----@param buf integer
----@param id integer?
----@return integer? row0
-function M._pr_edit.mark_row(buf, id)
-  if not id then return nil end
-  local pos = vim.api.nvim_buf_get_extmark_by_id(buf, M._pr_edit.ns, id, {})
-  return pos and pos[1] or nil
-end
-
----@param buf integer
----@param label_pattern string
----@return integer? row0
-function M._pr_edit.label_row(buf, label_pattern)
-  if not vim.api.nvim_buf_is_valid(buf) then return nil end
-  for index, line in ipairs(vim.api.nvim_buf_get_lines(buf, 0, -1, false)) do
-    if line:match(label_pattern) then return index - 1 end
-  end
-  return nil
-end
-
----@param buf integer
----@param id integer?
----@param label_pattern string
----@return integer? row0
-function M._pr_edit.field_row(buf, id, label_pattern)
-  return M._pr_edit.label_row(buf, label_pattern) or M._pr_edit.mark_row(buf, id)
-end
-
----@return integer namespace
-function M._pr_edit.markdown_namespace()
-  if M._pr_edit.render_markdown_ns then return M._pr_edit.render_markdown_ns end
-  local ok, ui = pcall(require, "render-markdown.core.ui")
-  M._pr_edit.render_markdown_ns = ok and ui and ui.ns or vim.api.nvim_create_namespace("render-markdown.nvim")
-  return M._pr_edit.render_markdown_ns
-end
-
----@param buf integer
----@return integer? first0
----@return integer? after0
-function M._pr_edit.description_range0(buf)
-  local status = M._status_states and M._status_states[buf] or nil
-  local state = status and status.pr_edit or nil
-  if not state then return nil, nil end
-  return M._pr_edit.mark_row(buf, state.desc_start_mark), M._pr_edit.mark_row(buf, state.desc_end_mark)
-end
-
----@param buf integer
----@param ranges table[]
-function M._pr_edit.prune_markdown_ranges(buf, ranges)
-  if not vim.api.nvim_buf_is_valid(buf) then return end
-  local namespace = M._pr_edit.markdown_namespace()
-  if type(ranges) ~= "table" or #ranges == 0 then
-    vim.api.nvim_buf_clear_namespace(buf, namespace, 0, -1)
-    return
-  end
-  local function row_in_range(row0)
-    for _, range in ipairs(ranges) do
-      if row0 >= range.first0 and row0 < range.after0 then return true end
-    end
-    return false
-  end
-  for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(buf, namespace, 0, -1, {})) do
-    local row0 = mark[2]
-    if not row_in_range(row0) then pcall(vim.api.nvim_buf_del_extmark, buf, namespace, mark[1]) end
-  end
-end
-
----@param row0 integer
----@param ranges table[]
----@return boolean
-function M._pr_edit.row_in_markdown_range(row0, ranges)
-  for _, range in ipairs(ranges or {}) do
-    if row0 >= range.first0 and row0 < range.after0 then return true end
-  end
-  return false
-end
-
----@param ranges table[]
----@return table[]
-function M._pr_edit.markdown_parser_regions(ranges)
-  local region = {}
-  for _, range in ipairs(ranges or {}) do
-    if range.first0 and range.after0 and range.after0 > range.first0 then
-      region[#region + 1] = { range.first0, 0, range.after0, 0 }
-    end
-  end
-  return #region > 0 and { region } or {}
-end
-
----@param parser table
----@param ranges table[]
-function M._pr_edit.apply_markdown_parser_regions(parser, ranges)
-  if type(parser) ~= "table" or type(parser.set_included_regions) ~= "function" then return end
-  pcall(parser.set_included_regions, parser, M._pr_edit.markdown_parser_regions(ranges))
-end
-
----@param buf integer
-function M._pr_edit.prune_description_markdown(buf)
-  local first0, after0 = M._pr_edit.description_range0(buf)
-  if first0 == nil or after0 == nil or after0 <= first0 then
-    M._pr_edit.prune_markdown_ranges(buf, {})
-    return
-  end
-  M._pr_edit.prune_markdown_ranges(buf, { { first0 = first0, after0 = after0 } })
-end
-
----@param ranges table[]?
----@return table[]
-function M._pr_edit.normalized_markdown_ranges(ranges)
-  local normalized = {}
-  for _, range in ipairs(ranges or {}) do
-    local first0 = tonumber(range and range.first0)
-    local after0 = tonumber(range and range.after0)
-    if first0 and after0 and after0 > first0 then
-      normalized[#normalized + 1] = { first0 = first0, after0 = after0 }
-    end
-  end
-  table.sort(normalized, function(left, right)
-    if left.first0 == right.first0 then return left.after0 < right.after0 end
-    return left.first0 < right.first0
-  end)
-  local merged = {}
-  for _, range in ipairs(normalized) do
-    local previous = merged[#merged]
-    if previous and range.first0 <= previous.after0 then
-      previous.after0 = math.max(previous.after0, range.after0)
-    else
-      merged[#merged + 1] = range
-    end
-  end
-  return merged
-end
-
----@param buf integer
----@return table[]
-function M._pr_edit.markdown_ranges0(buf)
-  local ranges = {}
-  local function add_range(first0, after0)
-    if first0 ~= nil and after0 ~= nil and after0 > first0 then
-      ranges[#ranges + 1] = { first0 = first0, after0 = after0 }
-    end
-  end
-
-  local first0, after0 = M._pr_edit.description_range0(buf)
-  add_range(first0, after0)
-
-  local state = M._review.state(buf)
-  if state then
-    add_range(M._review.mark_row(buf, state.review_comment_start), M._review.mark_row(buf, state.review_comment_end))
-    for _, comment in ipairs(state.review_comments or {}) do
-      add_range(M._review.comment_body_range0(buf, comment))
-      for _, range in ipairs(comment.review_markdown_ranges or {}) do
-        add_range(M._review.mark_row(buf, range.start_mark), M._review.mark_row(buf, range.end_mark))
-      end
-    end
-  end
-
-  return M._pr_edit.normalized_markdown_ranges(ranges)
-end
-
----@param buf integer
----@param ranges table[]
----@return fun()
-function M._pr_edit.begin_markdown_extmark_scope(buf, ranges)
-  M._pr_edit.markdown_extmark_scopes = M._pr_edit.markdown_extmark_scopes or {}
-  local scope = M._pr_edit.markdown_extmark_scopes[buf] or { count = 0, ranges = {} }
-  scope.count = scope.count + 1
-  scope.ranges = M._pr_edit.normalized_markdown_ranges(ranges)
-  M._pr_edit.markdown_extmark_scopes[buf] = scope
-
-  if not M._pr_edit.markdown_extmark_set_extmark then
-    local original_set_extmark = vim.api.nvim_buf_set_extmark
-    M._pr_edit.markdown_extmark_original_set_extmark = original_set_extmark
-    M._pr_edit.markdown_extmark_set_extmark = function(mark_buf, namespace, row0, col0, opts)
-      local active_scope = M._pr_edit.markdown_extmark_scopes and M._pr_edit.markdown_extmark_scopes[mark_buf] or nil
-      if active_scope and active_scope.count > 0 and namespace == M._pr_edit.markdown_namespace() then
-        local mark_row0 = tonumber(row0)
-        if mark_row0 and not M._pr_edit.row_in_markdown_range(mark_row0, active_scope.ranges) then return nil end
-      end
-      return original_set_extmark(mark_buf, namespace, row0, col0, opts)
-    end
-    vim.api.nvim_buf_set_extmark = M._pr_edit.markdown_extmark_set_extmark
-  end
-
-  local restored = false
-  return function()
-    if restored then return end
-    restored = true
-    local current_scope = M._pr_edit.markdown_extmark_scopes and M._pr_edit.markdown_extmark_scopes[buf] or nil
-    if current_scope then
-      current_scope.count = current_scope.count - 1
-      if current_scope.count > 0 then
-        M._pr_edit.markdown_extmark_scopes[buf] = current_scope
-      else
-        M._pr_edit.markdown_extmark_scopes[buf] = nil
-      end
-    end
-    if M._pr_edit.markdown_extmark_scopes and next(M._pr_edit.markdown_extmark_scopes) == nil then
-      if vim.api.nvim_buf_set_extmark == M._pr_edit.markdown_extmark_set_extmark then
-        vim.api.nvim_buf_set_extmark = M._pr_edit.markdown_extmark_original_set_extmark
-      end
-      M._pr_edit.markdown_extmark_set_extmark = nil
-      M._pr_edit.markdown_extmark_original_set_extmark = nil
-    end
-  end
-end
-
----@param buf integer
----@param win integer
----@param ranges table[]
----@return table
-function M._pr_edit.markdown_region_config(buf, win, ranges)
-  local conceallevel = vim.api.nvim_get_option_value("conceallevel", { scope = "local", win = win })
-  local concealcursor = vim.api.nvim_get_option_value("concealcursor", { scope = "local", win = win })
-  return {
-    enabled = true,
-    render_modes = true,
-    debounce = 0,
-    completions = { lsp = { enabled = false } },
-    sign = { enabled = false },
-    win_options = {
-      conceallevel = { default = conceallevel, rendered = conceallevel },
-      concealcursor = { default = concealcursor, rendered = concealcursor },
-    },
-    on = {
-      render = function(ctx)
-        M._pr_edit.prune_markdown_ranges(ctx.buf, ranges)
-      end,
-    },
-  }
-end
-
----@param buf integer
-function M._pr_edit.reset_render_markdown_config(buf)
-  local ok, state = pcall(require, "render-markdown.state")
-  if ok and type(state) == "table" and type(state.cache) == "table" then
-    state.cache[buf] = nil
-  end
-end
-
----@param buf integer
----@param ranges table[]
----@return fun()
-function M._pr_edit.begin_markdown_parser_scope(buf, ranges)
-  M._pr_edit.markdown_parser_scopes = M._pr_edit.markdown_parser_scopes or {}
-  M._pr_edit.markdown_parser_ranges = M._pr_edit.markdown_parser_ranges or {}
-  M._pr_edit.markdown_parser_scopes[buf] = (M._pr_edit.markdown_parser_scopes[buf] or 0) + 1
-  M._pr_edit.markdown_parser_ranges[buf] = M._pr_edit.normalized_markdown_ranges(ranges)
-  if M._pr_edit.markdown_parser_get_parser then
-    local restored = false
-    return function()
-      if restored then return end
-      restored = true
-      local count = (M._pr_edit.markdown_parser_scopes[buf] or 1) - 1
-      M._pr_edit.markdown_parser_scopes[buf] = count > 0 and count or nil
-      if count <= 0 and M._pr_edit.markdown_parser_ranges then M._pr_edit.markdown_parser_ranges[buf] = nil end
-    end
-  end
-
-  local original_get_parser = vim.treesitter.get_parser
-  M._pr_edit.markdown_parser_original_get_parser = original_get_parser
-  M._pr_edit.markdown_parser_get_parser = function(parser_buf, lang, opts)
-    local scopes = M._pr_edit.markdown_parser_scopes or {}
-    if lang == nil and (scopes[parser_buf] or 0) > 0 then
-      local parser = original_get_parser(parser_buf, "markdown", opts)
-      local parser_ranges = M._pr_edit.markdown_parser_ranges and M._pr_edit.markdown_parser_ranges[parser_buf] or {}
-      M._pr_edit.apply_markdown_parser_regions(parser, parser_ranges)
-      return parser
-    end
-    return original_get_parser(parser_buf, lang, opts)
-  end
-  vim.treesitter.get_parser = M._pr_edit.markdown_parser_get_parser
-
-  local restored = false
-  return function()
-    if restored then return end
-    restored = true
-    local count = (M._pr_edit.markdown_parser_scopes[buf] or 1) - 1
-    M._pr_edit.markdown_parser_scopes[buf] = count > 0 and count or nil
-    if count <= 0 and M._pr_edit.markdown_parser_ranges then M._pr_edit.markdown_parser_ranges[buf] = nil end
-  end
-end
-
----@param buf integer
----@param win integer
----@return table
-function M._pr_edit.description_markdown_config(buf, win)
-  local first0, after0 = M._pr_edit.description_range0(buf)
-  return M._pr_edit.markdown_region_config(buf, win, M._pr_edit.normalized_markdown_ranges({
-    { first0 = first0, after0 = after0 },
-  }))
-end
-
----@param buf integer
----@return integer?
-function M._pr_edit.markdown_window(buf)
-  if vim.api.nvim_get_current_buf() == buf then return vim.api.nvim_get_current_win() end
-  local wins = vim.fn.win_findbuf(buf)
-  for _, win in ipairs(wins) do
-    if vim.api.nvim_win_is_valid(win) then return win end
-  end
-  return nil
-end
-
----@param buf integer
-function M._pr_edit.activate_markdown_code(buf)
-  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
-  local ok, markdown_code = pcall(require, "markdown_code")
-  if ok and type(markdown_code) == "table" and type(markdown_code.activate) == "function" then
-    markdown_code.activate(buf, {
-      filetype = "markdown",
-      notify_title = "DiffReview",
-    })
-  end
-end
-
----@param buf integer
-function M._pr_edit.render_markdown_regions(buf)
-  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
-
-  M._pr_edit.activate_markdown_code(buf)
-
-  local ranges = M._pr_edit.markdown_ranges0(buf)
-  if #ranges == 0 then
-    M._pr_edit.prune_markdown_ranges(buf, ranges)
-    M._status_stop_markdown_highlighter(buf)
-    return
-  end
-
-  if M._pr_edit.render_markdown_unavailable then return end
-  local ok, render_markdown = pcall(require, "render-markdown")
-  if not ok or type(render_markdown) ~= "table" or type(render_markdown.render) ~= "function" then
-    M._pr_edit.render_markdown_unavailable = true
-    return
-  end
-
-  local win = M._pr_edit.markdown_window(buf)
-  if not win then return end
-  M._pr_edit.reset_render_markdown_config(buf)
-  local restore_parser = M._pr_edit.begin_markdown_parser_scope(buf, ranges)
-  local restore_extmarks = M._pr_edit.begin_markdown_extmark_scope(buf, ranges)
-  local function restore_scope()
-    restore_extmarks()
-    restore_parser()
-  end
-  local config = M._pr_edit.markdown_region_config(buf, win, ranges)
-  local on_render = config.on.render
-  config.on.render = function(ctx)
-    if on_render then on_render(ctx) end
-    restore_scope()
-  end
-  local render_ok, err = pcall(render_markdown.render, {
-    buf = buf,
-    win = win,
-    config = config,
-  })
-  if render_ok then
-    vim.defer_fn(function()
-      M._pr_edit.prune_markdown_ranges(buf, M._pr_edit.markdown_ranges0(buf))
-      restore_scope()
-    end, 100)
-    M._status_stop_markdown_highlighter(buf)
-  else
-    restore_scope()
-    if not M._pr_edit.render_markdown_error_notified then
-      M._pr_edit.render_markdown_error_notified = true
-      vim.notify("DiffReview markdown render failed: " .. tostring(err), vim.log.levels.WARN, { title = "DiffReview" })
-    end
-  end
-end
-
----@param buf integer
-function M._pr_edit.render_description_markdown(buf)
-  M._pr_edit.render_markdown_regions(buf)
-end
-
----@param buf integer
----@param status table
----@return string? title without the "Title:" label
----@return string? desc description block joined with newlines
----@return string? review reviewer-request field without the "Review:" label
----@return string? milestone milestone field without the "Release:" label or marker icon
-function M._pr_edit.current_values(buf, status)
-  local state = status.pr_edit
-  if not state then return nil end
-  local title_row0 = M._pr_edit.field_row(buf, state.title_mark, "^Title:")
-  local review_row0 = M._pr_edit.field_row(buf, state.review_mark, "^Review:")
-  local milestone_row0 = M._pr_edit.field_row(buf, state.milestone_mark, "^Release:")
-  local first0 = M._pr_edit.mark_row(buf, state.desc_start_mark)
-  local after0 = M._pr_edit.mark_row(buf, state.desc_end_mark)
-  if not (title_row0 and review_row0 and milestone_row0 and first0 and after0) then return nil end
-  local title_line = vim.api.nvim_buf_get_lines(buf, title_row0, title_row0 + 1, false)[1] or ""
-  local review_line = vim.api.nvim_buf_get_lines(buf, review_row0, review_row0 + 1, false)[1] or ""
-  local milestone_line = vim.api.nvim_buf_get_lines(buf, milestone_row0, milestone_row0 + 1, false)[1] or ""
-  local title = vim.trim((title_line:gsub("^Title:%s*", "")))
-  local review = vim.trim((review_line:gsub("^Review:%s*", "")))
-  local milestone = M._pr_edit.milestone_value(milestone_line)
-  local desc = state.description_rendered_folded
-    and table.concat(status_markdown_lines(status.pr.body), "\n")
-    or table.concat(vim.api.nvim_buf_get_lines(buf, first0, after0, false), "\n")
-  return title, desc, review, milestone
-end
-
----@param buf integer
----@param status table
----@return boolean title_dirty
----@return boolean desc_dirty
----@return boolean review_dirty
----@return boolean milestone_dirty
-function M._pr_edit.dirty_flags(buf, status)
-  local title, desc, review, milestone = M._pr_edit.current_values(buf, status)
-  if title == nil or not status.pr then return false, false, false, false end
-  local baseline = table.concat(status_markdown_lines(status.pr.body), "\n")
-  return title ~= status.pr.title,
-    desc ~= baseline,
-    M._pr_edit.reviewer_change(status, review).changed,
-    M._pr_edit.milestone_change(status, milestone).changed
-end
-
----@param buf integer
----@param row integer 1-based cursor row
----@return "title"|"review"|"milestone"|"desc"|nil
-function M._pr_edit.region_kind_at(buf, row)
-  local status = M._status_states and M._status_states[buf] or nil
-  local state = status and status.pr_edit or nil
-  if not state then return nil end
-  local title_row0 = M._pr_edit.field_row(buf, state.title_mark, "^Title:")
-  local review_row0 = M._pr_edit.field_row(buf, state.review_mark, "^Review:")
-  local milestone_row0 = M._pr_edit.field_row(buf, state.milestone_mark, "^Release:")
-  local first0 = M._pr_edit.mark_row(buf, state.desc_start_mark)
-  local after0 = M._pr_edit.mark_row(buf, state.desc_end_mark)
-  if title_row0 and row == title_row0 + 1 then return "title" end
-  if review_row0 and row == review_row0 + 1 then return "review" end
-  if milestone_row0 and row == milestone_row0 + 1 then return "milestone" end
-  if first0 and after0 and row >= first0 + 1 and row <= after0 then return "desc" end
-  return nil
-end
-
----@param buf integer
----@param state DiffReviewPrEditState
-function M._pr_edit.clear_markers(buf, state)
-  for _, key in ipairs({ "title_marker_id", "review_marker_id", "milestone_marker_id", "desc_marker_id" }) do
-    if state[key] then
-      pcall(vim.api.nvim_buf_del_extmark, buf, M._pr_edit.ns, state[key])
-      state[key] = nil
-    end
-  end
-end
-
----Show/hide the "*" out-of-sync markers on the Title/Description labels.
----@param buf integer
-function M._pr_edit.refresh_markers(buf)
-  local status = M._status_states and M._status_states[buf] or nil
-  local state = status and status.pr_edit or nil
-  if not (state and vim.api.nvim_buf_is_valid(buf)) then return end
-  local title_dirty, desc_dirty, review_dirty, milestone_dirty = M._pr_edit.dirty_flags(buf, status)
-  local title_row0 = M._pr_edit.field_row(buf, state.title_mark, "^Title:")
-  local review_row0 = M._pr_edit.field_row(buf, state.review_mark, "^Review:")
-  local milestone_row0 = M._pr_edit.field_row(buf, state.milestone_mark, "^Release:")
-  local first0 = M._pr_edit.mark_row(buf, state.desc_start_mark)
-
-  local function set_marker(key, wanted, row0)
-    if wanted and not state[key] and row0 then
-      state[key] = vim.api.nvim_buf_set_extmark(buf, M._pr_edit.ns, row0, 0, {
-        virt_text = { { "*", "DiffReviewPrDirty" } },
-        virt_text_pos = "inline",
-        right_gravity = false,
-      })
-    elseif not wanted and state[key] then
-      pcall(vim.api.nvim_buf_del_extmark, buf, M._pr_edit.ns, state[key])
-      state[key] = nil
-    end
-  end
-
-  set_marker("title_marker_id", title_dirty, title_row0)
-  set_marker("review_marker_id", review_dirty, review_row0)
-  set_marker("milestone_marker_id", milestone_dirty, milestone_row0)
-  set_marker("desc_marker_id", desc_dirty, first0 and first0 - 1 or nil)
-end
-
----Re-renders are blocked while the buffer holds unsynced PR edits; they
----would clobber them.
----@param buf integer
----@return boolean
-function M._pr_edit.blocks_render(buf)
-  local status = M._status_states and M._status_states[buf] or nil
-  local state = status and status.pr_edit or nil
-  if not (state and status.pr and vim.api.nvim_buf_is_valid(buf)) then return false end
-  local title_dirty, desc_dirty, review_dirty, milestone_dirty = M._pr_edit.dirty_flags(buf, status)
-  if not (title_dirty or desc_dirty or review_dirty or milestone_dirty) then return false end
-  vim.notify("Unsynced PR edits — :w to sync before refreshing", vim.log.levels.WARN, { title = "DiffReview" })
-  return true
-end
-
----Locate the title/description regions after a render and re-anchor the
----tracking extmarks. Rendering wipes the buffer, so this runs on every
----PR-view render.
----@param buf integer
-function M._pr_edit.on_render(buf)
-  local status = M._status_states and M._status_states[buf] or nil
-  local state = status and status.pr_edit or nil
-  if not (state and status.pr and vim.api.nvim_buf_is_valid(buf)) then return end
-  vim.api.nvim_buf_clear_namespace(buf, M._pr_edit.ns, 0, -1)
-  state.title_mark, state.review_mark, state.milestone_mark, state.status_mark, state.desc_start_mark, state.desc_end_mark = nil, nil, nil, nil, nil, nil
-  state.title_marker_id, state.review_marker_id, state.milestone_marker_id, state.desc_marker_id = nil, nil, nil, nil
-
-  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-  local title_row, review_row, milestone_row, status_row, label_row
-  for index, line in ipairs(lines) do
-    if not title_row and line:match("^Title:") then title_row = index end
-    if not review_row and line:match("^Review:") then review_row = index end
-    if not milestone_row and line:match("^Release:") then milestone_row = index end
-    if not status_row and line:match("^Status:") then status_row = index end
-    if not label_row and line == "Description:" then label_row = index end
-    if title_row and review_row and milestone_row and status_row and label_row then break end
-  end
-  if not (title_row and review_row and milestone_row and status_row and label_row) then return end
-
-  -- right_gravity=false: a mark with right gravity slides to the next line
-  -- when its own line is replaced (retyped), losing the region.
-  local description_folded = status_folded("pr-head-section:description", false)
-  state.description_rendered_folded = description_folded
-  local body_count = description_folded and 0 or #status_markdown_lines(status.pr.body)
-  state.title_mark = vim.api.nvim_buf_set_extmark(buf, M._pr_edit.ns, title_row - 1, 0, { right_gravity = false })
-  state.review_mark = vim.api.nvim_buf_set_extmark(buf, M._pr_edit.ns, review_row - 1, 0, { right_gravity = false })
-  state.milestone_mark = vim.api.nvim_buf_set_extmark(buf, M._pr_edit.ns, milestone_row - 1, 0, { right_gravity = false })
-  state.status_mark = vim.api.nvim_buf_set_extmark(buf, M._pr_edit.ns, status_row - 1, 0, { right_gravity = false })
-  state.desc_start_mark = vim.api.nvim_buf_set_extmark(buf, M._pr_edit.ns, label_row, 0, { right_gravity = false })
-  state.desc_end_mark = vim.api.nvim_buf_set_extmark(buf, M._pr_edit.ns, label_row + body_count, 0, { right_gravity = false })
-  vim.bo[buf].modified = false
-  M._pr_edit.refresh_markers(buf)
-  M._pr_edit.sync_modifiable(buf)
-  if vim.api.nvim_get_current_buf() ~= buf then M._pr_edit.render_description_markdown(buf) end
-end
-
----@param line string?
----@return string
-function M._pr_edit.milestone_value(line)
-  local value = vim.trim(tostring(line or ""):gsub("^Release:%s*", ""):gsub("^Milestone:%s*", ""))
-  value = vim.trim(value:gsub("^" .. vim.pesc(M._milestone_icon) .. "%s*", ""))
-  return value
-end
-
----@param status table
----@param milestone string?
----@return { current: string, desired: string, changed: boolean }
-function M._pr_edit.milestone_change(status, milestone)
-  local current = M._pr_overview.milestone_title(status and status.pr or nil)
-  local desired = vim.trim(tostring(milestone or ""))
-  return {
-    current = current,
-    desired = desired,
-    changed = current ~= desired,
-  }
-end
-
----@param milestones DiffReviewGhMilestone[]?
----@param title string
----@return DiffReviewGhMilestone?
-function M._pr_edit.find_milestone(milestones, title)
-  local desired = vim.trim(tostring(title or ""))
-  if desired == "" then return nil end
-  local desired_key = desired:lower()
-  for _, milestone in ipairs(milestones or {}) do
-    if vim.trim(tostring(milestone.title or "")):lower() == desired_key then return milestone end
-  end
-  return nil
-end
-
----@param text string?
----@return string[]
-function M._pr_edit.reviewer_usernames(text)
-  local usernames = {}
-  local seen = {}
-  for token in tostring(text or ""):gmatch("@?[%w][%w_-]*") do
-    local username = token:gsub("^@", "")
-    local key = username:lower()
-    if username ~= "" and not seen[key] then
-      seen[key] = true
-      usernames[#usernames + 1] = username
-    end
-  end
-  return usernames
-end
-
----@param reviewers any[]?
----@return table<string, boolean>
-function M._pr_edit.reviewer_set(reviewers)
-  local set = {}
-  for _, reviewer in ipairs(reviewers or {}) do
-    local username = M._pr_overview.reviewer_login(reviewer)
-    if username ~= "" then set[username:lower()] = true end
-  end
-  return set
-end
-
----@param status table
----@param review string?
----@return { current: DiffReviewGhRequestedReviewer[], desired: string[], add: string[], remove: string[], changed: boolean }
-function M._pr_edit.reviewer_change(status, review)
-  local current = status and status.pr and M._pr_overview.pending_reviewers(status.pr, status) or {}
-  local desired = M._pr_edit.reviewer_usernames(review)
-  local current_set = M._pr_edit.reviewer_set(current)
-  local desired_set = M._pr_edit.reviewer_set(desired)
-  local add = {}
-  local remove = {}
-  for _, reviewer in ipairs(desired) do
-    if not current_set[reviewer:lower()] then add[#add + 1] = reviewer end
-  end
-  for _, reviewer in ipairs(current) do
-    local username = M._pr_overview.reviewer_login(reviewer)
-    if username ~= "" and not desired_set[username:lower()] then remove[#remove + 1] = username end
-  end
-  return {
-    current = current,
-    desired = desired,
-    add = add,
-    remove = remove,
-    changed = #add > 0 or #remove > 0,
-  }
-end
-
----@param buf integer
----@param status table
----@param mark_id integer?
----@param segments table[]
----@param label_pattern string?
----@return integer? row0
-function M._pr_edit.patch_head_field_row(buf, status, mark_id, segments, label_pattern)
-  local state = status and status.pr_edit or nil
-  local row0 = state and M._pr_edit.mark_row(buf, mark_id) or nil
-  if label_pattern and vim.api.nvim_buf_is_valid(buf) then
-    for index, line in ipairs(vim.api.nvim_buf_get_lines(buf, 0, -1, false)) do
-      if line:match(label_pattern) then
-        row0 = index - 1
-        break
-      end
-    end
-  end
-  if not (row0 and status and status.pr and vim.api.nvim_buf_is_valid(buf)) then return end
-  local text, segment_highlights = M._status_segment_line_parts(segments)
-  local was_modifiable = vim.bo[buf].modifiable
-  local was_modified = vim.bo[buf].modified
-  local old_text = vim.api.nvim_buf_get_lines(buf, row0, row0 + 1, false)[1] or ""
-  vim.bo[buf].modifiable = true
-  vim.api.nvim_buf_set_text(buf, row0, 0, row0, #old_text, { text })
-  vim.bo[buf].modifiable = was_modifiable
-  vim.bo[buf].modified = was_modified
-  if status.lines then status.lines[row0 + 1] = text end
-  vim.api.nvim_buf_clear_namespace(buf, M._status_ns, row0, row0 + 1)
-  for _, highlight in ipairs(segment_highlights) do
-    pcall(vim.api.nvim_buf_set_extmark, buf, M._status_ns, row0, highlight.start_col, {
-      end_col = highlight.end_col,
-      hl_group = highlight.hl_group,
-      priority = 90,
-    })
-  end
-  return row0
-end
-
----@param buf integer
----@param status table
-function M._pr_edit.patch_review_row(buf, status)
-  local state = status and status.pr_edit or nil
-  local row0 = M._pr_edit.patch_head_field_row(buf, status, state and state.review_mark, {
-    { "Review: ", "DiffReviewStatusLabel" },
-    { M._pr_overview.pending_review_text(status and status.pr or nil, status), "DiffReviewReviewPending" },
-  }, "^Review:")
-  if state and row0 then
-    if state.review_mark then pcall(vim.api.nvim_buf_del_extmark, buf, M._pr_edit.ns, state.review_mark) end
-    state.review_mark = vim.api.nvim_buf_set_extmark(buf, M._pr_edit.ns, row0, 0, { right_gravity = false })
-  end
-end
-
----@param buf integer
----@param status table
-function M._pr_edit.patch_milestone_row(buf, status)
-  local state = status and status.pr_edit or nil
-  local row0 = M._pr_edit.patch_head_field_row(buf, status, state and state.milestone_mark, {
-    { "Release: ", "DiffReviewStatusLabel" },
-    { M._pr_overview.milestone_text(status and status.pr or nil), "DiffReviewStatusBranch" },
-  }, "^Release:")
-  if state and row0 then
-    if state.milestone_mark then pcall(vim.api.nvim_buf_del_extmark, buf, M._pr_edit.ns, state.milestone_mark) end
-    state.milestone_mark = vim.api.nvim_buf_set_extmark(buf, M._pr_edit.ns, row0, 0, { right_gravity = false })
-  end
-end
-
----@param buf integer
----@param status table
-function M._pr_edit.patch_status_row(buf, status)
-  local state = status and status.pr_edit or nil
-  local pr = status and status.pr or nil
-  local row0 = M._pr_edit.patch_head_field_row(buf, status, state and state.status_mark, {
-    { "Status: ", "DiffReviewStatusLabel" },
-    { M._pr_overview.status_text(pr), pr and pr.isDraft and "DiffReviewStatusFetching" or "DiffReviewStatusBranch" },
-  }, "^Status:")
-  if state and row0 then
-    if state.status_mark then pcall(vim.api.nvim_buf_del_extmark, buf, M._pr_edit.ns, state.status_mark) end
-    state.status_mark = vim.api.nvim_buf_set_extmark(buf, M._pr_edit.ns, row0, 0, { right_gravity = false })
-  end
-end
-
----@param buf integer
----@param status table?
----@return integer? row0
-function M._pr_edit.status_row(buf, status)
-  local state = status and status.pr_edit or nil
-  return M._pr_edit.field_row(buf, state and state.status_mark, "^Status:")
-end
-
----@param buf integer
----@return boolean
-function M._pr_edit.cursor_on_status_value(buf)
-  local status = M._status_states and M._status_states[buf] or M._status
-  local row0 = M._pr_edit.status_row(buf, status)
-  if not row0 then return false end
-  local cursor = vim.api.nvim_win_get_cursor(0)
-  if cursor[1] ~= row0 + 1 then return false end
-  local line = vim.api.nvim_buf_get_lines(buf, row0, row0 + 1, false)[1] or ""
-  local value_start = line:find(M._pr_overview.status_text(status and status.pr or nil), 1, true)
-  return value_start ~= nil and cursor[2] >= value_start - 1
-end
-
----@param change { add: string[], remove: string[] }
----@return string[]
-function M._pr_edit.reviewer_change_usernames(change)
-  local usernames = {}
-  local seen = {}
-  for _, list in ipairs({ change.add or {}, change.remove or {} }) do
-    for _, reviewer in ipairs(list) do
-      local username = M._pr_overview.reviewer_login(reviewer)
-      local key = username:lower()
-      if username ~= "" and not seen[key] then
-        seen[key] = true
-        usernames[#usernames + 1] = username
-      end
-    end
-  end
-  return usernames
-end
-
----@param username string
----@param users? table<string, DiffReviewGhUser>
----@return string
-function M._pr_edit.reviewer_display(username, users)
-  local user = users and users[username:lower()] or nil
-  local name = user and vim.trim(user.name or "") or ""
-  if name ~= "" then
-    return ("@%s (%s)"):format(username, name)
-  end
-  return "@" .. username
-end
-
----@param change { add: string[], remove: string[] }
----@param users? table<string, DiffReviewGhUser>
----@return string[]
-function M._pr_edit.review_change_confirmation_lines(change, users)
-  local lines = { "Confirm review request changes:" }
-  if #(change.remove or {}) > 0 then
-    lines[#lines + 1] = "Remove review request:"
-    for _, username in ipairs(change.remove) do
-      lines[#lines + 1] = "  - " .. M._pr_edit.reviewer_display(username, users)
-    end
-  end
-  if #(change.add or {}) > 0 then
-    lines[#lines + 1] = "Request review:"
-    for _, username in ipairs(change.add) do
-      lines[#lines + 1] = "  + " .. M._pr_edit.reviewer_display(username, users)
-    end
-  end
-  return lines
-end
-
----@param buf integer
-function M._pr_edit.restore_dirty(buf)
-  if not vim.api.nvim_buf_is_valid(buf) then return end
-  vim.bo[buf].modified = true
-  M._pr_edit.refresh_markers(buf)
-end
-
----@param change { desired: string[], add: string[], remove: string[] }
----@return string
-function M._pr_edit.review_change_summary(change)
-  local parts = {}
-  if #(change.remove or {}) > 0 then
-    parts[#parts + 1] = "removed " .. table.concat(vim.tbl_map(function(username) return "@" .. username end, change.remove), ", ")
-  end
-  if #(change.add or {}) > 0 then
-    parts[#parts + 1] = "requested " .. table.concat(vim.tbl_map(function(username) return "@" .. username end, change.add), ", ")
-  end
-  return table.concat(parts, "; ")
-end
-
----@param buf integer
----@param status table
-function M._pr_edit.revert_review_row(buf, status)
-  if not (status and status.pr) then return end
-  M._pr_edit.patch_review_row(buf, status)
-  M._pr_edit.refresh_markers(buf)
-  local title_dirty, desc_dirty, review_dirty, milestone_dirty = M._pr_edit.dirty_flags(buf, status)
-  vim.bo[buf].modified = title_dirty or desc_dirty or review_dirty or milestone_dirty
-end
-
----@param status table
----@param reviewers any[]?
-function M._pr_edit.set_pending_reviewers(status, reviewers)
-  if not (status and status.pr) then return end
-  local desired = {}
-  local seen = {}
-  M._pr_overview.add_reviewers(reviewers, desired, seen)
-  status.pr.requestedReviewers = desired
-  if status.pr_edit then status.pr_edit.pending_reviewers = nil end
-end
-
----@param buf integer
----@param status table
-function M._pr_edit.revert_milestone_row(buf, status)
-  if not (status and status.pr) then return end
-  M._pr_edit.patch_milestone_row(buf, status)
-  M._pr_edit.refresh_markers(buf)
-  local title_dirty, desc_dirty, review_dirty, milestone_dirty = M._pr_edit.dirty_flags(buf, status)
-  vim.bo[buf].modified = title_dirty or desc_dirty or review_dirty or milestone_dirty
-end
-
----@param status table
----@param milestone DiffReviewGhMilestone?
-function M._pr_edit.set_pr_milestone(status, milestone)
-  if not (status and status.pr) then return end
-  status.pr.milestone = milestone
-end
-
----@param buf integer
----@param status table
----@param change { desired: string[], add: string[], remove: string[] }
----@param done fun(ok: boolean)
-function M._pr_edit.apply_reviewer_change(buf, status, change, done)
-  local latest = M._status_states and M._status_states[buf] or status
-  if not (latest and latest.pr) then
-    done(false)
-    return
-  end
-
-  local function fail(message)
-    notify_error(message, "DiffReview")
-    M._pr_edit.restore_dirty(buf)
-    done(false)
-  end
-
-  local function request_added()
-    if #(change.add or {}) == 0 then
-      M._pr_edit.set_pending_reviewers(latest, change.desired)
-      M._pr_edit.patch_review_row(buf, latest)
-      vim.bo[buf].modified = false
-      M._pr_edit.refresh_markers(buf)
-      vim.notify(("Review requests updated: %s"):format(M._pr_edit.review_change_summary(change)), vim.log.levels.INFO, { title = "DiffReview" })
-      done(true)
-      return
-    end
-    gh.request_reviewers_async(latest.cwd, latest.pr.number, latest.pr.repo, change.add, function(result)
-      if not vim.api.nvim_buf_is_valid(buf) then
-        done(false)
-        return
-      end
-      if not result.ok then
-        fail("GitHub reviewer request failed: " .. (result.message or "gh failed"))
-        return
-      end
-      M._pr_edit.set_pending_reviewers(latest, change.desired)
-      M._pr_edit.patch_review_row(buf, latest)
-      vim.bo[buf].modified = false
-      M._pr_edit.refresh_markers(buf)
-      vim.notify(("Review requests updated: %s"):format(M._pr_edit.review_change_summary(change)), vim.log.levels.INFO, { title = "DiffReview" })
-      done(true)
-    end)
-  end
-
-  if #(change.remove or {}) == 0 then
-    request_added()
-    return
-  end
-  gh.remove_reviewers_async(latest.cwd, latest.pr.number, latest.pr.repo, change.remove, function(result)
-    if not vim.api.nvim_buf_is_valid(buf) then
-      done(false)
-      return
-    end
-    if not result.ok then
-      fail("GitHub reviewer removal failed: " .. (result.message or "gh failed"))
-      return
-    end
-    request_added()
-  end)
-end
-
----@param change { desired: string[], add: string[], remove: string[] }
----@param done fun(ok: boolean)
-function M._pr_edit.confirm_and_apply_reviewer_change(buf, status, change, done)
-  if not change.changed then
-    done(false)
-    return
-  end
-
-  local usernames = M._pr_edit.reviewer_change_usernames(change)
-  gh.resolve_users_async(status.cwd, usernames, function(user_result)
-    if not vim.api.nvim_buf_is_valid(buf) then
-      done(false)
-      return
-    end
-    local lines = M._pr_edit.review_change_confirmation_lines(change, user_result.users or {})
-    confirm(lines, function()
-      M._pr_edit.apply_reviewer_change(buf, status, change, done)
-    end, function()
-      local latest = M._status_states and M._status_states[buf] or status
-      M._pr_edit.revert_review_row(buf, latest)
-      done(false)
-    end)
-  end)
-end
-
----@param change { desired: string }
----@return string[]
-function M._pr_edit.milestone_create_confirmation_lines(change)
-  return {
-    "Release not found:",
-    "  " .. change.desired,
-    "",
-    "Create it now?",
-  }
-end
-
----@param change { desired: string }
----@return string
-function M._pr_edit.milestone_change_summary(change)
-  if change.desired == "" then return "cleared" end
-  return M._milestone_icon .. " " .. change.desired
-end
-
----@param buf integer
----@param status table
----@param milestone DiffReviewGhMilestone?
----@param done fun(ok: boolean)
-function M._pr_edit.apply_milestone(buf, status, milestone, done)
-  local latest = M._status_states and M._status_states[buf] or status
-  if not (latest and latest.pr) then
-    done(false)
-    return
-  end
-
-  local milestone_number = milestone and tonumber(milestone.number) or nil
-  if milestone and (not milestone_number or milestone_number <= 0) then
-    notify_error("GitHub milestone is missing its number", "DiffReview")
-    M._pr_edit.restore_dirty(buf)
-    done(false)
-    return
-  end
-
-  gh.set_pr_milestone_async(latest.cwd, latest.pr.number, latest.pr.repo, milestone_number, function(result)
-    if not vim.api.nvim_buf_is_valid(buf) then
-      done(false)
-      return
-    end
-    if not result.ok then
-      notify_error("GitHub milestone update failed: " .. (result.message or "gh failed"), "DiffReview")
-      M._pr_edit.restore_dirty(buf)
-      done(false)
-      return
-    end
-    M._pr_edit.set_pr_milestone(latest, milestone or result.milestone)
-    M._pr_edit.patch_milestone_row(buf, latest)
-    vim.bo[buf].modified = false
-    M._pr_edit.refresh_markers(buf)
-    vim.notify(("Release updated: %s"):format(M._pr_edit.milestone_change_summary({
-      desired = M._pr_overview.milestone_title(latest.pr),
-    })), vim.log.levels.INFO, { title = "DiffReview" })
-    done(true)
-  end)
-end
-
----@param buf integer
----@param status table
----@param change { current: string, desired: string, changed: boolean }
----@param done fun(ok: boolean)
-function M._pr_edit.confirm_and_apply_milestone_change(buf, status, change, done)
-  if not change.changed then
-    done(false)
-    return
-  end
-
-  if change.desired == "" then
-    M._pr_edit.apply_milestone(buf, status, nil, done)
-    return
-  end
-
-  gh.repo_milestones_async(status.cwd, status.pr.repo, function(result)
-    if not vim.api.nvim_buf_is_valid(buf) then
-      done(false)
-      return
-    end
-    if not result.ok then
-      notify_error("GitHub milestones lookup failed: " .. (result.message or "gh failed"), "DiffReview")
-      M._pr_edit.restore_dirty(buf)
-      done(false)
-      return
-    end
-
-    local milestone = M._pr_edit.find_milestone(result.milestones or {}, change.desired)
-    if milestone then
-      M._pr_edit.apply_milestone(buf, status, milestone, done)
-      return
-    end
-
-    confirm(M._pr_edit.milestone_create_confirmation_lines(change), function()
-      local latest = M._status_states and M._status_states[buf] or status
-      if not (latest and latest.pr) then
-        done(false)
-        return
-      end
-      gh.create_milestone_async(latest.cwd, latest.pr.repo, change.desired, function(create_result)
-        if not vim.api.nvim_buf_is_valid(buf) then
-          done(false)
-          return
-        end
-        if not create_result.ok or not create_result.milestone then
-          notify_error("GitHub milestone create failed: " .. (create_result.message or "gh failed"), "DiffReview")
-          M._pr_edit.restore_dirty(buf)
-          done(false)
-          return
-        end
-        M._pr_edit.apply_milestone(buf, latest, create_result.milestone, done)
-      end)
-    end, function()
-      local latest = M._status_states and M._status_states[buf] or status
-      M._pr_edit.revert_milestone_row(buf, latest)
-      done(false)
-    end)
-  end)
-end
-
----@param pr DiffReviewGhPR
----@param desired_draft boolean
----@return string[]
-function M._pr_edit.draft_status_confirmation_lines(pr, desired_draft)
-  if desired_draft then
-    return {
-      ("Move PR #%s back to draft?"):format(tostring(pr.number)),
-      "",
-      "Status will change from READY to DRAFT.",
-    }
-  end
-  return {
-    ("Mark PR #%s ready for review?"):format(tostring(pr.number)),
-    "",
-    "Status will change from DRAFT to READY.",
-  }
-end
-
----@param status table
----@return string
-function M._pr_edit.pr_node_id(status)
-  local pr = status and status.pr or nil
-  return type(pr and pr.id) == "string" and pr.id or ""
-end
-
----@param buf integer
----@param status table
----@param desired_draft boolean
----@param done fun(ok: boolean)
-function M._pr_edit.apply_draft_status(buf, status, desired_draft, done)
-  local latest = M._status_states and M._status_states[buf] or status
-  if not (latest and latest.pr) then
-    done(false)
-    return
-  end
-
-  local pr_node_id = M._pr_edit.pr_node_id(latest)
-  if pr_node_id == "" then
-    notify_error("GitHub draft status update failed: missing pull request node id", "DiffReview")
-    done(false)
-    return
-  end
-
-  gh.set_pr_draft_async(latest.cwd, pr_node_id, desired_draft, function(result)
-    if not vim.api.nvim_buf_is_valid(buf) then
-      done(false)
-      return
-    end
-    if not result.ok then
-      notify_error("GitHub draft status update failed: " .. (result.message or "gh failed"), "DiffReview")
-      done(false)
-      return
-    end
-    latest.pr.isDraft = type(result.is_draft) == "boolean" and result.is_draft or desired_draft
-    M._pr_edit.patch_status_row(buf, latest)
-    vim.notify(("PR #%s status updated: %s"):format(tostring(latest.pr.number), M._pr_overview.status_text(latest.pr)), vim.log.levels.INFO, { title = "DiffReview" })
-    done(true)
-  end)
-end
-
----@param buf integer
----@return boolean
-function M._pr_edit.toggle_draft_status_under_cursor(buf)
-  if not M._pr_edit.cursor_on_status_value(buf) then return false end
-  local status = M._status_states and M._status_states[buf] or M._status
-  local state = status and status.pr_edit or nil
-  if not (status and status.pr and state) then return true end
-  local desired_draft = not status.pr.isDraft
-  confirm(M._pr_edit.draft_status_confirmation_lines(status.pr, desired_draft), function()
-    M._pr_edit.enqueue(state, function(done)
-      M._pr_edit.apply_draft_status(buf, status, desired_draft, function()
-        done()
-      end)
-    end)
-  end)
-  return true
-end
-
----Sequential sync queue, mirroring status_enqueue_operation without its
----status-view reconcile tail (which would rebuild the PR buffer as a
----status view).
----@param state DiffReviewPrEditState
----@param operation fun(done: fun())
-function M._pr_edit.enqueue(state, operation)
-  state.queue[#state.queue + 1] = operation
-  local function run_next()
-    if state.running then return end
-    local next_operation = table.remove(state.queue, 1)
-    if not next_operation then return end
-    state.running = true
-    next_operation(function()
-      state.running = false
-      run_next()
-    end)
-  end
-  run_next()
-end
-
----BufWriteCmd handler: clear the "*" markers immediately, then sync the
----dirty fields to GitHub through the queue.
----@param buf integer
-function M._pr_edit.sync(buf)
-  local status = M._status_states and M._status_states[buf] or nil
-  local state = status and status.pr_edit or nil
-  if not (status and state and status.pr) then return end
-  M._status = status
-  local title, desc, review, milestone = M._pr_edit.current_values(buf, status)
-  local title_dirty, desc_dirty, review_dirty, milestone_dirty = M._pr_edit.dirty_flags(buf, status)
-  vim.bo[buf].modified = false
-  if not (title_dirty or desc_dirty or review_dirty or milestone_dirty) then
-    M._pr_edit.patch_review_row(buf, status)
-    M._pr_edit.patch_milestone_row(buf, status)
-    M._pr_edit.patch_status_row(buf, status)
-    return
-  end
-
-  M._pr_edit.clear_markers(buf, state)
-  local pr = status.pr
-  local function sync_title_and_description()
-    if not (title_dirty or desc_dirty) then return end
-    local edit = {
-      title = title_dirty and title or nil,
-      body = desc_dirty and desc or nil,
-    }
-    M._pr_edit.enqueue(state, function(done)
-      gh.update_pr_async(status.cwd, pr.number, pr.repo, edit, function(result)
-        if not vim.api.nvim_buf_is_valid(buf) then
-          done()
-          return
-        end
-        if result.code ~= 0 then
-          notify_error(
-            "GitHub PR update failed: " .. (result.output ~= "" and result.output or ("gh exited " .. tostring(result.code))),
-            "DiffReview"
-          )
-          vim.bo[buf].modified = true
-          M._pr_edit.refresh_markers(buf)
-          done()
-          return
-        end
-        if edit.title then pr.title = edit.title end
-        if edit.body then pr.body = edit.body end
-        local latest = M._status_states and M._status_states[buf] or nil
-        if latest == status then
-          M._status = status
-          render_pr_status(pr, status.cwd, buf, status.pr_diff_text)
-        end
-        vim.notify(("PR #%s updated"):format(tostring(pr.number)), vim.log.levels.INFO, { title = "DiffReview" })
-        done()
-      end)
-    end)
-  end
-
-  local function sync_milestone_then_title_and_description()
-    if milestone_dirty then
-      M._pr_edit.confirm_and_apply_milestone_change(buf, status, M._pr_edit.milestone_change(status, milestone), function(confirmed)
-        if confirmed then sync_title_and_description() end
-      end)
-    else
-      M._pr_edit.patch_milestone_row(buf, status)
-      sync_title_and_description()
-    end
-  end
-
-  if review_dirty then
-    M._pr_edit.confirm_and_apply_reviewer_change(buf, status, M._pr_edit.reviewer_change(status, review), function(confirmed)
-      if confirmed then sync_milestone_then_title_and_description() end
-    end)
-  else
-    M._pr_edit.patch_review_row(buf, status)
-    sync_milestone_then_title_and_description()
-  end
-end
-
----Unlock the buffer exactly when the cursor sits in an editable region, so
----every native editing command works there and nowhere else.
----@param buf integer
-function M._pr_edit.sync_modifiable(buf)
-  if not vim.api.nvim_buf_is_valid(buf) then return end
-  if vim.api.nvim_get_current_buf() ~= buf then return end
-  local row = M._normalize_status_cursor(buf) or vim.api.nvim_win_get_cursor(0)[1]
-  local status = M._status_states and M._status_states[buf] or nil
-  local state = status and status.pr_edit or nil
-  local wanted = M._pr_edit.region_kind_at(buf, row) ~= nil
-    or M._review.in_editable_region(buf, row)
-  if state and state.lock_initial then
-    if state.initial_cursor_row == nil then state.initial_cursor_row = row end
-    if row == state.initial_cursor_row then
-      wanted = false
-    else
-      state.lock_initial = false
-    end
-  end
-  if vim.bo[buf].modifiable ~= wanted then
-    vim.bo[buf].modifiable = wanted
-  end
-  M._pr_edit.render_description_markdown(buf)
-end
-
----Wire editing into a freshly created PR-view buffer: acwrite, the
----cursor-follows-modifiable lock, and lifecycle autocmds.
----@param buf integer
-function M._pr_edit.attach(buf)
-  local status = M._status_states and M._status_states[buf] or nil
-  if not status then return end
-  status.pr_edit = { queue = {}, running = false, lock_initial = true }
-  vim.bo[buf].buftype = "acwrite"
-  require("github.repo_cache").enable_user_completion(buf, status.pr and status.pr.repo or nil)
-
-  -- The title, reviewer request, and milestone fields are single-line: swallow newline attempts there.
-  vim.keymap.set("i", "<CR>", function()
-    local row = vim.api.nvim_win_get_cursor(0)[1]
-    local region = M._pr_edit.region_kind_at(buf, row)
-    if region == "title" or region == "review" or region == "milestone" then return "" end
-    return vim.api.nvim_replace_termcodes("<CR>", true, false, true)
-  end, { buffer = buf, expr = true })
-
-  local group = vim.api.nvim_create_augroup("DiffReviewPrEdit" .. buf, { clear = true })
-  vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI", "BufEnter" }, {
-    group = group,
-    buffer = buf,
-    callback = function()
-      M._pr_edit.sync_modifiable(buf)
-    end,
-  })
-  vim.api.nvim_create_autocmd({ "InsertLeave", "TextChanged", "TextChangedI" }, {
-    group = group,
-    buffer = buf,
-    callback = function()
-      M._review.sync_inline_comment_text(buf)
-      M._pr_edit.refresh_markers(buf)
-      M._pr_edit.render_description_markdown(buf)
-    end,
-  })
-  vim.api.nvim_create_autocmd("BufWriteCmd", {
-    group = group,
-    buffer = buf,
-    callback = function()
-      M._review.sync_inline_comment_text(buf)
-      M._pr_overview.sync_standalone_comments(buf)
-      M._pr_edit.sync(buf)
-    end,
-  })
-end
+-- Render/confirm seams used by the extracted pr_edit module (all in scope here).
+M._confirm = confirm
+M._status_markdown_lines = status_markdown_lines
+M._render_pr_status = render_pr_status
+-- Seams shared with the extracted pr_overview module.
+M._parse_hunk_header = parse_hunk_header
+M._status_short_oid = status_short_oid
+M._status_provider_file_key = status_provider_file_key
+M._status_provider_hunk_key = status_provider_hunk_key
+M._status_entry_under_cursor = status_entry_under_cursor
+M._status_render_file = status_render_file
+-- Seams shared with the extracted review module.
+M._status_command_visible = status_command_visible
+M._status_keys_for = status_keys_for
+M._notify_debug = notify_debug
+M._status_command_specs_by_id = status_command_specs_by_id
+M._status_diff_hunks_for_file = status_diff_hunks_for_file
+-- Seams shared with the extracted hunk_model module.
+M._parse_hunk_body = parse_hunk_body
+M._hunk_add_gutter = hunk_add_gutter
+M._treesitter_line_segments = treesitter_line_segments
+M._hunk_context_scope_key = hunk_context_scope_key
+M._same_hunk_context_scope = same_hunk_context_scope
+M._hunk_first_changed_current_line = hunk_first_changed_current_line
+M._hunk_line_visible_in_context_scope = hunk_line_visible_in_context_scope
+M._pr_edit = require("diff_review.pr_edit")
 
 ---@param entries DiffReviewStatusEntry[]
 ---@param target_section DiffReviewStatusSectionName
@@ -15431,6 +10233,33 @@ local function status_action_entries_for_target(entries, target_section)
     end
   end
   return action_entries
+end
+
+---@param entry DiffReviewStatusEntry
+---@return string?
+function M._status_entry_source_path(entry)
+  local status = M._status
+  if not (entry and entry.file and status) then return nil end
+  return M._status_diff_file_path(entry.file, status)
+end
+
+---@param entries DiffReviewStatusEntry[]
+---@param source_ids string[]
+function M._status_mark_diff_paths_pending(entries, source_ids)
+  local status = M._status
+  if not (status and status.diff_source_registry) then return end
+  local path_set = {}
+  for _, entry in ipairs(entries or {}) do
+    local path = M._status_entry_source_path(entry)
+    if path and path ~= "" then path_set[path] = true end
+  end
+  local paths = status_files_from_set(path_set)
+  if #paths == 0 then return end
+  M._status_perf_event("source.invalidate_paths", status.buf, {
+    source_ids = source_ids,
+    paths = paths,
+  })
+  M._diff_source_loader_model.invalidate(status.diff_source_registry, source_ids, paths)
 end
 
 ---@param entries DiffReviewStatusEntry[]
@@ -15551,6 +10380,7 @@ local function status_stage_entries(entries, opts)
   local staged_files = 0
   local status_buf = M._status and M._status.buf
 
+  M._status_mark_diff_paths_pending(action_entries, { "unstaged", "staged" })
   status_apply_optimistic_entries(action_entries, "staged", target_id)
 
   local function finish()
@@ -15631,6 +10461,7 @@ local function status_unstage_entries(entries, opts)
   local unstaged_files = 0
   local status_buf = M._status and M._status.buf
 
+  M._status_mark_diff_paths_pending(action_entries, { "staged", "unstaged" })
   status_apply_optimistic_entries(tracked_entries, "unstaged", target_id)
   status_apply_optimistic_entries(added_entries, "unstaged", target_id)
 
@@ -15698,7 +10529,7 @@ end
 ---@param target_id? string
 local function status_discard_entries(entries, target_id)
   local status_buf = M._status and M._status.buf
-  git_root_async(function(cwd, root_err)
+  git_backend.git_root_async(function(cwd, root_err)
     if not cwd then
       notify_error(root_err or "Unable to find git root")
       return
@@ -15706,6 +10537,7 @@ local function status_discard_entries(entries, target_id)
 
     local failures = {}
     if #entries == 0 then return end
+    M._status_mark_diff_paths_pending(entries, { "unstaged", "staged" })
 
     local function finish_all()
       if #failures > 0 then M.notify_git_failures("Discard failed", failures) end
@@ -15727,14 +10559,14 @@ local function status_discard_entries(entries, target_id)
         local args = { "apply", "--reverse", "--whitespace=nowarn", "--unidiff-zero" }
         if entry.hunk.staged then args[#args + 1] = "--index" end
         args[#args + 1] = "-"
-        run_git_at_root_async(cwd, args, entry.hunk.diff .. "\n", function(result)
+        git_backend.run_git_at_root_async(cwd, args, entry.hunk.diff .. "\n", function(result)
           if not result.ok then
             failures[#failures + 1] = { file = entry.file.filename, output = result.output, code = result.code }
           end
           next_entry()
         end)
       elseif entry.file.untracked then
-        local delete_code = delete_path(entry.file.filename)
+        local delete_code = git_backend.delete_path(entry.file.filename)
         if delete_code ~= 0 then
           failures[#failures + 1] = {
             file = entry.file.filename,
@@ -15761,7 +10593,7 @@ local function status_discard_entries(entries, target_id)
           ---@param context string
           ---@return boolean
           local function delete_file(path, context)
-            local delete_code = delete_path(path)
+            local delete_code = git_backend.delete_path(path)
             if delete_code == 0 then return true end
             failures[#failures + 1] = {
               file = path,
@@ -15772,7 +10604,7 @@ local function status_discard_entries(entries, target_id)
 
           if entry.file.section_name == "unstaged" then
             if git_status_is_added(entry.file.git_status) then
-              run_git_at_root_async(cwd, { "restore", "--staged", "--", relpath }, nil, function(restore_result)
+              git_backend.run_git_at_root_async(cwd, { "restore", "--staged", "--", relpath }, nil, function(restore_result)
                 if restore_result.ok then
                   delete_file(entry.file.filename, " after unstaging")
                 else
@@ -15781,13 +10613,13 @@ local function status_discard_entries(entries, target_id)
                 next_entry()
               end)
             else
-              run_git_at_root_async(cwd, { "checkout", "--", relpath }, nil, function(checkout_result)
+              git_backend.run_git_at_root_async(cwd, { "checkout", "--", relpath }, nil, function(checkout_result)
                 if not checkout_result.ok then add_failure(checkout_result) end
                 next_entry()
               end)
             end
           elseif git_status_is_added(entry.file.git_status) then
-            run_git_at_root_async(cwd, { "rm", "--cached", "--ignore-unmatch", "--", relpath }, nil, function(rm_result)
+            git_backend.run_git_at_root_async(cwd, { "rm", "--cached", "--ignore-unmatch", "--", relpath }, nil, function(rm_result)
               if rm_result.ok then
                 delete_file(entry.file.filename, " after unstaging")
               else
@@ -15801,13 +10633,13 @@ local function status_discard_entries(entries, target_id)
               failures[#failures + 1] = { file = entry.file.filename, message = "Missing original path for renamed file" }
               next_entry()
             else
-              run_git_at_root_async(cwd, { "restore", "--staged", "--", relpath, original_relpath }, nil, function(restore_result)
+              git_backend.run_git_at_root_async(cwd, { "restore", "--staged", "--", relpath, original_relpath }, nil, function(restore_result)
                 if not restore_result.ok then
                   add_failure(restore_result)
                   next_entry()
                   return
                 end
-                run_git_at_root_async(cwd, { "checkout", "--", original_relpath }, nil, function(checkout_result)
+                git_backend.run_git_at_root_async(cwd, { "checkout", "--", original_relpath }, nil, function(checkout_result)
                   if checkout_result.ok then
                     delete_file(entry.file.filename, " after restoring renamed file")
                   else
@@ -15818,25 +10650,25 @@ local function status_discard_entries(entries, target_id)
               end)
             end
           elseif git_status_is_deleted(entry.file.git_status) then
-            run_git_at_root_async(cwd, { "restore", "--staged", "--", relpath }, nil, function(restore_result)
+            git_backend.run_git_at_root_async(cwd, { "restore", "--staged", "--", relpath }, nil, function(restore_result)
               if not restore_result.ok then
                 add_failure(restore_result)
                 next_entry()
                 return
               end
-              run_git_at_root_async(cwd, { "checkout", "--", relpath }, nil, function(checkout_result)
+              git_backend.run_git_at_root_async(cwd, { "checkout", "--", relpath }, nil, function(checkout_result)
                 if not checkout_result.ok then add_failure(checkout_result) end
                 next_entry()
               end)
             end)
           else
-            run_git_at_root_async(cwd, { "restore", "--staged", "--", relpath }, nil, function(restore_result)
+            git_backend.run_git_at_root_async(cwd, { "restore", "--staged", "--", relpath }, nil, function(restore_result)
               if not restore_result.ok then
                 add_failure(restore_result)
                 next_entry()
                 return
               end
-              run_git_at_root_async(cwd, { "checkout", "--", relpath }, nil, function(checkout_result)
+              git_backend.run_git_at_root_async(cwd, { "checkout", "--", relpath }, nil, function(checkout_result)
                 if not checkout_result.ok then add_failure(checkout_result) end
                 next_entry()
               end)
@@ -15923,110 +10755,7 @@ local function closest_current_line_for_deleted_diff_line(diff_text, old_target_
   end
 end
 
--- File revision buffers: read-only scratch buffers holding a file's content
--- at a git revision, named GitFileRevision://<path>@<rev>. Functions hang off
--- the module table because init.lua is at Lua's 200-local limit.
-M._file_revision = { buffers = {} }
-
----Resolve the revision holding the pre-change content for a deleted diff
----line: the base of the diff the entry was rendered from, which is the only
----revision where the old line number is exact.
----@param entry DiffReviewStatusEntry
----@param status table?
----@return string? rev revision for `git show <rev>:<path>`
----@return string? path repo-relative path in that revision
-function M._file_revision.target(entry, status)
-  if not (entry.hunk and entry.file and status and status.cwd) then return nil end
-  local relpath = repo_relative(entry.file.filename, status.cwd)
-  if not relpath then return nil end
-  local view_kind = status.view_kind or "status"
-  if view_kind == "diff" and status.diff_branch then
-    return status.diff_branch, relpath
-  end
-  if view_kind == "status" and entry.kind == "hunk" then
-    if entry.hunk.staged then
-      return "HEAD", entry.hunk.git_original_file or relpath
-    end
-    return ":0", relpath
-  end
-  return nil
-end
-
----Open (or refresh) the read-only buffer for `path` as it exists at `rev`.
----The buffer is named with the short sha of the underlying commit (HEAD for
----the index revision `:0`, since the index is not a commit).
----@param opts { rev: string, path: string, cwd: string, line: integer?, on_error: fun(message: string) }
-function M._file_revision.open(opts)
-  local label_rev = opts.rev == ":0" and "HEAD" or opts.rev
-  systemlist_async({ "git", "-C", opts.cwd, "rev-parse", "--short", label_rev }, function(label_lines, label_code)
-    local label = label_code == 0 and vim.trim(tostring(label_lines and label_lines[1] or "")) or ""
-    if label == "" then label = opts.rev end
-    M._file_revision.show(opts, label)
-  end)
-end
-
----@param opts { rev: string, path: string, cwd: string, line: integer?, on_error: fun(message: string) }
----@param label string short sha (or raw revision when it cannot be resolved)
-function M._file_revision.show(opts, label)
-  local command = { "git", "-C", opts.cwd, "show", ("%s:%s"):format(opts.rev, opts.path) }
-  systemlist_async(command, function(lines, code, output)
-    if code ~= 0 then
-      opts.on_error(vim.trim(tostring(output or "")))
-      return
-    end
-    local name = ("GitFileRevision://%s@%s"):format(opts.path, label)
-    local buf = M._file_revision.buffers[name]
-    if not (buf and vim.api.nvim_buf_is_valid(buf)) then
-      buf = vim.api.nvim_create_buf(true, false)
-      -- "nowrite", not "nofile": buffer pickers (e.g. snacks) hide nofile
-      -- scratch buffers, and this buffer should stay reachable like a file.
-      vim.bo[buf].buftype = "nowrite"
-      vim.bo[buf].bufhidden = "hide"
-      vim.bo[buf].swapfile = false
-      if not pcall(vim.api.nvim_buf_set_name, buf, name) then
-        pcall(vim.api.nvim_buf_set_name, buf, ("%s#%d"):format(name, buf))
-      end
-      vim.keymap.set("n", "q", function()
-        pcall(vim.api.nvim_buf_delete, buf, { force = true })
-      end, { buffer = buf, silent = true, nowait = true, desc = "Close file revision" })
-      -- Sticky header: a red winbar marks the buffer as a historical revision.
-      -- Window-local, so it must be applied/cleared as windows show the
-      -- buffer; dropbar skips windows whose winbar is already set.
-      local header = ("%%#DiffReviewFileRevisionHeader# %s @ %s — read-only revision %%*"):format(
-        opts.path:gsub("%%", "%%%%"),
-        label:gsub("%%", "%%%%")
-      )
-      vim.api.nvim_create_autocmd("BufWinEnter", {
-        buffer = buf,
-        callback = function()
-          vim.wo.winbar = header
-        end,
-      })
-      vim.api.nvim_create_autocmd("BufWinLeave", {
-        buffer = buf,
-        callback = function()
-          vim.wo.winbar = ""
-        end,
-      })
-      M._file_revision.buffers[name] = buf
-    end
-    vim.bo[buf].readonly = false
-    vim.bo[buf].modifiable = true
-    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-    vim.bo[buf].modifiable = false
-    vim.bo[buf].readonly = true
-    local ft = detect_filetype(opts.path, lines)
-    if ft ~= "" and vim.bo[buf].filetype ~= ft then
-      vim.bo[buf].filetype = ft
-    end
-    vim.api.nvim_win_set_buf(vim.api.nvim_get_current_win(), buf)
-    if opts.line then
-      local target = math.min(math.max(opts.line, 1), vim.api.nvim_buf_line_count(buf))
-      pcall(vim.api.nvim_win_set_cursor, 0, { target, 0 })
-      vim.cmd("normal! zz")
-    end
-  end)
-end
+M._file_revision = require("diff_review.file_revision")
 
 ---Open a read-only buffer with `file` as it exists at git revision `rev`.
 ---Entry point for :GitFileRevision.
@@ -16039,7 +10768,7 @@ function M.open_file_revision(file, rev)
     notify_error("GitFileRevision requires a file and a revision", "DiffReview")
     return
   end
-  git_root_async(function(root, root_err)
+  git_backend.git_root_async(function(root, root_err)
     if not root then
       notify_error(root_err or "Not a git repository", "DiffReview")
       return
@@ -16230,7 +10959,7 @@ function M._status_open_commit_message(commit, cwd)
     return true
   end
 
-  systemlist_async({ "git", "-C", cwd, "show", "-s", "--format=%B", oid }, function(output, code, stderr)
+  git_backend.systemlist_async({ "git", "-C", cwd, "show", "-s", "--format=%B", oid }, function(output, code, stderr)
     if code ~= 0 then
       local message = vim.trim(stderr or "")
       notify_error("Commit message failed: " .. (message ~= "" and message or ("git exited " .. tostring(code))), "DiffReview")
@@ -16347,6 +11076,12 @@ end
 ---@return DiffReviewStatusEntry?
 function M._status_entry_by_id(entry_id)
   if not (entry_id and M._status and M._status.entries) then return nil end
+  local viewport = M._status.diff_viewport
+  if viewport and viewport.enabled and viewport.logical_entries then
+    for _, entry in pairs(viewport.logical_entries) do
+      if entry and entry.id == entry_id then return entry end
+    end
+  end
   for _, entry in pairs(M._status.entries) do
     if entry and entry.id == entry_id then return entry end
   end
@@ -16358,6 +11093,9 @@ end
 function M._status_entry_default_folded(entry)
   if not entry then return false end
   if entry.default_folded ~= nil then return entry.default_folded == true end
+  local ranges = M._status_fold_ranges_for_id(M._status, entry.id)
+  local range = ranges[1]
+  if range and range.default_folded ~= nil then return range.default_folded == true end
   if entry.kind == "file" or entry.kind == "pr_file" then
     return true
   elseif entry.kind == "commit" or entry.kind == "commit_file" then
@@ -16377,25 +11115,42 @@ function M._status_entry_default_folded(entry)
 end
 
 ---@param entry DiffReviewStatusEntry?
-local function status_toggle(entry)
+---@param state? table
+local function status_toggle(entry, state)
+  state = state or M._status
+  if not state then return end
   if not entry then return end
   local fold_id = entry.fold_target_id or entry.id
   if not fold_id then return end
-  if M._status and M._status.buf and M._pr_edit.blocks_render(M._status.buf) then return end
+  if state and state.buf and M._pr_edit.blocks_render(state.buf) then return end
   local fold_entry = entry
   if entry.fold_target_id then
     fold_entry = M._status_entry_by_id(fold_id) or { id = fold_id, kind = "pr_head_section" }
   end
   local default = M._status_entry_default_folded(fold_entry)
-  local next_folded = not status_folded(fold_id, default)
+  local current_folded = status_folded(fold_id, default, state)
+  local native_state = M._status_native_folded(state.buf, M._status_fold_ranges_for_id(state, fold_id), vim.api.nvim_get_current_win())
+  if native_state ~= nil then current_folded = native_state end
+  local next_folded = not current_folded
   if not next_folded then
     status_prewarm_entry_syntax(fold_entry)
   end
-  set_status_folded(fold_id, next_folded)
+  set_status_folded(fold_id, next_folded, state)
   if fold_entry.kind == "commit" and not next_folded and fold_entry.commit then
     status_load_commit_files(fold_entry.commit)
   end
-  render_status_or_notify(M._status.buf, fold_id, vim.api.nvim_win_get_cursor(0)[1], { reuse_sections = true })
+  local native_folded = M._status_set_native_fold_state(state.buf, fold_id, next_folded)
+  if not native_folded then
+    render_status_or_notify(state.buf, fold_id, vim.api.nvim_win_get_cursor(0)[1], { reuse_sections = true })
+  elseif state.view_kind == "status" then
+    local walkthrough = package.loaded["diff_review.walkthrough"]
+    if walkthrough and walkthrough.on_status_rendered then walkthrough.on_status_rendered(state.buf) end
+  end
+  if state.view_kind == "pr" then
+    M._pr_edit.sync_modifiable(state.buf)
+  elseif state.view_kind == "review" then
+    M._review.sync_modifiable(state.buf)
+  end
 end
 
 function M._status_collapse_parent()
@@ -16404,7 +11159,12 @@ function M._status_collapse_parent()
   local parent = M._status_parent_entry(line, entry)
   local target = parent or entry
   set_status_folded(target.id, true)
-  render_status_or_notify(M._status.buf, target.id, vim.api.nvim_win_get_cursor(0)[1], { reuse_sections = true })
+  if not M._status_set_native_fold_state(M._status.buf, target.id, true) then
+    render_status_or_notify(M._status.buf, target.id, vim.api.nvim_win_get_cursor(0)[1], { reuse_sections = true })
+  elseif M._status.view_kind == "status" then
+    local walkthrough = package.loaded["diff_review.walkthrough"]
+    if walkthrough and walkthrough.on_status_rendered then walkthrough.on_status_rendered(M._status.buf) end
+  end
 end
 
 ---@param title string
@@ -16500,7 +11260,7 @@ end
 ---@param buf integer
 ---@param action "push"|"pull"
 local function status_remote_action(buf, action)
-  git_root_async(function(cwd, root_err)
+  git_backend.git_root_async(function(cwd, root_err)
     if not cwd then
       notify_error(root_err or "Unable to find git root")
       return
@@ -16532,9 +11292,9 @@ local function status_remote_action(buf, action)
       end
     end
     notify_debug(title .. "ing changes...", vim.log.levels.INFO, { title = "DiffReview" })
-    system_text_stream_async({ "git", "-C", cwd, action, "--progress" }, nil, update_remote_status, function(result)
+    git_backend.system_text_stream_async({ "git", "-C", cwd, action, "--progress" }, nil, update_remote_status, function(result)
       local compact = {}
-      for _, line in ipairs(text_to_lines((result.stdout or "") .. (result.stderr or ""))) do
+      for _, line in ipairs(git_backend.text_to_lines((result.stdout or "") .. (result.stderr or ""))) do
         if line ~= "" then
           compact[#compact + 1] = line
         end
@@ -16568,11 +11328,15 @@ function M._walkthrough_host(buf)
     end,
     file_key = status_file_key,
     hunk_key = status_hunk_key,
-    set_folded = set_status_folded,
-    rerender = function()
-      render_status_or_notify(buf, nil, nil, { reuse_sections = true })
+    set_folded = function(key, folded)
+      local state = M._status_states and M._status_states[buf] or M._status
+      if state then M._status = state end
+      set_status_folded(key, folded, state)
     end,
-    git_list_async = systemlist_async,
+    rerender = function(target_id, fallback_line)
+      render_status_or_notify(buf, target_id, fallback_line, { reuse_sections = true })
+    end,
+    git_list_async = git_backend.systemlist_async,
     inventory_async = function(cb)
       local state = M._status_states and M._status_states[buf] or M._status
       local cwd = state and state.cwd
@@ -16583,7 +11347,7 @@ function M._walkthrough_host(buf)
       M._inventory.compute_async({
         cwd = cwd,
         sections = state.sections or {},
-        git_list_async = systemlist_async,
+        git_list_async = git_backend.systemlist_async,
         read_file_lines = M._file_source_lines,
         repo_relative = function(filename)
           return repo_relative(filename, cwd)
@@ -16623,6 +11387,7 @@ local function setup_status_keymaps(buf)
       end
     end
   end
+
 
   map("close", "n", function()
     local state = M._status_states and M._status_states[buf] or M._status
@@ -16666,9 +11431,10 @@ local function setup_status_keymaps(buf)
   end)
 
   map("toggle", "n", function()
-    if M._status_states and M._status_states[buf] then M._status = M._status_states[buf] end
+    local status = M._status_states and M._status_states[buf] or M._status
+    if status then M._status = status end
     if M._review.toggle_comment_fold(buf) then return end
-    status_toggle(status_entry_under_cursor())
+    status_toggle(status_entry_under_cursor(status), status)
   end)
 
   map("collapse_parent", "n", function()
@@ -16743,9 +11509,11 @@ local function setup_status_keymaps(buf)
     vim.api.nvim_create_autocmd("CursorMoved", {
       buffer = buf,
       callback = function()
-        if (M.config or config.options or config.defaults).status_cursor_prewarm == false then return end
-        if M._status_states and M._status_states[buf] then M._status = M._status_states[buf] end
-        status_defer_prewarm_under_cursor(buf)
+        M._status_perf_span("status.autocmd_cursor_prewarm", buf, nil, function()
+          if (M.config or config.options or config.defaults).status_cursor_prewarm == false then return end
+          if M._status_states and M._status_states[buf] then M._status = M._status_states[buf] end
+          status_defer_prewarm_under_cursor(buf)
+        end)
       end,
     })
     return
@@ -16788,6 +11556,18 @@ local function setup_status_keymaps(buf)
       status_open_pr(entry)
     elseif entry and entry.kind == "about" then
       status_open_about(entry)
+    elseif entry and entry.kind == "load_more" then
+      local status = M._status_states and M._status_states[buf] or M._status
+      if status then
+        -- Force-render the next chunk of deferred hunks from where the gate stopped, so
+        -- each activation always reveals more even when a single hunk exceeds the budget.
+        local chunk = 6
+        local target = (tonumber(entry.load_more_from) or 1) + chunk - 1
+        status.file_render_limits = status.file_render_limits or {}
+        status.file_render_limits[entry.file_key] = math.max(status.file_render_limits[entry.file_key] or 0, target)
+        M._status = status
+        render_status_or_notify(buf, nil, vim.api.nvim_win_get_cursor(0)[1], { reuse_sections = true })
+      end
     else
       status_jump(entry)
     end
@@ -16865,9 +11645,11 @@ local function setup_status_keymaps(buf)
   vim.api.nvim_create_autocmd("CursorMoved", {
     buffer = buf,
     callback = function()
-      if (M.config or config.options or config.defaults).status_cursor_prewarm == false then return end
-      if M._status_states and M._status_states[buf] then M._status = M._status_states[buf] end
-      status_defer_prewarm_under_cursor(buf)
+      M._status_perf_span("status.autocmd_cursor_prewarm", buf, nil, function()
+        if (M.config or config.options or config.defaults).status_cursor_prewarm == false then return end
+        if M._status_states and M._status_states[buf] then M._status = M._status_states[buf] end
+        status_defer_prewarm_under_cursor(buf)
+      end)
     end,
   })
 end
@@ -16965,26 +11747,6 @@ function M.open_pr_number(number, opts)
   end)
 end
 
----@param pr DiffReviewGhPR
----@param cwd string
----@param buf integer
-function M._review.load_diff(pr, cwd, buf)
-  local state = M._review.state(buf)
-  if not state then return end
-  state.pr_diff_request_id = (state.pr_diff_request_id or 0) + 1
-  local request_id = state.pr_diff_request_id
-  gh.pr_diff_async(cwd, pr.number, pr.repo, function(result)
-    local latest = M._review.state(buf)
-    if not (latest and latest.pr_diff_request_id == request_id and vim.api.nvim_buf_is_valid(buf)) then return end
-    M._status = latest
-    if result.code ~= 0 then
-      notify_error("GitHub PR diff failed: " .. (result.output ~= "" and result.output or ("gh exited " .. result.code)), "DiffReview")
-      return
-    end
-    latest.diff_text = result.stdout or ""
-    M._review.render(buf)
-  end)
-end
 
 --- Open a PR review buffer (":or"): the PR title, an editable review summary,
 --- and the changed files split into Unviewed/Viewed sections.
@@ -17056,47 +11818,7 @@ function M.open_review(pr, opts)
   return buf
 end
 
---- Resolve the PR from the current status/PR buffer and open its review.
----@param buf integer
-function M._review.start(buf)
-  local status = M._status_states and M._status_states[buf] or M._status
-  if not status then return end
-  local pr
-  if status.view_kind == "pr" then
-    pr = status.pr
-  elseif status.pr and status.pr.state == "ready" then
-    pr = status.pr.pr
-  end
-  if not pr then
-    vim.notify("No GitHub PR for this branch", vim.log.levels.INFO, { title = "DiffReview" })
-    return
-  end
-  M.open_review(pr, { cwd = status.cwd })
-end
 
----@param buf integer
-function M._review.setup_keymaps(buf)
-  local function map(id, fn)
-    local spec = status_command_specs_by_id[id]
-    if not (spec and status_command_visible(spec)) then return end
-    for _, key in ipairs(status_keys_for(id)) do
-      local mapped
-      mapped = function()
-        if M._status_states and M._status_states[buf] then M._status = M._status_states[buf] end
-        fn()
-      end
-      M._review.register_command_map(buf, id, spec.modes, key, mapped, { buffer = buf, silent = true, nowait = true, desc = spec.desc })
-    end
-  end
-  map("viewed", function() M._review.toggle_viewed(buf, true) end)
-  map("unviewed", function() M._review.toggle_viewed(buf, false) end)
-  map("comment", function() M._review.add_comment(buf) end)
-  map("delete", function() M._review.delete_comment(buf) end)
-  map("next_comment", function() M._review.navigate(buf, 1) end)
-  map("prev_comment", function() M._review.navigate(buf, -1) end)
-  map("sync", function() M._review.sync(buf) end)
-  map("submit", function() M._review.submit(buf) end)
-end
 
 ---@class DiffReviewBranchDiffOptions
 ---@field cwd? string
@@ -17171,7 +11893,7 @@ function M.open_branch_diff(branch, opts)
     open_for_root(opts.cwd, nil)
     return
   end
-  git_root_async(open_for_root)
+  git_backend.git_root_async(open_for_root)
 end
 
 ---@class DiffReviewCompactPreviewOptions
@@ -17190,7 +11912,7 @@ function M.open_compact_preview(opts)
 
     local command = M._git_diff_command(cwd)
     if opts.staged then command[#command + 1] = "--cached" end
-    systemlist_async(command, function(output, code, stderr)
+    git_backend.systemlist_async(command, function(output, code, stderr)
       if code ~= 0 then
         local message = vim.trim(stderr or "")
         notify_error(message ~= "" and message or "Unable to read git diff", "GitDiffCompactPreview")
@@ -17230,7 +11952,7 @@ function M.open_compact_preview(opts)
   if opts.cwd then
     open_for_root(opts.cwd)
   else
-    git_root_async(open_for_root)
+    git_backend.git_root_async(open_for_root)
   end
 end
 
@@ -17272,7 +11994,7 @@ function M.open()
     notify_error("DiffReview open failed: " .. tostring(err))
     return
   end
-  M._apply_status_window_options(win, state)
+  M._apply_status_window_options(win, M._main_status)
   vim.wo[win].foldcolumn = "0"
   render_status_or_notify(buf)
 end

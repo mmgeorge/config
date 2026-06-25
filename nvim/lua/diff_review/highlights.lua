@@ -14,6 +14,10 @@ function M.setup()
   local inline_del_bg = "#6a1010"
   local normal = vim.api.nvim_get_hl(0, { name = "Normal", link = false })
   local header_fg = normal.fg or "#c0c0c0"
+  local keyword_modifier = vim.api.nvim_get_hl(0, { name = "@keyword.modifier", link = false })
+  local type_hl = vim.api.nvim_get_hl(0, { name = "Type", link = false })
+  local statement_hl = vim.api.nvim_get_hl(0, { name = "Statement", link = false })
+  local variable_hl = vim.api.nvim_get_hl(0, { name = "@variable", link = false })
 
   vim.api.nvim_set_hl(0, "DiffReviewAddBg", { bg = add_bg })
   vim.api.nvim_set_hl(0, "DiffReviewDeleteBg", { bg = del_bg })
@@ -85,6 +89,20 @@ function M.setup()
   vim.api.nvim_set_hl(0, "DiffReviewWalkthroughActionRemove", { fg = "#ff5555", bold = true, italic = true })
   vim.api.nvim_set_hl(0, "DiffReviewWalkthroughType", { fg = "#5bff94" })
   vim.api.nvim_set_hl(0, "DiffReviewWalkthroughItemTitle", { fg = "#ffffff", bold = true })
+  if keyword_modifier.fg == normal.fg then
+    vim.api.nvim_set_hl(0, "@keyword.modifier", { fg = "#ff79c6", bold = true })
+  end
+  if type_hl.fg == normal.fg then
+    vim.api.nvim_set_hl(0, "Type", { fg = "#8be9fd" })
+    vim.api.nvim_set_hl(0, "@type", { fg = "#8be9fd" })
+  end
+  if statement_hl.fg == normal.fg then
+    vim.api.nvim_set_hl(0, "Statement", { fg = "#ff79c6", bold = true })
+    vim.api.nvim_set_hl(0, "@keyword", { fg = "#ff79c6", bold = true })
+  end
+  if variable_hl.fg == normal.fg then
+    vim.api.nvim_set_hl(0, "@variable", { fg = "#f8f8f2" })
+  end
 end
 
 return M

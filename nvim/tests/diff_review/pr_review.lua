@@ -232,6 +232,18 @@ local function find_row(buf, needle)
   error("missing row: " .. needle .. "\n" .. table.concat(lines(buf), "\n"), 2)
 end
 
+local function row_is_folded(buf, row)
+  vim.api.nvim_win_set_buf(0, buf)
+  return vim.fn.foldclosed(row) ~= -1
+end
+
+local function fold_text_at(buf, row)
+  vim.api.nvim_win_set_buf(0, buf)
+  local text = vim.fn.foldtextresult(row)
+  if text ~= "" then return text end
+  return vim.api.nvim_buf_get_lines(buf, row - 1, row, false)[1] or ""
+end
+
 local function assert_cursor_clamped_to_line(buf, row, label)
   vim.api.nvim_win_set_buf(0, buf)
   local line = lines(buf)[row] or ""
@@ -369,6 +381,8 @@ local function run()
   assert_true(not vim.wo[0].linebreak, "review buffer should not enable linebreak")
   assert_true(not vim.wo[0].breakindent, "review buffer should not enable breakindent")
   assert_true(vim.wo[0].conceallevel == 0, "review buffer should not conceal diff code rows")
+  assert_true(vim.wo[0].fillchars:find("fold: ", 1, true) ~= nil, "review buffer should not draw fold filler dots")
+  assert_true(vim.wo[0].winhighlight:find("Folded:Normal", 1, true) ~= nil, "review buffer should not recolor folded rows")
 
   -- ── layout + hint shows the review commands ────────────────────────────────
   assert_true(buffer_contains(buf, "Title: Add the thing"), "title missing")
@@ -420,10 +434,10 @@ local function run()
 
   -- ── Unviewed/Viewed sections use the shared GitStatus fold behavior ────────
   trigger(buf, "<Tab>", find_row(buf, "Unviewed Changes (2)"))
-  wait_for(function() return not buffer_contains(buf, "src/a.txt +1 -1") end, "Unviewed section did not fold")
-  assert_true(not buffer_contains(buf, "src/b.txt +1 -1"), "folded Unviewed section still showed b.txt")
+  wait_for(function() return row_is_folded(buf, find_row(buf, "src/a.txt +1 -1")) end, "Unviewed section did not fold")
+  assert_true(row_is_folded(buf, find_row(buf, "src/b.txt +1 -1")), "folded Unviewed section still showed b.txt")
   trigger(buf, "<Tab>", find_row(buf, "Unviewed Changes (2)"))
-  wait_for(function() return buffer_contains(buf, "src/a.txt +1 -1") end, "Unviewed section did not unfold")
+  wait_for(function() return not row_is_folded(buf, find_row(buf, "src/a.txt +1 -1")) end, "Unviewed section did not unfold")
 
   -- ── S/U move section headers and files between sections ────────────────────
   trigger(buf, "S", find_row(buf, "Unviewed Changes (2)"))
@@ -437,10 +451,12 @@ local function run()
   wait_for(function() return buffer_contains(buf, "Unviewed Changes (1)") end, "S did not move a.txt to viewed")
   assert_true(buffer_contains(buf, "Viewed Changes (1)"), "viewed count did not increase")
   trigger(buf, "<Tab>", find_row(buf, "Viewed Changes (1)"))
-  wait_for(function() return not buffer_contains(buf, "src/a.txt +1 -1") end, "Viewed section did not fold")
-  assert_true(buffer_contains(buf, "src/b.txt +1 -1"), "folding Viewed hid the Unviewed file")
+  wait_for(function() return row_is_folded(buf, row_after(buf, "src/a.txt +1 -1", find_row(buf, "Viewed Changes"))) end, "Viewed section did not fold")
+  assert_true(not row_is_folded(buf, find_row(buf, "src/b.txt +1 -1")), "folding Viewed hid the Unviewed file")
   trigger(buf, "<Tab>", find_row(buf, "Viewed Changes (1)"))
-  wait_for(function() return buffer_contains(buf, "src/a.txt +1 -1") end, "Viewed section did not unfold")
+  wait_for(function()
+    return not row_is_folded(buf, row_after(buf, "src/a.txt +1 -1", find_row(buf, "Viewed Changes")))
+  end, "Viewed section did not unfold")
   local persisted_buf = diff_review.open_review(pr, { cwd = "D:/diffreview-review-root" })
   assert_true(persisted_buf ~= nil, "persisted review did not open")
   wait_for(function() return buffer_contains(persisted_buf, "Viewed Changes (1)") end, "viewed hunk did not persist")
@@ -696,8 +712,9 @@ local function run()
   local folded_comment = diff_review._review.state(buf).review_comments[1]
   trigger(buf, "<Tab>", find_row(buf, "Edited comment body"))
   wait_for(function() return folded_comment.review_folded == true end, "<Tab> on comment body did not fold the comment")
-  local folded_row = vim.api.nvim_win_get_cursor(0)[1]
-  local folded_line = lines(buf)[folded_row] or ""
+  local folded_row = diff_review._review.comment_header_row0(buf, folded_comment) + 1
+  local folded_body_row = diff_review._review.comment_body_rows(buf, folded_comment)
+  local folded_line = fold_text_at(buf, folded_row)
   assert_true(
     folded_line:find(diff_review._review.comment_icon .. " me commented", 1, true) == 1,
     "folded comment did not start with icon/user/date: " .. folded_line
@@ -706,14 +723,17 @@ local function run()
     folded_line:find(" | Edited comment body", 1, true) ~= nil,
     "folded comment did not include preview text: " .. folded_line
   )
-  assert_true(not buffer_has_exact_line(buf, "Edited comment body"), "folded comment still rendered the editable body row")
-  assert_true(diff_review._review.comment_body_rows(buf, folded_comment) == nil, "folded comment kept editable body extmarks")
+  assert_true(buffer_has_exact_line(buf, "Edited comment body"), "folded comment lost the editable body row")
+  assert_true(folded_body_row ~= nil and row_is_folded(buf, folded_body_row), "folded comment body row stayed visible")
   assert_true(not vim.bo[buf].modifiable, "folded comment preview must stay read-only")
 
   trigger(buf, "<Tab>", folded_row)
   wait_for(function()
     local start_row = diff_review._review.comment_body_rows(buf, folded_comment)
-    return folded_comment.review_folded ~= true and start_row ~= nil and buffer_has_exact_line(buf, "Edited comment body")
+    return folded_comment.review_folded ~= true
+      and start_row ~= nil
+      and not row_is_folded(buf, start_row)
+      and buffer_has_exact_line(buf, "Edited comment body")
   end, "<Tab> on folded comment did not unfold it")
 
   trigger(buf, "<Tab>", find_row(buf, "Edited comment body"))
@@ -721,7 +741,10 @@ local function run()
   trigger(buf, "<Tab>", vim.api.nvim_win_get_cursor(0)[1])
   wait_for(function()
     local start_row = diff_review._review.comment_body_rows(buf, folded_comment)
-    return folded_comment.review_folded ~= true and start_row ~= nil and buffer_has_exact_line(buf, "Edited comment body")
+    return folded_comment.review_folded ~= true
+      and start_row ~= nil
+      and not row_is_folded(buf, start_row)
+      and buffer_has_exact_line(buf, "Edited comment body")
   end, "second folded comment toggle did not restore the body")
 
   trigger(buf, "<Tab>", find_row(buf, " L2"))
@@ -729,7 +752,10 @@ local function run()
   trigger(buf, "C", vim.api.nvim_win_get_cursor(0)[1])
   wait_for(function()
     local start_row = diff_review._review.comment_body_rows(buf, folded_comment)
-    return folded_comment.review_folded ~= true and start_row ~= nil and vim.api.nvim_win_get_cursor(0)[1] == start_row
+    return folded_comment.review_folded ~= true
+      and start_row ~= nil
+      and not row_is_folded(buf, start_row)
+      and vim.api.nvim_win_get_cursor(0)[1] == start_row
   end, "C on folded comment did not unfold and focus the body")
 
   -- ── visual deletion edits inline without opening a popup ───────────────────

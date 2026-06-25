@@ -3,6 +3,18 @@ vim.loader.enable(false)
 local diff_review = require("diff_review")
 local gh = require("diff_review.gh")
 
+-- Diff-body syntax/background/intraline live in the decoration span store and are
+-- emitted by the provider; drive the test seam to apply them into the decorate
+-- namespace, then read marks from both namespaces (gutter stays in _status_ns).
+local function row_marks(buf, row)
+  pcall(diff_review._status_decorate_rows, buf, row, row)
+  local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
+  for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(buf, diff_review._status_decorate_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })) do
+    marks[#marks + 1] = mark
+  end
+  return marks
+end
+
 local ferrous_root = "D:/code/ferrous"
 local calls = {}
 
@@ -107,7 +119,7 @@ end
 
 local function extmark_groups(buf, row)
   local groups = {}
-  local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
+  local marks = row_marks(buf, row)
   for _, mark in ipairs(marks) do
     local details = mark[4] or {}
     if type(details.hl_group) == "table" then

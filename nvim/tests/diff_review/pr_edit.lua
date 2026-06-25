@@ -627,6 +627,28 @@ local function find_row_after(buf, needle, after_row)
   error("missing row after " .. tostring(after_row) .. ": " .. needle .. "\n" .. table.concat(lines, "\n"), 2)
 end
 
+local function row_is_folded(buf, row)
+  vim.api.nvim_win_set_buf(0, buf)
+  return vim.fn.foldclosed(row) ~= -1
+end
+
+local function fold_text_at(buf, row)
+  vim.api.nvim_win_set_buf(0, buf)
+  local text = vim.fn.foldtextresult(row)
+  if text ~= "" then return text end
+  return vim.api.nvim_buf_get_lines(buf, row - 1, row, false)[1] or ""
+end
+
+local function find_status_entry_row(buf, predicate, label)
+  local state = diff_review._status_states and diff_review._status_states[buf] or nil
+  assert_true(state ~= nil, "missing status state for " .. tostring(label))
+  for row = 1, vim.api.nvim_buf_line_count(buf) do
+    local entry = state.entries and state.entries[row] or nil
+    if entry and predicate(entry, row) then return row end
+  end
+  error("missing status entry: " .. tostring(label), 2)
+end
+
 local function line_has_highlight(buf, row, hl_group, start_col, end_col)
   for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })) do
     local details = mark[4] or {}
@@ -907,6 +929,8 @@ local function run()
   assert_true(not vim.wo[0].linebreak, "PR overview should not enable linebreak")
   assert_true(not vim.wo[0].breakindent, "PR overview should not enable breakindent")
   assert_true(vim.wo[0].conceallevel == 0, "PR overview should not conceal code rows")
+  assert_true(vim.wo[0].fillchars:find("fold: ", 1, true) ~= nil, "PR overview should not draw fold filler dots")
+  assert_true(vim.wo[0].winhighlight:find("Folded:Normal", 1, true) ~= nil, "PR overview should not recolor folded rows")
   assert_true(buffer_contains(buf, "Line one"), "PR body did not render")
   wait_for(function() return buffer_contains(buf, "This is a regular comment") end, "PR conversation comment did not render")
   wait_for(function() return buffer_contains(buf, "Activity: 5 hours ago") end, "PR activity row did not use the newest comment/review activity")
@@ -919,8 +943,13 @@ local function run()
     "PR activity row should render after Status"
   )
   assert_true(buffer_contains(buf, "Comments (2):"), "PR comments heading did not use section heading format")
-  local first_regular_comment_row = find_row(buf, "This is a regular comment")
-  local first_regular_comment_line = vim.api.nvim_buf_get_lines(buf, first_regular_comment_row - 1, first_regular_comment_row, false)[1] or ""
+  local first_regular_comment_row = find_status_entry_row(buf, function(entry)
+    return entry.kind == "pr_comment"
+      and entry.pr_comment
+      and not entry.pr_comment_body
+      and entry.pr_comment.body == "This is a regular comment"
+  end, "first regular PR comment")
+  local first_regular_comment_line = fold_text_at(buf, first_regular_comment_row)
   assert_true(
     first_regular_comment_line:find("me 10 hours ago  This is a regular comment", 1, true) ~= nil,
     "regular PR comment row did not align metadata without action text: " .. first_regular_comment_line
@@ -936,8 +965,13 @@ local function run()
     "long PR conversation comment preview did not render"
   )
   assert_true(not buffer_has_carriage_return(buf), "PR comments rendered raw carriage returns")
-  local long_regular_preview_row = find_row(buf, "Lorem Ipsum is the ubiquitous placeholder")
-  local long_regular_preview_line = vim.api.nvim_buf_get_lines(buf, long_regular_preview_row - 1, long_regular_preview_row, false)[1] or ""
+  local long_regular_preview_row = find_status_entry_row(buf, function(entry)
+    return entry.kind == "pr_comment"
+      and entry.pr_comment
+      and not entry.pr_comment_body
+      and tostring(entry.pr_comment.body or ""):find("Second full line for expansion", 1, true) ~= nil
+  end, "long regular PR comment")
+  local long_regular_preview_line = fold_text_at(buf, long_regular_preview_row)
   assert_true(
     long_regular_preview_line:find("me 5 hours ago   Lorem Ipsum is the ubiquitous placeholder", 1, true) ~= nil,
     "long PR comment row did not align the shorter date column: " .. long_regular_preview_line
@@ -946,18 +980,13 @@ local function run()
     line_has_substring_highlight(buf, long_regular_preview_row, "5 hours ago", "DiffReviewStatusDate"),
     "long PR comment date did not use date highlight"
   )
-  assert_true(
-    not buffer_contains(buf, "Second full line for expansion"),
-    "long PR conversation comment should render collapsed by default"
-  )
-  assert_true(
-    not buffer_contains(buf, "```ts"),
-    "long PR conversation comment code block should stay collapsed by default"
-  )
+  assert_true(not buffer_contains(buf, "Second full line for expansion"), "long PR conversation comment body should not render while folded")
+  assert_true(not buffer_contains(buf, "```ts"), "long PR conversation comment code block should not render while folded")
   wait_for(function() return buffer_contains(buf, "Reviews (3):") end, "submitted reviews section did not render")
+  local has_single_inline_row, single_inline_row = pcall(find_row, buf, "Single inline review shell")
   assert_true(
-    not buffer_contains(buf, "Single inline review shell"),
-    "single inline-comment review shell should not render in Reviews"
+    not has_single_inline_row or row_is_folded(buf, single_inline_row),
+    "single inline-comment review shell should stay hidden unless its diff is expanded"
   )
   assert_true(buffer_contains(buf, "Changes (1):"), "PR changes heading did not use section heading format")
   assert_true(
@@ -1007,12 +1036,12 @@ local function run()
   move_cursor(buf, checks_status_row)
   trigger_buf_mapping(buf, "<Tab>")
   wait_for(function()
-    return not buffer_contains(buf, "Dummy Lint") and not buffer_contains(buf, "Dummy Unit Tests")
+    return row_is_folded(buf, find_row(buf, "Dummy Lint")) and row_is_folded(buf, find_row(buf, "Dummy Unit Tests"))
   end, "PR checks heading did not fold check rows")
   assert_true(buffer_contains(buf, "Description:"), "folding PR checks hid the Description heading")
   move_cursor(buf, checks_status_row)
   trigger_buf_mapping(buf, "<Tab>")
-  wait_for(function() return buffer_contains(buf, "Dummy Lint") end, "PR checks heading did not unfold check rows")
+  wait_for(function() return not row_is_folded(buf, find_row(buf, "Dummy Lint")) end, "PR checks heading did not unfold check rows")
   lint_check_row = find_row(buf, "Dummy Lint")
   checks_status_row = lint_check_row - 1
   description_row = find_row(buf, "Description:")
@@ -1020,9 +1049,8 @@ local function run()
   move_cursor(buf, description_row)
   trigger_buf_mapping(buf, "<Tab>")
   wait_for(function()
-    return not buffer_contains(buf, "Line one") and not buffer_contains(buf, "Line two")
+    return row_is_folded(buf, find_row(buf, "Line one")) and row_is_folded(buf, find_row(buf, "Line two"))
   end, "PR Description heading did not fold the description body")
-  assert_true(#render_markdown_mark_rows(buf) == 0, "folded PR description kept markdown marks")
   local folded_description_row = find_row(buf, "Description:")
   local folded_description_entry = diff_review._status_states[buf].entries[folded_description_row]
   assert_true(
@@ -1041,12 +1069,12 @@ local function run()
     "Description unfold render was blocked as dirty: " .. vim.inspect(captured_notifications)
   )
   wait_for(function()
-    return buffer_contains(buf, "Line one") and buffer_contains(buf, "Line two")
+    return not row_is_folded(buf, find_row(buf, "Line one")) and not row_is_folded(buf, find_row(buf, "Line two"))
   end, "PR Description heading did not unfold the description body")
   description_row = find_row(buf, "Description:")
   wait_for(function()
     local rows = render_markdown_mark_rows(buf)
-    return #rows == 1 and rows[1] == find_row(buf, "Line one")
+    return row_list_contains(rows, find_row(buf, "Line one")) and not row_list_contains(rows, 1)
   end, "PR description markdown marks did not return after unfolding")
   wait_for(function()
     return buffer_contains(buf, "foo     10 hours ago  This requires a few changes...")
@@ -1075,13 +1103,10 @@ local function run()
   assert_true(line_has_highlight(buf, approved_summary_row, "DiffReviewAddRange"), "approved review summary did not highlight status green")
   assert_true(not line_has_highlight(buf, commented_summary_row, "DiffReviewAddRange"), "commented review summary should not be green")
   assert_true(not line_has_highlight(buf, commented_summary_row, "DiffReviewDeleteRange"), "commented review summary should not be red")
-  local changes_file_row = find_row(buf, "src/a.txt +1 -1")
+  local changes_file_row = find_row_after(buf, "src/a.txt +1 -1", changes_heading_row)
   local recent_commits_row = find_row(buf, "Recent Commits (2):")
   assert_true(recent_commits_row > changes_file_row, "PR recent commits section did not render at the end")
-  assert_true(
-    not pcall(find_row_after, buf, "abc1234  1 day ago  chore: head commit", recent_commits_row),
-    "PR recent commits should start folded"
-  )
+  assert_true(not buffer_contains(buf, "abc1234  1 day ago  chore: head commit"), "PR recent commits should start folded")
   move_cursor(buf, recent_commits_row)
   trigger_buf_mapping(buf, "<Tab>")
   local head_commit_row = find_row_after(buf, "abc1234  1 day ago  chore: head commit", recent_commits_row)
@@ -1101,7 +1126,7 @@ local function run()
   wait_for(function() return buffer_contains(buf, "NEW LINE") end, "PR changed file did not expand")
   wait_for(function() return buffer_contains(buf, "This is inline comment without review") end, "PR inline code comment did not render")
   wait_for(function() return buffer_contains(buf, "Oh good point! fixed") end, "PR inline reply did not render")
-  local changed_code_row = find_row(buf, "NEW LINE")
+  local changed_code_row = find_row_after(buf, "NEW LINE", changes_file_row)
   local inline_comment_row = find_row_after(buf, "This is inline comment without review", changes_file_row)
   assert_true(
     inline_comment_row > changed_code_row,
@@ -1116,28 +1141,38 @@ local function run()
   trigger_buf_mapping(buf, "<Tab>")
   local expected_folded_preview = diff_review._review.comment_icon
     .. " me commented 10 hours ago | This is inline comment without review"
+  local inline_comment_header_row = find_status_entry_row(buf, function(entry, row)
+    return entry.kind == "review_comment"
+      and row > changes_file_row
+      and entry.review_boundary == "header"
+      and entry.review_comment
+      and tostring(entry.review_comment.body or ""):find("This is inline comment without review", 1, true) ~= nil
+  end, "inline review comment header")
   wait_for(function()
-    local ok, folded_row = pcall(find_row_after, buf, "This is inline comment without review", changes_file_row)
-    if not ok then return false end
-    local folded_line = vim.api.nvim_buf_get_lines(buf, folded_row - 1, folded_row, false)[1] or ""
-    return folded_line:find(expected_folded_preview, 1, true) ~= nil
-      and not buffer_contains(buf, "Oh good point! fixed")
+    return row_is_folded(buf, inline_comment_header_row)
+      and row_is_folded(buf, inline_reply_row)
+      and fold_text_at(buf, inline_comment_header_row):find(expected_folded_preview, 1, true) ~= nil
   end, "PR inline code comment did not fold")
-  inline_comment_row = find_row_after(buf, "This is inline comment without review", changes_file_row)
+  inline_comment_row = inline_comment_header_row
   move_cursor(buf, inline_comment_row)
   trigger_buf_mapping(buf, "<Tab>")
-  wait_for(function() return buffer_contains(buf, "Oh good point! fixed") end, "PR inline code comment did not unfold")
+  wait_for(function() return not row_is_folded(buf, inline_reply_row) end, "PR inline code comment did not unfold")
   inline_comment_row = find_row_after(buf, "This is inline comment without review", changes_file_row)
   inline_reply_row = find_row_after(buf, "Oh good point! fixed", inline_comment_row)
   local rejected_review_row = find_row(buf, "foo     10 hours ago")
   local regular_comment_row = find_row(buf, "This is a regular comment")
-  local long_regular_comment_row = find_row(buf, "Lorem Ipsum is the ubiquitous placeholder")
+  local long_regular_comment_row = find_status_entry_row(buf, function(entry)
+    return entry.kind == "pr_comment"
+      and entry.pr_comment
+      and not entry.pr_comment_body
+      and tostring(entry.pr_comment.body or ""):find("Second full line for expansion", 1, true) ~= nil
+  end, "long regular PR comment")
   move_cursor(buf, long_regular_comment_row)
   trigger_buf_mapping(buf, "<Tab>")
   wait_for(function()
-    return buffer_contains(buf, "```ts")
-      and buffer_contains(buf, "interface CommentBlock {")
-      and buffer_contains(buf, "Second full line for expansion")
+    return not row_is_folded(buf, find_row(buf, "```ts"))
+      and not row_is_folded(buf, find_row(buf, "interface CommentBlock {"))
+      and not row_is_folded(buf, find_row(buf, "Second full line for expansion"))
   end, "regular PR conversation comment did not expand")
   assert_true(not buffer_has_carriage_return(buf), "expanded PR comment rendered raw carriage returns")
   local comment_code_fence_row = find_row(buf, "```ts")
@@ -1159,18 +1194,28 @@ local function run()
     "https://github.com/owner/repo/pull/7#issuecomment-4702465967",
     "expanded regular PR comment body"
   )
-  long_regular_comment_row = find_row(buf, "Lorem Ipsum is the ubiquitous placeholder")
+  long_regular_comment_row = find_status_entry_row(buf, function(entry)
+    return entry.kind == "pr_comment"
+      and entry.pr_comment
+      and not entry.pr_comment_body
+      and tostring(entry.pr_comment.body or ""):find("Second full line for expansion", 1, true) ~= nil
+  end, "long regular PR comment")
   move_cursor(buf, long_regular_comment_row)
   trigger_buf_mapping(buf, "<Tab>")
   wait_for(function()
-    return not buffer_contains(buf, "Second full line for expansion")
+    return row_is_folded(buf, find_row(buf, "Second full line for expansion"))
   end, "regular PR conversation comment did not collapse")
-  assert_true(not buffer_contains(buf, "```ts"), "collapsed regular PR comment kept its code block")
-  long_regular_comment_row = find_row(buf, "Lorem Ipsum is the ubiquitous placeholder")
+  assert_true(row_is_folded(buf, find_row(buf, "```ts")), "collapsed regular PR comment kept its code block visible")
+  long_regular_comment_row = find_status_entry_row(buf, function(entry)
+    return entry.kind == "pr_comment"
+      and entry.pr_comment
+      and not entry.pr_comment_body
+      and tostring(entry.pr_comment.body or ""):find("Second full line for expansion", 1, true) ~= nil
+  end, "long regular PR comment")
   move_cursor(buf, long_regular_comment_row)
   trigger_buf_mapping(buf, "C")
   wait_for(function()
-    return buffer_contains(buf, "Second full line for expansion")
+    return not row_is_folded(buf, find_row(buf, "Second full line for expansion"))
   end, "viewer-authored regular PR comment did not open for editing")
   local long_regular_comment_body_row = find_row(buf, "Second full line for expansion")
   move_cursor(buf, long_regular_comment_body_row)
@@ -1189,9 +1234,20 @@ local function run()
   )
   wait_for(function() return saw_notification_containing("PR comment synced") end, "successful regular PR comment update was not notified")
   assert_true(buffer_contains(buf, "Edited existing regular comment"), "updated regular PR comment disappeared from the PR overview")
-  regular_comment_row = find_row(buf, "This is a regular comment")
-  changes_file_row = find_row(buf, "src/a.txt +1 -1")
-  inline_comment_row = find_row_after(buf, "This is inline comment without review", changes_file_row)
+  regular_comment_row = find_status_entry_row(buf, function(entry)
+    return entry.kind == "pr_comment"
+      and entry.pr_comment
+      and not entry.pr_comment_body
+      and entry.pr_comment.body == "This is a regular comment"
+  end, "first regular PR comment")
+  changes_file_row = find_row_after(buf, "src/a.txt +1 -1", find_row(buf, "Changes (1):"))
+  inline_comment_row = find_status_entry_row(buf, function(entry, row)
+    return entry.kind == "review_comment"
+      and row > changes_file_row
+      and entry.review_boundary == "header"
+      and entry.review_comment
+      and tostring(entry.review_comment.body or ""):find("This is inline comment without review", 1, true) ~= nil
+  end, "inline review comment header")
   inline_reply_row = find_row_after(buf, "Oh good point! fixed", inline_comment_row)
   rejected_review_row = find_row(buf, "foo     10 hours ago")
   opened_urls = {}
@@ -1234,8 +1290,8 @@ local function run()
     "fresh regular PR comment"
   )
 
-  changes_file_row = find_row(buf, "src/a.txt +1 -1")
-  changed_code_row = find_row(buf, "NEW LINE")
+  changes_file_row = find_row_after(buf, "src/a.txt +1 -1", find_row(buf, "Changes (1):"))
+  changed_code_row = find_row_after(buf, "NEW LINE", changes_file_row)
   move_cursor(buf, changed_code_row)
   trigger_buf_mapping(buf, "C")
   local standalone_header_row = find_row_after(buf, "you commented", changed_code_row)
@@ -1295,13 +1351,10 @@ local function run()
   move_cursor(buf, expanded_file_row)
   trigger_buf_mapping(buf, "<Tab>")
   wait_for(function()
-    local current_review_row = find_row(buf, "foo     10 hours ago")
-    local current_changes_row = find_row_after(buf, "Changes", current_review_row)
-    local review_block = table.concat(vim.api.nvim_buf_get_lines(buf, current_review_row - 1, current_changes_row - 1, false), "\n")
-    return review_block:find("src/a.txt +1 -1", 1, true)
-      and not review_block:find("NEW LINE", 1, true)
-      and not review_block:find("This is inline comment without review", 1, true)
-      and not review_block:find("Oh good point! fixed", 1, true)
+    return row_is_folded(buf, expanded_file_row)
+      and row_is_folded(buf, expanded_code_row)
+      and row_is_folded(buf, expanded_parent_row)
+      and row_is_folded(buf, expanded_reply_row)
   end, "expanded review file did not fold its diff context")
 
   rejected_review_row = find_row(buf, "foo     10 hours ago")
@@ -1309,9 +1362,8 @@ local function run()
   move_cursor(buf, expanded_file_row)
   trigger_buf_mapping(buf, "<Tab>")
   wait_for(function()
-    local current_changes_row = find_row_after(buf, "Changes", rejected_review_row)
-    local ok, current_code_row = pcall(find_row_after, buf, "NEW LINE", expanded_file_row)
-    return ok and current_code_row < current_changes_row
+    return not row_is_folded(buf, expanded_file_row)
+      and not row_is_folded(buf, find_row_after(buf, "NEW LINE", expanded_file_row))
   end, "expanded review file did not reopen after folding")
   changes_heading_row = find_row_after(buf, "Changes", rejected_review_row)
   expanded_code_row = find_row_after(buf, "NEW LINE", expanded_file_row)

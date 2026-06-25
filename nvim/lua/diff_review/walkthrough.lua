@@ -78,7 +78,7 @@
 ---@field file_key fun(section_name: string, filename: string): string
 ---@field hunk_key fun(section_name: string, filename: string, diff?: string): string
 ---@field set_folded fun(key: string, folded: boolean)
----@field rerender fun() synchronous reuse_sections re-render
+---@field rerender fun(target_id?: string, fallback_line?: integer) synchronous reuse_sections re-render
 ---@field git_list_async fun(command: string[], cb: fun(output: string[], code: integer))
 ---@field inventory_async? fun(cb: fun(result: DiffReviewInventoryResult))
 
@@ -557,18 +557,24 @@ function M._flow_summary_lines_for_test(flow, width)
   return flow_summary_lines(flow, width)
 end
 
----@param mode DiffReviewWalkthroughMode
+---@param win integer?
 ---@return integer
-local function status_render_width(mode)
-  local win = mode and mode.host and mode.host.buf and vim.fn.bufwinid(mode.host.buf) or -1
+local function effective_window_columns(win)
   local columns = vim.o.columns
-  if win ~= -1 then
+  if win and win ~= -1 and #vim.api.nvim_list_uis() > 0 then
     local ok, win_width = pcall(vim.api.nvim_win_get_width, win)
     if ok and type(win_width) == "number" and win_width > 0 then
       columns = win_width
     end
   end
-  return math.max(40, columns - 4)
+  return columns
+end
+
+---@param mode DiffReviewWalkthroughMode
+---@return integer
+local function status_render_width(mode)
+  local win = mode and mode.host and mode.host.buf and vim.fn.bufwinid(mode.host.buf) or -1
+  return math.max(40, effective_window_columns(win) - 4)
 end
 
 ---@param lines string[]
@@ -1089,10 +1095,13 @@ local function ensure_expanded(mode, step)
   for _, section in ipairs(sections) do
     for _, file in ipairs(section.files or {}) do
       if matches_file(file.relpath, step.file) or matches_file(file.filename, step.file) then
-        mode.host.set_folded("section:" .. (file.section_name or section.name), false)
-        mode.host.set_folded(mode.host.file_key(file.section_name, file.filename), false)
+        local section_key = "section:" .. (file.section_name or section.name)
+        local file_key = mode.host.file_key(file.section_name, file.filename)
+        mode.host.set_folded(section_key, false)
+        mode.host.set_folded(file_key, false)
         for _, hunk in ipairs(file.hunks or {}) do
-          mode.host.set_folded(mode.host.hunk_key(file.section_name, file.filename, hunk.diff), false)
+          local hunk_key = mode.host.hunk_key(file.section_name, file.filename, hunk.diff)
+          mode.host.set_folded(hunk_key, false)
         end
         expanded = true
       end
@@ -1264,7 +1273,7 @@ end
 local function render_comment_box(mode, step, target, win, opts)
   opts = opts or {}
   local buf = mode.host.buf
-  local win_width = vim.api.nvim_win_get_width(win)
+  local win_width = effective_window_columns(win)
   local inner_width = math.max(30, math.min(comment_box_max_inner_width, win_width - 8))
 
   ---@type { text: string, hl: string, chunks?: { text: string, hl: string }[] }[] content rows (without borders)
@@ -2399,7 +2408,7 @@ local function status_summary_rows(mode)
         text = heading_row.text,
         segments = heading_row.segments,
         id = heading_index == 1 and task_id or ("%s:heading:%d"):format(task_id, heading_index),
-        parent_id = status_section_id,
+        parent_id = heading_index == 1 and status_section_id or task_id,
         kind = heading_index == 1 and "pr_head_section" or "pr_head_line",
         fold_target_id = heading_index == 1 and false or task_id,
         default_folded = heading_index == 1,
@@ -2512,6 +2521,13 @@ end
 local function resolve_visible_step_target(mode, step)
   local state = mode.host.get_state()
   local target = M.resolve_step(state, step)
+  local function target_row_is_folded(candidate)
+    local win = vim.fn.bufwinid(mode.host.buf)
+    if win == -1 or not candidate.start_row then return false end
+    return vim.api.nvim_win_call(win, function()
+      return vim.fn.foldclosed(candidate.start_row) ~= -1
+    end)
+  end
   jump_debug_event("resolve_initial", {
     buf = mode.host.buf,
     step = {
@@ -2526,7 +2542,7 @@ local function resolve_visible_step_target(mode, step)
   -- Only unfold + re-render when no diff rows are rendered at all; a
   -- "nearest" match means the hunks are visible and just don't contain the
   -- exact line (TS-context scoping, deletions, staleness).
-  if (target.match == "file_only" or target.match == "missing") and ensure_expanded(mode, step) then
+  if (target.match == "file_only" or target.match == "missing" or target_row_is_folded(target)) and ensure_expanded(mode, step) then
     jump_debug_event("resolve_after_expand", {
       buf = mode.host.buf,
       previous_target = target,
@@ -2607,9 +2623,14 @@ function M.jump_status_step(buf, row)
 end
 
 ---@param target DiffReviewWalkthroughTarget
+---@param win integer
 ---@return boolean
-local function target_has_visible_diff_rows(target)
-  return target.match == "exact" or target.match == "nearest"
+local function target_has_visible_diff_rows(target, win)
+  if not (target.match == "exact" or target.match == "nearest") then return false end
+  if not (win and vim.api.nvim_win_is_valid(win) and target.start_row) then return false end
+  return vim.api.nvim_win_call(win, function()
+    return vim.fn.foldclosed(target.start_row) == -1
+  end)
 end
 
 ---@param mode DiffReviewWalkthroughMode
@@ -2618,7 +2639,7 @@ end
 local function render_visible_comment_boxes(mode, state, win)
   for _, step in ipairs(mode.doc.steps or {}) do
     local target = M.resolve_step(state, step)
-    if target_has_visible_diff_rows(target) then
+    if target_has_visible_diff_rows(target, win) then
       render_comment_box(mode, step, target, win, { anchor = "end" })
     end
   end
@@ -2896,7 +2917,8 @@ function M.start(host)
       host.set_folded(("walkthrough:task:%d"):format(task_index), true)
     end
     M._modes[host.buf] = mode
-    host.rerender()
+    local initial_target_id = #(doc.flow or {}) > 0 and "walkthrough:flow:1" or status_section_id
+    host.rerender(initial_target_id)
   end)
 end
 

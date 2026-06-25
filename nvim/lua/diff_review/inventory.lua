@@ -268,6 +268,7 @@ local function language_for_filename(filename, lines)
   local filetype = vim.filetype.match(args) or ""
   if filetype == "" then return nil end
   local lang = vim.treesitter.language.get_lang(filetype)
+  if lang == "typescriptreact" then lang = "tsx" end
   if not lang or not supported_langs[lang] then return nil end
   return lang
 end

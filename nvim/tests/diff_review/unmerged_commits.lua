@@ -3,6 +3,18 @@ vim.loader.enable(false)
 local diff_review = require("diff_review")
 local gh = require("diff_review.gh")
 
+-- Diff-body syntax/background/intraline live in the decoration span store and are
+-- emitted by the provider; drive the test seam to apply them into the decorate
+-- namespace, then read marks from both namespaces (gutter stays in _status_ns).
+local function row_marks(buf, row)
+  pcall(diff_review._status_decorate_rows, buf, row, row)
+  local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
+  for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(buf, diff_review._status_decorate_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })) do
+    marks[#marks + 1] = mark
+  end
+  return marks
+end
+
 local root = "D:/diffreview-unmerged-root"
 local calls = {}
 
@@ -62,6 +74,11 @@ local function buffer_contains_after(buf, needle, start_row)
   return false
 end
 
+local function row_is_folded(buf, row)
+  vim.api.nvim_win_set_buf(0, buf)
+  return vim.fn.foldclosed(row) ~= -1
+end
+
 local function find_row(buf, needle)
   for index, line in ipairs(status_lines(buf)) do
     if line:find(needle, 1, true) then return index end
@@ -78,7 +95,7 @@ local function find_row_after(buf, needle, start_row)
 end
 
 local function line_has_highlight_prefix(buf, row, hl_prefix)
-  local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
+  local marks = row_marks(buf, row)
   for _, mark in ipairs(marks) do
     local details = mark[4] or {}
     if type(details.hl_group) == "string" and details.hl_group:sub(1, #hl_prefix) == hl_prefix then return true end
@@ -87,7 +104,7 @@ local function line_has_highlight_prefix(buf, row, hl_prefix)
 end
 
 local function line_has_highlight(buf, row, hl_group, start_col, end_col)
-  local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
+  local marks = row_marks(buf, row)
   for _, mark in ipairs(marks) do
     local details = mark[4] or {}
     if details.hl_group == hl_group
@@ -108,7 +125,7 @@ end
 
 local function line_highlights(buf, row)
   local groups = {}
-  local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
+  local marks = row_marks(buf, row)
   for _, mark in ipairs(marks) do
     local details = mark[4] or {}
     if details.hl_group then groups[#groups + 1] = details.hl_group end
@@ -270,6 +287,7 @@ function backend.systemlist(command)
   if key == "git\t-C\t" .. root .. "\tshow\t-s\t--format=%B\t0000000000000000000000000000000000000001" then
     return { "docs: recent commit 01", "", "Recent commit body." }, 0
   end
+  if key == "git\t-C\t" .. root .. "\tshow\tHEAD:staged.txt" then return { "before" }, 0 end
   if key == "git\t-C\t" .. root .. "\tshow\t--format=\t--no-color\t--no-ext-diff\t--unified=0\t45806b8123456789" then
     return output_lines(commit_diff), 0
   end
@@ -322,7 +340,28 @@ local function run()
   wait_for(function() return buffer_contains(buf, "Recent Commits (30)") end, "recent commits section did not render")
   assert_true(find_row(buf, "Recent Commits (30)") > find_row(buf, "Unmerged into origin/master (4)"), "recent commits should render below unmerged commits")
   assert_true(saw_call_containing("\tlog\t--no-color\t--format=%H%x09%h%x09%cI%x09%s\t-30\torigin/master"), "recent commits did not use a 30-commit upstream git log")
-  assert_true(not buffer_contains(buf, "recent01  1 day ago   docs: recent commit 01"), "recent commits should start folded")
+  local status_state = diff_review._status_states and diff_review._status_states[buf] or diff_review._status
+  local registry = status_state and status_state.diff_source_registry or nil
+  assert_true(registry ~= nil, "GitStatus did not build a diff source registry")
+  local staged_source = registry.source_by_id.staged
+  assert_true(staged_source ~= nil, "GitStatus did not register staged source")
+  local staged_file = staged_source.file_by_key["staged\0staged.txt"]
+  assert_true(staged_file ~= nil, "GitStatus did not register staged file state")
+  assert_true(staged_file.stage_state == "staged", "staged file state did not keep staged stage state")
+  assert_true(#staged_file.hunks == 1, "collapsed staged file did not retain raw hunks")
+  local staged_old_line = nil
+  diff_review._diff_source_model.ensure_text(staged_file, "old", function(ok, snapshot)
+    assert_true(ok, "staged file old text loader failed")
+    staged_old_line = require("diff_review.text_snapshot").line_text(snapshot, 1)
+  end)
+  wait_for(function() return staged_old_line == "before" end, "staged file old text did not load lazily")
+  assert_true(registry.handle_by_id["commit:45806b8123456789"] ~= nil, "unmerged commit handle missing")
+  assert_true(registry.handle_by_id["commit:0000000000000000000000000000000000000001"] ~= nil, "recent commit handle missing")
+  assert_true(registry.source_by_id["commit:45806b8123456789"] == nil, "unexpanded unmerged commit created diff source eagerly")
+  assert_true(registry.source_by_id["commit:0000000000000000000000000000000000000001"] == nil, "unexpanded recent commit created diff source eagerly")
+  wait_for(function()
+    return row_is_folded(buf, find_row_after(buf, "recent01  1 day ago   docs: recent commit 01", find_row(buf, "Recent Commits (30)")))
+  end, "recent commits should start folded")
   assert_true(buffer_contains(buf, "45806b8  1 day ago  feat: add or mapping and guard ai generation"), "first unmerged commit missing")
   assert_true(buffer_contains(buf, "748971a  2 days ago feat: add debug notifications and AI commit flag"), "second unmerged commit missing")
   open_commit_message_from_subject(
@@ -358,6 +397,14 @@ local function run()
   assert_true(buffer_contains(buf, "New      added.txt +2 -0"), "expanded commit did not label new file")
   assert_true(buffer_contains(buf, "Removed  removed.txt +0 -2"), "expanded commit did not label removed file")
   assert_true(buffer_contains(buf, "Modified src/commit.rs +1 -1"), "expanded commit missing Rust modified file")
+  status_state = diff_review._status_states and diff_review._status_states[buf] or diff_review._status
+  registry = status_state.diff_source_registry
+  local commit_source = registry.source_by_id["commit:45806b8123456789"]
+  assert_true(commit_source ~= nil, "expanded unmerged commit did not register commit source")
+  local commit_file = commit_source.file_by_key["commit:45806b8123456789\0foo/bar.js"]
+  assert_true(commit_file ~= nil, "expanded unmerged commit did not register file state")
+  assert_true(commit_file.stage_state == "readonly", "commit file state should be readonly")
+  assert_true(#commit_file.hunks == 1, "collapsed commit file did not retain raw hunk")
   local modified_file_row = find_row(buf, "Modified foo/bar.js +1 -1")
   local added_file_row = find_row(buf, "New      added.txt +2 -0")
   local removed_file_row = find_row(buf, "Removed  removed.txt +0 -2")
@@ -368,6 +415,12 @@ local function run()
 
   trigger_normal_mapping("<Tab>", find_row(buf, "foo/bar.js +1 -1"))
   wait_for(function() return buffer_contains(buf, "@@ +1 -1") end, "commit file did not unfold hunks")
+  status_state = diff_review._status_states and diff_review._status_states[buf] or diff_review._status
+  registry = status_state.diff_source_registry
+  commit_source = registry.source_by_id["commit:45806b8123456789"]
+  commit_file = commit_source.file_by_key["commit:45806b8123456789\0foo/bar.js"]
+  assert_true(commit_file.layout ~= nil, "expanded commit file did not build body layout")
+  assert_true(commit_file.layout.row_index.total > 0, "expanded commit file layout did not measure hunk rows")
   trigger_normal_mapping("S", find_row(buf, "foo/bar.js +1 -1"))
   vim.wait(50)
   assert_true(not saw_call_containing("\tadd\t"), "stage command ran on read-only commit diff")
@@ -412,10 +465,20 @@ local function run()
     count_calls_containing("\tshow\t--format=\t--no-color\t--no-ext-diff\t--unified=0") == show_calls_before_recent,
     "expanding recent commits section loaded commit diffs eagerly"
   )
+  status_state = diff_review._status_states and diff_review._status_states[buf] or diff_review._status
+  registry = status_state.diff_source_registry
+  assert_true(registry.source_by_id["commit:0000000000000000000000000000000000000001"] == nil, "recent commit section expansion created commit diff source eagerly")
   trigger_normal_mapping("<Tab>", recent_row)
   wait_for(function()
     return buffer_contains_after(buf, "New      recent/added.txt +1 -0", find_row(buf, "Recent Commits (30)"))
   end, "expanded recent commit did not label new file\n" .. table.concat(status_lines(buf), "\n"))
+  status_state = diff_review._status_states and diff_review._status_states[buf] or diff_review._status
+  registry = status_state.diff_source_registry
+  local recent_source = registry.source_by_id["commit:0000000000000000000000000000000000000001"]
+  assert_true(recent_source ~= nil, "expanded recent commit did not register commit source")
+  local recent_file = recent_source.file_by_key["commit:0000000000000000000000000000000000000001\0recent/added.txt"]
+  assert_true(recent_file ~= nil, "expanded recent commit did not register file state")
+  assert_true(recent_file.stage_state == "readonly", "recent commit file state should be readonly")
   assert_true(
     buffer_contains_after(buf, "Removed  recent/removed.txt +0 -1", find_row(buf, "Recent Commits (30)")),
     "expanded recent commit did not label removed file"

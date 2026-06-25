@@ -3,6 +3,18 @@ vim.loader.enable(false)
 local diff_review = require("diff_review")
 local gh = require("diff_review.gh")
 
+-- Diff-body syntax/background/intraline live in the decoration span store and are
+-- emitted by the provider; drive the test seam to apply them into the decorate
+-- namespace, then read marks from both namespaces (gutter stays in _status_ns).
+local function row_marks(buf, row)
+  pcall(diff_review._status_decorate_rows, buf, row, row)
+  local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
+  for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(buf, diff_review._status_decorate_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })) do
+    marks[#marks + 1] = mark
+  end
+  return marks
+end
+
 local original_cwd = vim.fs.normalize(vim.fn.getcwd())
 local root = vim.fs.normalize(original_cwd .. "/.diffreview-intraline-render-test")
 local calls = {}
@@ -135,7 +147,7 @@ local function buffer_contains(buf, pattern)
 end
 
 line_has_highlight = function(buf, row, hl_group)
-  local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
+  local marks = row_marks(buf, row)
   for _, mark in ipairs(marks) do
     local details = mark[4] or {}
     if details.line_hl_group == hl_group then return true end
@@ -150,7 +162,7 @@ line_has_highlight = function(buf, row, hl_group)
 end
 
 local function line_has_background_highlight(buf, row, hl_group)
-  local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
+  local marks = row_marks(buf, row)
   for _, mark in ipairs(marks) do
     local details = mark[4] or {}
     if details.line_hl_group == hl_group then return true end
@@ -163,7 +175,7 @@ local function line_has_background_highlight(buf, row, hl_group)
 end
 
 local function line_has_gutter_chunk(buf, row, text, hl_group)
-  local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
+  local marks = row_marks(buf, row)
   for _, mark in ipairs(marks) do
     local details = mark[4] or {}
     for _, chunk in ipairs(details.virt_text or {}) do
@@ -175,7 +187,7 @@ end
 
 local function line_has_padded_gutter_chunk(buf, row, text, hl_group)
   local pattern = "^%s*" .. vim.pesc(text) .. "%s*$"
-  local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
+  local marks = row_marks(buf, row)
   for _, mark in ipairs(marks) do
     local details = mark[4] or {}
     for _, chunk in ipairs(details.virt_text or {}) do
@@ -186,7 +198,7 @@ local function line_has_padded_gutter_chunk(buf, row, text, hl_group)
 end
 
 local function background_highlight_start_col(buf, row, hl_group)
-  local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
+  local marks = row_marks(buf, row)
   for _, mark in ipairs(marks) do
     local details = mark[4] or {}
     if details.line_hl_group == hl_group then return 0 end
@@ -197,7 +209,7 @@ local function background_highlight_start_col(buf, row, hl_group)
 end
 
 local function highlight_priority(buf, row, hl_group)
-  local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
+  local marks = row_marks(buf, row)
   for _, mark in ipairs(marks) do
     local details = mark[4] or {}
     if details.hl_group == hl_group or details.line_hl_group == hl_group then return details.priority end

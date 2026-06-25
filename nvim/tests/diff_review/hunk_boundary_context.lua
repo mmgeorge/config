@@ -205,8 +205,21 @@ local function gutter_text(buf, row)
   return nil
 end
 
-local function line_has_highlight(buf, row, hl_group)
+-- Diff-body syntax/background/intraline now live in the decoration span store and
+-- are emitted by the provider; drive the test seam to apply them into the decorate
+-- namespace, then read marks from both namespaces (gutter stays in _status_ns).
+local function row_marks(buf, row)
+  pcall(diff_review._status_decorate_rows, buf, row, row)
   local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
+  local decorate = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_decorate_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
+  for _, mark in ipairs(decorate) do
+    marks[#marks + 1] = mark
+  end
+  return marks
+end
+
+local function line_has_highlight(buf, row, hl_group)
+  local marks = row_marks(buf, row)
   for _, mark in ipairs(marks) do
     local details = mark[4] or {}
     if details.hl_group == hl_group or tostring(details.hl_group):find("^" .. vim.pesc(hl_group) .. "%.") then return true end
@@ -221,7 +234,7 @@ end
 
 local function line_highlights(buf, row)
   local groups = {}
-  local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
+  local marks = row_marks(buf, row)
   for _, mark in ipairs(marks) do
     local details = mark[4] or {}
     if type(details.hl_group) == "table" then

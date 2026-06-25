@@ -2,9 +2,18 @@
 ---@field status_buffer_name string
 ---@field pr_buffer_name string
 ---@field debug_notifications boolean
+---@field status_perf_logging boolean
+---@field diff_profile_enabled boolean
+---@field diff_profile_log_path string?
+---@field diff_profile_slow_threshold_ms number
+---@field diff_profile_sample_rate number
 ---@field pr_lookup_mode? "real"|"mock-delay"
 ---@field pr_mock_delay_ms? integer
 ---@field status_cursor_prewarm boolean
+---@field status_cursor_prewarm_max_hunks integer max hunks warmed per cursor-driven file prewarm; 0 disables file prewarm
+---@field status_diff_viewport_enabled boolean
+---@field status_diff_viewport_threshold integer
+---@field status_diff_viewport_overscan integer
 ---@field about_auto_generate boolean
 ---@field about_auto_generate_delay_ms integer
 ---@field branch_prefix string default prefix for branches created with `bc`; a repo's .diffreview.json may override it
@@ -63,9 +72,18 @@ M.defaults = {
   status_buffer_name = "GitStatus",
   pr_buffer_name = "DiffReviewPR",
   debug_notifications = false,
+  status_perf_logging = true,
+  diff_profile_enabled = true,
+  diff_profile_log_path = nil,
+  diff_profile_slow_threshold_ms = 8,
+  diff_profile_sample_rate = 0,
   pr_lookup_mode = "real",
   pr_mock_delay_ms = 5000,
   status_cursor_prewarm = true,
+  status_cursor_prewarm_max_hunks = 12,
+  status_diff_viewport_enabled = false,
+  status_diff_viewport_threshold = 1200,
+  status_diff_viewport_overscan = 80,
   about_auto_generate = true,
   about_auto_generate_delay_ms = 1000,
   branch_prefix = "matt9222/",

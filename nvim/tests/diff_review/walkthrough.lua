@@ -244,6 +244,18 @@ local function find_row(buf, needle)
   error("missing row: " .. needle .. "\n" .. table.concat(lines, "\n"), 2)
 end
 
+local function row_is_folded(buf, row)
+  local win = vim.fn.bufwinid(buf)
+  assert_true(win ~= -1, "buffer window missing for fold check")
+  local previous_win = vim.api.nvim_get_current_win()
+  vim.api.nvim_set_current_win(win)
+  local folded = vim.fn.foldclosed(row) ~= -1
+  if vim.api.nvim_win_is_valid(previous_win) then
+    pcall(vim.api.nvim_set_current_win, previous_win)
+  end
+  return folded
+end
+
 local function assert_row_before(buf, first_needle, second_needle, message)
   local first_row = find_row(buf, first_needle)
   local second_row = find_row(buf, second_needle)
@@ -564,14 +576,17 @@ local function toggle_row(buf, needle)
   local row = find_row(buf, needle)
   local win = vim.fn.bufwinid(buf)
   assert_true(win ~= -1, "status window missing")
+  vim.api.nvim_set_current_win(win)
   vim.api.nvim_win_set_cursor(win, { row, 0 })
   trigger_buf_mapping(buf, "<Tab>")
 end
 
 local function expand_row_if_needed(buf, row_needle, visible_needle)
-  if buffer_contains(buf, visible_needle) then return end
+  if not row_is_folded(buf, find_row(buf, visible_needle)) then return end
   toggle_row(buf, row_needle)
-  wait_for(function() return buffer_contains(buf, visible_needle) end, row_needle .. " did not expand")
+  wait_for(function()
+    return not row_is_folded(buf, find_row(buf, visible_needle))
+  end, row_needle .. " did not expand")
 end
 
 local function run()
@@ -828,18 +843,24 @@ local function run()
     "summary task justification missing from folded task row")
   assert_true(not buffer_has_highlight_for_text(summary_buf, "Reviewers need the fixture story", "Reviewers",
     "DiffReviewWalkthroughJustification"), "summary task justification should use normal highlight")
-  assert_true(not buffer_contains(summary_buf, "The first fixture row carries the opening example for"),
-    "folded task should hide subtask justification")
-  assert_true(not buffer_contains(summary_buf, "Rewrite the first fixture file."),
-    "folded task should hide subtask rows")
+  wait_for(function()
+    return row_is_folded(summary_buf, find_row(summary_buf, "The first fixture row carries the opening example for"))
+  end, "folded task should hide subtask justification")
+  wait_for(function()
+    return row_is_folded(summary_buf, find_row(summary_buf, "Rewrite the first fixture file."))
+  end, "folded task should hide subtask rows")
   toggle_row(buf, "1. Update a.txt through the first task.")
-  wait_for(function() return buffer_contains(summary_buf, "Rewrite the first fixture file.") end,
+  wait_for(function()
+    return not row_is_folded(summary_buf, find_row(summary_buf, "Rewrite the first fixture file."))
+  end,
     "expanding first walkthrough task did not show subtask rows")
   toggle_row(buf, "└─ Rewrite the first fixture file.")
-  wait_for(function() return not buffer_contains(summary_buf, "Modify Cache a.txt rewrite") end,
+  wait_for(function() return row_is_folded(summary_buf, find_row(summary_buf, "Modify Cache a.txt rewrite")) end,
     "folding a walkthrough subtask should hide its items")
   toggle_row(buf, "└─ Rewrite the first fixture file.")
-  wait_for(function() return buffer_contains(summary_buf, "Modify Cache a.txt rewrite") end,
+  wait_for(function()
+    return not row_is_folded(summary_buf, find_row(summary_buf, "Modify Cache a.txt rewrite"))
+  end,
     "unfolding a walkthrough subtask should show its items")
   assert_true(not buffer_contains(summary_buf, "◦ Rewrite the fixture line to NEW."),
     "walkthrough summary should not render annotation title rows")
@@ -848,7 +869,9 @@ local function run()
   local change_row = find_row(summary_buf, "Modify Cache a.txt rewrite")
   local location_source_view = set_cursor_with_view(summary_buf, change_row, 0, change_row - 3)
   trigger_buf_mapping(summary_buf, ".")
-  wait_for(function() return buffer_contains(summary_buf, "NEW a.txt") end,
+  wait_for(function()
+    return not row_is_folded(summary_buf, find_row(summary_buf, "NEW a.txt"))
+  end,
     "pressing dot on a walkthrough change row should expand the target diff")
   local previous_mark = vim.api.nvim_buf_call(summary_buf, function()
     return vim.fn.getpos("''")
@@ -865,15 +888,13 @@ local function run()
       and view.leftcol == location_source_view.leftcol
   end, "walkthrough change row jump should save a native jump-list return location and view")
   toggle_row(buf, "a.txt +")
-  wait_for(function() return not buffer_contains(summary_buf, "NEW a.txt") end,
+  wait_for(function() return row_is_folded(summary_buf, find_row(summary_buf, "NEW a.txt")) end,
     "folding target file after location jump should hide its diff again")
   local expanded_second_task_row = find_row(summary_buf, "2. Update b.txt through the second task.")
   local expanded_lines = vim.api.nvim_buf_get_lines(summary_buf, 0, -1, false)
   assert_true(expanded_lines[expanded_second_task_row - 1] == "",
     "expanded walkthrough task should leave a blank separator before the next task")
-  toggle_row(buf, "2. Update b.txt through the second task.")
-  wait_for(function() return buffer_contains(summary_buf, "   └─ Add fn b.txt rewrite to repeat") end,
-    "expanding second walkthrough task did not show item rows")
+  expand_row_if_needed(buf, "2. Update b.txt through the second task.", "   └─ Add fn b.txt rewrite to repeat")
   assert_true(buffer_contains(summary_buf, "The first fixture row carries the opening example for"),
     "summary subtask justification missing")
   assert_true(buffer_contains(summary_buf, "rendering."),
@@ -904,10 +925,12 @@ local function run()
   assert_true(not buffer_contains(summary_buf, "struct a.txt rewrite"), "summary should not show fallback type keyword")
   assert_true(buffer_contains(summary_buf, "Cache a.txt rewrite"), "summary should show change role text")
   assert_true(not buffer_contains(summary_buf, "Function b.txt rewrite"), "summary should not show function type text")
-  assert_true(buffer_has_highlight_for_text(summary_buf, "a.txt rewrite", "Cache",
-    "DiffReviewWalkthroughActionModify"), "summary modified change kind should match action highlight")
-  assert_true(buffer_has_highlight_for_text(summary_buf, "b.txt rewrite", "fn",
-    "DiffReviewWalkthroughActionAdd"), "summary added function type should match action highlight")
+  wait_for(function()
+    return buffer_has_highlight_for_text(summary_buf, "a.txt rewrite", "Cache", "DiffReviewWalkthroughActionModify")
+  end, "summary modified change kind should match action highlight")
+  wait_for(function()
+    return buffer_has_highlight_for_text(summary_buf, "b.txt rewrite", "fn", "DiffReviewWalkthroughActionAdd")
+  end, "summary added function type should match action highlight")
   assert_true(buffer_has_highlight_for_text(summary_buf, "Modify Cache a.txt rewrite", "Modify",
     "DiffReviewWalkthroughActionModify"), "summary action highlight missing")
   assert_true(buffer_has_highlight_for_text(summary_buf, "a.txt rewrite", "a.txt rewrite",
@@ -933,7 +956,7 @@ local function run()
   wait_for(function() return box_contains(buf, "task total") end, "second visible a.txt comment box missing")
   local step_row = find_row(buf, "NEW a.txt")
   local cursor_row = vim.api.nvim_win_get_cursor(vim.fn.bufwinid(buf))[1]
-  assert_true(cursor_row == find_row(buf, "a.txt +"), "expanding a file should not jump to the walkthrough step")
+  assert_true(cursor_row ~= step_row, "expanding a file should not jump to the walkthrough step")
   assert_true(walkthrough_extmark_count(buf) > 0, "walkthrough extmarks missing")
   assert_true(not row_has_line_highlight(buf, step_row, "DiffReviewWalkthroughRegionAdd"),
     "automatic walkthrough comments should not highlight selected regions")
@@ -989,14 +1012,18 @@ local function run()
   toggle_row(buf, "a.txt +")
   wait_for(function() return not box_contains(buf, "concrete") end,
     "folding a.txt should remove its visible walkthrough boxes")
-  assert_true(box_contains(buf, "forward navigation"), "folding a.txt should keep b.txt's visible box")
+  wait_for(function() return box_contains(buf, "forward navigation") end,
+    "folding a.txt should keep b.txt's visible box")
 
   toggle_row(buf, "Walkthrough:")
   wait_for(function()
-    return buffer_contains(buf, "Walkthrough:") and not buffer_contains(buf, "Reviewers need the fixture story")
+    return buffer_contains(buf, "Walkthrough:")
+      and row_is_folded(buf, find_row(buf, "Reviewers need the fixture story"))
   end, "walkthrough summary did not fold")
   toggle_row(buf, "Walkthrough:")
-  wait_for(function() return buffer_contains(buf, "Reviewers need the fixture story") end,
+  wait_for(function()
+    return not row_is_folded(buf, find_row(buf, "Reviewers need the fixture story"))
+  end,
     "walkthrough summary did not unfold")
 
   diff_review.render_status(buf, nil, nil, { reuse_sections = true })

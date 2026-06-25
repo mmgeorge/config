@@ -3,6 +3,18 @@ vim.loader.enable(false)
 local diff_review = require("diff_review")
 local gh = require("diff_review.gh")
 
+-- Diff-body syntax/background/intraline live in the decoration span store and are
+-- emitted by the provider; drive the test seam to apply them into the decorate
+-- namespace, then read marks from both namespaces (gutter stays in _status_ns).
+local function row_marks(buf, row)
+  pcall(diff_review._status_decorate_rows, buf, row, row)
+  local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
+  for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(buf, diff_review._status_decorate_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })) do
+    marks[#marks + 1] = mark
+  end
+  return marks
+end
+
 local original_cwd = vim.fs.normalize(vim.fn.getcwd())
 local root = vim.fs.normalize(original_cwd .. "/.diffreview-staged-rust-syntax-test")
 local calls = {}
@@ -351,7 +363,7 @@ local function find_row_after(buf, pattern, after_row)
 end
 
 local function line_has_highlight(buf, row, hl_group)
-  local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
+  local marks = row_marks(buf, row)
   for _, mark in ipairs(marks) do
     local details = mark[4] or {}
     if details.line_hl_group == hl_group then return true end
@@ -374,7 +386,7 @@ local function find_row_with_highlight(buf, pattern, hl_group)
 end
 
 local function line_has_treesitter_highlight(buf, row)
-  local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
+  local marks = row_marks(buf, row)
   for _, mark in ipairs(marks) do
     local details = mark[4] or {}
     if type(details.hl_group) == "string" and details.hl_group:sub(1, 1) == "@" then return true end
@@ -388,7 +400,7 @@ local function line_has_treesitter_highlight(buf, row)
 end
 
 local function line_has_line_highlight(buf, row, hl_group)
-  local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
+  local marks = row_marks(buf, row)
   for _, mark in ipairs(marks) do
     local details = mark[4] or {}
     if details.line_hl_group == hl_group then return true end
@@ -397,7 +409,7 @@ local function line_has_line_highlight(buf, row, hl_group)
 end
 
 local function line_has_background_highlight(buf, row, hl_group)
-  local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
+  local marks = row_marks(buf, row)
   for _, mark in ipairs(marks) do
     local details = mark[4] or {}
     if details.line_hl_group == hl_group then return true end
@@ -411,7 +423,7 @@ end
 
 local function line_highlights(buf, row)
   local groups = {}
-  local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
+  local marks = row_marks(buf, row)
   for _, mark in ipairs(marks) do
     local details = mark[4] or {}
     if type(details.hl_group) == "table" then
@@ -947,7 +959,7 @@ local function run()
 
   diff_review.set_git_backend(backend)
   gh.set_backend(gh_backend)
-  assert_true(diff_review._git_backend == backend, "git backend was not installed")
+  assert_true(require("diff_review.git_backend").current == backend, "git backend was not installed")
   diff_review.setup({ about_auto_generate = false })
   diff_review.open()
   local buf = vim.api.nvim_get_current_buf()

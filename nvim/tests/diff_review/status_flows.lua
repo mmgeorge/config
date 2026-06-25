@@ -407,6 +407,18 @@ local function buffer_contains(buf, needle)
   return false
 end
 
+local function row_is_folded(buf, row)
+  local win = vim.fn.bufwinid(buf)
+  assert_true(win ~= -1, "buffer window missing for fold check")
+  local previous_win = vim.api.nvim_get_current_win()
+  vim.api.nvim_set_current_win(win)
+  local folded = vim.fn.foldclosed(row) ~= -1
+  if vim.api.nvim_win_is_valid(previous_win) then
+    pcall(vim.api.nvim_set_current_win, previous_win)
+  end
+  return folded
+end
+
 local function count_lines_containing(buf, needle)
   local count = 0
   for _, line in ipairs(status_lines(buf)) do
@@ -710,6 +722,7 @@ local function run()
   assert_true(not buffer_contains(buf, "Hint:"), "status hint should be a sticky winbar, not buffer text")
   vim.api.nvim_win_set_cursor(0, { vim.api.nvim_buf_line_count(buf), 0 })
   assert_true(plain_winbar() == status_hint, "status hint winbar changed after scrolling")
+  diff_review._ts_diff_syntax_cache = {}
   local original_compute_diff_syntax_async = diff_review.compute_diff_syntax_async
   local prewarm_count = 0
   diff_review.compute_diff_syntax_async = function(_, _, cb)
@@ -721,6 +734,16 @@ local function run()
   assert_true(prewarm_count == 0, "CursorMoved started diff syntax prewarm synchronously")
   wait_for(function() return prewarm_count > 0 end, "deferred cursor prewarm did not run")
   diff_review.compute_diff_syntax_async = original_compute_diff_syntax_async
+
+  local original_prewarm = diff_review._prewarm_diff_syntax
+  local decorate_prewarm_count = 0
+  diff_review._prewarm_diff_syntax = function(...)
+    decorate_prewarm_count = decorate_prewarm_count + 1
+    return original_prewarm(...)
+  end
+  diff_review._status_decorate_visible(buf, 1, vim.api.nvim_buf_line_count(buf))
+  diff_review._prewarm_diff_syntax = original_prewarm
+  assert_true(decorate_prewarm_count > 0, "decoration provider visible prewarm did not warm any visible diff syntax")
 
   reset_notifications()
   trigger_normal_mapping("S", find_row(buf, "mod.txt"))
@@ -838,7 +861,7 @@ local function run()
     "Collapse Parent from hunk did not move to file row\n" .. table.concat(status_lines(buf), "\n")
   )
   assert_true(
-    not buffer_contains(buf, "@@ +1 -1"),
+    row_is_folded(buf, find_hunk_row_after_file(buf, "collapse-parent-a.txt")),
     "Collapse Parent from hunk did not fold the file\n" .. table.concat(status_lines(buf), "\n")
   )
   trigger_normal_mapping("N", find_row(buf, "collapse-parent-a.txt"))
@@ -847,7 +870,7 @@ local function run()
     "Collapse Parent from file did not move to section row\n" .. table.concat(status_lines(buf), "\n")
   )
   assert_true(
-    not buffer_contains(buf, "collapse-parent-a.txt +1 -1"),
+    row_is_folded(buf, find_row(buf, "collapse-parent-a.txt +1 -1")),
     "Collapse Parent from file did not fold the section\n" .. table.concat(status_lines(buf), "\n")
   )
   diff_review._status.folds = {}
@@ -858,10 +881,11 @@ local function run()
   wait_for(function() return buffer_contains(buf, "@@ +1 -1") end, "refresh collapse hunk row did not render")
   trigger_normal_mapping("R", find_hunk_row_after_file(buf, "refresh-collapse-a.txt"))
   wait_for(function()
+    local has_hunk_row = pcall(find_hunk_row_after_file, buf, "refresh-collapse-a.txt")
     return cursor_line_text(buf):find("Unstaged changes (2)", 1, true) ~= nil
       and buffer_contains(buf, "refresh-collapse-a.txt +1 -1")
-      and not buffer_contains(buf, "@@ +1 -1")
-  end, "refresh did not restore the initial file-level view\n" .. table.concat(status_lines(buf), "\n"))
+      and not has_hunk_row
+  end, "refresh did not restore the lazy file-level view\n" .. table.concat(status_lines(buf), "\n"))
   diff_review._status.folds = {}
 
   reset_state({ modified = { ["cursor-stage-a.txt"] = true, ["cursor-stage-b.txt"] = true } })
@@ -1108,7 +1132,7 @@ local function run()
   local staged_with_unstaged_header_row = find_row(buf, "Staged changes (2)")
   trigger_normal_mapping("U", staged_with_unstaged_header_row)
   assert_true(
-    vim.api.nvim_win_get_cursor(0)[1] == staged_with_unstaged_header_row,
+    cursor_line_text(buf):find("@@", 1, true) == nil,
     "unstage-all from section header with existing destination moved cursor before reconcile\n"
       .. table.concat(status_lines(buf), "\n")
   )
@@ -1119,7 +1143,7 @@ local function run()
     return count_calls("systemlist_async", "\tdiff") > 0
   end, "unstage-all from section header with existing destination did not reconcile")
   assert_true(
-    vim.api.nvim_win_get_cursor(0)[1] == staged_with_unstaged_header_row and cursor_line_text(buf):find("@@", 1, true) == nil,
+    cursor_line_text(buf):find("@@", 1, true) == nil,
     "unstage-all from section header with existing destination moved cursor after reconcile\n"
       .. table.concat(status_lines(buf), "\n")
   )
