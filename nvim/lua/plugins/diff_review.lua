@@ -5,7 +5,7 @@ return {
     dependencies = { "folke/snacks.nvim" },
     cmd = { "GitStatus", "GitBranchDiff", "GitBranchDiffFile", "GitFileRevision", "GitDiffCompactPreview" },
     opts = {
-      perf_logging = true,
+      perf_logging = false,
       status_cursor_prewarm = true,
       -- status_cursor_prewarm_max_hunks = 2
     },

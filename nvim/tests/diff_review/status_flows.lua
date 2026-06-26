@@ -9,6 +9,7 @@ local session = require("diff_review.session")
 local syntax_engine = require("diff_review.render.syntax_engine")
 local gh = require("diff_review.integrations.gh")
 local repo_cache = require("github.repo_cache")
+local ui = require("diff_review.infra.ui")
 local original_notify = vim.notify
 
 local root = "D:/diffreview-flow-root"
@@ -423,6 +424,15 @@ local function row_is_folded(buf, row)
     pcall(vim.api.nvim_set_current_win, previous_win)
   end
   return folded
+end
+
+local function row_has_highlight(buf, row, hl_group)
+  local marks = vim.api.nvim_buf_get_extmarks(buf, ui.status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
+  for _, mark in ipairs(marks) do
+    local details = mark[4] or {}
+    if details.hl_group == hl_group then return true end
+  end
+  return false
 end
 
 local function count_lines_containing(buf, needle)
@@ -858,6 +868,29 @@ local function run()
   end, "hunk unstage did not run reverse cached apply")
   wait_for(function() return buffer_contains(buf, "Unstaged changes (1)") end, "hunk unstage did not reconcile")
 
+  reset_state({ modified = { ["fold-highlight.txt"] = true } })
+  render_and_wait(buf, "fold-highlight.txt +1 -1")
+  local highlighted_file_row = find_row(buf, "fold-highlight.txt")
+  assert_true(
+    row_has_highlight(buf, highlighted_file_row, "DiffReviewStatusPath"),
+    "file row path highlight missing before fold toggle\n" .. table.concat(status_lines(buf), "\n")
+  )
+  trigger_normal_mapping("<Tab>", highlighted_file_row)
+  wait_for(function() return pcall(find_hunk_row_after_file, buf, "fold-highlight.txt") end, "fold-highlight hunk row did not render")
+  trigger_normal_mapping("<Tab>", find_row(buf, "fold-highlight.txt"))
+  wait_for(function()
+    return not pcall(find_hunk_row_after_file, buf, "fold-highlight.txt")
+  end, "fold-highlight collapse kept hunk rows in a native fold\n" .. table.concat(status_lines(buf), "\n"))
+  highlighted_file_row = find_row(buf, "fold-highlight.txt")
+  assert_true(
+    not row_is_folded(buf, highlighted_file_row),
+    "fold-highlight file row closed into native foldtext\n" .. table.concat(status_lines(buf), "\n")
+  )
+  assert_true(
+    row_has_highlight(buf, highlighted_file_row, "DiffReviewStatusPath"),
+    "file row path highlight missing after fold toggle collapse\n" .. table.concat(status_lines(buf), "\n")
+  )
+
   reset_state({ modified = { ["collapse-parent-a.txt"] = true, ["collapse-parent-b.txt"] = true } })
   render_and_wait(buf, "collapse-parent-a.txt +1 -1")
   trigger_normal_mapping("<Tab>", find_row(buf, "collapse-parent-a.txt"))
@@ -868,8 +901,8 @@ local function run()
     "Collapse Parent from hunk did not move to file row\n" .. table.concat(status_lines(buf), "\n")
   )
   assert_true(
-    row_is_folded(buf, find_hunk_row_after_file(buf, "collapse-parent-a.txt")),
-    "Collapse Parent from hunk did not fold the file\n" .. table.concat(status_lines(buf), "\n")
+    not pcall(find_hunk_row_after_file, buf, "collapse-parent-a.txt"),
+    "Collapse Parent from hunk kept file body in native fold\n" .. table.concat(status_lines(buf), "\n")
   )
   trigger_normal_mapping("N", find_row(buf, "collapse-parent-a.txt"))
   assert_true(

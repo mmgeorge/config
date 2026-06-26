@@ -29,6 +29,13 @@ local session = require("diff_review.session")
 
 local M = {}
 
+---@param entry DiffReviewStatusEntry?
+---@param next_folded boolean
+---@return boolean
+local function status_should_render_collapsed_fold(entry, next_folded)
+  return next_folded and entry_nav()._status_entry_is_file_like(entry)
+end
+
 function M._status_confirm_create_pr(on_yes)
   local body = {
     "No GitHub PR found for this branch.",
@@ -346,7 +353,10 @@ local function status_toggle(entry, state)
     if fold_entry.kind == "commit" and not next_folded and fold_entry.commit then
       status_helpers.status_load_commit_files(fold_entry.commit)
     end
-    local native_folded = fold_state()._status_set_native_fold_state(state.buf, fold_id, next_folded)
+    local native_folded = false
+    if not status_should_render_collapsed_fold(fold_entry, next_folded) then
+      native_folded = fold_state()._status_set_native_fold_state(state.buf, fold_id, next_folded)
+    end
     if not native_folded then
       render_orchestrator.render_status_or_notify(state.buf, fold_id, vim.api.nvim_win_get_cursor(0)[1], { reuse_sections = true })
     elseif state.view_kind == "status" then
@@ -372,7 +382,11 @@ function M._status_collapse_parent()
   local parent = entry_nav()._status_parent_entry(line, entry)
   local target = parent or entry
   fold_state()._set_status_folded(target.id, true)
-  if not fold_state()._status_set_native_fold_state(session.status.buf, target.id, true) then
+  local native_folded = false
+  if not status_should_render_collapsed_fold(target, true) then
+    native_folded = fold_state()._status_set_native_fold_state(session.status.buf, target.id, true)
+  end
+  if not native_folded then
     render_orchestrator.render_status_or_notify(session.status.buf, target.id, vim.api.nvim_win_get_cursor(0)[1], { reuse_sections = true })
   elseif session.status.view_kind == "status" then
     local walkthrough = package.loaded["diff_review.views.walkthrough"]
