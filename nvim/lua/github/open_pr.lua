@@ -4,52 +4,26 @@ local repo_cache = require("github.repo_cache")
 local default_base_branch = "main"
 local state_cache = nil
 local state_path_for_test = nil
-local pr_context_limit = 60000
+local pr_context_limit = {
+  stat = 12000,
+  diff = 120000,
+}
 
-local pr_system_prompt = [[You generate GitHub pull request metadata from git commit messages.
-Return ONLY valid JSON with this exact shape:
-{"title":"<title>","body":"<markdown body>"}
+local compact_diff_options = {
+  max_hunks = 30,
+  max_changed_lines = 800,
+  min_hunk_changed_lines = 8,
+  hunk_head_lines = 12,
+}
 
-Title rules:
-- Must be a Conventional Commit subject.
-- Format: <type>: <description>
-- Types: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert
-- Imperative mood.
-- Lowercase first letter after the colon.
-- No trailing period.
-- Prefer concrete nouns from the commit messages.
+local pr_system_prompt = [[You write GitHub pull request descriptions.
+Return ONLY the PR description paragraph. Do not include a title, markdown headings, checklist, code fences, explanation, alternatives, or preface.]]
 
-Body rules:
-Use this template:
+local pr_header = [[Related #]]
 
-Related <issue number list>
-
-<summary>
-
-# Changes
-<major changes>
-
-## Testing
-- [x] Automated (integration, performance, screenshot, unit)
-<test files>
-- [ ] Manual (test app)
-
-For the above template, follow these rules:
-- <issue number list>
-  - If the issue numbers are known, put them here. Otherwise just write # and the user will fill in the rest.
-- <summary>
-  - Include a brief paragraph description of the PR that is succinct an factual.
-  - The first couples senteces state what major feature was added or bug fixed, a restatement of the title.
-    - "This PR adds support for X..."
-  - Then follow up with details about what major changes were needed to add the feature or fix the bug
-    - "A new source type ParquetSourceWorker handles querying files"
-- <major changes>
-  - A bulleted list of the major changes of the PR. The new files added and structure changes.
-  - Look at all commits and then created this bulleted summary.
-  - Do *not* just restate the commit history. Look at changes as a whole and then determine aggregate changes.
-- <test files>
-  - A bulleted list of added tests.
-]]
+local pr_footer = [[## Testing
+- [ ] Automated (integration, performance, screenshot, unit)
+- [ ] Manual (test app)]]
 
 local progress = {
   id = "github_open_pr",
@@ -268,50 +242,84 @@ end
 
 ---@param content string?
 ---@return string?
-local function normalize_pr_metadata_content(content)
+local function normalize_pr_description(content)
   if type(content) ~= "string" then return nil end
   content = vim.trim(content):gsub("\r\n", "\n")
   content = content:gsub("^```%w*\n", ""):gsub("\n```$", "")
   return vim.trim(content)
 end
 
-local function decode_pr_metadata(content)
-  content = normalize_pr_metadata_content(content)
-  if not content or content == "" then
+---@param content string?
+---@return string? description
+---@return string? error_message
+local function decode_pr_description(content)
+  local description = normalize_pr_description(content)
+  if not description or description == "" then
     return nil, "No response from model"
   end
 
-  local ok, metadata = pcall(vim.json.decode, content)
-  if not ok or type(metadata) ~= "table" then
-    return nil, "Model returned invalid JSON"
-  end
-
-  local title = type(metadata.title) == "string" and vim.trim(metadata.title) or ""
-  local body = type(metadata.body) == "string" and vim.trim(metadata.body) or ""
-  if title == "" or body == "" then
-    return nil, "Model response must include title and body"
-  end
-
-  return {
-    title = vim.trim(title:gsub("\n.*", "")),
-    body = body,
-  }
+  return description
 end
 
-local function build_context(branch, base_ref, commits)
-  local truncated_commits, commits_truncated = truncate_at_line(commits, pr_context_limit)
+---@param commits string
+---@return string?
+local function first_commit_subject(commits)
+  commits = tostring(commits or ""):gsub("\r\n", "\n")
+  for line in commits:gmatch("[^\n]+") do
+    local subject = vim.trim(line)
+    if subject ~= "" and subject ~= "---END-COMMIT---" then
+      return subject
+    end
+  end
+  return nil
+end
+
+---@param description string
+---@return string
+local function build_pr_body(description)
+  return table.concat({
+    pr_header,
+    vim.trim(description),
+    pr_footer,
+  }, "\n\n")
+end
+
+local function build_context(branch, base_ref, diff_stat, raw_diff)
+  local compacted_diff, diff_compacted, diff_metrics = require("git.diff").compact(raw_diff, compact_diff_options)
+  local truncated_stat, stat_truncated = truncate_at_line(diff_stat, pr_context_limit.stat)
+  local truncated_diff, diff_truncated = truncate_at_line(compacted_diff, pr_context_limit.diff)
+  local truncated = stat_truncated or diff_truncated
   local sections = {
-    "Generate metadata for a draft GitHub PR.",
+    "Generate a description for a draft GitHub PR.",
     "Base branch: " .. base_ref:gsub("^origin/", ""),
-    "Comparison ref used for commit messages: " .. base_ref,
+    "Comparison ref used for the diff: " .. base_ref,
     "Head branch: " .. branch,
   }
 
-  if commits_truncated then
-    table.insert(sections, "Some commit message context was truncated to stay within the model request size.")
+  if diff_compacted then
+    table.insert(sections, (
+      "Large diff compacted after counting %d hunks and %d changed lines. "
+      .. "The compact diff starts with an overall summary and only includes large hunks."
+    ):format(diff_metrics.hunks, diff_metrics.changed))
   end
 
-  table.insert(sections, "Commit messages:\n```text\n" .. truncated_commits .. "\n```")
+  if truncated then
+    table.insert(sections, "Some context is truncated to avoid exceeding the model request size. "
+      .. "Use the diff summary for overall scope, and visible hunks for details.")
+  end
+
+  if vim.trim(truncated_stat) ~= "" then
+    table.insert(sections, "Diff summary:\n```text\n" .. truncated_stat .. "\n```")
+  end
+
+  table.insert(sections, "Compact diff context:\n```diff\n" .. truncated_diff .. "\n```")
+  table.insert(sections, table.concat({
+    "Provide a PR description paragraph for the changes above.",
+    "3-4 sentence before/now story with precise, accessible prose.",
+    "Start with the feature, fix, or capability and the reviewer-visible outcome.",
+    "Then explain the old limitation and the new role-level architecture.",
+    "Name central constructs when they clarify ownership or a review boundary.",
+  }, " "))
   return table.concat(sections, "\n\n")
 end
 
@@ -495,23 +503,23 @@ local function choose_base_branch(cwd, current_branch, callback)
   end)
 end
 
-local function generate_metadata(context, callback)
+local function generate_description(context, callback)
   local ok_adapters, adapters = pcall(require, "ai.adapters")
   local selected = ok_adapters and adapters.get() or {}
   local model = selected.pr_create or selected.commit or "copilot,model=gpt-4.1"
 
-  show_progress("Generating PR title and description with " .. model .. "...")
+  show_progress("Generating PR description with " .. model .. "...")
   require("ai").generate({
     model = model,
     system = pr_system_prompt,
     prompt = context,
   }, function(result)
     if not result.ok then
-      callback(nil, result.error or "Unable to generate PR metadata")
+      callback(nil, result.error or "Unable to generate PR description")
       return
     end
-    local metadata, err = decode_pr_metadata(result.content)
-    callback(metadata, err)
+    local description, err = decode_pr_description(result.content)
+    callback(description, err)
   end)
 end
 
@@ -594,7 +602,7 @@ function M.open()
 
         git({ "rev-parse", "--verify", "origin/" .. selected_base_branch }, cwd, function(_, origin_err)
           local base_ref = origin_err and selected_base_branch or "origin/" .. selected_base_branch
-          git({ "log", "--reverse", "--format=%h %s%n%b%n---END-COMMIT---", base_ref .. "..HEAD" }, cwd,
+          git({ "log", "--reverse", "--format=%s%n%b%n---END-COMMIT---", base_ref .. "..HEAD" }, cwd,
             function(commits, commits_err)
               if commits_err then
                 fail_progress("Could not read PR commit messages: " .. commits_err)
@@ -607,19 +615,44 @@ function M.open()
                 return
               end
 
-              generate_metadata(build_context(branch, base_ref, commits), function(metadata, metadata_err)
-                if metadata_err then
-                  fail_progress("Failed to generate PR metadata: " .. metadata_err)
+              local title = first_commit_subject(commits)
+              if not title then
+                fail_progress("Could not determine PR title from the first commit")
+                return
+              end
+
+              git({ "diff", "--stat", "--summary", base_ref .. "..HEAD" }, cwd, function(diff_stat, stat_err)
+                if stat_err then
+                  fail_progress("Could not read PR diff summary: " .. stat_err)
                   return
                 end
 
-                push_branch(cwd, branch, function(_, push_err)
-                  if push_err then
-                    fail_progress("Failed to push branch: " .. push_err)
+                git({ "diff", "--no-ext-diff", "--no-color", base_ref .. "..HEAD" }, cwd, function(raw_diff, diff_err)
+                  if diff_err then
+                    fail_progress("Could not read PR diff context: " .. diff_err)
                     return
                   end
 
-                  create_pr(cwd, branch, selected_base_branch, metadata)
+                  generate_description(build_context(branch, base_ref, diff_stat, raw_diff), function(description, description_err)
+                    if description_err then
+                      fail_progress("Failed to generate PR description: " .. description_err)
+                      return
+                    end
+
+                    local metadata = {
+                      title = title,
+                      body = build_pr_body(description),
+                    }
+
+                    push_branch(cwd, branch, function(_, push_err)
+                      if push_err then
+                        fail_progress("Failed to push branch: " .. push_err)
+                        return
+                      end
+
+                      create_pr(cwd, branch, selected_base_branch, metadata)
+                    end)
+                  end)
                 end)
               end)
             end)

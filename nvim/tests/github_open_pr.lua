@@ -18,6 +18,17 @@ local original_ai = package.loaded["ai"]
 local original_ai_adapters = package.loaded["ai.adapters"]
 local created_pr_url = "https://github.example.test/org/repo/pull/42"
 local generated_model = nil
+local generated_prompt = nil
+local generated_system = nil
+local generated_pr_body = table.concat({
+  "Related #",
+  "Created by GithubPRCreate.",
+  table.concat({
+    "## Testing",
+    "- [ ] Automated (integration, performance, screenshot, unit)",
+    "- [ ] Manual (test app)",
+  }, "\n"),
+}, "\n\n")
 
 local function assert_true(condition, message)
   if not condition then error(message, 2) end
@@ -36,6 +47,8 @@ local function reset()
   captured_picker = nil
   system_calls = {}
   generated_model = nil
+  generated_prompt = nil
+  generated_system = nil
   branch_list_output = table.concat({
     "main",
     "feature/current",
@@ -68,7 +81,7 @@ gh.set_backend({
           id = "PR_kwTEST42",
           number = 42,
           title = "feat: create draft pr",
-          body = "Created by GithubPRCreate.",
+          body = generated_pr_body,
           url = created_pr_url,
           headRefName = "feature/current",
           headRefOid = "abc123456789",
@@ -106,12 +119,11 @@ package.loaded["ai.adapters"] = {
 package.loaded["ai"] = {
   generate = function(opts, cb)
     generated_model = opts.model
+    generated_prompt = opts.prompt
+    generated_system = opts.system
     cb({
       ok = true,
-      content = "```json\n" .. vim.json.encode({
-        title = "feat: create draft pr",
-        body = "Created by GithubPRCreate.",
-      }) .. "\n```",
+      content = "Created by GithubPRCreate.",
     })
   end,
 }
@@ -142,8 +154,27 @@ vim.system = function(command, opts, callback)
     callback({ code = 0, stdout = "abc123456789\n", stderr = "" })
     return
   end
-  if key == "git\tlog\t--reverse\t--format=%h %s%n%b%n---END-COMMIT---\torigin/main..HEAD" then
-    callback({ code = 0, stdout = "abc1234 feat: create draft pr\n---END-COMMIT---\n", stderr = "" })
+  if key == "git\tlog\t--reverse\t--format=%s%n%b%n---END-COMMIT---\torigin/main..HEAD" then
+    callback({ code = 0, stdout = "feat: create draft pr\n---END-COMMIT---\n", stderr = "" })
+    return
+  end
+  if key == "git\tdiff\t--stat\t--summary\torigin/main..HEAD" then
+    callback({ code = 0, stdout = " nvim/lua/github/open_pr.lua | 12 +++++++-----\n", stderr = "" })
+    return
+  end
+  if key == "git\tdiff\t--no-ext-diff\t--no-color\torigin/main..HEAD" then
+    callback({
+      code = 0,
+      stdout = table.concat({
+        "diff --git a/nvim/lua/github/open_pr.lua b/nvim/lua/github/open_pr.lua",
+        "--- a/nvim/lua/github/open_pr.lua",
+        "+++ b/nvim/lua/github/open_pr.lua",
+        "@@ -1 +1 @@",
+        "-old prompt",
+        "+new prompt",
+      }, "\n"),
+      stderr = "",
+    })
     return
   end
   if key == "git\trev-parse\t--abbrev-ref\t--symbolic-full-name\t@{u}" then
@@ -154,7 +185,7 @@ vim.system = function(command, opts, callback)
     callback({ code = 0, stdout = "", stderr = "" })
     return
   end
-  if key == "gh\tpr\tcreate\t--draft\t--base\tmain\t--head\tfeature/current\t--title\tfeat: create draft pr\t--body\tCreated by GithubPRCreate." then
+  if key == "gh\tpr\tcreate\t--draft\t--base\tmain\t--head\tfeature/current\t--title\tfeat: create draft pr\t--body\t" .. generated_pr_body then
     callback({ code = 0, stdout = created_pr_url .. "\n", stderr = "" })
     return
   end
@@ -278,6 +309,15 @@ local function run_tests()
   end, "create flow base confirmation did not render")
   press("y")
   wait_for(function() return generated_model == "test-pr-create-model" end, "PR create did not use pr_create adapter")
+  assert_true(generated_system:find("Return ONLY the PR description paragraph", 1, true) ~= nil, "PR prompt should request only a description")
+  assert_true(
+    generated_prompt:find("Compact diff context:", 1, true) ~= nil,
+    "PR prompt should include compact diff context"
+  )
+  assert_true(
+    generated_prompt:find("Provide a PR description paragraph for the changes above", 1, true) ~= nil,
+    "PR prompt should include description instructions"
+  )
   wait_for(function()
     return vim.bo[vim.api.nvim_get_current_buf()].filetype == "GitStatus"
       and vim.api.nvim_buf_get_name(0):find("DiffReviewPRTest://42", 1, true) ~= nil

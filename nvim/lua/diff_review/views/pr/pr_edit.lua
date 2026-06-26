@@ -145,6 +145,59 @@ function M.apply_markdown_parser_regions(parser, ranges)
   if type(parser.invalidate) == "function" then pcall(parser.invalidate, parser, true) end
 end
 
+--- Namespace for embedded code-fence syntax highlights, separate from render-markdown's chrome.
+M.code_block_ns = vim.api.nvim_create_namespace("diff_review.pr.code_block_syntax")
+
+--- Apply one injected code-language tree's highlights as extmarks, clipped to its own node
+--- ranges so only the fence content is colored.
+---@param buf integer
+---@param lang string
+---@param tree TSTree
+local function apply_code_tree_highlights(buf, lang, tree)
+  local query = vim.treesitter.query.get(lang, "highlights")
+  if not query then return end
+  for capture_id, node, metadata in query:iter_captures(tree:root(), buf, 0, -1) do
+    local capture = query.captures[capture_id]
+    -- Skip helper captures (leading underscore) that carry no highlight group.
+    if capture:sub(1, 1) ~= "_" then
+      local start_row, start_col, end_row, end_col = node:range()
+      pcall(vim.api.nvim_buf_set_extmark, buf, M.code_block_ns, start_row, start_col, {
+        end_row = end_row,
+        end_col = end_col,
+        hl_group = "@" .. capture,
+        priority = tonumber(metadata.priority) or 110,
+      })
+    end
+  end
+end
+
+--- Color embedded code-fence languages with treesitter, clipped to each fence's contiguous
+--- content so diff rows outside the markdown regions stay untouched. render-markdown owns the
+--- prose and chrome, so only the injected code languages are highlighted -- never the markdown or
+--- markdown_inline layers, whose nodes span the gaps between regions and bleed onto the diff.
+--- Parse asynchronously off the render path, then repaint the dedicated namespace.
+---@param buf integer
+---@param ranges table[] markdown regions (description + comment bodies)
+function M.highlight_code_blocks(buf, ranges)
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  local ok, parser = pcall(vim.treesitter.get_parser, buf, "markdown")
+  if not ok or type(parser) ~= "table" then return end
+  M.apply_markdown_parser_regions(parser, ranges)
+  parser:parse(true, function(err)
+    if err or not vim.api.nvim_buf_is_valid(buf) then return end
+    vim.api.nvim_buf_clear_namespace(buf, M.code_block_ns, 0, -1)
+    for lang, child in pairs(parser:children()) do
+      -- markdown_inline is the prose layer (owned by render-markdown) and spans region gaps;
+      -- only the real code languages map to contiguous fence content.
+      if lang ~= "markdown_inline" then
+        for _, tree in pairs(child:trees()) do
+          apply_code_tree_highlights(buf, lang, tree)
+        end
+      end
+    end
+  end)
+end
+
 ---@param buf integer
 function M.prune_description_markdown(buf)
   local first0, after0 = M.description_range0(buf)
@@ -354,25 +407,9 @@ function M.markdown_window(buf)
 end
 
 ---@param buf integer
-function M.activate_markdown_code(buf)
-  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
-  local ok, markdown_code = pcall(require, "markdown_code")
-  if ok and type(markdown_code) == "table" and type(markdown_code.activate) == "function" then
-    markdown_code.activate(buf, {
-      filetype = "markdown",
-      notify_title = "DiffReview",
-    })
-  end
-end
-
----@param buf integer
 function M.render_markdown_regions(buf)
   return trace.span("markdown.render_regions", buf, nil, function()
     if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
-
-    trace.span("markdown.activate_code", buf, nil, function()
-      M.activate_markdown_code(buf)
-    end)
 
     local ranges = trace.span("markdown.compute_ranges", buf, nil, function()
       return M.markdown_ranges0(buf)
@@ -429,10 +466,12 @@ function M.render_markdown_regions(buf)
     end)
     if render_ok then
       vim.defer_fn(function()
+        local fresh_ranges = M.markdown_ranges0(buf)
         trace.span("markdown.prune_deferred", buf, nil, function()
-          M.prune_markdown_ranges(buf, M.markdown_ranges0(buf))
+          M.prune_markdown_ranges(buf, fresh_ranges)
           restore_scope()
         end)
+        M.highlight_code_blocks(buf, fresh_ranges)
       end, 100)
       trace.span("markdown.stop_status_highlighter", buf, nil, function()
         render_orchestrator().stop_markdown_highlighter(buf)

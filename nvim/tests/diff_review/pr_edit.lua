@@ -4,8 +4,6 @@ local render_markdown_ns = vim.api.nvim_create_namespace("render-markdown.nvim")
 local render_markdown_calls = {}
 local render_markdown_parser_results = {}
 local render_markdown_outside_rows_during_render = {}
-local otter_calls = {}
-local otter_rafts = {}
 local language_register_calls = {}
 local original_language_register = vim.treesitter.language.register
 vim.treesitter.language.register = function(language, filetype)
@@ -60,29 +58,6 @@ package.loaded["render-markdown"] = {
       end
     end
     if ctx.config and ctx.config.on and ctx.config.on.render then ctx.config.on.render({ buf = ctx.buf, win = ctx.win }) end
-  end,
-}
-package.loaded["otter.keeper"] = { rafts = otter_rafts }
-package.loaded["otter"] = {
-  activate = function(languages, completion, diagnostics, tsquery)
-    local buf = vim.api.nvim_get_current_buf()
-    otter_calls[#otter_calls + 1] = {
-      kind = "activate",
-      buf = buf,
-      name = vim.api.nvim_buf_get_name(buf),
-      languages = languages,
-      completion = completion,
-      diagnostics = diagnostics,
-      tsquery = tsquery,
-    }
-    otter_rafts[buf] = { languages = { "typescript" } }
-  end,
-  sync_raft = function(buf)
-    otter_calls[#otter_calls + 1] = {
-      kind = "sync",
-      buf = buf,
-      name = vim.api.nvim_buf_get_name(buf),
-    }
   end,
 }
 
@@ -701,6 +676,11 @@ local function row_list_contains(rows, row)
   return false
 end
 
+local function code_block_highlighted(buf, row)
+  local ns = require("diff_review.views.pr.pr_edit").code_block_ns
+  return #vim.api.nvim_buf_get_extmarks(buf, ns, { row - 1, 0 }, { row - 1, -1 }, {}) > 0
+end
+
 --- 1-based rows that carry the "*" out-of-sync marker.
 ---@param buf integer
 ---@return integer[]
@@ -1189,10 +1169,8 @@ local function run()
       and row_list_contains(mark_rows, comment_code_row)
   end, "expanded regular PR comment code block was not kept as a markdown region")
   wait_for(function()
-    return otter_rafts[buf]
-      and otter_rafts[buf].languages
-      and otter_rafts[buf].languages[1] == "typescript"
-  end, "expanded regular PR comment code block did not activate markdown_code")
+    return code_block_highlighted(buf, find_row(buf, "interface CommentBlock {"))
+  end, "expanded regular PR comment code block was not treesitter-highlighted")
   assert_browse_url(
     buf,
     find_row(buf, "Second full line for expansion"),
@@ -1438,13 +1416,9 @@ local function run()
     render_markdown_outside_rows_during_render[1] == false,
     "PR markdown placed marks outside the registered markdown ranges during render"
   )
-  wait_for(function() return #otter_calls > 0 end, "PR markdown code blocks did not activate otter")
-  assert_true(otter_calls[1].kind == "activate", "PR markdown code should activate otter before syncing")
   for _, call in ipairs(language_register_calls) do
     assert_true(call.filetype ~= "GitStatus", "PR description must not register GitStatus as markdown")
   end
-  assert_true(not otter_calls[1].name:find("://", 1, true), "otter activation should use a temp-backed PR buffer name")
-  assert_true(vim.api.nvim_buf_get_name(buf):find("://", 1, true) ~= nil, "PR buffer name was not restored after otter activation")
   local markdown_rows = render_markdown_mark_rows(buf)
   assert_true(
     row_list_contains(markdown_rows, body_row) and not row_list_contains(markdown_rows, 1),
