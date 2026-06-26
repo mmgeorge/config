@@ -1,0 +1,6 @@
+---
+targets:
+  - antigravity-cli
+globs:
+  - '**/*'
+---
