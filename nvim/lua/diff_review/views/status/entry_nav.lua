@@ -16,6 +16,7 @@ local function status_render() return require("diff_review.views.status.status_r
 local function commit_view() return require("diff_review.views.status.commit_view") end
 local diff_buffer = require("diff_review.views.diff_buffer")
 local status_keys = require("diff_review.views.status.status_keys")
+local status_buffer = require("diff_review.views.status.status_buffer")
 -- keymaps edge kept lazy to avoid a load-time cycle.
 local function keymaps() return require("diff_review.shared.keymaps") end
 local notifications = require("diff_review.infra.notifications")
@@ -523,13 +524,10 @@ local function status_set_plain_lines(buf, lines)
   local state = session.states and session.states[buf] or (session.status and session.status.buf == buf and session.status) or nil
   if state then state.diff_viewport = nil end
   diff_buffer._clear_diff_gutter_visual_line(buf)
-  local was_rendering = vim.b[buf].diff_review_status_rendering
-  vim.b[buf].diff_review_status_rendering = true
-  vim.bo[buf].modifiable = true
-  vim.api.nvim_buf_clear_namespace(buf, ui.status_ns, 0, -1)
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-  vim.bo[buf].modifiable = false
-  vim.b[buf].diff_review_status_rendering = was_rendering
+  status_buffer.with_writable(buf, function()
+    vim.api.nvim_buf_clear_namespace(buf, ui.status_ns, 0, -1)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  end)
   keymaps().status_apply_hint_bar(buf)
 end
 

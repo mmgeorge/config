@@ -76,12 +76,9 @@ local function status_patch_head_line(buf, entry_id, head_line)
   if not target_line then return false end
 
   local text, segment_highlights = status_buffer.segment_line_parts(head_line.segments)
-  local was_rendering = vim.b[buf].diff_review_status_rendering
-  vim.b[buf].diff_review_status_rendering = true
-  vim.bo[buf].modifiable = true
-  vim.api.nvim_buf_set_lines(buf, target_line - 1, target_line, false, { text })
-  vim.bo[buf].modifiable = false
-  vim.b[buf].diff_review_status_rendering = was_rendering
+  status_buffer.with_writable(buf, function()
+    vim.api.nvim_buf_set_lines(buf, target_line - 1, target_line, false, { text })
+  end)
   status.entries[target_line] = head_line.entry
   if status.lines then status.lines[target_line] = text end
 

@@ -37,6 +37,24 @@ function M.add_extmark(state, line, col, opts)
   }
 end
 
+--- Run a status-buffer mutation with the buffer made writable, restoring modifiable and the
+--- render guard afterward even on error so a failed write cannot strand the buffer editable.
+--- Every programmatic write to a status buffer routes through here so the single in-place
+--- update strategies (full-render reconcile, header-line patch, plain-line reset) keep the
+--- diff_review render guard set instead of each re-implementing the toggle.
+---@param buf integer
+---@param mutate fun()
+function M.with_writable(buf, mutate)
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  local was_rendering = vim.b[buf].diff_review_status_rendering
+  vim.b[buf].diff_review_status_rendering = true
+  vim.bo[buf].modifiable = true
+  local ok, err = pcall(mutate)
+  vim.bo[buf].modifiable = false
+  vim.b[buf].diff_review_status_rendering = was_rendering
+  if not ok then error(err, 0) end
+end
+
 ---@param state DiffReviewStatusState
 ---@param text string
 ---@param entry table?

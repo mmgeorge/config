@@ -944,17 +944,14 @@ local function status_reconcile_buffer_lines(buf, new_lines)
 end
 
 local function status_write_rendered_buffer(buf)
-  local was_rendering = vim.b[buf].diff_review_status_rendering
-  vim.b[buf].diff_review_status_rendering = true
-  vim.bo[buf].modifiable = true
-  vim.api.nvim_buf_clear_namespace(buf, ui.status_ns, 0, -1)
-  local lines = session.status.lines or {}
-  for index, line in ipairs(lines) do
-    if type(line) ~= "string" then lines[index] = tostring(line or "") end
-  end
-  status_reconcile_buffer_lines(buf, lines)
-  vim.bo[buf].modifiable = false
-  vim.b[buf].diff_review_status_rendering = was_rendering
+  status_buffer.with_writable(buf, function()
+    vim.api.nvim_buf_clear_namespace(buf, ui.status_ns, 0, -1)
+    local lines = session.status.lines or {}
+    for index, line in ipairs(lines) do
+      if type(line) ~= "string" then lines[index] = tostring(line or "") end
+    end
+    status_reconcile_buffer_lines(buf, lines)
+  end)
 end
 
 local function status_apply_rendered_extmarks(buf)
