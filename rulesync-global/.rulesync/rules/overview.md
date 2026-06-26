@@ -78,11 +78,6 @@ The critical piece to remember is residual heat isn't the driver here; it's pure
 - **Testing Strategy:** Implement unit tests per module with mocks for isolation. Use integration tests for end-to-end workflows with real modules to catch boundary issues that mocks hide.
 - Keep functions focused and reasonably sized. A function whose body is shorter than its signature is a smell — if it isn't doing meaningful work beyond a direct call, it shouldn't exist.
 
-# Shell and Environment
-- **Never** read or set environment variables via shell commands. If one is required and unset, ask the user.
-- Do **not** prefix commands with `cmd /c`, just call them.
-- Unless there are compelling performance reasons, prefer using simple commands serially instead of complex combined ones. These are more likely to be auto-approved.
-
 # Semantic Local Search
 - Prefer the `sem` MCP tools for local code understanding before raw file reads, broad `rg`, or git diff commands.
 - Prefer MCP `sem_context` over shell file reads, file-prefix reads, editor buffer dumps, broad `rgfactory`, and other raw file-content methods when you need to understand local code.
@@ -109,6 +104,21 @@ The critical piece to remember is residual heat isn't the driver here; it's pure
 - Do not spawn explore agents for tiny lookups, single-file reads, tightly coupled debugging, direct implementation work, or the next critical-path step when the main agent is blocked on the answer. Do that work locally.
 - Make each delegated exploration task concrete and bounded. Include the target, the question to answer, desired thoroughness (`quick`, `medium`, or `thorough`), and the expected output format.
 - Ask explore agents to return compact evidence-backed findings with exact file paths, symbols, URLs, and gaps. The main agent owns synthesis, decisions, edits, and verification.
+
+# Shell
+Shell commands and test running are part of the development loop, so they need the same engineering discipline as code changes. A stuck command blocks iteration, hides the real failure, and turns verification into waiting instead of evidence.
+- **Never** read or set environment variables via shell commands. If one is required and unset, ask the user.
+- **Never** prefix commands with `cmd /c`, just call them.
+- Use simple commands serially instead of complex combined ones. These are more likely to be approved.
+- Always run shell commands with an explicit timeout. Use the shortest timeout that fits the command, and never set more than 120 seconds without the user explicitly approving a longer run.
+- Treat a timeout as a debugging signal. Do not rerun the same broad command with a longer timeout until you have narrowed the target, added output, or changed the command shape.
+- Do not run watch mode, dev servers, pagers, prompts, or other long-running interactive processes through an unbounded shell command. Use Terminal MCP for interactive TUI work, or start a managed background process only when the workflow requires it and you can stop or reuse it.
+
+# Testing
+- Prefer focused verification first: a single test file, test name, package target, linter target, or generated artifact check. Run the full suite only after the tight loop passes or when the change surface genuinely requires full coverage.
+- When a test is slow, optimize the iteration path before accepting the delay. Look for a smaller selector, a lower-level unit test, a fixture-only run, cached setup, or a direct validation command that proves the changed behavior.
+- If no focused command exists, say that clearly, run the best bounded command, and report the timeout or runtime as a testability problem worth improving.
+- Keep verification output actionable. Capture the command, timeout, exit status, and the failure line or artifact that proves the result.
 
 # Planning Walkthrough Model
 Use this section when asked to create, draft, write, review, or update an implementation plan, execution plan, refactor plan, test plan, or reviewer-readable code-flow walkthrough before making changes.

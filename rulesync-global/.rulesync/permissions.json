@@ -377,9 +377,6 @@
       "git commit": "deny",
       "git commit *": "deny"
     },
-    "write": {
-      "**": "allow"
-    },
     "webfetch": {
       "*": "allow"
     }
