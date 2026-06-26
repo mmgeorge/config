@@ -65,7 +65,7 @@ function M.perf_enabled()
     or dr()._gitstatus_debug_perf_enabled == true
     or global_enabled == true
     or global_enabled == 1
-    or (options and options.status_perf_logging == true)
+    or (options and options.perf_logging == true)
     or M.enabled()
 end
 

@@ -2,8 +2,7 @@
 ---@field status_buffer_name string
 ---@field pr_buffer_name string
 ---@field debug_notifications boolean
----@field status_perf_logging boolean
----@field diff_profile_enabled boolean
+---@field perf_logging boolean
 ---@field diff_profile_log_path string?
 ---@field diff_profile_slow_threshold_ms number
 ---@field diff_profile_sample_rate number
@@ -70,8 +69,10 @@ M.defaults = {
   status_buffer_name = "GitStatus",
   pr_buffer_name = "DiffReviewPR",
   debug_notifications = false,
-  status_perf_logging = true,
-  diff_profile_enabled = true,
+  -- Master perf switch: gates both the structured profiler (infra.perf →
+  -- diff-review-perf.log) and the GitStatus render timer (status_debug →
+  -- gitstatus-debug.log). The diff_profile_* keys below only tune the profiler.
+  perf_logging = true,
   diff_profile_log_path = nil,
   diff_profile_slow_threshold_ms = 8,
   diff_profile_sample_rate = 0,

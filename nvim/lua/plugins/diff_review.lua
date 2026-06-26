@@ -5,8 +5,9 @@ return {
     dependencies = { "folke/snacks.nvim" },
     cmd = { "GitStatus", "GitBranchDiff", "GitBranchDiffFile", "GitFileRevision", "GitDiffCompactPreview" },
     opts = {
-      status_perf_logging = true,
-      diff_profile_enabled = true,
+      perf_logging = true,
+      status_cursor_prewarm = true,
+      -- status_cursor_prewarm_max_hunks = 2
     },
     config = function(_, opts)
       vim.g.diff_review_gitstatus_debug = 1

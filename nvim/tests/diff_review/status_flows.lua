@@ -950,6 +950,17 @@ local function run()
   trigger_normal_mapping("<Tab>", find_row(buf, "context-stage-a.txt"))
   trigger_normal_mapping("<Tab>", find_row(buf, "context-stage-b.txt"))
   wait_for(function() return #pending_context_callbacks > 0 end, "status render did not request hunk context")
+  assert_true(
+    not pcall(find_hunk_row_after_file, buf, "context-stage-a.txt"),
+    "pending hunk context should keep file folded until context is ready\n" .. table.concat(status_lines(buf), "\n")
+  )
+  for _, request in ipairs(pending_context_callbacks) do
+    request.cb("DelayedContext")
+  end
+  wait_for(function()
+    return pcall(find_hunk_row_after_file, buf, "context-stage-a.txt")
+      and pcall(find_hunk_row_after_file, buf, "context-stage-b.txt")
+  end, "files did not open after delayed hunk context callbacks\n" .. table.concat(status_lines(buf), "\n"))
   reset_calls()
   trigger_normal_mapping("S", find_hunk_row_after_file(buf, "context-stage-a.txt"))
   wait_for(function()
@@ -957,17 +968,7 @@ local function run()
   end, "context cursor hunk stage did not run cached apply")
   wait_for(function()
     return cursor_is_on_hunk_after_file(buf, "context-stage-b.txt")
-  end, "cursor did not move to next hunk before delayed context callback\n" .. table.concat(status_lines(buf), "\n"))
-  for _, request in ipairs(pending_context_callbacks) do
-    if request.filename:find("context%-stage%-a%.txt") then
-      request.cb("DelayedContext")
-    end
-  end
-  vim.wait(50)
-  assert_true(
-    cursor_is_on_hunk_after_file(buf, "context-stage-b.txt"),
-    "delayed hunk context rerender stole cursor\n" .. table.concat(status_lines(buf), "\n")
-  )
+  end, "cursor did not move to next hunk after context-gated open\n" .. table.concat(status_lines(buf), "\n"))
   git_data.compute_hunk_context_async = original_compute_hunk_context_async
   syntax_engine.clear_context_cache()
 

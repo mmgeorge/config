@@ -13,6 +13,7 @@ local pr_edit = require("diff_review.views.pr.pr_edit")
 local render_orchestrator = require("diff_review.views.status.render_orchestrator")
 -- review edge kept lazy to avoid a load-time cycle.
 local function review() return require("diff_review.views.pr.review") end
+local function status_render() return require("diff_review.views.status.status_render") end
 local file_revision = require("diff_review.views.file_revision")
 local status_keys = require("diff_review.views.status.status_keys")
 local pr_state = require("diff_review.views.status.pr_state")
@@ -340,25 +341,29 @@ local function status_toggle(entry, state)
   local native_state = fold_state()._status_native_folded(state.buf, fold_state()._status_fold_ranges_for_id(state, fold_id), vim.api.nvim_get_current_win())
   if native_state ~= nil then current_folded = native_state end
   local next_folded = not current_folded
+  local function apply_fold_toggle()
+    fold_state()._set_status_folded(fold_id, next_folded, state)
+    if fold_entry.kind == "commit" and not next_folded and fold_entry.commit then
+      status_helpers.status_load_commit_files(fold_entry.commit)
+    end
+    local native_folded = fold_state()._status_set_native_fold_state(state.buf, fold_id, next_folded)
+    if not native_folded then
+      render_orchestrator.render_status_or_notify(state.buf, fold_id, vim.api.nvim_win_get_cursor(0)[1], { reuse_sections = true })
+    elseif state.view_kind == "status" then
+      local walkthrough = package.loaded["diff_review.views.walkthrough"]
+      if walkthrough and walkthrough.on_status_rendered then walkthrough.on_status_rendered(state.buf) end
+    end
+    if state.view_kind == "pr" then
+      pr_edit.sync_modifiable(state.buf)
+    elseif state.view_kind == "review" then
+      review().sync_modifiable(state.buf)
+    end
+  end
   if not next_folded then
     entry_nav()._status_prewarm_entry_syntax(fold_entry)
+    if status_render().status_prepare_file_expansion_context(fold_entry, state, apply_fold_toggle) then return end
   end
-  fold_state()._set_status_folded(fold_id, next_folded, state)
-  if fold_entry.kind == "commit" and not next_folded and fold_entry.commit then
-    status_helpers.status_load_commit_files(fold_entry.commit)
-  end
-  local native_folded = fold_state()._status_set_native_fold_state(state.buf, fold_id, next_folded)
-  if not native_folded then
-    render_orchestrator.render_status_or_notify(state.buf, fold_id, vim.api.nvim_win_get_cursor(0)[1], { reuse_sections = true })
-  elseif state.view_kind == "status" then
-    local walkthrough = package.loaded["diff_review.views.walkthrough"]
-    if walkthrough and walkthrough.on_status_rendered then walkthrough.on_status_rendered(state.buf) end
-  end
-  if state.view_kind == "pr" then
-    pr_edit.sync_modifiable(state.buf)
-  elseif state.view_kind == "review" then
-    review().sync_modifiable(state.buf)
-  end
+  apply_fold_toggle()
 end
 
 function M._status_collapse_parent()

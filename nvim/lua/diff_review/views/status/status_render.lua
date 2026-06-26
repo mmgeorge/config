@@ -65,6 +65,15 @@ local function status_operations_pending() return actions._status_operations_pen
 local status_render_current_model
 local status_current_model_render_delay_ms = 20
 
+---@param entry_kind string?
+---@return string
+local function status_hunk_entry_kind_for_file_entry(entry_kind)
+  if entry_kind == "commit_file" then return "commit_hunk" end
+  if entry_kind == "pr_file" then return "pr_hunk" end
+  if entry_kind == "pr_review_file" then return "pr_review_hunk" end
+  return "hunk"
+end
+
 ---@param opts? { clear_fancy_rows?: boolean, skip_operations?: boolean }
 local function status_request_current_model_render(opts)
   opts = opts or {}
@@ -365,6 +374,207 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_ki
   end)
   fold_state._status_register_fold_range(hunk_key, start_line, #session.status.lines, false, fold_text or session.status.lines[start_line])
   end)
+end
+
+---@param filename string?
+---@param line integer?
+---@param callback_key string
+---@param on_update fun(context: table|string|nil)?
+---@return table|string|nil context
+---@return boolean pending
+local function status_context_pending(filename, line, callback_key, on_update)
+  if not (filename and line) then return nil, false end
+  local context = syntax_engine.cached_hunk_context(filename, line, callback_key, on_update)
+  local cached_context = syntax_engine.context_cache_entry(filename .. ":" .. line)
+  return context, type(cached_context) == "table" and cached_context.pending == true
+end
+
+---@param file DiffReviewStatusFile?
+---@param hunk table?
+---@param previous_hunk table?
+---@param next_hunk table?
+---@param entry_kind string?
+---@param hunk_key string
+---@param on_update fun(context: table|string|nil)?
+---@return boolean
+local function status_hunk_expansion_context_pending(file, hunk, previous_hunk, next_hunk, entry_kind, hunk_key, on_update)
+  if not (file and file.filename and hunk) then return false end
+  local context_line = syntax_engine.status_hunk_context_line(hunk) or hunk.pos
+  local previous_context_line = previous_hunk and syntax_engine.status_hunk_context_line(previous_hunk) or nil
+  local next_context_line = next_hunk and syntax_engine.status_hunk_context_line(next_hunk) or nil
+  local syntax_source = syntax_engine.status_syntax_source_for_entry_kind(entry_kind)
+  local syntax_diff_text = nil
+  if syntax_source == "file" then
+    syntax_diff_text = syntax_engine.status_file_syntax_diff_text(file)
+  end
+  local require_file_match_for_context = entry_kind == "pr_hunk" or entry_kind == "pr_review_hunk"
+  local semantic_context_enabled = true
+  if require_file_match_for_context then
+    semantic_context_enabled = syntax_diff_text ~= nil and syntax_engine.diff_new_side_matches_file(file.filename, syntax_diff_text)
+  end
+
+  local context_pending = false
+  local current_context = nil
+  local previous_context = nil
+  local next_context = nil
+  if semantic_context_enabled then
+    local current_pending = false
+    local previous_pending = false
+    local next_pending = false
+    current_context, current_pending = status_context_pending(
+      file.filename,
+      context_line,
+      "status-expand:" .. hunk_key .. ":current",
+      on_update
+    )
+    previous_context, previous_pending = status_context_pending(
+      file.filename,
+      previous_context_line,
+      "status-expand:" .. hunk_key .. ":previous",
+      on_update
+    )
+    next_context, next_pending = status_context_pending(
+      file.filename,
+      next_context_line,
+      "status-expand:" .. hunk_key .. ":next",
+      on_update
+    )
+    context_pending = current_pending or previous_pending or next_pending
+  end
+
+  local suppress_start_boundary = syntax_engine.same_hunk_context_scope(previous_context, current_context)
+  local suppress_end_boundary = syntax_engine.same_hunk_context_scope(current_context, next_context)
+  local current_ancestor_key = hunk_model.context_ancestor_key(current_context)
+  local suppress_ancestor_start = current_ancestor_key ~= nil and syntax_engine.same_hunk_ancestor_scope(previous_context, current_context)
+  local suppress_ancestor_end = current_ancestor_key ~= nil and syntax_engine.same_hunk_ancestor_scope(current_context, next_context)
+  local suppress_start_boundary_keys = suppress_ancestor_start and { [current_ancestor_key] = true } or nil
+  local suppress_end_boundary_keys = suppress_ancestor_end and { [current_ancestor_key] = true } or nil
+  local ok, rows = pcall(
+    diff_render.build_fancy_diff_rows,
+    hunk.diff,
+    { hunk.staged },
+    file.filename,
+    function(hunk_line)
+      return ("status-expand:%s:%d"):format(hunk_key, hunk_line)
+    end,
+    on_update,
+    {
+      context_line = context_line,
+      boundary_context = true,
+      suppress_start_boundary = suppress_start_boundary,
+      suppress_end_boundary = suppress_end_boundary,
+      suppress_start_boundary_keys = suppress_start_boundary_keys,
+      suppress_end_boundary_keys = suppress_end_boundary_keys,
+      syntax_source = syntax_source,
+      syntax_diff_text = syntax_diff_text,
+      fallback_syntax_diff_text = hunk.fallback_syntax_diff_text,
+      old_syntax_row_offset = hunk.old_syntax_row_offset,
+      new_syntax_row_offset = hunk.new_syntax_row_offset,
+      compact_replacements = true,
+      require_file_match_for_context = require_file_match_for_context,
+    }
+  )
+  return context_pending or (ok and type(rows) == "table" and rawget(rows, "diff_review_context_pending") == true)
+end
+
+---@param entry DiffReviewStatusEntry?
+---@param on_update fun(context: table|string|nil)?
+---@return boolean
+local function status_file_expansion_context_pending(entry, on_update)
+  if not (entry and entry.file and entry.file.filename) then return false end
+  if not entry_nav._status_entry_is_file_like(entry) then return false end
+  local file = entry.file
+  if not file then return false end
+  local file_key = entry.id or status_file_key(file.section_name, file.filename)
+  local hunks = status_diff_hunks_for_file(file)
+  if #hunks == 0 then return false end
+  local display_hunks = size_gate._status_display_hunks(hunks)
+  local hunk_entry_kind = status_hunk_entry_kind_for_file_entry(entry.kind)
+  local render_budget = size_gate._status_file_render_row_budget()
+  local forced_hunks = size_gate._status_file_forced_hunk_count(file_key)
+  local rendered_rows = 0
+  local pending = false
+  for hunk_index, hunk in ipairs(display_hunks) do
+    if render_budget then
+      local next_estimate = size_gate._status_lazy_hunk_estimate(file, hunk)
+      if size_gate._status_size_gate_should_defer(rendered_rows, next_estimate, hunk_index, forced_hunks, render_budget) then
+        break
+      end
+      rendered_rows = rendered_rows + (next_estimate or 0)
+    end
+    local hunk_key = ("%s:%s"):format(file_key, vim.fn.sha256(hunk.diff or ""))
+    if status_hunk_expansion_context_pending(
+      file,
+      hunk,
+      display_hunks[hunk_index - 1],
+      display_hunks[hunk_index + 1],
+      hunk_entry_kind,
+      hunk_key,
+      on_update
+    ) then
+      pending = true
+    end
+  end
+  return pending
+end
+
+---@param entry DiffReviewStatusEntry?
+---@param state table?
+---@param on_ready fun()
+---@return boolean deferred
+local function status_prepare_file_expansion_context(entry, state, on_ready)
+  state = state or session.status
+  if not (state and entry and entry.file and entry_nav._status_entry_is_file_like(entry)) then return false end
+  local request_key = entry.id or entry.file.filename
+  state.file_expansion_context_generations = state.file_expansion_context_generations or {}
+  state.file_expansion_context_generations[request_key] = (state.file_expansion_context_generations[request_key] or 0) + 1
+  local generation = state.file_expansion_context_generations[request_key]
+  local buf = state.buf
+  local done = false
+  local function still_current()
+    local latest = buf and session.states and session.states[buf] or state
+    return latest == state
+      and state.file_expansion_context_generations
+      and state.file_expansion_context_generations[request_key] == generation
+      and (not buf or vim.api.nvim_buf_is_valid(buf))
+  end
+  local function finish()
+    if done or not still_current() then return end
+    done = true
+    on_ready()
+  end
+  local function retry()
+    if done or not still_current() then return end
+    local pending = trace.span("status.expand_file_context.prepare", buf, {
+      entry_id = entry.id,
+      file = entry.file and entry.file.filename or nil,
+      generation = generation,
+    }, function()
+      return status_file_expansion_context_pending(entry, function()
+        vim.schedule(retry)
+      end)
+    end)
+    if not pending then finish() end
+  end
+
+  local pending = trace.span("status.expand_file_context.prepare", buf, {
+    entry_id = entry.id,
+    file = entry.file and entry.file.filename or nil,
+    generation = generation,
+  }, function()
+    return status_file_expansion_context_pending(entry, function()
+      vim.schedule(retry)
+    end)
+  end)
+  if pending then
+    trace.event("status.expand_file_context.pending", buf, {
+      entry_id = entry.id,
+      file = entry.file and entry.file.filename or nil,
+      generation = generation,
+    })
+    return true
+  end
+  return false
 end
 
 local function status_render_file(file, entry_kind, hunk_entry_kind, file_key_override, hunk_key_builder, opts)
@@ -908,6 +1118,7 @@ M.status_render_file = status_render_file
 M.status_render_commit = status_render_commit
 M.status_render_section = status_render_section
 M.status_render_loaded = status_render_loaded
+M.status_prepare_file_expansion_context = status_prepare_file_expansion_context
 M.status_render_current_model = status_render_current_model
 M.status_request_current_model_render = status_request_current_model_render
 

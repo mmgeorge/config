@@ -32,7 +32,7 @@ end
 function M.configure_from_diff_review_options(options)
   options = options or {}
   M.setup({
-    enabled = options.diff_profile_enabled == true,
+    enabled = options.perf_logging == true,
     log_path = options.diff_profile_log_path,
     slow_threshold_ms = tonumber(options.diff_profile_slow_threshold_ms) or M.options.slow_threshold_ms,
     sample_rate = tonumber(options.diff_profile_sample_rate) or M.options.sample_rate,
