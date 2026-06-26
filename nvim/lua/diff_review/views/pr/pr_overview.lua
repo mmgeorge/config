@@ -10,9 +10,23 @@ local status_buffer = require("diff_review.views.status.status_buffer")
 local notifications = require("diff_review.infra.notifications")
 local gh = require("diff_review.integrations.gh")
 
-local function dr()
-  return require("diff_review")
-end
+-- status_render edge kept lazy to avoid a load-time cycle.
+local function status_render() return require("diff_review.views.status.status_render") end
+-- render_orchestrator edge kept lazy to avoid a load-time cycle.
+local function render_orchestrator() return require("diff_review.views.status.render_orchestrator") end
+local comment_rows = require("github.comment_rows")
+-- review edge kept lazy to avoid a load-time cycle.
+local function review_mod() return require("diff_review.views.pr.review") end
+local pr_edit = require("diff_review.views.pr.pr_edit")
+-- section_builder edge kept lazy to avoid a load-time cycle.
+local function section_builder() return require("diff_review.views.status.section_builder") end
+local status_keys = require("diff_review.views.status.status_keys")
+local status_head = require("diff_review.views.status.status_head")
+local entry_nav = require("diff_review.views.status.entry_nav")
+-- fold_state edge kept lazy to avoid a load-time cycle.
+local function fold_state() return require("diff_review.views.status.fold_state") end
+local datetime = require("diff_review.integrations.datetime")
+local ui = require("diff_review.infra.ui")
 local session = require("diff_review.session")
 
 -- Render-core shims: thread the active status into the state-passing buffer core so the
@@ -44,49 +58,49 @@ end
 -- lookup, render orchestrators).
 local diff_parse = require("diff_review.render.diff_parse")
 local parse_hunk_header = diff_parse.parse_hunk_header
-local function status_short_oid(...) return dr()._status_short_oid(...) end
-local function status_provider_file_key(...) return dr()._status_provider_file_key(...) end
-local function status_provider_hunk_key(...) return dr()._status_provider_hunk_key(...) end
-local function status_entry_under_cursor(...) return dr()._status_entry_under_cursor(...) end
-local function status_render_file(...) return dr()._status_render_file(...) end
-local function render_pr_status(...) return dr()._render_pr_status(...) end
+local function status_short_oid(...) return status_head._status_short_oid(...) end
+local function status_provider_file_key(...) return status_keys.provider_file_key(...) end
+local function status_provider_hunk_key(...) return status_keys.provider_hunk_key(...) end
+local function status_entry_under_cursor(...) return entry_nav._status_entry_under_cursor(...) end
+local function status_render_file(...) return status_render().status_render_file(...) end
+local function render_pr_status(...) return render_orchestrator().render_pr_status(...) end
 
 ---@param value any
 ---@return string
 function M.comment_datetime(value)
-  return dr()._datetime.relative(value)
+  return datetime.relative(value)
 end
 
 ---@param body string
 ---@return string
 function M.comment_preview(body)
-  return dr()._comment_rows.preview_text(body)
+  return comment_rows.preview_text(body)
 end
 
 ---@param comment table
 ---@return string
 function M.comment_author(comment)
-  return dr()._comment_rows.author(comment)
+  return comment_rows.author(comment)
 end
 
 ---@param text any
 ---@param width integer?
 ---@return string
 function M.pad_display_right(text, width)
-  return dr()._comment_rows.pad_right(text, width)
+  return comment_rows.pad_right(text, width)
 end
 
 ---@return GithubCommentRowsOpts
 function M.issue_comment_row_options()
   return {
-    comment_icon = dr()._comment_icon,
+    comment_icon = ui.comment_icon,
     relative_date = M.comment_datetime,
     entry_id = M.issue_comment_entry_id,
     preview_width = function(prefix)
-      return math.max(0, dr()._review.comment_rule_width(nil, nil) - vim.fn.strdisplaywidth(prefix))
+      return math.max(0, review_mod().comment_rule_width(nil, nil) - vim.fn.strdisplaywidth(prefix))
     end,
-    truncate_preview = dr()._review.truncate_preview_text,
-    body_lines = dr()._review.comment_body_lines,
+    truncate_preview = review_mod().truncate_preview_text,
+    body_lines = review_mod().comment_body_lines,
     kind = "pr_comment",
     line_hl_group = "DiffReviewReviewComment",
     body_hl_group = "DiffReviewReviewComment",
@@ -97,13 +111,13 @@ end
 ---@param comment table
 ---@return string
 function M.issue_comment_date(comment)
-  return dr()._comment_rows.date(comment, M.issue_comment_row_options())
+  return comment_rows.date(comment, M.issue_comment_row_options())
 end
 
 ---@param comments table[]?
 ---@return { author_width: integer, date_width: integer }
 function M.issue_comment_alignment(comments)
-  return dr()._comment_rows.alignment(comments, M.issue_comment_row_options())
+  return comment_rows.alignment(comments, M.issue_comment_row_options())
 end
 
 ---@param comment table
@@ -111,7 +125,7 @@ end
 ---@param has_preview? boolean
 ---@return string
 function M.issue_comment_prefix(comment, alignment, has_preview)
-  return dr()._comment_rows.prefix(comment, alignment, has_preview, M.issue_comment_row_options())
+  return comment_rows.prefix(comment, alignment, has_preview, M.issue_comment_row_options())
 end
 
 ---@param comment table
@@ -119,7 +133,7 @@ end
 ---@param alignment? { author_width?: integer, date_width?: integer }
 ---@return string
 function M.issue_comment_line(comment, expanded, alignment)
-  return dr()._comment_rows.line(comment, expanded, alignment, M.issue_comment_row_options())
+  return comment_rows.line(comment, expanded, alignment, M.issue_comment_row_options())
 end
 
 ---@param comment table?
@@ -141,7 +155,7 @@ function M.activity_text(pr, status)
   local latest_value = nil
 
   local function consider(value)
-    local epoch = dr()._datetime.parse(value)
+    local epoch = datetime.parse(value)
     if epoch and (not latest_epoch or epoch > latest_epoch) then
       latest_epoch = epoch
       latest_value = value
@@ -184,7 +198,7 @@ function M.activity_text(pr, status)
     consider_comment(comment)
   end
 
-  return latest_value and dr()._datetime.relative(latest_value) or ""
+  return latest_value and datetime.relative(latest_value) or ""
 end
 
 ---@param username string
@@ -257,11 +271,11 @@ end
 function M.pending_review_text(pr, status)
   local reviewers = M.pending_reviewers(pr, status)
   if #reviewers == 0 then return "" end
-  local tokens = { dr()._pending_review_icon }
+  local tokens = { ui.pending_review_icon }
   for _, reviewer in ipairs(reviewers) do
     local token = M.reviewer_token(M.reviewer_login(reviewer))
     if pr and pr.isDraft and M.reviewer_is_code_owner(reviewer) then
-      token = dr()._codeowner_review_icon .. token
+      token = ui.codeowner_review_icon .. token
     end
     tokens[#tokens + 1] = token
   end
@@ -282,7 +296,7 @@ end
 function M.milestone_text(pr)
   local title = M.milestone_title(pr)
   if title == "" then return "" end
-  return ("%s %s"):format(dr()._milestone_icon, title)
+  return ("%s %s"):format(ui.milestone_icon, title)
 end
 
 ---@param pr DiffReviewGhPR?
@@ -407,7 +421,7 @@ function M.review_state_style(state)
   state = tostring(state or "")
   if state == "APPROVED" then return "✓", "DiffReviewAddRange" end
   if state == "CHANGES_REQUESTED" then return "✗", "DiffReviewDeleteRange" end
-  return dr()._comment_icon, "DiffReviewReviewComment"
+  return ui.comment_icon, "DiffReviewReviewComment"
 end
 
 ---@param state string?
@@ -559,7 +573,7 @@ end
 ---@param comment table
 ---@return "LEFT"|"RIGHT"
 function M.comment_side(comment)
-  return dr()._section_builder.comment_side(comment)
+  return section_builder().comment_side(comment)
 end
 
 ---@param hunk DiffReviewHunk
@@ -769,8 +783,8 @@ end
 ---@param review DiffReviewGhSubmittedReview
 ---@return DiffReviewStatusFile[]
 function M.review_context_files(cwd, pr, diff_text, review)
-  local by_path = dr()._section_builder.comments_by_path(cwd, review.comments or {})
-  local files = dr()._section_builder.files_from_diff(cwd, {
+  local by_path = section_builder().comments_by_path(cwd, review.comments or {})
+  local files = section_builder().files_from_diff(cwd, {
     section_name = M.review_key(review),
     default_status = "",
     files = pr.files,
@@ -783,7 +797,7 @@ function M.review_context_files(cwd, pr, diff_text, review)
       for _, hunk in ipairs(file.hunks or {}) do
         vim.list_extend(hunks, M.review_context_hunks_for_hunk(file, hunk, file_comments))
       end
-      local copy = dr()._section_builder.file_with_hunks(file, hunks, file.section_name)
+      local copy = section_builder().file_with_hunks(file, hunks, file.section_name)
       copy.added = file.added
       copy.removed = file.removed
       copy.pr_review_comments = file_comments
@@ -885,9 +899,9 @@ function M.emit_review_comments_for(review, diff_line, indent)
   for index, comment in ipairs(review.comments or {}) do
     if comment.local_state ~= "deleted"
       and comment.abs_file == diff_line.file
-      and M.comment_side(comment) == dr()._review.side_of(diff_line)
+      and M.comment_side(comment) == review_mod().side_of(diff_line)
       and tonumber(comment.line) == tonumber(diff_line.line) then
-      dr()._review.emit_comment(comment, index, indent)
+      review_mod().emit_comment(comment, index, indent)
     end
   end
 end
@@ -942,11 +956,11 @@ function M.render_review(review, alignment)
   local entry = { id = review_key, kind = "pr_review", pr_review = review, default_folded = true }
   local line_number = status_add_segment_line(M.review_summary_segments(review, alignment), entry)
   if status_folded(review_key, true) then
-    dr()._status_register_fold_range(review_key, line_number, #session.status.lines, true, session.status.lines[line_number])
+    fold_state()._status_register_fold_range(review_key, line_number, #session.status.lines, true, session.status.lines[line_number])
     return
   end
   M.render_review_context(review)
-  dr()._status_register_fold_range(review_key, line_number, #session.status.lines, true, session.status.lines[line_number])
+  fold_state()._status_register_fold_range(review_key, line_number, #session.status.lines, true, session.status.lines[line_number])
 end
 
 ---@param comment table
@@ -969,7 +983,7 @@ function M.render_issue_comment(comment, index, alignment)
       status_add_highlight(line_number, highlight.start_col, highlight.end_col, highlight.hl_group)
     end
   end
-  dr()._status_register_fold_range(entry_id, start_line, #session.status.lines, true, fold_text)
+  fold_state()._status_register_fold_range(entry_id, start_line, #session.status.lines, true, fold_text)
 end
 
 ---@param comments table[]
@@ -984,7 +998,7 @@ function M.issue_comment_rows(comments, opts)
   row_opts.is_folded = opts.is_folded or function(entry_id, default)
     return status_folded(entry_id, default)
   end
-  return dr()._comment_rows.rows(comments, row_opts)
+  return comment_rows.rows(comments, row_opts)
 end
 
 ---@param comments table[]
@@ -1127,11 +1141,11 @@ function M.merge_remote_editable_comment(target, remote)
   target.viewer_did_author = remote.viewer_did_author
   target.replies = type(remote.replies) == "table" and vim.deepcopy(remote.replies) or (target.replies or {})
 
-  local remote_body = dr()._review.normalize_comment_body_text(remote.body)
-  local base_body = dr()._review.normalize_comment_body_text(target.base_body)
-  local local_body = dr()._review.normalize_comment_body_text(target.body)
-  local base_sync_body = dr()._review.comment_body_for_sync(base_body)
-  local local_sync_body = dr()._review.comment_body_for_sync(local_body)
+  local remote_body = review_mod().normalize_comment_body_text(remote.body)
+  local base_body = review_mod().normalize_comment_body_text(target.base_body)
+  local local_body = review_mod().normalize_comment_body_text(target.body)
+  local base_sync_body = review_mod().comment_body_for_sync(base_body)
+  local local_sync_body = review_mod().comment_body_for_sync(local_body)
   if target.local_state == "dirty" or target.local_state == "new" then
     if remote_body == local_sync_body then
       target.base_body = remote_body
@@ -1160,7 +1174,7 @@ function M.merge_viewer_authored_comment_into_list(status, list, remote, opts)
     if M.comment_identity_key(comment) == key then
       M.merge_remote_editable_comment(comment, remote)
       if opts and opts.regular then comment.pr_issue_comment = true else comment.standalone = true end
-      dr()._review.normalize_comment(status, comment)
+      review_mod().normalize_comment(status, comment)
       return
     end
   end
@@ -1173,9 +1187,9 @@ function M.merge_viewer_authored_comment_into_list(status, list, remote, opts)
     comment.local_state = "clean"
     comment.base_body = remote.body
     comment.replies = type(remote.replies) == "table" and vim.deepcopy(remote.replies) or {}
-    dr()._review.normalize_comment(status, comment)
+    review_mod().normalize_comment(status, comment)
   else
-    comment = dr()._review.comment_from_remote(status, remote)
+    comment = review_mod().comment_from_remote(status, remote)
     comment.standalone = true
   end
   list[#list + 1] = comment
@@ -1202,7 +1216,7 @@ end
 function M.regular_comment_index(status, target)
   if not (status and target) then return nil end
   for index, comment in ipairs(status.pr_regular_comments or {}) do
-    if dr()._review.same_comment(comment, target) then return index end
+    if review_mod().same_comment(comment, target) then return index end
   end
   return nil
 end
@@ -1220,10 +1234,10 @@ end
 function M.is_standalone_comment(status, comment)
   if not (status and comment) then return false end
   for _, local_comment in ipairs(status.pr_standalone_comments or {}) do
-    if dr()._review.same_comment(local_comment, comment) then return true end
+    if review_mod().same_comment(local_comment, comment) then return true end
   end
   for _, local_comment in ipairs(status.pr_regular_comments or {}) do
-    if dr()._review.same_comment(local_comment, comment) then return true end
+    if review_mod().same_comment(local_comment, comment) then return true end
   end
   return false
 end
@@ -1241,10 +1255,10 @@ function M.open_pr_comment_body(buf, status, comment)
       and entry.kind == "pr_comment"
       and entry.id
       and entry.pr_comment
-      and dr()._review.same_comment(entry.pr_comment, comment)
+      and review_mod().same_comment(entry.pr_comment, comment)
       and status_folded(entry.id, true) then
       set_status_folded(entry.id, false)
-      if not dr()._status_set_native_fold_state(buf, entry.id, false) then
+      if not fold_state()._status_set_native_fold_state(buf, entry.id, false) then
         render_pr_status(status.pr, status.cwd, buf, status.pr_diff_text)
       end
       return true
@@ -1258,7 +1272,7 @@ end
 function M.standalone_comment_under_cursor(buf)
   local status = M.state(buf)
   if not status then return nil end
-  local comment = dr()._review.comment_at_cursor(buf)
+  local comment = review_mod().comment_at_cursor(buf)
   if M.is_standalone_comment(status, comment) then return comment end
   return nil
 end
@@ -1294,17 +1308,17 @@ end
 ---@return table? payload
 function M.selection_payload(status)
   if not M.selection_is_in_changes(status) then return nil end
-  return dr()._review.selection_payload(status)
+  return review_mod().selection_payload(status)
 end
 
 ---@param buf integer
 function M.refresh_modified(buf)
   local status = M.state(buf)
   if not status or not vim.api.nvim_buf_is_valid(buf) then return end
-  local title_dirty, desc_dirty, review_dirty, milestone_dirty = dr()._pr_edit.dirty_flags(buf, status)
+  local title_dirty, desc_dirty, review_dirty, milestone_dirty = pr_edit.dirty_flags(buf, status)
   local comments_dirty = false
   for _, comment in ipairs(status.review_comments or {}) do
-    if dr()._review.comment_needs_sync(comment) then
+    if review_mod().comment_needs_sync(comment) then
       comments_dirty = true
       break
     end
@@ -1320,12 +1334,12 @@ function M.render_preserving_inline_cursor(buf)
   local snapshot
   if vim.api.nvim_get_current_buf() == buf then
     local cursor = vim.api.nvim_win_get_cursor(0)
-    comment = dr()._review.comment_body_at_row(buf, cursor[1])
-    if comment then snapshot = dr()._review.inline_comment_cursor_snapshot(buf, comment) end
+    comment = review_mod().comment_body_at_row(buf, cursor[1])
+    if comment then snapshot = review_mod().inline_comment_cursor_snapshot(buf, comment) end
   end
   render_pr_status(status.pr, status.cwd, buf, status.pr_diff_text)
   if comment and snapshot and comment.local_state ~= "deleted" then
-    dr()._review.restore_inline_comment_cursor(buf, comment, snapshot)
+    review_mod().restore_inline_comment_cursor(buf, comment, snapshot)
   end
 end
 
@@ -1349,7 +1363,7 @@ function M.apply_synced_standalone_comment(status, comment, remote, queued_body)
     comment.url = remote.url or comment.url
     comment.replies = type(remote.replies) == "table" and vim.deepcopy(remote.replies) or (comment.replies or {})
   end
-  if dr()._review.comment_body_for_sync(comment.body or "") == queued_body then
+  if review_mod().comment_body_for_sync(comment.body or "") == queued_body then
     comment.body = queued_body
     comment.base_body = queued_body
     comment.local_state = "clean"
@@ -1358,7 +1372,7 @@ function M.apply_synced_standalone_comment(status, comment, remote, queued_body)
     comment.local_state = "dirty"
   end
   comment.syncing = nil
-  dr()._review.normalize_comment(status, comment)
+  review_mod().normalize_comment(status, comment)
 end
 
 ---@param status table
@@ -1377,7 +1391,7 @@ function M.apply_synced_regular_comment(status, comment, remote, queued_body)
     comment.updated_at = remote.updated_at or comment.updated_at
     comment.url = remote.url or comment.url
   end
-  if dr()._review.comment_body_for_sync(comment.body or "") == queued_body then
+  if review_mod().comment_body_for_sync(comment.body or "") == queued_body then
     comment.body = queued_body
     comment.base_body = queued_body
     comment.local_state = "clean"
@@ -1386,7 +1400,7 @@ function M.apply_synced_regular_comment(status, comment, remote, queued_body)
     comment.local_state = "dirty"
   end
   comment.syncing = nil
-  dr()._review.normalize_comment(status, comment)
+  review_mod().normalize_comment(status, comment)
   M.refresh_editable_comments(status)
   if comment_index then
     local new_entry_id = M.issue_comment_entry_id(comment, comment_index)
@@ -1419,7 +1433,7 @@ end
 function M.sync_regular_comment(buf, comment)
   local status = M.state(buf)
   if not (status and status.pr and comment) then return end
-  local body = dr()._review.comment_body_for_sync(comment.body or "")
+  local body = review_mod().comment_body_for_sync(comment.body or "")
   if body == "" then
     comment.syncing = nil
     M.refresh_modified(buf)
@@ -1474,7 +1488,7 @@ function M.sync_standalone_comment(buf, comment)
     M.sync_regular_comment(buf, comment)
     return
   end
-  local body = dr()._review.comment_body_for_sync(comment.body or "")
+  local body = review_mod().comment_body_for_sync(comment.body or "")
   if body == "" then
     comment.syncing = nil
     M.refresh_modified(buf)
@@ -1535,17 +1549,17 @@ end
 function M.sync_standalone_comments(buf)
   local status = M.state(buf)
   if not status then return 0 end
-  dr()._review.sync_inline_comment_text(buf)
+  review_mod().sync_inline_comment_text(buf)
   local comments = {}
   for _, comment in ipairs(status.review_comments or {}) do
-    if dr()._review.comment_needs_sync(comment) then
+    if review_mod().comment_needs_sync(comment) then
       comment.syncing = true
       comments[#comments + 1] = comment
     end
   end
   if #comments == 0 then return 0 end
   for _, comment in ipairs(comments) do
-    dr()._review.refresh_inline_comment_header(buf, comment)
+    review_mod().refresh_inline_comment_header(buf, comment)
   end
   M.refresh_modified(buf)
   for _, comment in ipairs(comments) do
@@ -1559,7 +1573,7 @@ end
 ---@return table comment
 function M.create_inline_comment(status, payload)
   status.pr_standalone_comments = status.pr_standalone_comments or {}
-  local comment = dr()._review.inline_comment_from_payload(status, payload)
+  local comment = review_mod().inline_comment_from_payload(status, payload)
   comment.standalone = true
   status.pr_standalone_comments[#status.pr_standalone_comments + 1] = comment
   M.refresh_editable_comments(status)
@@ -1578,7 +1592,7 @@ function M.create_regular_comment(status)
     updated_at = created_at,
     local_state = "new",
   }
-  dr()._review.normalize_comment(status, comment)
+  review_mod().normalize_comment(status, comment)
   status.pr_regular_comments[#status.pr_regular_comments + 1] = comment
   set_status_folded(M.issue_comment_entry_id(comment, #status.pr_regular_comments), false)
   M.refresh_editable_comments(status)
@@ -1593,17 +1607,17 @@ function M.add_standalone_comment(buf)
   local existing = M.standalone_comment_under_cursor(buf)
   if existing then
     M.open_pr_comment_body(buf, status, existing)
-    dr()._review.focus_inline_comment(buf, existing)
+    review_mod().focus_inline_comment(buf, existing)
     return
   end
   local payload = M.selection_payload(status)
-  dr()._review.leave_visual()
-  if payload and not dr()._status_source_policy_allows_cursor(status, "comment") then return end
+  review_mod().leave_visual()
+  if payload and not entry_nav._status_source_policy_allows_cursor(status, "comment") then return end
   local comment = payload
     and M.create_inline_comment(status, payload)
     or M.create_regular_comment(status)
   render_pr_status(status.pr, status.cwd, buf, status.pr_diff_text)
-  dr()._review.focus_inline_comment(buf, comment, { insert = true })
+  review_mod().focus_inline_comment(buf, comment, { insert = true })
   M.refresh_modified(buf)
 end
 

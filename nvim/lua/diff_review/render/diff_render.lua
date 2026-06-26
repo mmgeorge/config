@@ -4,13 +4,19 @@
 ---@class DiffReviewDiffRenderModule
 local M = {}
 
-local syntax_engine = require("diff_review.render.syntax_engine")
+-- syntax_engine edge kept lazy to avoid a load-time cycle.
+local function syntax_engine() return require("diff_review.render.syntax_engine") end
 local diff_parse = require("diff_review.render.diff_parse")
 
 local util = require("diff_review.infra.util")
-local function dr()
-  return require("diff_review")
-end
+-- status_debug edge kept lazy to avoid a load-time cycle.
+local function status_debug() return require("diff_review.views.status.status_debug") end
+-- hunk_model edge kept lazy to avoid a load-time cycle.
+local function hunk_model() return require("diff_review.render.hunk_model") end
+local intraline_diff = require("diff_review.render.intraline_diff")
+-- diff_buffer edge kept lazy to avoid a load-time cycle.
+local function diff_buffer() return require("diff_review.views.diff_buffer") end
+local ui = require("diff_review.infra.ui")
 local session = require("diff_review.session")
 
 -- Seams to init-owned helpers the builders share.
@@ -78,7 +84,7 @@ local function hunk_boundary_row(text, segments, line_number, gutter, file, old_
       "",
       nil,
       meta = {
-        diff = dr()._hunk_diff_line_meta({
+        diff = hunk_model().diff_line_meta({
           prefix = " ",
           old_line = old_line,
           new_line = new_line,
@@ -99,7 +105,7 @@ local function hunk_boundary_row(text, segments, line_number, gutter, file, old_
 end
 
 local function hunk_boundary_ellipsis_row(reference_text, gutter)
-  return hunk_boundary_row(syntax_engine.line_indent(reference_text) .. "...", nil, nil, gutter)
+  return hunk_boundary_row(syntax_engine().line_indent(reference_text) .. "...", nil, nil, gutter)
 end
 
 local function hunk_header_row(header_parts)
@@ -123,13 +129,13 @@ local function hunk_body_row(parsed_line, gutter, file, syntax, syntax_row)
 
   local row = { diff_review_bg_hl = line_hl }
   local diff_meta = {
-    diff = dr()._hunk_diff_line_meta(parsed_line, file),
+    diff = hunk_model().diff_line_meta(parsed_line, file),
   }
   row[#row + 1] = { "", nil, meta = diff_meta }
   hunk_add_gutter(row, gutter, parsed_line.old_line, parsed_line.new_line, parsed_line.prefix, sign_hl, line_hl)
   local segments = nil
   if syntax and syntax_row then
-    segments = syntax_engine.treesitter_line_segments(syntax.buf, syntax.tree, syntax.highlight_query, syntax_row, parsed_line.code)
+    segments = syntax_engine().treesitter_line_segments(syntax.buf, syntax.tree, syntax.highlight_query, syntax_row, parsed_line.code)
   end
   if segments and #segments > 0 then
     for _, segment in ipairs(segments) do
@@ -170,7 +176,7 @@ local function merge_hunk_render_plans(plans)
   local current_group = nil ---@type DiffReviewHunkDisplayGroup?
   for _, plan in ipairs(plans) do
     local previous_plan = current_group and current_group.plans[#current_group.plans] or nil
-    if not (current_group and previous_plan and dr()._hunk_render_plans_should_merge(previous_plan, plan)) then
+    if not (current_group and previous_plan and hunk_model().render_plans_should_merge(previous_plan, plan)) then
       current_group = {
         plans = {},
         gutter = plan.gutter,
@@ -209,11 +215,11 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
     local old_file_pending = false
     local new_pending = false
     local file_pending = false
-    local uses_file_syntax = dr()._diff_uses_file_syntax(hunk_staged, opts)
-    local new_side_matches_file = dr()._diff_new_side_matches_file(filename, syntax_diff_text)
+    local uses_file_syntax = syntax_engine().diff_uses_file_syntax(hunk_staged, opts)
+    local new_side_matches_file = syntax_engine().diff_new_side_matches_file(filename, syntax_diff_text)
     source_matches_file = (not require_file_match_for_context) or new_side_matches_file
     if debug_context then
-      dr()._gitstatus_debug.event("build_fancy_diff_rows.syntax", {
+      status_debug().event("build_fancy_diff_rows.syntax", {
         context = debug_context,
         filename = filename,
         syntax_source = opts.syntax_source,
@@ -226,30 +232,30 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
     end
     local fallback_syntax_diff_text = opts.fallback_syntax_diff_text or diff_text
     if uses_file_syntax and new_side_matches_file then
-      old_file_syntax, old_file_pending = dr()._cached_old_file_syntax(filename, syntax_diff_text, syntax_callback_key .. ":old-file-syntax", on_context_update)
+      old_file_syntax, old_file_pending = syntax_engine().cached_old_file_syntax(filename, syntax_diff_text, syntax_callback_key .. ":old-file-syntax", on_context_update)
       if not old_file_syntax and not old_file_pending then
-        old_syntax, old_pending = syntax_engine.cached_diff_syntax(filename, fallback_syntax_diff_text, "old", syntax_callback_key .. ":old-diff-syntax", on_context_update)
+        old_syntax, old_pending = syntax_engine().cached_diff_syntax(filename, fallback_syntax_diff_text, "old", syntax_callback_key .. ":old-diff-syntax", on_context_update)
       end
-      file_syntax, file_pending = syntax_engine.cached_file_syntax(filename, syntax_callback_key .. ":file-syntax", on_context_update)
+      file_syntax, file_pending = syntax_engine().cached_file_syntax(filename, syntax_callback_key .. ":file-syntax", on_context_update)
       if not file_syntax and not file_pending then
-        new_syntax, new_pending = syntax_engine.cached_diff_syntax(filename, fallback_syntax_diff_text, "new", syntax_callback_key .. ":new-diff-syntax", on_context_update)
+        new_syntax, new_pending = syntax_engine().cached_diff_syntax(filename, fallback_syntax_diff_text, "new", syntax_callback_key .. ":new-diff-syntax", on_context_update)
       end
     else
-      old_syntax, old_pending = syntax_engine.cached_diff_syntax(filename, fallback_syntax_diff_text, "old", syntax_callback_key .. ":old-diff-syntax", on_context_update)
-      new_syntax, new_pending = syntax_engine.cached_diff_syntax(filename, fallback_syntax_diff_text, "new", syntax_callback_key .. ":new-diff-syntax", on_context_update)
+      old_syntax, old_pending = syntax_engine().cached_diff_syntax(filename, fallback_syntax_diff_text, "old", syntax_callback_key .. ":old-diff-syntax", on_context_update)
+      new_syntax, new_pending = syntax_engine().cached_diff_syntax(filename, fallback_syntax_diff_text, "new", syntax_callback_key .. ":new-diff-syntax", on_context_update)
     end
     syntax_pending = old_pending or old_file_pending or new_pending or file_pending
   end
 
-  local source_lines = source_matches_file and filename and dr()._file_source_lines(filename) or nil
+  local source_lines = source_matches_file and filename and syntax_engine().file_source_lines(filename) or nil
   local plans = {} ---@type DiffReviewHunkRenderPlan[]
 
   local function context_for_line(block, line)
     if not (source_matches_file and filename and line) then return nil end
     local callback_key = context_callback_key and context_callback_key(line)
       or ("diff-row:" .. (filename or block.file) .. ":" .. line)
-    local context = syntax_engine.cached_hunk_context(filename, line, callback_key, on_context_update)
-    local cached_context = syntax_engine.context_cache_entry(filename .. ":" .. line)
+    local context = syntax_engine().cached_hunk_context(filename, line, callback_key, on_context_update)
+    local cached_context = syntax_engine().context_cache_entry(filename .. ":" .. line)
     if type(cached_context) == "table" and cached_context.pending then context_pending = true end
     return context
   end
@@ -285,15 +291,15 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
     for _, hunk in ipairs(block.hunks) do
       hunk_idx = hunk_idx + 1
       hunk = parse_hunk_body(hunk)
-      local include_render_line = dr()._hunk_render_line_filter(hunk)
+      local include_render_line = hunk_model().render_line_filter(hunk)
       if type(source_lines) ~= "table" then
         include_render_line = function() return true end
       end
-      local line_by_position = dr()._hunk_current_line_by_position(hunk)
-      local occupied_lines = dr()._hunk_changed_current_line_set(hunk, line_by_position)
+      local line_by_position = hunk_model().current_line_by_position(hunk)
+      local occupied_lines = hunk_model().changed_current_line_set(hunk, line_by_position)
       local render_items = nil
       if opts.compact_replacements then
-        render_items = dr()._intraline_diff.compact_hunk_lines(hunk.lines)
+        render_items = intraline_diff.compact_hunk_lines(hunk.lines)
       else
         render_items = {}
         for _, parsed_line in ipairs(hunk.lines) do
@@ -301,7 +307,7 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
         end
       end
 
-      local regions = dr()._hunk_change_regions(render_items, line_by_position, function(line)
+      local regions = hunk_model().change_regions(render_items, line_by_position, function(line)
         return context_for_line(block, line)
       end)
       if type(source_lines) ~= "table" then
@@ -312,13 +318,13 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
       end
       local syntax_by_item = {}
       for item_index, item in ipairs(render_items) do
-        local parsed_line = dr()._hunk_render_item_line(item)
+        local parsed_line = hunk_model().render_item_line(item)
         local row_syntax, row_syntax_row = syntax_for_line(parsed_line)
         syntax_by_item[item_index] = {
           syntax = row_syntax,
           row = row_syntax_row,
         }
-        for _, backing_line in ipairs(dr()._hunk_render_item_backing_lines(item)) do
+        for _, backing_line in ipairs(hunk_model().render_item_backing_lines(item)) do
           advance_syntax_rows(backing_line)
         end
       end
@@ -328,7 +334,7 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
           changed_line = region.changed_line,
           after_line = region.after_line,
         }
-        local before_padding_lines = dr()._hunk_context_padding_lines(
+        local before_padding_lines = hunk_model().context_padding_lines(
           source_lines,
           hunk,
           region.context,
@@ -337,8 +343,8 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
           include_render_line,
           region_bounds
         )
-        dr()._hunk_annotate_padding_line_numbers(before_padding_lines, block)
-        local after_padding_lines = dr()._hunk_context_padding_lines(
+        hunk_model().annotate_padding_line_numbers(before_padding_lines, block)
+        local after_padding_lines = hunk_model().context_padding_lines(
           source_lines,
           hunk,
           region.context,
@@ -347,8 +353,8 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
           include_render_line,
           region_bounds
         )
-        dr()._hunk_annotate_padding_line_numbers(after_padding_lines, block)
-        local display_start, display_end = dr()._hunk_region_display_window(region, before_padding_lines, after_padding_lines)
+        hunk_model().annotate_padding_line_numbers(after_padding_lines, block)
+        local display_start, display_end = hunk_model().region_display_window(region, before_padding_lines, after_padding_lines)
         plans[#plans + 1] = {
           block = block,
           hunk = hunk,
@@ -362,10 +368,10 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
           source_lines = source_lines,
           occupied_lines = occupied_lines,
           syntax_by_item = syntax_by_item,
-          visible_source_lines = dr()._hunk_region_visible_source_lines(region, render_items, include_render_line),
+          visible_source_lines = hunk_model().region_visible_source_lines(region, render_items, include_render_line),
           before_padding_lines = before_padding_lines,
           after_padding_lines = after_padding_lines,
-          changed_lines = dr()._hunk_region_changed_current_lines(region, render_items, line_by_position),
+          changed_lines = hunk_model().region_changed_current_lines(region, render_items, line_by_position),
           display_start = display_start,
           display_end = display_end,
         }
@@ -377,13 +383,13 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
   local emitted_start_scope_keys = {}
   for group_index, group in ipairs(display_groups) do
     local next_group = display_groups[group_index + 1]
-    ret[#ret + 1] = hunk_header_row(dr()._hunk_virtual_header_parts(group, group.plans[1] and group.plans[1].hunk or nil))
+    ret[#ret + 1] = hunk_header_row(hunk_model().virtual_header_parts(group, group.plans[1] and group.plans[1].hunk or nil))
     local emitted_context_lines = {}
 
     local function add_context_padding_rows(padding_lines, gutter, block_file)
       for _, padding_line in ipairs(padding_lines or {}) do
         if not group.changed_lines[padding_line.line_number] and not emitted_context_lines[padding_line.line_number] then
-          ret[#ret + 1] = dr()._hunk_context_padding_row(
+          ret[#ret + 1] = hunk_model().context_padding_row(
             padding_line.line_number,
             padding_line.text,
             gutter,
@@ -403,20 +409,20 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
 
     local function add_context_bridge_rows(plan, next_plan)
       if not (plan and next_plan and type(source_lines) == "table") then return end
-      local previous_old_line, previous_new_line = dr()._hunk_last_visible_plan_coords(plan, plan.region.context)
-      local next_old_line, next_new_line = dr()._hunk_first_visible_plan_coords(next_plan, next_plan.region.context)
-      local gap = dr()._hunk_render_coord_gap(previous_old_line, previous_new_line, next_old_line, next_new_line)
-      if not (gap and gap > 0 and gap <= dr()._hunk_context_bridge_limit()) then return end
+      local previous_old_line, previous_new_line = hunk_model().last_visible_plan_coords(plan, plan.region.context)
+      local next_old_line, next_new_line = hunk_model().first_visible_plan_coords(next_plan, next_plan.region.context)
+      local gap = hunk_model().render_coord_gap(previous_old_line, previous_new_line, next_old_line, next_new_line)
+      if not (gap and gap > 0 and gap <= hunk_model().context_bridge_limit()) then return end
       if not (previous_new_line and next_new_line and next_new_line > previous_new_line + 1) then return end
       for line_number = previous_new_line + 1, next_new_line - 1 do
         if not group.changed_lines[line_number] and not emitted_context_lines[line_number] then
-          ret[#ret + 1] = dr()._hunk_context_padding_row(
+          ret[#ret + 1] = hunk_model().context_padding_row(
             line_number,
             source_lines[line_number] or "",
             group.gutter,
             filename or plan.block.file,
             file_syntax,
-            dr()._hunk_old_line_for_new_line(plan.block.hunks, line_number),
+            hunk_model().old_line_for_new_line(plan.block.hunks, line_number),
             line_number
           )
           emitted_context_lines[line_number] = true
@@ -435,7 +441,7 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
           start_boundaries[#start_boundaries + 1] = boundary
         end
         start_boundaries[#start_boundaries + 1] = {
-          key = syntax_engine.hunk_context_scope_key(raw_context),
+          key = syntax_engine().hunk_context_scope_key(raw_context),
           row = node_start,
           text = start_text,
           segments = raw_context.start_segments,
@@ -448,7 +454,7 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
             and opts.suppress_start_boundary_keys
             and opts.suppress_start_boundary_keys[boundary_key] == true
           local suppress_start_boundary = (group_index == 1 and plan_index == 1 and opts.suppress_start_boundary)
-            or syntax_engine.same_hunk_context_scope(previous_plan and previous_plan.region.context, raw_context)
+            or syntax_engine().same_hunk_context_scope(previous_plan and previous_plan.region.context, raw_context)
             or boundary_seen
             or suppress_boundary_key
           local boundary_visible = plan.visible_source_lines[boundary.text] == true
@@ -456,7 +462,7 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
           if not suppress_start_boundary
             and not boundary_visible
             and not emitted_context_lines[boundary.row] then
-            local boundary_old_line = dr()._hunk_old_line_for_new_line(plan.block.hunks, boundary.row)
+            local boundary_old_line = hunk_model().old_line_for_new_line(plan.block.hunks, boundary.row)
             local boundary_new_line = boundary.row
             ret[#ret + 1] = hunk_boundary_row(
               boundary.text,
@@ -473,15 +479,15 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
             local next_new_line = nil
             local next_boundary = start_boundaries[boundary_index + 1]
             if next_boundary then
-              next_old_line = dr()._hunk_old_line_for_new_line(plan.block.hunks, next_boundary.row)
+              next_old_line = hunk_model().old_line_for_new_line(plan.block.hunks, next_boundary.row)
               next_new_line = next_boundary.row
             else
-              next_old_line, next_new_line = dr()._hunk_first_visible_plan_coords(plan, raw_context)
+              next_old_line, next_new_line = hunk_model().first_visible_plan_coords(plan, raw_context)
             end
-            local adjacent_to_next = dr()._hunk_render_coords_adjacent(boundary_old_line, boundary_new_line, next_old_line, next_new_line)
+            local adjacent_to_next = hunk_model().render_coords_adjacent(boundary_old_line, boundary_new_line, next_old_line, next_new_line)
             if not adjacent_to_next then
               if boundary.selected then
-                local hidden_row, hidden_line = dr()._hunk_single_hidden_context_gap_row(
+                local hidden_row, hidden_line = hunk_model().single_hidden_context_gap_row(
                   source_lines,
                   plan.block,
                   boundary_new_line,
@@ -514,15 +520,15 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
       local last_visible_new_line = nil
       for item_index = plan.region.first_item, plan.region.last_item do
         local item = plan.render_items[item_index]
-        local parsed_line = dr()._hunk_render_item_line(item)
+        local parsed_line = hunk_model().render_item_line(item)
         local syntax_entry = plan.syntax_by_item[item_index] or {}
         local row_syntax = syntax_entry.syntax
         local row_syntax_row = syntax_entry.row
-        local visible_in_scope = syntax_engine.hunk_line_visible_in_context_scope(parsed_line, raw_context)
+        local visible_in_scope = syntax_engine().hunk_line_visible_in_context_scope(parsed_line, raw_context)
         local visible_in_hunk = plan.include_render_line(parsed_line)
         local context_already_emitted = parsed_line.prefix == " " and parsed_line.new_line and emitted_context_lines[parsed_line.new_line]
         if item.kind == "replacement" then
-          ret[#ret + 1] = dr()._hunk_replacement_row(item, group.gutter, filename or plan.block.file, row_syntax, row_syntax_row)
+          ret[#ret + 1] = hunk_model().replacement_row(item, group.gutter, filename or plan.block.file, row_syntax, row_syntax_row)
           for _, backing_line in ipairs(item.diff_lines or {}) do
             mark_emitted_context_line(backing_line)
           end
@@ -533,14 +539,14 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
           mark_emitted_context_line(parsed_line)
           last_visible_new_line = parsed_line.new_line
           previous_visible_changed = parsed_line.prefix == "+" or parsed_line.prefix == "-"
-        elseif dr()._hunk_hidden_closing_boundary_after_change(parsed_line, previous_visible_changed, raw_context, visible_in_hunk) then
+        elseif hunk_model().hidden_closing_boundary_after_change(parsed_line, previous_visible_changed, raw_context, visible_in_hunk) then
           local boundary_segments = nil
           if row_syntax and row_syntax_row then
-            boundary_segments = syntax_engine.treesitter_line_segments(row_syntax.buf, row_syntax.tree, row_syntax.highlight_query, row_syntax_row, parsed_line.code)
+            boundary_segments = syntax_engine().treesitter_line_segments(row_syntax.buf, row_syntax.tree, row_syntax.highlight_query, row_syntax_row, parsed_line.code)
           end
           local previous_line_emitted = parsed_line.new_line and emitted_context_lines[parsed_line.new_line - 1] == true
           if not previous_line_emitted then
-            local hidden_row, hidden_line = dr()._hunk_single_hidden_context_gap_row(
+            local hidden_row, hidden_line = hunk_model().single_hidden_context_gap_row(
               source_lines,
               plan.block,
               last_visible_new_line,
@@ -590,15 +596,15 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
         local next_group_plan = next_plan == nil and next_group and next_group.plans and next_group.plans[1] or nil
         local suppress_end_boundary = next_plan ~= nil
           or (group_index == #display_groups and plan_index == #group.plans and opts.suppress_end_boundary)
-          or syntax_engine.same_hunk_context_scope(raw_context, next_plan and next_plan.region.context)
-          or syntax_engine.same_hunk_context_scope(raw_context, next_group_plan and next_group_plan.region.context)
+          or syntax_engine().same_hunk_context_scope(raw_context, next_plan and next_plan.region.context)
+          or syntax_engine().same_hunk_context_scope(raw_context, next_group_plan and next_group_plan.region.context)
         if not suppress_end_boundary and not plan.visible_source_lines[end_text] and not emitted_context_lines[node_end] then
-          local boundary_old_line = dr()._hunk_old_line_for_new_line(plan.block.hunks, node_end)
+          local boundary_old_line = hunk_model().old_line_for_new_line(plan.block.hunks, node_end)
           local boundary_new_line = node_end
-          local previous_old_line, previous_new_line = dr()._hunk_last_visible_plan_coords(plan, raw_context)
-          local adjacent_to_previous = dr()._hunk_render_coords_adjacent(previous_old_line, previous_new_line, boundary_old_line, boundary_new_line)
+          local previous_old_line, previous_new_line = hunk_model().last_visible_plan_coords(plan, raw_context)
+          local adjacent_to_previous = hunk_model().render_coords_adjacent(previous_old_line, previous_new_line, boundary_old_line, boundary_new_line)
           if node_end ~= node_start and not adjacent_to_previous then
-            local hidden_row, hidden_line = dr()._hunk_single_hidden_context_gap_row(
+            local hidden_row, hidden_line = hunk_model().single_hidden_context_gap_row(
               source_lines,
               plan.block,
               previous_new_line,
@@ -628,22 +634,22 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
             )
           end
         end
-        local ancestor_boundary = dr()._hunk_context_ancestor_boundary(raw_context)
+        local ancestor_boundary = hunk_model().context_ancestor_boundary(raw_context)
         if ancestor_boundary
           and ancestor_boundary.end_row
           and ancestor_boundary.end_row ~= node_end then
           local suppress_ancestor_end = (ancestor_boundary.key ~= nil
               and opts.suppress_end_boundary_keys
               and opts.suppress_end_boundary_keys[ancestor_boundary.key] == true)
-            or (next_plan ~= nil and dr()._hunk_context_ancestor_key(next_plan.region.context) == ancestor_boundary.key)
-            or (next_group_plan ~= nil and dr()._hunk_context_ancestor_key(next_group_plan.region.context) == ancestor_boundary.key)
+            or (next_plan ~= nil and hunk_model().context_ancestor_key(next_plan.region.context) == ancestor_boundary.key)
+            or (next_group_plan ~= nil and hunk_model().context_ancestor_key(next_group_plan.region.context) == ancestor_boundary.key)
           if not suppress_ancestor_end and not emitted_context_lines[ancestor_boundary.end_row] then
-            local boundary_old_line = dr()._hunk_old_line_for_new_line(plan.block.hunks, ancestor_boundary.end_row)
+            local boundary_old_line = hunk_model().old_line_for_new_line(plan.block.hunks, ancestor_boundary.end_row)
             local boundary_new_line = ancestor_boundary.end_row
-            local previous_old_line, previous_new_line = dr()._hunk_last_visible_plan_coords(plan, raw_context)
-            local adjacent_to_previous = dr()._hunk_render_coords_adjacent(previous_old_line, previous_new_line, boundary_old_line, boundary_new_line)
+            local previous_old_line, previous_new_line = hunk_model().last_visible_plan_coords(plan, raw_context)
+            local adjacent_to_previous = hunk_model().render_coords_adjacent(previous_old_line, previous_new_line, boundary_old_line, boundary_new_line)
             if not adjacent_to_previous then
-              local hidden_row, hidden_line = dr()._hunk_single_hidden_context_gap_row(
+              local hidden_row, hidden_line = hunk_model().single_hidden_context_gap_row(
                 source_lines,
                 plan.block,
                 previous_new_line,
@@ -725,7 +731,7 @@ local function render_highlight_rows(buf, ns, rows)
     lines[row_index] = table.concat(line_parts)
     if row.diff_review_bg_hl then
       local content_length
-      lines[row_index], content_length = dr()._diff_pad_highlighted_line(lines[row_index], buf)
+      lines[row_index], content_length = diff_buffer()._diff_pad_highlighted_line(lines[row_index], buf)
       content_lengths[row_index] = content_length
       extmarks[#extmarks + 1] = {
         line = row_index,
@@ -753,7 +759,7 @@ local function render_highlight_rows(buf, ns, rows)
   session.empty_diff_rows[buf] = empty_diff_rows
   session.diff_line_content_lengths = session.diff_line_content_lengths or {}
   session.diff_line_content_lengths[buf] = content_lengths
-  dr()._clear_diff_gutter_visual_line(buf)
+  diff_buffer()._clear_diff_gutter_visual_line(buf)
   vim.bo[buf].modifiable = true
   vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
@@ -784,7 +790,7 @@ local function render_fancy_diff(buf, diff_text, hunk_staged, filename)
     vim.bo[buf].filetype = ft
   end
 
-  render_highlight_rows(buf, dr()._ns, build_fancy_diff_rows(
+  render_highlight_rows(buf, ui.preview_ns, build_fancy_diff_rows(
     diff_text,
     hunk_staged,
     filename,
@@ -794,7 +800,7 @@ local function render_fancy_diff(buf, diff_text, hunk_staged, filename)
     function()
       if not (buf and vim.api.nvim_buf_is_valid(buf) and filename) then return end
       session.buf_last_rendered[buf] = nil
-      dr()._refresh_diff_buffer(buf, filename)
+      diff_buffer()._refresh_diff_buffer(buf, filename)
     end
   ))
 end

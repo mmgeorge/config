@@ -9,6 +9,8 @@ local M = {}
 
 local session = require("diff_review.session")
 local notifications = require("diff_review.infra.notifications")
+local trace = require("diff_review.infra.perf_trace")
+local status_helpers = require("diff_review.views.status.status_helpers")
 
 --- Resolve the status state for a buffer from the active registry, falling back to the
 --- current singleton, so issue edits target the right buffer's state.
@@ -184,7 +186,7 @@ function M.patch_line(buf)
   if not status then return false end
   local head_line = M.head_line(status.issues)
   M.replace_head_line(status, head_line)
-  return require("diff_review")._status_patch_head_line(buf, "issues", head_line)
+  return status_helpers.status_patch_head_line(buf, "issues", head_line)
 end
 
 ---@param buf integer
@@ -239,7 +241,7 @@ end
 
 ---@param buf integer
 function M.sync_modifiable(buf)
-  return require("diff_review")._status_perf_span("status_issues.sync_modifiable", buf, nil, function()
+  return trace.span("status_issues.sync_modifiable", buf, nil, function()
     if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
     if vim.b[buf].diff_review_status_rendering then return end
     local status = status_for_buf(buf)
@@ -285,7 +287,7 @@ function M.attach(buf)
     group = group,
     buffer = buf,
     callback = function()
-      require("diff_review")._status_perf_span("status_issues.autocmd_sync_modifiable", buf, nil, function()
+      trace.span("status_issues.autocmd_sync_modifiable", buf, nil, function()
         M.sync_modifiable(buf)
       end)
     end,

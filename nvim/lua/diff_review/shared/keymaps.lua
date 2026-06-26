@@ -1,6 +1,6 @@
 --- Installs the GitStatus/PR/review/diff buffer keymaps and the sticky hint-bar winbar,
 --- resolving per-view command visibility and key bindings from the command vocabulary
---- and dispatching to init-owned actions.
+--- and dispatching to init-owned actions().
 ---@class DiffReviewKeymapsModule
 local M = {}
 
@@ -11,35 +11,53 @@ local command_specs = require("diff_review.shared.command_specs")
 local status_command_specs = command_specs.specs
 local status_command_specs_by_id = command_specs.by_id
 
-local function dr()
-  return require("diff_review")
-end
+-- render_orchestrator edge kept lazy to avoid a load-time cycle.
+local function render_orchestrator() return require("diff_review.views.status.render_orchestrator") end
+-- review edge kept lazy to avoid a load-time cycle.
+local function review() return require("diff_review.views.pr.review") end
+-- pr_overview edge kept lazy to avoid a load-time cycle.
+local function pr_overview() return require("diff_review.views.pr.pr_overview") end
+local pr_edit = require("diff_review.views.pr.pr_edit")
+-- commit_view edge kept lazy to avoid a load-time cycle.
+local function commit_view() return require("diff_review.views.status.commit_view") end
+-- actions edge kept lazy to avoid a load-time cycle.
+local function actions() return require("diff_review.views.status.actions") end
+local branch_diff = require("diff_review.views.branch_diff")
+local diff_buffer = require("diff_review.views.diff_buffer")
+local commands = require("diff_review.views.commands")
+local status_keys = require("diff_review.views.status.status_keys")
+local pr_state = require("diff_review.views.status.pr_state")
+-- entry_nav requires keymaps back for the hint bar, so this edge stays lazy to avoid
+-- a load-time circular require (shared -> views).
+local function entry_nav() return require("diff_review.views.status.entry_nav") end
+local status_helpers = require("diff_review.views.status.status_helpers")
+local trace = require("diff_review.infra.perf_trace")
 local session = require("diff_review.session")
 
 local function notify_error(message, title) return notifications.error(message, title) end
-local function status_entry_under_cursor(...) return dr()._status_entry_under_cursor(...) end
-local function render_pr_status(...) return dr()._render_pr_status(...) end
-local function status_open_pr(...) return dr()._status_open_pr(...) end
-local function status_show_help(...) return dr()._status_show_help(...) end
+local function status_entry_under_cursor(...) return entry_nav()._status_entry_under_cursor(...) end
+local function render_pr_status(...) return render_orchestrator().render_pr_status(...) end
+local function status_open_pr(...) return pr_state.open_pr(...) end
+local function status_show_help(...) return commit_view()._status_show_help(...) end
 
 -- Forward-declared: status_command_visible references it before its definition.
 local status_command_visible_for_view
-local function render_status_or_notify(...) return dr()._render_status_or_notify(...) end
-local function status_leave_visual_mode(...) return dr()._status_leave_visual_mode(...) end
-local function status_entries_from_visual_selection(...) return dr()._status_entries_from_visual_selection(...) end
-local function status_jump(...) return dr()._status_jump(...) end
-local function status_remote_action(...) return dr()._status_remote_action(...) end
-local function status_defer_prewarm_under_cursor(...) return dr()._status_defer_prewarm_under_cursor(...) end
-local function status_toggle(...) return dr()._status_toggle(...) end
-local function status_stage_entries(...) return dr()._status_stage_entries(...) end
-local function status_stage(...) return dr()._status_stage(...) end
-local function status_primary_key(...) return dr()._status_primary_key(...) end
-local function status_open_about(...) return dr()._status_open_about(...) end
-local function status_discard_entry_list(...) return dr()._status_discard_entry_list(...) end
-local function status_discard(...) return dr()._status_discard(...) end
-local function load_pr_diff(...) return dr()._load_pr_diff(...) end
-local function status_unstage(...) return dr()._status_unstage(...) end
-local function status_unstage_entries(...) return dr()._status_unstage_entries(...) end
+local function render_status_or_notify(...) return render_orchestrator().render_status_or_notify(...) end
+local function status_leave_visual_mode(...) return entry_nav()._status_leave_visual_mode(...) end
+local function status_entries_from_visual_selection(...) return entry_nav()._status_entries_from_visual_selection(...) end
+local function status_jump(...) return commit_view()._status_jump(...) end
+local function status_remote_action(...) return commit_view()._status_remote_action(...) end
+local function status_defer_prewarm_under_cursor(...) return entry_nav()._status_defer_prewarm_under_cursor(...) end
+local function status_toggle(...) return commit_view()._status_toggle(...) end
+local function status_stage_entries(...) return actions()._status_stage_entries(...) end
+local function status_stage(...) return actions()._status_stage(...) end
+local function status_primary_key(...) return status_keys.primary_key(...) end
+local function status_open_about(...) return commit_view()._status_open_about(...) end
+local function status_discard_entry_list(...) return actions()._status_discard_entry_list(...) end
+local function status_discard(...) return actions()._status_discard(...) end
+local function load_pr_diff(...) return render_orchestrator().load_pr_diff(...) end
+local function status_unstage(...) return actions()._status_unstage(...) end
+local function status_unstage_entries(...) return actions()._status_unstage_entries(...) end
 
 local function status_keymap_config()
   local options = M.config or config.options or config.defaults
@@ -58,7 +76,7 @@ end
 
 local function status_keys_for(command_id)
   local spec = status_command_specs_by_id[command_id]
-  local keymaps = spec and spec.keymap == "review" and dr()._review.keymap_config() or status_keymap_config()
+  local keymaps = spec and spec.keymap == "review" and review().keymap_config() or status_keymap_config()
   local key = keymaps[command_id]
   if key == false or key == nil then return {} end
   if type(key) == "table" then return key end
@@ -69,7 +87,7 @@ local function status_hint_segments(state)
   local view_kind = state and state.view_kind or (session.status and session.status.view_kind) or "status"
   local segments = {}
   local first = true
-  local hint_command_ids = dr()._status_hint_command_ids_by_view[view_kind] or dr()._status_hint_command_ids_by_view.status
+  local hint_command_ids = command_specs.hint_command_ids_by_view[view_kind] or command_specs.hint_command_ids_by_view.status
   for _, command_id in ipairs(hint_command_ids) do
     local spec = status_command_specs_by_id[command_id]
     if spec and spec.pinned and status_command_visible_for_view(spec, view_kind) then
@@ -162,7 +180,7 @@ local function setup_status_keymaps(buf)
         callback(...)
       end
       if view_kind == "review" then
-        dr()._review.register_command_map(buf, command_id, mode, key, mapped, map_opts)
+        review().register_command_map(buf, command_id, mode, key, mapped, map_opts)
       else
         vim.keymap.set(mode, key, mapped, map_opts)
       end
@@ -185,7 +203,7 @@ local function setup_status_keymaps(buf)
       local status = session.states and session.states[buf] or session.status
       if status and status.diff_branch and status.cwd then
         session.status = status
-        dr()._branch_diff.load(status.diff_branch, status.cwd, buf, status.diff_file)
+        branch_diff.load(status.diff_branch, status.cwd, buf, status.diff_file)
       end
       return
     end
@@ -195,8 +213,8 @@ local function setup_status_keymaps(buf)
         session.status = status
         render_pr_status(status.pr, status.cwd, buf)
         load_pr_diff(status.pr, status.cwd, buf)
-        dr()._pr_overview.load_comments(status.pr, status.cwd, buf)
-        dr()._pr_overview.load_checks(status.pr, status.cwd, buf)
+        pr_overview().load_comments(status.pr, status.cwd, buf)
+        pr_overview().load_checks(status.pr, status.cwd, buf)
       end
       return
     end
@@ -214,27 +232,27 @@ local function setup_status_keymaps(buf)
   map("toggle", "n", function()
     local status = session.states and session.states[buf] or session.status
     if status then session.status = status end
-    if dr()._review.toggle_comment_fold(buf) then return end
+    if review().toggle_comment_fold(buf) then return end
     status_toggle(status_entry_under_cursor(status), status)
   end)
 
   map("collapse_parent", "n", function()
     if session.states and session.states[buf] then session.status = session.states[buf] end
-    dr()._status_collapse_parent()
+    commit_view()._status_collapse_parent()
   end)
 
   map("visual_line_with_gutter", "n", function()
-    dr()._start_diff_gutter_visual_line(buf)
+    diff_buffer._start_diff_gutter_visual_line(buf)
   end)
 
   -- The review view gets its own action set (S/U/C/y/n/submit); the read-only
   -- PR and branch-diff views only get navigation commands.
   if view_kind == "review" then
-    dr()._review.setup_keymaps(buf)
+    review().setup_keymaps(buf)
     map("browse", { "n", "x" }, function()
       local status = session.states and session.states[buf] or session.status
-      local fragment = dr()._review.browse_fragment_under_cursor(buf)
-      dr()._review.leave_visual()
+      local fragment = review().browse_fragment_under_cursor(buf)
+      review().leave_visual()
       if not gh.browse_pr_changes(status and status.pr, fragment) then
         notify_error("Unable to open PR URL", "DiffReview")
       end
@@ -242,7 +260,7 @@ local function setup_status_keymaps(buf)
     local function review_open_action()
       if session.states and session.states[buf] then session.status = session.states[buf] end
       local entry = status_entry_under_cursor()
-      if dr()._status_open_commit_message_under_cursor(entry) then return end
+      if commit_view()._status_open_commit_message_under_cursor(entry) then return end
       status_jump(entry)
     end
     map("open", "n", review_open_action, "Jump to file")
@@ -258,7 +276,7 @@ local function setup_status_keymaps(buf)
     map("browse", "n", function()
       local status = session.states and session.states[buf] or session.status
       if status and status.view_kind == "pr" then
-        local url = dr()._pr_overview.url_under_cursor(buf)
+        local url = pr_overview().url_under_cursor(buf)
         if url and gh.browse_url(url) then return end
       end
       local pr = status and status.pr
@@ -268,29 +286,29 @@ local function setup_status_keymaps(buf)
     end)
     if is_pr_view then
       map("comment", { "n", "x" }, function()
-        dr()._pr_overview.add_standalone_comment(buf)
+        pr_overview().add_standalone_comment(buf)
       end)
       map("sync", { "n", "i" }, function()
-        dr()._review.sync_inline_comment_text(buf)
-        dr()._pr_overview.sync_standalone_comments(buf)
-        dr()._pr_edit.sync(buf)
+        review().sync_inline_comment_text(buf)
+        pr_overview().sync_standalone_comments(buf)
+        pr_edit.sync(buf)
       end)
     end
     map("review", "n", function()
-      dr()._review.start(buf)
+      review().start(buf)
     end)
     map("open", "n", function()
       if session.states and session.states[buf] then session.status = session.states[buf] end
-      if is_pr_view and dr()._pr_edit.toggle_draft_status_under_cursor(buf) then return end
+      if is_pr_view and pr_edit.toggle_draft_status_under_cursor(buf) then return end
       local entry = status_entry_under_cursor()
-      if dr()._status_open_commit_message_under_cursor(entry) then return end
+      if commit_view()._status_open_commit_message_under_cursor(entry) then return end
       status_jump(entry)
     end, "Jump to file")
     map("help", "n", status_show_help)
     vim.api.nvim_create_autocmd("CursorMoved", {
       buffer = buf,
       callback = function()
-        dr()._status_perf_span("status.autocmd_cursor_prewarm", buf, nil, function()
+        trace.span("status.autocmd_cursor_prewarm", buf, nil, function()
           if (M.config or config.options or config.defaults).status_cursor_prewarm == false then return end
           if session.states and session.states[buf] then session.status = session.states[buf] end
           status_defer_prewarm_under_cursor(buf)
@@ -331,7 +349,7 @@ local function setup_status_keymaps(buf)
     local entry = status_entry_under_cursor()
     if require("diff_review.views.walkthrough").jump_status_step(buf) then
       return
-    elseif dr()._status_open_commit_message_under_cursor(entry) then
+    elseif commit_view()._status_open_commit_message_under_cursor(entry) then
       return
     elseif entry and entry.kind == "pr" then
       status_open_pr(entry)
@@ -410,15 +428,15 @@ local function setup_status_keymaps(buf)
   end)
 
   map("branch_create", "n", function()
-    dr()._create_branch(buf)
+    status_helpers.create_branch(buf)
   end)
 
   map("walkthrough", "n", function()
-    require("diff_review.views.walkthrough").start(dr()._walkthrough_host(buf))
+    require("diff_review.views.walkthrough").start(commands._walkthrough_host(buf))
   end)
 
   map("review", "n", function()
-    dr()._review.start(buf)
+    review().start(buf)
   end)
 
   map("help", "n", status_show_help)
@@ -426,7 +444,7 @@ local function setup_status_keymaps(buf)
   vim.api.nvim_create_autocmd("CursorMoved", {
     buffer = buf,
     callback = function()
-      dr()._status_perf_span("status.autocmd_cursor_prewarm", buf, nil, function()
+      trace.span("status.autocmd_cursor_prewarm", buf, nil, function()
         if (M.config or config.options or config.defaults).status_cursor_prewarm == false then return end
         if session.states and session.states[buf] then session.status = session.states[buf] end
         status_defer_prewarm_under_cursor(buf)

@@ -123,7 +123,6 @@ end
 ---@param indent integer?
 ---@return integer line
 function M.add_fancy_row(state, row, entry, indent)
-  local diff_review = require("diff_review")
   indent = indent or 0
   local text_parts = {}
   if indent > 0 then
@@ -172,7 +171,7 @@ function M.add_fancy_row(state, row, entry, indent)
   local line_text = table.concat(text_parts)
   local content_length = nil
   if row.diff_review_bg_hl then
-    line_text, content_length = diff_review._diff_pad_highlighted_line(line_text, state.buf)
+    line_text, content_length = require("diff_review.views.diff_buffer")._diff_pad_highlighted_line(line_text, state.buf)
   end
 
   local line_entry = entry

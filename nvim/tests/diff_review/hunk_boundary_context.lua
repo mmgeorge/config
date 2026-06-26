@@ -1,6 +1,10 @@
 vim.loader.enable(false)
 
 local diff_review = require("diff_review")
+local status_render = require("diff_review.views.status.status_render")
+local hunk_model = require("diff_review.render.hunk_model")
+local git_data = require("diff_review.git.git_data")
+local ui = require("diff_review.infra.ui")
 local session = require("diff_review.session")
 local syntax_engine = require("diff_review.render.syntax_engine")
 local gh = require("diff_review.integrations.gh")
@@ -8,8 +12,8 @@ local gh = require("diff_review.integrations.gh")
 local original_cwd = vim.fs.normalize(vim.fn.getcwd())
 local root = vim.fs.normalize(original_cwd .. "/.diffreview-boundary-context-test")
 local calls = {}
-local original_compute_diff_syntax_async = diff_review.compute_diff_syntax_async
-local original_compute_file_syntax_async = diff_review.compute_file_syntax_async
+local original_compute_diff_syntax_async = git_data.compute_diff_syntax_async
+local original_compute_file_syntax_async = git_data.compute_file_syntax_async
 
 ---@type DiffReviewGhBackend
 local gh_backend = {}
@@ -193,7 +197,7 @@ local function find_row_in_file_section(buf, file_pattern, pattern)
 end
 
 local function gutter_text(buf, row)
-  local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
+  local marks = vim.api.nvim_buf_get_extmarks(buf, ui.status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
   for _, mark in ipairs(marks) do
     local details = mark[4] or {}
     if details.virt_text_pos == "inline" and details.virt_text then
@@ -211,9 +215,9 @@ end
 -- are emitted by the provider; drive the test seam to apply them into the decorate
 -- namespace, then read marks from both namespaces (gutter stays in _status_ns).
 local function row_marks(buf, row)
-  pcall(diff_review._status_decorate_rows, buf, row, row)
-  local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
-  local decorate = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_decorate_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
+  pcall(status_render.status_decorate_rows, buf, row, row)
+  local marks = vim.api.nvim_buf_get_extmarks(buf, ui.status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
+  local decorate = vim.api.nvim_buf_get_extmarks(buf, ui.status_decorate_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
   for _, mark in ipairs(decorate) do
     marks[#marks + 1] = mark
   end
@@ -272,8 +276,8 @@ local function trigger_normal_mapping(key, row)
 end
 
 local function assert_padding_omits_trailing_delimiters()
-  assert_true(diff_review._hunk_single_hidden_new_line(15, 17) == 16, "single hidden line should be detected")
-  assert_true(diff_review._hunk_single_hidden_new_line(15, 18) == nil, "multi-line gaps should stay collapsed")
+  assert_true(hunk_model.single_hidden_new_line(15, 17) == 16, "single hidden line should be detected")
+  assert_true(hunk_model.single_hidden_new_line(15, 18) == nil, "multi-line gaps should stay collapsed")
 
   local padding_source_lines = {}
   for line_number = 1, 90 do
@@ -302,7 +306,7 @@ local function assert_padding_omits_trailing_delimiters()
     sibling_after_rows = {},
   }
 
-  local padding = diff_review._hunk_context_padding_lines(
+  local padding = hunk_model.context_padding_lines(
     padding_source_lines,
     hunk,
     context,
@@ -312,11 +316,11 @@ local function assert_padding_omits_trailing_delimiters()
     { changed_line = 75, after_line = 83 }
   )
   assert_true(#padding == 0, "trailing delimiter padding should be omitted")
-  assert_true(not diff_review._hunk_context_padding_line_is_useful("        }"), "closing delimiter padding should not be useful")
-  assert_true(not diff_review._hunk_context_padding_line_is_useful(""), "blank padding should not be useful")
+  assert_true(not hunk_model.context_padding_line_is_useful("        }"), "closing delimiter padding should not be useful")
+  assert_true(not hunk_model.context_padding_line_is_useful(""), "blank padding should not be useful")
 
   padding_source_lines[74] = "      let previous_particle = particle_source.clone();"
-  padding = diff_review._hunk_context_padding_lines(
+  padding = hunk_model.context_padding_lines(
     padding_source_lines,
     hunk,
     context,
@@ -354,7 +358,7 @@ local function assert_padding_omits_trailing_delimiters()
     sibling_before_rows = {},
     sibling_after_rows = {},
   }
-  padding = diff_review._hunk_context_padding_lines(
+  padding = hunk_model.context_padding_lines(
     padding_source_lines,
     hunk,
     context,
@@ -390,14 +394,14 @@ local function run()
   assert_true(vim.fn.mkdir(root .. "/src", "p") == 1, "mkdir failed")
   local diff_syntax_batches = {}
   local file_syntax_requests = {}
-  diff_review.compute_diff_syntax_async = function(filename, lines_for_syntax, cb)
+  git_data.compute_diff_syntax_async = function(filename, lines_for_syntax, cb)
     diff_syntax_batches[#diff_syntax_batches + 1] = {
       filename = filename,
       lines = vim.deepcopy(lines_for_syntax),
     }
     original_compute_diff_syntax_async(filename, lines_for_syntax, cb)
   end
-  diff_review.compute_file_syntax_async = function(filename, cb)
+  git_data.compute_file_syntax_async = function(filename, cb)
     file_syntax_requests[filename] = (file_syntax_requests[filename] or 0) + 1
     original_compute_file_syntax_async(filename, cb)
   end
@@ -753,8 +757,8 @@ end
 local ok, err = xpcall(run, debug.traceback)
 diff_review.reset_git_backend()
 gh.reset_backend()
-diff_review.compute_diff_syntax_async = original_compute_diff_syntax_async
-diff_review.compute_file_syntax_async = original_compute_file_syntax_async
+git_data.compute_diff_syntax_async = original_compute_diff_syntax_async
+git_data.compute_file_syntax_async = original_compute_file_syntax_async
 vim.fn.delete(root, "rf")
 if not ok then
   vim.api.nvim_err_writeln(err)

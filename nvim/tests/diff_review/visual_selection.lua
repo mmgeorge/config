@@ -1,6 +1,7 @@
 vim.loader.enable(false)
 
 local diff_review = require("diff_review")
+local render_orchestrator = require("diff_review.views.status.render_orchestrator")
 local gh = require("diff_review.integrations.gh")
 
 local original_cwd = vim.fs.normalize(vim.fn.getcwd())
@@ -104,7 +105,7 @@ local function run()
   diff_review.open()
   assert_true(vim.bo.filetype == "GitStatus", "GitStatus buffer did not open")
   local status_buf = vim.api.nvim_get_current_buf()
-  diff_review.render_status(status_buf)
+  render_orchestrator.render_status(status_buf)
   wait_for(function()
     local lines = vim.api.nvim_buf_get_lines(status_buf, 0, -1, false)
     for _, line in ipairs(lines) do

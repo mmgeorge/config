@@ -1,6 +1,8 @@
 vim.loader.enable(false)
 
 local diff_review = require("diff_review")
+local status_helpers = require("diff_review.views.status.status_helpers")
+local repo_config = require("diff_review.git.repo_config")
 local gh = require("diff_review.integrations.gh")
 
 local root = "D:/diffreview-branch-create-root"
@@ -99,11 +101,11 @@ local function trigger(buf, key)
   mapping.callback()
 end
 
-local original_prompt = diff_review._prompt_branch_name
+local original_prompt = status_helpers.prompt_branch_name
 ---@type { default: string? }
 local input_capture = {}
 local function stub_input(response)
-  diff_review._prompt_branch_name = function(prefix, on_submit)
+  status_helpers.prompt_branch_name = function(prefix, on_submit)
     input_capture.default = prefix
     on_submit(response)
   end
@@ -141,7 +143,7 @@ local function run()
   assert_true(#switch_calls == 0, "submitting only the prefix must not create a branch")
 
   -- ── per-repo .diffreview.json overrides the prefix ─────────────────────────
-  diff_review._repo_config.set_reader(function(path)
+  repo_config.set_reader(function(path)
     if path:find(".diffreview.json", 1, true) then return '{ "branch_prefix": "team/" }' end
     return nil
   end)
@@ -149,7 +151,7 @@ local function run()
   trigger(buf, "bc")
   assert_true(input_capture.default == "team/", "repo config prefix not used: " .. tostring(input_capture.default))
   wait_for(function() return #switch_calls == 1 end, "git switch -c was not run for repo-config prefix")
-  diff_review._repo_config.reset_reader()
+  repo_config.reset_reader()
 
   -- ── failed switch surfaces the git error ───────────────────────────────────
   switch_calls = {}
@@ -162,8 +164,8 @@ end
 
 local ok, err = xpcall(run, debug.traceback)
 vim.notify = original_notify
-diff_review._prompt_branch_name = original_prompt
-diff_review._repo_config.reset_reader()
+status_helpers.prompt_branch_name = original_prompt
+repo_config.reset_reader()
 diff_review.reset_git_backend()
 gh.reset_backend()
 if not ok then

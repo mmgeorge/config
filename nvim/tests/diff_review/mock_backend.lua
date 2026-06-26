@@ -1,10 +1,12 @@
 vim.loader.enable(false)
 
 local diff_review = require("diff_review")
+local git_data = require("diff_review.git.git_data")
+local ui = require("diff_review.infra.ui")
 local gh = require("diff_review.integrations.gh")
 local root = "D:/mock/project"
-local original_compute_hunk_context_async = diff_review.compute_hunk_context_async
-local original_compute_diff_syntax_async = diff_review.compute_diff_syntax_async
+local original_compute_hunk_context_async = git_data.compute_hunk_context_async
+local original_compute_diff_syntax_async = git_data.compute_diff_syntax_async
 
 local function assert_true(condition, message)
   if not condition then error(message, 2) end
@@ -200,7 +202,7 @@ local function row_substring_range(lines, row, text, start_after)
 end
 
 local function row_range_has_highlight(buf, row, start_col, end_col, hl_group)
-  local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
+  local marks = vim.api.nvim_buf_get_extmarks(buf, ui.status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
   for _, mark in ipairs(marks) do
     local details = mark[4] or {}
     if details.hl_group == hl_group and mark[3] <= start_col and (details.end_col or mark[3]) >= end_col then
@@ -258,7 +260,7 @@ local function run()
   gh.set_backend(gh_backend)
   local ts_requests = 0
   local syntax_requests = 0
-  diff_review.compute_hunk_context_async = function(_, _, cb)
+  git_data.compute_hunk_context_async = function(_, _, cb)
     ts_requests = ts_requests + 1
     vim.defer_fn(function()
       cb({
@@ -270,7 +272,7 @@ local function run()
       })
     end, 5)
   end
-  diff_review.compute_diff_syntax_async = function(filename, lines_for_syntax, cb)
+  git_data.compute_diff_syntax_async = function(filename, lines_for_syntax, cb)
     syntax_requests = syntax_requests + 1
     original_compute_diff_syntax_async(filename, lines_for_syntax, cb)
   end
@@ -308,7 +310,7 @@ local function run()
   assert_true(contains_line(lines, "Modified " .. root .. "/a.txt +1 -1"), "missing modified a.txt prefix")
   assert_true(contains_line(lines, "Modified " .. root .. "/b.txt +1 -1"), "missing modified b.txt prefix")
   assert_true(contains_line(lines, "New      " .. root .. "/c.txt new"), "missing new c.txt prefix")
-  assert_true(diff_review._status_file_change_label({ git_status = "D" }) == "Removed", "deleted file label should render as Removed")
+  assert_true(git_data._status_file_change_label({ git_status = "D" }) == "Removed", "deleted file label should render as Removed")
   local modified_a_row = find_row(lines, "Modified " .. root .. "/a.txt +1 -1")
   local add_start, add_end = row_substring_range(lines, modified_a_row, "+1")
   local delete_start, delete_end = row_substring_range(lines, modified_a_row, "-1", add_end + 1)
@@ -374,8 +376,8 @@ end
 local ok, err = xpcall(run, debug.traceback)
 diff_review.reset_git_backend()
 gh.reset_backend()
-diff_review.compute_hunk_context_async = original_compute_hunk_context_async
-diff_review.compute_diff_syntax_async = original_compute_diff_syntax_async
+git_data.compute_hunk_context_async = original_compute_hunk_context_async
+git_data.compute_diff_syntax_async = original_compute_diff_syntax_async
 if not ok then
   vim.api.nvim_err_writeln(err)
   vim.cmd("cquit")

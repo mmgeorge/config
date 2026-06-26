@@ -5,14 +5,34 @@ local M = {}
 
 local config = require("diff_review.infra.config")
 local notifications = require("diff_review.infra.notifications")
-local keymaps = require("diff_review.shared.keymaps")
+-- keymaps edge kept lazy to avoid a load-time cycle.
+local function keymaps() return require("diff_review.shared.keymaps") end
 local gh = require("diff_review.integrations.gh")
 local git_backend = require("diff_review.git.git_backend")
 local paths = require("diff_review.infra.paths")
 
-local function dr()
-  return require("diff_review")
-end
+local syntax_engine = require("diff_review.render.syntax_engine")
+-- render_orchestrator edge kept lazy to avoid a load-time cycle.
+local function render_orchestrator() return require("diff_review.views.status.render_orchestrator") end
+-- pr_overview edge kept lazy to avoid a load-time cycle.
+local function pr_overview() return require("diff_review.views.pr.pr_overview") end
+-- state edge kept lazy to avoid a load-time cycle.
+local function state_mod() return require("diff_review.views.status.state") end
+local pr_edit = require("diff_review.views.pr.pr_edit")
+-- review edge kept lazy to avoid a load-time cycle.
+local function review() return require("diff_review.views.pr.review") end
+local file_revision = require("diff_review.views.file_revision")
+local branch_diff = require("diff_review.views.branch_diff")
+local status_keys = require("diff_review.views.status.status_keys")
+local window_options = require("diff_review.views.status.window_options")
+-- status_head edge kept lazy to avoid a load-time cycle.
+local function status_head() return require("diff_review.views.status.status_head") end
+-- entry_nav edge kept lazy to avoid a load-time cycle.
+local function entry_nav() return require("diff_review.views.status.entry_nav") end
+-- fold_state edge kept lazy to avoid a load-time cycle.
+local function fold_state() return require("diff_review.views.status.fold_state") end
+local status_helpers = require("diff_review.views.status.status_helpers")
+local inventory = require("diff_review.infra.inventory")
 local session = require("diff_review.session")
 
 local function notify_error(message, title)
@@ -42,7 +62,7 @@ function M.open_file_revision(file, rev)
       notify_error(rel_err or ("Path is outside the git root: " .. file), "DiffReview")
       return
     end
-    dr()._file_revision.open({
+    file_revision.open({
       rev = rev,
       path = relpath,
       cwd = root,
@@ -66,15 +86,15 @@ function M._walkthrough_host(buf)
     get_state = function()
       return session.states and session.states[buf] or session.status
     end,
-    file_key = dr()._status_keys.file_key,
-    hunk_key = dr()._status_keys.hunk_key,
+    file_key = status_keys.file_key,
+    hunk_key = status_keys.hunk_key,
     set_folded = function(key, folded)
       local state = session.states and session.states[buf] or session.status
       if state then session.status = state end
-      dr()._set_status_folded(key, folded, state)
+      fold_state()._set_status_folded(key, folded, state)
     end,
     rerender = function(target_id, fallback_line)
-      dr()._render_status_or_notify(buf, target_id, fallback_line, { reuse_sections = true })
+      render_orchestrator().render_status_or_notify(buf, target_id, fallback_line, { reuse_sections = true })
     end,
     git_list_async = git_backend.systemlist_async,
     inventory_async = function(cb)
@@ -84,11 +104,11 @@ function M._walkthrough_host(buf)
         cb({ rows = {} })
         return
       end
-      dr()._inventory.compute_async({
+      inventory.compute_async({
         cwd = cwd,
         sections = state.sections or {},
         git_list_async = git_backend.systemlist_async,
-        read_file_lines = dr()._file_source_lines,
+        read_file_lines = syntax_engine.file_source_lines,
         repo_relative = function(filename)
           return repo_relative(filename, cwd)
         end,
@@ -124,7 +144,7 @@ end
 function M.open_pr(pr, opts)
   opts = opts or {}
   if not pr then return nil end
-  dr()._setup_bg_highlights()
+  status_helpers.setup_bg_highlights()
 
   pr = pr_with_resolved_repo(pr, opts)
   local cwd = opts.cwd or (session.status and session.status.cwd) or vim.fn.getcwd()
@@ -133,7 +153,7 @@ function M.open_pr(pr, opts)
   vim.bo[buf].buftype = "nofile"
   vim.bo[buf].swapfile = false
   vim.bo[buf].filetype = "GitStatus"
-  local options = dr().config or config.options or config.defaults
+  local options = config.options or config.options or config.defaults
   local name = ("%s://%s"):format(options.pr_buffer_name, pr.number or "current")
   if pr.repo and pr.repo ~= "" then name = ("%s/%s"):format(name, pr.repo:gsub("/", "%%2F")) end
   if not pcall(vim.api.nvim_buf_set_name, buf, name) then
@@ -157,13 +177,13 @@ function M.open_pr(pr, opts)
   }
   state.pr_standalone_comments = {}
   state.pr_regular_comments = {}
-  state.review_comments = dr()._pr_overview.editable_comments(state)
+  state.review_comments = pr_overview().editable_comments(state)
   if pr.repo and pr.repo ~= "" then vim.b[buf].github_repo = pr.repo end
   session.status = state
-  dr()._attach_status_state(buf, state)
-  keymaps.setup_status_keymaps(buf)
-  dr()._pr_edit.attach(buf)
-  dr().github_load_repo_metadata(cwd, pr.repo)
+  state_mod().attach(buf, state)
+  keymaps().setup_status_keymaps(buf)
+  pr_edit.attach(buf)
+  status_head().github_load_repo_metadata(cwd, pr.repo)
 
   local win = vim.api.nvim_get_current_win()
   local ok, err = pcall(vim.api.nvim_win_set_buf, win, buf)
@@ -171,13 +191,13 @@ function M.open_pr(pr, opts)
     notify_error("DiffReview PR open failed: " .. tostring(err))
     return nil
   end
-  dr()._apply_status_window_options(win, state)
+  window_options.apply(win, state)
   vim.wo[win].foldcolumn = "0"
 
-  dr()._render_pr_status(pr, cwd, buf)
-  dr()._load_pr_diff(pr, cwd, buf)
-  dr()._pr_overview.load_comments(pr, cwd, buf)
-  dr()._pr_overview.load_checks(pr, cwd, buf)
+  render_orchestrator().render_pr_status(pr, cwd, buf)
+  render_orchestrator().load_pr_diff(pr, cwd, buf)
+  pr_overview().load_comments(pr, cwd, buf)
+  pr_overview().load_checks(pr, cwd, buf)
   return buf
 end
 
@@ -204,7 +224,7 @@ end
 function M.open_review(pr, opts)
   opts = opts or {}
   if not pr then return nil end
-  dr()._setup_bg_highlights()
+  status_helpers.setup_bg_highlights()
   pr = pr_with_resolved_repo(pr, opts)
   local cwd = opts.cwd or (session.status and session.status.cwd) or vim.fn.getcwd()
   local buf = vim.api.nvim_create_buf(true, false)
@@ -212,7 +232,7 @@ function M.open_review(pr, opts)
   vim.bo[buf].buftype = "nofile"
   vim.bo[buf].swapfile = false
   vim.bo[buf].filetype = "GitStatus"
-  local options = dr().config or config.options or config.defaults
+  local options = config.options or config.options or config.defaults
   local name = ("%sReview://%s"):format(options.pr_buffer_name, pr.number or "current")
   if not pcall(vim.api.nvim_buf_set_name, buf, name) then
     pcall(vim.api.nvim_buf_set_name, buf, name .. "#" .. buf)
@@ -240,13 +260,13 @@ function M.open_review(pr, opts)
     fancy_rows = {},
   }
   if pr.repo and pr.repo ~= "" then vim.b[buf].github_repo = pr.repo end
-  dr()._review.load_draft(state)
-  dr()._review.normalize_comments(state)
+  review().load_draft(state)
+  review().normalize_comments(state)
   session.status = state
-  dr()._attach_status_state(buf, state)
-  keymaps.setup_status_keymaps(buf)
-  dr()._review.attach(buf)
-  dr().github_load_repo_metadata(cwd, pr.repo)
+  state_mod().attach(buf, state)
+  keymaps().setup_status_keymaps(buf)
+  review().attach(buf)
+  status_head().github_load_repo_metadata(cwd, pr.repo)
 
   local win = vim.api.nvim_get_current_win()
   local ok, err = pcall(vim.api.nvim_win_set_buf, win, buf)
@@ -254,14 +274,14 @@ function M.open_review(pr, opts)
     notify_error("DiffReview review open failed: " .. tostring(err))
     return nil
   end
-  dr()._apply_status_window_options(win, state)
+  window_options.apply(win, state)
   vim.wo[win].foldcolumn = "0"
 
-  dr()._status_set_plain_lines(buf, { "Loading GitHub pending review..." })
-  dr()._review.load_remote_before_open(buf, function()
+  entry_nav()._status_set_plain_lines(buf, { "Loading GitHub pending review()..." })
+  review().load_remote_before_open(buf, function()
     if not vim.api.nvim_buf_is_valid(buf) then return end
-    dr()._review.render(buf)
-    dr()._review.load_diff(pr, cwd, buf)
+    review().render(buf)
+    review().load_diff(pr, cwd, buf)
   end)
   return buf
 end
@@ -286,7 +306,7 @@ function M.open_branch_diff(branch, opts)
     notify_error("GitBranchDiff requires a branch or revision", "GitBranchDiff")
     return
   end
-  dr()._setup_bg_highlights()
+  status_helpers.setup_bg_highlights()
 
   local function open_for_root(root, root_err)
     if not root then
@@ -321,8 +341,8 @@ function M.open_branch_diff(branch, opts)
       fancy_rows = {},
     }
     session.status = state
-    dr()._attach_status_state(buf, state)
-    keymaps.setup_status_keymaps(buf)
+    state_mod().attach(buf, state)
+    keymaps().setup_status_keymaps(buf)
 
     local win = vim.api.nvim_get_current_win()
     local ok, set_err = pcall(vim.api.nvim_win_set_buf, win, buf)
@@ -330,11 +350,11 @@ function M.open_branch_diff(branch, opts)
       notify_error("GitBranchDiff open failed: " .. tostring(set_err), "GitBranchDiff")
       return
     end
-    dr()._apply_status_window_options(win, state)
+    window_options.apply(win, state)
     vim.wo[win].foldcolumn = "0"
 
-    dr()._branch_diff.render(branch, root, buf, nil, file)
-    dr()._branch_diff.load(branch, root, buf, file)
+    branch_diff.render(branch, root, buf, nil, file)
+    branch_diff.load(branch, root, buf, file)
   end
 
   if opts.cwd then
@@ -358,7 +378,7 @@ function M.open_compact_preview(opts)
       return
     end
 
-    local command = dr()._git_diff_command(cwd)
+    local command = git_backend.git_diff_command(cwd)
     if opts.staged then command[#command + 1] = "--cached" end
     git_backend.systemlist_async(command, function(output, code, stderr)
       if code ~= 0 then
@@ -390,7 +410,7 @@ function M.open_compact_preview(opts)
         notify_error("GitDiffCompactPreview open failed: " .. tostring(set_err), "GitDiffCompactPreview")
         return
       end
-      dr()._apply_status_window_options(win, nil)
+      window_options.apply(win, nil)
       vim.wo[win].foldcolumn = "0"
       vim.b[buf].git_diff_compact_metrics = metrics
       vim.b[buf].git_diff_compacted = was_compacted
@@ -406,7 +426,7 @@ end
 
 --- Open a standalone, Neogit-style DiffReview status buffer.
 function M.open()
-  dr()._setup_bg_highlights()
+  status_helpers.setup_bg_highlights()
   local buf = session.status and session.status.buf
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then
     buf = vim.api.nvim_create_buf(true, false)
@@ -414,7 +434,7 @@ function M.open()
     vim.bo[buf].buftype = "nofile"
     vim.bo[buf].swapfile = false
     vim.bo[buf].filetype = "GitStatus"
-    pcall(vim.api.nvim_buf_set_name, buf, (dr().config or config.options).status_buffer_name)
+    pcall(vim.api.nvim_buf_set_name, buf, (config.options or config.options).status_buffer_name)
     session.main_status = {
       view_kind = "status",
       buf = buf,
@@ -429,8 +449,8 @@ function M.open()
       fancy_rows = {},
     }
     session.status = session.main_status
-    dr()._attach_status_state(buf, session.main_status)
-    keymaps.setup_status_keymaps(buf)
+    state_mod().attach(buf, session.main_status)
+    keymaps().setup_status_keymaps(buf)
   else
     session.main_status = session.states and session.states[buf] or session.main_status or session.status
     session.status = session.main_status
@@ -442,9 +462,9 @@ function M.open()
     notify_error("DiffReview open failed: " .. tostring(err))
     return
   end
-  dr()._apply_status_window_options(win, session.main_status)
+  window_options.apply(win, session.main_status)
   vim.wo[win].foldcolumn = "0"
-  dr()._render_status_or_notify(buf)
+  render_orchestrator().render_status_or_notify(buf)
 end
 
 return M

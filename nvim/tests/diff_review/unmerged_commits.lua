@@ -1,6 +1,11 @@
 vim.loader.enable(false)
 
 local diff_review = require("diff_review")
+local status_render = require("diff_review.views.status.status_render")
+local source = require("diff_review.render.source")
+local conventional_commit = require("diff_review.integrations.conventional_commit")
+local datetime = require("diff_review.integrations.datetime")
+local ui = require("diff_review.infra.ui")
 local session = require("diff_review.session")
 local gh = require("diff_review.integrations.gh")
 
@@ -8,9 +13,9 @@ local gh = require("diff_review.integrations.gh")
 -- emitted by the provider; drive the test seam to apply them into the decorate
 -- namespace, then read marks from both namespaces (gutter stays in _status_ns).
 local function row_marks(buf, row)
-  pcall(diff_review._status_decorate_rows, buf, row, row)
-  local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
-  for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(buf, diff_review._status_decorate_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })) do
+  pcall(status_render.status_decorate_rows, buf, row, row)
+  local marks = vim.api.nvim_buf_get_extmarks(buf, ui.status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
+  for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(buf, ui.status_decorate_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })) do
     marks[#marks + 1] = mark
   end
   return marks
@@ -46,9 +51,9 @@ local function wait_for(predicate, message)
 end
 
 local function set_datetime_now(value)
-  local epoch = diff_review._datetime.parse(value)
+  local epoch = datetime.parse(value)
   assert_true(type(epoch) == "number", "test datetime did not parse: " .. tostring(value))
-  diff_review._datetime.now_override = function() return epoch end
+  datetime.now_override = function() return epoch end
 end
 
 local function recent_commit_date(index)
@@ -327,11 +332,11 @@ local function run()
   diff_review.set_git_backend(backend)
   gh.set_backend(gh_backend)
   diff_review.setup({ about_auto_generate = false })
-  assert_true(diff_review._status_conventional_commit_type_end("feat: add row highlighting") == #"feat", "plain conventional type did not parse")
-  assert_true(diff_review._status_conventional_commit_type_end("fix(parser)!: handle bang") == #"fix", "scoped breaking conventional type did not parse")
-  assert_true(diff_review._status_conventional_commit_type_end("Fix: uppercase is ambiguous") == nil, "uppercase type should not parse")
-  assert_true(diff_review._status_conventional_commit_type_end("docs:missing space") == nil, "missing post-colon space should not parse")
-  assert_true(diff_review._status_conventional_commit_type_end("build(scope with space): no") == nil, "scope with spaces should not parse")
+  assert_true(conventional_commit.type_end("feat: add row highlighting") == #"feat", "plain conventional type did not parse")
+  assert_true(conventional_commit.type_end("fix(parser)!: handle bang") == #"fix", "scoped breaking conventional type did not parse")
+  assert_true(conventional_commit.type_end("Fix: uppercase is ambiguous") == nil, "uppercase type should not parse")
+  assert_true(conventional_commit.type_end("docs:missing space") == nil, "missing post-colon space should not parse")
+  assert_true(conventional_commit.type_end("build(scope with space): no") == nil, "scope with spaces should not parse")
   set_datetime_now("2026-06-15T12:00:00Z")
   diff_review.open()
   local buf = vim.api.nvim_get_current_buf()
@@ -351,7 +356,7 @@ local function run()
   assert_true(staged_file.stage_state == "staged", "staged file state did not keep staged stage state")
   assert_true(#staged_file.hunks == 1, "collapsed staged file did not retain raw hunks")
   local staged_old_line = nil
-  diff_review._diff_source_model.ensure_text(staged_file, "old", function(ok, snapshot)
+  source.ensure_text(staged_file, "old", function(ok, snapshot)
     assert_true(ok, "staged file old text loader failed")
     staged_old_line = require("diff_review.render.text_snapshot").line_text(snapshot, 1)
   end)
@@ -499,7 +504,7 @@ end
 local ok, err = xpcall(run, debug.traceback)
 diff_review.reset_git_backend()
 gh.reset_backend()
-diff_review._datetime.now_override = nil
+datetime.now_override = nil
 if not ok then
   vim.api.nvim_err_writeln(err)
   vim.cmd("cquit")

@@ -1,7 +1,7 @@
 --- Provides shared status-view helpers for notifications, git command building,
 --- commit metadata, branch creation, and small popup/diff-mapping utilities.
---- Functions live here, off init.lua's local budget, and reach back into the
---- active diff_review state through dr() so existing seams resolve unchanged.
+--- Functions live here, off init.lua's local budget, and reach the active
+--- status state via session.lua and sibling modules via direct requires.
 
 local M = {}
 
@@ -11,7 +11,14 @@ local notifications = require("diff_review.infra.notifications")
 local datetime = require("diff_review.integrations.datetime")
 local git_backend = require("diff_review.git.git_backend")
 
-local function dr() return require("diff_review") end
+local status_buffer = require("diff_review.views.status.status_buffer")
+local source = require("diff_review.render.source")
+-- diff_source_state edge kept lazy to avoid a load-time cycle.
+local function diff_source_state() return require("diff_review.views.status.diff_source_state") end
+-- render_orchestrator edge kept lazy to avoid a load-time cycle.
+local function render_orchestrator() return require("diff_review.views.status.render_orchestrator") end
+local repo_config = require("diff_review.git.repo_config")
+local ui = require("diff_review.infra.ui")
 local session = require("diff_review.session")
 
 local function setup_bg_highlights()
@@ -26,7 +33,7 @@ end
 
 ---@return boolean
 local function debug_notifications_enabled()
-  local options = dr().config or config.options or config.defaults
+  local options = config.options or config.options or config.defaults
   return options.debug_notifications == true
 end
 
@@ -44,30 +51,6 @@ local function notify_git_failures(title, failures)
   notifications.git_failures(title, failures)
 end
 
----@param cwd string
----@param extra_args? string[]
----@return string[]
-local function git_diff_command(cwd, extra_args)
-  local command = {
-    "git", "-C", cwd,
-    "-c", "core.quotepath=false",
-    "diff", "--no-color", "--no-ext-diff", "--unified=0",
-  }
-  for _, arg in ipairs(extra_args or {}) do
-    command[#command + 1] = arg
-  end
-  return command
-end
-
----@param cwd string
----@param commit_oid string
----@return string[]
-local function git_show_diff_command(cwd, commit_oid)
-  return {
-    "git", "-C", cwd,
-    "show", "--format=", "--no-color", "--no-ext-diff", "--unified=0", commit_oid,
-  }
-end
 
 ---@param buf integer
 ---@param entry_id string
@@ -92,7 +75,7 @@ local function status_patch_head_line(buf, entry_id, head_line)
   end
   if not target_line then return false end
 
-  local text, segment_highlights = dr()._status_segment_line_parts(head_line.segments)
+  local text, segment_highlights = status_buffer.segment_line_parts(head_line.segments)
   local was_rendering = vim.b[buf].diff_review_status_rendering
   vim.b[buf].diff_review_status_rendering = true
   vim.bo[buf].modifiable = true
@@ -102,9 +85,9 @@ local function status_patch_head_line(buf, entry_id, head_line)
   status.entries[target_line] = head_line.entry
   if status.lines then status.lines[target_line] = text end
 
-  vim.api.nvim_buf_clear_namespace(buf, dr()._status_ns, target_line - 1, target_line)
+  vim.api.nvim_buf_clear_namespace(buf, ui.status_ns, target_line - 1, target_line)
   for _, highlight in ipairs(segment_highlights) do
-    pcall(vim.api.nvim_buf_set_extmark, buf, dr()._status_ns, target_line - 1, highlight.start_col, {
+    pcall(vim.api.nvim_buf_set_extmark, buf, ui.status_ns, target_line - 1, highlight.start_col, {
       end_col = highlight.end_col,
       hl_group = highlight.hl_group,
       priority = 90,
@@ -129,7 +112,7 @@ local function status_load_commit_files(commit)
   local buf = status and status.buf
   if not (cwd and buf and vim.api.nvim_buf_is_valid(buf)) then return end
 
-  local source_state = dr()._status_ensure_commit_source_state(commit)
+  local source_state = diff_source_state()._status_ensure_commit_source_state(commit)
   if not source_state then return end
   local source_id = source_state.handle.id
   status.commit_file_cache = status.commit_file_cache or {}
@@ -153,7 +136,7 @@ local function status_load_commit_files(commit)
     files_error = nil,
   }
 
-  dr()._diff_source_model.ensure_loaded(source_state, function(ok, err)
+  source.ensure_loaded(source_state, function(ok, err)
     local latest_status = session.status
     if not (latest_status and latest_status.buf and vim.api.nvim_buf_is_valid(latest_status.buf)) then return end
     if latest_status.cwd ~= cwd then return end
@@ -187,7 +170,7 @@ local function status_load_commit_files(commit)
       end
     end
 
-    dr().render_status(latest_status.buf, nil, nil, { reuse_sections = true })
+    render_orchestrator().render_status(latest_status.buf, nil, nil, { reuse_sections = true })
   end)
 end
 
@@ -278,8 +261,8 @@ local function create_branch(buf)
     notify_error("Not a git repository", "DiffReview")
     return
   end
-  local prefix = dr()._repo_config.branch_prefix(cwd)
-  dr()._prompt_branch_name(prefix, function(name)
+  local prefix = repo_config.branch_prefix(cwd)
+  M.prompt_branch_name(prefix, function(name)
     if not name then return end
     name = vim.trim(name)
     if name == "" or name == prefix then return end
@@ -296,7 +279,7 @@ local function create_branch(buf)
         session.status = status
         status.pr = nil
         status.about = nil
-        dr()._render_status_or_notify(buf, nil, nil, { restore_initial_folds = true, refresh_pr = true, refresh_about = true })
+        render_orchestrator().render_status_or_notify(buf, nil, nil, { restore_initial_folds = true, refresh_pr = true, refresh_about = true })
       end
     end)
   end)
@@ -339,8 +322,6 @@ M.notify_error = notify_error
 M.debug_notifications_enabled = debug_notifications_enabled
 M.notify_debug = notify_debug
 M.notify_git_failures = notify_git_failures
-M.git_diff_command = git_diff_command
-M.git_show_diff_command = git_show_diff_command
 M.status_patch_head_line = status_patch_head_line
 M.status_commit_relative_date = status_commit_relative_date
 M.status_load_commit_files = status_load_commit_files

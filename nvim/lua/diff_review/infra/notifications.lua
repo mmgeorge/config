@@ -2,7 +2,10 @@
 ---@field error fun(message: string, title?: string)
 ---@field format_failures fun(failures: DiffReviewGitFailure[]): string
 ---@field git_failures fun(title: string, failures: DiffReviewGitFailure[])
+---@field debug fun(message: string, level?: integer, opts?: table)
 local M = {}
+
+local config = require("diff_review.infra.config")
 
 ---@param message string
 ---@param title? string
@@ -38,6 +41,15 @@ function M.git_failures(title, failures)
   local count = #failures
   local noun = count == 1 and "failure" or "failures"
   M.error(("%s: %d %s\n%s"):format(title, count, noun, M.format_failures(failures)))
+end
+
+---@param message string
+---@param level? integer
+---@param opts? table
+function M.debug(message, level, opts)
+  local options = config.options or config.defaults
+  if not (options and options.debug_notifications == true) then return end
+  vim.notify(message, level or vim.log.levels.INFO, opts)
 end
 
 return M

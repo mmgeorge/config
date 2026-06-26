@@ -1,13 +1,15 @@
 vim.loader.enable(false)
 
 local diff_review = require("diff_review")
+local syntax_engine = require("diff_review.render.syntax_engine")
+local git_data = require("diff_review.git.git_data")
 local gh = require("diff_review.integrations.gh")
 
 local original_cwd = vim.fs.normalize(vim.fn.getcwd())
 local root = vim.fs.normalize(original_cwd .. "/.diffreview-pr-syntax-test")
-local original_compute_hunk_context_async = diff_review.compute_hunk_context_async
-local original_compute_file_syntax_async = diff_review.compute_file_syntax_async
-local original_compute_diff_syntax_async = diff_review.compute_diff_syntax_async
+local original_compute_hunk_context_async = git_data.compute_hunk_context_async
+local original_compute_file_syntax_async = git_data.compute_file_syntax_async
+local original_compute_diff_syntax_async = git_data.compute_diff_syntax_async
 local original_debug_log_path = diff_review._gitstatus_debug_log_path
 local original_debug_force = diff_review._gitstatus_debug_force
 local debug_log_path = vim.fn.tempname()
@@ -172,18 +174,18 @@ local function run()
 
   local file_syntax_requests = {}
   local hunk_context_requests = {}
-  diff_review.compute_hunk_context_async = function(filename, line, cb)
+  git_data.compute_hunk_context_async = function(filename, line, cb)
     hunk_context_requests[#hunk_context_requests + 1] = {
       filename = vim.fs.normalize(filename),
       line = line,
     }
     cb(nil)
   end
-  diff_review.compute_file_syntax_async = function(filename, cb)
+  git_data.compute_file_syntax_async = function(filename, cb)
     file_syntax_requests[#file_syntax_requests + 1] = vim.fs.normalize(filename)
     cb(nil)
   end
-  diff_review.compute_diff_syntax_async = function(filename, lines_for_syntax, cb)
+  git_data.compute_diff_syntax_async = function(filename, lines_for_syntax, cb)
     cb(nil)
   end
 
@@ -193,10 +195,10 @@ local function run()
   diff_review._gitstatus_debug_force = true
   diff_review.setup({ about_auto_generate = false })
 
-  assert_true(diff_review._status_syntax_source_for_entry_kind("pr_file") == "file", "PR files should use file syntax")
-  assert_true(diff_review._status_syntax_source_for_entry_kind("pr_hunk") == "file", "PR hunks should use file syntax")
-  assert_true(diff_review._status_syntax_source_for_entry_kind("pr_review_hunk") == "diff", "PR review hunks should use diff syntax")
-  assert_true(diff_review._status_syntax_source_for_entry_kind("commit_hunk") == "diff", "commit hunks should use diff syntax")
+  assert_true(syntax_engine.status_syntax_source_for_entry_kind("pr_file") == "file", "PR files should use file syntax")
+  assert_true(syntax_engine.status_syntax_source_for_entry_kind("pr_hunk") == "file", "PR hunks should use file syntax")
+  assert_true(syntax_engine.status_syntax_source_for_entry_kind("pr_review_hunk") == "diff", "PR review hunks should use diff syntax")
+  assert_true(syntax_engine.status_syntax_source_for_entry_kind("commit_hunk") == "diff", "commit hunks should use diff syntax")
 
   local buf = diff_review.open_pr(pr, { cwd = root })
   assert_true(buf ~= nil, "open_pr did not return a buffer")
@@ -254,9 +256,9 @@ end
 local ok, err = xpcall(run, debug.traceback)
 diff_review.reset_git_backend()
 gh.reset_backend()
-diff_review.compute_hunk_context_async = original_compute_hunk_context_async
-diff_review.compute_file_syntax_async = original_compute_file_syntax_async
-diff_review.compute_diff_syntax_async = original_compute_diff_syntax_async
+git_data.compute_hunk_context_async = original_compute_hunk_context_async
+git_data.compute_file_syntax_async = original_compute_file_syntax_async
+git_data.compute_diff_syntax_async = original_compute_diff_syntax_async
 diff_review._gitstatus_debug_log_path = original_debug_log_path
 diff_review._gitstatus_debug_force = original_debug_force
 vim.fn.delete(root, "rf")

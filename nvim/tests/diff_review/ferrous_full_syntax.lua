@@ -1,6 +1,8 @@
 vim.loader.enable(false)
 
 local diff_review = require("diff_review")
+local status_render = require("diff_review.views.status.status_render")
+local ui = require("diff_review.infra.ui")
 local session = require("diff_review.session")
 local syntax_engine = require("diff_review.render.syntax_engine")
 local gh = require("diff_review.integrations.gh")
@@ -9,9 +11,9 @@ local gh = require("diff_review.integrations.gh")
 -- emitted by the provider; drive the test seam to apply them into the decorate
 -- namespace, then read marks from both namespaces (gutter stays in _status_ns).
 local function row_marks(buf, row)
-  pcall(diff_review._status_decorate_rows, buf, row, row)
-  local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
-  for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(buf, diff_review._status_decorate_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })) do
+  pcall(status_render.status_decorate_rows, buf, row, row)
+  local marks = vim.api.nvim_buf_get_extmarks(buf, ui.status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
+  for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(buf, ui.status_decorate_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })) do
     marks[#marks + 1] = mark
   end
   return marks
@@ -142,7 +144,7 @@ local function line_has_treesitter_highlight(buf, row)
 end
 
 local function first_diff_match_mismatch(filename, diff_text)
-  local lines = diff_review._file_source_lines(filename)
+  local lines = syntax_engine.file_source_lines(filename)
   if not lines then return "file source unavailable" end
 
   local hunk_header = nil
@@ -185,10 +187,10 @@ local function syntax_debug_for_row(buf, row)
   local entry = status.entries and status.entries[row] or nil
   if not (entry and entry.file and entry.hunk) then return "no status entry for row " .. tostring(row) end
   local file = entry.file
-  local syntax_diff_text = diff_review._status_file_syntax_diff_text(file)
-  local file_match = syntax_diff_text and diff_review._diff_new_side_matches_file(file.filename, syntax_diff_text)
-  local hunk_match = entry.hunk.diff and diff_review._diff_new_side_matches_file(file.filename, entry.hunk.diff)
-  local source_lines = diff_review._file_source_lines(file.filename)
+  local syntax_diff_text = syntax_engine.status_file_syntax_diff_text(file)
+  local file_match = syntax_diff_text and syntax_engine.diff_new_side_matches_file(file.filename, syntax_diff_text)
+  local hunk_match = entry.hunk.diff and syntax_engine.diff_new_side_matches_file(file.filename, entry.hunk.diff)
+  local source_lines = syntax_engine.file_source_lines(file.filename)
   local diff_line = entry.diff_line or {}
   local current_line = diff_line.line and source_lines and source_lines[diff_line.line] or nil
   local cache = syntax_engine.file_syntax_cache_entry(file.filename)

@@ -3,18 +3,20 @@
 --- gathers the values those builders format.
 ---
 --- Reads the live status state and the conventional-commit/datetime/pr-overview/issues helpers
---- through the init module via dr(), so the orchestrator owns state while this module owns the
+--- from session.lua and via direct requires, so the orchestrator owns state while this module owns the
 --- head-line layout.
 
 local ai_commit = require("diff_review.integrations.ai_commit")
 local gh = require("diff_review.integrations.gh")
 local git_backend = require("diff_review.git.git_backend")
 
---- Resolve the init module lazily so head-line builders reach orchestrator state and the shared
---- conventional-commit/datetime/pr-overview/issues seams without a load-time circular require.
-local function dr()
-  return require("diff_review")
-end
+local status_issues = require("diff_review.views.status.status_issues")
+-- pr_overview edge kept lazy to avoid a load-time cycle.
+local function pr_overview() return require("diff_review.views.pr.pr_overview") end
+local fold_state = require("diff_review.views.status.fold_state")
+local status_helpers = require("diff_review.views.status.status_helpers")
+local conventional_commit = require("diff_review.integrations.conventional_commit")
+local datetime = require("diff_review.integrations.datetime")
 local session = require("diff_review.session")
 
 local M = {}
@@ -58,7 +60,7 @@ local function status_head_row(name, oid, ref, ref_hl, subject, date_text, ref_w
   add_segment(" ")
 
   local subject_start_col = byte_col
-  for _, segment in ipairs(dr()._status_conventional_commit_subject_segments(subject or "", nil)) do
+  for _, segment in ipairs(conventional_commit.subject_segments(subject or "", nil)) do
     add_segment(segment[1], segment[2])
   end
   local subject_end_col = byte_col
@@ -83,7 +85,7 @@ function M._status_head_commit_line(name, oid, ref, ref_hl, subject, date_text, 
   local segments, subject_start_col, subject_end_col = status_head_row(name, oid, ref, ref_hl, subject, date_text, ref_width)
   return {
     segments = segments,
-    entry = dr()._status_commit_message_entry(commit, name, subject_start_col, subject_end_col),
+    entry = M._status_commit_message_entry(commit, name, subject_start_col, subject_end_col),
   }
 end
 
@@ -100,7 +102,7 @@ local function status_pr_head_line(pr_state)
   elseif pr_state.state == "ready" and pr_state.pr then
     entry.pr = pr_state.pr
     local subject = pr_state.pr.title ~= "" and pr_state.pr.title or ("PR #" .. tostring(pr_state.pr.number))
-    vim.list_extend(segments, dr()._status_conventional_commit_subject_segments(subject, "DiffReviewStatusPR"))
+    vim.list_extend(segments, conventional_commit.subject_segments(subject, "DiffReviewStatusPR"))
   elseif pr_state.state == "error" then
     segments[#segments + 1] = { "error", "ErrorMsg" }
   elseif pr_state.state == "unavailable" then
@@ -126,7 +128,7 @@ local function status_about_head_line(about_state)
     segments[#segments + 1] = { "...generating...", "DiffReviewStatusFetching" }
   elseif about_state.state == "ready" and about_state.message then
     entry.about = about_state
-    vim.list_extend(segments, dr()._status_conventional_commit_subject_segments(ai_commit.subject(about_state.message), "DiffReviewStatusPath"))
+    vim.list_extend(segments, conventional_commit.subject_segments(ai_commit.subject(about_state.message), "DiffReviewStatusPath"))
   elseif about_state.state == "error" then
     segments[#segments + 1] = { "error", "ErrorMsg" }
   else
@@ -141,7 +143,7 @@ end
 function M._status_patch_about_line(buf)
   local status = session.states and session.states[buf] or session.status
   if not status then return false end
-  return dr()._status_patch_head_line(buf, "about", status_about_head_line(status.about))
+  return status_helpers.status_patch_head_line(buf, "about", status_about_head_line(status.about))
 end
 
 ---@param values table
@@ -155,7 +157,7 @@ local function status_build_head_lines(values, pr_state, about_state, issues_sta
   if values.upstream then ref_width = math.max(ref_width, vim.fn.strdisplaywidth(values.upstream)) end
   if values.push_ref then ref_width = math.max(ref_width, vim.fn.strdisplaywidth(values.push_ref)) end
   local lines = {}
-  lines[#lines + 1] = dr()._status_head_commit_line(
+  lines[#lines + 1] = M._status_head_commit_line(
     "Head",
     values.head_oid or "0000000",
     values.branch or "(detached)",
@@ -171,7 +173,7 @@ local function status_build_head_lines(values, pr_state, about_state, issues_sta
   )
 
   if values.upstream then
-    lines[#lines + 1] = dr()._status_head_commit_line(
+    lines[#lines + 1] = M._status_head_commit_line(
       "Merge",
       values.upstream_oid or "",
       values.upstream,
@@ -195,7 +197,7 @@ local function status_build_head_lines(values, pr_state, about_state, issues_sta
       },
     }
   elseif values.push_ref then
-    lines[#lines + 1] = dr()._status_head_commit_line(
+    lines[#lines + 1] = M._status_head_commit_line(
       "Push",
       values.push_oid or "",
       values.push_ref,
@@ -213,7 +215,7 @@ local function status_build_head_lines(values, pr_state, about_state, issues_sta
 
   lines[#lines + 1] = status_pr_head_line(pr_state)
   lines[#lines + 1] = status_about_head_line(about_state)
-  lines[#lines + 1] = dr()._status_issues.head_line(issues_state)
+  lines[#lines + 1] = status_issues.head_line(issues_state)
   return lines
 end
 
@@ -237,7 +239,7 @@ end
 ---@param count integer
 ---@return table[]
 function M._status_section_heading_segments(title, count)
-  return { { dr()._status_section_heading_text(title, count), "DiffReviewStatusHeader" } }
+  return { { M._status_section_heading_text(title, count), "DiffReviewStatusHeader" } }
 end
 
 ---@param section DiffReviewStatusSection
@@ -292,7 +294,7 @@ local function status_pr_head_subject(pr)
   end
   commit = commit or commits[#commits]
   if type(commit) ~= "table" then return "", "", nil end
-  local date_text = dr()._datetime.relative(
+  local date_text = datetime.relative(
     commit.committedDate or commit.committed_date or commit.committed_at or commit.authoredDate or commit.authored_date or commit.authored_at,
     { yesterday = false }
   )
@@ -325,13 +327,13 @@ local function status_pr_detail_head_lines(pr, status)
     lines[#lines + 1] = { segments = { { "Repo:   ", "DiffReviewStatusLabel" }, { pr.repo, "DiffReviewStatusRemote" } } }
   end
   local head_subject, head_date, head_commit = status_pr_head_subject(pr)
-  local status_commit = dr()._pr_overview.status_commit_from_pr_commit(head_commit, pr.headRefName)
+  local status_commit = pr_overview().status_commit_from_pr_commit(head_commit, pr.headRefName)
     or {
       oid = pr.headRefOid,
       short_oid = status_short_oid(pr.headRefOid),
       subject = head_subject,
     }
-  lines[#lines + 1] = dr()._status_head_commit_line(
+  lines[#lines + 1] = M._status_head_commit_line(
     "Head",
     status_short_oid(pr.headRefOid),
     pr.headRefName or "",
@@ -347,10 +349,10 @@ local function status_pr_detail_head_lines(pr, status)
   lines[#lines + 1] = {
     segments = {
       { "Release: ", "DiffReviewStatusLabel" },
-      { dr()._pr_overview.milestone_text(pr), "DiffReviewStatusBranch" },
+      { pr_overview().milestone_text(pr), "DiffReviewStatusBranch" },
     },
   }
-  local pending_review_text = dr()._pr_overview.pending_review_text(pr, status)
+  local pending_review_text = pr_overview().pending_review_text(pr, status)
   lines[#lines + 1] = {
     segments = {
       { "Review: ", "DiffReviewStatusLabel" },
@@ -360,13 +362,13 @@ local function status_pr_detail_head_lines(pr, status)
   lines[#lines + 1] = {
     segments = {
       { "Status: ", "DiffReviewStatusLabel" },
-      { dr()._pr_overview.status_text(pr), pr.isDraft and "DiffReviewStatusFetching" or "DiffReviewStatusBranch" },
+      { pr_overview().status_text(pr), pr.isDraft and "DiffReviewStatusFetching" or "DiffReviewStatusBranch" },
     },
   }
   lines[#lines + 1] = {
     segments = {
       { "Activity: ", "DiffReviewStatusLabel" },
-      { dr()._pr_overview.activity_text(pr, status), "DiffReviewStatusDate" },
+      { pr_overview().activity_text(pr, status), "DiffReviewStatusDate" },
     },
   }
   lines[#lines + 1] = { segments = { { "" } } }
@@ -374,7 +376,7 @@ local function status_pr_detail_head_lines(pr, status)
     segments = { { "Description:", "DiffReviewStatusHeader" } },
     entry = { id = description_section_id, kind = "pr_head_section", default_folded = false },
   }
-  if not dr()._status_folded(description_section_id, false, status) then
+  if not fold_state._status_folded(description_section_id, false, status) then
     for line_index, line in ipairs(status_markdown_lines(pr.body)) do
       lines[#lines + 1] = {
         segments = { { line } },
@@ -387,7 +389,7 @@ local function status_pr_detail_head_lines(pr, status)
       }
     end
   end
-  vim.list_extend(lines, dr()._pr_overview.check_head_lines(pr, status))
+  vim.list_extend(lines, pr_overview().check_head_lines(pr, status))
   return lines
 end
 
@@ -409,7 +411,7 @@ function M.github_load_repo_metadata(cwd, repo)
   local cache = require("github.repo_cache")
   local issue_index_ok, issue_index = pcall(require, "github.issue_index")
   if repo and repo ~= "" then
-    dr()._status_enable_repo_completion(cwd, repo)
+    M._status_enable_repo_completion(cwd, repo)
     cache.ensure_metadata(cwd, repo, function(done)
       gh.repo_contributors_async(cwd, repo, done)
     end, { remember_cwd = false })
@@ -417,14 +419,14 @@ function M.github_load_repo_metadata(cwd, repo)
     return
   end
   local cached_repo = cache.repo_for_cwd(cwd)
-  if cached_repo then dr()._status_enable_repo_completion(cwd, cached_repo) end
+  if cached_repo then M._status_enable_repo_completion(cwd, cached_repo) end
   cache.ensure_metadata_for_cwd(cwd, function(done)
     gh.current_repo_async(cwd, function(result)
-      if result and result.ok and result.repo then dr()._status_enable_repo_completion(cwd, result.repo) end
+      if result and result.ok and result.repo then M._status_enable_repo_completion(cwd, result.repo) end
       done(result)
     end)
   end, function(resolved_repo, done)
-    dr()._status_enable_repo_completion(cwd, resolved_repo)
+    M._status_enable_repo_completion(cwd, resolved_repo)
     gh.repo_contributors_async(cwd, resolved_repo, done)
   end)
   if issue_index_ok then issue_index.ensure_current(cwd, { manual = false }) end
@@ -444,7 +446,7 @@ local function status_head_lines_async(cwd, cb)
     local status = session.status
     local pr_state = status and status.pr
     local about_state = status and status.about
-    local issues_state = dr()._status_issues.ensure_state(status, cwd)
+    local issues_state = status_issues.ensure_state(status, cwd)
     cb(status_build_head_lines(values, pr_state, about_state, issues_state), values)
   end
 

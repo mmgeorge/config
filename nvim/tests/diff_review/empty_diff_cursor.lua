@@ -1,6 +1,9 @@
 vim.loader.enable(false)
 
 local diff_review = require("diff_review")
+local render_orchestrator = require("diff_review.views.status.render_orchestrator")
+local diff_buffer = require("diff_review.views.diff_buffer")
+local ui = require("diff_review.infra.ui")
 local session = require("diff_review.session")
 local gh = require("diff_review.integrations.gh")
 
@@ -78,7 +81,7 @@ end
 local function visual_gutter_mark(status_buf, row)
   local marks = vim.api.nvim_buf_get_extmarks(
     status_buf,
-    diff_review._diff_gutter_visual_ns,
+    ui.gutter_visual_ns,
     { row - 1, 0 },
     { row - 1, -1 },
     { details = true }
@@ -129,7 +132,7 @@ local function run()
   diff_review.open()
   assert_true(vim.bo.filetype == "GitStatus", "GitStatus buffer did not open")
   local status_buf = vim.api.nvim_get_current_buf()
-  diff_review.render_status(status_buf)
+  render_orchestrator.render_status(status_buf)
   wait_for(function()
     local row = maybe_file_row("sample.lua")
     return row ~= nil
@@ -166,7 +169,7 @@ local function run()
   local code_line = vim.api.nvim_buf_get_lines(status_buf, code_row - 1, code_row, false)[1]
   local code_start = code_line:find(diff_line.code, 1, true)
   assert_true(code_start ~= nil, "diff code text missing from status row: " .. vim.inspect({ code_line, diff_line.code }))
-  local code_bounds = diff_review._diff_gutter_cursor_bounds(status_buf, code_row, diff_review._status_ns)
+  local code_bounds = diff_buffer._diff_gutter_cursor_bounds(status_buf, code_row, ui.status_ns)
   assert_true(code_bounds ~= nil, "non-empty diff row is missing inline gutter bounds")
   assert_true(code_bounds.content_length == #diff_line.code, "non-empty diff row should track real code length: " .. vim.inspect(code_bounds))
 
@@ -190,7 +193,7 @@ local function run()
   visual_gutter_mapping.callback()
   assert_true(has_local_visual_clipboard_yank(), "visual clipboard yank mapping was not installed for W selection")
   cursor = vim.fn.getcurpos()
-  assert_true(diff_review._is_visual_mode(), "W did not enter visual mode: " .. vim.inspect(vim.api.nvim_get_mode()))
+  assert_true(diff_buffer._is_visual_mode(), "W did not enter visual mode: " .. vim.inspect(vim.api.nvim_get_mode()))
   assert_true(cursor[2] == code_row, "W moved off non-empty diff row: " .. vim.inspect(cursor))
   assert_true(cursor[3] == 1, "W should keep the cursor at the real gutter edge: " .. vim.inspect(cursor))
   assert_true(cursor[4] == 0, "W should not use a virtual gutter offset: " .. vim.inspect(cursor))
@@ -202,20 +205,20 @@ local function run()
     assert_true(chunk[2] == "Visual", "Visual gutter overlay did not select a gutter chunk: " .. vim.inspect(selected_gutter.virt_text))
   end
 
-  diff_review._normalize_status_cursor(status_buf)
+  diff_buffer._normalize_status_cursor(status_buf)
   cursor = vim.fn.getcurpos()
   assert_true(cursor[2] == code_row, "visual gutter normalization moved off row: " .. vim.inspect(cursor))
   assert_true(cursor[3] == 1, "visual gutter normalization clamped into code text: " .. vim.inspect(cursor))
   assert_true(cursor[4] == 0, "visual gutter normalization added virtual gutter offset: " .. vim.inspect(cursor))
   assert_true(visual_gutter_mark(status_buf, code_row) ~= nil, "visual gutter overlay disappeared during active selection")
 
-  local expected_yank = diff_review._diff_gutter_text(code_bounds.virt_text) .. code_line:sub(1, code_bounds.content_length)
+  local expected_yank = diff_buffer._diff_gutter_text(code_bounds.virt_text) .. code_line:sub(1, code_bounds.content_length)
   local clipboard_yank_mapping = vim.fn.maparg("<Space>l", "x", false, true)
   assert_true(type(clipboard_yank_mapping.callback) == "function", "missing visual clipboard yank mapping")
   vim.fn.setreg("+", "", "V")
   clipboard_yank_mapping.callback()
   wait_for(function()
-    return not diff_review._is_visual_mode()
+    return not diff_buffer._is_visual_mode()
   end, "visual gutter clipboard yank did not leave visual mode")
   assert_true(vim.fn.getregtype("+") == "V", "W clipboard yank should write a linewise register: " .. vim.inspect(vim.fn.getregtype("+")))
   assert_true(vim.fn.getreg("+") == expected_yank .. "\n", "W clipboard yank did not include gutter text: " .. vim.inspect({ expected = expected_yank, actual = vim.fn.getreg("+") }))
@@ -227,9 +230,9 @@ local function run()
   assert_true(has_local_visual_clipboard_yank(), "visual clipboard yank mapping was not installed for second W selection")
   vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "nx", false)
   wait_for(function()
-    return not diff_review._is_visual_mode()
+    return not diff_buffer._is_visual_mode()
   end, "visual gutter selection did not exit")
-  diff_review._normalize_status_cursor(status_buf)
+  diff_buffer._normalize_status_cursor(status_buf)
   assert_true(visual_gutter_mark(status_buf, code_row) == nil, "visual gutter overlay was not cleared after selection")
   assert_true(not has_local_visual_clipboard_yank(), "visual clipboard yank mapping was not removed after selection")
   cursor = vim.fn.getcurpos()

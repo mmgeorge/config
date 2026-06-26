@@ -7,9 +7,20 @@ local notifications = require("diff_review.infra.notifications")
 local git_backend = require("diff_review.git.git_backend")
 local paths = require("diff_review.infra.paths")
 
-local function dr()
-  return require("diff_review")
-end
+local mutation_queue = require("diff_review.render.mutation_queue")
+local source = require("diff_review.render.source")
+local source_loader = require("diff_review.render.source_loader")
+-- status_render edge kept lazy to avoid a load-time cycle.
+local function status_render() return require("diff_review.views.status.status_render") end
+-- render_orchestrator edge kept lazy to avoid a load-time cycle.
+local function render_orchestrator() return require("diff_review.views.status.render_orchestrator") end
+local diff_source_state = require("diff_review.views.status.diff_source_state")
+local git_data = require("diff_review.git.git_data")
+-- section_map edge kept lazy to avoid a load-time cycle.
+local function section_map() return require("diff_review.views.status.section_map") end
+local entry_nav = require("diff_review.views.status.entry_nav")
+local status_helpers = require("diff_review.views.status.status_helpers")
+local trace = require("diff_review.infra.perf_trace")
 local session = require("diff_review.session")
 
 local function notify_error(message, title)
@@ -38,10 +49,10 @@ local status_reconcile_delay_ms = 120
 local function status_apply_optimistic_entries(entries, target_section, target_id)
   local status = session.status
   if not (status and status.sections) then return end
-  local next_sections = dr()._status_apply_optimistic_move(status.sections, entries, target_section)
+  local next_sections = section_map()._status_apply_optimistic_move(status.sections, entries, target_section)
   if not next_sections then return end
   status.sections = next_sections
-  dr()._status_render_current_model(target_id)
+  status_render().status_render_current_model(target_id)
 end
 
 ---@param buf integer
@@ -49,9 +60,9 @@ end
 local function refresh_status_after_action(buf, target_id)
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
   if target_id then
-    dr()._render_status_or_notify(buf, target_id, vim.api.nvim_win_get_cursor(0)[1])
+    render_orchestrator().render_status_or_notify(buf, target_id, vim.api.nvim_win_get_cursor(0)[1])
   else
-    dr()._render_status_or_notify(buf)
+    render_orchestrator().render_status_or_notify(buf)
   end
 end
 
@@ -59,7 +70,7 @@ local function status_operations_pending()
   local status = session.status
   if not status then return false end
   if status.operation_queue_model then
-    return dr()._diff_mutation_queue_model.pending(status.operation_queue_model)
+    return mutation_queue.pending(status.operation_queue_model)
   end
   return status.operation_running or #(status.operation_queue or {}) > 0
 end
@@ -80,20 +91,20 @@ local function status_reload_invalidated_diff_sources(status, done)
       path_set[path] = true
     end
   end
-  local paths = dr()._status_files_from_set(path_set)
+  local paths = entry_nav._status_files_from_set(path_set)
   if #source_ids == 0 or #paths == 0 then
     done()
     return
   end
-  dr()._status_perf_event("source.reload_invalidated.start", status.buf, {
+  trace.event("source.reload_invalidated.start", status.buf, {
     source_ids = source_ids,
     paths = paths,
   })
-  dr()._diff_source_model.reload_paths(registry, source_ids, paths, function(ok, err)
+  source.reload_paths(registry, source_ids, paths, function(ok, err)
     if not ok then
       notify_error("Diff source reload failed: " .. tostring(err or "unknown error"), "DiffReview")
     end
-    dr()._status_perf_event("source.reload_invalidated.done", status.buf, {
+    trace.event("source.reload_invalidated.done", status.buf, {
       ok = ok,
       source_ids = source_ids,
       paths = paths,
@@ -132,9 +143,9 @@ local function status_enqueue_operation(operation)
   session.status = session.status or {}
   local status = session.status
   status.reconcile_generation = (status.reconcile_generation or 0) + 1
-  status.operation_queue_model = status.operation_queue_model or dr()._diff_mutation_queue_model.new()
-  dr()._diff_mutation_queue_model.enqueue(status.operation_queue_model, operation)
-  dr()._diff_mutation_queue_model.on_idle(status.operation_queue_model, function()
+  status.operation_queue_model = status.operation_queue_model or mutation_queue.new()
+  mutation_queue.enqueue(status.operation_queue_model, operation)
+  mutation_queue.on_idle(status.operation_queue_model, function()
     status_request_reconcile(status.reconcile_buf, status.reconcile_target_id)
   end)
 end
@@ -158,7 +169,7 @@ end
 local function status_entry_source_path(entry)
   local status = session.status
   if not (entry and entry.file and status) then return nil end
-  return dr()._status_diff_file_path(entry.file, status)
+  return diff_source_state._status_diff_file_path(entry.file, status)
 end
 
 ---@param entries DiffReviewStatusEntry[]
@@ -171,13 +182,13 @@ local function status_mark_diff_paths_pending(entries, source_ids)
     local path = status_entry_source_path(entry)
     if path and path ~= "" then path_set[path] = true end
   end
-  local paths = dr()._status_files_from_set(path_set)
+  local paths = entry_nav._status_files_from_set(path_set)
   if #paths == 0 then return end
-  dr()._status_perf_event("source.invalidate_paths", status.buf, {
+  trace.event("source.invalidate_paths", status.buf, {
     source_ids = source_ids,
     paths = paths,
   })
-  dr()._diff_source_loader_model.invalidate(status.diff_source_registry, source_ids, paths)
+  source_loader.invalidate(status.diff_source_registry, source_ids, paths)
 end
 
 ---@param entries DiffReviewStatusEntry[]
@@ -199,13 +210,13 @@ local function status_split_action_entries(entries)
       end
     end
   end
-  return hunk_diffs, dr()._status_files_from_set(tracked_files), dr()._status_files_from_set(untracked_files)
+  return hunk_diffs, entry_nav._status_files_from_set(tracked_files), entry_nav._status_files_from_set(untracked_files)
 end
 
 ---@param entry DiffReviewStatusEntry
 ---@return boolean
 local function status_entry_is_added(entry)
-  return dr()._git_status_is_added((entry.file and entry.file.git_status) or (entry.hunk and entry.hunk.git_status))
+  return git_data._git_status_is_added((entry.file and entry.file.git_status) or (entry.hunk and entry.hunk.git_status))
 end
 
 ---@param entries DiffReviewStatusEntry[]
@@ -257,7 +268,7 @@ local function status_split_unstage_entries(entries)
       end
     end
   end
-  return hunk_diffs, dr()._status_files_from_set(tracked_files), dr()._status_files_from_set(added_files)
+  return hunk_diffs, entry_nav._status_files_from_set(tracked_files), entry_nav._status_files_from_set(added_files)
 end
 
 ---@param entries DiffReviewStatusEntry[]
@@ -284,7 +295,7 @@ local function status_stage_entries(entries, opts)
   opts = opts or {}
   if #entries == 0 then return end
   if blocked_by_active_commit("Stage") then return end
-  local expanded_entries = dr()._status_expanded_entries(entries)
+  local expanded_entries = entry_nav._status_expanded_entries(entries)
   if #expanded_entries == 0 then return end
 
   local action_entries = status_action_entries_for_target(expanded_entries, "staged")
@@ -292,7 +303,7 @@ local function status_stage_entries(entries, opts)
 
   local target_id = nil
   if not opts.preserve_cursor then
-    target_id = dr()._status_action_target_id(entries, action_entries, "staged", { file_target = "next" })
+    target_id = entry_nav._status_action_target_id(entries, action_entries, "staged", { file_target = "next" })
   end
   local hunk_diffs, tracked_files, untracked_files = status_split_action_entries(action_entries)
   local staged_hunks = 0
@@ -304,7 +315,7 @@ local function status_stage_entries(entries, opts)
 
   local function finish()
     if staged_hunks > 0 or staged_files > 0 then
-      dr()._status_notify_action("Staged", staged_hunks, staged_files)
+      entry_nav._status_notify_action("Staged", staged_hunks, staged_files)
     end
     status_request_reconcile(status_buf, target_id)
   end
@@ -314,7 +325,7 @@ local function status_stage_entries(entries, opts)
       finish()
       return
     end
-    dr().stage_files_async(untracked_files, function(result)
+    git_data.stage_files_async(untracked_files, function(result)
       staged_files = staged_files + #result.successes
       finish()
     end)
@@ -325,7 +336,7 @@ local function status_stage_entries(entries, opts)
       stage_untracked_files()
       return
     end
-    dr().stage_tracked_files_async(tracked_files, function(result)
+    git_data.stage_tracked_files_async(tracked_files, function(result)
       staged_files = staged_files + #result.successes
       stage_untracked_files()
     end)
@@ -337,7 +348,7 @@ local function status_stage_entries(entries, opts)
       stage_files_after_hunks()
       return
     end
-    dr().stage_patch_async(diff, function(ok)
+    git_data.stage_patch_async(diff, function(ok)
       if ok then staged_hunks = staged_hunks + 1 end
       stage_hunk_at(index + 1)
     end)
@@ -365,7 +376,7 @@ local function status_unstage_entries(entries, opts)
   opts = opts or {}
   if #entries == 0 then return end
   if blocked_by_active_commit("Unstage") then return end
-  local expanded_entries = dr()._status_expanded_entries(entries)
+  local expanded_entries = entry_nav._status_expanded_entries(entries)
   if #expanded_entries == 0 then return end
 
   local action_entries = status_unstage_action_entries(expanded_entries)
@@ -373,7 +384,7 @@ local function status_unstage_entries(entries, opts)
 
   local target_id = nil
   if not opts.preserve_cursor then
-    target_id = dr()._status_action_target_id(entries, action_entries, status_unstage_target_section(action_entries))
+    target_id = entry_nav._status_action_target_id(entries, action_entries, status_unstage_target_section(action_entries))
   end
   local tracked_entries, added_entries = status_partition_unstage_entries(action_entries)
   local hunk_diffs, files, added_files = status_split_unstage_entries(action_entries)
@@ -387,7 +398,7 @@ local function status_unstage_entries(entries, opts)
 
   local function finish()
     if unstaged_hunks > 0 or unstaged_files > 0 then
-      dr()._status_notify_action("Unstaged", unstaged_hunks, unstaged_files)
+      entry_nav._status_notify_action("Unstaged", unstaged_hunks, unstaged_files)
     end
     status_request_reconcile(status_buf, target_id)
   end
@@ -398,19 +409,19 @@ local function status_unstage_entries(entries, opts)
         finish()
         return
       end
-      dr().unstage_added_files_async(added_files, function(result)
+      git_data.unstage_added_files_async(added_files, function(result)
         unstaged_files = unstaged_files + #result.successes
         finish()
       end)
       return
     end
-    dr().unstage_files_async(files, function(result)
+    git_data.unstage_files_async(files, function(result)
       unstaged_files = unstaged_files + #result.successes
       if #added_files == 0 then
         finish()
         return
       end
-      dr().unstage_added_files_async(added_files, function(added_result)
+      git_data.unstage_added_files_async(added_files, function(added_result)
         unstaged_files = unstaged_files + #added_result.successes
         finish()
       end)
@@ -423,7 +434,7 @@ local function status_unstage_entries(entries, opts)
       unstage_files_after_hunks()
       return
     end
-    dr().unstage_patch_async(diff, function(ok)
+    git_data.unstage_patch_async(diff, function(ok)
       if ok then unstaged_hunks = unstaged_hunks + 1 end
       unstage_hunk_at(index + 1)
     end)
@@ -461,7 +472,7 @@ local function status_discard_entries(entries, target_id)
     status_mark_diff_paths_pending(entries, { "unstaged", "staged" })
 
     local function finish_all()
-      if #failures > 0 then dr().notify_git_failures("Discard failed", failures) end
+      if #failures > 0 then notifications.git_failures("Discard failed", failures) end
       refresh_status_after_action(status_buf, target_id)
     end
 
@@ -524,7 +535,7 @@ local function status_discard_entries(entries, target_id)
           end
 
           if entry.file.section_name == "unstaged" then
-            if dr()._git_status_is_added(entry.file.git_status) then
+            if git_data._git_status_is_added(entry.file.git_status) then
               git_backend.run_git_at_root_async(cwd, { "restore", "--staged", "--", relpath }, nil, function(restore_result)
                 if restore_result.ok then
                   delete_file(entry.file.filename, " after unstaging")
@@ -539,7 +550,7 @@ local function status_discard_entries(entries, target_id)
                 next_entry()
               end)
             end
-          elseif dr()._git_status_is_added(entry.file.git_status) then
+          elseif git_data._git_status_is_added(entry.file.git_status) then
             git_backend.run_git_at_root_async(cwd, { "rm", "--cached", "--ignore-unmatch", "--", relpath }, nil, function(rm_result)
               if rm_result.ok then
                 delete_file(entry.file.filename, " after unstaging")
@@ -548,7 +559,7 @@ local function status_discard_entries(entries, target_id)
               end
               next_entry()
             end)
-          elseif dr()._git_status_is_renamed(entry.file.git_status) then
+          elseif git_data._git_status_is_renamed(entry.file.git_status) then
             local original_relpath = entry.file.original_relpath
             if not original_relpath or original_relpath == "" then
               failures[#failures + 1] = { file = entry.file.filename, message = "Missing original path for renamed file" }
@@ -570,7 +581,7 @@ local function status_discard_entries(entries, target_id)
                 end)
               end)
             end
-          elseif dr()._git_status_is_deleted(entry.file.git_status) then
+          elseif git_data._git_status_is_deleted(entry.file.git_status) then
             git_backend.run_git_at_root_async(cwd, { "restore", "--staged", "--", relpath }, nil, function(restore_result)
               if not restore_result.ok then
                 add_failure(restore_result)
@@ -609,7 +620,7 @@ end
 local function status_discard_entry_list(entries, target_id, opts)
   opts = opts or {}
   local discard_entries = {}
-  for _, entry in ipairs(dr()._status_expanded_entries(entries)) do
+  for _, entry in ipairs(entry_nav._status_expanded_entries(entries)) do
     if entry.kind == "hunk" or entry.kind == "file" then
       discard_entries[#discard_entries + 1] = entry
     end
@@ -617,7 +628,7 @@ local function status_discard_entry_list(entries, target_id, opts)
   if #discard_entries == 0 then return end
   local action_target_id = nil
   if not opts.preserve_cursor then
-    action_target_id = dr()._status_action_target_id(entries, discard_entries) or target_id
+    action_target_id = entry_nav._status_action_target_id(entries, discard_entries) or target_id
   end
 
   local message
@@ -631,9 +642,9 @@ local function status_discard_entry_list(entries, target_id, opts)
     for _, entry in ipairs(discard_entries) do
       files[entry.file.filename] = true
     end
-    message = { ("Discard changes in %d file(s)?"):format(dr()._status_count_set(files)) }
+    message = { ("Discard changes in %d file(s)?"):format(entry_nav._status_count_set(files)) }
   end
-  dr()._confirm(message, function()
+  status_helpers.confirm(message, function()
     status_discard_entries(discard_entries, action_target_id)
   end)
 end

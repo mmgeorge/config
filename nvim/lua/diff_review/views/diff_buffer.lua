@@ -4,17 +4,25 @@
 ---
 --- Owns the per-buffer diff caches (the diff:// registry, per-buffer hunks, and saved cursors) as
 --- module-locals and reads the shared per-session caches from session.lua, so this module keeps its
---- own view state while reaching render/parse seams and orchestrator functions through dr().
+--- own view state while reaching render/parse seams and orchestrator functions via direct requires.
 
 local diff_render = require("diff_review.render.diff_render")
 local git_backend = require("diff_review.git.git_backend")
 
---- Resolve the init module lazily so diff-buffer behavior can reach orchestrator state and the
---- shared parse/render seams without a load-time circular require.
-local function dr()
-  return require("diff_review")
-end
+-- state edge kept lazy to avoid a load-time cycle.
+local function state() return require("diff_review.views.status.state") end
+-- git_data edge kept lazy to avoid a load-time cycle.
+local function git_data() return require("diff_review.git.git_data") end
+local window_options = require("diff_review.views.status.window_options")
+local trace = require("diff_review.infra.perf_trace")
+local ui = require("diff_review.infra.ui")
 local session = require("diff_review.session")
+
+-- Gutter visual-line mode + cursor-normalizing state, keyed by buffer. Private to this module
+-- (previously parked on the init table as shared state during the monolith era).
+local gutter_visual_yank_maps = {}
+local gutter_visual_selections = {}
+local cursor_normalizing = {}
 
 -- Per-diff-buffer view caches, owned here and keyed by buffer handle (diff_bufs by
 -- "diff:"..filename). Cleared together by cleanup_diff_buffers on session teardown.
@@ -51,7 +59,7 @@ end
 
 function M._diff_pad_highlighted_line(line_text, buf)
   local content_length = #line_text
-  local fill_width = dr()._diff_visual_fill_width(buf)
+  local fill_width = M._diff_visual_fill_width(buf)
   local display_width = vim.fn.strdisplaywidth(line_text)
   if display_width < fill_width then
     line_text = line_text .. string.rep(" ", fill_width - display_width)
@@ -90,7 +98,7 @@ function M._diff_gutter_cursor_bounds(buf, row, namespace)
     local col = mark[3] or 0
     local details = mark[4] or {}
     if details.virt_text and details.virt_text_pos == "inline" and col <= content_length then
-      local width = dr()._inline_virtual_text_width(details.virt_text)
+      local width = M._inline_virtual_text_width(details.virt_text)
       if width > 0 then
         return {
           line = line,
@@ -135,28 +143,28 @@ end
 ---@param buf integer
 function M._clear_diff_gutter_visual_overlay(buf)
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
-  pcall(vim.api.nvim_buf_clear_namespace, buf, dr()._diff_gutter_visual_ns, 0, -1)
+  pcall(vim.api.nvim_buf_clear_namespace, buf, ui.gutter_visual_ns, 0, -1)
 end
 
 ---@param buf integer
 function M._clear_diff_gutter_visual_line(buf)
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
-  if dr()._diff_gutter_visual_line_yank_maps and dr()._diff_gutter_visual_line_yank_maps[buf] then
+  if gutter_visual_yank_maps and gutter_visual_yank_maps[buf] then
     pcall(vim.keymap.del, "x", "<Space>l", { buffer = buf })
-    dr()._diff_gutter_visual_line_yank_maps[buf] = nil
+    gutter_visual_yank_maps[buf] = nil
   end
-  dr()._clear_diff_gutter_visual_overlay(buf)
+  M._clear_diff_gutter_visual_overlay(buf)
 end
 
 ---@param buf integer
 function M._install_diff_gutter_visual_line_yank_maps(buf)
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
-  dr()._diff_gutter_visual_line_yank_maps = dr()._diff_gutter_visual_line_yank_maps or {}
-  if dr()._diff_gutter_visual_line_yank_maps[buf] then return end
-  dr()._diff_gutter_visual_line_yank_maps[buf] = true
+  gutter_visual_yank_maps = gutter_visual_yank_maps or {}
+  if gutter_visual_yank_maps[buf] then return end
+  gutter_visual_yank_maps[buf] = true
   vim.keymap.set("x", "<Space>l", function()
-    if dr()._yank_diff_gutter_visual_line(buf, "+") then return end
-    dr()._clear_diff_gutter_visual_line(buf)
+    if M._yank_diff_gutter_visual_line(buf, "+") then return end
+    M._clear_diff_gutter_visual_line(buf)
     vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Space>l", true, false, true), "m", false)
   end, { buffer = buf, nowait = true, silent = true, desc = "Yank selection to clipboard" })
 end
@@ -164,12 +172,12 @@ end
 ---@param buf integer
 ---@return boolean
 function M._diff_gutter_visual_line_active(buf)
-  local selections = dr()._diff_gutter_visual_line_selections
+  local selections = gutter_visual_selections
   if not (selections and selections[buf]) then return false end
   if selections[buf] == "starting" then return true end
-  if dr()._is_visual_mode() then return true end
+  if M._is_visual_mode() then return true end
   selections[buf] = nil
-  dr()._clear_diff_gutter_visual_line(buf)
+  M._clear_diff_gutter_visual_line(buf)
   return false
 end
 
@@ -177,25 +185,25 @@ end
 ---@return integer
 function M._diff_gutter_namespace(buf)
   local status = session.states and session.states[buf] or nil
-  return status and dr()._status_ns or dr()._ns
+  return status and ui.status_ns or ui.preview_ns
 end
 
 ---@param buf integer
 function M._refresh_diff_gutter_visual_line(buf)
-  if not dr()._diff_gutter_visual_line_active(buf) then return end
-  dr()._clear_diff_gutter_visual_overlay(buf)
+  if not M._diff_gutter_visual_line_active(buf) then return end
+  M._clear_diff_gutter_visual_overlay(buf)
   local cursor_row = vim.api.nvim_win_get_cursor(0)[1]
   local start_pos = vim.fn.getpos("v")
   local start_row = start_pos and start_pos[2] or cursor_row
   if start_row == 0 then start_row = cursor_row end
   local first_row = math.min(start_row, cursor_row)
   local last_row = math.max(start_row, cursor_row)
-  local namespace = dr()._diff_gutter_namespace(buf)
+  local namespace = M._diff_gutter_namespace(buf)
   for row = first_row, last_row do
-    local bounds = dr()._diff_gutter_cursor_bounds(buf, row, namespace)
+    local bounds = M._diff_gutter_cursor_bounds(buf, row, namespace)
     if bounds and bounds.virt_text then
-      pcall(vim.api.nvim_buf_set_extmark, buf, dr()._diff_gutter_visual_ns, row - 1, 0, {
-        virt_text = dr()._diff_gutter_visual_chunks(bounds.virt_text),
+      pcall(vim.api.nvim_buf_set_extmark, buf, ui.gutter_visual_ns, row - 1, 0, {
+        virt_text = M._diff_gutter_visual_chunks(bounds.virt_text),
         virt_text_pos = "overlay",
         virt_text_win_col = bounds.gutter_col,
         hl_mode = "replace",
@@ -208,14 +216,14 @@ end
 ---@param buf integer
 function M._start_diff_gutter_visual_line(buf)
   if not (buf and vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_get_current_buf() == buf) then return end
-  dr()._diff_gutter_visual_line_selections = dr()._diff_gutter_visual_line_selections or {}
-  dr()._diff_gutter_visual_line_selections[buf] = "starting"
-  dr()._install_diff_gutter_visual_line_yank_maps(buf)
+  gutter_visual_selections = gutter_visual_selections or {}
+  gutter_visual_selections[buf] = "starting"
+  M._install_diff_gutter_visual_line_yank_maps(buf)
   local row = vim.api.nvim_win_get_cursor(0)[1]
   vim.fn.setpos(".", { 0, row, 1, 0 })
   vim.cmd("normal! V")
-  dr()._diff_gutter_visual_line_selections[buf] = true
-  dr()._refresh_diff_gutter_visual_line(buf)
+  gutter_visual_selections[buf] = true
+  M._refresh_diff_gutter_visual_line(buf)
 end
 
 ---@param buf integer
@@ -227,13 +235,13 @@ function M._diff_gutter_visual_line_text(buf)
   if start_row == 0 then start_row = cursor_row end
   local first_row = math.min(start_row, cursor_row)
   local last_row = math.max(start_row, cursor_row)
-  local namespace = dr()._diff_gutter_namespace(buf)
+  local namespace = M._diff_gutter_namespace(buf)
   local lines = {}
   for row = first_row, last_row do
     local line = vim.api.nvim_buf_get_lines(buf, row - 1, row, false)[1] or ""
-    local bounds = dr()._diff_gutter_cursor_bounds(buf, row, namespace)
+    local bounds = M._diff_gutter_cursor_bounds(buf, row, namespace)
     if bounds and bounds.virt_text then
-      lines[#lines + 1] = dr()._diff_gutter_text(bounds.virt_text) .. line:sub(1, bounds.content_length)
+      lines[#lines + 1] = M._diff_gutter_text(bounds.virt_text) .. line:sub(1, bounds.content_length)
     else
       lines[#lines + 1] = line
     end
@@ -245,8 +253,8 @@ end
 ---@param register? string
 ---@return boolean handled
 function M._yank_diff_gutter_visual_line(buf, register)
-  if not dr()._diff_gutter_visual_line_active(buf) then return false end
-  local lines = dr()._diff_gutter_visual_line_text(buf)
+  if not M._diff_gutter_visual_line_active(buf) then return false end
+  local lines = M._diff_gutter_visual_line_text(buf)
   register = register or vim.v.register
   if register == nil or register == "" then register = '"' end
   vim.fn.setreg(register, lines, "V")
@@ -256,8 +264,8 @@ function M._yank_diff_gutter_visual_line(buf, register)
   if register == '"' and vim.o.clipboard:find("unnamed", 1, true) then
     pcall(vim.fn.setreg, "*", lines, "V")
   end
-  dr()._diff_gutter_visual_line_selections[buf] = nil
-  dr()._clear_diff_gutter_visual_line(buf)
+  gutter_visual_selections[buf] = nil
+  M._clear_diff_gutter_visual_line(buf)
   vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "nx", false)
   return true
 end
@@ -268,7 +276,7 @@ end
 function M._normalize_diff_gutter_cursor(buf, namespace)
   if not (buf and vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_get_current_buf() == buf) then return false end
   local row = vim.api.nvim_win_get_cursor(0)[1]
-  local bounds = dr()._diff_gutter_cursor_bounds(buf, row, namespace)
+  local bounds = M._diff_gutter_cursor_bounds(buf, row, namespace)
   if not bounds then return false end
 
   local pos = vim.fn.getcurpos()
@@ -306,9 +314,9 @@ end
 function M._align_diff_cursor(buf)
   local status = session.states and session.states[buf] or nil
   if status then
-    return dr()._normalize_diff_gutter_cursor(buf, dr()._status_ns)
+    return M._normalize_diff_gutter_cursor(buf, ui.status_ns)
   end
-  return dr()._normalize_diff_gutter_cursor(buf, dr()._ns)
+  return M._normalize_diff_gutter_cursor(buf, ui.preview_ns)
 end
 
 ---@param buf integer
@@ -334,23 +342,23 @@ end
 ---@return integer? row
 function M._normalize_status_cursor(buf)
   if not (buf and vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_get_current_buf() == buf) then return nil end
-  dr()._cursor_normalizing = dr()._cursor_normalizing or {}
-  if dr()._cursor_normalizing[buf] then return vim.api.nvim_win_get_cursor(0)[1] end
-  dr()._cursor_normalizing[buf] = true
-  if dr()._diff_gutter_visual_line_active(buf) then
-    dr()._refresh_diff_gutter_visual_line(buf)
-    dr()._cursor_normalizing[buf] = nil
+  cursor_normalizing = cursor_normalizing or {}
+  if cursor_normalizing[buf] then return vim.api.nvim_win_get_cursor(0)[1] end
+  cursor_normalizing[buf] = true
+  if M._diff_gutter_visual_line_active(buf) then
+    M._refresh_diff_gutter_visual_line(buf)
+    cursor_normalizing[buf] = nil
     return vim.api.nvim_win_get_cursor(0)[1]
   end
-  local handled = dr()._align_diff_cursor(buf)
-  if not handled then dr()._clamp_buffer_text_cursor(buf) end
-  dr()._cursor_normalizing[buf] = nil
+  local handled = M._align_diff_cursor(buf)
+  if not handled then M._clamp_buffer_text_cursor(buf) end
+  cursor_normalizing[buf] = nil
   return vim.api.nvim_win_get_cursor(0)[1]
 end
 
 ---@param buf integer
 function M._align_empty_diff_cursor(buf)
-  dr()._normalize_status_cursor(buf)
+  M._normalize_status_cursor(buf)
 end
 --- Find which hunk the cursor is in within a diff buffer.
 --- Returns the hunk's complete diff patch (with file header) or nil.
@@ -446,13 +454,13 @@ function M.open_diff_buffer(filename)
         if not vim.api.nvim_buf_is_valid(buf) or not buf_filename[buf] then return end
         -- Re-hide the number column: re-entering the diff buffer (e.g. a
         -- window switch back from the real file) restores it otherwise.
-        dr()._hide_line_numbers(vim.api.nvim_get_current_win())
+        window_options.hide_line_numbers(vim.api.nvim_get_current_win())
         vim.schedule(function()
           if not vim.api.nvim_buf_is_valid(buf) then return end
           -- Re-fetch diff if cache was invalidated
           local function render_and_restore()
             if not vim.api.nvim_buf_is_valid(buf) then return end
-            dr()._refresh_diff_buffer(buf, filename)
+            M._refresh_diff_buffer(buf, filename)
             -- Restore saved cursor
             local saved = buf_saved_cursor[buf]
             local new_hunks = buf_hunks[buf]
@@ -483,7 +491,7 @@ function M.open_diff_buffer(filename)
             buf_saved_cursor[buf] = nil
           end
           if not session.file_diffs or session.file_diffs[filename] == nil then
-            dr()._update_file_diff_cache_async(filename, render_and_restore)
+            M._update_file_diff_cache_async(filename, render_and_restore)
           else
             render_and_restore()
           end
@@ -493,8 +501,8 @@ function M.open_diff_buffer(filename)
     vim.api.nvim_create_autocmd("CursorMoved", {
       buffer = buf,
       callback = function()
-        dr()._status_perf_span("diff.autocmd_cursor_moved", buf, nil, function()
-          dr()._normalize_status_cursor(buf)
+        trace.span("diff.autocmd_cursor_moved", buf, nil, function()
+          M._normalize_status_cursor(buf)
         end)
       end,
     })
@@ -506,7 +514,7 @@ function M.open_diff_buffer(filename)
       if vim.api.nvim_buf_is_valid(buf) then
         pcall(vim.api.nvim_buf_delete, buf, { force = true })
       end
-      dr()._cleanup_diff_buffers()
+      state().cleanup_diff_buffers()
     end, vim.tbl_extend("force", kopts, { desc = "Close DiffReview", nowait = true }))
 
 
@@ -539,7 +547,7 @@ function M.open_diff_buffer(filename)
       if not target_file then return end
 
       -- Leaving the diff preview for the real file: restore its number column.
-      dr()._restore_line_numbers(vim.api.nvim_get_current_win())
+      window_options.restore(vim.api.nvim_get_current_win())
 
       -- Save cursor as hunk-relative position so we can restore after re-render.
       -- Store: { hunk_index, offset_within_hunk, col, hunk_header }
@@ -697,7 +705,7 @@ function M.open_diff_buffer(filename)
           end
         end
       end
-      dr().stage_patch_async(patch, function(ok)
+      git_data().stage_patch_async(patch, function(ok)
         if not ok then return end
         notify_debug("Hunk staged")
         local win = vim.api.nvim_get_current_win()
@@ -719,7 +727,7 @@ function M.open_diff_buffer(filename)
         end
         -- Re-render this file's diff buffer so the staged hunk folds in place.
         if filename then
-          dr().refresh_open_diff_buffer(filename)
+          M.refresh_open_diff_buffer(filename)
         end
         goto_next()
         -- The async list refresh re-renders the buffer (resetting the
@@ -735,7 +743,7 @@ function M.open_diff_buffer(filename)
         vim.notify("No hunk under cursor", vim.log.levels.WARN)
         return
       end
-      dr().unstage_patch_async(patch, function(ok)
+      git_data().unstage_patch_async(patch, function(ok)
         if not ok then return end
         notify_debug("Hunk unstaged")
         local win = vim.api.nvim_get_current_win()
@@ -767,7 +775,7 @@ function M.open_diff_buffer(filename)
         end
         -- Re-render this file's diff buffer so the hunk expands in place.
         if filename then
-          dr().refresh_open_diff_buffer(filename)
+          M.refresh_open_diff_buffer(filename)
         end
         stay()
         -- The async list refresh re-renders the buffer (resetting the
@@ -790,7 +798,7 @@ function M.open_diff_buffer(filename)
           found = true
           h.folded = not h.folded
           notify_debug("Hunk " .. i .. " folded=" .. tostring(h.folded) .. " range=" .. h.start_line .. "-" .. h.end_line)
-          dr()._render_with_folds(buf)
+          M._render_with_folds(buf)
           pcall(vim.api.nvim_win_set_cursor, 0, { h.start_line, 0 })
           return
         end
@@ -815,7 +823,7 @@ end
 ---@param diff_text string
 ---@return table[]
 function M._compute_hunk_map(diff_text)
-  local raw_hunks = dr()._parse_diff(diff_text, false)
+  local raw_hunks = git_data()._parse_diff(diff_text, false)
   local rendered_line = 0
   local hunk_map = {}
   for _, h in ipairs(raw_hunks) do
@@ -902,13 +910,13 @@ function M._refresh_diff_buffer(buf, filename)
     -- _render_with_folds is a no-op (no window shows the buffer yet), so the
     -- staged-hunk folds must be applied once the buffer becomes visible.
     if session.buf_last_rendered[buf] == diff_text and buf_hunks[buf] then
-      dr()._render_with_folds(buf)
+      M._render_with_folds(buf)
       return
     end
     session.buf_last_rendered[buf] = diff_text
 
     diff_render.render_fancy_diff(buf, diff_text, staged_flags, filename)
-    local hunk_map = dr()._compute_hunk_map(diff_text)
+    local hunk_map = M._compute_hunk_map(diff_text)
     -- Auto-fold staged hunks
     if staged_flags then
       for i, h in ipairs(hunk_map) do
@@ -919,14 +927,14 @@ function M._refresh_diff_buffer(buf, filename)
     end
     buf_hunks[buf] = hunk_map
     -- Highlight @@ header lines with subtle gray background
-    vim.api.nvim_buf_clear_namespace(buf, dr()._hunk_header_ns, 0, -1)
+    vim.api.nvim_buf_clear_namespace(buf, ui.hunk_header_ns, 0, -1)
     for _, h in ipairs(hunk_map) do
-      pcall(vim.api.nvim_buf_set_extmark, buf, dr()._hunk_header_ns, h.start_line - 1, 0, {
+      pcall(vim.api.nvim_buf_set_extmark, buf, ui.hunk_header_ns, h.start_line - 1, 0, {
         line_hl_group = "DiffReviewHunkHeader",
-        priority = dr()._hunk_header_priority,
+        priority = ui.hunk_header_priority,
       })
     end
-    dr()._render_with_folds(buf)
+    M._render_with_folds(buf)
   else
     vim.bo[buf].modifiable = true
     local message = diff_text == false and "No textual diff" or "No changes"
@@ -935,8 +943,8 @@ function M._refresh_diff_buffer(buf, filename)
     buf_hunks[buf] = {}
     if session.empty_diff_rows then session.empty_diff_rows[buf] = nil end
     if session.diff_line_content_lengths then session.diff_line_content_lengths[buf] = nil end
-    vim.api.nvim_buf_clear_namespace(buf, dr()._hunk_header_ns, 0, -1)
-    vim.api.nvim_buf_clear_namespace(buf, dr()._active_hunk_header_ns, 0, -1)
+    vim.api.nvim_buf_clear_namespace(buf, ui.hunk_header_ns, 0, -1)
+    vim.api.nvim_buf_clear_namespace(buf, ui.active_hunk_header_ns, 0, -1)
   end
 end
 
@@ -944,7 +952,7 @@ end
 ---@param item_diff string?
 ---@return table?
 function M._highlight_active_hunk(buf, item_diff)
-  vim.api.nvim_buf_clear_namespace(buf, dr()._active_hunk_header_ns, 0, -1)
+  vim.api.nvim_buf_clear_namespace(buf, ui.active_hunk_header_ns, 0, -1)
   if not item_diff then return nil end
 
   local hunks = buf_hunks[buf]
@@ -952,9 +960,9 @@ function M._highlight_active_hunk(buf, item_diff)
 
   for _, hunk in ipairs(hunks) do
     if hunk.diff == item_diff then
-      pcall(vim.api.nvim_buf_set_extmark, buf, dr()._active_hunk_header_ns, hunk.start_line - 1, 0, {
+      pcall(vim.api.nvim_buf_set_extmark, buf, ui.active_hunk_header_ns, hunk.start_line - 1, 0, {
         line_hl_group = "DiffReviewActiveHunkHeader",
-        priority = dr()._active_hunk_header_priority,
+        priority = ui.active_hunk_header_priority,
       })
       return hunk
     end
@@ -973,7 +981,7 @@ function M._update_file_diff_cache_async(filename, cb)
   -- and doesn't re-run this on every cursor move.
   local relpath = session.untracked and session.untracked[filename]
   if relpath then
-    local diff_text = dr()._build_untracked_diff(filename, relpath)
+    local diff_text = git_data()._build_untracked_diff(filename, relpath)
     -- Cache `false` (not nil) as a "checked, no diff" sentinel; cast to satisfy the
     -- string-valued field type while preserving the boolean sentinel at runtime.
     session.file_diffs[filename] = diff_text or false
@@ -986,7 +994,7 @@ function M._update_file_diff_cache_async(filename, cb)
       if cb then cb() end
       return
     end
-    dr()._file_diff_and_flags_async(cwd, filename, function(diff_text, flags)
+    git_data()._file_diff_and_flags_async(cwd, filename, function(diff_text, flags)
       session.file_diffs[filename] = diff_text or false
       session.file_hunk_staged[filename] = flags
       if cb then cb() end
@@ -1004,10 +1012,10 @@ function M.refresh_open_diff_buffer(filename)
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
 
   -- Re-fetch diff data for this file only (cache is stale after staging)
-  dr()._update_file_diff_cache_async(filename, function()
+  M._update_file_diff_cache_async(filename, function()
     if not vim.api.nvim_buf_is_valid(buf) then return end
     session.buf_last_rendered[buf] = nil  -- force re-render
-    dr()._refresh_diff_buffer(buf, filename)
+    M._refresh_diff_buffer(buf, filename)
   end)
 end
 

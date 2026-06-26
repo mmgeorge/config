@@ -2,18 +2,30 @@
 --- render_status, the PR-detail and PR-diff render passes, the per-view after-render hooks,
 --- and the cursor-target and untracked-hunk helpers those render passes depend on.
 ---
---- Reads live status state, the sibling helper/state/pr seams, and the perf/debug spans through
---- the init module via dr(); uses the git backend, gh integration, and status_render as direct requires.
+--- Reads live status state, the sibling helper/state/pr seams, and the perf/debug spans via session.lua and direct requires; uses the git backend, gh integration, and status_render as direct requires.
 
 local git_backend = require("diff_review.git.git_backend")
 local gh = require("diff_review.integrations.gh")
-local status_render = require("diff_review.views.status.status_render")
-
---- Resolve the init module lazily so render passes can reach orchestrator state, the build/load/
---- reconcile helpers, and the open/render seams without a load-time circular require.
-local function dr()
-  return require("diff_review")
-end
+-- status_render edge kept lazy to avoid a load-time cycle.
+local function status_render() return require("diff_review.views.status.status_render") end
+local status_debug = require("diff_review.views.status.status_debug")
+local pr_edit = require("diff_review.views.pr.pr_edit")
+-- review edge kept lazy to avoid a load-time cycle.
+local function review() return require("diff_review.views.pr.review") end
+local status_issues = require("diff_review.views.status.status_issues")
+local state = require("diff_review.views.status.state")
+local pr_overview = require("diff_review.views.pr.pr_overview")
+local actions = require("diff_review.views.status.actions")
+local git_data = require("diff_review.git.git_data")
+local section_builder = require("diff_review.views.status.section_builder")
+local pr_state = require("diff_review.views.status.pr_state")
+local status_head = require("diff_review.views.status.status_head")
+local section_map = require("diff_review.views.status.section_map")
+local entry_nav = require("diff_review.views.status.entry_nav")
+local fold_state = require("diff_review.views.status.fold_state")
+local status_helpers = require("diff_review.views.status.status_helpers")
+local notifications = require("diff_review.infra.notifications")
+local trace = require("diff_review.infra.perf_trace")
 local session = require("diff_review.session")
 
 local M = {}
@@ -37,7 +49,7 @@ end
 ---@param file DiffReviewStatusFile
 ---@return DiffReviewHunk[]
 local function diff_hunks_for_file(file)
-  return dr()._status_perf_span("status.diff_hunks_for_file", session.status and session.status.buf or nil, {
+  return trace.span("status.diff_hunks_for_file", session.status and session.status.buf or nil, {
     file = file and file.filename or nil,
     relpath = file and file.relpath or nil,
     existing_hunk_count = file and file.hunks and #file.hunks or nil,
@@ -47,11 +59,11 @@ local function diff_hunks_for_file(file)
     if not file.untracked then return {} end
 
     local relpath = session.untracked and session.untracked[file.filename]
-    local diff_text = relpath and dr()._build_untracked_diff(file.filename, relpath) or nil
+    local diff_text = relpath and git_data._build_untracked_diff(file.filename, relpath) or nil
     if not diff_text then return {} end
 
     local hunks = {}
-    for _, parsed_hunk in ipairs(dr()._parse_diff(diff_text, false)) do
+    for _, parsed_hunk in ipairs(git_data._parse_diff(diff_text, false)) do
       hunks[#hunks + 1] = {
         filename = file.filename,
         section_name = file.section_name,
@@ -79,41 +91,41 @@ end
 --- Run the PR overview view's after-render work (its view controller's after_render hook).
 ---@param buf integer
 local function after_render_pr(buf)
-  dr()._status_perf_span("status.after_render.pr_edit_on_render", buf, nil, function() dr()._pr_edit.on_render(buf) end)
-  dr()._status_perf_span("status.after_render.review_on_render", buf, nil, function() dr()._review.on_render(buf) end)
-  dr()._status_perf_span("status.after_render.markdown", buf, nil, function() dr()._pr_edit.render_markdown_regions(buf) end)
-  dr()._status_perf_span("status.after_render.native_folds", buf, nil, function() dr()._status_apply_native_folds(buf) end)
-  dr()._status_perf_span("status.after_render.pr_sync_modifiable", buf, nil, function() dr()._pr_edit.sync_modifiable(buf) end)
-  dr()._status_perf_span("status.after_render.schedule_native_folds", buf, nil, function() dr()._status_schedule_native_folds(buf) end)
+  trace.span("status.after_render.pr_edit_on_render", buf, nil, function() pr_edit.on_render(buf) end)
+  trace.span("status.after_render.review_on_render", buf, nil, function() review().on_render(buf) end)
+  trace.span("status.after_render.markdown", buf, nil, function() pr_edit.render_markdown_regions(buf) end)
+  trace.span("status.after_render.native_folds", buf, nil, function() fold_state._status_apply_native_folds(buf) end)
+  trace.span("status.after_render.pr_sync_modifiable", buf, nil, function() pr_edit.sync_modifiable(buf) end)
+  trace.span("status.after_render.schedule_native_folds", buf, nil, function() fold_state._status_schedule_native_folds(buf) end)
 end
 
 --- Run the PR review view's after-render work.
 ---@param buf integer
 local function after_render_review(buf)
-  dr()._status_perf_span("status.after_render.review_on_render", buf, nil, function() dr()._review.on_render(buf) end)
-  dr()._status_perf_span("status.after_render.markdown", buf, nil, function() dr()._pr_edit.render_markdown_regions(buf) end)
-  dr()._status_perf_span("status.after_render.native_folds", buf, nil, function() dr()._status_apply_native_folds(buf) end)
-  dr()._status_perf_span("status.after_render.review_sync_modifiable", buf, nil, function() dr()._review.sync_modifiable(buf) end)
-  dr()._status_perf_span("status.after_render.schedule_native_folds", buf, nil, function() dr()._status_schedule_native_folds(buf) end)
+  trace.span("status.after_render.review_on_render", buf, nil, function() review().on_render(buf) end)
+  trace.span("status.after_render.markdown", buf, nil, function() pr_edit.render_markdown_regions(buf) end)
+  trace.span("status.after_render.native_folds", buf, nil, function() fold_state._status_apply_native_folds(buf) end)
+  trace.span("status.after_render.review_sync_modifiable", buf, nil, function() review().sync_modifiable(buf) end)
+  trace.span("status.after_render.schedule_native_folds", buf, nil, function() fold_state._status_schedule_native_folds(buf) end)
 end
 
 --- Run the GitStatus view's after-render work.
 ---@param buf integer
 local function after_render_status(buf)
-  dr()._status_perf_span("status.after_render.stop_markdown", buf, nil, function() stop_markdown_highlighter(buf) end)
-  dr()._status_perf_span("status.after_render.native_folds", buf, nil, function() dr()._status_apply_native_folds(buf) end)
-  dr()._status_perf_span("status.after_render.issues_sync_modifiable", buf, nil, function() dr()._status_issues.sync_modifiable(buf) end)
+  trace.span("status.after_render.stop_markdown", buf, nil, function() stop_markdown_highlighter(buf) end)
+  trace.span("status.after_render.native_folds", buf, nil, function() fold_state._status_apply_native_folds(buf) end)
+  trace.span("status.after_render.issues_sync_modifiable", buf, nil, function() status_issues.sync_modifiable(buf) end)
 end
 
 --- Run the after-render work for branch diff and any other status-like view.
 ---@param buf integer
 local function after_render_default(buf)
-  dr()._status_perf_span("status.after_render.native_folds", buf, nil, function() dr()._status_apply_native_folds(buf) end)
+  trace.span("status.after_render.native_folds", buf, nil, function() fold_state._status_apply_native_folds(buf) end)
 end
 
 function M.render_status(buf, target_id, fallback_line, opts)
   opts = opts or {}
-  dr()._setup_bg_highlights()
+  status_helpers.setup_bg_highlights()
   if session.states and session.states[buf] then
     session.status = session.states[buf]
   end
@@ -127,7 +139,7 @@ function M.render_status(buf, target_id, fallback_line, opts)
     if preserve_current_cursor then
       target_id, fallback_line = cursor_target(buf)
     end
-    status_render.status_render_loaded(buf, target_id, fallback_line, opts, session.status.head_lines, session.status.sections)
+    status_render().status_render_loaded(buf, target_id, fallback_line, opts, session.status.head_lines, session.status.sections)
     return
   end
 
@@ -135,7 +147,7 @@ function M.render_status(buf, target_id, fallback_line, opts)
   local request_id = session.status.request_id
   local has_existing_view = session.status.head_lines ~= nil or session.status.sections ~= nil
   if not has_existing_view then
-    dr()._status_set_plain_lines(buf, { "Loading DiffReview..." })
+    entry_nav._status_set_plain_lines(buf, { "Loading DiffReview..." })
   end
 
   git_backend.git_root_async(function(cwd, root_err)
@@ -143,34 +155,34 @@ function M.render_status(buf, target_id, fallback_line, opts)
     if not (latest_status and latest_status.request_id == request_id) then return end
     session.status = latest_status
     if not cwd then
-      dr()._notify_error(root_err or "Unable to find git root")
+      notifications.error(root_err or "Unable to find git root")
       if not has_existing_view then
-        dr()._status_set_plain_lines(buf, { "Not a git repository" })
+        entry_nav._status_set_plain_lines(buf, { "Not a git repository" })
       end
       return
     end
 
     latest_status.cwd = cwd
-    dr()._status_issues.ensure_state(latest_status, cwd)
-    local pr_request_id = dr()._status_ensure_pr_state(cwd, buf, opts.refresh_pr)
+    status_issues.ensure_state(latest_status, cwd)
+    local pr_request_id = pr_state.status_ensure_pr_state(cwd, buf, opts.refresh_pr)
 
-    dr()._status_load_async(cwd, function(result)
+    section_map._status_load_async(cwd, function(result)
       local current_status = session.states and session.states[buf] or render_state
       if not (current_status and current_status.request_id == request_id) then return end
       session.status = current_status
       if not vim.api.nvim_buf_is_valid(buf) then return end
-      if dr()._status_operations_pending() then
-        dr()._status_request_reconcile(buf, target_id)
+      if actions._status_operations_pending() then
+        actions._status_request_reconcile(buf, target_id)
         return
       end
       if opts.restore_initial_folds then
-        dr()._status_restore_initial_folds(result.sections)
-        target_id = dr()._status_first_grouping_id(result.sections)
+        state.restore_initial_folds(result.sections)
+        target_id = state.first_grouping_id(result.sections)
         fallback_line = nil
       end
-      dr()._status_ensure_about_state(cwd, buf, dr()._status_has_changes(result.sections), opts.refresh_about)
-      dr()._status_issues.ensure_state(current_status, cwd)
-      result.head_lines = dr()._status_build_head_lines(
+      pr_state.status_ensure_about_state(cwd, buf, pr_state.status_has_changes(result.sections), opts.refresh_about)
+      status_issues.ensure_state(current_status, cwd)
+      result.head_lines = status_head._status_build_head_lines(
         result.head_values or {},
         current_status.pr,
         current_status.about,
@@ -183,7 +195,7 @@ function M.render_status(buf, target_id, fallback_line, opts)
       if preserve_current_cursor and not opts.restore_initial_folds then
         target_id, fallback_line = cursor_target(buf)
       end
-      status_render.status_render_loaded(buf, target_id, fallback_line, opts, result.head_lines, result.sections)
+      status_render().status_render_loaded(buf, target_id, fallback_line, opts, result.head_lines, result.sections)
       vim.schedule(function()
         local metadata_status = session.states and session.states[buf] or render_state
         if not (
@@ -192,11 +204,11 @@ function M.render_status(buf, target_id, fallback_line, opts)
           and metadata_status.cwd == cwd
           and vim.api.nvim_buf_is_valid(buf)
         ) then return end
-        dr().github_load_repo_metadata(cwd, require("github.repo_cache").repo_for_cwd(cwd))
+        status_head.github_load_repo_metadata(cwd, require("github.repo_cache").repo_for_cwd(cwd))
       end)
       if pr_request_id then
         vim.defer_fn(function()
-          dr()._status_start_pr_lookup(cwd, buf, pr_request_id)
+          pr_state.status_start_pr_lookup(cwd, buf, pr_request_id)
         end, 50)
       end
     end)
@@ -212,7 +224,7 @@ local function render_status_or_notify(buf, target_id, fallback_line, opts)
     M.render_status(buf, target_id, fallback_line, opts)
   end, debug.traceback)
   if not ok then
-    dr()._notify_error("DiffReview render failed: " .. tostring(err))
+    notifications.error("DiffReview render failed: " .. tostring(err))
   end
 end
 
@@ -223,9 +235,9 @@ end
 local function render_pr_status(pr, cwd, buf, diff_text)
   local status = session.status
   if not (status and status.buf == buf) then return end
-  if dr()._pr_edit.blocks_render(buf) then return end
+  if pr_edit.blocks_render(buf) then return end
   diff_text = diff_text or status.pr_diff_text
-  dr()._gitstatus_debug.event("render_pr_status.start", {
+  status_debug.event("render_pr_status.start", {
     buf = buf,
     cwd = cwd,
     pr_number = pr and pr.number or nil,
@@ -237,25 +249,25 @@ local function render_pr_status(pr, cwd, buf, diff_text)
   })
   status.pr_standalone_comments = status.pr_standalone_comments or {}
   status.pr_regular_comments = status.pr_regular_comments or {}
-  dr()._pr_overview.refresh_editable_comments(status)
-  status.head_lines = dr()._status_pr_detail_head_lines(pr, status)
-  status.sections = dr()._status_pr_sections(cwd, pr, diff_text, status.pr_comments, status.pr_standalone_comments, status.pr_regular_comments)
+  pr_overview.refresh_editable_comments(status)
+  status.head_lines = status_head._status_pr_detail_head_lines(pr, status)
+  status.sections = section_map._status_pr_sections(cwd, pr, diff_text, status.pr_comments, status.pr_standalone_comments, status.pr_regular_comments)
   local section_file_count = 0
   for _, section in ipairs(status.sections or {}) do
     section_file_count = section_file_count + #(section.files or {})
   end
-  dr()._gitstatus_debug.event("render_pr_status.sections", {
+  status_debug.event("render_pr_status.sections", {
     buf = buf,
     pr_number = pr and pr.number or nil,
     section_count = status.sections and #status.sections or nil,
     file_count = section_file_count,
   })
   status.fancy_rows = {}
-  status.pr_code_comments_by_anchor = dr()._section_builder.comment_anchor_index_from_sections(status.sections, { field = "pr_comments" })
+  status.pr_code_comments_by_anchor = section_builder.comment_anchor_index_from_sections(status.sections, { field = "pr_comments" })
   status.review_after_row = function(diff_line, indent)
-    dr()._section_builder.emit_anchored_comments(status, diff_line, indent, { index_field = "pr_code_comments_by_anchor" })
+    section_builder.emit_anchored_comments(status, diff_line, indent, { index_field = "pr_code_comments_by_anchor" })
   end
-  status_render.status_render_loaded(buf, nil, nil, { reuse_sections = true }, status.head_lines, status.sections)
+  status_render().status_render_loaded(buf, nil, nil, { reuse_sections = true }, status.head_lines, status.sections)
 end
 
 ---@param pr DiffReviewGhPR
@@ -266,7 +278,7 @@ local function load_pr_diff(pr, cwd, buf)
   if not (status and status.buf == buf) then return end
   status.pr_diff_request_id = (status.pr_diff_request_id or 0) + 1
   local request_id = status.pr_diff_request_id
-  dr()._gitstatus_debug.event("load_pr_diff.start", {
+  status_debug.event("load_pr_diff.start", {
     buf = buf,
     cwd = cwd,
     request_id = request_id,
@@ -282,7 +294,7 @@ local function load_pr_diff(pr, cwd, buf)
       and vim.api.nvim_buf_is_valid(buf)
     ) then return end
     session.status = latest_status
-    dr()._gitstatus_debug.event("load_pr_diff.done", {
+    status_debug.event("load_pr_diff.done", {
       buf = buf,
       cwd = cwd,
       request_id = request_id,
@@ -295,7 +307,7 @@ local function load_pr_diff(pr, cwd, buf)
       output = result and result.code ~= 0 and result.output or nil,
     })
     if result.code ~= 0 then
-      dr()._notify_error("GitHub PR diff failed: " .. (result.output ~= "" and result.output or ("gh exited " .. result.code)), "DiffReview")
+      notifications.error("GitHub PR diff failed: " .. (result.output ~= "" and result.output or ("gh exited " .. result.code)), "DiffReview")
       return
     end
     latest_status.pr_diff_text = result.stdout or ""

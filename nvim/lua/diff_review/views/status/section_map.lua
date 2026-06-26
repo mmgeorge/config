@@ -3,18 +3,26 @@
 --- hunk append, optimistic stage/unstage moves, and reindexing).
 ---
 --- Reads the diff parser, git collector, section order/index, fold state, key builders, and the
---- pr_overview/section_builder modules through the init module via dr().
+--- pr_overview/section_builder modules via direct requires.
 
 local git_backend = require("diff_review.git.git_backend")
 
---- Resolve the init module lazily so section assembly can reach the shared parse/collect/order/fold
---- seams without a load-time circular require.
-local function dr()
-  return require("diff_review")
-end
+local pr_overview = require("diff_review.views.pr.pr_overview")
+local git_data = require("diff_review.git.git_data")
+local section_builder = require("diff_review.views.status.section_builder")
+local status_keys = require("diff_review.views.status.status_keys")
+local status_head = require("diff_review.views.status.status_head")
 local session = require("diff_review.session")
 
 local M = {}
+
+--- Ordered status sections (unstaged before staged). Owned here, the sole consumer; previously
+--- parked on the init table as M._status_section_order during the monolith era.
+---@type DiffReviewSectionConfig[]
+local status_section_order = {
+  { name = "unstaged", title = "Unstaged changes", default_folded = false },
+  { name = "staged", title = "Staged changes", default_folded = false },
+}
 
 local function status_section_for_item(item)
   local data = item.item or {}
@@ -46,13 +54,13 @@ function M._status_sort_section_files(buf, section)
   if not (section and type(section.files) == "table") then return end
   local ranks = {}
   for _, file in ipairs(section.files) do
-    ranks[file] = dr()._status_walkthrough_file_rank(buf, file) or math.huge
+    ranks[file] = M._status_walkthrough_file_rank(buf, file) or math.huge
   end
   table.sort(section.files, function(left_file, right_file)
     local left_rank = ranks[left_file] or math.huge
     local right_rank = ranks[right_file] or math.huge
     if left_rank ~= right_rank then return left_rank < right_rank end
-    return dr()._status_file_path_sort_key(left_file) < dr()._status_file_path_sort_key(right_file)
+    return M._status_file_path_sort_key(left_file) < M._status_file_path_sort_key(right_file)
   end)
 end
 
@@ -60,7 +68,7 @@ end
 ---@param sections DiffReviewStatusSection[]
 function M._status_sort_sections_for_render(buf, sections)
   for _, section in ipairs(sections or {}) do
-    dr()._status_sort_section_files(buf, section)
+    M._status_sort_section_files(buf, section)
   end
 end
 
@@ -68,7 +76,7 @@ end
 ---@return DiffReviewStatusSection[]
 local function status_sections_from_items(collected_items)
   local sections = {} ---@type table<string, DiffReviewStatusSection>
-  for _, section_config in ipairs(dr()._status_section_order) do
+  for _, section_config in ipairs(status_section_order) do
     sections[section_config.name] = {
       name = section_config.name,
       title = section_config.title,
@@ -127,9 +135,9 @@ local function status_sections_from_items(collected_items)
   end
 
   local ordered = {} ---@type DiffReviewStatusSection[]
-  for _, section_config in ipairs(dr()._status_section_order) do
+  for _, section_config in ipairs(status_section_order) do
     local section = sections[section_config.name]
-    dr()._status_sort_section_files(session.status and session.status.buf or nil, section)
+    M._status_sort_section_files(session.status and session.status.buf or nil, section)
     for _, file in ipairs(section.files) do
       table.sort(file.hunks, function(left_hunk, right_hunk)
         return (left_hunk.pos or 0) < (right_hunk.pos or 0)
@@ -242,7 +250,7 @@ end
 local function status_files_from_diff_provider(cwd, provider, diff_text)
   local files_by_name = {} ---@type table<string, DiffReviewStatusFile>
   local files_with_provider_stats = {} ---@type table<string, boolean>
-  local diff_file_statuses = dr()._diff_file_statuses(diff_text or "")
+  local diff_file_statuses = M._diff_file_statuses(diff_text or "")
   local files = {} ---@type DiffReviewStatusFile[]
 
   local function ensure_file(relpath, stats)
@@ -287,7 +295,7 @@ local function status_files_from_diff_provider(cwd, provider, diff_text)
     ensure_file(relpath, nil)
   end
 
-  for _, parsed_hunk in ipairs(dr()._parse_diff(diff_text or "", false)) do
+  for _, parsed_hunk in ipairs(git_data._parse_diff(diff_text or "", false)) do
     local file = ensure_file(parsed_hunk.file, nil)
     if not files_with_provider_stats[file.filename] then
       file.added = file.added + (parsed_hunk.added or 0)
@@ -324,7 +332,7 @@ end
 ---@return DiffReviewStatusFile[]
 local function status_commit_files_from_diff(cwd, commit, diff_text)
   return status_files_from_diff_provider(cwd, {
-    section_name = dr()._status_keys.commit_key(commit.oid),
+    section_name = status_keys.commit_key(commit.oid),
     default_status = "modified",
   }, diff_text)
 end
@@ -358,7 +366,7 @@ end
 ---@return DiffReviewStatusSection[]
 local function status_pr_sections(cwd, pr, diff_text, comments, local_comments, local_issue_comments)
   local provider_key = "pr:" .. tostring(pr.number)
-  local change_sections, files = dr()._section_builder.sections_from_diff(cwd, {
+  local change_sections, files = section_builder.sections_from_diff(cwd, {
     title = "Changes",
     section_name = provider_key .. ":changes",
     default_status = "",
@@ -371,22 +379,22 @@ local function status_pr_sections(cwd, pr, diff_text, comments, local_comments, 
   local code_comments = {}
   local local_comment_keys = {}
   for _, comment in ipairs(local_comments or {}) do
-    local key = dr()._pr_overview.comment_identity_key(comment)
+    local key = pr_overview.comment_identity_key(comment)
     if key then local_comment_keys[key] = true end
   end
   for _, comment in ipairs(comments and comments.code_comments or {}) do
-    local key = dr()._pr_overview.comment_identity_key(comment)
+    local key = pr_overview.comment_identity_key(comment)
     if not (key and local_comment_keys[key]) then code_comments[#code_comments + 1] = comment end
   end
   vim.list_extend(code_comments, local_comments or {})
-  dr()._section_builder.attach_comments(cwd, files, code_comments, { field = "pr_comments" })
+  section_builder.attach_comments(cwd, files, code_comments, { field = "pr_comments" })
   local sections = {}
-  local reviews_section = dr()._pr_overview.reviews_section(comments)
+  local reviews_section = pr_overview.reviews_section(comments)
   if reviews_section then sections[#sections + 1] = reviews_section end
-  local issue_comments_section = dr()._pr_overview.issue_comments_section(comments, local_issue_comments)
+  local issue_comments_section = pr_overview.issue_comments_section(comments, local_issue_comments)
   if issue_comments_section then sections[#sections + 1] = issue_comments_section end
   vim.list_extend(sections, change_sections)
-  local commits_section = dr()._pr_overview.commits_section(pr)
+  local commits_section = pr_overview.commits_section(pr)
   if commits_section then sections[#sections + 1] = commits_section end
   return sections
 end
@@ -507,7 +515,7 @@ end
 ---@return table<DiffReviewStatusSectionName, DiffReviewStatusSection>
 local function status_empty_section_map()
   local sections = {}
-  for _, section_config in ipairs(dr()._status_section_order) do
+  for _, section_config in ipairs(status_section_order) do
     sections[section_config.name] = {
       name = section_config.name,
       title = section_config.title,
@@ -564,9 +572,9 @@ end
 ---@return DiffReviewStatusSection[]
 local function status_order_section_map(section_map)
   local ordered = {}
-  for _, section_config in ipairs(dr()._status_section_order) do
+  for _, section_config in ipairs(status_section_order) do
     local section = section_map[section_config.name]
-    dr()._status_sort_section_files(session.status and session.status.buf or nil, section)
+    M._status_sort_section_files(session.status and session.status.buf or nil, section)
     for _, file in ipairs(section.files) do
       file.section_name = section.name
       file.untracked = section.name ~= "staged" and file.untracked == true
@@ -587,11 +595,11 @@ local function status_order_section_map(section_map)
     status_reindex_section(section)
     if #section.files > 0 then ordered[#ordered + 1] = section end
   end
-  if section_map.unmerged and #(section_map.unmerged.commits or {}) > 0 then
-    ordered[#ordered + 1] = section_map.unmerged
+  if M.unmerged and #(M.unmerged.commits or {}) > 0 then
+    ordered[#ordered + 1] = M.unmerged
   end
-  if section_map.recent and #(section_map.recent.commits or {}) > 0 then
-    ordered[#ordered + 1] = section_map.recent
+  if M.recent and #(M.recent.commits or {}) > 0 then
+    ordered[#ordered + 1] = M.recent
   end
   return ordered
 end
@@ -750,7 +758,7 @@ local function status_load_async(cwd, cb)
     cb({ head_lines = head_lines, head_values = head_values or {}, sections = ordered_sections })
   end
 
-  dr()._status_head_lines_async(cwd, function(lines, values)
+  status_head._status_head_lines_async(cwd, function(lines, values)
     head_lines = lines
     head_values = values
     status_unmerged_section_async(cwd, values.upstream, values.branch, function(section)
@@ -765,7 +773,7 @@ local function status_load_async(cwd, cb)
     end)
     maybe_done()
   end)
-  dr()._collect_items_from_git(cwd, function(items)
+  git_data._collect_items_from_git(cwd, function(items)
     sections = status_sections_from_items(items or {})
     maybe_done()
   end, { skip_pre_render = true, skip_ts_context = true })

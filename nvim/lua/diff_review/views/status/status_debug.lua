@@ -2,7 +2,8 @@
 --- timer that feeds the debug log, and the row/extmark/syntax inspection dump. Dev-only — the hot
 --- path reaches it only when debug logging is enabled.
 ---
---- Reads live status state, namespaces, and the perf module through the init module via dr().
+--- Reads live status state and namespaces from session.lua and the perf module directly, and the
+--- init-owned gitstatus-debug flags via require("diff_review") (the one intentional residual seam).
 
 local config = require("diff_review.infra.config")
 
@@ -11,10 +12,16 @@ local config = require("diff_review.infra.config")
 local function dr()
   return require("diff_review")
 end
+local notifications = require("diff_review.infra.notifications")
+local ui = require("diff_review.infra.ui")
 local session = require("diff_review.session")
 local syntax_engine = require("diff_review.render.syntax_engine")
+local perf_trace = require("diff_review.infra.perf_trace")
 
 local M = {}
+
+-- Register this module as the perf_trace debug sink so spans and events also reach the dev perf log.
+perf_trace.set_debug_sink(M)
 
 function M.enabled()
   local global_enabled = vim.g.diff_review_gitstatus_debug
@@ -47,12 +54,12 @@ function M.event(event, payload)
   )
   local ok, err = pcall(vim.fn.writefile, { line }, dr()._gitstatus_debug_log_path(), "a")
   if not ok then
-    dr()._notify_debug("GitStatus debug event failed: " .. tostring(err), vim.log.levels.WARN, { title = "GitStatus" })
+    notifications.debug("GitStatus debug event failed: " .. tostring(err), vim.log.levels.WARN, { title = "GitStatus" })
   end
 end
 
 function M.perf_enabled()
-  local options = dr().config or config.options or config.defaults
+  local options = config.options or config.options or config.defaults
   local global_enabled = vim.g.diff_review_gitstatus_perf
   return dr()._gitstatus_debug_perf_force == true
     or dr()._gitstatus_debug_perf_enabled == true
@@ -87,7 +94,7 @@ function M.flush_perf()
   local function report_error(err)
     if not err then return end
     pcall(vim.schedule, function()
-      dr()._notify_debug("GitStatus perf log failed: " .. tostring(err), vim.log.levels.WARN, { title = "GitStatus" })
+      notifications.debug("GitStatus perf log failed: " .. tostring(err), vim.log.levels.WARN, { title = "GitStatus" })
     end)
   end
   if uv and uv.fs_open and uv.fs_write and uv.fs_close then
@@ -106,7 +113,7 @@ function M.flush_perf()
   end
   local ok, err = pcall(vim.fn.writefile, lines, dr()._gitstatus_debug_log_path(), "a")
   if not ok then
-    dr()._notify_debug("GitStatus perf log failed: " .. tostring(err), vim.log.levels.WARN, { title = "GitStatus" })
+    notifications.debug("GitStatus perf log failed: " .. tostring(err), vim.log.levels.WARN, { title = "GitStatus" })
   end
 end
 
@@ -333,13 +340,13 @@ function M.file_syntax(state, filename)
     if file_entry then break end
   end
   if file_entry then
-    local diff_text = dr()._status_file_syntax_diff_text(file_entry)
+    local diff_text = syntax_engine.status_file_syntax_diff_text(file_entry)
     lines[#lines + 1] = "    combined_diff_len=" .. tostring(diff_text and #diff_text or 0)
-    lines[#lines + 1] = "    new_side_matches_file=" .. tostring(diff_text and dr()._diff_new_side_matches_file(filename, diff_text) or nil)
+    lines[#lines + 1] = "    new_side_matches_file=" .. tostring(diff_text and syntax_engine.diff_new_side_matches_file(filename, diff_text) or nil)
   else
     lines[#lines + 1] = "    status_file=<not-found>"
   end
-  local source_lines = dr()._file_source_lines(filename)
+  local source_lines = syntax_engine.file_source_lines(filename)
   lines[#lines + 1] = "    source_lines=" .. tostring(source_lines and #source_lines or nil)
   lines[#lines + 1] = "    file_syntax_cache=" .. M.cache_state(syntax_engine.file_syntax_cache_entry(filename))
   return lines
@@ -432,7 +439,7 @@ function M.dump(buf, reason)
       local diff_line = entry and entry.diff_line or nil
       if diff_line and diff_line.code and diff_line.code:match("%S") then
         local has_treesitter = false
-        for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(buf, dr()._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })) do
+        for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(buf, ui.status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })) do
           local details = mark[4] or {}
           if type(details.hl_group) == "string" and details.hl_group:sub(1, 1) == "@" then
             has_treesitter = true
@@ -457,7 +464,7 @@ function M.dump(buf, reason)
 
     local ok, err = pcall(vim.fn.writefile, lines, dr()._gitstatus_debug_log_path(), "a")
     if not ok then
-      dr()._notify_debug("GitStatus debug dump failed: " .. tostring(err), vim.log.levels.WARN, { title = "GitStatus" })
+      notifications.debug("GitStatus debug dump failed: " .. tostring(err), vim.log.levels.WARN, { title = "GitStatus" })
     end
   end, 250)
 end

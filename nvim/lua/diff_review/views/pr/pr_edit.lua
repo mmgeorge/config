@@ -12,11 +12,19 @@ local config = require("diff_review.infra.config")
 local notifications = require("diff_review.infra.notifications")
 local region = require("diff_review.render.region")
 
---- Resolve the diff_review root module lazily, avoiding a load-time require cycle while
---- letting pr_edit reach status state, perf spans, and sibling views at call time.
-local function dr()
-  return require("diff_review")
-end
+local status_buffer = require("diff_review.views.status.status_buffer")
+-- review edge kept lazy to avoid a load-time cycle.
+local function review_mod() return require("diff_review.views.pr.review") end
+-- render_orchestrator edge kept lazy to avoid a load-time cycle.
+local function render_orchestrator() return require("diff_review.views.status.render_orchestrator") end
+-- pr_overview edge kept lazy to avoid a load-time cycle.
+local function pr_overview() return require("diff_review.views.pr.pr_overview") end
+local diff_buffer = require("diff_review.views.diff_buffer")
+-- status_head edge kept lazy to avoid a load-time cycle.
+local function status_head() return require("diff_review.views.status.status_head") end
+local status_helpers = require("diff_review.views.status.status_helpers")
+local trace = require("diff_review.infra.perf_trace")
+local ui = require("diff_review.infra.ui")
 local session = require("diff_review.session")
 
 
@@ -182,13 +190,13 @@ function M.markdown_ranges0(buf)
   local first0, after0 = M.description_range0(buf)
   add_range(first0, after0)
 
-  local state = dr()._review.state(buf)
+  local state = review_mod().state(buf)
   if state then
-    add_range(dr()._review.mark_row(buf, state.review_comment_start), dr()._review.mark_row(buf, state.review_comment_end))
+    add_range(review_mod().mark_row(buf, state.review_comment_start), review_mod().mark_row(buf, state.review_comment_end))
     for _, comment in ipairs(state.review_comments or {}) do
-      add_range(dr()._review.comment_body_range0(buf, comment))
+      add_range(review_mod().comment_body_range0(buf, comment))
       for _, range in ipairs(comment.review_markdown_ranges or {}) do
-        add_range(dr()._review.mark_row(buf, range.start_mark), dr()._review.mark_row(buf, range.end_mark))
+        add_range(review_mod().mark_row(buf, range.start_mark), review_mod().mark_row(buf, range.end_mark))
       end
     end
   end
@@ -354,27 +362,27 @@ end
 
 ---@param buf integer
 function M.render_markdown_regions(buf)
-  return dr()._status_perf_span("markdown.render_regions", buf, nil, function()
+  return trace.span("markdown.render_regions", buf, nil, function()
     if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
 
-    dr()._status_perf_span("markdown.activate_code", buf, nil, function()
+    trace.span("markdown.activate_code", buf, nil, function()
       M.activate_markdown_code(buf)
     end)
 
-    local ranges = dr()._status_perf_span("markdown.compute_ranges", buf, nil, function()
+    local ranges = trace.span("markdown.compute_ranges", buf, nil, function()
       return M.markdown_ranges0(buf)
     end)
-    dr()._status_perf_event("markdown.render_regions.ranges", buf, { ranges = #ranges })
+    trace.event("markdown.render_regions.ranges", buf, { ranges = #ranges })
     if #ranges == 0 then
-      dr()._status_perf_span("markdown.prune_empty", buf, nil, function()
+      trace.span("markdown.prune_empty", buf, nil, function()
         M.prune_markdown_ranges(buf, ranges)
-        dr()._status_stop_markdown_highlighter(buf)
+        render_orchestrator().stop_markdown_highlighter(buf)
       end)
       return
     end
 
     if M.render_markdown_unavailable then return end
-    local ok, render_markdown = dr()._status_perf_span("markdown.require_render_markdown", buf, nil, function()
+    local ok, render_markdown = trace.span("markdown.require_render_markdown", buf, nil, function()
       return pcall(require, "render-markdown")
     end)
     if not ok or type(render_markdown) ~= "table" or type(render_markdown.render) ~= "function" then
@@ -382,24 +390,24 @@ function M.render_markdown_regions(buf)
       return
     end
 
-    local win = dr()._status_perf_span("markdown.resolve_window", buf, nil, function()
+    local win = trace.span("markdown.resolve_window", buf, nil, function()
       return M.markdown_window(buf)
     end)
     if not win then return end
-    dr()._status_perf_span("markdown.reset_config", buf, { ranges = #ranges }, function()
+    trace.span("markdown.reset_config", buf, { ranges = #ranges }, function()
       M.reset_render_markdown_config(buf)
     end)
-    local restore_parser = dr()._status_perf_span("markdown.begin_parser_scope", buf, { ranges = #ranges }, function()
+    local restore_parser = trace.span("markdown.begin_parser_scope", buf, { ranges = #ranges }, function()
       return M.begin_markdown_parser_scope(buf, ranges)
     end)
-    local restore_extmarks = dr()._status_perf_span("markdown.begin_extmark_scope", buf, { ranges = #ranges }, function()
+    local restore_extmarks = trace.span("markdown.begin_extmark_scope", buf, { ranges = #ranges }, function()
       return M.begin_markdown_extmark_scope(buf, ranges)
     end)
     local function restore_scope()
       restore_extmarks()
       restore_parser()
     end
-    local config = dr()._status_perf_span("markdown.build_config", buf, { ranges = #ranges }, function()
+    local config = trace.span("markdown.build_config", buf, { ranges = #ranges }, function()
       return M.markdown_region_config(buf, win, ranges)
     end)
     local on_render = config.on.render
@@ -407,7 +415,7 @@ function M.render_markdown_regions(buf)
       if on_render then on_render(ctx) end
       restore_scope()
     end
-    local render_ok, err = dr()._status_perf_span("markdown.render_markdown_render", buf, { ranges = #ranges }, function()
+    local render_ok, err = trace.span("markdown.render_markdown_render", buf, { ranges = #ranges }, function()
       return pcall(render_markdown.render, {
         buf = buf,
         win = win,
@@ -416,13 +424,13 @@ function M.render_markdown_regions(buf)
     end)
     if render_ok then
       vim.defer_fn(function()
-        dr()._status_perf_span("markdown.prune_deferred", buf, nil, function()
+        trace.span("markdown.prune_deferred", buf, nil, function()
           M.prune_markdown_ranges(buf, M.markdown_ranges0(buf))
           restore_scope()
         end)
       end, 100)
-      dr()._status_perf_span("markdown.stop_status_highlighter", buf, nil, function()
-        dr()._status_stop_markdown_highlighter(buf)
+      trace.span("markdown.stop_status_highlighter", buf, nil, function()
+        render_orchestrator().stop_markdown_highlighter(buf)
       end)
     else
       restore_scope()
@@ -472,7 +480,7 @@ end
 function M.dirty_flags(buf, status)
   local title, desc, review, milestone = M.current_values(buf, status)
   if title == nil or not status.pr then return false, false, false, false end
-  local baseline = table.concat(dr()._status_markdown_lines(status.pr.body), "\n")
+  local baseline = table.concat(status_head()._status_markdown_lines(status.pr.body), "\n")
   return title ~= status.pr.title,
     desc ~= baseline,
     M.reviewer_change(status, review).changed,
@@ -580,7 +588,7 @@ function M.on_render(buf)
 
   -- right_gravity=false: a mark with right gravity slides to the next line
   -- when its own line is replaced (retyped), losing the region.
-  local body_count = #dr()._status_markdown_lines(status.pr.body)
+  local body_count = #status_head()._status_markdown_lines(status.pr.body)
   state.title_mark = vim.api.nvim_buf_set_extmark(buf, M.ns, title_row - 1, 0, { right_gravity = false })
   state.review_mark = vim.api.nvim_buf_set_extmark(buf, M.ns, review_row - 1, 0, { right_gravity = false })
   state.milestone_mark = vim.api.nvim_buf_set_extmark(buf, M.ns, milestone_row - 1, 0, { right_gravity = false })
@@ -596,7 +604,7 @@ end
 ---@return string
 function M.milestone_value(line)
   local value = vim.trim(tostring(line or ""):gsub("^Release:%s*", ""):gsub("^Milestone:%s*", ""))
-  value = vim.trim(value:gsub("^" .. vim.pesc(dr()._milestone_icon) .. "%s*", ""))
+  value = vim.trim(value:gsub("^" .. vim.pesc(ui.milestone_icon) .. "%s*", ""))
   return value
 end
 
@@ -604,7 +612,7 @@ end
 ---@param milestone string?
 ---@return { current: string, desired: string, changed: boolean }
 function M.milestone_change(status, milestone)
-  local current = dr()._pr_overview.milestone_title(status and status.pr or nil)
+  local current = pr_overview().milestone_title(status and status.pr or nil)
   local desired = vim.trim(tostring(milestone or ""))
   return {
     current = current,
@@ -647,7 +655,7 @@ end
 function M.reviewer_set(reviewers)
   local set = {}
   for _, reviewer in ipairs(reviewers or {}) do
-    local username = dr()._pr_overview.reviewer_login(reviewer)
+    local username = pr_overview().reviewer_login(reviewer)
     if username ~= "" then set[username:lower()] = true end
   end
   return set
@@ -657,7 +665,7 @@ end
 ---@param review string?
 ---@return { current: DiffReviewGhRequestedReviewer[], desired: string[], add: string[], remove: string[], changed: boolean }
 function M.reviewer_change(status, review)
-  local current = status and status.pr and dr()._pr_overview.pending_reviewers(status.pr, status) or {}
+  local current = status and status.pr and pr_overview().pending_reviewers(status.pr, status) or {}
   local desired = M.reviewer_usernames(review)
   local current_set = M.reviewer_set(current)
   local desired_set = M.reviewer_set(desired)
@@ -667,7 +675,7 @@ function M.reviewer_change(status, review)
     if not current_set[reviewer:lower()] then add[#add + 1] = reviewer end
   end
   for _, reviewer in ipairs(current) do
-    local username = dr()._pr_overview.reviewer_login(reviewer)
+    local username = pr_overview().reviewer_login(reviewer)
     if username ~= "" and not desired_set[username:lower()] then remove[#remove + 1] = username end
   end
   return {
@@ -697,7 +705,7 @@ function M.patch_head_field_row(buf, status, mark_id, segments, label_pattern)
     end
   end
   if not (row0 and status and status.pr and vim.api.nvim_buf_is_valid(buf)) then return end
-  local text, segment_highlights = dr()._status_segment_line_parts(segments)
+  local text, segment_highlights = status_buffer.segment_line_parts(segments)
   local was_modifiable = vim.bo[buf].modifiable
   local was_modified = vim.bo[buf].modified
   local old_text = vim.api.nvim_buf_get_lines(buf, row0, row0 + 1, false)[1] or ""
@@ -706,9 +714,9 @@ function M.patch_head_field_row(buf, status, mark_id, segments, label_pattern)
   vim.bo[buf].modifiable = was_modifiable
   vim.bo[buf].modified = was_modified
   if status.lines then status.lines[row0 + 1] = text end
-  vim.api.nvim_buf_clear_namespace(buf, dr()._status_ns, row0, row0 + 1)
+  vim.api.nvim_buf_clear_namespace(buf, ui.status_ns, row0, row0 + 1)
   for _, highlight in ipairs(segment_highlights) do
-    pcall(vim.api.nvim_buf_set_extmark, buf, dr()._status_ns, row0, highlight.start_col, {
+    pcall(vim.api.nvim_buf_set_extmark, buf, ui.status_ns, row0, highlight.start_col, {
       end_col = highlight.end_col,
       hl_group = highlight.hl_group,
       priority = 90,
@@ -723,7 +731,7 @@ function M.patch_review_row(buf, status)
   local state = status and status.pr_edit or nil
   local row0 = M.patch_head_field_row(buf, status, state and state.review_mark, {
     { "Review: ", "DiffReviewStatusLabel" },
-    { dr()._pr_overview.pending_review_text(status and status.pr or nil, status), "DiffReviewReviewPending" },
+    { pr_overview().pending_review_text(status and status.pr or nil, status), "DiffReviewReviewPending" },
   }, "^Review:")
   if state and row0 then
     if state.review_mark then pcall(vim.api.nvim_buf_del_extmark, buf, M.ns, state.review_mark) end
@@ -737,7 +745,7 @@ function M.patch_milestone_row(buf, status)
   local state = status and status.pr_edit or nil
   local row0 = M.patch_head_field_row(buf, status, state and state.milestone_mark, {
     { "Release: ", "DiffReviewStatusLabel" },
-    { dr()._pr_overview.milestone_text(status and status.pr or nil), "DiffReviewStatusBranch" },
+    { pr_overview().milestone_text(status and status.pr or nil), "DiffReviewStatusBranch" },
   }, "^Release:")
   if state and row0 then
     if state.milestone_mark then pcall(vim.api.nvim_buf_del_extmark, buf, M.ns, state.milestone_mark) end
@@ -752,7 +760,7 @@ function M.patch_status_row(buf, status)
   local pr = status and status.pr or nil
   local row0 = M.patch_head_field_row(buf, status, state and state.status_mark, {
     { "Status: ", "DiffReviewStatusLabel" },
-    { dr()._pr_overview.status_text(pr), pr and pr.isDraft and "DiffReviewStatusFetching" or "DiffReviewStatusBranch" },
+    { pr_overview().status_text(pr), pr and pr.isDraft and "DiffReviewStatusFetching" or "DiffReviewStatusBranch" },
   }, "^Status:")
   if state and row0 then
     if state.status_mark then pcall(vim.api.nvim_buf_del_extmark, buf, M.ns, state.status_mark) end
@@ -777,7 +785,7 @@ function M.cursor_on_status_value(buf)
   local cursor = vim.api.nvim_win_get_cursor(0)
   if cursor[1] ~= row0 + 1 then return false end
   local line = vim.api.nvim_buf_get_lines(buf, row0, row0 + 1, false)[1] or ""
-  local value_start = line:find(dr()._pr_overview.status_text(status and status.pr or nil), 1, true)
+  local value_start = line:find(pr_overview().status_text(status and status.pr or nil), 1, true)
   return value_start ~= nil and cursor[2] >= value_start - 1
 end
 
@@ -788,7 +796,7 @@ function M.reviewer_change_usernames(change)
   local seen = {}
   for _, list in ipairs({ change.add or {}, change.remove or {} }) do
     for _, reviewer in ipairs(list) do
-      local username = dr()._pr_overview.reviewer_login(reviewer)
+      local username = pr_overview().reviewer_login(reviewer)
       local key = username:lower()
       if username ~= "" and not seen[key] then
         seen[key] = true
@@ -867,7 +875,7 @@ function M.set_pending_reviewers(status, reviewers)
   if not (status and status.pr) then return end
   local desired = {}
   local seen = {}
-  dr()._pr_overview.add_reviewers(reviewers, desired, seen)
+  pr_overview().add_reviewers(reviewers, desired, seen)
   status.pr.requestedReviewers = desired
   if status.pr_edit then status.pr_edit.pending_reviewers = nil end
 end
@@ -966,7 +974,7 @@ function M.confirm_and_apply_reviewer_change(buf, status, change, done)
       return
     end
     local lines = M.review_change_confirmation_lines(change, user_result.users or {})
-    dr()._confirm(lines, function()
+    status_helpers.confirm(lines, function()
       M.apply_reviewer_change(buf, status, change, done)
     end, function()
       local latest = session.states and session.states[buf] or status
@@ -991,7 +999,7 @@ end
 ---@return string
 function M.milestone_change_summary(change)
   if change.desired == "" then return "cleared" end
-  return dr()._milestone_icon .. " " .. change.desired
+  return ui.milestone_icon .. " " .. change.desired
 end
 
 ---@param buf integer
@@ -1029,7 +1037,7 @@ function M.apply_milestone(buf, status, milestone, done)
     vim.bo[buf].modified = false
     M.refresh_markers(buf)
     vim.notify(("Release updated: %s"):format(M.milestone_change_summary({
-      desired = dr()._pr_overview.milestone_title(latest.pr),
+      desired = pr_overview().milestone_title(latest.pr),
     })), vim.log.levels.INFO, { title = "DiffReview" })
     done(true)
   end)
@@ -1068,7 +1076,7 @@ function M.confirm_and_apply_milestone_change(buf, status, change, done)
       return
     end
 
-    dr()._confirm(M.milestone_create_confirmation_lines(change), function()
+    status_helpers.confirm(M.milestone_create_confirmation_lines(change), function()
       local latest = session.states and session.states[buf] or status
       if not (latest and latest.pr) then
         done(false)
@@ -1150,7 +1158,7 @@ function M.apply_draft_status(buf, status, desired_draft, done)
     end
     latest.pr.isDraft = type(result.is_draft) == "boolean" and result.is_draft or desired_draft
     M.patch_status_row(buf, latest)
-    vim.notify(("PR #%s status updated: %s"):format(tostring(latest.pr.number), dr()._pr_overview.status_text(latest.pr)), vim.log.levels.INFO, { title = "DiffReview" })
+    vim.notify(("PR #%s status updated: %s"):format(tostring(latest.pr.number), pr_overview().status_text(latest.pr)), vim.log.levels.INFO, { title = "DiffReview" })
     done(true)
   end)
 end
@@ -1163,7 +1171,7 @@ function M.toggle_draft_status_under_cursor(buf)
   local state = status and status.pr_edit or nil
   if not (status and status.pr and state) then return true end
   local desired_draft = not status.pr.isDraft
-  dr()._confirm(M.draft_status_confirmation_lines(status.pr, desired_draft), function()
+  status_helpers.confirm(M.draft_status_confirmation_lines(status.pr, desired_draft), function()
     M.enqueue(state, function(done)
       M.apply_draft_status(buf, status, desired_draft, function()
         done()
@@ -1240,7 +1248,7 @@ function M.sync(buf)
         local latest = session.states and session.states[buf] or nil
         if latest == status then
           session.status = status
-          dr()._render_pr_status(pr, status.cwd, buf, status.pr_diff_text)
+          render_orchestrator().render_pr_status(pr, status.cwd, buf, status.pr_diff_text)
         end
         vim.notify(("PR #%s updated"):format(tostring(pr.number)), vim.log.levels.INFO, { title = "DiffReview" })
         done()
@@ -1275,17 +1283,17 @@ end
 function M.sync_modifiable(buf)
   if not vim.api.nvim_buf_is_valid(buf) then return end
   if vim.api.nvim_get_current_buf() ~= buf then return end
-  return dr()._status_perf_span("pr_edit.sync_modifiable", buf, nil, function()
-    local row = dr()._status_perf_span("pr_edit.normalize_status_cursor", buf, nil, function()
-      return dr()._normalize_status_cursor(buf)
+  return trace.span("pr_edit.sync_modifiable", buf, nil, function()
+    local row = trace.span("pr_edit.normalize_status_cursor", buf, nil, function()
+      return diff_buffer._normalize_status_cursor(buf)
     end) or vim.api.nvim_win_get_cursor(0)[1]
     local status = session.states and session.states[buf] or nil
     local state = status and status.pr_edit or nil
-    local region_kind = dr()._status_perf_span("pr_edit.region_kind_at", buf, { row = row }, function()
+    local region_kind = trace.span("pr_edit.region_kind_at", buf, { row = row }, function()
       return M.region_kind_at(buf, row)
     end)
-    local review_editable = dr()._status_perf_span("pr_edit.review_in_editable_region", buf, { row = row }, function()
-      return dr()._review.in_editable_region(buf, row)
+    local review_editable = trace.span("pr_edit.review_in_editable_region", buf, { row = row }, function()
+      return review_mod().in_editable_region(buf, row)
     end)
     local wanted = region_kind ~= nil or review_editable
     if state and state.lock_initial then
@@ -1299,7 +1307,7 @@ function M.sync_modifiable(buf)
     if vim.bo[buf].modifiable ~= wanted then
       vim.bo[buf].modifiable = wanted
     end
-    dr()._status_perf_span("pr_edit.render_description_markdown", buf, {
+    trace.span("pr_edit.render_description_markdown", buf, {
       row = row,
       editable = wanted,
       region_kind = region_kind,
@@ -1332,7 +1340,7 @@ function M.attach(buf)
     group = group,
     buffer = buf,
     callback = function()
-      dr()._status_perf_span("pr_edit.autocmd_sync_modifiable", buf, nil, function()
+      trace.span("pr_edit.autocmd_sync_modifiable", buf, nil, function()
         M.sync_modifiable(buf)
       end)
     end,
@@ -1341,8 +1349,8 @@ function M.attach(buf)
     group = group,
     buffer = buf,
     callback = function()
-      dr()._status_perf_span("pr_edit.autocmd_text_changed", buf, nil, function()
-        dr()._review.sync_inline_comment_text(buf)
+      trace.span("pr_edit.autocmd_text_changed", buf, nil, function()
+        review_mod().sync_inline_comment_text(buf)
         M.refresh_markers(buf)
         M.render_description_markdown(buf)
       end)
@@ -1352,8 +1360,8 @@ function M.attach(buf)
     group = group,
     buffer = buf,
     callback = function()
-      dr()._review.sync_inline_comment_text(buf)
-      dr()._pr_overview.sync_standalone_comments(buf)
+      review_mod().sync_inline_comment_text(buf)
+      pr_overview().sync_standalone_comments(buf)
       M.sync(buf)
     end,
   })

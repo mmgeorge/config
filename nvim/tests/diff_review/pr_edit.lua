@@ -87,7 +87,7 @@ package.loaded["otter"] = {
 }
 
 local diff_review = require("diff_review")
-local session = require("diff_review.session")
+local datetime = require("diff_review.integrations.datetime")
 local gh = require("diff_review.integrations.gh")
 local github_gh = require("github.gh")
 local issue_index = require("github.issue_index")
@@ -593,9 +593,9 @@ local function wait_for(condition, message)
 end
 
 local function set_datetime_now(value)
-  local epoch = diff_review._datetime.parse(value)
+  local epoch = datetime.parse(value)
   assert_true(type(epoch) == "number", "test datetime did not parse: " .. tostring(value))
-  diff_review._datetime.now_override = function() return epoch end
+  datetime.now_override = function() return epoch end
 end
 
 local function buffer_contains(buf, needle)
@@ -641,6 +641,7 @@ local function fold_text_at(buf, row)
 end
 
 local function find_status_entry_row(buf, predicate, label)
+  local session = require("diff_review.session")
   local state = session.states and session.states[buf] or nil
   assert_true(state ~= nil, "missing status state for " .. tostring(label))
   for row = 1, vim.api.nvim_buf_line_count(buf) do
@@ -651,7 +652,8 @@ local function find_status_entry_row(buf, predicate, label)
 end
 
 local function line_has_highlight(buf, row, hl_group, start_col, end_col)
-  for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })) do
+  local ui = require("diff_review.infra.ui")
+  for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(buf, ui.status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })) do
     local details = mark[4] or {}
     if details.hl_group == hl_group
       and (start_col == nil or mark[3] == start_col)
@@ -854,6 +856,8 @@ local pr = {
 }
 
 local function run()
+  local ui = require("diff_review.infra.ui")
+  local session = require("diff_review.session")
   vim.notify = capture_notify
   diff_review.set_git_backend(git_backend)
   gh.set_backend(gh_backend)
@@ -865,16 +869,16 @@ local function run()
   issue_index._reset_for_test()
   issue_index._set_progress_enabled_for_test(false)
   set_datetime_now("2026-06-15T12:00:00Z")
-  assert_true(diff_review._datetime.relative("2026-06-15T11:55:00Z") == "5 minutes ago", "minute date label failed")
-  assert_true(diff_review._datetime.relative("2026-06-15T10:00:00Z") == "2 hours ago", "hour date label failed")
-  assert_true(diff_review._datetime.relative("2026-06-14T12:00:00Z") == "Yesterday", "yesterday date label failed")
-  assert_true(diff_review._datetime.relative("2026-06-14T12:00:00Z", { yesterday = false }) == "1 day ago", "one-day date label failed")
-  assert_true(diff_review._datetime.relative("2026-06-12T12:00:00Z") == "3 days ago", "day date label failed")
-  assert_true(diff_review._datetime.relative("2026-06-07T12:00:00Z") == "Last week", "last week date label failed")
-  assert_true(diff_review._datetime.relative("2026-05-01T12:00:00Z") == "Last month", "last month date label failed")
-  assert_true(diff_review._datetime.relative("2026-04-01T12:00:00Z") == "April 1, 2026", "absolute date label failed")
+  assert_true(datetime.relative("2026-06-15T11:55:00Z") == "5 minutes ago", "minute date label failed")
+  assert_true(datetime.relative("2026-06-15T10:00:00Z") == "2 hours ago", "hour date label failed")
+  assert_true(datetime.relative("2026-06-14T12:00:00Z") == "Yesterday", "yesterday date label failed")
+  assert_true(datetime.relative("2026-06-14T12:00:00Z", { yesterday = false }) == "1 day ago", "one-day date label failed")
+  assert_true(datetime.relative("2026-06-12T12:00:00Z") == "3 days ago", "day date label failed")
+  assert_true(datetime.relative("2026-06-07T12:00:00Z") == "Last week", "last week date label failed")
+  assert_true(datetime.relative("2026-05-01T12:00:00Z") == "Last month", "last month date label failed")
+  assert_true(datetime.relative("2026-04-01T12:00:00Z") == "April 1, 2026", "absolute date label failed")
   assert_true(
-    diff_review._datetime.action_phrase("mmgeorge", "commented", "2026-06-15T11:55:00Z") == "mmgeorge commented 5 minutes ago",
+    datetime.action_phrase("mmgeorge", "commented", "2026-06-15T11:55:00Z") == "mmgeorge commented 5 minutes ago",
     "action phrase date label failed"
   )
   set_datetime_now("2026-06-15T03:20:00Z")
@@ -893,7 +897,7 @@ local function run()
   end)
   write_issue_snapshot(pr.repo)
 
-  local draft_codeowner_text = diff_review._pr_overview.pending_review_text({
+  local draft_codeowner_text = require("diff_review.views.pr.pr_overview").pending_review_text({
     isDraft = true,
     requestedReviewers = {
       { login = "codeowners", is_code_owner = true },
@@ -901,17 +905,17 @@ local function run()
     },
   }, nil)
   assert_true(
-    draft_codeowner_text == diff_review._pending_review_icon .. " " .. diff_review._codeowner_review_icon .. "@codeowners @alice-dev",
+    draft_codeowner_text == ui.pending_review_icon .. " " .. ui.codeowner_review_icon .. "@codeowners @alice-dev",
     "draft codeowner reviewers should render with a warning icon: " .. tostring(draft_codeowner_text)
   )
-  local ready_codeowner_text = diff_review._pr_overview.pending_review_text({
+  local ready_codeowner_text = require("diff_review.views.pr.pr_overview").pending_review_text({
     isDraft = false,
     requestedReviewers = {
       { login = "codeowners", is_code_owner = true },
     },
   }, nil)
   assert_true(
-    ready_codeowner_text == diff_review._pending_review_icon .. " @codeowners",
+    ready_codeowner_text == ui.pending_review_icon .. " @codeowners",
     "ready codeowner reviewers should render without a draft warning icon: " .. tostring(ready_codeowner_text)
   )
 
@@ -1140,7 +1144,7 @@ local function run()
   )
   move_cursor(buf, inline_comment_row)
   trigger_buf_mapping(buf, "<Tab>")
-  local expected_folded_preview = diff_review._review.comment_icon
+  local expected_folded_preview = require("diff_review.views.pr.review").comment_icon
     .. " me commented 10 hours ago | This is inline comment without review"
   local inline_comment_header_row = find_status_entry_row(buf, function(entry, row)
     return entry.kind == "review_comment"
@@ -1261,7 +1265,7 @@ local function run()
   move_cursor(buf, regular_comment_row)
   trigger_buf_mapping(buf, "C")
   wait_for(function() return buffer_contains(buf, "Comments (3):") end, "regular PR comment draft did not update the comments count")
-  local regular_draft_header_row = find_row_after(buf, diff_review._review.comment_icon .. " you", regular_comment_row)
+  local regular_draft_header_row = find_row_after(buf, require("diff_review.views.pr.review").comment_icon .. " you", regular_comment_row)
   assert_true(
     not line_has_highlight(buf, regular_draft_header_row, "DiffReviewReviewCommentHeader"),
     "new regular PR comment used the blue review-comment header highlight"
@@ -1376,7 +1380,7 @@ local function run()
   move_cursor(buf, expanded_code_row)
   trigger_buf_mapping(buf, "C")
   wait_for(function() return buffer_contains(buf, "Comments (4):") end, "review-context C did not create a regular PR comment")
-  local context_regular_header_row = find_row_after(buf, diff_review._review.comment_icon .. " you", find_row(buf, "Regular from PR overview"))
+  local context_regular_header_row = find_row_after(buf, require("diff_review.views.pr.review").comment_icon .. " you", find_row(buf, "Regular from PR overview"))
   local context_regular_body_row = context_regular_header_row + 1
   edit_line(buf, context_regular_body_row, "Regular from review context")
   trigger_buf_mapping(buf, "<C-s>")
@@ -1568,12 +1572,12 @@ local function run()
   assert_true(vim.deep_equal(reviewer_payload.reviewers, { "alice-dev", "bobtown" }), "wrong reviewers payload: " .. vim.inspect(reviewer_payload))
   wait_for(function() return saw_notification_containing("Review requests updated: requested @alice-dev, @bobtown") end, "successful reviewer request was not notified")
   assert_true(
-    vim.api.nvim_buf_get_lines(buf, review_row - 1, review_row, false)[1] == "Review: " .. diff_review._pending_review_icon .. " @alice-dev @bobtown",
+    vim.api.nvim_buf_get_lines(buf, review_row - 1, review_row, false)[1] == "Review: " .. ui.pending_review_icon .. " @alice-dev @bobtown",
     "Review row did not show pending reviewers after reviewer request"
   )
   assert_true(not vim.bo[buf].modified, "reviewer request sync must clear the modified flag")
 
-  edit_line(buf, review_row, "Review: " .. diff_review._pending_review_icon .. " @alice-dev")
+  edit_line(buf, review_row, "Review: " .. ui.pending_review_icon .. " @alice-dev")
   assert_true(vim.bo[buf].modified, "reviewer removal edit must mark the PR buffer modified")
   rows = marker_rows(buf)
   assert_true(#rows == 1 and rows[1] == review_row, "reviewer removal edit did not mark the Review row dirty")
@@ -1587,7 +1591,7 @@ local function run()
   end, "reviewer removal confirmation did not describe the pending removal")
   trigger_current_mapping("n")
   wait_for(function()
-    return vim.api.nvim_buf_get_lines(buf, review_row - 1, review_row, false)[1] == "Review: " .. diff_review._pending_review_icon .. " @alice-dev @bobtown"
+    return vim.api.nvim_buf_get_lines(buf, review_row - 1, review_row, false)[1] == "Review: " .. ui.pending_review_icon .. " @alice-dev @bobtown"
   end, "cancelled reviewer removal did not restore the Review row")
   assert_true(#reviewer_remove_calls == 0, "cancelled reviewer removal still called GitHub")
   assert_true(#marker_rows(buf) == 0, "cancelled reviewer removal did not clear the marker")
@@ -1629,7 +1633,7 @@ local function run()
   assert_true(#marker_rows(buf) == 0, "markers must stay clear after a successful sync")
   assert_true(buffer_contains(buf, "Title:  New title"), "post-sync re-render lost the new title")
   assert_true(
-    buffer_contains(buf, "Review: " .. diff_review._pending_review_icon .. " @alice-dev @bobtown"),
+    buffer_contains(buf, "Review: " .. ui.pending_review_icon .. " @alice-dev @bobtown"),
     "post-sync re-render lost pending reviewers"
   )
 
@@ -1639,7 +1643,7 @@ local function run()
   assert_true(#edit_calls == 1, "no-op save must not call gh")
 
   -- ── Review: mixed removals and new requests are confirmed together ─────────
-  edit_line(buf, review_row, "Review: " .. diff_review._pending_review_icon .. " @bobtown @mgeorge-esri")
+  edit_line(buf, review_row, "Review: " .. ui.pending_review_icon .. " @bobtown @mgeorge-esri")
   assert_true(vim.bo[buf].modified, "mixed reviewer edit must mark the PR buffer modified")
   rows = marker_rows(buf)
   assert_true(#rows == 1 and rows[1] == review_row, "mixed reviewer edit did not mark the Review row dirty")
@@ -1665,7 +1669,7 @@ local function run()
   )
   wait_for(function() return saw_notification_containing("Review requests updated: removed @alice-dev; requested @mgeorge-esri") end, "mixed reviewer update was not notified")
   assert_true(
-    vim.api.nvim_buf_get_lines(buf, review_row - 1, review_row, false)[1] == "Review: " .. diff_review._pending_review_icon .. " @bobtown @mgeorge-esri",
+    vim.api.nvim_buf_get_lines(buf, review_row - 1, review_row, false)[1] == "Review: " .. ui.pending_review_icon .. " @bobtown @mgeorge-esri",
     "mixed reviewer update did not render the desired pending reviewers"
   )
   assert_true(not vim.bo[buf].modified, "mixed reviewer sync must clear the modified flag")
@@ -1690,9 +1694,9 @@ local function run()
   end, "missing milestone was not created and assigned")
   assert_true(milestone_create_calls[1].payload.title == "5.1", "wrong milestone create payload: " .. vim.inspect(milestone_create_calls[1].payload))
   assert_true(milestone_set_calls[1].payload.milestone == 501, "wrong milestone set payload: " .. vim.inspect(milestone_set_calls[1].payload))
-  wait_for(function() return saw_notification_containing("Release updated: " .. diff_review._milestone_icon .. " 5.1") end, "successful release update was not notified")
+  wait_for(function() return saw_notification_containing("Release updated: " .. ui.milestone_icon .. " 5.1") end, "successful release update was not notified")
   assert_true(
-    vim.api.nvim_buf_get_lines(buf, milestone_row - 1, milestone_row, false)[1] == "Release: " .. diff_review._milestone_icon .. " 5.1",
+    vim.api.nvim_buf_get_lines(buf, milestone_row - 1, milestone_row, false)[1] == "Release: " .. ui.milestone_icon .. " 5.1",
     "Release row did not show the assigned milestone"
   )
   assert_true(pr.milestone and pr.milestone.title == "5.1", "PR cache milestone was not updated")
@@ -1719,7 +1723,7 @@ gh.reset_backend()
 github_gh.reset_backend()
 issue_index._reset_for_test()
 repo_cache.set_data_dir_for_test(nil)
-diff_review._datetime.now_override = nil
+datetime.now_override = nil
 vim.fn.delete(repo_cache_dir, "rf")
 if not ok then
   vim.api.nvim_err_writeln(err)

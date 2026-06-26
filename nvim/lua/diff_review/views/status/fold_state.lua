@@ -3,15 +3,20 @@
 --- that re-applies folds and view-specific modifiable/comment-rule sync.
 ---
 --- Reads live status state and the view modules (pr_edit/review/status_issues), window options, and
---- perf span through the init module via dr().
+--- perf span via session.lua and direct requires.
 
 local status_buffer = require("diff_review.views.status.status_buffer")
 
---- Resolve the init module lazily so fold application can reach orchestrator state and the view
---- sync/window-option seams without a load-time circular require.
-local function dr()
-  return require("diff_review")
-end
+local pr_edit = require("diff_review.views.pr.pr_edit")
+-- review edge kept lazy to avoid a load-time cycle.
+local function review() return require("diff_review.views.pr.review") end
+local status_issues = require("diff_review.views.status.status_issues")
+local window_options = require("diff_review.views.status.window_options")
+-- keymaps edge kept lazy to avoid a load-time cycle.
+local function keymaps() return require("diff_review.shared.keymaps") end
+local trace = require("diff_review.infra.perf_trace")
+-- Status WinResized/VimResized autocmd id, registered once (module-private state).
+local resize_autocmd
 local session = require("diff_review.session")
 
 local M = {}
@@ -46,7 +51,7 @@ function _G.diff_review_status_foldtext()
   local state = session.states and session.states[buf] or session.status
   local fold_start = tonumber(vim.v.foldstart) or vim.fn.line(".")
   local value = state and state.fold_text_by_start_line and state.fold_text_by_start_line[fold_start] or nil
-  return dr()._status_fold_text(value)
+  return M._status_fold_text(value)
 end
 
 ---@param fold_id string?
@@ -129,17 +134,17 @@ function M._status_set_native_fold_state(buf, fold_id, _folded)
       or fold_id:find("^provider%-hunk:")) then
     return false
   end
-  local ranges = dr()._status_fold_ranges_for_id(state, fold_id)
+  local ranges = M._status_fold_ranges_for_id(state, fold_id)
   if #ranges == 0 then return false end
   local has_native_range = false
   for _, range in ipairs(ranges) do
-    if dr()._status_fold_range_span(range) > 0 then
+    if M._status_fold_range_span(range) > 0 then
       has_native_range = true
       break
     end
   end
   if not has_native_range then return false end
-  dr()._status_apply_native_folds(buf)
+  M._status_apply_native_folds(buf)
   return true
 end
 
@@ -164,7 +169,7 @@ end
 function M._status_apply_native_folds(buf)
   local state = session.states and session.states[buf] or session.status
   if not (state and state.fold_range_order and vim.api.nvim_buf_is_valid(buf)) then return end
-  return dr()._status_perf_span("status.apply_native_folds", buf, {
+  return trace.span("status.apply_native_folds", buf, {
     fold_ranges = #(state.fold_range_order or {}),
   }, function()
     local max_line = vim.api.nvim_buf_line_count(buf)
@@ -173,14 +178,14 @@ function M._status_apply_native_folds(buf)
       ranges[#ranges + 1] = range
     end
     table.sort(ranges, function(left, right)
-      local left_span = dr()._status_fold_range_span(left)
-      local right_span = dr()._status_fold_range_span(right)
+      local left_span = M._status_fold_range_span(left)
+      local right_span = M._status_fold_range_span(right)
       if left_span == right_span then return (left.start_line or 0) > (right.start_line or 0) end
       return left_span < right_span
     end)
     for _, win in ipairs(vim.fn.win_findbuf(buf)) do
       if vim.api.nvim_win_is_valid(win) then
-        dr()._apply_status_window_options(win, state)
+        window_options.apply(win, state)
         vim.api.nvim_win_call(win, function()
           local view = vim.fn.winsaveview()
           pcall(vim.cmd, "normal! zE")
@@ -193,7 +198,7 @@ function M._status_apply_native_folds(buf)
               pcall(vim.cmd, ("%d,%dfold"):format(range.start_line, range.end_line))
             end
           end
-          vim.fn.winrestview(dr()._status_view_for_fold_restore(view, ranges, state))
+          vim.fn.winrestview(M._status_view_for_fold_restore(view, ranges, state))
         end)
       end
     end
@@ -204,18 +209,18 @@ end
 function M._status_sync_after_native_folds(buf)
   local state = session.states and session.states[buf] or session.status
   if not state then return end
-  return dr()._status_perf_span("status.sync_after_native_folds", buf, nil, function()
+  return trace.span("status.sync_after_native_folds", buf, nil, function()
     if state.view_kind == "pr" then
-      dr()._status_perf_span("status.native_folds.pr_sync_modifiable", buf, nil, function()
-        dr()._pr_edit.sync_modifiable(buf)
+      trace.span("status.native_folds.pr_sync_modifiable", buf, nil, function()
+        pr_edit.sync_modifiable(buf)
       end)
     elseif state.view_kind == "review" then
-      dr()._status_perf_span("status.native_folds.review_sync_modifiable", buf, nil, function()
-        dr()._review.sync_modifiable(buf)
+      trace.span("status.native_folds.review_sync_modifiable", buf, nil, function()
+        review().sync_modifiable(buf)
       end)
     elseif state.view_kind == "status" then
-      dr()._status_perf_span("status.native_folds.issues_sync_modifiable", buf, nil, function()
-        dr()._status_issues.sync_modifiable(buf)
+      trace.span("status.native_folds.issues_sync_modifiable", buf, nil, function()
+        status_issues.sync_modifiable(buf)
       end)
     end
   end)
@@ -230,10 +235,10 @@ function M._status_schedule_native_folds(buf)
   vim.defer_fn(function()
     local latest = session.states and session.states[buf] or session.status
     if not (latest and latest.native_fold_generation == generation and vim.api.nvim_buf_is_valid(buf)) then return end
-    dr()._status_perf_span("status.native_folds_deferred", buf, { generation = generation }, function()
+    trace.span("status.native_folds_deferred", buf, { generation = generation }, function()
       session.status = latest
-      dr()._status_apply_native_folds(buf)
-      dr()._status_sync_after_native_folds(buf)
+      M._status_apply_native_folds(buf)
+      M._status_sync_after_native_folds(buf)
     end)
   end, 20)
 end
@@ -245,13 +250,13 @@ function M._refresh_status_windows_after_resize()
       local buf = vim.api.nvim_win_get_buf(win)
       local state = session.states[buf]
       if state then
-        dr()._apply_status_window_options(win, state)
-        dr()._status_apply_hint_bar(buf, win)
-        if state.view_kind == "review" and dr()._review and dr()._review.refresh_inline_comment_rules then
-          local width = dr()._review.comment_rule_width(win, buf)
+        window_options.apply(win, state)
+        keymaps().status_apply_hint_bar(buf, win)
+        if state.view_kind == "review" and review and review().refresh_inline_comment_rules then
+          local width = review().comment_rule_width(win, buf)
           if state.review_comment_rule_width ~= width then
             state.review_comment_rule_width = width
-            dr()._review.refresh_inline_comment_rules(buf, win)
+            review().refresh_inline_comment_rules(buf, win)
           end
         end
       end
@@ -260,12 +265,12 @@ function M._refresh_status_windows_after_resize()
 end
 
 function M._ensure_status_resize_autocmd()
-  if dr()._status_resize_autocmd then return end
+  if resize_autocmd then return end
   local group = vim.api.nvim_create_augroup("DiffReviewStatusResize", { clear = true })
-  dr()._status_resize_autocmd = vim.api.nvim_create_autocmd({ "WinResized", "VimResized" }, {
+  resize_autocmd = vim.api.nvim_create_autocmd({ "WinResized", "VimResized" }, {
     group = group,
     callback = function()
-      dr()._refresh_status_windows_after_resize()
+      M._refresh_status_windows_after_resize()
     end,
   })
 end

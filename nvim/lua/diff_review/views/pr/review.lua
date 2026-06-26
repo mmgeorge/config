@@ -10,9 +10,29 @@ local gh = require("diff_review.integrations.gh")
 local config = require("diff_review.infra.config")
 local repo_relative = require("diff_review.infra.paths").repo_relative
 
-local function dr()
-  return require("diff_review")
-end
+-- render_orchestrator edge kept lazy to avoid a load-time cycle.
+local function render_orchestrator() return require("diff_review.views.status.render_orchestrator") end
+-- status_render edge kept lazy to avoid a load-time cycle.
+local function status_render() return require("diff_review.views.status.status_render") end
+-- pr_overview edge kept lazy to avoid a load-time cycle.
+local function pr_overview() return require("diff_review.views.pr.pr_overview") end
+local comment_rows = require("github.comment_rows")
+-- pr_edit edge kept lazy to avoid a load-time cycle.
+local function pr_edit() return require("diff_review.views.pr.pr_edit") end
+local diff_buffer = require("diff_review.views.diff_buffer")
+-- commands edge kept lazy to avoid a load-time cycle.
+local function commands() return require("diff_review.views.commands") end
+-- section_builder edge kept lazy to avoid a load-time cycle.
+local function section_builder() return require("diff_review.views.status.section_builder") end
+local status_keys = require("diff_review.views.status.status_keys")
+local entry_nav = require("diff_review.views.status.entry_nav")
+-- fold_state edge kept lazy to avoid a load-time cycle.
+local function fold_state() return require("diff_review.views.status.fold_state") end
+local keymaps = require("diff_review.shared.keymaps")
+local command_specs = require("diff_review.shared.command_specs")
+local datetime = require("diff_review.integrations.datetime")
+local trace = require("diff_review.infra.perf_trace")
+local ui = require("diff_review.infra.ui")
 local session = require("diff_review.session")
 
 -- Render-core shims: thread the active status into the state-passing buffer core.
@@ -35,7 +55,7 @@ end
 local function notify_error(message, title)
   return notifications.error(message, title)
 end
-local function notify_debug(...) return dr()._notify_debug(...) end
+local function notify_debug(...) return notifications.debug(...) end
 
 --- One queued comment sync operation: the GitHub op, the target comment, and the
 --- normalized body captured at enqueue time so later edits cannot mutate it in flight.
@@ -45,17 +65,17 @@ local function notify_debug(...) return dr()._notify_debug(...) end
 ---@field body string?
 
 -- Seams to init-owned helpers the review view shares.
-local function render_pr_status(...) return dr()._render_pr_status(...) end
-local function status_command_visible(...) return dr()._status_command_visible(...) end
-local function status_entry_under_cursor(...) return dr()._status_entry_under_cursor(...) end
-local function status_keys_for(...) return dr()._status_keys_for(...) end
-local function status_provider_file_key(...) return dr()._status_provider_file_key(...) end
-local function status_render_loaded(...) return dr()._status_render_loaded(...) end
+local function render_pr_status(...) return render_orchestrator().render_pr_status(...) end
+local function status_command_visible(...) return keymaps.status_command_visible(...) end
+local function status_entry_under_cursor(...) return entry_nav._status_entry_under_cursor(...) end
+local function status_keys_for(...) return keymaps.status_keys_for(...) end
+local function status_provider_file_key(...) return status_keys.provider_file_key(...) end
+local function status_render_loaded(...) return status_render().status_render_loaded(...) end
 
 local M = {
   ns = vim.api.nvim_create_namespace("diff_review.views.pr.review"),
-  comment_icon = nil,
-  reply_icon = nil,
+  comment_icon = ui.comment_icon,
+  reply_icon = ui.reply_icon,
   -- Test seams: the comment-body input and the verdict picker. Defaults open
   -- real UI; tests override them. Mirrors the set_backend/set_reader pattern.
   input_provider = nil, ---@type (fun(title: string, on_submit: fun(text: string), prefill: string?))?
@@ -71,8 +91,8 @@ function M.state(buf)
   if status and status.view_kind == "pr" then
     status.pr_standalone_comments = status.pr_standalone_comments or {}
     status.pr_regular_comments = status.pr_regular_comments or {}
-    if dr()._pr_overview.editable_comments then
-      status.review_comments = dr()._pr_overview.editable_comments(status)
+    if pr_overview().editable_comments then
+      status.review_comments = pr_overview().editable_comments(status)
     else
       status.review_comments = status.pr_standalone_comments
     end
@@ -866,7 +886,7 @@ end
 ---@param section_name string
 ---@return DiffReviewStatusFile
 function M.file_with_hunks(file, hunks, section_name)
-  return dr()._section_builder.file_with_hunks(file, hunks, section_name)
+  return section_builder().file_with_hunks(file, hunks, section_name)
 end
 
 ---@param state table
@@ -904,7 +924,7 @@ end
 ---@param state table
 ---@return DiffReviewStatusSection[]
 function M.sections(state)
-  local files = dr()._section_builder.files_from_diff(state.cwd, {
+  local files = section_builder().files_from_diff(state.cwd, {
     section_name = "review",
     default_status = "",
     files = state.pr.files,
@@ -943,14 +963,14 @@ function M.sections(state)
     M.prune_viewed_hunks(state, active_keys)
   end
   return {
-    dr()._section_builder.section_from_files("Unviewed Changes", unviewed, {
+    section_builder().section_from_files("Unviewed Changes", unviewed, {
       name = "review:unviewed",
       keep_empty = true,
       file_key_prefix = "review:unviewed",
       file_entry_kind = "pr_review_file",
       hunk_entry_kind = "pr_review_hunk",
     }),
-    dr()._section_builder.section_from_files("Viewed Changes", viewed, {
+    section_builder().section_from_files("Viewed Changes", viewed, {
       name = "review:viewed",
       keep_empty = true,
       file_key_prefix = "review:viewed",
@@ -966,7 +986,7 @@ end
 function M.ensure_expanded(state)
   if state.review_expanded or not state.diff_text or state.diff_text == "" then return end
   state.review_expanded = true
-  local files = dr()._section_builder.files_from_diff(state.cwd, {
+  local files = section_builder().files_from_diff(state.cwd, {
     section_name = "review",
     default_status = "",
     files = state.pr.files,
@@ -992,7 +1012,7 @@ function M.render(buf)
   end
   state.fancy_rows = {}
   state.review_rendered_comment_count = 0
-  state.review_comment_anchor_index = dr()._section_builder.comment_anchor_index(state.review_comments)
+  state.review_comment_anchor_index = section_builder().comment_anchor_index(state.review_comments)
   -- status_add_fancy_row consults this hook to interleave comment lines.
   state.review_after_row = function(diff_line, indent)
     M.emit_comments_for(state, diff_line, indent)
@@ -1033,7 +1053,7 @@ end
 ---@param value any
 ---@return string
 function M.format_comment_datetime(value)
-  local relative = dr()._datetime.relative(value)
+  local relative = datetime.relative(value)
   if relative ~= "" then return relative end
   return "just now"
 end
@@ -1065,7 +1085,7 @@ function M.comment_header_text(comment)
   local marker = M.comment_has_dirty_marker(comment) and "*" or ""
   local left_text = ("%s %s "):format(
     M.comment_icon,
-    dr()._datetime.action_phrase(marker .. user, "commented", comment.updated_at or comment.created_at)
+    datetime.action_phrase(marker .. user, "commented", comment.updated_at or comment.created_at)
   )
   local right_text = ""
   if not comment.pr_issue_comment then
@@ -1082,7 +1102,7 @@ function M.reply_header_text(reply)
   local user = tostring(reply.user or "unknown")
   return ("%s %s "):format(
     M.reply_icon,
-    dr()._datetime.action_phrase(user, "replied", reply.updated_at or reply.created_at)
+    datetime.action_phrase(user, "replied", reply.updated_at or reply.created_at)
   ), ""
 end
 
@@ -1163,7 +1183,7 @@ end
 ---@param body string
 ---@return string
 function M.comment_preview_text(body)
-  return dr()._comment_rows.preview_text(body)
+  return comment_rows.preview_text(body)
 end
 
 ---@param text string
@@ -1186,7 +1206,7 @@ function M.comment_folded_line(comment, win, buf)
   local marker = M.comment_has_dirty_marker(comment) and "*" or ""
   local left_text = ("%s %s | "):format(
     M.comment_icon,
-    dr()._datetime.action_phrase(marker .. user, "commented", comment.updated_at or comment.created_at)
+    datetime.action_phrase(marker .. user, "commented", comment.updated_at or comment.created_at)
   )
   local width = M.comment_rule_width(win, buf)
   local preview_width = math.max(0, width - vim.fn.strdisplaywidth(left_text))
@@ -1197,7 +1217,7 @@ end
 ---@param line_number integer
 ---@param text string
 function M.add_comment_rule_date_highlights(line_number, text)
-  for _, range in ipairs(dr()._datetime.date_highlight_ranges(text)) do
+  for _, range in ipairs(datetime.date_highlight_ranges(text)) do
     status_add_highlight(line_number, range.start_col, range.end_col, "DiffReviewStatusDate")
   end
 end
@@ -1206,8 +1226,8 @@ end
 ---@param row0 integer
 ---@param text string
 function M.set_comment_rule_date_extmarks(buf, row0, text)
-  for _, range in ipairs(dr()._datetime.date_highlight_ranges(text)) do
-    pcall(vim.api.nvim_buf_set_extmark, buf, dr()._status_ns, row0, range.start_col, {
+  for _, range in ipairs(datetime.date_highlight_ranges(text)) do
+    pcall(vim.api.nvim_buf_set_extmark, buf, ui.status_ns, row0, range.start_col, {
       end_col = range.end_col,
       hl_group = "DiffReviewStatusDate",
       priority = 95,
@@ -1293,7 +1313,7 @@ function M.emit_comment(comment, index, indent)
     local line_number = status_add_line(folded_line, folded_entry, "DiffReviewReviewCommentHeader")
     status_add_highlight(line_number, 0, #folded_line, "DiffReviewReviewCommentHeader")
     M.add_comment_rule_date_highlights(line_number, folded_line)
-    dr()._status_register_fold_range(fold_id, start_line, line_number, true, folded_line)
+    fold_state()._status_register_fold_range(fold_id, start_line, line_number, true, folded_line)
     return
   end
 
@@ -1337,7 +1357,7 @@ function M.emit_comment(comment, index, indent)
   local footer = M.comment_footer_line()
   local footer_line = status_add_line(footer, footer_entry, "DiffReviewReviewCommentHeader")
   status_add_highlight(footer_line, 0, #footer, "DiffReviewReviewCommentHeader")
-  dr()._status_register_fold_range(fold_id, start_line, footer_line, comment.review_folded == true, function()
+  fold_state()._status_register_fold_range(fold_id, start_line, footer_line, comment.review_folded == true, function()
     return M.comment_folded_line(comment)
   end)
 end
@@ -1347,7 +1367,7 @@ end
 ---@param diff_line table
 ---@param indent integer
 function M.emit_comments_for(state, diff_line, indent)
-  dr()._section_builder.emit_anchored_comments(state, diff_line, indent, {
+  section_builder().emit_anchored_comments(state, diff_line, indent, {
     index_field = "review_comment_anchor_index",
     count_field = "review_rendered_comment_count",
     skip = function(comment) return comment == state.review_editing_comment end,
@@ -1417,7 +1437,7 @@ function M.toggle_comment_fold(buf)
     if entry and entry.kind == "pr_comment" and entry.id and entry.pr_comment then
       local folded = not status_folded(entry.id, true)
       set_status_folded(entry.id, folded)
-      if not dr()._status_set_native_fold_state(buf, entry.id, folded) then
+      if not fold_state()._status_set_native_fold_state(buf, entry.id, folded) then
         render_pr_status(state.pr, state.cwd, buf, state.pr_diff_text)
       end
       return true
@@ -1431,7 +1451,7 @@ function M.toggle_comment_fold(buf)
   end
   local fold_id = comment.review_fold_id or M.comment_fold_id(comment, index)
   set_status_folded(fold_id, comment.review_folded == true)
-  if not dr()._status_set_native_fold_state(buf, fold_id, comment.review_folded == true) then
+  if not fold_state()._status_set_native_fold_state(buf, fold_id, comment.review_folded == true) then
     if state.view_kind == "pr" then
       render_pr_status(state.pr, state.cwd, buf, state.pr_diff_text)
     else
@@ -1793,7 +1813,7 @@ function M.clamp_comment_cursor(buf)
   local state = M.state(buf)
   if not state or state.review_clamping_cursor then return nil end
   state.review_clamping_cursor = true
-  local row = dr()._normalize_status_cursor(buf) or vim.api.nvim_win_get_cursor(0)[1]
+  local row = diff_buffer._normalize_status_cursor(buf) or vim.api.nvim_win_get_cursor(0)[1]
   state.review_clamping_cursor = nil
   state.review_last_cursor_row = row
   return row
@@ -1925,17 +1945,17 @@ end
 function M.sync_modifiable(buf)
   if not vim.api.nvim_buf_is_valid(buf) then return end
   if vim.api.nvim_get_current_buf() ~= buf then return end
-  return dr()._status_perf_span("review.sync_modifiable", buf, nil, function()
-    local row = dr()._status_perf_span("review.clamp_comment_cursor", buf, nil, function()
+  return trace.span("review.sync_modifiable", buf, nil, function()
+    local row = trace.span("review.clamp_comment_cursor", buf, nil, function()
       return M.clamp_comment_cursor(buf)
     end) or vim.api.nvim_win_get_cursor(0)[1]
-    local wanted = dr()._status_perf_span("review.in_editable_region", buf, { row = row }, function()
+    local wanted = trace.span("review.in_editable_region", buf, { row = row }, function()
       return M.in_editable_region(buf, row)
     end)
     if vim.bo[buf].modifiable ~= wanted then
       vim.bo[buf].modifiable = wanted
     end
-    dr()._status_perf_span("review.sync_command_keymaps", buf, nil, function()
+    trace.span("review.sync_command_keymaps", buf, nil, function()
       M.sync_command_keymaps(buf)
     end)
   end)
@@ -2047,14 +2067,14 @@ function M.replace_comment_rule_line(buf, row0, line)
   if row0 == nil or row0 < 0 then return false end
   local old_line = vim.api.nvim_buf_get_lines(buf, row0, row0 + 1, false)[1]
   if old_line == nil or old_line == line then return false end
-  pcall(vim.api.nvim_buf_clear_namespace, buf, dr()._status_ns, row0, row0 + 1)
+  pcall(vim.api.nvim_buf_clear_namespace, buf, ui.status_ns, row0, row0 + 1)
   pcall(vim.api.nvim_buf_set_text, buf, row0, 0, row0, #old_line, { line })
   if line ~= "" then
-    pcall(vim.api.nvim_buf_set_extmark, buf, dr()._status_ns, row0, 0, {
+    pcall(vim.api.nvim_buf_set_extmark, buf, ui.status_ns, row0, 0, {
       line_hl_group = "DiffReviewReviewCommentHeader",
       priority = 80,
     })
-    pcall(vim.api.nvim_buf_set_extmark, buf, dr()._status_ns, row0, 0, {
+    pcall(vim.api.nvim_buf_set_extmark, buf, ui.status_ns, row0, 0, {
       end_col = #line,
       hl_group = "DiffReviewReviewCommentHeader",
       priority = 90,
@@ -2149,8 +2169,8 @@ function M.sync_inline_comment_text(buf)
     vim.bo[buf].modified = true
   end
   local is_regular_pr_comment = state.view_kind == "pr"
-    and dr()._pr_overview.is_regular_comment
-    and dr()._pr_overview.is_regular_comment(state, comment)
+    and pr_overview().is_regular_comment
+    and pr_overview().is_regular_comment(state, comment)
   if not is_regular_pr_comment then M.refresh_inline_comment_header(buf, comment) end
   return true
 end
@@ -2172,7 +2192,7 @@ function M.toggle_viewed(buf, viewed)
         hunks[#hunks + 1] = hunk
       end
     else
-      for _, hunk in ipairs(dr()._status_diff_hunks_for_file(file)) do
+      for _, hunk in ipairs(render_orchestrator().diff_hunks_for_file(file)) do
         hunks[#hunks + 1] = hunk
       end
     end
@@ -2333,7 +2353,7 @@ function M.focus_inline_comment(buf, comment, opts)
     if state and state.view_kind == "review" then M.save_draft(state) end
     local fold_id = comment.review_fold_id or M.comment_fold_id(comment)
     set_status_folded(fold_id, false)
-    if not dr()._status_set_native_fold_state(buf, fold_id, false) then
+    if not fold_state()._status_set_native_fold_state(buf, fold_id, false) then
       if state and state.view_kind == "pr" then
         render_pr_status(state.pr, state.cwd, buf, state.pr_diff_text)
       else
@@ -2404,7 +2424,7 @@ function M.add_comment(buf)
   local payload = M.selection_payload(state)
   M.leave_visual()
   if not payload then return end
-  if not dr()._status_source_policy_allows_cursor(state, "comment") then return end
+  if not entry_nav._status_source_policy_allows_cursor(state, "comment") then return end
   local comment = M.create_inline_comment(state, payload)
   M.save_draft(state)
   M.render(buf)
@@ -2616,7 +2636,7 @@ function M.attach(buf)
     group = group,
     buffer = buf,
     callback = function()
-      dr()._status_perf_span("review.autocmd_sync_modifiable", buf, nil, function()
+      trace.span("review.autocmd_sync_modifiable", buf, nil, function()
         M.sync_modifiable(buf)
       end)
     end,
@@ -2625,10 +2645,10 @@ function M.attach(buf)
     group = group,
     buffer = buf,
     callback = function()
-      dr()._status_perf_span("review.autocmd_text_changed", buf, nil, function()
+      trace.span("review.autocmd_text_changed", buf, nil, function()
         M.sync_comment_text(buf)
         M.sync_inline_comment_text(buf)
-        dr()._pr_edit.render_markdown_regions(buf)
+        pr_edit().render_markdown_regions(buf)
       end)
     end,
   })
@@ -2670,13 +2690,13 @@ function M.start(buf)
     vim.notify("No GitHub PR for this branch", vim.log.levels.INFO, { title = "DiffReview" })
     return
   end
-  dr().open_review(pr, { cwd = status.cwd })
+  commands().open_review(pr, { cwd = status.cwd })
 end
 
 ---@param buf integer
 function M.setup_keymaps(buf)
   local function map(id, fn)
-    local spec = dr()._status_command_specs_by_id[id]
+    local spec = command_specs.by_id[id]
     if not (spec and status_command_visible(spec)) then return end
     for _, key in ipairs(status_keys_for(id)) do
       local mapped

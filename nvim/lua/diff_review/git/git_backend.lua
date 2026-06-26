@@ -14,6 +14,31 @@ function M.reset_backend()
   M.current = nil
 end
 
+---@param cwd string
+---@param extra_args? string[]
+---@return string[]
+function M.git_diff_command(cwd, extra_args)
+  local command = {
+    "git", "-C", cwd,
+    "-c", "core.quotepath=false",
+    "diff", "--no-color", "--no-ext-diff", "--unified=0",
+  }
+  for _, arg in ipairs(extra_args or {}) do
+    command[#command + 1] = arg
+  end
+  return command
+end
+
+---@param cwd string
+---@param commit_oid string
+---@return string[]
+function M.git_show_diff_command(cwd, commit_oid)
+  return {
+    "git", "-C", cwd,
+    "show", "--format=", "--no-color", "--no-ext-diff", "--unified=0", commit_oid,
+  }
+end
+
 ---@param stdout string?
 ---@param stderr string?
 ---@return string

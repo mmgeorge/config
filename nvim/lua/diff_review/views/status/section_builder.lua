@@ -1,3 +1,5 @@
+-- review edge kept lazy to avoid a load-time cycle.
+local function review_mod() return require("diff_review.views.pr.review") end
 --- Builds status sections and files from diff text and attaches review comments to them,
 --- turning a raw diff plus optional PR comment data into the section/file/hunk tree the
 --- render core walks.
@@ -22,7 +24,7 @@ end
 ---@param diff_text? string
 ---@return DiffReviewStatusFile[]
 function M.files_from_diff(cwd, spec, diff_text)
-  return require("diff_review")._status_files_from_diff_provider(cwd, {
+  return require("diff_review.views.status.section_map")._status_files_from_diff_provider(cwd, {
     section_name = spec.section_name,
     default_status = spec.default_status or "",
     files = spec.files,
@@ -189,7 +191,7 @@ end
 ---@param indent integer
 ---@param opts { index_field: string, count_field?: string, skip?: fun(comment: table): boolean }
 function M.emit_anchored_comments(state, diff_line, indent, opts)
-  local review = require("diff_review")._review
+  local review = review_mod()
   local key = M.comment_anchor_key(diff_line.file, review.side_of(diff_line), diff_line.line)
   local comments = key and state[opts.index_field] and state[opts.index_field][key] or nil
   for _, item in ipairs(comments or {}) do

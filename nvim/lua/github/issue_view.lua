@@ -3,6 +3,21 @@ local github_comment_rows = require("github.comment_rows")
 local issue_index = require("github.issue_index")
 local diff_review_ok, diff_review = pcall(require, "diff_review")
 if not diff_review_ok then diff_review = nil end
+-- Reach the diff_review PR view modules directly (the init re-export seam was removed).
+local pr_overview_ok, pr_overview_mod = pcall(require, "diff_review.views.pr.pr_overview")
+if not pr_overview_ok then pr_overview_mod = nil end
+local pr_edit_ok, pr_edit_mod = pcall(require, "diff_review.views.pr.pr_edit")
+if not pr_edit_ok then pr_edit_mod = nil end
+local review_ok, review_mod = pcall(require, "diff_review.views.pr.review")
+if not review_ok then review_mod = nil end
+local datetime_ok, datetime_mod = pcall(require, "diff_review.integrations.datetime")
+if not datetime_ok then datetime_mod = nil end
+local keymaps_ok, keymaps_mod = pcall(require, "diff_review.shared.keymaps")
+if not keymaps_ok then keymaps_mod = nil end
+local status_head_ok, status_head_mod = pcall(require, "diff_review.views.status.status_head")
+if not status_head_ok then status_head_mod = nil end
+local ui_ok, ui_mod = pcall(require, "diff_review.infra.ui")
+if not ui_ok then ui_mod = nil end
 
 local namespace = vim.api.nvim_create_namespace("github.issue_view")
 local decoration_namespace = vim.api.nvim_create_namespace("github.issue_view.decorations")
@@ -116,10 +131,10 @@ local function parse_activity_time(value)
   if value == "" then return nil end
   if
     diff_review
-    and type(diff_review._datetime) == "table"
-    and type(diff_review._datetime.parse) == "function"
+    and type(datetime_mod) == "table"
+    and type(datetime_mod.parse) == "function"
   then
-    local ok, epoch = pcall(diff_review._datetime.parse, value)
+    local ok, epoch = pcall(datetime_mod.parse, value)
     if ok and epoch then return epoch end
   end
   local ok, epoch = pcall(vim.fn.strptime, "%Y-%m-%dT%H:%M:%SZ", value)
@@ -132,7 +147,7 @@ end
 local function activity_datetime(value)
   value = tostring(value or "")
   if value == "" then return "" end
-  local overview = diff_review and type(diff_review._pr_overview) == "table" and diff_review._pr_overview or nil
+  local overview = diff_review and type(pr_overview_mod) == "table" and pr_overview_mod or nil
   if overview and type(overview.comment_datetime) == "function" then return overview.comment_datetime(value) end
   return value
 end
@@ -184,13 +199,13 @@ end
 
 ---@return table?
 local function pr_overview()
-  if diff_review and type(diff_review._pr_overview) == "table" then return diff_review._pr_overview end
+  if diff_review and type(pr_overview_mod) == "table" then return pr_overview_mod end
   return nil
 end
 
 ---@return table?
 local function pr_edit()
-  if diff_review and type(diff_review._pr_edit) == "table" then return diff_review._pr_edit end
+  if diff_review and type(pr_edit_mod) == "table" then return pr_edit_mod end
   return nil
 end
 
@@ -475,10 +490,10 @@ end
 local function markdown_namespace()
   if
     diff_review
-    and type(diff_review._pr_edit) == "table"
-    and type(diff_review._pr_edit.markdown_namespace) == "function"
+    and type(pr_edit_mod) == "table"
+    and type(pr_edit_mod.markdown_namespace) == "function"
   then
-    return diff_review._pr_edit.markdown_namespace()
+    return pr_edit_mod.markdown_namespace()
   end
   local ok, ui = pcall(require, "render-markdown.core.ui")
   if ok and type(ui) == "table" and ui.ns then return ui.ns end
@@ -672,8 +687,8 @@ end
 ---@param count integer
 ---@return string
 local function section_heading_text(title, count)
-  if diff_review and type(diff_review._status_section_heading_text) == "function" then
-    return diff_review._status_section_heading_text(title, count)
+  if diff_review and type(status_head_mod._status_section_heading_text) == "function" then
+    return status_head_mod._status_section_heading_text(title, count)
   end
   title = tostring(title or ""):gsub("%s*:%s*$", "")
   return ("%s (%d):"):format(title, math.max(0, math.floor(tonumber(count) or 0)))
@@ -713,7 +728,7 @@ end
 local function comment_row_options()
   local overview = pr_overview()
   local opts = {
-    comment_icon = diff_review and diff_review._comment_icon or "",
+    comment_icon = ui_mod and ui_mod.comment_icon or "",
     entry_id = comment_entry_id,
     line_hl_group = "DiffReviewReviewComment",
     body_hl_group = "DiffReviewReviewComment",
@@ -722,14 +737,14 @@ local function comment_row_options()
   if overview and type(overview.comment_datetime) == "function" then opts.relative_date = overview.comment_datetime end
   if
     diff_review
-    and type(diff_review._review) == "table"
-    and type(diff_review._review.comment_rule_width) == "function"
-    and type(diff_review._review.truncate_preview_text) == "function"
+    and type(review_mod) == "table"
+    and type(review_mod.comment_rule_width) == "function"
+    and type(review_mod.truncate_preview_text) == "function"
   then
     opts.preview_width = function(prefix)
-      return math.max(0, diff_review._review.comment_rule_width(nil, nil) - vim.fn.strdisplaywidth(prefix))
+      return math.max(0, review_mod.comment_rule_width(nil, nil) - vim.fn.strdisplaywidth(prefix))
     end
-    opts.truncate_preview = diff_review._review.truncate_preview_text
+    opts.truncate_preview = review_mod.truncate_preview_text
   end
   return opts
 end
@@ -889,8 +904,8 @@ end
 ---@return string
 local function hint_winbar()
   local segments = hint_segments()
-  if diff_review and type(diff_review._status_hint_winbar) == "function" then
-    return diff_review._status_hint_winbar(segments, hint_title())
+  if diff_review and type(keymaps_mod.status_hint_winbar) == "function" then
+    return keymaps_mod.status_hint_winbar(segments, hint_title())
   end
   local parts = { ("%%#DiffReviewStatusLabel#%s%%*"):format(hint_title():gsub("%%", "%%%%")) }
   if #segments > 0 then parts[#parts + 1] = "%=" end

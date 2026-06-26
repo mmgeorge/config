@@ -1,6 +1,8 @@
 vim.loader.enable(false)
 
 local diff_review = require("diff_review")
+local hunk_model = require("diff_review.render.hunk_model")
+local ui = require("diff_review.infra.ui")
 local gh = require("diff_review.integrations.gh")
 
 local original_cwd = vim.fs.normalize(vim.fn.getcwd())
@@ -384,7 +386,7 @@ local function section_has_pattern_between(buf, file_pattern, pattern, start_row
 end
 
 local function gutter_text(buf, row)
-  local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
+  local marks = vim.api.nvim_buf_get_extmarks(buf, ui.status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
   for _, mark in ipairs(marks) do
     local details = mark[4] or {}
     if details.virt_text_pos == "inline" and details.virt_text then
@@ -439,7 +441,7 @@ local function run()
   local self_row = find_row(buf, "Self {")
   local self_gutter = gutter_text(buf, self_row)
   assert_true(self_gutter:find("^%s*76%s+85%s+$", 1) ~= nil, "semantic context gutter should map old/new line numbers: " .. self_gutter)
-  local insert_old_line = diff_review._hunk_old_line_for_new_line({
+  local insert_old_line = hunk_model.old_line_for_new_line({
     { old_start = 73, old_count = 0, new_start = 74, new_count = 9 },
     { old_start = 88, old_count = 0, new_start = 89, new_count = 1 },
     { old_start = 74, old_count = 9, new_start = 93, new_count = 0 },
@@ -449,20 +451,20 @@ local function run()
     "pure deletion parent context should use old_start - 1 with current new line, got " .. tostring(insert_old_line)
   )
   assert_true(
-    diff_review._hunk_render_coords_adjacent(73, 93, 74, nil),
+    hunk_model.render_coords_adjacent(73, 93, 74, nil),
     "boundary parent and first deletion row should be adjacent on the old side"
   )
-  local for_mesh_old_line = diff_review._hunk_old_line_for_new_line({
+  local for_mesh_old_line = hunk_model.old_line_for_new_line({
     { old_start = 73, old_count = 0, new_start = 74, new_count = 9 },
     { old_start = 88, old_count = 0, new_start = 89, new_count = 1 },
     { old_start = 74, old_count = 9, new_start = 93, new_count = 0 },
   }, 94)
-  local enumerate_old_line = diff_review._hunk_old_line_for_new_line({
+  local enumerate_old_line = hunk_model.old_line_for_new_line({
     { old_start = 73, old_count = 0, new_start = 74, new_count = 9 },
     { old_start = 88, old_count = 0, new_start = 89, new_count = 1 },
     { old_start = 74, old_count = 9, new_start = 93, new_count = 0 },
   }, 95)
-  local material_old_line = diff_review._hunk_old_line_for_new_line({
+  local material_old_line = hunk_model.old_line_for_new_line({
     { old_start = 73, old_count = 0, new_start = 74, new_count = 9 },
     { old_start = 88, old_count = 0, new_start = 89, new_count = 1 },
     { old_start = 74, old_count = 9, new_start = 93, new_count = 0 },

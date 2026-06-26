@@ -3,15 +3,24 @@
 --- resolution, decoration-row prewarm/scheduling, and cursor restore after a re-render.
 ---
 --- Reads live status state, the diff-source/key/decoration models, and the syntax prewarm seam
---- through the init module via dr().
+--- from session.lua and sibling modules.
 
 local syntax_engine = require("diff_review.render.syntax_engine")
 
---- Resolve the init module lazily so navigation can reach orchestrator state and the shared
---- source/key/prewarm seams without a load-time circular require.
-local function dr()
-  return require("diff_review")
-end
+local source = require("diff_review.render.source")
+-- diff_source_state edge kept lazy to avoid a load-time cycle.
+local function diff_source_state() return require("diff_review.views.status.diff_source_state") end
+-- status_render edge kept lazy to avoid a load-time cycle.
+local function status_render() return require("diff_review.views.status.status_render") end
+-- commit_view edge kept lazy to avoid a load-time cycle.
+local function commit_view() return require("diff_review.views.status.commit_view") end
+local diff_buffer = require("diff_review.views.diff_buffer")
+local status_keys = require("diff_review.views.status.status_keys")
+-- keymaps edge kept lazy to avoid a load-time cycle.
+local function keymaps() return require("diff_review.shared.keymaps") end
+local notifications = require("diff_review.infra.notifications")
+local trace = require("diff_review.infra.perf_trace")
+local ui = require("diff_review.infra.ui")
 local session = require("diff_review.session")
 
 local M = {}
@@ -50,7 +59,7 @@ function M._status_source_policy_for_entry(status, entry)
   if not source_id and entry.kind == "pr_hunk" and status.pr then source_id = "pr:" .. tostring(status.pr.number) .. ":changes" end
   if not source_id and entry.kind == "pr_review_hunk" then source_id = "review:unviewed" end
   if not source_id then return nil end
-  return dr()._diff_source_model.policy(status.diff_source_registry, source_id)
+  return source.policy(status.diff_source_registry, source_id)
 end
 
 ---@param status table?
@@ -58,8 +67,8 @@ end
 ---@return boolean
 function M._status_source_policy_allows_cursor(status, command)
   if not (status and status.entries) then return true end
-  local _, entry = dr()._status_entry_line_under_cursor()
-  local policy = dr()._status_source_policy_for_entry(status, entry)
+  local _, entry = M._status_entry_line_under_cursor()
+  local policy = M._status_source_policy_for_entry(status, entry)
   if not policy then return true end
   return policy[command] == true
 end
@@ -90,10 +99,10 @@ function M._status_parent_entry(current_line, entry)
     local candidate = entries[line]
     if entry.fold_target_id and candidate and candidate.id == entry.fold_target_id then return candidate end
     if entry.kind == "commit_hunk" and candidate and candidate.kind == "commit_file" then return candidate end
-    if dr()._status_entry_is_hunk_like(entry) and dr()._status_entry_is_file_like(candidate) then return candidate end
-    if dr()._status_entry_is_file_like(entry) and candidate and candidate.kind == "pr_review" then return candidate end
-    if dr()._status_entry_is_file_like(entry) and candidate and candidate.kind == "commit" then return candidate end
-    if (dr()._status_entry_is_file_like(entry) or entry.kind == "commit" or entry.kind == "pr_review") and candidate and candidate.kind == "section" then
+    if M._status_entry_is_hunk_like(entry) and M._status_entry_is_file_like(candidate) then return candidate end
+    if M._status_entry_is_file_like(entry) and candidate and candidate.kind == "pr_review" then return candidate end
+    if M._status_entry_is_file_like(entry) and candidate and candidate.kind == "commit" then return candidate end
+    if (M._status_entry_is_file_like(entry) or entry.kind == "commit" or entry.kind == "pr_review") and candidate and candidate.kind == "section" then
       return candidate
     end
   end
@@ -102,29 +111,29 @@ end
 
 ---@param entry DiffReviewStatusEntry?
 local function status_prewarm_entry_syntax(entry)
-  return dr()._status_perf_span("status.prewarm_entry_syntax", session.status and session.status.buf or nil, {
+  return trace.span("status.prewarm_entry_syntax", session.status and session.status.buf or nil, {
     entry_id = entry and entry.id or nil,
     entry_kind = entry and entry.kind or nil,
     file = entry and entry.file and entry.file.filename or nil,
   }, function()
     if not entry then return end
-    if dr()._status_entry_is_file_like(entry) and entry.file then
-      local syntax_source = dr()._status_syntax_source_for_entry_kind(entry.kind)
+    if M._status_entry_is_file_like(entry) and entry.file then
+      local syntax_source = syntax_engine.status_syntax_source_for_entry_kind(entry.kind)
       syntax_engine.prewarm_file_diff_syntax(entry.file, "status-cursor-prewarm:" .. (entry.id or entry.file.filename), nil, { syntax_source = syntax_source })
-    elseif dr()._status_entry_is_hunk_like(entry) and entry.file and entry.hunk then
+    elseif M._status_entry_is_hunk_like(entry) and entry.file and entry.hunk then
       local callback_key = "status-cursor-prewarm:" .. (entry.id or entry.file.filename)
-      local syntax_source = dr()._status_syntax_source_for_entry_kind(entry.kind)
+      local syntax_source = syntax_engine.status_syntax_source_for_entry_kind(entry.kind)
       local syntax_diff_text = nil
       if syntax_source == "file" then
-        syntax_diff_text = dr()._status_perf_span("status.prewarm_entry_syntax.hunk_combined_diff", session.status and session.status.buf or nil, {
+        syntax_diff_text = trace.span("status.prewarm_entry_syntax.hunk_combined_diff", session.status and session.status.buf or nil, {
           entry_id = entry.id,
           entry_kind = entry.kind,
           file = entry.file.filename,
         }, function()
-          return dr()._status_file_syntax_diff_text(entry.file)
+          return syntax_engine.status_file_syntax_diff_text(entry.file)
         end)
       end
-      dr()._prewarm_diff_syntax(entry.file.filename, entry.hunk.diff, { entry.hunk.staged }, callback_key, nil, {
+      syntax_engine.prewarm_diff_syntax(entry.file.filename, entry.hunk.diff, { entry.hunk.staged }, callback_key, nil, {
         syntax_source = syntax_source,
         syntax_diff_text = syntax_diff_text,
       })
@@ -144,9 +153,9 @@ function M._status_resolve_decoration_row(buf, row)
   local diff_line = (entry.diff_lines and entry.diff_lines[1]) or entry.diff_line
   local file = entry.file
   if not (diff_line and file) then return nil end
-  local source_id = dr()._status_diff_source_id(file, entry.kind)
+  local source_id = diff_source_state()._status_diff_source_id(file, entry.kind)
   return {
-    file_key = dr()._diff_source_model.file_key(source_id, file.relpath or file.filename),
+    file_key = source.file_key(source_id, file.relpath or file.filename),
     revision = status.render_revision or 0,
     line = diff_line.line,
     side = diff_line.side == "left" and "old" or "new",
@@ -173,7 +182,7 @@ function M._status_schedule_decorate_visible(buf, first_row, last_row)
     local current = session.states and session.states[buf] or nil
     if not (current and current.decorate_request_id == request_id) then return end
     if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
-    dr()._status_decorate_visible(buf, first_row, last_row)
+    status_render().status_decorate_visible(buf, first_row, last_row)
   end, 30)
 end
 
@@ -197,7 +206,7 @@ local function status_defer_prewarm_under_cursor(buf)
   local request_id = status.cursor_prewarm_request_id
   local entry = status_entry_under_cursor()
   local entry_id = entry and entry.id or nil
-  dr()._status_perf_event("status.cursor_prewarm_schedule", buf, {
+  trace.event("status.cursor_prewarm_schedule", buf, {
     request_id = request_id,
     entry_id = entry_id,
     entry_kind = entry and entry.kind or nil,
@@ -207,7 +216,7 @@ local function status_defer_prewarm_under_cursor(buf)
     local latest_status = session.states and session.states[buf] or session.status
     if not (latest_status and latest_status.cursor_prewarm_request_id == request_id) then return end
     if not (buf and vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_get_current_buf() == buf) then return end
-    dr()._status_perf_span("status.cursor_prewarm_run", buf, {
+    trace.span("status.cursor_prewarm_run", buf, {
       request_id = request_id,
       scheduled_entry_id = entry_id,
     }, function()
@@ -275,7 +284,7 @@ local function status_file_entries_for_entry(entry)
   if entry.kind == "section" then
     local entries = {}
     for _, file in ipairs(entry.section.files or {}) do
-      entries[#entries + 1] = { id = dr()._status_keys.file_key(file.section_name, file.filename), kind = "file", file = file }
+      entries[#entries + 1] = { id = status_keys.file_key(file.section_name, file.filename), kind = "file", file = file }
     end
     return entries
   end
@@ -332,7 +341,7 @@ local function status_notify_action(action, hunk_count, file_count)
   if file_count > 0 then
     parts[#parts + 1] = ("%d file(s)"):format(file_count)
   end
-  dr()._notify_debug(("%s %s"):format(action, table.concat(parts, ", ")), vim.log.levels.INFO, { title = "DiffReview" })
+  notifications.debug(("%s %s"):format(action, table.concat(parts, ", ")), vim.log.levels.INFO, { title = "DiffReview" })
 end
 
 ---@param entries DiffReviewStatusEntry[]
@@ -426,7 +435,7 @@ local function status_nearest_header_line(fallback_line)
     local best_line = nil
     local best_distance = nil
     for entry_id, line in pairs(viewport.logical_entry_line_by_id) do
-      local entry = dr()._status_entry_by_id(entry_id)
+      local entry = commit_view()._status_entry_by_id(entry_id)
       if entry and (
         entry.kind == "section"
         or entry.kind == "file"
@@ -495,7 +504,7 @@ local function status_restore_cursor(buf, target_id, fallback_line)
   local target_line = nil
   local entries = session.status and session.status.entries
   if target_id then
-    target_line = dr()._status_find_entry_line(entries, target_id, fallback_line)
+    target_line = M._status_find_entry_line(entries, target_id, fallback_line)
   end
   if not target_line and not fallback_line then return end
   if not target_line and fallback_line and status_target_is_header(target_id) then
@@ -513,15 +522,15 @@ local function status_set_plain_lines(buf, lines)
   if session.diff_line_content_lengths then session.diff_line_content_lengths[buf] = nil end
   local state = session.states and session.states[buf] or (session.status and session.status.buf == buf and session.status) or nil
   if state then state.diff_viewport = nil end
-  dr()._clear_diff_gutter_visual_line(buf)
+  diff_buffer._clear_diff_gutter_visual_line(buf)
   local was_rendering = vim.b[buf].diff_review_status_rendering
   vim.b[buf].diff_review_status_rendering = true
   vim.bo[buf].modifiable = true
-  vim.api.nvim_buf_clear_namespace(buf, dr()._status_ns, 0, -1)
+  vim.api.nvim_buf_clear_namespace(buf, ui.status_ns, 0, -1)
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
   vim.bo[buf].modifiable = false
   vim.b[buf].diff_review_status_rendering = was_rendering
-  dr()._status_apply_hint_bar(buf)
+  keymaps().status_apply_hint_bar(buf)
 end
 
 -- Expose the bare-local navigation helpers that init action handlers and other modules call by name.

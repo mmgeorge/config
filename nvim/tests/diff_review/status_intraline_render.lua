@@ -1,6 +1,8 @@
 vim.loader.enable(false)
 
 local diff_review = require("diff_review")
+local status_render = require("diff_review.views.status.status_render")
+local ui = require("diff_review.infra.ui")
 local session = require("diff_review.session")
 local gh = require("diff_review.integrations.gh")
 
@@ -8,9 +10,9 @@ local gh = require("diff_review.integrations.gh")
 -- emitted by the provider; drive the test seam to apply them into the decorate
 -- namespace, then read marks from both namespaces (gutter stays in _status_ns).
 local function row_marks(buf, row)
-  pcall(diff_review._status_decorate_rows, buf, row, row)
-  local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
-  for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(buf, diff_review._status_decorate_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })) do
+  pcall(status_render.status_decorate_rows, buf, row, row)
+  local marks = vim.api.nvim_buf_get_extmarks(buf, ui.status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
+  for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(buf, ui.status_decorate_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })) do
     marks[#marks + 1] = mark
   end
   return marks

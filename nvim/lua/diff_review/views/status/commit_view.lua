@@ -2,18 +2,28 @@
 --- (commit) view, create-PR confirmation, the verdict/help popups, the remote push/pull action,
 --- and the jump/toggle/collapse cursor actions over status entries.
 ---
---- Reads live status state, render/open entry points, and the commit-file loader through the init
---- module via dr(); uses the git backend as a direct require.
+--- Reads live status state, render/open entry points, and the commit-file loader from session.lua and sibling modules; uses the git backend as a direct require.
 
 local git_backend = require("diff_review.git.git_backend")
-local keymaps = require("diff_review.shared.keymaps")
+-- keymaps edge kept lazy to avoid a load-time cycle.
+local function keymaps() return require("diff_review.shared.keymaps") end
 local status_command_specs = require("diff_review.shared.command_specs").specs
 
---- Resolve the init module lazily so dialog/action handlers can reach orchestrator state and the
---- open/render seams without a load-time circular require.
-local function dr()
-  return require("diff_review")
-end
+local pr_edit = require("diff_review.views.pr.pr_edit")
+local render_orchestrator = require("diff_review.views.status.render_orchestrator")
+-- review edge kept lazy to avoid a load-time cycle.
+local function review() return require("diff_review.views.pr.review") end
+local file_revision = require("diff_review.views.file_revision")
+local status_keys = require("diff_review.views.status.status_keys")
+local pr_state = require("diff_review.views.status.pr_state")
+local status_head = require("diff_review.views.status.status_head")
+-- entry_nav edge kept lazy to avoid a load-time cycle.
+local function entry_nav() return require("diff_review.views.status.entry_nav") end
+-- fold_state edge kept lazy to avoid a load-time cycle.
+local function fold_state() return require("diff_review.views.status.fold_state") end
+local status_helpers = require("diff_review.views.status.status_helpers")
+local notifications = require("diff_review.infra.notifications")
+local ui = require("diff_review.infra.ui")
 local session = require("diff_review.session")
 
 local M = {}
@@ -68,8 +78,8 @@ local function status_open_about(entry)
   if not about and session.status then about = session.status.about end
   if not about or about.state == "none" then
     local status = session.status
-    if status and status.cwd and status.buf and dr()._status_has_changes(status.sections) then
-      dr()._status_ensure_about_state(status.cwd, status.buf, true, false, true)
+    if status and status.cwd and status.buf and pr_state.status_has_changes(status.sections) then
+      pr_state.status_ensure_about_state(status.cwd, status.buf, true, false, true)
       vim.notify("Generating commit message...", vim.log.levels.INFO, { title = "DiffReview" })
       return
     end
@@ -124,7 +134,7 @@ function M._status_open_commit_message(commit, cwd)
   if type(commit) ~= "table" then return false end
   local oid = vim.trim(tostring(commit.oid or commit.sha or commit.id or ""))
   local short_oid = vim.trim(tostring(commit.short_oid or commit.shortOid or commit.abbreviatedOid or ""))
-  if short_oid == "" then short_oid = dr()._status_short_oid(oid) end
+  if short_oid == "" then short_oid = status_head._status_short_oid(oid) end
   local title_id = short_oid ~= "" and short_oid or vim.fn.sha256(tostring(commit.subject or commit.messageHeadline or "")):sub(1, 8)
 
   local buf = vim.api.nvim_create_buf(true, false)
@@ -146,22 +156,22 @@ function M._status_open_commit_message(commit, cwd)
 
   local function set_lines(lines)
     if not vim.api.nvim_buf_is_valid(buf) then return end
-    if type(lines) ~= "table" or #lines == 0 then lines = dr()._status_commit_message_fallback_lines(commit) end
+    if type(lines) ~= "table" or #lines == 0 then lines = M._status_commit_message_fallback_lines(commit) end
     vim.bo[buf].modifiable = true
     vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
     vim.bo[buf].modifiable = false
   end
 
   if oid == "" or not (cwd and cwd ~= "") then
-    set_lines(dr()._status_commit_message_fallback_lines(commit))
+    set_lines(M._status_commit_message_fallback_lines(commit))
     return true
   end
 
   git_backend.systemlist_async({ "git", "-C", cwd, "show", "-s", "--format=%B", oid }, function(output, code, stderr)
     if code ~= 0 then
       local message = vim.trim(stderr or "")
-      dr()._notify_error("Commit message failed: " .. (message ~= "" and message or ("git exited " .. tostring(code))), "DiffReview")
-      set_lines(dr()._status_commit_message_fallback_lines(commit))
+      notifications.error("Commit message failed: " .. (message ~= "" and message or ("git exited " .. tostring(code))), "DiffReview")
+      set_lines(M._status_commit_message_fallback_lines(commit))
       return
     end
     set_lines(output or {})
@@ -171,9 +181,9 @@ end
 
 function M._status_open_commit_message_under_cursor(entry)
   local cursor = vim.api.nvim_win_get_cursor(0)
-  local commit = dr()._status_commit_message_target(entry, cursor and cursor[2])
+  local commit = M._status_commit_message_target(entry, cursor and cursor[2])
   if not commit then return false end
-  return dr()._status_open_commit_message(commit, session.status and session.status.cwd)
+  return M._status_open_commit_message(commit, session.status and session.status.cwd)
 end
 
 ---@param span table
@@ -208,7 +218,7 @@ function M._status_jump_diff_line(entry, cursor_col)
   local has_delete = false
   local cursor_span = nil
   for _, span in ipairs(spans) do
-    local kind = dr()._status_inline_span_kind(span)
+    local kind = M._status_inline_span_kind(span)
     if kind == "add" then has_add = true end
     if kind == "delete" then has_delete = true end
     if type(cursor_col) == "number"
@@ -220,11 +230,11 @@ function M._status_jump_diff_line(entry, cursor_col)
     end
   end
 
-  local cursor_kind = dr()._status_inline_span_kind(cursor_span)
-  if cursor_kind == "add" then return dr()._status_diff_line_with_prefix(entry, "+") or entry.diff_line end
-  if cursor_kind == "delete" then return dr()._status_diff_line_with_prefix(entry, "-") or entry.diff_line end
-  if has_add and not has_delete then return dr()._status_diff_line_with_prefix(entry, "-") or entry.diff_line end
-  if has_delete and not has_add then return dr()._status_diff_line_with_prefix(entry, "+") or entry.diff_line end
+  local cursor_kind = M._status_inline_span_kind(cursor_span)
+  if cursor_kind == "add" then return M._status_diff_line_with_prefix(entry, "+") or entry.diff_line end
+  if cursor_kind == "delete" then return M._status_diff_line_with_prefix(entry, "-") or entry.diff_line end
+  if has_add and not has_delete then return M._status_diff_line_with_prefix(entry, "-") or entry.diff_line end
+  if has_delete and not has_add then return M._status_diff_line_with_prefix(entry, "+") or entry.diff_line end
   return entry.diff_line
 end
 
@@ -234,11 +244,11 @@ end
 local function status_jump(entry, skip_revision, selected_diff_line)
   if not (entry and entry.file and entry.file.filename) then return end
   local cursor = vim.api.nvim_win_get_cursor(0)
-  local jump_diff_line = selected_diff_line or dr()._status_jump_diff_line(entry, cursor and cursor[2])
+  local jump_diff_line = selected_diff_line or M._status_jump_diff_line(entry, cursor and cursor[2])
   if not skip_revision and jump_diff_line and jump_diff_line.side == "left" and jump_diff_line.line then
-    local rev, path = dr()._file_revision.target(entry, session.status)
+    local rev, path = file_revision.target(entry, session.status)
     if rev and path then
-      dr()._file_revision.open({
+      file_revision.open({
         rev = rev,
         path = path,
         cwd = session.status.cwd,
@@ -254,7 +264,7 @@ local function status_jump(entry, skip_revision, selected_diff_line)
   local target_line
   if jump_diff_line and jump_diff_line.line then
     if jump_diff_line.side == "left" and entry.hunk and entry.hunk.diff then
-      target_line = dr()._closest_current_line_for_deleted_diff_line(entry.hunk.diff, jump_diff_line.line)
+      target_line = status_helpers.closest_current_line_for_deleted_diff_line(entry.hunk.diff, jump_diff_line.line)
     else
       target_line = jump_diff_line.line
     end
@@ -291,7 +301,7 @@ end
 function M._status_entry_default_folded(entry)
   if not entry then return false end
   if entry.default_folded ~= nil then return entry.default_folded == true end
-  local ranges = dr()._status_fold_ranges_for_id(session.status, entry.id)
+  local ranges = fold_state()._status_fold_ranges_for_id(session.status, entry.id)
   local range = ranges[1]
   if range and range.default_folded ~= nil then return range.default_folded == true end
   if entry.kind == "file" or entry.kind == "pr_file" then
@@ -320,45 +330,45 @@ local function status_toggle(entry, state)
   if not entry then return end
   local fold_id = entry.fold_target_id or entry.id
   if not fold_id then return end
-  if state and state.buf and dr()._pr_edit.blocks_render(state.buf) then return end
+  if state and state.buf and pr_edit.blocks_render(state.buf) then return end
   local fold_entry = entry
   if entry.fold_target_id then
-    fold_entry = dr()._status_entry_by_id(fold_id) or { id = fold_id, kind = "pr_head_section" }
+    fold_entry = M._status_entry_by_id(fold_id) or { id = fold_id, kind = "pr_head_section" }
   end
-  local default = dr()._status_entry_default_folded(fold_entry)
-  local current_folded = dr()._status_folded(fold_id, default, state)
-  local native_state = dr()._status_native_folded(state.buf, dr()._status_fold_ranges_for_id(state, fold_id), vim.api.nvim_get_current_win())
+  local default = M._status_entry_default_folded(fold_entry)
+  local current_folded = fold_state()._status_folded(fold_id, default, state)
+  local native_state = fold_state()._status_native_folded(state.buf, fold_state()._status_fold_ranges_for_id(state, fold_id), vim.api.nvim_get_current_win())
   if native_state ~= nil then current_folded = native_state end
   local next_folded = not current_folded
   if not next_folded then
-    dr()._status_prewarm_entry_syntax(fold_entry)
+    entry_nav()._status_prewarm_entry_syntax(fold_entry)
   end
-  dr()._set_status_folded(fold_id, next_folded, state)
+  fold_state()._set_status_folded(fold_id, next_folded, state)
   if fold_entry.kind == "commit" and not next_folded and fold_entry.commit then
-    dr()._status_load_commit_files(fold_entry.commit)
+    status_helpers.status_load_commit_files(fold_entry.commit)
   end
-  local native_folded = dr()._status_set_native_fold_state(state.buf, fold_id, next_folded)
+  local native_folded = fold_state()._status_set_native_fold_state(state.buf, fold_id, next_folded)
   if not native_folded then
-    dr()._render_status_or_notify(state.buf, fold_id, vim.api.nvim_win_get_cursor(0)[1], { reuse_sections = true })
+    render_orchestrator.render_status_or_notify(state.buf, fold_id, vim.api.nvim_win_get_cursor(0)[1], { reuse_sections = true })
   elseif state.view_kind == "status" then
     local walkthrough = package.loaded["diff_review.views.walkthrough"]
     if walkthrough and walkthrough.on_status_rendered then walkthrough.on_status_rendered(state.buf) end
   end
   if state.view_kind == "pr" then
-    dr()._pr_edit.sync_modifiable(state.buf)
+    pr_edit.sync_modifiable(state.buf)
   elseif state.view_kind == "review" then
-    dr()._review.sync_modifiable(state.buf)
+    review().sync_modifiable(state.buf)
   end
 end
 
 function M._status_collapse_parent()
-  local line, entry = dr()._status_entry_line_under_cursor()
+  local line, entry = entry_nav()._status_entry_line_under_cursor()
   if not (line and entry) then return end
-  local parent = dr()._status_parent_entry(line, entry)
+  local parent = entry_nav()._status_parent_entry(line, entry)
   local target = parent or entry
-  dr()._set_status_folded(target.id, true)
-  if not dr()._status_set_native_fold_state(session.status.buf, target.id, true) then
-    dr()._render_status_or_notify(session.status.buf, target.id, vim.api.nvim_win_get_cursor(0)[1], { reuse_sections = true })
+  fold_state()._set_status_folded(target.id, true)
+  if not fold_state()._status_set_native_fold_state(session.status.buf, target.id, true) then
+    render_orchestrator.render_status_or_notify(session.status.buf, target.id, vim.api.nvim_win_get_cursor(0)[1], { reuse_sections = true })
   elseif session.status.view_kind == "status" then
     local walkthrough = package.loaded["diff_review.views.walkthrough"]
     if walkthrough and walkthrough.on_status_rendered then walkthrough.on_status_rendered(session.status.buf) end
@@ -400,7 +410,7 @@ local function status_open_popup(title, lines)
       pcall(vim.api.nvim_win_close, win, true)
     end
   end
-  for _, key in ipairs({ "q", "<Esc>", dr()._status_keys.primary_key("help") }) do
+  for _, key in ipairs({ "q", "<Esc>", status_keys.primary_key("help") }) do
     if key ~= "" then
       vim.keymap.set("n", key, close, { buffer = buf, nowait = true, silent = true, desc = "Close help" })
     end
@@ -408,22 +418,22 @@ local function status_open_popup(title, lines)
 
   local key_width = 0
   for _, spec in ipairs(status_command_specs) do
-    if keymaps.status_command_visible(spec) then
-      key_width = math.max(key_width, #dr()._status_keys.key_text(keymaps.status_keys_for(spec.id)))
+    if keymaps().status_command_visible(spec) then
+      key_width = math.max(key_width, #status_keys.key_text(keymaps().status_keys_for(spec.id)))
     end
   end
   local line_index = 0
   for _, spec in ipairs(status_command_specs) do
-    if not keymaps.status_command_visible(spec) then goto continue end
-    local key_text = dr()._status_keys.key_text(keymaps.status_keys_for(spec.id))
+    if not keymaps().status_command_visible(spec) then goto continue end
+    local key_text = status_keys.key_text(keymaps().status_keys_for(spec.id))
     if key_text ~= "" then
       line_index = line_index + 1
-      pcall(vim.api.nvim_buf_set_extmark, buf, dr()._status_ns, line_index - 1, 2, {
+      pcall(vim.api.nvim_buf_set_extmark, buf, ui.status_ns, line_index - 1, 2, {
         end_col = 2 + #key_text,
         hl_group = "DiffReviewStatusHintKey",
         priority = 90,
       })
-      pcall(vim.api.nvim_buf_set_extmark, buf, dr()._status_ns, line_index - 1, key_width + 6, {
+      pcall(vim.api.nvim_buf_set_extmark, buf, ui.status_ns, line_index - 1, key_width + 6, {
         end_col = #lines[line_index],
         hl_group = "DiffReviewStatusHint",
         priority = 80,
@@ -438,15 +448,15 @@ end
 local function status_show_help()
   local key_width = 0
   for _, spec in ipairs(status_command_specs) do
-    if keymaps.status_command_visible(spec) then
-      key_width = math.max(key_width, #dr()._status_keys.key_text(keymaps.status_keys_for(spec.id)))
+    if keymaps().status_command_visible(spec) then
+      key_width = math.max(key_width, #status_keys.key_text(keymaps().status_keys_for(spec.id)))
     end
   end
 
   local lines = {}
   for _, spec in ipairs(status_command_specs) do
-    if not keymaps.status_command_visible(spec) then goto continue end
-    local key_text = dr()._status_keys.key_text(keymaps.status_keys_for(spec.id))
+    if not keymaps().status_command_visible(spec) then goto continue end
+    local key_text = status_keys.key_text(keymaps().status_keys_for(spec.id))
     if key_text ~= "" then
       lines[#lines + 1] = ("  %-" .. key_width .. "s  %s"):format(key_text, spec.desc)
     end
@@ -460,7 +470,7 @@ end
 local function status_remote_action(buf, action)
   git_backend.git_root_async(function(cwd, root_err)
     if not cwd then
-      dr()._notify_error(root_err or "Unable to find git root")
+      notifications.error(root_err or "Unable to find git root")
       return
     end
 
@@ -473,9 +483,9 @@ local function status_remote_action(buf, action)
         session.status.remote_action = session.status.remote_action or { action = action, state = "running" }
         session.status.remote_action.status = line
         if session.status.head_values then
-          session.status.head_lines = dr()._status_build_head_lines(session.status.head_values, session.status.pr, session.status.about, session.status.issues)
+          session.status.head_lines = status_head._status_build_head_lines(session.status.head_values, session.status.pr, session.status.about, session.status.issues)
           if vim.api.nvim_buf_is_valid(buf) then
-            dr().render_status(buf, nil, nil, { reuse_sections = true })
+            render_orchestrator.render_status(buf, nil, nil, { reuse_sections = true })
           end
         end
       end
@@ -483,13 +493,13 @@ local function status_remote_action(buf, action)
     if session.status then
       session.status.remote_action = { action = action, state = "running", status = running_status }
       if session.status.head_values then
-        session.status.head_lines = dr()._status_build_head_lines(session.status.head_values, session.status.pr, session.status.about, session.status.issues)
+        session.status.head_lines = status_head._status_build_head_lines(session.status.head_values, session.status.pr, session.status.about, session.status.issues)
         if vim.api.nvim_buf_is_valid(buf) then
-          dr().render_status(buf, nil, nil, { reuse_sections = true })
+          render_orchestrator.render_status(buf, nil, nil, { reuse_sections = true })
         end
       end
     end
-    dr()._notify_debug(title .. "ing changes...", vim.log.levels.INFO, { title = "DiffReview" })
+    notifications.debug(title .. "ing changes...", vim.log.levels.INFO, { title = "DiffReview" })
     git_backend.system_text_stream_async({ "git", "-C", cwd, action, "--progress" }, nil, update_remote_status, function(result)
       local compact = {}
       for _, line in ipairs(git_backend.text_to_lines((result.stdout or "") .. (result.stderr or ""))) do
@@ -498,13 +508,13 @@ local function status_remote_action(buf, action)
         end
       end
       if result.code == 0 then
-        dr()._notify_debug(title .. " complete", vim.log.levels.INFO, { title = "DiffReview" })
+        notifications.debug(title .. " complete", vim.log.levels.INFO, { title = "DiffReview" })
       else
-        dr()._notify_error(title .. " failed: " .. (#compact > 0 and table.concat(compact, "\n") or ("git exited " .. result.code)))
+        notifications.error(title .. " failed: " .. (#compact > 0 and table.concat(compact, "\n") or ("git exited " .. result.code)))
       end
       if vim.api.nvim_buf_is_valid(buf) then
         if session.status then session.status.remote_action = nil end
-        dr()._render_status_or_notify(buf)
+        render_orchestrator.render_status_or_notify(buf)
       end
     end)
   end)

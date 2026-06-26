@@ -6,11 +6,10 @@ local M = {}
 local git_backend = require("diff_review.git.git_backend")
 local notifications = require("diff_review.infra.notifications")
 
---- Resolve the diff_review root module lazily, avoiding a load-time cycle while letting
---- branch_diff reach status state, section building, and the render core at call time.
-local function dr()
-  return require("diff_review")
-end
+-- status_render edge kept lazy to avoid a load-time cycle.
+local function status_render() return require("diff_review.views.status.status_render") end
+-- section_builder edge kept lazy to avoid a load-time cycle.
+local function section_builder() return require("diff_review.views.status.section_builder") end
 local session = require("diff_review.session")
 
 
@@ -45,7 +44,7 @@ end
 ---@return DiffReviewStatusSection[]
 function M.sections(cwd, branch, diff_text, file)
   local provider_key = "diff:" .. branch .. (file and (":" .. file) or "")
-  local sections = dr()._section_builder.sections_from_diff(cwd, {
+  local sections = section_builder().sections_from_diff(cwd, {
     title = "Changes vs " .. branch,
     section_name = provider_key .. ":changes",
     default_status = "",
@@ -68,7 +67,7 @@ function M.render(branch, cwd, buf, diff_text, file)
   status.head_lines = M.head_lines(branch, file)
   status.sections = M.sections(cwd, branch, diff_text, file)
   status.fancy_rows = {}
-  dr()._status_render_loaded(buf, nil, nil, { reuse_sections = true }, status.head_lines, status.sections)
+  status_render().status_render_loaded(buf, nil, nil, { reuse_sections = true }, status.head_lines, status.sections)
 end
 
 ---@param branch string
@@ -80,7 +79,7 @@ function M.load(branch, cwd, buf, file)
   if not (status and status.buf == buf) then return end
   status.branch_diff_request_id = (status.branch_diff_request_id or 0) + 1
   local request_id = status.branch_diff_request_id
-  local command = dr()._git_diff_command(cwd, { branch })
+  local command = git_backend.git_diff_command(cwd, { branch })
   if file then
     vim.list_extend(command, { "--", file })
   end

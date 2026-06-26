@@ -1,6 +1,7 @@
 vim.loader.enable(false)
 
 local diff_review = require("diff_review")
+local render_orchestrator = require("diff_review.views.status.render_orchestrator")
 local session = require("diff_review.session")
 local gh = require("diff_review.integrations.gh")
 local walkthrough = require("diff_review.views.walkthrough")
@@ -1027,7 +1028,7 @@ local function run()
   end,
     "walkthrough summary did not unfold")
 
-  diff_review.render_status(buf, nil, nil, { reuse_sections = true })
+  render_orchestrator.render_status(buf, nil, nil, { reuse_sections = true })
   wait_for(function() return box_contains(buf, "forward navigation") end, "re-render dropped visible walkthrough boxes")
 
   trigger_buf_mapping(buf, "ow")

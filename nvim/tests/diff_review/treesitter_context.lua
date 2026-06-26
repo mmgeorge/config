@@ -1,6 +1,7 @@
 vim.loader.enable(false)
 
 local diff_review = require("diff_review")
+local git_data = require("diff_review.git.git_data")
 local original_cwd = vim.fs.normalize(vim.fn.getcwd())
 local test_root = vim.fs.normalize(original_cwd .. "/.diffreview-treesitter-context-test")
 
@@ -44,7 +45,7 @@ local function run()
   vim.bo[buf].filetype = "rust"
 
   local struct_context = nil
-  diff_review.compute_hunk_context_async(filename, 3, function(context)
+  git_data.compute_hunk_context_async(filename, 3, function(context)
     struct_context = context
   end)
   wait_for(function() return struct_context ~= nil end, "struct context did not resolve")
@@ -54,7 +55,7 @@ local function run()
   assert_true(struct_context.end_text == "}", "wrong struct end: " .. tostring(struct_context.end_text))
 
   local function_context = nil
-  diff_review.compute_hunk_context_async(filename, 9, function(context)
+  git_data.compute_hunk_context_async(filename, 9, function(context)
     function_context = context
   end)
   wait_for(function() return function_context ~= nil end, "function context did not resolve")
@@ -74,7 +75,7 @@ local function run()
 
   vim.api.nvim_buf_delete(buf, { force = true })
   local unloaded_context = nil
-  diff_review.compute_hunk_context_async(filename, 3, function(context)
+  git_data.compute_hunk_context_async(filename, 3, function(context)
     unloaded_context = context
   end)
   wait_for(function() return unloaded_context ~= nil end, "unloaded file context did not resolve")

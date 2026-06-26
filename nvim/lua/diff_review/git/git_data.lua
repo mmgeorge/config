@@ -2,7 +2,7 @@
 --- unified-diff parsing, hunk extraction/ordering, untracked-diff synthesis, the git-status item
 --- collector, and the async tree-sitter syntax computation entry points.
 ---
---- Reads the notify/filetype/nul helpers and live status state through the init module via dr(),
+--- Reads the notify/filetype/nul helpers and live status state from session.lua and sibling modules,
 --- and the git backend, syntax engine, and path helpers as direct requires.
 
 local git_backend = require("diff_review.git.git_backend")
@@ -12,9 +12,9 @@ local paths = require("diff_review.infra.paths")
 --- Resolve the init module lazily so git data ops can reach the shared notify/filetype seams and
 --- orchestrator state without a load-time circular require.
 local util = require("diff_review.infra.util")
-local function dr()
-  return require("diff_review")
-end
+local diff_buffer = require("diff_review.views.diff_buffer")
+local notifications = require("diff_review.infra.notifications")
+local trace = require("diff_review.infra.perf_trace")
 local session = require("diff_review.session")
 
 local M = {}
@@ -24,7 +24,7 @@ local function run_file_batch_async(files, args_for_file, title, cb)
   git_backend.git_root_async(function(root, root_err)
   if not root then
     local failures = { { message = root_err or "Unable to find git root" } }
-    dr().notify_git_failures(title, failures)
+    notifications.git_failures(title, failures)
     cb({ ok = false, successes = {}, failures = failures })
     return
   end
@@ -36,7 +36,7 @@ local function run_file_batch_async(files, args_for_file, title, cb)
 
   local function finish_all()
     if #failures > 0 then
-      dr().notify_git_failures(title, failures)
+      notifications.git_failures(title, failures)
     end
     cb({ ok = #failures == 0, successes = successes, failures = failures })
   end
@@ -82,7 +82,7 @@ local function run_file_batch_sync_for_test_backend(files, args_for_file, title)
   local root, root_err = git_backend.git_root_sync_for_test_backend()
   if not root then
     local failures = { { message = root_err or "Unable to find git root" } }
-    dr().notify_git_failures(title, failures)
+    notifications.git_failures(title, failures)
     return { ok = false, successes = {}, failures = failures }
   end
 
@@ -107,7 +107,7 @@ local function run_file_batch_sync_for_test_backend(files, args_for_file, title)
     end
   end
   if #failures > 0 then
-    dr().notify_git_failures(title, failures)
+    notifications.git_failures(title, failures)
   end
   return { ok = #failures == 0, successes = successes, failures = failures }
 end
@@ -116,13 +116,13 @@ end
 ---@param cb fun(ok: boolean)
 function M.stage_patch_async(diff, cb)
   if not diff or diff == "" then
-    dr()._notify_error("No patch to stage")
+    notifications.error("No patch to stage")
     cb(false)
     return
   end
   git_backend.run_git_async({ "apply", "--cached", "--whitespace=nowarn", "--unidiff-zero", "-" }, diff .. "\n", function(result)
     if not result.ok then
-      dr()._notify_error("Stage failed: " .. (result.output ~= "" and result.output or ("git exited " .. result.code)))
+      notifications.error("Stage failed: " .. (result.output ~= "" and result.output or ("git exited " .. result.code)))
       cb(false)
       return
     end
@@ -134,13 +134,13 @@ end
 ---@param cb fun(ok: boolean)
 function M.unstage_patch_async(diff, cb)
   if not diff or diff == "" then
-    dr()._notify_error("No patch to unstage")
+    notifications.error("No patch to unstage")
     cb(false)
     return
   end
   git_backend.run_git_async({ "apply", "--cached", "--reverse", "--whitespace=nowarn", "--unidiff-zero", "-" }, diff .. "\n", function(result)
     if not result.ok then
-      dr()._notify_error("Unstage failed: " .. (result.output ~= "" and result.output or ("git exited " .. result.code)))
+      notifications.error("Unstage failed: " .. (result.output ~= "" and result.output or ("git exited " .. result.code)))
       cb(false)
       return
     end
@@ -152,12 +152,12 @@ end
 ---@return boolean
 function M.stage_patch(diff)
   if not diff or diff == "" then
-    dr()._notify_error("No patch to stage")
+    notifications.error("No patch to stage")
     return false
   end
   local result = git_backend.run_git_sync_for_test_backend({ "apply", "--cached", "--whitespace=nowarn", "--unidiff-zero", "-" }, diff .. "\n")
   if not result.ok then
-    dr()._notify_error("Stage failed: " .. (result.output ~= "" and result.output or ("git exited " .. result.code)))
+    notifications.error("Stage failed: " .. (result.output ~= "" and result.output or ("git exited " .. result.code)))
     return false
   end
   return true
@@ -167,12 +167,12 @@ end
 ---@return boolean
 function M.unstage_patch(diff)
   if not diff or diff == "" then
-    dr()._notify_error("No patch to unstage")
+    notifications.error("No patch to unstage")
     return false
   end
   local result = git_backend.run_git_sync_for_test_backend({ "apply", "--cached", "--reverse", "--whitespace=nowarn", "--unidiff-zero", "-" }, diff .. "\n")
   if not result.ok then
-    dr()._notify_error("Unstage failed: " .. (result.output ~= "" and result.output or ("git exited " .. result.code)))
+    notifications.error("Unstage failed: " .. (result.output ~= "" and result.output or ("git exited " .. result.code)))
     return false
   end
   return true
@@ -451,7 +451,7 @@ end
 ---@param staged boolean
 ---@param cb fun(hunks: DiffReviewHunk[])
 local function get_hunks_async(cwd, staged, cb)
-  local args = dr()._git_diff_command(cwd, staged and { "--cached" } or nil)
+  local args = git_backend.git_diff_command(cwd, staged and { "--cached" } or nil)
   git_backend.systemlist_async(args, function(result, code)
     if code ~= 0 then
       cb({})
@@ -606,7 +606,7 @@ end
 ---@param filename string
 ---@param cb fun(syntax?: DiffReviewTreeSitterSyntax)
 function M.compute_file_syntax_async(filename, cb)
-  return dr()._status_perf_span("treesitter.compute_file_syntax_async", session.status and session.status.buf or nil, {
+  return trace.span("treesitter.compute_file_syntax_async", session.status and session.status.buf or nil, {
     file = filename,
   }, function()
     local buf = syntax_engine.treesitter_source_buffer(filename)
@@ -628,7 +628,7 @@ function M.compute_file_syntax_async(filename, cb)
     local highlight_ok, highlight_query = pcall(vim.treesitter.query.get, lang, "highlights")
     if not highlight_ok then highlight_query = nil end
 
-    local parser_ok, parser = dr()._status_perf_span("treesitter.compute_file_syntax_async.get_parser", session.status and session.status.buf or nil, {
+    local parser_ok, parser = trace.span("treesitter.compute_file_syntax_async.get_parser", session.status and session.status.buf or nil, {
       file = filename,
       lang = lang,
     }, function()
@@ -656,7 +656,7 @@ function M.compute_file_syntax_async(filename, cb)
       })
     end
 
-    local parse_ok, parsed = dr()._status_perf_span("treesitter.compute_file_syntax_async.parse_call", session.status and session.status.buf or nil, {
+    local parse_ok, parsed = trace.span("treesitter.compute_file_syntax_async.parse_call", session.status and session.status.buf or nil, {
       file = filename,
       lang = lang,
       source_line_count = line_count,
@@ -684,7 +684,7 @@ end
 ---@param lines string[]
 ---@param cb fun(syntax?: DiffReviewTreeSitterSyntax)
 function M.compute_diff_syntax_async(filename, lines, cb)
-  return dr()._status_perf_span("treesitter.compute_diff_syntax_async", session.status and session.status.buf or nil, {
+  return trace.span("treesitter.compute_diff_syntax_async", session.status and session.status.buf or nil, {
     file = filename,
     source_line_count = #lines,
   }, function()
@@ -708,7 +708,7 @@ function M.compute_diff_syntax_async(filename, lines, cb)
     vim.bo[buf].buftype = "nofile"
     vim.bo[buf].swapfile = false
     vim.bo[buf].filetype = ft
-    dr()._status_perf_span("treesitter.compute_diff_syntax_async.set_lines", session.status and session.status.buf or nil, {
+    trace.span("treesitter.compute_diff_syntax_async.set_lines", session.status and session.status.buf or nil, {
       file = filename,
       lang = lang,
       source_line_count = #lines,
@@ -716,7 +716,7 @@ function M.compute_diff_syntax_async(filename, lines, cb)
       vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
     end)
 
-    local parser_ok, parser = dr()._status_perf_span("treesitter.compute_diff_syntax_async.get_parser", session.status and session.status.buf or nil, {
+    local parser_ok, parser = trace.span("treesitter.compute_diff_syntax_async.get_parser", session.status and session.status.buf or nil, {
       file = filename,
       lang = lang,
     }, function()
@@ -746,7 +746,7 @@ function M.compute_diff_syntax_async(filename, lines, cb)
       })
     end
 
-    local parse_ok, parsed = dr()._status_perf_span("treesitter.compute_diff_syntax_async.parse_call", session.status and session.status.buf or nil, {
+    local parse_ok, parsed = trace.span("treesitter.compute_diff_syntax_async.parse_call", session.status and session.status.buf or nil, {
       file = filename,
       lang = lang,
       source_line_count = line_count,
@@ -995,8 +995,8 @@ local function collect_items_from_git(cwd, cb, _ctx)
     vim.schedule(function()
       for filename, diff_text in pairs(session.file_diffs) do
         if diff_text and diff_text ~= "" then
-          local buf = dr().open_diff_buffer(filename)
-          dr()._refresh_diff_buffer(buf, filename)
+          local buf = diff_buffer.open_diff_buffer(filename)
+          diff_buffer._refresh_diff_buffer(buf, filename)
         end
       end
     end)

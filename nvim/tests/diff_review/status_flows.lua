@@ -1,6 +1,10 @@
 vim.loader.enable(false)
 
 local diff_review = require("diff_review")
+local render_orchestrator = require("diff_review.views.status.render_orchestrator")
+local status_render = require("diff_review.views.status.status_render")
+local git_data = require("diff_review.git.git_data")
+local paths = require("diff_review.infra.paths")
 local session = require("diff_review.session")
 local syntax_engine = require("diff_review.render.syntax_engine")
 local gh = require("diff_review.integrations.gh")
@@ -573,7 +577,7 @@ local function release_gh_async()
 end
 
 local function render_and_wait(buf, needle)
-  diff_review.render_status(buf)
+  render_orchestrator.render_status(buf)
   wait_for(function() return buffer_contains(buf, needle) end, "status did not render " .. needle)
 end
 
@@ -588,19 +592,19 @@ local function open_compact_preview_and_wait(opts, expected)
 end
 
 local function assert_path_helpers()
-  local relpath, err = diff_review._repo_relative_for_test("D:\\Repo\\App\\src\\main.rs", "d:/repo/app", true)
+  local relpath, err = paths.repo_relative_for_test("D:\\Repo\\App\\src\\main.rs", "d:/repo/app", true)
   assert_true(relpath == "src/main.rs", "windows drive/backslash path failed: " .. tostring(relpath or err))
 
-  relpath, err = diff_review._repo_relative_for_test("D:/Repo/App/src/main.rs", "D:/Repo/App", true)
+  relpath, err = paths.repo_relative_for_test("D:/Repo/App/src/main.rs", "D:/Repo/App", true)
   assert_true(relpath == "src/main.rs", "windows slash path failed: " .. tostring(relpath or err))
 
-  relpath, err = diff_review._repo_relative_for_test("/home/matt/project/src/lib.lua", "/home/matt/project", false)
+  relpath, err = paths.repo_relative_for_test("/home/matt/project/src/lib.lua", "/home/matt/project", false)
   assert_true(relpath == "src/lib.lua", "linux path failed: " .. tostring(relpath or err))
 
-  relpath, err = diff_review._repo_relative_for_test("/Users/matt/Project/src/init.lua", "/Users/matt/Project", false)
+  relpath, err = paths.repo_relative_for_test("/Users/matt/Project/src/init.lua", "/Users/matt/Project", false)
   assert_true(relpath == "src/init.lua", "macos path failed: " .. tostring(relpath or err))
 
-  relpath = diff_review._repo_relative_for_test("/Users/matt/Project/src/init.lua", "/Users/matt/project", false)
+  relpath = paths.repo_relative_for_test("/Users/matt/Project/src/init.lua", "/Users/matt/project", false)
   assert_true(relpath == nil, "case-sensitive unix-style path should reject mismatched root")
 end
 
@@ -635,11 +639,11 @@ local function run()
   diff_review._gitstatus_debug_enabled = nil
   diff_review._gitstatus_debug_force = nil
   vim.g.diff_review_gitstatus_debug = nil
-  diff_review._gitstatus_debug.dump(buf, "disabled-test")
+  require("diff_review.views.status.status_debug").dump(buf, "disabled-test")
   vim.wait(350)
   assert_true(vim.fn.filereadable(debug_log_path) == 0, "GitStatus debug dump should be disabled by default")
   diff_review._gitstatus_debug_force = true
-  diff_review._gitstatus_debug.dump(buf, "enabled-test")
+  require("diff_review.views.status.status_debug").dump(buf, "enabled-test")
   wait_for(function() return vim.fn.filereadable(debug_log_path) == 1 end, "GitStatus debug dump did not write when enabled")
   diff_review._gitstatus_debug_force = nil
   vim.g.diff_review_gitstatus_debug = original_gitstatus_debug
@@ -674,7 +678,7 @@ local function run()
 
   reset_state({ modified = { ["startup-pr-delay.txt"] = true } })
   reset_gh_calls()
-  diff_review.render_status(buf, nil, nil, { refresh_pr = true })
+  render_orchestrator.render_status(buf, nil, nil, { refresh_pr = true })
   wait_for(function() return buffer_contains(buf, "startup-pr-delay.txt +1 -1") end, "status did not render before PR lookup")
   assert_true(gh_calls == 0, "PR lookup started before initial status render")
   wait_for(function() return gh_calls > 0 end, "deferred PR lookup did not run after status render")
@@ -682,24 +686,24 @@ local function run()
   reset_state({ modified = { ["pr-header-only.txt"] = true } })
   reset_gh_calls()
   hold_gh_async()
-  diff_review.render_status(buf, nil, nil, { refresh_pr = true })
+  render_orchestrator.render_status(buf, nil, nil, { refresh_pr = true })
   wait_for(function() return buffer_contains(buf, "pr-header-only.txt +1 -1") end, "status did not render before held PR lookup")
   wait_for(function() return gh_calls > 0 end, "held PR lookup did not start")
-  local original_render_status = diff_review.render_status
+  local original_render_status = render_orchestrator.render_status
   local pr_completion_rerendered = false
-  diff_review.render_status = function(...)
+  render_orchestrator.render_status = function(...)
     pr_completion_rerendered = true
     return original_render_status(...)
   end
   release_gh_async()
   wait_for(function() return buffer_contains(buf, "PR:     none") end, "PR completion did not patch header line")
-  diff_review.render_status = original_render_status
+  render_orchestrator.render_status = original_render_status
   assert_true(not pr_completion_rerendered, "PR completion rerendered the full status buffer")
 
   reset_state({ modified = { ["mock-pr-delay.txt"] = true } })
   reset_gh_calls()
   diff_review.setup({ pr_lookup_mode = "mock-delay", pr_mock_delay_ms = 20, about_auto_generate = false })
-  diff_review.render_status(buf, nil, nil, { refresh_pr = true })
+  render_orchestrator.render_status(buf, nil, nil, { refresh_pr = true })
   wait_for(function() return buffer_contains(buf, "mock-pr-delay.txt +1 -1") end, "mock PR delay status did not render")
   assert_true(gh_calls == 0, "mock PR delay spawned gh before timer")
   wait_for(function() return buffer_contains(buf, "PR:     none") end, "mock PR delay did not finish as no PR")
@@ -725,9 +729,9 @@ local function run()
   vim.api.nvim_win_set_cursor(0, { vim.api.nvim_buf_line_count(buf), 0 })
   assert_true(plain_winbar() == status_hint, "status hint winbar changed after scrolling")
   syntax_engine.clear_diff_syntax_cache()
-  local original_compute_diff_syntax_async = diff_review.compute_diff_syntax_async
+  local original_compute_diff_syntax_async = git_data.compute_diff_syntax_async
   local prewarm_count = 0
-  diff_review.compute_diff_syntax_async = function(_, _, cb)
+  git_data.compute_diff_syntax_async = function(_, _, cb)
     prewarm_count = prewarm_count + 1
     cb(nil)
   end
@@ -735,16 +739,17 @@ local function run()
   vim.api.nvim_exec_autocmds("CursorMoved", { buffer = buf })
   assert_true(prewarm_count == 0, "CursorMoved started diff syntax prewarm synchronously")
   wait_for(function() return prewarm_count > 0 end, "deferred cursor prewarm did not run")
-  diff_review.compute_diff_syntax_async = original_compute_diff_syntax_async
+  git_data.compute_diff_syntax_async = original_compute_diff_syntax_async
 
-  local original_prewarm = diff_review._prewarm_diff_syntax
+  local syntax_engine = require("diff_review.render.syntax_engine")
+  local original_prewarm = syntax_engine.prewarm_diff_syntax
   local decorate_prewarm_count = 0
-  diff_review._prewarm_diff_syntax = function(...)
+  syntax_engine.prewarm_diff_syntax = function(...)
     decorate_prewarm_count = decorate_prewarm_count + 1
     return original_prewarm(...)
   end
-  diff_review._status_decorate_visible(buf, 1, vim.api.nvim_buf_line_count(buf))
-  diff_review._prewarm_diff_syntax = original_prewarm
+  status_render.status_decorate_visible(buf, 1, vim.api.nvim_buf_line_count(buf))
+  syntax_engine.prewarm_diff_syntax = original_prewarm
   assert_true(decorate_prewarm_count > 0, "decoration provider visible prewarm did not warm any visible diff syntax")
 
   reset_notifications()
@@ -931,8 +936,8 @@ local function run()
   end, "rapid hunk stages did not reconcile after debounce")
 
   local pending_context_callbacks = {}
-  local original_compute_hunk_context_async = diff_review.compute_hunk_context_async
-  diff_review.compute_hunk_context_async = function(filename, line, cb)
+  local original_compute_hunk_context_async = git_data.compute_hunk_context_async
+  git_data.compute_hunk_context_async = function(filename, line, cb)
     pending_context_callbacks[#pending_context_callbacks + 1] = {
       filename = filename,
       line = line,
@@ -963,7 +968,7 @@ local function run()
     cursor_is_on_hunk_after_file(buf, "context-stage-b.txt"),
     "delayed hunk context rerender stole cursor\n" .. table.concat(status_lines(buf), "\n")
   )
-  diff_review.compute_hunk_context_async = original_compute_hunk_context_async
+  git_data.compute_hunk_context_async = original_compute_hunk_context_async
   syntax_engine.clear_context_cache()
 
   reset_state({ modified = { ["refresh-cursor-a.txt"] = true, ["refresh-cursor-b.txt"] = true } })
@@ -971,7 +976,7 @@ local function run()
   trigger_normal_mapping("<Tab>", find_row(buf, "refresh-cursor-a.txt"))
   trigger_normal_mapping("<Tab>", find_row(buf, "refresh-cursor-b.txt"))
   vim.api.nvim_win_set_cursor(0, { find_hunk_row_after_file(buf, "refresh-cursor-b.txt"), 0 })
-  diff_review.render_status(buf)
+  render_orchestrator.render_status(buf)
   wait_for(function()
     return cursor_is_on_hunk_after_file(buf, "refresh-cursor-b.txt")
   end, "untargeted status refresh did not preserve cursor\n" .. table.concat(status_lines(buf), "\n"))
@@ -982,7 +987,7 @@ local function run()
   local late_cursor_b_row = find_row(buf, "late-cursor-b.txt")
   vim.api.nvim_win_set_cursor(0, { late_cursor_a_row, 0 })
   hold_systemlist_async()
-  diff_review.render_status(buf)
+  render_orchestrator.render_status(buf)
   wait_for(function()
     return held_systemlist_async and #held_systemlist_async > 0
   end, "status refresh did not start held async git calls")

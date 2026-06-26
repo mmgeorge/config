@@ -1,13 +1,15 @@
 vim.loader.enable(false)
 
 local diff_review = require("diff_review")
+local render_orchestrator = require("diff_review.views.status.render_orchestrator")
+local git_data = require("diff_review.git.git_data")
 local gh = require("diff_review.integrations.gh")
 
 local root = "D:/diffreview-binary-root"
 local calls = {}
 local state = {}
-local original_compute_hunk_context_async = diff_review.compute_hunk_context_async
-local original_compute_diff_syntax_async = diff_review.compute_diff_syntax_async
+local original_compute_hunk_context_async = git_data.compute_hunk_context_async
+local original_compute_diff_syntax_async = git_data.compute_diff_syntax_async
 
 local function assert_true(condition, message)
   if not condition then error(message, 2) end
@@ -81,7 +83,7 @@ local function trigger_normal_mapping(key, row)
 end
 
 local function render_and_wait(buf, needle)
-  diff_review.render_status(buf)
+  render_orchestrator.render_status(buf)
   wait_for(function() return buffer_contains(buf, needle) end, "status did not render " .. needle)
 end
 
@@ -162,11 +164,11 @@ local function run()
 
   local ts_requests = 0
   local syntax_requests = 0
-  diff_review.compute_hunk_context_async = function(_, _, cb)
+  git_data.compute_hunk_context_async = function(_, _, cb)
     ts_requests = ts_requests + 1
     cb("unexpected")
   end
-  diff_review.compute_diff_syntax_async = function(_, _, cb)
+  git_data.compute_diff_syntax_async = function(_, _, cb)
     syntax_requests = syntax_requests + 1
     cb(nil)
   end
@@ -194,8 +196,8 @@ local ok, err = xpcall(run, debug.traceback)
 vim.fn.delete(root, "rf")
 diff_review.reset_git_backend()
 gh.reset_backend()
-diff_review.compute_hunk_context_async = original_compute_hunk_context_async
-diff_review.compute_diff_syntax_async = original_compute_diff_syntax_async
+git_data.compute_hunk_context_async = original_compute_hunk_context_async
+git_data.compute_diff_syntax_async = original_compute_diff_syntax_async
 if not ok then
   vim.api.nvim_err_writeln(err)
   vim.cmd("cquit")

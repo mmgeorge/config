@@ -1,6 +1,8 @@
 vim.loader.enable(false)
 
 local diff_review = require("diff_review")
+local render_orchestrator = require("diff_review.views.status.render_orchestrator")
+local ui = require("diff_review.infra.ui")
 local session = require("diff_review.session")
 local ai_commit = require("diff_review.integrations.ai_commit")
 local commit = require("diff_review.integrations.commit")
@@ -403,7 +405,7 @@ local function find_row(buf, needle)
 end
 
 local function line_has_highlight(buf, row, hl_group, start_col, end_col)
-  local marks = vim.api.nvim_buf_get_extmarks(buf, diff_review._status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
+  local marks = vim.api.nvim_buf_get_extmarks(buf, ui.status_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
   for _, mark in ipairs(marks) do
     local details = mark[4] or {}
     if mark[3] == start_col and details.end_col == end_col and details.hl_group == hl_group then return true end
@@ -620,7 +622,7 @@ local function run()
   assert_true(not buffer_contains(pr_buf, "Hint:"), "PRView hint should be a sticky winbar, not buffer text")
   assert_true(buffer_contains(pr_buf, "Title:  feat: Improve DiffReview"), "PRView missing title")
   assert_true(
-    buffer_contains(pr_buf, "Review: " .. diff_review._pending_review_icon .. " " .. diff_review._codeowner_review_icon .. "@platform-team"),
+    buffer_contains(pr_buf, "Review: " .. ui.pending_review_icon .. " " .. ui.codeowner_review_icon .. "@platform-team"),
     "PRView missing draft codeowner reviewer warning"
   )
   assert_true(buffer_contains(pr_buf, "Description:"), "PRView missing description heading")
@@ -668,7 +670,7 @@ local function run()
   pr_title = "PR after queued ogp"
   hold_pr_lookup = true
   release_pr_lookup = nil
-  diff_review.render_status(status_buf, nil, nil, { refresh_pr = true })
+  render_orchestrator.render_status(status_buf, nil, nil, { refresh_pr = true })
   wait_for(function() return buffer_contains(status_buf, "...fetching...") end, "PR row did not refetch for queued ogp test")
   trigger_normal_mapping("ogp", find_row(status_buf, "Head:"))
   assert_true(vim.api.nvim_get_current_buf() == status_buf, "ogp while fetching should wait in GitStatus")
@@ -694,7 +696,7 @@ local function run()
 
   vim.api.nvim_win_set_buf(0, status_buf)
   pr_mode = "none"
-  diff_review.render_status(status_buf, nil, nil, { refresh_pr = true })
+  render_orchestrator.render_status(status_buf, nil, nil, { refresh_pr = true })
   wait_for(function() return buffer_contains(status_buf, "PR:     none") end, "PR row did not render none state")
 
   local open_pr = require("github.open_pr")
@@ -722,7 +724,7 @@ local function run()
   reset_notifications()
   local count_before_unavailable = generate_count
   pr_mode = "unavailable"
-  diff_review.render_status(status_buf, nil, nil, { refresh_pr = true })
+  render_orchestrator.render_status(status_buf, nil, nil, { refresh_pr = true })
   wait_for(function() return buffer_contains(status_buf, "PR:     unavailable") end, "PR row did not render unavailable state")
   assert_true(#notifications == 0, "unavailable PR lookup should not emit error notifications: " .. vim.inspect(notifications))
   assert_true(generate_count == count_before_unavailable, "unavailable PR lookup should not restart AI generation")

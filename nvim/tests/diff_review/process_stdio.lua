@@ -1,6 +1,7 @@
 vim.loader.enable(false)
 
 local diff_review = require("diff_review")
+local git_backend = require("diff_review.git.git_backend")
 local ai_commit = require("diff_review.integrations.ai_commit")
 local gh = require("diff_review.integrations.gh")
 local github_gh = require("github.gh")
@@ -138,7 +139,7 @@ local function run()
   end
 
   assert_true(
-    diff_review._system_output("stdout", "stderr") == "stdout\nstderr",
+    git_backend.system_output("stdout", "stderr") == "stdout\nstderr",
     "system output should keep both stdout and stderr"
   )
 

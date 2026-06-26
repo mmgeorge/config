@@ -8,13 +8,34 @@ local status_buffer = require("diff_review.views.status.status_buffer")
 local diff_render = require("diff_review.render.diff_render")
 local syntax_engine = require("diff_review.render.syntax_engine")
 local config = require("diff_review.infra.config")
+-- Decoration provider registered once per session (module-private state).
+local decoration_registered = false
 
 local status_file_indent = 0
 local status_hunk_indent = 0
 
-local function dr()
-  return require("diff_review")
-end
+local status_debug = require("diff_review.views.status.status_debug")
+local hunk_model = require("diff_review.render.hunk_model")
+local view_controller = require("diff_review.shared.view_controller")
+local source = require("diff_review.render.source")
+local render_orchestrator = require("diff_review.views.status.render_orchestrator")
+local diff_source_state = require("diff_review.views.status.diff_source_state")
+local pr_overview = require("diff_review.views.pr.pr_overview")
+local pr_edit = require("diff_review.views.pr.pr_edit")
+local actions = require("diff_review.views.status.actions")
+local diff_buffer = require("diff_review.views.diff_buffer")
+local git_data = require("diff_review.git.git_data")
+local status_keys = require("diff_review.views.status.status_keys")
+local status_head = require("diff_review.views.status.status_head")
+local size_gate = require("diff_review.views.status.size_gate")
+local section_map = require("diff_review.views.status.section_map")
+local entry_nav = require("diff_review.views.status.entry_nav")
+local fold_state = require("diff_review.views.status.fold_state")
+local status_helpers = require("diff_review.views.status.status_helpers")
+local keymaps = require("diff_review.shared.keymaps")
+local conventional_commit = require("diff_review.integrations.conventional_commit")
+local trace = require("diff_review.infra.perf_trace")
+local ui = require("diff_review.infra.ui")
 local session = require("diff_review.session")
 
 -- Render-accumulator shims: thread the active status into the state-passing buffer core.
@@ -26,24 +47,24 @@ local function status_add_fancy_row(row, entry, indent) return status_buffer.add
 local function status_folded(key, default, state) return status_buffer.folded(state or session.status or {}, key, default) end
 
 -- Seams to init-owned helpers (key builders, cursor, prewarm, highlights).
-local function status_commit_relative_date(...) return dr()._status_commit_relative_date(...) end
-local function status_hunk_key(...) return dr()._status_hunk_key(...) end
-local function status_provider_hunk_key(...) return dr()._status_provider_hunk_key(...) end
-local function status_provider_file_key(...) return dr()._status_provider_file_key(...) end
-local function status_prewarm_entry_syntax(...) return dr()._status_prewarm_entry_syntax(...) end
-local function setup_bg_highlights() return dr()._setup_bg_highlights() end
-local function status_restore_cursor(...) return dr()._status_restore_cursor(...) end
-local function status_commit_key(...) return dr()._status_commit_key(...) end
-local function status_commit_hunk_key(...) return dr()._status_commit_hunk_key(...) end
-local function status_commit_file_key(...) return dr()._status_commit_file_key(...) end
-local function status_file_key(...) return dr()._status_file_key(...) end
-local function status_section_key(...) return dr()._status_section_key(...) end
-local function status_diff_hunks_for_file(...) return dr()._status_diff_hunks_for_file(...) end
-local function status_cursor_target(...) return dr()._status_cursor_target(...) end
-local function status_operations_pending(...) return dr()._status_operations_pending(...) end
+local function status_commit_relative_date(...) return status_helpers.status_commit_relative_date(...) end
+local function status_hunk_key(...) return status_keys.hunk_key(...) end
+local function status_provider_hunk_key(...) return status_keys.provider_hunk_key(...) end
+local function status_provider_file_key(...) return status_keys.provider_file_key(...) end
+local function status_prewarm_entry_syntax(...) return entry_nav._status_prewarm_entry_syntax(...) end
+local function setup_bg_highlights() return status_helpers.setup_bg_highlights() end
+local function status_restore_cursor(...) return entry_nav._status_restore_cursor(...) end
+local function status_commit_key(...) return status_keys.commit_key(...) end
+local function status_commit_hunk_key(...) return status_keys.commit_hunk_key(...) end
+local function status_commit_file_key(...) return status_keys.commit_file_key(...) end
+local function status_file_key(...) return status_keys.file_key(...) end
+local function status_section_key(...) return status_keys.section_key(...) end
+local function status_diff_hunks_for_file(...) return render_orchestrator.diff_hunks_for_file(...) end
+local function status_cursor_target(...) return render_orchestrator.cursor_target(...) end
+local function status_operations_pending(...) return actions._status_operations_pending(...) end
 
 local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_kind, hunk_key_override)
-  return dr()._status_perf_span("status_render.render_hunk", session.status and session.status.buf or nil, {
+  return trace.span("status_render.render_hunk", session.status and session.status.buf or nil, {
     file = file and file.filename or nil,
     relpath = file and file.relpath or nil,
     entry_kind = entry_kind,
@@ -58,35 +79,35 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_ki
   if hunk_folded then
     local header = ("%s@@ +%d -%d"):format(string.rep(" ", status_hunk_indent), hunk.added or 0, hunk.removed or 0)
     local start_line = status_add_line(header, entry, "DiffReviewActiveHunkHeader")
-    dr()._status_register_fold_range(hunk_key, start_line, #session.status.lines, false, session.status.lines[start_line])
+    fold_state._status_register_fold_range(hunk_key, start_line, #session.status.lines, false, session.status.lines[start_line])
     return
   end
   session.status.fancy_rows = session.status.fancy_rows or {}
   local rows_key
-  local context_line = dr()._status_hunk_context_line(hunk) or hunk.pos
-  local previous_context_line = previous_hunk and dr()._status_hunk_context_line(previous_hunk) or nil
-  local next_context_line = next_hunk and dr()._status_hunk_context_line(next_hunk) or nil
-  local syntax_source = dr()._status_syntax_source_for_entry_kind(entry_kind)
+  local context_line = syntax_engine.status_hunk_context_line(hunk) or hunk.pos
+  local previous_context_line = previous_hunk and syntax_engine.status_hunk_context_line(previous_hunk) or nil
+  local next_context_line = next_hunk and syntax_engine.status_hunk_context_line(next_hunk) or nil
+  local syntax_source = syntax_engine.status_syntax_source_for_entry_kind(entry_kind)
   local syntax_diff_text = nil
   if syntax_source == "file" then
-    syntax_diff_text = dr()._status_perf_span("status_render.render_hunk.syntax_diff_text", session.status and session.status.buf or nil, {
+    syntax_diff_text = trace.span("status_render.render_hunk.syntax_diff_text", session.status and session.status.buf or nil, {
       file = file.filename,
       hunk_key = hunk_key,
       entry_kind = entry_kind,
     }, function()
-      return dr()._status_file_syntax_diff_text(file)
+      return syntax_engine.status_file_syntax_diff_text(file)
     end)
   end
   local require_file_match_for_context = entry_kind == "pr_hunk" or entry_kind == "pr_review_hunk"
   local semantic_context_enabled = true
   if require_file_match_for_context then
-    semantic_context_enabled = syntax_diff_text ~= nil and dr()._status_perf_span("status_render.render_hunk.new_side_matches_file", session.status and session.status.buf or nil, {
+    semantic_context_enabled = syntax_diff_text ~= nil and trace.span("status_render.render_hunk.new_side_matches_file", session.status and session.status.buf or nil, {
       file = file.filename,
       hunk_key = hunk_key,
       entry_kind = entry_kind,
       diff_len = #(syntax_diff_text or ""),
     }, function()
-      return dr()._diff_new_side_matches_file(file.filename, syntax_diff_text)
+      return syntax_engine.diff_new_side_matches_file(file.filename, syntax_diff_text)
     end)
   end
   local function rerender_with_context()
@@ -101,7 +122,7 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_ki
       if buf and vim.api.nvim_buf_is_valid(buf) then
         if status_operations_pending() then return end
         local target_id, fallback_line = status_cursor_target(buf)
-        dr().render_status(buf, target_id, fallback_line, { reuse_sections = true })
+        render_orchestrator.render_status(buf, target_id, fallback_line, { reuse_sections = true })
       end
     end)
   end
@@ -109,7 +130,7 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_ki
   local previous_context = nil
   local next_context = nil
   if semantic_context_enabled then
-    dr()._status_perf_span("status_render.render_hunk.context_lookup", session.status and session.status.buf or nil, {
+    trace.span("status_render.render_hunk.context_lookup", session.status and session.status.buf or nil, {
       file = file.filename,
       hunk_key = hunk_key,
       context_line = context_line,
@@ -138,12 +159,12 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_ki
   end
   local suppress_start_boundary = syntax_engine.same_hunk_context_scope(previous_context, current_context)
   local suppress_end_boundary = syntax_engine.same_hunk_context_scope(current_context, next_context)
-  local current_ancestor_key = dr()._hunk_context_ancestor_key(current_context)
-  local suppress_ancestor_start = current_ancestor_key ~= nil and dr()._same_hunk_ancestor_scope(previous_context, current_context)
-  local suppress_ancestor_end = current_ancestor_key ~= nil and dr()._same_hunk_ancestor_scope(current_context, next_context)
+  local current_ancestor_key = hunk_model.context_ancestor_key(current_context)
+  local suppress_ancestor_start = current_ancestor_key ~= nil and syntax_engine.same_hunk_ancestor_scope(previous_context, current_context)
+  local suppress_ancestor_end = current_ancestor_key ~= nil and syntax_engine.same_hunk_ancestor_scope(current_context, next_context)
   local suppress_start_boundary_keys = suppress_ancestor_start and { [current_ancestor_key] = true } or nil
   local suppress_end_boundary_keys = suppress_ancestor_end and { [current_ancestor_key] = true } or nil
-  local syntax_hash = dr()._status_perf_span("status_render.render_hunk.rows_key_sha256", session.status and session.status.buf or nil, {
+  local syntax_hash = trace.span("status_render.render_hunk.rows_key_sha256", session.status and session.status.buf or nil, {
     file = file.filename,
     hunk_key = hunk_key,
     diff_len = #(syntax_diff_text or hunk.diff or ""),
@@ -160,10 +181,10 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_ki
     syntax_source .. ":compact:" .. syntax_hash
   )
   local debug_context = nil
-  if dr()._gitstatus_debug.enabled() then
+  if status_debug.enabled() then
     local view_kind = session.status and session.status.view_kind or nil
     if view_kind == "pr" or entry_kind == "pr_hunk" or entry_kind == "pr_review_hunk" then
-      local source_lines = dr()._file_source_lines(file.filename)
+      local source_lines = syntax_engine.file_source_lines(file.filename)
       local new_side_matches_file = nil
       if syntax_diff_text then
         new_side_matches_file = semantic_context_enabled
@@ -196,21 +217,21 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_ki
         suppress_ancestor_start = suppress_ancestor_start,
         suppress_ancestor_end = suppress_ancestor_end,
       }
-      dr()._gitstatus_debug.event("status_render_hunk.before", debug_context)
+      status_debug.event("status_render_hunk.before", debug_context)
     end
   end
   local rows = session.status.fancy_rows[rows_key]
   if rows and debug_context then
-    dr()._gitstatus_debug.event("status_render_hunk.cache_hit", {
+    status_debug.event("status_render_hunk.cache_hit", {
       context = debug_context,
       row_count = #rows,
       syntax_pending = rows.diff_review_syntax_pending,
       context_pending = rows.diff_review_context_pending,
-      preview = dr()._gitstatus_debug.row_preview(rows, 8),
+      preview = status_debug.row_preview(rows, 8),
     })
   end
   if not rows then
-    local ok, built_rows = dr()._status_perf_span("status_render.render_hunk.build_fancy_rows", session.status and session.status.buf or nil, {
+    local ok, built_rows = trace.span("status_render.render_hunk.build_fancy_rows", session.status and session.status.buf or nil, {
       file = file.filename,
       hunk_key = hunk_key,
       rows_key = rows_key,
@@ -246,14 +267,14 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_ki
       )
     end)
     if debug_context then
-      dr()._gitstatus_debug.event("status_render_hunk.built", {
+      status_debug.event("status_render_hunk.built", {
         context = debug_context,
         ok = ok,
         error = ok and nil or tostring(built_rows),
         row_count = ok and type(built_rows) == "table" and #built_rows or nil,
         syntax_pending = ok and type(built_rows) == "table" and built_rows.diff_review_syntax_pending or nil,
         context_pending = ok and type(built_rows) == "table" and built_rows.diff_review_context_pending or nil,
-        preview = ok and dr()._gitstatus_debug.row_preview(built_rows, 8) or nil,
+        preview = ok and status_debug.row_preview(built_rows, 8) or nil,
       })
     end
     if ok then
@@ -266,7 +287,7 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_ki
   end
   if not rows then
     if debug_context then
-      dr()._gitstatus_debug.event("status_render_hunk.fallback", {
+      status_debug.event("status_render_hunk.fallback", {
         context = debug_context,
       })
     end
@@ -281,7 +302,7 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_ki
     local start_text = nil
     local end_text = nil
     if type(ts_context) == "table" then
-      visible_hunk_lines = dr()._status_perf_span("status_render.render_hunk.visible_source_lines", session.status and session.status.buf or nil, {
+      visible_hunk_lines = trace.span("status_render.render_hunk.visible_source_lines", session.status and session.status.buf or nil, {
         file = file.filename,
         hunk_key = hunk_key,
         diff_len = #(hunk.diff or ""),
@@ -306,13 +327,13 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_ki
         status_add_fancy_row(diff_render.hunk_boundary_row(end_text, ts_context.end_segments, node_end), nil, status_hunk_indent)
       end
     end
-    dr()._status_register_fold_range(hunk_key, start_line, #session.status.lines, false, session.status.lines[start_line])
+    fold_state._status_register_fold_range(hunk_key, start_line, #session.status.lines, false, session.status.lines[start_line])
     return
   end
 
   local start_line = #session.status.lines + 1
   local fold_text = nil
-  dr()._status_perf_span("status_render.render_hunk.emit_rows", session.status and session.status.buf or nil, {
+  trace.span("status_render.render_hunk.emit_rows", session.status and session.status.buf or nil, {
     file = file.filename,
     hunk_key = hunk_key,
     row_count = #rows,
@@ -325,12 +346,12 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_ki
       end
     end
   end)
-  dr()._status_register_fold_range(hunk_key, start_line, #session.status.lines, false, fold_text or session.status.lines[start_line])
+  fold_state._status_register_fold_range(hunk_key, start_line, #session.status.lines, false, fold_text or session.status.lines[start_line])
   end)
 end
 
 local function status_render_file(file, entry_kind, hunk_entry_kind, file_key_override, hunk_key_builder, opts)
-  return dr()._status_perf_span("status_render.render_file", session.status and session.status.buf or nil, {
+  return trace.span("status_render.render_file", session.status and session.status.buf or nil, {
     file = file and file.filename or nil,
     relpath = file and file.relpath or nil,
     entry_kind = entry_kind,
@@ -341,8 +362,8 @@ local function status_render_file(file, entry_kind, hunk_entry_kind, file_key_ov
   opts = opts or {}
   local file_key = file_key_override or status_file_key(file.section_name, file.filename)
   local default_folded = not (opts.default_open or opts.force_open)
-  local stats, stat_segments = dr()._status_file_stat_text_and_segments(file)
-  local change_label, change_label_hl = dr()._status_file_change_label(file)
+  local stats, stat_segments = git_data._status_file_stat_text_and_segments(file)
+  local change_label, change_label_hl = git_data._status_file_change_label(file)
   local change_label_width = #"Modified"
   local padded_change_label = change_label .. string.rep(" ", math.max(0, change_label_width - #change_label))
   local line = ("%s%s %s %s"):format(string.rep(" ", status_file_indent), padded_change_label, file.relpath, stats)
@@ -369,13 +390,13 @@ local function status_render_file(file, entry_kind, hunk_entry_kind, file_key_ov
     local walkthrough = package.loaded["diff_review.views.walkthrough"]
     render_folded_file_body = walkthrough and walkthrough._modes and walkthrough._modes[session.status.buf] ~= nil
   end
-  dr()._status_record_diff_file_header_state(file, entry_kind, hunk_entry_kind, file_key)
+  diff_source_state._status_record_diff_file_header_state(file, entry_kind, hunk_entry_kind, file_key)
   if file_folded and not render_folded_file_body then
-    dr()._status_register_fold_range(file_key, line_number, #session.status.lines, default_folded, session.status.lines[line_number])
+    fold_state._status_register_fold_range(file_key, line_number, #session.status.lines, default_folded, session.status.lines[line_number])
     return
   end
 
-  local hunks = dr()._status_perf_span("status_render.render_file.hunks", session.status and session.status.buf or nil, {
+  local hunks = trace.span("status_render.render_file.hunks", session.status and session.status.buf or nil, {
     file = file.filename,
     relpath = file.relpath,
     entry_kind = entry_kind,
@@ -384,25 +405,25 @@ local function status_render_file(file, entry_kind, hunk_entry_kind, file_key_ov
   end)
   if #hunks == 0 then
     status_add_line(string.rep(" ", status_hunk_indent) .. "No textual diff", entry, "Comment")
-    dr()._status_register_fold_range(file_key, line_number, #session.status.lines, default_folded, session.status.lines[line_number])
+    fold_state._status_register_fold_range(file_key, line_number, #session.status.lines, default_folded, session.status.lines[line_number])
     return
   end
-  local display_hunks = dr()._status_perf_span("status_render.render_file.display_hunks", session.status and session.status.buf or nil, {
+  local display_hunks = trace.span("status_render.render_file.display_hunks", session.status and session.status.buf or nil, {
     file = file.filename,
     relpath = file.relpath,
     hunk_count = #hunks,
   }, function()
-    return dr()._status_display_hunks(hunks)
+    return size_gate._status_display_hunks(hunks)
   end)
-  dr()._status_record_diff_file_state(file, hunks, display_hunks, entry_kind, hunk_entry_kind, file_key)
-  dr()._status_perf_span("status_render.render_file.render_hunks", session.status and session.status.buf or nil, {
+  diff_source_state._status_record_diff_file_state(file, hunks, display_hunks, entry_kind, hunk_entry_kind, file_key)
+  trace.span("status_render.render_file.render_hunks", session.status and session.status.buf or nil, {
     file = file.filename,
     relpath = file.relpath,
     hunk_count = #hunks,
     display_hunk_count = #display_hunks,
   }, function()
-    local render_budget = dr()._status_file_render_row_budget()
-    local forced_hunks = dr()._status_file_forced_hunk_count(file_key)
+    local render_budget = size_gate._status_file_render_row_budget()
+    local forced_hunks = size_gate._status_file_forced_hunk_count(file_key)
     local body_start_line = #session.status.lines
     for hunk_index, hunk in ipairs(display_hunks) do
       -- Size gate: keep the first hunk and any force-loaded hunks, then stop once the
@@ -410,8 +431,8 @@ local function status_render_file(file, entry_kind, hunk_entry_kind, file_key_ov
       -- cannot freeze the render. The deferred hunks load through the load-more row.
       if render_budget then
         local rendered_rows = #session.status.lines - body_start_line
-        local next_estimate = dr()._status_lazy_hunk_estimate(file, hunk)
-        if dr()._status_size_gate_should_defer(rendered_rows, next_estimate, hunk_index, forced_hunks, render_budget) then
+        local next_estimate = size_gate._status_lazy_hunk_estimate(file, hunk)
+        if size_gate._status_size_gate_should_defer(rendered_rows, next_estimate, hunk_index, forced_hunks, render_budget) then
           local remaining = #display_hunks - hunk_index + 1
           status_add_line(
             string.rep(" ", status_hunk_indent) .. ("… %d more change blocks — press <CR>/o to load"):format(remaining),
@@ -432,7 +453,7 @@ local function status_render_file(file, entry_kind, hunk_entry_kind, file_key_ov
       status_render_hunk(file, hunk, display_hunks[hunk_index - 1], display_hunks[hunk_index + 1], hunk_entry_kind, hunk_key)
     end
   end)
-  dr()._status_register_fold_range(file_key, line_number, #session.status.lines, default_folded, session.status.lines[line_number])
+  fold_state._status_register_fold_range(file_key, line_number, #session.status.lines, default_folded, session.status.lines[line_number])
   end)
 end
 
@@ -461,40 +482,40 @@ local function status_render_commit(commit, date_width)
     commit_subject_start_col = suffix_start_col,
     commit_subject_end_col = suffix_start_col and (suffix_start_col + #suffix) or nil,
   }
-  dr()._status_register_commit_source_handle(commit)
+  diff_source_state._status_register_commit_source_handle(commit)
   local line_number = status_add_line(line, entry)
   status_add_highlight(line_number, 0, #commit.short_oid, "DiffReviewStatusObjectId")
   if date_start_col then
     status_add_highlight(line_number, date_start_col, date_start_col + #date_text, "DiffReviewStatusDate")
   end
-  local conventional_type_end = dr()._status_conventional_commit_type_end(suffix)
+  local conventional_type_end = conventional_commit.type_end(suffix)
   if suffix_start_col and conventional_type_end then
     status_add_highlight(line_number, suffix_start_col, suffix_start_col + conventional_type_end, "DiffReviewStatusCommitType")
   end
 
   if status_folded(commit_key, true) then
-    dr()._status_register_fold_range(commit_key, line_number, #session.status.lines, true, session.status.lines[line_number])
+    fold_state._status_register_fold_range(commit_key, line_number, #session.status.lines, true, session.status.lines[line_number])
     return
   end
 
   if commit.files_loading then
     status_add_line("...loading...", entry, "DiffReviewStatusFetching")
-    dr()._status_register_fold_range(commit_key, line_number, #session.status.lines, true, session.status.lines[line_number])
+    fold_state._status_register_fold_range(commit_key, line_number, #session.status.lines, true, session.status.lines[line_number])
     return
   end
   if commit.files_error then
     status_add_line(commit.files_error, entry, "ErrorMsg")
-    dr()._status_register_fold_range(commit_key, line_number, #session.status.lines, true, session.status.lines[line_number])
+    fold_state._status_register_fold_range(commit_key, line_number, #session.status.lines, true, session.status.lines[line_number])
     return
   end
   if not commit.files_loaded then
     status_add_line("...loading...", entry, "DiffReviewStatusFetching")
-    dr()._status_register_fold_range(commit_key, line_number, #session.status.lines, true, session.status.lines[line_number])
+    fold_state._status_register_fold_range(commit_key, line_number, #session.status.lines, true, session.status.lines[line_number])
     return
   end
   if #(commit.files or {}) == 0 then
     status_add_line("No textual diff", entry, "Comment")
-    dr()._status_register_fold_range(commit_key, line_number, #session.status.lines, true, session.status.lines[line_number])
+    fold_state._status_register_fold_range(commit_key, line_number, #session.status.lines, true, session.status.lines[line_number])
     return
   end
 
@@ -509,11 +530,11 @@ local function status_render_commit(commit, date_width)
       end
     )
   end
-  dr()._status_register_fold_range(commit_key, line_number, #session.status.lines, true, session.status.lines[line_number])
+  fold_state._status_register_fold_range(commit_key, line_number, #session.status.lines, true, session.status.lines[line_number])
 end
 
 local function status_render_section(section)
-  return dr()._status_perf_span("status_render.render_section", session.status and session.status.buf or nil, {
+  return trace.span("status_render.render_section", session.status and session.status.buf or nil, {
     section = section and section.name or nil,
     title = section and section.title or nil,
     file_count = section and section.files and #section.files or nil,
@@ -522,7 +543,7 @@ local function status_render_section(section)
     issue_comment_count = section and section.issue_comments and #section.issue_comments or nil,
   }, function()
   local section_key = status_section_key(section.name)
-  local line = dr()._status_section_heading_text(section.title, dr()._status_section_count(section))
+  local line = status_head._status_section_heading_text(section.title, status_head._status_section_count(section))
   local section_default_folded = section.default_folded
   local entry = { id = section_key, kind = "section", section = section, default_folded = section_default_folded }
   local line_number = status_add_line(line, entry, "DiffReviewStatusHeader")
@@ -537,24 +558,24 @@ local function status_render_section(section)
     for _, commit in ipairs(section.commits) do
       status_render_commit(commit, date_width)
     end
-    dr()._status_register_fold_range(section_key, line_number, #session.status.lines, section_default_folded, session.status.lines[line_number])
+    fold_state._status_register_fold_range(section_key, line_number, #session.status.lines, section_default_folded, session.status.lines[line_number])
     return
   end
   if section_folded then
-    dr()._status_register_fold_range(section_key, line_number, #session.status.lines, section_default_folded, session.status.lines[line_number])
+    fold_state._status_register_fold_range(section_key, line_number, #session.status.lines, section_default_folded, session.status.lines[line_number])
     return
   end
   if section.issue_comments then
-    dr()._pr_overview.render_issue_comments(section.issue_comments)
-    dr()._status_register_fold_range(section_key, line_number, #session.status.lines, section.default_folded, session.status.lines[line_number])
+    pr_overview.render_issue_comments(section.issue_comments)
+    fold_state._status_register_fold_range(section_key, line_number, #session.status.lines, section.default_folded, session.status.lines[line_number])
     return
   end
   if section.reviews then
-    local alignment = dr()._pr_overview.review_summary_alignment(section.reviews)
+    local alignment = pr_overview.review_summary_alignment(section.reviews)
     for _, review in ipairs(section.reviews) do
-      dr()._pr_overview.render_review(review, alignment)
+      pr_overview.render_review(review, alignment)
     end
-    dr()._status_register_fold_range(section_key, line_number, #session.status.lines, section.default_folded, session.status.lines[line_number])
+    fold_state._status_register_fold_range(section_key, line_number, #session.status.lines, section.default_folded, session.status.lines[line_number])
     return
   end
   for _, file in ipairs(section.files) do
@@ -572,14 +593,14 @@ local function status_render_section(section)
       status_render_file(file)
     end
   end
-  dr()._status_register_fold_range(section_key, line_number, #session.status.lines, section.default_folded, session.status.lines[line_number])
+  fold_state._status_register_fold_range(section_key, line_number, #session.status.lines, section.default_folded, session.status.lines[line_number])
   end)
 end
 
 local function status_decorate_visible(buf, first_row, last_row)
   local status = session.states and session.states[buf] or nil
   if not (status and status.entries) then return end
-  if (dr().config or config.options or config.defaults).status_cursor_prewarm == false then return end
+  if (config.options or config.options or config.defaults).status_cursor_prewarm == false then return end
   first_row = math.max(1, math.floor(tonumber(first_row) or 1))
   last_row = math.max(first_row, math.floor(tonumber(last_row) or first_row))
   local saved = session.status
@@ -587,7 +608,7 @@ local function status_decorate_visible(buf, first_row, last_row)
   local seen = {}
   for row = first_row, last_row do
     local entry = status.entries[row]
-    if entry and (dr()._status_entry_is_file_like(entry) or dr()._status_entry_is_hunk_like(entry)) then
+    if entry and (entry_nav._status_entry_is_file_like(entry) or entry_nav._status_entry_is_hunk_like(entry)) then
       local key = entry.id or (entry.file and entry.file.filename) or tostring(row)
       if not seen[key] then
         seen[key] = true
@@ -625,11 +646,11 @@ local function status_decorate_rows(buf, first_row, last_row)
   local count = vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_buf_line_count(buf) or 0
   first_row = math.max(1, math.floor(tonumber(first_row) or 1))
   last_row = math.min(count > 0 and count or last_row or first_row, math.floor(tonumber(last_row) or count))
-  pcall(vim.api.nvim_buf_clear_namespace, buf, dr()._status_decorate_ns, first_row - 1, last_row)
+  pcall(vim.api.nvim_buf_clear_namespace, buf, ui.status_decorate_ns, first_row - 1, last_row)
   for line = first_row, last_row do
     local spans = status.diff_row_spans[line]
     if spans then
-      status_emit_row_spans(buf, dr()._status_decorate_ns, line - 1, spans, false)
+      status_emit_row_spans(buf, ui.status_decorate_ns, line - 1, spans, false)
       applied[line] = spans
     end
   end
@@ -637,20 +658,20 @@ local function status_decorate_rows(buf, first_row, last_row)
 end
 
 local function status_register_decoration_provider()
-  if dr()._status_decoration_registered then return end
-  dr()._status_decoration_registered = true
-  vim.api.nvim_set_decoration_provider(dr()._status_decorate_ns, {
+  if decoration_registered then return end
+  decoration_registered = true
+  vim.api.nvim_set_decoration_provider(ui.status_decorate_ns, {
     on_win = function(_, _, win_buf, toprow, botrow)
       local status = session.states and session.states[win_buf] or nil
       if not status then return false end
-      dr()._status_schedule_decorate_visible(win_buf, toprow + 1, botrow + 1)
+      entry_nav._status_schedule_decorate_visible(win_buf, toprow + 1, botrow + 1)
       return true
     end,
     on_line = function(_, _, win_buf, row)
       local status = session.states and session.states[win_buf] or nil
       local spans = status and status.diff_row_spans and status.diff_row_spans[row + 1] or nil
       if spans then
-        status_emit_row_spans(win_buf, dr()._status_decorate_ns, row, spans, true)
+        status_emit_row_spans(win_buf, ui.status_decorate_ns, row, spans, true)
       end
     end,
   })
@@ -660,7 +681,7 @@ local function status_write_rendered_buffer(buf)
   local was_rendering = vim.b[buf].diff_review_status_rendering
   vim.b[buf].diff_review_status_rendering = true
   vim.bo[buf].modifiable = true
-  vim.api.nvim_buf_clear_namespace(buf, dr()._status_ns, 0, -1)
+  vim.api.nvim_buf_clear_namespace(buf, ui.status_ns, 0, -1)
   for index, line in ipairs(session.status.lines or {}) do
     if type(line) ~= "string" then session.status.lines[index] = tostring(line or "") end
   end
@@ -671,13 +692,13 @@ end
 
 local function status_apply_rendered_extmarks(buf)
   for _, line_hl in ipairs(session.status.line_highlights or {}) do
-    pcall(vim.api.nvim_buf_set_extmark, buf, dr()._status_ns, line_hl.line - 1, 0, {
+    pcall(vim.api.nvim_buf_set_extmark, buf, ui.status_ns, line_hl.line - 1, 0, {
       line_hl_group = line_hl.hl_group,
       priority = 80,
     })
   end
   for _, highlight in ipairs(session.status.highlights or {}) do
-    pcall(vim.api.nvim_buf_set_extmark, buf, dr()._status_ns, highlight.line - 1, highlight.start_col, {
+    pcall(vim.api.nvim_buf_set_extmark, buf, ui.status_ns, highlight.line - 1, highlight.start_col, {
       end_col = highlight.end_col,
       hl_group = highlight.hl_group,
       priority = highlight.priority or 90,
@@ -685,18 +706,18 @@ local function status_apply_rendered_extmarks(buf)
   end
   for _, extmark in ipairs(session.status.extmarks or {}) do
     local extmark_opts = vim.tbl_extend("force", { priority = 95 }, extmark.opts)
-    pcall(vim.api.nvim_buf_set_extmark, buf, dr()._status_ns, extmark.line - 1, extmark.col, extmark_opts)
+    pcall(vim.api.nvim_buf_set_extmark, buf, ui.status_ns, extmark.line - 1, extmark.col, extmark_opts)
   end
 end
 
 local function status_after_buffer_render(buf, walkthrough)
-  return dr()._status_perf_span("status_render.after_buffer_render", buf, nil, function()
+  return trace.span("status_render.after_buffer_render", buf, nil, function()
     status_register_decoration_provider()
-    dr()._status_perf_span("status_render.after_render.hint_bar", buf, nil, function()
-      dr()._status_apply_hint_bar(buf)
+    trace.span("status_render.after_render.hint_bar", buf, nil, function()
+      keymaps.status_apply_hint_bar(buf)
     end)
     if walkthrough then
-      dr()._status_perf_span("status_render.after_render.walkthrough", buf, nil, function()
+      trace.span("status_render.after_render.walkthrough", buf, nil, function()
         walkthrough.on_status_rendered(buf)
       end)
     end
@@ -704,15 +725,15 @@ local function status_after_buffer_render(buf, walkthrough)
     -- Resolve per-view after-render behavior through the registered view controller,
     -- falling back to the default (folds only) for unregistered/branch-diff views.
     local view_kind = session.status.view_kind or "status"
-    if not dr()._diff_view_controller_model.run_hook(view_kind, "after_render", { buf = buf }) then
-      dr()._status_after_render_default(buf)
+    if not view_controller.run_hook(view_kind, "after_render", { buf = buf }) then
+      render_orchestrator.after_render_default(buf)
     end
-    dr()._gitstatus_debug.dump(buf, "status_render_loaded")
+    status_debug.dump(buf, "status_render_loaded")
   end)
 end
 
 local function status_render_loaded(buf, target_id, fallback_line, opts, head_lines, sections)
-  return dr()._status_perf_span("status_render.render_loaded", buf, {
+  return trace.span("status_render.render_loaded", buf, {
     target_id = target_id,
     fallback_line = fallback_line,
     reuse_sections = opts and opts.reuse_sections or nil,
@@ -720,7 +741,7 @@ local function status_render_loaded(buf, target_id, fallback_line, opts, head_li
     section_count = sections and #sections or nil,
   }, function()
   opts = opts or {}
-  if dr()._pr_edit.blocks_render(buf) then return end
+  if pr_edit.blocks_render(buf) then return end
   setup_bg_highlights()
   local previous_registry = session.status and session.status.diff_source_registry or nil
   session.status = session.status or {}
@@ -735,22 +756,22 @@ local function status_render_loaded(buf, target_id, fallback_line, opts, head_li
   session.status.fold_ranges_by_id = {}
   session.status.fold_range_order = {}
   session.status.fold_text_by_start_line = {}
-  session.status.diff_source_registry = (opts.reuse_sections and previous_registry) or dr()._diff_source_model.new_registry()
-  dr()._status_configure_diff_source_policies(session.status.diff_source_registry)
+  session.status.diff_source_registry = (opts.reuse_sections and previous_registry) or source.new_registry()
+  diff_source_state._status_configure_diff_source_policies(session.status.diff_source_registry)
   session.diff_line_content_lengths = session.diff_line_content_lengths or {}
   session.diff_line_content_lengths[buf] = {}
-  dr()._clear_diff_gutter_visual_line(buf)
+  diff_buffer._clear_diff_gutter_visual_line(buf)
 
   local walkthrough = package.loaded["diff_review.views.walkthrough"]
   if walkthrough and walkthrough.status_head_lines then
     head_lines = walkthrough.status_head_lines(buf, head_lines)
   end
-  dr()._status_sort_sections_for_render(buf, sections)
+  section_map._status_sort_sections_for_render(buf, sections)
 
   local active_head_stack = {}
   local function close_active_head_parent(parent, end_line)
     if parent then
-      dr()._status_register_fold_range(
+      fold_state._status_register_fold_range(
         parent.id,
         parent.start_line,
         end_line,
@@ -770,7 +791,7 @@ local function status_render_loaded(buf, target_id, fallback_line, opts, head_li
     end
   end
 
-  dr()._status_perf_span("status_render.render_loaded.head_rows", buf, {
+  trace.span("status_render.render_loaded.head_rows", buf, {
     head_line_count = #head_lines,
   }, function()
     for _, head_line in ipairs(head_lines) do
@@ -803,7 +824,7 @@ local function status_render_loaded(buf, target_id, fallback_line, opts, head_li
     status_add_line("")
   end)
 
-  dr()._status_perf_span("status_render.render_loaded.sections", buf, {
+  trace.span("status_render.render_loaded.sections", buf, {
     section_count = #sections,
   }, function()
     if #sections == 0 then
@@ -818,26 +839,26 @@ local function status_render_loaded(buf, target_id, fallback_line, opts, head_li
     end
   end)
 
-  dr()._status_perf_span("status_render.render_loaded.write_buffer", buf, {
+  trace.span("status_render.render_loaded.write_buffer", buf, {
     line_count = #session.status.lines,
   }, function()
     status_write_rendered_buffer(buf)
   end)
-  dr()._status_perf_span("status_render.render_loaded.apply_extmarks", buf, {
+  trace.span("status_render.render_loaded.apply_extmarks", buf, {
     highlight_count = #(session.status.highlights or {}),
     line_highlight_count = #(session.status.line_highlights or {}),
     extmark_count = #(session.status.extmarks or {}),
   }, function()
     status_apply_rendered_extmarks(buf)
   end)
-  dr()._status_perf_span("status_render.render_loaded.restore_cursor", buf, {
+  trace.span("status_render.render_loaded.restore_cursor", buf, {
     target_id = target_id,
     fallback_line = fallback_line,
   }, function()
     status_restore_cursor(buf, target_id, fallback_line)
   end)
 
-  dr()._status_perf_span("status_render.render_loaded.after_render", buf, nil, function()
+  trace.span("status_render.render_loaded.after_render", buf, nil, function()
     status_after_buffer_render(buf, walkthrough)
   end)
   end)

@@ -1,6 +1,7 @@
 vim.loader.enable(false)
 
 local diff_review = require("diff_review")
+local render_orchestrator = require("diff_review.views.status.render_orchestrator")
 local gh = require("diff_review.integrations.gh")
 local root = "D:/mock/project"
 
@@ -106,7 +107,7 @@ local function run()
   assert_true(buffer_contains(buf, "Loading DiffReview..."), "first render did not enter loading state")
 
   generation = "second"
-  diff_review.render_status(buf)
+  render_orchestrator.render_status(buf)
   flush("second")
   assert_true(vim.wait(1000, function()
     return buffer_contains(buf, "second subject")

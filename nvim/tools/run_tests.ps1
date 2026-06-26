@@ -7,17 +7,40 @@ $ErrorActionPreference = "Stop"
 $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 Set-Location $repo
 
+# Truncate the diff-review perf log at the start of each run. Profiling is on by default and the
+# log balloons across runs (hundreds of MB), which slows the perf-heavy tests into timeouts.
+try {
+  $cache = (& nvim --headless -u NONE --cmd "set shadafile=NONE" -c "lua io.write(vim.fn.stdpath('cache'))" -c "qa!" 2>$null) -join ""
+  if ($cache) {
+    $perfLog = Join-Path $cache "diff-review-perf.log"
+    if (Test-Path $perfLog) { Clear-Content $perfLog -ErrorAction SilentlyContinue }
+  }
+} catch {}
+
 $common = @("--headless", "-i", "NONE", "--cmd", "set shadafile=NONE", "-u", "nvim/init.lua")
 
 function Invoke-Nvim {
-  param([string[]]$ExtraArgs)
-  $errFile = New-TemporaryFile
-  $nvimArgs = $common + $ExtraArgs
-  # Native splatting (PS7) quotes args with spaces/= correctly, unlike Start-Process -ArgumentList.
-  & nvim @nvimArgs 2> $errFile.FullName | Out-Null
-  $code = $LASTEXITCODE
-  $err = Get-Content $errFile.FullName -Raw
-  Remove-Item $errFile.FullName -Force -ErrorAction SilentlyContinue
+  param([string[]]$ExtraArgs, [int]$TimeoutSec = 45)
+  # Run headless nvim under a hard per-test timeout so a stuck wait loop can never stall the
+  # suite. A timed-out test is tree-killed and reported as failure (exit 124), never left to
+  # orphan. ProcessStartInfo.ArgumentList quotes each arg correctly (spaces/=) like native splatting.
+  $psi = [System.Diagnostics.ProcessStartInfo]::new()
+  $psi.FileName = "nvim"
+  foreach ($a in ($common + $ExtraArgs)) { [void]$psi.ArgumentList.Add($a) }
+  $psi.RedirectStandardError = $true
+  $psi.RedirectStandardOutput = $true
+  $psi.UseShellExecute = $false
+  $proc = [System.Diagnostics.Process]::Start($psi)
+  $errTask = $proc.StandardError.ReadToEndAsync()
+  [void]$proc.StandardOutput.ReadToEndAsync()  # drain stdout to avoid pipe-buffer deadlock
+  if ($proc.WaitForExit($TimeoutSec * 1000)) {
+    $code = $proc.ExitCode
+    $err = $errTask.Result
+  } else {
+    try { $proc.Kill($true) } catch {}
+    $code = 124
+    $err = "TIMEOUT after ${TimeoutSec}s"
+  }
   return @{ Code = $code; Err = $err }
 }
 

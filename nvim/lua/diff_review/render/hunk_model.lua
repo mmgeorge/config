@@ -4,20 +4,19 @@
 ---@class DiffReviewHunkModelModule
 local M = {}
 
-local function dr()
-  return require("diff_review")
-end
-
+local diff_render = require("diff_review.render.diff_render")
+-- syntax_engine edge kept lazy to avoid a load-time cycle.
+local function syntax_engine() return require("diff_review.render.syntax_engine") end
 local diff_parse = require("diff_review.render.diff_parse")
 
 -- Seam to the init-owned hunk helpers shared with the model.
 local parse_hunk_body = diff_parse.parse_hunk_body
-local function hunk_add_gutter(...) return dr()._hunk_add_gutter(...) end
-local function treesitter_line_segments(...) return dr()._treesitter_line_segments(...) end
-local function hunk_context_scope_key(...) return dr()._hunk_context_scope_key(...) end
-local function same_hunk_context_scope(...) return dr()._same_hunk_context_scope(...) end
+local function hunk_add_gutter(...) return diff_render.hunk_add_gutter(...) end
+local function treesitter_line_segments(...) return syntax_engine().treesitter_line_segments(...) end
+local function hunk_context_scope_key(...) return syntax_engine().hunk_context_scope_key(...) end
+local function same_hunk_context_scope(...) return syntax_engine().same_hunk_context_scope(...) end
 local hunk_first_changed_current_line = diff_parse.hunk_first_changed_current_line
-local function hunk_line_visible_in_context_scope(...) return dr()._hunk_line_visible_in_context_scope(...) end
+local function hunk_line_visible_in_context_scope(...) return syntax_engine().hunk_line_visible_in_context_scope(...) end
 
 ---@param context DiffReviewHunkTreeSitterContext|string?
 ---@return DiffReviewHunkBoundaryContext?

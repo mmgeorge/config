@@ -8,7 +8,17 @@ local gh = require("diff_review.integrations.gh")
 
 local M = {}
 
-local function dr() return require("diff_review") end
+-- render_orchestrator edge kept lazy to avoid a load-time cycle.
+local function render_orchestrator() return require("diff_review.views.status.render_orchestrator") end
+-- commit_view edge kept lazy to avoid a load-time cycle.
+local function commit_view() return require("diff_review.views.status.commit_view") end
+-- commands edge kept lazy to avoid a load-time cycle.
+local function commands() return require("diff_review.views.commands") end
+-- status_head depends back on pr_state (status_head -> fold_state -> keymaps -> pr_state),
+-- so this edge stays lazy to avoid a load-time circular require.
+local function status_head() return require("diff_review.views.status.status_head") end
+local status_helpers = require("diff_review.views.status.status_helpers")
+local notifications = require("diff_review.infra.notifications")
 local session = require("diff_review.session")
 
 -- Forward-declare so status_start_pr_lookup can capture the open action as an upvalue.
@@ -37,11 +47,11 @@ local function status_start_pr_lookup(cwd, buf, request_id)
     else
       local message = result.message or "Unable to fetch GitHub pull request"
       latest_status.pr = { state = "error", message = message, lookup_started = true }
-      dr()._notify_error("GitHub PR lookup failed: " .. message)
+      notifications.error("GitHub PR lookup failed: " .. message)
     end
 
     if latest_status.head_values then
-      latest_status.head_lines = dr()._status_build_head_lines(
+      latest_status.head_lines = status_head()._status_build_head_lines(
         latest_status.head_values,
         latest_status.pr,
         latest_status.about,
@@ -49,8 +59,8 @@ local function status_start_pr_lookup(cwd, buf, request_id)
       )
     end
     if vim.api.nvim_buf_is_valid(buf) and latest_status.head_lines and latest_status.sections then
-      if not dr()._status_patch_head_line(buf, "pr", dr()._status_pr_head_line(latest_status.pr)) then
-        dr().render_status(buf, nil, nil, { reuse_sections = true })
+      if not status_helpers.status_patch_head_line(buf, "pr", status_head()._status_pr_head_line(latest_status.pr)) then
+        render_orchestrator().render_status(buf, nil, nil, { reuse_sections = true })
       end
     end
     if pending_open then
@@ -76,7 +86,7 @@ local function status_start_pr_lookup(cwd, buf, request_id)
     end
   end
 
-  local options = dr().config or config.options or config.defaults
+  local options = config.options or config.options or config.defaults
   if options.pr_lookup_mode == "mock-delay" then
     vim.defer_fn(function()
       complete_pr_lookup({ ok = true })
@@ -125,7 +135,7 @@ local function status_ensure_about_state(cwd, buf, has_changes, force, allow_gen
     return
   end
 
-  if not allow_generation and (dr().config or config.options or config.defaults).about_auto_generate == false then
+  if not allow_generation and (config.options or config.options or config.defaults).about_auto_generate == false then
     status.about_root = cwd
     status.about = { state = "none", waiters = {} }
     status.about_pending = nil
@@ -141,7 +151,7 @@ local function status_ensure_about_state(cwd, buf, has_changes, force, allow_gen
   status.about_request_id = (status.about_request_id or 0) + 1
   local request_id = status.about_request_id
   if allow_generation then
-    dr()._status_patch_about_line(buf)
+    status_head()._status_patch_about_line(buf)
   end
 
   local function start_generation()
@@ -155,7 +165,7 @@ local function status_ensure_about_state(cwd, buf, has_changes, force, allow_gen
       latest_status.about = result
       latest_status.about_pending = nil
       if latest_status.head_values then
-        latest_status.head_lines = dr()._status_build_head_lines(
+        latest_status.head_lines = status_head()._status_build_head_lines(
           latest_status.head_values,
           latest_status.pr,
           latest_status.about,
@@ -163,14 +173,14 @@ local function status_ensure_about_state(cwd, buf, has_changes, force, allow_gen
         )
       end
       if vim.api.nvim_buf_is_valid(buf) and latest_status.head_lines and latest_status.sections then
-        if not dr()._status_patch_about_line(buf) then
-          dr().render_status(buf, nil, nil, { reuse_sections = true })
+        if not status_head()._status_patch_about_line(buf) then
+          render_orchestrator().render_status(buf, nil, nil, { reuse_sections = true })
         end
       end
     end)
   end
 
-  local delay = allow_generation and 0 or ((dr().config or config.options or config.defaults).about_auto_generate_delay_ms or 0)
+  local delay = allow_generation and 0 or ((config.options or config.options or config.defaults).about_auto_generate_delay_ms or 0)
   if delay > 0 then
     status.about_pending = true
     vim.defer_fn(start_generation, delay)
@@ -193,19 +203,19 @@ status_open_pr = function(entry)
       return
     end
     if pr_state and pr_state.state == "error" then
-      dr()._notify_error("GitHub PR lookup failed: " .. (pr_state.message or "Unable to fetch GitHub pull request"), "DiffReview")
+      notifications.error("GitHub PR lookup failed: " .. (pr_state.message or "Unable to fetch GitHub pull request"), "DiffReview")
       return
     end
     if pr_state and pr_state.state == "unavailable" then
       vim.notify(pr_state.message or "GitHub PR lookup is unavailable", vim.log.levels.INFO, { title = "DiffReview" })
       return
     end
-    dr()._status_confirm_create_pr(function()
+    commit_view()._status_confirm_create_pr(function()
       require("github.open_pr").open()
     end)
     return
   end
-  dr().open_pr(pr, { cwd = session.status and session.status.cwd or nil })
+  commands().open_pr(pr, { cwd = session.status and session.status.cwd or nil })
 end
 
 M.status_start_pr_lookup = status_start_pr_lookup
