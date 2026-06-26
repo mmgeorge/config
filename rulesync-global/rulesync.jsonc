@@ -3,22 +3,26 @@
   "targets": [
     "claudecode",
     "codexcli",
-    "copilotcli",
-    "antigravity-cli"
+    "antigravity-cli",
+    "copilotcli"
   ],
   "features": [
     "rules",
-    "skills"
+    "ignore",
+    "mcp",
+    "commands",
+    "subagents",
+    "skills",
+    "hooks"
   ],
   "outputRoots": [
     "."
   ],
-  "delete": true,
+  "global": true,
+  "delete": false,
   "verbose": false,
   "silent": false,
-  "global": true,
   "simulateCommands": false,
   "simulateSubagents": false,
-  "simulateSkills": false,
-  "gitignoreTargetsOnly": true
+  "simulateSkills": false
 }

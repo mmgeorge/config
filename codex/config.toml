@@ -31,6 +31,9 @@ trust_level = "trusted"
 [projects.'d:\code\ferrous']
 trust_level = "trusted"
 
+[projects.'d:\config']
+trust_level = "trusted"
+
 [projects.'D:\']
 trust_level = "trusted"
 
@@ -119,7 +122,8 @@ url = "https://developers.openai.com/mcp"
 default_tools_approval_mode = "approve"
 
 [mcp_servers.terminal]
-command = "terminal-mcp --headless"
+command = "terminal-mcp"
+args = ["--headless"]
 
 [mcp_servers.terminal.tools.takeScreenshot]
 approval_mode = "approve"

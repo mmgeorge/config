@@ -1,3 +1,10 @@
+---
+root: true
+targets:
+  - '*'
+globs:
+  - '**/*'
+---
 # General Guidelines
 - Always complete the full task. **Never** stop partway ("good stopping point", "I'll leave the rest to you", etc.). If you hit an error, debug it. If a fix causes a new problem, fix that too. Done means it works — including a green build and passing tests — not that you've made an attempt.
 - **Never** refuse to fix something because it's "out of scope" or "in a different module." Chase bugs to their root cause regardless of module, layer, or crate.

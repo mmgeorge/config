@@ -1,3 +1,17 @@
+# Rulesync-generated LLM provider directories
+.agents/
+.claude/
+.codex/
+.copilot/
+.gemini/
+
+# Rulesync-generated LLM provider root files
+.claude.json
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+.github/copilot-instructions.md
+
 **/.claude/settings.local.json
 .gitstatus
 .walkthrough.json
