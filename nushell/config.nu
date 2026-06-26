@@ -9,12 +9,12 @@ $env.BIN_HOME = $env.XDG_BASE  | path join ".bin"
 $env.EDITOR = "nvim"
 $env.PAGER = "delta"
 $env.ZELLIJ_CONFIG_FILE = $env.XDG_BASE  | path join "config" "zellij" "config.kdl"
-$env.CODEX_HOME = $env.XDG_CONFIG_HOME | path join "codex"
 $env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = 64000
 if $nu.os-info.name == "windows" {
   $env.CLAUDE_CODE_USE_POWERSHELL_TOOL = 1
 }
-$env.COPILOT_CUSTOM_INSTRUCTIONS_DIRS = $env.XDG_CONFIG_HOME | path join "copilot"
+# $env.CODEX_HOME = $env.XDG_CONFIG_HOME | path join "codex"
+# $env.COPILOT_CUSTOM_INSTRUCTIONS_DIRS = $env.XDG_CONFIG_HOME | path join "copilot"
 
 alias mux = zellij
 alias cls = clear
@@ -142,8 +142,8 @@ def --wrapped co [...args] {
         --deny-tool 'shell(azcopy)'
         --deny-tool 'shell(azcopy:*)'
         --allow-all-urls
-        --add-dir '/Users/matt9222/Developer/agents'
-        --add-dir '/Users/matt9222/config/copilot/.github/instructions'
+        # --add-dir '/Users/matt9222/Developer/agents'
+        # --add-dir '/Users/matt9222/config/copilot/.github/instructions'
     ]
   ^copilot ...$copilot_args ...$args
 

@@ -1,6 +1,4 @@
 ---
-targets:
-  - codexcli
 name: remote-code-explorer
 description: >-
   Use when exploring a remote codebase: GitHub repositories, external source
@@ -10,6 +8,9 @@ description: >-
   NOT for local file searches; use the built-in explorer for the current
   workspace. NOT for general web/current-facts research; use search-explorer for
   that.
+claudecode:
+  model: claude-opus-4-8
+  effort: low
 codexcli:
   model: gpt-5.5
   model_reasoning_effort: low
@@ -17,6 +18,12 @@ codexcli:
     - Remote Code Explorer
     - Scout
     - Researcher
+copilotcli:
+  model: gpt-5.1
+  model_reasoning_effort: low
+antigravity:
+  model: gemini-3.5-flash
+  model_reasoning_effort: low
 ---
 You are a fast, read-only remote codebase explorer. Return output as quickly as possible. Use parallel tool calls wherever possible.
 

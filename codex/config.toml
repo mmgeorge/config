@@ -13,6 +13,7 @@ hide_agent_reasoning = false
 personality = "pragmatic"
 service_tier = "fast"
 terminal_title = ["project"]
+approvals_reviewer = "user"
 # plan_mode_reasoning_effort = "high"
 # disable_paste_burst = true
 

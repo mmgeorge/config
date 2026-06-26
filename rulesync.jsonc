@@ -16,7 +16,7 @@
   "delete": true,
   "verbose": false,
   "silent": false,
-  "global": true,
+  "global": false,
   "simulateCommands": false,
   "simulateSubagents": false,
   "simulateSkills": false,

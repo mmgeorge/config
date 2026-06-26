@@ -4,10 +4,8 @@ description: >-
   Develop and debug Lua and Neovim plugin code, and drive the user's running
   Neovim over RPC. Use when writing or reviewing Lua / Neovim code (autocmds,
   keymaps, treesitter, floating windows, folds, user commands, plugin modules),
-  when building Trouble.nvim sources or Snacks.nvim diff UIs, or when you need
-  to inspect or execute things inside the live editor — buffers, windows,
-  options, LSP clients, diagnostics, plugin source, help docs — via the $NVIM
-  socket.
+  when building Trouble.nvim sources or Snacks.nvim diff UIs, or when inspecting
+  live editor state via the $NVIM socket.
 targets:
   - '*'
 ---
@@ -20,11 +18,13 @@ This skill covers two things:
 2. **Driving the user's *running* Neovim over RPC** — to inspect editor state
    and verify changes against the real thing instead of guessing.
 
-Reach for the RPC section whenever a question is answerable by the live editor
-("what's attached to this buffer?", "did my change take?"). Reach for
-`references/plugin-patterns.md` before touching Trouble sources, the Snacks diff
-renderer, folds, floating-window previews, or git-from-inside-nvim — those have
-non-obvious failure modes already mapped out there.
+Reach for RPC whenever a question is answerable by the live editor ("what's
+attached to this buffer?", "did my change take?"). Use the
+`terminal-tui-debugging` skill when the visible terminal grid matters, or when a
+bug depends on rendered TUI behavior. Reach for `references/plugin-patterns.md`
+before touching Trouble sources, the Snacks diff renderer, folds,
+floating-window previews, or git-from-inside-nvim — those have non-obvious
+failure modes already mapped out there.
 
 ---
 

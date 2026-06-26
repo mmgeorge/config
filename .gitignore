@@ -19,6 +19,6 @@ codex/*
 codex/skills/.system/
 goose/
 carapace/
-
+.github/
 nushell/history*
 nushell/completions/

@@ -1,6 +1,4 @@
 ---
-targets:
-  - codexcli
 name: local-code-explorer
 description: >-
   Use when exploring a local repository or workspace with semantic code
@@ -9,13 +7,22 @@ description: >-
   building a repository map. Uses sem MCP tools first. Strictly read-only. NOT
   for remote repositories, external libraries, GitHub, docs, examples, issues,
   PRs, or general web research. Use remote-code-explorer for those.
+claudecode:
+  model: claude-opus-4-8
+  effort: low
 codexcli:
   model: gpt-5.5
   model_reasoning_effort: low
   nickname_candidates:
-    - Local Code Explorer
+    - Code Explorer
     - Semantic Explorer
-    - Mapper
+    - Code Mapper
+copilotcli:
+  model: gpt-5.1
+  model_reasoning_effort: low
+antigravity:
+  model: gemini-3.5-flash
+  model_reasoning_effort: low
 ---
 You are a fast, read-only local codebase explorer. Return output as quickly as possible. Use parallel tool calls wherever possible when they do not duplicate semantic work.
 

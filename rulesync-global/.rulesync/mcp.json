@@ -41,6 +41,9 @@
         "stdio",
         "--toolsets=context,actions,discussions,issues,labels,notifications,orgs,projects,pull_requests,repos,users"
       ],
+      "envVars": [
+        "GITHUB_PERSONAL_ACCESS_TOKEN"
+      ],
       "default_tools_approval_mode": "approve"
     },
     "openaiDeveloperDocs": {
@@ -53,15 +56,7 @@
       "args": [
         "--headless"
       ],
-      "default_tools_approval_mode": "approve",
-      "tools": [
-        "takeScreenshot",
-        "getContent",
-        "sendKey",
-        "type",
-        "startRecording",
-        "stopRecording"
-      ]
+      "default_tools_approval_mode": "approve"
     }
   }
 }
