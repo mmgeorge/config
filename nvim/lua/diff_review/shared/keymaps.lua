@@ -162,11 +162,341 @@ local function status_clear_hint_bar(win)
   end
 end
 
+-- ===========================================================================
+-- Buffer-local keymaps for the status-family views (status / pr / diff / review).
+--
+-- Data-driven: each command's per-view *behavior* lives in COMMON_KEYMAPS (bound in
+-- every view) or VIEW_KEYMAPS[view_kind] (one entry per binding). Per-view *visibility*
+-- and the *keys* still come from shared/command_specs.lua (the `views` field) and
+-- status_keys_for() (config.defaults.keymaps, overridable via setup{ keymaps = ... });
+-- these tables own only the action callback. Adding a command to a view = one entry
+-- here + its spec in command_specs.lua. Non-keymap per-view setup (the cursor-prewarm
+-- autocmd, the review action set, the jump-back keys) lives in VIEW_SETUP_HOOKS.
+-- ===========================================================================
+
+local function close_view(buf)
+  local state = session.states and session.states[buf] or session.status
+  if vim.api.nvim_buf_is_valid(buf) then
+    pcall(vim.api.nvim_buf_delete, buf, { force = true })
+  end
+  if session.states then session.states[buf] = nil end
+  if session.main_status == state then session.main_status = nil end
+  if session.status == state then session.status = session.main_status end
+end
+
+local function refresh_status(buf)
+  if session.status then
+    session.status.pr = nil
+    session.status.about = nil
+  end
+  render_status_or_notify(buf, nil, nil, {
+    restore_initial_folds = true,
+    refresh_pr = true,
+    refresh_about = true,
+  })
+end
+
+local function refresh_pr(buf)
+  local status = session.states and session.states[buf] or session.status
+  if status and status.pr and status.cwd then
+    session.status = status
+    render_pr_status(status.pr, status.cwd, buf)
+    load_pr_diff(status.pr, status.cwd, buf)
+    pr_overview().load_comments(status.pr, status.cwd, buf)
+    pr_overview().load_checks(status.pr, status.cwd, buf)
+  end
+end
+
+local function refresh_diff(buf)
+  local status = session.states and session.states[buf] or session.status
+  if status and status.diff_branch and status.cwd then
+    session.status = status
+    branch_diff.load(status.diff_branch, status.cwd, buf, status.diff_file)
+  end
+end
+
+local function toggle_fold(buf)
+  local status = session.states and session.states[buf] or session.status
+  if status then session.status = status end
+  if review().toggle_comment_fold(buf) then return end
+  status_toggle(status_entry_under_cursor(status), status)
+end
+
+local function collapse_parent(buf)
+  if session.states and session.states[buf] then session.status = session.states[buf] end
+  commit_view()._status_collapse_parent()
+end
+
+local function start_visual_line_gutter(buf)
+  diff_buffer._start_diff_gutter_visual_line(buf)
+end
+
+local function stage_under_cursor(buf)
+  status_stage(status_entry_under_cursor())
+end
+
+local function stage_selection(buf)
+  local entries = status_entries_from_visual_selection()
+  status_leave_visual_mode()
+  status_stage_entries(entries, { preserve_cursor = true })
+end
+
+local function unstage_under_cursor(buf)
+  status_unstage(status_entry_under_cursor())
+end
+
+local function unstage_selection(buf)
+  local entries = status_entries_from_visual_selection()
+  status_leave_visual_mode()
+  status_unstage_entries(entries, { preserve_cursor = true })
+end
+
+local function discard_under_cursor(buf)
+  status_discard(status_entry_under_cursor())
+end
+
+local function discard_selection(buf)
+  local entries = status_entries_from_visual_selection()
+  status_leave_visual_mode()
+  status_discard_entry_list(entries, nil, { preserve_cursor = true })
+end
+
+local function status_open(buf)
+  local entry = status_entry_under_cursor()
+  if require("diff_review.views.walkthrough").jump_status_step(buf) then
+    return
+  elseif commit_view()._status_open_commit_message_under_cursor(entry) then
+    return
+  elseif entry and entry.kind == "pr" then
+    status_open_pr(entry)
+  elseif entry and entry.kind == "about" then
+    status_open_about(entry)
+  elseif entry and entry.kind == "load_more" then
+    local status = session.states and session.states[buf] or session.status
+    if status then
+      -- Force-render the next chunk of deferred hunks from where the gate stopped, so
+      -- each activation always reveals more even when a single hunk exceeds the budget.
+      local chunk = 6
+      local target = (tonumber(entry.load_more_from) or 1) + chunk - 1
+      status.file_render_limits = status.file_render_limits or {}
+      status.file_render_limits[entry.file_key] = math.max(status.file_render_limits[entry.file_key] or 0, target)
+      session.status = status
+      render_status_or_notify(buf, nil, vim.api.nvim_win_get_cursor(0)[1], { reuse_sections = true })
+    end
+  else
+    status_jump(entry)
+  end
+end
+
+local function pr_open(buf)
+  local is_pr_view = session.status and session.status.view_kind == "pr"
+  if is_pr_view and pr_edit.toggle_draft_status_under_cursor(buf) then return end
+  local entry = status_entry_under_cursor()
+  if commit_view()._status_open_commit_message_under_cursor(entry) then return end
+  status_jump(entry)
+end
+
+local function review_open(buf)
+  local entry = status_entry_under_cursor()
+  if commit_view()._status_open_commit_message_under_cursor(entry) then return end
+  status_jump(entry)
+end
+
+local function browse_pr(buf)
+  local status = session.states and session.states[buf] or session.status
+  if status and status.view_kind == "pr" then
+    local url = pr_overview().url_under_cursor(buf)
+    if url and gh.browse_url(url) then return end
+  end
+  local pr = status and status.pr
+  if not gh.browse_pr(pr) then
+    notify_error("Unable to open PR URL", "DiffReview")
+  end
+end
+
+local function review_browse(buf)
+  local status = session.states and session.states[buf] or session.status
+  local fragment = review().browse_fragment_under_cursor(buf)
+  review().leave_visual()
+  if not gh.browse_pr_changes(status and status.pr, fragment) then
+    notify_error("Unable to open PR URL", "DiffReview")
+  end
+end
+
+local function pr_add_comment(buf)
+  pr_overview().add_standalone_comment(buf)
+end
+
+local function pr_sync_comments(buf)
+  review().sync_inline_comment_text(buf)
+  pr_overview().sync_standalone_comments(buf)
+  pr_edit.sync(buf)
+end
+
+local function start_review(buf)
+  review().start(buf)
+end
+
+local function commit_changes(buf)
+  require("diff_review.integrations.commit").commit({
+    win = vim.api.nvim_get_current_win(),
+    on_done = function()
+      if vim.api.nvim_buf_is_valid(buf) then render_status_or_notify(buf) end
+    end,
+  })
+end
+
+local function push_remote(buf)
+  status_remote_action(buf, "push")
+end
+
+local function pull_remote(buf)
+  status_remote_action(buf, "pull")
+end
+
+local function open_pr_action(buf)
+  status_open_pr(status_entry_under_cursor())
+end
+
+local function create_branch(buf)
+  status_helpers.create_branch(buf)
+end
+
+local function start_walkthrough(buf)
+  require("diff_review.views.walkthrough").start(commands._walkthrough_host(buf))
+end
+
+local function show_help(buf)
+  status_show_help()
+end
+
+local function jump_back_with_saved_view(buf)
+  local walkthrough = require("diff_review.views.walkthrough")
+  walkthrough._debug_jump_event("status_jump_back_start", {
+    buf = buf,
+    view = walkthrough._jump_debug_snapshot(vim.fn.bufwinid(buf), buf),
+  })
+  vim.cmd("normal! \15")
+  walkthrough._debug_jump_event("status_jump_back_after_ctrl_o", {
+    buf = buf,
+    view = walkthrough._jump_debug_snapshot(vim.fn.bufwinid(buf), buf),
+  })
+  local restored = walkthrough.restore_jump_return_view(buf, true)
+  walkthrough._debug_jump_event("status_jump_back_after_restore", {
+    buf = buf,
+    restored = restored,
+    view = walkthrough._jump_debug_snapshot(vim.fn.bufwinid(buf), buf),
+  })
+  vim.schedule(function()
+    if vim.api.nvim_buf_is_valid(buf) then
+      local scheduled_restored = walkthrough.restore_jump_return_view(buf, true)
+      walkthrough._debug_jump_event("status_jump_back_scheduled_restore", {
+        buf = buf,
+        restored = scheduled_restored,
+        view = walkthrough._jump_debug_snapshot(vim.fn.bufwinid(buf), buf),
+      })
+    end
+  end)
+end
+
+local function install_cursor_prewarm(buf)
+  vim.api.nvim_create_autocmd("CursorMoved", {
+    buffer = buf,
+    callback = function()
+      trace.span("status.autocmd_cursor_prewarm", buf, nil, function()
+        if (M.config or config.options or config.defaults).status_cursor_prewarm == false then return end
+        if session.states and session.states[buf] then session.status = session.states[buf] end
+        status_defer_prewarm_under_cursor(buf)
+      end)
+    end,
+  })
+end
+
+--- Bindings installed in every status-family view. `mode` mirrors vim.keymap.set;
+--- `handler(buf)` is the action. Keys + visibility come from command_specs.
+local COMMON_KEYMAPS = {
+  { id = "close", mode = "n", handler = close_view },
+  { id = "toggle", mode = "n", handler = toggle_fold },
+  { id = "collapse_parent", mode = "n", handler = collapse_parent },
+  { id = "visual_line_with_gutter", mode = "n", handler = start_visual_line_gutter },
+}
+
+--- Per-view command behavior. A command only installs where command_specs marks it
+--- visible (status_command_visible), so an entry listed in a view it is hidden from is
+--- a harmless no-op; keep these lists aligned with command_specs.views for clarity.
+local VIEW_KEYMAPS = {
+  status = {
+    { id = "refresh", mode = "n", handler = refresh_status },
+    { id = "stage", mode = "n", handler = stage_under_cursor, desc = "Stage hunk/file" },
+    { id = "stage", mode = "x", handler = stage_selection, desc = "Stage selection" },
+    { id = "unstage", mode = "n", handler = unstage_under_cursor, desc = "Unstage hunk/file" },
+    { id = "unstage", mode = "x", handler = unstage_selection, desc = "Unstage selection" },
+    { id = "discard", mode = "n", handler = discard_under_cursor, desc = "Discard hunk/file" },
+    { id = "discard", mode = "x", handler = discard_selection, desc = "Discard selection" },
+    { id = "open", mode = "n", handler = status_open },
+    { id = "commit", mode = "n", handler = commit_changes },
+    { id = "push", mode = "n", handler = push_remote },
+    { id = "pull", mode = "n", handler = pull_remote },
+    { id = "pr", mode = "n", handler = open_pr_action },
+    { id = "branch_create", mode = "n", handler = create_branch },
+    { id = "walkthrough", mode = "n", handler = start_walkthrough },
+    { id = "review", mode = "n", handler = start_review },
+    { id = "help", mode = "n", handler = show_help },
+  },
+  pr = {
+    { id = "refresh", mode = "n", handler = refresh_pr },
+    { id = "browse", mode = "n", handler = browse_pr },
+    { id = "comment", mode = { "n", "x" }, handler = pr_add_comment },
+    { id = "sync", mode = { "n", "i" }, handler = pr_sync_comments },
+    { id = "review", mode = "n", handler = start_review },
+    { id = "open", mode = "n", handler = pr_open, desc = "Jump to file" },
+    { id = "help", mode = "n", handler = show_help },
+  },
+  diff = {
+    { id = "refresh", mode = "n", handler = refresh_diff },
+    { id = "open", mode = "n", handler = pr_open, desc = "Jump to file" },
+    { id = "help", mode = "n", handler = show_help },
+  },
+  review = {
+    { id = "refresh", mode = "n", handler = refresh_status },
+    { id = "browse", mode = { "n", "x" }, handler = review_browse },
+    { id = "open", mode = "n", handler = review_open, desc = "Jump to file" },
+    { id = "help", mode = "n", handler = show_help },
+  },
+}
+
+--- Per-view setup that is not a single command keymap: the review action set + the
+--- scheduled open re-map, the jump-back keys, and the cursor-prewarm autocmd. Receives
+--- the buffer and the view's `map` helper (for re-mapping).
+local VIEW_SETUP_HOOKS = {
+  status = function(buf, _map)
+    local opts = { buffer = buf, silent = true, nowait = true }
+    for _, key in ipairs({ ",", "<C-o>" }) do
+      vim.keymap.set("n", key, function() jump_back_with_saved_view(buf) end,
+        vim.tbl_extend("force", opts, { desc = "Jump back" }))
+    end
+    install_cursor_prewarm(buf)
+  end,
+  pr = function(buf, _map)
+    install_cursor_prewarm(buf)
+  end,
+  diff = function(buf, _map)
+    install_cursor_prewarm(buf)
+  end,
+  review = function(buf, map)
+    review().setup_keymaps(buf)
+    vim.schedule(function()
+      if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+      if session.states and session.states[buf] then session.status = session.states[buf] end
+      map("open", "n", function() review_open(buf) end, "Jump to file")
+    end)
+  end,
+}
+
 local function setup_status_keymaps(buf)
   require("github.repo_cache").enable_user_completion(buf)
   local opts = { buffer = buf, silent = true, nowait = true }
   local view_kind = session.status and session.status.view_kind or "status"
-  local is_pr_view = view_kind == "pr"
   local function map(command_id, mode, callback, desc)
     local spec = status_command_specs_by_id[command_id]
     if spec and not status_command_visible(spec) then return end
@@ -187,270 +517,14 @@ local function setup_status_keymaps(buf)
     end
   end
 
-
-  map("close", "n", function()
-    local state = session.states and session.states[buf] or session.status
-    if vim.api.nvim_buf_is_valid(buf) then
-      pcall(vim.api.nvim_buf_delete, buf, { force = true })
-    end
-    if session.states then session.states[buf] = nil end
-    if session.main_status == state then session.main_status = nil end
-    if session.status == state then session.status = session.main_status end
-  end)
-
-  map("refresh", "n", function()
-    if view_kind == "diff" then
-      local status = session.states and session.states[buf] or session.status
-      if status and status.diff_branch and status.cwd then
-        session.status = status
-        branch_diff.load(status.diff_branch, status.cwd, buf, status.diff_file)
-      end
-      return
-    end
-    if is_pr_view then
-      local status = session.states and session.states[buf] or session.status
-      if status and status.pr and status.cwd then
-        session.status = status
-        render_pr_status(status.pr, status.cwd, buf)
-        load_pr_diff(status.pr, status.cwd, buf)
-        pr_overview().load_comments(status.pr, status.cwd, buf)
-        pr_overview().load_checks(status.pr, status.cwd, buf)
-      end
-      return
-    end
-    if session.status then
-      session.status.pr = nil
-      session.status.about = nil
-    end
-    render_status_or_notify(buf, nil, nil, {
-      restore_initial_folds = true,
-      refresh_pr = true,
-      refresh_about = true,
-    })
-  end)
-
-  map("toggle", "n", function()
-    local status = session.states and session.states[buf] or session.status
-    if status then session.status = status end
-    if review().toggle_comment_fold(buf) then return end
-    status_toggle(status_entry_under_cursor(status), status)
-  end)
-
-  map("collapse_parent", "n", function()
-    if session.states and session.states[buf] then session.status = session.states[buf] end
-    commit_view()._status_collapse_parent()
-  end)
-
-  map("visual_line_with_gutter", "n", function()
-    diff_buffer._start_diff_gutter_visual_line(buf)
-  end)
-
-  -- The review view gets its own action set (S/U/C/y/n/submit); the read-only
-  -- PR and branch-diff views only get navigation commands.
-  if view_kind == "review" then
-    review().setup_keymaps(buf)
-    map("browse", { "n", "x" }, function()
-      local status = session.states and session.states[buf] or session.status
-      local fragment = review().browse_fragment_under_cursor(buf)
-      review().leave_visual()
-      if not gh.browse_pr_changes(status and status.pr, fragment) then
-        notify_error("Unable to open PR URL", "DiffReview")
-      end
-    end)
-    local function review_open_action()
-      if session.states and session.states[buf] then session.status = session.states[buf] end
-      local entry = status_entry_under_cursor()
-      if commit_view()._status_open_commit_message_under_cursor(entry) then return end
-      status_jump(entry)
-    end
-    map("open", "n", review_open_action, "Jump to file")
-    vim.schedule(function()
-      if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
-      if session.states and session.states[buf] then session.status = session.states[buf] end
-      map("open", "n", review_open_action, "Jump to file")
-    end)
-    map("help", "n", status_show_help)
-    return
+  for _, entry in ipairs(COMMON_KEYMAPS) do
+    map(entry.id, entry.mode, function() entry.handler(buf) end, entry.desc)
   end
-  if view_kind ~= "status" then
-    map("browse", "n", function()
-      local status = session.states and session.states[buf] or session.status
-      if status and status.view_kind == "pr" then
-        local url = pr_overview().url_under_cursor(buf)
-        if url and gh.browse_url(url) then return end
-      end
-      local pr = status and status.pr
-      if not gh.browse_pr(pr) then
-        notify_error("Unable to open PR URL", "DiffReview")
-      end
-    end)
-    if is_pr_view then
-      map("comment", { "n", "x" }, function()
-        pr_overview().add_standalone_comment(buf)
-      end)
-      map("sync", { "n", "i" }, function()
-        review().sync_inline_comment_text(buf)
-        pr_overview().sync_standalone_comments(buf)
-        pr_edit.sync(buf)
-      end)
-    end
-    map("review", "n", function()
-      review().start(buf)
-    end)
-    map("open", "n", function()
-      if session.states and session.states[buf] then session.status = session.states[buf] end
-      if is_pr_view and pr_edit.toggle_draft_status_under_cursor(buf) then return end
-      local entry = status_entry_under_cursor()
-      if commit_view()._status_open_commit_message_under_cursor(entry) then return end
-      status_jump(entry)
-    end, "Jump to file")
-    map("help", "n", status_show_help)
-    vim.api.nvim_create_autocmd("CursorMoved", {
-      buffer = buf,
-      callback = function()
-        trace.span("status.autocmd_cursor_prewarm", buf, nil, function()
-          if (M.config or config.options or config.defaults).status_cursor_prewarm == false then return end
-          if session.states and session.states[buf] then session.status = session.states[buf] end
-          status_defer_prewarm_under_cursor(buf)
-        end)
-      end,
-    })
-    return
+  for _, entry in ipairs(VIEW_KEYMAPS[view_kind] or {}) do
+    map(entry.id, entry.mode, function() entry.handler(buf) end, entry.desc)
   end
-
-  map("stage", "n", function()
-    status_stage(status_entry_under_cursor())
-  end, "Stage hunk/file")
-  map("stage", "x", function()
-    local entries = status_entries_from_visual_selection()
-    status_leave_visual_mode()
-    status_stage_entries(entries, { preserve_cursor = true })
-  end, "Stage selection")
-
-  map("unstage", "n", function()
-    status_unstage(status_entry_under_cursor())
-  end, "Unstage hunk/file")
-  map("unstage", "x", function()
-    local entries = status_entries_from_visual_selection()
-    status_leave_visual_mode()
-    status_unstage_entries(entries, { preserve_cursor = true })
-  end, "Unstage selection")
-
-  map("discard", "n", function()
-    status_discard(status_entry_under_cursor())
-  end, "Discard hunk/file")
-  map("discard", "x", function()
-    local entries = status_entries_from_visual_selection()
-    status_leave_visual_mode()
-    status_discard_entry_list(entries, nil, { preserve_cursor = true })
-  end, "Discard selection")
-
-  map("open", "n", function()
-    local entry = status_entry_under_cursor()
-    if require("diff_review.views.walkthrough").jump_status_step(buf) then
-      return
-    elseif commit_view()._status_open_commit_message_under_cursor(entry) then
-      return
-    elseif entry and entry.kind == "pr" then
-      status_open_pr(entry)
-    elseif entry and entry.kind == "about" then
-      status_open_about(entry)
-    elseif entry and entry.kind == "load_more" then
-      local status = session.states and session.states[buf] or session.status
-      if status then
-        -- Force-render the next chunk of deferred hunks from where the gate stopped, so
-        -- each activation always reveals more even when a single hunk exceeds the budget.
-        local chunk = 6
-        local target = (tonumber(entry.load_more_from) or 1) + chunk - 1
-        status.file_render_limits = status.file_render_limits or {}
-        status.file_render_limits[entry.file_key] = math.max(status.file_render_limits[entry.file_key] or 0, target)
-        session.status = status
-        render_status_or_notify(buf, nil, vim.api.nvim_win_get_cursor(0)[1], { reuse_sections = true })
-      end
-    else
-      status_jump(entry)
-    end
-  end)
-
-  local function jump_back_with_saved_view()
-    local walkthrough = require("diff_review.views.walkthrough")
-    walkthrough._debug_jump_event("status_jump_back_start", {
-      buf = buf,
-      view = walkthrough._jump_debug_snapshot(vim.fn.bufwinid(buf), buf),
-    })
-    vim.cmd("normal! \15")
-    walkthrough._debug_jump_event("status_jump_back_after_ctrl_o", {
-      buf = buf,
-      view = walkthrough._jump_debug_snapshot(vim.fn.bufwinid(buf), buf),
-    })
-    local restored = walkthrough.restore_jump_return_view(buf, true)
-    walkthrough._debug_jump_event("status_jump_back_after_restore", {
-      buf = buf,
-      restored = restored,
-      view = walkthrough._jump_debug_snapshot(vim.fn.bufwinid(buf), buf),
-    })
-    vim.schedule(function()
-      if vim.api.nvim_buf_is_valid(buf) then
-        local scheduled_restored = walkthrough.restore_jump_return_view(buf, true)
-        walkthrough._debug_jump_event("status_jump_back_scheduled_restore", {
-          buf = buf,
-          restored = scheduled_restored,
-          view = walkthrough._jump_debug_snapshot(vim.fn.bufwinid(buf), buf),
-        })
-      end
-    end)
-  end
-  for _, key in ipairs({ ",", "<C-o>" }) do
-    vim.keymap.set("n", key, jump_back_with_saved_view,
-      vim.tbl_extend("force", opts, { desc = "Jump back" }))
-  end
-
-  local function commit()
-    require("diff_review.integrations.commit").commit({
-      win = vim.api.nvim_get_current_win(),
-      on_done = function()
-        if vim.api.nvim_buf_is_valid(buf) then render_status_or_notify(buf) end
-      end,
-    })
-  end
-  map("commit", "n", commit)
-
-  map("push", "n", function()
-    status_remote_action(buf, "push")
-  end)
-
-  map("pull", "n", function()
-    status_remote_action(buf, "pull")
-  end)
-
-  map("pr", "n", function()
-    status_open_pr(status_entry_under_cursor())
-  end)
-
-  map("branch_create", "n", function()
-    status_helpers.create_branch(buf)
-  end)
-
-  map("walkthrough", "n", function()
-    require("diff_review.views.walkthrough").start(commands._walkthrough_host(buf))
-  end)
-
-  map("review", "n", function()
-    review().start(buf)
-  end)
-
-  map("help", "n", status_show_help)
-
-  vim.api.nvim_create_autocmd("CursorMoved", {
-    buffer = buf,
-    callback = function()
-      trace.span("status.autocmd_cursor_prewarm", buf, nil, function()
-        if (M.config or config.options or config.defaults).status_cursor_prewarm == false then return end
-        if session.states and session.states[buf] then session.status = session.states[buf] end
-        status_defer_prewarm_under_cursor(buf)
-      end)
-    end,
-  })
+  local hook = VIEW_SETUP_HOOKS[view_kind]
+  if hook then hook(buf, map) end
 end
 
 -- Public surface (init reaches these via seams).

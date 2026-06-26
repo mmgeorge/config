@@ -47,6 +47,61 @@
 ---     reset_git_backend()       seam the headless test suite drives.
 ---
 --- ===========================================================================
+--- CONFIGURATION & KEYBINDINGS  (lazy.nvim)
+--- ===========================================================================
+--- Configure via require("diff_review").setup(opts), passed from a lazy.nvim spec.
+--- In-buffer ACTION keys default to the table below and are overridden per-command
+--- in opts.keymaps; keys that LAUNCH a view go in the spec's keys=.
+---
+---   -- e.g. lua/plugins/diff_review.lua
+---   return {
+---     "you/diff_review",                      -- or `dir = vim.fn.stdpath("config")` for a local plugin
+---     cmd = {                                  -- lazy-load on these user commands
+---       "GitStatus", "GitBranchDiff", "GitBranchDiffFile",
+---       "GitFileRevision", "GitDiffCompactPreview",
+---     },
+---     keys = {                                 -- your keys to LAUNCH a view
+---       { "<leader>gs", "<cmd>GitStatus<cr>", desc = "Git status review" },
+---       { "<leader>gd", function() require("diff_review").open_compact_preview() end,
+---         desc = "Compact diff preview" },
+---     },
+---     opts = {
+---       about_auto_generate = false,           -- a few common options (see infra/config.lua defaults)
+---       keymaps = {
+---         -- In-buffer ACTION keys. Override per command; unspecified keys keep
+---         -- their defaults (deep-merge). A value is a key string, a LIST of keys,
+---         -- or false to DISABLE that binding.
+---         status = {                            -- GitStatus / PR / branch-diff / diff views
+---           discard = "X",                      -- rebind one command
+---           open = { "<cr>", "o" },             -- bind multiple keys
+---           walkthrough = false,                -- disable a binding
+---         },
+---         review = {                            -- batched PR review mode (its own key group)
+---           submit = "<C-CR>",
+---         },
+---       },
+---     },
+---     config = function(_, opts)
+---       require("diff_review").setup(opts)
+---       -- the spec also registers the :Git* user commands here (see the real
+---       -- lua/plugins/diff_review.lua); a packaged plugin would do that in plugin/.
+---     end,
+---   }
+---
+--- Keymap model — two groups by MODE, not per view. The status-family views
+--- (status / pr / diff / branch-diff) share one consistent vocabulary from
+--- `keymaps.status`; review mode redefines keys and has its own `keymaps.review`.
+--- Which commands appear in which view is data in shared/command_specs.lua (the
+--- `views` field), and the in-buffer `?` help lists the live bindings per view.
+--- Defaults:
+---   status:  close=q  refresh=R  toggle=<Tab>  collapse_parent=N
+---            visual_line_with_gutter=W  stage=S  unstage=U  discard=j
+---            open={o,<CR>,.}  commit=cc  push=opp  pull=opP  pr=ogp
+---            branch_create=bc  browse=b  walkthrough=ow  review=or  help=?
+---   review:  viewed=S  unviewed=U  comment=C  delete=J  next_comment=y
+---            prev_comment=z  sync=<C-s>  submit=cc
+---
+--- ===========================================================================
 --- BUFFERS / VIEWS
 --- ===========================================================================
 ---   GitStatus       The main review buffer (views/status/*).
