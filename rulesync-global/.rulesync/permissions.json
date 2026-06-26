@@ -1,6 +1,9 @@
 {
   "$schema": "https://github.com/dyoshikawa/rulesync/releases/latest/download/permissions-schema.json",
   "permission": {
+    "edit": {
+      ".": "allow"
+    },
     "bash": {
       "cat": "allow",
       "cat *": "allow",
@@ -222,6 +225,8 @@
       "npm search *": "allow",
       "npm pack": "allow",
       "npm pack *": "allow",
+      "nvim": "allow",
+      "nvim *": "allow",
       "yarn list": "allow",
       "yarn list *": "allow",
       "yarn outdated": "allow",

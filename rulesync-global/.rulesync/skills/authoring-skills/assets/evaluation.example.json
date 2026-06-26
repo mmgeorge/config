@@ -1,0 +1,11 @@
+{
+  "_comment": "One evaluation = a task + a behavioral rubric. Make 3+ per skill, each targeting a real gap you saw the agent fail without the skill. There is no built-in runner: these are your source of truth — run them by hand or with a small harness, comparing skill-on vs skill-off (baseline). 'expected_behavior' items are observable outcomes, not implementation details.",
+  "skills": ["<skill-name>"],
+  "query": "<a realistic user request that should exercise the skill>",
+  "files": ["test-files/<input-the-task-needs>"],
+  "expected_behavior": [
+    "<observable outcome 1 — e.g. 'reads ALL pages, skipping none'>",
+    "<observable outcome 2 — e.g. 'writes readable text to output.txt'>",
+    "<observable outcome 3 — e.g. 'reports a clear error instead of guessing when the file is missing'>"
+  ]
+}
