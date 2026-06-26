@@ -13,7 +13,8 @@
     "commands",
     "subagents",
     "skills",
-    "hooks"
+    "hooks",
+    "permissions"
   ],
   "outputRoots": [
     "."
