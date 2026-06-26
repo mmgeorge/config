@@ -904,15 +904,55 @@ local function status_register_decoration_provider()
   })
 end
 
+--- Write only the changed line span so unchanged rows keep their extmarks, because a full
+--- nvim_buf_set_lines(0, -1) relocates and collapses every overlapping mark -- reverting
+--- concealed description/comment markdown to raw text until the async repaint, the fold flicker.
+--- Preserve every mark outside the diffed head/tail span.
+---
+--- This edits the buffer in place, so a treesitter parser kept on it across renders holds
+--- stale trees afterward. pr_edit.apply_markdown_parser_regions invalidates the markdown
+--- parser for that reason -- without it, re-parsing reused nodes segfaults treesitter.
+---@param buf integer
+---@param new_lines string[]
+local function status_reconcile_buffer_lines(buf, new_lines)
+  local old_lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  local old_count = #old_lines
+  local new_count = #new_lines
+
+  -- Keep the matching head, leaving those rows and every mark anchored to them untouched.
+  local shared = math.min(old_count, new_count)
+  local prefix = 0
+  while prefix < shared and old_lines[prefix + 1] == new_lines[prefix + 1] do
+    prefix = prefix + 1
+  end
+
+  -- Keep the matching tail without reclaiming rows the head already matched.
+  local suffix = 0
+  local tail_limit = shared - prefix
+  while suffix < tail_limit and old_lines[old_count - suffix] == new_lines[new_count - suffix] do
+    suffix = suffix + 1
+  end
+
+  -- Skip the write when nothing moved so no row, and no mark, is disturbed.
+  if old_count == new_count and prefix + suffix == old_count then return end
+
+  local replacement = {}
+  for index = prefix + 1, new_count - suffix do
+    replacement[#replacement + 1] = new_lines[index]
+  end
+  vim.api.nvim_buf_set_lines(buf, prefix, old_count - suffix, false, replacement)
+end
+
 local function status_write_rendered_buffer(buf)
   local was_rendering = vim.b[buf].diff_review_status_rendering
   vim.b[buf].diff_review_status_rendering = true
   vim.bo[buf].modifiable = true
   vim.api.nvim_buf_clear_namespace(buf, ui.status_ns, 0, -1)
-  for index, line in ipairs(session.status.lines or {}) do
-    if type(line) ~= "string" then session.status.lines[index] = tostring(line or "") end
+  local lines = session.status.lines or {}
+  for index, line in ipairs(lines) do
+    if type(line) ~= "string" then lines[index] = tostring(line or "") end
   end
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, session.status.lines)
+  status_reconcile_buffer_lines(buf, lines)
   vim.bo[buf].modifiable = false
   vim.b[buf].diff_review_status_rendering = was_rendering
 end

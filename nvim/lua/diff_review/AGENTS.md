@@ -268,6 +268,12 @@ Run the branch-create test:
 nvim --headless -i NONE --cmd "set shadafile=NONE" -u nvim/init.lua -c "lua vim.loader.enable(false)" -S nvim/tests/diff_review/branch_create.lua
 ```
 
+Run the markdown-parser reconcile guard (pins the parser invalidate that prevents the PR/review fold segfault):
+
+```text
+nvim --headless -i NONE --cmd "set shadafile=NONE" -u nvim/init.lua -S nvim/tests/diff_review/markdown_parser_reconcile.lua
+```
+
 Run the whitespace check:
 
 ```text

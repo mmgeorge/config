@@ -891,6 +891,45 @@ local function run()
     "file row path highlight missing after fold toggle collapse\n" .. table.concat(status_lines(buf), "\n")
   )
 
+  -- A fold re-render must not disturb extmarks on rows it leaves unchanged. A full
+  -- nvim_buf_set_lines relocates and collapses every overlapping mark (the render-markdown
+  -- conceal flicker on the PR description and comments), so toggling a later file must keep
+  -- a mark on an earlier, untouched row byte-for-byte intact.
+  reset_state({ modified = { ["preserve-mark-a.txt"] = true, ["preserve-mark-b.txt"] = true } })
+  render_and_wait(buf, "preserve-mark-a.txt +1 -1")
+  local sentinel_host, fold_target = "preserve-mark-a.txt", "preserve-mark-b.txt"
+  if find_row(buf, sentinel_host) > find_row(buf, fold_target) then
+    sentinel_host, fold_target = fold_target, sentinel_host
+  end
+  local sentinel_ns = vim.api.nvim_create_namespace("diff_review_flow_sentinel")
+  local sentinel_row = find_row(buf, sentinel_host)
+  local sentinel_end_col = #status_lines(buf)[sentinel_row]
+  local sentinel_id = vim.api.nvim_buf_set_extmark(buf, sentinel_ns, sentinel_row - 1, 0, {
+    end_row = sentinel_row - 1,
+    end_col = sentinel_end_col,
+    hl_group = "Comment",
+  })
+  local function assert_sentinel_intact(stage)
+    local pos = vim.api.nvim_buf_get_extmark_by_id(buf, sentinel_ns, sentinel_id, { details = true })
+    assert_true(#pos > 0, "sentinel extmark lost after " .. stage)
+    local details = pos[3] or {}
+    assert_true(
+      pos[1] == sentinel_row - 1 and details.end_col == sentinel_end_col,
+      string.format(
+        "fold re-render corrupted an unchanged-row extmark after %s (row %d->%d, end_col %d->%s) -- full set_lines instead of reconcile\n%s",
+        stage, sentinel_row - 1, pos[1], sentinel_end_col, tostring(details.end_col),
+        table.concat(status_lines(buf), "\n")
+      )
+    )
+  end
+  trigger_normal_mapping("<Tab>", find_row(buf, fold_target))
+  wait_for(function() return pcall(find_hunk_row_after_file, buf, fold_target) end, "preserve-mark fold target did not expand")
+  assert_sentinel_intact("expanding the later file")
+  trigger_normal_mapping("<Tab>", find_row(buf, fold_target))
+  wait_for(function() return not pcall(find_hunk_row_after_file, buf, fold_target) end, "preserve-mark fold target did not collapse")
+  assert_sentinel_intact("collapsing the later file")
+  vim.api.nvim_buf_clear_namespace(buf, sentinel_ns, 0, -1)
+
   reset_state({ modified = { ["collapse-parent-a.txt"] = true, ["collapse-parent-b.txt"] = true } })
   render_and_wait(buf, "collapse-parent-a.txt +1 -1")
   trigger_normal_mapping("<Tab>", find_row(buf, "collapse-parent-a.txt"))

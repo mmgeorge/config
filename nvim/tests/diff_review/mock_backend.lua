@@ -335,8 +335,11 @@ local function run()
   vim.cmd("doautocmd <nomodeline> CursorMoved")
   wait_for(function() return syntax_requests > 0 end, "file row cursor movement did not prewarm diff syntax")
   trigger_normal_mapping("<Tab>", first_row)
-  lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-  assert_true(contains_line(lines, "@@ +1 -1"), "missing fallback hunk header before async treesitter context")
+  -- File expansion defers until hunk context loads asynchronously, so the fallback hunk
+  -- header arrives shortly after the Tab rather than synchronously with it.
+  wait_for(function()
+    return contains_line(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "@@ +1 -1")
+  end, "missing fallback hunk header before async treesitter context")
   wait_for(function() return buffer_contains(buf, "AsyncScope") end, "async treesitter context did not render boundary row")
   assert_true(ts_requests > 0, "treesitter async context was not requested")
   lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)

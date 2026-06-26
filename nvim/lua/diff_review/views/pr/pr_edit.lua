@@ -138,6 +138,11 @@ end
 function M.apply_markdown_parser_regions(parser, ranges)
   if type(parser) ~= "table" or type(parser.set_included_regions) ~= "function" then return end
   pcall(parser.set_included_regions, parser, M.markdown_parser_regions(ranges))
+  -- Force a fresh parse over the new regions. The status reconcile edits buffer lines in
+  -- place, so when the region count is unchanged set_included_regions reuses cached trees
+  -- whose byte offsets no longer match the shifted regions, and parsing those stale nodes
+  -- against the edited buffer segfaults treesitter.
+  if type(parser.invalidate) == "function" then pcall(parser.invalidate, parser, true) end
 end
 
 ---@param buf integer
