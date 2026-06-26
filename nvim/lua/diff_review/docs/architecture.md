@@ -9,8 +9,8 @@ syntax, intraline highlights, and folding.
 This document is the map a new developer should read before touching any subsystem.
 It covers the directory layout, the architectural seams that hold it together, every
 buffer type, the render engine internals, and the end-to-end data flows. Pair it with
-[`AGENTS.md`](AGENTS.md) (testing, linting, the live-nvim debugging recipe) and the
-repo-root `architecture.md` (the diff-render decoration-provider design notes).
+`.rulesync/rules/diff_review.md` (testing, linting, the live-nvim debugging recipe)
+and the repo-root `architecture.md` (the diff-render decoration-provider design notes).
 
 ---
 
@@ -68,8 +68,7 @@ diff_review/
 ├── session.lua               Shared session-state store: active status state, per-buffer registry, per-session diff caches
 ├── types.lua                 Shared LuaCATS (---@class/---@alias) catalog — annotation only, never required at runtime
 ├── query_runtime.lua         Puts the plugin root on the runtimepath so bundled queries resolve
-├── architecture.md           This document
-├── AGENTS.md                 Contributor guide: testing, linting, live-nvim debugging, known bugs
+├── docs/architecture.md      This document
 ├── walkthrough.schema.json   JSON schema for the LLM-authored .walkthrough.json document
 │
 ├── views/                    Buffer-producing views (one boundary per user-facing surface)
@@ -155,6 +154,10 @@ diff_review/
     └── <lang>/diff_inventory.scm  Extract all named symbols + line ranges for the change inventory
 ```
 
+Contributor-facing assistant rules live at the repo root in
+`.rulesync/rules/diff_review.md`; keep that rule focused on working practices and keep
+this document focused on architecture.
+
 ---
 
 ## 3. Shared state (`session.lua`) and the `dr()` seam
@@ -207,7 +210,7 @@ A consequence for tooling: the re-export loops are invisible to static analysis,
 `lua-language-server` would flag hundreds of `undefined-field` reads on `dr()._x`. The
 `DiffReviewModule` class in `init.lua` carries an `---@field [string] any` catch-all to
 silence that architectural noise without losing typing on the explicit seams. See
-[`AGENTS.md` → Linting](AGENTS.md).
+`.rulesync/rules/diff_review.md` -> Linting.
 
 ---
 
@@ -739,7 +742,7 @@ Diagnostics come from `lua-language-server` (`--check`, configured by `nvim/.lua
 Most `undefined-field` / `inject-field` volume is the dynamic `dr()` seam, not real bugs.
 After a `git mv`-heavy refactor the editor's lua-ls holds **stale old paths** and reports
 phantom `duplicate-*` warnings — run `:LspRestart` to clear them (a fresh CLI `--check`
-never shows them). See [`AGENTS.md` → Linting](AGENTS.md) for the full triage.
+never shows them). See `.rulesync/rules/diff_review.md` -> Linting for the full triage.
 
 ---
 

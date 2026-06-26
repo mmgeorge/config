@@ -13,7 +13,7 @@ When editing Neovim Lua plugin code, use LuaLS/EmmyLua annotations for public AP
 
 Diagnostics come from `lua-language-server`. Check the whole plugin from the CLI with `lua-language-server --check nvim/lua/diff_review --logpath <scratch-outside-repo>` using the scoop build because the Mason build crashes `--check` on a locale bug. Config lives at `nvim/.luarc.json` with LuaJIT, the `vim` global, and `checkThirdParty = false`. Lazydev supplies the real `vim` runtime types in-editor.
 
-Most `undefined-field` and `inject-field` volume comes from the dynamic `dr()` boundary pattern. `init` injects hundreds of `M._x` members through `for pairs` loops that lua-ls cannot see statically. After a `git mv`-heavy refactor, run `:LspRestart` to clear stale-index duplicate warnings because lua-ls merges the old and new paths. See `lua/diff_review/AGENTS.md` under Linting for triage and the actionable codes worth fixing.
+Most `undefined-field` and `inject-field` volume comes from the dynamic `dr()` boundary pattern. `init` injects hundreds of `M._x` members through `for pairs` loops that lua-ls cannot see statically. After a `git mv`-heavy refactor, run `:LspRestart` to clear stale-index duplicate warnings because lua-ls merges the old and new paths. See `.rulesync/rules/diff_review.md` under Linting for triage and the actionable codes worth fixing.
 
 Every Neovim request path must surface request failures with notifications. External CLI calls, Git/GitHub/API requests, async metadata loads, completion sources, and background processes must report nonzero exits, invalid JSON, missing required context, and stale-operation errors through `vim.notify()` or a module notification wrapper.
 

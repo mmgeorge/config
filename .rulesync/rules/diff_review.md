@@ -1,4 +1,13 @@
-# DiffReview Plugin Notes
+---
+globs:
+  - 'nvim/lua/diff_review/**/*'
+  - 'nvim/tests/diff_review/**/*'
+  - 'nvim/lua/plugins/diff_review.lua'
+---
+
+# DiffReview Plugin Rules
+
+Keep `nvim/lua/diff_review/docs/architecture.md` up to date when changing DiffReview subsystem boundaries, data flow, buffer types, render pipelines, state ownership, or cross-module invariants. The Rulesync rule should tell agents what to do; the architecture document should explain how the system works and why the boundaries exist.
 
 DiffReview is a standalone local Neovim plugin. Trouble must not own this
 feature: do not place DiffReview code under `trouble/sources`, do not register a

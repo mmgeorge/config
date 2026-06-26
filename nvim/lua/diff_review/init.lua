@@ -113,7 +113,7 @@
 ---   Walkthrough     LLM-authored guided review: summary + anchored comment boxes.
 ---
 --- ===========================================================================
---- ARCHITECTURE  (see lua/diff_review/architecture.md for the full reference)
+--- ARCHITECTURE  (see lua/diff_review/docs/architecture.md for the full reference)
 --- ===========================================================================
 --- A layered package with a strict inward dependency direction:
 ---
