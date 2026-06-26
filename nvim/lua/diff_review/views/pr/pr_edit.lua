@@ -198,6 +198,67 @@ function M.highlight_code_blocks(buf, ranges)
   end)
 end
 
+--- True when a 1-based line sits inside an embedded code fence, identified by an injected
+--- code-language tree covering it, so the treesitter indentexpr applies only to fence content.
+---@param parser table markdown LanguageTree, already parsed
+---@param lnum integer
+---@return boolean
+function M.line_in_code_fence(parser, lnum)
+  for lang, child in pairs(parser:children()) do
+    if lang ~= "markdown_inline" then
+      for _, tree in pairs(child:trees()) do
+        local start_row, _, end_row = tree:root():range()
+        if lnum - 1 >= start_row and lnum - 1 <= end_row then return true end
+      end
+    end
+  end
+  return false
+end
+
+--- Compute the indent for a code-fence line by referencing nvim-treesitter's indent engine.
+--- The main-branch get_indent reads vim.treesitter.get_parser(bufnr) directly, so opening the
+--- markdown parser scope points that lookup at the region-scoped markdown parser (injection-aware
+--- via for_each_tree) without registering GitStatus as markdown or touching plugin internals.
+--- Requires the nvim-treesitter main branch; on the legacy master path get_indent reads
+--- nvim-treesitter.parsers instead and this returns -1 (default indenting).
+---@param buf integer
+---@param lnum integer 1-based
+---@return integer indent -1 falls back to default indenting
+function M.compute_code_fence_indent(buf, lnum)
+  if not (buf and vim.api.nvim_buf_is_valid(buf) and lnum) then return -1 end
+  local ok_indent, nt_indent = pcall(require, "nvim-treesitter.indent")
+  if not ok_indent or type(nt_indent.get_indent) ~= "function" then return -1 end
+  local ranges = M.markdown_ranges0(buf)
+  local ok_parser, parser = pcall(vim.treesitter.get_parser, buf, "markdown")
+  if not ok_parser or type(parser) ~= "table" then return -1 end
+  M.apply_markdown_parser_regions(parser, ranges)
+  pcall(parser.parse, parser, true)
+  if not M.line_in_code_fence(parser, lnum) then return -1 end
+
+  local restore = M.begin_markdown_parser_scope(buf, ranges)
+  local ok, indent = pcall(nt_indent.get_indent, lnum)
+  restore()
+  return (ok and type(indent) == "number") and indent or -1
+end
+
+--- Buffer indentexpr: treesitter-indent embedded code fences, default indenting everywhere else.
+---@return integer
+function M.code_fence_indentexpr()
+  return M.compute_code_fence_indent(vim.api.nvim_get_current_buf(), vim.v.lnum)
+end
+
+M.code_fence_indentexpr_string = "v:lua.require'diff_review.views.pr.pr_edit'.code_fence_indentexpr()"
+
+--- Point the buffer's indentexpr at the scoped code-fence indenter so editing embedded code
+--- auto-indents through treesitter while prose, headers, and diff rows keep default indenting.
+---@param buf integer
+function M.enable_code_fence_indent(buf)
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  if vim.bo[buf].indentexpr ~= M.code_fence_indentexpr_string then
+    vim.bo[buf].indentexpr = M.code_fence_indentexpr_string
+  end
+end
+
 ---@param buf integer
 function M.prune_description_markdown(buf)
   local first0, after0 = M.description_range0(buf)
@@ -422,6 +483,7 @@ function M.render_markdown_regions(buf)
       end)
       return
     end
+    M.enable_code_fence_indent(buf)
 
     if M.render_markdown_unavailable then return end
     local ok, render_markdown = trace.span("markdown.require_render_markdown", buf, nil, function()
