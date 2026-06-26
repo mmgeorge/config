@@ -1,7 +1,4 @@
 ---
-targets:
-  - claudecode
-  - copilotcli
 globs:
   - 'nvim/**/*'
 ---

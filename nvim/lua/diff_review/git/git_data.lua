@@ -553,10 +553,7 @@ function M.compute_hunk_context_async(filename, line, cb)
     return
   end
 
-  local ft = vim.bo[buf].filetype
-  if ft == "" then
-    ft = util.detect_filetype(filename)
-  end
+  local ft = syntax_engine.syntax_buffer_filetype(buf, filename)
   local lang = vim.treesitter.language.get_lang(ft)
   if not lang then
     cb(nil)
@@ -615,10 +612,7 @@ function M.compute_file_syntax_async(filename, cb)
       return
     end
 
-    local ft = vim.bo[buf].filetype
-    if ft == "" then
-      ft = util.detect_filetype(filename)
-    end
+    local ft = syntax_engine.syntax_buffer_filetype(buf, filename)
     local lang = vim.treesitter.language.get_lang(ft)
     if not lang then
       cb(nil)
@@ -707,7 +701,7 @@ function M.compute_diff_syntax_async(filename, lines, cb)
     vim.bo[buf].bufhidden = "wipe"
     vim.bo[buf].buftype = "nofile"
     vim.bo[buf].swapfile = false
-    vim.bo[buf].filetype = ft
+    syntax_engine.mark_syntax_scratch_buffer(buf, ft)
     trace.span("treesitter.compute_diff_syntax_async.set_lines", session.status and session.status.buf or nil, {
       file = filename,
       lang = lang,

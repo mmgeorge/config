@@ -60,8 +60,38 @@ local function status_commit_file_key(...) return status_keys.commit_file_key(..
 local function status_file_key(...) return status_keys.file_key(...) end
 local function status_section_key(...) return status_keys.section_key(...) end
 local function status_diff_hunks_for_file(...) return render_orchestrator.diff_hunks_for_file(...) end
-local function status_cursor_target(...) return render_orchestrator.cursor_target(...) end
-local function status_operations_pending(...) return actions._status_operations_pending(...) end
+local function status_operations_pending() return actions._status_operations_pending() end
+
+local status_render_current_model
+local status_current_model_render_delay_ms = 20
+
+---@param opts? { clear_fancy_rows?: boolean, skip_operations?: boolean }
+local function status_request_current_model_render(opts)
+  opts = opts or {}
+  local status = session.status
+  if not (status and status.buf and vim.api.nvim_buf_is_valid(status.buf) and status.head_lines and status.sections) then
+    return
+  end
+  if status.current_model_render_pending then return end
+  status.current_model_render_pending = true
+  local buf = status.buf
+  vim.defer_fn(function()
+    local latest_status = session.states and session.states[buf] or session.status
+    if latest_status then latest_status.current_model_render_pending = false end
+    if not (
+      latest_status
+      and latest_status.buf == buf
+      and vim.api.nvim_buf_is_valid(buf)
+      and latest_status.head_lines
+      and latest_status.sections
+    ) then
+      return
+    end
+    session.status = latest_status
+    if opts.skip_operations and status_operations_pending() then return end
+    status_render_current_model(nil, { clear_fancy_rows = opts.clear_fancy_rows })
+  end, status_current_model_render_delay_ms)
+end
 
 local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_kind, hunk_key_override)
   return trace.span("status_render.render_hunk", session.status and session.status.buf or nil, {
@@ -111,20 +141,7 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_ki
     end)
   end
   local function rerender_with_context()
-    session.status = session.status or {}
-    if session.status.context_rerender_pending then return end
-    session.status.context_rerender_pending = true
-    vim.schedule(function()
-      if not session.status then return end
-      session.status.context_rerender_pending = false
-      session.status.fancy_rows = {}
-      local buf = session.status.buf
-      if buf and vim.api.nvim_buf_is_valid(buf) then
-        if status_operations_pending() then return end
-        local target_id, fallback_line = status_cursor_target(buf)
-        render_orchestrator.render_status(buf, target_id, fallback_line, { reuse_sections = true })
-      end
-    end)
+    status_request_current_model_render({ clear_fancy_rows = false, skip_operations = true })
   end
   local current_context = nil
   local previous_context = nil
@@ -864,12 +881,17 @@ local function status_render_loaded(buf, target_id, fallback_line, opts, head_li
   end)
 end
 
-local function status_render_current_model(target_id)
+---@param target_id? string
+---@param opts? { clear_fancy_rows?: boolean }
+status_render_current_model = function(target_id, opts)
   local status = session.status
   if not (status and status.buf and vim.api.nvim_buf_is_valid(status.buf) and status.head_lines and status.sections) then
     return
   end
-  status.fancy_rows = {}
+  opts = opts or {}
+  if opts.clear_fancy_rows ~= false then
+    status.fancy_rows = {}
+  end
   status_render_loaded(status.buf, target_id, vim.api.nvim_win_get_cursor(0)[1], { reuse_sections = true }, status.head_lines, status.sections)
 end
 
@@ -887,5 +909,6 @@ M.status_render_commit = status_render_commit
 M.status_render_section = status_render_section
 M.status_render_loaded = status_render_loaded
 M.status_render_current_model = status_render_current_model
+M.status_request_current_model_render = status_request_current_model_render
 
 return M

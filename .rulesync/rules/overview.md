@@ -1,7 +1,5 @@
 ---
 root: true
-targets:
-  - '*'
 globs:
   - '**/*'
 ---

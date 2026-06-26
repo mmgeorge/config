@@ -4,8 +4,13 @@ return {
     dir = vim.fn.stdpath("config"),
     dependencies = { "folke/snacks.nvim" },
     cmd = { "GitStatus", "GitBranchDiff", "GitBranchDiffFile", "GitFileRevision", "GitDiffCompactPreview" },
+    opts = {
+      status_perf_logging = true,
+      diff_profile_enabled = true,
+    },
     config = function(_, opts)
       vim.g.diff_review_gitstatus_debug = 1
+      vim.g.diff_review_gitstatus_perf = 1
       local diff_review = require("diff_review")
       diff_review.setup(opts)
       vim.api.nvim_create_user_command("GitStatus", function()

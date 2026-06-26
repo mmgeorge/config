@@ -25,7 +25,7 @@ local parse_hunk_body = diff_parse.parse_hunk_body
 local loaded_file_buffer = util.loaded_file_buffer
 local file_contains_nul = util.file_contains_nul
 local lines_contain_nul = util.lines_contain_nul
-local function status_render_current_model(...) return status_render().status_render_current_model(...) end
+local function status_request_current_model_render(...) return status_render().status_request_current_model_render(...) end
 local function status_diff_hunks_for_file(...) return render_orchestrator().diff_hunks_for_file(...) end
 local hunk_first_changed_current_line = diff_parse.hunk_first_changed_current_line
 local detect_filetype = util.detect_filetype
@@ -82,6 +82,28 @@ local function file_source_lines(filename)
   end)
 end
 
+--- Mark a scratch buffer as a syntax-only parser source without firing FileType autocmds.
+---@param buf integer
+---@param filetype string
+local function mark_syntax_scratch_buffer(buf, filetype)
+  vim.b[buf].diff_review_syntax_scratch = true
+  vim.b[buf].diff_review_syntax_filetype = filetype or ""
+end
+
+--- Resolve the parser filetype for a syntax buffer without relying on FileType autocmd state.
+---@param buf integer
+---@param filename string
+---@return string
+local function syntax_buffer_filetype(buf, filename)
+  local filetype = vim.b[buf].diff_review_syntax_filetype
+  if type(filetype) == "string" and filetype ~= "" then return filetype end
+
+  filetype = vim.bo[buf].filetype
+  if filetype ~= "" then return filetype end
+
+  return detect_filetype(filename)
+end
+
 local function treesitter_source_buffer(filename)
   return trace.span("treesitter.source_buffer", session.status and session.status.buf or nil, {
     file = filename,
@@ -110,7 +132,7 @@ local function treesitter_source_buffer(filename)
     }, function()
       vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
     end)
-    vim.bo[buf].filetype = detect_filetype(filename, lines)
+    mark_syntax_scratch_buffer(buf, detect_filetype(filename, lines))
     ts_source_bufs[filename] = buf
     return buf
   end)
@@ -564,12 +586,8 @@ local function cached_diff_syntax(filename, diff_text, side, callback_key, on_up
           local ok, err = pcall(callback, syntax)
           if not ok then notify_error("Tree-sitter diff syntax update failed: " .. tostring(err)) end
         end
-        if syntax and status_render_current_model and session.status and session.status.buf then
-          vim.schedule(function()
-            if session.status and session.status.buf and vim.api.nvim_buf_is_valid(session.status.buf) then
-              status_render_current_model()
-            end
-          end)
+        if syntax and next(callbacks) == nil and status_request_current_model_render and session.status and session.status.buf then
+          status_request_current_model_render({ clear_fancy_rows = false, skip_operations = true })
         end
       end)
     end)
@@ -711,12 +729,8 @@ local function cached_old_file_syntax(filename, diff_text, callback_key, on_upda
           local ok, err = pcall(callback, syntax)
           if not ok then notify_error("Tree-sitter old file syntax update failed: " .. tostring(err)) end
         end
-        if syntax and status_render_current_model and session.status and session.status.buf then
-          vim.schedule(function()
-            if session.status and session.status.buf and vim.api.nvim_buf_is_valid(session.status.buf) then
-              status_render_current_model()
-            end
-          end)
+        if syntax and next(callbacks) == nil and status_request_current_model_render and session.status and session.status.buf then
+          status_request_current_model_render({ clear_fancy_rows = false, skip_operations = true })
         end
       end)
     end)
@@ -932,6 +946,8 @@ M.status_prewarm_hunk_budget = status_prewarm_hunk_budget
 M.status_syntax_source_for_entry_kind = status_syntax_source_for_entry_kind
 M.treesitter_source_buffer = treesitter_source_buffer
 M.clear_treesitter_source_buffers = clear_treesitter_source_buffers
+M.mark_syntax_scratch_buffer = mark_syntax_scratch_buffer
+M.syntax_buffer_filetype = syntax_buffer_filetype
 M.treesitter_line_segments = treesitter_line_segments
 M.hunk_context_from_trees = hunk_context_from_trees
 M.cached_hunk_context = cached_hunk_context
