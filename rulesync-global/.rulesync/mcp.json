@@ -18,6 +18,7 @@
       "default_tools_approval_mode": "approve"
     },
     "google-dev-knowledge": {
+      "targets": ["claudecode", "codexcli", "antigravity-cli"],
       "type": "http",
       "url": "https://developerknowledge.googleapis.com/mcp",
       "default_tools_approval_mode": "approve",
@@ -35,23 +36,42 @@
       ],
       "default_tools_approval_mode": "approve"
     },
-    "github": {
+    "github-enterprise": {
+      "targets": ["copilotcli"],
       "command": "github-mcp-server",
       "args": [
         "stdio",
-        "--toolsets=context,actions,discussions,issues,labels,notifications,orgs,projects,pull_requests,repos,users"
+        "--gh-host=https://devtopia.esri.com",
+        "--toolsets=discussions,issues,labels,projects,pull_requests,repos,users"
       ],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "$GH_ENTERPRISE_AGENT_TOKEN"
+      },
+      "default_tools_approval_mode": "approve"
+    },
+    "github": {
+      "targets": ["claudecode", "codexcli", "antigravity-cli"],
+      "command": "github-mcp-server",
+      "args": [
+        "stdio",
+        "--toolsets=context,actions,discussions,issues,labels,pull_requests,repos,users"
+      ],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "$GH_AGENT_TOKEN"
+      },
       "envVars": [
-        "GITHUB_PERSONAL_ACCESS_TOKEN"
+        "GITHUB_PERSONAL_ACCESS_TOKEN",
+        "GH_AGENT_TOKEN"
       ],
       "default_tools_approval_mode": "approve"
     },
     "openaiDeveloperDocs": {
+      "targets": ["codexcli"],
       "type": "http",
       "url": "https://developers.openai.com/mcp",
       "default_tools_approval_mode": "approve"
     },
-    "terminal": {
+    "terminal-mcp": {
       "command": "terminal-mcp",
       "args": [
         "--headless"
