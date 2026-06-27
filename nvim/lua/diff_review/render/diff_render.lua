@@ -730,16 +730,16 @@ local function render_highlight_rows(buf, ns, rows)
     end
     lines[row_index] = table.concat(line_parts)
     if row.diff_review_bg_hl then
-      local content_length
-      lines[row_index], content_length = diff_buffer()._diff_pad_highlighted_line(lines[row_index], buf)
-      content_lengths[row_index] = content_length
+      content_lengths[row_index] = #lines[row_index]
       extmarks[#extmarks + 1] = {
         line = row_index,
         col = 0,
         opts = {
-          end_col = #lines[row_index],
+          end_row = row_index,
+          end_col = 0,
           hl_group = row.diff_review_bg_hl,
           priority = 60,
+          hl_eol = true,
         },
       }
     end

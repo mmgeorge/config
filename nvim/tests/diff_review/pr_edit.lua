@@ -910,9 +910,9 @@ local function run()
     line_has_substring_highlight(buf, find_row(buf, "Head:   abc1234"), "1 day ago", "DiffReviewStatusDate"),
     "PR head date did not use date highlight"
   )
-  assert_true(not vim.wo[0].wrap, "PR overview should reuse GitStatus no-wrap formatting")
-  assert_true(not vim.wo[0].linebreak, "PR overview should not enable linebreak")
-  assert_true(not vim.wo[0].breakindent, "PR overview should not enable breakindent")
+  assert_true(vim.wo[0].wrap, "PR overview should reuse GitStatus soft-wrap formatting")
+  assert_true(vim.wo[0].linebreak, "PR overview should enable linebreak for word-aware wrap")
+  assert_true(not vim.wo[0].breakindent, "PR overview should keep breakindent off so wrapped diff rows have no unpainted background notch")
   assert_true(vim.wo[0].conceallevel == 0, "PR overview should not conceal code rows")
   assert_true(vim.wo[0].fillchars:find("fold: ", 1, true) ~= nil, "PR overview should not draw fold filler dots")
   assert_true(vim.wo[0].winhighlight:find("Folded:Normal", 1, true) ~= nil, "PR overview should not recolor folded rows")

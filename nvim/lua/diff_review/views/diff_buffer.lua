@@ -47,26 +47,6 @@ function M.cleanup_diff_buffers()
   buf_saved_cursor = {}
 end
 
-function M._diff_visual_fill_width(buf)
-  local width = vim.o.columns
-  for _, win in ipairs(vim.fn.win_findbuf(buf)) do
-    if vim.api.nvim_win_is_valid(win) then
-      width = math.max(width, vim.api.nvim_win_get_width(win))
-    end
-  end
-  return math.max(width + 8, 160)
-end
-
-function M._diff_pad_highlighted_line(line_text, buf)
-  local content_length = #line_text
-  local fill_width = M._diff_visual_fill_width(buf)
-  local display_width = vim.fn.strdisplaywidth(line_text)
-  if display_width < fill_width then
-    line_text = line_text .. string.rep(" ", fill_width - display_width)
-  end
-  return line_text, content_length
-end
-
 ---@param virt_text table[]?
 ---@return integer
 function M._inline_virtual_text_width(virt_text)

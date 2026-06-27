@@ -187,10 +187,10 @@ function M.add_fancy_row(state, row, entry, indent)
   end
 
   local line_text = table.concat(text_parts)
-  local content_length = nil
-  if row.diff_review_bg_hl then
-    line_text, content_length = require("diff_review.views.diff_buffer")._diff_pad_highlighted_line(line_text, state.buf)
-  end
+  -- Diff-body rows fill their background to the window edge via an hl_eol bg span (below),
+  -- not trailing-space padding, so the buffer line stays pure code, the inline word-diff
+  -- highlight keeps painting on top, and soft-wrap never spills a padded tail onto rows.
+  local content_length = row.diff_review_bg_hl and #line_text or nil
 
   local line_entry = entry
   if row.diff_review_boundary or row.diff_review_context_padding then
@@ -228,7 +228,7 @@ function M.add_fancy_row(state, row, entry, indent)
     session.diff_line_content_lengths[state.buf] = session.diff_line_content_lengths[state.buf] or {}
     session.diff_line_content_lengths[state.buf][line] = content_length or #line_text
     spans = spans or { highlights = {} }
-    spans.bg = { end_col = #line_text, hl_group = row.diff_review_bg_hl, priority = 60 }
+    spans.bg = { hl_group = row.diff_review_bg_hl, priority = 60 }
   end
   if row.diff_review_boundary then
     state.boundary_lines = state.boundary_lines or {}

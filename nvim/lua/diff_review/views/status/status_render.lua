@@ -849,10 +849,15 @@ end
 local function status_emit_row_spans(buf, namespace, row, spans, ephemeral)
   if not spans then return end
   if spans.bg then
+    -- Cover the line's EOL (end_row = row + 1) with hl_eol so the diff background fills to
+    -- the window edge on every soft-wrapped display row without trailing-space padding,
+    -- while staying a char-range span below the inline word-diff highlights.
     pcall(vim.api.nvim_buf_set_extmark, buf, namespace, row, 0, {
-      end_col = spans.bg.end_col,
+      end_row = row + 1,
+      end_col = 0,
       hl_group = spans.bg.hl_group,
       priority = spans.bg.priority or 60,
+      hl_eol = true,
       ephemeral = ephemeral or nil,
     })
   end

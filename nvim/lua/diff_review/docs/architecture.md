@@ -386,6 +386,18 @@ rows, and body rows with their syntax segments and inline spans.
 extmarks**: it clears the namespace, sets the lines, and adds highlight, line-background,
 and virtual-text extmarks at fixed priorities.
 
+**Why the diff background uses `hl_eol`, not padding.** The DiffReview windows enable soft
+word wrap (`wrap` + `linebreak`, set in `window_options.apply`), so a long diff line wraps
+instead of running off-screen. `breakindent` stays off on purpose — its wrapped-continuation
+indent is virtual whitespace no character-range highlight can paint, so an indented
+continuation would show an unpainted notch under the gutter on `+`/`-` rows. The `+`/`-` line background therefore fills to the
+window edge with `hl_eol` on a char-range span at priority 60 — *below* the inline word-diff
+highlights — instead of padding the buffer line with trailing spaces. Padding (the old
+`_diff_pad_highlighted_line` to ~160 cols) would spill a blank highlighted tail onto every
+wrapped continuation row and leak into yanks; `hl_eol` keeps the band full-width on each
+display row while the buffer line stays pure code. Emitted in `status_render`'s ephemeral
+decoration provider (status views) and `diff_render`'s extmark pass (standalone diff buffers).
+
 **Why the gutter is virtual text, not buffer content.** Line numbers and the `+`/`-`
 sign live as *inline virtual text*, not as characters in the buffer. So a visual
 selection, yank, search, or `gd` operates on the real code only — the gutter never

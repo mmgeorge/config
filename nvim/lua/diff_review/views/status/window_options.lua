@@ -84,14 +84,19 @@ function M.hide_line_numbers(win)
   vim.wo[win].virtualedit = "all"
 end
 
---- Apply the full status-window option set (hidden numbers, manual folds, no wrap/conceal).
+--- Apply the full status-window option set (hidden numbers, manual folds, soft word wrap, no conceal).
 ---@param win integer?
 ---@param _state? table
 function M.apply(win, _state)
   if not (win and vim.api.nvim_win_is_valid(win)) then return end
   M.hide_line_numbers(win)
-  vim.wo[win].wrap = false
-  vim.wo[win].linebreak = false
+  -- Soft-wrap mixed prose/diff content at word boundaries (linebreak). Keep breakindent
+  -- OFF: a wrapped-continuation indent is virtual whitespace the diff background cannot
+  -- paint, so an indented continuation shows an unpainted notch under the gutter on +/-
+  -- rows. Landing continuations at column 0 keeps the hl_eol band gap-free. Diff rows
+  -- carry their old/new/sign gutter as inline virt_text on the first display row only.
+  vim.wo[win].wrap = true
+  vim.wo[win].linebreak = true
   vim.wo[win].breakindent = false
   vim.wo[win].conceallevel = 0
   vim.wo[win].concealcursor = ""
