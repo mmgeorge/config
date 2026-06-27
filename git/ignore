@@ -1,4 +1,5 @@
 # Rulesync-generated LLM provider directories
+.DS_Store
 .agents/
 .claude/
 .codex/
@@ -15,3 +16,4 @@ GEMINI.md
 **/.claude/settings.local.json
 .gitstatus
 .walkthrough.json
+.sem/
