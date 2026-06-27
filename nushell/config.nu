@@ -386,7 +386,131 @@ def ai [prompt: string] {
   print $command
 }
 
-def hashupdate [url?: string] {
+def screenshot-local-path [
+  repo_root: path
+  url: string
+] {
+  let parsed = (
+    $url
+    | ansi strip
+    | parse --regex '(?:^|/)\.screenshots/(?P<namespace>[^/]+)/(?P<hash>[0-9a-f]+)\.png$'
+  )
+
+  if ($parsed | is-empty) {
+    null
+  } else {
+    $repo_root | path join ".screenshots" $parsed.0.namespace $"($parsed.0.hash).png"
+  }
+}
+
+def screenshot-accept-local-references [
+  repo_root: path
+  log_path: path
+] {
+  let log = (open --raw $log_path | ansi strip)
+  let failures = (
+    $log
+    | parse --regex 'expected:\s*(?:(?P<tag>[^\s:]+):)?(?P<expected>[0-9a-f]+)\s*\((?P<expectedUrl>[^)]*)\)\s*,\s*got:\s*(?P<actual>[0-9a-f]+)\s*\((?P<actualUrl>[^)]*)\)'
+  )
+
+  mut accepted = 0
+  mut missing = 0
+  mut seen = []
+
+  for failure in $failures {
+    let expected_path = (screenshot-local-path $repo_root $failure.expectedUrl)
+    let actual_path = (screenshot-local-path $repo_root $failure.actualUrl)
+
+    if ($expected_path == null) or ($actual_path == null) or ($expected_path in $seen) {
+      continue
+    }
+
+    if not ($actual_path | path exists) {
+      print --stderr $"Missing actual screenshot: ($actual_path)"
+      $missing = ($missing + 1)
+      continue
+    }
+
+    mkdir ($expected_path | path dirname)
+    cp -f $actual_path $expected_path
+    $seen = ($seen | append $expected_path)
+    $accepted = ($accepted + 1)
+  }
+
+  {
+    accepted: $accepted
+    missing: $missing
+    failures: ($failures | length)
+  }
+}
+
+def screenshotSync [
+  target?: path # Optional screenshot spec file or directory. Defaults to all screenshot tests.
+] {
+  if (which bash | is-empty) {
+    error "screenshotSync requires bash so vitest output can stream while being logged"
+    return
+  }
+
+  let repo_result = (^git rev-parse --show-toplevel | complete)
+
+  if $repo_result.exit_code != 0 {
+    error "screenshotSync must run inside a git repository"
+    return
+  }
+
+  let repo_root = ($repo_result.stdout | str trim)
+  let test_targets = if $target == null {
+    ["tests/screenshotTests2d" "tests/screenshotTests3d"]
+  } else {
+    let requested_path = ($target | path expand)
+
+    if not ($requested_path | path exists) {
+      error $"screenshotSync target not found: ($target)"
+      return
+    }
+
+    let relative_target = (try { $requested_path | path relative-to $repo_root } catch { null })
+
+    if $relative_target == null {
+      error $"screenshotSync target must be inside repo: ($target)"
+      return
+    }
+
+    [$relative_target]
+  }
+
+  let timestamp = (date now | format date "%Y%m%d-%H%M%S")
+  let log_path = ($nu.temp-path | path join $"screenshotSync-($timestamp).log")
+
+  print $"Running screenshot tests: ($test_targets | str join ' ')"
+  print $"Log: ($log_path)"
+
+  ^bash -c 'set -o pipefail
+log_path="$1"
+shift
+cd "$1"
+shift
+AGENT=1 VITEST_HEADLESS=true VITEST_DISABLE_INLINE_REPORTS=true pnpm vitest --run --browser.headless --browser.ui=false "$@" 2>&1 | tee "$log_path"
+exit ${PIPESTATUS[0]}' bash $log_path $repo_root ...$test_targets
+
+  let test_exit_code = $env.LAST_EXIT_CODE
+  let sync_result = (screenshot-accept-local-references $repo_root $log_path)
+
+  print $"Accepted ($sync_result.accepted) local screenshot reference(s)"
+
+  if $sync_result.missing > 0 {
+    print --stderr $"Skipped ($sync_result.missing) missing actual screenshot(s)"
+  }
+
+  if ($test_exit_code != 0) and ($sync_result.accepted == 0) {
+    error $"Screenshot tests failed and no local references were accepted. See ($log_path)"
+  } else if $test_exit_code != 0 {
+    print $"Initial run failed, but local references were accepted. Rerun screenshotSync to verify."
+  }
+}
+
+def screenshotPull [url?: string] {
   # Default URL from clipboard (macOS: pbpaste) if not provided
   let url = if $url == null {
     (^pbpaste | str trim)

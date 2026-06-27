@@ -28,6 +28,15 @@ M.settings = {
         env = {
           FOO = 1
         },
+        new_worktree_setup = {
+          symlinks = {
+            {
+              path = '.screenshots',
+              target = 'screenshots',
+              target_base = 'worktree_parent',
+            },
+          },
+        },
         tabs = {
           { title = 'main',
             focus = true,
@@ -276,6 +285,117 @@ local function directory_exists(path)
   end
 
   return run_command({ 'test', '-d', path }) ~= nil
+end
+
+local function ensure_directory(path)
+  path = normalize_path(path)
+  if not path then
+    return false, 'Directory path is required'
+  end
+
+  if directory_exists(path) then
+    return true
+  end
+
+  local stdout, stderr
+  if is_windows then
+    stdout, stderr = run_command({
+      'powershell.exe',
+      '-NoProfile',
+      '-NonInteractive',
+      '-Command',
+      'New-Item -ItemType Directory -Force -LiteralPath $args[0] | Out-Null',
+      path,
+    })
+  else
+    stdout, stderr = run_command({ 'mkdir', '-p', path })
+  end
+
+  if not stdout then
+    return false, stderr
+  end
+
+  if not directory_exists(path) then
+    return false, 'Could not create directory ' .. path
+  end
+
+  return true
+end
+
+local function read_symlink_target(path)
+  path = normalize_path(path)
+  if not path then
+    return nil, 'Symlink path is required'
+  end
+
+  local stdout, stderr
+  if is_windows then
+    stdout, stderr = run_command({
+      'powershell.exe',
+      '-NoProfile',
+      '-NonInteractive',
+      '-Command',
+      '$item = Get-Item -LiteralPath $args[0] -Force -ErrorAction Stop; if ($item.LinkType) { [Console]::Out.Write($item.Target) }',
+      path,
+    })
+  else
+    stdout, stderr = run_command({ 'readlink', path })
+  end
+
+  if not stdout then
+    return nil, stderr
+  end
+
+  local target = trim(stdout)
+  if target == '' then
+    return nil, nil
+  end
+
+  return normalize_path(target), nil
+end
+
+local function symlink_points_to(path, target)
+  local existing_target = read_symlink_target(path)
+  if not existing_target then
+    return false
+  end
+
+  if not is_absolute(existing_target) then
+    existing_target = join_path(dirname(path), existing_target)
+  end
+
+  return normalize_path(existing_target) == normalize_path(target)
+end
+
+local function symlink_or_path_exists(path)
+  if path_exists(path) then
+    return true
+  end
+
+  return read_symlink_target(path) ~= nil
+end
+
+local function create_symbolic_link(path, target)
+  local stdout, stderr
+  if is_windows then
+    stdout, stderr = run_command({
+      'powershell.exe',
+      '-NoProfile',
+      '-NonInteractive',
+      '-Command',
+      'New-Item -ItemType SymbolicLink -LiteralPath $args[0] -Target $args[1] | Out-Null',
+      path,
+      target,
+    })
+  else
+    stdout, stderr = run_command({ 'ln', '-s', target, path })
+  end
+
+  if not stdout then
+    return false, stderr
+  end
+
+  return true
 end
 
 local function remove_directory_tree(path)
@@ -1144,6 +1264,165 @@ local function current_worktree_for_path(repo, path)
   return best_match
 end
 
+local function append_setup_specs(target_specs, source_specs)
+  if not source_specs then
+    return
+  end
+
+  if type(source_specs) ~= 'table' then
+    return
+  end
+
+  if source_specs.path or source_specs.target then
+    table.insert(target_specs, source_specs)
+    return
+  end
+
+  for _, spec in ipairs(source_specs) do
+    table.insert(target_specs, spec)
+  end
+end
+
+local function resolve_new_worktree_setup(repo)
+  local setup = {
+    symlinks = {},
+  }
+
+  local default_setup = M.settings.new_worktree_setup or {}
+  append_setup_specs(setup.symlinks, default_setup.symlinks)
+
+  local settings = repo_settings(repo.name)
+  local repo_setup = settings.new_worktree_setup or {}
+  append_setup_specs(setup.symlinks, repo_setup.symlinks)
+
+  return setup
+end
+
+local function resolve_setup_base(repo, worktree, base)
+  base = base or 'worktree'
+
+  if base == 'worktree' then
+    return worktree.path, worktree.path and nil or 'Worktree path is unavailable'
+  end
+
+  if base == 'main_worktree' or base == 'repo_main' then
+    return repo.main_path, repo.main_path and nil or 'Main worktree path is unavailable'
+  end
+
+  if base == 'worktree_parent' then
+    return repo.worktree_parent, repo.worktree_parent and nil or 'Worktree parent is unavailable'
+  end
+
+  if is_absolute(base) then
+    return normalize_path(base)
+  end
+
+  return nil, 'Unknown setup path base: ' .. tostring(base)
+end
+
+local function resolve_setup_path(repo, worktree, path, base)
+  path = normalize_path(path)
+  if not path then
+    return nil, 'Setup path is required'
+  end
+
+  if is_absolute(path) then
+    return path
+  end
+
+  local base_path, base_err = resolve_setup_base(repo, worktree, base)
+  if not base_path then
+    return nil, base_err
+  end
+
+  return join_path(base_path, path)
+end
+
+local function create_worktree_symlink(repo, worktree, spec)
+  if type(spec) ~= 'table' then
+    return false, 'Symlink setup must be a table'
+  end
+
+  local link_path, link_err = resolve_setup_path(
+    repo,
+    worktree,
+    spec.path or spec.link_path or spec.link,
+    spec.path_base or 'worktree'
+  )
+  if not link_path then
+    return false, link_err
+  end
+
+  local target_path, target_err = resolve_setup_path(
+    repo,
+    worktree,
+    spec.target or spec.to,
+    spec.target_base or 'main_worktree'
+  )
+  if not target_path then
+    return false, target_err
+  end
+
+  if not path_exists(target_path) then
+    if not spec.create_target then
+      return false, 'Symlink target does not exist: ' .. target_path
+    end
+
+    local target_ok, target_mkdir_err = ensure_directory(target_path)
+    if not target_ok then
+      return false, target_mkdir_err
+    end
+  end
+
+  if symlink_or_path_exists(link_path) then
+    if symlink_points_to(link_path, target_path) then
+      return true
+    end
+
+    return false, 'Cannot create symlink at existing path: ' .. link_path
+  end
+
+  local parent_ok, parent_err = ensure_directory(dirname(link_path))
+  if not parent_ok then
+    return false, parent_err
+  end
+
+  local link_ok, link_err = create_symbolic_link(link_path, target_path)
+  if not link_ok then
+    return false, link_err
+  end
+
+  if not symlink_points_to(link_path, target_path) then
+    return false, 'Could not verify symlink ' .. link_path .. ' -> ' .. target_path
+  end
+
+  return true
+end
+
+local function run_new_worktree_setup(window, repo, worktree)
+  local setup = resolve_new_worktree_setup(repo)
+  local failures = {}
+
+  for _, spec in ipairs(setup.symlinks) do
+    local setup_ok, setup_err = create_worktree_symlink(repo, worktree, spec)
+    if not setup_ok then
+      table.insert(failures, setup_err or 'unknown setup failure')
+    end
+  end
+
+  if #failures == 0 then
+    return true
+  end
+
+  local message = failures[1]
+  if #failures > 1 then
+    message = tostring(#failures) .. ' setup steps failed; first: ' .. message
+  end
+
+  notify(window, 'Created the worktree, but setup failed: ' .. message)
+  return false
+end
+
 local function remote_ref_parts(ref)
   if not ref then
     return nil, nil
@@ -1352,6 +1631,8 @@ local function create_worktree(window, pane, repo, opts)
     notify(window, 'Created the worktree, but could not locate it in git worktree list')
     return
   end
+
+  run_new_worktree_setup(window, updated_repo, worktree)
 
   switch_to_worktree(window, pane, worktree, {
     first_run = resolve_layout(worktree).first_run,
