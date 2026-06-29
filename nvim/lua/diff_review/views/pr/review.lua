@@ -1268,8 +1268,8 @@ function M.emit_comment_reply(comment, comment_index, reply, reply_index)
     review_boundary = "reply_header",
   }
   local header = M.reply_header_line(reply)
-  local header_line = status_add_line(header, header_entry, "DiffReviewReviewCommentHeader")
-  status_add_highlight(header_line, 0, #header, "DiffReviewReviewCommentHeader")
+  local header_line = status_add_line(header, header_entry, "DiffReviewReviewCommentBoxHeader")
+  status_add_highlight(header_line, 0, #header, "DiffReviewReviewCommentBoxHeader")
   M.add_comment_rule_date_highlights(header_line, header)
 
   for body_index, line in ipairs(M.comment_body_lines(reply.body or "")) do
@@ -1283,8 +1283,8 @@ function M.emit_comment_reply(comment, comment_index, reply, reply_index)
       review_reply_body = true,
       review_reply_body_index = body_index,
     }
-    local body_line = status_add_line(line, body_entry)
-    if line ~= "" then status_add_highlight(body_line, 0, #line, "DiffReviewReviewComment") end
+    local body_line = status_add_line(line, body_entry, "DiffReviewReviewCommentBox")
+    if line ~= "" then status_add_highlight(body_line, 0, #line, "DiffReviewReviewCommentBox") end
   end
 end
 
@@ -1310,8 +1310,8 @@ function M.emit_comment(comment, index, indent)
       review_boundary = "folded",
     }
     local folded_line = M.comment_folded_line(comment)
-    local line_number = status_add_line(folded_line, folded_entry, "DiffReviewReviewCommentHeader")
-    status_add_highlight(line_number, 0, #folded_line, "DiffReviewReviewCommentHeader")
+    local line_number = status_add_line(folded_line, folded_entry, "DiffReviewReviewCommentBoxHeader")
+    status_add_highlight(line_number, 0, #folded_line, "DiffReviewReviewCommentBoxHeader")
     M.add_comment_rule_date_highlights(line_number, folded_line)
     fold_state()._status_register_fold_range(fold_id, start_line, line_number, true, folded_line)
     return
@@ -1326,8 +1326,8 @@ function M.emit_comment(comment, index, indent)
     review_boundary = "header",
   }
   local header = M.comment_header_line(comment)
-  local header_line = status_add_line(header, header_entry, "DiffReviewReviewCommentHeader")
-  status_add_highlight(header_line, 0, #header, "DiffReviewReviewCommentHeader")
+  local header_line = status_add_line(header, header_entry, "DiffReviewReviewCommentBoxHeader")
+  status_add_highlight(header_line, 0, #header, "DiffReviewReviewCommentBoxHeader")
   M.add_comment_rule_date_highlights(header_line, header)
 
   for body_index, line in ipairs(body_lines) do
@@ -1339,8 +1339,8 @@ function M.emit_comment(comment, index, indent)
       review_body = true,
       review_body_index = body_index,
     }
-    local body_line = status_add_line(line, body_entry)
-    if line ~= "" then status_add_highlight(body_line, 0, #line, "DiffReviewReviewComment") end
+    local body_line = status_add_line(line, body_entry, "DiffReviewReviewCommentBox")
+    if line ~= "" then status_add_highlight(body_line, 0, #line, "DiffReviewReviewCommentBox") end
   end
 
   for reply_index, reply in ipairs(type(comment.replies) == "table" and comment.replies or {}) do
@@ -1355,8 +1355,8 @@ function M.emit_comment(comment, index, indent)
     review_boundary = "footer",
   }
   local footer = M.comment_footer_line()
-  local footer_line = status_add_line(footer, footer_entry, "DiffReviewReviewCommentHeader")
-  status_add_highlight(footer_line, 0, #footer, "DiffReviewReviewCommentHeader")
+  local footer_line = status_add_line(footer, footer_entry, "DiffReviewReviewCommentBoxHeader")
+  status_add_highlight(footer_line, 0, #footer, "DiffReviewReviewCommentBoxHeader")
   fold_state()._status_register_fold_range(fold_id, start_line, footer_line, comment.review_folded == true, function()
     return M.comment_folded_line(comment)
   end)
@@ -2071,12 +2071,12 @@ function M.replace_comment_rule_line(buf, row0, line)
   pcall(vim.api.nvim_buf_set_text, buf, row0, 0, row0, #old_line, { line })
   if line ~= "" then
     pcall(vim.api.nvim_buf_set_extmark, buf, ui.status_ns, row0, 0, {
-      line_hl_group = "DiffReviewReviewCommentHeader",
+      line_hl_group = "DiffReviewReviewCommentBoxHeader",
       priority = 80,
     })
     pcall(vim.api.nvim_buf_set_extmark, buf, ui.status_ns, row0, 0, {
       end_col = #line,
-      hl_group = "DiffReviewReviewCommentHeader",
+      hl_group = "DiffReviewReviewCommentBoxHeader",
       priority = 90,
     })
     M.set_comment_rule_date_extmarks(buf, row0, line)

@@ -383,6 +383,15 @@ function M.markdown_region_config(buf, win, ranges)
     debounce = 0,
     completions = { lsp = { enabled = false } },
     sign = { enabled = false },
+    -- Disable render-markdown's per-heading background so a `# heading` row keeps the
+    -- underlying line background (the dark gray comment box, or the normal description bg)
+    -- instead of a mismatched tint. backgrounds merges by index, so replace all six levels.
+    heading = {
+      backgrounds = {
+        "DiffReviewMarkdownHeadingBg", "DiffReviewMarkdownHeadingBg", "DiffReviewMarkdownHeadingBg",
+        "DiffReviewMarkdownHeadingBg", "DiffReviewMarkdownHeadingBg", "DiffReviewMarkdownHeadingBg",
+      },
+    },
     win_options = {
       conceallevel = { default = conceallevel, rendered = conceallevel },
       concealcursor = { default = concealcursor, rendered = concealcursor },
@@ -699,7 +708,13 @@ function M.on_render(buf)
   state.review_mark = vim.api.nvim_buf_set_extmark(buf, M.ns, review_row - 1, 0, { right_gravity = false })
   state.milestone_mark = vim.api.nvim_buf_set_extmark(buf, M.ns, milestone_row - 1, 0, { right_gravity = false })
   state.status_mark = vim.api.nvim_buf_set_extmark(buf, M.ns, status_row - 1, 0, { right_gravity = false })
-  state.desc_region = region.new(buf, M.ns, label_row, label_row + body_count, { end_exclusive = true, region_kind = "markdown", editable = true })
+  -- end_right_gravity: keep the exclusive one-past anchor (so read_text/current_values stay
+  -- correct) but let a line opened at the bottom (o / trailing <CR>) extend the region into
+  -- it, instead of falling on the exclusive boundary and going un-editable.
+  -- end_right_gravity: keep the exclusive one-past anchor (so read_text/current_values stay
+  -- correct) but let a line opened at the bottom (o / trailing <CR>) extend the region into
+  -- it, instead of falling on the exclusive boundary and going un-editable.
+  state.desc_region = region.new(buf, M.ns, label_row, label_row + body_count, { end_exclusive = true, end_right_gravity = true, region_kind = "markdown", editable = true })
   vim.bo[buf].modified = false
   M.refresh_markers(buf)
   M.sync_modifiable(buf)

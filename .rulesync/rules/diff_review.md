@@ -271,6 +271,12 @@ Run the PR-review test:
 nvim --headless -i NONE --cmd "set shadafile=NONE" -u nvim/init.lua -c "lua vim.loader.enable(false)" -S nvim/tests/diff_review/pr_review.lua
 ```
 
+Run the editable-region append guard (pins that opening a line at the bottom of the description, review summary, or comment body stays editable — the O/o cursor-follows-modifiable bug):
+
+```text
+nvim --headless -i NONE --cmd "set shadafile=NONE" -u nvim/init.lua -c "lua vim.loader.enable(false)" -S nvim/tests/diff_review/editable_region_append.lua
+```
+
 Run the branch-create test:
 
 ```text

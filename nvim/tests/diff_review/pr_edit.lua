@@ -945,6 +945,21 @@ local function run()
     line_has_substring_highlight(buf, first_regular_comment_row, "10 hours ago", "DiffReviewStatusDate"),
     "regular PR comment date did not use date highlight"
   )
+  -- The dark gray comment-box background is scoped to inline diff comments only; the PR
+  -- conversation/list rows must keep the plain comment highlight, not the box groups.
+  assert_true(
+    not line_has_highlight(buf, first_regular_comment_row, "DiffReviewReviewCommentBox")
+      and not line_has_highlight(buf, first_regular_comment_row, "DiffReviewReviewCommentBoxHeader"),
+    "PR conversation comment list row must not carry the inline comment box highlight"
+  )
+  -- The shared comment groups (list rows, review summary, standalone PR comments) must carry
+  -- no background; only the dedicated *Box groups do. Pins the box bg from leaking back here.
+  assert_true(vim.api.nvim_get_hl(0, { name = "DiffReviewReviewComment" }).bg == nil,
+    "DiffReviewReviewComment must not have a background (box bg belongs to DiffReviewReviewCommentBox)")
+  assert_true(vim.api.nvim_get_hl(0, { name = "DiffReviewReviewCommentHeader" }).bg == nil,
+    "DiffReviewReviewCommentHeader must not have a background (box bg belongs to DiffReviewReviewCommentBoxHeader)")
+  assert_true(vim.api.nvim_get_hl(0, { name = "DiffReviewReviewCommentBox" }).bg ~= nil,
+    "DiffReviewReviewCommentBox must carry the dark gray box background")
   assert_true(
     buffer_contains(buf, "Lorem Ipsum is the ubiquitous placeholder"),
     "long PR conversation comment preview did not render"

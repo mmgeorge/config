@@ -701,8 +701,8 @@ local function run()
   assert_true(#comment_updates == 0, "inline comment edit synced before manual sync")
   assert_true(buffer_contains(buf, "*me commented"), "inline comment edit did not mark the header dirty")
   assert_true(
-    row_has_line_highlight(buf, find_row(buf, "*me commented"), "DiffReviewReviewCommentHeader"),
-    "dirty inline comment header lost its review-header highlight"
+    row_has_line_highlight(buf, find_row(buf, "*me commented"), "DiffReviewReviewCommentBoxHeader"),
+    "dirty inline comment header lost its review-comment-box header highlight"
   )
   trigger(buf, "<C-s>")
   wait_for(function() return not buffer_contains(buf, "*me commented") end, "manual sync did not clear dirty marker after inline edit")

@@ -16,6 +16,7 @@ function M.setup()
   local modify_fg = "#ffb86c"
   local inline_add_bg = "#0b6b2a"
   local inline_del_bg = "#6a1010"
+  local review_comment_bg = "#2d2d2d"
   local normal = vim.api.nvim_get_hl(0, { name = "Normal", link = false })
   local header_fg = normal.fg or "#c0c0c0"
   local keyword_modifier = vim.api.nvim_get_hl(0, { name = "@keyword.modifier", link = false })
@@ -71,8 +72,21 @@ function M.setup()
   })
   vim.api.nvim_set_hl(0, "DiffReviewFileRevisionHeader", { fg = "#ff5555", bold = true })
   vim.api.nvim_set_hl(0, "DiffReviewPrDirty", { fg = "#ff5555", bold = true })
+  -- Shared comment text/header groups: PR-overview review/comment list rows, the review
+  -- summary field, and standalone PR comments. No background — only the inline comment BOXES
+  -- (the dark gray cards below diff rows) carry one, via the dedicated *Box groups below.
   vim.api.nvim_set_hl(0, "DiffReviewReviewComment", { fg = "#d4d4d4" })
   vim.api.nvim_set_hl(0, "DiffReviewReviewCommentHeader", { fg = "#61afef", bold = true })
+  -- Inline comment box (header/footer rule + body) anchored under a diff row: dark gray card
+  -- with white text/border so it reads as distinct from the code it comments on.
+  vim.api.nvim_set_hl(0, "DiffReviewReviewCommentBox", { fg = "#ffffff", bg = review_comment_bg })
+  vim.api.nvim_set_hl(0, "DiffReviewReviewCommentBoxHeader", { fg = "#ffffff", bg = review_comment_bg, bold = true })
+  -- Cleared (no background) group for rendered markdown headings inside diff_review regions.
+  -- render-markdown paints a heading-line background (hl_eol) that would otherwise override the
+  -- comment box's dark gray on a `# heading` row; pointing its backgrounds at this empty group
+  -- lets the row keep its underlying line background — the box dark gray, or the normal
+  -- description background — so the heading no longer shows a mismatched tint.
+  vim.api.nvim_set_hl(0, "DiffReviewMarkdownHeadingBg", {})
   vim.api.nvim_set_hl(0, "DiffReviewReviewPending", { fg = "#e5c07b", italic = true })
   vim.api.nvim_set_hl(0, "DiffReviewWalkthroughRegion", { bg = "#2d3a55" })
   vim.api.nvim_set_hl(0, "DiffReviewWalkthroughRegionAdd", { bg = add_bg })
