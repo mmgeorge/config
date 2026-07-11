@@ -20,7 +20,15 @@ config.webgpu_power_preference = "HighPerformance"
 
 if wezterm.target_triple:find("windows") then
   config.default_cwd = "D:/"
-  config.default_prog = { "D:/config/windows/nudevcmd.bat" }
+  config.default_prog = {
+    "powershell.exe",
+    "-NoLogo",
+    "-NoProfile",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-File",
+    "D:/config/windows/nu-dev-shell.ps1",
+  }
 end
 config.animation_fps = 30
 config.max_fps = 120

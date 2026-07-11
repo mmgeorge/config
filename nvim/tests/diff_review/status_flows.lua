@@ -879,12 +879,13 @@ local function run()
   wait_for(function() return pcall(find_hunk_row_after_file, buf, "fold-highlight.txt") end, "fold-highlight hunk row did not render")
   trigger_normal_mapping("<Tab>", find_row(buf, "fold-highlight.txt"))
   wait_for(function()
-    return not pcall(find_hunk_row_after_file, buf, "fold-highlight.txt")
-  end, "fold-highlight collapse kept hunk rows in a native fold\n" .. table.concat(status_lines(buf), "\n"))
+    local found, row = pcall(find_hunk_row_after_file, buf, "fold-highlight.txt")
+    return found and row_is_folded(buf, row)
+  end, "fold-highlight collapse did not retain hunk rows in a native fold\n" .. table.concat(status_lines(buf), "\n"))
   highlighted_file_row = find_row(buf, "fold-highlight.txt")
   assert_true(
-    not row_is_folded(buf, highlighted_file_row),
-    "fold-highlight file row closed into native foldtext\n" .. table.concat(status_lines(buf), "\n")
+    row_is_folded(buf, highlighted_file_row),
+    "fold-highlight file row did not close into native foldtext\n" .. table.concat(status_lines(buf), "\n")
   )
   assert_true(
     row_has_highlight(buf, highlighted_file_row, "DiffReviewStatusPath"),
@@ -926,7 +927,10 @@ local function run()
   wait_for(function() return pcall(find_hunk_row_after_file, buf, fold_target) end, "preserve-mark fold target did not expand")
   assert_sentinel_intact("expanding the later file")
   trigger_normal_mapping("<Tab>", find_row(buf, fold_target))
-  wait_for(function() return not pcall(find_hunk_row_after_file, buf, fold_target) end, "preserve-mark fold target did not collapse")
+  wait_for(function()
+    local found, row = pcall(find_hunk_row_after_file, buf, fold_target)
+    return found and row_is_folded(buf, row)
+  end, "preserve-mark fold target did not collapse natively")
   assert_sentinel_intact("collapsing the later file")
   vim.api.nvim_buf_clear_namespace(buf, sentinel_ns, 0, -1)
 
@@ -940,8 +944,8 @@ local function run()
     "Collapse Parent from hunk did not move to file row\n" .. table.concat(status_lines(buf), "\n")
   )
   assert_true(
-    not pcall(find_hunk_row_after_file, buf, "collapse-parent-a.txt"),
-    "Collapse Parent from hunk kept file body in native fold\n" .. table.concat(status_lines(buf), "\n")
+    row_is_folded(buf, find_hunk_row_after_file(buf, "collapse-parent-a.txt")),
+    "Collapse Parent from hunk did not keep the file body in a native fold\n" .. table.concat(status_lines(buf), "\n")
   )
   trigger_normal_mapping("N", find_row(buf, "collapse-parent-a.txt"))
   assert_true(
@@ -960,11 +964,12 @@ local function run()
   wait_for(function() return buffer_contains(buf, "@@ +1 -1") end, "refresh collapse hunk row did not render")
   trigger_normal_mapping("R", find_hunk_row_after_file(buf, "refresh-collapse-a.txt"))
   wait_for(function()
-    local has_hunk_row = pcall(find_hunk_row_after_file, buf, "refresh-collapse-a.txt")
+    local has_hunk_row, hunk_row = pcall(find_hunk_row_after_file, buf, "refresh-collapse-a.txt")
     return cursor_line_text(buf):find("Unstaged changes (2)", 1, true) ~= nil
       and buffer_contains(buf, "refresh-collapse-a.txt +1 -1")
-      and not has_hunk_row
-  end, "refresh did not restore the lazy file-level view\n" .. table.concat(status_lines(buf), "\n"))
+      and has_hunk_row
+      and row_is_folded(buf, hunk_row)
+  end, "refresh did not preserve the materialized file in its native fold\n" .. table.concat(status_lines(buf), "\n"))
   session.status.folds = {}
 
   reset_state({ modified = { ["cursor-stage-a.txt"] = true, ["cursor-stage-b.txt"] = true } })

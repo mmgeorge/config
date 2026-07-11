@@ -115,12 +115,13 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_ki
   local hunk_key = hunk_key_override or status_hunk_key(file.section_name, file.filename, hunk.diff)
   local hunk_folded = status_folded(hunk_key, false)
   local entry = { id = hunk_key, kind = entry_kind or "hunk", file = file, hunk = hunk, default_folded = false }
-  if hunk_folded then
+  if hunk_folded and not fold_state._status_entry_materialized(session.status, hunk_key) then
     local header = ("%s@@ +%d -%d"):format(string.rep(" ", status_hunk_indent), hunk.added or 0, hunk.removed or 0)
     local start_line = status_add_line(header, entry, "DiffReviewActiveHunkHeader")
     fold_state._status_register_fold_range(hunk_key, start_line, #session.status.lines, false, session.status.lines[start_line])
     return
   end
+  fold_state._status_set_entry_materialized(session.status, hunk_key)
   session.status.fancy_rows = session.status.fancy_rows or {}
   local rows_key
   local context_line = syntax_engine.status_hunk_context_line(hunk) or hunk.pos
@@ -608,16 +609,12 @@ local function status_render_file(file, entry_kind, hunk_entry_kind, file_key_ov
   local line_number = status_add_segment_line(file_segments, entry)
 
   local file_folded = (not opts.force_open) and status_folded(file_key, default_folded)
-  local render_folded_file_body = false
-  if file_folded and session.status and session.status.view_kind == "status" then
-    local walkthrough = package.loaded["diff_review.views.walkthrough"]
-    render_folded_file_body = walkthrough and walkthrough._modes and walkthrough._modes[session.status.buf] ~= nil
-  end
   diff_source_state._status_record_diff_file_header_state(file, entry_kind, hunk_entry_kind, file_key)
-  if file_folded and not render_folded_file_body then
+  if file_folded and not fold_state._status_entry_materialized(session.status, file_key) then
     fold_state._status_register_fold_range(file_key, line_number, #session.status.lines, default_folded, file_segments)
     return
   end
+  fold_state._status_set_entry_materialized(session.status, file_key)
 
   local hunks = trace.span("status_render.render_file.hunks", session.status and session.status.buf or nil, {
     file = file.filename,
@@ -1018,6 +1015,7 @@ local function status_render_loaded(buf, target_id, fallback_line, opts, head_li
   session.status.line_highlights = {}
   session.status.extmarks = {}
   session.status.comment_box_record_by_anchor = {}
+  session.status.comment_box_record_by_id = {}
   session.status.diff_row_spans = {}
   session.status.boundary_lines = {}
   session.status.fold_ranges_by_id = {}

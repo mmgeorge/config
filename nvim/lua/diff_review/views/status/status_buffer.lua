@@ -172,7 +172,7 @@ end
 --- Render one fancy-diff row into `state`: plain text plus its highlight, extmark, and
 --- per-line span decoration, routing diff-body decoration into the ephemeral span store
 --- and keeping the gutter as a persistent inline extmark.
---- Emit review draft comments below the row when `state.review_after_row` is set.
+--- Emit anchored comments below the row when `state.comment_after_row` is set.
 ---@param state DiffReviewStatusState
 ---@param row table
 ---@param entry table?
@@ -303,14 +303,14 @@ function M.add_fancy_row(state, row, entry, indent)
   end
   -- Review view: emit any draft comments anchored on this diff row as real
   -- (navigable, editable) lines right below it.
-  if state.review_after_row and diff_line and entry and not (row.diff_review_boundary or row.diff_review_context_padding) then
+  if state.comment_after_row and diff_line and entry and not (row.diff_review_boundary or row.diff_review_context_padding) then
     local emitted = {}
     local targets = diff_lines or { diff_line }
     for _, target_line in ipairs(targets) do
       local key = ("%s\0%s\0%s"):format(tostring(target_line.file), tostring(target_line.side), tostring(target_line.line))
       if not emitted[key] then
         emitted[key] = true
-        state.review_after_row(target_line, indent)
+        state.comment_after_row(target_line, indent, entry)
       end
     end
   end

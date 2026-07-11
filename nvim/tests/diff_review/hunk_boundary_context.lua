@@ -647,7 +647,14 @@ local function run()
   trigger_normal_mapping("<Tab>", find_row(buf, engine_header))
   local collapsed_lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
   assert_true(contains_line(collapsed_lines, engine_header), "collapsed hunk header missing")
-  assert_true(not contains_line(collapsed_lines, "let stderr_layer = tracing_subscriber"), "collapsed hunk showed body")
+  assert_true(
+    contains_line(collapsed_lines, "let stderr_layer = tracing_subscriber"),
+    "collapsed hunk discarded its materialized body"
+  )
+  assert_true(
+    vim.fn.foldclosed(find_row(buf, "let stderr_layer = tracing_subscriber")) ~= -1,
+    "collapsed hunk did not hide its materialized body behind a native fold"
+  )
 
   trigger_normal_mapping("<Tab>", find_row(buf, "tangent.rs"))
   wait_for(function()

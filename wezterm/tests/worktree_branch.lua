@@ -240,9 +240,13 @@ assert_equal(current_action.spec.name, 'repo:mmgeorge/progress',
   'progress workspace must use the future worktree branch name')
 assert_equal(current_action.spec.spawn.cwd, 'D:/repo',
   'progress runner must start from the existing repository path')
+assert_equal(current_action.spec.spawn.args[1], 'nu',
+  'progress workflow must use the cross-platform Nushell runner')
 assert_equal(current_spawn_contains(
-  'create-worktree.ps1 -RepositoryPath D:/repo -WorktreePath D:/mmgeorge/progress -StartPoint main -NewBranch mmgeorge/progress'), true,
+  'create-worktree.nu --repository-path D:/repo --worktree-path D:/mmgeorge/progress --start-point main --new-branch mmgeorge/progress'), true,
   'progress workspace must receive the complete worktree creation request')
+assert_equal(current_spawn_contains('--use-cached-remote-base'), true,
+  'new branch from a local base must compare against its cached remote branch')
 assert_equal(command_history_contains('worktree add -b mmgeorge/progress'), false,
   'Lua must not block on git worktree add before switching workspaces')
 
@@ -287,9 +291,11 @@ end
 assert_equal(current_action.kind, 'workspace',
   'newly discovered remote branch must open a progress workspace')
 assert_equal(current_spawn_contains(
-  '-StartPoint origin/coworker/demo -NewBranch coworker/demo'), true,
+  '--start-point origin/coworker/demo --new-branch coworker/demo'), true,
   'newly discovered remote branch must pass its tracking branch request to the progress runner\n'
     .. table.concat(recorded_commands, '\n') .. '\nspawn: ' .. table.concat(current_action.spec.spawn.args, ' '))
+assert_equal(current_spawn_contains('--use-cached-remote-base'), false,
+  'explicit remote branch must remain the selected worktree start point')
 
 open_branch_source('existing')
 choose_id('remote')
@@ -316,10 +322,12 @@ assert_equal(current_action.spec.title, 'Existing branch from local for repo',
 choose_id('local-only')
 assert_equal(current_action.kind, 'workspace',
   'existing local branch must open a progress workspace')
-assert_equal(current_spawn_contains('-StartPoint local-only -WorkspaceName repo:local-only'), true,
+assert_equal(current_spawn_contains('--start-point local-only --workspace-name repo:local-only'), true,
   'existing local branch must pass its local tip to the progress runner')
-assert_equal(current_spawn_contains('-NewBranch'), false,
+assert_equal(current_spawn_contains('--new-branch'), false,
   'existing local branch must not ask the progress runner to create a branch')
+assert_equal(current_spawn_contains('--use-cached-remote-base'), false,
+  'existing local branch must preserve its selected local tip')
 
 fake_repository = {
   common_dir = 'D:/code/test-wt/.bare',

@@ -1,11 +1,5 @@
---- Shared comment rendering for every diff-with-comments surface (PR review, PR status,
---- PR overview, walkthrough). Interactive comments render by default as compact real buffer
---- rows so normal cursor movement can enter them. The shared dispatcher
---- (section_builder.emit_anchored_comments) morphs the focused comment or PR reply draft
---- into full-width editable rows. Readonly surfaces (walkthrough) reuse the same box-line
---- builder through virtual lines.
-
-local status_buffer = require("diff_review.views.status.status_buffer")
+--- Builds view-independent compact comment-box rows for every diff-with-comments surface.
+--- Status-buffer ownership lives in views.status.comment_box_rows.
 
 --- Box content the renderer reads; the full descriptor adds identity/anchor for dispatch.
 ---@class DiffReviewCommentBoxContent
@@ -110,24 +104,6 @@ end
 
 M.wrap_text = wrap_text
 
---- Resolve the narrowest displayed text width so one box layout fits every window.
----@param buf integer?
----@return integer
-local function display_columns(buf)
-  local width
-  if buf and vim.api.nvim_buf_is_valid(buf) then
-    for _, win in ipairs(vim.api.nvim_list_wins()) do
-      if vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == buf then
-        local wininfo = vim.fn.getwininfo(win)[1]
-        local textoff = tonumber(wininfo and wininfo.textoff) or 0
-        local text_width = math.max(1, vim.api.nvim_win_get_width(win) - textoff)
-        width = width and math.min(width, text_width) or text_width
-      end
-    end
-  end
-  return width or tonumber(vim.o.columns) or 80
-end
-
 --- Build segmented display rows for a compact comment box.
 ---@param desc DiffReviewCommentBoxContent
 ---@param win_width integer
@@ -205,68 +181,6 @@ function M.build_box_group_lines(items, win_width)
     vim.list_extend(box_lines, M.build_box_lines(item.desc, win_width, item.style))
   end
   return box_lines
-end
-
---- Emit a compact comment box as real status-buffer rows after its diff anchor.
---- Real rows let normal cursor movement enter the box and trigger inline editing.
----@param state table
----@param desc DiffReviewCommentDescriptor
----@param anchor_line integer 1-based buffer line of the diff row
----@param style DiffReviewCommentBoxStyle?
-function M.render_box(state, desc, anchor_line, style)
-  if not (state and anchor_line and anchor_line > 0) then return end
-  state.comment_box_record_by_anchor = state.comment_box_record_by_anchor or {}
-  local record = state.comment_box_record_by_anchor[anchor_line]
-  if not record then
-    record = { anchor_line = anchor_line, items = {} }
-    state.comment_box_record_by_anchor[anchor_line] = record
-  end
-  local width = display_columns(state.buf)
-  local item = {
-    desc = desc,
-    style = style,
-    start_line = #(state.lines or {}) + 1,
-  }
-  record.items[#record.items + 1] = item
-  state.comment_box_render_width = width
-
-  local anchor_entry = state.entries and state.entries[anchor_line] or nil
-  local occurrence_id = tostring(anchor_entry and anchor_entry.id or anchor_line)
-  local box_rows = M.build_box_lines(desc, width, style)
-  for box_row_index, segments in ipairs(box_rows) do
-    local entry = {
-      id = ("comment-box:%s:%s:%d:%d"):format(
-        occurrence_id,
-        tostring(desc.id or #record.items),
-        #record.items,
-        box_row_index
-      ),
-      kind = "comment_box",
-      comment_box = desc,
-      comment_box_source = desc.source,
-      comment_box_index = desc.index,
-      comment_box_anchor_line = anchor_line,
-      comment_box_anchor_entry_id = anchor_entry and anchor_entry.id or nil,
-      comment_box_boundary = box_row_index == 1 and "header"
-        or (box_row_index == #box_rows and "footer" or "body"),
-    }
-    item.end_line = status_buffer.add_segment_line(state, segments, entry)
-  end
-  record.start_line = record.start_line or item.start_line
-  record.end_line = item.end_line
-end
-
---- Report whether real comment boxes need a layout render after a width change.
----@param state table
----@return boolean layout_changed
-function M.refresh_buffer(state)
-  local buf = state and state.buf or nil
-  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return false end
-  if not next(state.comment_box_record_by_anchor or {}) then return false end
-  local width = display_columns(buf)
-  if state.comment_box_render_width == width then return false end
-  state.comment_box_render_width = width
-  return true
 end
 
 return M

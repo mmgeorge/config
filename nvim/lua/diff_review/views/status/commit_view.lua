@@ -29,13 +29,6 @@ local session = require("diff_review.session")
 
 local M = {}
 
----@param entry DiffReviewStatusEntry?
----@param next_folded boolean
----@return boolean
-local function status_should_render_collapsed_fold(entry, next_folded)
-  return next_folded and entry_nav()._status_entry_is_file_like(entry)
-end
-
 function M._status_confirm_create_pr(on_yes)
   local body = {
     "No GitHub PR found for this branch.",
@@ -353,10 +346,7 @@ local function status_toggle(entry, state)
     if fold_entry.kind == "commit" and not next_folded and fold_entry.commit then
       status_helpers.status_load_commit_files(fold_entry.commit)
     end
-    local native_folded = false
-    if not status_should_render_collapsed_fold(fold_entry, next_folded) then
-      native_folded = fold_state()._status_set_native_fold_state(state.buf, fold_id, next_folded)
-    end
+    local native_folded = fold_state()._status_set_native_fold_state(state.buf, fold_id, next_folded)
     if not native_folded then
       render_orchestrator.render_status_or_notify(state.buf, fold_id, vim.api.nvim_win_get_cursor(0)[1], { reuse_sections = true })
     elseif state.view_kind == "status" then
@@ -370,8 +360,11 @@ local function status_toggle(entry, state)
     end
   end
   if not next_folded then
-    entry_nav()._status_prewarm_entry_syntax(fold_entry)
-    if status_render().status_prepare_file_expansion_context(fold_entry, state, apply_fold_toggle) then return end
+    if not fold_state()._status_has_native_fold_range(state, fold_id) then
+      fold_state()._status_set_entry_materialized(state, fold_id)
+      entry_nav()._status_prewarm_entry_syntax(fold_entry)
+      if status_render().status_prepare_file_expansion_context(fold_entry, state, apply_fold_toggle) then return end
+    end
   end
   apply_fold_toggle()
 end
@@ -382,10 +375,7 @@ function M._status_collapse_parent()
   local parent = entry_nav()._status_parent_entry(line, entry)
   local target = parent or entry
   fold_state()._set_status_folded(target.id, true)
-  local native_folded = false
-  if not status_should_render_collapsed_fold(target, true) then
-    native_folded = fold_state()._status_set_native_fold_state(session.status.buf, target.id, true)
-  end
+  local native_folded = fold_state()._status_set_native_fold_state(session.status.buf, target.id, true)
   if not native_folded then
     render_orchestrator.render_status_or_notify(session.status.buf, target.id, vim.api.nvim_win_get_cursor(0)[1], { reuse_sections = true })
   elseif session.status.view_kind == "status" then

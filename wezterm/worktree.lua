@@ -7,7 +7,7 @@ local M = {}
 local is_windows = wezterm.target_triple:find('windows') ~= nil
 
 M.settings = {
-  creation_runner_path = wezterm.config_dir .. '/../windows/create-worktree.ps1',
+  creation_runner_path = wezterm.config_dir .. '/../scripts/create-worktree.nu',
   debug = false,
   debug_log_path = wezterm.home_dir .. '/wezterm-worktree-debug.log',
   roots = {
@@ -1662,7 +1662,7 @@ local function created_branch(opts)
   return opts.branch or opts.new_branch or opts.start_point
 end
 
-local function finish_created_worktree(window, pane, repo, opts, workspace_open)
+local function finish_created_worktree(window, repo, opts)
   local updated_repo = build_repo(opts.path) or build_repo(repo.main_path)
   if not updated_repo then
     notify(window, 'Created the worktree, but could not refresh repository metadata')
@@ -1689,35 +1689,29 @@ local function finish_created_worktree(window, pane, repo, opts, workspace_open)
   local layout_options = {
     first_run = resolve_layout(worktree).first_run,
   }
-  if workspace_open then
-    queue_layout(worktree, layout_options)
-    return
-  end
-
-  switch_to_worktree(window, pane, worktree, layout_options)
+  queue_layout(worktree, layout_options)
 end
 
 local function worktree_creation_command(repo, opts, workspace_name)
   local command = {
-    'powershell.exe',
-    '-NoLogo',
-    '-NoProfile',
-    '-ExecutionPolicy',
-    'Bypass',
-    '-File',
+    'nu',
+    '--no-config-file',
     M.settings.creation_runner_path,
-    '-RepositoryPath',
+    '--repository-path',
     repo.main_path,
-    '-WorktreePath',
+    '--worktree-path',
     opts.path,
-    '-StartPoint',
+    '--start-point',
     opts.start_point,
   }
   if opts.new_branch then
-    table.insert(command, '-NewBranch')
+    table.insert(command, '--new-branch')
     table.insert(command, opts.new_branch)
   end
-  table.insert(command, '-WorkspaceName')
+  if opts.use_cached_remote_base then
+    table.insert(command, '--use-cached-remote-base')
+  end
+  table.insert(command, '--workspace-name')
   table.insert(command, workspace_name)
   return command
 end
@@ -1761,8 +1755,6 @@ local function start_visible_worktree_creation(window, pane, repo, opts)
 end
 
 local function create_worktree(window, pane, repo, opts)
-  local args = { 'worktree', 'add' }
-
   if find_worktree(repo, opts.path) then
     notify(window, 'A worktree already exists at ' .. opts.path)
     return
@@ -1776,26 +1768,9 @@ local function create_worktree(window, pane, repo, opts)
       )
       return
     end
-
-    table.insert(args, '-b')
-    table.insert(args, opts.new_branch)
   end
 
-  table.insert(args, opts.path)
-  table.insert(args, opts.start_point)
-
-  if is_windows then
-    start_visible_worktree_creation(window, pane, repo, opts)
-    return
-  end
-
-  local stdout, stderr = git_output(repo.main_path, args)
-  if not stdout then
-    notify(window, stderr)
-    return
-  end
-
-  finish_created_worktree(window, pane, repo, opts, false)
+  start_visible_worktree_creation(window, pane, repo, opts)
 end
 
 local function branch_records(repo, source, remote, exclude_checked_out)
@@ -2106,7 +2081,7 @@ local function choose_existing_branch(window, pane, repo)
   end)
 end
 
-local function prompt_new_branch(window, pane, repo, record)
+local function prompt_new_branch(window, pane, repo, record, use_cached_remote_base)
   prompt(
     window,
     pane,
@@ -2132,6 +2107,7 @@ local function prompt_new_branch(window, pane, repo, record)
           new_branch = new_branch,
           path = default_worktree_path(repo, sanitize_name(new_branch)),
           start_point = record.id,
+          use_cached_remote_base = use_cached_remote_base,
         })
       end)
     end
@@ -2153,7 +2129,7 @@ local function choose_new_branch(window, pane, repo)
       'Start point',
       false,
       function(branch_window, branch_pane, record)
-        prompt_new_branch(branch_window, branch_pane, repo, record)
+        prompt_new_branch(branch_window, branch_pane, repo, record, source == 'local')
       end
     )
   end)
@@ -2632,9 +2608,9 @@ function M.handle_user_var_changed(window, pane, name, value)
     return
   end
 
-  finish_created_worktree(window, pane, {
+  finish_created_worktree(window, {
     main_path = pending.repo_main_path,
-  }, pending, true)
+  }, pending)
 end
 
 function M.handle_update_status(window, pane)

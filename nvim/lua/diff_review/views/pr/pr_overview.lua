@@ -928,8 +928,8 @@ function M.render_review_context(review)
 
   local review_key = M.review_key(review)
   local comment_index = section_builder().comment_anchor_index(comments)
-  local previous_hook = status.review_after_row
-  status.review_after_row = function(diff_line, indent)
+  local previous_hook = status.comment_after_row
+  status.comment_after_row = function(diff_line, indent)
     section_builder().emit_anchored_comments(status, diff_line, indent, { index = comment_index })
   end
   local ok, err = pcall(function()
@@ -946,7 +946,7 @@ function M.render_review_context(review)
       )
     end
   end)
-  status.review_after_row = previous_hook
+  status.comment_after_row = previous_hook
   if not ok then error(err) end
 end
 

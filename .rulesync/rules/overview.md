@@ -10,6 +10,19 @@ This repository stores the user's **dotfiles** and personal developer environmen
 
 Treat this repo as operational infrastructure, not as a single application. A change here can alter the behavior of Neovim, Nushell, WezTerm, Git, Codex, Claude Code, Copilot CLI, and Antigravity CLI across unrelated projects.
 
+# Cross-Platform Scripting
+
+This repository supports **Windows and macOS**, and every supported platform can assume **Nushell is installed**. Treat every shared workflow as cross-platform unless its owning directory or integration explicitly targets Windows.
+
+- Use **Nushell** for new repository-level scripts, automation, launchers, and orchestration that should run on both Windows and macOS.
+- Use **PowerShell** only for irreducible Windows integrations such as Windows APIs or Visual Studio environment initialization.
+- Do not add batch, Bash, or Zsh scripts. Use Nushell for portable behavior and PowerShell for the narrow Windows-only boundary.
+- Keep shared orchestration in a `.nu` script when a workflow needs a Windows-specific action. Route only the irreducible Windows operation through a narrow PowerShell adapter.
+- Do not duplicate an entire workflow into Windows and macOS implementations. Extract the common state transitions, Git behavior, validation, and error handling into one Nushell source.
+- Validate every new or modified standalone Nushell script with `nu -c 'nu-check path/to/script.nu'`.
+
+Platform-specific placement does not make platform-specific implementation acceptable by itself. For example, a WezTerm worktree workflow that runs on both operating systems should use a shared Nushell runner even if Windows requires a small final handoff to PowerShell.
+
 # Rulesync Source Layout
 
 This repository uses **Rulesync** as the source of truth for assistant-facing rules, skills, agents, MCP config, hooks, commands, and ignore files. Generated provider files such as `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `.agents/`, `.claude/`, `.codex/`, `.copilot/`, and `.gemini/` should not receive hand edits because Rulesync will overwrite them.
@@ -57,4 +70,3 @@ rulesync generate --dry-run --config rulesync-global/rulesync.jsonc --input-root
 Choose the source directory by the intended audience. If the behavior should affect only this dotfiles repo, place it in local `.rulesync/`. If the behavior should become the default for every project and provider CLI, place it in `rulesync-global/.rulesync/`.
 
 When adding a new **skill**, **subagent**, **command**, **hook**, or **MCP server**, update the Rulesync source first and run the matching dry run. Only inspect generated files afterward to verify output shape.
-

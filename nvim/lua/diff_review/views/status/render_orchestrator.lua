@@ -265,7 +265,7 @@ local function render_pr_status(pr, cwd, buf, diff_text)
   })
   status.fancy_rows = {}
   status.pr_code_comments_by_anchor = section_builder.comment_anchor_index_from_sections(status.sections, { field = "pr_comments" })
-  status.review_after_row = function(diff_line, indent)
+  status.comment_after_row = function(diff_line, indent)
     section_builder.emit_anchored_comments(status, diff_line, indent, { index_field = "pr_code_comments_by_anchor" })
   end
   status_render().status_render_loaded(buf, nil, nil, { reuse_sections = true }, status.head_lines, status.sections)

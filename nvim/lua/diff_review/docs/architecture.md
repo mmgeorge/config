@@ -86,6 +86,7 @@ diff_review/
 │   └── status/               The :GitStatus view, decomposed into one responsibility per file
 │       ├── state.lua           State lifecycle + per-buffer autocmd state machine + perf wrappers
 │       ├── status_buffer.lua   Accumulates lines/highlights/extmarks/folds into a per-buffer state
+│       ├── comment_box_rows.lua Owns compact comments as real status-buffer rows and resize records
 │       ├── status_render.lua   Full render pass: head + sections → buffer → extmarks → decoration provider
 │       ├── render_orchestrator.lua  Async git-root + load pipeline, PR-detail/PR-diff render passes
 │       ├── status_head.lua     Head/about lines (HEAD/merge/push rows, PR summary, section headings)
@@ -114,7 +115,7 @@ diff_review/
 │   ├── syntax_engine.lua      Async tree-sitter syntax + hunk-context producer with three caches + prewarm
 │   ├── syntax_context.lua     Per-file tree-sitter parse state (snapshot/parser/tree/query) → highlight spans
 │   ├── diff_render.lua        Build fancy-diff rows (gutter/boundary/body) and apply them as buffer extmarks
-│   ├── comment_box.lua        Shared compact box rows; walkthroughs reuse them as virtual lines
+│   ├── comment_box.lua        Pure compact comment-box wrapping and segmented row layout
 │   ├── layout.lua             Fenwick (binary-indexed) tree mapping items → buffer rows in O(log n)
 │   ├── row_tree.lua           Logical node tree (hunks/padding/annotations) kept in row-sync via layout
 │   ├── region.lua             Extmark-anchored buffer region with dirty tracking
@@ -423,8 +424,9 @@ keep the cursor from stepping into that virtual gutter.
   for editable comment regions that must survive surrounding edits.
 - **`comment_box.lua`** — builds every compact inline PR, submitted-review,
   batched-review, and walkthrough comment through one segmented box primitive.
-  Interactive surfaces emit those segments as real status-buffer rows, which lets normal
-  cursor movement enter a box. Walkthroughs reuse the segments as readonly virtual lines.
+  `views/status/comment_box_rows.lua` emits those segments as real status-buffer rows, which
+  lets normal cursor movement enter every box. Walkthrough annotations use the same rows
+  with readonly descriptors instead of a separate virtual-line transport.
   `section_builder.emit_anchored_comments` dispatches the cursor-selected occurrence to
   full-width editable rows only while its stable diff-entry ID owns focus, so duplicate
   appearances under Reviews and Changes cannot both become editable. The primitive wraps
@@ -485,10 +487,11 @@ provider driven. `render_orchestrator.lua` wraps the async git-root + load pipel
 the PR-specific render passes.
 
 **4. Fold and gate.** `fold_state.lua` owns the per-key fold map, native fold ranges,
-foldtext, and resize refresh. `size_gate.lua` estimates how many rows a file's hunks and
-comments will occupy and **defers the body render of files over budget**, so opening a
-status with a 20,000-line diff stays responsive — the body renders lazily (via
-`hunk_index` chunking) when the file is expanded.
+foldtext, materialized-entry state, and resize refresh. Initially collapsed files omit
+their bodies. The first expansion materializes the file and hunk rows once, after which
+collapse and expansion use native folds without rebuilding the status buffer. `size_gate.lua`
+estimates how many rows a file's hunks and comments will occupy and **defers the body
+render of files over budget**, so opening a status with a 20,000-line diff stays responsive.
 
 **5. Bridge to the engine.** `diff_source_state.lua` is the seam between status entries
 and the render engine: it owns the per-file diff-source registry, commit source handles,
@@ -584,16 +587,17 @@ contributors, triggered on `@` in any PR/review text field.
 A guided, LLM-authored review. An LLM writes `.walkthrough.json` (schema in
 `walkthrough.schema.json`) describing a flow, a task tree, and ordered **steps** that each
 point at a file and line with a comment. `ow` in the status buffer adds a foldable summary
-section and renders the author's comment boxes as virtual-line boxes anchored below the
-referenced regions inside the inline diff.
+section and registers the author's comments as readonly anchored providers. The shared
+status renderer emits them as real comment-box rows below their diff lines.
 
 The hard part is **step resolution**: matching a step's `(file, line)` against the
-currently rendered entries, expanding folds as needed, and degrading gracefully. Each
+current diff model before rows render, expanding folds as needed, and degrading gracefully. Each
 step records the **HEAD sha the document was generated against**, so a stale walkthrough
 falls back to nearest-line or file-only anchoring with a visible note rather than pointing
 at the wrong code. The walkthrough talks to the rest of the plugin through a narrow
 `DiffReviewWalkthroughHost` interface (`views/commands._walkthrough_host`) — `cwd`,
-`resolve_root_async`, `get_state`, fold keys, `set_folded`, `rerender`,
+`resolve_root_async`, `get_state`, fold keys, native-fold application, anchored-comment
+registration, `set_folded`, `rerender`,
 `inventory_async` — so it never reaches into init internals directly. The host resolves
 and caches the canonical Git root from the status view's working directory before it
 loads the artifact or inventory. This keeps `HEAD:path` lookups repository-relative even

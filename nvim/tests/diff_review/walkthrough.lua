@@ -431,59 +431,51 @@ local function row_has_line_highlight(buf, row, hl_group)
   return false
 end
 
---- Concatenated text of the inline comment box (virt_lines extmarks).
-local function box_text(buf)
-  local marks = vim.api.nvim_buf_get_extmarks(buf, walkthrough._ns, 0, -1, { details = true })
-  local chunks = {}
-  for _, mark in ipairs(marks) do
-    for _, virt_line in ipairs(mark[4].virt_lines or {}) do
-      for _, chunk in ipairs(virt_line) do
-        chunks[#chunks + 1] = chunk[1]
-      end
+local function comment_box_items(buf)
+  local state = session.states[buf] or session.status
+  local items = {}
+  for _, record in pairs(state and state.comment_box_record_by_anchor or {}) do
+    for _, item in ipairs(record.items or {}) do
+      item.buf = buf
+      items[#items + 1] = item
     end
   end
-  return table.concat(chunks, "\n")
+  table.sort(items, function(left, right) return left.start_line < right.start_line end)
+  return items
+end
+
+local function comment_box_lines(item)
+  if not item then return {} end
+  return vim.api.nvim_buf_get_lines(item.buf, item.start_line - 1, item.end_line, false)
+end
+
+--- Concatenated text of the real-row comment boxes.
+local function box_text(buf)
+  local lines = {}
+  for _, item in ipairs(comment_box_items(buf)) do
+    if not row_is_folded(buf, item.start_line) then vim.list_extend(lines, comment_box_lines(item)) end
+  end
+  return table.concat(lines, "\n")
 end
 
 local function comment_box_mark(buf)
-  local marks = vim.api.nvim_buf_get_extmarks(buf, walkthrough._ns, 0, -1, { details = true })
-  for _, mark in ipairs(marks) do
-    if mark[4].virt_lines then return mark end
-  end
-  return nil
+  return comment_box_items(buf)[1]
 end
 
 local function comment_box_mark_containing(buf, needle)
-  local marks = vim.api.nvim_buf_get_extmarks(buf, walkthrough._ns, 0, -1, { details = true })
-  for _, mark in ipairs(marks) do
-    local chunks = {}
-    for _, virt_line in ipairs(mark[4].virt_lines or {}) do
-      for _, chunk in ipairs(virt_line) do
-        chunks[#chunks + 1] = chunk[1]
-      end
-    end
-    if table.concat(chunks, "\n"):find(needle, 1, true) then return mark end
+  for _, item in ipairs(comment_box_items(buf)) do
+    if table.concat(comment_box_lines(item), "\n"):find(needle, 1, true) then return item end
   end
   return nil
 end
 
 local function comment_box_inner_width(mark)
-  local virt_lines = mark and mark[4] and mark[4].virt_lines or {}
-  local bottom = virt_lines[#virt_lines]
-  local width = 0
-  for _, chunk in ipairs(bottom or {}) do
-    width = width + vim.fn.strdisplaywidth(chunk[1])
-  end
-  return math.max(width - 4, 0)
+  local lines = comment_box_lines(mark)
+  return math.max(vim.fn.strdisplaywidth(lines[#lines] or "") - 4, 0)
 end
 
 local function comment_box_header_text(mark)
-  local virt_lines = mark and mark[4] and mark[4].virt_lines or {}
-  local chunks = {}
-  for _, chunk in ipairs(virt_lines[1] or {}) do
-    chunks[#chunks + 1] = chunk[1]
-  end
-  return table.concat(chunks, "")
+  return comment_box_lines(mark)[1] or ""
 end
 
 local function box_contains(buf, needle)
@@ -491,11 +483,14 @@ local function box_contains(buf, needle)
 end
 
 local function box_has_highlight_for_text(buf, text, hl_group)
-  local marks = vim.api.nvim_buf_get_extmarks(buf, walkthrough._ns, 0, -1, { details = true })
-  for _, mark in ipairs(marks) do
-    for _, virt_line in ipairs(mark[4].virt_lines or {}) do
-      for _, chunk in ipairs(virt_line) do
-        if chunk[1]:find(text, 1, true) and chunk[2] == hl_group then return true end
+  local state = session.states[buf] or session.status
+  for _, item in ipairs(comment_box_items(buf)) do
+    for row = item.start_line, item.end_line do
+      local line = vim.api.nvim_buf_get_lines(buf, row - 1, row, false)[1] or ""
+      if line:find(text, 1, true) then
+        for _, highlight in ipairs(state.highlights or {}) do
+          if highlight.line == row and highlight.hl_group == hl_group then return true end
+        end
       end
     end
   end
@@ -648,11 +643,25 @@ local function toggle_row(buf, needle)
 end
 
 local function expand_row_if_needed(buf, row_needle, visible_needle)
-  if not row_is_folded(buf, find_row(buf, visible_needle)) then return end
+  local found, visible_row = pcall(find_row, buf, visible_needle)
+  if found and not row_is_folded(buf, visible_row) then return end
   toggle_row(buf, row_needle)
   wait_for(function()
-    return not row_is_folded(buf, find_row(buf, visible_needle))
+    local rendered, row = pcall(find_row, buf, visible_needle)
+    return rendered and not row_is_folded(buf, row)
   end, row_needle .. " did not expand")
+end
+
+local function expand_walkthrough_subtask(buf, task_needle, subtask_needle, visible_needle)
+  local subtask_row = find_row(buf, subtask_needle)
+  local parent_fold_start = vim.fn.foldclosed(subtask_row)
+  if parent_fold_start ~= -1 and parent_fold_start < subtask_row then
+    toggle_row(buf, task_needle)
+    wait_for(function()
+      return vim.fn.foldclosed(subtask_row) == subtask_row
+    end, task_needle .. " did not reveal its folded subtasks")
+  end
+  expand_row_if_needed(buf, subtask_needle, visible_needle)
 end
 
 local function run()
@@ -934,9 +943,15 @@ local function run()
   wait_for(function()
     return row_is_folded(summary_buf, find_row(summary_buf, "The first fixture row carries the opening example for"))
   end, "folded task should hide subtask justification")
+  local subtask_row = find_row(summary_buf, "Rewrite the first fixture file.")
   wait_for(function()
-    return row_is_folded(summary_buf, find_row(summary_buf, "Rewrite the first fixture file."))
-  end, "default walkthrough state should show the folded subtask title")
+    local fold_start = vim.fn.foldclosed(subtask_row)
+    return fold_start ~= -1 and fold_start < subtask_row
+  end, "default walkthrough state should hide subtask titles inside the task fold")
+  toggle_row(buf, "1. Update a.txt through the first task.")
+  wait_for(function()
+    return vim.fn.foldclosed(subtask_row) == subtask_row
+  end, "unfolding a walkthrough task should reveal folded subtask titles")
   toggle_row(buf, "└─ Rewrite the first fixture file.")
   wait_for(function()
     return not row_is_folded(summary_buf, find_row(summary_buf, "Modify Cache a.txt rewrite"))
@@ -983,7 +998,12 @@ local function run()
   local expanded_lines = vim.api.nvim_buf_get_lines(summary_buf, 0, -1, false)
   assert_true(expanded_lines[expanded_second_task_row - 1] == "",
     "expanded walkthrough task should leave a blank separator before the next task")
-  expand_row_if_needed(buf, "└─ Rewrite the second fixture file.", "   └─ Add fn b.txt rewrite to repeat")
+  expand_walkthrough_subtask(
+    buf,
+    "2. Update b.txt through the second task.",
+    "└─ Rewrite the second fixture file.",
+    "   └─ Add fn b.txt rewrite to repeat"
+  )
   assert_true(buffer_contains(summary_buf, "The first fixture row carries the opening example for"),
     "summary subtask justification missing")
   assert_true(buffer_contains(summary_buf, "rendering."),
@@ -1053,8 +1073,11 @@ local function run()
     "automatic walkthrough comments should not use generic blue region background")
   local box_mark = comment_box_mark_containing(buf, "concrete")
   assert_true(box_mark ~= nil, "inline comment box mark missing")
-  assert_true(box_mark[2] == step_row - 1, "inline comment box should anchor below the selected row")
-  assert_true(box_mark[4].virt_lines_above ~= true, "inline comment box should render below the selected row")
+  assert_true(box_mark.anchor_line == step_row, "inline comment box should anchor below the selected row")
+  assert_true(box_mark.start_line == step_row + 1, "inline comment box should use real rows below the selected row")
+  local box_entry = (session.states[buf] or session.status).entries[box_mark.start_line]
+  assert_true(box_entry.kind == "comment_box", "walkthrough annotation did not use shared comment-box rows")
+  assert_true(box_entry.comment_box.readonly == true, "walkthrough annotation descriptor must stay read-only")
   assert_true(not buffer_has_mapping(buf, "C"), "read-only walkthrough box exposed the comment edit action")
   assert_true(not buffer_has_mapping(buf, "J"), "read-only walkthrough box exposed the comment delete action")
   assert_true(not vim.bo[buf].modifiable, "walkthrough status buffer must remain read-only around comment boxes")
@@ -1091,9 +1114,7 @@ local function run()
     return resized_mark and comment_box_inner_width(resized_mark) <= 40
   end, "walkthrough comment box did not resize with the terminal")
   local resized_box_mark = comment_box_mark_containing(buf, "concrete")
-  for _, virtual_line in ipairs(resized_box_mark[4].virt_lines or {}) do
-    local text = ""
-    for _, chunk in ipairs(virtual_line) do text = text .. tostring(chunk[1] or "") end
+  for _, text in ipairs(comment_box_lines(resized_box_mark)) do
     assert_true(vim.fn.strdisplaywidth(text) <= 48, "resized walkthrough comment box overflowed the terminal")
   end
   vim.o.columns = original_columns
@@ -1171,7 +1192,12 @@ local function run()
   }
   set_walkthrough_doc(graph_doc)
   summary_buf = start_walkthrough(buf)
-  expand_row_if_needed(buf, "└─ Rewrite the first fixture file.", "Modify Cache a.txt rewrite")
+  expand_walkthrough_subtask(
+    buf,
+    "1. Update a.txt through the first task.",
+    "└─ Rewrite the first fixture file.",
+    "Modify Cache a.txt rewrite"
+  )
   assert_row_before(buf, "Modify Cache a.txt rewrite", "Modify Cache a.txt total marker",
     "walkthrough change rows should remain visually connected before the next action")
   assert_true(not buffer_contains(summary_buf, "◦ Second action comment."),
@@ -1193,7 +1219,12 @@ local function run()
     "The second row keeps the location label aligned while sharing the same anchor line.")
   set_walkthrough_doc(added_span_doc)
   summary_buf = start_walkthrough(buf)
-  expand_row_if_needed(buf, "└─ Rewrite the first fixture file.", "Modify Cache a.txt rewrite")
+  expand_walkthrough_subtask(
+    buf,
+    "1. Update a.txt through the first task.",
+    "└─ Rewrite the first fixture file.",
+    "Modify Cache a.txt rewrite"
+  )
   wait_for(function() return buffer_contains(summary_buf, "Modify Cache a.txt render snapshot") end,
     "expanding walkthrough subtask should show sibling change rows")
   assert_true(not buffer_contains(summary_buf, "◦ Store solver buffers on a resource."),
@@ -1346,7 +1377,7 @@ local function run()
   local long_start_row = find_row(buf, "NEW long 02 a.txt")
   local long_box_mark = comment_box_mark_containing(buf, "selected line remains visible")
   assert_true(long_box_mark ~= nil, "long-anchor comment box mark missing")
-  local long_anchor_row = long_box_mark[2] + 1
+  local long_anchor_row = long_box_mark.anchor_line
   assert_true(long_anchor_row >= long_start_row,
     ("long-region box should anchor at or after the rendered start row (start %d, anchor %d)"):format(
       long_start_row, long_anchor_row))
@@ -1467,7 +1498,12 @@ local function run()
   set_walkthrough_doc(optional_change_annotation)
   captured_notifications = {}
   summary_buf = start_walkthrough(buf)
-  expand_row_if_needed(buf, "└─ Rewrite the first fixture file.", "Modify Cache a.txt summary-only rewrite")
+  expand_walkthrough_subtask(
+    buf,
+    "1. Update a.txt through the first task.",
+    "└─ Rewrite the first fixture file.",
+    "Modify Cache a.txt summary-only rewrite"
+  )
   wait_for(function() return buffer_contains(summary_buf, "Modify Cache a.txt summary-only rewrite") end,
     "summary-only change without annotation should render")
   assert_true(not saw_notification_containing("invalid \"annotation\""),

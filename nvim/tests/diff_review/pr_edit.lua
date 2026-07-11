@@ -1568,20 +1568,13 @@ local function run()
 
   move_cursor(buf, expanded_file_row)
   trigger_buf_mapping(buf, "<Tab>")
-  -- A file-like review entry collapses by re-render, dropping its diff context and comments
-  -- rather than closing into native foldtext that would strip its colored header highlight.
   wait_for(function()
-    local changes_row = find_row_after(buf, "Changes", rejected_review_row)
-    local review_section = table.concat(
-      vim.api.nvim_buf_get_lines(buf, rejected_review_row - 1, changes_row - 1, false),
-      "\n"
-    )
-    return not review_section:find("NEW LINE", 1, true)
-      and not review_section:find("Oh good point! fixed", 1, true)
-  end, "collapsed review file did not drop its diff context")
+    return row_is_folded(buf, find_row_after(buf, "NEW LINE", expanded_file_row))
+      and row_is_folded(buf, find_row_after(buf, "Oh good point! fixed", expanded_file_row))
+  end, "collapsed review file did not hide its materialized diff context")
   assert_true(
-    not row_is_folded(buf, find_row_after(buf, "src/a.txt +1 -1", rejected_review_row)),
-    "collapsed review file closed into native foldtext instead of re-rendering"
+    row_is_folded(buf, find_row_after(buf, "src/a.txt +1 -1", rejected_review_row)),
+    "collapsed review file did not close its native fold range"
   )
 
   rejected_review_row = find_row(buf, "foo     10 hours ago")

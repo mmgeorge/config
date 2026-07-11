@@ -23,6 +23,7 @@ local function review() return require("diff_review.views.pr.review") end
 local file_revision = require("diff_review.views.file_revision")
 local branch_diff = require("diff_review.views.branch_diff")
 local status_keys = require("diff_review.views.status.status_keys")
+local section_builder = require("diff_review.views.status.section_builder")
 local window_options = require("diff_review.views.status.window_options")
 -- status_head edge kept lazy to avoid a load-time cycle.
 local function status_head() return require("diff_review.views.status.status_head") end
@@ -117,6 +118,25 @@ function M._walkthrough_host(buf)
       local state = session.states and session.states[buf] or session.status
       if state then session.status = state end
       fold_state()._set_status_folded(key, folded, state)
+    end,
+    has_native_fold = function(key)
+      return fold_state()._status_has_native_fold_range(status_state(), key)
+    end,
+    apply_native_folds = function()
+      fold_state()._status_apply_native_folds(buf)
+    end,
+    comment_anchor_key = section_builder.comment_anchor_key,
+    set_comment_index = function(index)
+      local state = status_state()
+      if not state then return end
+      state.walkthrough_comment_index = index
+      if index then
+        state.comment_after_row = function(diff_line, _, entry)
+          section_builder.emit_anchored_descriptors(state, diff_line, entry, index)
+        end
+      else
+        state.comment_after_row = nil
+      end
     end,
     rerender = function(target_id, fallback_line)
       render_orchestrator().render_status_or_notify(buf, target_id, fallback_line, { reuse_sections = true })

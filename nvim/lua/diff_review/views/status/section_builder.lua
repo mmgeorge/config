@@ -146,7 +146,28 @@ function M.comment_anchor_key(file, side, line)
   local line_number = tonumber(line)
   if not (file and file ~= "" and line_number) then return nil end
   local normalized_file = vim.fs.normalize(tostring(file))
-  return ("%s\0%s\0%d"):format(normalized_file, tostring(side or "RIGHT"), math.floor(line_number))
+  local normalized_side = tostring(side or "RIGHT"):upper()
+  return ("%s\0%s\0%d"):format(normalized_file, normalized_side, math.floor(line_number))
+end
+
+--- Emit prebuilt comment descriptors anchored on one diff line.
+---@param state table
+---@param diff_line table
+---@param entry table?
+---@param index table<string, { descriptor: DiffReviewCommentDescriptor, section_name?: string }[]>
+---@param style? DiffReviewCommentBoxStyle
+function M.emit_anchored_descriptors(state, diff_line, entry, index, style)
+  local key = M.comment_anchor_key(diff_line.file, diff_line.side, diff_line.line)
+  local descriptors = key and index and index[key] or nil
+  if not descriptors then return end
+  local comment_box_rows = require("diff_review.views.status.comment_box_rows")
+  local anchor_line = #(state.lines or {})
+  local section_name = entry and entry.file and entry.file.section_name or nil
+  for _, item in ipairs(descriptors) do
+    if not item.section_name or item.section_name == section_name then
+      comment_box_rows.render_box(state, item.descriptor, anchor_line, style)
+    end
+  end
 end
 
 ---@param comments table[]
@@ -197,7 +218,7 @@ function M.emit_anchored_comments(state, diff_line, indent, opts)
   local comment_index = opts.index or (opts.index_field and state[opts.index_field])
   local comments = key and comment_index and comment_index[key] or nil
   if not comments then return end
-  local comment_box = require("diff_review.render.comment_box")
+  local comment_box_rows = require("diff_review.views.status.comment_box_rows")
   -- The diff row was just appended, so its 1-based buffer line is the current line count.
   local anchor_line = #(state.lines or {})
   local anchor_entry = state.entries and state.entries[anchor_line] or nil
@@ -246,7 +267,7 @@ function M.emit_anchored_comments(state, diff_line, indent, opts)
           reply_draft = reply_target_matches and reply_draft or nil,
         })
         descriptor.readonly = not reply_target_matches and (opts.readonly == true or not editable)
-        comment_box.render_box(state, descriptor, anchor_line, review.review_box_style)
+        comment_box_rows.render_box(state, descriptor, anchor_line, review.review_box_style)
       end
     end
   end

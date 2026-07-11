@@ -1018,7 +1018,7 @@ function M.render(buf)
   state.review_rendered_comment_count = 0
   state.review_comment_anchor_index = section_builder().comment_anchor_index(state.review_comments)
   -- status_add_fancy_row consults this hook to interleave comment lines.
-  state.review_after_row = function(diff_line, indent)
+  state.comment_after_row = function(diff_line, indent)
     M.emit_comments_for(state, diff_line, indent)
   end
   state.review_rendering = true
@@ -1394,7 +1394,7 @@ end
 ---buffer lines with no prefixes, virtual borders, or render wrapping.
 ---@param comment table
 ---@param index integer comment number (1-based)
----@param indent integer unused; retained for the review_after_row hook shape
+---@param indent integer unused; retained for the comment_after_row hook shape
 ---@param opts? { parent_readonly?: boolean, reply_draft?: DiffReviewPrReplyDraft }
 function M.emit_comment(comment, index, indent, opts)
   opts = opts or {}

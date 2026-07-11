@@ -6,11 +6,13 @@
 --- perf span via session.lua and direct requires.
 
 local status_buffer = require("diff_review.views.status.status_buffer")
-local comment_box = require("diff_review.render.comment_box")
+local comment_box_rows = require("diff_review.views.status.comment_box_rows")
 
 local pr_edit = require("diff_review.views.pr.pr_edit")
 -- review edge kept lazy to avoid a load-time cycle.
 local function review() return require("diff_review.views.pr.review") end
+-- render_orchestrator edge kept lazy to avoid a load-time cycle.
+local function render_orchestrator() return require("diff_review.views.status.render_orchestrator") end
 local status_issues = require("diff_review.views.status.status_issues")
 local window_options = require("diff_review.views.status.window_options")
 -- keymaps edge kept lazy to avoid a load-time cycle.
@@ -131,12 +133,6 @@ end
 ---@return boolean
 function M._status_set_native_fold_state(buf, fold_id, _folded)
   local state = session.states and session.states[buf] or session.status
-  if type(fold_id) == "string"
-    and (fold_id:find("^hunk:")
-      or fold_id:find("^commit%-hunk:")
-      or fold_id:find("^provider%-hunk:")) then
-    return false
-  end
   local ranges = M._status_fold_ranges_for_id(state, fold_id)
   if #ranges == 0 then return false end
   local has_native_range = false
@@ -149,6 +145,31 @@ function M._status_set_native_fold_state(buf, fold_id, _folded)
   if not has_native_range then return false end
   M._status_apply_native_folds(buf)
   return true
+end
+
+---@param state table?
+---@param fold_id string
+---@return boolean
+function M._status_entry_materialized(state, fold_id)
+  return state ~= nil and state.materialized_entry_by_id ~= nil and state.materialized_entry_by_id[fold_id] == true
+end
+
+---@param state table?
+---@param fold_id string
+function M._status_set_entry_materialized(state, fold_id)
+  if not state then return end
+  state.materialized_entry_by_id = state.materialized_entry_by_id or {}
+  state.materialized_entry_by_id[fold_id] = true
+end
+
+---@param state table?
+---@param fold_id string
+---@return boolean
+function M._status_has_native_fold_range(state, fold_id)
+  for _, range in ipairs(M._status_fold_ranges_for_id(state, fold_id)) do
+    if M._status_fold_range_span(range) > 0 then return true end
+  end
+  return false
 end
 
 ---@param buf integer?
@@ -192,14 +213,19 @@ function M._status_apply_native_folds(buf)
         vim.api.nvim_win_call(win, function()
           local view = vim.fn.winsaveview()
           pcall(vim.cmd, "normal! zE")
-          for range_index = #ranges, 1, -1 do
+          local folded_ranges = {}
+          for range_index = 1, #ranges do
             local range = ranges[range_index]
             if range.start_line >= 1
               and range.end_line <= max_line
               and range.end_line > range.start_line
               and status_folded(range.id, range.default_folded, state) then
               pcall(vim.cmd, ("%d,%dfold"):format(range.start_line, range.end_line))
+              folded_ranges[#folded_ranges + 1] = range
             end
+          end
+          for _, range in ipairs(folded_ranges) do
+            pcall(vim.cmd, ("%dfoldclose"):format(range.start_line))
           end
           vim.fn.winrestview(M._status_view_for_fold_restore(view, ranges, state))
         end)
@@ -258,9 +284,13 @@ function M._refresh_status_windows_after_resize()
         keymaps().status_apply_hint_bar(buf, win)
         if not refreshed_buffers[buf] then
           refreshed_buffers[buf] = true
-          local comment_layout_changed = comment_box.refresh_buffer(state)
-          if comment_layout_changed and (state.view_kind == "pr" or state.view_kind == "review") then
-            review().render_preserving_inline_cursor(buf)
+          local comment_layout_changed = comment_box_rows.refresh_buffer(state)
+          if comment_layout_changed then
+            if state.view_kind == "pr" or state.view_kind == "review" then
+              review().render_preserving_inline_cursor(buf)
+            else
+              render_orchestrator().render_status_or_notify(buf, nil, nil, { reuse_sections = true })
+            end
           else
             M._status_apply_native_folds(buf)
           end

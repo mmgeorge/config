@@ -79,6 +79,10 @@
 ---@field file_key fun(section_name: string, filename: string): string
 ---@field hunk_key fun(section_name: string, filename: string, diff?: string): string
 ---@field set_folded fun(key: string, folded: boolean)
+---@field has_native_fold fun(key: string): boolean
+---@field apply_native_folds fun()
+---@field comment_anchor_key fun(file: string?, side: string?, line: integer|string?): string?
+---@field set_comment_index fun(index?: table<string, { descriptor: DiffReviewCommentDescriptor, section_name?: string }[]>)
 ---@field rerender fun(target_id?: string, fallback_line?: integer) synchronous reuse_sections re-render
 ---@field git_list_async fun(command: string[], cb: fun(output: string[], code: integer))
 ---@field inventory_async? fun(cb: fun(result: DiffReviewInventoryResult))
@@ -96,6 +100,7 @@
 ---@field inventory? DiffReviewInventoryResult
 ---@field inventory_signature? string
 ---@field inventory_pending_signature? string
+---@field anchor_match_by_id? table<string, DiffReviewWalkthroughMatch>
 
 ---@class DiffReviewWalkthroughCommentBoxPlacement
 ---@field anchor_row integer
@@ -1008,93 +1013,6 @@ function M.file_sort_rank(buf, file)
   return best_rank
 end
 
----@param entry table?
----@param step_file string
----@return boolean
-local function entry_matches_file(entry, step_file)
-  local file = entry and entry.file
-  if not file then return false end
-  return matches_file(file.relpath, step_file) or matches_file(file.filename, step_file)
-end
-
---- Resolve a step against the rendered status state. Exposed for tests.
----@param state table status state with lines/entries
----@param step DiffReviewWalkthroughStep
----@return DiffReviewWalkthroughTarget
-function M.resolve_step(state, step)
-  local lines = state and state.lines or {}
-  local entries = state and state.entries or {}
-
-  ---@type table<string, { rows: { row: integer, new_line: integer }[], file_row: integer? }>
-  local by_section = {}
-  for row = 1, #lines do
-    local entry = entries[row]
-    if entry_matches_file(entry, step.file) then
-      local section_name = entry.file.section_name or "unstaged"
-      local section = by_section[section_name]
-      if not section then
-        section = { rows = {} }
-        by_section[section_name] = section
-      end
-      if entry.kind == "file" and not section.file_row then
-        section.file_row = row
-      end
-      local diff_lines = type(entry.diff_lines) == "table" and entry.diff_lines or { entry.diff_line }
-      for _, diff_line in ipairs(diff_lines) do
-        if diff_line and diff_line.side == "right" and type(diff_line.line) == "number" then
-          section.rows[#section.rows + 1] = { row = row, new_line = diff_line.line }
-        end
-      end
-    end
-  end
-
-  -- A section containing rendered rows INSIDE the step's region wins,
-  -- preferring sections in order. This finds regions that only live in
-  -- staged hunks (partially staged files), and regions split across hunk
-  -- boundaries anchor at the first hunk row that falls inside the region
-  -- even when start.line itself is not rendered.
-  for _, section_name in ipairs(section_preference) do
-    local section = by_section[section_name]
-    if section then
-      local start_row, end_row = nil, nil
-      for _, candidate in ipairs(section.rows) do
-        if candidate.new_line >= step.start_pos.line and candidate.new_line <= step.end_pos.line then
-          start_row = math.min(start_row or candidate.row, candidate.row)
-          end_row = math.max(end_row or candidate.row, candidate.row)
-        end
-      end
-      if start_row then
-        return { match = "exact", start_row = start_row, end_row = end_row }
-      end
-    end
-  end
-
-  -- No rendered row inside the region anywhere: globally nearest row across
-  -- all sections (ties keep the preferred section's row).
-  local best = nil
-  for _, section_name in ipairs(section_preference) do
-    local section = by_section[section_name]
-    for _, candidate in ipairs(section and section.rows or {}) do
-      local distance = math.abs(candidate.new_line - step.start_pos.line)
-      if not best or distance < best.distance then
-        best = { row = candidate.row, distance = distance }
-      end
-    end
-  end
-  if best then
-    return { match = "nearest", start_row = best.row, end_row = best.row }
-  end
-
-  for _, section_name in ipairs(section_preference) do
-    local section = by_section[section_name]
-    if section and section.file_row then
-      return { match = "file_only", start_row = section.file_row, end_row = section.file_row }
-    end
-  end
-
-  return { match = "missing" }
-end
-
 --- Unfold the step's file (and its hunks) when no diff rows are rendered yet,
 --- then re-render synchronously so resolution can retry once.
 ---@param mode DiffReviewWalkthroughMode
@@ -1104,11 +1022,13 @@ local function ensure_expanded(mode, step)
   local state = mode.host.get_state()
   local sections = state and state.sections or {}
   local expanded = false
+  local can_apply_native = true
   for _, section in ipairs(sections) do
     for _, file in ipairs(section.files or {}) do
       if matches_file(file.relpath, step.file) or matches_file(file.filename, step.file) then
         local section_key = "section:" .. (file.section_name or section.name)
         local file_key = mode.host.file_key(file.section_name, file.filename)
+        can_apply_native = can_apply_native and mode.host.has_native_fold(file_key)
         mode.host.set_folded(section_key, false)
         mode.host.set_folded(file_key, false)
         for _, hunk in ipairs(file.hunks or {}) do
@@ -1120,7 +1040,11 @@ local function ensure_expanded(mode, step)
     end
   end
   if expanded then
-    mode.host.rerender()
+    if can_apply_native then
+      mode.host.apply_native_folds()
+    else
+      mode.host.rerender()
+    end
   end
   return expanded
 end
@@ -1242,6 +1166,106 @@ local function format_step_heading_label(step)
   return ("%d.%d-%d"):format(step.task_index, step.step_index, task_step_total)
 end
 
+---@param step DiffReviewWalkthroughStep
+---@return string
+local function step_comment_id(step)
+  return ("walkthrough:%d:%d"):format(step.task_index, step.step_index)
+end
+
+---@param file DiffReviewStatusFile
+---@return integer[]
+local function walkthrough_file_candidate_lines(file)
+  local candidate_set = {}
+  local diff_parse = require("diff_review.render.diff_parse")
+  for _, raw_hunk in ipairs(file.hunks or {}) do
+    for _, block in ipairs(diff_parse.parse_unified_diff(raw_hunk.diff or "")) do
+      for _, parsed_hunk in ipairs(block.hunks or {}) do
+        diff_parse.parse_hunk_body(parsed_hunk)
+        candidate_set[parsed_hunk.new_start] = true
+        for _, parsed_line in ipairs(parsed_hunk.lines or {}) do
+          if parsed_line.new_line then candidate_set[parsed_line.new_line] = true end
+        end
+      end
+    end
+  end
+  local candidates = {}
+  for line in pairs(candidate_set) do candidates[#candidates + 1] = line end
+  table.sort(candidates)
+  return candidates
+end
+
+---@param candidates integer[]
+---@param requested integer
+---@return integer? line
+---@return DiffReviewWalkthroughMatch match
+local function resolve_candidate_line(candidates, requested)
+  local nearest = nil
+  local nearest_distance = nil
+  for _, candidate in ipairs(candidates) do
+    if candidate == requested then return candidate, "exact" end
+    local distance = math.abs(candidate - requested)
+    if not nearest_distance or distance < nearest_distance then
+      nearest = candidate
+      nearest_distance = distance
+    end
+  end
+  return nearest, nearest and "nearest" or "file_only"
+end
+
+---@param mode DiffReviewWalkthroughMode
+---@param state table?
+---@return table<string, { descriptor: DiffReviewCommentDescriptor, section_name?: string }[]>
+local function build_comment_index(mode, state)
+  local index = {}
+  mode.anchor_match_by_id = {}
+  local sections = state and state.sections or {}
+  for _, step in ipairs(mode.doc.steps or {}) do
+    local matched_file = nil
+    local matched_section = nil
+    for _, preferred_section in ipairs(section_preference) do
+      for _, section in ipairs(sections) do
+        for _, file in ipairs(section.files or {}) do
+          if file.section_name == preferred_section
+            and (matches_file(file.relpath, step.file) or matches_file(file.filename, step.file)) then
+            matched_file = file
+            matched_section = preferred_section
+            break
+          end
+        end
+        if matched_file then break end
+      end
+      if matched_file then break end
+    end
+    if matched_file then
+      local resolved_line, match = resolve_candidate_line(
+        walkthrough_file_candidate_lines(matched_file),
+        step.start_pos.line
+      )
+      mode.anchor_match_by_id[step_comment_id(step)] = match
+      local key = resolved_line and mode.host.comment_anchor_key(matched_file.filename, "RIGHT", resolved_line) or nil
+      if key then
+        local heading_title = step.title or step.item_title
+        local heading_label = format_step_heading_label(step)
+        local heading = (" %s%s "):format(heading_label, heading_title and (" " .. heading_title) or "")
+        local descriptor = {
+          id = step_comment_id(step),
+          anchor = { file = matched_file.filename, side = "RIGHT", line = resolved_line },
+          heading = heading,
+          body_lines = vim.split(step.comment or "", "\n", { plain = true }),
+          stale_note = staleness_note({ match = match }, mode.stale),
+          readonly = true,
+          source = step,
+        }
+        index[key] = index[key] or {}
+        index[key][#index[key] + 1] = { descriptor = descriptor, section_name = matched_section }
+      end
+    else
+      mode.anchor_match_by_id[step_comment_id(step)] = "missing"
+    end
+  end
+  return index
+end
+
 ---@param win_height integer
 ---@param line_count integer
 ---@return integer screen_row
@@ -1255,54 +1279,6 @@ end
 ---@param win_height integer
 ---@param comment_line_count integer
 ---@return integer anchor_row
-local function comment_box_anchor_row(target, win_height, comment_line_count)
-  local start_row = target.start_row or 1
-  local end_row = target.end_row or start_row
-  if end_row < start_row then end_row = start_row end
-
-  local target_screen_row = comment_box_start_screen_row(win_height, comment_line_count)
-  local max_anchor_offset = math.max(target_screen_row - 2, 0)
-  local latest_anchor_with_start_visible = start_row + max_anchor_offset
-  return math.max(start_row, math.min(end_row, latest_anchor_with_start_visible))
-end
-
---- Render the per-step comment as an inline virt_lines box below the region:
---- it scrolls with the buffer and pushes following lines down instead of
---- overlapping them. Everything lives in the walkthrough namespace, so a
---- namespace clear removes the box together with the region highlight.
----@param mode DiffReviewWalkthroughMode
----@param step DiffReviewWalkthroughStep
----@param target DiffReviewWalkthroughTarget
----@param win integer
----@param opts? { anchor?: "viewport"|"end" }
----@return DiffReviewWalkthroughCommentBoxPlacement placement
-local function render_comment_box(mode, step, target, win, opts)
-  opts = opts or {}
-  local buf = mode.host.buf
-  -- Header: "3.1-4 title" left-aligned; the body carries the mini-justification.
-  local heading_title = step.title or step.item_title
-  local heading_label = format_step_heading_label(step)
-  local heading = (" %s%s "):format(heading_label, heading_title and (" " .. heading_title) or "")
-  -- Share the box renderer with PR review/status so every "diff + comment" surface draws an
-  -- identical box. The walkthrough keeps its own staleness-aware anchoring (resolve_step), which
-  -- review/status do not need, so it does not use the per-diff-row review_after_row seam.
-  local virt_lines = require("diff_review.render.comment_box").build_box_lines({
-    heading = heading,
-    body_lines = vim.split(step.comment or "", "\n", { plain = true }),
-    stale_note = staleness_note(target, mode.stale),
-  }, effective_window_columns(win))
-
-  local anchor_row = target.end_row or target.start_row or 1
-  if opts.anchor ~= "end" then
-    anchor_row = comment_box_anchor_row(target, vim.api.nvim_win_get_height(win), #virt_lines)
-  end
-  pcall(vim.api.nvim_buf_set_extmark, buf, M._ns, anchor_row - 1, 0, {
-    virt_lines = virt_lines,
-    virt_lines_above = false,
-  })
-  return { anchor_row = anchor_row, line_count = #virt_lines }
-end
-
 -- ─── mode lifecycle ──────────────────────────────────────────────────────────
 
 ---@param win integer
@@ -2418,6 +2394,8 @@ function M.status_head_lines(buf, head_lines)
   local mode = M._modes[buf]
   if not mode then return head_lines end
 
+  mode.host.set_comment_index(build_comment_index(mode, mode.host.get_state()))
+
   local lines = {}
   vim.list_extend(lines, head_lines or {})
   lines[#lines + 1] = { segments = { { "" } } }
@@ -2491,10 +2469,33 @@ end
 
 ---@param mode DiffReviewWalkthroughMode
 ---@param step DiffReviewWalkthroughStep
+---@param state table?
+---@return DiffReviewWalkthroughTarget
+local function rendered_step_target(mode, step, state)
+  local comment_id = step_comment_id(step)
+  local match = mode.anchor_match_by_id and mode.anchor_match_by_id[comment_id] or "missing"
+  local record = state and state.comment_box_record_by_id and state.comment_box_record_by_id[comment_id] or nil
+  if record then
+    return { match = match, start_row = record.anchor_line, end_row = record.anchor_line }
+  end
+  if match == "file_only" then
+    for row, entry in pairs(state and state.entries or {}) do
+      local file = entry and entry.file
+      if entry and entry.kind == "file" and file
+        and (matches_file(file.relpath, step.file) or matches_file(file.filename, step.file)) then
+        return { match = "file_only", start_row = row, end_row = row }
+      end
+    end
+  end
+  return { match = match }
+end
+
+---@param mode DiffReviewWalkthroughMode
+---@param step DiffReviewWalkthroughStep
 ---@return DiffReviewWalkthroughTarget target
 local function resolve_visible_step_target(mode, step)
   local state = mode.host.get_state()
-  local target = M.resolve_step(state, step)
+  local target = rendered_step_target(mode, step, state)
   local function target_row_is_folded(candidate)
     local win = vim.fn.bufwinid(mode.host.buf)
     if win == -1 or not candidate.start_row then return false end
@@ -2516,14 +2517,14 @@ local function resolve_visible_step_target(mode, step)
   -- Only unfold + re-render when no diff rows are rendered at all; a
   -- "nearest" match means the hunks are visible and just don't contain the
   -- exact line (TS-context scoping, deletions, staleness).
-  if (target.match == "file_only" or target.match == "missing" or target_row_is_folded(target)) and ensure_expanded(mode, step) then
+  if (not target.start_row or target_row_is_folded(target)) and ensure_expanded(mode, step) then
     jump_debug_event("resolve_after_expand", {
       buf = mode.host.buf,
       previous_target = target,
       view = jump_debug_snapshot(vim.fn.bufwinid(mode.host.buf), mode.host.buf),
     })
     state = mode.host.get_state()
-    target = M.resolve_step(state, step)
+    target = rendered_step_target(mode, step, state)
   end
   jump_debug_event("resolve_final", {
     buf = mode.host.buf,
@@ -2599,26 +2600,6 @@ end
 ---@param target DiffReviewWalkthroughTarget
 ---@param win integer
 ---@return boolean
-local function target_has_visible_diff_rows(target, win)
-  if not (target.match == "exact" or target.match == "nearest") then return false end
-  if not (win and vim.api.nvim_win_is_valid(win) and target.start_row) then return false end
-  return vim.api.nvim_win_call(win, function()
-    return vim.fn.foldclosed(target.start_row) == -1
-  end)
-end
-
----@param mode DiffReviewWalkthroughMode
----@param state table?
----@param win integer
-local function render_visible_comment_boxes(mode, state, win)
-  for _, step in ipairs(mode.doc.steps or {}) do
-    local target = M.resolve_step(state, step)
-    if target_has_visible_diff_rows(target, win) then
-      render_comment_box(mode, step, target, win, { anchor = "end" })
-    end
-  end
-end
-
 ---@param mode DiffReviewWalkthroughMode
 ---@param row integer
 ---@return string
@@ -2687,8 +2668,16 @@ local function show_step(mode, index)
     target = { match = "missing", start_row = cursor_row, end_row = cursor_row }
   end
   apply_region_highlight(mode, target)
-  local placement = render_comment_box(mode, step, target, win)
-  focus_comment_box_below(win, target, placement)
+  local state = mode.host.get_state()
+  local record = state and state.comment_box_record_by_id and state.comment_box_record_by_id[step_comment_id(step)] or nil
+  if record then
+    focus_comment_box_below(win, target, {
+      anchor_row = record.anchor_line,
+      line_count = math.max(1, (record.end_line or record.start_line) - record.start_line + 1),
+    })
+  elseif target.start_row then
+    pcall(vim.api.nvim_win_call, win, function() vim.cmd("normal! zz") end)
+  end
 end
 
 ---@param mode DiffReviewWalkthroughMode
@@ -2719,7 +2708,7 @@ local function begin(mode)
   vim.api.nvim_create_autocmd("BufWipeout", {
     buffer = buf,
     once = true,
-    callback = function() M.stop(buf) end,
+    callback = function() M.stop(buf, { rerender = false }) end,
   })
 
   show_step(mode, 1)
@@ -2734,6 +2723,7 @@ function M.stop(buf, opts)
   local mode = M._modes[buf]
   if not mode then return end
   M._modes[buf] = nil
+  if mode.host then mode.host.set_comment_index(nil) end
 
   if vim.api.nvim_buf_is_valid(buf) then
     -- The namespace clear removes the region highlight and the inline
@@ -2750,7 +2740,7 @@ function M.stop(buf, opts)
       end
     end
   end
-  if opts.rerender and mode.host and vim.api.nvim_buf_is_valid(buf) then
+  if opts.rerender ~= false and mode.host and vim.api.nvim_buf_is_valid(buf) then
     mode.host.rerender()
   end
 end
@@ -2890,7 +2880,7 @@ function M.start(host)
       }
       for task_index, task in ipairs(doc.tasks or {}) do
         local task_id = ("walkthrough:task:%d"):format(task_index)
-        host.set_folded(task_id, false)
+        host.set_folded(task_id, true)
         for subtask_index, _ in ipairs(task.subtasks or {}) do
           host.set_folded(("%s:subtask:%d"):format(task_id, subtask_index), true)
         end
@@ -2917,18 +2907,14 @@ function M.on_status_rendered(buf)
     vim.api.nvim_buf_clear_namespace(buf, M._ns, 0, -1)
     local state = active.host.get_state()
     apply_status_summary_highlights(active, state)
-    if active.index == 0 then
-      render_visible_comment_boxes(active, state, win)
-      return
-    end
+    if active.index == 0 then return end
     local step = active.doc.steps[active.index]
-    local target = M.resolve_step(state, step)
+    local target = rendered_step_target(active, step, state)
     if target.match == "missing" then
       local cursor_row = vim.api.nvim_win_get_cursor(win)[1]
       target = { match = "missing", start_row = cursor_row, end_row = cursor_row }
     end
     apply_region_highlight(active, target)
-    render_comment_box(active, step, target, win)
   end)
 end
 

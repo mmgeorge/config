@@ -5,9 +5,9 @@ return {
     dependencies = { "folke/snacks.nvim" },
     cmd = { "GitStatus", "GitBranchDiff", "GitBranchDiffFile", "GitFileRevision", "GitDiffCompactPreview" },
     opts = {
-      perf_logging = false,
+      perf_logging = true,
       status_cursor_prewarm = true,
-      walkthrough_inventory = false,
+      walkthrough_inventory = "sem",
       -- status_cursor_prewarm_max_hunks = 2
     },
     config = function(_, opts)
