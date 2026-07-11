@@ -207,9 +207,29 @@ local function plain_winbar()
   return (vim.wo.winbar or ""):gsub("%%#[^#]+#", ""):gsub("%%%*", ""):gsub("%%=", " "):gsub("%%%%", "%%")
 end
 
+--- Concatenated text of every virt_lines comment box in the status namespace. Unfocused
+--- comments render as boxes (virtual lines), so box content is not in the buffer's real lines.
+local function box_text_lines(buf)
+  local out = {}
+  local ok, marks = pcall(vim.api.nvim_buf_get_extmarks, buf, ui.status_ns, 0, -1, { details = true })
+  if not ok then return out end
+  for _, mark in ipairs(marks) do
+    local vlines = mark[4] and mark[4].virt_lines
+    for _, vline in ipairs(vlines or {}) do
+      local text = ""
+      for _, chunk in ipairs(vline) do text = text .. (chunk[1] or "") end
+      out[#out + 1] = { text = text, anchor_row = mark[2] + 1 }
+    end
+  end
+  return out
+end
+
 local function buffer_contains(buf, needle)
   for _, line in ipairs(lines(buf)) do
     if line:find(needle, 1, true) then return true end
+  end
+  for _, box in ipairs(box_text_lines(buf)) do
+    if box.text:find(needle, 1, true) then return true end
   end
   return false
 end
@@ -231,6 +251,11 @@ end
 local function find_row(buf, needle)
   for index, line in ipairs(lines(buf)) do
     if line:find(needle, 1, true) then return index end
+  end
+  -- Boxed (unfocused) comment text lives in virt_lines, not a buffer row. Return the box's
+  -- anchor diff row — where the user puts the cursor and presses C to morph it to editable rows.
+  for _, box in ipairs(box_text_lines(buf)) do
+    if box.text:find(needle, 1, true) then return box.anchor_row end
   end
   error("missing row: " .. needle .. "\n" .. table.concat(lines(buf), "\n"), 2)
 end
@@ -1290,11 +1315,6 @@ local function run()
   trigger(buf, "b", find_row(buf, "Title: Add the thing"))
   assert_true(opened_urls[#opened_urls] == pr.url .. "/changes", "b did not browse to the PR changes URL")
   local a_hash = vim.fn.sha256("src/a.txt")
-  trigger(buf, "b", find_row(buf, "NEW src/a.txt"))
-  assert_true(
-    opened_urls[#opened_urls] == pr.url .. "/changes#diff-" .. a_hash .. "R2",
-    "b did not browse to the added-line anchor: " .. tostring(opened_urls[#opened_urls])
-  )
   trigger_visual(buf, "b", find_row(buf, "NEW src/a.txt"), find_row(buf, "omega src/a.txt"))
   assert_true(
     opened_urls[#opened_urls] == pr.url .. "/changes#diff-" .. a_hash .. "R2-R3",
@@ -1305,33 +1325,17 @@ local function run()
     opened_urls[#opened_urls] == pr.url .. "/changes#diff-" .. a_hash .. "L2",
     "b did not browse to the deleted-line anchor: " .. tostring(opened_urls[#opened_urls])
   )
-  local browse_comment_body_row = find_row(buf, "Edited comment body")
-  local browse_comment_header_row = browse_comment_body_row - 1
-  local browse_comment_footer_row = browse_comment_body_row + 1
-  trigger(buf, "b", browse_comment_header_row)
-  assert_true(
-    opened_urls[#opened_urls] == pr.url .. "/changes#r101",
-    "b on comment header did not browse to the review comment anchor: " .. tostring(opened_urls[#opened_urls])
-  )
-  trigger(buf, "b", browse_comment_body_row)
-  assert_true(
-    opened_urls[#opened_urls] == pr.url .. "/changes#r101",
-    "b on comment body did not browse to the review comment anchor: " .. tostring(opened_urls[#opened_urls])
-  )
-  trigger(buf, "b", browse_comment_footer_row)
-  assert_true(
-    opened_urls[#opened_urls] == pr.url .. "/changes#r101",
-    "b on comment footer did not browse to the review comment anchor: " .. tostring(opened_urls[#opened_urls])
-  )
-  trigger(buf, "b", browse_comment_header_row - 1)
-  assert_true(
-    opened_urls[#opened_urls] == pr.url .. "/changes#diff-" .. a_hash .. "R2",
-    "b on code above a comment should browse to code, not comment: " .. tostring(opened_urls[#opened_urls])
-  )
-  trigger(buf, "b", browse_comment_footer_row + 1)
+  -- A diff row without a comment browses its code line.
+  trigger(buf, "b", find_row(buf, "omega src/a.txt"))
   assert_true(
     opened_urls[#opened_urls] == pr.url .. "/changes#diff-" .. a_hash .. "R3",
-    "b on code below a comment should browse to code, not comment: " .. tostring(opened_urls[#opened_urls])
+    "b on a non-commented code line should browse code: " .. tostring(opened_urls[#opened_urls])
+  )
+  -- The R2 line carries the "Edited comment body" comment box; b there browses the comment.
+  trigger(buf, "b", find_row(buf, "Edited comment body"))
+  assert_true(
+    opened_urls[#opened_urls] == pr.url .. "/changes#r101",
+    "b on a boxed comment did not browse to the review comment anchor: " .. tostring(opened_urls[#opened_urls])
   )
 
   -- ── submit flushes pending comments, then submits the pending review ───────

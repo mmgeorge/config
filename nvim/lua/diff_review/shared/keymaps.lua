@@ -207,6 +207,11 @@ local function refresh_pr(buf)
   end
 end
 
+local function reply_or_refresh_pr(buf)
+  if pr_overview().reply_to_comment(buf) then return end
+  refresh_pr(buf)
+end
+
 local function refresh_diff(buf)
   local status = session.states and session.states[buf] or session.status
   if status and status.diff_branch and status.cwd then
@@ -290,7 +295,8 @@ end
 
 local function pr_open(buf)
   local is_pr_view = session.status and session.status.view_kind == "pr"
-  if is_pr_view and pr_edit.toggle_draft_status_under_cursor(buf) then return end
+  if is_pr_view and pr_edit.choose_pr_state_under_cursor(buf) then return end
+  if is_pr_view and pr_overview().open_issue_comment_under_cursor(buf) then return end
   local entry = status_entry_under_cursor()
   if commit_view()._status_open_commit_message_under_cursor(entry) then return end
   status_jump(entry)
@@ -327,8 +333,13 @@ local function pr_add_comment(buf)
   pr_overview().add_standalone_comment(buf)
 end
 
+local function pr_delete_comment(buf)
+  pr_overview().delete_standalone_comment(buf)
+end
+
 local function pr_sync_comments(buf)
   review().sync_inline_comment_text(buf)
+  pr_overview().sync_reply_draft(buf)
   pr_overview().sync_standalone_comments(buf)
   pr_edit.sync(buf)
 end
@@ -444,12 +455,13 @@ local VIEW_KEYMAPS = {
     { id = "help", mode = "n", handler = show_help },
   },
   pr = {
-    { id = "refresh", mode = "n", handler = refresh_pr },
+    { id = "reply", mode = "n", handler = reply_or_refresh_pr },
     { id = "browse", mode = "n", handler = browse_pr },
     { id = "comment", mode = { "n", "x" }, handler = pr_add_comment },
+    { id = "delete", mode = "n", handler = pr_delete_comment },
     { id = "sync", mode = { "n", "i" }, handler = pr_sync_comments },
     { id = "review", mode = "n", handler = start_review },
-    { id = "open", mode = "n", handler = pr_open, desc = "Jump to file" },
+    { id = "open", mode = "n", handler = pr_open, desc = "Open comment or jump to file" },
     { id = "help", mode = "n", handler = show_help },
   },
   diff = {
@@ -509,7 +521,7 @@ local function setup_status_keymaps(buf)
         if session.states and session.states[buf] then session.status = session.states[buf] end
         callback(...)
       end
-      if view_kind == "review" then
+      if view_kind == "review" or view_kind == "pr" then
         review().register_command_map(buf, command_id, mode, key, mapped, map_opts)
       else
         vim.keymap.set(mode, key, mapped, map_opts)

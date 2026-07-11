@@ -115,7 +115,6 @@ local M = {
 }
 
 local nav_keys = { "z", "y", "q", "<Esc>" }
-local comment_box_max_inner_width = 84
 local status_section_id = "walkthrough:section"
 local jump_return_group = vim.api.nvim_create_augroup("DiffReviewWalkthroughJumpReturn", { clear = false })
 
@@ -1234,12 +1233,6 @@ local function staleness_note(target, stale)
   return nil
 end
 
----@param content { text: string, hl: string, chunks?: { text: string, hl: string }[] }[]
----@param text string
----@param hl string
-local function append_comment_row(content, text, hl)
-  content[#content + 1] = { text = text, hl = hl }
-end
 
 ---@param step DiffReviewWalkthroughStep
 ---@return string
@@ -1285,52 +1278,18 @@ end
 local function render_comment_box(mode, step, target, win, opts)
   opts = opts or {}
   local buf = mode.host.buf
-  local win_width = effective_window_columns(win)
-  local inner_width = math.max(30, math.min(comment_box_max_inner_width, win_width - 8))
-
-  ---@type { text: string, hl: string, chunks?: { text: string, hl: string }[] }[] content rows (without borders)
-  local content = {}
-  for _, line in ipairs(wrap_text(step.comment, inner_width - 2)) do
-    append_comment_row(content, line, "DiffReviewWalkthroughComment")
-  end
-  local note = staleness_note(target, mode.stale)
-  if note then
-    append_comment_row(content, "", "DiffReviewWalkthroughComment")
-    append_comment_row(content, note, "DiffReviewWalkthroughStale")
-  end
   -- Header: "3.1-4 title" left-aligned; the body carries the mini-justification.
   local heading_title = step.title or step.item_title
   local heading_label = format_step_heading_label(step)
   local heading = (" %s%s "):format(heading_label, heading_title and (" " .. heading_title) or "")
-  for _, row in ipairs(content) do
-    inner_width = math.max(inner_width, vim.fn.strdisplaywidth(row.text) + 2)
-  end
-  local heading_width = vim.fn.strdisplaywidth(heading)
-  inner_width = math.max(inner_width, heading_width + 3)
-
-  local pad = "  "
-  local virt_lines = {}
-  virt_lines[#virt_lines + 1] = {
-    { pad .. "╭─", "FloatBorder" },
-    { heading, "DiffReviewWalkthroughItemTitle" },
-    { ("─"):rep(math.max(inner_width - heading_width - 2, 0)), "FloatBorder" },
-    { "─╮", "FloatBorder" },
-  }
-  for _, row in ipairs(content) do
-    local fill = (" "):rep(math.max(inner_width - vim.fn.strdisplaywidth(row.text) - 2, 0))
-    local virt_line = { { pad .. "│ ", "FloatBorder" } }
-    if row.chunks then
-      for _, chunk in ipairs(row.chunks) do
-        virt_line[#virt_line + 1] = { chunk.text, chunk.hl }
-      end
-      virt_line[#virt_line + 1] = { fill, row.hl }
-    else
-      virt_line[#virt_line + 1] = { row.text .. fill, row.hl }
-    end
-    virt_line[#virt_line + 1] = { " │", "FloatBorder" }
-    virt_lines[#virt_lines + 1] = virt_line
-  end
-  virt_lines[#virt_lines + 1] = { { pad .. "╰" .. ("─"):rep(inner_width) .. "╯", "FloatBorder" } }
+  -- Share the box renderer with PR review/status so every "diff + comment" surface draws an
+  -- identical box. The walkthrough keeps its own staleness-aware anchoring (resolve_step), which
+  -- review/status do not need, so it does not use the per-diff-row review_after_row seam.
+  local virt_lines = require("diff_review.render.comment_box").build_box_lines({
+    heading = heading,
+    body_lines = vim.split(step.comment or "", "\n", { plain = true }),
+    stale_note = staleness_note(target, mode.stale),
+  }, effective_window_columns(win))
 
   local anchor_row = target.end_row or target.start_row or 1
   if opts.anchor ~= "end" then

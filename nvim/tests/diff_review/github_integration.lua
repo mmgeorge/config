@@ -152,75 +152,136 @@ end
 ---@type DiffReviewGhBackend
 local gh_backend = {}
 
-local function pr_json()
-  return vim.json.encode({
-    number = 42,
-    id = "PR_kwTEST42",
-    title = pr_title,
+local full_pr_fields = "id,number,title,body,url,headRefName,headRefOid,commits,files,changedFiles,additions,deletions,reviewRequests,milestone,isDraft,state,createdAt,updatedAt,closedAt"
+local branch_pr_fields = "id,number,title,body,url,headRefName,headRefOid,state,isDraft,createdAt,updatedAt,closedAt"
+
+local function pr_table(number, title, state, is_draft)
+  number = number or 42
+  state = state or "OPEN"
+  if is_draft == nil then is_draft = state == "OPEN" end
+  return {
+    number = number,
+    id = "PR_kwTEST" .. tostring(number),
+    title = title or pr_title,
     body = "This PR adds GitHub integration.\n\n- status row\n- PR view",
-    url = "https://github.example.test/org/repo/pull/42",
+    url = ("https://github.example.test/org/repo/pull/%s"):format(tostring(number)),
     headRefName = "feature/pr-view",
     headRefOid = "abc123456789",
-    commits = {
-      {
-        oid = "abc123456789",
-        messageHeadline = "mock subject",
+    state = state,
+    isDraft = is_draft,
+    createdAt = ("2026-06-%02dT10:00:00Z"):format(math.max(1, math.min(number, 28))),
+    updatedAt = ("2026-06-%02dT12:00:00Z"):format(math.max(1, math.min(number, 28))),
+    closedAt = state == "CLOSED" and "2026-06-28T12:00:00Z" or vim.NIL,
+  }
+end
+
+local function pr_json(number, title, state, is_draft)
+  local pr = pr_table(number, title, state, is_draft)
+  pr.commits = {
+    {
+      oid = "abc123456789",
+      messageHeadline = "mock subject",
+    },
+  }
+  pr.files = {
+    {
+      path = "lua/diff_review/init.lua",
+      additions = 8,
+      deletions = 2,
+      changeType = "MODIFIED",
+    },
+    {
+      path = "lua/diff_review/gh.lua",
+      additions = 100,
+      deletions = 0,
+      changeType = "ADDED",
+    },
+  }
+  pr.changedFiles = 2
+  pr.additions = 108
+  pr.deletions = 2
+  pr.reviewRequests = {
+    {
+      asCodeOwner = true,
+      requestedReviewer = {
+        login = "platform-team",
+        __typename = "Team",
       },
     },
-    files = {
-      {
-        path = "lua/diff_review/init.lua",
-        additions = 8,
-        deletions = 2,
-        changeType = "MODIFIED",
-      },
-      {
-        path = "lua/diff_review/gh.lua",
-        additions = 100,
-        deletions = 0,
-        changeType = "ADDED",
-      },
-    },
-    changedFiles = 2,
-    additions = 108,
-    deletions = 2,
-    reviewRequests = {
-      {
-        asCodeOwner = true,
-        requestedReviewer = {
-          login = "platform-team",
-          __typename = "Team",
-        },
-      },
-    },
-    milestone = vim.NIL,
-    isDraft = true,
+  }
+  pr.milestone = vim.NIL
+  return vim.json.encode({
+    id = pr.id,
+    number = pr.number,
+    title = pr.title,
+    body = pr.body,
+    url = pr.url,
+    headRefName = pr.headRefName,
+    headRefOid = pr.headRefOid,
+    state = pr.state,
+    isDraft = pr.isDraft,
+    createdAt = pr.createdAt,
+    updatedAt = pr.updatedAt,
+    closedAt = pr.closedAt,
+    commits = pr.commits,
+    files = pr.files,
+    changedFiles = pr.changedFiles,
+    additions = pr.additions,
+    deletions = pr.deletions,
+    reviewRequests = pr.reviewRequests,
+    milestone = pr.milestone,
   })
 end
 
-local function respond_current_pr_lookup(cb)
-  if pr_mode == "none" then
-    cb({ code = 1, stdout = "", stderr = "no pull requests found", output = "no pull requests found" })
-  elseif pr_mode == "unavailable" then
+local function respond_branch_pr_lookup(cb)
+  if pr_mode == "unavailable" then
     cb({ code = 1, stdout = "", stderr = gh_host_mismatch, output = gh_host_mismatch })
-  else
-    cb({ code = 0, stdout = pr_json(), stderr = "", output = pr_json() })
+    return
   end
+  if pr_mode == "error" then
+    cb({ code = 1, stdout = "", stderr = "mock branch PR list failure", output = "mock branch PR list failure" })
+    return
+  end
+  local prs = {}
+  if pr_mode == "ready" then
+    prs = { pr_table(42, pr_title, "OPEN", true) }
+  elseif pr_mode == "multiple" then
+    prs = {
+      pr_table(41, "Newest closed PR", "CLOSED", false),
+      pr_table(44, pr_title, "OPEN", false),
+      pr_table(43, "Older active PR", "OPEN", true),
+    }
+  elseif pr_mode == "closed" then
+    prs = {
+      pr_table(45, pr_title, "CLOSED", false),
+      pr_table(40, "Older closed PR", "CLOSED", false),
+    }
+  end
+  local stdout = vim.json.encode(prs)
+  cb({ code = 0, stdout = stdout, stderr = "", output = stdout })
 end
 
 function gh_backend.system_async(command, input, cb, cwd)
   record("gh_system_async", command, cwd)
   vim.defer_fn(function()
     local key = command_key(command)
-    if key == "gh\tpr\tview\t--json\tid,number,title,body,url,headRefName,headRefOid,commits,files,changedFiles,additions,deletions,reviewRequests,milestone,isDraft" then
+    if key == "gh\tpr\tlist\t--head\tfeature/pr-view\t--state\tall\t--limit\t100\t--json\t" .. branch_pr_fields then
       if hold_pr_lookup then
         release_pr_lookup = function()
           release_pr_lookup = nil
-          respond_current_pr_lookup(cb)
+          respond_branch_pr_lookup(cb)
         end
         return
       end
-      respond_current_pr_lookup(cb)
+      respond_branch_pr_lookup(cb)
+      return
+    end
+    if command[1] == "gh" and command[2] == "pr" and command[3] == "view" and command[5] == "--json" and command[6] == full_pr_fields then
+      local number = tonumber(command[4]) or 42
+      local state = pr_mode == "closed" and "CLOSED" or "OPEN"
+      local is_draft = pr_mode == "ready"
+      local stdout = pr_json(number, pr_title, state, is_draft)
+      cb({ code = 0, stdout = stdout, stderr = "", output = stdout })
       return
     end
     if key == "gh\tpr\tdiff\t42\t--patch\t--color\tnever" then
@@ -666,6 +727,15 @@ local function run()
 
   vim.api.nvim_win_set_buf(0, status_buf)
   reset_notifications()
+  pr_mode = "multiple"
+  pr_title = "Newest active same-branch PR"
+  render_orchestrator.render_status(status_buf, nil, nil, { refresh_pr = true })
+  wait_for(function() return buffer_contains(status_buf, "Newest active same-branch PR") end, "latest active same-branch PR did not win selection")
+  assert_true(
+    session.status.pr.state == "ready" and session.status.pr.pr.number == 44,
+    "same-branch PR selection did not prefer the newest active PR: " .. vim.inspect(session.status.pr)
+  )
+
   pr_mode = "ready"
   pr_title = "PR after queued ogp"
   hold_pr_lookup = true
@@ -719,6 +789,43 @@ local function run()
   trigger_normal_mapping("ogp", find_row(status_buf, "Head:"))
   trigger_normal_mapping("y", 1)
   assert_true(create_pr_count == 1, "accepting create prompt should start GithubPRCreate flow")
+
+  pr_mode = "closed"
+  pr_title = "Newest closed same-branch PR"
+  vim.api.nvim_win_set_buf(0, status_buf)
+  render_orchestrator.render_status(status_buf, nil, nil, { refresh_pr = true })
+  wait_for(function()
+    return buffer_contains(status_buf, "Newest closed same-branch PR") and buffer_contains(status_buf, "[closed]")
+  end, "latest closed same-branch PR did not render as the fallback")
+  assert_true(
+    session.status.pr.state == "closed" and session.status.pr.pr.number == 45,
+    "same-branch PR selection did not retain the newest closed fallback: " .. vim.inspect(session.status.pr)
+  )
+
+  trigger_normal_mapping("ogp", find_row(status_buf, "Head:"))
+  local closed_choice_buf = vim.api.nvim_get_current_buf()
+  assert_true(buffer_contains(closed_choice_buf, "Open closed PR #45"), "closed PR chooser did not offer the latest closed PR")
+  assert_true(buffer_contains(closed_choice_buf, "Create a new draft PR"), "closed PR chooser did not offer new PR creation")
+  trigger_normal_mapping("q", 1)
+  assert_true(create_pr_count == 1, "q in the closed PR chooser created a PR")
+
+  vim.api.nvim_win_set_buf(0, status_buf)
+  trigger_normal_mapping("ogp", find_row(status_buf, "Head:"))
+  trigger_normal_mapping("o", 1)
+  wait_for(function()
+    local current_buf = vim.api.nvim_get_current_buf()
+    return current_buf ~= status_buf
+      and buffer_contains(current_buf, "Newest closed same-branch PR")
+      and buffer_contains(current_buf, "Status: CLOSED")
+  end, "closed PR chooser did not open the closed PR")
+  local closed_pr_buf = vim.api.nvim_get_current_buf()
+  trigger_normal_mapping("q", 1)
+  assert_true(not vim.api.nvim_buf_is_valid(closed_pr_buf), "q did not close the closed PR view")
+
+  vim.api.nvim_win_set_buf(0, status_buf)
+  trigger_normal_mapping("ogp", find_row(status_buf, "Head:"))
+  trigger_normal_mapping("c", 1)
+  assert_true(create_pr_count == 2, "closed PR chooser did not start new PR creation")
   open_pr.open = original_open_pr
 
   reset_notifications()
@@ -728,6 +835,17 @@ local function run()
   wait_for(function() return buffer_contains(status_buf, "PR:     unavailable") end, "PR row did not render unavailable state")
   assert_true(#notifications == 0, "unavailable PR lookup should not emit error notifications: " .. vim.inspect(notifications))
   assert_true(generate_count == count_before_unavailable, "unavailable PR lookup should not restart AI generation")
+
+  reset_notifications()
+  pr_mode = "error"
+  render_orchestrator.render_status(status_buf, nil, nil, { refresh_pr = true })
+  wait_for(function() return buffer_contains(status_buf, "PR:     error") end, "failed branch PR list did not render an error state")
+  wait_for(function()
+    for _, notification in ipairs(notifications) do
+      if notification.message:find("mock branch PR list failure", 1, true) then return true end
+    end
+    return false
+  end, "failed branch PR list did not notify with the underlying error")
 
   gh.reset_backend()
   gh.set_timeout_ms(20)

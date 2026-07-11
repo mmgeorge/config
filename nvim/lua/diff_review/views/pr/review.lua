@@ -5,6 +5,7 @@
 local status_buffer = require("diff_review.views.status.status_buffer")
 local region = require("diff_review.render.region")
 local annotations = require("diff_review.render.annotations")
+local choice_popup = require("diff_review.infra.choice_popup")
 local notifications = require("diff_review.infra.notifications")
 local gh = require("diff_review.integrations.gh")
 local config = require("diff_review.infra.config")
@@ -76,9 +77,6 @@ local M = {
   ns = vim.api.nvim_create_namespace("diff_review.views.pr.review"),
   comment_icon = ui.comment_icon,
   reply_icon = ui.reply_icon,
-  -- Test seams: the comment-body input and the verdict picker. Defaults open
-  -- real UI; tests override them. Mirrors the set_backend/set_reader pattern.
-  input_provider = nil, ---@type (fun(title: string, on_submit: fun(text: string), prefill: string?))?
   verdict_provider = nil, ---@type (fun(on_choice: fun(event: string?)))?
   data_dir_for_test = nil,
 }
@@ -513,7 +511,8 @@ function M.run_sync_item(buf, item, cb)
         M.save_draft(state)
         if vim.api.nvim_buf_is_valid(buf) then M.render_preserving_inline_cursor(buf) end
       elseif item.op == "delete" and item.comment and item.comment.local_state == "deleted" then
-        item.comment.local_state = "clean"
+        item.comment.local_state = item.comment.delete_previous_state or "clean"
+        item.comment.delete_previous_state = nil
         M.save_draft(state)
         if vim.api.nvim_buf_is_valid(buf) then M.render_preserving_inline_cursor(buf) end
       end
@@ -533,6 +532,7 @@ function M.run_sync_item(buf, item, cb)
         for index, existing in ipairs(state.review_comments or {}) do
           if existing == comment then table.remove(state.review_comments, index) break end
         end
+        comment.delete_previous_state = nil
         M.save_draft(state)
         if vim.api.nvim_buf_is_valid(buf) then M.render(buf) end
         finish(true)
@@ -828,6 +828,10 @@ function M.browse_fragment_under_cursor(buf)
     return comment_fragment(entry.review_comment)
   end
 
+  if entry.kind == "comment_box" and entry.comment_box_source then
+    return comment_fragment(entry.comment_box_source)
+  end
+
   local diff_line = entry.diff_line
   if diff_line then
     local path = repo_relative(diff_line.file, state.cwd) or diff_line.file
@@ -1037,14 +1041,20 @@ end
 
 ---@param buf integer
 function M.render_preserving_inline_cursor(buf)
+  local state = M.state(buf)
   local comment
   local snapshot
   if buf and vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_get_current_buf() == buf then
+    M.sync_inline_comment_text(buf)
     local cursor = vim.api.nvim_win_get_cursor(0)
     comment = M.comment_body_at_row(buf, cursor[1])
     if comment then snapshot = M.inline_comment_cursor_snapshot(buf, comment) end
   end
-  M.render(buf)
+  if state and state.view_kind == "pr" then
+    render_pr_status(state.pr, state.cwd, buf, state.pr_diff_text)
+  else
+    M.render(buf)
+  end
   if comment and snapshot and comment.local_state ~= "deleted" then
     M.restore_inline_comment_cursor(buf, comment, snapshot)
   end
@@ -1105,6 +1115,62 @@ function M.reply_header_text(reply)
     datetime.action_phrase(user, "replied", reply.updated_at or reply.created_at)
   ), ""
 end
+
+---@param draft DiffReviewPrReplyDraft
+---@return string left_text
+---@return string right_text
+function M.reply_draft_header_text(draft)
+  local marker = draft.syncing and "" or "*"
+  return ("%s %syou replying "):format(M.reply_icon, marker), ""
+end
+
+--- Box style for review comment boxes: same border as the walkthrough so every surface's
+--- read-only box looks identical, with review's header/body foreground groups.
+---@type DiffReviewCommentBoxStyle
+M.review_box_style = {
+  border = "FloatBorder",
+  heading = "DiffReviewReviewCommentHeader",
+  body = "DiffReviewReviewComment",
+  stale = "Comment",
+}
+
+--- Build a shared read-only box descriptor from a review comment. Every comment renders as a
+--- box except the one focused for editing (state.focused_comment_id), which keeps full rows.
+---@param comment table
+---@param index integer
+---@param opts? { reply_draft?: DiffReviewPrReplyDraft }
+---@return DiffReviewCommentDescriptor
+function M.describe_comment(comment, index, opts)
+  local left, right = M.comment_header_text(comment)
+  local replies = {}
+  for _, reply in ipairs(type(comment.replies) == "table" and comment.replies or {}) do
+    if type(reply) == "table" then
+      replies[#replies + 1] = {
+        heading = vim.trim((M.reply_header_text(reply))),
+        body_lines = M.comment_body_lines(reply.body or ""),
+      }
+    end
+  end
+  local reply_draft = opts and opts.reply_draft or nil
+  if reply_draft then
+    replies[#replies + 1] = {
+      heading = vim.trim((M.reply_draft_header_text(reply_draft))),
+      body_lines = M.comment_body_lines(reply_draft.body or ""),
+    }
+  end
+  return {
+    id = comment.local_id,
+    anchor = { file = comment.abs_file or comment.path, side = comment.side or "RIGHT", line = comment.line },
+    heading = " " .. vim.trim(tostring(left) .. tostring(right)) .. " ",
+    body_lines = M.comment_body_lines(comment.body or ""),
+    readonly = false,
+    replies = #replies > 0 and replies or nil,
+    reply_draft = reply_draft,
+    source = comment,
+    index = index,
+  }
+end
+
 
 ---@param win integer?
 ---@param buf integer?
@@ -1288,13 +1354,50 @@ function M.emit_comment_reply(comment, comment_index, reply, reply_index)
   end
 end
 
+---@param comment table
+---@param comment_index integer
+---@param draft DiffReviewPrReplyDraft
+function M.emit_comment_reply_draft(comment, comment_index, draft)
+  local fold_id = comment.review_fold_id or M.comment_fold_id(comment, comment_index)
+  local header_entry = {
+    id = fold_id,
+    kind = "review_comment",
+    review_comment = comment,
+    comment_index = comment_index,
+    review_reply_draft = draft,
+    review_boundary = "reply_draft_header",
+  }
+  local left_text, right_text = M.reply_draft_header_text(draft)
+  local header = M.comment_rule_line(left_text, right_text)
+  local header_line = status_add_line(header, header_entry, "DiffReviewReviewCommentBoxHeader")
+  status_add_highlight(header_line, 0, #header, "DiffReviewReviewCommentBoxHeader")
+
+  local body_lines = M.comment_body_lines(draft.body or "")
+  draft.review_rendered_body_text = table.concat(body_lines, "\n")
+  for body_index, line in ipairs(body_lines) do
+    local body_entry = {
+      id = fold_id,
+      kind = "review_comment",
+      review_comment = comment,
+      comment_index = comment_index,
+      review_reply_draft = draft,
+      review_reply_draft_body = true,
+      review_reply_draft_body_index = body_index,
+    }
+    local body_line = status_add_line(line, body_entry, "DiffReviewReviewCommentBox")
+    if line ~= "" then status_add_highlight(body_line, 0, #line, "DiffReviewReviewCommentBox") end
+  end
+end
+
 ---Emit a draft comment as plain, navigable buffer lines below its anchor diff
 ---row. Header/footer are read-only rule rows; body rows are full-width editable
 ---buffer lines with no prefixes, virtual borders, or render wrapping.
 ---@param comment table
 ---@param index integer comment number (1-based)
 ---@param indent integer unused; retained for the review_after_row hook shape
-function M.emit_comment(comment, index, indent)
+---@param opts? { parent_readonly?: boolean, reply_draft?: DiffReviewPrReplyDraft }
+function M.emit_comment(comment, index, indent, opts)
+  opts = opts or {}
   local body_lines = M.comment_body_lines(comment.body or "")
   comment.review_rendered_body_text = table.concat(body_lines, "\n")
   local fold_id = M.comment_fold_id(comment, index)
@@ -1336,7 +1439,8 @@ function M.emit_comment(comment, index, indent)
       kind = "review_comment",
       review_comment = comment,
       comment_index = index,
-      review_body = true,
+      review_body = opts.parent_readonly ~= true,
+      review_readonly_body = opts.parent_readonly == true,
       review_body_index = body_index,
     }
     local body_line = status_add_line(line, body_entry, "DiffReviewReviewCommentBox")
@@ -1346,6 +1450,7 @@ function M.emit_comment(comment, index, indent)
   for reply_index, reply in ipairs(type(comment.replies) == "table" and comment.replies or {}) do
     if type(reply) == "table" then M.emit_comment_reply(comment, index, reply, reply_index) end
   end
+  if opts.reply_draft then M.emit_comment_reply_draft(comment, index, opts.reply_draft) end
 
   local footer_entry = {
     id = fold_id,
@@ -1378,10 +1483,13 @@ end
 ---@param row integer
 ---@return table? comment
 ---@return integer? index
-function M.comment_at_row(buf, row)
+function M.rendered_comment_at_row(buf, row)
   local state = M.state(buf)
   if not state then return nil end
   local entry = state.entries and state.entries[row] or nil
+  if entry and entry.kind == "comment_box" and entry.comment_box_source then
+    return entry.comment_box_source, entry.comment_box_index
+  end
   if entry and entry.kind == "review_comment" then
     return entry.review_comment, entry.comment_index
   end
@@ -1401,6 +1509,21 @@ function M.comment_at_row(buf, row)
 end
 
 ---@param buf integer
+---@param row integer
+---@return table? comment
+---@return integer? index
+function M.comment_at_row(buf, row)
+  local state = M.state(buf)
+  if not state then return nil end
+  local entry = state.entries and state.entries[row] or nil
+  if entry and entry.kind == "comment_box" and entry.comment_box and entry.comment_box.readonly then return nil end
+  local comment, index = M.rendered_comment_at_row(buf, row)
+  if not comment then return nil end
+  if entry and entry.kind == "pr_comment" and index == nil then return nil end
+  return comment, index
+end
+
+---@param buf integer
 ---@return table? comment
 ---@return integer? index
 function M.comment_under_cursor(buf)
@@ -1408,11 +1531,7 @@ function M.comment_under_cursor(buf)
   if not state then return nil end
   session.status = state
   local cursor_row = vim.api.nvim_win_get_cursor(0)[1]
-  for _, row in ipairs({ cursor_row, cursor_row - 1, cursor_row + 1 }) do
-    local comment, index = M.comment_at_row(buf, row)
-    if comment then return comment, index end
-  end
-  return nil
+  return M.comment_at_row(buf, cursor_row)
 end
 
 ---@param buf integer
@@ -1422,6 +1541,71 @@ function M.comment_at_cursor(buf)
   if not (buf and vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_get_current_buf() == buf) then return nil end
   local row = vim.api.nvim_win_get_cursor(0)[1]
   return M.comment_at_row(buf, row)
+end
+
+--- Promote a comment to editable rows (set focus + re-render), then place the cursor in it.
+---@param buf integer
+---@param comment table
+---@param opts? { insert?: boolean, anchor_row?: integer, anchor_entry_id?: string }
+function M.focus_comment(buf, comment, opts)
+  local state = M.state(buf)
+  if not (state and comment and comment.local_id) then return end
+  local anchor_row = opts and opts.anchor_row or vim.api.nvim_win_get_cursor(0)[1]
+  local anchor_entry = state.entries and state.entries[anchor_row] or nil
+  M.sync_inline_comment_text(buf)
+  state.focused_comment_id = comment.local_id
+  state.focused_comment_entry_id = opts and opts.anchor_entry_id or (anchor_entry and anchor_entry.id or nil)
+  state.focused_comment_anchor_row = anchor_row
+  if state.view_kind == "pr" then
+    render_pr_status(state.pr, state.cwd, buf, state.pr_diff_text)
+  else
+    M.render(buf)
+  end
+  M.focus_inline_comment(buf, comment, opts)
+end
+
+--- Expand a PR comment thread and focus its inline reply draft.
+---@param buf integer
+---@param draft DiffReviewPrReplyDraft
+---@param opts? { insert?: boolean, anchor_row?: integer, anchor_entry_id?: string }
+function M.focus_reply_draft(buf, draft, opts)
+  local state = M.state(buf)
+  if not (state and state.view_kind == "pr" and draft and draft.parent) then return end
+  M.sync_inline_comment_text(buf)
+  M.clear_comment_focus(state)
+  draft.focused = true
+  draft.anchor_row = opts and opts.anchor_row or draft.anchor_row
+  draft.anchor_entry_id = opts and opts.anchor_entry_id or draft.anchor_entry_id
+  render_pr_status(state.pr, state.cwd, buf, state.pr_diff_text)
+  pr_overview().refresh_modified(buf)
+  M.focus_editable_body(buf, draft, { insert = not opts or opts.insert ~= false })
+end
+
+--- Promote the exact compact comment row under the cursor into an inline editor.
+---@param buf integer
+---@return boolean promoted
+function M.promote_comment_box_under_cursor(buf)
+  if not (buf and vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_get_current_buf() == buf) then return false end
+  local state = M.state(buf)
+  if not state or state.review_promoting_comment then return false end
+  local row = vim.api.nvim_win_get_cursor(0)[1]
+  local entry = state.entries and state.entries[row] or nil
+  if not entry or entry.kind ~= "comment_box" then return false end
+  local descriptor = entry.comment_box
+  if not (descriptor and descriptor.source) or descriptor.readonly then return false end
+  if not descriptor.reply_draft and not descriptor.id then return false end
+
+  state.review_promoting_comment = true
+  local focus = descriptor.reply_draft and M.focus_reply_draft or M.focus_comment
+  local target = descriptor.reply_draft or descriptor.source
+  local ok, err = pcall(focus, buf, target, {
+    insert = descriptor.reply_draft ~= nil,
+    anchor_row = entry.comment_box_anchor_line,
+    anchor_entry_id = entry.comment_box_anchor_entry_id,
+  })
+  state.review_promoting_comment = nil
+  if not ok then error(err, 0) end
+  return true
 end
 
 ---@param buf integer
@@ -1437,6 +1621,9 @@ function M.toggle_comment_fold(buf)
     if entry and entry.kind == "pr_comment" and entry.id and entry.pr_comment then
       local folded = not status_folded(entry.id, true)
       set_status_folded(entry.id, folded)
+      if folded and state.focused_comment_id and M.same_comment(entry.pr_comment, M.comment_at_row(buf, row)) then
+        M.clear_comment_focus(state)
+      end
       if not fold_state()._status_set_native_fold_state(buf, entry.id, folded) then
         render_pr_status(state.pr, state.cwd, buf, state.pr_diff_text)
       end
@@ -1484,6 +1671,12 @@ function M.on_render(buf)
     comment.review_body_render_row_count = nil
     comment.review_markdown_ranges = nil
   end
+  local reply_draft = state.pr_reply_draft
+  if reply_draft then
+    reply_draft.review_header_mark = nil
+    reply_draft.review_body_region = nil
+    reply_draft.review_body_line_marks = nil
+  end
 
   local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
   local label_row
@@ -1506,7 +1699,12 @@ function M.on_render(buf)
   local range_comment, range_start
   local function close_comment_range(end_row)
     if range_comment and range_start and end_row >= range_start then
-      range_comment.review_body_region = region.new(buf, M.ns, range_start - 1, end_row, { region_kind = "review_body", editable = true })
+      range_comment.review_body_region = region.new(buf, M.ns, range_start - 1, end_row, {
+        region_kind = "review_body",
+        editable = true,
+        end_exclusive = true,
+        end_right_gravity = true,
+      })
     end
     range_comment, range_start = nil, nil
   end
@@ -1547,8 +1745,15 @@ function M.on_render(buf)
       local comment = entry.review_comment
       comment.review_reply_header_marks = comment.review_reply_header_marks or {}
       if entry.review_reply_index then
-        comment.review_reply_header_marks[entry.review_reply_index] = vim.api.nvim_buf_set_extmark(buf, M.ns, row - 1, 0, { right_gravity = false })
+        comment.review_reply_header_marks[entry.review_reply_index] = vim.api.nvim_buf_set_extmark(buf, M.ns, row - 1, 0, { right_gravity = true })
       end
+    elseif entry
+      and entry.kind == "review_comment"
+      and entry.review_boundary == "reply_draft_header"
+      and entry.review_reply_draft then
+      close_comment_range(row - 1)
+      close_markdown_range(row - 1)
+      entry.review_reply_draft.review_header_mark = vim.api.nvim_buf_set_extmark(buf, M.ns, row - 1, 0, { right_gravity = false })
     elseif entry and entry.kind == "review_comment" and entry.review_boundary == "footer" and entry.review_comment then
       close_comment_range(row - 1)
       close_markdown_range(row - 1)
@@ -1564,7 +1769,23 @@ function M.on_render(buf)
         close_comment_range(row - 1)
         range_comment, range_start = comment, row
       end
-    elseif entry and entry.kind == "review_comment" and entry.review_reply_body and entry.review_comment then
+    elseif entry and entry.kind == "review_comment" and entry.review_reply_draft_body and entry.review_reply_draft then
+      close_markdown_range(row - 1)
+      local draft = entry.review_reply_draft
+      draft.review_body_line_marks = draft.review_body_line_marks or {}
+      local mark_id = vim.api.nvim_buf_set_extmark(buf, M.ns, row - 1, 0, { right_gravity = false })
+      draft.review_body_line_marks[#draft.review_body_line_marks + 1] = {
+        id = mark_id,
+        line_index = entry.review_reply_draft_body_index,
+      }
+      if draft ~= range_comment then
+        close_comment_range(row - 1)
+        range_comment, range_start = draft, row
+      end
+    elseif entry
+      and entry.kind == "review_comment"
+      and (entry.review_reply_body or entry.review_readonly_body)
+      and entry.review_comment then
       close_comment_range(row - 1)
       if entry.review_comment ~= markdown_range_comment then
         close_markdown_range(row - 1)
@@ -1600,6 +1821,68 @@ function M.same_comment(left, right)
   if left.remote_node_id and right.remote_node_id and left.remote_node_id == right.remote_node_id then return true end
   if left.remote_id and right.remote_id and tonumber(left.remote_id) == tonumber(right.remote_id) then return true end
   return false
+end
+
+--- Clear the selected inline comment occurrence before rendering it as a box.
+---@param state table
+function M.clear_comment_focus(state)
+  state.focused_comment_id = nil
+  state.focused_comment_entry_id = nil
+  state.focused_comment_anchor_row = nil
+end
+
+--- Collapse the focused inline editor after the cursor leaves that comment.
+---@param buf integer
+---@return boolean collapsed
+function M.collapse_focused_comment_if_cursor_left(buf)
+  if not (buf and vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_get_current_buf() == buf) then return false end
+  local state = M.state(buf)
+  if not state or state.review_collapsing_comment then return false end
+
+  local reply_draft = state.pr_reply_draft
+  if reply_draft and reply_draft.focused then
+    local cursor_row = vim.api.nvim_win_get_cursor(0)[1]
+    if M.reply_draft_body_at_row(buf, cursor_row) == reply_draft then return false end
+    pr_overview().sync_reply_draft_text(buf)
+    if M.comment_body_for_sync(reply_draft.body or "") == "" then
+      state.pr_reply_draft = nil
+    else
+      reply_draft.focused = false
+    end
+    state.review_collapsing_comment = true
+    local ok, err = pcall(render_pr_status, state.pr, state.cwd, buf, state.pr_diff_text)
+    state.review_collapsing_comment = nil
+    if not ok then error(err) end
+    pr_overview().refresh_modified(buf)
+    return true
+  end
+
+  if not state.focused_comment_id then return false end
+
+  local focused_comment
+  for _, comment in ipairs(state.review_comments or {}) do
+    if comment.local_id == state.focused_comment_id then
+      focused_comment = comment
+      break
+    end
+  end
+  local cursor_row = vim.api.nvim_win_get_cursor(0)[1]
+  local cursor_comment = M.comment_at_row(buf, cursor_row)
+  if focused_comment and cursor_comment and M.same_comment(focused_comment, cursor_comment) then return false end
+
+  M.sync_inline_comment_text(buf)
+  M.clear_comment_focus(state)
+  state.review_collapsing_comment = true
+  local ok, err = pcall(function()
+    if state.view_kind == "pr" then
+      render_pr_status(state.pr, state.cwd, buf, state.pr_diff_text)
+    else
+      M.render(buf)
+    end
+  end)
+  state.review_collapsing_comment = nil
+  if not ok then error(err) end
+  return true
 end
 
 ---@param buf integer
@@ -1675,6 +1958,18 @@ function M.comment_body_at_row(buf, row)
       end
     end
   end
+  return nil
+end
+
+---@param buf integer
+---@param row integer 1-based
+---@return DiffReviewPrReplyDraft? draft
+function M.reply_draft_body_at_row(buf, row)
+  local state = M.state(buf)
+  local draft = state and state.pr_reply_draft or nil
+  if not draft or not draft.review_body_region then return nil end
+  local start_row0, end_row0 = region.bounds(draft.review_body_region)
+  if start_row0 ~= nil and end_row0 ~= nil and row >= start_row0 + 1 and row <= end_row0 then return draft end
   return nil
 end
 
@@ -1823,7 +2118,9 @@ end
 ---@param row integer 1-based
 ---@return boolean
 function M.in_editable_region(buf, row)
-  return M.in_comment_region(buf, row) or M.comment_body_at_row(buf, row) ~= nil
+  return M.in_comment_region(buf, row)
+    or M.comment_body_at_row(buf, row) ~= nil
+    or M.reply_draft_body_at_row(buf, row) ~= nil
 end
 
 ---@param buf integer
@@ -1851,7 +2148,7 @@ end
 ---@return table? state
 function M.command_map_state(buf)
   local state = session.states and session.states[buf] or session.status
-  if not (state and state.view_kind == "review") then return nil end
+  if not (state and (state.view_kind == "review" or state.view_kind == "pr")) then return nil end
   state.review_command_maps = state.review_command_maps or {}
   state.review_command_maps_by_key = state.review_command_maps_by_key or {}
   return state
@@ -1868,9 +2165,17 @@ end
 ---@param command_id string
 ---@return boolean
 function M.command_map_should_be_active(buf, command_id)
+  local state = M.command_map_state(buf)
   if command_id == "sync" then return true end
   if command_id == "browse" and vim.fn.mode():sub(1, 1) == "n" then return true end
   if command_id == "toggle" and vim.fn.mode():sub(1, 1) == "n" then return true end
+  if command_id == "reply" and state and state.view_kind == "pr" then return true end
+  if command_id == "delete"
+    and state
+    and state.view_kind == "pr"
+    and M.reply_draft_body_at_row(buf, vim.api.nvim_win_get_cursor(0)[1]) then
+    return true
+  end
   return not M.cursor_or_selection_in_editable_region(buf)
 end
 
@@ -2117,7 +2422,7 @@ function M.refresh_inline_comment_rules(buf, win, target_comment)
         if M.replace_comment_rule_line(buf, reply_row0, reply_header) and reply_row0 ~= nil then
           pcall(vim.api.nvim_buf_del_extmark, buf, M.ns, reply_mark_id)
           comment.review_reply_header_marks = comment.review_reply_header_marks or {}
-          comment.review_reply_header_marks[reply_index] = vim.api.nvim_buf_set_extmark(buf, M.ns, reply_row0, 0, { right_gravity = false })
+          comment.review_reply_header_marks[reply_index] = vim.api.nvim_buf_set_extmark(buf, M.ns, reply_row0, 0, { right_gravity = true })
         end
       end
     end
@@ -2270,76 +2575,26 @@ function M.selection_payload(state)
   return payload
 end
 
----@param title string
----@param on_submit fun(text: string)
----@param prefill? string existing text to edit
----@param opts? { on_cancel?: fun(), cursor?: integer[] }
-function M.open_input(title, on_submit, prefill, opts)
-  if M.input_provider then
-    M.input_provider(title, on_submit, prefill)
-    return
+--- Focus an editable body owner whose rows are tracked through the shared region model.
+---@param buf integer
+---@param owner table
+---@param opts? { insert?: boolean }
+function M.focus_editable_body(buf, owner, opts)
+  if not (buf and vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_get_current_buf() == buf) then return end
+  local start_row, end_row = M.comment_body_rows(buf, owner)
+  if not start_row or not end_row then return end
+  local cursor = vim.api.nvim_win_get_cursor(0)
+  local target_row = cursor[1]
+  if target_row < start_row or target_row > end_row then target_row = start_row end
+  local line = vim.api.nvim_buf_get_lines(buf, target_row - 1, target_row, false)[1] or ""
+  local target_col = math.min(math.max(cursor[2] or 0, 0), #line)
+  pcall(vim.api.nvim_win_set_cursor, 0, { target_row, target_col })
+  M.sync_modifiable(buf)
+  if opts and opts.insert then
+    vim.schedule(function()
+      if vim.api.nvim_get_current_buf() == buf then pcall(vim.cmd, "startinsert") end
+    end)
   end
-  local buf = vim.api.nvim_create_buf(false, true)
-  vim.bo[buf].bufhidden = "wipe"
-  if prefill and prefill ~= "" then
-    vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.split(prefill, "\n", { plain = true }))
-  end
-  local width = math.min(72, math.max(40, math.floor(vim.o.columns * 0.6)))
-  local content_height = math.max(1, #vim.api.nvim_buf_get_lines(buf, 0, -1, false))
-  local max_height = math.max(1, vim.o.lines - 6)
-  local height = math.min(content_height, max_height)
-  local win = vim.api.nvim_open_win(buf, true, {
-    relative = "cursor",
-    row = 1,
-    col = 0,
-    width = width,
-    height = height,
-    style = "minimal",
-    border = "rounded",
-    title = " " .. title .. " (Ctrl-s submit, Ctrl-q cancel) ",
-    title_pos = "center",
-  })
-  pcall(vim.api.nvim_set_current_win, win)
-  if opts and opts.cursor then
-    local popup_lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-    local target_row = math.min(math.max(opts.cursor[1] or 1, 1), math.max(#popup_lines, 1))
-    local line = popup_lines[target_row] or ""
-    local target_col = math.min(math.max(opts.cursor[2] or 0, 0), #line)
-    pcall(vim.api.nvim_win_set_cursor, win, { target_row, target_col })
-  end
-  local done = false
-  local function enter_insert()
-    if done or not vim.api.nvim_win_is_valid(win) then return end
-    pcall(vim.api.nvim_set_current_win, win)
-    pcall(vim.cmd, "startinsert")
-    vim.defer_fn(function()
-      if done or not vim.api.nvim_win_is_valid(win) then return end
-      pcall(vim.api.nvim_set_current_win, win)
-      pcall(vim.cmd, "startinsert")
-    end, 10)
-  end
-  local function close()
-    if vim.api.nvim_win_is_valid(win) then pcall(vim.api.nvim_win_close, win, true) end
-  end
-  local function cancel()
-    if done then return end
-    done = true
-    close()
-    if opts and opts.on_cancel then opts.on_cancel() end
-  end
-  local function submit()
-    if done then return end
-    done = true
-    vim.cmd("stopinsert")
-    local text = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
-    close()
-    on_submit(text)
-  end
-  vim.keymap.set({ "n", "i" }, "<C-s>", submit, { buffer = buf })
-  vim.keymap.set({ "n", "i" }, "<C-q>", cancel, { buffer = buf, nowait = true })
-  vim.keymap.set("n", "<Esc>", cancel, { buffer = buf, nowait = true })
-  enter_insert()
-  vim.schedule(enter_insert)
 end
 
 ---@param buf integer
@@ -2361,20 +2616,7 @@ function M.focus_inline_comment(buf, comment, opts)
       end
     end
   end
-  local start_row, end_row = M.comment_body_rows(buf, comment)
-  if not start_row or not end_row then return end
-  local cursor = vim.api.nvim_win_get_cursor(0)
-  local target_row = cursor[1]
-  if target_row < start_row or target_row > end_row then target_row = start_row end
-  local line = vim.api.nvim_buf_get_lines(buf, target_row - 1, target_row, false)[1] or ""
-  local target_col = math.min(math.max(cursor[2] or 0, 0), #line)
-  pcall(vim.api.nvim_win_set_cursor, 0, { target_row, target_col })
-  M.sync_modifiable(buf)
-  if opts and opts.insert then
-    vim.schedule(function()
-      if vim.api.nvim_get_current_buf() == buf then pcall(vim.cmd, "startinsert") end
-    end)
-  end
+  M.focus_editable_body(buf, comment, opts)
 end
 
 ---@param state table
@@ -2409,26 +2651,23 @@ function M.create_inline_comment(state, payload)
   return comment
 end
 
----`C`: on an existing comment, focus its inline editable body; on a changed diff line, add a draft
----comment. On anything else it is a no-op. Comments are local until submit.
+--- Create a draft comment from the changed line or selection under the cursor.
+--- Existing compact comments enter editing through cursor movement instead of this command.
 ---@param buf integer
 function M.add_comment(buf)
   local state = M.state(buf)
   if not state then return end
   session.status = state
-  local existing = M.comment_under_cursor(buf)
-  if existing then
-    M.focus_inline_comment(buf, existing)
-    return
-  end
+  local row = vim.api.nvim_win_get_cursor(0)[1]
+  local entry = state.entries and state.entries[row] or nil
+  if entry and (entry.kind == "comment_box" or entry.kind == "review_comment" or entry.kind == "pr_comment") then return end
   local payload = M.selection_payload(state)
   M.leave_visual()
   if not payload then return end
   if not entry_nav._status_source_policy_allows_cursor(state, "comment") then return end
   local comment = M.create_inline_comment(state, payload)
+  M.focus_comment(buf, comment, { insert = true })
   M.save_draft(state)
-  M.render(buf)
-  M.focus_inline_comment(buf, comment, { insert = true })
 end
 
 ---`J`: remove the draft comment under the cursor.
@@ -2439,9 +2678,13 @@ function M.delete_comment(buf)
   local comment, index = M.comment_under_cursor(buf)
   if not (comment and index) then return end
   if comment.remote_node_id then
+    comment.delete_previous_state = comment.local_state
     comment.local_state = "deleted"
   else
     table.remove(state.review_comments, index)
+  end
+  if state.focused_comment_id == comment.local_id then
+    M.clear_comment_focus(state)
   end
   M.save_draft(state)
   M.render(buf)
@@ -2473,12 +2716,18 @@ end
 function M.navigate(buf, direction)
   local state = M.state(buf)
   if not state then return end
-  local rows = {}
+  local row_index = {}
   for row, entry in pairs(state.entries or {}) do
     if entry.kind == "review_comment" and entry.review_first then
-      rows[#rows + 1] = row
+      row_index[row] = true
+    elseif entry.kind == "comment_box"
+      and entry.comment_box_boundary == "header"
+      and entry.comment_box
+      and not entry.comment_box.readonly then
+      row_index[row] = true
     end
   end
+  local rows = vim.tbl_keys(row_index)
   if #rows == 0 then
     vim.notify("No comments yet", vim.log.levels.INFO, { title = "DiffReview" })
     return
@@ -2580,53 +2829,15 @@ end
 --- `c`/`a`/`r` pick, `q`/`<Esc>` cancels.
 ---@param on_choice fun(event: string?)
 function M.pick_verdict(on_choice)
-  local options = {
-    { key = "c", event = "COMMENT", label = "Comment (no verdict)" },
-    { key = "a", event = "APPROVE", label = "Approve" },
-    { key = "r", event = "REQUEST_CHANGES", label = "Request changes" },
-  }
-  local lines = { "" }
-  for _, opt in ipairs(options) do
-    lines[#lines + 1] = ("  [%s]  %s"):format(opt.key, opt.label)
-  end
-  lines[#lines + 1] = "  [q]  cancel"
-  lines[#lines + 1] = ""
-
-  local buf = vim.api.nvim_create_buf(false, true)
-  vim.bo[buf].bufhidden = "wipe"
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-  vim.bo[buf].modifiable = false
-  local width = 0
-  for _, line in ipairs(lines) do
-    width = math.max(width, #line)
-  end
-  local win = vim.api.nvim_open_win(buf, true, {
-    relative = "cursor",
-    row = 1,
-    col = 0,
-    width = width + 2,
-    height = #lines,
-    style = "minimal",
-    border = "rounded",
-    title = " Submit review ",
-    title_pos = "center",
+  choice_popup.open({
+    title = "Submit review",
+    options = {
+      { key = "c", value = "COMMENT", label = "Comment (no verdict)" },
+      { key = "a", value = "APPROVE", label = "Approve" },
+      { key = "r", value = "REQUEST_CHANGES", label = "Request changes" },
+    },
+    on_choice = on_choice,
   })
-  local chosen = false
-  local function close()
-    if vim.api.nvim_win_is_valid(win) then pcall(vim.api.nvim_win_close, win, true) end
-  end
-  local function choose(event)
-    if chosen then return end
-    chosen = true
-    close()
-    on_choice(event)
-  end
-  for _, opt in ipairs(options) do
-    vim.keymap.set("n", opt.key, function() choose(opt.event) end, { buffer = buf, nowait = true, silent = true })
-  end
-  vim.keymap.set("n", "q", function() choose(nil) end, { buffer = buf, nowait = true, silent = true })
-  vim.keymap.set("n", "<Esc>", function() choose(nil) end, { buffer = buf, nowait = true, silent = true })
-  vim.api.nvim_create_autocmd("BufLeave", { buffer = buf, once = true, callback = function() choose(nil) end })
 end
 
 ---@param buf integer
@@ -2635,8 +2846,13 @@ function M.attach(buf)
   vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI", "BufEnter", "ModeChanged" }, {
     group = group,
     buffer = buf,
-    callback = function()
+    callback = function(event)
       trace.span("review.autocmd_sync_modifiable", buf, nil, function()
+        if event.event == "CursorMoved" or event.event == "CursorMovedI" then
+          if not M.promote_comment_box_under_cursor(buf) then
+            M.collapse_focused_comment_if_cursor_left(buf)
+          end
+        end
         M.sync_modifiable(buf)
       end)
     end,

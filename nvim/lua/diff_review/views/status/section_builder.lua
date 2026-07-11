@@ -184,22 +184,70 @@ function M.comment_anchor_index_from_sections(sections, opts)
   return by_anchor
 end
 
---- Emit any draft/published comments anchored on `diff_line` as review lines below it,
---- routing through the review view's comment renderer.
+--- Emit comments anchored on `diff_line` below it. Each unfocused interactive comment renders
+--- as compact real rows, while the focused comment or reply draft renders as a full-width editor.
+--- Readonly providers reuse the box builder without gaining a parent-comment editing path.
 ---@param state table
 ---@param diff_line table
 ---@param indent integer
----@param opts { index_field: string, count_field?: string, skip?: fun(comment: table): boolean }
+---@param opts { index?: table<string, { comment: table, index: integer }[]>, index_field?: string, count_field?: string, readonly?: boolean, skip?: fun(comment: table): boolean }
 function M.emit_anchored_comments(state, diff_line, indent, opts)
   local review = review_mod()
   local key = M.comment_anchor_key(diff_line.file, review.side_of(diff_line), diff_line.line)
-  local comments = key and state[opts.index_field] and state[opts.index_field][key] or nil
-  for _, item in ipairs(comments or {}) do
-    if item.comment
-      and item.comment.local_state ~= "deleted"
-      and not (opts.skip and opts.skip(item.comment)) then
+  local comment_index = opts.index or (opts.index_field and state[opts.index_field])
+  local comments = key and comment_index and comment_index[key] or nil
+  if not comments then return end
+  local comment_box = require("diff_review.render.comment_box")
+  -- The diff row was just appended, so its 1-based buffer line is the current line count.
+  local anchor_line = #(state.lines or {})
+  local anchor_entry = state.entries and state.entries[anchor_line] or nil
+  local focus_target_matches = (
+    state.focused_comment_entry_id ~= nil
+    and anchor_entry ~= nil
+    and anchor_entry.id == state.focused_comment_entry_id
+  ) or (state.focused_comment_entry_id == nil and state.focused_comment_anchor_row == anchor_line)
+  for _, item in ipairs(comments) do
+    local comment = item.comment
+    local comment_index = item.index
+    local editable = state.view_kind == "review"
+    -- Resolve viewer comments through the PR-owned store so boxes retain saved edits and deletions.
+    for _, editable_item in ipairs(state.review_comment_anchor_index and state.review_comment_anchor_index[key] or {}) do
+      if review.same_comment(editable_item.comment, comment) then
+        comment = editable_item.comment
+        comment_index = editable_item.index
+        editable = true
+        break
+      end
+    end
+    local focus_here = not opts.readonly
+      and state.focused_comment_id ~= nil
+      and focus_target_matches
+    if comment
+      and comment.local_state ~= "deleted"
+      and not (opts.skip and opts.skip(comment)) then
       if opts.count_field then state[opts.count_field] = (state[opts.count_field] or 0) + 1 end
-      review.emit_comment(item.comment, item.index, indent)
+      local focused = focus_here and state.focused_comment_id == comment.local_id
+      local reply_draft = state.pr_reply_draft
+      local reply_target_matches = reply_draft
+        and review.same_comment(reply_draft.parent, comment)
+        and ((reply_draft.anchor_entry_id ~= nil
+            and anchor_entry ~= nil
+            and anchor_entry.id == reply_draft.anchor_entry_id)
+          or (reply_draft.anchor_entry_id == nil and reply_draft.anchor_row == anchor_line))
+      if reply_target_matches and reply_draft.focused then
+        review.emit_comment(comment, comment_index, indent, {
+          parent_readonly = true,
+          reply_draft = reply_draft,
+        })
+      elseif focused then
+        review.emit_comment(comment, comment_index, indent)
+      else
+        local descriptor = review.describe_comment(comment, comment_index, {
+          reply_draft = reply_target_matches and reply_draft or nil,
+        })
+        descriptor.readonly = not reply_target_matches and (opts.readonly == true or not editable)
+        comment_box.render_box(state, descriptor, anchor_line, review.review_box_style)
+      end
     end
   end
 end

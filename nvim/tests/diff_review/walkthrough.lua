@@ -258,6 +258,16 @@ local function row_is_folded(buf, row)
   return folded
 end
 
+local function fold_text_has_segment(buf, row, text, hl_group)
+  local state = session.states and session.states[buf] or session.status
+  local fold_text = state and state.fold_text_by_start_line and state.fold_text_by_start_line[row] or nil
+  if type(fold_text) ~= "table" then return false end
+  for _, segment in ipairs(fold_text) do
+    if segment[2] == hl_group and tostring(segment[1] or ""):find(text, 1, true) then return true end
+  end
+  return false
+end
+
 local function assert_row_before(buf, first_needle, second_needle, message)
   local first_row = find_row(buf, first_needle)
   local second_row = find_row(buf, second_needle)
@@ -892,6 +902,15 @@ local function run()
   toggle_row(buf, "a.txt +")
   wait_for(function() return row_is_folded(summary_buf, find_row(summary_buf, "NEW a.txt")) end,
     "folding target file after location jump should hide its diff again")
+  local folded_file_row = find_row(summary_buf, "a.txt +")
+  assert_true(
+    fold_text_has_segment(summary_buf, folded_file_row, "a.txt", "DiffReviewStatusPath"),
+    "folded walkthrough file row should keep the path highlight in native foldtext"
+  )
+  assert_true(
+    fold_text_has_segment(summary_buf, folded_file_row, "+3", "DiffReviewAddRange"),
+    "folded walkthrough file row should keep the added-stat highlight in native foldtext"
+  )
   local expanded_second_task_row = find_row(summary_buf, "2. Update b.txt through the second task.")
   local expanded_lines = vim.api.nvim_buf_get_lines(summary_buf, 0, -1, false)
   assert_true(expanded_lines[expanded_second_task_row - 1] == "",

@@ -47,6 +47,22 @@ not `status_enqueue_operation`, whose reconcile tail would rebuild the PR
 buffer as a status view). Failures notify and restore the markers.
 Re-renders are blocked while edits are unsynced.
 
+The PR lifecycle row renders `DRAFT`, `OPEN`, or `CLOSED`. Activating its
+status value with the shared open action displays exactly the other two states
+in a keyboard chooser (`d`/`o`/`c`), with `q`/`<Esc>` cancelling. Route every
+transition through the PR edit queue and `gh.set_pr_state_async`. A closed PR
+may require two ordered mutations: reopen first, then convert to draft or mark
+ready when the reopened draft flag does not match the requested state. If the
+second mutation fails, render the intermediate remote state and notify the
+underlying failure instead of leaving a stale lifecycle label.
+
+Branch PR discovery must list all PRs for the current head branch, not ask
+`gh pr view` to choose one. Sort by descending PR number, open the newest
+`OPEN` PR (draft or ready) automatically, and ignore older active candidates.
+If no active PR exists, retain the newest `CLOSED` PR and make `ogp` show a
+choice between opening that PR and creating a new draft PR. Ignore merged PRs
+for this fallback. `q`/`<Esc>` cancels without opening or creating anything.
+
 Pressing `or` in the status or PR view starts PR review mode
 (`M._review`, view_kind = "review", `M.open_review(pr, opts)`): the PR title,
 an editable review summary, and the changed files split into Unviewed/Viewed
@@ -55,21 +71,52 @@ comments are drafted locally, synced deliberately, and submitted together:
 - `S`/`U` move the hunk/file under the cursor between the sections; on
   Unviewed/Viewed section headers they move the whole section.
 - `C` on a changed (diff body) line creates an empty inline editable comment
-  body and focuses it; on an existing comment, or the line immediately
-  above/below it, it focuses that comment body. Comments render as real,
-  navigable buffer lines
-  emitted inline right below their anchor row by a renderer hook
-  (`M._status.review_after_row`, consumed in `status_add_fancy_row`): a
-  read-only rule header, raw editable full-width body rows, and a read-only
-  rule footer. Header rules start directly with the author/date, use dashes only
-  between the left label and the right-aligned line number, and do not have
-  surrounding `--` frame markers. Size header/footer rules to the window text
-  area so they never overflow or soft-wrap, and refresh those rule rows from
-  shared display/resize handling (`WinResized`/`VimResized` plus
-  `BufWinEnter`). The review window enables soft word wrap; do not hard-wrap,
-  reflow, prefix, or draw box sides into editable body text.
-- `J` deletes the draft comment under the cursor; `y`/`n` jump between
-  comments.
+  body and focuses it. `C` only creates comments. Entering an existing compact
+  comment with normal cursor movement promotes that exact occurrence to an
+  inline editor and makes its body editable automatically. Every unfocused
+  inline comment renders through `render/comment_box.lua` as compact real
+  status-buffer rows below its diff row. `section_builder.emit_anchored_comments` owns this dispatch for PR
+  Changes, expanded submitted Reviews, and batched review mode. Walkthroughs
+  call the same box-line builder through virtual lines because they remain readonly.
+  It resolves viewer-authored remote snapshots through the PR-owned editable
+  store before both box and editor rendering. Saved edits, reply threads, and
+  deletions must therefore survive every focus transition and re-render.
+  Only the occurrence entered by the cursor transforms into full-width buffer
+  rows: a read-only rule header, raw editable body rows, and a read-only rule
+  footer. Track that occurrence by its stable diff-entry ID, not its raw row,
+  because collapsing the previous editor shifts later rows. Saving keeps the
+  selected editor open. Moving the cursor outside its header, body, replies,
+  and footer clears that focus and restores the compact box. Header rules start
+  directly with the author/date, use dashes only between the left label and the
+  right-aligned line number, and do not have surrounding `--` frame markers.
+  Size header/footer rules to the window text area so they never overflow or
+  soft-wrap, and refresh those rule rows from shared display/resize handling
+  (`WinResized`/`VimResized` plus `BufWinEnter`). The review window enables soft
+  word wrap; do not hard-wrap, reflow, prefix, or draw box sides into editable
+  body text. Measure box width in display cells, split unbroken text, preserve
+  same-anchor box order, and re-render compact rows on resize.
+- Inline replies in the PR overview (`view_kind = "pr"`) render inside their
+  parent comment box. Separate the parent and each reply with an internal
+  heading rule while preserving one outer top/bottom border for the full
+  thread. `R` stays bound across both compact and focused remote comment modes
+  and creates a real inline reply draft below the selected thread. The shared
+  comment dispatcher renders only that draft body as editable, `<C-s>` posts it
+  through GitHub's review-comment reply endpoint, and `J` discards it. Outside
+  an inline comment, `R` keeps its PR refresh behavior. Do not expose reply
+  creation in batched
+  review mode or walkthroughs.
+- Top-level PR conversation comments in the `Comments` section are foldable
+  list entries, not inline annotations. Render every comment closed by default
+  as one metadata/preview row. Normal cursor movement must never expand or
+  focus these comments. The shared open action (`o`, `<CR>`, or `.` by default)
+  expands the selected conversation comment, and `<Tab>` collapses it. A
+  manually opened comment stays open when the cursor leaves. Viewer-authored
+  bodies remain editable after opening, but they must not enter the inline
+  annotation focus or auto-collapse lifecycle.
+- `J` deletes the editable draft or viewer-authored inline comment under the
+  cursor. Remote deletions sync on `<C-s>` and remove the
+  identity from both flattened and submitted-review comment projections.
+  `y`/`z` jump between full-width comments and compact box rows.
 - `b` on actual comment rows (header/body/footer) opens the GitHub comment
   anchor; adjacent diff rows keep their code-line anchors instead of borrowing
   the nearby comment.
@@ -86,7 +133,7 @@ The review summary is edited in place with the same cursor-follows-modifiable
 mechanism as `M._pr_edit`. Diff rows carry absolute paths, so comments keep
 both `path` (repo-relative, for GitHub) and `abs_file` (for matching rendered
 rows). Tests drive the comment body and verdict through the
-`M._review.input_provider` / `M._review.verdict_provider` seams. The summary
+`M._review.verdict_provider` seam. The summary
 region's end extmark uses right gravity (a left-gravity boundary mark gets
 pulled into an edit of the adjacent line). Review-specific key defaults live in
 `config.keymaps.review`, but the hint bar, `?` help, and installed mappings must

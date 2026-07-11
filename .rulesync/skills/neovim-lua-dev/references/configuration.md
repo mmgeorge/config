@@ -42,14 +42,14 @@ Per-repo overrides (e.g. `branch_prefix`) come from `<repo>/.diffreview.json` vi
 
 Defaults live under `config.defaults.keymaps`, split into exactly two groups:
 
-- `keymaps.status` — the status-family views: **status / pr / diff / branch-diff** share one vocabulary (`q` close, `<Tab>` toggle, `o`/`<CR>`/`.` open, `R` refresh, `?` help, `S`/`U`/`j` stage/unstage/discard, …).
+- `keymaps.status` — the status-family views: **status / pr / diff / branch-diff** share one vocabulary (`q` close, `<Tab>` toggle, `o`/`<CR>`/`.` open, `R` refresh, `?` help, `S`/`U`/`j` stage/unstage/discard, …). The PR view also resolves `R` through its `reply` command: it creates an inline reply draft through the shared comment renderer across compact and focused comments, then falls back to refresh elsewhere.
 - `keymaps.review` — review mode **redefines** keys (`S` = mark viewed, `U` = unviewed, `cc` = submit, `<C-s>` = sync). It earns its own group because its vocabulary genuinely diverges.
 
 ```lua
 -- infra/config.lua (excerpt)
 keymaps = {
   status = {
-    close = "q", refresh = "R", toggle = "<Tab>", collapse_parent = "N",
+    close = "q", refresh = "R", reply = "R", toggle = "<Tab>", collapse_parent = "N",
     stage = "S", unstage = "U", discard = "j",
     open = { "o", "<CR>", "." }, commit = "cc", help = "?", -- …
   },
@@ -93,9 +93,12 @@ To fully replace, pass a **string** (single key cleanly overrides the whole tabl
 { id = "stage", label = "stage", desc = "Stage hunk/file/selection",
   modes = { "n", "x" }, visual = true, pinned = true, views = { status = true } },
 
-{ id = "comment", label = "comment", desc = "Add or edit an inline comment",
+{ id = "comment", label = "comment", desc = "Add an inline comment",
   modes = { "n", "x" }, keymap = "review", visual = true, pinned = true,
   views = { pr = true, review = true } },           -- key comes from the REVIEW group
+
+{ id = "reply", label = "reply", desc = "Reply to comment, otherwise refresh PR",
+  modes = "n", pinned = true, views = { pr = true } }, -- key comes from STATUS
 
 { id = "open", label = "open", desc = "Open PR/about or jump to file", modes = "n", pinned = true },
 ```
@@ -186,6 +189,18 @@ end
 The status family is one family that **intentionally shares muscle memory**: `q`, `<Tab>`, `o`, `R`, `?` mean the same thing in status, pr, diff, and branch-diff. A per-view key table would duplicate those identical bindings four times and invite drift — rebind `open` in one view, forget the others. One `keymaps.status` group keeps all four in lockstep, and `command_specs.views` decides *where each appears* without duplicating *what key it is*.
 
 Review mode is the exception that proves the rule: `S`/`cc` mean different actions there, so it gets its own `keymaps.review` group. Add a third group **only** when a view's vocabulary genuinely diverges — not to vary one or two keys.
+
+The PR overview keeps the shared `open` vocabulary while specializing its target. On a
+top-level conversation comment, `o`, `<CR>`, or `.` expands that folded list entry. On
+diff content, the same command still jumps to the file. Cursor movement never substitutes
+for `open` on conversation comments because those rows do not use the inline-annotation
+focus lifecycle.
+
+Small contextual choices use `infra/choice_popup.lua` instead of adding another
+view-local popup implementation. Pass typed `{ key, value, label }` options and one
+`on_choice` callback. The primitive owns `q`/`<Esc>` cancellation and buffer cleanup.
+The PR status row uses this path to show the other two lifecycle states, while the
+closed-PR `ogp` fallback uses it to choose between opening and creating.
 
 Best practice: centralize all in-buffer keys under `opts.keymaps` (the gitsigns/telescope idiom). Never scatter default keys into view modules; a view module owns behavior, the config owns keys.
 

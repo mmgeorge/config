@@ -56,6 +56,18 @@ end)
 
 Re-check `request_id` at **every** async hop (root lookup, status load, metadata load), not just the outermost one — a slow first call can otherwise repaint over a newer refresh that already completed.
 
+PR discovery follows the same rule across two hops. First list every PR for the named
+head branch, then fetch full details only for the selected candidate. Re-check the status
+request id before starting the detail request and again before rendering its result. The
+selection policy belongs above the transport: newest active PR first, newest closed PR as
+a user-confirmed fallback, and merged PRs excluded.
+
+Composite PR lifecycle changes also run serially. `CLOSED -> DRAFT` reopens before it
+converts, while reopening a draft as `OPEN` must mark it ready after the reopen. If the
+second mutation fails, return and render the intermediate GitHub state before notifying
+the failure. Hiding that partial success leaves the editor claiming `CLOSED` after GitHub
+already reopened the PR.
+
 ---
 
 ## Optimistic UI model, reconcile after the queue is idle

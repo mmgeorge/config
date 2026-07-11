@@ -250,6 +250,7 @@ local function render_pr_status(pr, cwd, buf, diff_text)
   status.pr_standalone_comments = status.pr_standalone_comments or {}
   status.pr_regular_comments = status.pr_regular_comments or {}
   pr_overview.refresh_editable_comments(status)
+  status.review_comment_anchor_index = section_builder.comment_anchor_index(status.review_comments)
   status.head_lines = status_head._status_pr_detail_head_lines(pr, status)
   status.sections = section_map._status_pr_sections(cwd, pr, diff_text, status.pr_comments, status.pr_standalone_comments, status.pr_regular_comments)
   local section_file_count = 0

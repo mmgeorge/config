@@ -9,6 +9,7 @@ local M = { ns = vim.api.nvim_create_namespace("diff_review.views.pr.pr_edit") }
 
 local gh = require("diff_review.integrations.gh")
 local config = require("diff_review.infra.config")
+local choice_popup = require("diff_review.infra.choice_popup")
 local notifications = require("diff_review.infra.notifications")
 local region = require("diff_review.render.region")
 
@@ -881,7 +882,7 @@ function M.patch_status_row(buf, status)
   local pr = status and status.pr or nil
   local row0 = M.patch_head_field_row(buf, status, state and state.status_mark, {
     { "Status: ", "DiffReviewStatusLabel" },
-    { pr_overview().status_text(pr), pr and pr.isDraft and "DiffReviewStatusFetching" or "DiffReviewStatusBranch" },
+    { pr_overview().status_text(pr), pr_overview().status_highlight(pr) },
   }, "^Status:")
   if state and row0 then
     if state.status_mark then pcall(vim.api.nvim_buf_del_extmark, buf, M.ns, state.status_mark) end
@@ -1225,21 +1226,18 @@ function M.confirm_and_apply_milestone_change(buf, status, change, done)
 end
 
 ---@param pr DiffReviewGhPR
----@param desired_draft boolean
----@return string[]
-function M.draft_status_confirmation_lines(pr, desired_draft)
-  if desired_draft then
-    return {
-      ("Move PR #%s back to draft?"):format(tostring(pr.number)),
-      "",
-      "Status will change from READY to DRAFT.",
-    }
+---@return DiffReviewChoicePopupOption[]
+function M.pr_state_options(pr)
+  local current = pr_overview().status_text(pr)
+  local options = {}
+  for _, candidate in ipairs({
+    { key = "d", value = "DRAFT", label = "DRAFT" },
+    { key = "o", value = "OPEN", label = "OPEN" },
+    { key = "c", value = "CLOSED", label = "CLOSED" },
+  }) do
+    if candidate.value ~= current then options[#options + 1] = candidate end
   end
-  return {
-    ("Mark PR #%s ready for review?"):format(tostring(pr.number)),
-    "",
-    "Status will change from DRAFT to READY.",
-  }
+  return options
 end
 
 ---@param status table
@@ -1251,9 +1249,9 @@ end
 
 ---@param buf integer
 ---@param status table
----@param desired_draft boolean
+---@param desired_state "DRAFT"|"OPEN"|"CLOSED"
 ---@param done fun(ok: boolean)
-function M.apply_draft_status(buf, status, desired_draft, done)
+function M.apply_pr_state(buf, status, desired_state, done)
   local latest = session.states and session.states[buf] or status
   if not (latest and latest.pr) then
     done(false)
@@ -1262,22 +1260,27 @@ function M.apply_draft_status(buf, status, desired_draft, done)
 
   local pr_node_id = M.pr_node_id(latest)
   if pr_node_id == "" then
-    notifications.error("GitHub draft status update failed: missing pull request node id", "DiffReview")
+    notifications.error("GitHub PR state update failed: missing pull request node id", "DiffReview")
     done(false)
     return
   end
 
-  gh.set_pr_draft_async(latest.cwd, pr_node_id, desired_draft, function(result)
+  local current_state = pr_overview().status_text(latest.pr)
+  gh.set_pr_state_async(latest.cwd, pr_node_id, current_state, desired_state, function(result)
     if not vim.api.nvim_buf_is_valid(buf) then
       done(false)
       return
     end
+    if result.state and result.state ~= "" then latest.pr.state = result.state end
+    if type(result.is_draft) == "boolean" then latest.pr.isDraft = result.is_draft end
     if not result.ok then
-      notifications.error("GitHub draft status update failed: " .. (result.message or "gh failed"), "DiffReview")
+      M.patch_status_row(buf, latest)
+      notifications.error("GitHub PR state update failed: " .. (result.message or "gh failed"), "DiffReview")
       done(false)
       return
     end
-    latest.pr.isDraft = type(result.is_draft) == "boolean" and result.is_draft or desired_draft
+    latest.pr.state = result.state and result.state ~= "" and result.state or (desired_state == "CLOSED" and "CLOSED" or "OPEN")
+    latest.pr.isDraft = type(result.is_draft) == "boolean" and result.is_draft or desired_state == "DRAFT"
     M.patch_status_row(buf, latest)
     vim.notify(("PR #%s status updated: %s"):format(tostring(latest.pr.number), pr_overview().status_text(latest.pr)), vim.log.levels.INFO, { title = "DiffReview" })
     done(true)
@@ -1286,19 +1289,21 @@ end
 
 ---@param buf integer
 ---@return boolean
-function M.toggle_draft_status_under_cursor(buf)
+function M.choose_pr_state_under_cursor(buf)
   if not M.cursor_on_status_value(buf) then return false end
   local status = session.states and session.states[buf] or session.status
   local state = status and status.pr_edit or nil
   if not (status and status.pr and state) then return true end
-  local desired_draft = not status.pr.isDraft
-  status_helpers.confirm(M.draft_status_confirmation_lines(status.pr, desired_draft), function()
-    M.enqueue(state, function(done)
-      M.apply_draft_status(buf, status, desired_draft, function()
-        done()
+  choice_popup.open({
+    title = ("PR #%s state"):format(tostring(status.pr.number)),
+    options = M.pr_state_options(status.pr),
+    on_choice = function(desired_state)
+      if not desired_state then return end
+      M.enqueue(state, function(done)
+        M.apply_pr_state(buf, status, desired_state, function() done() end)
       end)
-    end)
-  end)
+    end,
+  })
   return true
 end
 
@@ -1428,6 +1433,7 @@ function M.sync_modifiable(buf)
     if vim.bo[buf].modifiable ~= wanted then
       vim.bo[buf].modifiable = wanted
     end
+    review_mod().sync_command_keymaps(buf)
     trace.span("pr_edit.render_description_markdown", buf, {
       row = row,
       editable = wanted,
@@ -1460,8 +1466,14 @@ function M.attach(buf)
   vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI", "BufEnter" }, {
     group = group,
     buffer = buf,
-    callback = function()
+    callback = function(event)
       trace.span("pr_edit.autocmd_sync_modifiable", buf, nil, function()
+        if event.event == "CursorMoved" or event.event == "CursorMovedI" then
+          local promoted = review_mod().promote_comment_box_under_cursor(buf)
+          if not promoted then
+            review_mod().collapse_focused_comment_if_cursor_left(buf)
+          end
+        end
         M.sync_modifiable(buf)
       end)
     end,
@@ -1472,6 +1484,7 @@ function M.attach(buf)
     callback = function()
       trace.span("pr_edit.autocmd_text_changed", buf, nil, function()
         review_mod().sync_inline_comment_text(buf)
+        pr_overview().sync_reply_draft_text(buf)
         M.refresh_markers(buf)
         M.render_description_markdown(buf)
       end)
@@ -1482,6 +1495,7 @@ function M.attach(buf)
     buffer = buf,
     callback = function()
       review_mod().sync_inline_comment_text(buf)
+      pr_overview().sync_reply_draft(buf)
       pr_overview().sync_standalone_comments(buf)
       M.sync(buf)
     end,

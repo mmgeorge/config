@@ -18,11 +18,31 @@ local function commands() return require("diff_review.views.commands") end
 -- so this edge stays lazy to avoid a load-time circular require.
 local function status_head() return require("diff_review.views.status.status_head") end
 local status_helpers = require("diff_review.views.status.status_helpers")
+local choice_popup = require("diff_review.infra.choice_popup")
 local notifications = require("diff_review.infra.notifications")
 local session = require("diff_review.session")
 
 -- Forward-declare so status_start_pr_lookup can capture the open action as an upvalue.
 local status_open_pr
+
+--- Select the newest active PR and newest closed fallback for one branch.
+---@param prs DiffReviewGhPR[]?
+---@return DiffReviewGhPR? active
+---@return DiffReviewGhPR? closed
+function M.select_branch_pr(prs)
+  local ordered = vim.deepcopy(prs or {})
+  table.sort(ordered, function(left, right)
+    return tonumber(left.number) > tonumber(right.number)
+  end)
+  local active
+  local closed
+  for _, pr in ipairs(ordered) do
+    local state = tostring(pr.state or "OPEN"):upper()
+    if not active and state == "OPEN" then active = pr end
+    if not closed and state == "CLOSED" then closed = pr end
+  end
+  return active, closed
+end
 
 local function status_start_pr_lookup(cwd, buf, request_id)
   if not vim.api.nvim_buf_is_valid(buf) then return end
@@ -31,7 +51,7 @@ local function status_start_pr_lookup(cwd, buf, request_id)
   if status.pr.lookup_started then return end
   status.pr.lookup_started = true
 
-  local function complete_pr_lookup(result)
+  local function complete_pr_lookup(result, resolved_state)
     local latest_status = session.states and session.states[buf] or session.status
     if not (latest_status and latest_status.pr_request_id == request_id and latest_status.pr_root == cwd) then return end
     session.status = latest_status
@@ -39,7 +59,7 @@ local function status_start_pr_lookup(cwd, buf, request_id)
     local pending_open_win = latest_status.pr and latest_status.pr.open_when_ready_win
 
     if result.ok and result.pr then
-      latest_status.pr = { state = "ready", pr = result.pr, lookup_started = true }
+      latest_status.pr = { state = resolved_state or "ready", pr = result.pr, lookup_started = true }
     elseif result.ok and result.unavailable then
       latest_status.pr = { state = "unavailable", message = result.message, lookup_started = true }
     elseif result.ok then
@@ -94,7 +114,29 @@ local function status_start_pr_lookup(cwd, buf, request_id)
     return
   end
 
-  gh.current_pr_async(cwd, complete_pr_lookup)
+  local branch = status.head_values and status.head_values.branch or nil
+  if not branch or branch == "" or branch == "HEAD" then
+    gh.current_pr_async(cwd, complete_pr_lookup)
+    return
+  end
+
+  gh.prs_for_branch_async(cwd, branch, nil, function(result)
+    local latest_status = session.states and session.states[buf] or session.status
+    if not (latest_status and latest_status.pr_request_id == request_id and latest_status.pr_root == cwd) then return end
+    if not result.ok or result.unavailable then
+      complete_pr_lookup(result)
+      return
+    end
+    local active, closed = M.select_branch_pr(result.prs)
+    local candidate = active or closed
+    if not candidate then
+      complete_pr_lookup({ ok = true })
+      return
+    end
+    gh.pr_async(cwd, candidate.number, candidate.repo, function(detail_result)
+      complete_pr_lookup(detail_result, active and "ready" or "closed")
+    end)
+  end)
 end
 
 ---@param cwd string
@@ -191,12 +233,36 @@ local function status_ensure_about_state(cwd, buf, has_changes, force, allow_gen
 end
 
 status_open_pr = function(entry)
+  local current_pr_state = session.status and session.status.pr or nil
+  if current_pr_state
+    and current_pr_state.pr
+    and (current_pr_state.state == "closed" or tostring(current_pr_state.pr.state or ""):upper() == "CLOSED") then
+    local closed_pr = current_pr_state.pr
+    choice_popup.open({
+      title = "Closed pull request",
+      relative = "editor",
+      min_width = 38,
+      options = {
+        { key = "o", value = "open", label = ("Open closed PR #%s"):format(tostring(closed_pr.number)) },
+        { key = "c", value = "create", label = "Create a new draft PR" },
+      },
+      on_choice = function(choice)
+        if choice == "open" then
+          commands().open_pr(closed_pr, { cwd = session.status and session.status.cwd or nil })
+        elseif choice == "create" then
+          require("github.open_pr").open()
+        end
+      end,
+    })
+    return
+  end
+
   local pr = entry and entry.pr
-  if not pr and session.status and session.status.pr and session.status.pr.state == "ready" then
-    pr = session.status.pr.pr
+  if not pr and current_pr_state and current_pr_state.state == "ready" then
+    pr = current_pr_state.pr
   end
   if not pr then
-    local pr_state = session.status and session.status.pr
+    local pr_state = current_pr_state
     if pr_state and pr_state.state == "fetching" then
       pr_state.open_when_ready = true
       pr_state.open_when_ready_win = vim.api.nvim_get_current_win()

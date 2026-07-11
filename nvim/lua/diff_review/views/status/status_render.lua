@@ -593,23 +593,19 @@ local function status_render_file(file, entry_kind, hunk_entry_kind, file_key_ov
   local change_label, change_label_hl = git_data._status_file_change_label(file)
   local change_label_width = #"Modified"
   local padded_change_label = change_label .. string.rep(" ", math.max(0, change_label_width - #change_label))
-  local line = ("%s%s %s %s"):format(string.rep(" ", status_file_indent), padded_change_label, file.relpath, stats)
-  local entry = { id = file_key, kind = entry_kind or "file", file = file, default_folded = default_folded }
-  local line_number = status_add_line(line, entry)
-  local label_start = status_file_indent
-  local label_end = label_start + #change_label
-  local path_start = label_start + #padded_change_label + 1
-  local stats_start = #line - #stats
-  status_add_highlight(line_number, label_start, label_end, change_label_hl)
-  status_add_highlight(line_number, path_start, stats_start - 1, "DiffReviewStatusPath")
-  for _, stat_segment in ipairs(stat_segments) do
-    status_add_highlight(
-      line_number,
-      stats_start + stat_segment.start_col,
-      stats_start + stat_segment.end_col,
-      stat_segment.hl_group
-    )
+  local file_segments = {}
+  if status_file_indent > 0 then file_segments[#file_segments + 1] = { string.rep(" ", status_file_indent) } end
+  file_segments[#file_segments + 1] = { change_label, change_label_hl }
+  local label_padding = padded_change_label:sub(#change_label + 1)
+  if label_padding ~= "" then file_segments[#file_segments + 1] = { label_padding } end
+  file_segments[#file_segments + 1] = { " " }
+  file_segments[#file_segments + 1] = { file.relpath, "DiffReviewStatusPath" }
+  file_segments[#file_segments + 1] = { " " }
+  for _, segment in ipairs(status_buffer.highlighted_text_segments(stats, stat_segments)) do
+    file_segments[#file_segments + 1] = segment
   end
+  local entry = { id = file_key, kind = entry_kind or "file", file = file, default_folded = default_folded }
+  local line_number = status_add_segment_line(file_segments, entry)
 
   local file_folded = (not opts.force_open) and status_folded(file_key, default_folded)
   local render_folded_file_body = false
@@ -619,7 +615,7 @@ local function status_render_file(file, entry_kind, hunk_entry_kind, file_key_ov
   end
   diff_source_state._status_record_diff_file_header_state(file, entry_kind, hunk_entry_kind, file_key)
   if file_folded and not render_folded_file_body then
-    fold_state._status_register_fold_range(file_key, line_number, #session.status.lines, default_folded, session.status.lines[line_number])
+    fold_state._status_register_fold_range(file_key, line_number, #session.status.lines, default_folded, file_segments)
     return
   end
 
@@ -632,7 +628,7 @@ local function status_render_file(file, entry_kind, hunk_entry_kind, file_key_ov
   end)
   if #hunks == 0 then
     status_add_line(string.rep(" ", status_hunk_indent) .. "No textual diff", entry, "Comment")
-    fold_state._status_register_fold_range(file_key, line_number, #session.status.lines, default_folded, session.status.lines[line_number])
+    fold_state._status_register_fold_range(file_key, line_number, #session.status.lines, default_folded, file_segments)
     return
   end
   local display_hunks = trace.span("status_render.render_file.display_hunks", session.status and session.status.buf or nil, {
@@ -680,7 +676,7 @@ local function status_render_file(file, entry_kind, hunk_entry_kind, file_key_ov
       status_render_hunk(file, hunk, display_hunks[hunk_index - 1], display_hunks[hunk_index + 1], hunk_entry_kind, hunk_key)
     end
   end)
-  fold_state._status_register_fold_range(file_key, line_number, #session.status.lines, default_folded, session.status.lines[line_number])
+  fold_state._status_register_fold_range(file_key, line_number, #session.status.lines, default_folded, file_segments)
   end)
 end
 
@@ -975,7 +971,8 @@ local function status_apply_rendered_extmarks(buf)
   end
   for _, extmark in ipairs(session.status.extmarks or {}) do
     local extmark_opts = vim.tbl_extend("force", { priority = 95 }, extmark.opts)
-    pcall(vim.api.nvim_buf_set_extmark, buf, ui.status_ns, extmark.line - 1, extmark.col, extmark_opts)
+    local ok, extmark_id = pcall(vim.api.nvim_buf_set_extmark, buf, ui.status_ns, extmark.line - 1, extmark.col, extmark_opts)
+    if ok then extmark.id = extmark_id end
   end
 end
 
@@ -1020,6 +1017,7 @@ local function status_render_loaded(buf, target_id, fallback_line, opts, head_li
   session.status.highlights = {}
   session.status.line_highlights = {}
   session.status.extmarks = {}
+  session.status.comment_box_record_by_anchor = {}
   session.status.diff_row_spans = {}
   session.status.boundary_lines = {}
   session.status.fold_ranges_by_id = {}

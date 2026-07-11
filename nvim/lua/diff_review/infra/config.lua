@@ -90,6 +90,7 @@ M.defaults = {
     status = {
       close = "q",
       refresh = "R",
+      reply = "R",
       toggle = "<Tab>",
       collapse_parent = "N",
       visual_line_with_gutter = "W",

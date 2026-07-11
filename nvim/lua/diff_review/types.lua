@@ -96,7 +96,7 @@
 
 ---@class DiffReviewStatusEntry
 ---@field id? string
----@field kind "section"|"file"|"hunk"|"context_line"|"commit"|"commit_message"|"commit_file"|"commit_hunk"|"pr_file"|"pr_hunk"|"pr_comment"|"pr_comment_reply"|"pr_review"|"pr_review_file"|"pr_review_hunk"|"review_comment"|"pr"|"about"|"pr_check"|"pr_head_section"|"pr_head_line"
+---@field kind "section"|"file"|"hunk"|"context_line"|"commit"|"commit_message"|"commit_file"|"commit_hunk"|"pr_file"|"pr_hunk"|"pr_comment"|"pr_comment_reply"|"pr_review"|"pr_review_file"|"pr_review_hunk"|"review_comment"|"comment_box"|"pr"|"about"|"pr_check"|"pr_head_section"|"pr_head_line"
 ---@field section? DiffReviewStatusSection
 ---@field file? DiffReviewStatusFile
 ---@field hunk? DiffReviewHunk
@@ -108,6 +108,16 @@
 ---@field pr_comment_reply? DiffReviewGhReviewCommentReply
 ---@field review_comment? table
 ---@field review_reply? table
+---@field review_readonly_body? boolean
+---@field review_reply_draft? DiffReviewPrReplyDraft
+---@field review_reply_draft_body? boolean
+---@field review_reply_draft_body_index? integer
+---@field comment_box? DiffReviewCommentDescriptor
+---@field comment_box_source? table
+---@field comment_box_index? integer
+---@field comment_box_anchor_line? integer
+---@field comment_box_anchor_entry_id? string
+---@field comment_box_boundary? "header"|"body"|"footer"
 ---@field diff_line? table
 ---@field pr? DiffReviewGhPR
 ---@field pr_check? DiffReviewGhPRCheck
@@ -122,7 +132,7 @@
 ---@alias DiffReviewStatusViewKind "status"|"pr"|"diff"|"review"
 
 ---@class DiffReviewStatusPRState
----@field state "fetching"|"ready"|"none"|"unavailable"|"error"
+---@field state "fetching"|"ready"|"closed"|"none"|"unavailable"|"error"
 ---@field pr? DiffReviewGhPR
 ---@field message? string
 ---@field lookup_started? boolean

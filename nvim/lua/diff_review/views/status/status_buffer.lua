@@ -29,12 +29,15 @@ end
 ---@param line integer
 ---@param col integer
 ---@param opts table
+---@return table extmark
 function M.add_extmark(state, line, col, opts)
-  state.extmarks[#state.extmarks + 1] = {
+  local extmark = {
     line = line,
     col = col,
     opts = opts,
   }
+  state.extmarks[#state.extmarks + 1] = extmark
+  return extmark
 end
 
 --- Run a status-buffer mutation with the buffer made writable, restoring modifiable and the
@@ -94,6 +97,41 @@ function M.segment_line_parts(segments)
     col = col + #text
   end
   return table.concat(parts), segment_highlights
+end
+
+--- Build display segments from byte-indexed highlight spans.
+---@param text string
+---@param highlights table[]
+---@return table[] segments
+function M.highlighted_text_segments(text, highlights)
+  text = tostring(text or "")
+  local ordered_highlights = {}
+  for _, highlight in ipairs(highlights or {}) do
+    ordered_highlights[#ordered_highlights + 1] = highlight
+  end
+  table.sort(ordered_highlights, function(left, right)
+    return (tonumber(left.start_col) or 0) < (tonumber(right.start_col) or 0)
+  end)
+
+  local segments = {}
+  local cursor_col = 0
+  local text_len = #text
+  for _, highlight in ipairs(ordered_highlights) do
+    local start_col = math.max(0, math.min(text_len, tonumber(highlight.start_col) or 0))
+    local end_col = math.max(start_col, math.min(text_len, tonumber(highlight.end_col) or start_col))
+    if start_col > cursor_col then
+      segments[#segments + 1] = { text:sub(cursor_col + 1, start_col) }
+    end
+    if end_col > start_col then
+      segments[#segments + 1] = { text:sub(start_col + 1, end_col), highlight.hl_group }
+    end
+    cursor_col = end_col
+  end
+  if cursor_col < text_len then
+    segments[#segments + 1] = { text:sub(cursor_col + 1) }
+  end
+  if #segments == 0 then segments[#segments + 1] = { text } end
+  return segments
 end
 
 ---@param state DiffReviewStatusState

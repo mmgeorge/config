@@ -114,6 +114,7 @@ diff_review/
 │   ├── syntax_engine.lua      Async tree-sitter syntax + hunk-context producer with three caches + prewarm
 │   ├── syntax_context.lua     Per-file tree-sitter parse state (snapshot/parser/tree/query) → highlight spans
 │   ├── diff_render.lua        Build fancy-diff rows (gutter/boundary/body) and apply them as buffer extmarks
+│   ├── comment_box.lua        Shared compact box rows; walkthroughs reuse them as virtual lines
 │   ├── layout.lua             Fenwick (binary-indexed) tree mapping items → buffer rows in O(log n)
 │   ├── row_tree.lua           Logical node tree (hunks/padding/annotations) kept in row-sync via layout
 │   ├── region.lua             Extmark-anchored buffer region with dirty tracking
@@ -136,6 +137,7 @@ diff_review/
 │
 ├── infra/                    Cross-cutting leaves
 │   ├── config.lua             Config schema + defaults + setup merge (keymaps, perf, lookup mode)
+│   ├── choice_popup.lua       Shared keyboard chooser for lifecycle, closed-PR, and verdict menus
 │   ├── highlights.lua         Define every DiffReview highlight group from the active colorscheme
 │   ├── notifications.lua      Centralized error + git-failure notifications
 │   ├── perf.lua               JSON event/span profiler gated by config
@@ -419,6 +421,17 @@ keep the cursor from stepping into that virtual gutter.
   top of `layout`, keeping each node's row span in sync as content changes.
 - **`region.lua`** — a buffer range anchored by two extmarks with dirty tracking, used
   for editable comment regions that must survive surrounding edits.
+- **`comment_box.lua`** — builds every compact inline PR, submitted-review,
+  batched-review, and walkthrough comment through one segmented box primitive.
+  Interactive surfaces emit those segments as real status-buffer rows, which lets normal
+  cursor movement enter a box. Walkthroughs reuse the segments as readonly virtual lines.
+  `section_builder.emit_anchored_comments` dispatches the cursor-selected occurrence to
+  full-width editable rows only while its stable diff-entry ID owns focus, so duplicate
+  appearances under Reviews and Changes cannot both become editable. The primitive wraps
+  by display cells, splits unbroken text, preserves same-anchor order, and requests a
+  status re-render on resize. Save preserves focus. The shared review cursor lifecycle
+  clears focus and restores the compact rows only after the cursor leaves the selected
+  comment's header, body, replies, and footer.
 - **`annotations.lua`** — the review-comment model: a by-anchor index, a per-comment sync
   state machine (`new`/`dirty`/`clean`/`deleted`/`conflict`), and a **serial sync queue**
   that drains dirty comments to the remote one at a time, rejecting stale completions by
@@ -501,8 +514,44 @@ restore), `pr_state.lua` (async PR + AI-about lookup with request-id race guards
 
 Renders a PR into a `GitStatus` buffer (`view_kind = "pr"`): the metadata header,
 foldable checks section (with status icons), submitted-review summaries
-(approved/changes-requested/commented), and inline issue/review comments laid out by the
-`github.comment_rows` engine. It loads comments and checks asynchronously through `gh`.
+(approved/changes-requested/commented), regular issue comments laid out by
+`github.comment_rows`, and inline review comments dispatched through the shared anchored
+comment-box renderer. Expanding a submitted review reuses the same box path as Changes.
+Entering a compact box row promotes only that occurrence to editable buffer rows. `C`
+creates a new comment instead of selecting an existing one. Viewer-authored snapshots resolve through the PR-owned editable
+store before either render mode. GitHub update responses preserve replies they do not
+include, while deletion removes the identity from the editable store, flattened code
+comments, and nested submitted-review comments before re-rendering. It loads comments and
+checks asynchronously through `gh`. Existing replies render as internal divided blocks
+inside one outer comment box. In this PR surface only, `R` stays bound across compact and
+focused remote comment modes and creates a PR-owned inline reply draft below the selected
+thread. `section_builder.emit_anchored_comments` expands that occurrence through the same
+full-width comment renderer while keeping the parent and posted replies readonly. The reply
+body alone receives an editable extmark region. `<C-s>` posts it through GitHub's
+review-comment reply endpoint, `J` discards it, and leaving the body collapses a nonempty
+draft back into the merged compact thread. The same key falls back to PR refresh away from
+an inline comment.
+
+The status row models the PR lifecycle as `DRAFT`, `OPEN`, or `CLOSED`.
+Activating it opens `infra.choice_popup` with exactly the other two states.
+`pr_edit` serializes the chosen transition through its mutation queue, while
+`gh.set_pr_state_async` maps the lifecycle edge to close, reopen, ready, or
+convert-to-draft GraphQL mutations. Closed-to-draft and closed-draft-to-open
+transitions compose two calls and return the intermediate state when the
+second call fails, keeping the local label synchronized with GitHub.
+
+GitStatus resolves `ogp` through a branch-wide PR list. `pr_state` sorts the
+results by descending PR number, selects the newest active PR across ready and
+draft states, and opens it directly. Without an active PR, it retains the
+newest closed candidate and uses the shared chooser to open that PR or start a
+new draft PR. Merged PRs never become closed fallbacks.
+
+Top-level issue comments under `Comments` remain a separate foldable-list flow. They
+start as one metadata/preview row and cursor movement never opens them. The status-family
+open command (`o`, `<CR>`, or `.` by default) expands the selected comment, while
+`<Tab>` collapses it. Expanded comments retain their fold state when the cursor leaves.
+Viewer-authored bodies become editable through their rendered body regions without
+entering the inline annotation focus lifecycle.
 
 ### PR edit (`views/pr/pr_edit.lua`)
 
@@ -519,7 +568,11 @@ the reviewer comment per hunk, mark files viewed/unviewed, pick a verdict, and s
 comment carries `body` (current), `base_body` (last synced), and `remote_body` (on
 conflict) plus a `local_state` machine. Mutations flow through the `annotations` serial
 sync queue, and the draft is persisted to the `github.repo_cache` so a closed buffer
-never loses pending comments.
+never loses pending comments. Unfocused comments use the shared compact-row renderer.
+Cursor entry promotes the selected box to full-width editable rows and tracks the selected
+diff entry by stable ID so re-rendering can collapse a previous editor without losing
+focus. `C` creates a new comment from a changed line. `J` resolves the exact comment row
+under the cursor, while `y`/`z` navigate across both representations.
 
 ### Reviewer source (`views/pr/reviewer_source.lua`)
 
@@ -609,6 +662,9 @@ branch-create action) behind a reader seam so tests never hit the filesystem.
 
 - **`config.lua`** — the `DiffReviewConfig` schema, defaults, and the `setup` deep-merge.
   Owns buffer names, perf options, the PR-lookup mode, and the full keymap config.
+- **`choice_popup.lua`** — renders a small keyboard-driven chooser from typed options,
+  centralizing option keys, `q`/`<Esc>` cancellation, popup sizing, and callback cleanup.
+  PR lifecycle changes, closed-PR resolution, and review verdict selection reuse it.
 - **`highlights.lua`** — defines every DiffReview highlight group at setup, deriving
   backgrounds from the active colorscheme so the diff colors track the theme.
 - **`notifications.lua`** — centralized `error` and `git_failures` notifications.
@@ -699,7 +755,9 @@ open_review(pr)
   └─ views/commands.open_review (view_kind = "review")
        ├─ review.load_draft (disk)  +  review.load_remote_before_open (GitHub)
        ├─ review.merge (conflict detection)
-       └─ review.render → Unviewed/Viewed sections with inline comment rows
+       └─ review.render → Unviewed/Viewed sections with anchored comment boxes
+            enter box → selected occurrence becomes full-width editable rows
+            press C on changed line → create and focus a new comment
             press cc → comment input → annotations sync queue → gh review comment
             submit  → flush sync queue → gh submit review (verdict)
 ```
@@ -745,7 +803,7 @@ press the commit key
 ## 16. Testing and linting
 
 The headless suite lives in `nvim/tests/diff_review/` and runs via
-`pwsh -File nvim/tools/run_tests.ps1` (expect `TESTS PASS=29 FAIL=0` and
+`pwsh -File nvim/tools/run_tests.ps1` (expect `TESTS PASS=32 FAIL=0` and
 `WHITESPACE: CLEAN`). `tests/diff_review/mock_backend.lua` injects a fake git backend so
 tests never touch a real repo. `diff_architecture.lua` guards the render-engine extraction
 boundaries.

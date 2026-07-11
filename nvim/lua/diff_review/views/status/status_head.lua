@@ -99,10 +99,11 @@ local function status_pr_head_line(pr_state)
 
   if not pr_state or pr_state.state == "fetching" then
     segments[#segments + 1] = { "...fetching...", "DiffReviewStatusFetching" }
-  elseif pr_state.state == "ready" and pr_state.pr then
+  elseif (pr_state.state == "ready" or pr_state.state == "closed") and pr_state.pr then
     entry.pr = pr_state.pr
     local subject = pr_state.pr.title ~= "" and pr_state.pr.title or ("PR #" .. tostring(pr_state.pr.number))
     vim.list_extend(segments, conventional_commit.subject_segments(subject, "DiffReviewStatusPR"))
+    if pr_state.state == "closed" then segments[#segments + 1] = { " [closed]", "DiffReviewStatusClosed" } end
   elseif pr_state.state == "error" then
     segments[#segments + 1] = { "error", "ErrorMsg" }
   elseif pr_state.state == "unavailable" then
@@ -362,7 +363,7 @@ local function status_pr_detail_head_lines(pr, status)
   lines[#lines + 1] = {
     segments = {
       { "Status: ", "DiffReviewStatusLabel" },
-      { pr_overview().status_text(pr), pr.isDraft and "DiffReviewStatusFetching" or "DiffReviewStatusBranch" },
+      { pr_overview().status_text(pr), pr_overview().status_highlight(pr) },
     },
   }
   lines[#lines + 1] = {

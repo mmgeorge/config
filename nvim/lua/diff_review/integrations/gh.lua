@@ -53,10 +53,21 @@
 ---@field requestedReviewers? DiffReviewGhRequestedReviewer[]
 ---@field milestone? DiffReviewGhMilestone
 ---@field isDraft boolean
+---@field state string
+---@field createdAt? string
+---@field updatedAt? string
+---@field closedAt? string
 
 ---@class DiffReviewGhPRResult
 ---@field ok boolean
 ---@field pr? DiffReviewGhPR
+---@field message? string
+---@field code? integer
+---@field unavailable? boolean
+
+---@class DiffReviewGhPRListResult
+---@field ok boolean
+---@field prs? DiffReviewGhPR[]
 ---@field message? string
 ---@field code? integer
 ---@field unavailable? boolean
@@ -143,6 +154,12 @@
 ---@field message? string
 ---@field code? integer
 
+---@class DiffReviewGhReviewReplyResult
+---@field ok boolean
+---@field reply? DiffReviewGhReviewCommentReply
+---@field message? string
+---@field code? integer
+
 ---@class DiffReviewGhPendingReview
 ---@field id integer
 ---@field node_id string
@@ -161,6 +178,13 @@
 
 ---@class DiffReviewGhPrDraftResult
 ---@field ok boolean
+---@field is_draft? boolean
+---@field message? string
+---@field code? integer
+
+---@class DiffReviewGhPrStateResult
+---@field ok boolean
+---@field state? string
 ---@field is_draft? boolean
 ---@field message? string
 ---@field code? integer
@@ -192,6 +216,25 @@ local pr_json_fields = table.concat({
   "reviewRequests",
   "milestone",
   "isDraft",
+  "state",
+  "createdAt",
+  "updatedAt",
+  "closedAt",
+}, ",")
+
+local pr_list_json_fields = table.concat({
+  "id",
+  "number",
+  "title",
+  "body",
+  "url",
+  "headRefName",
+  "headRefOid",
+  "state",
+  "isDraft",
+  "createdAt",
+  "updatedAt",
+  "closedAt",
 }, ",")
 
 ---@param backend DiffReviewGhBackend?
@@ -465,6 +508,8 @@ local function normalize_pr(raw, repo)
   end
 
   local normalized_repo = repo or M.repo_from_pr_url(raw.url)
+  local state = tostring(raw.state or ""):upper()
+  if state == "" then state = raw.closed == true and "CLOSED" or "OPEN" end
   return {
     id = type(raw.id) == "string" and raw.id or nil,
     number = as_integer(raw.number),
@@ -482,6 +527,10 @@ local function normalize_pr(raw, repo)
     requestedReviewers = normalize_requested_reviewers(raw),
     milestone = normalize_milestone(raw.milestone),
     isDraft = raw.isDraft == true or raw.is_draft == true,
+    state = state,
+    createdAt = raw.createdAt or raw.created_at,
+    updatedAt = raw.updatedAt or raw.updated_at,
+    closedAt = raw.closedAt or raw.closed_at,
   }
 end
 
@@ -538,6 +587,57 @@ function M.current_pr_async(cwd, cb)
     end
 
     cb({ ok = true, pr = normalize_pr(decoded) })
+  end)
+end
+
+---@param branch string
+---@param repo? string
+---@return DiffReviewGhCommand
+local function pr_list_command(branch, repo)
+  local command = {
+    "gh", "pr", "list",
+    "--head", branch,
+    "--state", "all",
+    "--limit", "100",
+    "--json", pr_list_json_fields,
+  }
+  if repo and repo ~= "" then vim.list_extend(command, { "--repo", repo }) end
+  return command
+end
+
+--- List every PR for one branch so callers can apply lifecycle selection policy.
+---@param cwd string
+---@param branch string
+---@param repo? string
+---@param cb fun(result: DiffReviewGhPRListResult)
+function M.prs_for_branch_async(cwd, branch, repo, cb)
+  if type(branch) ~= "string" or branch == "" or branch == "HEAD" then
+    cb({ ok = false, message = "PR lookup requires a named branch", code = 1 })
+    return
+  end
+  system_text_async(pr_list_command(branch, repo), nil, cwd, function(result)
+    if result.code ~= 0 then
+      local output = result.output or ""
+      if is_no_pr_output(output) then
+        cb({ ok = true, prs = {} })
+      elseif is_pr_lookup_unavailable_output(output) then
+        cb({ ok = true, unavailable = true, message = output })
+      else
+        cb({ ok = false, message = output ~= "" and output or ("gh exited " .. result.code), code = result.code })
+      end
+      return
+    end
+
+    local ok, decoded = pcall(vim.json.decode, result.stdout or "")
+    if not ok or type(decoded) ~= "table" then
+      cb({ ok = false, message = "gh pr list returned invalid JSON", code = result.code })
+      return
+    end
+    local prs = {}
+    for _, raw in ipairs(decoded) do
+      if type(raw) == "table" then prs[#prs + 1] = normalize_pr(raw, repo) end
+    end
+    cb({ ok = true, prs = prs })
   end)
 end
 
@@ -910,7 +1010,6 @@ local function normalize_review_comment(raw, thread)
     url = browser_url(raw),
     resolved = thread.isResolved,
     outdated = thread.isOutdated,
-    replies = {},
   }
 end
 
@@ -920,6 +1019,7 @@ local function normalize_review_thread(thread)
   local nodes = thread.comments and thread.comments.nodes or {}
   if type(nodes) ~= "table" or type(nodes[1]) ~= "table" then return nil end
   local comment = normalize_review_comment(nodes[1], thread)
+  comment.replies = {}
   for node_index = 2, #nodes do
     local reply = nodes[node_index]
     if type(reply) == "table" then comment.replies[#comment.replies + 1] = normalize_review_reply(reply) end
@@ -1032,6 +1132,38 @@ end
 
 ---@param cwd string
 ---@param pr_node_id string
+---@param mutation string
+---@param input_type string
+---@param cb fun(result: DiffReviewGhPrStateResult)
+local function mutate_pr_state_async(cwd, pr_node_id, mutation, input_type, cb)
+  local query = table.concat({
+    ("mutation($input:%s!) {"):format(input_type),
+    ("  %s(input:$input) {"):format(mutation),
+    "    pullRequest { id state isDraft }",
+    "  }",
+    "}",
+  }, "\n")
+  graphql_async(query, { input = { pullRequestId = pr_node_id } }, cwd, function(result)
+    if result.code ~= 0 then
+      cb({ ok = false, message = result.output ~= "" and result.output or ("gh exited " .. tostring(result.code)), code = result.code })
+      return
+    end
+    local decoded = decode_json(result.stdout)
+    local pull_request = decoded and decoded.data and decoded.data[mutation] and decoded.data[mutation].pullRequest
+    if type(pull_request) ~= "table" then
+      cb({ ok = false, message = "gh api returned invalid PR state JSON", code = result.code })
+      return
+    end
+    cb({
+      ok = true,
+      state = tostring(pull_request.state or ""):upper(),
+      is_draft = pull_request.isDraft == true or pull_request.is_draft == true,
+    })
+  end)
+end
+
+---@param cwd string
+---@param pr_node_id string
 ---@param draft boolean
 ---@param cb fun(result: DiffReviewGhPrDraftResult)
 function M.set_pr_draft_async(cwd, pr_node_id, draft, cb)
@@ -1042,27 +1174,70 @@ function M.set_pr_draft_async(cwd, pr_node_id, draft, cb)
 
   local mutation = draft and "convertPullRequestToDraft" or "markPullRequestReadyForReview"
   local input_type = draft and "ConvertPullRequestToDraftInput" or "MarkPullRequestReadyForReviewInput"
-  local query = table.concat({
-    ("mutation($input:%s!) {"):format(input_type),
-    ("  %s(input:$input) {"):format(mutation),
-    "    pullRequest { id isDraft }",
-    "  }",
-    "}",
-  }, "\n")
-
-  graphql_async(query, { input = { pullRequestId = pr_node_id } }, cwd, function(result)
-    if result.code ~= 0 then
-      cb({ ok = false, message = result.output ~= "" and result.output or ("gh exited " .. tostring(result.code)), code = result.code })
-      return
-    end
-    local decoded = decode_json(result.stdout)
-    local pull_request = decoded and decoded.data and decoded.data[mutation] and decoded.data[mutation].pullRequest
-    if type(pull_request) ~= "table" then
-      cb({ ok = false, message = "gh api returned invalid PR draft status JSON", code = result.code })
-      return
-    end
-    cb({ ok = true, is_draft = pull_request.isDraft == true or pull_request.is_draft == true })
+  mutate_pr_state_async(cwd, pr_node_id, mutation, input_type, function(result)
+    cb({ ok = result.ok, is_draft = result.is_draft, message = result.message, code = result.code })
   end)
+end
+
+--- Move a PR between DRAFT, OPEN, and CLOSED, composing reopen then draft when required.
+---@param cwd string
+---@param pr_node_id string
+---@param current_state string
+---@param desired_state string
+---@param cb fun(result: DiffReviewGhPrStateResult)
+function M.set_pr_state_async(cwd, pr_node_id, current_state, desired_state, cb)
+  if type(pr_node_id) ~= "string" or pr_node_id == "" then
+    cb({ ok = false, message = "PR state update requires a pull request node id", code = 1 })
+    return
+  end
+  current_state = tostring(current_state or ""):upper()
+  desired_state = tostring(desired_state or ""):upper()
+  if desired_state ~= "DRAFT" and desired_state ~= "OPEN" and desired_state ~= "CLOSED" then
+    cb({ ok = false, message = "Unsupported PR state: " .. desired_state, code = 1 })
+    return
+  end
+  if current_state == desired_state then
+    cb({ ok = true, state = desired_state == "DRAFT" and "OPEN" or desired_state, is_draft = desired_state == "DRAFT" })
+    return
+  end
+
+  if desired_state == "CLOSED" then
+    mutate_pr_state_async(cwd, pr_node_id, "closePullRequest", "ClosePullRequestInput", cb)
+    return
+  end
+  if current_state == "CLOSED" then
+    mutate_pr_state_async(cwd, pr_node_id, "reopenPullRequest", "ReopenPullRequestInput", function(reopen_result)
+      if not reopen_result.ok then
+        cb(reopen_result)
+        return
+      end
+      local reopened_draft = reopen_result.is_draft == true
+      if desired_state == "OPEN" and not reopened_draft then
+        cb(reopen_result)
+        return
+      end
+      if desired_state == "DRAFT" and reopened_draft then
+        cb(reopen_result)
+        return
+      end
+      local draft = desired_state == "DRAFT"
+      local mutation = draft and "convertPullRequestToDraft" or "markPullRequestReadyForReview"
+      local input_type = draft and "ConvertPullRequestToDraftInput" or "MarkPullRequestReadyForReviewInput"
+      mutate_pr_state_async(cwd, pr_node_id, mutation, input_type, function(final_result)
+        if not final_result.ok then
+          final_result.state = reopen_result.state ~= "" and reopen_result.state or "OPEN"
+          final_result.is_draft = reopen_result.is_draft
+        end
+        cb(final_result)
+      end)
+    end)
+    return
+  end
+
+  local draft = desired_state == "DRAFT"
+  local mutation = draft and "convertPullRequestToDraft" or "markPullRequestReadyForReview"
+  local input_type = draft and "ConvertPullRequestToDraftInput" or "MarkPullRequestReadyForReviewInput"
+  mutate_pr_state_async(cwd, pr_node_id, mutation, input_type, cb)
 end
 
 ---@param cwd string
@@ -1412,6 +1587,38 @@ function M.create_pr_review_comment_async(cwd, number, repo, opts, cb)
     end
     cb({ ok = true, comments = { normalize_review_comment(decoded) } })
   end)
+end
+
+--- Create a reply under a top-level pull-request review comment.
+---@param cwd string
+---@param number integer|string
+---@param repo string?
+---@param comment_id integer|string
+---@param body string
+---@param cb fun(result: DiffReviewGhReviewReplyResult)
+function M.create_review_comment_reply_async(cwd, number, repo, comment_id, body, cb)
+  if not comment_id or tostring(comment_id) == "" then
+    cb({ ok = false, message = "review comment reply requires a top-level comment id", code = 1 })
+    return
+  end
+  local suffix = ("comments/%s/replies"):format(tostring(comment_id))
+  system_text_async(
+    { "gh", "api", "--method", "POST", pr_api_path(number, repo, suffix), "--input", "-" },
+    vim.json.encode({ body = body }),
+    cwd,
+    function(result)
+      if result.code ~= 0 then
+        cb({ ok = false, message = result.output ~= "" and result.output or ("gh exited " .. result.code), code = result.code })
+        return
+      end
+      local decoded = decode_json(result.stdout)
+      if not decoded then
+        cb({ ok = false, message = "gh api returned invalid review reply JSON", code = result.code })
+        return
+      end
+      cb({ ok = true, reply = normalize_review_reply(decoded), code = result.code })
+    end
+  )
 end
 
 ---@param cwd string

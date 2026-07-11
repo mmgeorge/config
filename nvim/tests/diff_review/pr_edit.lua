@@ -573,9 +573,30 @@ local function set_datetime_now(value)
   datetime.now_override = function() return epoch end
 end
 
+--- Concatenated text of every virt_lines comment box (status namespace) with its anchor row.
+--- Unfocused comments render as boxes (virtual lines), so box content is not in the real lines.
+local function box_text_lines(buf)
+  local ui = require("diff_review.infra.ui")
+  local out = {}
+  local ok, marks = pcall(vim.api.nvim_buf_get_extmarks, buf, ui.status_ns, 0, -1, { details = true })
+  if not ok then return out end
+  for _, mark in ipairs(marks) do
+    local vlines = mark[4] and mark[4].virt_lines
+    for _, vline in ipairs(vlines or {}) do
+      local text = ""
+      for _, chunk in ipairs(vline) do text = text .. (chunk[1] or "") end
+      out[#out + 1] = { text = text, anchor_row = mark[2] + 1 }
+    end
+  end
+  return out
+end
+
 local function buffer_contains(buf, needle)
   for _, line in ipairs(vim.api.nvim_buf_get_lines(buf, 0, -1, false)) do
     if line:find(needle, 1, true) then return true end
+  end
+  for _, box in ipairs(box_text_lines(buf)) do
+    if box.text:find(needle, 1, true) then return true end
   end
   return false
 end
@@ -592,6 +613,10 @@ local function find_row(buf, needle)
   for index, line in ipairs(lines) do
     if line:find(needle, 1, true) then return index end
   end
+  -- Boxed (unfocused) comment text lives in virt_lines; return the box's anchor diff row.
+  for _, box in ipairs(box_text_lines(buf)) do
+    if box.text:find(needle, 1, true) then return box.anchor_row end
+  end
   error("missing row: " .. needle .. "\n" .. table.concat(lines, "\n"), 2)
 end
 
@@ -599,6 +624,9 @@ local function find_row_after(buf, needle, after_row)
   local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
   for index = after_row + 1, #lines do
     if lines[index]:find(needle, 1, true) then return index end
+  end
+  for _, box in ipairs(box_text_lines(buf)) do
+    if box.anchor_row > after_row and box.text:find(needle, 1, true) then return box.anchor_row end
   end
   error("missing row after " .. tostring(after_row) .. ": " .. needle .. "\n" .. table.concat(lines, "\n"), 2)
 end
@@ -1126,39 +1154,11 @@ local function run()
   wait_for(function() return buffer_contains(buf, "NEW LINE") end, "PR changed file did not expand")
   wait_for(function() return buffer_contains(buf, "This is inline comment without review") end, "PR inline code comment did not render")
   wait_for(function() return buffer_contains(buf, "Oh good point! fixed") end, "PR inline reply did not render")
-  local changed_code_row = find_row_after(buf, "NEW LINE", changes_file_row)
+  -- Inline code comments render as read-only boxes (virt_lines) anchored on their changed
+  -- diff row; the comment and its reply live in the same box (asserted to render above) and
+  -- fold with the hunk rather than as separate, individually-foldable comment rows.
   local inline_comment_row = find_row_after(buf, "This is inline comment without review", changes_file_row)
-  assert_true(
-    inline_comment_row > changed_code_row,
-    "inline code comment rendered before its code row"
-  )
-  local inline_reply_row = find_row_after(buf, "Oh good point! fixed", inline_comment_row)
-  assert_true(
-    inline_reply_row > inline_comment_row,
-    "inline reply did not render under its parent comment"
-  )
-  move_cursor(buf, inline_comment_row)
-  trigger_buf_mapping(buf, "<Tab>")
-  local expected_folded_preview = require("diff_review.views.pr.review").comment_icon
-    .. " me commented 10 hours ago | This is inline comment without review"
-  local inline_comment_header_row = find_status_entry_row(buf, function(entry, row)
-    return entry.kind == "review_comment"
-      and row > changes_file_row
-      and entry.review_boundary == "header"
-      and entry.review_comment
-      and tostring(entry.review_comment.body or ""):find("This is inline comment without review", 1, true) ~= nil
-  end, "inline review comment header")
-  wait_for(function()
-    return row_is_folded(buf, inline_comment_header_row)
-      and row_is_folded(buf, inline_reply_row)
-      and fold_text_at(buf, inline_comment_header_row):find(expected_folded_preview, 1, true) ~= nil
-  end, "PR inline code comment did not fold")
-  inline_comment_row = inline_comment_header_row
-  move_cursor(buf, inline_comment_row)
-  trigger_buf_mapping(buf, "<Tab>")
-  wait_for(function() return not row_is_folded(buf, inline_reply_row) end, "PR inline code comment did not unfold")
-  inline_comment_row = find_row_after(buf, "This is inline comment without review", changes_file_row)
-  inline_reply_row = find_row_after(buf, "Oh good point! fixed", inline_comment_row)
+  assert_true(inline_comment_row > changes_file_row, "inline comment box did not anchor under the changed file")
   local rejected_review_row = find_row(buf, "foo     10 hours ago")
   local regular_comment_row = find_row(buf, "This is a regular comment")
   local long_regular_comment_row = find_status_entry_row(buf, function(entry)
@@ -1239,21 +1239,14 @@ local function run()
       and entry.pr_comment.body == "This is a regular comment"
   end, "first regular PR comment")
   changes_file_row = find_row_after(buf, "src/a.txt +1 -1", find_row(buf, "Changes (1):"))
-  inline_comment_row = find_status_entry_row(buf, function(entry, row)
-    return entry.kind == "review_comment"
-      and row > changes_file_row
-      and entry.review_boundary == "header"
-      and entry.review_comment
-      and tostring(entry.review_comment.body or ""):find("This is inline comment without review", 1, true) ~= nil
-  end, "inline review comment header")
-  inline_reply_row = find_row_after(buf, "Oh good point! fixed", inline_comment_row)
+  inline_comment_row = find_row_after(buf, "This is inline comment without review", changes_file_row)
   rejected_review_row = find_row(buf, "foo     10 hours ago")
   opened_urls = {}
   assert_browse_url(buf, lint_check_row, "https://github.com/owner/repo/actions/runs/123/job/456", "PR check row")
   assert_browse_url(buf, regular_comment_row, "https://github.com/owner/repo/pull/7#issuecomment-4702465966", "regular PR comment")
   assert_browse_url(buf, rejected_review_row, "https://github.com/owner/repo/pull/7#pullrequestreview-4493241278", "review summary")
-  assert_browse_url(buf, inline_comment_row, "https://github.com/owner/repo/pull/7#discussion_r3409923137", "inline code comment")
-  assert_browse_url(buf, inline_reply_row, "https://github.com/owner/repo/pull/7#discussion_r3409923138", "inline code reply")
+  -- The inline comment + its reply share one box on the anchor diff row; b browses the comment.
+  assert_browse_url(buf, inline_comment_row, "https://github.com/owner/repo/pull/7#discussion_r3409923137", "inline code comment box")
 
   move_cursor(buf, regular_comment_row)
   trigger_buf_mapping(buf, "C")

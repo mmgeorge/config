@@ -16,7 +16,7 @@ function M.setup()
   local modify_fg = "#ffb86c"
   local inline_add_bg = "#0b6b2a"
   local inline_del_bg = "#6a1010"
-  local review_comment_bg = "#2d2d2d"
+  local review_comment_bg = "#000000"
   local normal = vim.api.nvim_get_hl(0, { name = "Normal", link = false })
   local header_fg = normal.fg or "#c0c0c0"
   local keyword_modifier = vim.api.nvim_get_hl(0, { name = "@keyword.modifier", link = false })

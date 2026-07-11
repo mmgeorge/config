@@ -104,4 +104,4 @@ local function run()
 end
 
 run()
-vim.cmd("qa")
+vim.cmd("qa!")

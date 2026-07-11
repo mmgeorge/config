@@ -6,6 +6,7 @@
 --- perf span via session.lua and direct requires.
 
 local status_buffer = require("diff_review.views.status.status_buffer")
+local comment_box = require("diff_review.render.comment_box")
 
 local pr_edit = require("diff_review.views.pr.pr_edit")
 -- review edge kept lazy to avoid a load-time cycle.
@@ -34,11 +35,13 @@ local function set_status_folded(key, folded, state)
 end
 
 ---@param value any
----@return string
+---@return any
 function M._status_fold_text(value)
   if type(value) == "function" then
     local ok, text = pcall(value)
-    if ok then return tostring(text or "") end
+    if ok then return M._status_fold_text(text) end
+  elseif type(value) == "table" then
+    return value
   elseif value ~= nil then
     return tostring(value)
   end
@@ -245,6 +248,7 @@ end
 
 function M._refresh_status_windows_after_resize()
   if not session.states then return end
+  local refreshed_buffers = {}
   for _, win in ipairs(vim.api.nvim_list_wins()) do
     if vim.api.nvim_win_is_valid(win) then
       local buf = vim.api.nvim_win_get_buf(win)
@@ -252,6 +256,17 @@ function M._refresh_status_windows_after_resize()
       if state then
         window_options.apply(win, state)
         keymaps().status_apply_hint_bar(buf, win)
+        if not refreshed_buffers[buf] then
+          refreshed_buffers[buf] = true
+          local comment_layout_changed = comment_box.refresh_buffer(state)
+          if comment_layout_changed and (state.view_kind == "pr" or state.view_kind == "review") then
+            review().render_preserving_inline_cursor(buf)
+          else
+            M._status_apply_native_folds(buf)
+          end
+          local walkthrough = package.loaded["diff_review.views.walkthrough"]
+          if walkthrough and walkthrough.on_status_rendered then walkthrough.on_status_rendered(buf) end
+        end
         if state.view_kind == "review" and review and review().refresh_inline_comment_rules then
           local width = review().comment_rule_width(win, buf)
           if state.review_comment_rule_width ~= width then

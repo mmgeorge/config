@@ -302,7 +302,19 @@ end
 ---@param pr DiffReviewGhPR?
 ---@return string
 function M.status_text(pr)
-  return pr and pr.isDraft and "DRAFT" or "READY"
+  local state = tostring(pr and pr.state or "OPEN"):upper()
+  if state == "CLOSED" then return "CLOSED" end
+  if state == "MERGED" then return "MERGED" end
+  return pr and pr.isDraft and "DRAFT" or "OPEN"
+end
+
+---@param pr DiffReviewGhPR?
+---@return string
+function M.status_highlight(pr)
+  local status = M.status_text(pr)
+  if status == "CLOSED" or status == "MERGED" then return "DiffReviewStatusClosed" end
+  if status == "OPEN" then return "DiffReviewStatusOpen" end
+  return "DiffReviewStatusFetching"
 end
 
 ---@param check DiffReviewGhPRCheck
@@ -874,7 +886,9 @@ function M.entry_url(pr, entry)
     if base_url and reply.remote_id then return ("%s/changes#r%s"):format(base_url, tostring(reply.remote_id)) end
   end
 
-  local comment = entry.pr_comment or entry.review_comment
+  local comment = entry.pr_comment
+    or entry.review_comment
+    or (entry.comment_box and entry.comment_box.source)
   if comment then
     if comment.url and comment.url ~= "" then return comment.url end
     if base_url and comment.remote_id then
@@ -890,20 +904,6 @@ function M.entry_url(pr, entry)
   end
 
   return nil
-end
-
----@param review DiffReviewGhSubmittedReview
----@param diff_line table
----@param indent integer
-function M.emit_review_comments_for(review, diff_line, indent)
-  for index, comment in ipairs(review.comments or {}) do
-    if comment.local_state ~= "deleted"
-      and comment.abs_file == diff_line.file
-      and M.comment_side(comment) == review_mod().side_of(diff_line)
-      and tonumber(comment.line) == tonumber(diff_line.line) then
-      review_mod().emit_comment(comment, index, indent)
-    end
-  end
 end
 
 ---@param review DiffReviewGhSubmittedReview
@@ -927,9 +927,10 @@ function M.render_review_context(review)
   end
 
   local review_key = M.review_key(review)
+  local comment_index = section_builder().comment_anchor_index(comments)
   local previous_hook = status.review_after_row
   status.review_after_row = function(diff_line, indent)
-    M.emit_review_comments_for(review, diff_line, indent)
+    section_builder().emit_anchored_comments(status, diff_line, indent, { index = comment_index })
   end
   local ok, err = pcall(function()
     for _, file in ipairs(files) do
@@ -1015,7 +1016,9 @@ function M.url_under_cursor(buf)
   if session.states and session.states[buf] then session.status = session.states[buf] end
   local status = session.status
   if not (status and status.view_kind == "pr") then return nil end
-  return M.entry_url(status.pr, status_entry_under_cursor())
+  local url = M.entry_url(status.pr, status_entry_under_cursor())
+  if url then return url end
+  return nil
 end
 
 ---@param pr DiffReviewGhPR
@@ -1107,6 +1110,149 @@ function M.state(buf)
   if not (status and status.view_kind == "pr" and status.pr) then return nil end
   M.refresh_editable_comments(status)
   return status
+end
+
+---@class DiffReviewPrReplyDraft
+---@field parent table
+---@field body string
+---@field focused boolean
+---@field syncing boolean?
+---@field anchor_row integer?
+---@field anchor_entry_id string?
+---@field review_header_mark integer?
+---@field review_body_region table?
+---@field review_body_line_marks table[]?
+---@field review_rendered_body_text string?
+
+--- Resolve the top-level inline comment under the cursor from either PR render mode.
+---@param buf integer
+---@return table? comment
+function M.reply_target_under_cursor(buf)
+  local status = M.state(buf)
+  if not (status and vim.api.nvim_get_current_buf() == buf) then return nil end
+  local row = vim.api.nvim_win_get_cursor(0)[1]
+  local comment = review_mod().rendered_comment_at_row(buf, row)
+  if not comment or comment.pr_issue_comment or not comment.remote_id then return nil end
+  return comment
+end
+
+--- Append a created reply to every in-memory projection of its parent comment.
+---@param status table
+---@param target table
+---@param reply DiffReviewGhReviewCommentReply
+function M.append_review_comment_reply(status, target, reply)
+  local seen = {}
+  local function append(comment)
+    if not (comment and review_mod().same_comment(comment, target)) or seen[comment] then return end
+    seen[comment] = true
+    comment.replies = comment.replies or {}
+    comment.replies[#comment.replies + 1] = reply
+  end
+  append(target)
+  for _, comment in ipairs(status.pr_standalone_comments or {}) do append(comment) end
+  local comments = status.pr_comments or {}
+  for _, comment in ipairs(comments.code_comments or {}) do append(comment) end
+  for _, submitted_review in ipairs(comments.reviews or {}) do
+    for _, comment in ipairs(submitted_review.comments or {}) do append(comment) end
+  end
+end
+
+--- Create or focus an inline reply draft below the selected PR comment thread.
+---@param buf integer
+---@return boolean handled
+function M.reply_to_comment(buf)
+  local status = M.state(buf)
+  local comment = M.reply_target_under_cursor(buf)
+  if not (status and comment) then return false end
+  review_mod().sync_inline_comment_text(buf)
+  M.sync_reply_draft_text(buf)
+  local row = vim.api.nvim_win_get_cursor(0)[1]
+  local entry = status.entries and status.entries[row] or nil
+  local anchor_row = entry and entry.comment_box_anchor_line or status.focused_comment_anchor_row
+  local anchor_entry_id = entry and entry.comment_box_anchor_entry_id or status.focused_comment_entry_id
+  local draft = status.pr_reply_draft
+  if draft and not review_mod().same_comment(draft.parent, comment) then
+    if review_mod().comment_body_for_sync(draft.body or "") ~= "" then
+      vim.notify("Save the current reply before starting another", vim.log.levels.WARN, { title = "DiffReview" })
+      review_mod().focus_reply_draft(buf, draft, { insert = true })
+      return true
+    end
+    status.pr_reply_draft = nil
+    draft = nil
+  end
+  if not draft then
+    draft = {
+      parent = comment,
+      body = "",
+      focused = true,
+      anchor_row = anchor_row,
+      anchor_entry_id = anchor_entry_id,
+    }
+    status.pr_reply_draft = draft
+  end
+  review_mod().focus_reply_draft(buf, draft, {
+    insert = true,
+    anchor_row = anchor_row,
+    anchor_entry_id = anchor_entry_id,
+  })
+  return true
+end
+
+--- Read the inline reply editor back into its PR-owned draft.
+---@param buf integer
+---@return boolean changed
+function M.sync_reply_draft_text(buf)
+  local status = M.state(buf)
+  local draft = status and status.pr_reply_draft or nil
+  if not (draft and vim.api.nvim_buf_is_valid(buf)) then return false end
+  local edited_text = review_mod().comment_body_text_from_buffer(buf, draft)
+  if edited_text == nil then return false end
+  edited_text = review_mod().normalize_comment_body_text(edited_text)
+  if edited_text == review_mod().normalize_comment_body_text(draft.body or "") then return false end
+  draft.body = edited_text
+  draft.review_rendered_body_text = edited_text
+  draft.syncing = nil
+  vim.bo[buf].modified = true
+  return true
+end
+
+--- Post the active inline reply draft through the review-comment reply endpoint.
+---@param buf integer
+---@return boolean handled
+function M.sync_reply_draft(buf)
+  local status = M.state(buf)
+  if not status then return false end
+  M.sync_reply_draft_text(buf)
+  local draft = status.pr_reply_draft
+  if not draft then return false end
+  local body = review_mod().comment_body_for_sync(draft.body or "")
+  if body == "" then
+    vim.notify("Reply body cannot be empty", vim.log.levels.WARN, { title = "DiffReview" })
+    return true
+  end
+  if draft.syncing then return true end
+  if vim.fn.mode():sub(1, 1) == "i" then pcall(vim.cmd, "stopinsert") end
+  draft.syncing = true
+  M.refresh_modified(buf)
+  local comment = draft.parent
+  gh.create_review_comment_reply_async(status.cwd, status.pr.number, status.pr.repo, comment.remote_id, body, function(result)
+    local latest = M.state(buf) or status
+    if not result.ok or not result.reply then
+      draft.syncing = nil
+      if vim.api.nvim_buf_is_valid(buf) then M.refresh_modified(buf) end
+      notify_error("GitHub review reply failed: " .. (result.message or "gh returned no reply"), "DiffReview")
+      return
+    end
+    M.append_review_comment_reply(latest, comment, result.reply)
+    if latest.pr_reply_draft == draft then latest.pr_reply_draft = nil end
+    if vim.api.nvim_buf_is_valid(buf) and latest.buf == buf then
+      session.status = latest
+      render_pr_status(latest.pr, latest.cwd, buf, latest.pr_diff_text)
+      M.refresh_modified(buf)
+    end
+    vim.notify("Reply posted", vim.log.levels.INFO, { title = "DiffReview" })
+  end)
+  return true
 end
 
 ---@param comment table?
@@ -1242,29 +1388,49 @@ function M.is_standalone_comment(status, comment)
   return false
 end
 
----@param buf integer
+--- Remove an inline comment from every PR-owned comment projection.
 ---@param status table
----@param comment table
----@return boolean opened
-function M.open_pr_comment_body(buf, status, comment)
-  if not (buf and status and comment and vim.api.nvim_buf_is_valid(buf)) then return false end
-  local cursor_row = vim.api.nvim_win_get_cursor(0)[1]
-  for _, row in ipairs({ cursor_row, cursor_row - 1, cursor_row + 1 }) do
-    local entry = status.entries and status.entries[row] or nil
-    if entry
-      and entry.kind == "pr_comment"
-      and entry.id
-      and entry.pr_comment
-      and review_mod().same_comment(entry.pr_comment, comment)
-      and status_folded(entry.id, true) then
-      set_status_folded(entry.id, false)
-      if not fold_state()._status_set_native_fold_state(buf, entry.id, false) then
-        render_pr_status(status.pr, status.cwd, buf, status.pr_diff_text)
+---@param target table
+---@return boolean removed
+function M.remove_standalone_comment(status, target)
+  if not (status and target) then return false end
+  local removed = false
+  local function remove_matching_comment(list)
+    for index = #(list or {}), 1, -1 do
+      if review_mod().same_comment(list[index], target) then
+        table.remove(list, index)
+        removed = true
       end
-      return true
     end
   end
-  return false
+  remove_matching_comment(status.pr_standalone_comments)
+  local remote_comments = status.pr_comments
+  if remote_comments then
+    remove_matching_comment(remote_comments.code_comments)
+    for _, submitted_review in ipairs(remote_comments.reviews or {}) do
+      remove_matching_comment(submitted_review.comments)
+    end
+  end
+  M.refresh_editable_comments(status)
+  return removed
+end
+
+--- Open the PR conversation comment selected by the open command.
+---@param buf integer
+---@return boolean opened
+function M.open_issue_comment_under_cursor(buf)
+  local status = M.state(buf)
+  if not (status and status.view_kind == "pr" and vim.api.nvim_buf_is_valid(buf)) then return false end
+  local cursor_row = vim.api.nvim_win_get_cursor(0)[1]
+  local entry = status.entries and status.entries[cursor_row] or nil
+  if not (entry and entry.kind == "pr_comment" and entry.id and entry.pr_comment) then return false end
+  if not status_folded(entry.id, true) then return true end
+
+  set_status_folded(entry.id, false)
+  if not fold_state()._status_set_native_fold_state(buf, entry.id, false) then
+    render_pr_status(status.pr, status.cwd, buf, status.pr_diff_text)
+  end
+  return true
 end
 
 ---@param buf integer
@@ -1323,7 +1489,11 @@ function M.refresh_modified(buf)
       break
     end
   end
-  vim.bo[buf].modified = title_dirty or desc_dirty or review_dirty or milestone_dirty or comments_dirty
+  local reply_draft = status.pr_reply_draft
+  local reply_dirty = reply_draft ~= nil
+    and not reply_draft.syncing
+    and review_mod().comment_body_for_sync(reply_draft.body or "") ~= ""
+  vim.bo[buf].modified = title_dirty or desc_dirty or review_dirty or milestone_dirty or comments_dirty or reply_dirty
 end
 
 ---@param buf integer
@@ -1488,6 +1658,43 @@ function M.sync_standalone_comment(buf, comment)
     M.sync_regular_comment(buf, comment)
     return
   end
+  if comment.local_state == "deleted" then
+    local comment_node_id = comment.remote_node_id
+    if not comment_node_id or comment_node_id == "" then
+      comment.syncing = nil
+      M.remove_standalone_comment(status, comment)
+      render_pr_status(status.pr, status.cwd, buf, status.pr_diff_text)
+      M.refresh_modified(buf)
+      return
+    end
+    M.enqueue_standalone_sync(status, function(done)
+      gh.delete_review_comment_async(status.cwd, comment_node_id, function(result)
+        local latest = M.state(buf)
+        if not latest then done() return end
+        comment.syncing = nil
+        if not result.ok then
+          comment.local_state = comment.delete_previous_state or "clean"
+          comment.delete_previous_state = nil
+          notify_error("GitHub inline comment delete failed: " .. (result.message or "gh failed"), "DiffReview")
+          if vim.api.nvim_buf_is_valid(buf) then
+            render_pr_status(latest.pr, latest.cwd, buf, latest.pr_diff_text)
+            M.refresh_modified(buf)
+          end
+          done()
+          return
+        end
+        comment.delete_previous_state = nil
+        M.remove_standalone_comment(latest, comment)
+        if vim.api.nvim_buf_is_valid(buf) then
+          render_pr_status(latest.pr, latest.cwd, buf, latest.pr_diff_text)
+          M.refresh_modified(buf)
+        end
+        vim.notify("Inline comment deleted", vim.log.levels.INFO, { title = "DiffReview" })
+        done()
+      end)
+    end)
+    return
+  end
   local body = review_mod().comment_body_for_sync(comment.body or "")
   if body == "" then
     comment.syncing = nil
@@ -1604,10 +1811,9 @@ function M.add_standalone_comment(buf)
   local status = M.state(buf)
   if not status then return end
   session.status = status
-  local existing = M.standalone_comment_under_cursor(buf)
-  if existing then
-    M.open_pr_comment_body(buf, status, existing)
-    review_mod().focus_inline_comment(buf, existing)
+  local row = vim.api.nvim_win_get_cursor(0)[1]
+  local entry = status.entries and status.entries[row] or nil
+  if entry and (entry.kind == "comment_box" or entry.kind == "pr_comment" or review_mod().comment_at_row(buf, row)) then
     return
   end
   local payload = M.selection_payload(status)
@@ -1616,8 +1822,50 @@ function M.add_standalone_comment(buf)
   local comment = payload
     and M.create_inline_comment(status, payload)
     or M.create_regular_comment(status)
+  if payload then
+    review_mod().focus_comment(buf, comment, { insert = true })
+    M.refresh_modified(buf)
+    return
+  end
   render_pr_status(status.pr, status.cwd, buf, status.pr_diff_text)
   review_mod().focus_inline_comment(buf, comment, { insert = true })
+  M.refresh_modified(buf)
+end
+
+--- Delete the editable inline PR comment under the cursor.
+---@param buf integer
+function M.delete_standalone_comment(buf)
+  local status = M.state(buf)
+  if not status then return end
+  local row = vim.api.nvim_win_get_cursor(0)[1]
+  local entry = status.entries and status.entries[row] or nil
+  local reply_draft = status.pr_reply_draft
+  if reply_draft
+    and (review_mod().reply_draft_body_at_row(buf, row) == reply_draft
+      or (entry and entry.comment_box and entry.comment_box.reply_draft == reply_draft)) then
+    status.pr_reply_draft = nil
+    render_pr_status(status.pr, status.cwd, buf, status.pr_diff_text)
+    M.refresh_modified(buf)
+    vim.notify("Reply draft discarded", vim.log.levels.INFO, { title = "DiffReview" })
+    return
+  end
+  local comment = M.standalone_comment_under_cursor(buf)
+  if not comment or M.is_regular_comment(status, comment) then
+    vim.notify("Only your inline PR comments can be deleted here", vim.log.levels.INFO, { title = "DiffReview" })
+    return
+  end
+  if comment.remote_node_id then
+    comment.delete_previous_state = comment.local_state
+    comment.local_state = "deleted"
+    vim.notify("Inline comment marked for deletion. Press Ctrl-S to sync", vim.log.levels.INFO, { title = "DiffReview" })
+  else
+    M.remove_standalone_comment(status, comment)
+  end
+  if status.focused_comment_id == comment.local_id then
+    review_mod().clear_comment_focus(status)
+  end
+  M.refresh_editable_comments(status)
+  render_pr_status(status.pr, status.cwd, buf, status.pr_diff_text)
   M.refresh_modified(buf)
 end
 
