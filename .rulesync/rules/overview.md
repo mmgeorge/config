@@ -15,13 +15,12 @@ Treat this repo as operational infrastructure, not as a single application. A ch
 This repository supports **Windows and macOS**, and every supported platform can assume **Nushell is installed**. Treat every shared workflow as cross-platform unless its owning directory or integration explicitly targets Windows.
 
 - Use **Nushell** for new repository-level scripts, automation, launchers, and orchestration that should run on both Windows and macOS.
-- Use **PowerShell** only for irreducible Windows integrations such as Windows APIs or Visual Studio environment initialization.
-- Do not add batch, Bash, or Zsh scripts. Use Nushell for portable behavior and PowerShell for the narrow Windows-only boundary.
-- Keep shared orchestration in a `.nu` script when a workflow needs a Windows-specific action. Route only the irreducible Windows operation through a narrow PowerShell adapter.
+- Use native platform scripting only for irreducible operating-system integrations. On Windows, PowerShell, `cmd`, and batch files remain valid narrow adapters for Windows APIs, toolchain initialization, or lower startup overhead.
+- Do not implement shared workflow behavior in a platform-specific shell. Keep shared orchestration in a `.nu` script and route only the irreducible operating-system operation through a narrow native adapter.
 - Do not duplicate an entire workflow into Windows and macOS implementations. Extract the common state transitions, Git behavior, validation, and error handling into one Nushell source.
 - Validate every new or modified standalone Nushell script with `nu -c 'nu-check path/to/script.nu'`.
 
-Platform-specific placement does not make platform-specific implementation acceptable by itself. For example, a WezTerm worktree workflow that runs on both operating systems should use a shared Nushell runner even if Windows requires a small final handoff to PowerShell.
+Platform-specific placement does not make platform-specific implementation acceptable by itself. For example, a WezTerm worktree workflow that runs on both operating systems should use a shared Nushell runner even if Windows uses a small batch handoff for faster Visual Studio environment initialization.
 
 # Rulesync Source Layout
 

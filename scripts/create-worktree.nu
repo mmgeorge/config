@@ -6,8 +6,8 @@ def send-wezterm-user-variable [name: string, value: string] {
 def start-development-shell [working_directory: string] {
   cd $working_directory
   if $nu.os-info.name == 'windows' {
-    let launcher = $env.FILE_PWD | path join '..' 'windows' 'nu-dev-shell.ps1' | path expand
-    exec powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $launcher
+    let launcher = $env.FILE_PWD | path join '..' 'windows' 'nudevcmd.bat' | path expand
+    exec $launcher
   } else {
     exec nu
   }

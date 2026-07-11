@@ -56,12 +56,8 @@
         "stdio",
         "--toolsets=context,actions,discussions,issues,labels,pull_requests,repos,users"
       ],
-      "env": {
-        "GITHUB_PERSONAL_ACCESS_TOKEN": "$GH_AGENT_TOKEN"
-      },
       "envVars": [
-        "GITHUB_PERSONAL_ACCESS_TOKEN",
-        "GH_AGENT_TOKEN"
+        "GITHUB_PERSONAL_ACCESS_TOKEN"
       ],
       "default_tools_approval_mode": "approve"
     },
