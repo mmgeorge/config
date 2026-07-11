@@ -12,6 +12,9 @@ codexcli:
     - Walkthrough Writer
     - Review Guide Writer
     - DiffReview Writer
+antigravity:
+  model: gemini-3.5-flash
+  model_reasoning_effort: medium
 ---
 
 # Walkthrough Writer
