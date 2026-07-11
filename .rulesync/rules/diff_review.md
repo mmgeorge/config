@@ -164,14 +164,22 @@ the row's inline `virt_text` extmark (see `gutter_text` in
 Walkthrough startup must resolve the repository root from the status view's
 working directory before reading `.walkthrough.json` or computing inventory.
 Cache that canonical root in the walkthrough host and use it for every
-`git -C` command and repository-relative path conversion. Neovim may start in
-any repository subdirectory, while Git interprets `HEAD:path` relative to the
-command working directory.
+root-scoped process and repository-relative path conversion. Neovim may start
+in any repository subdirectory.
 
 Walkthrough inventory must derive each canonical repository-relative path from
 the file's absolute filename and the resolved Git root. Treat a status-provided
 `relpath` as fallback data because status rows may have computed it relative to
 Neovim's launch directory rather than the repository root.
+
+`walkthrough_inventory` accepts only `"sem"` or `false` and defaults to
+`"sem"`. Sem inventory runs one asynchronous `sem diff HEAD --format json
+--no-cosmetics` for tracked changes and one batched asynchronous `sem entities
+--format json` for untracked files. Do not add a native Git or Tree-sitter
+fallback. Missing Sem, command failures, invalid JSON, and unsupported filetypes
+produce no fallback inventory. Failures must notify with the Sem error. When
+set to `false`, omit `inventory_async` from `DiffReviewWalkthroughHost` so the
+walkthrough skips inventory scheduling and its completion rerender.
 
 Folded walkthrough tasks must keep the complete task heading visible, including
 every wrapped title and task-justification line. Anchor the native child fold at

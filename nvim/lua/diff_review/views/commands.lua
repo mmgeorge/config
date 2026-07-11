@@ -11,7 +11,6 @@ local gh = require("diff_review.integrations.gh")
 local git_backend = require("diff_review.git.git_backend")
 local paths = require("diff_review.infra.paths")
 
-local syntax_engine = require("diff_review.render.syntax_engine")
 -- render_orchestrator edge kept lazy to avoid a load-time cycle.
 local function render_orchestrator() return require("diff_review.views.status.render_orchestrator") end
 -- pr_overview edge kept lazy to avoid a load-time cycle.
@@ -123,7 +122,7 @@ function M._walkthrough_host(buf)
       render_orchestrator().render_status_or_notify(buf, target_id, fallback_line, { reuse_sections = true })
     end,
     git_list_async = git_backend.systemlist_async,
-    inventory_async = function(cb)
+    inventory_async = config.options.walkthrough_inventory == "sem" and function(cb)
       resolve_root_async(function(root, root_err)
         if not root then
           if root_err and root_err ~= "" then
@@ -140,8 +139,10 @@ function M._walkthrough_host(buf)
         inventory.compute_async({
           cwd = root,
           sections = state.sections or {},
-          git_list_async = git_backend.systemlist_async,
-          read_file_lines = syntax_engine.file_source_lines,
+          run_text_async = git_backend.system_text_async,
+          sem_available = function()
+            return vim.fn.executable("sem") == 1
+          end,
           repo_relative = function(filename)
             return repo_relative(filename, root)
           end,
@@ -152,7 +153,7 @@ function M._walkthrough_host(buf)
           cb(result or { rows = {} })
         end)
       end)
-    end,
+    end or nil,
   }
 end
 

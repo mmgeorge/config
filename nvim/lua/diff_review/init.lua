@@ -67,6 +67,7 @@
 ---     },
 ---     opts = {
 ---       about_auto_generate = false,           -- a few common options (see infra/config.lua defaults)
+---       walkthrough_inventory = "sem",         -- use Sem inventory; false disables it
 ---       keymaps = {
 ---         -- In-buffer ACTION keys. Override per command; unspecified keys keep
 ---         -- their defaults (deep-merge). A value is a key string, a LIST of keys,

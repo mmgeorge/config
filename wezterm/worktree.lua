@@ -7,6 +7,8 @@ local M = {}
 local is_windows = wezterm.target_triple:find('windows') ~= nil
 
 M.settings = {
+  debug = false,
+  debug_log_path = wezterm.home_dir .. '/wezterm-worktree-debug.log',
   roots = {
     wezterm.home_dir .. '/Developer',
     wezterm.home_dir .. '/code',
@@ -16,7 +18,7 @@ M.settings = {
     -- wezterm.home_dir .. '/projects',
   },
   auto_setup_new_workspaces = true,
-  branch_prefix = 'matt9222/',
+  branch_prefix = 'mmgeorge/',
   layouts = {
     default = {
       tabs = {
@@ -72,6 +74,34 @@ M.settings = {
   },
 }
 
+local function debug_log(event, fields)
+  if not M.settings.debug then
+    return
+  end
+
+  local payload = ''
+  if fields then
+    local encoded, value = pcall(wezterm.json_encode, fields)
+    payload = encoded and (' ' .. value) or (' ' .. tostring(fields))
+  end
+
+  local line = os.date('!%Y-%m-%dT%H:%M:%SZ') .. ' [worktree] ' .. event .. payload
+  if wezterm.log_info then
+    wezterm.log_info(line)
+  end
+
+  local file, err = io.open(M.settings.debug_log_path, 'a')
+  if not file then
+    if wezterm.log_error then
+      wezterm.log_error('[worktree] Could not open debug log: ' .. tostring(err))
+    end
+    return
+  end
+
+  file:write(line, '\n')
+  file:close()
+end
+
 local function trim(text)
   if not text then
     return ''
@@ -86,6 +116,9 @@ local function normalize_path(path)
   end
 
   path = path:gsub('\\', '/')
+  if is_windows and path:match('^/%a:/') then
+    path = path:sub(2)
+  end
 
   if path ~= '/' and not path:match('^%a:/$') then
     path = path:gsub('/+$', '')
@@ -171,11 +204,23 @@ local function notify(window, message)
 end
 
 local function run_command(command)
+  debug_log('command.start', { command = command })
   local success, stdout, stderr = wezterm.run_child_process(command)
   if not success then
+    debug_log('command.finish', {
+      command = command,
+      stderr = trim(stderr ~= '' and stderr or stdout),
+      success = false,
+    })
     return nil, trim(stderr ~= '' and stderr or stdout)
   end
 
+  debug_log('command.finish', {
+    command = command,
+    stderr = trim(stderr or ''),
+    stdout = trim(stdout or ''),
+    success = true,
+  })
   return stdout or '', stderr or ''
 end
 
@@ -431,10 +476,32 @@ end
 local function current_pane_path(pane)
   local cwd = pane:get_current_working_dir()
   if not cwd or not cwd.file_path then
+    debug_log('pane.cwd.missing', {
+      cwd = cwd and tostring(cwd) or nil,
+    })
     return nil
   end
 
-  return normalize_path(cwd.file_path)
+  local foreground = nil
+  local foreground_ok, foreground_info = pcall(function()
+    return pane:get_foreground_process_info()
+  end)
+  if foreground_ok and foreground_info then
+    foreground = {
+      cwd = foreground_info.cwd,
+      executable = foreground_info.executable,
+      name = foreground_info.name,
+    }
+  end
+
+  local path = normalize_path(cwd.file_path)
+  debug_log('pane.cwd', {
+    file_path = cwd.file_path,
+    foreground = foreground,
+    normalized_path = path,
+    uri = tostring(cwd),
+  })
+  return path
 end
 
 local function git_common_dir(path)
@@ -575,16 +642,30 @@ end
 local function build_repo(path, common_dir)
   path = normalize_path(path)
   if not path then
+    debug_log('repo.build.rejected', { reason = 'missing path' })
     return nil
   end
 
+  debug_log('repo.build.start', {
+    common_dir = common_dir,
+    path = path,
+  })
   common_dir = common_dir or git_common_dir(path)
   if not common_dir then
+    debug_log('repo.build.rejected', {
+      path = path,
+      reason = 'git common directory unavailable',
+    })
     return nil
   end
 
   local worktrees = parse_worktrees(path)
   if not worktrees or #worktrees == 0 then
+    debug_log('repo.build.rejected', {
+      common_dir = common_dir,
+      path = path,
+      reason = 'worktree inventory unavailable',
+    })
     return nil
   end
 
@@ -612,6 +693,25 @@ local function build_repo(path, common_dir)
     repo.worktree_parent = preferred_worktree_parent(repo.worktrees, default_parent)
   end
 
+  local worktree_records = {}
+  for _, worktree in ipairs(repo.worktrees) do
+    table.insert(worktree_records, {
+      bare = worktree.bare == true,
+      branch = worktree.branch_name,
+      is_main = worktree.is_main == true,
+      path = worktree.path,
+      workspace = worktree.workspace_name,
+    })
+  end
+  debug_log('repo.build.resolved', {
+    common_dir = repo.id,
+    main_path = repo.main_path,
+    name = repo.name,
+    root_path = repo.root_path,
+    source_path = path,
+    worktree_parent = repo.worktree_parent,
+    worktrees = worktree_records,
+  })
   return repo
 end
 
@@ -681,10 +781,21 @@ end
 local function repo_for_pane(pane)
   local path = current_pane_path(pane)
   if not path then
+    debug_log('pane.repo.missing', { reason = 'pane path unavailable' })
     return nil
   end
 
-  return build_repo(path)
+  local repo = build_repo(path)
+  debug_log('pane.repo', {
+    path = path,
+    repo = repo and {
+      id = repo.id,
+      main_path = repo.main_path,
+      name = repo.name,
+      root_path = repo.root_path,
+    } or nil,
+  })
+  return repo
 end
 
 local function flatten_worktrees(repos)
@@ -1078,6 +1189,11 @@ end
 local function switch_to_worktree(window, pane, worktree, opts)
   opts = opts or {}
   local exists = workspace_exists(worktree.workspace_name)
+  debug_log('worktree.switch', {
+    exists = exists,
+    path = worktree.path,
+    workspace = worktree.workspace_name,
+  })
   if not exists and M.settings.auto_setup_new_workspaces then
     queue_layout(worktree, opts)
   end
@@ -1545,6 +1661,14 @@ local function create_worktree(window, pane, repo, opts)
   end
 
   if opts.new_branch then
+    if local_branch_exists(repo, opts.new_branch) then
+      notify(
+        window,
+        'Branch ' .. opts.new_branch .. ' already exists. Use Check out existing branch, then choose Local branch'
+      )
+      return
+    end
+
     table.insert(args, '-b')
     table.insert(args, opts.new_branch)
   end
@@ -1628,26 +1752,24 @@ local function branch_records(repo, source, remote, exclude_checked_out)
   local branch_names = {}
   local output = git_capture(repo.main_path, {
     'for-each-ref',
-    '--format=%(refname:short)%09%(committerdate:unix)',
+    '--format=%(refname:short)%09%(committerdate:unix)%09%(symref)%09END',
     branch_source.ref_namespace(source, remote),
   }) or ''
 
   for _, line in ipairs(split_lines(output)) do
-    local ref, timestamp = line:match('^(.-)%s+([0-9]+)$')
-    ref = ref or line
-    local logical_name = branch_source.logical_name(ref, source)
-    if ref ~= ''
-      and not ref:match('/HEAD$')
-      and not (exclude_checked_out and checked_out_worktree(repo, logical_name))
-    then
-      branch_names[logical_name] = true
-      table.insert(ref_records, {
-        committed_at = tonumber(timestamp) or 0,
-        id = ref,
-        logical_name = logical_name,
-        release_version = parse_release_version(logical_name),
-        source = source,
-      })
+    local ref, timestamp, symref = line:match('^(.-)\t([0-9]+)\t(.-)\tEND$')
+    if ref and ref ~= '' and symref == '' then
+      local logical_name = branch_source.logical_name(ref, source)
+      if not (exclude_checked_out and checked_out_worktree(repo, logical_name)) then
+        branch_names[logical_name] = true
+        table.insert(ref_records, {
+          committed_at = tonumber(timestamp) or 0,
+          id = ref,
+          logical_name = logical_name,
+          release_version = parse_release_version(logical_name),
+          source = source,
+        })
+      end
     end
   end
 
@@ -2493,6 +2615,24 @@ function M.menu()
       current_repo = workspace_repo
     end
 
+    debug_log('menu.context', {
+      current_path = current_path,
+      current_repo = current_repo and {
+        id = current_repo.id,
+        main_path = current_repo.main_path,
+        name = current_repo.name,
+        root_path = current_repo.root_path,
+      } or nil,
+      current_worktree = current_worktree and {
+        branch = current_worktree.branch_name,
+        is_main = current_worktree.is_main == true,
+        path = current_worktree.path,
+        workspace = current_worktree.workspace_name,
+      } or nil,
+      current_workspace = current_workspace,
+      repository_count = #repos,
+    })
+
     local choices = {}
 
     if current_repo then
@@ -2531,6 +2671,8 @@ function M.menu()
         label = worktree_label(worktree, current_workspace, current_worktree),
       })
     end
+
+    debug_log('menu.choices', { choices = choices })
 
     choose(window, pane, {
       choices = choices,

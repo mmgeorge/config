@@ -599,10 +599,18 @@ and caches the canonical Git root from the status view's working directory befor
 loads the artifact or inventory. This keeps `HEAD:path` lookups repository-relative even
 when Neovim starts inside a subdirectory.
 
-Inventory canonicalizes every absolute status filename against that cached root before
-issuing `HEAD:path` reads. Status-provided relative paths remain fallback metadata because
-they may originate from Neovim's launch directory and therefore omit the root-to-launch
-prefix.
+Inventory canonicalizes Sem file paths and absolute status filenames against that cached
+root. Status-provided relative paths remain fallback metadata because they may originate
+from Neovim's launch directory and omit the root-to-launch prefix.
+
+The `walkthrough_inventory` setup option accepts `"sem"` or `false`. The Sem path runs a
+single asynchronous `sem diff HEAD` for the combined staged and unstaged comparison,
+plus one batched `sem entities` request for
+untracked files, then normalizes supported Sem entity and change types into inventory
+rows. No native Git/Tree-sitter inventory remains. Missing Sem, unsupported languages,
+command failures, or invalid JSON do not fall back. With the option disabled,
+`views/commands._walkthrough_host` omits `inventory_async`, so the walkthrough renderer
+skips inventory scheduling entirely.
 
 Each task heading remains fully visible while its nested tree stays folded. The final
 wrapped heading row owns the native fold range and supplies its fold text, while earlier

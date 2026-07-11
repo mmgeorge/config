@@ -10,30 +10,21 @@ local function wait_for(condition, message)
   assert_true(vim.wait(3000, condition, 10), message)
 end
 
-local function fake_file(relpath, status, diff)
+---@param relpath string
+---@param status string
+---@return table
+local function fake_file(relpath, status)
   return {
     filename = root .. "/" .. relpath,
     relpath = relpath,
     git_status = status,
     untracked = status == "??",
-    hunks = diff and { { diff = diff } } or {},
+    hunks = {},
   }
 end
 
-local function compute(opts)
-  local result = nil
-  inventory.compute_async(vim.tbl_extend("force", {
-    cwd = root,
-    git_list_async = function(command, cb)
-      cb({}, 1, "unexpected git command: " .. table.concat(command, " "))
-    end,
-  }, opts), function(computed)
-    result = computed
-  end)
-  wait_for(function() return result ~= nil end, "inventory did not compute")
-  return result
-end
-
+---@param result DiffReviewInventoryResult
+---@return table<string, DiffReviewInventoryRow>
 local function rows_by_label(result)
   local rows = {}
   for _, row in ipairs(result.rows or {}) do
@@ -42,6 +33,10 @@ local function rows_by_label(result)
   return rows
 end
 
+---@param result DiffReviewInventoryResult
+---@param label string
+---@param action "added"|"removed"|"modified"
+---@return string
 local function detail_names(result, label, action)
   local names = {}
   for _, change in ipairs((((result.details or {})[label] or {})[action] or {})) do
@@ -51,6 +46,11 @@ local function detail_names(result, label, action)
   return table.concat(names, ",")
 end
 
+---@param row DiffReviewInventoryRow?
+---@param added integer
+---@param removed integer
+---@param modified integer
+---@param label string
 local function assert_counts(row, added, removed, modified, label)
   assert_true(row ~= nil, "missing row: " .. label)
   assert_true(row.added == added,
@@ -61,216 +61,142 @@ local function assert_counts(row, added, removed, modified, label)
     ("%s modified mismatch: expected %d, got %s"):format(label, modified, tostring(row.modified)))
 end
 
-local function rust_diff()
-  return table.concat({
-    "diff --git a/src/lib.rs b/src/lib.rs",
-    "--- a/src/lib.rs",
-    "+++ b/src/lib.rs",
-    "@@ -1,8 +1,8 @@",
-    " pub struct Cache {",
-    "-  value: u32,",
-    "+  value: u64,",
-    " }",
-    " ",
-    " pub fn keep() {",
-    "-  old_call();",
-    "+  new_call();",
-    " }",
-    "-pub fn remove_me() {}",
-    "+pub enum Mode { Fast }",
-  }, "\n")
-end
-
-local function typescript_diff()
-  return table.concat({
-    "diff --git a/src/panel.ts b/src/panel.ts",
-    "--- a/src/panel.ts",
-    "+++ b/src/panel.ts",
-    "@@ -1,8 +1,10 @@",
-    " interface Props {",
-    "   name: string;",
-    "+  enabled: boolean;",
-    " }",
-    " class Panel {",
-    "   render() {",
-    "-    return oldValue;",
-    "+    return newValue;",
-    "   }",
-    " }",
-    "+type Mode = \"card\";",
-  }, "\n")
-end
-
 local function run()
-  local result = compute({
+  local commands = {}
+  local result
+  local tracked_json = vim.json.encode({
+    summary = { fileCount = 3 },
+    changes = {
+      {
+        entityId = "src/lib.rs::fn::run",
+        changeType = "modified",
+        entityType = "function",
+        entityName = "run",
+        filePath = "src/lib.rs",
+        startLine = 8,
+      },
+      {
+        entityId = "src/lib.rs::struct::Mode",
+        changeType = "added",
+        entityType = "struct",
+        entityName = "Mode",
+        filePath = "src/lib.rs",
+        startLine = 2,
+      },
+      {
+        entityId = "src/old.rs::enum::Legacy",
+        changeType = "deleted",
+        entityType = "enum",
+        entityName = "Legacy",
+        filePath = "src/old.rs",
+        oldStartLine = 4,
+      },
+      {
+        entityId = "docs/usage.md::orphan::module-level",
+        changeType = "modified",
+        entityType = "orphan",
+        entityName = "module-level",
+        filePath = "docs/usage.md",
+      },
+    },
+  })
+  local untracked_json = vim.json.encode({
+    {
+      file = root .. "/src/new.rs",
+      type = "struct",
+      name = "NewState",
+      start_line = 1,
+      end_line = 3,
+    },
+    {
+      file = root .. "/src/new.rs",
+      type = "function",
+      name = "create",
+      start_line = 5,
+      end_line = 7,
+    },
+  })
+
+  inventory.compute_async({
+    cwd = root,
     sections = {
       {
         name = "unstaged",
         files = {
-          fake_file("src/lib.rs", "M", rust_diff()),
-          fake_file("src/panel.ts", "M", typescript_diff()),
-          fake_file("docs/usage.md", "M", table.concat({
-            "diff --git a/docs/usage.md b/docs/usage.md",
-            "--- a/docs/usage.md",
-            "+++ b/docs/usage.md",
-            "@@ -1 +1 @@",
-            "-old docs",
-            "+new docs",
-          }, "\n")),
-          fake_file("plans/followup.md", "M", table.concat({
-            "diff --git a/plans/followup.md b/plans/followup.md",
-            "--- a/plans/followup.md",
-            "+++ b/plans/followup.md",
-            "@@ -1 +1 @@",
-            "-old plan",
-            "+new plan",
-          }, "\n")),
-          fake_file("blue/docs/rendering.md", "M", table.concat({
-            "diff --git a/blue/docs/rendering.md b/blue/docs/rendering.md",
-            "--- a/blue/docs/rendering.md",
-            "+++ b/blue/docs/rendering.md",
-            "@@ -1 +1 @@",
-            "-old nested docs",
-            "+new nested docs",
-          }, "\n")),
-          fake_file("blue/plans/implicit.md", "M", table.concat({
-            "diff --git a/blue/plans/implicit.md b/blue/plans/implicit.md",
-            "--- a/blue/plans/implicit.md",
-            "+++ b/blue/plans/implicit.md",
-            "@@ -1 +1 @@",
-            "-old nested plan",
-            "+new nested plan",
-          }, "\n")),
+          fake_file("src/lib.rs", "M"),
+          fake_file("src/old.rs", "D"),
+          fake_file("docs/usage.md", "M"),
+          fake_file("src/new.rs", "??"),
+          fake_file("assets/unsupported.bin", "??"),
         },
       },
     },
-    old_lines_by_relpath = {
-      ["src/lib.rs"] = {
-        "pub struct Cache {",
-        "  value: u32,",
-        "}",
-        "",
-        "pub fn keep() {",
-        "  old_call();",
-        "}",
-        "pub fn remove_me() {}",
-      },
-      ["src/panel.ts"] = {
-        "interface Props {",
-        "  name: string;",
-        "}",
-        "class Panel {",
-        "  render() {",
-        "    return oldValue;",
-        "  }",
-        "}",
-      },
-    },
-    new_lines_by_relpath = {
-      ["src/lib.rs"] = {
-        "pub struct Cache {",
-        "  value: u64,",
-        "}",
-        "",
-        "pub fn keep() {",
-        "  new_call();",
-        "}",
-        "pub enum Mode { Fast }",
-      },
-      ["src/panel.ts"] = {
-        "interface Props {",
-        "  name: string;",
-        "  enabled: boolean;",
-        "}",
-        "class Panel {",
-        "  render() {",
-        "    return newValue;",
-        "  }",
-        "}",
-        "type Mode = \"card\";",
-      },
-      ["docs/usage.md"] = { "new docs" },
-      ["plans/followup.md"] = { "new plan" },
-      ["blue/docs/rendering.md"] = { "new nested docs" },
-      ["blue/plans/implicit.md"] = { "new nested plan" },
-    },
-  })
-  local rows = rows_by_label(result)
-  assert_counts(rows["function"], 0, 1, 2, "function")
-  assert_counts(rows.struct, 0, 0, 1, "struct")
-  assert_counts(rows.enum, 1, 0, 0, "enum")
-  assert_counts(rows.interface, 0, 0, 1, "interface")
-  assert_counts(rows.type, 1, 0, 0, "type")
-  assert_true(rows.class == nil, "class should not be modified by a method-body-only change")
-  assert_counts(rows.docs, 0, 0, 2, "docs")
-  assert_counts(rows.plans, 0, 0, 2, "plans")
-  assert_counts(rows.files, 0, 0, 6, "files")
-  assert_true(detail_names(result, "function", "modified") == "Panel.render,keep",
-    "function detail list should include modified functions")
-  assert_true(detail_names(result, "function", "removed") == "remove_me",
-    "function detail list should include removed functions")
-  assert_true(detail_names(result, "enum", "added") == "Mode",
-    "enum detail list should include added enum")
-  assert_true(detail_names(result, "docs", "modified") == "blue/docs/rendering.md,docs/usage.md",
-    "docs detail list should include root and nested docs files")
-  assert_true(detail_names(result, "plans", "modified") == "blue/plans/implicit.md,plans/followup.md",
-    "plans detail list should include root and nested plan files")
-  assert_true(detail_names(result, "files", "modified") == "blue/docs/rendering.md,blue/plans/implicit.md,docs/usage.md,plans/followup.md,src/lib.rs,src/panel.ts",
-    "files detail list should include changed files")
-
-  local nested_file = fake_file("docs/nested.md", "M", nil)
-  nested_file.filename = root .. "/workspace/docs/nested.md"
-  result = compute({
-    sections = { { name = "unstaged", files = { nested_file } } },
+    sem_available = function() return true end,
     repo_relative = function(filename)
       return filename:sub(#root + 2)
     end,
-    old_lines_by_relpath = { ["workspace/docs/nested.md"] = { "old nested docs" } },
-    new_lines_by_relpath = { ["workspace/docs/nested.md"] = { "new nested docs" } },
-  })
-  rows = rows_by_label(result)
-  assert_counts(rows.docs, 0, 0, 1, "nested working-directory docs")
-  assert_true(detail_names(result, "files", "modified") == "workspace/docs/nested.md",
-    "inventory should derive repository-relative paths from absolute filenames")
+    run_text_async = function(command, _, cb)
+      commands[#commands + 1] = command
+      vim.schedule(function()
+        local stdout = command[2] == "diff" and tracked_json or untracked_json
+        cb({ code = 0, stdout = stdout, stderr = "", output = stdout })
+      end)
+    end,
+  }, function(computed)
+    result = computed
+  end)
 
-  result = compute({
-    sections = {
-      {
-        name = "unstaged",
-        files = {
-          fake_file("src/new_panel.tsx", "A", nil),
-          fake_file("src/old.rs", "D", nil),
-        },
-      },
-    },
-    old_lines_by_relpath = {
-      ["src/old.rs"] = {
-        "pub struct OldState {",
-        "  value: u32,",
-        "}",
-        "pub fn old_helper() {}",
-      },
-    },
-    new_lines_by_relpath = {
-      ["src/new_panel.tsx"] = {
-        "class NewPanel {",
-        "  render() {",
-        "    return <div />;",
-        "  }",
-        "}",
-      },
-      ["src/old.rs"] = {},
-    },
-  })
-  rows = rows_by_label(result)
-  assert_counts(rows.class, 1, 0, 0, "added class")
-  assert_counts(rows["function"], 1, 1, 0, "added and removed functions")
-  assert_counts(rows.struct, 0, 1, 0, "removed struct")
-  assert_counts(rows.files, 1, 1, 0, "added and removed files")
-  assert_true(detail_names(result, "function", "added") == "NewPanel.render",
-    "added file detail list should include added methods")
-  assert_true(detail_names(result, "function", "removed") == "old_helper",
-    "removed file detail list should include removed functions")
+  wait_for(function() return result ~= nil end, "Sem inventory did not compute")
+  assert_true(#commands == 2, "Sem inventory should run one diff and one batched entities command")
+  assert_true(commands[1][1] == "sem" and commands[1][2] == "diff",
+    "tracked inventory should come from sem diff")
+  assert_true(commands[2][1] == "sem" and commands[2][2] == "entities",
+    "untracked inventory should come from sem entities")
+
+  local rows = rows_by_label(result)
+  assert_counts(rows["function"], 1, 0, 1, "function")
+  assert_counts(rows.struct, 2, 0, 0, "struct")
+  assert_counts(rows.enum, 0, 1, 0, "enum")
+  assert_counts(rows.docs, 0, 0, 1, "docs")
+  assert_counts(rows.files, 1, 1, 2, "files")
+  assert_true(detail_names(result, "function", "added") == "create",
+    "untracked Sem entities should be added symbols")
+  assert_true(detail_names(result, "function", "modified") == "run",
+    "tracked Sem changes should preserve modified symbols")
+  assert_true(detail_names(result, "files", "added") == "src/new.rs",
+    "unsupported untracked files should be absent when Sem returns no entities")
+  assert_true(not vim.inspect(commands):find("git", 1, true),
+    "Sem inventory must not invoke the removed native Git inventory")
+
+  local unavailable_result
+  local unavailable_calls = 0
+  inventory.compute_async({
+    cwd = root,
+    sections = {},
+    sem_available = function() return false end,
+    run_text_async = function()
+      unavailable_calls = unavailable_calls + 1
+    end,
+  }, function(computed)
+    unavailable_result = computed
+  end)
+  assert_true(unavailable_result ~= nil and unavailable_result.error:find("requires Sem", 1, true) ~= nil,
+    "missing Sem should return a visible inventory error")
+  assert_true(unavailable_calls == 0, "missing Sem should not invoke another inventory backend")
+
+  local failed_result
+  inventory.compute_async({
+    cwd = root,
+    sections = {},
+    sem_available = function() return true end,
+    run_text_async = function(_, _, cb)
+      cb({ code = 1, stdout = "", stderr = "parse failed", output = "parse failed" })
+    end,
+  }, function(computed)
+    failed_result = computed
+  end)
+  assert_true(failed_result ~= nil and failed_result.error:find("parse failed", 1, true) ~= nil,
+    "Sem failures should surface the underlying error without native fallback")
 end
 
 local ok, err = xpcall(run, debug.traceback)

@@ -7,6 +7,7 @@ return {
     opts = {
       perf_logging = false,
       status_cursor_prewarm = true,
+      walkthrough_inventory = false,
       -- status_cursor_prewarm_max_hunks = 2
     },
     config = function(_, opts)

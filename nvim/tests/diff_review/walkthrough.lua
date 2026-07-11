@@ -5,6 +5,7 @@ local render_orchestrator = require("diff_review.views.status.render_orchestrato
 local session = require("diff_review.session")
 local gh = require("diff_review.integrations.gh")
 local walkthrough = require("diff_review.views.walkthrough")
+local commands = require("diff_review.views.commands")
 
 local root = "D:/diffreview-flow-root"
 local nested_cwd = root .. "/engine/plugins/model"
@@ -164,6 +165,43 @@ function backend.system(command)
 end
 
 function backend.system_async(command, input, cb)
+  if command[1] == "sem" and command[2] == "diff" then
+    local changes = {}
+    for _, relpath in ipairs({ "a.txt", "b.txt", "c.txt" }) do
+      changes[#changes + 1] = {
+        changeType = "modified",
+        entityType = "orphan",
+        entityName = "module-level",
+        filePath = relpath,
+      }
+    end
+    changes[#changes + 1] = {
+      changeType = "added",
+      entityType = "orphan",
+      entityName = "module-level",
+      filePath = "new.txt",
+    }
+    vim.defer_fn(function()
+      local stdout = vim.json.encode({ summary = {}, changes = changes })
+      cb({ code = 0, stdout = stdout, stderr = "", output = stdout })
+    end, 3)
+    return
+  end
+  if command[1] == "sem" and command[2] == "entities" then
+    vim.defer_fn(function()
+      local stdout = vim.json.encode({
+        {
+          type = "orphan",
+          name = "module-level",
+          file = root .. "/new.txt",
+          start_line = 1,
+          end_line = 4,
+        },
+      })
+      cb({ code = 0, stdout = stdout, stderr = "", output = stdout })
+    end, 3)
+    return
+  end
   vim.defer_fn(function()
     local output, code = backend.system(command)
     cb({ code = code, stdout = output, stderr = "", output = output })
@@ -622,7 +660,16 @@ local function run()
   diff_review.set_git_backend(backend)
   gh.set_backend(gh_backend)
   walkthrough.set_reader(fixture_reader)
-  diff_review.setup({ about_auto_generate = false })
+  local invalid_config_ok, invalid_config_error = pcall(diff_review.setup, {
+    about_auto_generate = false,
+    walkthrough_inventory = true,
+  })
+  assert_true(not invalid_config_ok and tostring(invalid_config_error):find('must be "sem" or false', 1, true) ~= nil,
+    "walkthrough inventory should reject removed native option values")
+  diff_review.setup({ about_auto_generate = false, walkthrough_inventory = false })
+  assert_true(commands._walkthrough_host(0).inventory_async == nil,
+    "walkthrough_inventory=false should remove inventory from the walkthrough critical path")
+  diff_review.setup({ about_auto_generate = false, walkthrough_inventory = "sem" })
 
   local wide_flow = walkthrough._flow_summary_lines_for_test(valid_doc().flow, 120)
   assert_true(wide_flow[1] == "Walkthrough fixture JSON → DiffReviewWalkthrough parser → status summary rows",
@@ -754,7 +801,9 @@ local function run()
     "inventory should render before status change sections")
   local inventory_file_row = "files +1 0 ~3"
   assert_true(buffer_contains(summary_buf, inventory_file_row),
-    "walkthrough inventory should count changed files")
+    "walkthrough inventory should count changed files: "
+      .. table.concat(vim.tbl_filter(function(line) return line:find("files", 1, true) ~= nil end,
+        vim.api.nvim_buf_get_lines(summary_buf, 0, -1, false)), " | "))
   assert_true(buffer_has_status_highlight_for_text(summary_buf, inventory_file_row,
     "+1", "DiffReviewAddRange"), "inventory added count should be green")
   assert_true(buffer_has_status_highlight_for_text(summary_buf, inventory_file_row,

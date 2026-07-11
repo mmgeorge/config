@@ -12,8 +12,8 @@ local function assert_equal(actual, expected, message)
 end
 
 local choices = branch_source.source_choices()
-assert_equal(choices[1].id, 'remote', 'remote source must remain first')
-assert_equal(choices[2].id, 'local', 'local source must remain second')
+assert_equal(choices[1].id, 'local', 'local source must remain first')
+assert_equal(choices[2].id, 'remote', 'remote source must remain second')
 
 local fetch_args = branch_source.remote_fetch_args('origin')
 assert_equal(table.concat(fetch_args, ' '),
@@ -43,6 +43,7 @@ assert_equal(branch_source.existing_remote_action({ local_exists = true }), 'blo
 local current_action
 local command_history = {}
 local fake_action = {}
+local notifications = {}
 local fake_repository = {
   common_dir = 'D:/repo/.git',
   pane_path = 'D:/repo',
@@ -90,18 +91,18 @@ package.preload.wezterm = function()
         return true, 'origin\n', ''
       end
       if command_contains(command, 'for-each-ref') and command_contains(command, 'refs/remotes/origin') then
-        return true, 'origin/main\t100\norigin/coworker/demo\t90\norigin/local-only\t80\n', ''
+        return true, 'origin\t100\trefs/remotes/origin/master\tEND\norigin/main\t100\t\tEND\norigin/coworker/demo\t90\t\tEND\norigin/behind\t80\t\tEND\n', ''
       end
       if command_contains(command, 'for-each-ref') and command_contains(command, 'refs/heads') then
-        return true, 'main\t100\nlocal-only\t90\n', ''
+        return true, 'main\t100\t\tEND\nlocal-only\t90\t\tEND\n', ''
       end
       if command_contains(command, 'show-ref --verify --quiet refs/heads/coworker/demo') then
         return false, '', ''
       end
-      if command_contains(command, 'rev-parse --verify origin/local-only') then
+      if command_contains(command, 'rev-parse --verify origin/behind') then
         return true, 'remote-tip\n', ''
       end
-      if command_contains(command, 'rev-parse --verify local-only') then
+      if command_contains(command, 'rev-parse --verify behind') then
         return true, 'local-tip\n', ''
       end
       return true, '', ''
@@ -116,7 +117,11 @@ package.preload.wezterm = function()
 end
 
 local worktree = require 'worktree'
+worktree.settings.debug = false
 assert_equal(type(worktree.menu), 'function', 'worktree module must load with the branch-source model')
+assert_equal(worktree.settings.branch_prefix, 'mmgeorge/', 'default branch prefix must use mmgeorge')
+assert_equal(worktree.settings.layouts.by_repo.maps.branch_prefix, 'matt9222/',
+  'maps repository must retain the matt9222 prefix')
 
 local fake_window = {}
 function fake_window:active_workspace()
@@ -125,7 +130,8 @@ end
 function fake_window:perform_action(action)
   current_action = action
 end
-function fake_window:toast_notification()
+function fake_window:toast_notification(_, message)
+  table.insert(notifications, message)
 end
 
 local fake_pane = {}
@@ -158,8 +164,19 @@ local function choice_by_id(id)
   return nil
 end
 
+local function notification_contains(expected)
+  for _, message in ipairs(notifications) do
+    if message:find(expected, 1, true) then
+      return true
+    end
+  end
+
+  return false
+end
+
 local function open_branch_source(mode)
   command_history = {}
+  notifications = {}
   worktree.menu()(fake_window, fake_pane)
   choose_id('create-current')
   choose_id(mode)
@@ -171,6 +188,15 @@ assert_equal(command_history_contains('fetch --prune --no-tags --no-recurse-subm
   'new branch remote source must refresh only the selected remote')
 assert_equal(current_action.spec.title, 'Start point from origin for repo',
   'new branch remote source must show refreshed remote refs')
+assert_equal(choice_by_id('origin'), nil,
+  'remote source must omit the symbolic remote HEAD')
+choose_id('origin/main')
+assert_equal(current_action.kind, 'prompt', 'new branch start point must prompt for a branch name')
+current_action.spec.action(fake_window, fake_pane, 'temp')
+assert_equal(command_history_contains('worktree add -b mmgeorge/temp'), false,
+  'existing branch collision must stop before git worktree add')
+assert_equal(notification_contains('Branch mmgeorge/temp already exists'), true,
+  'existing branch collision must explain how to use the local branch flow')
 
 open_branch_source('new')
 choose_id('local')
@@ -195,9 +221,19 @@ assert_equal(command_history_contains('worktree add -b coworker/demo D:/coworker
 
 open_branch_source('existing')
 choose_id('remote')
-choose_id('origin/local-only')
-assert_equal(command_history_contains('branch --force local-only origin/local-only'), true,
-  'remote source must fast-forward a matching local branch that is behind')
+local existing_remote_choice_ids = {}
+for _, choice in ipairs(current_action.spec.choices) do
+  table.insert(existing_remote_choice_ids, choice.id)
+end
+assert_equal(choice_by_id('origin/behind') ~= nil, true,
+  'existing remote source must include origin/behind: ' .. table.concat(existing_remote_choice_ids, ', '))
+choose_id('origin/behind')
+recorded_commands = {}
+for _, command in ipairs(command_history) do
+  table.insert(recorded_commands, table.concat(command, ' '))
+end
+assert_equal(command_history_contains('branch --force behind origin/behind'), true,
+  'remote source must fast-forward a matching local branch that is behind\n' .. table.concat(recorded_commands, '\n'))
 
 open_branch_source('existing')
 choose_id('local')
@@ -208,7 +244,7 @@ assert_equal(current_action.spec.title, 'Existing branch from local for repo',
 
 fake_repository = {
   common_dir = 'D:/code/test-wt/.bare',
-  pane_path = 'D:/code/test-wt',
+  pane_path = '/D:/code/test-wt',
   worktrees = table.concat({
     'worktree D:/code/test-wt/.bare',
     'bare',
@@ -222,6 +258,8 @@ fake_repository = {
 worktree.menu()(fake_window, fake_pane)
 assert_equal(choice_by_id('create-current') ~= nil, true,
   'bare repository root must offer new worktree creation for the current repository')
+assert_equal(command_history_contains('git -C D:/code/test-wt rev-parse'), true,
+  'Windows file URL paths must lose their leading slash before Git runs')
 local main_worktree_choice = choice_by_id('D:/code/test-wt/master')
 assert_equal(main_worktree_choice ~= nil, true,
   'bare repository root must list its main worktree')

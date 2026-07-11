@@ -15,6 +15,7 @@
 ---@field status_diff_viewport_overscan integer
 ---@field about_auto_generate boolean
 ---@field about_auto_generate_delay_ms integer
+---@field walkthrough_inventory "sem"|false compute inventory with Sem or disable it
 ---@field branch_prefix string default prefix for branches created with `bc`; a repo's .diffreview.json may override it
 ---@field keymaps DiffReviewKeymapConfig
 
@@ -85,6 +86,7 @@ M.defaults = {
   status_diff_viewport_overscan = 80,
   about_auto_generate = true,
   about_auto_generate_delay_ms = 1000,
+  walkthrough_inventory = "sem",
   branch_prefix = "matt9222/",
   keymaps = {
     status = {
@@ -127,7 +129,11 @@ M.options = vim.deepcopy(M.defaults)
 ---@param opts? DiffReviewConfig
 ---@return DiffReviewConfig
 function M.setup(opts)
-  M.options = vim.tbl_deep_extend("force", vim.deepcopy(M.defaults), opts or {})
+  local options = vim.tbl_deep_extend("force", vim.deepcopy(M.defaults), opts or {})
+  if options.walkthrough_inventory ~= "sem" and options.walkthrough_inventory ~= false then
+    error('walkthrough_inventory must be "sem" or false')
+  end
+  M.options = options
   return M.options
 end
 

@@ -16,12 +16,12 @@ local M = {}
 function M.source_choices()
   return {
     {
-      id = 'remote',
-      label = 'Remote branch (refresh first)',
-    },
-    {
       id = 'local',
       label = 'Local branch (use current tip)',
+    },
+    {
+      id = 'remote',
+      label = 'Remote branch (refresh first)',
     },
   }
 end

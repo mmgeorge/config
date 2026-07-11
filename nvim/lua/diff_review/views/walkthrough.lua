@@ -1692,7 +1692,7 @@ end
 ---@return string?
 local function status_inventory_signature(state)
   if type(state) ~= "table" or type(state.sections) ~= "table" then return nil end
-  local parts = {}
+  local parts = { tostring(state.request_id or 0) }
   for _, section in ipairs(state.sections or {}) do
     parts[#parts + 1] = tostring(section.name or "")
     for _, file in ipairs(section.files or {}) do
@@ -1705,12 +1705,9 @@ local function status_inventory_signature(state)
         tostring(file.added or 0),
         tostring(file.removed or 0),
       }, "\t")
-      for _, hunk in ipairs(file.hunks or {}) do
-        parts[#parts + 1] = tostring(hunk.diff or "")
-      end
     end
   end
-  return vim.fn.sha256(table.concat(parts, "\n"))
+  return table.concat(parts, "\n")
 end
 
 ---@param mode DiffReviewWalkthroughMode
