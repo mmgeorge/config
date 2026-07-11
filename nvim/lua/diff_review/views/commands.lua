@@ -77,14 +77,40 @@ end
 ---@param buf integer
 ---@return DiffReviewWalkthroughHost
 function M._walkthrough_host(buf)
+  local resolved_root
+
+  local function status_state()
+    return session.states and session.states[buf] or session.status
+  end
+
+  --- Resolve and cache the root shared by walkthrough artifact and inventory reads.
+  ---@param cb fun(root?: string, err?: string)
+  local function resolve_root_async(cb)
+    if resolved_root then
+      cb(resolved_root, nil)
+      return
+    end
+    local state = status_state()
+    local cwd = state and state.cwd
+    if not cwd or cwd == "" then
+      cb(nil, "No repository loaded")
+      return
+    end
+    git_backend.git_root_at_async(cwd, function(root, root_err)
+      if root then resolved_root = root end
+      cb(root, root_err)
+    end)
+  end
+
   return {
     buf = buf,
     cwd = function()
-      local state = session.states and session.states[buf] or session.status
-      return state and state.cwd
+      local state = status_state()
+      return resolved_root or (state and state.cwd)
     end,
+    resolve_root_async = resolve_root_async,
     get_state = function()
-      return session.states and session.states[buf] or session.status
+      return status_state()
     end,
     file_key = status_keys.file_key,
     hunk_key = status_keys.hunk_key,
@@ -98,25 +124,33 @@ function M._walkthrough_host(buf)
     end,
     git_list_async = git_backend.systemlist_async,
     inventory_async = function(cb)
-      local state = session.states and session.states[buf] or session.status
-      local cwd = state and state.cwd
-      if not cwd or cwd == "" then
-        cb({ rows = {} })
-        return
-      end
-      inventory.compute_async({
-        cwd = cwd,
-        sections = state.sections or {},
-        git_list_async = git_backend.systemlist_async,
-        read_file_lines = syntax_engine.file_source_lines,
-        repo_relative = function(filename)
-          return repo_relative(filename, cwd)
-        end,
-      }, function(result)
-        if result and result.error and result.error ~= "" then
-          notify_error("Walkthrough inventory failed: " .. result.error, "DiffReview")
+      resolve_root_async(function(root, root_err)
+        if not root then
+          if root_err and root_err ~= "" then
+            notify_error("Walkthrough inventory failed: " .. root_err, "DiffReview")
+          end
+          cb({ rows = {} })
+          return
         end
-        cb(result or { rows = {} })
+        local state = status_state()
+        if not state then
+          cb({ rows = {} })
+          return
+        end
+        inventory.compute_async({
+          cwd = root,
+          sections = state.sections or {},
+          git_list_async = git_backend.systemlist_async,
+          read_file_lines = syntax_engine.file_source_lines,
+          repo_relative = function(filename)
+            return repo_relative(filename, root)
+          end,
+        }, function(result)
+          if result and result.error and result.error ~= "" then
+            notify_error("Walkthrough inventory failed: " .. result.error, "DiffReview")
+          end
+          cb(result or { rows = {} })
+        end)
       end)
     end,
   }

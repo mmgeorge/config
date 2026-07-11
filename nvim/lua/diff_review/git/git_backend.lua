@@ -227,9 +227,16 @@ function M.delete_path(path)
   return vim.fn.delete(path)
 end
 
+--- Resolve the repository root from `cwd` so callers do not depend on Neovim's launch directory.
+---@param cwd? string
 ---@param cb fun(root?: string, err?: string)
-function M.git_root_async(cb)
-  M.systemlist_async({ "git", "rev-parse", "--show-toplevel" }, function(output, code, stderr)
+function M.git_root_at_async(cwd, cb)
+  local command = { "git" }
+  if cwd and cwd ~= "" then
+    vim.list_extend(command, { "-C", cwd })
+  end
+  vim.list_extend(command, { "rev-parse", "--show-toplevel" })
+  M.systemlist_async(command, function(output, code, stderr)
     local root = output[1]
     if code ~= 0 or not root or root == "" then
       local message = vim.trim(stderr or "")
@@ -238,6 +245,11 @@ function M.git_root_async(cb)
     end
     cb(vim.trim(root), nil)
   end)
+end
+
+---@param cb fun(root?: string, err?: string)
+function M.git_root_async(cb)
+  M.git_root_at_async(nil, cb)
 end
 
 ---@return string? root

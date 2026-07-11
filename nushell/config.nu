@@ -535,6 +535,8 @@ def screenshotPull [url?: string] {
   }
 }
 
+$env.config.shell_integration.osc7 = true
+
 $env.config.history = {
   file_format: "sqlite",
   sync_on_enter: true, # Not sure this does anything when sqlite mode enabled.

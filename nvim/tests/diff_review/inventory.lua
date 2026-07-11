@@ -218,6 +218,21 @@ local function run()
   assert_true(detail_names(result, "files", "modified") == "blue/docs/rendering.md,blue/plans/implicit.md,docs/usage.md,plans/followup.md,src/lib.rs,src/panel.ts",
     "files detail list should include changed files")
 
+  local nested_file = fake_file("docs/nested.md", "M", nil)
+  nested_file.filename = root .. "/workspace/docs/nested.md"
+  result = compute({
+    sections = { { name = "unstaged", files = { nested_file } } },
+    repo_relative = function(filename)
+      return filename:sub(#root + 2)
+    end,
+    old_lines_by_relpath = { ["workspace/docs/nested.md"] = { "old nested docs" } },
+    new_lines_by_relpath = { ["workspace/docs/nested.md"] = { "new nested docs" } },
+  })
+  rows = rows_by_label(result)
+  assert_counts(rows.docs, 0, 0, 1, "nested working-directory docs")
+  assert_true(detail_names(result, "files", "modified") == "workspace/docs/nested.md",
+    "inventory should derive repository-relative paths from absolute filenames")
+
   result = compute({
     sections = {
       {

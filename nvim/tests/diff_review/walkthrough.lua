@@ -7,8 +7,10 @@ local gh = require("diff_review.integrations.gh")
 local walkthrough = require("diff_review.views.walkthrough")
 
 local root = "D:/diffreview-flow-root"
+local nested_cwd = root .. "/engine/plugins/model"
 local head_sha = string.rep("a", 40)
 local untracked_files = {}
+local observed_commands = {}
 
 local function assert_true(condition, message)
   if not condition then error(message, 2) end
@@ -102,8 +104,15 @@ end
 local backend = {}
 
 function backend.systemlist(command)
+  observed_commands[#observed_commands + 1] = command_key(command)
   local key = command_key(command)
   if key == "git\trev-parse\t--show-toplevel" then
+    return { root }, 0
+  end
+  if key == "git\t-C\t" .. root .. "\trev-parse\t--show-toplevel" then
+    return { root }, 0
+  end
+  if key == "git\t-C\t" .. nested_cwd .. "\trev-parse\t--show-toplevel" then
     return { root }, 0
   end
   if key == "git\t-C\t" .. root .. "\trev-parse\t--short\tHEAD" then
@@ -316,6 +325,13 @@ local function trigger_buf_mapping(buf, key)
   end)
   assert_true(type(mapping.callback) == "function", "missing buffer mapping for " .. key)
   mapping.callback()
+end
+
+local function buffer_has_mapping(buf, key)
+  for _, mapping in ipairs(vim.api.nvim_buf_get_keymap(buf, "n")) do
+    if mapping.lhs == key then return true end
+  end
+  return false
 end
 
 local function current_win_view(buf)
@@ -702,12 +718,20 @@ local function run()
   -- ── integrated status summary + lazy inline comment boxes ─────────────────
   set_walkthrough_doc(valid_doc())
   local buf = open_status()
+  local status_state = session.states[buf] or session.status
+  status_state.cwd = nested_cwd
   local original_q_desc = vim.api.nvim_buf_call(buf, function()
     return vim.fn.maparg("q", "n", false, true).desc
   end)
 
   vim.o.columns = 120
   local summary_buf = start_walkthrough(buf)
+  assert_true(vim.tbl_contains(observed_commands,
+    "git\t-C\t" .. nested_cwd .. "\trev-parse\t--show-toplevel"),
+    "walkthrough should resolve the repository root from the status working directory")
+  assert_true(walkthrough._modes[buf].host.cwd() == root,
+    "walkthrough host should cache the resolved repository root")
+  status_state.cwd = root
   local float_win = find_float_with("walkthrough fixture")
   assert_true(float_win == nil, "walkthrough should not open a summary popup")
   assert_true(not buffer_contains(summary_buf, "WARNING"), "fresh walkthrough should not warn")
@@ -853,6 +877,9 @@ local function run()
     "summary task title should be bold white")
   assert_true(buffer_contains(summary_buf, "Reviewers need the fixture story before individual file rewrites."),
     "summary task justification missing from folded task row")
+  local task_title_row = find_row(summary_buf, "1. Update a.txt through the first task.")
+  assert_true(vim.fn.foldclosed(task_title_row) == -1,
+    "folded task should keep its title and leading justification text visible")
   assert_true(not buffer_has_highlight_for_text(summary_buf, "Reviewers need the fixture story", "Reviewers",
     "DiffReviewWalkthroughJustification"), "summary task justification should use normal highlight")
   wait_for(function()
@@ -860,15 +887,7 @@ local function run()
   end, "folded task should hide subtask justification")
   wait_for(function()
     return row_is_folded(summary_buf, find_row(summary_buf, "Rewrite the first fixture file."))
-  end, "folded task should hide subtask rows")
-  toggle_row(buf, "1. Update a.txt through the first task.")
-  wait_for(function()
-    return not row_is_folded(summary_buf, find_row(summary_buf, "Rewrite the first fixture file."))
-  end,
-    "expanding first walkthrough task did not show subtask rows")
-  toggle_row(buf, "└─ Rewrite the first fixture file.")
-  wait_for(function() return row_is_folded(summary_buf, find_row(summary_buf, "Modify Cache a.txt rewrite")) end,
-    "folding a walkthrough subtask should hide its items")
+  end, "default walkthrough state should show the folded subtask title")
   toggle_row(buf, "└─ Rewrite the first fixture file.")
   wait_for(function()
     return not row_is_folded(summary_buf, find_row(summary_buf, "Modify Cache a.txt rewrite"))
@@ -915,7 +934,7 @@ local function run()
   local expanded_lines = vim.api.nvim_buf_get_lines(summary_buf, 0, -1, false)
   assert_true(expanded_lines[expanded_second_task_row - 1] == "",
     "expanded walkthrough task should leave a blank separator before the next task")
-  expand_row_if_needed(buf, "2. Update b.txt through the second task.", "   └─ Add fn b.txt rewrite to repeat")
+  expand_row_if_needed(buf, "└─ Rewrite the second fixture file.", "   └─ Add fn b.txt rewrite to repeat")
   assert_true(buffer_contains(summary_buf, "The first fixture row carries the opening example for"),
     "summary subtask justification missing")
   assert_true(buffer_contains(summary_buf, "rendering."),
@@ -987,6 +1006,9 @@ local function run()
   assert_true(box_mark ~= nil, "inline comment box mark missing")
   assert_true(box_mark[2] == step_row - 1, "inline comment box should anchor below the selected row")
   assert_true(box_mark[4].virt_lines_above ~= true, "inline comment box should render below the selected row")
+  assert_true(not buffer_has_mapping(buf, "C"), "read-only walkthrough box exposed the comment edit action")
+  assert_true(not buffer_has_mapping(buf, "J"), "read-only walkthrough box exposed the comment delete action")
+  assert_true(not vim.bo[buf].modifiable, "walkthrough status buffer must remain read-only around comment boxes")
   assert_true(box_contains(buf, "1.1-2 Rewrite the fixture line to NEW."), "inline box heading missing")
   assert_true(box_contains(buf, "1.2-2 Check the total marker on the next comment."),
     "automatic mode should render all visible comments")
@@ -1012,9 +1034,29 @@ local function run()
   assert_true(not box_contains(buf, "rewrite the second line for the first fixture file"),
     "inline box should not show change note")
   assert_true(not box_contains(buf, "[z] back"), "inline box should not show command footer")
+  local original_columns = vim.o.columns
+  vim.o.columns = 48
+  vim.api.nvim_exec_autocmds("VimResized", {})
+  wait_for(function()
+    local resized_mark = comment_box_mark_containing(buf, "concrete")
+    return resized_mark and comment_box_inner_width(resized_mark) <= 40
+  end, "walkthrough comment box did not resize with the terminal")
+  local resized_box_mark = comment_box_mark_containing(buf, "concrete")
+  for _, virtual_line in ipairs(resized_box_mark[4].virt_lines or {}) do
+    local text = ""
+    for _, chunk in ipairs(virtual_line) do text = text .. tostring(chunk[1] or "") end
+    assert_true(vim.fn.strdisplaywidth(text) <= 48, "resized walkthrough comment box overflowed the terminal")
+  end
+  vim.o.columns = original_columns
+  vim.api.nvim_exec_autocmds("VimResized", {})
+  wait_for(function()
+    local restored_mark = comment_box_mark_containing(buf, "concrete")
+    return restored_mark and comment_box_inner_width(restored_mark) == 84
+  end, "walkthrough comment box did not restore after terminal resize")
 
   expand_row_if_needed(buf, "b.txt +", "NEW b.txt")
   wait_for(function() return box_contains(buf, "forward navigation") end, "step 3 box did not render")
+  assert_true(not row_is_folded(buf, find_row(buf, "NEW b.txt")), "b.txt did not stay expanded before folding a.txt")
   assert_true(box_contains(buf, "2.1-1 Mirror the rewrite in the second fixture."), "step 3 task label missing")
   assert_true(not box_contains(buf, "Task 2.1-1 Mirror the rewrite in the second fixture."),
     "step 2 task label should not include Task")
@@ -1033,8 +1075,17 @@ local function run()
   toggle_row(buf, "a.txt +")
   wait_for(function() return not box_contains(buf, "concrete") end,
     "folding a.txt should remove its visible walkthrough boxes")
-  wait_for(function() return box_contains(buf, "forward navigation") end,
-    "folding a.txt should keep b.txt's visible box")
+  local kept_b_box = vim.wait(2000, function() return box_contains(buf, "forward navigation") end, 10)
+  assert_true(
+    kept_b_box,
+    "folding a.txt should keep b.txt's visible box: "
+      .. vim.inspect({
+        box_text = box_text(buf),
+        b_row = find_row(buf, "b.txt +"),
+        b_folded = row_is_folded(buf, find_row(buf, "NEW b.txt")),
+        folds = (session.states[buf] or session.status).folds,
+      })
+  )
 
   toggle_row(buf, "Walkthrough:")
   wait_for(function()
@@ -1071,7 +1122,7 @@ local function run()
   }
   set_walkthrough_doc(graph_doc)
   summary_buf = start_walkthrough(buf)
-  expand_row_if_needed(buf, "1. Update a.txt through the first task.", "└─ Rewrite the first fixture file.")
+  expand_row_if_needed(buf, "└─ Rewrite the first fixture file.", "Modify Cache a.txt rewrite")
   assert_row_before(buf, "Modify Cache a.txt rewrite", "Modify Cache a.txt total marker",
     "walkthrough change rows should remain visually connected before the next action")
   assert_true(not buffer_contains(summary_buf, "◦ Second action comment."),
@@ -1093,7 +1144,7 @@ local function run()
     "The second row keeps the location label aligned while sharing the same anchor line.")
   set_walkthrough_doc(added_span_doc)
   summary_buf = start_walkthrough(buf)
-  expand_row_if_needed(buf, "1. Update a.txt through the first task.", "└─ Rewrite the first fixture file.")
+  expand_row_if_needed(buf, "└─ Rewrite the first fixture file.", "Modify Cache a.txt rewrite")
   wait_for(function() return buffer_contains(summary_buf, "Modify Cache a.txt render snapshot") end,
     "expanding walkthrough subtask should show sibling change rows")
   assert_true(not buffer_contains(summary_buf, "◦ Store solver buffers on a resource."),
@@ -1330,6 +1381,16 @@ local function run()
   summary_buf = start_walkthrough(buf)
   wait_for(function() return buffer_contains(summary_buf, "Walkthrough:") end,
     "long walkthrough text should enter walkthrough mode")
+  local long_task_title_row = find_row(summary_buf, "1. Update a.txt through the first task.")
+  local long_task_subtask_row = find_row(summary_buf, "Rewrite the first fixture file.")
+  for heading_row = long_task_title_row, long_task_subtask_row - 1 do
+    local fold_start = vim.fn.foldclosed(heading_row)
+    assert_true(fold_start == -1 or fold_start == heading_row,
+      ("folded task should keep wrapped heading row %d visible, but fold %d hides it")
+        :format(heading_row, fold_start))
+  end
+  assert_true(row_is_folded(summary_buf, long_task_subtask_row),
+    "folded task should still hide nested subtasks after preserving its full heading")
   trigger_buf_mapping(buf, "ow")
   wait_for(function() return not buffer_contains(buf, "Walkthrough:") end,
     "long walkthrough text mode did not toggle off")
@@ -1357,7 +1418,7 @@ local function run()
   set_walkthrough_doc(optional_change_annotation)
   captured_notifications = {}
   summary_buf = start_walkthrough(buf)
-  expand_row_if_needed(buf, "1. Update a.txt through the first task.", "└─ Rewrite the first fixture file.")
+  expand_row_if_needed(buf, "└─ Rewrite the first fixture file.", "Modify Cache a.txt summary-only rewrite")
   wait_for(function() return buffer_contains(summary_buf, "Modify Cache a.txt summary-only rewrite") end,
     "summary-only change without annotation should render")
   assert_true(not saw_notification_containing("invalid \"annotation\""),

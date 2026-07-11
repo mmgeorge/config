@@ -148,12 +148,12 @@ end
 ---@param file table
 ---@return string
 local function file_relpath(opts, file)
-  if type(file.relpath) == "string" and file.relpath ~= "" and not file.relpath:match("^%a:[/\\]") then
-    return normalize_relpath(file.relpath)
-  end
   if opts.repo_relative and type(file.filename) == "string" then
     local relpath = opts.repo_relative(file.filename)
     if relpath and relpath ~= "" then return normalize_relpath(relpath) end
+  end
+  if type(file.relpath) == "string" and file.relpath ~= "" and not file.relpath:match("^%a:[/\\]") then
+    return normalize_relpath(file.relpath)
   end
   return normalize_relpath(file.filename)
 end

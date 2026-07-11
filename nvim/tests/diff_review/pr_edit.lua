@@ -111,6 +111,10 @@ local pr_diff_text = table.concat({
 local edit_calls = {}
 ---@type { command: string[], input: string?, payload: table }[]
 local standalone_comment_calls = {}
+standalone_comment_calls.updates = {}
+standalone_comment_calls.deletes = {}
+standalone_comment_calls.replies = {}
+standalone_comment_calls.reply_should_fail = false
 ---@type { command: string[], input: string?, payload: table }[]
 local issue_comment_calls = {}
 ---@type { command: string[], input: string?, payload: table }[]
@@ -143,12 +147,57 @@ function gh_backend.system_async(command, input, cb)
     if key == "gh api graphql --input -" then
       local graphql_payload = vim.json.decode(input or "{}")
       local query = tostring(graphql_payload.query or "")
+      if draft_status_calls.should_fail
+        and (query:find("PullRequestReadyForReview", 1, true)
+          or query:find("PullRequestToDraft", 1, true)
+          or query:find("closePullRequest", 1, true)
+          or query:find("reopenPullRequest", 1, true)) then
+        cb({ code = 1, stdout = "", stderr = "mock PR state failure", output = "mock PR state failure" })
+        return
+      end
+      if query:find("updatePullRequestReviewComment", 1, true) then
+        local mutation_input = graphql_payload.variables and graphql_payload.variables.input or {}
+        standalone_comment_calls.updates[#standalone_comment_calls.updates + 1] = {
+          command = command,
+          input = input,
+          payload = mutation_input,
+        }
+        local stdout = vim.json.encode({
+          data = {
+            updatePullRequestReviewComment = {
+              pullRequestReviewComment = {
+                id = mutation_input.pullRequestReviewCommentId,
+                databaseId = 3409923137,
+                body = mutation_input.body,
+                path = "src/a.txt",
+                line = 5,
+                createdAt = "2026-06-14T17:14:07Z",
+                updatedAt = "2026-06-14T19:00:00Z",
+                author = { login = "me" },
+              },
+            },
+          },
+        })
+        cb({ code = 0, stdout = stdout, stderr = "", output = stdout })
+        return
+      end
+      if query:find("deletePullRequestReviewComment", 1, true) then
+        local mutation_input = graphql_payload.variables and graphql_payload.variables.input or {}
+        standalone_comment_calls.deletes[#standalone_comment_calls.deletes + 1] = {
+          command = command,
+          input = input,
+          payload = mutation_input,
+        }
+        local stdout = vim.json.encode({ data = { deletePullRequestReviewComment = { clientMutationId = vim.NIL } } })
+        cb({ code = 0, stdout = stdout, stderr = "", output = stdout })
+        return
+      end
       if query:find("markPullRequestReadyForReview", 1, true) then
         draft_status_calls[#draft_status_calls + 1] = { command = command, input = input, payload = graphql_payload }
         local stdout = vim.json.encode({
           data = {
             markPullRequestReadyForReview = {
-              pullRequest = { id = "PR_kwTEST7", isDraft = false },
+              pullRequest = { id = "PR_kwTEST7", state = "OPEN", isDraft = false },
             },
           },
         })
@@ -160,7 +209,31 @@ function gh_backend.system_async(command, input, cb)
         local stdout = vim.json.encode({
           data = {
             convertPullRequestToDraft = {
-              pullRequest = { id = "PR_kwTEST7", isDraft = true },
+              pullRequest = { id = "PR_kwTEST7", state = "OPEN", isDraft = true },
+            },
+          },
+        })
+        cb({ code = 0, stdout = stdout, stderr = "", output = stdout })
+        return
+      end
+      if query:find("closePullRequest", 1, true) then
+        draft_status_calls[#draft_status_calls + 1] = { command = command, input = input, payload = graphql_payload }
+        local stdout = vim.json.encode({
+          data = {
+            closePullRequest = {
+              pullRequest = { id = "PR_kwTEST7", state = "CLOSED", isDraft = false },
+            },
+          },
+        })
+        cb({ code = 0, stdout = stdout, stderr = "", output = stdout })
+        return
+      end
+      if query:find("reopenPullRequest", 1, true) then
+        draft_status_calls[#draft_status_calls + 1] = { command = command, input = input, payload = graphql_payload }
+        local stdout = vim.json.encode({
+          data = {
+            reopenPullRequest = {
+              pullRequest = { id = "PR_kwTEST7", state = "OPEN", isDraft = draft_status_calls.reopen_as_draft == true },
             },
           },
         })
@@ -390,6 +463,26 @@ function gh_backend.system_async(command, input, cb)
       cb({ code = 0, stdout = stdout, stderr = "", output = stdout })
       return
     end
+    if key == "gh api --method POST /repos/owner/repo/pulls/7/comments/3409923139/replies --input -" then
+      local payload = vim.json.decode(input or "{}")
+      standalone_comment_calls.replies[#standalone_comment_calls.replies + 1] = { command = command, input = input, payload = payload }
+      if standalone_comment_calls.reply_should_fail then
+        cb({ code = 1, stdout = "", stderr = "mock reply failure", output = "mock reply failure" })
+        return
+      end
+      local stdout = vim.json.encode({
+        id = 3409923140,
+        node_id = "PRRC_REPLY_2",
+        in_reply_to_id = 3409923139,
+        body = payload.body,
+        created_at = "2026-06-15T03:20:00Z",
+        updated_at = "2026-06-15T03:20:00Z",
+        html_url = "https://github.com/owner/repo/pull/7#discussion_r3409923140",
+        user = { login = "me" },
+      })
+      cb({ code = 0, stdout = stdout, stderr = "", output = stdout })
+      return
+    end
     if key == "gh api --method POST /repos/owner/repo/issues/7/comments --input -" then
       local payload = vim.json.decode(input or "{}")
       local call_index = #issue_comment_calls + 1
@@ -573,19 +666,25 @@ local function set_datetime_now(value)
   datetime.now_override = function() return epoch end
 end
 
---- Concatenated text of every virt_lines comment box (status namespace) with its anchor row.
---- Unfocused comments render as boxes (virtual lines), so box content is not in the real lines.
+--- Concatenated text of every compact comment box with its first cursorable row.
 local function box_text_lines(buf)
-  local ui = require("diff_review.infra.ui")
   local out = {}
-  local ok, marks = pcall(vim.api.nvim_buf_get_extmarks, buf, ui.status_ns, 0, -1, { details = true })
-  if not ok then return out end
-  for _, mark in ipairs(marks) do
-    local vlines = mark[4] and mark[4].virt_lines
-    for _, vline in ipairs(vlines or {}) do
-      local text = ""
-      for _, chunk in ipairs(vline) do text = text .. (chunk[1] or "") end
-      out[#out + 1] = { text = text, anchor_row = mark[2] + 1 }
+  local state = require("diff_review.views.pr.review").state(buf)
+  local buffer_lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  local current
+  for row = 1, #buffer_lines do
+    local entry = state and state.entries and state.entries[row] or nil
+    if entry and entry.kind == "comment_box" then
+      if entry.comment_box_boundary == "header" or not current then
+        current = { lines = {}, anchor_row = row, descriptor = entry.comment_box }
+      end
+      current.lines[#current.lines + 1] = buffer_lines[row] or ""
+      if entry.comment_box_boundary == "footer" then
+        current.text = table.concat(current.lines, "\n")
+        current.lines = nil
+        out[#out + 1] = current
+        current = nil
+      end
     end
   end
   return out
@@ -613,20 +712,20 @@ local function find_row(buf, needle)
   for index, line in ipairs(lines) do
     if line:find(needle, 1, true) then return index end
   end
-  -- Boxed (unfocused) comment text lives in virt_lines; return the box's anchor diff row.
-  for _, box in ipairs(box_text_lines(buf)) do
-    if box.text:find(needle, 1, true) then return box.anchor_row end
-  end
   error("missing row: " .. needle .. "\n" .. table.concat(lines, "\n"), 2)
+end
+
+local function find_box_at_or_after(buf, needle, start_row)
+  for _, box in ipairs(box_text_lines(buf)) do
+    if box.anchor_row >= start_row and box.text:find(needle, 1, true) then return box end
+  end
+  error("missing comment box at or after " .. tostring(start_row) .. ": " .. needle, 2)
 end
 
 local function find_row_after(buf, needle, after_row)
   local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
   for index = after_row + 1, #lines do
     if lines[index]:find(needle, 1, true) then return index end
-  end
-  for _, box in ipairs(box_text_lines(buf)) do
-    if box.anchor_row > after_row and box.text:find(needle, 1, true) then return box.anchor_row end
   end
   error("missing row after " .. tostring(after_row) .. ": " .. needle .. "\n" .. table.concat(lines, "\n"), 2)
 end
@@ -861,9 +960,11 @@ local pr = {
   additions = 1,
   deletions = 1,
   isDraft = true,
+  state = "OPEN",
 }
 
 local function run()
+  local review = require("diff_review.views.pr.review")
   local ui = require("diff_review.infra.ui")
   local session = require("diff_review.session")
   vim.notify = capture_notify
@@ -1154,11 +1255,107 @@ local function run()
   wait_for(function() return buffer_contains(buf, "NEW LINE") end, "PR changed file did not expand")
   wait_for(function() return buffer_contains(buf, "This is inline comment without review") end, "PR inline code comment did not render")
   wait_for(function() return buffer_contains(buf, "Oh good point! fixed") end, "PR inline reply did not render")
-  -- Inline code comments render as read-only boxes (virt_lines) anchored on their changed
-  -- diff row; the comment and its reply live in the same box (asserted to render above) and
-  -- fold with the hunk rather than as separate, individually-foldable comment rows.
+  -- Inline code comments render as compact real rows below their changed diff row. The
+  -- comment and reply live in the same box and fold with the hunk.
   local inline_comment_row = find_row_after(buf, "This is inline comment without review", changes_file_row)
   assert_true(inline_comment_row > changes_file_row, "inline comment box did not anchor under the changed file")
+  local function inline_boxes_fit(width)
+    local state = review.state(buf)
+    local rendered_lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+    for row = 1, #rendered_lines do
+      local entry = state and state.entries and state.entries[row] or nil
+      if entry and entry.kind == "comment_box" and vim.fn.strdisplaywidth(rendered_lines[row] or "") > width then return false end
+    end
+    return true
+  end
+  local original_columns = vim.o.columns
+  vim.o.columns = 48
+  vim.api.nvim_exec_autocmds("VimResized", {})
+  wait_for(function() return inline_boxes_fit(48) end, "PR inline comment boxes did not shrink with the terminal")
+  assert_true(buffer_contains(buf, "This is inline comment without review"), "PR resize dropped the inline comment body")
+  assert_true(buffer_contains(buf, "Oh good point! fixed"), "PR resize dropped the inline comment reply")
+  vim.o.columns = original_columns
+  vim.api.nvim_exec_autocmds("VimResized", {})
+  wait_for(function() return inline_boxes_fit(original_columns) end, "PR inline comment boxes did not restore after resize")
+  local readonly_inline_box = find_box_at_or_after(buf, "Single inline review shell", changes_file_row)
+  local editable_count_before_readonly_c = #review.state(buf).review_comments
+  move_cursor(buf, readonly_inline_box.anchor_row)
+  local focused_comment_before_readonly_c = review.state(buf).focused_comment_id
+  local readonly_entry = review.state(buf).entries[readonly_inline_box.anchor_row]
+  local readonly_resolved = readonly_entry.comment_box_source
+  assert_true(readonly_resolved and readonly_resolved.remote_node_id == "PRRC_2",
+    "readonly box row resolved the wrong comment: " .. vim.inspect(readonly_resolved))
+  assert_true(not require("diff_review.views.pr.pr_overview").is_standalone_comment(review.state(buf), readonly_resolved),
+    "readonly box entered the editable PR-owned store: " .. vim.inspect(review.state(buf).review_comments))
+  assert_true(readonly_entry.comment_box.readonly == true, "another author's compact comment became editable")
+  assert_true(not vim.bo[buf].modifiable, "another author's compact comment unlocked the buffer")
+  trigger_buf_mapping(buf, "C")
+  assert_true(find_box_at_or_after(buf, "Single inline review shell", changes_file_row) ~= nil,
+    "C promoted another author's inline comment out of its readonly box")
+  assert_true(review.state(buf).focused_comment_id == focused_comment_before_readonly_c,
+    "C focused another author's inline comment: " .. vim.inspect({
+      before = focused_comment_before_readonly_c,
+      after = review.state(buf).focused_comment_id,
+    }))
+  assert_true(
+    #review.state(buf).review_comments == editable_count_before_readonly_c,
+    "C created a replacement comment for another author's inline box"
+  )
+  local pr_window_count = #vim.api.nvim_list_wins()
+  trigger_buf_mapping(buf, "R")
+  local reply_draft = review.state(buf).pr_reply_draft
+  assert_true(reply_draft ~= nil, "R did not create an inline reply draft")
+  assert_true(vim.api.nvim_get_current_buf() == buf, "R switched away from the PR buffer")
+  assert_true(#vim.api.nvim_list_wins() == pr_window_count, "R opened a bespoke reply popup")
+  local reply_draft_row = review.comment_body_rows(buf, reply_draft)
+  assert_true(reply_draft_row ~= nil, "R did not render an editable reply body below the comment")
+  assert_true(vim.api.nvim_win_get_cursor(0)[1] == reply_draft_row, "R did not focus the inline reply body")
+  assert_true(vim.bo[buf].modifiable, "inline reply body did not unlock the PR buffer")
+  edit_line(buf, reply_draft_row, "Reply created from the PR view")
+  trigger_buf_mapping(buf, "<C-s>")
+  wait_for(function() return #standalone_comment_calls.replies == 1 end, "R did not create a PR review reply")
+  assert_true(
+    standalone_comment_calls.replies[1].payload.body == "Reply created from the PR view",
+    "R sent the wrong reply body: " .. vim.inspect(standalone_comment_calls.replies[1].payload)
+  )
+  wait_for(function() return buffer_contains(buf, "Reply created from the PR view") end, "created reply did not render")
+  local replied_box = find_box_at_or_after(buf, "Single inline review shell", changes_file_row)
+  assert_true(replied_box.text:find("Reply created from the PR view", 1, true) ~= nil, "created reply left its parent block")
+  assert_true(replied_box.text:find("├─", 1, true) ~= nil, "created reply lacks a merged divider")
+  assert_true(select(2, replied_box.text:gsub("╭", "")) == 1, "created reply added another top border")
+  assert_true(select(2, replied_box.text:gsub("╰", "")) == 1, "created reply added another bottom border")
+  assert_true(saw_notification_containing("Reply posted"), "successful reply was not notified")
+  standalone_comment_calls.reply_should_fail = true
+  captured_notifications = {}
+  move_cursor(buf, replied_box.anchor_row)
+  trigger_buf_mapping(buf, "R")
+  local failed_reply_draft = review.state(buf).pr_reply_draft
+  local failed_reply_row = review.comment_body_rows(buf, failed_reply_draft)
+  assert_true(failed_reply_row ~= nil, "failed-reply setup did not create an inline editor")
+  edit_line(buf, failed_reply_row, "Reply that should fail")
+  trigger_buf_mapping(buf, "<C-s>")
+  wait_for(function() return saw_notification_containing("mock reply failure") end, "failed reply did not notify")
+  assert_true(#(readonly_resolved.replies or {}) == 1, "failed reply mutated the posted comment thread")
+  assert_true(
+    review.state(buf).pr_reply_draft == failed_reply_draft
+      and failed_reply_draft.body == "Reply that should fail",
+    "failed reply discarded the inline draft"
+  )
+  move_cursor(buf, find_row(buf, "URL:"))
+  assert_true(not failed_reply_draft.focused, "leaving the inline reply body did not collapse its editor")
+  local failed_reply_box = find_box_at_or_after(buf, "Single inline review shell", changes_file_row)
+  assert_true(
+    failed_reply_box.text:find("Reply that should fail", 1, true) ~= nil,
+    "collapsed reply draft left the merged comment thread"
+  )
+  move_cursor(buf, failed_reply_box.anchor_row)
+  wait_for(function()
+    return failed_reply_draft.focused
+      and review.reply_draft_body_at_row(buf, vim.api.nvim_win_get_cursor(0)[1]) == failed_reply_draft
+  end, "cursor entry did not reopen the inline reply draft")
+  trigger_buf_mapping(buf, "J")
+  assert_true(review.state(buf).pr_reply_draft == nil, "J did not discard the failed inline reply draft")
+  standalone_comment_calls.reply_should_fail = false
   local rejected_review_row = find_row(buf, "foo     10 hours ago")
   local regular_comment_row = find_row(buf, "This is a regular comment")
   local long_regular_comment_row = find_status_entry_row(buf, function(entry)
@@ -1168,12 +1365,17 @@ local function run()
       and tostring(entry.pr_comment.body or ""):find("Second full line for expansion", 1, true) ~= nil
   end, "long regular PR comment")
   move_cursor(buf, long_regular_comment_row)
-  trigger_buf_mapping(buf, "<Tab>")
+  assert_true(
+    not buffer_contains(buf, "Second full line for expansion"),
+    "cursor entry auto-opened the regular PR conversation comment"
+  )
+  assert_true(not buffer_contains(buf, "```ts"), "cursor entry auto-opened the regular PR comment code block")
+  trigger_buf_mapping(buf, "<CR>")
   wait_for(function()
     return not row_is_folded(buf, find_row(buf, "```ts"))
       and not row_is_folded(buf, find_row(buf, "interface CommentBlock {"))
       and not row_is_folded(buf, find_row(buf, "Second full line for expansion"))
-  end, "regular PR conversation comment did not expand")
+  end, "open did not expand the regular PR conversation comment")
   assert_true(not buffer_has_carriage_return(buf), "expanded PR comment rendered raw carriage returns")
   local comment_code_fence_row = find_row(buf, "```ts")
   local comment_code_row = find_row(buf, "interface CommentBlock {")
@@ -1191,6 +1393,11 @@ local function run()
     find_row(buf, "Second full line for expansion"),
     "https://github.com/owner/repo/pull/7#issuecomment-4702465967",
     "expanded regular PR comment body"
+  )
+  move_cursor(buf, rejected_review_row)
+  assert_true(
+    not row_is_folded(buf, find_row(buf, "Second full line for expansion")),
+    "leaving a manually opened PR conversation comment collapsed it like an annotation"
   )
   long_regular_comment_row = find_status_entry_row(buf, function(entry)
     return entry.kind == "pr_comment"
@@ -1211,10 +1418,13 @@ local function run()
       and tostring(entry.pr_comment.body or ""):find("Second full line for expansion", 1, true) ~= nil
   end, "long regular PR comment")
   move_cursor(buf, long_regular_comment_row)
-  trigger_buf_mapping(buf, "C")
+  wait_for(function()
+    return row_is_folded(buf, find_row(buf, "Second full line for expansion"))
+  end, "cursor entry reopened the viewer-authored regular PR comment")
+  trigger_buf_mapping(buf, "<CR>")
   wait_for(function()
     return not row_is_folded(buf, find_row(buf, "Second full line for expansion"))
-  end, "viewer-authored regular PR comment did not open for editing")
+  end, "open did not reopen the viewer-authored regular PR comment")
   local long_regular_comment_body_row = find_row(buf, "Second full line for expansion")
   move_cursor(buf, long_regular_comment_body_row)
   assert_true(vim.bo[buf].modifiable, "viewer-authored regular PR comment body must be editable")
@@ -1248,7 +1458,7 @@ local function run()
   -- The inline comment + its reply share one box on the anchor diff row; b browses the comment.
   assert_browse_url(buf, inline_comment_row, "https://github.com/owner/repo/pull/7#discussion_r3409923137", "inline code comment box")
 
-  move_cursor(buf, regular_comment_row)
+  move_cursor(buf, find_row(buf, "Comments (2):"))
   trigger_buf_mapping(buf, "C")
   wait_for(function() return buffer_contains(buf, "Comments (3):") end, "regular PR comment draft did not update the comments count")
   local regular_draft_header_row = find_row_after(buf, require("diff_review.views.pr.review").comment_icon .. " you", regular_comment_row)
@@ -1282,7 +1492,7 @@ local function run()
   )
 
   changes_file_row = find_row_after(buf, "src/a.txt +1 -1", find_row(buf, "Changes (1):"))
-  changed_code_row = find_row_after(buf, "NEW LINE", changes_file_row)
+  changed_code_row = find_row_after(buf, "old line", changes_file_row)
   move_cursor(buf, changed_code_row)
   trigger_buf_mapping(buf, "C")
   local standalone_header_row = find_row_after(buf, "you commented", changed_code_row)
@@ -1298,7 +1508,7 @@ local function run()
   assert_true(standalone_payload.commit_id == pr.headRefOid, "standalone comment did not target the PR head commit")
   assert_true(standalone_payload.path == "src/a.txt", "standalone comment path was wrong")
   assert_true(standalone_payload.line == 5, "standalone comment line was wrong")
-  assert_true(standalone_payload.side == "RIGHT", "standalone comment side was wrong")
+  assert_true(standalone_payload.side == "LEFT", "standalone comment side was wrong")
   wait_for(function() return saw_notification_containing("Inline comment synced") end, "successful standalone sync was not notified")
   assert_true(buffer_contains(buf, "Standalone from PR overview"), "posted standalone comment disappeared from the PR overview")
   assert_browse_url(
@@ -1333,11 +1543,28 @@ local function run()
     not expanded_review_lines:find("far context after", 1, true),
     "expanded review rendered trailing hunk content outside the comment context"
   )
-  local expanded_parent_row = find_row_after(buf, "This is inline comment without review", expanded_code_row)
-  local expanded_reply_row = find_row_after(buf, "Oh good point! fixed", expanded_parent_row)
-  assert_true(expanded_reply_row > expanded_parent_row, "expanded review reply did not render under the parent comment")
-  assert_true(expanded_reply_row < changes_heading_row, "expanded review reply rendered in the wrong section")
-  assert_true(buffer_contains(buf, "foo replied 10 hours ago"), "expanded review reply header did not render author and timestamp")
+  local expanded_comment_box = find_box_at_or_after(buf, "This is inline comment without review", expanded_code_row)
+  assert_true(expanded_comment_box.anchor_row < changes_heading_row, "expanded review comment box rendered in the wrong section")
+  assert_true(
+    expanded_comment_box.text:find("Oh good point! fixed", 1, true) ~= nil,
+    "expanded review reply did not reuse the parent comment box: " .. vim.inspect(expanded_comment_box)
+  )
+  assert_true(
+    expanded_comment_box.text:find("foo replied 10 hours ago", 1, true) ~= nil,
+    "expanded review reply header did not render author and timestamp"
+  )
+  assert_true(
+    expanded_comment_box.text:find("├─", 1, true) ~= nil,
+    "expanded review reply did not render as a merged block divider"
+  )
+  assert_true(
+    expanded_review_lines:find("This is inline comment without review", 1, true) ~= nil,
+    "expanded review compact comment was not emitted as real buffer rows"
+  )
+  assert_true(
+    review.state(buf).entries[find_row_after(buf, "This is inline comment without review", expanded_code_row)].kind == "comment_box",
+    "expanded review comment did not use the shared compact-row renderer"
+  )
 
   move_cursor(buf, expanded_file_row)
   trigger_buf_mapping(buf, "<Tab>")
@@ -1367,12 +1594,12 @@ local function run()
   end, "expanded review file did not reopen after folding")
   changes_heading_row = find_row_after(buf, "Changes", rejected_review_row)
   expanded_code_row = find_row_after(buf, "NEW LINE", expanded_file_row)
-  expanded_parent_row = find_row_after(buf, "This is inline comment without review", expanded_code_row)
-  expanded_reply_row = find_row_after(buf, "Oh good point! fixed", expanded_parent_row)
-  assert_true(expanded_reply_row < changes_heading_row, "expanded review reply rendered in the wrong section after reopening")
+  expanded_comment_box = find_box_at_or_after(buf, "This is inline comment without review", expanded_code_row)
+  assert_true(expanded_comment_box.anchor_row < changes_heading_row, "expanded review comment box rendered in the wrong section after reopening")
   local previous_issue_comment_count = #issue_comment_calls
   local previous_standalone_comment_count = #standalone_comment_calls
-  move_cursor(buf, expanded_code_row)
+  local review_context_comment_row = find_row_after(buf, "gamma", expanded_file_row)
+  move_cursor(buf, review_context_comment_row)
   trigger_buf_mapping(buf, "C")
   wait_for(function() return buffer_contains(buf, "Comments (4):") end, "review-context C did not create a regular PR comment")
   local context_regular_header_row = find_row_after(buf, require("diff_review.views.pr.review").comment_icon .. " you", find_row(buf, "Regular from PR overview"))
@@ -1388,6 +1615,112 @@ local function run()
     issue_comment_calls[#issue_comment_calls].payload.body == "Regular from review context",
     "wrong review-context regular PR comment body: " .. vim.inspect(issue_comment_calls[#issue_comment_calls].payload)
   )
+
+  rejected_review_row = find_row(buf, "foo     10 hours ago")
+  changes_heading_row = find_row_after(buf, "Changes", rejected_review_row)
+  expanded_comment_box = find_box_at_or_after(buf, "This is inline comment without review", rejected_review_row)
+  assert_true(expanded_comment_box.anchor_row < changes_heading_row, "review comment box disappeared before edit")
+  local editable_comment_count = #review.state(buf).review_comments
+  move_cursor(buf, expanded_comment_box.anchor_row)
+  wait_for(function()
+    local cursor_row = vim.api.nvim_win_get_cursor(0)[1]
+    local cursor_line = vim.api.nvim_buf_get_lines(buf, cursor_row - 1, cursor_row, false)[1] or ""
+    return cursor_line:find("This is inline comment without review", 1, true) ~= nil
+  end, "cursor entry did not focus the review comment's editable body")
+  assert_true(review.state(buf).view_kind == "pr", "editing a review comment left the PR surface")
+  assert_true(vim.bo[buf].modifiable, "focused review comment body must be editable")
+  assert_true(
+    #review.state(buf).review_comments == editable_comment_count,
+    "cursor entry on a review comment box created a duplicate comment"
+  )
+  local focused_inline_row = vim.api.nvim_win_get_cursor(0)[1]
+  local focused_inline_comment = review.comment_body_at_row(buf, focused_inline_row)
+  local focused_reply_mapping = vim.api.nvim_buf_call(buf, function()
+    return vim.fn.maparg("R", "n", false, true)
+  end)
+  assert_true(type(focused_reply_mapping.callback) == "function", "R fell through to Replace mode from the focused inline comment")
+  local focused_start_row, focused_end_row = review.comment_body_rows(buf, focused_inline_comment)
+  edit_line(buf, focused_inline_row, "Edited inline comment from Reviews")
+  assert_true(
+    focused_inline_comment.body == "Edited inline comment from Reviews",
+    "inline comment edit captured non-body rows: "
+      .. vim.inspect({
+        body = focused_inline_comment.body,
+        cursor_row = focused_inline_row,
+        body_rows_before = { focused_start_row, focused_end_row },
+        lines = vim.api.nvim_buf_get_lines(buf, focused_start_row - 1, focused_end_row + 2, false),
+      })
+  )
+  local body_text_after_header_refresh = review.comment_body_text_from_buffer(buf, focused_inline_comment)
+  local refreshed_start_row, refreshed_end_row = review.comment_body_rows(buf, focused_inline_comment)
+  assert_true(
+    body_text_after_header_refresh == "Edited inline comment from Reviews",
+    "inline header refresh moved the editable region: "
+      .. vim.inspect({
+        body_text = body_text_after_header_refresh,
+        body_rows = { refreshed_start_row, refreshed_end_row },
+        lines = vim.api.nvim_buf_get_lines(buf, refreshed_start_row - 1, refreshed_end_row + 2, false),
+      })
+  )
+  trigger_buf_mapping(buf, "<C-s>")
+  wait_for(function() return #standalone_comment_calls.updates == 1 end, "edited review comment was not updated")
+  assert_true(
+    standalone_comment_calls.updates[1].payload.pullRequestReviewCommentId == "PRRC_1",
+    "inline comment update targeted the wrong node: " .. vim.inspect(standalone_comment_calls.updates[1].payload)
+  )
+  assert_true(
+    standalone_comment_calls.updates[1].payload.body == "Edited inline comment from Reviews",
+    "inline comment update sent the wrong body: " .. vim.inspect(standalone_comment_calls.updates[1].payload)
+  )
+  wait_for(function() return saw_notification_containing("Inline comment synced") end, "edited review comment sync was not notified")
+  assert_true(
+    review.state(buf).focused_comment_id == focused_inline_comment.local_id
+      and review.comment_body_at_row(buf, vim.api.nvim_win_get_cursor(0)[1]) == focused_inline_comment,
+    "saving a PR inline comment collapsed its active editor"
+  )
+
+  local changes_row_for_delete = find_row(buf, "Changes (1):")
+  local standalone_box = find_box_at_or_after(buf, "Standalone from PR overview", changes_row_for_delete)
+  move_cursor(buf, standalone_box.anchor_row)
+  local standalone_comment = standalone_box.descriptor.source
+  assert_true(
+    review.state(buf).focused_comment_id == standalone_comment.local_id,
+    "entering the next PR comment did not transfer editor focus"
+  )
+  assert_true(find_box_at_or_after(buf, "Edited inline comment from Reviews", rejected_review_row) ~= nil,
+    "leaving a PR inline comment did not restore its box")
+  wait_for(function()
+    local cursor_row = vim.api.nvim_win_get_cursor(0)[1]
+    local cursor_line = vim.api.nvim_buf_get_lines(buf, cursor_row - 1, cursor_row, false)[1] or ""
+    return cursor_line:find("Standalone from PR overview", 1, true) ~= nil
+  end, "cursor entry on the standalone box did not focus its editable body")
+  assert_true(buffer_contains(buf, "Edited inline comment from Reviews"), "saved review edit disappeared when its box collapsed")
+  assert_true(buffer_contains(buf, "Oh good point! fixed"), "saved review edit dropped the existing reply thread")
+  move_cursor(buf, review.comment_header_row0(buf, standalone_comment) + 1)
+  trigger_buf_mapping(buf, "J")
+  assert_true(not buffer_contains(buf, "Standalone from PR overview"), "J did not hide the deleted inline PR comment")
+  assert_true(vim.bo[buf].modified, "deleted inline PR comment did not mark the buffer modified")
+  trigger_buf_mapping(buf, "<C-s>")
+  wait_for(function() return #standalone_comment_calls.deletes == 1 end, "deleted inline PR comment was not synced")
+  assert_true(
+    standalone_comment_calls.deletes[1].payload.id == "PRRC_STANDALONE_1",
+    "inline comment delete targeted the wrong node: " .. vim.inspect(standalone_comment_calls.deletes[1].payload)
+  )
+  wait_for(function() return saw_notification_containing("Inline comment deleted") end, "inline comment deletion was not notified")
+
+  local edited_review_box = find_box_at_or_after(buf, "Edited inline comment from Reviews", rejected_review_row)
+  move_cursor(buf, edited_review_box.anchor_row)
+  move_cursor(buf, review.comment_header_row0(buf, edited_review_box.descriptor.source) + 1)
+  trigger_buf_mapping(buf, "J")
+  assert_true(not buffer_contains(buf, "Edited inline comment from Reviews"), "J did not hide the submitted-review comment box")
+  trigger_buf_mapping(buf, "<C-s>")
+  wait_for(function() return #standalone_comment_calls.deletes == 2 end, "submitted-review comment deletion was not synced")
+  assert_true(
+    standalone_comment_calls.deletes[2].payload.id == "PRRC_1",
+    "submitted-review delete targeted the wrong node: " .. vim.inspect(standalone_comment_calls.deletes[2].payload)
+  )
+  wait_for(function() return not buffer_contains(buf, "Edited inline comment from Reviews") end,
+    "deleted submitted-review comment reappeared from the remote snapshot")
   move_cursor(buf, find_row(buf, "URL:"))
   assert_true(vim.bo[buf].buftype == "acwrite", "PR buffer must be acwrite")
   assert_true(not vim.bo[buf].modifiable, "PR buffer must start nomodifiable")
@@ -1507,37 +1840,93 @@ local function run()
     return row_list_contains(rows, body_row) and not row_list_contains(rows, 1)
   end, "PR description markdown did not re-render after leaving the editable body")
 
-  -- ── Status: Enter confirms draft/ready transitions ─────────────────────────
+  -- ── Status: Enter chooses between the other lifecycle states ───────────────
   move_cursor_to_text(buf, status_row, "DRAFT")
   trigger_buf_mapping(buf, "<CR>")
   wait_for(function()
-    return buffer_contains(vim.api.nvim_get_current_buf(), "Mark PR #7 ready for review?")
-      and buffer_contains(vim.api.nvim_get_current_buf(), "Status will change from DRAFT to READY.")
-  end, "ready-for-review confirmation did not render")
-  trigger_current_mapping("y")
+    return buffer_contains(vim.api.nvim_get_current_buf(), "[o]  OPEN")
+      and buffer_contains(vim.api.nvim_get_current_buf(), "[c]  CLOSED")
+      and not buffer_contains(vim.api.nvim_get_current_buf(), "[d]  DRAFT")
+  end, "draft state chooser did not render the other two states")
+  trigger_current_mapping("q")
+  assert_true(#draft_status_calls == 0, "q changed PR state instead of cancelling")
+
+  move_cursor_to_text(buf, status_row, "DRAFT")
+  trigger_buf_mapping(buf, "<CR>")
+  trigger_current_mapping("o")
   wait_for(function() return #draft_status_calls == 1 end, "mark ready mutation was not sent")
   assert_true(
     draft_status_calls[1].payload.variables.input.pullRequestId == "PR_kwTEST7",
     "mark ready mutation used wrong PR node id: " .. vim.inspect(draft_status_calls[1].payload)
   )
-  wait_for(function() return buffer_contains(buf, "Status: READY") end, "PR status row did not switch to READY")
-  assert_true(pr.isDraft == false, "PR cache did not switch to ready")
+  wait_for(function() return buffer_contains(buf, "Status: OPEN") end, "PR status row did not switch to OPEN")
+  assert_true(pr.isDraft == false and pr.state == "OPEN", "PR cache did not switch to open")
 
-  status_row = find_row(buf, "Status: READY")
-  move_cursor_to_text(buf, status_row, "READY")
+  status_row = find_row(buf, "Status: OPEN")
+  move_cursor_to_text(buf, status_row, "OPEN")
   trigger_buf_mapping(buf, "<CR>")
   wait_for(function()
-    return buffer_contains(vim.api.nvim_get_current_buf(), "Move PR #7 back to draft?")
-      and buffer_contains(vim.api.nvim_get_current_buf(), "Status will change from READY to DRAFT.")
-  end, "draft confirmation did not render")
-  trigger_current_mapping("y")
-  wait_for(function() return #draft_status_calls == 2 end, "convert-to-draft mutation was not sent")
+    return buffer_contains(vim.api.nvim_get_current_buf(), "[d]  DRAFT")
+      and buffer_contains(vim.api.nvim_get_current_buf(), "[c]  CLOSED")
+      and not buffer_contains(vim.api.nvim_get_current_buf(), "[o]  OPEN")
+  end, "open state chooser did not render the other two states")
+  trigger_current_mapping("c")
+  wait_for(function() return #draft_status_calls == 2 end, "close mutation was not sent")
   assert_true(
     draft_status_calls[2].payload.variables.input.pullRequestId == "PR_kwTEST7",
-    "convert draft mutation used wrong PR node id: " .. vim.inspect(draft_status_calls[2].payload)
+    "close mutation used wrong PR node id: " .. vim.inspect(draft_status_calls[2].payload)
   )
-  wait_for(function() return buffer_contains(buf, "Status: DRAFT") end, "PR status row did not switch back to DRAFT")
-  assert_true(pr.isDraft == true, "PR cache did not switch back to draft")
+  wait_for(function() return buffer_contains(buf, "Status: CLOSED") end, "PR status row did not switch to CLOSED")
+  assert_true(pr.state == "CLOSED", "PR cache did not switch to closed")
+
+  status_row = find_row(buf, "Status: CLOSED")
+  move_cursor_to_text(buf, status_row, "CLOSED")
+  trigger_buf_mapping(buf, "<CR>")
+  wait_for(function()
+    return buffer_contains(vim.api.nvim_get_current_buf(), "[d]  DRAFT")
+      and buffer_contains(vim.api.nvim_get_current_buf(), "[o]  OPEN")
+      and not buffer_contains(vim.api.nvim_get_current_buf(), "[c]  CLOSED")
+  end, "closed state chooser did not render the other two states")
+  trigger_current_mapping("d")
+  wait_for(function() return #draft_status_calls == 4 end, "closed-to-draft transition did not reopen then convert")
+  assert_true(
+    tostring(draft_status_calls[3].payload.query):find("reopenPullRequest", 1, true) ~= nil
+      and tostring(draft_status_calls[4].payload.query):find("convertPullRequestToDraft", 1, true) ~= nil,
+    "closed-to-draft transition used the wrong mutation order: " .. vim.inspect(draft_status_calls)
+  )
+  wait_for(function() return buffer_contains(buf, "Status: DRAFT") end, "PR status row did not switch from CLOSED to DRAFT")
+  assert_true(pr.state == "OPEN" and pr.isDraft == true, "PR cache did not switch from closed to draft")
+
+  draft_status_calls.should_fail = true
+  captured_notifications = {}
+  status_row = find_row(buf, "Status: DRAFT")
+  move_cursor_to_text(buf, status_row, "DRAFT")
+  trigger_buf_mapping(buf, "<CR>")
+  trigger_current_mapping("c")
+  wait_for(function() return saw_notification_containing("mock PR state failure") end, "failed PR state mutation was not notified")
+  assert_true(buffer_contains(buf, "Status: DRAFT"), "failed PR state mutation changed the rendered status")
+  assert_true(pr.state == "OPEN" and pr.isDraft == true, "failed PR state mutation changed the PR cache")
+  draft_status_calls.should_fail = false
+
+  move_cursor_to_text(buf, status_row, "DRAFT")
+  trigger_buf_mapping(buf, "<CR>")
+  trigger_current_mapping("c")
+  wait_for(function() return #draft_status_calls == 5 and buffer_contains(buf, "Status: CLOSED") end,
+    "draft-to-closed setup transition did not complete")
+  draft_status_calls.reopen_as_draft = true
+  status_row = find_row(buf, "Status: CLOSED")
+  move_cursor_to_text(buf, status_row, "CLOSED")
+  trigger_buf_mapping(buf, "<CR>")
+  trigger_current_mapping("o")
+  wait_for(function() return #draft_status_calls == 7 end, "closed draft did not reopen then mark ready")
+  assert_true(
+    tostring(draft_status_calls[6].payload.query):find("reopenPullRequest", 1, true) ~= nil
+      and tostring(draft_status_calls[7].payload.query):find("markPullRequestReadyForReview", 1, true) ~= nil,
+    "closed-draft-to-open transition used the wrong mutation order: " .. vim.inspect(draft_status_calls)
+  )
+  wait_for(function() return buffer_contains(buf, "Status: OPEN") end, "closed draft did not switch to OPEN")
+  assert_true(pr.state == "OPEN" and pr.isDraft == false, "closed draft cache did not switch to open")
+  draft_status_calls.reopen_as_draft = false
 
   -- ── Review: completes cached repo contributors and sends reviewer requests ──
   wait_for(function()

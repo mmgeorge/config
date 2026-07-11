@@ -593,8 +593,26 @@ step records the **HEAD sha the document was generated against**, so a stale wal
 falls back to nearest-line or file-only anchoring with a visible note rather than pointing
 at the wrong code. The walkthrough talks to the rest of the plugin through a narrow
 `DiffReviewWalkthroughHost` interface (`views/commands._walkthrough_host`) — `cwd`,
-`get_state`, fold keys, `set_folded`, `rerender`, `inventory_async` — so it never reaches
-into init internals directly.
+`resolve_root_async`, `get_state`, fold keys, `set_folded`, `rerender`,
+`inventory_async` — so it never reaches into init internals directly. The host resolves
+and caches the canonical Git root from the status view's working directory before it
+loads the artifact or inventory. This keeps `HEAD:path` lookups repository-relative even
+when Neovim starts inside a subdirectory.
+
+Inventory canonicalizes every absolute status filename against that cached root before
+issuing `HEAD:path` reads. Status-provided relative paths remain fallback metadata because
+they may originate from Neovim's launch directory and therefore omit the root-to-launch
+prefix.
+
+Each task heading remains fully visible while its nested tree stays folded. The final
+wrapped heading row owns the native fold range and supplies its fold text, while earlier
+title and justification rows remain outside that range. As a result, `<Tab>` changes only
+the visibility of subtasks and changes, not the reviewer-facing task narrative.
+
+Initial walkthrough activation expands each task and folds each subtask. Reviewers see
+the complete task narrative plus the subtask outline immediately, then use `<Tab>` on a
+subtask to reveal its justification and concrete changes. Task-level folding remains
+available for collapsing the whole subtree.
 
 ---
 
@@ -605,8 +623,9 @@ into init internals directly.
 A **pluggable async process runner**. By default it spawns through `vim.system`. Tests
 inject a `DiffReviewGitBackend` via `set_backend(...)` so they run without touching a real
 repo. It exposes async primitives (`system_text_async`, `system_text_stream_async`,
-`systemlist_async`), git-root discovery (`git_root_async` → `git rev-parse
---show-toplevel`), and high-level runners (`run_git_async` that resolves the root first).
+`systemlist_async`), git-root discovery (`git_root_async` from the process directory and
+`git_root_at_async` from an explicit working directory), and high-level runners
+(`run_git_async` that resolves the root first).
 The streaming variant feeds an `on_line` callback for progress, then a final callback on
 exit — this is how large diffs and long-running commands report incrementally.
 

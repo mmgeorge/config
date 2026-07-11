@@ -1,5 +1,6 @@
 local wezterm = require 'wezterm'
 local act = wezterm.action
+local branch_source = require 'worktree_branch'
 
 local M = {}
 
@@ -587,10 +588,12 @@ local function build_repo(path, common_dir)
     return nil
   end
 
+  local is_bare_layout = basename(common_dir) == '.bare'
   local repo = {
     id = common_dir,
     name = basename(dirname(common_dir)),
     main_path = main_worktree_path(worktrees),
+    root_path = is_bare_layout and dirname(common_dir) or nil,
     worktrees = worktrees,
   }
 
@@ -603,7 +606,7 @@ local function build_repo(path, common_dir)
   end
 
   local default_parent = default_worktree_parent(common_dir, repo.main_path)
-  if basename(common_dir) == '.bare' then
+  if is_bare_layout then
     repo.worktree_parent = default_parent
   else
     repo.worktree_parent = preferred_worktree_parent(repo.worktrees, default_parent)
@@ -1251,11 +1254,23 @@ local function current_worktree_for_path(repo, path)
     return nil
   end
 
+  path = normalize_path(path)
+  if repo.root_path and path == repo.root_path then
+    for _, worktree in ipairs(repo.worktrees) do
+      if worktree.is_main then
+        return worktree
+      end
+    end
+  end
+
   local best_match = nil
   local best_length = -1
 
   for _, worktree in ipairs(repo.worktrees) do
-    if path_is_within(path, worktree.path) and #worktree.path > best_length then
+    if should_display_worktree(worktree)
+      and path_is_within(path, worktree.path)
+      and #worktree.path > best_length
+    then
       best_match = worktree
       best_length = #worktree.path
     end
@@ -1423,52 +1438,23 @@ local function run_new_worktree_setup(window, repo, worktree)
   return false
 end
 
-local function remote_ref_parts(ref)
-  if not ref then
-    return nil, nil
+local function list_remotes(repo)
+  local output, err = git_capture(repo.main_path, { 'remote' })
+  if output == nil then
+    return nil, err
   end
 
-  return ref:match('^([^/]+)/(.+)$')
+  return split_lines(output)
 end
 
-local function refresh_remotes(window, repo)
-  local stdout, stderr = git_output(repo.main_path, { 'fetch', '--all' })
+local function refresh_remote(window, repo, remote)
+  local stdout, stderr = git_output(repo.main_path, branch_source.remote_fetch_args(remote))
   if not stdout then
-    notify(window, 'Could not refresh remotes for ' .. repo.name .. ': ' .. stderr)
+    notify(window, 'Could not refresh ' .. remote .. ' for ' .. repo.name .. ': ' .. stderr)
     return false
   end
 
   return true
-end
-
-local function refresh_remote_ref(window, repo, ref)
-  local remote, remote_branch = remote_ref_parts(ref)
-  if not remote or not remote_branch then
-    return true
-  end
-
-  local stdout, stderr = git_output(repo.main_path, {
-    'fetch',
-    remote,
-    remote_branch .. ':refs/remotes/' .. remote .. '/' .. remote_branch,
-  })
-  if not stdout then
-    notify(window, 'Could not update ' .. ref .. ': ' .. stderr)
-    return false
-  end
-
-  return true
-end
-
-local function remote_ref_exists(repo, ref)
-  local stdout = git_capture(repo.main_path, {
-    'show-ref',
-    '--verify',
-    '--quiet',
-    'refs/remotes/' .. ref,
-  })
-
-  return stdout ~= nil
 end
 
 local function branch_upstream(repo, branch)
@@ -1480,21 +1466,6 @@ local function branch_upstream(repo, branch)
 
   if upstream and upstream ~= '' then
     return upstream
-  end
-
-  return nil
-end
-
-local function infer_branch_upstream(repo, branch)
-  if remote_ref_exists(repo, 'origin/' .. branch) then
-    return 'origin/' .. branch
-  end
-
-  local remotes = git_capture(repo.main_path, { 'remote' }) or ''
-  for _, remote in ipairs(split_lines(remotes)) do
-    if remote ~= 'origin' and remote_ref_exists(repo, remote .. '/' .. branch) then
-      return remote .. '/' .. branch
-    end
   end
 
   return nil
@@ -1521,14 +1492,6 @@ local function ensure_branch_upstream(repo, branch, upstream)
   return true
 end
 
-local function resolve_branch_upstream(repo, branch, preferred_upstream)
-  if preferred_upstream and preferred_upstream ~= '' then
-    return preferred_upstream
-  end
-
-  return branch_upstream(repo, branch) or infer_branch_upstream(repo, branch)
-end
-
 local function checked_out_worktree(repo, branch)
   for _, worktree in ipairs(repo.worktrees) do
     if worktree.branch_name == branch then
@@ -1539,52 +1502,38 @@ local function checked_out_worktree(repo, branch)
   return nil
 end
 
-local function refresh_start_point(window, repo, start_point, source, opts)
-  opts = opts or {}
+local function local_branch_exists(repo, branch)
+  local stdout = git_capture(repo.main_path, {
+    'show-ref',
+    '--verify',
+    '--quiet',
+    'refs/heads/' .. branch,
+  })
 
-  if source == 'remote' then
-    return refresh_remote_ref(window, repo, start_point)
+  return stdout ~= nil
+end
+
+local function ref_oid(repo, ref)
+  return git_capture(repo.main_path, { 'rev-parse', '--verify', ref })
+end
+
+local function local_branch_is_ancestor(repo, branch, remote_ref)
+  local stdout, stderr = git_output(repo.main_path, {
+    'merge-base',
+    '--is-ancestor',
+    branch,
+    remote_ref,
+  })
+
+  if stdout ~= nil then
+    return true, nil
   end
 
-  local upstream = resolve_branch_upstream(repo, start_point, opts.upstream)
-  local upstream_ok, upstream_err = ensure_branch_upstream(repo, start_point, upstream)
-  if not upstream_ok then
-    local message = upstream_err and upstream_err ~= '' and upstream_err or ('could not set upstream to ' .. upstream)
-    notify(window, 'Could not set upstream for ' .. start_point .. ': ' .. message)
-    return false
+  if stderr and stderr ~= '' then
+    return nil, stderr
   end
 
-  local worktree = checked_out_worktree(repo, start_point)
-  if worktree then
-    if not upstream then
-      return true
-    end
-
-    local stdout, stderr = git_output(worktree.path, { 'pull', '--ff-only' })
-    if not stdout then
-      notify(window, 'Could not pull ' .. start_point .. ': ' .. stderr)
-      return false
-    end
-
-    return true
-  end
-
-  if upstream then
-    local upstream_remote, upstream_branch = remote_ref_parts(upstream)
-    if upstream_remote and upstream_branch then
-      local stdout, stderr = git_output(repo.main_path, {
-        'fetch',
-        upstream_remote,
-        upstream_branch .. ':refs/heads/' .. start_point,
-      })
-      if not stdout then
-        notify(window, 'Could not update ' .. start_point .. ': ' .. stderr)
-        return false
-      end
-    end
-  end
-
-  return true
+  return false, nil
 end
 
 local function create_worktree(window, pane, repo, opts)
@@ -1639,100 +1588,7 @@ local function create_worktree(window, pane, repo, opts)
   })
 end
 
-local function existing_refs(repo)
-  local checked_out = {}
-  for _, worktree in ipairs(repo.worktrees) do
-    if worktree.branch_name then
-      checked_out[worktree.branch_name] = true
-    end
-  end
-
-  local local_branch_names = {}
-  local ref_records = {}
-
-  local function logical_ref_name(branch, source)
-    if source == 'remote' then
-      return branch:match('^[^/]+/(.+)$') or branch
-    end
-
-    return branch
-  end
-
-  local function add_refs(ref, source)
-    local output = git_capture(repo.main_path, {
-      'for-each-ref',
-      '--format=%(refname:short)%09%(committerdate:unix)',
-      ref,
-    }) or ''
-
-    for _, line in ipairs(split_lines(output)) do
-      local branch, timestamp = line:match('^(.-)%s+([0-9]+)$')
-      branch = branch or line
-      if branch ~= '' and not branch:match('/HEAD$') then
-        local logical_name = logical_ref_name(branch, source)
-        if source == 'local' then
-          local_branch_names[logical_name] = true
-        end
-
-        if source ~= 'local' or not checked_out[logical_name] then
-          table.insert(ref_records, {
-            committed_at = tonumber(timestamp) or 0,
-            id = branch,
-            label = source .. ': ' .. branch,
-            logical_name = logical_name,
-            source = source,
-          })
-        end
-      end
-    end
-  end
-
-  add_refs('refs/heads', 'local')
-  add_refs('refs/remotes', 'remote')
-
-  table.sort(ref_records, function(left, right)
-    local left_source = left.source == 'local' and 0 or 1
-    local right_source = right.source == 'local' and 0 or 1
-    if left_source ~= right_source then
-      return left_source < right_source
-    end
-
-    local left_is_matt = left.logical_name:match('^matt9222/') ~= nil
-    local right_is_matt = right.logical_name:match('^matt9222/') ~= nil
-    if left_is_matt ~= right_is_matt then
-      return left_is_matt
-    end
-
-    if left_is_matt and left.committed_at ~= right.committed_at then
-      return left.committed_at > right.committed_at
-    end
-
-    if left.logical_name ~= right.logical_name then
-      return left.logical_name < right.logical_name
-    end
-
-    return left.id < right.id
-  end)
-
-  return ref_records, checked_out, local_branch_names
-end
-
-local function start_points(repo)
-  local point_records = {}
-  local seen = {}
-  local source_branch_names = {
-    ['local'] = {},
-    ['remote'] = {},
-  }
-
-  local function logical_branch_name(branch, source)
-    if source == 'remote' then
-      return branch:match('^[^/]+/(.+)$') or branch
-    end
-
-    return branch
-  end
-
+local function branch_records(repo, source, remote, exclude_checked_out)
   local function parse_release_version(branch)
     local version = branch:match('^([%d%.]+)%-release$')
     if not version then
@@ -1768,71 +1624,54 @@ local function start_points(repo)
     return false
   end
 
-  local function add_ref_points(ref, source)
-    local output = git_capture(repo.main_path, {
-      'for-each-ref',
-      '--format=%(refname:short)%09%(committerdate:unix)',
-      ref,
-    }) or ''
+  local ref_records = {}
+  local branch_names = {}
+  local output = git_capture(repo.main_path, {
+    'for-each-ref',
+    '--format=%(refname:short)%09%(committerdate:unix)',
+    branch_source.ref_namespace(source, remote),
+  }) or ''
 
-    for _, line in ipairs(split_lines(output)) do
-      local branch, timestamp = line:match('^(.-)%s+([0-9]+)$')
-      branch = branch or line
-      if branch ~= '' and not branch:match('/HEAD$') and not seen[branch] then
-        seen[branch] = true
-        local logical_name = logical_branch_name(branch, source)
-        source_branch_names[source][logical_name] = true
-        table.insert(point_records, {
-          id = branch,
-          label = source .. ': ' .. branch,
-          committed_at = tonumber(timestamp) or 0,
-          logical_name = logical_name,
-          release_version = parse_release_version(logical_name),
-          source = source,
-        })
-      end
+  for _, line in ipairs(split_lines(output)) do
+    local ref, timestamp = line:match('^(.-)%s+([0-9]+)$')
+    ref = ref or line
+    local logical_name = branch_source.logical_name(ref, source)
+    if ref ~= ''
+      and not ref:match('/HEAD$')
+      and not (exclude_checked_out and checked_out_worktree(repo, logical_name))
+    then
+      branch_names[logical_name] = true
+      table.insert(ref_records, {
+        committed_at = tonumber(timestamp) or 0,
+        id = ref,
+        logical_name = logical_name,
+        release_version = parse_release_version(logical_name),
+        source = source,
+      })
     end
   end
 
-  local function source_rank(point)
-    if point.source == 'local' then
+  local function branch_group(record)
+    if record.logical_name == 'main' then
       return 0
     end
 
-    return 1
-  end
-
-  local function branch_group(point)
-    local names = source_branch_names[point.source]
-    if point.logical_name == 'main' then
+    if not branch_names.main and record.logical_name == 'master' then
       return 0
     end
 
-    if not names.main and point.logical_name == 'master' then
-      return 0
-    end
-
-    if point.release_version then
+    if record.release_version then
       return 1
     end
 
-    if point.logical_name:match('^matt9222/') then
+    if record.logical_name:match('^matt9222/') then
       return 2
     end
 
     return 3
   end
 
-  add_ref_points('refs/heads', 'local')
-  add_ref_points('refs/remotes', 'remote')
-
-  table.sort(point_records, function(left, right)
-    local left_source = source_rank(left)
-    local right_source = source_rank(right)
-    if left_source ~= right_source then
-      return left_source < right_source
-    end
-
+  table.sort(ref_records, function(left, right)
     local left_group = branch_group(left)
     local right_group = branch_group(right)
     if left_group ~= right_group then
@@ -1856,140 +1695,259 @@ local function start_points(repo)
     return left.id < right.id
   end)
 
-  local points = {}
-  for _, point in ipairs(point_records) do
-    table.insert(points, {
-      id = point.source .. '\t' .. point.id,
-      label = point.label,
-    })
-  end
-
-  return points
+  return ref_records
 end
 
-local function choose_existing_branch(window, pane, repo)
-  if not refresh_remotes(window, repo) then
+local function choose_remote(window, pane, repo, callback)
+  local remotes, err = list_remotes(repo)
+  if not remotes then
+    notify(window, 'Could not list remotes for ' .. repo.name .. ': ' .. err)
     return
   end
 
-  local refs, checked_out, local_branch_names = existing_refs(repo)
-  if #refs == 0 then
-    notify(window, 'No local or remote refs are available for a new worktree')
+  if #remotes == 0 then
+    notify(window, 'No remotes are configured for ' .. repo.name)
+    return
+  end
+
+  if #remotes == 1 then
+    callback(window, pane, remotes[1])
     return
   end
 
   local choices = {}
-  local refs_by_id = {}
-  for _, ref in ipairs(refs) do
-    local choice_id = ref.source .. '\t' .. ref.id
-    refs_by_id[choice_id] = ref
+  for _, remote in ipairs(remotes) do
     table.insert(choices, {
-      id = choice_id,
-      label = ref.label,
+      id = remote,
+      label = remote,
     })
   end
 
   choose(window, pane, {
     choices = choices,
-    title = 'Existing branch or remote for ' .. repo.name,
-  }, function(inner_window, inner_pane, id)
-    if not id then
+    fuzzy = false,
+    title = 'Remote for ' .. repo.name,
+  }, function(inner_window, inner_pane, remote)
+    if not remote then
       return
-    end
-
-    local ref = refs_by_id[id]
-    if not ref then
-      notify(inner_window, 'Could not resolve the selected ref')
-      return
-    end
-
-    local target_branch = ref.logical_name
-    local create_opts = {
-      branch = target_branch,
-      start_point = ref.id,
-    }
-
-    if ref.source == 'remote' then
-      create_opts.upstream = ref.id
-      if local_branch_names[target_branch] then
-        if checked_out[target_branch] then
-          notify(inner_window, 'Local branch ' .. target_branch .. ' is already checked out; use the new-branch path instead')
-          return
-        end
-
-        create_opts.start_point = target_branch
-      else
-        create_opts.new_branch = target_branch
-      end
     end
 
     after_overlay(function()
-      create_opts.path = default_worktree_path(repo, sanitize_name(target_branch))
-      create_worktree(inner_window, pane, repo, create_opts)
+      callback(inner_window, pane, remote)
     end)
   end)
 end
 
-local function choose_new_branch(window, pane, repo)
-  if not refresh_remotes(window, repo) then
-    return
-  end
-
-  local points = start_points(repo)
-  if #points == 0 then
-    notify(window, 'No local or remote branches were found for ' .. repo.name)
-    return
-  end
-
+local function choose_branch_source(window, pane, repo, title, callback)
   choose(window, pane, {
-    choices = points,
-    title = 'Start point for new branch in ' .. repo.name,
-  }, function(inner_window, inner_pane, selected_point)
-    if not selected_point then
-      return
-    end
-
-    local source, start_point = selected_point:match('^([^\t]+)\t(.+)$')
-    if not source or not start_point then
-      notify(inner_window, 'Could not resolve the selected start point')
+    choices = branch_source.source_choices(),
+    fuzzy = false,
+    title = title .. ' for ' .. repo.name,
+  }, function(inner_window, inner_pane, source)
+    if not source then
       return
     end
 
     after_overlay(function()
-      prompt(
-        inner_window,
-        pane,
-        'New branch name from ' .. start_point,
-        function(branch_window, branch_pane, line)
-          if line == nil then
-            return
-          end
-
-          local new_branch = qualify_branch_name(repo, line)
-          if new_branch == '' then
-            notify(branch_window, 'A new branch name is required')
-            return
-          end
-
-          if new_branch:sub(-1) == '/' then
-            notify(branch_window, 'A branch name is required after ' .. (resolve_branch_prefix(repo) or 'the prefix'))
-            return
-          end
-
-          after_overlay(function()
-            if not refresh_start_point(branch_window, repo, start_point, source) then
-              return
-            end
-
-            create_worktree(branch_window, pane, repo, {
-              new_branch = new_branch,
-              path = default_worktree_path(repo, sanitize_name(new_branch)),
-              start_point = start_point,
-            })
-          end)
-        end
-      )
+      if source == 'remote' then
+        choose_remote(inner_window, pane, repo, function(remote_window, remote_pane, remote)
+          callback(remote_window, remote_pane, source, remote)
+        end)
+      else
+        callback(inner_window, pane, source, nil)
+      end
     end)
+  end)
+end
+
+local function choose_branch(window, pane, repo, source, remote, title, exclude_checked_out, callback)
+  local records = branch_records(repo, source, remote, exclude_checked_out)
+  if #records == 0 then
+    notify(window, 'No ' .. source .. ' branches are available for ' .. repo.name)
+    return
+  end
+
+  local records_by_id = {}
+  local choices = {}
+  for _, record in ipairs(records) do
+    records_by_id[record.id] = record
+    table.insert(choices, {
+      id = record.id,
+      label = record.logical_name,
+    })
+  end
+
+  choose(window, pane, {
+    choices = choices,
+    title = title .. ' from ' .. (remote or source) .. ' for ' .. repo.name,
+  }, function(inner_window, inner_pane, id)
+    local record = records_by_id[id]
+    if not record then
+      return
+    end
+
+    after_overlay(function()
+      callback(inner_window, pane, record)
+    end)
+  end)
+end
+
+local function prepare_remote_existing_branch(window, repo, record)
+  local branch = record.logical_name
+  local local_exists = local_branch_exists(repo, branch)
+  local checked_out = local_exists and checked_out_worktree(repo, branch) or nil
+  local local_oid, local_oid_err
+  if local_exists then
+    local_oid, local_oid_err = ref_oid(repo, branch)
+    if not local_oid then
+      notify(window, 'Could not resolve local branch ' .. branch .. ': ' .. local_oid_err)
+      return nil
+    end
+  end
+
+  local remote_oid, remote_oid_err = ref_oid(repo, record.id)
+  if not remote_oid then
+    notify(window, 'Could not resolve remote branch ' .. record.id .. ': ' .. remote_oid_err)
+    return nil
+  end
+
+  local same_tip = local_oid ~= nil and remote_oid ~= nil and local_oid == remote_oid
+  local local_is_ancestor = false
+  if local_exists and not checked_out and not same_tip then
+    local ancestor, ancestor_err = local_branch_is_ancestor(repo, branch, record.id)
+    if ancestor == nil then
+      notify(window, 'Could not compare ' .. branch .. ' with ' .. record.id .. ': ' .. ancestor_err)
+      return nil
+    end
+    local_is_ancestor = ancestor
+  end
+  local action = branch_source.existing_remote_action({
+    checked_out = checked_out ~= nil,
+    local_exists = local_exists,
+    local_is_ancestor = local_is_ancestor,
+    same_tip = same_tip,
+  })
+
+  if action == 'blocked_checked_out' then
+    notify(window, 'Local branch ' .. branch .. ' is already checked out at ' .. checked_out.path)
+    return nil
+  end
+
+  if action == 'blocked_diverged' then
+    notify(
+      window,
+      'Local branch ' .. branch .. ' is ahead of or diverged from ' .. record.id .. '. Choose Local branch or resolve it first'
+    )
+    return nil
+  end
+
+  if action == 'fast_forward' then
+    local stdout, stderr = git_output(repo.main_path, {
+      'branch',
+      '--force',
+      branch,
+      record.id,
+    })
+    if not stdout then
+      notify(window, 'Could not fast-forward ' .. branch .. ' to ' .. record.id .. ': ' .. stderr)
+      return nil
+    end
+  end
+
+  return {
+    branch = branch,
+    new_branch = action == 'create_tracking' and branch or nil,
+    start_point = action == 'create_tracking' and record.id or branch,
+    upstream = record.id,
+  }
+end
+
+local function choose_existing_branch(window, pane, repo)
+  choose_branch_source(window, pane, repo, 'Existing branch source', function(source_window, source_pane, source, remote)
+    if source == 'remote' and not refresh_remote(source_window, repo, remote) then
+      return
+    end
+
+    choose_branch(
+      source_window,
+      source_pane,
+      repo,
+      source,
+      remote,
+      'Existing branch',
+      source == 'local',
+      function(branch_window, branch_pane, record)
+        local create_opts
+        if source == 'remote' then
+          create_opts = prepare_remote_existing_branch(branch_window, repo, record)
+        else
+          create_opts = {
+            branch = record.logical_name,
+            start_point = record.id,
+          }
+        end
+
+        if not create_opts then
+          return
+        end
+
+        create_opts.path = default_worktree_path(repo, sanitize_name(record.logical_name))
+        create_worktree(branch_window, branch_pane, repo, create_opts)
+      end
+    )
+  end)
+end
+
+local function prompt_new_branch(window, pane, repo, record)
+  prompt(
+    window,
+    pane,
+    'New branch name from ' .. record.id,
+    function(branch_window, branch_pane, line)
+      if line == nil then
+        return
+      end
+
+      local new_branch = qualify_branch_name(repo, line)
+      if new_branch == '' then
+        notify(branch_window, 'A new branch name is required')
+        return
+      end
+
+      if new_branch:sub(-1) == '/' then
+        notify(branch_window, 'A branch name is required after ' .. (resolve_branch_prefix(repo) or 'the prefix'))
+        return
+      end
+
+      after_overlay(function()
+        create_worktree(branch_window, pane, repo, {
+          new_branch = new_branch,
+          path = default_worktree_path(repo, sanitize_name(new_branch)),
+          start_point = record.id,
+        })
+      end)
+    end
+  )
+end
+
+local function choose_new_branch(window, pane, repo)
+  choose_branch_source(window, pane, repo, 'New branch source', function(source_window, source_pane, source, remote)
+    if source == 'remote' and not refresh_remote(source_window, repo, remote) then
+      return
+    end
+
+    choose_branch(
+      source_window,
+      source_pane,
+      repo,
+      source,
+      remote,
+      'Start point',
+      false,
+      function(branch_window, branch_pane, record)
+        prompt_new_branch(branch_window, branch_pane, repo, record)
+      end
+    )
   end)
 end
 
@@ -2002,7 +1960,7 @@ local function start_create_flow(window, pane, repo)
       },
       {
         id = 'existing',
-        label = 'Use existing branch or remote ref',
+        label = 'Check out existing branch',
       },
     },
     fuzzy = false,
@@ -2441,10 +2399,12 @@ choose_worktree_to_remove = function(window, pane, repos, current_workspace)
   end)
 end
 
-local function worktree_label(worktree, current_workspace)
+local function worktree_label(worktree, current_workspace, current_worktree)
   local branch = worktree.branch_name or 'detached'
   local target = worktree.is_main and 'main worktree' or basename(worktree.path)
-  local prefix = worktree.workspace_name == current_workspace and '* ' or '  '
+  local is_current = worktree.workspace_name == current_workspace
+    or (current_worktree and worktree.path == current_worktree.path)
+  local prefix = is_current and '* ' or '  '
   return prefix .. worktree.repo_name .. ' [' .. branch .. '] - ' .. target
 end
 
@@ -2568,7 +2528,7 @@ function M.menu()
     for _, worktree in ipairs(flatten_worktrees(repos)) do
       table.insert(choices, {
         id = worktree.path,
-        label = worktree_label(worktree, current_workspace),
+        label = worktree_label(worktree, current_workspace, current_worktree),
       })
     end
 

@@ -161,6 +161,29 @@ search operate on the code alone. Tests asserting gutter content must read
 the row's inline `virt_text` extmark (see `gutter_text` in
 `tests/diff_review/hunk_boundary_context.lua`).
 
+Walkthrough startup must resolve the repository root from the status view's
+working directory before reading `.walkthrough.json` or computing inventory.
+Cache that canonical root in the walkthrough host and use it for every
+`git -C` command and repository-relative path conversion. Neovim may start in
+any repository subdirectory, while Git interprets `HEAD:path` relative to the
+command working directory.
+
+Walkthrough inventory must derive each canonical repository-relative path from
+the file's absolute filename and the resolved Git root. Treat a status-provided
+`relpath` as fallback data because status rows may have computed it relative to
+Neovim's launch directory rather than the repository root.
+
+Folded walkthrough tasks must keep the complete task heading visible, including
+every wrapped title and task-justification line. Anchor the native child fold at
+the final heading row so its fold text preserves that row, while `<Tab>` only
+reveals or hides the nested subtask and change rows. Keep the task title segment
+bold through `DiffReviewWalkthroughItemTitle` in both folded and expanded states.
+
+The walkthrough's initial fold state must expose task headings and each subtask
+title while keeping every subtask's justification and concrete change rows
+folded. `<Tab>` on a subtask reveals its changes. `<Tab>` on a task still folds
+or unfolds the complete task subtree.
+
 Diff rendering uses two layers:
 
 - Raw hunks are the data/action model. Git diff/show commands should request

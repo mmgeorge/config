@@ -74,6 +74,7 @@
 ---@class DiffReviewWalkthroughHost narrow interface handed over by diff_review
 ---@field buf integer
 ---@field cwd fun(): string?
+---@field resolve_root_async fun(cb: fun(root?: string, err?: string))
 ---@field get_state fun(): table? current status state (lines, entries, sections)
 ---@field file_key fun(section_name: string, filename: string): string
 ---@field hunk_key fun(section_name: string, filename: string, diff?: string): string
@@ -1662,6 +1663,7 @@ local function append_status_task_body_rows(rows, task, task_id, width, item_tit
       id = subtask_id,
       parent_id = task_id,
       kind = "pr_head_section",
+      default_folded = true,
     }, width, item_titles)
 
     local item_prefix = subtask_prefix .. tree_continuation(subtask_is_last)
@@ -2376,15 +2378,17 @@ local function status_summary_rows(mode)
 
   for task_index, task in ipairs(mode.doc.tasks or {}) do
     local task_id = ("walkthrough:task:%d"):format(task_index)
-    for heading_index, heading_row in ipairs(status_task_heading_rows(task_index, task, width)) do
+    local heading_rows = status_task_heading_rows(task_index, task, width)
+    for heading_index, heading_row in ipairs(heading_rows) do
+      local anchors_task_fold = heading_index == #heading_rows
       rows[#rows + 1] = {
         text = heading_row.text,
         segments = heading_row.segments,
-        id = heading_index == 1 and task_id or ("%s:heading:%d"):format(task_id, heading_index),
-        parent_id = heading_index == 1 and status_section_id or task_id,
-        kind = heading_index == 1 and "pr_head_section" or "pr_head_line",
-        fold_target_id = heading_index == 1 and false or task_id,
-        default_folded = heading_index == 1,
+        id = anchors_task_fold and task_id or ("%s:heading:%d"):format(task_id, heading_index),
+        parent_id = status_section_id,
+        kind = anchors_task_fold and "pr_head_section" or "pr_head_line",
+        fold_target_id = anchors_task_fold and false or task_id,
+        default_folded = anchors_task_fold,
       }
     end
 
@@ -2850,48 +2854,54 @@ function M.start(host)
     return
   end
 
-  local cwd = host.cwd()
-  if not cwd or cwd == "" then
-    notify("No repository loaded", vim.log.levels.WARN)
-    return
-  end
-
-  local path = cwd .. "/.walkthrough.json"
-  local text = (M._reader or read_file)(path)
-  if not text then
-    notify("No .walkthrough.json found at repo root", vim.log.levels.INFO)
-    return
-  end
-
-  local ok, decoded = pcall(vim.json.decode, text, { luanil = { object = true, array = true } })
-  if not ok then
-    notify(".walkthrough.json is not valid JSON: " .. tostring(decoded), vim.log.levels.WARN)
-    return
-  end
-  local doc, parse_err = parse_doc(decoded)
-  if not doc then
-    notify(".walkthrough.json: " .. parse_err, vim.log.levels.WARN)
-    return
-  end
-
-  host.git_list_async({ "git", "-C", cwd, "rev-parse", "HEAD" }, function(output, code)
+  host.resolve_root_async(function(root, root_err)
     if not vim.api.nvim_buf_is_valid(host.buf) then return end
-    local head_sha = code == 0 and vim.trim((output or {})[1] or "") or nil
-    ---@type DiffReviewWalkthroughMode
-    local mode = {
-      host = host,
-      doc = doc,
-      index = 0,
-      head_sha = head_sha,
-      stale = not head_sha or head_sha:lower() ~= doc.commit:lower(),
-      saved_maps = {},
-    }
-    for task_index, _ in ipairs(doc.tasks or {}) do
-      host.set_folded(("walkthrough:task:%d"):format(task_index), true)
+    if not root then
+      notify(root_err or "No repository loaded", vim.log.levels.WARN)
+      return
     end
-    M._modes[host.buf] = mode
-    local initial_target_id = #(doc.flow or {}) > 0 and "walkthrough:flow:1" or status_section_id
-    host.rerender(initial_target_id)
+
+    local path = root .. "/.walkthrough.json"
+    local text = (M._reader or read_file)(path)
+    if not text then
+      notify("No .walkthrough.json found at repo root", vim.log.levels.INFO)
+      return
+    end
+
+    local ok, decoded = pcall(vim.json.decode, text, { luanil = { object = true, array = true } })
+    if not ok then
+      notify(".walkthrough.json is not valid JSON: " .. tostring(decoded), vim.log.levels.WARN)
+      return
+    end
+    local doc, parse_err = parse_doc(decoded)
+    if not doc then
+      notify(".walkthrough.json: " .. parse_err, vim.log.levels.WARN)
+      return
+    end
+
+    host.git_list_async({ "git", "-C", root, "rev-parse", "HEAD" }, function(output, code)
+      if not vim.api.nvim_buf_is_valid(host.buf) then return end
+      local head_sha = code == 0 and vim.trim((output or {})[1] or "") or nil
+      ---@type DiffReviewWalkthroughMode
+      local mode = {
+        host = host,
+        doc = doc,
+        index = 0,
+        head_sha = head_sha,
+        stale = not head_sha or head_sha:lower() ~= doc.commit:lower(),
+        saved_maps = {},
+      }
+      for task_index, task in ipairs(doc.tasks or {}) do
+        local task_id = ("walkthrough:task:%d"):format(task_index)
+        host.set_folded(task_id, false)
+        for subtask_index, _ in ipairs(task.subtasks or {}) do
+          host.set_folded(("%s:subtask:%d"):format(task_id, subtask_index), true)
+        end
+      end
+      M._modes[host.buf] = mode
+      local initial_target_id = #(doc.flow or {}) > 0 and "walkthrough:flow:1" or status_section_id
+      host.rerender(initial_target_id)
+    end)
   end)
 end
 
