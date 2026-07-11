@@ -7,6 +7,7 @@ local M = {}
 local is_windows = wezterm.target_triple:find('windows') ~= nil
 
 M.settings = {
+  creation_runner_path = wezterm.config_dir .. '/../windows/create-worktree.ps1',
   debug = false,
   debug_log_path = wezterm.home_dir .. '/wezterm-worktree-debug.log',
   roots = {
@@ -856,6 +857,11 @@ local function pending_layouts()
   return wezterm.GLOBAL.worktree_pending_layouts
 end
 
+local function pending_creations()
+  wezterm.GLOBAL.worktree_pending_creations = wezterm.GLOBAL.worktree_pending_creations or {}
+  return wezterm.GLOBAL.worktree_pending_creations
+end
+
 local function pending_removals()
   wezterm.GLOBAL.worktree_pending_removals = wezterm.GLOBAL.worktree_pending_removals or {}
   return wezterm.GLOBAL.worktree_pending_removals
@@ -1652,6 +1658,108 @@ local function local_branch_is_ancestor(repo, branch, remote_ref)
   return false, nil
 end
 
+local function created_branch(opts)
+  return opts.branch or opts.new_branch or opts.start_point
+end
+
+local function finish_created_worktree(window, pane, repo, opts, workspace_open)
+  local updated_repo = build_repo(opts.path) or build_repo(repo.main_path)
+  if not updated_repo then
+    notify(window, 'Created the worktree, but could not refresh repository metadata')
+    return
+  end
+
+  local worktree = find_worktree(updated_repo, opts.path)
+  if not worktree then
+    notify(window, 'Created the worktree, but could not locate it in git worktree list')
+    return
+  end
+
+  if opts.upstream then
+    local branch = created_branch(opts)
+    local upstream_ok, upstream_err = ensure_branch_upstream(updated_repo, branch, opts.upstream)
+    if not upstream_ok then
+      local message = upstream_err and upstream_err ~= '' and upstream_err or ('could not set upstream to ' .. opts.upstream)
+      notify(window, 'Created the worktree, but could not set upstream for ' .. branch .. ': ' .. message)
+    end
+  end
+
+  run_new_worktree_setup(window, updated_repo, worktree)
+
+  local layout_options = {
+    first_run = resolve_layout(worktree).first_run,
+  }
+  if workspace_open then
+    queue_layout(worktree, layout_options)
+    return
+  end
+
+  switch_to_worktree(window, pane, worktree, layout_options)
+end
+
+local function worktree_creation_command(repo, opts, workspace_name)
+  local command = {
+    'powershell.exe',
+    '-NoLogo',
+    '-NoProfile',
+    '-ExecutionPolicy',
+    'Bypass',
+    '-File',
+    M.settings.creation_runner_path,
+    '-RepositoryPath',
+    repo.main_path,
+    '-WorktreePath',
+    opts.path,
+    '-StartPoint',
+    opts.start_point,
+  }
+  if opts.new_branch then
+    table.insert(command, '-NewBranch')
+    table.insert(command, opts.new_branch)
+  end
+  table.insert(command, '-WorkspaceName')
+  table.insert(command, workspace_name)
+  return command
+end
+
+local function start_visible_worktree_creation(window, pane, repo, opts)
+  local branch = created_branch(opts)
+  local worktree = {
+    branch_name = branch,
+    path = opts.path,
+    repo_main_path = repo.main_path,
+    repo_name = repo.name,
+  }
+  worktree.workspace_name = worktree_workspace_name(repo.name, worktree)
+
+  if workspace_exists(worktree.workspace_name) then
+    notify(window, 'Workspace ' .. worktree.workspace_name .. ' already exists')
+    return
+  end
+
+  pending_creations()[worktree.workspace_name] = {
+    branch = opts.branch,
+    new_branch = opts.new_branch,
+    path = opts.path,
+    repo_main_path = repo.main_path,
+    start_point = opts.start_point,
+    upstream = opts.upstream,
+    workspace_name = worktree.workspace_name,
+  }
+
+  window:perform_action(
+    act.SwitchToWorkspace({
+      name = worktree.workspace_name,
+      spawn = {
+        args = worktree_creation_command(repo, opts, worktree.workspace_name),
+        cwd = repo.main_path,
+        label = worktree.workspace_name,
+      },
+    }),
+    pane
+  )
+end
+
 local function create_worktree(window, pane, repo, opts)
   local args = { 'worktree', 'add' }
 
@@ -1676,40 +1784,18 @@ local function create_worktree(window, pane, repo, opts)
   table.insert(args, opts.path)
   table.insert(args, opts.start_point)
 
+  if is_windows then
+    start_visible_worktree_creation(window, pane, repo, opts)
+    return
+  end
+
   local stdout, stderr = git_output(repo.main_path, args)
   if not stdout then
     notify(window, stderr)
     return
   end
 
-  if opts.upstream then
-    local branch = opts.branch or opts.new_branch or opts.start_point
-    if branch then
-      local upstream_ok, upstream_err = ensure_branch_upstream(repo, branch, opts.upstream)
-      if not upstream_ok then
-        local message = upstream_err and upstream_err ~= '' and upstream_err or ('could not set upstream to ' .. opts.upstream)
-        notify(window, 'Created the worktree, but could not set upstream for ' .. branch .. ': ' .. message)
-      end
-    end
-  end
-
-  local updated_repo = build_repo(opts.path) or build_repo(repo.main_path)
-  if not updated_repo then
-    notify(window, 'Created the worktree, but could not refresh repository metadata')
-    return
-  end
-
-  local worktree = find_worktree(updated_repo, opts.path)
-  if not worktree then
-    notify(window, 'Created the worktree, but could not locate it in git worktree list')
-    return
-  end
-
-  run_new_worktree_setup(window, updated_repo, worktree)
-
-  switch_to_worktree(window, pane, worktree, {
-    first_run = resolve_layout(worktree).first_run,
-  })
+  finish_created_worktree(window, pane, repo, opts, false)
 end
 
 local function branch_records(repo, source, remote, exclude_checked_out)
@@ -2528,6 +2614,27 @@ local function worktree_label(worktree, current_workspace, current_worktree)
     or (current_worktree and worktree.path == current_worktree.path)
   local prefix = is_current and '* ' or '  '
   return prefix .. worktree.repo_name .. ' [' .. branch .. '] - ' .. target
+end
+
+function M.handle_user_var_changed(window, pane, name, value)
+  if name ~= 'WORKTREE_CREATE_READY' and name ~= 'WORKTREE_CREATE_FAILED' then
+    return
+  end
+
+  local pending = pending_creations()[value]
+  if not pending then
+    return
+  end
+
+  pending_creations()[value] = nil
+  if name == 'WORKTREE_CREATE_FAILED' then
+    notify(window, 'Worktree creation failed. The Git error remains visible in the workspace')
+    return
+  end
+
+  finish_created_worktree(window, pane, {
+    main_path = pending.repo_main_path,
+  }, pending, true)
 end
 
 function M.handle_update_status(window, pane)

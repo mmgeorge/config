@@ -116,6 +116,10 @@ wezterm.on('update-status', function(window, pane)
   worktree.handle_update_status(window, pane)
 end)
 
+wezterm.on('user-var-changed', function(window, pane, name, value)
+  worktree.handle_user_var_changed(window, pane, name, value)
+end)
+
 wezterm.on('format-tab-title', function(tab, tabs, panes, config, hover, max_width)
   local user_title = tab.active_pane.title
   local pwd = tab.active_pane.current_working_dir

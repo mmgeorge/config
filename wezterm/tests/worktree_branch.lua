@@ -44,6 +44,8 @@ local current_action
 local command_history = {}
 local fake_action = {}
 local notifications = {}
+local active_workspace = 'default'
+local active_tab_title
 local fake_repository = {
   common_dir = 'D:/repo/.git',
   pane_path = 'D:/repo',
@@ -58,6 +60,10 @@ function fake_action.PromptInputLine(spec)
   return { kind = 'prompt', spec = spec }
 end
 
+function fake_action.SwitchToWorkspace(spec)
+  return { kind = 'workspace', spec = spec }
+end
+
 local function command_contains(command, expected)
   return table.concat(command, ' '):find(expected, 1, true) ~= nil
 end
@@ -69,6 +75,7 @@ package.preload.wezterm = function()
     action_callback = function(callback)
       return callback
     end,
+    config_dir = wezterm_dir,
     executable_dir = wezterm_dir,
     home_dir = wezterm_dir,
     mux = {
@@ -99,6 +106,11 @@ package.preload.wezterm = function()
       if command_contains(command, 'show-ref --verify --quiet refs/heads/coworker/demo') then
         return false, '', ''
       end
+      if command_contains(command, 'show-ref --verify --quiet refs/heads/mmgeorge/progress')
+        or command_contains(command, 'show-ref --verify --quiet refs/heads/mmgeorge/failed')
+      then
+        return false, '', ''
+      end
       if command_contains(command, 'rev-parse --verify origin/behind') then
         return true, 'remote-tip\n', ''
       end
@@ -125,7 +137,17 @@ assert_equal(worktree.settings.layouts.by_repo.maps.branch_prefix, 'matt9222/',
 
 local fake_window = {}
 function fake_window:active_workspace()
-  return 'default'
+  return active_workspace
+end
+function fake_window:active_tab()
+  return {
+    set_title = function(_, title)
+      active_tab_title = title
+    end,
+  }
+end
+function fake_window:mux_window()
+  return {}
 end
 function fake_window:perform_action(action)
   current_action = action
@@ -152,6 +174,12 @@ local function command_history_contains(expected)
   end
 
   return false
+end
+
+local function current_spawn_contains(expected)
+  local spawn = current_action.spec and current_action.spec.spawn
+  local args = spawn and spawn.args or {}
+  return table.concat(args, ' '):find(expected, 1, true) ~= nil
 end
 
 local function choice_by_id(id)
@@ -205,6 +233,46 @@ assert_equal(command_history_contains(' fetch '), false,
 assert_equal(current_action.spec.title, 'Start point from local for repo',
   'new branch local source must show local refs')
 
+choose_id('main')
+current_action.spec.action(fake_window, fake_pane, 'progress')
+assert_equal(current_action.kind, 'workspace', 'new local branch must switch to a progress workspace immediately')
+assert_equal(current_action.spec.name, 'repo:mmgeorge/progress',
+  'progress workspace must use the future worktree branch name')
+assert_equal(current_action.spec.spawn.cwd, 'D:/repo',
+  'progress runner must start from the existing repository path')
+assert_equal(current_spawn_contains(
+  'create-worktree.ps1 -RepositoryPath D:/repo -WorktreePath D:/mmgeorge/progress -StartPoint main -NewBranch mmgeorge/progress'), true,
+  'progress workspace must receive the complete worktree creation request')
+assert_equal(command_history_contains('worktree add -b mmgeorge/progress'), false,
+  'Lua must not block on git worktree add before switching workspaces')
+
+fake_repository.worktrees = table.concat({
+  'worktree D:/repo',
+  'HEAD abc123',
+  'branch refs/heads/main',
+  '',
+  'worktree D:/mmgeorge/progress',
+  'HEAD def456',
+  'branch refs/heads/mmgeorge/progress',
+  '',
+}, '\n')
+active_workspace = 'repo:mmgeorge/progress'
+worktree.handle_user_var_changed(fake_window, fake_pane, 'WORKTREE_CREATE_READY', active_workspace)
+worktree.handle_update_status(fake_window, fake_pane)
+assert_equal(active_tab_title, 'main',
+  'successful progress runner completion must apply the repository layout')
+active_workspace = 'default'
+
+open_branch_source('new')
+choose_id('local')
+choose_id('main')
+current_action.spec.action(fake_window, fake_pane, 'failed')
+active_workspace = 'repo:mmgeorge/failed'
+worktree.handle_user_var_changed(fake_window, fake_pane, 'WORKTREE_CREATE_FAILED', active_workspace)
+assert_equal(notification_contains('Worktree creation failed'), true,
+  'failed progress runner completion must remain visible to the user')
+active_workspace = 'default'
+
 open_branch_source('existing')
 choose_id('remote')
 assert_equal(command_history_contains('fetch --prune --no-tags --no-recurse-submodules origin'), true,
@@ -216,8 +284,12 @@ local recorded_commands = {}
 for _, command in ipairs(command_history) do
   table.insert(recorded_commands, table.concat(command, ' '))
 end
-assert_equal(command_history_contains('worktree add -b coworker/demo D:/coworker/demo origin/coworker/demo'), true,
-  'newly discovered remote branch must create a matching local worktree branch\n' .. table.concat(recorded_commands, '\n'))
+assert_equal(current_action.kind, 'workspace',
+  'newly discovered remote branch must open a progress workspace')
+assert_equal(current_spawn_contains(
+  '-StartPoint origin/coworker/demo -NewBranch coworker/demo'), true,
+  'newly discovered remote branch must pass its tracking branch request to the progress runner\n'
+    .. table.concat(recorded_commands, '\n') .. '\nspawn: ' .. table.concat(current_action.spec.spawn.args, ' '))
 
 open_branch_source('existing')
 choose_id('remote')
@@ -241,6 +313,13 @@ assert_equal(command_history_contains(' fetch '), false,
   'existing local source must not fetch')
 assert_equal(current_action.spec.title, 'Existing branch from local for repo',
   'existing local source must show local refs')
+choose_id('local-only')
+assert_equal(current_action.kind, 'workspace',
+  'existing local branch must open a progress workspace')
+assert_equal(current_spawn_contains('-StartPoint local-only -WorkspaceName repo:local-only'), true,
+  'existing local branch must pass its local tip to the progress runner')
+assert_equal(current_spawn_contains('-NewBranch'), false,
+  'existing local branch must not ask the progress runner to create a branch')
 
 fake_repository = {
   common_dir = 'D:/code/test-wt/.bare',
