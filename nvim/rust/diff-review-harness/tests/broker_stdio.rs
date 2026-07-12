@@ -115,17 +115,15 @@ fn streams_mock_backend_events_before_the_jsonl_response() {
             .iter()
             .filter(|event| **event == "backend_event")
             .count(),
-        3
+        1
     );
     let backend_kind = planned
         .iter()
         .filter(|message| message.get("event").and_then(Value::as_str) == Some("backend_event"))
         .filter_map(|message| message.pointer("/payload/kind").and_then(Value::as_str))
         .collect::<Vec<_>>();
-    assert_eq!(
-        backend_kind,
-        vec!["user_message", "assistant_message", "assistant_summary"]
-    );
+    assert_eq!(backend_kind, vec!["timeline_active"]);
+    assert!(event_name.contains(&"interaction_complete"));
     assert!(event_name.contains(&"plan_review"));
     assert!(planned.last().unwrap().get("error").is_none());
 
@@ -139,4 +137,85 @@ fn streams_mock_backend_events_before_the_jsonl_response() {
             .and_then(Value::as_bool),
         Some(true)
     );
+}
+
+#[test]
+fn reports_structured_lease_recovery_and_allows_a_new_session() {
+    let repository = tempfile::tempdir().unwrap();
+    git(repository.path(), &["init", "-q"]);
+    git(
+        repository.path(),
+        &["config", "user.email", "harness@example.invalid"],
+    );
+    git(
+        repository.path(),
+        &["config", "user.name", "Harness Integration"],
+    );
+    std::fs::write(repository.path().join("README.md"), "# Harness\n").unwrap();
+    git(repository.path(), &["add", "."]);
+    git(repository.path(), &["commit", "-qm", "seed"]);
+    let data = tempfile::tempdir().unwrap();
+    let initialize = |id: u64, client_id: &str, action: Option<&str>| {
+        json!({
+            "id": id,
+            "method": "initialize",
+            "params": {
+                "data_root": data.path(),
+                "workspace": repository.path(),
+                "client_id": client_id,
+                "backend": { "kind": "mock", "command": ["mock"] },
+                "model": "mock-model",
+                "effort": "low",
+                "trust_profile": "workspace",
+                "goal_max_turns": 20,
+                "lease_conflict_action": action
+            }
+        })
+    };
+
+    let mut owner = BrokerProcess::start();
+    owner.request(initialize(1, "owner", None));
+    let owner_snapshot = owner.read_response(1);
+    let owner_session_id = owner_snapshot
+        .last()
+        .unwrap()
+        .pointer("/result/session/id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_owned();
+    owner.request(
+        json!({ "id": 2, "method": "prompt.submit", "params": { "text": "prime fork support" } }),
+    );
+    assert!(
+        owner
+            .read_response(2)
+            .last()
+            .unwrap()
+            .get("error")
+            .is_none()
+    );
+
+    let mut blocked = BrokerProcess::start();
+    blocked.request(initialize(3, "blocked", None));
+    let conflict = blocked.read_response(3);
+    let error = conflict.last().unwrap().get("error").unwrap();
+    assert_eq!(error["code"], "session_lease_conflict");
+    assert_eq!(error["data"]["session_id"], owner_session_id);
+    assert_eq!(error["data"]["native_fork"], true);
+
+    let mut replacement = BrokerProcess::start();
+    replacement.request(initialize(4, "replacement", Some("new")));
+    let replacement_snapshot = replacement.read_response(4);
+    let replacement_session_id = replacement_snapshot
+        .last()
+        .unwrap()
+        .pointer("/result/session/id")
+        .and_then(Value::as_str)
+        .unwrap();
+    assert_ne!(replacement_session_id, owner_session_id);
+
+    replacement.request(json!({ "id": 5, "method": "shutdown", "params": {} }));
+    replacement.read_response(5);
+    owner.request(json!({ "id": 6, "method": "shutdown", "params": {} }));
+    owner.read_response(6);
 }

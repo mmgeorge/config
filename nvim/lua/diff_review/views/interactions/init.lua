@@ -46,7 +46,25 @@ local function render(interaction)
   vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, output.lines)
   vim.api.nvim_buf_clear_namespace(state.buf, namespace, 0, -1)
   for _, highlight in ipairs(output.highlight) do
-    vim.api.nvim_buf_add_highlight(state.buf, namespace, highlight.group, highlight.line - 1, 0, -1)
+    local first = highlight.first or 0
+    local last = highlight.last or -1
+    if last < 0 then last = #(output.lines[highlight.line] or "") end
+    if last > first then
+      vim.api.nvim_buf_set_extmark(state.buf, namespace, highlight.line - 1, first, {
+        end_col = last,
+        hl_group = highlight.group,
+        priority = highlight.priority or 90,
+      })
+    end
+  end
+  for _, extmark in ipairs(output.extmark or {}) do
+    vim.api.nvim_buf_set_extmark(
+      state.buf,
+      namespace,
+      extmark.line - 1,
+      extmark.col or 0,
+      extmark.options or {}
+    )
   end
   for _, comment in ipairs(output.comment) do
     local box_line = comment_box.build_box_lines({

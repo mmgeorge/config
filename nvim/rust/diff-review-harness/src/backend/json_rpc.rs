@@ -1386,7 +1386,7 @@ mod test {
     }
 
     #[test]
-    fn records_token_usage_without_emitting_transcript_noise() {
+    fn records_token_usage_without_emitting_interaction_noise() {
         let mut output = BackendOutput::default();
         normalize_event(
             &json!({

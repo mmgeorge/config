@@ -36,10 +36,10 @@ function M.open()
   vim.wo[transcript_win].wrap = true
   vim.wo[transcript_win].linebreak = true
   vim.wo[transcript_win].breakindent = true
-  vim.wo[transcript_win].breakindentopt = ""
+  vim.wo[transcript_win].breakindentopt = "shift:0"
   vim.wo[transcript_win].foldmethod = "manual"
   vim.wo[transcript_win].foldenable = true
-  vim.wo[transcript_win].foldtext = "v:lua.require'diff_review.render.harness.transcript'.foldtext()"
+  vim.wo[transcript_win].foldtext = "v:lua.require'diff_review.render.harness.interaction_tree'.foldtext()"
   vim.wo[transcript_win].fillchars = "fold: "
   configure_gutterless_window(transcript_win)
 

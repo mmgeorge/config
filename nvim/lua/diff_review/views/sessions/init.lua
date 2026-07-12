@@ -6,6 +6,7 @@ local config = require("diff_review.infra.config")
 local keymaps = require("diff_review.shared.keymaps")
 local notifications = require("diff_review.infra.notifications")
 local session = require("diff_review.session")
+local interaction_state = require("diff_review.views.harness.interaction_state")
 
 local namespace = vim.api.nvim_create_namespace("DiffReviewSessions")
 local fork
@@ -93,12 +94,13 @@ local function resume()
   client.request("session.resume", { session_id = entry.id }, function(result, request_error)
     if request_error then notifications.error(request_error, "Sessions") return end
     session.harness.session = result.session
-    session.harness.transcript = result.transcript or {}
+    interaction_state.replace(session.harness, result.interaction or {})
     session.harness.capability = result.capability or {}
     session.harness.queue = {}
     session.harness.goal = result.goal
     session.harness.active_plan = result.active_plan
-    require("diff_review.views.harness.controller").render()
+    session.harness.plan_progress = nil
+    require("diff_review.views.harness.controller").render(true)
     M.refresh()
   end)
 end
@@ -110,12 +112,13 @@ fork = function()
   client.request("session.fork", { session_id = entry.id }, function(result, request_error)
     if request_error then notifications.error(request_error, "Sessions fork") return end
     session.harness.session = result.session
-    session.harness.transcript = result.transcript or {}
+    interaction_state.replace(session.harness, result.interaction or {})
     session.harness.capability = result.capability or {}
     session.harness.queue = {}
     session.harness.goal = result.goal
     session.harness.active_plan = result.active_plan
-    require("diff_review.views.harness.controller").render()
+    session.harness.plan_progress = nil
+    require("diff_review.views.harness.controller").render(true)
     M.refresh()
   end)
 end

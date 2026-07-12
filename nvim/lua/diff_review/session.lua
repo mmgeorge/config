@@ -67,8 +67,15 @@ M.empty_diff_rows = {}
 ---@field busy boolean
 ---@field session table?
 ---@field capability table
----@field transcript table[]
----@field transcript_revision integer
+---@field interaction table[]
+---@field interaction_by_id table<string, table>
+---@field pending_interaction table?
+---@field render_rows table<integer, table>
+---@field fold_installed table<string, boolean>
+---@field activity_expanded table<string, boolean>
+---@field rendered_lines string[]
+---@field render_namespace integer?
+---@field render_initialized boolean
 ---@field queue string[]
 ---@field transcript_buf integer?
 ---@field transcript_win integer?
@@ -76,8 +83,8 @@ M.empty_diff_rows = {}
 ---@field composer_win integer?
 ---@field prompt_line integer[]
 ---@field activity_range table[]
----@field activity_view table<string, "collapsed"|"full">
 ---@field active_plan table?
+---@field plan_progress table?
 ---@field plan_annotations table[]
 ---@field no_checkpoint boolean
 ---@field interactions table?
@@ -88,7 +95,7 @@ M.empty_diff_rows = {}
 ---@field pending_config table?
 ---@field pending_mode "read"|"write"?
 
---- Harness process, view, queue, transcript, and capability state. The broker owns
+--- Harness process, view, queue, interaction-tree, and capability state. The broker owns
 --- durable state while this table owns only the current Neovim presentation.
 ---@type DiffReviewHarnessPresentationState
 M.harness = {
@@ -97,8 +104,15 @@ M.harness = {
   busy = false,
   session = nil,
   capability = {},
-  transcript = {},
-  transcript_revision = 0,
+  interaction = {},
+  interaction_by_id = {},
+  pending_interaction = nil,
+  render_rows = {},
+  fold_installed = {},
+  activity_expanded = {},
+  rendered_lines = {},
+  render_namespace = nil,
+  render_initialized = false,
   queue = {},
   transcript_buf = nil,
   transcript_win = nil,
@@ -106,8 +120,8 @@ M.harness = {
   composer_win = nil,
   prompt_line = {},
   activity_range = {},
-  activity_view = {},
   active_plan = nil,
+  plan_progress = nil,
   plan_annotations = {},
   no_checkpoint = false,
   interactions = nil,

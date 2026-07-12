@@ -1,20 +1,25 @@
 use crate::backend::{
     Backend, BackendCapability, BackendEvent, BackendEventSink, BackendLaunch, BackendRequest,
-    PromptMode, TrustPolicy, TurnSummary,
+    PromptMode, TrustPolicy,
 };
 use crate::checkpoint::{GitCheckpoint, WorkspaceSnapshot, checkpoint_diff};
 use crate::goal::{ContinuationDecision, GoalRecord, GoalState};
-use crate::interaction::{InteractionComment, InteractionRecord, InteractionState};
+use crate::interaction::{
+    ActiveThoughtUpdate, CompletedThought, InteractionComment, InteractionRecord, InteractionState,
+    TimelineReducer,
+};
 use crate::plan::{PlanAnnotation, PlanFileStore, PlanRecord, PlanState};
 use crate::protocol::{BrokerEvent, BrokerRequest, BrokerResponse};
 use crate::session::{HarnessPreference, HarnessSession, SessionStore, WriteMode};
 use crate::storage::SqliteStore;
 use crate::workspace::WorkspaceKind;
+use crate::workspace::watch::{NotifyWorkspaceWatch, WorkspaceWatch};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 /// Defines wall-clock access consumed by leases and durable timelines.
@@ -53,17 +58,27 @@ pub struct InitializeRequest {
     pub session_id: Option<String>,
     #[serde(default = "default_goal_max_turns")]
     pub goal_max_turns: u32,
+    #[serde(default)]
+    pub lease_conflict_action: Option<String>,
 }
 
 /// Represents the complete client-visible state for one active session.
 #[derive(Clone, Debug, Serialize)]
 pub struct BrokerSnapshot {
     pub session: HarnessSession,
-    pub transcript: Vec<Value>,
+    pub interaction: Vec<InteractionRecord>,
     pub capability: BackendCapability,
     pub no_checkpoint: bool,
     pub goal: Option<GoalRecord>,
     pub active_plan: Option<PlanRecord>,
+}
+
+struct InteractionRuntime {
+    interaction_id: String,
+    timeline: TimelineReducer,
+    watcher: Option<NotifyWorkspaceWatch>,
+    thought_generation: u64,
+    last_checkpoint_id: Option<String>,
 }
 
 /// Represents one request result plus asynchronous events emitted before its response.
@@ -74,23 +89,6 @@ pub struct DispatchResult {
 
 struct InteractionAdmission {
     prompt: String,
-    transcript_kind: &'static str,
-}
-
-impl InteractionAdmission {
-    fn message(prompt: impl Into<String>) -> Self {
-        Self {
-            prompt: prompt.into(),
-            transcript_kind: "user_message",
-        }
-    }
-
-    fn action(prompt: impl Into<String>) -> Self {
-        Self {
-            prompt: prompt.into(),
-            transcript_kind: "user_action",
-        }
-    }
 }
 
 /// Coordinates backend turns, durable state, plan review, goals, and interaction checkpoints.
@@ -101,13 +99,14 @@ pub struct HarnessBroker {
     data_root: PathBuf,
     client_id: String,
     backend_launch: BackendLaunch,
-    backend: Box<dyn Backend>,
+    backend: Arc<dyn Backend>,
     session: HarnessSession,
     capability: BackendCapability,
     goal_max_turns: u32,
     trust_policy: TrustPolicy,
     event_sink: Option<BackendEventSink>,
     clock: Box<dyn Clock>,
+    interaction_runtime: Option<InteractionRuntime>,
 }
 
 impl HarnessBroker {
@@ -130,16 +129,21 @@ impl HarnessBroker {
             }
         };
         let now_ms = clock.now_ms();
-        let backend = crate::backend::build(request.backend.clone())?;
-        let mut session = match request.session_id.as_deref() {
+        let backend = Arc::<dyn Backend>::from(crate::backend::build(request.backend.clone())?);
+        let force_new_session = request.lease_conflict_action.as_deref() == Some("new");
+        let mut session = match request.session_id.as_deref().filter(|_| !force_new_session) {
             Some(session_id) => {
                 store.acquire_session_lease(session_id, &request.client_id, now_ms)?
             }
             None => {
-                let latest_session = store
-                    .list_session(Some(&workspace))?
-                    .into_iter()
-                    .find(|session| session.backend == request.backend.kind);
+                let latest_session = if force_new_session {
+                    None
+                } else {
+                    store
+                        .list_session(Some(&workspace))?
+                        .into_iter()
+                        .find(|session| session.backend == request.backend.kind)
+                };
                 match latest_session {
                     Some(session) => {
                         store.acquire_session_lease(&session.id, &request.client_id, now_ms)?
@@ -210,6 +214,7 @@ impl HarnessBroker {
             trust_policy: request.trust_policy,
             event_sink: None,
             clock,
+            interaction_runtime: None,
         })
     }
 
@@ -231,7 +236,7 @@ impl HarnessBroker {
             .flatten();
         Ok(BrokerSnapshot {
             session: self.session.clone(),
-            transcript: self.store.list_event(&self.session.id)?,
+            interaction: self.store.list_interaction(&self.session.id)?,
             capability: self.capability.clone(),
             no_checkpoint: matches!(self.workspace_kind, WorkspaceKind::Untracked(_)),
             goal,
@@ -383,7 +388,7 @@ impl HarnessBroker {
                 .run_interaction(
                     request.to_owned(),
                     PromptMode::Plan,
-                    Some(InteractionAdmission::message(text)),
+                    Some(InteractionAdmission { prompt: text }),
                 )
                 .await?;
             leading_event.append(&mut event);
@@ -401,7 +406,7 @@ impl HarnessBroker {
         self.run_interaction(
             text.clone(),
             PromptMode::Chat,
-            Some(InteractionAdmission::message(text)),
+            Some(InteractionAdmission { prompt: text }),
         )
         .await
     }
@@ -420,42 +425,45 @@ impl HarnessBroker {
         let (mut interaction, new_interaction) =
             self.interaction_for_turn(admitted_prompt, admission.is_some(), now_ms)?;
         let mut event = Vec::new();
-        if let Some(admission) = admission {
-            let transcript_event = BackendEvent {
-                kind: admission.transcript_kind.into(),
-                text: Some(admission.prompt),
-                data: Value::Null,
-                activity: None,
-                summary: None,
-                plan_progress: None,
-            };
-            self.append_transcript(Some(&interaction.id), &transcript_event)?;
-            if let Some(event_sink) = &self.event_sink {
-                let _ = event_sink.send(transcript_event);
-            } else {
-                event.push(self.event("backend_event", serde_json::to_value(transcript_event)?)?);
-            }
-        }
-
-        if new_interaction && let WorkspaceKind::Git(workspace) = &self.workspace_kind {
-            let checkpoint =
-                GitCheckpoint::new(workspace).capture(&self.store, &self.session.id, now_ms)?;
-            interaction.checkpoint_before = Some(checkpoint.id.clone());
-            self.store.save_checkpoint(&checkpoint)?;
+        if new_interaction {
+            self.start_interaction_runtime(&mut interaction, &mut event, now_ms)?;
+        } else if self
+            .interaction_runtime
+            .as_ref()
+            .is_none_or(|runtime| runtime.interaction_id != interaction.id)
+        {
+            self.resume_interaction_runtime(&interaction, &mut event)?;
         }
         self.store.save_interaction(&interaction)?;
 
         let turn_started_at_ms = self.clock.now_ms();
         let output = self
-            .backend
-            .prompt_stream(
+            .prompt_with_timeline(
                 self.backend_request(text.clone(), mode),
-                self.event_sink.clone(),
+                &mut interaction,
+                &mut event,
             )
             .await;
         let mut output = match output {
             Ok(output) => output,
             Err(error) => {
+                let final_checkpoint_id = self.capture_final_checkpoint(&mut interaction)?;
+                if let Some(mut runtime) = self.interaction_runtime.take() {
+                    let (final_thought, response) =
+                        runtime.timeline.finish_turn(self.clock.now_ms(), false);
+                    if let Some(thought) = final_thought {
+                        self.complete_thought_with_checkpoint(
+                            &mut runtime,
+                            &mut interaction,
+                            thought,
+                            final_checkpoint_id.as_deref(),
+                            &mut event,
+                        )?;
+                    }
+                    if let Some(response) = response {
+                        interaction.response = Some(response);
+                    }
+                }
                 interaction.state = InteractionState::Failed;
                 interaction.completed_at_ms = Some(self.clock.now_ms());
                 self.store.save_interaction(&interaction)?;
@@ -465,33 +473,14 @@ impl HarnessBroker {
             }
         };
         let token_count = output.metrics.token_count;
-        if let Some(assistant_event) = output
-            .event
-            .iter_mut()
-            .rev()
-            .find(|backend_event| backend_event.kind == "assistant_message")
-        {
-            let summary = TurnSummary {
-                duration_ms: self
-                    .clock
-                    .now_ms()
-                    .saturating_sub(turn_started_at_ms)
-                    .try_into()
-                    .unwrap_or_default(),
-                token_count,
-            };
-            assistant_event.summary = Some(summary.clone());
-            if let Some(event_sink) = &self.event_sink {
-                let _ = event_sink.send(BackendEvent {
-                    kind: "assistant_summary".into(),
-                    text: None,
-                    data: Value::Null,
-                    activity: None,
-                    summary: Some(summary),
-                    plan_progress: None,
-                });
-            }
-        }
+        interaction.duration_ms = interaction.duration_ms.saturating_add(
+            self.clock
+                .now_ms()
+                .saturating_sub(turn_started_at_ms)
+                .try_into()
+                .unwrap_or_default(),
+        );
+        interaction.token_count = token_count.or(interaction.token_count);
         self.capability = output.capability.clone();
         self.session.native_fork = output.capability.native_fork;
         self.session.backend_session_id = output.backend_session_id.clone();
@@ -499,12 +488,7 @@ impl HarnessBroker {
             self.session.provider_label = output.runtime.provider;
         }
         self.session.resolved_model = output.runtime.model;
-        for backend_event in output.event.drain(..) {
-            self.append_transcript(Some(&interaction.id), &backend_event)?;
-            if self.event_sink.is_none() {
-                event.push(self.event("backend_event", serde_json::to_value(backend_event)?)?);
-            }
-        }
+        output.event.clear();
 
         if mode == PromptMode::Plan {
             let Some(markdown) = output.plan_markdown.take() else {
@@ -557,28 +541,69 @@ impl HarnessBroker {
             event.push(self.event("plan_review", serde_json::to_value(&plan)?)?);
         }
 
-        if let WorkspaceKind::Git(workspace) = &self.workspace_kind {
-            let checkpoint = GitCheckpoint::new(workspace).capture(
-                &self.store,
-                &self.session.id,
-                self.clock.now_ms(),
-            )?;
-            output.evidence.workspace_changed =
-                interaction.checkpoint_before.as_deref() != Some(&checkpoint.id);
-            interaction.checkpoint_after = Some(checkpoint.id.clone());
-            let before = interaction
-                .checkpoint_before
-                .as_deref()
-                .map(|id| self.store.load_checkpoint(id))
-                .transpose()?
-                .flatten()
-                .context("interaction before checkpoint is missing")?;
-            interaction.diff_text = Some(checkpoint_diff(&self.store, &before, &checkpoint)?);
-            self.store.save_checkpoint(&checkpoint)?;
-        }
+        let final_checkpoint_id = self.capture_final_checkpoint(&mut interaction)?;
+        output.evidence.workspace_changed =
+            final_checkpoint_id.as_deref() != interaction.checkpoint_before.as_deref();
         self.session.updated_at_ms = self.clock.now_ms();
         self.save_session()?;
         let continuing = self.apply_goal_evidence(output.evidence, &mut event)?;
+        let mut runtime = self
+            .interaction_runtime
+            .take()
+            .context("active interaction timeline is missing")?;
+        let (final_thought, response) = runtime
+            .timeline
+            .finish_turn(self.clock.now_ms(), continuing);
+        let has_final_thought = final_thought.is_some();
+        if let Some(thought) = final_thought {
+            self.complete_thought_with_checkpoint(
+                &mut runtime,
+                &mut interaction,
+                thought,
+                final_checkpoint_id.as_deref(),
+                &mut event,
+            )?;
+        }
+        if let Some(response) = response {
+            interaction.response = Some(response);
+        }
+        let residual_change =
+            final_checkpoint_id.as_deref() != runtime.last_checkpoint_id.as_deref();
+        if residual_change && !has_final_thought {
+            interaction.attribution_complete = false;
+            let thought = CompletedThought {
+                id: format!(
+                    "{}:thought:{}",
+                    interaction.id,
+                    interaction.thought.len() + 1
+                ),
+                text: "Workspace changes detected at completion".into(),
+                synthetic: true,
+                tool: Vec::new(),
+                started_at_ms: self.clock.now_ms(),
+                completed_at_ms: self.clock.now_ms(),
+                checkpoint_before: None,
+                checkpoint_after: None,
+                diff_text: None,
+            };
+            self.complete_thought_with_checkpoint(
+                &mut runtime,
+                &mut interaction,
+                thought,
+                final_checkpoint_id.as_deref(),
+                &mut event,
+            )?;
+        }
+        if continuing {
+            if let Some(checkpoint_id) = final_checkpoint_id {
+                runtime.last_checkpoint_id = Some(checkpoint_id);
+            }
+            runtime.thought_generation = runtime
+                .watcher
+                .as_ref()
+                .map_or(runtime.thought_generation, WorkspaceWatch::generation);
+            self.interaction_runtime = Some(runtime);
+        }
         interaction.state = if continuing {
             InteractionState::Running
         } else {
@@ -598,6 +623,312 @@ impl HarnessBroker {
             json!({ "interaction": interaction, "session": self.session, "capability": self.capability }),
             event,
         ))
+    }
+
+    fn start_interaction_runtime(
+        &mut self,
+        interaction: &mut InteractionRecord,
+        event: &mut Vec<BrokerEvent>,
+        now_ms: i64,
+    ) -> Result<()> {
+        let watcher = match &self.workspace_kind {
+            WorkspaceKind::Git(workspace) => match NotifyWorkspaceWatch::start(workspace) {
+                Ok(watcher) => Some(watcher),
+                Err(error) => {
+                    self.emit_live(
+                        BackendEvent {
+                            kind: "error".into(),
+                            text: Some(format!(
+                                "Workspace watcher unavailable; Harness will checkpoint every thought: {error:#}"
+                            )),
+                            data: Value::Null,
+                            activity: None,
+                            summary: None,
+                            plan_progress: None,
+                        },
+                        event,
+                    )?;
+                    None
+                }
+            },
+            WorkspaceKind::Untracked(_) => None,
+        };
+        let mut last_checkpoint_id = None;
+        if let WorkspaceKind::Git(workspace) = &self.workspace_kind {
+            let checkpoint =
+                GitCheckpoint::new(workspace).capture(&self.store, &self.session.id, now_ms)?;
+            interaction.checkpoint_before = Some(checkpoint.id.clone());
+            last_checkpoint_id = Some(checkpoint.id.clone());
+            self.store.save_checkpoint(&checkpoint)?;
+        }
+        let thought_generation = watcher.as_ref().map_or(0, WorkspaceWatch::generation);
+        self.interaction_runtime = Some(InteractionRuntime {
+            interaction_id: interaction.id.clone(),
+            timeline: TimelineReducer::new(&interaction.id),
+            watcher,
+            thought_generation,
+            last_checkpoint_id,
+        });
+        Ok(())
+    }
+
+    fn resume_interaction_runtime(
+        &mut self,
+        interaction: &InteractionRecord,
+        event: &mut Vec<BrokerEvent>,
+    ) -> Result<()> {
+        let watcher = match &self.workspace_kind {
+            WorkspaceKind::Git(workspace) => match NotifyWorkspaceWatch::start(workspace) {
+                Ok(watcher) => Some(watcher),
+                Err(error) => {
+                    self.emit_live(
+                        BackendEvent {
+                            kind: "error".into(),
+                            text: Some(format!(
+                                "Workspace watcher unavailable; Harness will checkpoint every thought: {error:#}"
+                            )),
+                            data: Value::Null,
+                            activity: None,
+                            summary: None,
+                            plan_progress: None,
+                        },
+                        event,
+                    )?;
+                    None
+                }
+            },
+            WorkspaceKind::Untracked(_) => None,
+        };
+        let thought_generation = watcher.as_ref().map_or(0, WorkspaceWatch::generation);
+        self.interaction_runtime = Some(InteractionRuntime {
+            interaction_id: interaction.id.clone(),
+            timeline: TimelineReducer::new(&interaction.id),
+            watcher,
+            thought_generation,
+            last_checkpoint_id: interaction
+                .checkpoint_after
+                .clone()
+                .or_else(|| interaction.checkpoint_before.clone()),
+        });
+        Ok(())
+    }
+
+    async fn prompt_with_timeline(
+        &mut self,
+        request: BackendRequest,
+        interaction: &mut InteractionRecord,
+        event: &mut Vec<BrokerEvent>,
+    ) -> Result<crate::backend::BackendOutput> {
+        let mut runtime = self
+            .interaction_runtime
+            .take()
+            .context("active interaction timeline is missing")?;
+        let backend = Arc::clone(&self.backend);
+        let (backend_event_sink, mut backend_event_stream) = tokio::sync::mpsc::unbounded_channel();
+        let prompt = async move {
+            backend
+                .prompt_stream(request, Some(backend_event_sink))
+                .await
+        };
+        tokio::pin!(prompt);
+        let outcome = loop {
+            tokio::select! {
+                Some(backend_event) = backend_event_stream.recv() => {
+                    if let Err(error) = self
+                        .process_backend_event(&mut runtime, interaction, backend_event, event)
+                        .await
+                    {
+                        break Err(error);
+                    }
+                }
+                result = &mut prompt => break result,
+            }
+        };
+        let mut outcome = outcome;
+        while outcome.is_ok()
+            && let Ok(backend_event) = backend_event_stream.try_recv()
+        {
+            if let Err(error) = self
+                .process_backend_event(&mut runtime, interaction, backend_event, event)
+                .await
+            {
+                outcome = Err(error);
+            }
+        }
+        self.interaction_runtime = Some(runtime);
+        outcome
+    }
+
+    fn capture_final_checkpoint(
+        &mut self,
+        interaction: &mut InteractionRecord,
+    ) -> Result<Option<String>> {
+        let WorkspaceKind::Git(workspace) = &self.workspace_kind else {
+            return Ok(None);
+        };
+        let checkpoint = GitCheckpoint::new(workspace).capture(
+            &self.store,
+            &self.session.id,
+            self.clock.now_ms(),
+        )?;
+        interaction.checkpoint_after = Some(checkpoint.id.clone());
+        let before = interaction
+            .checkpoint_before
+            .as_deref()
+            .map(|id| self.store.load_checkpoint(id))
+            .transpose()?
+            .flatten()
+            .context("interaction before checkpoint is missing")?;
+        interaction.diff_text = Some(checkpoint_diff(&self.store, &before, &checkpoint)?);
+        self.store.save_checkpoint(&checkpoint)?;
+        Ok(Some(checkpoint.id))
+    }
+
+    async fn process_backend_event(
+        &mut self,
+        runtime: &mut InteractionRuntime,
+        interaction: &mut InteractionRecord,
+        backend_event: BackendEvent,
+        event: &mut Vec<BrokerEvent>,
+    ) -> Result<()> {
+        if backend_event
+            .activity
+            .as_ref()
+            .is_some_and(|activity| activity.kind == crate::backend::ToolActivityKind::FileChange)
+            && let Some(watcher) = runtime.watcher.as_ref()
+        {
+            watcher.mark_provider_change();
+        }
+        if backend_event.kind == "plan" {
+            self.emit_live(backend_event.clone(), event)?;
+        }
+        let transition = runtime.timeline.apply(&backend_event, self.clock.now_ms());
+        if let Some(thought) = transition.completed {
+            self.complete_thought(runtime, interaction, thought, event)
+                .await?;
+        }
+        if let Some(active) = transition.active {
+            self.emit_timeline_active(active, event)?;
+        }
+        Ok(())
+    }
+
+    async fn complete_thought(
+        &mut self,
+        runtime: &mut InteractionRuntime,
+        interaction: &mut InteractionRecord,
+        thought: CompletedThought,
+        event: &mut Vec<BrokerEvent>,
+    ) -> Result<()> {
+        let observation = match runtime.watcher.as_ref() {
+            Some(watcher) => Some(
+                watcher
+                    .wait_for_quiet(Duration::from_millis(50), Duration::from_millis(250))
+                    .await,
+            ),
+            None => None,
+        };
+        let dirty = observation.is_none_or(|value| {
+            !value.healthy || !value.quiet || value.generation != runtime.thought_generation
+        });
+        let checkpoint_id = if dirty {
+            match &self.workspace_kind {
+                WorkspaceKind::Git(workspace) => {
+                    let checkpoint = GitCheckpoint::new(workspace).capture(
+                        &self.store,
+                        &self.session.id,
+                        self.clock.now_ms(),
+                    )?;
+                    let checkpoint_id = checkpoint.id.clone();
+                    self.store.save_checkpoint(&checkpoint)?;
+                    Some(checkpoint_id)
+                }
+                WorkspaceKind::Untracked(_) => None,
+            }
+        } else {
+            runtime.last_checkpoint_id.clone()
+        };
+        self.complete_thought_with_checkpoint(
+            runtime,
+            interaction,
+            thought,
+            checkpoint_id.as_deref(),
+            event,
+        )?;
+        runtime.thought_generation = observation
+            .map(|value| value.generation)
+            .or_else(|| runtime.watcher.as_ref().map(WorkspaceWatch::generation))
+            .unwrap_or_default();
+        Ok(())
+    }
+
+    fn complete_thought_with_checkpoint(
+        &mut self,
+        runtime: &mut InteractionRuntime,
+        interaction: &mut InteractionRecord,
+        mut thought: CompletedThought,
+        checkpoint_id: Option<&str>,
+        event: &mut Vec<BrokerEvent>,
+    ) -> Result<()> {
+        thought.checkpoint_before = runtime.last_checkpoint_id.clone();
+        thought.checkpoint_after = checkpoint_id.map(str::to_owned);
+        if let (Some(before_id), Some(after_id)) = (
+            thought.checkpoint_before.as_deref(),
+            thought.checkpoint_after.as_deref(),
+        ) {
+            let before = self
+                .store
+                .load_checkpoint(before_id)?
+                .context("thought before checkpoint is missing")?;
+            let after = self
+                .store
+                .load_checkpoint(after_id)?
+                .context("thought after checkpoint is missing")?;
+            thought.diff_text = Some(checkpoint_diff(&self.store, &before, &after)?);
+        }
+        if let Some(checkpoint_id) = checkpoint_id {
+            runtime.last_checkpoint_id = Some(checkpoint_id.to_owned());
+        }
+        interaction.thought.push(thought.clone());
+        self.store.save_interaction(interaction)?;
+        self.emit_live(
+            BackendEvent {
+                kind: "timeline_thought_completed".into(),
+                text: None,
+                data: serde_json::to_value(thought)?,
+                activity: None,
+                summary: None,
+                plan_progress: None,
+            },
+            event,
+        )
+    }
+
+    fn emit_timeline_active(
+        &self,
+        active: ActiveThoughtUpdate,
+        event: &mut Vec<BrokerEvent>,
+    ) -> Result<()> {
+        self.emit_live(
+            BackendEvent {
+                kind: "timeline_active".into(),
+                text: None,
+                data: serde_json::to_value(active)?,
+                activity: None,
+                summary: None,
+                plan_progress: None,
+            },
+            event,
+        )
+    }
+
+    fn emit_live(&self, backend_event: BackendEvent, event: &mut Vec<BrokerEvent>) -> Result<()> {
+        if let Some(event_sink) = self.event_sink.as_ref() {
+            let _ = event_sink.send(backend_event);
+        } else {
+            event.push(self.event("backend_event", serde_json::to_value(backend_event)?)?);
+        }
+        Ok(())
     }
 
     fn interaction_for_turn(
@@ -634,6 +965,11 @@ impl HarnessBroker {
                 diff_text: None,
                 created_at_ms: now_ms,
                 completed_at_ms: None,
+                thought: Vec::new(),
+                response: None,
+                duration_ms: 0,
+                token_count: None,
+                attribution_complete: true,
                 comment: Vec::new(),
             },
             true,
@@ -679,10 +1015,9 @@ impl HarnessBroker {
             .run_interaction(
                 execution_prompt,
                 PromptMode::ExecutePlan,
-                Some(InteractionAdmission::action(format!(
-                    "Accept plan: {}",
-                    plan.request
-                ))),
+                Some(InteractionAdmission {
+                    prompt: format!("Accept plan: {}", plan.request),
+                }),
             )
             .await;
         let execution_succeeded = execution.is_ok();
@@ -703,7 +1038,6 @@ impl HarnessBroker {
                     summary: None,
                     plan_progress: None,
                 };
-                self.append_transcript(None, &backend_event)?;
                 (
                     json!({
                         "session": self.session,
@@ -765,10 +1099,9 @@ impl HarnessBroker {
             .run_interaction(
                 instruction,
                 PromptMode::Plan,
-                Some(InteractionAdmission::action(format!(
-                    "Request plan changes: {}",
-                    plan.request
-                ))),
+                Some(InteractionAdmission {
+                    prompt: format!("Request plan changes: {}", plan.request),
+                }),
             )
             .await
         {
@@ -818,7 +1151,9 @@ impl HarnessBroker {
             .run_interaction(
                 prompt,
                 PromptMode::GoalContinuation,
-                Some(InteractionAdmission::message(format!("/goal {objective}"))),
+                Some(InteractionAdmission {
+                    prompt: format!("/goal {objective}"),
+                }),
             )
             .await?;
         event.insert(0, self.event("goal_changed", serde_json::to_value(goal)?)?);
@@ -882,7 +1217,9 @@ impl HarnessBroker {
             .run_interaction(
                 prompt,
                 PromptMode::GoalContinuation,
-                Some(InteractionAdmission::message("/goal resume")),
+                Some(InteractionAdmission {
+                    prompt: "/goal resume".into(),
+                }),
             )
             .await
         {
@@ -1041,10 +1378,9 @@ impl HarnessBroker {
         self.run_interaction(
             prompt,
             PromptMode::RequestChanges,
-            Some(InteractionAdmission::action(format!(
-                "Request changes for interaction {}",
-                interaction.ordinal
-            ))),
+            Some(InteractionAdmission {
+                prompt: format!("Request changes for interaction {}", interaction.ordinal),
+            }),
         )
         .await
     }
@@ -1093,11 +1429,6 @@ impl HarnessBroker {
             self.session.goal_id = None;
         }
         self.session.write_mode = WriteMode::Read;
-        self.append_transcript(None, json!({
-            "kind": "system_message",
-            "text": format!("Rolled back interaction {} and superseded later interactions.", interaction[target_index].ordinal),
-            "created_at_ms": self.clock.now_ms()
-        }))?;
         self.save_session()?;
         Ok((
             json!({ "rolled_back": interaction[target_index].id }),
@@ -1111,6 +1442,7 @@ impl HarnessBroker {
     async fn new_session(&mut self) -> Result<(Value, Vec<BrokerEvent>)> {
         self.pause_current_goal().await?;
         self.release_lease()?;
+        self.interaction_runtime = None;
         let now_ms = self.clock.now_ms();
         self.session = HarnessSession {
             id: Uuid::new_v4().to_string(),
@@ -1193,6 +1525,7 @@ impl HarnessBroker {
             session.provider_label = backend_provider_label(&self.backend_launch);
         }
         self.store.save_session(&session)?;
+        self.interaction_runtime = None;
         self.session = session;
         self.capability.native_fork = self.session.native_fork;
         Ok((
@@ -1292,6 +1625,14 @@ impl HarnessBroker {
             source.backend == self.backend_launch.kind,
             "source session uses a different configured backend"
         );
+        let source_interaction = self.store.list_interaction(&source.id)?;
+        let mut source_comment = Vec::new();
+        for interaction in &source_interaction {
+            source_comment.push((
+                interaction.id.clone(),
+                self.store.list_interaction_comment(&interaction.id)?,
+            ));
+        }
         self.pause_current_goal().await?;
         let backend_session_id = self
             .backend
@@ -1321,8 +1662,28 @@ impl HarnessBroker {
         fork.lease_owner = Some(self.client_id.clone());
         fork.lease_expires_at_ms = Some(now_ms + 30_000);
         self.store.save_session(&fork)?;
+        for mut interaction in source_interaction {
+            let source_interaction_id = interaction.id;
+            interaction.id = Uuid::new_v4().to_string();
+            interaction.session_id.clone_from(&fork.id);
+            interaction.checkpoint_before = None;
+            interaction.checkpoint_after = None;
+            self.store.save_interaction(&interaction)?;
+            if let Some((_, comment_list)) = source_comment
+                .iter()
+                .find(|(interaction_id, _)| interaction_id == &source_interaction_id)
+            {
+                for source_comment in comment_list {
+                    let mut comment = source_comment.clone();
+                    comment.id = Uuid::new_v4().to_string();
+                    comment.interaction_id.clone_from(&interaction.id);
+                    self.store.save_interaction_comment(&comment)?;
+                }
+            }
+        }
         self.release_lease()?;
         self.workspace_kind = crate::workspace::resolve(Path::new(&fork.workspace))?;
+        self.interaction_runtime = None;
         self.session = fork;
         Ok((
             serde_json::to_value(self.snapshot()?)?,
@@ -1343,19 +1704,6 @@ impl HarnessBroker {
             trust_policy: self.trust_policy.clone(),
             backend_session_id: self.session.backend_session_id.clone(),
         }
-    }
-
-    fn append_transcript<T: Serialize>(
-        &mut self,
-        interaction_id: Option<&str>,
-        payload: T,
-    ) -> Result<()> {
-        self.store.append_event(
-            &self.session.id,
-            interaction_id,
-            self.clock.now_ms(),
-            &payload,
-        )
     }
 
     fn event(&self, name: &str, payload: Value) -> Result<BrokerEvent> {
@@ -1480,14 +1828,100 @@ mod test {
     impl Backend for FailingBackend {
         async fn prompt_stream(
             &self,
-            _request: BackendRequest,
+            request: BackendRequest,
             _event_sink: Option<BackendEventSink>,
         ) -> Result<crate::backend::BackendOutput> {
+            let nested = Path::new(&request.workspace).join("failed/deep/write.txt");
+            std::fs::create_dir_all(nested.parent().context("failed write parent")?)?;
+            std::fs::write(&nested, "written before provider failure\n")?;
             anyhow::bail!("synthetic provider failure")
         }
 
         async fn fork(&self, _request: BackendRequest) -> Result<String> {
             anyhow::bail!("synthetic provider failure")
+        }
+    }
+
+    struct NestedWriteBackend;
+
+    #[async_trait::async_trait]
+    impl Backend for NestedWriteBackend {
+        async fn prompt_stream(
+            &self,
+            request: BackendRequest,
+            event_sink: Option<BackendEventSink>,
+        ) -> Result<crate::backend::BackendOutput> {
+            let commentary = BackendEvent {
+                kind: "assistant_message".into(),
+                text: Some("Creating the nested module.".into()),
+                data: Value::Null,
+                activity: None,
+                summary: None,
+                plan_progress: None,
+            };
+            let started = BackendEvent {
+                kind: "tool".into(),
+                text: None,
+                data: Value::Null,
+                activity: Some(crate::backend::ToolActivity {
+                    id: "nested-command".into(),
+                    kind: crate::backend::ToolActivityKind::Command,
+                    title: "create nested module".into(),
+                    output: None,
+                    status: Some("inProgress".into()),
+                    output_delta: false,
+                }),
+                summary: None,
+                plan_progress: None,
+            };
+            if let Some(event_sink) = event_sink.as_ref() {
+                let _ = event_sink.send(commentary.clone());
+                let _ = event_sink.send(started.clone());
+            }
+            let nested = Path::new(&request.workspace).join("apps/new/deep/module");
+            std::fs::create_dir_all(&nested)?;
+            std::fs::write(nested.join("lib.rs"), "pub fn nested() {}\n")?;
+            let completed = BackendEvent {
+                kind: "tool".into(),
+                text: None,
+                data: Value::Null,
+                activity: Some(crate::backend::ToolActivity {
+                    id: "nested-command".into(),
+                    kind: crate::backend::ToolActivityKind::Command,
+                    title: "create nested module".into(),
+                    output: Some("created nested module".into()),
+                    status: Some("completed".into()),
+                    output_delta: false,
+                }),
+                summary: None,
+                plan_progress: None,
+            };
+            let response = BackendEvent {
+                kind: "assistant_message".into(),
+                text: Some("The nested module is ready.".into()),
+                data: Value::Null,
+                activity: None,
+                summary: None,
+                plan_progress: None,
+            };
+            if let Some(event_sink) = event_sink {
+                let _ = event_sink.send(completed.clone());
+                let _ = event_sink.send(response.clone());
+            }
+            Ok(crate::backend::BackendOutput {
+                backend_session_id: Some("nested-write".into()),
+                event: vec![commentary, started, completed, response],
+                capability: BackendCapability::default(),
+                runtime: crate::backend::BackendRuntime {
+                    provider: "Nested test".into(),
+                    model: Some(request.model),
+                },
+                ..crate::backend::BackendOutput::default()
+            })
+        }
+
+        async fn fork(&self, _request: BackendRequest) -> Result<String> {
+            Ok("nested-write-fork".into())
         }
     }
 
@@ -1550,6 +1984,88 @@ mod test {
     }
 
     #[tokio::test]
+    async fn forks_a_live_session_without_taking_its_lease() {
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let initialize =
+            |client_id: &str, lease_conflict_action: Option<String>| InitializeRequest {
+                data_root: data.path().to_string_lossy().into_owned(),
+                workspace: repository.path().to_string_lossy().into_owned(),
+                client_id: client_id.into(),
+                backend: BackendLaunch {
+                    kind: "mock".into(),
+                    command: vec!["mock".into()],
+                },
+                model: "mock-model".into(),
+                effort: "low".into(),
+                trust_profile: "workspace".into(),
+                trust_policy: TrustPolicy::default(),
+                session_id: None,
+                goal_max_turns: 20,
+                lease_conflict_action,
+            };
+
+        let mut source = HarnessBroker::initialize_with_clock(
+            initialize("source-client", None),
+            Box::new(FixedClock(100)),
+        )
+        .unwrap();
+        let source_session_id = source.session.id.clone();
+        let prompt = source
+            .dispatch(BrokerRequest {
+                id: 1,
+                method: "prompt.submit".into(),
+                params: json!({ "text": "preserve this interaction" }),
+            })
+            .await;
+        assert!(prompt.response.error.is_none());
+        assert!(source.session.native_fork);
+
+        let conflict = match HarnessBroker::initialize_with_clock(
+            initialize("fork-client", None),
+            Box::new(FixedClock(110)),
+        ) {
+            Ok(_) => panic!("second controller should encounter the live lease"),
+            Err(error) => error,
+        };
+        let conflict = conflict
+            .downcast_ref::<crate::session::SessionLeaseConflict>()
+            .expect("structured lease conflict");
+        assert_eq!(conflict.session_id, source_session_id);
+        assert!(conflict.native_fork);
+
+        let mut fork_controller = HarnessBroker::initialize_with_clock(
+            initialize("fork-client", Some("new".into())),
+            Box::new(FixedClock(110)),
+        )
+        .unwrap();
+        let forked = fork_controller
+            .dispatch(BrokerRequest {
+                id: 2,
+                method: "session.fork".into(),
+                params: json!({ "session_id": source_session_id }),
+            })
+            .await;
+        assert!(forked.response.error.is_none());
+        let snapshot = forked.response.result.expect("fork snapshot");
+        assert_ne!(snapshot["session"]["id"], source_session_id);
+        assert_eq!(snapshot["interaction"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            snapshot["interaction"][0]["prompt"],
+            "preserve this interaction"
+        );
+        let persisted_source = fork_controller
+            .store
+            .load_session(&source_session_id)
+            .unwrap()
+            .expect("source session");
+        assert_eq!(
+            persisted_source.lease_owner.as_deref(),
+            Some("source-client")
+        );
+    }
+
+    #[tokio::test]
     async fn carries_model_effort_and_fast_mode_into_a_new_session() {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
@@ -1568,6 +2084,7 @@ mod test {
                 session_id: None,
                 goal_max_turns: 20,
                 trust_policy: TrustPolicy::default(),
+                lease_conflict_action: None,
             },
             Box::new(FixedClock(100)),
         )
@@ -1620,6 +2137,7 @@ mod test {
                 session_id: None,
                 goal_max_turns: 20,
                 trust_policy: TrustPolicy::default(),
+                lease_conflict_action: None,
             },
             Box::new(FixedClock(200)),
         )
@@ -1648,6 +2166,7 @@ mod test {
                 session_id: None,
                 goal_max_turns: 20,
                 trust_policy: TrustPolicy::default(),
+                lease_conflict_action: None,
             },
             Box::new(FixedClock(100)),
         )
@@ -1655,15 +2174,6 @@ mod test {
         let session_id = broker.session.id.clone();
         broker.session.name = "Persistent analysis".into();
         broker.store.save_session(&broker.session).unwrap();
-        broker
-            .store
-            .append_event(
-                &session_id,
-                None,
-                100,
-                &json!({ "kind": "user_message", "text": "remember this" }),
-            )
-            .unwrap();
         drop(broker);
 
         let restarted = HarnessBroker::initialize_with_clock(
@@ -1681,6 +2191,7 @@ mod test {
                 session_id: None,
                 goal_max_turns: 20,
                 trust_policy: TrustPolicy::default(),
+                lease_conflict_action: None,
             },
             Box::new(FixedClock(200)),
         )
@@ -1691,8 +2202,7 @@ mod test {
         assert_eq!(restarted.session.model, "mock-model");
         assert_eq!(restarted.session.effort, "low");
         let snapshot = restarted.snapshot().unwrap();
-        assert_eq!(snapshot.transcript.len(), 1);
-        assert_eq!(snapshot.transcript[0]["text"], "remember this");
+        assert!(snapshot.interaction.is_empty());
         assert_eq!(
             restarted
                 .store
@@ -1722,6 +2232,7 @@ mod test {
                 session_id: None,
                 goal_max_turns: 20,
                 trust_policy: TrustPolicy::default(),
+                lease_conflict_action: None,
             },
             Box::new(FixedClock(100)),
         )
@@ -1738,15 +2249,11 @@ mod test {
             )
             .await;
         assert!(planned.response.error.is_none());
-        assert_eq!(event_stream.try_recv().unwrap().kind, "user_message");
         assert_eq!(
             event_stream.try_recv().unwrap().kind,
-            "assistant_message",
-            "provider events must reach the live stream before the final response is rendered"
+            "timeline_active",
+            "provider progress must reach the live stream before the final response is rendered"
         );
-        let summary_event = event_stream.try_recv().unwrap();
-        assert_eq!(summary_event.kind, "assistant_summary");
-        assert_eq!(summary_event.summary.unwrap().duration_ms, 0);
         let review = planned
             .event
             .iter()
@@ -1816,12 +2323,6 @@ mod test {
         let interaction = broker.store.list_interaction(&broker.session.id).unwrap();
         assert_eq!(interaction[0].prompt, "/plan build the feature");
         assert_eq!(interaction[1].prompt, "Accept plan: build the feature");
-        let transcript = broker.store.list_event(&broker.session.id).unwrap();
-        assert!(transcript.iter().any(|event| {
-            event.get("kind").and_then(Value::as_str) == Some("user_action")
-                && event.get("text").and_then(Value::as_str)
-                    == Some("Accept plan: build the feature")
-        }));
     }
 
     #[tokio::test]
@@ -1843,11 +2344,12 @@ mod test {
                 session_id: None,
                 goal_max_turns: 20,
                 trust_policy: TrustPolicy::default(),
+                lease_conflict_action: None,
             },
             Box::new(FixedClock(200)),
         )
         .unwrap();
-        broker.backend = Box::new(FailingBackend);
+        broker.backend = Arc::new(FailingBackend);
         let result = broker
             .dispatch(BrokerRequest {
                 id: 1,
@@ -1857,6 +2359,72 @@ mod test {
             .await;
         assert!(result.response.error.is_some());
         assert_eq!(broker.active_goal().unwrap().state, GoalState::Paused);
+        let interaction = broker.store.list_interaction(&broker.session.id).unwrap();
+        assert_eq!(interaction.len(), 1);
+        assert_eq!(interaction[0].state, InteractionState::Failed);
+        assert!(interaction[0].checkpoint_after.is_some());
+        assert!(
+            interaction[0]
+                .diff_text
+                .as_deref()
+                .is_some_and(|diff| diff.contains("failed/deep/write.txt"))
+        );
+    }
+
+    #[tokio::test]
+    async fn watcher_attributes_shell_created_nested_directories_to_the_completed_thought() {
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = HarnessBroker::initialize_with_clock(
+            InitializeRequest {
+                data_root: data.path().to_string_lossy().into_owned(),
+                workspace: repository.path().to_string_lossy().into_owned(),
+                client_id: "watcher-test".into(),
+                backend: BackendLaunch {
+                    kind: "mock".into(),
+                    command: vec!["mock".into()],
+                },
+                model: "mock-model".into(),
+                effort: "low".into(),
+                trust_profile: "workspace".into(),
+                session_id: None,
+                goal_max_turns: 20,
+                trust_policy: TrustPolicy::default(),
+                lease_conflict_action: None,
+            },
+            Box::new(FixedClock(300)),
+        )
+        .unwrap();
+        broker.backend = Arc::new(NestedWriteBackend);
+        let result = broker
+            .dispatch(BrokerRequest {
+                id: 1,
+                method: "prompt.submit".into(),
+                params: json!({ "text": "create a nested module" }),
+            })
+            .await;
+        assert!(
+            result.response.error.is_none(),
+            "{:?}",
+            result.response.error
+        );
+        let interaction = broker.store.list_interaction(&broker.session.id).unwrap();
+        assert_eq!(interaction.len(), 1);
+        assert_eq!(interaction[0].thought.len(), 1);
+        let thought = &interaction[0].thought[0];
+        assert_eq!(thought.text, "Creating the nested module.");
+        assert_eq!(thought.tool.len(), 1);
+        assert!(
+            thought
+                .diff_text
+                .as_deref()
+                .is_some_and(|diff| diff.contains("apps/new/deep/module/lib.rs")),
+            "nested file must be captured by the watcher-gated thought checkpoint"
+        );
+        assert_eq!(
+            interaction[0].response.as_deref(),
+            Some("The nested module is ready.")
+        );
     }
 
     #[tokio::test]
@@ -1878,6 +2446,7 @@ mod test {
                 session_id: None,
                 goal_max_turns: 20,
                 trust_policy: TrustPolicy::default(),
+                lease_conflict_action: None,
             },
             Box::new(FixedClock(300)),
         )

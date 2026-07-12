@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use diff_review_harness::backend::BackendEvent;
 use diff_review_harness::broker::{HarnessBroker, InitializeRequest};
 use diff_review_harness::protocol::{BrokerEvent, BrokerMessage, BrokerRequest, BrokerResponse};
+use diff_review_harness::session::SessionLeaseConflict;
 use diff_review_harness::storage::SqliteStore;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -46,15 +47,27 @@ async fn run_broker() -> Result<()> {
     let mut broker = match HarnessBroker::initialize(initialize) {
         Ok(broker) => broker,
         Err(error) => {
-            write_message(
-                &mut output,
-                &BrokerMessage::Response(BrokerResponse::failure(
-                    initialize_request.id,
-                    "initialize_failed",
-                    format!("{error:#}"),
-                )),
-            )
-            .await?;
+            let response = error.downcast_ref::<SessionLeaseConflict>().map_or_else(
+                || {
+                    BrokerResponse::failure(
+                        initialize_request.id,
+                        "initialize_failed",
+                        format!("{error:#}"),
+                    )
+                },
+                |conflict| {
+                    BrokerResponse::failure_with_data(
+                        initialize_request.id,
+                        "session_lease_conflict",
+                        conflict.to_string(),
+                        serde_json::json!({
+                            "session_id": conflict.session_id,
+                            "native_fork": conflict.native_fork,
+                        }),
+                    )
+                },
+            );
+            write_message(&mut output, &BrokerMessage::Response(response)).await?;
             return Ok(());
         }
     };

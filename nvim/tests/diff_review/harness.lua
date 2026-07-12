@@ -4,7 +4,7 @@ local diff_review = require("diff_review")
 local builder = require("diff_review.harness.builder")
 local client = require("diff_review.harness.client")
 local controller = require("diff_review.views.harness.controller")
-local transcript_renderer = require("diff_review.render.harness.transcript")
+local interaction_renderer = require("diff_review.render.harness.interaction_tree")
 local session = require("diff_review.session")
 
 local function assert_true(condition, message)
@@ -82,12 +82,15 @@ local interaction = {
 
 local request_by_method = {}
 local goal_continue_count = 0
+local prompt_count = 0
+local launched_binary = nil
 
 local function emit(options, message)
   vim.schedule(function() options.stdout(nil, vim.json.encode(message) .. "\n") end)
 end
 
-local function fake_launcher(_, options, _)
+local function fake_launcher(command, options, _)
+  launched_binary = command[1]
   local process = {}
   function process:write(payload)
     local request = vim.json.decode(vim.trim(payload))
@@ -96,56 +99,76 @@ local function fake_launcher(_, options, _)
       vim.defer_fn(function()
         emit(options, { id = request.id, result = {
           session = active_session,
-          transcript = {},
+          interaction = {},
           capability = { native_fork = false, model_selection = true },
           no_checkpoint = false,
         } })
       end, 80)
     elseif request.method == "prompt.submit" then
-      emit(options, { event = "backend_event", payload = { kind = "user_message", text = request.params.text } })
       if request.params.text == "/goal fail" then
         emit(options, { id = request.id, error = { message = "synthetic goal failure" } })
         return
       end
+      prompt_count = prompt_count + 1
+      local interaction_id = "live-interaction-" .. prompt_count
+      local thought_id = interaction_id .. ":thought:1"
+      local completed_tool = nil
       if request.params.text == "hello harness" then
         local output = table.concat({ "# Rendering", "line two", "line three", "line four", "last line" }, "\n")
         emit(options, { event = "backend_event", payload = {
-          kind = "tool",
-          activity = {
-            id = "command-one",
-            kind = "command",
-            title = "Get-Content README.md",
-            status = "inProgress",
-            output_delta = false,
+          kind = "timeline_active",
+          data = {
+            interaction_id = interaction_id,
+            thought_id = thought_id,
+            text = "Working",
+            synthetic = true,
+            tool_count = 1,
+            failed_count = 0,
+            revision = 1,
           },
         } })
+        completed_tool = {
+          id = "command-one",
+          kind = "command",
+          title = "Get-Content README.md",
+          status = "completed",
+          output = output,
+        }
         emit(options, { event = "backend_event", payload = {
-          kind = "tool",
-          activity = {
-            id = "command-one",
-            kind = "command",
-            title = "command",
-            output = output,
-            output_delta = true,
-          },
-        } })
-        emit(options, { event = "backend_event", payload = {
-          kind = "tool",
-          activity = {
-            id = "command-completed-with-different-provider-id",
-            kind = "command",
-            title = "Get-Content README.md",
-            output = output,
-            status = "completed",
-            output_delta = false,
+          kind = "timeline_thought_completed",
+          data = {
+            id = thought_id,
+            text = "Working",
+            synthetic = true,
+            tool = { completed_tool },
+            started_at_ms = 0,
+            completed_at_ms = 1000,
           },
         } })
       end
-      emit(options, { event = "backend_event", payload = { kind = "assistant_message", text = "Mock " } })
-      emit(options, { event = "backend_event", payload = { kind = "assistant_message", text = "reply" } })
       emit(options, { event = "backend_event", payload = {
-        kind = "assistant_summary",
-        summary = { duration_ms = 2000, token_count = 2700 },
+        kind = "timeline_active",
+        data = {
+          interaction_id = interaction_id,
+          thought_id = interaction_id .. ":thought:2",
+          text = "Mock ",
+          synthetic = false,
+          tool_count = 0,
+          failed_count = 0,
+          revision = 2,
+        },
+      } })
+      emit(options, { event = "backend_event", payload = {
+        kind = "timeline_active",
+        data = {
+          interaction_id = interaction_id,
+          thought_id = interaction_id .. ":thought:2",
+          text = "Mock reply",
+          synthetic = false,
+          tool_count = 0,
+          failed_count = 0,
+          revision = 3,
+        },
       } })
       if request.params.text:match("^/plan ") then
         emit(options, { event = "plan_review", payload = {
@@ -158,10 +181,51 @@ local function fake_launcher(_, options, _)
       end
       if request.params.text == "hello harness" then
         vim.defer_fn(function()
-          emit(options, { id = request.id, result = { session = active_session, capability = { native_fork = false } } })
+          local completed = {
+            id = interaction_id,
+            session_id = active_session.id,
+            ordinal = prompt_count,
+            prompt = request.params.text,
+            state = "complete",
+            thought = completed_tool and { {
+              id = thought_id,
+              text = "Working",
+              synthetic = true,
+              tool = { completed_tool },
+              started_at_ms = 0,
+              completed_at_ms = 1000,
+            } } or {},
+            response = "Mock reply",
+            duration_ms = 2000,
+            token_count = 2700,
+            attribution_complete = true,
+          }
+          emit(options, { event = "interaction_complete", payload = completed })
+          emit(options, { id = request.id, result = {
+            interaction = completed,
+            session = active_session,
+            capability = { native_fork = false },
+          } })
         end, 1200)
       else
-        emit(options, { id = request.id, result = { session = active_session, capability = { native_fork = false } } })
+        local completed = {
+          id = interaction_id,
+          session_id = active_session.id,
+          ordinal = prompt_count,
+          prompt = request.params.text,
+          state = "complete",
+          thought = {},
+          response = "Mock reply",
+          duration_ms = 2000,
+          token_count = 2700,
+          attribution_complete = true,
+        }
+        emit(options, { event = "interaction_complete", payload = completed })
+        emit(options, { id = request.id, result = {
+          interaction = completed,
+          session = active_session,
+          capability = { native_fork = false },
+        } })
       end
     elseif request.method == "interaction.list" then
       emit(options, { id = request.id, result = { interaction } })
@@ -182,8 +246,20 @@ local function fake_launcher(_, options, _)
       emit(options, { id = request.id, result = active_session })
     elseif request.method == "session.new" then
       active_session = vim.tbl_extend("force", active_session, { id = "session-two", write_mode = "read" })
-      emit(options, { event = "session_changed", payload = { session = active_session, transcript = {} } })
-      emit(options, { id = request.id, result = { session = active_session, transcript = {} } })
+      emit(options, { event = "session_changed", payload = { session = active_session, interaction = {} } })
+      emit(options, { id = request.id, result = { session = active_session, interaction = {} } })
+    elseif request.method == "session.fork" then
+      active_session = vim.tbl_extend("force", active_session, {
+        id = "session-fork",
+        native_fork = true,
+        write_mode = "read",
+      })
+      emit(options, { event = "session_changed", payload = { session = active_session } })
+      emit(options, { id = request.id, result = {
+        session = active_session,
+        interaction = { interaction },
+        capability = { native_fork = true },
+      } })
     elseif request.method == "goal.continue" then
       goal_continue_count = goal_continue_count + 1
       if goal_continue_count == 2 then
@@ -193,7 +269,7 @@ local function fake_launcher(_, options, _)
     elseif request.method == "state.get" then
       emit(options, { id = request.id, result = {
         session = active_session,
-        transcript = session.harness.transcript,
+        interaction = session.harness.interaction,
         capability = { native_fork = false },
         no_checkpoint = false,
         goal = { objective = "fail", state = "paused" },
@@ -221,6 +297,7 @@ local ok, failure = pcall(function()
   assert_true(vim.uv.fs_stat(builder.manifest_path()) ~= nil, "Harness builder should resolve its crate from the plugin runtime")
 
   builder._set_crate_dir_for_test(crate_root)
+  builder._set_artifact_root_for_test(vim.fs.joinpath(test_root, "artifacts"))
   builder._set_runner_for_test(function(_, _, callback)
     vim.fn.mkdir(vim.fs.dirname(builder.release_binary_path()), "p")
     vim.fn.writefile({ "fake" }, builder.release_binary_path())
@@ -229,8 +306,17 @@ local ok, failure = pcall(function()
   client._set_launcher_for_test(fake_launcher)
 
   local render_frame_list = {}
-  controller._set_render_observer_for_test(function(lines) render_frame_list[#render_frame_list + 1] = lines end)
+  local render_transaction_list = {}
+  controller._set_render_observer_for_test(function(lines, transaction)
+    render_frame_list[#render_frame_list + 1] = lines
+    render_transaction_list[#render_transaction_list + 1] = transaction
+  end)
   require("diff_review.views.harness").open()
+  assert_true(vim.wait(1000, function() return launched_binary ~= nil end, 10), "Harness broker did not launch")
+  assert_true(launched_binary ~= builder.release_binary_path(), "Harness must not execute Cargo's replaceable output")
+  assert_equals(launched_binary, builder.deployed_binary_path(), "Harness should launch the immutable staged executable")
+  assert_equals(vim.wo[session.harness.transcript_win].breakindentopt, "shift:0",
+    "wrapped Harness rows should preserve their existing indent without adding another shift")
   assert_equals(vim.api.nvim_buf_get_lines(session.harness.transcript_buf, 0, 1, false)[1], "",
     "new Harness transcripts should open empty")
   local original_get_parser = vim.treesitter.get_parser
@@ -274,8 +360,8 @@ local ok, failure = pcall(function()
   controller.submit()
   assert_true(vim.wait(2000, function()
     if not session.harness.ready or session.harness.busy then return false end
-    for _, event in ipairs(session.harness.transcript) do
-      if event.kind == "assistant_message" and event.text == "Mock reply" then return true end
+    for _, item in ipairs(session.harness.interaction) do
+      if item.prompt == "what is this repo?" and item.response == "Mock reply" then return true end
     end
     return false
   end, 10), "Harness did not complete the prompt queued during initialization")
@@ -296,102 +382,208 @@ local ok, failure = pcall(function()
   local summary_seen = false
   for _, frame in ipairs(render_frame_list) do
     local frame_text = table.concat(frame, "\n")
-    if frame_text:find("  Mock ", 1, true) and not frame_text:find("  Mock reply", 1, true) then
+    if frame_text:find("↳ Mock ", 1, true) and not frame_text:find("↳ Mock reply", 1, true) then
       partial_response_seen = true
     end
-    if frame_text:find("  Mock reply", 1, true) then complete_response_seen = true end
+    if frame_text:find("Mock reply", 1, true) then complete_response_seen = true end
     if frame_text:find("▸ Thought for 2s, 2.7k tokens", 1, true) then summary_seen = true end
   end
   assert_true(partial_response_seen, "each assistant delta should produce a visible intermediate frame")
   assert_true(complete_response_seen, "assistant deltas should compose into the complete response")
   assert_true(summary_seen, "assistant completion should produce a final summary frame")
-  local markdown_render = require("diff_review.render.harness.transcript").build({ {
-    kind = "assistant_message",
-    text = "# Heading\n\n- **item**",
-    summary = { duration_ms = 42000, token_count = 28500 },
+  local markdown_render = interaction_renderer.build({ {
+    id = "markdown",
+    prompt = "Explain the result",
+    state = "complete",
+    duration_ms = 42000,
+    token_count = 28500,
+    thought = {},
+    response = "# Heading\n\n- **item**",
   } })
-  assert_equals(markdown_render.markdown_range[1].first0, 1,
+  assert_equals(markdown_render.markdown_ranges[1].first0, 3,
     "assistant markdown should begin after its thought summary")
-  assert_equals(markdown_render.markdown_range[1].after0, 4,
+  assert_equals(markdown_render.markdown_ranges[1].after0, 6,
     "assistant markdown should end with its response body")
-  assert_equals(markdown_render.highlights[1].group, "DiffReviewHarnessThought",
+  assert_true(vim.iter(markdown_render.highlights):any(function(highlight)
+    return highlight.line == 2 and highlight.group == "DiffReviewHarnessThought"
+  end),
     "thought summaries should use the Harness green highlight")
-  local commentary_render = transcript_renderer.build({
-    {
-      kind = "assistant_message",
+  assert_equals(interaction_renderer.foldtext("▸ Thought for 42s, 28.5k tokens")[1][2],
+    "DiffReviewHarnessThought",
+    "closed thought folds should retain the Harness green highlight")
+  assert_true(vim.iter(markdown_render.highlights):any(function(highlight)
+    return highlight.line == 3 and highlight.group == "DiffReviewHarnessResponse"
+  end),
+    "response headings should use the Harness white highlight")
+  local completed_thought_render = interaction_renderer.build({ {
+    id = "completed-thought",
+    prompt = "Inspect the repository",
+    state = "complete",
+    thought = { {
+      id = "completed-thought:1",
+      text = "I’m tracing the repository’s ownership boundaries\nand generated configuration.",
+      tool = { {
+        id = "completed-thought:tool:1",
+        kind = "command",
+        title = "rg --files",
+        status = "completed",
+        output = "README.md",
+      } },
+    } },
+  } }, { expanded = {
+    ["interaction:completed-thought:thoughts"] = true,
+    ["interaction:completed-thought:thought:completed-thought:1"] = true,
+  } })
+  assert_equals(completed_thought_render.lines[3],
+    "↳ I’m tracing the repository’s ownership boundaries",
+    "completed thoughts should retain their first text row")
+  assert_equals(completed_thought_render.lines[4], "  and generated configuration.",
+    "completed thoughts should retain every continuation row")
+  assert_true(vim.iter(completed_thought_render.highlights):all(function(highlight)
+    if highlight.line ~= 3 and highlight.line ~= 4 then return true end
+    return highlight.group == "DiffReviewHarnessCommentary"
+  end), "completed thought rows should retain the original italic commentary highlight")
+  assert_equals(completed_thought_render.rows[3].expand_key,
+    "interaction:completed-thought:thought:completed-thought:1",
+    "completed thought rows should own their semantic expansion state")
+  assert_equals(completed_thought_render.rows[5].expand_key,
+    "interaction:completed-thought:thought:completed-thought:1:tools",
+    "completed tool summaries should own the tool-list expansion state")
+  assert_equals(completed_thought_render.lines[5], "  ▸ Ran 1 tool",
+    "thought tool summaries should render as nested disclosure nodes")
+  assert_equals(interaction_renderer.foldtext("  ▸ Ran 3 tools (2 failed)")[1][2], "Normal",
+    "collapsed tool summaries should not inherit the dark Folded highlight")
+  local folded_command_chunks = require("diff_review.render.harness.tool").foldtext_chunks({
+    kind = "command",
+    title = "rg --files",
+    status = "completed",
+  }, "  ")
+  assert_equals(folded_command_chunks[1][2], "DiffReviewHarnessToolSuccess",
+    "collapsed command bullets should retain their completion highlight")
+  assert_true(vim.iter(folded_command_chunks):any(function(chunk)
+    return chunk[1] == "rg" and chunk[2] == "DiffReviewHarnessCommand"
+  end), "collapsed commands should retain their command-name highlight")
+  local commentary_render = interaction_renderer.build({ {
+    id = "commentary",
+    prompt = "Map the repo",
+    state = "running",
+    thought = {},
+    active = {
       text = "I’ll trace the repository’s actual control points and generated boundaries, then give you the operational map rather\nthan a directory listing.",
+      tool_count = 0,
+      failed_count = 0,
     },
-    { kind = "tool", activity = { id = "trace", kind = "command", title = "rg --files", output = "README.md", status = "completed" } },
-    { kind = "assistant_message", text = "# Repository\n\nFinal response." },
-  })
-  assert_equals(commentary_render.lines[1],
-    "  I’ll trace the repository’s actual control points and generated boundaries, then give you the operational map rather",
-    "intermediate commentary should carry the response indent")
-  assert_equals(commentary_render.lines[2], "  than a directory listing.",
-    "explicit commentary continuations should preserve the response indent")
-  assert_equals(commentary_render.highlights[1].group, "DiffReviewHarnessCommentary",
-    "intermediate commentary should render in italics")
-  assert_equals(#commentary_render.markdown_range, 1,
-    "only the final assistant response should enter the markdown region")
-  local streaming_response = transcript_renderer.build({ {
-    kind = "assistant_message",
-    text = "Inspecting the repository.",
   } }, { working_seconds = 2 })
-  assert_true(not vim.tbl_contains(streaming_response.lines, "▸ Thinking…"),
+  assert_equals(commentary_render.lines[3],
+    "↳ I’ll trace the repository’s actual control points and generated boundaries, then give you the operational map rather",
+    "intermediate commentary should carry the response indent")
+  assert_equals(commentary_render.lines[4], "  than a directory listing.",
+    "explicit commentary continuations should preserve the response indent")
+  assert_true(vim.iter(commentary_render.highlights):any(function(highlight)
+    return highlight.line == 3 and highlight.group == "DiffReviewHarnessCommentary"
+  end),
+    "intermediate commentary should render in italics")
+  assert_equals(#commentary_render.markdown_ranges, 0,
+    "streaming commentary should stay outside the markdown region")
+  assert_true(not vim.tbl_contains(commentary_render.lines, "▸ Thinking…"),
     "streaming should rely on actual commentary instead of a transient Thinking placeholder")
   local settled_transcript = vim.api.nvim_buf_get_lines(session.harness.transcript_buf, 0, -1, false)
   assert_true(vim.tbl_contains(settled_transcript, "▸ what is this repo?"), "user prompts should use the Harness prompt marker")
   assert_true(vim.tbl_contains(settled_transcript, "▸ Thought for 2s, 2.7k tokens"),
     "completed responses should expose timing and token usage")
-  assert_true(vim.tbl_contains(settled_transcript, "  Mock reply"), "assistant response content should be indented")
+  assert_true(vim.tbl_contains(settled_transcript, "Mock reply"),
+    "assistant response content should remain raw Markdown in the buffer")
+  local response_body_line = line_number(settled_transcript, "Mock reply")
+  assert_true(vim.iter(vim.api.nvim_buf_get_extmarks(
+    session.harness.transcript_buf,
+    session.harness.render_namespace,
+    { response_body_line - 1, 0 },
+    { response_body_line - 1, -1 },
+    { details = true }
+  )):any(function(extmark)
+    local virtual_text = extmark[4].virt_text
+    return virtual_text and virtual_text[1] and virtual_text[1][1] == "  "
+  end), "response rows should use a visual two-column prefix so soft wraps stay aligned")
   assert_true(not vim.tbl_contains(settled_transcript, "You"), "transcript should not render a You label")
   assert_true(not vim.tbl_contains(settled_transcript, "Assistant"), "transcript should not render an Assistant label")
-  local multiline_prompt = transcript_renderer.build({ {
-    kind = "user_message",
-    text = "What is this repo?\nis it cool?",
+  local multiline_prompt = interaction_renderer.build({ {
+    id = "multiline",
+    prompt = "What is this repo?\nis it cool?",
+    state = "running",
+    thought = {},
   } })
   assert_equals(multiline_prompt.lines[1], "▸ What is this repo?", "prompt should mark its first line")
   assert_equals(multiline_prompt.lines[2], "  is it cool?", "prompt continuation should align under quoted input")
   assert_equals(multiline_prompt.highlights[1].group, "DiffReviewHarnessPrompt",
     "user prompts should use the Harness yellow highlight")
-  local rejected_command = transcript_renderer.build({ {
-    kind = "tool",
-    activity = {
+  local command_render = interaction_renderer.build({ {
+    id = "commands",
+    prompt = "Run commands",
+    state = "complete",
+    duration_ms = 1,
+    thought = { {
+      id = "commands:thought:1",
+      text = "Checking the workspace.",
+      tool = { {
       id = "rejected-command",
       kind = "command",
       title = "Get-ChildItem -Force",
       output = "`pwsh -Command Get-ChildItem` rejected: Generated from Rulesync permission.bash: pwsh",
       status = "failed",
-    },
-  } }, { activity_view = { ["rejected-command"] = "full" } })
-  local consecutive_command = transcript_renderer.build({
-    { kind = "tool", activity = { id = "one", kind = "command", title = "first", output = "hidden one", status = "completed" } },
-    { kind = "tool", activity = { id = "two", kind = "command", title = "second", output = "hidden two", status = "completed" } },
-  })
-  assert_equals(consecutive_command.lines[2], "• Ran second",
-    "consecutive commands should render without a blank separator")
-  assert_equals(rejected_command.lines[1], "• Ran Get-ChildItem -Force",
-    "rejected commands should communicate failure without adding transcript text")
-  assert_equals(#rejected_command.lines, 1,
-    "rejected commands should suppress redundant permission output")
-  assert_true(vim.iter(rejected_command.highlights):any(function(highlight)
-    return highlight.line == 1
-      and highlight.first == 0
-      and highlight.last == #"•"
-      and highlight.group == "DiffReviewHarnessToolFailure"
-  end), "rejected command bullets should use the failure highlight")
-  local ansi_command = transcript_renderer.build({ {
-    kind = "tool",
-    activity = {
+      failed = true,
+    }, {
       id = "ansi-command",
       kind = "command",
       title = "Get-ChildItem -Force",
       output = "\27[32;1mMode\27[0m  \27[32;1mName\27[0m",
       status = "completed",
-    },
-  } }, { activity_view = { ["ansi-command"] = "full" } })
-  assert_equals(ansi_command.lines[2], "  └ Mode  Name",
+      failed = false,
+    } },
+      started_at_ms = 0,
+      completed_at_ms = 1,
+    } },
+  } })
+  assert_true(vim.tbl_contains(command_render.lines, "  • Ran Get-ChildItem -Force"),
+    "completed commands should publish one stable command row")
+  assert_true(vim.tbl_contains(command_render.lines, "    └ Mode  Name"),
     "command output should never expose terminal color controls")
+  assert_true(vim.iter(command_render.highlights):any(function(highlight)
+    return command_render.lines[highlight.line] == "  • Ran Get-ChildItem -Force"
+      and highlight.first == 2
+      and highlight.last == 2 + #"•"
+      and highlight.group == "DiffReviewHarnessToolFailure"
+  end), "rejected command bullets should use the failure highlight")
+  local long_command_render = interaction_renderer.build({ {
+    id = "long-command",
+    prompt = "Inspect manifests",
+    state = "complete",
+    thought = { {
+      id = "long-command:thought:1",
+      text = "Inspecting manifests.",
+      tool = { {
+        id = "long-command:tool:1",
+        kind = "command",
+        title = "rg -n --glob 'README*' --glob 'rulesync.jsonc' --glob 'package.json' --glob 'Cargo.toml' --glob 'init.lua' --glob 'config.toml' 'Rulesync|dotfiles|Neovim|Nushell|WezTerm|Codex' .",
+        output = "README.md:1:# Config",
+        status = "completed",
+      } },
+    } },
+  } }, { content_width = 72 })
+  local command_line_list = {}
+  for line, row in pairs(long_command_render.rows) do
+    if row.tool and row.tool.id == "long-command:tool:1" and row.kind ~= "tool_output" then
+      command_line_list[#command_line_list + 1] = long_command_render.lines[line]
+    end
+  end
+  assert_true(#command_line_list > 1, "long folded commands should render as multiple real buffer lines")
+  for _, line in ipairs(command_line_list) do
+    assert_true(vim.fn.strdisplaywidth(line) <= 72, "wrapped command row exceeded the transcript width: " .. line)
+  end
+  local output_line = line_number(long_command_render.lines, "    └ README.md:1:# Config")
+  assert_true(output_line ~= nil, "long command fixture should retain its folded output")
+  assert_equals(long_command_render.rows[output_line - #command_line_list].expand_key,
+    "interaction:long-command:thought:long-command:thought:1:tool:1",
+    "wrapped command rows should share one semantic output expansion key")
   assert_equals(vim.bo[session.harness.transcript_buf].filetype, "Harness", "transcript filetype mismatch")
   assert_equals(vim.bo[session.harness.composer_buf].filetype, "HarnessInput", "composer filetype mismatch")
   for _, harness_win in ipairs({ session.harness.transcript_win, session.harness.composer_win }) do
@@ -428,8 +620,8 @@ local ok, failure = pcall(function()
     "winbar should render Read with the white mode highlight")
   assert_true(vim.wo[session.harness.transcript_win].breakindent,
     "Harness soft-wrapped commentary should preserve its leading indent")
-  assert_equals(vim.wo[session.harness.transcript_win].breakindentopt, "",
-    "Harness soft wraps should not add an extra continuation shift")
+  assert_equals(vim.wo[session.harness.transcript_win].breakindentopt, "shift:0",
+    "Harness soft wraps should preserve the row indent without adding another two columns")
   assert_true(vim.wo[session.harness.transcript_win].winbar:find("Mock CLI", 1, true) ~= nil, "winbar should expose the underlying CLI")
   assert_true(vim.wo[session.harness.transcript_win].winbar:find("mock-model-resolved", 1, true) ~= nil, "winbar should expose the resolved model")
   local plain_winbar = vim.wo[session.harness.transcript_win].winbar:gsub("%%#.-#", ""):gsub("%%%*", "")
@@ -510,257 +702,404 @@ local ok, failure = pcall(function()
   assert_true(vim.wait(1000, function() return active_session.write_mode == "read" end, 10), "second Shift-Tab should restore Read mode")
 
   vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "hello harness" })
-  session.harness.activity_view["command-one"] = "full"
   local tool_frame_start = #render_frame_list + 1
   controller.submit()
   assert_true(vim.wait(2000, function()
-    for _, event in ipairs(session.harness.transcript) do
-      if event.activity and event.activity.id == "command-one" and event.activity.status == "completed" then return true end
+    for _, item in ipairs(session.harness.interaction) do
+      if item.prompt == "hello harness" and item.state == "complete" then return true end
     end
     return false
-  end, 10), "Harness did not render the backend event")
-  local tool_started_seen = false
-  local tool_delta_seen = false
+  end, 10), "Harness did not complete the interaction timeline")
+  local active_counter_seen = false
+  local active_tool_leak_seen = false
+  local mixed_transition_seen = false
   local tool_completed_seen = false
   for frame_index = tool_frame_start, #render_frame_list do
     local frame_text = table.concat(render_frame_list[frame_index], "\n")
-    if frame_text:find("• Running Get-Content README.md", 1, true)
-      and frame_text:find("  └ working…", 1, true)
-    then
-      tool_started_seen = true
+    if frame_text:find("Running 1 tool", 1, true) then
+      active_counter_seen = true
+      if frame_text:find("Get-Content README.md", 1, true) then active_tool_leak_seen = true end
+      if frame_text:find("Ran 1 tool", 1, true) then mixed_transition_seen = true end
     end
-    if frame_text:find("• Running Get-Content README.md", 1, true)
-      and frame_text:find("  └ # Rendering", 1, true)
-    then
-      tool_delta_seen = true
-    end
-    if frame_text:find("• Ran Get-Content README.md", 1, true)
-      and frame_text:find("  └ # Rendering", 1, true)
-    then
-      tool_completed_seen = true
-    end
+    if frame_text:find("▸ Thought for 2s, 2.7k tokens, 1 tool called", 1, true)
+      and not frame_text:find("• Ran Get-Content README.md", 1, true) then tool_completed_seen = true end
   end
-  assert_true(tool_started_seen, "tool start should render before output arrives")
-  assert_true(tool_delta_seen, "tool output delta should render before completion")
-  assert_true(tool_completed_seen, "tool completion should replace the running state")
-  local command_count = 0
-  for _, event in ipairs(session.harness.transcript) do
-    if event.activity and event.activity.id == "command-one" then command_count = command_count + 1 end
+  assert_true(active_counter_seen, "active thoughts should stream an updating tool counter")
+  assert_true(not active_tool_leak_seen, "active thoughts must not expose expandable tool rows")
+  assert_true(not mixed_transition_seen, "Running-to-Ran transitions must publish one coherent frame")
+  assert_true(tool_completed_seen, "completed thoughts should atomically publish their collapsed summary")
+  for transaction_index = tool_frame_start, #render_transaction_list do
+    assert_true((render_transaction_list[transaction_index].first0 or 0) > 0,
+      "streaming a later interaction should never rewrite the settled transcript prefix")
   end
-  assert_equals(command_count, 1, "command lifecycle updates should render as one activity")
-  session.harness.activity_view["command-one"] = nil
-  controller.render()
   local transcript_line = vim.api.nvim_buf_get_lines(session.harness.transcript_buf, 0, -1, false)
-  assert_true(vim.tbl_contains(transcript_line, "• Ran Get-Content README.md"), "collapsed tools should name the command")
-  assert_true(not vim.tbl_contains(transcript_line, "  └ # Rendering"), "collapsed tools should hide output content")
-  local collapsed_running = transcript_renderer.build({ {
-    kind = "tool",
-    activity = {
-      id = "running-command",
-      kind = "command",
-      title = "Get-Content rulesync.jsonc -TotalCount 220",
-      status = "inProgress",
-    },
-  } })
-  assert_equals(#collapsed_running.lines, 1,
-    "collapsed running commands should hide the working status row")
-  assert_equals(collapsed_running.activity_range[1].first, 1,
-    "collapsed commands without output should remain expandable")
-  local long_command_event = { kind = "tool", activity = {
-    id = "long-command",
-    kind = "command",
-    title = "Get-Content large.txt",
-    status = "completed",
-    output = table.concat({ "one", "two", "three", "four", "five", "six" }, "\n"),
-  } }
-  local collapsed_long_command = transcript_renderer.build({ long_command_event })
-  assert_equals(#collapsed_long_command.lines, 1,
-    "collapsed commands should contain only their command row")
-  assert_equals(collapsed_long_command.lines[1], "• Ran Get-Content large.txt",
-    "collapsed commands should preserve their command text")
-  local expanded_long_command = transcript_renderer.build({ long_command_event }, {
-    activity_view = { ["long-command"] = "full" },
-  })
-  assert_equals(#expanded_long_command.lines, 7,
-    "one expansion should render every command output line")
-  assert_equals(expanded_long_command.lines[2], "  └ one",
-    "expanded command output should attach its first row to the command")
-  assert_equals(expanded_long_command.lines[7], "    six",
-    "expanded command output should retain its final row without a preview stage")
-  assert_equals(expanded_long_command.activity_range[1].last, 7,
-    "expanded command targeting should include every output row")
-  local hidden_control_tool = transcript_renderer.build({
-    { kind = "user_message", text = "/goal finish the change" },
-    {
-      kind = "tool",
-      activity = {
-        id = "goal-complete",
-        kind = "tool_call",
-        title = "harness_goal_complete",
-        status = "completed",
-      },
-    },
-  })
-  assert_equals(#hidden_control_tool.lines, 1,
-    "Harness control tools should never enter the visible transcript")
-  local plan_event = {
-    kind = "plan",
-    plan_progress = {
-      id = "turn-plan",
-      status = "inProgress",
-      step_list = {
-        { text = "Inventory the repository", status = "completed" },
-        { text = "Trace configuration boundaries", status = "inProgress" },
-        { text = "Synthesize the analysis", status = "pending" },
-      },
+  assert_true(not vim.tbl_contains(transcript_line, "  • Ran Get-Content README.md"),
+    "completed summaries should initially hide their thought tree")
+  local summary_line = line_number(transcript_line, "▸ Thought for 2s, 2.7k tokens, 1 tool called")
+  assert_true(summary_line ~= nil, "completed interaction should render its summary node")
+  vim.api.nvim_win_set_cursor(session.harness.transcript_win, { summary_line, 0 })
+  controller.toggle_activity()
+  local thought_line = line_number(vim.api.nvim_buf_get_lines(session.harness.transcript_buf, 0, -1, false),
+    "↳ Working")
+  assert_true(thought_line ~= nil, "expanding a summary should reveal its completed thought")
+  vim.api.nvim_win_set_cursor(session.harness.transcript_win, { thought_line, 0 })
+  controller.toggle_activity()
+  local tool_summary_line = line_number(vim.api.nvim_buf_get_lines(session.harness.transcript_buf, 0, -1, false),
+    "  ▸ Ran 1 tool")
+  assert_true(tool_summary_line ~= nil, "expanding a thought should reveal its tool summary")
+  vim.api.nvim_win_set_cursor(session.harness.transcript_win, { tool_summary_line, 0 })
+  controller.toggle_activity()
+  transcript_line = vim.api.nvim_buf_get_lines(session.harness.transcript_buf, 0, -1, false)
+  assert_true(vim.tbl_contains(transcript_line, "  • Ran Get-Content README.md"),
+    "expanding a tool summary should reveal command headers")
+  assert_true(not vim.tbl_contains(transcript_line, "    └ # Rendering"),
+    "command headers should initially hide their output")
+  local plan_progress = {
+    id = "turn-plan",
+    status = "inProgress",
+    step_list = {
+      { text = "Inventory the repository", status = "completed" },
+      { text = "Trace configuration boundaries", status = "inProgress" },
+      { text = "Synthesize the analysis", status = "pending" },
     },
   }
-  local active_plan = transcript_renderer.build({
-    { kind = "plan", data = { method = "turn/plan/updated" } },
-    plan_event,
-  }, { working_seconds = 1 })
-  assert_equals(active_plan.lines[1], "• Plan",
+  local active_plan = interaction_renderer.build({ {
+    id = "plan-interaction",
+    prompt = "analyze the repo",
+    state = "running",
+    thought = {},
+    active = { text = "Working", tool_count = 0, failed_count = 0 },
+  } }, {
+    working_seconds = 1,
+    plan_progress = plan_progress,
+    active_interaction_id = "plan-interaction",
+  })
+  assert_equals(active_plan.lines[4], "• Plan",
     "native plan updates should render as one structured status row")
-  assert_equals(active_plan.lines[2], "  [x] Inventory the repository",
+  assert_equals(active_plan.lines[5], "  [x] Inventory the repository",
     "active plans should show their current checklist by default")
-  assert_equals(active_plan.lines[3], "  [-] Trace configuration boundaries",
+  assert_equals(active_plan.lines[6], "  [-] Trace configuration boundaries",
     "active plans should update the in-progress checklist row")
-  assert_equals(active_plan.lines[4], "  [ ] Synthesize the analysis",
+  assert_equals(active_plan.lines[7], "  [ ] Synthesize the analysis",
     "active plans should show pending checklist rows")
-  assert_equals(active_plan.lines[6], "  Working (1s)",
-    "live plan status should remain immediately above elapsed work status")
-  assert_equals(active_plan.activity_range[1].id, "plan:turn-plan",
-    "native plan rows should expose a stable expansion target")
-  assert_equals(active_plan.activity_range[1].default_view, "full",
-    "active plan expansion should drive the default Tab state")
-  local expanded_plan = transcript_renderer.build({ plan_event }, {
-    activity_view = { ["plan:turn-plan"] = "full" },
+  assert_equals(#active_plan.lines, 7,
+    "active plans should not append a duplicate elapsed-work row")
+  assert_equals(#active_plan.folds, 0, "active plan progress should not expose a mutable fold")
+  plan_progress.status = "completed"
+  plan_progress.name = "Repository analysis"
+  for _, step in ipairs(plan_progress.step_list) do step.status = "completed" end
+  local completed_plan = interaction_renderer.build({ {
+    id = "plan-interaction",
+    prompt = "analyze the repo",
+    state = "complete",
+    duration_ms = 1000,
+    thought = {},
+  } }, {
+    plan_progress = plan_progress,
+    active_interaction_id = "plan-interaction",
   })
-  assert_equals(expanded_plan.lines[2], "  [x] Inventory the repository",
-    "expanded plans should check completed steps")
-  assert_equals(expanded_plan.lines[3], "  [-] Trace configuration boundaries",
-    "expanded plans should mark the active step")
-  assert_equals(expanded_plan.lines[4], "  [ ] Synthesize the analysis",
-    "expanded plans should retain pending steps")
-  plan_event.plan_progress.status = "completed"
-  plan_event.plan_progress.name = "Repository analysis"
-  local completed_plan = transcript_renderer.build({ plan_event })
-  assert_equals(completed_plan.lines[1], "• Plan Repository analysis Complete",
+  assert_equals(completed_plan.lines[3], "• Plan Repository analysis Complete",
     "completed named plans should emit a final completion row")
-  assert_equals(#completed_plan.lines, 1,
-    "completed plans should collapse their checklist by default")
-  assert_equals(completed_plan.activity_range[1].default_view, "collapsed",
-    "completed plan expansion should drive the default Tab state")
-  local expanded_completed_plan = transcript_renderer.build({ plan_event }, {
-    activity_view = { ["plan:turn-plan"] = "full" },
-  })
-  assert_equals(expanded_completed_plan.lines[4], "  [x] Synthesize the analysis",
-    "completed plans should retain the final checklist for Tab expansion")
-  local wrapped_command = require("diff_review.render.harness.transcript").build({ {
-    kind = "tool",
-    activity = {
-      id = "wrapped-command",
-      kind = "command",
-      status = "completed",
-      title = [["C:\Program Files\PowerShell\7\pwsh.exe" -Command 'Get-ChildItem -Force | Select-Object Mode,Name']],
-      output = "",
-    },
-  } }, { activity_view = { ["wrapped-command"] = "full" } })
-  assert_equals(wrapped_command.lines[1], "• Ran Get-ChildItem -Force | Select-Object Mode,Name",
+  assert_equals(completed_plan.lines[6], "  [x] Synthesize the analysis",
+    "completed plans should retain the final checklist for native fold expansion")
+  assert_true(vim.iter(completed_plan.folds):any(function(fold)
+    return fold.key == "plan:turn-plan" and fold.folded == true
+  end), "completed plan checklists should publish one stable folded range")
+
+  local wrapped_tool = {
+    id = "wrapped-command",
+    kind = "command",
+    status = "completed",
+    title = [["C:\Program Files\PowerShell\7\pwsh.exe" -Command 'Get-ChildItem -Force | Select-Object Mode,Name']],
+    output = "",
+    failed = false,
+  }
+  local wrapped_command = interaction_renderer.build({ {
+    id = "wrapped",
+    prompt = "list files",
+    state = "complete",
+    thought = { {
+      id = "wrapped:thought:1",
+      text = "Listing files.",
+      tool = { wrapped_tool },
+      started_at_ms = 0,
+      completed_at_ms = 1,
+    } },
+  } })
+  assert_true(vim.tbl_contains(wrapped_command.lines, "  • Ran Get-ChildItem -Force | Select-Object Mode,Name"),
     "command rows should remove the PowerShell launcher wrapper")
-  assert_equals(wrapped_command.lines[2], "  └ no output", "empty commands should render an explicit muted result")
+  assert_true(vim.tbl_contains(wrapped_command.lines, "    └ no output"),
+    "empty commands should retain an explicit muted result inside their fold")
   assert_true(vim.iter(wrapped_command.highlights):any(function(highlight)
-    return highlight.line == 1 and highlight.group == "DiffReviewHarnessOption"
+    return highlight.group == "DiffReviewHarnessOption"
   end), "command options should use their semantic highlight")
   assert_true(vim.iter(wrapped_command.highlights):any(function(highlight)
-    return highlight.line == 2 and highlight.group == "DiffReviewHarnessOutput"
+    return highlight.group == "DiffReviewHarnessOutput"
   end), "command output should use the muted output highlight")
   assert_true(vim.iter(wrapped_command.highlights):any(function(highlight)
-    return highlight.line == 1
-      and highlight.first == 0
-      and highlight.last == #"•"
+    return highlight.first == 2
+      and highlight.last == 2 + #"•"
       and highlight.group == "DiffReviewHarnessToolSuccess"
   end), "successful command bullets should use the success highlight")
-  assert_true(vim.tbl_contains(transcript_line, "  Working (0s)"), "active request should render indented elapsed work status")
-  assert_true(vim.wait(1600, function()
-    return vim.tbl_contains(vim.api.nvim_buf_get_lines(session.harness.transcript_buf, 0, -1, false), "  Working (1s)")
-  end, 20), "elapsed work status should update once per second")
-  local activity_range = session.harness.activity_range[1]
-  vim.api.nvim_set_current_win(session.harness.transcript_win)
-  vim.api.nvim_win_set_cursor(session.harness.transcript_win, { activity_range.first, 0 })
-  controller.toggle_activity()
-  transcript_line = vim.api.nvim_buf_get_lines(session.harness.transcript_buf, 0, -1, false)
-  assert_true(vim.tbl_contains(transcript_line, "  └ # Rendering"),
-    "one activity toggle should reveal the first output line")
-  assert_true(vim.tbl_contains(transcript_line, "    last line"),
-    "one activity toggle should reveal the complete command output")
-  assert_equals(session.harness.activity_view["command-one"], "full",
-    "one activity toggle should enter the full state directly")
-  activity_range = session.harness.activity_range[1]
-  vim.api.nvim_win_set_cursor(session.harness.transcript_win, { activity_range.last, 0 })
-  controller.toggle_activity()
-  transcript_line = vim.api.nvim_buf_get_lines(session.harness.transcript_buf, 0, -1, false)
-  assert_true(not vim.tbl_contains(transcript_line, "    last line"),
-    "Tab from any expanded output row should collapse the command")
-  assert_equals(session.harness.activity_view["command-one"], "collapsed",
-    "the second activity toggle should return directly to collapsed")
-  activity_range = session.harness.activity_range[1]
-  assert_equals(vim.api.nvim_win_get_cursor(session.harness.transcript_win)[1], activity_range.first,
-    "collapsing command output should return the cursor to its command row")
-  vim.fn.maparg("<Tab>", "n", false, true).callback()
-  transcript_line = vim.api.nvim_buf_get_lines(session.harness.transcript_buf, 0, -1, false)
-  assert_true(vim.tbl_contains(transcript_line, "    last line"),
-    "the installed Tab mapping should reveal complete command output in one press")
-  assert_equals(vim.api.nvim_win_get_cursor(session.harness.transcript_win)[1], session.harness.activity_range[1].first,
-    "expanding command output should keep the cursor on its command row")
-  controller.render()
-  assert_true(vim.tbl_contains(vim.api.nvim_buf_get_lines(session.harness.transcript_buf, 0, -1, false), "    last line"),
-    "full command output should survive a streaming rerender")
-
-  local original_transcript = session.harness.transcript
-  local original_activity_view = session.harness.activity_view
-  session.harness.transcript = {
-    { kind = "tool", activity = {
-      id = "first-command",
-      kind = "command",
-      title = "first",
-      output = "first output",
-      status = "completed",
+  local diff_text = table.concat({
+    "diff --git a/nvim/lua/diff_review/render/diff_tree.lua b/nvim/lua/diff_review/render/diff_tree.lua",
+    "--- a/nvim/lua/diff_review/render/diff_tree.lua",
+    "+++ b/nvim/lua/diff_review/render/diff_tree.lua",
+    "@@ -1,2 +1,2 @@",
+    " local M = {}",
+    "-return M",
+    "+return { M }",
+  }, "\n")
+  local thought_diff_render = interaction_renderer.build({ {
+    id = "thought-diff",
+    prompt = "change the renderer",
+    state = "complete",
+    duration_ms = 1,
+    diff_text = diff_text,
+    thought = { {
+      id = "thought-diff:thought:1",
+      text = "Updating the renderer.",
+      tool = {},
+      diff_text = diff_text,
     } },
-    { kind = "assistant_message", text = "between commands" },
-    { kind = "tool", activity = {
-      id = "second-command",
-      kind = "command",
-      title = "second",
-      output = "second output\nsecond final",
-      status = "completed",
-    } },
+  } })
+  local thought_change_line = line_number(thought_diff_render.lines, "  ▸ Changed 1 file +1 -1")
+  assert_true(thought_change_line ~= nil, "thought change summaries should render as nested disclosure nodes")
+  assert_true(thought_diff_render.lines[thought_change_line + 1]:match("^    Modified") ~= nil,
+    "thought-level file rows should nest beneath their change summary")
+  assert_true(thought_diff_render.lines[thought_change_line + 2]:match("^    @@") ~= nil,
+    "thought-level hunk rows should align with their nested file header")
+  local aggregate_diff_render = interaction_renderer.build({ {
+    id = "aggregate-diff",
+    prompt = "change the renderer",
+    state = "complete",
+    duration_ms = 1,
+    diff_text = diff_text,
+    thought = {},
+  } }, { expanded = {
+    ["interaction:aggregate-diff:aggregate"] = true,
+    ["interaction:aggregate-diff:aggregate:file:1"] = true,
+    ["interaction:aggregate-diff:aggregate:file:1:hunk:1"] = true,
+  } })
+  local aggregate_change_line = line_number(aggregate_diff_render.lines, "▸ Changed 1 file +1 -1")
+  assert_true(aggregate_change_line ~= nil, "aggregate change summaries should remain top-level nodes")
+  assert_true(aggregate_diff_render.lines[aggregate_change_line + 1]:match("^  Modified") ~= nil,
+    "aggregate file rows should nest one level below their change summary")
+  assert_true(aggregate_diff_render.lines[aggregate_change_line + 2]:match("^  @@") ~= nil,
+    "aggregate hunk rows should align with their nested file header")
+  local collapsed_aggregate_render = interaction_renderer.build({ {
+    id = "aggregate-diff",
+    prompt = "change the renderer",
+    state = "complete",
+    duration_ms = 1,
+    diff_text = diff_text,
+    thought = {},
+    response = "Done",
+  } }, { expanded = {} })
+  local transaction_buf = vim.api.nvim_create_buf(false, true)
+  local transaction_namespace = vim.api.nvim_create_namespace("diff_review_harness_collapse_test")
+  local transaction_state = {
+    transcript_buf = transaction_buf,
+    transcript_win = nil,
+    rendered_lines = {},
+    render_rows = {},
+    render_namespace = transaction_namespace,
+    render_initialized = false,
+    fold_installed = {},
   }
-  session.harness.activity_view = {}
-  controller.render()
-  local second_range = session.harness.activity_range[2]
-  vim.api.nvim_win_set_cursor(session.harness.transcript_win, { second_range.first, 0 })
-  vim.fn.maparg("<Tab>", "n", false, true).callback()
-  local targeted_lines = vim.api.nvim_buf_get_lines(session.harness.transcript_buf, 0, -1, false)
-  assert_true(not vim.tbl_contains(targeted_lines, "  └ first output"),
-    "expanding the second command should leave the first command collapsed")
-  assert_true(vim.tbl_contains(targeted_lines, "  └ second output"),
-    "expanding the second command should reveal its first output row")
-  assert_true(vim.tbl_contains(targeted_lines, "    second final"),
-    "expanding the second command should reveal its final output row")
-  assert_equals(session.harness.activity_view["second-command"], "full",
-    "cursor targeting should update only the selected command identity")
-  assert_true(session.harness.activity_view["first-command"] == nil,
-    "cursor targeting should not mutate another command identity")
-  local prose_line = line_number(targeted_lines, "  between commands")
-  assert_true(prose_line ~= nil, "synthetic command transcript should retain its prose separator")
-  vim.api.nvim_win_set_cursor(session.harness.transcript_win, { prose_line, 0 })
+  require("diff_review.render.harness.transaction").apply(transaction_state, aggregate_diff_render, { reset = true })
+  assert_true(vim.iter(vim.api.nvim_buf_get_extmarks(transaction_buf, transaction_namespace, 0, -1, { details = true }))
+    :any(function(extmark) return type(extmark[4].virt_text) == "table" end),
+    "expanded Harness diffs should install persistent shared gutters")
+  require("diff_review.render.harness.transaction").apply(transaction_state, collapsed_aggregate_render)
+  local collapsed_extmark_list = vim.api.nvim_buf_get_extmarks(
+    transaction_buf, transaction_namespace, 0, -1, { details = true }
+  )
+  assert_true(not vim.iter(collapsed_extmark_list)
+    :any(function(extmark)
+      local virtual_text = extmark[4].virt_text
+      return type(virtual_text) == "table" and #virtual_text > 1
+    end),
+    "collapsing a Harness diff should remove old gutters before deleted rows can relocate them")
+  assert_true(not vim.iter(collapsed_extmark_list):any(function(extmark)
+    local details = extmark[4]
+    local group = tostring(details.hl_group or details.line_hl_group or "")
+    return group:find("DiffReviewAdd", 1, true) or group:find("DiffReviewDelete", 1, true)
+  end), "collapsing a Harness diff should remove old diff colors before suffix rows relocate")
+  assert_equals(vim.api.nvim_buf_get_lines(transaction_buf, -2, -1, false)[1], "Done",
+    "collapsing a Harness diff should leave the response row uncorrupted")
+  local duplicate_thought_key = "interaction:duplicate-diff:thought:duplicate-thought"
+  local duplicate_aggregate_key = "interaction:duplicate-diff:aggregate"
+  local duplicate_expanded = {
+    ["interaction:duplicate-diff:thoughts"] = true,
+    [duplicate_thought_key] = true,
+    [duplicate_thought_key .. ":changes"] = true,
+    [duplicate_thought_key .. ":changes:file:1"] = true,
+    [duplicate_thought_key .. ":changes:file:1:hunk:1"] = true,
+    [duplicate_aggregate_key] = true,
+    [duplicate_aggregate_key .. ":file:1"] = true,
+    [duplicate_aggregate_key .. ":file:1:hunk:1"] = true,
+  }
+  local duplicate_interaction = { {
+    id = "duplicate-diff",
+    prompt = "change the renderer",
+    state = "complete",
+    duration_ms = 1,
+    diff_text = diff_text,
+    thought = { {
+      id = "duplicate-thought",
+      text = "Updating the renderer.",
+      tool = {},
+      diff_text = diff_text,
+    } },
+  } }
+  local duplicate_render = interaction_renderer.build(duplicate_interaction, { expanded = duplicate_expanded })
+  local duplicate_buf = vim.api.nvim_create_buf(false, true)
+  local duplicate_win = vim.api.nvim_open_win(duplicate_buf, false, {
+    relative = "editor",
+    row = 1,
+    col = 1,
+    width = 60,
+    height = 12,
+    style = "minimal",
+  })
+  local duplicate_state = {
+    transcript_buf = duplicate_buf,
+    transcript_win = duplicate_win,
+    rendered_lines = {},
+    render_rows = {},
+    render_namespace = vim.api.nvim_create_namespace("diff_review_harness_duplicate_cursor_test"),
+    render_initialized = false,
+    fold_installed = {},
+  }
+  require("diff_review.render.harness.transaction").apply(duplicate_state, duplicate_render, { reset = true })
+  local aggregate_hunk_line = line_number(duplicate_render.lines, "  @@ +1 -1")
+  assert_true(aggregate_hunk_line ~= nil, "duplicate diff fixture should expose the aggregate hunk header")
+  vim.api.nvim_win_set_cursor(duplicate_win, { aggregate_hunk_line, 0 })
+  duplicate_expanded[duplicate_aggregate_key .. ":file:1:hunk:1"] = false
+  local collapsed_duplicate_render = interaction_renderer.build(duplicate_interaction, { expanded = duplicate_expanded })
+  require("diff_review.render.harness.transaction").apply(duplicate_state, collapsed_duplicate_render)
+  local restored_hunk_line = vim.api.nvim_win_get_cursor(duplicate_win)[1]
+  assert_equals(collapsed_duplicate_render.lines[restored_hunk_line], "  @@ +1 -1",
+    "collapsing one repeated diff should keep the cursor on that tree's hunk header")
+  vim.api.nvim_win_close(duplicate_win, true)
+  vim.api.nvim_buf_delete(duplicate_buf, { force = true })
+  local diff_key = "projection:file:1"
+  local hunk_key = diff_key .. ":hunk:1"
+  local collapsed_diff = require("diff_review.render.diff_tree").build(diff_text, {
+    key_prefix = "projection",
+    expanded = {},
+  })
+  assert_equals(#collapsed_diff.lines, 1, "collapsed changed-file nodes should materialize only the file header")
+  assert_equals(collapsed_diff.rows[1].expand_key, diff_key,
+    "changed-file headers should own stable semantic expansion keys")
+  local file_diff = require("diff_review.render.diff_tree").build(diff_text, {
+    key_prefix = "projection",
+    expanded = { [diff_key] = true },
+  })
+  assert_equals(#file_diff.lines, 2, "expanded files should materialize only collapsed hunk headers")
+  assert_equals(file_diff.rows[2].expand_key, hunk_key,
+    "hunk headers should own stable semantic expansion keys")
+  local indented_file_diff = require("diff_review.render.diff_tree").build(diff_text, {
+    key_prefix = "projection",
+    indent = 2,
+    expanded = { [diff_key] = true },
+  })
+  assert_true(indented_file_diff.lines[1]:match("^  Modified") ~= nil,
+    "embedded file headers should apply only the caller-selected indent")
+  assert_true(indented_file_diff.lines[2]:match("^  @@") ~= nil,
+    "embedded hunk headers should align exactly with their file header")
+  local background_extmark = require("diff_review.render.row_emitter").extmark_list(4, {
+    bg = { hl_group = "DiffReviewAddBg", priority = 60 },
+    highlights = {},
+  }, false)[1]
+  assert_equals(background_extmark.options.end_row, 5,
+    "the shared row emitter should cover the complete diff row instead of a zero-length gutter span")
+  assert_true(background_extmark.options.hl_eol == true,
+    "the shared row emitter should extend diff backgrounds to the window edge")
+  local syntax_updated = false
+  local expanded_diff_options = {
+    key_prefix = "projection",
+    cwd = vim.uv.cwd(),
+    expanded = { [diff_key] = true, [hunk_key] = true },
+    on_update = function() syntax_updated = true end,
+  }
+  local expanded_diff = require("diff_review.render.diff_tree").build(diff_text, expanded_diff_options)
+  vim.wait(1000, function() return syntax_updated end, 10)
+  assert_true(syntax_updated, "Harness diff syntax should schedule an asynchronous shared-renderer upgrade")
+  vim.wait(2000, function()
+    expanded_diff = require("diff_review.render.diff_tree").build(diff_text, expanded_diff_options)
+    for _, spans in pairs(expanded_diff.diff_row_spans or {}) do
+      if vim.iter(spans.highlights or {}):any(function(highlight)
+        return tostring(highlight.hl_group):match("^@") ~= nil
+      end) then return true end
+    end
+    return false
+  end, 10)
+  assert_true(#expanded_diff.lines > 2, "expanded hunks should materialize their shared fancy diff rows")
+  local syntax_group_list = {}
+  for _, spans in pairs(expanded_diff.diff_row_spans or {}) do
+    for _, highlight in ipairs(spans.highlights or {}) do
+      syntax_group_list[#syntax_group_list + 1] = tostring(highlight.hl_group)
+    end
+  end
+  assert_true(vim.iter(syntax_group_list):any(function(group)
+    return group:match("^@") ~= nil
+  end), "Harness diffs should retain the shared Tree-sitter syntax highlights: " .. table.concat(syntax_group_list, ","))
+  local active_tree = require("diff_review.render.harness.interaction_tree").build({ {
+    id = "active-only",
+    prompt = "stream",
+    state = "running",
+    thought = {},
+    active = {
+      text = "Working",
+      tool_count = 3,
+      failed_count = 1,
+      latest_tool = {
+        id = "latest-tool",
+        kind = "command",
+        title = "rg -n -C 3 pattern nvim/lua/plugins/highlight.lua",
+        output = "line one\nline two\nline three\nline four\nline five",
+        status = "completed",
+        failed = false,
+      },
+    },
+  } }, { working_seconds = 1 })
+  assert_true(vim.tbl_contains(active_tree.lines, "  Running 3 tools (1 failed)"),
+    "active thoughts should expose their updating tool counter")
+  assert_equals(#active_tree.folds, 0, "active thoughts must not expose expandable ranges")
+  assert_true(vim.tbl_contains(active_tree.lines,
+    "  • Ran rg -n -C 3 pattern nvim/lua/plugins/highlight.lua"),
+    "active thoughts should render the latest tool identity")
+  assert_true(vim.tbl_contains(active_tree.lines, "    └ line one"),
+    "active tool previews should render their first output line")
+  assert_true(vim.tbl_contains(active_tree.lines, "      line four"),
+    "active tool previews should render up to four output lines")
+  assert_true(not vim.tbl_contains(active_tree.lines, "      line five"),
+    "active tool previews should truncate output after four lines")
+
+  vim.api.nvim_set_current_win(session.harness.transcript_win)
+  local tool_line = nil
+  for line, row in pairs(session.harness.render_rows) do
+    if row.kind == "tool" and row.tool.id == "command-one" then tool_line = line end
+  end
+  assert_true(tool_line ~= nil, "completed thought should index its tool row")
+  assert_true(session.harness.render_rows[tool_line].expand_key ~= nil,
+    "completed tool rows should own one output expansion key")
+  vim.api.nvim_win_set_cursor(session.harness.transcript_win, { tool_line, 0 })
   controller.toggle_activity()
-  assert_equals(session.harness.activity_view["second-command"], "full",
-    "Tab on prose should not toggle the nearest command")
-  session.harness.transcript = original_transcript
-  session.harness.activity_view = original_activity_view
+  assert_true(vim.tbl_contains(vim.api.nvim_buf_get_lines(session.harness.transcript_buf, 0, -1, false),
+    "    └ # Rendering"), "one activity toggle should reveal the complete command output")
+  controller.toggle_activity()
+  assert_true(not vim.tbl_contains(vim.api.nvim_buf_get_lines(session.harness.transcript_buf, 0, -1, false),
+    "    └ # Rendering"), "the second activity toggle should hide the complete command output")
   controller.render()
+  assert_true(not vim.tbl_contains(vim.api.nvim_buf_get_lines(session.harness.transcript_buf, 0, -1, false),
+    "    └ # Rendering"), "collapsed completed output should survive later render transactions")
+
+  vim.api.nvim_set_current_win(session.harness.transcript_win)
+  assert_equals(#session.harness.activity_range, 0,
+    "interaction nodes should avoid overlapping native fold ranges")
   assert_true(#session.harness.prompt_line >= 2, "Harness should index each user prompt for cursor-relative navigation")
   local first_prompt_line = session.harness.prompt_line[1]
   local second_prompt_line = session.harness.prompt_line[2]
@@ -772,10 +1111,10 @@ local ok, failure = pcall(function()
   assert_equals(vim.api.nvim_win_get_cursor(session.harness.transcript_win)[1], second_prompt_line,
     "Ctrl-z should find the next prompt from the current cursor row")
   local hello_count = 0
-  for _, event in ipairs(session.harness.transcript) do
-    if event.kind == "user_message" and event.text == "hello harness" then hello_count = hello_count + 1 end
+  for _, item in ipairs(session.harness.interaction) do
+    if item.prompt == "hello harness" then hello_count = hello_count + 1 end
   end
-  assert_equals(hello_count, 1, "streamed user admission should replace the optimistic duplicate")
+  assert_equals(hello_count, 1, "broker completion should replace the optimistic interaction")
 
   session.harness.busy = true
   vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "queued prompt" })
@@ -903,6 +1242,34 @@ local ok, failure = pcall(function()
   controller.drain()
   assert_true(vim.wait(2000, function() return goal_continue_count == 2 and not session.harness.busy end, 10), "goal continuation should drain until a terminal guard state")
   assert_equals(session.harness.goal.state, "stalled", "goal guard should stop automatic continuation")
+
+  local new_session_result
+  client.resolve_lease_conflict("new", { session_id = "busy-session" }, function(result, resolve_error)
+    assert_true(resolve_error == nil, resolve_error)
+    new_session_result = result
+  end)
+  assert_true(vim.wait(2000, function() return new_session_result ~= nil end, 10),
+    "lease conflict should allow an independently initialized new session")
+  assert_equals(request_by_method.initialize.params.lease_conflict_action, "new",
+    "lease recovery should bypass the busy latest-session lease")
+
+  local fork_result
+  client.resolve_lease_conflict("fork", { session_id = "busy-session" }, function(result, resolve_error)
+    assert_true(resolve_error == nil, resolve_error)
+    fork_result = result
+  end)
+  assert_true(vim.wait(2000, function() return fork_result ~= nil end, 10),
+    "lease conflict should fork through an independently leased broker")
+  assert_equals(request_by_method["session.fork"].params.session_id, "busy-session",
+    "lease recovery should fork the conflicted source session")
+  assert_equals(fork_result.session.id, "session-fork", "lease recovery should return the fork snapshot")
+  local harness_view = require("diff_review.views.harness")
+  assert_true(not vim.iter(harness_view.lease_conflict_options({ native_fork = false })):any(function(option)
+    return option.value == "fork"
+  end), "lease recovery should hide fork when the backend cannot fork")
+  assert_true(vim.iter(harness_view.lease_conflict_options({ native_fork = true })):any(function(option)
+    return option.value == "fork"
+  end), "lease recovery should expose fork when the persisted backend capability allows it")
 end)
 
 controller._set_render_observer_for_test(nil)

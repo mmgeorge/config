@@ -32,6 +32,33 @@ impl SqliteStore {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.execute_batch(
             r#"
+            CREATE TABLE IF NOT EXISTS preference_record (
+                workspace TEXT NOT NULL,
+                backend TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                PRIMARY KEY(workspace, backend)
+            );
+            "#,
+        )?;
+        let schema_version: u32 =
+            connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if schema_version < 2 {
+            connection.execute_batch(
+                r#"
+                PRAGMA foreign_keys=OFF;
+                DROP TABLE IF EXISTS transcript_event;
+                DROP TABLE IF EXISTS interaction_comment;
+                DROP TABLE IF EXISTS checkpoint_record;
+                DROP TABLE IF EXISTS goal_record;
+                DROP TABLE IF EXISTS plan_record;
+                DROP TABLE IF EXISTS interaction_record;
+                DROP TABLE IF EXISTS session_record;
+                PRAGMA foreign_keys=ON;
+                "#,
+            )?;
+        }
+        connection.execute_batch(
+            r#"
             CREATE TABLE IF NOT EXISTS session_record (
                 id TEXT PRIMARY KEY,
                 workspace TEXT NOT NULL,
@@ -40,12 +67,6 @@ impl SqliteStore {
             );
             CREATE INDEX IF NOT EXISTS session_workspace_activity
                 ON session_record(workspace, updated_at_ms DESC);
-            CREATE TABLE IF NOT EXISTS preference_record (
-                workspace TEXT NOT NULL,
-                backend TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                PRIMARY KEY(workspace, backend)
-            );
             CREATE TABLE IF NOT EXISTS interaction_record (
                 id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL,
@@ -79,16 +100,7 @@ impl SqliteStore {
                 payload TEXT NOT NULL,
                 FOREIGN KEY(session_id) REFERENCES session_record(id) ON DELETE CASCADE
             );
-            CREATE TABLE IF NOT EXISTS transcript_event (
-                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                interaction_id TEXT,
-                created_at_ms INTEGER NOT NULL,
-                payload TEXT NOT NULL,
-                FOREIGN KEY(session_id) REFERENCES session_record(id) ON DELETE CASCADE
-            );
-            CREATE INDEX IF NOT EXISTS transcript_session_sequence
-                ON transcript_event(session_id, sequence);
+            PRAGMA user_version=2;
             "#,
         )?;
         Ok(Self {
@@ -326,29 +338,6 @@ impl SqliteStore {
         )
     }
 
-    /// Append one transcript event without mutating earlier events.
-    pub fn append_event<T: Serialize>(
-        &mut self,
-        session_id: &str,
-        interaction_id: Option<&str>,
-        created_at_ms: i64,
-        event: &T,
-    ) -> Result<()> {
-        self.connection.execute(
-            "INSERT INTO transcript_event(session_id, interaction_id, created_at_ms, payload) VALUES(?1, ?2, ?3, ?4)",
-            params![session_id, interaction_id, created_at_ms, encode(event)?],
-        )?;
-        Ok(())
-    }
-
-    /// Load transcript events in append order for deterministic buffer reconstruction.
-    pub fn list_event(&self, session_id: &str) -> Result<Vec<serde_json::Value>> {
-        self.list_payload(
-            "SELECT payload FROM transcript_event WHERE session_id=?1 ORDER BY sequence",
-            [session_id],
-        )
-    }
-
     /// Write a content-addressed object once and return its SHA-256 identifier.
     pub fn put_object(&self, content: &[u8]) -> Result<String> {
         let object_id = crate::plan::digest(content);
@@ -533,5 +522,71 @@ mod test {
                 .as_deref(),
             Some("client-two")
         );
+    }
+
+    #[test]
+    fn timeline_migration_preserves_preferences_and_discards_legacy_sessions() {
+        let temporary = tempfile::tempdir().unwrap();
+        let database_path = temporary.path().join("harness.sqlite3");
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE preference_record (
+                    workspace TEXT NOT NULL,
+                    backend TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    PRIMARY KEY(workspace, backend)
+                );
+                CREATE TABLE session_record (
+                    id TEXT PRIMARY KEY,
+                    workspace TEXT NOT NULL,
+                    updated_at_ms INTEGER NOT NULL,
+                    payload TEXT NOT NULL
+                );
+                CREATE TABLE transcript_event (
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                );
+                PRAGMA user_version=1;
+                "#,
+            )
+            .unwrap();
+        let preference = HarnessPreference {
+            model: "remembered-model".into(),
+            effort: "low".into(),
+            fast_mode: true,
+        };
+        connection
+            .execute(
+                "INSERT INTO preference_record(workspace, backend, payload) VALUES(?1, ?2, ?3)",
+                params!["D:/work", "codex", encode(&preference).unwrap()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO session_record(id, workspace, updated_at_ms, payload) VALUES('old', 'D:/work', 1, '{}')",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = SqliteStore::open(temporary.path()).unwrap();
+        let restored = store.load_preference("D:/work", "codex").unwrap().unwrap();
+        assert_eq!(restored.model, "remembered-model");
+        assert_eq!(restored.effort, "low");
+        assert!(restored.fast_mode);
+        assert!(store.list_session(None).unwrap().is_empty());
+        let legacy_table: Option<String> = store
+            .connection
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='transcript_event'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert!(legacy_table.is_none());
     }
 }

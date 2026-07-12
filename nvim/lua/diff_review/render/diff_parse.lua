@@ -76,11 +76,20 @@ local function parse_unified_diff(diff_text)
   for _, line in ipairs(vim.split(diff_text or "", "\n", { plain = true })) do
     local left_path, right_path = line:match("^diff %-%-git a/(.-) b/(.+)$")
     if left_path or right_path then
-      current_block = { file = right_path or left_path or "", hunks = {} }
+      current_block = {
+        file = right_path or left_path or "",
+        old_file = left_path,
+        new_file = right_path,
+        hunks = {},
+      }
       blocks[#blocks + 1] = current_block
       current_hunk = nil
+    elseif line:match("^%-%-%- ") then
+      local path = line:match("^%-%-%-%s+(.+)$")
+      if current_block then current_block.old_file = path and diff_path_without_prefix(path) or nil end
     elseif line:match("^%+%+%+ ") then
       local path = line:match("^%+%+%+%s+(.+)$")
+      if current_block then current_block.new_file = path and diff_path_without_prefix(path) or nil end
       if path and path ~= "/dev/null" then
         if not current_block then
           current_block = { file = diff_path_without_prefix(path), hunks = {} }

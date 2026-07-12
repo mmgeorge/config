@@ -244,6 +244,12 @@ function M.add_fancy_row(state, row, entry, indent)
   elseif diff_line and entry then
     local diff_entry = { diff_line = diff_line }
     if diff_lines then diff_entry.diff_lines = diff_lines end
+    for _, coordinate in ipairs(diff_lines or { diff_line }) do
+      if coordinate.side == "left" then diff_entry.old_line = coordinate.line end
+      if coordinate.side == "right" then diff_entry.new_line = coordinate.line end
+      if coordinate.old_line then diff_entry.old_line = coordinate.old_line end
+      if coordinate.new_line then diff_entry.new_line = coordinate.new_line end
+    end
     local inline_jump_spans = {}
     for _, inline_highlight in ipairs(row.diff_review_inline_highlights or {}) do
       inline_jump_spans[#inline_jump_spans + 1] = {
@@ -261,10 +267,12 @@ function M.add_fancy_row(state, row, entry, indent)
   -- extmarks, so the decoration provider emits it ephemerally for visible rows only.
   -- Chrome rows (commits/sections/headers) keep using the persistent accumulators.
   local spans = nil
-  if row.diff_review_bg_hl then
+  if row.diff_review_bg_hl and state.buf then
     session.diff_line_content_lengths = session.diff_line_content_lengths or {}
     session.diff_line_content_lengths[state.buf] = session.diff_line_content_lengths[state.buf] or {}
     session.diff_line_content_lengths[state.buf][line] = content_length or #line_text
+  end
+  if row.diff_review_bg_hl then
     spans = spans or { highlights = {} }
     spans.bg = { hl_group = row.diff_review_bg_hl, priority = 60 }
   end

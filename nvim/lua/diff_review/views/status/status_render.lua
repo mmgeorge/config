@@ -5,6 +5,8 @@
 local M = {}
 
 local status_buffer = require("diff_review.views.status.status_buffer")
+local diff_component = require("diff_review.render.diff_component")
+local row_emitter = require("diff_review.render.row_emitter")
 local diff_render = require("diff_review.render.diff_render")
 local syntax_engine = require("diff_review.render.syntax_engine")
 local config = require("diff_review.infra.config")
@@ -267,7 +269,7 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_ki
       syntax_diff_len = syntax_diff_text and #syntax_diff_text or nil,
     }, function()
       return pcall(
-        diff_render.build_fancy_diff_rows,
+        diff_component.build_rows,
         hunk.diff,
         { hunk.staged },
         file.filename,
@@ -359,21 +361,21 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_ki
   end
 
   local start_line = #session.status.lines + 1
-  local fold_text = nil
+  local append_result = nil
   trace.span("status_render.render_hunk.emit_rows", session.status and session.status.buf or nil, {
     file = file.filename,
     hunk_key = hunk_key,
     row_count = #rows,
   }, function()
-    for row_index = 1, #rows do
-      local row = rows[row_index]
-      if row then
-        local line = status_add_fancy_row(row, entry, status_hunk_indent)
-        if row.diff_review_hunk_header then fold_text = session.status.lines[line] end
-      end
-    end
+    append_result = diff_component.append_rows(session.status, rows, entry, status_hunk_indent)
   end)
-  fold_state._status_register_fold_range(hunk_key, start_line, #session.status.lines, false, fold_text or session.status.lines[start_line])
+  fold_state._status_register_fold_range(
+    hunk_key,
+    start_line,
+    #session.status.lines,
+    false,
+    append_result and append_result.fold_text or session.status.lines[start_line]
+  )
   end)
 end
 
@@ -590,23 +592,8 @@ local function status_render_file(file, entry_kind, hunk_entry_kind, file_key_ov
   opts = opts or {}
   local file_key = file_key_override or status_file_key(file.section_name, file.filename)
   local default_folded = not (opts.default_open or opts.force_open)
-  local stats, stat_segments = git_data._status_file_stat_text_and_segments(file)
-  local change_label, change_label_hl = git_data._status_file_change_label(file)
-  local change_label_width = #"Modified"
-  local padded_change_label = change_label .. string.rep(" ", math.max(0, change_label_width - #change_label))
-  local file_segments = {}
-  if status_file_indent > 0 then file_segments[#file_segments + 1] = { string.rep(" ", status_file_indent) } end
-  file_segments[#file_segments + 1] = { change_label, change_label_hl }
-  local label_padding = padded_change_label:sub(#change_label + 1)
-  if label_padding ~= "" then file_segments[#file_segments + 1] = { label_padding } end
-  file_segments[#file_segments + 1] = { " " }
-  file_segments[#file_segments + 1] = { file.relpath, "DiffReviewStatusPath" }
-  file_segments[#file_segments + 1] = { " " }
-  for _, segment in ipairs(status_buffer.highlighted_text_segments(stats, stat_segments)) do
-    file_segments[#file_segments + 1] = segment
-  end
   local entry = { id = file_key, kind = entry_kind or "file", file = file, default_folded = default_folded }
-  local line_number = status_add_segment_line(file_segments, entry)
+  local line_number, file_segments = diff_component.append_file_header(session.status, file, entry, status_file_indent)
 
   local file_folded = (not opts.force_open) and status_folded(file_key, default_folded)
   diff_source_state._status_record_diff_file_header_state(file, entry_kind, hunk_entry_kind, file_key)
@@ -840,28 +827,7 @@ local function status_decorate_visible(buf, first_row, last_row)
 end
 
 local function status_emit_row_spans(buf, namespace, row, spans, ephemeral)
-  if not spans then return end
-  if spans.bg then
-    -- Cover the line's EOL (end_row = row + 1) with hl_eol so the diff background fills to
-    -- the window edge on every soft-wrapped display row without trailing-space padding,
-    -- while staying a char-range span below the inline word-diff highlights.
-    pcall(vim.api.nvim_buf_set_extmark, buf, namespace, row, 0, {
-      end_row = row + 1,
-      end_col = 0,
-      hl_group = spans.bg.hl_group,
-      priority = spans.bg.priority or 60,
-      hl_eol = true,
-      ephemeral = ephemeral or nil,
-    })
-  end
-  for _, highlight in ipairs(spans.highlights or {}) do
-    pcall(vim.api.nvim_buf_set_extmark, buf, namespace, row, highlight.start_col, {
-      end_col = highlight.end_col,
-      hl_group = highlight.hl_group,
-      priority = highlight.priority or 90,
-      ephemeral = ephemeral or nil,
-    })
-  end
+  if spans then row_emitter.emit(buf, namespace, row, spans, ephemeral) end
 end
 
 local function status_decorate_rows(buf, first_row, last_row)

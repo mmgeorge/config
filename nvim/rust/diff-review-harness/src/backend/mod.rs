@@ -81,7 +81,7 @@ pub struct BackendRequest {
     pub backend_session_id: Option<String>,
 }
 
-/// Represents a streamed backend update normalized for the Neovim transcript.
+/// Represents a streamed backend update normalized for the interaction reducer.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BackendEvent {
     pub kind: String,
@@ -95,7 +95,7 @@ pub struct BackendEvent {
     pub plan_progress: Option<PlanProgress>,
 }
 
-/// Represents one provider plan as stable progress state for transcript consumers.
+/// Represents one provider plan as stable progress state for interaction consumers.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PlanProgress {
     pub id: String,
@@ -139,7 +139,7 @@ pub enum ToolActivityKind {
     ToolCall,
 }
 
-/// Routes normalized provider updates to the live Neovim transcript.
+/// Routes normalized provider updates to the live interaction reducer.
 pub type BackendEventSink = UnboundedSender<BackendEvent>;
 
 /// Represents the normalized result of one complete backend turn.

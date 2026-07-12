@@ -53,13 +53,13 @@ end
 ---@param callback fun(result?: any, error?: string)
 ---@param result? any
 ---@param start_error? string
-local function finish_start(callback, result, start_error)
+local function finish_start(callback, result, start_error, error_detail)
   local client = state()
   client.starting = false
-  callback(result, start_error)
+  callback(result, start_error, error_detail)
   local callback_list = client.initialize_callback
   client.initialize_callback = {}
-  for _, queued_callback in ipairs(callback_list) do queued_callback(result, start_error) end
+  for _, queued_callback in ipairs(callback_list) do queued_callback(result, start_error, error_detail) end
 end
 
 local function ensure_shutdown_autocmd()
@@ -86,7 +86,11 @@ local function dispatch_message(message)
   if not pending then return end
   client.pending[message.id] = nil
   if message.error then
-    pending.callback(nil, tostring(message.error.message or message.error.code or "Harness request failed"))
+    pending.callback(
+      nil,
+      tostring(message.error.message or message.error.code or "Harness request failed"),
+      message.error
+    )
     if pending.method ~= "initialize" and pending.method ~= "state.get" then
       for _, subscriber in pairs(client.subscriber) do
         local ok, err = pcall(subscriber, "state_invalidated", { method = pending.method })
@@ -123,16 +127,16 @@ local function consume_stdout(chunk, generation)
 end
 
 ---@param callback fun(result?: any, error?: string)
-local function send_initialize(callback)
+local function send_initialize(callback, initialize_options)
   local client = state()
   local harness_config = config.options.harness
   local descriptor = backend_descriptor()
   client.next_id = client.next_id + 1
   local id = client.next_id
-  client.pending[id] = { method = "initialize", callback = function(result, request_error)
+  client.pending[id] = { method = "initialize", callback = function(result, request_error, error_detail)
     if request_error then
       client.ready = false
-      finish_start(callback, nil, request_error)
+      finish_start(callback, nil, request_error, error_detail)
       return
     end
     client.ready = true
@@ -150,6 +154,7 @@ local function send_initialize(callback)
     trust_profile = harness_config.trust_profile,
     trust_policy = harness_config.trust_profiles[harness_config.trust_profile],
     goal_max_turns = harness_config.goal_max_turns,
+    lease_conflict_action = initialize_options and initialize_options.lease_conflict_action or nil,
   })
   local ok, write_error = pcall(client.process.write, client.process, payload)
   if not ok then
@@ -160,7 +165,7 @@ end
 
 ---@param binary string
 ---@param callback fun(result?: any, error?: string)
-local function launch(binary, callback)
+local function launch(binary, callback, initialize_options)
   local client = state()
   client.generation = client.generation + 1
   local generation = client.generation
@@ -213,7 +218,19 @@ local function launch(binary, callback)
   end
   client.process = process_or_error
   ensure_shutdown_autocmd()
-  send_initialize(callback)
+  send_initialize(callback, initialize_options)
+end
+
+local function start_process(callback, initialize_options)
+  local client = state()
+  client.starting = true
+  builder.ensure(function(build_result)
+    if not build_result.ok or not build_result.path then
+      finish_start(callback, nil, build_result.message or "Harness broker build failed")
+      return
+    end
+    launch(build_result.path, callback, initialize_options)
+  end)
 end
 
 ---@param callback fun(result?: any, error?: string)
@@ -228,14 +245,22 @@ function M.start(callback)
     client.initialize_callback[#client.initialize_callback + 1] = callback
     return
   end
-  client.starting = true
-  builder.ensure(function(build_result)
-    if not build_result.ok or not build_result.path then
-      finish_start(callback, nil, build_result.message or "Harness broker build failed")
+  start_process(callback)
+end
+
+function M.resolve_lease_conflict(action, conflict, callback)
+  callback = callback or function() end
+  M.stop()
+  local initialize_options = action == "retry" and nil or { lease_conflict_action = "new" }
+  start_process(function(result, start_error, error_detail)
+    if start_error or action ~= "fork" then
+      callback(result, start_error, error_detail)
       return
     end
-    launch(build_result.path, callback)
-  end)
+    M.request("session.fork", { session_id = conflict.session_id }, function(fork_result, fork_error)
+      callback(fork_result, fork_error)
+    end)
+  end, initialize_options)
 end
 
 ---@param method string

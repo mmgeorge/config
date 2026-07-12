@@ -1,5 +1,21 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::fmt;
+
+/// Represents an active session lease held by another Neovim client.
+#[derive(Clone, Debug)]
+pub struct SessionLeaseConflict {
+    pub session_id: String,
+    pub native_fork: bool,
+}
+
+impl fmt::Display for SessionLeaseConflict {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("session is controlled by another Neovim instance")
+    }
+}
+
+impl std::error::Error for SessionLeaseConflict {}
 
 /// Represents the write authority enforced for one harness session.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -55,10 +71,13 @@ impl HarnessSession {
             .lease_owner
             .as_deref()
             .is_some_and(|owner| owner != client_id);
-        anyhow::ensure!(
-            !(lease_active && owned_elsewhere),
-            "session is controlled by another Neovim instance"
-        );
+        if lease_active && owned_elsewhere {
+            return Err(SessionLeaseConflict {
+                session_id: self.id.clone(),
+                native_fork: self.native_fork,
+            }
+            .into());
+        }
         self.lease_owner = Some(client_id.into());
         self.lease_expires_at_ms = Some(now_ms + 30_000);
         Ok(())

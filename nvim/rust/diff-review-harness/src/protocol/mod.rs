@@ -25,6 +25,8 @@ pub struct BrokerResponse {
 pub struct ProtocolError {
     pub code: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
 }
 
 /// Represents an asynchronous state change streamed from the broker.
@@ -60,6 +62,25 @@ impl BrokerResponse {
             error: Some(ProtocolError {
                 code: code.into(),
                 message: message.into(),
+                data: None,
+            }),
+        }
+    }
+
+    /// Build a failed response with structured recovery metadata.
+    pub fn failure_with_data(
+        id: u64,
+        code: impl Into<String>,
+        message: impl Into<String>,
+        data: Value,
+    ) -> Self {
+        Self {
+            id,
+            result: None,
+            error: Some(ProtocolError {
+                code: code.into(),
+                message: message.into(),
+                data: Some(data),
             }),
         }
     }

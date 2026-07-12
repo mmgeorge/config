@@ -24,7 +24,7 @@
 ---   :GitDiffCompactPreview[!]
 ---       Preview the compacted unified diff (with `!`, the staged diff).
 ---   :Harness / :HarnessNew
----       Open the AI transcript/composer or start a fresh durable Harness session.
+---       Open the AI interaction tree/composer or start a fresh durable Harness session.
 ---   :Interactions / :Sessions
 ---       Review per-user-action diffs and browse durable repository/global sessions.
 ---
@@ -116,7 +116,7 @@
 ---   PR overview     Metadata, checks, review summaries, inline comments.
 ---   Review          Draft-comment CRUD, viewed-state, verdict, submission.
 ---   Walkthrough     LLM-authored guided review: summary + anchored comment boxes.
----   Harness         Real-line AI transcript plus a multiline composer split.
+---   Harness         Foldable AI interaction tree plus a multiline composer split.
 ---   PlanReview      Physical Markdown plan with edits, annotations, and oY/oN decisions.
 ---   Interactions    Foldable session interaction diffs with review and rollback.
 ---   Sessions        Current Repo / All Repos Harness session browser.

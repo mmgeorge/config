@@ -77,7 +77,7 @@ diff_review/
 │   ├── branch_diff.lua       Working-tree-vs-branch diff rendered into a status buffer
 │   ├── file_revision.lua     Read-only view of a file at a historical revision
 │   ├── walkthrough.lua       LLM-authored guided review: summary section + anchored comment boxes
-│   ├── harness/              Dedicated transcript/composer tab and prompt queue controller
+│   ├── harness/              Dedicated interaction-tree/composer tab and prompt queue controller
 │   ├── plan_review/          Physical Markdown plan review with edits, annotations, accept, and revision
 │   ├── interactions/         Per-user-interaction diff review, comments, request changes, and rollback
 │   ├── sessions/             Current-worktree and all-worktree durable session browser
@@ -119,6 +119,9 @@ diff_review/
 │   ├── syntax_engine.lua      Async tree-sitter syntax + hunk-context producer with three caches + prewarm
 │   ├── syntax_context.lua     Per-file tree-sitter parse state (snapshot/parser/tree/query) → highlight spans
 │   ├── diff_render.lua        Build fancy-diff rows (gutter/boundary/body) and apply them as buffer extmarks
+│   ├── diff_component.lua     Shared file headers, hunk rows, and status-buffer accumulation
+│   ├── row_emitter.lua        Emit shared diff-row spans for GitStatus, PR review, and Harness
+│   ├── diff_tree.lua           Compose file headers and fancy hunks into an indentable fold tree
 │   ├── comment_box.lua        Pure compact comment-box wrapping and segmented row layout
 │   ├── layout.lua             Fenwick (binary-indexed) tree mapping items → buffer rows in O(log n)
 │   ├── row_tree.lua           Logical node tree (hunks/padding/annotations) kept in row-sync via layout
@@ -127,7 +130,7 @@ diff_review/
 │   ├── mutation_queue.lua     Serial buffer-mutation queue with idle callbacks
 │   ├── decoration.lua         Decoration-provider cache for ephemeral per-row syntax highlights
 │   ├── text_snapshot.lua      Immutable byte-indexed text snapshot (line spans without copying lines)
-│   └── harness/              Pure transcript and interaction-history row builders
+│   └── harness/              Interaction tree, tool, Markdown, queue, and node-local transaction renderers
 │
 ├── git/                      The Git data layer
 │   ├── git_backend.lua        Pluggable async process runner (vim.system or an injected test backend)
@@ -142,7 +145,7 @@ diff_review/
 │   └── datetime.lua           Relative/absolute date formatting + date highlight ranges
 │
 ├── harness/                 Thin Neovim client for the Rust Harness broker
-│   ├── builder.lua            Generic Rust-sidecar builder instance
+│   ├── builder.lua            Shared Rust-sidecar builder instance; launches versioned cache deployments, never Cargo output
 │   ├── client.lua             Long-lived JSONL process, request correlation, events, generation guards
 │   ├── protocol.lua           JSONL request/message codec
 │   └── backends/              Lua launch descriptors only: ACP, Codex app-server, and test mock
@@ -246,7 +249,7 @@ type. The standalone diff, file-revision, and preview buffers are separate.
 | Compact preview | `diff` | — | `open_compact_preview` (`:GitDiffCompactPreview`) | Raw compacted git diff |
 | Commit message | (commit ft) | — | `commit.editor` (borrowed window) | The `git commit` message buffer, AI-prefilled |
 | Commit console | (scratch) | — | `commit.commit` | Streamed pre-commit hook + git output |
-| Harness transcript | `Harness` | — | `:Harness` | Real-line chat transcript, complete tool-output toggles, elapsed work, user-prompt navigation |
+| Harness interaction tree | `Harness` | — | `:Harness` | Prompt, thought, tool, diff, plan-progress, response, and elapsed-work nodes with stable native folds |
 | Harness composer | `HarnessInput` | — | `:Harness` | Auto-growing multiline prompt input and FIFO queue editing |
 | Plan review | `markdown` | — | `/plan <request>` | Physical editable plan, line annotations, accept or request changes |
 | Interactions | `DiffReviewInteractions` | — | `:Interactions` | Foldable interaction/file/hunk diffs, comments, rollback |
@@ -295,9 +298,11 @@ Core fields:
 - view-specific state — PR data, review comments, walkthrough mode, diff source handles.
 
 The Neovim-local Harness presentation state lives under `session.harness`. It holds
-buffer/window handles, the local FIFO prompt queue, process generation, and capability
-flags. Durable sessions, transcripts, plans, goals, interactions, and checkpoints never
-live in Lua. The Rust broker owns them and reconstructs Lua state after restart.
+buffer/window handles, the local FIFO prompt queue, process generation, capability flags,
+and a presentation copy of the current interaction list. Durable sessions, plans, goals,
+interaction timelines, and checkpoints never live in Lua. The Rust broker owns those
+records, then reconstructs Lua presentation state after restart. Raw transcript events no
+longer form part of the storage or rendering model.
 
 The active-state pointers live in **`session.lua`** (Section 3):
 
@@ -881,38 +886,71 @@ name capabilities rather than layers: `broker`, `session`, `plan`, `goal`, `inte
 `control_tools`. Consumer-owned traits stay beside the feature that consumes them.
 
 The broker runs once per Neovim process over JSONL stdio. Provider events cross a live
-channel while the turn runs, so transcript rendering never waits for the final response.
-The broker records the admitted user action itself and drops provider `userMessage`
-lifecycle echoes before they reach the transcript. Assistant deltas still cross the same
-channel immediately and coalesce into one visible response model. The controller renders
-each admitted delta synchronously on Neovim's main loop instead of collapsing multiple
-provider updates behind one scheduled redraw. Lifecycle notifications enter the transcript
-only through explicit agent-message, reasoning, plan, tool, or error classifications.
-Token-usage notifications update turn metrics and never fall through as assistant prose.
-Command and tool lifecycle events carry a stable `ToolActivity` identity. Started,
-output-delta, and completed updates replace one visible activity instead of producing
-duplicate blocks, while the completed record retains the full output for persistence.
-The transcript projects that record as one collapsed Codex-style command row. `<Tab>` or
-`oa` on that row reveals every real output line in one step, and the same action anywhere
-inside the expanded command collapses it back to the command row. Toggling always returns
-the cursor to that stable row, while prose outside an activity never targets a neighboring
-command. A transient `Working (Ns)` tail updates once per second while a request
-runs and disappears at the request boundary. It never enters durable transcript state.
-User input renders as `> prompt` with aligned multiline continuation rows. Assistant output
-drops role labels, indents Markdown beneath a `▸ Thinking…` streaming marker, then replaces
-that marker with `▸ Thought for <duration>, <tokens>` after the broker receives final timing
-and provider-reported usage. A transcript revision prevents late initialization or state
-snapshots from replacing newer optimistic or streamed events, eliminating one-frame
-regressions to the empty ready state.
+channel into `TimelineReducer`, which owns one active thought and an ordered set of completed
+thoughts for the current user interaction. Assistant commentary establishes thought
+boundaries. Tool events that arrive first create a synthetic `Working` thought. Stable tool
+identities merge start, output, and completion events into one completed tool record.
+
+The live protocol publishes `ActiveThoughtUpdate` counters plus one replaceable latest-tool
+record while a thought remains mutable. The Harness tree shows `Running N tools`, the latest
+tool heading, and at most four output lines without exposing a fold whose contents could change
+while open. Each lifecycle event replaces that preview, so a newly started tool displaces the
+previous tool instead of accumulating mutable rows. When the next thought or turn boundary
+closes that thought, the broker waits for a short filesystem quiet interval, captures its
+checkpoint when needed, and publishes one immutable `CompletedThought`. The UI then changes
+`Running` to `Ran` atomically and enables semantic expansion nodes for that thought, its tool
+list, each tool result, and its changes. The final assistant message becomes the Markdown response instead of another thought
+when it contains no tools.
+
+`NotifyWorkspaceWatch` starts before the interaction baseline and recursively observes the
+worktree. Its callback filters `.git` metadata paths and otherwise only advances a monotonic
+generation, so filesystem bursts never run Git or inspect file content on the event thread.
+Provider file-change signals advance the same counter.
+Thought closure checkpoints only when the generation changed, the watcher failed, or the
+quiet wait reached its bound. The final turn boundary always captures an authoritative
+checkpoint. Any residual diff becomes a synthetic completion thought and marks attribution
+incomplete, preventing a missed or late watcher event from hiding work. Watcher failure
+degrades to checkpointing every completed thought.
+
+The Lua controller renders durable `InteractionRecord` values instead of replaying raw
+provider events. `interaction_tree.lua` builds the high-level prompt, thought, tool, change,
+and response tree. Each completed node owns a stable expansion key, and the renderer materializes
+only the children selected by `session.harness.activity_expanded`. This projection avoids
+overlapping native ranges, which cannot reliably represent wrapped thought and command headings.
+`transaction.lua` finds the smallest changed line interval and applies one buffer mutation while
+preserving semantic cursor identity, viewport position, plan folds, and settled prefix extmarks.
+Active thoughts never expose expansion keys. Completed nodes stay immutable, so an expanded
+command or diff never changes while the user reads it.
+Elapsed work appears only in the mutable `Thinking for Ns` header and never enters SQLite.
+
+GitStatus, PR review, the Harness tree, and `:Interactions` route file headers and hunk bodies
+through `diff_component.lua`. It owns the call into `diff_render.build_fancy_diff_rows` plus the
+`status_buffer.add_fancy_row` and `status_buffer.add_segment_line` accumulation used by every
+consumer. `diff_tree.lua` supplies checkpoint paths, expansion keys, caller-selected indentation,
+and interaction metadata without recomposing any visual row. The result retains the native
+`diff_row_spans` state shape, and `row_emitter.lua` applies that same state in GitStatus, PR review,
+and Harness. No Harness code reconstructs background or syntax ranges. The shared path keeps Tree-sitter syntax, file
+labels, stats, gutters, row backgrounds, intraline replacements,
+diff-line identities, and annotation coordinates consistent across live work and later review.
+Harness materializes file and hunk children from semantic expansion state. Other consumers may
+request the fully materialized tree and retain their existing view controller.
+
 SQLite uses WAL mode under
 `stdpath("data")/diff-review/harness/harness.sqlite3`. File content lives in a SHA-256
 object store, while plans remain inspectable physical Markdown under `plans/`. A session
 lease grants one live Neovim write control and leaves other instances free to browse.
 Immediate SQLite transactions arbitrate acquisition, a ten-second heartbeat protects long
 turns, and owner-checked saves prevent a stale broker from overwriting a replacement owner.
+An initialization collision returns structured lease metadata instead of a terminal string
+failure. Neovim offers Retry and Start New Session for every collision, and adds Fork Session
+only when the persisted backend capability advertises native fork. Fork recovery initializes
+an independently leased broker, forks the provider conversation, copies immutable interaction
+history and comments, clears rollback checkpoints that belong to the source session, and never
+takes or releases the source lease.
 Broker initialization selects the most recently updated session for the resolved repository
-and configured backend, then restores its transcript, plan, goal, model controls, and provider
-session identity. `:Harness` therefore resumes repository-local work across Neovim restarts,
+and configured backend, then restores its interaction timeline, plan, goal, model controls,
+and provider session identity. Schema version 2 removes legacy raw transcript events while
+preserving model, effort, and fast-mode preferences. `:Harness` therefore resumes repository-local work across Neovim restarts,
 while `/clear` remains the explicit boundary for creating a new session. Every restored session
 returns to Read mode before another turn can run.
 
@@ -931,12 +969,12 @@ its app-server protocol directly, including `model/list`, Plan collaboration mod
 dynamic Harness control tools, `thread/goal/set`, and `thread/fork`. Native fork enters
 the command set only after the backend advertises it. No transcript-copy fallback exists.
 
-Native provider plan lifecycle events also normalize into `PlanProgress` transcript state.
-Repeated updates coalesce and relocate one plan row to the live transcript tail, immediately
-above elapsed `Working` status. Active plans show their completed, active, and pending checklist
-steps by default. The provider's completion event replaces that live block with a collapsed
-`Plan Complete` row, and `<Tab>` restores the final checked checklist. This progress display does
-not enter `PlanReview` unless the user explicitly invoked `/plan`.
+Native provider plan lifecycle events also normalize into `PlanProgress` presentation state.
+Repeated updates replace one checklist beneath the active thought. Active plans show completed,
+active, and pending steps. The provider's
+completion event replaces that live block with a folded `Plan Complete` node, and `<Tab>`
+restores the final checked checklist. This progress display does not enter `PlanReview` unless
+the user explicitly invoked `/plan`.
 
 Harness defaults to the direct Codex app-server backend. The ACP launch descriptor runs
 `copilot --acp` when `harness.backend = "acp"`. Override
@@ -1017,15 +1055,17 @@ The headless suite lives in `nvim/tests/diff_review/` and runs via
 `nvim/tools/run_tests.ps1` (expect zero failures and `WHITESPACE: CLEAN`).
 `tests/diff_review/mock_backend.lua` injects a fake git backend so
 tests never touch a real repo. `diff_architecture.lua` guards the render-engine extraction
-boundaries. `tests/diff_review/harness.lua` drives transcript, queue, PlanReview,
-Interactions, Sessions, atomic key-list configuration, and fork capability gating through
-a deterministic JSONL process mock.
+boundaries. `tests/diff_review/harness.lua` drives interaction-tree transitions, node-local
+render transactions, immutable fold behavior, queue editing, PlanReview, Interactions,
+Sessions, atomic key-list configuration, and fork capability gating through a deterministic
+JSONL process mock.
 
 The Rust suite runs with `cargo test --manifest-path
 nvim/rust/diff-review-harness/Cargo.toml`. It isolates plan revisions, goal guards,
-SQLite session filters, leases, content-addressed interaction diffs, divergence refusal,
-unborn Git worktrees, failed-provider goal pausing, ACP plan normalization, exact control
-tools, backend/session compatibility, and worktree-only rollback. The ignored
+SQLite session filters and migration, leases, content-addressed interaction diffs,
+recursive watcher delivery, quiet-window fallback, divergence refusal, unborn Git
+worktrees, failed-provider goal pausing with final checkpoints, ACP plan normalization,
+exact control tools, backend/session compatibility, and worktree-only rollback. The ignored
 `tests/codex_cli.rs` integration uses the installed
 authenticated Codex CLI with `gpt-5.4-mini` at low effort in a temporary Git repository.
 Run it explicitly with `cargo test --manifest-path nvim/rust/diff-review-harness/Cargo.toml

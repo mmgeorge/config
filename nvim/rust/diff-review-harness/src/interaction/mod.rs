@@ -1,5 +1,12 @@
 use serde::{Deserialize, Serialize};
 
+mod timeline;
+
+pub use timeline::{
+    ActiveThought, ActiveThoughtUpdate, CompletedThought, CompletedTool, TimelineReducer,
+    TimelineTransition,
+};
+
 /// Represents one admitted user action and every backend turn it caused.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct InteractionRecord {
@@ -14,7 +21,21 @@ pub struct InteractionRecord {
     pub created_at_ms: i64,
     pub completed_at_ms: Option<i64>,
     #[serde(default)]
+    pub thought: Vec<CompletedThought>,
+    #[serde(default)]
+    pub response: Option<String>,
+    #[serde(default)]
+    pub duration_ms: u64,
+    #[serde(default)]
+    pub token_count: Option<u64>,
+    #[serde(default = "default_true")]
+    pub attribution_complete: bool,
+    #[serde(default)]
     pub comment: Vec<InteractionComment>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Represents whether an interaction can still receive backend turns.

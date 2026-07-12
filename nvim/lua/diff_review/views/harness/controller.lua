@@ -5,12 +5,13 @@ local command_set = require("diff_review.shared.view_command_set")
 local config = require("diff_review.infra.config")
 local keymaps = require("diff_review.shared.keymaps")
 local notifications = require("diff_review.infra.notifications")
-local renderer = require("diff_review.render.harness.transcript")
+local renderer = require("diff_review.render.harness.interaction_tree")
 local markdown = require("diff_review.render.harness.markdown")
 local queue_renderer = require("diff_review.render.harness.queue")
+local render_transaction = require("diff_review.render.harness.transaction")
 local layout = require("diff_review.views.harness.layout")
 local session = require("diff_review.session")
-local transcript_state = require("diff_review.views.harness.transcript_state")
+local interaction_state = require("diff_review.views.harness.interaction_state")
 
 local namespace = vim.api.nvim_create_namespace("DiffReviewHarnessTranscript")
 local queue_namespace = vim.api.nvim_create_namespace("DiffReviewHarnessQueue")
@@ -134,58 +135,41 @@ local function working_seconds()
   return math.floor((vim.uv.hrtime() - working_started_ns + 500000000) / 1000000000)
 end
 
-function M.render()
+---@param reset? boolean
+function M.render(reset)
   local state = harness_state()
   local buf = state.transcript_buf
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
   local transcript_win = state.transcript_win
   local transcript_visible = transcript_win and vim.api.nvim_win_is_valid(transcript_win)
-  local saved_view = nil
   local follow_tail = false
   if transcript_visible then
     local active_win = vim.api.nvim_get_current_win()
     local previous_last_line = vim.api.nvim_buf_line_count(buf)
     vim.api.nvim_win_call(transcript_win, function()
-      saved_view = vim.fn.winsaveview()
       follow_tail = active_win ~= transcript_win or vim.api.nvim_win_get_cursor(transcript_win)[1] >= previous_last_line
     end)
   end
-  local render = renderer.build(state.transcript, {
-    ready = state.ready,
+  local render = renderer.build(state.interaction, {
     working_seconds = working_seconds(),
-    activity_view = state.activity_view,
+    content_width = transcript_visible and vim.api.nvim_win_get_width(transcript_win) or nil,
+    cwd = vim.uv.cwd(),
+    on_diff_update = function() vim.schedule(M.render) end,
+    expanded = state.activity_expanded,
+    plan_progress = state.plan_progress,
+    active_interaction_id = state.pending_interaction and state.pending_interaction.id
+      or (state.interaction[#state.interaction] and state.interaction[#state.interaction].id),
   })
-  state.prompt_line = render.prompt_line
-  state.activity_range = render.activity_range
-  vim.bo[buf].modifiable = true
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, render.lines)
-  vim.api.nvim_buf_clear_namespace(buf, namespace, 0, -1)
-  for _, highlight in ipairs(render.highlights) do
-    vim.api.nvim_buf_add_highlight(buf, namespace, highlight.group, highlight.line - 1, highlight.first, highlight.last)
-  end
-  vim.bo[buf].modifiable = false
-  markdown.render(buf, transcript_win, render.markdown_range)
-  if render_observer_for_test then render_observer_for_test(vim.deepcopy(render.lines)) end
-  if transcript_visible then
-    vim.api.nvim_win_call(transcript_win, function()
-      vim.cmd("silent! normal! zE")
-      for _, range in ipairs(render.activity_range) do
-        if range.fold_first and range.fold_last and range.fold_last >= range.fold_first then
-          local view = state.activity_view and state.activity_view[range.id] or "collapsed"
-          if view ~= "full" then
-            vim.cmd(range.fold_first .. "," .. range.fold_last .. "fold")
-            vim.api.nvim_win_set_cursor(transcript_win, { range.fold_first, 0 })
-            vim.cmd("silent! foldclose")
-          end
-        end
-      end
-      if follow_tail then
-        vim.api.nvim_win_set_cursor(transcript_win, { math.max(1, #render.lines), 0 })
-        vim.cmd("silent! normal! zb")
-      elseif saved_view then
-        vim.fn.winrestview(saved_view)
-      end
-    end)
+  state.prompt_line = render.prompt_lines
+  state.activity_range = render.folds
+  state.render_namespace = namespace
+  local transaction = render_transaction.apply(state, render, {
+    reset = reset == true,
+    follow_tail = follow_tail,
+  })
+  markdown.render(buf, transcript_win, render.markdown_ranges)
+  if render_observer_for_test then
+    render_observer_for_test(vim.deepcopy(render.lines), vim.deepcopy(transaction))
   end
   M.refresh_winbar()
 end
@@ -225,20 +209,17 @@ end
 local function synchronize_state()
   if state_sync_pending then return end
   state_sync_pending = true
-  local state = harness_state()
-  local observed_revision = transcript_state.revision(state)
-  local observed_count = #state.transcript
   client.request("state.get", {}, function(result, request_error)
     state_sync_pending = false
     if request_error or not result then return end
     local state = harness_state()
     state.session = result.session
-    transcript_state.reconcile_snapshot(state, result.transcript or {}, observed_revision, observed_count)
+    interaction_state.replace(state, result.interaction or {})
     state.capability = result.capability or {}
     state.no_checkpoint = result.no_checkpoint == true
     state.goal = result.goal
     state.active_plan = result.active_plan
-    M.render()
+    M.render(true)
   end)
 end
 
@@ -247,122 +228,18 @@ end
 local function on_event(event, payload)
   local state = harness_state()
   if event == "backend_event" then
-    if payload.kind == "assistant_summary" and type(payload.summary) == "table" then
-      for transcript_index = #state.transcript, 1, -1 do
-        local transcript_event = state.transcript[transcript_index]
-        if transcript_event.kind == "assistant_message" then
-          transcript_event.summary = payload.summary
-          transcript_state.mark_changed(state)
-          schedule_render()
-          return
-        end
-      end
-      return
+    if payload.kind == "timeline_active" then
+      interaction_state.apply_active(state, payload.data or payload)
+      schedule_render()
+    elseif payload.kind == "timeline_thought_completed" then
+      interaction_state.complete_thought(state, payload.data or payload)
+      schedule_render()
+    elseif payload.kind == "plan" and type(payload.plan_progress) == "table" then
+      state.plan_progress = vim.deepcopy(payload.plan_progress)
+      schedule_render()
+    elseif payload.kind == "error" and type(payload.text) == "string" then
+      notifications.warn(payload.text, "Harness")
     end
-    if payload.kind == "plan" and type(payload.plan_progress) == "table" then
-      for transcript_index = #state.transcript, 1, -1 do
-        local transcript_event = state.transcript[transcript_index]
-        if transcript_event.kind == "user_message" then break end
-        local previous_progress = type(transcript_event.plan_progress) == "table" and transcript_event.plan_progress or nil
-        if previous_progress and previous_progress.id == payload.plan_progress.id then
-          if payload.plan_progress.name ~= nil then previous_progress.name = payload.plan_progress.name end
-          if type(payload.plan_progress.step_list) == "table" and #payload.plan_progress.step_list > 0 then
-            previous_progress.step_list = payload.plan_progress.step_list
-          end
-          previous_progress.status = payload.plan_progress.status or previous_progress.status
-          transcript_event.data = payload.data
-          table.remove(state.transcript, transcript_index)
-          state.transcript[#state.transcript + 1] = transcript_event
-          transcript_state.mark_changed(state)
-          schedule_render()
-          return
-        end
-      end
-    end
-    local previous = state.transcript[#state.transcript]
-    if payload.kind == "user_message"
-      and previous
-      and previous.kind == "user_message"
-      and previous.text == payload.text
-    then
-      return
-    end
-    local activity = type(payload.activity) == "table" and payload.activity or nil
-    if activity and activity.id then
-      local matching_index = nil
-      for transcript_index = #state.transcript, 1, -1 do
-        local transcript_event = state.transcript[transcript_index]
-        local previous_activity = type(transcript_event.activity) == "table" and transcript_event.activity or nil
-        if previous_activity and previous_activity.id == activity.id then
-          if activity.title
-            and activity.title ~= ""
-            and activity.title ~= "command"
-            and activity.title ~= "file changes"
-            and activity.title ~= "tool"
-          then
-            previous_activity.title = activity.title
-          end
-          previous_activity.kind = activity.kind or previous_activity.kind
-          previous_activity.status = activity.status or previous_activity.status
-          if type(activity.output) == "string" then
-            if activity.output_delta then
-              previous_activity.output = (previous_activity.output or "") .. activity.output
-            else
-              previous_activity.output = activity.output
-            end
-          end
-          previous_activity.output_delta = false
-          transcript_event.data = payload.data
-          transcript_state.mark_changed(state)
-          schedule_render()
-          return
-        end
-      end
-      if activity.title and activity.title ~= "" and activity.title ~= "command"
-        and activity.title ~= "file changes" and activity.title ~= "tool"
-        and (activity.output ~= nil or (activity.status ~= "inProgress" and activity.status ~= "in_progress"))
-      then
-        for transcript_index = #state.transcript, 1, -1 do
-          local previous_activity = type(state.transcript[transcript_index].activity) == "table"
-              and state.transcript[transcript_index].activity or nil
-          if previous_activity
-            and previous_activity.kind == activity.kind
-            and previous_activity.title == activity.title
-            and (previous_activity.status == "inProgress" or previous_activity.status == "in_progress")
-          then
-            if matching_index then
-              matching_index = nil
-              break
-            end
-            matching_index = transcript_index
-          end
-        end
-      end
-      if matching_index then
-        local previous_activity = state.transcript[matching_index].activity
-        previous_activity.status = activity.status or previous_activity.status
-        previous_activity.output = activity.output or previous_activity.output
-        previous_activity.output_delta = false
-        state.transcript[matching_index].data = payload.data
-        transcript_state.mark_changed(state)
-        schedule_render()
-        return
-      end
-    end
-    local mergeable = payload.kind == "assistant_message" or payload.kind == "reasoning"
-    if mergeable
-      and previous
-      and previous.kind == payload.kind
-      and type(previous.text) == "string"
-      and type(payload.text) == "string"
-    then
-      previous.text = previous.text .. payload.text
-      previous.data = payload.data
-      transcript_state.mark_changed(state)
-    else
-      transcript_state.append(state, payload)
-    end
-    schedule_render()
   elseif event == "plan_review" then
     state.active_plan = payload
     require("diff_review.views.plan_review").open(payload)
@@ -379,15 +256,18 @@ local function on_event(event, payload)
   elseif event == "session_changed" or event == "session_configured" or event == "mode_changed" then
     local next_session = payload.session or payload
     if event == "session_changed" and state.session and next_session.id ~= state.session.id then
-      transcript_state.replace(state, payload.transcript or {})
+      interaction_state.replace(state, payload.interaction or {})
       state.queue = {}
       state.goal = nil
       state.active_plan = nil
+      state.plan_progress = nil
     end
     state.session = next_session
     M.refresh_winbar()
   elseif event == "interaction_rolled_back" then
-    transcript_state.append(state, { kind = "system_message", text = "Workspace rollback completed." })
+    synchronize_state()
+  elseif event == "interaction_complete" or event == "interaction_updated" then
+    interaction_state.complete_interaction(state, payload.interaction or payload)
     M.render()
   elseif event == "state_invalidated" then
     synchronize_state()
@@ -402,19 +282,20 @@ local function begin_request(text)
   if goal_objective and goal_objective ~= "pause" and goal_objective ~= "resume" and goal_objective ~= "clear" then
     state.goal = { objective = goal_objective, state = "active" }
   end
-  transcript_state.append(state, { kind = "user_message", text = text })
+  interaction_state.begin(state, text)
+  state.plan_progress = nil
   M.render()
   client.request("prompt.submit", { text = text }, function(result, request_error)
     set_busy(false)
     if request_error then
-      transcript_state.append(state, { kind = "error", text = request_error })
+      interaction_state.fail_pending(state, request_error)
       notifications.error(request_error, "Harness")
       M.render()
       return
     elseif result then
       state.session = result.session or (result.id and result) or state.session
       state.capability = result.capability or state.capability
-      if result.transcript then transcript_state.replace(state, result.transcript) end
+      if result.interaction then interaction_state.complete_interaction(state, result.interaction) end
     end
     M.render()
     vim.schedule(M.drain)
@@ -596,27 +477,14 @@ function M.toggle_activity()
   if not (state.transcript_win and vim.api.nvim_win_is_valid(state.transcript_win)) then return end
   vim.api.nvim_set_current_win(state.transcript_win)
   local cursor_line = vim.api.nvim_win_get_cursor(state.transcript_win)[1]
-  local selected = nil
-  for _, range in ipairs(state.activity_range or {}) do
-    if cursor_line >= range.first and cursor_line <= range.last then
-      selected = range
-      break
-    end
-  end
-  if not selected then
-    notifications.warn("Place the cursor on a tool or plan to toggle its output", "Harness")
+  local row = state.render_rows and state.render_rows[cursor_line] or nil
+  local expand_key = row and row.expand_key or nil
+  if not expand_key then
+    notifications.warn("Only completed thoughts, tools, and changes can expand", "Harness")
     return
   end
-  state.activity_view = state.activity_view or {}
-  local current = state.activity_view[selected.id] or selected.default_view or "collapsed"
-  state.activity_view[selected.id] = current == "collapsed" and "full" or "collapsed"
+  state.activity_expanded[expand_key] = not state.activity_expanded[expand_key]
   M.render()
-  for _, range in ipairs(state.activity_range or {}) do
-    if range.id == selected.id then
-      vim.api.nvim_win_set_cursor(state.transcript_win, { range.first, 0 })
-      break
-    end
-  end
 end
 
 ---@param direction integer
