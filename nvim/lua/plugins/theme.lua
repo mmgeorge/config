@@ -1,21 +1,4 @@
-local colors = {
-  red = "#ef3573",
-  -- light_red = "#c3d0e0",
-  off_white = "#ccdbed",
-  green = "#5bff94",
-  yellow = "#ffe18e",
-  gray = "#696969",
-  light_gray = "#8a929c",
-  -- white = "#e9e9e9",
-  white = "#ffffff",
-  light_blue = "#3ec5ff",
-  -- light_gray = "#b4b4b4",
-  teal = "#9dffe7",
-  dark_gray = "#151515",
-  black = "#000000",
-  visual = "#303136",
-  error = "red"
-}
+local colors = require("theme.palette")
 
 return {
   {

@@ -64,8 +64,8 @@ resolves that lazily.
 
 ```
 diff_review/
-├── init.lua                  Star-hub facade: wires every submodule, re-exports functions, exposes open*/setup/get
-├── session.lua               Shared session-state store: active status state, per-buffer registry, per-session diff caches
+├── init.lua                  Thin public facade: exposes setup/get and user-facing open* entry points
+├── session.lua               Shared mutable state: status registries, diff caches, Harness presentation handles
 ├── types.lua                 Shared LuaCATS (---@class/---@alias) catalog — annotation only, never required at runtime
 ├── query_runtime.lua         Puts the plugin root on the runtimepath so bundled queries resolve
 ├── docs/architecture.md      This document
@@ -77,6 +77,10 @@ diff_review/
 │   ├── branch_diff.lua       Working-tree-vs-branch diff rendered into a status buffer
 │   ├── file_revision.lua     Read-only view of a file at a historical revision
 │   ├── walkthrough.lua       LLM-authored guided review: summary section + anchored comment boxes
+│   ├── harness/              Dedicated transcript/composer tab and prompt queue controller
+│   ├── plan_review/          Physical Markdown plan review with edits, annotations, accept, and revision
+│   ├── interactions/         Per-user-interaction diff review, comments, request changes, and rollback
+│   ├── sessions/             Current-worktree and all-worktree durable session browser
 │   ├── pr/
 │   │   ├── pr_overview.lua    PR metadata, checks, review summaries, inline comments
 │   │   ├── pr_edit.lua        In-place edit of PR title/body/reviewers/milestone with queued mutations
@@ -122,7 +126,8 @@ diff_review/
 │   ├── annotations.lua        Review-comment model: by-anchor index + sync state machine + serial sync queue
 │   ├── mutation_queue.lua     Serial buffer-mutation queue with idle callbacks
 │   ├── decoration.lua         Decoration-provider cache for ephemeral per-row syntax highlights
-│   └── text_snapshot.lua      Immutable byte-indexed text snapshot (line spans without copying lines)
+│   ├── text_snapshot.lua      Immutable byte-indexed text snapshot (line spans without copying lines)
+│   └── harness/              Pure transcript and interaction-history row builders
 │
 ├── git/                      The Git data layer
 │   ├── git_backend.lua        Pluggable async process runner (vim.system or an injected test backend)
@@ -135,6 +140,12 @@ diff_review/
 │   ├── commit.lua             Fake-editor commit bridge: headless nvim as GIT_EDITOR over RPC
 │   ├── conventional_commit.lua  Parse the conventional-commit prefix into colored segments
 │   └── datetime.lua           Relative/absolute date formatting + date highlight ranges
+│
+├── harness/                 Thin Neovim client for the Rust Harness broker
+│   ├── builder.lua            Generic Rust-sidecar builder instance
+│   ├── client.lua             Long-lived JSONL process, request correlation, events, generation guards
+│   ├── protocol.lua           JSONL request/message codec
+│   └── backends/              Lua launch descriptors only: ACP, Codex app-server, and test mock
 │
 ├── infra/                    Cross-cutting leaves
 │   ├── config.lua             Config schema + defaults + setup merge (keymaps, perf, lookup mode)
@@ -235,6 +246,11 @@ type. The standalone diff, file-revision, and preview buffers are separate.
 | Compact preview | `diff` | — | `open_compact_preview` (`:GitDiffCompactPreview`) | Raw compacted git diff |
 | Commit message | (commit ft) | — | `commit.editor` (borrowed window) | The `git commit` message buffer, AI-prefilled |
 | Commit console | (scratch) | — | `commit.commit` | Streamed pre-commit hook + git output |
+| Harness transcript | `Harness` | — | `:Harness` | Real-line chat transcript, complete tool-output toggles, elapsed work, user-prompt navigation |
+| Harness composer | `HarnessInput` | — | `:Harness` | Auto-growing multiline prompt input and FIFO queue editing |
+| Plan review | `markdown` | — | `/plan <request>` | Physical editable plan, line annotations, accept or request changes |
+| Interactions | `DiffReviewInteractions` | — | `:Interactions` | Foldable interaction/file/hunk diffs, comments, rollback |
+| Sessions | `DiffReviewSessions` | — | `:Sessions` | Current Repo and All Repos durable session tabs |
 
 **Why one filetype for four views.** Folding, keymaps, highlight groups, and the
 hint-bar winbar are all keyed on the `GitStatus` filetype. Sharing it means the status,
@@ -252,6 +268,10 @@ Registered in `nvim/lua/plugins/diff_review.lua`:
 :GitBranchDiffFile <file> <branch>    " open_branch_diff(branch, { file = file })
 :GitFileRevision <file> <commit>      " open_file_revision(file, commit)
 :GitDiffCompactPreview[!]             " open_compact_preview({ staged = bang })
+:Harness                              " open_harness()
+:HarnessNew                           " new_harness_session()
+:Interactions                         " open_interactions()
+:Sessions                             " open_sessions()
 ```
 
 PR and review buffers are opened programmatically by the `github` integration
@@ -273,6 +293,11 @@ Core fields:
 - `folds` — `{ key → folded }` over the stable keys from `status_keys.lua`.
 - `highlights`, `extmarks` — accumulated decoration, applied after the lines are written.
 - view-specific state — PR data, review comments, walkthrough mode, diff source handles.
+
+The Neovim-local Harness presentation state lives under `session.harness`. It holds
+buffer/window handles, the local FIFO prompt queue, process generation, and capability
+flags. Durable sessions, transcripts, plans, goals, interactions, and checkpoints never
+live in Lua. The Rust broker owns them and reconstructs Lua state after restart.
 
 The active-state pointers live in **`session.lua`** (Section 3):
 
@@ -691,8 +716,10 @@ branch-create action) behind a reader seam so tests never hit the filesystem.
 
 ## 11. Infra (`infra/`)
 
-- **`config.lua`** — the `DiffReviewConfig` schema, defaults, and the `setup` deep-merge.
-  Owns buffer names, perf options, the PR-lookup mode, and the full keymap config.
+- **`config.lua`** — the `DiffReviewConfig` schema, defaults, and setup merge. Owns
+  buffer names, Harness launch descriptors, trust profiles, perf options, and the full
+  keymap config. List values replace defaults atomically, so a configured key list never
+  inherits trailing default entries.
 - **`choice_popup.lua`** — renders a small keyboard-driven chooser from typed options,
   centralizing option keys, `q`/`<Esc>` cancellation, popup sizing, and callback cleanup.
   PR lifecycle changes, closed-PR resolution, and review verdict selection reuse it.
@@ -725,9 +752,10 @@ back four view kinds.
   optionally supplying `sources`, `head_rows`, `sections`, `command_set`, and
   `after_render` hooks. `run_hook(view_kind, hook, state)` is how `status_render` stays
   view-agnostic — it asks the registered controller what to do.
-- **`keymaps.lua`** — installs per-view buffer keymaps (resolving visibility per
-  `view_kind` from the command specs) and renders the sticky **hint-bar winbar**. Keymaps
-  dispatch into init-owned actions through `dr()`.
+- **`keymaps.lua`** — installs status-family and generic command-set keymaps, then renders
+  their sticky **hint-bar winbars** and help popups from the same configured keys.
+  Capability-gated commands never enter a command set, so unsupported actions disappear
+  from mappings, hints, and help together.
 
 ---
 
@@ -806,6 +834,158 @@ press the commit key
        └─ pre-commit hook output streams into the console buffer
 ```
 
+**Plan, review, and execute through Harness**
+
+```
+:Harness → multiline composer → /plan <request>
+  └─ harness/client JSONL request → Rust broker
+       ├─ force READ and capture interaction checkpoint-before
+       ├─ ACP or Codex strategy runs one planning turn
+       ├─ accept only harness_plan_submit or a complete native plan artifact
+       └─ PlanFileStore writes plans/<session>/<plan>/working.md + immutable revision
+            └─ PlanReview opens the physical file with :edit
+                 ├─ user edits normal Markdown and C anchors comments with extmarks
+                 ├─ oN saves the complete user revision + annotations → revised model plan
+                 └─ oY hashes the exact saved plan → WRITE → Goal: Complete the plan
+                      └─ execution interaction → checkpoint-after → exact per-interaction diff
+```
+
+**Persist goals without hiding user prompts**
+
+```
+backend turn completes
+  └─ GoalRecord observes { tool call, workspace change, structured/native terminal state }
+       ├─ queued user prompt exists → admit it before any continuation
+       ├─ progress → request another continuation at idle
+       ├─ first no-progress turn → one retry
+       ├─ second consecutive no-progress turn → stalled
+       └─ 20 total goal turns → stalled until explicit /goal resume resets the budget
+```
+
+**Review or roll back an interaction**
+
+```
+:Interactions → Interaction → file → hunk
+  ├─ diff_parse + source normalization build real diff rows and native folds
+  ├─ C stores an annotation through the shared annotation/comment-box model
+  ├─ oN creates a new user interaction containing diff + comments
+  └─ R pauses local goal activity and revalidates HEAD, index digest, and workspace digest
+       └─ restore worktree-only CAS objects or refuse without changing files
+```
+
+### Harness broker boundary
+
+The feature-first Rust crate lives at `nvim/rust/diff-review-harness`. Its directories
+name capabilities rather than layers: `broker`, `session`, `plan`, `goal`, `interaction`,
+`checkpoint`, `backend/acp`, `backend/codex`, `storage`, `workspace`, `protocol`, and
+`control_tools`. Consumer-owned traits stay beside the feature that consumes them.
+
+The broker runs once per Neovim process over JSONL stdio. Provider events cross a live
+channel while the turn runs, so transcript rendering never waits for the final response.
+The broker records the admitted user action itself and drops provider `userMessage`
+lifecycle echoes before they reach the transcript. Assistant deltas still cross the same
+channel immediately and coalesce into one visible response model. The controller renders
+each admitted delta synchronously on Neovim's main loop instead of collapsing multiple
+provider updates behind one scheduled redraw. Lifecycle notifications enter the transcript
+only through explicit agent-message, reasoning, plan, tool, or error classifications.
+Token-usage notifications update turn metrics and never fall through as assistant prose.
+Command and tool lifecycle events carry a stable `ToolActivity` identity. Started,
+output-delta, and completed updates replace one visible activity instead of producing
+duplicate blocks, while the completed record retains the full output for persistence.
+The transcript projects that record as one collapsed Codex-style command row. `<Tab>` or
+`oa` on that row reveals every real output line in one step, and the same action anywhere
+inside the expanded command collapses it back to the command row. Toggling always returns
+the cursor to that stable row, while prose outside an activity never targets a neighboring
+command. A transient `Working (Ns)` tail updates once per second while a request
+runs and disappears at the request boundary. It never enters durable transcript state.
+User input renders as `> prompt` with aligned multiline continuation rows. Assistant output
+drops role labels, indents Markdown beneath a `▸ Thinking…` streaming marker, then replaces
+that marker with `▸ Thought for <duration>, <tokens>` after the broker receives final timing
+and provider-reported usage. A transcript revision prevents late initialization or state
+snapshots from replacing newer optimistic or streamed events, eliminating one-frame
+regressions to the empty ready state.
+SQLite uses WAL mode under
+`stdpath("data")/diff-review/harness/harness.sqlite3`. File content lives in a SHA-256
+object store, while plans remain inspectable physical Markdown under `plans/`. A session
+lease grants one live Neovim write control and leaves other instances free to browse.
+Immediate SQLite transactions arbitrate acquisition, a ten-second heartbeat protects long
+turns, and owner-checked saves prevent a stale broker from overwriting a replacement owner.
+Broker initialization selects the most recently updated session for the resolved repository
+and configured backend, then restores its transcript, plan, goal, model controls, and provider
+session identity. `:Harness` therefore resumes repository-local work across Neovim restarts,
+while `/clear` remains the explicit boundary for creating a new session. Every restored session
+returns to Read mode before another turn can run.
+
+ACP uses the official Rust SDK dependency and a negotiated JSON-RPC driver. One ACP agent
+process stays attached across turns, so agents without optional `session/load` still retain
+conversation state during the Neovim run. Restoring those sessions after a broker restart
+requires the agent to advertise `loadSession`. The ACP client
+implements the filesystem and complete terminal lifecycle it advertises, retains bounded
+UTF-8 output, validates paths against the workspace, and maps published model and thought
+config options onto Harness model/effort settings. `/plan` selects an advertised plan,
+architect, planning, or ask mode through `session/set_mode`, then returns to a code-capable
+mode for execution. Stable ACP `entries` plan updates and exact Harness control-tool calls
+normalize into the same reviewed plan contract. Names printed in prose or command output
+never count as control calls. Codex uses
+its app-server protocol directly, including `model/list`, Plan collaboration mode,
+dynamic Harness control tools, `thread/goal/set`, and `thread/fork`. Native fork enters
+the command set only after the backend advertises it. No transcript-copy fallback exists.
+
+Native provider plan lifecycle events also normalize into `PlanProgress` transcript state.
+Repeated updates coalesce and relocate one plan row to the live transcript tail, immediately
+above elapsed `Working` status. Active plans show their completed, active, and pending checklist
+steps by default. The provider's completion event replaces that live block with a collapsed
+`Plan Complete` row, and `<Tab>` restores the final checked checklist. This progress display does
+not enter `PlanReview` unless the user explicitly invoked `/plan`.
+
+Harness defaults to the direct Codex app-server backend. The ACP launch descriptor runs
+`copilot --acp` when `harness.backend = "acp"`. Override
+`harness.backends.acp.command` to use another ACP agent without changing the broker or views.
+Copilot ACP currently omits model selection from `configOptions`, so Harness leaves the
+provider default untouched. If Copilot rejects that configured model while creating the
+initial conversation, the ACP adapter restarts the process and retries once with a fresh
+session. Established sessions retain their context and fail with actionable guidance rather
+than being replaced. A second initial rejection also tells the user to choose a supported
+model in Copilot instead of retrying indefinitely.
+
+Read and Write appear in the Harness winbar. Codex enforces them with native sandbox and
+approval fields. ACP permission requests pass through the workspace trust profile, but
+provider-private tools can bypass client permission requests. That protocol limitation
+remains visible in the ACP winbar and belongs to the follow-up hardening work.
+`Shift-Tab` toggles Read and Write in both transcript and composer modes through the broker's
+durable `mode.set` request. A toggle during an active turn shows the pending mode with `*`
+and applies it at the next safe request boundary. Non-Git Write retains the checkpoint warning
+and confirmation path.
+
+Only the transcript window owns the Harness winbar. The composer clears its window-local
+winbar so the split presents session identity once. The transcript winbar begins directly
+with Read or Write, omits the redundant Harness title and trust-profile suffix, and then
+displays the underlying provider executable and resolved runtime model.
+Codex resolves the configured `default` sentinel through the `isDefault` entry from
+`model/list`, then caches and persists that model on the Harness session. ACP identifies
+the launch command, such as `Copilot CLI (ACP)`, and displays a model only when the agent
+publishes one through session configuration. Before resolution, the winbar says
+`resolving model` instead of presenting `default` as though it were a real model ID.
+
+`/rename <name>` routes directly to the broker's durable `session.rename` request rather
+than entering the model transcript. `/rename` clears the optional display name. The
+`:Sessions` view renders that name as its first column and substitutes `[unnamed]` for
+empty names, keeping storage semantics separate from presentation fallback text.
+
+Non-Git WRITE requires an explicit confirmation and permanently displays `NO CHECKPOINT`
+for that session. Git checkpoints include tracked and nonignored untracked files, exclude
+ignored files, and never mutate the index or history during rollback.
+
+### Deferred Harness work
+
+- Add `PlanProgress` task/subtask tracking when backends expose reliable task boundaries.
+- Harden ACP write enforcement as the protocol grows guarantees for provider-private tools.
+- Audit provider-local hooks and command policies that can still reject a tool under Harness
+  WRITE, because backend-native policy layers remain authoritative outside the Harness protocol.
+- Move the per-Neovim broker to a shared daemon only if cross-editor live control becomes
+  valuable enough to justify process discovery and stronger lease coordination.
+- Add provider strategies after ACP and Codex prove the backend contract. Do not scrape PTYs.
+
 ---
 
 ## 15. Conventions and invariants
@@ -834,10 +1014,33 @@ press the commit key
 ## 16. Testing and linting
 
 The headless suite lives in `nvim/tests/diff_review/` and runs via
-`pwsh -File nvim/tools/run_tests.ps1` (expect `TESTS PASS=32 FAIL=0` and
-`WHITESPACE: CLEAN`). `tests/diff_review/mock_backend.lua` injects a fake git backend so
+`nvim/tools/run_tests.ps1` (expect zero failures and `WHITESPACE: CLEAN`).
+`tests/diff_review/mock_backend.lua` injects a fake git backend so
 tests never touch a real repo. `diff_architecture.lua` guards the render-engine extraction
-boundaries.
+boundaries. `tests/diff_review/harness.lua` drives transcript, queue, PlanReview,
+Interactions, Sessions, atomic key-list configuration, and fork capability gating through
+a deterministic JSONL process mock.
+
+The Rust suite runs with `cargo test --manifest-path
+nvim/rust/diff-review-harness/Cargo.toml`. It isolates plan revisions, goal guards,
+SQLite session filters, leases, content-addressed interaction diffs, divergence refusal,
+unborn Git worktrees, failed-provider goal pausing, ACP plan normalization, exact control
+tools, backend/session compatibility, and worktree-only rollback. The ignored
+`tests/codex_cli.rs` integration uses the installed
+authenticated Codex CLI with `gpt-5.4-mini` at low effort in a temporary Git repository.
+Run it explicitly with `cargo test --manifest-path nvim/rust/diff-review-harness/Cargo.toml
+--test codex_cli -- --ignored --nocapture`. It verifies model discovery, no writes before
+plan acceptance, execution, structured goal completion, resume, and native fork without
+touching this dotfiles worktree.
+
+The ignored `tests/copilot_acp.rs` integration launches the configured
+`copilot --acp` command in a temporary repository and submits the basic read-only
+"What is this repo?" prompt. Run it explicitly with `cargo test --manifest-path
+nvim/rust/diff-review-harness/Cargo.toml --test copilot_acp -- --ignored --nocapture`.
+
+After automated tests, use Terminal MCP to open `:Harness`, `PlanReview`, `:Interactions`,
+and `:Sessions` at both 160x48 and 100x30. Inspect winbars, folds, prompt navigation,
+composer growth, queue editing, and capability-gated actions in a real PTY.
 
 Diagnostics come from `lua-language-server` (`--check`, configured by `nvim/.luarc.json`).
 Most `undefined-field` / `inject-field` volume is the dynamic `dr()` seam, not real bugs.
@@ -856,5 +1059,7 @@ never shows them). See `.rulesync/rules/diff_review.md` -> Linting for the full 
 - **Working on PRs/reviews?** Start at `views/pr/review.lua` and `pr_overview.lua`, with
   `integrations/gh.lua` for the data.
 - **Changing git behavior?** Start at `git/git_data.lua` over `git/git_backend.lua`.
+- **Changing Harness behavior?** Start at `harness/client.lua` and the matching `views/`
+  directory, then follow the JSONL method into `nvim/rust/diff-review-harness/src/broker`.
 - **Anything cross-cutting?** Shared state lives in `session.lua`; a module's own caches
   live in that module; `init.lua` only re-exports functions reached through the `dr()` seam.

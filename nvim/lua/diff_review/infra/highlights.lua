@@ -5,6 +5,7 @@
 local M = {}
 
 function M.setup()
+  local palette = require("theme.palette")
   local function get_bg(name)
     local hl = vim.api.nvim_get_hl(0, { name = name, link = false })
     return hl.bg
@@ -58,6 +59,18 @@ function M.setup()
   vim.api.nvim_set_hl(0, "DiffReviewStatusBranch", { fg = "#f1fa8c", bold = true })
   vim.api.nvim_set_hl(0, "DiffReviewStatusRemote", { fg = "#00afff", bold = true })
   vim.api.nvim_set_hl(0, "DiffReviewStatusLabel", { fg = "#c0c0c0", bold = true })
+  vim.api.nvim_set_hl(0, "DiffReviewHarnessPrompt", { fg = palette.yellow, bold = true })
+  vim.api.nvim_set_hl(0, "DiffReviewHarnessThought", { fg = palette.green, bold = true })
+  vim.api.nvim_set_hl(0, "DiffReviewHarnessGoal", { fg = palette.green, bold = true })
+  vim.api.nvim_set_hl(0, "DiffReviewHarnessRead", { fg = palette.white, bold = true })
+  vim.api.nvim_set_hl(0, "DiffReviewHarnessWrite", { fg = palette.yellow, bold = true })
+  vim.api.nvim_set_hl(0, "DiffReviewHarnessCommentary", { italic = true })
+  vim.api.nvim_set_hl(0, "DiffReviewHarnessCommand", { fg = palette.light_blue, bold = true })
+  vim.api.nvim_set_hl(0, "DiffReviewHarnessOption", { fg = palette.red })
+  vim.api.nvim_set_hl(0, "DiffReviewHarnessArgument", { fg = palette.white })
+  vim.api.nvim_set_hl(0, "DiffReviewHarnessOutput", { fg = palette.gray })
+  vim.api.nvim_set_hl(0, "DiffReviewHarnessToolSuccess", { fg = palette.green })
+  vim.api.nvim_set_hl(0, "DiffReviewHarnessToolFailure", { fg = palette.red })
   vim.api.nvim_set_hl(0, "DiffReviewStatusPR", { fg = "#d4d4d4" })
   vim.api.nvim_set_hl(0, "DiffReviewStatusFetching", { fg = "#9ca3af", italic = true })
   vim.api.nvim_set_hl(0, "DiffReviewHunkContext", {

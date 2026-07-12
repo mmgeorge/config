@@ -61,4 +61,58 @@ M.diff_line_content_lengths = {}
 ---@type table<integer, table>
 M.empty_diff_rows = {}
 
+---@class DiffReviewHarnessPresentationState
+---@field client DiffReviewHarnessClient?
+---@field ready boolean
+---@field busy boolean
+---@field session table?
+---@field capability table
+---@field transcript table[]
+---@field transcript_revision integer
+---@field queue string[]
+---@field transcript_buf integer?
+---@field transcript_win integer?
+---@field composer_buf integer?
+---@field composer_win integer?
+---@field prompt_line integer[]
+---@field activity_range table[]
+---@field activity_view table<string, "collapsed"|"full">
+---@field active_plan table?
+---@field plan_annotations table[]
+---@field no_checkpoint boolean
+---@field interactions table?
+---@field sessions_view table?
+---@field plan_review table?
+---@field command_set DiffReviewViewCommandSet?
+---@field goal table?
+---@field pending_config table?
+---@field pending_mode "read"|"write"?
+
+--- Harness process, view, queue, transcript, and capability state. The broker owns
+--- durable state while this table owns only the current Neovim presentation.
+---@type DiffReviewHarnessPresentationState
+M.harness = {
+  client = nil,
+  ready = false,
+  busy = false,
+  session = nil,
+  capability = {},
+  transcript = {},
+  transcript_revision = 0,
+  queue = {},
+  transcript_buf = nil,
+  transcript_win = nil,
+  composer_buf = nil,
+  composer_win = nil,
+  prompt_line = {},
+  activity_range = {},
+  activity_view = {},
+  active_plan = nil,
+  plan_annotations = {},
+  no_checkpoint = false,
+  interactions = nil,
+  sessions_view = nil,
+  plan_review = nil,
+}
+
 return M

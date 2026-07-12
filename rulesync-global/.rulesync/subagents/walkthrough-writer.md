@@ -7,7 +7,7 @@ description: >-
   generation context remain outside the parent agent.
 codexcli:
   model: gpt-5.6-terra
-  model_reasoning_effort: medium
+  model_reasoning_effort: low
   nickname_candidates:
     - Walkthrough Writer
     - Review Guide Writer

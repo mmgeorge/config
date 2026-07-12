@@ -65,7 +65,8 @@ return {
               "snacks_picker_input",
               "snacks_picker_list",
               "snacks_layout_box",
-              "NeogitStatus"
+              "NeogitStatus",
+              "HarnessInput",
             },
             statusline = {
               -- "snacks_picker_input",

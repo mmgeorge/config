@@ -3,7 +3,10 @@ return {
     "diff-review-local",
     dir = vim.fn.stdpath("config"),
     dependencies = { "folke/snacks.nvim" },
-    cmd = { "GitStatus", "GitBranchDiff", "GitBranchDiffFile", "GitFileRevision", "GitDiffCompactPreview" },
+    cmd = {
+      "GitStatus", "GitBranchDiff", "GitBranchDiffFile", "GitFileRevision", "GitDiffCompactPreview",
+      "Harness", "HarnessNew", "Interactions", "Sessions",
+    },
     opts = {
       perf_logging = true,
       status_cursor_prewarm = true,
@@ -18,6 +21,18 @@ return {
       vim.api.nvim_create_user_command("GitStatus", function()
         diff_review.open()
       end, { desc = "Review git changes" })
+      vim.api.nvim_create_user_command("Harness", function()
+        diff_review.open_harness()
+      end, { desc = "Open the DiffReview AI Harness" })
+      vim.api.nvim_create_user_command("HarnessNew", function()
+        diff_review.new_harness_session()
+      end, { desc = "Create a fresh Harness session" })
+      vim.api.nvim_create_user_command("Interactions", function()
+        diff_review.open_interactions()
+      end, { desc = "Review and roll back Harness interactions" })
+      vim.api.nvim_create_user_command("Sessions", function()
+        diff_review.open_sessions()
+      end, { desc = "Browse Harness sessions" })
       local function complete_branches(arglead)
         local refs = vim.fn.systemlist({ "git", "for-each-ref", "--format=%(refname:short)", "refs/heads", "refs/remotes" })
         if vim.v.shell_error ~= 0 then return {} end

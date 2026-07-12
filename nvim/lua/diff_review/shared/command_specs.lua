@@ -78,6 +78,55 @@ M.hint_command_ids_by_view = {
   },
 }
 
+---@type table<string, DiffReviewStatusCommandSpec[]>
+M.view_specs = {
+  harness = {
+    { id = "submit", label = "send", desc = "Submit the composer", modes = { "n", "i" }, pinned = true },
+    { id = "edit_queued", label = "edit queued", desc = "Remove and edit the newest queued prompt", modes = { "n", "i" }, pinned = true },
+    { id = "toggle_mode", label = "mode", desc = "Toggle Read and Write mode", modes = { "n", "i" }, pinned = true },
+    { id = "previous_prompt", label = "previous", desc = "Jump to the previous user prompt", modes = "n", pinned = false },
+    { id = "next_prompt", label = "next", desc = "Jump to the next user prompt", modes = "n", pinned = false },
+    { id = "toggle_activity", label = "activity", desc = "Toggle complete tool output", modes = "n", pinned = true },
+    { id = "model", label = "model", desc = "Select the model at the next safe boundary", modes = "n", pinned = false },
+    { id = "effort_down", label = "effort-", desc = "Decrease reasoning effort", modes = "n", pinned = false },
+    { id = "effort_up", label = "effort+", desc = "Increase reasoning effort", modes = "n", pinned = false },
+    { id = "close", label = "close", desc = "Close Harness", modes = "n", pinned = true },
+    { id = "help", label = "help", desc = "Show Harness help", modes = "n", pinned = true },
+  },
+  plan_review = {
+    { id = "comment", label = "comment", desc = "Annotate the current plan line", modes = "n", pinned = true },
+    { id = "accept", label = "accept", desc = "Accept the exact saved plan and execute it", modes = "n", pinned = true },
+    { id = "request_changes", label = "changes", desc = "Save edits and request a complete revised plan", modes = "n", pinned = true },
+    { id = "close", label = "close", desc = "Return to Harness without deciding", modes = "n", pinned = true },
+    { id = "help", label = "help", desc = "Show PlanReview help", modes = "n", pinned = true },
+  },
+  interactions = {
+    { id = "toggle", label = "toggle", desc = "Toggle an interaction or file fold", modes = "n", pinned = true },
+    { id = "comment", label = "comment", desc = "Annotate a changed line", modes = "n", pinned = true },
+    { id = "request_changes", label = "changes", desc = "Send interaction diff comments to the agent", modes = "n", pinned = true },
+    { id = "rollback", label = "rollback", desc = "Restore the workspace before this interaction", modes = "n", pinned = true },
+    { id = "refresh", label = "refresh", desc = "Reload interaction history", modes = "n", pinned = false },
+    { id = "close", label = "close", desc = "Close Interactions", modes = "n", pinned = true },
+    { id = "help", label = "help", desc = "Show Interactions help", modes = "n", pinned = true },
+  },
+  sessions = {
+    { id = "open", label = "open", desc = "Resume the selected same-worktree session", modes = "n", pinned = true },
+    { id = "tab_next", label = "scope", desc = "Switch Current Repo and All Repos", modes = "n", pinned = true },
+    { id = "fork", label = "fork", desc = "Fork through the backend's native session API", modes = "n", pinned = true },
+    { id = "rename", label = "rename", desc = "Rename Harness-owned session metadata", modes = "n", pinned = false },
+    { id = "delete", label = "delete", desc = "Delete Harness state while preserving the provider session", modes = "n", pinned = false },
+    { id = "refresh", label = "refresh", desc = "Reload sessions", modes = "n", pinned = false },
+    { id = "close", label = "close", desc = "Close Sessions", modes = "n", pinned = true },
+    { id = "help", label = "help", desc = "Show Sessions help", modes = "n", pinned = true },
+  },
+}
+
+M.view_spec_by_id = {}
+for group, spec_list in pairs(M.view_specs) do
+  M.view_spec_by_id[group] = {}
+  for _, spec in ipairs(spec_list) do M.view_spec_by_id[group][spec.id] = spec end
+end
+
 ---@type table<string, DiffReviewStatusCommandSpec>
 M.by_id = {}
 for _, spec in ipairs(M.specs) do

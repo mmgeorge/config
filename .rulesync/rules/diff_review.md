@@ -3,6 +3,8 @@ globs:
   - 'nvim/lua/diff_review/**/*'
   - 'nvim/tests/diff_review/**/*'
   - 'nvim/lua/plugins/diff_review.lua'
+  - 'nvim/lua/rust_sidecar/**/*'
+  - 'nvim/rust/diff-review-harness/**/*'
 ---
 
 # DiffReview Plugin Rules
@@ -17,10 +19,76 @@ The public commands are `:GitStatus`, `:GitBranchDiff <branch>` (read-only diff
 of the working tree against a branch or revision),
 `:GitBranchDiffFile <file> <branch>` (same, limited to one file), and
 `:GitFileRevision <file> <commit>` (read-only buffer with the file's content at
-a revision), registered by `nvim/lua/plugins/diff_review.lua`. The plugin
+a revision), `:Harness`, `:HarnessNew`, `:Interactions`, and `:Sessions`,
+registered by `nvim/lua/plugins/diff_review.lua`. The plugin
 entrypoints are `require("diff_review").open()`,
 `require("diff_review").open_branch_diff(branch, { file = ... })`, and
-`require("diff_review").open_file_revision(file, rev)`.
+`require("diff_review").open_file_revision(file, rev)`, plus the corresponding
+Harness open functions on the same facade.
+
+Harness keeps Lua presentation state in `session.harness` and durable state in
+`nvim/rust/diff-review-harness`. Keep the Rust crate feature-first. Use the
+`broker`, `session`, `plan`, `goal`, `interaction`, `checkpoint`, `backend`,
+`storage`, `workspace`, `protocol`, and `control_tools` directories. Do not add
+generic `application`, `domain`, or `ports` layers.
+
+Only the Harness transcript window owns the winbar. Clear the composer winbar.
+Start the transcript winbar with `Read` or `Write`, omit the redundant Harness
+title and trust-profile suffix, then name the underlying CLI/provider and
+resolved runtime model rather than only the adapter kind or configured `default` sentinel.
+Resolve the Codex default through `model/list`, persist `provider_label` and
+`resolved_model` on the Harness session, and show an explicit resolving state
+until provider metadata arrives. Stream provider events into the transcript
+before the final response, but discard Codex `userMessage` lifecycle echoes
+because the broker already records each admitted user action.
+
+Render every explicit assistant delta and tool lifecycle update on the Neovim
+main loop without coalescing distinct provider events into one visual frame.
+Never classify arbitrary lifecycle string fields as assistant prose. Route
+token-usage notifications into final turn metadata. Render user prompts with
+`>` and aligned continuation rows, omit `You` and `Assistant` labels, indent
+assistant Markdown, and replace the streaming `▸ Thinking…` marker with
+`▸ Thought for <duration>, <tokens>` at completion. Guard snapshots with a
+transcript revision so initialization and state reconciliation cannot flash an
+older empty transcript over optimistic or streamed content.
+
+Normalize each provider tool lifecycle by its stable call ID. Keep complete
+tool output in durable state, but render commands as one Codex-style preview:
+the command, first output line, folded middle-line count, and last output line.
+`oa` expands the native fold to show every real output row. While any request
+runs, append a transient `Working (Ns)` row, update it once per second, keep the
+transcript at the tail unless the user is actively inspecting it, and remove
+the row without persisting it when the request finishes.
+
+Map `Shift-Tab` in both normal and insert mode to toggle Read and Write through
+the durable broker `mode.set` method. Queue a busy-turn toggle for the next safe
+boundary and mark the pending winbar mode with `*`. Preserve the explicit
+confirmation before enabling Write without Git checkpoints.
+
+Every `/plan` result must stop in a physical editable `PlanReview` file before
+execution. Accept only an explicit `harness_plan_submit` result or a complete
+native plan artifact. `oY` accepts the exact saved digest and starts the visible
+`Complete the plan` goal. `oN` sends the full edited plan, its diff against the
+last model revision, and every extmark-anchored annotation back for revision.
+ACP planning should select a provider-advertised plan or architect mode through
+`session/set_mode` when one exists. The control-tool normalizer must recognize
+exact structured tool names, never names printed inside prose or command output.
+Copilot ACP does not advertise model selection. Retry an initial session's exact
+unsupported-model failure once through a fresh ACP process and session. Preserve
+established sessions and surface actionable provider model guidance instead of
+discarding their context, looping, or silently changing models.
+
+One Harness interaction starts with one admitted user action. Automatic goal
+continuations stay in that interaction until another user action starts the next
+record. Render admitted review actions separately from typed questions so prompt
+navigation remains exact. Keep the 20-total-turn limit and the
+two-consecutive-no-progress guard. A tool call or workspace change resets the
+no-progress count. A failed backend turn pauses the goal before the client
+reconciles durable state, preventing an automatic retry loop.
+
+Native fork must remain capability gated. When the backend or ACP agent cannot
+fork, omit the mapping, hint, help entry, and action. Do not copy transcripts or
+offer a warning-confirm fallback.
 
 Pressing open on a deleted (left-side) diff line opens a file revision buffer
 (`GitFileRevision://<path>@<short sha>`, owned by `M._file_revision`) at the
@@ -300,6 +368,33 @@ Run the mocked integration test:
 ```text
 nvim --headless -i NONE --cmd "set shadafile=NONE" -u nvim/init.lua -c "lua vim.loader.enable(false)" -S nvim/tests/diff_review/mock_backend.lua
 ```
+
+Run the Harness UI/process mock:
+
+```text
+nvim --headless -i NONE --cmd "set shadafile=NONE" -u nvim/init.lua -c "lua vim.loader.enable(false)" -S nvim/tests/diff_review/harness.lua
+```
+
+Run the Rust broker suite:
+
+```text
+cargo test --manifest-path nvim/rust/diff-review-harness/Cargo.toml
+```
+
+Run the opt-in real Codex integration only in its temporary Git repository:
+
+```text
+cargo test --manifest-path nvim/rust/diff-review-harness/Cargo.toml --test codex_cli -- --ignored --nocapture
+```
+
+Run the opt-in real ACP prompt integration through Copilot CLI:
+
+```text
+cargo test --manifest-path nvim/rust/diff-review-harness/Cargo.toml --test copilot_acp -- --ignored --nocapture
+```
+
+After automated verification, use Terminal MCP at 160x48 and 100x30 to inspect
+the live Harness, PlanReview, Interactions, and Sessions buffers.
 
 Run the GitHub integration test:
 

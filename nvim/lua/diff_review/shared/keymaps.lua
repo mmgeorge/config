@@ -551,4 +551,142 @@ M.status_command_visible = status_command_visible
 M.status_keys_for = status_keys_for
 M.setup_status_keymaps = setup_status_keymaps
 
+---@param group string
+---@param command_id string
+---@return string[]
+function M.view_keys_for(group, command_id)
+  local options = M.config or config.options or config.defaults
+  local keymap_group = options.keymaps and options.keymaps[group] or {}
+  local key = keymap_group and keymap_group[command_id]
+  if key == false or key == nil then return {} end
+  if type(key) == "table" then return vim.deepcopy(key) end
+  return { key }
+end
+
+---@param buf integer
+---@param group string
+---@param command_set DiffReviewViewCommandSet
+---@param context? table
+function M.setup_view_keymaps(buf, group, command_set, context)
+  context = context or {}
+  local spec_by_id = command_specs.view_spec_by_id[group] or {}
+  for _, command_id in ipairs(command_set.order or {}) do
+    local action = command_set.action_by_id[command_id]
+    local spec = spec_by_id[command_id]
+    if action and spec and (not action.enabled or action.enabled(context)) then
+      local modes = type(spec.modes) == "table" and spec.modes or { spec.modes or "n" }
+      for _, key in ipairs(M.view_keys_for(group, command_id)) do
+        vim.keymap.set(modes, key, function()
+          require("diff_review.shared.view_command_set").dispatch(command_set, command_id, context)
+        end, { buffer = buf, silent = true, nowait = true, desc = spec.desc })
+      end
+    end
+  end
+end
+
+---@param group string
+---@param command_set DiffReviewViewCommandSet
+---@param context? table
+---@return string
+function M.view_hint(group, command_set, context)
+  context = context or {}
+  local spec_by_id = command_specs.view_spec_by_id[group] or {}
+  local segment = {}
+  for _, command_id in ipairs(command_set.order or {}) do
+    local action = command_set.action_by_id[command_id]
+    local spec = spec_by_id[command_id]
+    local key = M.view_keys_for(group, command_id)[1]
+    if action and spec and spec.pinned and key and (not action.enabled or action.enabled(context)) then
+      segment[#segment + 1] = key .. " " .. spec.label
+    end
+  end
+  return table.concat(segment, " | ")
+end
+
+---@param win integer
+---@param title string
+---@param group string
+---@param command_set DiffReviewViewCommandSet
+---@param status? string|{ text: string, group: string }[]
+---@param context? table
+function M.apply_view_winbar(win, title, group, command_set, status, context)
+  if not (win and vim.api.nvim_win_is_valid(win)) then return end
+  local title_text = tostring(title or "")
+  local status_segment_list = type(status) == "table" and status or nil
+  local status_text = status_segment_list and table.concat(vim.tbl_map(function(segment)
+    return segment.text
+  end, status_segment_list)) or tostring(status or "")
+  local status_rendered = status_segment_list and table.concat(vim.tbl_map(function(segment)
+    return ("%%#%s#%s%%*"):format(segment.group, segment.text:gsub("%%", "%%%%"))
+  end, status_segment_list)) or nil
+  local hint_text = M.view_hint(group, command_set, context)
+  local full_width = vim.fn.strdisplaywidth(title_text) + vim.fn.strdisplaywidth(status_text) + vim.fn.strdisplaywidth(hint_text) + 4
+  local left_text = title_text ~= "" and title_text or status_text
+  local center_text = title_text ~= "" and status_text or ""
+  local left = left_text:gsub("%%", "%%%%")
+  local center = center_text:gsub("%%", "%%%%")
+  if full_width <= vim.api.nvim_win_get_width(win) then
+    local hint = hint_text:gsub("%%", "%%%%")
+    if status_rendered then
+      local rendered_left = title_text ~= "" and ("%%#DiffReviewStatusLabel#%s%%*"):format(left) or status_rendered
+      local rendered_center = title_text ~= "" and status_rendered or ""
+      vim.wo[win].winbar = ("%s%%=%s%%=%%#DiffReviewStatusHint#%s%%*"):format(rendered_left, rendered_center, hint)
+      return
+    end
+    vim.wo[win].winbar = ("%%#DiffReviewStatusLabel#%s%%*%%=%%#DiffReviewStatusHint#%s%%*%%=%%#DiffReviewStatusHint#%s%%*")
+      :format(left, center, hint)
+    return
+  end
+  local help_action = command_set.action_by_id.help
+  local help_key = help_action and M.view_keys_for(group, "help")[1] or nil
+  local help_hint = help_key and (help_key .. " help"):gsub("%%", "%%%%") or ""
+  local help_section = help_hint ~= "" and ("%%=%%#DiffReviewStatusHint#%s%%*"):format(help_hint) or ""
+  if status_rendered then
+    local rendered_left = title_text ~= "" and ("%%#DiffReviewStatusLabel#%s%%*"):format(left) or status_rendered
+    local rendered_center = title_text ~= "" and status_rendered or ""
+    vim.wo[win].winbar = ("%s  %s%s"):format(rendered_left, rendered_center, help_section)
+    return
+  end
+  vim.wo[win].winbar = ("%%#DiffReviewStatusLabel#%s%%*  %%#DiffReviewStatusHint#%s%%*%s"):format(left, center, help_section)
+end
+
+---@param group string
+---@param command_set DiffReviewViewCommandSet
+---@param title string
+---@param context? table
+function M.show_view_help(group, command_set, title, context)
+  context = context or {}
+  local spec_by_id = command_specs.view_spec_by_id[group] or {}
+  local line = { title, "" }
+  for _, command_id in ipairs(command_set.order or {}) do
+    local action = command_set.action_by_id[command_id]
+    local spec = spec_by_id[command_id]
+    local keys = M.view_keys_for(group, command_id)
+    if action and spec and #keys > 0 and (not action.enabled or action.enabled(context)) then
+      line[#line + 1] = ("  %-12s %s"):format(table.concat(keys, ", "), spec.desc)
+    end
+  end
+  local width = math.min(80, math.max(40, vim.o.columns - 8))
+  local height = math.min(#line + 2, math.max(6, vim.o.lines - 6))
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[buf].buftype = "nofile"
+  vim.bo[buf].bufhidden = "wipe"
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, line)
+  vim.bo[buf].modifiable = false
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative = "editor",
+    row = math.floor((vim.o.lines - height) / 2),
+    col = math.floor((vim.o.columns - width) / 2),
+    width = width,
+    height = height,
+    border = "rounded",
+    style = "minimal",
+    title = " " .. title .. " ",
+    title_pos = "center",
+  })
+  vim.keymap.set("n", "q", function() if vim.api.nvim_win_is_valid(win) then vim.api.nvim_win_close(win, true) end end,
+    { buffer = buf, silent = true, nowait = true, desc = "Close help" })
+end
+
 return M

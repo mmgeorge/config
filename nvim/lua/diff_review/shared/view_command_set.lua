@@ -25,6 +25,20 @@ function M.register(set, id, run, opts)
   set.action_by_id[id] = { id = id, run = run, enabled = opts and opts.enabled or nil }
 end
 
+--- Unregister a view command so unsupported capabilities disappear from hints and help.
+---@param set DiffReviewViewCommandSet
+---@param id string
+function M.unregister(set, id)
+  if not set.action_by_id[id] then return end
+  set.action_by_id[id] = nil
+  for index, command_id in ipairs(set.order) do
+    if command_id == id then
+      table.remove(set.order, index)
+      return
+    end
+  end
+end
+
 ---@param set DiffReviewViewCommandSet
 ---@param id string
 ---@return DiffReviewViewCommandAction?

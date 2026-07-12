@@ -1,5 +1,7 @@
 ---@class DiffReviewNotificationsModule
 ---@field error fun(message: string, title?: string)
+---@field warn fun(message: string, title?: string)
+---@field info fun(message: string, title?: string)
 ---@field format_failures fun(failures: DiffReviewGitFailure[]): string
 ---@field git_failures fun(title: string, failures: DiffReviewGitFailure[])
 ---@field debug fun(message: string, level?: integer, opts?: table)
@@ -11,6 +13,18 @@ local config = require("diff_review.infra.config")
 ---@param title? string
 function M.error(message, title)
   vim.notify(message, vim.log.levels.ERROR, { title = title or "Diff Review" })
+end
+
+---@param message string
+---@param title? string
+function M.warn(message, title)
+  vim.notify(message, vim.log.levels.WARN, { title = title or "Diff Review" })
+end
+
+---@param message string
+---@param title? string
+function M.info(message, title)
+  vim.notify(message, vim.log.levels.INFO, { title = title or "Diff Review" })
 end
 
 ---@param failures DiffReviewGitFailure[]

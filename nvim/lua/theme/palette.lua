@@ -1,0 +1,15 @@
+return {
+  red = "#ef3573",
+  off_white = "#ccdbed",
+  green = "#5bff94",
+  yellow = "#ffe18e",
+  gray = "#696969",
+  light_gray = "#8a929c",
+  white = "#ffffff",
+  light_blue = "#3ec5ff",
+  teal = "#9dffe7",
+  dark_gray = "#151515",
+  black = "#000000",
+  visual = "#303136",
+  error = "red",
+}

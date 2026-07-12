@@ -23,6 +23,10 @@
 ---       Open a file read-only as it existed at a git revision.
 ---   :GitDiffCompactPreview[!]
 ---       Preview the compacted unified diff (with `!`, the staged diff).
+---   :Harness / :HarnessNew
+---       Open the AI transcript/composer or start a fresh durable Harness session.
+---   :Interactions / :Sessions
+---       Review per-user-action diffs and browse durable repository/global sessions.
 ---
 --- GitHub PR review surfaces (the PR overview, in-place PR title/body/reviewer
 --- editing, and the batched review mode with draft comments + verdict) are
@@ -112,6 +116,10 @@
 ---   PR overview     Metadata, checks, review summaries, inline comments.
 ---   Review          Draft-comment CRUD, viewed-state, verdict, submission.
 ---   Walkthrough     LLM-authored guided review: summary + anchored comment boxes.
+---   Harness         Real-line AI transcript plus a multiline composer split.
+---   PlanReview      Physical Markdown plan with edits, annotations, and oY/oN decisions.
+---   Interactions    Foldable session interaction diffs with review and rollback.
+---   Sessions        Current Repo / All Repos Harness session browser.
 ---
 --- ===========================================================================
 --- ARCHITECTURE  (see lua/diff_review/docs/architecture.md for the full reference)
@@ -246,6 +254,10 @@ M.open_review = commands.open_review
 M.open_branch_diff = commands.open_branch_diff
 M.open_file_revision = commands.open_file_revision
 M.open_compact_preview = commands.open_compact_preview
+M.open_harness = function() require("diff_review.views.harness").open() end
+M.new_harness_session = function() require("diff_review.views.harness").new_session() end
+M.open_interactions = function() require("diff_review.views.interactions").open() end
+M.open_sessions = function() require("diff_review.views.sessions").open() end
 M.set_git_backend = git_backend.set_backend
 M.reset_git_backend = git_backend.reset_backend
 
