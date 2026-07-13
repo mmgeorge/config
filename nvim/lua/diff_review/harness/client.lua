@@ -76,6 +76,13 @@ end
 local function dispatch_message(message)
   local client = state()
   if message.event then
+    if client.snapshot and (message.event == "plan_question" or message.event == "plan_question_updated") then
+      client.snapshot.active_plan = vim.deepcopy(message.payload and message.payload.plan or nil)
+    elseif client.snapshot and (message.event == "question" or message.event == "question_updated") then
+      client.snapshot.active_elicitation = vim.deepcopy(message.payload)
+    elseif client.snapshot and message.event == "question_answered" then
+      client.snapshot.active_elicitation = nil
+    end
     for _, subscriber in pairs(client.subscriber) do
       local ok, err = pcall(subscriber, message.event, message.payload)
       if not ok then notifications.error("Harness event subscriber failed: " .. tostring(err), "Harness") end
@@ -98,6 +105,15 @@ local function dispatch_message(message)
       end
     end
   else
+    if pending.method == "state.get" then
+      client.snapshot = message.result
+    elseif pending.method == "history.record" and client.snapshot then
+      client.snapshot.prompt_history = vim.deepcopy(message.result or {})
+    elseif (pending.method == "question.answer" or pending.method == "question.skip")
+      and client.snapshot
+    then
+      client.snapshot = vim.deepcopy(message.result)
+    end
     pending.callback(message.result, nil)
   end
 end
@@ -265,7 +281,7 @@ end
 
 ---@param method string
 ---@param params? table
----@param callback? fun(result?: any, error?: string)
+---@param callback? fun(result?: any, error?: string, error_detail?: table)
 function M.request(method, params, callback)
   callback = callback or function() end
   M.start(function(_, start_error)

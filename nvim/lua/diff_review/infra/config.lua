@@ -58,11 +58,17 @@
 
 ---@class DiffReviewHarnessKeymapConfig
 ---@field submit DiffReviewKeymap
+---@field steer DiffReviewKeymap
+---@field cancel DiffReviewKeymap
 ---@field edit_queued DiffReviewKeymap
 ---@field toggle_mode DiffReviewKeymap
 ---@field previous_prompt DiffReviewKeymap
 ---@field next_prompt DiffReviewKeymap
+---@field history_previous DiffReviewKeymap
+---@field history_next DiffReviewKeymap
 ---@field toggle_activity DiffReviewKeymap
+---@field open_artifact DiffReviewKeymap
+---@field reopen_question DiffReviewKeymap
 ---@field model DiffReviewKeymap
 ---@field effort_down DiffReviewKeymap
 ---@field effort_up DiffReviewKeymap
@@ -75,6 +81,19 @@
 ---@field request_changes DiffReviewKeymap
 ---@field close DiffReviewKeymap
 ---@field help DiffReviewKeymap
+
+---@class DiffReviewPlanQuestionKeymapConfig
+---@field previous DiffReviewKeymap
+---@field next DiffReviewKeymap
+---@field select DiffReviewKeymap
+---@field feedback DiffReviewKeymap
+---@field question_previous DiffReviewKeymap
+---@field question_next DiffReviewKeymap
+---@field focus_input DiffReviewKeymap
+---@field submit_input DiffReviewKeymap
+---@field confirm DiffReviewKeymap
+---@field revise DiffReviewKeymap
+---@field close DiffReviewKeymap
 
 ---@class DiffReviewInteractionKeymapConfig
 ---@field toggle DiffReviewKeymap
@@ -100,6 +119,7 @@
 ---@field review DiffReviewReviewKeymapConfig
 ---@field harness DiffReviewHarnessKeymapConfig
 ---@field plan_review DiffReviewPlanReviewKeymapConfig
+---@field plan_question DiffReviewPlanQuestionKeymapConfig
 ---@field interactions DiffReviewInteractionKeymapConfig
 ---@field sessions DiffReviewSessionKeymapConfig
 
@@ -126,6 +146,7 @@
 ---@field composer_min_height integer
 ---@field composer_max_height integer
 ---@field goal_max_turns integer
+---@field question_choice_keys string[]
 ---@field non_git_write_confirm boolean
 ---@field backends table<string, DiffReviewHarnessBackendConfig>
 ---@field trust_profile string
@@ -171,6 +192,7 @@ M.defaults = {
     composer_min_height = 3,
     composer_max_height = 12,
     goal_max_turns = 20,
+    question_choice_keys = { "n", "e", "i", "l", "u", "y" },
     non_git_write_confirm = true,
     backends = {
       acp = { command = { "copilot", "--acp" } },
@@ -224,11 +246,17 @@ M.defaults = {
     },
     harness = {
       submit = "<C-s>",
+      steer = "<C-q>",
+      cancel = "<C-c>",
       edit_queued = "<M-s>",
       toggle_mode = "<S-Tab>",
       previous_prompt = "<C-y>",
       next_prompt = "<C-z>",
+      history_previous = "<Up>",
+      history_next = "<Down>",
       toggle_activity = { "oa", "<Tab>" },
+      open_artifact = "op",
+      reopen_question = "oe",
       model = "oM",
       effort_down = "<M-,>",
       effort_up = "<M-.>",
@@ -241,6 +269,19 @@ M.defaults = {
       request_changes = "oN",
       close = "q",
       help = "?",
+    },
+    plan_question = {
+      previous = { "<Up>", "s" },
+      next = { "<Down>", "t" },
+      select = "<CR>",
+      feedback = "<Tab>",
+      question_previous = "<Left>",
+      question_next = "<Right>",
+      focus_input = "go",
+      submit_input = "<C-s>",
+      confirm = "y",
+      revise = "n",
+      close = "q",
     },
     interactions = {
       toggle = "<Tab>",
@@ -288,6 +329,15 @@ function M.setup(opts)
   if not options.harness.trust_profiles[options.harness.trust_profile] then
     error("harness.trust_profile must name a configured trust profile")
   end
+  local question_key_set = {}
+  for _, key in ipairs(options.harness.question_choice_keys or {}) do
+    if key == "a" or key == "o" then
+      error(('harness.question_choice_keys cannot contain reserved key "%s"'):format(key))
+    end
+    if question_key_set[key] then error("harness.question_choice_keys must be unique") end
+    question_key_set[key] = true
+  end
+  if vim.tbl_isempty(question_key_set) then error("harness.question_choice_keys cannot be empty") end
   M.options = options
   return M.options
 end

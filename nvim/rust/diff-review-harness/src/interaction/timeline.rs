@@ -49,6 +49,8 @@ pub struct CompletedThought {
     pub checkpoint_before: Option<String>,
     pub checkpoint_after: Option<String>,
     pub diff_text: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
 }
 
 /// Carries every visible state transition caused by one normalized backend event.
@@ -228,6 +230,7 @@ fn complete(active: ActiveThought, now_ms: i64) -> CompletedThought {
         checkpoint_before: None,
         checkpoint_after: None,
         diff_text: None,
+        task_id: None,
     }
 }
 
@@ -258,7 +261,7 @@ mod test {
             data: Value::Null,
             activity: None,
             summary: None,
-            plan_progress: None,
+            task_update: None,
         }
     }
 
@@ -276,7 +279,7 @@ mod test {
                 output_delta: false,
             }),
             summary: None,
-            plan_progress: None,
+            task_update: None,
         }
     }
 

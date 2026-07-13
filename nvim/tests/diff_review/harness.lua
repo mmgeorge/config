@@ -84,6 +84,7 @@ local request_by_method = {}
 local goal_continue_count = 0
 local prompt_count = 0
 local launched_binary = nil
+local active_plan = nil
 
 local function emit(options, message)
   vim.schedule(function() options.stdout(nil, vim.json.encode(message) .. "\n") end)
@@ -171,12 +172,18 @@ local function fake_launcher(command, options, _)
         },
       } })
       if request.params.text:match("^/plan ") then
-        emit(options, { event = "plan_review", payload = {
+        active_plan = {
           id = "plan-one",
           session_id = active_session.id,
+          title = "Inspect the feature",
           state = "awaiting_review",
           working_path = plan_path,
           review_digest = "digest",
+        }
+        emit(options, { event = "plan_created", payload = {
+          plan = active_plan,
+          lifecycle = { id = "lifecycle-one", kind = "created" },
+          content = "# Plan\n\n1. Review the implementation.",
         } })
       end
       if request.params.text == "hello harness" then
@@ -273,7 +280,14 @@ local function fake_launcher(command, options, _)
         capability = { native_fork = false },
         no_checkpoint = false,
         goal = { objective = "fail", state = "paused" },
+        active_plan = active_plan,
+        artifact = active_plan and { active_plan } or {},
       } })
+    elseif request.method == "plan.activate" then
+      emit(options, { id = request.id, result = active_plan })
+    elseif request.method == "plan.accept" then
+      emit(options, { event = "goal_changed", payload = { objective = "Complete the plan", state = "complete" } })
+      emit(options, { id = request.id, result = { session = active_session } })
     elseif request.method == "shutdown" then
       emit(options, { id = request.id, result = { shutdown = true } })
     else
@@ -754,57 +768,95 @@ local ok, failure = pcall(function()
     "expanding a tool summary should reveal command headers")
   assert_true(not vim.tbl_contains(transcript_line, "    └ # Rendering"),
     "command headers should initially hide their output")
-  local plan_progress = {
-    id = "turn-plan",
-    status = "inProgress",
-    step_list = {
-      { text = "Inventory the repository", status = "completed" },
-      { text = "Trace configuration boundaries", status = "inProgress" },
-      { text = "Synthesize the analysis", status = "pending" },
+  local task_snapshot = {
+    scope_id = "turn-plan",
+    revision = 1,
+    current = {
+      { id = "task-1", title = "Inventory the repository", status = "completed" },
+      { id = "task-2", title = "Trace configuration boundaries", status = "in_progress" },
+      { id = "task-3", title = "Synthesize the analysis", status = "pending" },
     },
   }
   local active_plan = interaction_renderer.build({ {
     id = "plan-interaction",
-    prompt = "analyze the repo",
+    prompt = "/plan analyze the repo",
+    kind = "plan_draft",
     state = "running",
     thought = {},
     active = { text = "Working", tool_count = 0, failed_count = 0 },
+    task = task_snapshot,
   } }, {
     working_seconds = 1,
-    plan_progress = plan_progress,
-    active_interaction_id = "plan-interaction",
   })
-  assert_equals(active_plan.lines[4], "• Plan",
-    "native plan updates should render as one structured status row")
-  assert_equals(active_plan.lines[5], "  [x] Inventory the repository",
-    "active plans should show their current checklist by default")
-  assert_equals(active_plan.lines[6], "  [-] Trace configuration boundaries",
-    "active plans should update the in-progress checklist row")
-  assert_equals(active_plan.lines[7], "  [ ] Synthesize the analysis",
-    "active plans should show pending checklist rows")
-  assert_equals(#active_plan.lines, 7,
-    "active plans should not append a duplicate elapsed-work row")
-  assert_equals(#active_plan.folds, 0, "active plan progress should not expose a mutable fold")
-  plan_progress.status = "completed"
-  plan_progress.name = "Repository analysis"
-  for _, step in ipairs(plan_progress.step_list) do step.status = "completed" end
+  assert_true(vim.tbl_contains(active_plan.lines, "▸ Planning for 1s"),
+    "Harness planning should use a dedicated inline summary")
+  assert_true(vim.tbl_contains(active_plan.lines, "● Inventory the repository"),
+    "active planning should show completed provider tasks inline")
+  assert_true(vim.tbl_contains(active_plan.lines, "◐ Trace configuration boundaries"),
+    "active planning should show the provider's current task inline")
+  assert_true(vim.tbl_contains(active_plan.lines, "○ Synthesize the analysis"),
+    "active planning should show pending provider tasks inline")
+  assert_true(not vim.tbl_contains(active_plan.lines, "• Plan"),
+    "provider tasks should never reappear as a tail-only plan block")
+  for _, task in ipairs(task_snapshot.current) do task.status = "completed" end
   local completed_plan = interaction_renderer.build({ {
     id = "plan-interaction",
-    prompt = "analyze the repo",
+    prompt = "/plan analyze the repo",
+    kind = "plan_draft",
     state = "complete",
     duration_ms = 1000,
     thought = {},
-  } }, {
-    plan_progress = plan_progress,
-    active_interaction_id = "plan-interaction",
-  })
-  assert_equals(completed_plan.lines[3], "• Plan Repository analysis Complete",
-    "completed named plans should emit a final completion row")
-  assert_equals(completed_plan.lines[6], "  [x] Synthesize the analysis",
-    "completed plans should retain the final checklist for native fold expansion")
-  assert_true(vim.iter(completed_plan.folds):any(function(fold)
-    return fold.key == "plan:turn-plan" and fold.folded == true
-  end), "completed plan checklists should publish one stable folded range")
+    task = task_snapshot,
+  } })
+  assert_true(vim.tbl_contains(completed_plan.lines, "▸ Planned for 1s"),
+    "completed planning should retain its dedicated summary")
+  assert_true(vim.tbl_contains(completed_plan.lines, "● Synthesize the analysis"),
+    "completed provider tasks should remain inline with their interaction")
+  assert_equals(#completed_plan.folds, 0,
+    "provider task state should use semantic expansion instead of native folds")
+  local lifecycle_collapsed = interaction_renderer.build({ {
+    kind = "plan_lifecycle",
+    id = "lifecycle-created",
+    lifecycle = { id = "lifecycle-created", kind = "created" },
+    content = "# Streaming plan\n\nUse one timeline projection.",
+  } }, { expanded = {} })
+  assert_equals(lifecycle_collapsed.lines[1], "▸ Plan created",
+    "plan creation should render as one inline lifecycle node")
+  assert_true(not vim.tbl_contains(lifecycle_collapsed.lines, "  ▸ Content"),
+    "collapsed lifecycle nodes should hide artifact content")
+  local lifecycle_expanded = interaction_renderer.build({ {
+    kind = "plan_lifecycle",
+    id = "lifecycle-created",
+    lifecycle = { id = "lifecycle-created", kind = "created" },
+    content = "# Streaming plan\n\nUse one timeline projection.",
+  } }, { expanded = { ["plan_lifecycle:lifecycle-created"] = true } })
+  assert_true(vim.tbl_contains(lifecycle_expanded.lines, "  ▸ Content"),
+    "expanded lifecycle nodes should reveal artifact content")
+  assert_equals(#lifecycle_expanded.markdown_ranges, 1,
+    "expanded plan content should register one markdown region")
+  local attributed_execution = interaction_renderer.build({ {
+    kind = "plan_execution",
+    id = "execution-one",
+    execution = { state = "complete" },
+    interaction = { {
+      id = "execution-interaction",
+      state = "complete",
+      duration_ms = 1000,
+      task = { current = { { id = "task-one", title = "Rewrite core", status = "completed" } } },
+      thought = { {
+        id = "thought-one",
+        text = "Rewriting core.",
+        task_id = "task-one",
+        tool = {},
+      } },
+    } },
+  } }, { expanded = { ["interaction:execution-one:task:task-one"] = true } })
+  assert_true(vim.tbl_contains(attributed_execution.lines, "▸ Executed plan (1/1) for 1s"),
+    "accepted plan execution should render as one grouped timeline node")
+  assert_true(vim.tbl_contains(attributed_execution.lines, "● Rewrite core"),
+    "execution should render the provider's final task presentation")
+  assert_true(vim.tbl_contains(attributed_execution.lines, "↳ Rewriting core."),
+    "completed tasks should expand their frozen attributed thoughts")
 
   local wrapped_tool = {
     id = "wrapped-command",
@@ -1065,7 +1117,7 @@ local ok, failure = pcall(function()
       },
     },
   } }, { working_seconds = 1 })
-  assert_true(vim.tbl_contains(active_tree.lines, "  Running 3 tools (1 failed)"),
+  assert_true(vim.tbl_contains(active_tree.lines, "  ▸ Running 3 tools (1 failed)"),
     "active thoughts should expose their updating tool counter")
   assert_equals(#active_tree.folds, 0, "active thoughts must not expose expandable ranges")
   assert_true(vim.tbl_contains(active_tree.lines,
@@ -1144,7 +1196,16 @@ local ok, failure = pcall(function()
 
   vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/plan inspect the feature" })
   controller.submit()
-  assert_true(vim.wait(2000, function() return vim.api.nvim_buf_get_name(0) == plan_path end, 10), "PlanReview did not open the physical plan")
+  assert_true(vim.wait(2000, function() return #(session.harness.artifact or {}) == 1 end, 10),
+    "completed planning should publish a session artifact")
+  assert_true(vim.api.nvim_buf_get_name(0) ~= plan_path,
+    "completed planning should not open PlanReview automatically")
+  local original_select = vim.ui.select
+  vim.ui.select = function(items, _, callback) callback(items[1]) end
+  controller.open_artifact_picker()
+  vim.ui.select = original_select
+  assert_true(vim.wait(2000, function() return vim.api.nvim_buf_get_name(0) == plan_path end, 10),
+    "artifact selection did not open the physical plan")
   assert_equals(vim.bo.filetype, "markdown", "PlanReview should use markdown")
   assert_true(vim.fn.maparg("oY", "n", false, true).callback ~= nil, "PlanReview accept mapping missing")
   assert_true(vim.fn.maparg("oN", "n", false, true).callback ~= nil, "PlanReview request-changes mapping missing")
@@ -1154,15 +1215,25 @@ local ok, failure = pcall(function()
 
   vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/plan revise the feature" })
   controller.submit()
-  assert_true(vim.wait(2000, function() return vim.api.nvim_buf_get_name(0) == plan_path end, 10), "second PlanReview did not open")
+  assert_true(vim.wait(2000, function() return not session.harness.busy end, 10), "second planning turn did not complete")
+  vim.ui.select = function(items, _, callback) callback(items[1]) end
+  controller.open_artifact_picker()
+  vim.ui.select = original_select
+  assert_true(vim.wait(2000, function() return vim.api.nvim_buf_get_name(0) == plan_path end, 10),
+    "second artifact selection did not open PlanReview")
   local original_input = vim.ui.input
-  vim.ui.input = function(_, callback) callback("Name the exact module") end
+  vim.ui.input = function(options, callback)
+    if options.prompt == "Plan comment: " then callback("Name the exact module")
+    else callback("Include explicit integration coverage") end
+  end
   vim.fn.maparg("C", "n", false, true).callback()
-  vim.ui.input = original_input
   vim.fn.maparg("oN", "n", false, true).callback()
+  vim.ui.input = original_input
   assert_true(vim.wait(2000, function() return request_by_method["plan.request_changes"] ~= nil end, 10), "PlanReview did not request changes")
   assert_equals(request_by_method["plan.request_changes"].params.annotations[1].body, "Name the exact module",
     "PlanReview should serialize anchored annotations")
+  assert_equals(request_by_method["plan.request_changes"].params.comment, "Include explicit integration coverage",
+    "PlanReview should serialize the optional overall review comment")
   vim.cmd("tabclose")
 
   require("diff_review.views.interactions").open()

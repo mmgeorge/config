@@ -65,6 +65,7 @@ M.empty_diff_rows = {}
 ---@field client DiffReviewHarnessClient?
 ---@field ready boolean
 ---@field busy boolean
+---@field cancel_requested boolean
 ---@field session table?
 ---@field capability table
 ---@field interaction table[]
@@ -77,6 +78,7 @@ M.empty_diff_rows = {}
 ---@field render_namespace integer?
 ---@field render_initialized boolean
 ---@field queue string[]
+---@field pending_steer table[]
 ---@field transcript_buf integer?
 ---@field transcript_win integer?
 ---@field composer_buf integer?
@@ -84,7 +86,9 @@ M.empty_diff_rows = {}
 ---@field prompt_line integer[]
 ---@field activity_range table[]
 ---@field active_plan table?
----@field plan_progress table?
+---@field active_elicitation table?
+---@field artifact table[]
+---@field timeline table[]
 ---@field plan_annotations table[]
 ---@field no_checkpoint boolean
 ---@field interactions table?
@@ -94,6 +98,11 @@ M.empty_diff_rows = {}
 ---@field goal table?
 ---@field pending_config table?
 ---@field pending_mode "read"|"write"?
+---@field plan_question_open boolean?
+---@field presented_question_set_id string?
+---@field prompt_history string[]
+---@field prompt_history_index integer
+---@field prompt_history_draft string?
 
 --- Harness process, view, queue, interaction-tree, and capability state. The broker owns
 --- durable state while this table owns only the current Neovim presentation.
@@ -102,6 +111,7 @@ M.harness = {
   client = nil,
   ready = false,
   busy = false,
+  cancel_requested = false,
   session = nil,
   capability = {},
   interaction = {},
@@ -114,6 +124,7 @@ M.harness = {
   render_namespace = nil,
   render_initialized = false,
   queue = {},
+  pending_steer = {},
   transcript_buf = nil,
   transcript_win = nil,
   composer_buf = nil,
@@ -121,12 +132,19 @@ M.harness = {
   prompt_line = {},
   activity_range = {},
   active_plan = nil,
-  plan_progress = nil,
+  active_elicitation = nil,
+  artifact = {},
+  timeline = {},
   plan_annotations = {},
   no_checkpoint = false,
   interactions = nil,
   sessions_view = nil,
   plan_review = nil,
+  plan_question_open = false,
+  presented_question_set_id = nil,
+  prompt_history = {},
+  prompt_history_index = 0,
+  prompt_history_draft = nil,
 }
 
 return M

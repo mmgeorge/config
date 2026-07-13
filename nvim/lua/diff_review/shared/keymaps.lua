@@ -609,7 +609,8 @@ end
 ---@param command_set DiffReviewViewCommandSet
 ---@param status? string|{ text: string, group: string }[]
 ---@param context? table
-function M.apply_view_winbar(win, title, group, command_set, status, context)
+---@param right_status? { text: string, group: string }[]
+function M.apply_view_winbar(win, title, group, command_set, status, context, right_status)
   if not (win and vim.api.nvim_win_is_valid(win)) then return end
   local title_text = tostring(title or "")
   local status_segment_list = type(status) == "table" and status or nil
@@ -620,7 +621,12 @@ function M.apply_view_winbar(win, title, group, command_set, status, context)
     return ("%%#%s#%s%%*"):format(segment.group, segment.text:gsub("%%", "%%%%"))
   end, status_segment_list)) or nil
   local hint_text = M.view_hint(group, command_set, context)
-  local full_width = vim.fn.strdisplaywidth(title_text) + vim.fn.strdisplaywidth(status_text) + vim.fn.strdisplaywidth(hint_text) + 4
+  local right_status_text = table.concat(vim.tbl_map(function(segment) return segment.text end, right_status or {}))
+  local right_status_rendered = table.concat(vim.tbl_map(function(segment)
+    return ("%%#%s#%s%%*"):format(segment.group, segment.text:gsub("%%", "%%%%"))
+  end, right_status or {}))
+  local full_width = vim.fn.strdisplaywidth(title_text) + vim.fn.strdisplaywidth(status_text)
+    + vim.fn.strdisplaywidth(right_status_text) + vim.fn.strdisplaywidth(hint_text) + 7
   local left_text = title_text ~= "" and title_text or status_text
   local center_text = title_text ~= "" and status_text or ""
   local left = left_text:gsub("%%", "%%%%")
@@ -630,24 +636,30 @@ function M.apply_view_winbar(win, title, group, command_set, status, context)
     if status_rendered then
       local rendered_left = title_text ~= "" and ("%%#DiffReviewStatusLabel#%s%%*"):format(left) or status_rendered
       local rendered_center = title_text ~= "" and status_rendered or ""
-      vim.wo[win].winbar = ("%s%%=%s%%=%%#DiffReviewStatusHint#%s%%*"):format(rendered_left, rendered_center, hint)
+      local rendered_right = right_status_rendered
+      if rendered_right ~= "" and hint ~= "" then rendered_right = rendered_right .. " • " end
+      vim.wo[win].winbar = ("%s%%=%s%%=%s%%#DiffReviewStatusHint#%s%%*"):format(
+        rendered_left, rendered_center, rendered_right, hint)
       return
     end
-    vim.wo[win].winbar = ("%%#DiffReviewStatusLabel#%s%%*%%=%%#DiffReviewStatusHint#%s%%*%%=%%#DiffReviewStatusHint#%s%%*")
-      :format(left, center, hint)
+    local rendered_right = right_status_rendered
+    if rendered_right ~= "" and hint ~= "" then rendered_right = rendered_right .. " • " end
+    vim.wo[win].winbar = ("%%#DiffReviewStatusLabel#%s%%*%%=%%#DiffReviewStatusHint#%s%%*%%=%s%%#DiffReviewStatusHint#%s%%*")
+      :format(left, center, rendered_right, hint)
     return
   end
   local help_action = command_set.action_by_id.help
   local help_key = help_action and M.view_keys_for(group, "help")[1] or nil
   local help_hint = help_key and (help_key .. " help"):gsub("%%", "%%%%") or ""
-  local help_section = help_hint ~= "" and ("%%=%%#DiffReviewStatusHint#%s%%*"):format(help_hint) or ""
+  local compact_right = right_status_rendered ~= "" and ("%%=%s"):format(right_status_rendered)
+    or (help_hint ~= "" and ("%%=%%#DiffReviewStatusHint#%s%%*"):format(help_hint) or "")
   if status_rendered then
     local rendered_left = title_text ~= "" and ("%%#DiffReviewStatusLabel#%s%%*"):format(left) or status_rendered
     local rendered_center = title_text ~= "" and status_rendered or ""
-    vim.wo[win].winbar = ("%s  %s%s"):format(rendered_left, rendered_center, help_section)
+    vim.wo[win].winbar = ("%s  %s%s"):format(rendered_left, rendered_center, compact_right)
     return
   end
-  vim.wo[win].winbar = ("%%#DiffReviewStatusLabel#%s%%*  %%#DiffReviewStatusHint#%s%%*%s"):format(left, center, help_section)
+  vim.wo[win].winbar = ("%%#DiffReviewStatusLabel#%s%%*  %%#DiffReviewStatusHint#%s%%*%s"):format(left, center, compact_right)
 end
 
 ---@param group string

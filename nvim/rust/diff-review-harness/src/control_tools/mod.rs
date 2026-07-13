@@ -2,6 +2,43 @@ use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+/// Build the shared structured-input contract for planning feedback.
+pub fn plan_question_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "questions": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 3,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "header": { "type": "string" },
+                        "question": { "type": "string" },
+                        "options": {
+                            "type": "array",
+                            "minItems": 2,
+                            "maxItems": 3,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "label": { "type": "string" },
+                                    "description": { "type": "string" }
+                                },
+                                "required": ["label", "description"]
+                            }
+                        },
+                        "allowFreeform": { "type": "boolean" }
+                    },
+                    "required": ["header", "question", "options"]
+                }
+            }
+        },
+        "required": ["questions"]
+    })
+}
+
 /// Run the Harness control-tool MCP server over JSONL stdio.
 pub async fn run_stdio() -> Result<()> {
     let mut input = BufReader::new(tokio::io::stdin()).lines();
@@ -56,6 +93,11 @@ fn tool_list() -> Vec<Value> {
             "inputSchema": { "type": "object", "properties": { "markdown": { "type": "string" } }, "required": ["markdown"] }
         }),
         json!({
+            "name": "harness_plan_question",
+            "description": "Pause any Harness turn and present one to three interactive user questions. Use this for explicit requests for multiple-choice questions as well as planning decisions.",
+            "inputSchema": plan_question_input_schema()
+        }),
+        json!({
             "name": "harness_goal_complete",
             "description": "Mark the active Harness goal complete only after every required task finishes.",
             "inputSchema": { "type": "object", "properties": { "summary": { "type": "string" } }, "required": ["summary"] }
@@ -78,7 +120,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn exposes_plan_and_goal_control_tools() {
+    fn exposes_question_plan_and_goal_control_tools() {
         let tool = tool_list();
         let name: Vec<_> = tool
             .iter()
@@ -88,6 +130,7 @@ mod test {
             name,
             [
                 "harness_plan_submit",
+                "harness_plan_question",
                 "harness_goal_complete",
                 "harness_goal_blocked",
                 "harness_goal_status"

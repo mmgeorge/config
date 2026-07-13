@@ -1,6 +1,8 @@
 --- Builds view-independent compact comment-box rows for every diff-with-comments surface.
 --- Status-buffer ownership lives in views.status.comment_box_rows.
 
+local display_text = require("diff_review.render.display_text")
+
 --- Box content the renderer reads; the full descriptor adds identity/anchor for dispatch.
 ---@class DiffReviewCommentBoxContent
 ---@field heading string preformatted heading text drawn in the box top border
@@ -35,24 +37,6 @@ M.default_style = {
   stale = "DiffReviewWalkthroughStale",
 }
 
---- Split the largest display-width prefix from text without breaking a character.
----@param value string
----@param width integer
----@return { prefix: string, remainder: string }
-local function take_display_prefix(value, width)
-  if width <= 0 or value == "" then return { prefix = "", remainder = value } end
-  local prefix = ""
-  local character_count = vim.fn.strchars(value)
-  for character_index = 0, character_count - 1 do
-    local character = vim.fn.strcharpart(value, character_index, 1)
-    if vim.fn.strdisplaywidth(prefix .. character) > width then
-      return { prefix = prefix, remainder = vim.fn.strcharpart(value, character_index) }
-    end
-    prefix = prefix .. character
-  end
-  return { prefix = prefix, remainder = "" }
-end
-
 --- Truncate display text to width while preserving a visible truncation marker.
 ---@param value string
 ---@param width integer
@@ -62,47 +46,11 @@ local function truncate_display(value, width)
   if width <= 0 then return "" end
   if vim.fn.strdisplaywidth(value) <= width then return value end
   if width == 1 then return "…" end
-  local split = take_display_prefix(value, width - 1)
+  local split = display_text.take_prefix(value, width - 1)
   return split.prefix .. "…"
 end
 
---- Wrap text to a display width, preserving blank lines and splitting overlong words.
----@param text string
----@param width integer
----@return string[]
-local function wrap_text(text, width)
-  width = math.max(1, width)
-  local wrapped = {}
-  for _, paragraph in ipairs(vim.split(tostring(text or ""), "\n", { plain = true })) do
-    if vim.trim(paragraph) == "" then
-      wrapped[#wrapped + 1] = ""
-    else
-      local line = ""
-      for word in paragraph:gmatch("%S+") do
-        if line ~= "" and vim.fn.strdisplaywidth(line .. " " .. word) <= width then
-          line = line .. " " .. word
-        else
-          if line ~= "" then
-            wrapped[#wrapped + 1] = line
-            line = ""
-          end
-          while vim.fn.strdisplaywidth(word) > width do
-            local split = take_display_prefix(word, width)
-            if split.prefix == "" then break end
-            wrapped[#wrapped + 1] = split.prefix
-            word = split.remainder
-          end
-          line = word
-        end
-      end
-      if line ~= "" then wrapped[#wrapped + 1] = line end
-    end
-  end
-  if #wrapped == 0 then wrapped[1] = "" end
-  return wrapped
-end
-
-M.wrap_text = wrap_text
+M.wrap_text = display_text.wrap
 
 --- Build segmented display rows for a compact comment box.
 ---@param desc DiffReviewCommentBoxContent
@@ -116,7 +64,7 @@ function M.build_box_lines(desc, win_width, style)
 
   ---@type { text: string, hl: string, divider?: boolean }[]
   local content = {}
-  for _, line in ipairs(wrap_text(table.concat(desc.body_lines or {}, "\n"), content_width)) do
+  for _, line in ipairs(display_text.wrap(table.concat(desc.body_lines or {}, "\n"), content_width)) do
     content[#content + 1] = { text = line, hl = style.body }
   end
   for _, reply in ipairs(desc.replies or {}) do
@@ -127,13 +75,13 @@ function M.build_box_lines(desc, win_width, style)
         divider = true,
       }
     end
-    for _, line in ipairs(wrap_text(table.concat(reply.body_lines or {}, "\n"), content_width)) do
+    for _, line in ipairs(display_text.wrap(table.concat(reply.body_lines or {}, "\n"), content_width)) do
       content[#content + 1] = { text = line, hl = style.body }
     end
   end
   if desc.stale_note then
     content[#content + 1] = { text = "", hl = style.body }
-    for _, line in ipairs(wrap_text(desc.stale_note, content_width)) do
+    for _, line in ipairs(display_text.wrap(desc.stale_note, content_width)) do
       content[#content + 1] = { text = line, hl = style.stale }
     end
   end

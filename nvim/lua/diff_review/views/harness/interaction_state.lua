@@ -72,6 +72,17 @@ function M.apply_active(state, update)
 end
 
 ---@param state DiffReviewHarnessPresentationState
+---@param snapshot table
+function M.apply_task(state, snapshot)
+  if type(snapshot) ~= "table" then return end
+  local interaction = state.pending_interaction or state.interaction[#state.interaction]
+  if not interaction then return end
+  local previous = interaction.task
+  if previous and (previous.revision or 0) > (snapshot.revision or 0) then return end
+  interaction.task = vim.deepcopy(snapshot)
+end
+
+---@param state DiffReviewHarnessPresentationState
 ---@param thought table
 function M.complete_thought(state, thought)
   if type(thought) ~= "table" or not thought.id then return end

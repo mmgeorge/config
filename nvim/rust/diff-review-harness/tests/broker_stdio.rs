@@ -115,16 +115,19 @@ fn streams_mock_backend_events_before_the_jsonl_response() {
             .iter()
             .filter(|event| **event == "backend_event")
             .count(),
-        1
+        2
     );
     let backend_kind = planned
         .iter()
         .filter(|message| message.get("event").and_then(Value::as_str) == Some("backend_event"))
         .filter_map(|message| message.pointer("/payload/kind").and_then(Value::as_str))
         .collect::<Vec<_>>();
-    assert_eq!(backend_kind, vec!["timeline_active"]);
+    assert_eq!(
+        backend_kind,
+        vec!["timeline_interaction_started", "timeline_active"]
+    );
     assert!(event_name.contains(&"interaction_complete"));
-    assert!(event_name.contains(&"plan_review"));
+    assert!(event_name.contains(&"plan_created"));
     assert!(planned.last().unwrap().get("error").is_none());
 
     broker.request(json!({ "id": 3, "method": "shutdown", "params": {} }));

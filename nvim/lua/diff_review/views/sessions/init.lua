@@ -99,7 +99,9 @@ local function resume()
     session.harness.queue = {}
     session.harness.goal = result.goal
     session.harness.active_plan = result.active_plan
-    session.harness.plan_progress = nil
+    session.harness.active_elicitation = result.active_elicitation
+    session.harness.timeline = vim.deepcopy(result.timeline or {})
+    session.harness.artifact = vim.deepcopy(result.artifact or {})
     require("diff_review.views.harness.controller").render(true)
     M.refresh()
   end)
@@ -117,7 +119,9 @@ fork = function()
     session.harness.queue = {}
     session.harness.goal = result.goal
     session.harness.active_plan = result.active_plan
-    session.harness.plan_progress = nil
+    session.harness.active_elicitation = result.active_elicitation
+    session.harness.timeline = vim.deepcopy(result.timeline or {})
+    session.harness.artifact = vim.deepcopy(result.artifact or {})
     require("diff_review.views.harness.controller").render(true)
     M.refresh()
   end)

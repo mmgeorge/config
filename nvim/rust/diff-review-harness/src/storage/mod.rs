@@ -1,7 +1,7 @@
 use crate::checkpoint::CheckpointRecord;
 use crate::goal::GoalRecord;
 use crate::interaction::{InteractionComment, InteractionRecord};
-use crate::plan::PlanRecord;
+use crate::plan::{PlanExecutionRecord, PlanLifecycleRecord, PlanRecord};
 use crate::session::{HarnessPreference, HarnessSession, SessionStore};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -88,6 +88,18 @@ impl SqliteStore {
                 payload TEXT NOT NULL,
                 FOREIGN KEY(session_id) REFERENCES session_record(id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS plan_lifecycle_record (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES session_record(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS plan_execution_record (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES session_record(id) ON DELETE CASCADE
+            );
             CREATE TABLE IF NOT EXISTS goal_record (
                 id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL,
@@ -100,7 +112,7 @@ impl SqliteStore {
                 payload TEXT NOT NULL,
                 FOREIGN KEY(session_id) REFERENCES session_record(id) ON DELETE CASCADE
             );
-            PRAGMA user_version=2;
+            PRAGMA user_version=3;
             "#,
         )?;
         Ok(Self {
@@ -308,6 +320,58 @@ impl SqliteStore {
     /// Load a plan by stable Harness identifier.
     pub fn load_plan(&self, plan_id: &str) -> Result<Option<PlanRecord>> {
         self.load_payload("SELECT payload FROM plan_record WHERE id=?1", [plan_id])
+    }
+
+    /// Load every plan artifact for one session in creation order.
+    pub fn list_plan(&self, session_id: &str) -> Result<Vec<PlanRecord>> {
+        self.list_payload(
+            "SELECT payload FROM plan_record WHERE session_id=?1 ORDER BY rowid",
+            [session_id],
+        )
+    }
+
+    /// Write one immutable plan lifecycle event.
+    pub fn save_plan_lifecycle(&mut self, lifecycle: &PlanLifecycleRecord) -> Result<()> {
+        self.save_scoped_payload(
+            "plan_lifecycle_record",
+            &lifecycle.id,
+            &lifecycle.session_id,
+            lifecycle,
+        )
+    }
+
+    /// Load plan lifecycle events in their insertion order.
+    pub fn list_plan_lifecycle(&self, session_id: &str) -> Result<Vec<PlanLifecycleRecord>> {
+        self.list_payload(
+            "SELECT payload FROM plan_lifecycle_record WHERE session_id=?1 ORDER BY rowid",
+            [session_id],
+        )
+    }
+
+    /// Write one accepted-plan execution record.
+    pub fn save_plan_execution(&mut self, execution: &PlanExecutionRecord) -> Result<()> {
+        self.save_scoped_payload(
+            "plan_execution_record",
+            &execution.id,
+            &execution.session_id,
+            execution,
+        )
+    }
+
+    /// Load one accepted-plan execution by stable identifier.
+    pub fn load_plan_execution(&self, execution_id: &str) -> Result<Option<PlanExecutionRecord>> {
+        self.load_payload(
+            "SELECT payload FROM plan_execution_record WHERE id=?1",
+            [execution_id],
+        )
+    }
+
+    /// Load every accepted-plan execution for one session.
+    pub fn list_plan_execution(&self, session_id: &str) -> Result<Vec<PlanExecutionRecord>> {
+        self.list_payload(
+            "SELECT payload FROM plan_execution_record WHERE session_id=?1 ORDER BY rowid",
+            [session_id],
+        )
     }
 
     /// Write a goal lifecycle record.
@@ -588,5 +652,27 @@ mod test {
             .optional()
             .unwrap();
         assert!(legacy_table.is_none());
+    }
+
+    #[test]
+    fn version_two_migration_preserves_durable_sessions() {
+        let temporary = tempfile::tempdir().unwrap();
+        {
+            let mut store = SqliteStore::open(temporary.path()).unwrap();
+            store
+                .save_session(&session("preserved", "D:/work"))
+                .unwrap();
+            store
+                .connection
+                .pragma_update(None, "user_version", 2)
+                .unwrap();
+        }
+        let store = SqliteStore::open(temporary.path()).unwrap();
+        assert!(store.load_session("preserved").unwrap().is_some());
+        let schema_version: u32 = store
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(schema_version, 3);
     }
 }

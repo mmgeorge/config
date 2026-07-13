@@ -6,6 +6,7 @@ local layout = require("diff_review.views.harness.layout")
 local notifications = require("diff_review.infra.notifications")
 local session = require("diff_review.session")
 local interaction_state = require("diff_review.views.harness.interaction_state")
+local prompt_history = require("diff_review.views.harness.prompt_history")
 
 local function valid_window(win) return win and vim.api.nvim_win_is_valid(win) end
 
@@ -15,14 +16,20 @@ local function apply_snapshot(state, result)
   if previous_session_id ~= (result.session and result.session.id or nil) then state.activity_expanded = {} end
   state.capability = result.capability or {}
   interaction_state.reconcile_snapshot(state, result.interaction or {})
+  state.timeline = vim.deepcopy(result.timeline or {})
+  state.artifact = vim.deepcopy(result.artifact or {})
   state.no_checkpoint = result.no_checkpoint == true
   state.goal = result.goal
   state.active_plan = result.active_plan
+  state.active_elicitation = result.active_elicitation
+  prompt_history.replace(result.prompt_history)
   controller.render(true)
   controller.resolve_runtime_model()
-  if state.active_plan and state.active_plan.state == "awaiting_review" then
-    require("diff_review.views.plan_review").open(state.active_plan)
-  elseif state.goal and state.goal.state == "active" then
+  if state.active_elicitation and state.active_elicitation.elicitation then
+    state.presented_question_set_id = nil
+    vim.schedule(controller.present_plan_question)
+  end
+  if state.goal and state.goal.state == "active" then
     vim.schedule(controller.drain)
   end
 end
@@ -70,9 +77,7 @@ function M.open()
   local state = session.harness
   if valid_window(state.composer_win) then
     vim.api.nvim_set_current_win(state.composer_win)
-    if state.active_plan and state.active_plan.state == "awaiting_review" then
-      require("diff_review.views.plan_review").open(state.active_plan)
-    elseif state.goal and state.goal.state == "active" then
+    if state.goal and state.goal.state == "active" then
       vim.schedule(controller.drain)
     end
     return
@@ -99,7 +104,9 @@ function M.new_session()
     state.queue = {}
     state.goal = nil
     state.active_plan = nil
-    state.plan_progress = nil
+    state.timeline = vim.deepcopy(result.timeline or {})
+    state.artifact = vim.deepcopy(result.artifact or {})
+    prompt_history.replace(result.prompt_history)
     controller.render(true)
   end)
 end

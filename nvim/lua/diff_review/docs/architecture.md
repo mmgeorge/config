@@ -122,6 +122,7 @@ diff_review/
 │   ├── diff_component.lua     Shared file headers, hunk rows, and status-buffer accumulation
 │   ├── row_emitter.lua        Emit shared diff-row spans for GitStatus, PR review, and Harness
 │   ├── diff_tree.lua           Compose file headers and fancy hunks into an indentable fold tree
+│   ├── display_text.lua       Shared display-cell wrapping with semantic first/continuation prefixes
 │   ├── comment_box.lua        Pure compact comment-box wrapping and segmented row layout
 │   ├── layout.lua             Fenwick (binary-indexed) tree mapping items → buffer rows in O(log n)
 │   ├── row_tree.lua           Logical node tree (hunks/padding/annotations) kept in row-sync via layout
@@ -250,7 +251,8 @@ type. The standalone diff, file-revision, and preview buffers are separate.
 | Commit message | (commit ft) | — | `commit.editor` (borrowed window) | The `git commit` message buffer, AI-prefilled |
 | Commit console | (scratch) | — | `commit.commit` | Streamed pre-commit hook + git output |
 | Harness interaction tree | `Harness` | — | `:Harness` | Prompt, thought, tool, diff, plan-progress, response, and elapsed-work nodes with stable native folds |
-| Harness composer | `HarnessInput` | — | `:Harness` | Auto-growing multiline prompt input and FIFO queue editing |
+| Harness composer | `HarnessInput` | — | `:Harness` | Auto-growing multiline prompt input, active-turn steering, FIFO queue editing, and global prompt-history recall |
+| Planning question | `DiffReviewPlanQuestion` | — | `harness_plan_question` | Centered durable choices, attached input, and final answer review |
 | Plan review | `markdown` | — | `/plan <request>` | Physical editable plan, line annotations, accept or request changes |
 | Interactions | `DiffReviewInteractions` | — | `:Interactions` | Foldable interaction/file/hunk diffs, comments, rollback |
 | Sessions | `DiffReviewSessions` | — | `:Sessions` | Current Repo and All Repos durable session tabs |
@@ -298,7 +300,7 @@ Core fields:
 - view-specific state — PR data, review comments, walkthrough mode, diff source handles.
 
 The Neovim-local Harness presentation state lives under `session.harness`. It holds
-buffer/window handles, the local FIFO prompt queue, process generation, capability flags,
+buffer/window handles, pending steering indicators, the local FIFO prompt queue, process generation, capability flags,
 and a presentation copy of the current interaction list. Durable sessions, plans, goals,
 interaction timelines, and checkpoints never live in Lua. The Rust broker owns those
 records, then reconstructs Lua presentation state after restart. Raw transcript events no
@@ -846,7 +848,10 @@ press the commit key
   └─ harness/client JSONL request → Rust broker
        ├─ force READ and capture interaction checkpoint-before
        ├─ ACP or Codex strategy runs one planning turn
-       ├─ accept only harness_plan_submit or a complete native plan artifact
+       ├─ harness_plan_question → durable PlanElicitation → centered Harness-relative float
+       │    ├─ answers, notes, Other, and clarification turns preserve AwaitingInput
+       │    └─ reviewed y confirmation serializes the decisions and resumes the planning contract
+       ├─ harness_plan_submit becomes the only review-artifact boundary
        └─ PlanFileStore writes plans/<session>/<plan>/working.md + immutable revision
             └─ PlanReview opens the physical file with :edit
                  ├─ user edits normal Markdown and C anchors comments with extmarks
@@ -881,15 +886,47 @@ backend turn completes
 ### Harness broker boundary
 
 The feature-first Rust crate lives at `nvim/rust/diff-review-harness`. Its directories
-name capabilities rather than layers: `broker`, `session`, `plan`, `goal`, `interaction`,
-`checkpoint`, `backend/acp`, `backend/codex`, `storage`, `workspace`, `protocol`, and
-`control_tools`. Consumer-owned traits stay beside the feature that consumes them.
+name capabilities rather than layers: `broker`, `session`, `plan`, `goal`, `interaction`, `timeline`,
+`checkpoint`, `backend`, `storage`, `workspace`, `protocol`, and `control_tools`. The backend
+directory owns ACP and Codex transports plus the shared active-turn steering lane. Consumer-owned
+traits stay beside the feature that consumes them.
 
 The broker runs once per Neovim process over JSONL stdio. Provider events cross a live
 channel into `TimelineReducer`, which owns one active thought and an ordered set of completed
 thoughts for the current user interaction. Assistant commentary establishes thought
 boundaries. Tool events that arrive first create a synthetic `Working` thought. Stable tool
 identities merge start, output, and completion events into one completed tool record.
+
+`turn.cancel` bypasses the broker's serialized request queue so Ctrl-c can interrupt an active
+provider turn instead of waiting behind it. The broker drops the prompt future, asks the backend
+to release any retained transport, finalizes partial timeline state, and persists the interaction
+as cancelled. Goal continuation pauses at the same boundary, while the session and completed
+transcript remain available for the next prompt.
+
+`turn.steer` uses the same out-of-band broker lane without creating another interaction. Ctrl-q
+clears HarnessInput only after admitting the text into a pending steering record, then the backend
+delivers it to the active provider turn and acknowledges the request. The Codex backend maps that
+operation to app-server `turn/steer` with the active thread and expected turn IDs. The shared
+steering lane activates before transport startup, so input submitted during connection or
+`turn/start` setup waits for that same turn. Codex releases the buffered input only after the
+matching `turn/started` notification because the earlier `turn/start` response allocates an ID
+before the provider installs the active turn. Prompt mode does not gate the lane. Chat, `/plan`,
+goals, and accepted-plan execution therefore share one steering contract. ACP advertises steering
+as unavailable because ACP v1 provides no equivalent request.
+
+The broker keeps an active dispatch response pending until every admitted steering request reaches
+a terminal result. If the provider turn completes first, the backend rejects the unacknowledged
+steering request and Lua moves its text into the ordinary FIFO follow-up queue. Unsupported or idle
+steering leaves the composer untouched. This boundary prevents a completion race from dropping a
+planning constraint while preserving the existing interaction semantics.
+
+Provider checklist events normalize into complete `ProviderTaskUpdate` replacements regardless
+of whether they arrive during `/plan`, accepted-plan execution, or ordinary chat. `TaskTracker`
+owns stable Harness task identities, current provider order, and superseded history. Explicit
+provider IDs match first, exact normalized titles match second, and an unambiguous ordinal slot
+allows a provider rename. Removed tasks disappear unless a completed thought references them.
+When one task is in progress at thought completion, the broker freezes that task ID onto the
+thought. Later checklist rewrites never reparent historical work.
 
 The live protocol publishes `ActiveThoughtUpdate` counters plus one replaceable latest-tool
 record while a thought remains mutable. The Harness tree shows `Running N tools`, the latest
@@ -912,13 +949,18 @@ checkpoint. Any residual diff becomes a synthetic completion thought and marks a
 incomplete, preventing a missed or late watcher event from hiding work. Watcher failure
 degrades to checkpointing every completed thought.
 
-The Lua controller renders durable `InteractionRecord` values instead of replaying raw
-provider events. `interaction_tree.lua` builds the high-level prompt, thought, tool, change,
-and response tree. Each completed node owns a stable expansion key, and the renderer materializes
+The Rust `TimelineProjector` combines interactions, plan lifecycle records, and accepted-plan
+executions into one ordered presentation. The Lua controller renders that projection instead of
+replaying raw provider events or maintaining a tail-only checklist. `interaction_tree.lua`
+coordinates the high-level projection, `task_tree.lua` owns provider tasks, and `plan_event.lua`
+owns artifact lifecycle rows. Each completed node owns a stable expansion key, and the renderer materializes
 only the children selected by `session.harness.activity_expanded`. This projection avoids
 overlapping native ranges, which cannot reliably represent wrapped thought and command headings.
+`display_text.lua` wraps prompts and thoughts into real rows using rendered-cell width before row
+ownership, highlights, and folds are assigned. Continuation rows therefore preserve the tree's
+two-column indent without depending on window-local soft-wrap behavior.
 `transaction.lua` finds the smallest changed line interval and applies one buffer mutation while
-preserving semantic cursor identity, viewport position, plan folds, and settled prefix extmarks.
+preserving semantic cursor identity, viewport position, expansion state, and settled prefix extmarks.
 Active thoughts never expose expansion keys. Completed nodes stay immutable, so an expanded
 command or diff never changes while the user reads it.
 Elapsed work appears only in the mutable `Thinking for Ns` header and never enters SQLite.
@@ -945,7 +987,8 @@ An initialization collision returns structured lease metadata instead of a termi
 failure. Neovim offers Retry and Start New Session for every collision, and adds Fork Session
 only when the persisted backend capability advertises native fork. Fork recovery initializes
 an independently leased broker, forks the provider conversation, copies immutable interaction
-history and comments, clears rollback checkpoints that belong to the source session, and never
+history, comments, plan artifacts, lifecycle events, task attribution, and completed execution
+history. It clears rollback checkpoints and active execution state that belong to the source session, and never
 takes or releases the source lease.
 Broker initialization selects the most recently updated session for the resolved repository
 and configured backend, then restores its interaction timeline, plan, goal, model controls,
@@ -954,27 +997,93 @@ preserving model, effort, and fast-mode preferences. `:Harness` therefore resume
 while `/clear` remains the explicit boundary for creating a new session. Every restored session
 returns to Read mode before another turn can run.
 
+Schema version 3 adds plan lifecycle and execution records without deleting version-2 sessions.
+Plans remain physical Markdown under `plans/<session>/<plan>/working.md`, with immutable model
+and user revisions beside them. The snapshot exposes every plan as an artifact plus the active
+saved path. The model receives that path as context for later plan questions, while unsaved
+PlanReview edits remain editor-local until review submission.
+
+Schema version 4 adds a repository-independent prompt history ordered newest first and pruned
+transactionally to 100 entries. Every broker snapshot carries that shared list, while
+`prompt_history.lua` owns only the active composer index and draft. Up begins recall only from
+an empty composer, repeated Up walks backward, and Down returns toward the draft. Transcript
+prompt jumps remain separate commands, so input recall cannot move the review cursor.
+
 ACP uses the official Rust SDK dependency and a negotiated JSON-RPC driver. One ACP agent
 process stays attached across turns, so agents without optional `session/load` still retain
 conversation state during the Neovim run. Restoring those sessions after a broker restart
 requires the agent to advertise `loadSession`. The ACP client
 implements the filesystem and complete terminal lifecycle it advertises, retains bounded
 UTF-8 output, validates paths against the workspace, and maps published model and thought
-config options onto Harness model/effort settings. `/plan` selects an advertised plan,
-architect, planning, or ask mode through `session/set_mode`, then returns to a code-capable
-mode for execution. Stable ACP `entries` plan updates and exact Harness control-tool calls
-normalize into the same reviewed plan contract. Names printed in prose or command output
-never count as control calls. Codex uses
-its app-server protocol directly, including `model/list`, Plan collaboration mode,
-dynamic Harness control tools, `thread/goal/set`, and `thread/fork`. Native fork enters
+config options onto Harness model/effort settings. `/plan` does not select an ACP plan or
+architect mode. Harness sends the same read-only planning contract through ACP and Codex, and
+`harness_plan_question` pauses either backend on one to three structured decisions while
+`harness_plan_submit` alone creates a review artifact. ACP receives the question tool through
+the Harness control MCP and Codex receives the same schema as a dynamic tool. An agent that
+ends with an ordinary text question degrades into one free-form decision instead of failing.
+The question tool also works during ordinary chat, goal, and execution turns. Those questions
+persist on their owning `InteractionRecord`, while planning questions remain on `PlanRecord`.
+`BrokerSnapshot.active_elicitation` projects either owner through one question UI contract, so
+answer, skip, Ask, and continue reuse the same centered float without creating a plan artifact.
+Ordinary prose never counts as a submitted question set.
+Stable ACP `entries` updates and Codex
+`turn/plan/updated` events feed the generic task tracker without submitting a plan. Names printed
+in prose or command output never count as control calls. Codex uses its app-server protocol
+directly, including `model/list`, dynamic Harness control tools, `thread/goal/set`, and
+`thread/fork`, but it does not set `collaborationMode` for Harness planning. Native fork enters
 the command set only after the backend advertises it. No transcript-copy fallback exists.
 
-Native provider plan lifecycle events also normalize into `PlanProgress` presentation state.
-Repeated updates replace one checklist beneath the active thought. Active plans show completed,
-active, and pending steps. The provider's
-completion event replaces that live block with a folded `Plan Complete` node, and `<Tab>`
-restores the final checked checklist. This progress display does not enter `PlanReview` unless
-the user explicitly invoked `/plan`.
+Provider token-usage notifications normalize into durable `ContextUsage` session state. The
+Harness winbar renders the remaining percentage and total window at its right edge without
+adding timeline entries. Codex uses app-server `thread/compact/start` for `/compact`. ACP exposes
+the command only when `available_commands_update` advertises `compact`, then routes the command
+through the active ACP session. Compaction never creates a user interaction, and unsupported
+backends omit the command instead of receiving a synthetic summarization prompt.
+
+`/plan` emits `Planning` and `Planned` interaction summaries. A question-only turn becomes
+`Planning paused`, saves `PlanElicitation` under the active `AwaitingInput` plan, renders its
+choices in the timeline, and opens a centered float relative to the Harness transcript window.
+The float shows `Question N of M`, maps provider choices and Other through configurable
+`harness.question_choice_keys`, reserves `a` for Ask, and reserves `o` for Other. Provider choices
+default to `n`, `e`, `i`, `l`, `u`, and `y`. Arrow keys plus `s`/`t` change the light-blue selected
+row without submitting it. The compact footer exposes only question navigation and Tab feedback.
+Enter records an ordinary choice or opens the
+attached editor for Other and Ask. Tab opens that same editor for optional choice feedback.
+Ctrl-s belongs only to the attached input window, where it records the selected answer plus text
+and advances to the next unanswered question. The input renders as an independent rounded float
+below the choice window and uses inline virtual text for left padding, so presentation spacing
+never enters the submitted value. Opening a question forces Normal mode. Enter or Tab starts a
+new input in Insert mode, while `go` moves between existing panes without changing to Insert mode.
+
+After the final answer, the float becomes an explicit review page that lists every question,
+selected answer, and additional input in question order. `y` closes the elicitation and resumes
+the provider. `n` returns to the first question while preserving the broker-backed answer set,
+including feedback and Other text, so each answer can be inspected or replaced before submission.
+The main question float never maps Ctrl-s and cannot bypass this review boundary.
+
+Answer and skip requests update only the durable elicitation record. Ask and subsequent ordinary
+Harness prompts run read-only clarification interactions while leaving the same question active.
+The float reopens after an Ask response, `/questions` restores it after an intentional close, and
+the broker serializes missing answers as intentional best-judgment decisions only when the user
+explicitly continues. A provisional `QuestionAnswered` lifecycle record is removed if that
+continuation turn fails, so the timeline never claims feedback was consumed while the elicitation
+has been restored.
+Question IDs prevent a restored session from repeatedly presenting the same picker, while the
+durable timeline and winbar still expose the pending decision after dismissal or restart.
+Successful submission adds a
+collapsed `Plan created` or `Plan revision created` lifecycle node and increments the artifact
+count in the winbar. Harness never opens PlanReview automatically. `op` selects a session artifact
+through the floating no-preview picker, marks it active, and opens its physical working copy.
+Request changes records saved edits, anchored annotations, and an optional overall comment before
+starting another read-only revision turn. Acceptance emits `Plan accepted`, creates the guarded
+`Complete the plan` goal, and groups every execution turn under one `Executing plan` entry.
+
+Task rows render inline under the interaction or execution that received them. Current task state
+uses pending, in-progress, and completed markers. Completed tasks can expand their frozen thoughts.
+Active tasks and active thoughts remain non-expandable, so streaming never mutates an open node.
+Superseded tasks appear only when their owning summary expands. Provider tasks stay advisory and
+never decide goal completion. The structured goal tool, the 20-turn limit, and the two-turn
+no-progress guard remain the execution authority.
 
 Harness defaults to the direct Codex app-server backend. The ACP launch descriptor runs
 `copilot --acp` when `harness.backend = "acp"`. Override
@@ -1016,7 +1125,8 @@ ignored files, and never mutate the index or history during rollback.
 
 ### Deferred Harness work
 
-- Add `PlanProgress` task/subtask tracking when backends expose reliable task boundaries.
+- Add task-level diff annotations and feedback cycles now that stable task identity and shared
+  diff rendering exist in the timeline.
 - Harden ACP write enforcement as the protocol grows guarantees for provider-private tools.
 - Audit provider-local hooks and command policies that can still reject a tool under Harness
   WRITE, because backend-native policy layers remain authoritative outside the Harness protocol.
@@ -1056,8 +1166,8 @@ The headless suite lives in `nvim/tests/diff_review/` and runs via
 `tests/diff_review/mock_backend.lua` injects a fake git backend so
 tests never touch a real repo. `diff_architecture.lua` guards the render-engine extraction
 boundaries. `tests/diff_review/harness.lua` drives interaction-tree transitions, node-local
-render transactions, immutable fold behavior, queue editing, PlanReview, Interactions,
-Sessions, atomic key-list configuration, and fork capability gating through a deterministic
+render transactions, immutable fold behavior, steering acknowledgment and fallback, queue editing,
+PlanReview, Interactions, Sessions, atomic key-list configuration, and fork capability gating through a deterministic
 JSONL process mock.
 
 The Rust suite runs with `cargo test --manifest-path
@@ -1069,8 +1179,8 @@ exact control tools, backend/session compatibility, and worktree-only rollback. 
 `tests/codex_cli.rs` integration uses the installed
 authenticated Codex CLI with `gpt-5.4-mini` at low effort in a temporary Git repository.
 Run it explicitly with `cargo test --manifest-path nvim/rust/diff-review-harness/Cargo.toml
---test codex_cli -- --ignored --nocapture`. It verifies model discovery, no writes before
-plan acceptance, execution, structured goal completion, resume, and native fork without
+--test codex_cli -- --ignored --nocapture`. It verifies model discovery, plan steering, no writes
+before plan acceptance, execution, structured goal completion, resume, and native fork without
 touching this dotfiles worktree.
 
 The ignored `tests/copilot_acp.rs` integration launches the configured

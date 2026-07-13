@@ -60,7 +60,8 @@ function M.setup()
   vim.api.nvim_set_hl(0, "DiffReviewStatusRemote", { fg = "#00afff", bold = true })
   vim.api.nvim_set_hl(0, "DiffReviewStatusLabel", { fg = "#c0c0c0", bold = true })
   vim.api.nvim_set_hl(0, "DiffReviewHarnessPrompt", { fg = palette.yellow, bold = true })
-  vim.api.nvim_set_hl(0, "DiffReviewHarnessThought", { fg = palette.green, bold = true })
+  vim.api.nvim_set_hl(0, "DiffReviewHarnessThought", { fg = palette.white, bold = true })
+  vim.api.nvim_set_hl(0, "DiffReviewHarnessThinking", { fg = palette.green, bold = true })
   vim.api.nvim_set_hl(0, "DiffReviewHarnessResponse", { fg = palette.white, bold = true })
   vim.api.nvim_set_hl(0, "DiffReviewHarnessGoal", { fg = palette.green, bold = true })
   vim.api.nvim_set_hl(0, "DiffReviewHarnessRead", { fg = palette.white, bold = true })
@@ -68,6 +69,18 @@ function M.setup()
   vim.api.nvim_set_hl(0, "DiffReviewHarnessCommentary", { italic = true })
   vim.api.nvim_set_hl(0, "DiffReviewHarnessCommand", { fg = palette.light_blue, bold = true })
   vim.api.nvim_set_hl(0, "DiffReviewHarnessOption", { fg = palette.red })
+  vim.api.nvim_set_hl(0, "DiffReviewHarnessQuestionSelected", { fg = palette.light_blue, bold = true })
+  vim.api.nvim_set_hl(0, "DiffReviewHarnessQuestionKey", { fg = palette.yellow, bold = true })
+  vim.api.nvim_set_hl(0, "DiffReviewHarnessQuestionHint", { fg = palette.gray })
+  vim.api.nvim_set_hl(0, "DiffReviewHarnessQuestionReviewQuestion", { fg = palette.white })
+  vim.api.nvim_set_hl(0, "DiffReviewHarnessQuestionReviewAnswer", { fg = palette.light_blue })
+  vim.api.nvim_set_hl(0, "DiffReviewHarnessQuestionReviewInput", { fg = header_fg })
+  vim.api.nvim_set_hl(0, "DiffReviewHarnessHiddenCursor", {
+    fg = palette.black,
+    bg = palette.black,
+    blend = 100,
+    nocombine = true,
+  })
   vim.api.nvim_set_hl(0, "DiffReviewHarnessArgument", { fg = palette.white })
   vim.api.nvim_set_hl(0, "DiffReviewHarnessOutput", { fg = palette.gray })
   vim.api.nvim_set_hl(0, "DiffReviewHarnessToolSuccess", { fg = palette.green })

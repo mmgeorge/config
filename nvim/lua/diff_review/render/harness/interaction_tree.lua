@@ -1,6 +1,10 @@
 local M = {}
 
+local display_text = require("diff_review.render.display_text")
+
 local diff_tree = require("diff_review.render.diff_tree")
+local plan_event = require("diff_review.render.harness.plan_event")
+local task_tree = require("diff_review.render.harness.task_tree")
 local tool_render = require("diff_review.render.harness.tool")
 
 ---@param line? string
@@ -46,11 +50,10 @@ local function interaction_counts(interaction)
   return count, failed
 end
 
-local function append_wrapped(result, text, first_prefix, continuation_prefix, group)
-  local lines = vim.split(tostring(text or ""), "\n", { plain = true })
-  if #lines == 0 then lines = { "" } end
-  for index, line in ipairs(lines) do
-    result.lines[#result.lines + 1] = (index == 1 and first_prefix or continuation_prefix) .. line
+local function append_wrapped(result, text, first_prefix, continuation_prefix, group, width)
+  local line_list = display_text.wrap(text, width, first_prefix, continuation_prefix)
+  for _, line in ipairs(line_list) do
+    result.lines[#result.lines + 1] = line
     if group then
       result.highlights[#result.highlights + 1] = {
         line = #result.lines,
@@ -191,7 +194,7 @@ end
 local function append_completed_thought(result, interaction, thought, thought_index, options)
   local thought_key = ("interaction:%s:thought:%s"):format(interaction.id or interaction.ordinal, thought.id or thought_index)
   local first = #result.lines + 1
-  append_wrapped(result, thought.text, "↳ ", "  ", "DiffReviewHarnessCommentary")
+  append_wrapped(result, thought.text, "↳ ", "  ", "DiffReviewHarnessCommentary", options.content_width)
   local thought_last = #result.lines
   for line = first, thought_last do
     result.rows[line] = {
@@ -241,49 +244,58 @@ local function append_completed_thought(result, interaction, thought, thought_in
   end
 end
 
-local function append_plan(result, plan_progress, interaction)
-  if type(plan_progress) ~= "table" then return end
-  local complete = plan_progress.status == "completed" or plan_progress.status == "complete"
-  local name = type(plan_progress.name) == "string" and vim.trim(plan_progress.name) or ""
-  local heading = complete and "• Plan" .. (name ~= "" and (" " .. name) or "") .. " Complete" or "• Plan"
-  local first = #result.lines + 1
-  result.lines[first] = heading
-  result.rows[first] = { kind = "plan", interaction = interaction }
-  result.highlights[#result.highlights + 1] = {
-    line = first,
-    first = 0,
-    last = -1,
-    group = "DiffReviewStatusSection",
-  }
-  for _, step in ipairs(plan_progress.step_list or {}) do
-    local status = step.status
-    local marker = status == "completed" and "[x]" or ((status == "inProgress" or status == "in_progress") and "[-]" or "[ ]")
-    result.lines[#result.lines + 1] = ("  %s %s"):format(marker, step.text or step.step or "")
-    result.rows[#result.lines] = { kind = "plan_step", interaction = interaction }
+local function append_active_thought(result, interaction, active, options)
+  local active_first = #result.lines + 1
+  append_wrapped(result, active.text, "↳ ", "  ", "DiffReviewHarnessCommentary", options.content_width)
+  for line = active_first, #result.lines do
+    result.rows[line] = { kind = "active_thought", interaction = interaction }
   end
-  if complete and #result.lines > first then
-    result.folds[#result.folds + 1] = {
-      key = "plan:" .. tostring(plan_progress.id or interaction.id),
-      first = first,
-      last = #result.lines,
-      folded = true,
-    }
+  local running = tool_count_text("Running", active.tool_count or 0, active.failed_count or 0)
+  if running then
+    result.lines[#result.lines + 1] = "  ▸ " .. running
+    result.rows[#result.lines] = { kind = "active_tool_count", interaction = interaction }
+  end
+  if type(active.latest_tool) == "table" then
+    append_active_tool_preview(result, active.latest_tool, options.content_width)
   end
 end
 
 local function append_interaction(result, interaction, options)
   if #result.lines > 0 then result.lines[#result.lines + 1] = "" end
-  local prompt_line = #result.lines + 1
-  append_wrapped(result, interaction.prompt, "▸ ", "  ", "DiffReviewHarnessPrompt")
-  result.prompt_lines[#result.prompt_lines + 1] = prompt_line
-  result.rows[prompt_line] = { kind = "prompt", interaction = interaction }
+  if not interaction.hide_prompt and interaction.kind ~= "plan_execution" then
+    local prompt_line = #result.lines + 1
+    append_wrapped(result, interaction.prompt, "▸ ", "  ", "DiffReviewHarnessPrompt", options.content_width)
+    result.prompt_lines[#result.prompt_lines + 1] = prompt_line
+    for line = prompt_line, #result.lines do
+      result.rows[line] = { kind = "prompt", interaction = interaction }
+    end
+  end
   local complete = interaction.state == "complete" or interaction.state == "failed"
-    or interaction.state == "rolled_back" or interaction.state == "superseded"
+    or interaction.state == "cancelled" or interaction.state == "rolled_back"
+    or interaction.state == "superseded"
   local tool_count, failed_count = interaction_counts(interaction)
   local previous_duration = math.floor((interaction.duration_ms or 0) / 1000)
   local duration = complete and previous_duration or previous_duration + (options.working_seconds or 0)
   local token_text = complete and format_token_count(interaction.token_count) or nil
-  local summary = complete and ("▸ Thought for %ds"):format(duration) or ("▸ Thinking for %ds"):format(duration)
+  local summary
+  if interaction.state == "cancelled" then
+    summary = ("▸ Cancelled after %ds"):format(duration)
+  elseif interaction.kind == "plan_draft" or interaction.kind == "plan_revision" then
+    if complete and interaction.awaiting_input then
+      summary = ("▸ Planning paused after %ds"):format(duration)
+    else
+      summary = complete and ("▸ Planned for %ds"):format(duration) or ("▸ Planning for %ds"):format(duration)
+    end
+  elseif interaction.kind == "plan_execution" then
+    local current = interaction.task and interaction.task.current or {}
+    local completed = 0
+    for _, task in ipairs(current) do if task.status == "completed" then completed = completed + 1 end end
+    local progress = #current > 0 and (" (%d/%d)"):format(completed, #current) or ""
+    summary = complete and ("▸ Executed plan%s for %ds"):format(progress, duration)
+      or ("▸ Executing plan%s for %ds"):format(progress, duration)
+  else
+    summary = complete and ("▸ Thought for %ds"):format(duration) or ("▸ Thinking for %ds"):format(duration)
+  end
   if token_text then summary = summary .. ", " .. token_text .. " tokens" end
   if tool_count > 0 then
     summary = summary .. (", %d %s called"):format(tool_count, tool_count == 1 and "tool" or "tools")
@@ -298,33 +310,25 @@ local function append_interaction(result, interaction, options)
     line = summary_line,
     first = 0,
     last = -1,
-    group = "DiffReviewHarnessThought",
+    group = complete and "DiffReviewHarnessThought" or "DiffReviewHarnessThinking",
   }
-  if not complete or result.expanded[summary_key] then
+  local task_owns_active = task_tree.append(result, interaction, options, complete, {
+    append_completed_thought = append_completed_thought,
+    append_active_thought = append_active_thought,
+  })
+  if (not complete or result.expanded[summary_key]) and not interaction.task then
     for thought_index, thought in ipairs(interaction.thought or {}) do
       append_completed_thought(result, interaction, thought, thought_index, options)
     end
+  elseif result.expanded[summary_key] and interaction.task then
+    for thought_index, thought in ipairs(interaction.thought or {}) do
+      if not thought.task_id then append_completed_thought(result, interaction, thought, thought_index, options) end
+    end
+    task_tree.append_superseded(result, interaction)
   end
   if interaction.active then
-    local active = interaction.active
-    local active_line = #result.lines + 1
-    append_wrapped(result, active.text, "↳ ", "  ", "DiffReviewHarnessCommentary")
-    result.rows[active_line] = { kind = "active_thought", interaction = interaction }
-    local running = tool_count_text("Running", active.tool_count or 0, active.failed_count or 0)
-    if running then
-      result.lines[#result.lines + 1] = "  " .. running
-      result.rows[#result.lines] = { kind = "active_tool_count", interaction = interaction }
-    end
-    if type(active.latest_tool) == "table" then
-      append_active_tool_preview(result, active.latest_tool, options.content_width)
-    end
-    if options.plan_progress and options.active_interaction_id == interaction.id then
-      append_plan(result, options.plan_progress, interaction)
-    end
+    if not task_owns_active then append_active_thought(result, interaction, interaction.active, options) end
   elseif complete then
-    if options.plan_progress and options.active_interaction_id == interaction.id then
-      append_plan(result, options.plan_progress, interaction)
-    end
     local aggregate = diff_tree.build(interaction.diff_text, {
       indent = 2,
       key_prefix = ("interaction:%s:aggregate"):format(interaction.id or interaction.ordinal),
@@ -363,8 +367,32 @@ local function append_interaction(result, interaction, options)
   end
 end
 
+local function aggregate_execution(entry)
+  local aggregate = {
+    id = entry.id,
+    prompt = "",
+    hide_prompt = true,
+    kind = "plan_execution",
+    state = entry.execution and entry.execution.state == "active" and "running" or "complete",
+    thought = {},
+    duration_ms = 0,
+    token_count = 0,
+  }
+  for _, interaction in ipairs(entry.interaction or {}) do
+    for _, thought in ipairs(interaction.thought or {}) do aggregate.thought[#aggregate.thought + 1] = thought end
+    aggregate.duration_ms = aggregate.duration_ms + (interaction.duration_ms or 0)
+    aggregate.token_count = math.max(aggregate.token_count or 0, interaction.token_count or 0)
+    aggregate.active = interaction.active or aggregate.active
+    aggregate.task = interaction.task or aggregate.task
+    aggregate.diff_text = interaction.diff_text or aggregate.diff_text
+    aggregate.response = interaction.response or aggregate.response
+  end
+  if aggregate.token_count == 0 then aggregate.token_count = nil end
+  return aggregate
+end
+
 ---@param interactions table[]
----@param options? { working_seconds?: integer, plan_progress?: table, active_interaction_id?: string, cwd?: string, on_diff_update?: function, expanded?: table<string, boolean> }
+---@param options? { working_seconds?: integer, cwd?: string, on_diff_update?: function, expanded?: table<string, boolean> }
 ---@return table
 function M.build(interactions, options)
   options = options or {}
@@ -381,7 +409,17 @@ function M.build(interactions, options)
     diff_row_spans = {},
     expanded = expanded,
   }
-  for _, interaction in ipairs(interactions or {}) do append_interaction(result, interaction, options) end
+  for _, entry in ipairs(interactions or {}) do
+    if entry.kind == "interaction" and entry.interaction then
+      append_interaction(result, entry.interaction, options)
+    elseif entry.kind == "plan_lifecycle" then
+      plan_event.append(result, entry, { append_response = append_response })
+    elseif entry.kind == "plan_execution" then
+      append_interaction(result, aggregate_execution(entry), options)
+    else
+      append_interaction(result, entry, options)
+    end
+  end
   if #result.lines == 0 then result.lines = { "" } end
   return result
 end

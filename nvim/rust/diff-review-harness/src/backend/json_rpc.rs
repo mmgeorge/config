@@ -1,7 +1,9 @@
 use crate::backend::{
-    BackendEvent, BackendEventSink, BackendOutput, PlanProgress, PlanStep, ToolActivity,
-    ToolActivityKind, TrustPolicy,
+    BackendEvent, BackendEventSink, BackendOutput, ProviderTaskEntry, ProviderTaskUpdate,
+    TaskStatus, ToolActivity, ToolActivityKind, TrustPolicy,
 };
+use crate::plan::PlanQuestionSet;
+use crate::session::ContextUsage;
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::fs;
@@ -91,36 +93,53 @@ impl JsonRpcProcess {
         params: Value,
         output: &mut BackendOutput,
     ) -> Result<Value> {
+        let id = self.send_request(method, params).await?;
+        loop {
+            let message = self.read_message(output).await?;
+            if let Some(result) = Self::request_result(&message, id, method) {
+                return result;
+            }
+        }
+    }
+
+    /// Start one JSON-RPC request without taking ownership of the response loop.
+    pub async fn send_request(&mut self, method: &str, params: Value) -> Result<u64> {
         let id = self.next_id;
         self.next_id += 1;
         self.write_message(
             &json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }),
         )
         .await?;
-        loop {
-            let line = self
-                .stdout
-                .next_line()
-                .await
-                .context("read backend JSONL")?
-                .context("backend closed stdout before completing the request")?;
-            let message: Value = serde_json::from_str(&line)
-                .with_context(|| format!("decode backend JSON-RPC line: {line}"))?;
-            if message.get("id").and_then(Value::as_u64) == Some(id)
-                && message.get("method").is_none()
-            {
-                if let Some(error) = message.get("error") {
-                    anyhow::bail!("backend {method} failed: {error}");
-                }
-                return Ok(message.get("result").cloned().unwrap_or(Value::Null));
-            }
-            if message.get("id").is_some() && message.get("method").is_some() {
-                self.respond_to_provider_request(&message).await?;
-                normalize_event(&message, output, self.event_sink.as_ref());
-                continue;
-            }
-            normalize_event(&message, output, self.event_sink.as_ref());
+        Ok(id)
+    }
+
+    /// Read and normalize one provider message while preserving request routing metadata.
+    pub async fn read_message(&mut self, output: &mut BackendOutput) -> Result<Value> {
+        let line = self
+            .stdout
+            .next_line()
+            .await
+            .context("read backend JSONL")?
+            .context("backend closed stdout before completing the request")?;
+        let message: Value = serde_json::from_str(&line)
+            .with_context(|| format!("decode backend JSON-RPC line: {line}"))?;
+        if message.get("id").is_some() && message.get("method").is_some() {
+            self.respond_to_provider_request(&message).await?;
         }
+        normalize_event(&message, output, self.event_sink.as_ref());
+        Ok(message)
+    }
+
+    /// Resolve one matching JSON-RPC response without consuming unrelated messages.
+    pub fn request_result(message: &Value, id: u64, method: &str) -> Option<Result<Value>> {
+        if message.get("id").and_then(Value::as_u64) != Some(id) || message.get("method").is_some()
+        {
+            return None;
+        }
+        if let Some(error) = message.get("error") {
+            return Some(Err(anyhow::anyhow!("backend {method} failed: {error}")));
+        }
+        Some(Ok(message.get("result").cloned().unwrap_or(Value::Null)))
     }
 
     /// Collect provider events until a named terminal notification arrives.
@@ -130,18 +149,7 @@ impl JsonRpcProcess {
         output: &mut BackendOutput,
     ) -> Result<Value> {
         loop {
-            let line = self
-                .stdout
-                .next_line()
-                .await
-                .context("read backend JSONL")?
-                .context("backend closed stdout before the turn completed")?;
-            let message: Value = serde_json::from_str(&line)
-                .with_context(|| format!("decode backend JSON-RPC line: {line}"))?;
-            if message.get("id").is_some() && message.get("method").is_some() {
-                self.respond_to_provider_request(&message).await?;
-            }
-            normalize_event(&message, output, self.event_sink.as_ref());
+            let message = self.read_message(output).await?;
             if message.get("method").and_then(Value::as_str) == Some(terminal_method) {
                 return Ok(message.get("params").cloned().unwrap_or(Value::Null));
             }
@@ -470,10 +478,28 @@ fn normalize_event(
     let usage_event = method_lower.contains("tokenusage")
         || encoded.contains("\"sessionupdate\":\"usage_update\"")
         || encoded.contains("\"session_update\":\"usage_update\"");
+    if let Some(native_compact) = available_compact_update(&params) {
+        output.metrics.native_compact_update = Some(native_compact);
+    }
     if let Some(token_count) = turn_token_count(&params) {
         output.metrics.token_count = Some(token_count);
     }
     if usage_event {
+        if let Some(context_usage) = context_usage(&params) {
+            output.metrics.context_usage = Some(context_usage.clone());
+            let event = BackendEvent {
+                kind: "context_usage".into(),
+                text: None,
+                data: serde_json::to_value(context_usage).unwrap_or(Value::Null),
+                activity: None,
+                summary: None,
+                task_update: None,
+            };
+            if let Some(event_sink) = event_sink {
+                let _ = event_sink.send(event.clone());
+            }
+            append_output_event(output, event);
+        }
         return;
     }
     let control_tool = control_tool_name(&params);
@@ -509,16 +535,15 @@ fn normalize_event(
         "assistant_message"
     };
 
-    if tool_event && control_tool == Some("harness_plan_submit") {
-        if let Some(plan) = find_plan(&params) {
-            output.plan_markdown = Some(plan);
-            output.structured_plan = true;
-        }
-    } else if !output.structured_plan
-        && plan_event
+    if tool_event
+        && control_tool == Some("harness_plan_submit")
         && let Some(plan) = find_plan(&params)
     {
         output.plan_markdown = Some(plan);
+        output.structured_plan = true;
+    }
+    if tool_event && control_tool == Some("harness_plan_question") {
+        output.plan_question = find_plan_question(&params);
     }
     if tool_event && control_tool == Some("harness_goal_complete") {
         output.evidence.structured_complete = true;
@@ -548,8 +573,8 @@ fn normalize_event(
         let activity = tool_event
             .then(|| normalize_tool_activity(method, &params))
             .flatten();
-        let plan_progress = plan_event
-            .then(|| normalize_plan_progress(method, &params))
+        let task_update = plan_event
+            .then(|| normalize_task_update(method, &params))
             .flatten();
         let event = BackendEvent {
             kind: kind.into(),
@@ -557,13 +582,48 @@ fn normalize_event(
             data: json!({ "method": method, "params": params }),
             activity,
             summary: None,
-            plan_progress,
+            task_update,
         };
         if let Some(event_sink) = event_sink {
             let _ = event_sink.send(event.clone());
         }
         append_output_event(output, event);
     }
+}
+
+fn context_usage(params: &Value) -> Option<ContextUsage> {
+    if let Some(token_usage) = params
+        .get("tokenUsage")
+        .or_else(|| params.get("token_usage"))
+    {
+        let used = token_usage
+            .pointer("/last/totalTokens")
+            .or_else(|| token_usage.pointer("/last/total_tokens"))
+            .and_then(Value::as_u64)?;
+        let size = token_usage
+            .get("modelContextWindow")
+            .or_else(|| token_usage.get("model_context_window"))
+            .and_then(Value::as_u64)?;
+        return ContextUsage::codex(used, size);
+    }
+    let update = params.get("update").unwrap_or(params);
+    let used = update.get("used").and_then(Value::as_u64)?;
+    let size = update.get("size").and_then(Value::as_u64)?;
+    ContextUsage::acp(used, size)
+}
+
+fn available_compact_update(params: &Value) -> Option<bool> {
+    let update = params.get("update").unwrap_or(params);
+    let command_list = update
+        .get("availableCommands")
+        .or_else(|| update.get("available_commands"))?
+        .as_array()?;
+    Some(command_list.iter().any(|command| {
+        command
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| name.trim_start_matches('/').eq_ignore_ascii_case("compact"))
+    }))
 }
 
 fn turn_token_count(params: &Value) -> Option<u64> {
@@ -610,6 +670,7 @@ fn control_tool_name(value: &Value) -> Option<&str> {
                     && matches!(
                         name,
                         "harness_plan_submit"
+                            | "harness_plan_question"
                             | "harness_goal_complete"
                             | "harness_goal_blocked"
                             | "harness_goal_status"
@@ -624,17 +685,43 @@ fn control_tool_name(value: &Value) -> Option<&str> {
     }
 }
 
+fn find_plan_question(value: &Value) -> Option<PlanQuestionSet> {
+    if value
+        .get("tool")
+        .or_else(|| value.get("name"))
+        .or_else(|| value.get("toolName"))
+        .or_else(|| value.get("tool_name"))
+        .and_then(Value::as_str)
+        == Some("harness_plan_question")
+        && let Some(arguments) = value.get("arguments")
+    {
+        if let Ok(question) = serde_json::from_value(arguments.clone()) {
+            return Some(question);
+        }
+        if let Some(arguments) = arguments.as_str()
+            && let Ok(arguments) = serde_json::from_str(arguments)
+        {
+            return Some(arguments);
+        }
+    }
+    match value {
+        Value::Array(item) => item.iter().find_map(find_plan_question),
+        Value::Object(map) => map.values().find_map(find_plan_question),
+        _ => None,
+    }
+}
+
 fn append_output_event(output: &mut BackendOutput, event: BackendEvent) {
-    if let Some(progress) = event.plan_progress.as_ref()
+    if let Some(update) = event.task_update.as_ref()
         && let Some(index) = output.event.iter().rposition(|previous| {
             previous
-                .plan_progress
+                .task_update
                 .as_ref()
-                .is_some_and(|previous_progress| previous_progress.id == progress.id)
+                .is_some_and(|previous_update| previous_update.scope_id == update.scope_id)
         })
     {
         let mut previous = output.event.remove(index);
-        merge_plan_progress(&mut previous, event);
+        merge_task_update(&mut previous, event);
         output.event.push(previous);
         return;
     }
@@ -693,44 +780,65 @@ fn append_output_event(output: &mut BackendOutput, event: BackendEvent) {
     output.event.push(event);
 }
 
-fn merge_plan_progress(previous: &mut BackendEvent, incoming: BackendEvent) {
-    let Some(incoming_progress) = incoming.plan_progress else {
+fn merge_task_update(previous: &mut BackendEvent, incoming: BackendEvent) {
+    let Some(incoming_update) = incoming.task_update else {
         return;
     };
-    let Some(previous_progress) = previous.plan_progress.as_mut() else {
+    let Some(previous_update) = previous.task_update.as_mut() else {
         return;
     };
-    if incoming_progress.name.is_some() {
-        previous_progress.name = incoming_progress.name;
+    if incoming_update.name.is_some() {
+        previous_update.name = incoming_update.name;
     }
-    if !incoming_progress.step_list.is_empty() {
-        previous_progress.step_list = incoming_progress.step_list;
+    if incoming_update.replace_entries {
+        previous_update.entry_list = incoming_update.entry_list;
     }
-    previous_progress.status = incoming_progress.status;
+    previous_update.replace_entries = incoming_update.replace_entries;
+    previous_update.complete = incoming_update.complete;
     previous.data = incoming.data;
 }
 
-fn normalize_plan_progress(method: &str, params: &Value) -> Option<PlanProgress> {
+fn normalize_task_update(method: &str, params: &Value) -> Option<ProviderTaskUpdate> {
     let envelope = params.get("update").unwrap_or(params);
     let entry_list = envelope
         .get("plan")
         .or_else(|| envelope.get("entries"))
         .and_then(Value::as_array);
-    let step_list = entry_list
+    let replace_entries = entry_list.is_some();
+    let entry_list = entry_list
         .into_iter()
         .flatten()
-        .filter_map(|entry| {
-            let text = entry
+        .enumerate()
+        .filter_map(|(provider_ordinal, entry)| {
+            let content = entry
                 .get("step")
                 .or_else(|| entry.get("content"))
                 .and_then(Value::as_str)?;
-            let status = entry
+            let status = match entry
                 .get("status")
                 .and_then(Value::as_str)
-                .unwrap_or("pending");
-            Some(PlanStep {
-                text: text.to_owned(),
-                status: status.to_owned(),
+                .unwrap_or("pending")
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "inprogress" | "in_progress" | "active" => TaskStatus::InProgress,
+                "completed" | "complete" | "done" => TaskStatus::Completed,
+                _ => TaskStatus::Pending,
+            };
+            Some(ProviderTaskEntry {
+                provider_id: entry
+                    .get("id")
+                    .or_else(|| entry.get("taskId"))
+                    .or_else(|| entry.get("task_id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                content: content.to_owned(),
+                priority: entry
+                    .get("priority")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                status,
+                provider_ordinal,
             })
         })
         .collect::<Vec<_>>();
@@ -740,10 +848,10 @@ fn normalize_plan_progress(method: &str, params: &Value) -> Option<PlanProgress>
             .get("status")
             .and_then(Value::as_str)
             .is_some_and(|status| matches!(status, "completed" | "complete"));
-    if step_list.is_empty() && !completed {
+    if entry_list.is_empty() && !completed {
         return None;
     }
-    let id = envelope
+    let scope_id = envelope
         .get("turnId")
         .or_else(|| envelope.get("turn_id"))
         .or_else(|| envelope.get("threadId"))
@@ -759,11 +867,12 @@ fn normalize_plan_progress(method: &str, params: &Value) -> Option<PlanProgress>
         .and_then(Value::as_str)
         .filter(|name| !name.trim().is_empty())
         .map(str::to_owned);
-    Some(PlanProgress {
-        id,
+    Some(ProviderTaskUpdate {
+        scope_id,
         name,
-        status: if completed { "completed" } else { "inProgress" }.to_owned(),
-        step_list,
+        complete: completed,
+        replace_entries,
+        entry_list,
     })
 }
 
@@ -1051,7 +1160,40 @@ mod test {
     }
 
     #[test]
-    fn preserves_native_plan_across_lifecycle_events_without_plan_content() {
+    fn extracts_structured_questions_from_dynamic_tool_arguments() {
+        let mut output = BackendOutput::default();
+        normalize_event(
+            &json!({
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "type": "dynamicToolCall",
+                        "tool": "harness_plan_question",
+                        "arguments": {
+                            "questions": [{
+                                "header": "Migration",
+                                "question": "Which migration should the plan use?",
+                                "options": [
+                                    { "label": "Staged", "description": "Support both formats temporarily." },
+                                    { "label": "Immediate", "description": "Remove the old format now." }
+                                ],
+                                "allowFreeform": true
+                            }]
+                        }
+                    }
+                }
+            }),
+            &mut output,
+            None,
+        );
+        let question = output.plan_question.expect("structured planning question");
+        assert_eq!(question.questions[0].header, "Migration");
+        assert_eq!(question.questions[0].options[0].label, "Staged");
+        assert!(output.event.is_empty());
+    }
+
+    #[test]
+    fn replaces_task_state_across_lifecycle_events_without_creating_an_artifact() {
         let mut output = BackendOutput::default();
         normalize_event(
             &json!({
@@ -1069,15 +1211,12 @@ mod test {
             &mut output,
             None,
         );
-        assert_eq!(
-            output.plan_markdown.as_deref(),
-            Some("# Plan\n\n1. [ ] Inspect the change\n")
-        );
+        assert!(output.plan_markdown.is_none());
         assert_eq!(output.event.len(), 1);
-        let progress = output.event[0].plan_progress.as_ref().unwrap();
-        assert_eq!(progress.status, "completed");
-        assert_eq!(progress.step_list.len(), 1);
-        assert_eq!(progress.step_list[0].text, "Inspect the change");
+        let update = output.event[0].task_update.as_ref().unwrap();
+        assert!(update.complete);
+        assert_eq!(update.entry_list.len(), 1);
+        assert_eq!(update.entry_list[0].content, "Inspect the change");
     }
 
     #[test]
@@ -1097,10 +1236,10 @@ mod test {
             &mut output,
             None,
         );
-        assert_eq!(
-            output.plan_markdown.as_deref(),
-            Some("# Plan\n\n1. [x] Inspect the change\n2. [-] Apply the fix\n")
-        );
+        assert!(output.plan_markdown.is_none());
+        let update = output.event[0].task_update.as_ref().unwrap();
+        assert_eq!(update.entry_list[0].status, TaskStatus::Completed);
+        assert_eq!(update.entry_list[1].status, TaskStatus::InProgress);
     }
 
     #[test]
@@ -1393,7 +1532,10 @@ mod test {
                 "method": "thread/tokenUsage/updated",
                 "params": {
                     "threadId": "thread-1",
-                    "tokenUsage": { "last": { "totalTokens": 2700 } }
+                    "tokenUsage": {
+                        "last": { "totalTokens": 2700 },
+                        "modelContextWindow": 353000
+                    }
                 }
             }),
             &mut output,
@@ -1409,6 +1551,61 @@ mod test {
         );
 
         assert_eq!(output.metrics.token_count, Some(2700));
-        assert!(output.event.is_empty());
+        assert_eq!(
+            output.metrics.context_usage,
+            Some(ContextUsage {
+                used: 2700,
+                size: 353000,
+                remaining_percent: 100,
+            })
+        );
+        assert_eq!(output.event.len(), 1);
+        assert_eq!(output.event[0].kind, "context_usage");
+    }
+
+    #[test]
+    fn records_acp_context_and_native_compaction_capability() {
+        let mut output = BackendOutput::default();
+        normalize_event(
+            &json!({
+                "method": "session/update",
+                "params": {
+                    "sessionId": "session-1",
+                    "update": {
+                        "sessionUpdate": "usage_update",
+                        "used": 156000,
+                        "size": 200000
+                    }
+                }
+            }),
+            &mut output,
+            None,
+        );
+        normalize_event(
+            &json!({
+                "method": "session/update",
+                "params": {
+                    "sessionId": "session-1",
+                    "update": {
+                        "sessionUpdate": "available_commands_update",
+                        "availableCommands": [
+                            { "name": "compact", "description": "Compact context" }
+                        ]
+                    }
+                }
+            }),
+            &mut output,
+            None,
+        );
+
+        assert_eq!(
+            output.metrics.context_usage,
+            Some(ContextUsage {
+                used: 156000,
+                size: 200000,
+                remaining_percent: 22,
+            })
+        );
+        assert_eq!(output.metrics.native_compact_update, Some(true));
     }
 }

@@ -1,5 +1,6 @@
 use diff_review_harness::backend::codex::CodexBackend;
 use diff_review_harness::backend::{Backend, BackendRequest, PromptMode, TrustPolicy};
+use diff_review_harness::plan::PlanPrompt;
 use diff_review_harness::session::WriteMode;
 use std::fs;
 use std::path::Path;
@@ -21,7 +22,7 @@ fn request(workspace: &Path, mode: PromptMode, text: &str) -> BackendRequest {
         mode,
         model: "gpt-5.4-mini".into(),
         effort: "low".into(),
-        fast_mode: false,
+        fast_mode: true,
         write_mode: if mode == PromptMode::Plan {
             WriteMode::Read
         } else {
@@ -124,7 +125,9 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
         .prompt(request(
             repository.path(),
             PromptMode::Plan,
-            "Create a concise plan to add harness-integration.txt containing exactly `verified`. Do not modify files.",
+            &PlanPrompt::draft(
+                "Create a concise plan to add harness-integration.txt containing exactly `verified`. Do not modify files.",
+            ),
         ))
         .await
         .unwrap();

@@ -1,9 +1,11 @@
 ---@module 'blink.cmp'
 local CommandSource = {}
+local session = require("diff_review.session")
 
 local command_list = {
   { label = "/plan", detail = "Create a reviewed plan" },
   { label = "/plan cancel", detail = "Cancel the active plan" },
+  { label = "/questions", detail = "Reopen pending planning questions" },
   { label = "/goal", detail = "Set a persistent goal" },
   { label = "/goal pause", detail = "Pause automatic goal continuation" },
   { label = "/goal resume", detail = "Resume automatic goal continuation" },
@@ -11,6 +13,7 @@ local command_list = {
   { label = "/read", detail = "Require approval for workspace writes" },
   { label = "/write", detail = "Allow workspace writes" },
   { label = "/clear", detail = "Start a new session" },
+  { label = "/compact", detail = "Compact provider-owned context", capability = "native_compact" },
   { label = "/rename", detail = "Rename the current session" },
   { label = "/effort", detail = "Select reasoning effort" },
   { label = "/model", detail = "Select the backend model" },
@@ -41,6 +44,8 @@ function CommandSource:get_completions(_, callback)
   local items = {}
   if command_start then
     for _, command in ipairs(command_list) do
+      local capability = session.harness.capability or {}
+      if command.capability and capability[command.capability] ~= true then goto continue end
       items[#items + 1] = {
         label = command.label,
         filterText = command.label,
@@ -54,6 +59,7 @@ function CommandSource:get_completions(_, callback)
           },
         },
       }
+      ::continue::
     end
   end
   callback({ items = items, is_incomplete_backward = false, is_incomplete_forward = false })

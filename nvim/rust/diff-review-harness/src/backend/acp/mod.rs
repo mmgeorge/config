@@ -25,6 +25,7 @@ struct AcpConnection {
     initialized: Value,
     session: HashMap<String, Value>,
     preview_session_id: Option<String>,
+    native_compact: bool,
 }
 
 impl AcpBackend {
@@ -67,6 +68,7 @@ impl AcpBackend {
             initialized,
             session: HashMap::new(),
             preview_session_id: None,
+            native_compact: output.metrics.native_compact_update.unwrap_or(false),
         })
     }
 
@@ -81,8 +83,9 @@ impl AcpBackend {
                 || encoded.contains("session/fork")
                 || encoded.contains("forksession")
                 || encoded.contains("fork_session"),
+            native_compact: false,
+            native_steer: false,
             native_goal: false,
-            native_plan: encoded.contains("plan"),
             model_selection: false,
             effort_selection: false,
             permission_control: true,
@@ -139,7 +142,7 @@ impl AcpBackend {
 
     fn desired_mode(session: &Value, request: &BackendRequest) -> Option<String> {
         if request.mode == crate::backend::PromptMode::Plan {
-            Self::mode_id(session, &["plan", "architect", "planning", "ask"])
+            None
         } else {
             Self::mode_id(session, &["code", "agent", "default", "build", "write"])
         }
@@ -426,14 +429,14 @@ impl AcpBackend {
 
     fn prompt_text(request: &BackendRequest) -> String {
         let contract = match request.mode {
-            crate::backend::PromptMode::Plan => {
-                "You are planning in READ mode. Do not modify files. Call harness_plan_submit with the complete Markdown plan."
-            }
+            crate::backend::PromptMode::Plan => return request.text.clone(),
             crate::backend::PromptMode::GoalContinuation
             | crate::backend::PromptMode::ExecutePlan => {
                 "Continue until the active goal reaches a terminal state. Call harness_goal_complete or harness_goal_blocked. Ordinary prose does not complete the goal."
             }
-            _ => "Use the Harness control tools for plan and goal terminal state.",
+            _ => {
+                "Use harness_plan_question whenever the user explicitly requests interactive or multiple-choice questions. The question tool works outside planning. Do not claim questions were sent through prose. Use the other Harness control tools for plan and goal terminal state."
+            }
         };
         format!("{contract}\n\n{}", request.text)
     }
@@ -479,6 +482,7 @@ impl Backend for AcpBackend {
             Self::configure_connection(connection, &attempt_request, event_sink.clone());
             let result = async {
                 output.capability = Self::capability(&connection.initialized);
+                output.capability.native_compact = connection.native_compact;
                 let (session_id, mut session) =
                     Self::prompt_session(connection, &attempt_request, &mut output).await?;
                 output.backend_session_id = Some(session_id.clone());
@@ -486,9 +490,6 @@ impl Backend for AcpBackend {
                     Self::config_option(&session, "model").is_some();
                 output.capability.effort_selection =
                     Self::config_option(&session, "thought_level").is_some();
-                output.capability.native_plan =
-                    Self::mode_id(&session, &["plan", "architect", "planning", "ask"]).is_some()
-                        || output.capability.native_plan;
                 output.runtime.provider = self.provider_label();
                 output.runtime.model = Self::runtime_model(&session, &attempt_request);
                 Self::configure_session(
@@ -512,6 +513,10 @@ impl Backend for AcpBackend {
                     )
                     .await
                     .context("run ACP prompt")?;
+                if let Some(native_compact) = output.metrics.native_compact_update {
+                    connection.native_compact = native_compact;
+                    output.capability.native_compact = native_compact;
+                }
                 Ok(output)
             }
             .await;
@@ -582,6 +587,21 @@ impl Backend for AcpBackend {
             *connection_guard = None;
         }
         result
+    }
+
+    async fn compact(&self, mut request: BackendRequest) -> Result<BackendOutput> {
+        anyhow::ensure!(
+            request.backend_session_id.is_some(),
+            "ACP session has not started"
+        );
+        request.text = "/compact".into();
+        self.prompt_stream(request, None).await
+    }
+
+    async fn cancel(&self) -> Result<()> {
+        let mut connection_guard = self.connection.lock().await;
+        *connection_guard = None;
+        Ok(())
     }
 
     async fn model_list(&self, request: BackendRequest) -> Result<Vec<BackendModel>> {
@@ -658,8 +678,8 @@ mod test {
     fn selects_plan_and_execution_modes_from_acp_session_state() {
         let session = session();
         assert_eq!(
-            AcpBackend::desired_mode(&session, &request(PromptMode::Plan)).as_deref(),
-            Some("architect")
+            AcpBackend::desired_mode(&session, &request(PromptMode::Plan)),
+            None
         );
         assert_eq!(
             AcpBackend::desired_mode(&session, &request(PromptMode::ExecutePlan)).as_deref(),

@@ -8,4 +8,5 @@ pub mod plan;
 pub mod protocol;
 pub mod session;
 pub mod storage;
+pub mod timeline;
 pub mod workspace;

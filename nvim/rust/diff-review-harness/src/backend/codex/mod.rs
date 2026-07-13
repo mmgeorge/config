@@ -1,4 +1,5 @@
 use crate::backend::json_rpc::JsonRpcProcess;
+use crate::backend::steering::{ActiveSteering, SteerCommand, SteeringLane};
 use crate::backend::{
     Backend, BackendCapability, BackendEventSink, BackendModel, BackendOutput, BackendRequest,
     PromptMode,
@@ -7,24 +8,14 @@ use crate::session::WriteMode;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use tokio::sync::Mutex;
 
 /// Owns Codex app-server thread lifecycle, prompting, permission policy, and native fork.
 pub struct CodexBackend {
     command: Vec<String>,
     default_model: Mutex<Option<String>>,
-}
-
-fn assistant_plan_fallback(output: &BackendOutput) -> Option<String> {
-    let markdown = output
-        .event
-        .iter()
-        .filter(|event| event.kind == "assistant_message")
-        .filter_map(|event| event.text.as_deref())
-        .filter(|text| !text.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    (!markdown.trim().is_empty()).then_some(markdown)
+    steering: SteeringLane,
 }
 
 impl CodexBackend {
@@ -37,6 +28,7 @@ impl CodexBackend {
         Ok(Self {
             command,
             default_model: Mutex::new(None),
+            steering: SteeringLane::default(),
         })
     }
 
@@ -156,6 +148,95 @@ impl CodexBackend {
         *self.default_model.lock().await = Some(model.clone());
         Ok(model)
     }
+
+    async fn run_active_turn(
+        process: &mut JsonRpcProcess,
+        output: &mut BackendOutput,
+        steering: &mut ActiveSteering,
+        thread_id: &str,
+        turn_id: &str,
+        mut provider_turn_started: bool,
+    ) -> Result<Value> {
+        let mut pending_command = HashMap::<u64, SteerCommand>::new();
+        loop {
+            tokio::select! {
+                Some(command) = steering.receive(), if provider_turn_started => {
+                    let request_id = process
+                        .send_request(
+                            "turn/steer",
+                            json!({
+                                "threadId": thread_id,
+                                "input": [{ "type": "text", "text": command.text.clone() }],
+                                "expectedTurnId": turn_id,
+                            }),
+                        )
+                        .await;
+                    match request_id {
+                        Ok(request_id) => {
+                            pending_command.insert(request_id, command);
+                        }
+                        Err(error) => command.complete(Err(error)),
+                    }
+                }
+                message = process.read_message(output) => {
+                    let message = message?;
+                    if Self::notification_turn_id(&message, "turn/started") == Some(turn_id) {
+                        provider_turn_started = true;
+                    }
+                    if let Some(request_id) = message.get("id").and_then(Value::as_u64)
+                        && let Some(command) = pending_command.remove(&request_id)
+                    {
+                        let result = JsonRpcProcess::request_result(
+                            &message,
+                            request_id,
+                            "turn/steer",
+                        )
+                        .context("Codex steering response omitted its request result")?
+                        .map(drop);
+                        command.complete(result);
+                    }
+                    if message.get("method").and_then(Value::as_str) == Some("turn/completed") {
+                        drop(pending_command);
+                        return Ok(message.get("params").cloned().unwrap_or(Value::Null));
+                    }
+                }
+            }
+        }
+    }
+
+    fn notification_turn_id<'a>(message: &'a Value, method: &str) -> Option<&'a str> {
+        (message.get("method").and_then(Value::as_str) == Some(method))
+            .then(|| message.pointer("/params/turn/id").and_then(Value::as_str))
+            .flatten()
+    }
+
+    async fn start_turn(
+        process: &mut JsonRpcProcess,
+        output: &mut BackendOutput,
+        params: Value,
+    ) -> Result<(Value, bool)> {
+        let request_id = process.send_request("turn/start", params).await?;
+        let mut started_turn_id = None;
+        loop {
+            let message = process.read_message(output).await?;
+            if let Some(turn_id) = Self::notification_turn_id(&message, "turn/started") {
+                started_turn_id = Some(turn_id.to_owned());
+            }
+            if let Some(response) =
+                JsonRpcProcess::request_result(&message, request_id, "turn/start")
+            {
+                let turn = response?;
+                let turn_id = turn
+                    .pointer("/turn/id")
+                    .or_else(|| turn.get("turnId"))
+                    .or_else(|| turn.get("turn_id"))
+                    .and_then(Value::as_str)
+                    .context("Codex turn/start response omitted turn id")?;
+                let provider_turn_started = started_turn_id.as_deref() == Some(turn_id);
+                return Ok((turn, provider_turn_started));
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -165,11 +246,13 @@ impl Backend for CodexBackend {
         request: BackendRequest,
         event_sink: Option<BackendEventSink>,
     ) -> Result<BackendOutput> {
+        let mut active_steering = self.steering.activate()?;
         let mut output = BackendOutput {
             capability: BackendCapability {
                 native_fork: true,
+                native_compact: true,
+                native_steer: true,
                 native_goal: true,
-                native_plan: true,
                 model_selection: true,
                 effort_selection: true,
                 permission_control: true,
@@ -182,6 +265,7 @@ impl Backend for CodexBackend {
             .await?;
         output.runtime.provider = "Codex CLI".into();
         output.runtime.model = Some(resolved_model);
+        let plan_question_schema = crate::control_tools::plan_question_input_schema();
         let thread = match &request.backend_session_id {
             Some(thread_id) => process.request("thread/resume", json!({
                 "threadId": thread_id,
@@ -195,9 +279,10 @@ impl Backend for CodexBackend {
                 "sandbox": if request.write_mode == WriteMode::Write { "workspace-write" } else { "read-only" },
                 "experimentalRawEvents": false,
                 "historyMode": "legacy",
-                "developerInstructions": "You run inside DiffReview Harness. For planning, call harness_plan_submit with the complete Markdown plan. For a terminal goal state, call harness_goal_complete or harness_goal_blocked. Never claim completion through ordinary prose alone.",
+                "developerInstructions": "You run inside DiffReview Harness. Call harness_plan_question whenever the user asks for interactive or multiple-choice questions, and during planning when a material user decision is required. The question tool works in every mode. Call harness_plan_submit only with a complete Markdown plan. End the turn after a Harness question or plan control call. For a terminal goal state, call harness_goal_complete or harness_goal_blocked. Never claim a control action through ordinary prose alone.",
                 "dynamicTools": [
                     { "type": "function", "name": "harness_plan_submit", "description": "Submit the complete Markdown plan for mandatory user review.", "inputSchema": { "type": "object", "properties": { "markdown": { "type": "string" } }, "required": ["markdown"] } },
+                    { "type": "function", "name": "harness_plan_question", "description": "Pause any Harness turn and present one to three interactive user questions. Use this for explicit requests for multiple-choice questions as well as planning decisions.", "inputSchema": plan_question_schema },
                     { "type": "function", "name": "harness_goal_complete", "description": "Mark the active Harness goal complete.", "inputSchema": { "type": "object", "properties": { "summary": { "type": "string" } }, "required": ["summary"] } },
                     { "type": "function", "name": "harness_goal_blocked", "description": "Mark the active Harness goal blocked.", "inputSchema": { "type": "object", "properties": { "reason": { "type": "string" } }, "required": ["reason"] } },
                     { "type": "function", "name": "harness_goal_status", "description": "Report nonterminal progress toward the active Harness goal.", "inputSchema": { "type": "object", "properties": { "status": { "type": "string" } }, "required": ["status"] } }
@@ -213,7 +298,10 @@ impl Backend for CodexBackend {
             .or(request.backend_session_id.clone())
             .context("Codex thread response omitted thread id")?;
         output.backend_session_id = Some(thread_id.clone());
-        let mut prompt = request.text.clone();
+        let mut prompt = format!(
+            "Harness interaction contract: when the user explicitly asks for interactive or multiple-choice questions, call harness_plan_question with the complete question set. The tool works outside planning. Do not claim questions were sent through prose.\n\n{}",
+            request.text
+        );
         if request.mode == PromptMode::GoalContinuation {
             let objective = request
                 .text
@@ -250,26 +338,32 @@ impl Backend for CodexBackend {
                 )
                 .await?;
         }
-        let collaboration_mode = (request.mode == PromptMode::Plan).then(|| {
-            let settings = Self::with_model(json!({
-                "reasoning_effort": request.effort,
-                "developer_instructions": "Produce a reviewer-readable implementation plan, then call harness_plan_submit with the complete Markdown artifact. Do not modify files."
-            }), &request.model);
-            json!({ "mode": "plan", "settings": settings })
-        });
-        process.request("turn/start", Self::with_model(json!({
+        let (turn, provider_turn_started) = Self::start_turn(&mut process, &mut output, Self::with_model(json!({
             "threadId": thread_id,
             "input": [{ "type": "text", "text": prompt }],
             "cwd": request.workspace,
             "effort": request.effort,
             "serviceTier": if request.fast_mode { Value::String("fast".into()) } else { Value::Null },
-            "collaborationMode": collaboration_mode,
             "approvalPolicy": Self::approval_policy(&request),
             "sandboxPolicy": {
                 "type": if request.write_mode == WriteMode::Write { "workspaceWrite" } else { "readOnly" }
             }
-        }), &request.model), &mut output).await?;
-        let completed = process.read_until("turn/completed", &mut output).await?;
+        }), &request.model)).await?;
+        let turn_id = turn
+            .pointer("/turn/id")
+            .or_else(|| turn.get("turnId"))
+            .or_else(|| turn.get("turn_id"))
+            .and_then(Value::as_str)
+            .context("Codex turn/start response omitted turn id")?;
+        let completed = Self::run_active_turn(
+            &mut process,
+            &mut output,
+            &mut active_steering,
+            &thread_id,
+            turn_id,
+            provider_turn_started,
+        )
+        .await?;
         let status = completed
             .pointer("/turn/status")
             .or_else(|| completed.get("status"))
@@ -279,9 +373,6 @@ impl Backend for CodexBackend {
             !status.eq_ignore_ascii_case("failed"),
             "Codex turn failed: {completed}"
         );
-        if request.mode == PromptMode::Plan && output.plan_markdown.is_none() {
-            output.plan_markdown = assistant_plan_fallback(&output);
-        }
         Ok(output)
     }
 
@@ -305,6 +396,62 @@ impl Backend for CodexBackend {
             .and_then(Value::as_str)
             .map(str::to_owned)
             .context("Codex fork response omitted thread id")
+    }
+
+    async fn steer(&self, text: String) -> Result<()> {
+        self.steering.steer(text).await
+    }
+
+    async fn compact(&self, request: BackendRequest) -> Result<BackendOutput> {
+        let thread_id = request
+            .backend_session_id
+            .clone()
+            .context("Codex thread has not started")?;
+        let mut output = BackendOutput {
+            backend_session_id: Some(thread_id.clone()),
+            capability: BackendCapability {
+                native_fork: true,
+                native_compact: true,
+                native_steer: true,
+                native_goal: true,
+                model_selection: true,
+                effort_selection: true,
+                permission_control: true,
+            },
+            ..BackendOutput::default()
+        };
+        let mut process = self.connect(&request, &mut output, None).await?;
+        process
+            .request(
+                "thread/resume",
+                json!({
+                    "threadId": thread_id,
+                    "cwd": request.workspace,
+                    "approvalPolicy": Self::approval_policy(&request),
+                    "sandbox": if request.write_mode == WriteMode::Write { "workspace-write" } else { "read-only" }
+                }),
+                &mut output,
+            )
+            .await?;
+        process
+            .request(
+                "thread/compact/start",
+                json!({ "threadId": thread_id }),
+                &mut output,
+            )
+            .await?;
+        let completed = process.read_until("turn/completed", &mut output).await?;
+        let status = completed
+            .pointer("/turn/status")
+            .or_else(|| completed.get("status"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        anyhow::ensure!(
+            !status.eq_ignore_ascii_case("failed"),
+            "Codex compaction failed: {completed}"
+        );
+        output.runtime.provider = "Codex CLI".into();
+        Ok(output)
     }
 
     async fn model_list(&self, request: BackendRequest) -> Result<Vec<BackendModel>> {
@@ -353,26 +500,6 @@ impl Backend for CodexBackend {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::backend::BackendEvent;
-
-    #[test]
-    fn uses_codex_plan_mode_message_when_no_structured_plan_event_arrives() {
-        let output = BackendOutput {
-            event: vec![BackendEvent {
-                kind: "assistant_message".into(),
-                text: Some("# Plan\n\n1. Inspect the change.".into()),
-                data: Value::Null,
-                activity: None,
-                summary: None,
-                plan_progress: None,
-            }],
-            ..BackendOutput::default()
-        };
-        assert_eq!(
-            assistant_plan_fallback(&output).as_deref(),
-            Some("# Plan\n\n1. Inspect the change.")
-        );
-    }
 
     #[test]
     fn omits_the_default_model_sentinel_from_codex_requests() {
@@ -395,5 +522,21 @@ mod test {
         }));
         assert_eq!(catalog[0].id, "gpt-default");
         assert!(catalog[0].is_default);
+    }
+
+    #[test]
+    fn recognizes_only_the_matching_turn_started_notification() {
+        let started = json!({
+            "method": "turn/started",
+            "params": { "turn": { "id": "turn-42", "status": "inProgress" } }
+        });
+        assert_eq!(
+            CodexBackend::notification_turn_id(&started, "turn/started"),
+            Some("turn-42")
+        );
+        assert_eq!(
+            CodexBackend::notification_turn_id(&started, "turn/completed"),
+            None
+        );
     }
 }

@@ -2,21 +2,25 @@ pub mod acp;
 pub mod codex;
 mod json_rpc;
 mod process;
+mod steering;
 
 use crate::goal::TurnEvidence;
-use crate::session::WriteMode;
+use crate::plan::PlanQuestionSet;
+use crate::session::{ContextUsage, WriteMode};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 
 /// Represents backend features that control visible Harness actions.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct BackendCapability {
     pub native_fork: bool,
+    pub native_compact: bool,
+    pub native_steer: bool,
     pub native_goal: bool,
-    pub native_plan: bool,
     pub model_selection: bool,
     pub effort_selection: bool,
     pub permission_control: bool,
@@ -92,23 +96,42 @@ pub struct BackendEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<TurnSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plan_progress: Option<PlanProgress>,
+    pub task_update: Option<ProviderTaskUpdate>,
 }
 
-/// Represents one provider plan as stable progress state for interaction consumers.
+/// Represents one complete provider task replacement.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct PlanProgress {
-    pub id: String,
+pub struct ProviderTaskUpdate {
+    pub scope_id: String,
     pub name: Option<String>,
-    pub status: String,
-    pub step_list: Vec<PlanStep>,
+    pub complete: bool,
+    #[serde(default = "default_true")]
+    pub replace_entries: bool,
+    pub entry_list: Vec<ProviderTaskEntry>,
 }
 
-/// Represents one checklist step within normalized provider plan progress.
+fn default_true() -> bool {
+    true
+}
+
+/// Represents one task within a provider replacement.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct PlanStep {
-    pub text: String,
-    pub status: String,
+pub struct ProviderTaskEntry {
+    pub provider_id: Option<String>,
+    pub content: String,
+    pub priority: Option<String>,
+    pub status: TaskStatus,
+    pub provider_ordinal: usize,
+}
+
+/// Defines provider task state plus retained superseded history.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Superseded,
 }
 
 /// Represents final timing and usage metadata for one assistant response.
@@ -148,6 +171,7 @@ pub struct BackendOutput {
     pub backend_session_id: Option<String>,
     pub event: Vec<BackendEvent>,
     pub plan_markdown: Option<String>,
+    pub plan_question: Option<PlanQuestionSet>,
     pub evidence: TurnEvidence,
     pub capability: BackendCapability,
     pub runtime: BackendRuntime,
@@ -161,6 +185,8 @@ pub struct BackendOutput {
 #[derive(Clone, Debug, Default)]
 pub struct TurnMetrics {
     pub token_count: Option<u64>,
+    pub context_usage: Option<ContextUsage>,
+    pub native_compact_update: Option<bool>,
 }
 
 /// Represents the provider identity and resolved model shown by Harness.
@@ -212,6 +238,21 @@ pub trait Backend: Send + Sync {
     ) -> Result<()> {
         Ok(())
     }
+
+    /// Compact provider-owned conversation history when the backend advertises support.
+    async fn compact(&self, _request: BackendRequest) -> Result<BackendOutput> {
+        anyhow::bail!("backend does not support context compaction")
+    }
+
+    /// Append user input to the active provider turn when native steering is available.
+    async fn steer(&self, _text: String) -> Result<()> {
+        anyhow::bail!("backend does not support active-turn steering")
+    }
+
+    /// Stop the active provider transport after its prompt future is cancelled.
+    async fn cancel(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Build a backend strategy from an explicit launch descriptor.
@@ -219,12 +260,22 @@ pub fn build(launch: BackendLaunch) -> Result<Box<dyn Backend>> {
     match launch.kind.as_str() {
         "acp" => Ok(Box::new(acp::AcpBackend::new(launch.command)?)),
         "codex" => Ok(Box::new(codex::CodexBackend::new(launch.command)?)),
-        "mock" => Ok(Box::new(MockBackend)),
+        "mock" => Ok(Box::new(MockBackend {
+            delay: match launch.command.first().map(String::as_str) {
+                Some("blocking") => Some(Duration::from_secs(60)),
+                Some("steering") => Some(Duration::from_millis(500)),
+                _ => None,
+            },
+            steering: steering::SteeringLane::default(),
+        })),
         kind => anyhow::bail!("unsupported Harness backend: {kind}"),
     }
 }
 
-struct MockBackend;
+struct MockBackend {
+    delay: Option<Duration>,
+    steering: steering::SteeringLane,
+}
 
 #[async_trait]
 impl Backend for MockBackend {
@@ -233,15 +284,53 @@ impl Backend for MockBackend {
         request: BackendRequest,
         event_sink: Option<BackendEventSink>,
     ) -> Result<BackendOutput> {
-        let plan_markdown =
-            (request.mode == PromptMode::Plan).then(|| format!("# Plan\n\n1. {}\n", request.text));
+        let mut active_steering = self.steering.activate()?;
+        let mut steering_text_list = Vec::new();
+        if let Some(delay) = self.delay {
+            let delay = tokio::time::sleep(delay);
+            tokio::pin!(delay);
+            loop {
+                tokio::select! {
+                    () = &mut delay => break,
+                    Some(command) = active_steering.receive() => {
+                        steering_text_list.push(command.text.clone());
+                        if let Some(event_sink) = event_sink.as_ref() {
+                            let _ = event_sink.send(BackendEvent {
+                                kind: "steering_input".into(),
+                                text: Some(command.text.clone()),
+                                data: Value::Null,
+                                activity: None,
+                                summary: None,
+                                task_update: None,
+                            });
+                        }
+                        command.complete(Ok(()));
+                    }
+                }
+            }
+        }
+        let plan_markdown = (request.mode == PromptMode::Plan).then(|| {
+            let steering = steering_text_list
+                .iter()
+                .map(|text| format!("- {text}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if steering.is_empty() {
+                format!("# Plan\n\n1. {}\n", request.text)
+            } else {
+                format!(
+                    "# Plan\n\n1. {}\n\n## Steering constraints\n\n{steering}\n",
+                    request.text
+                )
+            }
+        });
         let event = BackendEvent {
             kind: "assistant_message".into(),
             text: Some(format!("Mock response: {}", request.text)),
             data: Value::Null,
             activity: None,
             summary: None,
-            plan_progress: None,
+            task_update: None,
         };
         if let Some(event_sink) = event_sink {
             let _ = event_sink.send(event.clone());
@@ -252,6 +341,7 @@ impl Backend for MockBackend {
                 .or_else(|| Some("mock-session".into())),
             event: vec![event],
             plan_markdown,
+            plan_question: None,
             evidence: TurnEvidence {
                 tool_called: request.write_mode == WriteMode::Write,
                 structured_complete: matches!(request.mode, PromptMode::GoalContinuation),
@@ -259,8 +349,9 @@ impl Backend for MockBackend {
             },
             capability: BackendCapability {
                 native_fork: true,
+                native_compact: true,
+                native_steer: true,
                 native_goal: true,
-                native_plan: true,
                 model_selection: true,
                 effort_selection: true,
                 permission_control: true,
@@ -283,6 +374,34 @@ impl Backend for MockBackend {
         ))
     }
 
+    async fn steer(&self, text: String) -> Result<()> {
+        self.steering.steer(text).await
+    }
+
+    async fn compact(&self, request: BackendRequest) -> Result<BackendOutput> {
+        Ok(BackendOutput {
+            backend_session_id: request.backend_session_id,
+            capability: BackendCapability {
+                native_fork: true,
+                native_compact: true,
+                native_steer: true,
+                native_goal: true,
+                model_selection: true,
+                effort_selection: true,
+                permission_control: true,
+            },
+            runtime: BackendRuntime {
+                provider: "Mock backend".into(),
+                model: Some(request.model),
+            },
+            metrics: TurnMetrics {
+                context_usage: ContextUsage::acp(20_000, 100_000),
+                ..TurnMetrics::default()
+            },
+            ..BackendOutput::default()
+        })
+    }
+
     async fn model_list(&self, _request: BackendRequest) -> Result<Vec<BackendModel>> {
         Ok(vec![BackendModel {
             id: "mock-model".into(),
@@ -290,5 +409,54 @@ impl Backend for MockBackend {
             effort: vec!["low".into(), "medium".into(), "high".into()],
             is_default: true,
         }])
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::{Backend, BackendRequest, MockBackend, PromptMode, TrustPolicy, steering};
+    use crate::session::WriteMode;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn applies_steering_to_the_same_planning_turn() {
+        let backend = Arc::new(MockBackend {
+            delay: Some(Duration::from_millis(50)),
+            steering: steering::SteeringLane::default(),
+        });
+        let prompt_backend = Arc::clone(&backend);
+        let prompt = tokio::spawn(async move {
+            prompt_backend
+                .prompt_stream(
+                    BackendRequest {
+                        workspace: ".".into(),
+                        text: "Refactor X".into(),
+                        mode: PromptMode::Plan,
+                        model: "mock-model".into(),
+                        effort: "low".into(),
+                        fast_mode: false,
+                        write_mode: WriteMode::Read,
+                        trust_profile: "workspace".into(),
+                        trust_policy: TrustPolicy::default(),
+                        backend_session_id: None,
+                    },
+                    None,
+                )
+                .await
+        });
+        loop {
+            match backend.steer("And be sure to modify Y".into()).await {
+                Ok(()) => break,
+                Err(error) if format!("{error:#}").contains("no active turn") => {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => panic!("unexpected steering failure: {error:#}"),
+            }
+        }
+        let output = prompt.await.unwrap().unwrap();
+        let plan = output.plan_markdown.unwrap();
+        assert!(plan.contains("Refactor X"));
+        assert!(plan.contains("And be sure to modify Y"));
     }
 }

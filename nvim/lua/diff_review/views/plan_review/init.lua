@@ -106,7 +106,7 @@ local function accept(plan, buf, tab)
   session.harness.busy = true
   session.harness.goal = { objective = "Complete the plan", state = "active" }
   require("diff_review.views.harness.controller").refresh_winbar()
-  client.request("plan.accept", { digest = digest }, function(result, request_error)
+  client.request("plan.accept", { plan_id = plan.id, digest = digest }, function(result, request_error)
     session.harness.busy = false
     if request_error then
       session.harness.goal = previous_goal
@@ -130,19 +130,33 @@ end
 local function request_changes(plan, buf)
   if not write_plan(buf) then return end
   local annotation = serialized_annotation(plan, buf)
-  set_locked(buf, true)
-  session.harness.busy = true
-  require("diff_review.views.harness.controller").refresh_winbar()
-  client.request("plan.request_changes", { annotations = annotation }, function(_, request_error)
-    session.harness.busy = false
-    if request_error then
-      set_locked(buf, false)
-      notifications.error(request_error, "PlanReview")
-      require("diff_review.views.harness.controller").refresh_winbar()
-      return
-    end
-    notifications.info("Plan revision requested", "PlanReview")
-    require("diff_review.views.harness.controller").render()
+  vim.ui.input({ prompt = "Overall plan review comment (optional): " }, function(comment)
+    if comment == nil then return end
+    set_locked(buf, true)
+    session.harness.busy = true
+    require("diff_review.views.harness.controller").refresh_winbar()
+    client.request("plan.request_changes", {
+      plan_id = plan.id,
+      annotations = annotation,
+      comment = vim.trim(comment),
+    }, function(_, request_error)
+      session.harness.busy = false
+      if request_error then
+        set_locked(buf, false)
+        notifications.error(request_error, "PlanReview")
+        require("diff_review.views.harness.controller").refresh_winbar()
+        return
+      end
+      if vim.api.nvim_buf_is_valid(buf) then
+        vim.api.nvim_buf_call(buf, function() vim.cmd("silent edit!") end)
+        vim.api.nvim_buf_clear_namespace(buf, namespace, 0, -1)
+        set_locked(buf, false)
+      end
+      local revision_key = plan.id .. ":" .. tostring(plan.model_revision or 0)
+      session.harness.plan_annotations[revision_key] = nil
+      notifications.info("Plan revision requested", "PlanReview")
+      require("diff_review.views.harness.controller").render()
+    end)
   end)
 end
 
