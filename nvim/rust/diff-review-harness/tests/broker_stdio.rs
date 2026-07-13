@@ -2,6 +2,7 @@ use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::time::Duration;
 
 struct BrokerProcess {
     child: Child,
@@ -140,6 +141,171 @@ fn streams_mock_backend_events_before_the_jsonl_response() {
             .and_then(Value::as_bool),
         Some(true)
     );
+}
+
+#[test]
+fn cancels_a_running_turn_through_the_out_of_band_request_lane() {
+    let repository = tempfile::tempdir().unwrap();
+    git(repository.path(), &["init", "-q"]);
+    git(
+        repository.path(),
+        &["config", "user.email", "harness@example.invalid"],
+    );
+    git(
+        repository.path(),
+        &["config", "user.name", "Harness Integration"],
+    );
+    std::fs::write(repository.path().join("README.md"), "# Harness\n").unwrap();
+    git(repository.path(), &["add", "."]);
+    git(repository.path(), &["commit", "-qm", "seed"]);
+    let data = tempfile::tempdir().unwrap();
+    let mut broker = BrokerProcess::start();
+    broker.request(json!({
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "data_root": data.path(),
+            "workspace": repository.path(),
+            "client_id": "cancel-test",
+            "backend": { "kind": "mock", "command": ["blocking"] },
+            "model": "mock-model",
+            "effort": "low",
+            "trust_profile": "workspace",
+            "goal_max_turns": 20
+        }
+    }));
+    assert!(
+        broker
+            .read_response(1)
+            .last()
+            .unwrap()
+            .get("error")
+            .is_none()
+    );
+
+    broker.request(json!({
+        "id": 2,
+        "method": "prompt.submit",
+        "params": { "text": "keep working until cancelled" }
+    }));
+    broker.request(json!({ "id": 3, "method": "turn.cancel", "params": {} }));
+
+    let cancellation = broker.read_response(3);
+    assert_eq!(
+        cancellation
+            .last()
+            .unwrap()
+            .pointer("/result/cancel_requested")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    let cancelled_turn = broker.read_response(2);
+    assert_eq!(
+        cancelled_turn
+            .last()
+            .unwrap()
+            .pointer("/error/code")
+            .and_then(Value::as_str),
+        Some("turn_cancelled")
+    );
+    assert!(cancelled_turn.iter().any(|message| {
+        message.get("event").and_then(Value::as_str) == Some("backend_event")
+            && message.pointer("/payload/kind").and_then(Value::as_str)
+                == Some("timeline_interaction_cancelled")
+    }));
+
+    broker.request(json!({ "id": 4, "method": "state.get", "params": {} }));
+    let snapshot = broker.read_response(4);
+    assert_eq!(
+        snapshot
+            .last()
+            .unwrap()
+            .pointer("/result/interaction/0/state")
+            .and_then(Value::as_str),
+        Some("cancelled")
+    );
+    broker.request(json!({ "id": 5, "method": "shutdown", "params": {} }));
+    broker.read_response(5);
+}
+
+#[test]
+fn steers_a_running_planning_turn_without_creating_an_interaction() {
+    let repository = tempfile::tempdir().unwrap();
+    git(repository.path(), &["init", "-q"]);
+    git(
+        repository.path(),
+        &["config", "user.email", "harness@example.invalid"],
+    );
+    git(
+        repository.path(),
+        &["config", "user.name", "Harness Integration"],
+    );
+    std::fs::write(repository.path().join("README.md"), "# Harness\n").unwrap();
+    git(repository.path(), &["add", "."]);
+    git(repository.path(), &["commit", "-qm", "seed"]);
+    let data = tempfile::tempdir().unwrap();
+    let mut broker = BrokerProcess::start();
+    broker.request(json!({
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "data_root": data.path(),
+            "workspace": repository.path(),
+            "client_id": "steer-test",
+            "backend": { "kind": "mock", "command": ["blocking"] },
+            "model": "mock-model",
+            "effort": "low",
+            "trust_profile": "workspace",
+            "goal_max_turns": 20
+        }
+    }));
+    let initialized = broker.read_response(1);
+    assert_eq!(
+        initialized
+            .last()
+            .unwrap()
+            .pointer("/result/capability/native_steer")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+
+    broker.request(json!({
+        "id": 2,
+        "method": "prompt.submit",
+        "params": { "text": "/plan refactor X" }
+    }));
+    std::thread::sleep(Duration::from_millis(100));
+    broker.request(json!({
+        "id": 3,
+        "method": "turn.steer",
+        "params": { "text": "And be sure to modify Y" }
+    }));
+    let steered = broker.read_response(3);
+    assert_eq!(
+        steered
+            .last()
+            .unwrap()
+            .pointer("/result/steered")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+
+    broker.request(json!({ "id": 4, "method": "turn.cancel", "params": {} }));
+    broker.read_response(4);
+    broker.read_response(2);
+    broker.request(json!({ "id": 5, "method": "state.get", "params": {} }));
+    let snapshot = broker.read_response(5);
+    let interaction = snapshot
+        .last()
+        .unwrap()
+        .pointer("/result/interaction")
+        .and_then(Value::as_array)
+        .unwrap();
+    assert_eq!(interaction.len(), 1);
+    assert_eq!(interaction[0]["prompt"], "/plan refactor X");
+
+    broker.request(json!({ "id": 6, "method": "shutdown", "params": {} }));
+    broker.read_response(6);
 }
 
 #[test]

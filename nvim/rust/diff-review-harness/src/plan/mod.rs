@@ -13,6 +13,7 @@ pub use prompt::PlanPrompt;
 #[serde(rename_all = "snake_case")]
 pub enum PlanState {
     Generating,
+    AwaitingInput,
     AwaitingReview,
     Revising,
     Accepted,
@@ -35,6 +36,8 @@ pub struct PlanRecord {
     pub user_revision: u32,
     pub review_digest: Option<String>,
     pub accepted_digest: Option<String>,
+    #[serde(default)]
+    pub elicitation: Option<PlanElicitation>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
 }
@@ -43,6 +46,8 @@ pub struct PlanRecord {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanLifecycleKind {
+    QuestionAsked,
+    QuestionAnswered,
     Created,
     ChangesRequested,
     RevisionCreated,
@@ -62,7 +67,229 @@ pub struct PlanLifecycleRecord {
     pub overall_comment: Option<String>,
     #[serde(default)]
     pub annotation: Vec<PlanAnnotation>,
+    #[serde(default)]
+    pub question: Option<PlanQuestionSet>,
+    #[serde(default)]
+    pub answer: Option<String>,
     pub created_at_ms: i64,
+}
+
+/// Represents one selectable answer for a planning question.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PlanQuestionOption {
+    pub label: String,
+    pub description: String,
+}
+
+/// Represents one structured decision requested while creating a plan.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PlanQuestion {
+    #[serde(default)]
+    pub id: String,
+    pub header: String,
+    pub question: String,
+    #[serde(default)]
+    pub options: Vec<PlanQuestionOption>,
+    #[serde(default = "default_allow_freeform", alias = "allowFreeform")]
+    pub allow_freeform: bool,
+}
+
+/// Represents one atomic set of planning decisions presented to the user.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PlanQuestionSet {
+    #[serde(default)]
+    pub id: String,
+    pub questions: Vec<PlanQuestion>,
+}
+
+/// Defines one committed response to a planning question.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PlanQuestionResponse {
+    Selected {
+        option: String,
+        feedback: Option<String>,
+    },
+    Other {
+        text: String,
+    },
+    Skipped,
+}
+
+/// Associates one durable response with its planning question.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PlanQuestionAnswer {
+    pub question_id: String,
+    pub response: PlanQuestionResponse,
+}
+
+/// Tracks an unresolved planning decision set across answers and clarification turns.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PlanElicitation {
+    pub question_set: PlanQuestionSet,
+    #[serde(default)]
+    pub answer: Vec<PlanQuestionAnswer>,
+    #[serde(default)]
+    pub current_index: usize,
+    #[serde(default)]
+    pub clarification_active: bool,
+}
+
+impl PlanElicitation {
+    /// Build unresolved elicitation state from a normalized provider question set.
+    pub fn new(question_set: PlanQuestionSet) -> Self {
+        Self {
+            question_set,
+            answer: Vec::new(),
+            current_index: 0,
+            clarification_active: false,
+        }
+    }
+
+    /// Resolve the question currently presented by the review UI.
+    pub fn current_question(&self) -> Option<&PlanQuestion> {
+        self.question_set.questions.get(self.current_index)
+    }
+
+    /// Resolve a question by its durable identifier for non-linear review navigation.
+    pub fn question(&self, question_id: &str) -> Option<&PlanQuestion> {
+        self.question_set
+            .questions
+            .iter()
+            .find(|question| question.id == question_id)
+    }
+
+    /// Commit one response and advance presentation to the next question.
+    pub fn answer(&mut self, question_id: &str, response: PlanQuestionResponse) -> Result<()> {
+        let question_index = self
+            .question_set
+            .questions
+            .iter()
+            .position(|question| question.id == question_id)
+            .context("planning question not found")?;
+        validate_response(&self.question_set.questions[question_index], &response)?;
+        self.answer
+            .retain(|answer| answer.question_id != question_id);
+        self.answer.push(PlanQuestionAnswer {
+            question_id: question_id.to_owned(),
+            response,
+        });
+        self.current_index = self
+            .question_set
+            .questions
+            .iter()
+            .position(|question| {
+                !self
+                    .answer
+                    .iter()
+                    .any(|answer| answer.question_id == question.id)
+            })
+            .unwrap_or(self.question_set.questions.len());
+        self.clarification_active = false;
+        Ok(())
+    }
+
+    /// Serialize every decision for the planning continuation contract.
+    pub fn feedback(&self) -> String {
+        let mut line_list = vec!["Planning feedback:".to_owned()];
+        for question in &self.question_set.questions {
+            let answer = self
+                .answer
+                .iter()
+                .find(|answer| answer.question_id == question.id);
+            let value = match answer.map(|answer| &answer.response) {
+                Some(PlanQuestionResponse::Selected { option, feedback }) => feedback
+                    .as_ref()
+                    .filter(|feedback| !feedback.trim().is_empty())
+                    .map(|feedback| format!("{option} — {feedback}"))
+                    .unwrap_or_else(|| option.clone()),
+                Some(PlanQuestionResponse::Other { text }) => text.clone(),
+                Some(PlanQuestionResponse::Skipped) | None => {
+                    "[intentionally unanswered; continue with best judgment]".into()
+                }
+            };
+            line_list.push(format!("- {}: {value}", question.header));
+        }
+        line_list.join("\n")
+    }
+}
+
+fn validate_response(question: &PlanQuestion, response: &PlanQuestionResponse) -> Result<()> {
+    match response {
+        PlanQuestionResponse::Selected { option, .. } => anyhow::ensure!(
+            question
+                .options
+                .iter()
+                .any(|choice| choice.label == *option),
+            "selected planning option does not exist"
+        ),
+        PlanQuestionResponse::Other { text } => {
+            anyhow::ensure!(
+                question.allow_freeform,
+                "planning question forbids free-form answers"
+            );
+            anyhow::ensure!(
+                !text.trim().is_empty(),
+                "free-form planning answer cannot be empty"
+            );
+        }
+        PlanQuestionResponse::Skipped => {}
+    }
+    Ok(())
+}
+
+impl PlanQuestionSet {
+    /// Build a free-form fallback from an ordinary assistant question.
+    pub fn freeform(question: String) -> Self {
+        Self {
+            id: String::new(),
+            questions: vec![PlanQuestion {
+                id: String::new(),
+                header: "Planning feedback".into(),
+                question,
+                options: Vec::new(),
+                allow_freeform: true,
+            }],
+        }
+    }
+
+    /// Assign durable identifiers and validate the question set before persistence.
+    pub fn normalize(mut self) -> Result<Self> {
+        anyhow::ensure!(
+            !self.questions.is_empty() && self.questions.len() <= 3,
+            "planning feedback must contain between one and three questions"
+        );
+        if self.id.is_empty() {
+            self.id = uuid::Uuid::new_v4().to_string();
+        }
+        for (index, question) in self.questions.iter_mut().enumerate() {
+            anyhow::ensure!(
+                !question.question.trim().is_empty(),
+                "planning question text cannot be empty"
+            );
+            anyhow::ensure!(
+                question.options.is_empty() || (2..=3).contains(&question.options.len()),
+                "structured planning questions require two or three choices"
+            );
+            for option in &question.options {
+                anyhow::ensure!(
+                    !option.label.trim().is_empty() && !option.description.trim().is_empty(),
+                    "planning question choices require labels and descriptions"
+                );
+            }
+            if question.id.is_empty() {
+                question.id = format!("{}:{}", self.id, index + 1);
+            }
+            if question.header.trim().is_empty() {
+                question.header = format!("Question {}", index + 1);
+            }
+        }
+        Ok(self)
+    }
+}
+
+fn default_allow_freeform() -> bool {
+    true
 }
 
 /// Defines terminal and nonterminal states for one accepted plan execution.
@@ -326,5 +553,92 @@ mod test {
         );
         store.delete_session("session").unwrap();
         assert!(!temporary.path().join("plans/session").exists());
+    }
+
+    #[test]
+    fn normalizes_durable_question_identifiers_and_freeform_defaults() {
+        let question = PlanQuestionSet {
+            id: String::new(),
+            questions: vec![PlanQuestion {
+                id: String::new(),
+                header: String::new(),
+                question: "Which migration?".into(),
+                options: vec![
+                    PlanQuestionOption {
+                        label: "Staged".into(),
+                        description: "Support both formats.".into(),
+                    },
+                    PlanQuestionOption {
+                        label: "Immediate".into(),
+                        description: "Replace immediately.".into(),
+                    },
+                ],
+                allow_freeform: true,
+            }],
+        }
+        .normalize()
+        .unwrap();
+        assert!(!question.id.is_empty());
+        assert_eq!(question.questions[0].header, "Question 1");
+        assert!(question.questions[0].id.starts_with(&question.id));
+        assert!(question.questions[0].allow_freeform);
+    }
+
+    #[test]
+    fn preserves_answer_notes_skips_and_unanswered_questions() {
+        let question_set = PlanQuestionSet {
+            id: "set".into(),
+            questions: vec![
+                PlanQuestion {
+                    id: "migration".into(),
+                    header: "Migration".into(),
+                    question: "Which migration?".into(),
+                    options: vec![
+                        PlanQuestionOption {
+                            label: "Staged".into(),
+                            description: "Support both formats.".into(),
+                        },
+                        PlanQuestionOption {
+                            label: "Immediate".into(),
+                            description: "Replace immediately.".into(),
+                        },
+                    ],
+                    allow_freeform: true,
+                },
+                PlanQuestion {
+                    id: "storage".into(),
+                    header: "Storage".into(),
+                    question: "Which store?".into(),
+                    options: Vec::new(),
+                    allow_freeform: true,
+                },
+                PlanQuestion {
+                    id: "testing".into(),
+                    header: "Testing".into(),
+                    question: "Which tests?".into(),
+                    options: Vec::new(),
+                    allow_freeform: true,
+                },
+            ],
+        };
+        let mut elicitation = PlanElicitation::new(question_set);
+        elicitation
+            .answer("storage", PlanQuestionResponse::Skipped)
+            .unwrap();
+        assert_eq!(elicitation.current_question().unwrap().id, "migration");
+        elicitation
+            .answer(
+                "migration",
+                PlanQuestionResponse::Selected {
+                    option: "Staged".into(),
+                    feedback: Some("Keep one compatibility release".into()),
+                },
+            )
+            .unwrap();
+
+        let feedback = elicitation.feedback();
+        assert!(feedback.contains("Staged — Keep one compatibility release"));
+        assert_eq!(feedback.matches("intentionally unanswered").count(), 2);
+        assert_eq!(elicitation.current_question().unwrap().id, "testing");
     }
 }

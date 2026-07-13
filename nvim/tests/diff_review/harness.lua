@@ -42,6 +42,8 @@ local active_session = {
   name = "Harness test",
   workspace = vim.fn.getcwd(),
   backend = "mock",
+  native_compact = true,
+  context_usage = { used = 275000, size = 353000, remaining_percent = 22 },
   backend_session_id = "provider-one",
   model = "mock-model",
   provider_label = "Mock CLI",
@@ -83,8 +85,51 @@ local interaction = {
 local request_by_method = {}
 local goal_continue_count = 0
 local prompt_count = 0
+local steer_should_fail = false
+local steered_text_list = {}
 local launched_binary = nil
 local active_plan = nil
+local active_elicitation = nil
+local prompt_history = { "most recent prompt", "older prompt" }
+
+local function planning_question_set()
+  return {
+    id = "question-set",
+    questions = {
+      {
+        id = "question-one",
+        header = "Migration",
+        question = "Which migration strategy should the plan use?",
+        options = {
+          { label = "Staged", description = "Support both formats temporarily." },
+          { label = "Immediate", description = "Remove the old format now." },
+          { label = "Compatible", description = "Keep a compatibility layer." },
+        },
+        allow_freeform = true,
+      },
+      {
+        id = "question-two",
+        header = "Storage",
+        question = "Which storage boundary should own the state?",
+        options = {
+          { label = "SQLite", description = "Persist it through the broker." },
+          { label = "Memory", description = "Keep it editor-local." },
+        },
+        allow_freeform = true,
+      },
+      {
+        id = "question-three",
+        header = "Testing",
+        question = "Which verification depth should the plan require?",
+        options = {
+          { label = "Focused", description = "Run focused coverage." },
+          { label = "Full", description = "Run the complete suite." },
+        },
+        allow_freeform = true,
+      },
+    },
+  }
+end
 
 local function emit(options, message)
   vim.schedule(function() options.stdout(nil, vim.json.encode(message) .. "\n") end)
@@ -101,8 +146,9 @@ local function fake_launcher(command, options, _)
         emit(options, { id = request.id, result = {
           session = active_session,
           interaction = {},
-          capability = { native_fork = false, model_selection = true },
+          capability = { native_fork = false, native_compact = true, native_steer = true, model_selection = true },
           no_checkpoint = false,
+          prompt_history = prompt_history,
         } })
       end, 80)
     elseif request.method == "prompt.submit" then
@@ -171,7 +217,44 @@ local function fake_launcher(command, options, _)
           revision = 3,
         },
       } })
-      if request.params.text:match("^/plan ") then
+      if request.params.text == "/plan choose a migration" then
+        local question_set = planning_question_set()
+        active_plan = {
+          id = "plan-question",
+          session_id = active_session.id,
+          title = "Choose a migration",
+          state = "awaiting_input",
+          working_path = "",
+          elicitation = {
+            question_set = question_set,
+            answer = {},
+            current_index = 0,
+            clarification_active = false,
+          },
+        }
+        active_elicitation = {
+          owner = "plan",
+          plan_id = active_plan.id,
+          elicitation = active_plan.elicitation,
+        }
+        emit(options, { event = "plan_question", payload = {
+          plan = active_plan,
+          lifecycle = { id = "question-lifecycle", kind = "question_asked" },
+          question = question_set,
+        } })
+      elseif request.params.text == "ask choices" then
+        active_elicitation = {
+          owner = "interaction",
+          interaction_id = interaction_id,
+          elicitation = {
+            question_set = planning_question_set(),
+            answer = {},
+            current_index = 0,
+            clarification_active = false,
+          },
+        }
+        emit(options, { event = "question", payload = active_elicitation })
+      elseif request.params.text:match("^/plan ") then
         active_plan = {
           id = "plan-one",
           session_id = active_session.id,
@@ -211,7 +294,7 @@ local function fake_launcher(command, options, _)
           emit(options, { id = request.id, result = {
             interaction = completed,
             session = active_session,
-            capability = { native_fork = false },
+            capability = { native_fork = false, native_steer = true },
           } })
         end, 1200)
       else
@@ -223,6 +306,7 @@ local function fake_launcher(command, options, _)
           state = "complete",
           thought = {},
           response = "Mock reply",
+          awaiting_input = request.params.text == "/plan choose a migration" or request.params.text == "ask choices",
           duration_ms = 2000,
           token_count = 2700,
           attribution_complete = true,
@@ -231,9 +315,49 @@ local function fake_launcher(command, options, _)
         emit(options, { id = request.id, result = {
           interaction = completed,
           session = active_session,
-          capability = { native_fork = false },
+          capability = { native_fork = false, native_steer = true },
         } })
       end
+    elseif request.method == "history.record" then
+      table.insert(prompt_history, 1, request.params.text)
+      while #prompt_history > 100 do table.remove(prompt_history) end
+      emit(options, { id = request.id, result = prompt_history })
+    elseif request.method == "question.answer" or request.method == "question.skip" then
+      local response = request.method == "question.skip" and { kind = "skipped" } or request.params.response
+      active_plan.elicitation.answer[#active_plan.elicitation.answer + 1] = {
+        question_id = request.params.question_id,
+        response = response,
+      }
+      active_plan.elicitation.current_index = active_plan.elicitation.current_index + 1
+      active_plan.elicitation.clarification_active = false
+      active_elicitation.elicitation = active_plan.elicitation
+      emit(options, { event = "question_updated", payload = active_elicitation })
+      emit(options, { id = request.id, result = {
+        session = active_session,
+        active_plan = active_plan,
+        active_elicitation = active_elicitation,
+      } })
+    elseif request.method == "question.ask" then
+      active_plan.elicitation.clarification_active = true
+      active_elicitation.elicitation = active_plan.elicitation
+      emit(options, { event = "question_updated", payload = active_elicitation })
+      emit(options, { id = request.id, result = { session = active_session } })
+    elseif request.method == "question.continue" then
+      active_plan.elicitation = nil
+      active_elicitation = nil
+      active_plan.state = "awaiting_review"
+      active_plan.working_path = plan_path
+      active_plan.review_digest = "digest"
+      emit(options, { event = "plan_question_answered", payload = {
+        plan = active_plan,
+        lifecycle = { id = "answer-lifecycle", kind = "question_answered" },
+      } })
+      emit(options, { event = "plan_created", payload = {
+        plan = active_plan,
+        lifecycle = { id = "question-plan-created", kind = "created" },
+        content = "# Plan\n\n1. Review the implementation.",
+      } })
+      emit(options, { id = request.id, result = { session = active_session } })
     elseif request.method == "interaction.list" then
       emit(options, { id = request.id, result = { interaction } })
     elseif request.method == "session.list" then
@@ -251,10 +375,37 @@ local function fake_launcher(command, options, _)
       active_session = vim.tbl_extend("force", active_session, request.params)
       emit(options, { event = "session_configured", payload = active_session })
       emit(options, { id = request.id, result = active_session })
+    elseif request.method == "session.compact" then
+      active_session.context_usage = { used = 40000, size = 353000, remaining_percent = 92 }
+      emit(options, { event = "context_compacted", payload = {
+        session = active_session,
+        interaction = session.harness.interaction,
+        capability = { native_fork = false, native_compact = true, native_steer = true },
+      } })
+      emit(options, { id = request.id, result = {
+        session = active_session,
+        interaction = session.harness.interaction,
+        capability = { native_fork = false, native_compact = true, native_steer = true },
+      } })
+    elseif request.method == "turn.steer" then
+      steered_text_list[#steered_text_list + 1] = request.params.text
+      vim.defer_fn(function()
+        if steer_should_fail then
+          emit(options, { id = request.id, error = { message = "active turn already completed" } })
+        else
+          emit(options, { id = request.id, result = { steered = true } })
+        end
+      end, 80)
+    elseif request.method == "turn.cancel" then
+      emit(options, { id = request.id, result = { cancel_requested = true } })
     elseif request.method == "session.new" then
       active_session = vim.tbl_extend("force", active_session, { id = "session-two", write_mode = "read" })
       emit(options, { event = "session_changed", payload = { session = active_session, interaction = {} } })
-      emit(options, { id = request.id, result = { session = active_session, interaction = {} } })
+      emit(options, { id = request.id, result = {
+        session = active_session,
+        interaction = {},
+        prompt_history = prompt_history,
+      } })
     elseif request.method == "session.fork" then
       active_session = vim.tbl_extend("force", active_session, {
         id = "session-fork",
@@ -277,11 +428,13 @@ local function fake_launcher(command, options, _)
       emit(options, { id = request.id, result = {
         session = active_session,
         interaction = session.harness.interaction,
-        capability = { native_fork = false },
+        capability = { native_fork = false, native_compact = true, native_steer = true },
         no_checkpoint = false,
         goal = { objective = "fail", state = "paused" },
         active_plan = active_plan,
-        artifact = active_plan and { active_plan } or {},
+        active_elicitation = active_elicitation,
+        artifact = active_plan and active_plan.working_path ~= "" and { active_plan } or {},
+        prompt_history = prompt_history,
       } })
     elseif request.method == "plan.activate" then
       emit(options, { id = request.id, result = active_plan })
@@ -310,6 +463,54 @@ local ok, failure = pcall(function()
   assert_equals(#require("diff_review.infra.config").options.keymaps.status.open, 1, "configured key lists should replace defaults atomically")
   assert_true(vim.uv.fs_stat(builder.manifest_path()) ~= nil, "Harness builder should resolve its crate from the plugin runtime")
 
+  local question_model = require("diff_review.views.harness.plan_question.model")
+  local question_entries = question_model.entries({
+    options = {
+      { label = "Staged", description = "Support both formats." },
+      { label = "Immediate", description = "Replace immediately." },
+      { label = "Compatible", description = "Keep the compatibility layer." },
+    },
+    allow_freeform = true,
+  }, require("diff_review.infra.config").options.harness.question_choice_keys)
+  assert_equals(question_entries[1].key, "n", "question choices should start with the configured quick keys")
+  assert_equals(question_entries[4].key, "o", "Other should always use o")
+  assert_equals(question_entries[5].key, "a", "Ask should always use a regardless of option count")
+  local question_frame = require("diff_review.views.harness.plan_question.render").build(
+    { question = "Which migration?" }, question_entries, 70, false
+  )
+  assert_true(not vim.iter(question_frame.lines):any(function(line) return line:find("    └ ", 1, true) ~= nil end),
+    "question options should not embed feedback input rows")
+
+  local question_render = interaction_renderer.build({ {
+    kind = "plan_lifecycle",
+    id = "question-lifecycle",
+    lifecycle = {
+      kind = "question_asked",
+      question = { questions = { {
+        header = "Migration",
+        question = "Which migration should the plan use?",
+        options = { { label = "Staged", description = "Support both formats temporarily." } },
+      } } },
+    },
+  } })
+  assert_true(vim.tbl_contains(question_render.lines, "▸ Planning paused for feedback"),
+    "planning questions should render as a durable paused state")
+  assert_true(vim.tbl_contains(question_render.lines, "Which migration should the plan use?"),
+    "planning questions should remain visible without expansion")
+  assert_true(vim.tbl_contains(question_render.lines, "    ○ Staged — Support both formats temporarily."),
+    "planning question choices should remain visible in the timeline")
+  local paused_plan_render = interaction_renderer.build({ {
+    id = "paused-plan",
+    prompt = "/plan choose a migration",
+    kind = "plan_draft",
+    state = "complete",
+    awaiting_input = true,
+    duration_ms = 3000,
+    thought = {},
+  } })
+  assert_true(vim.tbl_contains(paused_plan_render.lines, "▸ Planning paused after 3s"),
+    "question-only plan turns should not claim that the plan completed")
+
   builder._set_crate_dir_for_test(crate_root)
   builder._set_artifact_root_for_test(vim.fs.joinpath(test_root, "artifacts"))
   builder._set_runner_for_test(function(_, _, callback)
@@ -327,6 +528,9 @@ local ok, failure = pcall(function()
   end)
   require("diff_review.views.harness").open()
   assert_true(vim.wait(1000, function() return launched_binary ~= nil end, 10), "Harness broker did not launch")
+  assert_true(vim.wait(1000, function()
+    return session.harness.prompt_history[1] == "most recent prompt"
+  end, 10), "Harness did not restore the broker prompt history")
   assert_true(launched_binary ~= builder.release_binary_path(), "Harness must not execute Cargo's replaceable output")
   assert_equals(launched_binary, builder.deployed_binary_path(), "Harness should launch the immutable staged executable")
   assert_equals(vim.wo[session.harness.transcript_win].breakindentopt, "shift:0",
@@ -396,7 +600,7 @@ local ok, failure = pcall(function()
   local summary_seen = false
   for _, frame in ipairs(render_frame_list) do
     local frame_text = table.concat(frame, "\n")
-    if frame_text:find("↳ Mock ", 1, true) and not frame_text:find("↳ Mock reply", 1, true) then
+    if frame_text:find("↳ Mock", 1, true) and not frame_text:find("↳ Mock reply", 1, true) then
       partial_response_seen = true
     end
     if frame_text:find("Mock reply", 1, true) then complete_response_seen = true end
@@ -501,6 +705,38 @@ local ok, failure = pcall(function()
     "streaming commentary should stay outside the markdown region")
   assert_true(not vim.tbl_contains(commentary_render.lines, "▸ Thinking…"),
     "streaming should rely on actual commentary instead of a transient Thinking placeholder")
+  local wrapped_commentary = interaction_renderer.build({ {
+    id = "wrapped-commentary",
+    prompt = "Plan a narrow timeline",
+    state = "running",
+    thought = {},
+    active = {
+      text = "Repository facts leave three product decisions unresolved. Each one changes the dependency stack and test boundary.",
+      tool_count = 0,
+      failed_count = 0,
+    },
+  } }, { working_seconds = 2, content_width = 44 })
+  local wrapped_thought_line_list = {}
+  for line, row in pairs(wrapped_commentary.rows) do
+    if row.kind == "active_thought" then wrapped_thought_line_list[#wrapped_thought_line_list + 1] = line end
+  end
+  table.sort(wrapped_thought_line_list)
+  assert_true(#wrapped_thought_line_list > 1, "long timeline thoughts should become real wrapped rows")
+  for index, line in ipairs(wrapped_thought_line_list) do
+    local text = wrapped_commentary.lines[line]
+    assert_true(vim.fn.strdisplaywidth(text) <= 44, "timeline thought exceeded its content width: " .. text)
+    assert_true(text:sub(1, index == 1 and 4 or 2) == (index == 1 and "↳ " or "  "),
+      "timeline thought continuations should preserve their semantic indent")
+  end
+  local unicode_wrap = require("diff_review.render.display_text").wrap(
+    "界界界界界界界界界界界界",
+    10,
+    "↳ ",
+    "  "
+  )
+  assert_true(#unicode_wrap > 1, "display wrapping should split overlong multibyte words")
+  assert_true(vim.iter(unicode_wrap):all(function(line) return vim.fn.strdisplaywidth(line) <= 10 end),
+    "display wrapping should measure multibyte text by rendered cells")
   local settled_transcript = vim.api.nvim_buf_get_lines(session.harness.transcript_buf, 0, -1, false)
   assert_true(vim.tbl_contains(settled_transcript, "▸ what is this repo?"), "user prompts should use the Harness prompt marker")
   assert_true(vim.tbl_contains(settled_transcript, "▸ Thought for 2s, 2.7k tokens"),
@@ -638,6 +874,8 @@ local ok, failure = pcall(function()
     "Harness soft wraps should preserve the row indent without adding another two columns")
   assert_true(vim.wo[session.harness.transcript_win].winbar:find("Mock CLI", 1, true) ~= nil, "winbar should expose the underlying CLI")
   assert_true(vim.wo[session.harness.transcript_win].winbar:find("mock-model-resolved", 1, true) ~= nil, "winbar should expose the resolved model")
+  assert_true(vim.wo[session.harness.transcript_win].winbar:find("22%% context left (353K)", 1, true) ~= nil,
+    "winbar should expose normalized context remaining at the right edge")
   local plain_winbar = vim.wo[session.harness.transcript_win].winbar:gsub("%%#.-#", ""):gsub("%%%*", "")
   assert_true(plain_winbar:find("Harness", 1, true) == nil, "winbar should omit the redundant view name")
   assert_true(vim.wo[session.harness.transcript_win].winbar:find("@workspace", 1, true) == nil, "winbar should omit the trust profile")
@@ -650,6 +888,10 @@ local ok, failure = pcall(function()
   session.harness.goal = nil
   controller.refresh_winbar()
   assert_true(vim.fn.maparg("<C-s>", "i", false, true).callback ~= nil, "composer should map submit in insert mode")
+  assert_true(vim.fn.maparg("<C-q>", "n", false, true).callback ~= nil,
+    "HarnessInput should map Ctrl-q to active-turn steering in normal mode")
+  assert_true(vim.fn.maparg("<C-q>", "i", false, true).callback ~= nil,
+    "HarnessInput should map Ctrl-q to active-turn steering in insert mode")
   assert_true(vim.fn.maparg("<S-Tab>", "n", false, true).callback ~= nil, "Harness should map Shift-Tab in normal mode")
   assert_true(vim.fn.maparg("<S-Tab>", "i", false, true).callback ~= nil, "Harness should map Shift-Tab in insert mode")
   assert_true(vim.fn.maparg("<M-s>", "i", false, true).callback ~= nil,
@@ -666,6 +908,65 @@ local ok, failure = pcall(function()
     "Harness transcript should map q to close")
   assert_true(not has_buffer_keymap(session.harness.composer_buf, "n", "q"),
     "HarnessInput should leave q available for normal-mode editing")
+  session.harness.busy = true
+  vim.api.nvim_set_current_win(session.harness.transcript_win)
+  local transcript_cancel = vim.fn.maparg("<C-c>", "n", false, true).callback
+  assert_true(transcript_cancel ~= nil, "Harness should map Ctrl-c to turn cancellation")
+  vim.api.nvim_set_current_win(session.harness.composer_win)
+  vim.wait(100, function() return false end, 10)
+  assert_equals(vim.wo[session.harness.composer_win].winbar, "",
+    "entering HarnessInput should not let Dropbar restore a composer winbar")
+  vim.api.nvim_set_current_win(session.harness.transcript_win)
+  vim.api.nvim_set_current_win(session.harness.composer_win)
+  vim.wait(100, function() return false end, 10)
+  assert_equals(vim.wo[session.harness.composer_win].winbar, "",
+    "re-entering HarnessInput should preserve the composer winbar exclusion")
+  assert_true(vim.fn.maparg("<C-c>", "i", false, true).callback ~= nil,
+    "HarnessInput should map Ctrl-c to turn cancellation")
+  vim.api.nvim_set_current_win(session.harness.transcript_win)
+  transcript_cancel()
+  assert_true(vim.wait(1000, function() return request_by_method["turn.cancel"] ~= nil end, 10),
+    "Ctrl-c should send an out-of-band turn cancellation request")
+  session.harness.busy = false
+  session.harness.cancel_requested = false
+  assert_true(not has_buffer_keymap(session.harness.transcript_buf, "i", "<Up>"),
+    "prompt history should remain scoped to HarnessInput")
+  assert_true(has_buffer_keymap(session.harness.composer_buf, "i", "<Up>"),
+    "HarnessInput should map Up to older global prompts")
+  assert_true(has_buffer_keymap(session.harness.composer_buf, "i", "<Down>"),
+    "HarnessInput should map Down to newer global prompts")
+  vim.api.nvim_set_current_win(session.harness.composer_win)
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "" })
+  local history_previous = vim.fn.maparg("<Up>", "i", false, true).callback
+  local history_next = vim.fn.maparg("<Down>", "i", false, true).callback
+  assert_equals(session.harness.prompt_history[1], "what is this repo?",
+    "composer navigation should use the current broker history")
+  history_previous()
+  assert_equals(vim.api.nvim_get_current_line(), "what is this repo?",
+    "Up on an empty composer should recall the newest global prompt")
+  history_previous()
+  assert_equals(vim.api.nvim_get_current_line(), "most recent prompt",
+    "repeated Up should continue toward older prompts")
+  history_next()
+  assert_equals(vim.api.nvim_get_current_line(), "what is this repo?",
+    "Down should move toward newer prompts")
+  history_next()
+  assert_equals(vim.api.nvim_get_current_line(), "",
+    "Down past the newest prompt should restore the empty composer")
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "unsent draft" })
+  history_previous()
+  assert_equals(vim.api.nvim_get_current_line(), "unsent draft",
+    "Up should preserve a nonempty composer before history navigation starts")
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "" })
+  history_previous()
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "edited recalled prompt" })
+  vim.api.nvim_exec_autocmds("TextChangedI", { buffer = session.harness.composer_buf })
+  assert_equals(session.harness.prompt_history_index, 0,
+    "editing a recalled prompt should leave history navigation")
+  history_previous()
+  assert_equals(vim.api.nvim_get_current_line(), "edited recalled prompt",
+    "Up should preserve an edited recalled prompt as a new draft")
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "" })
   local original_ui_select = vim.ui.select
   local effort_picker_options = nil
   vim.ui.select = function(_, options, callback)
@@ -694,9 +995,49 @@ local ok, failure = pcall(function()
   assert_true(command_completion ~= nil and #command_completion.items >= 9, "slash completion should list Harness commands")
   assert_true(vim.iter(command_completion.items):any(function(item) return item.label == "/rename" end),
     "slash completion should expose session rename")
+  assert_true(vim.iter(command_completion.items):any(function(item) return item.label == "/compact" end),
+    "slash completion should expose compact when the backend advertises it")
   assert_equals(command_completion.items[1].label, "/plan", "slash completion should prioritize plan creation")
 
+  session.harness.capability.native_compact = false
+  command_source:get_completions({}, function(result) command_completion = result end)
+  assert_true(not vim.iter(command_completion.items):any(function(item) return item.label == "/compact" end),
+    "slash completion should omit compact when the backend does not advertise it")
+  session.harness.capability.native_compact = true
+
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/compact" })
+  controller.submit()
+  assert_true(vim.wait(2000, function()
+    return request_by_method["session.compact"] ~= nil
+      and session.harness.session.context_usage.remaining_percent == 92
+      and not session.harness.busy
+  end, 10), "/compact should invoke provider compaction without creating a chat interaction")
+  assert_true(vim.wo[session.harness.transcript_win].winbar:find("92%% context left (353K)", 1, true) ~= nil,
+    "compaction should refresh the right-aligned context status")
+
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "ask choices" })
+  controller.submit()
+  local ordinary_question_view = require("diff_review.views.harness.plan_question")
+  assert_true(vim.wait(2000, ordinary_question_view.is_open, 10),
+    "ordinary chat questions should open the shared Harness question float")
+  assert_equals(session.harness.active_elicitation.owner, "interaction",
+    "ordinary questions should remain interaction-owned instead of creating a plan")
+  vim.fn.maparg("q", "n", false, true).callback()
+  assert_true(vim.wo[session.harness.transcript_win].winbar:find("Input requested (press oe)", 1, true) ~= nil,
+    "closed ordinary questions should advertise the configured reopen key")
+  assert_true(has_buffer_keymap(session.harness.transcript_buf, "n", "oe"),
+    "Harness should bind the configured question reopen action")
+  vim.api.nvim_set_current_win(session.harness.transcript_win)
+  vim.fn.maparg("oe", "n", false, true).callback()
+  assert_true(vim.wait(1000, ordinary_question_view.is_open, 10),
+    "the Harness reopen key should restore an ordinary interaction question")
+  vim.fn.maparg("q", "n", false, true).callback()
+  active_elicitation = nil
+  session.harness.active_elicitation = nil
+  session.harness.presented_question_set_id = nil
+
   local file_source = require("diff_review.views.harness.completion.file_source").new()
+  vim.api.nvim_set_current_win(session.harness.composer_win)
   vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "inspect @nvim/lua/diff_review" })
   vim.api.nvim_win_set_cursor(session.harness.composer_win, { 1, 29 })
   assert_true(file_source:enabled(), "file completion should activate after @")
@@ -724,6 +1065,8 @@ local ok, failure = pcall(function()
     end
     return false
   end, 10), "Harness did not complete the interaction timeline")
+  assert_true(vim.wait(1000, function() return session.harness.prompt_history[1] == "hello harness" end, 10),
+    "submitted prompts should enter global history immediately")
   local active_counter_seen = false
   local active_tool_leak_seen = false
   local mixed_transition_seen = false
@@ -777,7 +1120,7 @@ local ok, failure = pcall(function()
       { id = "task-3", title = "Synthesize the analysis", status = "pending" },
     },
   }
-  local active_plan = interaction_renderer.build({ {
+  local active_plan_render = interaction_renderer.build({ {
     id = "plan-interaction",
     prompt = "/plan analyze the repo",
     kind = "plan_draft",
@@ -788,15 +1131,15 @@ local ok, failure = pcall(function()
   } }, {
     working_seconds = 1,
   })
-  assert_true(vim.tbl_contains(active_plan.lines, "▸ Planning for 1s"),
+  assert_true(vim.tbl_contains(active_plan_render.lines, "▸ Planning for 1s"),
     "Harness planning should use a dedicated inline summary")
-  assert_true(vim.tbl_contains(active_plan.lines, "● Inventory the repository"),
+  assert_true(vim.tbl_contains(active_plan_render.lines, "● Inventory the repository"),
     "active planning should show completed provider tasks inline")
-  assert_true(vim.tbl_contains(active_plan.lines, "◐ Trace configuration boundaries"),
+  assert_true(vim.tbl_contains(active_plan_render.lines, "◐ Trace configuration boundaries"),
     "active planning should show the provider's current task inline")
-  assert_true(vim.tbl_contains(active_plan.lines, "○ Synthesize the analysis"),
+  assert_true(vim.tbl_contains(active_plan_render.lines, "○ Synthesize the analysis"),
     "active planning should show pending provider tasks inline")
-  assert_true(not vim.tbl_contains(active_plan.lines, "• Plan"),
+  assert_true(not vim.tbl_contains(active_plan_render.lines, "• Plan"),
     "provider tasks should never reappear as a tail-only plan block")
   for _, task in ipairs(task_snapshot.current) do task.status = "completed" end
   local completed_plan = interaction_renderer.build({ {
@@ -1130,6 +1473,16 @@ local ok, failure = pcall(function()
   assert_true(not vim.tbl_contains(active_tree.lines, "      line five"),
     "active tool previews should truncate output after four lines")
 
+  local cancelled_tree = interaction_renderer.build({ {
+    id = "cancelled-only",
+    prompt = "stop this turn",
+    state = "cancelled",
+    duration_ms = 2000,
+    thought = {},
+  } })
+  assert_true(vim.tbl_contains(cancelled_tree.lines, "▸ Cancelled after 2s"),
+    "cancelled interactions should retain an explicit terminal state in the timeline")
+
   vim.api.nvim_set_current_win(session.harness.transcript_win)
   local tool_line = nil
   for line, row in pairs(session.harness.render_rows) do
@@ -1168,6 +1521,68 @@ local ok, failure = pcall(function()
   end
   assert_equals(hello_count, 1, "broker completion should replace the optimistic interaction")
 
+  local prompt_count_before_steer = prompt_count
+  session.harness.capability.native_steer = true
+  session.harness.active_plan = { id = "steering-plan", state = "planning" }
+  session.harness.busy = true
+  vim.api.nvim_set_current_win(session.harness.composer_win)
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false,
+    { "And be sure to modify Y" })
+  vim.fn.maparg("<C-q>", "i", false, true).callback()
+  assert_equals(table.concat(vim.api.nvim_buf_get_lines(session.harness.composer_buf, 0, -1, false), "\n"), "",
+    "Ctrl-q should clear the composer after accepting a steering prompt")
+  local steer_preview = false
+  for _, extmark in ipairs(vim.api.nvim_buf_get_extmarks(session.harness.composer_buf, -1, 0, -1, { details = true })) do
+    local virtual_line_list = extmark[4].virt_lines or {}
+    if virtual_line_list[1] and virtual_line_list[1][1]
+      and virtual_line_list[1][1][1] == "• Steering active turn"
+      and virtual_line_list[2] and virtual_line_list[2][1]
+      and virtual_line_list[2][1][1] == "└ And be sure to modify Y"
+    then
+      steer_preview = true
+    end
+  end
+  assert_true(steer_preview, "pending steering should render above HarnessInput until the provider acknowledges it")
+  assert_true(vim.wait(1000, function() return #(session.harness.pending_steer or {}) == 0 end, 10),
+    "provider acknowledgement should clear the pending steering indicator")
+  assert_equals(steered_text_list[#steered_text_list], "And be sure to modify Y",
+    "planning steering should send the follow-up to the active provider turn")
+  assert_equals(prompt_count, prompt_count_before_steer,
+    "planning steering should not create a second Harness interaction")
+  assert_equals(#session.harness.queue, 0,
+    "successful steering should not leave a queued follow-up")
+
+  steer_should_fail = true
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false,
+    { "Preserve the verification section" })
+  controller.steer_submit()
+  assert_true(vim.wait(1000, function()
+    return #(session.harness.pending_steer or {}) == 0
+      and session.harness.queue[#session.harness.queue] == "Preserve the verification section"
+  end, 10), "a completion race should preserve failed steering as a regular queued follow-up")
+  assert_equals(prompt_count, prompt_count_before_steer,
+    "failed steering should remain queued while the current turn is still active")
+  session.harness.queue = {}
+  steer_should_fail = false
+
+  local previous_steer_request = request_by_method["turn.steer"]
+  session.harness.capability.native_steer = false
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "Unsupported steering" })
+  controller.steer_submit()
+  assert_equals(request_by_method["turn.steer"], previous_steer_request,
+    "unsupported backends should not receive steering requests")
+  assert_equals(vim.api.nvim_get_current_line(), "Unsupported steering",
+    "unsupported steering should preserve the composer draft")
+  session.harness.capability.native_steer = true
+  session.harness.busy = false
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "No active turn" })
+  controller.steer_submit()
+  assert_equals(request_by_method["turn.steer"], previous_steer_request,
+    "idle Harness sessions should not receive steering requests")
+  assert_equals(vim.api.nvim_get_current_line(), "No active turn",
+    "idle steering should preserve the composer draft")
+  session.harness.active_plan = nil
+
   session.harness.busy = true
   vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "queued prompt" })
   controller.submit()
@@ -1193,6 +1608,80 @@ local ok, failure = pcall(function()
   assert_equals(session.harness.queue[#session.harness.queue], "displaced draft", "edit queued should preserve an existing draft")
   session.harness.queue = {}
   session.harness.busy = false
+
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/plan choose a migration" })
+  controller.submit()
+  local question_view = require("diff_review.views.harness.plan_question")
+  assert_true(vim.wait(2000, question_view.is_open, 10), "planning questions should open a custom float")
+  local question_state = question_view._state_for_test()
+  local question_config = vim.api.nvim_win_get_config(question_state.win)
+  assert_equals(question_config.relative, "win", "planning questions should float relative to Harness")
+  assert_true(vim.inspect(question_config.title):find("Harness question 1 of 3", 1, true) ~= nil,
+    "planning question title should show sequence progress")
+  assert_true(vim.fn.maparg("a", "n", false, true).callback ~= nil,
+    "Ask should always own the a key")
+  vim.fn.maparg("q", "n", false, true).callback()
+  assert_true(not question_view.is_open(), "q should hide the question float without resolving it")
+  assert_true(vim.wo[session.harness.transcript_win].winbar:find(
+    "Planning: feedback requested (press oe)", 1, true
+  ) ~= nil, "closed planning questions should advertise the configured reopen key")
+  vim.api.nvim_set_current_win(session.harness.transcript_win)
+  vim.fn.maparg("oe", "n", false, true).callback()
+  assert_true(vim.wait(1000, question_view.is_open, 10), "oe should reopen durable planning elicitation state")
+  question_state = question_view._state_for_test()
+  vim.fn.maparg("<Tab>", "n", false, true).callback()
+  assert_equals(question_state.input_kind, "choice", "Tab should open the attached feedback editor")
+  assert_true(vim.api.nvim_win_is_valid(question_state.input_win), "feedback editor should own a separate float")
+  vim.api.nvim_buf_set_lines(question_state.input_buf, 0, -1, false,
+    { "Preserve compatibility for one release" })
+  vim.fn.maparg("<C-s>", "i", false, true).callback()
+  assert_true(vim.wait(1000, function()
+    return active_plan.elicitation.current_index == 1
+  end, 10), "inline feedback should commit the selected option")
+  assert_true(vim.inspect(vim.api.nvim_win_get_config(question_state.win).title):find(
+    "Harness question 2 of 3", 1, true
+  ) ~= nil, "the float should advance without reopening")
+  vim.fn.maparg("o", "n", false, true).callback()
+  assert_equals(question_state.input_kind, nil, "Other quick key should only highlight its row")
+  vim.fn.maparg("<CR>", "n", false, true).callback()
+  assert_equals(question_state.input_kind, "other", "Enter should open Other's free-form input row")
+  vim.fn.maparg("go", "n", false, true).callback()
+  vim.fn.maparg("<Right>", "n", false, true).callback()
+  assert_equals(question_state.elicitation.current_index, 2, "Right should preview the next question")
+  assert_equals(active_plan.elicitation.current_index, 1, "question navigation should not submit an answer")
+  vim.fn.maparg("<Left>", "n", false, true).callback()
+  vim.fn.maparg("n", "n", false, true).callback()
+  assert_equals(active_plan.elicitation.current_index, 1, "direct choice keys should not commit")
+  vim.fn.maparg("<CR>", "n", false, true).callback()
+  vim.fn.maparg("<C-s>", "i", false, true).callback()
+  assert_true(vim.wait(1000, function() return active_plan.elicitation.current_index == 2 end, 10),
+    "C-s should commit the highlighted choice while the editor is open")
+  vim.fn.maparg("a", "n", false, true).callback()
+  assert_equals(question_state.input_kind, nil, "a should highlight Ask without opening an editor")
+  vim.fn.maparg("<CR>", "n", false, true).callback()
+  assert_equals(question_state.input_kind, "ask", "Enter should open the Ask input below its row")
+  vim.api.nvim_buf_set_lines(question_state.input_buf, 0, -1, false, { "Why does full verification matter?" })
+  vim.fn.maparg("<C-s>", "i", false, true).callback()
+  assert_true(vim.wait(2000, function()
+    return request_by_method["question.ask"] ~= nil and question_view.is_open()
+  end, 10), "Ask should clarify without consuming the pending question")
+  assert_equals(active_plan.elicitation.current_index, 2, "clarification should preserve the current question")
+  vim.fn.maparg("n", "n", false, true).callback()
+  assert_equals(active_plan.elicitation.current_index, 2, "direct choice keys should still wait for Enter")
+  vim.fn.maparg("<CR>", "n", false, true).callback()
+  assert_true(vim.wait(1000, function()
+    return active_plan.elicitation.current_index == 3
+  end, 10), "direct choice keys should commit the current question")
+  local review_submit_mapping = vim.api.nvim_buf_call(question_state.buf, function()
+    return vim.fn.maparg("<C-s>", "n", false, true)
+  end)
+  assert_equals(review_submit_mapping.callback, nil,
+    "the final answer review should not bind Ctrl-s")
+  vim.fn.maparg("y", "n", false, true).callback()
+  assert_true(vim.wait(2000, function() return active_plan.state == "awaiting_review" end, 10),
+    "y should explicitly continue planning with reviewed answers")
+  assert_equals(active_plan.state, "awaiting_review", "answering a planning question should produce the review artifact")
+  assert_equals(active_plan.elicitation, nil, "continued planning should clear durable elicitation state")
 
   vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/plan inspect the feature" })
   controller.submit()
@@ -1295,12 +1784,16 @@ local ok, failure = pcall(function()
   assert_true(vim.wait(2000, function()
     return request_by_method["session.configure"] ~= nil and session.harness.session.effort == "high"
   end, 10), "/effort should configure the active session")
+  assert_true(vim.wait(1000, function() return session.harness.prompt_history[1] == "/effort high" end, 10),
+    "slash commands should enter shared prompt history")
   require("diff_review.views.harness").new_session()
   assert_true(vim.wait(2000, function()
     return session.harness.session.id == "session-two"
   end, 10), "new session should complete")
   assert_equals(session.harness.session.model, "selected-model", "new sessions should preserve the selected model")
   assert_equals(session.harness.session.effort, "high", "new sessions should preserve the selected effort")
+  assert_equals(session.harness.prompt_history[1], "/effort high",
+    "new sessions should retain the shared prompt history")
   vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/goal fail" })
   controller.submit()
   assert_true(vim.wait(2000, function()
@@ -1349,6 +1842,10 @@ builder._reset_for_test()
 pcall(vim.fn.delete, test_root, "rf")
 
 if not ok then
+  pcall(vim.cmd, "stopinsert")
+  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_valid(buf) then vim.bo[buf].modified = false end
+  end
   vim.api.nvim_err_writeln(failure)
   vim.cmd("cquit 1")
 else

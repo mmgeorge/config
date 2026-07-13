@@ -7,12 +7,41 @@ impl PlanPrompt {
         format!(
             r#"You are planning a software change in READ mode. Do not modify files.
 
-Explore the repository before asking questions. Resolve discoverable facts from the code. Ask only when a product decision materially changes the implementation. Produce a decision-complete reviewer-readable plan with Overview, Usage, Code flow, Tasks, Modularity and validation, and Test plan sections. Keep the overview, code flow, and task tree aligned. Do not parse the plan into an execution checklist. Provider task updates are advisory progress only.
+Explore the repository before asking questions. Resolve discoverable facts from the code. Ask only when a product decision materially changes the implementation. When feedback is required, call harness_plan_question with one to three concise questions, two or three mutually exclusive choices per structured question, and a recommended choice first. End that turn after requesting feedback. Produce a decision-complete reviewer-readable plan with Overview, Usage, Code flow, Tasks, Modularity and validation, and Test plan sections. Keep the overview, code flow, and task tree aligned. Do not parse the plan into an execution checklist. Provider task updates are advisory progress only.
 
 When the plan is complete, call harness_plan_submit with the entire Markdown artifact. Do not treat ordinary prose or a provider checklist as plan submission.
 
 User request:
 {request}"#
+        )
+    }
+
+    /// Continue one paused planning conversation with the user's selected feedback.
+    pub fn feedback(request: &str, answer: &str) -> String {
+        format!(
+            r#"Continue the existing READ-mode planning conversation for the original request below. Incorporate the user's planning feedback. If another material product decision remains, call harness_plan_question and end the turn. Otherwise call harness_plan_submit with the complete Markdown plan.
+
+Original request:
+{request}
+
+Planning feedback:
+{answer}"#
+        )
+    }
+
+    /// Build a clarification turn that preserves the unresolved planning decision.
+    pub fn clarification(request: &str, elicitation_json: &str, question: &str) -> String {
+        format!(
+            r#"Answer the user's clarification question about an unresolved planning decision. Stay in READ mode. Do not continue or rewrite the plan, do not select an option for the user, and do not call harness_plan_question or harness_plan_submit. Explain only what helps the user decide.
+
+Original planning request:
+{request}
+
+Current elicitation state:
+{elicitation_json}
+
+User clarification question:
+{question}"#
         )
     }
 
@@ -60,8 +89,18 @@ mod test {
         let prompt = PlanPrompt::draft("Refactor the renderer");
         assert!(prompt.contains("READ mode"));
         assert!(prompt.contains("harness_plan_submit"));
+        assert!(prompt.contains("harness_plan_question"));
         assert!(prompt.contains("Refactor the renderer"));
         assert!(!prompt.contains("collaborationMode"));
+    }
+
+    #[test]
+    fn feedback_continues_the_same_planning_contract() {
+        let prompt = PlanPrompt::feedback("Refactor the renderer", "Use a staged migration");
+        assert!(prompt.contains("Refactor the renderer"));
+        assert!(prompt.contains("Use a staged migration"));
+        assert!(prompt.contains("harness_plan_question"));
+        assert!(prompt.contains("harness_plan_submit"));
     }
 
     #[test]
@@ -69,5 +108,13 @@ mod test {
         let prompt = PlanPrompt::with_active_artifact("Why?".into(), "plan", "D:/plan/working.md");
         assert!(prompt.contains("D:/plan/working.md"));
         assert!(prompt.ends_with("Why?"));
+    }
+
+    #[test]
+    fn clarification_preserves_the_pending_decision_boundary() {
+        let prompt = PlanPrompt::clarification("Refactor", "{\"question\":\"Migration?\"}", "Why?");
+        assert!(prompt.contains("do not select an option"));
+        assert!(prompt.contains("Why?"));
+        assert!(prompt.contains("Migration?"));
     }
 }

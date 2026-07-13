@@ -121,16 +121,25 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
         .expect("gpt-5.4-mini is required for the fast Harness integration test");
     assert!(model.effort.iter().any(|effort| effort == "low"));
 
-    let planned = backend
-        .prompt(request(
-            repository.path(),
-            PromptMode::Plan,
-            &PlanPrompt::draft(
-                "Create a concise plan to add harness-integration.txt containing exactly `verified`. Do not modify files.",
-            ),
-        ))
-        .await
-        .unwrap();
+    let planning = backend.prompt(request(
+        repository.path(),
+        PromptMode::Plan,
+        &PlanPrompt::draft(
+            "Create a concise plan to add harness-integration.txt containing exactly `verified`. Do not modify files.",
+        ),
+    ));
+    let steering = async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        backend
+            .steer(
+                "Include the literal marker `STEERING_CONSTRAINT_7B3D` in the plan Overview."
+                    .into(),
+            )
+            .await
+    };
+    let (planned, steered) = tokio::join!(planning, steering);
+    let planned = planned.unwrap();
+    steered.unwrap();
     assert!(
         planned
             .plan_markdown
@@ -138,6 +147,14 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
             .is_some_and(|plan| !plan.trim().is_empty()),
         "Codex planning events did not contain a complete plan: {:#?}",
         planned.event
+    );
+    assert!(
+        planned
+            .plan_markdown
+            .as_deref()
+            .is_some_and(|plan| plan.contains("STEERING_CONSTRAINT_7B3D")),
+        "Codex planning ignored the active-turn steering constraint: {:#?}",
+        planned.plan_markdown
     );
     assert!(!repository.path().join("harness-integration.txt").exists());
 

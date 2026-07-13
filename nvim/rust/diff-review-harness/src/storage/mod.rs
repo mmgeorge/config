@@ -112,7 +112,12 @@ impl SqliteStore {
                 payload TEXT NOT NULL,
                 FOREIGN KEY(session_id) REFERENCES session_record(id) ON DELETE CASCADE
             );
-            PRAGMA user_version=3;
+            CREATE TABLE IF NOT EXISTS prompt_history_record (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                text TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL
+            );
+            PRAGMA user_version=4;
             "#,
         )?;
         Ok(Self {
@@ -348,6 +353,15 @@ impl SqliteStore {
         )
     }
 
+    /// Remove one provisional lifecycle event after its owning backend turn fails.
+    pub fn delete_plan_lifecycle(&mut self, lifecycle_id: &str) -> Result<()> {
+        self.connection.execute(
+            "DELETE FROM plan_lifecycle_record WHERE id=?1",
+            [lifecycle_id],
+        )?;
+        Ok(())
+    }
+
     /// Write one accepted-plan execution record.
     pub fn save_plan_execution(&mut self, execution: &PlanExecutionRecord) -> Result<()> {
         self.save_scoped_payload(
@@ -426,6 +440,35 @@ impl SqliteStore {
             .join(&object_id[0..2])
             .join(&object_id[2..]);
         fs::read(&path).with_context(|| format!("read Harness object {}", path.display()))
+    }
+
+    /// Record one globally shared prompt and retain only the newest bounded history.
+    pub fn record_prompt_history(&mut self, text: &str, created_at_ms: i64) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO prompt_history_record(text, created_at_ms) VALUES(?1, ?2)",
+            params![text, created_at_ms],
+        )?;
+        transaction.execute(
+            "DELETE FROM prompt_history_record WHERE id NOT IN \
+             (SELECT id FROM prompt_history_record ORDER BY id DESC LIMIT 100)",
+            [],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Load globally shared prompts from newest to oldest.
+    pub fn list_prompt_history(&self) -> Result<Vec<String>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT text FROM prompt_history_record ORDER BY id DESC LIMIT 100")?;
+        let row_list = statement.query_map([], |row| row.get::<_, String>(0))?;
+        row_list
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     fn save_scoped_payload<T: Serialize>(
@@ -538,6 +581,8 @@ mod test {
             lease_owner: None,
             lease_expires_at_ms: None,
             native_fork: false,
+            native_compact: false,
+            context_usage: None,
         }
     }
 
@@ -550,6 +595,25 @@ mod test {
         }
         assert_eq!(store.list_session(Some("D:/one")).unwrap().len(), 1);
         assert_eq!(store.list_session(None).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn shares_only_the_newest_hundred_prompts() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut store = SqliteStore::open(temporary.path()).unwrap();
+        for index in 0..105 {
+            store
+                .record_prompt_history(&format!("prompt-{index}"), index)
+                .unwrap();
+        }
+
+        let history = store.list_prompt_history().unwrap();
+        assert_eq!(history.len(), 100);
+        assert_eq!(history.first().map(String::as_str), Some("prompt-104"));
+        assert_eq!(history.last().map(String::as_str), Some("prompt-5"));
+
+        let reopened = SqliteStore::open(temporary.path()).unwrap();
+        assert_eq!(reopened.list_prompt_history().unwrap(), history);
     }
 
     #[test]
@@ -673,6 +737,6 @@ mod test {
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(schema_version, 3);
+        assert_eq!(schema_version, 4);
     }
 }
