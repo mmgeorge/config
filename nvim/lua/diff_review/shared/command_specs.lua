@@ -92,6 +92,7 @@ M.view_specs = {
     { id = "history_next", label = "history+", desc = "Recall the next submitted prompt", modes = { "n", "i" }, pinned = false },
     { id = "toggle_activity", label = "activity", desc = "Toggle complete tool output", modes = "n", pinned = true },
     { id = "open_artifact", label = "artifacts", desc = "Open a session artifact", modes = "n", pinned = true },
+    { id = "agent", label = "agents", desc = "Switch or start a child-agent timeline", modes = "n", pinned = true },
     { id = "reopen_question", label = "feedback", desc = "Reopen pending Harness questions", modes = "n", pinned = false },
     { id = "model", label = "model", desc = "Select the model at the next safe boundary", modes = "n", pinned = false },
     { id = "effort_down", label = "effort-", desc = "Decrease reasoning effort", modes = "n", pinned = false },

@@ -4,8 +4,81 @@ local diff_review = require("diff_review")
 local builder = require("diff_review.harness.builder")
 local client = require("diff_review.harness.client")
 local controller = require("diff_review.views.harness.controller")
-local interaction_renderer = require("diff_review.render.harness.interaction_tree")
+local raw_interaction_renderer = require("diff_review.render.harness.interaction_tree")
 local session = require("diff_review.session")
+
+local function normalize_interaction(interaction)
+  if interaction.node_list then return interaction end
+  local node_list = {}
+  if interaction.thought or interaction.active or interaction.response then
+    node_list[#node_list + 1] = {
+      kind = "main_segment",
+      segment = {
+        id = interaction.id .. ":segment:1",
+        state = interaction.state == "running" and "running" or "complete",
+        started_at_ms = interaction.created_at_ms or 0,
+        completed_at_ms = interaction.completed_at_ms,
+        duration_ms = interaction.duration_ms or 0,
+        token_count = interaction.token_count,
+        spawned_agent_count = #(interaction.agent or {}),
+        thought = interaction.thought or {},
+        active = interaction.active,
+        response = interaction.response,
+      },
+    }
+  end
+  for _, steering in ipairs(interaction.steering_input or {}) do
+    node_list[#node_list + 1] = { kind = "steering_prompt", prompt = steering }
+  end
+  interaction.node_list = node_list
+  interaction.thought = nil
+  interaction.active = nil
+  interaction.response = nil
+  interaction.steering_input = nil
+  return interaction
+end
+
+local function normalize_entry(entry)
+  if entry.interaction and entry.kind == "interaction" then
+    entry.interaction = normalize_interaction(entry.interaction)
+    entry.agent_by_id = entry.agent_by_id or {}
+    for _, agent in ipairs(entry.agent or {}) do
+      local run_id = agent.run and agent.run.id or agent.id
+      entry.agent_by_id[run_id] = agent
+      entry.interaction.node_list[#entry.interaction.node_list + 1] = {
+        kind = "agent_reference",
+        agent = {
+          id = entry.interaction.id .. ":agent:" .. run_id,
+          agent_run_id = run_id,
+          created_at_ms = agent.run and agent.run.created_at_ms or 0,
+        },
+      }
+      for _, node in ipairs(entry.interaction.node_list) do
+        if node.kind == "main_segment" then
+          node.segment.spawned_agent_count = (node.segment.spawned_agent_count or 0) + 1
+          break
+        end
+      end
+    end
+    entry.agent = nil
+  elseif entry.kind == "agent_lifecycle" then
+    for _, child_interaction in ipairs(entry.interaction or {}) do normalize_interaction(child_interaction) end
+  elseif entry.kind == "plan_execution" then
+    for _, execution_interaction in ipairs(entry.interaction or {}) do normalize_interaction(execution_interaction) end
+  elseif entry.id and entry.prompt then
+    normalize_interaction(entry)
+  end
+  return entry
+end
+
+local interaction_renderer = {
+  build = function(entry_list, options)
+    local normalized = vim.deepcopy(entry_list)
+    for _, entry in ipairs(normalized) do normalize_entry(entry) end
+    return raw_interaction_renderer.build(normalized, options)
+  end,
+  foldtext = raw_interaction_renderer.foldtext,
+}
 
 local function assert_true(condition, message)
   if not condition then error(message, 2) end
@@ -25,6 +98,13 @@ end
 local function line_number(line_list, expected)
   for index, line in ipairs(line_list) do
     if line == expected then return index end
+  end
+  return nil
+end
+
+local function interaction_response(interaction)
+  for _, node in ipairs(interaction.node_list or {}) do
+    if node.segment and type(node.segment.response) == "string" then return node.segment.response end
   end
   return nil
 end
@@ -136,6 +216,24 @@ local function emit(options, message)
   vim.schedule(function() options.stdout(nil, vim.json.encode(message) .. "\n") end)
 end
 
+local function mock_segment(interaction_id, state, active, thought, response, duration_ms)
+  return {
+    kind = "main_segment",
+    segment = {
+      id = interaction_id .. ":segment:1",
+      state = state,
+      started_at_ms = 0,
+      completed_at_ms = state == "complete" and (duration_ms or 0) or nil,
+      duration_ms = duration_ms or 0,
+      token_count = state == "complete" and 2700 or nil,
+      spawned_agent_count = 0,
+      thought = thought or {},
+      active = active,
+      response = response,
+    },
+  }
+end
+
 local function fake_launcher(command, options, _)
   launched_binary = command[1]
   local process = {}
@@ -173,7 +271,7 @@ local function fake_launcher(command, options, _)
             ordinal = prompt_count + 1,
             prompt = request.params.text,
             state = "running",
-            thought = {},
+            node_list = {},
           },
         } })
         return
@@ -185,15 +283,18 @@ local function fake_launcher(command, options, _)
       if request.params.text == "hello harness" then
         local output = table.concat({ "# Rendering", "line two", "line three", "line four", "last line" }, "\n")
         emit(options, { event = "backend_event", payload = {
-          kind = "timeline_active",
+          kind = "timeline_node_updated",
           data = {
             interaction_id = interaction_id,
-            thought_id = thought_id,
-            text = "Working",
-            synthetic = true,
-            tool_count = 1,
-            failed_count = 0,
-            revision = 1,
+            node = mock_segment(interaction_id, "running", {
+              interaction_id = interaction_id,
+              thought_id = thought_id,
+              text = "Working",
+              synthetic = true,
+              tool_count = 1,
+              failed_count = 0,
+              revision = 1,
+            }),
           },
         } })
         completed_tool = {
@@ -204,39 +305,62 @@ local function fake_launcher(command, options, _)
           output = output,
         }
         emit(options, { event = "backend_event", payload = {
-          kind = "timeline_thought_completed",
+          kind = "timeline_node_updated",
           data = {
+            interaction_id = interaction_id,
+            node = mock_segment(interaction_id, "running", nil, { {
+              id = thought_id,
+              text = "Working",
+              synthetic = true,
+              tool = { completed_tool },
+              started_at_ms = 0,
+              completed_at_ms = 1000,
+            } }),
+          },
+        } })
+      end
+      emit(options, { event = "backend_event", payload = {
+        kind = "timeline_node_updated",
+        data = {
+          interaction_id = interaction_id,
+          node = mock_segment(interaction_id, "running", {
+            interaction_id = interaction_id,
+            thought_id = interaction_id .. ":thought:2",
+            text = "Mock ",
+            synthetic = false,
+            tool_count = 0,
+            failed_count = 0,
+            revision = 2,
+          }, completed_tool and { {
             id = thought_id,
             text = "Working",
             synthetic = true,
             tool = { completed_tool },
             started_at_ms = 0,
             completed_at_ms = 1000,
-          },
-        } })
-      end
-      emit(options, { event = "backend_event", payload = {
-        kind = "timeline_active",
-        data = {
-          interaction_id = interaction_id,
-          thought_id = interaction_id .. ":thought:2",
-          text = "Mock ",
-          synthetic = false,
-          tool_count = 0,
-          failed_count = 0,
-          revision = 2,
+          } } or {}),
         },
       } })
       emit(options, { event = "backend_event", payload = {
-        kind = "timeline_active",
+        kind = "timeline_node_updated",
         data = {
           interaction_id = interaction_id,
-          thought_id = interaction_id .. ":thought:2",
-          text = "Mock reply",
-          synthetic = false,
-          tool_count = 0,
-          failed_count = 0,
-          revision = 3,
+          node = mock_segment(interaction_id, "running", {
+            interaction_id = interaction_id,
+            thought_id = interaction_id .. ":thought:2",
+            text = "Mock reply",
+            synthetic = false,
+            tool_count = 0,
+            failed_count = 0,
+            revision = 3,
+          }, completed_tool and { {
+            id = thought_id,
+            text = "Working",
+            synthetic = true,
+            tool = { completed_tool },
+            started_at_ms = 0,
+            completed_at_ms = 1000,
+          } } or {}),
         },
       } })
       if request.params.text == "/plan choose a migration" then
@@ -299,18 +423,16 @@ local function fake_launcher(command, options, _)
             ordinal = prompt_count,
             prompt = request.params.text,
             state = "complete",
-            thought = completed_tool and { {
+            node_list = { mock_segment(interaction_id, "complete", nil, completed_tool and { {
               id = thought_id,
               text = "Working",
               synthetic = true,
               tool = { completed_tool },
               started_at_ms = 0,
               completed_at_ms = 1000,
-            } } or {},
-            response = "Mock reply",
+            } } or {}, "Mock reply", 2000) },
             duration_ms = 2000,
             token_count = 2700,
-            attribution_complete = true,
           }
           emit(options, { event = "interaction_complete", payload = completed })
           emit(options, { id = request.id, result = {
@@ -326,12 +448,10 @@ local function fake_launcher(command, options, _)
           ordinal = prompt_count,
           prompt = request.params.text,
           state = "complete",
-          thought = {},
-          response = "Mock reply",
+          node_list = { mock_segment(interaction_id, "complete", nil, {}, "Mock reply", 2000) },
           awaiting_input = request.params.text == "/plan choose a migration" or request.params.text == "ask choices",
           duration_ms = 2000,
           token_count = 2700,
-          attribution_complete = true,
         }
         emit(options, { event = "interaction_complete", payload = completed })
         emit(options, { id = request.id, result = {
@@ -425,6 +545,21 @@ local function fake_launcher(command, options, _)
         if steer_should_fail then
           emit(options, { id = request.id, error = { message = "active turn already completed" } })
         else
+          local active_interaction = session.harness.interaction[#session.harness.interaction]
+          emit(options, { event = "backend_event", payload = {
+            kind = "timeline_node_updated",
+            data = {
+              interaction_id = active_interaction.id,
+              node = {
+                kind = "steering_prompt",
+                prompt = {
+                  id = active_interaction.id .. ":steering:1",
+                  text = request.params.text,
+                  created_at_ms = 1,
+                },
+              },
+            },
+          } })
           emit(options, { id = request.id, result = { steered = true } })
         end
       end, 80)
@@ -548,6 +683,212 @@ local ok, failure = pcall(function()
     "planning questions should remain visible without expansion")
   assert_true(vim.tbl_contains(question_render.lines, "    ○ Staged — Support both formats temporarily."),
     "planning question choices should remain visible in the timeline")
+  local agent_render = interaction_renderer.build({ {
+    kind = "agent_lifecycle",
+    id = "agent-run",
+    run = {
+      id = "agent-run",
+      definition = "explorer",
+      nickname = "Bevy scout",
+      task = "Inspect Bevy ownership",
+      status = "running",
+      created_at_ms = 1000,
+      updated_at_ms = 2000,
+    },
+    interaction = { {
+      id = "child-turn",
+      state = "running",
+      thought = { {
+        id = "child-thought",
+        text = "Tracing Bevy ownership.",
+        tool = { { id = "tool-1", kind = "command", title = "Ran rg Bevy", status = "completed" } },
+      } },
+    } },
+  } }, {
+    expanded = { ["agent_lifecycle:agent-run"] = true },
+    now_ms = 3000,
+  })
+  assert_equals(agent_render.lines[1], "▸ Agent Bevy scout running for 2s, 1 tool called",
+    "parent timelines should render child runtime and tool activity")
+  assert_equals(agent_render.lines[2], "  ↳ Tracing Bevy ownership.",
+    "expanded child lifecycle nodes should expose the child timeline")
+  local parent_with_agent = interaction_renderer.build({ {
+    kind = "interaction",
+    interaction = {
+      id = "parent-turn",
+      prompt = "/agent explorer inspect Bevy",
+      state = "running",
+      duration_ms = 1000,
+      active_wait = { interaction_id = "parent-turn", started_at_ms = 1000, agent_count = 1 },
+      thought = { {
+        id = "delegation-thought",
+        text = "Delegating the repository map.",
+        tool = {},
+      } },
+    },
+    agent = { {
+      kind = "agent_lifecycle",
+      id = "agent-run",
+      run = {
+        id = "agent-run",
+        definition = "explorer",
+        nickname = "Bevy scout",
+        status = "running",
+        created_at_ms = 1000,
+        updated_at_ms = 2000,
+      },
+      interaction = { {
+        id = "child-turn",
+        state = "running",
+        thought = {},
+        active = { text = "Inspecting Bevy ownership.", tool_count = 0, failed_count = 0 },
+      } },
+    } },
+  } }, { now_ms = 3000 })
+  assert_equals(parent_with_agent.lines[2], "▸ Thinking for 1s, 1 agent spawned",
+    "a parent interaction should summarize its owned child run")
+  assert_true(vim.tbl_contains(parent_with_agent.lines, "▸ Waiting on 1 subagent for 2s"),
+    "a parent without active work should expose its transient waiting state")
+  assert_true(vim.tbl_contains(parent_with_agent.lines, "▸ Agent Bevy scout running for 2s"),
+    "the main timeline should keep child runtime at top-level indentation")
+  parent_with_agent = interaction_renderer.build({ {
+    kind = "interaction",
+    interaction = {
+      id = "parent-turn",
+      prompt = "/agent explorer inspect Bevy",
+      state = "running",
+      duration_ms = 1000,
+      thought = {},
+      active = { text = "Continuing parent analysis.", tool_count = 0, failed_count = 0 },
+    },
+    agent = { {
+      kind = "agent_lifecycle",
+      id = "agent-run",
+      run = { id = "agent-run", definition = "explorer", status = "running", created_at_ms = 1000 },
+    } },
+  } }, { now_ms = 3000 })
+  assert_true(not vim.tbl_contains(parent_with_agent.lines, "↳ Waiting on 1 subagent."),
+    "parent work should replace the synthetic waiting state while its child keeps running")
+  local interaction_state = require("diff_review.views.harness.interaction_state")
+  local steering_state = {
+    interaction = { {
+      id = "steering-parent",
+      prompt = "/agent explorer inspect Bevy",
+      state = "running",
+      node_list = {},
+      active_wait = { interaction_id = "steering-parent", started_at_ms = 1000, agent_count = 1 },
+    } },
+  }
+  steering_state.interaction_by_id = { ["steering-parent"] = steering_state.interaction[1] }
+  interaction_state.apply_node(steering_state, {
+    interaction_id = "steering-parent",
+    node = {
+      kind = "steering_prompt",
+      prompt = { id = "steering-parent:steering:1", text = "What day is it?", created_at_ms = 2000 },
+    },
+  })
+  assert_true(steering_state.interaction[1].active_wait == nil,
+    "an acknowledged steering node should atomically remove transient waiting chrome")
+  assert_equals(steering_state.interaction[1].node_list[1].prompt.text, "What day is it?",
+    "steering should retain its chronological position after waiting disappears")
+  local projected_timeline = require("diff_review.views.harness.timeline").project({
+    timeline = {},
+    interaction = { {
+      id = "parent-turn",
+      prompt = "/agent local-code-explorer inspect Bevy",
+      state = "complete",
+      thought = {},
+    } },
+    agent = {
+      run = {
+        {
+          id = "coordinator-run",
+          definition = "default",
+          parent_interaction_id = "parent-turn",
+          provider_thread_id = "coordinator-thread",
+          status = "completed",
+        },
+        {
+          id = "explorer-run",
+          definition = "local-code-explorer",
+          parent_interaction_id = "parent-turn",
+          parent_thread_id = "coordinator-thread",
+          provider_thread_id = "explorer-thread",
+          status = "completed",
+        },
+      },
+      turn = { {
+        agent_run_id = "explorer-run",
+        interaction = { id = "child-turn", state = "complete", response = "Mapped Bevy." },
+      } },
+    },
+  })
+  assert_equals(#projected_timeline, 1,
+    "completed interactions missing from a durable snapshot should remain in the local projection")
+  assert_equals(projected_timeline[1].interaction.id, "parent-turn",
+    "the projection should retain the spawning parent interaction")
+  local coordinator_entry = projected_timeline[1].agent_by_id["coordinator-run"]
+  assert_true(coordinator_entry ~= nil,
+    "provider-nested children should not flatten beside their parent agent")
+  assert_equals(coordinator_entry.run.definition, "default",
+    "the root provider child should remain attached to the interaction")
+  assert_equals(coordinator_entry.agent[1].run.definition, "local-code-explorer",
+    "parent thread identity should preserve nested provider hierarchy")
+  assert_equals(coordinator_entry.agent[1].interaction[1].response, "Mapped Bevy.",
+    "the nested run should carry its durable child interaction timeline")
+  local delegation_segment = mock_segment("ordered-parent", "complete", nil, { {
+    id = "delegating",
+    text = "Delegating the repository map.",
+    tool = {},
+  } }, nil, 1000)
+  delegation_segment.segment.spawned_agent_count = 1
+  local ordered_render = interaction_renderer.build({ {
+    kind = "interaction",
+    interaction = {
+      id = "ordered-parent",
+      prompt = "/agent explorer inspect Bevy",
+      state = "complete",
+      node_list = {
+        delegation_segment,
+        {
+          kind = "agent_reference",
+          agent = { id = "ordered-parent:agent:agent-one", agent_run_id = "agent-one" },
+        },
+        {
+          kind = "steering_prompt",
+          prompt = { id = "ordered-parent:steering:1", text = "What day is it?" },
+        },
+        mock_segment("ordered-parent-answer", "complete", nil, {}, "Today is Tuesday.", 1000),
+        mock_segment("ordered-parent-final", "complete", nil, {}, "Final synthesis.", 1000),
+      },
+    },
+    agent_by_id = {
+      ["agent-one"] = {
+        kind = "agent_lifecycle",
+        id = "agent-one",
+        run = {
+          id = "agent-one",
+          definition = "explorer",
+          status = "completed",
+          created_at_ms = 1000,
+          updated_at_ms = 2000,
+          completed_at_ms = 2000,
+        },
+        interaction = {},
+      },
+    },
+  } }, { now_ms = 3000 })
+  local agent_line = line_number(ordered_render.lines, "▸ Agent explorer completed in 1s")
+  local steering_line = line_number(ordered_render.lines, "▸ What day is it?")
+  local response_line = line_number(ordered_render.lines, "▸ Response")
+  local intermediate_response_line = line_number(ordered_render.lines, "Today is Tuesday.")
+  local final_response_line = line_number(ordered_render.lines, "Final synthesis.")
+  assert_true(agent_line ~= nil and steering_line ~= nil and response_line ~= nil,
+    "ordered interaction nodes should all render:\n" .. table.concat(ordered_render.lines, "\n"))
+  assert_true(agent_line < steering_line and steering_line < response_line,
+    "agent completion should stay at its spawn position while steering and response append after it")
+  assert_true(intermediate_response_line < final_response_line,
+    "a completed steering answer should remain visible before the final parent synthesis")
   local paused_plan_render = interaction_renderer.build({ {
     id = "paused-plan",
     prompt = "/plan choose a migration",
@@ -628,7 +969,7 @@ local ok, failure = pcall(function()
   assert_true(vim.wait(2000, function()
     if not session.harness.ready or session.harness.busy then return false end
     for _, item in ipairs(session.harness.interaction) do
-      if item.prompt == "what is this repo?" and item.response == "Mock reply" then return true end
+      if item.prompt == "what is this repo?" and interaction_response(item) == "Mock reply" then return true end
     end
     return false
   end, 10), "Harness did not complete the prompt queued during initialization")
@@ -698,7 +1039,7 @@ local ok, failure = pcall(function()
       } },
     } },
   } }, { expanded = {
-    ["interaction:completed-thought:thoughts"] = true,
+    ["interaction:completed-thought:segment:completed-thought:segment:1"] = true,
     ["interaction:completed-thought:thought:completed-thought:1"] = true,
   } })
   assert_equals(completed_thought_render.lines[3],
@@ -815,6 +1156,24 @@ local ok, failure = pcall(function()
   assert_equals(multiline_prompt.lines[2], "  is it cool?", "prompt continuation should align under quoted input")
   assert_equals(multiline_prompt.highlights[1].group, "DiffReviewHarnessPrompt",
     "user prompts should use the Harness yellow highlight")
+  local steering_render = interaction_renderer.build({ {
+    id = "steering",
+    prompt = "Start the analysis",
+    state = "complete",
+    duration_ms = 1000,
+    thought = {},
+    steering_input = { {
+      id = "steering:steering:1",
+      text = "Also inspect the renderer\nand its tests",
+      created_at_ms = 1,
+    } },
+  } }, { content_width = 80 })
+  assert_equals(steering_render.lines[3], "▸ Also inspect the renderer",
+    "acknowledged steering should render as user input under the owning turn summary")
+  assert_equals(steering_render.lines[4], "  and its tests",
+    "multiline steering should preserve prompt continuation alignment")
+  assert_equals(#steering_render.prompt_lines, 2,
+    "prompt navigation should include original and steering inputs")
   local command_render = interaction_renderer.build({ {
     id = "commands",
     prompt = "Run commands",
@@ -1066,6 +1425,38 @@ local ok, failure = pcall(function()
     "slash completion should expose compact when the backend advertises it")
   assert_equals(command_completion.items[1].label, "/plan", "slash completion should prioritize plan creation")
 
+  session.harness.capability.agent = { catalog = false }
+  command_source:get_completions({}, function(result) command_completion = result end)
+  assert_true(not vim.iter(command_completion.items):any(function(item) return item.label == "/agent" end),
+    "slash completion should hide child agents for ACP-compatible backends")
+  session.harness.capability.agent = { catalog = true }
+  command_source:get_completions({}, function(result) command_completion = result end)
+  assert_true(vim.iter(command_completion.items):any(function(item) return item.label == "/agent" end),
+    "slash completion should expose child agents for native Codex sessions")
+  session.harness.agent = {
+    definition = {
+      { name = "explorer", description = "Read-oriented repository explorer" },
+      { name = "worker", description = "Implementation-focused Codex agent" },
+    },
+    run = {},
+    turn = {},
+  }
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/agent exp" })
+  vim.api.nvim_win_set_cursor(session.harness.composer_win, { 1, 10 })
+  command_source:get_completions({}, function(result) command_completion = result end)
+  assert_equals(#command_completion.items, 2, "/agent should complete definitions from the broker catalog")
+  assert_equals(command_completion.items[1].label, "explorer", "agent completion should preserve catalog order")
+  assert_equals(command_completion.items[1].textEdit.newText, "explorer",
+    "agent completion should insert only the selected definition")
+  assert_equals(command_completion.items[1].textEdit.range.start.character, 7,
+    "agent completion should replace only the partial definition token")
+  assert_equals(command_completion.items[1].textEdit.range["end"].character, 10,
+    "agent completion should stop at the current cursor")
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/agent explorer inspect Bevy" })
+  vim.api.nvim_win_set_cursor(session.harness.composer_win, { 1, 28 })
+  command_source:get_completions({}, function(result) command_completion = result end)
+  assert_equals(#command_completion.items, 0, "agent completion should stop after the definition argument")
+
   session.harness.capability.native_compact = false
   command_source:get_completions({}, function(result) command_completion = result end)
   assert_true(not vim.iter(command_completion.items):any(function(item) return item.label == "/compact" end),
@@ -1151,7 +1542,8 @@ local ok, failure = pcall(function()
   assert_true(active_counter_seen, "active thoughts should stream an updating tool counter")
   assert_true(not active_tool_leak_seen, "active thoughts must not expose expandable tool rows")
   assert_true(not mixed_transition_seen, "Running-to-Ran transitions must publish one coherent frame")
-  assert_true(tool_completed_seen, "completed thoughts should atomically publish their collapsed summary")
+  assert_true(tool_completed_seen, "completed thoughts should atomically publish their collapsed summary\n"
+    .. table.concat(render_frame_list[#render_frame_list] or {}, "\n"))
   for transaction_index = tool_frame_start, #render_transaction_list do
     assert_true((render_transaction_list[transaction_index].first0 or 0) > 0,
       "streaming a later interaction should never rewrite the settled transcript prefix")
@@ -1444,6 +1836,23 @@ local ok, failure = pcall(function()
   local restored_hunk_line = vim.api.nvim_win_get_cursor(duplicate_win)[1]
   assert_equals(collapsed_duplicate_render.lines[restored_hunk_line], "  @@ +1 -1",
     "collapsing one repeated diff should keep the cursor on that tree's hunk header")
+  local stale_projection_render = {
+    lines = { "short child timeline" },
+    rows = { [999] = duplicate_state.render_rows[restored_hunk_line] },
+    highlights = {},
+    extmarks = {},
+    diff_row_spans = {},
+    folds = {},
+  }
+  local projection_ok, projection_error = pcall(
+    require("diff_review.render.harness.transaction").apply,
+    duplicate_state,
+    stale_projection_render
+  )
+  assert_true(projection_ok, "shrinking a timeline projection should bound semantic cursor restoration: "
+    .. tostring(projection_error))
+  assert_equals(vim.api.nvim_win_get_cursor(duplicate_win)[1], 1,
+    "shrinking a timeline projection should clamp the cursor to the rendered buffer")
   vim.api.nvim_win_close(duplicate_win, true)
   vim.api.nvim_buf_delete(duplicate_buf, { force = true })
   local diff_key = "projection:file:1"
@@ -1508,7 +1917,7 @@ local ok, failure = pcall(function()
   assert_true(vim.iter(syntax_group_list):any(function(group)
     return group:match("^@") ~= nil
   end), "Harness diffs should retain the shared Tree-sitter syntax highlights: " .. table.concat(syntax_group_list, ","))
-  local active_tree = require("diff_review.render.harness.interaction_tree").build({ {
+  local active_tree = interaction_renderer.build({ {
     id = "active-only",
     prompt = "stream",
     state = "running",
@@ -1616,6 +2025,12 @@ local ok, failure = pcall(function()
     "planning steering should send the follow-up to the active provider turn")
   assert_equals(prompt_count, prompt_count_before_steer,
     "planning steering should not create a second Harness interaction")
+  local transcript = table.concat(
+    vim.api.nvim_buf_get_lines(session.harness.transcript_buf, 0, -1, false),
+    "\n"
+  )
+  assert_true(transcript:find("▸ And be sure to modify Y", 1, true) ~= nil,
+    "acknowledged steering should appear in the owning interaction timeline")
   assert_equals(#session.harness.queue, 0,
     "successful steering should not leave a queued follow-up")
 

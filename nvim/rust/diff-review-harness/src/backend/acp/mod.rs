@@ -90,6 +90,7 @@ impl AcpBackend {
             model_selection: false,
             effort_selection: false,
             permission_control: true,
+            agent: crate::agent::AgentCapability::default(),
         }
     }
 

@@ -1,6 +1,79 @@
-use crate::backend::{BackendEvent, ToolActivity};
+use crate::backend::{BackendEvent, ProviderChangeSet, ToolActivity};
+use crate::interaction::change::ProviderDiffBuilder;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::HashMap;
+
+/// Stores tool lifecycle records in first-seen provider order.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ToolStore {
+    order: Vec<String>,
+    item: HashMap<String, CompletedTool>,
+}
+
+impl ToolStore {
+    fn merge(&mut self, activity: &ToolActivity) {
+        if !self.item.contains_key(&activity.id) {
+            self.order.push(activity.id.clone());
+        }
+        let tool = self
+            .item
+            .entry(activity.id.clone())
+            .or_insert_with(|| CompletedTool {
+                id: activity.id.clone(),
+                kind: tool_kind(activity),
+                title: activity.title.clone(),
+                output: String::new(),
+                status: activity
+                    .status
+                    .clone()
+                    .unwrap_or_else(|| "inProgress".into()),
+                failed: false,
+                change: ProviderChangeSet::default(),
+            });
+        if !activity.title.is_empty()
+            && !matches!(activity.title.as_str(), "command" | "file changes" | "tool")
+        {
+            tool.title.clone_from(&activity.title);
+        }
+        if let Some(status) = activity.status.as_ref() {
+            tool.status.clone_from(status);
+        }
+        if let Some(output) = activity.output.as_ref() {
+            if activity.output_delta {
+                tool.output.push_str(output);
+            } else {
+                tool.output.clone_from(output);
+            }
+        }
+        if !activity.change.is_empty() {
+            tool.change.clone_from(&activity.change);
+        }
+        tool.failed = tool_failed(&tool.status, &tool.output);
+    }
+
+    fn len(&self) -> usize {
+        self.order.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.order.is_empty()
+    }
+
+    fn failed_count(&self) -> usize {
+        self.item.values().filter(|tool| tool.failed).count()
+    }
+
+    fn get(&self, id: &str) -> Option<&CompletedTool> {
+        self.item.get(id)
+    }
+
+    fn into_list(mut self) -> Vec<CompletedTool> {
+        self.order
+            .into_iter()
+            .filter_map(|id| self.item.remove(&id))
+            .collect()
+    }
+}
 
 /// Represents the one non-expandable thought currently receiving streamed activity.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -9,7 +82,7 @@ pub struct ActiveThought {
     pub text: String,
     pub synthetic: bool,
     pub started_at_ms: i64,
-    pub tool: BTreeMap<String, CompletedTool>,
+    pub tool: ToolStore,
     pub latest_tool_id: Option<String>,
 }
 
@@ -35,6 +108,8 @@ pub struct CompletedTool {
     pub output: String,
     pub status: String,
     pub failed: bool,
+    #[serde(default)]
+    pub change: ProviderChangeSet,
 }
 
 /// Represents one immutable thought and the workspace delta attributed to it.
@@ -46,8 +121,6 @@ pub struct CompletedThought {
     pub tool: Vec<CompletedTool>,
     pub started_at_ms: i64,
     pub completed_at_ms: i64,
-    pub checkpoint_before: Option<String>,
-    pub checkpoint_after: Option<String>,
     pub diff_text: Option<String>,
     #[serde(default)]
     pub task_id: Option<String>,
@@ -111,7 +184,7 @@ impl TimelineReducer {
                     text: text.to_owned(),
                     synthetic: false,
                     started_at_ms: now_ms,
-                    tool: BTreeMap::new(),
+                    tool: ToolStore::default(),
                     latest_tool_id: None,
                 });
             }
@@ -137,6 +210,11 @@ impl TimelineReducer {
         (None, Some(active.text))
     }
 
+    /// Complete the active thought before an acknowledged user steering boundary.
+    pub fn complete_active(&mut self, now_ms: i64) -> Option<CompletedThought> {
+        self.take_active(now_ms)
+    }
+
     fn ensure_active(&mut self, now_ms: i64) {
         if self.active.is_some() {
             return;
@@ -147,45 +225,14 @@ impl TimelineReducer {
             text: "Working".into(),
             synthetic: true,
             started_at_ms: now_ms,
-            tool: BTreeMap::new(),
+            tool: ToolStore::default(),
             latest_tool_id: None,
         });
     }
 
     fn merge_tool(&mut self, activity: &ToolActivity) {
         let active = self.active.as_mut().expect("active thought is initialized");
-        {
-            let tool = active
-                .tool
-                .entry(activity.id.clone())
-                .or_insert_with(|| CompletedTool {
-                    id: activity.id.clone(),
-                    kind: tool_kind(activity),
-                    title: activity.title.clone(),
-                    output: String::new(),
-                    status: activity
-                        .status
-                        .clone()
-                        .unwrap_or_else(|| "inProgress".into()),
-                    failed: false,
-                });
-            if !activity.title.is_empty()
-                && !matches!(activity.title.as_str(), "command" | "file changes" | "tool")
-            {
-                tool.title.clone_from(&activity.title);
-            }
-            if let Some(status) = activity.status.as_ref() {
-                tool.status.clone_from(status);
-            }
-            if let Some(output) = activity.output.as_ref() {
-                if activity.output_delta {
-                    tool.output.push_str(output);
-                } else {
-                    tool.output.clone_from(output);
-                }
-            }
-            tool.failed = tool_failed(&tool.status, &tool.output);
-        }
+        active.tool.merge(activity);
         active.latest_tool_id = Some(activity.id.clone());
         self.revision += 1;
     }
@@ -199,7 +246,7 @@ impl TimelineReducer {
             text: active.text.clone(),
             synthetic: active.synthetic,
             tool_count: active.tool.len(),
-            failed_count: active.tool.values().filter(|tool| tool.failed).count(),
+            failed_count: active.tool.failed_count(),
             latest_tool: active
                 .latest_tool_id
                 .as_ref()
@@ -220,16 +267,16 @@ impl TimelineReducer {
 }
 
 fn complete(active: ActiveThought, now_ms: i64) -> CompletedThought {
+    let tool_list = active.tool.into_list();
+    let diff_text = ProviderDiffBuilder::build(&tool_list);
     CompletedThought {
         id: active.id,
         text: active.text,
         synthetic: active.synthetic,
-        tool: active.tool.into_values().collect(),
+        tool: tool_list,
         started_at_ms: active.started_at_ms,
         completed_at_ms: now_ms,
-        checkpoint_before: None,
-        checkpoint_after: None,
-        diff_text: None,
+        diff_text,
         task_id: None,
     }
 }
@@ -244,14 +291,14 @@ fn tool_kind(activity: &ToolActivity) -> String {
 fn tool_failed(status: &str, output: &str) -> bool {
     matches!(
         status.to_ascii_lowercase().as_str(),
-        "failed" | "error" | "denied" | "rejected" | "cancelled" | "canceled"
+        "failed" | "error" | "denied" | "declined" | "rejected" | "cancelled" | "canceled"
     ) || output.to_ascii_lowercase().contains(" rejected:")
 }
 
 #[cfg(test)]
 mod test {
     use super::TimelineReducer;
-    use crate::backend::{BackendEvent, ToolActivity, ToolActivityKind};
+    use crate::backend::{BackendEvent, ProviderChangeSet, ToolActivity, ToolActivityKind};
     use serde_json::Value;
 
     fn assistant(text: &str) -> BackendEvent {
@@ -276,6 +323,7 @@ mod test {
                 title: format!("command {id}"),
                 output: Some(format!("output {id}")),
                 status: Some(status.into()),
+                change: ProviderChangeSet::default(),
                 output_delta: false,
             }),
             summary: None,
@@ -351,6 +399,19 @@ mod test {
             thought.expect("completed thought").text,
             "Intermediate result"
         );
+        assert!(response.is_none());
+    }
+
+    #[test]
+    fn steering_boundary_completes_untooled_commentary() {
+        let mut reducer = TimelineReducer::new("interaction");
+        reducer.apply(&assistant("Researching."), 10);
+
+        let thought = reducer.complete_active(20).expect("completed thought");
+
+        assert_eq!(thought.text, "Researching.");
+        let (remaining, response) = reducer.finish_turn(30, false);
+        assert!(remaining.is_none());
         assert!(response.is_none());
     }
 }

@@ -892,10 +892,18 @@ directory owns ACP and Codex transports plus the shared active-turn steering lan
 traits stay beside the feature that consumes them.
 
 The broker runs once per Neovim process over JSONL stdio. Provider events cross a live
-channel into `TimelineReducer`, which owns one active thought and an ordered set of completed
-thoughts for the current user interaction. Assistant commentary establishes thought
+channel into `TimelineReducer`, which owns one active thought inside the current `MainSegment`.
+`InteractionRecord` persists an ordered `InteractionNode` list containing main segments,
+child-agent references, and acknowledged steering prompts. Assistant commentary establishes thought
 boundaries. Tool events that arrive first create a synthetic `Working` thought. Stable tool
 identities merge start, output, and completion events into one completed tool record.
+
+The Codex `CodexTurnCoordinator` treats one user request as a logical interaction that may outlive
+its first parent app-server turn. It retains the JSON-RPC process while descendant threads remain
+active, accepts steering as another parent turn on the same thread, and starts a bounded synthesis
+turn after the final child completes. Child lifecycle updates replace `AgentRun` state behind the
+existing `AgentReference`, so they never move the child row. `ActiveWait` drives only the current
+`Waiting on N subagents` row. Clearing that state removes the row without creating historical data.
 
 `turn.cancel` bypasses the broker's serialized request queue so Ctrl-c can interrupt an active
 provider turn instead of waiting behind it. The broker drops the prompt future, asks the backend
@@ -913,7 +921,11 @@ history while preserving the quick-regret workflow for a genuinely output-free t
 `turn.steer` uses the same out-of-band broker lane without creating another interaction. Ctrl-q
 clears HarnessInput only after admitting the text into a pending steering record, then the backend
 delivers it to the active provider turn and acknowledges the request. The Codex backend maps that
-operation to app-server `turn/steer` with the active thread and expected turn IDs. The shared
+operation to app-server `turn/steer` with the active thread and expected turn IDs. A provider
+acknowledgement closes the current thought boundary and appends a durable `SteeringPrompt` node to
+the owning interaction. The timeline renders that child with the same yellow prompt treatment and
+prompt-navigation index as ordinary user input. Failed or late steering creates no timeline child
+and moves its text into the follow-up queue. The shared
 steering lane activates before transport startup, so input submitted during connection or
 `turn/start` setup waits for that same turn. Codex releases the buffered input only after the
 matching `turn/started` notification because the earlier `turn/start` response allocates an ID
@@ -940,21 +952,27 @@ record while a thought remains mutable. The Harness tree shows `Running N tools`
 tool heading, and at most four output lines without exposing a fold whose contents could change
 while open. Each lifecycle event replaces that preview, so a newly started tool displaces the
 previous tool instead of accumulating mutable rows. When the next thought or turn boundary
-closes that thought, the broker waits for a short filesystem quiet interval, captures its
-checkpoint when needed, and publishes one immutable `CompletedThought`. The UI then changes
+closes that thought, the broker merges successful completed provider file-change items in their
+first-seen order and publishes one immutable `CompletedThought`. The UI then changes
 `Running` to `Ran` atomically and enables semantic expansion nodes for that thought, its tool
 list, each tool result, and its changes. The final assistant message becomes the Markdown response instead of another thought
 when it contains no tools.
 
-`NotifyWorkspaceWatch` starts before the interaction baseline and recursively observes the
-worktree. Its callback filters `.git` metadata paths and otherwise only advances a monotonic
-generation, so filesystem bursts never run Git or inspect file content on the event thread.
-Provider file-change signals advance the same counter.
-Thought closure checkpoints only when the generation changed, the watcher failed, or the
-quiet wait reached its bound. The final turn boundary always captures an authoritative
-checkpoint. Any residual diff becomes a synthetic completion thought and marks attribution
-incomplete, preventing a missed or late watcher event from hiding work. Watcher failure
-degrades to checkpointing every completed thought.
+Codex `fileChange` items carry path, operation kind, move destination, textual diff, and final
+status. The backend replaces provisional patch revisions by provider item ID, while the timeline
+retains first-seen tool order. Only completed successful file-change items contribute to a
+thought diff. Commands, formatters, generators, failed patches, and declined patches therefore
+remain visible as tools without being misattributed as authored edits. Backends that do not
+publish structured file changes omit the thought-level Changed node instead of inferring it from
+the filesystem or command output.
+
+Every Git interaction captures one baseline before its first provider turn and one terminal
+checkpoint when the interaction completes, fails, or cancels. Steering and automatic goal
+continuations reuse that baseline without intermediate Git scans. The terminal checkpoint uses
+`git ls-files --cached --others --exclude-standard`, so the aggregate interaction diff includes
+tracked files and nonignored untracked files while excluding ignored build output at any depth.
+This aggregate remains the rollback and cancellation-divergence authority. It intentionally
+includes command and formatter effects that do not belong to an individual thought.
 
 The Rust `TimelineProjector` combines interactions, plan lifecycle records, and accepted-plan
 executions into one ordered presentation. The Lua controller renders that projection instead of
@@ -966,11 +984,20 @@ overlapping native ranges, which cannot reliably represent wrapped thought and c
 `display_text.lua` wraps prompts and thoughts into real rows using rendered-cell width before row
 ownership, highlights, and folds are assigned. Continuation rows therefore preserve the tree's
 two-column indent without depending on window-local soft-wrap behavior.
-`transaction.lua` finds the smallest changed line interval and applies one buffer mutation while
-preserving semantic cursor identity, viewport position, expansion state, and settled prefix extmarks.
+`transaction.lua` compares stable node blocks, applies changed blocks from bottom to top, and
+preserves semantic cursor identity, viewport position, expansion state, and settled prefix extmarks.
+It validates semantic row indexes against the post-mutation buffer before restoring the cursor, so
+switching between timelines with different lengths cannot address a row from the previous projection.
+It rebuilds native folds only when fold topology changes, which prevents timer-driven streaming
+frames from repeatedly closing and reopening unchanged folds.
 Active thoughts never expose expansion keys. Completed nodes stay immutable, so an expanded
 command or diff never changes while the user reads it.
 Elapsed work appears only in the mutable `Thinking for Ns` header and never enters SQLite.
+
+Schema version 6 performs one explicit migration from categorical thought, steering, response, and
+agent records into ordered interaction nodes. Runtime code reads only the node model. The migration
+uses recorded timestamps and stable IDs to preserve the best available historical order without
+carrying compatibility branches into the renderer.
 
 GitStatus, PR review, the Harness tree, and `:Interactions` route file headers and hunk bodies
 through `diff_component.lua`. It owns the call into `diff_render.build_fancy_diff_rows` plus the
@@ -1130,6 +1157,43 @@ Non-Git WRITE requires an explicit confirmation and permanently displays `NO CHE
 for that session. Git checkpoints include tracked and nonignored untracked files, exclude
 ignored files, and never mutate the index or history during rollback.
 
+Harness subagents follow the same Rust-state and Lua-presentation split. `AgentRegistry` owns
+Codex definition discovery, repeated run instances, provider thread identity, lifecycle state,
+parent interaction identity, and durable child turns. Every user-submitted parent or child interaction owns one Git baseline
+and terminal snapshot, while automatic provider child work remains inside its parent interaction.
+Child turns reuse `InteractionRecord`, `TimelineReducer`, and the shared interaction-tree renderer.
+Definition discovery merges built-ins, `CODEX_HOME/agents`, and workspace `.codex/agents` with
+workspace definitions taking precedence. The home-directory `.codex/agents` path supplies the
+personal fallback when `CODEX_HOME` is unavailable.
+
+Codex collaboration tool status describes the parent tool call, not the child. The JSON-RPC
+normalizer therefore emits one lifecycle update per `agentsStates` entry and uses each child's
+reported status. Only spawn and concrete subagent-activity events may create runs. Wait, input, and
+close events update an already indexed provider thread and cannot manufacture `default` agents.
+Provider spawn events may precede the child thread identifier. `AgentRegistry` resolves that
+two-phase handshake through one unambiguous active run with the same parent interaction, parent
+thread, and turn. It refuses ambiguous sibling matches. Parent thread ownership becomes immutable
+after binding, so later wait events cannot reparent a child or create a cycle. The Codex backend
+also waits for the original parent thread and turn to complete. A child `turn/completed` closes only
+the child timeline and never terminates the parent request.
+Every broker session load deletes legacy unbound placeholders created by the earlier conflated model.
+
+`/agent` opens a centered selector with Main, Active, Done, and Available sections.
+`/agent <definition> <task>` asks the parent Codex thread to spawn the selected definition because
+app-server exposes child lifecycle events but no direct client spawn RPC. The parent instruction
+requests exactly one spawn with the selected definition and rejects default intermediary agents.
+The Codex launch strategy translates Harness definition names into native identifier form, such as
+`local-code-explorer` to `local_code_explorer`, while preserving the catalog name on the durable run.
+The main timeline nests each run under its spawning interaction, derives `Waiting on N subagents`
+only while the parent has no active thought, and replaces that state when parent work resumes.
+Child runtime, tool totals, failures, and completion remain visible in the collapsed node. Expanding
+the node reveals its immutable thought and response timeline. Provider-nested children follow
+`parent_thread_id`, preserving the actual hierarchy instead of flattening every run beside the parent.
+Selecting a child changes
+both the rendered timeline and composer target. Codex child prompts use the reported thread id,
+while steering and interruption target its active turn id. ACP advertises no agent capability and
+therefore hides the command rather than simulating children from transcript prose.
+
 ### Deferred Harness work
 
 - Add task-level diff annotations and feedback cycles now that stable task identity and shared
@@ -1179,13 +1243,13 @@ and fork capability gating through a deterministic JSONL process mock.
 
 The Rust suite runs with `cargo test --manifest-path
 nvim/rust/diff-review-harness/Cargo.toml`. It isolates plan revisions, goal guards,
-SQLite session filters and migration, leases, content-addressed interaction diffs,
-recursive watcher delivery, quiet-window fallback, divergence refusal, unborn Git
-worktrees, failed-provider goal pausing with final checkpoints, ACP plan normalization,
+SQLite session filters and migration, leases, ordered provider file-change attribution,
+Gitignored interaction boundaries, divergence refusal, unborn Git worktrees,
+failed-provider goal pausing with final checkpoints, ACP plan normalization,
 exact control tools, backend/session compatibility, output-free cancellation retraction,
 visible-output and workspace-change retraction guards, and worktree-only rollback. The ignored
 `tests/codex_cli.rs` integration uses the installed
-authenticated Codex CLI with `gpt-5.4-mini` at low effort in a temporary Git repository.
+authenticated Codex CLI with `gpt-5.6-terra` at low effort and fast mode in a temporary Git repository.
 Run it explicitly with `cargo test --manifest-path nvim/rust/diff-review-harness/Cargo.toml
 --test codex_cli -- --ignored --nocapture`. It verifies model discovery, plan steering, no writes
 before plan acceptance, execution, structured goal completion, resume, and native fork without

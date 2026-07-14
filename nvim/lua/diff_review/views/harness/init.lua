@@ -22,6 +22,15 @@ local function apply_snapshot(state, result)
   state.goal = result.goal
   state.active_plan = result.active_plan
   state.active_elicitation = result.active_elicitation
+  state.agent = vim.deepcopy(result.agent or { definition = {}, run = {}, turn = {} })
+  state.agent_live = {}
+  if state.selected_agent_run_id then
+    local selected_exists = false
+    for _, run in ipairs(state.agent.run or {}) do
+      if run.id == state.selected_agent_run_id then selected_exists = true end
+    end
+    if not selected_exists then state.selected_agent_run_id = nil end
+  end
   prompt_history.replace(result.prompt_history)
   controller.render(true)
   controller.resolve_runtime_model()

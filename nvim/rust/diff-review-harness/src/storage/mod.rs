@@ -1,3 +1,4 @@
+use crate::agent::{AgentRun, AgentTurnRecord};
 use crate::checkpoint::CheckpointRecord;
 use crate::goal::GoalRecord;
 use crate::interaction::{InteractionComment, InteractionRecord};
@@ -7,6 +8,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde_json::json;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -26,7 +28,7 @@ impl SqliteStore {
         fs::create_dir_all(&object_root).with_context(|| {
             format!("create Harness object directory {}", object_root.display())
         })?;
-        let connection = Connection::open(data_root.join("harness.sqlite3"))?;
+        let mut connection = Connection::open(data_root.join("harness.sqlite3"))?;
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
@@ -117,9 +119,28 @@ impl SqliteStore {
                 text TEXT NOT NULL,
                 created_at_ms INTEGER NOT NULL
             );
-            PRAGMA user_version=4;
+            CREATE TABLE IF NOT EXISTS agent_run_record (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES session_record(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS agent_turn_record (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                agent_run_id TEXT NOT NULL,
+                ordinal INTEGER NOT NULL,
+                payload TEXT NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES session_record(id) ON DELETE CASCADE,
+                FOREIGN KEY(agent_run_id) REFERENCES agent_run_record(id) ON DELETE CASCADE
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS agent_turn_run_ordinal
+                ON agent_turn_record(agent_run_id, ordinal);
             "#,
         )?;
+        if schema_version < 6 {
+            migrate_interaction_timeline_v6(&mut connection)?;
+        }
         Ok(Self {
             connection,
             object_root,
@@ -487,6 +508,51 @@ impl SqliteStore {
             .map_err(Into::into)
     }
 
+    /// Write one concrete child-agent run into its owning Harness session.
+    pub fn save_agent_run(&mut self, run: &AgentRun) -> Result<()> {
+        self.save_scoped_payload("agent_run_record", &run.id, &run.session_id, run)
+    }
+
+    /// Load child-agent runs in creation order for one Harness session.
+    pub fn list_agent_run(&self, session_id: &str) -> Result<Vec<AgentRun>> {
+        self.list_payload(
+            "SELECT payload FROM agent_run_record WHERE session_id=?1 ORDER BY rowid",
+            [session_id],
+        )
+    }
+
+    /// Delete one child-agent run and its cascading turn history.
+    pub fn delete_agent_run(&mut self, run_id: &str) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM agent_run_record WHERE id=?1", [run_id])?;
+        Ok(())
+    }
+
+    /// Write one child-agent turn while preserving its run-local ordinal.
+    pub fn save_agent_turn(&mut self, turn: &AgentTurnRecord) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO agent_turn_record(id, session_id, agent_run_id, ordinal, payload) \
+             VALUES(?1, ?2, ?3, ?4, ?5) ON CONFLICT(id) DO UPDATE SET \
+             ordinal=excluded.ordinal, payload=excluded.payload",
+            params![
+                turn.id,
+                turn.session_id,
+                turn.agent_run_id,
+                turn.ordinal as i64,
+                encode(turn)?
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Load child-agent turns in their run-local interaction order.
+    pub fn list_agent_turn(&self, run_id: &str) -> Result<Vec<AgentTurnRecord>> {
+        self.list_payload(
+            "SELECT payload FROM agent_turn_record WHERE agent_run_id=?1 ORDER BY ordinal",
+            [run_id],
+        )
+    }
+
     fn save_scoped_payload<T: Serialize>(
         &mut self,
         table: &str,
@@ -571,6 +637,217 @@ fn decode<T: DeserializeOwned>(value: &str) -> Result<T> {
     serde_json::from_str(value).context("decode Harness storage payload")
 }
 
+fn migrate_interaction_timeline_v6(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mut agent_by_interaction =
+        std::collections::HashMap::<String, Vec<serde_json::Value>>::new();
+    {
+        let mut statement = transaction.prepare("SELECT payload FROM agent_run_record")?;
+        let payload_list = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for payload in payload_list {
+            let run: serde_json::Value = serde_json::from_str(&payload)?;
+            if let Some(parent_id) = run
+                .get("parent_interaction_id")
+                .and_then(serde_json::Value::as_str)
+            {
+                agent_by_interaction
+                    .entry(parent_id.to_owned())
+                    .or_default()
+                    .push(run);
+            }
+        }
+    }
+    let interaction_payload_list = {
+        let mut statement = transaction.prepare("SELECT id, payload FROM interaction_record")?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (interaction_id, payload) in interaction_payload_list {
+        let value: serde_json::Value = serde_json::from_str(&payload)?;
+        let migrated = migrate_interaction_value(
+            value,
+            agent_by_interaction
+                .remove(&interaction_id)
+                .unwrap_or_default(),
+        )?;
+        transaction.execute(
+            "UPDATE interaction_record SET payload=?2 WHERE id=?1",
+            params![interaction_id, serde_json::to_string(&migrated)?],
+        )?;
+    }
+    let agent_turn_payload_list = {
+        let mut statement = transaction.prepare("SELECT id, payload FROM agent_turn_record")?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (turn_id, payload) in agent_turn_payload_list {
+        let mut value: serde_json::Value = serde_json::from_str(&payload)?;
+        if let Some(interaction) = value.get_mut("interaction") {
+            *interaction = migrate_interaction_value(std::mem::take(interaction), Vec::new())?;
+        }
+        transaction.execute(
+            "UPDATE agent_turn_record SET payload=?2 WHERE id=?1",
+            params![turn_id, serde_json::to_string(&value)?],
+        )?;
+    }
+    transaction.pragma_update(None, "user_version", 6)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_interaction_value(
+    mut value: serde_json::Value,
+    agent_list: Vec<serde_json::Value>,
+) -> Result<serde_json::Value> {
+    let object = value
+        .as_object_mut()
+        .context("legacy interaction payload is not an object")?;
+    if object.contains_key("node_list") {
+        return Ok(value);
+    }
+    let interaction_id = object
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("interaction")
+        .to_owned();
+    let completed_at_ms = object
+        .get("completed_at_ms")
+        .and_then(serde_json::Value::as_i64)
+        .or_else(|| {
+            object
+                .get("created_at_ms")
+                .and_then(serde_json::Value::as_i64)
+        })
+        .unwrap_or_default();
+    let thought_list = object
+        .remove("thought")
+        .and_then(|thought| thought.as_array().cloned())
+        .unwrap_or_default();
+    let steering_list = object
+        .remove("steering_input")
+        .and_then(|steering| steering.as_array().cloned())
+        .unwrap_or_default();
+    let response = object
+        .remove("response")
+        .filter(|response| !response.is_null());
+    let mut event_list = Vec::<(i64, u8, String, serde_json::Value)>::new();
+    for (index, thought) in thought_list.into_iter().enumerate() {
+        let started_at_ms = thought
+            .get("started_at_ms")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(completed_at_ms);
+        let thought_completed_at_ms = thought
+            .get("completed_at_ms")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(started_at_ms);
+        let id = format!("{interaction_id}:legacy-segment:{}", index + 1);
+        event_list.push((
+            started_at_ms,
+            0,
+            id.clone(),
+            json!({
+                "kind": "main_segment",
+                "segment": {
+                    "id": id,
+                    "state": "complete",
+                    "started_at_ms": started_at_ms,
+                    "completed_at_ms": thought_completed_at_ms,
+                    "duration_ms": thought_completed_at_ms.saturating_sub(started_at_ms) as u64,
+                    "token_count": null,
+                    "spawned_agent_count": 0,
+                    "thought": [thought],
+                    "active": null,
+                    "response": null
+                }
+            }),
+        ));
+    }
+    for steering in steering_list {
+        let created_at_ms = steering
+            .get("created_at_ms")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(completed_at_ms);
+        let id = steering
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("legacy-steering")
+            .to_owned();
+        let text = steering
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        event_list.push((
+            created_at_ms,
+            1,
+            id.clone(),
+            json!({
+                "kind": "steering_prompt",
+                "prompt": { "id": id, "text": text, "created_at_ms": created_at_ms }
+            }),
+        ));
+    }
+    for agent in agent_list {
+        let created_at_ms = agent
+            .get("created_at_ms")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(completed_at_ms);
+        let run_id = agent
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("legacy-agent")
+            .to_owned();
+        let id = format!("{interaction_id}:agent:{run_id}");
+        event_list.push((
+            created_at_ms,
+            2,
+            id.clone(),
+            json!({
+                "kind": "agent_reference",
+                "agent": { "id": id, "agent_run_id": run_id, "created_at_ms": created_at_ms }
+            }),
+        ));
+    }
+    if let Some(response) = response {
+        let id = format!("{interaction_id}:legacy-response");
+        event_list.push((
+            completed_at_ms,
+            3,
+            id.clone(),
+            json!({
+                "kind": "main_segment",
+                "segment": {
+                    "id": id,
+                    "state": "complete",
+                    "started_at_ms": completed_at_ms,
+                    "completed_at_ms": completed_at_ms,
+                    "duration_ms": 0,
+                    "token_count": null,
+                    "spawned_agent_count": 0,
+                    "thought": [],
+                    "active": null,
+                    "response": response
+                }
+            }),
+        ));
+    }
+    event_list.sort_by(|left, right| {
+        (left.0, left.1, left.2.as_str()).cmp(&(right.0, right.1, right.2.as_str()))
+    });
+    object.insert(
+        "node_list".into(),
+        serde_json::Value::Array(event_list.into_iter().map(|event| event.3).collect()),
+    );
+    Ok(value)
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -630,6 +907,69 @@ mod test {
 
         let reopened = SqliteStore::open(temporary.path()).unwrap();
         assert_eq!(reopened.list_prompt_history().unwrap(), history);
+    }
+
+    #[test]
+    fn persists_repeated_agent_runs_and_run_local_turns() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut store = SqliteStore::open(temporary.path()).unwrap();
+        store.save_session(&session("session", "D:/work")).unwrap();
+        let first = AgentRun::pending("session", "explorer", "inspect Bevy", 1);
+        let second = AgentRun::pending("session", "explorer", "inspect physics", 2);
+        store.save_agent_run(&first).unwrap();
+        store.save_agent_run(&second).unwrap();
+        let interaction = InteractionRecord {
+            id: "interaction".into(),
+            session_id: "session".into(),
+            ordinal: 1,
+            prompt: "report".into(),
+            kind: crate::interaction::InteractionKind::Chat,
+            state: crate::interaction::InteractionState::Complete,
+            plan_id: None,
+            execution_id: None,
+            checkpoint_before: None,
+            checkpoint_after: None,
+            diff_text: None,
+            created_at_ms: 3,
+            completed_at_ms: Some(4),
+            node_list: vec![crate::interaction::InteractionNode::MainSegment {
+                segment: crate::interaction::MainSegment {
+                    id: "interaction:segment:1".into(),
+                    state: crate::interaction::SegmentState::Complete,
+                    started_at_ms: 3,
+                    completed_at_ms: Some(4),
+                    duration_ms: 1,
+                    token_count: None,
+                    spawned_agent_count: 0,
+                    thought: Vec::new(),
+                    active: None,
+                    response: Some("done".into()),
+                },
+            }],
+            awaiting_input: false,
+            elicitation: None,
+            duration_ms: 1,
+            token_count: None,
+            comment: Vec::new(),
+            task: None,
+        };
+        store
+            .save_agent_turn(&AgentTurnRecord {
+                id: "turn".into(),
+                session_id: "session".into(),
+                agent_run_id: first.id.clone(),
+                ordinal: 1,
+                interaction,
+            })
+            .unwrap();
+
+        assert_eq!(store.list_agent_run("session").unwrap().len(), 2);
+        assert_eq!(store.list_agent_turn(&first.id).unwrap().len(), 1);
+        assert!(store.list_agent_turn(&second.id).unwrap().is_empty());
+
+        store.delete_agent_run(&first.id).unwrap();
+        assert_eq!(store.list_agent_run("session").unwrap().len(), 1);
+        assert!(store.list_agent_turn(&first.id).unwrap().is_empty());
     }
 
     #[test]
@@ -753,6 +1093,46 @@ mod test {
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(schema_version, 4);
+        assert_eq!(schema_version, 6);
+    }
+
+    #[test]
+    fn version_six_migration_orders_legacy_interaction_events_once() {
+        let legacy = json!({
+            "id": "interaction-one",
+            "created_at_ms": 1,
+            "completed_at_ms": 40,
+            "thought": [{
+                "id": "thought-one",
+                "started_at_ms": 10,
+                "completed_at_ms": 15,
+                "text": "Investigating",
+                "tool": [],
+                "change": null
+            }],
+            "steering_input": [{
+                "id": "steering-one",
+                "text": "Also inspect tests",
+                "created_at_ms": 30
+            }],
+            "response": "Finished"
+        });
+        let migrated = migrate_interaction_value(
+            legacy,
+            vec![json!({ "id": "agent-one", "created_at_ms": 20 })],
+        )
+        .unwrap();
+        let node_list = migrated["node_list"].as_array().unwrap();
+        assert_eq!(node_list.len(), 4);
+        assert_eq!(node_list[0]["kind"], "main_segment");
+        assert_eq!(node_list[1]["kind"], "agent_reference");
+        assert_eq!(node_list[2]["kind"], "steering_prompt");
+        assert_eq!(node_list[3]["segment"]["response"], "Finished");
+        assert!(migrated.get("thought").is_none());
+        assert!(migrated.get("steering_input").is_none());
+        assert!(migrated.get("response").is_none());
+
+        let remigrated = migrate_interaction_value(migrated.clone(), Vec::new()).unwrap();
+        assert_eq!(remigrated, migrated);
     }
 }

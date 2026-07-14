@@ -1,5 +1,5 @@
 use crate::backend::json_rpc::JsonRpcProcess;
-use crate::backend::steering::{ActiveSteering, SteerCommand, SteeringLane};
+use crate::backend::steering::SteeringLane;
 use crate::backend::{
     Backend, BackendCapability, BackendEventSink, BackendModel, BackendOutput, BackendRequest,
     PromptMode,
@@ -8,8 +8,9 @@ use crate::session::WriteMode;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use std::collections::HashMap;
 use tokio::sync::Mutex;
+
+mod turn_coordinator;
 
 /// Owns Codex app-server thread lifecycle, prompting, permission policy, and native fork.
 pub struct CodexBackend {
@@ -164,65 +165,21 @@ impl CodexBackend {
         Ok(model)
     }
 
-    async fn run_active_turn(
-        process: &mut JsonRpcProcess,
-        output: &mut BackendOutput,
-        steering: &mut ActiveSteering,
-        thread_id: &str,
-        turn_id: &str,
-        mut provider_turn_started: bool,
-    ) -> Result<Value> {
-        let mut pending_command = HashMap::<u64, SteerCommand>::new();
-        loop {
-            tokio::select! {
-                Some(command) = steering.receive(), if provider_turn_started => {
-                    let request_id = process
-                        .send_request(
-                            "turn/steer",
-                            json!({
-                                "threadId": thread_id,
-                                "input": [{ "type": "text", "text": command.text.clone() }],
-                                "expectedTurnId": turn_id,
-                            }),
-                        )
-                        .await;
-                    match request_id {
-                        Ok(request_id) => {
-                            pending_command.insert(request_id, command);
-                        }
-                        Err(error) => command.complete(Err(error)),
-                    }
-                }
-                message = process.read_message(output) => {
-                    let message = message?;
-                    if Self::notification_turn_id(&message, "turn/started") == Some(turn_id) {
-                        provider_turn_started = true;
-                    }
-                    if let Some(request_id) = message.get("id").and_then(Value::as_u64)
-                        && let Some(command) = pending_command.remove(&request_id)
-                    {
-                        let result = JsonRpcProcess::request_result(
-                            &message,
-                            request_id,
-                            "turn/steer",
-                        )
-                        .context("Codex steering response omitted its request result")?
-                        .map(drop);
-                        command.complete(result);
-                    }
-                    if message.get("method").and_then(Value::as_str) == Some("turn/completed") {
-                        drop(pending_command);
-                        return Ok(message.get("params").cloned().unwrap_or(Value::Null));
-                    }
-                }
-            }
-        }
-    }
-
     fn notification_turn_id<'a>(message: &'a Value, method: &str) -> Option<&'a str> {
         (message.get("method").and_then(Value::as_str) == Some(method))
             .then(|| message.pointer("/params/turn/id").and_then(Value::as_str))
             .flatten()
+    }
+
+    fn notification_matches_turn(
+        message: &Value,
+        method: &str,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> bool {
+        message.get("method").and_then(Value::as_str) == Some(method)
+            && message.pointer("/params/threadId").and_then(Value::as_str) == Some(thread_id)
+            && Self::notification_turn_id(message, method) == Some(turn_id)
     }
 
     async fn start_turn(
@@ -232,13 +189,14 @@ impl CodexBackend {
         request: &BackendRequest,
         thread_id: &str,
         params: Value,
-    ) -> Result<(Value, bool)> {
+    ) -> Result<(Value, bool, Vec<Value>)> {
         let request_id = process.send_request("turn/start", params).await?;
         *self.active_turn.lock().await = CodexTurnState::Submitted {
             request: request.clone(),
             thread_id: thread_id.to_owned(),
         };
         let mut started_turn_id = None;
+        let mut observed_message_list = Vec::new();
         loop {
             let message = process.read_message(output).await?;
             if let Some(turn_id) = Self::notification_turn_id(&message, "turn/started") {
@@ -255,8 +213,10 @@ impl CodexBackend {
                     .and_then(Value::as_str)
                     .context("Codex turn/start response omitted turn id")?;
                 let provider_turn_started = started_turn_id.as_deref() == Some(turn_id);
-                return Ok((turn, provider_turn_started));
+                observed_message_list.push(message);
+                return Ok((turn, provider_turn_started, observed_message_list));
             }
+            observed_message_list.push(message);
         }
     }
 }
@@ -269,7 +229,7 @@ impl Backend for CodexBackend {
         event_sink: Option<BackendEventSink>,
     ) -> Result<BackendOutput> {
         *self.active_turn.lock().await = CodexTurnState::Pending;
-        let mut active_steering = self.steering.activate()?;
+        let mut active_steering = self.steering.activate(event_sink.clone())?;
         let mut output = BackendOutput {
             capability: BackendCapability {
                 native_fork: true,
@@ -280,9 +240,11 @@ impl Backend for CodexBackend {
                 model_selection: true,
                 effort_selection: true,
                 permission_control: true,
+                agent: crate::agent::AgentCapability::codex(),
             },
             ..BackendOutput::default()
         };
+        let coordinator_event_sink = event_sink.clone();
         let mut process = self.connect(&request, &mut output, event_sink).await?;
         let resolved_model = self
             .resolve_model(&request, &mut process, &mut output)
@@ -362,7 +324,7 @@ impl Backend for CodexBackend {
                 )
                 .await?;
         }
-        let (turn, provider_turn_started) = self.start_turn(&mut process, &mut output, &request, &thread_id, Self::with_model(json!({
+        let (turn, provider_turn_started, observed_message_list) = self.start_turn(&mut process, &mut output, &request, &thread_id, Self::with_model(json!({
             "threadId": thread_id,
             "input": [{ "type": "text", "text": prompt }],
             "cwd": request.workspace,
@@ -379,13 +341,19 @@ impl Backend for CodexBackend {
             .or_else(|| turn.get("turn_id"))
             .and_then(Value::as_str)
             .context("Codex turn/start response omitted turn id")?;
-        let completed = Self::run_active_turn(
+        let completed = turn_coordinator::CodexTurnCoordinator::new(
+            self,
             &mut process,
             &mut output,
             &mut active_steering,
+            coordinator_event_sink,
+            &request,
             &thread_id,
-            turn_id,
+        )
+        .run(
+            turn_id.to_owned(),
             provider_turn_started,
+            observed_message_list,
         )
         .await?;
         *self.active_turn.lock().await = CodexTurnState::Completed;
@@ -427,6 +395,14 @@ impl Backend for CodexBackend {
         self.steering.steer(text).await
     }
 
+    async fn steer_target(&self, text: String, target: crate::backend::SteerTarget) -> Result<()> {
+        self.steering.steer_target(text, target).await
+    }
+
+    async fn interrupt_target(&self, target: crate::backend::SteerTarget) -> Result<()> {
+        self.steering.interrupt_target(target).await
+    }
+
     async fn compact(&self, request: BackendRequest) -> Result<BackendOutput> {
         let thread_id = request
             .backend_session_id
@@ -443,6 +419,7 @@ impl Backend for CodexBackend {
                 model_selection: true,
                 effort_selection: true,
                 permission_control: true,
+                agent: crate::agent::AgentCapability::codex(),
             },
             ..BackendOutput::default()
         };
@@ -585,6 +562,37 @@ mod test {
             CodexBackend::notification_turn_id(&started, "turn/completed"),
             None
         );
+    }
+
+    #[test]
+    fn ignores_a_child_completion_while_waiting_for_the_parent_turn() {
+        let child = json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "child-thread",
+                "turn": { "id": "child-turn", "status": "completed" }
+            }
+        });
+        let parent = json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "parent-thread",
+                "turn": { "id": "parent-turn", "status": "completed" }
+            }
+        });
+
+        assert!(!CodexBackend::notification_matches_turn(
+            &child,
+            "turn/completed",
+            "parent-thread",
+            "parent-turn"
+        ));
+        assert!(CodexBackend::notification_matches_turn(
+            &parent,
+            "turn/completed",
+            "parent-thread",
+            "parent-turn"
+        ));
     }
 
     #[tokio::test]

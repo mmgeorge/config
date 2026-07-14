@@ -1,3 +1,4 @@
+use crate::agent::AgentRun;
 use crate::interaction::InteractionRecord;
 use crate::plan::{
     PlanExecutionRecord, PlanFileStore, PlanLifecycleKind, PlanLifecycleRecord, PlanRecord,
@@ -29,6 +30,11 @@ pub enum TimelineEntry {
         execution: PlanExecutionRecord,
         interaction: Vec<InteractionRecord>,
     },
+    AgentLifecycle {
+        id: String,
+        created_at_ms: i64,
+        run: AgentRun,
+    },
 }
 
 impl TimelineEntry {
@@ -36,7 +42,8 @@ impl TimelineEntry {
         match self {
             Self::Interaction { created_at_ms, .. }
             | Self::PlanLifecycle { created_at_ms, .. }
-            | Self::PlanExecution { created_at_ms, .. } => *created_at_ms,
+            | Self::PlanExecution { created_at_ms, .. }
+            | Self::AgentLifecycle { created_at_ms, .. } => *created_at_ms,
         }
     }
 }
@@ -51,6 +58,7 @@ impl TimelineProjector {
         plan_list: &[PlanRecord],
         lifecycle_list: Vec<PlanLifecycleRecord>,
         execution_list: Vec<PlanExecutionRecord>,
+        agent_run_list: Vec<AgentRun>,
         plan_file: &PlanFileStore,
     ) -> Result<Vec<TimelineEntry>> {
         let plan_by_id = plan_list
@@ -116,6 +124,13 @@ impl TimelineProjector {
                     .remove(&execution.id)
                     .unwrap_or_default(),
                 execution,
+            });
+        }
+        for run in agent_run_list {
+            result.push(TimelineEntry::AgentLifecycle {
+                id: run.id.clone(),
+                created_at_ms: run.created_at_ms,
+                run,
             });
         }
         result.sort_by_key(TimelineEntry::created_at_ms);

@@ -43,8 +43,7 @@ The critical piece to remember is residual heat isn't the driver here; it's pure
 - Banned Phrasing: Never use patronizing, defensive, or softening transitions, including "in plain English," "honestly," "to be fair," or "frankly." The output must inherently be simple, direct, and honest from the first word.
 
 # Formatting Execution
-- Divide your response into distinct sections with clear Markdown headings.
-- Every heading must be immediately followed by a 1–3 sentence introductory paragraph before any math blocks, code blocks, or bulleted lists are introduced.
+- Use Markdown headings such as `##` when they improve navigation or separate distinct concerns.
 - Actively use standard Markdown bolding (**text**) on central industry terms (e.g., specific algorithms, core phenomena) within prose to ensure instant visual scannability.
 - Use proper markdown Latex formatting for math.
 
@@ -123,24 +122,24 @@ Shell commands and test running are part of the development loop, so they need t
 # Planning Walkthrough Model
 Use this section when asked to create, draft, write, review, or update an implementation plan, execution plan, refactor plan, test plan, or reviewer-readable code-flow walkthrough before making changes.
 
-Plans follow the walkthrough artifact model. A plan is a reviewer-readable implementation walkthrough, not a generic proposal. Start with the review overview, then usage, then a compact code-flow diagram, then a numbered task tree. The overview, usage, code-flow diagram, and task tree must describe the same data-flow narrative from producer or entry point, through stores and transforms, into consumers. Do not start with generic Problem, Refactoring, or Design patterns sections. Do not organize a plan as a file inventory unless the real review path is file-based.
+Plans follow the walkthrough artifact model. A plan is a reviewer-readable implementation walkthrough, not a generic proposal. Frame the plan around the domain object model and its ownership relationships, then use 1-3 separate code-flow diagrams to explain the major runtime or data flows that cross those boundaries. Do not force unrelated behavior into one linear flow. Connect every flow back to the objects and owners in the model. Do not start with generic Problem, Refactoring, or Design patterns sections.
 
 When creating a plan, use this template. Output each section in order:
 
-1. **Overview** - 2-3 sentence before/now story with precise, accessible prose. Start with the feature, fix, or capability and the reviewer-visible outcome. Then explain the old limitation and the new role-level architecture. Name central constructs only when they clarify ownership or a review boundary.
+1. **Overview** - 2-3 sentence context-and-outcome story with precise, accessible prose. Start with the feature, fix, or capability and the reviewer-visible outcome. Then explain the relevant limitation, unmet capability, or architectural motivation and the resulting role-level architecture. Use a before/now contrast only when the plan changes existing behavior. Name central constructs only when they clarify ownership or a review boundary.
 2. **Usage** - Include this section immediately after Overview. When the plan adds or changes caller-facing behavior, such as a command, API, function, UI action, config, or text-producing workflow, show one concrete call or interaction and the expected result. For CLI tasks, include the full command and expected stdout, exit status, or artifact. Use fenced code for text-based inputs and outputs. For visual, audio, hardware, or other non-text results, write a compact text placeholder such as `<visual result: rendered preview updates with the selected theme>`. If no caller-facing usage applies, write `<Omitted>` as the only body text and keep the following section numbers unchanged.
-3. **Code flow diagram** - Compact ASCII diagram that follows the same path as the tasks. Start at the relevant producer, entry point, state owner, request, event, buffer, record, or artifact. Continue through stores or transforms and end at the consumers. Include input/output types or state names when they clarify the flow. Mark modified/new nodes with `*` and removed nodes with `~`. Keep file paths out of the diagram.
-4. **Tasks** - Numbered walkthrough tree. Each task is an active architectural review claim, not a file bucket. Use the shape `<Active verb> <domain object> <with|through|in|across> <architectural role>.` Add one justification sentence after the title using the shape `<same subject> now <new behavior>, so <old limitation or review concern> is resolved.` Connect this explicitly to the problem it solves or why it matters.
-   - `Task` is a numbered architectural claim that advances the code-flow narrative.
-   - `Group` is an owning boundary and starts with one of these colorizable type terms: `module`, `file`, `package`, or `directory`.
+3. **Diagrams** - Start with 1-2 sentences that summarize the ownership change and briefly describe the role of every object reference shown, followed by a compact two-column, unboxed UML-style diagram of the changed domain objects, state owners, services, configs, and consumers. Label the columns `Objects` and `Relationships`. Under `Objects`, list each relevant object with only the fields and methods needed to understand the change. Put the object's repository-relative file path on the next indented line in square brackets, before its members. Repeat a shared path under every object it defines so each declaration remains independently traceable. Indent public operations with `+` and internal fields with `-`. Under `Relationships`, place each outgoing relationship beside its source object's declaration. Separate the columns with spaces only. Do not draw boxes, vertical dividers, or horizontal rules. Label ownership, reads, writes, calls, and other dependencies on horizontal arrows. Use stereotypes such as `<<Resource>>` when an architectural role matters. Use `◆` and cardinality such as `0..*` when lifecycle ownership matters. Then include 1-3 labeled compact code-flow diagrams for the major runtime, data, request, event, persistence, recovery, or configuration flows affected by the plan. Precede each code-flow diagram with 1-2 sentences that explain the flow and why it matters. Lay each flow out horizontally from its actual entry point to its observable consumer or effect. Put the action or state on the first line of each node and its repository-relative file path or logical subsystem on the second line in square brackets. Keep each action and location visually paired on adjacent lines, but do not require fixed-width columns or cross-flow alignment. Use natural title-case flow labels such as `Capture`, `Sync`, and `Recovery`, never all caps. Label arrows with the value, event, or result crossing each boundary. Keep every diagram line at 100 characters or fewer. Shorten labels or split a long flow at a meaningful boundary rather than exceeding the limit. Reuse object names from the UML diagram so reviewers can connect execution to ownership. Do not merge independent flows merely to produce one end-to-end diagram. Mark modified/new nodes with `*` and removed nodes with `~`.
+4. **Tasks** - Numbered walkthrough tree organized by domain object and ownership responsibility. Each task is an active architectural review claim, not a file bucket or a forced stage in one code flow. Prefer the title shape `<Active verb> <domain object> <with|through|in|across> <architectural role>.`, but vary it when another concise active construction states the ownership change more precisely. Follow the title with 1-2 sentences that add new information about the architectural effect, motivation, constraint, or reviewer-visible consequence. Do not merely paraphrase the title. Use `now` only when contrasting changed existing behavior. For additions, state what the new construct owns, enables, or connects without inventing a previous behavior.
+   - `Task` is a numbered architectural claim that advances the object model or clarifies an ownership boundary.
+   - `Group` is a concrete source-file boundary. Start every group with `file` followed by the required repository-relative file path, such as `file src/draft_sync.rs`. Do not use `module`, `package`, `directory`, or a friendly file label in place of a path.
    - `Subtask` is a local design move under a group. Start with one of these verbs: `Expose`, `Encapsulate`, `Move`, `Centralize`, `Distribute`, `Extract`, `Inline`, `Split`, `Merge`, `Compose`, `Embed`, `Create`, `Destroy`, `Register`, `Unregister`, `Attach`, `Detach`, `Start`, `Stop`, `Route`, `Resolve`, `Defer`, `Configure`, `Relax`, `Enable`, `Disable`, `Reuse`, `Generalize`, or `Specialize`.
    - `Change` is a concrete construct edit. Start with one of these actions: `Add`, `Modify`, or `Remove`.
    - After the action, include a standalone colorizable type/kind term before the target. Use one of these kind terms when possible: `class`, `struct`, `enum`, `trait`, `interface`, `test`, `app`, `config`, `fn`, `method`, `constant`, or `field`. Use a code-proven role term such as `Resource`, `Cache`, or `Adapter` only when that role is clearer than the broad kind.
-   - Keep the group type term and change kind/role term separate from the target so renderers can colorize words like `module`, `file`, `struct`, `fn`, `config`, and `Resource`.
+   - Keep the `file` group term and change kind/role term separate from the target so renderers can colorize words like `file`, `struct`, `fn`, `config`, and `Resource`.
    - Include every function, type, config, app, test, or field that will be added, modified, or deleted.
-   - Keep tasks in the same order as the code-flow diagram. Do not switch to unrelated file, layer, artifact-type, or implementation buckets.
-5. **Modularity, testability, and plan validation** - Are ownership claims correct? Are boundaries clean, interfaces narrow, internals hidden, and behavior testable in isolation? If the plan touches many unrelated files, revise the task/group boundaries before presenting it. Check that the overview, usage, code-flow diagram, tasks, and tests agree. Every changed construct appears under a task. Task titles are architectural claims. Groups are owning boundaries. Subtasks are local design moves. Changes are concrete edits. Ownership claims are explicit. No section collapses request failures, validation, or user-visible behavior into vague `handle`, `support`, `make`, or `update` wording.
-6. **Test plan** - Specific tests tied to the walkthrough flow:
+   - Order tasks by the object model and ownership relationships. Within each task, order concrete changes in the sequence that makes the ownership change easiest to review. Do not contort the task tree to mirror one code-flow diagram.
+5. **Modularity, testability, and plan validation** - Are ownership claims correct? Are boundaries clean, interfaces narrow, internals hidden, and behavior testable in isolation? If the plan touches many unrelated files, revise the object ownership or task boundaries before presenting it. Check that the overview, usage, two-column unboxed UML diagram, 1-3 code-flow diagrams, tasks, and tests agree. Every changed construct appears under a task. Every group names a repository-relative file path. Each selected major flow has a separate diagram. Every diagram has a 1-2 sentence description, and the UML description covers every displayed object reference. The UML diagram places each object's repository-relative path before its relevant members under `Objects`, places outgoing references under `Relationships`, and uses no boxes or divider lines. Code-flow actions sit above their locations and use natural title-case labels without requiring fixed-width alignment. No diagram line exceeds 100 characters. Task titles are architectural claims, and their rationale adds information instead of restating the claim. Groups are concrete file boundaries. Subtasks are local design moves. Changes are concrete edits. Ownership claims are explicit. No section collapses request failures, validation, or user-visible behavior into vague `handle`, `support`, `make`, or `update` wording.
+6. **Test plan** - Specific tests tied to the ownership boundaries and relevant code flows:
    - **Unit tests**: What to test, what to mock, what behavior each validates.
    - **Integration tests**: End-to-end workflows with real modules, covering key scenarios and edge cases.
 
@@ -174,36 +173,95 @@ Expected result:
 drained 1 pending draft for doc-42
 ```
 
-# Code flow
-DocumentEditor::apply_edit()
-└─ *DraftChange
-└─ *DraftCache
-├─ editor recovery
-└─ *SyncWorker::drain_cache() -> SaveRequest
-└─ retry save request
+# Diagrams
+
+The diagrams establish the changed ownership model first, then separate the three lifecycle flows that use it.
+
+## Object model and ownership
+
+`DraftCache` owns durable `DraftChange` records independently from editor buffers. `DocumentEditor` writes those records, `SyncWorker` drains them after persistence, and `EditorRecovery` reads them when rebuilding a session.
+
+```text
+Objects                                   Relationships
+
+*DocumentEditor                           DocumentEditor ──writes──▶ DraftCache
+  [src/editor/session.rs]
+  + apply_edit(document_id, edit)
+
+*DraftCache <<Resource>>                  DraftCache ◆──owns 0..*──▶ DraftChange
+  [src/draft_sync.rs]
+  + store(change)
+  + pending(): DraftChange[]
+  + mark_saved(draft_id)
+
+*DraftChange
+  [src/draft_sync.rs]
+  - document_id: DocumentId
+  - status: DraftStatus
+
+SyncWorker                                SyncWorker ──drains──▶ DraftCache
+  [src/sync/worker.rs]
+  + drain_cache()
+
+EditorRecovery                            EditorRecovery ──reads──▶ DraftCache
+  [src/editor/recovery.rs]
+  + restore_session()
+```
+
+## Code flow: edit capture
+
+The editor persists each change before the active buffer can close.
+
+```text
+Capture   *apply_edit                       *store             *Pending
+          [editor/session.rs] ─DraftChange▶ [draft_sync.rs] ─▶ [DraftCache]
+```
+
+## Code flow: background save retry
+
+The sync worker turns cached drafts into save requests and clears only successful records.
+
+```text
+Sync      *drain_cache        *pending                      save                    *mark_saved
+          [sync/worker.rs] ─▶ [draft_sync.rs] ─SaveRequest▶ [persistence] ─success▶ [draft_sync.rs]
+```
+
+## Code flow: session recovery
+
+The recovery path rebuilds editor state from drafts that remain pending.
+
+```text
+Recovery  *restore                *pending                      buffer
+          [editor/recovery.rs] ─▶ [draft_sync.rs] ─DraftChange▶ [editor session]
+```
 
 # Tasks
-1. Write editor changes through durable draft state. Editor changes now become cached draft records before save, so closing the buffer no longer drops unsynced work.
-module editor session
-└─ Route draft changes out of the active buffer.
+
+1. Own pending editor changes through durable draft state. DraftCache gives pending records a lifetime independent from editor buffers. Closing a buffer therefore preserves unsynced work.
+file src/draft_sync.rs
+└─ Create the durable owner for draft records and their lifecycle.
 ├─ Add struct DraftChange to describe pending editor edits
+├─ Add Resource DraftCache to store pending draft records
+└─ Add fn DraftCache::mark_saved to clear records after persistence
+2. Route editor mutation through the draft owner. DocumentEditor now persists each edit before buffer lifetime can end, making DraftCache the durable boundary.
+file src/editor/session.rs
+└─ Route draft changes out of the active buffer.
 └─ Modify fn DocumentEditor::apply_edit to write changes to DraftCache
-module draft sync
-└─ Create the cache that carries drafts to retry.
-└─ Add Resource DraftCache to store pending draft records
-2. Drain cached drafts through background sync. The sync worker now reads cached draft records, so failed saves can retry without reopening the editor.
-module draft sync
+3. Consume pending drafts through sync and recovery boundaries. A shared cache contract gives retries and reopened sessions one durable source of truth.
+file src/sync/worker.rs
 └─ Resolve cached drafts into save attempts.
-├─ Modify fn SyncWorker::drain_cache to build retry save requests
-└─ Add fn DraftCache::mark_saved to clear durable records after persistence
-file editor recovery
+└─ Modify fn SyncWorker::drain_cache to build retry save requests
+file src/editor/recovery.rs
 └─ Reuse cached drafts for reopened sessions.
 └─ Modify fn restore_editor_session to load pending DraftChange records
 
 # Modularity, testability, and plan validation
 
-DraftCache owns durable draft state behind a narrow editor/sync boundary. The editor, sync worker, recovery path, and tests all follow the same draft record flow.
+DraftCache owns durable draft state behind a narrow interface. The editor, sync worker, and recovery path depend on that owner without pretending their distinct lifecycle flows form one linear pipeline.
 
 # Test plan
+
+Tests verify the draft owner in isolation and each lifecycle flow across real boundaries.
+
 * **Unit tests**: DraftCache stores pending DraftChange records, SyncWorker::drain_cache turns cached drafts into SaveRequest values, and DraftCache::mark_saved clears saved records.
 * **Integration tests**: Apply an edit, close and reopen the editor, then verify the session restores the cached draft and the background sync drains it into a retry save request.

@@ -14,6 +14,7 @@ local session = require("diff_review.session")
 local interaction_state = require("diff_review.views.harness.interaction_state")
 local prompt_history = require("diff_review.views.harness.prompt_history")
 local context_status = require("diff_review.views.harness.context_status")
+local main_timeline = require("diff_review.views.harness.timeline")
 
 local namespace = vim.api.nvim_create_namespace("DiffReviewHarnessTranscript")
 local queue_namespace = vim.api.nvim_create_namespace("DiffReviewHarnessQueue")
@@ -35,6 +36,40 @@ local begin_request
 
 ---@return table
 local function harness_state() return session.harness end
+
+local function selected_agent_run(state)
+  if not state.selected_agent_run_id then return nil end
+  for _, run in ipairs((state.agent and state.agent.run) or {}) do
+    if run.id == state.selected_agent_run_id then return run end
+  end
+  return nil
+end
+
+local function selected_agent_timeline(state)
+  if not state.selected_agent_run_id then return nil end
+  local timeline = {}
+  for _, turn in ipairs((state.agent and state.agent.turn) or {}) do
+    if turn.agent_run_id == state.selected_agent_run_id then
+      timeline[#timeline + 1] = { kind = "interaction", interaction = turn.interaction }
+    end
+  end
+  local live = (state.agent_live or {})[state.selected_agent_run_id]
+  if live and live.interaction then
+    local interaction = vim.deepcopy(live.interaction)
+    interaction.active = vim.deepcopy(live.active)
+    timeline[#timeline + 1] = { kind = "interaction", interaction = interaction }
+  end
+  return timeline
+end
+
+local function discard_terminal_agent_live_state(state)
+  state.agent_live = state.agent_live or {}
+  for _, run in ipairs((state.agent and state.agent.run) or {}) do
+    if run.status == "completed" or run.status == "failed" or run.status == "interrupted" or run.status == "closed" then
+      state.agent_live[run.id] = nil
+    end
+  end
+end
 
 local function render_queue()
   local state = harness_state()
@@ -132,6 +167,11 @@ local function status_text()
       group = "DiffReviewStatusLabel",
     },
   }
+  local selected_run = selected_agent_run(state)
+  segment_list[#segment_list + 1] = {
+    text = selected_run and (" • " .. (selected_run.nickname or selected_run.definition)) or " • Main",
+    group = "DiffReviewStatusLabel",
+  }
   if goal then
     segment_list[#segment_list + 1] = { text = goal, group = "DiffReviewHarnessGoal" }
   end
@@ -197,27 +237,15 @@ function M.render(reset)
       follow_tail = active_win ~= transcript_win or vim.api.nvim_win_get_cursor(transcript_win)[1] >= previous_last_line
     end)
   end
-  local timeline = vim.deepcopy(state.timeline or {})
-  if #timeline == 0 then
-    timeline = state.interaction
-  else
-    local known = {}
-    for _, entry in ipairs(timeline) do
-      if entry.kind == "interaction" and entry.interaction then known[entry.interaction.id] = true end
-      for _, interaction in ipairs(entry.interaction or {}) do known[interaction.id] = true end
-    end
-    for _, interaction in ipairs(state.interaction or {}) do
-      if interaction.state == "running" and not known[interaction.id] then
-        timeline[#timeline + 1] = { kind = "interaction", interaction = interaction }
-      end
-    end
-  end
+  local agent_timeline = selected_agent_timeline(state)
+  local timeline = agent_timeline or main_timeline.project(state)
   local render = renderer.build(timeline, {
     working_seconds = working_seconds(),
     content_width = transcript_visible and vim.api.nvim_win_get_width(transcript_win) or nil,
     cwd = vim.uv.cwd(),
     on_diff_update = function() vim.schedule(M.render) end,
     expanded = state.activity_expanded,
+    now_ms = os.time() * 1000,
   })
   state.prompt_line = render.prompt_lines
   state.activity_range = render.folds
@@ -287,6 +315,12 @@ local function synchronize_state(callback)
     local state = harness_state()
     state.session = result.session
     interaction_state.replace(state, result.interaction or {})
+    if result.active_wait then
+      interaction_state.apply_wait(state, {
+        interaction_id = result.active_wait.interaction_id,
+        wait = result.active_wait,
+      })
+    end
     state.timeline = vim.deepcopy(result.timeline or {})
     state.artifact = vim.deepcopy(result.artifact or {})
     state.capability = result.capability or {}
@@ -294,6 +328,8 @@ local function synchronize_state(callback)
     state.goal = result.goal
     state.active_plan = result.active_plan
     state.active_elicitation = result.active_elicitation
+    state.agent = vim.deepcopy(result.agent or { definition = {}, run = {}, turn = {} })
+    state.agent_live = {}
     prompt_history.replace(result.prompt_history)
     local elicitation = state.active_elicitation and state.active_elicitation.elicitation
     local question_set_id = elicitation and elicitation.question_set and elicitation.question_set.id
@@ -310,14 +346,32 @@ end
 local function on_event(event, payload)
   local state = harness_state()
   if event == "backend_event" then
-    if payload.kind == "context_usage" then
+    if payload.kind == "agent_updated" then
+      state.agent = vim.deepcopy(payload.data or payload)
+      discard_terminal_agent_live_state(state)
+      schedule_render()
+    elseif payload.kind == "agent_timeline_updated" then
+      local update = payload.data or payload
+      state.agent_live = state.agent_live or {}
+      state.agent_live[update.run_id] = update
+      schedule_render()
+    elseif payload.kind == "context_usage" then
       if state.session then state.session.context_usage = payload.data or payload end
       M.refresh_winbar()
-    elseif payload.kind == "timeline_active" then
-      interaction_state.apply_active(state, payload.data or payload)
+    elseif payload.kind == "timeline_node_updated" then
+      local update = payload.data or payload
+      interaction_state.apply_node(state, update)
+      local acknowledged = update.node and update.node.prompt
+      for index, pending in ipairs(state.pending_steer or {}) do
+        if acknowledged and pending.text == acknowledged.text then
+          table.remove(state.pending_steer, index)
+          break
+        end
+      end
+      M.refresh_winbar()
       schedule_render()
-    elseif payload.kind == "timeline_thought_completed" then
-      interaction_state.complete_thought(state, payload.data or payload)
+    elseif payload.kind == "timeline_wait_updated" then
+      interaction_state.apply_wait(state, payload.data or payload)
       schedule_render()
     elseif payload.kind == "timeline_task_updated" then
       interaction_state.apply_task(state, payload.data or payload)
@@ -387,6 +441,9 @@ local function on_event(event, payload)
     M.refresh_winbar()
   elseif event == "interaction_rolled_back" then
     synchronize_state()
+  elseif event == "agent_updated" then
+    state.agent = vim.deepcopy(payload)
+    schedule_render()
   elseif event == "interaction_complete" or event == "interaction_updated" then
     interaction_state.complete_interaction(state, payload.interaction or payload)
     synchronize_state()
@@ -478,15 +535,18 @@ end
 ---@param text string
 begin_request = function(text)
   local state = harness_state()
+  local selected_run = selected_agent_run(state)
   state.cancel_requested = false
   set_busy(true)
   local goal_objective = text:match("^/goal%s+(.+)$")
   if goal_objective and goal_objective ~= "pause" and goal_objective ~= "resume" and goal_objective ~= "clear" then
     state.goal = { objective = goal_objective, state = "active" }
   end
-  interaction_state.begin(state, text)
+  if not selected_run then interaction_state.begin(state, text) end
   M.render()
-  client.request("prompt.submit", { text = text }, function(result, request_error, error_detail)
+  local method = selected_run and "agent.submit" or "prompt.submit"
+  local params = selected_run and { run_id = selected_run.id, text = text } or { text = text }
+  client.request(method, params, function(result, request_error, error_detail)
     set_busy(false)
     state.cancel_requested = false
     if request_error then
@@ -501,7 +561,7 @@ begin_request = function(text)
         vim.schedule(M.drain)
         return
       end
-      interaction_state.fail_pending(state, request_error)
+      if not selected_run then interaction_state.fail_pending(state, request_error) end
       notifications.error(request_error, "Harness")
       M.render()
       return
@@ -528,7 +588,12 @@ function M.cancel_turn()
     and #(state.queue or {}) == 0
     and #(state.pending_steer or {}) == 0
     and composer_text(state.composer_buf) == ""
-  client.request("turn.cancel", { restore_prompt_if_no_output = restore_prompt }, function(result, request_error)
+  local selected_run = selected_agent_run(state)
+  local target = selected_run and selected_run.provider_thread_id and selected_run.active_turn_id and {
+    thread_id = selected_run.provider_thread_id,
+    turn_id = selected_run.active_turn_id,
+  } or nil
+  client.request("turn.cancel", { restore_prompt_if_no_output = restore_prompt, target = target }, function(result, request_error)
     if request_error then
       state.cancel_requested = false
       notifications.error(request_error, "Harness cancel")
@@ -655,6 +720,33 @@ function M.open_artifact_picker()
   end)
 end
 
+---Open the provider-backed child-agent selector and switch the composer target.
+function M.open_agent_picker()
+  local state = harness_state()
+  if not (state.capability.agent and state.capability.agent.catalog) then
+    notifications.warn("The current backend does not expose child agents", "Harness")
+    return
+  end
+  require("diff_review.views.harness.agent_picker").open({
+    agent = state.agent or {},
+    selected_run_id = state.selected_agent_run_id,
+    on_select = function(run_id)
+      state.selected_agent_run_id = run_id
+      state.activity_expanded = {}
+      M.render(true)
+    end,
+    on_spawn = function(definition, task)
+      set_busy(true)
+      client.request("agent.start", { definition = definition, task = task }, function(_, request_error)
+        set_busy(false)
+        if request_error then notifications.error(request_error, "Harness agent") end
+        synchronize_state()
+        vim.schedule(M.drain)
+      end)
+    end,
+  })
+end
+
 function M.submit()
   local state = harness_state()
   local text = composer_text(state.composer_buf)
@@ -684,6 +776,27 @@ function M.submit()
     set_composer_text(state.composer_buf, "")
     state.presented_question_set_id = nil
     M.present_plan_question()
+    return
+  end
+  if text == "/agent" then
+    set_composer_text(state.composer_buf, "")
+    M.open_agent_picker()
+    return
+  end
+  local agent_definition, agent_task = text:match("^/agent%s+(%S+)%s+(.+)$")
+  if agent_definition and agent_task then
+    set_composer_text(state.composer_buf, "")
+    set_busy(true)
+    client.request("agent.start", { definition = agent_definition, task = agent_task }, function(_, request_error)
+      set_busy(false)
+      if request_error then notifications.error(request_error, "Harness agent") end
+      synchronize_state()
+      vim.schedule(M.drain)
+    end)
+    return
+  elseif text:match("^/agent%s+") then
+    set_composer_text(state.composer_buf, "")
+    notifications.warn("Use /agent <definition> <task>", "Harness")
     return
   end
   if text == "/compact" then
@@ -774,9 +887,14 @@ function M.steer_submit()
   state.pending_steer = state.pending_steer or {}
   state.pending_steer[#state.pending_steer + 1] = pending
   M.refresh_winbar()
-  client.request("turn.steer", { text = text }, function(_, request_error)
-    remove_pending_steer(state, pending)
+  local selected_run = selected_agent_run(state)
+  local target = selected_run and selected_run.provider_thread_id and selected_run.active_turn_id and {
+    thread_id = selected_run.provider_thread_id,
+    turn_id = selected_run.active_turn_id,
+  } or nil
+  client.request("turn.steer", { text = text, target = target }, function(_, request_error)
     if request_error then
+      remove_pending_steer(state, pending)
       state.queue[#state.queue + 1] = text
       notifications.warn("Steering missed the active turn; queued as a follow-up", "Harness")
     else
@@ -991,6 +1109,7 @@ function M.command_set()
   command_set.register(set, "next_prompt", function() M.jump_prompt(1) end)
   command_set.register(set, "toggle_activity", M.toggle_activity)
   command_set.register(set, "open_artifact", M.open_artifact_picker)
+  command_set.register(set, "agent", M.open_agent_picker)
   command_set.register(set, "reopen_question", M.reopen_question)
   command_set.register(set, "model", M.select_model)
   command_set.register(set, "effort_down", function() M.change_effort(-1) end)

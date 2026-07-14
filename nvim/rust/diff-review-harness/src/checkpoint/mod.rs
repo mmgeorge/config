@@ -299,7 +299,11 @@ mod test {
             &["config", "user.email", "harness@example.invalid"],
         );
         git(temporary.path(), &["config", "user.name", "Harness Test"]);
-        fs::write(temporary.path().join(".gitignore"), "ignored.tmp\n").unwrap();
+        fs::write(
+            temporary.path().join(".gitignore"),
+            "ignored.tmp\ntarget/\n",
+        )
+        .unwrap();
         fs::write(temporary.path().join("tracked.txt"), "before\n").unwrap();
         git(temporary.path(), &["add", "."]);
         git(temporary.path(), &["commit", "-qm", "seed"]);
@@ -316,11 +320,18 @@ mod test {
         fs::write(repository.path().join("tracked.txt"), "after\n").unwrap();
         fs::write(repository.path().join("new.txt"), "new\n").unwrap();
         fs::write(repository.path().join("ignored.tmp"), "ignored\n").unwrap();
+        fs::create_dir_all(repository.path().join("target/generated/deep")).unwrap();
+        fs::write(
+            repository.path().join("target/generated/deep/artifact.txt"),
+            "ignored nested artifact\n",
+        )
+        .unwrap();
         let after = snapshot.capture(&store, "session", 2).unwrap();
         let diff = checkpoint_diff(&store, &before, &after).unwrap();
         assert!(diff.contains("tracked.txt"));
         assert!(diff.contains("new.txt"));
         assert!(!diff.contains("ignored.tmp"));
+        assert!(!diff.contains("target/generated/deep/artifact.txt"));
 
         snapshot.restore(&store, &after, &before).unwrap();
         assert_eq!(
@@ -329,6 +340,12 @@ mod test {
         );
         assert!(!repository.path().join("new.txt").exists());
         assert!(repository.path().join("ignored.tmp").exists());
+        assert!(
+            repository
+                .path()
+                .join("target/generated/deep/artifact.txt")
+                .exists()
+        );
     }
 
     #[test]

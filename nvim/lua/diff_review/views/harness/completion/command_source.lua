@@ -3,6 +3,7 @@ local CommandSource = {}
 local session = require("diff_review.session")
 
 local command_list = {
+  { label = "/agent", detail = "Select or spawn a child agent", capability = "agent" },
   { label = "/plan", detail = "Create a reviewed plan" },
   { label = "/plan cancel", detail = "Cancel the active plan" },
   { label = "/questions", detail = "Reopen pending planning questions" },
@@ -27,7 +28,7 @@ function CommandSource.new()
 end
 
 function CommandSource:get_trigger_characters()
-  return { "/" }
+  return { "/", " " }
 end
 
 function CommandSource:enabled()
@@ -40,12 +41,43 @@ function CommandSource:get_completions(_, callback)
   local row = vim.api.nvim_win_get_cursor(0)[1] - 1
   local cursor_column = vim.api.nvim_win_get_cursor(0)[2]
   local line = vim.api.nvim_get_current_line()
-  local command_start = line:sub(1, cursor_column):find("/")
+  local prefix = line:sub(1, cursor_column)
+  local command_start = prefix:find("/")
   local items = {}
+  local definition_start = prefix:match("^%s*/agent%s+()([^%s]*)$")
+  if definition_start then
+    local capability = session.harness.capability or {}
+    if capability.agent and capability.agent.catalog then
+      for _, definition in ipairs((session.harness.agent or {}).definition or {}) do
+        items[#items + 1] = {
+          label = definition.name,
+          filterText = definition.name,
+          detail = definition.description,
+          kind = vim.lsp.protocol.CompletionItemKind.Value,
+          textEdit = {
+            newText = definition.name,
+            range = {
+              start = { line = row, character = definition_start - 1 },
+              ["end"] = { line = row, character = cursor_column },
+            },
+          },
+        }
+      end
+    end
+    callback({ items = items, is_incomplete_backward = false, is_incomplete_forward = false })
+    return
+  end
+  if prefix:match("^%s*/agent%s+") then
+    callback({ items = items, is_incomplete_backward = false, is_incomplete_forward = false })
+    return
+  end
   if command_start then
     for _, command in ipairs(command_list) do
       local capability = session.harness.capability or {}
-      if command.capability and capability[command.capability] ~= true then goto continue end
+      if command.capability == "agent" and not (capability.agent and capability.agent.catalog) then goto continue end
+      if command.capability and command.capability ~= "agent" and capability[command.capability] ~= true then
+        goto continue
+      end
       items[#items + 1] = {
         label = command.label,
         filterText = command.label,

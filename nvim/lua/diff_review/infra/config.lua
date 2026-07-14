@@ -68,6 +68,7 @@
 ---@field history_next DiffReviewKeymap
 ---@field toggle_activity DiffReviewKeymap
 ---@field open_artifact DiffReviewKeymap
+---@field agent DiffReviewKeymap
 ---@field reopen_question DiffReviewKeymap
 ---@field model DiffReviewKeymap
 ---@field effort_down DiffReviewKeymap
@@ -256,6 +257,7 @@ M.defaults = {
       history_next = "<Down>",
       toggle_activity = { "oa", "<Tab>" },
       open_artifact = "op",
+      agent = "og",
       reopen_question = "oe",
       model = "oM",
       effort_down = "<M-,>",

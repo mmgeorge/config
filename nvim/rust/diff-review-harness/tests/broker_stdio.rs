@@ -131,7 +131,7 @@ fn streams_mock_backend_events_before_the_jsonl_response() {
         .collect::<Vec<_>>();
     assert_eq!(
         backend_kind,
-        vec!["timeline_interaction_started", "timeline_active"]
+        vec!["timeline_interaction_started", "timeline_node_updated"]
     );
     assert!(event_name.contains(&"interaction_complete"));
     assert!(event_name.contains(&"plan_created"));
@@ -403,7 +403,7 @@ fn visible_output_prevents_cancelled_turn_retraction() {
     let visible = broker.read_message();
     assert_eq!(
         visible.pointer("/payload/kind").and_then(Value::as_str),
-        Some("timeline_active")
+        Some("timeline_node_updated")
     );
     broker.request(json!({
         "id": 3,
@@ -499,7 +499,7 @@ fn workspace_changes_prevent_cancelled_turn_retraction() {
 }
 
 #[test]
-fn steers_a_running_planning_turn_without_creating_an_interaction() {
+fn persists_acknowledged_steering_on_the_active_interaction() {
     let repository = tempfile::tempdir().unwrap();
     git(repository.path(), &["init", "-q"]);
     git(
@@ -522,7 +522,7 @@ fn steers_a_running_planning_turn_without_creating_an_interaction() {
             "data_root": data.path(),
             "workspace": repository.path(),
             "client_id": "steer-test",
-            "backend": { "kind": "mock", "command": ["blocking"] },
+            "backend": { "kind": "mock", "command": ["visible-blocking"] },
             "model": "mock-model",
             "effort": "low",
             "trust_profile": "workspace",
@@ -559,6 +559,43 @@ fn steers_a_running_planning_turn_without_creating_an_interaction() {
             .and_then(Value::as_bool),
         Some(true)
     );
+    let mut event_list: Vec<_> = steered
+        .iter()
+        .filter(|message| message.get("id").is_none())
+        .cloned()
+        .collect();
+    while !event_list.iter().any(|message| {
+        message.pointer("/payload/kind").and_then(Value::as_str) == Some("timeline_node_updated")
+            && message
+                .pointer("/payload/data/node/kind")
+                .and_then(Value::as_str)
+                == Some("steering_prompt")
+    }) {
+        event_list.push(broker.read_message());
+    }
+    let steering_event = event_list
+        .iter()
+        .find(|message| {
+            message.pointer("/payload/kind").and_then(Value::as_str)
+                == Some("timeline_node_updated")
+                && message
+                    .pointer("/payload/data/node/kind")
+                    .and_then(Value::as_str)
+                    == Some("steering_prompt")
+        })
+        .unwrap();
+    assert_eq!(
+        steering_event
+            .pointer("/payload/kind")
+            .and_then(Value::as_str),
+        Some("timeline_node_updated")
+    );
+    assert_eq!(
+        steering_event
+            .pointer("/payload/data/node/prompt/text")
+            .and_then(Value::as_str),
+        Some("And be sure to modify Y")
+    );
 
     broker.request(json!({ "id": 4, "method": "turn.cancel", "params": {} }));
     broker.read_response(4);
@@ -573,6 +610,18 @@ fn steers_a_running_planning_turn_without_creating_an_interaction() {
         .unwrap();
     assert_eq!(interaction.len(), 1);
     assert_eq!(interaction[0]["prompt"], "/plan refactor X");
+    assert_eq!(
+        interaction[0]
+            .pointer("/node_list/1/prompt/text")
+            .and_then(Value::as_str),
+        Some("And be sure to modify Y")
+    );
+    assert_eq!(
+        interaction[0]
+            .pointer("/node_list/1/prompt/id")
+            .and_then(Value::as_str),
+        Some(format!("{}:steering:1", interaction[0]["id"].as_str().unwrap()).as_str())
+    );
 
     broker.request(json!({ "id": 6, "method": "shutdown", "params": {} }));
     broker.read_response(6);

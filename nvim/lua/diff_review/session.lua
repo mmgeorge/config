@@ -77,6 +77,7 @@ M.empty_diff_rows = {}
 ---@field rendered_lines string[]
 ---@field render_namespace integer?
 ---@field render_initialized boolean
+---@field render_fold_signature? string
 ---@field queue string[]
 ---@field pending_steer table[]
 ---@field transcript_buf integer?
@@ -103,6 +104,9 @@ M.empty_diff_rows = {}
 ---@field prompt_history string[]
 ---@field prompt_history_index integer
 ---@field prompt_history_draft string?
+---@field agent table
+---@field selected_agent_run_id string?
+---@field agent_live table<string, table>
 
 --- Harness process, view, queue, interaction-tree, and capability state. The broker owns
 --- durable state while this table owns only the current Neovim presentation.
@@ -123,6 +127,7 @@ M.harness = {
   rendered_lines = {},
   render_namespace = nil,
   render_initialized = false,
+  render_fold_signature = nil,
   queue = {},
   pending_steer = {},
   transcript_buf = nil,
@@ -145,6 +150,9 @@ M.harness = {
   prompt_history = {},
   prompt_history_index = 0,
   prompt_history_draft = nil,
+  agent = { definition = {}, run = {}, turn = {} },
+  selected_agent_run_id = nil,
+  agent_live = {},
 }
 
 return M

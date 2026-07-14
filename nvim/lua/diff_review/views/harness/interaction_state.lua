@@ -35,7 +35,7 @@ function M.begin(state, prompt)
     id = "pending:" .. tostring(vim.uv.hrtime()),
     prompt = prompt,
     state = "running",
-    thought = {},
+    node_list = {},
   }
   state.interaction[#state.interaction + 1] = interaction
   state.interaction_by_id[interaction.id] = interaction
@@ -54,7 +54,7 @@ local function resolve(state, interaction_id)
     state.pending_interaction = nil
     return pending
   end
-  interaction = { id = interaction_id, prompt = "", state = "running", thought = {} }
+  interaction = { id = interaction_id, prompt = "", state = "running", node_list = {} }
   state.interaction[#state.interaction + 1] = interaction
   state.interaction_by_id[interaction_id] = interaction
   return interaction
@@ -62,13 +62,37 @@ end
 
 ---@param state DiffReviewHarnessPresentationState
 ---@param update table
-function M.apply_active(state, update)
+function M.apply_node(state, update)
+  if type(update) ~= "table" or not update.interaction_id then return end
+  local node = update.node
+  if type(node) ~= "table" then return end
+  local interaction = resolve(state, update.interaction_id)
+  if node.kind == "steering_prompt" then interaction.active_wait = nil end
+  interaction.node_list = interaction.node_list or {}
+  local node_id = node.segment and node.segment.id
+    or node.agent and node.agent.id
+    or node.prompt and node.prompt.id
+  if not node_id then return end
+  for index, previous in ipairs(interaction.node_list) do
+    local previous_id = previous.segment and previous.segment.id
+      or previous.agent and previous.agent.id
+      or previous.prompt and previous.prompt.id
+    if previous_id == node_id then
+      interaction.node_list[index] = vim.deepcopy(node)
+      interaction.state = "running"
+      return
+    end
+  end
+  interaction.node_list[#interaction.node_list + 1] = vim.deepcopy(node)
+  interaction.state = "running"
+end
+
+---@param state DiffReviewHarnessPresentationState
+---@param update table
+function M.apply_wait(state, update)
   if type(update) ~= "table" or not update.interaction_id then return end
   local interaction = resolve(state, update.interaction_id)
-  local previous = interaction.active
-  if previous and (previous.revision or 0) > (update.revision or 0) then return end
-  interaction.active = vim.deepcopy(update)
-  interaction.state = "running"
+  interaction.active_wait = type(update.wait) == "table" and vim.deepcopy(update.wait) or nil
 end
 
 ---@param state DiffReviewHarnessPresentationState
@@ -84,24 +108,6 @@ end
 
 ---@param state DiffReviewHarnessPresentationState
 ---@param thought table
-function M.complete_thought(state, thought)
-  if type(thought) ~= "table" or not thought.id then return end
-  local interaction_id = thought.id:match("^(.-):thought:%d+$")
-  if not interaction_id then return end
-  local interaction = resolve(state, interaction_id)
-  interaction.thought = interaction.thought or {}
-  local replaced = false
-  for index, previous in ipairs(interaction.thought) do
-    if previous.id == thought.id then
-      interaction.thought[index] = vim.deepcopy(thought)
-      replaced = true
-      break
-    end
-  end
-  if not replaced then interaction.thought[#interaction.thought + 1] = vim.deepcopy(thought) end
-  if interaction.active and interaction.active.thought_id == thought.id then interaction.active = nil end
-end
-
 ---@param state DiffReviewHarnessPresentationState
 ---@param completed table
 function M.complete_interaction(state, completed)
@@ -109,7 +115,7 @@ function M.complete_interaction(state, completed)
   local current = resolve(state, completed.id)
   for key in pairs(current) do current[key] = nil end
   for key, value in pairs(vim.deepcopy(completed)) do current[key] = value end
-  current.active = nil
+  current.active_wait = nil
   state.pending_interaction = nil
 end
 
@@ -138,8 +144,18 @@ function M.fail_pending(state, message)
   local interaction = state.pending_interaction
   if not interaction then return end
   interaction.state = "failed"
-  interaction.active = nil
-  interaction.response = message
+  interaction.active_wait = nil
+  interaction.node_list = interaction.node_list or {}
+  interaction.node_list[#interaction.node_list + 1] = {
+    kind = "main_segment",
+    segment = {
+      id = interaction.id .. ":segment:error",
+      state = "complete",
+      duration_ms = 0,
+      thought = {},
+      response = message,
+    },
+  }
   interaction.completed_at_ms = math.floor(vim.uv.hrtime() / 1000000)
   state.pending_interaction = nil
 end

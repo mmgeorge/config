@@ -1,6 +1,8 @@
+use crate::agent::{AgentLifecycleEvent, AgentRunStatus};
 use crate::backend::{
-    BackendEvent, BackendEventSink, BackendOutput, ProviderTaskEntry, ProviderTaskUpdate,
-    TaskStatus, ToolActivity, ToolActivityKind, TrustPolicy,
+    BackendEvent, BackendEventSink, BackendOutput, ProviderChangeKind, ProviderChangeSet,
+    ProviderFileChange, ProviderTaskEntry, ProviderTaskUpdate, TaskStatus, ToolActivity,
+    ToolActivityKind, TrustPolicy,
 };
 use crate::plan::PlanQuestionSet;
 use crate::session::ContextUsage;
@@ -126,7 +128,7 @@ impl JsonRpcProcess {
         if message.get("id").is_some() && message.get("method").is_some() {
             self.respond_to_provider_request(&message).await?;
         }
-        normalize_event(&message, output, self.event_sink.as_ref());
+        normalize_event_in_workspace(&message, output, self.event_sink.as_ref(), &self.workspace);
         Ok(message)
     }
 
@@ -459,10 +461,20 @@ fn is_absolute_path(path: &str) -> bool {
         || path.as_bytes().get(1).is_some_and(|byte| *byte == b':')
 }
 
+#[cfg(test)]
 fn normalize_event(
     message: &Value,
     output: &mut BackendOutput,
     event_sink: Option<&BackendEventSink>,
+) {
+    normalize_event_in_workspace(message, output, event_sink, "");
+}
+
+fn normalize_event_in_workspace(
+    message: &Value,
+    output: &mut BackendOutput,
+    event_sink: Option<&BackendEventSink>,
+    workspace: &str,
 ) {
     let method = message
         .get("method")
@@ -473,6 +485,50 @@ fn normalize_event(
     let method_lower = method.to_ascii_lowercase();
     let encoded = params.to_string().to_ascii_lowercase();
     if method_lower == "turn/moderationmetadata" {
+        return;
+    }
+    if matches!(method_lower.as_str(), "turn/started" | "turn/completed")
+        && pointer_string(
+            &params,
+            &[
+                "/threadId",
+                "/thread_id",
+                "/turn/threadId",
+                "/turn/thread_id",
+            ],
+        )
+        .is_some()
+    {
+        let event = BackendEvent {
+            kind: method_lower.replace('/', "_"),
+            text: None,
+            data: json!({ "method": method, "params": params }),
+            activity: None,
+            summary: None,
+            task_update: None,
+        };
+        if let Some(event_sink) = event_sink {
+            let _ = event_sink.send(event.clone());
+        }
+        append_output_event(output, event);
+        return;
+    }
+    let agent_lifecycle_list = normalize_agent_lifecycle(method, &params);
+    if !agent_lifecycle_list.is_empty() {
+        for lifecycle in agent_lifecycle_list {
+            let event = BackendEvent {
+                kind: "agent_lifecycle".into(),
+                text: None,
+                data: serde_json::to_value(lifecycle).unwrap_or(Value::Null),
+                activity: None,
+                summary: None,
+                task_update: None,
+            };
+            if let Some(event_sink) = event_sink {
+                let _ = event_sink.send(event.clone());
+            }
+            append_output_event(output, event);
+        }
         return;
     }
     let usage_event = method_lower.contains("tokenusage")
@@ -571,8 +627,11 @@ fn normalize_event(
         && (tool_event || plan_event || reasoning_event || assistant_event || error_event)
     {
         let activity = tool_event
-            .then(|| normalize_tool_activity(method, &params))
+            .then(|| normalize_tool_activity(method, &params, workspace))
             .flatten();
+        if activity.as_ref().is_some_and(successful_file_change) {
+            output.evidence.workspace_changed = true;
+        }
         let task_update = plan_event
             .then(|| normalize_task_update(method, &params))
             .flatten();
@@ -589,6 +648,178 @@ fn normalize_event(
         }
         append_output_event(output, event);
     }
+}
+
+fn normalize_agent_status(status: &str) -> Option<AgentRunStatus> {
+    match status.to_ascii_lowercase().as_str() {
+        "pendinginit" => Some(AgentRunStatus::Starting),
+        "running" => Some(AgentRunStatus::Running),
+        "interrupted" | "cancelled" | "canceled" => Some(AgentRunStatus::Interrupted),
+        "completed" | "complete" | "done" => Some(AgentRunStatus::Completed),
+        "errored" | "failed" | "error" => Some(AgentRunStatus::Failed),
+        "shutdown" | "closed" | "notfound" => Some(AgentRunStatus::Closed),
+        "waiting" | "idle" => Some(AgentRunStatus::Waiting),
+        _ => None,
+    }
+}
+
+fn normalize_agent_lifecycle(method: &str, params: &Value) -> Vec<AgentLifecycleEvent> {
+    let encoded = params.to_string().to_ascii_lowercase();
+    let method_lower = method.to_ascii_lowercase();
+    if !method_lower.contains("subagent")
+        && !method_lower.contains("collabagent")
+        && !encoded.contains("collabagenttoolcall")
+        && !encoded.contains("subagentactivity")
+    {
+        return Vec::new();
+    }
+    let item = params.pointer("/item").unwrap_or(params);
+    let operation = first_string(item, &["tool", "operation", "action", "type"])
+        .unwrap_or_else(|| "agentActivity".into());
+    let parent_thread_id = pointer_string(
+        params,
+        &[
+            "/item/senderThreadId",
+            "/item/sender_thread_id",
+            "/threadId",
+            "/thread_id",
+            "/senderThreadId",
+            "/sender_thread_id",
+        ],
+    );
+    let turn_id = pointer_string(
+        params,
+        &["/turnId", "/turn_id", "/item/turnId", "/item/turn_id"],
+    );
+    let definition = first_string(item, &["agentType", "agent_type", "role"]);
+    let nickname = first_string(item, &["agentNickname", "agent_nickname", "nickname"]);
+    let task = first_string(item, &["prompt", "task", "input"]);
+    if item
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|item_type| item_type.eq_ignore_ascii_case("subAgentActivity"))
+    {
+        let starts_child =
+            first_string(item, &["kind"]).is_some_and(|kind| kind.eq_ignore_ascii_case("started"));
+        let status = match first_string(item, &["kind"])
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "interrupted" => AgentRunStatus::Interrupted,
+            _ => AgentRunStatus::Running,
+        };
+        let provider_thread_id = pointer_string(
+            params,
+            &[
+                "/item/agentThreadId",
+                "/item/agent_thread_id",
+                "/agentThreadId",
+            ],
+        );
+        return provider_thread_id
+            .map(|provider_thread_id| {
+                vec![AgentLifecycleEvent {
+                    operation,
+                    starts_child,
+                    parent_thread_id,
+                    provider_thread_id: Some(provider_thread_id),
+                    turn_id,
+                    definition,
+                    nickname,
+                    task,
+                    status,
+                }]
+            })
+            .unwrap_or_default();
+    }
+
+    let receiver_thread_id_list = item
+        .get("receiverThreadIds")
+        .or_else(|| item.get("receiver_thread_ids"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let agent_state_map = item
+        .get("agentsStates")
+        .or_else(|| item.get("agents_states"))
+        .and_then(Value::as_object);
+    let mut lifecycle_list = Vec::new();
+    for receiver_thread_id in receiver_thread_id_list {
+        let status = agent_state_map
+            .and_then(|state_map| state_map.get(&receiver_thread_id))
+            .and_then(|state| first_string(state, &["status", "state"]))
+            .and_then(|status| normalize_agent_status(&status))
+            .or_else(|| {
+                if operation.eq_ignore_ascii_case("spawnAgent") {
+                    Some(AgentRunStatus::Running)
+                } else if operation.eq_ignore_ascii_case("closeAgent")
+                    && method_lower.ends_with("/completed")
+                {
+                    Some(AgentRunStatus::Closed)
+                } else {
+                    None
+                }
+            });
+        let Some(status) = status else { continue };
+        lifecycle_list.push(AgentLifecycleEvent {
+            operation: operation.clone(),
+            starts_child: operation.eq_ignore_ascii_case("spawnAgent"),
+            parent_thread_id: parent_thread_id.clone(),
+            provider_thread_id: Some(receiver_thread_id),
+            turn_id: turn_id.clone(),
+            definition: definition.clone(),
+            nickname: nickname.clone(),
+            task: task.clone(),
+            status,
+        });
+    }
+    if lifecycle_list.is_empty() && operation.eq_ignore_ascii_case("spawnAgent") {
+        let status_text = first_string(item, &["status", "state"]).unwrap_or_default();
+        lifecycle_list.push(AgentLifecycleEvent {
+            operation,
+            starts_child: true,
+            parent_thread_id,
+            provider_thread_id: None,
+            turn_id,
+            definition,
+            nickname,
+            task,
+            status: if status_text.eq_ignore_ascii_case("inProgress") {
+                AgentRunStatus::Starting
+            } else {
+                AgentRunStatus::Running
+            },
+        });
+    }
+    lifecycle_list
+}
+
+/// Resolve child-agent lifecycle state from one raw provider message.
+pub(crate) fn agent_lifecycle_list(message: &Value) -> Vec<AgentLifecycleEvent> {
+    let method = message
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let params = message.get("params").unwrap_or(&Value::Null);
+    normalize_agent_lifecycle(method, params)
+}
+
+fn pointer_string(value: &Value, pointer_list: &[&str]) -> Option<String> {
+    pointer_list
+        .iter()
+        .find_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
+        .map(str::to_owned)
+}
+
+fn first_string(value: &Value, field_list: &[&str]) -> Option<String> {
+    field_list
+        .iter()
+        .find_map(|field| value.get(field).and_then(Value::as_str))
+        .map(str::to_owned)
 }
 
 fn context_usage(params: &Value) -> Option<ContextUsage> {
@@ -876,7 +1107,7 @@ fn normalize_task_update(method: &str, params: &Value) -> Option<ProviderTaskUpd
     })
 }
 
-fn normalize_tool_activity(method: &str, params: &Value) -> Option<ToolActivity> {
+fn normalize_tool_activity(method: &str, params: &Value, workspace: &str) -> Option<ToolActivity> {
     let envelope = params.get("update").unwrap_or(params);
     let item = envelope.get("item").unwrap_or(envelope);
     let id = item
@@ -962,9 +1193,93 @@ fn normalize_tool_activity(method: &str, params: &Value) -> Option<ToolActivity>
         title,
         output,
         status,
+        change: normalize_file_change_set(item, envelope, workspace),
         output_delta: method_lower.ends_with("/outputdelta")
             || method_lower.ends_with("/output_delta"),
     })
+}
+
+fn normalize_file_change_set(item: &Value, envelope: &Value, workspace: &str) -> ProviderChangeSet {
+    let change_list = item
+        .get("changes")
+        .or_else(|| item.get("change_list"))
+        .or_else(|| envelope.get("changes"))
+        .or_else(|| envelope.get("change_list"))
+        .and_then(Value::as_array);
+    let Some(change_list) = change_list else {
+        return ProviderChangeSet::default();
+    };
+    let file = change_list
+        .iter()
+        .filter_map(|change| {
+            let path = change
+                .get("path")
+                .or_else(|| change.get("filePath"))
+                .or_else(|| change.get("file_path"))
+                .and_then(Value::as_str)?;
+            let path = provider_change_path(path, workspace);
+            let move_path = change
+                .get("movePath")
+                .or_else(|| change.get("move_path"))
+                .and_then(Value::as_str)
+                .map(|path| provider_change_path(path, workspace));
+            let kind = if move_path.is_some() {
+                ProviderChangeKind::Move
+            } else {
+                match change
+                    .get("kind")
+                    .or_else(|| change.get("operation"))
+                    .and_then(|kind| {
+                        kind.as_str()
+                            .or_else(|| kind.get("type").and_then(Value::as_str))
+                    })
+                    .unwrap_or("update")
+                    .to_ascii_lowercase()
+                    .as_str()
+                {
+                    "add" | "create" | "created" => ProviderChangeKind::Add,
+                    "delete" | "deleted" | "remove" => ProviderChangeKind::Delete,
+                    "move" | "rename" => ProviderChangeKind::Move,
+                    _ => ProviderChangeKind::Update,
+                }
+            };
+            let diff = change
+                .get("diff")
+                .or_else(|| change.get("patch"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            Some(ProviderFileChange {
+                path,
+                move_path,
+                kind,
+                diff,
+            })
+        })
+        .collect();
+    ProviderChangeSet { file }
+}
+
+fn provider_change_path(path: &str, workspace: &str) -> String {
+    if workspace.is_empty() {
+        return path.to_owned();
+    }
+    Path::new(path)
+        .strip_prefix(Path::new(workspace))
+        .unwrap_or_else(|_| Path::new(path))
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn successful_file_change(activity: &ToolActivity) -> bool {
+    activity.kind == ToolActivityKind::FileChange
+        && !activity.change.is_empty()
+        && activity.status.as_deref().is_some_and(|status| {
+            matches!(
+                status.to_ascii_lowercase().as_str(),
+                "completed" | "complete" | "success" | "succeeded"
+            )
+        })
 }
 
 fn tool_title(value: &Value) -> Option<String> {
@@ -1014,6 +1329,9 @@ fn merge_tool_activity(previous: &mut BackendEvent, incoming: BackendEvent) {
     }
     if incoming_activity.status.is_some() {
         previous_activity.status = incoming_activity.status;
+    }
+    if !incoming_activity.change.is_empty() {
+        previous_activity.change = incoming_activity.change;
     }
     previous_activity.output_delta = false;
     previous.data = incoming.data;
@@ -1384,6 +1702,111 @@ mod test {
     }
 
     #[test]
+    fn replaces_codex_patch_revisions_with_the_completed_change_set() {
+        let mut output = BackendOutput::default();
+        normalize_event(
+            &json!({
+                "method": "item/fileChange/patchUpdated",
+                "params": {
+                    "itemId": "patch-1",
+                    "changes": [{
+                        "path": "src/main.rs",
+                        "kind": "update",
+                        "diff": "@@ -1 +1 @@\n-old\n+draft"
+                    }]
+                }
+            }),
+            &mut output,
+            None,
+        );
+        normalize_event(
+            &json!({
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "id": "patch-1",
+                        "type": "fileChange",
+                        "status": "completed",
+                        "changes": [{
+                            "path": "src/main.rs",
+                            "kind": "update",
+                            "diff": "@@ -1 +1 @@\n-old\n+final"
+                        }]
+                    }
+                }
+            }),
+            &mut output,
+            None,
+        );
+
+        assert_eq!(output.event.len(), 1);
+        let activity = output.event[0].activity.as_ref().expect("file change");
+        assert_eq!(activity.change.file.len(), 1);
+        assert!(activity.change.file[0].diff.contains("+final"));
+        assert!(!activity.change.file[0].diff.contains("+draft"));
+        assert!(output.evidence.workspace_changed);
+    }
+
+    #[test]
+    fn normalizes_codex_absolute_paths_and_structured_change_kinds() {
+        let mut output = BackendOutput::default();
+        normalize_event_in_workspace(
+            &json!({
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "id": "patch-1",
+                        "type": "fileChange",
+                        "status": "completed",
+                        "changes": [{
+                            "path": "C:\\workspace\\src\\main.rs",
+                            "kind": { "type": "add" },
+                            "diff": "@@ -0,0 +1 @@\n+created"
+                        }]
+                    }
+                }
+            }),
+            &mut output,
+            None,
+            "C:\\workspace",
+        );
+
+        let change = &output.event[0].activity.as_ref().unwrap().change.file[0];
+        assert_eq!(change.path, "src/main.rs");
+        assert_eq!(change.kind, ProviderChangeKind::Add);
+    }
+
+    #[test]
+    fn declined_file_changes_do_not_count_as_workspace_progress() {
+        let mut output = BackendOutput::default();
+        normalize_event(
+            &json!({
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "id": "patch-1",
+                        "type": "fileChange",
+                        "status": "declined",
+                        "changes": [{
+                            "path": "src/main.rs",
+                            "kind": "update",
+                            "diff": "@@ -1 +1 @@\n-old\n+rejected"
+                        }]
+                    }
+                }
+            }),
+            &mut output,
+            None,
+        );
+
+        assert!(!output.evidence.workspace_changed);
+        assert_eq!(
+            output.event[0].activity.as_ref().unwrap().change.file.len(),
+            1
+        );
+    }
+
+    #[test]
     fn derives_codex_command_status_from_lifecycle_method() {
         let mut output = BackendOutput::default();
         normalize_event(
@@ -1607,5 +2030,136 @@ mod test {
             })
         );
         assert_eq!(output.metrics.native_compact_update, Some(true));
+    }
+
+    #[test]
+    fn normalizes_codex_spawn_activity_without_rendering_it_as_a_tool() {
+        let mut output = BackendOutput::default();
+        normalize_event(
+            &json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "parent-thread",
+                    "turnId": "parent-turn",
+                    "item": {
+                        "id": "spawn-1",
+                        "type": "collabAgentToolCall",
+                        "tool": "spawnAgent",
+                        "agentType": "explorer",
+                        "agentNickname": "Bevy scout",
+                        "prompt": "Inspect Bevy",
+                        "receiverThreadIds": ["child-thread"],
+                        "status": "completed"
+                    }
+                }
+            }),
+            &mut output,
+            None,
+        );
+
+        assert_eq!(output.event.len(), 1);
+        assert_eq!(output.event[0].kind, "agent_lifecycle");
+        let lifecycle: AgentLifecycleEvent =
+            serde_json::from_value(output.event[0].data.clone()).unwrap();
+        assert_eq!(
+            lifecycle.provider_thread_id.as_deref(),
+            Some("child-thread")
+        );
+        assert_eq!(lifecycle.definition.as_deref(), Some("explorer"));
+        assert_eq!(lifecycle.status, AgentRunStatus::Running);
+        assert!(output.event[0].activity.is_none());
+    }
+
+    #[test]
+    fn normalizes_each_codex_child_state_instead_of_the_wait_tool_state() {
+        let mut output = BackendOutput::default();
+        normalize_event(
+            &json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "parent-thread",
+                    "turnId": "parent-turn",
+                    "item": {
+                        "type": "collabAgentToolCall",
+                        "tool": "wait",
+                        "senderThreadId": "parent-thread",
+                        "receiverThreadIds": ["complete-child", "running-child"],
+                        "agentsStates": {
+                            "complete-child": { "status": "completed" },
+                            "running-child": { "status": "running" }
+                        },
+                        "status": "completed"
+                    }
+                }
+            }),
+            &mut output,
+            None,
+        );
+
+        assert_eq!(output.event.len(), 2);
+        let lifecycle_list = output
+            .event
+            .iter()
+            .map(|event| serde_json::from_value::<AgentLifecycleEvent>(event.data.clone()).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(lifecycle_list[0].status, AgentRunStatus::Completed);
+        assert_eq!(lifecycle_list[1].status, AgentRunStatus::Running);
+        assert_eq!(
+            lifecycle_list[0].parent_thread_id.as_deref(),
+            Some("parent-thread")
+        );
+    }
+
+    #[test]
+    fn ignores_a_codex_wait_without_child_state() {
+        let mut output = BackendOutput::default();
+        normalize_event(
+            &json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "parent-thread",
+                    "item": {
+                        "type": "collabAgentToolCall",
+                        "tool": "wait",
+                        "receiverThreadIds": [],
+                        "agentsStates": {},
+                        "status": "completed"
+                    }
+                }
+            }),
+            &mut output,
+            None,
+        );
+
+        assert!(output.event.is_empty());
+    }
+
+    #[test]
+    fn normalizes_codex_subagent_activity_with_its_child_identity() {
+        let mut output = BackendOutput::default();
+        normalize_event(
+            &json!({
+                "method": "item/updated",
+                "params": {
+                    "threadId": "parent-thread",
+                    "item": {
+                        "type": "subAgentActivity",
+                        "agentThreadId": "child-thread",
+                        "agentPath": "explorer",
+                        "kind": "interrupted"
+                    }
+                }
+            }),
+            &mut output,
+            None,
+        );
+
+        let lifecycle: AgentLifecycleEvent =
+            serde_json::from_value(output.event[0].data.clone()).unwrap();
+        assert_eq!(
+            lifecycle.provider_thread_id.as_deref(),
+            Some("child-thread")
+        );
+        assert_eq!(lifecycle.status, AgentRunStatus::Interrupted);
     }
 }

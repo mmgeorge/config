@@ -3,7 +3,9 @@ pub mod codex;
 mod json_rpc;
 mod process;
 mod steering;
+pub use steering::SteerTarget;
 
+use crate::agent::AgentCapability;
 use crate::goal::TurnEvidence;
 use crate::plan::PlanQuestionSet;
 use crate::session::{ContextUsage, WriteMode};
@@ -25,6 +27,7 @@ pub struct BackendCapability {
     pub model_selection: bool,
     pub effort_selection: bool,
     pub permission_control: bool,
+    pub agent: AgentCapability,
 }
 
 /// Represents one executable backend launch descriptor.
@@ -151,7 +154,44 @@ pub struct ToolActivity {
     pub output: Option<String>,
     pub status: Option<String>,
     #[serde(default)]
+    pub change: ProviderChangeSet,
+    #[serde(default)]
     pub output_delta: bool,
+}
+
+/// Defines one provider-reported file operation without consulting workspace state.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderChangeKind {
+    Add,
+    Delete,
+    #[default]
+    Update,
+    Move,
+}
+
+/// Represents one provider-reported file edit and its textual patch.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProviderFileChange {
+    pub path: String,
+    #[serde(default)]
+    pub move_path: Option<String>,
+    pub kind: ProviderChangeKind,
+    pub diff: String,
+}
+
+/// Stores provider-reported file edits for one tool lifecycle item.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProviderChangeSet {
+    #[serde(default)]
+    pub file: Vec<ProviderFileChange>,
+}
+
+impl ProviderChangeSet {
+    /// Return whether this provider item carries any structured file edits.
+    pub fn is_empty(&self) -> bool {
+        self.file.is_empty()
+    }
 }
 
 /// Defines the visible action verb for one normalized tool invocation.
@@ -250,6 +290,16 @@ pub trait Backend: Send + Sync {
         anyhow::bail!("backend does not support active-turn steering")
     }
 
+    /// Append user input to one specific provider child turn.
+    async fn steer_target(&self, text: String, _target: SteerTarget) -> Result<()> {
+        self.steer(text).await
+    }
+
+    /// Interrupt one specific provider child turn without cancelling its parent.
+    async fn interrupt_target(&self, _target: SteerTarget) -> Result<()> {
+        anyhow::bail!("backend does not support targeted child interruption")
+    }
+
     /// Stop the active provider transport after its prompt future is cancelled.
     async fn cancel(&self) -> Result<()> {
         Ok(())
@@ -302,7 +352,7 @@ impl Backend for MockBackend {
         request: BackendRequest,
         event_sink: Option<BackendEventSink>,
     ) -> Result<BackendOutput> {
-        let mut active_steering = self.steering.activate()?;
+        let mut active_steering = self.steering.activate(event_sink.clone())?;
         let mut steering_text_list = Vec::new();
         let event = BackendEvent {
             kind: "assistant_message".into(),
@@ -331,16 +381,6 @@ impl Backend for MockBackend {
                     () = &mut delay => break,
                     Some(command) = active_steering.receive() => {
                         steering_text_list.push(command.text.clone());
-                        if let Some(event_sink) = event_sink.as_ref() {
-                            let _ = event_sink.send(BackendEvent {
-                                kind: "steering_input".into(),
-                                text: Some(command.text.clone()),
-                                data: Value::Null,
-                                activity: None,
-                                summary: None,
-                                task_update: None,
-                            });
-                        }
                         command.complete(Ok(()));
                     }
                 }
@@ -387,6 +427,7 @@ impl Backend for MockBackend {
                 model_selection: true,
                 effort_selection: true,
                 permission_control: true,
+                agent: AgentCapability::default(),
             },
             runtime: BackendRuntime {
                 provider: "Mock backend".into(),
@@ -426,6 +467,7 @@ impl Backend for MockBackend {
                 model_selection: true,
                 effort_selection: true,
                 permission_control: true,
+                agent: AgentCapability::default(),
             },
             runtime: BackendRuntime {
                 provider: "Mock backend".into(),

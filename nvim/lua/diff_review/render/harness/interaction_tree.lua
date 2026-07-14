@@ -4,6 +4,7 @@ local display_text = require("diff_review.render.display_text")
 
 local diff_tree = require("diff_review.render.diff_tree")
 local plan_event = require("diff_review.render.harness.plan_event")
+local agent_event = require("diff_review.render.harness.agent_event")
 local task_tree = require("diff_review.render.harness.task_tree")
 local tool_render = require("diff_review.render.harness.tool")
 
@@ -260,23 +261,26 @@ local function append_active_thought(result, interaction, active, options)
   end
 end
 
-local function append_interaction(result, interaction, options)
-  if #result.lines > 0 then result.lines[#result.lines + 1] = "" end
-  if not interaction.hide_prompt and interaction.kind ~= "plan_execution" then
-    local prompt_line = #result.lines + 1
-    append_wrapped(result, interaction.prompt, "▸ ", "  ", "DiffReviewHarnessPrompt", options.content_width)
-    result.prompt_lines[#result.prompt_lines + 1] = prompt_line
-    for line = prompt_line, #result.lines do
-      result.rows[line] = { kind = "prompt", interaction = interaction }
-    end
-  end
-  local complete = interaction.state == "complete" or interaction.state == "failed"
-    or interaction.state == "cancelled" or interaction.state == "rolled_back"
-    or interaction.state == "superseded"
-  local tool_count, failed_count = interaction_counts(interaction)
-  local previous_duration = math.floor((interaction.duration_ms or 0) / 1000)
-  local duration = complete and previous_duration or previous_duration + (options.working_seconds or 0)
-  local token_text = complete and format_token_count(interaction.token_count) or nil
+local function append_segment(result, interaction, segment, options, defer_response)
+  local segment_first = #result.lines + 1
+  local segment_interaction = {
+    id = interaction.id,
+    segment_id = segment.id,
+    ordinal = interaction.ordinal,
+    kind = interaction.kind,
+    state = segment.state == "complete" and "complete" or "running",
+    awaiting_input = interaction.awaiting_input,
+    thought = segment.thought or {},
+    active = segment.active,
+    task = interaction.task,
+    duration_ms = segment.duration_ms or 0,
+    token_count = segment.token_count,
+  }
+  local complete = segment.state == "complete"
+  local tool_count, failed_count = interaction_counts(segment_interaction)
+  local duration = math.floor((segment.duration_ms or 0) / 1000)
+  if not complete then duration = duration + (options.working_seconds or 0) end
+  local token_text = complete and format_token_count(segment.token_count) or nil
   local summary
   if interaction.state == "cancelled" then
     summary = ("▸ Cancelled after %ds"):format(duration)
@@ -301,10 +305,21 @@ local function append_interaction(result, interaction, options)
     summary = summary .. (", %d %s called"):format(tool_count, tool_count == 1 and "tool" or "tools")
     if failed_count > 0 then summary = summary .. (" (%d failed)"):format(failed_count) end
   end
+  local spawned_agent_count = segment.spawned_agent_count or 0
+  if spawned_agent_count > 0 then
+    summary = summary .. (", %d %s spawned"):format(
+      spawned_agent_count,
+      spawned_agent_count == 1 and "agent" or "agents"
+    )
+  end
   local summary_line = #result.lines + 1
   result.lines[summary_line] = summary
-  result.rows[summary_line] = { kind = complete and "thought_summary" or "thinking_summary", interaction = interaction }
-  local summary_key = ("interaction:%s:thoughts"):format(interaction.id or interaction.ordinal)
+  result.rows[summary_line] = {
+    kind = complete and "thought_summary" or "thinking_summary",
+    interaction = interaction,
+    node_id = segment.id,
+  }
+  local summary_key = ("interaction:%s:segment:%s"):format(interaction.id or interaction.ordinal, segment.id)
   if complete then result.rows[summary_line].expand_key = summary_key end
   result.highlights[#result.highlights + 1] = {
     line = summary_line,
@@ -312,23 +327,113 @@ local function append_interaction(result, interaction, options)
     last = -1,
     group = complete and "DiffReviewHarnessThought" or "DiffReviewHarnessThinking",
   }
-  local task_owns_active = task_tree.append(result, interaction, options, complete, {
+  local task_owns_active = task_tree.append(result, segment_interaction, options, complete, {
     append_completed_thought = append_completed_thought,
     append_active_thought = append_active_thought,
   })
   if (not complete or result.expanded[summary_key]) and not interaction.task then
-    for thought_index, thought in ipairs(interaction.thought or {}) do
-      append_completed_thought(result, interaction, thought, thought_index, options)
+    for thought_index, thought in ipairs(segment.thought or {}) do
+      append_completed_thought(result, segment_interaction, thought, thought_index, options)
     end
   elseif result.expanded[summary_key] and interaction.task then
-    for thought_index, thought in ipairs(interaction.thought or {}) do
-      if not thought.task_id then append_completed_thought(result, interaction, thought, thought_index, options) end
+    for thought_index, thought in ipairs(segment.thought or {}) do
+      if not thought.task_id then
+        append_completed_thought(result, segment_interaction, thought, thought_index, options)
+      end
     end
-    task_tree.append_superseded(result, interaction)
+    task_tree.append_superseded(result, segment_interaction)
   end
-  if interaction.active then
-    if not task_owns_active then append_active_thought(result, interaction, interaction.active, options) end
-  elseif complete then
+  if segment.active and not task_owns_active then
+    append_active_thought(result, segment_interaction, segment.active, options)
+  end
+  if complete and not defer_response and type(segment.response) == "string" and segment.response ~= "" then
+    local response_line = #result.lines + 1
+    result.lines[response_line] = "▸ Response"
+    result.rows[response_line] = { kind = "response", interaction = interaction, node_id = segment.id }
+    result.highlights[#result.highlights + 1] = {
+      line = response_line,
+      first = 0,
+      last = -1,
+      group = "DiffReviewHarnessResponse",
+    }
+    local first_markdown = #result.lines + 1
+    append_response(result, segment.response)
+    result.markdown_ranges[#result.markdown_ranges + 1] = { first0 = first_markdown - 1, after0 = #result.lines }
+  end
+  for line = segment_first, #result.lines do
+    result.rows[line] = result.rows[line] or { kind = "segment_content", interaction = interaction }
+    result.rows[line].node_id = segment.id
+  end
+end
+
+local function append_interaction(result, interaction, options, agent_by_id)
+  if #result.lines > 0 then result.lines[#result.lines + 1] = "" end
+  if not interaction.hide_prompt and interaction.kind ~= "plan_execution" then
+    local prompt_line = #result.lines + 1
+    append_wrapped(result, interaction.prompt, "▸ ", "  ", "DiffReviewHarnessPrompt", options.content_width)
+    result.prompt_lines[#result.prompt_lines + 1] = prompt_line
+    for line = prompt_line, #result.lines do
+      result.rows[line] = {
+        kind = "prompt",
+        interaction = interaction,
+        node_id = (interaction.id or tostring(interaction.ordinal)) .. ":prompt",
+      }
+    end
+  end
+  local complete = interaction.state == "complete" or interaction.state == "failed"
+    or interaction.state == "cancelled" or interaction.state == "rolled_back"
+    or interaction.state == "superseded"
+  local deferred_response = nil
+  local final_response_segment_id = nil
+  if complete then
+    for node_index = #(interaction.node_list or {}), 1, -1 do
+      local node = interaction.node_list[node_index]
+      if node.kind == "main_segment" and node.segment
+        and type(node.segment.response) == "string" and node.segment.response ~= ""
+      then
+        final_response_segment_id = node.segment.id
+        break
+      end
+    end
+  end
+  for _, node in ipairs(interaction.node_list or {}) do
+    if node.kind == "main_segment" and node.segment then
+      local defer_response = complete and node.segment.id == final_response_segment_id
+      append_segment(result, interaction, node.segment, options, defer_response)
+      if defer_response then deferred_response = node.segment end
+    elseif node.kind == "steering_prompt" and node.prompt then
+      local first = #result.lines + 1
+      append_wrapped(result, node.prompt.text, "▸ ", "  ", "DiffReviewHarnessPrompt", options.content_width)
+      result.prompt_lines[#result.prompt_lines + 1] = first
+      for line = first, #result.lines do
+        result.rows[line] = {
+          kind = "steering_prompt",
+          interaction = interaction,
+          steering_input = node.prompt,
+          node_id = node.prompt.id,
+        }
+      end
+    elseif node.kind == "agent_reference" and node.agent then
+      local agent = agent_by_id and agent_by_id[node.agent.agent_run_id]
+      if agent then
+        local first = #result.lines + 1
+        agent_event.append(result, agent, options, 0, node.agent.id)
+        for line = first, #result.lines do
+          result.rows[line] = result.rows[line] or { kind = "agent_content", interaction = interaction }
+          result.rows[line].node_id = node.agent.id
+        end
+      end
+    end
+  end
+  if interaction.active_wait then
+    local elapsed = math.max(0, math.floor(((options.now_ms or 0) - (interaction.active_wait.started_at_ms or 0)) / 1000))
+    local count = interaction.active_wait.agent_count or 0
+    local noun = count == 1 and "subagent" or "subagents"
+    local line = #result.lines + 1
+    result.lines[line] = ("▸ Waiting on %d %s for %ds"):format(count, noun, elapsed)
+    result.rows[line] = { kind = "agent_wait", interaction = interaction, node_id = interaction.id .. ":wait" }
+  end
+  if complete then
     local aggregate = diff_tree.build(interaction.diff_text, {
       indent = 2,
       key_prefix = ("interaction:%s:aggregate"):format(interaction.id or interaction.ordinal),
@@ -349,11 +454,19 @@ local function append_interaction(result, interaction, options)
       local aggregate_key = ("interaction:%s:aggregate"):format(interaction.id or interaction.ordinal)
       result.rows[changed_line].expand_key = aggregate_key
       if result.expanded[aggregate_key] then append_prebuilt_diff(result, aggregate) end
+      for line = changed_line, #result.lines do
+        result.rows[line] = result.rows[line] or { kind = "changes", interaction = interaction }
+        result.rows[line].node_id = aggregate_key
+      end
     end
-    if type(interaction.response) == "string" and interaction.response ~= "" then
+    if deferred_response then
       local response_line = #result.lines + 1
       result.lines[response_line] = "▸ Response"
-      result.rows[response_line] = { kind = "response", interaction = interaction }
+      result.rows[response_line] = {
+        kind = "response",
+        interaction = interaction,
+        node_id = deferred_response.id .. ":response",
+      }
       result.highlights[#result.highlights + 1] = {
         line = response_line,
         first = 0,
@@ -361,8 +474,18 @@ local function append_interaction(result, interaction, options)
         group = "DiffReviewHarnessResponse",
       }
       local first_markdown = #result.lines + 1
-      append_response(result, interaction.response)
-      result.markdown_ranges[#result.markdown_ranges + 1] = { first0 = first_markdown - 1, after0 = #result.lines }
+      append_response(result, deferred_response.response)
+      for line = first_markdown, #result.lines do
+        result.rows[line] = {
+          kind = "response_body",
+          interaction = interaction,
+          node_id = deferred_response.id .. ":response",
+        }
+      end
+      result.markdown_ranges[#result.markdown_ranges + 1] = {
+        first0 = first_markdown - 1,
+        after0 = #result.lines,
+      }
     end
   end
 end
@@ -374,20 +497,15 @@ local function aggregate_execution(entry)
     hide_prompt = true,
     kind = "plan_execution",
     state = entry.execution and entry.execution.state == "active" and "running" or "complete",
-    thought = {},
-    duration_ms = 0,
-    token_count = 0,
+    node_list = {},
   }
   for _, interaction in ipairs(entry.interaction or {}) do
-    for _, thought in ipairs(interaction.thought or {}) do aggregate.thought[#aggregate.thought + 1] = thought end
-    aggregate.duration_ms = aggregate.duration_ms + (interaction.duration_ms or 0)
-    aggregate.token_count = math.max(aggregate.token_count or 0, interaction.token_count or 0)
-    aggregate.active = interaction.active or aggregate.active
+    for _, node in ipairs(interaction.node_list or {}) do
+      aggregate.node_list[#aggregate.node_list + 1] = node
+    end
     aggregate.task = interaction.task or aggregate.task
     aggregate.diff_text = interaction.diff_text or aggregate.diff_text
-    aggregate.response = interaction.response or aggregate.response
   end
-  if aggregate.token_count == 0 then aggregate.token_count = nil end
   return aggregate
 end
 
@@ -411,16 +529,36 @@ function M.build(interactions, options)
   }
   for _, entry in ipairs(interactions or {}) do
     if entry.kind == "interaction" and entry.interaction then
-      append_interaction(result, entry.interaction, options)
+      append_interaction(result, entry.interaction, options, entry.agent_by_id)
     elseif entry.kind == "plan_lifecycle" then
       plan_event.append(result, entry, { append_response = append_response })
     elseif entry.kind == "plan_execution" then
       append_interaction(result, aggregate_execution(entry), options)
+    elseif entry.kind == "agent_lifecycle" then
+      agent_event.append(result, entry, options, 0)
     else
       append_interaction(result, entry, options)
     end
   end
   if #result.lines == 0 then result.lines = { "" } end
+  local next_node_id = nil
+  local node_id_by_line = {}
+  for line = #result.lines, 1, -1 do
+    local row = result.rows[line]
+    if row and row.node_id then next_node_id = row.node_id end
+    node_id_by_line[line] = next_node_id or ("tail:%d"):format(line)
+  end
+  result.blocks = {}
+  local block = nil
+  for line = 1, #result.lines do
+    local node_id = node_id_by_line[line]
+    if not block or block.id ~= node_id then
+      block = { id = node_id, first = line, last = line, lines = {} }
+      result.blocks[#result.blocks + 1] = block
+    end
+    block.last = line
+    block.lines[#block.lines + 1] = result.lines[line]
+  end
   return result
 end
 

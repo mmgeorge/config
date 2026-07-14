@@ -1,8 +1,6 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-pub mod watch;
-
 /// Represents whether a workspace can provide tracked interaction checkpoints.
 #[derive(Clone, Debug)]
 pub enum WorkspaceKind {

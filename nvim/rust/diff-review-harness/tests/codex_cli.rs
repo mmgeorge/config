@@ -1,6 +1,11 @@
+use diff_review_harness::agent::AgentRunStatus;
 use diff_review_harness::backend::codex::CodexBackend;
-use diff_review_harness::backend::{Backend, BackendRequest, PromptMode, TrustPolicy};
+use diff_review_harness::backend::{
+    Backend, BackendLaunch, BackendRequest, PromptMode, ToolActivityKind, TrustPolicy,
+};
+use diff_review_harness::broker::{HarnessBroker, InitializeRequest};
 use diff_review_harness::plan::PlanPrompt;
+use diff_review_harness::protocol::BrokerRequest;
 use diff_review_harness::session::WriteMode;
 use std::fs;
 use std::path::Path;
@@ -20,7 +25,7 @@ fn request(workspace: &Path, mode: PromptMode, text: &str) -> BackendRequest {
         workspace: workspace.to_string_lossy().into_owned(),
         text: text.into(),
         mode,
-        model: "gpt-5.4-mini".into(),
+        model: "gpt-5.6-terra".into(),
         effort: "low".into(),
         fast_mode: true,
         write_mode: if mode == PromptMode::Plan {
@@ -117,8 +122,8 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
         .unwrap();
     let model = model_list
         .iter()
-        .find(|model| model.id == "gpt-5.4-mini")
-        .expect("gpt-5.4-mini is required for the fast Harness integration test");
+        .find(|model| model.id == "gpt-5.6-terra")
+        .expect("gpt-5.6-terra is required for the fast Harness integration test");
     assert!(model.effort.iter().any(|effort| effort == "low"));
 
     let planning = backend.prompt(request(
@@ -169,7 +174,22 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
         .prompt_stream(execute.clone(), Some(event_sink))
         .await
         .unwrap();
-    assert!(event_stream.try_recv().is_ok());
+    let streamed_event_list: Vec<_> = std::iter::from_fn(|| event_stream.try_recv().ok()).collect();
+    assert!(!streamed_event_list.is_empty());
+    assert!(
+        streamed_event_list.iter().any(|event| {
+            event.kind == "tool"
+                && event.activity.as_ref().is_some_and(|tool| {
+                    tool.kind == ToolActivityKind::FileChange
+                        && tool.status.as_deref() == Some("completed")
+                        && tool.change.file.iter().any(|change| {
+                            change.path.replace('\\', "/") == "harness-integration.txt"
+                                && !change.diff.trim().is_empty()
+                        })
+                })
+        }),
+        "Codex did not stream a completed structured file change: {streamed_event_list:#?}"
+    );
     assert_eq!(
         fs::read_to_string(repository.path().join("harness-integration.txt")).unwrap(),
         "verified\n"
@@ -191,4 +211,186 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
         .unwrap();
     let forked = backend.fork(execute).await.unwrap();
     assert!(!forked.trim().is_empty());
+}
+
+#[tokio::test]
+#[ignore = "requires an installed and authenticated Codex CLI with subagents enabled"]
+async fn streams_structured_child_agent_lifecycle() {
+    let repository = tempfile::tempdir().unwrap();
+    git(repository.path(), &["init", "-q"]);
+    fs::write(repository.path().join("README.md"), "# Child lifecycle\n").unwrap();
+    let backend =
+        CodexBackend::new(vec!["codex".into(), "app-server".into(), "--stdio".into()]).unwrap();
+    let mut backend_request = request(
+        repository.path(),
+        PromptMode::Chat,
+        "Spawn an explorer subagent to read README.md and report its heading. Wait for it to finish.",
+    );
+    backend_request.write_mode = WriteMode::Read;
+    let output = tokio::time::timeout(Duration::from_secs(90), backend.prompt(backend_request))
+        .await
+        .expect("Codex subagent turn exceeded 90 seconds")
+        .unwrap();
+    assert!(
+        output
+            .event
+            .iter()
+            .any(|event| event.kind == "agent_lifecycle"),
+        "Codex did not emit a structured child lifecycle event: {:#?}",
+        output.event
+    );
+    let lifecycle_list = output
+        .event
+        .iter()
+        .filter(|event| event.kind == "agent_lifecycle")
+        .map(|event| {
+            serde_json::from_value::<diff_review_harness::agent::AgentLifecycleEvent>(
+                event.data.clone(),
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let child_thread_list = lifecycle_list
+        .iter()
+        .filter_map(|lifecycle| lifecycle.provider_thread_id.as_deref())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        child_thread_list.len(),
+        1,
+        "one requested child must not manufacture extra provider identities: {lifecycle_list:#?}"
+    );
+    let child_thread_id = child_thread_list.into_iter().next().unwrap();
+    let child_completion_index = output
+        .event
+        .iter()
+        .position(|event| {
+            event.kind == "turn_completed"
+                && event
+                    .data
+                    .pointer("/params/threadId")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(child_thread_id)
+        })
+        .expect("the explorer must emit a terminal turn event for its provider identity");
+    let parent_thread_id = output
+        .backend_session_id
+        .as_deref()
+        .expect("the parent turn must preserve its provider thread identity");
+    let parent_response_index = output
+        .event
+        .iter()
+        .enumerate()
+        .skip(child_completion_index + 1)
+        .find_map(|(index, event)| {
+            (event.kind == "assistant_message"
+                && event
+                    .data
+                    .pointer("/params/threadId")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(parent_thread_id)
+                && event
+                    .text
+                    .as_deref()
+                    .is_some_and(|text| text.contains("Child lifecycle")))
+            .then_some(index)
+        })
+        .expect("the parent must synthesize the child result after the child completes");
+    let parent_completion_index = output
+        .event
+        .iter()
+        .enumerate()
+        .skip(parent_response_index + 1)
+        .find_map(|(index, event)| {
+            (event.kind == "turn_completed"
+                && event
+                    .data
+                    .pointer("/params/threadId")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(parent_thread_id))
+            .then_some(index)
+        })
+        .expect("the parent turn must complete after reporting the child result");
+    assert!(
+        child_completion_index < parent_response_index
+            && parent_response_index < parent_completion_index,
+        "the explorer must emit a terminal turn event for its provider identity: {:#?}",
+        output.event
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires an installed Codex CLI and the configured local-code-explorer definition"]
+async fn broker_runs_the_configured_local_code_explorer_to_parent_completion() {
+    let repository = tempfile::tempdir().unwrap();
+    let data_root = tempfile::tempdir().unwrap();
+    git(repository.path(), &["init", "-q"]);
+    fs::write(
+        repository.path().join("README.md"),
+        "# Broker child lifecycle\n",
+    )
+    .unwrap();
+    let mut broker = HarnessBroker::initialize(InitializeRequest {
+        data_root: data_root.path().to_string_lossy().into_owned(),
+        workspace: repository.path().to_string_lossy().into_owned(),
+        client_id: "real-local-code-explorer-test".into(),
+        backend: BackendLaunch {
+            kind: "codex".into(),
+            command: vec!["codex".into(), "app-server".into(), "--stdio".into()],
+        },
+        model: "gpt-5.6-terra".into(),
+        effort: "low".into(),
+        trust_profile: "workspace".into(),
+        trust_policy: TrustPolicy::default(),
+        session_id: None,
+        goal_max_turns: 20,
+        lease_conflict_action: None,
+    })
+    .unwrap();
+    let dispatch = tokio::time::timeout(
+        Duration::from_secs(90),
+        broker.dispatch(BrokerRequest {
+            id: 1,
+            method: "agent.start".into(),
+            params: serde_json::json!({
+                "definition": "local-code-explorer",
+                "task": "Read README.md and report its heading to the parent."
+            }),
+        }),
+    )
+    .await
+    .expect("the broker child-agent flow exceeded 90 seconds");
+    assert!(
+        dispatch.response.error.is_none(),
+        "the real /agent flow failed: {:#?}",
+        dispatch.response.error
+    );
+    let snapshot = broker.snapshot().unwrap();
+    assert_eq!(
+        snapshot.agent.run.len(),
+        1,
+        "one request must create one durable child run"
+    );
+    let run = &snapshot.agent.run[0];
+    assert_eq!(run.definition, "local-code-explorer");
+    assert_eq!(run.status, AgentRunStatus::Completed);
+    assert!(run.parent_interaction_id.is_some());
+    assert!(run.provider_thread_id.is_some());
+    assert_eq!(
+        snapshot.agent.turn.len(),
+        1,
+        "the child timeline must persist under its run"
+    );
+    let parent = snapshot
+        .interaction
+        .iter()
+        .find(|interaction| Some(&interaction.id) == run.parent_interaction_id.as_ref())
+        .expect("the child run must reference its spawning parent interaction");
+    assert!(parent.node_list.iter().any(|node| match node {
+        diff_review_harness::interaction::InteractionNode::MainSegment { segment } =>
+            segment.response.as_deref().is_some_and(|response| {
+                response.contains("Broker child lifecycle")
+                    || response.contains("# Broker child lifecycle")
+            }),
+        _ => false,
+    }));
 }

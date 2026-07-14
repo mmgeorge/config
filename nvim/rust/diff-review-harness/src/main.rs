@@ -155,7 +155,7 @@ async fn run_broker() -> Result<()> {
                     let response = match steer_result {
                         Ok(()) => BrokerResponse::success(
                             request_id,
-                            serde_json::json!({ "steered": true }),
+                            serde_json::json!({ "steered": true, "cancel_requested": true }),
                         )?,
                         Err(error) => BrokerResponse::failure(
                             request_id,
@@ -169,6 +169,20 @@ async fn run_broker() -> Result<()> {
                     match line? {
                         Some(line) => match serde_json::from_str::<BrokerRequest>(&line) {
                             Ok(cancel_request) if cancel_request.method == "turn.cancel" => {
+                                let target = cancel_request
+                                    .params
+                                    .get("target")
+                                    .and_then(parse_steer_target);
+                                if let Some(target) = target {
+                                    pending_steer_count += 1;
+                                    let backend = Arc::clone(&backend);
+                                    let steer_result_sink = steer_result_sink.clone();
+                                    tokio::spawn(async move {
+                                        let result = backend.interrupt_target(target).await;
+                                        let _ = steer_result_sink.send((cancel_request.id, result));
+                                    });
+                                    continue;
+                                }
                                 let restore_prompt = cancel_request
                                     .params
                                     .get("restore_prompt_if_no_output")
@@ -195,8 +209,15 @@ async fn run_broker() -> Result<()> {
                                     pending_steer_count += 1;
                                     let backend = Arc::clone(&backend);
                                     let steer_result_sink = steer_result_sink.clone();
+                                    let target = steer_request
+                                        .params
+                                        .get("target")
+                                        .and_then(parse_steer_target);
                                     tokio::spawn(async move {
-                                        let result = backend.steer(text).await;
+                                        let result = match target {
+                                            Some(target) => backend.steer_target(text, target).await,
+                                            None => backend.steer(text).await,
+                                        };
                                         let _ = steer_result_sink.send((steer_request.id, result));
                                     });
                                 } else {
@@ -235,6 +256,15 @@ async fn run_broker() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn parse_steer_target(
+    value: &serde_json::Value,
+) -> Option<diff_review_harness::backend::SteerTarget> {
+    Some(diff_review_harness::backend::SteerTarget {
+        thread_id: value.get("thread_id")?.as_str()?.to_owned(),
+        turn_id: value.get("turn_id")?.as_str()?.to_owned(),
+    })
 }
 
 async fn write_invalid_request(
