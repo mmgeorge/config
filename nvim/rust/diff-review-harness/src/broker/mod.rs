@@ -3502,13 +3502,10 @@ fn acquire_lease(session: &mut HarnessSession, client_id: &str, now_ms: i64) -> 
 }
 
 /// Load durable child runs while removing placeholders created by legacy lifecycle parsing.
-fn load_agent_registry(store: &mut SqliteStore, session_id: &str) -> Result<AgentRegistry> {
-    let mut run_list = store.list_agent_run(session_id)?;
-    for run in run_list.iter().filter(|run| run.is_orphaned_placeholder()) {
-        store.delete_agent_run(&run.id)?;
-    }
-    run_list.retain(|run| !run.is_orphaned_placeholder());
-    Ok(AgentRegistry::from_run_list(run_list))
+fn load_agent_registry(store: &SqliteStore, session_id: &str) -> Result<AgentRegistry> {
+    Ok(AgentRegistry::from_run_list(
+        store.list_agent_run(session_id)?,
+    ))
 }
 
 fn required_text(value: &Value, field: &str) -> Result<String> {
@@ -4156,49 +4153,6 @@ mod test {
         assert!(routed);
         assert_eq!(completed.status, AgentRunStatus::Completed);
         assert!(completed.status.accepts_prompt());
-    }
-
-    #[test]
-    fn initialization_removes_legacy_unbound_agent_placeholders() {
-        let repository = repository();
-        let data = tempfile::tempdir().unwrap();
-        let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        let session_id = broker.session.id.clone();
-        let mut orphan = AgentRun::pending(&session_id, "default", "", 100);
-        orphan.status = AgentRunStatus::Completed;
-        broker.store.save_agent_run(&orphan).unwrap();
-        broker.release_lease().unwrap();
-        drop(broker);
-
-        let restarted = HarnessBroker::initialize_with_clock(
-            InitializeRequest {
-                data_root: data.path().to_string_lossy().into_owned(),
-                workspace: repository.path().to_string_lossy().into_owned(),
-                client_id: "restart-client".into(),
-                backend: BackendLaunch {
-                    kind: "mock".into(),
-                    command: vec!["mock".into()],
-                },
-                model: "mock-model".into(),
-                effort: "low".into(),
-                trust_profile: "workspace".into(),
-                session_id: Some(session_id),
-                goal_max_turns: 20,
-                trust_policy: TrustPolicy::default(),
-                lease_conflict_action: None,
-            },
-            Box::new(FixedClock(200)),
-        )
-        .unwrap();
-
-        assert!(restarted.agent_registry.list().is_empty());
-        assert!(
-            restarted
-                .store
-                .list_agent_run(&restarted.session.id)
-                .unwrap()
-                .is_empty()
-        );
     }
 
     #[tokio::test]

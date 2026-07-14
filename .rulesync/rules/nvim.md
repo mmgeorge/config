@@ -21,6 +21,14 @@ Do not silently convert request failures into empty lists, no-op refreshes, or s
 
 More generally, make Neovim error handling loud and obvious. When plugin code catches or recovers from an error, favor a user-visible notification over a silent return, hidden log-only message, or speculative fallback unless the error is truly expected and harmless.
 
+## Personal Infrastructure Compatibility
+
+Treat this Neovim configuration and its local sidecars as personal infrastructure that may break stored internal state between revisions. Do not add data migrations, compatibility shims, legacy decoders, or fallback code for old private formats unless explicitly requested.
+
+Version durable session payloads with one exact current format. Hide sessions written by any other version instead of upgrading, deleting, or partially decoding them. Preserve independent user preferences only when their current schema still decodes directly.
+
+Prefer deleting obsolete compatibility code when a format changes. Tests should prove that current data reopens and outdated data stays invisible, not that historical formats migrate successfully.
+
 ## GitHub Data And Issue Cache
 
 All Neovim GitHub state that should survive restarts belongs under the `gitstatus` namespace in Neovim's data dir. `github.repo_cache.base_dir()` defaults to `vim.fs.joinpath(vim.fn.stdpath("data"), "gitstatus")`.

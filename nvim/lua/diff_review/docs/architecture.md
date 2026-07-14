@@ -994,10 +994,9 @@ Active thoughts never expose expansion keys. Completed nodes stay immutable, so 
 command or diff never changes while the user reads it.
 Elapsed work appears only in the mutable `Thinking for Ns` header and never enters SQLite.
 
-Schema version 6 performs one explicit migration from categorical thought, steering, response, and
-agent records into ordered interaction nodes. Runtime code reads only the node model. The migration
-uses recorded timestamps and stable IDs to preserve the best available historical order without
-carrying compatibility branches into the renderer.
+Each stored session uses one versioned envelope. Session loading and listing accept only the exact
+current format, leaving older rows invisible without migration or partial decoding. Runtime code
+therefore reads only the current ordered interaction model.
 
 GitStatus, PR review, the Harness tree, and `:Interactions` route file headers and hunk bodies
 through `diff_component.lua`. It owns the call into `diff_render.build_fancy_diff_rows` plus the
@@ -1026,19 +1025,19 @@ history. It clears rollback checkpoints and active execution state that belong t
 takes or releases the source lease.
 Broker initialization selects the most recently updated session for the resolved repository
 and configured backend, then restores its interaction timeline, plan, goal, model controls,
-and provider session identity. Schema version 2 removes legacy raw transcript events while
-preserving model, effort, and fast-mode preferences. `:Harness` therefore resumes repository-local work across Neovim restarts,
+and provider session identity. Independent model, effort, and fast-mode preferences remain available
+when older sessions become invisible. `:Harness` therefore resumes current repository-local work across Neovim restarts,
 while `/clear` remains the explicit boundary for creating a new session. Every restored session
 returns to Read mode before another turn can run.
 
-Schema version 3 adds plan lifecycle and execution records without deleting version-2 sessions.
-Plans remain physical Markdown under `plans/<session>/<plan>/working.md`, with immutable model
+Plan lifecycle and execution records accompany current sessions. Plans remain physical Markdown
+under `plans/<session>/<plan>/working.md`, with immutable model
 and user revisions beside them. The snapshot exposes every plan as an artifact plus the active
 saved path. The model receives that path as context for later plan questions, while unsaved
 PlanReview edits remain editor-local until review submission.
 
-Schema version 4 adds a repository-independent prompt history ordered newest first and pruned
-transactionally to 100 entries. Every broker snapshot carries that shared list, while
+Repository-independent prompt history stays ordered newest first and pruned transactionally to
+100 entries. Every broker snapshot carries that shared list, while
 `prompt_history.lua` owns only the active composer index and draft. Up begins recall only from
 an empty composer, repeated Up walks backward, and Down returns toward the draft. Transcript
 prompt jumps remain separate commands, so input recall cannot move the review cursor.
@@ -1176,7 +1175,6 @@ thread, and turn. It refuses ambiguous sibling matches. Parent thread ownership 
 after binding, so later wait events cannot reparent a child or create a cycle. The Codex backend
 also waits for the original parent thread and turn to complete. A child `turn/completed` closes only
 the child timeline and never terminates the parent request.
-Every broker session load deletes legacy unbound placeholders created by the earlier conflated model.
 
 `/agent` opens a centered selector with Main, Active, Done, and Available sections.
 `/agent <definition> <task>` asks the parent Codex thread to spawn the selected definition because
@@ -1243,7 +1241,7 @@ and fork capability gating through a deterministic JSONL process mock.
 
 The Rust suite runs with `cargo test --manifest-path
 nvim/rust/diff-review-harness/Cargo.toml`. It isolates plan revisions, goal guards,
-SQLite session filters and migration, leases, ordered provider file-change attribution,
+SQLite current-version session filters, leases, ordered provider file-change attribution,
 Gitignored interaction boundaries, divergence refusal, unborn Git worktrees,
 failed-provider goal pausing with final checkpoints, ACP plan normalization,
 exact control tools, backend/session compatibility, output-free cancellation retraction,

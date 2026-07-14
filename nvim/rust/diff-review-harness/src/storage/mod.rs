@@ -6,12 +6,20 @@ use crate::plan::{PlanExecutionRecord, PlanLifecycleRecord, PlanRecord};
 use crate::session::{HarnessPreference, HarnessSession, SessionStore};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
-use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde_json::json;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+const SESSION_FORMAT_VERSION: u32 = 1;
+
+/// Stores one session with the exact durable format that produced it.
+#[derive(Deserialize, Serialize)]
+struct SessionEnvelope {
+    format_version: u32,
+    session: HarnessSession,
+}
 
 /// Owns SQLite metadata and content-addressed objects for the Harness broker.
 pub struct SqliteStore {
@@ -20,7 +28,7 @@ pub struct SqliteStore {
 }
 
 impl SqliteStore {
-    /// Open durable storage and apply idempotent schema migrations.
+    /// Open durable storage for the current Harness format.
     pub fn open(data_root: &Path) -> Result<Self> {
         fs::create_dir_all(data_root)
             .with_context(|| format!("create Harness data directory {}", data_root.display()))?;
@@ -28,7 +36,7 @@ impl SqliteStore {
         fs::create_dir_all(&object_root).with_context(|| {
             format!("create Harness object directory {}", object_root.display())
         })?;
-        let mut connection = Connection::open(data_root.join("harness.sqlite3"))?;
+        let connection = Connection::open(data_root.join("harness.sqlite3"))?;
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
@@ -42,23 +50,6 @@ impl SqliteStore {
             );
             "#,
         )?;
-        let schema_version: u32 =
-            connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if schema_version < 2 {
-            connection.execute_batch(
-                r#"
-                PRAGMA foreign_keys=OFF;
-                DROP TABLE IF EXISTS transcript_event;
-                DROP TABLE IF EXISTS interaction_comment;
-                DROP TABLE IF EXISTS checkpoint_record;
-                DROP TABLE IF EXISTS goal_record;
-                DROP TABLE IF EXISTS plan_record;
-                DROP TABLE IF EXISTS interaction_record;
-                DROP TABLE IF EXISTS session_record;
-                PRAGMA foreign_keys=ON;
-                "#,
-            )?;
-        }
         connection.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS session_record (
@@ -138,9 +129,6 @@ impl SqliteStore {
                 ON agent_turn_record(agent_run_id, ordinal);
             "#,
         )?;
-        if schema_version < 6 {
-            migrate_interaction_timeline_v6(&mut connection)?;
-        }
         Ok(Self {
             connection,
             object_root,
@@ -191,11 +179,12 @@ impl SqliteStore {
                 |row| row.get(0),
             )
             .with_context(|| format!("load Harness session lease {session_id}"))?;
-        let mut session: HarnessSession = decode(&payload)?;
+        let mut session = decode_current_session(&payload)?
+            .with_context(|| format!("Harness session {session_id} uses an outdated format"))?;
         session.acquire_lease(client_id, now_ms)?;
         transaction.execute(
             "UPDATE session_record SET payload=?2 WHERE id=?1",
-            params![session_id, encode(&session)?],
+            params![session_id, encode_session(&session)?],
         )?;
         transaction.commit()?;
         Ok(session)
@@ -214,14 +203,15 @@ impl SqliteStore {
             )
             .optional()?;
         if let Some(payload) = payload {
-            let mut session: HarnessSession = decode(&payload)?;
-            if session.lease_owner.as_deref() == Some(client_id) {
-                session.lease_owner = None;
-                session.lease_expires_at_ms = None;
-                transaction.execute(
-                    "UPDATE session_record SET payload=?2 WHERE id=?1",
-                    params![session_id, encode(&session)?],
-                )?;
+            if let Some(mut session) = decode_current_session(&payload)? {
+                if session.lease_owner.as_deref() == Some(client_id) {
+                    session.lease_owner = None;
+                    session.lease_expires_at_ms = None;
+                    transaction.execute(
+                        "UPDATE session_record SET payload=?2 WHERE id=?1",
+                        params![session_id, encode_session(&session)?],
+                    )?;
+                }
             }
         }
         transaction.commit()?;
@@ -243,7 +233,8 @@ impl SqliteStore {
             [session_id],
             |row| row.get(0),
         )?;
-        let mut session: HarnessSession = decode(&payload)?;
+        let mut session = decode_current_session(&payload)?
+            .with_context(|| format!("Harness session {session_id} uses an outdated format"))?;
         anyhow::ensure!(
             session.lease_owner.as_deref() == Some(client_id),
             "Harness session lease ownership changed"
@@ -251,7 +242,7 @@ impl SqliteStore {
         session.lease_expires_at_ms = Some(now_ms + 30_000);
         transaction.execute(
             "UPDATE session_record SET payload=?2 WHERE id=?1",
-            params![session_id, encode(&session)?],
+            params![session_id, encode_session(&session)?],
         )?;
         transaction.commit()?;
         Ok(())
@@ -262,16 +253,19 @@ impl SqliteStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let owner: Option<String> = transaction
+        let payload: Option<String> = transaction
             .query_row(
                 "SELECT payload FROM session_record WHERE id=?1",
                 [&session.id],
                 |row| row.get::<_, String>(0),
             )
-            .optional()?
-            .map(|payload| decode::<HarnessSession>(&payload))
-            .transpose()?
-            .and_then(|stored| stored.lease_owner);
+            .optional()?;
+        let owner = match payload {
+            Some(payload) => {
+                decode_current_session(&payload)?.and_then(|stored| stored.lease_owner)
+            }
+            None => None,
+        };
         anyhow::ensure!(
             owner.as_deref() == Some(client_id),
             "Harness session lease ownership changed"
@@ -282,7 +276,7 @@ impl SqliteStore {
                 session.id,
                 session.workspace,
                 session.updated_at_ms,
-                encode(session)?
+                encode_session(session)?
             ],
         )?;
         transaction.commit()?;
@@ -521,13 +515,6 @@ impl SqliteStore {
         )
     }
 
-    /// Delete one child-agent run and its cascading turn history.
-    pub fn delete_agent_run(&mut self, run_id: &str) -> Result<()> {
-        self.connection
-            .execute("DELETE FROM agent_run_record WHERE id=?1", [run_id])?;
-        Ok(())
-    }
-
     /// Write one child-agent turn while preserving its run-local ordinal.
     pub fn save_agent_turn(&mut self, turn: &AgentTurnRecord) -> Result<()> {
         self.connection.execute(
@@ -590,6 +577,22 @@ impl SqliteStore {
         let rows = statement.query_map(params, |row| row.get::<_, String>(0))?;
         rows.map(|row| decode(&row?)).collect()
     }
+
+    fn list_current_session<P: rusqlite::Params>(
+        &self,
+        sql: &str,
+        params: P,
+    ) -> Result<Vec<HarnessSession>> {
+        let mut statement = self.connection.prepare(sql)?;
+        let rows = statement.query_map(params, |row| row.get::<_, String>(0))?;
+        let mut session_list = Vec::new();
+        for row in rows {
+            if let Some(session) = decode_current_session(&row?)? {
+                session_list.push(session);
+            }
+        }
+        Ok(session_list)
+    }
 }
 
 impl SessionStore for SqliteStore {
@@ -597,25 +600,38 @@ impl SessionStore for SqliteStore {
         self.connection.execute(
             "INSERT INTO session_record(id, workspace, updated_at_ms, payload) VALUES(?1, ?2, ?3, ?4)\
              ON CONFLICT(id) DO UPDATE SET workspace=excluded.workspace, updated_at_ms=excluded.updated_at_ms, payload=excluded.payload",
-            params![session.id, session.workspace, session.updated_at_ms, encode(session)?],
+            params![
+                session.id,
+                session.workspace,
+                session.updated_at_ms,
+                encode_session(session)?
+            ],
         )?;
         Ok(())
     }
 
     fn load_session(&self, session_id: &str) -> Result<Option<HarnessSession>> {
-        self.load_payload(
-            "SELECT payload FROM session_record WHERE id=?1",
-            [session_id],
-        )
+        let payload: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT payload FROM session_record WHERE id=?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match payload {
+            Some(value) => decode_current_session(&value),
+            None => Ok(None),
+        }
     }
 
     fn list_session(&self, workspace: Option<&str>) -> Result<Vec<HarnessSession>> {
         match workspace {
-            Some(path) => self.list_payload(
+            Some(path) => self.list_current_session(
                 "SELECT payload FROM session_record WHERE workspace=?1 ORDER BY updated_at_ms DESC",
                 [path],
             ),
-            None => self.list_payload(
+            None => self.list_current_session(
                 "SELECT payload FROM session_record ORDER BY updated_at_ms DESC",
                 [],
             ),
@@ -637,215 +653,24 @@ fn decode<T: DeserializeOwned>(value: &str) -> Result<T> {
     serde_json::from_str(value).context("decode Harness storage payload")
 }
 
-fn migrate_interaction_timeline_v6(connection: &mut Connection) -> Result<()> {
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let mut agent_by_interaction =
-        std::collections::HashMap::<String, Vec<serde_json::Value>>::new();
-    {
-        let mut statement = transaction.prepare("SELECT payload FROM agent_run_record")?;
-        let payload_list = statement
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        for payload in payload_list {
-            let run: serde_json::Value = serde_json::from_str(&payload)?;
-            if let Some(parent_id) = run
-                .get("parent_interaction_id")
-                .and_then(serde_json::Value::as_str)
-            {
-                agent_by_interaction
-                    .entry(parent_id.to_owned())
-                    .or_default()
-                    .push(run);
-            }
-        }
-    }
-    let interaction_payload_list = {
-        let mut statement = transaction.prepare("SELECT id, payload FROM interaction_record")?;
-        statement
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-    };
-    for (interaction_id, payload) in interaction_payload_list {
-        let value: serde_json::Value = serde_json::from_str(&payload)?;
-        let migrated = migrate_interaction_value(
-            value,
-            agent_by_interaction
-                .remove(&interaction_id)
-                .unwrap_or_default(),
-        )?;
-        transaction.execute(
-            "UPDATE interaction_record SET payload=?2 WHERE id=?1",
-            params![interaction_id, serde_json::to_string(&migrated)?],
-        )?;
-    }
-    let agent_turn_payload_list = {
-        let mut statement = transaction.prepare("SELECT id, payload FROM agent_turn_record")?;
-        statement
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-    };
-    for (turn_id, payload) in agent_turn_payload_list {
-        let mut value: serde_json::Value = serde_json::from_str(&payload)?;
-        if let Some(interaction) = value.get_mut("interaction") {
-            *interaction = migrate_interaction_value(std::mem::take(interaction), Vec::new())?;
-        }
-        transaction.execute(
-            "UPDATE agent_turn_record SET payload=?2 WHERE id=?1",
-            params![turn_id, serde_json::to_string(&value)?],
-        )?;
-    }
-    transaction.pragma_update(None, "user_version", 6)?;
-    transaction.commit()?;
-    Ok(())
+fn encode_session(session: &HarnessSession) -> Result<String> {
+    encode(&SessionEnvelope {
+        format_version: SESSION_FORMAT_VERSION,
+        session: session.clone(),
+    })
 }
 
-fn migrate_interaction_value(
-    mut value: serde_json::Value,
-    agent_list: Vec<serde_json::Value>,
-) -> Result<serde_json::Value> {
-    let object = value
-        .as_object_mut()
-        .context("legacy interaction payload is not an object")?;
-    if object.contains_key("node_list") {
-        return Ok(value);
+fn decode_current_session(value: &str) -> Result<Option<HarnessSession>> {
+    let payload: serde_json::Value = decode(value)?;
+    let format_version = payload
+        .get("format_version")
+        .and_then(serde_json::Value::as_u64);
+    if format_version != Some(u64::from(SESSION_FORMAT_VERSION)) {
+        return Ok(None);
     }
-    let interaction_id = object
-        .get("id")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("interaction")
-        .to_owned();
-    let completed_at_ms = object
-        .get("completed_at_ms")
-        .and_then(serde_json::Value::as_i64)
-        .or_else(|| {
-            object
-                .get("created_at_ms")
-                .and_then(serde_json::Value::as_i64)
-        })
-        .unwrap_or_default();
-    let thought_list = object
-        .remove("thought")
-        .and_then(|thought| thought.as_array().cloned())
-        .unwrap_or_default();
-    let steering_list = object
-        .remove("steering_input")
-        .and_then(|steering| steering.as_array().cloned())
-        .unwrap_or_default();
-    let response = object
-        .remove("response")
-        .filter(|response| !response.is_null());
-    let mut event_list = Vec::<(i64, u8, String, serde_json::Value)>::new();
-    for (index, thought) in thought_list.into_iter().enumerate() {
-        let started_at_ms = thought
-            .get("started_at_ms")
-            .and_then(serde_json::Value::as_i64)
-            .unwrap_or(completed_at_ms);
-        let thought_completed_at_ms = thought
-            .get("completed_at_ms")
-            .and_then(serde_json::Value::as_i64)
-            .unwrap_or(started_at_ms);
-        let id = format!("{interaction_id}:legacy-segment:{}", index + 1);
-        event_list.push((
-            started_at_ms,
-            0,
-            id.clone(),
-            json!({
-                "kind": "main_segment",
-                "segment": {
-                    "id": id,
-                    "state": "complete",
-                    "started_at_ms": started_at_ms,
-                    "completed_at_ms": thought_completed_at_ms,
-                    "duration_ms": thought_completed_at_ms.saturating_sub(started_at_ms) as u64,
-                    "token_count": null,
-                    "spawned_agent_count": 0,
-                    "thought": [thought],
-                    "active": null,
-                    "response": null
-                }
-            }),
-        ));
-    }
-    for steering in steering_list {
-        let created_at_ms = steering
-            .get("created_at_ms")
-            .and_then(serde_json::Value::as_i64)
-            .unwrap_or(completed_at_ms);
-        let id = steering
-            .get("id")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("legacy-steering")
-            .to_owned();
-        let text = steering
-            .get("text")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        event_list.push((
-            created_at_ms,
-            1,
-            id.clone(),
-            json!({
-                "kind": "steering_prompt",
-                "prompt": { "id": id, "text": text, "created_at_ms": created_at_ms }
-            }),
-        ));
-    }
-    for agent in agent_list {
-        let created_at_ms = agent
-            .get("created_at_ms")
-            .and_then(serde_json::Value::as_i64)
-            .unwrap_or(completed_at_ms);
-        let run_id = agent
-            .get("id")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("legacy-agent")
-            .to_owned();
-        let id = format!("{interaction_id}:agent:{run_id}");
-        event_list.push((
-            created_at_ms,
-            2,
-            id.clone(),
-            json!({
-                "kind": "agent_reference",
-                "agent": { "id": id, "agent_run_id": run_id, "created_at_ms": created_at_ms }
-            }),
-        ));
-    }
-    if let Some(response) = response {
-        let id = format!("{interaction_id}:legacy-response");
-        event_list.push((
-            completed_at_ms,
-            3,
-            id.clone(),
-            json!({
-                "kind": "main_segment",
-                "segment": {
-                    "id": id,
-                    "state": "complete",
-                    "started_at_ms": completed_at_ms,
-                    "completed_at_ms": completed_at_ms,
-                    "duration_ms": 0,
-                    "token_count": null,
-                    "spawned_agent_count": 0,
-                    "thought": [],
-                    "active": null,
-                    "response": response
-                }
-            }),
-        ));
-    }
-    event_list.sort_by(|left, right| {
-        (left.0, left.1, left.2.as_str()).cmp(&(right.0, right.1, right.2.as_str()))
-    });
-    object.insert(
-        "node_list".into(),
-        serde_json::Value::Array(event_list.into_iter().map(|event| event.3).collect()),
-    );
-    Ok(value)
+    let envelope: SessionEnvelope =
+        serde_json::from_value(payload).context("decode current Harness session payload")?;
+    Ok(Some(envelope.session))
 }
 
 #[cfg(test)]
@@ -966,10 +791,6 @@ mod test {
         assert_eq!(store.list_agent_run("session").unwrap().len(), 2);
         assert_eq!(store.list_agent_turn(&first.id).unwrap().len(), 1);
         assert!(store.list_agent_turn(&second.id).unwrap().is_empty());
-
-        store.delete_agent_run(&first.id).unwrap();
-        assert_eq!(store.list_agent_run("session").unwrap().len(), 1);
-        assert!(store.list_agent_turn(&first.id).unwrap().is_empty());
     }
 
     #[test]
@@ -1009,130 +830,106 @@ mod test {
     }
 
     #[test]
-    fn timeline_migration_preserves_preferences_and_discards_legacy_sessions() {
+    fn hides_outdated_sessions_without_deleting_preferences() {
         let temporary = tempfile::tempdir().unwrap();
-        let database_path = temporary.path().join("harness.sqlite3");
-        let connection = Connection::open(&database_path).unwrap();
-        connection
-            .execute_batch(
-                r#"
-                CREATE TABLE preference_record (
-                    workspace TEXT NOT NULL,
-                    backend TEXT NOT NULL,
-                    payload TEXT NOT NULL,
-                    PRIMARY KEY(workspace, backend)
-                );
-                CREATE TABLE session_record (
-                    id TEXT PRIMARY KEY,
-                    workspace TEXT NOT NULL,
-                    updated_at_ms INTEGER NOT NULL,
-                    payload TEXT NOT NULL
-                );
-                CREATE TABLE transcript_event (
-                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                    session_id TEXT NOT NULL,
-                    payload TEXT NOT NULL
-                );
-                PRAGMA user_version=1;
-                "#,
-            )
-            .unwrap();
+        let mut store = SqliteStore::open(temporary.path()).unwrap();
         let preference = HarnessPreference {
             model: "remembered-model".into(),
             effort: "low".into(),
             fast_mode: true,
         };
-        connection
+        store
+            .save_preference("D:/work", "codex", &preference)
+            .unwrap();
+        store
+            .connection
             .execute(
-                "INSERT INTO preference_record(workspace, backend, payload) VALUES(?1, ?2, ?3)",
-                params!["D:/work", "codex", encode(&preference).unwrap()],
+                "INSERT INTO session_record(id, workspace, updated_at_ms, payload) VALUES(?1, ?2, ?3, ?4)",
+                params![
+                    "outdated",
+                    "D:/work",
+                    1,
+                    encode(&serde_json::json!({
+                        "format_version": SESSION_FORMAT_VERSION - 1,
+                        "session": session("outdated", "D:/work")
+                    }))
+                    .unwrap()
+                ],
             )
             .unwrap();
-        connection
+        store
+            .connection
             .execute(
-                "INSERT INTO session_record(id, workspace, updated_at_ms, payload) VALUES('old', 'D:/work', 1, '{}')",
-                [],
+                "INSERT INTO session_record(id, workspace, updated_at_ms, payload) VALUES(?1, ?2, ?3, ?4)",
+                params![
+                    "future",
+                    "D:/work",
+                    2,
+                    encode(&serde_json::json!({
+                        "format_version": SESSION_FORMAT_VERSION + 1,
+                        "session": session("future", "D:/work")
+                    }))
+                    .unwrap()
+                ],
             )
             .unwrap();
-        drop(connection);
+        store
+            .connection
+            .execute(
+                "INSERT INTO session_record(id, workspace, updated_at_ms, payload) VALUES(?1, ?2, ?3, ?4)",
+                params![
+                    "unversioned",
+                    "D:/work",
+                    3,
+                    encode(&session("unversioned", "D:/work")).unwrap()
+                ],
+            )
+            .unwrap();
+        store.save_session(&session("current", "D:/work")).unwrap();
 
-        let store = SqliteStore::open(temporary.path()).unwrap();
-        let restored = store.load_preference("D:/work", "codex").unwrap().unwrap();
-        assert_eq!(restored.model, "remembered-model");
-        assert_eq!(restored.effort, "low");
-        assert!(restored.fast_mode);
-        assert!(store.list_session(None).unwrap().is_empty());
-        let legacy_table: Option<String> = store
+        assert!(store.load_session("outdated").unwrap().is_none());
+        assert!(store.load_session("future").unwrap().is_none());
+        assert!(store.load_session("unversioned").unwrap().is_none());
+        assert_eq!(
+            store
+                .list_session(Some("D:/work"))
+                .unwrap()
+                .into_iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>(),
+            vec!["current"]
+        );
+        assert_eq!(
+            store
+                .load_preference("D:/work", "codex")
+                .unwrap()
+                .unwrap()
+                .model,
+            "remembered-model"
+        );
+        let outdated_count: u32 = store
             .connection
             .query_row(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='transcript_event'",
+                "SELECT COUNT(*) FROM session_record WHERE id='outdated'",
                 [],
                 |row| row.get(0),
             )
-            .optional()
             .unwrap();
-        assert!(legacy_table.is_none());
+        assert_eq!(outdated_count, 1);
     }
 
     #[test]
-    fn version_two_migration_preserves_durable_sessions() {
+    fn reopens_sessions_written_by_the_current_format() {
         let temporary = tempfile::tempdir().unwrap();
         {
             let mut store = SqliteStore::open(temporary.path()).unwrap();
-            store
-                .save_session(&session("preserved", "D:/work"))
-                .unwrap();
-            store
-                .connection
-                .pragma_update(None, "user_version", 2)
-                .unwrap();
+            store.save_session(&session("current", "D:/work")).unwrap();
         }
+
         let store = SqliteStore::open(temporary.path()).unwrap();
-        assert!(store.load_session("preserved").unwrap().is_some());
-        let schema_version: u32 = store
-            .connection
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        assert_eq!(schema_version, 6);
-    }
-
-    #[test]
-    fn version_six_migration_orders_legacy_interaction_events_once() {
-        let legacy = json!({
-            "id": "interaction-one",
-            "created_at_ms": 1,
-            "completed_at_ms": 40,
-            "thought": [{
-                "id": "thought-one",
-                "started_at_ms": 10,
-                "completed_at_ms": 15,
-                "text": "Investigating",
-                "tool": [],
-                "change": null
-            }],
-            "steering_input": [{
-                "id": "steering-one",
-                "text": "Also inspect tests",
-                "created_at_ms": 30
-            }],
-            "response": "Finished"
-        });
-        let migrated = migrate_interaction_value(
-            legacy,
-            vec![json!({ "id": "agent-one", "created_at_ms": 20 })],
-        )
-        .unwrap();
-        let node_list = migrated["node_list"].as_array().unwrap();
-        assert_eq!(node_list.len(), 4);
-        assert_eq!(node_list[0]["kind"], "main_segment");
-        assert_eq!(node_list[1]["kind"], "agent_reference");
-        assert_eq!(node_list[2]["kind"], "steering_prompt");
-        assert_eq!(node_list[3]["segment"]["response"], "Finished");
-        assert!(migrated.get("thought").is_none());
-        assert!(migrated.get("steering_input").is_none());
-        assert!(migrated.get("response").is_none());
-
-        let remigrated = migrate_interaction_value(migrated.clone(), Vec::new()).unwrap();
-        assert_eq!(remigrated, migrated);
+        assert_eq!(
+            store.load_session("current").unwrap().unwrap().id,
+            "current"
+        );
     }
 }

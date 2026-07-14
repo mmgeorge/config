@@ -137,12 +137,6 @@ impl AgentRun {
     pub fn label(&self) -> &str {
         self.nickname.as_deref().unwrap_or(&self.definition)
     }
-
-    /// Return whether a legacy lifecycle event created an unbound phantom run.
-    pub fn is_orphaned_placeholder(&self) -> bool {
-        self.provider_thread_id.is_none()
-            && (self.status != AgentRunStatus::Starting || self.task.trim().is_empty())
-    }
 }
 
 /// Stores one child-agent turn using the shared Harness interaction shape.
@@ -412,20 +406,6 @@ mod test {
                 .resolve_unbound(Some("parent"), None, None)
                 .is_none()
         );
-    }
-
-    #[test]
-    fn orphaned_placeholder_requires_an_unbound_pending_task() {
-        let valid = AgentRun::pending("session", "explorer", "inspect Bevy", 1);
-        assert!(!valid.is_orphaned_placeholder());
-
-        let mut orphan = AgentRun::pending("session", "default", "", 1);
-        assert!(orphan.is_orphaned_placeholder());
-        orphan.task = "inspect Bevy".into();
-        orphan.status = AgentRunStatus::Completed;
-        assert!(orphan.is_orphaned_placeholder());
-        orphan.provider_thread_id = Some("child-thread".into());
-        assert!(!orphan.is_orphaned_placeholder());
     }
 
     #[test]
