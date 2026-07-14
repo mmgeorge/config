@@ -121,11 +121,9 @@ return {
       'ribru17/blink-cmp-spell'
     },
 
-    -- Build the Rust fuzzy matcher locally instead of replacing a pre-built DLL.
+    -- Build the Rust fuzzy matcher locally instead of downloading a pre-built library.
     version = '1.*',
-    build = function()
-      require('blink.cmp').build():wait(60000)
-    end,
+    build = 'cargo build --release',
 
     init = function()
       vim.cmd([[highlight BlinkCmpMenu             guibg=#242529 guifg=White]])

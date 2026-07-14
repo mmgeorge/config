@@ -92,7 +92,7 @@ def main [
 
   mut git_arguments = ['-C' $repository_path 'worktree' 'add']
   if $new_branch != '' {
-    $git_arguments = $git_arguments | append ['-b' $new_branch]
+    $git_arguments = $git_arguments | append ['--no-track' '-b' $new_branch]
   }
   $git_arguments = $git_arguments | append [$worktree_path $resolved_start_point]
 

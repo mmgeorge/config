@@ -6,8 +6,24 @@ local M = {}
 
 local is_windows = wezterm.target_triple:find('windows') ~= nil
 
+local function resolve_module_dir(module_name)
+  local module_fragment = module_name:gsub('%.', '/')
+  for template in package.path:gmatch('[^;]+') do
+    local candidate = template:gsub('%?', module_fragment)
+    local file = io.open(candidate, 'r')
+    if file then
+      file:close()
+      return candidate:match('^(.*)[/\\][^/\\]+$')
+    end
+  end
+
+  return wezterm.config_dir
+end
+
+local module_dir = resolve_module_dir('worktree')
+
 M.settings = {
-  creation_runner_path = wezterm.config_dir .. '/../scripts/create-worktree.nu',
+  creation_runner_path = module_dir .. '/../scripts/create-worktree.nu',
   debug = false,
   debug_log_path = wezterm.home_dir .. '/wezterm-worktree-debug.log',
   roots = {
