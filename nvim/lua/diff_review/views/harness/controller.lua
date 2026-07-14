@@ -77,6 +77,24 @@ local function set_composer_text(buf, text)
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.split(text, "\n", { plain = true }))
 end
 
+local function restore_retracted_prompt(text)
+  local state = harness_state()
+  if composer_text(state.composer_buf) ~= "" then
+    table.insert(state.queue, 1, text)
+    notifications.warn("The retracted prompt was queued because the composer already contains a newer draft", "Harness")
+    render_queue()
+    return
+  end
+  set_composer_text(state.composer_buf, text)
+  layout.resize_composer(state.composer_buf, state.composer_win)
+  vim.schedule(function()
+    if state.composer_win and vim.api.nvim_win_is_valid(state.composer_win) then
+      vim.api.nvim_set_current_win(state.composer_win)
+      vim.cmd("startinsert!")
+    end
+  end)
+end
+
 ---@return { text: string, group: string }[]
 local function status_text()
   local state = harness_state()
@@ -304,6 +322,9 @@ local function on_event(event, payload)
     elseif payload.kind == "timeline_task_updated" then
       interaction_state.apply_task(state, payload.data or payload)
       schedule_render()
+    elseif payload.kind == "timeline_interaction_retracted" then
+      interaction_state.retract(state, payload.data or payload)
+      M.render()
     elseif payload.kind == "timeline_interaction_started" or payload.kind == "timeline_interaction_cancelled" then
       interaction_state.complete_interaction(state, payload.data or payload)
       schedule_render()
@@ -469,6 +490,12 @@ begin_request = function(text)
     set_busy(false)
     state.cancel_requested = false
     if request_error then
+      if error_detail and error_detail.code == "turn_retracted" then
+        local prompt = error_detail.data and error_detail.data.prompt or text
+        restore_retracted_prompt(prompt)
+        synchronize_state()
+        return
+      end
       if error_detail and error_detail.code == "turn_cancelled" then
         synchronize_state()
         vim.schedule(M.drain)
@@ -497,7 +524,11 @@ function M.cancel_turn()
   if state.cancel_requested then return end
   state.cancel_requested = true
   M.refresh_winbar()
-  client.request("turn.cancel", {}, function(result, request_error)
+  local restore_prompt = state.capability.native_turn_rollback == true
+    and #(state.queue or {}) == 0
+    and #(state.pending_steer or {}) == 0
+    and composer_text(state.composer_buf) == ""
+  client.request("turn.cancel", { restore_prompt_if_no_output = restore_prompt }, function(result, request_error)
     if request_error then
       state.cancel_requested = false
       notifications.error(request_error, "Harness cancel")

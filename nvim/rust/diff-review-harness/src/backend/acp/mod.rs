@@ -85,6 +85,7 @@ impl AcpBackend {
                 || encoded.contains("fork_session"),
             native_compact: false,
             native_steer: false,
+            native_turn_rollback: false,
             native_goal: false,
             model_selection: false,
             effort_selection: false,

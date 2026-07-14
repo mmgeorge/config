@@ -126,7 +126,7 @@ async fn run_broker() -> Result<()> {
             continue;
         }
         let shutdown = request.method == "shutdown";
-        cancellation.arm();
+        cancellation.arm(request.method == "prompt.submit");
         let (event_sink, mut event_stream) = tokio::sync::mpsc::unbounded_channel();
         let backend = broker.backend_handle();
         let (steer_result_sink, mut steer_result_stream) = tokio::sync::mpsc::unbounded_channel();
@@ -169,7 +169,12 @@ async fn run_broker() -> Result<()> {
                     match line? {
                         Some(line) => match serde_json::from_str::<BrokerRequest>(&line) {
                             Ok(cancel_request) if cancel_request.method == "turn.cancel" => {
-                                cancellation.request();
+                                let restore_prompt = cancel_request
+                                    .params
+                                    .get("restore_prompt_if_no_output")
+                                    .and_then(serde_json::Value::as_bool)
+                                    .unwrap_or(false);
+                                cancellation.request(restore_prompt);
                                 write_message(
                                     &mut output,
                                     &BrokerMessage::Response(BrokerResponse::success(

@@ -20,6 +20,7 @@ pub struct BackendCapability {
     pub native_fork: bool,
     pub native_compact: bool,
     pub native_steer: bool,
+    pub native_turn_rollback: bool,
     pub native_goal: bool,
     pub model_selection: bool,
     pub effort_selection: bool,
@@ -253,6 +254,11 @@ pub trait Backend: Send + Sync {
     async fn cancel(&self) -> Result<()> {
         Ok(())
     }
+
+    /// Roll back a cancelled turn after the broker proves it produced no visible output or changes.
+    async fn rollback_cancelled_turn(&self) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 /// Build a backend strategy from an explicit launch descriptor.
@@ -262,10 +268,20 @@ pub fn build(launch: BackendLaunch) -> Result<Box<dyn Backend>> {
         "codex" => Ok(Box::new(codex::CodexBackend::new(launch.command)?)),
         "mock" => Ok(Box::new(MockBackend {
             delay: match launch.command.first().map(String::as_str) {
-                Some("blocking") => Some(Duration::from_secs(60)),
+                Some("blocking" | "visible-blocking" | "writing-blocking") => {
+                    Some(Duration::from_secs(60))
+                }
                 Some("steering") => Some(Duration::from_millis(500)),
                 _ => None,
             },
+            emit_before_delay: launch
+                .command
+                .first()
+                .is_some_and(|value| value == "visible-blocking"),
+            write_before_delay: launch
+                .command
+                .first()
+                .is_some_and(|value| value == "writing-blocking"),
             steering: steering::SteeringLane::default(),
         })),
         kind => anyhow::bail!("unsupported Harness backend: {kind}"),
@@ -274,6 +290,8 @@ pub fn build(launch: BackendLaunch) -> Result<Box<dyn Backend>> {
 
 struct MockBackend {
     delay: Option<Duration>,
+    emit_before_delay: bool,
+    write_before_delay: bool,
     steering: steering::SteeringLane,
 }
 
@@ -286,6 +304,25 @@ impl Backend for MockBackend {
     ) -> Result<BackendOutput> {
         let mut active_steering = self.steering.activate()?;
         let mut steering_text_list = Vec::new();
+        let event = BackendEvent {
+            kind: "assistant_message".into(),
+            text: Some(format!("Mock response: {}", request.text)),
+            data: Value::Null,
+            activity: None,
+            summary: None,
+            task_update: None,
+        };
+        if self.emit_before_delay
+            && let Some(event_sink) = event_sink.as_ref()
+        {
+            let _ = event_sink.send(event.clone());
+        }
+        if self.write_before_delay {
+            std::fs::write(
+                std::path::Path::new(&request.workspace).join("mock-provider-change.txt"),
+                "changed before cancellation\n",
+            )?;
+        }
         if let Some(delay) = self.delay {
             let delay = tokio::time::sleep(delay);
             tokio::pin!(delay);
@@ -324,15 +361,9 @@ impl Backend for MockBackend {
                 )
             }
         });
-        let event = BackendEvent {
-            kind: "assistant_message".into(),
-            text: Some(format!("Mock response: {}", request.text)),
-            data: Value::Null,
-            activity: None,
-            summary: None,
-            task_update: None,
-        };
-        if let Some(event_sink) = event_sink {
+        if !self.emit_before_delay
+            && let Some(event_sink) = event_sink
+        {
             let _ = event_sink.send(event.clone());
         }
         Ok(BackendOutput {
@@ -351,6 +382,7 @@ impl Backend for MockBackend {
                 native_fork: true,
                 native_compact: true,
                 native_steer: true,
+                native_turn_rollback: true,
                 native_goal: true,
                 model_selection: true,
                 effort_selection: true,
@@ -378,6 +410,10 @@ impl Backend for MockBackend {
         self.steering.steer(text).await
     }
 
+    async fn rollback_cancelled_turn(&self) -> Result<bool> {
+        Ok(true)
+    }
+
     async fn compact(&self, request: BackendRequest) -> Result<BackendOutput> {
         Ok(BackendOutput {
             backend_session_id: request.backend_session_id,
@@ -385,6 +421,7 @@ impl Backend for MockBackend {
                 native_fork: true,
                 native_compact: true,
                 native_steer: true,
+                native_turn_rollback: true,
                 native_goal: true,
                 model_selection: true,
                 effort_selection: true,
@@ -423,6 +460,8 @@ mod test {
     async fn applies_steering_to_the_same_planning_turn() {
         let backend = Arc::new(MockBackend {
             delay: Some(Duration::from_millis(50)),
+            emit_before_delay: false,
+            write_before_delay: false,
             steering: steering::SteeringLane::default(),
         });
         let prompt_backend = Arc::clone(&backend);

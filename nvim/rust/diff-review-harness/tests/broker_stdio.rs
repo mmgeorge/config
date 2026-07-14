@@ -46,6 +46,12 @@ impl BrokerProcess {
             }
         }
     }
+
+    fn read_message(&mut self) -> Value {
+        let mut line = String::new();
+        assert_ne!(self.stdout.read_line(&mut line).unwrap(), 0);
+        serde_json::from_str(&line).unwrap()
+    }
 }
 
 impl Drop for BrokerProcess {
@@ -226,6 +232,270 @@ fn cancels_a_running_turn_through_the_out_of_band_request_lane() {
     );
     broker.request(json!({ "id": 5, "method": "shutdown", "params": {} }));
     broker.read_response(5);
+}
+
+#[test]
+fn retracts_an_output_free_planning_turn_and_restores_control_state() {
+    let repository = tempfile::tempdir().unwrap();
+    git(repository.path(), &["init", "-q"]);
+    git(
+        repository.path(),
+        &["config", "user.email", "harness@example.invalid"],
+    );
+    git(
+        repository.path(),
+        &["config", "user.name", "Harness Integration"],
+    );
+    std::fs::write(repository.path().join("README.md"), "# Harness\n").unwrap();
+    git(repository.path(), &["add", "."]);
+    git(repository.path(), &["commit", "-qm", "seed"]);
+    let data = tempfile::tempdir().unwrap();
+    let mut broker = BrokerProcess::start();
+    broker.request(json!({
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "data_root": data.path(),
+            "workspace": repository.path(),
+            "client_id": "retract-test",
+            "backend": { "kind": "mock", "command": ["blocking"] },
+            "model": "mock-model",
+            "effort": "low",
+            "trust_profile": "workspace",
+            "goal_max_turns": 20
+        }
+    }));
+    let initialized = broker.read_response(1);
+    assert_eq!(
+        initialized
+            .last()
+            .unwrap()
+            .pointer("/result/capability/native_turn_rollback")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+
+    broker.request(json!({
+        "id": 2,
+        "method": "mode.set",
+        "params": { "mode": "write" }
+    }));
+    broker.read_response(2);
+    let prompt = "/plan reconsider this\nbefore doing anything";
+    broker.request(json!({
+        "id": 3,
+        "method": "prompt.submit",
+        "params": { "text": prompt }
+    }));
+    broker.request(json!({
+        "id": 4,
+        "method": "turn.cancel",
+        "params": { "restore_prompt_if_no_output": true }
+    }));
+
+    let cancellation = broker.read_response(4);
+    assert_eq!(
+        cancellation
+            .last()
+            .unwrap()
+            .pointer("/result/cancel_requested")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    let retracted = broker.read_response(3);
+    assert_eq!(
+        retracted
+            .last()
+            .unwrap()
+            .pointer("/error/code")
+            .and_then(Value::as_str),
+        Some("turn_retracted")
+    );
+    assert_eq!(
+        retracted
+            .last()
+            .unwrap()
+            .pointer("/error/data/prompt")
+            .and_then(Value::as_str),
+        Some(prompt)
+    );
+    assert!(retracted.iter().any(|message| {
+        message.get("event").and_then(Value::as_str) == Some("backend_event")
+            && message.pointer("/payload/kind").and_then(Value::as_str)
+                == Some("timeline_interaction_retracted")
+    }));
+
+    broker.request(json!({ "id": 5, "method": "state.get", "params": {} }));
+    let snapshot = broker.read_response(5);
+    assert_eq!(
+        snapshot
+            .last()
+            .unwrap()
+            .pointer("/result/interaction")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0)
+    );
+    assert_eq!(
+        snapshot
+            .last()
+            .unwrap()
+            .pointer("/result/session/write_mode")
+            .and_then(Value::as_str),
+        Some("write")
+    );
+    assert_eq!(
+        snapshot
+            .last()
+            .unwrap()
+            .pointer("/result/artifact")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0)
+    );
+    broker.request(json!({ "id": 6, "method": "shutdown", "params": {} }));
+    broker.read_response(6);
+}
+
+#[test]
+fn visible_output_prevents_cancelled_turn_retraction() {
+    let repository = tempfile::tempdir().unwrap();
+    git(repository.path(), &["init", "-q"]);
+    git(
+        repository.path(),
+        &["config", "user.email", "harness@example.invalid"],
+    );
+    git(
+        repository.path(),
+        &["config", "user.name", "Harness Integration"],
+    );
+    std::fs::write(repository.path().join("README.md"), "# Harness\n").unwrap();
+    git(repository.path(), &["add", "."]);
+    git(repository.path(), &["commit", "-qm", "seed"]);
+    let data = tempfile::tempdir().unwrap();
+    let mut broker = BrokerProcess::start();
+    broker.request(json!({
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "data_root": data.path(),
+            "workspace": repository.path(),
+            "client_id": "visible-cancel-test",
+            "backend": { "kind": "mock", "command": ["visible-blocking"] },
+            "model": "mock-model",
+            "effort": "low",
+            "trust_profile": "workspace",
+            "goal_max_turns": 20
+        }
+    }));
+    broker.read_response(1);
+
+    broker.request(json!({
+        "id": 2,
+        "method": "prompt.submit",
+        "params": { "text": "show output before cancellation" }
+    }));
+    let started = broker.read_message();
+    assert_eq!(
+        started.pointer("/payload/kind").and_then(Value::as_str),
+        Some("timeline_interaction_started")
+    );
+    let visible = broker.read_message();
+    assert_eq!(
+        visible.pointer("/payload/kind").and_then(Value::as_str),
+        Some("timeline_active")
+    );
+    broker.request(json!({
+        "id": 3,
+        "method": "turn.cancel",
+        "params": { "restore_prompt_if_no_output": true }
+    }));
+    broker.read_response(3);
+    let cancelled = broker.read_response(2);
+    assert_eq!(
+        cancelled
+            .last()
+            .unwrap()
+            .pointer("/error/code")
+            .and_then(Value::as_str),
+        Some("turn_cancelled")
+    );
+    assert!(cancelled.iter().any(|message| {
+        message.pointer("/payload/kind").and_then(Value::as_str)
+            == Some("timeline_interaction_cancelled")
+    }));
+
+    broker.request(json!({ "id": 4, "method": "shutdown", "params": {} }));
+    broker.read_response(4);
+}
+
+#[test]
+fn workspace_changes_prevent_cancelled_turn_retraction() {
+    let repository = tempfile::tempdir().unwrap();
+    git(repository.path(), &["init", "-q"]);
+    git(
+        repository.path(),
+        &["config", "user.email", "harness@example.invalid"],
+    );
+    git(
+        repository.path(),
+        &["config", "user.name", "Harness Integration"],
+    );
+    std::fs::write(repository.path().join("README.md"), "# Harness\n").unwrap();
+    git(repository.path(), &["add", "."]);
+    git(repository.path(), &["commit", "-qm", "seed"]);
+    let data = tempfile::tempdir().unwrap();
+    let mut broker = BrokerProcess::start();
+    broker.request(json!({
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "data_root": data.path(),
+            "workspace": repository.path(),
+            "client_id": "changed-cancel-test",
+            "backend": { "kind": "mock", "command": ["writing-blocking"] },
+            "model": "mock-model",
+            "effort": "low",
+            "trust_profile": "workspace",
+            "goal_max_turns": 20
+        }
+    }));
+    broker.read_response(1);
+
+    broker.request(json!({
+        "id": 2,
+        "method": "prompt.submit",
+        "params": { "text": "change the workspace" }
+    }));
+    let started = broker.read_message();
+    assert_eq!(
+        started.pointer("/payload/kind").and_then(Value::as_str),
+        Some("timeline_interaction_started")
+    );
+    let changed_path = repository.path().join("mock-provider-change.txt");
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !changed_path.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(changed_path.exists());
+    broker.request(json!({
+        "id": 3,
+        "method": "turn.cancel",
+        "params": { "restore_prompt_if_no_output": true }
+    }));
+    broker.read_response(3);
+    let cancelled = broker.read_response(2);
+    assert_eq!(
+        cancelled
+            .last()
+            .unwrap()
+            .pointer("/error/code")
+            .and_then(Value::as_str),
+        Some("turn_cancelled")
+    );
+
+    broker.request(json!({ "id": 4, "method": "shutdown", "params": {} }));
+    broker.read_response(4);
 }
 
 #[test]

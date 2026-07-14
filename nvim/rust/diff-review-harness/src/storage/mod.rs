@@ -278,6 +278,15 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Remove one provisional interaction after its provider turn is retracted.
+    pub fn delete_interaction(&mut self, interaction_id: &str) -> Result<()> {
+        self.connection.execute(
+            "DELETE FROM interaction_record WHERE id=?1",
+            [interaction_id],
+        )?;
+        Ok(())
+    }
+
     /// Load interactions in their admitted user-action order.
     pub fn list_interaction(&self, session_id: &str) -> Result<Vec<InteractionRecord>> {
         self.list_payload(
@@ -396,6 +405,13 @@ impl SqliteStore {
     /// Load a goal by stable Harness identifier.
     pub fn load_goal(&self, goal_id: &str) -> Result<Option<GoalRecord>> {
         self.load_payload("SELECT payload FROM goal_record WHERE id=?1", [goal_id])
+    }
+
+    /// Remove one provisional goal created by a retracted prompt.
+    pub fn delete_goal(&mut self, goal_id: &str) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM goal_record WHERE id=?1", [goal_id])?;
+        Ok(())
     }
 
     /// Write one immutable workspace checkpoint record.

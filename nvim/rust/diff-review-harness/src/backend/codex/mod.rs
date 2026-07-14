@@ -16,6 +16,20 @@ pub struct CodexBackend {
     command: Vec<String>,
     default_model: Mutex<Option<String>>,
     steering: SteeringLane,
+    active_turn: Mutex<CodexTurnState>,
+}
+
+/// Tracks whether the current prompt reached Codex conversation history.
+#[derive(Clone, Debug, Default)]
+enum CodexTurnState {
+    #[default]
+    Idle,
+    Pending,
+    Submitted {
+        request: BackendRequest,
+        thread_id: String,
+    },
+    Completed,
 }
 
 impl CodexBackend {
@@ -29,6 +43,7 @@ impl CodexBackend {
             command,
             default_model: Mutex::new(None),
             steering: SteeringLane::default(),
+            active_turn: Mutex::new(CodexTurnState::Idle),
         })
     }
 
@@ -211,11 +226,18 @@ impl CodexBackend {
     }
 
     async fn start_turn(
+        &self,
         process: &mut JsonRpcProcess,
         output: &mut BackendOutput,
+        request: &BackendRequest,
+        thread_id: &str,
         params: Value,
     ) -> Result<(Value, bool)> {
         let request_id = process.send_request("turn/start", params).await?;
+        *self.active_turn.lock().await = CodexTurnState::Submitted {
+            request: request.clone(),
+            thread_id: thread_id.to_owned(),
+        };
         let mut started_turn_id = None;
         loop {
             let message = process.read_message(output).await?;
@@ -246,12 +268,14 @@ impl Backend for CodexBackend {
         request: BackendRequest,
         event_sink: Option<BackendEventSink>,
     ) -> Result<BackendOutput> {
+        *self.active_turn.lock().await = CodexTurnState::Pending;
         let mut active_steering = self.steering.activate()?;
         let mut output = BackendOutput {
             capability: BackendCapability {
                 native_fork: true,
                 native_compact: true,
                 native_steer: true,
+                native_turn_rollback: true,
                 native_goal: true,
                 model_selection: true,
                 effort_selection: true,
@@ -338,7 +362,7 @@ impl Backend for CodexBackend {
                 )
                 .await?;
         }
-        let (turn, provider_turn_started) = Self::start_turn(&mut process, &mut output, Self::with_model(json!({
+        let (turn, provider_turn_started) = self.start_turn(&mut process, &mut output, &request, &thread_id, Self::with_model(json!({
             "threadId": thread_id,
             "input": [{ "type": "text", "text": prompt }],
             "cwd": request.workspace,
@@ -364,6 +388,7 @@ impl Backend for CodexBackend {
             provider_turn_started,
         )
         .await?;
+        *self.active_turn.lock().await = CodexTurnState::Completed;
         let status = completed
             .pointer("/turn/status")
             .or_else(|| completed.get("status"))
@@ -413,6 +438,7 @@ impl Backend for CodexBackend {
                 native_fork: true,
                 native_compact: true,
                 native_steer: true,
+                native_turn_rollback: true,
                 native_goal: true,
                 model_selection: true,
                 effort_selection: true,
@@ -495,6 +521,27 @@ impl Backend for CodexBackend {
         }
         Ok(())
     }
+
+    async fn rollback_cancelled_turn(&self) -> Result<bool> {
+        let state = std::mem::take(&mut *self.active_turn.lock().await);
+        match state {
+            CodexTurnState::Pending => Ok(true),
+            CodexTurnState::Submitted { request, thread_id } => {
+                let mut output = BackendOutput::default();
+                let mut process = self.connect(&request, &mut output, None).await?;
+                process
+                    .request(
+                        "thread/rollback",
+                        json!({ "threadId": thread_id, "numTurns": 1 }),
+                        &mut output,
+                    )
+                    .await
+                    .context("roll back output-free Codex turn")?;
+                Ok(true)
+            }
+            CodexTurnState::Idle | CodexTurnState::Completed => Ok(false),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -538,5 +585,14 @@ mod test {
             CodexBackend::notification_turn_id(&started, "turn/completed"),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn distinguishes_an_unsubmitted_cancel_from_a_completed_turn() {
+        let backend = CodexBackend::new(vec!["codex".into(), "app-server".into()]).unwrap();
+        *backend.active_turn.lock().await = CodexTurnState::Pending;
+        assert!(backend.rollback_cancelled_turn().await.unwrap());
+        *backend.active_turn.lock().await = CodexTurnState::Completed;
+        assert!(!backend.rollback_cancelled_turn().await.unwrap());
     }
 }

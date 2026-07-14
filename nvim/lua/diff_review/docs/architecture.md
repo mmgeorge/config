@@ -899,9 +899,16 @@ identities merge start, output, and completion events into one completed tool re
 
 `turn.cancel` bypasses the broker's serialized request queue so Ctrl-c can interrupt an active
 provider turn instead of waiting behind it. The broker drops the prompt future, asks the backend
-to release any retained transport, finalizes partial timeline state, and persists the interaction
-as cancelled. Goal continuation pauses at the same boundary, while the session and completed
-transcript remain available for the next prompt.
+to release any retained transport, then either retracts or cancels the interaction. A newly
+submitted `prompt.submit` remains retractable only while the provider has produced no assistant
+message, tool activity, task update, or workspace delta. Context usage and reasoning status alone
+do not consume that eligibility. Codex maps an eligible retraction to app-server
+`thread/rollback`, the broker deletes the provisional interaction and restores pre-submit plan or
+goal control state, and Lua returns the exact prompt to HarnessInput. ACP advertises no turn
+rollback capability, so it always follows ordinary cancellation. Once visible activity or a file
+change occurs, the broker finalizes partial timeline state and persists the interaction as
+cancelled. This split prevents the composer from presenting text that still exists in provider
+history while preserving the quick-regret workflow for a genuinely output-free turn.
 
 `turn.steer` uses the same out-of-band broker lane without creating another interaction. Ctrl-q
 clears HarnessInput only after admitting the text into a pending steering record, then the backend
@@ -1167,15 +1174,16 @@ The headless suite lives in `nvim/tests/diff_review/` and runs via
 tests never touch a real repo. `diff_architecture.lua` guards the render-engine extraction
 boundaries. `tests/diff_review/harness.lua` drives interaction-tree transitions, node-local
 render transactions, immutable fold behavior, steering acknowledgment and fallback, queue editing,
-PlanReview, Interactions, Sessions, atomic key-list configuration, and fork capability gating through a deterministic
-JSONL process mock.
+output-free prompt restoration, PlanReview, Interactions, Sessions, atomic key-list configuration,
+and fork capability gating through a deterministic JSONL process mock.
 
 The Rust suite runs with `cargo test --manifest-path
 nvim/rust/diff-review-harness/Cargo.toml`. It isolates plan revisions, goal guards,
 SQLite session filters and migration, leases, content-addressed interaction diffs,
 recursive watcher delivery, quiet-window fallback, divergence refusal, unborn Git
 worktrees, failed-provider goal pausing with final checkpoints, ACP plan normalization,
-exact control tools, backend/session compatibility, and worktree-only rollback. The ignored
+exact control tools, backend/session compatibility, output-free cancellation retraction,
+visible-output and workspace-change retraction guards, and worktree-only rollback. The ignored
 `tests/codex_cli.rs` integration uses the installed
 authenticated Codex CLI with `gpt-5.4-mini` at low effort in a temporary Git repository.
 Run it explicitly with `cargo test --manifest-path nvim/rust/diff-review-harness/Cargo.toml

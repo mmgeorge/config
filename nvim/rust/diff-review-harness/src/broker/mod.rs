@@ -104,6 +104,7 @@ struct InteractionRuntime {
     thought_generation: u64,
     last_checkpoint_id: Option<String>,
     task: TaskTracker,
+    retraction_eligible: bool,
 }
 
 /// Represents one request result plus asynchronous events emitted before its response.
@@ -115,6 +116,8 @@ pub struct DispatchResult {
 /// Coordinates an out-of-band cancellation request with the active backend turn.
 pub struct TurnCancellation {
     requested: AtomicBool,
+    restore_prompt: AtomicBool,
+    retraction_allowed: AtomicBool,
     notify: Notify,
 }
 
@@ -122,19 +125,30 @@ impl TurnCancellation {
     fn new() -> Self {
         Self {
             requested: AtomicBool::new(false),
+            restore_prompt: AtomicBool::new(false),
+            retraction_allowed: AtomicBool::new(false),
             notify: Notify::new(),
         }
     }
 
     /// Clear cancellation state before dispatching the next broker request.
-    pub fn arm(&self) {
+    pub fn arm(&self, retraction_allowed: bool) {
         self.requested.store(false, Ordering::Release);
+        self.restore_prompt.store(false, Ordering::Release);
+        self.retraction_allowed
+            .store(retraction_allowed, Ordering::Release);
     }
 
     /// Request cancellation without waiting for the broker's serialized request lane.
-    pub fn request(&self) {
+    pub fn request(&self, restore_prompt: bool) {
+        self.restore_prompt.store(restore_prompt, Ordering::Release);
         self.requested.store(true, Ordering::Release);
         self.notify.notify_waiters();
+    }
+
+    fn restores_prompt(&self) -> bool {
+        self.restore_prompt.load(Ordering::Acquire)
+            && self.retraction_allowed.load(Ordering::Acquire)
     }
 
     async fn cancelled(&self) {
@@ -159,11 +173,30 @@ impl std::fmt::Display for TurnCancelled {
 
 impl std::error::Error for TurnCancelled {}
 
+#[derive(Debug)]
+struct TurnRetracted {
+    prompt: String,
+}
+
+impl std::fmt::Display for TurnRetracted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Output-free turn retracted")
+    }
+}
+
+impl std::error::Error for TurnRetracted {}
+
 struct InteractionAdmission {
     prompt: String,
     kind: InteractionKind,
     plan_id: Option<String>,
     execution_id: Option<String>,
+}
+
+struct PromptControlSnapshot {
+    session: HarnessSession,
+    goal: Option<GoalRecord>,
+    execution: Vec<PlanExecutionRecord>,
 }
 
 impl InteractionAdmission {
@@ -315,6 +348,7 @@ impl HarnessBroker {
             native_fork: session.native_fork,
             native_compact: session.native_compact,
             native_steer: request.backend.kind == "codex" || request.backend.kind == "mock",
+            native_turn_rollback: request.backend.kind == "codex" || request.backend.kind == "mock",
             ..BackendCapability::default()
         };
         Ok(Self {
@@ -435,6 +469,17 @@ impl HarnessBroker {
                 },
             },
             Err(error) => {
+                if let Some(retracted) = error.downcast_ref::<TurnRetracted>() {
+                    return DispatchResult {
+                        response: BrokerResponse::failure_with_data(
+                            id,
+                            "turn_retracted",
+                            retracted.to_string(),
+                            json!({ "prompt": retracted.prompt }),
+                        ),
+                        event: Vec::new(),
+                    };
+                }
                 let code = if error.downcast_ref::<TurnCancelled>().is_some() {
                     "turn_cancelled"
                 } else {
@@ -552,6 +597,22 @@ impl HarnessBroker {
     }
 
     async fn submit_prompt(&mut self, params: Value) -> Result<(Value, Vec<BrokerEvent>)> {
+        let snapshot = PromptControlSnapshot {
+            session: self.session.clone(),
+            goal: self.current_goal()?,
+            execution: self.store.list_plan_execution(&self.session.id)?,
+        };
+        let result = self.submit_prompt_inner(params).await;
+        if result
+            .as_ref()
+            .is_err_and(|error| error.downcast_ref::<TurnRetracted>().is_some())
+        {
+            self.restore_retracted_control_state(snapshot).await?;
+        }
+        result
+    }
+
+    async fn submit_prompt_inner(&mut self, params: Value) -> Result<(Value, Vec<BrokerEvent>)> {
         let text = required_text(&params, "text")?;
         if text == "/read" {
             return self.set_mode(json!({ "mode": "read" }));
@@ -651,6 +712,54 @@ impl HarnessBroker {
             Some(InteractionAdmission::chat(text)),
         )
         .await
+    }
+
+    async fn restore_retracted_control_state(
+        &mut self,
+        snapshot: PromptControlSnapshot,
+    ) -> Result<()> {
+        let current_goal = self.current_goal()?;
+        let goal_changed = match (&current_goal, &snapshot.goal) {
+            (Some(current), Some(restored)) => {
+                current.id != restored.id
+                    || current.objective != restored.objective
+                    || current.state != restored.state
+            }
+            (None, None) => false,
+            _ => true,
+        };
+        let current_goal_id = self.session.goal_id.clone();
+        let restored_goal_id = snapshot.goal.as_ref().map(|goal| goal.id.as_str());
+        if current_goal_id.as_deref() != restored_goal_id
+            && let Some(goal_id) = current_goal_id.as_deref()
+        {
+            self.store.delete_goal(goal_id)?;
+        }
+        if let Some(goal) = snapshot.goal.as_ref() {
+            self.store.save_goal(goal)?;
+        }
+        for execution in &snapshot.execution {
+            self.store.save_plan_execution(execution)?;
+        }
+        self.session = snapshot.session;
+        self.save_session()?;
+
+        if goal_changed
+            && self.session.backend == "codex"
+            && self.session.backend_session_id.is_some()
+        {
+            let request = self.backend_request(String::new(), PromptMode::Chat);
+            match snapshot.goal {
+                Some(goal) => {
+                    let status = goal_state_name(goal.state);
+                    self.backend
+                        .goal_status(request, Some(goal.objective), status)
+                        .await?;
+                }
+                None => self.backend.goal_status(request, None, "cleared").await?,
+            }
+        }
+        Ok(())
     }
 
     fn answer_plan_question_choice(&mut self, params: Value) -> Result<(Value, Vec<BrokerEvent>)> {
@@ -981,6 +1090,57 @@ impl HarnessBroker {
             Err(error) => {
                 let cancelled = error.downcast_ref::<TurnCancelled>().is_some();
                 let final_checkpoint_id = self.capture_final_checkpoint(&mut interaction)?;
+                let workspace_unchanged = interaction.checkpoint_before.is_some()
+                    && interaction.checkpoint_before == final_checkpoint_id;
+                let retraction_eligible = cancelled
+                    && self.turn_cancellation.restores_prompt()
+                    && self.capability.native_turn_rollback
+                    && workspace_unchanged
+                    && self
+                        .interaction_runtime
+                        .as_ref()
+                        .is_some_and(|runtime| runtime.retraction_eligible);
+                if retraction_eligible {
+                    match self.backend.rollback_cancelled_turn().await {
+                        Ok(true) => {
+                            self.interaction_runtime.take();
+                            self.store.delete_interaction(&interaction.id)?;
+                            self.emit_live(
+                                BackendEvent {
+                                    kind: "timeline_interaction_retracted".into(),
+                                    text: None,
+                                    data: json!({
+                                        "interaction_id": interaction.id,
+                                        "prompt": interaction.prompt.clone(),
+                                    }),
+                                    activity: None,
+                                    summary: None,
+                                    task_update: None,
+                                },
+                                &mut event,
+                            )?;
+                            return Err(anyhow::Error::new(TurnRetracted {
+                                prompt: interaction.prompt,
+                            }));
+                        }
+                        Ok(false) => {}
+                        Err(rollback_error) => {
+                            self.emit_live(
+                                BackendEvent {
+                                    kind: "error".into(),
+                                    text: Some(format!(
+                                        "Cancelled turn could not be retracted: {rollback_error:#}"
+                                    )),
+                                    data: Value::Null,
+                                    activity: None,
+                                    summary: None,
+                                    task_update: None,
+                                },
+                                &mut event,
+                            )?;
+                        }
+                    }
+                }
                 if let Some(mut runtime) = self.interaction_runtime.take() {
                     let (final_thought, response) =
                         runtime.timeline.finish_turn(self.clock.now_ms(), false);
@@ -1324,6 +1484,7 @@ impl HarnessBroker {
                 .clone()
                 .map(TaskTracker::from_snapshot)
                 .unwrap_or_default(),
+            retraction_eligible: true,
         });
         Ok(())
     }
@@ -1370,6 +1531,7 @@ impl HarnessBroker {
                 .clone()
                 .map(TaskTracker::from_snapshot)
                 .unwrap_or_default(),
+            retraction_eligible: false,
         });
         Ok(())
     }
@@ -1463,6 +1625,17 @@ impl HarnessBroker {
         backend_event: BackendEvent,
         event: &mut Vec<BrokerEvent>,
     ) -> Result<()> {
+        if backend_event.task_update.is_some()
+            || backend_event.activity.is_some()
+            || (backend_event.kind == "assistant_message"
+                && backend_event
+                    .text
+                    .as_deref()
+                    .is_some_and(|text| !text.is_empty()))
+            || backend_event.kind == "error"
+        {
+            runtime.retraction_eligible = false;
+        }
         if backend_event.kind == "context_usage" {
             let context_usage: ContextUsage = serde_json::from_value(backend_event.data.clone())?;
             self.session.context_usage = Some(context_usage);
@@ -2368,6 +2541,7 @@ impl HarnessBroker {
         self.capability = BackendCapability {
             native_compact: self.session.backend == "codex",
             native_steer: self.session.backend == "codex" || self.session.backend == "mock",
+            native_turn_rollback: self.session.backend == "codex" || self.session.backend == "mock",
             ..BackendCapability::default()
         };
         self.store.save_session(&self.session)?;
@@ -2775,6 +2949,17 @@ fn required_text(value: &Value, field: &str) -> Result<String> {
         .and_then(Value::as_str)
         .map(str::to_owned)
         .with_context(|| format!("{field} is required"))
+}
+
+fn goal_state_name(state: GoalState) -> &'static str {
+    match state {
+        GoalState::Active => "active",
+        GoalState::Paused => "paused",
+        GoalState::Complete => "complete",
+        GoalState::Blocked => "blocked",
+        GoalState::Stalled => "stalled",
+        GoalState::Cleared => "cleared",
+    }
 }
 
 fn plan_title(markdown: &str, request: &str) -> String {

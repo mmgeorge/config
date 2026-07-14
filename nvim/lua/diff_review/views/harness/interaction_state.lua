@@ -114,6 +114,25 @@ function M.complete_interaction(state, completed)
 end
 
 ---@param state DiffReviewHarnessPresentationState
+---@param retracted table
+function M.retract(state, retracted)
+  if type(retracted) ~= "table" or not retracted.interaction_id then return end
+  local pending = state.pending_interaction
+  local target_id = retracted.interaction_id
+  if pending and pending.prompt == retracted.prompt then target_id = pending.id end
+  for index, interaction in ipairs(state.interaction or {}) do
+    if interaction.id == target_id or interaction.id == retracted.interaction_id then
+      table.remove(state.interaction, index)
+      break
+    end
+  end
+  if pending and (pending.id == target_id or pending.id == retracted.interaction_id) then
+    state.pending_interaction = nil
+  end
+  rebuild_index(state)
+end
+
+---@param state DiffReviewHarnessPresentationState
 ---@param message string
 function M.fail_pending(state, message)
   local interaction = state.pending_interaction

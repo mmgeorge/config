@@ -91,6 +91,7 @@ local launched_binary = nil
 local active_plan = nil
 local active_elicitation = nil
 local prompt_history = { "most recent prompt", "older prompt" }
+local retract_request = nil
 
 local function planning_question_set()
   return {
@@ -146,7 +147,13 @@ local function fake_launcher(command, options, _)
         emit(options, { id = request.id, result = {
           session = active_session,
           interaction = {},
-          capability = { native_fork = false, native_compact = true, native_steer = true, model_selection = true },
+          capability = {
+            native_fork = false,
+            native_compact = true,
+            native_steer = true,
+            native_turn_rollback = true,
+            model_selection = true,
+          },
           no_checkpoint = false,
           prompt_history = prompt_history,
         } })
@@ -154,6 +161,21 @@ local function fake_launcher(command, options, _)
     elseif request.method == "prompt.submit" then
       if request.params.text == "/goal fail" then
         emit(options, { id = request.id, error = { message = "synthetic goal failure" } })
+        return
+      end
+      if request.params.text == "retract me" then
+        retract_request = request
+        emit(options, { event = "backend_event", payload = {
+          kind = "timeline_interaction_started",
+          data = {
+            id = "retracted-interaction",
+            session_id = active_session.id,
+            ordinal = prompt_count + 1,
+            prompt = request.params.text,
+            state = "running",
+            thought = {},
+          },
+        } })
         return
       end
       prompt_count = prompt_count + 1
@@ -294,7 +316,7 @@ local function fake_launcher(command, options, _)
           emit(options, { id = request.id, result = {
             interaction = completed,
             session = active_session,
-            capability = { native_fork = false, native_steer = true },
+            capability = { native_fork = false, native_steer = true, native_turn_rollback = true },
           } })
         end, 1200)
       else
@@ -315,7 +337,7 @@ local function fake_launcher(command, options, _)
         emit(options, { id = request.id, result = {
           interaction = completed,
           session = active_session,
-          capability = { native_fork = false, native_steer = true },
+          capability = { native_fork = false, native_steer = true, native_turn_rollback = true },
         } })
       end
     elseif request.method == "history.record" then
@@ -380,12 +402,22 @@ local function fake_launcher(command, options, _)
       emit(options, { event = "context_compacted", payload = {
         session = active_session,
         interaction = session.harness.interaction,
-        capability = { native_fork = false, native_compact = true, native_steer = true },
+        capability = {
+          native_fork = false,
+          native_compact = true,
+          native_steer = true,
+          native_turn_rollback = true,
+        },
       } })
       emit(options, { id = request.id, result = {
         session = active_session,
         interaction = session.harness.interaction,
-        capability = { native_fork = false, native_compact = true, native_steer = true },
+        capability = {
+          native_fork = false,
+          native_compact = true,
+          native_steer = true,
+          native_turn_rollback = true,
+        },
       } })
     elseif request.method == "turn.steer" then
       steered_text_list[#steered_text_list + 1] = request.params.text
@@ -398,6 +430,18 @@ local function fake_launcher(command, options, _)
       end, 80)
     elseif request.method == "turn.cancel" then
       emit(options, { id = request.id, result = { cancel_requested = true } })
+      if request.params.restore_prompt_if_no_output and retract_request then
+        emit(options, { event = "backend_event", payload = {
+          kind = "timeline_interaction_retracted",
+          data = { interaction_id = "retracted-interaction", prompt = retract_request.params.text },
+        } })
+        emit(options, { id = retract_request.id, error = {
+          code = "turn_retracted",
+          message = "Output-free turn retracted",
+          data = { prompt = retract_request.params.text },
+        } })
+        retract_request = nil
+      end
     elseif request.method == "session.new" then
       active_session = vim.tbl_extend("force", active_session, { id = "session-two", write_mode = "read" })
       emit(options, { event = "session_changed", payload = { session = active_session, interaction = {} } })
@@ -428,7 +472,12 @@ local function fake_launcher(command, options, _)
       emit(options, { id = request.id, result = {
         session = active_session,
         interaction = session.harness.interaction,
-        capability = { native_fork = false, native_compact = true, native_steer = true },
+        capability = {
+          native_fork = false,
+          native_compact = true,
+          native_steer = true,
+          native_turn_rollback = true,
+        },
         no_checkpoint = false,
         goal = { objective = "fail", state = "paused" },
         active_plan = active_plan,
@@ -927,8 +976,26 @@ local ok, failure = pcall(function()
   transcript_cancel()
   assert_true(vim.wait(1000, function() return request_by_method["turn.cancel"] ~= nil end, 10),
     "Ctrl-c should send an out-of-band turn cancellation request")
+  assert_true(request_by_method["turn.cancel"].params.restore_prompt_if_no_output,
+    "Ctrl-c should request prompt restoration when the backend can roll back an output-free turn")
   session.harness.busy = false
   session.harness.cancel_requested = false
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "retract me" })
+  controller.submit()
+  assert_true(vim.wait(1000, function() return retract_request ~= nil end, 10),
+    "the output-free prompt should remain active until cancellation")
+  controller.cancel_turn()
+  assert_true(vim.wait(1000, function()
+    return not session.harness.busy
+      and table.concat(vim.api.nvim_buf_get_lines(session.harness.composer_buf, 0, -1, false), "\n") == "retract me"
+  end, 10), "an output-free cancellation should restore the exact prompt to HarnessInput")
+  assert_true(not vim.tbl_contains(vim.tbl_map(function(item) return item.id end, session.harness.interaction),
+    "retracted-interaction"), "the retracted interaction should disappear from the timeline")
+  assert_true(not table.concat(vim.api.nvim_buf_get_lines(session.harness.transcript_buf, 0, -1, false), "\n")
+    :find("▸ retract me", 1, true), "the settled transcript should not retain the retracted prompt")
+  if prompt_history[1] == "retract me" then table.remove(prompt_history, 1) end
+  if session.harness.prompt_history[1] == "retract me" then table.remove(session.harness.prompt_history, 1) end
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "" })
   assert_true(not has_buffer_keymap(session.harness.transcript_buf, "i", "<Up>"),
     "prompt history should remain scoped to HarnessInput")
   assert_true(has_buffer_keymap(session.harness.composer_buf, "i", "<Up>"),
