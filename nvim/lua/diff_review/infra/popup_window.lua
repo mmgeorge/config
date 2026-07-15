@@ -14,9 +14,12 @@ local view_group = vim.api.nvim_create_augroup("DiffReviewPopupView", { clear = 
 ---@field col? integer
 ---@field width integer
 ---@field height integer
----@field title string
+---@field title string|table
 ---@field filetype? string
 ---@field focusable? boolean
+---@field enter? boolean
+---@field origin? DiffReviewPopupOrigin
+---@field border? string|string[]
 ---@field cursorline? boolean
 ---@field wrap? boolean
 ---@field linebreak? boolean
@@ -81,7 +84,8 @@ end
 ---@param options DiffReviewPopupWindowOptions
 ---@return integer, integer
 function M.open(options)
-  local origin = M.capture_origin()
+  local origin = options.origin or M.capture_origin()
+  if options.origin then vim.cmd("stopinsert") end
   local buf = vim.api.nvim_create_buf(false, true)
   vim.bo[buf].buftype = "nofile"
   vim.bo[buf].bufhidden = "wipe"
@@ -96,14 +100,14 @@ function M.open(options)
     width = options.width,
     height = options.height,
     style = "minimal",
-    border = "rounded",
-    title = " " .. options.title .. " ",
+    border = options.border or "rounded",
+    title = type(options.title) == "table" and options.title or (" " .. options.title .. " "),
     title_pos = "center",
     focusable = options.focusable ~= false,
     zindex = options.zindex or 80,
   }
   if relative == "win" then window_config.win = options.win or options.parent_win end
-  local popup_win = vim.api.nvim_open_win(buf, true, window_config)
+  local popup_win = vim.api.nvim_open_win(buf, options.enter ~= false, window_config)
   origin_by_window[popup_win] = origin
   vim.wo[popup_win].cursorline = options.cursorline == true
   vim.wo[popup_win].wrap = options.wrap == true

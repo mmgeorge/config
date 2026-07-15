@@ -36,12 +36,18 @@ if not (vim.uv or vim.loop).fs_stat(lazypath) then
   })
 end
 
-vim.opt.rtp:prepend(vim.fn.expand("~/config/nvim"))
+local config_root = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p:h")
+vim.opt.rtp:prepend(config_root)
 vim.opt.rtp:prepend(lazypath)
 
 require("lazy").setup("plugins", {
   defaults = {
     cond = not vim.g.vscode,
+  },
+  performance = {
+    rtp = {
+      paths = { config_root },
+    },
   },
   change_detection = {
     notify = false

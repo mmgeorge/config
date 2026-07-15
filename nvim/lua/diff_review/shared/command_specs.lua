@@ -93,6 +93,7 @@ M.view_specs = {
     { id = "toggle_activity", label = "activity", desc = "Toggle complete tool output", modes = "n", pinned = true },
     { id = "open_artifact", label = "artifacts", desc = "Open a session artifact", modes = "n", pinned = true },
     { id = "agent", label = "agents", desc = "Switch or start a child-agent timeline", modes = "n", pinned = true },
+    { id = "sessions", label = "sessions", desc = "Search and preview durable Harness sessions", modes = "n", pinned = true },
     { id = "reopen_question", label = "feedback", desc = "Reopen pending Harness questions", modes = "n", pinned = false },
     { id = "model", label = "model", desc = "Select the model at the next safe boundary", modes = "n", pinned = false },
     { id = "effort_down", label = "effort-", desc = "Decrease reasoning effort", modes = "n", pinned = false },
@@ -107,18 +108,16 @@ M.view_specs = {
     { id = "close", label = "close", desc = "Return to Harness without deciding", modes = "n", pinned = true },
     { id = "help", label = "help", desc = "Show PlanReview help", modes = "n", pinned = true },
   },
-  plan_question = {
+  picker = {
     { id = "previous", label = "previous", desc = "Highlight the previous planning option", modes = "n", pinned = false },
     { id = "next", label = "next", desc = "Highlight the next planning option", modes = "n", pinned = false },
     { id = "select", label = "select", desc = "Select the highlighted planning option", modes = "n", pinned = false },
     { id = "feedback", label = "feedback", desc = "Select with additional feedback", modes = "n", pinned = false },
-    { id = "question_previous", label = "previous question", desc = "Show the previous Harness question", modes = "n", pinned = false },
-    { id = "question_next", label = "next question", desc = "Show the next Harness question", modes = "n", pinned = false },
+    { id = "page_previous", label = "previous page", desc = "Show the previous picker page", modes = "n", pinned = false },
+    { id = "page_next", label = "next page", desc = "Show the next picker page", modes = "n", pinned = false },
     { id = "focus_input", label = "edit", desc = "Switch between Harness options and feedback input", modes = "n", pinned = false },
     { id = "submit_input", label = "submit", desc = "Submit Harness option input", modes = { "n", "i" }, pinned = false },
-    { id = "confirm", label = "submit", desc = "Submit the reviewed Harness answers", modes = "n", pinned = false },
-    { id = "revise", label = "revise", desc = "Return to the first Harness question", modes = "n", pinned = false },
-    { id = "close", label = "close", desc = "Hide planning questions without losing progress", modes = "n", pinned = false },
+    { id = "close", label = "close", desc = "Close the active picker", modes = "n", pinned = false },
   },
   interactions = {
     { id = "toggle", label = "toggle", desc = "Toggle an interaction or file fold", modes = "n", pinned = true },
@@ -128,16 +127,6 @@ M.view_specs = {
     { id = "refresh", label = "refresh", desc = "Reload interaction history", modes = "n", pinned = false },
     { id = "close", label = "close", desc = "Close Interactions", modes = "n", pinned = true },
     { id = "help", label = "help", desc = "Show Interactions help", modes = "n", pinned = true },
-  },
-  sessions = {
-    { id = "open", label = "open", desc = "Resume the selected same-worktree session", modes = "n", pinned = true },
-    { id = "tab_next", label = "scope", desc = "Switch Current Repo and All Repos", modes = "n", pinned = true },
-    { id = "fork", label = "fork", desc = "Fork through the backend's native session API", modes = "n", pinned = true },
-    { id = "rename", label = "rename", desc = "Rename Harness-owned session metadata", modes = "n", pinned = false },
-    { id = "delete", label = "delete", desc = "Delete Harness state while preserving the provider session", modes = "n", pinned = false },
-    { id = "refresh", label = "refresh", desc = "Reload sessions", modes = "n", pinned = false },
-    { id = "close", label = "close", desc = "Close Sessions", modes = "n", pinned = true },
-    { id = "help", label = "help", desc = "Show Sessions help", modes = "n", pinned = true },
   },
 }
 

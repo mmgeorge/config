@@ -15,18 +15,11 @@ local interaction_state = require("diff_review.views.harness.interaction_state")
 local prompt_history = require("diff_review.views.harness.prompt_history")
 local context_status = require("diff_review.views.harness.context_status")
 local main_timeline = require("diff_review.views.harness.timeline")
-local popup_window = require("diff_review.infra.popup_window")
+local snapshot = require("diff_review.views.harness.snapshot")
+local picker = require("diff_review.views.picker")
 
 local namespace = vim.api.nvim_create_namespace("DiffReviewHarnessTranscript")
 local queue_namespace = vim.api.nvim_create_namespace("DiffReviewHarnessQueue")
-local choice_picker = {
-  main = { current = false },
-  layout = {
-    preset = "select",
-    preview = false,
-    layout = { relative = "editor", row = 2 },
-  },
-}
 local unsubscribe = nil
 local state_sync_pending = false
 local working_timer = nil
@@ -37,6 +30,40 @@ local begin_request
 
 ---@return table
 local function harness_state() return session.harness end
+
+local function picker_host(state)
+  local window_list = {}
+  for _, win in ipairs({ state.transcript_win, state.composer_win }) do
+    if win and vim.api.nvim_win_is_valid(win) then window_list[#window_list + 1] = win end
+  end
+  local current = vim.api.nvim_get_current_win()
+  local control_win = vim.tbl_contains(window_list, current) and current or state.composer_win or state.transcript_win
+  return {
+    window_list = window_list,
+    control_win = control_win,
+    transcript_win = state.transcript_win,
+    composer_win = state.composer_win,
+  }
+end
+
+local function open_choice_picker(state, title, subtitle, option_list, callback)
+  for index, option in ipairs(option_list) do
+    option.key = option.key or config.options.picker.choice_keys[index]
+  end
+  picker.open({
+    host = picker_host(state),
+    page_list = {
+      {
+        id = title,
+        title = title,
+        subtitle = subtitle,
+        option_list = option_list,
+        footer = "↑↓ select  Enter confirm  q close",
+      },
+    },
+    on_confirm = function(result) callback(result.option.value) end,
+  })
+end
 
 local function selected_agent_run(state)
   if not state.selected_agent_run_id then return nil end
@@ -352,26 +379,14 @@ local function synchronize_state(callback)
       return
     end
     local state = harness_state()
-    state.session = result.session
-    interaction_state.replace(state, result.interaction or {})
+    snapshot.apply(state, result)
     if result.active_wait then
       interaction_state.apply_wait(state, {
         interaction_id = result.active_wait.interaction_id,
         wait = result.active_wait,
       })
     end
-    state.timeline = vim.deepcopy(result.timeline or {})
-    state.artifact = vim.deepcopy(result.artifact or {})
-    state.capability = result.capability or {}
-    state.no_checkpoint = result.no_checkpoint == true
-    state.goal = result.goal
-    state.active_plan = result.active_plan
-    state.active_elicitation = result.active_elicitation
-    state.approval = vim.deepcopy(result.approval or {})
     reconcile_approval_presentation(state)
-    state.agent = vim.deepcopy(result.agent or { definition = {}, run = {}, turn = {} })
-    state.agent_live = {}
-    prompt_history.replace(result.prompt_history)
     local elicitation = state.active_elicitation and state.active_elicitation.elicitation
     local question_set_id = elicitation and elicitation.question_set and elicitation.question_set.id
     if elicitation and question_set_id ~= state.presented_question_set_id then
@@ -518,6 +533,8 @@ function M.present_approval()
   state.presented_approval_id = request.id
   require("diff_review.views.harness.approval").open(request, {
     transcript_win = state.transcript_win,
+    window_list = picker_host(state).window_list,
+    control_win = picker_host(state).control_win,
     resolve = function(approval_id, choice_id, callback)
       client.request("approval.resolve", {
         approval_id = approval_id,
@@ -555,6 +572,8 @@ function M.present_plan_question()
   state.plan_question_open = true
   require("diff_review.views.harness.plan_question").open(elicitation, {
     transcript_win = state.transcript_win,
+    window_list = picker_host(state).window_list,
+    control_win = picker_host(state).control_win,
     answer = function(params, callback)
       client.request("question.answer", params, function(result, request_error)
         if request_error then
@@ -796,14 +815,11 @@ function M.open_artifact_picker()
     notifications.info("This Harness session has no artifacts", "Harness")
     return
   end
-  popup_window.select(artifact_list, {
-    prompt = "Harness artifacts",
-    snacks = choice_picker,
-    format_item = function(artifact)
+  local option_list = vim.tbl_map(function(artifact)
       local title = artifact.title and artifact.title ~= "" and artifact.title or "[unnamed plan]"
-      return ("%s  [%s]"):format(title, artifact.state or "unknown")
-    end,
-  }, function(artifact)
+      return { label = title, detail = artifact.state or "unknown", value = artifact }
+    end, artifact_list)
+  open_choice_picker(state, "Harness artifacts", "Open a plan created by this session.", option_list, function(artifact)
     if not artifact then return end
     client.request("plan.activate", { plan_id = artifact.id }, function(plan, request_error)
       if request_error then
@@ -825,6 +841,7 @@ function M.open_agent_picker()
     return
   end
   require("diff_review.views.harness.agent_picker").open({
+    host = picker_host(state),
     agent = state.agent or {},
     selected_run_id = state.selected_agent_run_id,
     on_select = function(run_id)
@@ -842,6 +859,10 @@ function M.open_agent_picker()
       end)
     end,
   })
+end
+
+function M.open_session_picker()
+  require("diff_review.views.harness.session_picker").open(picker_host(harness_state()))
 end
 
 function M.submit()
@@ -878,6 +899,11 @@ function M.submit()
   if text == "/agent" then
     set_composer_text(state.composer_buf, "")
     M.open_agent_picker()
+    return
+  end
+  if text == "/sessions" then
+    set_composer_text(state.composer_buf, "")
+    M.open_session_picker()
     return
   end
   local agent_definition, agent_task = text:match("^/agent%s+(%S+)%s+(.+)$")
@@ -1073,8 +1099,18 @@ end
 
 function M.select_effort()
   local effort_list = { "minimal", "low", "medium", "high", "xhigh" }
-  popup_window.select(effort_list, { prompt = "Harness reasoning effort", snacks = choice_picker }, function(effort)
-    if effort then M.configure({ effort = effort }) end
+  local detail_list = {
+    minimal = "Fastest reasoning for straightforward work.",
+    low = "Light reasoning for routine changes.",
+    medium = "Balanced reasoning for everyday work.",
+    high = "Deeper reasoning for complex changes.",
+    xhigh = "Maximum reasoning for the hardest work.",
+  }
+  local options = vim.tbl_map(function(effort)
+    return { label = effort, detail = detail_list[effort], value = effort }
+  end, effort_list)
+  open_choice_picker(harness_state(), "Select reasoning effort", "Applied at the next safe turn boundary.", options, function(effort)
+    M.configure({ effort = effort })
   end)
 end
 
@@ -1092,13 +1128,15 @@ end
 function M.select_fast_mode()
   local state = harness_state()
   local enabled = state.session and state.session.fast_mode == true
-  popup_window.select({ enabled and "Disable fast mode" or "Enable fast mode", "Cancel" }, {
-    prompt = "Codex fast mode",
-    snacks = choice_picker,
-  }, function(choice)
-    if choice == "Enable fast mode" then M.configure_fast_mode(true) end
-    if choice == "Disable fast mode" then M.configure_fast_mode(false) end
-  end)
+  local next_enabled = not enabled
+  open_choice_picker(state, "Codex fast mode", "Choose whether Codex prioritizes faster inference.", {
+    {
+      label = next_enabled and "Enable fast mode" or "Disable fast mode",
+      detail = "Apply this setting at the next safe turn boundary.",
+      value = next_enabled,
+    },
+    { label = "Cancel", detail = "Keep the current setting.", value = nil },
+  }, function(choice) if choice ~= nil then M.configure_fast_mode(choice) end end)
 end
 
 function M.select_model()
@@ -1106,17 +1144,29 @@ function M.select_model()
     if request_error then notifications.error(request_error, "Harness model") return end
     if type(model_list) ~= "table" or #model_list == 0 then
       local current = harness_state().session and harness_state().session.model or config.options.harness.model
-      popup_window.input({ prompt = "Harness model: ", default = current }, function(model)
-        if model and vim.trim(model) ~= "" then M.configure({ model = vim.trim(model) }) end
-      end)
+      picker.open({
+        host = picker_host(harness_state()),
+        initial_input_kind = "other",
+        page_list = {
+          {
+            id = "custom-model",
+            title = "Harness model",
+            subtitle = "Enter a model identifier exposed by the current backend.",
+            option_list = { { label = "Model", value = current, input_kind = "other" } },
+            allow_input = true,
+            input_height = 3,
+            footer = "C-s apply  go options  q close",
+          },
+        },
+        on_confirm = function(result) M.configure({ model = result.text }) end,
+      })
       return
     end
-    popup_window.select(model_list, {
-      prompt = "Harness model",
-      snacks = choice_picker,
-      format_item = function(model) return model.label .. "  " .. model.id end,
-    }, function(model)
-      if model then M.configure({ model = model.id }) end
+    local options = vim.tbl_map(function(model)
+      return { label = model.label, detail = model.id, value = model }
+    end, model_list)
+    open_choice_picker(harness_state(), "Select model and effort", "Models exposed by the active Codex backend.", options, function(model)
+      M.configure({ model = model.id })
     end)
   end)
 end
@@ -1152,12 +1202,10 @@ function M.set_mode(mode)
 
   if mode ~= "read" and state.no_checkpoint and config.options.harness.non_git_write_confirm then
     local label = mode == "yolo" and "YOLO" or (mode:sub(1, 1):upper() .. mode:sub(2))
-    popup_window.select({ "Cancel", "Enable " .. label .. " without checkpoints" }, {
-      prompt = "This is not a Git worktree. Harness cannot diff or roll back changes.",
-      snacks = choice_picker,
-    }, function(choice)
-      if choice == "Enable " .. label .. " without checkpoints" then apply_mode() end
-    end)
+    open_choice_picker(state, "Enable " .. label .. " without checkpoints?", "This is not a Git worktree. Harness cannot diff or roll back changes.", {
+      { label = "Cancel", detail = "Keep the current execution mode.", value = false },
+      { label = "Enable " .. label, detail = "Proceed without Harness rollback support.", value = true },
+    }, function(choice) if choice then apply_mode() end end)
     return
   end
   apply_mode()
@@ -1217,6 +1265,7 @@ function M.command_set()
   command_set.register(set, "toggle_activity", M.toggle_activity)
   command_set.register(set, "open_artifact", M.open_artifact_picker)
   command_set.register(set, "agent", M.open_agent_picker)
+  command_set.register(set, "sessions", M.open_session_picker)
   command_set.register(set, "reopen_question", M.reopen_question)
   command_set.register(set, "model", M.select_model)
   command_set.register(set, "effort_down", function() M.change_effort(-1) end)

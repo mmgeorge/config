@@ -18,6 +18,7 @@
 ---@field walkthrough_inventory "sem"|false compute inventory with Sem or disable it
 ---@field branch_prefix string default prefix for branches created with `bc`; a repo's .diffreview.json may override it
 ---@field harness DiffReviewHarnessConfig
+---@field picker DiffReviewPickerConfig
 ---@field keymaps DiffReviewKeymapConfig
 
 --- Per-repository config read from `<repo root>/.diffreview.json`.
@@ -69,6 +70,7 @@
 ---@field toggle_activity DiffReviewKeymap
 ---@field open_artifact DiffReviewKeymap
 ---@field agent DiffReviewKeymap
+---@field sessions DiffReviewKeymap
 ---@field reopen_question DiffReviewKeymap
 ---@field model DiffReviewKeymap
 ---@field effort_down DiffReviewKeymap
@@ -83,17 +85,15 @@
 ---@field close DiffReviewKeymap
 ---@field help DiffReviewKeymap
 
----@class DiffReviewPlanQuestionKeymapConfig
+---@class DiffReviewPickerKeymapConfig
 ---@field previous DiffReviewKeymap
 ---@field next DiffReviewKeymap
 ---@field select DiffReviewKeymap
 ---@field feedback DiffReviewKeymap
----@field question_previous DiffReviewKeymap
----@field question_next DiffReviewKeymap
+---@field page_previous DiffReviewKeymap
+---@field page_next DiffReviewKeymap
 ---@field focus_input DiffReviewKeymap
 ---@field submit_input DiffReviewKeymap
----@field confirm DiffReviewKeymap
----@field revise DiffReviewKeymap
 ---@field close DiffReviewKeymap
 
 ---@class DiffReviewInteractionKeymapConfig
@@ -105,24 +105,13 @@
 ---@field close DiffReviewKeymap
 ---@field help DiffReviewKeymap
 
----@class DiffReviewSessionKeymapConfig
----@field open DiffReviewKeymap
----@field tab_next DiffReviewKeymap
----@field fork DiffReviewKeymap
----@field rename DiffReviewKeymap
----@field delete DiffReviewKeymap
----@field refresh DiffReviewKeymap
----@field close DiffReviewKeymap
----@field help DiffReviewKeymap
-
 ---@class DiffReviewKeymapConfig
 ---@field status DiffReviewStatusKeymapConfig
 ---@field review DiffReviewReviewKeymapConfig
 ---@field harness DiffReviewHarnessKeymapConfig
 ---@field plan_review DiffReviewPlanReviewKeymapConfig
----@field plan_question DiffReviewPlanQuestionKeymapConfig
+---@field picker DiffReviewPickerKeymapConfig
 ---@field interactions DiffReviewInteractionKeymapConfig
----@field sessions DiffReviewSessionKeymapConfig
 
 ---@class DiffReviewHarnessBackendConfig
 ---@field command string[]
@@ -134,13 +123,17 @@
 ---@field buffer_name string
 ---@field composer_name string
 ---@field interactions_buffer_name string
----@field sessions_buffer_name string
 ---@field composer_min_height integer
 ---@field composer_max_height integer
 ---@field goal_max_turns integer
----@field question_choice_keys string[]
 ---@field non_git_write_confirm boolean
 ---@field backends table<string, DiffReviewHarnessBackendConfig>
+
+---@class DiffReviewPickerConfig
+---@field choice_keys string[]
+---@field session_keys string[]
+---@field max_height integer
+---@field input_height integer
 
 ---@class DiffReviewConfigModule
 ---@field defaults DiffReviewConfig
@@ -178,17 +171,21 @@ M.defaults = {
     buffer_name = "Harness",
     composer_name = "HarnessInput",
     interactions_buffer_name = "Interactions",
-    sessions_buffer_name = "Sessions",
     composer_min_height = 3,
     composer_max_height = 12,
     goal_max_turns = 20,
-    question_choice_keys = { "n", "e", "i", "l", "u", "y" },
     non_git_write_confirm = true,
     backends = {
       acp = { command = { "copilot", "--acp" } },
       codex = { command = { "codex", "app-server" } },
       mock = { command = { "mock" } },
     },
+  },
+  picker = {
+    choice_keys = { "n", "e", "i", "l", "u", "y" },
+    session_keys = { "n", "e", "a", "i", "l", "u", "o", "y" },
+    max_height = 24,
+    input_height = 3,
   },
   keymaps = {
     status = {
@@ -235,6 +232,7 @@ M.defaults = {
       toggle_activity = { "oa", "<Tab>" },
       open_artifact = "op",
       agent = "og",
+      sessions = "os",
       reopen_question = "oe",
       model = "oM",
       effort_down = "<M-,>",
@@ -249,17 +247,15 @@ M.defaults = {
       close = "q",
       help = "?",
     },
-    plan_question = {
+    picker = {
       previous = { "<Up>", "s" },
       next = { "<Down>", "t" },
       select = "<CR>",
       feedback = "<Tab>",
-      question_previous = "<Left>",
-      question_next = "<Right>",
+      page_previous = "<Left>",
+      page_next = "<Right>",
       focus_input = "go",
       submit_input = "<C-s>",
-      confirm = "y",
-      revise = "n",
       close = "q",
     },
     interactions = {
@@ -267,16 +263,6 @@ M.defaults = {
       comment = "C",
       request_changes = "oN",
       rollback = "R",
-      refresh = "r",
-      close = "q",
-      help = "?",
-    },
-    sessions = {
-      open = { "<CR>", "o" },
-      tab_next = "<Tab>",
-      fork = "F",
-      rename = "rn",
-      delete = "d",
       refresh = "r",
       close = "q",
       help = "?",
@@ -306,14 +292,14 @@ function M.setup(opts)
     error("harness.backend must name a configured harness backend")
   end
   local question_key_set = {}
-  for _, key in ipairs(options.harness.question_choice_keys or {}) do
+  for _, key in ipairs(options.picker.choice_keys or {}) do
     if key == "a" or key == "o" then
-      error(('harness.question_choice_keys cannot contain reserved key "%s"'):format(key))
+      error(('picker.choice_keys cannot contain reserved key "%s"'):format(key))
     end
-    if question_key_set[key] then error("harness.question_choice_keys must be unique") end
+    if question_key_set[key] then error("picker.choice_keys must be unique") end
     question_key_set[key] = true
   end
-  if vim.tbl_isempty(question_key_set) then error("harness.question_choice_keys cannot be empty") end
+  if vim.tbl_isempty(question_key_set) then error("picker.choice_keys cannot be empty") end
   M.options = options
   return M.options
 end

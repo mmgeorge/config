@@ -25,8 +25,8 @@
 ---       Preview the compacted unified diff (with `!`, the staged diff).
 ---   :Harness / :HarnessNew
 ---       Open the AI interaction tree/composer or start a fresh durable Harness session.
----   :Interactions / :Sessions
----       Review per-user-action diffs and browse durable repository/global sessions.
+---   :Interactions
+---       Review per-user-action diffs. Harness exposes durable sessions through /sessions.
 ---
 --- GitHub PR review surfaces (the PR overview, in-place PR title/body/reviewer
 --- editing, and the batched review mode with draft comments + verdict) are
@@ -119,7 +119,6 @@
 ---   Harness         Foldable AI interaction tree plus a multiline composer split.
 ---   PlanReview      Physical Markdown plan with edits, annotations, and oY/oN decisions.
 ---   Interactions    Foldable session interaction diffs with review and rollback.
----   Sessions        Current Repo / All Repos Harness session browser.
 ---
 --- ===========================================================================
 --- ARCHITECTURE  (see lua/diff_review/docs/architecture.md for the full reference)
@@ -257,7 +256,6 @@ M.open_compact_preview = commands.open_compact_preview
 M.open_harness = function() require("diff_review.views.harness").open() end
 M.new_harness_session = function() require("diff_review.views.harness").new_session() end
 M.open_interactions = function() require("diff_review.views.interactions").open() end
-M.open_sessions = function() require("diff_review.views.sessions").open() end
 M.set_git_backend = git_backend.set_backend
 M.reset_git_backend = git_backend.reset_backend
 

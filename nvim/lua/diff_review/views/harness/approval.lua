@@ -1,27 +1,13 @@
-local M = {}
+local Approval = {}
 
-local choice_flow = require("diff_review.views.harness.choice_flow")
+local config = require("diff_review.infra.config")
+local picker = require("diff_review.views.picker")
 
----@class DiffReviewApprovalRequest
----@field id string
----@field title string
----@field detail string
----@field reason? string
----@field choice_list { id: string, label: string }[]
-
----@class DiffReviewApprovalHost
----@field transcript_win integer
----@field resolve fun(id: string, choice: string, callback: fun(resolved: boolean))
----@field closed function
-
----@param request DiffReviewApprovalRequest
----@return DiffReviewChoiceFlowOption[]
 local function option_list(request)
-  local key_list = { "n", "e", "i", "l", "u", "y", "o" }
   local result = {}
   for index, choice in ipairs(request.choice_list or {}) do
     result[#result + 1] = {
-      key = key_list[index],
+      key = config.options.picker.choice_keys[index],
       value = choice.id,
       label = choice.label,
     }
@@ -29,37 +15,44 @@ local function option_list(request)
   return result
 end
 
----@param request DiffReviewApprovalRequest
----@param host DiffReviewApprovalHost
-function M.open(request, host)
-  choice_flow.open({
-    parent_win = host.transcript_win,
-    title = "Approval requested",
-    filetype = "DiffReviewHarnessApproval",
-    width = 72,
+---@param request table
+---@param host table
+function Approval.open(request, host)
+  picker.open({
+    owner = "approval",
+    host = {
+      window_list = host.window_list or { host.transcript_win },
+      control_win = host.control_win or host.transcript_win,
+    },
     page_list = {
       {
-        prompt = request.title,
-        detail = request.reason and (request.detail .. "\nReason: " .. request.reason) or request.detail,
+        id = request.id,
+        title = "Approval requested",
+        subtitle = request.title,
+        content_list = {
+          { text = request.detail or "", group = "DiffReviewPickerText" },
+          request.reason and { text = "Reason: " .. request.reason, group = "DiffReviewPickerText" } or nil,
+        },
         option_list = option_list(request),
-        footer = "  ↑↓ navigate  Enter select  q close",
+        footer = "↑↓ select  Enter confirm  q close",
       },
     },
-    on_select = function(option, _, close)
-      host.resolve(request.id, option.value, function(resolved)
-        if resolved then close() end
+    on_confirm = function(result)
+      host.resolve(request.id, result.option.value, function(resolved)
+        if resolved then picker.close(false) end
       end)
+      return false
     end,
     on_close = host.closed,
   })
 end
 
-function M.is_open()
-  return choice_flow.is_open()
+function Approval.is_open()
+  return picker.is_open("approval")
 end
 
-function M.close()
-  choice_flow.close()
+function Approval.close()
+  picker.close()
 end
 
-return M
+return Approval

@@ -253,16 +253,39 @@ type. The standalone diff, file-revision, and preview buffers are separate.
 | Commit console | (scratch) | — | `commit.commit` | Streamed pre-commit hook + git output |
 | Harness interaction tree | `Harness` | — | `:Harness` | Prompt, thought, tool, diff, plan-progress, response, and elapsed-work nodes with stable native folds |
 | Harness composer | `HarnessInput` | — | `:Harness` | Auto-growing multiline prompt input, active-turn steering, FIFO queue editing, and global prompt-history recall |
-| Planning question | `DiffReviewPlanQuestion` | — | `harness_plan_question` | Centered durable choices, attached input, and final answer review |
+| Harness picker | `DiffReviewPicker` | — | Harness selectors and requests | Bottom-anchored search, pages, two-column choices, attached input, and final review |
+| Picker search | `DiffReviewPickerSearch` | — | Session and other searchable selectors | Focused one-line fuzzy input with dynamically assigned result keys |
+| Picker input | `DiffReviewPickerInput` | — | `views/picker/input.lua` | Multiline feedback, Other answers, Ask prompts, custom models, and agent tasks |
 | Plan review | `markdown` | — | `/plan <request>` | Physical editable plan, line annotations, accept or request changes |
 | Interactions | `DiffReviewInteractions` | — | `:Interactions` | Foldable interaction/file/hunk diffs, comments, rollback |
-| Sessions | `DiffReviewSessions` | — | `:Sessions` | Current Repo and All Repos durable session tabs |
 
 **Why one filetype for four views.** Folding, keymaps, highlight groups, and the
 hint-bar winbar are all keyed on the `GitStatus` filetype. Sharing it means the status,
 PR, PR-review, and branch-diff buffers reuse the entire status rendering and interaction
 stack. The `view_kind` field on the state selects which command set, head builders, and
 sections apply, dispatched through the **view-controller registry** (`shared/view_controller.lua`).
+
+### Shared Harness picker
+
+`views/picker/` owns every compact Harness decision surface. Pure state and layout modules own
+single or multiple selection, pages, responsive label/detail rows, and reserved input geometry.
+The renderer applies one frame with extmarks, while the window owner anchors a non-focusable float to the
+bottom of the union of the Harness transcript and composer windows.
+
+The control window retains modal navigation. An optional `DiffReviewPickerSearch` child owns fuzzy
+filtering, while `DiffReviewPickerInput` owns multiline feedback and returns to the control window
+through `go`. The picker captures the opening
+window and mode once, restores existing buffer-local mappings on close, and restores the original
+mode only after the complete picker lifecycle ends. Models, effort, fast mode, artifacts, agents,
+approvals, lease conflicts, execution confirmations, and planning questions therefore share the
+same geometry and focus contract without duplicating popup mechanics.
+
+The `/sessions` specialization defaults to the current repository and toggles all repositories with
+`C-o`. Moving the result selection requests a read-only `session.preview` projection and temporarily
+swaps only the Harness transcript window to a scratch timeline rendered by the regular Harness tree.
+The active transcript buffer keeps receiving background renders off-screen and returns unchanged
+when the picker closes. `C-j` deletes the selected inactive session, while Enter resumes a compatible
+same-repository session. Preview requests never acquire or alter a durable session lease.
 
 ### User command surface
 
@@ -277,8 +300,9 @@ Registered in `nvim/lua/plugins/diff_review.lua`:
 :Harness                              " open_harness()
 :HarnessNew                           " new_harness_session()
 :Interactions                         " open_interactions()
-:Sessions                             " open_sessions()
 ```
+
+Inside Harness, `/sessions` or the configured `os` mapping opens durable session search.
 
 PR and review buffers are opened programmatically by the `github` integration
 (`nvim/lua/github/open_pr.lua`, pickers) through `open_pr` / `open_review`, not by a
@@ -854,7 +878,7 @@ press the commit key
   └─ harness/client JSONL request → Rust broker
        ├─ force READ and capture interaction checkpoint-before
        ├─ ACP or Codex strategy runs one planning turn
-       ├─ harness_plan_question → durable PlanElicitation → centered Harness-relative float
+       ├─ harness_plan_question → durable PlanElicitation → bottom-anchored shared picker
        │    ├─ answers, notes, Other, and clarification turns preserve AwaitingInput
        │    └─ reviewed y confirmation serializes the decisions and resumes the planning contract
        ├─ harness_plan_submit becomes the only review-artifact boundary
@@ -1065,7 +1089,7 @@ ends with an ordinary text question degrades into one free-form decision instead
 The question tool also works during ordinary chat, goal, and execution turns. Those questions
 persist on their owning `InteractionRecord`, while planning questions remain on `PlanRecord`.
 `BrokerSnapshot.active_elicitation` projects either owner through one question UI contract, so
-answer, skip, Ask, and continue reuse the same centered float without creating a plan artifact.
+answer, skip, Ask, and continue reuse the shared bottom picker without creating a plan artifact.
 Ordinary prose never counts as a submitted question set.
 Stable ACP `entries` updates and Codex
 `turn/plan/updated` events feed the generic task tracker without submitting a plan. Names printed
@@ -1083,18 +1107,20 @@ backends omit the command instead of receiving a synthetic summarization prompt.
 
 `/plan` emits `Planning` and `Planned` interaction summaries. A question-only turn becomes
 `Planning paused`, saves `PlanElicitation` under the active `AwaitingInput` plan, renders its
-choices in the timeline, and opens a centered float relative to the Harness transcript window.
-The float shows `Question N of M`, maps provider choices and Other through configurable
-`harness.question_choice_keys`, reserves `a` for Ask, and reserves `o` for Other. Provider choices
+choices in the timeline, and opens the shared picker across the bottom of the complete Harness
+transcript-and-composer surface. The border shows the question title and `N/M` progress. The
+picker maps provider choices and Other through configurable `picker.choice_keys`, reserves `a`
+for Ask, and reserves `o` for Other. Provider choices
 default to `n`, `e`, `i`, `l`, `u`, and `y`. Arrow keys plus `s`/`t` change the light-blue selected
 row without submitting it. The compact footer exposes only question navigation and Tab feedback.
 Enter records an ordinary choice or opens the
 attached editor for Other and Ask. Tab opens that same editor for optional choice feedback.
 Ctrl-s belongs only to the attached input window, where it records the selected answer plus text
-and advances to the next unanswered question. The input renders as an independent rounded float
-below the choice window and uses inline virtual text for left padding, so presentation spacing
-never enters the submitted value. Opening a question forces Normal mode. Enter or Tab starts a
-new input in Insert mode, while `go` moves between existing panes without changing to Insert mode.
+and advances to the next unanswered question. The input renders as an independent rounded child
+inside rows reserved by the parent picker and uses inline virtual text for left padding, so
+presentation spacing never enters the submitted value. Reserving those rows keeps the parent top
+edge stable while the input opens. Opening any picker or attached input forces Normal mode.
+`go` moves between existing panes without changing to Insert mode.
 
 After the final answer, the float becomes an explicit review page that lists every question,
 selected answer, and additional input in question order. `y` closes the elicitation and resumes
@@ -1179,8 +1205,8 @@ publishes one through session configuration. Before resolution, the winbar says
 
 `/rename <name>` routes directly to the broker's durable `session.rename` request rather
 than entering the model transcript. `/rename` clears the optional display name. The
-`:Sessions` view renders that name as its first column and substitutes `[unnamed]` for
-empty names, keeping storage semantics separate from presentation fallback text.
+The `/sessions` picker searches that name and substitutes `[unnamed]` for empty names,
+keeping storage semantics separate from presentation fallback text.
 
 Non-Git WRITE requires an explicit confirmation and permanently displays `NO CHECKPOINT`
 for that session. Git checkpoints include tracked and nonignored untracked files, exclude
@@ -1206,7 +1232,10 @@ after binding, so later wait events cannot reparent a child or create a cycle. T
 also waits for the original parent thread and turn to complete. A child `turn/completed` closes only
 the child timeline and never terminates the parent request.
 
-`/agent` opens a centered selector with Main, Active, Done, and Available sections.
+`/agent` opens the shared bottom picker with Main, Active, Done, and Available sections. Choosing
+an available definition transforms the same picker into an attached multiline task input without
+resizing the Harness split. Choosing an existing run switches timelines and restores the window
+that opened the picker.
 `/agent <definition> <task>` asks the parent Codex thread to spawn the selected definition because
 app-server exposes child lifecycle events but no direct client spawn RPC. The parent instruction
 requests exactly one spawn with the selected definition and rejects default intermediary agents.
@@ -1266,7 +1295,7 @@ The headless suite lives in `nvim/tests/diff_review/` and runs via
 tests never touch a real repo. `diff_architecture.lua` guards the render-engine extraction
 boundaries. `tests/diff_review/harness.lua` drives interaction-tree transitions, node-local
 render transactions, immutable fold behavior, steering acknowledgment and fallback, queue editing,
-output-free prompt restoration, PlanReview, Interactions, Sessions, atomic key-list configuration,
+output-free prompt restoration, PlanReview, Interactions, session search and preview, atomic key-list configuration,
 and fork capability gating through a deterministic JSONL process mock.
 
 The Rust suite runs with `cargo test --manifest-path
@@ -1288,9 +1317,10 @@ The ignored `tests/copilot_acp.rs` integration launches the configured
 "What is this repo?" prompt. Run it explicitly with `cargo test --manifest-path
 nvim/rust/diff-review-harness/Cargo.toml --test copilot_acp -- --ignored --nocapture`.
 
-After automated tests, use Terminal MCP to open `:Harness`, `PlanReview`, `:Interactions`,
-and `:Sessions` at both 160x48 and 100x30. Inspect winbars, folds, prompt navigation,
-composer growth, queue editing, and capability-gated actions in a real PTY.
+After automated tests, use Terminal MCP to open `:Harness`, PlanReview, and `:Interactions`, then
+exercise `/sessions` at both 160x48 and 100x30. Inspect fuzzy filtering, preview replacement,
+scope toggling, deletion, resume, focus restoration, winbars, folds, prompt navigation, composer
+growth, queue editing, and capability-gated actions in a real PTY.
 
 Diagnostics come from `lua-language-server` (`--check`, configured by `nvim/.luarc.json`).
 Most `undefined-field` / `inject-field` volume is the dynamic `dr()` seam, not real bugs.

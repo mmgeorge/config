@@ -5,34 +5,13 @@ local controller = require("diff_review.views.harness.controller")
 local layout = require("diff_review.views.harness.layout")
 local notifications = require("diff_review.infra.notifications")
 local session = require("diff_review.session")
-local interaction_state = require("diff_review.views.harness.interaction_state")
-local prompt_history = require("diff_review.views.harness.prompt_history")
+local snapshot = require("diff_review.views.harness.snapshot")
+local picker = require("diff_review.views.picker")
 
 local function valid_window(win) return win and vim.api.nvim_win_is_valid(win) end
 
 local function apply_snapshot(state, result)
-  local previous_session_id = state.session and state.session.id or nil
-  state.session = result.session
-  if previous_session_id ~= (result.session and result.session.id or nil) then state.activity_expanded = {} end
-  state.capability = result.capability or {}
-  interaction_state.reconcile_snapshot(state, result.interaction or {})
-  state.timeline = vim.deepcopy(result.timeline or {})
-  state.artifact = vim.deepcopy(result.artifact or {})
-  state.no_checkpoint = result.no_checkpoint == true
-  state.goal = result.goal
-  state.active_plan = result.active_plan
-  state.active_elicitation = result.active_elicitation
-  state.approval = vim.deepcopy(result.approval or {})
-  state.agent = vim.deepcopy(result.agent or { definition = {}, run = {}, turn = {} })
-  state.agent_live = {}
-  if state.selected_agent_run_id then
-    local selected_exists = false
-    for _, run in ipairs(state.agent.run or {}) do
-      if run.id == state.selected_agent_run_id then selected_exists = true end
-    end
-    if not selected_exists then state.selected_agent_run_id = nil end
-  end
-  prompt_history.replace(result.prompt_history)
+  snapshot.apply(state, result, "reconcile")
   controller.render(true)
   controller.resolve_runtime_model()
   if state.active_elicitation and state.active_elicitation.elicitation then
@@ -61,14 +40,24 @@ end
 local function finish_start(state, result, start_error, error_detail)
   local conflict = error_detail and error_detail.code == "session_lease_conflict" and error_detail.data or nil
   if conflict then
-    require("diff_review.infra.choice_popup").open({
-      title = "Session in use",
-      relative = "editor",
-      min_width = 34,
-      options = M.lease_conflict_options(conflict),
-      cancel_label = "Cancel",
-      on_choice = function(action)
-        if not action then return end
+    local option_list = M.lease_conflict_options(conflict)
+    for _, option in ipairs(option_list) do option.detail = option.desc end
+    picker.open({
+      host = {
+        window_list = { state.transcript_win, state.composer_win },
+        control_win = state.composer_win,
+      },
+      page_list = {
+        {
+          id = "lease-conflict",
+          title = "Session in use",
+          subtitle = "Another Neovim instance controls this Harness session.",
+          option_list = option_list,
+          footer = "↑↓ select  Enter confirm  q close",
+        },
+      },
+      on_confirm = function(result)
+        local action = result.option.value
         client.resolve_lease_conflict(action, conflict, function(next_result, next_error, next_detail)
           finish_start(state, next_result, next_error, next_detail)
         end)
@@ -107,16 +96,8 @@ function M.new_session()
   client.request("session.new", {}, function(result, request_error)
     if request_error then notifications.error(request_error, "Harness") return end
     local state = session.harness
-    state.session = result.session
-    state.activity_expanded = {}
-    state.capability = result.capability or {}
-    interaction_state.replace(state, result.interaction or {})
+    snapshot.apply(state, result)
     state.queue = {}
-    state.goal = nil
-    state.active_plan = nil
-    state.timeline = vim.deepcopy(result.timeline or {})
-    state.artifact = vim.deepcopy(result.artifact or {})
-    prompt_history.replace(result.prompt_history)
     controller.render(true)
   end)
 end
