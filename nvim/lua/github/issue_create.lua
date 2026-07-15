@@ -1,4 +1,5 @@
 local gh = require("github.gh")
+local popup_window = require("diff_review.infra.popup_window")
 
 local M = {}
 
@@ -52,14 +53,14 @@ function M.open(args)
     return
   end
 
-  vim.ui.input({ prompt = "Issue title: " }, function(input)
+  popup_window.input({ prompt = "Issue title: " }, function(input)
     input = vim.trim(input or "")
     if input == "" then
       notify("Issue creation cancelled: title is required", vim.log.levels.WARN)
       return
     end
 
-    vim.ui.input({ prompt = "Issue body (optional): " }, function(body)
+    popup_window.input({ prompt = "Issue body (optional): " }, function(body)
       if body == nil then
         notify("Issue creation cancelled", vim.log.levels.WARN)
         return

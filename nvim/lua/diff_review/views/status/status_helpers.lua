@@ -8,6 +8,7 @@ local M = {}
 local config = require("diff_review.infra.config")
 local highlights = require("diff_review.infra.highlights")
 local notifications = require("diff_review.infra.notifications")
+local popup_window = require("diff_review.infra.popup_window")
 local datetime = require("diff_review.integrations.datetime")
 local git_backend = require("diff_review.git.git_backend")
 
@@ -179,23 +180,17 @@ local function confirm(lines, on_yes, on_no)
   for _, line in ipairs(body) do
     width = math.max(width, #line + 4)
   end
-  local buf = vim.api.nvim_create_buf(false, true)
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, body)
-  vim.bo[buf].modifiable = false
-  vim.bo[buf].bufhidden = "wipe"
-  local win = vim.api.nvim_open_win(buf, true, {
+  local buf, win = popup_window.open({
     relative = "editor",
     width = width,
     height = #body,
-    col = math.floor((vim.o.columns - width) / 2),
-    row = math.floor((vim.o.lines - #body) / 2),
-    style = "minimal",
-    border = "rounded",
-    title = " Confirm ",
-    title_pos = "center",
+    title = "Confirm",
+    filetype = "DiffReviewConfirm",
   })
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, body)
+  vim.bo[buf].modifiable = false
   local function close()
-    if vim.api.nvim_win_is_valid(win) then pcall(vim.api.nvim_win_close, win, true) end
+    popup_window.close(win)
   end
   local function cancel()
     close()
@@ -215,26 +210,20 @@ end
 ---@param prefix string prefilled text
 ---@param on_submit fun(name: string?)
 local function prompt_branch_name(prefix, on_submit)
-  local buf = vim.api.nvim_create_buf(false, true)
-  vim.bo[buf].bufhidden = "wipe"
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, { prefix })
   local width = math.min(60, math.max(30, math.floor(vim.o.columns * 0.4)))
-  local win = vim.api.nvim_open_win(buf, true, {
+  local buf, win = popup_window.open({
     relative = "editor",
-    row = math.floor((vim.o.lines - 3) / 2),
-    col = math.floor((vim.o.columns - width) / 2),
     width = width,
     height = 1,
-    style = "minimal",
-    border = "rounded",
-    title = " New branch ",
-    title_pos = "center",
+    title = "New branch",
+    filetype = "DiffReviewBranchPrompt",
   })
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, { prefix })
   local done = false
   local function finish(value)
     if done then return end
     done = true
-    if vim.api.nvim_win_is_valid(win) then pcall(vim.api.nvim_win_close, win, true) end
+    popup_window.close(win)
     on_submit(value)
   end
   vim.keymap.set({ "i", "n" }, "<CR>", function()
@@ -245,7 +234,6 @@ local function prompt_branch_name(prefix, on_submit)
   vim.keymap.set("n", "<Esc>", function() finish(nil) end, { buffer = buf, nowait = true })
   vim.keymap.set("n", "q", function() finish(nil) end, { buffer = buf, nowait = true })
   vim.api.nvim_create_autocmd("BufLeave", { buffer = buf, once = true, callback = function() finish(nil) end })
-  vim.cmd("startinsert!")
 end
 
 --- `bc`: prompt for a name (prefilled with the repo's branch prefix) and

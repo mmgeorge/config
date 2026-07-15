@@ -7,6 +7,7 @@ local M = {}
 local config = require("diff_review.infra.config")
 local gh = require("diff_review.integrations.gh")
 local notifications = require("diff_review.infra.notifications")
+local popup_window = require("diff_review.infra.popup_window")
 local command_specs = require("diff_review.shared.command_specs")
 local status_command_specs = command_specs.specs
 local status_command_specs_by_id = command_specs.by_id
@@ -680,24 +681,16 @@ function M.show_view_help(group, command_set, title, context)
   end
   local width = math.min(80, math.max(40, vim.o.columns - 8))
   local height = math.min(#line + 2, math.max(6, vim.o.lines - 6))
-  local buf = vim.api.nvim_create_buf(false, true)
-  vim.bo[buf].buftype = "nofile"
-  vim.bo[buf].bufhidden = "wipe"
-  vim.bo[buf].modifiable = true
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, line)
-  vim.bo[buf].modifiable = false
-  local win = vim.api.nvim_open_win(buf, true, {
+  local buf, win = popup_window.open({
     relative = "editor",
-    row = math.floor((vim.o.lines - height) / 2),
-    col = math.floor((vim.o.columns - width) / 2),
     width = width,
     height = height,
-    border = "rounded",
-    style = "minimal",
-    title = " " .. title .. " ",
-    title_pos = "center",
+    title = title,
+    filetype = "DiffReviewHelp",
   })
-  vim.keymap.set("n", "q", function() if vim.api.nvim_win_is_valid(win) then vim.api.nvim_win_close(win, true) end end,
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, line)
+  vim.bo[buf].modifiable = false
+  vim.keymap.set("n", "q", function() popup_window.close(win) end,
     { buffer = buf, silent = true, nowait = true, desc = "Close help" })
 end
 

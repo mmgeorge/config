@@ -22,6 +22,7 @@ local function apply_snapshot(state, result)
   state.goal = result.goal
   state.active_plan = result.active_plan
   state.active_elicitation = result.active_elicitation
+  state.approval = vim.deepcopy(result.approval or {})
   state.agent = vim.deepcopy(result.agent or { definition = {}, run = {}, turn = {} })
   state.agent_live = {}
   if state.selected_agent_run_id then
@@ -38,6 +39,7 @@ local function apply_snapshot(state, result)
     state.presented_question_set_id = nil
     vim.schedule(controller.present_plan_question)
   end
+  if #state.approval > 0 then vim.schedule(controller.present_approval) end
   if state.goal and state.goal.state == "active" then
     vim.schedule(controller.drain)
   end
@@ -98,7 +100,6 @@ function M.open()
   controller.render(true)
   client.start(function(result, start_error, error_detail) finish_start(state, result, start_error, error_detail) end)
   vim.api.nvim_set_current_win(state.composer_win)
-  vim.cmd("startinsert")
 end
 
 function M.new_session()

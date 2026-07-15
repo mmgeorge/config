@@ -78,10 +78,10 @@ impl InteractionRecord {
                 .count()
                 + 1;
             self.node_list.push(InteractionNode::MainSegment {
-                segment: MainSegment::running(
+                segment: Box::new(MainSegment::running(
                     format!("{}:segment:{segment_ordinal}", self.id),
                     now_ms,
-                ),
+                )),
             });
         }
         match self.node_list.last_mut() {

@@ -1,16 +1,21 @@
+use crate::backend::approval::PermissionCoordinator;
 use crate::backend::json_rpc::JsonRpcProcess;
 use crate::backend::steering::SteeringLane;
 use crate::backend::{
     Backend, BackendCapability, BackendEventSink, BackendModel, BackendOutput, BackendRequest,
     PromptMode,
 };
-use crate::session::WriteMode;
+use crate::session::ExecutionMode;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::{Value, json};
+use std::sync::Arc;
 use tokio::sync::Mutex;
 
+mod security;
 mod turn_coordinator;
+
+use security::CodexSecurity;
 
 /// Owns Codex app-server thread lifecycle, prompting, permission policy, and native fork.
 pub struct CodexBackend {
@@ -18,6 +23,7 @@ pub struct CodexBackend {
     default_model: Mutex<Option<String>>,
     steering: SteeringLane,
     active_turn: Mutex<CodexTurnState>,
+    permission_coordinator: Arc<PermissionCoordinator>,
 }
 
 /// Tracks whether the current prompt reached Codex conversation history.
@@ -34,8 +40,17 @@ enum CodexTurnState {
 }
 
 impl CodexBackend {
-    /// Build a Codex backend from its app-server launch command.
+    /// Build a Codex backend with an isolated conservative permission registry.
     pub fn new(command: Vec<String>) -> Result<Self> {
+        let permission_coordinator = PermissionCoordinator::transient(".")?;
+        Self::new_with_permission_coordinator(command, permission_coordinator)
+    }
+
+    /// Build a Codex backend with the shared Harness permission coordinator.
+    pub fn new_with_permission_coordinator(
+        command: Vec<String>,
+        permission_coordinator: Arc<PermissionCoordinator>,
+    ) -> Result<Self> {
         anyhow::ensure!(
             !command.is_empty(),
             "Codex backend requires harness.backends.codex.command"
@@ -45,6 +60,7 @@ impl CodexBackend {
             default_model: Mutex::new(None),
             steering: SteeringLane::default(),
             active_turn: Mutex::new(CodexTurnState::Idle),
+            permission_coordinator,
         })
     }
 
@@ -54,11 +70,13 @@ impl CodexBackend {
         output: &mut BackendOutput,
         event_sink: Option<BackendEventSink>,
     ) -> Result<JsonRpcProcess> {
+        let security = CodexSecurity::new(request.execution_mode);
+        let command = security.launch_command(&self.command);
         let mut process = JsonRpcProcess::start(
-            &self.command,
-            request.write_mode == WriteMode::Write,
+            &command,
             &request.workspace,
-            request.trust_policy.clone(),
+            request.execution_mode,
+            Arc::clone(&self.permission_coordinator),
             event_sink,
         )
         .await?;
@@ -70,12 +88,13 @@ impl CodexBackend {
         Ok(process)
     }
 
-    fn approval_policy(request: &BackendRequest) -> &'static str {
-        if request.write_mode == WriteMode::Write {
-            "never"
-        } else {
-            "untrusted"
-        }
+    fn apply_security(params: &mut Value, request: &BackendRequest) {
+        CodexSecurity::new(request.execution_mode).apply(params, &request.workspace);
+    }
+
+    fn secure(mut params: Value, request: &BackendRequest) -> Value {
+        Self::apply_security(&mut params, request);
+        params
     }
 
     fn with_model(mut params: Value, model: &str) -> Value {
@@ -240,6 +259,12 @@ impl Backend for CodexBackend {
                 model_selection: true,
                 effort_selection: true,
                 permission_control: true,
+                execution_mode_list: vec![
+                    ExecutionMode::Read,
+                    ExecutionMode::Write,
+                    ExecutionMode::Full,
+                    ExecutionMode::Yolo,
+                ],
                 agent: crate::agent::AgentCapability::codex(),
             },
             ..BackendOutput::default()
@@ -253,16 +278,12 @@ impl Backend for CodexBackend {
         output.runtime.model = Some(resolved_model);
         let plan_question_schema = crate::control_tools::plan_question_input_schema();
         let thread = match &request.backend_session_id {
-            Some(thread_id) => process.request("thread/resume", json!({
+            Some(thread_id) => process.request("thread/resume", Self::secure(json!({
                 "threadId": thread_id,
+                "cwd": request.workspace
+            }), &request), &mut output).await?,
+            None => process.request("thread/start", Self::with_model(Self::secure(json!({
                 "cwd": request.workspace,
-                "approvalPolicy": Self::approval_policy(&request),
-                "sandbox": if request.write_mode == WriteMode::Write { "workspace-write" } else { "read-only" }
-            }), &mut output).await?,
-            None => process.request("thread/start", Self::with_model(json!({
-                "cwd": request.workspace,
-                "approvalPolicy": Self::approval_policy(&request),
-                "sandbox": if request.write_mode == WriteMode::Write { "workspace-write" } else { "read-only" },
                 "experimentalRawEvents": false,
                 "historyMode": "legacy",
                 "developerInstructions": "You run inside DiffReview Harness. Call harness_plan_question whenever the user asks for interactive or multiple-choice questions, and during planning when a material user decision is required. The question tool works in every mode. Call harness_plan_submit only with a complete Markdown plan. End the turn after a Harness question or plan control call. For a terminal goal state, call harness_goal_complete or harness_goal_blocked. Never claim a control action through ordinary prose alone.",
@@ -273,7 +294,7 @@ impl Backend for CodexBackend {
                     { "type": "function", "name": "harness_goal_blocked", "description": "Mark the active Harness goal blocked.", "inputSchema": { "type": "object", "properties": { "reason": { "type": "string" } }, "required": ["reason"] } },
                     { "type": "function", "name": "harness_goal_status", "description": "Report nonterminal progress toward the active Harness goal.", "inputSchema": { "type": "object", "properties": { "status": { "type": "string" } }, "required": ["status"] } }
                 ]
-            }), &request.model), &mut output).await?,
+            }), &request), &request.model), &mut output).await?,
         };
         let thread_id = thread
             .pointer("/thread/id")
@@ -324,17 +345,13 @@ impl Backend for CodexBackend {
                 )
                 .await?;
         }
-        let (turn, provider_turn_started, observed_message_list) = self.start_turn(&mut process, &mut output, &request, &thread_id, Self::with_model(json!({
+        let (turn, provider_turn_started, observed_message_list) = self.start_turn(&mut process, &mut output, &request, &thread_id, Self::with_model(Self::secure(json!({
             "threadId": thread_id,
             "input": [{ "type": "text", "text": prompt }],
             "cwd": request.workspace,
             "effort": request.effort,
-            "serviceTier": if request.fast_mode { Value::String("fast".into()) } else { Value::Null },
-            "approvalPolicy": Self::approval_policy(&request),
-            "sandboxPolicy": {
-                "type": if request.write_mode == WriteMode::Write { "workspaceWrite" } else { "readOnly" }
-            }
-        }), &request.model)).await?;
+            "serviceTier": if request.fast_mode { Value::String("fast".into()) } else { Value::Null }
+        }), &request), &request.model)).await?;
         let turn_id = turn
             .pointer("/turn/id")
             .or_else(|| turn.get("turnId"))
@@ -376,12 +393,19 @@ impl Backend for CodexBackend {
             .context("Codex thread has not started")?;
         let mut output = BackendOutput::default();
         let mut process = self.connect(&request, &mut output, None).await?;
-        let result = process.request("thread/fork", json!({
-            "threadId": source,
-            "cwd": request.workspace,
-            "approvalPolicy": Self::approval_policy(&request),
-            "sandbox": if request.write_mode == WriteMode::Write { "workspace-write" } else { "read-only" }
-        }), &mut output).await?;
+        let result = process
+            .request(
+                "thread/fork",
+                Self::secure(
+                    json!({
+                        "threadId": source,
+                        "cwd": request.workspace
+                    }),
+                    &request,
+                ),
+                &mut output,
+            )
+            .await?;
         result
             .pointer("/thread/id")
             .or_else(|| result.get("threadId"))
@@ -419,6 +443,12 @@ impl Backend for CodexBackend {
                 model_selection: true,
                 effort_selection: true,
                 permission_control: true,
+                execution_mode_list: vec![
+                    ExecutionMode::Read,
+                    ExecutionMode::Write,
+                    ExecutionMode::Full,
+                    ExecutionMode::Yolo,
+                ],
                 agent: crate::agent::AgentCapability::codex(),
             },
             ..BackendOutput::default()
@@ -427,12 +457,13 @@ impl Backend for CodexBackend {
         process
             .request(
                 "thread/resume",
-                json!({
-                    "threadId": thread_id,
-                    "cwd": request.workspace,
-                    "approvalPolicy": Self::approval_policy(&request),
-                    "sandbox": if request.write_mode == WriteMode::Write { "workspace-write" } else { "read-only" }
-                }),
+                Self::secure(
+                    json!({
+                        "threadId": thread_id,
+                        "cwd": request.workspace
+                    }),
+                    &request,
+                ),
                 &mut output,
             )
             .await?;

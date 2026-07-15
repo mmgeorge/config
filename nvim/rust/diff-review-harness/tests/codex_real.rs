@@ -1,6 +1,7 @@
-use diff_review_harness::backend::{BackendLaunch, TrustPolicy};
+use diff_review_harness::backend::BackendLaunch;
 use diff_review_harness::broker::{HarnessBroker, InitializeRequest};
 use diff_review_harness::protocol::BrokerRequest;
+use diff_review_harness::session::ExecutionMode;
 use serde_json::{Value, json};
 use std::process::Command;
 use std::time::Duration;
@@ -21,6 +22,7 @@ async fn asks_for_feedback_then_creates_a_plan_without_native_collaboration_mode
 
     let mut broker = HarnessBroker::initialize(InitializeRequest {
         data_root: temporary.path().join("data").to_string_lossy().into_owned(),
+        permission_file: None,
         workspace: workspace.to_string_lossy().into_owned(),
         client_id: "real-codex-test".into(),
         backend: BackendLaunch {
@@ -29,8 +31,6 @@ async fn asks_for_feedback_then_creates_a_plan_without_native_collaboration_mode
         },
         model: "default".into(),
         effort: "low".into(),
-        trust_profile: "workspace".into(),
-        trust_policy: TrustPolicy::default(),
         session_id: None,
         goal_max_turns: 20,
         lease_conflict_action: None,
@@ -98,19 +98,30 @@ async fn asks_for_feedback_then_creates_a_plan_without_native_collaboration_mode
         diff_review_harness::plan::PlanState::AwaitingInput
     );
     let elicitation = paused_plan.elicitation.expect("pending elicitation");
-    let question_id = elicitation
+    let question = elicitation
         .current_question()
-        .expect("current planning question")
-        .id
+        .expect("current planning question");
+    let question_id = question.id.clone();
+    let selected_option = question
+        .options
+        .iter()
+        .find(|option| option.label.to_ascii_lowercase().contains("integration"))
+        .or_else(|| question.options.first())
+        .expect("Codex planning question should provide a selectable answer")
+        .label
         .clone();
 
     let answered = broker
         .dispatch(BrokerRequest {
             id: 4,
-            method: "plan.question.answer".into(),
+            method: "question.answer".into(),
             params: json!({
                 "question_id": question_id,
-                "response": { "kind": "other", "text": "Integration tests" }
+                "response": {
+                    "kind": "selected",
+                    "option": selected_option,
+                    "feedback": null
+                }
             }),
         })
         .await;
@@ -124,7 +135,7 @@ async fn asks_for_feedback_then_creates_a_plan_without_native_collaboration_mode
         Duration::from_secs(120),
         broker.dispatch(BrokerRequest {
             id: 5,
-            method: "plan.question.continue".into(),
+            method: "question.continue".into(),
             params: Value::Null,
         }),
     )
@@ -138,8 +149,46 @@ async fn asks_for_feedback_then_creates_a_plan_without_native_collaboration_mode
     let snapshot = broker.snapshot().unwrap();
     assert_eq!(snapshot.artifact.len(), 1);
     assert!(std::path::Path::new(&snapshot.artifact[0].working_path).exists());
+    assert_eq!(snapshot.session.execution_mode, ExecutionMode::Read);
+
+    let new_session = broker
+        .dispatch(BrokerRequest {
+            id: 6,
+            method: "session.new".into(),
+            params: Value::Null,
+        })
+        .await;
+    assert!(new_session.response.error.is_none());
     assert_eq!(
-        snapshot.session.write_mode,
-        diff_review_harness::session::WriteMode::Read
+        broker.snapshot().unwrap().session.execution_mode,
+        ExecutionMode::Read
     );
+    let write_mode = broker
+        .dispatch(BrokerRequest {
+            id: 7,
+            method: "session.execution_mode".into(),
+            params: json!({ "mode": "write" }),
+        })
+        .await;
+    assert!(write_mode.response.error.is_none());
+    let write_result = tokio::time::timeout(
+        Duration::from_secs(120),
+        broker.dispatch(BrokerRequest {
+            id: 8,
+            method: "prompt.submit".into(),
+            params: json!({
+                "text": "Create mode-write-proof.txt in the workspace with exactly this content: `Harness native Write mode verified`. Do not change any other file."
+            }),
+        }),
+    )
+    .await
+    .expect("real Codex Write-mode timeout");
+    assert!(
+        write_result.response.error.is_none(),
+        "{:?}",
+        write_result.response.error
+    );
+    let write_proof = std::fs::read_to_string(workspace.join("mode-write-proof.txt"))
+        .expect("Write mode should create the requested workspace file");
+    assert_eq!(write_proof.trim_end(), "Harness native Write mode verified");
 }

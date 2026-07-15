@@ -1,6 +1,7 @@
 local M = {}
 
 local command_set = require("diff_review.shared.view_command_set")
+local navigation = require("diff_review.views.harness.choice_flow.navigation")
 local config = require("diff_review.infra.config")
 local input_window = require("diff_review.views.harness.plan_question.input_window")
 local keymaps = require("diff_review.shared.keymaps")
@@ -160,7 +161,7 @@ close = function(notify_host)
   local host = state.host
   clear_modal_keymaps()
   input_window.close(state.input_win)
-  if valid_window() then vim.api.nvim_win_close(state.win, true) end
+  window.close(state.win)
   state.buf = nil
   state.win = nil
   state.elicitation = nil
@@ -199,7 +200,7 @@ end
 
 local function move(delta)
   if #state.entry_list == 0 then return end
-  state.selected_index = ((state.selected_index - 1 + delta) % #state.entry_list) + 1
+  state.selected_index = navigation.cycle(state.selected_index, #state.entry_list, delta)
   render_view()
   update_input_target()
 end
@@ -213,7 +214,7 @@ local function move_question(delta)
   local count = model.question_count(state.elicitation)
   if count == 0 or not previous_question then return end
   local current_index = state.elicitation.current_index or 0
-  state.elicitation.current_index = math.max(0, math.min(count - 1, current_index + delta))
+  state.elicitation.current_index = navigation.clamp(current_index + 1, count, delta) - 1
   local question = current_question()
   state.entry_list = question and model.entries(question, config.options.harness.question_choice_keys) or {}
   select_answered_entry()
@@ -241,7 +242,6 @@ end
 local function edit_input()
   if not valid_input_window() then return end
   vim.api.nvim_set_current_win(state.input_win)
-  vim.cmd("startinsert!")
 end
 
 local function commit_input()
@@ -452,7 +452,6 @@ function M.open(elicitation, host)
   local parent_height = vim.api.nvim_win_get_height(host.transcript_win)
   local height = math.min(#initial_frame.lines, math.max(6, parent_height - 10))
   state.buf, state.win = window.open(host.transcript_win, width, height, title())
-  vim.cmd("stopinsert")
   render_view()
   install_keymaps()
 end

@@ -29,6 +29,10 @@ Version durable session payloads with one exact current format. Hide sessions wr
 
 Prefer deleting obsolete compatibility code when a format changes. Tests should prove that current data reopens and outdated data stays invisible, not that historical formats migrate successfully.
 
+Harness permissions live in `stdpath("config")/diff_review/permissions.json` and use the validated Rulesync-shaped JSON format owned by the Rust sidecar. Edit that one document through `:Permissions`. Keep Read, Write, Full, and YOLO as fixed execution modes, project each mode through the backend's native sandbox boundary, and never let JSON permission rules widen the selected mode. Do not reintroduce named trust profiles, Lua boolean permission tables, provider-specific approval persistence, or direct writes that bypass policy validation.
+
+Keep the global Rulesync `codexcli` target free of the `permissions` feature while Harness owns Codex approvals. A generated Codex exec policy can reject an operation before Harness receives its approval request, splitting policy ownership across two evaluators.
+
 ## GitHub Data And Issue Cache
 
 All Neovim GitHub state that should survive restarts belongs under the `gitstatus` namespace in Neovim's data dir. `github.repo_cache.base_dir()` defaults to `vim.fs.joinpath(vim.fn.stdpath("data"), "gitstatus")`.

@@ -1,14 +1,16 @@
+use crate::backend::approval::PermissionCoordinator;
 use crate::backend::json_rpc::JsonRpcProcess;
 use crate::backend::{
     Backend, BackendCapability, BackendEventSink, BackendModel, BackendOutput, BackendRequest,
 };
-use crate::session::WriteMode;
+use crate::session::ExecutionMode;
 use agent_client_protocol::schema::v1::SessionModeState;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use tokio::sync::Mutex;
 
 pub(crate) mod terminal;
@@ -17,6 +19,7 @@ pub(crate) mod terminal;
 pub struct AcpBackend {
     command: Vec<String>,
     connection: Mutex<Option<AcpConnection>>,
+    permission_coordinator: Arc<PermissionCoordinator>,
 }
 
 /// Owns one long-lived ACP agent process and its known provider sessions.
@@ -29,8 +32,17 @@ struct AcpConnection {
 }
 
 impl AcpBackend {
-    /// Build an ACP backend from its configured executable and arguments.
+    /// Build an ACP backend with an isolated conservative permission registry.
     pub fn new(command: Vec<String>) -> Result<Self> {
+        let permission_coordinator = PermissionCoordinator::transient(".")?;
+        Self::new_with_permission_coordinator(command, permission_coordinator)
+    }
+
+    /// Build an ACP backend with the shared Harness permission coordinator.
+    pub fn new_with_permission_coordinator(
+        command: Vec<String>,
+        permission_coordinator: Arc<PermissionCoordinator>,
+    ) -> Result<Self> {
         anyhow::ensure!(
             !command.is_empty(),
             "ACP backend requires harness.backends.acp.command"
@@ -38,6 +50,7 @@ impl AcpBackend {
         Ok(Self {
             command,
             connection: Mutex::new(None),
+            permission_coordinator,
         })
     }
 
@@ -49,16 +62,16 @@ impl AcpBackend {
     ) -> Result<AcpConnection> {
         let mut process = JsonRpcProcess::start(
             &self.command,
-            request.write_mode == WriteMode::Write,
             &request.workspace,
-            request.trust_policy.clone(),
+            request.execution_mode,
+            Arc::clone(&self.permission_coordinator),
             event_sink,
         )
         .await?;
         let initialized = process.request("initialize", json!({
             "protocolVersion": 1,
             "clientCapabilities": {
-                "fs": { "readTextFile": true, "writeTextFile": request.write_mode == WriteMode::Write },
+                "fs": { "readTextFile": true, "writeTextFile": request.execution_mode.permits_workspace_write() },
                 "terminal": true
             },
             "clientInfo": { "name": "diff-review-harness", "version": env!("CARGO_PKG_VERSION") }
@@ -90,6 +103,7 @@ impl AcpBackend {
             model_selection: false,
             effort_selection: false,
             permission_control: true,
+            execution_mode_list: vec![ExecutionMode::Read, ExecutionMode::Write],
             agent: crate::agent::AgentCapability::default(),
         }
     }
@@ -300,13 +314,13 @@ impl AcpBackend {
         connection: &mut AcpConnection,
         request: &BackendRequest,
         event_sink: Option<BackendEventSink>,
-    ) {
+    ) -> Result<()> {
         connection.process.configure_request(
-            request.write_mode == WriteMode::Write,
             &request.workspace,
-            request.trust_policy.clone(),
+            request.execution_mode,
             event_sink,
         );
+        Ok(())
     }
 
     fn session_id(session: &Value, fallback: Option<&str>) -> Result<String> {
@@ -481,7 +495,7 @@ impl Backend for AcpBackend {
             let connection = connection_guard
                 .as_mut()
                 .context("ACP connection initialization failed")?;
-            Self::configure_connection(connection, &attempt_request, event_sink.clone());
+            Self::configure_connection(connection, &attempt_request, event_sink.clone())?;
             let result = async {
                 output.capability = Self::capability(&connection.initialized);
                 output.capability.native_compact = connection.native_compact;
@@ -561,7 +575,7 @@ impl Backend for AcpBackend {
         let connection = connection_guard
             .as_mut()
             .context("ACP connection initialization failed")?;
-        Self::configure_connection(connection, &request, None);
+        Self::configure_connection(connection, &request, None)?;
         let result = async {
             anyhow::ensure!(
                 Self::capability(&connection.initialized).native_fork,
@@ -615,7 +629,7 @@ impl Backend for AcpBackend {
         let connection = connection_guard
             .as_mut()
             .context("ACP connection initialization failed")?;
-        Self::configure_connection(connection, &request, None);
+        Self::configure_connection(connection, &request, None)?;
         let result = async {
             let session = Self::inspect_session(connection, &request, &mut output).await?;
             let effort = Self::config_option(&session, "thought_level")
@@ -647,7 +661,7 @@ impl Backend for AcpBackend {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::backend::{PromptMode, TrustPolicy};
+    use crate::backend::PromptMode;
 
     fn request(mode: PromptMode) -> BackendRequest {
         BackendRequest {
@@ -657,9 +671,7 @@ mod test {
             model: "default".into(),
             effort: "medium".into(),
             fast_mode: false,
-            write_mode: WriteMode::Read,
-            trust_profile: "workspace".into(),
-            trust_policy: TrustPolicy::default(),
+            execution_mode: ExecutionMode::Read,
             backend_session_id: None,
         }
     }

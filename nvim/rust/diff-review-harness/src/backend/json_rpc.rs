@@ -1,16 +1,21 @@
 use crate::agent::{AgentLifecycleEvent, AgentRunStatus};
+use crate::backend::approval::{
+    ApprovalResolution, PermissionCoordinator, acp_response, codex_response,
+    permission_from_provider, protected_target,
+};
 use crate::backend::{
     BackendEvent, BackendEventSink, BackendOutput, ProviderChangeKind, ProviderChangeSet,
     ProviderFileChange, ProviderTaskEntry, ProviderTaskUpdate, TaskStatus, ToolActivity,
-    ToolActivityKind, TrustPolicy,
+    ToolActivityKind,
 };
 use crate::plan::PlanQuestionSet;
-use crate::session::ContextUsage;
+use crate::session::{ContextUsage, ExecutionMode};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 
@@ -20,9 +25,9 @@ pub struct JsonRpcProcess {
     stdin: ChildStdin,
     stdout: tokio::io::Lines<BufReader<ChildStdout>>,
     next_id: u64,
-    write_allowed: bool,
     workspace: String,
-    trust_policy: TrustPolicy,
+    execution_mode: ExecutionMode,
+    permission_coordinator: Arc<PermissionCoordinator>,
     event_sink: Option<BackendEventSink>,
     terminal: super::acp::terminal::TerminalStore,
 }
@@ -31,9 +36,9 @@ impl JsonRpcProcess {
     /// Start one provider process with isolated stdin, stdout, and stderr pipes.
     pub async fn start(
         command: &[String],
-        write_allowed: bool,
         workspace: &str,
-        trust_policy: TrustPolicy,
+        execution_mode: ExecutionMode,
+        permission_coordinator: Arc<PermissionCoordinator>,
         event_sink: Option<BackendEventSink>,
     ) -> Result<Self> {
         let (program, args) = command
@@ -60,9 +65,9 @@ impl JsonRpcProcess {
             stdin,
             stdout: BufReader::new(stdout).lines(),
             next_id: 1,
-            write_allowed,
             workspace: workspace.to_owned(),
-            trust_policy,
+            execution_mode,
+            permission_coordinator,
             event_sink,
             terminal: super::acp::terminal::TerminalStore::default(),
         })
@@ -71,14 +76,12 @@ impl JsonRpcProcess {
     /// Configure per-turn workspace, permission, and live-event state.
     pub fn configure_request(
         &mut self,
-        write_allowed: bool,
         workspace: &str,
-        trust_policy: TrustPolicy,
+        execution_mode: ExecutionMode,
         event_sink: Option<BackendEventSink>,
     ) {
-        self.write_allowed = write_allowed;
         self.workspace = workspace.to_owned();
-        self.trust_policy = trust_policy;
+        self.execution_mode = execution_mode;
         self.event_sink = event_sink;
     }
 
@@ -192,38 +195,44 @@ impl JsonRpcProcess {
     async fn provider_request_result(&mut self, method: &str, message: &Value) -> Result<Value> {
         let params = message.get("params").unwrap_or(&Value::Null);
         match method {
-            "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
-                Ok(codex_permission_result(
-                    self.write_allowed
-                        && workspace_profile_allows(message, &self.workspace, &self.trust_policy),
-                ))
+            "item/commandExecution/requestApproval"
+            | "item/fileChange/requestApproval"
+            | "item/permissions/requestApproval"
+            | "mcpServer/elicitation/request" => {
+                if method == "mcpServer/elicitation/request"
+                    && message
+                        .pointer("/params/meta/codex_approval_kind")
+                        .and_then(Value::as_str)
+                        != Some("mcp_tool_call")
+                {
+                    return Ok(json!({ "action": "decline", "content": Value::Null }));
+                }
+                let resolution = self.authorize_provider_request(method, message).await?;
+                Ok(codex_response(message, resolution))
             }
-            "item/permissions/requestApproval" => Ok(codex_permission_result(false)),
             "item/tool/call" => Ok(json!({
                 "contentItems": [{ "type": "inputText", "text": "Recorded by DiffReview Harness" }],
                 "success": true
             })),
-            "session/request_permission" => Ok(acp_permission_result(
-                message,
-                self.write_allowed
-                    && workspace_profile_allows(message, &self.workspace, &self.trust_policy),
-            )),
-            "fs/read_text_file" => self.read_text_file(params),
-            "fs/write_text_file" => self.write_text_file(params),
+            "session/request_permission" => {
+                let resolution = self.authorize_provider_request(method, message).await?;
+                Ok(acp_response(message, resolution))
+            }
+            "fs/read_text_file" => {
+                self.require_provider_permission(method, message).await?;
+                self.read_text_file(params)
+            }
+            "fs/write_text_file" => {
+                self.require_provider_permission(method, message).await?;
+                self.write_text_file(params)
+            }
             "terminal/create" => {
-                anyhow::ensure!(
-                    workspace_profile_allows(message, &self.workspace, &self.trust_policy),
-                    "trust profile denied ACP terminal command"
-                );
+                self.require_provider_permission(method, message).await?;
                 let cwd = params
                     .get("cwd")
                     .and_then(Value::as_str)
                     .unwrap_or(&self.workspace);
-                let cwd = provider_path(
-                    cwd,
-                    &self.workspace,
-                    self.trust_policy.allow_outside_workspace,
-                )?;
+                let cwd = provider_path(cwd, &self.workspace, true)?;
                 anyhow::ensure!(cwd.is_dir(), "ACP terminal cwd is not a directory");
                 self.terminal.create(params, cwd).await
             }
@@ -235,8 +244,45 @@ impl JsonRpcProcess {
         }
     }
 
+    async fn authorize_provider_request(
+        &mut self,
+        method: &str,
+        message: &Value,
+    ) -> Result<ApprovalResolution> {
+        let request = permission_from_provider(method, message, &self.workspace);
+        let protected = {
+            let store = self.permission_coordinator.store();
+            let store = store
+                .read()
+                .map_err(|_| anyhow::anyhow!("permission store lock poisoned"))?;
+            protected_target(&request, &store)
+        };
+        if protected {
+            return Ok(ApprovalResolution::DenyOnce);
+        }
+        let resolution = self
+            .permission_coordinator
+            .authorize(self.execution_mode, request, self.event_sink.as_ref())
+            .await?;
+        Ok(resolution)
+    }
+
+    async fn require_provider_permission(&mut self, method: &str, message: &Value) -> Result<()> {
+        let resolution = self.authorize_provider_request(method, message).await?;
+        anyhow::ensure!(
+            matches!(
+                resolution,
+                ApprovalResolution::AllowOnce
+                    | ApprovalResolution::AllowExact
+                    | ApprovalResolution::AllowBroad
+            ),
+            "Harness permissions denied provider request"
+        );
+        Ok(())
+    }
+
     fn read_text_file(&self, params: &Value) -> Result<Value> {
-        let path = required_provider_path(params, &self.workspace, &self.trust_policy)?;
+        let path = required_provider_path_unrestricted(params)?;
         let content = fs::read_to_string(&path)
             .with_context(|| format!("read ACP file {}", path.display()))?;
         let line = params.get("line").and_then(Value::as_u64).unwrap_or(1);
@@ -245,12 +291,7 @@ impl JsonRpcProcess {
     }
 
     fn write_text_file(&self, params: &Value) -> Result<Value> {
-        anyhow::ensure!(self.write_allowed, "READ mode denies ACP file writes");
-        anyhow::ensure!(
-            self.trust_policy.allow_workspace_write,
-            "trust profile denies ACP workspace writes"
-        );
-        let path = required_provider_path(params, &self.workspace, &self.trust_policy)?;
+        let path = required_provider_path_unrestricted(params)?;
         let content = params
             .get("content")
             .and_then(Value::as_str)
@@ -266,45 +307,12 @@ impl Drop for JsonRpcProcess {
     }
 }
 
-fn acp_permission_result(message: &Value, write_allowed: bool) -> Value {
-    if !write_allowed {
-        return json!({ "outcome": { "outcome": "cancelled" } });
-    }
-    let option_id = message
-        .pointer("/params/options")
-        .and_then(Value::as_array)
-        .and_then(|option| {
-            option
-                .iter()
-                .find(|entry| {
-                    let kind = entry
-                        .get("kind")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    kind.contains("allow") || kind.contains("once")
-                })
-                .or_else(|| option.first())
-        })
-        .and_then(|entry| entry.get("optionId").or_else(|| entry.get("option_id")))
-        .cloned()
-        .unwrap_or_else(|| Value::String("allow_once".into()));
-    json!({ "outcome": { "outcome": "selected", "optionId": option_id } })
-}
-
-fn codex_permission_result(write_allowed: bool) -> Value {
-    json!({ "decision": if write_allowed { "acceptForSession" } else { "decline" } })
-}
-
-fn required_provider_path(
-    params: &Value,
-    workspace: &str,
-    policy: &TrustPolicy,
-) -> Result<PathBuf> {
+fn required_provider_path_unrestricted(params: &Value) -> Result<PathBuf> {
     let path = params
         .get("path")
         .and_then(Value::as_str)
         .context("ACP file path is required")?;
-    provider_path(path, workspace, policy.allow_outside_workspace)
+    normalize_absolute(Path::new(path))
 }
 
 fn provider_path(path: &str, workspace: &str, allow_outside_workspace: bool) -> Result<PathBuf> {
@@ -378,87 +386,6 @@ fn select_line(content: &str, line: u64, limit: Option<u64>) -> String {
         .skip(skip_count)
         .take(take_count)
         .collect()
-}
-
-fn workspace_profile_allows(message: &Value, workspace: &str, policy: &TrustPolicy) -> bool {
-    let encoded = message.to_string().to_ascii_lowercase();
-    let contains_command = message.pointer("/params/command").is_some()
-        || encoded.contains("commandexecution")
-        || encoded.contains("terminal");
-    if contains_command && !policy.allow_command {
-        return false;
-    }
-    if encoded.contains("filechange") && !policy.allow_workspace_write {
-        return false;
-    }
-    let git_index = ["git add", "git reset", "git restore --staged"]
-        .iter()
-        .any(|pattern| encoded.contains(pattern));
-    let git_history = [
-        "git commit",
-        "git checkout",
-        "git switch",
-        "git rebase",
-        "git merge",
-        "git cherry-pick",
-        "git push",
-        "git fetch",
-        "git pull",
-    ]
-    .iter()
-    .any(|pattern| encoded.contains(pattern));
-    let network = ["curl ", "wget ", "invoke-webrequest", "invoke-restmethod"]
-        .iter()
-        .any(|pattern| encoded.contains(pattern));
-    let elevation = ["sudo ", "runas "]
-        .iter()
-        .any(|pattern| encoded.contains(pattern));
-    let denied_command = (git_index && !policy.allow_git_index)
-        || (git_history && !policy.allow_git_history)
-        || (network && !policy.allow_network)
-        || (elevation && !policy.allow_elevation);
-    if denied_command {
-        return false;
-    }
-
-    if policy.allow_outside_workspace {
-        return true;
-    }
-    let Ok(workspace) = normalize_absolute(Path::new(workspace)) else {
-        return false;
-    };
-    absolute_path_list(message).into_iter().all(|path| {
-        normalize_absolute(Path::new(&path)).is_ok_and(|path| path_starts_with(&path, &workspace))
-    })
-}
-
-fn absolute_path_list(value: &Value) -> Vec<String> {
-    let mut result = Vec::new();
-    match value {
-        Value::Object(map) => {
-            for (key, child) in map {
-                if (key.eq_ignore_ascii_case("path") || key.to_ascii_lowercase().ends_with("path"))
-                    && child.as_str().is_some_and(is_absolute_path)
-                {
-                    result.push(child.as_str().unwrap_or_default().to_owned());
-                }
-                result.extend(absolute_path_list(child));
-            }
-        }
-        Value::Array(item) => {
-            for child in item {
-                result.extend(absolute_path_list(child));
-            }
-        }
-        _ => {}
-    }
-    result
-}
-
-fn is_absolute_path(path: &str) -> bool {
-    path.starts_with('/')
-        || path.starts_with("\\\\")
-        || path.as_bytes().get(1).is_some_and(|byte| *byte == b':')
 }
 
 #[cfg(test)]
@@ -1414,33 +1341,13 @@ mod test {
     use super::*;
 
     #[test]
-    fn workspace_profile_denies_index_network_and_outside_paths() {
+    fn provider_paths_preserve_the_workspace_boundary() {
         let root = tempfile::tempdir().unwrap();
         let workspace = root.path().join("work");
         let sibling = root.path().join("work-other");
         fs::create_dir_all(workspace.join("src")).unwrap();
         fs::create_dir_all(&sibling).unwrap();
         let workspace = workspace.to_string_lossy().into_owned();
-        assert!(!workspace_profile_allows(
-            &json!({ "params": { "command": "git add ." } }),
-            &workspace,
-            &TrustPolicy::default()
-        ));
-        assert!(!workspace_profile_allows(
-            &json!({ "params": { "command": "curl https://example.com" } }),
-            &workspace,
-            &TrustPolicy::default()
-        ));
-        assert!(!workspace_profile_allows(
-            &json!({ "params": { "path": sibling.join("file.txt") } }),
-            &workspace,
-            &TrustPolicy::default()
-        ));
-        assert!(workspace_profile_allows(
-            &json!({ "params": { "path": Path::new(&workspace).join("src/main.rs"), "command": "cargo test" } }),
-            &workspace,
-            &TrustPolicy::default()
-        ));
         assert!(
             provider_path(
                 Path::new(&workspace)

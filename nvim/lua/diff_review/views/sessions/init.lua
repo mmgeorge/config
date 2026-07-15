@@ -5,6 +5,7 @@ local command_set = require("diff_review.shared.view_command_set")
 local config = require("diff_review.infra.config")
 local keymaps = require("diff_review.shared.keymaps")
 local notifications = require("diff_review.infra.notifications")
+local popup_window = require("diff_review.infra.popup_window")
 local session = require("diff_review.session")
 local interaction_state = require("diff_review.views.harness.interaction_state")
 
@@ -39,7 +40,8 @@ local function render(item)
     local active = session.harness.session and session.harness.session.id == entry.id and "*" or " "
     local name = type(entry.name) == "string" and vim.trim(entry.name) or ""
     if name == "" then name = "[unnamed]" end
-    local mode = string.upper(entry.write_mode or "read")
+    local raw_mode = entry.execution_mode or "read"
+    local mode = raw_mode == "yolo" and "YOLO" or (raw_mode:sub(1, 1):upper() .. raw_mode:sub(2))
     local provider = entry.backend_session_id and "provider linked" or "not started"
     line[#line + 1] = ("%-28s %s %-7s %-8s %-14s %s/%s"):format(
       name, active, mode, entry.backend or "", provider, entry.model or "", entry.effort or ""
@@ -144,7 +146,7 @@ end
 local function rename()
   local entry = selected_session()
   if not entry then return end
-  vim.ui.input({ prompt = "Session name: ", default = entry.name or "" }, function(name)
+  popup_window.input({ prompt = "Session name: ", default = entry.name or "" }, function(name)
     if name == nil then return end
     client.request("session.rename", { session_id = entry.id, name = vim.trim(name) }, function(_, request_error)
       if request_error then notifications.error(request_error, "Sessions") return end
@@ -156,7 +158,7 @@ end
 local function delete()
   local entry = selected_session()
   if not entry then return end
-  vim.ui.select({ "Cancel", "Delete Harness state" }, {
+  popup_window.select({ "Cancel", "Delete Harness state" }, {
     prompt = "Delete this Harness session? The native provider session remains intact.",
   }, function(choice)
     if choice ~= "Delete Harness state" then return end

@@ -176,10 +176,13 @@ function M.apply(state, render, options)
   local buf = state.transcript_buf
   local win = state.transcript_win
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return { replaced = 0 } end
+  local transcript_visible = win
+    and vim.api.nvim_win_is_valid(win)
+    and vim.api.nvim_win_get_buf(win) == buf
   local previous_lines = state.render_initialized and state.rendered_lines
     or vim.api.nvim_buf_get_lines(buf, 0, -1, false)
   local saved_view, anchor = nil, nil
-  if win and vim.api.nvim_win_is_valid(win) then
+  if transcript_visible then
     vim.api.nvim_win_call(win, function()
       saved_view = vim.fn.winsaveview()
       local cursor = vim.api.nvim_win_get_cursor(win)
@@ -235,11 +238,13 @@ function M.apply(state, render, options)
   state.render_initialized = true
   state.render_rows = render.rows or {}
   local next_fold_signature = fold_signature(render.folds)
-  if options.reset == true or state.render_fold_signature ~= next_fold_signature then
+  if transcript_visible and (options.reset == true or state.render_fold_signature ~= next_fold_signature) then
     install_folds(win, render.folds or {})
     state.render_fold_signature = next_fold_signature
+  elseif not transcript_visible then
+    state.render_fold_signature = nil
   end
-  if win and vim.api.nvim_win_is_valid(win) then
+  if transcript_visible then
     if options.follow_tail then
       vim.api.nvim_win_call(win, function()
         local line_count = math.max(1, vim.api.nvim_buf_line_count(buf))

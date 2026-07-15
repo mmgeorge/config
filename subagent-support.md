@@ -198,7 +198,7 @@ Each parent interaction persists an ordered `InteractionNode` list. A `MainSegme
 
 Codex keeps one app-server process alive after an early parent `turn/completed` notification whenever descendant threads remain active. A logical-turn coordinator continues consuming child lifecycle events, accepts Ctrl-q steering as a new parent turn on the same thread, and starts a bounded final synthesis turn after the last descendant completes. `Waiting on N subagents` derives from transient coordinator state. It disappears when parent work resumes or every child finishes and never enters SQLite history.
 
-Schema version 6 migrates categorical interaction fields into this ordered node model once. The Lua projection consumes only the ordered representation. This explicit migration prevents the renderer from re-sorting old thoughts, agents, steering, and responses on every frame.
+The Lua projection consumes only the ordered representation. Sessions carry an exact format version, and the store hides every noncurrent session instead of migrating or partially decoding its timeline.
 
 The selector should show:
 

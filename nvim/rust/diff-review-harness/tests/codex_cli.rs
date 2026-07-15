@@ -1,12 +1,12 @@
 use diff_review_harness::agent::AgentRunStatus;
 use diff_review_harness::backend::codex::CodexBackend;
 use diff_review_harness::backend::{
-    Backend, BackendLaunch, BackendRequest, PromptMode, ToolActivityKind, TrustPolicy,
+    Backend, BackendLaunch, BackendRequest, PromptMode, ToolActivityKind,
 };
 use diff_review_harness::broker::{HarnessBroker, InitializeRequest};
 use diff_review_harness::plan::PlanPrompt;
 use diff_review_harness::protocol::BrokerRequest;
-use diff_review_harness::session::WriteMode;
+use diff_review_harness::session::ExecutionMode;
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
@@ -28,13 +28,11 @@ fn request(workspace: &Path, mode: PromptMode, text: &str) -> BackendRequest {
         model: "gpt-5.6-terra".into(),
         effort: "low".into(),
         fast_mode: true,
-        write_mode: if mode == PromptMode::Plan {
-            WriteMode::Read
+        execution_mode: if mode == PromptMode::Plan {
+            ExecutionMode::Read
         } else {
-            WriteMode::Write
+            ExecutionMode::Write
         },
-        trust_profile: "workspace".into(),
-        trust_policy: TrustPolicy::default(),
         backend_session_id: None,
     }
 }
@@ -226,7 +224,7 @@ async fn streams_structured_child_agent_lifecycle() {
         PromptMode::Chat,
         "Spawn an explorer subagent to read README.md and report its heading. Wait for it to finish.",
     );
-    backend_request.write_mode = WriteMode::Read;
+    backend_request.execution_mode = ExecutionMode::Read;
     let output = tokio::time::timeout(Duration::from_secs(90), backend.prompt(backend_request))
         .await
         .expect("Codex subagent turn exceeded 90 seconds")
@@ -331,6 +329,7 @@ async fn broker_runs_the_configured_local_code_explorer_to_parent_completion() {
     .unwrap();
     let mut broker = HarnessBroker::initialize(InitializeRequest {
         data_root: data_root.path().to_string_lossy().into_owned(),
+        permission_file: None,
         workspace: repository.path().to_string_lossy().into_owned(),
         client_id: "real-local-code-explorer-test".into(),
         backend: BackendLaunch {
@@ -339,8 +338,6 @@ async fn broker_runs_the_configured_local_code_explorer_to_parent_completion() {
         },
         model: "gpt-5.6-terra".into(),
         effort: "low".into(),
-        trust_profile: "workspace".into(),
-        trust_policy: TrustPolicy::default(),
         session_id: None,
         goal_max_turns: 20,
         lease_conflict_action: None,

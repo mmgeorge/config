@@ -5,6 +5,7 @@ pub mod checkpoint;
 pub mod control_tools;
 pub mod goal;
 pub mod interaction;
+pub mod permissions;
 pub mod plan;
 pub mod protocol;
 pub mod session;

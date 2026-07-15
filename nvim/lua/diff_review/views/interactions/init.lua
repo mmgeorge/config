@@ -5,6 +5,7 @@ local command_set = require("diff_review.shared.view_command_set")
 local config = require("diff_review.infra.config")
 local keymaps = require("diff_review.shared.keymaps")
 local notifications = require("diff_review.infra.notifications")
+local popup_window = require("diff_review.infra.popup_window")
 local renderer = require("diff_review.render.harness.interactions")
 local annotations = require("diff_review.render.annotations")
 local comment_box = require("diff_review.render.comment_box")
@@ -98,7 +99,7 @@ local function add_comment()
     notifications.warn("Move to a changed line before adding an interaction comment", "Interactions")
     return
   end
-  vim.ui.input({ prompt = "Interaction comment: " }, function(body)
+  popup_window.input({ prompt = "Interaction comment: " }, function(body)
     if not body or vim.trim(body) == "" then return end
     local comment = {
       id = ("nvim-%s-%s"):format(vim.fn.getpid(), vim.uv.hrtime()),
@@ -146,7 +147,7 @@ local function rollback()
     notifications.warn("Rollback is unavailable because this session has NO CHECKPOINT", "Interactions")
     return
   end
-  vim.ui.select({ "Cancel", "Rollback interaction " .. tostring(row.interaction.ordinal) }, {
+  popup_window.select({ "Cancel", "Rollback interaction " .. tostring(row.interaction.ordinal) }, {
     prompt = "Restore the worktree before this interaction and supersede later interactions?",
   }, function(choice)
     if not choice or choice == "Cancel" then return end

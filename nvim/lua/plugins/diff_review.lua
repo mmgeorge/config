@@ -5,7 +5,7 @@ return {
     dependencies = { "folke/snacks.nvim" },
     cmd = {
       "GitStatus", "GitBranchDiff", "GitBranchDiffFile", "GitFileRevision", "GitDiffCompactPreview",
-      "Harness", "HarnessNew", "Interactions", "Sessions",
+      "Harness", "HarnessNew", "Interactions", "Sessions", "Permissions",
     },
     opts = {
       perf_logging = true,
@@ -33,6 +33,9 @@ return {
       vim.api.nvim_create_user_command("Sessions", function()
         diff_review.open_sessions()
       end, { desc = "Browse Harness sessions" })
+      vim.api.nvim_create_user_command("Permissions", function()
+        require("diff_review.views.permissions").open()
+      end, { desc = "Edit Harness permissions" })
       local function complete_branches(arglead)
         local refs = vim.fn.systemlist({ "git", "for-each-ref", "--format=%(refname:short)", "refs/heads", "refs/remotes" })
         if vim.v.shell_error ~= 0 then return {} end

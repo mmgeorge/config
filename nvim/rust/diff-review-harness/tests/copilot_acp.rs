@@ -1,6 +1,6 @@
 use diff_review_harness::backend::acp::AcpBackend;
-use diff_review_harness::backend::{Backend, BackendRequest, PromptMode, TrustPolicy};
-use diff_review_harness::session::WriteMode;
+use diff_review_harness::backend::{Backend, BackendRequest, PromptMode};
+use diff_review_harness::session::ExecutionMode;
 use std::fs;
 
 #[tokio::test]
@@ -28,9 +28,7 @@ async fn answers_a_basic_read_only_prompt_through_the_default_acp_command() {
             model: "default".into(),
             effort: "medium".into(),
             fast_mode: false,
-            write_mode: WriteMode::Read,
-            trust_profile: "workspace".into(),
-            trust_policy: TrustPolicy::default(),
+            execution_mode: ExecutionMode::Read,
             backend_session_id: None,
         })
         .await

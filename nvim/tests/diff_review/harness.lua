@@ -129,8 +129,7 @@ local active_session = {
   provider_label = "Mock CLI",
   resolved_model = "mock-model-resolved",
   effort = "low",
-  trust_profile = "workspace",
-  write_mode = "read",
+  execution_mode = "read",
   native_fork = false,
 }
 
@@ -253,6 +252,7 @@ local function fake_launcher(command, options, _)
             model_selection = true,
           },
           no_checkpoint = false,
+          approval = {},
           prompt_history = prompt_history,
         } })
       end, 80)
@@ -509,10 +509,28 @@ local function fake_launcher(command, options, _)
       emit(options, { id = request.id, result = active_session })
     elseif request.method == "backend.models" then
       emit(options, { id = request.id, result = { { id = "mock-model", label = "Mock model", effort = { "low" } } } })
-    elseif request.method == "mode.set" then
-      active_session.write_mode = request.params.mode
-      emit(options, { event = "mode_changed", payload = active_session })
+    elseif request.method == "session.execution_mode" then
+      active_session.execution_mode = request.params.mode
+      emit(options, { event = "execution_mode_changed", payload = active_session })
       emit(options, { id = request.id, result = active_session })
+    elseif request.method == "test.approval.open" then
+      emit(options, { event = "backend_event", payload = {
+        kind = "approval_requested",
+        data = {
+          id = "approval-test",
+          title = "Run command",
+          detail = "rg TODO",
+          profile = "Read",
+          choice_list = { { id = "deny_once", label = "Deny once" } },
+        },
+      } })
+      emit(options, { id = request.id, result = { opened = true } })
+    elseif request.method == "test.approval.cancel" then
+      emit(options, { event = "backend_event", payload = {
+        kind = "approval_cancelled",
+        data = { id = "approval-test" },
+      } })
+      emit(options, { id = request.id, result = { cancelled = true } })
     elseif request.method == "session.configure" then
       active_session = vim.tbl_extend("force", active_session, request.params)
       emit(options, { event = "session_configured", payload = active_session })
@@ -578,7 +596,7 @@ local function fake_launcher(command, options, _)
         retract_request = nil
       end
     elseif request.method == "session.new" then
-      active_session = vim.tbl_extend("force", active_session, { id = "session-two", write_mode = "read" })
+      active_session = vim.tbl_extend("force", active_session, { id = "session-two", execution_mode = "read" })
       emit(options, { event = "session_changed", payload = { session = active_session, interaction = {} } })
       emit(options, { id = request.id, result = {
         session = active_session,
@@ -589,7 +607,7 @@ local function fake_launcher(command, options, _)
       active_session = vim.tbl_extend("force", active_session, {
         id = "session-fork",
         native_fork = true,
-        write_mode = "read",
+        execution_mode = "read",
       })
       emit(options, { event = "session_changed", payload = { session = active_session } })
       emit(options, { id = request.id, result = {
@@ -617,6 +635,8 @@ local function fake_launcher(command, options, _)
         goal = { objective = "fail", state = "paused" },
         active_plan = active_plan,
         active_elicitation = active_elicitation,
+        approval = {},
+        agent = { definition = {}, run = {}, turn = {} },
         artifact = active_plan and active_plan.working_path ~= "" and { active_plan } or {},
         prompt_history = prompt_history,
       } })
@@ -927,6 +947,20 @@ local ok, failure = pcall(function()
     "wrapped Harness rows should preserve their existing indent without adding another shift")
   assert_equals(vim.api.nvim_buf_get_lines(session.harness.transcript_buf, 0, 1, false)[1], "",
     "new Harness transcripts should open empty")
+  client.request("test.approval.open", {}, function() end)
+  assert_true(vim.wait(1000, function()
+    return require("diff_review.views.harness.approval").is_open()
+      and #(session.harness.approval or {}) == 1
+  end, 10), "streamed approvals should open without waiting for a state snapshot")
+  assert_true(vim.wo[session.harness.transcript_win].winbar:find("Approval requested", 1, true) ~= nil,
+    "a pending approval should appear in the Harness winbar")
+  client.request("test.approval.cancel", {}, function() end)
+  assert_true(vim.wait(1000, function()
+    return not require("diff_review.views.harness.approval").is_open()
+      and #(session.harness.approval or {}) == 0
+  end, 10), "approval cancellation should close the float and clear pending state")
+  assert_true(vim.wo[session.harness.transcript_win].winbar:find("Approval requested", 1, true) == nil,
+    "approval cancellation should clear the Harness winbar")
   local original_get_parser = vim.treesitter.get_parser
   local original_treesitter_start = vim.treesitter.start
   local original_render_markdown = package.loaded["render-markdown"]
@@ -1254,6 +1288,12 @@ local ok, failure = pcall(function()
     "Harness transcripts should hide the fold gutter")
   assert_equals(vim.wo[session.harness.composer_win].foldcolumn, "1",
     "Harness input should reserve a one-character gutter")
+  local composer_mode_autocmd_list = vim.api.nvim_get_autocmds({
+    group = "DiffReviewHarnessComposerMode",
+    buffer = session.harness.composer_buf,
+  })
+  assert_true(#composer_mode_autocmd_list == 2,
+    "HarnessInput should enforce Normal mode on buffer and window entry")
   local wrapped_buf = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_buf_set_lines(wrapped_buf, 0, -1, false, {
     "header",
@@ -1286,7 +1326,7 @@ local ok, failure = pcall(function()
     "winbar should expose normalized context remaining at the right edge")
   local plain_winbar = vim.wo[session.harness.transcript_win].winbar:gsub("%%#.-#", ""):gsub("%%%*", "")
   assert_true(plain_winbar:find("Harness", 1, true) == nil, "winbar should omit the redundant view name")
-  assert_true(vim.wo[session.harness.transcript_win].winbar:find("@workspace", 1, true) == nil, "winbar should omit the trust profile")
+  assert_true(vim.wo[session.harness.transcript_win].winbar:find("@workspace", 1, true) == nil, "winbar should omit legacy trust labels")
   assert_equals(vim.wo[session.harness.composer_win].winbar, "", "composer should not duplicate the Harness winbar")
   session.harness.goal = { objective = "Complete the plan", state = "active" }
   controller.refresh_winbar()
@@ -1413,7 +1453,7 @@ local ok, failure = pcall(function()
     "choice-only Harness pickers should float over the transcript area")
   local command_source = require("diff_review.views.harness.completion.command_source").new()
   vim.api.nvim_set_current_win(session.harness.composer_win)
-  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/" })
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/ " })
   vim.api.nvim_win_set_cursor(session.harness.composer_win, { 1, 1 })
   assert_true(command_source:enabled(), "slash completion should activate at the start of a Harness prompt")
   local command_completion = nil
@@ -1423,6 +1463,10 @@ local ok, failure = pcall(function()
     "slash completion should expose session rename")
   assert_true(vim.iter(command_completion.items):any(function(item) return item.label == "/compact" end),
     "slash completion should expose compact when the backend advertises it")
+  assert_true(vim.iter(command_completion.items):any(function(item) return item.label == "/full" end),
+    "slash completion should expose Full mode")
+  assert_true(vim.iter(command_completion.items):any(function(item) return item.label == "/yolo" end),
+    "slash completion should expose YOLO mode")
   assert_equals(command_completion.items[1].label, "/plan", "slash completion should prioritize plan creation")
 
   session.harness.capability.agent = { catalog = false }
@@ -1441,7 +1485,7 @@ local ok, failure = pcall(function()
     run = {},
     turn = {},
   }
-  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/agent exp" })
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/agent exp " })
   vim.api.nvim_win_set_cursor(session.harness.composer_win, { 1, 10 })
   command_source:get_completions({}, function(result) command_completion = result end)
   assert_equals(#command_completion.items, 2, "/agent should complete definitions from the broker catalog")
@@ -1506,13 +1550,26 @@ local ok, failure = pcall(function()
     return item.label == "@nvim/lua/diff_review/init.lua"
   end), "workspace file completion should include Git-visible files")
   vim.fn.maparg("<S-Tab>", "n", false, true).callback()
-  assert_true(vim.wait(1000, function() return active_session.write_mode == "write" end, 10), "Shift-Tab should enable Write mode")
-  assert_equals(request_by_method["mode.set"].params.mode, "write", "Shift-Tab should route Write through the broker")
+  assert_true(vim.wait(1000, function() return active_session.execution_mode == "write" end, 10),
+    "Shift-Tab should enable Write mode")
+  assert_equals(request_by_method["session.execution_mode"].params.mode, "write",
+    "Shift-Tab should route Write mode through the broker")
   assert_true(vim.wo[session.harness.transcript_win].winbar:find("Write", 1, true) ~= nil, "winbar should show Write mode")
   assert_true(vim.wo[session.harness.transcript_win].winbar:find("%#DiffReviewHarnessWrite#Write%*", 1, true) ~= nil,
-    "winbar should render Write with the yellow mode highlight")
+    "winbar should render Write with its mode highlight")
   vim.fn.maparg("<S-Tab>", "n", false, true).callback()
-  assert_true(vim.wait(1000, function() return active_session.write_mode == "read" end, 10), "second Shift-Tab should restore Read mode")
+  assert_true(vim.wait(1000, function() return active_session.execution_mode == "full" end, 10),
+    "second Shift-Tab should enable Full mode")
+  assert_true(vim.wo[session.harness.transcript_win].winbar:find("%#DiffReviewHarnessFull#Full%*", 1, true) ~= nil,
+    "winbar should render Full with its mode highlight")
+  vim.fn.maparg("<S-Tab>", "n", false, true).callback()
+  assert_true(vim.wait(1000, function() return active_session.execution_mode == "yolo" end, 10),
+    "third Shift-Tab should enable YOLO mode")
+  assert_true(vim.wo[session.harness.transcript_win].winbar:find("%#DiffReviewHarnessYolo#YOLO%*", 1, true) ~= nil,
+    "winbar should render YOLO with its mode highlight")
+  vim.fn.maparg("<S-Tab>", "n", false, true).callback()
+  assert_true(vim.wait(1000, function() return active_session.execution_mode == "read" end, 10),
+    "fourth Shift-Tab should restore Read mode")
 
   vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "hello harness" })
   local tool_frame_start = #render_frame_list + 1
@@ -1853,6 +1910,25 @@ local ok, failure = pcall(function()
     .. tostring(projection_error))
   assert_equals(vim.api.nvim_win_get_cursor(duplicate_win)[1], 1,
     "shrinking a timeline projection should clamp the cursor to the rendered buffer")
+  local foreign_buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(foreign_buf, 0, -1, false, { "trust policy", "still editing" })
+  vim.api.nvim_win_set_buf(duplicate_win, foreign_buf)
+  vim.api.nvim_win_set_cursor(duplicate_win, { 2, 0 })
+  local hidden_render = interaction_renderer.build(duplicate_interaction, { expanded = duplicate_expanded })
+  local hidden_ok, hidden_error = pcall(
+    require("diff_review.render.harness.transaction").apply,
+    duplicate_state,
+    hidden_render,
+    { follow_tail = true }
+  )
+  assert_true(hidden_ok, "rendering a hidden transcript should not address the visible policy buffer: "
+    .. tostring(hidden_error))
+  assert_equals(vim.api.nvim_win_get_buf(duplicate_win), foreign_buf,
+    "a hidden transcript render should preserve the window's current buffer")
+  assert_equals(vim.api.nvim_win_get_cursor(duplicate_win)[1], 2,
+    "a hidden transcript render should preserve the foreign buffer cursor")
+  vim.api.nvim_win_set_buf(duplicate_win, duplicate_buf)
+  vim.api.nvim_buf_delete(foreign_buf, { force = true })
   vim.api.nvim_win_close(duplicate_win, true)
   vim.api.nvim_buf_delete(duplicate_buf, { force = true })
   local diff_key = "projection:file:1"

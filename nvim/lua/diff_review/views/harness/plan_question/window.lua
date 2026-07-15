@@ -1,7 +1,7 @@
 local M = {}
 
 local namespace = vim.api.nvim_create_namespace("DiffReviewHarnessPlanQuestion")
-local popup_window = require("diff_review.views.harness.popup.window")
+local choice_window = require("diff_review.views.harness.choice_flow.window")
 
 ---@param transcript_win integer
 ---@param width integer
@@ -9,14 +9,7 @@ local popup_window = require("diff_review.views.harness.popup.window")
 ---@param title string
 ---@return integer, integer
 function M.open(transcript_win, width, height, title)
-  return popup_window.open({
-    parent_win = transcript_win,
-    width = width,
-    height = height,
-    title = title,
-    filetype = "DiffReviewPlanQuestion",
-    zindex = 80,
-  })
+  return choice_window.open(transcript_win, width, height, title, "DiffReviewPlanQuestion", 80)
 end
 
 ---@param win integer
@@ -24,7 +17,7 @@ end
 ---@param width integer
 ---@param height integer
 function M.resize(win, transcript_win, width, height)
-  popup_window.resize(win, transcript_win, width, height)
+  choice_window.resize(win, transcript_win, width, height)
 end
 
 ---@param buf integer
@@ -70,25 +63,30 @@ function M.render(buf, frame, selected_index, entry_list)
     -1
   )
   vim.bo[buf].modifiable = false
-  popup_window.clamp_view(vim.fn.bufwinid(buf), buf)
+  choice_window.clamp_view(vim.fn.bufwinid(buf), buf)
 end
 
 ---@param win integer
 ---@param hidden boolean
 function M.set_cursor_hidden(win, hidden)
-  popup_window.set_cursor_hidden(win, hidden)
+  choice_window.set_cursor_hidden(win, hidden)
 end
 
 ---@param win integer
 ---@param focusable boolean
 function M.set_focusable(win, focusable)
-  popup_window.set_focusable(win, focusable)
+  choice_window.set_focusable(win, focusable)
 end
 
 ---@param win integer
 ---@param title string
 function M.set_title(win, title)
-  popup_window.set_title(win, title)
+  choice_window.set_title(win, title)
+end
+
+---@param win integer?
+function M.close(win)
+  choice_window.close(win)
 end
 
 return M

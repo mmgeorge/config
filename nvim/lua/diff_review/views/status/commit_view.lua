@@ -24,6 +24,7 @@ local function entry_nav() return require("diff_review.views.status.entry_nav") 
 local function fold_state() return require("diff_review.views.status.fold_state") end
 local status_helpers = require("diff_review.views.status.status_helpers")
 local notifications = require("diff_review.infra.notifications")
+local popup_window = require("diff_review.infra.popup_window")
 local ui = require("diff_review.infra.ui")
 local session = require("diff_review.session")
 
@@ -42,25 +43,18 @@ function M._status_confirm_create_pr(on_yes)
     width = math.max(width, #line + 4)
   end
 
-  local buf = vim.api.nvim_create_buf(false, true)
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, body)
-  vim.bo[buf].modifiable = false
-  vim.bo[buf].bufhidden = "wipe"
-
-  local win = vim.api.nvim_open_win(buf, true, {
+  local buf, win = popup_window.open({
     relative = "editor",
     width = width,
     height = #body,
-    col = math.floor((vim.o.columns - width) / 2),
-    row = math.floor((vim.o.lines - #body) / 2),
-    style = "minimal",
-    border = "rounded",
-    title = " GitStatus ",
-    title_pos = "center",
+    title = "GitStatus",
+    filetype = "DiffReviewConfirm",
   })
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, body)
+  vim.bo[buf].modifiable = false
 
   local function close()
-    if vim.api.nvim_win_is_valid(win) then pcall(vim.api.nvim_win_close, win, true) end
+    popup_window.close(win)
   end
 
   vim.keymap.set("n", "y", function()
@@ -395,29 +389,18 @@ local function status_open_popup(title, lines)
   width = math.min(math.max(width, 44), math.max(vim.o.columns - 4, 20))
   local height = math.min(#lines, math.max(vim.o.lines - 6, 1))
 
-  local buf = vim.api.nvim_create_buf(false, true)
-  vim.bo[buf].bufhidden = "wipe"
-  vim.bo[buf].buftype = "nofile"
-  vim.bo[buf].filetype = "DiffReviewHelp"
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-  vim.bo[buf].modifiable = false
-
-  local win = vim.api.nvim_open_win(buf, true, {
+  local buf, win = popup_window.open({
     relative = "editor",
     width = width,
     height = height,
-    col = math.floor((vim.o.columns - width) / 2),
-    row = math.floor((vim.o.lines - height) / 2),
-    style = "minimal",
-    border = "rounded",
-    title = " " .. title .. " ",
-    title_pos = "center",
+    title = title,
+    filetype = "DiffReviewHelp",
   })
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].modifiable = false
 
   local function close()
-    if vim.api.nvim_win_is_valid(win) then
-      pcall(vim.api.nvim_win_close, win, true)
-    end
+    popup_window.close(win)
   end
   for _, key in ipairs({ "q", "<Esc>", status_keys.primary_key("help") }) do
     if key ~= "" then

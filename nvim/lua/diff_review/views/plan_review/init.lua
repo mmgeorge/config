@@ -4,6 +4,7 @@ local client = require("diff_review.harness.client")
 local command_set = require("diff_review.shared.view_command_set")
 local keymaps = require("diff_review.shared.keymaps")
 local notifications = require("diff_review.infra.notifications")
+local popup_window = require("diff_review.infra.popup_window")
 local session = require("diff_review.session")
 
 local namespace = vim.api.nvim_create_namespace("DiffReviewPlanReview")
@@ -36,7 +37,7 @@ end
 ---@param buf integer
 local function add_comment(plan, buf)
   local line = vim.api.nvim_win_get_cursor(0)[1] - 1
-  vim.ui.input({ prompt = "Plan comment: " }, function(body)
+  popup_window.input({ prompt = "Plan comment: " }, function(body)
     if not body or vim.trim(body) == "" or not vim.api.nvim_buf_is_valid(buf) then return end
     local mark = vim.api.nvim_buf_set_extmark(buf, namespace, line, 0, {
       right_gravity = false,
@@ -130,7 +131,7 @@ end
 local function request_changes(plan, buf)
   if not write_plan(buf) then return end
   local annotation = serialized_annotation(plan, buf)
-  vim.ui.input({ prompt = "Overall plan review comment (optional): " }, function(comment)
+  popup_window.input({ prompt = "Overall plan review comment (optional): " }, function(comment)
     if comment == nil then return end
     set_locked(buf, true)
     session.harness.busy = true

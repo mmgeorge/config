@@ -1,6 +1,7 @@
 local gh = require("github.gh")
 local github_comment_rows = require("github.comment_rows")
 local issue_index = require("github.issue_index")
+local popup_window = require("diff_review.infra.popup_window")
 local diff_review_ok, diff_review = pcall(require, "diff_review")
 if not diff_review_ok then diff_review = nil end
 -- Reach the diff_review PR view modules directly (the init re-export seam was removed).
@@ -948,11 +949,15 @@ local function show_commands_popup()
   end
   width = math.min(math.max(width, 32), math.max(32, vim.o.columns - 4))
   local height = #lines
-  local popup_buf = vim.api.nvim_create_buf(false, true)
-  vim.bo[popup_buf].buftype = "nofile"
-  vim.bo[popup_buf].bufhidden = "wipe"
-  vim.bo[popup_buf].swapfile = false
-  vim.bo[popup_buf].filetype = "GithubIssueHelp"
+  local popup_buf, popup_win = popup_window.open({
+    relative = "editor",
+    width = width,
+    height = height,
+    row = math.max(0, math.floor((vim.o.lines - height) / 2) - 1),
+    col = math.max(0, math.floor((vim.o.columns - width) / 2)),
+    title = "GitHub Issue Commands",
+    filetype = "GithubIssueHelp",
+  })
   vim.api.nvim_buf_set_lines(popup_buf, 0, -1, false, lines)
   vim.bo[popup_buf].modifiable = false
   for index, spec in ipairs(command_specs) do
@@ -961,20 +966,9 @@ local function show_commands_popup()
       hl_group = "DiffReviewStatusHintKey",
     })
   end
-  local popup_win = vim.api.nvim_open_win(popup_buf, true, {
-    relative = "editor",
-    width = width,
-    height = height,
-    row = math.max(0, math.floor((vim.o.lines - height) / 2) - 1),
-    col = math.max(0, math.floor((vim.o.columns - width) / 2)),
-    style = "minimal",
-    border = "rounded",
-    title = title,
-    title_pos = "center",
-  })
   vim.wo[popup_win].winhighlight = "Normal:NormalFloat,FloatBorder:FloatBorder"
   local close = function()
-    if vim.api.nvim_win_is_valid(popup_win) then vim.api.nvim_win_close(popup_win, true) end
+    popup_window.close(popup_win)
   end
   for _, key in ipairs({ "q", "<Esc>", "?" }) do
     vim.keymap.set("n", key, close, { buffer = popup_buf, nowait = true, desc = "Close issue command help" })

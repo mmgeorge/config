@@ -2,6 +2,7 @@ local gh = require("github.gh")
 local issue_index = require("github.issue_index")
 local issue_view = require("github.issue_view")
 local repo_cache = require("github.repo_cache")
+local popup_window = require("diff_review.infra.popup_window")
 
 local M = {}
 
@@ -169,7 +170,7 @@ local function open_picker(title, items, opts)
     return
   end
 
-  vim.ui.select(items, {
+  popup_window.select(items, {
     prompt = title,
     format_item = item_label,
   }, function(item)

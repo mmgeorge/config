@@ -12,7 +12,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const SESSION_FORMAT_VERSION: u32 = 1;
+const SESSION_FORMAT_VERSION: u32 = 3;
 
 /// Stores one session with the exact durable format that produced it.
 #[derive(Deserialize, Serialize)]
@@ -202,17 +202,16 @@ impl SqliteStore {
                 |row| row.get(0),
             )
             .optional()?;
-        if let Some(payload) = payload {
-            if let Some(mut session) = decode_current_session(&payload)? {
-                if session.lease_owner.as_deref() == Some(client_id) {
-                    session.lease_owner = None;
-                    session.lease_expires_at_ms = None;
-                    transaction.execute(
-                        "UPDATE session_record SET payload=?2 WHERE id=?1",
-                        params![session_id, encode_session(&session)?],
-                    )?;
-                }
-            }
+        if let Some(payload) = payload
+            && let Some(mut session) = decode_current_session(&payload)?
+            && session.lease_owner.as_deref() == Some(client_id)
+        {
+            session.lease_owner = None;
+            session.lease_expires_at_ms = None;
+            transaction.execute(
+                "UPDATE session_record SET payload=?2 WHERE id=?1",
+                params![session_id, encode_session(&session)?],
+            )?;
         }
         transaction.commit()?;
         Ok(())
@@ -676,7 +675,6 @@ fn decode_current_session(value: &str) -> Result<Option<HarnessSession>> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::session::WriteMode;
 
     fn session(id: &str, workspace: &str) -> HarnessSession {
         HarnessSession {
@@ -690,8 +688,7 @@ mod test {
             resolved_model: None,
             effort: "medium".into(),
             fast_mode: false,
-            trust_profile: "workspace".into(),
-            write_mode: WriteMode::Read,
+            execution_mode: crate::session::ExecutionMode::Read,
             created_at_ms: 1,
             updated_at_ms: 1,
             active_plan_id: None,
@@ -758,7 +755,7 @@ mod test {
             created_at_ms: 3,
             completed_at_ms: Some(4),
             node_list: vec![crate::interaction::InteractionNode::MainSegment {
-                segment: crate::interaction::MainSegment {
+                segment: Box::new(crate::interaction::MainSegment {
                     id: "interaction:segment:1".into(),
                     state: crate::interaction::SegmentState::Complete,
                     started_at_ms: 3,
@@ -769,7 +766,7 @@ mod test {
                     thought: Vec::new(),
                     active: None,
                     response: Some("done".into()),
-                },
+                }),
             }],
             awaiting_input: false,
             elicitation: None,

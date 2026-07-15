@@ -162,13 +162,12 @@ local function send_initialize(callback, initialize_options)
   end }
   local payload = protocol.encode_request(id, "initialize", {
     data_root = vim.fs.joinpath(vim.fn.stdpath("data"), "diff-review", "harness"),
+    permission_file = vim.fs.joinpath(vim.fn.stdpath("config"), "diff_review", "permissions.json"),
     workspace = vim.fn.getcwd(),
     client_id = ("nvim-%s-%s"):format(vim.fn.getpid(), vim.uv.hrtime()),
     backend = { kind = descriptor.kind, command = descriptor.command },
     model = harness_config.model,
     effort = harness_config.effort,
-    trust_profile = harness_config.trust_profile,
-    trust_policy = harness_config.trust_profiles[harness_config.trust_profile],
     goal_max_turns = harness_config.goal_max_turns,
     lease_conflict_action = initialize_options and initialize_options.lease_conflict_action or nil,
   })

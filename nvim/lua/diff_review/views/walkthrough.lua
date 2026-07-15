@@ -106,6 +106,8 @@
 ---@field anchor_row integer
 ---@field line_count integer
 
+local popup_window = require("diff_review.infra.popup_window")
+
 ---@class DiffReviewWalkthroughModule
 ---@field _modes table<integer, DiffReviewWalkthroughMode>
 ---@field _reader DiffReviewWalkthroughReader?
@@ -2774,9 +2776,14 @@ function M._open_summary(mode, opts)
   lines[#lines + 1] = ("  %d steps    [y/<CR>] start    [q/<Esc>] %s"):format(
     #mode.doc.steps, opts.resume and "quit" or "cancel")
 
-  local popup_buf = vim.api.nvim_create_buf(false, true)
-  vim.bo[popup_buf].bufhidden = "wipe"
-  vim.bo[popup_buf].buftype = "nofile"
+  local height = math.min(#lines, math.max(vim.o.lines - 6, 1))
+  local popup_buf, win = popup_window.open({
+    relative = "editor",
+    width = width,
+    height = height,
+    title = "Walkthrough",
+    filetype = "DiffReviewWalkthroughSummary",
+  })
   vim.api.nvim_buf_set_lines(popup_buf, 0, -1, false, lines)
   vim.bo[popup_buf].modifiable = false
   apply_summary_highlights(popup_buf, lines, mode.doc)
@@ -2791,23 +2798,8 @@ function M._open_summary(mode, opts)
     hl_group = "DiffReviewStatusHint",
   })
 
-  local height = math.min(#lines, math.max(vim.o.lines - 6, 1))
-  local win = vim.api.nvim_open_win(popup_buf, true, {
-    relative = "editor",
-    width = width,
-    height = height,
-    col = math.floor((vim.o.columns - width) / 2),
-    row = math.floor((vim.o.lines - height) / 2),
-    style = "minimal",
-    border = "rounded",
-    title = " Walkthrough ",
-    title_pos = "center",
-  })
-
   local function close_popup()
-    if vim.api.nvim_win_is_valid(win) then
-      pcall(vim.api.nvim_win_close, win, true)
-    end
+    popup_window.close(win)
   end
   local popup_opts = { buffer = popup_buf, nowait = true, silent = true }
   for _, key in ipairs({ "y", "<CR>" }) do

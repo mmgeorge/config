@@ -99,7 +99,6 @@ fn streams_mock_backend_events_before_the_jsonl_response() {
             "backend": { "kind": "mock", "command": ["mock"] },
             "model": "mock-model",
             "effort": "low",
-            "trust_profile": "workspace",
             "goal_max_turns": 20
         }
     }));
@@ -176,7 +175,6 @@ fn cancels_a_running_turn_through_the_out_of_band_request_lane() {
             "backend": { "kind": "mock", "command": ["blocking"] },
             "model": "mock-model",
             "effort": "low",
-            "trust_profile": "workspace",
             "goal_max_turns": 20
         }
     }));
@@ -261,7 +259,6 @@ fn retracts_an_output_free_planning_turn_and_restores_control_state() {
             "backend": { "kind": "mock", "command": ["blocking"] },
             "model": "mock-model",
             "effort": "low",
-            "trust_profile": "workspace",
             "goal_max_turns": 20
         }
     }));
@@ -277,7 +274,7 @@ fn retracts_an_output_free_planning_turn_and_restores_control_state() {
 
     broker.request(json!({
         "id": 2,
-        "method": "mode.set",
+        "method": "session.execution_mode",
         "params": { "mode": "write" }
     }));
     broker.read_response(2);
@@ -340,7 +337,7 @@ fn retracts_an_output_free_planning_turn_and_restores_control_state() {
         snapshot
             .last()
             .unwrap()
-            .pointer("/result/session/write_mode")
+            .pointer("/result/session/execution_mode")
             .and_then(Value::as_str),
         Some("write")
     );
@@ -384,7 +381,6 @@ fn visible_output_prevents_cancelled_turn_retraction() {
             "backend": { "kind": "mock", "command": ["visible-blocking"] },
             "model": "mock-model",
             "effort": "low",
-            "trust_profile": "workspace",
             "goal_max_turns": 20
         }
     }));
@@ -456,7 +452,6 @@ fn workspace_changes_prevent_cancelled_turn_retraction() {
             "backend": { "kind": "mock", "command": ["writing-blocking"] },
             "model": "mock-model",
             "effort": "low",
-            "trust_profile": "workspace",
             "goal_max_turns": 20
         }
     }));
@@ -525,7 +520,6 @@ fn persists_acknowledged_steering_on_the_active_interaction() {
             "backend": { "kind": "mock", "command": ["visible-blocking"] },
             "model": "mock-model",
             "effort": "low",
-            "trust_profile": "workspace",
             "goal_max_turns": 20
         }
     }));
@@ -654,7 +648,6 @@ fn reports_structured_lease_recovery_and_allows_a_new_session() {
                 "backend": { "kind": "mock", "command": ["mock"] },
                 "model": "mock-model",
                 "effort": "low",
-                "trust_profile": "workspace",
                 "goal_max_turns": 20,
                 "lease_conflict_action": action
             }

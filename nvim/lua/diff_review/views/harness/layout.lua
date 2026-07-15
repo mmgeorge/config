@@ -1,5 +1,7 @@
 local M = {}
 
+local composer_mode_group = vim.api.nvim_create_augroup("DiffReviewHarnessComposerMode", { clear = false })
+
 local config = require("diff_review.infra.config")
 
 ---@param win integer
@@ -9,6 +11,16 @@ local function configure_gutterless_window(win)
   vim.wo[win].signcolumn = "no"
   vim.wo[win].foldcolumn = "0"
   vim.wo[win].statuscolumn = ""
+end
+
+local function keep_composer_normal_on_entry(buf)
+  vim.api.nvim_clear_autocmds({ group = composer_mode_group, buffer = buf })
+  vim.api.nvim_create_autocmd({ "BufEnter", "WinEnter" }, {
+    group = composer_mode_group,
+    buffer = buf,
+    callback = function() vim.cmd("stopinsert") end,
+    desc = "Keep Harness input in Normal mode when focused",
+  })
 end
 
 ---@param name string
@@ -57,6 +69,7 @@ function M.open()
   vim.wo[composer_win].linebreak = true
   configure_gutterless_window(composer_win)
   vim.wo[composer_win].foldcolumn = "1"
+  keep_composer_normal_on_entry(composer_buf)
   return transcript_buf, transcript_win, composer_buf, composer_win
 end
 

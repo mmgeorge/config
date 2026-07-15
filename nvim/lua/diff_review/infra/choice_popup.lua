@@ -17,6 +17,8 @@
 
 local M = {}
 
+local popup_window = require("diff_review.infra.popup_window")
+
 --- Open a choice popup and resolve one option or nil when cancelled.
 ---@param opts DiffReviewChoicePopupOptions
 ---@return integer buf
@@ -33,35 +35,29 @@ function M.open(opts)
     width = math.max(width, vim.fn.strdisplaywidth(line))
   end
 
-  local buf = vim.api.nvim_create_buf(false, true)
-  vim.bo[buf].bufhidden = "wipe"
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-  vim.bo[buf].modifiable = false
-
   local relative = opts.relative or "cursor"
-  local window_opts = {
+  local buf, win = popup_window.open({
     relative = relative,
     width = width + 2,
     height = #lines,
-    style = "minimal",
-    border = "rounded",
-    title = (" %s "):format(opts.title),
-    title_pos = "center",
-  }
+    title = opts.title,
+    filetype = "DiffReviewChoicePopup",
+  })
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].modifiable = false
   if relative == "editor" then
-    window_opts.row = math.max(0, math.floor((vim.o.lines - #lines) / 2))
-    window_opts.col = math.max(0, math.floor((vim.o.columns - width - 2) / 2))
-  else
-    window_opts.row = 1
-    window_opts.col = 0
+    local row = math.max(0, math.floor((vim.o.lines - #lines) / 2))
+    local col = math.max(0, math.floor((vim.o.columns - width - 2) / 2))
+    local window_config = vim.api.nvim_win_get_config(win)
+    window_config.row = row
+    window_config.col = col
+    vim.api.nvim_win_set_config(win, window_config)
   end
-
-  local win = vim.api.nvim_open_win(buf, true, window_opts)
   local chosen = false
   local function choose(value)
     if chosen then return end
     chosen = true
-    if vim.api.nvim_win_is_valid(win) then pcall(vim.api.nvim_win_close, win, true) end
+    popup_window.close(win)
     opts.on_choice(value)
   end
 

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum InteractionNode {
-    MainSegment { segment: MainSegment },
+    MainSegment { segment: Box<MainSegment> },
     AgentReference { agent: AgentReference },
     SteeringPrompt { prompt: SteeringPrompt },
 }

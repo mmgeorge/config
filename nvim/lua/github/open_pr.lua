@@ -1,5 +1,6 @@
 local M = {}
 local repo_cache = require("github.repo_cache")
+local popup_window = require("diff_review.infra.popup_window")
 
 local default_base_branch = "main"
 local state_cache = nil
@@ -377,25 +378,18 @@ local function confirm(lines, on_yes, on_no)
     width = math.max(width, #line + 4)
   end
 
-  local buf = vim.api.nvim_create_buf(false, true)
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, body)
-  vim.bo[buf].modifiable = false
-  vim.bo[buf].bufhidden = "wipe"
-
-  local win = vim.api.nvim_open_win(buf, true, {
+  local buf, win = popup_window.open({
     relative = "editor",
     width = width,
     height = #body,
-    col = math.floor((vim.o.columns - width) / 2),
-    row = math.floor((vim.o.lines - #body) / 2),
-    style = "minimal",
-    border = "rounded",
-    title = " GithubPRCreate ",
-    title_pos = "center",
+    title = "GithubPRCreate",
+    filetype = "DiffReviewConfirm",
   })
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, body)
+  vim.bo[buf].modifiable = false
 
   local function close()
-    if vim.api.nvim_win_is_valid(win) then pcall(vim.api.nvim_win_close, win, true) end
+    popup_window.close(win)
   end
 
   vim.keymap.set("n", "y", function()
@@ -424,6 +418,13 @@ local function pick_base_branch(branches, current_base_branch, callback)
   end
 
   if _G.Snacks and Snacks.picker and type(Snacks.picker.pick) == "function" then
+    local origin = popup_window.capture_origin()
+    local restored = false
+    local function restore_origin()
+      if restored then return end
+      restored = true
+      popup_window.restore_origin(origin)
+    end
     Snacks.picker.pick({
       title = "Select PR base branch",
       items = vim.tbl_map(function(branch)
@@ -439,13 +440,15 @@ local function pick_base_branch(branches, current_base_branch, callback)
       end,
       confirm = function(picker, item)
         if picker and picker.close then picker:close() end
+        restore_origin()
         callback(item and item.branch or nil)
       end,
+      on_close = restore_origin,
     })
     return
   end
 
-  vim.ui.select(branches, {
+  popup_window.select(branches, {
     prompt = "Select PR base branch",
   }, callback)
 end

@@ -15,6 +15,7 @@ local interaction_state = require("diff_review.views.harness.interaction_state")
 local prompt_history = require("diff_review.views.harness.prompt_history")
 local context_status = require("diff_review.views.harness.context_status")
 local main_timeline = require("diff_review.views.harness.timeline")
+local popup_window = require("diff_review.infra.popup_window")
 
 local namespace = vim.api.nvim_create_namespace("DiffReviewHarnessTranscript")
 local queue_namespace = vim.api.nvim_create_namespace("DiffReviewHarnessQueue")
@@ -125,7 +126,6 @@ local function restore_retracted_prompt(text)
   vim.schedule(function()
     if state.composer_win and vim.api.nvim_win_is_valid(state.composer_win) then
       vim.api.nvim_set_current_win(state.composer_win)
-      vim.cmd("startinsert!")
     end
   end)
 end
@@ -134,8 +134,8 @@ end
 local function status_text()
   local state = harness_state()
   local active_session = state.session or {}
-  local raw_mode = state.pending_mode or active_session.write_mode or "read"
-  local mode = raw_mode:sub(1, 1):upper() .. raw_mode:sub(2):lower()
+  local raw_mode = state.pending_mode or active_session.execution_mode or "read"
+  local mode = raw_mode:lower() == "yolo" and "YOLO" or (raw_mode:sub(1, 1):upper() .. raw_mode:sub(2))
   if state.pending_mode then mode = mode .. "*" end
   local backend = active_session.backend or config.options.harness.backend
   local provider = active_session.provider_label
@@ -160,7 +160,12 @@ local function status_text()
   local segment_list = {
     {
       text = mode,
-      group = raw_mode == "write" and "DiffReviewHarnessWrite" or "DiffReviewHarnessRead",
+      group = ({
+        read = "DiffReviewHarnessRead",
+        write = "DiffReviewHarnessWrite",
+        full = "DiffReviewHarnessFull",
+        yolo = "DiffReviewHarnessYolo",
+      })[raw_mode:lower()] or "DiffReviewHarnessRead",
     },
     {
       text = (" • %s • %s %s%s"):format(provider, model, effort, fast),
@@ -189,6 +194,14 @@ local function status_text()
       text = state.active_elicitation.owner == "plan"
           and (" • Planning: feedback requested" .. reopen_hint)
         or (" • Input requested" .. reopen_hint),
+      group = "DiffReviewHarnessWrite",
+    }
+  end
+  if #(state.approval or {}) > 0 then
+    local reopen_key = keymaps.view_keys_for("harness", "reopen_question")[1]
+    local reopen_hint = reopen_key and (" (press " .. reopen_key .. ")") or ""
+    segment_list[#segment_list + 1] = {
+      text = " • Approval requested" .. reopen_hint,
       group = "DiffReviewHarnessWrite",
     }
   end
@@ -298,6 +311,32 @@ local function set_busy(busy)
   schedule_render()
 end
 
+---@param state table
+---@param approval_id string
+---@return boolean
+local function remove_approval(state, approval_id)
+  for index, approval in ipairs(state.approval or {}) do
+    if approval.id == approval_id then
+      table.remove(state.approval, index)
+      return true
+    end
+  end
+  return false
+end
+
+---@param state table
+local function reconcile_approval_presentation(state)
+  local presented_id = state.presented_approval_id
+  if not presented_id then return end
+  local still_pending = vim.iter(state.approval or {}):any(function(approval)
+    return approval.id == presented_id
+  end)
+  if still_pending then return end
+  require("diff_review.views.harness.approval").close()
+  state.approval_open = false
+  state.presented_approval_id = nil
+end
+
 ---@param callback? function
 local function synchronize_state(callback)
   if state_sync_pending then return end
@@ -328,6 +367,8 @@ local function synchronize_state(callback)
     state.goal = result.goal
     state.active_plan = result.active_plan
     state.active_elicitation = result.active_elicitation
+    state.approval = vim.deepcopy(result.approval or {})
+    reconcile_approval_presentation(state)
     state.agent = vim.deepcopy(result.agent or { definition = {}, run = {}, turn = {} })
     state.agent_live = {}
     prompt_history.replace(result.prompt_history)
@@ -336,6 +377,7 @@ local function synchronize_state(callback)
     if elicitation and question_set_id ~= state.presented_question_set_id then
       vim.schedule(M.present_plan_question)
     end
+    if #state.approval > 0 then vim.schedule(M.present_approval) end
     M.render()
     if callback then callback(result) end
   end)
@@ -346,7 +388,21 @@ end
 local function on_event(event, payload)
   local state = harness_state()
   if event == "backend_event" then
-    if payload.kind == "agent_updated" then
+    if payload.kind == "approval_requested" then
+      local request = payload.data or payload
+      state.approval = state.approval or {}
+      if not vim.iter(state.approval):any(function(approval) return approval.id == request.id end) then
+        state.approval[#state.approval + 1] = request
+      end
+      M.refresh_winbar()
+      vim.schedule(M.present_approval)
+    elseif payload.kind == "approval_resolved" or payload.kind == "approval_cancelled" then
+      local request = payload.data or payload
+      remove_approval(state, request.id)
+      reconcile_approval_presentation(state)
+      M.refresh_winbar()
+      if #state.approval > 0 then vim.schedule(M.present_approval) end
+    elseif payload.kind == "agent_updated" then
       state.agent = vim.deepcopy(payload.data or payload)
       discard_terminal_agent_live_state(state)
       schedule_render()
@@ -423,7 +479,9 @@ local function on_event(event, payload)
     if event == "goal_continue_requested" then vim.schedule(M.drain) end
   elseif event == "context_compacted" then
     synchronize_state()
-  elseif event == "session_changed" or event == "session_configured" or event == "mode_changed" then
+  elseif event == "session_changed" or event == "session_configured" or event == "mode_changed"
+    or event == "execution_mode_changed"
+  then
     local next_session = payload.session or payload
     if event == "session_changed" and state.session and next_session.id ~= state.session.id then
       interaction_state.replace(state, payload.interaction or {})
@@ -450,6 +508,41 @@ local function on_event(event, payload)
   elseif event == "state_invalidated" then
     synchronize_state()
   end
+end
+
+function M.present_approval()
+  local state = harness_state()
+  local request = state.approval and state.approval[1]
+  if state.approval_open or not request then return end
+  state.approval_open = true
+  state.presented_approval_id = request.id
+  require("diff_review.views.harness.approval").open(request, {
+    transcript_win = state.transcript_win,
+    resolve = function(approval_id, choice_id, callback)
+      client.request("approval.resolve", {
+        approval_id = approval_id,
+        choice_id = choice_id,
+      }, function(_, request_error)
+        if request_error then
+          notifications.error(request_error, "Harness approval")
+          synchronize_state()
+          callback(false)
+          return
+        end
+        remove_approval(state, approval_id)
+        state.approval_open = false
+        state.presented_approval_id = nil
+        callback(true)
+        M.refresh_winbar()
+        if #state.approval > 0 then vim.schedule(M.present_approval) end
+      end)
+    end,
+    closed = function()
+      state.approval_open = false
+      state.presented_approval_id = nil
+      M.refresh_winbar()
+    end,
+  })
 end
 
 ---@return nil
@@ -524,8 +617,12 @@ end
 
 function M.reopen_question()
   local state = harness_state()
+  if #(state.approval or {}) > 0 then
+    M.present_approval()
+    return
+  end
   if not (state.active_elicitation and state.active_elicitation.elicitation) then
-    notifications.warn("No Harness questions await feedback", "Harness")
+    notifications.warn("No Harness approval or question awaits feedback", "Harness")
     return
   end
   state.presented_question_set_id = nil
@@ -699,7 +796,7 @@ function M.open_artifact_picker()
     notifications.info("This Harness session has no artifacts", "Harness")
     return
   end
-  vim.ui.select(artifact_list, {
+  popup_window.select(artifact_list, {
     prompt = "Harness artifacts",
     snacks = choice_picker,
     format_item = function(artifact)
@@ -752,7 +849,7 @@ function M.submit()
   local text = composer_text(state.composer_buf)
   if text == "" then return end
   prompt_history.record(text)
-  if text == "/write" or text == "/read" then
+  if vim.tbl_contains({ "/read", "/write", "/full", "/yolo" }, text) then
     set_composer_text(state.composer_buf, "")
     M.set_mode(text:sub(2))
     return
@@ -917,7 +1014,6 @@ function M.edit_last_queued()
   set_composer_text(state.composer_buf, queued)
   if state.composer_win and vim.api.nvim_win_is_valid(state.composer_win) then
     vim.api.nvim_set_current_win(state.composer_win)
-    vim.cmd("startinsert")
   end
   M.refresh_winbar()
 end
@@ -977,7 +1073,7 @@ end
 
 function M.select_effort()
   local effort_list = { "minimal", "low", "medium", "high", "xhigh" }
-  vim.ui.select(effort_list, { prompt = "Harness reasoning effort", snacks = choice_picker }, function(effort)
+  popup_window.select(effort_list, { prompt = "Harness reasoning effort", snacks = choice_picker }, function(effort)
     if effort then M.configure({ effort = effort }) end
   end)
 end
@@ -996,7 +1092,7 @@ end
 function M.select_fast_mode()
   local state = harness_state()
   local enabled = state.session and state.session.fast_mode == true
-  vim.ui.select({ enabled and "Disable fast mode" or "Enable fast mode", "Cancel" }, {
+  popup_window.select({ enabled and "Disable fast mode" or "Enable fast mode", "Cancel" }, {
     prompt = "Codex fast mode",
     snacks = choice_picker,
   }, function(choice)
@@ -1010,12 +1106,12 @@ function M.select_model()
     if request_error then notifications.error(request_error, "Harness model") return end
     if type(model_list) ~= "table" or #model_list == 0 then
       local current = harness_state().session and harness_state().session.model or config.options.harness.model
-      vim.ui.input({ prompt = "Harness model: ", default = current }, function(model)
+      popup_window.input({ prompt = "Harness model: ", default = current }, function(model)
         if model and vim.trim(model) ~= "" then M.configure({ model = vim.trim(model) }) end
       end)
       return
     end
-    vim.ui.select(model_list, {
+    popup_window.select(model_list, {
       prompt = "Harness model",
       snacks = choice_picker,
       format_item = function(model) return model.label .. "  " .. model.id end,
@@ -1031,19 +1127,20 @@ function M.resolve_runtime_model()
   end)
 end
 
----@param mode "read"|"write"
+---@param mode string
 function M.set_mode(mode)
   local state = harness_state()
+  mode = mode:lower()
   local function apply_mode()
     if state.busy then
       state.pending_mode = mode
       M.refresh_winbar()
-      notifications.info("Harness mode will change after the active request", "Harness")
+      notifications.info("Harness execution mode will change after the active request", "Harness")
       return
     end
-    client.request("mode.set", { mode = mode }, function(result, request_error)
+    client.request("session.execution_mode", { mode = mode }, function(result, request_error)
       if request_error then
-        notifications.error("Failed to change Harness mode: " .. request_error, "Harness")
+        notifications.error("Failed to change Harness execution mode: " .. request_error, "Harness")
         M.refresh_winbar()
         return
       end
@@ -1053,12 +1150,13 @@ function M.set_mode(mode)
     end)
   end
 
-  if mode == "write" and state.no_checkpoint and config.options.harness.non_git_write_confirm then
-    vim.ui.select({ "Cancel", "Enable Write without checkpoints" }, {
-      prompt = "This is not a Git worktree. Harness cannot diff or roll back writes.",
+  if mode ~= "read" and state.no_checkpoint and config.options.harness.non_git_write_confirm then
+    local label = mode == "yolo" and "YOLO" or (mode:sub(1, 1):upper() .. mode:sub(2))
+    popup_window.select({ "Cancel", "Enable " .. label .. " without checkpoints" }, {
+      prompt = "This is not a Git worktree. Harness cannot diff or roll back changes.",
       snacks = choice_picker,
     }, function(choice)
-      if choice == "Enable Write without checkpoints" then apply_mode() end
+      if choice == "Enable " .. label .. " without checkpoints" then apply_mode() end
     end)
     return
   end
@@ -1067,8 +1165,17 @@ end
 
 function M.toggle_mode()
   local state = harness_state()
-  local current_mode = state.pending_mode or (state.session and state.session.write_mode) or "read"
-  M.set_mode(current_mode == "read" and "write" or "read")
+  local mode_list = (state.capability and state.capability.execution_mode_list) or {}
+  if #mode_list == 0 then mode_list = { "read", "write", "full", "yolo" } end
+  local current_mode = state.pending_mode or (state.session and state.session.execution_mode) or "read"
+  local current_index = 0
+  for index, candidate in ipairs(mode_list) do
+    if candidate == current_mode then
+      current_index = index
+      break
+    end
+  end
+  M.set_mode(mode_list[(current_index % #mode_list) + 1])
 end
 
 ---@param next_config table

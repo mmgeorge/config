@@ -127,15 +127,6 @@
 ---@class DiffReviewHarnessBackendConfig
 ---@field command string[]
 
----@class DiffReviewHarnessTrustProfile
----@field allow_workspace_write boolean
----@field allow_command boolean
----@field allow_network boolean
----@field allow_outside_workspace boolean
----@field allow_git_index boolean
----@field allow_git_history boolean
----@field allow_elevation boolean
-
 ---@class DiffReviewHarnessConfig
 ---@field backend "acp"|"codex"|"mock"
 ---@field model string
@@ -150,8 +141,6 @@
 ---@field question_choice_keys string[]
 ---@field non_git_write_confirm boolean
 ---@field backends table<string, DiffReviewHarnessBackendConfig>
----@field trust_profile string
----@field trust_profiles table<string, DiffReviewHarnessTrustProfile>
 
 ---@class DiffReviewConfigModule
 ---@field defaults DiffReviewConfig
@@ -199,18 +188,6 @@ M.defaults = {
       acp = { command = { "copilot", "--acp" } },
       codex = { command = { "codex", "app-server" } },
       mock = { command = { "mock" } },
-    },
-    trust_profile = "workspace",
-    trust_profiles = {
-      workspace = {
-        allow_workspace_write = true,
-        allow_command = true,
-        allow_network = false,
-        allow_outside_workspace = false,
-        allow_git_index = false,
-        allow_git_history = false,
-        allow_elevation = false,
-      },
     },
   },
   keymaps = {
@@ -327,9 +304,6 @@ function M.setup(opts)
   end
   if not options.harness.backends[options.harness.backend] then
     error("harness.backend must name a configured harness backend")
-  end
-  if not options.harness.trust_profiles[options.harness.trust_profile] then
-    error("harness.trust_profile must name a configured trust profile")
   end
   local question_key_set = {}
   for _, key in ipairs(options.harness.question_choice_keys or {}) do

@@ -1,4 +1,5 @@
 pub mod acp;
+pub mod approval;
 pub mod codex;
 mod json_rpc;
 mod process;
@@ -8,7 +9,7 @@ pub use steering::SteerTarget;
 use crate::agent::AgentCapability;
 use crate::goal::TurnEvidence;
 use crate::plan::PlanQuestionSet;
-use crate::session::{ContextUsage, WriteMode};
+use crate::session::{ContextUsage, ExecutionMode};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,8 @@ pub struct BackendCapability {
     pub model_selection: bool,
     pub effort_selection: bool,
     pub permission_control: bool,
+    #[serde(default)]
+    pub execution_mode_list: Vec<ExecutionMode>,
     pub agent: AgentCapability,
 }
 
@@ -35,32 +38,6 @@ pub struct BackendCapability {
 pub struct BackendLaunch {
     pub kind: String,
     pub command: Vec<String>,
-}
-
-/// Represents the write operations automatically approved in WRITE mode.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct TrustPolicy {
-    pub allow_workspace_write: bool,
-    pub allow_command: bool,
-    pub allow_network: bool,
-    pub allow_outside_workspace: bool,
-    pub allow_git_index: bool,
-    pub allow_git_history: bool,
-    pub allow_elevation: bool,
-}
-
-impl Default for TrustPolicy {
-    fn default() -> Self {
-        Self {
-            allow_workspace_write: true,
-            allow_command: true,
-            allow_network: false,
-            allow_outside_workspace: false,
-            allow_git_index: false,
-            allow_git_history: false,
-            allow_elevation: false,
-        }
-    }
 }
 
 /// Represents the broker intent for one admitted prompt.
@@ -83,9 +60,7 @@ pub struct BackendRequest {
     pub model: String,
     pub effort: String,
     pub fast_mode: bool,
-    pub write_mode: WriteMode,
-    pub trust_profile: String,
-    pub trust_policy: TrustPolicy,
+    pub execution_mode: ExecutionMode,
     pub backend_session_id: Option<String>,
 }
 
@@ -312,10 +287,21 @@ pub trait Backend: Send + Sync {
 }
 
 /// Build a backend strategy from an explicit launch descriptor.
-pub fn build(launch: BackendLaunch) -> Result<Box<dyn Backend>> {
+pub fn build(
+    launch: BackendLaunch,
+    permission_coordinator: std::sync::Arc<approval::PermissionCoordinator>,
+) -> Result<Box<dyn Backend>> {
     match launch.kind.as_str() {
-        "acp" => Ok(Box::new(acp::AcpBackend::new(launch.command)?)),
-        "codex" => Ok(Box::new(codex::CodexBackend::new(launch.command)?)),
+        "acp" => Ok(Box::new(acp::AcpBackend::new_with_permission_coordinator(
+            launch.command,
+            permission_coordinator,
+        )?)),
+        "codex" => Ok(Box::new(
+            codex::CodexBackend::new_with_permission_coordinator(
+                launch.command,
+                permission_coordinator,
+            )?,
+        )),
         "mock" => Ok(Box::new(MockBackend {
             delay: match launch.command.first().map(String::as_str) {
                 Some("blocking" | "visible-blocking" | "writing-blocking") => {
@@ -414,7 +400,7 @@ impl Backend for MockBackend {
             plan_markdown,
             plan_question: None,
             evidence: TurnEvidence {
-                tool_called: request.write_mode == WriteMode::Write,
+                tool_called: request.execution_mode.permits_workspace_write(),
                 structured_complete: matches!(request.mode, PromptMode::GoalContinuation),
                 ..TurnEvidence::default()
             },
@@ -427,6 +413,12 @@ impl Backend for MockBackend {
                 model_selection: true,
                 effort_selection: true,
                 permission_control: true,
+                execution_mode_list: vec![
+                    ExecutionMode::Read,
+                    ExecutionMode::Write,
+                    ExecutionMode::Full,
+                    ExecutionMode::Yolo,
+                ],
                 agent: AgentCapability::default(),
             },
             runtime: BackendRuntime {
@@ -467,6 +459,12 @@ impl Backend for MockBackend {
                 model_selection: true,
                 effort_selection: true,
                 permission_control: true,
+                execution_mode_list: vec![
+                    ExecutionMode::Read,
+                    ExecutionMode::Write,
+                    ExecutionMode::Full,
+                    ExecutionMode::Yolo,
+                ],
                 agent: AgentCapability::default(),
             },
             runtime: BackendRuntime {
@@ -493,8 +491,8 @@ impl Backend for MockBackend {
 
 #[cfg(test)]
 mod test {
-    use super::{Backend, BackendRequest, MockBackend, PromptMode, TrustPolicy, steering};
-    use crate::session::WriteMode;
+    use super::{Backend, BackendRequest, MockBackend, PromptMode, steering};
+    use crate::session::ExecutionMode;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -517,9 +515,7 @@ mod test {
                         model: "mock-model".into(),
                         effort: "low".into(),
                         fast_mode: false,
-                        write_mode: WriteMode::Read,
-                        trust_profile: "workspace".into(),
-                        trust_policy: TrustPolicy::default(),
+                        execution_mode: ExecutionMode::Read,
                         backend_session_id: None,
                     },
                     None,

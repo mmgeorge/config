@@ -83,6 +83,7 @@ async fn run_broker() -> Result<()> {
     .await?;
 
     let cancellation = broker.turn_cancellation();
+    let permission_coordinator = broker.permission_coordinator();
     let mut pending_request: VecDeque<BrokerRequest> = VecDeque::new();
     let mut input_closed = false;
     loop {
@@ -125,9 +126,22 @@ async fn run_broker() -> Result<()> {
             .await?;
             continue;
         }
+        if request.method == "approval.resolve" {
+            write_message(
+                &mut output,
+                &BrokerMessage::Response(BrokerResponse::failure(
+                    request.id,
+                    "approval_unavailable",
+                    "Harness has no active approval request",
+                )),
+            )
+            .await?;
+            continue;
+        }
         let shutdown = request.method == "shutdown";
         cancellation.arm(request.method == "prompt.submit");
         let (event_sink, mut event_stream) = tokio::sync::mpsc::unbounded_channel();
+        let approval_event_sink = event_sink.clone();
         let backend = broker.backend_handle();
         let (steer_result_sink, mut steer_result_stream) = tokio::sync::mpsc::unbounded_channel();
         let mut pending_steer_count = 0_usize;
@@ -189,6 +203,7 @@ async fn run_broker() -> Result<()> {
                                     .and_then(serde_json::Value::as_bool)
                                     .unwrap_or(false);
                                 cancellation.request(restore_prompt);
+                                permission_coordinator.cancel_all(Some(&approval_event_sink))?;
                                 write_message(
                                     &mut output,
                                     &BrokerMessage::Response(BrokerResponse::success(
@@ -230,6 +245,41 @@ async fn run_broker() -> Result<()> {
                                         )),
                                     ).await?;
                                 }
+                            }
+                            Ok(approval_request) if approval_request.method == "approval.resolve" => {
+                                let approval_id = approval_request
+                                    .params
+                                    .get("approval_id")
+                                    .and_then(serde_json::Value::as_str);
+                                let choice_id = approval_request
+                                    .params
+                                    .get("choice_id")
+                                    .and_then(serde_json::Value::as_str);
+                                let response = match (approval_id, choice_id) {
+                                    (Some(approval_id), Some(choice_id)) => {
+                                        match permission_coordinator.resolve(
+                                            approval_id,
+                                            choice_id,
+                                            Some(&approval_event_sink),
+                                        ) {
+                                            Ok(view) => BrokerResponse::success(
+                                                approval_request.id,
+                                                serde_json::json!({ "resolved": true, "approval": view }),
+                                            )?,
+                                            Err(error) => BrokerResponse::failure(
+                                                approval_request.id,
+                                                "approval_failed",
+                                                format!("{error:#}"),
+                                            ),
+                                        }
+                                    }
+                                    _ => BrokerResponse::failure(
+                                        approval_request.id,
+                                        "invalid_request",
+                                        "approval.resolve requires approval_id and choice_id",
+                                    ),
+                                };
+                                write_message(&mut output, &BrokerMessage::Response(response)).await?;
                             }
                             Ok(next_request) => pending_request.push_back(next_request),
                             Err(error) => write_invalid_request(&mut output, error).await?,

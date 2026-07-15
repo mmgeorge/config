@@ -88,6 +88,8 @@ M.empty_diff_rows = {}
 ---@field activity_range table[]
 ---@field active_plan table?
 ---@field active_elicitation table?
+---@field approval DiffReviewApprovalRequest[]
+---@field approval_open boolean
 ---@field artifact table[]
 ---@field timeline table[]
 ---@field plan_annotations table[]
@@ -98,7 +100,7 @@ M.empty_diff_rows = {}
 ---@field command_set DiffReviewViewCommandSet?
 ---@field goal table?
 ---@field pending_config table?
----@field pending_mode "read"|"write"?
+---@field pending_mode string?
 ---@field plan_question_open boolean?
 ---@field presented_question_set_id string?
 ---@field prompt_history string[]
@@ -138,6 +140,8 @@ M.harness = {
   activity_range = {},
   active_plan = nil,
   active_elicitation = nil,
+  approval = {},
+  approval_open = false,
   artifact = {},
   timeline = {},
   plan_annotations = {},

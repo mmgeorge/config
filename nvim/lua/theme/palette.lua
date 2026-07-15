@@ -3,6 +3,8 @@ return {
   off_white = "#ccdbed",
   green = "#5bff94",
   yellow = "#ffe18e",
+  orange = "#ff9e64",
+  purple = "#bb9af7",
   gray = "#696969",
   light_gray = "#8a929c",
   white = "#ffffff",

@@ -217,21 +217,13 @@ impl<'a> CodexTurnCoordinator<'a> {
             self.output,
             self.request,
             self.thread_id,
-            CodexBackend::with_model(json!({
+            CodexBackend::with_model(CodexBackend::secure(json!({
                 "threadId": self.thread_id,
                 "input": [{ "type": "text", "text": text }],
                 "cwd": self.request.workspace,
                 "effort": self.request.effort,
-                "serviceTier": if self.request.fast_mode { Value::String("fast".into()) } else { Value::Null },
-                "approvalPolicy": CodexBackend::approval_policy(self.request),
-                "sandboxPolicy": {
-                    "type": if self.request.write_mode == crate::session::WriteMode::Write {
-                        "workspaceWrite"
-                    } else {
-                        "readOnly"
-                    }
-                }
-            }), &self.request.model),
+                "serviceTier": if self.request.fast_mode { Value::String("fast".into()) } else { Value::Null }
+            }), self.request), &self.request.model),
         ).await?;
         for message in observed_message_list {
             self.descendant.observe(&message, self.thread_id);

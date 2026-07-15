@@ -1,6 +1,34 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+/// Defines the execution boundary selected for one Harness session.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionMode {
+    #[default]
+    Read,
+    Write,
+    Full,
+    Yolo,
+}
+
+impl ExecutionMode {
+    /// Return the stable user-facing label for this execution boundary.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Read => "Read",
+            Self::Write => "Write",
+            Self::Full => "Full",
+            Self::Yolo => "YOLO",
+        }
+    }
+
+    /// Return whether this execution boundary permits workspace mutation.
+    pub const fn permits_workspace_write(self) -> bool {
+        !matches!(self, Self::Read)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ContextUsage {
     pub used: u64,
@@ -53,15 +81,6 @@ impl fmt::Display for SessionLeaseConflict {
 
 impl std::error::Error for SessionLeaseConflict {}
 
-/// Represents the write authority enforced for one harness session.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum WriteMode {
-    #[default]
-    Read,
-    Write,
-}
-
 /// Represents one durable conversation and its backend identity.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct HarnessSession {
@@ -78,8 +97,8 @@ pub struct HarnessSession {
     pub effort: String,
     #[serde(default)]
     pub fast_mode: bool,
-    pub trust_profile: String,
-    pub write_mode: WriteMode,
+    #[serde(default)]
+    pub execution_mode: ExecutionMode,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
     pub active_plan_id: Option<String>,

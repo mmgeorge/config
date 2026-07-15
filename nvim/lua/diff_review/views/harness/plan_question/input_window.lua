@@ -1,5 +1,7 @@
 local M = {}
 
+local popup_window = require("diff_review.infra.popup_window")
+
 local padding_namespace = vim.api.nvim_create_namespace("DiffReviewHarnessQuestionInputPadding")
 
 ---@param buf integer
@@ -15,16 +17,6 @@ local function apply_padding(buf)
   end
 end
 
-local function window_options(win)
-  vim.wo[win].cursorline = false
-  vim.wo[win].wrap = true
-  vim.wo[win].linebreak = true
-  vim.wo[win].number = false
-  vim.wo[win].relativenumber = false
-  vim.wo[win].signcolumn = "no"
-  vim.wo[win].scrolloff = 0
-end
-
 ---@param transcript_win integer
 ---@param question_win integer
 ---@param title string
@@ -37,11 +29,19 @@ function M.open(transcript_win, question_win, title, text)
   local question_height = vim.api.nvim_win_get_height(question_win)
   local available_height = transcript_height - question_row - question_height - 2
   local height = math.max(1, math.min(5, available_height))
-  local buf = vim.api.nvim_create_buf(false, true)
-  vim.bo[buf].buftype = "nofile"
-  vim.bo[buf].bufhidden = "wipe"
-  vim.bo[buf].swapfile = false
-  vim.bo[buf].filetype = "DiffReviewHarnessQuestionInput"
+  local buf, win = popup_window.open({
+    relative = "win",
+    win = transcript_win,
+    row = question_row + question_height + 2,
+    col = tonumber(question_config.col) or 0,
+    width = vim.api.nvim_win_get_width(question_win),
+    height = height,
+    title = title,
+    filetype = "DiffReviewHarnessQuestionInput",
+    wrap = true,
+    linebreak = true,
+    zindex = 81,
+  })
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.split(text, "\n", { plain = true }))
   apply_padding(buf)
   vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, {
@@ -49,20 +49,6 @@ function M.open(transcript_win, question_win, title, text)
     callback = function() apply_padding(buf) end,
     desc = "Maintain Harness question input padding",
   })
-  local win = vim.api.nvim_open_win(buf, true, {
-    relative = "win",
-    win = transcript_win,
-    row = question_row + question_height + 2,
-    col = tonumber(question_config.col) or 0,
-    width = vim.api.nvim_win_get_width(question_win),
-    height = height,
-    style = "minimal",
-    border = "rounded",
-    title = " " .. title .. " ",
-    title_pos = "center",
-    zindex = 81,
-  })
-  window_options(win)
   return buf, win
 end
 
@@ -97,7 +83,7 @@ end
 
 ---@param win integer?
 function M.close(win)
-  if win and vim.api.nvim_win_is_valid(win) then vim.api.nvim_win_close(win, true) end
+  popup_window.close(win)
 end
 
 return M

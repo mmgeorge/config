@@ -154,6 +154,7 @@ diff_review/
 ├── infra/                    Cross-cutting leaves
 │   ├── config.lua             Config schema + defaults + setup merge (keymaps, perf, lookup mode)
 │   ├── choice_popup.lua       Shared keyboard chooser for lifecycle, closed-PR, and verdict menus
+│   ├── popup_window.lua       Shared float construction plus origin window/mode restoration
 │   ├── highlights.lua         Define every DiffReview highlight group from the active colorscheme
 │   ├── notifications.lua      Centralized error + git-failure notifications
 │   ├── perf.lua               JSON event/span profiler gated by config
@@ -724,12 +725,17 @@ branch-create action) behind a reader seam so tests never hit the filesystem.
 ## 11. Infra (`infra/`)
 
 - **`config.lua`** — the `DiffReviewConfig` schema, defaults, and setup merge. Owns
-  buffer names, Harness launch descriptors, trust profiles, perf options, and the full
+  buffer names, Harness launch descriptors, execution defaults, perf options, and the full
   keymap config. List values replace defaults atomically, so a configured key list never
   inherits trailing default entries.
 - **`choice_popup.lua`** — renders a small keyboard-driven chooser from typed options,
   centralizing option keys, `q`/`<Esc>` cancellation, popup sizing, and callback cleanup.
   PR lifecycle changes, closed-PR resolution, and review verdict selection reuse it.
+- **`popup_window.lua`** — exclusively owns DiffReview float construction and closure.
+  Every custom popup, help window, chooser, and attached input leaves Insert mode while
+  visible, then restores the originating window and its Normal, Insert, Replace, or Visual
+  mode. Its `select` and `input` wrappers apply the same lifecycle to Snacks-backed
+  `vim.ui` pickers without duplicating window geometry.
 - **`highlights.lua`** — defines every DiffReview highlight group at setup, deriving
   backgrounds from the active colorscheme so the diff colors track the theme.
 - **`notifications.lua`** — centralized `error` and `git_failures` notifications.
@@ -988,6 +994,8 @@ two-column indent without depending on window-local soft-wrap behavior.
 preserves semantic cursor identity, viewport position, expansion state, and settled prefix extmarks.
 It validates semantic row indexes against the post-mutation buffer before restoring the cursor, so
 switching between timelines with different lengths cannot address a row from the previous projection.
+It mutates a hidden transcript buffer without applying window-local cursor, view, or fold state when
+that window currently displays Permissions or another view. Returning to Harness then rebuilds folds.
 It rebuilds native folds only when fold topology changes, which prevents timer-driven streaming
 frames from repeatedly closing and reopening unchanged folds.
 Active thoughts never expose expansion keys. Completed nodes stay immutable, so an expanded
@@ -1027,8 +1035,8 @@ Broker initialization selects the most recently updated session for the resolved
 and configured backend, then restores its interaction timeline, plan, goal, model controls,
 and provider session identity. Independent model, effort, and fast-mode preferences remain available
 when older sessions become invisible. `:Harness` therefore resumes current repository-local work across Neovim restarts,
-while `/clear` remains the explicit boundary for creating a new session. Every restored session
-returns to Read mode before another turn can run.
+while `/clear` remains the explicit boundary for creating a new session. Resumed sessions retain
+their persisted execution mode. New and forked sessions establish a fresh Read boundary.
 
 Plan lifecycle and execution records accompany current sessions. Plans remain physical Markdown
 under `plans/<session>/<plan>/working.md`, with immutable model
@@ -1128,18 +1136,40 @@ session. Established sessions retain their context and fail with actionable guid
 than being replaced. A second initial rejection also tells the user to choose a supported
 model in Copilot instead of retrying indefinitely.
 
-Read and Write appear in the Harness winbar. Codex enforces them with native sandbox and
-approval fields. ACP permission requests pass through the workspace trust profile, but
-provider-private tools can bypass client permission requests. That protocol limitation
-remains visible in the ACP winbar and belongs to the follow-up hardening work.
-`Shift-Tab` toggles Read and Write in both transcript and composer modes through the broker's
-durable `mode.set` request. A toggle during an active turn shows the pending mode with `*`
-and applies it at the next safe request boundary. Non-Git Write retains the checkpoint warning
-and confirmation path.
+The Rust `PermissionStore` loads one validated Rulesync-shaped document from
+`stdpath("config")/diff_review/permissions.json`, compiles command and resource matchers once, and
+gives every surfaced provider request to one `PermissionCoordinator`. `allow` proceeds immediately,
+`deny` rejects immediately, and `ask` blocks the provider response on the Harness approval float.
+Persistent approval choices atomically replace exact or broad JSON rules with allow or deny. The
+permission document remains outside provider write authority, including shell commands that name it.
+
+Approval requests bypass the timeline reducer and stream directly into the controller. Resolution
+and cancellation emit matching lifecycle events keyed by approval ID, so the controller removes the
+request, closes its float, clears the winbar status, and presents the next queued request atomically.
+Cancelling a turn drains the coordinator before provider teardown, preventing abandoned requests
+from reappearing through a later state snapshot.
+
+Read, Write, Full, and YOLO form the fixed execution-mode set. New and forked sessions start in Read,
+while resumed sessions retain their persisted mode. Plan creation, review, acceptance, rejection,
+and cancellation never change it. `Shift-Tab` cycles the four modes through
+`session.execution_mode`, while an active turn defers selection to its next safe request boundary.
+`:Permissions` uses an `acwrite` JSON buffer, so invalid documents never replace the compiled policy.
+Non-Git modes that permit writes retain the checkpoint warning and confirmation path.
+
+`CodexSecurity` projects every thread and turn through the same native policy. Read selects a
+read-only profile with network access, Write adds workspace-root writes, Full selects unrestricted
+filesystem access with on-request approvals, and YOLO selects unrestricted access with native
+approval bypass. ACP retains its existing best-effort Read and Write behavior. Provider-private
+operations that emit no client approval request remain outside the protocol boundary.
+
+The global Rulesync config omits the `permissions` feature only for `codexcli`. Codex therefore
+cannot apply a generated exec-policy denial before Harness evaluates the request. Direct Codex CLI
+sessions retain Codex's native sandbox and approval policy, while the other provider targets keep
+their existing generated permission outputs.
 
 Only the transcript window owns the Harness winbar. The composer clears its window-local
 winbar so the split presents session identity once. The transcript winbar begins directly
-with Read or Write, omits the redundant Harness title and trust-profile suffix, and then
+with the active execution mode, omits the redundant Harness title, and then
 displays the underlying provider executable and resolved runtime model.
 Codex resolves the configured `default` sentinel through the `isDefault` entry from
 `model/list`, then caches and persists that model on the Harness session. ACP identifies

@@ -2,9 +2,10 @@ use crate::agent::{
     AgentDefinition, AgentLifecycleEvent, AgentRegistry, AgentRun, AgentRunStatus, AgentTurnRecord,
     load_codex_agent_catalog,
 };
+use crate::backend::approval::{ApprovalRequestView, PermissionCoordinator};
 use crate::backend::{
     Backend, BackendCapability, BackendEvent, BackendEventSink, BackendLaunch, BackendRequest,
-    PromptMode, TrustPolicy,
+    PromptMode,
 };
 use crate::checkpoint::{GitCheckpoint, WorkspaceSnapshot, checkpoint_diff};
 use crate::goal::{ContinuationDecision, GoalRecord, GoalState};
@@ -12,13 +13,16 @@ use crate::interaction::{
     ActiveThoughtUpdate, ActiveWait, CompletedThought, InteractionComment, InteractionKind,
     InteractionRecord, InteractionState, TaskTracker, TimelineReducer,
 };
+use crate::permissions::store::PermissionStore;
 use crate::plan::{
     ArtifactSummary, PlanAnnotation, PlanElicitation, PlanExecutionRecord, PlanExecutionState,
     PlanFileStore, PlanLifecycleKind, PlanLifecycleRecord, PlanPrompt, PlanQuestionResponse,
     PlanQuestionSet, PlanRecord, PlanState,
 };
 use crate::protocol::{BrokerEvent, BrokerRequest, BrokerResponse};
-use crate::session::{ContextUsage, HarnessPreference, HarnessSession, SessionStore, WriteMode};
+use crate::session::{
+    ContextUsage, ExecutionMode, HarnessPreference, HarnessSession, SessionStore,
+};
 use crate::storage::SqliteStore;
 use crate::timeline::{TimelineEntry, TimelineProjector};
 use crate::workspace::WorkspaceKind;
@@ -28,7 +32,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc,
+    Arc, RwLock,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -57,6 +61,8 @@ impl Clock for SystemClock {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct InitializeRequest {
     pub data_root: String,
+    #[serde(default)]
+    pub permission_file: Option<String>,
     pub workspace: String,
     pub client_id: String,
     pub backend: BackendLaunch,
@@ -64,10 +70,6 @@ pub struct InitializeRequest {
     pub model: String,
     #[serde(default = "default_effort")]
     pub effort: String,
-    #[serde(default = "default_trust_profile")]
-    pub trust_profile: String,
-    #[serde(default)]
-    pub trust_policy: TrustPolicy,
     pub session_id: Option<String>,
     #[serde(default = "default_goal_max_turns")]
     pub goal_max_turns: u32,
@@ -91,6 +93,7 @@ pub struct BrokerSnapshot {
     pub active_wait: Option<ActiveWait>,
     pub prompt_history: Vec<String>,
     pub agent: AgentSnapshot,
+    pub approval: Vec<ApprovalRequestView>,
 }
 
 /// Represents selectable definitions and durable child timelines for one session.
@@ -275,7 +278,8 @@ pub struct HarnessBroker {
     session: HarnessSession,
     capability: BackendCapability,
     goal_max_turns: u32,
-    trust_policy: TrustPolicy,
+    permission_store: Arc<RwLock<PermissionStore>>,
+    permission_coordinator: Arc<PermissionCoordinator>,
     event_sink: Option<BackendEventSink>,
     clock: Box<dyn Clock>,
     interaction_runtime: Option<InteractionRuntime>,
@@ -304,7 +308,21 @@ impl HarnessBroker {
             }
         };
         let now_ms = clock.now_ms();
-        let backend = Arc::<dyn Backend>::from(crate::backend::build(request.backend.clone())?);
+        let permission_file = request
+            .permission_file
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| data_root.join("permissions.json"));
+        let permission_store = Arc::new(RwLock::new(PermissionStore::load(
+            permission_file,
+            &workspace,
+        )?));
+        let permission_coordinator =
+            Arc::new(PermissionCoordinator::new(Arc::clone(&permission_store)));
+        let backend = Arc::<dyn Backend>::from(crate::backend::build(
+            request.backend.clone(),
+            Arc::clone(&permission_coordinator),
+        )?);
         let force_new_session = request.lease_conflict_action.as_deref() == Some("new");
         let mut session = match request.session_id.as_deref().filter(|_| !force_new_session) {
             Some(session_id) => {
@@ -341,8 +359,7 @@ impl HarnessBroker {
                                 .as_ref()
                                 .map_or(request.effort, |value| value.effort.clone()),
                             fast_mode: preference.is_some_and(|value| value.fast_mode),
-                            trust_profile: request.trust_profile,
-                            write_mode: WriteMode::Read,
+                            execution_mode: ExecutionMode::Read,
                             created_at_ms: now_ms,
                             updated_at_ms: now_ms,
                             active_plan_id: None,
@@ -365,7 +382,6 @@ impl HarnessBroker {
         if session.resolved_model.is_none() && session.model != "default" {
             session.resolved_model = Some(session.model.clone());
         }
-        session.write_mode = WriteMode::Read;
         session.updated_at_ms = now_ms;
         store.save_session(&session)?;
         store.save_preference(
@@ -382,6 +398,7 @@ impl HarnessBroker {
             native_compact: session.native_compact,
             native_steer: request.backend.kind == "codex" || request.backend.kind == "mock",
             native_turn_rollback: request.backend.kind == "codex" || request.backend.kind == "mock",
+            execution_mode_list: execution_mode_list(&request.backend.kind),
             agent: if request.backend.kind == "codex" {
                 crate::agent::AgentCapability::codex()
             } else {
@@ -389,7 +406,7 @@ impl HarnessBroker {
             },
             ..BackendCapability::default()
         };
-        let agent_registry = load_agent_registry(&mut store, &session.id)?;
+        let agent_registry = load_agent_registry(&store, &session.id)?;
         Ok(Self {
             store,
             plan_file: PlanFileStore::new(&data_root),
@@ -401,7 +418,8 @@ impl HarnessBroker {
             session,
             capability,
             goal_max_turns: request.goal_max_turns,
-            trust_policy: request.trust_policy,
+            permission_store,
+            permission_coordinator,
             event_sink: None,
             clock,
             interaction_runtime: None,
@@ -419,6 +437,11 @@ impl HarnessBroker {
     /// Clone the backend control boundary for out-of-band active-turn requests.
     pub fn backend_handle(&self) -> Arc<dyn Backend> {
         Arc::clone(&self.backend)
+    }
+
+    /// Share the out-of-band permission lane with the broker transport loop.
+    pub fn permission_coordinator(&self) -> Arc<PermissionCoordinator> {
+        Arc::clone(&self.permission_coordinator)
     }
 
     /// Build the initial snapshot returned by the initialize response.
@@ -513,6 +536,7 @@ impl HarnessBroker {
                 run: agent_run_list,
                 turn: agent_turn_list,
             },
+            approval: self.permission_coordinator.pending_list()?,
         })
     }
 
@@ -577,7 +601,9 @@ impl HarnessBroker {
             "agent.list" => Ok((serde_json::to_value(self.snapshot()?.agent)?, Vec::new())),
             "agent.start" => self.start_agent(params).await,
             "agent.submit" => self.submit_agent_prompt(params).await,
-            "mode.set" => self.set_mode(params),
+            "permissions.open" => self.open_permission_document(),
+            "permissions.save" => self.save_permission_document(params),
+            "session.execution_mode" => self.select_execution_mode(params),
             "prompt.submit" => self.submit_prompt(params).await,
             "history.record" => self.record_prompt_history(params),
             "queue.edit_last" => anyhow::bail!("prompt queue ownership lives in the Neovim client"),
@@ -615,6 +641,42 @@ impl HarnessBroker {
             }
             _ => anyhow::bail!("unknown Harness broker method: {method}"),
         }
+    }
+
+    fn open_permission_document(&self) -> Result<(Value, Vec<BrokerEvent>)> {
+        let (path, source) = self
+            .permission_store
+            .read()
+            .map_err(|_| anyhow::anyhow!("permission store lock poisoned"))?
+            .open();
+        Ok((json!({ "path": path, "source": source }), Vec::new()))
+    }
+
+    fn save_permission_document(&mut self, params: Value) -> Result<(Value, Vec<BrokerEvent>)> {
+        let source = required_text(&params, "source")?;
+        self.permission_store
+            .write()
+            .map_err(|_| anyhow::anyhow!("permission store lock poisoned"))?
+            .save(&source)?;
+        self.open_permission_document()
+    }
+
+    fn select_execution_mode(&mut self, params: Value) -> Result<(Value, Vec<BrokerEvent>)> {
+        let mode = serde_json::from_value::<ExecutionMode>(
+            params.get("mode").cloned().context("mode is required")?,
+        )?;
+        anyhow::ensure!(
+            self.session.backend == "codex" || self.capability.execution_mode_list.contains(&mode),
+            "execution mode {} is unavailable for this backend",
+            mode.label()
+        );
+        self.session.execution_mode = mode;
+        self.save_session()?;
+        let session = serde_json::to_value(&self.session)?;
+        Ok((
+            session.clone(),
+            vec![self.event("execution_mode_changed", session)?],
+        ))
     }
 
     async fn start_agent(&mut self, params: Value) -> Result<(Value, Vec<BrokerEvent>)> {
@@ -1073,17 +1135,6 @@ impl HarnessBroker {
         Ok(Some(run))
     }
 
-    fn set_mode(&mut self, params: Value) -> Result<(Value, Vec<BrokerEvent>)> {
-        let mode: WriteMode =
-            serde_json::from_value(params.get("mode").cloned().context("mode is required")?)?;
-        self.session.write_mode = mode;
-        self.save_session()?;
-        Ok((
-            serde_json::to_value(&self.session)?,
-            vec![self.event("mode_changed", serde_json::to_value(&self.session)?)?],
-        ))
-    }
-
     fn record_prompt_history(&mut self, params: Value) -> Result<(Value, Vec<BrokerEvent>)> {
         let text = required_text(&params, "text")?;
         self.store
@@ -1134,10 +1185,16 @@ impl HarnessBroker {
     async fn submit_prompt_inner(&mut self, params: Value) -> Result<(Value, Vec<BrokerEvent>)> {
         let text = required_text(&params, "text")?;
         if text == "/read" {
-            return self.set_mode(json!({ "mode": "read" }));
+            return self.select_execution_mode(json!({ "mode": "read" }));
         }
         if text == "/write" {
-            return self.set_mode(json!({ "mode": "write" }));
+            return self.select_execution_mode(json!({ "mode": "write" }));
+        }
+        if text == "/full" {
+            return self.select_execution_mode(json!({ "mode": "full" }));
+        }
+        if text == "/yolo" {
+            return self.select_execution_mode(json!({ "mode": "yolo" }));
         }
         if text == "/clear" {
             return self.new_session().await;
@@ -1153,8 +1210,6 @@ impl HarnessBroker {
                 let (_, pause_event) = self.pause_goal().await?;
                 leading_event.extend(pause_event);
             }
-            self.session.write_mode = WriteMode::Read;
-            self.save_session()?;
             let (result, mut event) = self
                 .run_interaction(
                     PlanPrompt::draft(request),
@@ -1444,8 +1499,6 @@ impl HarnessBroker {
         };
         plan.updated_at_ms = self.clock.now_ms();
         self.store.save_plan(&plan)?;
-        self.session.write_mode = WriteMode::Read;
-        self.save_session()?;
         let lifecycle = PlanLifecycleRecord {
             id: Uuid::new_v4().to_string(),
             session_id: self.session.id.clone(),
@@ -1792,7 +1845,6 @@ impl HarnessBroker {
                 },
             };
             self.session.active_plan_id = Some(plan.id.clone());
-            self.session.write_mode = WriteMode::Read;
             if let Some(markdown) = markdown {
                 let lifecycle_kind = if plan.model_revision == 0 {
                     PlanLifecycleKind::Created
@@ -1998,6 +2050,13 @@ impl HarnessBroker {
             }
         };
         let mut outcome = outcome;
+        if outcome.is_err()
+            && let Err(error) = self
+                .permission_coordinator
+                .cancel_all(self.event_sink.as_ref())
+        {
+            outcome = Err(error).context("clear pending approval requests");
+        }
         if outcome
             .as_ref()
             .is_err_and(|error| error.downcast_ref::<TurnCancelled>().is_some())
@@ -2051,6 +2110,10 @@ impl HarnessBroker {
         backend_event: BackendEvent,
         event: &mut Vec<BrokerEvent>,
     ) -> Result<()> {
+        if backend_event.kind == "approval_requested" {
+            self.emit_live(backend_event, event)?;
+            return Ok(());
+        }
         if backend_event.kind == "parent_boundary" {
             let boundary = backend_event
                 .data
@@ -2437,7 +2500,6 @@ impl HarnessBroker {
         plan.updated_at_ms = self.clock.now_ms();
         self.store.save_plan(&plan)?;
         self.session.active_plan_id = Some(plan.id.clone());
-        self.session.write_mode = WriteMode::Write;
         let objective = "Complete the plan".to_owned();
         let goal = self.create_goal(objective, self.session.backend == "codex")?;
         let lifecycle = PlanLifecycleRecord {
@@ -2687,7 +2749,6 @@ impl HarnessBroker {
             created_at_ms: self.clock.now_ms(),
         };
         self.store.save_plan_lifecycle(&lifecycle)?;
-        self.session.write_mode = WriteMode::Read;
         self.save_session()?;
         Ok((
             serde_json::to_value(&plan)?,
@@ -3046,7 +3107,6 @@ impl HarnessBroker {
             self.store.save_goal(&goal)?;
             self.session.goal_id = None;
         }
-        self.session.write_mode = WriteMode::Read;
         self.save_session()?;
         Ok((
             json!({ "rolled_back": interaction[target_index].id }),
@@ -3075,8 +3135,7 @@ impl HarnessBroker {
             resolved_model: self.session.resolved_model.clone(),
             effort: self.session.effort.clone(),
             fast_mode: self.session.fast_mode,
-            trust_profile: self.session.trust_profile.clone(),
-            write_mode: WriteMode::Read,
+            execution_mode: ExecutionMode::Read,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
             active_plan_id: None,
@@ -3091,6 +3150,7 @@ impl HarnessBroker {
             native_compact: self.session.backend == "codex",
             native_steer: self.session.backend == "codex" || self.session.backend == "mock",
             native_turn_rollback: self.session.backend == "codex" || self.session.backend == "mock",
+            execution_mode_list: execution_mode_list(&self.session.backend),
             agent: if self.session.backend == "codex" {
                 crate::agent::AgentCapability::codex()
             } else {
@@ -3152,14 +3212,13 @@ impl HarnessBroker {
             self.store
                 .acquire_session_lease(&session.id, &self.client_id, self.clock.now_ms())?;
         self.release_lease()?;
-        session.write_mode = WriteMode::Read;
         if session.provider_label.is_empty() {
             session.provider_label = backend_provider_label(&self.backend_launch);
         }
         self.store.save_session(&session)?;
         self.interaction_runtime = None;
         self.session = session;
-        self.agent_registry = load_agent_registry(&mut self.store, &self.session.id)?;
+        self.agent_registry = load_agent_registry(&self.store, &self.session.id)?;
         self.agent_runtime_by_run.clear();
         self.capability.native_fork = self.session.native_fork;
         self.capability.native_compact = self.session.native_compact;
@@ -3319,9 +3378,7 @@ impl HarnessBroker {
                 model: source.model.clone(),
                 effort: source.effort.clone(),
                 fast_mode: source.fast_mode,
-                write_mode: WriteMode::Read,
-                trust_profile: source.trust_profile.clone(),
-                trust_policy: self.trust_policy.clone(),
+                execution_mode: ExecutionMode::Read,
                 backend_session_id: source.backend_session_id.clone(),
             })
             .await?;
@@ -3330,7 +3387,7 @@ impl HarnessBroker {
         fork.id = Uuid::new_v4().to_string();
         fork.name = format!("{} (fork)", fork.name);
         fork.backend_session_id = Some(backend_session_id);
-        fork.write_mode = WriteMode::Read;
+        fork.execution_mode = ExecutionMode::Read;
         fork.active_plan_id = None;
         fork.goal_id = None;
         fork.created_at_ms = now_ms;
@@ -3411,7 +3468,7 @@ impl HarnessBroker {
         self.workspace_kind = crate::workspace::resolve(Path::new(&fork.workspace))?;
         self.interaction_runtime = None;
         self.session = fork;
-        self.agent_registry = load_agent_registry(&mut self.store, &self.session.id)?;
+        self.agent_registry = load_agent_registry(&self.store, &self.session.id)?;
         self.agent_runtime_by_run.clear();
         Ok((
             serde_json::to_value(self.snapshot()?)?,
@@ -3427,9 +3484,7 @@ impl HarnessBroker {
             model: self.session.model.clone(),
             effort: self.session.effort.clone(),
             fast_mode: self.session.fast_mode,
-            write_mode: self.session.write_mode,
-            trust_profile: self.session.trust_profile.clone(),
-            trust_policy: self.trust_policy.clone(),
+            execution_mode: self.session.execution_mode,
             backend_session_id: self.session.backend_session_id.clone(),
         }
     }
@@ -3544,9 +3599,6 @@ fn default_model() -> String {
 fn default_effort() -> String {
     "medium".into()
 }
-fn default_trust_profile() -> String {
-    "workspace".into()
-}
 fn default_goal_max_turns() -> u32 {
     20
 }
@@ -3572,6 +3624,19 @@ fn backend_provider_label(launch: &BackendLaunch) -> String {
             }
         }
         kind => format!("{kind} backend"),
+    }
+}
+
+fn execution_mode_list(backend: &str) -> Vec<ExecutionMode> {
+    if backend == "codex" || backend == "mock" {
+        vec![
+            ExecutionMode::Read,
+            ExecutionMode::Write,
+            ExecutionMode::Full,
+            ExecutionMode::Yolo,
+        ]
+    } else {
+        vec![ExecutionMode::Read, ExecutionMode::Write]
     }
 }
 
@@ -3961,8 +4026,7 @@ mod test {
             resolved_model: Some("model".into()),
             effort: "low".into(),
             fast_mode: false,
-            trust_profile: "workspace".into(),
-            write_mode: WriteMode::Read,
+            execution_mode: ExecutionMode::Read,
             created_at_ms: 0,
             updated_at_ms: 0,
             active_plan_id: None,
@@ -4009,6 +4073,7 @@ mod test {
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
                 data_root: data_root.to_string_lossy().into_owned(),
+                permission_file: None,
                 workspace: repository.to_string_lossy().into_owned(),
                 client_id: "planning-question-client".into(),
                 backend: BackendLaunch {
@@ -4017,10 +4082,8 @@ mod test {
                 },
                 model: "mock-model".into(),
                 effort: "low".into(),
-                trust_profile: "workspace".into(),
                 session_id: None,
                 goal_max_turns: 20,
-                trust_policy: TrustPolicy::default(),
                 lease_conflict_action: None,
             },
             Box::new(FixedClock(100)),
@@ -4230,6 +4293,7 @@ mod test {
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
                 data_root: data.path().to_string_lossy().into_owned(),
+                permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "compact-client".into(),
                 backend: BackendLaunch {
@@ -4238,10 +4302,8 @@ mod test {
                 },
                 model: "mock-model".into(),
                 effort: "low".into(),
-                trust_profile: "workspace".into(),
                 session_id: None,
                 goal_max_turns: 20,
-                trust_policy: TrustPolicy::default(),
                 lease_conflict_action: None,
             },
             Box::new(FixedClock(100)),
@@ -4297,6 +4359,7 @@ mod test {
         let initialize =
             |client_id: &str, lease_conflict_action: Option<String>| InitializeRequest {
                 data_root: data.path().to_string_lossy().into_owned(),
+                permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: client_id.into(),
                 backend: BackendLaunch {
@@ -4305,8 +4368,6 @@ mod test {
                 },
                 model: "mock-model".into(),
                 effort: "low".into(),
-                trust_profile: "workspace".into(),
-                trust_policy: TrustPolicy::default(),
                 session_id: None,
                 goal_max_turns: 20,
                 lease_conflict_action,
@@ -4318,6 +4379,13 @@ mod test {
         )
         .unwrap();
         let source_session_id = source.session.id.clone();
+        source
+            .dispatch(BrokerRequest {
+                id: 0,
+                method: "session.execution_mode".into(),
+                params: json!({ "mode": "full" }),
+            })
+            .await;
         let prompt = source
             .dispatch(BrokerRequest {
                 id: 1,
@@ -4356,6 +4424,7 @@ mod test {
         assert!(forked.response.error.is_none());
         let snapshot = forked.response.result.expect("fork snapshot");
         assert_ne!(snapshot["session"]["id"], source_session_id);
+        assert_eq!(snapshot["session"]["execution_mode"], "read");
         assert_eq!(snapshot["interaction"].as_array().map(Vec::len), Some(1));
         assert_eq!(
             snapshot["interaction"][0]["prompt"],
@@ -4373,12 +4442,13 @@ mod test {
     }
 
     #[tokio::test]
-    async fn carries_model_effort_and_fast_mode_into_a_new_session() {
+    async fn carries_preferences_into_a_new_session_and_mode_into_a_resume() {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
                 data_root: data.path().to_string_lossy().into_owned(),
+                permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "settings-client".into(),
                 backend: BackendLaunch {
@@ -4387,15 +4457,21 @@ mod test {
                 },
                 model: "default".into(),
                 effort: "medium".into(),
-                trust_profile: "workspace".into(),
                 session_id: None,
                 goal_max_turns: 20,
-                trust_policy: TrustPolicy::default(),
                 lease_conflict_action: None,
             },
             Box::new(FixedClock(100)),
         )
         .unwrap();
+        let selected = broker
+            .dispatch(BrokerRequest {
+                id: 0,
+                method: "session.execution_mode".into(),
+                params: json!({ "mode": "yolo" }),
+            })
+            .await;
+        assert!(selected.response.error.is_none());
         let configured = broker
             .dispatch(BrokerRequest {
                 id: 1,
@@ -4416,6 +4492,15 @@ mod test {
         assert_eq!(session["model"], "gpt-5.6");
         assert_eq!(session["effort"], "low");
         assert_eq!(session["fast_mode"], true);
+        assert_eq!(session["execution_mode"], "read");
+        let selected = broker
+            .dispatch(BrokerRequest {
+                id: 21,
+                method: "session.execution_mode".into(),
+                params: json!({ "mode": "full" }),
+            })
+            .await;
+        assert!(selected.response.error.is_none());
         let renamed = broker
             .dispatch(BrokerRequest {
                 id: 3,
@@ -4429,9 +4514,11 @@ mod test {
         );
         drop(broker);
 
+        let resumed_session_id = session["id"].as_str().expect("new session id").to_owned();
         let restarted = HarnessBroker::initialize_with_clock(
             InitializeRequest {
                 data_root: data.path().to_string_lossy().into_owned(),
+                permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "restarted-settings-client".into(),
                 backend: BackendLaunch {
@@ -4440,10 +4527,8 @@ mod test {
                 },
                 model: "default".into(),
                 effort: "medium".into(),
-                trust_profile: "workspace".into(),
-                session_id: None,
+                session_id: Some(resumed_session_id),
                 goal_max_turns: 20,
-                trust_policy: TrustPolicy::default(),
                 lease_conflict_action: None,
             },
             Box::new(FixedClock(200)),
@@ -4452,6 +4537,7 @@ mod test {
         assert_eq!(restarted.session.model, "gpt-5.6");
         assert_eq!(restarted.session.effort, "low");
         assert!(restarted.session.fast_mode);
+        assert_eq!(restarted.session.execution_mode, ExecutionMode::Full);
     }
 
     #[tokio::test]
@@ -4461,6 +4547,7 @@ mod test {
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
                 data_root: data.path().to_string_lossy().into_owned(),
+                permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "first-client".into(),
                 backend: BackendLaunch {
@@ -4469,10 +4556,8 @@ mod test {
                 },
                 model: "mock-model".into(),
                 effort: "low".into(),
-                trust_profile: "workspace".into(),
                 session_id: None,
                 goal_max_turns: 20,
-                trust_policy: TrustPolicy::default(),
                 lease_conflict_action: None,
             },
             Box::new(FixedClock(100)),
@@ -4486,6 +4571,7 @@ mod test {
         let restarted = HarnessBroker::initialize_with_clock(
             InitializeRequest {
                 data_root: data.path().to_string_lossy().into_owned(),
+                permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "second-client".into(),
                 backend: BackendLaunch {
@@ -4494,10 +4580,8 @@ mod test {
                 },
                 model: "different-model".into(),
                 effort: "high".into(),
-                trust_profile: "workspace".into(),
                 session_id: None,
                 goal_max_turns: 20,
-                trust_policy: TrustPolicy::default(),
                 lease_conflict_action: None,
             },
             Box::new(FixedClock(200)),
@@ -4678,6 +4762,7 @@ mod test {
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
                 data_root: data.path().to_string_lossy().into_owned(),
+                permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "test-client".into(),
                 backend: BackendLaunch {
@@ -4686,10 +4771,8 @@ mod test {
                 },
                 model: "mock-model".into(),
                 effort: "low".into(),
-                trust_profile: "workspace".into(),
                 session_id: None,
                 goal_max_turns: 20,
-                trust_policy: TrustPolicy::default(),
                 lease_conflict_action: None,
             },
             Box::new(FixedClock(100)),
@@ -4728,7 +4811,7 @@ mod test {
             .and_then(Value::as_str)
             .unwrap();
         assert!(Path::new(path).exists());
-        assert_eq!(broker.session.write_mode, WriteMode::Read);
+        assert_eq!(broker.session.execution_mode, ExecutionMode::Read);
         let planned_snapshot = broker.snapshot().unwrap();
         assert_eq!(planned_snapshot.artifact.len(), 1);
         assert!(planned_snapshot.timeline.iter().any(|entry| matches!(
@@ -4750,7 +4833,7 @@ mod test {
             "{:?}",
             accepted.response.error
         );
-        assert_eq!(broker.session.write_mode, WriteMode::Write);
+        assert_eq!(broker.session.execution_mode, ExecutionMode::Read);
         let goal = broker.active_goal().unwrap();
         assert_eq!(goal.objective, "Complete the plan");
         assert!(broker.snapshot().unwrap().active_execution.is_some());
@@ -4811,6 +4894,7 @@ mod test {
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
                 data_root: data.path().to_string_lossy().into_owned(),
+                permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "failure-test".into(),
                 backend: BackendLaunch {
@@ -4819,10 +4903,8 @@ mod test {
                 },
                 model: "mock-model".into(),
                 effort: "low".into(),
-                trust_profile: "workspace".into(),
                 session_id: None,
                 goal_max_turns: 20,
-                trust_policy: TrustPolicy::default(),
                 lease_conflict_action: None,
             },
             Box::new(FixedClock(200)),
@@ -4857,6 +4939,7 @@ mod test {
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
                 data_root: data.path().to_string_lossy().into_owned(),
+                permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "task-test".into(),
                 backend: BackendLaunch {
@@ -4865,10 +4948,8 @@ mod test {
                 },
                 model: "mock-model".into(),
                 effort: "low".into(),
-                trust_profile: "workspace".into(),
                 session_id: None,
                 goal_max_turns: 20,
-                trust_policy: TrustPolicy::default(),
                 lease_conflict_action: None,
             },
             Box::new(FixedClock(250)),
@@ -4899,6 +4980,7 @@ mod test {
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
                 data_root: data.path().to_string_lossy().into_owned(),
+                permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "parent-boundary-test".into(),
                 backend: BackendLaunch {
@@ -4907,10 +4989,8 @@ mod test {
                 },
                 model: "mock-model".into(),
                 effort: "low".into(),
-                trust_profile: "workspace".into(),
                 session_id: None,
                 goal_max_turns: 20,
-                trust_policy: TrustPolicy::default(),
                 lease_conflict_action: None,
             },
             Box::new(FixedClock(500)),
@@ -4986,6 +5066,7 @@ mod test {
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
                 data_root: data.path().to_string_lossy().into_owned(),
+                permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "interaction-diff-test".into(),
                 backend: BackendLaunch {
@@ -4994,10 +5075,8 @@ mod test {
                 },
                 model: "mock-model".into(),
                 effort: "low".into(),
-                trust_profile: "workspace".into(),
                 session_id: None,
                 goal_max_turns: 20,
-                trust_policy: TrustPolicy::default(),
                 lease_conflict_action: None,
             },
             Box::new(FixedClock(300)),
@@ -5061,6 +5140,7 @@ mod test {
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
                 data_root: data.path().to_string_lossy().into_owned(),
+                permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "backend-test".into(),
                 backend: BackendLaunch {
@@ -5069,10 +5149,8 @@ mod test {
                 },
                 model: "mock-model".into(),
                 effort: "low".into(),
-                trust_profile: "workspace".into(),
                 session_id: None,
                 goal_max_turns: 20,
-                trust_policy: TrustPolicy::default(),
                 lease_conflict_action: None,
             },
             Box::new(FixedClock(300)),
