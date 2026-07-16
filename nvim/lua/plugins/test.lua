@@ -60,9 +60,27 @@ local function vitest_adapter()
     vitestCommand = "pnpm vitest run --browser.headless",
   })
 
+  local function emit_review_results(spec, results, phase)
+    local review = spec and spec.context and spec.context.screenshot_review
+    if not review then
+      return
+    end
+
+    local screenshot_review = require("screenshot_review")
+    local failures = screenshot_review.extract_failures_from_results(results, { cwd = spec.cwd or review.cwd or vim.uv.cwd() })
+
+    if phase == "complete" then
+      screenshot_review.emit_run_complete(review, failures)
+    else
+      screenshot_review.emit_run_update(review, failures)
+    end
+  end
+
   local base_results = adapter.results
   adapter.results = function(spec, process_result, tree)
-    return remap_results_to_positions(base_results(spec, process_result, tree), tree)
+    local results = remap_results_to_positions(base_results(spec, process_result, tree), tree)
+    emit_review_results(spec, results, "complete")
+    return results
   end
 
   local query = [[
@@ -97,6 +115,11 @@ local function vitest_adapter()
     local spec = base_build_spec(args)
     if spec then
       spec.context.tree = args.tree
+      spec.context.screenshot_review = args.screenshot_review
+
+      if spec.context.screenshot_review then
+        require("screenshot_review").emit_run_start(spec.context.screenshot_review)
+      end
 
       if spec.stream then
         local base_stream = spec.stream
@@ -108,7 +131,9 @@ local function vitest_adapter()
               return nil
             end
 
-            return remap_results_to_positions(results, args.tree)
+            local mapped = remap_results_to_positions(results, args.tree)
+            emit_review_results(spec, mapped, "update")
+            return mapped
           end
         end
       end
@@ -129,6 +154,10 @@ return {
       "nvim-treesitter/nvim-treesitter",
       "marilari88/neotest-vitest",
       -- "mrcjkb/rustaceanvim",
+    },
+    cmd = {
+      "ScreenshotReviewFile",
+      "ScreenshotReviewNearest",
     },
     keys = {
       {
@@ -161,6 +190,21 @@ return {
       },
     },
     config = function()
+      vim.api.nvim_create_user_command("ScreenshotReviewFile", function()
+        require("screenshot_review").review_file()
+      end, { desc = "Run screenshot tests for current file and open browser review" })
+
+      vim.api.nvim_create_user_command("ScreenshotReviewNearest", function()
+        require("screenshot_review").review_nearest()
+      end, { desc = "Run nearest screenshot test and open browser review" })
+
+      vim.api.nvim_create_autocmd("VimLeavePre", {
+        group = vim.api.nvim_create_augroup("screenshot-review", { clear = true }),
+        callback = function()
+          require("screenshot_review").release_client_lease()
+        end,
+      })
+
       require("neotest").setup({
         adapters = {
           vitest_adapter(),

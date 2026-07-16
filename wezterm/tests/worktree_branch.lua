@@ -75,7 +75,7 @@ package.preload.wezterm = function()
     action_callback = function(callback)
       return callback
     end,
-    config_dir = wezterm_dir,
+    config_dir = tests_dir,
     executable_dir = wezterm_dir,
     home_dir = wezterm_dir,
     mux = {
@@ -129,6 +129,8 @@ package.preload.wezterm = function()
 end
 
 local worktree = require 'worktree'
+assert_equal(worktree.settings.creation_runner_path, wezterm_dir .. '/../scripts/create-worktree.nu',
+  'creation runner must resolve relative to the worktree module instead of the top-level config loader')
 worktree.settings.debug = false
 assert_equal(type(worktree.menu), 'function', 'worktree module must load with the branch-source model')
 assert_equal(worktree.settings.branch_prefix, 'mmgeorge/', 'default branch prefix must use mmgeorge')

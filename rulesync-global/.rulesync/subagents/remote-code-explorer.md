@@ -12,15 +12,15 @@ claudecode:
   model: claude-opus-4-8
   effort: low
 codexcli:
-  model: gpt-5.5
-  model_reasoning_effort: low
+  model: gpt-5.6-terra
+  model_reasoning_effort: medium
   nickname_candidates:
-    - Remote Code Explorer
-    - Scout
-    - Researcher
+    - Code Explorer
+    - Semantic Explorer
+    - Code Mapper
 copilotcli:
-  model: gpt-5.1
-  model_reasoning_effort: low
+  model: gpt-5.6-terra
+  model_reasoning_effort: medium
 antigravity:
   model: gemini-3.5-flash
   model_reasoning_effort: low
