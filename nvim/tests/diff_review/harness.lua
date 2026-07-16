@@ -504,6 +504,13 @@ local function fake_launcher(command, options, _)
       emit(options, { id = request.id, result = { interaction } })
     elseif request.method == "session.list" then
       emit(options, { id = request.id, result = { active_session } })
+    elseif request.method == "session.preview" then
+      emit(options, { id = request.id, result = {
+        session = active_session,
+        interaction = session.harness.interaction,
+        timeline = session.harness.timeline,
+        agent = session.harness.agent or { definition = {}, run = {}, turn = {} },
+      } })
     elseif request.method == "session.rename" then
       active_session.name = vim.trim(request.params.name or "")
       emit(options, { id = request.id, result = active_session })
@@ -675,16 +682,10 @@ local ok, failure = pcall(function()
       { label = "Compatible", description = "Keep the compatibility layer." },
     },
     allow_freeform = true,
-  }, require("diff_review.infra.config").options.harness.question_choice_keys)
+  }, require("diff_review.infra.config").options.picker.choice_keys)
   assert_equals(question_entries[1].key, "n", "question choices should start with the configured quick keys")
   assert_equals(question_entries[4].key, "o", "Other should always use o")
   assert_equals(question_entries[5].key, "a", "Ask should always use a regardless of option count")
-  local question_frame = require("diff_review.views.harness.plan_question.render").build(
-    { question = "Which migration?" }, question_entries, 70, false
-  )
-  assert_true(not vim.iter(question_frame.lines):any(function(line) return line:find("    └ ", 1, true) ~= nil end),
-    "question options should not embed feedback input rows")
-
   local question_render = interaction_renderer.build({ {
     kind = "plan_lifecycle",
     id = "question-lifecycle",
@@ -1282,12 +1283,29 @@ local ok, failure = pcall(function()
     assert_true(not vim.wo[harness_win].number, "Harness windows should hide absolute line numbers")
     assert_true(not vim.wo[harness_win].relativenumber, "Harness windows should hide relative line numbers")
     assert_equals(vim.wo[harness_win].signcolumn, "no", "Harness windows should hide the sign gutter")
-    assert_equals(vim.wo[harness_win].statuscolumn, "", "Harness windows should hide custom status columns")
   end
+  assert_equals(vim.wo[session.harness.transcript_win].statuscolumn, "",
+    "Harness transcripts should hide custom status columns")
   assert_equals(vim.wo[session.harness.transcript_win].foldcolumn, "0",
     "Harness transcripts should hide the fold gutter")
-  assert_equals(vim.wo[session.harness.composer_win].foldcolumn, "1",
-    "Harness input should reserve a one-character gutter")
+  assert_equals(vim.wo[session.harness.composer_win].foldcolumn, "2",
+    "Harness input should reserve a two-character gutter")
+  assert_equals(vim.wo[session.harness.composer_win].statuscolumn,
+    "%#DiffReviewHarnessPrompt#%{v:lnum == 1 ? '❯ ' : '  '}%*",
+    "Harness input should render a prompt marker only beside its first line")
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "first line", "second line" })
+  local first_composer_gutter = vim.api.nvim_eval_statusline(
+    vim.wo[session.harness.composer_win].statuscolumn,
+    { winid = session.harness.composer_win, use_statuscol_lnum = 1 }
+  )
+  local second_composer_gutter = vim.api.nvim_eval_statusline(
+    vim.wo[session.harness.composer_win].statuscolumn,
+    { winid = session.harness.composer_win, use_statuscol_lnum = 2 }
+  )
+  assert_equals(first_composer_gutter.str, "❯ ", "Harness input should mark and pad its first line")
+  assert_true(second_composer_gutter.str:match("^%s*$") ~= nil,
+    "Harness input should leave continuation-line gutters blank")
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "" })
   local composer_mode_autocmd_list = vim.api.nvim_get_autocmds({
     group = "DiffReviewHarnessComposerMode",
     buffer = session.harness.composer_buf,
@@ -1433,24 +1451,27 @@ local ok, failure = pcall(function()
   assert_equals(vim.api.nvim_get_current_line(), "edited recalled prompt",
     "Up should preserve an edited recalled prompt as a new draft")
   vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "" })
-  local original_ui_select = vim.ui.select
-  local effort_picker_options = nil
-  vim.ui.select = function(_, options, callback)
-    effort_picker_options = options
-    callback(nil)
-  end
   controller.select_effort()
-  vim.ui.select = original_ui_select
-  assert_true(effort_picker_options.snacks.layout.preview == false,
-    "choice-only Harness pickers should disable the Snacks preview pane")
-  assert_true(effort_picker_options.snacks.main.current == false,
-    "choice-only Harness pickers should not treat HarnessInput as their main window")
-  assert_equals(effort_picker_options.snacks.layout.preset, "select",
-    "choice-only Harness pickers should use the floating select preset")
-  assert_equals(effort_picker_options.snacks.layout.layout.relative, "editor",
-    "choice-only Harness pickers should float relative to the full editor")
-  assert_equals(effort_picker_options.snacks.layout.layout.row, 2,
-    "choice-only Harness pickers should float over the transcript area")
+  local effort_picker = require("diff_review.views.picker")._state_for_test()
+  assert_true(effort_picker ~= nil, "effort selection should use the shared picker")
+  assert_equals(effort_picker.spec.page_list[1].title, "Select reasoning effort",
+    "effort selection should label its picker page")
+  assert_equals(#effort_picker.spec.page_list[1].option_list, 5,
+    "effort selection should expose every reasoning level")
+  assert_equals(vim.api.nvim_win_get_config(effort_picker.win).focusable, true,
+    "effort picker should own modal focus")
+  require("diff_review.views.picker").close(false)
+  controller.select_model()
+  assert_true(vim.wait(1000, function() return require("diff_review.views.picker").is_open() end, 10),
+    "model selection should open the shared picker after backend discovery")
+  local model_picker = require("diff_review.views.picker")._state_for_test()
+  assert_equals(model_picker.spec.page_list[1].option_list[1].detail, "mock-model",
+    "model picker should render backend identifiers in the detail column")
+  vim.fn.maparg("<CR>", "n", false, true).callback()
+  assert_true(vim.wait(1000, function()
+    return request_by_method["session.configure"]
+      and request_by_method["session.configure"].params.model == "mock-model"
+  end, 10), "model selection should configure the chosen backend model")
   local command_source = require("diff_review.views.harness.completion.command_source").new()
   vim.api.nvim_set_current_win(session.harness.composer_win)
   vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/ " })
@@ -2173,8 +2194,8 @@ local ok, failure = pcall(function()
   assert_true(vim.wait(2000, question_view.is_open, 10), "planning questions should open a custom float")
   local question_state = question_view._state_for_test()
   local question_config = vim.api.nvim_win_get_config(question_state.win)
-  assert_equals(question_config.relative, "win", "planning questions should float relative to Harness")
-  assert_true(vim.inspect(question_config.title):find("Harness question 1 of 3", 1, true) ~= nil,
+  assert_equals(question_config.relative, "editor", "planning questions should overlay the complete Harness surface")
+  assert_true(vim.inspect(question_config.title):find("1/3", 1, true) ~= nil,
     "planning question title should show sequence progress")
   assert_true(vim.fn.maparg("a", "n", false, true).callback ~= nil,
     "Ask should always own the a key")
@@ -2188,7 +2209,7 @@ local ok, failure = pcall(function()
   assert_true(vim.wait(1000, question_view.is_open, 10), "oe should reopen durable planning elicitation state")
   question_state = question_view._state_for_test()
   vim.fn.maparg("<Tab>", "n", false, true).callback()
-  assert_equals(question_state.input_kind, "choice", "Tab should open the attached feedback editor")
+  assert_equals(question_state.input_kind, "feedback", "Tab should open the attached feedback editor")
   assert_true(vim.api.nvim_win_is_valid(question_state.input_win), "feedback editor should own a separate float")
   vim.api.nvim_buf_set_lines(question_state.input_buf, 0, -1, false,
     { "Preserve compatibility for one release" })
@@ -2197,7 +2218,7 @@ local ok, failure = pcall(function()
     return active_plan.elicitation.current_index == 1
   end, 10), "inline feedback should commit the selected option")
   assert_true(vim.inspect(vim.api.nvim_win_get_config(question_state.win).title):find(
-    "Harness question 2 of 3", 1, true
+    "2/3", 1, true
   ) ~= nil, "the float should advance without reopening")
   vim.fn.maparg("o", "n", false, true).callback()
   assert_equals(question_state.input_kind, nil, "Other quick key should only highlight its row")
@@ -2205,15 +2226,14 @@ local ok, failure = pcall(function()
   assert_equals(question_state.input_kind, "other", "Enter should open Other's free-form input row")
   vim.fn.maparg("go", "n", false, true).callback()
   vim.fn.maparg("<Right>", "n", false, true).callback()
-  assert_equals(question_state.elicitation.current_index, 2, "Right should preview the next question")
+  assert_equals(question_state.state.page_index, 3, "Right should preview the next question")
   assert_equals(active_plan.elicitation.current_index, 1, "question navigation should not submit an answer")
   vim.fn.maparg("<Left>", "n", false, true).callback()
   vim.fn.maparg("n", "n", false, true).callback()
   assert_equals(active_plan.elicitation.current_index, 1, "direct choice keys should not commit")
   vim.fn.maparg("<CR>", "n", false, true).callback()
-  vim.fn.maparg("<C-s>", "i", false, true).callback()
   assert_true(vim.wait(1000, function() return active_plan.elicitation.current_index == 2 end, 10),
-    "C-s should commit the highlighted choice while the editor is open")
+    "Enter should commit the highlighted choice without feedback")
   vim.fn.maparg("a", "n", false, true).callback()
   assert_equals(question_state.input_kind, nil, "a should highlight Ask without opening an editor")
   vim.fn.maparg("<CR>", "n", false, true).callback()
@@ -2223,6 +2243,7 @@ local ok, failure = pcall(function()
   assert_true(vim.wait(2000, function()
     return request_by_method["question.ask"] ~= nil and question_view.is_open()
   end, 10), "Ask should clarify without consuming the pending question")
+  question_state = question_view._state_for_test()
   assert_equals(active_plan.elicitation.current_index, 2, "clarification should preserve the current question")
   vim.fn.maparg("n", "n", false, true).callback()
   assert_equals(active_plan.elicitation.current_index, 2, "direct choice keys should still wait for Enter")
@@ -2247,10 +2268,8 @@ local ok, failure = pcall(function()
     "completed planning should publish a session artifact")
   assert_true(vim.api.nvim_buf_get_name(0) ~= plan_path,
     "completed planning should not open PlanReview automatically")
-  local original_select = vim.ui.select
-  vim.ui.select = function(items, _, callback) callback(items[1]) end
   controller.open_artifact_picker()
-  vim.ui.select = original_select
+  vim.fn.maparg("<CR>", "n", false, true).callback()
   assert_true(vim.wait(2000, function() return vim.api.nvim_buf_get_name(0) == plan_path end, 10),
     "artifact selection did not open the physical plan")
   assert_equals(vim.bo.filetype, "markdown", "PlanReview should use markdown")
@@ -2263,9 +2282,8 @@ local ok, failure = pcall(function()
   vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/plan revise the feature" })
   controller.submit()
   assert_true(vim.wait(2000, function() return not session.harness.busy end, 10), "second planning turn did not complete")
-  vim.ui.select = function(items, _, callback) callback(items[1]) end
   controller.open_artifact_picker()
-  vim.ui.select = original_select
+  vim.fn.maparg("<CR>", "n", false, true).callback()
   assert_true(vim.wait(2000, function() return vim.api.nvim_buf_get_name(0) == plan_path end, 10),
     "second artifact selection did not open PlanReview")
   local original_input = vim.ui.input
@@ -2308,30 +2326,29 @@ local ok, failure = pcall(function()
   assert_true(vim.wait(2000, function()
     return request_by_method["session.rename"] ~= nil and session.harness.session.name == "Architecture review"
   end, 10), "/rename should persist the active session name")
-  require("diff_review.views.sessions").open()
-  assert_true(vim.wait(2000, function() return vim.bo.filetype == "DiffReviewSessions" end, 10), "Sessions did not open")
-  assert_true(vim.fn.maparg("F", "n", false, true).callback == nil, "unsupported native fork should be absent")
-  assert_true(vim.api.nvim_get_current_line():find("Current Repo", 1, true) ~= nil, "Sessions should show repository and global tabs")
-  local named_session_line = vim.iter(vim.api.nvim_buf_get_lines(0, 0, -1, false)):find(function(line)
-    return line:find("Architecture review", 1, true) ~= nil
-  end)
-  assert_true(named_session_line ~= nil and named_session_line:find("Architecture review", 1, true) == 1,
-    "Sessions should render the session name as its first column")
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/sessions" })
+  controller.submit()
+  local session_picker = require("diff_review.views.picker")
+  assert_true(vim.wait(2000, function() return session_picker.is_open("sessions") end, 10),
+    "session search picker did not open")
+  local session_picker_state = session_picker._state_for_test()
+  local session_page = require("diff_review.views.picker.state").page(session_picker_state.state, session_picker_state.spec)
+  assert_equals(session_page.option_list[1].label, "Architecture review",
+    "session search should expose the durable name as its label")
+  session_picker.close(true)
 
-  vim.cmd("tabclose")
   vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/rename" })
   controller.submit()
   assert_true(vim.wait(2000, function() return session.harness.session.name == "" end, 10),
     "/rename without a name should clear the active session name")
-  require("diff_review.views.sessions").open()
-  assert_true(vim.wait(2000, function() return vim.bo.filetype == "DiffReviewSessions" end, 10),
-    "Sessions did not reopen for unnamed-session verification")
-  local unnamed_session_line = vim.iter(vim.api.nvim_buf_get_lines(0, 0, -1, false)):find(function(line)
-    return line:find("[unnamed]", 1, true) ~= nil
-  end)
-  assert_true(unnamed_session_line ~= nil and unnamed_session_line:find("[unnamed]", 1, true) == 1,
-    "Sessions should render empty names as [unnamed] in the first column")
-  vim.cmd("tabclose")
+  controller.open_session_picker()
+  assert_true(vim.wait(2000, function() return session_picker.is_open("sessions") end, 10),
+    "session search did not reopen for unnamed-session verification")
+  session_picker_state = session_picker._state_for_test()
+  session_page = require("diff_review.views.picker.state").page(session_picker_state.state, session_picker_state.spec)
+  assert_equals(session_page.option_list[1].label, "[unnamed]",
+    "session search should render empty names as [unnamed]")
+  session_picker.close(true)
   vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/model selected-model" })
   controller.submit()
   assert_true(vim.wait(2000, function()

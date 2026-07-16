@@ -186,8 +186,19 @@ end
 
 ---@param win integer
 ---@param hidden boolean
-function M.set_cursor_hidden(win, hidden)
-  vim.wo[win].winhighlight = hidden and "Cursor:DiffReviewHarnessHiddenCursor" or ""
+---@param base? string
+function M.set_cursor_hidden(win, hidden, base)
+  if not hidden and base ~= nil then
+    vim.wo[win].winhighlight = base
+    return
+  end
+  local highlight_list = vim.split(base or vim.wo[win].winhighlight, ",", { plain = true, trimempty = true })
+  highlight_list = vim.tbl_filter(function(entry)
+    if hidden then return not vim.startswith(entry, "Cursor:") end
+    return entry ~= "Cursor:DiffReviewHiddenCursor"
+  end, highlight_list)
+  if hidden then highlight_list[#highlight_list + 1] = "Cursor:DiffReviewHiddenCursor" end
+  vim.wo[win].winhighlight = table.concat(highlight_list, ",")
 end
 
 ---@param win integer

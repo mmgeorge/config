@@ -3,9 +3,10 @@ local M = {}
 local composer_mode_group = vim.api.nvim_create_augroup("DiffReviewHarnessComposerMode", { clear = false })
 
 local config = require("diff_review.infra.config")
+local input_gutter = require("diff_review.shared.input_gutter")
 
 ---@param win integer
-local function configure_gutterless_window(win)
+function M.configure_gutterless_window(win)
   vim.wo[win].number = false
   vim.wo[win].relativenumber = false
   vim.wo[win].signcolumn = "no"
@@ -53,7 +54,7 @@ function M.open()
   vim.wo[transcript_win].foldenable = true
   vim.wo[transcript_win].foldtext = "v:lua.require'diff_review.render.harness.interaction_tree'.foldtext()"
   vim.wo[transcript_win].fillchars = "fold: "
-  configure_gutterless_window(transcript_win)
+  M.configure_gutterless_window(transcript_win)
 
   vim.cmd("belowright " .. tostring(options.composer_min_height) .. "split")
   local composer_win = vim.api.nvim_get_current_win()
@@ -67,8 +68,7 @@ function M.open()
   vim.api.nvim_buf_set_lines(composer_buf, 0, -1, false, { "" })
   vim.wo[composer_win].wrap = true
   vim.wo[composer_win].linebreak = true
-  configure_gutterless_window(composer_win)
-  vim.wo[composer_win].foldcolumn = "1"
+  input_gutter.apply(composer_win)
   keep_composer_normal_on_entry(composer_buf)
   return transcript_buf, transcript_win, composer_buf, composer_win
 end

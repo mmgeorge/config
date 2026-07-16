@@ -104,6 +104,15 @@ pub struct AgentSnapshot {
     pub turn: Vec<AgentTurnRecord>,
 }
 
+/// Represents a stored session timeline projected without acquiring its lease.
+#[derive(Clone, Debug, Serialize)]
+pub struct SessionPreview {
+    pub session: HarnessSession,
+    pub interaction: Vec<InteractionRecord>,
+    pub timeline: Vec<TimelineEntry>,
+    pub agent: AgentSnapshot,
+}
+
 /// Represents the durable owner and question state presented by the Harness question UI.
 #[derive(Clone, Debug, Serialize)]
 pub struct ActiveElicitation {
@@ -629,6 +638,7 @@ impl HarnessBroker {
             "interaction.rollback" => self.rollback_interaction(params).await,
             "session.new" | "session.clear" => self.new_session().await,
             "session.list" => self.list_session(params),
+            "session.preview" => self.preview_session(params),
             "session.resume" => self.resume_session(params).await,
             "session.rename" => self.rename_session(params),
             "session.configure" => self.configure_session(params),
@@ -3190,6 +3200,40 @@ impl HarnessBroker {
         Ok((serde_json::to_value(session)?, Vec::new()))
     }
 
+    fn preview_session(&self, params: Value) -> Result<(Value, Vec<BrokerEvent>)> {
+        let session_id = required_text(&params, "session_id")?;
+        let preview_session = self
+            .store
+            .load_session(&session_id)?
+            .context("session not found")?;
+        let interaction = self.store.list_interaction(&session_id)?;
+        let plan_list = self.store.list_plan(&session_id)?;
+        let agent_run_list = self.store.list_agent_run(&session_id)?;
+        let timeline = TimelineProjector::build(
+            interaction.clone(),
+            &plan_list,
+            self.store.list_plan_lifecycle(&session_id)?,
+            self.store.list_plan_execution(&session_id)?,
+            agent_run_list.clone(),
+            &self.plan_file,
+        )?;
+        let mut agent_turn_list = Vec::new();
+        for run in &agent_run_list {
+            agent_turn_list.extend(self.store.list_agent_turn(&run.id)?);
+        }
+        let preview = SessionPreview {
+            session: preview_session,
+            interaction,
+            timeline,
+            agent: AgentSnapshot {
+                definition: Vec::new(),
+                run: agent_run_list,
+                turn: agent_turn_list,
+            },
+        };
+        Ok((serde_json::to_value(preview)?, Vec::new()))
+    }
+
     async fn resume_session(&mut self, params: Value) -> Result<(Value, Vec<BrokerEvent>)> {
         let session_id = required_text(&params, "session_id")?;
         let mut session = self
@@ -4538,6 +4582,80 @@ mod test {
         assert_eq!(restarted.session.effort, "low");
         assert!(restarted.session.fast_mode);
         assert_eq!(restarted.session.execution_mode, ExecutionMode::Full);
+    }
+
+    #[tokio::test]
+    async fn previews_a_stored_session_without_acquiring_its_lease() {
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = HarnessBroker::initialize_with_clock(
+            InitializeRequest {
+                data_root: data.path().to_string_lossy().into_owned(),
+                permission_file: None,
+                workspace: repository.path().to_string_lossy().into_owned(),
+                client_id: "preview-client".into(),
+                backend: BackendLaunch {
+                    kind: "mock".into(),
+                    command: vec!["mock".into()],
+                },
+                model: "mock-model".into(),
+                effort: "low".into(),
+                session_id: None,
+                goal_max_turns: 20,
+                lease_conflict_action: None,
+            },
+            Box::new(FixedClock(100)),
+        )
+        .unwrap();
+        let source_session_id = broker.session.id.clone();
+        let prompt = broker
+            .dispatch(BrokerRequest {
+                id: 1,
+                method: "prompt.submit".into(),
+                params: json!({ "text": "preserve preview history" }),
+            })
+            .await;
+        assert!(prompt.response.error.is_none());
+        let created = broker
+            .dispatch(BrokerRequest {
+                id: 2,
+                method: "session.new".into(),
+                params: json!({}),
+            })
+            .await;
+        assert!(created.response.error.is_none());
+        let mut source_session = broker
+            .store
+            .load_session(&source_session_id)
+            .unwrap()
+            .expect("source session");
+        source_session.lease_owner = Some("foreign-client".into());
+        source_session.lease_expires_at_ms = Some(500);
+        broker.store.save_session(&source_session).unwrap();
+
+        let preview = broker
+            .dispatch(BrokerRequest {
+                id: 3,
+                method: "session.preview".into(),
+                params: json!({ "session_id": source_session_id }),
+            })
+            .await;
+        assert!(preview.response.error.is_none());
+        let result = preview.response.result.expect("session preview");
+        assert_eq!(result["session"]["id"], source_session_id);
+        assert_eq!(result["interaction"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            result["interaction"][0]["prompt"],
+            "preserve preview history"
+        );
+        assert_eq!(result["timeline"].as_array().map(Vec::len), Some(1));
+        let persisted = broker
+            .store
+            .load_session(&source_session_id)
+            .unwrap()
+            .expect("persisted source session");
+        assert_eq!(persisted.lease_owner.as_deref(), Some("foreign-client"));
+        assert_eq!(persisted.lease_expires_at_ms, Some(500));
     }
 
     #[tokio::test]

@@ -1,465 +1,146 @@
-local M = {}
+local PlanQuestion = {}
 
-local command_set = require("diff_review.shared.view_command_set")
-local navigation = require("diff_review.views.harness.choice_flow.navigation")
 local config = require("diff_review.infra.config")
-local input_window = require("diff_review.views.harness.plan_question.input_window")
-local keymaps = require("diff_review.shared.keymaps")
 local model = require("diff_review.views.harness.plan_question.model")
-local notifications = require("diff_review.infra.notifications")
-local render = require("diff_review.views.harness.plan_question.render")
-local window = require("diff_review.views.harness.plan_question.window")
+local picker = require("diff_review.views.picker")
 
----@class DiffReviewPlanQuestionHost
----@field transcript_win integer
----@field answer fun(params: table, callback: fun(elicitation?: table))
----@field skip fun(params: table, callback: fun(elicitation?: table))
----@field ask fun(params: table)
----@field continue fun()
----@field closed? fun()
+local active_elicitation = nil
+local active_host = nil
 
----@class DiffReviewPlanQuestionViewState
----@field buf integer?
----@field win integer?
----@field elicitation table?
----@field host DiffReviewPlanQuestionHost?
----@field entry_list DiffReviewPlanQuestionEntry[]
----@field selected_index integer
----@field input_entry integer?
----@field input_kind "choice"|"other"|"ask"?
----@field input_buf integer?
----@field input_win integer?
----@field input_draft string
----@field input_draft_by_question table<string, string>
----@field frame DiffReviewPlanQuestionFrame?
----@field modal_keymap_list table[]
-
----@type DiffReviewPlanQuestionViewState
-local state = {
-  buf = nil,
-  win = nil,
-  elicitation = nil,
-  host = nil,
-  entry_list = {},
-  selected_index = 1,
-  input_entry = nil,
-  input_kind = nil,
-  input_buf = nil,
-  input_win = nil,
-  input_draft = "",
-  input_draft_by_question = {},
-  frame = nil,
-  modal_keymap_list = {},
-}
-
-local function valid_window() return state.win and vim.api.nvim_win_is_valid(state.win) end
-
-local function valid_input_window()
-  return state.input_win and vim.api.nvim_win_is_valid(state.input_win)
-end
-
-local function current_question()
-  return state.elicitation and model.current_question(state.elicitation) or nil
-end
-
-local function select_answered_entry()
-  local question = current_question()
-  if not (question and state.elicitation) then
-    state.selected_index = 1
-    return
+local function option_list(question, elicitation)
+  local entries = model.entries(question, config.options.picker.choice_keys)
+  local answer = model.answer_for(elicitation, question.id)
+  local selected_index = model.selected_entry_index(entries, answer)
+  local result = {}
+  for _, entry in ipairs(entries) do
+    result[#result + 1] = {
+      key = entry.key,
+      label = entry.label,
+      detail = entry.description,
+      value = entry.option,
+      entry_kind = entry.kind,
+      input_kind = entry.kind == "ask" and "ask" or entry.kind == "other" and "other" or nil,
+    }
   end
-  state.selected_index = model.selected_entry_index(
-    state.entry_list,
-    model.answer_for(state.elicitation, question.id)
-  )
+  return result, selected_index, entries
 end
 
-local function title()
-  local count = state.elicitation and model.question_count(state.elicitation) or 0
-  local index = math.min((state.elicitation and state.elicitation.current_index or 0) + 1, count)
-  if not current_question() then return ("Review Harness answers (%d)"):format(count) end
-  return ("Harness question %d of %d"):format(index, count)
+local function question_page_list(elicitation)
+  local question_set = elicitation.question_set or {}
+  local page_list = {}
+  for index, question in ipairs(question_set.questions or {}) do
+    local options, selected_index, entries = option_list(question, elicitation)
+    local answer = model.answer_for(elicitation, question.id)
+    local selected_entry = entries[selected_index]
+    page_list[#page_list + 1] = {
+      id = question.id,
+      title = question.header or question.question or "Planning question",
+      subtitle = question.question ~= question.header and question.question or question.detail,
+      option_list = options,
+      selected_index = selected_index,
+      initial_draft = selected_entry and model.input_text(selected_entry, answer) or "",
+      allow_input = true,
+      input_height = config.options.picker.input_height,
+      footer = "←→ page  ↑↓ select  Enter confirm  Tab feedback",
+    }
+  end
+  return page_list
 end
 
-local close
-local confirm_answers
-local revise_answers
-
-local function clear_modal_keymaps()
-  for _, mapping in ipairs(state.modal_keymap_list) do
-    if vim.api.nvim_buf_is_valid(mapping.buf) then
-      pcall(vim.keymap.del, "n", mapping.key, { buffer = mapping.buf })
-      if mapping.previous and next(mapping.previous) then
-        vim.api.nvim_buf_call(mapping.buf, function() vim.fn.mapset("n", false, mapping.previous) end)
-      end
+local function review_page(elicitation)
+  local content_list = {}
+  for index, item in ipairs(model.review_item_list(elicitation)) do
+    content_list[#content_list + 1] = {
+      text = ("%d. %s"):format(index, item.question),
+      group = "DiffReviewPickerQuestion",
+    }
+    content_list[#content_list + 1] = { text = item.answer, group = "DiffReviewPickerAnswer" }
+    if item.additional_input then
+      content_list[#content_list + 1] = { text = item.additional_input, group = "DiffReviewPickerText" }
     end
   end
-  state.modal_keymap_list = {}
-end
-
-local function preserve_modal_keymap(key)
-  if vim.iter(state.modal_keymap_list):any(function(mapping) return mapping.key == key end) then return end
-  local transcript_buf = vim.api.nvim_win_get_buf(state.host.transcript_win)
-  local previous = vim.api.nvim_buf_call(transcript_buf, function()
-    return vim.fn.maparg(key, "n", false, true)
-  end)
-  state.modal_keymap_list[#state.modal_keymap_list + 1] = {
-    buf = transcript_buf,
-    key = key,
-    previous = previous,
+  return {
+    id = "review",
+    title = ("Review Harness answers (%d)"):format(model.question_count(elicitation)),
+    subtitle = "Confirm the answers that will continue planning.",
+    content_list = content_list,
+    option_list = {
+      { key = "y", label = "Submit answers", value = "submit", confirm_on_key = true },
+      { key = "n", label = "Revise answers", value = "revise", confirm_on_key = true },
+    },
+    footer = "y submit  n revise  q close",
   }
 end
 
-local function render_view()
-  if not (state.buf and vim.api.nvim_buf_is_valid(state.buf) and valid_window()) then return end
-  local question = current_question()
-  local width = vim.api.nvim_win_get_width(state.win)
-  state.entry_list = question and model.entries(question, config.options.harness.question_choice_keys) or {}
-  state.selected_index = math.max(1, math.min(state.selected_index, math.max(1, #state.entry_list)))
-  local review_item_list = not question and state.elicitation and model.review_item_list(state.elicitation) or nil
-  state.frame = render.build(question, state.entry_list, width, review_item_list)
-  local parent_height = vim.api.nvim_win_get_height(state.host.transcript_win)
-  local height = math.min(#state.frame.lines, math.max(6, parent_height - 10))
-  window.resize(state.win, state.host.transcript_win, width, height)
-  window.render(state.buf, state.frame, state.selected_index, state.entry_list)
-  window.set_cursor_hidden(state.win, true)
-  window.set_focusable(state.win, false)
-  window.set_title(state.win, title())
-  if vim.api.nvim_get_current_win() == state.win then
-    vim.api.nvim_set_current_win(state.host.transcript_win)
-  end
-end
-
-local function input_title()
-  local entry = state.entry_list[state.input_entry or state.selected_index]
-  if state.input_kind == "ask" then return "Ask" end
-  if state.input_kind == "other" then return "Other answer" end
-  return entry and ("Feedback for " .. entry.label) or "Feedback"
-end
-
-local function update_input_target()
-  if not valid_input_window() then return end
-  local entry = state.entry_list[state.selected_index]
-  if not entry then return end
-  state.input_entry = state.selected_index
-  state.input_kind = entry.kind == "ask" and "ask" or entry.kind == "other" and "other" or "choice"
-  input_window.retarget(state.input_win, state.win, input_title())
-end
-
-local function restore_current_input_draft()
-  if not (valid_input_window() and state.input_buf) then return end
-  local question = current_question()
-  local entry = state.entry_list[state.selected_index]
-  if not (question and entry and state.elicitation) then return end
-  local answer = model.answer_for(state.elicitation, question.id)
-  state.input_draft = state.input_draft_by_question[question.id] or model.input_text(entry, answer)
-  input_window.set_text(state.input_buf, state.input_draft)
-  update_input_target()
-end
-
-close = function(notify_host)
-  local host = state.host
-  clear_modal_keymaps()
-  input_window.close(state.input_win)
-  window.close(state.win)
-  state.buf = nil
-  state.win = nil
-  state.elicitation = nil
-  state.host = nil
-  state.entry_list = {}
-  state.input_entry = nil
-  state.input_kind = nil
-  state.input_buf = nil
-  state.input_win = nil
-  state.input_draft = ""
-  state.input_draft_by_question = {}
-  state.frame = nil
-  state.modal_keymap_list = {}
-  if notify_host and host and host.closed then host.closed() end
-end
-
-local function apply_elicitation(elicitation)
-  if not elicitation then
-    close(false)
-    return
-  end
-  local answered_question = current_question()
-  if answered_question then state.input_draft_by_question[answered_question.id] = nil end
-  input_window.close(state.input_win)
-  state.elicitation = vim.deepcopy(elicitation)
-  state.input_entry = nil
-  state.input_kind = nil
-  state.input_buf = nil
-  state.input_win = nil
-  state.input_draft = ""
-  local question = current_question()
-  state.entry_list = question and model.entries(question, config.options.harness.question_choice_keys) or {}
-  select_answered_entry()
-  render_view()
-end
-
-local function move(delta)
-  if #state.entry_list == 0 then return end
-  state.selected_index = navigation.cycle(state.selected_index, #state.entry_list, delta)
-  render_view()
-  update_input_target()
-end
-
-local function move_question(delta)
-  if not state.elicitation then return end
-  local previous_question = current_question()
-  if valid_input_window() and previous_question then
-    state.input_draft_by_question[previous_question.id] = input_window.text(state.input_buf)
-  end
-  local count = model.question_count(state.elicitation)
-  if count == 0 or not previous_question then return end
-  local current_index = state.elicitation.current_index or 0
-  state.elicitation.current_index = navigation.clamp(current_index + 1, count, delta) - 1
-  local question = current_question()
-  state.entry_list = question and model.entries(question, config.options.harness.question_choice_keys) or {}
-  select_answered_entry()
-  render_view()
-  restore_current_input_draft()
-end
-
-local function focus_options()
-  if not valid_window() then return end
-  if valid_input_window() then
-    state.input_draft = input_window.text(state.input_buf)
-    local question = current_question()
-    if question then state.input_draft_by_question[question.id] = state.input_draft end
-  end
-  vim.cmd("stopinsert")
-  vim.api.nvim_set_current_win(state.host.transcript_win)
-end
-
-local function focus_input()
-  if not valid_input_window() then return end
-  vim.cmd("stopinsert")
-  vim.api.nvim_set_current_win(state.input_win)
-end
-
-local function edit_input()
-  if not valid_input_window() then return end
-  vim.api.nvim_set_current_win(state.input_win)
-end
-
-local function commit_input()
-  local text = state.input_buf and input_window.text(state.input_buf) or ""
-  local entry = state.entry_list[state.input_entry or 0]
-  local question = current_question()
-  local host = state.host
-  if not (entry and question and host) then return end
-  if (state.input_kind == "other" or state.input_kind == "ask") and text == "" then
-    notifications.warn("Enter a value before submitting this Harness option.", "Harness")
-    return
-  end
-  vim.cmd("stopinsert")
-  if state.input_kind == "ask" then
-    local params = { question_id = question.id, text = text }
-    close(false)
-    host.ask(params)
-    return
-  end
-  local response = state.input_kind == "other"
-      and { kind = "other", text = text }
-      or { kind = "selected", option = entry.option, feedback = text ~= "" and text or nil }
-  host.answer({ question_id = question.id, response = response }, apply_elicitation)
-end
-
-local function install_input_keymaps()
-  if not state.input_buf then return end
-  for _, key in ipairs(keymaps.view_keys_for("plan_question", "submit_input")) do
-    vim.keymap.set({ "n", "i" }, key, commit_input, {
-      buffer = state.input_buf,
-      silent = true,
-      nowait = true,
-      desc = "Submit Harness question input",
-    })
-  end
-  for _, key in ipairs(keymaps.view_keys_for("plan_question", "focus_input")) do
-    vim.keymap.set("n", key, focus_options, {
-      buffer = state.input_buf,
-      silent = true,
-      nowait = true,
-      desc = "Return to Harness question options",
-    })
-  end
-end
-
-local function begin_input(entry_index, kind)
-  if not (state.buf and valid_window() and state.host) then return end
-  state.input_entry = entry_index
-  state.input_kind = kind
-  if not valid_input_window() then
-    local question = current_question()
-    local entry = state.entry_list[entry_index]
-    local answer = question and state.elicitation and model.answer_for(state.elicitation, question.id) or nil
-    state.input_draft = question and state.input_draft_by_question[question.id]
-      or (entry and model.input_text(entry, answer) or "")
-    state.input_buf, state.input_win = input_window.open(
-      state.host.transcript_win,
-      state.win,
-      input_title(),
-      state.input_draft
-    )
-    install_input_keymaps()
-  else
-    input_window.retarget(state.input_win, state.win, input_title())
-  end
-  edit_input()
-end
-
-local function select(with_feedback)
-  local entry = state.entry_list[state.selected_index]
-  local question = current_question()
-  local host = state.host
-  if not (entry and question and host) then return end
-  if valid_input_window() then
-    update_input_target()
-    edit_input()
-    return
-  end
-  if entry.kind == "ask" then
-    begin_input(state.selected_index, "ask")
-  elseif entry.kind == "other" then
-    begin_input(state.selected_index, "other")
-  elseif with_feedback then
-    begin_input(state.selected_index, "choice")
-  else
-    host.answer({
-      question_id = question.id,
-      response = { kind = "selected", option = entry.option, feedback = nil },
-    }, apply_elicitation)
-  end
-end
-
-confirm_answers = function()
-  if current_question() then return end
-  local host = state.host
-  if not host then return end
-  close(false)
-  host.continue()
-end
-
-revise_answers = function()
-  if current_question() or not state.elicitation then return end
-  state.elicitation.current_index = 0
-  local question = current_question()
-  if not question then return end
-  state.entry_list = model.entries(question, config.options.harness.question_choice_keys)
-  select_answered_entry()
-  render_view()
-end
-
----@param key string
----@return boolean
-local function run_review_action(key)
-  if current_question() then return false end
-  if vim.tbl_contains(keymaps.view_keys_for("plan_question", "confirm"), key) then
-    confirm_answers()
-    return true
-  end
-  if vim.tbl_contains(keymaps.view_keys_for("plan_question", "revise"), key) then
-    revise_answers()
-    return true
-  end
-  return false
-end
-
-local function install_keymaps()
-  local set = command_set.new()
-  command_set.register(set, "previous", function() move(-1) end)
-  command_set.register(set, "next", function() move(1) end)
-  command_set.register(set, "select", function() select(false) end)
-  command_set.register(set, "feedback", function() select(true) end)
-  command_set.register(set, "question_previous", function() move_question(-1) end)
-  command_set.register(set, "question_next", function() move_question(1) end)
-  command_set.register(set, "focus_input", focus_input)
-  command_set.register(set, "confirm", confirm_answers)
-  command_set.register(set, "revise", revise_answers)
-  command_set.register(set, "close", function() close(true) end)
-  local transcript_buf = vim.api.nvim_win_get_buf(state.host.transcript_win)
-  for _, command_id in ipairs(set.order) do
-    for _, key in ipairs(keymaps.view_keys_for("plan_question", command_id)) do preserve_modal_keymap(key) end
-  end
-  keymaps.setup_view_keymaps(transcript_buf, "plan_question", set)
-  for index, key in ipairs(config.options.harness.question_choice_keys) do
-    preserve_modal_keymap(key)
-    vim.keymap.set("n", key, function()
-      if run_review_action(key) then return end
-      if state.entry_list[index] and state.entry_list[index].kind ~= "ask" then
-        state.selected_index = index
-        render_view()
-        update_input_target()
+local function build_spec(elicitation, host)
+  local question = model.current_question(elicitation)
+  local pages = question and question_page_list(elicitation) or { review_page(elicitation) }
+  local initial_page = question and math.min((elicitation.current_index or 0) + 1, #pages) or 1
+  return {
+    owner = "plan_question",
+    host = {
+      window_list = host.window_list or { host.transcript_win },
+      control_win = host.control_win or host.transcript_win,
+    },
+    page_list = pages,
+    initial_page = initial_page,
+    on_confirm = function(result)
+      if result.page.id == "review" then
+        if result.option.value == "submit" then
+          picker.close(false)
+          host.continue()
+        else
+          active_elicitation.current_index = 0
+          picker.update(build_spec(active_elicitation, host))
+        end
+        return false
       end
-    end, {
-      buffer = transcript_buf,
-      silent = true,
-      nowait = true,
-      desc = "Select planning option " .. index,
-    })
-  end
-  preserve_modal_keymap("o")
-  vim.keymap.set("n", "o", function()
-    for index, entry in ipairs(state.entry_list) do
-      if entry.kind == "other" then
-        state.selected_index = index
-        render_view()
-        update_input_target()
-        return
+      local question_id = result.page.id
+      local entry_kind = result.option.entry_kind
+      if result.input_kind == "ask" then
+        picker.close(false)
+        host.ask({ question_id = question_id, text = result.text })
+        return false
       end
-    end
-  end, {
-    buffer = transcript_buf,
-    silent = true,
-    nowait = true,
-    desc = "Select Other planning option",
-  })
-  preserve_modal_keymap("a")
-  vim.keymap.set("n", "a", function()
-    if run_review_action("a") then return end
-    for index, entry in ipairs(state.entry_list) do
-      if entry.kind == "ask" then
-        state.selected_index = index
-        render_view()
-        update_input_target()
-        return
-      end
-    end
-  end, {
-    buffer = transcript_buf,
-    silent = true,
-    nowait = true,
-    desc = "Ask about this planning question",
-  })
+      local response = entry_kind == "other"
+          and { kind = "other", text = result.text }
+        or {
+          kind = "selected",
+          option = result.option.value,
+          feedback = result.text and result.text ~= "" and result.text or nil,
+        }
+      host.answer({ question_id = question_id, response = response }, function(next_elicitation)
+        if not next_elicitation then
+          picker.close(false)
+          return
+        end
+        active_elicitation = vim.deepcopy(next_elicitation)
+        picker.update(build_spec(active_elicitation, host))
+      end)
+      return false
+    end,
+    on_close = host.closed,
+  }
 end
 
 ---@param elicitation table
----@param host DiffReviewPlanQuestionHost
-function M.open(elicitation, host)
-  close(false)
-  state.elicitation = vim.deepcopy(elicitation)
-  state.host = host
-  state.input_draft_by_question = {}
-  local parent_width = vim.api.nvim_win_get_width(host.transcript_win)
-  local width = math.max(48, math.min(78, parent_width - 8))
-  local question = current_question()
-  state.entry_list = question and model.entries(question, config.options.harness.question_choice_keys) or {}
-  select_answered_entry()
-  local review_item_list = not question and model.review_item_list(state.elicitation) or nil
-  local initial_frame = render.build(question, state.entry_list, width, review_item_list)
-  local parent_height = vim.api.nvim_win_get_height(host.transcript_win)
-  local height = math.min(#initial_frame.lines, math.max(6, parent_height - 10))
-  state.buf, state.win = window.open(host.transcript_win, width, height, title())
-  render_view()
-  install_keymaps()
+---@param host table
+function PlanQuestion.open(elicitation, host)
+  active_elicitation = vim.deepcopy(elicitation)
+  active_host = host
+  picker.open(build_spec(active_elicitation, active_host))
 end
 
----@return boolean
-function M.is_open() return valid_window() == true end
+function PlanQuestion.is_open()
+  return picker.is_open("plan_question")
+end
 
----@return table?
-function M._state_for_test() return state end
+function PlanQuestion.close()
+  picker.close()
+end
 
-return M
+function PlanQuestion._state_for_test()
+  return picker._state_for_test()
+end
+
+return PlanQuestion

@@ -5,7 +5,7 @@ return {
     dependencies = { "folke/snacks.nvim" },
     cmd = {
       "GitStatus", "GitBranchDiff", "GitBranchDiffFile", "GitFileRevision", "GitDiffCompactPreview",
-      "Harness", "HarnessNew", "Interactions", "Sessions", "Permissions",
+      "Harness", "HarnessNew", "Interactions", "Permissions",
     },
     opts = {
       perf_logging = true,
@@ -30,9 +30,6 @@ return {
       vim.api.nvim_create_user_command("Interactions", function()
         diff_review.open_interactions()
       end, { desc = "Review and roll back Harness interactions" })
-      vim.api.nvim_create_user_command("Sessions", function()
-        diff_review.open_sessions()
-      end, { desc = "Browse Harness sessions" })
       vim.api.nvim_create_user_command("Permissions", function()
         require("diff_review.views.permissions").open()
       end, { desc = "Edit Harness permissions" })

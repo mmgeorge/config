@@ -49,9 +49,17 @@ local function commit(params, callback)
   callback(vim.deepcopy(elicitation))
 end
 
-vim.api.nvim_buf_set_name(0, "Harness")
+local transcript_win = vim.api.nvim_get_current_win()
+vim.bo.swapfile = false
+vim.api.nvim_buf_set_name(0, "HarnessPickerManual")
+vim.cmd("belowright 3split")
+local composer_win = vim.api.nvim_get_current_win()
+vim.bo.swapfile = false
+vim.api.nvim_buf_set_name(0, "HarnessInputPickerManual")
 require("diff_review.views.harness.plan_question").open(elicitation, {
-  transcript_win = vim.api.nvim_get_current_win(),
+  transcript_win = transcript_win,
+  window_list = { transcript_win, composer_win },
+  control_win = composer_win,
   answer = commit,
   skip = commit,
   ask = function(params) vim.notify("Ask: " .. params.text) end,

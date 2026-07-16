@@ -269,14 +269,18 @@ sections apply, dispatched through the **view-controller registry** (`shared/vie
 
 `views/picker/` owns every compact Harness decision surface. Pure state and layout modules own
 single or multiple selection, pages, responsive label/detail rows, and reserved input geometry.
-The renderer applies one frame with extmarks, while the window owner anchors a non-focusable float to the
+The renderer applies one frame with extmarks, while the window owner anchors a focusable float to the
 bottom of the union of the Harness transcript and composer windows.
 
-The control window retains modal navigation. An optional `DiffReviewPickerSearch` child owns fuzzy
-filtering, while `DiffReviewPickerInput` owns multiline feedback and returns to the control window
-through `go`. The picker captures the opening
-window and mode once, restores existing buffer-local mappings on close, and restores the original
-mode only after the complete picker lifecycle ends. Models, effort, fast mode, artifacts, agents,
+The picker buffer owns modal navigation and globally hides its focused cursor through Neovim's
+blend-100 TUI cursor contract. An optional `DiffReviewPickerSearch` child owns fuzzy filtering,
+while `DiffReviewPickerInput` owns multiline feedback and returns to the picker through `go`.
+`shared/input_gutter.lua` gives both picker input and HarnessInput the same two-cell window gutter
+without inserting prompt text into either buffer. The picker captures the opening window, mode,
+and cursor configuration once, then restores them after the complete lifecycle ends. An empty
+cursor configuration restores as an equivalent explicit all-mode block cursor because Neovim
+otherwise leaves the terminal in its last hidden TUI state. Models,
+effort, fast mode, artifacts, agents,
 approvals, lease conflicts, execution confirmations, and planning questions therefore share the
 same geometry and focus contract without duplicating popup mechanics.
 
@@ -1116,11 +1120,14 @@ row without submitting it. The compact footer exposes only question navigation a
 Enter records an ordinary choice or opens the
 attached editor for Other and Ask. Tab opens that same editor for optional choice feedback.
 Ctrl-s belongs only to the attached input window, where it records the selected answer plus text
-and advances to the next unanswered question. The input renders as an independent rounded child
-inside rows reserved by the parent picker and uses inline virtual text for left padding, so
-presentation spacing never enters the submitted value. Reserving those rows keeps the parent top
-edge stable while the input opens. Opening any picker or attached input forces Normal mode.
-`go` moves between existing panes without changing to Insert mode.
+and advances to the next unanswered question. The input renders as an independent borderless child
+inside rows reserved by the parent picker and uses the shared window-local prompt gutter, so buffer
+columns contain only submitted text. Reserving those rows keeps the parent top edge stable while
+the input opens. Opening the picker focuses its read-only navigation buffer with the cursor hidden.
+Opening an attached input restores the configured cursor and enters Insert mode. Tab returns to
+the cursorless picker without closing the child, so its text
+follows whichever option the user selects next. Tab or `go` can focus that existing child again,
+while Ctrl-c clears its draft, closes it, shrinks the picker, and restores option focus.
 
 After the final answer, the float becomes an explicit review page that lists every question,
 selected answer, and additional input in question order. `y` closes the elicitation and resumes

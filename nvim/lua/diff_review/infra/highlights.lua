@@ -80,7 +80,7 @@ function M.setup()
   vim.api.nvim_set_hl(0, "DiffReviewPickerText", { fg = header_fg })
   vim.api.nvim_set_hl(0, "DiffReviewPickerQuestion", { fg = palette.white })
   vim.api.nvim_set_hl(0, "DiffReviewPickerAnswer", { fg = palette.light_blue })
-  vim.api.nvim_set_hl(0, "DiffReviewHarnessHiddenCursor", {
+  vim.api.nvim_set_hl(0, "DiffReviewHiddenCursor", {
     fg = palette.black,
     bg = palette.black,
     blend = 100,

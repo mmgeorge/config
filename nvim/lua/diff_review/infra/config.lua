@@ -256,6 +256,7 @@ M.defaults = {
       page_next = "<Right>",
       focus_input = "go",
       submit_input = "<C-s>",
+      clear_input = "<C-c>",
       close = "q",
     },
     interactions = {
