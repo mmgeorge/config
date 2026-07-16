@@ -190,11 +190,11 @@ end
 
 local function enter_insert_mode(instance, target_win)
   vim.cmd("startinsert")
-  vim.schedule(function()
+  vim.defer_fn(function()
     if active == instance and valid_window(target_win) and vim.api.nvim_get_current_win() == target_win then
       vim.cmd("startinsert")
     end
-  end)
+  end, 10)
 end
 
 local function focus_input(instance, enter_insert)
@@ -479,6 +479,9 @@ end
 ---@param spec table
 function Picker.update(spec)
   if not active then return end
+  local previous_page = picker_state.page(active.state, active.spec)
+  local previous_option = picker_state.selected_option(active.state, active.spec)
+  local previous_option_id = previous_option and tostring(previous_option.id or previous_option.value or "") or nil
   close_input(active)
   clear_modal_keymaps(active)
   local previous_state = active.state
@@ -488,6 +491,17 @@ function Picker.update(spec)
   next_state.selected_set_by_page = previous_state.selected_set_by_page
   for page_id, draft in pairs(previous_state.draft_by_page) do next_state.draft_by_page[page_id] = draft end
   for page_id, query in pairs(previous_state.query_by_page) do next_state.query_by_page[page_id] = query end
+  if previous_option_id and previous_page then
+    local next_page = picker_state.page(next_state, spec)
+    if next_page.id == previous_page.id then
+      for option_index, option in ipairs(next_page.option_list) do
+        if tostring(option.id or option.value or "") == previous_option_id then
+          next_state.selected_index_by_page[next_page.id] = option_index
+          break
+        end
+      end
+    end
+  end
   active.state = next_state
   active.notified_identity = nil
   render_view(active)

@@ -21,8 +21,9 @@ For the surrounding subsystem patterns see trouble-and-snacks.md (Trouble source
 | Cursor jumps back a moment after an action | #11 |
 | Rapid `S S` flickers through an intermediate state | #12 |
 | `dtable::stdio_init: couldn't make stderr distinct...` on Windows | #13 |
+| Cursor stays hidden after a modal, or remains visible inside it | #14 |
 
-## The 13 bugs
+## The 14 bugs
 
 ### 1. Shared Table References
 
@@ -275,3 +276,31 @@ vim.system(command, {
 Preserve combined `stdout` and `stderr` in wrapper `output` fields so
 notifications keep the actionable error text. Add or update a regression test
 that checks startup commands request `stdout == true` and `stderr == true`.
+
+### 14. A Focused Modal Leaks Or Fails To Hide The Terminal Cursor
+
+**Bug**: A navigation-only modal either shows a block cursor that should remain
+invisible, or closing the modal leaves the cursor hidden in the editor.
+
+**Cause**: Neovim's `Cursor` highlight controls the cell styling but does not
+reliably hide the terminal's focused cursor. `guicursor` drives terminal cursor
+shape and visibility globally. Setting it to a hidden blend group works while
+the modal owns focus, but restoring an empty option can leave the terminal in
+that last explicit hidden state because no visible cursor transition gets sent.
+
+**Fix**: Treat cursor visibility as a paired modal lifecycle. Capture the global
+configuration before opening, set an explicit hidden cursor while the modal
+owns focus, and restore an explicit visible fallback when the captured value
+was empty. Restore before focusing any editable child and on every close path.
+
+```lua
+local function set_modal_cursor_hidden(modal, hidden)
+  local visible = modal.guicursor ~= "" and modal.guicursor or "a:block-Cursor"
+  vim.o.guicursor = hidden and "n:block-ModalHiddenCursor" or visible
+end
+```
+
+Keep the window-local `Cursor:ModalHiddenCursor` mapping as presentation state,
+but do not rely on it as the terminal visibility mechanism. Verify the complete
+sequence in a fresh PTY: cursor visible in the editor, hidden while modal focus
+owns the terminal cell, then visible again after close and inside editable input.

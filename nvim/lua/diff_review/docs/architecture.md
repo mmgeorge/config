@@ -279,7 +279,11 @@ while `DiffReviewPickerInput` owns multiline feedback and returns to the picker 
 without inserting prompt text into either buffer. The picker captures the opening window, mode,
 and cursor configuration once, then restores them after the complete lifecycle ends. An empty
 cursor configuration restores as an equivalent explicit all-mode block cursor because Neovim
-otherwise leaves the terminal in its last hidden TUI state. Models,
+otherwise leaves the terminal in its last hidden TUI state. This global transition is intentional:
+mapping only the picker window's `Cursor` highlight does not hide the focused terminal cursor.
+Do not replace the paired `guicursor` transition with window-local highlighting, and do not restore
+an empty cursor option directly after hiding it. Either change leaves cursor visibility stuck in the
+terminal's previous state. Models,
 effort, fast mode, artifacts, agents,
 approvals, lease conflicts, execution confirmations, and planning questions therefore share the
 same geometry and focus contract without duplicating popup mechanics.
@@ -1239,11 +1243,18 @@ after binding, so later wait events cannot reparent a child or create a cycle. T
 also waits for the original parent thread and turn to complete. A child `turn/completed` closes only
 the child timeline and never terminates the parent request.
 
-`/agent` opens the shared bottom picker with Main, Active, Done, and Available sections. Choosing
-an available definition transforms the same picker into an attached multiline task input without
-resizing the Harness split. Choosing an existing run switches timelines and restores the window
-that opened the picker.
-`/agent <definition> <task>` asks the parent Codex thread to spawn the selected definition because
+`/agent` owns timeline navigation only. Its shared bottom picker presents Main, Running, and Done
+sections, derives each child's elapsed time and tool/failure totals from the same summary component
+as the parent timeline, and refreshes that presentation while it remains open. `/agent main` always
+returns to the parent conversation. Zero-based numeric selectors and alphabetic aliases select only
+running children in label order, so `/agent a` and `/agent 0` target the same first running child
+without letting completed history shift those positions. Choosing any picker row switches timelines
+and restores the window that opened the picker.
+
+`/spawn` owns child creation. The no-argument form opens the shared bottom picker with a focused
+fuzzy-search input over provider definitions. Choosing a definition transforms the same picker into
+an attached multiline task input without resizing the Harness split. `/spawn <definition> <task>`
+asks the parent Codex thread to spawn the selected definition because
 app-server exposes child lifecycle events but no direct client spawn RPC. The parent instruction
 requests exactly one spawn with the selected definition and rejects default intermediary agents.
 The Codex launch strategy translates Harness definition names into native identifier form, such as

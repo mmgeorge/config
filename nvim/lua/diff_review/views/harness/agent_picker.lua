@@ -1,105 +1,131 @@
 local AgentPicker = {}
 
+local agent_catalog = require("diff_review.views.harness.agent_catalog")
+local agent_summary = require("diff_review.render.harness.agent_summary")
 local config = require("diff_review.infra.config")
 local picker = require("diff_review.views.picker")
 
-local function entry_list(agent, selected_run_id)
+local active = nil
+
+---@param instance table
+local function stop_timer(instance)
+  if not instance.timer then return end
+  instance.timer:stop()
+  instance.timer:close()
+  instance.timer = nil
+end
+
+---@param state table
+---@param selected_run_id string?
+---@return table[]
+---@return integer
+local function option_list(state, selected_run_id)
   local result = {
-    { value = { kind = "main" }, label = "Main", detail = "Parent conversation" },
+    { id = "main", value = { kind = "main" }, label = "Main", detail = "Parent conversation" },
   }
-  for _, run in ipairs(agent.run or {}) do
-    if run.status == "starting" or run.status == "running" or run.status == "waiting" then
+  local now_ms = os.time() * 1000
+  for _, group in ipairs({
+    { title = "Running", run_list = agent_catalog.run_list(state.agent, true) },
+    { title = "Done", run_list = agent_catalog.run_list(state.agent, false) },
+  }) do
+    for _, run in ipairs(group.run_list) do
       result[#result + 1] = {
+        id = "run:" .. run.id,
         value = { kind = "run", run = run },
-        label = run.nickname or run.definition,
-        detail = run.status,
-        section = "Active",
+        label = agent_summary.label(run),
+        detail = agent_summary.status_detail(
+          run,
+          agent_catalog.interaction_list(state.agent, state.agent_live, run.id),
+          now_ms
+        ),
+        section = group.title,
       }
     end
-  end
-  for _, run in ipairs(agent.run or {}) do
-    if run.status ~= "starting" and run.status ~= "running" and run.status ~= "waiting" then
-      result[#result + 1] = {
-        value = { kind = "run", run = run },
-        label = run.nickname or run.definition,
-        detail = run.status,
-        section = "Done",
-      }
-    end
-  end
-  for _, definition in ipairs(agent.definition or {}) do
-    result[#result + 1] = {
-      value = { kind = "definition", definition = definition },
-      label = definition.name,
-      detail = definition.description,
-      section = "Available",
-    }
   end
   local initial = 1
   for index, entry in ipairs(result) do
     if entry.value.run and entry.value.run.id == selected_run_id then initial = index end
-    entry.key = config.options.picker.choice_keys[index]
+    entry.key = config.options.picker.session_keys[index]
   end
   return result, initial
 end
 
----@param options table
-function AgentPicker.open(options)
-  local entries, initial = entry_list(options.agent or {}, options.selected_run_id)
-  local host = options.host
-  local function open_launcher()
-    picker.open({
-      owner = "agent",
-      host = host,
-      page_list = {
-        {
-          id = "agents",
-          title = "Harness timelines",
-          subtitle = "Select a timeline or start another agent.",
-          option_list = entries,
-          selected_index = initial,
-          footer = "↑↓ select  Enter confirm  q close",
-        },
+---@param instance table
+---@return table
+local function build_spec(instance)
+  local state = instance.state_provider()
+  local entries, initial = option_list(state, state.selected_agent_run_id)
+  return {
+    owner = "agent",
+    host = instance.host,
+    page_list = {
+      {
+        id = "agents",
+        title = "Harness timelines",
+        subtitle = "Switch between the parent conversation and existing child-agent timelines.",
+        option_list = entries,
+        selected_index = initial,
+        footer = "↑↓ select  Enter switch  q close",
       },
-      on_confirm = function(result)
-        local item = result.option.value
-        if item.kind == "definition" then
-          local definition = item.definition
-          picker.update({
-            owner = "agent",
-            host = host,
-            initial_input_kind = "other",
-            page_list = {
-              {
-                id = "agent-task-" .. definition.name,
-                title = "Task for " .. definition.name,
-                subtitle = definition.description,
-                allow_input = true,
-                input_height = 5,
-                option_list = {
-                  {
-                    label = "Agent task",
-                    detail = "Describe the bounded work for this child agent.",
-                    value = definition.name,
-                    input_kind = "other",
-                  },
-                },
-                footer = "C-s spawn  go options  q close",
-              },
-            },
-            on_confirm = function(task_result)
-              options.on_spawn(definition.name, task_result.text)
-            end,
-            on_close = options.on_close,
-          })
-          return false
-        end
-        options.on_select(item.run and item.run.id or nil)
-      end,
-      on_close = options.on_close,
-    })
+    },
+    on_confirm = function(result)
+      stop_timer(instance)
+      if active == instance then active = nil end
+      local item = result.option.value
+      instance.on_select(item.run and item.run.id or nil)
+    end,
+    on_close = function()
+      stop_timer(instance)
+      if active == instance then active = nil end
+      if instance.on_close then instance.on_close() end
+    end,
+  }
+end
+
+---@param instance table
+local function refresh(instance)
+  if active ~= instance or not picker.is_open("agent") then return end
+  picker.update(build_spec(instance))
+end
+
+---@class DiffReviewAgentPickerOptions
+---@field host table
+---@field state_provider fun(): table
+---@field on_select fun(run_id: string?)
+---@field on_close? fun()
+
+---@param options DiffReviewAgentPickerOptions
+function AgentPicker.open(options)
+  if active then
+    stop_timer(active)
+    active = nil
   end
-  open_launcher()
+  local instance = {
+    host = options.host,
+    state_provider = options.state_provider,
+    on_select = options.on_select,
+    on_close = options.on_close,
+    timer = vim.uv.new_timer(),
+  }
+  active = instance
+  picker.open(build_spec(instance))
+  instance.timer:start(1000, 1000, function()
+    vim.schedule(function() refresh(instance) end)
+  end)
+end
+
+function AgentPicker.refresh()
+  if active then refresh(active) end
+end
+
+function AgentPicker.close()
+  if active then stop_timer(active) end
+  active = nil
+  if picker.is_open("agent") then picker.close(true) end
+end
+
+function AgentPicker._state_for_test()
+  return active
 end
 
 return AgentPicker

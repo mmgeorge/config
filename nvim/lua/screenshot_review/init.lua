@@ -213,7 +213,7 @@ function M.open_review_url(context)
     return
   end
 
-  vim.system({ "open", url }, { text = true }, function(result)
+  vim.system({ "open", url }, { text = true, stdout = true, stderr = true }, function(result)
     if result.code ~= 0 then
       vim.schedule(function()
         M.notify_error("Failed to open screenshot review page: " .. tostring(result.stderr or ""))

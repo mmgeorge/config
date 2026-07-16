@@ -380,6 +380,7 @@ local function synchronize_state(callback)
     end
     local state = harness_state()
     snapshot.apply(state, result)
+    require("diff_review.views.harness.agent_picker").refresh()
     if result.active_wait then
       interaction_state.apply_wait(state, {
         interaction_id = result.active_wait.interaction_id,
@@ -420,11 +421,13 @@ local function on_event(event, payload)
     elseif payload.kind == "agent_updated" then
       state.agent = vim.deepcopy(payload.data or payload)
       discard_terminal_agent_live_state(state)
+      require("diff_review.views.harness.agent_picker").refresh()
       schedule_render()
     elseif payload.kind == "agent_timeline_updated" then
       local update = payload.data or payload
       state.agent_live = state.agent_live or {}
       state.agent_live[update.run_id] = update
+      require("diff_review.views.harness.agent_picker").refresh()
       schedule_render()
     elseif payload.kind == "context_usage" then
       if state.session then state.session.context_usage = payload.data or payload end
@@ -516,6 +519,7 @@ local function on_event(event, payload)
     synchronize_state()
   elseif event == "agent_updated" then
     state.agent = vim.deepcopy(payload)
+    require("diff_review.views.harness.agent_picker").refresh()
     schedule_render()
   elseif event == "interaction_complete" or event == "interaction_updated" then
     interaction_state.complete_interaction(state, payload.interaction or payload)
@@ -833,32 +837,69 @@ function M.open_artifact_picker()
   end)
 end
 
----Open the provider-backed child-agent selector and switch the composer target.
-function M.open_agent_picker()
+---Switch the transcript and composer target to one child-agent timeline or Main.
+---@param selector string
+function M.select_agent(selector)
+  local state = harness_state()
+  if selector:lower() == "main" then
+    state.selected_agent_run_id = nil
+  else
+    local run, resolve_error = require("diff_review.views.harness.agent_catalog").resolve(state.agent, selector)
+    if not run then
+      notifications.warn(resolve_error or ("No child agent matches " .. selector), "Harness agent")
+      return
+    end
+    state.selected_agent_run_id = run.id
+  end
+  state.activity_expanded = {}
+  M.render(true)
+end
+
+---Request one provider-backed child agent with an explicit definition and task.
+---@param definition string
+---@param task string
+function M.spawn_agent(definition, task)
   local state = harness_state()
   if not (state.capability.agent and state.capability.agent.catalog) then
-    notifications.warn("The current backend does not expose child agents", "Harness")
+    notifications.warn("The current backend does not expose spawnable child agents", "Harness agent")
     return
   end
+  set_busy(true)
+  client.request("agent.start", { definition = definition, task = task }, function(_, request_error)
+    set_busy(false)
+    if request_error then notifications.error(request_error, "Harness agent") end
+    synchronize_state()
+    vim.schedule(M.drain)
+  end)
+end
+
+---Open the provider-backed child-agent timeline selector.
+function M.open_agent_picker()
+  local state = harness_state()
   require("diff_review.views.harness.agent_picker").open({
     host = picker_host(state),
-    agent = state.agent or {},
-    selected_run_id = state.selected_agent_run_id,
+    state_provider = harness_state,
     on_select = function(run_id)
-      state.selected_agent_run_id = run_id
-      state.activity_expanded = {}
-      M.render(true)
-    end,
-    on_spawn = function(definition, task)
-      set_busy(true)
-      client.request("agent.start", { definition = definition, task = task }, function(_, request_error)
-        set_busy(false)
-        if request_error then notifications.error(request_error, "Harness agent") end
-        synchronize_state()
-        vim.schedule(M.drain)
-      end)
+      M.select_agent(run_id and run_id or "main")
     end,
   })
+end
+
+---Open the searchable agent-definition selector and attached task editor.
+---@param definition_name? string
+function M.open_spawn_picker(definition_name)
+  local state = harness_state()
+  if not (state.capability.agent and state.capability.agent.catalog) then
+    notifications.warn("The current backend does not expose spawnable child agents", "Harness agent")
+    return
+  end
+  local opened = require("diff_review.views.harness.spawn_picker").open({
+    host = picker_host(state),
+    definition_list = (state.agent and state.agent.definition) or {},
+    definition_name = definition_name,
+    on_spawn = M.spawn_agent,
+  })
+  if not opened then notifications.warn("Unknown agent definition: " .. definition_name, "Harness agent") end
 end
 
 function M.open_session_picker()
@@ -901,25 +942,40 @@ function M.submit()
     M.open_agent_picker()
     return
   end
+  if text == "/spawn" then
+    set_composer_text(state.composer_buf, "")
+    M.open_spawn_picker()
+    return
+  end
   if text == "/sessions" then
     set_composer_text(state.composer_buf, "")
     M.open_session_picker()
     return
   end
-  local agent_definition, agent_task = text:match("^/agent%s+(%S+)%s+(.+)$")
-  if agent_definition and agent_task then
+  local agent_selector = text:match("^/agent%s+(%S+)%s*$")
+  if agent_selector then
     set_composer_text(state.composer_buf, "")
-    set_busy(true)
-    client.request("agent.start", { definition = agent_definition, task = agent_task }, function(_, request_error)
-      set_busy(false)
-      if request_error then notifications.error(request_error, "Harness agent") end
-      synchronize_state()
-      vim.schedule(M.drain)
-    end)
+    M.select_agent(agent_selector)
     return
   elseif text:match("^/agent%s+") then
     set_composer_text(state.composer_buf, "")
-    notifications.warn("Use /agent <definition> <task>", "Harness")
+    notifications.warn("Use /agent main, /agent <running alias>, or /agent", "Harness")
+    return
+  end
+  local spawn_definition, spawn_task = text:match("^/spawn%s+(%S+)%s+(.+)$")
+  if spawn_definition and spawn_task then
+    set_composer_text(state.composer_buf, "")
+    M.spawn_agent(spawn_definition, spawn_task)
+    return
+  end
+  local spawn_definition_only = text:match("^/spawn%s+(%S+)%s*$")
+  if spawn_definition_only then
+    set_composer_text(state.composer_buf, "")
+    M.open_spawn_picker(spawn_definition_only)
+    return
+  elseif text:match("^/spawn%s+") then
+    set_composer_text(state.composer_buf, "")
+    notifications.warn("Use /spawn <definition> <task>", "Harness")
     return
   end
   if text == "/compact" then

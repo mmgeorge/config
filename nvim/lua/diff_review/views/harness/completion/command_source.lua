@@ -1,9 +1,12 @@
 ---@module 'blink.cmp'
 local CommandSource = {}
+local agent_catalog = require("diff_review.views.harness.agent_catalog")
+local agent_summary = require("diff_review.render.harness.agent_summary")
 local session = require("diff_review.session")
 
 local command_list = {
-  { label = "/agent", detail = "Select or spawn a child agent", capability = "agent" },
+  { label = "/agent", detail = "Switch between Main and child-agent timelines", capability = "agent_observe" },
+  { label = "/spawn", detail = "Spawn a child agent", capability = "agent_catalog" },
   { label = "/plan", detail = "Create a reviewed plan" },
   { label = "/plan cancel", detail = "Cancel the active plan" },
   { label = "/sessions", detail = "Search, preview, resume, or delete a Harness session" },
@@ -47,7 +50,7 @@ function CommandSource:get_completions(_, callback)
   local prefix = line:sub(1, cursor_column)
   local command_start = prefix:find("/")
   local items = {}
-  local definition_start = prefix:match("^%s*/agent%s+()([^%s]*)$")
+  local definition_start = prefix:match("^%s*/spawn%s+()([^%s]*)$")
   if definition_start then
     local capability = session.harness.capability or {}
     if capability.agent and capability.agent.catalog then
@@ -70,6 +73,38 @@ function CommandSource:get_completions(_, callback)
     callback({ items = items, is_incomplete_backward = false, is_incomplete_forward = false })
     return
   end
+  if prefix:match("^%s*/spawn%s+") then
+    callback({ items = items, is_incomplete_backward = false, is_incomplete_forward = false })
+    return
+  end
+  local selector_start = prefix:match("^%s*/agent%s+()([^%s]*)$")
+  if selector_start then
+    local selector_list = { { selector = "main", detail = "Parent conversation" } }
+    for index, run in ipairs(agent_catalog.run_list(session.harness.agent, true)) do
+      if index > 26 then break end
+      selector_list[#selector_list + 1] = {
+        selector = string.char(string.byte("a") + index - 1),
+        detail = agent_summary.label(run) .. " · running child " .. index,
+      }
+    end
+    for _, selector in ipairs(selector_list) do
+      items[#items + 1] = {
+        label = selector.selector,
+        filterText = selector.selector,
+        detail = selector.detail,
+        kind = vim.lsp.protocol.CompletionItemKind.Value,
+        textEdit = {
+          newText = selector.selector,
+          range = {
+            start = { line = row, character = selector_start - 1 },
+            ["end"] = { line = row, character = cursor_column },
+          },
+        },
+      }
+    end
+    callback({ items = items, is_incomplete_backward = false, is_incomplete_forward = false })
+    return
+  end
   if prefix:match("^%s*/agent%s+") then
     callback({ items = items, is_incomplete_backward = false, is_incomplete_forward = false })
     return
@@ -77,8 +112,18 @@ function CommandSource:get_completions(_, callback)
   if command_start then
     for _, command in ipairs(command_list) do
       local capability = session.harness.capability or {}
-      if command.capability == "agent" and not (capability.agent and capability.agent.catalog) then goto continue end
-      if command.capability and command.capability ~= "agent" and capability[command.capability] ~= true then
+      if command.capability == "agent_observe"
+        and not (capability.agent and capability.agent.observe)
+        and #(((session.harness.agent or {}).run) or {}) == 0
+      then
+        goto continue
+      end
+      if command.capability == "agent_catalog" and not (capability.agent and capability.agent.catalog) then
+        goto continue
+      end
+      if command.capability and command.capability ~= "agent_observe" and command.capability ~= "agent_catalog"
+        and capability[command.capability] ~= true
+      then
         goto continue
       end
       items[#items + 1] = {

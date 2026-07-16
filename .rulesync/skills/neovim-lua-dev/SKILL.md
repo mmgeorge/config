@@ -78,6 +78,12 @@ decomposition to become clean. The references are how to skip that pain.
   become visible. → **`references/rendering-and-highlights.md`**.
 - **Window options belong to windows:** `vim.wo[win]`, not `vim.wo[0]` — the "current
   window" inside an autocmd is often not the one you mean.
+- **Focused TUI cursor hiding needs an explicit lifecycle.** A window-local
+  `Cursor:Hidden` highlight does not reliably hide the terminal cursor in the focused
+  window. Capture `vim.o.guicursor`, set an explicit hidden cursor while the modal owns
+  focus, then restore an explicit visible fallback when the captured value was empty.
+  Never leave the global option hidden after closing or entering an input child.
+  → **`references/common-bugs.md`**.
 - **`nvim_win_set_buf` fires no `BufRead`/`FileType` autocmds** (LSP/gitsigns won't
   attach); use `vim.cmd.edit` when you need plugins to attach.
 - **Tie per-display setup to the buffer, not one code path** — a buffer is re-entered
@@ -117,7 +123,7 @@ Read the file that matches the work **before** you start it:
 | **`references/rendering-and-highlights.md`** | Render large diffs/lists, add per-row highlights or virtual text, use a decoration provider, or implement folding / lazy syntax in a buffer that can reach tens of thousands of lines. |
 | **`references/async-and-git.md`** | Shell out to `git`/`gh`, parse a diff, stage/unstage hunks, run `git commit` from inside nvim, or do Tree-sitter work in a render/keymap/autocmd path. |
 | **`references/trouble-and-snacks.md`** | Build a Trouble.nvim v3 custom source or use the Snacks.nvim diff renderer. |
-| **`references/common-bugs.md`** | Scan the moment a symptom matches — preview won't edit, folds re-collapse on stage, cursor jumps back after an action, a buffer half-renders after a window switch, a Windows stdio error on status open. |
+| **`references/common-bugs.md`** | Scan the moment a symptom matches — preview won't edit, folds re-collapse on stage, cursor jumps back after an action, a modal cursor remains hidden or visible, a buffer half-renders after a window switch, or Windows reports a stdio error. |
 | **`references/live-nvim-rpc.md`** | Inspect or verify against the **running** editor over the `$NVIM` socket (buffers, windows, options, LSP, diagnostics; "did my change take?"). |
 
 Also reach for the **`terminal-tui-debugging`** skill when the rendered terminal grid

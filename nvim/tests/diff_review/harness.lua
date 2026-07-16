@@ -1494,10 +1494,14 @@ local ok, failure = pcall(function()
   command_source:get_completions({}, function(result) command_completion = result end)
   assert_true(not vim.iter(command_completion.items):any(function(item) return item.label == "/agent" end),
     "slash completion should hide child agents for ACP-compatible backends")
-  session.harness.capability.agent = { catalog = true }
+  assert_true(not vim.iter(command_completion.items):any(function(item) return item.label == "/spawn" end),
+    "slash completion should hide child-agent spawning for ACP-compatible backends")
+  session.harness.capability.agent = { catalog = true, observe = true }
   command_source:get_completions({}, function(result) command_completion = result end)
   assert_true(vim.iter(command_completion.items):any(function(item) return item.label == "/agent" end),
-    "slash completion should expose child agents for native Codex sessions")
+    "slash completion should expose child timelines for native Codex sessions")
+  assert_true(vim.iter(command_completion.items):any(function(item) return item.label == "/spawn" end),
+    "slash completion should expose child-agent spawning for native Codex sessions")
   session.harness.agent = {
     definition = {
       { name = "explorer", description = "Read-oriented repository explorer" },
@@ -1506,21 +1510,65 @@ local ok, failure = pcall(function()
     run = {},
     turn = {},
   }
-  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/agent exp " })
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/spawn exp " })
   vim.api.nvim_win_set_cursor(session.harness.composer_win, { 1, 10 })
   command_source:get_completions({}, function(result) command_completion = result end)
-  assert_equals(#command_completion.items, 2, "/agent should complete definitions from the broker catalog")
-  assert_equals(command_completion.items[1].label, "explorer", "agent completion should preserve catalog order")
+  assert_equals(#command_completion.items, 2, "/spawn should complete definitions from the broker catalog")
+  assert_equals(command_completion.items[1].label, "explorer", "spawn completion should preserve catalog order")
   assert_equals(command_completion.items[1].textEdit.newText, "explorer",
-    "agent completion should insert only the selected definition")
+    "spawn completion should insert only the selected definition")
   assert_equals(command_completion.items[1].textEdit.range.start.character, 7,
-    "agent completion should replace only the partial definition token")
+    "spawn completion should replace only the partial definition token")
   assert_equals(command_completion.items[1].textEdit.range["end"].character, 10,
-    "agent completion should stop at the current cursor")
-  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/agent explorer inspect Bevy" })
+    "spawn completion should stop at the current cursor")
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/spawn explorer inspect Bevy" })
   vim.api.nvim_win_set_cursor(session.harness.composer_win, { 1, 28 })
   command_source:get_completions({}, function(result) command_completion = result end)
-  assert_equals(#command_completion.items, 0, "agent completion should stop after the definition argument")
+  assert_equals(#command_completion.items, 0, "spawn completion should stop after the definition argument")
+
+  session.harness.agent.run = {
+    { id = "run-zeta", definition = "zeta", status = "running", created_at_ms = 2, updated_at_ms = 2 },
+    { id = "run-done", definition = "ended", status = "completed", created_at_ms = 1, updated_at_ms = 2 },
+    { id = "run-alpha", definition = "alpha", status = "waiting", created_at_ms = 1, updated_at_ms = 2 },
+  }
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/agent x" })
+  vim.api.nvim_win_set_cursor(session.harness.composer_win, { 1, 8 })
+  command_source:get_completions({}, function(result) command_completion = result end)
+  assert_equals(command_completion.items[1].label, "main", "/agent completion should lead with Main")
+  assert_equals(command_completion.items[2].label, "a", "/agent completion should expose the first running alias")
+  assert_equals(command_completion.items[3].label, "b", "/agent completion should expose the second running alias")
+  assert_equals(#command_completion.items, 3, "/agent completion should exclude ended children from aliases")
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/agent" })
+  controller.submit()
+  assert_true(require("diff_review.views.picker").is_open("agent"),
+    "/agent without arguments should open the timeline picker")
+  require("diff_review.views.picker").close(true)
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/spawn" })
+  controller.submit()
+  local spawn_picker_state = require("diff_review.views.picker")._state_for_test()
+  assert_true(require("diff_review.views.picker").is_open("spawn") and spawn_picker_state.search_win ~= nil,
+    "/spawn without arguments should open the searchable definition picker")
+  require("diff_review.views.picker").close(true)
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/agent a" })
+  controller.submit()
+  assert_equals(session.harness.selected_agent_run_id, "run-alpha",
+    "/agent a should select the first alphabetic running child")
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/agent 1" })
+  controller.submit()
+  assert_equals(session.harness.selected_agent_run_id, "run-zeta",
+    "/agent 1 should share the second running-child alias")
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/agent main" })
+  controller.submit()
+  assert_equals(session.harness.selected_agent_run_id, nil, "/agent main should always restore the parent timeline")
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/spawn explorer inspect Bevy" })
+  controller.submit()
+  assert_true(vim.wait(1000, function()
+    return request_by_method["agent.start"] ~= nil and not session.harness.busy
+  end, 10), "/spawn should route the definition and task through agent.start")
+  assert_equals(request_by_method["agent.start"].params.definition, "explorer",
+    "/spawn should preserve the selected definition")
+  assert_equals(request_by_method["agent.start"].params.task, "inspect Bevy",
+    "/spawn should preserve the child task")
 
   session.harness.capability.native_compact = false
   command_source:get_completions({}, function(result) command_completion = result end)
