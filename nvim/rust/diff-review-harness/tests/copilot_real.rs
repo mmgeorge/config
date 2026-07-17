@@ -1,0 +1,112 @@
+use diff_review_harness::backend::BackendLaunch;
+use diff_review_harness::broker::{HarnessBroker, InitializeRequest};
+use diff_review_harness::protocol::BrokerRequest;
+use serde_json::{Value, json};
+use std::process::Command;
+use std::time::Duration;
+
+#[tokio::test]
+#[ignore = "requires an authenticated Copilot CLI and performs a real model turn"]
+async fn streams_one_native_copilot_sdk_turn_through_the_broker() {
+    let temporary = tempfile::tempdir().unwrap();
+    let workspace = temporary.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let status = Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(&workspace)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    std::fs::write(workspace.join("README.md"), "# Copilot fixture\n").unwrap();
+
+    let mut broker = HarnessBroker::initialize(InitializeRequest {
+        data_root: temporary.path().join("data").to_string_lossy().into_owned(),
+        permission_file: None,
+        workspace: workspace.to_string_lossy().into_owned(),
+        client_id: "real-copilot-test".into(),
+        backend: BackendLaunch {
+            kind: "copilot".into(),
+            command: Vec::new(),
+        },
+        model: "default".into(),
+        effort: "low".into(),
+        session_id: None,
+        goal_max_turns: 20,
+        lease_conflict_action: None,
+    })
+    .unwrap();
+
+    let model_response = broker
+        .dispatch(BrokerRequest {
+            id: 1,
+            method: "backend.models".into(),
+            params: Value::Null,
+        })
+        .await;
+    assert!(model_response.response.error.is_none());
+    let model_list = model_response
+        .response
+        .result
+        .as_ref()
+        .and_then(Value::as_array)
+        .expect("Copilot model catalog");
+    let selected_model = model_list
+        .iter()
+        .find(|model| {
+            model.get("id").and_then(Value::as_str).is_some_and(|id| {
+                let normalized = id.to_ascii_lowercase();
+                id != "auto"
+                    && (normalized.contains("mini")
+                        || normalized.contains("haiku")
+                        || normalized.contains("flash"))
+            })
+        })
+        .or_else(|| {
+            model_list.iter().find(|model| {
+                model.get("id").and_then(Value::as_str) != Some("auto")
+                    && model
+                        .get("effort")
+                        .and_then(Value::as_array)
+                        .is_some_and(|effort_list| effort_list.iter().any(|effort| effort == "low"))
+            })
+        })
+        .or_else(|| {
+            model_list
+                .iter()
+                .find(|model| model.get("id").and_then(Value::as_str) != Some("auto"))
+        })
+        .and_then(|model| model.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or("default")
+        .to_owned();
+    let configured = broker
+        .dispatch(BrokerRequest {
+            id: 2,
+            method: "session.configure".into(),
+            params: json!({ "model": selected_model, "effort": "low" }),
+        })
+        .await;
+    assert!(configured.response.error.is_none());
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(120),
+        broker.dispatch(BrokerRequest {
+            id: 3,
+            method: "prompt.submit".into(),
+            params: json!({
+                "text": "Reply with exactly COPILOT_OK. Do not call tools."
+            }),
+        }),
+    )
+    .await
+    .expect("real Copilot SDK turn timeout");
+    assert!(
+        response.response.error.is_none(),
+        "{:?}",
+        response.response.error
+    );
+    let snapshot = broker.snapshot().unwrap();
+    assert_eq!(snapshot.session.provider_label, "Copilot CLI");
+    let persisted = serde_json::to_string(&snapshot.interaction).unwrap();
+    assert!(persisted.contains("COPILOT_OK"), "{persisted}");
+}
