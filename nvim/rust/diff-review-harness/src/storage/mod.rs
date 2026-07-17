@@ -12,7 +12,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const SESSION_FORMAT_VERSION: u32 = 4;
+const SESSION_FORMAT_VERSION: u32 = 5;
 
 /// Stores one session with the exact durable format that produced it.
 #[derive(Deserialize, Serialize)]
@@ -681,10 +681,10 @@ mod test {
             id: id.into(),
             name: id.into(),
             workspace: workspace.into(),
-            backend: "acp".into(),
+            backend: "copilot".into(),
             backend_session_id: None,
             model: "default".into(),
-            provider_label: "ACP agent".into(),
+            provider_label: "Copilot CLI".into(),
             resolved_model: None,
             effort: "medium".into(),
             fast_mode: false,

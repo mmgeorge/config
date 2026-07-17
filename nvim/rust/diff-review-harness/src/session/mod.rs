@@ -43,7 +43,7 @@ impl ContextUsage {
         Self::with_baseline(used, size, Self::CODEX_BASELINE_TOKENS)
     }
 
-    pub fn acp(used: u64, size: u64) -> Option<Self> {
+    pub fn reported(used: u64, size: u64) -> Option<Self> {
         Self::with_baseline(used, size, 0)
     }
 
@@ -171,8 +171,8 @@ mod context_usage_test {
     }
 
     #[test]
-    fn preserves_acp_context_as_reported_by_the_agent() {
-        let usage = ContextUsage::acp(156_000, 200_000).expect("valid ACP usage");
+    fn preserves_provider_context_as_reported_by_the_backend() {
+        let usage = ContextUsage::reported(156_000, 200_000).expect("valid reported usage");
         assert_eq!(usage.remaining_percent, 22);
     }
 }

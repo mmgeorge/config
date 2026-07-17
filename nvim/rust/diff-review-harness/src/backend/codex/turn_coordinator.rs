@@ -1,5 +1,5 @@
 use super::CodexBackend;
-use crate::backend::json_rpc::{JsonRpcProcess, agent_lifecycle_list};
+use super::json_rpc::{CodexJsonRpc, agent_lifecycle_list};
 use crate::backend::steering::{ActiveSteering, ActiveTurnOperation, SteerCommand};
 use crate::backend::{BackendEvent, BackendEventSink, BackendOutput, BackendRequest};
 use anyhow::{Context, Result};
@@ -74,7 +74,7 @@ struct ParentTurn {
 /// Coordinates parent turns and descendant lifecycles over one Codex app-server process.
 pub(super) struct CodexTurnCoordinator<'a> {
     backend: &'a CodexBackend,
-    process: &'a mut JsonRpcProcess,
+    process: &'a mut CodexJsonRpc,
     output: &'a mut BackendOutput,
     steering: &'a mut ActiveSteering,
     event_sink: Option<BackendEventSink>,
@@ -88,7 +88,7 @@ pub(super) struct CodexTurnCoordinator<'a> {
 impl<'a> CodexTurnCoordinator<'a> {
     pub(super) fn new(
         backend: &'a CodexBackend,
-        process: &'a mut JsonRpcProcess,
+        process: &'a mut CodexJsonRpc,
         output: &'a mut BackendOutput,
         steering: &'a mut ActiveSteering,
         event_sink: Option<BackendEventSink>,
@@ -314,7 +314,7 @@ impl<'a> CodexTurnCoordinator<'a> {
         let Some(command) = pending_command.remove(&request_id) else {
             return Ok(());
         };
-        let result = JsonRpcProcess::request_result(message, request_id, "active turn command")
+        let result = CodexJsonRpc::request_result(message, request_id, "active turn command")
             .context("Codex active-turn command response omitted its result")?
             .map(drop);
         command.complete(result);

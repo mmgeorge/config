@@ -6,6 +6,8 @@ local client = require("diff_review.harness.client")
 local controller = require("diff_review.views.harness.controller")
 local raw_interaction_renderer = require("diff_review.render.harness.interaction_tree")
 local session = require("diff_review.session")
+local interaction_state = require("diff_review.views.harness.interaction_state")
+local harness_snapshot = require("diff_review.views.harness.snapshot")
 
 local function normalize_interaction(interaction)
   if interaction.node_list then return interaction end
@@ -250,6 +252,8 @@ local function fake_launcher(command, options, _)
             native_steer = true,
             native_turn_rollback = true,
             model_selection = true,
+            effort_selection = true,
+            fast_mode = true,
           },
           no_checkpoint = false,
           approval = {},
@@ -561,6 +565,9 @@ local function fake_launcher(command, options, _)
           native_compact = true,
           native_steer = true,
           native_turn_rollback = true,
+          model_selection = true,
+          effort_selection = true,
+          fast_mode = true,
         },
       } })
       emit(options, { id = request.id, result = {
@@ -571,6 +578,9 @@ local function fake_launcher(command, options, _)
           native_compact = true,
           native_steer = true,
           native_turn_rollback = true,
+          model_selection = true,
+          effort_selection = true,
+          fast_mode = true,
         },
       } })
     elseif request.method == "turn.steer" then
@@ -646,6 +656,9 @@ local function fake_launcher(command, options, _)
           native_compact = true,
           native_steer = true,
           native_turn_rollback = true,
+          model_selection = true,
+          effort_selection = true,
+          fast_mode = true,
         },
         no_checkpoint = false,
         goal = { objective = "fail", state = "paused" },
@@ -676,8 +689,14 @@ local ok, failure = pcall(function()
     harness = { backend = "mock" },
     keymaps = { status = { open = { "x" } } },
   })
-  assert_equals(require("diff_review.infra.config").defaults.harness.backends.acp.command[1], "copilot",
-    "default ACP backend should have a runnable launch descriptor")
+  assert_equals(#require("diff_review.infra.config").defaults.harness.backends.copilot.command, 0,
+    "default Copilot backend should launch the SDK-managed CLI")
+  assert_equals(
+    require("diff_review.harness.backends.copilot")
+      .descriptor(require("diff_review.infra.config").defaults.harness).kind,
+    "copilot",
+    "Copilot launch descriptors should select the native Rust backend"
+  )
   assert_equals(require("diff_review.infra.config").defaults.harness.backend, "codex",
     "Harness should default to the direct Codex backend")
   assert_equals(#require("diff_review.infra.config").options.keymaps.status.open, 1, "configured key lists should replace defaults atomically")
@@ -713,6 +732,17 @@ local ok, failure = pcall(function()
     "planning questions should remain visible without expansion")
   assert_true(vim.tbl_contains(question_render.lines, "    ○ Staged — Support both formats temporarily."),
     "planning question choices should remain visible in the timeline")
+  local withdrawn_question_render = interaction_renderer.build({ {
+    kind = "plan_lifecycle",
+    id = "withdrawn-question-lifecycle",
+    lifecycle = {
+      kind = "question_withdrawn",
+      answer = "Repository policy determines the migration.",
+    },
+  } })
+  assert_true(vim.tbl_contains(withdrawn_question_render.lines,
+    "▸ Question withdrawn: Repository policy determines the migration."),
+    "withdrawn planning questions should retain their evidence in the durable timeline")
   local agent_render = interaction_renderer.build({ {
     kind = "agent_lifecycle",
     id = "agent-run",
@@ -1024,7 +1054,13 @@ local ok, failure = pcall(function()
   local prompt_seen = false
   for _, frame in ipairs(render_frame_list) do
     local frame_text = table.concat(frame, "\n")
-    if frame_text:find("what is this repo?", 1, true) then prompt_seen = true end
+    if frame_text:find("what is this repo?", 1, true) then
+      if not prompt_seen then
+        assert_true(frame_text:find("▸ Thinking for 0s", 1, true) ~= nil,
+          "the first prompt frame must include its optimistic Thinking node: " .. frame_text)
+      end
+      prompt_seen = true
+    end
     if prompt_seen then
       assert_true(frame_text:find("what is this repo?", 1, true) ~= nil,
         "rendered transcript must not regress to a stale pre-prompt snapshot: " .. frame_text)
@@ -1047,6 +1083,56 @@ local ok, failure = pcall(function()
   assert_true(partial_response_seen, "each assistant delta should produce a visible intermediate frame")
   assert_true(complete_response_seen, "assistant deltas should compose into the complete response")
   assert_true(summary_seen, "assistant completion should produce a final summary frame")
+  local timing_state = {
+    interaction = {},
+    interaction_by_id = {},
+    interaction_presentation = {},
+  }
+  interaction_state.begin(timing_state, "Measure the turn", 1000000000)
+  local immediate_timing = raw_interaction_renderer.build(timing_state.interaction, { working_seconds = 0 })
+  assert_equals(immediate_timing.lines[2], "▸ Thinking for 0s",
+    "optimistic interactions should render before the first provider event")
+  interaction_state.start_interaction(timing_state, {
+    id = "timed-interaction",
+    prompt = "Measure the turn",
+    state = "running",
+    node_list = {},
+  })
+  local admitted_timing = raw_interaction_renderer.build(timing_state.interaction, { working_seconds = 3 })
+  assert_equals(admitted_timing.lines[2], "▸ Thinking for 3s",
+    "interaction admission should preserve the optimistic segment")
+  interaction_state.apply_node(timing_state, {
+    interaction_id = "timed-interaction",
+    node = mock_segment("timed-interaction", "running", nil, {}, nil, 1000),
+  })
+  assert_equals(#timing_state.interaction[1].node_list, 1,
+    "the first provider segment should replace the optimistic segment without duplication")
+  local completed_timing = {
+    id = "timed-interaction",
+    prompt = "Measure the turn",
+    state = "complete",
+    node_list = { mock_segment("timed-interaction", "complete", nil, {}, "Done", 1000) },
+  }
+  interaction_state.complete_interaction(timing_state, completed_timing, 7200000000)
+  local final_timing = raw_interaction_renderer.build(timing_state.interaction)
+  assert_equals(final_timing.lines[2], "▸ Thought for 6s, 2.7k tokens",
+    "completion should retain local wall-clock time when provider duration is shorter")
+  interaction_state.reconcile_snapshot(timing_state, { completed_timing })
+  local reconciled_timing = raw_interaction_renderer.build(timing_state.interaction)
+  assert_equals(reconciled_timing.lines[2], "▸ Thought for 6s, 2.7k tokens",
+    "snapshot reconciliation should not regress the completed duration")
+  local cached_context = { used = 275000, size = 353000, remaining_percent = 22 }
+  local context_state = {
+    session = { id = "same-session", context_usage = cached_context },
+    interaction = {},
+    interaction_by_id = {},
+  }
+  harness_snapshot.apply(context_state, {
+    session = { id = "same-session" },
+    interaction = {},
+  }, "reconcile")
+  assert_equals(context_state.session.context_usage.remaining_percent, 22,
+    "same-session snapshots should retain the latest context status until the provider refreshes it")
   local markdown_render = interaction_renderer.build({ {
     id = "markdown",
     prompt = "Explain the result",
@@ -1506,9 +1592,14 @@ local ok, failure = pcall(function()
   session.harness.capability.agent = { catalog = false }
   command_source:get_completions({}, function(result) command_completion = result end)
   assert_true(not vim.iter(command_completion.items):any(function(item) return item.label == "/agent" end),
-    "slash completion should hide child agents for ACP-compatible backends")
+    "slash completion should hide child timelines when observation is unavailable")
   assert_true(not vim.iter(command_completion.items):any(function(item) return item.label == "/spawn" end),
-    "slash completion should hide child-agent spawning for ACP-compatible backends")
+    "slash completion should hide child-agent spawning when the catalog is unavailable")
+  session.harness.capability.fast_mode = false
+  command_source:get_completions({}, function(result) command_completion = result end)
+  assert_true(not vim.iter(command_completion.items):any(function(item) return item.label == "/fast" end),
+    "slash completion should hide fast mode when the backend does not advertise it")
+  session.harness.capability.fast_mode = true
   session.harness.capability.agent = { catalog = true, observe = true }
   command_source:get_completions({}, function(result) command_completion = result end)
   assert_true(vim.iter(command_completion.items):any(function(item) return item.label == "/agent" end),

@@ -14,6 +14,7 @@ function M.append(result, entry, host)
     created = "Plan created",
     question_asked = "Planning paused for feedback",
     question_answered = "Plan feedback received",
+    question_withdrawn = "Question withdrawn",
     changes_requested = "Plan changes requested",
     revision_created = "Plan revision created",
     accepted = "Plan accepted",
@@ -22,6 +23,8 @@ function M.append(result, entry, host)
   if lifecycle.kind == "changes_requested" and lifecycle.overall_comment and lifecycle.overall_comment ~= "" then
     label = label .. ": " .. lifecycle.overall_comment
   elseif lifecycle.kind == "question_answered" and lifecycle.answer and lifecycle.answer ~= "" then
+    label = label .. ": " .. lifecycle.answer:gsub("[\r\n]+", " "):sub(1, 100)
+  elseif lifecycle.kind == "question_withdrawn" and lifecycle.answer and lifecycle.answer ~= "" then
     label = label .. ": " .. lifecycle.answer:gsub("[\r\n]+", " "):sub(1, 100)
   end
   local key = "plan_lifecycle:" .. tostring(entry.id or lifecycle.id)

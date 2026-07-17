@@ -164,16 +164,15 @@ impl PermissionCoordinator {
             }
             _ => None,
         };
-        if let Some(decision) = persistent_decision {
-            if let Err(error) = self
+        if let Some(decision) = persistent_decision
+            && let Err(error) = self
                 .store
                 .write()
                 .map_err(|_| anyhow::anyhow!("permission store lock poisoned"))?
                 .set_rule_list(&choice.rule_list, decision)
-            {
-                Self::emit_lifecycle(event_sink, "approval_cancelled", &pending.view)?;
-                return Err(error);
-            }
+        {
+            Self::emit_lifecycle(event_sink, "approval_cancelled", &pending.view)?;
+            return Err(error);
         }
         if pending.response.send(choice.resolution).is_err() {
             Self::emit_lifecycle(event_sink, "approval_cancelled", &pending.view)?;
@@ -373,14 +372,7 @@ pub fn permission_from_provider(
 ) -> PermissionRequest {
     let params = message.get("params").unwrap_or(&Value::Null);
     let id = format!("approval-{}", Uuid::new_v4());
-    let provider = if method.starts_with("session/")
-        || method.starts_with("fs/")
-        || method.starts_with("terminal/")
-    {
-        "ACP"
-    } else {
-        "Codex CLI"
-    };
+    let provider = "Codex CLI";
     let reason = params
         .get("reason")
         .and_then(Value::as_str)
@@ -439,10 +431,70 @@ pub fn permission_from_provider(
     }
 }
 
+/// Normalize one Copilot SDK permission callback into the Harness permission model.
+pub fn permission_from_copilot(
+    id: String,
+    kind: &str,
+    params: Value,
+    workspace: &str,
+) -> PermissionRequest {
+    let encoded = params.to_string();
+    let target_list = match kind {
+        "shell" => vec![PermissionTarget::Command {
+            command: params
+                .get("command")
+                .or_else(|| params.get("fullCommand"))
+                .or_else(|| params.get("full_command"))
+                .and_then(Value::as_str)
+                .unwrap_or(&encoded)
+                .to_owned(),
+        }],
+        "write" => vec![PermissionTarget::Write {
+            path: provider_path(&params).unwrap_or_else(|| workspace.into()),
+        }],
+        "read" => vec![PermissionTarget::Read {
+            path: provider_path(&params).unwrap_or_else(|| workspace.into()),
+        }],
+        "url" => vec![PermissionTarget::Network {
+            target: params
+                .get("url")
+                .or_else(|| params.get("target"))
+                .and_then(Value::as_str)
+                .unwrap_or("*")
+                .to_owned(),
+        }],
+        "mcp" => vec![PermissionTarget::Mcp {
+            target: params
+                .get("toolName")
+                .or_else(|| params.get("tool_name"))
+                .or_else(|| params.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("*")
+                .to_owned(),
+        }],
+        _ => normalize_permission_payload(&params, &encoded),
+    };
+    PermissionRequest {
+        id,
+        provider: "Copilot CLI".into(),
+        reason: params
+            .get("reason")
+            .or_else(|| params.get("intention"))
+            .or_else(|| params.get("warning"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        target_list,
+    }
+}
+
 fn provider_path(params: &Value) -> Option<String> {
     params
         .get("path")
         .and_then(Value::as_str)
+        .or_else(|| params.get("fileName").and_then(Value::as_str))
+        .or_else(|| params.get("file_name").and_then(Value::as_str))
+        .or_else(|| params.get("filePath").and_then(Value::as_str))
+        .or_else(|| params.get("file_path").and_then(Value::as_str))
         .or_else(|| params.get("grantRoot").and_then(Value::as_str))
         .or_else(|| params.pointer("/file/path").and_then(Value::as_str))
         .map(str::to_owned)
@@ -513,33 +565,6 @@ fn normalize_permission_payload(params: &Value, encoded: &str) -> Vec<Permission
     target_list
 }
 
-pub fn acp_response(message: &Value, resolution: ApprovalResolution) -> Value {
-    if resolution == ApprovalResolution::Cancel {
-        return json!({ "outcome": { "outcome": "cancelled" } });
-    }
-    let allow = matches!(
-        resolution,
-        ApprovalResolution::AllowOnce
-            | ApprovalResolution::AllowExact
-            | ApprovalResolution::AllowBroad
-    );
-    let desired = if allow { "allow_once" } else { "reject_once" };
-    let option_id = message
-        .pointer("/params/options")
-        .and_then(Value::as_array)
-        .and_then(|option_list| {
-            option_list
-                .iter()
-                .find(|option| option.get("kind").and_then(Value::as_str) == Some(desired))
-                .and_then(|option| option.get("optionId").or_else(|| option.get("option_id")))
-                .cloned()
-        });
-    option_id.map_or_else(
-        || json!({ "outcome": { "outcome": "cancelled" } }),
-        |option_id| json!({ "outcome": { "outcome": "selected", "optionId": option_id } }),
-    )
-}
-
 pub fn codex_response(message: &Value, resolution: ApprovalResolution) -> Value {
     let allow = matches!(
         resolution,
@@ -579,6 +604,37 @@ pub fn protected_target(request: &PermissionRequest, store: &PermissionStore) ->
 mod test {
     use super::*;
     use crate::permissions::store::PermissionStore;
+
+    #[test]
+    fn maps_copilot_permission_kinds_into_shared_targets() {
+        let write = permission_from_copilot(
+            "write-one".into(),
+            "write",
+            json!({ "fileName": "D:/repo/src/main.rs", "intention": "Apply edit" }),
+            "D:/repo",
+        );
+        assert_eq!(write.provider, "Copilot CLI");
+        assert_eq!(write.reason.as_deref(), Some("Apply edit"));
+        assert_eq!(
+            write.target_list,
+            vec![PermissionTarget::Write {
+                path: "D:/repo/src/main.rs".into(),
+            }]
+        );
+
+        let mcp = permission_from_copilot(
+            "mcp-one".into(),
+            "mcp",
+            json!({ "toolName": "github.search_code" }),
+            "D:/repo",
+        );
+        assert_eq!(
+            mcp.target_list,
+            vec![PermissionTarget::Mcp {
+                target: "github.search_code".into(),
+            }]
+        );
+    }
 
     #[test]
     fn builds_exact_and_broad_command_choices() {

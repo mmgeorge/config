@@ -279,8 +279,12 @@ local function append_segment(result, interaction, segment, options, defer_respo
   }
   local complete = segment.state == "complete"
   local tool_count, failed_count = interaction_counts(segment_interaction)
-  local duration = math.floor((segment.duration_ms or 0) / 1000)
-  if not complete then duration = duration + (options.working_seconds or 0) end
+  local duration_ms = math.max(
+    segment.duration_ms or 0,
+    segment.presentation_duration_ms or 0,
+    complete and 0 or ((options.working_seconds or 0) * 1000)
+  )
+  local duration = math.floor(duration_ms / 1000)
   local token_text = complete and format_token_count(segment.token_count) or nil
   local summary
   if interaction.state == "cancelled" then

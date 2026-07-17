@@ -8,13 +8,12 @@ local M = {}
 ---@param harness_config DiffReviewHarnessConfig
 ---@return DiffReviewHarnessBackendDescriptor
 function M.descriptor(harness_config)
-  local backend = harness_config.backends.acp or {}
+  local backend = harness_config.backends.copilot or {}
   return {
-    kind = "acp",
+    kind = "copilot",
     command = vim.deepcopy(backend.command or {}),
-    permission_note = "ACP permissions are best effort for provider-private tools",
+    permission_note = "Copilot routes approvals through Harness permission policy",
   }
 end
 
 return M
-

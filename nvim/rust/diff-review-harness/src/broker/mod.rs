@@ -16,8 +16,8 @@ use crate::interaction::{
 use crate::permissions::store::PermissionStore;
 use crate::plan::{
     ArtifactSummary, PlanAnnotation, PlanElicitation, PlanExecutionRecord, PlanExecutionState,
-    PlanFileStore, PlanLifecycleKind, PlanLifecycleRecord, PlanPrompt, PlanQuestionResponse,
-    PlanQuestionSet, PlanRecord, PlanState,
+    PlanFileStore, PlanLifecycleKind, PlanLifecycleRecord, PlanPrompt, PlanQuestionAnswer,
+    PlanQuestionResponse, PlanQuestionSet, PlanQuestionWithdrawal, PlanRecord, PlanState,
 };
 use crate::protocol::{BrokerEvent, BrokerRequest, BrokerResponse};
 use crate::session::{
@@ -332,6 +332,7 @@ impl HarnessBroker {
             request.backend.clone(),
             Arc::clone(&permission_coordinator),
         )?);
+        let backend_descriptor = backend.descriptor();
         let force_new_session = request.lease_conflict_action.as_deref() == Some("new");
         let mut session = match request.session_id.as_deref().filter(|_| !force_new_session) {
             Some(session_id) => {
@@ -362,7 +363,7 @@ impl HarnessBroker {
                             model: preference
                                 .as_ref()
                                 .map_or(request.model, |value| value.model.clone()),
-                            provider_label: backend_provider_label(&request.backend),
+                            provider_label: backend_descriptor.label.clone(),
                             resolved_model: None,
                             effort: preference
                                 .as_ref()
@@ -376,7 +377,7 @@ impl HarnessBroker {
                             lease_owner: None,
                             lease_expires_at_ms: None,
                             native_fork: false,
-                            native_compact: request.backend.kind == "codex",
+                            native_compact: backend_descriptor.capability.native_compact,
                             context_usage: None,
                         };
                         acquire_lease(&mut session, &request.client_id, now_ms)?;
@@ -386,7 +387,7 @@ impl HarnessBroker {
             }
         };
         if session.provider_label.is_empty() {
-            session.provider_label = backend_provider_label(&request.backend);
+            session.provider_label = backend_descriptor.label.clone();
         }
         if session.resolved_model.is_none() && session.model != "default" {
             session.resolved_model = Some(session.model.clone());
@@ -402,19 +403,9 @@ impl HarnessBroker {
                 fast_mode: session.fast_mode,
             },
         )?;
-        let capability = BackendCapability {
-            native_fork: session.native_fork,
-            native_compact: session.native_compact,
-            native_steer: request.backend.kind == "codex" || request.backend.kind == "mock",
-            native_turn_rollback: request.backend.kind == "codex" || request.backend.kind == "mock",
-            execution_mode_list: execution_mode_list(&request.backend.kind),
-            agent: if request.backend.kind == "codex" {
-                crate::agent::AgentCapability::codex()
-            } else {
-                crate::agent::AgentCapability::default()
-            },
-            ..BackendCapability::default()
-        };
+        let mut capability = backend_descriptor.capability;
+        capability.native_fork = session.native_fork || capability.native_fork;
+        capability.native_compact = session.native_compact || capability.native_compact;
         let agent_registry = load_agent_registry(&store, &session.id)?;
         Ok(Self {
             store,
@@ -537,7 +528,7 @@ impl HarnessBroker {
                 .and_then(|runtime| runtime.active_wait.clone()),
             prompt_history: self.store.list_prompt_history()?,
             agent: AgentSnapshot {
-                definition: if self.session.backend == "codex" {
+                definition: if self.capability.agent.catalog {
                     load_codex_agent_catalog(Path::new(&self.session.workspace))?
                 } else {
                     Vec::new()
@@ -676,7 +667,7 @@ impl HarnessBroker {
             params.get("mode").cloned().context("mode is required")?,
         )?;
         anyhow::ensure!(
-            self.session.backend == "codex" || self.capability.execution_mode_list.contains(&mode),
+            self.capability.execution_mode_list.contains(&mode),
             "execution mode {} is unavailable for this backend",
             mode.label()
         );
@@ -1328,9 +1319,7 @@ impl HarnessBroker {
         self.session = snapshot.session;
         self.save_session()?;
 
-        if goal_changed
-            && self.session.backend == "codex"
-            && self.session.backend_session_id.is_some()
+        if goal_changed && self.capability.native_goal && self.session.backend_session_id.is_some()
         {
             let request = self.backend_request(String::new(), PromptMode::Chat);
             match snapshot.goal {
@@ -1394,6 +1383,94 @@ impl HarnessBroker {
                 serde_json::to_value(&snapshot.active_elicitation)?,
             )?],
         ))
+    }
+
+    /// Record one explicit conversational answer against the durable elicitation owner.
+    fn answer_active_elicitation_from_model(
+        &mut self,
+        answer: PlanQuestionAnswer,
+        event: &mut Vec<BrokerEvent>,
+    ) -> Result<()> {
+        let has_pending_question;
+        if self.active_plan_awaits_input()? {
+            let mut plan = self.active_elicitation_plan()?;
+            let elicitation = plan
+                .elicitation
+                .as_mut()
+                .context("active plan has no elicitation state")?;
+            elicitation.answer_from_model(&answer.question_id, answer.response)?;
+            has_pending_question = elicitation.current_question().is_some();
+            plan.updated_at_ms = self.clock.now_ms();
+            self.store.save_plan(&plan)?;
+        } else {
+            let mut interaction = self.active_interaction_elicitation()?;
+            let elicitation = interaction
+                .elicitation
+                .as_mut()
+                .context("active interaction has no elicitation state")?;
+            elicitation.answer_from_model(&answer.question_id, answer.response)?;
+            has_pending_question = elicitation.current_question().is_some();
+            self.store.save_interaction(&interaction)?;
+        }
+        if has_pending_question {
+            event.push(self.event(
+                "question_updated",
+                serde_json::to_value(self.snapshot()?.active_elicitation)?,
+            )?);
+        }
+        Ok(())
+    }
+
+    /// Remove the durable elicitation only when the provider reports that no decision remains.
+    fn withdraw_active_elicitation(
+        &mut self,
+        withdrawal: PlanQuestionWithdrawal,
+        event: &mut Vec<BrokerEvent>,
+    ) -> Result<()> {
+        let reason = withdrawal.reason.trim();
+        anyhow::ensure!(!reason.is_empty(), "question withdrawal reason is required");
+        if self.active_plan_awaits_input()? {
+            let mut plan = self.active_elicitation_plan()?;
+            let elicitation = plan
+                .elicitation
+                .take()
+                .context("active plan has no elicitation state")?;
+            plan.state = if plan.model_revision > 0 {
+                PlanState::Revising
+            } else {
+                PlanState::Generating
+            };
+            plan.updated_at_ms = self.clock.now_ms();
+            self.store.save_plan(&plan)?;
+            let lifecycle = PlanLifecycleRecord {
+                id: Uuid::new_v4().to_string(),
+                session_id: self.session.id.clone(),
+                plan_id: plan.id.clone(),
+                kind: PlanLifecycleKind::QuestionWithdrawn,
+                model_revision: plan.model_revision,
+                user_revision: plan.user_revision,
+                overall_comment: None,
+                annotation: Vec::new(),
+                question: Some(elicitation.question_set),
+                answer: Some(reason.to_owned()),
+                created_at_ms: self.clock.now_ms(),
+            };
+            self.store.save_plan_lifecycle(&lifecycle)?;
+            event.push(self.event(
+                "plan_question_withdrawn",
+                json!({ "plan": plan, "lifecycle": lifecycle }),
+            )?);
+            return Ok(());
+        }
+        let mut interaction = self.active_interaction_elicitation()?;
+        interaction.awaiting_input = false;
+        interaction.elicitation = None;
+        self.store.save_interaction(&interaction)?;
+        event.push(self.event(
+            "question_withdrawn",
+            json!({ "interaction_id": interaction.id, "reason": reason }),
+        )?);
+        Ok(())
     }
 
     /// Replace the pending owner question set when a clarification turn asks again.
@@ -1487,6 +1564,10 @@ impl HarnessBroker {
 
     async fn ask_plan_question(&mut self, params: Value) -> Result<(Value, Vec<BrokerEvent>)> {
         let mut plan = self.active_elicitation_plan()?;
+        let original_elicitation = plan
+            .elicitation
+            .clone()
+            .context("active plan has no elicitation state")?;
         let question_id = required_text(&params, "question_id")?;
         let text = required_text(&params, "text")?;
         let elicitation = plan
@@ -1502,13 +1583,74 @@ impl HarnessBroker {
         let elicitation_json = serde_json::to_string_pretty(&elicitation)?;
         plan.updated_at_ms = self.clock.now_ms();
         self.store.save_plan(&plan)?;
-        let (value, event) = self
+        let (mut value, mut event) = self
             .run_interaction(
                 PlanPrompt::clarification(&plan.request, &elicitation_json, &text),
                 PromptMode::Chat,
                 Some(InteractionAdmission::chat(text)),
             )
             .await?;
+        let mut current_plan = self
+            .store
+            .load_plan(&plan.id)?
+            .context("active plan record is missing after clarification")?;
+        if current_plan.elicitation.is_none()
+            && matches!(
+                current_plan.state,
+                PlanState::Generating | PlanState::Revising
+            )
+        {
+            let withdrawal = self
+                .store
+                .list_plan_lifecycle(&self.session.id)?
+                .into_iter()
+                .rev()
+                .find(|lifecycle| {
+                    lifecycle.plan_id == plan.id
+                        && lifecycle.kind == PlanLifecycleKind::QuestionWithdrawn
+                })
+                .context("withdrawn planning question has no lifecycle record")?;
+            let feedback = format!(
+                "Pending planning questions withdrawn: {}",
+                withdrawal
+                    .answer
+                    .as_deref()
+                    .unwrap_or("no material decision remains")
+            );
+            let continuation = self
+                .run_interaction(
+                    PlanPrompt::feedback(&plan.request, &feedback),
+                    PromptMode::Plan,
+                    Some(InteractionAdmission::plan(
+                        feedback,
+                        Some(plan.id.clone()),
+                        plan.model_revision > 0,
+                    )),
+                )
+                .await;
+            match continuation {
+                Ok((next_value, mut next_event)) => {
+                    value = next_value;
+                    event.append(&mut next_event);
+                }
+                Err(error) => {
+                    self.store.delete_plan_lifecycle(&withdrawal.id)?;
+                    current_plan.state = PlanState::AwaitingInput;
+                    current_plan.elicitation = Some(original_elicitation);
+                    current_plan.updated_at_ms = self.clock.now_ms();
+                    self.store.save_plan(&current_plan)?;
+                    return Err(error).context("continue planning after question withdrawal");
+                }
+            }
+        } else if current_plan
+            .elicitation
+            .as_ref()
+            .is_some_and(|elicitation| elicitation.current_question().is_none())
+        {
+            let (next_value, mut next_event) = self.continue_plan_question().await?;
+            value = next_value;
+            event.append(&mut next_event);
+        }
         Ok((value, event))
     }
 
@@ -1532,15 +1674,22 @@ impl HarnessBroker {
         elicitation.clarification_active = true;
         let elicitation_json = serde_json::to_string_pretty(elicitation)?;
         self.store.save_interaction(&interaction)?;
-        let (value, event) = self
+        let (mut value, mut event) = self
             .run_interaction(
-                format!(
-                    "The user asks for clarification about a pending Harness question. Answer the clarification without resolving or replacing the question set.\n\nPending questions:\n{elicitation_json}\n\nUser question:\n{text}"
-                ),
+                PlanPrompt::question_follow_up(&elicitation_json, &text),
                 PromptMode::Chat,
                 Some(InteractionAdmission::chat(text)),
             )
             .await?;
+        if self
+            .find_active_interaction_elicitation()?
+            .and_then(|interaction| interaction.elicitation)
+            .is_some_and(|elicitation| elicitation.current_question().is_none())
+        {
+            let (next_value, mut next_event) = self.continue_question().await?;
+            value = next_value;
+            event.append(&mut next_event);
+        }
         Ok((value, event))
     }
 
@@ -1852,6 +2001,24 @@ impl HarnessBroker {
             .filter(|text| !text.trim().is_empty());
         output.event.clear();
 
+        if let Some(control_error) = output.control_error.take() {
+            anyhow::bail!(control_error);
+        }
+
+        let elicitation_control_count = usize::from(output.plan_question.is_some())
+            + usize::from(output.question_answer.is_some())
+            + usize::from(output.question_withdrawal.is_some());
+        anyhow::ensure!(
+            elicitation_control_count <= 1,
+            "backend turn emitted multiple Harness question control actions"
+        );
+        if mode == PromptMode::Plan {
+            anyhow::ensure!(
+                output.question_answer.is_none() && output.question_withdrawal.is_none(),
+                "planning generation cannot answer or withdraw a pending question"
+            );
+        }
+
         if mode == PromptMode::Plan {
             let markdown = output.plan_markdown.take();
             let question = output.plan_question.take().or_else(|| {
@@ -1977,21 +2144,27 @@ impl HarnessBroker {
                     json!({ "plan": plan, "lifecycle": lifecycle, "question": question }),
                 )?);
             }
-        } else if let Some(question) = output.plan_question.take() {
-            let question = question.normalize()?;
-            if !self.replace_active_elicitation(question.clone(), &mut event)? {
-                interaction.awaiting_input = true;
-                interaction.elicitation = Some(PlanElicitation::new(question.clone()));
-                self.store.save_interaction(&interaction)?;
-                event.push(self.event(
-                    "question",
-                    json!({
-                        "owner": "interaction",
-                        "plan_id": interaction.plan_id,
-                        "interaction_id": interaction.id,
-                        "elicitation": interaction.elicitation,
-                    }),
-                )?);
+        } else {
+            if let Some(question) = output.plan_question.take() {
+                let question = question.normalize()?;
+                if !self.replace_active_elicitation(question.clone(), &mut event)? {
+                    interaction.awaiting_input = true;
+                    interaction.elicitation = Some(PlanElicitation::new(question.clone()));
+                    self.store.save_interaction(&interaction)?;
+                    event.push(self.event(
+                        "question",
+                        json!({
+                            "owner": "interaction",
+                            "plan_id": interaction.plan_id,
+                            "interaction_id": interaction.id,
+                            "elicitation": interaction.elicitation,
+                        }),
+                    )?);
+                }
+            } else if let Some(answer) = output.question_answer.take() {
+                self.answer_active_elicitation_from_model(answer, &mut event)?;
+            } else if let Some(withdrawal) = output.question_withdrawal.take() {
+                self.withdraw_active_elicitation(withdrawal, &mut event)?;
             }
         }
 
@@ -2567,7 +2740,7 @@ impl HarnessBroker {
         self.store.save_plan(&plan)?;
         self.session.active_plan_id = Some(plan.id.clone());
         let objective = "Complete the plan".to_owned();
-        let goal = self.create_goal(objective, self.session.backend == "codex")?;
+        let goal = self.create_goal(objective, self.capability.native_goal)?;
         let lifecycle = PlanLifecycleRecord {
             id: Uuid::new_v4().to_string(),
             session_id: self.session.id.clone(),
@@ -2850,7 +3023,7 @@ impl HarnessBroker {
     async fn set_goal(&mut self, params: Value) -> Result<(Value, Vec<BrokerEvent>)> {
         let objective = required_text(&params, "objective")?;
         self.pause_current_goal().await?;
-        let goal = self.create_goal(objective.clone(), self.session.backend == "codex")?;
+        let goal = self.create_goal(objective.clone(), self.capability.native_goal)?;
         let prompt = if goal.native {
             format!("/goal {objective}")
         } else {
@@ -3209,21 +3382,10 @@ impl HarnessBroker {
             lease_owner: Some(self.client_id.clone()),
             lease_expires_at_ms: Some(now_ms + 30_000),
             native_fork: false,
-            native_compact: self.session.backend == "codex",
+            native_compact: self.backend.descriptor().capability.native_compact,
             context_usage: None,
         };
-        self.capability = BackendCapability {
-            native_compact: self.session.backend == "codex",
-            native_steer: self.session.backend == "codex" || self.session.backend == "mock",
-            native_turn_rollback: self.session.backend == "codex" || self.session.backend == "mock",
-            execution_mode_list: execution_mode_list(&self.session.backend),
-            agent: if self.session.backend == "codex" {
-                crate::agent::AgentCapability::codex()
-            } else {
-                crate::agent::AgentCapability::default()
-            },
-            ..BackendCapability::default()
-        };
+        self.capability = self.backend.descriptor().capability;
         self.store.save_session(&self.session)?;
         Ok((
             serde_json::to_value(self.snapshot()?)?,
@@ -3313,7 +3475,7 @@ impl HarnessBroker {
                 .acquire_session_lease(&session.id, &self.client_id, self.clock.now_ms())?;
         self.release_lease()?;
         if session.provider_label.is_empty() {
-            session.provider_label = backend_provider_label(&self.backend_launch);
+            session.provider_label = self.backend.descriptor().label;
         }
         self.store.save_session(&session)?;
         self.interaction_runtime = None;
@@ -3322,8 +3484,10 @@ impl HarnessBroker {
         self.agent_runtime_by_run.clear();
         self.capability.native_fork = self.session.native_fork;
         self.capability.native_compact = self.session.native_compact;
-        self.capability.native_steer =
-            self.session.backend == "codex" || self.session.backend == "mock";
+        self.capability = self.backend.descriptor().capability;
+        self.capability.native_fork = self.session.native_fork || self.capability.native_fork;
+        self.capability.native_compact =
+            self.session.native_compact || self.capability.native_compact;
         Ok((
             serde_json::to_value(self.snapshot()?)?,
             vec![self.event("session_changed", serde_json::to_value(&self.session)?)?],
@@ -3374,7 +3538,7 @@ impl HarnessBroker {
         }
         if let Some(fast_mode) = params.get("fast_mode").and_then(Value::as_bool) {
             anyhow::ensure!(
-                self.session.backend == "codex",
+                self.capability.native_goal,
                 "fast mode requires the Codex backend"
             );
             self.session.fast_mode = fast_mode;
@@ -3703,43 +3867,6 @@ fn default_goal_max_turns() -> u32 {
     20
 }
 
-fn backend_provider_label(launch: &BackendLaunch) -> String {
-    match launch.kind.as_str() {
-        "codex" => "Codex CLI".into(),
-        "mock" => "Mock backend".into(),
-        "acp" => {
-            let executable = launch
-                .command
-                .first()
-                .map(String::as_str)
-                .unwrap_or("ACP agent");
-            let stem = Path::new(executable)
-                .file_stem()
-                .and_then(|value| value.to_str())
-                .unwrap_or(executable);
-            if stem.eq_ignore_ascii_case("copilot") {
-                "Copilot CLI (ACP)".into()
-            } else {
-                format!("{stem} (ACP)")
-            }
-        }
-        kind => format!("{kind} backend"),
-    }
-}
-
-fn execution_mode_list(backend: &str) -> Vec<ExecutionMode> {
-    if backend == "codex" || backend == "mock" {
-        vec![
-            ExecutionMode::Read,
-            ExecutionMode::Write,
-            ExecutionMode::Full,
-            ExecutionMode::Yolo,
-        ]
-    } else {
-        vec![ExecutionMode::Read, ExecutionMode::Write]
-    }
-}
-
 #[cfg(test)]
 mod test {
     use super::*;
@@ -3830,6 +3957,106 @@ mod test {
     struct PlanningQuestionBackend {
         turn: std::sync::atomic::AtomicUsize,
         structured: bool,
+    }
+
+    struct MutableQuestionBackend {
+        fail_withdrawal_continuation: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Backend for MutableQuestionBackend {
+        async fn prompt_stream(
+            &self,
+            request: BackendRequest,
+            _event_sink: Option<BackendEventSink>,
+        ) -> Result<crate::backend::BackendOutput> {
+            let question_set = || PlanQuestionSet {
+                id: "migration-set".into(),
+                questions: vec![crate::plan::PlanQuestion {
+                    id: "migration".into(),
+                    header: "Migration".into(),
+                    question: "Which migration should the implementation use?".into(),
+                    options: vec![
+                        crate::plan::PlanQuestionOption {
+                            label: "Staged".into(),
+                            description: "Preserve compatibility temporarily.".into(),
+                        },
+                        crate::plan::PlanQuestionOption {
+                            label: "Immediate".into(),
+                            description: "Replace the old format now.".into(),
+                        },
+                    ],
+                    allow_freeform: true,
+                }],
+            };
+            let mut output = crate::backend::BackendOutput {
+                backend_session_id: Some("mutable-question".into()),
+                capability: BackendCapability::default(),
+                runtime: crate::backend::BackendRuntime {
+                    provider: "Mutable question test".into(),
+                    model: Some(request.model),
+                },
+                ..crate::backend::BackendOutput::default()
+            };
+            if request
+                .text
+                .contains("User follow-up:\nreplace the options")
+            {
+                let mut replacement = question_set();
+                replacement.questions[0].options = vec![
+                    crate::plan::PlanQuestionOption {
+                        label: "Safe".into(),
+                        description: "Retain compatibility.".into(),
+                    },
+                    crate::plan::PlanQuestionOption {
+                        label: "Fast".into(),
+                        description: "Prefer immediate cleanup.".into(),
+                    },
+                ];
+                output.plan_question = Some(replacement);
+            } else if request.text.contains("User follow-up:\nuse staged") {
+                output.question_answer = Some(PlanQuestionAnswer {
+                    question_id: "migration".into(),
+                    response: PlanQuestionResponse::Selected {
+                        option: "Staged".into(),
+                        feedback: None,
+                    },
+                });
+            } else if request
+                .text
+                .contains("User follow-up:\nthis decision is not material")
+            {
+                output.question_withdrawal = Some(PlanQuestionWithdrawal {
+                    reason: "Repository policy determines the migration.".into(),
+                });
+            } else if request
+                .text
+                .contains("Pending planning questions withdrawn")
+                || request
+                    .text
+                    .contains("Planning feedback:\n- Migration: Staged")
+                || request
+                    .text
+                    .contains("The user answered the pending Harness questions")
+            {
+                if self.fail_withdrawal_continuation
+                    && request
+                        .text
+                        .contains("Pending planning questions withdrawn")
+                {
+                    anyhow::bail!("synthetic withdrawal continuation failure");
+                }
+                output.plan_markdown = (request.mode == PromptMode::Plan)
+                    .then(|| "# Migration plan\n\n## Overview\n\nFollow repository policy.".into());
+            } else {
+                output.plan_question = Some(question_set());
+            }
+            Ok(output)
+        }
+
+        async fn fork(&self, _request: BackendRequest) -> Result<String> {
+            Ok("mutable-question-fork".into())
+        }
     }
 
     impl PlanningQuestionBackend {
@@ -4190,6 +4417,14 @@ mod test {
         )
         .unwrap();
         broker.backend = Arc::new(PlanningQuestionBackend::new(structured));
+        broker
+    }
+
+    fn mutable_question_broker(repository: &Path, data_root: &Path) -> HarnessBroker {
+        let mut broker = planning_question_broker(repository, data_root, true);
+        broker.backend = Arc::new(MutableQuestionBackend {
+            fail_withdrawal_continuation: false,
+        });
         broker
     }
 
@@ -4946,6 +5181,181 @@ mod test {
     }
 
     #[tokio::test]
+    async fn clarification_replaces_the_complete_pending_question_set() {
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = mutable_question_broker(repository.path(), data.path());
+        broker
+            .dispatch(BrokerRequest {
+                id: 1,
+                method: "prompt.submit".into(),
+                params: json!({ "text": "/plan migrate the event format" }),
+            })
+            .await;
+        let result = broker
+            .dispatch(BrokerRequest {
+                id: 2,
+                method: "prompt.submit".into(),
+                params: json!({ "text": "replace the options" }),
+            })
+            .await;
+        assert!(result.response.error.is_none());
+        let elicitation = broker
+            .snapshot()
+            .unwrap()
+            .active_plan
+            .unwrap()
+            .elicitation
+            .unwrap();
+        assert_eq!(elicitation.revision, 2);
+        assert_eq!(
+            elicitation.question_set.questions[0].options[0].label,
+            "Safe"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_chat_answer_resumes_an_ordinary_request() {
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = mutable_question_broker(repository.path(), data.path());
+        broker
+            .dispatch(BrokerRequest {
+                id: 1,
+                method: "prompt.submit".into(),
+                params: json!({ "text": "ask which migration to use" }),
+            })
+            .await;
+        let result = broker
+            .dispatch(BrokerRequest {
+                id: 2,
+                method: "prompt.submit".into(),
+                params: json!({ "text": "use staged" }),
+            })
+            .await;
+        assert!(result.response.error.is_none());
+        assert!(broker.snapshot().unwrap().active_elicitation.is_none());
+        assert!(
+            result
+                .event
+                .iter()
+                .any(|event| event.event == "question_answered")
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_chat_answer_resumes_a_plan_when_no_decisions_remain() {
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = mutable_question_broker(repository.path(), data.path());
+        broker
+            .dispatch(BrokerRequest {
+                id: 1,
+                method: "prompt.submit".into(),
+                params: json!({ "text": "/plan migrate the event format" }),
+            })
+            .await;
+        let result = broker
+            .dispatch(BrokerRequest {
+                id: 2,
+                method: "prompt.submit".into(),
+                params: json!({ "text": "use staged" }),
+            })
+            .await;
+        assert!(result.response.error.is_none());
+        let snapshot = broker.snapshot().unwrap();
+        assert_eq!(
+            snapshot.active_plan.unwrap().state,
+            PlanState::AwaitingReview
+        );
+        assert!(snapshot.active_elicitation.is_none());
+        assert!(
+            result
+                .event
+                .iter()
+                .any(|event| event.event == "plan_question_answered")
+        );
+    }
+
+    #[tokio::test]
+    async fn withdrawn_plan_question_resumes_planning_and_records_its_reason() {
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = mutable_question_broker(repository.path(), data.path());
+        broker
+            .dispatch(BrokerRequest {
+                id: 1,
+                method: "prompt.submit".into(),
+                params: json!({ "text": "/plan migrate the event format" }),
+            })
+            .await;
+        let result = broker
+            .dispatch(BrokerRequest {
+                id: 2,
+                method: "prompt.submit".into(),
+                params: json!({ "text": "this decision is not material" }),
+            })
+            .await;
+        assert!(result.response.error.is_none());
+        let snapshot = broker.snapshot().unwrap();
+        assert_eq!(
+            snapshot.active_plan.unwrap().state,
+            PlanState::AwaitingReview
+        );
+        assert!(snapshot.active_elicitation.is_none());
+        let lifecycle = broker
+            .store
+            .list_plan_lifecycle(&broker.session.id)
+            .unwrap();
+        assert!(lifecycle.iter().any(|entry| {
+            entry.kind == PlanLifecycleKind::QuestionWithdrawn
+                && entry.answer.as_deref() == Some("Repository policy determines the migration.")
+        }));
+        assert!(
+            result
+                .event
+                .iter()
+                .any(|event| event.event == "plan_question_withdrawn")
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_withdrawal_continuation_restores_the_pending_question() {
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = mutable_question_broker(repository.path(), data.path());
+        broker.backend = Arc::new(MutableQuestionBackend {
+            fail_withdrawal_continuation: true,
+        });
+        broker
+            .dispatch(BrokerRequest {
+                id: 1,
+                method: "prompt.submit".into(),
+                params: json!({ "text": "/plan migrate the event format" }),
+            })
+            .await;
+        let result = broker
+            .dispatch(BrokerRequest {
+                id: 2,
+                method: "prompt.submit".into(),
+                params: json!({ "text": "this decision is not material" }),
+            })
+            .await;
+        assert!(result.response.error.is_some());
+        let plan = broker.snapshot().unwrap().active_plan.unwrap();
+        assert_eq!(plan.state, PlanState::AwaitingInput);
+        assert!(plan.elicitation.is_some());
+        assert!(
+            !broker
+                .store
+                .list_plan_lifecycle(&broker.session.id)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.kind == PlanLifecycleKind::QuestionWithdrawn)
+        );
+    }
+
+    #[tokio::test]
     async fn treats_an_unstructured_planning_question_as_freeform_feedback() {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
@@ -5378,8 +5788,8 @@ mod test {
         .unwrap();
         let active_id = broker.session.id.clone();
         let mut incompatible = broker.session.clone();
-        incompatible.id = "acp-session".into();
-        incompatible.backend = "acp".into();
+        incompatible.id = "copilot-session".into();
+        incompatible.backend = "copilot".into();
         incompatible.lease_owner = None;
         incompatible.lease_expires_at_ms = None;
         broker.store.save_session(&incompatible).unwrap();

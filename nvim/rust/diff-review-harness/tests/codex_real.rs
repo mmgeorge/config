@@ -98,9 +98,36 @@ async fn asks_for_feedback_then_creates_a_plan_without_native_collaboration_mode
         diff_review_harness::plan::PlanState::AwaitingInput
     );
     let elicitation = paused_plan.elicitation.expect("pending elicitation");
-    let question = elicitation
+    let initial_revision = elicitation.revision;
+
+    let replaced = tokio::time::timeout(
+        Duration::from_secs(120),
+        broker.dispatch(BrokerRequest {
+            id: 4,
+            method: "prompt.submit".into(),
+            params: json!({
+                "text": "Replace the pending question with exactly two options named Unit tests and Integration tests. Keep one question and do not choose an answer for me."
+            }),
+        }),
+    )
+    .await
+    .expect("real Codex question replacement timeout");
+    assert!(
+        replaced.response.error.is_none(),
+        "{:?}",
+        replaced.response.error
+    );
+    let replaced_plan = broker
+        .snapshot()
+        .unwrap()
+        .active_plan
+        .expect("planning state after question replacement");
+    let replaced_elicitation = replaced_plan.elicitation.expect("replaced elicitation");
+    assert!(replaced_elicitation.revision > initial_revision);
+    let question = replaced_elicitation
         .current_question()
         .expect("current planning question");
+    assert_eq!(question.options.len(), 2);
     let question_id = question.id.clone();
     let selected_option = question
         .options
@@ -113,7 +140,7 @@ async fn asks_for_feedback_then_creates_a_plan_without_native_collaboration_mode
 
     let answered = broker
         .dispatch(BrokerRequest {
-            id: 4,
+            id: 5,
             method: "question.answer".into(),
             params: json!({
                 "question_id": question_id,
@@ -134,7 +161,7 @@ async fn asks_for_feedback_then_creates_a_plan_without_native_collaboration_mode
     let resumed = tokio::time::timeout(
         Duration::from_secs(120),
         broker.dispatch(BrokerRequest {
-            id: 5,
+            id: 6,
             method: "question.continue".into(),
             params: Value::Null,
         }),
@@ -153,7 +180,7 @@ async fn asks_for_feedback_then_creates_a_plan_without_native_collaboration_mode
 
     let new_session = broker
         .dispatch(BrokerRequest {
-            id: 6,
+            id: 7,
             method: "session.new".into(),
             params: Value::Null,
         })
@@ -165,7 +192,7 @@ async fn asks_for_feedback_then_creates_a_plan_without_native_collaboration_mode
     );
     let write_mode = broker
         .dispatch(BrokerRequest {
-            id: 7,
+            id: 8,
             method: "session.execution_mode".into(),
             params: json!({ "mode": "write" }),
         })
@@ -174,7 +201,7 @@ async fn asks_for_feedback_then_creates_a_plan_without_native_collaboration_mode
     let write_result = tokio::time::timeout(
         Duration::from_secs(120),
         broker.dispatch(BrokerRequest {
-            id: 8,
+            id: 9,
             method: "prompt.submit".into(),
             params: json!({
                 "text": "Create mode-write-proof.txt in the workspace with exactly this content: `Harness native Write mode verified`. Do not change any other file."

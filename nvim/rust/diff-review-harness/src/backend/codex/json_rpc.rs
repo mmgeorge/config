@@ -1,7 +1,7 @@
 use crate::agent::{AgentLifecycleEvent, AgentRunStatus};
 use crate::backend::approval::{
-    ApprovalResolution, PermissionCoordinator, acp_response, codex_response,
-    permission_from_provider, protected_target,
+    ApprovalResolution, PermissionCoordinator, codex_response, permission_from_provider,
+    protected_target,
 };
 use crate::backend::{
     BackendEvent, BackendEventSink, BackendOutput, ProviderChangeKind, ProviderChangeSet,
@@ -12,15 +12,14 @@ use crate::plan::PlanQuestionSet;
 use crate::session::{ContextUsage, ExecutionMode};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
-use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 
-/// Owns one JSON-RPC subprocess for an ACP or Codex turn.
-pub struct JsonRpcProcess {
+/// Owns one Codex app-server JSON-RPC subprocess.
+pub struct CodexJsonRpc {
     child: Child,
     stdin: ChildStdin,
     stdout: tokio::io::Lines<BufReader<ChildStdout>>,
@@ -29,10 +28,9 @@ pub struct JsonRpcProcess {
     execution_mode: ExecutionMode,
     permission_coordinator: Arc<PermissionCoordinator>,
     event_sink: Option<BackendEventSink>,
-    terminal: super::acp::terminal::TerminalStore,
 }
 
-impl JsonRpcProcess {
+impl CodexJsonRpc {
     /// Start one provider process with isolated stdin, stdout, and stderr pipes.
     pub async fn start(
         command: &[String],
@@ -69,20 +67,7 @@ impl JsonRpcProcess {
             execution_mode,
             permission_coordinator,
             event_sink,
-            terminal: super::acp::terminal::TerminalStore::default(),
         })
-    }
-
-    /// Configure per-turn workspace, permission, and live-event state.
-    pub fn configure_request(
-        &mut self,
-        workspace: &str,
-        execution_mode: ExecutionMode,
-        event_sink: Option<BackendEventSink>,
-    ) {
-        self.workspace = workspace.to_owned();
-        self.execution_mode = execution_mode;
-        self.event_sink = event_sink;
     }
 
     /// Send one JSON-RPC notification without allocating a response identifier.
@@ -193,7 +178,6 @@ impl JsonRpcProcess {
     }
 
     async fn provider_request_result(&mut self, method: &str, message: &Value) -> Result<Value> {
-        let params = message.get("params").unwrap_or(&Value::Null);
         match method {
             "item/commandExecution/requestApproval"
             | "item/fileChange/requestApproval"
@@ -214,32 +198,6 @@ impl JsonRpcProcess {
                 "contentItems": [{ "type": "inputText", "text": "Recorded by DiffReview Harness" }],
                 "success": true
             })),
-            "session/request_permission" => {
-                let resolution = self.authorize_provider_request(method, message).await?;
-                Ok(acp_response(message, resolution))
-            }
-            "fs/read_text_file" => {
-                self.require_provider_permission(method, message).await?;
-                self.read_text_file(params)
-            }
-            "fs/write_text_file" => {
-                self.require_provider_permission(method, message).await?;
-                self.write_text_file(params)
-            }
-            "terminal/create" => {
-                self.require_provider_permission(method, message).await?;
-                let cwd = params
-                    .get("cwd")
-                    .and_then(Value::as_str)
-                    .unwrap_or(&self.workspace);
-                let cwd = provider_path(cwd, &self.workspace, true)?;
-                anyhow::ensure!(cwd.is_dir(), "ACP terminal cwd is not a directory");
-                self.terminal.create(params, cwd).await
-            }
-            "terminal/output" => self.terminal.output(params).await,
-            "terminal/wait_for_exit" => self.terminal.wait(params).await,
-            "terminal/kill" => self.terminal.kill(params).await,
-            "terminal/release" => self.terminal.release(params).await,
             _ => Ok(Value::Null),
         }
     }
@@ -266,126 +224,12 @@ impl JsonRpcProcess {
             .await?;
         Ok(resolution)
     }
-
-    async fn require_provider_permission(&mut self, method: &str, message: &Value) -> Result<()> {
-        let resolution = self.authorize_provider_request(method, message).await?;
-        anyhow::ensure!(
-            matches!(
-                resolution,
-                ApprovalResolution::AllowOnce
-                    | ApprovalResolution::AllowExact
-                    | ApprovalResolution::AllowBroad
-            ),
-            "Harness permissions denied provider request"
-        );
-        Ok(())
-    }
-
-    fn read_text_file(&self, params: &Value) -> Result<Value> {
-        let path = required_provider_path_unrestricted(params)?;
-        let content = fs::read_to_string(&path)
-            .with_context(|| format!("read ACP file {}", path.display()))?;
-        let line = params.get("line").and_then(Value::as_u64).unwrap_or(1);
-        let limit = params.get("limit").and_then(Value::as_u64);
-        Ok(json!({ "content": select_line(&content, line, limit) }))
-    }
-
-    fn write_text_file(&self, params: &Value) -> Result<Value> {
-        let path = required_provider_path_unrestricted(params)?;
-        let content = params
-            .get("content")
-            .and_then(Value::as_str)
-            .context("ACP file content is required")?;
-        fs::write(&path, content).with_context(|| format!("write ACP file {}", path.display()))?;
-        Ok(json!({}))
-    }
 }
 
-impl Drop for JsonRpcProcess {
+impl Drop for CodexJsonRpc {
     fn drop(&mut self) {
         let _ = self.child.start_kill();
     }
-}
-
-fn required_provider_path_unrestricted(params: &Value) -> Result<PathBuf> {
-    let path = params
-        .get("path")
-        .and_then(Value::as_str)
-        .context("ACP file path is required")?;
-    normalize_absolute(Path::new(path))
-}
-
-fn provider_path(path: &str, workspace: &str, allow_outside_workspace: bool) -> Result<PathBuf> {
-    let path = normalize_absolute(Path::new(path))?;
-    if allow_outside_workspace {
-        return Ok(path);
-    }
-    let workspace = fs::canonicalize(workspace)
-        .or_else(|_| normalize_absolute(Path::new(workspace)))
-        .context("resolve ACP workspace boundary")?;
-    let mut existing = path.as_path();
-    while !existing.exists() {
-        existing = existing
-            .parent()
-            .context("ACP path has no existing ancestor")?;
-    }
-    let resolved = fs::canonicalize(existing)
-        .with_context(|| format!("resolve ACP path boundary {}", existing.display()))?;
-    anyhow::ensure!(
-        path_starts_with(&resolved, &workspace),
-        "ACP path escaped the workspace: {}",
-        path.display()
-    );
-    Ok(path)
-}
-
-fn normalize_absolute(path: &Path) -> Result<PathBuf> {
-    anyhow::ensure!(
-        path.is_absolute(),
-        "ACP path must be absolute: {}",
-        path.display()
-    );
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                anyhow::ensure!(normalized.pop(), "ACP path escaped its filesystem root");
-            }
-            _ => normalized.push(component.as_os_str()),
-        }
-    }
-    Ok(normalized)
-}
-
-#[cfg(windows)]
-fn path_starts_with(path: &Path, root: &Path) -> bool {
-    let path = path
-        .to_string_lossy()
-        .replace('\\', "/")
-        .to_ascii_lowercase();
-    let root = root
-        .to_string_lossy()
-        .replace('\\', "/")
-        .to_ascii_lowercase();
-    path == root || path.starts_with(&(root + "/"))
-}
-
-#[cfg(not(windows))]
-fn path_starts_with(path: &Path, root: &Path) -> bool {
-    path.starts_with(root)
-}
-
-fn select_line(content: &str, line: u64, limit: Option<u64>) -> String {
-    let skip_count = usize::try_from(line.saturating_sub(1)).unwrap_or(usize::MAX);
-    let take_count = limit
-        .and_then(|value| usize::try_from(value).ok())
-        .unwrap_or(usize::MAX);
-    content
-        .split_inclusive('\n')
-        .skip(skip_count)
-        .take(take_count)
-        .collect()
 }
 
 #[cfg(test)]
@@ -458,9 +302,7 @@ fn normalize_event_in_workspace(
         }
         return;
     }
-    let usage_event = method_lower.contains("tokenusage")
-        || encoded.contains("\"sessionupdate\":\"usage_update\"")
-        || encoded.contains("\"session_update\":\"usage_update\"");
+    let usage_event = method_lower.contains("tokenusage");
     if let Some(native_compact) = available_compact_update(&params) {
         output.metrics.native_compact_update = Some(native_compact);
     }
@@ -489,21 +331,13 @@ fn normalize_event_in_workspace(
     let tool_event = method_lower.contains("tool")
         || method_lower.contains("commandexecution")
         || method_lower.contains("filechange")
-        || encoded.contains("\"tool_call\"")
-        || encoded.contains("\"tool_call_update\"")
         || encoded.contains("\"command_execution\"")
         || encoded.contains("\"type\":\"commandexecution\"")
         || encoded.contains("\"type\":\"dynamictoolcall\"")
         || encoded.contains("\"type\":\"filechange\"");
-    let plan_event = method_lower.contains("plan")
-        || encoded.contains("\"sessionupdate\":\"plan\"")
-        || encoded.contains("\"session_update\":\"plan\"");
-    let reasoning_event = method_lower.contains("reason")
-        || encoded.contains("\"agent_thought_chunk\"")
-        || encoded.contains("\"thought\"");
-    let assistant_event = method_lower.contains("agentmessage")
-        || encoded.contains("\"sessionupdate\":\"agent_message_chunk\"")
-        || encoded.contains("\"session_update\":\"agent_message_chunk\"");
+    let plan_event = method_lower.contains("plan");
+    let reasoning_event = method_lower.contains("reason") || encoded.contains("\"thought\"");
+    let assistant_event = method_lower.contains("agentmessage");
     let error_event = method_lower.contains("error") || encoded.contains("\"type\":\"error\"");
     let kind = if error_event {
         "error"
@@ -527,6 +361,25 @@ fn normalize_event_in_workspace(
     }
     if tool_event && control_tool == Some("harness_plan_question") {
         output.plan_question = find_plan_question(&params);
+        if output.plan_question.is_none() {
+            output.control_error = Some("harness_plan_question received invalid arguments".into());
+        }
+    }
+    if tool_event && control_tool == Some("harness_question_answer") {
+        output.question_answer = find_control_arguments(&params, "harness_question_answer")
+            .and_then(|arguments| serde_json::from_value(arguments).ok());
+        if output.question_answer.is_none() {
+            output.control_error =
+                Some("harness_question_answer received invalid arguments".into());
+        }
+    }
+    if tool_event && control_tool == Some("harness_question_withdraw") {
+        output.question_withdrawal = find_control_arguments(&params, "harness_question_withdraw")
+            .and_then(|arguments| serde_json::from_value(arguments).ok());
+        if output.question_withdrawal.is_none() {
+            output.control_error =
+                Some("harness_question_withdraw received invalid arguments".into());
+        }
     }
     if tool_event && control_tool == Some("harness_goal_complete") {
         output.evidence.structured_complete = true;
@@ -767,7 +620,7 @@ fn context_usage(params: &Value) -> Option<ContextUsage> {
     let update = params.get("update").unwrap_or(params);
     let used = update.get("used").and_then(Value::as_u64)?;
     let size = update.get("size").and_then(Value::as_u64)?;
-    ContextUsage::acp(used, size)
+    ContextUsage::reported(used, size)
 }
 
 fn available_compact_update(params: &Value) -> Option<bool> {
@@ -829,6 +682,8 @@ fn control_tool_name(value: &Value) -> Option<&str> {
                         name,
                         "harness_plan_submit"
                             | "harness_plan_question"
+                            | "harness_question_answer"
+                            | "harness_question_withdraw"
                             | "harness_goal_complete"
                             | "harness_goal_blocked"
                             | "harness_goal_status"
@@ -865,6 +720,32 @@ fn find_plan_question(value: &Value) -> Option<PlanQuestionSet> {
     match value {
         Value::Array(item) => item.iter().find_map(find_plan_question),
         Value::Object(map) => map.values().find_map(find_plan_question),
+        _ => None,
+    }
+}
+
+fn find_control_arguments(value: &Value, control_name: &str) -> Option<Value> {
+    if value
+        .get("tool")
+        .or_else(|| value.get("name"))
+        .or_else(|| value.get("toolName"))
+        .or_else(|| value.get("tool_name"))
+        .and_then(Value::as_str)
+        == Some(control_name)
+        && let Some(arguments) = value.get("arguments")
+    {
+        if let Some(arguments) = arguments.as_str() {
+            return serde_json::from_str(arguments).ok();
+        }
+        return Some(arguments.clone());
+    }
+    match value {
+        Value::Array(item) => item
+            .iter()
+            .find_map(|item| find_control_arguments(item, control_name)),
+        Value::Object(map) => map
+            .values()
+            .find_map(|item| find_control_arguments(item, control_name)),
         _ => None,
     }
 }
@@ -1048,8 +929,6 @@ fn normalize_tool_activity(method: &str, params: &Value, workspace: &str) -> Opt
         .to_owned();
     let item_type = item
         .get("type")
-        .or_else(|| envelope.get("sessionUpdate"))
-        .or_else(|| envelope.get("session_update"))
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_ascii_lowercase();
@@ -1341,41 +1220,6 @@ mod test {
     use super::*;
 
     #[test]
-    fn provider_paths_preserve_the_workspace_boundary() {
-        let root = tempfile::tempdir().unwrap();
-        let workspace = root.path().join("work");
-        let sibling = root.path().join("work-other");
-        fs::create_dir_all(workspace.join("src")).unwrap();
-        fs::create_dir_all(&sibling).unwrap();
-        let workspace = workspace.to_string_lossy().into_owned();
-        assert!(
-            provider_path(
-                Path::new(&workspace)
-                    .join("new/file.txt")
-                    .to_string_lossy()
-                    .as_ref(),
-                &workspace,
-                false
-            )
-            .is_ok()
-        );
-        assert!(
-            provider_path(
-                sibling.join("file.txt").to_string_lossy().as_ref(),
-                &workspace,
-                false
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn selects_acp_file_lines_without_rewriting_line_endings() {
-        assert_eq!(select_line("one\r\ntwo\r\nthree", 2, Some(1)), "two\r\n");
-        assert_eq!(select_line("one\ntwo", 3, None), "");
-    }
-
-    #[test]
     fn extracts_complete_plan_from_dynamic_tool_arguments() {
         let value = json!({
             "tool": "harness_plan_submit",
@@ -1418,6 +1262,50 @@ mod test {
     }
 
     #[test]
+    fn extracts_answer_and_withdrawal_without_rendering_control_tools() {
+        let mut answer_output = BackendOutput::default();
+        normalize_event(
+            &json!({
+                "method": "item/completed",
+                "params": { "item": {
+                    "type": "dynamicToolCall",
+                    "tool": "harness_question_answer",
+                    "arguments": {
+                        "question_id": "migration",
+                        "response": { "kind": "selected", "option": "Staged" }
+                    }
+                } }
+            }),
+            &mut answer_output,
+            None,
+        );
+        let answer = answer_output
+            .question_answer
+            .expect("structured question answer");
+        assert_eq!(answer.question_id, "migration");
+        assert!(answer_output.event.is_empty());
+
+        let mut withdrawal_output = BackendOutput::default();
+        normalize_event(
+            &json!({
+                "method": "item/completed",
+                "params": { "item": {
+                    "type": "dynamicToolCall",
+                    "tool": "harness_question_withdraw",
+                    "arguments": { "reason": "Repository policy determines the choice." }
+                } }
+            }),
+            &mut withdrawal_output,
+            None,
+        );
+        assert_eq!(
+            withdrawal_output.question_withdrawal.unwrap().reason,
+            "Repository policy determines the choice."
+        );
+        assert!(withdrawal_output.event.is_empty());
+    }
+
+    #[test]
     fn replaces_task_state_across_lifecycle_events_without_creating_an_artifact() {
         let mut output = BackendOutput::default();
         normalize_event(
@@ -1442,29 +1330,6 @@ mod test {
         assert!(update.complete);
         assert_eq!(update.entry_list.len(), 1);
         assert_eq!(update.entry_list[0].content, "Inspect the change");
-    }
-
-    #[test]
-    fn extracts_stable_acp_plan_entries() {
-        let mut output = BackendOutput::default();
-        normalize_event(
-            &json!({
-                "method": "session/update",
-                "params": {
-                    "sessionUpdate": "plan",
-                    "entries": [
-                        { "content": "Inspect the change", "status": "completed" },
-                        { "content": "Apply the fix", "status": "in_progress" }
-                    ]
-                }
-            }),
-            &mut output,
-            None,
-        );
-        assert!(output.plan_markdown.is_none());
-        let update = output.event[0].task_update.as_ref().unwrap();
-        assert_eq!(update.entry_list[0].status, TaskStatus::Completed);
-        assert_eq!(update.entry_list[1].status, TaskStatus::InProgress);
     }
 
     #[test]
@@ -1803,50 +1668,6 @@ mod test {
     }
 
     #[test]
-    fn correlates_acp_tool_call_updates_into_one_activity() {
-        let mut output = BackendOutput::default();
-        normalize_event(
-            &json!({
-                "method": "session/update",
-                "params": {
-                    "update": {
-                        "sessionUpdate": "tool_call",
-                        "toolCallId": "tool-1",
-                        "title": "Read README.md",
-                        "status": "in_progress"
-                    }
-                }
-            }),
-            &mut output,
-            None,
-        );
-        normalize_event(
-            &json!({
-                "method": "session/update",
-                "params": {
-                    "update": {
-                        "sessionUpdate": "tool_call_update",
-                        "toolCallId": "tool-1",
-                        "status": "completed",
-                        "content": [{
-                            "type": "content",
-                            "content": { "type": "text", "text": "# Harness" }
-                        }]
-                    }
-                }
-            }),
-            &mut output,
-            None,
-        );
-
-        assert_eq!(output.event.len(), 1);
-        let activity = output.event[0].activity.as_ref().unwrap();
-        assert_eq!(activity.title, "Read README.md");
-        assert_eq!(activity.output.as_deref(), Some("# Harness"));
-        assert_eq!(activity.status.as_deref(), Some("completed"));
-    }
-
-    #[test]
     fn compacts_multiline_command_titles_for_one_line_previews() {
         assert_eq!(
             compact_tool_title("pwsh -Command\n  Get-Content README.md\r\n").as_deref(),
@@ -1891,52 +1712,6 @@ mod test {
         );
         assert_eq!(output.event.len(), 1);
         assert_eq!(output.event[0].kind, "context_usage");
-    }
-
-    #[test]
-    fn records_acp_context_and_native_compaction_capability() {
-        let mut output = BackendOutput::default();
-        normalize_event(
-            &json!({
-                "method": "session/update",
-                "params": {
-                    "sessionId": "session-1",
-                    "update": {
-                        "sessionUpdate": "usage_update",
-                        "used": 156000,
-                        "size": 200000
-                    }
-                }
-            }),
-            &mut output,
-            None,
-        );
-        normalize_event(
-            &json!({
-                "method": "session/update",
-                "params": {
-                    "sessionId": "session-1",
-                    "update": {
-                        "sessionUpdate": "available_commands_update",
-                        "availableCommands": [
-                            { "name": "compact", "description": "Compact context" }
-                        ]
-                    }
-                }
-            }),
-            &mut output,
-            None,
-        );
-
-        assert_eq!(
-            output.metrics.context_usage,
-            Some(ContextUsage {
-                used: 156000,
-                size: 200000,
-                remaining_percent: 22,
-            })
-        );
-        assert_eq!(output.metrics.native_compact_update, Some(true));
     }
 
     #[test]

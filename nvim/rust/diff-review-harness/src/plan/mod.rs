@@ -48,6 +48,7 @@ pub struct PlanRecord {
 pub enum PlanLifecycleKind {
     QuestionAsked,
     QuestionAnswered,
+    QuestionWithdrawn,
     Created,
     ChangesRequested,
     RevisionCreated,
@@ -121,6 +122,12 @@ pub enum PlanQuestionResponse {
 pub struct PlanQuestionAnswer {
     pub question_id: String,
     pub response: PlanQuestionResponse,
+}
+
+/// Represents one model-reported reason that no pending user decision remains.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PlanQuestionWithdrawal {
+    pub reason: String,
 }
 
 /// Tracks an unresolved planning decision set across answers and clarification turns.
@@ -213,6 +220,17 @@ impl PlanElicitation {
             })
             .unwrap_or(self.question_set.questions.len());
         self.clarification_active = false;
+        Ok(())
+    }
+
+    /// Commit an explicit conversational answer and reopen presentation at the next decision.
+    pub fn answer_from_model(
+        &mut self,
+        question_id: &str,
+        response: PlanQuestionResponse,
+    ) -> Result<()> {
+        self.answer(question_id, response)?;
+        self.revision = self.revision.saturating_add(1);
         Ok(())
     }
 
@@ -725,5 +743,33 @@ mod test {
         assert_eq!(elicitation.answer[0].question_id, "kept");
         assert_eq!(elicitation.current_question().unwrap().id, "invalid");
         assert!(!elicitation.clarification_active);
+    }
+
+    #[test]
+    fn model_answer_advances_and_revises_elicitation_presentation() {
+        let mut elicitation = PlanElicitation::new(PlanQuestionSet {
+            id: "set".into(),
+            questions: vec![PlanQuestion {
+                id: "migration".into(),
+                header: "Migration".into(),
+                question: "Which migration?".into(),
+                options: vec![PlanQuestionOption {
+                    label: "Staged".into(),
+                    description: "Preserve compatibility.".into(),
+                }],
+                allow_freeform: true,
+            }],
+        });
+        elicitation
+            .answer_from_model(
+                "migration",
+                PlanQuestionResponse::Selected {
+                    option: "Staged".into(),
+                    feedback: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(elicitation.revision, 2);
+        assert!(elicitation.current_question().is_none());
     }
 }

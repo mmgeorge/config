@@ -149,7 +149,7 @@ diff_review/
 │   ├── builder.lua            Shared Rust-sidecar builder instance; launches versioned cache deployments, never Cargo output
 │   ├── client.lua             Long-lived JSONL process, request correlation, events, generation guards
 │   ├── protocol.lua           JSONL request/message codec
-│   └── backends/              Lua launch descriptors only: ACP, Codex app-server, and test mock
+│   └── backends/              Lua launch descriptors only: Codex app-server, Copilot SDK, and test mock
 │
 ├── infra/                    Cross-cutting leaves
 │   ├── config.lua             Config schema + defaults + setup merge (keymaps, perf, lookup mode)
@@ -885,7 +885,7 @@ press the commit key
 :Harness → multiline composer → /plan <request>
   └─ harness/client JSONL request → Rust broker
        ├─ force READ and capture interaction checkpoint-before
-       ├─ ACP or Codex strategy runs one planning turn
+       ├─ selected Backend implementation runs one planning turn
        ├─ harness_plan_question → durable PlanElicitation → bottom-anchored shared picker
        │    ├─ answers, notes, Other, and clarification turns preserve AwaitingInput
        │    └─ reviewed y confirmation serializes the decisions and resumes the planning contract
@@ -925,9 +925,11 @@ backend turn completes
 
 The feature-first Rust crate lives at `nvim/rust/diff-review-harness`. Its directories
 name capabilities rather than layers: `broker`, `session`, `plan`, `goal`, `interaction`, `timeline`,
-`checkpoint`, `backend`, `storage`, `workspace`, `protocol`, and `control_tools`. The backend
-directory owns ACP and Codex transports plus the shared active-turn steering lane. Consumer-owned
-traits stay beside the feature that consumes them.
+`checkpoint`, `backend`, `storage`, `workspace`, `protocol`, and `control_tools`. `Backend` defines
+the complete provider contract once, while `CodexBackend` and `CopilotBackend` own their private
+transports and expose capability values that drive broker and editor behavior. `CodexJsonRpc`
+remains private to the Codex implementation. `CopilotEventDecoder` remains private to the native
+Copilot SDK implementation. Consumer-owned traits stay beside the feature that consumes them.
 
 The broker runs once per Neovim process over JSONL stdio. Provider events cross a live
 channel into `TimelineReducer`, which owns one active thought inside the current `MainSegment`.
@@ -954,7 +956,7 @@ submitted `prompt.submit` remains retractable only while the provider has produc
 message, tool activity, task update, or workspace delta. Context usage and reasoning status alone
 do not consume that eligibility. Codex maps an eligible retraction to app-server
 `thread/rollback`, the broker deletes the provisional interaction and restores pre-submit plan or
-goal control state, and Lua returns the exact prompt to HarnessInput. ACP advertises no turn
+goal control state, and Lua returns the exact prompt to HarnessInput. Copilot advertises no turn
 rollback capability, so it always follows ordinary cancellation. Once visible activity or a file
 change occurs, the broker finalizes partial timeline state and persists the interaction as
 cancelled. This split prevents the composer from presenting text that still exists in provider
@@ -971,9 +973,10 @@ and moves its text into the follow-up queue. The shared
 steering lane activates before transport startup, so input submitted during connection or
 `turn/start` setup waits for that same turn. Codex releases the buffered input only after the
 matching `turn/started` notification because the earlier `turn/start` response allocates an ID
-before the provider installs the active turn. Prompt mode does not gate the lane. Chat, `/plan`,
-goals, and accepted-plan execution therefore share one steering contract. ACP advertises steering
-as unavailable because ACP v1 provides no equivalent request.
+before the provider installs the active turn. Copilot maps the same lane to the SDK's immediate
+delivery mode on its active session, then publishes the canonical acknowledgement through a
+turn-scoped event sink only after the SDK accepts the message. Prompt mode does not gate the lane. Chat, `/plan`, goals, and
+accepted-plan execution therefore share one steering contract.
 
 The broker keeps an active dispatch response pending until every admitted steering request reaches
 a terminal result. If the provider turn completes first, the backend rejects the unacknowledged
@@ -1036,7 +1039,12 @@ It rebuilds native folds only when fold topology changes, which prevents timer-d
 frames from repeatedly closing and reopening unchanged folds.
 Active thoughts never expose expansion keys. Completed nodes stay immutable, so an expanded
 command or diff never changes while the user reads it.
-Elapsed work appears only in the mutable `Thinking for Ns` header and never enters SQLite.
+Prompt submission creates one optimistic main segment before transport dispatch, so the first
+render already contains `Thinking for 0s`. Broker admission preserves that segment until the first
+real timeline node atomically replaces it. The presentation layer measures elapsed work from the
+local submit clock and retains that duration through completion and same-session snapshot
+reconciliation, preventing a shorter provider duration from moving the visible clock backward.
+This presentation timing never enters SQLite.
 
 Each stored session uses one versioned envelope. Session loading and listing accept only the exact
 current format, leaving older rows invisible without migration or partial decoding. Runtime code
@@ -1086,36 +1094,37 @@ Repository-independent prompt history stays ordered newest first and pruned tran
 an empty composer, repeated Up walks backward, and Down returns toward the draft. Transcript
 prompt jumps remain separate commands, so input recall cannot move the review cursor.
 
-ACP uses the official Rust SDK dependency and a negotiated JSON-RPC driver. One ACP agent
-process stays attached across turns, so agents without optional `session/load` still retain
-conversation state during the Neovim run. Restoring those sessions after a broker restart
-requires the agent to advertise `loadSession`. The ACP client
-implements the filesystem and complete terminal lifecycle it advertises, retains bounded
-UTF-8 output, validates paths against the workspace, and maps published model and thought
-config options onto Harness model/effort settings. `/plan` does not select an ACP plan or
-architect mode. Harness sends the same read-only planning contract through ACP and Codex, and
+`CopilotBackend` embeds the official GitHub Copilot Rust SDK and retains one native `Client` plus
+one resumable SDK `Session`. The SDK owns CLI startup and authentication when the launch command
+stays empty. An explicit command remains available for development and pinned installations.
+The backend subscribes before every send, forwards deltas immediately, and lets
+`CopilotEventDecoder` normalize messages, reasoning, tool lifecycle, usage, tasks, and subagent
+events into the same broker model as Codex. `/plan` does not select a provider-native plan mode.
+Harness sends the same read-only planning contract through both backends, and
 `harness_plan_question` pauses either backend on one to three structured decisions while
-`harness_plan_submit` alone creates a review artifact. ACP receives the question tool through
-the Harness control MCP and Codex receives the same schema as a dynamic tool. An agent that
-ends with an ordinary text question degrades into one free-form decision instead of failing.
+`harness_plan_submit` alone creates a review artifact. `ControlToolRegistry` owns every Harness
+tool schema once, then Codex projects it into app-server dynamic tools while Copilot projects it
+into SDK `Tool` handlers. An agent that ends with an ordinary text question degrades into one
+free-form decision instead of failing.
 The question tool also works during ordinary chat, goal, and execution turns. Those questions
 persist on their owning `InteractionRecord`, while planning questions remain on `PlanRecord`.
 `BrokerSnapshot.active_elicitation` projects either owner through one question UI contract, so
 answer, skip, Ask, and continue reuse the shared bottom picker without creating a plan artifact.
-Ordinary prose never counts as a submitted question set.
-Stable ACP `entries` updates and Codex
+Ordinary prose never counts as a submitted question set. Copilot `session.todos_changed` and Codex
 `turn/plan/updated` events feed the generic task tracker without submitting a plan. Names printed
 in prose or command output never count as control calls. Codex uses its app-server protocol
 directly, including `model/list`, dynamic Harness control tools, `thread/goal/set`, and
-`thread/fork`, but it does not set `collaborationMode` for Harness planning. Native fork enters
-the command set only after the backend advertises it. No transcript-copy fallback exists.
+`thread/fork`, but it does not set `collaborationMode` for Harness planning. Copilot uses the SDK
+model catalog, native permission callbacks, immediate steering, cancellation, and streamed
+subagent observation. Native fork enters the command set only after the backend advertises it.
+No transcript-copy fallback exists.
 
 Provider token-usage notifications normalize into durable `ContextUsage` session state. The
 Harness winbar renders the remaining percentage and total window at its right edge without
-adding timeline entries. Codex uses app-server `thread/compact/start` for `/compact`. ACP exposes
-the command only when `available_commands_update` advertises `compact`, then routes the command
-through the active ACP session. Compaction never creates a user interaction, and unsupported
-backends omit the command instead of receiving a synthetic summarization prompt.
+adding timeline entries. Codex uses app-server `thread/compact/start` for `/compact`. Copilot's
+SDK compacts automatically but exposes no manual compaction request, so its capability omits
+`/compact`. Compaction never creates a user interaction, and unsupported backends omit the command
+instead of receiving a synthetic summarization prompt.
 
 `/plan` emits `Planning` and `Planned` interaction summaries. A question-only turn becomes
 `Planning paused`, saves `PlanElicitation` under the active `AwaitingInput` plan, renders its
@@ -1144,11 +1153,21 @@ including feedback and Other text, so each answer can be inspected or replaced b
 The main question float never maps Ctrl-s and cannot bypass this review boundary.
 
 Answer and skip requests update only the durable elicitation record. Ask and subsequent ordinary
-Harness prompts run read-only clarification interactions while leaving the same question active.
+Harness prompts run read-only follow-up interactions against a mutable decision set. The provider
+must preserve the set without a control call when it remains valid, may replace the complete set
+through `harness_plan_question`, may record only an explicit user answer through
+`harness_question_answer`, and may remove the boundary through `harness_question_withdraw` only
+when user direction or repository evidence proves that no material decision remains. A model
+recommendation never qualifies as an answer.
 Closing the float leaves a Timeline Status reading `Waiting for input (press oe)`. Clarification
 chat can continue without reopening that unchanged question set, while `oe` or `/questions`
 restores it explicitly. A provider replacement increments the elicitation revision, preserves only
-answers that remain valid against the new schema, and presents the revised questions once. The
+answers that remain valid against the new schema, and presents the revised questions once. A
+conversational answer also increments the elicitation revision so the next unresolved decision
+reopens. Withdrawing an ordinary question clears its status after the response. Withdrawing a
+planning question records `Question withdrawn: <reason>` in plan history and starts a new planning
+turn automatically. Failed planning continuation restores the original elicitation and removes the
+provisional withdrawal lifecycle, preserving the review boundary. The
 status takes precedence over a concurrent subagent wait because user input blocks provider
 continuation. The broker serializes missing answers as intentional best-judgment decisions only
 when the user explicitly continues. A provisional `QuestionAnswered` lifecycle record is removed if that
@@ -1171,15 +1190,11 @@ Superseded tasks appear only when their owning summary expands. Provider tasks s
 never decide goal completion. The structured goal tool, the 20-turn limit, and the two-turn
 no-progress guard remain the execution authority.
 
-Harness defaults to the direct Codex app-server backend. The ACP launch descriptor runs
-`copilot --acp` when `harness.backend = "acp"`. Override
-`harness.backends.acp.command` to use another ACP agent without changing the broker or views.
-Copilot ACP currently omits model selection from `configOptions`, so Harness leaves the
-provider default untouched. If Copilot rejects that configured model while creating the
-initial conversation, the ACP adapter restarts the process and retries once with a fresh
-session. Established sessions retain their context and fail with actionable guidance rather
-than being replaced. A second initial rejection also tells the user to choose a supported
-model in Copilot instead of retrying indefinitely.
+Harness defaults to the direct Codex app-server backend. Set `harness.backend = "copilot"` to use
+the native Copilot SDK. An empty `harness.backends.copilot.command` delegates CLI discovery and
+startup to the SDK. A nonempty command selects an explicit Copilot CLI executable and prefix
+arguments. Persisted provider session IDs resume through the same backend, and backend mismatches
+remain invalid session transitions.
 
 The Rust `PermissionStore` loads one validated Rulesync-shaped document from
 `stdpath("config")/diff_review/permissions.json`, compiles command and resource matchers once, and
@@ -1201,11 +1216,12 @@ and cancellation never change it. `Shift-Tab` cycles the four modes through
 `:Permissions` uses an `acwrite` JSON buffer, so invalid documents never replace the compiled policy.
 Non-Git modes that permit writes retain the checkpoint warning and confirmation path.
 
-`CodexSecurity` projects every thread and turn through the same native policy. Read selects a
+`CodexSecurity` projects every Codex thread and turn through the same native policy. Read selects a
 read-only profile with network access, Write adds workspace-root writes, Full selects unrestricted
 filesystem access with on-request approvals, and YOLO selects unrestricted access with native
-approval bypass. ACP retains its existing best-effort Read and Write behavior. Provider-private
-operations that emit no client approval request remain outside the protocol boundary.
+approval bypass. Copilot routes SDK permission callbacks through the same `PermissionCoordinator`,
+including shell, read, write, URL, MCP, custom-tool, memory, and hook requests. Provider-private
+operations that emit no client approval request remain outside the Harness policy boundary.
 
 The global Rulesync config omits the `permissions` feature only for `codexcli`. Codex therefore
 cannot apply a generated exec-policy denial before Harness evaluates the request. Direct Codex CLI
@@ -1217,10 +1233,10 @@ winbar so the split presents session identity once. The transcript winbar begins
 with the active execution mode, omits the redundant Harness title, and then
 displays the underlying provider executable and resolved runtime model.
 Codex resolves the configured `default` sentinel through the `isDefault` entry from
-`model/list`, then caches and persists that model on the Harness session. ACP identifies
-the launch command, such as `Copilot CLI (ACP)`, and displays a model only when the agent
-publishes one through session configuration. Before resolution, the winbar says
-`resolving model` instead of presenting `default` as though it were a real model ID.
+`model/list`, then caches and persists that model on the Harness session. Copilot maps the SDK
+model catalog into the same picker and applies supported reasoning effort when it creates,
+resumes, or reconfigures the active session. Before resolution, the winbar says `resolving model`
+instead of presenting `default` as though it were a real model ID.
 
 `/rename <name>` routes directly to the broker's durable `session.rename` request rather
 than entering the model transcript. `/rename` clears the optional display name. The
@@ -1274,19 +1290,20 @@ the node reveals its immutable thought and response timeline. Provider-nested ch
 `parent_thread_id`, preserving the actual hierarchy instead of flattening every run beside the parent.
 Selecting a child changes
 both the rendered timeline and composer target. Codex child prompts use the reported thread id,
-while steering and interruption target its active turn id. ACP advertises no agent capability and
-therefore hides the command rather than simulating children from transcript prose.
+while steering and interruption target its active turn id. Copilot exposes streamed child
+lifecycle and timeline observation, but it omits a Harness-owned catalog and direct child control.
+The picker therefore shows observed Copilot children without advertising unsupported spawn or
+interrupt actions.
 
 ### Deferred Harness work
 
 - Add task-level diff annotations and feedback cycles now that stable task identity and shared
   diff rendering exist in the timeline.
-- Harden ACP write enforcement as the protocol grows guarantees for provider-private tools.
 - Audit provider-local hooks and command policies that can still reject a tool under Harness
   WRITE, because backend-native policy layers remain authoritative outside the Harness protocol.
 - Move the per-Neovim broker to a shared daemon only if cross-editor live control becomes
   valuable enough to justify process discovery and stronger lease coordination.
-- Add provider strategies after ACP and Codex prove the backend contract. Do not scrape PTYs.
+- Add provider strategies only through the typed `Backend` contract. Do not scrape PTYs.
 
 ---
 
@@ -1328,7 +1345,7 @@ The Rust suite runs with `cargo test --manifest-path
 nvim/rust/diff-review-harness/Cargo.toml`. It isolates plan revisions, goal guards,
 SQLite current-version session filters, leases, ordered provider file-change attribution,
 Gitignored interaction boundaries, divergence refusal, unborn Git worktrees,
-failed-provider goal pausing with final checkpoints, ACP plan normalization,
+failed-provider goal pausing with final checkpoints, provider task normalization,
 exact control tools, backend/session compatibility, output-free cancellation retraction,
 visible-output and workspace-change retraction guards, and worktree-only rollback. The ignored
 `tests/codex_cli.rs` integration uses the installed
@@ -1338,10 +1355,11 @@ Run it explicitly with `cargo test --manifest-path nvim/rust/diff-review-harness
 before plan acceptance, execution, structured goal completion, resume, and native fork without
 touching this dotfiles worktree.
 
-The ignored `tests/copilot_acp.rs` integration launches the configured
-`copilot --acp` command in a temporary repository and submits the basic read-only
-"What is this repo?" prompt. Run it explicitly with `cargo test --manifest-path
-nvim/rust/diff-review-harness/Cargo.toml --test copilot_acp -- --ignored --nocapture`.
+The ignored `tests/copilot_real.rs` integration starts the native Copilot SDK in a temporary Git
+repository, discovers the authenticated model catalog, chooses a small or fast model when
+available, and streams one exact read-only response through the complete broker. Run it explicitly
+with `cargo test --manifest-path nvim/rust/diff-review-harness/Cargo.toml --test copilot_real --
+--ignored --nocapture`.
 
 After automated tests, use Terminal MCP to open `:Harness`, PlanReview, and `:Interactions`, then
 exercise `/sessions` at both 160x48 and 100x30. Inspect fuzzy filtering, preview replacement,

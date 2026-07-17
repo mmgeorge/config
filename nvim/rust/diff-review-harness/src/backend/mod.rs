@@ -1,14 +1,12 @@
-pub mod acp;
 pub mod approval;
 pub mod codex;
-mod json_rpc;
-mod process;
+pub mod copilot;
 mod steering;
 pub use steering::SteerTarget;
 
 use crate::agent::AgentCapability;
 use crate::goal::TurnEvidence;
-use crate::plan::PlanQuestionSet;
+use crate::plan::{PlanQuestionAnswer, PlanQuestionSet, PlanQuestionWithdrawal};
 use crate::session::{ContextUsage, ExecutionMode};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -16,6 +14,35 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
+
+/// Identifies one supported provider implementation without leaking launch strings across consumers.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendKind {
+    Codex,
+    Copilot,
+    Mock,
+}
+
+impl BackendKind {
+    /// Parse one persisted backend name into the supported provider set.
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "codex" => Ok(Self::Codex),
+            "copilot" => Ok(Self::Copilot),
+            "mock" => Ok(Self::Mock),
+            _ => anyhow::bail!("unsupported Harness backend: {value}"),
+        }
+    }
+}
+
+/// Describes provider identity and capability for broker and editor consumers.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct BackendDescriptor {
+    pub kind: BackendKind,
+    pub label: String,
+    pub capability: BackendCapability,
+}
 
 /// Represents backend features that control visible Harness actions.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -27,6 +54,7 @@ pub struct BackendCapability {
     pub native_goal: bool,
     pub model_selection: bool,
     pub effort_selection: bool,
+    pub fast_mode: bool,
     pub permission_control: bool,
     #[serde(default)]
     pub execution_mode_list: Vec<ExecutionMode>,
@@ -76,6 +104,20 @@ pub struct BackendEvent {
     pub summary: Option<TurnSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_update: Option<ProviderTaskUpdate>,
+}
+
+impl BackendEvent {
+    /// Build the canonical event for provider-acknowledged active-turn input.
+    pub(crate) fn steering_input(text: String) -> Self {
+        Self {
+            kind: "steering_input".into(),
+            text: Some(text),
+            data: Value::Null,
+            activity: None,
+            summary: None,
+            task_update: None,
+        }
+    }
 }
 
 /// Represents one complete provider task replacement.
@@ -188,6 +230,9 @@ pub struct BackendOutput {
     pub event: Vec<BackendEvent>,
     pub plan_markdown: Option<String>,
     pub plan_question: Option<PlanQuestionSet>,
+    pub question_answer: Option<PlanQuestionAnswer>,
+    pub question_withdrawal: Option<PlanQuestionWithdrawal>,
+    pub control_error: Option<String>,
     pub evidence: TurnEvidence,
     pub capability: BackendCapability,
     pub runtime: BackendRuntime,
@@ -225,6 +270,15 @@ pub struct BackendModel {
 /// Defines the prompt, fork, and capability operations consumed by the broker.
 #[async_trait]
 pub trait Backend: Send + Sync {
+    /// Return stable provider identity and capability without starting a provider process.
+    fn descriptor(&self) -> BackendDescriptor {
+        BackendDescriptor {
+            kind: BackendKind::Mock,
+            label: "Mock CLI".into(),
+            capability: mock_capability(),
+        }
+    }
+
     /// Run one prompt and normalize provider events into Harness events.
     async fn prompt(&self, request: BackendRequest) -> Result<BackendOutput> {
         self.prompt_stream(request, None).await
@@ -238,7 +292,9 @@ pub trait Backend: Send + Sync {
     ) -> Result<BackendOutput>;
 
     /// Fork a provider session only when the provider advertises native support.
-    async fn fork(&self, request: BackendRequest) -> Result<String>;
+    async fn fork(&self, _request: BackendRequest) -> Result<String> {
+        anyhow::bail!("backend does not support session fork")
+    }
 
     /// List provider models for the Harness model picker.
     async fn model_list(&self, _request: BackendRequest) -> Result<Vec<BackendModel>> {
@@ -291,18 +347,20 @@ pub fn build(
     launch: BackendLaunch,
     permission_coordinator: std::sync::Arc<approval::PermissionCoordinator>,
 ) -> Result<Box<dyn Backend>> {
-    match launch.kind.as_str() {
-        "acp" => Ok(Box::new(acp::AcpBackend::new_with_permission_coordinator(
-            launch.command,
-            permission_coordinator,
-        )?)),
-        "codex" => Ok(Box::new(
+    match BackendKind::parse(&launch.kind)? {
+        BackendKind::Codex => Ok(Box::new(
             codex::CodexBackend::new_with_permission_coordinator(
                 launch.command,
                 permission_coordinator,
             )?,
         )),
-        "mock" => Ok(Box::new(MockBackend {
+        BackendKind::Copilot => Ok(Box::new(
+            copilot::CopilotBackend::new_with_permission_coordinator(
+                launch.command,
+                permission_coordinator,
+            )?,
+        )),
+        BackendKind::Mock => Ok(Box::new(MockBackend {
             delay: match launch.command.first().map(String::as_str) {
                 Some("blocking" | "visible-blocking" | "writing-blocking") => {
                     Some(Duration::from_secs(60))
@@ -320,7 +378,6 @@ pub fn build(
                 .is_some_and(|value| value == "writing-blocking"),
             steering: steering::SteeringLane::default(),
         })),
-        kind => anyhow::bail!("unsupported Harness backend: {kind}"),
     }
 }
 
@@ -333,6 +390,14 @@ struct MockBackend {
 
 #[async_trait]
 impl Backend for MockBackend {
+    fn descriptor(&self) -> BackendDescriptor {
+        BackendDescriptor {
+            kind: BackendKind::Mock,
+            label: "Mock CLI".into(),
+            capability: mock_capability(),
+        }
+    }
+
     async fn prompt_stream(
         &self,
         request: BackendRequest,
@@ -399,28 +464,15 @@ impl Backend for MockBackend {
             event: vec![event],
             plan_markdown,
             plan_question: None,
+            question_answer: None,
+            question_withdrawal: None,
+            control_error: None,
             evidence: TurnEvidence {
                 tool_called: request.execution_mode.permits_workspace_write(),
                 structured_complete: matches!(request.mode, PromptMode::GoalContinuation),
                 ..TurnEvidence::default()
             },
-            capability: BackendCapability {
-                native_fork: true,
-                native_compact: true,
-                native_steer: true,
-                native_turn_rollback: true,
-                native_goal: true,
-                model_selection: true,
-                effort_selection: true,
-                permission_control: true,
-                execution_mode_list: vec![
-                    ExecutionMode::Read,
-                    ExecutionMode::Write,
-                    ExecutionMode::Full,
-                    ExecutionMode::Yolo,
-                ],
-                agent: AgentCapability::default(),
-            },
+            capability: mock_capability(),
             runtime: BackendRuntime {
                 provider: "Mock backend".into(),
                 model: Some(request.model),
@@ -450,29 +502,13 @@ impl Backend for MockBackend {
     async fn compact(&self, request: BackendRequest) -> Result<BackendOutput> {
         Ok(BackendOutput {
             backend_session_id: request.backend_session_id,
-            capability: BackendCapability {
-                native_fork: true,
-                native_compact: true,
-                native_steer: true,
-                native_turn_rollback: true,
-                native_goal: true,
-                model_selection: true,
-                effort_selection: true,
-                permission_control: true,
-                execution_mode_list: vec![
-                    ExecutionMode::Read,
-                    ExecutionMode::Write,
-                    ExecutionMode::Full,
-                    ExecutionMode::Yolo,
-                ],
-                agent: AgentCapability::default(),
-            },
+            capability: mock_capability(),
             runtime: BackendRuntime {
                 provider: "Mock backend".into(),
                 model: Some(request.model),
             },
             metrics: TurnMetrics {
-                context_usage: ContextUsage::acp(20_000, 100_000),
+                context_usage: ContextUsage::reported(20_000, 100_000),
                 ..TurnMetrics::default()
             },
             ..BackendOutput::default()
@@ -486,6 +522,27 @@ impl Backend for MockBackend {
             effort: vec!["low".into(), "medium".into(), "high".into()],
             is_default: true,
         }])
+    }
+}
+
+fn mock_capability() -> BackendCapability {
+    BackendCapability {
+        native_fork: true,
+        native_compact: true,
+        native_steer: true,
+        native_turn_rollback: true,
+        native_goal: true,
+        model_selection: true,
+        effort_selection: true,
+        fast_mode: true,
+        permission_control: true,
+        execution_mode_list: vec![
+            ExecutionMode::Read,
+            ExecutionMode::Write,
+            ExecutionMode::Full,
+            ExecutionMode::Yolo,
+        ],
+        agent: AgentCapability::default(),
     }
 }
 

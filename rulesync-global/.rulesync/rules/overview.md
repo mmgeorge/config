@@ -128,7 +128,110 @@ When creating a plan, use this template. Output each section in order:
 
 1. **Overview** - 2-3 sentence context-and-outcome story with precise, accessible prose. Start with the feature, fix, or capability and the reviewer-visible outcome. Then explain the relevant limitation, unmet capability, or architectural motivation and the resulting role-level architecture. Use a before/now contrast only when the plan changes existing behavior. Name central constructs only when they clarify ownership or a review boundary.
 2. **Usage** - Include this section immediately after Overview. When the plan adds or changes caller-facing behavior, such as a command, API, function, UI action, config, or text-producing workflow, show one concrete call or interaction and the expected result. For CLI tasks, include the full command and expected stdout, exit status, or artifact. Use fenced code for text-based inputs and outputs. For visual, audio, hardware, or other non-text results, write a compact text placeholder such as `<visual result: rendered preview updates with the selected theme>`. If no caller-facing usage applies, write `<Omitted>` as the only body text and keep the following section numbers unchanged.
-3. **Diagrams** - Start with 1-2 sentences that summarize the ownership change and briefly describe the role of every object reference shown, followed by a compact two-column, unboxed UML-style diagram of the changed domain objects, state owners, services, configs, and consumers. Label the columns `Objects` and `Relationships`. Under `Objects`, list each relevant object with only the fields and methods needed to understand the change. Put the object's repository-relative file path on the next indented line in square brackets, before its members. Repeat a shared path under every object it defines so each declaration remains independently traceable. Indent public operations with `+` and internal fields with `-`. Under `Relationships`, place each outgoing relationship beside its source object's declaration. Separate the columns with spaces only. Do not draw boxes, vertical dividers, or horizontal rules. Label ownership, reads, writes, calls, and other dependencies on horizontal arrows. Use stereotypes such as `<<Resource>>` when an architectural role matters. Use `◆` and cardinality such as `0..*` when lifecycle ownership matters. Then include 1-3 labeled compact code-flow diagrams for the major runtime, data, request, event, persistence, recovery, or configuration flows affected by the plan. Precede each code-flow diagram with 1-2 sentences that explain the flow and why it matters. Lay each flow out horizontally from its actual entry point to its observable consumer or effect. Put the action or state on the first line of each node and its repository-relative file path or logical subsystem on the second line in square brackets. Keep each action and location visually paired on adjacent lines, but do not require fixed-width columns or cross-flow alignment. Use natural title-case flow labels such as `Capture`, `Sync`, and `Recovery`, never all caps. Label arrows with the value, event, or result crossing each boundary. Keep every diagram line at 100 characters or fewer. Shorten labels or split a long flow at a meaningful boundary rather than exceeding the limit. Reuse object names from the UML diagram so reviewers can connect execution to ownership. Do not merge independent flows merely to produce one end-to-end diagram. Mark modified/new nodes with `*` and removed nodes with `~`.
+3. **Diagrams** - Start with 1-2 sentences that summarize the ownership change and the role of every displayed type. Follow with a compact, unboxed UML-style diagram whose fixed columns are named `Contracts` and `Concrete`. Put traits, interfaces, and abstract base classes under `Contracts`. Put structs, classes, enums, configs, resources, and other instantiable or value types under `Concrete`. Write `<none>` when the plan has no relevant contract. Rows do not imply relationships between columns.
+   - Start every declaration with its construct kind, such as `*trait Backend`, `*struct CodexBackend: Backend`, `*interface Focusable`, or `*class SceneEditor extends Widget: Focusable`. A colon declares contract conformance. `extends` declares inheritance. Mark modified or new declarations with `*` and removed declarations with `~`.
+   - Put the repository-relative path on the next indented line after the complete declaration and before its members. Repeat a shared path for every declaration it defines. Keep both column anchors fixed. Wrapped declarations, paths, fields, and operations must remain aligned within their own column.
+   - Indent public operations with `+` and internal fields with `-`. Keep properties and return types on one line whenever possible. Omit `: void` and `: ()`. Add `: Type` only for a meaningful return value.
+   - Declare shared operations once on their trait, interface, or abstract base. Do not repeat inherited operations under concrete implementations. Put concrete-only operations on an implementation only when they matter to the plan. Model implementation capability differences as fields, capability values, strategies, or explicit results instead of asymmetric subsets of contract operations.
+   - Use an unqualified `Type` for owned state, `&Type` for a retained non-owning reference, and `@Type` for retained shared ownership. Use `Type?` for an optional value and `Type[]` for zero or more values. Parameters and return types already express transient dependencies, so do not add `uses` relationships or a separate relationship column.
+   - **Exclusive child types:** Keep reusable concrete types at the column's base indentation. When a type forms an intentional private implementation detail used exclusively by one parent, declare it immediately beneath that parent and indent it one additional level. Keep its path and members indented relative to its declaration. Do not infer exclusivity merely from having one current caller.
+   - Name enum variants without a field marker. Indent named payload fields beneath their variant and prefix them with `+` because the variant exposes them as contract data. Reserve `-` for private struct or class state. When direct accessors belong in the design, use `noun()`, `noun_mut()`, and `set_noun(value)` instead of `get_noun()` variants. Omit `noun_mut()` when the language or API does not expose a distinct mutable-reference operation.
+
+   Rust example:
+
+   ```text
+   Contracts                                 Concrete
+
+   *trait PaymentGateway                     *struct StripeGateway: PaymentGateway
+     [src/payment/gateway.rs]                  [src/payment/stripe_gateway.rs]
+     + authorize(request): Authorization       - client: HttpClient
+     + capture(id): Receipt                    - credentials: &SecretProvider
+     + refund(id, amount): Refund
+
+   *trait InventoryStore                     *struct PostgresInventoryStore: InventoryStore
+     [src/inventory/store.rs]                  [src/inventory/postgres_store.rs]
+     + reserve(request): Reservation           - connection_pool: @DatabasePool
+     + release(reservation_id)
+     + commit(reservation_id)
+
+                                             *struct CheckoutService
+                                               [src/checkout/service.rs]
+                                               - sessions: CheckoutSessionStore
+                                               - gateway: @PaymentGateway
+                                               - inventory: @InventoryStore
+                                               - catalog: &PricingCatalog
+                                               + submit(session_id): CheckoutResult
+                                               + cancel(session_id)
+
+                                               *struct CheckoutSessionStore
+                                                 [src/checkout/session_store.rs]
+                                                 - sessions: CheckoutSession[]
+                                                 + create(session)
+                                                 + find(id): &CheckoutSession
+
+                                             *struct CheckoutSession
+                                               [src/checkout/session.rs]
+                                               - authorization: Authorization?
+                                               - adjustments: PriceAdjustment[]
+                                               - state: CheckoutState
+                                               + state(): &CheckoutState
+                                               + state_mut(): &mut CheckoutState
+                                               + set_state(state)
+
+                                             *enum CheckoutState
+                                               [src/checkout/session.rs]
+                                               Draft
+                                               PaymentAuthorized
+                                                 + authorization_id: AuthorizationId
+                                               Failed
+                                                 + error: CheckoutError
+   ```
+
+   TypeScript example:
+
+   ```text
+   Contracts                                 Concrete
+
+   *abstract class Widget                    *class SceneEditor extends Widget:
+     [src/ui/widget.ts]                        Focusable, CommandTarget
+                                               [src/editor/scene-editor.ts]
+     + render(canvas)                          - viewport: SceneViewport
+     + measure(bounds): Size                   - selection: SelectionModel
+     + handle_event(event)                     - document: &SceneDocument
+                                               - assets: @AssetCache
+                                               - hovered_entity: EntityId?
+                                               + selection(): SelectionModel
+                                               + set_selection(selection)
+
+                                               *class SelectionModel
+                                                 [src/editor/selection-model.ts]
+                                                 - selected_ids: EntityId[]
+                                                 + selected_ids(): EntityId[]
+                                                 + set_selected_ids(selected_ids)
+
+   *interface Focusable                      *class SceneViewport extends Widget: Focusable
+     [src/ui/focusable.ts]                     [src/editor/scene-viewport.ts]
+     + focus()                                 - camera: Camera
+     + blur()                                  - document: &SceneDocument
+     + has_focus(): Boolean                    - renderer: @RenderDevice
+
+   *interface CommandTarget                  *class AssetCache
+     [src/command/command-target.ts]           [src/asset/asset-cache.ts]
+     + can_execute(command): Boolean           - entries: AssetCacheEntry[]
+     + execute(command): CommandResult         - decoder: @AssetDecoder
+                                               + load(asset_id): Asset
+                                               + clear()
+
+                                             *enum EditorCommand
+                                               [src/command/editor-command.ts]
+                                               DeleteSelection
+                                               RenameEntity
+                                                 + entity_id: EntityId
+                                                 + name: String
+   ```
+
+   Then include 1-3 labeled compact code-flow diagrams for the major runtime, data, request, event, persistence, recovery, or configuration flows affected by the plan. Precede each flow with 1-2 sentences that explain why it matters. Lay each flow out horizontally from its actual entry point to its observable consumer or effect. Put the action or state on the first line of each node and its repository-relative path or logical subsystem on the next line. Keep actions and locations visually paired. Use natural title-case labels such as `Capture`, `Sync`, and `Recovery`. Label arrows with the value, event, or result crossing each boundary. Keep every diagram line at 100 characters or fewer. Split long flows at meaningful boundaries. Reuse names from the UML diagram and keep independent flows separate.
+
 4. **Tasks** - Numbered walkthrough tree organized by domain object and ownership responsibility. Each task is an active architectural review claim, not a file bucket or a forced stage in one code flow. Prefer the title shape `<Active verb> <domain object> <with|through|in|across> <architectural role>.`, but vary it when another concise active construction states the ownership change more precisely. Follow the title with 1-2 sentences that add new information about the architectural effect, motivation, constraint, or reviewer-visible consequence. Do not merely paraphrase the title. Use `now` only when contrasting changed existing behavior. For additions, state what the new construct owns, enables, or connects without inventing a previous behavior.
    - `Task` is a numbered architectural claim that advances the object model or clarifies an ownership boundary.
    - `Group` is a concrete source-file boundary. Start every group with `file` followed by the required repository-relative file path, such as `file src/draft_sync.rs`. Do not use `module`, `package`, `directory`, or a friendly file label in place of a path.
@@ -138,7 +241,7 @@ When creating a plan, use this template. Output each section in order:
    - Keep the `file` group term and change kind/role term separate from the target so renderers can colorize words like `file`, `struct`, `fn`, `config`, and `Resource`.
    - Include every function, type, config, app, test, or field that will be added, modified, or deleted.
    - Order tasks by the object model and ownership relationships. Within each task, order concrete changes in the sequence that makes the ownership change easiest to review. Do not contort the task tree to mirror one code-flow diagram.
-5. **Modularity, testability, and plan validation** - Are ownership claims correct? Are boundaries clean, interfaces narrow, internals hidden, and behavior testable in isolation? If the plan touches many unrelated files, revise the object ownership or task boundaries before presenting it. Check that the overview, usage, two-column unboxed UML diagram, 1-3 code-flow diagrams, tasks, and tests agree. Every changed construct appears under a task. Every group names a repository-relative file path. Each selected major flow has a separate diagram. Every diagram has a 1-2 sentence description, and the UML description covers every displayed object reference. The UML diagram places each object's repository-relative path before its relevant members under `Objects`, places outgoing references under `Relationships`, and uses no boxes or divider lines. Code-flow actions sit above their locations and use natural title-case labels without requiring fixed-width alignment. No diagram line exceeds 100 characters. Task titles are architectural claims, and their rationale adds information instead of restating the claim. Groups are concrete file boundaries. Subtasks are local design moves. Changes are concrete edits. Ownership claims are explicit. No section collapses request failures, validation, or user-visible behavior into vague `handle`, `support`, `make`, or `update` wording.
+5. **Modularity, testability, and plan validation** - Validate the plan as one ownership model. Every changed construct must appear under a task, every group must name a repository-relative path, and every major flow must have its own described diagram. The UML must keep fixed `Contracts` and `Concrete` anchors, place paths after complete declarations, declare shared operations once, encode retained state through `Type`, `&Type`, `@Type`, `Type?`, and `Type[]`, and indent exclusive child types directly beneath their parent. Check that task claims, UML fields, code-flow values, and tests describe the same boundaries. Revise plans that scatter ownership across unrelated files, expose broad interfaces, hide capability differences in asymmetric implementations, imply accidental exclusivity, exceed 100 characters on a diagram line, or collapse failures and user-visible behavior into vague `handle`, `support`, `make`, or `update` wording.
 6. **Test plan** - Specific tests tied to the ownership boundaries and relevant code flows:
    - **Unit tests**: What to test, what to mock, what behavior each validates.
    - **Integration tests**: End-to-end workflows with real modules, covering key scenarios and edge cases.
@@ -179,33 +282,37 @@ The diagrams establish the changed ownership model first, then separate the thre
 
 ## Object model and ownership
 
-`DraftCache` owns durable `DraftChange` records independently from editor buffers. `DocumentEditor` writes those records, `SyncWorker` drains them after persistence, and `EditorRecovery` reads them when rebuilding a session.
+`DraftCache` owns durable `DraftChange` records independently from editor buffers. `DocumentEditor`, `SyncWorker`, and `EditorRecovery` retain shared access to that owner for capture, persistence, and recovery.
 
 ```text
-Objects                                   Relationships
+Contracts                                 Concrete
 
-*DocumentEditor                           DocumentEditor ──writes──▶ DraftCache
-  [src/editor/session.rs]
-  + apply_edit(document_id, edit)
+<none>                                    *struct DocumentEditor
+                                            [src/editor/session.rs]
+                                            - draft_cache: @DraftCache
+                                            + apply_edit(document_id, edit)
 
-*DraftCache <<Resource>>                  DraftCache ◆──owns 0..*──▶ DraftChange
-  [src/draft_sync.rs]
-  + store(change)
-  + pending(): DraftChange[]
-  + mark_saved(draft_id)
+                                          *struct DraftCache
+                                            [src/draft_sync.rs]
+                                            - changes: DraftChange[]
+                                            + store(change)
+                                            + pending(): &DraftChange[]
+                                            + mark_saved(draft_id)
 
-*DraftChange
-  [src/draft_sync.rs]
-  - document_id: DocumentId
-  - status: DraftStatus
+                                          *struct DraftChange
+                                            [src/draft_sync.rs]
+                                            - document_id: DocumentId
+                                            - status: DraftStatus
 
-SyncWorker                                SyncWorker ──drains──▶ DraftCache
-  [src/sync/worker.rs]
-  + drain_cache()
+                                          *struct SyncWorker
+                                            [src/sync/worker.rs]
+                                            - draft_cache: @DraftCache
+                                            + drain_cache()
 
-EditorRecovery                            EditorRecovery ──reads──▶ DraftCache
-  [src/editor/recovery.rs]
-  + restore_session()
+                                          *struct EditorRecovery
+                                            [src/editor/recovery.rs]
+                                            - draft_cache: @DraftCache
+                                            + restore_session()
 ```
 
 ## Code flow: edit capture

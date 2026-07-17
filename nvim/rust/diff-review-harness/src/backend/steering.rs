@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use serde_json::Value;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 
@@ -137,14 +136,7 @@ impl SteerCommand {
             && self.operation == ActiveTurnOperation::Steer
             && let Some(event_sink) = self.event_sink.take()
         {
-            let _ = event_sink.send(BackendEvent {
-                kind: "steering_input".into(),
-                text: Some(self.text.clone()),
-                data: Value::Null,
-                activity: None,
-                summary: None,
-                task_update: None,
-            });
+            let _ = event_sink.send(BackendEvent::steering_input(self.text.clone()));
         }
         if let Some(completion) = self.completion.take() {
             let _ = completion.send(result.map_err(|error| format!("{error:#}")));

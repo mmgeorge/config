@@ -29,20 +29,14 @@ Planning feedback:
         )
     }
 
-    /// Build a clarification turn that preserves the unresolved planning decision.
+    /// Build a follow-up turn that may preserve or explicitly mutate pending decisions.
     pub fn clarification(request: &str, elicitation_json: &str, question: &str) -> String {
-        format!(
-            r#"Answer the user's clarification question about an unresolved planning decision. Stay in READ mode. Do not continue or rewrite the plan, do not select an option for the user, and do not call harness_plan_question or harness_plan_submit. Explain only what helps the user decide.
+        mutable_elicitation_prompt(Some(request), elicitation_json, question)
+    }
 
-Original planning request:
-{request}
-
-Current elicitation state:
-{elicitation_json}
-
-User clarification question:
-{question}"#
-        )
+    /// Build an ordinary follow-up turn against one pending Harness decision set.
+    pub fn question_follow_up(elicitation_json: &str, question: &str) -> String {
+        mutable_elicitation_prompt(None, elicitation_json, question)
     }
 
     /// Build a complete replacement request from reviewed plan state.
@@ -80,6 +74,48 @@ Anchored annotations:
     }
 }
 
+fn mutable_elicitation_prompt(
+    planning_request: Option<&str>,
+    elicitation_json: &str,
+    question: &str,
+) -> String {
+    let workflow_boundary = if planning_request.is_some() {
+        "Do not continue or submit the plan during this turn."
+    } else {
+        "Do not continue the original request during this turn."
+    };
+    let planning_context = planning_request
+        .map(|request| format!("\nOriginal planning request:\n{request}\n"))
+        .unwrap_or_default();
+    format!(
+        r#"The user is responding while a Harness question set remains pending. Treat the pending elicitation as mutable decision state, not as a modal lock.
+
+Stay in READ mode. Answer the user's follow-up directly, using repository evidence when relevant. {workflow_boundary}
+
+After answering, choose exactly one outcome:
+
+1. Preserve
+   Make no control-tool call when the existing questions and options remain material and valid.
+
+2. Answer
+   Call harness_question_answer only when the user explicitly and unambiguously answers a pending question. Do not convert tentative language, discussion, or model preference into an answer.
+
+3. Replace
+   Call harness_plan_question with the complete revised question set when the user requests changes or when clarification changes which questions or options remain material. Preserve question IDs only when their meaning remains unchanged. End the turn after replacement.
+
+4. Withdraw
+   Call harness_question_withdraw when no material user decision remains. Provide a concise reason grounded in an explicit user instruction, delegated judgment, repository evidence, or a resolved requirement. End the turn after withdrawal.
+
+Never select an option merely because you recommend it. Never retain a question that no longer affects the implementation. Never withdraw a question merely to avoid asking for input. "Choose for me" explicitly delegates the decision and may resolve the question. Tentative language such as "I'm leaning toward" does not resolve the question. If only part of the question set changes, replace the complete set while retaining unchanged questions and stable IDs. If a new material decision emerges, include it in the complete replacement set. After any control-tool call, let the Harness present or resume the resulting workflow.
+{planning_context}
+Pending elicitation:
+{elicitation_json}
+
+User follow-up:
+{question}"#
+    )
+}
+
 #[cfg(test)]
 mod test {
     use super::PlanPrompt;
@@ -113,8 +149,20 @@ mod test {
     #[test]
     fn clarification_preserves_the_pending_decision_boundary() {
         let prompt = PlanPrompt::clarification("Refactor", "{\"question\":\"Migration?\"}", "Why?");
-        assert!(prompt.contains("do not select an option"));
+        assert!(prompt.contains("mutable decision state"));
+        assert!(prompt.contains("harness_question_answer"));
+        assert!(prompt.contains("harness_plan_question"));
+        assert!(prompt.contains("harness_question_withdraw"));
+        assert!(prompt.contains("Tentative language"));
         assert!(prompt.contains("Why?"));
         assert!(prompt.contains("Migration?"));
+    }
+
+    #[test]
+    fn ordinary_question_follow_up_omits_planning_language() {
+        let prompt = PlanPrompt::question_follow_up("{\"question\":\"Format?\"}", "Use JSON");
+        assert!(prompt.contains("Do not continue the original request"));
+        assert!(!prompt.contains("Original planning request"));
+        assert!(prompt.contains("harness_question_answer"));
     }
 }

@@ -1,10 +1,10 @@
 use crate::backend::approval::PermissionCoordinator;
-use crate::backend::json_rpc::JsonRpcProcess;
 use crate::backend::steering::SteeringLane;
 use crate::backend::{
-    Backend, BackendCapability, BackendEventSink, BackendModel, BackendOutput, BackendRequest,
-    PromptMode,
+    Backend, BackendCapability, BackendDescriptor, BackendEventSink, BackendKind, BackendModel,
+    BackendOutput, BackendRequest, PromptMode,
 };
+use crate::control_tools::ControlToolRegistry;
 use crate::session::ExecutionMode;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -12,9 +12,12 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+mod json_rpc;
+mod process;
 mod security;
 mod turn_coordinator;
 
+use json_rpc::CodexJsonRpc;
 use security::CodexSecurity;
 
 /// Owns Codex app-server thread lifecycle, prompting, permission policy, and native fork.
@@ -37,6 +40,27 @@ enum CodexTurnState {
         thread_id: String,
     },
     Completed,
+}
+
+fn capability() -> BackendCapability {
+    BackendCapability {
+        native_fork: true,
+        native_compact: true,
+        native_steer: true,
+        native_turn_rollback: true,
+        native_goal: true,
+        model_selection: true,
+        effort_selection: true,
+        fast_mode: true,
+        permission_control: true,
+        execution_mode_list: vec![
+            ExecutionMode::Read,
+            ExecutionMode::Write,
+            ExecutionMode::Full,
+            ExecutionMode::Yolo,
+        ],
+        agent: crate::agent::AgentCapability::codex(),
+    }
 }
 
 impl CodexBackend {
@@ -69,10 +93,10 @@ impl CodexBackend {
         request: &BackendRequest,
         output: &mut BackendOutput,
         event_sink: Option<BackendEventSink>,
-    ) -> Result<JsonRpcProcess> {
+    ) -> Result<CodexJsonRpc> {
         let security = CodexSecurity::new(request.execution_mode);
         let command = security.launch_command(&self.command);
-        let mut process = JsonRpcProcess::start(
+        let mut process = CodexJsonRpc::start(
             &command,
             &request.workspace,
             request.execution_mode,
@@ -108,7 +132,7 @@ impl CodexBackend {
     }
 
     async fn model_catalog(
-        process: &mut JsonRpcProcess,
+        process: &mut CodexJsonRpc,
         output: &mut BackendOutput,
     ) -> Result<Vec<BackendModel>> {
         let result = process
@@ -164,7 +188,7 @@ impl CodexBackend {
     async fn resolve_model(
         &self,
         request: &BackendRequest,
-        process: &mut JsonRpcProcess,
+        process: &mut CodexJsonRpc,
         output: &mut BackendOutput,
     ) -> Result<String> {
         if request.model != "default" {
@@ -203,7 +227,7 @@ impl CodexBackend {
 
     async fn start_turn(
         &self,
-        process: &mut JsonRpcProcess,
+        process: &mut CodexJsonRpc,
         output: &mut BackendOutput,
         request: &BackendRequest,
         thread_id: &str,
@@ -221,8 +245,7 @@ impl CodexBackend {
             if let Some(turn_id) = Self::notification_turn_id(&message, "turn/started") {
                 started_turn_id = Some(turn_id.to_owned());
             }
-            if let Some(response) =
-                JsonRpcProcess::request_result(&message, request_id, "turn/start")
+            if let Some(response) = CodexJsonRpc::request_result(&message, request_id, "turn/start")
             {
                 let turn = response?;
                 let turn_id = turn
@@ -242,6 +265,14 @@ impl CodexBackend {
 
 #[async_trait]
 impl Backend for CodexBackend {
+    fn descriptor(&self) -> BackendDescriptor {
+        BackendDescriptor {
+            kind: BackendKind::Codex,
+            label: "Codex CLI".into(),
+            capability: capability(),
+        }
+    }
+
     async fn prompt_stream(
         &self,
         request: BackendRequest,
@@ -250,23 +281,7 @@ impl Backend for CodexBackend {
         *self.active_turn.lock().await = CodexTurnState::Pending;
         let mut active_steering = self.steering.activate(event_sink.clone())?;
         let mut output = BackendOutput {
-            capability: BackendCapability {
-                native_fork: true,
-                native_compact: true,
-                native_steer: true,
-                native_turn_rollback: true,
-                native_goal: true,
-                model_selection: true,
-                effort_selection: true,
-                permission_control: true,
-                execution_mode_list: vec![
-                    ExecutionMode::Read,
-                    ExecutionMode::Write,
-                    ExecutionMode::Full,
-                    ExecutionMode::Yolo,
-                ],
-                agent: crate::agent::AgentCapability::codex(),
-            },
+            capability: capability(),
             ..BackendOutput::default()
         };
         let coordinator_event_sink = event_sink.clone();
@@ -276,7 +291,18 @@ impl Backend for CodexBackend {
             .await?;
         output.runtime.provider = "Codex CLI".into();
         output.runtime.model = Some(resolved_model);
-        let plan_question_schema = crate::control_tools::plan_question_input_schema();
+        let dynamic_tool_list = ControlToolRegistry
+            .definition_list()
+            .into_iter()
+            .map(|definition| {
+                json!({
+                    "type": "function",
+                    "name": definition.name,
+                    "description": definition.description,
+                    "inputSchema": definition.input_schema,
+                })
+            })
+            .collect::<Vec<_>>();
         let thread = match &request.backend_session_id {
             Some(thread_id) => process.request("thread/resume", Self::secure(json!({
                 "threadId": thread_id,
@@ -286,14 +312,8 @@ impl Backend for CodexBackend {
                 "cwd": request.workspace,
                 "experimentalRawEvents": false,
                 "historyMode": "legacy",
-                "developerInstructions": "You run inside DiffReview Harness. Call harness_plan_question whenever the user asks for interactive or multiple-choice questions, and during planning when a material user decision is required. The question tool works in every mode. Call harness_plan_submit only with a complete Markdown plan. End the turn after a Harness question or plan control call. For a terminal goal state, call harness_goal_complete or harness_goal_blocked. Never claim a control action through ordinary prose alone.",
-                "dynamicTools": [
-                    { "type": "function", "name": "harness_plan_submit", "description": "Submit the complete Markdown plan for mandatory user review.", "inputSchema": { "type": "object", "properties": { "markdown": { "type": "string" } }, "required": ["markdown"] } },
-                    { "type": "function", "name": "harness_plan_question", "description": "Pause any Harness turn and present one to three interactive user questions. Use this for explicit requests for multiple-choice questions as well as planning decisions.", "inputSchema": plan_question_schema },
-                    { "type": "function", "name": "harness_goal_complete", "description": "Mark the active Harness goal complete.", "inputSchema": { "type": "object", "properties": { "summary": { "type": "string" } }, "required": ["summary"] } },
-                    { "type": "function", "name": "harness_goal_blocked", "description": "Mark the active Harness goal blocked.", "inputSchema": { "type": "object", "properties": { "reason": { "type": "string" } }, "required": ["reason"] } },
-                    { "type": "function", "name": "harness_goal_status", "description": "Report nonterminal progress toward the active Harness goal.", "inputSchema": { "type": "object", "properties": { "status": { "type": "string" } }, "required": ["status"] } }
-                ]
+                "developerInstructions": "You run inside DiffReview Harness. Call harness_plan_question whenever the user asks for interactive or multiple-choice questions, and during planning when a material user decision is required. While questions remain pending, use harness_question_answer only for an explicit user answer and harness_question_withdraw only when no material user decision remains. The question tools work in every mode. Call harness_plan_submit only with a complete Markdown plan. End the turn after a Harness question or plan control call. For a terminal goal state, call harness_goal_complete or harness_goal_blocked. Never claim a control action through ordinary prose alone.",
+                "dynamicTools": dynamic_tool_list
             }), &request), &request.model), &mut output).await?,
         };
         let thread_id = thread
@@ -306,7 +326,7 @@ impl Backend for CodexBackend {
             .context("Codex thread response omitted thread id")?;
         output.backend_session_id = Some(thread_id.clone());
         let mut prompt = format!(
-            "Harness interaction contract: when the user explicitly asks for interactive or multiple-choice questions, call harness_plan_question with the complete question set. The tool works outside planning. Do not claim questions were sent through prose.\n\n{}",
+            "Harness interaction contract: when the user explicitly asks for interactive or multiple-choice questions, call harness_plan_question with the complete question set. While questions remain pending, use harness_question_answer only for an explicit user answer and harness_question_withdraw only when no material user decision remains. The question tools work outside planning. Do not claim control actions through prose.\n\n{}",
             request.text
         );
         if request.mode == PromptMode::GoalContinuation {
@@ -434,23 +454,7 @@ impl Backend for CodexBackend {
             .context("Codex thread has not started")?;
         let mut output = BackendOutput {
             backend_session_id: Some(thread_id.clone()),
-            capability: BackendCapability {
-                native_fork: true,
-                native_compact: true,
-                native_steer: true,
-                native_turn_rollback: true,
-                native_goal: true,
-                model_selection: true,
-                effort_selection: true,
-                permission_control: true,
-                execution_mode_list: vec![
-                    ExecutionMode::Read,
-                    ExecutionMode::Write,
-                    ExecutionMode::Full,
-                    ExecutionMode::Yolo,
-                ],
-                agent: crate::agent::AgentCapability::codex(),
-            },
+            capability: capability(),
             ..BackendOutput::default()
         };
         let mut process = self.connect(&request, &mut output, None).await?;

@@ -22,11 +22,11 @@ local command_list = {
   { label = "/clear", detail = "Start a new session" },
   { label = "/compact", detail = "Compact provider-owned context", capability = "native_compact" },
   { label = "/rename", detail = "Rename the current session" },
-  { label = "/effort", detail = "Select reasoning effort" },
-  { label = "/model", detail = "Select the backend model" },
-  { label = "/fast", detail = "Toggle Codex fast mode" },
-  { label = "/fast on", detail = "Enable Codex fast mode" },
-  { label = "/fast off", detail = "Disable Codex fast mode" },
+  { label = "/effort", detail = "Select reasoning effort", capability = "effort_selection" },
+  { label = "/model", detail = "Select the backend model", capability = "model_selection" },
+  { label = "/fast", detail = "Toggle backend fast mode", capability = "fast_mode" },
+  { label = "/fast on", detail = "Enable backend fast mode", capability = "fast_mode" },
+  { label = "/fast off", detail = "Disable backend fast mode", capability = "fast_mode" },
 }
 
 function CommandSource.new()

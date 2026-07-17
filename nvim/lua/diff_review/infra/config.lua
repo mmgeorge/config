@@ -117,7 +117,7 @@
 ---@field command string[]
 
 ---@class DiffReviewHarnessConfig
----@field backend "acp"|"codex"|"mock"
+---@field backend "codex"|"copilot"|"mock"
 ---@field model string
 ---@field effort string
 ---@field buffer_name string
@@ -176,8 +176,8 @@ M.defaults = {
     goal_max_turns = 20,
     non_git_write_confirm = true,
     backends = {
-      acp = { command = { "copilot", "--acp" } },
       codex = { command = { "codex", "app-server" } },
+      copilot = { command = {} },
       mock = { command = { "mock" } },
     },
   },

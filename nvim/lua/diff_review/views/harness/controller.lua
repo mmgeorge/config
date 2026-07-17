@@ -170,7 +170,7 @@ local function status_text()
   local backend = active_session.backend or config.options.harness.backend
   local provider = active_session.provider_label
     or (backend == "codex" and "Codex CLI")
-    or (backend == "acp" and "ACP agent")
+    or (backend == "copilot" and "Copilot CLI")
     or backend
   local configured_model = active_session.model or config.options.harness.model
   local model = active_session.resolved_model or (configured_model == "default" and "resolving model" or configured_model)
@@ -185,7 +185,6 @@ local function status_text()
     local goal_state = state.goal.state and state.goal.state ~= "active" and (" [" .. state.goal.state .. "]") or ""
     goal = " • Goal: " .. state.goal.objective .. goal_state
   end
-  local permission_note = backend == "acp" and " • ACP permission best effort" or ""
   local fast = active_session.fast_mode and " fast" or ""
   local segment_list = {
     {
@@ -225,8 +224,8 @@ local function status_text()
       group = "DiffReviewHarnessWrite",
     }
   end
-  if busy ~= "" or permission_note ~= "" then
-    segment_list[#segment_list + 1] = { text = busy .. permission_note, group = "DiffReviewStatusLabel" }
+  if busy ~= "" then
+    segment_list[#segment_list + 1] = { text = busy, group = "DiffReviewStatusLabel" }
   end
   return segment_list
 end
@@ -252,7 +251,7 @@ end
 ---@return integer?
 local function working_seconds()
   if not harness_state().busy or not working_started_ns then return nil end
-  return math.floor((vim.uv.hrtime() - working_started_ns + 500000000) / 1000000000)
+  return math.floor((vim.uv.hrtime() - working_started_ns) / 1000000000)
 end
 
 ---@param reset? boolean
@@ -446,7 +445,10 @@ local function on_event(event, payload)
     elseif payload.kind == "timeline_interaction_retracted" then
       interaction_state.retract(state, payload.data or payload)
       M.render()
-    elseif payload.kind == "timeline_interaction_started" or payload.kind == "timeline_interaction_cancelled" then
+    elseif payload.kind == "timeline_interaction_started" then
+      interaction_state.start_interaction(state, payload.data or payload)
+      schedule_render()
+    elseif payload.kind == "timeline_interaction_cancelled" then
       interaction_state.complete_interaction(state, payload.data or payload)
       schedule_render()
     elseif payload.kind == "timeline_plan_lifecycle" then
@@ -486,6 +488,10 @@ local function on_event(event, payload)
     state.active_elicitation = nil
     question_presentation.reset(state)
     synchronize_state()
+  elseif event == "question_withdrawn" then
+    state.active_elicitation = nil
+    question_presentation.reset(state)
+    synchronize_state()
   elseif event == "plan_question" then
     state.active_plan = payload.plan or state.active_plan
     synchronize_state()
@@ -493,7 +499,8 @@ local function on_event(event, payload)
     state.active_plan = payload.plan or state.active_plan
     M.refresh_winbar()
   elseif event == "plan_created" or event == "plan_revision_created" or event == "plan_changes_requested"
-    or event == "plan_question_answered" or event == "plan_accepted" or event == "plan_cancelled"
+    or event == "plan_question_answered" or event == "plan_question_withdrawn"
+    or event == "plan_accepted" or event == "plan_cancelled"
     or event == "plan_activated"
   then
     synchronize_state()
@@ -661,12 +668,12 @@ begin_request = function(text)
   local state = harness_state()
   local selected_run = selected_agent_run(state)
   state.cancel_requested = false
+  if not selected_run then interaction_state.begin(state, text) end
   set_busy(true)
   local goal_objective = text:match("^/goal%s+(.+)$")
   if goal_objective and goal_objective ~= "pause" and goal_objective ~= "resume" and goal_objective ~= "clear" then
     state.goal = { objective = goal_objective, state = "active" }
   end
-  if not selected_run then interaction_state.begin(state, text) end
   M.render()
   local method = selected_run and "agent.submit" or "prompt.submit"
   local params = selected_run and { run_id = selected_run.id, text = text } or { text = text }
@@ -1003,12 +1010,20 @@ function M.submit()
   local model = text:match("^/model%s+(.+)$")
   if model then
     set_composer_text(state.composer_buf, "")
+    if state.capability.model_selection ~= true then
+      notifications.warn("The current backend does not support model selection", "Harness")
+      return
+    end
     M.configure({ model = vim.trim(model) })
     return
   end
   local effort = text:match("^/effort%s+(%S+)$")
   if effort then
     set_composer_text(state.composer_buf, "")
+    if state.capability.effort_selection ~= true then
+      notifications.warn("The current backend does not support reasoning effort selection", "Harness")
+      return
+    end
     if not vim.tbl_contains({ "minimal", "low", "medium", "high", "xhigh" }, effort) then
       notifications.warn("Unknown reasoning effort: " .. effort, "Harness")
       return
@@ -1166,6 +1181,10 @@ function M.change_effort(direction)
 end
 
 function M.select_effort()
+  if harness_state().capability.effort_selection ~= true then
+    notifications.warn("The current backend does not support reasoning effort selection", "Harness")
+    return
+  end
   local effort_list = { "minimal", "low", "medium", "high", "xhigh" }
   local detail_list = {
     minimal = "Fastest reasoning for straightforward work.",
@@ -1185,9 +1204,8 @@ end
 ---@param enabled boolean
 function M.configure_fast_mode(enabled)
   local state = harness_state()
-  local backend = state.session and state.session.backend or config.options.harness.backend
-  if backend ~= "codex" then
-    notifications.warn("Fast mode requires the Codex backend", "Harness")
+  if state.capability.fast_mode ~= true then
+    notifications.warn("The current backend does not support fast mode", "Harness")
     return
   end
   M.configure({ fast_mode = enabled })
@@ -1208,6 +1226,10 @@ function M.select_fast_mode()
 end
 
 function M.select_model()
+  if harness_state().capability.model_selection ~= true then
+    notifications.warn("The current backend does not support model selection", "Harness")
+    return
+  end
   client.request("backend.models", {}, function(model_list, request_error)
     if request_error then notifications.error(request_error, "Harness model") return end
     if type(model_list) ~= "table" or #model_list == 0 then
@@ -1233,7 +1255,7 @@ function M.select_model()
     local options = vim.tbl_map(function(model)
       return { label = model.label, detail = model.id, value = model }
     end, model_list)
-    open_choice_picker(harness_state(), "Select model and effort", "Models exposed by the active Codex backend.", options, function(model)
+    open_choice_picker(harness_state(), "Select model and effort", "Models exposed by the active backend.", options, function(model)
       M.configure({ model = model.id })
     end)
   end)

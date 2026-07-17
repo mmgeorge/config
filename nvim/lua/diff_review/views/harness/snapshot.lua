@@ -8,7 +8,13 @@ local prompt_history = require("diff_review.views.harness.prompt_history")
 ---@param interaction_mode? "replace"|"reconcile"
 function HarnessSnapshot.apply(state, result, interaction_mode)
   local previous_session_id = state.session and state.session.id or nil
+  local previous_context_usage = state.session and state.session.context_usage or nil
   state.session = result.session
+  if previous_session_id == (result.session and result.session.id or nil)
+    and previous_context_usage and not state.session.context_usage
+  then
+    state.session.context_usage = previous_context_usage
+  end
   if previous_session_id ~= (result.session and result.session.id or nil) then state.activity_expanded = {} end
   state.capability = result.capability or {}
   if interaction_mode == "reconcile" then
