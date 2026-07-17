@@ -70,20 +70,21 @@ end
 local function append_response(result, text, first_prefix, first_prefix_group)
   local line_list = vim.split(tostring(text or ""), "\n", { plain = true })
   if #line_list == 0 then line_list = { "" } end
+  local indentation = string.rep(" ", vim.fn.strdisplaywidth(first_prefix or "  "))
   for line_index, line in ipairs(line_list) do
     local first_line = line_index == 1
-    local prefix = first_line and first_prefix or "  "
-    local prefix_group = first_line and first_prefix_group or "Normal"
-    result.lines[#result.lines + 1] = line
-    result.extmarks[#result.extmarks + 1] = {
-      line = #result.lines,
-      col = 0,
-      options = {
-        virt_text = { { prefix, prefix_group } },
-        virt_text_pos = "inline",
-        hl_mode = "combine",
-      },
-    }
+    result.lines[#result.lines + 1] = indentation .. line
+    if first_line and first_prefix then
+      result.extmarks[#result.extmarks + 1] = {
+        line = #result.lines,
+        col = 0,
+        options = {
+          virt_text = { { first_prefix, first_prefix_group } },
+          virt_text_pos = "overlay",
+          hl_mode = "combine",
+        },
+      }
+    end
   end
 end
 

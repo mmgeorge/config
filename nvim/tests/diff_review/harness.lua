@@ -779,7 +779,7 @@ local ok, failure = pcall(function()
   } })
   assert_true(vim.tbl_contains(question_render.lines, "▸ Planning paused for feedback"),
     "planning questions should render as a durable paused state")
-  assert_true(vim.tbl_contains(question_render.lines, "Which migration should the plan use?"),
+  assert_true(vim.tbl_contains(question_render.lines, "  Which migration should the plan use?"),
     "planning questions should remain visible without expansion")
   assert_true(vim.tbl_contains(question_render.lines, "    ○ Staged — Support both formats temporarily."),
     "planning question choices should remain visible in the timeline")
@@ -997,8 +997,8 @@ local ok, failure = pcall(function()
   } }, { now_ms = 3000 })
   local agent_line = line_number(ordered_render.lines, "▸ Agent explorer completed in 1s")
   local steering_line = line_number(ordered_render.lines, "▸ What day is it?")
-  local intermediate_response_line = line_number(ordered_render.lines, "Today is Tuesday.")
-  local final_response_line = line_number(ordered_render.lines, "Final synthesis.")
+  local intermediate_response_line = line_number(ordered_render.lines, "  Today is Tuesday.")
+  local final_response_line = line_number(ordered_render.lines, "  Final synthesis.")
   assert_true(agent_line ~= nil and steering_line ~= nil and final_response_line ~= nil,
     "ordered interaction nodes should all render:\n" .. table.concat(ordered_render.lines, "\n"))
   assert_true(agent_line < steering_line and steering_line < final_response_line,
@@ -1204,6 +1204,10 @@ local ok, failure = pcall(function()
     "assistant markdown should begin directly after its thought summary")
   assert_equals(markdown_render.markdown_ranges[1].after0, 5,
     "assistant markdown should end with its response body")
+  assert_equals(markdown_render.lines[3], "  # Heading",
+    "response indentation should live in the buffer so native wrapping can preserve it")
+  assert_equals(markdown_render.lines[5], "  - **item**",
+    "every response line should retain the same structural indentation")
   assert_true(vim.iter(markdown_render.highlights):any(function(highlight)
     return highlight.line == 2 and highlight.group == "DiffReviewHarnessThought"
   end),
@@ -1216,6 +1220,7 @@ local ok, failure = pcall(function()
     return virtual_text and virtual_text[1]
       and virtual_text[1][1] == "▸ "
       and virtual_text[1][2] == "DiffReviewHarnessResponse"
+      and extmark.options.virt_text_pos == "overlay"
   end), "response markers should use the Harness white highlight")
   local completed_thought_render = interaction_renderer.build({ {
     id = "completed-thought",
@@ -1325,9 +1330,9 @@ local ok, failure = pcall(function()
   assert_true(vim.tbl_contains(settled_transcript, "▸ what is this repo?"), "user prompts should use the Harness prompt marker")
   assert_true(vim.tbl_contains(settled_transcript, "▸ Thought for 2s, 2.7k tokens"),
     "completed responses should expose timing and token usage")
-  assert_true(vim.tbl_contains(settled_transcript, "Mock reply"),
-    "assistant response content should remain raw Markdown in the buffer")
-  local response_body_line = line_number(settled_transcript, "Mock reply")
+  assert_true(vim.tbl_contains(settled_transcript, "  Mock reply"),
+    "assistant response content should retain Markdown with structural indentation")
+  local response_body_line = line_number(settled_transcript, "  Mock reply")
   assert_true(vim.iter(vim.api.nvim_buf_get_extmarks(
     session.harness.transcript_buf,
     session.harness.render_namespace,
@@ -2132,7 +2137,7 @@ local ok, failure = pcall(function()
     local group = tostring(details.hl_group or details.line_hl_group or "")
     return group:find("DiffReviewAdd", 1, true) or group:find("DiffReviewDelete", 1, true)
   end), "collapsing a Harness diff should remove old diff colors before suffix rows relocate")
-  assert_equals(vim.api.nvim_buf_get_lines(transaction_buf, -2, -1, false)[1], "Done",
+  assert_equals(vim.api.nvim_buf_get_lines(transaction_buf, -2, -1, false)[1], "  Done",
     "collapsing a Harness diff should leave the response row uncorrupted")
   local duplicate_thought_key = "interaction:duplicate-diff:thought:duplicate-thought"
   local duplicate_aggregate_key = "interaction:duplicate-diff:aggregate"

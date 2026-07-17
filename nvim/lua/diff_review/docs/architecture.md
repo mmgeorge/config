@@ -1037,6 +1037,12 @@ overlapping native ranges, which cannot reliably represent wrapped thought and c
 `display_text.lua` wraps prompts and thoughts into real rows using rendered-cell width before row
 ownership, highlights, and folds are assigned. Continuation rows therefore preserve the tree's
 two-column indent without depending on window-local soft-wrap behavior.
+Markdown responses retain each source line and rely on Neovim soft-wrap so window resizing can
+reflow prose without rebuilding the timeline. Their two-column structural indentation lives in
+the real buffer text because `breakindent` cannot measure inline virtual text. The first response
+row overlays `▸ ` onto those two spaces, preserving the timeline marker without changing layout.
+Keep structural whitespace real and reserve extmarks for overlay markers and highlighting, or
+wrapped response continuations will regress to column zero.
 `transaction.lua` compares stable node blocks, applies changed blocks from bottom to top, and
 preserves semantic cursor identity, viewport position, expansion state, and settled prefix extmarks.
 It validates semantic row indexes against the post-mutation buffer before restoring the cursor, so
