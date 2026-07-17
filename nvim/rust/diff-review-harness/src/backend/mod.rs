@@ -87,6 +87,7 @@ pub struct BackendRequest {
     pub mode: PromptMode,
     pub model: String,
     pub effort: String,
+    pub context_window: Option<String>,
     pub fast_mode: bool,
     pub execution_mode: ExecutionMode,
     pub backend_session_id: Option<String>,
@@ -257,12 +258,25 @@ pub struct BackendRuntime {
     pub model: Option<String>,
 }
 
-/// Represents one model and its provider-advertised reasoning efforts.
+/// Represents one selectable context-window tier advertised by a provider.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BackendContextWindow {
+    pub id: String,
+    pub token_limit: Option<u64>,
+}
+
+/// Represents one model and the controls advertised by its provider.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BackendModel {
     pub id: String,
-    pub label: String,
-    pub effort: Vec<String>,
+    pub reasoning: Vec<String>,
+    pub default_reasoning: Option<String>,
+    pub selected_reasoning: Option<String>,
+    pub context_window: Vec<BackendContextWindow>,
+    pub default_context_window: Option<String>,
+    pub selected_context_window: Option<String>,
+    pub vision: bool,
+    pub description: Option<String>,
     #[serde(default)]
     pub is_default: bool,
 }
@@ -518,8 +532,17 @@ impl Backend for MockBackend {
     async fn model_list(&self, _request: BackendRequest) -> Result<Vec<BackendModel>> {
         Ok(vec![BackendModel {
             id: "mock-model".into(),
-            label: "Mock model".into(),
-            effort: vec!["low".into(), "medium".into(), "high".into()],
+            reasoning: vec!["low".into(), "medium".into(), "high".into()],
+            default_reasoning: Some("medium".into()),
+            selected_reasoning: None,
+            context_window: vec![BackendContextWindow {
+                id: "default".into(),
+                token_limit: Some(100_000),
+            }],
+            default_context_window: Some("default".into()),
+            selected_context_window: None,
+            vision: false,
+            description: Some("Deterministic Harness test model.".into()),
             is_default: true,
         }])
     }
@@ -571,6 +594,7 @@ mod test {
                         mode: PromptMode::Plan,
                         model: "mock-model".into(),
                         effort: "low".into(),
+                        context_window: None,
                         fast_mode: false,
                         execution_mode: ExecutionMode::Read,
                         backend_session_id: None,

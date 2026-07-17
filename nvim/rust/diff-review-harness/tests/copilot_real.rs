@@ -50,6 +50,18 @@ async fn streams_one_native_copilot_sdk_turn_through_the_broker() {
         .as_ref()
         .and_then(Value::as_array)
         .expect("Copilot model catalog");
+    assert!(model_list.iter().all(|model| model.get("label").is_none()));
+    assert!(model_list.iter().all(|model| {
+        model.get("reasoning").is_some()
+            && model.get("context_window").is_some()
+            && model.get("vision").is_some()
+    }));
+    assert!(model_list.iter().any(|model| {
+        model
+            .get("context_window")
+            .and_then(Value::as_array)
+            .is_some_and(|context_window| !context_window.is_empty())
+    }));
     let selected_model = model_list
         .iter()
         .find(|model| {
@@ -65,7 +77,7 @@ async fn streams_one_native_copilot_sdk_turn_through_the_broker() {
             model_list.iter().find(|model| {
                 model.get("id").and_then(Value::as_str) != Some("auto")
                     && model
-                        .get("effort")
+                        .get("reasoning")
                         .and_then(Value::as_array)
                         .is_some_and(|effort_list| effort_list.iter().any(|effort| effort == "low"))
             })

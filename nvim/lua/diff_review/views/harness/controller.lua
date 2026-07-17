@@ -15,6 +15,7 @@ local interaction_state = require("diff_review.views.harness.interaction_state")
 local prompt_history = require("diff_review.views.harness.prompt_history")
 local context_status = require("diff_review.views.harness.context_status")
 local main_timeline = require("diff_review.views.harness.timeline")
+local model_picker = require("diff_review.views.harness.model_picker")
 local snapshot = require("diff_review.views.harness.snapshot")
 local picker = require("diff_review.views.picker")
 local timeline_status = require("diff_review.views.harness.timeline_status")
@@ -1257,12 +1258,13 @@ function M.select_model()
       })
       return
     end
-    local options = vim.tbl_map(function(model)
-      return { label = model.label, detail = model.id, value = model }
-    end, model_list)
-    open_choice_picker(harness_state(), "Select model and effort", "Models exposed by the active backend.", options, function(model)
-      M.configure({ model = model.id })
-    end)
+    local state = harness_state()
+    model_picker.open({
+      host = picker_host(state),
+      model_list = model_list,
+      current_model = state.session and (state.session.resolved_model or state.session.model),
+      on_confirm = M.configure,
+    })
   end)
 end
 

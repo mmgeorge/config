@@ -529,7 +529,21 @@ local function fake_launcher(command, options, _)
       active_session.name = vim.trim(request.params.name or "")
       emit(options, { id = request.id, result = active_session })
     elseif request.method == "backend.models" then
-      emit(options, { id = request.id, result = { { id = "mock-model", label = "Mock model", effort = { "low" } } } })
+      emit(options, { id = request.id, result = { {
+        id = "mock-model",
+        label = "Redundant provider label",
+        reasoning = { "low", "high" },
+        default_reasoning = "low",
+        selected_reasoning = "low",
+        context_window = {
+          { id = "default", token_limit = 100000 },
+          { id = "long_context", token_limit = 200000 },
+        },
+        default_context_window = "default",
+        selected_context_window = "default",
+        vision = true,
+        description = "Backend supplied description.",
+      } } })
     elseif request.method == "session.execution_mode" then
       active_session.execution_mode = request.params.mode
       emit(options, { event = "execution_mode_changed", payload = active_session })
@@ -1577,12 +1591,30 @@ local ok, failure = pcall(function()
   assert_true(vim.wait(1000, function() return require("diff_review.views.picker").is_open() end, 10),
     "model selection should open the shared picker after backend discovery")
   local model_picker = require("diff_review.views.picker")._state_for_test()
-  assert_equals(model_picker.spec.page_list[1].option_list[1].detail, "mock-model",
-    "model picker should render backend identifiers in the detail column")
+  local model_option = model_picker.spec.page_list[1].option_list[1]
+  assert_equals(model_option.label, "mock-model", "model picker should lead with the backend model id")
+  assert_true(not model_option.detail:find("Redundant provider label", 1, true),
+    "model picker should never render the redundant provider label")
+  assert_true(model_option.detail:find("low", 1, true) < model_option.detail:find("100K", 1, true)
+      and model_option.detail:find("100K", 1, true) < model_option.detail:find("Vision", 1, true)
+      and model_option.detail:find("Vision", 1, true) < model_option.detail:find("Backend supplied", 1, true),
+    "model picker should order reasoning, context, vision, and description")
+  model_picker.spec.action_list[3].callback()
+  model_picker = require("diff_review.views.picker")._state_for_test()
+  assert_true(model_picker.spec.page_list[1].option_list[1].detail:find("high", 1, true) ~= nil,
+    "right should cycle the selected reasoning effort")
+  model_picker.spec.action_list[1].callback()
+  model_picker = require("diff_review.views.picker")._state_for_test()
+  model_picker.spec.action_list[3].callback()
+  model_picker = require("diff_review.views.picker")._state_for_test()
+  assert_true(model_picker.spec.page_list[1].option_list[1].detail:find("200K", 1, true) ~= nil,
+    "Tab followed by right should cycle the selected context window")
   vim.fn.maparg("<CR>", "n", false, true).callback()
   assert_true(vim.wait(1000, function()
     return request_by_method["session.configure"]
       and request_by_method["session.configure"].params.model == "mock-model"
+      and request_by_method["session.configure"].params.effort == "high"
+      and request_by_method["session.configure"].params.context_window == "long_context"
   end, 10), "model selection should configure the chosen backend model")
   local command_source = require("diff_review.views.harness.completion.command_source").new()
   vim.api.nvim_set_current_win(session.harness.composer_win)

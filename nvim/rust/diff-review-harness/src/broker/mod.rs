@@ -21,7 +21,7 @@ use crate::plan::{
 };
 use crate::protocol::{BrokerEvent, BrokerRequest, BrokerResponse};
 use crate::session::{
-    ContextUsage, ExecutionMode, HarnessPreference, HarnessSession, SessionStore,
+    ContextUsage, ExecutionMode, HarnessPreference, HarnessSession, ModelSetting, SessionStore,
 };
 use crate::storage::SqliteStore;
 use crate::timeline::{TimelineEntry, TimelineProjector};
@@ -368,7 +368,8 @@ impl HarnessBroker {
                             effort: preference
                                 .as_ref()
                                 .map_or(request.effort, |value| value.effort.clone()),
-                            fast_mode: preference.is_some_and(|value| value.fast_mode),
+                            context_window: None,
+                            fast_mode: preference.as_ref().is_some_and(|value| value.fast_mode),
                             execution_mode: ExecutionMode::Read,
                             created_at_ms: now_ms,
                             updated_at_ms: now_ms,
@@ -380,6 +381,12 @@ impl HarnessBroker {
                             native_compact: backend_descriptor.capability.native_compact,
                             context_usage: None,
                         };
+                        session.context_window = preference.as_ref().and_then(|preference| {
+                            preference
+                                .model_setting
+                                .get(&session.model)
+                                .and_then(|setting| setting.context_window.clone())
+                        });
                         acquire_lease(&mut session, &request.client_id, now_ms)?;
                         session
                     }
@@ -394,14 +401,11 @@ impl HarnessBroker {
         }
         session.updated_at_ms = now_ms;
         store.save_session(&session)?;
+        let previous_preference = store.load_preference(&session.workspace, &session.backend)?;
         store.save_preference(
             &session.workspace,
             &session.backend,
-            &HarnessPreference {
-                model: session.model.clone(),
-                effort: session.effort.clone(),
-                fast_mode: session.fast_mode,
-            },
+            &preference_for_session(&session, previous_preference),
         )?;
         let mut capability = backend_descriptor.capability;
         capability.native_fork = session.native_fork || capability.native_fork;
@@ -1147,10 +1151,24 @@ impl HarnessBroker {
     }
 
     async fn list_backend_model(&mut self) -> Result<(Value, Vec<BrokerEvent>)> {
-        let model_list = self
+        let mut model_list = self
             .backend
             .model_list(self.backend_request(String::new(), PromptMode::Chat))
             .await?;
+        let preference = self
+            .store
+            .load_preference(&self.session.workspace, &self.session.backend)?;
+        for model in &mut model_list {
+            let setting = preference
+                .as_ref()
+                .and_then(|preference| preference.model_setting.get(&model.id));
+            model.selected_reasoning = setting
+                .and_then(|setting| setting.reasoning.clone())
+                .or_else(|| model.default_reasoning.clone());
+            model.selected_context_window = setting
+                .and_then(|setting| setting.context_window.clone())
+                .or_else(|| model.default_context_window.clone());
+        }
         if self.session.model == "default"
             && let Some(model) = model_list
                 .iter()
@@ -3373,6 +3391,7 @@ impl HarnessBroker {
             provider_label: self.session.provider_label.clone(),
             resolved_model: self.session.resolved_model.clone(),
             effort: self.session.effort.clone(),
+            context_window: self.session.context_window.clone(),
             fast_mode: self.session.fast_mode,
             execution_mode: ExecutionMode::Read,
             created_at_ms: now_ms,
@@ -3536,6 +3555,12 @@ impl HarnessBroker {
             anyhow::ensure!(!effort.trim().is_empty(), "effort cannot be empty");
             self.session.effort = effort.to_owned();
         }
+        if params.get("context_window").is_some() {
+            self.session.context_window = params
+                .get("context_window")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+        }
         if let Some(fast_mode) = params.get("fast_mode").and_then(Value::as_bool) {
             anyhow::ensure!(
                 self.capability.native_goal,
@@ -3641,6 +3666,7 @@ impl HarnessBroker {
                 mode: PromptMode::Chat,
                 model: source.model.clone(),
                 effort: source.effort.clone(),
+                context_window: source.context_window.clone(),
                 fast_mode: source.fast_mode,
                 execution_mode: ExecutionMode::Read,
                 backend_session_id: source.backend_session_id.clone(),
@@ -3747,6 +3773,7 @@ impl HarnessBroker {
             mode,
             model: self.session.model.clone(),
             effort: self.session.effort.clone(),
+            context_window: self.session.context_window.clone(),
             fast_mode: self.session.fast_mode,
             execution_mode: self.session.execution_mode,
             backend_session_id: self.session.backend_session_id.clone(),
@@ -3769,14 +3796,13 @@ impl HarnessBroker {
     }
 
     fn save_preference(&mut self) -> Result<()> {
+        let previous = self
+            .store
+            .load_preference(&self.session.workspace, &self.session.backend)?;
         self.store.save_preference(
             &self.session.workspace,
             &self.session.backend,
-            &HarnessPreference {
-                model: self.session.model.clone(),
-                effort: self.session.effort.clone(),
-                fast_mode: self.session.fast_mode,
-            },
+            &preference_for_session(&self.session, previous),
         )
     }
 
@@ -3825,6 +3851,28 @@ fn load_agent_registry(store: &SqliteStore, session_id: &str) -> Result<AgentReg
     Ok(AgentRegistry::from_run_list(
         store.list_agent_run(session_id)?,
     ))
+}
+
+fn preference_for_session(
+    session: &HarnessSession,
+    previous: Option<HarnessPreference>,
+) -> HarnessPreference {
+    let mut model_setting = previous
+        .map(|preference| preference.model_setting)
+        .unwrap_or_default();
+    model_setting.insert(
+        session.model.clone(),
+        ModelSetting {
+            reasoning: Some(session.effort.clone()),
+            context_window: session.context_window.clone(),
+        },
+    );
+    HarnessPreference {
+        model: session.model.clone(),
+        effort: session.effort.clone(),
+        model_setting,
+        fast_mode: session.fast_mode,
+    }
 }
 
 fn required_text(value: &Value, field: &str) -> Result<String> {
@@ -4352,6 +4400,7 @@ mod test {
             provider_label: "Mock backend".into(),
             resolved_model: Some("model".into()),
             effort: "low".into(),
+            context_window: None,
             fast_mode: false,
             execution_mode: ExecutionMode::Read,
             created_at_ms: 0,
@@ -4367,6 +4416,35 @@ mod test {
         assert!(acquire_lease(&mut session, "two", 10).is_err());
         assert!(acquire_lease(&mut session, "two", 21).is_ok());
         assert_eq!(FixedClock(5).now_ms(), 5);
+
+        let mut model_setting = std::collections::BTreeMap::new();
+        model_setting.insert(
+            "other-model".into(),
+            ModelSetting {
+                reasoning: Some("high".into()),
+                context_window: Some("long_context".into()),
+            },
+        );
+        let preference = preference_for_session(
+            &session,
+            Some(HarnessPreference {
+                model: "other-model".into(),
+                effort: "high".into(),
+                model_setting,
+                fast_mode: false,
+            }),
+        );
+        assert_eq!(preference.model_setting.len(), 2);
+        assert_eq!(
+            preference.model_setting["other-model"]
+                .context_window
+                .as_deref(),
+            Some("long_context")
+        );
+        assert_eq!(
+            preference.model_setting["model"].reasoning.as_deref(),
+            Some("low")
+        );
     }
 
     fn git(workspace: &Path, args: &[&str]) {
@@ -4811,10 +4889,52 @@ mod test {
             .dispatch(BrokerRequest {
                 id: 1,
                 method: "session.configure".into(),
-                params: json!({ "model": "gpt-5.6", "effort": "low", "fast_mode": true }),
+                params: json!({
+                    "model": "gpt-5.6",
+                    "effort": "low",
+                    "context_window": "default",
+                    "fast_mode": true
+                }),
             })
             .await;
         assert!(configured.response.error.is_none());
+        broker
+            .dispatch(BrokerRequest {
+                id: 11,
+                method: "session.configure".into(),
+                params: json!({
+                    "model": "gpt-5.4",
+                    "effort": "high",
+                    "context_window": "long_context"
+                }),
+            })
+            .await;
+        broker
+            .dispatch(BrokerRequest {
+                id: 12,
+                method: "session.configure".into(),
+                params: json!({
+                    "model": "gpt-5.6",
+                    "effort": "low",
+                    "context_window": "default"
+                }),
+            })
+            .await;
+        let preference = broker
+            .store
+            .load_preference(&broker.session.workspace, &broker.session.backend)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            preference.model_setting["gpt-5.4"]
+                .context_window
+                .as_deref(),
+            Some("long_context")
+        );
+        assert_eq!(
+            preference.model_setting["gpt-5.6"].reasoning.as_deref(),
+            Some("low")
+        );
         let created = broker
             .dispatch(BrokerRequest {
                 id: 2,
@@ -4826,6 +4946,7 @@ mod test {
         assert_eq!(session["name"], "");
         assert_eq!(session["model"], "gpt-5.6");
         assert_eq!(session["effort"], "low");
+        assert_eq!(session["context_window"], "default");
         assert_eq!(session["fast_mode"], true);
         assert_eq!(session["execution_mode"], "read");
         let selected = broker

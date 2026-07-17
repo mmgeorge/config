@@ -27,6 +27,7 @@ fn request(workspace: &Path, mode: PromptMode, text: &str) -> BackendRequest {
         mode,
         model: "gpt-5.6-terra".into(),
         effort: "low".into(),
+        context_window: None,
         fast_mode: true,
         execution_mode: if mode == PromptMode::Plan {
             ExecutionMode::Read
@@ -35,6 +36,31 @@ fn request(workspace: &Path, mode: PromptMode, text: &str) -> BackendRequest {
         },
         backend_session_id: None,
     }
+}
+
+#[tokio::test]
+#[ignore = "requires an installed and authenticated Codex CLI"]
+async fn lists_backend_owned_codex_model_metadata() {
+    let repository = tempfile::tempdir().unwrap();
+    let backend = CodexBackend::new(vec!["codex".into(), "app-server".into()]).unwrap();
+
+    let model_list = tokio::time::timeout(
+        Duration::from_secs(30),
+        backend.model_list(request(repository.path(), PromptMode::Chat, "")),
+    )
+    .await
+    .expect("Codex model list timed out")
+    .unwrap();
+
+    assert!(!model_list.is_empty());
+    assert!(model_list.iter().all(|model| !model.id.is_empty()));
+    assert!(
+        model_list
+            .iter()
+            .all(|model| model.selected_reasoning.is_none())
+    );
+    assert!(model_list.iter().any(|model| !model.reasoning.is_empty()));
+    assert!(model_list.iter().any(|model| model.description.is_some()));
 }
 
 #[tokio::test]
@@ -122,7 +148,7 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
         .iter()
         .find(|model| model.id == "gpt-5.6-terra")
         .expect("gpt-5.6-terra is required for the fast Harness integration test");
-    assert!(model.effort.iter().any(|effort| effort == "low"));
+    assert!(model.reasoning.iter().any(|effort| effort == "low"));
 
     let planning = backend.prompt(request(
         repository.path(),

@@ -931,6 +931,14 @@ transports and expose capability values that drive broker and editor behavior. `
 remains private to the Codex implementation. `CopilotEventDecoder` remains private to the native
 Copilot SDK implementation. Consumer-owned traits stay beside the feature that consumes them.
 
+`BackendModel` forms the provider-neutral model-picker contract. Each backend supplies the model
+identifier, ordered reasoning choices, context-window tiers, vision capability, and optional
+description. It never supplies a display label because the model identifier already owns that
+identity in the UI. The broker overlays durable reasoning and context selections per model before
+Lua receives the catalog. `views/harness/model_picker.lua` therefore owns only picker interaction
+state, field cycling, and presentation order. Copilot maps the selected context tier into native
+session creation and `set_model`, while Codex exposes only the controls returned by app-server.
+
 The broker runs once per Neovim process over JSONL stdio. Provider events cross a live
 channel into `TimelineReducer`, which owns one active thought inside the current `MainSegment`.
 `InteractionRecord` persists an ordered `InteractionNode` list containing main segments,

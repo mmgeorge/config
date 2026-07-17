@@ -1,5 +1,6 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Defines the execution boundary selected for one Harness session.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -96,6 +97,8 @@ pub struct HarnessSession {
     pub resolved_model: Option<String>,
     pub effort: String,
     #[serde(default)]
+    pub context_window: Option<String>,
+    #[serde(default)]
     pub fast_mode: bool,
     #[serde(default)]
     pub execution_mode: ExecutionMode,
@@ -119,7 +122,16 @@ pub struct HarnessPreference {
     pub model: String,
     pub effort: String,
     #[serde(default)]
+    pub model_setting: BTreeMap<String, ModelSetting>,
+    #[serde(default)]
     pub fast_mode: bool,
+}
+
+/// Stores durable controls selected for one provider model.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ModelSetting {
+    pub reasoning: Option<String>,
+    pub context_window: Option<String>,
 }
 
 impl HarnessSession {

@@ -5,8 +5,8 @@ use crate::backend::approval::{
     ApprovalResolution, PermissionCoordinator, permission_from_copilot, protected_target,
 };
 use crate::backend::{
-    Backend, BackendCapability, BackendDescriptor, BackendEvent, BackendEventSink, BackendKind,
-    BackendModel, BackendOutput, BackendRequest,
+    Backend, BackendCapability, BackendContextWindow, BackendDescriptor, BackendEvent,
+    BackendEventSink, BackendKind, BackendModel, BackendOutput, BackendRequest,
 };
 use crate::control_tools::{ControlToolInvocation, ControlToolRegistry, apply_invocation};
 use crate::session::ExecutionMode;
@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use event_decoder::CopilotEventDecoder;
 use github_copilot_sdk::handler::{PermissionHandler, PermissionResult};
 use github_copilot_sdk::tool::ToolHandler;
+use github_copilot_sdk::types::ContextTier;
 use github_copilot_sdk::{
     CliProgram, Client, ClientOptions, DeliveryMode, MessageOptions, Model, PermissionRequestData,
     PermissionRequestKind, RequestId, ResumeSessionConfig, SessionConfig, SessionId,
@@ -95,8 +96,7 @@ impl CopilotBackend {
                 session
                     .set_model(
                         &request.model,
-                        reasoning_effort
-                            .map(|effort| SetModelOptions::default().with_reasoning_effort(effort)),
+                        model_options(reasoning_effort, request.context_window.as_deref()),
                     )
                     .await
                     .context("set Copilot session model")?;
@@ -122,6 +122,7 @@ impl CopilotBackend {
             let mut config = ResumeSessionConfig::new(SessionId::new(session_id));
             config.model = (request.model != "default").then(|| request.model.clone());
             config.reasoning_effort = reasoning_effort.clone();
+            config.context_tier = request.context_window.clone();
             config.streaming = Some(true);
             config.system_message = Some(system_message);
             config.tools = Some(tool_list);
@@ -137,6 +138,7 @@ impl CopilotBackend {
             let mut config = SessionConfig::default();
             config.model = (request.model != "default").then(|| request.model.clone());
             config.reasoning_effort = reasoning_effort;
+            config.context_tier = request.context_window.clone();
             config.streaming = Some(true);
             config.system_message = Some(system_message);
             config.tools = Some(tool_list);
@@ -408,11 +410,65 @@ impl Drop for CopilotTurnEventGuard<'_> {
 }
 
 fn model_descriptor(model: Model) -> BackendModel {
+    let output_limit = model
+        .capabilities
+        .limits
+        .as_ref()
+        .and_then(|limit| limit.max_output_tokens)
+        .unwrap_or(0);
+    let token_price = model
+        .billing
+        .as_ref()
+        .and_then(|billing| billing.token_prices.as_ref());
+    let mut context_window = Vec::new();
+    if let Some(default_limit) = token_price.and_then(|price| price.max_prompt_tokens) {
+        context_window.push(BackendContextWindow {
+            id: "default".into(),
+            token_limit: u64::try_from(default_limit.saturating_add(output_limit)).ok(),
+        });
+    } else if let Some(default_limit) = model
+        .capabilities
+        .limits
+        .as_ref()
+        .and_then(|limit| limit.max_context_window_tokens)
+    {
+        context_window.push(BackendContextWindow {
+            id: "default".into(),
+            token_limit: u64::try_from(default_limit).ok(),
+        });
+    }
+    if let Some(long_limit) = token_price
+        .and_then(|price| price.long_context.as_ref())
+        .and_then(|long_context| long_context.max_prompt_tokens)
+    {
+        context_window.push(BackendContextWindow {
+            id: "long_context".into(),
+            token_limit: u64::try_from(long_limit.saturating_add(output_limit)).ok(),
+        });
+    }
+    let vision = model
+        .capabilities
+        .supports
+        .as_ref()
+        .and_then(|supports| supports.vision)
+        .unwrap_or_else(|| {
+            model
+                .capabilities
+                .limits
+                .as_ref()
+                .is_some_and(|limit| limit.vision.is_some())
+        });
     BackendModel {
         is_default: model.id == "auto",
         id: model.id,
-        label: model.name,
-        effort: model.supported_reasoning_efforts.unwrap_or_default(),
+        reasoning: model.supported_reasoning_efforts.unwrap_or_default(),
+        default_reasoning: model.default_reasoning_effort,
+        selected_reasoning: None,
+        context_window,
+        default_context_window: Some("default".into()),
+        selected_context_window: None,
+        vision,
+        description: None,
     }
 }
 
@@ -420,8 +476,14 @@ fn default_model_descriptor() -> BackendModel {
     BackendModel {
         is_default: true,
         id: "default".into(),
-        label: "Auto".into(),
-        effort: Vec::new(),
+        reasoning: Vec::new(),
+        default_reasoning: None,
+        selected_reasoning: None,
+        context_window: Vec::new(),
+        default_context_window: None,
+        selected_context_window: None,
+        vision: false,
+        description: None,
     }
 }
 
@@ -435,8 +497,32 @@ fn selected_reasoning_effort(
     model_list
         .iter()
         .find(|model| model.id == request.model)
-        .filter(|model| model.effort.iter().any(|effort| effort == &request.effort))
+        .filter(|model| {
+            model
+                .reasoning
+                .iter()
+                .any(|effort| effort == &request.effort)
+        })
         .map(|_| request.effort.clone())
+}
+
+fn model_options(
+    reasoning_effort: Option<String>,
+    context_window: Option<&str>,
+) -> Option<SetModelOptions> {
+    let mut options = SetModelOptions::default();
+    if let Some(reasoning_effort) = reasoning_effort {
+        options = options.with_reasoning_effort(reasoning_effort);
+    }
+    if let Some(context_window) = context_window {
+        let context_tier = match context_window {
+            "default" => ContextTier::Default,
+            "long_context" => ContextTier::LongContext,
+            _ => return Some(options),
+        };
+        options = options.with_context_tier(context_tier);
+    }
+    (options.reasoning_effort.is_some() || options.context_tier.is_some()).then_some(options)
 }
 
 #[derive(Default)]
@@ -663,14 +749,21 @@ mod test {
             mode: crate::backend::PromptMode::Chat,
             model: "default".into(),
             effort: "low".into(),
+            context_window: None,
             fast_mode: false,
             execution_mode: ExecutionMode::Read,
             backend_session_id: None,
         };
         let model_list = vec![BackendModel {
             id: "gpt-test".into(),
-            label: "GPT Test".into(),
-            effort: vec!["medium".into()],
+            reasoning: vec!["medium".into()],
+            default_reasoning: Some("medium".into()),
+            selected_reasoning: None,
+            context_window: Vec::new(),
+            default_context_window: None,
+            selected_context_window: None,
+            vision: false,
+            description: None,
             is_default: false,
         }];
         assert_eq!(selected_reasoning_effort(&model_list, &request), None);
@@ -689,8 +782,49 @@ mod test {
 
         assert!(model.is_default);
         assert_eq!(model.id, "default");
-        assert_eq!(model.label, "Auto");
-        assert!(model.effort.is_empty());
+        assert!(model.reasoning.is_empty());
+        assert!(model.context_window.is_empty());
+    }
+
+    #[test]
+    fn maps_provider_reasoning_context_and_vision_metadata() {
+        let model: Model = serde_json::from_value(serde_json::json!({
+            "id": "gpt-test",
+            "name": "Ignored display label",
+            "defaultReasoningEffort": "low",
+            "supportedReasoningEfforts": ["low", "high"],
+            "capabilities": {
+                "limits": { "max_output_tokens": 28000 },
+                "supports": { "reasoningEffort": true, "vision": true }
+            },
+            "billing": {
+                "tokenPrices": {
+                    "maxPromptTokens": 300000,
+                    "longContext": { "maxPromptTokens": 1072000 }
+                }
+            }
+        }))
+        .unwrap();
+
+        let descriptor = model_descriptor(model);
+
+        assert_eq!(descriptor.id, "gpt-test");
+        assert_eq!(descriptor.reasoning, ["low", "high"]);
+        assert_eq!(descriptor.default_reasoning.as_deref(), Some("low"));
+        assert_eq!(descriptor.context_window[0].token_limit, Some(328_000));
+        assert_eq!(descriptor.context_window[1].token_limit, Some(1_100_000));
+        assert!(descriptor.vision);
+    }
+
+    #[test]
+    fn applies_reasoning_and_context_to_a_native_model_switch() {
+        let options = model_options(Some("high".into()), Some("long_context")).unwrap();
+
+        assert_eq!(options.reasoning_effort.as_deref(), Some("high"));
+        assert!(matches!(
+            options.context_tier,
+            Some(ContextTier::LongContext)
+        ));
     }
 
     #[test]

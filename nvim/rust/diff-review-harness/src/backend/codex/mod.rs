@@ -170,12 +170,23 @@ impl CodexBackend {
                     .collect();
                 Some(BackendModel {
                     id: id.to_owned(),
-                    label: model
-                        .get("displayName")
+                    default_reasoning: model
+                        .get("defaultReasoningEffort")
                         .and_then(Value::as_str)
-                        .unwrap_or(id)
-                        .to_owned(),
-                    effort,
+                        .map(str::to_owned),
+                    reasoning: effort,
+                    selected_reasoning: None,
+                    context_window: Vec::new(),
+                    default_context_window: None,
+                    selected_context_window: None,
+                    vision: model
+                        .get("supportsVision")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    description: model
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
                     is_default: model
                         .get("isDefault")
                         .and_then(Value::as_bool)

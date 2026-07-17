@@ -687,6 +687,7 @@ mod test {
             provider_label: "Copilot CLI".into(),
             resolved_model: None,
             effort: "medium".into(),
+            context_window: None,
             fast_mode: false,
             execution_mode: crate::session::ExecutionMode::Read,
             created_at_ms: 1,
@@ -833,6 +834,7 @@ mod test {
         let preference = HarnessPreference {
             model: "remembered-model".into(),
             effort: "low".into(),
+            model_setting: Default::default(),
             fast_mode: true,
         };
         store
