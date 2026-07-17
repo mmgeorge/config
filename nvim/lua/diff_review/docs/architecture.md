@@ -941,7 +941,11 @@ its first parent app-server turn. It retains the JSON-RPC process while descenda
 active, accepts steering as another parent turn on the same thread, and starts a bounded synthesis
 turn after the final child completes. Child lifecycle updates replace `AgentRun` state behind the
 existing `AgentReference`, so they never move the child row. `ActiveWait` drives only the current
-`Waiting on N subagents` row. Clearing that state removes the row without creating historical data.
+Timeline Status at the end of the Main timeline. The status uses an animated spinner followed by
+`Waiting for N subagents` and carries no duration because it represents current control state, not
+history. Clearing `ActiveWait` removes the status without creating a timeline node. A normal
+Harness submit while this status remains active uses the parent steering lane immediately. Ctrl-q
+retains its explicit steering shortcut, and child timelines never project Main control state.
 
 `turn.cancel` bypasses the broker's serialized request queue so Ctrl-c can interrupt an active
 provider turn instead of waiting behind it. The broker drops the prompt future, asks the backend
@@ -1141,13 +1145,17 @@ The main question float never maps Ctrl-s and cannot bypass this review boundary
 
 Answer and skip requests update only the durable elicitation record. Ask and subsequent ordinary
 Harness prompts run read-only clarification interactions while leaving the same question active.
-The float reopens after an Ask response, `/questions` restores it after an intentional close, and
-the broker serializes missing answers as intentional best-judgment decisions only when the user
-explicitly continues. A provisional `QuestionAnswered` lifecycle record is removed if that
+Closing the float leaves a Timeline Status reading `Waiting for input (press oe)`. Clarification
+chat can continue without reopening that unchanged question set, while `oe` or `/questions`
+restores it explicitly. A provider replacement increments the elicitation revision, preserves only
+answers that remain valid against the new schema, and presents the revised questions once. The
+status takes precedence over a concurrent subagent wait because user input blocks provider
+continuation. The broker serializes missing answers as intentional best-judgment decisions only
+when the user explicitly continues. A provisional `QuestionAnswered` lifecycle record is removed if that
 continuation turn fails, so the timeline never claims feedback was consumed while the elicitation
 has been restored.
-Question IDs prevent a restored session from repeatedly presenting the same picker, while the
-durable timeline and winbar still expose the pending decision after dismissal or restart.
+Elicitation revisions prevent a restored session from repeatedly presenting the same picker, while
+the transient Timeline Status exposes the pending decision after dismissal or restart.
 Successful submission adds a
 collapsed `Plan created` or `Plan revision created` lifecycle node and increments the artifact
 count in the winbar. Harness never opens PlanReview automatically. `op` selects a session artifact

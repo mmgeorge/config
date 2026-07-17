@@ -67,7 +67,6 @@ function M.apply_node(state, update)
   local node = update.node
   if type(node) ~= "table" then return end
   local interaction = resolve(state, update.interaction_id)
-  if node.kind == "steering_prompt" then interaction.active_wait = nil end
   interaction.node_list = interaction.node_list or {}
   local node_id = node.segment and node.segment.id
     or node.agent and node.agent.id
@@ -90,9 +89,8 @@ end
 ---@param state DiffReviewHarnessPresentationState
 ---@param update table
 function M.apply_wait(state, update)
-  if type(update) ~= "table" or not update.interaction_id then return end
-  local interaction = resolve(state, update.interaction_id)
-  interaction.active_wait = type(update.wait) == "table" and vim.deepcopy(update.wait) or nil
+  if type(update) ~= "table" then return end
+  state.active_wait = type(update.wait) == "table" and vim.deepcopy(update.wait) or nil
 end
 
 ---@param state DiffReviewHarnessPresentationState
@@ -115,7 +113,6 @@ function M.complete_interaction(state, completed)
   local current = resolve(state, completed.id)
   for key in pairs(current) do current[key] = nil end
   for key, value in pairs(vim.deepcopy(completed)) do current[key] = value end
-  current.active_wait = nil
   state.pending_interaction = nil
 end
 
@@ -144,7 +141,6 @@ function M.fail_pending(state, message)
   local interaction = state.pending_interaction
   if not interaction then return end
   interaction.state = "failed"
-  interaction.active_wait = nil
   interaction.node_list = interaction.node_list or {}
   interaction.node_list[#interaction.node_list + 1] = {
     kind = "main_segment",

@@ -372,6 +372,7 @@ local function fake_launcher(command, options, _)
           state = "awaiting_input",
           working_path = "",
           elicitation = {
+            revision = 1,
             question_set = question_set,
             answer = {},
             current_index = 0,
@@ -393,12 +394,20 @@ local function fake_launcher(command, options, _)
           owner = "interaction",
           interaction_id = interaction_id,
           elicitation = {
+            revision = 1,
             question_set = planning_question_set(),
             answer = {},
             current_index = 0,
             clarification_active = false,
           },
         }
+        emit(options, { event = "question", payload = active_elicitation })
+      elseif request.params.text == "replace choices" and active_elicitation then
+        local replacement = planning_question_set()
+        replacement.id = "question-set-replacement"
+        replacement.questions[1].question = "Which revised migration strategy should the plan use?"
+        active_elicitation.elicitation.question_set = replacement
+        active_elicitation.elicitation.revision = active_elicitation.elicitation.revision + 1
         emit(options, { event = "question", payload = active_elicitation })
       elseif request.params.text:match("^/plan ") then
         active_plan = {
@@ -740,7 +749,6 @@ local ok, failure = pcall(function()
       prompt = "/agent explorer inspect Bevy",
       state = "running",
       duration_ms = 1000,
-      active_wait = { interaction_id = "parent-turn", started_at_ms = 1000, agent_count = 1 },
       thought = { {
         id = "delegation-thought",
         text = "Delegating the repository map.",
@@ -765,11 +773,13 @@ local ok, failure = pcall(function()
         active = { text = "Inspecting Bevy ownership.", tool_count = 0, failed_count = 0 },
       } },
     } },
-  } }, { now_ms = 3000 })
+  } }, { now_ms = 3000, timeline_status = { id = "subagents", text = "Waiting for 1 subagent" } })
   assert_equals(parent_with_agent.lines[2], "▸ Thinking for 1s, 1 agent spawned",
     "a parent interaction should summarize its owned child run")
-  assert_true(vim.tbl_contains(parent_with_agent.lines, "▸ Waiting on 1 subagent for 2s"),
+  assert_true(vim.tbl_contains(parent_with_agent.lines, "  Waiting for 1 subagent"),
     "a parent without active work should expose its transient waiting state")
+  assert_equals(parent_with_agent.lines[parent_with_agent.timeline_status_line - 1], "",
+    "Timeline Status should always have one leading blank line")
   assert_true(vim.tbl_contains(parent_with_agent.lines, "▸ Agent Bevy scout running for 2s"),
     "the main timeline should keep child runtime at top-level indentation")
   parent_with_agent = interaction_renderer.build({ {
@@ -792,12 +802,12 @@ local ok, failure = pcall(function()
     "parent work should replace the synthetic waiting state while its child keeps running")
   local interaction_state = require("diff_review.views.harness.interaction_state")
   local steering_state = {
+    active_wait = { interaction_id = "steering-parent", started_at_ms = 1000, agent_count = 1 },
     interaction = { {
       id = "steering-parent",
       prompt = "/agent explorer inspect Bevy",
       state = "running",
       node_list = {},
-      active_wait = { interaction_id = "steering-parent", started_at_ms = 1000, agent_count = 1 },
     } },
   }
   steering_state.interaction_by_id = { ["steering-parent"] = steering_state.interaction[1] }
@@ -808,8 +818,11 @@ local ok, failure = pcall(function()
       prompt = { id = "steering-parent:steering:1", text = "What day is it?", created_at_ms = 2000 },
     },
   })
-  assert_true(steering_state.interaction[1].active_wait == nil,
-    "an acknowledged steering node should atomically remove transient waiting chrome")
+  assert_true(steering_state.active_wait ~= nil,
+    "timeline nodes should not own session-level waiting state")
+  interaction_state.apply_wait(steering_state, { interaction_id = "steering-parent", wait = nil })
+  assert_true(steering_state.active_wait == nil,
+    "an explicit wait update should atomically remove transient waiting chrome")
   assert_equals(steering_state.interaction[1].node_list[1].prompt.text, "What day is it?",
     "steering should retain its chronological position after waiting disappears")
   local projected_timeline = require("diff_review.views.harness.timeline").project({
@@ -1594,10 +1607,32 @@ local ok, failure = pcall(function()
   assert_equals(session.harness.active_elicitation.owner, "interaction",
     "ordinary questions should remain interaction-owned instead of creating a plan")
   vim.fn.maparg("q", "n", false, true).callback()
-  assert_true(vim.wo[session.harness.transcript_win].winbar:find("Input requested (press oe)", 1, true) ~= nil,
-    "closed ordinary questions should advertise the configured reopen key")
+  controller.render()
+  local question_timeline = vim.api.nvim_buf_get_lines(session.harness.transcript_buf, 0, -1, false)
+  assert_true(vim.tbl_contains(question_timeline, "  Waiting for input (press oe)"),
+    "closed ordinary questions should advertise the configured reopen key in Timeline Status")
+  assert_true(vim.wo[session.harness.transcript_win].winbar:find("Input requested", 1, true) == nil,
+    "pending input should no longer duplicate status in the winbar")
   assert_true(has_buffer_keymap(session.harness.transcript_buf, "n", "oe"),
     "Harness should bind the configured question reopen action")
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "clarify choices" })
+  controller.submit()
+  assert_true(vim.wait(1000, function() return not session.harness.busy end, 10),
+    "clarification chat should complete while the question remains pending")
+  assert_true(not ordinary_question_view.is_open(),
+    "an unchanged question revision should remain dismissed after clarification chat")
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "replace choices" })
+  controller.submit()
+  assert_true(vim.wait(1000, ordinary_question_view.is_open, 10),
+    "a provider-replaced question revision should present automatically")
+  local replacement_question_state = ordinary_question_view._state_for_test()
+  local replacement_question_text = table.concat(
+    vim.api.nvim_buf_get_lines(replacement_question_state.buf, 0, -1, false),
+    "\n"
+  )
+  assert_true(replacement_question_text:find("Which revised migration strategy", 1, true) ~= nil,
+    "the replacement picker should render the provider's current questions")
+  vim.fn.maparg("q", "n", false, true).callback()
   vim.api.nvim_set_current_win(session.harness.transcript_win)
   vim.fn.maparg("oe", "n", false, true).callback()
   assert_true(vim.wait(1000, ordinary_question_view.is_open, 10),
@@ -1605,7 +1640,7 @@ local ok, failure = pcall(function()
   vim.fn.maparg("q", "n", false, true).callback()
   active_elicitation = nil
   session.harness.active_elicitation = nil
-  session.harness.presented_question_set_id = nil
+  session.harness.presented_question_key = nil
 
   local file_source = require("diff_review.views.harness.completion.file_source").new()
   vim.api.nvim_set_current_win(session.harness.composer_win)
@@ -2179,6 +2214,19 @@ local ok, failure = pcall(function()
   assert_equals(#session.harness.queue, 0,
     "successful steering should not leave a queued follow-up")
 
+  session.harness.active_wait = { interaction_id = "active", agent_count = 1 }
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false,
+    { "Also inspect the transaction layer" })
+  controller.submit()
+  assert_true(vim.wait(1000, function()
+    return steered_text_list[#steered_text_list] == "Also inspect the transaction layer"
+      and #(session.harness.pending_steer or {}) == 0
+  end, 10), "C-s should start immediate parent chat while Main waits on a subagent")
+  assert_equals(prompt_count, prompt_count_before_steer,
+    "wait chat should reuse the parent turn instead of creating a concurrent broker interaction")
+  assert_equals(#session.harness.queue, 0, "admitted wait chat should not enter the follow-up queue")
+  session.harness.active_wait = nil
+
   steer_should_fail = true
   vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false,
     { "Preserve the verification section" })
@@ -2249,9 +2297,11 @@ local ok, failure = pcall(function()
     "Ask should always own the a key")
   vim.fn.maparg("q", "n", false, true).callback()
   assert_true(not question_view.is_open(), "q should hide the question float without resolving it")
-  assert_true(vim.wo[session.harness.transcript_win].winbar:find(
-    "Planning: feedback requested (press oe)", 1, true
-  ) ~= nil, "closed planning questions should advertise the configured reopen key")
+  controller.render()
+  assert_true(vim.tbl_contains(
+    vim.api.nvim_buf_get_lines(session.harness.transcript_buf, 0, -1, false),
+    "  Waiting for input (press oe)"
+  ), "closed planning questions should advertise the configured reopen key in Timeline Status")
   vim.api.nvim_set_current_win(session.harness.transcript_win)
   vim.fn.maparg("oe", "n", false, true).callback()
   assert_true(vim.wait(1000, question_view.is_open, 10), "oe should reopen durable planning elicitation state")
@@ -2289,8 +2339,12 @@ local ok, failure = pcall(function()
   vim.api.nvim_buf_set_lines(question_state.input_buf, 0, -1, false, { "Why does full verification matter?" })
   vim.fn.maparg("<C-s>", "i", false, true).callback()
   assert_true(vim.wait(2000, function()
-    return request_by_method["question.ask"] ~= nil and question_view.is_open()
+    return request_by_method["question.ask"] ~= nil and not session.harness.busy
   end, 10), "Ask should clarify without consuming the pending question")
+  assert_true(not question_view.is_open(), "clarification chat should leave the current question revision dismissed")
+  vim.api.nvim_set_current_win(session.harness.transcript_win)
+  vim.fn.maparg("oe", "n", false, true).callback()
+  assert_true(vim.wait(1000, question_view.is_open, 10), "oe should reopen the unchanged question revision")
   question_state = question_view._state_for_test()
   assert_equals(active_plan.elicitation.current_index, 2, "clarification should preserve the current question")
   vim.fn.maparg("n", "n", false, true).callback()

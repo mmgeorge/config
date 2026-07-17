@@ -127,6 +127,7 @@ pub struct PlanQuestionAnswer {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PlanElicitation {
     pub question_set: PlanQuestionSet,
+    pub revision: u32,
     #[serde(default)]
     pub answer: Vec<PlanQuestionAnswer>,
     #[serde(default)]
@@ -140,10 +141,36 @@ impl PlanElicitation {
     pub fn new(question_set: PlanQuestionSet) -> Self {
         Self {
             question_set,
+            revision: 1,
             answer: Vec::new(),
             current_index: 0,
             clarification_active: false,
         }
+    }
+
+    /// Replace provider questions while preserving responses that remain structurally valid.
+    pub fn replace_question_set(&mut self, question_set: PlanQuestionSet) {
+        self.answer.retain(|answer| {
+            question_set
+                .questions
+                .iter()
+                .find(|question| question.id == answer.question_id)
+                .is_some_and(|question| validate_response(question, &answer.response).is_ok())
+        });
+        self.question_set = question_set;
+        self.revision = self.revision.saturating_add(1);
+        self.current_index = self
+            .question_set
+            .questions
+            .iter()
+            .position(|question| {
+                !self
+                    .answer
+                    .iter()
+                    .any(|answer| answer.question_id == question.id)
+            })
+            .unwrap_or(self.question_set.questions.len());
+        self.clarification_active = false;
     }
 
     /// Resolve the question currently presented by the review UI.
@@ -640,5 +667,63 @@ mod test {
         assert!(feedback.contains("Staged — Keep one compatibility release"));
         assert_eq!(feedback.matches("intentionally unanswered").count(), 2);
         assert_eq!(elicitation.current_question().unwrap().id, "testing");
+    }
+
+    #[test]
+    fn replaces_questions_and_preserves_only_valid_answers() {
+        let option = |label: &str| PlanQuestionOption {
+            label: label.into(),
+            description: format!("Use {label}"),
+        };
+        let question = |id: &str, options: Vec<PlanQuestionOption>, allow_freeform| PlanQuestion {
+            id: id.into(),
+            header: id.into(),
+            question: format!("Choose {id}"),
+            options,
+            allow_freeform,
+        };
+        let mut elicitation = PlanElicitation::new(PlanQuestionSet {
+            id: "first".into(),
+            questions: vec![
+                question("kept", vec![option("Staged"), option("Immediate")], true),
+                question("invalid", vec![option("Local"), option("Remote")], true),
+                question("removed", Vec::new(), true),
+            ],
+        });
+        elicitation
+            .answer(
+                "kept",
+                PlanQuestionResponse::Selected {
+                    option: "Staged".into(),
+                    feedback: Some("retain feedback".into()),
+                },
+            )
+            .unwrap();
+        elicitation
+            .answer(
+                "invalid",
+                PlanQuestionResponse::Other {
+                    text: "custom".into(),
+                },
+            )
+            .unwrap();
+        elicitation
+            .answer("removed", PlanQuestionResponse::Skipped)
+            .unwrap();
+
+        elicitation.replace_question_set(PlanQuestionSet {
+            id: "second".into(),
+            questions: vec![
+                question("kept", vec![option("Staged"), option("Immediate")], true),
+                question("invalid", vec![option("Local"), option("Remote")], false),
+                question("new", Vec::new(), true),
+            ],
+        });
+
+        assert_eq!(elicitation.revision, 2);
+        assert_eq!(elicitation.answer.len(), 1);
+        assert_eq!(elicitation.answer[0].question_id, "kept");
+        assert_eq!(elicitation.current_question().unwrap().id, "invalid");
+        assert!(!elicitation.clarification_active);
     }
 }

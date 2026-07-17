@@ -88,6 +88,7 @@ M.empty_diff_rows = {}
 ---@field activity_range table[]
 ---@field active_plan table?
 ---@field active_elicitation table?
+---@field active_wait table?
 ---@field approval DiffReviewApprovalRequest[]
 ---@field approval_open boolean
 ---@field artifact table[]
@@ -101,7 +102,9 @@ M.empty_diff_rows = {}
 ---@field pending_config table?
 ---@field pending_mode string?
 ---@field plan_question_open boolean?
----@field presented_question_set_id string?
+---@field presented_question_key string?
+---@field timeline_status_timer uv.uv_timer_t?
+---@field timeline_status_line integer?
 ---@field prompt_history string[]
 ---@field prompt_history_index integer
 ---@field prompt_history_draft string?
@@ -139,6 +142,7 @@ M.harness = {
   activity_range = {},
   active_plan = nil,
   active_elicitation = nil,
+  active_wait = nil,
   approval = {},
   approval_open = false,
   artifact = {},
@@ -148,7 +152,9 @@ M.harness = {
   interactions = nil,
   plan_review = nil,
   plan_question_open = false,
-  presented_question_set_id = nil,
+  presented_question_key = nil,
+  timeline_status_timer = nil,
+  timeline_status_line = nil,
   prompt_history = {},
   prompt_history_index = 0,
   prompt_history_draft = nil,

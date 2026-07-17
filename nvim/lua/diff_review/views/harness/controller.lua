@@ -17,6 +17,8 @@ local context_status = require("diff_review.views.harness.context_status")
 local main_timeline = require("diff_review.views.harness.timeline")
 local snapshot = require("diff_review.views.harness.snapshot")
 local picker = require("diff_review.views.picker")
+local timeline_status = require("diff_review.views.harness.timeline_status")
+local question_presentation = require("diff_review.views.harness.question_presentation")
 
 local namespace = vim.api.nvim_create_namespace("DiffReviewHarnessTranscript")
 local queue_namespace = vim.api.nvim_create_namespace("DiffReviewHarnessQueue")
@@ -27,6 +29,7 @@ local working_started_ns = nil
 local render_observer_for_test = nil
 local render_pending = false
 local begin_request
+local submit_immediate
 
 ---@return table
 local function harness_state() return session.harness end
@@ -214,16 +217,6 @@ local function status_text()
       group = "DiffReviewStatusLabel",
     }
   end
-  if state.active_elicitation and state.active_elicitation.elicitation then
-    local reopen_key = keymaps.view_keys_for("harness", "reopen_question")[1]
-    local reopen_hint = reopen_key and (" (press " .. reopen_key .. ")") or ""
-    segment_list[#segment_list + 1] = {
-      text = state.active_elicitation.owner == "plan"
-          and (" • Planning: feedback requested" .. reopen_hint)
-        or (" • Input requested" .. reopen_hint),
-      group = "DiffReviewHarnessWrite",
-    }
-  end
   if #(state.approval or {}) > 0 then
     local reopen_key = keymaps.view_keys_for("harness", "reopen_question")[1]
     local reopen_hint = reopen_key and (" (press " .. reopen_key .. ")") or ""
@@ -279,6 +272,7 @@ function M.render(reset)
   end
   local agent_timeline = selected_agent_timeline(state)
   local timeline = agent_timeline or main_timeline.project(state)
+  local status = agent_timeline and nil or timeline_status.resolve(state)
   local render = renderer.build(timeline, {
     working_seconds = working_seconds(),
     content_width = transcript_visible and vim.api.nvim_win_get_width(transcript_win) or nil,
@@ -286,6 +280,7 @@ function M.render(reset)
     on_diff_update = function() vim.schedule(M.render) end,
     expanded = state.activity_expanded,
     now_ms = os.time() * 1000,
+    timeline_status = status,
   })
   state.prompt_line = render.prompt_lines
   state.activity_range = render.folds
@@ -294,6 +289,7 @@ function M.render(reset)
     reset = reset == true,
     follow_tail = follow_tail,
   })
+  timeline_status.synchronize(state, render.timeline_status_line)
   markdown.render(buf, transcript_win, render.markdown_ranges)
   if render_observer_for_test then
     render_observer_for_test(vim.deepcopy(render.lines), vim.deepcopy(transaction))
@@ -381,17 +377,14 @@ local function synchronize_state(callback)
     local state = harness_state()
     snapshot.apply(state, result)
     require("diff_review.views.harness.agent_picker").refresh()
-    if result.active_wait then
-      interaction_state.apply_wait(state, {
-        interaction_id = result.active_wait.interaction_id,
-        wait = result.active_wait,
-      })
-    end
     reconcile_approval_presentation(state)
     local elicitation = state.active_elicitation and state.active_elicitation.elicitation
-    local question_set_id = elicitation and elicitation.question_set and elicitation.question_set.id
-    if elicitation and question_set_id ~= state.presented_question_set_id then
-      vim.schedule(M.present_plan_question)
+    if elicitation and question_presentation.should_present(state) then
+      if state.plan_question_open then
+        require("diff_review.views.harness.plan_question").close()
+        state.plan_question_open = false
+      end
+      vim.schedule(function() M.present_plan_question(false) end)
     end
     if #state.approval > 0 then vim.schedule(M.present_approval) end
     M.render()
@@ -473,12 +466,25 @@ local function on_event(event, payload)
     end
   elseif event == "question" then
     state.active_elicitation = payload
-    vim.schedule(M.present_plan_question)
+    if question_presentation.should_present(state) then
+      if state.plan_question_open then
+        require("diff_review.views.harness.plan_question").close()
+        state.plan_question_open = false
+      end
+      vim.schedule(function() M.present_plan_question(false) end)
+    end
+    schedule_render()
   elseif event == "question_updated" then
     state.active_elicitation = payload
-    M.refresh_winbar()
+    if question_presentation.should_present(state) then
+      require("diff_review.views.harness.plan_question").close()
+      state.plan_question_open = false
+      vim.schedule(function() M.present_plan_question(false) end)
+    end
+    schedule_render()
   elseif event == "question_answered" then
     state.active_elicitation = nil
+    question_presentation.reset(state)
     synchronize_state()
   elseif event == "plan_question" then
     state.active_plan = payload.plan or state.active_plan
@@ -507,10 +513,11 @@ local function on_event(event, payload)
       state.goal = nil
       state.active_plan = nil
       state.active_elicitation = nil
+      state.active_wait = nil
       state.timeline = {}
       state.artifact = {}
       state.plan_question_open = false
-      state.presented_question_set_id = nil
+      question_presentation.reset(state)
       prompt_history.reset_navigation()
     end
     state.session = next_session
@@ -566,13 +573,13 @@ function M.present_approval()
   })
 end
 
----@return nil
-function M.present_plan_question()
+---@param force? boolean
+function M.present_plan_question(force)
   local state = harness_state()
   local elicitation = state.active_elicitation and state.active_elicitation.elicitation
   if state.busy or state.plan_question_open or not elicitation then return end
-  local question_set = elicitation.question_set or {}
-  state.presented_question_set_id = question_set.id
+  if not force and not question_presentation.should_present(state) then return end
+  question_presentation.mark_presented(state)
   state.plan_question_open = true
   require("diff_review.views.harness.plan_question").open(elicitation, {
     transcript_win = state.transcript_win,
@@ -602,28 +609,26 @@ function M.present_plan_question()
     end,
     ask = function(params)
       state.plan_question_open = false
-      state.presented_question_set_id = nil
       prompt_history.record(params.text)
       set_busy(true)
       client.request("question.ask", params, function(_, request_error)
         set_busy(false)
         if request_error then
           notifications.error(request_error, "Planning clarification")
-          synchronize_state(function() vim.schedule(M.present_plan_question) end)
+          synchronize_state()
           return
         end
-        synchronize_state(function() vim.schedule(M.present_plan_question) end)
+        synchronize_state()
       end)
     end,
     continue = function()
       state.plan_question_open = false
-      state.presented_question_set_id = nil
       set_busy(true)
       client.request("question.continue", {}, function(_, request_error)
         set_busy(false)
         if request_error then
           notifications.error(request_error, "Planning continuation")
-          synchronize_state(function() vim.schedule(M.present_plan_question) end)
+          synchronize_state(function() vim.schedule(function() M.present_plan_question(true) end) end)
           return
         end
         synchronize_state()
@@ -648,8 +653,7 @@ function M.reopen_question()
     notifications.warn("No Harness approval or question awaits feedback", "Harness")
     return
   end
-  state.presented_question_set_id = nil
-  M.present_plan_question()
+  M.present_plan_question(true)
 end
 
 ---@param text string
@@ -769,7 +773,6 @@ function M.drain()
     return
   end
   if state.active_elicitation and state.active_elicitation.elicitation then
-    M.present_plan_question()
     return
   end
   local text = table.remove(state.queue, 1)
@@ -933,8 +936,7 @@ function M.submit()
   end
   if text == "/questions" then
     set_composer_text(state.composer_buf, "")
-    state.presented_question_set_id = nil
-    M.present_plan_question()
+    M.present_plan_question(true)
     return
   end
   if text == "/agent" then
@@ -1031,6 +1033,12 @@ function M.submit()
   end
   set_composer_text(state.composer_buf, "")
   if state.busy then
+    if state.active_wait and not selected_agent_run(state)
+      and state.capability and state.capability.native_steer
+    then
+      submit_immediate(state, text, false)
+      return
+    end
     state.queue[#state.queue + 1] = text
     M.refresh_winbar()
     return
@@ -1047,20 +1055,7 @@ local function remove_pending_steer(state, target)
   end
 end
 
----Send the composer into the active provider turn without creating a new interaction.
-function M.steer_submit()
-  local state = harness_state()
-  local text = composer_text(state.composer_buf)
-  if text == "" then return end
-  if not state.busy then
-    notifications.warn("Harness has no active turn to steer", "Harness")
-    return
-  end
-  if not (state.capability and state.capability.native_steer) then
-    notifications.warn("The current backend does not support active-turn steering", "Harness")
-    return
-  end
-  prompt_history.record(text)
+submit_immediate = function(state, text, notify_success)
   set_composer_text(state.composer_buf, "")
   local pending = { text = text }
   state.pending_steer = state.pending_steer or {}
@@ -1076,12 +1071,29 @@ function M.steer_submit()
       remove_pending_steer(state, pending)
       state.queue[#state.queue + 1] = text
       notifications.warn("Steering missed the active turn; queued as a follow-up", "Harness")
-    else
+    elseif notify_success then
       notifications.info("Steered the active turn", "Harness")
     end
     M.refresh_winbar()
     vim.schedule(M.drain)
   end)
+end
+
+---Send the composer into the active provider turn without creating a new interaction.
+function M.steer_submit()
+  local state = harness_state()
+  local text = composer_text(state.composer_buf)
+  if text == "" then return end
+  if not state.busy then
+    notifications.warn("Harness has no active turn to steer", "Harness")
+    return
+  end
+  if not (state.capability and state.capability.native_steer) then
+    notifications.warn("The current backend does not support active-turn steering", "Harness")
+    return
+  end
+  prompt_history.record(text)
+  submit_immediate(state, text, true)
 end
 
 function M.edit_last_queued()
@@ -1302,6 +1314,7 @@ end
 
 local function close()
   local state = harness_state()
+  timeline_status.stop(state)
   local tab_count = vim.fn.tabpagenr("$")
   if tab_count > 1 then vim.cmd("tabclose") else vim.cmd("enew") end
   state.transcript_win = nil

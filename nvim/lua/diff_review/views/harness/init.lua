@@ -15,7 +15,7 @@ local function apply_snapshot(state, result)
   controller.render(true)
   controller.resolve_runtime_model()
   if state.active_elicitation and state.active_elicitation.elicitation then
-    state.presented_question_set_id = nil
+    state.presented_question_key = nil
     vim.schedule(controller.present_plan_question)
   end
   if #state.approval > 0 then vim.schedule(controller.present_approval) end

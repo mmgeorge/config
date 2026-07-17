@@ -4,6 +4,7 @@ local display_text = require("diff_review.render.display_text")
 
 local diff_tree = require("diff_review.render.diff_tree")
 local plan_event = require("diff_review.render.harness.plan_event")
+local timeline_status = require("diff_review.render.harness.timeline_status")
 local agent_event = require("diff_review.render.harness.agent_event")
 local task_tree = require("diff_review.render.harness.task_tree")
 local tool_render = require("diff_review.render.harness.tool")
@@ -425,14 +426,6 @@ local function append_interaction(result, interaction, options, agent_by_id)
       end
     end
   end
-  if interaction.active_wait then
-    local elapsed = math.max(0, math.floor(((options.now_ms or 0) - (interaction.active_wait.started_at_ms or 0)) / 1000))
-    local count = interaction.active_wait.agent_count or 0
-    local noun = count == 1 and "subagent" or "subagents"
-    local line = #result.lines + 1
-    result.lines[line] = ("▸ Waiting on %d %s for %ds"):format(count, noun, elapsed)
-    result.rows[line] = { kind = "agent_wait", interaction = interaction, node_id = interaction.id .. ":wait" }
-  end
   if complete then
     local aggregate = diff_tree.build(interaction.diff_text, {
       indent = 2,
@@ -540,6 +533,7 @@ function M.build(interactions, options)
       append_interaction(result, entry, options)
     end
   end
+  timeline_status.append(result, options.timeline_status)
   if #result.lines == 0 then result.lines = { "" } end
   local next_node_id = nil
   local node_id_by_line = {}

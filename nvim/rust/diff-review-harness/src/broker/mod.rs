@@ -1396,6 +1396,61 @@ impl HarnessBroker {
         ))
     }
 
+    /// Replace the pending owner question set when a clarification turn asks again.
+    fn replace_active_elicitation(
+        &mut self,
+        question: PlanQuestionSet,
+        event: &mut Vec<BrokerEvent>,
+    ) -> Result<bool> {
+        if self.active_plan_awaits_input()? {
+            let mut plan = self.active_elicitation_plan()?;
+            plan.elicitation
+                .as_mut()
+                .context("active plan has no elicitation state")?
+                .replace_question_set(question.clone());
+            plan.updated_at_ms = self.clock.now_ms();
+            self.store.save_plan(&plan)?;
+            let lifecycle = PlanLifecycleRecord {
+                id: Uuid::new_v4().to_string(),
+                session_id: self.session.id.clone(),
+                plan_id: plan.id.clone(),
+                kind: PlanLifecycleKind::QuestionAsked,
+                model_revision: plan.model_revision,
+                user_revision: plan.user_revision,
+                overall_comment: None,
+                annotation: Vec::new(),
+                question: Some(question.clone()),
+                answer: None,
+                created_at_ms: self.clock.now_ms(),
+            };
+            self.store.save_plan_lifecycle(&lifecycle)?;
+            event.push(self.event(
+                "plan_question",
+                json!({ "plan": plan, "lifecycle": lifecycle, "question": question }),
+            )?);
+            return Ok(true);
+        }
+        let Some(mut owner) = self.find_active_interaction_elicitation()? else {
+            return Ok(false);
+        };
+        owner
+            .elicitation
+            .as_mut()
+            .context("active interaction has no elicitation state")?
+            .replace_question_set(question);
+        self.store.save_interaction(&owner)?;
+        event.push(self.event(
+            "question",
+            json!({
+                "owner": "interaction",
+                "plan_id": owner.plan_id,
+                "interaction_id": owner.id,
+                "elicitation": owner.elicitation,
+            }),
+        )?);
+        Ok(true)
+    }
+
     fn skip_question(&mut self, params: Value) -> Result<(Value, Vec<BrokerEvent>)> {
         self.answer_question(json!({
             "question_id": required_text(&params, "question_id")?,
@@ -1447,17 +1502,13 @@ impl HarnessBroker {
         let elicitation_json = serde_json::to_string_pretty(&elicitation)?;
         plan.updated_at_ms = self.clock.now_ms();
         self.store.save_plan(&plan)?;
-        let (value, mut event) = self
+        let (value, event) = self
             .run_interaction(
                 PlanPrompt::clarification(&plan.request, &elicitation_json, &text),
                 PromptMode::Chat,
                 Some(InteractionAdmission::chat(text)),
             )
             .await?;
-        event.insert(
-            0,
-            self.event("plan_question_updated", json!({ "plan": plan }))?,
-        );
         Ok((value, event))
     }
 
@@ -1900,7 +1951,10 @@ impl HarnessBroker {
             } else if let Some(question) = question {
                 let question = question.normalize()?;
                 plan.state = PlanState::AwaitingInput;
-                plan.elicitation = Some(PlanElicitation::new(question.clone()));
+                match plan.elicitation.as_mut() {
+                    Some(elicitation) => elicitation.replace_question_set(question.clone()),
+                    None => plan.elicitation = Some(PlanElicitation::new(question.clone())),
+                }
                 plan.updated_at_ms = self.clock.now_ms();
                 self.store.save_plan(&plan)?;
                 interaction.awaiting_input = true;
@@ -1925,18 +1979,20 @@ impl HarnessBroker {
             }
         } else if let Some(question) = output.plan_question.take() {
             let question = question.normalize()?;
-            interaction.awaiting_input = true;
-            interaction.elicitation = Some(PlanElicitation::new(question.clone()));
-            self.store.save_interaction(&interaction)?;
-            event.push(self.event(
-                "question",
-                json!({
-                    "owner": "interaction",
-                    "plan_id": interaction.plan_id,
-                    "interaction_id": interaction.id,
-                    "elicitation": interaction.elicitation,
-                }),
-            )?);
+            if !self.replace_active_elicitation(question.clone(), &mut event)? {
+                interaction.awaiting_input = true;
+                interaction.elicitation = Some(PlanElicitation::new(question.clone()));
+                self.store.save_interaction(&interaction)?;
+                event.push(self.event(
+                    "question",
+                    json!({
+                        "owner": "interaction",
+                        "plan_id": interaction.plan_id,
+                        "interaction_id": interaction.id,
+                        "elicitation": interaction.elicitation,
+                    }),
+                )?);
+            }
         }
 
         self.session.updated_at_ms = self.clock.now_ms();
@@ -4841,6 +4897,52 @@ mod test {
                 PlanLifecycleKind::Created
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn replaces_plan_questions_on_the_original_owner_and_preserves_valid_answers() {
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = planning_question_broker(repository.path(), data.path(), true);
+        broker
+            .dispatch(BrokerRequest {
+                id: 1,
+                method: "prompt.submit".into(),
+                params: json!({ "text": "/plan migrate the event format" }),
+            })
+            .await;
+        let initial = broker.snapshot().unwrap().active_plan.unwrap();
+        let question = initial.elicitation.as_ref().unwrap().question_set.questions[0].clone();
+        broker
+            .dispatch(BrokerRequest {
+                id: 2,
+                method: "question.answer".into(),
+                params: json!({
+                    "question_id": question.id,
+                    "response": { "kind": "selected", "option": "Staged", "feedback": "one release" }
+                }),
+            })
+            .await;
+        let replacement = PlanQuestionSet {
+            id: "replacement".into(),
+            questions: vec![question],
+        }
+        .normalize()
+        .unwrap();
+        let mut event = Vec::new();
+        assert!(
+            broker
+                .replace_active_elicitation(replacement, &mut event)
+                .unwrap()
+        );
+
+        let snapshot = broker.snapshot().unwrap();
+        let plan = snapshot.active_plan.unwrap();
+        let elicitation = plan.elicitation.unwrap();
+        assert_eq!(elicitation.revision, 2);
+        assert_eq!(elicitation.answer.len(), 1);
+        assert_eq!(snapshot.active_elicitation.unwrap().plan_id, Some(plan.id));
+        assert!(event.iter().any(|event| event.event == "plan_question"));
     }
 
     #[tokio::test]

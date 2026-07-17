@@ -22,6 +22,7 @@ function HarnessSnapshot.apply(state, result, interaction_mode)
   state.goal = result.goal
   state.active_plan = result.active_plan
   state.active_elicitation = result.active_elicitation
+  state.active_wait = vim.deepcopy(result.active_wait)
   state.approval = vim.deepcopy(result.approval or {})
   state.agent = vim.deepcopy(result.agent or { definition = {}, run = {}, turn = {} })
   state.agent_live = {}
