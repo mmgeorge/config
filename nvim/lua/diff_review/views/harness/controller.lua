@@ -936,6 +936,11 @@ function M.submit()
     M.select_model()
     return
   end
+  if text == "/backend" then
+    set_composer_text(state.composer_buf, "")
+    M.select_backend()
+    return
+  end
   if text == "/rename" then
     set_composer_text(state.composer_buf, "")
     M.rename_session("")
@@ -1259,6 +1264,32 @@ function M.select_model()
       M.configure({ model = model.id })
     end)
   end)
+end
+
+function M.select_backend()
+  local state = harness_state()
+  local current = state.session and state.session.backend or config.options.harness.backend
+  local option_list = {}
+  for backend, backend_config in pairs(config.options.harness.backends) do
+    if backend_config.selectable ~= false then
+      option_list[#option_list + 1] = {
+        id = backend,
+        label = backend_config.label,
+        detail = backend_config.detail .. (backend == current and " (current)" or ""),
+        value = backend,
+      }
+    end
+  end
+  table.sort(option_list, function(left, right) return left.label < right.label end)
+  open_choice_picker(state, "Select Harness backend", "Switch the CLI used for this workspace.", option_list,
+    function(backend)
+      if backend == current then return end
+      if state.busy then
+        notifications.warn("Cancel or finish the active turn before switching backends", "Harness backend")
+        return
+      end
+      require("diff_review.views.harness").switch_backend(backend)
+    end)
 end
 
 function M.resolve_runtime_model()

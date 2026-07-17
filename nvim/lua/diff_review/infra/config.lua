@@ -115,6 +115,9 @@
 
 ---@class DiffReviewHarnessBackendConfig
 ---@field command string[]
+---@field label string
+---@field detail string
+---@field selectable? boolean
 
 ---@class DiffReviewHarnessConfig
 ---@field backend "codex"|"copilot"|"mock"
@@ -176,9 +179,22 @@ M.defaults = {
     goal_max_turns = 20,
     non_git_write_confirm = true,
     backends = {
-      codex = { command = { "codex", "app-server" } },
-      copilot = { command = {} },
-      mock = { command = { "mock" } },
+      codex = {
+        command = { "codex", "app-server" },
+        label = "Codex CLI",
+        detail = "OpenAI Codex app-server",
+      },
+      copilot = {
+        command = {},
+        label = "Copilot CLI",
+        detail = "GitHub Copilot SDK",
+      },
+      mock = {
+        command = { "mock" },
+        label = "Mock",
+        detail = "Harness test backend",
+        selectable = false,
+      },
     },
   },
   picker = {
@@ -285,7 +301,7 @@ function M.setup(opts)
     for key, value in pairs(override) do result[key] = merge(default[key], value) end
     return result
   end
-  local options = merge(M.defaults, opts or {})
+  local options = (opts == nil or vim.tbl_isempty(opts)) and vim.deepcopy(M.defaults) or merge(M.defaults, opts)
   if options.walkthrough_inventory ~= "sem" and options.walkthrough_inventory ~= false then
     error('walkthrough_inventory must be "sem" or false')
   end
@@ -302,6 +318,7 @@ function M.setup(opts)
   end
   if vim.tbl_isempty(question_key_set) then error("picker.choice_keys cannot be empty") end
   M.options = options
+  M.harness_backend_explicit = opts ~= nil and opts.harness ~= nil and opts.harness.backend ~= nil
   return M.options
 end
 

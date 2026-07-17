@@ -1082,6 +1082,13 @@ when older sessions become invisible. `:Harness` therefore resumes current repos
 while `/clear` remains the explicit boundary for creating a new session. Resumed sessions retain
 their persisted execution mode. New and forked sessions establish a fresh Read boundary.
 
+`/backend` opens the shared Harness picker over user-selectable backend descriptors. Confirmation
+stops the generic broker, restarts it with the selected launch descriptor, and resumes the latest
+same-repository session owned by that backend. Neovim stores the last successful selection in
+`stdpath("data")/diff-review/harness/backend.json` before the next editor launch. An explicit
+`setup({ harness = { backend = ... } })` remains authoritative, and failed switches restore the
+previous backend rather than persisting a broken default.
+
 Plan lifecycle and execution records accompany current sessions. Plans remain physical Markdown
 under `plans/<session>/<plan>/working.md`, with immutable model
 and user revisions beside them. The snapshot exposes every plan as an artifact plus the active

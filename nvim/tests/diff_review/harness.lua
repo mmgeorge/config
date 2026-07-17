@@ -242,6 +242,7 @@ local function fake_launcher(command, options, _)
     local request = vim.json.decode(vim.trim(payload))
     request_by_method[request.method] = request
     if request.method == "initialize" then
+      active_session.backend = request.params.backend.kind
       vim.defer_fn(function()
         emit(options, { id = request.id, result = {
           session = active_session,
@@ -685,10 +686,22 @@ local function fake_launcher(command, options, _)
 end
 
 local ok, failure = pcall(function()
+  local default_config = require("diff_review.infra.config").setup()
+  assert_equals(default_config.harness.backend, "codex",
+    "an empty setup should retain the complete default configuration")
   diff_review.setup({
     harness = { backend = "mock" },
     keymaps = { status = { open = { "x" } } },
   })
+  local backend_preference = require("diff_review.harness.backend_preference")
+  local backend_preference_path = vim.fs.joinpath(test_root, "backend.json")
+  backend_preference._set_path_for_test(backend_preference_path)
+  local preference_saved, preference_error = backend_preference.save("copilot")
+  assert_true(preference_saved, preference_error)
+  assert_equals(backend_preference.load(require("diff_review.infra.config").options.harness.backends, "codex"),
+    "copilot", "backend preferences should round-trip through the Harness data file")
+  assert_equals(require("diff_review.infra.config").options.harness.backend, "mock",
+    "an explicit setup backend should remain authoritative over persisted defaults")
   assert_equals(#require("diff_review.infra.config").defaults.harness.backends.copilot.command, 0,
     "default Copilot backend should launch the SDK-managed CLI")
   assert_equals(
@@ -1581,6 +1594,8 @@ local ok, failure = pcall(function()
   assert_true(command_completion ~= nil and #command_completion.items >= 9, "slash completion should list Harness commands")
   assert_true(vim.iter(command_completion.items):any(function(item) return item.label == "/rename" end),
     "slash completion should expose session rename")
+  assert_true(vim.iter(command_completion.items):any(function(item) return item.label == "/backend" end),
+    "slash completion should expose backend selection")
   assert_true(vim.iter(command_completion.items):any(function(item) return item.label == "/compact" end),
     "slash completion should expose compact when the backend advertises it")
   assert_true(vim.iter(command_completion.items):any(function(item) return item.label == "/full" end),
@@ -2602,11 +2617,30 @@ local ok, failure = pcall(function()
   assert_true(vim.iter(harness_view.lease_conflict_options({ native_fork = true })):any(function(option)
     return option.value == "fork"
   end), "lease recovery should expose fork when the persisted backend capability allows it")
+
+  session.harness.busy = false
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/backend" })
+  controller.submit()
+  local backend_picker = require("diff_review.views.picker")._state_for_test()
+  assert_true(backend_picker ~= nil, "/backend should open the shared picker")
+  assert_equals(backend_picker.spec.page_list[1].title, "Select Harness backend",
+    "the backend picker should identify its purpose")
+  assert_equals(#backend_picker.spec.page_list[1].option_list, 2,
+    "the backend picker should hide non-user test backends")
+  vim.fn.maparg("<CR>", "n", false, true).callback()
+  assert_true(vim.wait(2000, function()
+    return require("diff_review.infra.config").options.harness.backend == "codex"
+      and request_by_method.initialize.params.backend.kind == "codex"
+      and session.harness.session.backend == "codex"
+  end, 10), "selecting a backend should restart the broker with that backend")
+  assert_equals(backend_preference.load(require("diff_review.infra.config").options.harness.backends, "copilot"),
+    "codex", "a successful backend switch should persist the selected backend")
 end)
 
 controller._set_render_observer_for_test(nil)
 client._reset_for_test()
 builder._reset_for_test()
+require("diff_review.harness.backend_preference")._set_path_for_test(nil)
 pcall(vim.fn.delete, test_root, "rf")
 
 if not ok then
