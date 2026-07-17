@@ -1043,6 +1043,10 @@ the real buffer text because `breakindent` cannot measure inline virtual text. T
 row overlays `▸ ` onto those two spaces, preserving the timeline marker without changing layout.
 Keep structural whitespace real and reserve extmarks for overlay markers and highlighting, or
 wrapped response continuations will regress to column zero.
+`markdown.lua` registers `Harness` as a Markdown Tree-sitter filetype so render-markdown's default
+parser lookup resolves the same parser, then restricts that parser to the response ranges emitted
+by the timeline. A render with no response ranges clears the included regions and render-markdown
+namespace, preventing Markdown captures from leaking into prompts, tools, or shared diff rows.
 `transaction.lua` compares stable node blocks, applies changed blocks from bottom to top, and
 preserves semantic cursor identity, viewport position, expansion state, and settled prefix extmarks.
 It validates semantic row indexes against the post-mutation buffer before restoring the cursor, so

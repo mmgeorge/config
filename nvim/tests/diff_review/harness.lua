@@ -1066,10 +1066,13 @@ local ok, failure = pcall(function()
   local original_get_parser = vim.treesitter.get_parser
   local original_treesitter_start = vim.treesitter.start
   local original_render_markdown = package.loaded["render-markdown"]
+  local original_render_markdown_ui = package.loaded["render-markdown.core.ui"]
   local parser_region_list = nil
   local highlighted_language = nil
   local render_markdown_options = nil
+  local markdown_namespace = vim.api.nvim_create_namespace("DiffReviewHarnessMarkdownTest")
   package.loaded["render-markdown"] = { render = function(options) render_markdown_options = options end }
+  package.loaded["render-markdown.core.ui"] = { ns = markdown_namespace }
   vim.treesitter.get_parser = function(buf, language)
     assert_equals(buf, session.harness.transcript_buf, "markdown should parse the Harness transcript")
     assert_equals(language, "markdown", "Harness responses should use the markdown parser")
@@ -1087,14 +1090,29 @@ local ok, failure = pcall(function()
     session.harness.transcript_win,
     { { first0 = 2, after0 = 4 } }
   )
+  assert_equals(vim.treesitter.language.get_lang("Harness"), "markdown",
+    "render-markdown should discover the response parser through the Harness filetype")
+  local rendered_parser_region_list = vim.deepcopy(parser_region_list)
+  vim.api.nvim_buf_set_extmark(session.harness.transcript_buf, markdown_namespace, 0, 0, {})
+  require("diff_review.render.harness.markdown").render(
+    session.harness.transcript_buf,
+    session.harness.transcript_win,
+    {}
+  )
+  assert_equals(#vim.api.nvim_buf_get_extmarks(
+    session.harness.transcript_buf, markdown_namespace, 0, -1, {}
+  ), 0, "empty response ranges should clear stale render-markdown extmarks")
+  assert_equals(#parser_region_list, 0,
+    "empty response ranges should clear stale Markdown parser regions")
   vim.treesitter.get_parser = original_get_parser
   vim.treesitter.start = original_treesitter_start
   package.loaded["render-markdown"] = original_render_markdown
+  package.loaded["render-markdown.core.ui"] = original_render_markdown_ui
   assert_equals(highlighted_language, "markdown",
     "Harness markdown regions should activate inline Tree-sitter highlights")
-  assert_equals(parser_region_list[1][1][1], 2,
+  assert_equals(rendered_parser_region_list[1][1][1], 2,
     "Harness markdown highlighting should begin at the response range")
-  assert_equals(parser_region_list[1][1][3], 4,
+  assert_equals(rendered_parser_region_list[1][1][3], 4,
     "Harness markdown highlighting should stop before unrelated transcript rows")
   assert_equals(render_markdown_options.config.win_options.conceallevel.default, 0,
     "Harness markdown should restore the transcript's original conceal level in raw mode")

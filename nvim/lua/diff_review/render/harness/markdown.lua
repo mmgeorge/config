@@ -1,6 +1,26 @@
 local M = {}
 
 local failed = false
+local language_registered = false
+
+---@return boolean
+local function ensure_language()
+  if language_registered then return true end
+  local ok, register_error = pcall(vim.treesitter.language.register, "markdown", "Harness")
+  if ok then
+    language_registered = true
+    return true
+  end
+  if not failed then
+    failed = true
+    vim.notify(
+      "Harness markdown language registration failed: " .. tostring(register_error),
+      vim.log.levels.WARN,
+      { title = "Harness" }
+    )
+  end
+  return false
+end
 
 ---@param row integer
 ---@param range_list { first0: integer, after0: integer }[]
@@ -35,10 +55,27 @@ local function prune_extmarks(buf, range_list)
 end
 
 ---@param buf integer
+local function clear(buf)
+  if not vim.api.nvim_buf_is_valid(buf) then return end
+  local parser_ok, parser = pcall(vim.treesitter.get_parser, buf, "markdown")
+  if parser_ok then
+    pcall(parser.set_included_regions, parser, {})
+    if type(parser.invalidate) == "function" then pcall(parser.invalidate, parser, true) end
+  end
+  local ui_ok, ui = pcall(require, "render-markdown.core.ui")
+  if ui_ok and ui.ns then pcall(vim.api.nvim_buf_clear_namespace, buf, ui.ns, 0, -1) end
+end
+
+---@param buf integer
 ---@param win integer?
 ---@param range_list { first0: integer, after0: integer }[]
 function M.render(buf, win, range_list)
-  if #range_list == 0 or not (win and vim.api.nvim_win_is_valid(win)) then return end
+  if not ensure_language() then return end
+  if #range_list == 0 then
+    clear(buf)
+    return
+  end
+  if not (win and vim.api.nvim_win_is_valid(win)) then return end
   local ok, render_markdown = pcall(require, "render-markdown")
   if not ok or type(render_markdown.render) ~= "function" then return end
   local parser_ok, parser = pcall(vim.treesitter.get_parser, buf, "markdown")
