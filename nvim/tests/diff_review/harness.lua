@@ -989,19 +989,26 @@ local ok, failure = pcall(function()
           updated_at_ms = 2000,
           completed_at_ms = 2000,
         },
-        interaction = {},
+        interaction = { {
+          node_list = { mock_segment("agent-one", "complete", nil, {}, "Child result.", 1000) },
+        } },
       },
     },
   } }, { now_ms = 3000 })
   local agent_line = line_number(ordered_render.lines, "▸ Agent explorer completed in 1s")
   local steering_line = line_number(ordered_render.lines, "▸ What day is it?")
-  local response_line = line_number(ordered_render.lines, "▸ Response")
   local intermediate_response_line = line_number(ordered_render.lines, "Today is Tuesday.")
   local final_response_line = line_number(ordered_render.lines, "Final synthesis.")
-  assert_true(agent_line ~= nil and steering_line ~= nil and response_line ~= nil,
+  assert_true(agent_line ~= nil and steering_line ~= nil and final_response_line ~= nil,
     "ordered interaction nodes should all render:\n" .. table.concat(ordered_render.lines, "\n"))
-  assert_true(agent_line < steering_line and steering_line < response_line,
+  assert_true(agent_line < steering_line and steering_line < final_response_line,
     "agent completion should stay at its spawn position while steering and response append after it")
+  assert_true(not vim.tbl_contains(ordered_render.lines, "▸ Response"),
+    "responses should render their content directly without a standalone label")
+  assert_true(vim.tbl_contains(ordered_render.lines, "  ▸ Child result."),
+    "expanded child-agent responses should render their content directly after the marker")
+  assert_true(not vim.tbl_contains(ordered_render.lines, "  ▸ Response"),
+    "expanded child-agent responses should not retain the standalone label")
   assert_true(intermediate_response_line < final_response_line,
     "a completed steering answer should remain visible before the final parent synthesis")
   local paused_plan_render = interaction_renderer.build({ {
@@ -1193,9 +1200,9 @@ local ok, failure = pcall(function()
     thought = {},
     response = "# Heading\n\n- **item**",
   } })
-  assert_equals(markdown_render.markdown_ranges[1].first0, 3,
-    "assistant markdown should begin after its thought summary")
-  assert_equals(markdown_render.markdown_ranges[1].after0, 6,
+  assert_equals(markdown_render.markdown_ranges[1].first0, 2,
+    "assistant markdown should begin directly after its thought summary")
+  assert_equals(markdown_render.markdown_ranges[1].after0, 5,
     "assistant markdown should end with its response body")
   assert_true(vim.iter(markdown_render.highlights):any(function(highlight)
     return highlight.line == 2 and highlight.group == "DiffReviewHarnessThought"
@@ -1204,10 +1211,12 @@ local ok, failure = pcall(function()
   assert_equals(interaction_renderer.foldtext("▸ Thought for 42s, 28.5k tokens")[1][2],
     "DiffReviewHarnessThought",
     "closed thought folds should retain the Harness green highlight")
-  assert_true(vim.iter(markdown_render.highlights):any(function(highlight)
-    return highlight.line == 3 and highlight.group == "DiffReviewHarnessResponse"
-  end),
-    "response headings should use the Harness white highlight")
+  assert_true(vim.iter(markdown_render.extmarks):any(function(extmark)
+    local virtual_text = extmark.line == 3 and extmark.options.virt_text or nil
+    return virtual_text and virtual_text[1]
+      and virtual_text[1][1] == "▸ "
+      and virtual_text[1][2] == "DiffReviewHarnessResponse"
+  end), "response markers should use the Harness white highlight")
   local completed_thought_render = interaction_renderer.build({ {
     id = "completed-thought",
     prompt = "Inspect the repository",
@@ -1327,8 +1336,10 @@ local ok, failure = pcall(function()
     { details = true }
   )):any(function(extmark)
     local virtual_text = extmark[4].virt_text
-    return virtual_text and virtual_text[1] and virtual_text[1][1] == "  "
-  end), "response rows should use a visual two-column prefix so soft wraps stay aligned")
+    return virtual_text and virtual_text[1] and virtual_text[1][1] == "▸ "
+  end), "the first response row should render the Harness marker without changing raw Markdown")
+  assert_true(not vim.tbl_contains(settled_transcript, "▸ Response"),
+    "the transcript should not render a standalone response label")
   assert_true(not vim.tbl_contains(settled_transcript, "You"), "transcript should not render a You label")
   assert_true(not vim.tbl_contains(settled_transcript, "Assistant"), "transcript should not render an Assistant label")
   local multiline_prompt = interaction_renderer.build({ {

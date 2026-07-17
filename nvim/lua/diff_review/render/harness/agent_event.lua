@@ -39,9 +39,9 @@ local function append_interaction_detail(result, interaction, width, indent)
         end
       end
       if type(segment.response) == "string" and segment.response ~= "" then
-        result.lines[#result.lines + 1] = string.rep(" ", indent) .. "▸ Response"
-        for _, line in ipairs(vim.split(segment.response, "\n", { plain = true })) do
-          result.lines[#result.lines + 1] = continuation_prefix .. line
+        for line_index, line in ipairs(vim.split(segment.response, "\n", { plain = true })) do
+          local prefix = line_index == 1 and (string.rep(" ", indent) .. "▸ ") or continuation_prefix
+          result.lines[#result.lines + 1] = prefix .. line
         end
       end
     end

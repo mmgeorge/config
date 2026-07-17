@@ -67,21 +67,28 @@ local function append_wrapped(result, text, first_prefix, continuation_prefix, g
   end
 end
 
-local function append_response(result, text)
+local function append_response(result, text, first_prefix, first_prefix_group)
   local line_list = vim.split(tostring(text or ""), "\n", { plain = true })
   if #line_list == 0 then line_list = { "" } end
-  for _, line in ipairs(line_list) do
+  for line_index, line in ipairs(line_list) do
+    local first_line = line_index == 1
+    local prefix = first_line and first_prefix or "  "
+    local prefix_group = first_line and first_prefix_group or "Normal"
     result.lines[#result.lines + 1] = line
     result.extmarks[#result.extmarks + 1] = {
       line = #result.lines,
       col = 0,
       options = {
-        virt_text = { { "  ", "Normal" } },
+        virt_text = { { prefix, prefix_group } },
         virt_text_pos = "inline",
         hl_mode = "combine",
       },
     }
   end
+end
+
+local function append_timeline_response(result, text)
+  append_response(result, text, "▸ ", "DiffReviewHarnessResponse")
 end
 
 local function append_prebuilt_diff(result, tree)
@@ -353,17 +360,9 @@ local function append_segment(result, interaction, segment, options, defer_respo
   end
   if complete and not defer_response and type(segment.response) == "string" and segment.response ~= "" then
     local response_line = #result.lines + 1
-    result.lines[response_line] = "▸ Response"
     result.rows[response_line] = { kind = "response", interaction = interaction, node_id = segment.id }
-    result.highlights[#result.highlights + 1] = {
-      line = response_line,
-      first = 0,
-      last = -1,
-      group = "DiffReviewHarnessResponse",
-    }
-    local first_markdown = #result.lines + 1
-    append_response(result, segment.response)
-    result.markdown_ranges[#result.markdown_ranges + 1] = { first0 = first_markdown - 1, after0 = #result.lines }
+    append_timeline_response(result, segment.response)
+    result.markdown_ranges[#result.markdown_ranges + 1] = { first0 = response_line - 1, after0 = #result.lines }
   end
   for line = segment_first, #result.lines do
     result.rows[line] = result.rows[line] or { kind = "segment_content", interaction = interaction }
@@ -458,21 +457,13 @@ local function append_interaction(result, interaction, options, agent_by_id)
     end
     if deferred_response then
       local response_line = #result.lines + 1
-      result.lines[response_line] = "▸ Response"
       result.rows[response_line] = {
         kind = "response",
         interaction = interaction,
         node_id = deferred_response.id .. ":response",
       }
-      result.highlights[#result.highlights + 1] = {
-        line = response_line,
-        first = 0,
-        last = -1,
-        group = "DiffReviewHarnessResponse",
-      }
-      local first_markdown = #result.lines + 1
-      append_response(result, deferred_response.response)
-      for line = first_markdown, #result.lines do
+      append_timeline_response(result, deferred_response.response)
+      for line = response_line + 1, #result.lines do
         result.rows[line] = {
           kind = "response_body",
           interaction = interaction,
@@ -480,7 +471,7 @@ local function append_interaction(result, interaction, options, agent_by_id)
         }
       end
       result.markdown_ranges[#result.markdown_ranges + 1] = {
-        first0 = first_markdown - 1,
+        first0 = response_line - 1,
         after0 = #result.lines,
       }
     end
