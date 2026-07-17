@@ -10,6 +10,7 @@ local command_list = {
   { label = "/plan", detail = "Create a reviewed plan" },
   { label = "/plan cancel", detail = "Cancel the active plan" },
   { label = "/sessions", detail = "Search, preview, resume, or delete a Harness session" },
+  { label = "/undo", detail = "Roll back to an interaction and restore its prompt" },
   { label = "/backend", detail = "Switch the Harness CLI backend" },
   { label = "/questions", detail = "Reopen pending planning questions" },
   { label = "/goal", detail = "Set a persistent goal" },

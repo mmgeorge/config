@@ -164,6 +164,7 @@ local interaction = {
 }
 
 local request_by_method = {}
+local interaction_review_list = { interaction }
 local goal_continue_count = 0
 local prompt_count = 0
 local steer_should_fail = false
@@ -515,7 +516,18 @@ local function fake_launcher(command, options, _)
       } })
       emit(options, { id = request.id, result = { session = active_session } })
     elseif request.method == "interaction.list" then
-      emit(options, { id = request.id, result = { interaction } })
+      emit(options, { id = request.id, result = interaction_review_list })
+    elseif request.method == "interaction.rollback" then
+      local target_index = nil
+      for index, record in ipairs(interaction_review_list) do
+        if record.id == request.params.interaction_id then target_index = index break end
+      end
+      for index = target_index or (#interaction_review_list + 1), #interaction_review_list do
+        interaction_review_list[index].state = index == target_index and "rolled_back" or "superseded"
+      end
+      session.harness.interaction = vim.deepcopy(interaction_review_list)
+      emit(options, { id = request.id, result = { rolled_back = request.params.interaction_id } })
+      emit(options, { event = "interaction_rolled_back", payload = interaction_review_list[target_index] })
     elseif request.method == "session.list" then
       emit(options, { id = request.id, result = { active_session } })
     elseif request.method == "session.preview" then
@@ -1656,6 +1668,8 @@ local ok, failure = pcall(function()
     "slash completion should expose session rename")
   assert_true(vim.iter(command_completion.items):any(function(item) return item.label == "/backend" end),
     "slash completion should expose backend selection")
+  assert_true(vim.iter(command_completion.items):any(function(item) return item.label == "/undo" end),
+    "slash completion should expose interaction rollback")
   assert_true(vim.iter(command_completion.items):any(function(item) return item.label == "/compact" end),
     "slash completion should expose compact when the backend advertises it")
   assert_true(vim.iter(command_completion.items):any(function(item) return item.label == "/full" end),
@@ -2568,26 +2582,100 @@ local ok, failure = pcall(function()
   assert_equals(request_by_method["plan.request_changes"].params.comment, "Include explicit integration coverage",
     "PlanReview should serialize the optional overall review comment")
   vim.cmd("tabclose")
+  assert_true(vim.wait(2000, function() return not session.harness.busy end, 10),
+    "plan review should settle before testing interaction rollback")
 
-  require("diff_review.views.interactions").open()
-  assert_true(vim.wait(2000, function() return vim.bo.filetype == "DiffReviewInteractions" end, 10), "Interactions did not open")
-  local interaction_text = table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, false), "\n")
-  assert_true(interaction_text:find("Interaction 1", 1, true) ~= nil, "Interactions should render interaction headers")
-  assert_true(interaction_text:find("return 'after'", 1, true) ~= nil, "Interactions should render parsed diff lines")
-  local comment_rendered = false
-  for _, extmark in ipairs(vim.api.nvim_buf_get_extmarks(0, -1, 0, -1, { details = true })) do
-    for _, virtual_line in ipairs(extmark[4].virt_lines or {}) do
-      for _, segment in ipairs(virtual_line) do
-        if segment[1]:find("Persisted review note", 1, true) then comment_rendered = true end
-      end
-    end
-  end
-  assert_true(comment_rendered, "Interactions should restore persisted review comments")
-  assert_true(vim.fn.maparg("R", "n", false, true).callback ~= nil, "checkpointed sessions should expose rollback")
-  vim.fn.maparg("<Tab>", "n", false, true).callback()
-  assert_equals(vim.fn.foldclosed(1), 1, "interaction folds should begin on their visible header")
-  vim.fn.maparg("<Tab>", "n", false, true).callback()
-  vim.cmd("tabclose")
+  interaction_review_list = {
+    {
+      id = "undo-one",
+      ordinal = 1,
+      prompt = "First prompt",
+      state = "complete",
+      checkpoint_before = "before-one",
+    },
+    {
+      id = "undo-running",
+      ordinal = 2,
+      prompt = "Running prompt",
+      state = "running",
+      checkpoint_before = "before-running",
+    },
+    {
+      id = "undo-three",
+      ordinal = 3,
+      prompt = "Failed prompt",
+      state = "failed",
+      checkpoint_before = "before-three",
+    },
+    {
+      id = "undo-superseded",
+      ordinal = 4,
+      prompt = "Superseded prompt",
+      state = "superseded",
+      checkpoint_before = "before-superseded",
+    },
+    {
+      id = "undo-five",
+      ordinal = 5,
+      prompt = "Rewrite the picker\nthen run its tests",
+      state = "cancelled",
+      checkpoint_before = "before-five",
+    },
+  }
+  request_by_method["interaction.rollback"] = nil
+  vim.api.nvim_set_current_win(session.harness.composer_win)
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/undo" })
+  controller.submit()
+  local shared_picker = require("diff_review.views.picker")
+  assert_true(vim.wait(1000, function() return shared_picker.is_open() end, 10),
+    "/undo should open the shared interaction picker")
+  local undo_picker = shared_picker._state_for_test()
+  local undo_page = require("diff_review.views.picker.state").page(undo_picker.state, undo_picker.spec)
+  assert_equals(#undo_page.option_list, 3, "/undo should expose only checkpointed terminal interactions")
+  assert_equals(undo_page.option_list[1].label, "Interaction 5", "/undo should list newest interactions first")
+  assert_true(undo_page.option_list[1].detail:find("cancelled · Rewrite the picker then run its tests", 1, true) ~= nil,
+    "/undo should flatten the prompt only in picker details")
+  assert_equals(undo_page.option_list[2].label, "Interaction 3", "/undo should retain failed interactions")
+  assert_equals(undo_page.option_list[3].label, "Interaction 1", "/undo should retain completed interactions")
+  vim.fn.maparg("<CR>", "n", false, true).callback()
+  assert_true(vim.wait(1000, function()
+    local active_picker = shared_picker._state_for_test()
+    return active_picker and active_picker.spec.page_list[1].title == "Confirm rollback"
+  end, 10),
+    "selecting an interaction should open rollback confirmation")
+  local confirmation = shared_picker._state_for_test()
+  local confirmation_page = require("diff_review.views.picker.state").page(confirmation.state, confirmation.spec)
+  assert_equals(confirmation_page.option_list[1].label, "Cancel", "rollback confirmation should default to Cancel")
+  vim.fn.maparg("<CR>", "n", false, true).callback()
+  assert_equals(request_by_method["interaction.rollback"], nil, "cancelling undo should not call the broker")
+
+  vim.api.nvim_set_current_win(session.harness.composer_win)
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/undo" })
+  controller.submit()
+  assert_true(vim.wait(1000, function() return shared_picker.is_open() end, 10),
+    "/undo should reopen after cancellation")
+  vim.fn.maparg("<CR>", "n", false, true).callback()
+  assert_true(vim.wait(1000, function()
+    local active_picker = shared_picker._state_for_test()
+    return active_picker and active_picker.spec.page_list[1].title == "Confirm rollback"
+  end, 10),
+    "undo confirmation should reopen for the selected interaction")
+  vim.fn.maparg("<Down>", "n", false, true).callback()
+  vim.fn.maparg("<CR>", "n", false, true).callback()
+  assert_true(vim.wait(2000, function() return request_by_method["interaction.rollback"] ~= nil end, 10),
+    "confirmed undo should call the broker")
+  assert_true(vim.wait(2000, function()
+    return table.concat(vim.api.nvim_buf_get_lines(session.harness.composer_buf, 0, -1, false), "\n")
+      == "Rewrite the picker\nthen run its tests"
+  end, 10), "confirmed undo should restore the exact prompt")
+  assert_true(vim.wait(2000, function()
+    return vim.api.nvim_get_current_win() == session.harness.composer_win
+  end, 10), "confirmed undo should focus the composer")
+  assert_equals(request_by_method["interaction.rollback"].params.interaction_id, "undo-five",
+    "undo should send the selected interaction id")
+  local restored_cursor = vim.api.nvim_win_get_cursor(session.harness.composer_win)
+  assert_equals(restored_cursor[1], 2, "undo should place the composer cursor on the final prompt line")
+  assert_equals(restored_cursor[2], 18, "undo should place the composer cursor at the end of the restored prompt")
 
   vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/rename Architecture review" })
   controller.submit()

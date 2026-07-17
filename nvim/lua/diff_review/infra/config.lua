@@ -96,22 +96,12 @@
 ---@field submit_input DiffReviewKeymap
 ---@field close DiffReviewKeymap
 
----@class DiffReviewInteractionKeymapConfig
----@field toggle DiffReviewKeymap
----@field comment DiffReviewKeymap
----@field request_changes DiffReviewKeymap
----@field rollback DiffReviewKeymap
----@field refresh DiffReviewKeymap
----@field close DiffReviewKeymap
----@field help DiffReviewKeymap
-
 ---@class DiffReviewKeymapConfig
 ---@field status DiffReviewStatusKeymapConfig
 ---@field review DiffReviewReviewKeymapConfig
 ---@field harness DiffReviewHarnessKeymapConfig
 ---@field plan_review DiffReviewPlanReviewKeymapConfig
 ---@field picker DiffReviewPickerKeymapConfig
----@field interactions DiffReviewInteractionKeymapConfig
 
 ---@class DiffReviewHarnessBackendConfig
 ---@field command string[]
@@ -125,7 +115,6 @@
 ---@field effort string
 ---@field buffer_name string
 ---@field composer_name string
----@field interactions_buffer_name string
 ---@field composer_min_height integer
 ---@field composer_max_height integer
 ---@field goal_max_turns integer
@@ -173,7 +162,6 @@ M.defaults = {
     effort = "medium",
     buffer_name = "Harness",
     composer_name = "HarnessInput",
-    interactions_buffer_name = "Interactions",
     composer_min_height = 3,
     composer_max_height = 12,
     goal_max_turns = 20,
@@ -274,15 +262,6 @@ M.defaults = {
       submit_input = "<C-s>",
       clear_input = "<C-c>",
       close = "q",
-    },
-    interactions = {
-      toggle = "<Tab>",
-      comment = "C",
-      request_changes = "oN",
-      rollback = "R",
-      refresh = "r",
-      close = "q",
-      help = "?",
     },
   },
 }

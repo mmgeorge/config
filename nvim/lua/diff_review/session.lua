@@ -95,7 +95,6 @@ M.empty_diff_rows = {}
 ---@field timeline table[]
 ---@field plan_annotations table[]
 ---@field no_checkpoint boolean
----@field interactions table?
 ---@field plan_review table?
 ---@field command_set DiffReviewViewCommandSet?
 ---@field goal table?
@@ -149,7 +148,6 @@ M.harness = {
   timeline = {},
   plan_annotations = {},
   no_checkpoint = false,
-  interactions = nil,
   plan_review = nil,
   plan_question_open = false,
   presented_question_key = nil,

@@ -119,15 +119,6 @@ M.view_specs = {
     { id = "submit_input", label = "submit", desc = "Submit Harness option input", modes = { "n", "i" }, pinned = false },
     { id = "close", label = "close", desc = "Close the active picker", modes = "n", pinned = false },
   },
-  interactions = {
-    { id = "toggle", label = "toggle", desc = "Toggle an interaction or file fold", modes = "n", pinned = true },
-    { id = "comment", label = "comment", desc = "Annotate a changed line", modes = "n", pinned = true },
-    { id = "request_changes", label = "changes", desc = "Send interaction diff comments to the agent", modes = "n", pinned = true },
-    { id = "rollback", label = "rollback", desc = "Restore the workspace before this interaction", modes = "n", pinned = true },
-    { id = "refresh", label = "refresh", desc = "Reload interaction history", modes = "n", pinned = false },
-    { id = "close", label = "close", desc = "Close Interactions", modes = "n", pinned = true },
-    { id = "help", label = "help", desc = "Show Interactions help", modes = "n", pinned = true },
-  },
 }
 
 M.view_spec_by_id = {}

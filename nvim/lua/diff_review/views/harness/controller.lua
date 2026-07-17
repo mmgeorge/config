@@ -848,6 +848,115 @@ function M.open_artifact_picker()
   end)
 end
 
+---@class DiffReviewRollbackInteraction
+---@field id string
+---@field ordinal integer
+---@field prompt string
+---@field state "complete"|"failed"|"cancelled"
+---@field checkpoint_before string
+
+---@param interaction DiffReviewRollbackInteraction
+local function restore_interaction_prompt(interaction)
+  local state = harness_state()
+  set_composer_text(state.composer_buf, interaction.prompt or "")
+  layout.resize_composer(state.composer_buf, state.composer_win)
+  vim.schedule(function()
+    if not (state.composer_buf and vim.api.nvim_buf_is_valid(state.composer_buf)
+      and state.composer_win and vim.api.nvim_win_is_valid(state.composer_win))
+    then
+      return
+    end
+    local line_list = vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)
+    local last_line = line_list[#line_list] or ""
+    vim.api.nvim_set_current_win(state.composer_win)
+    vim.api.nvim_win_set_cursor(state.composer_win, { math.max(1, #line_list), #last_line })
+    vim.cmd("startinsert!")
+  end)
+end
+
+---@param interaction DiffReviewRollbackInteraction
+local function rollback_interaction(interaction)
+  local state = harness_state()
+  if state.busy then
+    notifications.warn("Cancel or finish the active turn before undoing an interaction", "Harness undo")
+    return
+  end
+  client.request("interaction.rollback", { interaction_id = interaction.id }, function(_, request_error)
+    if request_error then
+      notifications.error(request_error, "Harness undo")
+      return
+    end
+    notifications.info("Rolled back to before Interaction " .. tostring(interaction.ordinal), "Harness undo")
+    synchronize_state()
+    restore_interaction_prompt(interaction)
+  end)
+end
+
+---@param interaction DiffReviewRollbackInteraction
+local function confirm_rollback(interaction)
+  open_choice_picker(
+    harness_state(),
+    "Confirm rollback",
+    "Restore the worktree before Interaction " .. tostring(interaction.ordinal)
+      .. " and supersede every later interaction?",
+    {
+      { label = "Cancel", detail = "Keep the current workspace.", value = false },
+      {
+        label = "Rollback to before Interaction " .. tostring(interaction.ordinal),
+        detail = "Restore its checkpoint and return the prompt to the composer.",
+        value = true,
+      },
+    },
+    function(confirmed)
+      if confirmed then rollback_interaction(interaction) end
+    end
+  )
+end
+
+---Open the checkpointed interaction picker for an editable rollback.
+function M.open_undo_picker()
+  local state = harness_state()
+  if state.busy then
+    notifications.warn("Cancel or finish the active turn before undoing an interaction", "Harness undo")
+    return
+  end
+  if state.no_checkpoint then
+    notifications.warn("Undo is unavailable because this session has NO CHECKPOINT", "Harness undo")
+    return
+  end
+  client.request("interaction.list", {}, function(interaction_list, request_error)
+    if request_error then
+      notifications.error(request_error, "Harness undo")
+      return
+    end
+    local rollback_state = { complete = true, failed = true, cancelled = true }
+    local option_list = {}
+    for index = #(interaction_list or {}), 1, -1 do
+      local interaction = interaction_list[index]
+      if interaction.checkpoint_before and rollback_state[interaction.state] then
+        local prompt = vim.trim(tostring(interaction.prompt or ""):gsub("%s+", " "))
+        option_list[#option_list + 1] = {
+          id = interaction.id,
+          label = "Interaction " .. tostring(interaction.ordinal),
+          detail = tostring(interaction.state) .. " · " .. (prompt ~= "" and prompt or "[empty prompt]"),
+          value = interaction,
+        }
+      end
+    end
+    if #option_list == 0 then
+      notifications.info("This Harness session has no interactions available to undo", "Harness undo")
+      return
+    end
+    open_choice_picker(
+      state,
+      "Undo interaction",
+      "Select the interaction whose original prompt should be restored.",
+      option_list,
+      confirm_rollback
+    )
+  end)
+end
+
 ---Switch the transcript and composer target to one child-agent timeline or Main.
 ---@param selector string
 function M.select_agent(selector)
@@ -965,6 +1074,11 @@ function M.submit()
   if text == "/sessions" then
     set_composer_text(state.composer_buf, "")
     M.open_session_picker()
+    return
+  end
+  if text == "/undo" then
+    set_composer_text(state.composer_buf, "")
+    M.open_undo_picker()
     return
   end
   local agent_selector = text:match("^/agent%s+(%S+)%s*$")

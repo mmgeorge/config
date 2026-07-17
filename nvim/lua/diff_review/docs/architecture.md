@@ -79,7 +79,6 @@ diff_review/
 │   ├── walkthrough.lua       LLM-authored guided review: summary section + anchored comment boxes
 │   ├── harness/              Dedicated interaction-tree/composer tab and prompt queue controller
 │   ├── plan_review/          Physical Markdown plan review with edits, annotations, accept, and revision
-│   ├── interactions/         Per-user-interaction diff review, comments, request changes, and rollback
 │   ├── sessions/             Current-worktree and all-worktree durable session browser
 │   ├── pr/
 │   │   ├── pr_overview.lua    PR metadata, checks, review summaries, inline comments
@@ -257,7 +256,6 @@ type. The standalone diff, file-revision, and preview buffers are separate.
 | Picker search | `DiffReviewPickerSearch` | — | Session and other searchable selectors | Focused one-line fuzzy input with dynamically assigned result keys |
 | Picker input | `DiffReviewPickerInput` | — | `views/picker/input.lua` | Multiline feedback, Other answers, Ask prompts, custom models, and agent tasks |
 | Plan review | `markdown` | — | `/plan <request>` | Physical editable plan, line annotations, accept or request changes |
-| Interactions | `DiffReviewInteractions` | — | `:Interactions` | Foldable interaction/file/hunk diffs, comments, rollback |
 
 **Why one filetype for four views.** Folding, keymaps, highlight groups, and the
 hint-bar winbar are all keyed on the `GitStatus` filetype. Sharing it means the status,
@@ -283,10 +281,15 @@ otherwise leaves the terminal in its last hidden TUI state. This global transiti
 mapping only the picker window's `Cursor` highlight does not hide the focused terminal cursor.
 Do not replace the paired `guicursor` transition with window-local highlighting, and do not restore
 an empty cursor option directly after hiding it. Either change leaves cursor visibility stuck in the
-terminal's previous state. Models,
-effort, fast mode, artifacts, agents,
+terminal's previous state. Models, effort, fast mode, artifacts, agents, interaction rollback,
 approvals, lease conflicts, execution confirmations, and planning questions therefore share the
 same geometry and focus contract without duplicating popup mechanics.
+
+The `/undo` specialization loads the active session's durable interaction records and lists
+checkpointed complete, failed, or cancelled interactions newest first. Selecting a record opens a
+second picker with `Cancel` selected before the destructive choice. A successful broker rollback
+restores the selected interaction's exact multiline prompt to `HarnessInput`, moves the cursor to
+its end, and enters Insert mode so the reverted request can be edited or resubmitted.
 
 The `/sessions` specialization defaults to the current repository and toggles all repositories with
 `C-o`. Moving the result selection requests a read-only `session.preview` projection and temporarily
@@ -307,10 +310,9 @@ Registered in `nvim/lua/plugins/diff_review.lua`:
 :GitDiffCompactPreview[!]             " open_compact_preview({ staged = bang })
 :Harness                              " open_harness()
 :HarnessNew                           " new_harness_session()
-:Interactions                         " open_interactions()
 ```
 
-Inside Harness, `/sessions` or the configured `os` mapping opens durable session search.
+Inside Harness, `/sessions` opens durable session search and `/undo` opens checkpoint rollback.
 
 PR and review buffers are opened programmatically by the `github` integration
 (`nvim/lua/github/open_pr.lua`, pickers) through `open_pr` / `open_review`, not by a
@@ -910,15 +912,13 @@ backend turn completes
        └─ 20 total goal turns → stalled until explicit /goal resume resets the budget
 ```
 
-**Review or roll back an interaction**
+**Roll back and revise an interaction**
 
 ```
-:Interactions → Interaction → file → hunk
-  ├─ diff_parse + source normalization build real diff rows and native folds
-  ├─ C stores an annotation through the shared annotation/comment-box model
-  ├─ oN creates a new user interaction containing diff + comments
-  └─ R pauses local goal activity and revalidates HEAD, index digest, and workspace digest
-       └─ restore worktree-only CAS objects or refuse without changing files
+/undo → newest-first interaction picker → confirmation picker
+  └─ interaction.rollback revalidates HEAD, index digest, and workspace digest
+       ├─ restore worktree-only CAS objects or refuse without changing files
+       └─ success → reconcile Harness → restore the selected prompt to HarnessInput
 ```
 
 ### Harness broker boundary
@@ -1058,7 +1058,7 @@ Each stored session uses one versioned envelope. Session loading and listing acc
 current format, leaving older rows invisible without migration or partial decoding. Runtime code
 therefore reads only the current ordered interaction model.
 
-GitStatus, PR review, the Harness tree, and `:Interactions` route file headers and hunk bodies
+GitStatus, PR review, and the Harness tree route file headers and hunk bodies
 through `diff_component.lua`. It owns the call into `diff_render.build_fancy_diff_rows` plus the
 `status_buffer.add_fancy_row` and `status_buffer.add_segment_line` accumulation used by every
 consumer. `diff_tree.lua` supplies checkpoint paths, expansion keys, caller-selected indentation,
@@ -1353,7 +1353,7 @@ The headless suite lives in `nvim/tests/diff_review/` and runs via
 tests never touch a real repo. `diff_architecture.lua` guards the render-engine extraction
 boundaries. `tests/diff_review/harness.lua` drives interaction-tree transitions, node-local
 render transactions, immutable fold behavior, steering acknowledgment and fallback, queue editing,
-output-free prompt restoration, PlanReview, Interactions, session search and preview, atomic key-list configuration,
+output-free prompt restoration, PlanReview, `/undo`, session search and preview, atomic key-list configuration,
 and fork capability gating through a deterministic JSONL process mock.
 
 The Rust suite runs with `cargo test --manifest-path
@@ -1376,8 +1376,9 @@ available, and streams one exact read-only response through the complete broker.
 with `cargo test --manifest-path nvim/rust/diff-review-harness/Cargo.toml --test copilot_real --
 --ignored --nocapture`.
 
-After automated tests, use Terminal MCP to open `:Harness`, PlanReview, and `:Interactions`, then
-exercise `/sessions` at both 160x48 and 100x30. Inspect fuzzy filtering, preview replacement,
+After automated tests, use Terminal MCP to open `:Harness` and PlanReview, then exercise `/undo`
+and `/sessions` at both 160x48 and 100x30. Inspect rollback confirmation, prompt restoration,
+fuzzy filtering, preview replacement,
 scope toggling, deletion, resume, focus restoration, winbars, folds, prompt navigation, composer
 growth, queue editing, and capability-gated actions in a real PTY.
 
