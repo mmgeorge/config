@@ -532,7 +532,7 @@ local function fake_launcher(command, options, _)
       emit(options, { id = request.id, result = { {
         id = "mock-model",
         label = "Redundant provider label",
-        reasoning = { "low", "high" },
+        reasoning = { "low", "medium", "high" },
         default_reasoning = "low",
         selected_reasoning = "low",
         context_window = {
@@ -543,6 +543,18 @@ local function fake_launcher(command, options, _)
         selected_context_window = "default",
         vision = true,
         description = "Backend supplied description.",
+      }, {
+        id = "mock-model-secondary",
+        reasoning = { "low", "medium", "high" },
+        default_reasoning = "medium",
+        selected_reasoning = "medium",
+        context_window = {
+          { id = "default", token_limit = 100000 },
+          { id = "long_context", token_limit = 200000 },
+        },
+        default_context_window = "long_context",
+        selected_context_window = "long_context",
+        description = "Alignment reference.",
       } } })
     elseif request.method == "session.execution_mode" then
       active_session.execution_mode = request.params.mode
@@ -1599,21 +1611,37 @@ local ok, failure = pcall(function()
       and model_option.detail:find("100K", 1, true) < model_option.detail:find("Vision", 1, true)
       and model_option.detail:find("Vision", 1, true) < model_option.detail:find("Backend supplied", 1, true),
     "model picker should order reasoning, context, vision, and description")
+  local description_column = model_option.detail:find("Backend supplied", 1, true)
+  local reference_option = model_picker.spec.page_list[1].option_list[2]
+  local function display_column(text, value)
+    local byte_index = assert(text:find(value, 1, true))
+    return vim.fn.strdisplaywidth(text:sub(1, byte_index - 1))
+  end
   model_picker.spec.action_list[3].callback()
   model_picker = require("diff_review.views.picker")._state_for_test()
-  assert_true(model_picker.spec.page_list[1].option_list[1].detail:find("high", 1, true) ~= nil,
+  model_option = model_picker.spec.page_list[1].option_list[1]
+  assert_true(model_option.detail:find("medium", 1, true) ~= nil,
     "right should cycle the selected reasoning effort")
+  assert_equals(display_column(model_option.detail, "medium"), display_column(reference_option.detail, "medium"),
+    "reasoning values should retain their column when selection arrows appear")
+  assert_equals(model_option.detail:find("Backend supplied", 1, true), description_column,
+    "reasoning arrows should not shift columns to their right")
   model_picker.spec.action_list[1].callback()
   model_picker = require("diff_review.views.picker")._state_for_test()
   model_picker.spec.action_list[3].callback()
   model_picker = require("diff_review.views.picker")._state_for_test()
-  assert_true(model_picker.spec.page_list[1].option_list[1].detail:find("200K", 1, true) ~= nil,
+  model_option = model_picker.spec.page_list[1].option_list[1]
+  assert_true(model_option.detail:find("200K", 1, true) ~= nil,
     "Tab followed by right should cycle the selected context window")
+  assert_equals(display_column(model_option.detail, "200K"), display_column(reference_option.detail, "200K"),
+    "context values should retain their column when selection arrows appear")
+  assert_equals(model_option.detail:find("Backend supplied", 1, true), description_column,
+    "context arrows should not shift columns to their right")
   vim.fn.maparg("<CR>", "n", false, true).callback()
   assert_true(vim.wait(1000, function()
     return request_by_method["session.configure"]
       and request_by_method["session.configure"].params.model == "mock-model"
-      and request_by_method["session.configure"].params.effort == "high"
+      and request_by_method["session.configure"].params.effort == "medium"
       and request_by_method["session.configure"].params.context_window == "long_context"
   end, 10), "model selection should configure the chosen backend model")
   local command_source = require("diff_review.views.harness.completion.command_source").new()

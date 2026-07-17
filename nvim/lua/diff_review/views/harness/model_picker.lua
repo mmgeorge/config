@@ -83,19 +83,49 @@ local function context_label(model)
   return nil
 end
 
-local function decorated(value, active)
-  if not value or value == "" then return nil end
-  return active and ("← %s →"):format(value) or value
+local function padded_field(value, active, column)
+  if column.width == 0 then return nil end
+  local text = value or ""
+  if column.selectable then
+    text = active and ("← %s →"):format(text) or ("  %s  "):format(text)
+  end
+  return text .. string.rep(" ", math.max(0, column.width - vim.fn.strdisplaywidth(text)))
 end
 
-local function model_detail(model, active_field)
+local function column_layout(model_list)
+  local layout = {
+    reasoning = { width = 0, selectable = false },
+    context_window = { width = 0, selectable = false },
+    vision = { width = 0, selectable = false },
+  }
+  for _, model in ipairs(model_list) do
+    layout.reasoning.selectable = layout.reasoning.selectable or #(model.reasoning or {}) > 1
+    layout.context_window.selectable = layout.context_window.selectable or #(model.context_window or {}) > 1
+    for _, reasoning in ipairs(model.reasoning or {}) do
+      layout.reasoning.width = math.max(layout.reasoning.width, vim.fn.strdisplaywidth(reasoning))
+    end
+    for _, context in ipairs(model.context_window or {}) do
+      layout.context_window.width = math.max(
+        layout.context_window.width,
+        vim.fn.strdisplaywidth(format_token_count(context.token_limit) or context.id)
+      )
+    end
+    if model.vision then layout.vision.width = vim.fn.strdisplaywidth("Vision") end
+  end
+  for _, column in pairs(layout) do
+    if column.selectable then column.width = column.width + 4 end
+  end
+  return layout
+end
+
+local function model_detail(model, active_field, layout)
   local segment_list = {}
   local function append(value)
     if value and value ~= "" then segment_list[#segment_list + 1] = value end
   end
-  append(decorated(model.picker_reasoning, active_field == "reasoning"))
-  append(decorated(context_label(model), active_field == "context_window"))
-  if model.vision then append("Vision") end
+  append(padded_field(model.picker_reasoning, active_field == "reasoning", layout.reasoning))
+  append(padded_field(context_label(model), active_field == "context_window", layout.context_window))
+  append(padded_field(model.vision and "Vision" or nil, false, layout.vision))
   append(model.description)
   return table.concat(segment_list, "  ")
 end
@@ -110,6 +140,7 @@ function ModelPicker.open(options)
     for _, model in ipairs(model_list) do if model.is_default then default_model = model break end end
     selected_model_id = (default_model or model_list[1]).id
   end
+  local layout = column_layout(model_list)
   local active_field_by_model = {}
   local api
 
@@ -129,7 +160,7 @@ function ModelPicker.open(options)
       option_list[#option_list + 1] = {
         id = model.id,
         label = model.id,
-        detail = model_detail(model, model.id == selected_model_id and active_field(model) or nil),
+        detail = model_detail(model, model.id == selected_model_id and active_field(model) or nil, layout),
         value = model,
       }
     end
@@ -208,5 +239,6 @@ function ModelPicker.open(options)
 end
 
 ModelPicker._format_token_count = format_token_count
+ModelPicker._column_layout = column_layout
 
 return ModelPicker
