@@ -212,6 +212,37 @@ async fn run_broker() -> Result<()> {
                                     )?),
                                 ).await?;
                             }
+                            Ok(restart_request) if restart_request.method == "turn.restart" => {
+                                let mode: Result<diff_review_harness::session::ExecutionMode> = restart_request
+                                    .params
+                                    .get("mode")
+                                    .cloned()
+                                    .context("turn.restart requires mode")
+                                    .and_then(|value| {
+                                        serde_json::from_value(value)
+                                            .context("turn.restart mode is invalid")
+                                    });
+                                let response = match mode {
+                                    Ok(mode) => {
+                                        cancellation.request(false);
+                                        permission_coordinator
+                                            .cancel_all(Some(&approval_event_sink))?;
+                                        BrokerResponse::success(
+                                            restart_request.id,
+                                            serde_json::json!({
+                                                "restart_requested": true,
+                                                "mode": mode,
+                                            }),
+                                        )?
+                                    }
+                                    Err(error) => BrokerResponse::failure(
+                                        restart_request.id,
+                                        "invalid_request",
+                                        format!("{error:#}"),
+                                    ),
+                                };
+                                write_message(&mut output, &BrokerMessage::Response(response)).await?;
+                            }
                             Ok(steer_request) if steer_request.method == "turn.steer" => {
                                 let text = steer_request
                                     .params

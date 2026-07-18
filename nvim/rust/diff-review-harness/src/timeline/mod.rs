@@ -4,8 +4,17 @@ use crate::plan::{
     PlanExecutionRecord, PlanFileStore, PlanLifecycleKind, PlanLifecycleRecord, PlanRecord,
 };
 use anyhow::Result;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+/// Represents one durable session-level action shown outside model interactions.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SessionEventRecord {
+    pub id: String,
+    pub session_id: String,
+    pub created_at_ms: i64,
+    pub name: String,
+}
 
 /// Represents one fully resolved top-level Harness timeline entry.
 #[derive(Clone, Debug, Serialize)]
@@ -35,6 +44,11 @@ pub enum TimelineEntry {
         created_at_ms: i64,
         run: AgentRun,
     },
+    SessionEvent {
+        id: String,
+        created_at_ms: i64,
+        event: SessionEventRecord,
+    },
 }
 
 impl TimelineEntry {
@@ -43,7 +57,8 @@ impl TimelineEntry {
             Self::Interaction { created_at_ms, .. }
             | Self::PlanLifecycle { created_at_ms, .. }
             | Self::PlanExecution { created_at_ms, .. }
-            | Self::AgentLifecycle { created_at_ms, .. } => *created_at_ms,
+            | Self::AgentLifecycle { created_at_ms, .. }
+            | Self::SessionEvent { created_at_ms, .. } => *created_at_ms,
         }
     }
 }
@@ -59,6 +74,7 @@ impl TimelineProjector {
         lifecycle_list: Vec<PlanLifecycleRecord>,
         execution_list: Vec<PlanExecutionRecord>,
         agent_run_list: Vec<AgentRun>,
+        session_event_list: Vec<SessionEventRecord>,
         plan_file: &PlanFileStore,
     ) -> Result<Vec<TimelineEntry>> {
         let plan_by_id = plan_list
@@ -131,6 +147,13 @@ impl TimelineProjector {
                 id: run.id.clone(),
                 created_at_ms: run.created_at_ms,
                 run,
+            });
+        }
+        for event in session_event_list {
+            result.push(TimelineEntry::SessionEvent {
+                id: event.id.clone(),
+                created_at_ms: event.created_at_ms,
+                event,
             });
         }
         result.sort_by_key(TimelineEntry::created_at_ms);

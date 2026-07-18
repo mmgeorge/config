@@ -285,6 +285,13 @@ terminal's previous state. Models, effort, fast mode, artifacts, agents, interac
 approvals, lease conflicts, execution confirmations, and planning questions therefore share the
 same geometry and focus contract without duplicating popup mechanics.
 
+Configuration pickers never depend on the serialized provider-turn request lane to become visible.
+Harness resolves and caches backend model metadata when the view activates, then `/model` opens from
+that presentation cache even while a provider turn runs. Model, effort, fast-mode, backend, and
+execution-mode selections continue through their normal mutation owners. Configuration and backend
+changes queue for the next safe boundary, while execution mode retains its active-turn restart
+contract.
+
 The `/undo` specialization loads the active session's durable interaction records and lists
 checkpointed complete, failed, or cancelled interactions newest first. Selecting a record opens a
 second picker with `Cancel` selected before the destructive choice. A successful broker rollback
@@ -980,6 +987,15 @@ change occurs, the broker finalizes partial timeline state and persists the inte
 cancelled. This split prevents the composer from presenting text that still exists in provider
 history while preserving the quick-regret workflow for a genuinely output-free turn.
 
+`turn.restart` uses that same out-of-band lane for an execution-mode change. Shift-Tab records the
+target mode in the Harness winbar, interrupts the active provider turn, persists the mode after
+the cancellation settles, then resumes the cancelled interaction on the retained provider
+conversation. The interrupted segment remains durable and the resumed provider work appends the
+next `MainSegment`, so one user action keeps one interaction checkpoint and one rollback boundary.
+Codex exposes the submitted app-server thread for resumption, while Copilot exposes its retained
+SDK session. A restart failure preserves the partial transcript, keeps the selected execution mode,
+and notifies the user instead of silently replaying the original prompt.
+
 `turn.steer` uses the same out-of-band broker lane without creating another interaction. Ctrl-q
 clears HarnessInput only after admitting the text into a pending steering record, then the backend
 delivers it to the active provider turn and acknowledges the request. The Codex backend maps that
@@ -1262,9 +1278,16 @@ from reappearing through a later state snapshot.
 Read, Write, Full, and YOLO form the fixed execution-mode set. New and forked sessions start in Read,
 while resumed sessions retain their persisted mode. Plan creation, review, acceptance, rejection,
 and cancellation never change it. `Shift-Tab` cycles the four modes through
-`session.execution_mode`, while an active turn defers selection to its next safe request boundary.
+`session.execution_mode` while idle. During an active main turn it requests `turn.restart`, then
+persists the selected mode and resumes the cancelled interaction under that new security boundary.
 `:Permissions` uses an `acwrite` JSON buffer, so invalid documents never replace the compiled policy.
 Non-Git modes that permit writes retain the checkpoint warning and confirmation path.
+
+Inline `/model`, `/effort`, and `/mode` commands cross the same broker capability boundary as
+their pickers. The broker validates explicit model identifiers and model-specific reasoning effort
+against backend discovery before mutating session state, while execution modes validate against the
+backend's advertised mode set. Accepted changes and rejected values render as session-level timeline
+status entries, giving inline commands the same visible outcome contract as session rename.
 
 `CodexSecurity` projects every Codex thread and turn through the same native policy. Read selects a
 read-only profile with network access, Write adds workspace-root writes, Full selects unrestricted
@@ -1289,7 +1312,9 @@ resumes, or reconfigures the active session. Before resolution, the winbar says 
 instead of presenting `default` as though it were a real model ID.
 
 `/rename <name>` routes directly to the broker's durable `session.rename` request rather
-than entering the model transcript. `/rename` clears the optional display name. The
+than entering the model transcript. The broker records a durable session timeline event
+after the rename succeeds, so the transcript confirms completion immediately and after
+session reopen. `/rename` clears the optional display name. The
 The `/sessions` picker searches that name and substitutes `[unnamed]` for empty names,
 keeping storage semantics separate from presentation fallback text.
 

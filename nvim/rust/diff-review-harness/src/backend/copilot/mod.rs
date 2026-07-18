@@ -362,6 +362,14 @@ impl Backend for CopilotBackend {
         }
         Ok(())
     }
+
+    async fn active_session_id(&self) -> Option<String> {
+        self.active_session
+            .lock()
+            .await
+            .as_ref()
+            .map(|session| session.id().to_string())
+    }
 }
 
 /// Coordinates acknowledged steering events with the currently active Copilot turn.

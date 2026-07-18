@@ -5,6 +5,20 @@ local display_text = require("diff_review.render.display_text")
 local diff_tree = require("diff_review.render.diff_tree")
 local plan_event = require("diff_review.render.harness.plan_event")
 local timeline_status = require("diff_review.render.harness.timeline_status")
+
+local function append_session_event(result, entry)
+  local event = entry.event or {}
+  local name = event.name or ""
+  local text = event.message or (name == "" and "Session name cleared" or ("Session renamed to " .. name))
+  result.lines[#result.lines + 1] = "  " .. text
+  result.rows[#result.lines] = { kind = "session_event", node_id = entry.id }
+  result.highlights[#result.highlights + 1] = {
+    line = #result.lines,
+    first = 2,
+    last = 2 + #text,
+    group = event.severity == "error" and "DiagnosticError" or "Comment",
+  }
+end
 local agent_event = require("diff_review.render.harness.agent_event")
 local markdown_text = require("diff_review.render.harness.markdown_text")
 local task_tree = require("diff_review.render.harness.task_tree")
@@ -587,6 +601,8 @@ function M.build(interactions, options)
       append_interaction(result, aggregate_execution(entry), options)
     elseif entry.kind == "agent_lifecycle" then
       agent_event.append(result, entry, options, 0)
+    elseif entry.kind == "session_event" then
+      append_session_event(result, entry)
     else
       append_interaction(result, entry, options)
     end

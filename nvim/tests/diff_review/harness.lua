@@ -178,6 +178,7 @@ local active_plan = nil
 local active_elicitation = nil
 local prompt_history = { "most recent prompt", "older prompt" }
 local retract_request = nil
+local backend_model_request_blocked = false
 
 local function planning_question_set()
   return {
@@ -543,8 +544,27 @@ local function fake_launcher(command, options, _)
       } })
     elseif request.method == "session.rename" then
       active_session.name = vim.trim(request.params.name or "")
+      if #session.harness.timeline == 0 then
+        for _, interaction in ipairs(session.harness.interaction or {}) do
+          session.harness.timeline[#session.harness.timeline + 1] = {
+            kind = "interaction",
+            interaction = vim.deepcopy(interaction),
+          }
+        end
+      end
+      local timeline_entry = {
+        kind = "session_event",
+        id = "session-event-" .. tostring(vim.uv.hrtime()),
+        created_at_ms = 1,
+        event = { name = active_session.name },
+      }
+      emit(options, { event = "backend_event", payload = {
+        kind = "timeline_session_event",
+        data = timeline_entry,
+      } })
       emit(options, { id = request.id, result = active_session })
     elseif request.method == "backend.models" then
+      if backend_model_request_blocked then return end
       emit(options, { id = request.id, result = { {
         id = "mock-model",
         label = "Redundant provider label",
@@ -576,6 +596,13 @@ local function fake_launcher(command, options, _)
       active_session.execution_mode = request.params.mode
       emit(options, { event = "execution_mode_changed", payload = active_session })
       emit(options, { id = request.id, result = active_session })
+    elseif request.method == "turn.restart" then
+      emit(options, { id = request.id, result = {
+        restart_requested = true,
+        mode = request.params.mode,
+      } })
+    elseif request.method == "interaction.resume" then
+      emit(options, { id = request.id, result = active_session })
     elseif request.method == "test.approval.open" then
       emit(options, { event = "backend_event", payload = {
         kind = "approval_requested",
@@ -595,7 +622,27 @@ local function fake_launcher(command, options, _)
       } })
       emit(options, { id = request.id, result = { cancelled = true } })
     elseif request.method == "session.configure" then
-      active_session = vim.tbl_extend("force", active_session, request.params)
+      if request.params.validate == true
+        and request.params.model
+        and not vim.tbl_contains({ "mock-model", "mock-model-secondary" }, request.params.model)
+      then
+        emit(options, { id = request.id, error = {
+          message = "model " .. request.params.model .. " is unavailable for this backend",
+        } })
+        return
+      end
+      if request.params.validate == true
+        and request.params.effort
+        and not vim.tbl_contains({ "low", "medium", "high" }, request.params.effort)
+      then
+        emit(options, { id = request.id, error = {
+          message = "reasoning effort " .. request.params.effort .. " is unavailable for model mock-model",
+        } })
+        return
+      end
+      local next_config = vim.deepcopy(request.params)
+      next_config.validate = nil
+      active_session = vim.tbl_extend("force", active_session, next_config)
       emit(options, { event = "session_configured", payload = active_session })
       emit(options, { id = request.id, result = active_session })
     elseif request.method == "session.compact" then
@@ -1649,6 +1696,16 @@ local ok, failure = pcall(function()
   assert_equals(vim.api.nvim_win_get_config(effort_picker.win).focusable, true,
     "effort picker should own modal focus")
   require("diff_review.views.picker").close(false)
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/mode" })
+  controller.submit()
+  local mode_picker = require("diff_review.views.picker")._state_for_test()
+  assert_equals(mode_picker.spec.page_list[1].title, "Select execution mode",
+    "mode selection should use the shared picker")
+  assert_equals(#mode_picker.spec.page_list[1].option_list, 4,
+    "mode selection should expose Read, Write, Full, and YOLO")
+  assert_equals(mode_picker.spec.page_list[1].option_list[2].label, "Write",
+    "mode selection should label the workspace-write mode")
+  require("diff_review.views.picker").close(false)
   controller.select_model()
   assert_true(vim.wait(1000, function() return require("diff_review.views.picker").is_open() end, 10),
     "model selection should open the shared picker after backend discovery")
@@ -1694,6 +1751,48 @@ local ok, failure = pcall(function()
       and request_by_method["session.configure"].params.effort == "medium"
       and request_by_method["session.configure"].params.context_window == "long_context"
   end, 10), "model selection should configure the chosen backend model")
+  backend_model_request_blocked = true
+  session.harness.busy = true
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/model" })
+  controller.submit()
+  assert_true(require("diff_review.views.picker").is_open(),
+    "/model should open from the cached catalog during an active turn")
+  local busy_model_picker = require("diff_review.views.picker")._state_for_test()
+  busy_model_picker.spec.on_confirm({ option = busy_model_picker.spec.page_list[1].option_list[2] })
+  assert_equals(session.harness.pending_config.model, "mock-model-secondary",
+    "active-turn model picker selection should queue for the next safe boundary")
+  require("diff_review.views.picker").close(false)
+  session.harness.pending_config = nil
+  session.harness.pending_config_validate = false
+
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/effort" })
+  controller.submit()
+  local busy_effort_picker = require("diff_review.views.picker")._state_for_test()
+  assert_equals(busy_effort_picker.spec.page_list[1].title, "Select reasoning effort",
+    "/effort should open during an active turn")
+  busy_effort_picker.spec.on_confirm({ option = busy_effort_picker.spec.page_list[1].option_list[4] })
+  assert_equals(session.harness.pending_config.effort, "high",
+    "active-turn effort picker selection should queue for the next safe boundary")
+  require("diff_review.views.picker").close(false)
+  session.harness.pending_config = nil
+  session.harness.pending_config_validate = false
+
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/backend" })
+  controller.submit()
+  local busy_backend_picker = require("diff_review.views.picker")._state_for_test()
+  assert_equals(busy_backend_picker.spec.page_list[1].title, "Select Harness backend",
+    "/backend should open during an active turn")
+  local alternate_backend = vim.iter(busy_backend_picker.spec.page_list[1].option_list):find(function(option)
+    return option.value ~= session.harness.session.backend
+  end)
+  assert_true(alternate_backend ~= nil, "backend picker coverage requires an alternate backend")
+  busy_backend_picker.spec.on_confirm({ option = alternate_backend })
+  assert_equals(session.harness.pending_backend, alternate_backend.value,
+    "active-turn backend picker selection should queue for the next safe boundary")
+  require("diff_review.views.picker").close(false)
+  session.harness.pending_backend = nil
+  session.harness.busy = false
+  backend_model_request_blocked = false
   local command_source = require("diff_review.views.harness.completion.command_source").new()
   vim.api.nvim_set_current_win(session.harness.composer_win)
   vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/ " })
@@ -1708,6 +1807,8 @@ local ok, failure = pcall(function()
     "slash completion should expose backend selection")
   assert_true(vim.iter(command_completion.items):any(function(item) return item.label == "/undo" end),
     "slash completion should expose interaction rollback")
+  assert_true(vim.iter(command_completion.items):any(function(item) return item.label == "/mode" end),
+    "slash completion should expose execution-mode selection")
   assert_true(vim.iter(command_completion.items):any(function(item) return item.label == "/compact" end),
     "slash completion should expose compact when the backend advertises it")
   assert_true(vim.iter(command_completion.items):any(function(item) return item.label == "/full" end),
@@ -1715,6 +1816,97 @@ local ok, failure = pcall(function()
   assert_true(vim.iter(command_completion.items):any(function(item) return item.label == "/yolo" end),
     "slash completion should expose YOLO mode")
   assert_equals(command_completion.items[1].label, "/plan", "slash completion should prioritize plan creation")
+
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/mode w" })
+  vim.api.nvim_win_set_cursor(session.harness.composer_win, { 1, 7 })
+  command_source:get_completions({}, function(result) command_completion = result end)
+  assert_equals(#command_completion.items, 4, "/mode completion should expose every execution mode")
+  assert_true(vim.iter(command_completion.items):any(function(item) return item.label == "write" end),
+    "/mode completion should expose Write mode")
+  assert_equals(command_completion.items[1].textEdit.range.start.character, 6,
+    "/mode completion should replace only the mode name")
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/mode write" })
+  controller.submit()
+  assert_true(vim.wait(1000, function() return active_session.execution_mode == "write" end, 10),
+    "/mode write should switch directly without opening the picker")
+  controller.set_mode("read")
+  assert_true(vim.wait(1000, function() return active_session.execution_mode == "read" end, 10),
+    "direct mode command coverage should restore the shared fixture mode")
+
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/model mock" })
+  vim.api.nvim_win_set_cursor(session.harness.composer_win, { 1, 11 })
+  command_completion = nil
+  command_source:get_completions({}, function(result) command_completion = result end)
+  assert_true(vim.wait(1000, function() return command_completion ~= nil end, 10),
+    "/model completion should resolve backend models asynchronously")
+  assert_equals(#command_completion.items, 2, "/model completion should expose every backend model")
+  assert_equals(command_completion.items[1].label, "mock-model",
+    "/model completion should preserve backend model identifiers")
+  assert_equals(command_completion.items[1].textEdit.range.start.character, 7,
+    "/model completion should replace only the model identifier")
+
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/model mock-model m" })
+  vim.api.nvim_win_set_cursor(session.harness.composer_win, { 1, 19 })
+  command_completion = nil
+  command_source:get_completions({}, function(result) command_completion = result end)
+  assert_true(vim.wait(1000, function() return command_completion ~= nil end, 10),
+    "/model effort completion should resolve model metadata asynchronously")
+  assert_equals(#command_completion.items, 3,
+    "/model effort completion should expose only efforts supported by that model")
+  assert_true(vim.iter(command_completion.items):any(function(item) return item.label == "medium" end),
+    "/model effort completion should expose the backend's medium effort")
+  assert_equals(command_completion.items[1].textEdit.range.start.character, 18,
+    "/model effort completion should replace only the effort name")
+
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/effort x" })
+  vim.api.nvim_win_set_cursor(session.harness.composer_win, { 1, 9 })
+  command_source:get_completions({}, function(result) command_completion = result end)
+  assert_equals(#command_completion.items, 5, "/effort completion should expose every reasoning effort")
+  assert_true(vim.iter(command_completion.items):any(function(item) return item.label == "xhigh" end),
+    "/effort completion should expose xhigh")
+
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/model mock-model-secondary" })
+  controller.submit()
+  assert_true(vim.wait(1000, function() return active_session.model == "mock-model-secondary" end, 10),
+    "/model NAME should switch models directly")
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/model mock-model high" })
+  controller.submit()
+  assert_true(vim.wait(1000, function()
+    return active_session.model == "mock-model" and active_session.effort == "high"
+  end, 10), "/model NAME EFFORT should configure both values directly")
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/effort low" })
+  controller.submit()
+  assert_true(vim.wait(1000, function() return active_session.effort == "low" end, 10),
+    "/effort EFFORT should configure reasoning directly")
+  controller.configure({ model = "mock-model", effort = "medium" })
+  assert_true(vim.wait(1000, function() return active_session.effort == "medium" end, 10),
+    "model and effort command coverage should restore the shared fixture configuration")
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/model sol" })
+  controller.submit()
+  assert_true(vim.wait(1000, function()
+    return vim.iter(session.harness.timeline):any(function(entry)
+      return entry.event and entry.event.message
+        and entry.event.message:find("model sol is unavailable", 1, true) ~= nil
+    end)
+  end, 10), "invalid inline models should render their rejection on the timeline")
+  assert_equals(active_session.model, "mock-model", "invalid inline models should leave the active model unchanged")
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/effort xhigh" })
+  controller.submit()
+  assert_true(vim.wait(1000, function()
+    return vim.iter(session.harness.timeline):any(function(entry)
+      return entry.event and entry.event.message
+        and entry.event.message:find("reasoning effort xhigh is unavailable", 1, true) ~= nil
+    end)
+  end, 10), "invalid inline efforts should render their rejection on the timeline")
+  assert_equals(active_session.effort, "medium", "invalid inline efforts should leave reasoning unchanged")
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/mode invalid" })
+  controller.submit()
+  assert_true(vim.iter(session.harness.timeline):any(function(entry)
+    return entry.event and entry.event.message
+      and entry.event.message:find("Unknown execution mode: invalid", 1, true) ~= nil
+  end), "invalid inline modes should render their rejection on the timeline")
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/ " })
+  vim.api.nvim_win_set_cursor(session.harness.composer_win, { 1, 1 })
 
   session.harness.capability.agent = { catalog = false }
   command_source:get_completions({}, function(result) command_completion = result end)
@@ -1892,6 +2084,17 @@ local ok, failure = pcall(function()
   vim.fn.maparg("<S-Tab>", "n", false, true).callback()
   assert_true(vim.wait(1000, function() return active_session.execution_mode == "read" end, 10),
     "fourth Shift-Tab should restore Read mode")
+
+  session.harness.busy = true
+  vim.fn.maparg("<S-Tab>", "n", false, true).callback()
+  assert_true(vim.wait(1000, function()
+    return request_by_method["turn.restart"] and request_by_method["turn.restart"].params.mode == "write"
+  end, 10), "busy Shift-Tab should restart the active turn in Write mode")
+  assert_true(session.harness.mode_restart_requested and session.harness.pending_mode == "write",
+    "busy Shift-Tab should retain the target mode until the cancelled turn resumes")
+  session.harness.busy = false
+  session.harness.mode_restart_requested = false
+  session.harness.pending_mode = nil
 
   vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "hello harness" })
   local tool_frame_start = #render_frame_list + 1
@@ -2460,7 +2663,7 @@ local ok, failure = pcall(function()
   assert_equals(mcp_active_tree.lines[mcp_arguments_highlight.line]:sub(
     mcp_arguments_highlight.first + 1,
     mcp_arguments_highlight.last
-  ):sub(1, 1), "(", "MCP argument highlighting should begin at the JSON delimiter")
+  ):sub(1, 1), "{", "MCP argument highlighting should begin inside the JSON delimiters")
   assert_true(vim.tbl_contains(mcp_active_tree.lines, "    └ Fetching crate metadata"),
     "active MCP calls should render their latest progress message")
 
@@ -2938,6 +3141,12 @@ local ok, failure = pcall(function()
   assert_true(vim.wait(2000, function()
     return request_by_method["session.rename"] ~= nil and session.harness.session.name == "Architecture review"
   end, 10), "/rename should persist the active session name")
+  assert_true(vim.wait(2000, function()
+    return vim.tbl_contains(
+      vim.api.nvim_buf_get_lines(session.harness.transcript_buf, 0, -1, false),
+      "  Session renamed to Architecture review"
+    )
+  end, 10), "/rename should confirm completion in the timeline")
   vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/sessions" })
   controller.submit()
   local session_picker = require("diff_review.views.picker")
@@ -2953,6 +3162,12 @@ local ok, failure = pcall(function()
   controller.submit()
   assert_true(vim.wait(2000, function() return session.harness.session.name == "" end, 10),
     "/rename without a name should clear the active session name")
+  assert_true(vim.wait(2000, function()
+    return vim.tbl_contains(
+      vim.api.nvim_buf_get_lines(session.harness.transcript_buf, 0, -1, false),
+      "  Session name cleared"
+    )
+  end, 10), "/rename without a name should confirm completion in the timeline")
   controller.open_session_picker()
   assert_true(vim.wait(2000, function() return session_picker.is_open("sessions") end, 10),
     "session search did not reopen for unnamed-session verification")
@@ -2961,10 +3176,10 @@ local ok, failure = pcall(function()
   assert_equals(session_page.option_list[1].label, "[unnamed]",
     "session search should render empty names as [unnamed]")
   session_picker.close(true)
-  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/model selected-model" })
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/model mock-model-secondary" })
   controller.submit()
   assert_true(vim.wait(2000, function()
-    return request_by_method["session.configure"] ~= nil and session.harness.session.model == "selected-model"
+    return request_by_method["session.configure"] ~= nil and session.harness.session.model == "mock-model-secondary"
   end, 10), "/model should configure the active session")
   vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/effort high" })
   controller.submit()
@@ -2977,7 +3192,7 @@ local ok, failure = pcall(function()
   assert_true(vim.wait(2000, function()
     return session.harness.session.id == "session-two"
   end, 10), "new session should complete")
-  assert_equals(session.harness.session.model, "selected-model", "new sessions should preserve the selected model")
+  assert_equals(session.harness.session.model, "mock-model-secondary", "new sessions should preserve the selected model")
   assert_equals(session.harness.session.effort, "high", "new sessions should preserve the selected effort")
   assert_equals(session.harness.prompt_history[1], "/effort high",
     "new sessions should retain the shared prompt history")

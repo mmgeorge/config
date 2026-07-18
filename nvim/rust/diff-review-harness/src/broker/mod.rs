@@ -25,7 +25,7 @@ use crate::session::{
     ContextUsage, ExecutionMode, HarnessPreference, HarnessSession, ModelSetting, SessionStore,
 };
 use crate::storage::SqliteStore;
-use crate::timeline::{TimelineEntry, TimelineProjector};
+use crate::timeline::{SessionEventRecord, TimelineEntry, TimelineProjector};
 use crate::workspace::WorkspaceKind;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -505,6 +505,7 @@ impl HarnessBroker {
             lifecycle_list,
             execution_list,
             self.agent_registry.list(),
+            self.store.list_session_event(&self.session.id)?,
             &self.plan_file,
         )?;
         let agent_run_list = self.agent_registry.list();
@@ -609,6 +610,7 @@ impl HarnessBroker {
             "permissions.open" => self.open_permission_document(),
             "permissions.save" => self.save_permission_document(params),
             "session.execution_mode" => self.select_execution_mode(params),
+            "interaction.resume" => self.resume_interaction(params).await,
             "prompt.submit" => self.submit_prompt(params).await,
             "history.record" => self.record_prompt_history(params),
             "queue.edit_last" => anyhow::bail!("prompt queue ownership lives in the Neovim client"),
@@ -637,7 +639,7 @@ impl HarnessBroker {
             "session.preview" => self.preview_session(params),
             "session.resume" => self.resume_session(params).await,
             "session.rename" => self.rename_session(params),
-            "session.configure" => self.configure_session(params),
+            "session.configure" => self.configure_session(params).await,
             "session.compact" => self.compact_session().await,
             "session.delete" => self.delete_session(params),
             "session.fork" => self.fork_session(params).await,
@@ -683,6 +685,21 @@ impl HarnessBroker {
             session.clone(),
             vec![self.event("execution_mode_changed", session)?],
         ))
+    }
+
+    async fn resume_interaction(&mut self, params: Value) -> Result<(Value, Vec<BrokerEvent>)> {
+        let text = required_text(&params, "text")?;
+        let interaction = self
+            .store
+            .list_interaction(&self.session.id)?
+            .into_iter()
+            .last()
+            .context("no Harness interaction is available to resume")?;
+        anyhow::ensure!(
+            interaction.state == InteractionState::Cancelled,
+            "the latest Harness interaction is not cancelled"
+        );
+        self.run_interaction(text, PromptMode::Chat, None).await
     }
 
     async fn start_agent(&mut self, params: Value) -> Result<(Value, Vec<BrokerEvent>)> {
@@ -1901,6 +1918,11 @@ impl HarnessBroker {
             Ok(output) => output,
             Err(error) => {
                 let cancelled = error.downcast_ref::<TurnCancelled>().is_some();
+                if cancelled
+                    && let Some(backend_session_id) = self.backend.active_session_id().await
+                {
+                    self.session.backend_session_id = Some(backend_session_id);
+                }
                 let final_checkpoint_id = self.capture_final_checkpoint(&mut interaction)?;
                 let workspace_unchanged = interaction.checkpoint_before.is_some()
                     && interaction.checkpoint_before == final_checkpoint_id;
@@ -3505,6 +3527,7 @@ impl HarnessBroker {
             self.store.list_plan_lifecycle(&session_id)?,
             self.store.list_plan_execution(&session_id)?,
             agent_run_list.clone(),
+            self.store.list_session_event(&session_id)?,
             &self.plan_file,
         )?;
         let mut agent_turn_list = Vec::new();
@@ -3590,15 +3613,98 @@ impl HarnessBroker {
             .load_session(&session_id)?
             .context("session not found")?;
         session.name = name;
-        session.updated_at_ms = self.clock.now_ms();
+        let created_at_ms = self.clock.now_ms();
+        session.updated_at_ms = created_at_ms;
         self.store.save_session(&session)?;
+        let timeline_event = SessionEventRecord {
+            id: Uuid::new_v4().to_string(),
+            session_id: session.id.clone(),
+            created_at_ms,
+            name: session.name.clone(),
+        };
+        self.store.save_session_event(&timeline_event)?;
         if self.session.id == session.id {
             self.session = session.clone();
         }
-        Ok((serde_json::to_value(session)?, Vec::new()))
+        let entry = TimelineEntry::SessionEvent {
+            id: timeline_event.id.clone(),
+            created_at_ms,
+            event: timeline_event,
+        };
+        Ok((
+            serde_json::to_value(session)?,
+            vec![self.event(
+                "backend_event",
+                json!({ "kind": "timeline_session_event", "data": entry }),
+            )?],
+        ))
     }
 
-    fn configure_session(&mut self, params: Value) -> Result<(Value, Vec<BrokerEvent>)> {
+    async fn configure_session(&mut self, params: Value) -> Result<(Value, Vec<BrokerEvent>)> {
+        if params.get("fast_mode").and_then(Value::as_bool).is_some() {
+            anyhow::ensure!(
+                self.capability.native_goal,
+                "fast mode requires the Codex backend"
+            );
+        }
+        let requested_model = params.get("model").and_then(Value::as_str);
+        let requested_effort = params.get("effort").and_then(Value::as_str);
+        let requested_context_window = params.get("context_window").and_then(Value::as_str);
+        let validate_selection = params.get("validate").and_then(Value::as_bool) == Some(true);
+        if validate_selection
+            && (requested_model.is_some()
+                || requested_effort.is_some()
+                || requested_context_window.is_some())
+        {
+            let model_list = self
+                .backend
+                .model_list(self.backend_request(String::new(), PromptMode::Chat))
+                .await?;
+            let target_model = requested_model
+                .and_then(|model| model_list.iter().find(|candidate| candidate.id == model))
+                .or_else(|| {
+                    let active_model = self
+                        .session
+                        .resolved_model
+                        .as_deref()
+                        .unwrap_or(&self.session.model);
+                    model_list
+                        .iter()
+                        .find(|candidate| candidate.id == active_model)
+                })
+                .or_else(|| model_list.iter().find(|candidate| candidate.is_default));
+            if let Some(model) = requested_model {
+                anyhow::ensure!(
+                    target_model.is_some_and(|candidate| candidate.id == model),
+                    "model {model} is unavailable for this backend"
+                );
+            }
+            if let Some(effort) = requested_effort {
+                let model =
+                    target_model.context("the active model is unavailable for this backend")?;
+                if !model.reasoning.is_empty() {
+                    anyhow::ensure!(
+                        model.reasoning.iter().any(|candidate| candidate == effort),
+                        "reasoning effort {effort} is unavailable for model {}",
+                        model.id
+                    );
+                }
+            }
+            if let Some(context_window) = requested_context_window {
+                let model =
+                    target_model.context("the active model is unavailable for this backend")?;
+                if !model.context_window.is_empty() {
+                    anyhow::ensure!(
+                        model
+                            .context_window
+                            .iter()
+                            .any(|candidate| candidate.id == context_window),
+                        "context window {context_window} is unavailable for model {}",
+                        model.id
+                    );
+                }
+            }
+        }
         if let Some(model) = params.get("model").and_then(Value::as_str) {
             anyhow::ensure!(!model.trim().is_empty(), "model cannot be empty");
             self.session.model = model.to_owned();
@@ -3615,10 +3721,6 @@ impl HarnessBroker {
                 .map(str::to_owned);
         }
         if let Some(fast_mode) = params.get("fast_mode").and_then(Value::as_bool) {
-            anyhow::ensure!(
-                self.capability.native_goal,
-                "fast mode requires the Codex backend"
-            );
             self.session.fast_mode = fast_mode;
         }
         self.save_session()?;
@@ -5060,9 +5162,14 @@ mod test {
             })
             .await;
         assert_eq!(
-            renamed.response.result.unwrap()["name"],
+            renamed.response.result.as_ref().unwrap()["name"],
             "Architecture review"
         );
+        assert!(renamed.event.iter().any(|event| {
+            event.event == "backend_event"
+                && event.payload["kind"] == "timeline_session_event"
+                && event.payload["data"]["event"]["name"] == "Architecture review"
+        }));
         drop(broker);
 
         let resumed_session_id = session["id"].as_str().expect("new session id").to_owned();
@@ -5089,6 +5196,72 @@ mod test {
         assert_eq!(restarted.session.effort, "low");
         assert!(restarted.session.fast_mode);
         assert_eq!(restarted.session.execution_mode, ExecutionMode::Full);
+        assert!(
+            restarted
+                .snapshot()
+                .unwrap()
+                .timeline
+                .iter()
+                .any(|entry| matches!(
+                    entry,
+                    TimelineEntry::SessionEvent { event, .. } if event.name == "Architecture review"
+                ))
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_inline_model_effort_and_mode_values_outside_backend_capabilities() {
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = HarnessBroker::initialize_with_clock(
+            InitializeRequest {
+                data_root: data.path().to_string_lossy().into_owned(),
+                permission_file: None,
+                workspace: repository.path().to_string_lossy().into_owned(),
+                client_id: "inline-config-client".into(),
+                backend: BackendLaunch {
+                    kind: "mock".into(),
+                    command: vec!["mock".into()],
+                },
+                model: "mock-model".into(),
+                effort: "medium".into(),
+                session_id: None,
+                goal_max_turns: 20,
+                lease_conflict_action: None,
+            },
+            Box::new(FixedClock(100)),
+        )
+        .unwrap();
+
+        let invalid_model = broker
+            .dispatch(BrokerRequest {
+                id: 1,
+                method: "session.configure".into(),
+                params: json!({ "model": "sol", "validate": true }),
+            })
+            .await;
+        assert!(invalid_model.response.error.is_some());
+        assert_eq!(broker.session.model, "mock-model");
+
+        let invalid_effort = broker
+            .dispatch(BrokerRequest {
+                id: 2,
+                method: "session.configure".into(),
+                params: json!({ "effort": "xhigh", "validate": true }),
+            })
+            .await;
+        assert!(invalid_effort.response.error.is_some());
+        assert_eq!(broker.session.effort, "medium");
+
+        let invalid_mode = broker
+            .dispatch(BrokerRequest {
+                id: 3,
+                method: "session.execution_mode".into(),
+                params: json!({ "mode": "invalid" }),
+            })
+            .await;
+        assert!(invalid_mode.response.error.is_some());
+        assert_eq!(broker.session.execution_mode, ExecutionMode::Read);
     }
 
     #[tokio::test]

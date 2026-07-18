@@ -208,6 +208,14 @@ function M.apply(state, render, options)
   end
   vim.bo[buf].modifiable = false
 
+  local applied_line_list = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  if not same_lines(applied_line_list, render.lines) then
+    vim.bo[buf].modifiable = true
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, render.lines)
+    vim.bo[buf].modifiable = false
+    operation_list = { { first0 = 0, old_after0 = #applied_line_list, replacement = render.lines } }
+  end
+
   for _, highlight in ipairs(render.highlights or {}) do
     local first = highlight.first or 0
     local last = highlight.last or -1

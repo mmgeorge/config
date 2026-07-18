@@ -98,7 +98,11 @@ local function dispatch_message(message)
       tostring(message.error.message or message.error.code or "Harness request failed"),
       message.error
     )
-    if pending.method ~= "initialize" and pending.method ~= "state.get" then
+    if pending.method ~= "initialize"
+      and pending.method ~= "state.get"
+      and pending.method ~= "session.configure"
+      and pending.method ~= "session.execution_mode"
+    then
       for _, subscriber in pairs(client.subscriber) do
         local ok, err = pcall(subscriber, "state_invalidated", { method = pending.method })
         if not ok then notifications.error("Harness event subscriber failed: " .. tostring(err), "Harness") end

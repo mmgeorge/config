@@ -458,6 +458,13 @@ impl Backend for CodexBackend {
         self.steering.interrupt_target(target).await
     }
 
+    async fn active_session_id(&self) -> Option<String> {
+        match &*self.active_turn.lock().await {
+            CodexTurnState::Submitted { thread_id, .. } => Some(thread_id.clone()),
+            CodexTurnState::Idle | CodexTurnState::Pending | CodexTurnState::Completed => None,
+        }
+    }
+
     async fn compact(&self, request: BackendRequest) -> Result<BackendOutput> {
         let thread_id = request
             .backend_session_id

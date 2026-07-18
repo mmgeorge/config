@@ -233,6 +233,128 @@ fn cancels_a_running_turn_through_the_out_of_band_request_lane() {
 }
 
 #[test]
+fn restarts_a_running_turn_in_write_mode_without_creating_another_interaction() {
+    let repository = tempfile::tempdir().unwrap();
+    git(repository.path(), &["init", "-q"]);
+    git(
+        repository.path(),
+        &["config", "user.email", "harness@example.invalid"],
+    );
+    git(
+        repository.path(),
+        &["config", "user.name", "Harness Integration"],
+    );
+    std::fs::write(repository.path().join("README.md"), "# Harness\n").unwrap();
+    git(repository.path(), &["add", "."]);
+    git(repository.path(), &["commit", "-qm", "seed"]);
+    let data = tempfile::tempdir().unwrap();
+    let mut broker = BrokerProcess::start();
+    broker.request(json!({
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "data_root": data.path(),
+            "workspace": repository.path(),
+            "client_id": "restart-test",
+            "backend": { "kind": "mock", "command": ["steering"] },
+            "model": "mock-model",
+            "effort": "low",
+            "goal_max_turns": 20
+        }
+    }));
+    assert!(
+        broker
+            .read_response(1)
+            .last()
+            .unwrap()
+            .get("error")
+            .is_none()
+    );
+
+    broker.request(json!({
+        "id": 2,
+        "method": "prompt.submit",
+        "params": { "text": "create the requested file" }
+    }));
+    let started = broker.read_message();
+    assert_eq!(
+        started.pointer("/payload/kind").and_then(Value::as_str),
+        Some("timeline_interaction_started")
+    );
+
+    broker.request(json!({
+        "id": 3,
+        "method": "turn.restart",
+        "params": { "mode": "write" }
+    }));
+    let restart = broker.read_response(3);
+    assert_eq!(
+        restart
+            .last()
+            .unwrap()
+            .pointer("/result/restart_requested")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    let cancelled = broker.read_response(2);
+    assert_eq!(
+        cancelled
+            .last()
+            .unwrap()
+            .pointer("/error/code")
+            .and_then(Value::as_str),
+        Some("turn_cancelled")
+    );
+
+    broker.request(json!({
+        "id": 4,
+        "method": "session.execution_mode",
+        "params": { "mode": "write" }
+    }));
+    assert!(
+        broker
+            .read_response(4)
+            .last()
+            .unwrap()
+            .get("error")
+            .is_none()
+    );
+    broker.request(json!({
+        "id": 5,
+        "method": "interaction.resume",
+        "params": { "text": "continue in write mode" }
+    }));
+    assert!(
+        broker
+            .read_response(5)
+            .last()
+            .unwrap()
+            .get("error")
+            .is_none()
+    );
+
+    broker.request(json!({ "id": 6, "method": "state.get", "params": {} }));
+    let snapshot = broker.read_response(6);
+    let interaction = snapshot
+        .last()
+        .unwrap()
+        .pointer("/result/interaction")
+        .and_then(Value::as_array)
+        .unwrap();
+    assert_eq!(interaction.len(), 1);
+    assert_eq!(interaction[0]["state"], "complete");
+    assert_eq!(interaction[0]["node_list"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        snapshot
+            .last()
+            .unwrap()
+            .pointer("/result/session/execution_mode")
+            .and_then(Value::as_str),
+        Some("write")
+    );
+}
+
+#[test]
 fn retracts_an_output_free_planning_turn_and_restores_control_state() {
     let repository = tempfile::tempdir().unwrap();
     git(repository.path(), &["init", "-q"]);

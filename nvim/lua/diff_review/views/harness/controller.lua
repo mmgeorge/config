@@ -31,9 +31,35 @@ local render_observer_for_test = nil
 local render_pending = false
 local begin_request
 local submit_immediate
+local effort_list = { "minimal", "low", "medium", "high", "xhigh" }
 
 ---@return table
 local function harness_state() return session.harness end
+
+---@param message string
+---@param severity? "status"|"error"
+local function append_session_status(message, severity)
+  local state = harness_state()
+  local previous_entry = state.timeline[#state.timeline]
+  local entry = {
+    kind = "session_event",
+    id = "local-session-event-" .. tostring(vim.uv.hrtime()),
+    created_at_ms = os.time() * 1000,
+    event = { message = message, severity = severity or "status" },
+    local_session_id = state.session and state.session.id,
+    local_after_id = previous_entry and previous_entry.id,
+  }
+  state.local_session_event = state.local_session_event or {}
+  state.local_session_event[#state.local_session_event + 1] = entry
+  state.timeline[#state.timeline + 1] = entry
+  M.render()
+end
+
+---@param message string
+local function report_configuration_error(message)
+  append_session_status("Configuration rejected: " .. message, "error")
+  notifications.error(message, "Harness")
+end
 
 local function picker_host(state)
   local window_list = {}
@@ -179,6 +205,7 @@ local function status_text()
   if state.pending_config and state.pending_config.model then model = state.pending_config.model .. "*" end
   if state.pending_config and state.pending_config.effort then effort = state.pending_config.effort .. "*" end
   local busy = state.cancel_requested and " • cancelling"
+    or state.mode_restart_requested and " • restarting"
     or state.busy and " • running"
     or (#state.queue > 0 and (" • queued " .. #state.queue) or "")
   local goal = nil
@@ -375,7 +402,24 @@ local function synchronize_state(callback)
       return
     end
     local state = harness_state()
+    local next_session_id = result.session and result.session.id
+    local local_session_event = vim.tbl_filter(function(entry)
+      return entry.local_session_id == next_session_id
+    end, state.local_session_event or {})
     snapshot.apply(state, result)
+    state.local_session_event = local_session_event
+    for _, entry in ipairs(local_session_event) do
+      local insertion_index = #state.timeline + 1
+      if entry.local_after_id then
+        for index, candidate in ipairs(state.timeline) do
+          if candidate.id == entry.local_after_id then
+            insertion_index = index + 1
+            break
+          end
+        end
+      end
+      table.insert(state.timeline, insertion_index, vim.deepcopy(entry))
+    end
     require("diff_review.views.harness.agent_picker").refresh()
     reconcile_approval_presentation(state)
     local elicitation = state.active_elicitation and state.active_elicitation.elicitation
@@ -390,6 +434,18 @@ local function synchronize_state(callback)
     M.render()
     if callback then callback(result) end
   end)
+end
+
+---@param state table
+---@param entry table
+local function upsert_timeline_entry(state, entry)
+  for index, previous in ipairs(state.timeline or {}) do
+    if previous.id == entry.id then
+      state.timeline[index] = entry
+      return
+    end
+  end
+  state.timeline[#state.timeline + 1] = entry
 end
 
 ---@param event string
@@ -454,16 +510,11 @@ local function on_event(event, payload)
       schedule_render()
     elseif payload.kind == "timeline_plan_lifecycle" then
       local entry = vim.deepcopy(payload.data or payload)
-      local replaced = false
-      for index, previous in ipairs(state.timeline or {}) do
-        if previous.id == entry.id then
-          state.timeline[index] = entry
-          replaced = true
-          break
-        end
-      end
-      if not replaced then state.timeline[#state.timeline + 1] = entry end
+      upsert_timeline_entry(state, entry)
       schedule_render()
+    elseif payload.kind == "timeline_session_event" then
+      upsert_timeline_entry(state, vim.deepcopy(payload.data or payload))
+      M.render()
     elseif payload.kind == "error" and type(payload.text) == "string" then
       notifications.warn(payload.text, "Harness")
     end
@@ -529,6 +580,7 @@ local function on_event(event, payload)
       prompt_history.reset_navigation()
     end
     state.session = next_session
+    if event == "execution_mode_changed" and not state.mode_restart_requested then state.pending_mode = nil end
     M.refresh_winbar()
   elseif event == "interaction_rolled_back" then
     synchronize_state()
@@ -664,6 +716,45 @@ function M.reopen_question()
   M.present_plan_question(true)
 end
 
+---@param mode string
+local function resume_mode_restart(mode)
+  local state = harness_state()
+  local label = mode == "yolo" and "YOLO" or (mode:sub(1, 1):upper() .. mode:sub(2))
+  set_busy(true)
+  client.request("session.execution_mode", { mode = mode }, function(session_result, mode_error)
+    if mode_error then
+      state.mode_restart_requested = false
+      state.pending_mode = nil
+      set_busy(false)
+      report_configuration_error("Could not change execution mode after interruption: " .. mode_error)
+      synchronize_state()
+      return
+    end
+    state.session = session_result or state.session
+    append_session_status("Execution mode changed to " .. label)
+    client.request("interaction.resume", {
+      text = "Continue the active task from the interrupted turn. Execution mode is now " .. label
+        .. ". Preserve completed work and do not repeat finished actions.",
+    }, function(result, resume_error)
+      state.mode_restart_requested = false
+      state.pending_mode = nil
+      set_busy(false)
+      if resume_error then
+        notifications.error("Harness could not resume after changing to " .. label .. ": " .. resume_error, "Harness")
+        synchronize_state()
+        return
+      end
+      if result then
+        state.session = result.session or (result.id and result) or state.session
+        state.capability = result.capability or state.capability
+        if result.interaction then interaction_state.complete_interaction(state, result.interaction) end
+      end
+      synchronize_state()
+      vim.schedule(M.drain)
+    end)
+  end)
+end
+
 ---@param text string
 begin_request = function(text)
   local state = harness_state()
@@ -689,6 +780,10 @@ begin_request = function(text)
         return
       end
       if error_detail and error_detail.code == "turn_cancelled" then
+        if state.mode_restart_requested and state.pending_mode then
+          resume_mode_restart(state.pending_mode)
+          return
+        end
         synchronize_state()
         vim.schedule(M.drain)
         return
@@ -714,6 +809,8 @@ function M.cancel_turn()
     return
   end
   if state.cancel_requested then return end
+  state.mode_restart_requested = false
+  state.pending_mode = nil
   state.cancel_requested = true
   M.refresh_winbar()
   local restore_prompt = state.capability.native_turn_rollback == true
@@ -768,6 +865,12 @@ function M.drain()
   local state = harness_state()
   if state.busy then return end
   if #(state.pending_steer or {}) > 0 then return end
+  if state.pending_backend then
+    local pending_backend = state.pending_backend
+    state.pending_backend = nil
+    require("diff_review.views.harness").switch_backend(pending_backend)
+    return
+  end
   if state.pending_mode then
     local pending_mode = state.pending_mode
     state.pending_mode = nil
@@ -776,8 +879,10 @@ function M.drain()
   end
   if state.pending_config then
     local pending_config = state.pending_config
+    local validate_selection = state.pending_config_validate == true
     state.pending_config = nil
-    M.configure(pending_config)
+    state.pending_config_validate = false
+    M.configure(pending_config, validate_selection)
     return
   end
   if state.active_elicitation and state.active_elicitation.elicitation then
@@ -1036,6 +1141,22 @@ function M.submit()
     M.set_mode(text:sub(2))
     return
   end
+  if text == "/mode" then
+    set_composer_text(state.composer_buf, "")
+    M.select_mode()
+    return
+  end
+  local execution_mode = text:match("^/mode%s+(%S+)$")
+  if execution_mode then
+    set_composer_text(state.composer_buf, "")
+    execution_mode = execution_mode:lower()
+    if not vim.tbl_contains({ "read", "write", "full", "yolo" }, execution_mode) then
+      report_configuration_error("Unknown execution mode: " .. execution_mode)
+      return
+    end
+    M.set_mode(execution_mode)
+    return
+  end
   if text == "/effort" then
     set_composer_text(state.composer_buf, "")
     M.select_effort()
@@ -1127,14 +1248,23 @@ function M.submit()
     M.rename_session(vim.trim(session_name))
     return
   end
-  local model = text:match("^/model%s+(.+)$")
+  local model, model_effort = text:match("^/model%s+(%S+)%s+(%S+)$")
+  if not model then model = text:match("^/model%s+(%S+)$") end
   if model then
     set_composer_text(state.composer_buf, "")
     if state.capability.model_selection ~= true then
       notifications.warn("The current backend does not support model selection", "Harness")
       return
     end
-    M.configure({ model = vim.trim(model) })
+    if model_effort and state.capability.effort_selection ~= true then
+      notifications.warn("The current backend does not support reasoning effort selection", "Harness")
+      return
+    end
+    if model_effort and not vim.tbl_contains(effort_list, model_effort) then
+      report_configuration_error("Unknown reasoning effort: " .. model_effort)
+      return
+    end
+    M.configure({ model = model, effort = model_effort }, true)
     return
   end
   local effort = text:match("^/effort%s+(%S+)$")
@@ -1144,11 +1274,11 @@ function M.submit()
       notifications.warn("The current backend does not support reasoning effort selection", "Harness")
       return
     end
-    if not vim.tbl_contains({ "minimal", "low", "medium", "high", "xhigh" }, effort) then
-      notifications.warn("Unknown reasoning effort: " .. effort, "Harness")
+    if not vim.tbl_contains(effort_list, effort) then
+      report_configuration_error("Unknown reasoning effort: " .. effort)
       return
     end
-    M.configure({ effort = effort })
+    M.configure({ effort = effort }, true)
     return
   end
   if text == "/fast" then
@@ -1294,7 +1424,6 @@ end
 ---@param direction integer
 function M.change_effort(direction)
   local state = harness_state()
-  local effort_list = { "minimal", "low", "medium", "high", "xhigh" }
   local current = state.session and state.session.effort or config.options.harness.effort
   local index = 3
   for candidate_index, candidate in ipairs(effort_list) do if candidate == current then index = candidate_index end end
@@ -1307,7 +1436,6 @@ function M.select_effort()
     notifications.warn("The current backend does not support reasoning effort selection", "Harness")
     return
   end
-  local effort_list = { "minimal", "low", "medium", "high", "xhigh" }
   local detail_list = {
     minimal = "Fastest reasoning for straightforward work.",
     low = "Light reasoning for routine changes.",
@@ -1348,12 +1476,12 @@ function M.select_fast_mode()
 end
 
 function M.select_model()
-  if harness_state().capability.model_selection ~= true then
+  local state = harness_state()
+  if state.capability.model_selection ~= true then
     notifications.warn("The current backend does not support model selection", "Harness")
     return
   end
-  client.request("backend.models", {}, function(model_list, request_error)
-    if request_error then notifications.error(request_error, "Harness model") return end
+  local function open_model_picker(model_list)
     if type(model_list) ~= "table" or #model_list == 0 then
       local current = harness_state().session and harness_state().session.model or config.options.harness.model
       picker.open({
@@ -1381,6 +1509,17 @@ function M.select_model()
       current_model = state.session and (state.session.resolved_model or state.session.model),
       on_confirm = M.configure,
     })
+  end
+  local backend = state.session and state.session.backend
+  if state.model_backend == backend and type(state.model_list) == "table" then
+    open_model_picker(state.model_list)
+    return
+  end
+  client.request("backend.models", {}, function(model_list, request_error)
+    if request_error then notifications.error(request_error, "Harness model") return end
+    state.model_backend = backend
+    state.model_list = vim.deepcopy(model_list or {})
+    open_model_picker(state.model_list)
   end)
 end
 
@@ -1403,7 +1542,9 @@ function M.select_backend()
     function(backend)
       if backend == current then return end
       if state.busy then
-        notifications.warn("Cancel or finish the active turn before switching backends", "Harness backend")
+        state.pending_backend = backend
+        M.refresh_winbar()
+        notifications.info("Harness backend will switch after the active turn", "Harness backend")
         return
       end
       require("diff_review.views.harness").switch_backend(backend)
@@ -1411,8 +1552,13 @@ function M.select_backend()
 end
 
 function M.resolve_runtime_model()
-  client.request("backend.models", {}, function(_, request_error)
+  local state = harness_state()
+  local backend = state.session and state.session.backend
+  client.request("backend.models", {}, function(model_list, request_error)
     if request_error then notifications.error("Failed to resolve Harness model: " .. request_error, "Harness") end
+    if request_error then return end
+    state.model_backend = backend
+    state.model_list = vim.deepcopy(model_list or {})
   end)
 end
 
@@ -1422,18 +1568,40 @@ function M.set_mode(mode)
   mode = mode:lower()
   local function apply_mode()
     if state.busy then
+      if state.mode_restart_requested then
+        notifications.info("Harness is already restarting in the requested execution mode", "Harness")
+        return
+      end
+      if selected_agent_run(state) then
+        state.pending_mode = mode
+        M.refresh_winbar()
+        notifications.info("Harness execution mode will change after the active child turn", "Harness")
+        return
+      end
       state.pending_mode = mode
+      state.mode_restart_requested = true
       M.refresh_winbar()
-      notifications.info("Harness execution mode will change after the active request", "Harness")
+      client.request("turn.restart", { mode = mode }, function(result, request_error)
+        if request_error or not (result and result.restart_requested) then
+          state.mode_restart_requested = false
+          state.pending_mode = nil
+          report_configuration_error(
+            "Failed to restart Harness in " .. mode .. " mode: " .. (request_error or "request rejected")
+          )
+          M.refresh_winbar()
+        end
+      end)
       return
     end
     client.request("session.execution_mode", { mode = mode }, function(result, request_error)
       if request_error then
-        notifications.error("Failed to change Harness execution mode: " .. request_error, "Harness")
+        report_configuration_error("Failed to change execution mode: " .. request_error)
         M.refresh_winbar()
         return
       end
       state.session = result or state.session
+      local label = mode == "yolo" and "YOLO" or (mode:sub(1, 1):upper() .. mode:sub(2))
+      append_session_status("Execution mode changed to " .. label)
       M.refresh_winbar()
       vim.schedule(M.drain)
     end)
@@ -1465,18 +1633,41 @@ function M.toggle_mode()
   M.set_mode(mode_list[(current_index % #mode_list) + 1])
 end
 
+function M.select_mode()
+  local state = harness_state()
+  local current_mode = state.pending_mode or (state.session and state.session.execution_mode) or "read"
+  local detail_list = {
+    read = "Allow reads and network access while denying local writes.",
+    write = "Allow workspace writes within the current repository.",
+    full = "Allow machine-wide writes with approval prompts.",
+    yolo = "Allow machine-wide writes without approval prompts.",
+  }
+  local option_list = vim.tbl_map(function(mode)
+    local label = mode == "yolo" and "YOLO" or (mode:sub(1, 1):upper() .. mode:sub(2))
+    if mode == current_mode then label = label .. " (current)" end
+    return { label = label, detail = detail_list[mode], value = mode }
+  end, { "read", "write", "full", "yolo" })
+  open_choice_picker(state, "Select execution mode", "Changing mode during a main turn restarts it automatically.", option_list,
+    M.set_mode)
+end
+
 ---@param next_config table
-function M.configure(next_config)
+---@param validate_selection? boolean
+function M.configure(next_config, validate_selection)
   local state = harness_state()
   if state.busy then
     state.pending_config = vim.tbl_extend("force", state.pending_config or {}, next_config)
+    state.pending_config_validate = state.pending_config_validate == true or validate_selection == true
     M.refresh_winbar()
     notifications.info("Harness configuration will apply at the next safe boundary", "Harness")
     return
   end
-  client.request("session.configure", next_config, function(result, request_error)
-    if request_error then notifications.error(request_error, "Harness") return end
+  local request_config = vim.tbl_extend("force", {}, next_config, { validate = validate_selection == true })
+  client.request("session.configure", request_config, function(result, request_error)
+    if request_error then report_configuration_error(request_error) return end
     state.session = result
+    if next_config.model then append_session_status("Model changed to " .. next_config.model) end
+    if next_config.effort then append_session_status("Reasoning effort changed to " .. next_config.effort) end
     M.refresh_winbar()
     if next_config.model and not result.resolved_model then M.resolve_runtime_model() end
     vim.schedule(M.drain)

@@ -68,6 +68,8 @@ M.empty_diff_rows = {}
 ---@field cancel_requested boolean
 ---@field session table?
 ---@field capability table
+---@field model_list table[]?
+---@field model_backend string?
 ---@field interaction table[]
 ---@field interaction_by_id table<string, table>
 ---@field pending_interaction table?
@@ -93,13 +95,17 @@ M.empty_diff_rows = {}
 ---@field approval_open boolean
 ---@field artifact table[]
 ---@field timeline table[]
+---@field local_session_event table[]?
 ---@field plan_annotations table[]
 ---@field no_checkpoint boolean
 ---@field plan_review table?
 ---@field command_set DiffReviewViewCommandSet?
 ---@field goal table?
 ---@field pending_config table?
+---@field pending_config_validate boolean?
+---@field pending_backend string?
 ---@field pending_mode string?
+---@field mode_restart_requested boolean?
 ---@field plan_question_open boolean?
 ---@field presented_question_key string?
 ---@field timeline_status_timer uv.uv_timer_t?
@@ -119,6 +125,7 @@ M.harness = {
   ready = false,
   busy = false,
   cancel_requested = false,
+  mode_restart_requested = false,
   session = nil,
   capability = {},
   interaction = {},

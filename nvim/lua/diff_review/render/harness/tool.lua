@@ -60,10 +60,10 @@ local function tool_verb(tool)
 end
 
 ---@param title string
----@return string, string
+---@return string, string?
 local function mcp_title_parts(title)
-  local name, arguments = title:match("^(.-)(%b())$")
-  return name or title, arguments or ""
+  local name, arguments = title:match("^(.-)%((.*)%)$")
+  return name or title, arguments
 end
 
 ---@param tool table
@@ -194,7 +194,7 @@ end
 ---@param tool table
 ---@param heading_line_list table[]
 function M.highlight_tool_call_lines(result, tool, heading_line_list)
-  local name = mcp_title_parts(tool.title or "tool")
+  local name, arguments = mcp_title_parts(tool.title or "tool")
   local title_offset = 0
   for _, heading_line in ipairs(heading_line_list) do
     local text = heading_line.text or ""
@@ -213,12 +213,14 @@ function M.highlight_tool_call_lines(result, tool, heading_line_list)
           group = "DiffReviewHarnessMcpName",
         }
       end
-      if fragment_end > name_end then
-        local argument_start = math.max(title_offset + 1, name_end + 1)
+      local argument_end = name_end + #(arguments or "") + 1
+      if arguments and fragment_end > name_end + 1 and title_offset < argument_end then
+        local argument_start = math.max(title_offset + 1, name_end + 2)
+        local highlighted_end = math.min(fragment_end, argument_end)
         result.highlights[#result.highlights + 1] = {
           line = heading_line.line,
           first = fragment_start + argument_start - title_offset - 2,
-          last = fragment_start + fragment_length - 1,
+          last = fragment_start + highlighted_end - title_offset - 1,
           group = "DiffReviewHarnessMcpArguments",
         }
       end
@@ -244,12 +246,17 @@ function M.foldtext_chunks(tool, indent, visible_text)
       }
     end
     local name, arguments = mcp_title_parts(tool.title or "tool")
-    return {
+    local chunk_list = {
       { (indent or "") .. "•", bullet_group },
       { " " .. verb .. " ", "Normal" },
       { name, "DiffReviewHarnessMcpName" },
-      { arguments, "DiffReviewHarnessMcpArguments" },
     }
+    if arguments ~= nil then
+      chunk_list[#chunk_list + 1] = { "(", "Normal" }
+      chunk_list[#chunk_list + 1] = { arguments, "DiffReviewHarnessMcpArguments" }
+      chunk_list[#chunk_list + 1] = { ")", "Normal" }
+    end
+    return chunk_list
   end
 
   if visible_text and not visible_text:find("• Ran ", 1, true) then

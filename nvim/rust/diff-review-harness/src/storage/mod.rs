@@ -4,6 +4,7 @@ use crate::goal::GoalRecord;
 use crate::interaction::{InteractionComment, InteractionRecord};
 use crate::plan::{PlanExecutionRecord, PlanLifecycleRecord, PlanRecord};
 use crate::session::{HarnessPreference, HarnessSession, SessionStore};
+use crate::timeline::SessionEventRecord;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::de::DeserializeOwned;
@@ -127,6 +128,12 @@ impl SqliteStore {
             );
             CREATE UNIQUE INDEX IF NOT EXISTS agent_turn_run_ordinal
                 ON agent_turn_record(agent_run_id, ordinal);
+            CREATE TABLE IF NOT EXISTS session_event_record (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES session_record(id) ON DELETE CASCADE
+            );
             "#,
         )?;
         Ok(Self {
@@ -372,6 +379,19 @@ impl SqliteStore {
     pub fn list_plan_lifecycle(&self, session_id: &str) -> Result<Vec<PlanLifecycleRecord>> {
         self.list_payload(
             "SELECT payload FROM plan_lifecycle_record WHERE session_id=?1 ORDER BY rowid",
+            [session_id],
+        )
+    }
+
+    /// Write one immutable session-level timeline event.
+    pub fn save_session_event(&mut self, event: &SessionEventRecord) -> Result<()> {
+        self.save_scoped_payload("session_event_record", &event.id, &event.session_id, event)
+    }
+
+    /// Load session-level timeline events in their insertion order.
+    pub fn list_session_event(&self, session_id: &str) -> Result<Vec<SessionEventRecord>> {
+        self.list_payload(
+            "SELECT payload FROM session_event_record WHERE session_id=?1 ORDER BY rowid",
             [session_id],
         )
     }

@@ -350,6 +350,11 @@ pub trait Backend: Send + Sync {
         Ok(())
     }
 
+    /// Return the provider conversation that can continue after an interrupted turn.
+    async fn active_session_id(&self) -> Option<String> {
+        None
+    }
+
     /// Roll back a cancelled turn after the broker proves it produced no visible output or changes.
     async fn rollback_cancelled_turn(&self) -> Result<bool> {
         Ok(false)
