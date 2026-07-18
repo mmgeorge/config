@@ -234,7 +234,7 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
         .await
         .unwrap();
     let forked = backend.fork(execute).await.unwrap();
-    assert!(!forked.trim().is_empty());
+    assert!(!forked.backend_session_id.trim().is_empty());
 }
 
 #[tokio::test]

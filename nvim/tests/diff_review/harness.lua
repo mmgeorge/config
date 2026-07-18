@@ -770,10 +770,22 @@ local function fake_launcher(command, options, _)
         agent = { definition = {}, run = {}, turn = {} },
         artifact = {},
         prompt_history = prompt_history,
+        fork_performance = {
+          total_ms = 150,
+          timing = {
+            { phase = "codex.process_start", duration_ms = 10 },
+            { phase = "codex.initialize", duration_ms = 20 },
+            { phase = "codex.thread_fork", duration_ms = 110 },
+            { phase = "broker.persist_activate", duration_ms = 5 },
+            { phase = "broker.snapshot", duration_ms = 5 },
+          },
+        },
       }
       session_snapshot_by_id[active_session.id] = vim.deepcopy(fork_snapshot)
-      emit(options, { event = "session_changed", payload = { session = active_session } })
-      emit(options, { id = request.id, result = fork_snapshot })
+      vim.defer_fn(function()
+        emit(options, { event = "session_changed", payload = { session = active_session } })
+        emit(options, { id = request.id, result = fork_snapshot })
+      end, 150)
     elseif request.method == "goal.continue" then
       goal_continue_count = goal_continue_count + 1
       if goal_continue_count == 2 then
@@ -822,6 +834,7 @@ local ok, failure = pcall(function()
   assert_equals(default_config.harness.backend, "codex",
     "an empty setup should retain the complete default configuration")
   diff_review.setup({
+    perf_logging = false,
     harness = { backend = "mock" },
     keymaps = { status = { open = { "x" } } },
   })
@@ -3212,16 +3225,33 @@ local ok, failure = pcall(function()
   local parent_transcript_buf = session.harness.transcript_buf
   session.harness.capability.native_fork = true
   active_session.native_fork = true
+  active_session.context_usage = { used = 50000, size = 200000, remaining_percent = 75 }
+  session.harness.session.context_usage = vim.deepcopy(active_session.context_usage)
   vim.api.nvim_set_current_win(session.harness.composer_win)
   vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/fork investigation" })
   controller.submit()
+  local pending_transcript_buf = session.harness.transcript_buf
+  assert_true(pending_transcript_buf ~= parent_transcript_buf,
+    "/fork should open a pending child timeline before the provider responds")
+  assert_equals(session.harness.session.id, parent_session_id,
+    "pending fork presentation should not invent a durable child session")
+  assert_true(line_number(
+    vim.api.nvim_buf_get_lines(pending_transcript_buf, 0, -1, false),
+    "  Forking investigation from " .. parent_session_id .. " (Architecture review)..."
+  ) ~= nil, "/fork should provide immediate visible progress")
   assert_true(vim.wait(2000, function()
     return request_by_method["session.fork"] ~= nil and session.harness.session.id == "session-fork"
   end, 10), "/fork should activate the provider-native child session")
   assert_equals(request_by_method["session.fork"].params.name, "investigation",
     "/fork should preserve the explicit child name")
   assert_equals(session.harness.session.name, "investigation", "/fork should expose the child name")
+  assert_equals(session.harness.session.context_usage.remaining_percent, 75,
+    "/fork should inherit the source context usage")
+  assert_true(vim.wo[session.harness.transcript_win].winbar:find("75%% context left (200K)", 1, true) ~= nil,
+    "/fork should immediately render inherited context usage in the winbar")
   local child_transcript_buf = session.harness.transcript_buf
+  assert_equals(child_transcript_buf, pending_transcript_buf,
+    "/fork should promote the pending timeline instead of opening another buffer")
   assert_true(child_transcript_buf ~= parent_transcript_buf,
     "/fork should open a distinct child timeline buffer")
   assert_equals(#session.harness.interaction, 0, "fork timelines should not clone local interactions")

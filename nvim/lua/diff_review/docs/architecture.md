@@ -1139,6 +1139,15 @@ executions, goals, or agent runs because the backend-owned conversation already 
 model context. Its local timeline begins with one durable typed `Forked` event containing the source
 session ID and display name. Explicit `/fork <name>` uses that child name. Bare `/fork` derives
 `<source-name> (fork)`, or `(fork)` when the source remains unnamed, without enforcing uniqueness.
+Codex forks request `excludeTurns` because Harness does not render provider-returned history. The broker
+copies the source session's last durable `ContextUsage` into the child before returning its snapshot, so
+the winbar immediately shows inherited context pressure while the provider retains the full model history.
+Neovim opens a provisional child timeline before issuing `session.fork` and renders `Forking from ...`
+without inventing a durable session identity. A successful response promotes that same buffer to the
+provider-backed child. A failure remains visible in the provisional timeline instead of restoring silence.
+Fork responses carry transient performance diagnostics for provider process startup, initialization,
+native fork work, broker persistence, and snapshot projection. Neovim records those phases alongside
+client-observed completion latency in the existing `diff-review-perf.log` JSONL stream.
 Broker initialization selects the most recently updated session for the resolved repository
 and configured backend, then restores its interaction timeline, plan, goal, model controls,
 and provider session identity. Independent model, effort, and fast-mode preferences remain available

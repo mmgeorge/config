@@ -36,7 +36,7 @@ use std::sync::{
     Arc, RwLock,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 use uuid::Uuid;
 
@@ -3788,6 +3788,8 @@ impl HarnessBroker {
     }
 
     async fn fork_session(&mut self, params: Value) -> Result<(Value, Vec<BrokerEvent>)> {
+        let fork_started = Instant::now();
+        let mut timing = Vec::new();
         let source = match params.get("session_id").and_then(Value::as_str) {
             Some(session_id) => self
                 .store
@@ -3803,8 +3805,14 @@ impl HarnessBroker {
             source.backend == self.backend_launch.kind,
             "source session uses a different configured backend"
         );
+        let pause_started = Instant::now();
         self.pause_current_goal().await?;
-        let backend_session_id = self
+        timing.push(crate::backend::BackendTimingRecord {
+            phase: "broker.pause_goal".into(),
+            duration_ms: pause_started.elapsed().as_secs_f64() * 1000.0,
+        });
+        let backend_started = Instant::now();
+        let backend_fork = self
             .backend
             .fork(BackendRequest {
                 workspace: source.workspace.clone(),
@@ -3818,11 +3826,20 @@ impl HarnessBroker {
                 backend_session_id: source.backend_session_id.clone(),
             })
             .await?;
+        let backend_duration_ms = backend_started.elapsed().as_secs_f64() * 1000.0;
+        timing.extend(backend_fork.timing);
+        timing.push(crate::backend::BackendTimingRecord {
+            phase: "broker.backend_total".into(),
+            duration_ms: backend_duration_ms,
+        });
+        let backend_session_id = backend_fork.backend_session_id;
+        let persistence_started = Instant::now();
         let now_ms = self.clock.now_ms();
         let mut fork = source.clone();
         fork.id = Uuid::new_v4().to_string();
         fork.name = resolve_fork_name(&params, &source.name);
         fork.backend_session_id = Some(backend_session_id);
+        fork.context_usage.clone_from(&source.context_usage);
         fork.execution_mode = ExecutionMode::Read;
         fork.active_plan_id = None;
         fork.goal_id = None;
@@ -3846,8 +3863,22 @@ impl HarnessBroker {
         self.session = fork;
         self.agent_registry = load_agent_registry(&self.store, &self.session.id)?;
         self.agent_runtime_by_run.clear();
+        timing.push(crate::backend::BackendTimingRecord {
+            phase: "broker.persist_activate".into(),
+            duration_ms: persistence_started.elapsed().as_secs_f64() * 1000.0,
+        });
+        let snapshot_started = Instant::now();
+        let mut snapshot = serde_json::to_value(self.snapshot()?)?;
+        timing.push(crate::backend::BackendTimingRecord {
+            phase: "broker.snapshot".into(),
+            duration_ms: snapshot_started.elapsed().as_secs_f64() * 1000.0,
+        });
+        snapshot["fork_performance"] = json!({
+            "total_ms": fork_started.elapsed().as_secs_f64() * 1000.0,
+            "timing": timing,
+        });
         Ok((
-            serde_json::to_value(self.snapshot()?)?,
+            snapshot,
             vec![self.event("session_changed", serde_json::to_value(&self.session)?)?],
         ))
     }
@@ -4088,7 +4119,10 @@ mod test {
             anyhow::bail!("synthetic provider failure")
         }
 
-        async fn fork(&self, _request: BackendRequest) -> Result<String> {
+        async fn fork(
+            &self,
+            _request: BackendRequest,
+        ) -> Result<crate::backend::BackendForkResult> {
             anyhow::bail!("synthetic provider failure")
         }
     }
@@ -4151,7 +4185,10 @@ mod test {
             })
         }
 
-        async fn fork(&self, _request: BackendRequest) -> Result<String> {
+        async fn fork(
+            &self,
+            _request: BackendRequest,
+        ) -> Result<crate::backend::BackendForkResult> {
             anyhow::bail!("parent boundary backend does not fork")
         }
     }
@@ -4256,8 +4293,13 @@ mod test {
             Ok(output)
         }
 
-        async fn fork(&self, _request: BackendRequest) -> Result<String> {
-            Ok("mutable-question-fork".into())
+        async fn fork(
+            &self,
+            _request: BackendRequest,
+        ) -> Result<crate::backend::BackendForkResult> {
+            Ok(crate::backend::BackendForkResult::unprofiled(
+                "mutable-question-fork",
+            ))
         }
     }
 
@@ -4329,8 +4371,13 @@ mod test {
             })
         }
 
-        async fn fork(&self, _request: BackendRequest) -> Result<String> {
-            Ok("planning-question-fork".into())
+        async fn fork(
+            &self,
+            _request: BackendRequest,
+        ) -> Result<crate::backend::BackendForkResult> {
+            Ok(crate::backend::BackendForkResult::unprofiled(
+                "planning-question-fork",
+            ))
         }
     }
 
@@ -4472,8 +4519,13 @@ mod test {
             })
         }
 
-        async fn fork(&self, _request: BackendRequest) -> Result<String> {
-            Ok("nested-write-fork".into())
+        async fn fork(
+            &self,
+            _request: BackendRequest,
+        ) -> Result<crate::backend::BackendForkResult> {
+            Ok(crate::backend::BackendForkResult::unprofiled(
+                "nested-write-fork",
+            ))
         }
     }
 
@@ -4530,8 +4582,13 @@ mod test {
             })
         }
 
-        async fn fork(&self, _request: BackendRequest) -> Result<String> {
-            Ok("task-update-fork".into())
+        async fn fork(
+            &self,
+            _request: BackendRequest,
+        ) -> Result<crate::backend::BackendForkResult> {
+            Ok(crate::backend::BackendForkResult::unprofiled(
+                "task-update-fork",
+            ))
         }
     }
 
@@ -4962,6 +5019,8 @@ mod test {
             .await;
         assert!(prompt.response.error.is_none());
         assert!(source.session.native_fork);
+        source.session.context_usage = ContextUsage::reported(50, 200);
+        source.save_session().unwrap();
 
         let conflict = match HarnessBroker::initialize_with_clock(
             initialize("fork-client", None),
@@ -4993,6 +5052,31 @@ mod test {
         assert_ne!(snapshot["session"]["id"], source_session_id);
         assert_eq!(snapshot["session"]["name"], "fork investigation");
         assert_eq!(snapshot["session"]["execution_mode"], "read");
+        assert_eq!(snapshot["session"]["context_usage"]["used"], 50);
+        assert_eq!(snapshot["session"]["context_usage"]["size"], 200);
+        assert_eq!(
+            snapshot["session"]["context_usage"]["remaining_percent"],
+            75
+        );
+        assert!(snapshot["fork_performance"]["total_ms"].as_f64().is_some());
+        let timing = snapshot["fork_performance"]["timing"]
+            .as_array()
+            .expect("fork timing list");
+        assert!(
+            timing
+                .iter()
+                .any(|entry| entry["phase"] == "broker.backend_total")
+        );
+        assert!(
+            timing
+                .iter()
+                .any(|entry| entry["phase"] == "broker.persist_activate")
+        );
+        assert!(
+            timing
+                .iter()
+                .any(|entry| entry["phase"] == "broker.snapshot")
+        );
         assert_eq!(snapshot["interaction"].as_array().map(Vec::len), Some(0));
         assert_eq!(snapshot["timeline"].as_array().map(Vec::len), Some(1));
         assert_eq!(snapshot["timeline"][0]["kind"], "session_event");

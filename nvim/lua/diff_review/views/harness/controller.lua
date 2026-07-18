@@ -5,6 +5,7 @@ local command_set = require("diff_review.shared.view_command_set")
 local config = require("diff_review.infra.config")
 local keymaps = require("diff_review.shared.keymaps")
 local notifications = require("diff_review.infra.notifications")
+local perf = require("diff_review.infra.perf")
 local renderer = require("diff_review.render.harness.interaction_tree")
 local markdown = require("diff_review.render.harness.markdown")
 local queue_renderer = require("diff_review.render.harness.queue")
@@ -288,6 +289,10 @@ function M.render(reset)
   local state = harness_state()
   local buf = state.transcript_buf
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  if session_navigation.render_pending(buf) then
+    M.refresh_winbar()
+    return
+  end
   local transcript_win = state.transcript_win
   local transcript_visible = transcript_win and vim.api.nvim_win_is_valid(transcript_win)
   local follow_tail = false
@@ -949,12 +954,37 @@ function M.fork_session(name)
   end
   local params = { session_id = active_session.id }
   if name and name ~= "" then params.name = name end
+  local fork_started = perf.now()
+  local pending = session_navigation.begin_fork(active_session, name)
+  perf.event("harness.fork.ui_opened", {
+    ms = perf.elapsed_ms(fork_started),
+    source_session_id = active_session.id,
+  })
   client.request("session.fork", params, function(result, request_error)
     if request_error then
-      notifications.error(request_error, "Harness fork")
+      perf.event("harness.fork.failed", {
+        ms = perf.elapsed_ms(fork_started),
+        source_session_id = active_session.id,
+        error = tostring(request_error),
+      })
+      session_navigation.fail_fork(pending, request_error)
       return
     end
-    session_navigation.activate(result)
+    local performance = result and result.fork_performance or {}
+    perf.event("harness.fork.complete", {
+      ms = perf.elapsed_ms(fork_started),
+      broker_ms = performance.total_ms,
+      source_session_id = active_session.id,
+      child_session_id = result.session and result.session.id,
+    })
+    for _, timing in ipairs(performance.timing or {}) do
+      perf.event("harness.fork.phase", {
+        phase = timing.phase,
+        ms = timing.duration_ms,
+        source_session_id = active_session.id,
+      })
+    end
+    session_navigation.complete_fork(pending, result)
   end)
 end
 

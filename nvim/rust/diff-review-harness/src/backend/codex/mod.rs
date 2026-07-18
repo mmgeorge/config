@@ -1,8 +1,8 @@
 use crate::backend::approval::PermissionCoordinator;
 use crate::backend::steering::SteeringLane;
 use crate::backend::{
-    Backend, BackendCapability, BackendDescriptor, BackendEventSink, BackendKind, BackendModel,
-    BackendOutput, BackendRequest, PromptMode,
+    Backend, BackendCapability, BackendDescriptor, BackendEventSink, BackendForkResult,
+    BackendKind, BackendModel, BackendOutput, BackendRequest, BackendTimingRecord, PromptMode,
 };
 use crate::control_tools::ControlToolRegistry;
 use crate::session::ExecutionMode;
@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::Mutex;
 
 mod json_rpc;
@@ -19,6 +20,11 @@ mod turn_coordinator;
 
 use json_rpc::CodexJsonRpc;
 use security::CodexSecurity;
+
+struct CodexConnection {
+    process: CodexJsonRpc,
+    timing: Vec<BackendTimingRecord>,
+}
 
 /// Owns Codex app-server thread lifecycle, prompting, permission policy, and native fork.
 pub struct CodexBackend {
@@ -93,9 +99,10 @@ impl CodexBackend {
         request: &BackendRequest,
         output: &mut BackendOutput,
         event_sink: Option<BackendEventSink>,
-    ) -> Result<CodexJsonRpc> {
+    ) -> Result<CodexConnection> {
         let security = CodexSecurity::new(request.execution_mode);
         let command = security.launch_command(&self.command);
+        let process_started = Instant::now();
         let mut process = CodexJsonRpc::start(
             &command,
             &request.workspace,
@@ -104,12 +111,26 @@ impl CodexBackend {
             event_sink,
         )
         .await?;
+        let process_duration_ms = process_started.elapsed().as_secs_f64() * 1000.0;
+        let initialize_started = Instant::now();
         process.request("initialize", json!({
             "clientInfo": { "name": "diff-review-harness", "title": "DiffReview Harness", "version": env!("CARGO_PKG_VERSION") },
             "capabilities": { "experimentalApi": true }
         }), output).await?;
         process.notify("initialized", Value::Null).await?;
-        Ok(process)
+        Ok(CodexConnection {
+            process,
+            timing: vec![
+                BackendTimingRecord {
+                    phase: "codex.process_start".into(),
+                    duration_ms: process_duration_ms,
+                },
+                BackendTimingRecord {
+                    phase: "codex.initialize".into(),
+                    duration_ms: initialize_started.elapsed().as_secs_f64() * 1000.0,
+                },
+            ],
+        })
     }
 
     fn apply_security(params: &mut Value, request: &BackendRequest) {
@@ -296,7 +317,10 @@ impl Backend for CodexBackend {
             ..BackendOutput::default()
         };
         let coordinator_event_sink = event_sink.clone();
-        let mut process = self.connect(&request, &mut output, event_sink).await?;
+        let mut process = self
+            .connect(&request, &mut output, event_sink)
+            .await?
+            .process;
         let resolved_model = self
             .resolve_model(&request, &mut process, &mut output)
             .await?;
@@ -417,33 +441,46 @@ impl Backend for CodexBackend {
         Ok(output)
     }
 
-    async fn fork(&self, request: BackendRequest) -> Result<String> {
+    async fn fork(&self, request: BackendRequest) -> Result<BackendForkResult> {
         let source = request
             .backend_session_id
             .clone()
             .context("Codex thread has not started")?;
         let mut output = BackendOutput::default();
-        let mut process = self.connect(&request, &mut output, None).await?;
+        let CodexConnection {
+            mut process,
+            mut timing,
+        } = self.connect(&request, &mut output, None).await?;
+        let fork_started = Instant::now();
         let result = process
             .request(
                 "thread/fork",
                 Self::secure(
                     json!({
                         "threadId": source,
-                        "cwd": request.workspace
+                        "cwd": request.workspace,
+                        "excludeTurns": true
                     }),
                     &request,
                 ),
                 &mut output,
             )
             .await?;
-        result
+        timing.push(BackendTimingRecord {
+            phase: "codex.thread_fork".into(),
+            duration_ms: fork_started.elapsed().as_secs_f64() * 1000.0,
+        });
+        let backend_session_id = result
             .pointer("/thread/id")
             .or_else(|| result.get("threadId"))
             .or_else(|| result.get("thread_id"))
             .and_then(Value::as_str)
             .map(str::to_owned)
-            .context("Codex fork response omitted thread id")
+            .context("Codex fork response omitted thread id")?;
+        Ok(BackendForkResult {
+            backend_session_id,
+            timing,
+        })
     }
 
     async fn steer(&self, text: String) -> Result<()> {
@@ -475,7 +512,7 @@ impl Backend for CodexBackend {
             capability: capability(),
             ..BackendOutput::default()
         };
-        let mut process = self.connect(&request, &mut output, None).await?;
+        let mut process = self.connect(&request, &mut output, None).await?.process;
         process
             .request(
                 "thread/resume",
@@ -512,7 +549,7 @@ impl Backend for CodexBackend {
 
     async fn model_list(&self, request: BackendRequest) -> Result<Vec<BackendModel>> {
         let mut output = BackendOutput::default();
-        let mut process = self.connect(&request, &mut output, None).await?;
+        let mut process = self.connect(&request, &mut output, None).await?.process;
         let model_list = Self::model_catalog(&mut process, &mut output).await?;
         if let Some(model) = model_list.iter().find(|model| model.is_default) {
             *self.default_model.lock().await = Some(model.id.clone());
@@ -531,7 +568,7 @@ impl Backend for CodexBackend {
             .clone()
             .context("Codex thread has not started")?;
         let mut output = BackendOutput::default();
-        let mut process = self.connect(&request, &mut output, None).await?;
+        let mut process = self.connect(&request, &mut output, None).await?.process;
         if status == "cleared" {
             process
                 .request(
@@ -558,7 +595,7 @@ impl Backend for CodexBackend {
             CodexTurnState::Pending => Ok(true),
             CodexTurnState::Submitted { request, thread_id } => {
                 let mut output = BackendOutput::default();
-                let mut process = self.connect(&request, &mut output, None).await?;
+                let mut process = self.connect(&request, &mut output, None).await?.process;
                 process
                     .request(
                         "thread/rollback",

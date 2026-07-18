@@ -35,17 +35,29 @@ local function named_buffer(name)
 end
 
 ---@param session_id? string
----@return integer
-function M.create_transcript_buffer(session_id)
+---@return string
+local function transcript_name(session_id)
   local name = config.options.harness.buffer_name
   if session_id and session_id ~= "" then name = name .. "://" .. session_id end
-  local buf = named_buffer(name)
+  return name
+end
+
+---@param session_id? string
+---@return integer
+function M.create_transcript_buffer(session_id)
+  local buf = named_buffer(transcript_name(session_id))
   vim.bo[buf].buftype = "nofile"
   vim.bo[buf].bufhidden = "hide"
   vim.bo[buf].swapfile = false
   vim.bo[buf].filetype = "Harness"
   vim.bo[buf].modifiable = false
   return buf
+end
+
+---@param buf integer
+---@param session_id string
+function M.rename_transcript_buffer(buf, session_id)
+  vim.api.nvim_buf_set_name(buf, transcript_name(session_id))
 end
 
 ---@param win integer

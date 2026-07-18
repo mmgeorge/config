@@ -258,6 +258,30 @@ pub struct BackendRuntime {
     pub model: Option<String>,
 }
 
+/// Represents one measured provider phase returned to broker diagnostics.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct BackendTimingRecord {
+    pub phase: String,
+    pub duration_ms: f64,
+}
+
+/// Represents a native provider fork and its provider-owned timing phases.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct BackendForkResult {
+    pub backend_session_id: String,
+    pub timing: Vec<BackendTimingRecord>,
+}
+
+impl BackendForkResult {
+    /// Build an unprofiled native fork result from its provider session identity.
+    pub fn unprofiled(backend_session_id: impl Into<String>) -> Self {
+        Self {
+            backend_session_id: backend_session_id.into(),
+            timing: Vec::new(),
+        }
+    }
+}
+
 /// Represents one selectable context-window tier advertised by a provider.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct BackendContextWindow {
@@ -306,7 +330,7 @@ pub trait Backend: Send + Sync {
     ) -> Result<BackendOutput>;
 
     /// Fork a provider session only when the provider advertises native support.
-    async fn fork(&self, _request: BackendRequest) -> Result<String> {
+    async fn fork(&self, _request: BackendRequest) -> Result<BackendForkResult> {
         anyhow::bail!("backend does not support session fork")
     }
 
@@ -501,13 +525,13 @@ impl Backend for MockBackend {
         })
     }
 
-    async fn fork(&self, request: BackendRequest) -> Result<String> {
-        Ok(format!(
+    async fn fork(&self, request: BackendRequest) -> Result<BackendForkResult> {
+        Ok(BackendForkResult::unprofiled(format!(
             "{}-fork",
             request
                 .backend_session_id
                 .unwrap_or_else(|| "mock-session".into())
-        ))
+        )))
     }
 
     async fn steer(&self, text: String) -> Result<()> {

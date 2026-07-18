@@ -13,8 +13,29 @@ local buffer_by_session_id = {}
 local session_id_by_buffer = {}
 local activation_session_id = nil
 local suppress_buffer_enter = false
+local pending_fork_sequence = 0
+---@type table<integer, DiffReviewHarnessPendingFork>
+local pending_fork_by_buffer = {}
+
+---@class DiffReviewHarnessPendingFork
+---@field buffer integer
+---@field source_session_id string
+---@field source_session_name string
+---@field child_name? string
+---@field error? string
 
 local function controller() return require("diff_review.views.harness.controller") end
+
+---@param win integer
+---@param buf integer
+local function switch_transcript_buffer(win, buf)
+  suppress_buffer_enter = true
+  vim.api.nvim_win_call(win, function()
+    vim.cmd("buffer " .. tostring(buf))
+    layout.configure_transcript_window(win)
+  end)
+  suppress_buffer_enter = false
+end
 
 ---@param buf integer
 ---@param session_id string
@@ -64,19 +85,81 @@ function M.activate(result, options)
     return
   end
   local buf = options.buffer or resolve_buffer(next_session.id)
+  local promoted_pending_fork = pending_fork_by_buffer[buf] ~= nil
+  pending_fork_by_buffer[buf] = nil
+  if promoted_pending_fork then layout.rename_transcript_buffer(buf, next_session.id) end
   M.register(buf, next_session.id)
   if options.switch_buffer ~= false and state.transcript_win and vim.api.nvim_win_is_valid(state.transcript_win) then
-    suppress_buffer_enter = true
-    vim.api.nvim_win_call(state.transcript_win, function()
-      vim.cmd("buffer " .. tostring(buf))
-      layout.configure_transcript_window(state.transcript_win)
-    end)
-    suppress_buffer_enter = false
+    switch_transcript_buffer(state.transcript_win, buf)
   end
   state.transcript_buf = buf
   layout.attach_scroll_boundary(buf, state.transcript_win)
   controller().activate_snapshot(result, options.interaction_mode)
   controller().attach_transcript(buf)
+end
+
+---@param source_session table
+---@param child_name? string
+---@return DiffReviewHarnessPendingFork
+function M.begin_fork(source_session, child_name)
+  local state = session.harness
+  pending_fork_sequence = pending_fork_sequence + 1
+  local buf = layout.create_transcript_buffer("fork-pending-" .. pending_fork_sequence)
+  local pending = {
+    buffer = buf,
+    source_session_id = source_session.id,
+    source_session_name = source_session.name or "",
+    child_name = child_name,
+  }
+  pending_fork_by_buffer[buf] = pending
+  local win = state.transcript_win
+  if win and vim.api.nvim_win_is_valid(win) then
+    vim.api.nvim_win_call(win, function() vim.cmd("normal! m'") end)
+    switch_transcript_buffer(win, buf)
+  end
+  state.transcript_buf = buf
+  layout.attach_scroll_boundary(buf, win)
+  M.render_pending(buf)
+  controller().attach_transcript(buf)
+  controller().refresh_winbar()
+  return pending
+end
+
+---@param buf integer
+---@return boolean
+function M.render_pending(buf)
+  local pending = pending_fork_by_buffer[buf]
+  if not pending or not vim.api.nvim_buf_is_valid(buf) then return false end
+  local source = pending.source_session_id
+  if pending.source_session_name ~= "" then source = source .. " (" .. pending.source_session_name .. ")" end
+  local action = pending.child_name and pending.child_name ~= "" and ("Forking " .. pending.child_name .. " from ")
+    or "Forking from "
+  local line = pending.error and ("Fork failed: " .. pending.error) or (action .. source .. "...")
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "", "  " .. line })
+  vim.bo[buf].modifiable = false
+  vim.bo[buf].modified = false
+  return true
+end
+
+---@param pending DiffReviewHarnessPendingFork
+---@param result table
+function M.complete_fork(pending, result)
+  local buf = pending.buffer
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then
+    M.activate(result)
+    return
+  end
+  M.activate(result, { buffer = buf })
+end
+
+---@param pending DiffReviewHarnessPendingFork
+---@param message string
+function M.fail_fork(pending, message)
+  pending.error = message
+  M.render_pending(pending.buffer)
+  controller().refresh_winbar()
+  notifications.error(message, "Harness fork")
 end
 
 ---@param session_id string
