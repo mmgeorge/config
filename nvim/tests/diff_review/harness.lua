@@ -1933,11 +1933,12 @@ local ok, failure = pcall(function()
   local thought_line = line_number(vim.api.nvim_buf_get_lines(session.harness.transcript_buf, 0, -1, false),
     "↳ Working")
   assert_true(thought_line ~= nil, "expanding a summary should reveal its completed thought")
-  vim.api.nvim_win_set_cursor(session.harness.transcript_win, { thought_line, 0 })
-  controller.toggle_activity()
-  local tool_summary_line = line_number(vim.api.nvim_buf_get_lines(session.harness.transcript_buf, 0, -1, false),
+  transcript_line = vim.api.nvim_buf_get_lines(session.harness.transcript_buf, 0, -1, false)
+  local tool_summary_line = line_number(transcript_line,
     "  ▸ Ran 1 tool")
-  assert_true(tool_summary_line ~= nil, "expanding a thought should reveal its tool summary")
+  assert_true(tool_summary_line ~= nil, "expanding a summary should reveal the thought's tool summary")
+  assert_true(not vim.tbl_contains(transcript_line, "  • Ran Get-Content README.md"),
+    "default thought expansion should keep individual tools hidden")
   vim.api.nvim_win_set_cursor(session.harness.transcript_win, { tool_summary_line, 0 })
   controller.toggle_activity()
   transcript_line = vim.api.nvim_buf_get_lines(session.harness.transcript_buf, 0, -1, false)

@@ -213,9 +213,10 @@ local function append_completed_thought(result, interaction, thought, thought_in
       thought = thought,
       interaction = interaction,
       expand_key = thought_key,
+      expanded_by_default = true,
     }
   end
-  if not result.expanded[thought_key] then return end
+  if result.expanded[thought_key] == false then return end
   local failed = 0
   for _, tool in ipairs(thought.tool or {}) do if tool_render.failed(tool) then failed = failed + 1 end end
   local count_text = tool_count_text("Ran", #(thought.tool or {}), failed)

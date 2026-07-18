@@ -1285,7 +1285,9 @@ function M.toggle_activity()
     notifications.warn("Only completed thoughts, tools, and changes can expand", "Harness")
     return
   end
-  state.activity_expanded[expand_key] = not state.activity_expanded[expand_key]
+  local expanded = state.activity_expanded[expand_key]
+  if expanded == nil then expanded = row.expanded_by_default == true end
+  state.activity_expanded[expand_key] = not expanded
   M.render()
 end
 
