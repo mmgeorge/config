@@ -9,9 +9,22 @@ local timeline_status = require("diff_review.render.harness.timeline_status")
 local function append_session_event(result, entry)
   local event = entry.event or {}
   local name = event.name or ""
-  local text = event.message or (name == "" and "Session name cleared" or ("Session renamed to " .. name))
+  local text
+  local target_session_id = nil
+  if event.kind == "forked" then
+    target_session_id = event.source_session_id
+    local source_name = event.source_session_name or ""
+    text = "Forked from " .. tostring(target_session_id or "")
+    if source_name ~= "" then text = text .. " (" .. source_name .. ")" end
+  else
+    text = event.message or (name == "" and "Session name cleared" or ("Session renamed to " .. name))
+  end
   result.lines[#result.lines + 1] = "  " .. text
-  result.rows[#result.lines] = { kind = "session_event", node_id = entry.id }
+  result.rows[#result.lines] = {
+    kind = "session_event",
+    node_id = entry.id,
+    target_session_id = target_session_id,
+  }
   result.highlights[#result.highlights + 1] = {
     line = #result.lines,
     first = 2,

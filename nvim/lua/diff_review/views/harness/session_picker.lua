@@ -6,7 +6,7 @@ local notifications = require("diff_review.infra.notifications")
 local picker = require("diff_review.views.picker")
 local session = require("diff_review.session")
 local session_preview = require("diff_review.views.harness.session_preview")
-local snapshot = require("diff_review.views.harness.snapshot")
+local session_navigation = require("diff_review.views.harness.session_navigation")
 
 local active = nil
 
@@ -52,22 +52,6 @@ local function request_preview(instance, entry)
   end)
 end
 
----@param result table
-local function activate_session(result)
-  local state = session.harness
-  snapshot.apply(state, result)
-  state.queue = {}
-  local controller = require("diff_review.views.harness.controller")
-  controller.render(true)
-  controller.resolve_runtime_model()
-  if state.active_elicitation and state.active_elicitation.elicitation then
-    state.presented_question_key = nil
-    vim.schedule(controller.present_plan_question)
-  end
-  if #state.approval > 0 then vim.schedule(controller.present_approval) end
-  if state.goal and state.goal.state == "active" then vim.schedule(controller.drain) end
-end
-
 ---@param instance table
 ---@param entry table
 local function resume_session(instance, entry)
@@ -88,7 +72,7 @@ local function resume_session(instance, entry)
       notifications.error(request_error, "Sessions")
       return
     end
-    activate_session(result)
+    session_navigation.activate(result)
   end)
 end
 

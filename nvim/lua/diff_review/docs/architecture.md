@@ -967,7 +967,10 @@ The Codex `CodexTurnCoordinator` treats one user request as a logical interactio
 its first parent app-server turn. It retains the JSON-RPC process while descendant threads remain
 active, accepts steering as another parent turn on the same thread, and starts a bounded synthesis
 turn after the final child completes. Child lifecycle updates replace `AgentRun` state behind the
-existing `AgentReference`, so they never move the child row. `ActiveWait` drives only the current
+existing `AgentReference`, so they never move the child row. Codex `subAgentActivity` values enter
+that lifecycle only for explicit start or terminal states. Directed `interacted` activity carries
+messages between agents without creating a run, and the descendant tracker rejects the parent
+thread identity unconditionally. `ActiveWait` drives only the current
 Timeline Status at the end of the Main timeline. The status uses an animated spinner followed by
 `Waiting for N subagents` and carries no duration because it represents current control state, not
 history. Clearing `ActiveWait` removes the status without creating a timeline node. A normal
@@ -1130,10 +1133,12 @@ turns, and owner-checked saves prevent a stale broker from overwriting a replace
 An initialization collision returns structured lease metadata instead of a terminal string
 failure. Neovim offers Retry and Start New Session for every collision, and adds Fork Session
 only when the persisted backend capability advertises native fork. Fork recovery initializes
-an independently leased broker, forks the provider conversation, copies immutable interaction
-history, comments, plan artifacts, lifecycle events, task attribution, and completed execution
-history. It clears rollback checkpoints and active execution state that belong to the source session, and never
-takes or releases the source lease.
+an independently leased broker and forks the provider conversation without taking or releasing the
+source lease. The child deliberately starts with no copied Harness interactions, comments, plans,
+executions, goals, or agent runs because the backend-owned conversation already carries the inherited
+model context. Its local timeline begins with one durable typed `Forked` event containing the source
+session ID and display name. Explicit `/fork <name>` uses that child name. Bare `/fork` derives
+`<source-name> (fork)`, or `(fork)` when the source remains unnamed, without enforcing uniqueness.
 Broker initialization selects the most recently updated session for the resolved repository
 and configured backend, then restores its interaction timeline, plan, goal, model controls,
 and provider session identity. Independent model, effort, and fast-mode preferences remain available
@@ -1314,9 +1319,17 @@ instead of presenting `default` as though it were a real model ID.
 `/rename <name>` routes directly to the broker's durable `session.rename` request rather
 than entering the model transcript. The broker records a durable session timeline event
 after the rename succeeds, so the transcript confirms completion immediately and after
-session reopen. `/rename` clears the optional display name. The
-The `/sessions` picker searches that name and substitutes `[unnamed]` for empty names,
+session reopen. `/rename` clears the optional display name. `SessionEventKind` distinguishes
+rename events from fork lineage without inferring behavior from optional fields. The `/sessions`
+picker searches that name and substitutes `[unnamed]` for empty names,
 keeping storage semantics separate from presentation fallback text.
+
+Each visited Harness session owns a distinct nofile transcript buffer inside the active Harness tab.
+`session_navigation.lua` maps those buffers to durable session IDs and re-enters the broker through
+`session.resume` on `BufEnter`. Enter or `.` on a `Forked` row switches to the source buffer through
+Neovim's normal buffer command, which records a native jump location. The existing `,` jump-back
+mapping can therefore return to the child buffer, whose `BufEnter` activation restores the child
+lease and snapshot without a parallel Lua navigation stack.
 
 Non-Git WRITE requires an explicit confirmation and permanently displays `NO CHECKPOINT`
 for that session. Git checkpoints include tracked and nonignored untracked files, exclude

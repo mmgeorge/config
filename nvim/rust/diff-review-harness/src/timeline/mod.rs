@@ -7,13 +7,27 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Represents one durable session action projected outside model interactions.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SessionEventKind {
+    Renamed {
+        name: String,
+    },
+    Forked {
+        source_session_id: String,
+        source_session_name: String,
+    },
+}
+
 /// Represents one durable session-level action shown outside model interactions.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SessionEventRecord {
     pub id: String,
     pub session_id: String,
     pub created_at_ms: i64,
-    pub name: String,
+    #[serde(flatten)]
+    pub detail: SessionEventKind,
 }
 
 /// Represents one fully resolved top-level Harness timeline entry.

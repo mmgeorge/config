@@ -94,6 +94,7 @@ M.view_specs = {
     { id = "open_artifact", label = "artifacts", desc = "Open a session artifact", modes = "n", pinned = true },
     { id = "agent", label = "agents", desc = "Switch or start a child-agent timeline", modes = "n", pinned = true },
     { id = "sessions", label = "sessions", desc = "Search and preview durable Harness sessions", modes = "n", pinned = true },
+    { id = "open_timeline", label = "open", desc = "Open the session linked by this timeline row", modes = "n", pinned = false },
     { id = "reopen_question", label = "feedback", desc = "Reopen pending Harness questions", modes = "n", pinned = false },
     { id = "model", label = "model", desc = "Select the model at the next safe boundary", modes = "n", pinned = false },
     { id = "effort_down", label = "effort-", desc = "Decrease reasoning effort", modes = "n", pinned = false },

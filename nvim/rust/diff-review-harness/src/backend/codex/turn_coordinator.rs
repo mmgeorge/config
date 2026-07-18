@@ -19,6 +19,9 @@ impl DescendantTracker {
             let Some(thread_id) = lifecycle.provider_thread_id else {
                 continue;
             };
+            if thread_id == parent_thread_id {
+                continue;
+            }
             if lifecycle.status.is_active() {
                 self.active_thread.insert(thread_id);
             } else {
@@ -423,6 +426,28 @@ mod test {
         );
         assert_eq!(tracker.active_count(), 1);
         assert!(tracker.active_thread.contains("child-two"));
+    }
+
+    #[test]
+    fn never_tracks_the_parent_thread_as_a_descendant() {
+        let mut tracker = DescendantTracker::default();
+        tracker.observe(
+            &json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "child-thread",
+                    "item": {
+                        "type": "collabAgentToolCall",
+                        "tool": "spawnAgent",
+                        "receiverThreadIds": ["parent-thread"],
+                        "status": "completed"
+                    }
+                }
+            }),
+            "parent-thread",
+        );
+
+        assert_eq!(tracker.active_count(), 0);
     }
 
     #[test]

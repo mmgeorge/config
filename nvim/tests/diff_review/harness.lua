@@ -134,6 +134,7 @@ local active_session = {
   execution_mode = "read",
   native_fork = false,
 }
+local session_snapshot_by_id = {}
 
 local interaction_diff_text = table.concat({
   "diff --git a/demo.lua b/demo.lua",
@@ -719,18 +720,60 @@ local function fake_launcher(command, options, _)
         interaction = {},
         prompt_history = prompt_history,
       } })
+    elseif request.method == "session.resume" then
+      local resumed = vim.deepcopy(session_snapshot_by_id[request.params.session_id])
+      if not resumed then
+        emit(options, { id = request.id, error = { message = "session not found" } })
+        return
+      end
+      active_session = resumed.session
+      emit(options, { event = "session_changed", payload = active_session })
+      emit(options, { id = request.id, result = resumed })
     elseif request.method == "session.fork" then
-      active_session = vim.tbl_extend("force", active_session, {
+      local source_session = vim.deepcopy(active_session)
+      session_snapshot_by_id[source_session.id] = {
+        session = source_session,
+        interaction = vim.deepcopy(session.harness.interaction or {}),
+        timeline = vim.deepcopy(session.harness.timeline or {}),
+        capability = vim.deepcopy(session.harness.capability or {}),
+        approval = {},
+        agent = vim.deepcopy(session.harness.agent or { definition = {}, run = {}, turn = {} }),
+        artifact = vim.deepcopy(session.harness.artifact or {}),
+        prompt_history = prompt_history,
+      }
+      local fork_name = vim.trim(request.params.name or "")
+      if fork_name == "" then
+        fork_name = source_session.name == "" and "(fork)" or (source_session.name .. " (fork)")
+      end
+      active_session = vim.tbl_extend("force", source_session, {
         id = "session-fork",
+        name = fork_name,
         native_fork = true,
         execution_mode = "read",
       })
-      emit(options, { event = "session_changed", payload = { session = active_session } })
-      emit(options, { id = request.id, result = {
+      local fork_timeline = { {
+        kind = "session_event",
+        id = "fork-event",
+        created_at_ms = 2,
+        event = {
+          kind = "forked",
+          source_session_id = source_session.id,
+          source_session_name = source_session.name,
+        },
+      } }
+      local fork_snapshot = {
         session = active_session,
-        interaction = { interaction },
+        interaction = {},
+        timeline = fork_timeline,
         capability = { native_fork = true },
-      } })
+        approval = {},
+        agent = { definition = {}, run = {}, turn = {} },
+        artifact = {},
+        prompt_history = prompt_history,
+      }
+      session_snapshot_by_id[active_session.id] = vim.deepcopy(fork_snapshot)
+      emit(options, { event = "session_changed", payload = { session = active_session } })
+      emit(options, { id = request.id, result = fork_snapshot })
     elseif request.method == "goal.continue" then
       goal_continue_count = goal_continue_count + 1
       if goal_continue_count == 2 then
@@ -1811,6 +1854,13 @@ local ok, failure = pcall(function()
     "slash completion should expose execution-mode selection")
   assert_true(vim.iter(command_completion.items):any(function(item) return item.label == "/compact" end),
     "slash completion should expose compact when the backend advertises it")
+  assert_true(not vim.iter(command_completion.items):any(function(item) return item.label == "/fork" end),
+    "slash completion should hide fork when the backend cannot fork")
+  session.harness.capability.native_fork = true
+  command_source:get_completions({}, function(result) command_completion = result end)
+  assert_true(vim.iter(command_completion.items):any(function(item) return item.label == "/fork" end),
+    "slash completion should expose fork when the backend advertises it")
+  session.harness.capability.native_fork = false
   assert_true(vim.iter(command_completion.items):any(function(item) return item.label == "/full" end),
     "slash completion should expose Full mode")
   assert_true(vim.iter(command_completion.items):any(function(item) return item.label == "/yolo" end),
@@ -3158,6 +3208,48 @@ local ok, failure = pcall(function()
     "session search should expose the durable name as its label")
   session_picker.close(true)
 
+  local parent_session_id = session.harness.session.id
+  local parent_transcript_buf = session.harness.transcript_buf
+  session.harness.capability.native_fork = true
+  active_session.native_fork = true
+  vim.api.nvim_set_current_win(session.harness.composer_win)
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/fork investigation" })
+  controller.submit()
+  assert_true(vim.wait(2000, function()
+    return request_by_method["session.fork"] ~= nil and session.harness.session.id == "session-fork"
+  end, 10), "/fork should activate the provider-native child session")
+  assert_equals(request_by_method["session.fork"].params.name, "investigation",
+    "/fork should preserve the explicit child name")
+  assert_equals(session.harness.session.name, "investigation", "/fork should expose the child name")
+  local child_transcript_buf = session.harness.transcript_buf
+  assert_true(child_transcript_buf ~= parent_transcript_buf,
+    "/fork should open a distinct child timeline buffer")
+  assert_equals(#session.harness.interaction, 0, "fork timelines should not clone local interactions")
+  local fork_line = line_number(
+    vim.api.nvim_buf_get_lines(child_transcript_buf, 0, -1, false),
+    "  Forked from " .. parent_session_id .. " (Architecture review)"
+  )
+  assert_true(fork_line ~= nil, "fork timelines should begin with durable parent lineage")
+  vim.api.nvim_set_current_win(session.harness.transcript_win)
+  vim.api.nvim_win_set_cursor(session.harness.transcript_win, { fork_line, 0 })
+  vim.fn.maparg("<CR>", "n", false, true).callback()
+  assert_true(vim.wait(2000, function()
+    return session.harness.session.id == parent_session_id
+      and session.harness.transcript_buf == parent_transcript_buf
+  end, 10), "Enter on fork lineage should open the parent session timeline")
+  vim.api.nvim_win_call(session.harness.transcript_win, function() vim.cmd("normal! \15") end)
+  assert_true(vim.wait(2000, function()
+    return session.harness.session.id == "session-fork"
+      and session.harness.transcript_buf == child_transcript_buf
+  end, 10), "the native jump-back path should reactivate the child session")
+  vim.api.nvim_win_set_cursor(session.harness.transcript_win, { fork_line, 0 })
+  vim.fn.maparg(".", "n", false, true).callback()
+  assert_true(vim.wait(2000, function()
+    return session.harness.session.id == parent_session_id
+      and session.harness.transcript_buf == parent_transcript_buf
+  end, 10), "dot on fork lineage should open the parent session timeline")
+
+  vim.api.nvim_set_current_win(session.harness.composer_win)
   vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/rename" })
   controller.submit()
   assert_true(vim.wait(2000, function() return session.harness.session.name == "" end, 10),

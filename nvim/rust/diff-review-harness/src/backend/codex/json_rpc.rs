@@ -473,15 +473,14 @@ fn normalize_agent_lifecycle(method: &str, params: &Value) -> Vec<AgentLifecycle
         .and_then(Value::as_str)
         .is_some_and(|item_type| item_type.eq_ignore_ascii_case("subAgentActivity"))
     {
-        let starts_child =
-            first_string(item, &["kind"]).is_some_and(|kind| kind.eq_ignore_ascii_case("started"));
-        let status = match first_string(item, &["kind"])
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "interrupted" => AgentRunStatus::Interrupted,
-            _ => AgentRunStatus::Running,
+        let kind = first_string(item, &["kind"]).unwrap_or_default();
+        let starts_child = kind.eq_ignore_ascii_case("started");
+        let status = if starts_child {
+            AgentRunStatus::Running
+        } else if let Some(status) = normalize_agent_status(&kind) {
+            status
+        } else {
+            return Vec::new();
         };
         let provider_thread_id = pointer_string(
             params,
@@ -2118,5 +2117,28 @@ mod test {
             Some("child-thread")
         );
         assert_eq!(lifecycle.status, AgentRunStatus::Interrupted);
+    }
+
+    #[test]
+    fn ignores_codex_subagent_interaction_directed_at_the_parent() {
+        let mut output = BackendOutput::default();
+        normalize_event(
+            &json!({
+                "method": "item/updated",
+                "params": {
+                    "threadId": "child-thread",
+                    "item": {
+                        "type": "subAgentActivity",
+                        "agentThreadId": "parent-thread",
+                        "agentPath": "/root",
+                        "kind": "interacted"
+                    }
+                }
+            }),
+            &mut output,
+            None,
+        );
+
+        assert!(output.event.is_empty());
     }
 }

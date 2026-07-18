@@ -34,27 +34,41 @@ local function named_buffer(name)
   return buf
 end
 
+---@param session_id? string
+---@return integer
+function M.create_transcript_buffer(session_id)
+  local name = config.options.harness.buffer_name
+  if session_id and session_id ~= "" then name = name .. "://" .. session_id end
+  local buf = named_buffer(name)
+  vim.bo[buf].buftype = "nofile"
+  vim.bo[buf].bufhidden = "hide"
+  vim.bo[buf].swapfile = false
+  vim.bo[buf].filetype = "Harness"
+  vim.bo[buf].modifiable = false
+  return buf
+end
+
+---@param win integer
+function M.configure_transcript_window(win)
+  vim.wo[win].wrap = true
+  vim.wo[win].linebreak = true
+  vim.wo[win].breakindent = true
+  vim.wo[win].breakindentopt = "shift:0"
+  vim.wo[win].foldmethod = "manual"
+  vim.wo[win].foldenable = true
+  vim.wo[win].foldtext = "v:lua.require'diff_review.render.harness.interaction_tree'.foldtext()"
+  vim.wo[win].fillchars = "fold: "
+  M.configure_gutterless_window(win)
+end
+
 ---@return integer, integer, integer, integer
 function M.open()
   local options = config.options.harness
   vim.cmd("tabnew")
   local transcript_win = vim.api.nvim_get_current_win()
-  local transcript_buf = named_buffer(options.buffer_name)
+  local transcript_buf = M.create_transcript_buffer()
   vim.api.nvim_win_set_buf(transcript_win, transcript_buf)
-  vim.bo[transcript_buf].buftype = "nofile"
-  vim.bo[transcript_buf].bufhidden = "hide"
-  vim.bo[transcript_buf].swapfile = false
-  vim.bo[transcript_buf].filetype = "Harness"
-  vim.bo[transcript_buf].modifiable = false
-  vim.wo[transcript_win].wrap = true
-  vim.wo[transcript_win].linebreak = true
-  vim.wo[transcript_win].breakindent = true
-  vim.wo[transcript_win].breakindentopt = "shift:0"
-  vim.wo[transcript_win].foldmethod = "manual"
-  vim.wo[transcript_win].foldenable = true
-  vim.wo[transcript_win].foldtext = "v:lua.require'diff_review.render.harness.interaction_tree'.foldtext()"
-  vim.wo[transcript_win].fillchars = "fold: "
-  M.configure_gutterless_window(transcript_win)
+  M.configure_transcript_window(transcript_win)
 
   vim.cmd("belowright " .. tostring(options.composer_min_height) .. "split")
   local composer_win = vim.api.nvim_get_current_win()

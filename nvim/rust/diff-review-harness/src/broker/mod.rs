@@ -25,7 +25,7 @@ use crate::session::{
     ContextUsage, ExecutionMode, HarnessPreference, HarnessSession, ModelSetting, SessionStore,
 };
 use crate::storage::SqliteStore;
-use crate::timeline::{SessionEventRecord, TimelineEntry, TimelineProjector};
+use crate::timeline::{SessionEventKind, SessionEventRecord, TimelineEntry, TimelineProjector};
 use crate::workspace::WorkspaceKind;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -3620,7 +3620,9 @@ impl HarnessBroker {
             id: Uuid::new_v4().to_string(),
             session_id: session.id.clone(),
             created_at_ms,
-            name: session.name.clone(),
+            detail: SessionEventKind::Renamed {
+                name: session.name.clone(),
+            },
         };
         self.store.save_session_event(&timeline_event)?;
         if self.session.id == session.id {
@@ -3801,17 +3803,6 @@ impl HarnessBroker {
             source.backend == self.backend_launch.kind,
             "source session uses a different configured backend"
         );
-        let source_interaction = self.store.list_interaction(&source.id)?;
-        let source_plan = self.store.list_plan(&source.id)?;
-        let source_lifecycle = self.store.list_plan_lifecycle(&source.id)?;
-        let source_execution = self.store.list_plan_execution(&source.id)?;
-        let mut source_comment = Vec::new();
-        for interaction in &source_interaction {
-            source_comment.push((
-                interaction.id.clone(),
-                self.store.list_interaction_comment(&interaction.id)?,
-            ));
-        }
         self.pause_current_goal().await?;
         let backend_session_id = self
             .backend
@@ -3830,7 +3821,7 @@ impl HarnessBroker {
         let now_ms = self.clock.now_ms();
         let mut fork = source.clone();
         fork.id = Uuid::new_v4().to_string();
-        fork.name = format!("{} (fork)", fork.name);
+        fork.name = resolve_fork_name(&params, &source.name);
         fork.backend_session_id = Some(backend_session_id);
         fork.execution_mode = ExecutionMode::Read;
         fork.active_plan_id = None;
@@ -3840,75 +3831,15 @@ impl HarnessBroker {
         fork.lease_owner = Some(self.client_id.clone());
         fork.lease_expires_at_ms = Some(now_ms + 30_000);
         self.store.save_session(&fork)?;
-        let mut plan_id_map = HashMap::new();
-        for source_plan in source_plan {
-            let mut plan = source_plan.clone();
-            plan.id = Uuid::new_v4().to_string();
-            plan.session_id.clone_from(&fork.id);
-            if !source_plan.working_path.is_empty() {
-                plan.working_path = self
-                    .plan_file
-                    .copy_plan(&source.id, &source_plan.id, &fork.id, &plan.id)?
-                    .to_string_lossy()
-                    .into_owned();
-            }
-            plan_id_map.insert(source_plan.id, plan.id.clone());
-            self.store.save_plan(&plan)?;
-        }
-        for mut lifecycle in source_lifecycle {
-            let Some(plan_id) = plan_id_map.get(&lifecycle.plan_id) else {
-                continue;
-            };
-            lifecycle.id = Uuid::new_v4().to_string();
-            lifecycle.session_id.clone_from(&fork.id);
-            lifecycle.plan_id.clone_from(plan_id);
-            self.store.save_plan_lifecycle(&lifecycle)?;
-        }
-        let mut execution_id_map = HashMap::new();
-        for mut execution in source_execution {
-            let Some(plan_id) = plan_id_map.get(&execution.plan_id) else {
-                continue;
-            };
-            let source_execution_id = execution.id.clone();
-            execution.id = Uuid::new_v4().to_string();
-            execution.session_id.clone_from(&fork.id);
-            execution.plan_id.clone_from(plan_id);
-            if execution.state == PlanExecutionState::Active {
-                execution.state = PlanExecutionState::Paused;
-                execution.completed_at_ms = Some(now_ms);
-            }
-            execution_id_map.insert(source_execution_id, execution.id.clone());
-            self.store.save_plan_execution(&execution)?;
-        }
-        for mut interaction in source_interaction {
-            let source_interaction_id = interaction.id;
-            interaction.id = Uuid::new_v4().to_string();
-            interaction.session_id.clone_from(&fork.id);
-            interaction.plan_id = interaction
-                .plan_id
-                .as_ref()
-                .and_then(|plan_id| plan_id_map.get(plan_id))
-                .cloned();
-            interaction.execution_id = interaction
-                .execution_id
-                .as_ref()
-                .and_then(|execution_id| execution_id_map.get(execution_id))
-                .cloned();
-            interaction.checkpoint_before = None;
-            interaction.checkpoint_after = None;
-            self.store.save_interaction(&interaction)?;
-            if let Some((_, comment_list)) = source_comment
-                .iter()
-                .find(|(interaction_id, _)| interaction_id == &source_interaction_id)
-            {
-                for source_comment in comment_list {
-                    let mut comment = source_comment.clone();
-                    comment.id = Uuid::new_v4().to_string();
-                    comment.interaction_id.clone_from(&interaction.id);
-                    self.store.save_interaction_comment(&comment)?;
-                }
-            }
-        }
+        self.store.save_session_event(&SessionEventRecord {
+            id: Uuid::new_v4().to_string(),
+            session_id: fork.id.clone(),
+            created_at_ms: now_ms,
+            detail: SessionEventKind::Forked {
+                source_session_id: source.id,
+                source_session_name: source.name,
+            },
+        })?;
         self.release_lease()?;
         self.workspace_kind = crate::workspace::resolve(Path::new(&fork.workspace))?;
         self.interaction_runtime = None;
@@ -4049,6 +3980,22 @@ fn required_text(value: &Value, field: &str) -> Result<String> {
         .with_context(|| format!("{field} is required"))
 }
 
+fn resolve_fork_name(params: &Value, source_name: &str) -> String {
+    params
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            if source_name.is_empty() {
+                "(fork)".into()
+            } else {
+                format!("{source_name} (fork)")
+            }
+        })
+}
+
 fn goal_state_name(state: GoalState) -> &'static str {
     match state {
         GoalState::Active => "active",
@@ -4084,6 +4031,16 @@ fn default_goal_max_turns() -> u32 {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn resolves_explicit_named_and_unnamed_fork_names() {
+        assert_eq!(
+            resolve_fork_name(&json!({ "name": "  investigation  " }), "review"),
+            "investigation"
+        );
+        assert_eq!(resolve_fork_name(&json!({}), "review"), "review (fork)");
+        assert_eq!(resolve_fork_name(&json!({}), ""), "(fork)");
+    }
 
     fn completed_interaction(
         id: &str,
@@ -5028,17 +4985,21 @@ mod test {
             .dispatch(BrokerRequest {
                 id: 2,
                 method: "session.fork".into(),
-                params: json!({ "session_id": source_session_id }),
+                params: json!({ "session_id": source_session_id, "name": "fork investigation" }),
             })
             .await;
         assert!(forked.response.error.is_none());
         let snapshot = forked.response.result.expect("fork snapshot");
         assert_ne!(snapshot["session"]["id"], source_session_id);
+        assert_eq!(snapshot["session"]["name"], "fork investigation");
         assert_eq!(snapshot["session"]["execution_mode"], "read");
-        assert_eq!(snapshot["interaction"].as_array().map(Vec::len), Some(1));
+        assert_eq!(snapshot["interaction"].as_array().map(Vec::len), Some(0));
+        assert_eq!(snapshot["timeline"].as_array().map(Vec::len), Some(1));
+        assert_eq!(snapshot["timeline"][0]["kind"], "session_event");
+        assert_eq!(snapshot["timeline"][0]["event"]["kind"], "forked");
         assert_eq!(
-            snapshot["interaction"][0]["prompt"],
-            "preserve this interaction"
+            snapshot["timeline"][0]["event"]["source_session_id"],
+            source_session_id
         );
         let persisted_source = fork_controller
             .store
@@ -5204,7 +5165,11 @@ mod test {
                 .iter()
                 .any(|entry| matches!(
                     entry,
-                    TimelineEntry::SessionEvent { event, .. } if event.name == "Architecture review"
+                    TimelineEntry::SessionEvent { event, .. }
+                        if matches!(
+                            &event.detail,
+                            SessionEventKind::Renamed { name } if name == "Architecture review"
+                        )
                 ))
         );
     }

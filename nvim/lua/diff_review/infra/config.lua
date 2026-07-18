@@ -71,6 +71,7 @@
 ---@field open_artifact DiffReviewKeymap
 ---@field agent DiffReviewKeymap
 ---@field sessions DiffReviewKeymap
+---@field open_timeline DiffReviewKeymap
 ---@field reopen_question DiffReviewKeymap
 ---@field model DiffReviewKeymap
 ---@field effort_down DiffReviewKeymap
@@ -237,6 +238,7 @@ M.defaults = {
       open_artifact = "op",
       agent = "og",
       sessions = "os",
+      open_timeline = { "<CR>", "." },
       reopen_question = "oe",
       model = "oM",
       effort_down = "<M-,>",

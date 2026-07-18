@@ -7,23 +7,17 @@ local controller = require("diff_review.views.harness.controller")
 local layout = require("diff_review.views.harness.layout")
 local notifications = require("diff_review.infra.notifications")
 local session = require("diff_review.session")
-local snapshot = require("diff_review.views.harness.snapshot")
+local session_navigation = require("diff_review.views.harness.session_navigation")
 local picker = require("diff_review.views.picker")
 
 local function valid_window(win) return win and vim.api.nvim_win_is_valid(win) end
 
 local function apply_snapshot(state, result)
-  snapshot.apply(state, result, "reconcile")
-  controller.render(true)
-  controller.resolve_runtime_model()
-  if state.active_elicitation and state.active_elicitation.elicitation then
-    state.presented_question_key = nil
-    vim.schedule(controller.present_plan_question)
-  end
-  if #state.approval > 0 then vim.schedule(controller.present_approval) end
-  if state.goal and state.goal.state == "active" then
-    vim.schedule(controller.drain)
-  end
+  session_navigation.activate(result, {
+    buffer = state.transcript_buf,
+    switch_buffer = false,
+    interaction_mode = "reconcile",
+  })
 end
 
 ---@param conflict table
@@ -148,10 +142,7 @@ function M.new_session()
   M.open()
   client.request("session.new", {}, function(result, request_error)
     if request_error then notifications.error(request_error, "Harness") return end
-    local state = session.harness
-    snapshot.apply(state, result)
-    state.queue = {}
-    controller.render(true)
+    session_navigation.activate(result)
   end)
 end
 

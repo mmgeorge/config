@@ -20,6 +20,7 @@ local snapshot = require("diff_review.views.harness.snapshot")
 local picker = require("diff_review.views.picker")
 local timeline_status = require("diff_review.views.harness.timeline_status")
 local question_presentation = require("diff_review.views.harness.question_presentation")
+local session_navigation = require("diff_review.views.harness.session_navigation")
 
 local namespace = vim.api.nvim_create_namespace("DiffReviewHarnessTranscript")
 local queue_namespace = vim.api.nvim_create_namespace("DiffReviewHarnessQueue")
@@ -311,6 +312,7 @@ function M.render(reset)
   })
   state.prompt_line = render.prompt_lines
   state.activity_range = render.folds
+  state.timeline_row = render.rows
   state.render_namespace = namespace
   local transaction = render_transaction.apply(state, render, {
     reset = reset == true,
@@ -420,6 +422,7 @@ local function synchronize_state(callback)
       end
       table.insert(state.timeline, insertion_index, vim.deepcopy(entry))
     end
+    M.attach_transcript(state.transcript_buf)
     require("diff_review.views.harness.agent_picker").refresh()
     reconcile_approval_presentation(state)
     local elicitation = state.active_elicitation and state.active_elicitation.elicitation
@@ -928,6 +931,43 @@ function M.rename_session(name)
   end)
 end
 
+---@param name? string
+function M.fork_session(name)
+  local state = harness_state()
+  local active_session = state.session
+  if not (active_session and active_session.id) then
+    notifications.error("No active Harness session to fork", "Harness")
+    return
+  end
+  if state.capability.native_fork ~= true then
+    notifications.warn("The current backend does not support session fork", "Harness")
+    return
+  end
+  if state.busy then
+    notifications.warn("Finish or cancel the active turn before forking", "Harness")
+    return
+  end
+  local params = { session_id = active_session.id }
+  if name and name ~= "" then params.name = name end
+  client.request("session.fork", params, function(result, request_error)
+    if request_error then
+      notifications.error(request_error, "Harness fork")
+      return
+    end
+    session_navigation.activate(result)
+  end)
+end
+
+function M.open_timeline_entry()
+  local state = harness_state()
+  if vim.api.nvim_get_current_buf() ~= state.transcript_buf then return end
+  local row = vim.api.nvim_win_get_cursor(0)[1]
+  local timeline_row = state.timeline_row and state.timeline_row[row]
+  if timeline_row and timeline_row.target_session_id then
+    session_navigation.open_parent(timeline_row.target_session_id)
+  end
+end
+
 function M.open_artifact_picker()
   local state = harness_state()
   local artifact_list = state.artifact or {}
@@ -1177,6 +1217,11 @@ function M.submit()
     M.rename_session("")
     return
   end
+  if text == "/fork" then
+    set_composer_text(state.composer_buf, "")
+    M.fork_session()
+    return
+  end
   if text == "/questions" then
     set_composer_text(state.composer_buf, "")
     M.present_plan_question(true)
@@ -1246,6 +1291,12 @@ function M.submit()
   if session_name then
     set_composer_text(state.composer_buf, "")
     M.rename_session(vim.trim(session_name))
+    return
+  end
+  local fork_name = text:match("^/fork%s+(.+)$")
+  if fork_name then
+    set_composer_text(state.composer_buf, "")
+    M.fork_session(vim.trim(fork_name))
     return
   end
   local model, model_effort = text:match("^/model%s+(%S+)%s+(%S+)$")
@@ -1683,6 +1734,22 @@ local function close()
   state.composer_win = nil
 end
 
+---@param result table
+---@param interaction_mode? "reconcile"
+function M.activate_snapshot(result, interaction_mode)
+  local state = harness_state()
+  snapshot.apply(state, result, interaction_mode)
+  state.queue = {}
+  M.render(true)
+  M.resolve_runtime_model()
+  if state.active_elicitation and state.active_elicitation.elicitation then
+    state.presented_question_key = nil
+    vim.schedule(M.present_plan_question)
+  end
+  if #state.approval > 0 then vim.schedule(M.present_approval) end
+  if state.goal and state.goal.state == "active" then vim.schedule(M.drain) end
+end
+
 ---@return DiffReviewViewCommandSet
 function M.command_set()
   local set = command_set.new()
@@ -1697,6 +1764,9 @@ function M.command_set()
   command_set.register(set, "open_artifact", M.open_artifact_picker)
   command_set.register(set, "agent", M.open_agent_picker)
   command_set.register(set, "sessions", M.open_session_picker)
+  if harness_state().capability.native_fork == true then
+    command_set.register(set, "open_timeline", M.open_timeline_entry)
+  end
   command_set.register(set, "reopen_question", M.reopen_question)
   command_set.register(set, "model", M.select_model)
   command_set.register(set, "effort_down", function() M.change_effort(-1) end)
@@ -1706,12 +1776,23 @@ function M.command_set()
   return set
 end
 
+---@param buf integer
+function M.attach_transcript(buf)
+  local state = harness_state()
+  for _, key in ipairs(keymaps.view_keys_for("harness", "open_timeline")) do
+    pcall(vim.keymap.del, "n", key, { buffer = buf })
+  end
+  state.command_set = M.command_set()
+  keymaps.setup_view_keymaps(buf, "harness", state.command_set)
+end
+
 function M.attach()
   local state = harness_state()
   state.command_set = M.command_set()
-  keymaps.setup_view_keymaps(state.transcript_buf, "harness", state.command_set)
+  M.attach_transcript(state.transcript_buf)
   local composer_command_set = M.command_set()
   command_set.unregister(composer_command_set, "close")
+  command_set.unregister(composer_command_set, "open_timeline")
   command_set.register(composer_command_set, "history_previous", prompt_history.previous)
   command_set.register(composer_command_set, "history_next", prompt_history.next)
   keymaps.setup_view_keymaps(state.composer_buf, "harness", composer_command_set)

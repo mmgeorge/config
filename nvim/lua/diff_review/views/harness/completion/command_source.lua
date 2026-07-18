@@ -32,6 +32,7 @@ local command_list = {
   { label = "/mode", detail = "Select the Harness execution mode" },
   { label = "/clear", detail = "Start a new session" },
   { label = "/compact", detail = "Compact provider-owned context", capability = "native_compact" },
+  { label = "/fork", detail = "Fork the current session with provider-owned context", capability = "native_fork" },
   { label = "/rename", detail = "Rename the current session" },
   { label = "/effort", detail = "Select reasoning effort", capability = "effort_selection" },
   { label = "/model", detail = "Select the backend model", capability = "model_selection" },
