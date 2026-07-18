@@ -327,14 +327,8 @@ fn normalize_event_in_workspace(
         }
         return;
     }
-    let control_tool = control_tool_name(&params);
-    let tool_event = method_lower.contains("tool")
-        || method_lower.contains("commandexecution")
-        || method_lower.contains("filechange")
-        || encoded.contains("\"command_execution\"")
-        || encoded.contains("\"type\":\"commandexecution\"")
-        || encoded.contains("\"type\":\"dynamictoolcall\"")
-        || encoded.contains("\"type\":\"filechange\"");
+    let control_tool = control_tool_name(method, &params);
+    let tool_event = is_tool_lifecycle_event(&method_lower, &encoded);
     let plan_event = method_lower.contains("plan");
     let reasoning_event = method_lower.contains("reason") || encoded.contains("\"thought\"");
     let assistant_event = method_lower.contains("agentmessage");
@@ -672,30 +666,44 @@ fn turn_token_count(params: &Value) -> Option<u64> {
     (token_count > 0).then_some(token_count)
 }
 
-fn control_tool_name(value: &Value) -> Option<&str> {
-    match value {
-        Value::Array(item) => item.iter().find_map(control_tool_name),
-        Value::Object(map) => {
-            for key in ["tool", "name", "toolName", "tool_name"] {
-                if let Some(name) = map.get(key).and_then(Value::as_str)
-                    && matches!(
-                        name,
-                        "harness_plan_submit"
-                            | "harness_plan_question"
-                            | "harness_question_answer"
-                            | "harness_question_withdraw"
-                            | "harness_goal_complete"
-                            | "harness_goal_blocked"
-                            | "harness_goal_status"
-                    )
-                {
-                    return Some(name);
-                }
-            }
-            map.values().find_map(control_tool_name)
-        }
-        _ => None,
+fn is_tool_lifecycle_event(method_lower: &str, encoded: &str) -> bool {
+    method_lower.contains("tool")
+        || method_lower.contains("commandexecution")
+        || method_lower.contains("filechange")
+        || encoded.contains("\"command_execution\"")
+        || encoded.contains("\"type\":\"commandexecution\"")
+        || encoded.contains("\"type\":\"dynamictoolcall\"")
+        || encoded.contains("\"type\":\"filechange\"")
+        || encoded.contains("\"type\":\"mcptoolcall\"")
+}
+
+fn control_tool_name<'value>(method: &str, value: &'value Value) -> Option<&'value str> {
+    let method_lower = method.to_ascii_lowercase();
+    let envelope = value.get("update").unwrap_or(value);
+    let item = envelope.get("item").unwrap_or(envelope);
+    let dynamic_tool_call = method_lower == "item/tool/call"
+        || item
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|item_type| item_type.eq_ignore_ascii_case("dynamicToolCall"));
+    if !dynamic_tool_call {
+        return None;
     }
+    ["tool", "name", "toolName", "tool_name"]
+        .into_iter()
+        .find_map(|key| item.get(key).and_then(Value::as_str))
+        .filter(|name| {
+            matches!(
+                *name,
+                "harness_plan_submit"
+                    | "harness_plan_question"
+                    | "harness_question_answer"
+                    | "harness_question_withdraw"
+                    | "harness_goal_complete"
+                    | "harness_goal_blocked"
+                    | "harness_goal_status"
+            )
+        })
 }
 
 fn find_plan_question(value: &Value) -> Option<PlanQuestionSet> {
@@ -946,38 +954,43 @@ fn normalize_tool_activity(method: &str, params: &Value, workspace: &str) -> Opt
     } else {
         ToolActivityKind::ToolCall
     };
-    let title = [
-        item.get("command"),
-        envelope.get("command"),
-        item.get("title"),
-        envelope.get("title"),
-        item.get("tool"),
-        envelope.get("tool"),
-        item.get("name"),
-        envelope.get("name"),
-    ]
-    .into_iter()
-    .flatten()
-    .find_map(tool_title)
-    .unwrap_or_else(|| match kind {
-        ToolActivityKind::Command => "command".into(),
-        ToolActivityKind::FileChange => "file changes".into(),
-        ToolActivityKind::ToolCall => "tool".into(),
-    });
-    let output = item
-        .get("aggregatedOutput")
-        .or_else(|| item.get("aggregated_output"))
-        .or_else(|| item.get("output"))
-        .or_else(|| envelope.get("output"))
-        .or_else(|| envelope.get("delta"))
-        .and_then(Value::as_str)
-        .map(strip_ansi_escapes::strip_str)
+    let title = mcp_tool_title(item)
         .or_else(|| {
-            envelope
-                .get("content")
-                .and_then(first_text)
-                .map(strip_ansi_escapes::strip_str)
+            [
+                item.get("command"),
+                envelope.get("command"),
+                item.get("title"),
+                envelope.get("title"),
+                item.get("tool"),
+                envelope.get("tool"),
+                item.get("name"),
+                envelope.get("name"),
+            ]
+            .into_iter()
+            .flatten()
+            .find_map(tool_title)
+        })
+        .unwrap_or_else(|| match kind {
+            ToolActivityKind::Command => "command".into(),
+            ToolActivityKind::FileChange => "file changes".into(),
+            ToolActivityKind::ToolCall => "tool".into(),
         });
+    let output = mcp_tool_output(item).or_else(|| {
+        item.get("aggregatedOutput")
+            .or_else(|| item.get("aggregated_output"))
+            .or_else(|| item.get("output"))
+            .or_else(|| envelope.get("output"))
+            .or_else(|| envelope.get("delta"))
+            .or_else(|| envelope.get("message"))
+            .and_then(Value::as_str)
+            .map(strip_ansi_escapes::strip_str)
+            .or_else(|| {
+                envelope
+                    .get("content")
+                    .and_then(first_text)
+                    .map(strip_ansi_escapes::strip_str)
+            })
+    });
     let status = item
         .get("status")
         .or_else(|| envelope.get("status"))
@@ -991,6 +1004,11 @@ fn normalize_tool_activity(method: &str, params: &Value, workspace: &str) -> Opt
         .or_else(|| {
             method_lower
                 .ends_with("/started")
+                .then(|| "inProgress".to_owned())
+        })
+        .or_else(|| {
+            method_lower
+                .eq("item/mcptoolcall/progress")
                 .then(|| "inProgress".to_owned())
         });
     Some(ToolActivity {
@@ -1101,6 +1119,97 @@ fn tool_title(value: &Value) -> Option<String> {
         }
         _ => None,
     }
+}
+
+fn mcp_tool_title(item: &Value) -> Option<String> {
+    item.get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|item_type| item_type.eq_ignore_ascii_case("mcpToolCall"))
+        .then_some(())?;
+    let server = item.get("server").and_then(Value::as_str)?;
+    let tool = item.get("tool").and_then(Value::as_str)?;
+    let arguments = item
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| Value::Object(Default::default()));
+    let arguments = redact_mcp_arguments(&arguments);
+    let arguments = serde_json::to_string(&arguments).ok()?;
+    compact_tool_title(&format!("{server}.{tool}({arguments})"))
+}
+
+fn mcp_tool_output(item: &Value) -> Option<String> {
+    item.get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|item_type| item_type.eq_ignore_ascii_case("mcpToolCall"))
+        .then_some(())?;
+    if let Some(message) = item.pointer("/error/message").and_then(Value::as_str) {
+        return Some(strip_ansi_escapes::strip_str(message));
+    }
+    let result = item.get("result")?;
+    let text_list = result
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|content| content.get("text").and_then(Value::as_str))
+        .map(format_mcp_text)
+        .collect::<Vec<_>>();
+    if !text_list.is_empty() {
+        return Some(text_list.join("\n"));
+    }
+    result
+        .get("structuredContent")
+        .and_then(|content| serde_json::to_string_pretty(content).ok())
+}
+
+fn redact_mcp_arguments(value: &Value) -> Value {
+    match value {
+        Value::Array(value_list) => {
+            Value::Array(value_list.iter().map(redact_mcp_arguments).collect())
+        }
+        Value::Object(value_map) => Value::Object(
+            value_map
+                .iter()
+                .map(|(key, value)| {
+                    let value = if sensitive_mcp_argument_key(key) {
+                        Value::String("[REDACTED]".into())
+                    } else {
+                        redact_mcp_arguments(value)
+                    };
+                    (key.clone(), value)
+                })
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+fn sensitive_mcp_argument_key(key: &str) -> bool {
+    matches!(
+        key.to_ascii_lowercase().replace(['-', '_'], "").as_str(),
+        "token"
+            | "apikey"
+            | "key"
+            | "secret"
+            | "password"
+            | "passphrase"
+            | "authorization"
+            | "bearer"
+            | "cookie"
+            | "session"
+            | "credential"
+            | "accesstoken"
+            | "refreshtoken"
+            | "clientsecret"
+            | "privatekey"
+    )
+}
+
+fn format_mcp_text(text: &str) -> String {
+    let text = strip_ansi_escapes::strip_str(text);
+    serde_json::from_str::<Value>(&text)
+        .and_then(|value| serde_json::to_string_pretty(&value))
+        .unwrap_or(text)
 }
 
 fn compact_tool_title(title: &str) -> Option<String> {
@@ -1471,6 +1580,172 @@ mod test {
         assert_eq!(activity.output.as_deref(), Some("# Harness\nline two\n"));
         assert_eq!(activity.status.as_deref(), Some("completed"));
         assert!(!activity.output_delta);
+    }
+
+    #[test]
+    fn correlates_codex_mcp_lifecycle_into_one_activity() {
+        let mut output = BackendOutput::default();
+        let (event_sink, event_stream) = tokio::sync::mpsc::unbounded_channel();
+        normalize_event(
+            &json!({
+                "method": "item/started",
+                "params": {
+                    "item": {
+                        "id": "mcp-1",
+                        "type": "mcpToolCall",
+                        "server": "docs-mcp",
+                        "tool": "crate_get",
+                        "arguments": {
+                            "crate": "bevy",
+                            "api_key": "must-not-persist",
+                            "nested": { "clientSecret": "also-secret" }
+                        },
+                        "status": "inProgress"
+                    }
+                }
+            }),
+            &mut output,
+            Some(&event_sink),
+        );
+        normalize_event(
+            &json!({
+                "method": "item/mcpToolCall/progress",
+                "params": {
+                    "itemId": "mcp-1",
+                    "message": "Fetching crate metadata"
+                }
+            }),
+            &mut output,
+            Some(&event_sink),
+        );
+        normalize_event(
+            &json!({
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "id": "mcp-1",
+                        "type": "mcpToolCall",
+                        "server": "docs-mcp",
+                        "tool": "crate_get",
+                        "arguments": {
+                            "crate": "bevy",
+                            "api_key": "must-not-persist",
+                            "nested": { "clientSecret": "also-secret" }
+                        },
+                        "status": "completed",
+                        "result": {
+                            "content": [
+                                { "type": "text", "text": "crate metadata" },
+                                { "type": "text", "text": "release metadata" }
+                            ]
+                        }
+                    }
+                }
+            }),
+            &mut output,
+            Some(&event_sink),
+        );
+
+        assert_eq!(
+            event_stream.len(),
+            3,
+            "each MCP lifecycle update must stream live"
+        );
+        assert_eq!(
+            output.event.len(),
+            1,
+            "one MCP call must persist as one activity"
+        );
+        let activity = output.event[0].activity.as_ref().expect("MCP activity");
+        assert_eq!(activity.id, "mcp-1");
+        assert_eq!(activity.kind, ToolActivityKind::ToolCall);
+        assert_eq!(
+            activity.title,
+            "docs-mcp.crate_get({\"api_key\":\"[REDACTED]\",\"crate\":\"bevy\",\"nested\":{\"clientSecret\":\"[REDACTED]\"}})"
+        );
+        assert!(!activity.title.contains("must-not-persist"));
+        assert!(!activity.title.contains("also-secret"));
+        assert_eq!(
+            activity.output.as_deref(),
+            Some("crate metadata\nrelease metadata")
+        );
+        assert_eq!(activity.status.as_deref(), Some("completed"));
+        assert!(output.evidence.tool_called);
+    }
+
+    #[test]
+    fn normalizes_codex_mcp_failure_output() {
+        let mut output = BackendOutput::default();
+        normalize_event(
+            &json!({
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "id": "mcp-failed",
+                        "type": "mcpToolCall",
+                        "server": "docs-mcp",
+                        "tool": "crate_get",
+                        "status": "failed",
+                        "error": { "message": "server unavailable" }
+                    }
+                }
+            }),
+            &mut output,
+            None,
+        );
+
+        let activity = output.event[0]
+            .activity
+            .as_ref()
+            .expect("failed MCP activity");
+        assert_eq!(activity.output.as_deref(), Some("server unavailable"));
+        assert_eq!(activity.status.as_deref(), Some("failed"));
+    }
+
+    #[test]
+    fn prettifies_codex_mcp_json_results() {
+        let output = mcp_tool_output(&json!({
+            "type": "mcpToolCall",
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": "{\"login\":\"mmgeorge\",\"details\":{\"followers\":22}}"
+                }]
+            }
+        }));
+        assert_eq!(
+            output.as_deref(),
+            Some("{\n  \"details\": {\n    \"followers\": 22\n  },\n  \"login\": \"mmgeorge\"\n}")
+        );
+    }
+
+    #[test]
+    fn does_not_classify_mcp_names_as_harness_control_tools() {
+        let mut output = BackendOutput::default();
+        normalize_event(
+            &json!({
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "id": "mcp-control-name",
+                        "type": "mcpToolCall",
+                        "server": "external-mcp",
+                        "tool": "harness_goal_complete",
+                        "status": "completed",
+                        "result": { "content": [{ "type": "text", "text": "ordinary result" }] }
+                    }
+                }
+            }),
+            &mut output,
+            None,
+        );
+
+        assert!(!output.evidence.structured_complete);
+        let activity = output.event[0]
+            .activity
+            .as_ref()
+            .expect("external MCP activity");
+        assert_eq!(activity.title, "external-mcp.harness_goal_complete({})");
     }
 
     #[test]

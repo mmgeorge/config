@@ -89,6 +89,8 @@ function M.setup()
     nocombine = true,
   })
   vim.api.nvim_set_hl(0, "DiffReviewHarnessArgument", { fg = palette.white })
+  vim.api.nvim_set_hl(0, "DiffReviewHarnessMcpName", { fg = palette.light_blue, bold = true })
+  vim.api.nvim_set_hl(0, "DiffReviewHarnessMcpArguments", { fg = palette.gray })
   vim.api.nvim_set_hl(0, "DiffReviewHarnessOutput", { fg = palette.gray })
   vim.api.nvim_set_hl(0, "DiffReviewHarnessToolSuccess", { fg = palette.green })
   vim.api.nvim_set_hl(0, "DiffReviewHarnessToolFailure", { fg = palette.red })

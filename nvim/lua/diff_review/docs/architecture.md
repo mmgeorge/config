@@ -945,6 +945,16 @@ channel into `TimelineReducer`, which owns one active thought inside the current
 child-agent references, and acknowledged steering prompts. Assistant commentary establishes thought
 boundaries. Tool events that arrive first create a synthetic `Working` thought. Stable tool
 identities merge start, output, and completion events into one completed tool record.
+Codex `mcpToolCall` items follow that same path. `CodexJsonRpc` converts their app-server
+`server`, `tool`, and compact JSON arguments into one `server.tool(arguments)` title. Before that
+title enters durable timeline state, the transport recursively replaces values named `token`,
+`api_key`, `key`, `secret`, `password`, `passphrase`, `authorization`, `bearer`, `cookie`,
+`session`, `credential`, `access_token`, `refresh_token`, `client_secret`, or `private_key` with
+`[REDACTED]`. It does not guess from value shape, preserving useful hashes and identifiers.
+`item/mcpToolCall/progress` replaces mutable previews, while completed result JSON is pretty
+printed before rendering. MCP payload details stop at the Codex transport boundary, so
+`ToolActivity`, `TimelineReducer`, and the Lua tree continue to represent every provider action as
+a generic tool.
 
 The Codex `CodexTurnCoordinator` treats one user request as a logical interaction that may outlive
 its first parent app-server turn. It retains the JSON-RPC process while descendant threads remain

@@ -1,5 +1,25 @@
 local M = {}
 
+---@param text string
+---@param width integer
+---@return string[]
+local function split_display_width(text, width)
+  local line_list = {}
+  local fragment = ""
+  local char_count = vim.fn.strchars(text)
+  for char_index = 0, char_count - 1 do
+    local character = vim.fn.strcharpart(text, char_index, 1)
+    if fragment ~= "" and vim.fn.strdisplaywidth(fragment .. character) > width then
+      line_list[#line_list + 1] = fragment
+      fragment = character
+    else
+      fragment = fragment .. character
+    end
+  end
+  if fragment ~= "" then line_list[#line_list + 1] = fragment end
+  return line_list
+end
+
 ---@param command string
 ---@param expects_command? boolean
 ---@return table[]
@@ -30,12 +50,49 @@ local function command_token_list(command, expects_command)
 end
 
 ---@param tool table
+---@return string
+local function tool_verb(tool)
+  local kind = tool.kind or "tool_call"
+  if kind == "command" then return "Ran" end
+  if kind == "file_change" then return "Edited" end
+  local status = tostring(tool.status or ""):lower()
+  return (status == "inprogress" or status == "in_progress") and "Calling" or "Called"
+end
+
+---@param title string
+---@return string, string
+local function mcp_title_parts(title)
+  local name, arguments = title:match("^(.-)(%b())$")
+  return name or title, arguments or ""
+end
+
+---@param tool table
 ---@param width? integer
 ---@param indent? string
 ---@return table[]
 function M.heading_lines(tool, width, indent)
   local leading = indent or ""
-  if tool.kind ~= "command" then return { { text = leading .. M.heading(tool) } } end
+  if tool.kind ~= "command" then
+    local heading = M.heading(tool)
+    if tool.kind ~= "tool_call" or not width or vim.fn.strdisplaywidth(leading .. heading) <= width then
+      return { {
+        text = leading .. heading,
+        title_fragment = tool.kind == "tool_call" and (tool.title or "tool") or nil,
+      } }
+    end
+    local verb = tool_verb(tool)
+    local title = tool.title or "tool"
+    local title_prefix = leading .. "  └ "
+    local continuation_prefix = leading .. "    "
+    local title_width = math.max(1, width - vim.fn.strdisplaywidth(title_prefix))
+    local title_line_list = split_display_width(title, title_width)
+    local line_list = { { text = leading .. "• " .. verb } }
+    for line_index, line in ipairs(title_line_list) do
+      local prefix = line_index == 1 and title_prefix or continuation_prefix
+      line_list[#line_list + 1] = { text = prefix .. line, title_fragment = line }
+    end
+    return line_list
+  end
 
   local command = M.display_command(tool.title or "command")
   if not width or width < 20 then
@@ -92,7 +149,7 @@ end
 ---@return string
 function M.heading(tool)
   local kind = tool.kind or "tool_call"
-  local verb = kind == "command" and "Ran" or (kind == "file_change" and "Edited" or "Called")
+  local verb = tool_verb(tool)
   local title = kind == "command" and M.display_command(tool.title or "command") or (tool.title or "tool")
   return ("• %s %s"):format(verb, title)
 end
@@ -133,6 +190,43 @@ function M.highlight_command_lines(result, heading_line_list)
   end
 end
 
+---@param result table
+---@param tool table
+---@param heading_line_list table[]
+function M.highlight_tool_call_lines(result, tool, heading_line_list)
+  local name = mcp_title_parts(tool.title or "tool")
+  local title_offset = 0
+  for _, heading_line in ipairs(heading_line_list) do
+    local text = heading_line.text or ""
+    local fragment = heading_line.title_fragment or ""
+    local fragment_length = #fragment
+    if fragment_length > 0 then
+      local fragment_start = #text - fragment_length + 1
+      local fragment_end = title_offset + fragment_length
+      local name_end = #name
+      if title_offset < name_end then
+        local highlighted_end = math.min(fragment_end, name_end)
+        result.highlights[#result.highlights + 1] = {
+          line = heading_line.line,
+          first = fragment_start - 1,
+          last = fragment_start + highlighted_end - title_offset - 1,
+          group = "DiffReviewHarnessMcpName",
+        }
+      end
+      if fragment_end > name_end then
+        local argument_start = math.max(title_offset + 1, name_end + 1)
+        result.highlights[#result.highlights + 1] = {
+          line = heading_line.line,
+          first = fragment_start + argument_start - title_offset - 2,
+          last = fragment_start + fragment_length - 1,
+          group = "DiffReviewHarnessMcpArguments",
+        }
+      end
+      title_offset = fragment_end
+    end
+  end
+end
+
 ---@param tool table
 ---@param indent? string
 ---@param visible_text? string
@@ -141,11 +235,20 @@ function M.foldtext_chunks(tool, indent, visible_text)
   local prefix = (indent or "") .. "• "
   local bullet_group = M.failed(tool) and "DiffReviewHarnessToolFailure" or "DiffReviewHarnessToolSuccess"
   local kind = tool.kind or "tool_call"
-  local verb = kind == "command" and "Ran" or (kind == "file_change" and "Edited" or "Called")
+  local verb = tool_verb(tool)
   if kind ~= "command" then
+    if kind ~= "tool_call" then
+      return {
+        { (indent or "") .. "•", bullet_group },
+        { (" %s %s"):format(verb, tool.title or "tool"), "Normal" },
+      }
+    end
+    local name, arguments = mcp_title_parts(tool.title or "tool")
     return {
       { (indent or "") .. "•", bullet_group },
-      { (" %s %s"):format(verb, tool.title or "tool"), "Normal" },
+      { " " .. verb .. " ", "Normal" },
+      { name, "DiffReviewHarnessMcpName" },
+      { arguments, "DiffReviewHarnessMcpArguments" },
     }
   end
 

@@ -2421,6 +2421,150 @@ local ok, failure = pcall(function()
   assert_true(not vim.tbl_contains(active_tree.lines, "      line five"),
     "active tool previews should truncate output after four lines")
 
+  local mcp_active_tree = interaction_renderer.build({ {
+    id = "mcp-active",
+    prompt = "inspect crate metadata",
+    state = "running",
+    thought = {},
+    active = {
+      text = "Working",
+      tool_count = 1,
+      failed_count = 0,
+      latest_tool = {
+        id = "mcp-tool",
+        kind = "tool_call",
+        title = 'docs-mcp.crate_get({"api_key":"[REDACTED]","crate":"bevy"})',
+        output = "Fetching crate metadata",
+        status = "inProgress",
+        failed = false,
+      },
+    },
+  } }, { working_seconds = 1 })
+  assert_true(vim.tbl_contains(mcp_active_tree.lines, "  ▸ Running 1 tool"),
+    "active MCP calls should contribute to the shared tool counter")
+  assert_true(vim.tbl_contains(mcp_active_tree.lines,
+    '  • Calling docs-mcp.crate_get({"api_key":"[REDACTED]","crate":"bevy"})'),
+  "active MCP calls should render redacted arguments with their server and tool identity")
+  local mcp_name_highlight = vim.iter(mcp_active_tree.highlights):find(function(highlight)
+    return highlight.group == "DiffReviewHarnessMcpName"
+  end)
+  assert_true(mcp_name_highlight ~= nil, "MCP calls should highlight their server and tool name")
+  assert_equals(mcp_active_tree.lines[mcp_name_highlight.line]:sub(
+    mcp_name_highlight.first + 1,
+    mcp_name_highlight.last
+  ), "docs-mcp.crate_get", "MCP name highlighting should start at the server name, not the lifecycle verb")
+  local mcp_arguments_highlight = vim.iter(mcp_active_tree.highlights):find(function(highlight)
+    return highlight.group == "DiffReviewHarnessMcpArguments"
+  end)
+  assert_true(mcp_arguments_highlight ~= nil, "MCP calls should highlight their argument JSON separately")
+  assert_equals(mcp_active_tree.lines[mcp_arguments_highlight.line]:sub(
+    mcp_arguments_highlight.first + 1,
+    mcp_arguments_highlight.last
+  ):sub(1, 1), "(", "MCP argument highlighting should begin at the JSON delimiter")
+  assert_true(vim.tbl_contains(mcp_active_tree.lines, "    └ Fetching crate metadata"),
+    "active MCP calls should render their latest progress message")
+
+  local narrow_mcp_tree = interaction_renderer.build({ {
+    id = "mcp-narrow",
+    prompt = "inspect crate metadata",
+    state = "running",
+    thought = {},
+    active = {
+      text = "Working",
+      tool_count = 1,
+      failed_count = 0,
+      latest_tool = {
+        id = "mcp-tool",
+        kind = "tool_call",
+        title = 'github.get_file_contents({"owner":"bevyengine","path":"crates/bevy_internal/src/lib.rs","token":"[REDACTED]"})',
+        output = "Fetching crate metadata",
+        status = "inProgress",
+        failed = false,
+      },
+    },
+  } }, { working_seconds = 1, content_width = 52 })
+  assert_true(vim.tbl_contains(narrow_mcp_tree.lines, "  • Calling"),
+    "narrow MCP calls should keep their lifecycle verb on a standalone heading")
+  assert_true(vim.iter(narrow_mcp_tree.lines):any(function(line)
+    return line:find("    └ github.get_file_contents", 1, true) ~= nil
+  end), "narrow MCP calls should indent the first wrapped argument line under the tool")
+  for line, row in pairs(narrow_mcp_tree.rows) do
+    if row.kind == "active_tool" or row.kind == "active_tool_continuation" then
+      assert_true(vim.fn.strdisplaywidth(narrow_mcp_tree.lines[line]) <= 52,
+        "wrapped MCP call exceeded the transcript width: " .. narrow_mcp_tree.lines[line])
+    end
+  end
+
+  local mcp_thought_key = "interaction:mcp-completed:thought:mcp-thought"
+  local mcp_completed_tree = interaction_renderer.build({ {
+    id = "mcp-completed",
+    prompt = "inspect crate metadata",
+    state = "complete",
+    duration_ms = 1000,
+    node_list = { {
+      kind = "main_segment",
+      segment = {
+        id = "mcp-segment",
+        state = "complete",
+        duration_ms = 1000,
+        thought = { {
+          id = "mcp-thought",
+          text = "Looking up the crate.",
+          tool = { {
+            id = "mcp-tool",
+            kind = "tool_call",
+            title = 'docs-mcp.crate_get({"api_key":"[REDACTED]","crate":"bevy"})',
+            output = '{\n  "details": {\n    "followers": 22\n  },\n  "login": "mmgeorge"\n}',
+            status = "completed",
+            failed = false,
+          } },
+        } },
+      },
+    } },
+  } }, {
+    expanded = {
+      ["interaction:mcp-completed:segment:mcp-segment"] = true,
+      [mcp_thought_key] = true,
+      [mcp_thought_key .. ":tools"] = true,
+      [mcp_thought_key .. ":tool:1"] = true,
+    },
+  })
+  assert_true(vim.tbl_contains(mcp_completed_tree.lines, "  ▸ Ran 1 tool"),
+    "completed MCP calls should contribute to the shared tool counter")
+  assert_true(vim.tbl_contains(mcp_completed_tree.lines,
+    '  • Called docs-mcp.crate_get({"api_key":"[REDACTED]","crate":"bevy"})'),
+  "completed MCP calls should reuse the generic redacted tool-call heading")
+  assert_true(vim.tbl_contains(mcp_completed_tree.lines, "    └ {"),
+    "expanded MCP calls should reveal formatted JSON output")
+  assert_true(vim.iter(mcp_completed_tree.lines):any(function(line)
+    return line:find('"login": "mmgeorge"', 1, true) ~= nil
+  end), "expanded MCP calls should preserve formatted JSON fields")
+
+  local mcp_failed_tree = interaction_renderer.build({ {
+    id = "mcp-failed",
+    prompt = "inspect crate metadata",
+    state = "running",
+    thought = {},
+    active = {
+      text = "Working",
+      tool_count = 1,
+      failed_count = 1,
+      latest_tool = {
+        id = "mcp-tool",
+        kind = "tool_call",
+        title = 'docs-mcp.crate_get({"api_key":"[REDACTED]","crate":"bevy"})',
+        output = "server unavailable",
+        status = "failed",
+        failed = true,
+      },
+    },
+  } }, { working_seconds = 1 })
+  assert_true(vim.tbl_contains(mcp_failed_tree.lines, "  ▸ Running 1 tool (1 failed)"),
+    "failed MCP calls should contribute to the shared failure counter")
+  assert_true(vim.iter(mcp_failed_tree.highlights):any(function(highlight)
+    return highlight.group == "DiffReviewHarnessToolFailure"
+  end), "failed MCP calls should reuse the shared failure presentation")
+
   local cancelled_tree = interaction_renderer.build({ {
     id = "cancelled-only",
     prompt = "stop this turn",

@@ -154,6 +154,8 @@ local function append_tool(result, tool, thought_key, tool_index, content_width)
   }
   if tool.kind == "command" then
     tool_render.highlight_command_lines(result, heading_line_list)
+  elseif tool.kind == "tool_call" then
+    tool_render.highlight_tool_call_lines(result, tool, heading_line_list)
   end
   if not result.expanded[tool_key] then return end
   local output_line_list = tool_render.output_lines(tool.output)
@@ -187,7 +189,11 @@ local function append_active_tool_preview(result, tool, content_width)
     last = 2 + #"•",
     group = tool_render.failed(tool) and "DiffReviewHarnessToolFailure" or "DiffReviewHarnessToolSuccess",
   }
-  if tool.kind == "command" then tool_render.highlight_command_lines(result, heading_line_list) end
+  if tool.kind == "command" then
+    tool_render.highlight_command_lines(result, heading_line_list)
+  elseif tool.kind == "tool_call" then
+    tool_render.highlight_tool_call_lines(result, tool, heading_line_list)
+  end
 
   local output_line_list = tool_render.output_lines(tool.output)
   for output_index = 1, math.min(#output_line_list, 4) do
