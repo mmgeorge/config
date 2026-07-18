@@ -1,0 +1,12 @@
+{
+  "name": "diff-review-utftex",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "utftex": "utftex.mjs"
+  },
+  "dependencies": {
+    "libtexprintf": "1.31.0"
+  }
+}

@@ -465,7 +465,9 @@ return {
       bigfile = { enabled = false },
       dashboard = { enabled = false },
       explorer = { enabled = true },
-      image = {},
+      image = {
+        math = { enabled = false },
+      },
       indent = {
         enabled = false,
         only_scope = true,

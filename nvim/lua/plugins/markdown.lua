@@ -1,11 +1,36 @@
 return {
   {
     'MeanderingProgrammer/render-markdown.nvim',
+    build = function()
+      local dependency = require('markdown_math.dependency')
+      local result = vim.system(dependency.install_command(), { text = true }):wait()
+      if result.code ~= 0 then
+        error('install libtexprintf: ' .. vim.trim(result.stderr or result.stdout or 'unknown npm error'))
+      end
+    end,
     dependencies = {
       'nvim-treesitter/nvim-treesitter',
       'nvim-tree/nvim-web-devicons',
     },
-    opts = {},
+    init = function()
+      if vim.fn.has('win32') == 1 then
+        -- Normalize Python child output because latex2text otherwise inherits Windows CP-1252.
+        vim.env.PYTHONIOENCODING = 'utf-8'
+      end
+    end,
+    opts = function()
+      return {
+        custom_handlers = {
+          markdown = require('markdown_math.display_handler'),
+        },
+        latex = {
+          converter = {
+            require('markdown_math.dependency').executable_path(),
+            'latex2text',
+          },
+        },
+      }
+    end,
   },
   {
     'jmbuhr/otter.nvim',

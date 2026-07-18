@@ -6,6 +6,7 @@ local diff_tree = require("diff_review.render.diff_tree")
 local plan_event = require("diff_review.render.harness.plan_event")
 local timeline_status = require("diff_review.render.harness.timeline_status")
 local agent_event = require("diff_review.render.harness.agent_event")
+local markdown_text = require("diff_review.render.harness.markdown_text")
 local task_tree = require("diff_review.render.harness.task_tree")
 local tool_render = require("diff_review.render.harness.tool")
 
@@ -68,7 +69,7 @@ local function append_wrapped(result, text, first_prefix, continuation_prefix, g
 end
 
 local function append_response(result, text, first_prefix, first_prefix_group)
-  local line_list = vim.split(tostring(text or ""), "\n", { plain = true })
+  local line_list = vim.split(markdown_text.normalize_math(tostring(text or "")), "\n", { plain = true })
   if #line_list == 0 then line_list = { "" } end
   local indentation = string.rep(" ", vim.fn.strdisplaywidth(first_prefix or "  "))
   for line_index, line in ipairs(line_list) do
