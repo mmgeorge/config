@@ -202,6 +202,46 @@ local function append_active_tool_preview(result, tool, content_width)
   end
 end
 
+---@param result table
+---@param tree table
+---@param options { indent: string, label: string, suffix?: string, kind: string, interaction: table, expand_key: string }
+---@return integer
+local function append_change_summary(result, tree, options)
+  local count_text = ("%d %s"):format(tree.file_count, tree.file_count == 1 and "file" or "files")
+  local prefix = options.indent .. "▸ " .. options.label .. " " .. count_text
+  local added_text = ("+%d"):format(tree.added)
+  local removed_text = ("-%d"):format(tree.removed)
+  local line = prefix .. " " .. added_text .. " " .. removed_text .. (options.suffix or "")
+  local summary_line = #result.lines + 1
+  result.lines[summary_line] = line
+  result.rows[summary_line] = {
+    kind = options.kind,
+    interaction = options.interaction,
+    expand_key = options.expand_key,
+    node_id = options.expand_key,
+  }
+  local added_first = #prefix + 1
+  local removed_first = added_first + #added_text + 1
+  result.highlights[#result.highlights + 1] = {
+    line = summary_line,
+    first = added_first,
+    last = added_first + #added_text,
+    group = "DiffReviewAddRange",
+  }
+  result.highlights[#result.highlights + 1] = {
+    line = summary_line,
+    first = removed_first,
+    last = removed_first + #removed_text,
+    group = "DiffReviewDeleteRange",
+  }
+  if result.expanded[options.expand_key] then append_prebuilt_diff(result, tree) end
+  for row = summary_line + 1, #result.lines do
+    result.rows[row] = result.rows[row] or { kind = options.kind, interaction = options.interaction }
+    result.rows[row].node_id = options.expand_key
+  end
+  return summary_line
+end
+
 local function append_completed_thought(result, interaction, thought, thought_index, options)
   local thought_key = ("interaction:%s:thought:%s"):format(interaction.id or interaction.ordinal, thought.id or thought_index)
   local first = #result.lines + 1
@@ -243,16 +283,14 @@ local function append_completed_thought(result, interaction, thought, thought_in
     expanded = result.expanded,
   })
   if tree.file_count > 0 then
-    local changed_line = #result.lines + 1
-    result.lines[#result.lines + 1] = ("  ▸ Changed %d %s +%d -%d"):format(
-      tree.file_count,
-      tree.file_count == 1 and "file" or "files",
-      tree.added,
-      tree.removed
-    )
-    result.rows[#result.lines] = { kind = "thought_changes", thought = thought, interaction = interaction }
-    result.rows[changed_line].expand_key = thought_key .. ":changes"
-    if result.expanded[thought_key .. ":changes"] then append_prebuilt_diff(result, tree) end
+    local changed_line = append_change_summary(result, tree, {
+      indent = "  ",
+      label = "Changed",
+      kind = "thought_changes",
+      interaction = interaction,
+      expand_key = thought_key .. ":changes",
+    })
+    result.rows[changed_line].thought = thought
   end
 end
 
@@ -433,29 +471,43 @@ local function append_interaction(result, interaction, options, agent_by_id)
     end
   end
   if complete then
-    local aggregate = diff_tree.build(interaction.diff_text, {
+    local attributed_key = ("interaction:%s:attributed"):format(interaction.id or interaction.ordinal)
+    local attributed = diff_tree.build(interaction.attributed_diff_text, {
       indent = 2,
-      key_prefix = ("interaction:%s:aggregate"):format(interaction.id or interaction.ordinal),
+      key_prefix = attributed_key,
       interaction = interaction,
       cwd = options.cwd,
       on_update = options.on_diff_update,
       expanded = result.expanded,
     })
-    if aggregate.file_count > 0 then
-      local changed_line = #result.lines + 1
-      result.lines[#result.lines + 1] = ("▸ Changed %d %s +%d -%d"):format(
-        aggregate.file_count,
-        aggregate.file_count == 1 and "file" or "files",
-        aggregate.added,
-        aggregate.removed
-      )
-      result.rows[#result.lines] = { kind = "changes", interaction = interaction }
-      local aggregate_key = ("interaction:%s:aggregate"):format(interaction.id or interaction.ordinal)
-      result.rows[changed_line].expand_key = aggregate_key
-      if result.expanded[aggregate_key] then append_prebuilt_diff(result, aggregate) end
-      for line = changed_line, #result.lines do
-        result.rows[line] = result.rows[line] or { kind = "changes", interaction = interaction }
-        result.rows[line].node_id = aggregate_key
+    if attributed.file_count > 0 then
+      append_change_summary(result, attributed, {
+        indent = "",
+        label = "Changed",
+        suffix = interaction.attributed_matches_checkpoint and " · checkpoint matched" or nil,
+        kind = "attributed_changes",
+        interaction = interaction,
+        expand_key = attributed_key,
+      })
+    end
+    if not interaction.attributed_matches_checkpoint then
+      local checkpoint_key = ("interaction:%s:checkpoint"):format(interaction.id or interaction.ordinal)
+      local checkpoint = diff_tree.build(interaction.checkpoint_diff_text, {
+        indent = 2,
+        key_prefix = checkpoint_key,
+        interaction = interaction,
+        cwd = options.cwd,
+        on_update = options.on_diff_update,
+        expanded = result.expanded,
+      })
+      if checkpoint.file_count > 0 then
+        append_change_summary(result, checkpoint, {
+          indent = "",
+          label = "Checkpoint total:",
+          kind = "checkpoint_changes",
+          interaction = interaction,
+          expand_key = checkpoint_key,
+        })
       end
     end
     if deferred_response then
@@ -495,7 +547,9 @@ local function aggregate_execution(entry)
       aggregate.node_list[#aggregate.node_list + 1] = node
     end
     aggregate.task = interaction.task or aggregate.task
-    aggregate.diff_text = interaction.diff_text or aggregate.diff_text
+    aggregate.attributed_diff_text = interaction.attributed_diff_text or aggregate.attributed_diff_text
+    aggregate.checkpoint_diff_text = interaction.checkpoint_diff_text or aggregate.checkpoint_diff_text
+    aggregate.attributed_matches_checkpoint = interaction.attributed_matches_checkpoint == true
   end
   return aggregate
 end

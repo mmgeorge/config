@@ -135,6 +135,15 @@ local active_session = {
   native_fork = false,
 }
 
+local interaction_diff_text = table.concat({
+  "diff --git a/demo.lua b/demo.lua",
+  "--- a/demo.lua",
+  "+++ b/demo.lua",
+  "@@ -1,1 +1,1 @@",
+  "-return 'before'",
+  "+return 'after'",
+}, "\n")
+
 local interaction = {
   id = "interaction-one",
   session_id = active_session.id,
@@ -143,14 +152,9 @@ local interaction = {
   state = "complete",
   checkpoint_before = "before",
   checkpoint_after = "after",
-  diff_text = table.concat({
-    "diff --git a/demo.lua b/demo.lua",
-    "--- a/demo.lua",
-    "+++ b/demo.lua",
-    "@@ -1,1 +1,1 @@",
-    "-return 'before'",
-    "+return 'after'",
-  }, "\n"),
+  attributed_diff_text = interaction_diff_text,
+  checkpoint_diff_text = interaction_diff_text,
+  attributed_matches_checkpoint = true,
   comment = {
     {
       id = "comment-one",
@@ -2085,7 +2089,9 @@ local ok, failure = pcall(function()
     prompt = "change the renderer",
     state = "complete",
     duration_ms = 1,
-    diff_text = diff_text,
+    attributed_diff_text = diff_text,
+    checkpoint_diff_text = diff_text,
+    attributed_matches_checkpoint = true,
     thought = { {
       id = "thought-diff:thought:1",
       text = "Updating the renderer.",
@@ -2099,30 +2105,99 @@ local ok, failure = pcall(function()
     "thought-level file rows should nest beneath their change summary")
   assert_true(thought_diff_render.lines[thought_change_line + 2]:match("^    @@") ~= nil,
     "thought-level hunk rows should align with their nested file header")
+  assert_true(vim.iter(thought_diff_render.highlights):any(function(highlight)
+    return highlight.line == thought_change_line and highlight.group == "DiffReviewAddRange"
+      and thought_diff_render.lines[highlight.line]:sub(highlight.first + 1, highlight.last) == "+1"
+  end), "thought change summaries should highlight additions")
+  assert_true(vim.iter(thought_diff_render.highlights):any(function(highlight)
+    return highlight.line == thought_change_line and highlight.group == "DiffReviewDeleteRange"
+      and thought_diff_render.lines[highlight.line]:sub(highlight.first + 1, highlight.last) == "-1"
+  end), "thought change summaries should highlight deletions")
   local aggregate_diff_render = interaction_renderer.build({ {
     id = "aggregate-diff",
     prompt = "change the renderer",
     state = "complete",
     duration_ms = 1,
-    diff_text = diff_text,
+    attributed_diff_text = diff_text,
+    checkpoint_diff_text = diff_text,
+    attributed_matches_checkpoint = true,
     thought = {},
   } }, { expanded = {
-    ["interaction:aggregate-diff:aggregate"] = true,
-    ["interaction:aggregate-diff:aggregate:file:1"] = true,
-    ["interaction:aggregate-diff:aggregate:file:1:hunk:1"] = true,
+    ["interaction:aggregate-diff:attributed"] = true,
+    ["interaction:aggregate-diff:attributed:file:1"] = true,
+    ["interaction:aggregate-diff:attributed:file:1:hunk:1"] = true,
   } })
-  local aggregate_change_line = line_number(aggregate_diff_render.lines, "▸ Changed 1 file +1 -1")
+  local aggregate_change_line = line_number(
+    aggregate_diff_render.lines,
+    "▸ Changed 1 file +1 -1 · checkpoint matched"
+  )
   assert_true(aggregate_change_line ~= nil, "aggregate change summaries should remain top-level nodes")
   assert_true(aggregate_diff_render.lines[aggregate_change_line + 1]:match("^  Modified") ~= nil,
     "aggregate file rows should nest one level below their change summary")
   assert_true(aggregate_diff_render.lines[aggregate_change_line + 2]:match("^  @@") ~= nil,
     "aggregate hunk rows should align with their nested file header")
+  assert_true(vim.iter(aggregate_diff_render.highlights):any(function(highlight)
+    return highlight.line == aggregate_change_line and highlight.group == "DiffReviewAddRange"
+      and aggregate_diff_render.lines[highlight.line]:sub(highlight.first + 1, highlight.last) == "+1"
+  end), "matched aggregate summaries should highlight additions")
+  assert_true(vim.iter(aggregate_diff_render.highlights):any(function(highlight)
+    return highlight.line == aggregate_change_line and highlight.group == "DiffReviewDeleteRange"
+      and aggregate_diff_render.lines[highlight.line]:sub(highlight.first + 1, highlight.last) == "-1"
+  end), "matched aggregate summaries should highlight deletions")
+  local external_diff_text = table.concat({
+    "diff --git a/external.lua b/external.lua",
+    "--- /dev/null",
+    "+++ b/external.lua",
+    "@@ -0,0 +1,1 @@",
+    "+external",
+  }, "\n")
+  local split_diff_render = interaction_renderer.build({ {
+    id = "split-diff",
+    prompt = "change the renderer",
+    state = "complete",
+    duration_ms = 1,
+    attributed_diff_text = diff_text,
+    checkpoint_diff_text = diff_text .. "\n" .. external_diff_text,
+    attributed_matches_checkpoint = false,
+    thought = {},
+  } }, { expanded = {} })
+  local attributed_change_line = line_number(split_diff_render.lines, "▸ Changed 1 file +1 -1")
+  local checkpoint_change_line = line_number(split_diff_render.lines, "▸ Checkpoint total: 2 files +2 -1")
+  assert_true(attributed_change_line ~= nil, "divergent interactions should retain the attributed summary")
+  assert_true(checkpoint_change_line ~= nil, "divergent interactions should render the checkpoint total")
+  assert_equals(split_diff_render.rows[attributed_change_line].expand_key, "interaction:split-diff:attributed",
+    "attributed summaries should own an independent expansion key")
+  assert_equals(split_diff_render.rows[checkpoint_change_line].expand_key, "interaction:split-diff:checkpoint",
+    "checkpoint summaries should own an independent expansion key")
+  assert_true(vim.iter(split_diff_render.highlights):any(function(highlight)
+    return highlight.line == checkpoint_change_line and highlight.group == "DiffReviewAddRange"
+      and split_diff_render.lines[highlight.line]:sub(highlight.first + 1, highlight.last) == "+2"
+  end), "checkpoint summaries should highlight additions")
+  assert_true(vim.iter(split_diff_render.highlights):any(function(highlight)
+    return highlight.line == checkpoint_change_line and highlight.group == "DiffReviewDeleteRange"
+      and split_diff_render.lines[highlight.line]:sub(highlight.first + 1, highlight.last) == "-1"
+  end), "checkpoint summaries should highlight deletions")
+  local checkpoint_only_render = interaction_renderer.build({ {
+    id = "checkpoint-only",
+    prompt = "run the formatter",
+    state = "complete",
+    duration_ms = 1,
+    checkpoint_diff_text = external_diff_text,
+    attributed_matches_checkpoint = false,
+    thought = {},
+  } }, { expanded = {} })
+  assert_true(line_number(checkpoint_only_render.lines, "▸ Changed 1 file +1 -0") == nil,
+    "interactions without provider attribution should not claim attributed changes")
+  assert_true(line_number(checkpoint_only_render.lines, "▸ Checkpoint total: 1 file +1 -0") ~= nil,
+    "interactions without provider attribution should retain the checkpoint total")
   local collapsed_aggregate_render = interaction_renderer.build({ {
     id = "aggregate-diff",
     prompt = "change the renderer",
     state = "complete",
     duration_ms = 1,
-    diff_text = diff_text,
+    attributed_diff_text = diff_text,
+    checkpoint_diff_text = diff_text,
+    attributed_matches_checkpoint = true,
     thought = {},
     response = "Done",
   } }, { expanded = {} })
@@ -2154,12 +2229,12 @@ local ok, failure = pcall(function()
   assert_true(not vim.iter(collapsed_extmark_list):any(function(extmark)
     local details = extmark[4]
     local group = tostring(details.hl_group or details.line_hl_group or "")
-    return group:find("DiffReviewAdd", 1, true) or group:find("DiffReviewDelete", 1, true)
+    return group:find("DiffReviewAddBg", 1, true) or group:find("DiffReviewDeleteBg", 1, true)
   end), "collapsing a Harness diff should remove old diff colors before suffix rows relocate")
   assert_equals(vim.api.nvim_buf_get_lines(transaction_buf, -2, -1, false)[1], "  Done",
     "collapsing a Harness diff should leave the response row uncorrupted")
   local duplicate_thought_key = "interaction:duplicate-diff:thought:duplicate-thought"
-  local duplicate_aggregate_key = "interaction:duplicate-diff:aggregate"
+  local duplicate_aggregate_key = "interaction:duplicate-diff:attributed"
   local duplicate_expanded = {
     ["interaction:duplicate-diff:thoughts"] = true,
     [duplicate_thought_key] = true,
@@ -2175,7 +2250,9 @@ local ok, failure = pcall(function()
     prompt = "change the renderer",
     state = "complete",
     duration_ms = 1,
-    diff_text = diff_text,
+    attributed_diff_text = diff_text,
+    checkpoint_diff_text = diff_text,
+    attributed_matches_checkpoint = true,
     thought = { {
       id = "duplicate-thought",
       text = "Updating the renderer.",

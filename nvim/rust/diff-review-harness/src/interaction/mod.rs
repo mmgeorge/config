@@ -6,6 +6,7 @@ mod node;
 mod task;
 mod timeline;
 
+pub use change::ProviderChangeIndex;
 pub use node::{
     ActiveWait, AgentReference, InteractionNode, MainSegment, SegmentState, SteeringPrompt,
 };
@@ -42,7 +43,9 @@ pub struct InteractionRecord {
     pub state: InteractionState,
     pub checkpoint_before: Option<String>,
     pub checkpoint_after: Option<String>,
-    pub diff_text: Option<String>,
+    pub attributed_diff_text: Option<String>,
+    pub checkpoint_diff_text: Option<String>,
+    pub attributed_matches_checkpoint: bool,
     pub created_at_ms: i64,
     pub completed_at_ms: Option<i64>,
     pub node_list: Vec<InteractionNode>,
@@ -191,7 +194,9 @@ mod test {
             state: InteractionState::Running,
             checkpoint_before: None,
             checkpoint_after: None,
-            diff_text: None,
+            attributed_diff_text: None,
+            checkpoint_diff_text: None,
+            attributed_matches_checkpoint: false,
             created_at_ms: 1,
             completed_at_ms: None,
             node_list: Vec::new(),

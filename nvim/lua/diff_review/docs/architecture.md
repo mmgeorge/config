@@ -1024,8 +1024,23 @@ checkpoint when the interaction completes, fails, or cancels. Steering and autom
 continuations reuse that baseline without intermediate Git scans. The terminal checkpoint uses
 `git ls-files --cached --others --exclude-standard`, so the aggregate interaction diff includes
 tracked files and nonignored untracked files while excluding ignored build output at any depth.
-This aggregate remains the rollback and cancellation-divergence authority. It intentionally
-includes command and formatter effects that do not belong to an individual thought.
+`GitCheckpoint` owns capture and restoration directly. The stored `CheckpointRecord` represents
+captured data rather than a second snapshot implementation.
+
+At terminal capture, `ProviderChangeIndex` collects normalized paths from successful structured
+file changes in the main timeline and every referenced child-agent turn. The checkpoint comparer
+then produces an attributed diff restricted to those paths and a checkpoint diff across every
+path. Because both use the same baseline-to-terminal content comparison, repeated edits,
+overlapping thoughts, and reversions resolve to one final canonical patch instead of summed
+provider hunks. Equal patches render one interaction-level `Changed … · checkpoint matched`
+node. Divergent patches render independent `Changed …` and `Checkpoint total: …` nodes. The
+per-thought provider trees remain available at their original timeline positions.
+
+The checkpoint total remains the rollback and cancellation-divergence authority. It intentionally
+includes command, formatter, and external-process effects that do not belong to a structured
+provider file change. A concurrent unattributed edit to a provider-reported path cannot be
+separated without operating-system provenance, so that path remains attributed while the complete
+checkpoint still preserves the exact rollback boundary.
 
 The Rust `TimelineProjector` combines interactions, plan lifecycle records, and accepted-plan
 executions into one ordered presentation. The Lua controller renders that projection instead of

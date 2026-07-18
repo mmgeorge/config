@@ -1,5 +1,50 @@
 use crate::backend::{ProviderChangeKind, ProviderFileChange};
-use crate::interaction::CompletedTool;
+use crate::interaction::{CompletedTool, InteractionNode, InteractionRecord};
+use std::collections::BTreeSet;
+
+/// Stores normalized paths from successful provider-owned file changes.
+#[derive(Default)]
+pub struct ProviderChangeIndex {
+    path_set: BTreeSet<String>,
+}
+
+impl ProviderChangeIndex {
+    /// Merge successful provider file changes from one interaction timeline.
+    pub fn record(&mut self, interaction: &InteractionRecord) {
+        for node in &interaction.node_list {
+            let InteractionNode::MainSegment { segment } = node else {
+                continue;
+            };
+            for thought in &segment.thought {
+                self.record_tool_list(&thought.tool);
+            }
+        }
+    }
+
+    fn record_tool_list(&mut self, tool_list: &[CompletedTool]) {
+        for tool in tool_list {
+            if !successful_file_change(tool) {
+                continue;
+            }
+            for change in &tool.change.file {
+                self.path_set.insert(normalize_path(&change.path));
+                if let Some(move_path) = change.move_path.as_deref() {
+                    self.path_set.insert(normalize_path(move_path));
+                }
+            }
+        }
+    }
+
+    /// Resolve normalized paths attributed to successful provider changes.
+    pub fn paths(&self) -> &BTreeSet<String> {
+        &self.path_set
+    }
+
+    /// Validate whether the provider attributed any path to this interaction.
+    pub fn is_empty(&self) -> bool {
+        self.path_set.is_empty()
+    }
+}
 
 #[derive(Default)]
 struct FileProjection {
@@ -16,7 +61,7 @@ impl ProviderDiffBuilder {
     pub fn build(tool_list: &[CompletedTool]) -> Option<String> {
         let mut projection_list = Vec::<FileProjection>::new();
         for tool in tool_list {
-            if tool.kind != "file_change" || tool.failed || !successful_status(&tool.status) {
+            if !successful_file_change(tool) {
                 continue;
             }
             for change in &tool.change.file {
@@ -29,6 +74,10 @@ impl ProviderDiffBuilder {
         }
         (!output.is_empty()).then_some(output)
     }
+}
+
+fn successful_file_change(tool: &CompletedTool) -> bool {
+    tool.kind == "file_change" && !tool.failed && successful_status(&tool.status)
 }
 
 fn successful_status(status: &str) -> bool {
@@ -174,7 +223,7 @@ fn render_projection(output: &mut String, projection: FileProjection) {
 
 #[cfg(test)]
 mod test {
-    use super::ProviderDiffBuilder;
+    use super::{ProviderChangeIndex, ProviderDiffBuilder};
     use crate::backend::{ProviderChangeKind, ProviderChangeSet, ProviderFileChange};
     use crate::interaction::CompletedTool;
 
@@ -245,6 +294,46 @@ mod test {
         };
 
         assert!(ProviderDiffBuilder::build(&[failed, command]).is_none());
+    }
+
+    #[test]
+    fn indexes_successful_provider_paths_and_move_destinations() {
+        let completed = file_tool(
+            "completed",
+            "completed",
+            vec![
+                ProviderFileChange {
+                    path: "a/src\\main.rs".into(),
+                    move_path: None,
+                    kind: ProviderChangeKind::Update,
+                    diff: "@@ -1 +1 @@\n-old\n+new".into(),
+                },
+                ProviderFileChange {
+                    path: "b/src/old.rs".into(),
+                    move_path: Some("b/src/new.rs".into()),
+                    kind: ProviderChangeKind::Move,
+                    diff: String::new(),
+                },
+            ],
+        );
+        let failed = file_tool(
+            "failed",
+            "failed",
+            vec![ProviderFileChange {
+                path: "failed.rs".into(),
+                move_path: None,
+                kind: ProviderChangeKind::Add,
+                diff: "failed".into(),
+            }],
+        );
+        let mut index = ProviderChangeIndex::default();
+
+        index.record_tool_list(&[completed, failed]);
+
+        assert_eq!(
+            index.paths().iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["src/main.rs", "src/new.rs", "src/old.rs"]
+        );
     }
 
     #[test]

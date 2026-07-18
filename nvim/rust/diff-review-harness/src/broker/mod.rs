@@ -7,11 +7,12 @@ use crate::backend::{
     Backend, BackendCapability, BackendEvent, BackendEventSink, BackendLaunch, BackendRequest,
     PromptMode,
 };
-use crate::checkpoint::{GitCheckpoint, WorkspaceSnapshot, checkpoint_diff};
+use crate::checkpoint::{GitCheckpoint, checkpoint_diff, checkpoint_diff_for_paths};
 use crate::goal::{ContinuationDecision, GoalRecord, GoalState};
 use crate::interaction::{
     ActiveThoughtUpdate, ActiveWait, CompletedThought, InteractionComment, InteractionKind,
-    InteractionRecord, InteractionState, TaskTracker, TimelineReducer,
+    InteractionNode, InteractionRecord, InteractionState, ProviderChangeIndex, TaskTracker,
+    TimelineReducer,
 };
 use crate::permissions::store::PermissionStore;
 use crate::plan::{
@@ -29,7 +30,7 @@ use crate::workspace::WorkspaceKind;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, RwLock,
@@ -750,7 +751,9 @@ impl HarnessBroker {
             state: InteractionState::Running,
             checkpoint_before: None,
             checkpoint_after: None,
-            diff_text: None,
+            attributed_diff_text: None,
+            checkpoint_diff_text: None,
+            attributed_matches_checkpoint: false,
             created_at_ms: now_ms,
             completed_at_ms: None,
             node_list: Vec::new(),
@@ -872,7 +875,7 @@ impl HarnessBroker {
                 .transpose()?
                 .flatten()
                 .context("child interaction before checkpoint is missing")?;
-            interaction.diff_text = Some(checkpoint_diff(&self.store, &before, &checkpoint)?);
+            self.populate_interaction_change_diffs(&mut interaction, &before, &checkpoint)?;
             interaction.checkpoint_after = Some(checkpoint.id.clone());
             self.store.save_checkpoint(&checkpoint)?;
         }
@@ -999,7 +1002,9 @@ impl HarnessBroker {
                     state: InteractionState::Running,
                     checkpoint_before: None,
                     checkpoint_after: None,
-                    diff_text: None,
+                    attributed_diff_text: None,
+                    checkpoint_diff_text: None,
+                    attributed_matches_checkpoint: false,
                     created_at_ms: now_ms,
                     completed_at_ms: None,
                     node_list: Vec::new(),
@@ -2355,9 +2360,55 @@ impl HarnessBroker {
             .transpose()?
             .flatten()
             .context("interaction before checkpoint is missing")?;
-        interaction.diff_text = Some(checkpoint_diff(&self.store, &before, &checkpoint)?);
+        self.populate_interaction_change_diffs(interaction, &before, &checkpoint)?;
         self.store.save_checkpoint(&checkpoint)?;
         Ok(Some(checkpoint.id))
+    }
+
+    fn populate_interaction_change_diffs(
+        &self,
+        interaction: &mut InteractionRecord,
+        before: &crate::checkpoint::CheckpointRecord,
+        after: &crate::checkpoint::CheckpointRecord,
+    ) -> Result<()> {
+        let change_index = self.interaction_provider_change_index(interaction)?;
+        let checkpoint_diff_text = checkpoint_diff(&self.store, before, after)?;
+        let attributed_diff_text = if change_index.is_empty() {
+            None
+        } else {
+            Some(checkpoint_diff_for_paths(
+                &self.store,
+                before,
+                after,
+                change_index.paths(),
+            )?)
+        };
+        interaction.attributed_matches_checkpoint = attributed_diff_text
+            .as_deref()
+            .is_some_and(|diff_text| diff_text == checkpoint_diff_text);
+        interaction.attributed_diff_text = attributed_diff_text;
+        interaction.checkpoint_diff_text = Some(checkpoint_diff_text);
+        Ok(())
+    }
+
+    fn interaction_provider_change_index(
+        &self,
+        interaction: &InteractionRecord,
+    ) -> Result<ProviderChangeIndex> {
+        let mut index = ProviderChangeIndex::default();
+        index.record(interaction);
+        let mut pending_run_id = referenced_agent_run_id_list(interaction);
+        let mut visited_run_id = HashSet::new();
+        while let Some(run_id) = pending_run_id.pop() {
+            if !visited_run_id.insert(run_id.clone()) {
+                continue;
+            }
+            for turn in self.store.list_agent_turn(&run_id)? {
+                index.record(&turn.interaction);
+                pending_run_id.extend(referenced_agent_run_id_list(&turn.interaction));
+            }
+        }
+        Ok(index)
     }
 
     async fn process_backend_event(
@@ -2703,7 +2754,9 @@ impl HarnessBroker {
                 state: InteractionState::Running,
                 checkpoint_before: None,
                 checkpoint_after: None,
-                diff_text: None,
+                attributed_diff_text: None,
+                checkpoint_diff_text: None,
+                attributed_matches_checkpoint: false,
                 created_at_ms: now_ms,
                 completed_at_ms: None,
                 node_list: Vec::new(),
@@ -3307,7 +3360,7 @@ impl HarnessBroker {
             "Address this review of interaction {}. Apply every requested change while preserving unrelated work.\n\nOriginal prompt:\n{}\n\nRecorded diff:\n{}\n\nReview comments:\n{}",
             interaction.ordinal,
             interaction.prompt,
-            interaction.diff_text.unwrap_or_default(),
+            interaction.checkpoint_diff_text.unwrap_or_default(),
             serde_json::to_string_pretty(&comment)?
         );
         self.run_interaction(
@@ -3847,6 +3900,17 @@ fn acquire_lease(session: &mut HarnessSession, client_id: &str, now_ms: i64) -> 
 }
 
 /// Load durable child runs while removing placeholders created by legacy lifecycle parsing.
+fn referenced_agent_run_id_list(interaction: &InteractionRecord) -> Vec<String> {
+    interaction
+        .node_list
+        .iter()
+        .filter_map(|node| match node {
+            InteractionNode::AgentReference { agent } => Some(agent.agent_run_id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 fn load_agent_registry(store: &SqliteStore, session_id: &str) -> Result<AgentRegistry> {
     Ok(AgentRegistry::from_run_list(
         store.list_agent_run(session_id)?,
@@ -3918,6 +3982,37 @@ fn default_goal_max_turns() -> u32 {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    fn completed_interaction(
+        id: &str,
+        session_id: &str,
+        node_list: Vec<InteractionNode>,
+    ) -> InteractionRecord {
+        InteractionRecord {
+            id: id.into(),
+            session_id: session_id.into(),
+            ordinal: 1,
+            prompt: "test interaction".into(),
+            kind: InteractionKind::Chat,
+            plan_id: None,
+            execution_id: None,
+            state: InteractionState::Complete,
+            checkpoint_before: None,
+            checkpoint_after: None,
+            attributed_diff_text: None,
+            checkpoint_diff_text: None,
+            attributed_matches_checkpoint: false,
+            created_at_ms: 1,
+            completed_at_ms: Some(2),
+            node_list,
+            awaiting_input: false,
+            elicitation: None,
+            duration_ms: 1,
+            token_count: None,
+            comment: Vec::new(),
+            task: None,
+        }
+    }
 
     struct FailingBackend;
 
@@ -5677,7 +5772,7 @@ mod test {
         assert!(interaction[0].checkpoint_after.is_some());
         assert!(
             interaction[0]
-                .diff_text
+                .checkpoint_diff_text
                 .as_deref()
                 .is_some_and(|diff| diff.contains("failed/deep/write.txt"))
         );
@@ -5870,17 +5965,179 @@ mod test {
         assert!(!thought_diff.contains("target/generated/deep/artifact.txt"));
         assert!(
             interaction[0]
-                .diff_text
+                .checkpoint_diff_text
                 .as_deref()
                 .is_some_and(|diff| diff.contains("apps/new/deep/module/lib.rs"))
         );
-        let interaction_diff = interaction[0].diff_text.as_deref().unwrap();
+        let attributed_diff = interaction[0]
+            .attributed_diff_text
+            .as_deref()
+            .expect("attributed interaction diff");
+        assert!(attributed_diff.contains("seed.txt"));
+        assert!(!attributed_diff.contains("apps/new/deep/module/lib.rs"));
+        assert!(!interaction[0].attributed_matches_checkpoint);
+        let interaction_diff = interaction[0].checkpoint_diff_text.as_deref().unwrap();
         assert!(interaction_diff.contains("seed.txt"));
         assert!(!interaction_diff.contains("target/generated/deep/artifact.txt"));
         assert!(
             segment_list.iter().any(|segment| {
                 segment.response.as_deref() == Some("The nested module is ready.")
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn matching_provider_and_checkpoint_changes_share_one_canonical_diff() {
+        let repository = repository();
+        std::fs::write(repository.path().join(".gitignore"), "apps/\ntarget/\n").unwrap();
+        git(repository.path(), &["add", ".gitignore"]);
+        git(
+            repository.path(),
+            &["commit", "-qm", "ignore generated output"],
+        );
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = HarnessBroker::initialize_with_clock(
+            InitializeRequest {
+                data_root: data.path().to_string_lossy().into_owned(),
+                permission_file: None,
+                workspace: repository.path().to_string_lossy().into_owned(),
+                client_id: "matching-interaction-diff-test".into(),
+                backend: BackendLaunch {
+                    kind: "mock".into(),
+                    command: vec!["mock".into()],
+                },
+                model: "mock-model".into(),
+                effort: "low".into(),
+                session_id: None,
+                goal_max_turns: 20,
+                lease_conflict_action: None,
+            },
+            Box::new(FixedClock(300)),
+        )
+        .unwrap();
+        broker.backend = Arc::new(NestedWriteBackend);
+
+        let result = broker
+            .dispatch(BrokerRequest {
+                id: 1,
+                method: "prompt.submit".into(),
+                params: json!({ "text": "change the seed" }),
+            })
+            .await;
+
+        assert!(
+            result.response.error.is_none(),
+            "{:?}",
+            result.response.error
+        );
+        let interaction = broker.store.list_interaction(&broker.session.id).unwrap();
+        assert_eq!(interaction.len(), 1);
+        assert!(interaction[0].attributed_matches_checkpoint);
+        assert_eq!(
+            interaction[0].attributed_diff_text,
+            interaction[0].checkpoint_diff_text
+        );
+    }
+
+    #[test]
+    fn provider_change_index_includes_referenced_child_turns() {
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = HarnessBroker::initialize_with_clock(
+            InitializeRequest {
+                data_root: data.path().to_string_lossy().into_owned(),
+                permission_file: None,
+                workspace: repository.path().to_string_lossy().into_owned(),
+                client_id: "child-attribution-test".into(),
+                backend: BackendLaunch {
+                    kind: "mock".into(),
+                    command: vec!["mock".into()],
+                },
+                model: "mock-model".into(),
+                effort: "low".into(),
+                session_id: None,
+                goal_max_turns: 20,
+                lease_conflict_action: None,
+            },
+            Box::new(FixedClock(300)),
+        )
+        .unwrap();
+        let child_run_id = "child-run";
+        let child_interaction = completed_interaction(
+            "child-interaction",
+            &broker.session.id,
+            vec![InteractionNode::MainSegment {
+                segment: Box::new(crate::interaction::MainSegment {
+                    id: "child-segment".into(),
+                    state: crate::interaction::SegmentState::Complete,
+                    started_at_ms: 1,
+                    completed_at_ms: Some(2),
+                    duration_ms: 1,
+                    token_count: None,
+                    spawned_agent_count: 0,
+                    thought: vec![CompletedThought {
+                        id: "child-thought".into(),
+                        text: "Editing the child file.".into(),
+                        synthetic: false,
+                        tool: vec![crate::interaction::CompletedTool {
+                            id: "child-change".into(),
+                            kind: "file_change".into(),
+                            title: "file changes".into(),
+                            output: String::new(),
+                            status: "completed".into(),
+                            failed: false,
+                            change: crate::backend::ProviderChangeSet {
+                                file: vec![crate::backend::ProviderFileChange {
+                                    path: "child.rs".into(),
+                                    move_path: None,
+                                    kind: crate::backend::ProviderChangeKind::Add,
+                                    diff: "child".into(),
+                                }],
+                            },
+                        }],
+                        started_at_ms: 1,
+                        completed_at_ms: 2,
+                        diff_text: None,
+                        task_id: None,
+                    }],
+                    active: None,
+                    response: None,
+                }),
+            }],
+        );
+        let mut child_run = AgentRun::pending(&broker.session.id, "explorer", "edit child", 1);
+        child_run.id = child_run_id.into();
+        child_run.parent_interaction_id = Some("parent-interaction".into());
+        broker.store.save_agent_run(&child_run).unwrap();
+        broker
+            .store
+            .save_agent_turn(&AgentTurnRecord {
+                id: "child-turn".into(),
+                session_id: broker.session.id.clone(),
+                agent_run_id: child_run_id.into(),
+                ordinal: 1,
+                interaction: child_interaction,
+            })
+            .unwrap();
+        let parent_interaction = completed_interaction(
+            "parent-interaction",
+            &broker.session.id,
+            vec![InteractionNode::AgentReference {
+                agent: crate::interaction::AgentReference {
+                    id: "child-reference".into(),
+                    agent_run_id: child_run_id.into(),
+                    created_at_ms: 1,
+                },
+            }],
+        );
+
+        let index = broker
+            .interaction_provider_change_index(&parent_interaction)
+            .unwrap();
+
+        assert_eq!(
+            index.paths().iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["child.rs"]
         );
     }
 

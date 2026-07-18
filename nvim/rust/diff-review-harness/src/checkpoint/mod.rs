@@ -24,25 +24,6 @@ pub struct CheckpointRecord {
     pub created_at_ms: i64,
 }
 
-/// Defines workspace snapshot operations consumed by interaction tracking.
-pub trait WorkspaceSnapshot {
-    /// Capture tracked and nonignored untracked files into durable object storage.
-    fn capture(
-        &self,
-        store: &SqliteStore,
-        session_id: &str,
-        now_ms: i64,
-    ) -> Result<CheckpointRecord>;
-
-    /// Restore a target checkpoint after validating the expected current checkpoint.
-    fn restore(
-        &self,
-        store: &SqliteStore,
-        expected_current: &CheckpointRecord,
-        target: &CheckpointRecord,
-    ) -> Result<()>;
-}
-
 /// Owns Git-backed worktree checkpoint capture and safe rollback.
 pub struct GitCheckpoint {
     workspace: PathBuf,
@@ -96,8 +77,9 @@ impl GitCheckpoint {
     }
 }
 
-impl WorkspaceSnapshot for GitCheckpoint {
-    fn capture(
+impl GitCheckpoint {
+    /// Build one checkpoint from tracked and nonignored untracked files.
+    pub fn capture(
         &self,
         store: &SqliteStore,
         session_id: &str,
@@ -143,7 +125,8 @@ impl WorkspaceSnapshot for GitCheckpoint {
         })
     }
 
-    fn restore(
+    /// Write a target checkpoint after validating the expected current checkpoint.
+    pub fn restore(
         &self,
         store: &SqliteStore,
         expected_current: &CheckpointRecord,
@@ -220,6 +203,25 @@ pub fn checkpoint_diff(
     before: &CheckpointRecord,
     after: &CheckpointRecord,
 ) -> Result<String> {
+    checkpoint_diff_matching(store, before, after, None)
+}
+
+/// Build the exact per-interaction diff for one selected set of normalized paths.
+pub fn checkpoint_diff_for_paths(
+    store: &SqliteStore,
+    before: &CheckpointRecord,
+    after: &CheckpointRecord,
+    path_set: &std::collections::BTreeSet<String>,
+) -> Result<String> {
+    checkpoint_diff_matching(store, before, after, Some(path_set))
+}
+
+fn checkpoint_diff_matching(
+    store: &SqliteStore,
+    before: &CheckpointRecord,
+    after: &CheckpointRecord,
+    selected_path_set: Option<&std::collections::BTreeSet<String>>,
+) -> Result<String> {
     let before_file: BTreeMap<_, _> = before
         .file
         .iter()
@@ -235,6 +237,9 @@ pub fn checkpoint_diff(
     path_set.extend(after_file.keys().copied());
     let mut output = String::new();
     for path in path_set {
+        if selected_path_set.is_some_and(|selected| !selected.contains(path)) {
+            continue;
+        }
         let before_id = before_file.get(path).copied();
         let after_id = after_file.get(path).copied();
         if before_id == after_id {
@@ -281,6 +286,7 @@ pub fn checkpoint_diff(
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::collections::BTreeSet;
 
     fn git(workspace: &Path, args: &[&str]) {
         let status = std::process::Command::new("git")
@@ -345,6 +351,29 @@ mod test {
                 .path()
                 .join("target/generated/deep/artifact.txt")
                 .exists()
+        );
+    }
+
+    #[test]
+    fn diffs_only_selected_checkpoint_paths() {
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(data.path()).unwrap();
+        let snapshot = GitCheckpoint::new(repository.path());
+        let before = snapshot.capture(&store, "session", 1).unwrap();
+        fs::write(repository.path().join("tracked.txt"), "after\n").unwrap();
+        fs::write(repository.path().join("external.txt"), "external\n").unwrap();
+        let after = snapshot.capture(&store, "session", 2).unwrap();
+        let selected = BTreeSet::from(["tracked.txt".to_owned()]);
+
+        let diff = checkpoint_diff_for_paths(&store, &before, &after, &selected).unwrap();
+
+        assert!(diff.contains("tracked.txt"));
+        assert!(!diff.contains("external.txt"));
+        assert!(
+            checkpoint_diff_for_paths(&store, &before, &after, &BTreeSet::new())
+                .unwrap()
+                .is_empty()
         );
     }
 
