@@ -1,8 +1,8 @@
 use diff_review_harness::agent::AgentRunStatus;
 use diff_review_harness::backend::codex::CodexBackend;
 use diff_review_harness::backend::{
-    Backend, BackendCatalogRequest, BackendInput, BackendLaunch, BackendRequest, PromptMode,
-    ToolActivityKind,
+    Backend, BackendCatalogRequest, BackendForkRequest, BackendInput, BackendLaunch,
+    BackendRequest, PromptMode, ToolActivityKind,
 };
 use diff_review_harness::broker::{HarnessBroker, InitializeRequest};
 use diff_review_harness::plan::PlanPrompt;
@@ -87,11 +87,20 @@ async fn lists_provider_skills_and_complete_mcp_rows() {
     assert!(!skill_list.is_empty());
     assert!(skill_list.iter().all(|skill| !skill.name.is_empty()));
     assert!(skill_list.iter().all(|skill| skill.path.is_some()));
-
-    let mcp_list = tokio::time::timeout(Duration::from_secs(30), backend.mcp_list(catalog_request))
+    let process_id = backend
+        .app_server_process_id()
         .await
-        .expect("Codex MCP list timed out")
-        .unwrap();
+        .expect("Codex app-server PID");
+
+    let mut new_session_catalog_request = catalog_request;
+    new_session_catalog_request.harness_session_id = "new-catalog-session".into();
+    let mcp_list = tokio::time::timeout(
+        Duration::from_secs(30),
+        backend.mcp_list(new_session_catalog_request),
+    )
+    .await
+    .expect("Codex MCP list timed out")
+    .unwrap();
     assert!(!mcp_list.is_empty());
     assert!(mcp_list.iter().all(|server| !server.name.is_empty()));
     assert!(mcp_list.iter().any(|server| server.transport != "unknown"));
@@ -101,6 +110,17 @@ async fn lists_provider_skills_and_complete_mcp_rows() {
             .iter()
             .all(|server| server.tools.iter().all(|tool| !tool.name.is_empty()))
     );
+    let fork = backend
+        .fork(BackendForkRequest {
+            source: request(repository.path(), PromptMode::Chat, ""),
+            target_harness_session_id: "prepared-fork-session".into(),
+            checkpoint_id: None,
+        })
+        .await
+        .unwrap();
+    assert!(!fork.backend_session_id.is_empty());
+    assert_eq!(backend.app_server_process_id().await, Some(process_id));
+    assert_eq!(backend.app_server_start_count(), 1);
 }
 
 #[tokio::test]
@@ -124,8 +144,15 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
     git(repository.path(), &["add", "."]);
     git(repository.path(), &["commit", "-qm", "seed"]);
 
-    let backend =
-        CodexBackend::new(vec!["codex".into(), "app-server".into(), "--stdio".into()]).unwrap();
+    let backend = CodexBackend::new(vec!["codex".into(), "app-server".into()]).unwrap();
+    backend
+        .model_list(request(repository.path(), PromptMode::Chat, ""))
+        .await
+        .unwrap();
+    let process_id = backend
+        .app_server_process_id()
+        .await
+        .expect("Codex app-server PID");
     let (answer_event_sink, mut answer_event_stream) = tokio::sync::mpsc::unbounded_channel();
     let mut answer_future = Box::pin(backend.prompt_stream(
         BackendRequest {
@@ -200,7 +227,8 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
     let steering = async {
         tokio::time::sleep(Duration::from_millis(50)).await;
         backend
-            .steer(
+            .steer_session(
+                "harness-session",
                 "Include the literal marker `STEERING_CONSTRAINT_7B3D` in the plan Overview."
                     .into(),
             )
@@ -273,8 +301,17 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
         .goal_status(execute.clone(), None, "cleared")
         .await
         .unwrap();
-    let forked = backend.fork(execute).await.unwrap();
+    let forked = backend
+        .fork(BackendForkRequest {
+            source: execute,
+            target_harness_session_id: "forked-harness-session".into(),
+            checkpoint_id: None,
+        })
+        .await
+        .unwrap();
     assert!(!forked.backend_session_id.trim().is_empty());
+    assert_eq!(backend.app_server_process_id().await, Some(process_id));
+    assert_eq!(backend.app_server_start_count(), 1);
 }
 
 #[tokio::test]
@@ -283,8 +320,7 @@ async fn streams_structured_child_agent_lifecycle() {
     let repository = tempfile::tempdir().unwrap();
     git(repository.path(), &["init", "-q"]);
     fs::write(repository.path().join("README.md"), "# Child lifecycle\n").unwrap();
-    let backend =
-        CodexBackend::new(vec!["codex".into(), "app-server".into(), "--stdio".into()]).unwrap();
+    let backend = CodexBackend::new(vec!["codex".into(), "app-server".into()]).unwrap();
     let mut backend_request = request(
         repository.path(),
         PromptMode::Chat,
@@ -400,7 +436,7 @@ async fn broker_runs_the_configured_local_code_explorer_to_parent_completion() {
         client_id: "real-local-code-explorer-test".into(),
         backend: BackendLaunch {
             kind: "codex".into(),
-            command: vec!["codex".into(), "app-server".into(), "--stdio".into()],
+            command: vec!["codex".into(), "app-server".into()],
         },
         model: "gpt-5.6-terra".into(),
         effort: "low".into(),

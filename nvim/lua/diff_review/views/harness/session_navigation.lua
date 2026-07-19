@@ -187,6 +187,7 @@ function M.render_pending(pending)
       or "Forking from "
     line = action .. source .. "..."
   end
+  line = line:gsub("[\r\n]+", " ")
   vim.bo[buf].modifiable = true
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "", "  " .. line })
   vim.bo[buf].modifiable = false

@@ -13,7 +13,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const SESSION_FORMAT_VERSION: u32 = 7;
+const SESSION_FORMAT_VERSION: u32 = 8;
 
 /// Stores one session with the exact durable format that produced it.
 #[derive(Deserialize, Serialize)]
@@ -703,6 +703,8 @@ mod test {
             workspace: workspace.into(),
             backend: "copilot".into(),
             backend_session_id: None,
+            provider_checkpoint_id: None,
+            provider_fork_state: crate::session::ProviderForkState::Ready,
             model: "default".into(),
             provider_label: "Copilot CLI".into(),
             resolved_model: None,

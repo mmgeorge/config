@@ -1,19 +1,20 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use diff_review_harness::broker::{
-    BrokerRuntime, HarnessBroker, InitializeRequest, TurnCancellation,
+    BrokerRuntime, HarnessBroker, InitializeRequest, TurnCancellation, prepare_new_session,
+    prepare_provider_fork,
 };
 use diff_review_harness::protocol::{BrokerEvent, BrokerMessage, BrokerRequest, BrokerResponse};
-use diff_review_harness::session::SessionLeaseConflict;
+use diff_review_harness::session::{ProviderForkState, SessionLeaseConflict};
 use diff_review_harness::storage::SqliteStore;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::sync::{Mutex, Notify, RwLock, mpsc};
 
 #[derive(Parser)]
 #[command(name = "diff-review-harness")]
@@ -62,8 +63,42 @@ impl SessionController {
 /// Stores live session controllers for one persistent broker process.
 struct SessionControllerRegistry {
     controller_by_id: RwLock<HashMap<String, Arc<SessionController>>>,
+    provider_fork_by_id: RwLock<HashMap<String, Arc<ProviderForkGate>>>,
     runtime: Arc<BrokerRuntime>,
     initialize: InitializeRequest,
+}
+
+/// Coordinates queued child work with one asynchronous provider fork.
+struct ProviderForkGate {
+    outcome: Mutex<Option<std::result::Result<(), String>>>,
+    notify: Notify,
+}
+
+impl ProviderForkGate {
+    /// Build a pending gate before the child snapshot reaches the client.
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            outcome: Mutex::new(None),
+            notify: Notify::new(),
+        })
+    }
+
+    /// Publish provider preparation once durable child state reflects the outcome.
+    async fn complete(&self, outcome: std::result::Result<(), String>) {
+        *self.outcome.lock().await = Some(outcome);
+        self.notify.notify_waiters();
+    }
+
+    /// Wait for provider preparation without blocking unrelated session controllers.
+    async fn wait(&self) -> Result<()> {
+        loop {
+            let notified = self.notify.notified();
+            if let Some(outcome) = self.outcome.lock().await.clone() {
+                return outcome.map_err(anyhow::Error::msg);
+            }
+            notified.await;
+        }
+    }
 }
 
 impl SessionControllerRegistry {
@@ -76,6 +111,7 @@ impl SessionControllerRegistry {
     ) -> Arc<Self> {
         Arc::new(Self {
             controller_by_id: RwLock::new(HashMap::from([(initial_session_id, controller)])),
+            provider_fork_by_id: RwLock::new(HashMap::new()),
             runtime,
             initialize,
         })
@@ -102,6 +138,31 @@ impl SessionControllerRegistry {
     /// Register a newly persisted session before its snapshot reaches Neovim.
     async fn register(&self, session_id: &str) -> Result<Arc<SessionController>> {
         self.resolve(session_id).await
+    }
+
+    /// Queue provider-bound child work until its native fork reaches durable readiness.
+    async fn await_provider_fork(
+        &self,
+        session_id: &str,
+        controller: &SessionController,
+    ) -> Result<()> {
+        let provider_fork_state = controller.broker.lock().await.provider_fork_state();
+        match provider_fork_state {
+            ProviderForkState::Ready => Ok(()),
+            ProviderForkState::Failed { message, .. } => anyhow::bail!(message),
+            ProviderForkState::Preparing { .. } => {
+                let gate = self
+                    .provider_fork_by_id
+                    .read()
+                    .await
+                    .get(session_id)
+                    .cloned()
+                    .context(
+                        "provider fork preparation was interrupted before this broker resumed",
+                    )?;
+                gate.wait().await
+            }
+        }
     }
 }
 
@@ -212,7 +273,18 @@ async fn route_request(
     if request.method == "session.resume" {
         return resume_session(registry, request, message_sink).await;
     }
+    if request.method == "session.fork" {
+        return route_session_fork(registry, session_id, request, message_sink).await;
+    }
+    if request.method == "session.new" {
+        return route_new_session(registry, session_id, request, message_sink).await;
+    }
     let controller = registry.resolve(&session_id).await?;
+    if request_requires_provider_fork(&request.method) {
+        registry
+            .await_provider_fork(&session_id, &controller)
+            .await?;
+    }
     if route_control_request(&controller, &request, message_sink).await? {
         return Ok(());
     }
@@ -265,6 +337,141 @@ async fn route_request(
     }
     message_sink.send(BrokerMessage::Response(result.response))?;
     Ok(())
+}
+
+async fn route_new_session(
+    registry: Arc<SessionControllerRegistry>,
+    session_id: String,
+    request: BrokerRequest,
+    message_sink: &mpsc::UnboundedSender<BrokerMessage>,
+) -> Result<()> {
+    let child = prepare_new_session(
+        PathBuf::from(&registry.initialize.data_root).as_path(),
+        &registry.initialize.client_id,
+        &registry.initialize.backend.kind,
+        registry
+            .runtime
+            .backend_handle()
+            .descriptor()
+            .capability
+            .native_compact,
+        &session_id,
+        &request.params,
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64,
+    )?;
+    let child_controller = registry.register(&child.id).await?;
+    let snapshot = child_controller.broker.lock().await.snapshot()?;
+    message_sink.send(BrokerMessage::Response(BrokerResponse::success(
+        request.id, snapshot,
+    )?))?;
+    message_sink.send(BrokerMessage::Event(BrokerEvent {
+        session_id: child.id.clone(),
+        event: "session_created".into(),
+        payload: serde_json::to_value(child)?,
+    }))?;
+    Ok(())
+}
+
+async fn route_session_fork(
+    registry: Arc<SessionControllerRegistry>,
+    session_id: String,
+    request: BrokerRequest,
+    message_sink: &mpsc::UnboundedSender<BrokerMessage>,
+) -> Result<()> {
+    let backend = registry.runtime.backend_handle();
+    let descriptor = backend.descriptor();
+    let preparation = prepare_provider_fork(
+        PathBuf::from(&registry.initialize.data_root).as_path(),
+        &registry.initialize.client_id,
+        &registry.initialize.backend.kind,
+        &descriptor.capability,
+        &session_id,
+        &request.params,
+    )?;
+    let child_session_id = preparation.child.id.clone();
+    let child_controller = registry.register(&child_session_id).await?;
+    let gate = ProviderForkGate::new();
+    registry
+        .provider_fork_by_id
+        .write()
+        .await
+        .insert(child_session_id.clone(), Arc::clone(&gate));
+
+    let mut snapshot = serde_json::to_value(child_controller.broker.lock().await.snapshot()?)?;
+    snapshot["fork_performance"] = json!({
+        "total_ms": preparation.total_duration_ms,
+        "timing": preparation.timing,
+        "provider_pending": true,
+    });
+    message_sink.send(BrokerMessage::Response(BrokerResponse::success(
+        request.id, snapshot,
+    )?))?;
+    message_sink.send(BrokerMessage::Event(BrokerEvent {
+        session_id: child_session_id.clone(),
+        event: "session_created".into(),
+        payload: serde_json::to_value(&preparation.child)?,
+    }))?;
+
+    let message_sink = message_sink.clone();
+    let registry_for_completion = Arc::clone(&registry);
+    tokio::task::spawn_local(async move {
+        let backend_started = Instant::now();
+        let mut result = backend
+            .fork(preparation.backend_request)
+            .await
+            .map_err(|error| format!("{error:#}"));
+        if let Ok(result) = &mut result {
+            result
+                .timing
+                .push(diff_review_harness::backend::BackendTimingRecord {
+                    phase: "broker.backend_total".into(),
+                    duration_ms: backend_started.elapsed().as_secs_f64() * 1000.0,
+                });
+        }
+        let mut readiness = result.as_ref().map(|_| ()).map_err(ToOwned::to_owned);
+        let completion = child_controller
+            .broker
+            .lock()
+            .await
+            .complete_provider_fork(result);
+        match completion {
+            Ok(event) => {
+                let _ = message_sink.send(BrokerMessage::Event(event));
+            }
+            Err(error) => {
+                readiness = Err(format!("persist provider fork outcome: {error:#}"));
+            }
+        }
+        gate.complete(readiness).await;
+        registry_for_completion
+            .provider_fork_by_id
+            .write()
+            .await
+            .remove(&child_session_id);
+    });
+    Ok(())
+}
+
+fn request_requires_provider_fork(method: &str) -> bool {
+    matches!(
+        method,
+        "prompt.submit"
+            | "agent.start"
+            | "agent.submit"
+            | "interaction.resume"
+            | "plan.accept"
+            | "plan.request_changes"
+            | "question.ask"
+            | "question.continue"
+            | "goal.set"
+            | "goal.resume"
+            | "goal.continue"
+            | "interaction.request_changes"
+            | "session.compact"
+    )
 }
 
 async fn resume_session(

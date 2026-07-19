@@ -1,7 +1,15 @@
+mod fork;
+mod new_session;
+
+pub use fork::{ForkPreparation, prepare_provider_fork};
+pub use new_session::prepare_new_session;
+
 use crate::agent::{
     AgentDefinition, AgentLifecycleEvent, AgentRegistry, AgentRun, AgentRunStatus, AgentTurnRecord,
     load_codex_agent_catalog,
 };
+#[cfg(test)]
+use crate::backend::BackendForkRequest;
 use crate::backend::approval::{ApprovalRequestView, PermissionCoordinator};
 use crate::backend::{
     Backend, BackendCapability, BackendCatalogRequest, BackendEvent, BackendEventSink,
@@ -22,7 +30,8 @@ use crate::plan::{
 };
 use crate::protocol::{BrokerEvent, BrokerRequest, BrokerResponse};
 use crate::session::{
-    ContextUsage, ExecutionMode, HarnessPreference, HarnessSession, ModelSetting, SessionStore,
+    ContextUsage, ExecutionMode, HarnessPreference, HarnessSession, ModelSetting,
+    ProviderForkState, SessionStore,
 };
 use crate::storage::SqliteStore;
 use crate::timeline::{SessionEventKind, SessionEventRecord, TimelineEntry, TimelineProjector};
@@ -36,7 +45,7 @@ use std::sync::{
     Arc, RwLock,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 use uuid::Uuid;
 
@@ -182,6 +191,11 @@ impl BrokerRuntime {
             permission_store,
             permission_coordinator,
         }))
+    }
+
+    /// Share the process-wide provider host with concurrent session controllers.
+    pub fn backend_handle(&self) -> Arc<dyn Backend> {
+        Arc::clone(&self.backend)
     }
 }
 
@@ -410,6 +424,8 @@ impl HarnessBroker {
                             workspace,
                             backend: request.backend.kind.clone(),
                             backend_session_id: None,
+                            provider_checkpoint_id: None,
+                            provider_fork_state: ProviderForkState::Ready,
                             model: preference
                                 .as_ref()
                                 .map_or(request.model, |value| value.model.clone()),
@@ -703,7 +719,9 @@ impl HarnessBroker {
             "session.configure" => self.configure_session(params).await,
             "session.compact" => self.compact_session().await,
             "session.delete" => self.delete_session(params),
-            "session.fork" => self.fork_session(params).await,
+            "session.fork" => anyhow::bail!(
+                "session.fork must route through the process-wide session coordinator"
+            ),
             "shutdown" => {
                 self.release_lease()?;
                 Ok((json!({ "shutdown": true }), Vec::new()))
@@ -2127,6 +2145,7 @@ impl HarnessBroker {
             self.session.context_usage = Some(context_usage);
         }
         self.session.backend_session_id = output.backend_session_id.clone();
+        self.session.provider_checkpoint_id = output.provider_checkpoint_id.clone();
         if !output.runtime.provider.is_empty() {
             self.session.provider_label = output.runtime.provider;
         }
@@ -3545,36 +3564,15 @@ impl HarnessBroker {
 
     async fn new_session(&mut self, params: Value) -> Result<(Value, Vec<BrokerEvent>)> {
         let now_ms = self.clock.now_ms();
-        let child = HarnessSession {
-            id: Uuid::new_v4().to_string(),
-            name: params
-                .get("name")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .unwrap_or_default()
-                .to_owned(),
-            workspace: self.session.workspace.clone(),
-            backend: self.session.backend.clone(),
-            backend_session_id: None,
-            model: self.session.model.clone(),
-            provider_label: self.session.provider_label.clone(),
-            resolved_model: self.session.resolved_model.clone(),
-            effort: self.session.effort.clone(),
-            context_window: self.session.context_window.clone(),
-            fast_mode: self.session.fast_mode,
-            execution_mode: ExecutionMode::Read,
-            created_at_ms: now_ms,
-            updated_at_ms: now_ms,
-            active_plan_id: None,
-            goal_id: None,
-            lease_owner: Some(self.client_id.clone()),
-            lease_expires_at_ms: Some(now_ms + 30_000),
-            native_fork: false,
-            native_compact: self.backend.descriptor().capability.native_compact,
-            context_usage: None,
-        };
-        self.store.save_session(&child)?;
+        let child = prepare_new_session(
+            &self.data_root,
+            &self.client_id,
+            &self.backend_launch.kind,
+            self.backend.descriptor().capability.native_compact,
+            &self.session.id,
+            &params,
+            now_ms,
+        )?;
         let snapshot = self.snapshot_for_session(child.clone())?;
         Ok((
             serde_json::to_value(snapshot)?,
@@ -3886,101 +3884,6 @@ impl HarnessBroker {
         ))
     }
 
-    async fn fork_session(&mut self, params: Value) -> Result<(Value, Vec<BrokerEvent>)> {
-        let fork_started = Instant::now();
-        let mut timing = Vec::new();
-        let source = match params.get("session_id").and_then(Value::as_str) {
-            Some(session_id) => self
-                .store
-                .load_session(session_id)?
-                .context("source session not found")?,
-            None => self.session.clone(),
-        };
-        anyhow::ensure!(
-            source.native_fork || (source.id == self.session.id && self.capability.native_fork),
-            "native fork is unavailable for this backend session"
-        );
-        anyhow::ensure!(
-            source.backend == self.backend_launch.kind,
-            "source session uses a different configured backend"
-        );
-        let backend_started = Instant::now();
-        let backend_fork = self
-            .backend
-            .fork(BackendRequest {
-                harness_session_id: source.id.clone(),
-                workspace: source.workspace.clone(),
-                input: BackendInput::from_text(""),
-                mode: PromptMode::Chat,
-                model: source.model.clone(),
-                effort: source.effort.clone(),
-                context_window: source.context_window.clone(),
-                fast_mode: source.fast_mode,
-                execution_mode: ExecutionMode::Read,
-                backend_session_id: source.backend_session_id.clone(),
-            })
-            .await?;
-        let backend_duration_ms = backend_started.elapsed().as_secs_f64() * 1000.0;
-        timing.extend(backend_fork.timing);
-        timing.push(crate::backend::BackendTimingRecord {
-            phase: "broker.backend_total".into(),
-            duration_ms: backend_duration_ms,
-        });
-        let backend_session_id = backend_fork.backend_session_id;
-        let persistence_started = Instant::now();
-        let now_ms = self.clock.now_ms();
-        let mut fork = source.clone();
-        fork.id = Uuid::new_v4().to_string();
-        let existing_name_set = self
-            .store
-            .list_session(Some(&source.workspace))?
-            .into_iter()
-            .map(|session| session.name)
-            .collect::<HashSet<_>>();
-        fork.name = resolve_fork_name(&params, &source.name, &existing_name_set);
-        fork.backend_session_id = Some(backend_session_id);
-        fork.context_usage.clone_from(&source.context_usage);
-        fork.execution_mode = ExecutionMode::Read;
-        fork.active_plan_id = None;
-        fork.goal_id = None;
-        fork.created_at_ms = now_ms;
-        fork.updated_at_ms = now_ms;
-        fork.lease_owner = Some(self.client_id.clone());
-        fork.lease_expires_at_ms = Some(now_ms + 30_000);
-        self.store.save_session(&fork)?;
-        self.store.save_session_event(&SessionEventRecord {
-            id: Uuid::new_v4().to_string(),
-            session_id: fork.id.clone(),
-            created_at_ms: now_ms,
-            detail: SessionEventKind::Forked {
-                source_session_id: source.id,
-                source_session_name: source.name,
-            },
-        })?;
-        timing.push(crate::backend::BackendTimingRecord {
-            phase: "broker.persist_child".into(),
-            duration_ms: persistence_started.elapsed().as_secs_f64() * 1000.0,
-        });
-        let snapshot_started = Instant::now();
-        let mut snapshot = serde_json::to_value(self.snapshot_for_session(fork.clone())?)?;
-        timing.push(crate::backend::BackendTimingRecord {
-            phase: "broker.snapshot".into(),
-            duration_ms: snapshot_started.elapsed().as_secs_f64() * 1000.0,
-        });
-        snapshot["fork_performance"] = json!({
-            "total_ms": fork_started.elapsed().as_secs_f64() * 1000.0,
-            "timing": timing,
-        });
-        Ok((
-            snapshot,
-            vec![BrokerEvent {
-                session_id: fork.id.clone(),
-                event: "session_created".into(),
-                payload: serde_json::to_value(fork)?,
-            }],
-        ))
-    }
-
     fn snapshot_for_session(&mut self, session: HarnessSession) -> Result<BrokerSnapshot> {
         let parent_session = std::mem::replace(&mut self.session, session);
         let child_workspace = crate::workspace::resolve(Path::new(&self.session.workspace))?;
@@ -4252,7 +4155,7 @@ mod test {
 
         async fn fork(
             &self,
-            _request: BackendRequest,
+            _request: BackendForkRequest,
         ) -> Result<crate::backend::BackendForkResult> {
             anyhow::bail!("synthetic provider failure")
         }
@@ -4318,7 +4221,7 @@ mod test {
 
         async fn fork(
             &self,
-            _request: BackendRequest,
+            _request: BackendForkRequest,
         ) -> Result<crate::backend::BackendForkResult> {
             anyhow::bail!("parent boundary backend does not fork")
         }
@@ -4413,7 +4316,7 @@ mod test {
 
         async fn fork(
             &self,
-            _request: BackendRequest,
+            _request: BackendForkRequest,
         ) -> Result<crate::backend::BackendForkResult> {
             Ok(crate::backend::BackendForkResult::unprofiled(
                 "mutable-question-fork",
@@ -4491,7 +4394,7 @@ mod test {
 
         async fn fork(
             &self,
-            _request: BackendRequest,
+            _request: BackendForkRequest,
         ) -> Result<crate::backend::BackendForkResult> {
             Ok(crate::backend::BackendForkResult::unprofiled(
                 "planning-question-fork",
@@ -4639,7 +4542,7 @@ mod test {
 
         async fn fork(
             &self,
-            _request: BackendRequest,
+            _request: BackendForkRequest,
         ) -> Result<crate::backend::BackendForkResult> {
             Ok(crate::backend::BackendForkResult::unprofiled(
                 "nested-write-fork",
@@ -4702,7 +4605,7 @@ mod test {
 
         async fn fork(
             &self,
-            _request: BackendRequest,
+            _request: BackendForkRequest,
         ) -> Result<crate::backend::BackendForkResult> {
             Ok(crate::backend::BackendForkResult::unprofiled(
                 "task-update-fork",
@@ -4725,6 +4628,8 @@ mod test {
             workspace: "work".into(),
             backend: "mock".into(),
             backend_session_id: None,
+            provider_checkpoint_id: None,
+            provider_fork_state: ProviderForkState::Ready,
             model: "model".into(),
             provider_label: "Mock backend".into(),
             resolved_model: Some("model".into()),
@@ -5194,47 +5099,53 @@ mod test {
         assert_eq!(conflict.session_id, source_session_id);
         assert!(conflict.native_fork);
 
-        let mut fork_controller = HarnessBroker::initialize_with_clock(
+        let fork_controller = HarnessBroker::initialize_with_clock(
             initialize("fork-client", Some("new".into())),
             Box::new(FixedClock(110)),
         )
         .unwrap();
-        let forked = fork_controller
-            .dispatch(BrokerRequest {
-                id: 2,
-                method: "session.fork".into(),
-                params: json!({ "session_id": source_session_id, "name": "fork investigation" }),
-            })
-            .await;
-        assert!(forked.response.error.is_none());
-        let snapshot = forked.response.result.expect("fork snapshot");
+        let preparation = prepare_provider_fork(
+            data.path(),
+            "fork-client",
+            "mock",
+            &fork_controller.capability,
+            &fork_controller.session.id,
+            &json!({ "session_id": source_session_id, "name": "fork investigation" }),
+        )
+        .unwrap();
+        assert!(matches!(
+            preparation.child.provider_fork_state,
+            ProviderForkState::Preparing { .. }
+        ));
+        assert_eq!(
+            preparation.backend_request.checkpoint_id.as_deref(),
+            Some("mock-checkpoint")
+        );
+        let child_session_id = preparation.child.id.clone();
+        let backend_fork = fork_controller
+            .backend
+            .fork(preparation.backend_request)
+            .await
+            .unwrap();
+        let mut child_initialize = initialize("fork-client", None);
+        child_initialize.session_id = Some(child_session_id);
+        let mut child_controller =
+            HarnessBroker::initialize_with_clock(child_initialize, Box::new(FixedClock(120)))
+                .unwrap();
+        let ready_event = child_controller
+            .complete_provider_fork(Ok(backend_fork))
+            .unwrap();
+        assert_eq!(ready_event.event, "session_fork_ready");
+        let snapshot = serde_json::to_value(child_controller.snapshot().unwrap()).unwrap();
         assert_ne!(snapshot["session"]["id"], source_session_id);
         assert_eq!(snapshot["session"]["name"], "fork investigation");
         assert_eq!(snapshot["session"]["execution_mode"], "read");
+        assert_eq!(snapshot["session"]["provider_fork_state"]["state"], "ready");
         assert_eq!(snapshot["session"]["context_usage"]["used"], 50);
         assert_eq!(snapshot["session"]["context_usage"]["size"], 200);
         assert_eq!(
             snapshot["session"]["context_usage"]["remaining_percent"],
             75
-        );
-        assert!(snapshot["fork_performance"]["total_ms"].as_f64().is_some());
-        let timing = snapshot["fork_performance"]["timing"]
-            .as_array()
-            .expect("fork timing list");
-        assert!(
-            timing
-                .iter()
-                .any(|entry| entry["phase"] == "broker.backend_total")
-        );
-        assert!(
-            timing
-                .iter()
-                .any(|entry| entry["phase"] == "broker.persist_child")
-        );
-        assert!(
-            timing
-                .iter()
-                .any(|entry| entry["phase"] == "broker.snapshot")
         );
         assert_eq!(snapshot["interaction"].as_array().map(Vec::len), Some(0));
         assert_eq!(snapshot["timeline"].as_array().map(Vec::len), Some(1));
@@ -5244,7 +5155,29 @@ mod test {
             snapshot["timeline"][0]["event"]["source_session_id"],
             source_session_id
         );
-        let persisted_source = fork_controller
+        let failed_preparation = prepare_provider_fork(
+            data.path(),
+            "fork-client",
+            "mock",
+            &fork_controller.capability,
+            &fork_controller.session.id,
+            &json!({ "session_id": source_session_id }),
+        )
+        .unwrap();
+        let mut failed_initialize = initialize("fork-client", None);
+        failed_initialize.session_id = Some(failed_preparation.child.id);
+        let mut failed_controller =
+            HarnessBroker::initialize_with_clock(failed_initialize, Box::new(FixedClock(130)))
+                .unwrap();
+        let failed_event = failed_controller
+            .complete_provider_fork(Err("native fork failed".into()))
+            .unwrap();
+        assert_eq!(failed_event.event, "session_fork_failed");
+        assert!(matches!(
+            failed_controller.provider_fork_state(),
+            ProviderForkState::Failed { message, .. } if message == "native fork failed"
+        ));
+        let persisted_source = child_controller
             .store
             .load_session(&source_session_id)
             .unwrap()

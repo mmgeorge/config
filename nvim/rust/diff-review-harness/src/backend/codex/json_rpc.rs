@@ -11,18 +11,17 @@ use crate::backend::{
 use crate::plan::PlanQuestionSet;
 use crate::session::{ContextUsage, ExecutionMode};
 use anyhow::{Context, Result};
+use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::path::Path;
-use std::process::Stdio;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout};
+use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
-/// Owns one Codex app-server JSON-RPC subprocess.
+/// Owns one session-scoped JSON-RPC connection to the shared Codex app-server.
 pub struct CodexJsonRpc {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: tokio::io::Lines<BufReader<ChildStdout>>,
+    socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
     next_id: u64,
     workspace: String,
     execution_mode: ExecutionMode,
@@ -31,37 +30,19 @@ pub struct CodexJsonRpc {
 }
 
 impl CodexJsonRpc {
-    /// Start one provider process with isolated stdin, stdout, and stderr pipes.
-    pub async fn start(
-        command: &[String],
+    /// Connect one session channel to the shared provider process.
+    pub async fn connect(
+        endpoint: &str,
         workspace: &str,
         execution_mode: ExecutionMode,
         permission_coordinator: Arc<PermissionCoordinator>,
         event_sink: Option<BackendEventSink>,
     ) -> Result<Self> {
-        let (program, args) = command
-            .split_first()
-            .context("backend launch command is empty")?;
-        let mut provider = super::process::command(program, args);
-        let mut child = provider
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true)
-            .spawn()
-            .with_context(|| format!("start Harness backend {program}"))?;
-        let stdin = child
-            .stdin
-            .take()
-            .context("backend stdin pipe was not created")?;
-        let stdout = child
-            .stdout
-            .take()
-            .context("backend stdout pipe was not created")?;
+        let (socket, _) = connect_async(endpoint)
+            .await
+            .with_context(|| format!("connect to shared Codex app-server at {endpoint}"))?;
         Ok(Self {
-            child,
-            stdin,
-            stdout: BufReader::new(stdout).lines(),
+            socket,
             next_id: 1,
             workspace: workspace.to_owned(),
             execution_mode,
@@ -117,14 +98,30 @@ impl CodexJsonRpc {
 
     /// Read and normalize one provider message while preserving request routing metadata.
     pub async fn read_message(&mut self, output: &mut BackendOutput) -> Result<Value> {
-        let line = self
-            .stdout
-            .next_line()
-            .await
-            .context("read backend JSONL")?
-            .context("backend closed stdout before completing the request")?;
-        let message: Value = serde_json::from_str(&line)
-            .with_context(|| format!("decode backend JSON-RPC line: {line}"))?;
+        let encoded = loop {
+            let frame = self
+                .socket
+                .next()
+                .await
+                .context("shared Codex app-server closed before completing the request")??;
+            match frame {
+                Message::Text(text) => break text.to_string(),
+                Message::Binary(bytes) => {
+                    break String::from_utf8(bytes.to_vec())
+                        .context("decode shared Codex app-server binary frame")?;
+                }
+                Message::Ping(payload) => {
+                    self.socket.send(Message::Pong(payload)).await?;
+                }
+                Message::Pong(_) => {}
+                Message::Close(close) => {
+                    anyhow::bail!("shared Codex app-server closed the session channel: {close:?}")
+                }
+                Message::Frame(_) => {}
+            }
+        };
+        let message: Value = serde_json::from_str(&encoded)
+            .with_context(|| format!("decode backend JSON-RPC message: {encoded}"))?;
         if message.get("id").is_some() && message.get("method").is_some() {
             self.respond_to_provider_request(&message).await?;
         }
@@ -159,16 +156,10 @@ impl CodexJsonRpc {
     }
 
     async fn write_message(&mut self, message: &Value) -> Result<()> {
-        let mut encoded = serde_json::to_vec(message)?;
-        encoded.push(b'\n');
-        self.stdin
-            .write_all(&encoded)
+        self.socket
+            .send(Message::Text(serde_json::to_string(message)?.into()))
             .await
-            .context("write backend JSON-RPC request")?;
-        self.stdin
-            .flush()
-            .await
-            .context("flush backend JSON-RPC request")
+            .context("write shared Codex app-server JSON-RPC request")
     }
 
     async fn respond_to_provider_request(&mut self, message: &Value) -> Result<()> {
@@ -235,12 +226,6 @@ impl CodexJsonRpc {
             .authorize(self.execution_mode, request, self.event_sink.as_ref())
             .await?;
         Ok(resolution)
-    }
-}
-
-impl Drop for CodexJsonRpc {
-    fn drop(&mut self) {
-        let _ = self.child.start_kill();
     }
 }
 

@@ -2,9 +2,9 @@ use crate::backend::approval::PermissionCoordinator;
 use crate::backend::steering::SteeringLane;
 use crate::backend::{
     Backend, BackendCapability, BackendCatalogRequest, BackendDescriptor, BackendEventSink,
-    BackendForkResult, BackendInput, BackendKind, BackendModel, BackendOutput, BackendRequest,
-    BackendTimingRecord, CatalogCapability, CatalogMutation, McpDefinition, McpStatus,
-    McpToolDefinition, PromptMode, SkillDefinition,
+    BackendForkRequest, BackendForkResult, BackendInput, BackendKind, BackendModel, BackendOutput,
+    BackendRequest, BackendTimingRecord, CatalogCapability, CatalogMutation, McpDefinition,
+    McpStatus, McpToolDefinition, PromptMode, SkillDefinition,
 };
 use crate::control_tools::ControlToolRegistry;
 use crate::session::ExecutionMode;
@@ -18,10 +18,12 @@ use tokio::sync::Mutex;
 
 mod json_rpc;
 mod process;
+mod runtime;
 mod security;
 mod turn_coordinator;
 
 use json_rpc::CodexJsonRpc;
+use runtime::CodexRuntime;
 use security::CodexSecurity;
 
 struct CodexConnection {
@@ -31,7 +33,7 @@ struct CodexConnection {
 
 /// Owns Codex app-server thread lifecycle, prompting, permission policy, and native fork.
 pub struct CodexBackend {
-    command: Vec<String>,
+    runtime: CodexRuntime,
     default_model: Mutex<Option<String>>,
     steering_by_session: Mutex<HashMap<String, SteeringLane>>,
     active_turn_by_session: Mutex<HashMap<String, CodexTurnState>>,
@@ -86,6 +88,16 @@ impl CodexBackend {
         Self::new_with_permission_coordinator(command, permission_coordinator)
     }
 
+    /// Return how many Codex app-server process generations this backend launched.
+    pub fn app_server_start_count(&self) -> u64 {
+        self.runtime.start_count()
+    }
+
+    /// Return the operating-system process identifier for the shared app-server.
+    pub async fn app_server_process_id(&self) -> Option<u32> {
+        self.runtime.process_id().await
+    }
+
     /// Build a Codex backend with the shared Harness permission coordinator.
     pub fn new_with_permission_coordinator(
         command: Vec<String>,
@@ -96,7 +108,9 @@ impl CodexBackend {
             "Codex backend requires harness.backends.codex.command"
         );
         Ok(Self {
-            command,
+            runtime: CodexRuntime::new(
+                CodexSecurity::new(ExecutionMode::Read).launch_command(&command),
+            ),
             default_model: Mutex::new(None),
             steering_by_session: Mutex::new(HashMap::new()),
             active_turn_by_session: Mutex::new(HashMap::new()),
@@ -112,17 +126,16 @@ impl CodexBackend {
         output: &mut BackendOutput,
         event_sink: Option<BackendEventSink>,
     ) -> Result<CodexConnection> {
-        let security = CodexSecurity::new(request.execution_mode);
-        let command = security.launch_command(&self.command);
         let process_started = Instant::now();
-        let mut process = CodexJsonRpc::start(
-            &command,
-            &request.workspace,
-            request.execution_mode,
-            Arc::clone(&self.permission_coordinator),
-            event_sink,
-        )
-        .await?;
+        let mut process = self
+            .runtime
+            .connect(
+                &request.workspace,
+                request.execution_mode,
+                Arc::clone(&self.permission_coordinator),
+                event_sink,
+            )
+            .await?;
         let process_duration_ms = process_started.elapsed().as_secs_f64() * 1000.0;
         let initialize_started = Instant::now();
         process.request("initialize", json!({
@@ -198,6 +211,22 @@ impl CodexBackend {
                 .insert("model".into(), Value::String(model.into()));
         }
         params
+    }
+
+    fn fork_parameters(
+        source_thread_id: String,
+        last_turn_id: String,
+        request: &BackendRequest,
+    ) -> Value {
+        Self::secure(
+            json!({
+                "threadId": source_thread_id,
+                "cwd": request.workspace,
+                "lastTurnId": last_turn_id,
+                "excludeTurns": true,
+            }),
+            request,
+        )
     }
 
     fn catalog_backend_request(request: &BackendCatalogRequest) -> BackendRequest {
@@ -761,6 +790,7 @@ impl Backend for CodexBackend {
             .lock()
             .await
             .insert(request.harness_session_id.clone(), turn_id.to_owned());
+        output.provider_checkpoint_id = Some(turn_id.to_owned());
         let status = completed
             .pointer("/turn/status")
             .or_else(|| completed.get("status"))
@@ -773,56 +803,46 @@ impl Backend for CodexBackend {
         Ok(output)
     }
 
-    async fn fork(&self, request: BackendRequest) -> Result<BackendForkResult> {
+    async fn fork(&self, request: BackendForkRequest) -> Result<BackendForkResult> {
+        let source_request = request.source;
         let mut output = BackendOutput::default();
-        let CodexConnection {
-            mut process,
-            mut timing,
-        } = self.connect(&request, &mut output, None).await?;
+        let mut connection = self.connect(&source_request, &mut output, None).await?;
         let fork_started = Instant::now();
-        let completed_turn_id = self
-            .completed_turn_by_session
-            .lock()
-            .await
-            .get(&request.harness_session_id)
-            .cloned();
-        let result = match (request.backend_session_id.clone(), completed_turn_id) {
+        let result = match (
+            source_request.backend_session_id.clone(),
+            request.checkpoint_id.clone(),
+        ) {
             (Some(source), Some(last_turn_id)) => {
-                process
+                connection
+                    .process
                     .request(
                         "thread/fork",
-                        Self::secure(
-                            json!({
-                                "threadId": source,
-                                "cwd": request.workspace,
-                                "lastTurnId": last_turn_id,
-                            }),
-                            &request,
-                        ),
+                        Self::fork_parameters(source, last_turn_id, &source_request),
                         &mut output,
                     )
                     .await?
             }
             _ => {
-                process
+                connection
+                    .process
                     .request(
                         "thread/start",
                         Self::with_model(
                             Self::secure(
                                 json!({
-                                    "cwd": request.workspace,
+                                    "cwd": source_request.workspace,
                                     "historyMode": "legacy",
                                 }),
-                                &request,
+                                &source_request,
                             ),
-                            &request.model,
+                            &source_request.model,
                         ),
                         &mut output,
                     )
                     .await?
             }
         };
-        timing.push(BackendTimingRecord {
+        connection.timing.push(BackendTimingRecord {
             phase: "codex.thread_fork".into(),
             duration_ms: fork_started.elapsed().as_secs_f64() * 1000.0,
         });
@@ -833,6 +853,11 @@ impl Backend for CodexBackend {
             .and_then(Value::as_str)
             .map(str::to_owned)
             .context("Codex fork response omitted thread id")?;
+        let timing = connection.timing.clone();
+        self.connection_by_session.lock().await.insert(
+            request.target_harness_session_id,
+            Arc::new(Mutex::new(connection)),
+        );
         Ok(BackendForkResult {
             backend_session_id,
             timing,
@@ -1160,6 +1185,31 @@ mod test {
         }));
         assert_eq!(catalog[0].id, "gpt-default");
         assert!(catalog[0].is_default);
+    }
+
+    #[test]
+    fn forks_without_replaying_provider_turns() {
+        let request = BackendRequest {
+            harness_session_id: "harness-session".into(),
+            workspace: "workspace".into(),
+            input: BackendInput::from_text(""),
+            mode: PromptMode::Chat,
+            model: "default".into(),
+            effort: "medium".into(),
+            context_window: None,
+            fast_mode: false,
+            execution_mode: ExecutionMode::Read,
+            backend_session_id: Some("source-thread".into()),
+        };
+        let params = CodexBackend::fork_parameters(
+            "source-thread".into(),
+            "completed-turn".into(),
+            &request,
+        );
+
+        assert_eq!(params.get("threadId"), Some(&json!("source-thread")));
+        assert_eq!(params.get("lastTurnId"), Some(&json!("completed-turn")));
+        assert_eq!(params.get("excludeTurns"), Some(&json!(true)));
     }
 
     #[test]

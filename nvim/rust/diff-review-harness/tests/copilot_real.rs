@@ -24,11 +24,17 @@ async fn lists_native_copilot_skills_and_mcp_rows() {
             .expect("Copilot skill list timed out")
             .unwrap();
     assert!(skill_list.iter().all(|skill| skill.user_invocable));
-    let mcp_list = tokio::time::timeout(Duration::from_secs(30), backend.mcp_list(request))
-        .await
-        .expect("Copilot MCP list timed out")
-        .unwrap();
+    let mut new_session_request = request;
+    new_session_request.harness_session_id = "copilot-new-catalog".into();
+    let mcp_list = tokio::time::timeout(
+        Duration::from_secs(30),
+        backend.mcp_list(new_session_request),
+    )
+    .await
+    .expect("Copilot MCP list timed out")
+    .unwrap();
     assert!(mcp_list.iter().all(|server| !server.name.is_empty()));
+    assert_eq!(backend.client_start_count(), 1);
 }
 
 #[tokio::test]

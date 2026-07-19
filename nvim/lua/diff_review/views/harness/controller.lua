@@ -571,6 +571,13 @@ local function on_event(event, payload)
     if event == "goal_continue_requested" then vim.schedule(M.drain) end
   elseif event == "context_compacted" then
     synchronize_state()
+  elseif event == "session_fork_ready" or event == "session_fork_failed" then
+    state.session = payload.session or state.session
+    M.refresh_winbar()
+    if event == "session_fork_failed" then
+      local provider_fork_state = state.session and state.session.provider_fork_state or {}
+      notifications.error(provider_fork_state.message or "Provider fork preparation failed", "Harness fork")
+    end
   elseif event == "session_changed" or event == "session_configured" or event == "mode_changed"
     or event == "execution_mode_changed"
   then

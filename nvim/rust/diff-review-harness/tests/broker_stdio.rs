@@ -2,7 +2,7 @@ use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 struct BrokerProcess {
     child: Child,
@@ -146,6 +146,163 @@ fn streams_mock_backend_events_before_the_jsonl_response() {
             .and_then(Value::as_bool),
         Some(true)
     );
+}
+
+#[test]
+fn opens_a_fork_before_provider_preparation_and_queues_only_the_child_prompt() {
+    let repository = tempfile::tempdir().unwrap();
+    git(repository.path(), &["init", "-q"]);
+    let data = tempfile::tempdir().unwrap();
+    let mut broker = BrokerProcess::start();
+    broker.request(json!({
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "data_root": data.path(),
+            "workspace": repository.path(),
+            "client_id": "async-fork-test",
+            "backend": { "kind": "mock", "command": ["fork-blocking"] },
+            "model": "mock-model",
+            "effort": "low",
+            "goal_max_turns": 20
+        }
+    }));
+    let initialized = broker.read_response(1);
+    let source_session_id = initialized
+        .last()
+        .unwrap()
+        .pointer("/result/session/id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_owned();
+
+    let fork_started = Instant::now();
+    broker.request(json!({
+        "id": 2,
+        "session_id": source_session_id,
+        "method": "session.fork",
+        "params": { "name": "concurrent child" }
+    }));
+    let forked = broker.read_response(2);
+    assert!(
+        fork_started.elapsed() < Duration::from_millis(300),
+        "fork response waited for provider preparation"
+    );
+    let child_session_id = forked
+        .last()
+        .unwrap()
+        .pointer("/result/session/id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        forked
+            .last()
+            .unwrap()
+            .pointer("/result/session/provider_fork_state/state")
+            .and_then(Value::as_str),
+        Some("preparing")
+    );
+
+    broker.request(json!({
+        "id": 3,
+        "session_id": child_session_id,
+        "method": "prompt.submit",
+        "params": { "text": "queued child prompt" }
+    }));
+    let parent_started = Instant::now();
+    broker.request(json!({
+        "id": 4,
+        "session_id": source_session_id,
+        "method": "prompt.submit",
+        "params": { "text": "independent parent prompt" }
+    }));
+    let parent_messages = broker.read_response(4);
+    assert!(
+        parent_started.elapsed() < Duration::from_millis(300),
+        "parent prompt queued behind child provider preparation"
+    );
+    assert!(parent_messages.last().unwrap().get("error").is_none());
+    let child_completed = parent_messages
+        .iter()
+        .any(|message| message.get("id").and_then(Value::as_u64) == Some(3));
+    if !child_completed {
+        let child_messages = broker.read_response(3);
+        assert!(child_messages.last().unwrap().get("error").is_none());
+    }
+}
+
+#[test]
+fn creates_a_new_session_while_the_source_turn_continues() {
+    let repository = tempfile::tempdir().unwrap();
+    git(repository.path(), &["init", "-q"]);
+    let data = tempfile::tempdir().unwrap();
+    let mut broker = BrokerProcess::start();
+    broker.request(json!({
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "data_root": data.path(),
+            "workspace": repository.path(),
+            "client_id": "concurrent-new-test",
+            "backend": { "kind": "mock", "command": ["session-blocking"] },
+            "model": "mock-model",
+            "effort": "low",
+            "goal_max_turns": 20
+        }
+    }));
+    let initialized = broker.read_response(1);
+    let source_session_id = initialized
+        .last()
+        .unwrap()
+        .pointer("/result/session/id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_owned();
+
+    broker.request(json!({
+        "id": 2,
+        "session_id": source_session_id,
+        "method": "prompt.submit",
+        "params": { "text": "keep the source busy" }
+    }));
+    let turn_started = broker.read_message();
+    assert_eq!(
+        turn_started.get("event").and_then(Value::as_str),
+        Some("backend_event")
+    );
+
+    let new_started = Instant::now();
+    broker.request(json!({
+        "id": 3,
+        "session_id": source_session_id,
+        "method": "session.new",
+        "params": { "name": "parallel work" }
+    }));
+    let created = broker.read_response(3);
+    assert!(
+        new_started.elapsed() < Duration::from_millis(300),
+        "new session response queued behind the source turn"
+    );
+    assert_eq!(
+        created
+            .last()
+            .unwrap()
+            .pointer("/result/session/name")
+            .and_then(Value::as_str),
+        Some("parallel work")
+    );
+    assert!(
+        created
+            .last()
+            .unwrap()
+            .pointer("/result/session/backend_session_id")
+            .and_then(Value::as_str)
+            .is_none()
+    );
+
+    let source_completed = broker.read_response(2);
+    assert!(source_completed.last().unwrap().get("error").is_none());
 }
 
 #[test]

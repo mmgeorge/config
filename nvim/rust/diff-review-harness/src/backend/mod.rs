@@ -236,6 +236,7 @@ pub type BackendEventSink = UnboundedSender<BackendEvent>;
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct BackendOutput {
     pub backend_session_id: Option<String>,
+    pub provider_checkpoint_id: Option<String>,
     pub event: Vec<BackendEvent>,
     pub plan_markdown: Option<String>,
     pub plan_question: Option<PlanQuestionSet>,
@@ -249,6 +250,14 @@ pub struct BackendOutput {
     pub structured_plan: bool,
     #[serde(skip)]
     pub metrics: TurnMetrics,
+}
+
+/// Describes a provider fork after the Harness child identity is allocated.
+#[derive(Clone, Debug)]
+pub struct BackendForkRequest {
+    pub source: BackendRequest,
+    pub target_harness_session_id: String,
+    pub checkpoint_id: Option<String>,
 }
 
 /// Tracks provider-reported metrics while one backend turn streams.
@@ -338,7 +347,7 @@ pub trait Backend: Send + Sync {
     ) -> Result<BackendOutput>;
 
     /// Fork a provider session only when the provider advertises native support.
-    async fn fork(&self, _request: BackendRequest) -> Result<BackendForkResult> {
+    async fn fork(&self, _request: BackendForkRequest) -> Result<BackendForkResult> {
         anyhow::bail!("backend does not support session fork")
     }
 
@@ -471,6 +480,7 @@ pub fn build(
                 Some("blocking" | "visible-blocking" | "writing-blocking") => {
                     Some(Duration::from_secs(60))
                 }
+                Some("session-blocking") => Some(Duration::from_millis(500)),
                 Some("steering") => Some(Duration::from_millis(500)),
                 _ => None,
             },
@@ -482,6 +492,11 @@ pub fn build(
                 .command
                 .first()
                 .is_some_and(|value| value == "writing-blocking"),
+            fork_delay: launch
+                .command
+                .first()
+                .is_some_and(|value| value == "fork-blocking")
+                .then_some(Duration::from_millis(500)),
             steering: steering::SteeringLane::default(),
         })),
     }
@@ -491,6 +506,7 @@ struct MockBackend {
     delay: Option<Duration>,
     emit_before_delay: bool,
     write_before_delay: bool,
+    fork_delay: Option<Duration>,
     steering: steering::SteeringLane,
 }
 
@@ -567,6 +583,7 @@ impl Backend for MockBackend {
             backend_session_id: request
                 .backend_session_id
                 .or_else(|| Some("mock-session".into())),
+            provider_checkpoint_id: Some("mock-checkpoint".into()),
             event: vec![event],
             plan_markdown,
             plan_question: None,
@@ -588,10 +605,14 @@ impl Backend for MockBackend {
         })
     }
 
-    async fn fork(&self, request: BackendRequest) -> Result<BackendForkResult> {
+    async fn fork(&self, request: BackendForkRequest) -> Result<BackendForkResult> {
+        if let Some(delay) = self.fork_delay {
+            tokio::time::sleep(delay).await;
+        }
         Ok(BackendForkResult::unprofiled(format!(
             "{}-fork",
             request
+                .source
                 .backend_session_id
                 .unwrap_or_else(|| "mock-session".into())
         )))
@@ -675,6 +696,7 @@ mod test {
             delay: Some(Duration::from_millis(50)),
             emit_before_delay: false,
             write_before_delay: false,
+            fork_delay: None,
             steering: steering::SteeringLane::default(),
         });
         let prompt_backend = Arc::clone(&backend);

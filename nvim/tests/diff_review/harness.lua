@@ -764,6 +764,16 @@ local function fake_launcher(command, options, _)
         name = fork_name,
         native_fork = true,
         execution_mode = "read",
+        backend_session_id = nil,
+        provider_checkpoint_id = nil,
+        provider_fork_state = {
+          state = "preparing",
+          source_session_id = source_session.id,
+          point = {
+            backend_session_id = source_session.backend_session_id,
+            checkpoint_id = source_session.provider_checkpoint_id,
+          },
+        },
       })
       local fork_timeline = { {
         kind = "session_event",
@@ -793,20 +803,23 @@ local function fake_launcher(command, options, _)
         artifact = {},
         prompt_history = prompt_history,
         fork_performance = {
-          total_ms = 150,
+          total_ms = 5,
+          provider_pending = true,
           timing = {
-            { phase = "codex.process_start", duration_ms = 10 },
-            { phase = "codex.initialize", duration_ms = 20 },
-            { phase = "codex.thread_fork", duration_ms = 110 },
-            { phase = "broker.persist_activate", duration_ms = 5 },
-            { phase = "broker.snapshot", duration_ms = 5 },
+            { phase = "broker.persist_child", duration_ms = 5 },
           },
         },
       }
       session_snapshot_by_id[active_session.id] = vim.deepcopy(fork_snapshot)
       vim.defer_fn(function()
-        emit(options, { event = "session_changed", payload = { session = active_session } })
         emit(options, { id = request.id, result = fork_snapshot })
+        emit(options, { event = "session_created", payload = active_session })
+      end, 1)
+      vim.defer_fn(function()
+        active_session.backend_session_id = "mock-session-fork"
+        active_session.provider_fork_state = { state = "ready" }
+        session_snapshot_by_id[active_session.id].session = vim.deepcopy(active_session)
+        emit(options, { event = "session_fork_ready", payload = { session = vim.deepcopy(active_session) } })
       end, 150)
     elseif request.method == "goal.continue" then
       goal_continue_count = goal_continue_count + 1
@@ -3284,6 +3297,11 @@ local ok, failure = pcall(function()
     "  Forked from " .. parent_session_id .. " (Architecture review)"
   )
   assert_true(fork_line ~= nil, "fork timelines should begin with durable parent lineage")
+  assert_true(vim.wait(2000, function()
+    return session.harness.session
+      and session.harness.session.provider_fork_state
+      and session.harness.session.provider_fork_state.state == "ready"
+  end, 10), "/fork should apply asynchronous provider readiness to the child session")
   vim.api.nvim_set_current_win(session.harness.composer_win)
   vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/rename" })
   controller.submit()

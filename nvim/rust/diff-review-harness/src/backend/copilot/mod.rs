@@ -6,8 +6,8 @@ use crate::backend::approval::{
 };
 use crate::backend::{
     Backend, BackendCapability, BackendCatalogRequest, BackendContextWindow, BackendDescriptor,
-    BackendEvent, BackendEventSink, BackendInput, BackendKind, BackendModel, BackendOutput,
-    BackendRequest, CatalogCapability, CatalogMutation, McpDefinition, McpStatus,
+    BackendEvent, BackendEventSink, BackendForkRequest, BackendInput, BackendKind, BackendModel,
+    BackendOutput, BackendRequest, CatalogCapability, CatalogMutation, McpDefinition, McpStatus,
     McpToolDefinition, PromptMode, SkillDefinition,
 };
 use crate::control_tools::{ControlToolInvocation, ControlToolRegistry, apply_invocation};
@@ -32,16 +32,23 @@ use github_copilot_sdk::{
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex as StandardMutex};
+use std::sync::{
+    Arc, Mutex as StandardMutex,
+    atomic::{AtomicU64, Ordering},
+};
 use tokio::sync::{Mutex, mpsc};
 
 const SYSTEM_MESSAGE: &str = "You run inside DiffReview Harness. Call harness_plan_question whenever the user asks for interactive or multiple-choice questions, and during planning when a material user decision is required. While questions remain pending, use harness_question_answer only for an explicit user answer and harness_question_withdraw only when no material user decision remains. The question tools work in every mode. Call harness_plan_submit only with a complete Markdown plan. End the turn after a Harness question or plan control call. For a terminal goal state, call harness_goal_complete or harness_goal_blocked. Never claim a control action through ordinary prose alone.";
+
+type SharedCopilotSession = Arc<github_copilot_sdk::session::Session>;
+type CopilotSessionSlot = Arc<Mutex<Option<SharedCopilotSession>>>;
 
 /// Owns the native Copilot SDK client, session, event decoder, and Harness callbacks.
 pub struct CopilotBackend {
     command: Vec<String>,
     client: Mutex<Option<Client>>,
-    active_session_by_harness: Mutex<HashMap<String, Arc<github_copilot_sdk::session::Session>>>,
+    client_start_count: AtomicU64,
+    session_slot_by_harness: Mutex<HashMap<String, CopilotSessionSlot>>,
     turn_event_by_harness: Mutex<HashMap<String, Arc<CopilotTurnEvent>>>,
     control_router_by_harness: Mutex<HashMap<String, Arc<ControlToolRouter>>>,
     permission_context_by_harness: Mutex<HashMap<String, Arc<CopilotPermissionContext>>>,
@@ -64,13 +71,19 @@ impl CopilotBackend {
         Ok(Self {
             command,
             client: Mutex::new(None),
-            active_session_by_harness: Mutex::new(HashMap::new()),
+            client_start_count: AtomicU64::new(0),
+            session_slot_by_harness: Mutex::new(HashMap::new()),
             turn_event_by_harness: Mutex::new(HashMap::new()),
             control_router_by_harness: Mutex::new(HashMap::new()),
             permission_context_by_harness: Mutex::new(HashMap::new()),
             completed_event_by_harness: Mutex::new(HashMap::new()),
             permission_coordinator,
         })
+    }
+
+    /// Return how many Copilot SDK client process generations this backend launched.
+    pub fn client_start_count(&self) -> u64 {
+        self.client_start_count.load(Ordering::Relaxed)
     }
 
     async fn client(&self, workspace: &str) -> Result<Client> {
@@ -88,16 +101,15 @@ impl CopilotBackend {
         let started = Client::start(options)
             .await
             .context("start GitHub Copilot SDK client")?;
+        self.client_start_count.fetch_add(1, Ordering::Relaxed);
         *client = Some(started.clone());
         Ok(started)
     }
 
-    async fn session(
-        &self,
-        request: &BackendRequest,
-    ) -> Result<Arc<github_copilot_sdk::session::Session>> {
-        let mut active_session_by_harness = self.active_session_by_harness.lock().await;
-        if let Some(session) = active_session_by_harness.get(&request.harness_session_id) {
+    async fn session(&self, request: &BackendRequest) -> Result<SharedCopilotSession> {
+        let session_slot = self.session_slot(&request.harness_session_id).await;
+        let mut active_session = session_slot.lock().await;
+        if let Some(session) = active_session.as_ref() {
             if request.model != "default" {
                 let client = self.client(&request.workspace).await?;
                 let reasoning_effort = Self::reasoning_effort(&client, request).await?;
@@ -155,8 +167,27 @@ impl CopilotBackend {
                 .context("create Copilot session")?
         };
         let session = Arc::new(session);
-        active_session_by_harness.insert(request.harness_session_id.clone(), Arc::clone(&session));
+        *active_session = Some(Arc::clone(&session));
         Ok(session)
+    }
+
+    async fn session_slot(&self, harness_session_id: &str) -> CopilotSessionSlot {
+        let mut session_slot_by_harness = self.session_slot_by_harness.lock().await;
+        Arc::clone(
+            session_slot_by_harness
+                .entry(harness_session_id.to_owned())
+                .or_insert_with(|| Arc::new(Mutex::new(None))),
+        )
+    }
+
+    async fn active_session(&self, harness_session_id: &str) -> Option<SharedCopilotSession> {
+        let session_slot = self
+            .session_slot_by_harness
+            .lock()
+            .await
+            .get(harness_session_id)
+            .cloned()?;
+        session_slot.lock().await.clone()
     }
 
     fn catalog_backend_request(request: &BackendCatalogRequest) -> BackendRequest {
@@ -366,6 +397,7 @@ impl Backend for CopilotBackend {
                             .lock()
                             .await
                             .insert(request.harness_session_id.clone(), provider_event.id.clone());
+                        output.provider_checkpoint_id = Some(provider_event.id.clone());
                         break;
                     }
                     if provider_event.event_type == "session.todos_changed" {
@@ -415,16 +447,14 @@ impl Backend for CopilotBackend {
         Ok(output)
     }
 
-    async fn fork(&self, request: BackendRequest) -> Result<crate::backend::BackendForkResult> {
+    async fn fork(&self, request: BackendForkRequest) -> Result<crate::backend::BackendForkResult> {
         let started = std::time::Instant::now();
-        let client = self.client(&request.workspace).await?;
-        let completed_event_id = self
-            .completed_event_by_harness
-            .lock()
-            .await
-            .get(&request.harness_session_id)
-            .cloned();
-        let backend_session_id = match (request.backend_session_id.clone(), completed_event_id) {
+        let mut target_request = request.source;
+        let client = self.client(&target_request.workspace).await?;
+        let backend_session_id = match (
+            target_request.backend_session_id.clone(),
+            request.checkpoint_id,
+        ) {
             (Some(source_session_id), Some(to_event_id)) => client
                 .rpc()
                 .sessions()
@@ -437,8 +467,11 @@ impl Backend for CopilotBackend {
                 .context("fork Copilot session")?
                 .session_id
                 .to_string(),
-            _ => self.session(&request).await?.id().to_string(),
+            _ => self.session(&target_request).await?.id().to_string(),
         };
+        target_request.harness_session_id = request.target_harness_session_id;
+        target_request.backend_session_id = Some(backend_session_id.clone());
+        self.session(&target_request).await?;
         Ok(crate::backend::BackendForkResult {
             backend_session_id,
             timing: vec![crate::backend::BackendTimingRecord {
@@ -727,11 +760,8 @@ impl Backend for CopilotBackend {
 
     async fn steer_session(&self, session_id: &str, text: String) -> Result<()> {
         let session = self
-            .active_session_by_harness
-            .lock()
+            .active_session(session_id)
             .await
-            .get(session_id)
-            .cloned()
             .context("Copilot session has not started")?;
         session
             .send(MessageOptions::new(text.clone()).with_mode(DeliveryMode::Immediate))
@@ -746,7 +776,7 @@ impl Backend for CopilotBackend {
     }
 
     async fn cancel_session(&self, session_id: &str) -> Result<()> {
-        if let Some(session) = self.active_session_by_harness.lock().await.get(session_id) {
+        if let Some(session) = self.active_session(session_id).await {
             session.abort().await.context("abort active Copilot turn")?;
         }
         Ok(())
@@ -757,10 +787,8 @@ impl Backend for CopilotBackend {
     }
 
     async fn active_session_id_for(&self, session_id: &str) -> Option<String> {
-        self.active_session_by_harness
-            .lock()
+        self.active_session(session_id)
             .await
-            .get(session_id)
             .map(|session| session.id().to_string())
     }
 }

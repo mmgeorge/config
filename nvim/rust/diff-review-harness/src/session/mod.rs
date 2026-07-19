@@ -37,6 +37,30 @@ pub struct ContextUsage {
     pub remaining_percent: u8,
 }
 
+/// Captures the provider-owned boundary used to materialize one fork.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProviderForkPoint {
+    pub backend_session_id: Option<String>,
+    pub checkpoint_id: Option<String>,
+}
+
+/// Tracks whether one Harness session can accept provider-bound work.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ProviderForkState {
+    #[default]
+    Ready,
+    Preparing {
+        source_session_id: String,
+        point: ProviderForkPoint,
+    },
+    Failed {
+        source_session_id: String,
+        point: ProviderForkPoint,
+        message: String,
+    },
+}
+
 impl ContextUsage {
     const CODEX_BASELINE_TOKENS: u64 = 12_000;
 
@@ -90,6 +114,8 @@ pub struct HarnessSession {
     pub workspace: String,
     pub backend: String,
     pub backend_session_id: Option<String>,
+    pub provider_checkpoint_id: Option<String>,
+    pub provider_fork_state: ProviderForkState,
     pub model: String,
     #[serde(default)]
     pub provider_label: String,

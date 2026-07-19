@@ -189,11 +189,28 @@ copying an unfinished prompt. `/new [name]` follows the same immediate-tab path 
 focuses an already-open timeline, opens in the current tab by default, and toggles new-tab opening with `<Tab>`.
 `:HarnessNew` also creates its provisional timeline before broker work. On a cold client it carries the new-session
 request through initialization so the broker creates that exact session without first resuming or persisting another one.
-On a warm client it routes `session.new` through the source controller while preserving every existing timeline tab.
+On a warm client the process-wide session coordinator clones provider-neutral settings from the durable source without
+entering its controller, so an active source turn or catalog lookup cannot delay the new timeline.
 
-The Rust broker keeps a shared provider runtime and a serialized controller per session. Codex retains one app-server
-process per Harness session, while Copilot retains one SDK session and its turn-local control lanes per Harness session.
-This preserves independent cancellation, approvals, queues, and modes while allowing separate timelines to run at once.
+The Rust broker keeps one process-wide provider runtime and a serialized controller per Harness session. Codex lazily
+launches one app-server with a loopback WebSocket listener, then gives each session an independent JSON-RPC connection
+and provider thread through that host. Catalog discovery, `/new`, `/fork`, resumed sessions, prompts, configuration,
+and compaction all reuse the same operating-system process. Copilot follows the same ownership rule through one SDK
+`Client`, while Harness-keyed session slots retain independent SDK sessions and turn-local control lanes. Each slot
+serializes only its own create or resume path, so one slow session bootstrap cannot block another timeline.
+
+Fork creation crosses two lifecycle boundaries. The broker first reads the source's last persisted provider session id
+and completed-turn checkpoint, writes a child with `provider_fork_state = preparing`, preserves inherited context usage,
+and returns its snapshot immediately. Provider preparation then runs outside the parent controller lock. Codex caches
+the prepared WebSocket connection under the child id, while Copilot caches the prepared SDK session there. A prompt
+submitted before preparation finishes waits on that child's gate only. Completion persists `ready` or `failed` before
+publishing `session_fork_ready` or `session_fork_failed`, so unrelated timelines continue and failure remains explicit.
+If the broker restarts with a child still marked `preparing`, provider-bound work reports the interrupted preparation
+instead of guessing at provider history.
+
+This split preserves independent cancellation, approvals, queues, and modes while preventing session creation from
+multiplying provider hosts. The user-visible result combines immediate tabs with real concurrent turns and one stable
+provider process per Harness broker.
 
 ---
 
@@ -995,7 +1012,7 @@ printed before rendering. MCP payload details stop at the Codex transport bounda
 a generic tool.
 
 The Codex `CodexTurnCoordinator` treats one user request as a logical interaction that may outlive
-its first parent app-server turn. It retains the JSON-RPC process while descendant threads remain
+its first parent app-server turn. It retains the session's JSON-RPC connection while descendant threads remain
 active, accepts steering as another parent turn on the same thread, and starts a bounded synthesis
 turn after the final child completes. Child lifecycle updates replace `AgentRun` state behind the
 existing `AgentReference`, so they never move the child row. Codex `subAgentActivity` values enter
