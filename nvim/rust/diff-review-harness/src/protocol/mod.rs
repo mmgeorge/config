@@ -32,6 +32,7 @@ pub struct ProtocolError {
 /// Represents an asynchronous state change streamed from the broker.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BrokerEvent {
+    pub session_id: String,
     pub event: String,
     pub payload: Value,
 }

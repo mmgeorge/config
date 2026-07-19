@@ -3,9 +3,10 @@ local M = {}
 ---@param id integer
 ---@param method string
 ---@param params? table
+---@param session_id? string
 ---@return string
-function M.encode_request(id, method, params)
-  return vim.json.encode({ id = id, method = method, params = params or {} }) .. "\n"
+function M.encode_request(id, method, params, session_id)
+  return vim.json.encode({ id = id, method = method, params = params or {}, session_id = session_id }) .. "\n"
 end
 
 ---@param line string
@@ -20,4 +21,3 @@ function M.decode_message(line)
 end
 
 return M
-

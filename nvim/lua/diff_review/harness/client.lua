@@ -25,8 +25,8 @@ local shutdown_autocmd = false
 
 ---@return DiffReviewHarnessClient
 local function state()
-  if session.harness.client then return session.harness.client end
-  session.harness.client = {
+  if session.harness_host.client then return session.harness_host.client end
+  session.harness_host.client = {
     process = nil,
     generation = 0,
     next_id = 0,
@@ -39,8 +39,9 @@ local function state()
     starting = false,
     initialize_callback = {},
     snapshot = nil,
+    snapshot_by_id = {},
   }
-  return session.harness.client
+  return session.harness_host.client
 end
 
 ---@return DiffReviewHarnessBackendDescriptor
@@ -76,15 +77,16 @@ end
 local function dispatch_message(message)
   local client = state()
   if message.event then
-    if client.snapshot and (message.event == "plan_question" or message.event == "plan_question_updated") then
-      client.snapshot.active_plan = vim.deepcopy(message.payload and message.payload.plan or nil)
-    elseif client.snapshot and (message.event == "question" or message.event == "question_updated") then
-      client.snapshot.active_elicitation = vim.deepcopy(message.payload)
-    elseif client.snapshot and message.event == "question_answered" then
-      client.snapshot.active_elicitation = nil
+    local event_snapshot = client.snapshot_by_id[message.session_id]
+    if event_snapshot and (message.event == "plan_question" or message.event == "plan_question_updated") then
+      event_snapshot.active_plan = vim.deepcopy(message.payload and message.payload.plan or nil)
+    elseif event_snapshot and (message.event == "question" or message.event == "question_updated") then
+      event_snapshot.active_elicitation = vim.deepcopy(message.payload)
+    elseif event_snapshot and message.event == "question_answered" then
+      event_snapshot.active_elicitation = nil
     end
     for _, subscriber in pairs(client.subscriber) do
-      local ok, err = pcall(subscriber, message.event, message.payload)
+      local ok, err = pcall(subscriber, message.event, message.payload, message.session_id)
       if not ok then notifications.error("Harness event subscriber failed: " .. tostring(err), "Harness") end
     end
     return
@@ -111,6 +113,8 @@ local function dispatch_message(message)
   else
     if pending.method == "state.get" then
       client.snapshot = message.result
+      local result_session_id = message.result and message.result.session and message.result.session.id
+      if result_session_id then client.snapshot_by_id[result_session_id] = message.result end
     elseif pending.method == "history.record" and client.snapshot then
       client.snapshot.prompt_history = vim.deepcopy(message.result or {})
     elseif (pending.method == "question.answer" or pending.method == "question.skip")
@@ -118,6 +122,8 @@ local function dispatch_message(message)
     then
       client.snapshot = vim.deepcopy(message.result)
     end
+    local result_session_id = message.result and message.result.session and message.result.session.id
+    if result_session_id then client.snapshot_by_id[result_session_id] = message.result end
     pending.callback(message.result, nil)
   end
 end
@@ -161,6 +167,8 @@ local function send_initialize(callback, initialize_options)
     end
     client.ready = true
     client.snapshot = result
+    local initialized_session_id = result and result.session and result.session.id
+    if initialized_session_id then client.snapshot_by_id[initialized_session_id] = result end
     session.harness.ready = true
     finish_start(callback, result, nil)
   end }
@@ -286,18 +294,38 @@ end
 ---@param params? table
 ---@param callback? fun(result?: any, error?: string, error_detail?: table)
 function M.request(method, params, callback)
+  local active_session_id = session.harness.session and session.harness.session.id or nil
+  M.request_for(active_session_id, method, params, callback)
+end
+
+---@param session_id? string
+---@param method string
+---@param params? table
+---@param callback? fun(result?: any, error?: string, error_detail?: table)
+function M.request_for(session_id, method, params, callback)
   callback = callback or function() end
+  local request_state = session.harness
+  local function session_callback(...)
+    local active_state = session.harness
+    session.activate_harness(request_state)
+    callback(...)
+    if active_state ~= request_state then session.activate_harness(active_state) end
+  end
   M.start(function(_, start_error)
-    if start_error then callback(nil, start_error) return end
+    if start_error then session_callback(nil, start_error) return end
     local client = state()
-    if not client.process then callback(nil, "Harness broker is not running") return end
+    if not client.process then session_callback(nil, "Harness broker is not running") return end
     client.next_id = client.next_id + 1
     local id = client.next_id
-    client.pending[id] = { method = method, callback = callback }
-    local ok, write_error = pcall(client.process.write, client.process, protocol.encode_request(id, method, params))
+    client.pending[id] = { method = method, callback = session_callback }
+    local ok, write_error = pcall(
+      client.process.write,
+      client.process,
+      protocol.encode_request(id, method, params, session_id)
+    )
     if not ok then
       client.pending[id] = nil
-      callback(nil, "Failed to write Harness request: " .. tostring(write_error))
+      session_callback(nil, "Failed to write Harness request: " .. tostring(write_error))
     end
   end)
 end
@@ -337,7 +365,7 @@ end
 function M._set_launcher_for_test(launcher) launcher_for_test = launcher end
 function M._reset_for_test()
   M.stop()
-  session.harness.client = nil
+  session.harness_host.client = nil
   launcher_for_test = nil
   shutdown_autocmd = false
 end

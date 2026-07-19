@@ -3,7 +3,7 @@ return {
     'MeanderingProgrammer/render-markdown.nvim',
     build = function()
       local dependency = require('markdown_math.dependency')
-      local result = vim.system(dependency.install_command(), { text = true }):wait()
+      local result = vim.system(dependency.install_command(), { text = true, stdout = true, stderr = true }):wait()
       if result.code ~= 0 then
         error('install libtexprintf: ' .. vim.trim(result.stderr or result.stdout or 'unknown npm error'))
       end

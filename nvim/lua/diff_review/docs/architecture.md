@@ -176,6 +176,22 @@ Contributor-facing assistant rules live at the repo root in
 `.rulesync/rules/diff_review.md`; keep that rule focused on working practices and keep
 this document focused on architecture.
 
+### Harness timeline ownership
+
+`harness/client.lua` owns one persistent JSONL broker process. Every request and streamed event carries a durable
+Harness session id, so the process routes independent turns without treating one session as globally active.
+`session.lua` mirrors that boundary through `harness_by_id`: each live session owns a transcript buffer, composer
+buffer, windows, queue, busy state, and subscriptions inside one real Neovim tab.
+
+`/fork` creates that tab before provider work finishes. The child receives only the source's last completed provider
+turn. A fork during the source's first in-progress turn therefore starts with an empty provider thread, rather than
+copying an unfinished prompt. `/new [name]` follows the same immediate-tab path without provider history. `/sessions`
+focuses an already-open timeline, opens in the current tab by default, and toggles new-tab opening with `<Tab>`.
+
+The Rust broker keeps a shared provider runtime and a serialized controller per session. Codex retains one app-server
+process per Harness session, while Copilot retains one SDK session and its turn-local control lanes per Harness session.
+This preserves independent cancellation, approvals, queues, and modes while allowing separate timelines to run at once.
+
 ---
 
 ## 3. Shared state (`session.lua`) and the `dr()` seam
@@ -291,6 +307,14 @@ that presentation cache even while a provider turn runs. Model, effort, fast-mod
 execution-mode selections continue through their normal mutation owners. Configuration and backend
 changes queue for the next safe boundary, while execution mode retains its active-turn restart
 contract.
+
+`views/harness/provider_catalog.lua` owns per-session caches for backend skills and MCP definitions.
+`/skills` toggles future skill eligibility and inserts enabled `$skill` selectors, while the completion
+source advertises only enabled user-invocable skills at the first non-whitespace token.
+
+`/mcp` renders each complete provider definition with transport, token attribution, lifecycle state,
+and its cached tools. Copilot applies MCP changes to its live SDK session. Codex interrupts an active
+turn, writes effective app-server config, confirms refreshed status, then resumes that interaction.
 
 The `/undo` specialization loads the active session's durable interaction records and lists
 checkpointed complete, failed, or cancelled interactions newest first. Selecting a record opens a
@@ -945,6 +969,10 @@ identity in the UI. The broker overlays durable reasoning and context selections
 Lua receives the catalog. `views/harness/model_picker.lua` therefore owns only picker interaction
 state, field cycling, and presentation order. Copilot maps the selected context tier into native
 session creation and `set_model`, while Codex exposes only the controls returned by app-server.
+
+`BackendInput` distinguishes ordinary text from explicit skill invocation before either provider
+sees the prompt. `SkillDefinition` normalizes discovery and enabled state, while each `McpDefinition`
+owns its tool inventory so callers never issue a second tool-list operation against the backend.
 
 The broker runs once per Neovim process over JSONL stdio. Provider events cross a live
 channel into `TimelineReducer`, which owns one active thought inside the current `MainSegment`.

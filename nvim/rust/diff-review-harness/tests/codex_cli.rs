@@ -1,7 +1,8 @@
 use diff_review_harness::agent::AgentRunStatus;
 use diff_review_harness::backend::codex::CodexBackend;
 use diff_review_harness::backend::{
-    Backend, BackendLaunch, BackendRequest, PromptMode, ToolActivityKind,
+    Backend, BackendCatalogRequest, BackendInput, BackendLaunch, BackendRequest, PromptMode,
+    ToolActivityKind,
 };
 use diff_review_harness::broker::{HarnessBroker, InitializeRequest};
 use diff_review_harness::plan::PlanPrompt;
@@ -22,8 +23,9 @@ fn git(workspace: &Path, args: &[&str]) {
 
 fn request(workspace: &Path, mode: PromptMode, text: &str) -> BackendRequest {
     BackendRequest {
+        harness_session_id: "harness-session".into(),
         workspace: workspace.to_string_lossy().into_owned(),
-        text: text.into(),
+        input: BackendInput::from_text(text),
         mode,
         model: "gpt-5.6-terra".into(),
         effort: "low".into(),
@@ -61,6 +63,44 @@ async fn lists_backend_owned_codex_model_metadata() {
     );
     assert!(model_list.iter().any(|model| !model.reasoning.is_empty()));
     assert!(model_list.iter().any(|model| model.description.is_some()));
+}
+
+#[tokio::test]
+#[ignore = "requires an installed and authenticated Codex CLI"]
+async fn lists_provider_skills_and_complete_mcp_rows() {
+    let repository = tempfile::tempdir().unwrap();
+    let backend = CodexBackend::new(vec!["codex".into(), "app-server".into()]).unwrap();
+    let catalog_request = BackendCatalogRequest {
+        harness_session_id: "catalog-session".into(),
+        workspace: repository.path().to_string_lossy().into_owned(),
+        execution_mode: ExecutionMode::Read,
+        backend_session_id: None,
+    };
+
+    let skill_list = tokio::time::timeout(
+        Duration::from_secs(30),
+        backend.skill_list(catalog_request.clone()),
+    )
+    .await
+    .expect("Codex skill list timed out")
+    .unwrap();
+    assert!(!skill_list.is_empty());
+    assert!(skill_list.iter().all(|skill| !skill.name.is_empty()));
+    assert!(skill_list.iter().all(|skill| skill.path.is_some()));
+
+    let mcp_list = tokio::time::timeout(Duration::from_secs(30), backend.mcp_list(catalog_request))
+        .await
+        .expect("Codex MCP list timed out")
+        .unwrap();
+    assert!(!mcp_list.is_empty());
+    assert!(mcp_list.iter().all(|server| !server.name.is_empty()));
+    assert!(mcp_list.iter().any(|server| server.transport != "unknown"));
+    assert!(mcp_list.iter().any(|server| !server.tools.is_empty()));
+    assert!(
+        mcp_list
+            .iter()
+            .all(|server| server.tools.iter().all(|tool| !tool.name.is_empty()))
+    );
 }
 
 #[tokio::test]

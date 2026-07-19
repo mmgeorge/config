@@ -67,13 +67,7 @@ local function resume_session(instance, entry)
   picker.close(false)
   session_preview.close()
   active = nil
-  client.request("session.resume", { session_id = entry.id }, function(result, request_error)
-    if request_error then
-      notifications.error(request_error, "Sessions")
-      return
-    end
-    session_navigation.activate(result)
-  end)
+  session_navigation.resume(entry.id, { open_mode = instance.open_mode })
 end
 
 local build_spec
@@ -101,6 +95,7 @@ end
 ---@return table
 build_spec = function(instance)
   local scope_label = instance.scope == "repo" and "current repository" or "all repositories"
+  local open_label = instance.open_mode == "tab" and "new tab" or "current tab"
   local option_list = vim.tbl_map(function(entry) return option(entry, instance.scope) end, instance.entry_list)
   return {
     owner = "sessions",
@@ -109,14 +104,24 @@ build_spec = function(instance)
       {
         id = "sessions",
         title = "Harness sessions",
-        subtitle = "Search " .. scope_label .. ". Moving the selection previews its timeline above.",
+        subtitle = "Search " .. scope_label .. ". Open in " .. open_label .. ".",
         option_list = option_list,
         empty_text = "No matching Harness sessions.",
         search = { choice_keys = config.options.picker.session_keys },
-        footer = "↑↓ select  Enter resume  C-j delete  C-o toggle scope  Esc normal",
+        footer = "↑↓ select  Enter open  Tab toggle tab  C-j delete  C-o scope  Esc normal",
       },
     },
     action_list = {
+      {
+        id = "open-mode",
+        key = "<Tab>",
+        modes = { "n", "i" },
+        desc = "Toggle current-tab and new-tab opening",
+        callback = function()
+          instance.open_mode = instance.open_mode == "current" and "tab" or "current"
+          picker.update(build_spec(instance))
+        end,
+      },
       {
         id = "delete",
         key = "<C-j>",
@@ -176,6 +181,7 @@ function SessionPicker.open(host)
   local instance = {
     host = host,
     scope = "repo",
+    open_mode = "current",
     entry_list = {},
     list_generation = 0,
     preview_generation = 0,

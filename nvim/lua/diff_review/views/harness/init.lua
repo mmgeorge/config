@@ -14,8 +14,7 @@ local function valid_window(win) return win and vim.api.nvim_win_is_valid(win) e
 
 local function apply_snapshot(state, result)
   session_navigation.activate(result, {
-    buffer = state.transcript_buf,
-    switch_buffer = false,
+    state = state,
     interaction_mode = "reconcile",
   })
 end
@@ -89,7 +88,8 @@ function M.open()
       config.options.harness.backend
     )
   end
-  state.transcript_buf, state.transcript_win, state.composer_buf, state.composer_win = layout.open()
+  state.transcript_buf, state.transcript_win, state.composer_buf, state.composer_win, state.timeline_tab =
+    layout.open("initial-pending-" .. tostring(vim.uv.hrtime()))
   layout.attach_auto_height(state.composer_buf, state.composer_win)
   layout.attach_scroll_boundary(state.transcript_buf, state.transcript_win)
   controller.attach()
@@ -138,11 +138,19 @@ function M.switch_backend(backend)
   end)
 end
 
-function M.new_session()
+---@param name? string
+function M.new_session(name)
   M.open()
-  client.request("session.new", {}, function(result, request_error)
-    if request_error then notifications.error(request_error, "Harness") return end
-    session_navigation.activate(result)
+  local source_session_id = session.harness.session and session.harness.session.id or nil
+  local pending = session_navigation.begin_new(name)
+  client.request_for(source_session_id, "session.new", { name = name }, function(result, request_error)
+    if request_error then
+      pending.error = request_error
+      session_navigation.render_pending(pending)
+      notifications.error(request_error, "Harness")
+      return
+    end
+    session_navigation.complete_pending(pending, result)
   end)
 end
 

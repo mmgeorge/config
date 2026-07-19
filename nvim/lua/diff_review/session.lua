@@ -117,10 +117,10 @@ M.empty_diff_rows = {}
 ---@field selected_agent_run_id string?
 ---@field agent_live table<string, table>
 
---- Harness process, view, queue, interaction-tree, and capability state. The broker owns
---- durable state while this table owns only the current Neovim presentation.
----@type DiffReviewHarnessPresentationState
-M.harness = {
+--- Build one Neovim presentation owner for one concurrently resident Harness session.
+---@return DiffReviewHarnessPresentationState
+local function new_harness_state()
+  return {
   client = nil,
   ready = false,
   busy = false,
@@ -166,6 +166,29 @@ M.harness = {
   agent = { definition = {}, run = {}, turn = {} },
   selected_agent_run_id = nil,
   agent_live = {},
-}
+  }
+end
+
+--- Harness process state shared by every timeline tab.
+M.harness_host = { client = nil }
+
+--- Presentation state indexed by durable Harness session id.
+---@type table<string, DiffReviewHarnessPresentationState>
+M.harness_by_id = {}
+
+--- Active presentation selected by the current Harness tab.
+---@type DiffReviewHarnessPresentationState
+M.harness = new_harness_state()
+
+function M.new_harness_state() return new_harness_state() end
+
+---@param state DiffReviewHarnessPresentationState
+function M.activate_harness(state) M.harness = state end
+
+---@param session_id string
+---@param state DiffReviewHarnessPresentationState
+function M.register_harness(session_id, state)
+  M.harness_by_id[session_id] = state
+end
 
 return M

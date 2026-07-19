@@ -5,8 +5,10 @@ use crate::backend::approval::{
     ApprovalResolution, PermissionCoordinator, permission_from_copilot, protected_target,
 };
 use crate::backend::{
-    Backend, BackendCapability, BackendContextWindow, BackendDescriptor, BackendEvent,
-    BackendEventSink, BackendKind, BackendModel, BackendOutput, BackendRequest,
+    Backend, BackendCapability, BackendCatalogRequest, BackendContextWindow, BackendDescriptor,
+    BackendEvent, BackendEventSink, BackendInput, BackendKind, BackendModel, BackendOutput,
+    BackendRequest, CatalogCapability, CatalogMutation, McpDefinition, McpStatus,
+    McpToolDefinition, PromptMode, SkillDefinition,
 };
 use crate::control_tools::{ControlToolInvocation, ControlToolRegistry, apply_invocation};
 use crate::session::ExecutionMode;
@@ -14,6 +16,12 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use event_decoder::CopilotEventDecoder;
 use github_copilot_sdk::handler::{PermissionHandler, PermissionResult};
+use github_copilot_sdk::rpc::{
+    CommandsInvokeRequest, McpConfigDisableRequest, McpConfigEnableRequest, McpDisableRequest,
+    McpDiscoverRequest, McpEnableRequest, McpListToolsRequest, SessionsForkRequest,
+    SkillsConfigSetDisabledSkillsRequest, SkillsDisableRequest, SkillsEnableRequest,
+    SlashCommandInvocationResult,
+};
 use github_copilot_sdk::tool::ToolHandler;
 use github_copilot_sdk::types::ContextTier;
 use github_copilot_sdk::{
@@ -22,6 +30,7 @@ use github_copilot_sdk::{
     SetModelOptions, SystemMessageConfig, Tool, ToolInvocation, ToolResult,
 };
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StandardMutex};
 use tokio::sync::{Mutex, mpsc};
@@ -32,10 +41,12 @@ const SYSTEM_MESSAGE: &str = "You run inside DiffReview Harness. Call harness_pl
 pub struct CopilotBackend {
     command: Vec<String>,
     client: Mutex<Option<Client>>,
-    active_session: Mutex<Option<Arc<github_copilot_sdk::session::Session>>>,
-    turn_event: CopilotTurnEvent,
-    control_router: Arc<ControlToolRouter>,
-    permission_context: Arc<CopilotPermissionContext>,
+    active_session_by_harness: Mutex<HashMap<String, Arc<github_copilot_sdk::session::Session>>>,
+    turn_event_by_harness: Mutex<HashMap<String, Arc<CopilotTurnEvent>>>,
+    control_router_by_harness: Mutex<HashMap<String, Arc<ControlToolRouter>>>,
+    permission_context_by_harness: Mutex<HashMap<String, Arc<CopilotPermissionContext>>>,
+    completed_event_by_harness: Mutex<HashMap<String, String>>,
+    permission_coordinator: Arc<PermissionCoordinator>,
 }
 
 impl CopilotBackend {
@@ -53,10 +64,12 @@ impl CopilotBackend {
         Ok(Self {
             command,
             client: Mutex::new(None),
-            active_session: Mutex::new(None),
-            turn_event: CopilotTurnEvent::default(),
-            control_router: Arc::new(ControlToolRouter::default()),
-            permission_context: Arc::new(CopilotPermissionContext::new(permission_coordinator)),
+            active_session_by_harness: Mutex::new(HashMap::new()),
+            turn_event_by_harness: Mutex::new(HashMap::new()),
+            control_router_by_harness: Mutex::new(HashMap::new()),
+            permission_context_by_harness: Mutex::new(HashMap::new()),
+            completed_event_by_harness: Mutex::new(HashMap::new()),
+            permission_coordinator,
         })
     }
 
@@ -83,13 +96,8 @@ impl CopilotBackend {
         &self,
         request: &BackendRequest,
     ) -> Result<Arc<github_copilot_sdk::session::Session>> {
-        let mut active_session = self.active_session.lock().await;
-        if let Some(session) = active_session.as_ref()
-            && request
-                .backend_session_id
-                .as_deref()
-                .is_none_or(|session_id| session.id().as_str() == session_id)
-        {
+        let mut active_session_by_harness = self.active_session_by_harness.lock().await;
+        if let Some(session) = active_session_by_harness.get(&request.harness_session_id) {
             if request.model != "default" {
                 let client = self.client(&request.workspace).await?;
                 let reasoning_effort = Self::reasoning_effort(&client, request).await?;
@@ -103,20 +111,15 @@ impl CopilotBackend {
             }
             return Ok(Arc::clone(session));
         }
-        if let Some(previous) = active_session.take() {
-            previous
-                .disconnect()
-                .await
-                .context("disconnect previous Copilot session")?;
-        }
         let client = self.client(&request.workspace).await?;
         let reasoning_effort = Self::reasoning_effort(&client, request).await?;
-        let tool_list = self.control_tool_list();
+        let tool_list =
+            self.control_tool_list(self.control_router(&request.harness_session_id).await);
         let system_message = SystemMessageConfig::new()
             .with_mode("append")
             .with_content(SYSTEM_MESSAGE);
         let permission_handler: Arc<dyn PermissionHandler> = Arc::new(CopilotPermissionHandler {
-            context: Arc::clone(&self.permission_context),
+            context: self.permission_context(&request.harness_session_id).await,
         });
         let session = if let Some(session_id) = request.backend_session_id.as_deref() {
             let mut config = ResumeSessionConfig::new(SessionId::new(session_id));
@@ -152,8 +155,23 @@ impl CopilotBackend {
                 .context("create Copilot session")?
         };
         let session = Arc::new(session);
-        *active_session = Some(Arc::clone(&session));
+        active_session_by_harness.insert(request.harness_session_id.clone(), Arc::clone(&session));
         Ok(session)
+    }
+
+    fn catalog_backend_request(request: &BackendCatalogRequest) -> BackendRequest {
+        BackendRequest {
+            harness_session_id: request.harness_session_id.clone(),
+            workspace: request.workspace.clone(),
+            input: BackendInput::from_text(""),
+            mode: PromptMode::Chat,
+            model: "default".into(),
+            effort: "medium".into(),
+            context_window: None,
+            fast_mode: false,
+            execution_mode: request.execution_mode,
+            backend_session_id: request.backend_session_id.clone(),
+        }
     }
 
     async fn reasoning_effort(client: &Client, request: &BackendRequest) -> Result<Option<String>> {
@@ -171,10 +189,31 @@ impl CopilotBackend {
         Ok(selected_reasoning_effort(&model_list, request))
     }
 
-    fn control_tool_list(&self) -> Vec<Tool> {
-        let handler: Arc<dyn ToolHandler> = Arc::new(CopilotControlToolHandler {
-            router: Arc::clone(&self.control_router),
-        });
+    async fn turn_event(&self, session_id: &str) -> Arc<CopilotTurnEvent> {
+        let mut event_by_harness = self.turn_event_by_harness.lock().await;
+        Arc::clone(event_by_harness.entry(session_id.to_owned()).or_default())
+    }
+
+    async fn control_router(&self, session_id: &str) -> Arc<ControlToolRouter> {
+        let mut router_by_harness = self.control_router_by_harness.lock().await;
+        Arc::clone(router_by_harness.entry(session_id.to_owned()).or_default())
+    }
+
+    async fn permission_context(&self, session_id: &str) -> Arc<CopilotPermissionContext> {
+        let mut context_by_harness = self.permission_context_by_harness.lock().await;
+        Arc::clone(
+            context_by_harness
+                .entry(session_id.to_owned())
+                .or_insert_with(|| {
+                    Arc::new(CopilotPermissionContext::new(Arc::clone(
+                        &self.permission_coordinator,
+                    )))
+                }),
+        )
+    }
+
+    fn control_tool_list(&self, router: Arc<ControlToolRouter>) -> Vec<Tool> {
+        let handler: Arc<dyn ToolHandler> = Arc::new(CopilotControlToolHandler { router });
         ControlToolRegistry
             .definition_list()
             .into_iter()
@@ -191,7 +230,7 @@ impl CopilotBackend {
 
 fn capability() -> BackendCapability {
     BackendCapability {
-        native_fork: false,
+        native_fork: true,
         native_compact: false,
         native_steer: true,
         native_turn_rollback: false,
@@ -214,6 +253,11 @@ fn capability() -> BackendCapability {
             interrupt: AgentControlMode::Unsupported,
             parallel: true,
         },
+        catalog: CatalogCapability {
+            skill: true,
+            mcp: true,
+            live_mcp_mutation: true,
+        },
     }
 }
 
@@ -232,15 +276,19 @@ impl Backend for CopilotBackend {
         request: BackendRequest,
         event_sink: Option<BackendEventSink>,
     ) -> Result<BackendOutput> {
-        let _turn_event_guard = self.turn_event.activate(event_sink.clone())?;
-        self.permission_context.configure(
-            request.execution_mode,
-            request.workspace.clone(),
-            event_sink.clone(),
-        )?;
+        let turn_event = self.turn_event(&request.harness_session_id).await;
+        let _turn_event_guard = turn_event.activate(event_sink.clone())?;
+        self.permission_context(&request.harness_session_id)
+            .await
+            .configure(
+                request.execution_mode,
+                request.workspace.clone(),
+                event_sink.clone(),
+            )?;
         let session = self.session(&request).await?;
         let mut subscription = session.subscribe();
-        let mut control_stream = self.control_router.activate()?;
+        let control_router = self.control_router(&request.harness_session_id).await;
+        let mut control_stream = control_router.activate()?;
         let mut output = BackendOutput {
             backend_session_id: Some(session.id().to_string()),
             capability: capability(),
@@ -270,9 +318,40 @@ impl Backend for CopilotBackend {
                 event_sink.as_ref(),
             );
         }
+        let provider_text = match &request.input {
+            BackendInput::Text { text } => text.clone(),
+            BackendInput::Skill { name, arguments } => {
+                let skill_available = session
+                    .rpc()
+                    .skills()
+                    .list()
+                    .await
+                    .with_context(|| format!("resolve Copilot skill ${name}"))?
+                    .skills
+                    .into_iter()
+                    .any(|skill| skill.name == *name && skill.enabled && skill.user_invocable);
+                anyhow::ensure!(
+                    skill_available,
+                    "Copilot skill ${name} is unavailable or disabled"
+                );
+                match session
+                    .rpc()
+                    .commands()
+                    .invoke(CommandsInvokeRequest {
+                        name: name.clone(),
+                        input: (!arguments.is_empty()).then(|| arguments.clone()),
+                    })
+                    .await
+                    .with_context(|| format!("invoke Copilot skill ${name}"))?
+                {
+                    SlashCommandInvocationResult::AgentPrompt(result) => result.prompt,
+                    _ => anyhow::bail!("Copilot skill ${name} did not produce an agent prompt"),
+                }
+            }
+        };
         let prompt = format!(
             "Harness interaction contract: when the user explicitly asks for interactive or multiple-choice questions, call harness_plan_question with the complete question set. While questions remain pending, use harness_question_answer only for an explicit user answer and harness_question_withdraw only when no material user decision remains. The question tools work outside planning. Do not claim control actions through prose.\n\n{}",
-            request.text
+            provider_text
         );
         session
             .send(MessageOptions::new(prompt))
@@ -283,6 +362,10 @@ impl Backend for CopilotBackend {
                 provider_event = subscription.recv() => {
                     let provider_event = provider_event.context("receive Copilot session event")?;
                     if provider_event.event_type == "session.idle" {
+                        self.completed_event_by_harness
+                            .lock()
+                            .await
+                            .insert(request.harness_session_id.clone(), provider_event.id.clone());
                         break;
                     }
                     if provider_event.event_type == "session.todos_changed" {
@@ -332,6 +415,39 @@ impl Backend for CopilotBackend {
         Ok(output)
     }
 
+    async fn fork(&self, request: BackendRequest) -> Result<crate::backend::BackendForkResult> {
+        let started = std::time::Instant::now();
+        let client = self.client(&request.workspace).await?;
+        let completed_event_id = self
+            .completed_event_by_harness
+            .lock()
+            .await
+            .get(&request.harness_session_id)
+            .cloned();
+        let backend_session_id = match (request.backend_session_id.clone(), completed_event_id) {
+            (Some(source_session_id), Some(to_event_id)) => client
+                .rpc()
+                .sessions()
+                .fork(SessionsForkRequest {
+                    name: None,
+                    session_id: SessionId::new(source_session_id),
+                    to_event_id: Some(to_event_id),
+                })
+                .await
+                .context("fork Copilot session")?
+                .session_id
+                .to_string(),
+            _ => self.session(&request).await?.id().to_string(),
+        };
+        Ok(crate::backend::BackendForkResult {
+            backend_session_id,
+            timing: vec![crate::backend::BackendTimingRecord {
+                phase: "copilot.session_fork".into(),
+                duration_ms: started.elapsed().as_secs_f64() * 1000.0,
+            }],
+        })
+    }
+
     async fn model_list(&self, request: BackendRequest) -> Result<Vec<BackendModel>> {
         let client = self.client(&request.workspace).await?;
         let model_list = client.list_models().await.context("list Copilot models")?;
@@ -341,33 +457,310 @@ impl Backend for CopilotBackend {
         Ok(model_list.into_iter().map(model_descriptor).collect())
     }
 
-    async fn steer(&self, text: String) -> Result<()> {
+    async fn skill_list(&self, request: BackendCatalogRequest) -> Result<Vec<SkillDefinition>> {
+        let backend_request = Self::catalog_backend_request(&request);
+        let session = self.session(&backend_request).await?;
+        let skill_list = session
+            .rpc()
+            .skills()
+            .list()
+            .await
+            .context("list Copilot skills")?;
+        Ok(skill_list
+            .skills
+            .into_iter()
+            .filter(|skill| skill.user_invocable)
+            .map(|skill| SkillDefinition {
+                name: skill.name,
+                description: skill.description,
+                enabled: skill.enabled,
+                user_invocable: skill.user_invocable,
+                path: skill.path,
+                source: serde_json::to_value(skill.source)
+                    .ok()
+                    .and_then(|source| source.as_str().map(str::to_owned)),
+                argument_hint: skill.argument_hint,
+            })
+            .collect())
+    }
+
+    async fn set_skill_enabled(
+        &self,
+        request: BackendCatalogRequest,
+        name: &str,
+        enabled: bool,
+    ) -> Result<CatalogMutation> {
+        let backend_request = Self::catalog_backend_request(&request);
+        let client = self.client(&request.workspace).await?;
+        let settings = client
+            .rpc()
+            .user()
+            .settings()
+            .get()
+            .await
+            .context("read Copilot disabled skills")?;
+        let mut disabled_skill_list = settings
+            .settings
+            .get("disabledSkills")
+            .and_then(|setting| setting.value.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|value| value.as_str().map(str::to_owned))
+            .collect::<Vec<_>>();
+        disabled_skill_list.retain(|disabled_name| disabled_name != name);
+        if !enabled {
+            disabled_skill_list.push(name.to_owned());
+            disabled_skill_list.sort();
+            disabled_skill_list.dedup();
+        }
+        client
+            .rpc()
+            .skills()
+            .config()
+            .set_disabled_skills(SkillsConfigSetDisabledSkillsRequest {
+                disabled_skills: disabled_skill_list,
+            })
+            .await
+            .context("persist Copilot disabled skills")?;
+        let session = self.session(&backend_request).await?;
+        if enabled {
+            session
+                .rpc()
+                .skills()
+                .enable(SkillsEnableRequest { name: name.into() })
+                .await
+                .with_context(|| format!("enable Copilot skill ${name}"))?;
+        } else {
+            session
+                .rpc()
+                .skills()
+                .disable(SkillsDisableRequest { name: name.into() })
+                .await
+                .with_context(|| format!("disable Copilot skill ${name}"))?;
+        }
+        Ok(CatalogMutation {
+            name: name.to_owned(),
+            enabled,
+            restart_required: false,
+        })
+    }
+
+    async fn mcp_list(&self, request: BackendCatalogRequest) -> Result<Vec<McpDefinition>> {
+        let backend_request = Self::catalog_backend_request(&request);
+        let client = self.client(&request.workspace).await?;
+        let session = self.session(&backend_request).await?;
+        let discovery = client
+            .rpc()
+            .mcp()
+            .discover(McpDiscoverRequest {
+                working_directory: Some(request.workspace.clone()),
+            })
+            .await
+            .context("discover Copilot MCP servers")?;
+        let server_list = session
+            .rpc()
+            .mcp()
+            .list()
+            .await
+            .context("list Copilot MCP status")?;
+        let status_by_name = server_list
+            .servers
+            .into_iter()
+            .map(|server| (server.name.clone(), server))
+            .collect::<HashMap<_, _>>();
+        let token_by_name = session
+            .rpc()
+            .metadata()
+            .get_context_attribution()
+            .await
+            .ok()
+            .and_then(|attribution| attribution.context_attribution)
+            .map(|attribution| {
+                attribution
+                    .entries
+                    .into_iter()
+                    .filter(|entry| entry.kind == "mcpServer")
+                    .map(|entry| {
+                        (
+                            entry
+                                .id
+                                .strip_prefix("mcpServer:")
+                                .unwrap_or(&entry.label)
+                                .to_owned(),
+                            entry.tokens.max(0) as u64,
+                        )
+                    })
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
+        let mut definition_list = Vec::new();
+        for discovered in discovery.servers {
+            let status_entry = status_by_name.get(&discovered.name);
+            let status_text = status_entry
+                .and_then(|server| serde_json::to_value(&server.status).ok())
+                .and_then(|status| status.as_str().map(str::to_owned))
+                .unwrap_or_else(|| {
+                    if discovered.enabled {
+                        "unavailable"
+                    } else {
+                        "disabled"
+                    }
+                    .into()
+                });
+            let status = match status_text.as_str() {
+                "disabled" | "not_configured" => McpStatus::Disabled,
+                "pending" => McpStatus::Loading,
+                "connected" => McpStatus::Connected,
+                "needs-auth" | "needs_auth" => McpStatus::NeedsAuthentication,
+                "failed" => McpStatus::Failed,
+                _ => McpStatus::Unavailable,
+            };
+            let (tools, tool_error) = if status == McpStatus::Connected {
+                match session
+                    .rpc()
+                    .mcp()
+                    .list_tools(McpListToolsRequest {
+                        server_name: discovered.name.clone(),
+                    })
+                    .await
+                {
+                    Ok(result) => (
+                        result
+                            .tools
+                            .into_iter()
+                            .map(|tool| McpToolDefinition {
+                                name: tool.name,
+                                description: tool.description,
+                            })
+                            .collect(),
+                        None,
+                    ),
+                    Err(error) => (Vec::new(), Some(format!("{error:#}"))),
+                }
+            } else {
+                (Vec::new(), None)
+            };
+            let transport = discovered
+                .r#type
+                .and_then(|transport| serde_json::to_value(transport).ok())
+                .and_then(|transport| transport.as_str().map(str::to_owned))
+                .unwrap_or_else(|| "unknown".into());
+            definition_list.push(McpDefinition {
+                token_count: token_by_name.get(&discovered.name).copied(),
+                token_estimated: false,
+                enabled: discovered.enabled,
+                status,
+                status_detail: status_entry.and_then(|server| server.error.clone()),
+                name: discovered.name,
+                transport,
+                tools,
+                tool_error,
+            });
+        }
+        definition_list.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(definition_list)
+    }
+
+    async fn set_mcp_enabled(
+        &self,
+        request: BackendCatalogRequest,
+        name: &str,
+        enabled: bool,
+    ) -> Result<CatalogMutation> {
+        let backend_request = Self::catalog_backend_request(&request);
+        let client = self.client(&request.workspace).await?;
+        if enabled {
+            client
+                .rpc()
+                .mcp()
+                .config()
+                .enable(McpConfigEnableRequest {
+                    names: vec![name.into()],
+                })
+                .await
+                .with_context(|| format!("persist enabled Copilot MCP {name}"))?;
+        } else {
+            client
+                .rpc()
+                .mcp()
+                .config()
+                .disable(McpConfigDisableRequest {
+                    names: vec![name.into()],
+                })
+                .await
+                .with_context(|| format!("persist disabled Copilot MCP {name}"))?;
+        }
+        let session = self.session(&backend_request).await?;
+        if enabled {
+            session
+                .rpc()
+                .mcp()
+                .enable(McpEnableRequest {
+                    server_name: name.into(),
+                })
+                .await
+                .with_context(|| format!("enable Copilot MCP {name}"))?;
+        } else {
+            session
+                .rpc()
+                .mcp()
+                .disable(McpDisableRequest {
+                    server_name: name.into(),
+                })
+                .await
+                .with_context(|| format!("disable Copilot MCP {name}"))?;
+        }
+        Ok(CatalogMutation {
+            name: name.to_owned(),
+            enabled,
+            restart_required: false,
+        })
+    }
+
+    async fn has_active_turn(&self, session_id: &str) -> bool {
+        self.turn_event(session_id).await.is_active()
+    }
+
+    async fn steer(&self, _text: String) -> Result<()> {
+        anyhow::bail!("Copilot steering requires a Harness session target")
+    }
+
+    async fn steer_session(&self, session_id: &str, text: String) -> Result<()> {
         let session = self
-            .active_session
+            .active_session_by_harness
             .lock()
             .await
-            .clone()
+            .get(session_id)
+            .cloned()
             .context("Copilot session has not started")?;
         session
             .send(MessageOptions::new(text.clone()).with_mode(DeliveryMode::Immediate))
             .await
             .context("steer active Copilot turn")?;
-        self.turn_event.publish_steering(text)?;
+        self.turn_event(session_id).await.publish_steering(text)?;
         Ok(())
     }
 
     async fn cancel(&self) -> Result<()> {
-        if let Some(session) = self.active_session.lock().await.as_ref() {
+        Ok(())
+    }
+
+    async fn cancel_session(&self, session_id: &str) -> Result<()> {
+        if let Some(session) = self.active_session_by_harness.lock().await.get(session_id) {
             session.abort().await.context("abort active Copilot turn")?;
         }
         Ok(())
     }
 
     async fn active_session_id(&self) -> Option<String> {
-        self.active_session
+        None
+    }
+
+    async fn active_session_id_for(&self, session_id: &str) -> Option<String> {
+        self.active_session_by_harness
             .lock()
             .await
-            .as_ref()
+            .get(session_id)
             .map(|session| session.id().to_string())
     }
 }
@@ -386,6 +779,13 @@ impl CopilotTurnEvent {
             .lock()
             .map_err(|_| anyhow::anyhow!("Copilot turn event lock poisoned"))? = event_sink;
         Ok(CopilotTurnEventGuard { owner: self })
+    }
+
+    fn is_active(&self) -> bool {
+        self.event_sink
+            .lock()
+            .expect("Copilot turn event lock poisoned")
+            .is_some()
     }
 
     /// Publish steering only after the Copilot SDK accepts the immediate message.
@@ -728,7 +1128,7 @@ mod test {
         let descriptor = backend.descriptor();
         assert_eq!(descriptor.kind, BackendKind::Copilot);
         assert!(descriptor.capability.native_steer);
-        assert!(!descriptor.capability.native_fork);
+        assert!(descriptor.capability.native_fork);
         assert!(!descriptor.capability.native_compact);
         assert!(descriptor.capability.agent.observe);
     }
@@ -752,8 +1152,9 @@ mod test {
     #[test]
     fn omits_reasoning_effort_for_auto_and_unsupported_models() {
         let mut request = BackendRequest {
+            harness_session_id: "harness-session".into(),
             workspace: "D:/repo".into(),
-            text: "test".into(),
+            input: BackendInput::from_text("test"),
             mode: crate::backend::PromptMode::Chat,
             model: "default".into(),
             effort: "low".into(),

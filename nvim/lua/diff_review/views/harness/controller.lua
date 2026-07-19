@@ -14,6 +14,7 @@ local layout = require("diff_review.views.harness.layout")
 local session = require("diff_review.session")
 local interaction_state = require("diff_review.views.harness.interaction_state")
 local prompt_history = require("diff_review.views.harness.prompt_history")
+local provider_picker = require("diff_review.views.harness.provider_picker")
 local context_status = require("diff_review.views.harness.context_status")
 local main_timeline = require("diff_review.views.harness.timeline")
 local model_picker = require("diff_review.views.harness.model_picker")
@@ -25,12 +26,7 @@ local session_navigation = require("diff_review.views.harness.session_navigation
 
 local namespace = vim.api.nvim_create_namespace("DiffReviewHarnessTranscript")
 local queue_namespace = vim.api.nvim_create_namespace("DiffReviewHarnessQueue")
-local unsubscribe = nil
-local state_sync_pending = false
-local working_timer = nil
-local working_started_ns = nil
 local render_observer_for_test = nil
-local render_pending = false
 local begin_request
 local submit_immediate
 local effort_list = { "minimal", "low", "medium", "high", "xhigh" }
@@ -280,8 +276,9 @@ end
 
 ---@return integer?
 local function working_seconds()
-  if not harness_state().busy or not working_started_ns then return nil end
-  return math.floor((vim.uv.hrtime() - working_started_ns) / 1000000000)
+  local state = harness_state()
+  if not state.busy or not state.working_started_ns then return nil end
+  return math.floor((vim.uv.hrtime() - state.working_started_ns) / 1000000000)
 end
 
 ---@param reset? boolean
@@ -289,10 +286,6 @@ function M.render(reset)
   local state = harness_state()
   local buf = state.transcript_buf
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
-  if session_navigation.render_pending(buf) then
-    M.refresh_winbar()
-    return
-  end
   local transcript_win = state.transcript_win
   local transcript_visible = transcript_win and vim.api.nvim_win_is_valid(transcript_win)
   local follow_tail = false
@@ -332,15 +325,19 @@ function M.render(reset)
 end
 
 local function schedule_render()
+  local state = harness_state()
   if not vim.in_fast_event() then
     M.render()
     return
   end
-  if render_pending then return end
-  render_pending = true
+  if state.render_pending then return end
+  state.render_pending = true
   vim.schedule(function()
-    render_pending = false
+    local active_state = session.harness
+    session.activate_harness(state)
+    state.render_pending = false
     M.render()
+    if active_state ~= state then session.activate_harness(active_state) end
   end)
 end
 
@@ -349,20 +346,23 @@ local function set_busy(busy)
   local state = harness_state()
   state.busy = busy
   if busy then
-    if working_started_ns then return end
-    working_started_ns = vim.uv.hrtime()
-    working_timer = vim.uv.new_timer()
-    working_timer:start(1000, 1000, function()
+    if state.working_started_ns then return end
+    state.working_started_ns = vim.uv.hrtime()
+    state.working_timer = vim.uv.new_timer()
+    state.working_timer:start(1000, 1000, function()
       vim.schedule(function()
-        if harness_state().busy then schedule_render() end
+        local active_state = session.harness
+        session.activate_harness(state)
+        if state.busy then schedule_render() end
+        if active_state ~= state then session.activate_harness(active_state) end
       end)
     end)
   else
-    working_started_ns = nil
-    if working_timer then
-      working_timer:stop()
-      working_timer:close()
-      working_timer = nil
+    state.working_started_ns = nil
+    if state.working_timer then
+      state.working_timer:stop()
+      state.working_timer:close()
+      state.working_timer = nil
     end
   end
   schedule_render()
@@ -396,10 +396,11 @@ end
 
 ---@param callback? function
 local function synchronize_state(callback)
-  if state_sync_pending then return end
-  state_sync_pending = true
+  local synchronized_state = harness_state()
+  if synchronized_state.state_sync_pending then return end
+  synchronized_state.state_sync_pending = true
   client.request("state.get", {}, function(result, request_error)
-    state_sync_pending = false
+    synchronized_state.state_sync_pending = false
     if request_error then
       notifications.error(request_error, "Harness state")
       return
@@ -763,6 +764,39 @@ local function resume_mode_restart(mode)
   end)
 end
 
+local function clear_mcp_restart(state)
+  state.mcp_restart = nil
+end
+
+local function maybe_resume_mcp_restart()
+  local state = harness_state()
+  local restart = state.mcp_restart
+  if not (restart and restart.mutation_finished and restart.turn_cancelled) then return end
+  picker.close(false)
+  set_busy(true)
+  local change_summary = restart.error and ("The MCP change failed: " .. restart.error)
+    or ("MCP server %s is now %s."):format(restart.name, restart.enabled and "enabled" or "disabled")
+  client.request("interaction.resume", {
+    text = "Continue the active task from the interrupted turn. " .. change_summary
+      .. " Preserve completed work and do not repeat finished actions.",
+  }, function(result, resume_error)
+    clear_mcp_restart(state)
+    set_busy(false)
+    if resume_error then
+      notifications.error("Harness could not resume after changing MCP state: " .. resume_error, "Harness MCP")
+      synchronize_state()
+      return
+    end
+    if result then
+      state.session = result.session or (result.id and result) or state.session
+      state.capability = result.capability or state.capability
+      if result.interaction then interaction_state.complete_interaction(state, result.interaction) end
+    end
+    synchronize_state()
+    vim.schedule(M.drain)
+  end)
+end
+
 ---@param text string
 begin_request = function(text)
   local state = harness_state()
@@ -788,6 +822,11 @@ begin_request = function(text)
         return
       end
       if error_detail and error_detail.code == "turn_cancelled" then
+        if state.mcp_restart then
+          state.mcp_restart.turn_cancelled = true
+          maybe_resume_mcp_restart()
+          return
+        end
         if state.mode_restart_requested and state.pending_mode then
           resume_mode_restart(state.pending_mode)
           return
@@ -948,10 +987,6 @@ function M.fork_session(name)
     notifications.warn("The current backend does not support session fork", "Harness")
     return
   end
-  if state.busy then
-    notifications.warn("Finish or cancel the active turn before forking", "Harness")
-    return
-  end
   local params = { session_id = active_session.id }
   if name and name ~= "" then params.name = name end
   local fork_started = perf.now()
@@ -960,7 +995,7 @@ function M.fork_session(name)
     ms = perf.elapsed_ms(fork_started),
     source_session_id = active_session.id,
   })
-  client.request("session.fork", params, function(result, request_error)
+  client.request_for(active_session.id, "session.fork", params, function(result, request_error)
     if request_error then
       perf.event("harness.fork.failed", {
         ms = perf.elapsed_ms(fork_started),
@@ -1242,6 +1277,16 @@ function M.submit()
     M.select_backend()
     return
   end
+  if text == "/skills" then
+    set_composer_text(state.composer_buf, "")
+    M.open_skill_picker()
+    return
+  end
+  if text == "/mcp" then
+    set_composer_text(state.composer_buf, "")
+    M.open_mcp_picker()
+    return
+  end
   if text == "/rename" then
     set_composer_text(state.composer_buf, "")
     M.rename_session("")
@@ -1250,6 +1295,11 @@ function M.submit()
   if text == "/fork" then
     set_composer_text(state.composer_buf, "")
     M.fork_session()
+    return
+  end
+  if text == "/new" then
+    set_composer_text(state.composer_buf, "")
+    require("diff_review.views.harness").new_session()
     return
   end
   if text == "/questions" then
@@ -1327,6 +1377,12 @@ function M.submit()
   if fork_name then
     set_composer_text(state.composer_buf, "")
     M.fork_session(vim.trim(fork_name))
+    return
+  end
+  local new_name = text:match("^/new%s+(.+)$")
+  if new_name then
+    set_composer_text(state.composer_buf, "")
+    require("diff_review.views.harness").new_session(vim.trim(new_name))
     return
   end
   local model, model_effort = text:match("^/model%s+(%S+)%s+(%S+)$")
@@ -1604,6 +1660,65 @@ function M.select_model()
   end)
 end
 
+function M.open_skill_picker()
+  local state = harness_state()
+  if not (state.capability.catalog and state.capability.catalog.skill) then
+    notifications.warn("The current backend does not advertise provider skills", "Harness skills")
+    return
+  end
+  provider_picker.open_skills({
+    host = picker_host(state),
+    on_insert = function(text) set_composer_text(harness_state().composer_buf, text) end,
+  })
+end
+
+function M.open_mcp_picker()
+  local state = harness_state()
+  if not (state.capability.catalog and state.capability.catalog.mcp) then
+    notifications.warn("The current backend does not advertise MCP management", "Harness MCP")
+    return
+  end
+  provider_picker.open_mcp({
+    host = picker_host(state),
+    on_mutation_start = function(definition, enabled)
+      local current = harness_state()
+      if current.busy and not current.capability.catalog.live_mcp_mutation then
+        current.mcp_restart = {
+          name = definition.name,
+          enabled = enabled,
+          mutation_finished = false,
+          turn_cancelled = false,
+        }
+      end
+    end,
+    on_mutation = function(result)
+      local current = harness_state()
+      append_session_status(("MCP server %s %s"):format(
+        result.name or "server",
+        result.enabled and "enabled" or "disabled"
+      ))
+      if result.restart_required then
+        current.mcp_restart = current.mcp_restart or {
+          name = result.name,
+          enabled = result.enabled,
+          turn_cancelled = false,
+        }
+        current.mcp_restart.mutation_finished = true
+        maybe_resume_mcp_restart()
+      else
+        clear_mcp_restart(current)
+      end
+    end,
+    on_mutation_error = function(mutation_error)
+      local current = harness_state()
+      if not current.mcp_restart then return end
+      current.mcp_restart.error = mutation_error
+      current.mcp_restart.mutation_finished = true
+      maybe_resume_mcp_restart()
+    end,
+  })
+end
+
 function M.select_backend()
   local state = harness_state()
   local current = state.session and state.session.backend or config.options.harness.backend
@@ -1827,8 +1942,14 @@ function M.attach()
   command_set.register(composer_command_set, "history_next", prompt_history.next)
   keymaps.setup_view_keymaps(state.composer_buf, "harness", composer_command_set)
   prompt_history.attach(state.composer_buf)
-  if unsubscribe then unsubscribe() end
-  unsubscribe = client.subscribe(on_event)
+  if state.unsubscribe then state.unsubscribe() end
+  state.unsubscribe = client.subscribe(function(event, payload, event_session_id)
+    if state.session and event_session_id and state.session.id ~= event_session_id then return end
+    local active_state = session.harness
+    session.activate_harness(state)
+    on_event(event, payload)
+    if active_state ~= state then session.activate_harness(active_state) end
+  end)
 end
 
 ---@param observer? fun(lines: string[])

@@ -73,18 +73,22 @@ function M.configure_transcript_window(win)
   M.configure_gutterless_window(win)
 end
 
----@return integer, integer, integer, integer
-function M.open()
+---@param timeline_key? string
+---@return integer, integer, integer, integer, integer
+function M.open(timeline_key)
   local options = config.options.harness
   vim.cmd("tabnew")
+  local tabpage = vim.api.nvim_get_current_tabpage()
   local transcript_win = vim.api.nvim_get_current_win()
-  local transcript_buf = M.create_transcript_buffer()
+  local transcript_buf = M.create_transcript_buffer(timeline_key)
   vim.api.nvim_win_set_buf(transcript_win, transcript_buf)
   M.configure_transcript_window(transcript_win)
 
   vim.cmd("belowright " .. tostring(options.composer_min_height) .. "split")
   local composer_win = vim.api.nvim_get_current_win()
-  local composer_buf = named_buffer(options.composer_name)
+  local composer_name = timeline_key and (options.composer_name .. "://" .. timeline_key)
+    or options.composer_name
+  local composer_buf = named_buffer(composer_name)
   vim.api.nvim_win_set_buf(composer_win, composer_buf)
   vim.bo[composer_buf].buftype = "nofile"
   vim.bo[composer_buf].bufhidden = "hide"
@@ -96,7 +100,7 @@ function M.open()
   vim.wo[composer_win].linebreak = true
   input_gutter.apply(composer_win)
   keep_composer_normal_on_entry(composer_buf)
-  return transcript_buf, transcript_win, composer_buf, composer_win
+  return transcript_buf, transcript_win, composer_buf, composer_win, tabpage
 end
 
 ---@param composer_buf integer

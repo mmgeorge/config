@@ -70,6 +70,18 @@ impl CodexJsonRpc {
         })
     }
 
+    /// Update the session-scoped request context before reusing this app-server process.
+    pub fn set_request_context(
+        &mut self,
+        workspace: &str,
+        execution_mode: ExecutionMode,
+        event_sink: Option<BackendEventSink>,
+    ) {
+        self.workspace = workspace.to_owned();
+        self.execution_mode = execution_mode;
+        self.event_sink = event_sink;
+    }
+
     /// Send one JSON-RPC notification without allocating a response identifier.
     pub async fn notify(&mut self, method: &str, params: Value) -> Result<()> {
         self.write_message(&json!({ "jsonrpc": "2.0", "method": method, "params": params }))

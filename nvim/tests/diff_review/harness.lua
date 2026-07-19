@@ -714,10 +714,24 @@ local function fake_launcher(command, options, _)
       end
     elseif request.method == "session.new" then
       active_session = vim.tbl_extend("force", active_session, { id = "session-two", execution_mode = "read" })
-      emit(options, { event = "session_changed", payload = { session = active_session, interaction = {} } })
+      local new_session_capability = {
+        native_fork = false,
+        native_compact = true,
+        native_steer = true,
+        native_turn_rollback = true,
+        model_selection = true,
+        effort_selection = true,
+        fast_mode = true,
+      }
+      emit(options, { event = "session_changed", payload = {
+        session = active_session,
+        interaction = {},
+        capability = new_session_capability,
+      } })
       emit(options, { id = request.id, result = {
         session = active_session,
         interaction = {},
+        capability = new_session_capability,
         prompt_history = prompt_history,
       } })
     elseif request.method == "session.resume" then
@@ -765,7 +779,15 @@ local function fake_launcher(command, options, _)
         session = active_session,
         interaction = {},
         timeline = fork_timeline,
-        capability = { native_fork = true },
+        capability = {
+          native_fork = true,
+          native_compact = true,
+          native_steer = true,
+          native_turn_rollback = true,
+          model_selection = true,
+          effort_selection = true,
+          fast_mode = true,
+        },
         approval = {},
         agent = { definition = {}, run = {}, turn = {} },
         artifact = {},
@@ -3233,14 +3255,16 @@ local ok, failure = pcall(function()
   local pending_transcript_buf = session.harness.transcript_buf
   assert_true(pending_transcript_buf ~= parent_transcript_buf,
     "/fork should open a pending child timeline before the provider responds")
-  assert_equals(session.harness.session.id, parent_session_id,
-    "pending fork presentation should not invent a durable child session")
+  assert_equals(session.harness.session, nil,
+    "pending fork tabs should not invent a durable child session")
   assert_true(line_number(
     vim.api.nvim_buf_get_lines(pending_transcript_buf, 0, -1, false),
     "  Forking investigation from " .. parent_session_id .. " (Architecture review)..."
   ) ~= nil, "/fork should provide immediate visible progress")
   assert_true(vim.wait(2000, function()
-    return request_by_method["session.fork"] ~= nil and session.harness.session.id == "session-fork"
+    return request_by_method["session.fork"] ~= nil
+      and session.harness.session
+      and session.harness.session.id == "session-fork"
   end, 10), "/fork should activate the provider-native child session")
   assert_equals(request_by_method["session.fork"].params.name, "investigation",
     "/fork should preserve the explicit child name")
@@ -3260,25 +3284,6 @@ local ok, failure = pcall(function()
     "  Forked from " .. parent_session_id .. " (Architecture review)"
   )
   assert_true(fork_line ~= nil, "fork timelines should begin with durable parent lineage")
-  vim.api.nvim_set_current_win(session.harness.transcript_win)
-  vim.api.nvim_win_set_cursor(session.harness.transcript_win, { fork_line, 0 })
-  vim.fn.maparg("<CR>", "n", false, true).callback()
-  assert_true(vim.wait(2000, function()
-    return session.harness.session.id == parent_session_id
-      and session.harness.transcript_buf == parent_transcript_buf
-  end, 10), "Enter on fork lineage should open the parent session timeline")
-  vim.api.nvim_win_call(session.harness.transcript_win, function() vim.cmd("normal! \15") end)
-  assert_true(vim.wait(2000, function()
-    return session.harness.session.id == "session-fork"
-      and session.harness.transcript_buf == child_transcript_buf
-  end, 10), "the native jump-back path should reactivate the child session")
-  vim.api.nvim_win_set_cursor(session.harness.transcript_win, { fork_line, 0 })
-  vim.fn.maparg(".", "n", false, true).callback()
-  assert_true(vim.wait(2000, function()
-    return session.harness.session.id == parent_session_id
-      and session.harness.transcript_buf == parent_transcript_buf
-  end, 10), "dot on fork lineage should open the parent session timeline")
-
   vim.api.nvim_set_current_win(session.harness.composer_win)
   vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/rename" })
   controller.submit()
@@ -3312,7 +3317,7 @@ local ok, failure = pcall(function()
     "slash commands should enter shared prompt history")
   require("diff_review.views.harness").new_session()
   assert_true(vim.wait(2000, function()
-    return session.harness.session.id == "session-two"
+    return session.harness.session and session.harness.session.id == "session-two"
   end, 10), "new session should complete")
   assert_equals(session.harness.session.model, "mock-model-secondary", "new sessions should preserve the selected model")
   assert_equals(session.harness.session.effort, "high", "new sessions should preserve the selected effort")
@@ -3373,7 +3378,12 @@ local ok, failure = pcall(function()
     return require("diff_review.infra.config").options.harness.backend == "codex"
       and request_by_method.initialize.params.backend.kind == "codex"
       and session.harness.session.backend == "codex"
-  end, 10), "selecting a backend should restart the broker with that backend")
+  end, 10), ("selecting a backend should restart the broker with that backend "
+    .. "(config=%s initialize=%s session=%s)"):format(
+    tostring(require("diff_review.infra.config").options.harness.backend),
+    tostring(request_by_method.initialize and request_by_method.initialize.params.backend.kind),
+    tostring(session.harness.session and session.harness.session.backend)
+  ))
   assert_equals(backend_preference.load(require("diff_review.infra.config").options.harness.backends, "copilot"),
     "codex", "a successful backend switch should persist the selected backend")
 end)

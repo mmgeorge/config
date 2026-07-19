@@ -1,7 +1,12 @@
 pub mod approval;
+mod catalog;
 pub mod codex;
 pub mod copilot;
 mod steering;
+pub use catalog::{
+    BackendCatalogRequest, BackendInput, CatalogCapability, CatalogMutation, McpDefinition,
+    McpStatus, McpToolDefinition, SkillDefinition,
+};
 pub use steering::SteerTarget;
 
 use crate::agent::AgentCapability;
@@ -59,6 +64,8 @@ pub struct BackendCapability {
     #[serde(default)]
     pub execution_mode_list: Vec<ExecutionMode>,
     pub agent: AgentCapability,
+    #[serde(default)]
+    pub catalog: CatalogCapability,
 }
 
 /// Represents one executable backend launch descriptor.
@@ -82,8 +89,9 @@ pub enum PromptMode {
 /// Represents one prompt sent across a backend boundary.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BackendRequest {
+    pub harness_session_id: String,
     pub workspace: String,
-    pub text: String,
+    pub input: BackendInput,
     pub mode: PromptMode,
     pub model: String,
     pub effort: String,
@@ -339,6 +347,41 @@ pub trait Backend: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// List user-invocable provider skills with their effective enabled state.
+    async fn skill_list(&self, _request: BackendCatalogRequest) -> Result<Vec<SkillDefinition>> {
+        Ok(Vec::new())
+    }
+
+    /// Persist one provider skill's enabled state for future turns.
+    async fn set_skill_enabled(
+        &self,
+        _request: BackendCatalogRequest,
+        _name: &str,
+        _enabled: bool,
+    ) -> Result<CatalogMutation> {
+        anyhow::bail!("backend does not support skill configuration")
+    }
+
+    /// List complete provider MCP definitions including cached tool metadata.
+    async fn mcp_list(&self, _request: BackendCatalogRequest) -> Result<Vec<McpDefinition>> {
+        Ok(Vec::new())
+    }
+
+    /// Persist one MCP server's enabled state and report whether its turn must resume.
+    async fn set_mcp_enabled(
+        &self,
+        _request: BackendCatalogRequest,
+        _name: &str,
+        _enabled: bool,
+    ) -> Result<CatalogMutation> {
+        anyhow::bail!("backend does not support MCP configuration")
+    }
+
+    /// Return whether one Harness session currently owns an in-flight provider turn.
+    async fn has_active_turn(&self, _session_id: &str) -> bool {
+        false
+    }
+
     /// Update a native provider goal when that backend owns goal persistence.
     async fn goal_status(
         &self,
@@ -359,6 +402,11 @@ pub trait Backend: Send + Sync {
         anyhow::bail!("backend does not support active-turn steering")
     }
 
+    /// Append user input to one Harness session's active provider turn.
+    async fn steer_session(&self, _session_id: &str, text: String) -> Result<()> {
+        self.steer(text).await
+    }
+
     /// Append user input to one specific provider child turn.
     async fn steer_target(&self, text: String, _target: SteerTarget) -> Result<()> {
         self.steer(text).await
@@ -374,14 +422,29 @@ pub trait Backend: Send + Sync {
         Ok(())
     }
 
+    /// Stop one Harness session's active provider transport.
+    async fn cancel_session(&self, _session_id: &str) -> Result<()> {
+        self.cancel().await
+    }
+
     /// Return the provider conversation that can continue after an interrupted turn.
     async fn active_session_id(&self) -> Option<String> {
         None
     }
 
+    /// Return one Harness session's provider conversation after interruption.
+    async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
+        self.active_session_id().await
+    }
+
     /// Roll back a cancelled turn after the broker proves it produced no visible output or changes.
     async fn rollback_cancelled_turn(&self) -> Result<bool> {
         Ok(false)
+    }
+
+    /// Roll back one Harness session's output-free cancelled turn.
+    async fn rollback_cancelled_turn_for(&self, _session_id: &str) -> Result<bool> {
+        self.rollback_cancelled_turn().await
     }
 }
 
@@ -450,7 +513,7 @@ impl Backend for MockBackend {
         let mut steering_text_list = Vec::new();
         let event = BackendEvent {
             kind: "assistant_message".into(),
-            text: Some(format!("Mock response: {}", request.text)),
+            text: Some(format!("Mock response: {}", request.input.text())),
             data: Value::Null,
             activity: None,
             summary: None,
@@ -487,11 +550,11 @@ impl Backend for MockBackend {
                 .collect::<Vec<_>>()
                 .join("\n");
             if steering.is_empty() {
-                format!("# Plan\n\n1. {}\n", request.text)
+                format!("# Plan\n\n1. {}\n", request.input.text())
             } else {
                 format!(
                     "# Plan\n\n1. {}\n\n## Steering constraints\n\n{steering}\n",
-                    request.text
+                    request.input.text()
                 )
             }
         });
@@ -595,6 +658,7 @@ fn mock_capability() -> BackendCapability {
             ExecutionMode::Yolo,
         ],
         agent: AgentCapability::default(),
+        catalog: CatalogCapability::default(),
     }
 }
 
@@ -618,8 +682,9 @@ mod test {
             prompt_backend
                 .prompt_stream(
                     BackendRequest {
+                        harness_session_id: "harness-session".into(),
                         workspace: ".".into(),
-                        text: "Refactor X".into(),
+                        input: super::BackendInput::from_text("Refactor X"),
                         mode: PromptMode::Plan,
                         model: "mock-model".into(),
                         effort: "low".into(),

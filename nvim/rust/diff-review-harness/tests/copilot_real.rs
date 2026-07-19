@@ -1,9 +1,35 @@
-use diff_review_harness::backend::BackendLaunch;
+use diff_review_harness::backend::copilot::CopilotBackend;
+use diff_review_harness::backend::{Backend, BackendCatalogRequest, BackendLaunch};
 use diff_review_harness::broker::{HarnessBroker, InitializeRequest};
 use diff_review_harness::protocol::BrokerRequest;
+use diff_review_harness::session::ExecutionMode;
 use serde_json::{Value, json};
 use std::process::Command;
 use std::time::Duration;
+
+#[tokio::test]
+#[ignore = "requires an authenticated Copilot CLI"]
+async fn lists_native_copilot_skills_and_mcp_rows() {
+    let temporary = tempfile::tempdir().unwrap();
+    let backend = CopilotBackend::new(Vec::new()).unwrap();
+    let request = BackendCatalogRequest {
+        harness_session_id: "copilot-catalog".into(),
+        workspace: temporary.path().to_string_lossy().into_owned(),
+        execution_mode: ExecutionMode::Read,
+        backend_session_id: None,
+    };
+    let skill_list =
+        tokio::time::timeout(Duration::from_secs(30), backend.skill_list(request.clone()))
+            .await
+            .expect("Copilot skill list timed out")
+            .unwrap();
+    assert!(skill_list.iter().all(|skill| skill.user_invocable));
+    let mcp_list = tokio::time::timeout(Duration::from_secs(30), backend.mcp_list(request))
+        .await
+        .expect("Copilot MCP list timed out")
+        .unwrap();
+    assert!(mcp_list.iter().all(|server| !server.name.is_empty()));
+}
 
 #[tokio::test]
 #[ignore = "requires an authenticated Copilot CLI and performs a real model turn"]

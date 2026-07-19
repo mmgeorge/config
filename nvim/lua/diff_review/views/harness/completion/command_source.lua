@@ -8,6 +8,7 @@ local agent_catalog = require("diff_review.views.harness.agent_catalog")
 local agent_summary = require("diff_review.render.harness.agent_summary")
 local client = require("diff_review.harness.client")
 local notifications = require("diff_review.infra.notifications")
+local provider_catalog = require("diff_review.views.harness.provider_catalog")
 local session = require("diff_review.session")
 
 local effort_list = { "minimal", "low", "medium", "high", "xhigh" }
@@ -20,6 +21,8 @@ local command_list = {
   { label = "/sessions", detail = "Search, preview, resume, or delete a Harness session" },
   { label = "/undo", detail = "Roll back to an interaction and restore its prompt" },
   { label = "/backend", detail = "Switch the Harness CLI backend" },
+  { label = "/skills", detail = "Browse and configure provider skills", capability = "skill_catalog" },
+  { label = "/mcp", detail = "Browse and configure MCP servers", capability = "mcp_catalog" },
   { label = "/questions", detail = "Reopen pending planning questions" },
   { label = "/goal", detail = "Set a persistent goal" },
   { label = "/goal pause", detail = "Pause automatic goal continuation" },
@@ -31,6 +34,7 @@ local command_list = {
   { label = "/yolo", detail = "Allow machine-wide writes without approvals" },
   { label = "/mode", detail = "Select the Harness execution mode" },
   { label = "/clear", detail = "Start a new session" },
+  { label = "/new", detail = "Start a new session in another tab" },
   { label = "/compact", detail = "Compact provider-owned context", capability = "native_compact" },
   { label = "/fork", detail = "Fork the current session with provider-owned context", capability = "native_fork" },
   { label = "/rename", detail = "Rename the current session" },
@@ -51,13 +55,14 @@ function CommandSource.new()
 end
 
 function CommandSource:get_trigger_characters()
-  return { "/", " " }
+  return { "/", "$", " " }
 end
 
 function CommandSource:enabled()
   local line = vim.api.nvim_get_current_line()
   local cursor_column = vim.api.nvim_win_get_cursor(0)[2]
-  return line:sub(1, cursor_column):match("^%s*/.*$") ~= nil
+  local prefix = line:sub(1, cursor_column)
+  return prefix:match("^%s*/") ~= nil or prefix:match("^%s*%$[^%s]*$") ~= nil
 end
 
 ---@param label string
@@ -141,6 +146,44 @@ function CommandSource:get_completions(_, callback)
   local prefix = line:sub(1, cursor_column)
   local command_start = prefix:find("/")
   local items = {}
+  local skill_start = prefix:match("^%s*%$()([^%s]*)$")
+  if skill_start then
+    local capability = session.harness.capability or {}
+    if not (capability.catalog and capability.catalog.skill) then
+      callback({ items = items, is_incomplete_backward = false, is_incomplete_forward = false })
+      return
+    end
+    provider_catalog.skills(false, function(skill_list, request_error)
+      if request_error then
+        notifications.error("Failed to complete Harness skill: " .. request_error, "Harness")
+        callback({ items = {}, is_incomplete_backward = false, is_incomplete_forward = false })
+        return
+      end
+      for _, skill in ipairs(skill_list or {}) do
+        if skill.enabled and skill.user_invocable ~= false then
+          items[#items + 1] = {
+            label = "$" .. skill.name,
+            filterText = skill.name,
+            detail = skill.description,
+            kind = vim.lsp.protocol.CompletionItemKind.Reference,
+            textEdit = {
+              newText = skill.name .. " ",
+              range = {
+                start = { line = row, character = skill_start - 1 },
+                ["end"] = { line = row, character = cursor_column },
+              },
+            },
+          }
+        end
+      end
+      callback({ items = items, is_incomplete_backward = false, is_incomplete_forward = false })
+    end)
+    return
+  end
+  if prefix:match("^%s*%$") then
+    callback({ items = items, is_incomplete_backward = false, is_incomplete_forward = false })
+    return
+  end
   local definition_start = prefix:match("^%s*/spawn%s+()([^%s]*)$")
   if definition_start then
     local capability = session.harness.capability or {}
@@ -295,8 +338,15 @@ function CommandSource:get_completions(_, callback)
         goto continue
       end
       if command.capability and command.capability ~= "agent_observe" and command.capability ~= "agent_catalog"
+        and command.capability ~= "skill_catalog" and command.capability ~= "mcp_catalog"
         and capability[command.capability] ~= true
       then
+        goto continue
+      end
+      if command.capability == "skill_catalog" and not (capability.catalog and capability.catalog.skill) then
+        goto continue
+      end
+      if command.capability == "mcp_catalog" and not (capability.catalog and capability.catalog.mcp) then
         goto continue
       end
       items[#items + 1] = {

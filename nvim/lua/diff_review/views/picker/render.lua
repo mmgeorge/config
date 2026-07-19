@@ -17,7 +17,7 @@ function PickerRender.apply(buf, frame)
       vim.api.nvim_buf_add_highlight(buf, namespace, content.group or "DiffReviewPickerText", line - 1, 0, -1)
     end
   end
-  for index, range in ipairs(frame.option_range) do
+  for index, range in ipairs(frame.primary_range or frame.option_range) do
     local group = index == frame.selected_index and "DiffReviewPickerSelected"
       or frame.chosen_index_set and frame.chosen_index_set[index] and "DiffReviewPickerChosen"
       or "DiffReviewPickerOption"
@@ -26,6 +26,11 @@ function PickerRender.apply(buf, frame)
     end
     if index ~= frame.selected_index then
       vim.api.nvim_buf_add_highlight(buf, namespace, "DiffReviewPickerKey", range.first - 1, 2, 3)
+    end
+  end
+  for _, range in pairs(frame.child_range or {}) do
+    for line = range.first, range.last do
+      vim.api.nvim_buf_add_highlight(buf, namespace, "DiffReviewPickerText", line - 1, 0, -1)
     end
   end
   vim.api.nvim_buf_add_highlight(buf, namespace, "DiffReviewPickerHint", frame.footer_line - 1, 0, -1)

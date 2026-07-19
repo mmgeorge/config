@@ -4,8 +4,8 @@ use crate::agent::{
 };
 use crate::backend::approval::{ApprovalRequestView, PermissionCoordinator};
 use crate::backend::{
-    Backend, BackendCapability, BackendEvent, BackendEventSink, BackendLaunch, BackendRequest,
-    PromptMode,
+    Backend, BackendCapability, BackendCatalogRequest, BackendEvent, BackendEventSink,
+    BackendInput, BackendLaunch, BackendRequest, PromptMode,
 };
 use crate::checkpoint::{GitCheckpoint, checkpoint_diff, checkpoint_diff_for_paths};
 use crate::goal::{ContinuationDecision, GoalRecord, GoalState};
@@ -141,6 +141,46 @@ struct AgentRuntime {
 pub struct DispatchResult {
     pub response: BrokerResponse,
     pub event: Vec<BrokerEvent>,
+}
+
+/// Owns provider and permission infrastructure shared by every session controller.
+pub struct BrokerRuntime {
+    backend: Arc<dyn Backend>,
+    permission_store: Arc<RwLock<PermissionStore>>,
+    permission_coordinator: Arc<PermissionCoordinator>,
+}
+
+impl BrokerRuntime {
+    /// Build shared provider infrastructure from one broker initialization request.
+    pub fn initialize(request: &InitializeRequest) -> Result<Arc<Self>> {
+        let data_root = PathBuf::from(&request.data_root);
+        let workspace_kind = crate::workspace::resolve(Path::new(&request.workspace))?;
+        let workspace = match &workspace_kind {
+            WorkspaceKind::Git(path) | WorkspaceKind::Untracked(path) => {
+                path.to_string_lossy().into_owned()
+            }
+        };
+        let permission_file = request
+            .permission_file
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| data_root.join("permissions.json"));
+        let permission_store = Arc::new(RwLock::new(PermissionStore::load(
+            permission_file,
+            &workspace,
+        )?));
+        let permission_coordinator =
+            Arc::new(PermissionCoordinator::new(Arc::clone(&permission_store)));
+        let backend = Arc::<dyn Backend>::from(crate::backend::build(
+            request.backend.clone(),
+            Arc::clone(&permission_coordinator),
+        )?);
+        Ok(Arc::new(Self {
+            backend,
+            permission_store,
+            permission_coordinator,
+        }))
+    }
 }
 
 /// Coordinates an out-of-band cancellation request with the active backend turn.
@@ -309,6 +349,23 @@ impl HarnessBroker {
         request: InitializeRequest,
         clock: Box<dyn Clock>,
     ) -> Result<Self> {
+        let runtime = BrokerRuntime::initialize(&request)?;
+        Self::initialize_with_runtime_and_clock(request, runtime, clock)
+    }
+
+    /// Initialize one session controller against shared provider infrastructure.
+    pub fn initialize_with_runtime(
+        request: InitializeRequest,
+        runtime: Arc<BrokerRuntime>,
+    ) -> Result<Self> {
+        Self::initialize_with_runtime_and_clock(request, runtime, Box::new(SystemClock))
+    }
+
+    fn initialize_with_runtime_and_clock(
+        request: InitializeRequest,
+        runtime: Arc<BrokerRuntime>,
+        clock: Box<dyn Clock>,
+    ) -> Result<Self> {
         let data_root = PathBuf::from(&request.data_root);
         let mut store = SqliteStore::open(&data_root)?;
         let workspace_kind = crate::workspace::resolve(Path::new(&request.workspace))?;
@@ -318,21 +375,9 @@ impl HarnessBroker {
             }
         };
         let now_ms = clock.now_ms();
-        let permission_file = request
-            .permission_file
-            .as_deref()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| data_root.join("permissions.json"));
-        let permission_store = Arc::new(RwLock::new(PermissionStore::load(
-            permission_file,
-            &workspace,
-        )?));
-        let permission_coordinator =
-            Arc::new(PermissionCoordinator::new(Arc::clone(&permission_store)));
-        let backend = Arc::<dyn Backend>::from(crate::backend::build(
-            request.backend.clone(),
-            Arc::clone(&permission_coordinator),
-        )?);
+        let permission_store = Arc::clone(&runtime.permission_store);
+        let permission_coordinator = Arc::clone(&runtime.permission_coordinator);
+        let backend = Arc::clone(&runtime.backend);
         let backend_descriptor = backend.descriptor();
         let force_new_session = request.lease_conflict_action.as_deref() == Some("new");
         let mut session = match request.session_id.as_deref().filter(|_| !force_new_session) {
@@ -442,6 +487,16 @@ impl HarnessBroker {
     /// Clone the backend control boundary for out-of-band active-turn requests.
     pub fn backend_handle(&self) -> Arc<dyn Backend> {
         Arc::clone(&self.backend)
+    }
+
+    /// Build the stable provider-catalog identity used outside serialized broker dispatch.
+    pub fn backend_catalog_request(&self) -> BackendCatalogRequest {
+        BackendCatalogRequest {
+            harness_session_id: self.session.id.clone(),
+            workspace: self.session.workspace.clone(),
+            execution_mode: self.session.execution_mode,
+            backend_session_id: self.session.backend_session_id.clone(),
+        }
     }
 
     /// Share the out-of-band permission lane with the broker transport loop.
@@ -600,7 +655,9 @@ impl HarnessBroker {
         method: &str,
         params: Value,
     ) -> Result<(Value, Vec<BrokerEvent>)> {
-        self.refresh_lease()?;
+        if !matches!(method, "state.get" | "session.list" | "session.preview") {
+            self.refresh_lease()?;
+        }
         match method {
             "state.get" => Ok((serde_json::to_value(self.snapshot()?)?, Vec::new())),
             "backend.models" => self.list_backend_model().await,
@@ -634,7 +691,7 @@ impl HarnessBroker {
             "interaction.comment.save" => self.save_interaction_comment(params),
             "interaction.request_changes" => self.request_interaction_changes(params).await,
             "interaction.rollback" => self.rollback_interaction(params).await,
-            "session.new" | "session.clear" => self.new_session().await,
+            "session.new" | "session.clear" => self.new_session(params).await,
             "session.list" => self.list_session(params),
             "session.preview" => self.preview_session(params),
             "session.resume" => self.resume_session(params).await,
@@ -800,7 +857,7 @@ impl HarnessBroker {
             },
             &mut event,
         )?;
-        let mut request = self.backend_request(text, PromptMode::Chat);
+        let mut request = self.backend_request(BackendInput::from_text(text), PromptMode::Chat);
         request
             .backend_session_id
             .clone_from(&run.provider_thread_id);
@@ -1175,7 +1232,7 @@ impl HarnessBroker {
     async fn list_backend_model(&mut self) -> Result<(Value, Vec<BrokerEvent>)> {
         let mut model_list = self
             .backend
-            .model_list(self.backend_request(String::new(), PromptMode::Chat))
+            .model_list(self.backend_request(BackendInput::from_text(""), PromptMode::Chat))
             .await?;
         let preference = self
             .store
@@ -1238,7 +1295,7 @@ impl HarnessBroker {
             return self.select_execution_mode(json!({ "mode": "yolo" }));
         }
         if text == "/clear" {
-            return self.new_session().await;
+            return self.new_session(Value::Null).await;
         }
         if text == "/plan cancel" {
             return self.cancel_plan();
@@ -1321,10 +1378,26 @@ impl HarnessBroker {
             }
             _ => text.clone(),
         };
-        self.run_interaction(
+        let input = match BackendInput::parse(&text) {
+            BackendInput::Skill {
+                name,
+                mut arguments,
+            } => {
+                if let Some(context) = prompt
+                    .strip_suffix(&text)
+                    .filter(|context| !context.is_empty())
+                {
+                    arguments = format!("{context}{arguments}");
+                }
+                BackendInput::Skill { name, arguments }
+            }
+            BackendInput::Text { .. } => BackendInput::from_text(prompt.clone()),
+        };
+        self.run_interaction_input(
             prompt,
             PromptMode::Chat,
             Some(InteractionAdmission::chat(text)),
+            input,
         )
         .await
     }
@@ -1361,7 +1434,7 @@ impl HarnessBroker {
 
         if goal_changed && self.capability.native_goal && self.session.backend_session_id.is_some()
         {
-            let request = self.backend_request(String::new(), PromptMode::Chat);
+            let request = self.backend_request(BackendInput::from_text(""), PromptMode::Chat);
             match snapshot.goal {
                 Some(goal) => {
                     let status = goal_state_name(goal.state);
@@ -1853,6 +1926,18 @@ impl HarnessBroker {
         mode: PromptMode,
         admission: Option<InteractionAdmission>,
     ) -> Result<(Value, Vec<BrokerEvent>)> {
+        let input = BackendInput::from_text(text.clone());
+        self.run_interaction_input(text, mode, admission, input)
+            .await
+    }
+
+    async fn run_interaction_input(
+        &mut self,
+        text: String,
+        mode: PromptMode,
+        admission: Option<InteractionAdmission>,
+        input: BackendInput,
+    ) -> Result<(Value, Vec<BrokerEvent>)> {
         let now_ms = self.clock.now_ms();
         let admitted_prompt = admission
             .as_ref()
@@ -1909,7 +1994,7 @@ impl HarnessBroker {
         let turn_started_at_ms = self.clock.now_ms();
         let output = self
             .prompt_with_timeline(
-                self.backend_request(text.clone(), mode),
+                self.backend_request(input, mode),
                 &mut interaction,
                 &mut event,
             )
@@ -1919,7 +2004,8 @@ impl HarnessBroker {
             Err(error) => {
                 let cancelled = error.downcast_ref::<TurnCancelled>().is_some();
                 if cancelled
-                    && let Some(backend_session_id) = self.backend.active_session_id().await
+                    && let Some(backend_session_id) =
+                        self.backend.active_session_id_for(&self.session.id).await
                 {
                     self.session.backend_session_id = Some(backend_session_id);
                 }
@@ -1935,7 +2021,11 @@ impl HarnessBroker {
                         .as_ref()
                         .is_some_and(|runtime| runtime.retraction_eligible);
                 if retraction_eligible {
-                    match self.backend.rollback_cancelled_turn().await {
+                    match self
+                        .backend
+                        .rollback_cancelled_turn_for(&self.session.id)
+                        .await
+                    {
                         Ok(true) => {
                             self.interaction_runtime.take();
                             self.store.delete_interaction(&interaction.id)?;
@@ -2344,7 +2434,7 @@ impl HarnessBroker {
         if outcome
             .as_ref()
             .is_err_and(|error| error.downcast_ref::<TurnCancelled>().is_some())
-            && let Err(error) = self.backend.cancel().await
+            && let Err(error) = self.backend.cancel_session(&self.session.id).await
         {
             outcome = Err(error).context("stop cancelled backend transport");
         }
@@ -3337,7 +3427,7 @@ impl HarnessBroker {
         }
         self.backend
             .goal_status(
-                self.backend_request(String::new(), PromptMode::GoalContinuation),
+                self.backend_request(BackendInput::from_text(""), PromptMode::GoalContinuation),
                 Some(goal.objective.clone()),
                 status,
             )
@@ -3449,16 +3539,17 @@ impl HarnessBroker {
         ))
     }
 
-    async fn new_session(&mut self) -> Result<(Value, Vec<BrokerEvent>)> {
-        self.pause_current_goal().await?;
-        self.release_lease()?;
-        self.interaction_runtime = None;
-        self.agent_registry = AgentRegistry::default();
-        self.agent_runtime_by_run.clear();
+    async fn new_session(&mut self, params: Value) -> Result<(Value, Vec<BrokerEvent>)> {
         let now_ms = self.clock.now_ms();
-        self.session = HarnessSession {
+        let child = HarnessSession {
             id: Uuid::new_v4().to_string(),
-            name: String::new(),
+            name: params
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .unwrap_or_default()
+                .to_owned(),
             workspace: self.session.workspace.clone(),
             backend: self.session.backend.clone(),
             backend_session_id: None,
@@ -3479,11 +3570,15 @@ impl HarnessBroker {
             native_compact: self.backend.descriptor().capability.native_compact,
             context_usage: None,
         };
-        self.capability = self.backend.descriptor().capability;
-        self.store.save_session(&self.session)?;
+        self.store.save_session(&child)?;
+        let snapshot = self.snapshot_for_session(child.clone())?;
         Ok((
-            serde_json::to_value(self.snapshot()?)?,
-            vec![self.event("session_changed", serde_json::to_value(&self.session)?)?],
+            serde_json::to_value(snapshot)?,
+            vec![BrokerEvent {
+                session_id: child.id.clone(),
+                event: "session_created".into(),
+                payload: serde_json::to_value(child)?,
+            }],
         ))
     }
 
@@ -3660,7 +3755,7 @@ impl HarnessBroker {
         {
             let model_list = self
                 .backend
-                .model_list(self.backend_request(String::new(), PromptMode::Chat))
+                .model_list(self.backend_request(BackendInput::from_text(""), PromptMode::Chat))
                 .await?;
             let target_model = requested_model
                 .and_then(|model| model_list.iter().find(|candidate| candidate.id == model))
@@ -3762,7 +3857,7 @@ impl HarnessBroker {
         );
         let output = self
             .backend
-            .compact(self.backend_request(String::new(), PromptMode::Chat))
+            .compact(self.backend_request(BackendInput::from_text(""), PromptMode::Chat))
             .await?;
         self.capability = output.capability.clone();
         self.session.native_fork = output.capability.native_fork;
@@ -3805,18 +3900,13 @@ impl HarnessBroker {
             source.backend == self.backend_launch.kind,
             "source session uses a different configured backend"
         );
-        let pause_started = Instant::now();
-        self.pause_current_goal().await?;
-        timing.push(crate::backend::BackendTimingRecord {
-            phase: "broker.pause_goal".into(),
-            duration_ms: pause_started.elapsed().as_secs_f64() * 1000.0,
-        });
         let backend_started = Instant::now();
         let backend_fork = self
             .backend
             .fork(BackendRequest {
+                harness_session_id: source.id.clone(),
                 workspace: source.workspace.clone(),
-                text: String::new(),
+                input: BackendInput::from_text(""),
                 mode: PromptMode::Chat,
                 model: source.model.clone(),
                 effort: source.effort.clone(),
@@ -3837,7 +3927,13 @@ impl HarnessBroker {
         let now_ms = self.clock.now_ms();
         let mut fork = source.clone();
         fork.id = Uuid::new_v4().to_string();
-        fork.name = resolve_fork_name(&params, &source.name);
+        let existing_name_set = self
+            .store
+            .list_session(Some(&source.workspace))?
+            .into_iter()
+            .map(|session| session.name)
+            .collect::<HashSet<_>>();
+        fork.name = resolve_fork_name(&params, &source.name, &existing_name_set);
         fork.backend_session_id = Some(backend_session_id);
         fork.context_usage.clone_from(&source.context_usage);
         fork.execution_mode = ExecutionMode::Read;
@@ -3857,18 +3953,12 @@ impl HarnessBroker {
                 source_session_name: source.name,
             },
         })?;
-        self.release_lease()?;
-        self.workspace_kind = crate::workspace::resolve(Path::new(&fork.workspace))?;
-        self.interaction_runtime = None;
-        self.session = fork;
-        self.agent_registry = load_agent_registry(&self.store, &self.session.id)?;
-        self.agent_runtime_by_run.clear();
         timing.push(crate::backend::BackendTimingRecord {
-            phase: "broker.persist_activate".into(),
+            phase: "broker.persist_child".into(),
             duration_ms: persistence_started.elapsed().as_secs_f64() * 1000.0,
         });
         let snapshot_started = Instant::now();
-        let mut snapshot = serde_json::to_value(self.snapshot()?)?;
+        let mut snapshot = serde_json::to_value(self.snapshot_for_session(fork.clone())?)?;
         timing.push(crate::backend::BackendTimingRecord {
             phase: "broker.snapshot".into(),
             duration_ms: snapshot_started.elapsed().as_secs_f64() * 1000.0,
@@ -3879,14 +3969,34 @@ impl HarnessBroker {
         });
         Ok((
             snapshot,
-            vec![self.event("session_changed", serde_json::to_value(&self.session)?)?],
+            vec![BrokerEvent {
+                session_id: fork.id.clone(),
+                event: "session_created".into(),
+                payload: serde_json::to_value(fork)?,
+            }],
         ))
     }
 
-    fn backend_request(&self, text: String, mode: PromptMode) -> BackendRequest {
+    fn snapshot_for_session(&mut self, session: HarnessSession) -> Result<BrokerSnapshot> {
+        let parent_session = std::mem::replace(&mut self.session, session);
+        let child_workspace = crate::workspace::resolve(Path::new(&self.session.workspace))?;
+        let parent_workspace = std::mem::replace(&mut self.workspace_kind, child_workspace);
+        let child_registry = load_agent_registry(&self.store, &self.session.id)?;
+        let parent_registry = std::mem::replace(&mut self.agent_registry, child_registry);
+        let parent_runtime = self.interaction_runtime.take();
+        let snapshot = self.snapshot();
+        self.session = parent_session;
+        self.workspace_kind = parent_workspace;
+        self.agent_registry = parent_registry;
+        self.interaction_runtime = parent_runtime;
+        snapshot
+    }
+
+    fn backend_request(&self, input: BackendInput, mode: PromptMode) -> BackendRequest {
         BackendRequest {
+            harness_session_id: self.session.id.clone(),
             workspace: self.session.workspace.clone(),
-            text,
+            input,
             mode,
             model: self.session.model.clone(),
             effort: self.session.effort.clone(),
@@ -3899,6 +4009,7 @@ impl HarnessBroker {
 
     fn event(&self, name: &str, payload: Value) -> Result<BrokerEvent> {
         Ok(BrokerEvent {
+            session_id: self.session.id.clone(),
             event: name.into(),
             payload,
         })
@@ -4011,7 +4122,11 @@ fn required_text(value: &Value, field: &str) -> Result<String> {
         .with_context(|| format!("{field} is required"))
 }
 
-fn resolve_fork_name(params: &Value, source_name: &str) -> String {
+fn resolve_fork_name(
+    params: &Value,
+    source_name: &str,
+    existing_name_set: &HashSet<String>,
+) -> String {
     params
         .get("name")
         .and_then(Value::as_str)
@@ -4019,11 +4134,15 @@ fn resolve_fork_name(params: &Value, source_name: &str) -> String {
         .filter(|name| !name.is_empty())
         .map(str::to_owned)
         .unwrap_or_else(|| {
-            if source_name.is_empty() {
-                "(fork)".into()
+            let base_name = if source_name.is_empty() {
+                "fork".to_owned()
             } else {
-                format!("{source_name} (fork)")
-            }
+                format!("{source_name}-fork")
+            };
+            (0_u64..)
+                .map(|ordinal| format!("{base_name}-{ordinal}"))
+                .find(|candidate| !existing_name_set.contains(candidate))
+                .expect("fork ordinal space is unbounded")
         })
 }
 
@@ -4065,12 +4184,20 @@ mod test {
 
     #[test]
     fn resolves_explicit_named_and_unnamed_fork_names() {
+        let existing_name_set = HashSet::from(["review-fork-0".to_owned()]);
         assert_eq!(
-            resolve_fork_name(&json!({ "name": "  investigation  " }), "review"),
+            resolve_fork_name(
+                &json!({ "name": "  investigation  " }),
+                "review",
+                &existing_name_set,
+            ),
             "investigation"
         );
-        assert_eq!(resolve_fork_name(&json!({}), "review"), "review (fork)");
-        assert_eq!(resolve_fork_name(&json!({}), ""), "(fork)");
+        assert_eq!(
+            resolve_fork_name(&json!({}), "review", &existing_name_set),
+            "review-fork-1"
+        );
+        assert_eq!(resolve_fork_name(&json!({}), "", &HashSet::new()), "fork-0");
     }
 
     fn completed_interaction(
@@ -4228,6 +4355,7 @@ mod test {
                     allow_freeform: true,
                 }],
             };
+            let request_text = request.input.text();
             let mut output = crate::backend::BackendOutput {
                 backend_session_id: Some("mutable-question".into()),
                 capability: BackendCapability::default(),
@@ -4237,10 +4365,7 @@ mod test {
                 },
                 ..crate::backend::BackendOutput::default()
             };
-            if request
-                .text
-                .contains("User follow-up:\nreplace the options")
-            {
+            if request_text.contains("User follow-up:\nreplace the options") {
                 let mut replacement = question_set();
                 replacement.questions[0].options = vec![
                     crate::plan::PlanQuestionOption {
@@ -4253,7 +4378,7 @@ mod test {
                     },
                 ];
                 output.plan_question = Some(replacement);
-            } else if request.text.contains("User follow-up:\nuse staged") {
+            } else if request_text.contains("User follow-up:\nuse staged") {
                 output.question_answer = Some(PlanQuestionAnswer {
                     question_id: "migration".into(),
                     response: PlanQuestionResponse::Selected {
@@ -4261,27 +4386,16 @@ mod test {
                         feedback: None,
                     },
                 });
-            } else if request
-                .text
-                .contains("User follow-up:\nthis decision is not material")
-            {
+            } else if request_text.contains("User follow-up:\nthis decision is not material") {
                 output.question_withdrawal = Some(PlanQuestionWithdrawal {
                     reason: "Repository policy determines the migration.".into(),
                 });
-            } else if request
-                .text
-                .contains("Pending planning questions withdrawn")
-                || request
-                    .text
-                    .contains("Planning feedback:\n- Migration: Staged")
-                || request
-                    .text
-                    .contains("The user answered the pending Harness questions")
+            } else if request_text.contains("Pending planning questions withdrawn")
+                || request_text.contains("Planning feedback:\n- Migration: Staged")
+                || request_text.contains("The user answered the pending Harness questions")
             {
                 if self.fail_withdrawal_continuation
-                    && request
-                        .text
-                        .contains("Pending planning questions withdrawn")
+                    && request_text.contains("Pending planning questions withdrawn")
                 {
                     anyhow::bail!("synthetic withdrawal continuation failure");
                 }
@@ -5070,7 +5184,7 @@ mod test {
         assert!(
             timing
                 .iter()
-                .any(|entry| entry["phase"] == "broker.persist_activate")
+                .any(|entry| entry["phase"] == "broker.persist_child")
         );
         assert!(
             timing
@@ -5191,6 +5305,26 @@ mod test {
         assert_eq!(session["context_window"], "default");
         assert_eq!(session["fast_mode"], true);
         assert_eq!(session["execution_mode"], "read");
+        drop(broker);
+        let mut broker = HarnessBroker::initialize_with_clock(
+            InitializeRequest {
+                data_root: data.path().to_string_lossy().into_owned(),
+                permission_file: None,
+                workspace: repository.path().to_string_lossy().into_owned(),
+                client_id: "settings-client".into(),
+                backend: BackendLaunch {
+                    kind: "codex".into(),
+                    command: vec!["codex".into(), "app-server".into()],
+                },
+                model: "default".into(),
+                effort: "medium".into(),
+                session_id: Some(session["id"].as_str().expect("child session id").to_owned()),
+                goal_max_turns: 20,
+                lease_conflict_action: None,
+            },
+            Box::new(FixedClock(100)),
+        )
+        .unwrap();
         let selected = broker
             .dispatch(BrokerRequest {
                 id: 21,

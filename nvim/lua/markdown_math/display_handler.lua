@@ -32,7 +32,7 @@ local function convert(input)
   local error_list = {}
   local command_list = environment.commands({ dependency.executable_path(), "latex2text" })
   for _, command in ipairs(command_list) do
-    local result = vim.system({ command }, { stdin = input, text = true }):wait()
+    local result = vim.system({ command }, { stdin = input, text = true, stdout = true, stderr = true }):wait()
     local output = (result.stdout or ""):gsub("\r", ""):gsub("\n+$", "")
     if result.code == 0 and output:find("%S") then
       local line_list = vim.split(output, "\n", { plain = true })

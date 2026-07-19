@@ -30,6 +30,8 @@ function PickerLayout.build(page, selected_index, width, options)
   options = options or {}
   local lines = {}
   local option_range = {}
+  local primary_range = {}
+  local child_range = {}
   local section_line = {}
   local content_range = {}
   local usable_width = math.max(20, width - 4)
@@ -75,7 +77,13 @@ function PickerLayout.build(page, selected_index, width, options)
       append(lines, wrap(label, usable_width, prefix))
       if detail ~= "" then append(lines, wrap(detail, usable_width, "      ")) end
     end
+    local primary_last = #lines
+    for _, child in ipairs(option.child_line_list or {}) do
+      append(lines, wrap(child, usable_width, "    ", "      "))
+    end
     option_range[index] = { first = first, last = #lines }
+    primary_range[index] = { first = first, last = primary_last }
+    if primary_last < #lines then child_range[index] = { first = primary_last + 1, last = #lines } end
   end
   if #page.option_list == 0 then lines[#lines + 1] = "  " .. (page.empty_text or "No matching options.") end
 
@@ -92,6 +100,8 @@ function PickerLayout.build(page, selected_index, width, options)
   return {
     lines = lines,
     option_range = option_range,
+    primary_range = primary_range,
+    child_range = child_range,
     section_line = section_line,
     content_range = content_range,
     selected_index = selected_index,
