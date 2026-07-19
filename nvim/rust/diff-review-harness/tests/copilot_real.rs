@@ -57,6 +57,7 @@ async fn streams_one_native_copilot_sdk_turn_through_the_broker() {
         model: "default".into(),
         effort: "low".into(),
         session_id: None,
+        new_session_name: None,
         goal_max_turns: 20,
         lease_conflict_action: None,
     })

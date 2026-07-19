@@ -72,6 +72,8 @@ pub struct InitializeRequest {
     #[serde(default = "default_effort")]
     pub effort: String,
     pub session_id: Option<String>,
+    #[serde(default)]
+    pub new_session_name: Option<String>,
     #[serde(default = "default_goal_max_turns")]
     pub goal_max_turns: u32,
     #[serde(default)]
@@ -379,7 +381,9 @@ impl HarnessBroker {
         let permission_coordinator = Arc::clone(&runtime.permission_coordinator);
         let backend = Arc::clone(&runtime.backend);
         let backend_descriptor = backend.descriptor();
-        let force_new_session = request.lease_conflict_action.as_deref() == Some("new");
+        let requested_new_session_name = request.new_session_name.as_deref().map(str::trim);
+        let force_new_session = requested_new_session_name.is_some()
+            || request.lease_conflict_action.as_deref() == Some("new");
         let mut session = match request.session_id.as_deref().filter(|_| !force_new_session) {
             Some(session_id) => {
                 store.acquire_session_lease(session_id, &request.client_id, now_ms)?
@@ -402,7 +406,7 @@ impl HarnessBroker {
                             store.load_preference(&workspace, &request.backend.kind)?;
                         let mut session = HarnessSession {
                             id: Uuid::new_v4().to_string(),
-                            name: String::new(),
+                            name: requested_new_session_name.unwrap_or_default().to_owned(),
                             workspace,
                             backend: request.backend.kind.clone(),
                             backend_session_id: None,
@@ -4813,6 +4817,7 @@ mod test {
                 model: "mock-model".into(),
                 effort: "low".into(),
                 session_id: None,
+                new_session_name: None,
                 goal_max_turns: 20,
                 lease_conflict_action: None,
             },
@@ -5041,6 +5046,7 @@ mod test {
                 model: "mock-model".into(),
                 effort: "low".into(),
                 session_id: None,
+                new_session_name: None,
                 goal_max_turns: 20,
                 lease_conflict_action: None,
             },
@@ -5091,6 +5097,44 @@ mod test {
     }
 
     #[tokio::test]
+    async fn initializes_one_named_session_without_resuming_a_leased_session() {
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let initialize = |client_id: &str, name: &str| InitializeRequest {
+            data_root: data.path().to_string_lossy().into_owned(),
+            permission_file: None,
+            workspace: repository.path().to_string_lossy().into_owned(),
+            client_id: client_id.into(),
+            backend: BackendLaunch {
+                kind: "mock".into(),
+                command: vec!["mock".into()],
+            },
+            model: "mock-model".into(),
+            effort: "low".into(),
+            session_id: None,
+            new_session_name: Some(name.into()),
+            goal_max_turns: 20,
+            lease_conflict_action: None,
+        };
+
+        let first = HarnessBroker::initialize_with_clock(
+            initialize("first-client", "first"),
+            Box::new(FixedClock(100)),
+        )
+        .unwrap();
+        let second = HarnessBroker::initialize_with_clock(
+            initialize("second-client", "  second  "),
+            Box::new(FixedClock(110)),
+        )
+        .unwrap();
+
+        assert_ne!(first.session.id, second.session.id);
+        assert_eq!(first.session.name, "first");
+        assert_eq!(second.session.name, "second");
+        assert_eq!(second.store.list_session(None).unwrap().len(), 2);
+    }
+
+    #[tokio::test]
     async fn forks_a_live_session_without_taking_its_lease() {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
@@ -5107,6 +5151,7 @@ mod test {
                 model: "mock-model".into(),
                 effort: "low".into(),
                 session_id: None,
+                new_session_name: None,
                 goal_max_turns: 20,
                 lease_conflict_action,
             };
@@ -5227,6 +5272,7 @@ mod test {
                 model: "default".into(),
                 effort: "medium".into(),
                 session_id: None,
+                new_session_name: None,
                 goal_max_turns: 20,
                 lease_conflict_action: None,
             },
@@ -5319,6 +5365,7 @@ mod test {
                 model: "default".into(),
                 effort: "medium".into(),
                 session_id: Some(session["id"].as_str().expect("child session id").to_owned()),
+                new_session_name: None,
                 goal_max_turns: 20,
                 lease_conflict_action: None,
             },
@@ -5365,6 +5412,7 @@ mod test {
                 model: "default".into(),
                 effort: "medium".into(),
                 session_id: Some(resumed_session_id),
+                new_session_name: None,
                 goal_max_turns: 20,
                 lease_conflict_action: None,
             },
@@ -5409,6 +5457,7 @@ mod test {
                 model: "mock-model".into(),
                 effort: "medium".into(),
                 session_id: None,
+                new_session_name: None,
                 goal_max_turns: 20,
                 lease_conflict_action: None,
             },
@@ -5464,6 +5513,7 @@ mod test {
                 model: "mock-model".into(),
                 effort: "low".into(),
                 session_id: None,
+                new_session_name: None,
                 goal_max_turns: 20,
                 lease_conflict_action: None,
             },
@@ -5538,6 +5588,7 @@ mod test {
                 model: "mock-model".into(),
                 effort: "low".into(),
                 session_id: None,
+                new_session_name: None,
                 goal_max_turns: 20,
                 lease_conflict_action: None,
             },
@@ -5562,6 +5613,7 @@ mod test {
                 model: "different-model".into(),
                 effort: "high".into(),
                 session_id: None,
+                new_session_name: None,
                 goal_max_turns: 20,
                 lease_conflict_action: None,
             },
@@ -5974,6 +6026,7 @@ mod test {
                 model: "mock-model".into(),
                 effort: "low".into(),
                 session_id: None,
+                new_session_name: None,
                 goal_max_turns: 20,
                 lease_conflict_action: None,
             },
@@ -6106,6 +6159,7 @@ mod test {
                 model: "mock-model".into(),
                 effort: "low".into(),
                 session_id: None,
+                new_session_name: None,
                 goal_max_turns: 20,
                 lease_conflict_action: None,
             },
@@ -6151,6 +6205,7 @@ mod test {
                 model: "mock-model".into(),
                 effort: "low".into(),
                 session_id: None,
+                new_session_name: None,
                 goal_max_turns: 20,
                 lease_conflict_action: None,
             },
@@ -6192,6 +6247,7 @@ mod test {
                 model: "mock-model".into(),
                 effort: "low".into(),
                 session_id: None,
+                new_session_name: None,
                 goal_max_turns: 20,
                 lease_conflict_action: None,
             },
@@ -6278,6 +6334,7 @@ mod test {
                 model: "mock-model".into(),
                 effort: "low".into(),
                 session_id: None,
+                new_session_name: None,
                 goal_max_turns: 20,
                 lease_conflict_action: None,
             },
@@ -6365,6 +6422,7 @@ mod test {
                 model: "mock-model".into(),
                 effort: "low".into(),
                 session_id: None,
+                new_session_name: None,
                 goal_max_turns: 20,
                 lease_conflict_action: None,
             },
@@ -6412,6 +6470,7 @@ mod test {
                 model: "mock-model".into(),
                 effort: "low".into(),
                 session_id: None,
+                new_session_name: None,
                 goal_max_turns: 20,
                 lease_conflict_action: None,
             },
@@ -6514,6 +6573,7 @@ mod test {
                 model: "mock-model".into(),
                 effort: "low".into(),
                 session_id: None,
+                new_session_name: None,
                 goal_max_turns: 20,
                 lease_conflict_action: None,
             },

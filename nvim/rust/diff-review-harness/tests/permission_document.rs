@@ -45,6 +45,7 @@ fn broker_fixture() -> (tempfile::TempDir, HarnessBroker) {
         model: "mock".into(),
         effort: "low".into(),
         session_id: None,
+        new_session_name: None,
         goal_max_turns: 20,
         lease_conflict_action: None,
     })

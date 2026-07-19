@@ -187,6 +187,9 @@ buffer, windows, queue, busy state, and subscriptions inside one real Neovim tab
 turn. A fork during the source's first in-progress turn therefore starts with an empty provider thread, rather than
 copying an unfinished prompt. `/new [name]` follows the same immediate-tab path without provider history. `/sessions`
 focuses an already-open timeline, opens in the current tab by default, and toggles new-tab opening with `<Tab>`.
+`:HarnessNew` also creates its provisional timeline before broker work. On a cold client it carries the new-session
+request through initialization so the broker creates that exact session without first resuming or persisting another one.
+On a warm client it routes `session.new` through the source controller while preserving every existing timeline tab.
 
 The Rust broker keeps a shared provider runtime and a serialized controller per session. Codex retains one app-server
 process per Harness session, while Copilot retains one SDK session and its turn-local control lanes per Harness session.

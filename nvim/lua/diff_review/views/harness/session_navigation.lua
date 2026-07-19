@@ -156,9 +156,11 @@ end
 ---@return DiffReviewHarnessPendingSession
 function M.begin_new(name)
   pending_sequence = pending_sequence + 1
+  local source_session_id = session.harness.session and session.harness.session.id or ""
+  local state = create_view("new-pending-" .. pending_sequence)
   local pending = {
-    state = create_view("new-pending-" .. pending_sequence),
-    source_session_id = session.harness.session and session.harness.session.id or "",
+    state = state,
+    source_session_id = source_session_id,
     source_session_name = "",
     child_name = name,
     kind = "new",

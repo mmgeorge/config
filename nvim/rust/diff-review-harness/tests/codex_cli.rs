@@ -405,6 +405,7 @@ async fn broker_runs_the_configured_local_code_explorer_to_parent_completion() {
         model: "gpt-5.6-terra".into(),
         effort: "low".into(),
         session_id: None,
+        new_session_name: None,
         goal_max_turns: 20,
         lease_conflict_action: None,
     })

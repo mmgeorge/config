@@ -152,7 +152,7 @@ local function consume_stdout(chunk, generation)
   end
 end
 
----@param callback fun(result?: any, error?: string)
+---@param callback fun(result?: any, error?: string, error_detail?: table)
 local function send_initialize(callback, initialize_options)
   local client = state()
   local harness_config = config.options.harness
@@ -182,6 +182,7 @@ local function send_initialize(callback, initialize_options)
     effort = harness_config.effort,
     goal_max_turns = harness_config.goal_max_turns,
     lease_conflict_action = initialize_options and initialize_options.lease_conflict_action or nil,
+    new_session_name = initialize_options and initialize_options.new_session_name or nil,
   })
   local ok, write_error = pcall(client.process.write, client.process, payload)
   if not ok then
@@ -191,7 +192,7 @@ local function send_initialize(callback, initialize_options)
 end
 
 ---@param binary string
----@param callback fun(result?: any, error?: string)
+---@param callback fun(result?: any, error?: string, error_detail?: table)
 local function launch(binary, callback, initialize_options)
   local client = state()
   client.generation = client.generation + 1
@@ -248,6 +249,7 @@ local function launch(binary, callback, initialize_options)
   send_initialize(callback, initialize_options)
 end
 
+---@param callback fun(result?: any, error?: string, error_detail?: table)
 local function start_process(callback, initialize_options)
   local client = state()
   client.starting = true
@@ -260,7 +262,7 @@ local function start_process(callback, initialize_options)
   end)
 end
 
----@param callback fun(result?: any, error?: string)
+---@param callback fun(result?: any, error?: string, error_detail?: table)
 function M.start(callback)
   callback = callback or function() end
   local client = state()
@@ -298,19 +300,38 @@ function M.request(method, params, callback)
   M.request_for(active_session_id, method, params, callback)
 end
 
+---@param request_state DiffReviewHarnessPresentationState
+---@param callback fun(result?: any, error?: string, error_detail?: table)
+---@return fun(result?: any, error?: string, error_detail?: table)
+local function scope_callback(request_state, callback)
+  return function(result, request_error, error_detail)
+    local active_state = session.harness
+    session.activate_harness(request_state)
+    callback(result, request_error, error_detail)
+    if active_state ~= request_state then session.activate_harness(active_state) end
+  end
+end
+
+---@param session_id? string
+---@param name? string
+---@param callback? fun(result?: any, error?: string, error_detail?: table)
+function M.create_session(session_id, name, callback)
+  callback = callback or function() end
+  local client = state()
+  if client.process or client.starting then
+    M.request_for(session_id, "session.new", { name = name }, callback)
+    return
+  end
+  start_process(scope_callback(session.harness, callback), { new_session_name = name or "" })
+end
+
 ---@param session_id? string
 ---@param method string
 ---@param params? table
 ---@param callback? fun(result?: any, error?: string, error_detail?: table)
 function M.request_for(session_id, method, params, callback)
   callback = callback or function() end
-  local request_state = session.harness
-  local function session_callback(...)
-    local active_state = session.harness
-    session.activate_harness(request_state)
-    callback(...)
-    if active_state ~= request_state then session.activate_harness(active_state) end
-  end
+  local session_callback = scope_callback(session.harness, callback)
   M.start(function(_, start_error)
     if start_error then session_callback(nil, start_error) return end
     local client = state()

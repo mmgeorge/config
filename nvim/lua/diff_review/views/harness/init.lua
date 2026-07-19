@@ -12,6 +12,14 @@ local picker = require("diff_review.views.picker")
 
 local function valid_window(win) return win and vim.api.nvim_win_is_valid(win) end
 
+local function resolve_backend_preference()
+  if config.harness_backend_explicit then return end
+  config.options.harness.backend = backend_preference.load(
+    config.options.harness.backends,
+    config.options.harness.backend
+  )
+end
+
 local function apply_snapshot(state, result)
   session_navigation.activate(result, {
     state = state,
@@ -82,12 +90,7 @@ function M.open()
     end
     return
   end
-  if not config.harness_backend_explicit then
-    config.options.harness.backend = backend_preference.load(
-      config.options.harness.backends,
-      config.options.harness.backend
-    )
-  end
+  resolve_backend_preference()
   state.transcript_buf, state.transcript_win, state.composer_buf, state.composer_win, state.timeline_tab =
     layout.open("initial-pending-" .. tostring(vim.uv.hrtime()))
   layout.attach_auto_height(state.composer_buf, state.composer_win)
@@ -140,10 +143,10 @@ end
 
 ---@param name? string
 function M.new_session(name)
-  M.open()
+  resolve_backend_preference()
   local source_session_id = session.harness.session and session.harness.session.id or nil
   local pending = session_navigation.begin_new(name)
-  client.request_for(source_session_id, "session.new", { name = name }, function(result, request_error)
+  client.create_session(source_session_id, name, function(result, request_error)
     if request_error then
       pending.error = request_error
       session_navigation.render_pending(pending)
