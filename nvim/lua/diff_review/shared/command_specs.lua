@@ -103,9 +103,10 @@ M.view_specs = {
     { id = "help", label = "help", desc = "Show Harness help", modes = "n", pinned = true },
   },
   plan_review = {
+    { id = "open", label = "open", desc = "Open the source file for this plan node", modes = "n", pinned = true },
     { id = "comment", label = "comment", desc = "Annotate the current plan line", modes = "n", pinned = true },
     { id = "accept", label = "accept", desc = "Accept the exact saved plan and execute it", modes = "n", pinned = true },
-    { id = "request_changes", label = "changes", desc = "Save edits and request a complete revised plan", modes = "n", pinned = true },
+    { id = "request_changes", label = "changes", desc = "Request a semantic revision from review comments", modes = "n", pinned = true },
     { id = "close", label = "close", desc = "Return to Harness without deciding", modes = "n", pinned = true },
     { id = "help", label = "help", desc = "Show PlanReview help", modes = "n", pinned = true },
   },

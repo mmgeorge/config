@@ -24,13 +24,15 @@ use crate::interaction::{
 };
 use crate::permissions::store::PermissionStore;
 use crate::plan::{
-    ArtifactSummary, PlanAnnotation, PlanElicitation, PlanExecutionRecord, PlanExecutionState,
-    PlanFileStore, PlanLifecycleKind, PlanLifecycleRecord, PlanPrompt, PlanQuestionAnswer,
-    PlanQuestionResponse, PlanQuestionSet, PlanQuestionWithdrawal, PlanRecord, PlanState,
+    ArtifactSummary, PlanAnnotation, PlanDeviation, PlanDeviationDisposition, PlanDeviationKind,
+    PlanDocument, PlanElicitation, PlanExecutionRecord, PlanExecutionState, PlanFileStore,
+    PlanLifecycleKind, PlanLifecycleRecord, PlanPrompt, PlanQuestionAnswer, PlanQuestionResponse,
+    PlanQuestionSet, PlanQuestionWithdrawal, PlanRecord, PlanResolutionKind, PlanState,
+    PlanTestPlan, ScopeDeviationReview,
 };
 use crate::protocol::{BrokerEvent, BrokerRequest, BrokerResponse};
 use crate::session::{
-    ContextUsage, ExecutionMode, HarnessPreference, HarnessSession, ModelSetting,
+    ContextUsage, ExecutionMode, HarnessMode, HarnessPreference, HarnessSession, ModelSetting,
     ProviderForkState, SessionStore,
 };
 use crate::storage::SqliteStore;
@@ -284,6 +286,7 @@ struct PromptControlSnapshot {
     session: HarnessSession,
     goal: Option<GoalRecord>,
     execution: Vec<PlanExecutionRecord>,
+    plan: Vec<PlanRecord>,
 }
 
 impl InteractionAdmission {
@@ -344,6 +347,7 @@ pub struct HarnessBroker {
     session: HarnessSession,
     capability: BackendCapability,
     goal_max_turns: u32,
+    scope_deviation_review: ScopeDeviationReview,
     permission_store: Arc<RwLock<PermissionStore>>,
     permission_coordinator: Arc<PermissionCoordinator>,
     event_sink: Option<BackendEventSink>,
@@ -437,6 +441,7 @@ impl HarnessBroker {
                             context_window: None,
                             fast_mode: preference.as_ref().is_some_and(|value| value.fast_mode),
                             execution_mode: ExecutionMode::Read,
+                            mode: HarnessMode::Read,
                             created_at_ms: now_ms,
                             updated_at_ms: now_ms,
                             active_plan_id: None,
@@ -488,6 +493,7 @@ impl HarnessBroker {
             session,
             capability,
             goal_max_turns: request.goal_max_turns,
+            scope_deviation_review: ScopeDeviationReview::Auto,
             permission_store,
             permission_coordinator,
             event_sink: None,
@@ -579,6 +585,9 @@ impl HarnessBroker {
             &plan_list,
             lifecycle_list,
             execution_list,
+            self.store.list_plan_deviation(&self.session.id)?,
+            self.store.list_plan_audit(&self.session.id)?,
+            self.store.list_plan_resolution(&self.session.id)?,
             self.agent_registry.list(),
             self.store.list_session_event(&self.session.id)?,
             &self.plan_file,
@@ -687,6 +696,7 @@ impl HarnessBroker {
             "permissions.open" => self.open_permission_document(),
             "permissions.save" => self.save_permission_document(params),
             "session.execution_mode" => self.select_execution_mode(params),
+            "session.mode" => self.select_harness_mode(params),
             "interaction.resume" => self.resume_interaction(params).await,
             "prompt.submit" => self.submit_prompt(params).await,
             "history.record" => self.record_prompt_history(params),
@@ -695,6 +705,8 @@ impl HarnessBroker {
             "plan.request_changes" => self.request_plan_changes(params).await,
             "plan.cancel" => self.cancel_plan(),
             "plan.activate" => self.activate_plan(params),
+            "plan.scope_deviation_review" => self.select_scope_deviation_review(params),
+            "plan.deviation.resolve" => self.resolve_plan_deviation(params).await,
             "question.answer" => self.answer_question(params),
             "question.skip" => self.skip_question(params),
             "question.ask" => self.ask_question(params).await,
@@ -758,12 +770,46 @@ impl HarnessBroker {
             mode.label()
         );
         self.session.execution_mode = mode;
+        self.session.mode = mode.into();
         self.save_session()?;
         let session = serde_json::to_value(&self.session)?;
         Ok((
             session.clone(),
             vec![self.event("execution_mode_changed", session)?],
         ))
+    }
+
+    fn select_harness_mode(&mut self, params: Value) -> Result<(Value, Vec<BrokerEvent>)> {
+        let mode = serde_json::from_value::<HarnessMode>(
+            params.get("mode").cloned().context("mode is required")?,
+        )?;
+        if let Some(execution_mode) = mode.execution_mode() {
+            anyhow::ensure!(
+                self.capability
+                    .execution_mode_list
+                    .contains(&execution_mode),
+                "execution mode {} is unavailable for this backend",
+                execution_mode.label()
+            );
+            self.session.execution_mode = execution_mode;
+        }
+        self.session.mode = mode;
+        self.save_session()?;
+        let session = serde_json::to_value(&self.session)?;
+        Ok((session.clone(), vec![self.event("mode_changed", session)?]))
+    }
+
+    fn select_scope_deviation_review(
+        &mut self,
+        params: Value,
+    ) -> Result<(Value, Vec<BrokerEvent>)> {
+        self.scope_deviation_review = serde_json::from_value(
+            params
+                .get("policy")
+                .cloned()
+                .context("scope deviation review policy is required")?,
+        )?;
+        Ok((json!({ "policy": self.scope_deviation_review }), Vec::new()))
     }
 
     async fn resume_interaction(&mut self, params: Value) -> Result<(Value, Vec<BrokerEvent>)> {
@@ -1291,6 +1337,7 @@ impl HarnessBroker {
             session: self.session.clone(),
             goal: self.current_goal()?,
             execution: self.store.list_plan_execution(&self.session.id)?,
+            plan: self.store.list_plan(&self.session.id)?,
         };
         let result = self.submit_prompt_inner(params).await;
         if result
@@ -1322,7 +1369,71 @@ impl HarnessBroker {
         if text == "/plan cancel" {
             return self.cancel_plan();
         }
-        if let Some(request) = text.strip_prefix("/plan ") {
+        anyhow::ensure!(text != "/plan", "usage: /plan <prompt>");
+        let explicit_plan_request = text.strip_prefix("/plan ");
+        let active_plan_controls = self
+            .session
+            .active_plan_id
+            .as_deref()
+            .map(|plan_id| self.store.load_plan(plan_id))
+            .transpose()?
+            .flatten()
+            .is_some_and(|plan| {
+                matches!(
+                    plan.state,
+                    PlanState::Generating
+                        | PlanState::Revising
+                        | PlanState::AwaitingInput
+                        | PlanState::AwaitingReview
+                )
+            });
+        let plan_request = explicit_plan_request.or_else(|| {
+            (self.session.mode == HarnessMode::Plan
+                && !active_plan_controls
+                && !text.starts_with('/'))
+            .then_some(text.as_str())
+        });
+        if let Some(request) = plan_request {
+            anyhow::ensure!(!request.trim().is_empty(), "usage: /plan <prompt>");
+            self.session.mode = HarnessMode::Plan;
+            let now_ms = self.clock.now_ms();
+            let plan_id = Uuid::new_v4().to_string();
+            let document = PlanDocument {
+                version: 1,
+                plan_id: plan_id.clone(),
+                title: request.chars().take(100).collect(),
+                overview: "Planning in progress.".into(),
+                usage: None,
+                definitions: Vec::new(),
+                flows: Vec::new(),
+                tasks: Vec::new(),
+                test_plan: PlanTestPlan::default(),
+                assumptions: Vec::new(),
+            };
+            let working_path =
+                self.plan_file
+                    .write_working_document(&self.session.id, &plan_id, &document)?;
+            let plan = PlanRecord {
+                id: plan_id.clone(),
+                session_id: self.session.id.clone(),
+                request: request.to_owned(),
+                title: document.title.clone(),
+                state: PlanState::Generating,
+                working_path: working_path.to_string_lossy().into_owned(),
+                document_version: document.version,
+                model_revision: 0,
+                submitted_version: None,
+                accepted_revision: None,
+                user_revision: 0,
+                review_digest: None,
+                accepted_digest: None,
+                elicitation: None,
+                created_at_ms: now_ms,
+                updated_at_ms: now_ms,
+            };
+            self.store.save_plan(&plan)?;
+            self.session.active_plan_id = Some(plan_id.clone());
+            self.save_session()?;
             let mut leading_event = Vec::new();
             if let Some(goal) = self.current_goal()?
                 && goal.state == GoalState::Active
@@ -1330,11 +1441,12 @@ impl HarnessBroker {
                 let (_, pause_event) = self.pause_goal().await?;
                 leading_event.extend(pause_event);
             }
+            let document_json = serde_json::to_string_pretty(&document)?;
             let (result, mut event) = self
                 .run_interaction(
-                    PlanPrompt::draft(request),
+                    PlanPrompt::with_active_document(PlanPrompt::draft(request), &document_json),
                     PromptMode::Plan,
-                    Some(InteractionAdmission::plan(text, None, false)),
+                    Some(InteractionAdmission::plan(text, Some(plan_id), false)),
                 )
                 .await?;
             leading_event.append(&mut event);
@@ -1387,16 +1499,22 @@ impl HarnessBroker {
                 .ask_question(json!({ "question_id": question_id, "text": text }))
                 .await;
         }
-        let prompt = match self
+        let active_plan = self
             .session
             .active_plan_id
             .as_deref()
             .map(|plan_id| self.store.load_plan(plan_id))
             .transpose()?
-            .flatten()
-        {
+            .flatten();
+        let prompt = match active_plan.as_ref() {
             Some(plan) if !plan.working_path.is_empty() => {
-                PlanPrompt::with_active_artifact(text.clone(), &plan.id, &plan.working_path)
+                let document = self
+                    .plan_file
+                    .read_working_document(&self.session.id, &plan.id)?;
+                PlanPrompt::with_active_document(
+                    text.clone(),
+                    &serde_json::to_string_pretty(&document)?,
+                )
             }
             _ => text.clone(),
         };
@@ -1415,9 +1533,17 @@ impl HarnessBroker {
             }
             BackendInput::Text { .. } => BackendInput::from_text(prompt.clone()),
         };
+        let prompt_mode = if self.session.mode == HarnessMode::Plan
+            && active_plan.as_ref().is_some_and(|plan| {
+                matches!(plan.state, PlanState::Generating | PlanState::Revising)
+            }) {
+            PromptMode::Plan
+        } else {
+            PromptMode::Chat
+        };
         self.run_interaction_input(
             prompt,
-            PromptMode::Chat,
+            prompt_mode,
             Some(InteractionAdmission::chat(text)),
             input,
         )
@@ -1450,6 +1576,20 @@ impl HarnessBroker {
         }
         for execution in &snapshot.execution {
             self.store.save_plan_execution(execution)?;
+        }
+        let restored_plan_id = snapshot
+            .plan
+            .iter()
+            .map(|plan| plan.id.as_str())
+            .collect::<HashSet<_>>();
+        for plan in self.store.list_plan(&self.session.id)? {
+            if !restored_plan_id.contains(plan.id.as_str()) {
+                self.store.delete_plan(&plan.id)?;
+                self.plan_file.delete_plan(&self.session.id, &plan.id)?;
+            }
+        }
+        for plan in &snapshot.plan {
+            self.store.save_plan(plan)?;
         }
         self.session = snapshot.session;
         self.save_session()?;
@@ -1958,7 +2098,7 @@ impl HarnessBroker {
         text: String,
         mode: PromptMode,
         admission: Option<InteractionAdmission>,
-        input: BackendInput,
+        mut input: BackendInput,
     ) -> Result<(Value, Vec<BrokerEvent>)> {
         let now_ms = self.clock.now_ms();
         let admitted_prompt = admission
@@ -2012,6 +2152,28 @@ impl HarnessBroker {
             },
             &mut event,
         )?;
+
+        if mode == PromptMode::Plan && !input.text().contains("Active canonical PlanDocument:") {
+            let plan_id = self
+                .session
+                .active_plan_id
+                .as_deref()
+                .context("planning turn has no active plan")?;
+            let document = self
+                .plan_file
+                .read_working_document(&self.session.id, plan_id)?;
+            let context = PlanPrompt::with_active_document(
+                String::new(),
+                &serde_json::to_string_pretty(&document)?,
+            );
+            input = match input {
+                BackendInput::Text { text } => BackendInput::from_text(format!("{context}{text}")),
+                BackendInput::Skill { name, arguments } => BackendInput::Skill {
+                    name,
+                    arguments: format!("{context}{arguments}"),
+                },
+            };
+        }
 
         let turn_started_at_ms = self.clock.now_ms();
         let output = self
@@ -2147,16 +2309,9 @@ impl HarnessBroker {
         self.session.backend_session_id = output.backend_session_id.clone();
         self.session.provider_checkpoint_id = output.provider_checkpoint_id.clone();
         if !output.runtime.provider.is_empty() {
-            self.session.provider_label = output.runtime.provider;
+            self.session.provider_label = output.runtime.provider.clone();
         }
-        self.session.resolved_model = output.runtime.model;
-        let fallback_question = output
-            .event
-            .iter()
-            .rev()
-            .find(|backend_event| backend_event.kind == "assistant_message")
-            .and_then(|backend_event| backend_event.text.clone())
-            .filter(|text| !text.trim().is_empty());
+        self.session.resolved_model = output.runtime.model.clone();
         output.event.clear();
 
         if let Some(control_error) = output.control_error.take() {
@@ -2178,21 +2333,7 @@ impl HarnessBroker {
         }
 
         if mode == PromptMode::Plan {
-            let markdown = output.plan_markdown.take();
-            let question = output.plan_question.take().or_else(|| {
-                markdown
-                    .is_none()
-                    .then(|| fallback_question.map(PlanQuestionSet::freeform))
-                    .flatten()
-            });
-            if markdown.is_none() && question.is_none() {
-                interaction.state = InteractionState::Failed;
-                interaction.completed_at_ms = Some(self.clock.now_ms());
-                self.store.save_interaction(&interaction)?;
-                self.save_session()?;
-                anyhow::bail!("planning turn ended without a submitted plan or feedback question");
-            }
-            let active_plan = self
+            let mut plan = self
                 .session
                 .active_plan_id
                 .as_deref()
@@ -2204,48 +2345,62 @@ impl HarnessBroker {
                         plan.state,
                         PlanState::Generating | PlanState::Revising | PlanState::AwaitingInput
                     )
-                });
-            let mut plan = match active_plan {
-                Some(plan) => plan,
-                None => PlanRecord {
-                    id: Uuid::new_v4().to_string(),
-                    session_id: self.session.id.clone(),
-                    request: interaction
-                        .prompt
-                        .strip_prefix("/plan ")
-                        .unwrap_or(&interaction.prompt)
-                        .to_owned(),
-                    title: markdown
-                        .as_deref()
-                        .map(|markdown| plan_title(markdown, &interaction.prompt))
-                        .unwrap_or_else(|| interaction.prompt.chars().take(100).collect()),
-                    state: PlanState::Generating,
-                    working_path: String::new(),
-                    model_revision: 0,
-                    user_revision: 0,
-                    review_digest: None,
-                    accepted_digest: None,
-                    elicitation: None,
-                    created_at_ms: now_ms,
-                    updated_at_ms: now_ms,
-                },
-            };
-            self.session.active_plan_id = Some(plan.id.clone());
-            if let Some(markdown) = markdown {
+                })
+                .context("planning turn has no active canonical plan")?;
+
+            if let Some(document) = output.plan_document.take() {
+                anyhow::ensure!(
+                    document.plan_id == plan.id,
+                    "created plan id does not match active plan"
+                );
+                document.validate()?;
+                plan.document_version = document.version;
+                plan.title = document.title.clone();
+                plan.working_path = self
+                    .plan_file
+                    .write_working_document(&self.session.id, &plan.id, &document)?
+                    .to_string_lossy()
+                    .into_owned();
+                plan.state = PlanState::Generating;
+                plan.updated_at_ms = self.clock.now_ms();
+            }
+            for edit_request in std::mem::take(&mut output.plan_edit) {
+                anyhow::ensure!(
+                    edit_request.plan_id == plan.id,
+                    "edited plan id does not match active plan"
+                );
+                let result = self
+                    .plan_file
+                    .edit_working_document(&self.session.id, edit_request)?;
+                plan.document_version = result.version;
+                plan.title = result.document.title;
+                plan.state = PlanState::Generating;
+                plan.updated_at_ms = self.clock.now_ms();
+            }
+            if let Some(read_plan_id) = output.plan_read.take() {
+                anyhow::ensure!(read_plan_id == plan.id, "requested plan is not active");
+            }
+
+            if let Some(submission) = output.plan_submit.take() {
+                anyhow::ensure!(
+                    submission.plan_id == plan.id,
+                    "submitted plan id does not match active plan"
+                );
                 let lifecycle_kind = if plan.model_revision == 0 {
                     PlanLifecycleKind::Created
                 } else {
                     PlanLifecycleKind::RevisionCreated
                 };
                 plan.model_revision += 1;
-                plan.title = plan_title(&markdown, &plan.request);
-                let (path, digest) = self.plan_file.write_model_revision(
+                let (document, rendered, digest) = self.plan_file.submit_document_revision(
                     &self.session.id,
                     &plan.id,
                     plan.model_revision,
-                    &markdown,
+                    submission.expected_version,
                 )?;
-                plan.working_path = path.to_string_lossy().into_owned();
+                plan.document_version = document.version;
+                plan.submitted_version = Some(document.version);
+                plan.title = document.title.clone();
                 plan.review_digest = Some(digest);
                 plan.elicitation = None;
                 plan.state = PlanState::AwaitingReview;
@@ -2271,9 +2426,15 @@ impl HarnessBroker {
                     } else {
                         "plan_revision_created"
                     },
-                    json!({ "plan": plan, "lifecycle": lifecycle, "content": markdown }),
+                    json!({
+                        "plan": plan,
+                        "lifecycle": lifecycle,
+                        "document": document,
+                        "content": rendered.markdown,
+                        "navigation": rendered.navigation
+                    }),
                 )?);
-            } else if let Some(question) = question {
+            } else if let Some(question) = output.plan_question.take() {
                 let question = question.normalize()?;
                 plan.state = PlanState::AwaitingInput;
                 match plan.elicitation.as_mut() {
@@ -2301,6 +2462,9 @@ impl HarnessBroker {
                     "plan_question",
                     json!({ "plan": plan, "lifecycle": lifecycle, "question": question }),
                 )?);
+            } else {
+                plan.updated_at_ms = self.clock.now_ms();
+                self.store.save_plan(&plan)?;
             }
         } else {
             if let Some(question) = output.plan_question.take() {
@@ -2326,9 +2490,14 @@ impl HarnessBroker {
             }
         }
 
+        let execution_paused = self.apply_plan_execution_control(&mut output, &mut event)?;
         self.session.updated_at_ms = self.clock.now_ms();
         self.save_session()?;
-        let continuing = self.apply_goal_evidence(output.evidence, &mut event)?;
+        let continuing = if execution_paused {
+            false
+        } else {
+            self.apply_goal_evidence(output.evidence, &mut event)?
+        };
         let mut runtime = self
             .interaction_runtime
             .take()
@@ -2929,7 +3098,16 @@ impl HarnessBroker {
             plan.state == PlanState::AwaitingReview,
             "plan does not await review"
         );
-        let (_, digest) = self.plan_file.read_working(&self.session.id, &plan.id)?;
+        let accepted_document = self.plan_file.read_submitted_document(
+            &self.session.id,
+            &plan.id,
+            plan.model_revision,
+        )?;
+        let accepted_render = crate::plan::render_plan(&accepted_document)?;
+        let digest = plan
+            .review_digest
+            .clone()
+            .context("submitted plan digest is missing")?;
         if let Some(expected) = params.get("digest").and_then(Value::as_str) {
             anyhow::ensure!(
                 expected == digest,
@@ -2937,15 +3115,13 @@ impl HarnessBroker {
             );
         }
         plan.user_revision += 1;
-        let (accepted_markdown, _) =
-            self.plan_file
-                .save_user_revision(&self.session.id, &plan.id, plan.user_revision)?;
         plan.accepted_digest = Some(digest);
+        plan.accepted_revision = Some(plan.model_revision);
         plan.state = PlanState::Accepted;
         plan.updated_at_ms = self.clock.now_ms();
         self.store.save_plan(&plan)?;
         self.session.active_plan_id = Some(plan.id.clone());
-        let objective = "Complete the plan".to_owned();
+        let objective = format!("Complete accepted plan: {}", plan.title);
         let goal = self.create_goal(objective, self.capability.native_goal)?;
         let lifecycle = PlanLifecycleRecord {
             id: Uuid::new_v4().to_string(),
@@ -2961,12 +3137,29 @@ impl HarnessBroker {
             created_at_ms: self.clock.now_ms(),
         };
         self.store.save_plan_lifecycle(&lifecycle)?;
+        let fresh_context = params
+            .get("fresh_context")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let planning_backend_session_id = self.session.backend_session_id.clone();
+        if fresh_context {
+            self.session.backend_session_id = None;
+            self.session.provider_checkpoint_id = None;
+            self.session.context_usage = None;
+        }
+        self.session.mode = HarnessMode::from(self.session.execution_mode);
+        self.save_session()?;
+        let mut scheduler = crate::plan::PlanScheduler::activate(&accepted_document);
+        scheduler.next_task(&accepted_document);
         let mut execution_record = PlanExecutionRecord {
             id: Uuid::new_v4().to_string(),
             session_id: self.session.id.clone(),
             plan_id: plan.id.clone(),
             goal_id: goal.id.clone(),
             state: PlanExecutionState::Active,
+            planning_backend_session_id,
+            execution_backend_session_id: self.session.backend_session_id.clone(),
+            scheduler,
             created_at_ms: self.clock.now_ms(),
             completed_at_ms: None,
         };
@@ -2982,7 +3175,8 @@ impl HarnessBroker {
                     "created_at_ms": lifecycle.created_at_ms,
                     "plan": &plan,
                     "lifecycle": &lifecycle,
-                    "content": &accepted_markdown
+                    "content": &accepted_render.markdown,
+                    "document": &accepted_document
                 }),
                 activity: None,
                 summary: None,
@@ -2991,7 +3185,9 @@ impl HarnessBroker {
             &mut pre_execution_event,
         )?;
         let execution_prompt = format!(
-            "Goal: Complete the plan. Execute the accepted plan exactly. Report completion with harness_goal_complete only when every task is finished.\n\n{accepted_markdown}"
+            "Goal: Complete the accepted plan task by task. Execution ID: {}. The scheduler selects whole tasks. Subtasks and code edits provide progress and audit evidence, not separate goals. Call harness_plan_task_report for the active task and harness_plan_deviation before departing from accepted intent. Report completion with harness_goal_complete only when every task and required test finishes.\n\nAccepted canonical PlanDocument:\n```json\n{}\n```",
+            execution_record.id,
+            serde_json::to_string_pretty(&accepted_document)?
         );
         let execution = self
             .run_interaction(
@@ -3005,6 +3201,12 @@ impl HarnessBroker {
             )
             .await;
         let execution_succeeded = execution.is_ok();
+        execution_record = self
+            .store
+            .load_plan_execution(&execution_record.id)?
+            .unwrap_or(execution_record);
+        execution_record.execution_backend_session_id = self.session.backend_session_id.clone();
+        self.store.save_plan_execution(&execution_record)?;
         let (result, mut event) = match execution {
             Ok(result) => result,
             Err(error) => {
@@ -3049,7 +3251,9 @@ impl HarnessBroker {
                     "plan": plan,
                     "lifecycle": lifecycle,
                     "execution": execution_record,
-                    "content": accepted_markdown
+                    "content": accepted_render.markdown,
+                    "document": accepted_document,
+                    "fresh_context": fresh_context
                 }),
             )?,
         );
@@ -3072,15 +3276,10 @@ impl HarnessBroker {
             "plan does not await review"
         );
         plan.user_revision += 1;
-        let (edited, digest) =
-            self.plan_file
-                .save_user_revision(&self.session.id, &plan.id, plan.user_revision)?;
-        let edit_diff = self.plan_file.user_edit_diff(
-            &self.session.id,
-            &plan.id,
-            plan.model_revision,
-            &edited,
-        )?;
+        let document = self
+            .plan_file
+            .read_working_document(&self.session.id, &plan.id)?;
+        let rendered = crate::plan::render_plan(&document)?;
         let annotation: Vec<PlanAnnotation> = serde_json::from_value(
             params
                 .get("annotations")
@@ -3094,9 +3293,9 @@ impl HarnessBroker {
             .filter(|comment| !comment.is_empty())
             .map(str::to_owned);
         plan.state = PlanState::Revising;
-        plan.review_digest = Some(digest);
         self.store.save_plan(&plan)?;
         self.session.active_plan_id = Some(plan.id.clone());
+        self.session.mode = HarnessMode::Plan;
         self.save_session()?;
         let lifecycle = PlanLifecycleRecord {
             id: Uuid::new_v4().to_string(),
@@ -3112,11 +3311,13 @@ impl HarnessBroker {
             created_at_ms: self.clock.now_ms(),
         };
         self.store.save_plan_lifecycle(&lifecycle)?;
-        let instruction = PlanPrompt::revision(
-            &edited,
-            &edit_diff,
-            &serde_json::to_string_pretty(&annotation)?,
-            overall_comment.as_deref(),
+        let instruction = PlanPrompt::with_active_document(
+            PlanPrompt::revision(
+                &rendered.markdown,
+                &serde_json::to_string_pretty(&annotation)?,
+                overall_comment.as_deref(),
+            ),
+            &serde_json::to_string_pretty(&document)?,
         );
         let leading_event = self.event(
             "plan_changes_requested",
@@ -3133,7 +3334,7 @@ impl HarnessBroker {
                     "created_at_ms": lifecycle.created_at_ms,
                     "plan": &plan,
                     "lifecycle": &lifecycle,
-                    "content": &edited
+                    "content": &rendered.markdown
                 }),
                 activity: None,
                 summary: None,
@@ -3295,14 +3496,16 @@ impl HarnessBroker {
         goal.resume(self.clock.now_ms());
         self.store.save_goal(&goal)?;
         self.sync_plan_execution(&goal)?;
-        let prompt = if goal.native {
-            "/goal resume".to_owned()
-        } else {
-            format!(
-                "/goal resume\nContinue working toward this goal: {}",
-                goal.objective
-            )
-        };
+        let prompt = self.plan_goal_prompt(&goal)?.unwrap_or_else(|| {
+            if goal.native {
+                "/goal resume".to_owned()
+            } else {
+                format!(
+                    "/goal resume\nContinue working toward this goal: {}",
+                    goal.objective
+                )
+            }
+        });
         let admission = self
             .store
             .list_plan_execution(&self.session.id)?
@@ -3353,13 +3556,64 @@ impl HarnessBroker {
     async fn continue_goal(&mut self) -> Result<(Value, Vec<BrokerEvent>)> {
         let goal = self.active_goal()?;
         anyhow::ensure!(goal.state == GoalState::Active, "goal is not active");
-        let prompt = if goal.native {
-            "/goal resume".to_owned()
-        } else {
-            format!("Continue working toward this goal: {}", goal.objective)
-        };
+        let prompt = self.plan_goal_prompt(&goal)?.unwrap_or_else(|| {
+            if goal.native {
+                "/goal resume".to_owned()
+            } else {
+                format!("Continue working toward this goal: {}", goal.objective)
+            }
+        });
         self.run_interaction(prompt, PromptMode::GoalContinuation, None)
             .await
+    }
+
+    fn plan_goal_prompt(&self, goal: &GoalRecord) -> Result<Option<String>> {
+        let Some(execution) = self
+            .store
+            .list_plan_execution(&self.session.id)?
+            .into_iter()
+            .find(|execution| execution.goal_id == goal.id)
+        else {
+            return Ok(None);
+        };
+        let plan = self
+            .store
+            .load_plan(&execution.plan_id)?
+            .context("accepted plan record is missing")?;
+        let accepted_revision = plan
+            .accepted_revision
+            .context("accepted plan revision is missing")?;
+        let accepted = self.plan_file.read_submitted_document(
+            &self.session.id,
+            &plan.id,
+            accepted_revision,
+        )?;
+        let deviation_list = self
+            .store
+            .list_plan_deviation(&self.session.id)?
+            .into_iter()
+            .filter(|deviation| deviation.execution_id == execution.id)
+            .collect::<Vec<_>>();
+        let effective = crate::plan::build_effective_plan(&accepted, &deviation_list)?;
+        let active_task_id = execution
+            .scheduler
+            .task
+            .iter()
+            .find(|task| task.state == crate::plan::PlanTaskState::Active)
+            .map(|task| task.task_id.as_str());
+        let active_task = active_task_id.and_then(|task_id| {
+            effective
+                .document
+                .tasks
+                .iter()
+                .find(|task| task.id == task_id)
+        });
+        Ok(Some(format!(
+            "Continue accepted-plan execution. Execution ID: {}. Complete the active whole task, then call harness_plan_task_report with detailed subtask, code-edit, path, and test evidence. Call harness_plan_deviation before departing from accepted intent. Call harness_goal_complete only after the scheduler has no incomplete tasks.\n\nActive task:\n```json\n{}\n```\n\nEffective canonical PlanDocument:\n```json\n{}\n```",
+            execution.id,
+            serde_json::to_string_pretty(&active_task)?,
+            serde_json::to_string_pretty(&effective.document)?,
+        )))
     }
 
     fn apply_goal_evidence(
@@ -3389,7 +3643,197 @@ impl HarnessBroker {
         };
         self.store.save_goal(&goal)?;
         self.sync_plan_execution(&goal)?;
+        let resolved_execution_id = self
+            .store
+            .list_plan_execution(&self.session.id)?
+            .into_iter()
+            .find(|execution| execution.goal_id == goal.id)
+            .map(|execution| execution.id);
+        let resolution_list = self.store.list_plan_resolution(&self.session.id)?;
+        if let Some(resolution) = resolved_execution_id.and_then(|execution_id| {
+            resolution_list
+                .into_iter()
+                .find(|resolution| resolution.execution_id == execution_id)
+        }) {
+            let deviations = self
+                .store
+                .list_plan_deviation(&self.session.id)?
+                .into_iter()
+                .filter(|deviation| deviation.execution_id == resolution.execution_id)
+                .collect::<Vec<_>>();
+            let audit = self
+                .store
+                .list_plan_audit(&self.session.id)?
+                .into_iter()
+                .find(|audit| audit.id == resolution.audit_id);
+            event.push(self.event(
+                "plan_resolution",
+                json!({ "resolution": resolution, "deviations": deviations, "audit": audit }),
+            )?);
+        }
         Ok(continuing)
+    }
+
+    fn apply_plan_execution_control(
+        &mut self,
+        output: &mut crate::backend::BackendOutput,
+        event: &mut Vec<BrokerEvent>,
+    ) -> Result<bool> {
+        if output.plan_deviation.is_empty() && output.plan_task_report.is_empty() {
+            return Ok(false);
+        }
+        let mut execution = self
+            .store
+            .list_plan_execution(&self.session.id)?
+            .into_iter()
+            .rev()
+            .find(|execution| execution.state == PlanExecutionState::Active)
+            .context("plan execution control requires an active execution")?;
+        let plan = self
+            .store
+            .load_plan(&execution.plan_id)?
+            .context("accepted plan record is missing")?;
+        let accepted_revision = plan
+            .accepted_revision
+            .context("accepted plan revision is missing")?;
+        let accepted = self.plan_file.read_submitted_document(
+            &self.session.id,
+            &plan.id,
+            accepted_revision,
+        )?;
+        let mut deviation_list = self.store.list_plan_deviation(&self.session.id)?;
+        let mut pause_for_review = false;
+        for request in std::mem::take(&mut output.plan_deviation) {
+            anyhow::ensure!(
+                request.plan_id == plan.id,
+                "deviation plan id does not match execution"
+            );
+            let disposition = match request.kind {
+                PlanDeviationKind::Informational => PlanDeviationDisposition::Recorded,
+                PlanDeviationKind::Scope
+                    if self.scope_deviation_review == ScopeDeviationReview::Auto =>
+                {
+                    PlanDeviationDisposition::AutoApproved
+                }
+                PlanDeviationKind::Scope => {
+                    pause_for_review = true;
+                    PlanDeviationDisposition::Pending
+                }
+            };
+            let deviation = PlanDeviation {
+                id: Uuid::new_v4().to_string(),
+                plan_id: plan.id.clone(),
+                execution_id: execution.id.clone(),
+                kind: request.kind,
+                disposition,
+                summary: request.summary,
+                reason: request.reason,
+                task_id: request.task_id,
+                subtask_id: request.subtask_id,
+                affected_paths: request.affected_paths,
+                proposed_operations: request.proposed_operations,
+                created_at_ms: self.clock.now_ms(),
+                resolved_at_ms: (disposition != PlanDeviationDisposition::Pending)
+                    .then(|| self.clock.now_ms()),
+            };
+            deviation.validate()?;
+            self.store
+                .save_plan_deviation(&self.session.id, &deviation)?;
+            event.push(self.event(
+                if disposition == PlanDeviationDisposition::Pending {
+                    "plan_deviation_review"
+                } else {
+                    "plan_deviation_recorded"
+                },
+                serde_json::to_value(&deviation)?,
+            )?);
+            deviation_list.push(deviation);
+        }
+        let effective = crate::plan::build_effective_plan(&accepted, &deviation_list)?;
+        if pause_for_review {
+            anyhow::ensure!(
+                output.plan_task_report.is_empty(),
+                "task cannot finish while a scope deviation awaits review"
+            );
+            let mut goal = self.active_goal()?;
+            goal.state = GoalState::Paused;
+            goal.updated_at_ms = self.clock.now_ms();
+            self.store.save_goal(&goal)?;
+            execution.state = PlanExecutionState::Paused;
+            self.store.save_plan_execution(&execution)?;
+            event.push(self.event("goal_changed", serde_json::to_value(goal)?)?);
+            return Ok(true);
+        }
+        for report in std::mem::take(&mut output.plan_task_report) {
+            anyhow::ensure!(
+                report.execution_id == execution.id,
+                "task report execution id does not match active execution"
+            );
+            execution
+                .scheduler
+                .apply_report(&effective.document, report)?;
+            event.push(self.event(
+                "plan_task_updated",
+                json!({ "execution": &execution, "scheduler": &execution.scheduler }),
+            )?);
+        }
+        if output.evidence.structured_complete {
+            anyhow::ensure!(
+                execution.scheduler.is_complete(),
+                "plan cannot complete before every scheduled task completes"
+            );
+        }
+        if execution
+            .scheduler
+            .task
+            .iter()
+            .any(|task| task.state == crate::plan::PlanTaskState::Blocked)
+        {
+            output.evidence.structured_blocked = true;
+        }
+        self.store.save_plan_execution(&execution)?;
+        Ok(false)
+    }
+
+    async fn resolve_plan_deviation(&mut self, params: Value) -> Result<(Value, Vec<BrokerEvent>)> {
+        let deviation_id = required_text(&params, "deviation_id")?;
+        let approved = params
+            .get("approved")
+            .and_then(Value::as_bool)
+            .context("approved is required")?;
+        let mut deviation = self
+            .store
+            .list_plan_deviation(&self.session.id)?
+            .into_iter()
+            .find(|deviation| deviation.id == deviation_id)
+            .context("plan deviation not found")?;
+        anyhow::ensure!(
+            deviation.disposition == PlanDeviationDisposition::Pending,
+            "plan deviation does not await review"
+        );
+        deviation.disposition = if approved {
+            PlanDeviationDisposition::UserApproved
+        } else {
+            PlanDeviationDisposition::Rejected
+        };
+        deviation.resolved_at_ms = Some(self.clock.now_ms());
+        self.store
+            .save_plan_deviation(&self.session.id, &deviation)?;
+        let mut event =
+            vec![self.event("plan_deviation_resolved", serde_json::to_value(&deviation)?)?];
+        if approved {
+            let (result, mut resume_event) = self.resume_goal().await?;
+            event.append(&mut resume_event);
+            Ok((result, event))
+        } else {
+            let mut goal = self.active_goal()?;
+            goal.state = GoalState::Blocked;
+            goal.updated_at_ms = self.clock.now_ms();
+            self.store.save_goal(&goal)?;
+            self.sync_plan_execution(&goal)?;
+            event.push(self.event("goal_changed", serde_json::to_value(&goal)?)?);
+            Ok((serde_json::to_value(goal)?, event))
+        }
     }
 
     fn sync_plan_execution(&mut self, goal: &GoalRecord) -> Result<()> {
@@ -3403,15 +3847,89 @@ impl HarnessBroker {
         };
         execution.state = match goal.state {
             GoalState::Active => PlanExecutionState::Active,
-            GoalState::Paused | GoalState::Cleared => PlanExecutionState::Paused,
+            GoalState::Paused => PlanExecutionState::Paused,
+            GoalState::Cleared => PlanExecutionState::Cancelled,
             GoalState::Complete => PlanExecutionState::Complete,
             GoalState::Blocked => PlanExecutionState::Blocked,
             GoalState::Stalled => PlanExecutionState::Stalled,
         };
-        if execution.state != PlanExecutionState::Active {
+        if matches!(
+            execution.state,
+            PlanExecutionState::Complete
+                | PlanExecutionState::Blocked
+                | PlanExecutionState::Stalled
+                | PlanExecutionState::Cancelled
+        ) {
             execution.completed_at_ms = Some(self.clock.now_ms());
         }
-        self.store.save_plan_execution(&execution)
+        self.store.save_plan_execution(&execution)?;
+        let resolution_kind = match execution.state {
+            PlanExecutionState::Complete => Some(PlanResolutionKind::Completed),
+            PlanExecutionState::Blocked | PlanExecutionState::Stalled => {
+                Some(PlanResolutionKind::Blocked)
+            }
+            PlanExecutionState::Cancelled => Some(PlanResolutionKind::Cancelled),
+            PlanExecutionState::Active | PlanExecutionState::Paused => None,
+        };
+        if let Some(kind) = resolution_kind {
+            self.finalize_plan_resolution(&execution, kind)?;
+        }
+        Ok(())
+    }
+
+    fn finalize_plan_resolution(
+        &mut self,
+        execution: &PlanExecutionRecord,
+        kind: PlanResolutionKind,
+    ) -> Result<()> {
+        if self
+            .store
+            .list_plan_resolution(&self.session.id)?
+            .iter()
+            .any(|resolution| resolution.execution_id == execution.id)
+        {
+            return Ok(());
+        }
+        let plan = self
+            .store
+            .load_plan(&execution.plan_id)?
+            .context("resolved plan record is missing")?;
+        let accepted_revision = plan
+            .accepted_revision
+            .context("resolved plan accepted revision is missing")?;
+        let accepted = self.plan_file.read_submitted_document(
+            &self.session.id,
+            &plan.id,
+            accepted_revision,
+        )?;
+        let deviation_list = self
+            .store
+            .list_plan_deviation(&self.session.id)?
+            .into_iter()
+            .filter(|deviation| deviation.execution_id == execution.id)
+            .collect::<Vec<_>>();
+        let effective = crate::plan::build_effective_plan(&accepted, &deviation_list)?;
+        let now_ms = self.clock.now_ms();
+        let audit = crate::plan::build_plan_audit(
+            Uuid::new_v4().to_string(),
+            execution.id.clone(),
+            &effective.document,
+            &execution.scheduler,
+            &deviation_list,
+            now_ms,
+        );
+        self.store.save_plan_audit(&self.session.id, &audit)?;
+        let resolution = crate::plan::build_plan_resolution(
+            Uuid::new_v4().to_string(),
+            self.session.id.clone(),
+            accepted_revision,
+            kind,
+            &execution.scheduler,
+            &deviation_list,
+            &audit,
+            now_ms,
+        )?;
+        self.store.save_plan_resolution(&resolution)
     }
 
     fn active_goal(&self) -> Result<GoalRecord> {
@@ -3623,6 +4141,9 @@ impl HarnessBroker {
             &plan_list,
             self.store.list_plan_lifecycle(&session_id)?,
             self.store.list_plan_execution(&session_id)?,
+            self.store.list_plan_deviation(&session_id)?,
+            self.store.list_plan_audit(&session_id)?,
+            self.store.list_plan_resolution(&session_id)?,
             agent_run_list.clone(),
             self.store.list_session_event(&session_id)?,
             &self.plan_file,
@@ -4064,17 +4585,6 @@ fn goal_state_name(state: GoalState) -> &'static str {
     }
 }
 
-fn plan_title(markdown: &str, request: &str) -> String {
-    markdown
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("# ").map(str::trim))
-        .filter(|title| !title.is_empty())
-        .unwrap_or(request)
-        .chars()
-        .take(100)
-        .collect()
-}
-
 fn default_model() -> String {
     "default".into()
 }
@@ -4236,6 +4746,57 @@ mod test {
         fail_withdrawal_continuation: bool,
     }
 
+    fn submit_test_plan(
+        request: &BackendRequest,
+        output: &mut crate::backend::BackendOutput,
+        overview: &str,
+    ) {
+        let request_text = request.input.text();
+        let mut document = crate::backend::mock_plan_document_from_prompt(&request_text)
+            .unwrap_or_else(|| {
+                panic!("planning prompt should include the canonical document: {request_text}")
+            });
+        document.title = "Migration plan".into();
+        document.overview = overview.into();
+        document.tasks = vec![crate::plan::PlanTask {
+            id: "task".into(),
+            title: "Implement the migration".into(),
+            rationale: "Apply the selected strategy at its owner.".into(),
+            order: 1,
+            files: vec![crate::plan::PlanFile {
+                path: "src/migration.rs".into(),
+                subtasks: vec![crate::plan::PlanSubtask {
+                    id: "subtask".into(),
+                    title: "Create the migration".into(),
+                    detail: "Change the persisted format.".into(),
+                    order: 1,
+                    code_edits: vec![crate::plan::CodeEdit {
+                        id: "edit".into(),
+                        action: crate::plan::PlanAction::Modify,
+                        kind: crate::plan::CodeKind::Function,
+                        target: "migrate".into(),
+                        description: "Apply the selected strategy.".into(),
+                        definition_id: None,
+                        member_id: None,
+                    }],
+                }],
+            }],
+        }];
+        document.test_plan.unit = vec![crate::plan::PlanTestCase {
+            id: "test".into(),
+            title: "Verifies migration".into(),
+            behavior: "The selected strategy preserves valid state.".into(),
+            mocks: Vec::new(),
+            task_ids: vec!["task".into()],
+            flow_ids: Vec::new(),
+        }];
+        output.plan_submit = Some(crate::backend::PlanSubmitRequest {
+            plan_id: document.plan_id.clone(),
+            expected_version: document.version,
+        });
+        output.plan_document = Some(document);
+    }
+
     #[async_trait::async_trait]
     impl Backend for MutableQuestionBackend {
         async fn prompt_stream(
@@ -4268,7 +4829,7 @@ mod test {
                 capability: BackendCapability::default(),
                 runtime: crate::backend::BackendRuntime {
                     provider: "Mutable question test".into(),
-                    model: Some(request.model),
+                    model: Some(request.model.clone()),
                 },
                 ..crate::backend::BackendOutput::default()
             };
@@ -4306,8 +4867,9 @@ mod test {
                 {
                     anyhow::bail!("synthetic withdrawal continuation failure");
                 }
-                output.plan_markdown = (request.mode == PromptMode::Plan)
-                    .then(|| "# Migration plan\n\n## Overview\n\nFollow repository policy.".into());
+                if request.mode == PromptMode::Plan {
+                    submit_test_plan(&request, &mut output, "Follow repository policy.");
+                }
             } else {
                 output.plan_question = Some(question_set());
             }
@@ -4376,20 +4938,25 @@ mod test {
                     allow_freeform: true,
                 }],
             });
-            Ok(crate::backend::BackendOutput {
+            let mut output = crate::backend::BackendOutput {
                 backend_session_id: Some("planning-question".into()),
                 event: vec![event],
-                plan_markdown: (turn > 0).then(|| {
-                    "# Migration plan\n\n## Overview\n\nUse the selected migration strategy.".into()
-                }),
                 plan_question,
                 capability: BackendCapability::default(),
                 runtime: crate::backend::BackendRuntime {
                     provider: "Planning question test".into(),
-                    model: Some(request.model),
+                    model: Some(request.model.clone()),
                 },
                 ..crate::backend::BackendOutput::default()
-            })
+            };
+            if turn > 0 && request.mode == PromptMode::Plan {
+                submit_test_plan(
+                    &request,
+                    &mut output,
+                    "Use the selected migration strategy.",
+                );
+            }
+            Ok(output)
         }
 
         async fn fork(
@@ -4637,6 +5204,7 @@ mod test {
             context_window: None,
             fast_mode: false,
             execution_mode: ExecutionMode::Read,
+            mode: HarnessMode::Read,
             created_at_ms: 0,
             updated_at_ms: 0,
             active_plan_id: None,
@@ -5583,7 +6151,11 @@ mod test {
                 params: json!({ "text": "/plan migrate the event format" }),
             })
             .await;
-        assert!(paused.response.error.is_none());
+        assert!(
+            paused.response.error.is_none(),
+            "{:?}",
+            paused.response.error
+        );
         assert!(
             paused
                 .event
@@ -5595,7 +6167,7 @@ mod test {
         assert_eq!(pending_plan.state, PlanState::AwaitingInput);
         let elicitation = pending_plan.elicitation.expect("durable elicitation");
         assert_eq!(elicitation.question_set.questions[0].header, "Migration");
-        assert!(paused_snapshot.artifact.is_empty());
+        assert_eq!(paused_snapshot.artifact.len(), 1);
         assert!(paused_snapshot.interaction.last().unwrap().awaiting_input);
 
         let question_id = elicitation.question_set.questions[0].id.clone();
@@ -5913,7 +6485,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn treats_an_unstructured_planning_question_as_freeform_feedback() {
+    async fn preserves_an_unstructured_planning_response_without_inventing_feedback() {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
@@ -5926,20 +6498,9 @@ mod test {
             })
             .await;
         assert!(paused.response.error.is_none());
-        let question = broker
-            .snapshot()
-            .unwrap()
-            .active_plan
-            .unwrap()
-            .elicitation
-            .unwrap()
-            .question_set;
-        assert!(question.questions[0].options.is_empty());
-        assert!(question.questions[0].allow_freeform);
-        assert_eq!(
-            question.questions[0].question,
-            "Which migration strategy should the plan use?"
-        );
+        let plan = broker.snapshot().unwrap().active_plan.unwrap();
+        assert_eq!(plan.state, PlanState::Generating);
+        assert!(plan.elicitation.is_none());
     }
 
     #[tokio::test]
@@ -6023,8 +6584,15 @@ mod test {
         );
         assert_eq!(broker.session.execution_mode, ExecutionMode::Read);
         let goal = broker.active_goal().unwrap();
-        assert_eq!(goal.objective, "Complete the plan");
-        assert!(broker.snapshot().unwrap().active_execution.is_some());
+        assert_eq!(goal.objective, "Complete accepted plan: build the feature");
+        assert!(broker.snapshot().unwrap().active_execution.is_none());
+        assert_eq!(goal.state, GoalState::Complete);
+        let resolution = broker
+            .store
+            .list_plan_resolution(&broker.session.id)
+            .unwrap();
+        assert_eq!(resolution.len(), 1);
+        assert_eq!(resolution[0].kind, PlanResolutionKind::Completed);
         let duplicate_acceptance = broker
             .dispatch(BrokerRequest {
                 id: 20,
@@ -6033,36 +6601,6 @@ mod test {
             })
             .await;
         assert!(duplicate_acceptance.response.error.is_some());
-        let interaction_count = broker
-            .store
-            .list_interaction(&broker.session.id)
-            .unwrap()
-            .len();
-        let paused = broker
-            .dispatch(BrokerRequest {
-                id: 3,
-                method: "goal.pause".into(),
-                params: json!({}),
-            })
-            .await;
-        assert!(paused.response.error.is_none());
-        let resumed = broker
-            .dispatch(BrokerRequest {
-                id: 4,
-                method: "goal.resume".into(),
-                params: json!({}),
-            })
-            .await;
-        assert!(resumed.response.error.is_none());
-        assert_eq!(
-            broker
-                .store
-                .list_interaction(&broker.session.id)
-                .unwrap()
-                .len(),
-            interaction_count + 1,
-            "an explicit goal resume must start a new user interaction"
-        );
         let plan = broker
             .store
             .load_plan(broker.session.active_plan_id.as_deref().unwrap())

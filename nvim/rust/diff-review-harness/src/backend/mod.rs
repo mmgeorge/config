@@ -238,7 +238,15 @@ pub struct BackendOutput {
     pub backend_session_id: Option<String>,
     pub provider_checkpoint_id: Option<String>,
     pub event: Vec<BackendEvent>,
-    pub plan_markdown: Option<String>,
+    pub plan_document: Option<crate::plan::PlanDocument>,
+    #[serde(default)]
+    pub plan_edit: Vec<crate::plan::PlanEditRequest>,
+    pub plan_submit: Option<PlanSubmitRequest>,
+    pub plan_read: Option<String>,
+    #[serde(default)]
+    pub plan_deviation: Vec<crate::plan::PlanDeviationRequest>,
+    #[serde(default)]
+    pub plan_task_report: Vec<crate::plan::PlanTaskReport>,
     pub plan_question: Option<PlanQuestionSet>,
     pub question_answer: Option<PlanQuestionAnswer>,
     pub question_withdrawal: Option<PlanQuestionWithdrawal>,
@@ -250,6 +258,13 @@ pub struct BackendOutput {
     pub structured_plan: bool,
     #[serde(skip)]
     pub metrics: TurnMetrics,
+}
+
+/// Identifies the exact canonical plan version entering review.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PlanSubmitRequest {
+    pub plan_id: String,
+    pub expected_version: u64,
 }
 
 /// Describes a provider fork after the Harness child identity is allocated.
@@ -559,21 +574,119 @@ impl Backend for MockBackend {
                 }
             }
         }
-        let plan_markdown = (request.mode == PromptMode::Plan).then(|| {
+        let planning_note = (request.mode == PromptMode::Plan).then(|| {
             let steering = steering_text_list
                 .iter()
                 .map(|text| format!("- {text}"))
                 .collect::<Vec<_>>()
                 .join("\n");
             if steering.is_empty() {
-                format!("# Plan\n\n1. {}\n", request.input.text())
+                request.input.text().to_owned()
             } else {
                 format!(
-                    "# Plan\n\n1. {}\n\n## Steering constraints\n\n{steering}\n",
+                    "{}\n\nSteering constraints:\n{steering}",
                     request.input.text()
                 )
             }
         });
+        let mut plan_document = planning_note
+            .as_deref()
+            .and_then(mock_plan_document_from_prompt);
+        if let Some(document) = plan_document.as_mut() {
+            document.overview = planning_note.unwrap_or_default();
+            document.tasks = vec![crate::plan::PlanTask {
+                id: "task-1".into(),
+                title: "Implement the requested change".into(),
+                rationale: "Connect the requested behavior to its source boundary.".into(),
+                order: 1,
+                files: vec![crate::plan::PlanFile {
+                    path: "src/change.rs".into(),
+                    subtasks: vec![crate::plan::PlanSubtask {
+                        id: "subtask-1".into(),
+                        title: "Create the implementation".into(),
+                        detail: "Apply the planned behavior at its owner.".into(),
+                        order: 1,
+                        code_edits: vec![crate::plan::CodeEdit {
+                            id: "edit-1".into(),
+                            action: crate::plan::PlanAction::Add,
+                            kind: crate::plan::CodeKind::Function,
+                            target: "requested_change".into(),
+                            description: "Implement the requested behavior.".into(),
+                            definition_id: None,
+                            member_id: None,
+                        }],
+                    }],
+                }],
+            }];
+            document.test_plan.unit = vec![crate::plan::PlanTestCase {
+                id: "test-1".into(),
+                title: "Verifies the requested change".into(),
+                behavior: "The implementation produces the requested result.".into(),
+                mocks: Vec::new(),
+                task_ids: vec!["task-1".into()],
+                flow_ids: Vec::new(),
+            }];
+        }
+        let plan_submit = plan_document.as_ref().map(|document| PlanSubmitRequest {
+            plan_id: document.plan_id.clone(),
+            expected_version: document.version,
+        });
+        let execution_document = matches!(
+            request.mode,
+            PromptMode::ExecutePlan | PromptMode::GoalContinuation
+        )
+        .then(|| mock_plan_document_from_prompt(&request.input.text()))
+        .flatten();
+        let execution_id = request
+            .input
+            .text()
+            .split("Execution ID: ")
+            .nth(1)
+            .and_then(|tail| tail.split(['.', '\n']).next())
+            .map(str::to_owned);
+        let plan_task_report = execution_document
+            .as_ref()
+            .zip(execution_id)
+            .and_then(|(document, execution_id)| {
+                document
+                    .tasks
+                    .first()
+                    .map(|task| (document, task, execution_id))
+            })
+            .map(
+                |(document, task, execution_id)| crate::plan::PlanTaskReport {
+                    execution_id,
+                    task_id: task.id.clone(),
+                    state: crate::plan::PlanTaskState::Complete,
+                    completed_subtask_ids: task
+                        .files
+                        .iter()
+                        .flat_map(|file| file.subtasks.iter().map(|subtask| subtask.id.clone()))
+                        .collect(),
+                    completed_code_edit_ids: task
+                        .files
+                        .iter()
+                        .flat_map(|file| file.subtasks.iter())
+                        .flat_map(|subtask| subtask.code_edits.iter().map(|edit| edit.id.clone()))
+                        .collect(),
+                    test_results: document
+                        .test_plan
+                        .unit
+                        .iter()
+                        .chain(&document.test_plan.integration)
+                        .map(|test| crate::plan::PlanTestResult {
+                            test_case_id: Some(test.id.clone()),
+                            status: crate::plan::PlanTestStatus::Passed,
+                            command: Some("mock test".into()),
+                            detail: None,
+                        })
+                        .collect(),
+                    changed_paths: task.files.iter().map(|file| file.path.clone()).collect(),
+                    summary: Some("Completed the mock task.".into()),
+                    blocking_reason: None,
+                },
+            );
+        let execution_complete = plan_task_report.is_some();
         if !self.emit_before_delay
             && let Some(event_sink) = event_sink
         {
@@ -585,14 +698,19 @@ impl Backend for MockBackend {
                 .or_else(|| Some("mock-session".into())),
             provider_checkpoint_id: Some("mock-checkpoint".into()),
             event: vec![event],
-            plan_markdown,
+            plan_document,
+            plan_edit: Vec::new(),
+            plan_submit,
+            plan_read: None,
+            plan_deviation: Vec::new(),
+            plan_task_report: plan_task_report.into_iter().collect(),
             plan_question: None,
             question_answer: None,
             question_withdrawal: None,
             control_error: None,
             evidence: TurnEvidence {
                 tool_called: request.execution_mode.permits_workspace_write(),
-                structured_complete: matches!(request.mode, PromptMode::GoalContinuation),
+                structured_complete: execution_complete,
                 ..TurnEvidence::default()
             },
             capability: mock_capability(),
@@ -661,6 +779,22 @@ impl Backend for MockBackend {
     }
 }
 
+pub(crate) fn mock_plan_document_from_prompt(prompt: &str) -> Option<crate::plan::PlanDocument> {
+    let mut remaining = prompt;
+    while let Some(offset) = remaining.find("```json\n") {
+        let json_start = offset + "```json\n".len();
+        let Some(relative_end) = remaining[json_start..].find("\n```") else {
+            return None;
+        };
+        let json_end = json_start + relative_end;
+        if let Ok(document) = serde_json::from_str(&remaining[json_start..json_end]) {
+            return Some(document);
+        }
+        remaining = &remaining[json_end + "\n```".len()..];
+    }
+    None
+}
+
 fn mock_capability() -> BackendCapability {
     BackendCapability {
         native_fork: true,
@@ -706,7 +840,9 @@ mod test {
                     BackendRequest {
                         harness_session_id: "harness-session".into(),
                         workspace: ".".into(),
-                        input: super::BackendInput::from_text("Refactor X"),
+                        input: super::BackendInput::from_text(
+                            "Active canonical PlanDocument:\n```json\n{\"version\":1,\"plan_id\":\"plan\",\"title\":\"Refactor X\",\"overview\":\"Planning\",\"usage\":null,\"definitions\":[],\"flows\":[],\"tasks\":[],\"test_plan\":{\"unit\":[],\"integration\":[]},\"assumptions\":[]}\n```\n\nRefactor X",
+                        ),
                         mode: PromptMode::Plan,
                         model: "mock-model".into(),
                         effort: "low".into(),
@@ -729,8 +865,8 @@ mod test {
             }
         }
         let output = prompt.await.unwrap().unwrap();
-        let plan = output.plan_markdown.unwrap();
-        assert!(plan.contains("Refactor X"));
-        assert!(plan.contains("And be sure to modify Y"));
+        let plan = output.plan_document.unwrap();
+        assert!(plan.overview.contains("Refactor X"));
+        assert!(plan.overview.contains("And be sure to modify Y"));
     }
 }

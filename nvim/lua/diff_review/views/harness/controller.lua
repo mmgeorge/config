@@ -189,7 +189,7 @@ end
 local function status_text()
   local state = harness_state()
   local active_session = state.session or {}
-  local raw_mode = state.pending_mode or active_session.execution_mode or "read"
+  local raw_mode = state.pending_mode or active_session.mode or active_session.execution_mode or "read"
   local mode = raw_mode:lower() == "yolo" and "YOLO" or (raw_mode:sub(1, 1):upper() .. raw_mode:sub(2))
   if state.pending_mode then mode = mode .. "*" end
   local backend = active_session.backend or config.options.harness.backend
@@ -220,6 +220,7 @@ local function status_text()
         write = "DiffReviewHarnessWrite",
         full = "DiffReviewHarnessFull",
         yolo = "DiffReviewHarnessYolo",
+        plan = "DiffReviewHarnessPlan",
       })[raw_mode:lower()] or "DiffReviewHarnessRead",
     },
     {
@@ -459,6 +460,27 @@ end
 
 ---@param event string
 ---@param payload table
+local function resolve_scope_deviation(deviation, approved)
+  client.request("plan.deviation.resolve", {
+    deviation_id = deviation.id,
+    approved = approved,
+  }, function(_, request_error)
+    if request_error then notifications.error(request_error, "Plan deviation") end
+  end)
+end
+
+local function present_scope_deviation(deviation)
+  local policy = config.options.harness.plan and config.options.harness.plan.scope_deviation_review or "auto"
+  if policy == "auto" then
+    resolve_scope_deviation(deviation, true)
+    return
+  end
+  open_choice_picker(harness_state(), "Review scope deviation", deviation.reason or deviation.summary, {
+    { label = "Approve", detail = deviation.summary, value = true },
+    { label = "Reject", detail = "Block execution without changing accepted intent.", value = false },
+  }, function(approved) resolve_scope_deviation(deviation, approved) end)
+end
+
 local function on_event(event, payload)
   local state = harness_state()
   if event == "backend_event" then
@@ -565,6 +587,13 @@ local function on_event(event, payload)
     or event == "plan_activated"
   then
     synchronize_state()
+  elseif event == "plan_deviation_review" then
+    vim.schedule(function() present_scope_deviation(payload) end)
+    schedule_render()
+  elseif event == "plan_deviation_recorded" or event == "plan_deviation_resolved"
+    or event == "plan_task_updated" or event == "plan_resolution"
+  then
+    synchronize_state()
   elseif event == "goal_changed" or event == "goal_continue_requested" then
     state.goal = payload.state == "cleared" and nil or payload
     M.refresh_winbar()
@@ -596,7 +625,9 @@ local function on_event(event, payload)
       prompt_history.reset_navigation()
     end
     state.session = next_session
-    if event == "execution_mode_changed" and not state.mode_restart_requested then state.pending_mode = nil end
+    if (event == "execution_mode_changed" or event == "mode_changed") and not state.mode_restart_requested then
+      state.pending_mode = nil
+    end
     M.refresh_winbar()
   elseif event == "interaction_rolled_back" then
     synchronize_state()
@@ -1262,7 +1293,7 @@ function M.submit()
   if execution_mode then
     set_composer_text(state.composer_buf, "")
     execution_mode = execution_mode:lower()
-    if not vim.tbl_contains({ "read", "write", "full", "yolo" }, execution_mode) then
+    if not vim.tbl_contains({ "read", "write", "full", "yolo", "plan" }, execution_mode) then
       report_configuration_error("Unknown execution mode: " .. execution_mode)
       return
     end
@@ -1770,6 +1801,22 @@ function M.set_mode(mode)
   local state = harness_state()
   mode = mode:lower()
   local function apply_mode()
+    if mode == "plan" then
+      if state.busy then
+        notifications.warn("Wait for the active turn before entering Plan mode", "Harness")
+        return
+      end
+      client.request("session.mode", { mode = mode }, function(result, request_error)
+        if request_error then
+          report_configuration_error("Failed to enter Plan mode: " .. request_error)
+          return
+        end
+        state.session = result or state.session
+        append_session_status("Mode changed to Plan")
+        M.refresh_winbar()
+      end)
+      return
+    end
     if state.busy then
       if state.mode_restart_requested then
         notifications.info("Harness is already restarting in the requested execution mode", "Harness")
@@ -1825,7 +1872,12 @@ function M.toggle_mode()
   local state = harness_state()
   local mode_list = (state.capability and state.capability.execution_mode_list) or {}
   if #mode_list == 0 then mode_list = { "read", "write", "full", "yolo" } end
-  local current_mode = state.pending_mode or (state.session and state.session.execution_mode) or "read"
+  local current_mode = state.pending_mode or (state.session and state.session.mode)
+    or (state.session and state.session.execution_mode) or "read"
+  if current_mode == "plan" then
+    M.set_mode((state.session and state.session.execution_mode) or "read")
+    return
+  end
   local current_index = 0
   for index, candidate in ipairs(mode_list) do
     if candidate == current_mode then
@@ -1838,19 +1890,21 @@ end
 
 function M.select_mode()
   local state = harness_state()
-  local current_mode = state.pending_mode or (state.session and state.session.execution_mode) or "read"
+  local current_mode = state.pending_mode or (state.session and state.session.mode)
+    or (state.session and state.session.execution_mode) or "read"
   local detail_list = {
     read = "Allow reads and network access while denying local writes.",
     write = "Allow workspace writes within the current repository.",
     full = "Allow machine-wide writes with approval prompts.",
     yolo = "Allow machine-wide writes without approval prompts.",
+    plan = "Use Harness planning directives and semantic plan actions under the retained authorization.",
   }
   local option_list = vim.tbl_map(function(mode)
     local label = mode == "yolo" and "YOLO" or (mode:sub(1, 1):upper() .. mode:sub(2))
     if mode == current_mode then label = label .. " (current)" end
     return { label = label, detail = detail_list[mode], value = mode }
-  end, { "read", "write", "full", "yolo" })
-  open_choice_picker(state, "Select execution mode", "Changing mode during a main turn restarts it automatically.", option_list,
+  end, { "read", "write", "full", "yolo", "plan" })
+  open_choice_picker(state, "Select Harness mode", "Plan changes interaction directives without widening authorization.", option_list,
     M.set_mode)
 end
 

@@ -2,7 +2,7 @@ use diff_review_harness::backend::BackendLaunch;
 use diff_review_harness::broker::{HarnessBroker, InitializeRequest};
 use diff_review_harness::permissions::store::PermissionStore;
 use diff_review_harness::protocol::BrokerRequest;
-use diff_review_harness::session::ExecutionMode;
+use diff_review_harness::session::{ExecutionMode, HarnessMode};
 use serde_json::json;
 use std::process::Command;
 
@@ -129,11 +129,18 @@ async fn cycles_explicit_modes_without_changing_mode_during_plan_control() {
             params: json!({ "text": "/write" }),
         })
         .await;
-    let planned = broker
+    broker
         .dispatch(BrokerRequest {
             id: 12,
+            method: "session.mode".into(),
+            params: json!({ "mode": "plan" }),
+        })
+        .await;
+    let planned = broker
+        .dispatch(BrokerRequest {
+            id: 13,
             method: "prompt.submit".into(),
-            params: json!({ "text": "/plan preserve the selected mode" }),
+            params: json!({ "text": "preserve the selected mode" }),
         })
         .await;
     assert!(planned.response.error.is_none());
@@ -141,9 +148,10 @@ async fn cycles_explicit_modes_without_changing_mode_during_plan_control() {
         broker.snapshot().unwrap().session.execution_mode,
         ExecutionMode::Write
     );
+    assert_eq!(broker.snapshot().unwrap().session.mode, HarnessMode::Plan);
     let accepted = broker
         .dispatch(BrokerRequest {
-            id: 13,
+            id: 14,
             method: "plan.accept".into(),
             params: json!({}),
         })
@@ -153,4 +161,5 @@ async fn cycles_explicit_modes_without_changing_mode_during_plan_control() {
         broker.snapshot().unwrap().session.execution_mode,
         ExecutionMode::Write
     );
+    assert_eq!(broker.snapshot().unwrap().session.mode, HarnessMode::Write);
 }

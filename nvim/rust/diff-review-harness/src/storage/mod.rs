@@ -13,7 +13,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const SESSION_FORMAT_VERSION: u32 = 8;
+const SESSION_FORMAT_VERSION: u32 = 9;
 
 /// Stores one session with the exact durable format that produced it.
 #[derive(Deserialize, Serialize)]
@@ -89,6 +89,24 @@ impl SqliteStore {
                 FOREIGN KEY(session_id) REFERENCES session_record(id) ON DELETE CASCADE
             );
             CREATE TABLE IF NOT EXISTS plan_execution_record (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES session_record(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS plan_deviation_record (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES session_record(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS plan_audit_record (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES session_record(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS plan_resolution_record (
                 id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL,
                 payload TEXT NOT NULL,
@@ -365,6 +383,13 @@ impl SqliteStore {
         )
     }
 
+    /// Remove one retracted canonical plan record.
+    pub fn delete_plan(&mut self, plan_id: &str) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM plan_record WHERE id=?1", [plan_id])?;
+        Ok(())
+    }
+
     /// Write one immutable plan lifecycle event.
     pub fn save_plan_lifecycle(&mut self, lifecycle: &PlanLifecycleRecord) -> Result<()> {
         self.save_scoped_payload(
@@ -427,6 +452,69 @@ impl SqliteStore {
     pub fn list_plan_execution(&self, session_id: &str) -> Result<Vec<PlanExecutionRecord>> {
         self.list_payload(
             "SELECT payload FROM plan_execution_record WHERE session_id=?1 ORDER BY rowid",
+            [session_id],
+        )
+    }
+
+    /// Write one execution-time plan deviation.
+    pub fn save_plan_deviation(
+        &mut self,
+        session_id: &str,
+        deviation: &crate::plan::PlanDeviation,
+    ) -> Result<()> {
+        self.save_scoped_payload(
+            "plan_deviation_record",
+            &deviation.id,
+            session_id,
+            deviation,
+        )
+    }
+
+    /// Load every plan deviation for one session in chronological order.
+    pub fn list_plan_deviation(&self, session_id: &str) -> Result<Vec<crate::plan::PlanDeviation>> {
+        self.list_payload(
+            "SELECT payload FROM plan_deviation_record WHERE session_id=?1 ORDER BY rowid",
+            [session_id],
+        )
+    }
+
+    /// Write one final accepted-plan audit.
+    pub fn save_plan_audit(
+        &mut self,
+        session_id: &str,
+        audit: &crate::plan::PlanAudit,
+    ) -> Result<()> {
+        self.save_scoped_payload("plan_audit_record", &audit.id, session_id, audit)
+    }
+
+    /// Load every plan audit for one session in chronological order.
+    pub fn list_plan_audit(&self, session_id: &str) -> Result<Vec<crate::plan::PlanAudit>> {
+        self.list_payload(
+            "SELECT payload FROM plan_audit_record WHERE session_id=?1 ORDER BY rowid",
+            [session_id],
+        )
+    }
+
+    /// Write one chronological terminal plan resolution.
+    pub fn save_plan_resolution(
+        &mut self,
+        resolution: &crate::plan::PlanResolutionRecord,
+    ) -> Result<()> {
+        self.save_scoped_payload(
+            "plan_resolution_record",
+            &resolution.id,
+            &resolution.session_id,
+            resolution,
+        )
+    }
+
+    /// Load every terminal plan resolution for one session in chronological order.
+    pub fn list_plan_resolution(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<crate::plan::PlanResolutionRecord>> {
+        self.list_payload(
+            "SELECT payload FROM plan_resolution_record WHERE session_id=?1 ORDER BY rowid",
             [session_id],
         )
     }
@@ -712,6 +800,7 @@ mod test {
             context_window: None,
             fast_mode: false,
             execution_mode: crate::session::ExecutionMode::Read,
+            mode: crate::session::HarnessMode::Read,
             created_at_ms: 1,
             updated_at_ms: 1,
             active_plan_id: None,

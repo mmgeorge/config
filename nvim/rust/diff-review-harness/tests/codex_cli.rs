@@ -237,21 +237,14 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
     let (planned, steered) = tokio::join!(planning, steering);
     let planned = planned.unwrap();
     steered.unwrap();
+    let plan_document = planned
+        .plan_document
+        .as_ref()
+        .expect("Codex planning did not submit a structured plan document");
+    assert!(!plan_document.overview.trim().is_empty());
     assert!(
-        planned
-            .plan_markdown
-            .as_deref()
-            .is_some_and(|plan| !plan.trim().is_empty()),
-        "Codex planning events did not contain a complete plan: {:#?}",
-        planned.event
-    );
-    assert!(
-        planned
-            .plan_markdown
-            .as_deref()
-            .is_some_and(|plan| plan.contains("STEERING_CONSTRAINT_7B3D")),
-        "Codex planning ignored the active-turn steering constraint: {:#?}",
-        planned.plan_markdown
+        plan_document.overview.contains("STEERING_CONSTRAINT_7B3D"),
+        "Codex planning ignored the active-turn steering constraint: {plan_document:#?}"
     );
     assert!(!repository.path().join("harness-integration.txt").exists());
 

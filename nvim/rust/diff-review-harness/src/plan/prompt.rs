@@ -2,14 +2,14 @@
 pub struct PlanPrompt;
 
 impl PlanPrompt {
-    /// Build a decision-complete read-only planning request for one user objective.
+    /// Build a decision-complete planning request for one user objective.
     pub fn draft(request: &str) -> String {
         format!(
-            r#"You are planning a software change in READ mode. Do not modify files.
+            r#"You are planning a software change in Harness Plan mode. The retained execution authorization still governs every command and file operation. Planning does not imply read-only access.
 
-Explore the repository before asking questions. Resolve discoverable facts from the code. Ask only when a product decision materially changes the implementation. When feedback is required, call harness_plan_question with one to three concise questions, two or three mutually exclusive choices per structured question, and a recommended choice first. End that turn after requesting feedback. Produce a decision-complete reviewer-readable plan with Overview, Usage, Code flow, Tasks, Modularity and validation, and Test plan sections. Keep the overview, code flow, and task tree aligned. Do not parse the plan into an execution checklist. Provider task updates are advisory progress only.
+Explore the repository before asking questions. Resolve discoverable facts from the code. You may write supporting planning material when the retained authorization permits it. Ask only when a product decision materially changes the implementation. When feedback is required, call harness_plan_question with one to three concise questions, two or three mutually exclusive choices per structured question, and a recommended choice first. End that turn after requesting feedback.
 
-When the plan is complete, call harness_plan_submit with the entire Markdown artifact. Do not treat ordinary prose or a provider checklist as plan submission.
+Build the canonical PlanDocument with harness_plan_create and semantic harness_plan_edit operations. Keep its object definitions, independent flows, architectural tasks, file boundaries, subtasks, concrete code edits, tests, and assumptions aligned. Replace a definition's complete members or enum variants when those nested details change. Do not use provider task updates as the plan. When the document passes submission validation, call harness_plan_submit with the exact plan_id and expected_version. Ordinary prose and provider checklists do not submit a plan.
 
 User request:
 {request}"#
@@ -19,7 +19,7 @@ User request:
     /// Continue one paused planning conversation with the user's selected feedback.
     pub fn feedback(request: &str, answer: &str) -> String {
         format!(
-            r#"Continue the existing READ-mode planning conversation for the original request below. Incorporate the user's planning feedback. If another material product decision remains, call harness_plan_question and end the turn. Otherwise call harness_plan_submit with the complete Markdown plan.
+            r#"Continue the existing Harness Plan mode conversation. Incorporate the user's feedback through semantic harness_plan_edit operations. If another material product decision remains, call harness_plan_question and end the turn. Otherwise call harness_plan_submit with the exact canonical plan ID and version.
 
 Original request:
 {request}
@@ -39,10 +39,9 @@ Planning feedback:
         mutable_elicitation_prompt(None, elicitation_json, question)
     }
 
-    /// Build a complete replacement request from reviewed plan state.
+    /// Build a semantic revision request from reviewed plan state.
     pub fn revision(
-        edited: &str,
-        edit_diff: &str,
+        rendered: &str,
         annotation_json: &str,
         overall_comment: Option<&str>,
     ) -> String {
@@ -50,27 +49,22 @@ Planning feedback:
             .filter(|value| !value.trim().is_empty())
             .unwrap_or("None");
         format!(
-            r#"Revise the saved implementation plan in READ mode. Do not modify repository files. Preserve intentional user edits, resolve every annotation and overall comment, then call harness_plan_submit with the complete replacement Markdown artifact.
+            r#"Revise the saved canonical plan in Harness Plan mode. Resolve every annotation and overall comment with semantic harness_plan_edit operations, then call harness_plan_submit with the exact resulting plan ID and version.
 
 Overall review comment:
 {comment}
 
-Current edited plan:
-{edited}
-
-User edit diff against the last model revision:
-{edit_diff}
+Current rendered plan:
+{rendered}
 
 Anchored annotations:
 {annotation_json}"#
         )
     }
 
-    /// Append the saved active-plan location without copying editor state into chat.
-    pub fn with_active_artifact(prompt: String, plan_id: &str, path: &str) -> String {
-        format!(
-            "Active plan artifact: id={plan_id}, path={path}. Read this saved file when the question depends on the plan. Unsaved editor changes are not part of the request.\n\n{prompt}"
-        )
+    /// Prepend the complete canonical plan so every provider can discover and edit it.
+    pub fn with_active_document(prompt: String, document_json: &str) -> String {
+        format!("Active canonical PlanDocument:\n```json\n{document_json}\n```\n\n{prompt}")
     }
 }
 
@@ -90,7 +84,7 @@ fn mutable_elicitation_prompt(
     format!(
         r#"The user is responding while a Harness question set remains pending. Treat the pending elicitation as mutable decision state, not as a modal lock.
 
-Stay in READ mode. Answer the user's follow-up directly, using repository evidence when relevant. {workflow_boundary}
+Remain in Harness Plan mode. The retained execution authorization governs repository access. Answer the user's follow-up directly, using repository evidence when relevant. {workflow_boundary}
 
 After answering, choose exactly one outcome:
 
@@ -123,7 +117,7 @@ mod test {
     #[test]
     fn planning_contract_requires_structured_submission_without_native_mode() {
         let prompt = PlanPrompt::draft("Refactor the renderer");
-        assert!(prompt.contains("READ mode"));
+        assert!(prompt.contains("Plan mode"));
         assert!(prompt.contains("harness_plan_submit"));
         assert!(prompt.contains("harness_plan_question"));
         assert!(prompt.contains("Refactor the renderer"));
@@ -140,9 +134,9 @@ mod test {
     }
 
     #[test]
-    fn active_artifact_context_exposes_only_the_saved_path() {
-        let prompt = PlanPrompt::with_active_artifact("Why?".into(), "plan", "D:/plan/working.md");
-        assert!(prompt.contains("D:/plan/working.md"));
+    fn active_artifact_context_exposes_the_canonical_document() {
+        let prompt = PlanPrompt::with_active_document("Why?".into(), "{\"plan_id\":\"plan\"}");
+        assert!(prompt.contains("\"plan_id\":\"plan\""));
         assert!(prompt.ends_with("Why?"));
     }
 

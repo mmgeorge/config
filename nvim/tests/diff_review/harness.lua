@@ -132,6 +132,7 @@ local active_session = {
   resolved_model = "mock-model-resolved",
   effort = "low",
   execution_mode = "read",
+  mode = "read",
   native_fork = false,
 }
 local session_snapshot_by_id = {}
@@ -595,7 +596,12 @@ local function fake_launcher(command, options, _)
       } } })
     elseif request.method == "session.execution_mode" then
       active_session.execution_mode = request.params.mode
+      active_session.mode = request.params.mode
       emit(options, { event = "execution_mode_changed", payload = active_session })
+      emit(options, { id = request.id, result = active_session })
+    elseif request.method == "session.mode" then
+      active_session.mode = request.params.mode
+      emit(options, { event = "mode_changed", payload = active_session })
       emit(options, { id = request.id, result = active_session })
     elseif request.method == "turn.restart" then
       emit(options, { id = request.id, result = {
@@ -1790,10 +1796,10 @@ local ok, failure = pcall(function()
   vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/mode" })
   controller.submit()
   local mode_picker = require("diff_review.views.picker")._state_for_test()
-  assert_equals(mode_picker.spec.page_list[1].title, "Select execution mode",
+  assert_equals(mode_picker.spec.page_list[1].title, "Select Harness mode",
     "mode selection should use the shared picker")
-  assert_equals(#mode_picker.spec.page_list[1].option_list, 4,
-    "mode selection should expose Read, Write, Full, and YOLO")
+  assert_equals(#mode_picker.spec.page_list[1].option_list, 5,
+    "mode selection should expose Read, Write, Full, YOLO, and Plan")
   assert_equals(mode_picker.spec.page_list[1].option_list[2].label, "Write",
     "mode selection should label the workspace-write mode")
   require("diff_review.views.picker").close(false)
@@ -1918,7 +1924,7 @@ local ok, failure = pcall(function()
   vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/mode w" })
   vim.api.nvim_win_set_cursor(session.harness.composer_win, { 1, 7 })
   command_source:get_completions({}, function(result) command_completion = result end)
-  assert_equals(#command_completion.items, 4, "/mode completion should expose every execution mode")
+  assert_equals(#command_completion.items, 5, "/mode completion should expose every Harness mode")
   assert_true(vim.iter(command_completion.items):any(function(item) return item.label == "write" end),
     "/mode completion should expose Write mode")
   assert_equals(command_completion.items[1].textEdit.range.start.character, 6,
@@ -1930,6 +1936,12 @@ local ok, failure = pcall(function()
   controller.set_mode("read")
   assert_true(vim.wait(1000, function() return active_session.execution_mode == "read" end, 10),
     "direct mode command coverage should restore the shared fixture mode")
+  vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/mode plan" })
+  controller.submit()
+  assert_true(vim.wait(1000, function() return active_session.mode == "plan" end, 10),
+    "/mode plan should enter Plan mode without changing authorization")
+  assert_equals(active_session.execution_mode, "read", "Plan mode should retain the selected execution authorization")
+  controller.set_mode("read")
 
   vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/model mock" })
   vim.api.nvim_win_set_cursor(session.harness.composer_win, { 1, 11 })
@@ -3112,11 +3124,18 @@ local ok, failure = pcall(function()
   assert_true(vim.wait(2000, function() return vim.api.nvim_buf_get_name(0) == plan_path end, 10),
     "artifact selection did not open the physical plan")
   assert_equals(vim.bo.filetype, "markdown", "PlanReview should use markdown")
+  assert_equals(vim.bo.modifiable, false, "PlanReview should render a read-only projection")
   assert_true(vim.fn.maparg("oY", "n", false, true).callback ~= nil, "PlanReview accept mapping missing")
   assert_true(vim.fn.maparg("oN", "n", false, true).callback ~= nil, "PlanReview request-changes mapping missing")
+  local original_select = vim.ui.select
+  vim.ui.select = function(items, _, callback) callback(items[1]) end
   vim.fn.maparg("oY", "n", false, true).callback()
+  vim.ui.select = original_select
   assert_true(vim.wait(2000, function() return request_by_method["plan.accept"] ~= nil end, 10), "PlanReview did not submit acceptance")
-  assert_equals(#request_by_method["plan.accept"].params.digest, 64, "PlanReview should submit the exact saved digest")
+  assert_equals(request_by_method["plan.accept"].params.digest, "digest",
+    "PlanReview should submit the immutable canonical digest")
+  assert_equals(request_by_method["plan.accept"].params.fresh_context, false,
+    "the default approval choice should continue provider context")
 
   vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/plan revise the feature" })
   controller.submit()

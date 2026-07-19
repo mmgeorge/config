@@ -60,26 +60,39 @@ local function serialized_annotation(plan, buf)
   return result
 end
 
+---@param plan table
+local function open_source(plan)
+  local index_path = vim.fs.joinpath(vim.fs.dirname(plan.working_path), "working.index.json")
+  local ok, source = pcall(vim.fn.readfile, index_path)
+  if not ok then
+    notifications.error("Failed to read plan navigation index", "PlanReview")
+    return
+  end
+  local decoded_ok, index = pcall(vim.json.decode, table.concat(source, "\n"))
+  if not decoded_ok then
+    notifications.error("Failed to decode plan navigation index", "PlanReview")
+    return
+  end
+  local line = vim.api.nvim_win_get_cursor(0)[1]
+  local candidate = nil
+  for _, target in ipairs(index.target or {}) do
+    if target.path and line >= target.first_line and line <= target.last_line then
+      if not candidate or (target.last_line - target.first_line) < (candidate.last_line - candidate.first_line) then
+        candidate = target
+      end
+    end
+  end
+  if not candidate then
+    notifications.info("This plan line has no source boundary", "PlanReview")
+    return
+  end
+  vim.cmd("edit " .. vim.fn.fnameescape(vim.fs.joinpath(vim.fn.getcwd(), candidate.path)))
+end
+
 ---@param buf integer
 ---@param locked boolean
 local function set_locked(buf, locked)
   if vim.api.nvim_buf_is_valid(buf) then vim.bo[buf].modifiable = not locked end
-end
-
----@param path string
----@return string?, string?
-local function saved_digest(path)
-  local ok, line_list = pcall(vim.fn.readfile, path, "b")
-  if not ok then return nil, "Failed to read the saved plan: " .. tostring(line_list) end
-  return vim.fn.sha256(table.concat(line_list, "\n")), nil
-end
-
----@param buf integer
----@return boolean
-local function write_plan(buf)
-  local ok, write_error = pcall(vim.api.nvim_buf_call, buf, function() vim.cmd("silent write") end)
-  if not ok then notifications.error("Failed to save the plan: " .. tostring(write_error), "PlanReview") end
-  return ok
 end
 
 ---@param tab integer
@@ -95,23 +108,21 @@ end
 
 ---@param plan table
 ---@param buf integer
-local function accept(plan, buf, tab)
-  if not write_plan(buf) then return end
-  local digest, digest_error = saved_digest(plan.working_path)
-  if not digest then
-    notifications.error(digest_error or "Failed to hash the saved plan", "PlanReview")
-    return
-  end
+local function accept_with_context(plan, buf, tab, fresh_context)
   set_locked(buf, true)
   local previous_goal = session.harness.goal
   session.harness.busy = true
   session.harness.goal = { objective = "Complete the plan", state = "active" }
   require("diff_review.views.harness.controller").refresh_winbar()
-  client.request("plan.accept", { plan_id = plan.id, digest = digest }, function(result, request_error)
+  client.request("plan.accept", {
+    plan_id = plan.id,
+    digest = plan.review_digest,
+    fresh_context = fresh_context,
+  }, function(result, request_error)
     session.harness.busy = false
     if request_error then
       session.harness.goal = previous_goal
-      set_locked(buf, false)
+      set_locked(buf, true)
       notifications.error(request_error, "PlanReview")
       require("diff_review.views.harness.controller").refresh_winbar()
       return
@@ -128,8 +139,21 @@ end
 
 ---@param plan table
 ---@param buf integer
+local function accept(plan, buf, tab)
+  vim.ui.select({
+    { label = "Continue context", fresh_context = false },
+    { label = "Fresh context", fresh_context = true },
+  }, {
+    prompt = "Approve plan",
+    format_item = function(item) return item.label end,
+  }, function(choice)
+    if choice then accept_with_context(plan, buf, tab, choice.fresh_context) end
+  end)
+end
+
+---@param plan table
+---@param buf integer
 local function request_changes(plan, buf)
-  if not write_plan(buf) then return end
   local annotation = serialized_annotation(plan, buf)
   popup_window.input({ prompt = "Overall plan review comment (optional): " }, function(comment)
     if comment == nil then return end
@@ -143,7 +167,6 @@ local function request_changes(plan, buf)
     }, function(_, request_error)
       session.harness.busy = false
       if request_error then
-        set_locked(buf, false)
         notifications.error(request_error, "PlanReview")
         require("diff_review.views.harness.controller").refresh_winbar()
         return
@@ -151,7 +174,6 @@ local function request_changes(plan, buf)
       if vim.api.nvim_buf_is_valid(buf) then
         vim.api.nvim_buf_call(buf, function() vim.cmd("silent edit!") end)
         vim.api.nvim_buf_clear_namespace(buf, namespace, 0, -1)
-        set_locked(buf, false)
       end
       local revision_key = plan.id .. ":" .. tostring(plan.model_revision or 0)
       session.harness.plan_annotations[revision_key] = nil
@@ -166,6 +188,7 @@ end
 ---@return DiffReviewViewCommandSet
 local function commands(plan, buf, tab)
   local set = command_set.new()
+  command_set.register(set, "open", function() open_source(plan) end)
   command_set.register(set, "comment", function() add_comment(plan, buf) end)
   command_set.register(set, "accept", function() accept(plan, buf, tab) end)
   command_set.register(set, "request_changes", function() request_changes(plan, buf) end)
@@ -192,13 +215,13 @@ function M.open(plan)
   local tab = vim.api.nvim_get_current_tabpage()
   vim.bo[buf].filetype = "markdown"
   vim.bo[buf].bufhidden = "hide"
-  vim.bo[buf].swapfile = true
-  vim.bo[buf].modifiable = true
+  vim.bo[buf].swapfile = false
+  vim.bo[buf].modifiable = false
   vim.api.nvim_buf_clear_namespace(buf, namespace, 0, -1)
   session.harness.plan_review = { plan = plan, buf = buf, win = win, tab = tab }
   local set = commands(plan, buf, tab)
   keymaps.setup_view_keymaps(buf, "plan_review", set)
-  keymaps.apply_view_winbar(win, "PlanReview", "plan_review", set, "Awaiting review • edits and C comments are preserved")
+  keymaps.apply_view_winbar(win, "PlanReview", "plan_review", set, "Awaiting review • read-only projection • C adds comments")
   for _, annotation in ipairs(annotation_list(plan)) do render_annotation(buf, annotation) end
 end
 

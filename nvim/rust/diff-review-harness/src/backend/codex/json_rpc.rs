@@ -8,7 +8,7 @@ use crate::backend::{
     ProviderFileChange, ProviderTaskEntry, ProviderTaskUpdate, TaskStatus, ToolActivity,
     ToolActivityKind,
 };
-use crate::plan::PlanQuestionSet;
+use crate::control_tools::{ControlToolInvocation, apply_invocation};
 use crate::session::{ContextUsage, ExecutionMode};
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -344,39 +344,19 @@ fn normalize_event_in_workspace(
     };
 
     if tool_event
-        && control_tool == Some("harness_plan_submit")
-        && let Some(plan) = find_plan(&params)
+        && let Some(control_tool) = control_tool
+        && let Some(arguments) = find_control_arguments(&params, control_tool)
+        && let Err(error) = apply_invocation(
+            &ControlToolInvocation {
+                name: control_tool.to_owned(),
+                arguments,
+            },
+            output,
+        )
     {
-        output.plan_markdown = Some(plan);
-        output.structured_plan = true;
-    }
-    if tool_event && control_tool == Some("harness_plan_question") {
-        output.plan_question = find_plan_question(&params);
-        if output.plan_question.is_none() {
-            output.control_error = Some("harness_plan_question received invalid arguments".into());
-        }
-    }
-    if tool_event && control_tool == Some("harness_question_answer") {
-        output.question_answer = find_control_arguments(&params, "harness_question_answer")
-            .and_then(|arguments| serde_json::from_value(arguments).ok());
-        if output.question_answer.is_none() {
-            output.control_error =
-                Some("harness_question_answer received invalid arguments".into());
-        }
-    }
-    if tool_event && control_tool == Some("harness_question_withdraw") {
-        output.question_withdrawal = find_control_arguments(&params, "harness_question_withdraw")
-            .and_then(|arguments| serde_json::from_value(arguments).ok());
-        if output.question_withdrawal.is_none() {
-            output.control_error =
-                Some("harness_question_withdraw received invalid arguments".into());
-        }
-    }
-    if tool_event && control_tool == Some("harness_goal_complete") {
-        output.evidence.structured_complete = true;
-    }
-    if tool_event && control_tool == Some("harness_goal_blocked") {
-        output.evidence.structured_blocked = true;
+        output.control_error = Some(format!(
+            "{control_tool} received invalid arguments: {error:#}"
+        ));
     }
     if method_lower.contains("goal")
         && params
@@ -691,7 +671,12 @@ fn control_tool_name<'value>(method: &str, value: &'value Value) -> Option<&'val
         .filter(|name| {
             matches!(
                 *name,
-                "harness_plan_submit"
+                "harness_plan_create"
+                    | "harness_plan_edit"
+                    | "harness_plan_read"
+                    | "harness_plan_submit"
+                    | "harness_plan_deviation"
+                    | "harness_plan_task_report"
                     | "harness_plan_question"
                     | "harness_question_answer"
                     | "harness_question_withdraw"
@@ -700,32 +685,6 @@ fn control_tool_name<'value>(method: &str, value: &'value Value) -> Option<&'val
                     | "harness_goal_status"
             )
         })
-}
-
-fn find_plan_question(value: &Value) -> Option<PlanQuestionSet> {
-    if value
-        .get("tool")
-        .or_else(|| value.get("name"))
-        .or_else(|| value.get("toolName"))
-        .or_else(|| value.get("tool_name"))
-        .and_then(Value::as_str)
-        == Some("harness_plan_question")
-        && let Some(arguments) = value.get("arguments")
-    {
-        if let Ok(question) = serde_json::from_value(arguments.clone()) {
-            return Some(question);
-        }
-        if let Some(arguments) = arguments.as_str()
-            && let Ok(arguments) = serde_json::from_str(arguments)
-        {
-            return Some(arguments);
-        }
-    }
-    match value {
-        Value::Array(item) => item.iter().find_map(find_plan_question),
-        Value::Object(map) => map.values().find_map(find_plan_question),
-        _ => None,
-    }
 }
 
 fn find_control_arguments(value: &Value, control_name: &str) -> Option<Value> {
@@ -1268,70 +1227,9 @@ fn first_text(value: &Value) -> Option<String> {
     }
 }
 
-fn find_plan(value: &Value) -> Option<String> {
-    if value.get("tool").and_then(Value::as_str) == Some("harness_plan_submit")
-        && let Some(markdown) = value.pointer("/arguments/markdown").and_then(Value::as_str)
-    {
-        return Some(markdown.to_owned());
-    }
-    if let Some(markdown) = value.get("markdown").and_then(Value::as_str) {
-        let encoded = value.to_string().to_ascii_lowercase();
-        if encoded.contains("harness_plan_submit") || encoded.contains("plan") {
-            return Some(markdown.to_owned());
-        }
-    }
-    if let Some(plan) = value.get("plan").and_then(Value::as_str) {
-        return Some(plan.to_owned());
-    }
-    if let Some(step_list) = value
-        .get("plan")
-        .or_else(|| value.get("entries"))
-        .and_then(Value::as_array)
-    {
-        return plan_entry_markdown(step_list);
-    }
-    match value {
-        Value::Array(item) => item.iter().find_map(find_plan),
-        Value::Object(map) => map.values().find_map(find_plan),
-        _ => None,
-    }
-}
-
-fn plan_entry_markdown(entry_list: &[Value]) -> Option<String> {
-    let mut markdown = String::from("# Plan\n\n");
-    let mut count = 0;
-    for entry in entry_list {
-        let Some(text) = entry
-            .get("step")
-            .or_else(|| entry.get("content"))
-            .and_then(Value::as_str)
-        else {
-            continue;
-        };
-        count += 1;
-        let status = entry.get("status").and_then(Value::as_str);
-        let marker = match status {
-            Some("completed" | "complete") => "[x] ",
-            Some("in_progress" | "inProgress") => "[-] ",
-            _ => "[ ] ",
-        };
-        markdown.push_str(&format!("{count}. {marker}{text}\n"));
-    }
-    (count > 0).then_some(markdown)
-}
-
 #[cfg(test)]
 mod test {
     use super::*;
-
-    #[test]
-    fn extracts_complete_plan_from_dynamic_tool_arguments() {
-        let value = json!({
-            "tool": "harness_plan_submit",
-            "arguments": { "markdown": "# Plan\n\nComplete" }
-        });
-        assert_eq!(find_plan(&value).as_deref(), Some("# Plan\n\nComplete"));
-    }
 
     #[test]
     fn extracts_structured_questions_from_dynamic_tool_arguments() {
@@ -1429,7 +1327,7 @@ mod test {
             &mut output,
             None,
         );
-        assert!(output.plan_markdown.is_none());
+        assert!(output.plan_document.is_none());
         assert_eq!(output.event.len(), 1);
         let update = output.event[0].task_update.as_ref().unwrap();
         assert!(update.complete);

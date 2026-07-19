@@ -122,6 +122,10 @@ Shell commands and test running are part of the development loop, so they need t
 # Planning Walkthrough Model
 Use this section when asked to create, draft, write, review, or update an implementation plan, execution plan, refactor plan, test plan, or reviewer-readable code-flow walkthrough before making changes.
 
+When DiffReview Harness exposes structured planning tools, treat its `PlanDocument` JSON as the canonical artifact and the rendered Markdown as a read-only reviewer projection. Create the document with `harness_plan_create`, apply focused semantic operations with `harness_plan_edit`, request current state with `harness_plan_read`, and submit the exact validated ID and version with `harness_plan_submit`. Update complete definition member or enum variant arrays instead of issuing member-level operations.
+
+During accepted-plan execution, work one complete task at a time. Use subtasks and code edits as progress and audit evidence rather than separate goals, report each task through `harness_plan_task_report`, and record divergences through `harness_plan_deviation`. Informational deviations preserve scope. Scope deviations follow the Harness review policy. Planning and plan approval never widen command permissions.
+
 Plans follow the walkthrough artifact model. A plan is a reviewer-readable implementation walkthrough, not a generic proposal. Frame the plan around the domain object model and its ownership relationships, then use 1-3 separate code-flow diagrams to explain the major runtime or data flows that cross those boundaries. Do not force unrelated behavior into one linear flow. Connect every flow back to the objects and owners in the model. Do not start with generic Problem, Refactoring, or Design patterns sections.
 
 When creating a plan, use this template. Output each section in order:

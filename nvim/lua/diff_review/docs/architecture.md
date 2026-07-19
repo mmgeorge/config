@@ -937,18 +937,22 @@ press the commit key
 ```
 :Harness → multiline composer → /plan <request>
   └─ harness/client JSONL request → Rust broker
-       ├─ force READ and capture interaction checkpoint-before
-       ├─ selected Backend implementation runs one planning turn
+       ├─ enter visible Plan mode while retaining Read/Write/Full/YOLO authorization
+       ├─ create canonical PlanDocument JSON and capture interaction checkpoint-before
+       ├─ selected Backend implementation runs Harness planning directives without native Plan mode
        ├─ harness_plan_question → durable PlanElicitation → bottom-anchored shared picker
        │    ├─ answers, notes, Other, and clarification turns preserve AwaitingInput
        │    └─ reviewed y confirmation serializes the decisions and resumes the planning contract
-       ├─ harness_plan_submit becomes the only review-artifact boundary
-       └─ PlanFileStore writes plans/<session>/<plan>/working.md + immutable revision
-            └─ PlanReview opens the physical file with :edit
-                 ├─ user edits normal Markdown and C anchors comments with extmarks
-                 ├─ oN saves the complete user revision + annotations → revised model plan
-                 └─ oY hashes the exact saved plan → WRITE → Goal: Complete the plan
-                      └─ execution interaction → checkpoint-after → exact per-interaction diff
+       ├─ harness_plan_create/edit/read mutate validated semantic nodes with optimistic versions
+       ├─ harness_plan_submit freezes JSON + Markdown + navigation index as one immutable revision
+       └─ PlanReview opens the read-only Markdown projection
+            ├─ Enter jumps through the navigation index and C anchors review comments
+            ├─ oN sends annotations → semantic model edits → a new submitted revision
+            └─ oY chooses continued or fresh provider context and injects complete accepted JSON
+                 └─ PlanScheduler activates one whole task at a time
+                      ├─ harness_plan_task_report stores subtask, code-edit, path, and test evidence
+                      ├─ harness_plan_deviation records informational or reviewed scope overlays
+                      └─ terminal goal → Plan Completed/Blocked/Cancelled → deviations + audit
 ```
 
 **Persist goals without hiding user prompts**
@@ -1174,7 +1178,7 @@ request the fully materialized tree and retain their existing view controller.
 
 SQLite uses WAL mode under
 `stdpath("data")/diff-review/harness/harness.sqlite3`. File content lives in a SHA-256
-object store, while plans remain inspectable physical Markdown under `plans/`. A session
+object store, while plans retain canonical JSON and generated Markdown projections under `plans/`. A session
 lease grants one live Neovim write control and leaves other instances free to browse.
 Immediate SQLite transactions arbitrate acquisition, a ten-second heartbeat protects long
 turns, and owner-checked saves prevent a stale broker from overwriting a replacement owner.
@@ -1210,11 +1214,12 @@ same-repository session owned by that backend. Neovim stores the last successful
 `setup({ harness = { backend = ... } })` remains authoritative, and failed switches restore the
 previous backend rather than persisting a broken default.
 
-Plan lifecycle and execution records accompany current sessions. Plans remain physical Markdown
-under `plans/<session>/<plan>/working.md`, with immutable model
-and user revisions beside them. The snapshot exposes every plan as an artifact plus the active
-saved path. The model receives that path as context for later plan questions, while unsaved
-PlanReview edits remain editor-local until review submission.
+Plan lifecycle and execution records accompany current sessions. Each plan stores mutable canonical
+state in `plans/<session>/<plan>/working.json`, then derives `working.md` and `working.index.json`
+for review and source navigation. Submission freezes all three projections as one immutable revision.
+The snapshot exposes the plan artifact and its generated review path, while every planning or
+execution turn receives the complete effective JSON document rather than relying on a path lookup.
+PlanReview remains read-only and routes reviewer feedback back through semantic plan operations.
 
 Repository-independent prompt history stays ordered newest first and pruned transactionally to
 100 entries. Every broker snapshot carries that shared list, while
@@ -1228,12 +1233,13 @@ stays empty. An explicit command remains available for development and pinned in
 The backend subscribes before every send, forwards deltas immediately, and lets
 `CopilotEventDecoder` normalize messages, reasoning, tool lifecycle, usage, tasks, and subagent
 events into the same broker model as Codex. `/plan` does not select a provider-native plan mode.
-Harness sends the same read-only planning contract through both backends, and
+Harness sends the same structured planning contract through both backends without changing the
+session's retained Read, Write, Full, or YOLO authorization. The
 `harness_plan_question` pauses either backend on one to three structured decisions while
 `harness_plan_submit` alone creates a review artifact. `ControlToolRegistry` owns every Harness
 tool schema once, then Codex projects it into app-server dynamic tools while Copilot projects it
-into SDK `Tool` handlers. An agent that ends with an ordinary text question degrades into one
-free-form decision instead of failing.
+into SDK `Tool` handlers. Ordinary prose remains an ordinary planning response until the agent
+invokes a structured control tool.
 The question tool also works during ordinary chat, goal, and execution turns. Those questions
 persist on their owning `InteractionRecord`, while planning questions remain on `PlanRecord`.
 `BrokerSnapshot.active_elicitation` projects either owner through one question UI contract, so

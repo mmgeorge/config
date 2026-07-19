@@ -170,7 +170,18 @@ local function send_initialize(callback, initialize_options)
     local initialized_session_id = result and result.session and result.session.id
     if initialized_session_id then client.snapshot_by_id[initialized_session_id] = result end
     session.harness.ready = true
-    finish_start(callback, result, nil)
+    local plan_config = harness_config.plan or {}
+    M.request("plan.scope_deviation_review", {
+      policy = plan_config.scope_deviation_review or "auto",
+    }, function(_, policy_error, policy_error_detail)
+      if policy_error then
+        client.ready = false
+        session.harness.ready = false
+        finish_start(callback, nil, policy_error, policy_error_detail)
+        return
+      end
+      finish_start(callback, result, nil)
+    end)
   end }
   local payload = protocol.encode_request(id, "initialize", {
     data_root = vim.fs.joinpath(vim.fn.stdpath("data"), "diff-review", "harness"),

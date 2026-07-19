@@ -1,7 +1,8 @@
 use crate::agent::AgentRun;
 use crate::interaction::InteractionRecord;
 use crate::plan::{
-    PlanExecutionRecord, PlanFileStore, PlanLifecycleKind, PlanLifecycleRecord, PlanRecord,
+    PlanAudit, PlanDeviation, PlanExecutionRecord, PlanFileStore, PlanLifecycleKind,
+    PlanLifecycleRecord, PlanRecord, PlanResolutionRecord, render_plan,
 };
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -53,6 +54,13 @@ pub enum TimelineEntry {
         execution: PlanExecutionRecord,
         interaction: Vec<InteractionRecord>,
     },
+    PlanResolution {
+        id: String,
+        created_at_ms: i64,
+        resolution: PlanResolutionRecord,
+        deviation: Vec<PlanDeviation>,
+        audit: Option<PlanAudit>,
+    },
     AgentLifecycle {
         id: String,
         created_at_ms: i64,
@@ -71,6 +79,7 @@ impl TimelineEntry {
             Self::Interaction { created_at_ms, .. }
             | Self::PlanLifecycle { created_at_ms, .. }
             | Self::PlanExecution { created_at_ms, .. }
+            | Self::PlanResolution { created_at_ms, .. }
             | Self::AgentLifecycle { created_at_ms, .. }
             | Self::SessionEvent { created_at_ms, .. } => *created_at_ms,
         }
@@ -87,6 +96,9 @@ impl TimelineProjector {
         plan_list: &[PlanRecord],
         lifecycle_list: Vec<PlanLifecycleRecord>,
         execution_list: Vec<PlanExecutionRecord>,
+        deviation_list: Vec<PlanDeviation>,
+        audit_list: Vec<PlanAudit>,
+        resolution_list: Vec<PlanResolutionRecord>,
         agent_run_list: Vec<AgentRun>,
         session_event_list: Vec<SessionEventRecord>,
         plan_file: &PlanFileStore,
@@ -116,22 +128,33 @@ impl TimelineProjector {
                 continue;
             };
             let content = match lifecycle.kind {
-                PlanLifecycleKind::Created | PlanLifecycleKind::RevisionCreated => {
-                    Some(plan_file.read_model_revision(
+                PlanLifecycleKind::Created | PlanLifecycleKind::RevisionCreated => Some(
+                    render_plan(&plan_file.read_submitted_document(
                         &lifecycle.session_id,
                         &lifecycle.plan_id,
                         lifecycle.model_revision,
-                    )?)
-                }
-                PlanLifecycleKind::ChangesRequested | PlanLifecycleKind::Accepted
-                    if lifecycle.user_revision > 0 =>
-                {
-                    Some(plan_file.read_user_revision(
-                        &lifecycle.session_id,
-                        &lifecycle.plan_id,
-                        lifecycle.user_revision,
-                    )?)
-                }
+                    )?)?
+                    .markdown,
+                ),
+                PlanLifecycleKind::Accepted => plan
+                    .accepted_revision
+                    .map(|revision| {
+                        plan_file.read_submitted_document(
+                            &lifecycle.session_id,
+                            &lifecycle.plan_id,
+                            revision,
+                        )
+                    })
+                    .transpose()?
+                    .map(|document| render_plan(&document).map(|rendered| rendered.markdown))
+                    .transpose()?,
+                PlanLifecycleKind::ChangesRequested => Some(
+                    render_plan(
+                        &plan_file
+                            .read_working_document(&lifecycle.session_id, &lifecycle.plan_id)?,
+                    )?
+                    .markdown,
+                ),
                 _ => None,
             };
             result.push(TimelineEntry::PlanLifecycle {
@@ -154,6 +177,22 @@ impl TimelineProjector {
                     .remove(&execution.id)
                     .unwrap_or_default(),
                 execution,
+            });
+        }
+        for resolution in resolution_list {
+            result.push(TimelineEntry::PlanResolution {
+                id: resolution.id.clone(),
+                created_at_ms: resolution.resolved_at_ms,
+                deviation: deviation_list
+                    .iter()
+                    .filter(|deviation| deviation.execution_id == resolution.execution_id)
+                    .cloned()
+                    .collect(),
+                audit: audit_list
+                    .iter()
+                    .find(|audit| audit.id == resolution.audit_id)
+                    .cloned(),
+                resolution,
             });
         }
         for run in agent_run_list {

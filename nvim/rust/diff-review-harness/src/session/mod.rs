@@ -13,6 +13,53 @@ pub enum ExecutionMode {
     Yolo,
 }
 
+/// Defines the visible Harness interaction mode independently from authorization.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessMode {
+    #[default]
+    Read,
+    Write,
+    Full,
+    Yolo,
+    Plan,
+}
+
+impl HarnessMode {
+    /// Return the stable user-facing label for this interaction mode.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Read => "Read",
+            Self::Write => "Write",
+            Self::Full => "Full",
+            Self::Yolo => "YOLO",
+            Self::Plan => "Plan",
+        }
+    }
+
+    /// Resolve the authorization selected by a non-planning interaction mode.
+    pub const fn execution_mode(self) -> Option<ExecutionMode> {
+        match self {
+            Self::Read => Some(ExecutionMode::Read),
+            Self::Write => Some(ExecutionMode::Write),
+            Self::Full => Some(ExecutionMode::Full),
+            Self::Yolo => Some(ExecutionMode::Yolo),
+            Self::Plan => None,
+        }
+    }
+}
+
+impl From<ExecutionMode> for HarnessMode {
+    fn from(value: ExecutionMode) -> Self {
+        match value {
+            ExecutionMode::Read => Self::Read,
+            ExecutionMode::Write => Self::Write,
+            ExecutionMode::Full => Self::Full,
+            ExecutionMode::Yolo => Self::Yolo,
+        }
+    }
+}
+
 impl ExecutionMode {
     /// Return the stable user-facing label for this execution boundary.
     pub const fn label(self) -> &'static str {
@@ -128,6 +175,8 @@ pub struct HarnessSession {
     pub fast_mode: bool,
     #[serde(default)]
     pub execution_mode: ExecutionMode,
+    #[serde(default)]
+    pub mode: HarnessMode,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
     pub active_plan_id: Option<String>,

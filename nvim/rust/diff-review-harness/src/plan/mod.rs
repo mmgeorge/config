@@ -2,11 +2,35 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+mod audit;
+mod deviation;
+mod document;
+mod edit;
 mod prompt;
+mod render;
+mod resolution;
+mod scheduler;
 
+pub use audit::{
+    PlanAudit, PlanAuditPathDifference, PlanAuditTask, build_plan_audit, render_plan_audit,
+};
+pub use deviation::{
+    EffectivePlan, PlanDeviation, PlanDeviationDisposition, PlanDeviationKind,
+    PlanDeviationRequest, ScopeDeviationReview, build_effective_plan,
+};
+pub use document::*;
+pub use edit::{PlanEditOperation, PlanEditRequest, PlanEditResult, TestCategory, apply_plan_edit};
 pub use prompt::PlanPrompt;
+pub use render::{PlanNavigationIndex, PlanNavigationTarget, RenderedPlan, render_plan};
+pub use resolution::{
+    PlanResolutionKind, PlanResolutionRecord, PlanTaskSummary, PlanTestSummary,
+    build_plan_resolution,
+};
+pub use scheduler::{
+    PlanScheduler, PlanTaskExecution, PlanTaskReport, PlanTaskState, PlanTestResult, PlanTestStatus,
+};
 
 /// Represents the review lifecycle of one model-authored plan.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -32,7 +56,13 @@ pub struct PlanRecord {
     pub title: String,
     pub state: PlanState,
     pub working_path: String,
+    #[serde(default)]
+    pub document_version: u64,
     pub model_revision: u32,
+    #[serde(default)]
+    pub submitted_version: Option<u64>,
+    #[serde(default)]
+    pub accepted_revision: Option<u32>,
     pub user_revision: u32,
     pub review_digest: Option<String>,
     pub accepted_digest: Option<String>,
@@ -346,6 +376,7 @@ pub enum PlanExecutionState {
     Paused,
     Stalled,
     Blocked,
+    Cancelled,
 }
 
 /// Tracks one accepted plan through its guarded execution goal.
@@ -356,6 +387,12 @@ pub struct PlanExecutionRecord {
     pub plan_id: String,
     pub goal_id: String,
     pub state: PlanExecutionState,
+    #[serde(default)]
+    pub planning_backend_session_id: Option<String>,
+    #[serde(default)]
+    pub execution_backend_session_id: Option<String>,
+    #[serde(default)]
+    pub scheduler: PlanScheduler,
     pub created_at_ms: i64,
     pub completed_at_ms: Option<i64>,
 }
@@ -402,105 +439,104 @@ impl PlanFileStore {
         Self { root: root.into() }
     }
 
-    /// Write a model revision and refresh the editable working copy.
-    pub fn write_model_revision(
+    /// Create or replace the canonical working document and its human projection.
+    pub fn write_working_document(
         &self,
         session_id: &str,
         plan_id: &str,
-        revision: u32,
-        markdown: &str,
-    ) -> Result<(PathBuf, String)> {
+        document: &PlanDocument,
+    ) -> Result<PathBuf> {
+        anyhow::ensure!(
+            document.plan_id == plan_id,
+            "working document plan id mismatch"
+        );
+        document.validate()?;
         let directory = self.plan_dir(session_id, plan_id);
         fs::create_dir_all(directory.join("revisions"))
             .with_context(|| format!("create plan directory {}", directory.display()))?;
-        let revision_path = directory
-            .join("revisions")
-            .join(format!("model-{revision:04}.md"));
-        fs::write(&revision_path, markdown)
-            .with_context(|| format!("write model plan revision {}", revision_path.display()))?;
-        let working_path = directory.join("working.md");
-        fs::write(&working_path, markdown)
-            .with_context(|| format!("write working plan {}", working_path.display()))?;
-        Ok((working_path, digest(markdown.as_bytes())))
+        let rendered = render_plan(document)?;
+        write_json_atomically(&directory.join("working.json"), document)?;
+        write_text_atomically(&directory.join("working.md"), &rendered.markdown)?;
+        write_json_atomically(&directory.join("working.index.json"), &rendered.navigation)?;
+        Ok(directory.join("working.md"))
     }
 
-    /// Save the complete edited plan as an immutable user revision.
-    pub fn save_user_revision(
+    /// Read and validate the canonical working document.
+    pub fn read_working_document(&self, session_id: &str, plan_id: &str) -> Result<PlanDocument> {
+        let path = self.plan_dir(session_id, plan_id).join("working.json");
+        let content = fs::read_to_string(&path)
+            .with_context(|| format!("read working plan document {}", path.display()))?;
+        let document = serde_json::from_str::<PlanDocument>(&content)
+            .with_context(|| format!("decode working plan document {}", path.display()))?;
+        document.validate()?;
+        Ok(document)
+    }
+
+    /// Apply one atomic semantic edit and refresh both projections.
+    pub fn edit_working_document(
+        &self,
+        session_id: &str,
+        request: PlanEditRequest,
+    ) -> Result<PlanEditResult> {
+        let document = self.read_working_document(session_id, &request.plan_id)?;
+        let result = apply_plan_edit(&document, request)?;
+        self.write_working_document(session_id, &result.plan_id, &result.document)?;
+        Ok(result)
+    }
+
+    /// Freeze one submitted JSON revision together with its exact rendered projection.
+    pub fn submit_document_revision(
         &self,
         session_id: &str,
         plan_id: &str,
         revision: u32,
-    ) -> Result<(String, String)> {
+        expected_version: u64,
+    ) -> Result<(PlanDocument, RenderedPlan, String)> {
+        let document = self.read_working_document(session_id, plan_id)?;
+        anyhow::ensure!(
+            document.version == expected_version,
+            "plan version changed before submission"
+        );
+        document.validate_for_submission()?;
+        let rendered = render_plan(&document)?;
+        let directory = self.plan_dir(session_id, plan_id).join("revisions");
+        fs::create_dir_all(&directory)?;
+        let stem = format!("submitted-{revision:04}");
+        write_json_atomically(&directory.join(format!("{stem}.json")), &document)?;
+        write_text_atomically(&directory.join(format!("{stem}.md")), &rendered.markdown)?;
+        write_json_atomically(
+            &directory.join(format!("{stem}.index.json")),
+            &rendered.navigation,
+        )?;
+        let checksum = digest(serde_json::to_vec(&document)?.as_slice());
+        Ok((document, rendered, checksum))
+    }
+
+    /// Read one submitted canonical revision for acceptance or timeline expansion.
+    pub fn read_submitted_document(
+        &self,
+        session_id: &str,
+        plan_id: &str,
+        revision: u32,
+    ) -> Result<PlanDocument> {
+        let path = self
+            .plan_dir(session_id, plan_id)
+            .join("revisions")
+            .join(format!("submitted-{revision:04}.json"));
+        let content = fs::read_to_string(&path)
+            .with_context(|| format!("read submitted plan document {}", path.display()))?;
+        serde_json::from_str(&content)
+            .with_context(|| format!("decode submitted plan document {}", path.display()))
+    }
+
+    /// Delete one physical plan artifact after its control state retracts.
+    pub fn delete_plan(&self, session_id: &str, plan_id: &str) -> Result<()> {
         let directory = self.plan_dir(session_id, plan_id);
-        let working_path = directory.join("working.md");
-        let markdown = fs::read_to_string(&working_path)
-            .with_context(|| format!("read working plan {}", working_path.display()))?;
-        let revision_path = directory
-            .join("revisions")
-            .join(format!("user-{revision:04}.md"));
-        fs::write(&revision_path, &markdown)
-            .with_context(|| format!("write user plan revision {}", revision_path.display()))?;
-        Ok((markdown.clone(), digest(markdown.as_bytes())))
-    }
-
-    /// Read and hash the editable working plan before accepting it.
-    pub fn read_working(&self, session_id: &str, plan_id: &str) -> Result<(String, String)> {
-        let working_path = self.plan_dir(session_id, plan_id).join("working.md");
-        let markdown = fs::read_to_string(&working_path)
-            .with_context(|| format!("read working plan {}", working_path.display()))?;
-        let checksum = digest(markdown.as_bytes());
-        Ok((markdown, checksum))
-    }
-
-    /// Read one immutable model revision for timeline expansion.
-    pub fn read_model_revision(
-        &self,
-        session_id: &str,
-        plan_id: &str,
-        revision: u32,
-    ) -> Result<String> {
-        let path = self
-            .plan_dir(session_id, plan_id)
-            .join("revisions")
-            .join(format!("model-{revision:04}.md"));
-        fs::read_to_string(&path)
-            .with_context(|| format!("read model plan revision {}", path.display()))
-    }
-
-    /// Read one immutable user revision for timeline expansion.
-    pub fn read_user_revision(
-        &self,
-        session_id: &str,
-        plan_id: &str,
-        revision: u32,
-    ) -> Result<String> {
-        let path = self
-            .plan_dir(session_id, plan_id)
-            .join("revisions")
-            .join(format!("user-{revision:04}.md"));
-        fs::read_to_string(&path)
-            .with_context(|| format!("read user plan revision {}", path.display()))
-    }
-
-    /// Build the user-edit diff against the last immutable model revision.
-    pub fn user_edit_diff(
-        &self,
-        session_id: &str,
-        plan_id: &str,
-        model_revision: u32,
-        edited: &str,
-    ) -> Result<String> {
-        let revision_path = self
-            .plan_dir(session_id, plan_id)
-            .join("revisions")
-            .join(format!("model-{model_revision:04}.md"));
-        let model = fs::read_to_string(&revision_path)
-            .with_context(|| format!("read model plan revision {}", revision_path.display()))?;
-        Ok(similar::TextDiff::from_lines(&model, edited)
-            .unified_diff()
-            .context_radius(3)
-            .header("model-plan.md", "user-edited-plan.md")
-            .to_string())
+        if directory.exists() {
+            fs::remove_dir_all(&directory)
+                .with_context(|| format!("delete plan directory {}", directory.display()))?;
+        }
+        Ok(())
     }
 
     /// Delete physical plan files for one removed Harness session.
@@ -537,17 +573,35 @@ impl PlanFileStore {
         let source = self.plan_dir(source_session_id, source_plan_id);
         let target = self.plan_dir(target_session_id, target_plan_id);
         fs::create_dir_all(target.join("revisions"))?;
-        fs::copy(source.join("working.md"), target.join("working.md"))?;
+        let mut working = self.read_working_document(source_session_id, source_plan_id)?;
+        working.plan_id = target_plan_id.to_owned();
+        self.write_working_document(target_session_id, target_plan_id, &working)?;
         let source_revision = source.join("revisions");
         if source_revision.exists() {
             for entry in fs::read_dir(&source_revision)? {
                 let entry = entry?;
-                if entry.file_type()?.is_file() {
-                    fs::copy(
-                        entry.path(),
-                        target.join("revisions").join(entry.file_name()),
-                    )?;
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !entry.file_type()?.is_file()
+                    || path.extension().and_then(|extension| extension.to_str()) != Some("json")
+                    || name.ends_with(".index.json")
+                {
+                    continue;
                 }
+                let mut document = serde_json::from_slice::<PlanDocument>(&fs::read(&path)?)?;
+                document.plan_id = target_plan_id.to_owned();
+                let rendered = render_plan(&document)?;
+                let stem = name.trim_end_matches(".json");
+                let target_revision = target.join("revisions");
+                write_json_atomically(&target_revision.join(format!("{stem}.json")), &document)?;
+                write_text_atomically(
+                    &target_revision.join(format!("{stem}.md")),
+                    &rendered.markdown,
+                )?;
+                write_json_atomically(
+                    &target_revision.join(format!("{stem}.index.json")),
+                    &rendered.navigation,
+                )?;
             }
         }
         Ok(target.join("working.md"))
@@ -556,6 +610,37 @@ impl PlanFileStore {
     fn plan_dir(&self, session_id: &str, plan_id: &str) -> PathBuf {
         self.root.join("plans").join(session_id).join(plan_id)
     }
+}
+
+fn write_json_atomically(path: &Path, value: &impl Serialize) -> Result<()> {
+    let content = serde_json::to_vec_pretty(value)?;
+    write_bytes_atomically(path, &content)
+}
+
+fn write_text_atomically(path: &Path, value: &str) -> Result<()> {
+    write_bytes_atomically(path, value.as_bytes())
+}
+
+fn write_bytes_atomically(path: &Path, value: &[u8]) -> Result<()> {
+    let temporary = path.with_extension(format!(
+        "{}.tmp-{}",
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("data"),
+        uuid::Uuid::new_v4()
+    ));
+    fs::write(&temporary, value)
+        .with_context(|| format!("write temporary plan artifact {}", temporary.display()))?;
+    if let Err(error) = fs::rename(&temporary, path) {
+        if !path.exists() {
+            return Err(error).with_context(|| format!("replace plan artifact {}", path.display()));
+        }
+        fs::remove_file(path)
+            .with_context(|| format!("remove previous plan artifact {}", path.display()))?;
+        fs::rename(&temporary, path)
+            .with_context(|| format!("replace plan artifact {}", path.display()))?;
+    }
+    Ok(())
 }
 
 /// Resolve a stable content digest for immutable plan acceptance.
@@ -568,32 +653,45 @@ mod test {
     use super::*;
 
     #[test]
-    fn preserves_model_and_user_revisions() {
+    fn preserves_submitted_json_revisions_while_the_working_document_changes() {
         let temporary = tempfile::tempdir().unwrap();
         let store = PlanFileStore::new(temporary.path());
-        let (working, first_digest) = store
-            .write_model_revision("session", "plan", 1, "# Plan\n\nInitial")
+        let document = document::test_fixture("plan", "Initial");
+        store
+            .write_working_document("session", "plan", &document)
             .unwrap();
-        fs::write(&working, "# Plan\n\nEdited").unwrap();
-        let (edited, edited_digest) = store.save_user_revision("session", "plan", 1).unwrap();
-        assert_eq!(edited, "# Plan\n\nEdited");
-        assert_ne!(first_digest, edited_digest);
-        assert!(
+        store
+            .submit_document_revision("session", "plan", 1, 1)
+            .unwrap();
+        store
+            .edit_working_document(
+                "session",
+                PlanEditRequest {
+                    plan_id: "plan".into(),
+                    expected_version: 1,
+                    operations: vec![PlanEditOperation::OverviewUpdate {
+                        text: "Edited".into(),
+                    }],
+                },
+            )
+            .unwrap();
+        assert_eq!(
             store
-                .user_edit_diff("session", "plan", 1, &edited)
+                .read_submitted_document("session", "plan", 1)
                 .unwrap()
-                .contains("Edited")
+                .overview,
+            "Initial"
         );
         assert!(
             temporary
                 .path()
-                .join("plans/session/plan/revisions/model-0001.md")
+                .join("plans/session/plan/revisions/submitted-0001.json")
                 .exists()
         );
         assert!(
             temporary
                 .path()
-                .join("plans/session/plan/revisions/user-0001.md")
+                .join("plans/session/plan/revisions/submitted-0001.index.json")
                 .exists()
         );
         store.delete_session("session").unwrap();

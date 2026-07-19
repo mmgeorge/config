@@ -1,4 +1,4 @@
-use crate::session::{ExecutionMode, HarnessSession, ProviderForkState, SessionStore};
+use crate::session::{ExecutionMode, HarnessMode, HarnessSession, ProviderForkState, SessionStore};
 use crate::storage::SqliteStore;
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -44,6 +44,7 @@ pub fn prepare_new_session(
         context_window: source.context_window,
         fast_mode: source.fast_mode,
         execution_mode: ExecutionMode::Read,
+        mode: HarnessMode::Read,
         created_at_ms: now_ms,
         updated_at_ms: now_ms,
         active_plan_id: None,

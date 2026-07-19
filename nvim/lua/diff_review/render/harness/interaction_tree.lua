@@ -4,6 +4,7 @@ local display_text = require("diff_review.render.display_text")
 
 local diff_tree = require("diff_review.render.diff_tree")
 local plan_event = require("diff_review.render.harness.plan_event")
+local plan_resolution = require("diff_review.render.harness.plan_resolution")
 local timeline_status = require("diff_review.render.harness.timeline_status")
 
 local function append_session_event(result, entry)
@@ -572,7 +573,14 @@ local function aggregate_execution(entry)
     prompt = "",
     hide_prompt = true,
     kind = "plan_execution",
-    state = entry.execution and entry.execution.state == "active" and "running" or "complete",
+    state = ({
+      active = "running",
+      complete = "complete",
+      paused = "paused",
+      stalled = "stalled",
+      blocked = "blocked",
+      cancelled = "cancelled",
+    })[entry.execution and entry.execution.state] or "running",
     node_list = {},
   }
   for _, interaction in ipairs(entry.interaction or {}) do
@@ -612,6 +620,8 @@ function M.build(interactions, options)
       plan_event.append(result, entry, { append_response = append_response })
     elseif entry.kind == "plan_execution" then
       append_interaction(result, aggregate_execution(entry), options)
+    elseif entry.kind == "plan_resolution" then
+      plan_resolution.append(result, entry)
     elseif entry.kind == "agent_lifecycle" then
       agent_event.append(result, entry, options, 0)
     elseif entry.kind == "session_event" then

@@ -218,6 +218,7 @@ function CommandSource:get_completions(_, callback)
       { name = "write", detail = "Allow workspace writes" },
       { name = "full", detail = "Allow machine-wide writes with approvals" },
       { name = "yolo", detail = "Allow machine-wide writes without approvals" },
+      { name = "plan", detail = "Plan with semantic artifacts under retained authorization" },
     }
     for _, mode in ipairs(mode_list) do
       items[#items + 1] = {

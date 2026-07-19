@@ -80,6 +80,7 @@
 ---@field help DiffReviewKeymap
 
 ---@class DiffReviewPlanReviewKeymapConfig
+---@field open DiffReviewKeymap
 ---@field comment DiffReviewKeymap
 ---@field accept DiffReviewKeymap
 ---@field request_changes DiffReviewKeymap
@@ -120,6 +121,7 @@
 ---@field composer_max_height integer
 ---@field goal_max_turns integer
 ---@field non_git_write_confirm boolean
+---@field plan { scope_deviation_review: "auto"|"prompt" }
 ---@field backends table<string, DiffReviewHarnessBackendConfig>
 
 ---@class DiffReviewPickerConfig
@@ -167,6 +169,9 @@ M.defaults = {
     composer_max_height = 12,
     goal_max_turns = 20,
     non_git_write_confirm = true,
+    plan = {
+      scope_deviation_review = "auto",
+    },
     backends = {
       codex = {
         command = { "codex", "app-server" },
@@ -247,6 +252,7 @@ M.defaults = {
       help = "?",
     },
     plan_review = {
+      open = { "<CR>", "." },
       comment = "C",
       accept = "oY",
       request_changes = "oN",
