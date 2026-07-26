@@ -28,29 +28,6 @@ function AgentCatalog.run_list(agent, active)
 end
 
 ---@param agent table?
----@param agent_live table<string, table>?
----@param run_id string
----@return table[]
-function AgentCatalog.interaction_list(agent, agent_live, run_id)
-  local result = {}
-  local index_by_id = {}
-  for _, turn in ipairs((agent and agent.turn) or {}) do
-    if turn.agent_run_id == run_id and turn.interaction then
-      result[#result + 1] = turn.interaction
-      if turn.interaction.id then index_by_id[turn.interaction.id] = #result end
-    end
-  end
-  local live = agent_live and agent_live[run_id]
-  if live and live.interaction then
-    local interaction = vim.deepcopy(live.interaction)
-    interaction.active = vim.deepcopy(live.active)
-    local existing_index = interaction.id and index_by_id[interaction.id] or nil
-    if existing_index then result[existing_index] = interaction else result[#result + 1] = interaction end
-  end
-  return result
-end
-
----@param agent table?
 ---@param selector string
 ---@return table? run
 ---@return string? error_message

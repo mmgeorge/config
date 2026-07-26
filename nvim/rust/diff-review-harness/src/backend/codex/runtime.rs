@@ -3,6 +3,7 @@ use super::process;
 use crate::backend::BackendEventSink;
 use crate::backend::approval::PermissionCoordinator;
 use crate::session::ExecutionMode;
+use crate::trace::TraceStore;
 use anyhow::{Context, Result};
 use std::net::TcpListener;
 use std::process::Stdio;
@@ -41,6 +42,8 @@ impl CodexRuntime {
         execution_mode: ExecutionMode,
         permission_coordinator: Arc<PermissionCoordinator>,
         event_sink: Option<BackendEventSink>,
+        trace: Arc<TraceStore>,
+        session_id: String,
     ) -> Result<CodexJsonRpc> {
         let mut server = self.server.lock().await;
         let running = match server.as_mut() {
@@ -66,6 +69,8 @@ impl CodexRuntime {
                 execution_mode,
                 Arc::clone(&permission_coordinator),
                 event_sink.clone(),
+                Arc::clone(&trace),
+                session_id.clone(),
             )
             .await
             {

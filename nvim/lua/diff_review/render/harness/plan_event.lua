@@ -32,6 +32,7 @@ function M.append(result, entry, host)
   result.lines[line] = "▸ " .. label
   result.rows[line] = { kind = "plan_lifecycle", lifecycle = lifecycle, expand_key = key }
   if lifecycle.kind == "question_asked" and lifecycle.question then
+    if not result.expanded[key] then return end
     for _, question in ipairs(lifecycle.question.questions or {}) do
       result.lines[#result.lines + 1] = "  ▸ " .. (question.header or "Question")
       result.rows[#result.lines] = { kind = "plan_question", lifecycle = lifecycle, question = question }
@@ -45,18 +46,11 @@ function M.append(result, entry, host)
     return
   end
   if not result.expanded[key] then return end
-  if type(entry.content) == "string" and entry.content ~= "" then
-    result.lines[#result.lines + 1] = "  ▸ Content"
-    result.rows[#result.lines] = { kind = "plan_content", lifecycle = lifecycle }
-    local first_markdown = #result.lines + 1
-    host.append_response(result, entry.content)
-    result.markdown_ranges[#result.markdown_ranges + 1] = { first0 = first_markdown - 1, after0 = #result.lines }
-  end
   if #(lifecycle.annotation or {}) > 0 then
     result.lines[#result.lines + 1] = "  ▸ Annotations"
     result.rows[#result.lines] = { kind = "plan_annotations", lifecycle = lifecycle }
     for _, annotation in ipairs(lifecycle.annotation) do
-      result.lines[#result.lines + 1] = ("    %d: %s"):format(annotation.line or 0, annotation.body or "")
+      result.lines[#result.lines + 1] = ("    %s: %s"):format(annotation.label or "Plan subject", annotation.body or "")
       result.rows[#result.lines] = { kind = "plan_annotation", lifecycle = lifecycle }
     end
   end

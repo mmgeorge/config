@@ -20,8 +20,17 @@ return {
     end,
     opts = function()
       return {
+        render_modes = { 'n', 'c', 't', 'i' },
         custom_handlers = {
           markdown = require('markdown_math.display_handler'),
+        },
+        heading = {
+          icons = { ' ', ' ', ' ', ' ', ' ', ' ' },
+          position = 'inline',
+          sign = false,
+          width = 'block',
+          left_pad = 0,
+          right_pad = 1,
         },
         latex = {
           converter = {

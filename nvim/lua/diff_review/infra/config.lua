@@ -252,6 +252,7 @@ M.defaults = {
       help = "?",
     },
     plan_review = {
+      toggle = "<Tab>",
       open = { "<CR>", "." },
       comment = "C",
       accept = "oY",

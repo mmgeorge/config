@@ -80,7 +80,7 @@ async fn asks_for_feedback_then_creates_a_plan_without_native_collaboration_mode
             id: 3,
             method: "prompt.submit".into(),
             params: json!({
-                "text": "/plan add a Testing section to README.md without changing any files. Before creating the plan, ask me whether the section should describe unit tests or integration tests. Do not choose for me."
+                "text": "/plan add a Testing section to README.md without changing any files. Your first action must call harness_plan_question with exactly one question asking which test type the section should describe. Give exactly two options named Unit tests and Integration tests. Do not call any plan create, edit, or submit tool until I answer."
             }),
         }),
     )
@@ -92,10 +92,14 @@ async fn asks_for_feedback_then_creates_a_plan_without_native_collaboration_mode
         planned.response.error
     );
     let paused_snapshot = broker.snapshot().unwrap();
-    assert!(paused_snapshot.artifact.is_empty());
     let paused_plan = paused_snapshot.active_plan.expect("paused planning state");
     assert_eq!(
         paused_plan.state,
+        diff_review_harness::plan::PlanState::AwaitingInput
+    );
+    assert_eq!(paused_snapshot.artifact.len(), 1);
+    assert_eq!(
+        paused_snapshot.artifact[0].state,
         diff_review_harness::plan::PlanState::AwaitingInput
     );
     let elicitation = paused_plan.elicitation.expect("pending elicitation");
@@ -177,6 +181,32 @@ async fn asks_for_feedback_then_creates_a_plan_without_native_collaboration_mode
     let snapshot = broker.snapshot().unwrap();
     assert_eq!(snapshot.artifact.len(), 1);
     assert!(std::path::Path::new(&snapshot.artifact[0].working_path).exists());
+    let submitted_plan = snapshot.active_plan.expect("submitted plan");
+    assert_eq!(
+        submitted_plan.state,
+        diff_review_harness::plan::PlanState::AwaitingReview
+    );
+    assert!(submitted_plan.elicitation.is_none());
+    assert_eq!(submitted_plan.question_ledger.resolution.len(), 1);
+    assert_eq!(
+        snapshot
+            .interaction
+            .iter()
+            .filter(|interaction| interaction.prompt.starts_with("Planning feedback:"))
+            .count(),
+        1,
+        "feedback continuation should remain one Harness interaction"
+    );
+    assert!(snapshot.timeline.iter().any(|entry| matches!(
+        entry,
+        diff_review_harness::timeline::TimelineEntry::Status {
+            status:
+                diff_review_harness::session::state_machine::SessionPhase::AwaitingPlanReview {
+                    ..
+                },
+            ..
+        }
+    )));
     assert_eq!(snapshot.session.execution_mode, ExecutionMode::Read);
 
     let new_session = broker

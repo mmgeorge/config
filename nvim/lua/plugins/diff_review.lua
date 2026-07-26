@@ -5,7 +5,7 @@ return {
     dependencies = { "folke/snacks.nvim" },
     cmd = {
       "GitStatus", "GitBranchDiff", "GitBranchDiffFile", "GitFileRevision", "GitDiffCompactPreview",
-      "Harness", "HarnessNew", "Permissions",
+      "Harness", "HarnessNew", "HarnessLog", "Permissions",
     },
     opts = {
       perf_logging = true,
@@ -27,6 +27,40 @@ return {
       vim.api.nvim_create_user_command("HarnessNew", function()
         diff_review.new_harness_session()
       end, { desc = "Create a fresh Harness session" })
+      vim.api.nvim_create_user_command("HarnessLog", function(command)
+        local client = require("diff_review.harness.client")
+        local action = command.args
+        local method = ({ on = "trace.configure", off = "trace.configure", toggle = "trace.toggle", clear = "trace.clear" })[action]
+        if action ~= "" and not method then
+          vim.notify("Usage: HarnessLog [on|off|toggle|clear]", vim.log.levels.WARN, { title = "Harness" })
+          return
+        end
+        local function open_trace(status, request_error)
+          if request_error then
+            vim.notify(request_error, vim.log.levels.ERROR, { title = "Harness" })
+            return
+          end
+          vim.cmd.edit(vim.fn.fnameescape(status.path))
+          vim.bo.readonly = true
+          vim.bo.modifiable = false
+        end
+        if action == "" then
+          client.request("trace.status", {}, open_trace)
+          return
+        end
+        local params = action == "on" and { enabled = true } or action == "off" and { enabled = false } or {}
+        client.request(method, params, function(status, request_error)
+          if request_error then
+            vim.notify(request_error, vim.log.levels.ERROR, { title = "Harness" })
+            return
+          end
+          vim.notify("Harness trace " .. (status.enabled and "enabled" or "disabled"), vim.log.levels.INFO, { title = "Harness" })
+        end)
+      end, {
+        nargs = "?",
+        complete = function() return { "on", "off", "toggle", "clear" } end,
+        desc = "Open or control the Harness protocol trace",
+      })
       vim.api.nvim_create_user_command("Permissions", function()
         require("diff_review.views.permissions").open()
       end, { desc = "Edit Harness permissions" })

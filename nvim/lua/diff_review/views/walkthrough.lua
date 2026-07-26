@@ -107,6 +107,8 @@
 ---@field line_count integer
 
 local popup_window = require("diff_review.infra.popup_window")
+local task_tree = require("diff_review.render.task_tree")
+local task_tree_style = require("diff_review.render.task_tree_style")
 
 ---@class DiffReviewWalkthroughModule
 ---@field _modes table<integer, DiffReviewWalkthroughMode>
@@ -271,19 +273,6 @@ local action_highlights = {
   Modify = "DiffReviewWalkthroughActionModify",
   Remove = "DiffReviewWalkthroughActionRemove",
 }
----@param is_last boolean
----@return string
-local function tree_branch(is_last)
-  return is_last and "└─ " or "├─ "
-end
-
----@param is_last boolean
----@return string
-local function tree_continuation(is_last)
-  return is_last and "   " or "│  "
-end
-
-local walkthrough_status_body_prefix = "  "
 
 ---@param action string
 ---@return string
@@ -312,7 +301,7 @@ end
 ---@return string
 local function summary_item_text(item, prefix, is_last)
   return prefix
-    .. tree_branch(is_last)
+    .. task_tree.branch(is_last)
     .. format_action(item.action)
     .. " "
     .. format_item_type_label(item.type, item.subtype)
@@ -590,8 +579,8 @@ local function append_task_summary_body(lines, task)
   local subtask_prefix = ""
   for subtask_index, subtask in ipairs(task.subtasks) do
     local subtask_is_last = subtask_index == #task.subtasks
-    lines[#lines + 1] = subtask_prefix .. tree_branch(subtask_is_last) .. subtask.title
-    local item_prefix = subtask_prefix .. tree_continuation(subtask_is_last)
+    lines[#lines + 1] = subtask_prefix .. task_tree.branch(subtask_is_last) .. subtask.title
+    local item_prefix = subtask_prefix .. task_tree.continuation(subtask_is_last)
     if subtask.justification then lines[#lines + 1] = item_prefix .. subtask.justification end
     for item_index, item in ipairs(subtask.items) do
       local item_is_last = item_index == #subtask.items
@@ -1081,17 +1070,6 @@ local function wrap_text(text, width)
 end
 
 ---@param line string
----@return string? first_prefix
----@return string? continuation_prefix
----@return string? body
-local function tree_wrap_parts(line)
-  local prefix, branch, body = line:match("^(%s*[│ ]*)([├└]─%s+)(%S.*)$")
-  if not prefix or not branch or not body then return nil, nil, nil end
-  local continuation = branch:find("├", 1, true) and "│  " or "   "
-  return prefix .. branch, prefix .. continuation, body
-end
-
----@param line string
 ---@return string? prefix
 ---@return string? body
 local function tree_indent_wrap_parts(line)
@@ -1100,27 +1078,15 @@ local function tree_indent_wrap_parts(line)
   return prefix, body
 end
 
----@param lines string[]
----@param first_prefix string
----@param continuation_prefix string
----@param body string
----@param width integer
-local function append_wrapped_tree_line(lines, first_prefix, continuation_prefix, body, width)
-  local body_width = math.max(width - vim.fn.strdisplaywidth(first_prefix), 8)
-  for index, wrapped_line in ipairs(wrap_text(body, body_width)) do
-    lines[#lines + 1] = (index == 1 and first_prefix or continuation_prefix) .. wrapped_line
-  end
-end
-
 ---@param line string
 ---@param item_titles string[]
 ---@return string? prefix
 ---@return string? note
 local function item_note_wrap_parts(line, item_titles)
-  local tree_prefix = tree_wrap_parts(line)
-  if not tree_prefix then return nil, nil end
+  local parsed_line = task_tree.parse_line(line)
+  if not parsed_line then return nil, nil end
   for _, title in ipairs(item_titles or {}) do
-    local title_start_byte = line:find(title .. " to ", #tree_prefix + 1, true)
+    local title_start_byte = line:find(title .. " to ", #parsed_line.first_prefix + 1, true)
     if title_start_byte then
       local note_start_byte = title_start_byte + #title + #" to "
       return line:sub(1, note_start_byte - 1), line:sub(note_start_byte)
@@ -1319,9 +1285,14 @@ local function summary_lines(text, width, item_titles)
       if item_prefix and item_note and append_wrapped_item_note(lines, item_prefix, item_note, width) then
         -- Item notes wrap as their own prose segment, aligned under the note.
       else
-        local first_prefix, continuation_prefix, tree_body = tree_wrap_parts(line)
-        if first_prefix and continuation_prefix and tree_body then
-          append_wrapped_tree_line(lines, first_prefix, continuation_prefix, tree_body, width)
+        local parsed_tree_line = task_tree.parse_line(line)
+        if parsed_tree_line then
+          vim.list_extend(lines, task_tree.wrap(
+            parsed_tree_line.body,
+            width,
+            parsed_tree_line.first_prefix,
+            parsed_tree_line.continuation_prefix
+          ))
         else
           local tree_indent, tree_indent_body = tree_indent_wrap_parts(line)
           if tree_indent and tree_indent_body then
@@ -1533,137 +1504,11 @@ local function status_summary_lines(mode)
   return summary_lines(mode.doc.summary, width, collect_summary_item_titles(mode.doc.tasks))
 end
 
----@param text string
----@param width integer
----@return string first_line
----@return string rest
-local function split_first_wrapped_line(text, width)
-  local current = ""
-  for start_byte, word in text:gmatch("()(%S+)") do
-    local candidate = current == "" and word or (current .. " " .. word)
-    if current ~= "" and vim.fn.strdisplaywidth(candidate) > width then
-      return current, vim.trim(text:sub(start_byte))
-    end
-    current = candidate
-  end
-  return current, ""
-end
-
----@param task_index integer
----@param task DiffReviewWalkthroughTask
----@param width integer
----@return { text: string, segments: table[] }[]
-local function status_task_heading_rows(task_index, task, width)
-  local title = ("%d. %s"):format(task_index, task.title)
-  if not (task.justification and task.justification ~= "") then
-    local rows = {}
-    for _, line in ipairs(summary_lines(title, width, {})) do
-      rows[#rows + 1] = { text = line, segments = { { line, "DiffReviewWalkthroughItemTitle" } } }
-    end
-    return rows
-  end
-
-  local rows = {}
-  local title_width = vim.fn.strdisplaywidth(title)
-  if title_width + 2 >= width then
-    for _, line in ipairs(summary_lines(title, width, {})) do
-      rows[#rows + 1] = { text = line, segments = { { line, "DiffReviewWalkthroughItemTitle" } } }
-    end
-    for _, line in ipairs(wrap_text(task.justification, width)) do
-      rows[#rows + 1] = { text = line, segments = { { line } } }
-    end
-    return rows
-  end
-
-  local first_justification, rest = split_first_wrapped_line(task.justification, width - title_width - 1)
-  local first_line = first_justification ~= "" and (title .. " " .. first_justification) or title
-  local first_segments = { { title, "DiffReviewWalkthroughItemTitle" } }
-  if first_justification ~= "" then
-    first_segments[#first_segments + 1] = { " " }
-    first_segments[#first_segments + 1] = { first_justification }
-  end
-  rows[#rows + 1] = { text = first_line, segments = first_segments }
-  for _, line in ipairs(wrap_text(rest, width)) do
-    rows[#rows + 1] = { text = line, segments = { { line } } }
-  end
-  return rows
-end
-
----@param rows table[]
----@param text string
----@param opts { id: string, parent_id: string, kind?: string, fold_target_id?: string|false, default_folded?: boolean, segments?: table[], walkthrough_step?: DiffReviewWalkthroughStep, inventory_cells?: table[] }
----@param width integer
----@param item_titles string[]
-local function append_status_summary_rows(rows, text, opts, width, item_titles)
-  local wrapped_lines = summary_lines(text, width, item_titles)
-  for wrapped_index, wrapped_line in ipairs(wrapped_lines) do
-    local is_primary = wrapped_index == 1
-    local id = is_primary and opts.id or ("%s:line:%d"):format(opts.id, wrapped_index)
-    local kind = is_primary and (opts.kind or "pr_head_line") or "pr_head_line"
-    local fold_target_id = opts.fold_target_id
-    if is_primary and opts.kind == "pr_head_section" and fold_target_id == nil then
-      fold_target_id = false
-    elseif not is_primary and opts.kind == "pr_head_section" then
-      fold_target_id = opts.id
-    end
-    rows[#rows + 1] = {
-      text = wrapped_line,
-      segments = is_primary and #wrapped_lines == 1 and opts.segments or nil,
-      id = id,
-      parent_id = opts.parent_id,
-      kind = kind,
-      fold_target_id = fold_target_id,
-      default_folded = is_primary and opts.default_folded == true,
-      walkthrough_step = is_primary and opts.walkthrough_step or nil,
-      inventory_cells = is_primary and opts.inventory_cells or nil,
-    }
-  end
-end
-
 ---@param path string?
 ---@return string
 local function basename(path)
   local normalized = tostring(path or ""):gsub("\\", "/")
   return normalized:match("([^/]+)$") or normalized
-end
-
----@param rows table[]
----@param task DiffReviewWalkthroughTask
----@param task_id string
----@param width integer
----@param item_titles string[]
-local function append_status_task_body_rows(rows, task, task_id, width, item_titles)
-  local subtask_prefix = walkthrough_status_body_prefix
-  for subtask_index, subtask in ipairs(task.subtasks) do
-    local subtask_id = ("%s:subtask:%d"):format(task_id, subtask_index)
-    local subtask_is_last = subtask_index == #task.subtasks
-    append_status_summary_rows(rows, subtask_prefix .. tree_branch(subtask_is_last) .. subtask.title, {
-      id = subtask_id,
-      parent_id = task_id,
-      kind = "pr_head_section",
-      default_folded = true,
-    }, width, item_titles)
-
-    local item_prefix = subtask_prefix .. tree_continuation(subtask_is_last)
-    if subtask.justification then
-      append_status_summary_rows(rows, item_prefix .. subtask.justification, {
-        id = ("%s:justification"):format(subtask_id),
-        parent_id = subtask_id,
-        fold_target_id = subtask_id,
-      }, width, item_titles)
-    end
-    for item_index, item in ipairs(subtask.items) do
-      local item_id = ("%s:item:%d"):format(subtask_id, item_index)
-      local item_is_last = item_index == #subtask.items
-      local item_steps = item.steps or {}
-      append_status_summary_rows(rows, summary_item_text(item, item_prefix, item_is_last), {
-        id = item_id,
-        parent_id = subtask_id,
-        fold_target_id = subtask_id,
-        walkthrough_step = item_steps[1],
-      }, width, item_titles)
-    end
-  end
 end
 
 ---@param state table|nil
@@ -2325,6 +2170,68 @@ local function append_status_flow_rows(rows, flow, width)
   end
 end
 
+---@param item DiffReviewWalkthroughItem
+---@return string
+local function walkthrough_item_node_text(item)
+  return format_action(item.action)
+    .. " "
+    .. format_item_type_label(item.type, item.subtype)
+    .. " "
+    .. item.title
+    .. " to "
+    .. item.note
+end
+
+---@param tasks DiffReviewWalkthroughTask[]
+---@return DiffReviewTaskTreeNode[]
+local function walkthrough_task_nodes(tasks)
+  local task_node_list = {}
+  for task_index, task in ipairs(tasks or {}) do
+    local task_id = ("walkthrough:task:%d"):format(task_index)
+    local task_title = ("%d. %s"):format(task_index, task.title)
+    local subtask_node_list = {}
+    for subtask_index, subtask in ipairs(task.subtasks or {}) do
+      local subtask_id = ("%s:subtask:%d"):format(task_id, subtask_index)
+      local item_node_list = {}
+      for item_index, item in ipairs(subtask.items or {}) do
+        local action = format_action(item.action)
+        local kind = format_item_type_label(item.type, item.subtype)
+        item_node_list[#item_node_list + 1] = {
+          id = ("%s:item:%d"):format(subtask_id, item_index),
+          text = walkthrough_item_node_text(item),
+          segments_for_line = task_tree_style.change(action, kind, item.title),
+          branch = true,
+          foldable = false,
+          metadata = { walkthrough_step = (item.steps or {})[1] },
+        }
+      end
+      subtask_node_list[#subtask_node_list + 1] = {
+        id = subtask_id,
+        text = subtask.title,
+        branch = true,
+        detail = subtask.justification,
+        children = item_node_list,
+        foldable = #item_node_list > 0,
+        default_folded = true,
+      }
+    end
+    task_node_list[#task_node_list + 1] = {
+      id = task_id,
+      text = task.title,
+      heading_detail = task.justification,
+      branch = false,
+      first_prefix = ("%d. "):format(task_index),
+      continuation_prefix = "   ",
+      children = subtask_node_list,
+      foldable = #subtask_node_list > 0,
+      default_folded = true,
+      gap_after = task_index < #(tasks or {}),
+      segments_for_line = task_tree_style.task(task_title),
+    }
+  end
+  return task_node_list
+end
+
 ---@param mode DiffReviewWalkthroughMode
 ---@return table[] rows
 local function status_summary_rows(mode)
@@ -2351,32 +2258,19 @@ local function status_summary_rows(mode)
     rows[#rows + 1] = { text = "", parent_id = status_section_id }
   end
 
-  for task_index, task in ipairs(mode.doc.tasks or {}) do
-    local task_id = ("walkthrough:task:%d"):format(task_index)
-    local heading_rows = status_task_heading_rows(task_index, task, width)
-    for heading_index, heading_row in ipairs(heading_rows) do
-      local anchors_task_fold = heading_index == #heading_rows
-      rows[#rows + 1] = {
-        text = heading_row.text,
-        segments = heading_row.segments,
-        id = anchors_task_fold and task_id or ("%s:heading:%d"):format(task_id, heading_index),
-        parent_id = status_section_id,
-        kind = anchors_task_fold and "pr_head_section" or "pr_head_line",
-        fold_target_id = anchors_task_fold and false or task_id,
-        default_folded = anchors_task_fold,
-      }
-    end
-
-    append_status_task_body_rows(rows, task, task_id, width, item_titles)
-    if task_index < #(mode.doc.tasks or {}) then
-      rows[#rows + 1] = {
-        text = "",
-        id = ("%s:separator"):format(task_id),
-        parent_id = task_id,
-        kind = "pr_head_line",
-        fold_target_id = task_id,
-      }
-    end
+  for _, task_row in ipairs(task_tree.render(walkthrough_task_nodes(mode.doc.tasks or {}), width)) do
+    local fold_target_id = task_row.fold_target_id
+    if task_row.fold_id then fold_target_id = false end
+    rows[#rows + 1] = {
+      text = task_row.text,
+      segments = task_row.segments,
+      id = task_row.id,
+      parent_id = task_row.parent_id or status_section_id,
+      kind = task_row.fold_id and "pr_head_section" or "pr_head_line",
+      fold_target_id = fold_target_id,
+      default_folded = task_row.default_folded == true,
+      walkthrough_step = task_row.metadata and task_row.metadata.walkthrough_step or nil,
+    }
   end
 
   if has_inventory then

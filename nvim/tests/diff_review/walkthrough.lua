@@ -1010,13 +1010,13 @@ local function run()
     "summary subtask justification continuation missing")
   assert_true(not buffer_contains(summary_buf, "why:"), "summary justification should not render a why label")
   assert_true(buffer_contains(summary_buf, "└─ Rewrite the first fixture file."), "summary subtask row missing")
-  assert_true((find_line(summary_buf, "└─ Rewrite the first fixture file.") or ""):match("^  └─ ") ~= nil,
+  assert_true((find_line(summary_buf, "└─ Rewrite the first fixture file.") or ""):match("^   └─ ") ~= nil,
     "expanded walkthrough subtask rows should be indented under the task")
-  assert_true(buffer_contains(summary_buf, "   ├─ Modify Cache a.txt rewrite to rewrite"),
+  assert_true(buffer_contains(summary_buf, "      ├─ Modify Cache a.txt rewrite to rewrite"),
     "summary item action row missing display verb")
-  assert_true((find_line(summary_buf, "Modify Cache a.txt rewrite") or ""):match("^     ├─ ") ~= nil,
+  assert_true((find_line(summary_buf, "Modify Cache a.txt rewrite") or ""):match("^      ├─ ") ~= nil,
     "expanded walkthrough action rows should preserve tree indentation under the task")
-  assert_true(buffer_contains(summary_buf, "   └─ Add fn b.txt rewrite to repeat"),
+  assert_true(buffer_contains(summary_buf, "      └─ Add fn b.txt rewrite to repeat"),
     "summary add action row should not be padded")
   assert_true(buffer_contains(summary_buf, "the second line"),
     "summary item inline note prefix missing")

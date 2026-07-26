@@ -17,7 +17,7 @@ pub struct PlanAuditTask {
     pub task_id: String,
     pub state: PlanTaskState,
     pub completed_subtask_ids: Vec<String>,
-    pub completed_code_edit_ids: Vec<String>,
+    pub completed_entity_ids: Vec<String>,
     pub changed_paths: Vec<String>,
 }
 
@@ -94,7 +94,7 @@ pub fn build_plan_audit(
                 task_id: task.task_id.clone(),
                 state: task.state,
                 completed_subtask_ids: task.completed_subtask_ids.clone(),
-                completed_code_edit_ids: task.completed_code_edit_ids.clone(),
+                completed_entity_ids: task.completed_entity_ids.clone(),
                 changed_paths: task.changed_paths.clone(),
             })
             .collect(),

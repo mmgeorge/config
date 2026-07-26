@@ -133,6 +133,18 @@ return {
       vim.api.nvim_set_hl(0, "RenderMarkdownCodeInline", { bg = colors.black })
       vim.api.nvim_set_hl(0, "RenderMarkdownCode", { bg = colors.black })
       vim.api.nvim_set_hl(0, "RenderMarkdownCodeBorder", { bg = colors.black })
+      vim.api.nvim_set_hl(0, "RenderMarkdownH1", { fg = colors.black, bg = colors.white })
+      vim.api.nvim_set_hl(0, "RenderMarkdownH1Bg", { fg = colors.black, bg = colors.white })
+      vim.api.nvim_set_hl(0, "RenderMarkdownH2", { fg = colors.white, bg = colors.gray })
+      vim.api.nvim_set_hl(0, "RenderMarkdownH2Bg", { fg = colors.white, bg = colors.gray })
+      vim.api.nvim_set_hl(0, "RenderMarkdownH3", { link = "@markup.heading.5.markdown" })
+      vim.api.nvim_set_hl(0, "RenderMarkdownH3Bg", { link = "Visual" })
+      vim.api.nvim_set_hl(0, "RenderMarkdownH4", { fg = colors.light_blue })
+      vim.api.nvim_set_hl(0, "RenderMarkdownH4Bg", { fg = colors.light_blue, bg = "none" })
+      vim.api.nvim_set_hl(0, "RenderMarkdownH5", { link = "@markup.heading.3.markdown" })
+      vim.api.nvim_set_hl(0, "RenderMarkdownH5Bg", { link = "DiffChange" })
+      vim.api.nvim_set_hl(0, "@markup.strong.markdown_inline", { fg = colors.white, bold = true })
+      vim.api.nvim_set_hl(0, "@markup.italic.markdown_inline", { italic = true })
 
 
       -- Tabline

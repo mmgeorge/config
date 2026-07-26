@@ -3,6 +3,8 @@
 ---
 --- Maintains one saved-value record per window id, keyed in saved_by_win, until restore clears it.
 
+local fold_presentation = require("diff_review.render.fold_presentation")
+
 ---@class DiffReviewWindowOptionState
 ---@field number boolean
 ---@field relativenumber boolean
@@ -27,31 +29,6 @@ local M = {}
 --- Saved prior window options per window id, populated on hide and cleared on restore.
 ---@type table<integer, DiffReviewWindowOptionState>
 M.saved_by_win = {}
-
---- Merge a `key:value` pair into a comma-list option (fillchars/winhighlight), preserving order
---- and replacing an existing entry for the same key.
----@param value string?
----@param key string
----@param replacement string
----@return string
-function M.option_with_pair(value, key, replacement)
-  local option_by_key = {}
-  local option_order = {}
-  for option in tostring(value or ""):gmatch("[^,]+") do
-    local option_key, option_value = option:match("^([^:]+):(.*)$")
-    if option_key and option_key ~= "" then
-      if option_by_key[option_key] == nil then option_order[#option_order + 1] = option_key end
-      option_by_key[option_key] = option_value
-    end
-  end
-  if option_by_key[key] == nil then option_order[#option_order + 1] = key end
-  option_by_key[key] = replacement
-  local parts = {}
-  for _, option_key in ipairs(option_order) do
-    parts[#parts + 1] = option_key .. ":" .. option_by_key[option_key]
-  end
-  return table.concat(parts, ",")
-end
 
 --- Hide line numbers and signs for the window, saving the prior values once so restore is exact.
 ---@param win integer?
@@ -103,9 +80,7 @@ function M.apply(win, _state)
   vim.wo[win].foldenable = true
   vim.wo[win].foldlevel = 99
   vim.wo[win].foldmethod = "manual"
-  vim.wo[win].foldtext = "v:lua.diff_review_status_foldtext()"
-  vim.wo[win].fillchars = M.option_with_pair(vim.wo[win].fillchars, "fold", " ")
-  vim.wo[win].winhighlight = M.option_with_pair(vim.wo[win].winhighlight, "Folded", "Normal")
+  fold_presentation.apply_window(win)
 end
 
 --- Restore the window's saved options and drop its record.

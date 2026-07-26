@@ -7,6 +7,7 @@
 
 local status_buffer = require("diff_review.views.status.status_buffer")
 local comment_box_rows = require("diff_review.views.status.comment_box_rows")
+local fold_presentation = require("diff_review.render.fold_presentation")
 
 local pr_edit = require("diff_review.views.pr.pr_edit")
 -- review edge kept lazy to avoid a load-time cycle.
@@ -39,24 +40,7 @@ end
 ---@param value any
 ---@return any
 function M._status_fold_text(value)
-  if type(value) == "function" then
-    local ok, text = pcall(value)
-    if ok then return M._status_fold_text(text) end
-  elseif type(value) == "table" then
-    return value
-  elseif value ~= nil then
-    return tostring(value)
-  end
-  local fold_start = tonumber(vim.v.foldstart) or vim.fn.line(".")
-  return vim.fn.getline(fold_start)
-end
-
-function _G.diff_review_status_foldtext()
-  local buf = vim.api.nvim_get_current_buf()
-  local state = session.states and session.states[buf] or session.status
-  local fold_start = tonumber(vim.v.foldstart) or vim.fn.line(".")
-  local value = state and state.fold_text_by_start_line and state.fold_text_by_start_line[fold_start] or nil
-  return M._status_fold_text(value)
+  return fold_presentation.resolve(value)
 end
 
 ---@param fold_id string?
@@ -193,6 +177,7 @@ end
 function M._status_apply_native_folds(buf)
   local state = session.states and session.states[buf] or session.status
   if not (state and state.fold_range_order and vim.api.nvim_buf_is_valid(buf)) then return end
+  fold_presentation.replace(buf, state.fold_text_by_start_line)
   return trace.span("status.apply_native_folds", buf, {
     fold_ranges = #(state.fold_range_order or {}),
   }, function()

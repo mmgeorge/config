@@ -74,6 +74,19 @@ struct ParentTurn {
     provider_started: bool,
 }
 
+impl ParentTurn {
+    fn observe_started(&mut self, message: &Value, thread_id: &str) -> bool {
+        let Some(started_turn_id) =
+            CodexBackend::notification_thread_turn_id(message, "turn/started", thread_id)
+        else {
+            return false;
+        };
+        self.id = started_turn_id.to_owned();
+        self.provider_started = true;
+        true
+    }
+}
+
 /// Coordinates parent turns and descendant lifecycles over one Codex app-server process.
 pub(super) struct CodexTurnCoordinator<'a> {
     backend: &'a CodexBackend,
@@ -146,9 +159,7 @@ impl<'a> CodexTurnCoordinator<'a> {
                         {
                             self.clear_wait();
                         }
-                        if CodexBackend::notification_turn_id(&message, "turn/started") == Some(active.id.as_str()) {
-                            active.provider_started = true;
-                        }
+                        active.observe_started(&message, self.thread_id);
                         if CodexBackend::notification_matches_turn(
                             &message,
                             "turn/completed",
@@ -466,5 +477,33 @@ mod test {
         assert!(is_parent_wait_message(&wait, "parent-thread"));
         assert!(!is_parent_wait_message(&response, "parent-thread"));
         assert!(is_parent_activity_message(&response, "parent-thread"));
+    }
+
+    #[test]
+    fn adopts_the_same_thread_started_id_without_adopting_child_turns() {
+        let mut parent = ParentTurn {
+            id: "initial-turn".into(),
+            provider_started: false,
+        };
+        let authoritative_start = json!({
+            "method": "turn/started",
+            "params": {
+                "threadId": "parent-thread",
+                "turn": { "id": "authoritative-turn" }
+            }
+        });
+        let child = json!({
+            "method": "turn/started",
+            "params": {
+                "threadId": "child-thread",
+                "turn": { "id": "child-turn" }
+            }
+        });
+
+        assert!(parent.observe_started(&authoritative_start, "parent-thread"));
+        assert_eq!(parent.id, "authoritative-turn");
+        assert!(parent.provider_started);
+        assert!(!parent.observe_started(&child, "parent-thread"));
+        assert_eq!(parent.id, "authoritative-turn");
     }
 }

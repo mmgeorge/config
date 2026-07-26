@@ -8,16 +8,164 @@ use crate::backend::{
     ProviderFileChange, ProviderTaskEntry, ProviderTaskUpdate, TaskStatus, ToolActivity,
     ToolActivityKind,
 };
-use crate::control_tools::{ControlToolInvocation, apply_invocation};
+use crate::control_tools::{
+    ControlToolInvocation, ControlToolRuntime, ControlTurnContext, apply_invocation,
+};
+use crate::plan::{PlanDocument, apply_plan_edit, render_plan};
 use crate::session::{ContextUsage, ExecutionMode};
+use crate::trace::TraceStore;
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+
+const DYNAMIC_TOOL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Debug)]
+struct DynamicToolTraceContext {
+    invocation_id: String,
+    request_id: Value,
+    item_id: Option<String>,
+    thread_id: Option<String>,
+    turn_id: Option<String>,
+    tool_name: String,
+    argument_bytes: usize,
+    mutation_count: usize,
+    mutation_summary: Value,
+    plan_id: Option<String>,
+    expected_version: Option<u64>,
+    started_at: Instant,
+}
+
+impl DynamicToolTraceContext {
+    fn from_message(message: &Value) -> Option<Self> {
+        let method = message.get("method").and_then(Value::as_str)?;
+        let params = message.get("params").unwrap_or(message);
+        let tool_name = control_tool_name(method, params)?.to_owned();
+        let arguments = find_control_arguments(params, &tool_name).unwrap_or(Value::Null);
+        let request_id = message.get("id").cloned().unwrap_or(Value::Null);
+        let item_id = [
+            "/params/item/id",
+            "/params/itemId",
+            "/params/item_id",
+            "/params/callId",
+            "/params/call_id",
+        ]
+        .into_iter()
+        .find_map(|pointer| message.pointer(pointer).and_then(Value::as_str))
+        .map(str::to_owned);
+        let invocation_id = item_id.clone().unwrap_or_else(|| {
+            let request_label = match &request_id {
+                Value::String(value) => value.clone(),
+                value => value.to_string(),
+            };
+            format!("rpc-{request_label}")
+        });
+        let mutation_summary = plan_mutation_summary(&arguments);
+        let mutation_count = mutation_summary
+            .as_object()
+            .map(|resource_map| {
+                resource_map
+                    .values()
+                    .filter_map(Value::as_object)
+                    .flat_map(|action_map| action_map.values())
+                    .filter_map(Value::as_u64)
+                    .sum::<u64>() as usize
+            })
+            .unwrap_or_default();
+        Some(Self {
+            invocation_id,
+            request_id,
+            item_id,
+            thread_id: message
+                .pointer("/params/threadId")
+                .or_else(|| message.pointer("/params/thread_id"))
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            turn_id: message
+                .pointer("/params/turnId")
+                .or_else(|| message.pointer("/params/turn_id"))
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            tool_name,
+            argument_bytes: serde_json::to_vec(&arguments).map_or(0, |encoded| encoded.len()),
+            mutation_count,
+            mutation_summary,
+            plan_id: arguments
+                .get("plan_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            expected_version: arguments.get("expected_version").and_then(Value::as_u64),
+            started_at: Instant::now(),
+        })
+    }
+
+    fn payload(&self, fields: Value) -> Value {
+        let mut payload = json!({
+            "invocation_id": self.invocation_id,
+            "request_id": self.request_id,
+            "item_id": self.item_id,
+            "thread_id": self.thread_id,
+            "turn_id": self.turn_id,
+            "tool_name": self.tool_name,
+            "argument_bytes": self.argument_bytes,
+            "mutation_count": self.mutation_count,
+            "mutation_summary": self.mutation_summary,
+            "plan_id": self.plan_id,
+            "expected_version": self.expected_version,
+            "elapsed_ms": self.started_at.elapsed().as_millis() as u64,
+        });
+        if let (Some(payload), Some(fields)) = (payload.as_object_mut(), fields.as_object()) {
+            payload.extend(fields.clone());
+        }
+        payload
+    }
+}
+
+fn plan_mutation_summary(arguments: &Value) -> Value {
+    let mut resource_map = serde_json::Map::new();
+    for resource_name in [
+        "plan",
+        "entity_changes",
+        "dependencies",
+        "flows",
+        "tasks",
+        "assumptions",
+    ] {
+        let Some(resource) = arguments.get(resource_name).and_then(Value::as_object) else {
+            continue;
+        };
+        let mut action_map = serde_json::Map::new();
+        for action_name in ["add", "modify", "remove"] {
+            let count = resource
+                .get(action_name)
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            if count > 0 {
+                action_map.insert(action_name.into(), json!(count));
+            }
+        }
+        if resource_name == "plan" {
+            let count = resource
+                .get("modify")
+                .and_then(Value::as_object)
+                .map_or(0, serde_json::Map::len);
+            if count > 0 {
+                action_map.insert("modify".into(), json!(count));
+            }
+        }
+        if !action_map.is_empty() {
+            resource_map.insert(resource_name.into(), Value::Object(action_map));
+        }
+    }
+    Value::Object(resource_map)
+}
 
 /// Owns one session-scoped JSON-RPC connection to the shared Codex app-server.
 pub struct CodexJsonRpc {
@@ -25,8 +173,14 @@ pub struct CodexJsonRpc {
     next_id: u64,
     workspace: String,
     execution_mode: ExecutionMode,
+    planning_feedback: bool,
+    plan_document: Option<PlanDocument>,
+    control_runtime: Option<ControlToolRuntime>,
+    control_invocation_key_set: HashSet<String>,
     permission_coordinator: Arc<PermissionCoordinator>,
     event_sink: Option<BackendEventSink>,
+    trace: Arc<TraceStore>,
+    session_id: String,
 }
 
 impl CodexJsonRpc {
@@ -37,6 +191,8 @@ impl CodexJsonRpc {
         execution_mode: ExecutionMode,
         permission_coordinator: Arc<PermissionCoordinator>,
         event_sink: Option<BackendEventSink>,
+        trace: Arc<TraceStore>,
+        session_id: String,
     ) -> Result<Self> {
         let (socket, _) = connect_async(endpoint)
             .await
@@ -46,12 +202,18 @@ impl CodexJsonRpc {
             next_id: 1,
             workspace: workspace.to_owned(),
             execution_mode,
+            planning_feedback: false,
+            plan_document: None,
+            control_runtime: None,
+            control_invocation_key_set: HashSet::new(),
             permission_coordinator,
             event_sink,
+            trace,
+            session_id,
         })
     }
 
-    /// Update the session-scoped request context before reusing this app-server process.
+    /// Update request context and reset control-call identity before reusing this process.
     pub fn set_request_context(
         &mut self,
         workspace: &str,
@@ -61,6 +223,15 @@ impl CodexJsonRpc {
         self.workspace = workspace.to_owned();
         self.execution_mode = execution_mode;
         self.event_sink = event_sink;
+        self.control_invocation_key_set.clear();
+        self.control_runtime = None;
+    }
+
+    /// Seed provider-visible control validation from one broker-owned turn snapshot.
+    pub fn set_control_context(&mut self, context: ControlTurnContext) {
+        self.plan_document = context.plan_document.clone();
+        self.planning_feedback = context.planning_feedback;
+        self.control_runtime = Some(ControlToolRuntime::new(context));
     }
 
     /// Send one JSON-RPC notification without allocating a response identifier.
@@ -120,12 +291,40 @@ impl CodexJsonRpc {
                 Message::Frame(_) => {}
             }
         };
+        self.trace.record(
+            &self.session_id,
+            "model.received_raw",
+            Value::String(encoded.clone()),
+        );
         let message: Value = serde_json::from_str(&encoded)
             .with_context(|| format!("decode backend JSON-RPC message: {encoded}"))?;
+        self.trace
+            .record(&self.session_id, "model.received", message.clone());
+        let method = message
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let rejects_question_resolution =
+            rejects_question_resolution(self.planning_feedback, method, &message);
+        let repeats_control_invocation = control_invocation_key(method, &message)
+            .is_some_and(|key| !self.control_invocation_key_set.insert(key));
         if message.get("id").is_some() && message.get("method").is_some() {
             self.respond_to_provider_request(&message).await?;
         }
-        normalize_event_in_workspace(&message, output, self.event_sink.as_ref(), &self.workspace);
+        let completed_control_lifecycle = repeats_control_invocation
+            && control_tool_name(method, message.get("params").unwrap_or(&Value::Null)).is_some()
+            && method.eq_ignore_ascii_case("item/completed");
+        if !rejects_question_resolution
+            && (!repeats_control_invocation || completed_control_lifecycle)
+        {
+            normalize_event_in_workspace(
+                &message,
+                output,
+                self.event_sink.as_ref(),
+                &self.workspace,
+                !repeats_control_invocation,
+            );
+        }
         Ok(message)
     }
 
@@ -156,8 +355,15 @@ impl CodexJsonRpc {
     }
 
     async fn write_message(&mut self, message: &Value) -> Result<()> {
+        let encoded = serde_json::to_string(message)?;
+        self.write_encoded_message(message, encoded).await
+    }
+
+    async fn write_encoded_message(&mut self, message: &Value, encoded: String) -> Result<()> {
+        self.trace
+            .record(&self.session_id, "model.sent", message.clone());
         self.socket
-            .send(Message::Text(serde_json::to_string(message)?.into()))
+            .send(Message::Text(encoded.into()))
             .await
             .context("write shared Codex app-server JSON-RPC request")
     }
@@ -168,7 +374,35 @@ impl CodexJsonRpc {
             .get("method")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let result = self.provider_request_result(method, message).await;
+        let trace_context = DynamicToolTraceContext::from_message(message);
+        if let Some(context) = trace_context.as_ref() {
+            self.trace.record(
+                &self.session_id,
+                "dynamic_tool_started",
+                context.payload(json!({ "phase": "provider_request" })),
+            );
+            self.trace.record(
+                &self.session_id,
+                "dynamic_tool_received",
+                context.payload(
+                    json!({ "handler_queue_ms": context.started_at.elapsed().as_millis() as u64 }),
+                ),
+            );
+        }
+        let result = self
+            .provider_request_result(method, message, trace_context.as_ref())
+            .await;
+        if let (Some(context), Err(error)) = (trace_context.as_ref(), &result) {
+            self.trace.record(
+                &self.session_id,
+                "dynamic_tool_failed",
+                context.payload(json!({
+                    "phase": "provider_request",
+                    "error_category": "internal",
+                    "error": format!("{error:#}"),
+                })),
+            );
+        }
         let response = match result {
             Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
             Err(error) => json!({
@@ -177,10 +411,96 @@ impl CodexJsonRpc {
                 "error": { "code": -32001, "message": format!("{error:#}") }
             }),
         };
-        self.write_message(&response).await
+        let serialization_started_at = Instant::now();
+        let encoded_response = match serde_json::to_string(&response) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                if let Some(context) = trace_context.as_ref() {
+                    self.trace.record(
+                        &self.session_id,
+                        "dynamic_tool_failed",
+                        context.payload(json!({
+                            "phase": "response_serialization",
+                            "error_category": "serialization",
+                            "error": format!("{error:#}"),
+                            "response_serialization_ms": serialization_started_at.elapsed().as_millis() as u64,
+                        })),
+                    );
+                }
+                return Err(error.into());
+            }
+        };
+        let response_serialization_ms = serialization_started_at.elapsed().as_millis() as u64;
+        let response_bytes = encoded_response.len();
+        let response_success = response
+            .pointer("/result/success")
+            .and_then(Value::as_bool)
+            .unwrap_or_else(|| response.get("error").is_none());
+        let response_started_at = Instant::now();
+        let (write_result, response_timed_out) = match tokio::time::timeout(
+            DYNAMIC_TOOL_RESPONSE_TIMEOUT,
+            self.write_encoded_message(&response, encoded_response),
+        )
+        .await
+        {
+            Ok(result) => (result, false),
+            Err(_) => (
+                Err(anyhow::anyhow!(
+                    "dynamic tool response exceeded the 30 second transport deadline"
+                )),
+                true,
+            ),
+        };
+        if let Some(context) = trace_context.as_ref() {
+            if response_timed_out {
+                self.trace.record(
+                    &self.session_id,
+                    "dynamic_tool_timed_out",
+                    context.payload(json!({
+                        "phase": "socket_write",
+                        "response_bytes": response_bytes,
+                        "response_serialization_ms": response_serialization_ms,
+                        "response_write_ms": response_started_at.elapsed().as_millis() as u64,
+                        "timeout_ms": DYNAMIC_TOOL_RESPONSE_TIMEOUT.as_millis() as u64,
+                    })),
+                );
+            } else {
+                match &write_result {
+                    Ok(()) => self.trace.record(
+                        &self.session_id,
+                        "dynamic_tool_responded",
+                        context.payload(json!({
+                            "phase": "socket_write",
+                            "response_bytes": response_bytes,
+                            "response_success": response_success,
+                            "response_serialization_ms": response_serialization_ms,
+                            "response_write_ms": response_started_at.elapsed().as_millis() as u64,
+                        })),
+                    ),
+                    Err(error) => self.trace.record(
+                        &self.session_id,
+                        "dynamic_tool_failed",
+                        context.payload(json!({
+                            "phase": "socket_write",
+                            "error_category": "transport",
+                            "error": format!("{error:#}"),
+                            "response_bytes": response_bytes,
+                            "response_serialization_ms": response_serialization_ms,
+                            "response_write_ms": response_started_at.elapsed().as_millis() as u64,
+                        })),
+                    ),
+                }
+            }
+        }
+        write_result
     }
 
-    async fn provider_request_result(&mut self, method: &str, message: &Value) -> Result<Value> {
+    async fn provider_request_result(
+        &mut self,
+        method: &str,
+        message: &Value,
+        trace_context: Option<&DynamicToolTraceContext>,
+    ) -> Result<Value> {
         match method {
             "item/commandExecution/requestApproval"
             | "item/fileChange/requestApproval"
@@ -197,12 +517,194 @@ impl CodexJsonRpc {
                 let resolution = self.authorize_provider_request(method, message).await?;
                 Ok(codex_response(message, resolution))
             }
-            "item/tool/call" => Ok(json!({
-                "contentItems": [{ "type": "inputText", "text": "Recorded by DiffReview Harness" }],
-                "success": true
-            })),
+            "item/tool/call"
+                if rejects_question_resolution(self.planning_feedback, method, message) =>
+            {
+                Ok(json!({
+                    "contentItems": [{
+                        "type": "inputText",
+                        "text": "Harness already recorded and consumed this planning feedback. Continue with harness_plan_edit, harness_question_ask, or harness_plan_submit."
+                    }],
+                    "success": false
+                }))
+            }
+            "item/tool/call" => {
+                let params = message.get("params").unwrap_or(message);
+                if let Some(invocation) = control_invocation(method, params)? {
+                    let validation_started_at = Instant::now();
+                    let mut decoded_output = BackendOutput::default();
+                    if let Err(error) = apply_invocation(&invocation, &mut decoded_output) {
+                        if let Some(context) = trace_context {
+                            self.trace.record(
+                                &self.session_id,
+                                "dynamic_tool_failed",
+                                context.payload(json!({
+                                    "phase": "argument_validation",
+                                    "error_category": "schema",
+                                    "error": format!("{error:#}"),
+                                    "validation_ms": validation_started_at.elapsed().as_millis() as u64,
+                                })),
+                            );
+                        }
+                        return Ok(json!({
+                            "contentItems": [{
+                                "type": "inputText",
+                                "text": format!(
+                                    "{} received invalid arguments: {error:#}. Use the exact tool schema. Group mutations by resource, then use add, modify, or remove inside that resource. Nested resources follow the same shape. Never use JSON Patch op, path, or value fields.",
+                                    invocation.name
+                                )
+                            }],
+                            "success": false
+                        }));
+                    }
+                    if let Some(context) = trace_context {
+                        self.trace.record(
+                            &self.session_id,
+                            "dynamic_tool_validated",
+                            context.payload(json!({
+                                "phase": "argument_validation",
+                                "validation_ms": validation_started_at.elapsed().as_millis() as u64,
+                            })),
+                        );
+                    }
+                    let execution_started_at = Instant::now();
+                    if let Err(error) = self.execute_control_invocation(&invocation, decoded_output)
+                    {
+                        if let Some(context) = trace_context {
+                            self.trace.record(
+                                &self.session_id,
+                                "dynamic_tool_failed",
+                                context.payload(json!({
+                                    "phase": "semantic_execution",
+                                    "error_category": "semantic",
+                                    "error": format!("{error:#}"),
+                                    "execution_ms": execution_started_at.elapsed().as_millis() as u64,
+                                })),
+                            );
+                        }
+                        return Ok(json!({
+                            "contentItems": [{
+                                "type": "inputText",
+                                "text": format!(
+                                    "{} failed canonical validation: {error:#}. The plan remains editable. Correct the referenced resource and retry harness_plan_submit with the current version.",
+                                    invocation.name
+                                )
+                            }],
+                            "success": false
+                        }));
+                    }
+                    if let Some(context) = trace_context {
+                        self.trace.record(
+                            &self.session_id,
+                            "dynamic_tool_executed",
+                            context.payload(json!({
+                                "phase": "semantic_execution",
+                                "execution_ms": execution_started_at.elapsed().as_millis() as u64,
+                                "resulting_version": self.plan_document.as_ref().map(|document| document.version),
+                            })),
+                        );
+                    }
+                    let response_text = match invocation.name.as_str() {
+                        "harness_plan_edit" => format!(
+                            "Plan edit accepted. The active canonical version is {}.",
+                            self.plan_document
+                                .as_ref()
+                                .map(|document| document.version)
+                                .unwrap_or_default()
+                        ),
+                        "harness_plan_read" => self
+                            .plan_document
+                            .as_ref()
+                            .map(serde_json::to_string_pretty)
+                            .transpose()?
+                            .context("plan read lost its active canonical document")?,
+                        "harness_plan_submit" => format!(
+                            "Plan version {} passed canonical submission validation.",
+                            self.plan_document
+                                .as_ref()
+                                .map(|document| document.version)
+                                .unwrap_or_default()
+                        ),
+                        _ => "Recorded by DiffReview Harness".into(),
+                    };
+                    return Ok(json!({
+                        "contentItems": [{ "type": "inputText", "text": response_text }],
+                        "success": true
+                    }));
+                }
+                Ok(json!({
+                    "contentItems": [{ "type": "inputText", "text": "Recorded by DiffReview Harness" }],
+                    "success": true
+                }))
+            }
             _ => Ok(Value::Null),
         }
+    }
+
+    fn execute_control_invocation(
+        &mut self,
+        invocation: &ControlToolInvocation,
+        mut output: BackendOutput,
+    ) -> Result<()> {
+        if let Some(runtime) = self.control_runtime.as_mut() {
+            let result = runtime.invoke_decoded(invocation.clone(), output)?;
+            if result.invocation.is_none() {
+                return Ok(());
+            }
+            self.plan_document = runtime.plan_document().cloned();
+            return Ok(());
+        }
+        match invocation.name.as_str() {
+            "harness_plan_edit" => {
+                let request = output
+                    .plan_edit
+                    .pop()
+                    .context("plan edit did not produce an edit request")?;
+                let document = self
+                    .plan_document
+                    .as_ref()
+                    .context("plan edit has no active canonical document")?;
+                self.plan_document = Some(apply_plan_edit(document, request)?.document);
+            }
+            "harness_plan_read" => {
+                let requested_plan_id = output
+                    .plan_read
+                    .as_deref()
+                    .context("plan read did not produce a plan id")?;
+                let document = self
+                    .plan_document
+                    .as_ref()
+                    .context("plan read has no active canonical document")?;
+                anyhow::ensure!(
+                    requested_plan_id == document.plan_id,
+                    "requested plan id does not match the active plan"
+                );
+            }
+            "harness_plan_submit" => {
+                let submission = output
+                    .plan_submit
+                    .as_ref()
+                    .context("plan submit did not produce a submission")?;
+                let document = self
+                    .plan_document
+                    .as_ref()
+                    .context("plan submit has no active canonical document")?;
+                anyhow::ensure!(
+                    submission.plan_id == document.plan_id,
+                    "submitted plan id does not match the active plan"
+                );
+                anyhow::ensure!(
+                    submission.expected_version == document.version,
+                    "submitted version {} does not match active version {}",
+                    submission.expected_version,
+                    document.version
+                );
+                document.validate_for_submission()?;
+                render_plan(document)?;
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     async fn authorize_provider_request(
@@ -229,13 +731,29 @@ impl CodexJsonRpc {
     }
 }
 
+fn rejects_question_resolution(planning_feedback: bool, method: &str, value: &Value) -> bool {
+    let params = value.get("params").unwrap_or(value);
+    planning_feedback
+        && matches!(
+            control_tool_name(method, params),
+            Some("harness_question_answer" | "harness_question_withdraw")
+        )
+}
+
+fn control_invocation_key(method: &str, value: &Value) -> Option<String> {
+    let params = value.get("params").unwrap_or(value);
+    let control_name = control_tool_name(method, params)?;
+    let arguments = find_control_arguments(params, control_name)?;
+    Some(format!("{control_name}:{arguments}"))
+}
+
 #[cfg(test)]
 fn normalize_event(
     message: &Value,
     output: &mut BackendOutput,
     event_sink: Option<&BackendEventSink>,
 ) {
-    normalize_event_in_workspace(message, output, event_sink, "");
+    normalize_event_in_workspace(message, output, event_sink, "", true);
 }
 
 fn normalize_event_in_workspace(
@@ -243,6 +761,7 @@ fn normalize_event_in_workspace(
     output: &mut BackendOutput,
     event_sink: Option<&BackendEventSink>,
     workspace: &str,
+    apply_control_invocation: bool,
 ) {
     let method = message
         .get("method")
@@ -343,20 +862,11 @@ fn normalize_event_in_workspace(
         "assistant_message"
     };
 
-    if tool_event
-        && let Some(control_tool) = control_tool
-        && let Some(arguments) = find_control_arguments(&params, control_tool)
-        && let Err(error) = apply_invocation(
-            &ControlToolInvocation {
-                name: control_tool.to_owned(),
-                arguments,
-            },
-            output,
-        )
+    if apply_control_invocation
+        && tool_event
+        && let Ok(Some(invocation)) = control_invocation(method, &params)
     {
-        output.control_error = Some(format!(
-            "{control_tool} received invalid arguments: {error:#}"
-        ));
+        let _ = apply_invocation(&invocation, output);
     }
     if method_lower.contains("goal")
         && params
@@ -366,9 +876,6 @@ fn normalize_event_in_workspace(
             .is_some_and(|status| status.eq_ignore_ascii_case("complete"))
     {
         output.evidence.native_complete = true;
-    }
-    if control_tool.is_some() {
-        return;
     }
     let user_message_item = params
         .pointer("/item/type")
@@ -380,6 +887,9 @@ fn normalize_event_in_workspace(
         let activity = tool_event
             .then(|| normalize_tool_activity(method, &params, workspace))
             .flatten();
+        if control_tool.is_some() && activity.is_none() {
+            return;
+        }
         if activity.as_ref().is_some_and(successful_file_change) {
             output.evidence.workspace_changed = true;
         }
@@ -671,13 +1181,12 @@ fn control_tool_name<'value>(method: &str, value: &'value Value) -> Option<&'val
         .filter(|name| {
             matches!(
                 *name,
-                "harness_plan_create"
-                    | "harness_plan_edit"
+                "harness_plan_edit"
                     | "harness_plan_read"
                     | "harness_plan_submit"
                     | "harness_plan_deviation"
                     | "harness_plan_task_report"
-                    | "harness_plan_question"
+                    | "harness_question_ask"
                     | "harness_question_answer"
                     | "harness_question_withdraw"
                     | "harness_goal_complete"
@@ -711,6 +1220,18 @@ fn find_control_arguments(value: &Value, control_name: &str) -> Option<Value> {
             .find_map(|item| find_control_arguments(item, control_name)),
         _ => None,
     }
+}
+
+fn control_invocation(method: &str, value: &Value) -> Result<Option<ControlToolInvocation>> {
+    let Some(control_name) = control_tool_name(method, value) else {
+        return Ok(None);
+    };
+    let arguments = find_control_arguments(value, control_name)
+        .with_context(|| format!("{control_name} omitted its arguments object"))?;
+    Ok(Some(ControlToolInvocation {
+        name: control_name.to_owned(),
+        arguments,
+    }))
 }
 
 fn append_output_event(output: &mut BackendOutput, event: BackendEvent) {
@@ -930,22 +1451,28 @@ fn normalize_tool_activity(method: &str, params: &Value, workspace: &str) -> Opt
             ToolActivityKind::FileChange => "file changes".into(),
             ToolActivityKind::ToolCall => "tool".into(),
         });
-    let output = mcp_tool_output(item).or_else(|| {
-        item.get("aggregatedOutput")
-            .or_else(|| item.get("aggregated_output"))
-            .or_else(|| item.get("output"))
-            .or_else(|| envelope.get("output"))
-            .or_else(|| envelope.get("delta"))
-            .or_else(|| envelope.get("message"))
-            .and_then(Value::as_str)
-            .map(strip_ansi_escapes::strip_str)
-            .or_else(|| {
-                envelope
-                    .get("content")
-                    .and_then(first_text)
-                    .map(strip_ansi_escapes::strip_str)
-            })
-    });
+    let output = mcp_tool_output(item)
+        .or_else(|| {
+            item.get("contentItems")
+                .and_then(first_text)
+                .map(strip_ansi_escapes::strip_str)
+        })
+        .or_else(|| {
+            item.get("aggregatedOutput")
+                .or_else(|| item.get("aggregated_output"))
+                .or_else(|| item.get("output"))
+                .or_else(|| envelope.get("output"))
+                .or_else(|| envelope.get("delta"))
+                .or_else(|| envelope.get("message"))
+                .and_then(Value::as_str)
+                .map(strip_ansi_escapes::strip_str)
+                .or_else(|| {
+                    envelope
+                        .get("content")
+                        .and_then(first_text)
+                        .map(strip_ansi_escapes::strip_str)
+                })
+        });
     let status = item
         .get("status")
         .or_else(|| envelope.get("status"))
@@ -1240,7 +1767,7 @@ mod test {
                 "params": {
                     "item": {
                         "type": "dynamicToolCall",
-                        "tool": "harness_plan_question",
+                        "tool": "harness_question_ask",
                         "arguments": {
                             "questions": [{
                                 "header": "Migration",
@@ -1249,7 +1776,7 @@ mod test {
                                     { "label": "Staged", "description": "Support both formats temporarily." },
                                     { "label": "Immediate", "description": "Remove the old format now." }
                                 ],
-                                "allowFreeform": true
+                        "allow_freeform": true
                             }]
                         }
                     }
@@ -1327,7 +1854,7 @@ mod test {
             &mut output,
             None,
         );
-        assert!(output.plan_document.is_none());
+        assert!(output.plan_edit.is_empty());
         assert_eq!(output.event.len(), 1);
         let update = output.event[0].task_update.as_ref().unwrap();
         assert!(update.complete);
@@ -1357,7 +1884,10 @@ mod test {
         normalize_event(
             &json!({
                 "method": "item/tool/call",
-                "params": { "name": "harness_goal_complete", "arguments": {} }
+                "params": {
+                    "name": "harness_goal_complete",
+                    "arguments": { "summary": "Complete" }
+                }
             }),
             &mut output,
             Some(&event_sink),
@@ -1365,6 +1895,198 @@ mod test {
         assert!(output.evidence.structured_complete);
         assert!(output.event.is_empty());
         assert!(event_stream.is_empty());
+    }
+
+    #[test]
+    fn correlates_dynamic_tool_trace_metadata_without_copying_arguments() {
+        let message = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "callId": "call-1",
+                "tool": "harness_plan_edit",
+                "arguments": {
+                    "plan_id": "plan-1",
+                    "expected_version": 3,
+                    "plan": {
+                        "modify": {
+                            "overview": "Updated overview",
+                            "usage": null
+                        }
+                    }
+                }
+            }
+        });
+
+        let context = DynamicToolTraceContext::from_message(&message).unwrap();
+        let payload = context.payload(json!({ "phase": "argument_validation" }));
+
+        assert_eq!(context.invocation_id, "call-1");
+        assert_eq!(context.mutation_count, 2);
+        assert_eq!(context.mutation_summary["plan"]["modify"], 2);
+        assert_eq!(context.plan_id.as_deref(), Some("plan-1"));
+        assert_eq!(context.expected_version, Some(3));
+        assert_eq!(payload["thread_id"], "thread-1");
+        assert_eq!(payload["turn_id"], "turn-1");
+        assert_eq!(payload["phase"], "argument_validation");
+        assert!(payload.get("arguments").is_none());
+        assert!(context.argument_bytes > 0);
+    }
+
+    #[test]
+    fn falls_back_to_the_json_rpc_id_for_dynamic_tool_trace_correlation() {
+        let message = json!({
+            "jsonrpc": "2.0",
+            "id": "request-7",
+            "method": "item/tool/call",
+            "params": {
+                "name": "harness_plan_submit",
+                "arguments": {
+                    "plan_id": "plan-1",
+                    "expected_version": 4
+                }
+            }
+        });
+
+        let context = DynamicToolTraceContext::from_message(&message).unwrap();
+
+        assert_eq!(context.invocation_id, "rpc-request-7");
+        assert_eq!(context.request_id, "request-7");
+    }
+
+    #[test]
+    fn renders_completed_control_calls_without_reapplying_their_semantic_effect() {
+        let mut output = BackendOutput::default();
+        let completed = json!({
+            "method": "item/completed",
+            "params": { "item": {
+                "id": "plan-edit-1",
+                "type": "dynamicToolCall",
+                "tool": "harness_plan_edit",
+                "status": "completed",
+                "success": true,
+                "contentItems": [{ "type": "inputText", "text": "Plan edit accepted." }],
+                "arguments": {
+                    "plan_id": "plan-1",
+                    "expected_version": 1,
+                    "plan": { "modify": { "overview": "Updated overview" } }
+                }
+            } }
+        });
+
+        normalize_event_in_workspace(&completed, &mut output, None, "", false);
+
+        assert!(output.plan_edit.is_empty());
+        let activity = output.event[0]
+            .activity
+            .as_ref()
+            .expect("control tool activity");
+        assert_eq!(activity.id, "plan-edit-1");
+        assert_eq!(activity.title, "harness_plan_edit");
+        assert_eq!(activity.status.as_deref(), Some("completed"));
+        assert_eq!(activity.output.as_deref(), Some("Plan edit accepted."));
+    }
+
+    #[test]
+    fn gives_replayed_control_lifecycle_and_request_messages_one_identity() {
+        let arguments = json!({
+            "plan_id": "plan-id",
+            "expected_version": 1,
+            "plan": { "modify": { "overview": "Updated overview" } }
+        });
+        let completed = json!({
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "id": "dynamic-tool-1",
+                    "type": "dynamicToolCall",
+                    "tool": "harness_plan_edit",
+                    "arguments": arguments
+                }
+            }
+        });
+        let request = json!({
+            "method": "item/tool/call",
+            "params": {
+                "name": "harness_plan_edit",
+                "arguments": arguments
+            }
+        });
+
+        assert_eq!(
+            control_invocation_key("item/completed", &completed),
+            control_invocation_key("item/tool/call", &request)
+        );
+        assert!(
+            control_invocation_key(
+                "item/started",
+                &json!({
+                    "method": "item/started",
+                    "params": {
+                        "item": {
+                            "type": "dynamicToolCall",
+                            "tool": "harness_plan_edit"
+                        }
+                    }
+                })
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn rejects_question_resolution_only_after_planning_feedback_is_consumed() {
+        let answer = json!({
+            "method": "item/tool/call",
+            "params": {
+                "name": "harness_question_answer",
+                "arguments": {
+                    "question_id": "reader_mode",
+                    "option_id": "preview_cli"
+                }
+            }
+        });
+        let withdraw = json!({
+            "method": "item/tool/call",
+            "params": {
+                "name": "harness_question_withdraw",
+                "arguments": {
+                    "question_id": "reader_mode"
+                }
+            }
+        });
+        let plan_edit = json!({
+            "method": "item/tool/call",
+            "params": {
+                "name": "harness_plan_edit",
+                "arguments": {}
+            }
+        });
+
+        assert!(rejects_question_resolution(true, "item/tool/call", &answer));
+        assert!(rejects_question_resolution(
+            true,
+            "item/tool/call",
+            &withdraw
+        ));
+        assert!(!rejects_question_resolution(
+            false,
+            "item/tool/call",
+            &answer
+        ));
+        assert!(!rejects_question_resolution(
+            true,
+            "item/tool/call",
+            &plan_edit
+        ));
+        assert!(!rejects_question_resolution(
+            true,
+            "item/tool/result",
+            &answer
+        ));
     }
 
     #[test]
@@ -1710,6 +2432,7 @@ mod test {
             &mut output,
             None,
             "C:\\workspace",
+            true,
         );
 
         let change = &output.event[0].activity.as_ref().unwrap().change.file[0];

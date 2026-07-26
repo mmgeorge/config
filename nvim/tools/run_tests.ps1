@@ -26,18 +26,24 @@ function Invoke-Nvim {
   # orphan. ProcessStartInfo.ArgumentList quotes each arg correctly (spaces/=) like native splatting.
   $psi = [System.Diagnostics.ProcessStartInfo]::new()
   $psi.FileName = "nvim"
+  $psi.WorkingDirectory = $repo
   foreach ($a in ($common + $ExtraArgs)) { [void]$psi.ArgumentList.Add($a) }
   $psi.RedirectStandardError = $true
   $psi.RedirectStandardOutput = $true
   $psi.UseShellExecute = $false
   $proc = [System.Diagnostics.Process]::Start($psi)
   $errTask = $proc.StandardError.ReadToEndAsync()
-  [void]$proc.StandardOutput.ReadToEndAsync()  # drain stdout to avoid pipe-buffer deadlock
+  $outTask = $proc.StandardOutput.ReadToEndAsync()
   if ($proc.WaitForExit($TimeoutSec * 1000)) {
+    $proc.WaitForExit()
     $code = $proc.ExitCode
     $err = $errTask.Result
+    [void]$outTask.Result
   } else {
     try { $proc.Kill($true) } catch {}
+    $proc.WaitForExit()
+    [void]$errTask.Result
+    [void]$outTask.Result
     $code = 124
     $err = "TIMEOUT after ${TimeoutSec}s"
   }

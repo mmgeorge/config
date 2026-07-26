@@ -12,15 +12,14 @@ local queue_renderer = require("diff_review.render.harness.queue")
 local render_transaction = require("diff_review.render.harness.transaction")
 local layout = require("diff_review.views.harness.layout")
 local session = require("diff_review.session")
-local interaction_state = require("diff_review.views.harness.interaction_state")
 local prompt_history = require("diff_review.views.harness.prompt_history")
 local provider_picker = require("diff_review.views.harness.provider_picker")
 local context_status = require("diff_review.views.harness.context_status")
-local main_timeline = require("diff_review.views.harness.timeline")
 local model_picker = require("diff_review.views.harness.model_picker")
 local snapshot = require("diff_review.views.harness.snapshot")
 local picker = require("diff_review.views.picker")
 local timeline_status = require("diff_review.views.harness.timeline_status")
+local timeline_cache = require("diff_review.views.harness.timeline_cache")
 local question_presentation = require("diff_review.views.harness.question_presentation")
 local session_navigation = require("diff_review.views.harness.session_navigation")
 
@@ -37,26 +36,16 @@ local function harness_state() return session.harness end
 ---@param message string
 ---@param severity? "status"|"error"
 local function append_session_status(message, severity)
-  local state = harness_state()
-  local previous_entry = state.timeline[#state.timeline]
-  local entry = {
-    kind = "session_event",
-    id = "local-session-event-" .. tostring(vim.uv.hrtime()),
-    created_at_ms = os.time() * 1000,
-    event = { message = message, severity = severity or "status" },
-    local_session_id = state.session and state.session.id,
-    local_after_id = previous_entry and previous_entry.id,
-  }
-  state.local_session_event = state.local_session_event or {}
-  state.local_session_event[#state.local_session_event + 1] = entry
-  state.timeline[#state.timeline + 1] = entry
-  M.render()
+  if severity == "error" then
+    notifications.error(message, "Harness")
+  else
+    notifications.info(message, "Harness")
+  end
 end
 
 ---@param message string
 local function report_configuration_error(message)
   append_session_status("Configuration rejected: " .. message, "error")
-  notifications.error(message, "Harness")
 end
 
 local function picker_host(state)
@@ -101,30 +90,33 @@ local function selected_agent_run(state)
   return nil
 end
 
-local function selected_agent_timeline(state)
-  if not state.selected_agent_run_id then return nil end
-  local timeline = {}
-  for _, turn in ipairs((state.agent and state.agent.turn) or {}) do
-    if turn.agent_run_id == state.selected_agent_run_id then
-      timeline[#timeline + 1] = { kind = "interaction", interaction = turn.interaction }
+---@param state table
+---@return string?
+local function goal_status_text(state)
+  local execution = state.goal_execution
+  if execution and execution.created_at_ms then
+    local terminal_at_ms = execution.state == "complete" and execution.completed_at_ms or nil
+    local elapsed_ms = math.max(0, (terminal_at_ms or (os.time() * 1000)) - execution.created_at_ms)
+    local elapsed_seconds = math.floor(elapsed_ms / 1000)
+    if execution.state == "complete" then return (" • Plan complete (%d s)"):format(elapsed_seconds) end
+    if execution.state ~= "active" then return nil end
+    local task_list = execution.scheduler and execution.scheduler.task or {}
+    for task_index, task in ipairs(task_list) do
+      if task.state == "active" then
+        return (" • Plan active (Task %d/%d, %d s)"):format(task_index, #task_list, elapsed_seconds)
+      end
     end
+    return nil
   end
-  local live = (state.agent_live or {})[state.selected_agent_run_id]
-  if live and live.interaction then
-    local interaction = vim.deepcopy(live.interaction)
-    interaction.active = vim.deepcopy(live.active)
-    timeline[#timeline + 1] = { kind = "interaction", interaction = interaction }
-  end
-  return timeline
-end
 
-local function discard_terminal_agent_live_state(state)
-  state.agent_live = state.agent_live or {}
-  for _, run in ipairs((state.agent and state.agent.run) or {}) do
-    if run.status == "completed" or run.status == "failed" or run.status == "interrupted" or run.status == "closed" then
-      state.agent_live[run.id] = nil
-    end
-  end
+  local goal = state.goal
+  if not goal or not goal.created_at_ms then return nil end
+  local terminal_at_ms = goal.state == "complete" and goal.updated_at_ms or nil
+  local elapsed_ms = math.max(0, (terminal_at_ms or (os.time() * 1000)) - goal.created_at_ms)
+  local elapsed_seconds = math.floor(elapsed_ms / 1000)
+  if goal.state == "active" then return (" • Goal active (%d s)"):format(elapsed_seconds) end
+  if goal.state == "complete" then return (" • Goal complete (%d s)"):format(elapsed_seconds) end
+  return nil
 end
 
 local function render_queue()
@@ -206,11 +198,7 @@ local function status_text()
     or state.mode_restart_requested and " • restarting"
     or state.busy and " • running"
     or (#state.queue > 0 and (" • queued " .. #state.queue) or "")
-  local goal = nil
-  if state.goal and state.goal.objective and state.goal.state ~= "cleared" then
-    local goal_state = state.goal.state and state.goal.state ~= "active" and (" [" .. state.goal.state .. "]") or ""
-    goal = " • Goal: " .. state.goal.objective .. goal_state
-  end
+  local goal = goal_status_text(state)
   local fast = active_session.fast_mode and " fast" or ""
   local segment_list = {
     {
@@ -297,9 +285,10 @@ function M.render(reset)
       follow_tail = active_win ~= transcript_win or vim.api.nvim_win_get_cursor(transcript_win)[1] >= previous_last_line
     end)
   end
-  local agent_timeline = selected_agent_timeline(state)
-  local timeline = agent_timeline or main_timeline.project(state)
+  local agent_timeline = timeline_cache.selected_agent_history(state)
+  local timeline = agent_timeline or timeline_cache.history(state)
   local status = agent_timeline and nil or timeline_status.resolve(state)
+  timeline_status.record(state, status)
   local render = renderer.build(timeline, {
     working_seconds = working_seconds(),
     content_width = transcript_visible and vim.api.nvim_win_get_width(transcript_win) or nil,
@@ -411,24 +400,7 @@ local function synchronize_state(callback)
       return
     end
     local state = harness_state()
-    local next_session_id = result.session and result.session.id
-    local local_session_event = vim.tbl_filter(function(entry)
-      return entry.local_session_id == next_session_id
-    end, state.local_session_event or {})
     snapshot.apply(state, result)
-    state.local_session_event = local_session_event
-    for _, entry in ipairs(local_session_event) do
-      local insertion_index = #state.timeline + 1
-      if entry.local_after_id then
-        for index, candidate in ipairs(state.timeline) do
-          if candidate.id == entry.local_after_id then
-            insertion_index = index + 1
-            break
-          end
-        end
-      end
-      table.insert(state.timeline, insertion_index, vim.deepcopy(entry))
-    end
     M.attach_transcript(state.transcript_buf)
     require("diff_review.views.harness.agent_picker").refresh()
     reconcile_approval_presentation(state)
@@ -444,18 +416,6 @@ local function synchronize_state(callback)
     M.render()
     if callback then callback(result) end
   end)
-end
-
----@param state table
----@param entry table
-local function upsert_timeline_entry(state, entry)
-  for index, previous in ipairs(state.timeline or {}) do
-    if previous.id == entry.id then
-      state.timeline[index] = entry
-      return
-    end
-  end
-  state.timeline[#state.timeline + 1] = entry
 end
 
 ---@param event string
@@ -483,7 +443,23 @@ end
 
 local function on_event(event, payload)
   local state = harness_state()
-  if event == "backend_event" then
+  if event == "timeline_patch" then
+    local applied, patch_error = timeline_cache.apply(state, payload)
+    if not applied then
+      notifications.error(patch_error or "Timeline patch failed", "Harness")
+      synchronize_state()
+      return
+    end
+    if state.status.kind ~= "awaiting_input" and state.plan_question_open then
+      require("diff_review.views.harness.plan_question").close()
+      state.plan_question_open = false
+    end
+    if state.status.kind == "awaiting_plan_review" then
+      state.active_elicitation = nil
+      question_presentation.reset(state)
+    end
+    schedule_render()
+  elseif event == "backend_event" then
     if payload.kind == "approval_requested" then
       local request = payload.data or payload
       state.approval = state.approval or {}
@@ -500,21 +476,12 @@ local function on_event(event, payload)
       if #state.approval > 0 then vim.schedule(M.present_approval) end
     elseif payload.kind == "agent_updated" then
       state.agent = vim.deepcopy(payload.data or payload)
-      discard_terminal_agent_live_state(state)
       require("diff_review.views.harness.agent_picker").refresh()
-      schedule_render()
-    elseif payload.kind == "agent_timeline_updated" then
-      local update = payload.data or payload
-      state.agent_live = state.agent_live or {}
-      state.agent_live[update.run_id] = update
-      require("diff_review.views.harness.agent_picker").refresh()
-      schedule_render()
     elseif payload.kind == "context_usage" then
       if state.session then state.session.context_usage = payload.data or payload end
       M.refresh_winbar()
     elseif payload.kind == "timeline_node_updated" then
       local update = payload.data or payload
-      interaction_state.apply_node(state, update)
       local acknowledged = update.node and update.node.prompt
       for index, pending in ipairs(state.pending_steer or {}) do
         if acknowledged and pending.text == acknowledged.text then
@@ -523,29 +490,6 @@ local function on_event(event, payload)
         end
       end
       M.refresh_winbar()
-      schedule_render()
-    elseif payload.kind == "timeline_wait_updated" then
-      interaction_state.apply_wait(state, payload.data or payload)
-      schedule_render()
-    elseif payload.kind == "timeline_task_updated" then
-      interaction_state.apply_task(state, payload.data or payload)
-      schedule_render()
-    elseif payload.kind == "timeline_interaction_retracted" then
-      interaction_state.retract(state, payload.data or payload)
-      M.render()
-    elseif payload.kind == "timeline_interaction_started" then
-      interaction_state.start_interaction(state, payload.data or payload)
-      schedule_render()
-    elseif payload.kind == "timeline_interaction_cancelled" then
-      interaction_state.complete_interaction(state, payload.data or payload)
-      schedule_render()
-    elseif payload.kind == "timeline_plan_lifecycle" then
-      local entry = vim.deepcopy(payload.data or payload)
-      upsert_timeline_entry(state, entry)
-      schedule_render()
-    elseif payload.kind == "timeline_session_event" then
-      upsert_timeline_entry(state, vim.deepcopy(payload.data or payload))
-      M.render()
     elseif payload.kind == "error" and type(payload.text) == "string" then
       notifications.warn(payload.text, "Harness")
     end
@@ -582,6 +526,8 @@ local function on_event(event, payload)
     state.active_plan = payload.plan or state.active_plan
     M.refresh_winbar()
   elseif event == "plan_created" or event == "plan_revision_created" or event == "plan_changes_requested"
+    or event == "plan_acceptance_started" or event == "plan_acceptance_updated"
+    or event == "plan_acceptance_cancelled"
     or event == "plan_question_answered" or event == "plan_question_withdrawn"
     or event == "plan_accepted" or event == "plan_cancelled"
     or event == "plan_activated"
@@ -596,7 +542,11 @@ local function on_event(event, payload)
     synchronize_state()
   elseif event == "goal_changed" or event == "goal_continue_requested" then
     state.goal = payload.state == "cleared" and nil or payload
-    M.refresh_winbar()
+    if state.goal_execution then
+      synchronize_state()
+    else
+      M.refresh_winbar()
+    end
     if event == "goal_continue_requested" then vim.schedule(M.drain) end
   elseif event == "context_compacted" then
     synchronize_state()
@@ -612,9 +562,9 @@ local function on_event(event, payload)
   then
     local next_session = payload.session or payload
     if event == "session_changed" and state.session and next_session.id ~= state.session.id then
-      interaction_state.replace(state, payload.interaction or {})
       state.queue = {}
       state.goal = nil
+      state.goal_execution = nil
       state.active_plan = nil
       state.active_elicitation = nil
       state.active_wait = nil
@@ -636,7 +586,6 @@ local function on_event(event, payload)
     require("diff_review.views.harness.agent_picker").refresh()
     schedule_render()
   elseif event == "interaction_complete" or event == "interaction_updated" then
-    interaction_state.complete_interaction(state, payload.interaction or payload)
     synchronize_state()
   elseif event == "state_invalidated" then
     synchronize_state()
@@ -685,6 +634,7 @@ function M.present_plan_question(force)
   local state = harness_state()
   local elicitation = state.active_elicitation and state.active_elicitation.elicitation
   if state.busy or state.plan_question_open or not elicitation then return end
+  local owner = state.active_elicitation.owner
   if not force and not question_presentation.should_present(state) then return end
   question_presentation.mark_presented(state)
   state.plan_question_open = true
@@ -692,6 +642,7 @@ function M.present_plan_question(force)
     transcript_win = state.transcript_win,
     window_list = picker_host(state).window_list,
     control_win = picker_host(state).control_win,
+    allow_ask = owner ~= "plan_acceptance",
     answer = function(params, callback)
       client.request("question.answer", params, function(result, request_error)
         if request_error then
@@ -735,7 +686,7 @@ function M.present_plan_question(force)
         set_busy(false)
         if request_error then
           notifications.error(request_error, "Planning continuation")
-          synchronize_state(function() vim.schedule(function() M.present_plan_question(true) end) end)
+          synchronize_state()
           return
         end
         synchronize_state()
@@ -743,6 +694,20 @@ function M.present_plan_question(force)
     end,
     closed = function()
       state.plan_question_open = false
+      if owner == "plan_acceptance" then
+        client.request("plan.acceptance.cancel", {}, function(result, request_error)
+          if request_error then
+            notifications.error(request_error, "Plan acceptance")
+            synchronize_state()
+            return
+          end
+          state.active_plan = result.active_plan or state.active_plan
+          state.active_elicitation = result.active_elicitation
+          M.render()
+          M.refresh_winbar()
+        end)
+        return
+      end
       local reopen_key = keymaps.view_keys_for("harness", "reopen_question")[1]
       local reopen_action = reopen_key and (reopen_key .. " or /questions") or "/questions"
       notifications.info(("Harness questions remain available with %s."):format(reopen_action), "Harness")
@@ -794,7 +759,6 @@ local function resume_mode_restart(mode)
       if result then
         state.session = result.session or (result.id and result) or state.session
         state.capability = result.capability or state.capability
-        if result.interaction then interaction_state.complete_interaction(state, result.interaction) end
       end
       synchronize_state()
       vim.schedule(M.drain)
@@ -828,7 +792,6 @@ local function maybe_resume_mcp_restart()
     if result then
       state.session = result.session or (result.id and result) or state.session
       state.capability = result.capability or state.capability
-      if result.interaction then interaction_state.complete_interaction(state, result.interaction) end
     end
     synchronize_state()
     vim.schedule(M.drain)
@@ -840,7 +803,6 @@ begin_request = function(text)
   local state = harness_state()
   local selected_run = selected_agent_run(state)
   state.cancel_requested = false
-  if not selected_run then interaction_state.begin(state, text) end
   set_busy(true)
   local goal_objective = text:match("^/goal%s+(.+)$")
   if goal_objective and goal_objective ~= "pause" and goal_objective ~= "resume" and goal_objective ~= "clear" then
@@ -873,14 +835,12 @@ begin_request = function(text)
         vim.schedule(M.drain)
         return
       end
-      if not selected_run then interaction_state.fail_pending(state, request_error) end
       notifications.error(request_error, "Harness")
       M.render()
       return
     elseif result then
       state.session = result.session or (result.id and result) or state.session
       state.capability = result.capability or state.capability
-      if result.interaction then interaction_state.complete_interaction(state, result.interaction) end
     end
     synchronize_state()
     vim.schedule(M.drain)

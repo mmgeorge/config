@@ -153,7 +153,7 @@ async fn cycles_explicit_modes_without_changing_mode_during_plan_control() {
         .dispatch(BrokerRequest {
             id: 14,
             method: "plan.accept".into(),
-            params: json!({}),
+            params: json!({ "execution_mode": "write" }),
         })
         .await;
     assert!(accepted.response.error.is_none());

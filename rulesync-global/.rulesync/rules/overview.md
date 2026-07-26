@@ -1,7 +1,9 @@
 ---
 root: true
 targets:
-  - '*'
+  - antigravity-cli
+  - claudecode
+  - copilotcli
 globs:
   - '**/*'
 ---

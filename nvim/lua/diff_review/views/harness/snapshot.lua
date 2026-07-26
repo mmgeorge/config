@@ -1,12 +1,11 @@
 local HarnessSnapshot = {}
 
-local interaction_state = require("diff_review.views.harness.interaction_state")
+local timeline_cache = require("diff_review.views.harness.timeline_cache")
 local prompt_history = require("diff_review.views.harness.prompt_history")
 
 ---@param state table
 ---@param result table
----@param interaction_mode? "replace"|"reconcile"
-function HarnessSnapshot.apply(state, result, interaction_mode)
+function HarnessSnapshot.apply(state, result)
   local previous_session_id = state.session and state.session.id or nil
   local previous_context_usage = state.session and state.session.context_usage or nil
   state.session = result.session
@@ -17,21 +16,16 @@ function HarnessSnapshot.apply(state, result, interaction_mode)
   end
   if previous_session_id ~= (result.session and result.session.id or nil) then state.activity_expanded = {} end
   state.capability = result.capability or {}
-  if interaction_mode == "reconcile" then
-    interaction_state.reconcile_snapshot(state, result.interaction or {})
-  else
-    interaction_state.replace(state, result.interaction or {})
-  end
-  state.timeline = vim.deepcopy(result.timeline or {})
+  timeline_cache.replace(state, result.timeline or {}, result.timeline_revision or 0)
   state.artifact = vim.deepcopy(result.artifact or {})
   state.no_checkpoint = result.no_checkpoint == true
   state.goal = result.goal
+  state.goal_execution = result.goal_execution
   state.active_plan = result.active_plan
   state.active_elicitation = result.active_elicitation
   state.active_wait = vim.deepcopy(result.active_wait)
   state.approval = vim.deepcopy(result.approval or {})
   state.agent = vim.deepcopy(result.agent or { definition = {}, run = {}, turn = {} })
-  state.agent_live = {}
   if state.selected_agent_run_id then
     local selected_exists = vim.iter(state.agent.run or {}):any(function(run)
       return run.id == state.selected_agent_run_id

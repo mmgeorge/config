@@ -11,4 +11,5 @@ pub mod protocol;
 pub mod session;
 pub mod storage;
 pub mod timeline;
+pub mod trace;
 pub mod workspace;

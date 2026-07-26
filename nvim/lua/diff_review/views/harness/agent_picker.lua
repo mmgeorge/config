@@ -4,6 +4,7 @@ local agent_catalog = require("diff_review.views.harness.agent_catalog")
 local agent_summary = require("diff_review.render.harness.agent_summary")
 local config = require("diff_review.infra.config")
 local picker = require("diff_review.views.picker")
+local timeline_cache = require("diff_review.views.harness.timeline_cache")
 
 local active = nil
 
@@ -35,7 +36,7 @@ local function option_list(state, selected_run_id)
         label = agent_summary.label(run),
         detail = agent_summary.status_detail(
           run,
-          agent_catalog.interaction_list(state.agent, state.agent_live, run.id),
+          timeline_cache.agent_interaction_list(state, run.id),
           now_ms
         ),
         section = group.title,

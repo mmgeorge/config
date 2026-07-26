@@ -42,9 +42,12 @@ local ok, failure = pcall(function()
   local spawn_picker = require("diff_review.views.harness.spawn_picker")
   local agent_catalog = require("diff_review.views.harness.agent_catalog")
   local selected_run_id = nil
+  local zeta_interaction = thought_with_tool({
+    { id = "ok", status = "completed", output = "done" },
+    { id = "failed", status = "failed", output = "denied" },
+  })
   local state = {
     selected_agent_run_id = "run-zeta",
-    agent_live = {},
     agent = {
       run = {
         {
@@ -72,10 +75,34 @@ local ok, failure = pcall(function()
       turn = {
         {
           agent_run_id = "run-zeta",
-          interaction = thought_with_tool({
-            { id = "ok", status = "completed", output = "done" },
-            { id = "failed", status = "failed", output = "denied" },
-          }),
+          interaction = zeta_interaction,
+        },
+      },
+    },
+    timeline = {
+      {
+        kind = "interaction",
+        id = "parent",
+        interaction = { id = "parent" },
+        agent_by_id = {
+          ["run-zeta"] = {
+            kind = "agent_lifecycle",
+            run = { id = "run-zeta" },
+            interaction = { zeta_interaction },
+            agent = {},
+          },
+          ["run-done"] = {
+            kind = "agent_lifecycle",
+            run = { id = "run-done" },
+            interaction = {},
+            agent = {},
+          },
+          ["run-alpha"] = {
+            kind = "agent_lifecycle",
+            run = { id = "run-alpha" },
+            interaction = {},
+            agent = {},
+          },
         },
       },
     },

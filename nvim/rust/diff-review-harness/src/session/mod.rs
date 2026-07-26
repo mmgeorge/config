@@ -1,5 +1,8 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+
+pub mod continuation;
+pub mod state_machine;
 use std::collections::BTreeMap;
 
 /// Defines the execution boundary selected for one Harness session.

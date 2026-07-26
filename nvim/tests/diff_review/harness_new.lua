@@ -73,6 +73,8 @@ local function fake_launcher(_, options, _)
       else
         emit(options, { id = request.id, result = snapshot(request.params.name) })
       end
+    elseif request.method == "plan.scope_deviation_review" then
+      emit(options, { id = request.id, result = { policy = request.params.policy } })
     elseif request.method == "shutdown" then
       emit(options, { id = request.id, result = { shutdown = true } })
     else

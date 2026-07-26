@@ -2,8 +2,10 @@ local M = {}
 
 local display_text = require("diff_review.render.display_text")
 
+local comment_box = require("diff_review.render.comment_box")
 local diff_tree = require("diff_review.render.diff_tree")
 local plan_event = require("diff_review.render.harness.plan_event")
+local plan_execution = require("diff_review.render.harness.plan_execution")
 local plan_resolution = require("diff_review.render.harness.plan_resolution")
 local timeline_status = require("diff_review.render.harness.timeline_status")
 
@@ -99,6 +101,9 @@ end
 local function append_response(result, text, first_prefix, first_prefix_group)
   local line_list = vim.split(markdown_text.normalize_math(tostring(text or "")), "\n", { plain = true })
   if #line_list == 0 then line_list = { "" } end
+  while #line_list > 1 and line_list[#line_list]:match("^%s*$") do
+    table.remove(line_list)
+  end
   local indentation = string.rep(" ", vim.fn.strdisplaywidth(first_prefix or "  "))
   for line_index, line in ipairs(line_list) do
     local first_line = line_index == 1
@@ -200,6 +205,27 @@ local function append_tool(result, tool, thought_key, tool_index, content_width)
   end
 end
 
+local function active_tool_output_lines(output, content_width)
+  local output_line_list = tool_render.output_lines(output)
+  local preview_line_list = {}
+  local maximum_line_count = 4
+
+  for _, output_line in ipairs(output_line_list) do
+    local remainder = output_line
+    repeat
+      local prefix = #preview_line_list == 0 and "    └ " or "      "
+      local available_width = math.max(1, (content_width or math.huge) - vim.fn.strdisplaywidth(prefix))
+      local split = display_text.take_prefix(remainder, available_width)
+      preview_line_list[#preview_line_list + 1] = prefix .. split.prefix
+      remainder = split.remainder
+    until remainder == "" or #preview_line_list == maximum_line_count
+
+    if #preview_line_list == maximum_line_count then break end
+  end
+
+  return preview_line_list
+end
+
 local function append_active_tool_preview(result, tool, content_width)
   local first = #result.lines + 1
   local heading_line_list = tool_render.heading_lines(tool, content_width, "  ")
@@ -223,9 +249,8 @@ local function append_active_tool_preview(result, tool, content_width)
     tool_render.highlight_tool_call_lines(result, tool, heading_line_list)
   end
 
-  local output_line_list = tool_render.output_lines(tool.output)
-  for output_index = 1, math.min(#output_line_list, 4) do
-    result.lines[#result.lines + 1] = (output_index == 1 and "    └ " or "      ") .. output_line_list[output_index]
+  for _, output_line in ipairs(active_tool_output_lines(tool.output, content_width)) do
+    result.lines[#result.lines + 1] = output_line
     result.rows[#result.lines] = { kind = "active_tool_output", tool = tool }
     result.highlights[#result.highlights + 1] = {
       line = #result.lines,
@@ -241,7 +266,8 @@ end
 ---@param options { indent: string, label: string, suffix?: string, kind: string, interaction: table, expand_key: string }
 ---@return integer
 local function append_change_summary(result, tree, options)
-  local count_text = ("%d %s"):format(tree.file_count, tree.file_count == 1 and "file" or "files")
+  local unit = options.unit or "file"
+  local count_text = ("%d %s"):format(tree.file_count, tree.file_count == 1 and unit or (unit .. "s"))
   local prefix = options.indent .. "▸ " .. options.label .. " " .. count_text
   local added_text = ("+%d"):format(tree.added)
   local removed_text = ("-%d"):format(tree.removed)
@@ -274,6 +300,54 @@ local function append_change_summary(result, tree, options)
     result.rows[row].node_id = options.expand_key
   end
   return summary_line
+end
+
+local function append_plan_comment_resolution(result, interaction, resolution, options)
+  local annotation_list = resolution.annotation or {}
+  local count = #annotation_list
+  if count == 0 then return end
+  local resolution_key = ("interaction:%s:resolved-comments:%s"):format(
+    interaction.id or interaction.ordinal,
+    resolution.id or count
+  )
+  local summary_line = #result.lines + 1
+  result.lines[summary_line] = ("  ▸ Resolved %d %s"):format(count, count == 1 and "comment" or "comments")
+  result.rows[summary_line] = {
+    kind = "plan_comment_resolution",
+    interaction = interaction,
+    expand_key = resolution_key,
+    node_id = resolution_key,
+  }
+  if not result.expanded[resolution_key] then return end
+  for _, annotation in ipairs(annotation_list) do
+    local box_line_list = comment_box.build_box_lines({
+      heading = (" Plan comment • %s "):format(annotation.label or "Plan subject"),
+      body_lines = vim.split(annotation.body or "", "\n", { plain = true }),
+    }, (options.content_width or 80) + 4)
+    for _, box_line in ipairs(box_line_list) do
+      local line = ""
+      local first = 0
+      for _, segment in ipairs(box_line) do
+        local text, group = segment[1], segment[2]
+        line = line .. text
+        if group then
+          result.highlights[#result.highlights + 1] = {
+            line = #result.lines + 1,
+            first = first,
+            last = first + #text,
+            group = group,
+          }
+        end
+        first = first + #text
+      end
+      result.lines[#result.lines + 1] = line
+      result.rows[#result.lines] = {
+        kind = "plan_comment_resolution_body",
+        interaction = interaction,
+        node_id = resolution_key,
+      }
+    end
+  end
 end
 
 local function append_completed_thought(result, interaction, thought, thought_index, options)
@@ -378,12 +452,8 @@ local function append_segment(result, interaction, segment, options, defer_respo
       summary = complete and ("▸ Planned for %ds"):format(duration) or ("▸ Planning for %ds"):format(duration)
     end
   elseif interaction.kind == "plan_execution" then
-    local current = interaction.task and interaction.task.current or {}
-    local completed = 0
-    for _, task in ipairs(current) do if task.status == "completed" then completed = completed + 1 end end
-    local progress = #current > 0 and (" (%d/%d)"):format(completed, #current) or ""
-    summary = complete and ("▸ Executed plan%s for %ds"):format(progress, duration)
-      or ("▸ Executing plan%s for %ds"):format(progress, duration)
+    summary = complete and ("▸ Executed plan for %ds"):format(duration)
+      or ("▸ Executing plan for %ds"):format(duration)
   else
     summary = complete and ("▸ Thought for %ds"):format(duration) or ("▸ Thinking for %ds"):format(duration)
   end
@@ -492,6 +562,29 @@ local function append_interaction(result, interaction, options, agent_by_id)
           node_id = node.prompt.id,
         }
       end
+    elseif node.kind == "plan_comment_resolution" and node.resolution then
+      append_plan_comment_resolution(result, interaction, node.resolution, options)
+    elseif node.kind == "artifact_change" and node.change then
+      local artifact_key = ("interaction:%s:artifact:%s"):format(
+        interaction.id or interaction.ordinal,
+        node.change.id or node.change.path
+      )
+      local artifact = diff_tree.build(node.change.diff_text, {
+        indent = 4,
+        key_prefix = artifact_key,
+        interaction = interaction,
+        cwd = options.cwd,
+        on_update = options.on_diff_update,
+        expanded = result.expanded,
+      })
+      append_change_summary(result, artifact, {
+        indent = "  ",
+        label = "Changed",
+        unit = "artifact",
+        kind = "artifact_change",
+        interaction = interaction,
+        expand_key = artifact_key,
+      })
     elseif node.kind == "agent_reference" and node.agent then
       local agent = agent_by_id and agent_by_id[node.agent.agent_run_id]
       if agent then
@@ -567,34 +660,6 @@ local function append_interaction(result, interaction, options, agent_by_id)
   end
 end
 
-local function aggregate_execution(entry)
-  local aggregate = {
-    id = entry.id,
-    prompt = "",
-    hide_prompt = true,
-    kind = "plan_execution",
-    state = ({
-      active = "running",
-      complete = "complete",
-      paused = "paused",
-      stalled = "stalled",
-      blocked = "blocked",
-      cancelled = "cancelled",
-    })[entry.execution and entry.execution.state] or "running",
-    node_list = {},
-  }
-  for _, interaction in ipairs(entry.interaction or {}) do
-    for _, node in ipairs(interaction.node_list or {}) do
-      aggregate.node_list[#aggregate.node_list + 1] = node
-    end
-    aggregate.task = interaction.task or aggregate.task
-    aggregate.attributed_diff_text = interaction.attributed_diff_text or aggregate.attributed_diff_text
-    aggregate.checkpoint_diff_text = interaction.checkpoint_diff_text or aggregate.checkpoint_diff_text
-    aggregate.attributed_matches_checkpoint = interaction.attributed_matches_checkpoint == true
-  end
-  return aggregate
-end
-
 ---@param interactions table[]
 ---@param options? { working_seconds?: integer, cwd?: string, on_diff_update?: function, expanded?: table<string, boolean> }
 ---@return table
@@ -619,7 +684,7 @@ function M.build(interactions, options)
     elseif entry.kind == "plan_lifecycle" then
       plan_event.append(result, entry, { append_response = append_response })
     elseif entry.kind == "plan_execution" then
-      append_interaction(result, aggregate_execution(entry), options)
+      plan_execution.append(result, entry, options, { append_interaction = append_interaction })
     elseif entry.kind == "plan_resolution" then
       plan_resolution.append(result, entry)
     elseif entry.kind == "agent_lifecycle" then

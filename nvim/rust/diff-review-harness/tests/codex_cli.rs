@@ -37,6 +37,7 @@ fn request(workspace: &Path, mode: PromptMode, text: &str) -> BackendRequest {
             ExecutionMode::Write
         },
         backend_session_id: None,
+        control_context: None,
     }
 }
 
@@ -217,12 +218,16 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
         .expect("gpt-5.6-terra is required for the fast Harness integration test");
     assert!(model.reasoning.iter().any(|effort| effort == "low"));
 
+    let planning_prompt = PlanPrompt::with_active_document(
+        PlanPrompt::draft(
+            "Create a concise plan to add harness-integration.txt containing exactly `verified` followed by a newline. Do not modify files.",
+        ),
+        r#"{"version":1,"plan_id":"plan","title":"Add harness integration marker","overview":"Planning in progress.","usage":null,"entity_changes":[],"flows":[],"tasks":[],"tests":[],"assumptions":[]}"#,
+    );
     let planning = backend.prompt(request(
         repository.path(),
         PromptMode::Plan,
-        &PlanPrompt::draft(
-            "Create a concise plan to add harness-integration.txt containing exactly `verified`. Do not modify files.",
-        ),
+        &planning_prompt,
     ));
     let steering = async {
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -237,14 +242,14 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
     let (planned, steered) = tokio::join!(planning, steering);
     let planned = planned.unwrap();
     steered.unwrap();
-    let plan_document = planned
-        .plan_document
-        .as_ref()
-        .expect("Codex planning did not submit a structured plan document");
-    assert!(!plan_document.overview.trim().is_empty());
     assert!(
-        plan_document.overview.contains("STEERING_CONSTRAINT_7B3D"),
-        "Codex planning ignored the active-turn steering constraint: {plan_document:#?}"
+        !planned.plan_edit.is_empty(),
+        "Codex planning did not edit the broker-owned structured plan"
+    );
+    let plan_edit_json = serde_json::to_string_pretty(&planned.plan_edit).unwrap();
+    assert!(
+        plan_edit_json.contains("STEERING_CONSTRAINT_7B3D"),
+        "Codex planning ignored the active-turn steering constraint: {plan_edit_json}"
     );
     assert!(!repository.path().join("harness-integration.txt").exists());
 
@@ -253,12 +258,18 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
         PromptMode::ExecutePlan,
         "Execute the accepted plan now. Create harness-integration.txt containing exactly `verified` followed by a newline, then call harness_goal_complete.",
     );
+    execute.execution_mode = ExecutionMode::Yolo;
     execute.backend_session_id = planned.backend_session_id.clone();
     let (event_sink, mut event_stream) = tokio::sync::mpsc::unbounded_channel();
-    let executed = backend
-        .prompt_stream(execute.clone(), Some(event_sink))
-        .await
-        .unwrap();
+    eprintln!("codex_cli stage: execute prompt started");
+    let executed = tokio::time::timeout(
+        Duration::from_secs(90),
+        backend.prompt_stream(execute.clone(), Some(event_sink)),
+    )
+    .await
+    .expect("Codex execution prompt timed out after provider-side completion")
+    .unwrap();
+    eprintln!("codex_cli stage: execute prompt returned");
     let streamed_event_list: Vec<_> = std::iter::from_fn(|| event_stream.try_recv().ok()).collect();
     assert!(!streamed_event_list.is_empty());
     assert!(
@@ -282,26 +293,43 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
     assert!(executed.evidence.structured_complete || executed.evidence.native_complete);
 
     execute.backend_session_id = executed.backend_session_id;
-    backend
-        .goal_status(execute.clone(), Some("Complete the plan".into()), "paused")
-        .await
-        .unwrap();
-    backend
-        .goal_status(execute.clone(), Some("Complete the plan".into()), "active")
-        .await
-        .unwrap();
-    backend
-        .goal_status(execute.clone(), None, "cleared")
-        .await
-        .unwrap();
-    let forked = backend
-        .fork(BackendForkRequest {
+    eprintln!("codex_cli stage: goal pause started");
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        backend.goal_status(execute.clone(), Some("Complete the plan".into()), "paused"),
+    )
+    .await
+    .expect("Codex goal pause timed out")
+    .unwrap();
+    eprintln!("codex_cli stage: goal resume started");
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        backend.goal_status(execute.clone(), Some("Complete the plan".into()), "active"),
+    )
+    .await
+    .expect("Codex goal resume timed out")
+    .unwrap();
+    eprintln!("codex_cli stage: goal clear started");
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        backend.goal_status(execute.clone(), None, "cleared"),
+    )
+    .await
+    .expect("Codex goal clear timed out")
+    .unwrap();
+    eprintln!("codex_cli stage: fork started");
+    let forked = tokio::time::timeout(
+        Duration::from_secs(30),
+        backend.fork(BackendForkRequest {
             source: execute,
             target_harness_session_id: "forked-harness-session".into(),
             checkpoint_id: None,
-        })
-        .await
-        .unwrap();
+        }),
+    )
+    .await
+    .expect("Codex fork timed out")
+    .unwrap();
+    eprintln!("codex_cli stage: fork returned");
     assert!(!forked.backend_session_id.trim().is_empty());
     assert_eq!(backend.app_server_process_id().await, Some(process_id));
     assert_eq!(backend.app_server_start_count(), 1);

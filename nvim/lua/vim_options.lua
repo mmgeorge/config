@@ -128,6 +128,20 @@ vim.api.nvim_create_autocmd("FileType", {
   end,
 })
 
+vim.api.nvim_create_autocmd({ "FileType", "BufWinEnter" }, {
+  group = vim.api.nvim_create_augroup("MarkdownWrap", { clear = true }),
+  pattern = "*",
+  callback = function(args)
+    if vim.bo[args.buf].filetype == "markdown" then
+      local window = vim.api.nvim_get_current_win()
+      if vim.api.nvim_win_get_buf(window) == args.buf then
+        vim.wo[window].wrap = true
+        vim.wo[window].linebreak = true
+      end
+    end
+  end,
+})
+
 -- Disable auto comment
 -- vim.cmd('autocmd BufEnter * set formatoptions-=cro')
 -- vim.cmd('autocmd BufEnter * setlocal formatoptions-=cro')

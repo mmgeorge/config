@@ -1,7 +1,7 @@
 local SessionPreview = {}
 
 local layout = require("diff_review.views.harness.layout")
-local main_timeline = require("diff_review.views.harness.timeline")
+local timeline_cache = require("diff_review.views.harness.timeline_cache")
 local markdown = require("diff_review.render.harness.markdown")
 local render_transaction = require("diff_review.render.harness.transaction")
 local renderer = require("diff_review.render.harness.interaction_tree")
@@ -49,13 +49,7 @@ end
 ---@param snapshot table
 function SessionPreview.render(snapshot)
   if not active or not vim.api.nvim_buf_is_valid(active.preview_buf) then return end
-  local state = {
-    timeline = vim.deepcopy(snapshot.timeline or {}),
-    interaction = vim.deepcopy(snapshot.interaction or {}),
-    agent = vim.deepcopy(snapshot.agent or { definition = {}, run = {}, turn = {} }),
-    agent_live = {},
-  }
-  local timeline = main_timeline.project(state)
+  local timeline = timeline_cache.history({ timeline = vim.deepcopy(snapshot.timeline or {}) })
   local render = renderer.build(timeline, {
     content_width = vim.api.nvim_win_is_valid(active.transcript_win)
         and vim.api.nvim_win_get_width(active.transcript_win)

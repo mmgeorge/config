@@ -5,6 +5,7 @@
 local status_buffer = require("diff_review.views.status.status_buffer")
 local region = require("diff_review.render.region")
 local annotations = require("diff_review.render.annotations")
+local comment_editor = require("diff_review.render.comment_editor")
 local choice_popup = require("diff_review.infra.choice_popup")
 local notifications = require("diff_review.infra.notifications")
 local gh = require("diff_review.integrations.gh")
@@ -237,7 +238,7 @@ end
 ---@param value any
 ---@return string
 function M.normalize_comment_body_text(value)
-  return (tostring(value or ""):gsub("\r\n", "\n"):gsub("\r", "\n"))
+  return comment_editor.normalize_body_text(value)
 end
 
 ---@param state table
@@ -1176,26 +1177,8 @@ end
 ---@param buf integer?
 ---@return integer
 function M.comment_rule_width(win, buf)
-  local width = tonumber(vim.o.columns) or 80
-  if win and win > 0 and vim.api.nvim_win_is_valid(win) then
-    width = vim.api.nvim_win_get_width(win)
-    local wininfo = vim.fn.getwininfo(win)[1]
-    local textoff = tonumber(wininfo and wininfo.textoff) or 0
-    width = width - textoff
-  else
-    local status = session.status
-    buf = buf or (status and status.buf) or nil
-    if buf and vim.api.nvim_buf_is_valid(buf) then
-      local displayed_win = vim.fn.bufwinid(buf)
-      if displayed_win and displayed_win > 0 and vim.api.nvim_win_is_valid(displayed_win) then
-        width = vim.api.nvim_win_get_width(displayed_win)
-        local wininfo = vim.fn.getwininfo(displayed_win)[1]
-        local textoff = tonumber(wininfo and wininfo.textoff) or 0
-        width = width - textoff
-      end
-    end
-  end
-  return math.max(40, width - 1)
+  local status = session.status
+  return comment_editor.display_width(win, buf or (status and status.buf) or nil)
 end
 
 ---@param left_text string
@@ -1204,20 +1187,7 @@ end
 ---@param buf integer?
 ---@return string
 function M.comment_rule_line(left_text, right_text, win, buf)
-  local width = M.comment_rule_width(win, buf)
-  left_text = tostring(left_text or "")
-  right_text = tostring(right_text or "")
-  local fixed_width = vim.fn.strdisplaywidth(left_text .. right_text)
-  if fixed_width > width then
-    local available_left_width = math.max(0, width - vim.fn.strdisplaywidth(right_text))
-    left_text = M.truncate_display(left_text, available_left_width)
-    fixed_width = vim.fn.strdisplaywidth(left_text .. right_text)
-  end
-  if fixed_width > width then
-    right_text = M.truncate_display(right_text, math.max(0, width - vim.fn.strdisplaywidth(left_text)))
-    fixed_width = vim.fn.strdisplaywidth(left_text .. right_text)
-  end
-  return left_text .. ("-"):rep(math.max(width - fixed_width, 0)) .. right_text
+  return comment_editor.rule_line(left_text, right_text, M.comment_rule_width(win, buf))
 end
 
 ---@param comment table
@@ -1242,8 +1212,7 @@ end
 ---@param buf integer?
 ---@return string
 function M.comment_footer_line(win, buf)
-  local width = M.comment_rule_width(win, buf)
-  return ("-"):rep(width)
+  return comment_editor.footer_line(M.comment_rule_width(win, buf))
 end
 
 ---@param body string
@@ -1304,9 +1273,7 @@ end
 ---@param body string
 ---@return string[]
 function M.comment_body_lines(body)
-  local lines = vim.split(M.normalize_comment_body_text(body), "\n", { plain = true })
-  if #lines == 0 then lines = { "" } end
-  return lines
+  return comment_editor.body_lines(body)
 end
 
 ---@param comment table

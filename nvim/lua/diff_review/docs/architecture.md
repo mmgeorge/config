@@ -78,7 +78,11 @@ diff_review/
 │   ├── file_revision.lua     Read-only view of a file at a historical revision
 │   ├── walkthrough.lua       LLM-authored guided review: summary section + anchored comment boxes
 │   ├── harness/              Dedicated interaction-tree/composer tab and prompt queue controller
-│   ├── plan_review/          Physical Markdown plan review with edits, annotations, accept, and revision
+│   ├── plan_review/          Canonical plan review with semantic task rows, annotations, folds, accept, and revision
+│   │   ├── init.lua           View lifecycle and composition of model, renderer, comments, and folds
+│   │   ├── task_model.lua     Non-rendering working.json/index adapter with canonical source anchors
+│   │   ├── comment.lua        Display-row projection plus editable source-anchored comments
+│   │   └── fold.lua           Plan task native-fold state capture and application
 │   ├── sessions/             Current-worktree and all-worktree durable session browser
 │   ├── pr/
 │   │   ├── pr_overview.lua    PR metadata, checks, review summaries, inline comments
@@ -122,7 +126,11 @@ diff_review/
 │   ├── row_emitter.lua        Emit shared diff-row spans for GitStatus, PR review, and Harness
 │   ├── diff_tree.lua           Compose file headers and fancy hunks into an indentable fold tree
 │   ├── display_text.lua       Shared display-cell wrapping with semantic first/continuation prefixes
+│   ├── task_tree.lua          View-independent semantic task tree → wrapped rows + fold metadata
+│   ├── task_tree_style.lua    Shared task/action/kind/target highlight segments
+│   ├── fold_presentation.lua  Shared native-fold labels, filler, and folded-row window chrome
 │   ├── comment_box.lua        Pure compact comment-box wrapping and segmented row layout
+│   ├── comment_editor.lua     Shared full-width comment rules and editable-body line normalization
 │   ├── layout.lua             Fenwick (binary-indexed) tree mapping items → buffer rows in O(log n)
 │   ├── row_tree.lua           Logical node tree (hunks/padding/annotations) kept in row-sync via layout
 │   ├── region.lua             Extmark-anchored buffer region with dirty tracking
@@ -183,6 +191,47 @@ Harness session id, so the process routes independent turns without treating one
 `session.lua` mirrors that boundary through `harness_by_id`: each live session owns a transcript buffer, composer
 buffer, windows, queue, busy state, and subscriptions inside one real Neovim tab.
 
+Rust projects the semantic timeline and its synthetic bottom status from the same session-scoped durable owners.
+`PlanStateMachine` validates question, feedback, submission, review, acceptance, cancellation, and failure
+transitions. `PlanQuestionLedger` records answers, skips, and withdrawals before generation resumes. It matches both
+the provider's logical id and a canonical digest of the user-visible content, so a resolved decision cannot become
+pending again when a provider retries with a different id. The transient `PlanElicitation` therefore contains only
+unresolved questions and never acts as the durable decision owner.
+
+The broker owns plan generation as one bounded continuation loop across every backend. Each provider turn first
+applies plan creation and edits to the canonical document, then the broker accepts only three forward outcomes: a
+submitted plan, a genuinely new unresolved question, or another bounded generation turn. `ContinuationBudget`
+centralizes the total-turn and consecutive-no-progress mechanics shared by goals and plan generation.
+`PlanGeneration` adds canonical document revision evidence, permits 20 total turns, and stops after two consecutive
+turns without canonical document progress. `/plan retry` resets only that budget while retaining the plan document
+and question ledger. Provider adapters stream one turn and never decide whether planning should continue.
+
+`SessionPhase` projects exactly one visible workflow phase from that control state. Plan review and planning failure
+preempt retained transport activity. Active retries expose `RetryingPlanGeneration`, while exhausted or failed turns
+expose `PlanningFailed` with `/plan retry` and `/plan cancel` as the only recovery actions. A submitted plan therefore
+cannot reopen a stale question picker, and a failed generation turn cannot roll consumed feedback backward.
+
+Each Rust session controller owns one `TimelineStream`. The stream compares stable top-level entry identities, advances
+its own monotonic revision, and emits ordered `insert`, `replace`, and `remove` operations. Provider lifecycle events
+remain transport evidence for approvals, context metadata, and diagnostics. They no longer mutate transcript records
+inside Lua. Initial load, explicit reconciliation, resume, and preview carry full snapshots. Normal streaming carries
+only the changed top-level entries.
+
+The projector consumes `QuestionAnswered` as transition evidence instead of publishing a second feedback row because
+the continuation interaction owns that visible user action. It also nests durable child-agent turns under their
+provider and spawning-interaction identities before serialization. Lua's `timeline_cache.lua` validates the session
+id and base revision, applies one patch atomically, extracts the final synthetic status, and requests `state.get` after
+a revision gap. It appends configured key hints and renders the resulting records without comparing answer text,
+joining agent tables, grouping interactions, or reconstructing workflow phase.
+
+`Idle` remains a structural Rust phase but produces no status entry. `Working`, `RetryingPlanGeneration`,
+`AwaitingInput`, `AwaitingPlanReview`, `PlanningFailed`, and `WaitingForAgent` occupy the final timeline position.
+Working duration starts from the Rust timestamp while Lua supplies only the local spinner animation. Lua never
+reopens a question after a continuation error. It renders the next Rust patch, which either contains a new
+`AwaitingInput` owner or a terminal failure. The timeline and status debug logs record session id, base revision,
+resulting revision, operation count, and rendered status, which makes transport divergence observable without
+creating a second state owner.
+
 `/fork` creates that tab before provider work finishes. The child receives only the source's last completed provider
 turn. A fork during the source's first in-progress turn therefore starts with an empty provider thread, rather than
 copying an unfinished prompt. `/new [name]` follows the same immediate-tab path without provider history. `/sessions`
@@ -191,6 +240,9 @@ focuses an already-open timeline, opens in the current tab by default, and toggl
 request through initialization so the broker creates that exact session without first resuming or persisting another one.
 On a warm client the process-wide session coordinator clones provider-neutral settings from the durable source without
 entering its controller, so an active source turn or catalog lookup cannot delay the new timeline.
+Controller registration clears one-shot initialization fields before opening that durable child and rejects any
+resolved controller whose session id differs from the requested id. This keeps every later event, state request, and
+question picker bound to the timeline that created it.
 
 The Rust broker keeps one process-wide provider runtime and a serialized controller per Harness session. Codex lazily
 launches one app-server with a loopback WebSocket listener, then gives each session an independent JSON-RPC connection
@@ -708,6 +760,12 @@ point at a file and line with a comment. `ow` in the status buffer adds a foldab
 section and registers the author's comments as readonly anchored providers. The shared
 status renderer emits them as real comment-box rows below their diff lines.
 
+Walkthrough adapts task, subtask, and change records into `render/task_tree.lua` nodes.
+That renderer owns Unicode sibling topology, display-cell wrapping, stable row identity,
+and fold metadata without depending on either view. `task_tree_style.lua` gives Walkthrough
+and PlanReview the same action, kind, target, and task-title segments. The status view remains
+responsible for applying those semantic rows and native folds.
+
 The hard part is **step resolution**: matching a step's `(file, line)` against the
 current diff model before rows render, expanding folds as needed, and degrading gracefully. Each
 step records the **HEAD sha the document was generated against**, so a stale walkthrough
@@ -940,17 +998,21 @@ press the commit key
        ├─ enter visible Plan mode while retaining Read/Write/Full/YOLO authorization
        ├─ create canonical PlanDocument JSON and capture interaction checkpoint-before
        ├─ selected Backend implementation runs Harness planning directives without native Plan mode
-       ├─ harness_plan_question → durable PlanElicitation → bottom-anchored shared picker
+       ├─ harness_question_ask → durable PlanElicitation → bottom-anchored shared picker
        │    ├─ answers, notes, Other, and clarification turns preserve AwaitingInput
        │    └─ reviewed y confirmation serializes the decisions and resumes the planning contract
-       ├─ harness_plan_create/edit/read mutate validated semantic nodes with optimistic versions
+       ├─ harness_plan_edit/read mutate the broker-owned entity graph with optimistic versions
+       │    ├─ each ProgramEntityChange owns lifecycle, path, members, and ownership references
+       │    ├─ every resource and nested resource uses the same add/modify/remove vocabulary
+       │    └─ flat test subtasks inherit task/file ownership and optionally trace production entities
        ├─ harness_plan_submit freezes JSON + Markdown + navigation index as one immutable revision
        └─ PlanReview opens the read-only Markdown projection
-            ├─ Enter jumps through the navigation index and C anchors review comments
-            ├─ oN sends annotations → semantic model edits → a new submitted revision
+            ├─ Enter jumps through exact semantic line anchors and C records line/body input
+            ├─ Rust resolves comments to semantic targets before revision prompting and persistence
+            ├─ oN sends canonical JSON + semantic annotations → edits → a submitted revision
             └─ oY chooses continued or fresh provider context and injects complete accepted JSON
                  └─ PlanScheduler activates one whole task at a time
-                      ├─ harness_plan_task_report stores subtask, code-edit, path, and test evidence
+                      ├─ harness_plan_task_report stores subtask, entity, path, and test-subtask evidence
                       ├─ harness_plan_deviation records informational or reviewed scope overlays
                       └─ terminal goal → Plan Completed/Blocked/Cancelled → deviations + audit
 ```
@@ -1015,17 +1077,31 @@ printed before rendering. MCP payload details stop at the Codex transport bounda
 `ToolActivity`, `TimelineReducer`, and the Lua tree continue to represent every provider action as
 a generic tool.
 
+`trace::TraceStore` owns opt-in protocol diagnostics independently from timeline persistence. It
+stores the process-global enabled setting beside the Harness data root and appends unredacted JSONL
+records to `harness-trace.jsonl` without an in-memory retention buffer. Every record carries a
+`session_id`. The broker records Lua RPC receipt, completion, failure, and Lua-facing events, while
+`CodexJsonRpc` records raw app-server frames before normalization. `:HarnessLog` opens that file
+and controls tracing through broker RPC methods. `:HarnessLog clear` remains the only retention
+operation.
+
 The Codex `CodexTurnCoordinator` treats one user request as a logical interaction that may outlive
-its first parent app-server turn. It retains the session's JSON-RPC connection while descendant threads remain
-active, accepts steering as another parent turn on the same thread, and starts a bounded synthesis
-turn after the final child completes. Child lifecycle updates replace `AgentRun` state behind the
-existing `AgentReference`, so they never move the child row. Codex `subAgentActivity` values enter
-that lifecycle only for explicit start or terminal states. Directed `interacted` activity carries
-messages between agents without creating a run, and the descendant tracker rejects the parent
-thread identity unconditionally. `ActiveWait` drives only the current
+its first parent app-server turn. App-server can return a provisional ID from `turn/start`, then
+publish the authoritative provider ID through same-thread `turn/started`, especially after native
+goal activation. The coordinator adopts that notification ID before matching `turn/completed`, so
+the logical interaction terminates instead of waiting on an ID app-server never completes. It
+retains the session's JSON-RPC connection while descendant threads remain active, accepts steering
+as another parent turn on the same thread, and starts a bounded synthesis turn after the final child
+completes. Child lifecycle updates replace `AgentRun` state behind the existing `AgentReference`, so
+they never move the child row. Codex `subAgentActivity` values enter that lifecycle only for explicit
+start or terminal states. Directed `interacted` activity carries messages between agents without
+creating a run, and the descendant tracker rejects the parent thread identity unconditionally.
+`ActiveWait` drives only the current
 Timeline Status at the end of the Main timeline. The status uses an animated spinner followed by
 `Waiting for N subagents` and carries no duration because it represents current control state, not
-history. Clearing `ActiveWait` removes the status without creating a timeline node. A normal
+history. A submitted plan in `AwaitingReview` renders `Waiting for plan review` with the configured
+artifact key until the reviewer opens PlanReview. Clearing `ActiveWait` removes the status without
+creating a timeline node. A normal
 Harness submit while this status remains active uses the parent steering lane immediately. Ctrl-q
 retains its explicit steering shortcut, and child timelines never project Main control state.
 
@@ -1130,6 +1206,8 @@ coordinates the high-level projection, `task_tree.lua` owns provider tasks, and 
 owns artifact lifecycle rows. Each completed node owns a stable expansion key, and the renderer materializes
 only the children selected by `session.harness.activity_expanded`. This projection avoids
 overlapping native ranges, which cannot reliably represent wrapped thought and command headings.
+When a planning-feedback lifecycle answer exactly matches its durable continuation prompt, the
+projection keeps the interaction as the single visible owner and omits the redundant lifecycle row.
 `display_text.lua` wraps prompts and thoughts into real rows using rendered-cell width before row
 ownership, highlights, and folds are assigned. Continuation rows therefore preserve the tree's
 two-column indent without depending on window-local soft-wrap behavior.
@@ -1153,12 +1231,11 @@ It rebuilds native folds only when fold topology changes, which prevents timer-d
 frames from repeatedly closing and reopening unchanged folds.
 Active thoughts never expose expansion keys. Completed nodes stay immutable, so an expanded
 command or diff never changes while the user reads it.
-Prompt submission creates one optimistic main segment before transport dispatch, so the first
-render already contains `Thinking for 0s`. Broker admission preserves that segment until the first
-real timeline node atomically replaces it. The presentation layer measures elapsed work from the
-local submit clock and retains that duration through completion and same-session snapshot
-reconciliation, preventing a shorter provider duration from moving the visible clock backward.
-This presentation timing never enters SQLite.
+Prompt submission does not create a Lua-owned interaction. Broker admission emits the first
+revisioned patch with the durable interaction and a Rust `Working` status, so the first visible
+segment already comes from canonical state. Later node and completion patches replace that stable
+interaction id without a presentation-side merge clock or optimistic shadow record. Lua animates
+the Rust `started_at_ms` timestamp but never creates, extends, or completes an interaction.
 
 Each stored session uses one versioned envelope. Session loading and listing accept only the exact
 current format, leaving older rows invisible without migration or partial decoding. Runtime code
@@ -1219,7 +1296,92 @@ state in `plans/<session>/<plan>/working.json`, then derives `working.md` and `w
 for review and source navigation. Submission freezes all three projections as one immutable revision.
 The snapshot exposes the plan artifact and its generated review path, while every planning or
 execution turn receives the complete effective JSON document rather than relying on a path lookup.
-PlanReview remains read-only and routes reviewer feedback back through semantic plan operations.
+The broker creates the document identity and initial version. Providers can only mutate it through
+resource-oriented `harness_plan_edit` mutations, read it, or submit an exact version. No
+whole-document create or replacement tool exists. `ProgramEntityChange` unifies the previous
+definition, relationship, symbol, and change layers. The model introduces entities and members with
+`name`, selects existing values with `entity` and `member`, and links implementation work with `entities`.
+Harness derives durable snake-case identities from additions and retains those identities for
+review, persistence, and execution. Model edits never author internal ID fields. Each entity also
+owns one add/modify/remove lifecycle action, one repository-relative file path, nested ordinary
+members, and inheritance, conformance, or exclusive-owner references. Enum cases live only in the
+owning enum's dedicated `variants` collection. Variant fields form their own typed child collection,
+so variants cannot acquire member-only visibility or callable properties. Package decisions live in a separate
+top-level dependency collection. Each dependency records only its name, version, manifest, optional
+license, and architectural justification. Harness derives dependency ownership by matching its
+manifest to exactly one task file, so subtasks never repeat dependency references. Every collection
+uses `add`, `modify`, and `remove`. Array position defines presentation and execution order
+throughout the document. Subtasks use `operation` for architectural moves so `action` remains
+reserved for add/modify/remove lifecycle changes. The operation owns the rendered imperative, while
+the description supplies its grammatical complement. Submission rejects descriptions that repeat
+the operation as their first word, preventing canonical data from producing labels such as
+`Route Route`. Flow targets use the tagged `EntityReference`
+union with `planned_entity` or `external_entity` plus one shared `entity` payload. Planned
+references resolve semantic entity names while external references retain their supplied boundary
+name. Assumptions remain plain text values. Tests remain optional and never form a detached
+top-level collection. Each concrete test forms one flat task-file subtask with `operation: "test"`,
+an add/modify/remove `action`, `name`, `category`, and `behavior`. The parent task and file establish
+architectural ownership and source placement. Optional `covers_entities` references provide reviewer
+traceability without claiming program-entity ownership. Concrete tests cannot enter
+`ProgramEntityChange`, keeping verification artifacts out of the object model. The Tasks section renders each test where
+implementation performs the work, while the final Test plan reprojects the same nested records by
+unit or integration category. Planning prompts prefer integration coverage across real module
+boundaries and reserve unit cases for algorithms, data structures, state machines, parsers, and
+other complex isolated behavior. They reject tests for properties already enforced by the type
+system and treat a test-only enforceable invariant as pressure to strengthen the types.
+`PlanGraph` resolves semantic names and durable internal
+identities for editing, submission, rendering, review, and execution.
+
+Review annotations retain the renderer target plus the exact canonical JSON path from
+`working.index.json`. The revision prompt can therefore identify `/entity_changes/2/members/1`
+without retransmitting or reverse-parsing Markdown.
+Edit, submission, and render validation aggregate every violation in one response. Submission
+requires every entity change to belong to one subtask and every dependency manifest to match exactly
+one task file. Test subtasks validate supplied `covers_entities` references, but test count and
+inferred task or flow coverage never gate submission.
+Control-tool schemas describe these semantic payloads directly. Usage uses `command` plus
+`expected_result`. Omitted Usage crosses the JSON boundary as `null`, while `<Omitted>` exists only
+in the rendered Markdown projection. `PlanDocument.prompt` retains the original request for
+revision context but never appears in the reviewer-facing Markdown projection.
+The generated object model uses stacked Markdown sections rather than a fenced two-column layout.
+Entities, members, variants, and variant fields derive `(new)`, `(modify)`, or `(remove)` directly
+from canonical lifecycle state. Each entity declaration aligns its repository-relative path against
+a bounded inline suffix column. Member signatures and enum payloads retain the full object-model
+column width and their semantic indentation, so a long return type cannot push every path outward
+or inherit a narrower wrapping boundary. A dedicated Dependencies section appears before Tasks and
+groups package changes beneath their repository-relative manifest. Each dependency row combines
+its action, package, version, license, and two-sentence justification into one wrapped tree node,
+while manifest and package rows retain separate review anchors. Runtime flow diagrams
+remain fenced text because their arrows encode sequence rather than review identity. The flow
+title remains in the Markdown heading rather than consuming diagram width. Every sequence renders
+as one vertical pipeline. Top-level steps, one-level child operations, and their results remain in
+the left column while planned file paths and external owners align in one calculated right column.
+When an owner cannot fit beside its action within 100 columns, it moves to one indented physical
+line beneath that action without truncation. Child operations express independent work owned by
+one composite step. Intermediate values use `├─` before the next downward transition, while a final
+observable result closes the pipeline with `└─`. Causally ordered work remains in separate top-level
+steps.
+PlanReview keeps the plan read-only and routes reviewer feedback back through semantic plan
+operations. `task_model.lua` reads `working.json` and `working.index.json`, maps the Tasks section
+into semantic nodes with canonical source lines, and leaves wrapping to the shared task-tree
+renderer. Its composed projection preserves a blank boundary before the following Test plan
+heading. Task nodes indent file groups, and each file node contributes another child prefix so
+subtasks and entity changes preserve their distinct ownership levels. Other sections retain their
+physical `working.md` rows. The view applies the resulting
+rows as real buffer text and owns native manual task and subtask folds. `fold_presentation.lua`
+supplies the same fold label, blank filler, and folded-row highlight mapping used by status
+Walkthroughs, so collapsed plans do not fall back to Neovim's dotted default. `<Tab>` resolves
+the selected display row to its semantic fold identity, so wrapped headings toggle the same owner.
+
+The comment controller inserts display-only rows after the final rendered row for one canonical
+source line. An unfocused annotation uses the shared compact comment-box renderer. Cursor focus
+replaces that box with the same full-width header, editable body, and footer primitives used by PR
+code comments, then collapses it when the cursor leaves. Source-line extmarks preserve line/body
+input while task rows wrap or folds reapply. Rust resolves each submitted line through
+`working.index.json` to one `PlanReviewTarget`, then stores and prompts with its JSON path, concise
+label, optional repository path, and comment body. Revision prompts therefore carry canonical JSON
+plus path-addressed annotations and never resend rendered Markdown. Resolved-comment timeline boxes
+show those semantic labels instead of stale line numbers.
 
 Repository-independent prompt history stays ordered newest first and pruned transactionally to
 100 entries. Every broker snapshot carries that shared list, while
@@ -1235,15 +1397,36 @@ The backend subscribes before every send, forwards deltas immediately, and lets
 events into the same broker model as Codex. `/plan` does not select a provider-native plan mode.
 Harness sends the same structured planning contract through both backends without changing the
 session's retained Read, Write, Full, or YOLO authorization. The
-`harness_plan_question` pauses either backend on one to three structured decisions while
+`harness_question_ask` pauses either backend on one to three structured decisions while
 `harness_plan_submit` alone creates a review artifact. `ControlToolRegistry` owns every Harness
 tool schema once, then Codex projects it into app-server dynamic tools while Copilot projects it
 into SDK `Tool` handlers. Ordinary prose remains an ordinary planning response until the agent
 invokes a structured control tool.
+`ControlToolRuntime` owns the provider-visible state machine for one bounded turn. The broker
+captures the active plan state, canonical document, resolved question digests, elicitation,
+execution, and goal state, then both adapters feed every control invocation through that Rust
+runtime before forwarding it. Aggregate `set`, `put`, and `remove` operations replace one stable
+owner at a time, so nested definition members, flow steps, and task files never depend on a
+provider-specific sequence of leaf mutations. The runtime terminalizes question asks and plan
+submissions, rejects controls outside their state, and treats an already-consumed question digest
+as an idempotent success rather than creating another picker. The broker still replays accepted
+operations against durable state with optimistic version checks, which keeps the session-scoped
+broker document authoritative.
 The question tool also works during ordinary chat, goal, and execution turns. Those questions
 persist on their owning `InteractionRecord`, while planning questions remain on `PlanRecord`.
 `BrokerSnapshot.active_elicitation` projects either owner through one question UI contract, so
 answer, skip, Ask, and continue reuse the shared bottom picker without creating a plan artifact.
+Submitting the review page consumes that question set before the provider continuation starts.
+The continuation prompt and control-tool descriptions therefore forbid `harness_question_answer`
+and `harness_question_withdraw` for the embedded planning feedback. The Codex request responder
+enforces the same boundary by returning an unsuccessful tool result and omitting the rejected call
+from normalized control output. If Codex edits the plan but ends without submitting or asking a new
+question, the backend starts one bounded corrective provider turn inside the same Harness
+interaction and requires the missing terminal control action. Codex app-server can expose one
+dynamic control invocation through both lifecycle and request messages. The JSON-RPC transport
+normalizes that invocation once across the full Harness request, including its corrective turn.
+This keeps one reviewed answer set attached to one planning interaction instead of reopening the
+same questions or applying one plan edit twice.
 Ordinary prose never counts as a submitted question set. Copilot `session.todos_changed` and Codex
 `turn/plan/updated` events feed the generic task tracker without submitting a plan. Names printed
 in prose or command output never count as control calls. Codex uses its app-server protocol
@@ -1260,8 +1443,8 @@ SDK compacts automatically but exposes no manual compaction request, so its capa
 `/compact`. Compaction never creates a user interaction, and unsupported backends omit the command
 instead of receiving a synthetic summarization prompt.
 
-`/plan` emits `Planning` and `Planned` interaction summaries. A question-only turn becomes
-`Planning paused`, saves `PlanElicitation` under the active `AwaitingInput` plan, renders its
+`/plan` uses the same `Thinking` and `Thought` interaction summaries as every model turn. A
+question-only turn saves `PlanElicitation` under the active `AwaitingInput` plan, renders its
 choices in the timeline, and opens the shared picker across the bottom of the complete Harness
 transcript-and-composer surface. The border shows the question title and `N/M` progress. The
 picker maps provider choices and Other through configurable `picker.choice_keys`, reserves `a`
@@ -1289,7 +1472,7 @@ The main question float never maps Ctrl-s and cannot bypass this review boundary
 Answer and skip requests update only the durable elicitation record. Ask and subsequent ordinary
 Harness prompts run read-only follow-up interactions against a mutable decision set. The provider
 must preserve the set without a control call when it remains valid, may replace the complete set
-through `harness_plan_question`, may record only an explicit user answer through
+through `harness_question_ask`, may record only an explicit user answer through
 `harness_question_answer`, and may remove the boundary through `harness_question_withdraw` only
 when user direction or repository evidence proves that no material decision remains. A model
 recommendation never qualifies as an answer.
@@ -1309,20 +1492,55 @@ continuation turn fails, so the timeline never claims feedback was consumed whil
 has been restored.
 Elicitation revisions prevent a restored session from repeatedly presenting the same picker, while
 the transient Timeline Status exposes the pending decision after dismissal or restart.
-Successful submission adds a
-collapsed `Plan created` or `Plan revision created` lifecycle node and increments the artifact
-count in the winbar. Harness never opens PlanReview automatically. `op` selects a session artifact
+Plan edit calls persist the structurally valid JSON draft without rendering its intermediate
+cross-section state. `harness_plan_submit` validates ownership coverage and renderability against
+the complete staged document. A rejected submission returns those violations to the provider and
+leaves the draft editable, while a successful submission atomically refreshes `working.md`, its
+navigation index, and the immutable submitted revision.
+Successful submission appends one collapsed artifact delta to the planning interaction that
+produced it and increments the artifact count in the winbar. The delta uses the shared changed-file
+tree while labeling the canonical plan as an artifact, so revision history stays attached to its
+causal turn instead of creating a sibling `Plan revision created` event or dumping the complete plan
+into the timeline. Harness never opens PlanReview automatically. `op` selects a session artifact
 through the floating no-preview picker, marks it active, and opens its physical working copy.
-Request changes records saved edits, anchored annotations, and an optional overall comment before
-starting another read-only revision turn. Acceptance emits `Plan accepted`, creates the guarded
-`Complete the plan` goal, and groups every execution turn under one `Executing plan` entry.
+`C` creates an inline annotation at the current source line. Cursor focus expands its editable body,
+while leaving the annotation collapses it into a compact rendered box. Request changes records
+line/body input, then Rust resolves every line to its exact semantic target before starting another
+read-only revision turn. That revision interaction names the overall comment when present and otherwise stays
+`Request plan changes`. The durable `ChangesRequested` record remains state-machine history but
+does not create a duplicate timeline node. PlanReview admits only one acceptance or revision request
+at a time. Once the reviewer commits `oY` or confirms an `oN` comment, it destroys the physical
+Markdown buffer immediately and restores the originating Harness window while the broker request
+continues. Failed revision requests preserve the Lua annotation cache so `op` can rebuild the review
+surface. Acceptance creates durable `PlanAcceptance` input in Rust and reuses the Harness multi-page
+question picker for provider-context reuse and execution authorization. Dismissing that picker
+cancels pending acceptance and restores plan-review status. Rust attaches one collapsed
+`Resolved N comments` node before the revision artifact delta only after the model submits the
+replacement plan. Acceptance prevents an accepted write plan from inheriting Read authorization and
+blocking its first file change. It then emits
+`Plan accepted`, creates the guarded `Complete accepted plan: <title>` goal, and groups every
+execution turn under one `PlanExecution` entry. `PlanScheduler` timestamps each whole-task
+activation and successful report. `PlanExecutionRecord` appends causally anchored task and
+deviation lifecycle events so the timeline places control outcomes after the interaction that
+persisted them. Cancellation pauses the execution without closing its active task. `/goal resume`
+reuses that task, the effective canonical plan, and an interruption-specific prompt that preserves
+completed workspace work.
 
-Task rows render inline under the interaction or execution that received them. Current task state
-uses pending, in-progress, and completed markers. Completed tasks can expand their frozen thoughts.
-Active tasks and active thoughts remain non-expandable, so streaming never mutates an open node.
-Superseded tasks appear only when their owning summary expands. Provider tasks stay advisory and
-never decide goal completion. The structured goal tool, the 20-turn limit, and the two-turn
-no-progress guard remain the execution authority.
+The Harness winbar uses the goal-linked execution projected by Rust rather than parsing goal text.
+Explicit goals render `Goal active (N s)` or `Goal complete (N s)`. Accepted plans render
+`Plan active (Task X/Y, N s)` or `Plan complete (N s)`. Paused, blocked, stalled, cancelled, and
+cleared states do not occupy winbar space because they contain no active work.
+
+Canonical scheduler rows render only `Task X/Y started: <PlanTask.title>` and
+`Task X/Y completed in Ns`. A successfully persisted deviation renders immediately after its
+causal interaction, while the terminal plan resolution retains the full deviation audit. Pending
+tasks, subtasks, rationale text, and file lists do not become lifecycle rows.
+
+Provider task rows remain advisory turn detail. They can expand their frozen thoughts but never
+drive scheduler ordinals, winbar progress, goal completion, or canonical task titles. The live
+projection recognizes interactions already owned by a durable `PlanExecution` and never appends
+the same execution as a second standalone row. The structured goal tool, the 20-turn limit, and
+the two-turn no-progress guard remain the execution authority.
 
 Harness defaults to the direct Codex app-server backend. Set `harness.backend = "copilot"` to use
 the native Copilot SDK. An empty `harness.backends.copilot.command` delegates CLI discovery and

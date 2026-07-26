@@ -103,6 +103,7 @@ M.view_specs = {
     { id = "help", label = "help", desc = "Show Harness help", modes = "n", pinned = true },
   },
   plan_review = {
+    { id = "toggle", label = "fold", desc = "Toggle the current plan task or subtask", modes = "n", pinned = true },
     { id = "open", label = "open", desc = "Open the source file for this plan node", modes = "n", pinned = true },
     { id = "comment", label = "comment", desc = "Annotate the current plan line", modes = "n", pinned = true },
     { id = "accept", label = "accept", desc = "Accept the exact saved plan and execute it", modes = "n", pinned = true },

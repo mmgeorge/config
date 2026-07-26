@@ -7,8 +7,8 @@ local picker = require("diff_review.views.picker")
 local active_elicitation = nil
 local active_host = nil
 
-local function option_list(question, elicitation)
-  local entries = model.entries(question, config.options.picker.choice_keys)
+local function option_list(question, elicitation, allow_ask)
+  local entries = model.entries(question, config.options.picker.choice_keys, allow_ask)
   local answer = model.answer_for(elicitation, question.id)
   local selected_index = model.selected_entry_index(entries, answer)
   local result = {}
@@ -25,11 +25,11 @@ local function option_list(question, elicitation)
   return result, selected_index, entries
 end
 
-local function question_page_list(elicitation)
+local function question_page_list(elicitation, allow_ask)
   local question_set = elicitation.question_set or {}
   local page_list = {}
   for index, question in ipairs(question_set.questions or {}) do
-    local options, selected_index, entries = option_list(question, elicitation)
+    local options, selected_index, entries = option_list(question, elicitation, allow_ask)
     local answer = model.answer_for(elicitation, question.id)
     local selected_entry = entries[selected_index]
     page_list[#page_list + 1] = {
@@ -74,7 +74,7 @@ end
 
 local function build_spec(elicitation, host)
   local question = model.current_question(elicitation)
-  local pages = question and question_page_list(elicitation) or { review_page(elicitation) }
+  local pages = question and question_page_list(elicitation, host.allow_ask) or { review_page(elicitation) }
   local initial_page = question and math.min((elicitation.current_index or 0) + 1, #pages) or 1
   return {
     owner = "plan_question",

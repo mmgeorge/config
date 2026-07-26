@@ -14,8 +14,9 @@ local M = {}
 
 ---@param question table
 ---@param choice_keys string[]
+---@param allow_ask boolean?
 ---@return DiffReviewPlanQuestionEntry[]
-function M.entries(question, choice_keys)
+function M.entries(question, choice_keys, allow_ask)
   local entry_list = {}
   for index, option in ipairs(question.options or {}) do
     entry_list[#entry_list + 1] = {
@@ -34,12 +35,14 @@ function M.entries(question, choice_keys)
       key = "o",
     }
   end
-  entry_list[#entry_list + 1] = {
-    kind = "ask",
-    label = "Ask…",
-    description = "Ask a question before deciding.",
-    key = "a",
-  }
+  if allow_ask ~= false then
+    entry_list[#entry_list + 1] = {
+      kind = "ask",
+      label = "Ask…",
+      description = "Ask a question before deciding.",
+      key = "a",
+    }
+  end
   return entry_list
 end
 

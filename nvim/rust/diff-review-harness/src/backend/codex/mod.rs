@@ -8,10 +8,12 @@ use crate::backend::{
 };
 use crate::control_tools::ControlToolRegistry;
 use crate::session::ExecutionMode;
+use crate::trace::TraceStore;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
@@ -40,6 +42,7 @@ pub struct CodexBackend {
     connection_by_session: Mutex<HashMap<String, Arc<Mutex<CodexConnection>>>>,
     completed_turn_by_session: Mutex<HashMap<String, String>>,
     permission_coordinator: Arc<PermissionCoordinator>,
+    trace: Arc<TraceStore>,
 }
 
 /// Tracks whether the current prompt reached Codex conversation history.
@@ -81,11 +84,20 @@ fn capability() -> BackendCapability {
     }
 }
 
+fn question_contract(mode: PromptMode, request_text: &str) -> &'static str {
+    if mode == PromptMode::Plan && request_text.contains("Planning feedback:") {
+        "The planning feedback in this turn has already been recorded and consumed. Do not call harness_question_answer or harness_question_withdraw for it."
+    } else {
+        "While questions remain pending, use harness_question_answer only for an explicit user answer and harness_question_withdraw only when no material user decision remains."
+    }
+}
+
 impl CodexBackend {
     /// Build a Codex backend with an isolated conservative permission registry.
     pub fn new(command: Vec<String>) -> Result<Self> {
         let permission_coordinator = PermissionCoordinator::transient(".")?;
-        Self::new_with_permission_coordinator(command, permission_coordinator)
+        let trace = Arc::new(TraceStore::open(Path::new("."))?);
+        Self::new_with_permission_coordinator(command, permission_coordinator, trace)
     }
 
     /// Return how many Codex app-server process generations this backend launched.
@@ -102,6 +114,7 @@ impl CodexBackend {
     pub fn new_with_permission_coordinator(
         command: Vec<String>,
         permission_coordinator: Arc<PermissionCoordinator>,
+        trace: Arc<TraceStore>,
     ) -> Result<Self> {
         anyhow::ensure!(
             !command.is_empty(),
@@ -117,6 +130,7 @@ impl CodexBackend {
             connection_by_session: Mutex::new(HashMap::new()),
             completed_turn_by_session: Mutex::new(HashMap::new()),
             permission_coordinator,
+            trace,
         })
     }
 
@@ -134,6 +148,8 @@ impl CodexBackend {
                 request.execution_mode,
                 Arc::clone(&self.permission_coordinator),
                 event_sink,
+                Arc::clone(&self.trace),
+                request.harness_session_id.clone(),
             )
             .await?;
         let process_duration_ms = process_started.elapsed().as_secs_f64() * 1000.0;
@@ -241,6 +257,7 @@ impl CodexBackend {
             fast_mode: false,
             execution_mode: request.execution_mode,
             backend_session_id: request.backend_session_id.clone(),
+            control_context: None,
         }
     }
 
@@ -580,15 +597,23 @@ impl CodexBackend {
             .flatten()
     }
 
+    fn notification_thread_turn_id<'a>(
+        message: &'a Value,
+        method: &str,
+        thread_id: &str,
+    ) -> Option<&'a str> {
+        (message.pointer("/params/threadId").and_then(Value::as_str) == Some(thread_id))
+            .then(|| Self::notification_turn_id(message, method))
+            .flatten()
+    }
+
     fn notification_matches_turn(
         message: &Value,
         method: &str,
         thread_id: &str,
         turn_id: &str,
     ) -> bool {
-        message.get("method").and_then(Value::as_str) == Some(method)
-            && message.pointer("/params/threadId").and_then(Value::as_str) == Some(thread_id)
-            && Self::notification_turn_id(message, method) == Some(turn_id)
+        Self::notification_thread_turn_id(message, method, thread_id) == Some(turn_id)
     }
 
     async fn start_turn(
@@ -663,6 +688,19 @@ impl Backend for CodexBackend {
             .await?;
         let mut connection = connection.lock().await;
         let process = &mut connection.process;
+        let request_text = request.input.text();
+        let mut control_context = request
+            .control_context
+            .clone()
+            .unwrap_or_else(|| crate::control_tools::ControlTurnContext::inactive(request.mode));
+        control_context.planning_feedback =
+            request.mode == PromptMode::Plan && request_text.contains("Planning feedback:");
+        if control_context.plan_document.is_none() {
+            control_context.plan_document = (request.mode == PromptMode::Plan)
+                .then(|| super::mock_plan_document_from_prompt(&request_text))
+                .flatten();
+        }
+        process.set_control_context(control_context);
         let resolved_model = self.resolve_model(&request, process, &mut output).await?;
         output.runtime.provider = "Codex CLI".into();
         output.runtime.model = Some(resolved_model);
@@ -679,17 +717,42 @@ impl Backend for CodexBackend {
             })
             .collect::<Vec<_>>();
         let thread = match &request.backend_session_id {
-            Some(thread_id) => process.request("thread/resume", Self::secure(json!({
-                "threadId": thread_id,
-                "cwd": request.workspace
-            }), &request), &mut output).await?,
-            None => process.request("thread/start", Self::with_model(Self::secure(json!({
-                "cwd": request.workspace,
-                "experimentalRawEvents": false,
-                "historyMode": "legacy",
-                "developerInstructions": "You run inside DiffReview Harness. During planning, build the canonical JSON artifact with harness_plan_create and harness_plan_edit, request its latest version with harness_plan_read, then call harness_plan_submit with its exact ID and version. During execution, call harness_plan_task_report after each whole task and harness_plan_deviation when implementation diverges from accepted intent. Call harness_plan_question whenever a material user decision remains. While questions remain pending, use harness_question_answer only for an explicit user answer and harness_question_withdraw only when no material user decision remains. The question tools work in every mode. End the turn after a Harness question or plan control call. For a terminal goal state, call harness_goal_complete or harness_goal_blocked. Never claim a control action through ordinary prose alone.",
-                "dynamicTools": dynamic_tool_list
-            }), &request), &request.model), &mut output).await?,
+            Some(thread_id) => {
+                process
+                    .request(
+                        "thread/resume",
+                        Self::secure(
+                            json!({
+                                "threadId": thread_id,
+                                "cwd": request.workspace
+                            }),
+                            &request,
+                        ),
+                        &mut output,
+                    )
+                    .await?
+            }
+            None => {
+                process
+                    .request(
+                        "thread/start",
+                        Self::with_model(
+                            Self::secure(
+                                json!({
+                                    "cwd": request.workspace,
+                                    "experimentalRawEvents": false,
+                                    "historyMode": "legacy",
+                                    "developerInstructions": super::HARNESS_SYSTEM_MESSAGE,
+                                    "dynamicTools": dynamic_tool_list
+                                }),
+                                &request,
+                            ),
+                            &request.model,
+                        ),
+                        &mut output,
+                    )
+                    .await?
+            }
         };
         let thread_id = thread
             .pointer("/thread/id")
@@ -700,9 +763,9 @@ impl Backend for CodexBackend {
             .or(request.backend_session_id.clone())
             .context("Codex thread response omitted thread id")?;
         output.backend_session_id = Some(thread_id.clone());
-        let request_text = request.input.text();
+        let question_contract = question_contract(request.mode, &request_text);
         let mut prompt = format!(
-            "Harness interaction contract: when the user explicitly asks for interactive or multiple-choice questions, call harness_plan_question with the complete question set. While questions remain pending, use harness_question_answer only for an explicit user answer and harness_question_withdraw only when no material user decision remains. The question tools work outside planning. Do not claim control actions through prose.\n\n{}",
+            "Harness interaction contract: when the user explicitly asks for interactive or multiple-choice questions, call harness_question_ask with the complete question set. {question_contract} The question tools work outside planning. Do not claim control actions through prose.\n\n{}",
             request_text
         );
         if request.mode == PromptMode::GoalContinuation {
@@ -754,34 +817,61 @@ impl Backend for CodexBackend {
                 .with_context(|| format!("skill ${name} omitted its provider path"))?;
             input.push(json!({ "type": "skill", "name": name, "path": path }));
         }
-        let (turn, provider_turn_started, observed_message_list) = self.start_turn(process, &mut output, &request, &thread_id, Self::with_model(Self::secure(json!({
-            "threadId": thread_id,
-            "input": input,
-            "cwd": request.workspace,
-            "effort": request.effort,
-            "serviceTier": if request.fast_mode { Value::String("fast".into()) } else { Value::Null }
-        }), &request), &request.model)).await?;
-        let turn_id = turn
-            .pointer("/turn/id")
-            .or_else(|| turn.get("turnId"))
-            .or_else(|| turn.get("turn_id"))
-            .and_then(Value::as_str)
-            .context("Codex turn/start response omitted turn id")?;
-        let completed = turn_coordinator::CodexTurnCoordinator::new(
-            self,
-            process,
-            &mut output,
-            &mut active_steering,
-            coordinator_event_sink,
-            &request,
-            &thread_id,
-        )
-        .run(
-            turn_id.to_owned(),
-            provider_turn_started,
-            observed_message_list,
-        )
-        .await?;
+        let turn_id = {
+            let (turn, provider_turn_started, observed_message_list) = self
+                .start_turn(
+                    process,
+                    &mut output,
+                    &request,
+                    &thread_id,
+                    Self::with_model(
+                        Self::secure(
+                            json!({
+                                "threadId": thread_id,
+                                "input": input,
+                                "cwd": request.workspace,
+                                "effort": request.effort,
+                                "serviceTier": if request.fast_mode { Value::String("fast".into()) } else { Value::Null }
+                            }),
+                            &request,
+                        ),
+                        &request.model,
+                    ),
+                )
+                .await?;
+            let current_turn_id = turn
+                .pointer("/turn/id")
+                .or_else(|| turn.get("turnId"))
+                .or_else(|| turn.get("turn_id"))
+                .and_then(Value::as_str)
+                .context("Codex turn/start response omitted turn id")?
+                .to_owned();
+            let completed = turn_coordinator::CodexTurnCoordinator::new(
+                self,
+                process,
+                &mut output,
+                &mut active_steering,
+                coordinator_event_sink.clone(),
+                &request,
+                &thread_id,
+            )
+            .run(
+                current_turn_id.clone(),
+                provider_turn_started,
+                observed_message_list,
+            )
+            .await?;
+            let status = completed
+                .pointer("/turn/status")
+                .or_else(|| completed.get("status"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            anyhow::ensure!(
+                !status.eq_ignore_ascii_case("failed"),
+                "Codex turn failed: {completed}"
+            );
+            current_turn_id
+        };
         self.active_turn_by_session.lock().await.insert(
             request.harness_session_id.clone(),
             CodexTurnState::Completed,
@@ -791,15 +881,6 @@ impl Backend for CodexBackend {
             .await
             .insert(request.harness_session_id.clone(), turn_id.to_owned());
         output.provider_checkpoint_id = Some(turn_id.to_owned());
-        let status = completed
-            .pointer("/turn/status")
-            .or_else(|| completed.get("status"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        anyhow::ensure!(
-            !status.eq_ignore_ascii_case("failed"),
-            "Codex turn failed: {completed}"
-        );
         Ok(output)
     }
 
@@ -1200,6 +1281,7 @@ mod test {
             fast_mode: false,
             execution_mode: ExecutionMode::Read,
             backend_session_id: Some("source-thread".into()),
+            control_context: None,
         };
         let params = CodexBackend::fork_parameters(
             "source-thread".into(),
@@ -1286,6 +1368,19 @@ mod test {
             CodexBackend::notification_turn_id(&started, "turn/completed"),
             None
         );
+    }
+
+    #[test]
+    fn planning_feedback_omits_pending_question_resolution_instructions() {
+        let contract = question_contract(
+            PromptMode::Plan,
+            "Planning feedback:\n- Geometry: Native Arrow",
+        );
+        assert!(contract.contains("already been recorded and consumed"));
+        assert!(contract.contains("Do not call harness_question_answer"));
+
+        let ordinary = question_contract(PromptMode::Chat, "Use Native Arrow");
+        assert!(ordinary.contains("While questions remain pending"));
     }
 
     #[test]

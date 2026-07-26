@@ -5,7 +5,6 @@ local origin_win = vim.api.nvim_get_current_win()
 local now_ms = os.time() * 1000
 local state = {
   selected_agent_run_id = nil,
-  agent_live = {},
   agent = {
     definition = {
       { name = "explorer", description = "Read-oriented repository explorer" },

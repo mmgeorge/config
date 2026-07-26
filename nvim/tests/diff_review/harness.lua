@@ -6,8 +6,16 @@ local client = require("diff_review.harness.client")
 local controller = require("diff_review.views.harness.controller")
 local raw_interaction_renderer = require("diff_review.render.harness.interaction_tree")
 local session = require("diff_review.session")
-local interaction_state = require("diff_review.views.harness.interaction_state")
 local harness_snapshot = require("diff_review.views.harness.snapshot")
+local timeline_cache = require("diff_review.views.harness.timeline_cache")
+
+local function projected_interaction_list(state)
+  local interaction_list = {}
+  for _, entry in ipairs(timeline_cache.history(state)) do
+    if entry.kind == "interaction" then interaction_list[#interaction_list + 1] = entry.interaction end
+  end
+  return interaction_list
+end
 
 local function normalize_interaction(interaction)
   if interaction.node_list then return interaction end
@@ -170,6 +178,7 @@ local interaction = {
 }
 
 local request_by_method = {}
+local request_count_by_method = {}
 local interaction_review_list = { interaction }
 local goal_continue_count = 0
 local prompt_count = 0
@@ -181,6 +190,10 @@ local active_elicitation = nil
 local prompt_history = { "most recent prompt", "older prompt" }
 local retract_request = nil
 local backend_model_request_blocked = false
+local plan_accept_delay_ms = 0
+local plan_request_changes_delay_ms = 0
+local mock_timeline = {}
+local mock_timeline_revision = 0
 
 local function planning_question_set()
   return {
@@ -225,6 +238,131 @@ local function emit(options, message)
   vim.schedule(function() options.stdout(nil, vim.json.encode(message) .. "\n") end)
 end
 
+local function emit_status_patch(options, status)
+  local final_entry = mock_timeline[#mock_timeline]
+  local operation_kind = final_entry and final_entry.kind == "status" and "replace" or "insert"
+  local operation_index = operation_kind == "replace" and (#mock_timeline - 1) or #mock_timeline
+  local base_revision = mock_timeline_revision
+  local entry = {
+    kind = "status",
+    id = active_session.id .. ":status",
+    created_at_ms = 0,
+    status = status,
+  }
+  if operation_kind == "replace" then
+    mock_timeline[#mock_timeline] = entry
+  else
+    mock_timeline[#mock_timeline + 1] = entry
+  end
+  mock_timeline_revision = base_revision + 1
+  emit(options, {
+    event = "timeline_patch",
+    payload = {
+      session_id = active_session.id,
+      base_revision = base_revision,
+      revision = mock_timeline_revision,
+      operation = { {
+        kind = operation_kind,
+        index = operation_index,
+        entry = entry,
+      } },
+    },
+  })
+end
+
+local function emit_interaction_patch(options, interaction, status)
+  local existing_index = nil
+  for index, entry in ipairs(mock_timeline) do
+    if entry.kind == "interaction" and entry.id == interaction.id then
+      existing_index = index
+      break
+    end
+  end
+  local entry = {
+    kind = "interaction",
+    id = interaction.id,
+    created_at_ms = interaction.created_at_ms or 0,
+    interaction = vim.deepcopy(interaction),
+    agent_by_id = {},
+  }
+  local base_revision = mock_timeline_revision
+  local operation_list = {}
+  if existing_index then
+    mock_timeline[existing_index] = entry
+    operation_list[#operation_list + 1] = { kind = "replace", index = existing_index - 1, entry = entry }
+  else
+    local final_entry = mock_timeline[#mock_timeline]
+    local insert_index = final_entry and final_entry.kind == "status" and (#mock_timeline - 1) or #mock_timeline
+    table.insert(mock_timeline, insert_index + 1, entry)
+    operation_list[#operation_list + 1] = { kind = "insert", index = insert_index, entry = entry }
+  end
+  if status == false then
+    local final_entry = mock_timeline[#mock_timeline]
+    if final_entry and final_entry.kind == "status" then
+      table.remove(mock_timeline)
+      operation_list[#operation_list + 1] = {
+        kind = "remove",
+        index = #mock_timeline,
+        id = final_entry.id,
+      }
+    end
+  elseif status then
+    local final_entry = mock_timeline[#mock_timeline]
+    local status_entry = {
+      kind = "status",
+      id = active_session.id .. ":status",
+      created_at_ms = 0,
+      status = status,
+    }
+    if final_entry and final_entry.kind == "status" then
+      mock_timeline[#mock_timeline] = status_entry
+      operation_list[#operation_list + 1] = {
+        kind = "replace",
+        index = #mock_timeline - 1,
+        entry = status_entry,
+      }
+    else
+      mock_timeline[#mock_timeline + 1] = status_entry
+      operation_list[#operation_list + 1] = {
+        kind = "insert",
+        index = #mock_timeline - 1,
+        entry = status_entry,
+      }
+    end
+  end
+  mock_timeline_revision = base_revision + 1
+  emit(options, {
+    event = "timeline_patch",
+    payload = {
+      session_id = active_session.id,
+      base_revision = base_revision,
+      revision = mock_timeline_revision,
+      operation = operation_list,
+    },
+  })
+end
+
+local function emit_entry_patch(options, entry)
+  local final_entry = mock_timeline[#mock_timeline]
+  local insert_index = final_entry and final_entry.kind == "status" and (#mock_timeline - 1) or #mock_timeline
+  table.insert(mock_timeline, insert_index + 1, entry)
+  local base_revision = mock_timeline_revision
+  mock_timeline_revision = base_revision + 1
+  emit(options, {
+    event = "timeline_patch",
+    payload = {
+      session_id = active_session.id,
+      base_revision = base_revision,
+      revision = mock_timeline_revision,
+      operation = { {
+        kind = "insert",
+        index = insert_index,
+        entry = entry,
+      } },
+    },
+  })
+end
+
 local function mock_segment(interaction_id, state, active, thought, response, duration_ms)
   return {
     kind = "main_segment",
@@ -249,6 +387,7 @@ local function fake_launcher(command, options, _)
   function process:write(payload)
     local request = vim.json.decode(vim.trim(payload))
     request_by_method[request.method] = request
+    request_count_by_method[request.method] = (request_count_by_method[request.method] or 0) + 1
     if request.method == "initialize" then
       active_session.backend = request.params.backend.kind
       vim.defer_fn(function()
@@ -293,6 +432,26 @@ local function fake_launcher(command, options, _)
       local interaction_id = "live-interaction-" .. prompt_count
       local thought_id = interaction_id .. ":thought:1"
       local completed_tool = nil
+      emit_interaction_patch(options, {
+        id = interaction_id,
+        session_id = active_session.id,
+        ordinal = prompt_count,
+        prompt = request.params.text,
+        state = "running",
+        node_list = {},
+        created_at_ms = 0,
+      }, { kind = "working", started_at_ms = os.time() * 1000, activity = "working" })
+      local function project_live_node(node)
+        emit_interaction_patch(options, {
+          id = interaction_id,
+          session_id = active_session.id,
+          ordinal = prompt_count,
+          prompt = request.params.text,
+          state = "running",
+          node_list = { node },
+          created_at_ms = 0,
+        })
+      end
       if request.params.text == "hello harness" then
         local output = table.concat({ "# Rendering", "line two", "line three", "line four", "last line" }, "\n")
         emit(options, { event = "backend_event", payload = {
@@ -310,6 +469,15 @@ local function fake_launcher(command, options, _)
             }),
           },
         } })
+        project_live_node(mock_segment(interaction_id, "running", {
+          interaction_id = interaction_id,
+          thought_id = thought_id,
+          text = "Working",
+          synthetic = true,
+          tool_count = 1,
+          failed_count = 0,
+          revision = 1,
+        }))
         completed_tool = {
           id = "command-one",
           kind = "command",
@@ -354,6 +522,22 @@ local function fake_launcher(command, options, _)
           } } or {}),
         },
       } })
+      project_live_node(mock_segment(interaction_id, "running", {
+        interaction_id = interaction_id,
+        thought_id = interaction_id .. ":thought:2",
+        text = "Mock ",
+        synthetic = false,
+        tool_count = 0,
+        failed_count = 0,
+        revision = 2,
+      }, completed_tool and { {
+        id = thought_id,
+        text = "Working",
+        synthetic = true,
+        tool = { completed_tool },
+        started_at_ms = 0,
+        completed_at_ms = 1000,
+      } } or {}))
       emit(options, { event = "backend_event", payload = {
         kind = "timeline_node_updated",
         data = {
@@ -376,6 +560,22 @@ local function fake_launcher(command, options, _)
           } } or {}),
         },
       } })
+      project_live_node(mock_segment(interaction_id, "running", {
+        interaction_id = interaction_id,
+        thought_id = interaction_id .. ":thought:2",
+        text = "Mock reply",
+        synthetic = false,
+        tool_count = 0,
+        failed_count = 0,
+        revision = 3,
+      }, completed_tool and { {
+        id = thought_id,
+        text = "Working",
+        synthetic = true,
+        tool = { completed_tool },
+        started_at_ms = 0,
+        completed_at_ms = 1000,
+      } } or {}))
       if request.params.text == "/plan choose a migration" then
         local question_set = planning_question_set()
         active_plan = {
@@ -402,6 +602,11 @@ local function fake_launcher(command, options, _)
           lifecycle = { id = "question-lifecycle", kind = "question_asked" },
           question = question_set,
         } })
+        emit_status_patch(options, {
+          kind = "awaiting_input",
+          owner = "plan",
+          plan_id = active_plan.id,
+        })
       elseif request.params.text == "ask choices" then
         active_elicitation = {
           owner = "interaction",
@@ -415,6 +620,11 @@ local function fake_launcher(command, options, _)
           },
         }
         emit(options, { event = "question", payload = active_elicitation })
+        emit_status_patch(options, {
+          kind = "awaiting_input",
+          owner = "interaction",
+          interaction_id = interaction_id,
+        })
       elseif request.params.text == "replace choices" and active_elicitation then
         local replacement = planning_question_set()
         replacement.id = "question-set-replacement"
@@ -436,6 +646,11 @@ local function fake_launcher(command, options, _)
           lifecycle = { id = "lifecycle-one", kind = "created" },
           content = "# Plan\n\n1. Review the implementation.",
         } })
+        emit_status_patch(options, {
+          kind = "awaiting_plan_review",
+          plan_id = active_plan.id,
+          revision = 0,
+        })
       end
       if request.params.text == "hello harness" then
         vim.defer_fn(function()
@@ -456,6 +671,7 @@ local function fake_launcher(command, options, _)
             duration_ms = 2000,
             token_count = 2700,
           }
+          emit_interaction_patch(options, completed, false)
           emit(options, { event = "interaction_complete", payload = completed })
           emit(options, { id = request.id, result = {
             interaction = completed,
@@ -475,6 +691,14 @@ local function fake_launcher(command, options, _)
           duration_ms = 2000,
           token_count = 2700,
         }
+        local retains_status = request.params.text == "/plan choose a migration"
+          or request.params.text == "ask choices"
+          or request.params.text:match("^/plan ") ~= nil
+        if retains_status then
+          emit_interaction_patch(options, completed)
+        else
+          emit_interaction_patch(options, completed, false)
+        end
         emit(options, { event = "interaction_complete", payload = completed })
         emit(options, { id = request.id, result = {
           interaction = completed,
@@ -500,6 +724,8 @@ local function fake_launcher(command, options, _)
         session = active_session,
         active_plan = active_plan,
         active_elicitation = active_elicitation,
+        timeline = vim.deepcopy(mock_timeline),
+        timeline_revision = mock_timeline_revision,
       } })
     elseif request.method == "question.ask" then
       active_plan.elicitation.clarification_active = true
@@ -532,7 +758,6 @@ local function fake_launcher(command, options, _)
       for index = target_index or (#interaction_review_list + 1), #interaction_review_list do
         interaction_review_list[index].state = index == target_index and "rolled_back" or "superseded"
       end
-      session.harness.interaction = vim.deepcopy(interaction_review_list)
       emit(options, { id = request.id, result = { rolled_back = request.params.interaction_id } })
       emit(options, { event = "interaction_rolled_back", payload = interaction_review_list[target_index] })
     elseif request.method == "session.list" then
@@ -540,14 +765,14 @@ local function fake_launcher(command, options, _)
     elseif request.method == "session.preview" then
       emit(options, { id = request.id, result = {
         session = active_session,
-        interaction = session.harness.interaction,
+        interaction = vim.deepcopy(interaction_review_list),
         timeline = session.harness.timeline,
         agent = session.harness.agent or { definition = {}, run = {}, turn = {} },
       } })
     elseif request.method == "session.rename" then
       active_session.name = vim.trim(request.params.name or "")
       if #session.harness.timeline == 0 then
-        for _, interaction in ipairs(session.harness.interaction or {}) do
+        for _, interaction in ipairs(interaction_review_list) do
           session.harness.timeline[#session.harness.timeline + 1] = {
             kind = "interaction",
             interaction = vim.deepcopy(interaction),
@@ -564,6 +789,7 @@ local function fake_launcher(command, options, _)
         kind = "timeline_session_event",
         data = timeline_entry,
       } })
+      emit_entry_patch(options, timeline_entry)
       emit(options, { id = request.id, result = active_session })
     elseif request.method == "backend.models" then
       if backend_model_request_blocked then return end
@@ -656,7 +882,7 @@ local function fake_launcher(command, options, _)
       active_session.context_usage = { used = 40000, size = 353000, remaining_percent = 92 }
       emit(options, { event = "context_compacted", payload = {
         session = active_session,
-        interaction = session.harness.interaction,
+        interaction = vim.deepcopy(interaction_review_list),
         capability = {
           native_fork = false,
           native_compact = true,
@@ -669,7 +895,7 @@ local function fake_launcher(command, options, _)
       } })
       emit(options, { id = request.id, result = {
         session = active_session,
-        interaction = session.harness.interaction,
+        interaction = vim.deepcopy(interaction_review_list),
         capability = {
           native_fork = false,
           native_compact = true,
@@ -686,7 +912,15 @@ local function fake_launcher(command, options, _)
         if steer_should_fail then
           emit(options, { id = request.id, error = { message = "active turn already completed" } })
         else
-          local active_interaction = session.harness.interaction[#session.harness.interaction]
+          local active_interaction = nil
+          for index = #mock_timeline, 1, -1 do
+            local entry = mock_timeline[index]
+            if entry.kind == "interaction" then
+              active_interaction = entry.interaction
+              break
+            end
+          end
+          assert(active_interaction, "active interaction missing from the mock Rust timeline")
           emit(options, { event = "backend_event", payload = {
             kind = "timeline_node_updated",
             data = {
@@ -701,6 +935,17 @@ local function fake_launcher(command, options, _)
               },
             },
           } })
+          local projected_interaction = vim.deepcopy(active_interaction)
+          projected_interaction.node_list = projected_interaction.node_list or {}
+          projected_interaction.node_list[#projected_interaction.node_list + 1] = {
+            kind = "steering_prompt",
+            prompt = {
+              id = active_interaction.id .. ":steering:1",
+              text = request.params.text,
+              created_at_ms = 1,
+            },
+          }
+          emit_interaction_patch(options, projected_interaction)
           emit(options, { id = request.id, result = { steered = true } })
         end
       end, 80)
@@ -753,7 +998,7 @@ local function fake_launcher(command, options, _)
       local source_session = vim.deepcopy(active_session)
       session_snapshot_by_id[source_session.id] = {
         session = source_session,
-        interaction = vim.deepcopy(session.harness.interaction or {}),
+        interaction = vim.deepcopy(interaction_review_list),
         timeline = vim.deepcopy(session.harness.timeline or {}),
         capability = vim.deepcopy(session.harness.capability or {}),
         approval = {},
@@ -836,7 +1081,7 @@ local function fake_launcher(command, options, _)
     elseif request.method == "state.get" then
       emit(options, { id = request.id, result = {
         session = active_session,
-        interaction = session.harness.interaction,
+        interaction = vim.deepcopy(interaction_review_list),
         capability = {
           native_fork = false,
           native_compact = true,
@@ -850,6 +1095,8 @@ local function fake_launcher(command, options, _)
         goal = { objective = "fail", state = "paused" },
         active_plan = active_plan,
         active_elicitation = active_elicitation,
+        timeline = vim.deepcopy(mock_timeline),
+        timeline_revision = mock_timeline_revision,
         approval = {},
         agent = { definition = {}, run = {}, turn = {} },
         artifact = active_plan and active_plan.working_path ~= "" and { active_plan } or {},
@@ -857,9 +1104,57 @@ local function fake_launcher(command, options, _)
       } })
     elseif request.method == "plan.activate" then
       emit(options, { id = request.id, result = active_plan })
+    elseif request.method == "plan.acceptance.begin" then
+      local function acceptance_result()
+        emit(options, { id = request.id, result = {
+          session = active_session,
+          capability = { execution_mode_list = { "write", "full", "yolo", "read" } },
+          active_plan = active_plan,
+          active_elicitation = {
+            owner = "plan_acceptance",
+            plan_id = active_plan.id,
+            elicitation = {
+              revision = 1,
+              current_index = 0,
+              answer = {},
+              question_set = {
+                id = "plan-acceptance",
+                questions = {
+                  {
+                    id = "acceptance-context",
+                    header = "Context",
+                    question = "Which provider context should execute the accepted plan?",
+                    options = {
+                      { label = "Continue context", description = "Continue from planning." },
+                      { label = "Fresh context", description = "Start fresh." },
+                    },
+                    allow_freeform = false,
+                  },
+                },
+              },
+            },
+          },
+        } })
+      end
+      if plan_accept_delay_ms > 0 then
+        vim.defer_fn(acceptance_result, plan_accept_delay_ms)
+      else
+        acceptance_result()
+      end
     elseif request.method == "plan.accept" then
-      emit(options, { event = "goal_changed", payload = { objective = "Complete the plan", state = "complete" } })
-      emit(options, { id = request.id, result = { session = active_session } })
+      local function accept_result()
+        emit(options, { event = "goal_changed", payload = { objective = "Complete the plan", state = "complete" } })
+        emit(options, { id = request.id, result = { session = active_session } })
+      end
+      if plan_accept_delay_ms > 0 then
+        vim.defer_fn(accept_result, plan_accept_delay_ms)
+      else
+        accept_result()
+      end
+    elseif request.method == "plan.request_changes" and plan_request_changes_delay_ms > 0 then
+      vim.defer_fn(function()
+        emit(options, { id = request.id, result = active_session })
+      end, plan_request_changes_delay_ms)
     elseif request.method == "shutdown" then
       emit(options, { id = request.id, result = { shutdown = true } })
     else
@@ -870,7 +1165,7 @@ local function fake_launcher(command, options, _)
   return process
 end
 
-local ok, failure = pcall(function()
+local ok, failure = xpcall(function()
   local default_config = require("diff_review.infra.config").setup()
   assert_equals(default_config.harness.backend, "codex",
     "an empty setup should retain the complete default configuration")
@@ -913,7 +1208,7 @@ local ok, failure = pcall(function()
   assert_equals(question_entries[1].key, "n", "question choices should start with the configured quick keys")
   assert_equals(question_entries[4].key, "o", "Other should always use o")
   assert_equals(question_entries[5].key, "a", "Ask should always use a regardless of option count")
-  local question_render = interaction_renderer.build({ {
+  local question_entry = {
     kind = "plan_lifecycle",
     id = "question-lifecycle",
     lifecycle = {
@@ -924,13 +1219,44 @@ local ok, failure = pcall(function()
         options = { { label = "Staged", description = "Support both formats temporarily." } },
       } } },
     },
-  } })
-  assert_true(vim.tbl_contains(question_render.lines, "▸ Planning paused for feedback"),
+  }
+  local collapsed_question_render = interaction_renderer.build({ question_entry }, { expanded = {} })
+  assert_true(vim.tbl_contains(collapsed_question_render.lines, "▸ Planning paused for feedback"),
     "planning questions should render as a durable paused state")
+  assert_true(not vim.tbl_contains(collapsed_question_render.lines, "  Which migration should the plan use?"),
+    "planning questions should collapse their details by default")
+  local question_render = interaction_renderer.build({ question_entry }, {
+    expanded = { ["plan_lifecycle:question-lifecycle"] = true },
+  })
   assert_true(vim.tbl_contains(question_render.lines, "  Which migration should the plan use?"),
-    "planning questions should remain visible without expansion")
+    "expanding a planning pause should reveal its question")
   assert_true(vim.tbl_contains(question_render.lines, "    ○ Staged — Support both formats temporarily."),
     "planning question choices should remain visible in the timeline")
+  local response_boundary_render = interaction_renderer.build({
+    {
+      kind = "interaction",
+      interaction = {
+        id = "response-boundary",
+        hide_prompt = true,
+        kind = "plan_draft",
+        state = "complete",
+        node_list = { {
+          kind = "main_segment",
+          segment = {
+            id = "response-boundary-segment",
+            state = "complete",
+            response = "I need the reader output contract.\n\n",
+          },
+        } },
+      },
+    },
+    question_entry,
+  }, { expanded = {} })
+  local response_line = line_number(response_boundary_render.lines, "  I need the reader output contract.")
+  assert_equals(response_boundary_render.lines[response_line + 1], "",
+    "timeline nodes should retain one separator after a response")
+  assert_equals(response_boundary_render.lines[response_line + 2], "▸ Planning paused for feedback",
+    "provider trailing newlines should not compound timeline node spacing")
   local withdrawn_question_render = interaction_renderer.build({ {
     kind = "plan_lifecycle",
     id = "withdrawn-question-lifecycle",
@@ -1029,76 +1355,6 @@ local ok, failure = pcall(function()
   } }, { now_ms = 3000 })
   assert_true(not vim.tbl_contains(parent_with_agent.lines, "↳ Waiting on 1 subagent."),
     "parent work should replace the synthetic waiting state while its child keeps running")
-  local interaction_state = require("diff_review.views.harness.interaction_state")
-  local steering_state = {
-    active_wait = { interaction_id = "steering-parent", started_at_ms = 1000, agent_count = 1 },
-    interaction = { {
-      id = "steering-parent",
-      prompt = "/agent explorer inspect Bevy",
-      state = "running",
-      node_list = {},
-    } },
-  }
-  steering_state.interaction_by_id = { ["steering-parent"] = steering_state.interaction[1] }
-  interaction_state.apply_node(steering_state, {
-    interaction_id = "steering-parent",
-    node = {
-      kind = "steering_prompt",
-      prompt = { id = "steering-parent:steering:1", text = "What day is it?", created_at_ms = 2000 },
-    },
-  })
-  assert_true(steering_state.active_wait ~= nil,
-    "timeline nodes should not own session-level waiting state")
-  interaction_state.apply_wait(steering_state, { interaction_id = "steering-parent", wait = nil })
-  assert_true(steering_state.active_wait == nil,
-    "an explicit wait update should atomically remove transient waiting chrome")
-  assert_equals(steering_state.interaction[1].node_list[1].prompt.text, "What day is it?",
-    "steering should retain its chronological position after waiting disappears")
-  local projected_timeline = require("diff_review.views.harness.timeline").project({
-    timeline = {},
-    interaction = { {
-      id = "parent-turn",
-      prompt = "/agent local-code-explorer inspect Bevy",
-      state = "complete",
-      thought = {},
-    } },
-    agent = {
-      run = {
-        {
-          id = "coordinator-run",
-          definition = "default",
-          parent_interaction_id = "parent-turn",
-          provider_thread_id = "coordinator-thread",
-          status = "completed",
-        },
-        {
-          id = "explorer-run",
-          definition = "local-code-explorer",
-          parent_interaction_id = "parent-turn",
-          parent_thread_id = "coordinator-thread",
-          provider_thread_id = "explorer-thread",
-          status = "completed",
-        },
-      },
-      turn = { {
-        agent_run_id = "explorer-run",
-        interaction = { id = "child-turn", state = "complete", response = "Mapped Bevy." },
-      } },
-    },
-  })
-  assert_equals(#projected_timeline, 1,
-    "completed interactions missing from a durable snapshot should remain in the local projection")
-  assert_equals(projected_timeline[1].interaction.id, "parent-turn",
-    "the projection should retain the spawning parent interaction")
-  local coordinator_entry = projected_timeline[1].agent_by_id["coordinator-run"]
-  assert_true(coordinator_entry ~= nil,
-    "provider-nested children should not flatten beside their parent agent")
-  assert_equals(coordinator_entry.run.definition, "default",
-    "the root provider child should remain attached to the interaction")
-  assert_equals(coordinator_entry.agent[1].run.definition, "local-code-explorer",
-    "parent thread identity should preserve nested provider hierarchy")
-  assert_equals(coordinator_entry.agent[1].interaction[1].response, "Mapped Bevy.",
-    "the nested run should carry its durable child interaction timeline")
   local delegation_segment = mock_segment("ordered-parent", "complete", nil, { {
     id = "delegating",
     text = "Delegating the repository map.",
@@ -1169,7 +1425,7 @@ local ok, failure = pcall(function()
     thought = {},
   } })
   assert_true(vim.tbl_contains(paused_plan_render.lines, "▸ Planning paused after 3s"),
-    "question-only plan turns should not claim that the plan completed")
+    "question-only plan turns should identify the paused planning state")
 
   builder._set_crate_dir_for_test(crate_root)
   builder._set_artifact_root_for_test(vim.fs.joinpath(test_root, "artifacts"))
@@ -1270,8 +1526,9 @@ local ok, failure = pcall(function()
   controller.submit()
   assert_true(vim.wait(2000, function()
     if not session.harness.ready or session.harness.busy then return false end
-    for _, item in ipairs(session.harness.interaction) do
-      if item.prompt == "what is this repo?" and interaction_response(item) == "Mock reply" then return true end
+    for _, entry in ipairs(timeline_cache.history(session.harness)) do
+      local item = entry.kind == "interaction" and entry.interaction or nil
+      if item and item.prompt == "what is this repo?" and interaction_response(item) == "Mock reply" then return true end
     end
     return false
   end, 10), "Harness did not complete the prompt queued during initialization")
@@ -1280,8 +1537,8 @@ local ok, failure = pcall(function()
     local frame_text = table.concat(frame, "\n")
     if frame_text:find("what is this repo?", 1, true) then
       if not prompt_seen then
-        assert_true(frame_text:find("▸ Thinking for 0s", 1, true) ~= nil,
-          "the first prompt frame must include its optimistic Thinking node: " .. frame_text)
+        assert_true(frame_text:find("Working for 0s", 1, true) ~= nil,
+          "the first prompt frame must include the Rust-owned working status: " .. frame_text)
       end
       prompt_seen = true
     end
@@ -1307,54 +1564,13 @@ local ok, failure = pcall(function()
   assert_true(partial_response_seen, "each assistant delta should produce a visible intermediate frame")
   assert_true(complete_response_seen, "assistant deltas should compose into the complete response")
   assert_true(summary_seen, "assistant completion should produce a final summary frame")
-  local timing_state = {
-    interaction = {},
-    interaction_by_id = {},
-    interaction_presentation = {},
-  }
-  interaction_state.begin(timing_state, "Measure the turn", 1000000000)
-  local immediate_timing = raw_interaction_renderer.build(timing_state.interaction, { working_seconds = 0 })
-  assert_equals(immediate_timing.lines[2], "▸ Thinking for 0s",
-    "optimistic interactions should render before the first provider event")
-  interaction_state.start_interaction(timing_state, {
-    id = "timed-interaction",
-    prompt = "Measure the turn",
-    state = "running",
-    node_list = {},
-  })
-  local admitted_timing = raw_interaction_renderer.build(timing_state.interaction, { working_seconds = 3 })
-  assert_equals(admitted_timing.lines[2], "▸ Thinking for 3s",
-    "interaction admission should preserve the optimistic segment")
-  interaction_state.apply_node(timing_state, {
-    interaction_id = "timed-interaction",
-    node = mock_segment("timed-interaction", "running", nil, {}, nil, 1000),
-  })
-  assert_equals(#timing_state.interaction[1].node_list, 1,
-    "the first provider segment should replace the optimistic segment without duplication")
-  local completed_timing = {
-    id = "timed-interaction",
-    prompt = "Measure the turn",
-    state = "complete",
-    node_list = { mock_segment("timed-interaction", "complete", nil, {}, "Done", 1000) },
-  }
-  interaction_state.complete_interaction(timing_state, completed_timing, 7200000000)
-  local final_timing = raw_interaction_renderer.build(timing_state.interaction)
-  assert_equals(final_timing.lines[2], "▸ Thought for 6s, 2.7k tokens",
-    "completion should retain local wall-clock time when provider duration is shorter")
-  interaction_state.reconcile_snapshot(timing_state, { completed_timing })
-  local reconciled_timing = raw_interaction_renderer.build(timing_state.interaction)
-  assert_equals(reconciled_timing.lines[2], "▸ Thought for 6s, 2.7k tokens",
-    "snapshot reconciliation should not regress the completed duration")
   local cached_context = { used = 275000, size = 353000, remaining_percent = 22 }
   local context_state = {
     session = { id = "same-session", context_usage = cached_context },
-    interaction = {},
-    interaction_by_id = {},
   }
   harness_snapshot.apply(context_state, {
     session = { id = "same-session" },
-    interaction = {},
-  }, "reconcile")
+  })
   assert_equals(context_state.session.context_usage.remaining_percent, 22,
     "same-session snapshots should retain the latest context status until the provider refreshes it")
   local markdown_render = interaction_renderer.build({ {
@@ -1678,11 +1894,54 @@ local ok, failure = pcall(function()
   assert_true(plain_winbar:find("Harness", 1, true) == nil, "winbar should omit the redundant view name")
   assert_true(vim.wo[session.harness.transcript_win].winbar:find("@workspace", 1, true) == nil, "winbar should omit legacy trust labels")
   assert_equals(vim.wo[session.harness.composer_win].winbar, "", "composer should not duplicate the Harness winbar")
-  session.harness.goal = { objective = "Complete the plan", state = "active" }
+  session.harness.goal = { objective = "Complete the plan", state = "active", created_at_ms = os.time() * 1000 }
   controller.refresh_winbar()
   assert_true(vim.wo[session.harness.transcript_win].winbar:find(
-    "%#DiffReviewHarnessGoal# • Goal: Complete the plan%*", 1, true
-  ) ~= nil, "winbar should render the active goal with the green goal highlight")
+    "%#DiffReviewHarnessGoal# • Goal active (", 1, true
+  ) ~= nil, "winbar should render the active goal duration with the green goal highlight")
+  session.harness.goal = {
+    objective = "Complete the plan",
+    state = "complete",
+    created_at_ms = 1000,
+    updated_at_ms = 44000,
+  }
+  controller.refresh_winbar()
+  assert_true(vim.wo[session.harness.transcript_win].winbar:find(
+    "%#DiffReviewHarnessGoal# • Goal complete (43 s)%*", 1, true
+  ) ~= nil, "winbar should retain completed-goal duration without a paused-style suffix")
+  session.harness.goal = { objective = "Complete the plan", state = "paused", created_at_ms = 1000 }
+  controller.refresh_winbar()
+  assert_true(vim.wo[session.harness.transcript_win].winbar:find("paused", 1, true) == nil,
+    "winbar should omit inactive goal states")
+  session.harness.goal_execution = {
+    state = "active",
+    created_at_ms = os.time() * 1000,
+    scheduler = {
+      task = {
+        { task_id = "task-one", state = "complete" },
+        { task_id = "task-two", state = "active" },
+        { task_id = "task-three", state = "pending" },
+      },
+    },
+  }
+  controller.refresh_winbar()
+  assert_true(vim.wo[session.harness.transcript_win].winbar:find(
+    "%#DiffReviewHarnessGoal# • Plan active (Task 2/3,", 1, true
+  ) ~= nil, "winbar should render canonical scheduler progress for accepted plans")
+  session.harness.goal_execution = {
+    state = "complete",
+    created_at_ms = 1000,
+    completed_at_ms = 44000,
+  }
+  controller.refresh_winbar()
+  assert_true(vim.wo[session.harness.transcript_win].winbar:find(
+    "%#DiffReviewHarnessGoal# • Plan complete (43 s)%*", 1, true
+  ) ~= nil, "winbar should retain completed plan duration")
+  session.harness.goal_execution = { state = "paused", created_at_ms = 1000 }
+  controller.refresh_winbar()
+  assert_true(vim.wo[session.harness.transcript_win].winbar:find("Plan active", 1, true) == nil,
+    "winbar should omit inactive plan execution states")
+  session.harness.goal_execution = nil
   session.harness.goal = nil
   controller.refresh_winbar()
   assert_true(vim.fn.maparg("<C-s>", "i", false, true).callback ~= nil, "composer should map submit in insert mode")
@@ -1738,8 +1997,14 @@ local ok, failure = pcall(function()
     return not session.harness.busy
       and table.concat(vim.api.nvim_buf_get_lines(session.harness.composer_buf, 0, -1, false), "\n") == "retract me"
   end, 10), "an output-free cancellation should restore the exact prompt to HarnessInput")
-  assert_true(not vim.tbl_contains(vim.tbl_map(function(item) return item.id end, session.harness.interaction),
-    "retracted-interaction"), "the retracted interaction should disappear from the timeline")
+  local retracted_interaction_present = false
+  for _, entry in ipairs(timeline_cache.history(session.harness)) do
+    if entry.kind == "interaction" and entry.id == "retracted-interaction" then
+      retracted_interaction_present = true
+      break
+    end
+  end
+  assert_true(not retracted_interaction_present, "the retracted interaction should disappear from the timeline")
   assert_true(not table.concat(vim.api.nvim_buf_get_lines(session.harness.transcript_buf, 0, -1, false), "\n")
     :find("▸ retract me", 1, true), "the settled transcript should not retain the retracted prompt")
   if prompt_history[1] == "retract me" then table.remove(prompt_history, 1) end
@@ -1991,30 +2256,37 @@ local ok, failure = pcall(function()
   controller.configure({ model = "mock-model", effort = "medium" })
   assert_true(vim.wait(1000, function() return active_session.effort == "medium" end, 10),
     "model and effort command coverage should restore the shared fixture configuration")
+  local original_notify = vim.notify
+  local configuration_notice_list = {}
+  vim.notify = function(message, level, options)
+    configuration_notice_list[#configuration_notice_list + 1] = {
+      message = message,
+      level = level,
+      options = options,
+    }
+  end
   vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/model sol" })
   controller.submit()
   assert_true(vim.wait(1000, function()
-    return vim.iter(session.harness.timeline):any(function(entry)
-      return entry.event and entry.event.message
-        and entry.event.message:find("model sol is unavailable", 1, true) ~= nil
+    return vim.iter(configuration_notice_list):any(function(notice)
+      return notice.message:find("model sol is unavailable", 1, true) ~= nil
     end)
-  end, 10), "invalid inline models should render their rejection on the timeline")
+  end, 10), "invalid inline models should report their rejection without mutating the Rust timeline")
   assert_equals(active_session.model, "mock-model", "invalid inline models should leave the active model unchanged")
   vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/effort xhigh" })
   controller.submit()
   assert_true(vim.wait(1000, function()
-    return vim.iter(session.harness.timeline):any(function(entry)
-      return entry.event and entry.event.message
-        and entry.event.message:find("reasoning effort xhigh is unavailable", 1, true) ~= nil
+    return vim.iter(configuration_notice_list):any(function(notice)
+      return notice.message:find("reasoning effort xhigh is unavailable", 1, true) ~= nil
     end)
-  end, 10), "invalid inline efforts should render their rejection on the timeline")
+  end, 10), "invalid inline efforts should report their rejection without mutating the Rust timeline")
   assert_equals(active_session.effort, "medium", "invalid inline efforts should leave reasoning unchanged")
   vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/mode invalid" })
   controller.submit()
-  assert_true(vim.iter(session.harness.timeline):any(function(entry)
-    return entry.event and entry.event.message
-      and entry.event.message:find("Unknown execution mode: invalid", 1, true) ~= nil
-  end), "invalid inline modes should render their rejection on the timeline")
+  assert_true(vim.iter(configuration_notice_list):any(function(notice)
+    return notice.message:find("Unknown execution mode: invalid", 1, true) ~= nil
+  end), "invalid inline modes should report their rejection without mutating the Rust timeline")
+  vim.notify = original_notify
   vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/ " })
   vim.api.nvim_win_set_cursor(session.harness.composer_win, { 1, 1 })
 
@@ -2128,6 +2400,8 @@ local ok, failure = pcall(function()
     "ordinary questions should remain interaction-owned instead of creating a plan")
   vim.fn.maparg("q", "n", false, true).callback()
   controller.render()
+  assert_equals(session.harness.status.kind, "awaiting_input",
+    "timeline patch should own the question status before rendering")
   local question_timeline = vim.api.nvim_buf_get_lines(session.harness.transcript_buf, 0, -1, false)
   assert_true(vim.tbl_contains(question_timeline, "  Waiting for input (press oe)"),
     "closed ordinary questions should advertise the configured reopen key in Timeline Status")
@@ -2210,7 +2484,7 @@ local ok, failure = pcall(function()
   local tool_frame_start = #render_frame_list + 1
   controller.submit()
   assert_true(vim.wait(2000, function()
-    for _, item in ipairs(session.harness.interaction) do
+    for _, item in ipairs(projected_interaction_list(session.harness)) do
       if item.prompt == "hello harness" and item.state == "complete" then return true end
     end
     return false
@@ -2309,49 +2583,138 @@ local ok, failure = pcall(function()
     "completed provider tasks should remain inline with their interaction")
   assert_equals(#completed_plan.folds, 0,
     "provider task state should use semantic expansion instead of native folds")
-  local lifecycle_collapsed = interaction_renderer.build({ {
-    kind = "plan_lifecycle",
-    id = "lifecycle-created",
-    lifecycle = { id = "lifecycle-created", kind = "created" },
-    content = "# Streaming plan\n\nUse one timeline projection.",
-  } }, { expanded = {} })
-  assert_equals(lifecycle_collapsed.lines[1], "▸ Plan created",
-    "plan creation should render as one inline lifecycle node")
-  assert_true(not vim.tbl_contains(lifecycle_collapsed.lines, "  ▸ Content"),
-    "collapsed lifecycle nodes should hide artifact content")
-  local lifecycle_expanded = interaction_renderer.build({ {
-    kind = "plan_lifecycle",
-    id = "lifecycle-created",
-    lifecycle = { id = "lifecycle-created", kind = "created" },
-    content = "# Streaming plan\n\nUse one timeline projection.",
-  } }, { expanded = { ["plan_lifecycle:lifecycle-created"] = true } })
-  assert_true(vim.tbl_contains(lifecycle_expanded.lines, "  ▸ Content"),
-    "expanded lifecycle nodes should reveal artifact content")
-  assert_equals(#lifecycle_expanded.markdown_ranges, 1,
-    "expanded plan content should register one markdown region")
+  local active_plan_revision = interaction_renderer.build({ {
+    id = "plan-revision",
+    prompt = "Request plan changes: show plan again",
+    kind = "plan_revision",
+    state = "running",
+    thought = {},
+  } }, {
+    working_seconds = 1,
+  })
+  assert_true(vim.tbl_contains(active_plan_revision.lines, "▸ Planning for 1s"),
+    "plan revisions should not fall through to the generic thinking summary")
+  local artifact_interaction = { {
+    kind = "interaction",
+    interaction = {
+      id = "plan-artifact-interaction",
+      hide_prompt = true,
+      kind = "plan_draft",
+      state = "complete",
+      node_list = {
+        {
+          kind = "main_segment",
+          segment = { id = "plan-segment", state = "complete", duration_ms = 1000 },
+        },
+        {
+          kind = "plan_comment_resolution",
+          resolution = {
+            id = "resolution-one",
+            annotation = {
+              { label = "Cargo.toml dependencies", body = "Name the exact dependency." },
+              { label = "invalid_metadata", body = "Cover malformed metadata." },
+            },
+          },
+        },
+        {
+          kind = "artifact_change",
+          change = {
+            id = "artifact-one",
+            path = "plans/plan.md",
+            diff_text = table.concat({
+              "diff --git a/plans/plan.md b/plans/plan.md",
+              "--- /dev/null",
+              "+++ b/plans/plan.md",
+              "@@ -0,0 +1,2 @@",
+              "+# Streaming plan",
+              "+Use one timeline projection.",
+              "",
+            }, "\n"),
+          },
+        },
+      },
+    },
+  } }
+  local artifact_collapsed = interaction_renderer.build(artifact_interaction, { expanded = {} })
+  assert_true(vim.tbl_contains(artifact_collapsed.lines, "  ▸ Changed 1 artifact +2 -0"),
+    "plan submission should attach one artifact delta to its planning interaction")
+  assert_true(vim.tbl_contains(artifact_collapsed.lines, "  ▸ Resolved 2 comments"),
+    "submitted plan revisions should retain their resolved inline review count")
+  assert_true(not vim.iter(artifact_collapsed.lines):any(function(line)
+    return line:find("Name the exact dependency.", 1, true) ~= nil
+  end), "resolved comments should collapse their full bodies by default")
+  assert_true(not vim.tbl_contains(artifact_collapsed.lines, "▸ Plan created"),
+    "plan submission should not create a sibling lifecycle node")
+  assert_true(not vim.tbl_contains(artifact_collapsed.lines, "+# Streaming plan"),
+    "artifact deltas should collapse their patch by default")
+  local artifact_expanded = interaction_renderer.build(artifact_interaction, {
+    expanded = {
+      ["interaction:plan-artifact-interaction:artifact:artifact-one"] = true,
+      ["interaction:plan-artifact-interaction:resolved-comments:resolution-one"] = true,
+    },
+  })
+  assert_true(vim.iter(artifact_expanded.lines):any(function(line)
+    return line:find("Plan comment • Cargo.toml dependencies", 1, true) ~= nil
+  end), "expanded resolution rows should retain each plan-comment anchor")
+  assert_true(vim.iter(artifact_expanded.lines):any(function(line)
+    return line:find("Cover malformed metadata.", 1, true) ~= nil
+  end), "expanded resolution rows should render complete inline comment bodies")
+  assert_true(vim.iter(artifact_expanded.lines):any(function(line)
+    return line:match("^    New%s+plans/plan%.md %+2 %-0") ~= nil
+  end), "expanding an artifact delta should reveal its changed artifact")
   local attributed_execution = interaction_renderer.build({ {
     kind = "plan_execution",
     id = "execution-one",
     execution = { state = "complete" },
-    interaction = { {
-      id = "execution-interaction",
-      state = "complete",
-      duration_ms = 1000,
-      task = { current = { { id = "task-one", title = "Rewrite core", status = "completed" } } },
-      thought = { {
-        id = "thought-one",
-        text = "Rewriting core.",
+    item = {
+      {
+        kind = "task_started",
         task_id = "task-one",
-        tool = {},
-      } },
-    } },
-  } }, { expanded = { ["interaction:execution-one:task:task-one"] = true } })
-  assert_true(vim.tbl_contains(attributed_execution.lines, "▸ Executed plan (1/1) for 1s"),
-    "accepted plan execution should render as one grouped timeline node")
-  assert_true(vim.tbl_contains(attributed_execution.lines, "● Rewrite core"),
-    "execution should render the provider's final task presentation")
+        ordinal = 1,
+        total = 1,
+        title = "Rewrite core",
+      },
+      {
+        kind = "interaction",
+        interaction = {
+          id = "execution-interaction",
+          kind = "plan_execution",
+          state = "complete",
+          task = { current = { { id = "task-one", title = "Provider label", status = "completed" } } },
+          node_list = { {
+            kind = "main_segment",
+            segment = {
+              id = "execution-segment",
+              state = "complete",
+              duration_ms = 1000,
+              thought = { {
+                id = "thought-one",
+                text = "Rewriting core.",
+                task_id = "task-one",
+                tool = {},
+              } },
+            },
+          } },
+        },
+      },
+      {
+        kind = "task_completed",
+        task_id = "task-one",
+        ordinal = 1,
+        total = 1,
+        title = "Rewrite core",
+        elapsed_ms = 1000,
+      },
+    },
+  } }, { expanded = { ["interaction:execution-interaction:task:task-one"] = true } })
+  assert_true(vim.tbl_contains(attributed_execution.lines, "▸ Executed plan for 1s"),
+    "accepted plan interactions should retain their execution summary")
+  assert_true(vim.tbl_contains(attributed_execution.lines, "▸ Task 1/1 started: Rewrite core"),
+    "execution should render the canonical scheduler task title")
+  assert_true(vim.tbl_contains(attributed_execution.lines, "● Provider label"),
+    "provider task snapshots should remain available as advisory turn detail")
   assert_true(vim.tbl_contains(attributed_execution.lines, "↳ Rewriting core."),
-    "completed tasks should expand their frozen attributed thoughts")
+    "execution interactions should retain their attributed thoughts")
 
   local wrapped_tool = {
     id = "wrapped-command",
@@ -2734,6 +3097,37 @@ local ok, failure = pcall(function()
   assert_true(not vim.tbl_contains(active_tree.lines, "      line five"),
     "active tool previews should truncate output after four lines")
 
+  local long_output_tree = interaction_renderer.build({ {
+    id = "active-long-output",
+    prompt = "inspect dependency metadata",
+    state = "running",
+    thought = {},
+    active = {
+      text = "Working",
+      tool_count = 1,
+      failed_count = 0,
+      latest_tool = {
+        id = "long-output-tool",
+        kind = "command",
+        title = "Get-Content target/debug/deps/datafusion.d",
+        output = string.rep("dependency-path/", 12),
+        status = "completed",
+        failed = false,
+      },
+    },
+  } }, { content_width = 30 })
+  local long_output_line_count = vim.iter(long_output_tree.rows):fold(0, function(count, row)
+    return count + ((row or {}).kind == "active_tool_output" and 1 or 0)
+  end)
+  assert_equals(long_output_line_count, 4,
+    "active tool previews should truncate width-wrapped output after four rendered lines")
+  for line_index, row in pairs(long_output_tree.rows) do
+    if row.kind == "active_tool_output" then
+      assert_true(vim.fn.strdisplaywidth(long_output_tree.lines[line_index]) <= 30,
+        "active tool preview rows should fit the rendered content width")
+    end
+  end
+
   local mcp_active_tree = interaction_renderer.build({ {
     id = "mcp-active",
     prompt = "inspect crate metadata",
@@ -2921,7 +3315,7 @@ local ok, failure = pcall(function()
   assert_equals(vim.api.nvim_win_get_cursor(session.harness.transcript_win)[1], second_prompt_line,
     "Ctrl-z should find the next prompt from the current cursor row")
   local hello_count = 0
-  for _, item in ipairs(session.harness.interaction) do
+  for _, item in ipairs(projected_interaction_list(session.harness)) do
     if item.prompt == "hello harness" then hello_count = hello_count + 1 end
   end
   assert_equals(hello_count, 1, "broker completion should replace the optimistic interaction")
@@ -3125,17 +3519,35 @@ local ok, failure = pcall(function()
     "artifact selection did not open the physical plan")
   assert_equals(vim.bo.filetype, "markdown", "PlanReview should use markdown")
   assert_equals(vim.bo.modifiable, false, "PlanReview should render a read-only projection")
+  assert_true(vim.wo.number, "PlanReview should show absolute line numbers")
+  assert_true(not vim.wo.relativenumber, "PlanReview should hide relative line numbers")
+  assert_equals(vim.wo.statuscolumn, vim.go.statuscolumn,
+    "PlanReview should restore the configured status column inherited from the gutterless Harness window")
   assert_true(vim.fn.maparg("oY", "n", false, true).callback ~= nil, "PlanReview accept mapping missing")
   assert_true(vim.fn.maparg("oN", "n", false, true).callback ~= nil, "PlanReview request-changes mapping missing")
-  local original_select = vim.ui.select
-  vim.ui.select = function(items, _, callback) callback(items[1]) end
+  local plan_review_buf = vim.api.nvim_get_current_buf()
+  local harness_buf = session.harness.transcript_buf
+  request_count_by_method["plan.acceptance.begin"] = 0
+  plan_accept_delay_ms = 100
   vim.fn.maparg("oY", "n", false, true).callback()
-  vim.ui.select = original_select
-  assert_true(vim.wait(2000, function() return request_by_method["plan.accept"] ~= nil end, 10), "PlanReview did not submit acceptance")
-  assert_equals(request_by_method["plan.accept"].params.digest, "digest",
+  assert_true(not vim.api.nvim_buf_is_valid(plan_review_buf),
+    "PlanReview should close immediately before acceptance setup completes")
+  assert_true(vim.api.nvim_get_current_buf() == harness_buf,
+    "PlanReview acceptance should restore the originating Harness buffer")
+  assert_true(vim.wait(2000, function() return request_by_method["plan.acceptance.begin"] ~= nil end, 10),
+    "PlanReview did not begin broker-owned acceptance")
+  assert_true(vim.wait(2000, function() return not session.harness.busy end, 10),
+    "PlanReview acceptance did not settle")
+  assert_equals(request_count_by_method["plan.acceptance.begin"], 1,
+    "PlanReview should admit only one acceptance while the first remains active")
+  plan_accept_delay_ms = 0
+  assert_equals(request_by_method["plan.acceptance.begin"].params.digest, "digest",
     "PlanReview should submit the immutable canonical digest")
-  assert_equals(request_by_method["plan.accept"].params.fresh_context, false,
-    "the default approval choice should continue provider context")
+  assert_equals(session.harness.active_elicitation.owner, "plan_acceptance",
+    "PlanReview acceptance should delegate choices to the Harness question owner")
+  require("diff_review.views.harness.plan_question").close()
+  assert_true(vim.wait(2000, function() return not session.harness.plan_question_open end, 10),
+    "closing the Harness acceptance picker should settle its presentation state")
 
   vim.api.nvim_buf_set_lines(session.harness.composer_buf, 0, -1, false, { "/plan revise the feature" })
   controller.submit()
@@ -3145,21 +3557,35 @@ local ok, failure = pcall(function()
   assert_true(vim.wait(2000, function() return vim.api.nvim_buf_get_name(0) == plan_path end, 10),
     "second artifact selection did not open PlanReview")
   local original_input = vim.ui.input
-  vim.ui.input = function(options, callback)
-    if options.prompt == "Plan comment: " then callback("Name the exact module")
-    else callback("Include explicit integration coverage") end
-  end
   vim.fn.maparg("C", "n", false, true).callback()
+  vim.wait(20)
+  vim.cmd("stopinsert")
+  assert_true(vim.bo.modifiable, "PlanReview should expand a new comment into an editable inline body")
+  local comment_body_row = vim.api.nvim_win_get_cursor(0)[1]
+  vim.api.nvim_buf_set_lines(0, comment_body_row - 1, comment_body_row, false, { "Name the exact module" })
+  vim.api.nvim_exec_autocmds("TextChanged", { buffer = 0 })
+  vim.api.nvim_win_set_cursor(0, { 1, 0 })
+  vim.api.nvim_exec_autocmds("CursorMoved", { buffer = 0 })
+  assert_true(not vim.bo.modifiable, "PlanReview should collapse an inline comment after the cursor leaves")
+  assert_true(table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, false), "\n"):find("╭─", 1, true) ~= nil,
+    "PlanReview should render an unfocused annotation through the compact comment-box renderer")
+  request_count_by_method["plan.request_changes"] = 0
+  plan_request_changes_delay_ms = 100
+  vim.ui.input = function(_, callback) callback("Include explicit integration coverage") end
   vim.fn.maparg("oN", "n", false, true).callback()
   vim.ui.input = original_input
   assert_true(vim.wait(2000, function() return request_by_method["plan.request_changes"] ~= nil end, 10), "PlanReview did not request changes")
+  assert_true(vim.wait(2000, function() return not session.harness.busy end, 10),
+    "PlanReview request-changes action did not settle")
+  assert_equals(request_count_by_method["plan.request_changes"], 1,
+    "PlanReview should admit only one revision request while the first remains active")
   assert_equals(request_by_method["plan.request_changes"].params.annotations[1].body, "Name the exact module",
     "PlanReview should serialize anchored annotations")
   assert_equals(request_by_method["plan.request_changes"].params.comment, "Include explicit integration coverage",
     "PlanReview should serialize the optional overall review comment")
-  vim.cmd("tabclose")
-  assert_true(vim.wait(2000, function() return not session.harness.busy end, 10),
-    "plan review should settle before testing interaction rollback")
+  plan_request_changes_delay_ms = 0
+  assert_true(vim.api.nvim_buf_get_name(0) ~= plan_path,
+    "successful revision requests should return from PlanReview to the Harness timeline")
 
   interaction_review_list = {
     {
@@ -3310,7 +3736,8 @@ local ok, failure = pcall(function()
     "/fork should promote the pending timeline instead of opening another buffer")
   assert_true(child_transcript_buf ~= parent_transcript_buf,
     "/fork should open a distinct child timeline buffer")
-  assert_equals(#session.harness.interaction, 0, "fork timelines should not clone local interactions")
+  assert_equals(#projected_interaction_list(session.harness), 0,
+    "fork timelines should not clone local interactions")
   local fork_line = line_number(
     vim.api.nvim_buf_get_lines(child_transcript_buf, 0, -1, false),
     "  Forked from " .. parent_session_id .. " (Architecture review)"
@@ -3423,7 +3850,7 @@ local ok, failure = pcall(function()
   ))
   assert_equals(backend_preference.load(require("diff_review.infra.config").options.harness.backends, "copilot"),
     "codex", "a successful backend switch should persist the selected backend")
-end)
+end, debug.traceback)
 
 controller._set_render_observer_for_test(nil)
 client._reset_for_test()

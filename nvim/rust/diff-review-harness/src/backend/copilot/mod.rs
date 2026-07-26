@@ -8,9 +8,13 @@ use crate::backend::{
     Backend, BackendCapability, BackendCatalogRequest, BackendContextWindow, BackendDescriptor,
     BackendEvent, BackendEventSink, BackendForkRequest, BackendInput, BackendKind, BackendModel,
     BackendOutput, BackendRequest, CatalogCapability, CatalogMutation, McpDefinition, McpStatus,
-    McpToolDefinition, PromptMode, SkillDefinition,
+    McpToolDefinition, PromptMode, ProviderChangeSet, SkillDefinition, ToolActivity,
+    ToolActivityKind,
 };
-use crate::control_tools::{ControlToolInvocation, ControlToolRegistry, apply_invocation};
+use crate::control_tools::{
+    ControlToolInvocation, ControlToolRegistry, ControlToolRuntime, ControlTurnContext,
+    apply_invocation,
+};
 use crate::session::ExecutionMode;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -38,7 +42,7 @@ use std::sync::{
 };
 use tokio::sync::{Mutex, mpsc};
 
-const SYSTEM_MESSAGE: &str = "You run inside DiffReview Harness. During planning, build the canonical JSON artifact with harness_plan_create and harness_plan_edit, request its latest version with harness_plan_read, then call harness_plan_submit with its exact ID and version. During execution, call harness_plan_task_report after each whole task and harness_plan_deviation when implementation diverges from accepted intent. Call harness_plan_question whenever a material user decision remains. While questions remain pending, use harness_question_answer only for an explicit user answer and harness_question_withdraw only when no material user decision remains. The question tools work in every mode. End the turn after a Harness question or plan control call. For a terminal goal state, call harness_goal_complete or harness_goal_blocked. Never claim a control action through ordinary prose alone.";
+const SYSTEM_MESSAGE: &str = super::HARNESS_SYSTEM_MESSAGE;
 
 type SharedCopilotSession = Arc<github_copilot_sdk::session::Session>;
 type CopilotSessionSlot = Arc<Mutex<Option<SharedCopilotSession>>>;
@@ -202,6 +206,7 @@ impl CopilotBackend {
             fast_mode: false,
             execution_mode: request.execution_mode,
             backend_session_id: request.backend_session_id.clone(),
+            control_context: None,
         }
     }
 
@@ -319,7 +324,11 @@ impl Backend for CopilotBackend {
         let session = self.session(&request).await?;
         let mut subscription = session.subscribe();
         let control_router = self.control_router(&request.harness_session_id).await;
-        let mut control_stream = control_router.activate()?;
+        let control_context = request
+            .control_context
+            .clone()
+            .unwrap_or_else(|| ControlTurnContext::inactive(request.mode));
+        let mut control_stream = control_router.activate(control_context)?;
         let mut output = BackendOutput {
             backend_session_id: Some(session.id().to_string()),
             capability: capability(),
@@ -381,7 +390,7 @@ impl Backend for CopilotBackend {
             }
         };
         let prompt = format!(
-            "Harness interaction contract: when the user explicitly asks for interactive or multiple-choice questions, call harness_plan_question with the complete question set. While questions remain pending, use harness_question_answer only for an explicit user answer and harness_question_withdraw only when no material user decision remains. The question tools work outside planning. Do not claim control actions through prose.\n\n{}",
+            "Harness interaction contract: when the user explicitly asks for interactive or multiple-choice questions, call harness_question_ask with the complete question set. While questions remain pending, use harness_question_answer only for an explicit user answer and harness_question_withdraw only when no material user decision remains. The question tools work outside planning. Do not claim control actions through prose.\n\n{}",
             provider_text
         );
         session
@@ -431,16 +440,30 @@ impl Backend for CopilotBackend {
                     }
                 }
                 invocation = control_stream.receive() => {
-                    if let Some(invocation) = invocation
-                        && let Err(error) = apply_invocation(&invocation, &mut output)
-                    {
-                        output.control_error = Some(format!("{error:#}"));
+                    if let Some(invocation) = invocation {
+                        let result = apply_invocation(&invocation, &mut output);
+                        control_stream.publish_completion(
+                            invocation,
+                            result.as_ref().err().map(|error| format!("{error:#}")),
+                            &mut output,
+                            event_sink.as_ref(),
+                        );
+                        if let Err(error) = result {
+                            output.control_error = Some(format!("{error:#}"));
+                        }
                     }
                 }
             }
         }
         while let Ok(invocation) = control_stream.try_receive() {
-            if let Err(error) = apply_invocation(&invocation, &mut output) {
+            let result = apply_invocation(&invocation, &mut output);
+            control_stream.publish_completion(
+                invocation,
+                result.as_ref().err().map(|error| format!("{error:#}")),
+                &mut output,
+                event_sink.as_ref(),
+            );
+            if let Err(error) = result {
                 output.control_error = Some(format!("{error:#}"));
             }
         }
@@ -964,10 +987,11 @@ fn model_options(
 #[derive(Default)]
 struct ControlToolRouter {
     sender: StandardMutex<Option<mpsc::UnboundedSender<ControlToolInvocation>>>,
+    runtime: StandardMutex<Option<ControlToolRuntime>>,
 }
 
 impl ControlToolRouter {
-    fn activate(self: &Arc<Self>) -> Result<ControlToolStream> {
+    fn activate(self: &Arc<Self>, context: ControlTurnContext) -> Result<ControlToolStream> {
         let mut sender = self
             .sender
             .lock()
@@ -978,26 +1002,44 @@ impl ControlToolRouter {
         );
         let (active_sender, receiver) = mpsc::unbounded_channel();
         *sender = Some(active_sender);
+        *self
+            .runtime
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Copilot control-tool runtime lock poisoned"))? =
+            Some(ControlToolRuntime::new(context));
         Ok(ControlToolStream {
             router: Arc::clone(self),
             receiver,
+            next_activity_id: 0,
         })
     }
 
-    fn route(&self, invocation: ControlToolInvocation) -> Result<()> {
+    fn route(&self, invocation: ControlToolInvocation) -> Result<String> {
+        let result = self
+            .runtime
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Copilot control-tool runtime lock poisoned"))?
+            .as_mut()
+            .context("Copilot control tool ran without an active turn")?
+            .invoke(invocation.clone())?;
+        let Some(invocation) = result.invocation else {
+            return Ok(result.message);
+        };
         self.sender
             .lock()
             .map_err(|_| anyhow::anyhow!("Copilot control-tool router lock poisoned"))?
             .as_ref()
             .context("Copilot control tool ran without an active turn")?
             .send(invocation)
-            .context("route Copilot control tool")
+            .context("route Copilot control tool")?;
+        Ok(result.message)
     }
 }
 
 struct ControlToolStream {
     router: Arc<ControlToolRouter>,
     receiver: mpsc::UnboundedReceiver<ControlToolInvocation>,
+    next_activity_id: u64,
 }
 
 impl ControlToolStream {
@@ -1008,12 +1050,57 @@ impl ControlToolStream {
     fn try_receive(&mut self) -> Result<ControlToolInvocation, mpsc::error::TryRecvError> {
         self.receiver.try_recv()
     }
+
+    /// Publish one completed Harness control call through the shared tool timeline.
+    fn publish_completion(
+        &mut self,
+        invocation: ControlToolInvocation,
+        error: Option<String>,
+        output: &mut BackendOutput,
+        event_sink: Option<&BackendEventSink>,
+    ) {
+        self.next_activity_id += 1;
+        let event = BackendEvent {
+            kind: "tool".into(),
+            text: None,
+            data: Value::Null,
+            activity: Some(ToolActivity {
+                id: format!("harness-control-{}", self.next_activity_id),
+                kind: ToolActivityKind::ToolCall,
+                title: invocation.name,
+                output: Some(
+                    error
+                        .clone()
+                        .unwrap_or_else(|| "Recorded by DiffReview Harness".into()),
+                ),
+                status: Some(
+                    if error.is_some() {
+                        "failed"
+                    } else {
+                        "completed"
+                    }
+                    .into(),
+                ),
+                change: ProviderChangeSet::default(),
+                output_delta: false,
+            }),
+            summary: None,
+            task_update: None,
+        };
+        if let Some(event_sink) = event_sink {
+            let _ = event_sink.send(event.clone());
+        }
+        output.event.push(event);
+    }
 }
 
 impl Drop for ControlToolStream {
     fn drop(&mut self) {
         if let Ok(mut sender) = self.router.sender.lock() {
             *sender = None;
+        }
+        if let Ok(mut runtime) = self.router.runtime.lock() {
+            *runtime = None;
         }
     }
 }
@@ -1034,7 +1121,7 @@ impl ToolHandler for CopilotControlToolHandler {
             arguments: invocation.arguments,
         });
         Ok(match result {
-            Ok(()) => ToolResult::Text(format!("{name} accepted by DiffReview Harness")),
+            Ok(message) => ToolResult::Text(message),
             Err(error) => ToolResult::Text(format!("{name} failed: {error:#}")),
         })
     }
@@ -1164,17 +1251,44 @@ mod test {
     #[tokio::test]
     async fn routes_control_tools_without_provider_specific_schemas() {
         let router = Arc::new(ControlToolRouter::default());
-        let mut stream = router.activate().unwrap();
+        let mut context = ControlTurnContext::inactive(PromptMode::Chat);
+        context.has_active_goal = true;
+        let mut stream = router.activate(context).unwrap();
         router
             .route(ControlToolInvocation {
                 name: "harness_goal_complete".into(),
-                arguments: Value::Null,
+                arguments: serde_json::json!({ "summary": "Complete" }),
             })
             .unwrap();
         assert_eq!(
             stream.receive().await.unwrap().name,
             "harness_goal_complete"
         );
+    }
+
+    #[test]
+    fn publishes_control_tools_through_the_shared_timeline() {
+        let router = Arc::new(ControlToolRouter::default());
+        let mut stream = router
+            .activate(ControlTurnContext::inactive(PromptMode::Chat))
+            .unwrap();
+        let (event_sink, mut event_stream) = mpsc::unbounded_channel();
+        let mut output = BackendOutput::default();
+
+        stream.publish_completion(
+            ControlToolInvocation {
+                name: "harness_plan_read".into(),
+                arguments: Value::Null,
+            },
+            None,
+            &mut output,
+            Some(&event_sink),
+        );
+
+        let activity = output.event[0].activity.as_ref().expect("tool activity");
+        assert_eq!(activity.title, "harness_plan_read");
+        assert_eq!(activity.status.as_deref(), Some("completed"));
+        assert_eq!(event_stream.try_recv().unwrap().kind, "tool");
     }
 
     #[test]
@@ -1190,6 +1304,7 @@ mod test {
             fast_mode: false,
             execution_mode: ExecutionMode::Read,
             backend_session_id: None,
+            control_context: None,
         };
         let model_list = vec![BackendModel {
             id: "gpt-test".into(),

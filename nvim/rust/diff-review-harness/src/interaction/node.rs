@@ -1,4 +1,5 @@
 use super::{ActiveThoughtUpdate, CompletedThought};
+use crate::plan::PlanAnnotation;
 use serde::{Deserialize, Serialize};
 
 /// Represents one durable item at a fixed position in an interaction timeline.
@@ -8,6 +9,8 @@ pub enum InteractionNode {
     MainSegment { segment: Box<MainSegment> },
     AgentReference { agent: AgentReference },
     SteeringPrompt { prompt: SteeringPrompt },
+    PlanCommentResolution { resolution: PlanCommentResolution },
+    ArtifactChange { change: ArtifactChange },
 }
 
 impl InteractionNode {
@@ -16,8 +19,27 @@ impl InteractionNode {
             Self::MainSegment { segment } => &segment.id,
             Self::AgentReference { agent } => &agent.id,
             Self::SteeringPrompt { prompt } => &prompt.id,
+            Self::PlanCommentResolution { resolution } => &resolution.id,
+            Self::ArtifactChange { change } => &change.id,
         }
     }
+}
+
+/// Represents inline review comments resolved by one submitted plan revision.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PlanCommentResolution {
+    pub id: String,
+    pub annotation: Vec<PlanAnnotation>,
+    pub created_at_ms: i64,
+}
+
+/// Represents one canonical artifact delta produced by an interaction.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ArtifactChange {
+    pub id: String,
+    pub path: String,
+    pub diff_text: String,
+    pub created_at_ms: i64,
 }
 
 /// Defines whether one main-agent segment still accepts streamed provider events.

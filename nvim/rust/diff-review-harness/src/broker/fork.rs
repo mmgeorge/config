@@ -106,6 +106,7 @@ pub fn prepare_provider_fork(
             fast_mode: source.fast_mode,
             execution_mode: ExecutionMode::Read,
             backend_session_id: fork_point.backend_session_id,
+            control_context: None,
         },
         target_harness_session_id: target_session_id,
         checkpoint_id: fork_point.checkpoint_id,

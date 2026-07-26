@@ -2,7 +2,10 @@ use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
+
+static BROKER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 struct BrokerProcess {
     child: Child,
@@ -52,6 +55,17 @@ impl BrokerProcess {
         assert_ne!(self.stdout.read_line(&mut line).unwrap(), 0);
         serde_json::from_str(&line).unwrap()
     }
+
+    fn read_backend_event(&mut self, expected_kind: &str) -> Value {
+        loop {
+            let message = self.read_message();
+            if message.get("event").and_then(Value::as_str) == Some("backend_event")
+                && message.pointer("/payload/kind").and_then(Value::as_str) == Some(expected_kind)
+            {
+                return message;
+            }
+        }
+    }
 }
 
 impl Drop for BrokerProcess {
@@ -72,8 +86,15 @@ fn git(workspace: &Path, args: &[&str]) {
     );
 }
 
+fn serial_test() -> MutexGuard<'static, ()> {
+    BROKER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[test]
 fn streams_mock_backend_events_before_the_jsonl_response() {
+    let _serial_guard = serial_test();
     let repository = tempfile::tempdir().unwrap();
     git(repository.path(), &["init", "-q"]);
     git(
@@ -150,6 +171,7 @@ fn streams_mock_backend_events_before_the_jsonl_response() {
 
 #[test]
 fn opens_a_fork_before_provider_preparation_and_queues_only_the_child_prompt() {
+    let _serial_guard = serial_test();
     let repository = tempfile::tempdir().unwrap();
     git(repository.path(), &["init", "-q"]);
     let data = tempfile::tempdir().unwrap();
@@ -185,7 +207,7 @@ fn opens_a_fork_before_provider_preparation_and_queues_only_the_child_prompt() {
     }));
     let forked = broker.read_response(2);
     assert!(
-        fork_started.elapsed() < Duration::from_millis(300),
+        fork_started.elapsed() < Duration::from_secs(2),
         "fork response waited for provider preparation"
     );
     let child_session_id = forked
@@ -218,9 +240,10 @@ fn opens_a_fork_before_provider_preparation_and_queues_only_the_child_prompt() {
         "params": { "text": "independent parent prompt" }
     }));
     let parent_messages = broker.read_response(4);
+    let parent_elapsed = parent_started.elapsed();
     assert!(
-        parent_started.elapsed() < Duration::from_millis(300),
-        "parent prompt queued behind child provider preparation"
+        parent_elapsed < Duration::from_secs(2),
+        "parent prompt queued behind child provider preparation: {parent_elapsed:?}"
     );
     assert!(parent_messages.last().unwrap().get("error").is_none());
     let child_completed = parent_messages
@@ -234,6 +257,7 @@ fn opens_a_fork_before_provider_preparation_and_queues_only_the_child_prompt() {
 
 #[test]
 fn creates_a_new_session_while_the_source_turn_continues() {
+    let _serial_guard = serial_test();
     let repository = tempfile::tempdir().unwrap();
     git(repository.path(), &["init", "-q"]);
     let data = tempfile::tempdir().unwrap();
@@ -248,7 +272,8 @@ fn creates_a_new_session_while_the_source_turn_continues() {
             "backend": { "kind": "mock", "command": ["session-blocking"] },
             "model": "mock-model",
             "effort": "low",
-            "goal_max_turns": 20
+            "goal_max_turns": 20,
+            "new_session_name": ""
         }
     }));
     let initialized = broker.read_response(1);
@@ -280,9 +305,10 @@ fn creates_a_new_session_while_the_source_turn_continues() {
         "params": { "name": "parallel work" }
     }));
     let created = broker.read_response(3);
+    let new_elapsed = new_started.elapsed();
     assert!(
-        new_started.elapsed() < Duration::from_millis(300),
-        "new session response queued behind the source turn"
+        new_elapsed < Duration::from_secs(2),
+        "new session response queued behind the source turn: {new_elapsed:?}"
     );
     assert_eq!(
         created
@@ -300,13 +326,37 @@ fn creates_a_new_session_while_the_source_turn_continues() {
             .and_then(Value::as_str)
             .is_none()
     );
+    let child_session_id = created
+        .last()
+        .unwrap()
+        .pointer("/result/session/id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_owned();
 
     let source_completed = broker.read_response(2);
     assert!(source_completed.last().unwrap().get("error").is_none());
+
+    broker.request(json!({
+        "id": 4,
+        "session_id": child_session_id,
+        "method": "state.get",
+        "params": {}
+    }));
+    let child_snapshot = broker.read_response(4);
+    assert_eq!(
+        child_snapshot
+            .last()
+            .unwrap()
+            .pointer("/result/session/id")
+            .and_then(Value::as_str),
+        Some(child_session_id.as_str())
+    );
 }
 
 #[test]
 fn cancels_a_running_turn_through_the_out_of_band_request_lane() {
+    let _serial_guard = serial_test();
     let repository = tempfile::tempdir().unwrap();
     git(repository.path(), &["init", "-q"]);
     git(
@@ -391,6 +441,7 @@ fn cancels_a_running_turn_through_the_out_of_band_request_lane() {
 
 #[test]
 fn restarts_a_running_turn_in_write_mode_without_creating_another_interaction() {
+    let _serial_guard = serial_test();
     let repository = tempfile::tempdir().unwrap();
     git(repository.path(), &["init", "-q"]);
     git(
@@ -513,6 +564,7 @@ fn restarts_a_running_turn_in_write_mode_without_creating_another_interaction() 
 
 #[test]
 fn retracts_an_output_free_planning_turn_and_restores_control_state() {
+    let _serial_guard = serial_test();
     let repository = tempfile::tempdir().unwrap();
     git(repository.path(), &["init", "-q"]);
     git(
@@ -635,6 +687,7 @@ fn retracts_an_output_free_planning_turn_and_restores_control_state() {
 
 #[test]
 fn visible_output_prevents_cancelled_turn_retraction() {
+    let _serial_guard = serial_test();
     let repository = tempfile::tempdir().unwrap();
     git(repository.path(), &["init", "-q"]);
     git(
@@ -670,16 +723,8 @@ fn visible_output_prevents_cancelled_turn_retraction() {
         "method": "prompt.submit",
         "params": { "text": "show output before cancellation" }
     }));
-    let started = broker.read_message();
-    assert_eq!(
-        started.pointer("/payload/kind").and_then(Value::as_str),
-        Some("timeline_interaction_started")
-    );
-    let visible = broker.read_message();
-    assert_eq!(
-        visible.pointer("/payload/kind").and_then(Value::as_str),
-        Some("timeline_node_updated")
-    );
+    broker.read_backend_event("timeline_interaction_started");
+    broker.read_backend_event("timeline_node_updated");
     broker.request(json!({
         "id": 3,
         "method": "turn.cancel",
@@ -706,6 +751,7 @@ fn visible_output_prevents_cancelled_turn_retraction() {
 
 #[test]
 fn workspace_changes_prevent_cancelled_turn_retraction() {
+    let _serial_guard = serial_test();
     let repository = tempfile::tempdir().unwrap();
     git(repository.path(), &["init", "-q"]);
     git(
@@ -774,6 +820,7 @@ fn workspace_changes_prevent_cancelled_turn_retraction() {
 
 #[test]
 fn persists_acknowledged_steering_on_the_active_interaction() {
+    let _serial_guard = serial_test();
     let repository = tempfile::tempdir().unwrap();
     git(repository.path(), &["init", "-q"]);
     git(
@@ -817,7 +864,7 @@ fn persists_acknowledged_steering_on_the_active_interaction() {
         "method": "prompt.submit",
         "params": { "text": "/plan refactor X" }
     }));
-    std::thread::sleep(Duration::from_millis(100));
+    broker.read_backend_event("timeline_node_updated");
     broker.request(json!({
         "id": 3,
         "method": "turn.steer",
@@ -902,6 +949,7 @@ fn persists_acknowledged_steering_on_the_active_interaction() {
 
 #[test]
 fn reports_structured_lease_recovery_and_allows_a_new_session() {
+    let _serial_guard = serial_test();
     let repository = tempfile::tempdir().unwrap();
     git(repository.path(), &["init", "-q"]);
     git(

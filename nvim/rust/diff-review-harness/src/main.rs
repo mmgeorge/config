@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use diff_review_harness::backend::BackendEvent;
 use diff_review_harness::broker::{
     BrokerRuntime, HarnessBroker, InitializeRequest, TurnCancellation, prepare_new_session,
     prepare_provider_fork,
@@ -128,8 +129,13 @@ impl SessionControllerRegistry {
         }
         let mut initialize = self.initialize.clone();
         initialize.session_id = Some(session_id.to_owned());
+        initialize.new_session_name = None;
         initialize.lease_conflict_action = None;
         let broker = HarnessBroker::initialize_with_runtime(initialize, Arc::clone(&self.runtime))?;
+        anyhow::ensure!(
+            broker.snapshot()?.session.id == session_id,
+            "resolved Harness controller does not own requested session {session_id}"
+        );
         let controller = SessionController::new(broker);
         controller_by_id.insert(session_id.to_owned(), Arc::clone(&controller));
         Ok(controller)
@@ -166,16 +172,12 @@ impl SessionControllerRegistry {
     }
 }
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main]
 async fn main() -> Result<()> {
-    tokio::task::LocalSet::new()
-        .run_until(async {
-            match Argument::parse().command {
-                Some(Command::Mcp) => diff_review_harness::control_tools::run_stdio().await,
-                None => run_broker().await,
-            }
-        })
-        .await
+    match Argument::parse().command {
+        Some(Command::Mcp) => diff_review_harness::control_tools::run_stdio().await,
+        None => run_broker().await,
+    }
 }
 
 async fn run_broker() -> Result<()> {
@@ -241,9 +243,16 @@ async fn run_broker() -> Result<()> {
         let session_id = envelope
             .session_id
             .unwrap_or_else(|| initial_session_id.clone());
+        if request_requires_provider_fork(&envelope.request.method) {
+            registry
+                .resolve(&session_id)
+                .await?
+                .cancellation
+                .arm(envelope.request.method == "prompt.submit");
+        }
         let registry = Arc::clone(&registry);
         let message_sink = message_sink.clone();
-        tokio::task::spawn_local(async move {
+        tokio::spawn(async move {
             let request_id = envelope.request.id;
             if let Err(error) =
                 route_request(registry, session_id, envelope.request, &message_sink).await
@@ -289,10 +298,10 @@ async fn route_request(
         return Ok(());
     }
 
-    controller
-        .cancellation
-        .arm(request.method == "prompt.submit");
-    let (event_sink, mut event_stream) = mpsc::unbounded_channel();
+    if !request_requires_provider_fork(&request.method) {
+        controller.cancellation.arm(false);
+    }
+    let (event_sink, mut event_stream) = mpsc::unbounded_channel::<BackendEvent>();
     let (data_root, lease_session_id, client_id) = controller.broker.lock().await.lease_identity();
     let (heartbeat_stop, heartbeat_stopped) = tokio::sync::oneshot::channel();
     let heartbeat = tokio::spawn(run_lease_heartbeat(
@@ -305,10 +314,18 @@ async fn route_request(
     let routed_session_id = session_id.clone();
     let event_forwarder = tokio::spawn(async move {
         while let Some(event) = event_stream.recv().await {
+            let (event_name, payload) = if event.kind == "timeline_patch" {
+                ("timeline_patch".to_owned(), event.data)
+            } else {
+                (
+                    "backend_event".to_owned(),
+                    serde_json::to_value(event).unwrap_or(Value::Null),
+                )
+            };
             let _ = message_sink_for_event.send(BrokerMessage::Event(BrokerEvent {
                 session_id: routed_session_id.clone(),
-                event: "backend_event".into(),
-                payload: serde_json::to_value(event).unwrap_or(Value::Null),
+                event: event_name,
+                payload,
             }));
         }
     });
@@ -417,7 +434,7 @@ async fn route_session_fork(
 
     let message_sink = message_sink.clone();
     let registry_for_completion = Arc::clone(&registry);
-    tokio::task::spawn_local(async move {
+    tokio::spawn(async move {
         let backend_started = Instant::now();
         let mut result = backend
             .fork(preparation.backend_request)

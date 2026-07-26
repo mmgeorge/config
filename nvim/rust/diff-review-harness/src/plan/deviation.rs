@@ -1,5 +1,5 @@
 use super::document::PlanDocument;
-use super::edit::{PlanEditOperation, PlanEditRequest, apply_plan_edit};
+use super::edit::{PlanEditRequest, PlanMutation, apply_plan_edit};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
@@ -46,7 +46,7 @@ pub struct PlanDeviation {
     #[serde(default)]
     pub affected_paths: Vec<String>,
     #[serde(default)]
-    pub proposed_operations: Vec<PlanEditOperation>,
+    pub proposed_changes: PlanMutation,
     pub created_at_ms: i64,
     pub resolved_at_ms: Option<i64>,
 }
@@ -63,7 +63,7 @@ pub struct PlanDeviationRequest {
     #[serde(default)]
     pub affected_paths: Vec<String>,
     #[serde(default)]
-    pub proposed_operations: Vec<PlanEditOperation>,
+    pub proposed_changes: PlanMutation,
 }
 
 impl PlanDeviation {
@@ -79,12 +79,12 @@ impl PlanDeviation {
         );
         match self.kind {
             PlanDeviationKind::Informational => anyhow::ensure!(
-                self.proposed_operations.is_empty(),
+                self.proposed_changes.is_empty(),
                 "informational deviation cannot change the plan"
             ),
             PlanDeviationKind::Scope => anyhow::ensure!(
-                !self.proposed_operations.is_empty(),
-                "scope deviation requires semantic operations"
+                !self.proposed_changes.is_empty(),
+                "scope deviation requires semantic changes"
             ),
         }
         Ok(())
@@ -121,7 +121,7 @@ pub fn build_effective_plan(
             PlanEditRequest {
                 plan_id: document.plan_id.clone(),
                 expected_version: document.version,
-                operations: deviation.proposed_operations.clone(),
+                mutation: deviation.proposed_changes.clone(),
             },
         )?;
         document = result.document;
@@ -152,9 +152,15 @@ mod test {
             task_id: Some("task".into()),
             subtask_id: None,
             affected_paths: Vec::new(),
-            proposed_operations: vec![PlanEditOperation::OverviewUpdate {
-                text: "Effective".into(),
-            }],
+            proposed_changes: PlanMutation {
+                plan: Some(super::super::edit::PlanFieldMutation {
+                    modify: super::super::edit::PlanFieldPatch {
+                        overview: Some("Effective".into()),
+                        ..Default::default()
+                    },
+                }),
+                ..Default::default()
+            },
             created_at_ms: 1,
             resolved_at_ms: Some(1),
         };

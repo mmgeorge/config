@@ -70,9 +70,6 @@ M.empty_diff_rows = {}
 ---@field capability table
 ---@field model_list table[]?
 ---@field model_backend string?
----@field interaction table[]
----@field interaction_by_id table<string, table>
----@field pending_interaction table?
 ---@field render_rows table<integer, table>
 ---@field fold_installed table<string, boolean>
 ---@field activity_expanded table<string, boolean>
@@ -95,7 +92,8 @@ M.empty_diff_rows = {}
 ---@field approval_open boolean
 ---@field artifact table[]
 ---@field timeline table[]
----@field local_session_event table[]?
+---@field timeline_revision integer
+---@field status table
 ---@field plan_annotations table[]
 ---@field no_checkpoint boolean
 ---@field plan_review table?
@@ -110,12 +108,12 @@ M.empty_diff_rows = {}
 ---@field presented_question_key string?
 ---@field timeline_status_timer uv.uv_timer_t?
 ---@field timeline_status_line integer?
+---@field timeline_status_trace_fingerprint string?
 ---@field prompt_history string[]
 ---@field prompt_history_index integer
 ---@field prompt_history_draft string?
 ---@field agent table
 ---@field selected_agent_run_id string?
----@field agent_live table<string, table>
 
 --- Build one Neovim presentation owner for one concurrently resident Harness session.
 ---@return DiffReviewHarnessPresentationState
@@ -128,9 +126,6 @@ local function new_harness_state()
   mode_restart_requested = false,
   session = nil,
   capability = {},
-  interaction = {},
-  interaction_by_id = {},
-  pending_interaction = nil,
   render_rows = {},
   fold_installed = {},
   activity_expanded = {},
@@ -147,12 +142,15 @@ local function new_harness_state()
   prompt_line = {},
   activity_range = {},
   active_plan = nil,
+  goal_execution = nil,
   active_elicitation = nil,
   active_wait = nil,
   approval = {},
   approval_open = false,
   artifact = {},
   timeline = {},
+  timeline_revision = 0,
+  status = { kind = "idle" },
   plan_annotations = {},
   no_checkpoint = false,
   plan_review = nil,
@@ -165,7 +163,6 @@ local function new_harness_state()
   prompt_history_draft = nil,
   agent = { definition = {}, run = {}, turn = {} },
   selected_agent_run_id = nil,
-  agent_live = {},
   }
 end
 

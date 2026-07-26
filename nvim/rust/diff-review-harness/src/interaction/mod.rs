@@ -8,7 +8,8 @@ mod timeline;
 
 pub use change::ProviderChangeIndex;
 pub use node::{
-    ActiveWait, AgentReference, InteractionNode, MainSegment, SegmentState, SteeringPrompt,
+    ActiveWait, AgentReference, ArtifactChange, InteractionNode, MainSegment,
+    PlanCommentResolution, SegmentState, SteeringPrompt,
 };
 pub use task::{TaskItem, TaskSnapshot, TaskTracker};
 pub use timeline::{
@@ -66,43 +67,45 @@ pub struct InteractionRecord {
 impl InteractionRecord {
     /// Start or return the running main-agent segment for this interaction.
     pub fn ensure_running_segment(&mut self, now_ms: i64) -> &mut MainSegment {
-        let running = self.node_list.last().is_some_and(|node| {
+        let running_index = self.node_list.iter().rposition(|node| {
             matches!(
                 node,
                 InteractionNode::MainSegment { segment }
                     if segment.state == SegmentState::Running
             )
         });
-        if !running {
-            let segment_ordinal = self
-                .node_list
-                .iter()
-                .filter(|node| matches!(node, InteractionNode::MainSegment { .. }))
-                .count()
-                + 1;
-            self.node_list.push(InteractionNode::MainSegment {
-                segment: Box::new(MainSegment::running(
-                    format!("{}:segment:{segment_ordinal}", self.id),
-                    now_ms,
-                )),
-            });
-        }
-        match self.node_list.last_mut() {
-            Some(InteractionNode::MainSegment { segment }) => segment,
-            _ => unreachable!("running segment must be the final interaction node"),
+        let segment_index = match running_index {
+            Some(index) => index,
+            None => {
+                let segment_ordinal = self
+                    .node_list
+                    .iter()
+                    .filter(|node| matches!(node, InteractionNode::MainSegment { .. }))
+                    .count()
+                    + 1;
+                self.node_list.push(InteractionNode::MainSegment {
+                    segment: Box::new(MainSegment::running(
+                        format!("{}:segment:{segment_ordinal}", self.id),
+                        now_ms,
+                    )),
+                });
+                self.node_list.len() - 1
+            }
+        };
+        match &mut self.node_list[segment_index] {
+            InteractionNode::MainSegment { segment } => segment,
+            _ => unreachable!("running segment index must address a main segment"),
         }
     }
 
     /// Return the current running main-agent segment when one exists.
     pub fn running_segment_mut(&mut self) -> Option<&mut MainSegment> {
-        match self.node_list.last_mut() {
-            Some(InteractionNode::MainSegment { segment })
-                if segment.state == SegmentState::Running =>
-            {
-                Some(segment)
+        self.node_list.iter_mut().rev().find_map(|node| match node {
+            InteractionNode::MainSegment { segment } if segment.state == SegmentState::Running => {
+                Some(segment.as_mut())
             }
             _ => None,
-        }
+        })
     }
 
     /// Complete the running segment without creating a historical wait event.
@@ -226,8 +229,35 @@ mod test {
                 InteractionNode::MainSegment { .. } => "segment",
                 InteractionNode::AgentReference { .. } => "agent",
                 InteractionNode::SteeringPrompt { .. } => "steering",
+                InteractionNode::PlanCommentResolution { .. } => "resolution",
+                InteractionNode::ArtifactChange { .. } => "artifact",
             })
             .collect::<Vec<_>>();
         assert_eq!(kind_list, ["segment", "agent", "steering", "segment"]);
+    }
+
+    #[test]
+    fn completes_the_running_segment_across_an_appended_plan_artifact() {
+        let mut interaction = interaction();
+        interaction.ensure_running_segment(10);
+        interaction.node_list.push(InteractionNode::ArtifactChange {
+            change: node::ArtifactChange {
+                id: "artifact-one".into(),
+                path: "plan.md".into(),
+                diff_text: "plan".into(),
+                created_at_ms: 20,
+            },
+        });
+
+        interaction.ensure_running_segment(30).response = Some("Submitted".into());
+        interaction.complete_running_segment(210);
+
+        assert_eq!(interaction.node_list.len(), 2);
+        let InteractionNode::MainSegment { segment } = &interaction.node_list[0] else {
+            panic!("first node must remain the main segment");
+        };
+        assert_eq!(segment.duration_ms, 200);
+        assert_eq!(segment.completed_at_ms, Some(210));
+        assert_eq!(segment.response.as_deref(), Some("Submitted"));
     }
 }
