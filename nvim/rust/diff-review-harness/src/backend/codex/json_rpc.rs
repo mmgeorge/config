@@ -176,7 +176,8 @@ pub struct CodexJsonRpc {
     planning_feedback: bool,
     plan_document: Option<PlanDocument>,
     control_runtime: Option<ControlToolRuntime>,
-    control_invocation_key_set: HashSet<String>,
+    rendered_control_invocation_key_set: HashSet<String>,
+    accepted_control_invocation_key_set: HashSet<String>,
     permission_coordinator: Arc<PermissionCoordinator>,
     event_sink: Option<BackendEventSink>,
     trace: Arc<TraceStore>,
@@ -205,7 +206,8 @@ impl CodexJsonRpc {
             planning_feedback: false,
             plan_document: None,
             control_runtime: None,
-            control_invocation_key_set: HashSet::new(),
+            rendered_control_invocation_key_set: HashSet::new(),
+            accepted_control_invocation_key_set: HashSet::new(),
             permission_coordinator,
             event_sink,
             trace,
@@ -223,7 +225,8 @@ impl CodexJsonRpc {
         self.workspace = workspace.to_owned();
         self.execution_mode = execution_mode;
         self.event_sink = event_sink;
-        self.control_invocation_key_set.clear();
+        self.rendered_control_invocation_key_set.clear();
+        self.accepted_control_invocation_key_set.clear();
         self.control_runtime = None;
     }
 
@@ -307,13 +310,23 @@ impl CodexJsonRpc {
         let rejects_question_resolution =
             rejects_question_resolution(self.planning_feedback, method, &message);
         let repeats_control_invocation = control_invocation_key(method, &message)
-            .is_some_and(|key| !self.control_invocation_key_set.insert(key));
+            .is_some_and(|key| !self.rendered_control_invocation_key_set.insert(key));
         let provider_request_success =
             if message.get("id").is_some() && message.get("method").is_some() {
                 Some(self.respond_to_provider_request(&message).await?)
             } else {
                 None
             };
+        if !rejects_question_resolution
+            && let Some(response_success) = provider_request_success
+            && should_apply_control_request_semantics(
+                &message,
+                &mut self.accepted_control_invocation_key_set,
+                response_success,
+            )
+        {
+            apply_control_request_result(&message, output, response_success)?;
+        }
         let completed_control_lifecycle = repeats_control_invocation
             && control_tool_name(method, message.get("params").unwrap_or(&Value::Null)).is_some()
             && method.eq_ignore_ascii_case("item/completed");
@@ -325,10 +338,7 @@ impl CodexJsonRpc {
                 output,
                 self.event_sink.as_ref(),
                 &self.workspace,
-                should_apply_control_semantics(
-                    repeats_control_invocation,
-                    provider_request_success,
-                ),
+                false,
             );
         }
         Ok(message)
@@ -747,11 +757,39 @@ impl CodexJsonRpc {
     }
 }
 
-fn should_apply_control_semantics(
-    repeats_control_invocation: bool,
-    provider_request_success: Option<bool>,
+fn apply_control_request_result(
+    message: &Value,
+    output: &mut BackendOutput,
+    response_success: bool,
+) -> Result<()> {
+    if !response_success {
+        return Ok(());
+    }
+    let method = message
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let params = message.get("params").unwrap_or(&Value::Null);
+    let Some(invocation) = control_invocation(method, params)? else {
+        return Ok(());
+    };
+    apply_invocation(&invocation, output)
+}
+
+fn should_apply_control_request_semantics(
+    message: &Value,
+    accepted_control_invocation_key_set: &mut HashSet<String>,
+    response_success: bool,
 ) -> bool {
-    !repeats_control_invocation && provider_request_success.unwrap_or(true)
+    response_success
+        && control_invocation_key(
+            message
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            message,
+        )
+        .is_none_or(|key| accepted_control_invocation_key_set.insert(key))
 }
 
 fn rejects_question_resolution(planning_feedback: bool, method: &str, value: &Value) -> bool {
@@ -1782,33 +1820,65 @@ mod test {
     use super::*;
 
     #[test]
-    fn exports_only_semantically_accepted_control_requests() {
-        assert!(!should_apply_control_semantics(false, Some(false)));
-        assert!(should_apply_control_semantics(false, Some(true)));
-        assert!(should_apply_control_semantics(false, None));
-        assert!(!should_apply_control_semantics(true, Some(true)));
-    }
-
-    #[test]
-    fn rejected_control_request_does_not_poison_corrected_output() {
-        let request = |overview: &str| {
+    fn lifecycle_events_cannot_poison_a_corrected_control_request() {
+        let invocation = |method: &str, overview: &str| {
             json!({
-                "id": overview,
-                "method": "item/tool/call",
+                "method": method,
                 "params": {
-                    "tool": "harness_plan_edit",
-                    "arguments": {
-                        "plan_id": "plan-1",
-                        "expected_version": 1,
-                        "plan": { "modify": { "overview": overview } }
+                    "item": {
+                        "id": overview,
+                        "type": "dynamicToolCall",
+                        "tool": "harness_plan_edit",
+                        "arguments": {
+                            "plan_id": "plan-1",
+                            "expected_version": 1,
+                            "plan": { "modify": { "overview": overview } }
+                        }
                     }
                 }
             })
         };
+        let request = |overview: &str| {
+            let mut request = invocation("item/started", overview);
+            request["id"] = Value::String(overview.to_owned());
+            request["method"] = Value::String("item/tool/call".into());
+            request
+        };
         let mut output = BackendOutput::default();
 
-        normalize_event_in_workspace(&request("rejected"), &mut output, None, "", false);
-        normalize_event_in_workspace(&request("corrected"), &mut output, None, "", true);
+        normalize_event_in_workspace(
+            &invocation("item/started", "rejected"),
+            &mut output,
+            None,
+            "",
+            false,
+        );
+        normalize_event_in_workspace(
+            &invocation("item/completed", "rejected"),
+            &mut output,
+            None,
+            "",
+            false,
+        );
+        assert!(output.plan_edit.is_empty());
+
+        normalize_event_in_workspace(
+            &invocation("item/started", "corrected"),
+            &mut output,
+            None,
+            "",
+            false,
+        );
+        apply_control_request_result(&request("rejected"), &mut output, false).unwrap();
+        assert!(output.plan_edit.is_empty());
+        apply_control_request_result(&request("corrected"), &mut output, true).unwrap();
+        normalize_event_in_workspace(
+            &invocation("item/completed", "corrected"),
+            &mut output,
+            None,
+            "",
+            false,
+        );
 
         assert_eq!(output.plan_edit.len(), 1);
         assert_eq!(
@@ -1819,6 +1889,83 @@ mod test {
                 .and_then(|plan| plan.modify.overview.as_deref()),
             Some("corrected")
         );
+    }
+
+    #[test]
+    fn accepted_submit_remains_authoritative_across_lifecycle_replays() {
+        let lifecycle = |method: &str| {
+            json!({
+                "method": method,
+                "params": {
+                    "item": {
+                        "id": "submit-1",
+                        "type": "dynamicToolCall",
+                        "tool": "harness_plan_submit",
+                        "arguments": {
+                            "plan_id": "plan-1",
+                            "expected_version": 5
+                        }
+                    }
+                }
+            })
+        };
+        let request = json!({
+            "id": 42,
+            "method": "item/tool/call",
+            "params": {
+                "itemId": "submit-1",
+                "tool": "harness_plan_submit",
+                "arguments": {
+                    "plan_id": "plan-1",
+                    "expected_version": 5
+                }
+            }
+        });
+        let mut output = BackendOutput::default();
+
+        normalize_event_in_workspace(&lifecycle("item/started"), &mut output, None, "", false);
+        assert!(output.plan_submit.is_none());
+
+        apply_control_request_result(&request, &mut output, true).unwrap();
+        normalize_event_in_workspace(&lifecycle("item/completed"), &mut output, None, "", false);
+
+        let submit = output.plan_submit.expect("accepted submit request");
+        assert_eq!(submit.plan_id, "plan-1");
+        assert_eq!(submit.expected_version, 5);
+    }
+
+    #[test]
+    fn accepted_control_request_identity_ignores_rejections_and_deduplicates_success() {
+        let request = json!({
+            "id": 42,
+            "method": "item/tool/call",
+            "params": {
+                "itemId": "edit-1",
+                "tool": "harness_plan_edit",
+                "arguments": {
+                    "plan_id": "plan-1",
+                    "expected_version": 1,
+                    "plan": { "modify": { "overview": "corrected" } }
+                }
+            }
+        });
+        let mut accepted_control_invocation_key_set = HashSet::new();
+
+        assert!(!should_apply_control_request_semantics(
+            &request,
+            &mut accepted_control_invocation_key_set,
+            false
+        ));
+        assert!(should_apply_control_request_semantics(
+            &request,
+            &mut accepted_control_invocation_key_set,
+            true
+        ));
+        assert!(!should_apply_control_request_semantics(
+            &request,
+            &mut accepted_control_invocation_key_set,
+            true
+        ));
     }
 
     #[test]

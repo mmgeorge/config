@@ -3,34 +3,76 @@ use diff_review_harness::broker::{HarnessBroker, InitializeRequest};
 use diff_review_harness::protocol::BrokerRequest;
 use diff_review_harness::session::ExecutionMode;
 use serde_json::{Value, json};
+use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
-#[tokio::test]
-#[ignore = "requires an authenticated Codex CLI and performs a real model turn"]
-async fn asks_for_feedback_then_creates_a_plan_without_native_collaboration_mode() {
-    let temporary = tempfile::tempdir().unwrap();
-    let workspace = temporary.path().join("workspace");
-    std::fs::create_dir_all(&workspace).unwrap();
+const GEOPARQUET_PLAN_TURN_TIMEOUT: Duration = Duration::from_secs(600);
+
+fn initialize_git_workspace(workspace: &Path) {
+    std::fs::create_dir_all(workspace).unwrap();
     let status = Command::new("git")
         .args(["init", "--quiet"])
-        .current_dir(&workspace)
+        .current_dir(workspace)
         .status()
         .unwrap();
     assert!(status.success());
-    std::fs::write(workspace.join("README.md"), "# Fixture\n").unwrap();
+}
 
+fn trace_tail(data_root: &Path) -> String {
+    let trace = std::fs::read_to_string(data_root.join("harness-trace.jsonl")).unwrap_or_default();
+    let mut record_list = trace
+        .lines()
+        .rev()
+        .take(40)
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .map(|record| {
+            let event = record
+                .get("event")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let payload = record.get("payload").unwrap_or(&Value::Null);
+            let detail_list = ["method", "status", "tool_name", "message", "text"]
+                .into_iter()
+                .filter_map(|field| {
+                    payload.get(field).and_then(Value::as_str).map(|value| {
+                        let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+                        format!(
+                            "{field}={}",
+                            &compact[..compact.floor_char_boundary(compact.len().min(160))]
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            if detail_list.is_empty() {
+                event.to_owned()
+            } else {
+                format!("{event} {}", detail_list.join(" "))
+            }
+        })
+        .collect::<Vec<_>>();
+    record_list.reverse();
+    record_list.join("\n")
+}
+
+async fn initialize_real_codex_broker(
+    data_root: &Path,
+    workspace: &Path,
+    client_id: &str,
+    effort: &str,
+    prefer_mini_model: bool,
+) -> HarnessBroker {
     let mut broker = HarnessBroker::initialize(InitializeRequest {
-        data_root: temporary.path().join("data").to_string_lossy().into_owned(),
+        data_root: data_root.to_string_lossy().into_owned(),
         permission_file: None,
         workspace: workspace.to_string_lossy().into_owned(),
-        client_id: "real-codex-test".into(),
+        client_id: client_id.into(),
         backend: BackendLaunch {
             kind: "codex".into(),
             command: vec!["codex".into(), "app-server".into()],
         },
         model: "default".into(),
-        effort: "low".into(),
+        effort: effort.into(),
         session_id: None,
         new_session_name: None,
         goal_max_turns: 20,
@@ -55,24 +97,55 @@ async fn asks_for_feedback_then_creates_a_plan_without_native_collaboration_mode
     let selected_model = model_list
         .iter()
         .find(|model| {
-            model
-                .get("id")
-                .and_then(Value::as_str)
-                .is_some_and(|id| id.contains("mini"))
+            if prefer_mini_model {
+                model
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| id.contains("mini"))
+            } else {
+                model
+                    .get("is_default")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            }
         })
         .or_else(|| model_list.first())
         .and_then(|model| model.get("id"))
         .and_then(Value::as_str)
         .expect("at least one Codex model")
         .to_owned();
+    let configured_effort = if prefer_mini_model { "low" } else { effort };
     let configured = broker
         .dispatch(BrokerRequest {
             id: 2,
             method: "session.configure".into(),
-            params: json!({ "model": selected_model, "effort": "low", "fast_mode": true }),
+            params: json!({
+                "model": selected_model,
+                "effort": configured_effort,
+                "fast_mode": true
+            }),
         })
         .await;
     assert!(configured.response.error.is_none());
+    broker
+}
+
+#[tokio::test]
+#[ignore = "requires an authenticated Codex CLI and performs a real model turn"]
+async fn asks_for_feedback_then_creates_a_plan_without_native_collaboration_mode() {
+    let temporary = tempfile::tempdir().unwrap();
+    let workspace = temporary.path().join("workspace");
+    initialize_git_workspace(&workspace);
+    std::fs::write(workspace.join("README.md"), "# Fixture\n").unwrap();
+
+    let mut broker = initialize_real_codex_broker(
+        &temporary.path().join("data"),
+        &workspace,
+        "real-codex-test",
+        "low",
+        true,
+    )
+    .await;
 
     let planned = tokio::time::timeout(
         Duration::from_secs(120),
@@ -249,4 +322,162 @@ async fn asks_for_feedback_then_creates_a_plan_without_native_collaboration_mode
     let write_proof = std::fs::read_to_string(workspace.join("mode-write-proof.txt"))
         .expect("Write mode should create the requested workspace file");
     assert_eq!(write_proof.trim_end(), "Harness native Write mode verified");
+}
+
+#[tokio::test]
+#[ignore = "requires an authenticated Codex CLI and performs real GeoParquet planning turns"]
+async fn geoparquet_prompt_reaches_plan_review_after_scope_feedback() {
+    let temporary = tempfile::tempdir().unwrap();
+    let workspace = temporary.path().join("workspace");
+    let crate_root = workspace.join("hello");
+    let data_root = temporary.path().join("data");
+    initialize_git_workspace(&workspace);
+    std::fs::create_dir_all(crate_root.join("src")).unwrap();
+    std::fs::write(
+        crate_root.join("Cargo.toml"),
+        "[package]\nname = \"hello\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        crate_root.join("src").join("main.rs"),
+        "fn main() {\n    println!(\"Hello, world!\");\n}\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(&data_root).unwrap();
+    std::fs::write(
+        data_root.join("harness-trace-config.json"),
+        "{\"enabled\":true}",
+    )
+    .unwrap();
+
+    let mut broker = initialize_real_codex_broker(
+        &data_root,
+        &workspace,
+        "real-geoparquet-plan-test",
+        "medium",
+        false,
+    )
+    .await;
+    let planned = match tokio::time::timeout(
+        GEOPARQUET_PLAN_TURN_TIMEOUT,
+        broker.dispatch(BrokerRequest {
+            id: 3,
+            method: "prompt.submit".into(),
+            params: json!({
+                "text": "/plan turn this into cli tool for geoparquet inspection use datafusion"
+            }),
+        }),
+    )
+    .await
+    {
+        Ok(planned) => planned,
+        Err(error) => panic!(
+            "GeoParquet planning timeout: {error:?}\ntrace tail:\n{}",
+            trace_tail(&data_root)
+        ),
+    };
+    assert!(
+        planned.response.error.is_none(),
+        "{:?}",
+        planned.response.error
+    );
+
+    let mut next_request_id = 4;
+    for _ in 0..3 {
+        let snapshot = broker.snapshot().unwrap();
+        let plan = snapshot.active_plan.expect("active GeoParquet plan");
+        match plan.state {
+            diff_review_harness::plan::PlanState::AwaitingReview => break,
+            diff_review_harness::plan::PlanState::AwaitingInput => {
+                let question = plan
+                    .elicitation
+                    .as_ref()
+                    .and_then(|elicitation| elicitation.current_question())
+                    .expect("pending GeoParquet scope question");
+                let selected_option = question
+                    .options
+                    .iter()
+                    .find(|option| {
+                        let scope =
+                            format!("{} {}", option.label, option.description).to_ascii_lowercase();
+                        scope.contains("metadata")
+                            && scope.contains("schema")
+                            && (scope.contains("row") || scope.contains("count"))
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "GeoParquet scope should offer metadata, schema, and rows: {:?}",
+                            question.options
+                        )
+                    })
+                    .label
+                    .clone();
+                let question_id = question.id.clone();
+                let answered = broker
+                    .dispatch(BrokerRequest {
+                        id: next_request_id,
+                        method: "question.answer".into(),
+                        params: json!({
+                            "question_id": question_id,
+                            "response": {
+                                "kind": "selected",
+                                "option": selected_option,
+                                "feedback": null
+                            }
+                        }),
+                    })
+                    .await;
+                next_request_id += 1;
+                assert!(
+                    answered.response.error.is_none(),
+                    "{:?}",
+                    answered.response.error
+                );
+                let continued = match tokio::time::timeout(
+                    GEOPARQUET_PLAN_TURN_TIMEOUT,
+                    broker.dispatch(BrokerRequest {
+                        id: next_request_id,
+                        method: "question.continue".into(),
+                        params: Value::Null,
+                    }),
+                )
+                .await
+                {
+                    Ok(continued) => continued,
+                    Err(error) => panic!(
+                        "GeoParquet feedback continuation timeout: {error:?}\ntrace tail:\n{}",
+                        trace_tail(&data_root)
+                    ),
+                };
+                next_request_id += 1;
+                assert!(
+                    continued.response.error.is_none(),
+                    "{:?}",
+                    continued.response.error
+                );
+            }
+            state => panic!("GeoParquet planning stopped in {state:?}"),
+        }
+    }
+
+    let snapshot = broker.snapshot().unwrap();
+    let plan = snapshot.active_plan.expect("submitted GeoParquet plan");
+    assert_eq!(
+        plan.state,
+        diff_review_harness::plan::PlanState::AwaitingReview
+    );
+    assert!(plan.submitted_version.is_some());
+    assert!(plan.elicitation.is_none());
+    assert_eq!(snapshot.artifact.len(), 1);
+    assert!(Path::new(&snapshot.artifact[0].working_path).exists());
+    assert!(snapshot.timeline.iter().any(|entry| matches!(
+        entry,
+        diff_review_harness::timeline::TimelineEntry::Status {
+            status:
+                diff_review_harness::session::state_machine::SessionPhase::AwaitingPlanReview {
+                    ..
+                },
+            ..
+        }
+    )));
 }

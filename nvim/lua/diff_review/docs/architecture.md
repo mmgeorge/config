@@ -1518,7 +1518,11 @@ operations against durable state with optimistic version checks, which keeps the
 broker document authoritative. Adapters export a control invocation into aggregate
 `BackendOutput` only after its provider request returns success. Rejected invocations remain
 visible as failed timeline activities but never enter durable replay, preventing a corrected plan
-from being poisoned by an earlier validation failure.
+from being poisoned by an earlier validation failure. Started and completed lifecycle
+notifications update the rendered tool activity only. They never authorize a control mutation,
+because those notifications can precede validation or replay a rejected call after its response.
+A separate accepted-request identity set keeps successful provider request replays idempotent
+without allowing rejected requests to reserve that identity.
 The question tool also works during ordinary chat, goal, and execution turns. Those questions
 persist on their owning `InteractionRecord`, while planning questions remain on `PlanRecord`.
 `BrokerSnapshot.active_elicitation` projects either owner through one question UI contract, so
