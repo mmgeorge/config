@@ -81,11 +81,10 @@ function M.resolve(state)
   end
   if status.kind == "working" then
     local elapsed_seconds = math.max(0, math.floor((os.time() * 1000 - (status.started_at_ms or 0)) / 1000))
-    local label = status.activity == "planning" and "Thinking" or "Working"
     return {
       id = "working",
       kind = "working",
-      text = ("%s for %ds"):format(label, elapsed_seconds),
+      text = ("Working for %ds"):format(elapsed_seconds),
       started_at_ms = status.started_at_ms,
     }
   end

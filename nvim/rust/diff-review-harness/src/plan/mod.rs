@@ -38,7 +38,7 @@ pub use graph::{PlanGraph, ResolvedPlanEntity};
 pub use prompt::{PlanExecutionPromptKind, PlanPrompt, execution_prompt};
 pub use render::{
     PlanNavigationAnchor, PlanNavigationIndex, PlanReviewTarget, PlanSection, RenderedPlan,
-    render_plan, render_plan_delta,
+    render_plan, render_plan_at, render_plan_delta,
 };
 pub use resolution::{
     PlanResolutionKind, PlanResolutionRecord, PlanTaskSummary, PlanTestSummary,
@@ -751,32 +751,44 @@ impl From<&PlanRecord> for ArtifactSummary {
     }
 }
 
-/// Represents one raw review comment before Rust resolves its rendered line.
+/// Represents one raw review comment before Rust resolves its rendered range.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PlanAnnotationInput {
-    pub line: u32,
+    pub start_line: u32,
+    pub end_line: u32,
     pub body: String,
 }
 
-/// Represents one review comment anchored to an exact canonical subject.
+/// Represents one canonical plan subject covered by a review comment.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct PlanAnnotation {
+pub struct PlanAnnotationSubject {
     pub target: PlanReviewTarget,
     pub json_path: String,
     pub label: String,
     pub path: Option<String>,
+}
+
+/// Represents one review comment anchored to an ordered canonical subject range.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PlanAnnotation {
+    pub subject: Vec<PlanAnnotationSubject>,
+    pub label: String,
     pub body: String,
 }
 
 /// Owns physical plan files and immutable revision history.
 pub struct PlanFileStore {
     root: PathBuf,
+    workspace: PathBuf,
 }
 
 impl PlanFileStore {
     /// Build a plan file store beneath the Harness data directory.
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+    pub fn new(root: impl Into<PathBuf>, workspace: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            workspace: workspace.into(),
+        }
     }
 
     /// Write the structurally valid working draft without rendering it.
@@ -822,6 +834,20 @@ impl PlanFileStore {
         Ok(result)
     }
 
+    /// Rename one newly added entity and persist the complete canonical document.
+    pub fn rename_added_entity(
+        &self,
+        session_id: &str,
+        plan_id: &str,
+        entity_id: &str,
+        new_name: String,
+    ) -> Result<PlanEditResult> {
+        let document = self.read_working_document(session_id, plan_id)?;
+        let result = edit::rename_added_entity(&document, entity_id, new_name)?;
+        self.write_working_document(session_id, &result.plan_id, &result.document)?;
+        Ok(result)
+    }
+
     /// Freeze one submitted JSON revision together with its exact rendered projection.
     pub fn submit_document_revision(
         &self,
@@ -836,7 +862,7 @@ impl PlanFileStore {
             "plan version changed before submission"
         );
         document.validate_for_submission()?;
-        let rendered = render_plan(&document)?;
+        let rendered = render_plan_at(&document, &self.workspace)?;
         let plan_directory = self.plan_dir(session_id, plan_id);
         let revision_directory = plan_directory.join("revisions");
         fs::create_dir_all(&revision_directory)?;
@@ -937,7 +963,7 @@ impl PlanFileStore {
                 }
                 let mut document = serde_json::from_slice::<PlanDocument>(&fs::read(&path)?)?;
                 document.plan_id = target_plan_id.to_owned();
-                let rendered = render_plan(&document)?;
+                let rendered = render_plan_at(&document, &self.workspace)?;
                 let stem = name.trim_end_matches(".json");
                 let target_revision = target.join("revisions");
                 write_json_atomically(&target_revision.join(format!("{stem}.json")), &document)?;
@@ -1002,7 +1028,7 @@ mod test {
     #[test]
     fn preserves_submitted_json_revisions_while_the_working_document_changes() {
         let temporary = tempfile::tempdir().unwrap();
-        let store = PlanFileStore::new(temporary.path());
+        let store = PlanFileStore::new(temporary.path(), temporary.path());
         let document = document::test_fixture("plan", "Initial");
         store
             .write_working_document("session", "plan", &document)
@@ -1054,7 +1080,7 @@ mod test {
     #[test]
     fn renders_only_complete_submissions_while_preserving_repairable_drafts() {
         let temporary = tempfile::tempdir().unwrap();
-        let store = PlanFileStore::new(temporary.path());
+        let store = PlanFileStore::new(temporary.path(), temporary.path());
         let document = document::test_fixture("plan", "Initial");
         store
             .write_working_document("session", "plan", &document)
@@ -1084,7 +1110,6 @@ mod test {
                                 variants: Vec::new(),
                                 extends: None,
                                 conforms_to: Vec::new(),
-                                exclusive_owner_entity_id: None,
                             }],
                             ..Default::default()
                         }),
@@ -1137,7 +1162,6 @@ mod test {
                                 variants: None,
                                 extends: PatchField::Missing,
                                 conforms_to: None,
-                                exclusive_owner_entity_id: PatchField::Missing,
                             }],
                             ..Default::default()
                         }),
@@ -1148,8 +1172,9 @@ mod test {
                                 description: None,
                                 files: Some(CollectionMutation {
                                     add: vec![PlanFile {
-                                        path: "src/inspection.rs".into(),
-                                        action: ChangeAction::Add,
+                                        change: PlanFileChange::Add {
+                                            path: "src/inspection.rs".into(),
+                                        },
                                         subtasks: vec![PlanSubtask::Work(PlanWorkSubtask {
                                             subtask_id: "create_inspection".into(),
                                             action: SubtaskAction::Create,

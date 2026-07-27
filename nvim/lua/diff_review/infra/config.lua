@@ -81,6 +81,10 @@
 
 ---@class DiffReviewPlanReviewKeymapConfig
 ---@field open DiffReviewKeymap
+---@field jump_entity DiffReviewKeymap
+---@field entity_info DiffReviewKeymap
+---@field rename_entity DiffReviewKeymap
+---@field schema DiffReviewKeymap
 ---@field comment DiffReviewKeymap
 ---@field accept DiffReviewKeymap
 ---@field request_changes DiffReviewKeymap
@@ -253,7 +257,11 @@ M.defaults = {
     },
     plan_review = {
       toggle = "<Tab>",
-      open = { "<CR>", "." },
+      open = "<CR>",
+      jump_entity = ".",
+      entity_info = "ol",
+      rename_entity = "<Space>f",
+      schema = "os",
       comment = "C",
       accept = "oY",
       request_changes = "oN",

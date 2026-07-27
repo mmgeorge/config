@@ -64,13 +64,48 @@ local ok, failure = pcall(function()
     "focused plan comment should replace compact box chrome with full inline rules")
 
   assert_equals(comment_view.serialize(buf), {
-    { line = 2, body = "Name the exact module\nCover the integration boundary" },
+    { start_line = 2, end_line = 2, body = "Name the exact module\nCover the integration boundary" },
   }, "serialized annotations should retain source-line identity across display expansion")
 
   comment_view.detach(buf)
   assert_equals(vim.api.nvim_buf_get_lines(buf, 0, -1, false), source_lines,
     "detaching PlanReview comments should restore the physical plan projection")
   assert_true(not vim.bo[buf].modifiable, "detached plan projection should remain read-only")
+
+  local range_source_lines = {
+    "*enum InspectionError",
+    "  Open",
+    "    path: PathBuf",
+    "  MissingGeoMetadata",
+    "    path: PathBuf",
+    "  Query",
+  }
+  local range_annotation_list = {}
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, range_source_lines)
+  vim.bo[buf].modifiable = false
+  comment_view.attach(buf, win, range_source_lines, range_annotation_list)
+  vim.api.nvim_win_set_cursor(win, { 2, 0 })
+  vim.cmd("normal! V3j")
+  comment_view.add_at_cursor(buf)
+  vim.wait(20)
+  vim.cmd("stopinsert")
+  assert_equals(
+    { range_annotation_list[1].source_line, range_annotation_list[1].end_source_line },
+    { 2, 5 },
+    "visual PlanReview comments should retain the complete selected source range"
+  )
+  local range_header_row = find_row(buf, " Plan comment ")
+  assert_true(
+    vim.api.nvim_buf_get_lines(buf, range_header_row - 1, range_header_row, false)[1]:find("lines 2-5", 1, true) ~= nil,
+    "visual PlanReview comments should label the selected line range"
+  )
+  vim.api.nvim_buf_set_lines(buf, range_header_row, range_header_row + 1, false, { "Merge these errors" })
+  assert_equals(comment_view.serialize(buf), {
+    { start_line = 2, end_line = 5, body = "Merge these errors" },
+  }, "serialized visual annotations should retain both range boundaries")
+
+  comment_view.detach(buf)
   vim.api.nvim_buf_delete(buf, { force = true })
 end)
 

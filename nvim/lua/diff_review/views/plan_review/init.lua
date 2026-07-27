@@ -8,7 +8,10 @@ local popup_window = require("diff_review.infra.popup_window")
 local task_tree = require("diff_review.render.task_tree")
 local session = require("diff_review.session")
 local comment_view = require("diff_review.views.plan_review.comment")
+local entity_info = require("diff_review.views.plan_review.entity_info")
+local entity_rename = require("diff_review.views.plan_review.entity_rename")
 local plan_fold = require("diff_review.views.plan_review.fold")
+local plan_schema = require("diff_review.views.plan_review.schema")
 local plan_task_model = require("diff_review.views.plan_review.task_model")
 
 local awaiting_review_status = "Awaiting review • read-only projection • C adds comments"
@@ -156,7 +159,7 @@ local function accept(plan, review)
 end
 
 ---@param plan table
----@param buf integer
+---@param review DiffReviewPlanReviewSession
 local function request_changes(plan, review)
   if not review_request_available() then return end
   local annotation = serialized_annotation(review.buf)
@@ -183,7 +186,36 @@ local function request_changes(plan, review)
 end
 
 ---@param plan table
----@param buf integer
+---@param review DiffReviewPlanReviewSession
+local function rename_entity(plan, review)
+  entity_rename.prompt(review.task_model, review.buf, review.win, function(entity, new_name)
+    if not begin_review_request(review.buf, "Renaming plan entity…") then return end
+    client.request("plan.entity.rename", {
+      plan_id = plan.id,
+      entity_id = entity.entity_id or entity.name,
+      expected_version = review.task_model.document.version,
+      name = new_name,
+    }, function(result, request_error)
+      finish_review_request(review.buf)
+      if request_error then
+        notifications.error(request_error, "PlanReview")
+        return
+      end
+      local next_plan = result and result.plan
+      if not next_plan then
+        notifications.error("Entity rename returned no plan", "PlanReview")
+        return
+      end
+      session.harness.active_plan = next_plan
+      close_review(review)
+      notifications.info(("Renamed %s to %s"):format(entity.name, new_name), "PlanReview")
+      vim.schedule(function() M.open(next_plan) end)
+    end)
+  end)
+end
+
+---@param plan table
+---@param review DiffReviewPlanReviewSession
 ---@return DiffReviewViewCommandSet
 local function commands(plan, review)
   local set = command_set.new()
@@ -191,6 +223,14 @@ local function commands(plan, review)
     review.fold_controller:toggle(review.buf, review.win)
   end)
   command_set.register(set, "open", function() open_source(plan, review.buf) end)
+  command_set.register(set, "jump_entity", function()
+    entity_info.jump(review.task_model, review.buf, review.win)
+  end)
+  command_set.register(set, "entity_info", function()
+    entity_info.show(review.task_model, review.buf, review.win)
+  end)
+  command_set.register(set, "rename_entity", function() rename_entity(plan, review) end)
+  command_set.register(set, "schema", function() plan_schema.open(plan, review) end)
   command_set.register(set, "comment", function() comment_view.add_at_cursor(review.buf) end)
   command_set.register(set, "accept", function() accept(plan, review) end)
   command_set.register(set, "request_changes", function() request_changes(plan, review) end)

@@ -200,7 +200,12 @@ fn validate_task_evidence(
     let planned_path = task
         .files
         .iter()
-        .map(|file| file.path.as_str())
+        .flat_map(|file| {
+            file.change
+                .source_path()
+                .into_iter()
+                .chain(std::iter::once(file.change.path()))
+        })
         .collect::<HashSet<_>>();
     let planned_test_subtask_id = task
         .files

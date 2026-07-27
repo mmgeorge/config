@@ -126,6 +126,8 @@ vim.fn.mkdir(vim.fs.joinpath(crate_root, "src"), "p")
 vim.fn.writefile({ "[package]", 'name = "diff-review-harness"', 'version = "0.1.0"' }, vim.fs.joinpath(crate_root, "Cargo.toml"))
 vim.fn.writefile({ "fn main() {}" }, vim.fs.joinpath(crate_root, "src", "main.rs"))
 vim.fn.writefile({ "# Plan", "", "1. Review the implementation." }, plan_path)
+local plan_json_line_list = { "{", '  "title": "Harness plan"', "}" }
+vim.fn.writefile(plan_json_line_list, vim.fs.joinpath(test_root, "working.json"))
 
 local active_session = {
   id = "session-one",
@@ -3525,7 +3527,24 @@ local ok, failure = xpcall(function()
     "PlanReview should restore the configured status column inherited from the gutterless Harness window")
   assert_true(vim.fn.maparg("oY", "n", false, true).callback ~= nil, "PlanReview accept mapping missing")
   assert_true(vim.fn.maparg("oN", "n", false, true).callback ~= nil, "PlanReview request-changes mapping missing")
+  assert_true(vim.fn.maparg(".", "n", false, true).callback ~= nil, "PlanReview entity-jump mapping missing")
+  assert_true(vim.fn.maparg("ol", "n", false, true).callback ~= nil, "PlanReview entity-info mapping missing")
+  assert_true(vim.fn.maparg("<Space>f", "n", false, true).callback ~= nil, "PlanReview entity-rename mapping missing")
+  assert_true(vim.fn.maparg("os", "n", false, true).callback ~= nil, "PlanReview schema mapping missing")
+  assert_true(vim.fn.maparg("C", "x", false, true).callback ~= nil, "PlanReview visual comment mapping missing")
   local plan_review_buf = vim.api.nvim_get_current_buf()
+  vim.fn.maparg("os", "n", false, true).callback()
+  local schema_buf = vim.api.nvim_get_current_buf()
+  assert_true(vim.api.nvim_buf_get_name(schema_buf):find("PlanReviewSchema://", 1, true) ~= nil,
+    "PlanReview schema command should open the canonical JSON buffer")
+  assert_equals(vim.bo[schema_buf].filetype, "json", "PlanReviewSchema should use JSON syntax")
+  assert_equals(vim.bo[schema_buf].modifiable, false, "PlanReviewSchema should be read-only")
+  assert_true(vim.deep_equal(vim.api.nvim_buf_get_lines(schema_buf, 0, -1, false), plan_json_line_list),
+    "PlanReviewSchema should preserve the canonical working.json content")
+  vim.fn.maparg("q", "n", false, true).callback()
+  assert_equals(vim.api.nvim_get_current_buf(), plan_review_buf,
+    "PlanReviewSchema q should restore the originating PlanReview buffer")
+  assert_true(not vim.api.nvim_buf_is_valid(schema_buf), "PlanReviewSchema should be wiped after returning")
   local harness_buf = session.harness.transcript_buf
   request_count_by_method["plan.acceptance.begin"] = 0
   plan_accept_delay_ms = 100

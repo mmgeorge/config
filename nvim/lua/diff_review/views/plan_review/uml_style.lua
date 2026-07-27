@@ -61,7 +61,7 @@ function M.align_owner(line, target, width)
   local target_type = target and target.target_type or nil
   if target_type ~= "entity"
       and target_type ~= "flow_step"
-      and target_type ~= "flow_operation" then
+      and target_type ~= "flow_edge" then
     return line
   end
   local inline_path_start = path_start(line)
@@ -170,6 +170,19 @@ local dependency_action_highlight = {
   Remove = "DiffReviewWalkthroughActionRemove",
 }
 
+local file_status_highlight = {
+  New = "DiffReviewFileStatusNew",
+  Modified = "DiffReviewFileStatusModified",
+  Deleted = "DiffReviewFileStatusDeleted",
+  Renamed = "DiffReviewFileStatusRenamed",
+}
+
+local function file_spans(line, span_list)
+  local status_start, status_end, status = line:find("([%a]+)%s*$")
+  local highlight = status and file_status_highlight[status] or nil
+  if highlight then add_span(span_list, status_start, status_end, highlight) end
+end
+
 ---@param line string
 ---@param span_list table[]
 local function dependency_spans(line, span_list)
@@ -221,13 +234,14 @@ end
 function M.segments(line, target)
   local target_type = target and target.target_type or nil
   local is_flow_row = target_type == "flow_step"
-    or target_type == "flow_operation"
-    or target_type == "flow_value"
+    or target_type == "flow_edge"
+    or target_type == "flow_edge_result"
   if target_type ~= "entity"
       and target_type ~= "entity_member"
       and target_type ~= "enum_variant"
       and target_type ~= "enum_variant_field"
       and target_type ~= "dependency"
+      and target_type ~= "file"
       and target_type ~= "test"
       and not is_flow_row then
     return nil
@@ -236,14 +250,39 @@ function M.segments(line, target)
   local inline_path_start = path_start(line)
   local limit = (inline_path_start or (#line + 1)) - 1
   local span_list = {}
-  if target_type == "flow_operation" then
-    add_span(span_list, 1, limit, "Normal")
-  elseif target_type == "flow_value" then
+  if target_type == "flow_edge" then
+    local callable_name = target and target.callable_name or nil
+    if type(callable_name) == "string" and callable_name ~= "" then
+      local callable_start, callable_end = line:find(callable_name, 1, true)
+      if callable_start and callable_start <= limit then
+        local callable_highlight = target.callable_kind == "method"
+            and "@function.method.call"
+          or "@function.call"
+        add_span(span_list, callable_start, callable_end, callable_highlight)
+      end
+    end
+    local target_name = target and target.target_name or nil
+    if target and target.target_is_type
+        and type(target_name) == "string"
+        and target_name ~= "" then
+      local search_start = 1
+      local target_start
+      local target_end
+      while true do
+        local match_start, match_end = line:find(target_name, search_start, true)
+        if not match_start or match_start > limit then break end
+        target_start = match_start
+        target_end = match_end
+        search_start = match_end + 1
+      end
+      add_span(span_list, target_start, target_end, "@type")
+    end
+  elseif target_type == "flow_edge_result" then
     local _, marker_end = line:find("├─", 1, true)
     if not marker_end then _, marker_end = line:find("└─", 1, true) end
     local value_start = marker_end and line:find("%S", marker_end + 1) or nil
     local value_end = line:find("%s*$") - 1
-    if value_start and target.value_kind == "type" then
+    if value_start and target and target.value_kind == "type" then
       add_span(span_list, 1, value_start - 1, "Normal")
       add_span(span_list, value_start, value_end, "@type")
       add_span(span_list, value_end + 1, #line, "Normal")
@@ -254,6 +293,8 @@ function M.segments(line, target)
     declaration_spans(line, span_list, limit)
   elseif target_type == "dependency" then
     dependency_spans(line, span_list)
+  elseif target_type == "file" then
+    file_spans(line, span_list)
   elseif target_type == "enum_variant" then
     local start_index, end_index = line:find("[%a_][%w_]*", 1)
     add_span(span_list, start_index, end_index, "@variable")

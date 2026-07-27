@@ -145,9 +145,6 @@ pub struct ProgramEntityPatch {
     #[serde(default)]
     pub extends: PatchField<EntityReference>,
     pub conforms_to: Option<Vec<EntityReference>>,
-    #[serde(default)]
-    #[serde(rename = "exclusive_owner_entity")]
-    pub exclusive_owner_entity_id: PatchField<String>,
 }
 
 /// Modifies one package dependency without replacing its durable identity.
@@ -172,9 +169,7 @@ pub struct PlanFlowStepPatch {
     pub step_id: String,
     pub action: Option<String>,
     pub target: Option<EntityReference>,
-    pub operations: Option<Vec<PlanFlowOperation>>,
-    #[serde(default)]
-    pub value_to_next: PatchField<PlanFlowValue>,
+    pub edges: Option<Vec<PlanFlowEdge>>,
 }
 
 /// Modifies one flow and optionally its nested steps.
@@ -240,7 +235,7 @@ impl PlanSubtaskPatch {
 #[serde(deny_unknown_fields)]
 pub struct PlanFilePatch {
     pub path: String,
-    pub action: Option<ChangeAction>,
+    pub change: Option<PlanFileChange>,
     pub subtasks: Option<CollectionMutation<PlanSubtask, PlanSubtaskPatch>>,
 }
 
@@ -392,6 +387,48 @@ pub fn apply_plan_edit(
     })
 }
 
+/// Rename one newly added entity through the canonical semantic edit path.
+pub fn rename_added_entity(
+    document: &PlanDocument,
+    entity_id: &str,
+    new_name: String,
+) -> Result<PlanEditResult> {
+    let entity = document
+        .entity_changes
+        .iter()
+        .find(|entity| entity.entity_id == entity_id || entity.name == entity_id)
+        .with_context(|| format!("program entity `{entity_id}` does not exist"))?;
+    anyhow::ensure!(
+        entity.action == ChangeAction::Add,
+        "only newly added plan entities can be renamed"
+    );
+    apply_plan_edit(
+        document,
+        PlanEditRequest {
+            plan_id: document.plan_id.clone(),
+            expected_version: document.version,
+            mutation: PlanMutation {
+                entity_changes: Some(CollectionMutation {
+                    modify: vec![ProgramEntityPatch {
+                        entity_id: entity.entity_id.clone(),
+                        action: None,
+                        kind: None,
+                        name: Some(new_name),
+                        description: None,
+                        path: None,
+                        members: None,
+                        variants: None,
+                        extends: PatchField::Missing,
+                        conforms_to: None,
+                    }],
+                    ..CollectionMutation::default()
+                }),
+                ..PlanMutation::default()
+            },
+        },
+    )
+}
+
 /// Apply reusable plan mutations to an in-memory document.
 pub fn apply_plan_mutation(document: &mut PlanDocument, mutation: PlanMutation) -> Result<()> {
     let previous_name_by_id = document
@@ -478,7 +515,38 @@ fn propagate_entity_rename(
             value.clone_from(name);
         }
     };
+    replace_identifier_occurrences(&mut document.title, &rename_by_previous_name);
+    replace_identifier_occurrences(&mut document.overview, &rename_by_previous_name);
+    if let Some(usage) = &mut document.usage {
+        replace_identifier_occurrences(&mut usage.command, &rename_by_previous_name);
+        replace_identifier_occurrences(&mut usage.expected_result, &rename_by_previous_name);
+    }
+    for assumption in &mut document.assumptions {
+        replace_identifier_occurrences(assumption, &rename_by_previous_name);
+    }
+    for dependency in &mut document.dependencies {
+        replace_identifier_occurrences(&mut dependency.justification, &rename_by_previous_name);
+    }
     for entity in &mut document.entity_changes {
+        replace_identifier_occurrences(&mut entity.description, &rename_by_previous_name);
+        for member in &mut entity.members {
+            replace_identifier_occurrences(&mut member.description, &rename_by_previous_name);
+            if let Some(type_name) = &mut member.type_name {
+                replace_identifier_occurrences(type_name, &rename_by_previous_name);
+            }
+            for parameter in &mut member.parameters {
+                replace_identifier_occurrences(&mut parameter.type_name, &rename_by_previous_name);
+            }
+            if let Some(return_type) = &mut member.return_type {
+                replace_identifier_occurrences(return_type, &rename_by_previous_name);
+            }
+        }
+        for variant in &mut entity.variants {
+            replace_identifier_occurrences(&mut variant.description, &rename_by_previous_name);
+            for field in &mut variant.fields {
+                replace_identifier_occurrences(&mut field.type_name, &rename_by_previous_name);
+            }
+        }
         if let Some(EntityReference::PlannedEntity { entity }) = &mut entity.extends {
             rename(entity);
         }
@@ -487,23 +555,51 @@ fn propagate_entity_rename(
                 rename(entity);
             }
         }
-        if let Some(owner) = &mut entity.exclusive_owner_entity_id {
-            rename(owner);
-        }
     }
     for flow in &mut document.flows {
+        replace_identifier_occurrences(&mut flow.title, &rename_by_previous_name);
+        replace_identifier_occurrences(&mut flow.description, &rename_by_previous_name);
         for step in &mut flow.steps {
+            replace_identifier_occurrences(&mut step.action, &rename_by_previous_name);
             if let EntityReference::PlannedEntity { entity } = &mut step.target {
                 rename(entity);
             }
-            for operation in &mut step.operations {
-                if let EntityReference::PlannedEntity { entity } = &mut operation.target {
+            for edge in &mut step.edges {
+                match &mut edge.relation {
+                    PlanFlowRelation::Call { callable }
+                    | PlanFlowRelation::Read { callable }
+                    | PlanFlowRelation::Write { callable } => {
+                        replace_identifier_occurrences(
+                            &mut callable.name,
+                            &rename_by_previous_name,
+                        );
+                    }
+                    PlanFlowRelation::Send { event } => {
+                        replace_identifier_occurrences(event, &rename_by_previous_name);
+                    }
+                    PlanFlowRelation::Construct
+                    | PlanFlowRelation::Emit
+                    | PlanFlowRelation::Return => {}
+                }
+                if let Some(result) = &mut edge.result {
+                    match result {
+                        PlanFlowValue::Type { name } => {
+                            replace_identifier_occurrences(name, &rename_by_previous_name);
+                        }
+                        PlanFlowValue::Text { text } => {
+                            replace_identifier_occurrences(text, &rename_by_previous_name);
+                        }
+                    }
+                }
+                if let EntityReference::PlannedEntity { entity } = &mut edge.target {
                     rename(entity);
                 }
             }
         }
     }
     for task in &mut document.tasks {
+        replace_identifier_occurrences(&mut task.title, &rename_by_previous_name);
+        replace_identifier_occurrences(&mut task.description, &rename_by_previous_name);
         for file in &mut task.files {
             for subtask in &mut file.subtasks {
                 if let Some(entity_ids) = subtask.owned_entity_ids_mut() {
@@ -511,14 +607,63 @@ fn propagate_entity_rename(
                         rename(entity);
                     }
                 }
-                if let PlanSubtask::Test(test) = subtask {
-                    for entity in &mut test.covered_entity_ids {
-                        rename(entity);
+                match subtask {
+                    PlanSubtask::Work(work) => {
+                        replace_identifier_occurrences(
+                            &mut work.description,
+                            &rename_by_previous_name,
+                        );
+                    }
+                    PlanSubtask::Test(test) => {
+                        replace_identifier_occurrences(
+                            &mut test.behavior,
+                            &rename_by_previous_name,
+                        );
+                        for entity in &mut test.covered_entity_ids {
+                            rename(entity);
+                        }
                     }
                 }
             }
         }
     }
+}
+
+fn replace_identifier_occurrences(value: &mut String, rename_by_name: &HashMap<String, String>) {
+    if rename_by_name.is_empty() || value.is_empty() {
+        return;
+    }
+    let original = std::mem::take(value);
+    let mut rendered = String::with_capacity(original.len());
+    let mut byte_offset = 0;
+    while byte_offset < original.len() {
+        let replacement = rename_by_name
+            .iter()
+            .filter(|(name, _)| original[byte_offset..].starts_with(name.as_str()))
+            .filter(|(name, _)| {
+                let previous = original[..byte_offset].chars().next_back();
+                let next = original[byte_offset + name.len()..].chars().next();
+                previous.is_none_or(|character| !is_identifier_character(character))
+                    && next.is_none_or(|character| !is_identifier_character(character))
+            })
+            .max_by_key(|(name, _)| name.len());
+        if let Some((name, replacement)) = replacement {
+            rendered.push_str(replacement);
+            byte_offset += name.len();
+            continue;
+        }
+        let character = original[byte_offset..]
+            .chars()
+            .next()
+            .expect("byte offset must remain on a character boundary");
+        rendered.push(character);
+        byte_offset += character.len_utf8();
+    }
+    *value = rendered;
+}
+
+fn is_identifier_character(character: char) -> bool {
+    character.is_alphanumeric() || character == '_'
 }
 
 fn apply_plan_field_patch(document: &mut PlanDocument, patch: PlanFieldPatch) {
@@ -539,9 +684,6 @@ fn apply_entity_patch(entity: &mut ProgramEntityChange, patch: ProgramEntityPatc
     assign(&mut entity.path, patch.path);
     patch.extends.apply(&mut entity.extends);
     assign(&mut entity.conforms_to, patch.conforms_to);
-    patch
-        .exclusive_owner_entity_id
-        .apply(&mut entity.exclusive_owner_entity_id);
     if let Some(members) = patch.members {
         apply_collection_mutation(
             &mut entity.members,
@@ -641,14 +783,14 @@ fn normalize_added_identity(mutation: &mut PlanMutation) {
                     normalize_step_identity(&flow_identity, step);
                 }
                 for step in &mut steps.modify {
-                    if let Some(operation_list) = &mut step.operations {
+                    if let Some(edge_list) = &mut step.edges {
                         let step_identity = format!(
                             "{}_step_{}",
                             flow_identity,
                             semantic_identity(&step.step_id)
                         );
-                        for operation in operation_list {
-                            normalize_operation_identity(&step_identity, operation);
+                        for edge in edge_list {
+                            normalize_edge_identity(&step_identity, edge);
                         }
                     }
                 }
@@ -762,17 +904,22 @@ fn normalize_step_identity(flow_identity: &str, step: &mut PlanFlowStep) {
     if step.step_id.is_empty() {
         step.step_id = format!("{}_step_{}", flow_identity, semantic_identity(&step.action));
     }
-    for operation in &mut step.operations {
-        normalize_operation_identity(&step.step_id, operation);
+    for edge in &mut step.edges {
+        normalize_edge_identity(&step.step_id, edge);
     }
 }
 
-fn normalize_operation_identity(step_identity: &str, operation: &mut PlanFlowOperation) {
-    if operation.operation_id.is_empty() {
-        operation.operation_id = format!(
-            "{}_operation_{}",
+fn normalize_edge_identity(step_identity: &str, edge: &mut PlanFlowEdge) {
+    if edge.edge_id.is_empty() {
+        let target = match &edge.target {
+            EntityReference::PlannedEntity { entity } => entity,
+            EntityReference::ExternalEntity { name, .. } => name,
+        };
+        edge.edge_id = format!(
+            "{}_edge_{}_{}",
             step_identity,
-            semantic_identity(&operation.action)
+            semantic_identity(&edge.relation.label()),
+            semantic_identity(target)
         );
     }
 }
@@ -876,8 +1023,7 @@ fn apply_flow_patch(flow: &mut PlanFlow, patch: PlanFlowPatch) -> Result<()> {
 fn apply_flow_step_patch(step: &mut PlanFlowStep, patch: PlanFlowStepPatch) -> Result<()> {
     assign(&mut step.action, patch.action);
     assign(&mut step.target, patch.target);
-    assign(&mut step.operations, patch.operations);
-    patch.value_to_next.apply(&mut step.value_to_next);
+    assign(&mut step.edges, patch.edges);
     Ok(())
 }
 
@@ -888,7 +1034,7 @@ fn apply_task_patch(task: &mut PlanTask, patch: PlanTaskPatch) -> Result<()> {
         apply_collection_mutation(
             &mut task.files,
             files,
-            |file| file.path.as_str(),
+            |file| file.change.path(),
             |patch| patch.path.as_str(),
             apply_file_patch,
             "task file",
@@ -898,7 +1044,7 @@ fn apply_task_patch(task: &mut PlanTask, patch: PlanTaskPatch) -> Result<()> {
 }
 
 fn apply_file_patch(file: &mut PlanFile, patch: PlanFilePatch) -> Result<()> {
-    assign(&mut file.action, patch.action);
+    assign(&mut file.change, patch.change);
     if let Some(subtasks) = patch.subtasks {
         apply_collection_mutation(
             &mut file.subtasks,
@@ -1077,7 +1223,6 @@ mod test {
                             variants: Vec::new(),
                             extends: None,
                             conforms_to: Vec::new(),
-                            exclusive_owner_entity_id: None,
                         }],
                         ..CollectionMutation::default()
                     }),
@@ -1114,7 +1259,6 @@ mod test {
                             variants: None,
                             extends: PatchField::Missing,
                             conforms_to: None,
-                            exclusive_owner_entity_id: PatchField::Missing,
                         }],
                         ..CollectionMutation::default()
                     }),
@@ -1272,7 +1416,6 @@ mod test {
                             variants: None,
                             extends: PatchField::Missing,
                             conforms_to: None,
-                            exclusive_owner_entity_id: PatchField::Missing,
                         }],
                         ..CollectionMutation::default()
                     }),
@@ -1325,7 +1468,6 @@ mod test {
                             }),
                             extends: PatchField::Missing,
                             conforms_to: None,
-                            exclusive_owner_entity_id: PatchField::Missing,
                         }],
                         ..CollectionMutation::default()
                     }),
@@ -1366,7 +1508,6 @@ mod test {
                             }),
                             extends: PatchField::Missing,
                             conforms_to: None,
-                            exclusive_owner_entity_id: PatchField::Missing,
                         }],
                         ..CollectionMutation::default()
                     }),
@@ -1401,7 +1542,6 @@ mod test {
                             }),
                             extends: PatchField::Missing,
                             conforms_to: None,
-                            exclusive_owner_entity_id: PatchField::Missing,
                         }],
                         ..CollectionMutation::default()
                     }),
@@ -1417,19 +1557,47 @@ mod test {
     fn propagates_entity_renames_through_semantic_references() {
         let mut document = super::super::test_fixture("plan", "Rename one entity.");
         super::super::attach_test_fixture(&mut document);
+        document.title = "Create PlanDocument".into();
+        document.overview = "PlanDocument owns canonical state without PlanDocumentFactory.".into();
+        document.dependencies = vec![PlanDependencyChange {
+            dependency_id: "serde".into(),
+            action: ChangeAction::Add,
+            name: "serde".into(),
+            version: "1".into(),
+            manifest: "Cargo.toml".into(),
+            license: Some("MIT OR Apache-2.0".into()),
+            justification: "Serialize PlanDocument without PlanDocumentFactory.".into(),
+        }];
+        document.entity_changes[0].members = vec![ProgramEntityMemberChange {
+            member_id: "load".into(),
+            action: ChangeAction::Add,
+            kind: MemberKind::Method,
+            name: "load".into(),
+            description: "Load one PlanDocument.".into(),
+            visibility: Some(Visibility::Public),
+            type_name: None,
+            parameters: Vec::new(),
+            return_type: Some("Result<PlanDocument, PlanError>".into()),
+        }];
+        document.tasks[0].description = "PlanDocument remains the task owner.".into();
         document.flows[0].steps[0].target = EntityReference::PlannedEntity {
             entity: "PlanDocument".into(),
         };
-        document.flows[0].steps[0]
-            .operations
-            .push(PlanFlowOperation {
-                operation_id: "validate_plan".into(),
-                action: "validate()".into(),
-                target: EntityReference::PlannedEntity {
-                    entity: "PlanDocument".into(),
+        document.flows[0].steps[0].edges.push(PlanFlowEdge {
+            edge_id: "validate_plan".into(),
+            relation: PlanFlowRelation::Call {
+                callable: PlanCallable {
+                    kind: PlanCallableKind::Method,
+                    name: "validate".into(),
                 },
-                result: Some("ValidatedPlan".into()),
-            });
+            },
+            target: EntityReference::PlannedEntity {
+                entity: "PlanDocument".into(),
+            },
+            result: Some(PlanFlowValue::Type {
+                name: "ValidatedPlan".into(),
+            }),
+        });
         *document.tasks[0].files[0].subtasks[0]
             .owned_entity_ids_mut()
             .unwrap() = vec!["PlanDocument".into()];
@@ -1456,7 +1624,6 @@ mod test {
                             variants: None,
                             extends: PatchField::Missing,
                             conforms_to: None,
-                            exclusive_owner_entity_id: PatchField::Missing,
                         }],
                         ..CollectionMutation::default()
                     }),
@@ -1473,7 +1640,7 @@ mod test {
             }
         );
         assert_eq!(
-            result.document.flows[0].steps[0].operations[0].target,
+            result.document.flows[0].steps[0].edges[1].target,
             EntityReference::PlannedEntity {
                 entity: "CanonicalPlan".into()
             }
@@ -1486,6 +1653,41 @@ mod test {
             result.document.tasks[0].files[0].subtasks[1].covered_entity_ids(),
             ["CanonicalPlan"]
         );
+        assert_eq!(
+            result.document.overview,
+            "CanonicalPlan owns canonical state without PlanDocumentFactory."
+        );
+        assert_eq!(result.document.title, "Create CanonicalPlan");
+        assert_eq!(
+            result.document.dependencies[0].justification,
+            "Serialize CanonicalPlan without PlanDocumentFactory."
+        );
+        assert_eq!(
+            result.document.entity_changes[0].members[0]
+                .return_type
+                .as_deref(),
+            Some("Result<CanonicalPlan, PlanError>")
+        );
+        assert_eq!(
+            result.document.entity_changes[0].members[0].description,
+            "Load one CanonicalPlan."
+        );
+        assert_eq!(
+            result.document.tasks[0].description,
+            "CanonicalPlan remains the task owner."
+        );
+    }
+
+    #[test]
+    fn direct_entity_rename_rejects_existing_entities() {
+        let mut document = super::super::test_fixture("plan", "Rename one entity.");
+        document.entity_changes[0].action = ChangeAction::Modify;
+
+        let error = rename_added_entity(&document, "PlanDocument", "CanonicalPlan".into())
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(error, "only newly added plan entities can be renamed");
     }
 
     #[test]
@@ -1507,7 +1709,7 @@ mod test {
                             files: Some(CollectionMutation {
                                 modify: vec![PlanFilePatch {
                                     path: "src/plan.rs".into(),
-                                    action: None,
+                                    change: None,
                                     subtasks: Some(CollectionMutation {
                                         modify: vec![PlanSubtaskPatch::Test(
                                             PlanTestSubtaskPatch {
@@ -1546,7 +1748,7 @@ mod test {
     }
 
     #[test]
-    fn adds_and_replaces_nested_flow_operations_with_stable_identity() {
+    fn adds_and_replaces_typed_flow_edges_with_stable_identity() {
         let added = apply_plan_edit(
             &empty_document(),
             PlanEditRequest {
@@ -1562,17 +1764,27 @@ mod test {
                                 step_id: String::new(),
                                 action: "Read table observations".into(),
                                 target: EntityReference::ExternalEntity {
-                                    entity: "GeoParquetInspector".into(),
+                                    entity_kind: ExternalEntityKind::Type,
+                                    name: "GeoParquetInspector".into(),
+                                    dependency: None,
                                 },
-                                operations: vec![PlanFlowOperation {
-                                    operation_id: String::new(),
-                                    action: "schema()".into(),
-                                    target: EntityReference::ExternalEntity {
-                                        entity: "datafusion::SessionContext".into(),
+                                edges: vec![PlanFlowEdge {
+                                    edge_id: String::new(),
+                                    relation: PlanFlowRelation::Read {
+                                        callable: PlanCallable {
+                                            kind: PlanCallableKind::Method,
+                                            name: "schema".into(),
+                                        },
                                     },
-                                    result: Some("schema text".into()),
+                                    target: EntityReference::ExternalEntity {
+                                        entity_kind: ExternalEntityKind::Type,
+                                        name: "SessionContext".into(),
+                                        dependency: Some("datafusion".into()),
+                                    },
+                                    result: Some(PlanFlowValue::Text {
+                                        text: "schema text".into(),
+                                    }),
                                 }],
-                                value_to_next: None,
                             }],
                         }],
                         ..CollectionMutation::default()
@@ -1585,8 +1797,8 @@ mod test {
 
         let step = &added.document.flows[0].steps[0];
         assert_eq!(
-            step.operations[0].operation_id,
-            "flow_table_inspection_step_read_table_observations_operation_schema"
+            step.edges[0].edge_id,
+            "flow_table_inspection_step_read_table_observations_edge_read_schema_session_context"
         );
 
         let modified = apply_plan_edit(
@@ -1605,15 +1817,21 @@ mod test {
                                     step_id: "Read table observations".into(),
                                     action: None,
                                     target: None,
-                                    operations: Some(vec![PlanFlowOperation {
-                                        operation_id: String::new(),
-                                        action: "count(*)".into(),
-                                        target: EntityReference::ExternalEntity {
-                                            entity: "datafusion::SessionContext".into(),
+                                    edges: Some(vec![PlanFlowEdge {
+                                        edge_id: String::new(),
+                                        relation: PlanFlowRelation::Call {
+                                            callable: PlanCallable {
+                                                kind: PlanCallableKind::Method,
+                                                name: "count".into(),
+                                            },
                                         },
-                                        result: Some("u64".into()),
+                                        target: EntityReference::ExternalEntity {
+                                            entity_kind: ExternalEntityKind::Type,
+                                            name: "SessionContext".into(),
+                                            dependency: Some("datafusion".into()),
+                                        },
+                                        result: Some(PlanFlowValue::Type { name: "u64".into() }),
                                     }]),
-                                    value_to_next: PatchField::Missing,
                                 }],
                                 ..CollectionMutation::default()
                             }),
@@ -1626,12 +1844,16 @@ mod test {
         )
         .unwrap();
 
-        let operation_list = &modified.document.flows[0].steps[0].operations;
-        assert_eq!(operation_list.len(), 1);
-        assert_eq!(operation_list[0].action, "count(*)");
+        let edge_list = &modified.document.flows[0].steps[0].edges;
+        assert_eq!(edge_list.len(), 1);
+        assert!(matches!(
+            &edge_list[0].relation,
+            PlanFlowRelation::Call { callable }
+                if callable.kind == PlanCallableKind::Method && callable.name == "count"
+        ));
         assert_eq!(
-            operation_list[0].operation_id,
-            "flow_table_inspection_step_read_table_observations_operation_count"
+            edge_list[0].edge_id,
+            "flow_table_inspection_step_read_table_observations_edge_call_count_session_context"
         );
     }
 
@@ -1681,4 +1903,29 @@ mod test {
         assert_eq!(result.version, 4);
         assert_eq!(result.document, document);
     }
+}
+#[test]
+fn replaces_a_file_change_with_a_tagged_rename() {
+    let mut file = PlanFile {
+        change: PlanFileChange::Modify {
+            path: "src/old.rs".into(),
+        },
+        subtasks: Vec::new(),
+    };
+
+    apply_file_patch(
+        &mut file,
+        PlanFilePatch {
+            path: "src/old.rs".into(),
+            change: Some(PlanFileChange::Rename {
+                from: "src/old.rs".into(),
+                to: "src/new.rs".into(),
+            }),
+            subtasks: None,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(file.change.path(), "src/new.rs");
+    assert_eq!(file.change.source_path(), Some("src/old.rs"));
 }

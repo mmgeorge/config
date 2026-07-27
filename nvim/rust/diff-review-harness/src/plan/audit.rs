@@ -50,7 +50,15 @@ pub fn build_plan_audit(
     let planned_paths = document
         .tasks
         .iter()
-        .flat_map(|task| task.files.iter().map(|file| file.path.clone()))
+        .flat_map(|task| {
+            task.files.iter().flat_map(|file| {
+                file.change
+                    .source_path()
+                    .into_iter()
+                    .chain(std::iter::once(file.change.path()))
+                    .map(str::to_owned)
+            })
+        })
         .collect::<BTreeSet<_>>();
     let changed_paths = scheduler
         .task

@@ -25,6 +25,22 @@ assert_equals(
   vim.api.nvim_get_hl(0, { name = "Normal", link = false }).fg,
   "plan metadata should use the regular text color"
 )
+local file_status_highlight = {
+  New = "DiffReviewFileStatusNew",
+  Modified = "DiffReviewFileStatusModified",
+  Deleted = "DiffReviewFileStatusDeleted",
+  Renamed = "DiffReviewFileStatusRenamed",
+}
+for status, highlight in pairs(file_status_highlight) do
+  local segments = uml_style.segments("│  └─ inspection.rs    " .. status, {
+    target_type = "file",
+  })
+  assert_equals(
+    highlight_for(segments, status),
+    highlight,
+    status .. " should use its semantic file-status highlight"
+  )
+end
 
 local aligned_entity = uml_style.align_owner(
   "*struct InspectionSummary [hello/src/inspection.rs]",
@@ -110,24 +126,58 @@ assert_equals(
   "code-flow actions should retain their existing presentation styling"
 )
 
-local flow_operation = uml_style.segments(
-  "    ├─ Read Arrow schema: schema text    [datafusion::SessionContext]",
-  { target_type = "flow_operation" }
+local flow_edge = uml_style.segments(
+  "  ├─ Read schema() from SessionContext",
+  {
+    target_type = "flow_edge",
+    callable_kind = "method",
+    callable_name = "schema",
+    target_name = "SessionContext",
+    target_is_type = true,
+  }
 )
 assert_equals(
-  highlight_for(flow_operation, "    ├─ Read Arrow schema: schema text    "),
-  "Normal",
-  "code-flow operation prose should use the standard text color"
+  highlight_for(flow_edge, "schema"),
+  "@function.method.call",
+  "typed flow methods should use Tree-sitter method-call highlighting"
+)
+local function_edge = uml_style.segments(
+  "  └─ Call decode() on GeoMetadata",
+  {
+    target_type = "flow_edge",
+    callable_kind = "function",
+    callable_name = "decode",
+    target_name = "GeoMetadata",
+    target_is_type = true,
+  }
 )
 assert_equals(
-  highlight_for(flow_operation, "[datafusion::SessionContext]"),
-  "DiffReviewPlanMetadata",
-  "code-flow operation paths should use the dark-gray plan metadata highlight"
+  highlight_for(function_edge, "decode"),
+  "@function.call",
+  "typed flow functions should use Tree-sitter function-call highlighting"
+)
+assert_equals(
+  highlight_for(flow_edge, "SessionContext"),
+  "@type",
+  "typed flow receivers should use Tree-sitter type highlighting"
+)
+local endpoint_edge = uml_style.segments(
+  "  └─ Emit to terminal stdout",
+  {
+    target_type = "flow_edge",
+    target_name = "terminal stdout",
+    target_is_type = false,
+  }
+)
+assert_equals(
+  highlight_for(endpoint_edge, "terminal stdout"),
+  nil,
+  "endpoint names should retain standard text highlighting"
 )
 
 local entity_value = uml_style.segments(
-  "    ├─ InspectionSummary",
-  { target_type = "flow_value", value_kind = "type" }
+  "        └─ InspectionSummary",
+  { target_type = "flow_edge_result", value_kind = "type" }
 )
 assert_equals(
   highlight_for(entity_value, "InspectionSummary"),
@@ -136,11 +186,11 @@ assert_equals(
 )
 
 local plain_flow_value = uml_style.segments(
-  "    └─ stdout and exit status",
-  { target_type = "flow_value", value_kind = "text" }
+  "        └─ stdout and exit status",
+  { target_type = "flow_edge_result", value_kind = "text" }
 )
 assert_equals(
-  highlight_for(plain_flow_value, "    └─ stdout and exit status"),
+  highlight_for(plain_flow_value, "        └─ stdout and exit status"),
   "Normal",
   "non-entity flow values should use the standard text color"
 )

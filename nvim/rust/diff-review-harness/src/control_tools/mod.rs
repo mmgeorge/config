@@ -338,7 +338,7 @@ fn plan_usage_input_schema() -> Value {
 
 fn entity_reference_input_schema() -> Value {
     json!({
-        "description": "Use planned_entity for the name of an entity in entity_changes. Use external_entity for a boundary outside the plan.",
+        "description": "Use planned_entity for one entity in entity_changes. External entities explicitly distinguish type receivers from runtime endpoints and may name their owning dependency.",
         "oneOf": [
             strict_object_input_schema(
                 vec![
@@ -350,9 +350,14 @@ fn entity_reference_input_schema() -> Value {
             strict_object_input_schema(
                 vec![
                     ("kind", json!({ "type": "string", "const": "external_entity" })),
-                    ("entity", string_schema()),
+                    (
+                        "entity_kind",
+                        json!({ "type": "string", "enum": ["type", "endpoint"] }),
+                    ),
+                    ("name", string_schema()),
+                    ("dependency", nullable_string_schema()),
                 ],
-                &["kind", "entity"],
+                &["kind", "entity_kind", "name"],
             ),
         ]
     })
@@ -488,7 +493,6 @@ fn entity_change_input_schema() -> Value {
                 "conforms_to",
                 json!({ "type": "array", "items": entity_reference_input_schema() }),
             ),
-            ("exclusive_owner_entity", nullable_string_schema()),
         ],
         &["action", "kind", "name", "description", "path"],
     )
@@ -522,7 +526,6 @@ fn entity_change_patch_input_schema() -> Value {
                 "conforms_to",
                 json!({ "type": "array", "items": entity_reference_input_schema() }),
             ),
-            ("exclusive_owner_entity", nullable_string_schema()),
         ],
         &["entity"],
     )
@@ -601,15 +604,11 @@ fn flow_step_input_schema() -> Value {
             ("action", string_schema()),
             ("target", entity_reference_input_schema()),
             (
-                "operations",
-                json!({ "type": "array", "items": flow_operation_input_schema() }),
-            ),
-            (
-                "value_to_next",
-                json!({ "oneOf": [flow_value_input_schema(), { "type": "null" }] }),
+                "edges",
+                json!({ "type": "array", "items": flow_edge_input_schema() }),
             ),
         ],
-        &["action", "target"],
+        &["action", "target", "edges"],
     )
 }
 
@@ -620,26 +619,85 @@ fn flow_step_patch_input_schema() -> Value {
             ("action", string_schema()),
             ("target", entity_reference_input_schema()),
             (
-                "operations",
-                json!({ "type": "array", "items": flow_operation_input_schema() }),
-            ),
-            (
-                "value_to_next",
-                json!({ "oneOf": [flow_value_input_schema(), { "type": "null" }] }),
+                "edges",
+                json!({ "type": "array", "items": flow_edge_input_schema() }),
             ),
         ],
         &["step"],
     )
 }
 
-fn flow_operation_input_schema() -> Value {
+fn flow_relation_input_schema() -> Value {
+    let callable_schema = || {
+        strict_object_input_schema(
+            vec![
+                (
+                    "kind",
+                    json!({ "type": "string", "enum": ["function", "method"] }),
+                ),
+                ("name", string_schema()),
+            ],
+            &["kind", "name"],
+        )
+    };
+    json!({
+        "description": "Typed runtime relationship from the owning flow step to one receiver or endpoint. Call, read, write, and construct targets must resolve to a type entity.",
+        "oneOf": [
+            strict_object_input_schema(
+                vec![("kind", json!({ "type": "string", "const": "construct" }))],
+                &["kind"],
+            ),
+            strict_object_input_schema(
+                vec![
+                    ("kind", json!({ "type": "string", "const": "call" })),
+                    ("callable", callable_schema()),
+                ],
+                &["kind", "callable"],
+            ),
+            strict_object_input_schema(
+                vec![
+                    ("kind", json!({ "type": "string", "const": "read" })),
+                    ("callable", callable_schema()),
+                ],
+                &["kind", "callable"],
+            ),
+            strict_object_input_schema(
+                vec![
+                    ("kind", json!({ "type": "string", "const": "write" })),
+                    ("callable", callable_schema()),
+                ],
+                &["kind", "callable"],
+            ),
+            strict_object_input_schema(
+                vec![
+                    ("kind", json!({ "type": "string", "const": "send" })),
+                    ("event", string_schema()),
+                ],
+                &["kind", "event"],
+            ),
+            strict_object_input_schema(
+                vec![("kind", json!({ "type": "string", "const": "emit" }))],
+                &["kind"],
+            ),
+            strict_object_input_schema(
+                vec![("kind", json!({ "type": "string", "const": "return" }))],
+                &["kind"],
+            ),
+        ]
+    })
+}
+
+fn flow_edge_input_schema() -> Value {
     strict_object_input_schema(
         vec![
-            ("action", string_schema()),
+            ("relation", flow_relation_input_schema()),
             ("target", entity_reference_input_schema()),
-            ("result", nullable_string_schema()),
+            (
+                "result",
+                json!({ "oneOf": [flow_value_input_schema(), { "type": "null" }] }),
+            ),
         ],
-        &["action", "target"],
+        &["relation", "target", "result"],
     )
 }
 
@@ -775,24 +833,87 @@ fn subtask_patch_input_schema() -> Value {
 }
 
 fn file_input_schema() -> Value {
-    strict_object_input_schema(
-        vec![
-            ("path", string_schema()),
-            ("action", change_action_schema()),
-            (
-                "subtasks",
-                json!({ "type": "array", "items": subtask_input_schema() }),
+    let subtasks = json!({ "type": "array", "items": subtask_input_schema() });
+    json!({
+        "oneOf": [
+            strict_object_input_schema(
+                vec![
+                    ("action", json!({ "type": "string", "const": "add" })),
+                    ("path", string_schema()),
+                    ("subtasks", subtasks.clone()),
+                ],
+                &["action", "path"],
             ),
-        ],
-        &["path"],
-    )
+            strict_object_input_schema(
+                vec![
+                    ("action", json!({ "type": "string", "const": "modify" })),
+                    ("path", string_schema()),
+                    ("subtasks", subtasks.clone()),
+                ],
+                &["action", "path"],
+            ),
+            strict_object_input_schema(
+                vec![
+                    ("action", json!({ "type": "string", "const": "remove" })),
+                    ("path", string_schema()),
+                    ("subtasks", subtasks.clone()),
+                ],
+                &["action", "path"],
+            ),
+            strict_object_input_schema(
+                vec![
+                    ("action", json!({ "type": "string", "const": "rename" })),
+                    ("from", string_schema()),
+                    ("to", string_schema()),
+                    ("subtasks", subtasks),
+                ],
+                &["action", "from", "to"],
+            ),
+        ]
+    })
+}
+
+fn file_change_input_schema() -> Value {
+    json!({
+        "oneOf": [
+            strict_object_input_schema(
+                vec![
+                    ("action", json!({ "type": "string", "const": "add" })),
+                    ("path", string_schema()),
+                ],
+                &["action", "path"],
+            ),
+            strict_object_input_schema(
+                vec![
+                    ("action", json!({ "type": "string", "const": "modify" })),
+                    ("path", string_schema()),
+                ],
+                &["action", "path"],
+            ),
+            strict_object_input_schema(
+                vec![
+                    ("action", json!({ "type": "string", "const": "remove" })),
+                    ("path", string_schema()),
+                ],
+                &["action", "path"],
+            ),
+            strict_object_input_schema(
+                vec![
+                    ("action", json!({ "type": "string", "const": "rename" })),
+                    ("from", string_schema()),
+                    ("to", string_schema()),
+                ],
+                &["action", "from", "to"],
+            ),
+        ]
+    })
 }
 
 fn file_patch_input_schema() -> Value {
     strict_object_input_schema(
         vec![
             ("path", string_schema()),
-            ("action", change_action_schema()),
+            ("change", file_change_input_schema()),
             (
                 "subtasks",
                 collection_mutation_schema(subtask_input_schema(), subtask_patch_input_schema()),
@@ -1116,7 +1237,10 @@ pub async fn run_stdio() -> Result<()> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::plan::{PatchField, PlanFlowValue, PlanSubtask, PlanUsage, TestCategory};
+    use crate::plan::{
+        PatchField, PlanCallableKind, PlanFlowRelation, PlanFlowValue, PlanSubtask, PlanUsage,
+        TestCategory,
+    };
 
     #[test]
     fn exposes_resource_oriented_plan_tools() {
@@ -1152,6 +1276,20 @@ mod test {
         assert!(
             schema
                 .pointer("/properties/entity_changes/properties/add/items/properties/entity_id")
+                .is_none()
+        );
+        assert!(
+            schema
+                .pointer(
+                    "/properties/entity_changes/properties/add/items/properties/exclusive_owner_entity"
+                )
+                .is_none()
+        );
+        assert!(
+            schema
+                .pointer(
+                    "/properties/entity_changes/properties/modify/items/properties/exclusive_owner_entity"
+                )
                 .is_none()
         );
         assert!(
@@ -1201,17 +1339,34 @@ mod test {
         );
         assert!(schema
             .pointer(
-                "/properties/flows/properties/add/items/properties/steps/items/properties/operations/items/properties/result"
+                "/properties/flows/properties/add/items/properties/steps/items/properties/edges/items/properties/result"
+            )
+            .is_some());
+        assert_eq!(
+            schema.pointer(
+                "/properties/flows/properties/add/items/properties/steps/items/properties/edges/items/properties/relation/oneOf/1/properties/callable/properties/kind/enum/1"
+            ),
+            Some(&json!("method"))
+        );
+        assert_eq!(
+            schema.pointer(
+                "/properties/flows/properties/add/items/properties/steps/items/properties/edges/items/properties/target/oneOf/1/properties/entity_kind/enum/0"
+            ),
+            Some(&json!("type"))
+        );
+        assert!(schema
+            .pointer(
+                "/properties/flows/properties/add/items/properties/steps/items/properties/edges/items/properties/target/oneOf/1/properties/dependency"
             )
             .is_some());
         assert!(schema
             .pointer(
-                "/properties/flows/properties/add/items/properties/steps/items/properties/operations/items/properties/operation_id"
+                "/properties/flows/properties/add/items/properties/steps/items/properties/edges/items/properties/edge_id"
             )
             .is_none());
         assert!(schema
             .pointer(
-                "/properties/flows/properties/modify/items/properties/steps/properties/modify/items/properties/operations/items/properties/target"
+                "/properties/flows/properties/modify/items/properties/steps/properties/modify/items/properties/edges/items/properties/target"
             )
             .is_some());
         assert!(
@@ -1233,7 +1388,7 @@ mod test {
         assert!(
             schema
                 .pointer(
-                    "/properties/tasks/properties/add/items/properties/files/items/properties/subtasks/items/oneOf/0/properties/entities/description"
+                    "/properties/tasks/properties/add/items/properties/files/items/oneOf/0/properties/subtasks/items/oneOf/0/properties/entities/description"
                 )
                 .and_then(Value::as_str)
                 .is_some_and(|description| description.contains("Complete replacement"))
@@ -1241,9 +1396,15 @@ mod test {
         assert!(schema.pointer("/properties/tests").is_none());
         assert_eq!(
             schema.pointer(
-                "/properties/tasks/properties/add/items/properties/files/items/properties/subtasks/items/oneOf/1/properties/operation/const"
+                "/properties/tasks/properties/add/items/properties/files/items/oneOf/0/properties/subtasks/items/oneOf/1/properties/operation/const"
             ),
             Some(&json!("test"))
+        );
+        assert_eq!(
+            schema.pointer(
+                "/properties/tasks/properties/add/items/properties/files/items/oneOf/3/properties/action/const"
+            ),
+            Some(&json!("rename"))
         );
     }
 
@@ -1317,24 +1478,37 @@ mod test {
                                 "kind": "planned_entity",
                                 "entity": "DraftCache"
                             },
-                            "value_to_next": {
-                                "kind": "type",
-                                "name": "DraftChange"
-                            },
-                            "operations": [
+                            "edges": [
                                 {
-                                    "action": "pending()",
+                                    "relation": {
+                                        "kind": "read",
+                                        "callable": {
+                                            "kind": "method",
+                                            "name": "pending"
+                                        }
+                                    },
                                     "target": {
                                         "kind": "planned_entity",
                                         "entity": "DraftCache"
                                     },
-                                    "result": "DraftChange[]"
+                                    "result": {
+                                        "kind": "type",
+                                        "name": "DraftChange[]"
+                                    }
                                 },
                                 {
-                                    "action": "status()",
+                                    "relation": {
+                                        "kind": "write",
+                                        "callable": {
+                                            "kind": "method",
+                                            "name": "persist"
+                                        }
+                                    },
                                     "target": {
                                         "kind": "external_entity",
-                                        "entity": "draft storage"
+                                        "entity_kind": "type",
+                                        "name": "DraftStore",
+                                        "dependency": null
                                     },
                                     "result": null
                                 }
@@ -1348,6 +1522,7 @@ mod test {
                         "description": "Keep drafts outside editor buffers.",
                         "files": [
                             {
+                                "action": "add",
                                 "path": "src/draft_sync.rs",
                                 "subtasks": [
                                     {
@@ -1398,22 +1573,21 @@ mod test {
         assert_eq!(dependency.name, "tokio");
         assert_eq!(dependency.version, "1");
         assert!(dependency.dependency_id.is_empty());
-        let operation_list = &request.mutation.flows.as_ref().unwrap().add[0].steps[0].operations;
-        assert_eq!(operation_list.len(), 2);
-        assert_eq!(operation_list[0].action, "pending()");
-        assert_eq!(operation_list[0].result.as_deref(), Some("DraftChange[]"));
-        assert_eq!(operation_list[1].result, None);
+        let edge_list = &request.mutation.flows.as_ref().unwrap().add[0].steps[0].edges;
+        assert_eq!(edge_list.len(), 2);
+        assert!(matches!(
+            &edge_list[0].relation,
+            PlanFlowRelation::Read { callable }
+                if callable.kind == PlanCallableKind::Method && callable.name == "pending"
+        ));
         assert_eq!(
-            request.mutation.flows.as_ref().unwrap().add[0].steps[0].value_to_next,
+            edge_list[0].result,
             Some(PlanFlowValue::Type {
-                name: "DraftChange".into()
+                name: "DraftChange[]".into()
             })
         );
-        assert!(
-            operation_list
-                .iter()
-                .all(|operation| operation.operation_id.is_empty())
-        );
+        assert_eq!(edge_list[1].result, None);
+        assert!(edge_list.iter().all(|edge| edge.edge_id.is_empty()));
         assert_eq!(
             request.mutation.plan.as_ref().unwrap().modify.usage,
             PatchField::Value(PlanUsage {

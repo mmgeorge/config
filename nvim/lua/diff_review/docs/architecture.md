@@ -81,8 +81,11 @@ diff_review/
 │   ├── plan_review/          Canonical plan review with semantic task rows, annotations, folds, accept, and revision
 │   │   ├── init.lua           View lifecycle and composition of model, renderer, comments, and folds
 │   │   ├── task_model.lua     Non-rendering working.json/index adapter with canonical source anchors
+│   │   ├── entity_info.lua    LSP-style entity-description hover resolved from canonical plan data
+│   │   ├── entity_rename.lua  Added-entity rename prompt and client-side eligibility boundary
 │   │   ├── comment.lua        Display-row projection plus editable source-anchored comments
-│   │   └── fold.lua           Plan task native-fold state capture and application
+│   │   ├── fold.lua           Plan task native-fold state capture and application
+│   │   └── schema.lua         Read-only working.json view with return-to-review lifecycle
 │   ├── sessions/             Current-worktree and all-worktree durable session browser
 │   ├── pr/
 │   │   ├── pr_overview.lua    PR metadata, checks, review summaries, inline comments
@@ -1293,7 +1296,9 @@ previous backend rather than persisting a broken default.
 
 Plan lifecycle and execution records accompany current sessions. Each plan stores mutable canonical
 state in `plans/<session>/<plan>/working.json`, then derives `working.md` and `working.index.json`
-for review and source navigation. Submission freezes all three projections as one immutable revision.
+for review and source navigation. The render boundary receives the session workspace explicitly, so
+repository-relative file classification never depends on the sidecar process directory. Submission
+freezes all three projections as one immutable revision.
 The snapshot exposes the plan artifact and its generated review path, while every planning or
 execution turn receives the complete effective JSON document rather than relying on a path lookup.
 The broker creates the document identity and initial version. Providers can only mutate it through
@@ -1304,21 +1309,27 @@ definition, relationship, symbol, and change layers. The model introduces entiti
 Harness derives durable snake-case identities from additions and retains those identities for
 review, persistence, and execution. Model edits never author internal ID fields. Each entity also
 owns one add/modify/remove lifecycle action, one repository-relative file path, nested ordinary
-members, and inheritance, conformance, or exclusive-owner references. Enum cases live only in the
+members, and inheritance or conformance references. Enum cases live only in the
 owning enum's dedicated `variants` collection. Variant fields form their own typed child collection,
 so variants cannot acquire member-only visibility or callable properties. Package decisions live in a separate
 top-level dependency collection. Each dependency records only its name, version, manifest, optional
 license, and architectural justification. Harness derives dependency ownership by matching its
 manifest to exactly one task file, so subtasks never repeat dependency references. Every collection
 uses `add`, `modify`, and `remove`. Array position defines presentation and execution order
-throughout the document. Subtasks use `operation` for architectural moves so `action` remains
-reserved for add/modify/remove lifecycle changes. The operation owns the rendered imperative, while
+throughout the document. Each task file carries a tagged `add`, `modify`, or `remove` operation
+with one `path`, or a `rename` operation with distinct `from` and `to` paths. Rename ownership
+resolves entities and subtasks against the destination while execution evidence and auditing include
+both paths. Subtasks use `operation` for architectural moves so `action` remains reserved for
+lifecycle changes. The operation owns the rendered imperative, while
 the description supplies its grammatical complement. Submission rejects descriptions that repeat
 the operation as their first word, preventing canonical data from producing labels such as
-`Route Route`. Flow targets use the tagged `EntityReference`
-union with `planned_entity` or `external_entity` plus one shared `entity` payload. Planned
-references resolve semantic entity names while external references retain their supplied boundary
-name. Assumptions remain plain text values. Tests remain optional and never form a detached
+`Route Route`. Flow targets use the tagged `EntityReference` union. Planned references resolve
+canonical entity identities. External references carry an explicit `type` or `endpoint` kind,
+a name, and optional dependency provenance. `construct`, `call`, `read`, and `write` accept only
+type targets. Their call-like relations store one structured `function` or `method` callable with
+a bare identifier, so rendering and highlighting never infer callable semantics from prose or
+parentheses. `send`, `emit`, and `return` may address endpoints such as terminals, workers, or
+schedulers. Assumptions remain plain text values. Tests remain optional and never form a detached
 top-level collection. Each concrete test forms one flat task-file subtask with `operation: "test"`,
 an add/modify/remove `action`, `name`, `category`, and `behavior`. The parent task and file establish
 architectural ownership and source placement. Optional `covers_entities` references provide reviewer
@@ -1329,8 +1340,16 @@ unit or integration category. Planning prompts prefer integration coverage acros
 boundaries and reserve unit cases for algorithms, data structures, state machines, parsers, and
 other complex isolated behavior. They reject tests for properties already enforced by the type
 system and treat a test-only enforceable invariant as pressure to strengthen the types.
-`PlanGraph` resolves semantic names and durable internal
-identities for editing, submission, rendering, review, and execution.
+`PlanGraph` resolves semantic names and durable internal identities for editing, submission,
+rendering, review, and execution. It also extracts planned-entity dependencies from member fields,
+parameters, return types, and enum payload types. The object-model projection nests a concrete
+entity beneath its sole concrete user, keeps shared or contract-owned entities at the root, and
+removes cyclic parent edges. `PlanGraph` assigns every entity a one-based hierarchy path and a
+preorder rank once after resolving those edges. The object-model projection consumes the hierarchy,
+while each task subtask filters its own entity references through the same rank without moving
+ownership or adding dependency indentation. A subtask therefore preserves the global owner-first
+order even when its dependency parent belongs to another subtask. This hierarchy crosses file and
+task boundaries because aligned path suffixes retain each declaration's actual source location.
 
 Review annotations retain the renderer target plus the exact canonical JSON path from
 `working.index.json`. The revision prompt can therefore identify `/entity_changes/2/members/1`
@@ -1346,21 +1365,42 @@ revision context but never appears in the reviewer-facing Markdown projection.
 The generated object model uses stacked Markdown sections rather than a fenced two-column layout.
 Entities, members, variants, and variant fields derive `(new)`, `(modify)`, or `(remove)` directly
 from canonical lifecycle state. Each entity declaration aligns its repository-relative path against
-a bounded inline suffix column. Member signatures and enum payloads retain the full object-model
-column width and their semantic indentation, so a long return type cannot push every path outward
-or inherit a narrower wrapping boundary. A dedicated Dependencies section appears before Tasks and
+a bounded inline suffix column. Derived dependency children indent beneath their sole concrete user
+in graph presentation order. Task entity lists use that same order within each subtask but retain
+the task tree's existing indentation. Entity change rows render semantic names as plain text so
+Tree-sitter type highlights, cursor inspection, and surrounding prose share one visual form.
+Member signatures and enum payloads retain the full
+object-model column width and their semantic indentation, so a long return type cannot push every
+path outward or inherit a narrower wrapping boundary. A dedicated Dependencies section appears before Tasks and
 groups package changes beneath their repository-relative manifest. Each dependency row combines
 its action, package, version, license, and two-sentence justification into one wrapped tree node,
-while manifest and package rows retain separate review anchors. Runtime flow diagrams
-remain fenced text because their arrows encode sequence rather than review identity. The flow
-title remains in the Markdown heading rather than consuming diagram width. Every sequence renders
-as one vertical pipeline. Top-level steps, one-level child operations, and their results remain in
-the left column while planned file paths and external owners align in one calculated right column.
-When an owner cannot fit beside its action within 100 columns, it moves to one indented physical
-line beneath that action without truncation. Child operations express independent work owned by
-one composite step. Intermediate values use `├─` before the next downward transition, while a final
-observable result closes the pipeline with `└─`. Causally ordered work remains in separate top-level
-steps.
+while manifest and package rows retain separate review anchors. A generated Files section collects
+every distinct task file, dependency manifest, and entity path without adding canonical model state.
+It folds those paths into one directory tree and aligns task-file status in a compact second column
+four spaces after the longest rendered file branch. Status comes from the canonical file operation:
+`New`, `Modified`, `Deleted`, or `Renamed`. Rename leaves show their source and destination names.
+Green, light blue, red, and purple status highlights preserve lifecycle meaning without coloring
+the neutral path tree. Incomplete drafts may still infer unmatched dependency or entity paths from
+the worktree until their required task-file owner exists. Runtime flow diagrams remain
+fenced text because their relationships encode execution rather than durable ownership. The flow
+title remains in the Markdown heading rather than consuming diagram width. Each top-level step
+names one acting planned or external participant and owns an ordered adjacency list of typed
+runtime edges. `construct`, `call`, `read`, `write`, `send`, `emit`, and `return` preserve the
+relationship between that actor and each edge target without relying on step array adjacency.
+Each edge may carry a structured type or text result. This lets an orchestration function expose
+construction and invocation boundaries without becoming a durable UML owner. Flow navigation
+anchors repeat callable kind, callable name, target name, and whether the receiver resolves to a
+type. PlanReview uses that canonical metadata to highlight free-function invocations through
+`@function.call`, method invocations through `@function.method.call`, and type receivers through
+`@type`; endpoint labels retain ordinary text styling.
+Steps, edges, and results remain in the left column while repository-relative paths for planned
+entities align in one calculated right column. External participants remain in the relationship
+text because their names identify runtime receivers rather than source locations. When a planned
+path cannot fit beside its action within 100 columns, it moves to one indented physical line beneath
+that action without truncation. Edge branches use a two-space tree level with `├─` and `└─`. A
+non-final edge carries `│` through its nested result, while a final edge closes without a
+continuation stem. Top-level step order controls reviewer presentation only. Typed edges carry
+runtime meaning.
 PlanReview keeps the plan read-only and routes reviewer feedback back through semantic plan
 operations. `task_model.lua` reads `working.json` and `working.index.json`, maps the Tasks section
 into semantic nodes with canonical source lines, and leaves wrapping to the shared task-tree
@@ -1372,16 +1412,39 @@ rows as real buffer text and owns native manual task and subtask folds. `fold_pr
 supplies the same fold label, blank filler, and folded-row highlight mapping used by status
 Walkthroughs, so collapsed plans do not fall back to Neovim's dotted default. `<Tab>` resolves
 the selected display row to its semantic fold identity, so wrapped headings toggle the same owner.
+The `schema` command replaces the PlanReview window with a read-only `PlanReviewSchema://<plan-id>`
+scratch buffer containing the unmodified `working.json` lines. Its buffer-local `q` mapping restores
+the originating PlanReview buffer in that window and wipes the transient schema buffer.
+The `entity_info` command resolves the entity name beneath the cursor against the canonical
+`working.json` model and opens its description through the shared cursor-relative popup primitive.
+It follows LSP hover behavior in a borderless 40-column float while keeping focus restoration and
+close events inside DiffReview.
+Rendered prose, UML declarations, and task rows therefore share one inspection path without
+duplicating descriptions into presentation metadata.
+The `jump_entity` command resolves the same cursor entity, maps its canonical object-model source
+line through the comment projection's extmark index, and moves `.` to the visible UML declaration.
+It moves through Neovim's native line-jump command before selecting the entity column, which records
+both the previous-context mark and a jumplist entry. `''`, `<C-o>`, and the existing `,` jump-back
+mapping therefore return to the original reference even when wrapping or review comments have
+shifted display rows. `<CR>` retains source-file navigation.
+The `rename_entity` command resolves that same entity and admits `<Space>f` only for an `Add`
+declaration. Its popup starts with the current name, then calls the broker-owned semantic rename
+operation. Rust updates exact identifier occurrences and structured entity references, validates
+the complete document, and publishes a fresh submitted revision and review digest. PlanReview
+reloads that canonical revision, so review and later accepted-plan execution consume identical JSON.
 
 The comment controller inserts display-only rows after the final rendered row for one canonical
-source line. An unfocused annotation uses the shared compact comment-box renderer. Cursor focus
-replaces that box with the same full-width header, editable body, and footer primitives used by PR
-code comments, then collapses it when the cursor leaves. Source-line extmarks preserve line/body
-input while task rows wrap or folds reapply. Rust resolves each submitted line through
-`working.index.json` to one `PlanReviewTarget`, then stores and prompts with its JSON path, concise
-label, optional repository path, and comment body. Revision prompts therefore carry canonical JSON
-plus path-addressed annotations and never resend rendered Markdown. Resolved-comment timeline boxes
-show those semantic labels instead of stale line numbers.
+source range. `C` accepts either the cursor line or a characterwise/linewise visual selection and
+creates one annotation spanning the selected PlanReview rows. An unfocused annotation uses the
+shared compact comment-box renderer. Cursor focus replaces that box with the same full-width header,
+editable body, and footer primitives used by PR code comments, then collapses it when the cursor
+leaves. Source-line extmarks preserve both range boundaries and the body while task rows wrap or
+folds reapply. Rust resolves every distinct navigation anchor between the submitted boundaries
+through `working.index.json`, then stores the ordered canonical subjects with their targets, JSON
+paths, labels, optional repository paths, and shared comment body. Revision prompts therefore carry
+canonical JSON plus range-addressed annotations and never resend rendered Markdown.
+Resolved-comment timeline boxes summarize those semantic subject ranges instead of stale line
+numbers.
 
 Repository-independent prompt history stays ordered newest first and pruned transactionally to
 100 entries. Every broker snapshot carries that shared list, while

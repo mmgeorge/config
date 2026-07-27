@@ -5,8 +5,9 @@ use std::path::{Component, Path};
 use anyhow::{Result, anyhow};
 
 use super::{
-    ChangeAction, EntityKind, EntityReference, PROVISIONAL_PLAN_TITLE, PlanDocument, PlanFlowValue,
-    PlanGraph, PlanSubtask, ProgramEntityChange,
+    ChangeAction, EntityKind, EntityReference, ExternalEntityKind, PROVISIONAL_PLAN_TITLE,
+    PlanCallable, PlanDocument, PlanFlowRelation, PlanFlowValue, PlanGraph, PlanSubtask,
+    ProgramEntityChange,
 };
 
 /// Defines the validation boundary that rejected one canonical plan.
@@ -173,27 +174,12 @@ impl<'a> PlanValidator<'a> {
                 }
             }
             if let Some(reference) = &entity.extends {
-                self.validate_reference(&format!("{path}.extends"), reference);
+                self.validate_type_reference(&format!("{path}.extends"), reference);
             }
             for (index, reference) in entity.conforms_to.iter().enumerate() {
-                self.validate_reference(&format!("{path}.conforms_to[{index}]"), reference);
-            }
-            if let Some(owner_id) = &entity.exclusive_owner_entity_id {
-                let owner = self.graph.entity(owner_id);
-                if owner.is_some_and(|owner| owner.entity_id == entity.entity_id) {
-                    self.push(
-                        &format!("{path}.exclusive_owner_entity"),
-                        "cannot reference the same entity",
-                    );
-                } else if owner.is_none() {
-                    self.push(
-                        &format!("{path}.exclusive_owner_entity"),
-                        "references a missing planned entity",
-                    );
-                }
+                self.validate_type_reference(&format!("{path}.conforms_to[{index}]"), reference);
             }
         }
-        self.validate_exclusive_owner_cycles();
     }
 
     fn validate_dependencies(&mut self) {
@@ -306,33 +292,40 @@ impl<'a> PlanValidator<'a> {
                 self.semantic_id(&format!("{step_path}.step_id"), &step.step_id);
                 self.required(&format!("{step_path}.action"), &step.action);
                 self.validate_reference(&format!("{step_path}.target"), &step.target);
-                if let Some(value) = &step.value_to_next {
-                    match value {
-                        PlanFlowValue::Type { name } => {
-                            self.required(&format!("{step_path}.value_to_next.name"), name);
-                        }
-                        PlanFlowValue::Text { text } => {
-                            self.required(&format!("{step_path}.value_to_next.text"), text);
-                        }
-                    }
-                }
                 self.unique_id(
-                    &format!("{step_path}.operations"),
-                    step.operations
-                        .iter()
-                        .map(|operation| operation.operation_id.as_str()),
+                    &format!("{step_path}.edges"),
+                    step.edges.iter().map(|edge| edge.edge_id.as_str()),
                 );
-                for operation in &step.operations {
-                    let operation_path =
-                        format!("{step_path}.operations.{}", operation.operation_id);
-                    self.semantic_id(
-                        &format!("{operation_path}.operation_id"),
-                        &operation.operation_id,
-                    );
-                    self.required(&format!("{operation_path}.action"), &operation.action);
-                    self.validate_reference(&format!("{operation_path}.target"), &operation.target);
-                    if let Some(result) = &operation.result {
-                        self.required(&format!("{operation_path}.result"), result);
+                for edge in &step.edges {
+                    let edge_path = format!("{step_path}.edges.{}", edge.edge_id);
+                    self.semantic_id(&format!("{edge_path}.edge_id"), &edge.edge_id);
+                    self.validate_reference(&format!("{edge_path}.target"), &edge.target);
+                    match &edge.relation {
+                        PlanFlowRelation::Call { callable }
+                        | PlanFlowRelation::Read { callable }
+                        | PlanFlowRelation::Write { callable } => {
+                            self.callable(&format!("{edge_path}.relation.callable"), callable);
+                            self.validate_type_reference(
+                                &format!("{edge_path}.target"),
+                                &edge.target,
+                            );
+                        }
+                        PlanFlowRelation::Send { event } => {
+                            self.required(&format!("{edge_path}.relation.event"), event);
+                        }
+                        PlanFlowRelation::Construct => self
+                            .validate_type_reference(&format!("{edge_path}.target"), &edge.target),
+                        PlanFlowRelation::Emit | PlanFlowRelation::Return => {}
+                    }
+                    if let Some(result) = &edge.result {
+                        match result {
+                            PlanFlowValue::Type { name } => {
+                                self.required(&format!("{edge_path}.result.name"), name);
+                            }
+                            PlanFlowValue::Text { text } => {
+                                self.required(&format!("{edge_path}.result.text"), text);
+                            }
+                        }
                     }
                 }
             }
@@ -352,9 +345,16 @@ impl<'a> PlanValidator<'a> {
             self.required(&format!("{path}.description"), &task.description);
             let mut file_path_set = HashSet::new();
             for file in &task.files {
-                let file_path = format!("{path}.files.{}", file.path);
-                self.repository_path(&format!("{file_path}.path"), &file.path);
-                if !file_path_set.insert(file.path.as_str()) {
+                let path_value = file.change.path();
+                let file_path = format!("{path}.files.{path_value}");
+                self.repository_path(&format!("{file_path}.path"), path_value);
+                if let Some(source_path) = file.change.source_path() {
+                    self.repository_path(&format!("{file_path}.from"), source_path);
+                    if source_path == path_value {
+                        self.push(&file_path, "rename source and destination must differ");
+                    }
+                }
+                if !file_path_set.insert(path_value) {
                     self.push(&file_path, "duplicates a task file path");
                 }
                 self.unique_id(
@@ -395,16 +395,16 @@ impl<'a> PlanValidator<'a> {
                                         ),
                                     );
                                 }
-                                if entity.path != file.path {
+                                if entity.path != path_value {
                                     self.push(
                                         &format!("{subtask_path}.entities"),
                                         &format!(
                                             "entity {entity_id} belongs to {} rather than {}",
-                                            entity.path, file.path
+                                            entity.path, path_value
                                         ),
                                     );
                                 }
-                                if file.action == ChangeAction::Add
+                                if file.change.entity_action() == ChangeAction::Add
                                     && entity.action != ChangeAction::Add
                                 {
                                     self.push(
@@ -412,7 +412,7 @@ impl<'a> PlanValidator<'a> {
                                         "an added file can contain only added entities",
                                     );
                                 }
-                                if file.action == ChangeAction::Remove
+                                if file.change.entity_action() == ChangeAction::Remove
                                     && entity.action != ChangeAction::Remove
                                 {
                                     self.push(
@@ -440,14 +440,15 @@ impl<'a> PlanValidator<'a> {
                                     );
                                 }
                             }
-                            if file.action == ChangeAction::Add && test.action != ChangeAction::Add
+                            if file.change.entity_action() == ChangeAction::Add
+                                && test.action != ChangeAction::Add
                             {
                                 self.push(
                                     &format!("{file_path}.action"),
                                     "an added file can contain only added tests",
                                 );
                             }
-                            if file.action == ChangeAction::Remove
+                            if file.change.entity_action() == ChangeAction::Remove
                                 && test.action != ChangeAction::Remove
                             {
                                 self.push(
@@ -483,6 +484,22 @@ impl<'a> PlanValidator<'a> {
         if self.document.tasks.is_empty() {
             self.push("tasks", "requires at least one task");
         }
+        for flow in &self.document.flows {
+            if flow.steps.is_empty() {
+                self.push(
+                    &format!("flows.{}.steps", flow.flow_id),
+                    "requires at least one acting step",
+                );
+            }
+            for step in &flow.steps {
+                if step.edges.is_empty() {
+                    self.push(
+                        &format!("flows.{}.steps.{}.edges", flow.flow_id, step.step_id),
+                        "requires at least one typed runtime edge",
+                    );
+                }
+            }
+        }
         let attached_entity_id = self
             .document
             .tasks
@@ -499,7 +516,7 @@ impl<'a> PlanValidator<'a> {
                 .tasks
                 .iter()
                 .flat_map(|task| &task.files)
-                .filter(|file| file.path == dependency.manifest)
+                .filter(|file| file.change.path() == dependency.manifest)
                 .count();
             if owner_count != 1 {
                 self.push(
@@ -524,9 +541,10 @@ impl<'a> PlanValidator<'a> {
                 );
             }
             for file in &task.files {
+                let file_path = file.change.path();
                 if file.subtasks.is_empty() {
                     self.push(
-                        &format!("tasks.{}.files.{}.subtasks", task.task_id, file.path),
+                        &format!("tasks.{}.files.{file_path}.subtasks", task.task_id),
                         "requires at least one subtask",
                     );
                 }
@@ -537,7 +555,7 @@ impl<'a> PlanValidator<'a> {
                         self.push(
                             &format!(
                                 "tasks.{}.files.{}.subtasks.{}.description",
-                                task.task_id, file.path, work.subtask_id
+                                task.task_id, file_path, work.subtask_id
                             ),
                             &format!(
                                 "must complement operation `{}` without repeating `{}` as its first word",
@@ -550,7 +568,7 @@ impl<'a> PlanValidator<'a> {
                         .document
                         .dependencies
                         .iter()
-                        .any(|dependency| dependency.manifest == file.path);
+                        .any(|dependency| dependency.manifest == file_path);
                     if matches!(subtask, PlanSubtask::Work(work) if work.entity_ids.is_empty())
                         && !owns_dependency
                     {
@@ -558,7 +576,7 @@ impl<'a> PlanValidator<'a> {
                             &format!(
                                 "tasks.{}.files.{}.subtasks.{}.entities",
                                 task.task_id,
-                                file.path,
+                                file_path,
                                 subtask.subtask_id()
                             ),
                             "requires at least one entity",
@@ -598,38 +616,30 @@ impl<'a> PlanValidator<'a> {
                     );
                 }
             }
-            EntityReference::ExternalEntity { entity } => {
-                self.required(&format!("{path}.entity"), entity)
+            EntityReference::ExternalEntity {
+                name, dependency, ..
+            } => {
+                self.required(&format!("{path}.name"), name);
+                if let Some(dependency) = dependency {
+                    self.required(&format!("{path}.dependency"), dependency);
+                }
             }
         }
     }
 
-    fn validate_exclusive_owner_cycles(&mut self) {
-        let owner_by_entity = self
-            .document
-            .entity_changes
-            .iter()
-            .filter_map(|entity| {
-                entity
-                    .exclusive_owner_entity_id
-                    .as_deref()
-                    .and_then(|owner| self.graph.entity(owner))
-                    .map(|owner| (entity.entity_id.as_str(), owner.entity_id.as_str()))
-            })
-            .collect::<HashMap<_, _>>();
-        for entity_id in owner_by_entity.keys() {
-            let mut visited = HashSet::new();
-            let mut current = *entity_id;
-            while let Some(owner_id) = owner_by_entity.get(current) {
-                if !visited.insert(current) {
-                    self.push(
-                        "entity_changes",
-                        &format!("exclusive ownership cycle includes {current}"),
-                    );
-                    break;
-                }
-                current = owner_id;
+    fn validate_type_reference(&mut self, path: &str, reference: &EntityReference) {
+        self.validate_reference(path, reference);
+        let is_type = match reference {
+            EntityReference::PlannedEntity { entity } => self
+                .graph
+                .entity(entity)
+                .is_some_and(|entity| entity_kind_is_type(entity.kind)),
+            EntityReference::ExternalEntity { entity_kind, .. } => {
+                *entity_kind == ExternalEntityKind::Type
             }
+        };
+        if !is_type {
+            self.push(path, "must reference one type entity");
         }
     }
 
@@ -681,12 +691,12 @@ impl<'a> PlanValidator<'a> {
                     step.step_id.as_str(),
                     format!("flows.{}.steps.{}", flow.flow_id, step.step_id),
                 ));
-                for operation in &step.operations {
+                for edge in &step.edges {
                     entry_list.push((
-                        operation.operation_id.as_str(),
+                        edge.edge_id.as_str(),
                         format!(
-                            "flows.{}.steps.{}.operations.{}",
-                            flow.flow_id, step.step_id, operation.operation_id
+                            "flows.{}.steps.{}.edges.{}",
+                            flow.flow_id, step.step_id, edge.edge_id
                         ),
                     ));
                 }
@@ -701,7 +711,7 @@ impl<'a> PlanValidator<'a> {
                         format!(
                             "tasks.{}.files.{}.subtasks.{}",
                             task.task_id,
-                            file.path,
+                            file.change.path(),
                             subtask.subtask_id()
                         ),
                     ));
@@ -735,6 +745,18 @@ impl<'a> PlanValidator<'a> {
     fn required(&mut self, path: &str, value: &str) {
         if value.trim().is_empty() {
             self.push(path, "cannot be empty");
+        }
+    }
+
+    fn callable(&mut self, path: &str, callable: &PlanCallable) {
+        self.required(&format!("{path}.name"), &callable.name);
+        if !callable.name.bytes().enumerate().all(|(index, byte)| {
+            byte == b'_' || byte.is_ascii_alphanumeric() && (index > 0 || !byte.is_ascii_digit())
+        }) {
+            self.push(
+                &format!("{path}.name"),
+                "must be one function or method identifier without parentheses",
+            );
         }
     }
 
@@ -792,6 +814,22 @@ fn description_starts_with_action(action: &str, description: &str) -> bool {
     first_word.eq_ignore_ascii_case(action)
 }
 
+fn entity_kind_is_type(kind: EntityKind) -> bool {
+    matches!(
+        kind,
+        EntityKind::Class
+            | EntityKind::AbstractClass
+            | EntityKind::Struct
+            | EntityKind::Enum
+            | EntityKind::Trait
+            | EntityKind::Interface
+            | EntityKind::Config
+            | EntityKind::Resource
+            | EntityKind::Cache
+            | EntityKind::Adapter
+    )
+}
+
 fn sentence_count(value: &str) -> usize {
     let character_list = value.chars().collect::<Vec<_>>();
     character_list
@@ -809,8 +847,21 @@ fn sentence_count(value: &str) -> usize {
 #[cfg(test)]
 mod test {
     use super::super::{
-        EntityReference, PlanFlowOperation, PlanFlowValue, attach_test_fixture, test_fixture,
+        EntityReference, ExternalEntityKind, PlanCallable, PlanCallableKind, PlanFileChange,
+        PlanFlowEdge, PlanFlowRelation, PlanFlowValue, attach_test_fixture, test_fixture,
     };
+
+    #[test]
+    fn rejects_a_file_rename_without_distinct_paths() {
+        let mut document = test_fixture("plan", "Overview");
+        document.tasks[0].files[0].change = PlanFileChange::Rename {
+            from: "src/plan.rs".into(),
+            to: "src/plan.rs".into(),
+        };
+
+        let error = document.validate().unwrap_err().to_string();
+        assert!(error.contains("rename source and destination must differ"));
+    }
 
     #[test]
     fn aggregates_independent_edit_violations() {
@@ -864,17 +915,11 @@ mod test {
     #[test]
     fn structured_flow_values_require_nonempty_content() {
         let mut document = test_fixture("plan", "Build structured planning.");
-        document.flows[0].steps[0].value_to_next = Some(PlanFlowValue::Type {
-            name: " ".into(),
-        });
+        document.flows[0].steps[0].edges[0].result = Some(PlanFlowValue::Type { name: " ".into() });
 
         let error = document.validate().unwrap_err();
 
-        assert!(
-            error
-                .to_string()
-                .contains("value_to_next.name: cannot be empty")
-        );
+        assert!(error.to_string().contains("result.name: cannot be empty"));
     }
 
     #[test]
@@ -892,24 +937,38 @@ mod test {
     }
 
     #[test]
-    fn nested_flow_operations_require_unique_identity_and_valid_targets() {
+    fn typed_flow_edges_require_unique_identity_valid_targets_and_results() {
         let mut document = test_fixture("plan", "Validate.");
-        document.flows[0].steps[0].operations = vec![
-            PlanFlowOperation {
-                operation_id: "read_schema".into(),
-                action: "schema()".into(),
+        document.flows[0].steps[0].edges = vec![
+            PlanFlowEdge {
+                edge_id: "read_schema".into(),
+                relation: PlanFlowRelation::Read {
+                    callable: PlanCallable {
+                        kind: PlanCallableKind::Method,
+                        name: "schema".into(),
+                    },
+                },
                 target: EntityReference::PlannedEntity {
                     entity: "missing_entity".into(),
                 },
-                result: Some("schema text".into()),
+                result: Some(PlanFlowValue::Text {
+                    text: "schema text".into(),
+                }),
             },
-            PlanFlowOperation {
-                operation_id: "read_schema".into(),
-                action: "count(*)".into(),
-                target: EntityReference::ExternalEntity {
-                    entity: "datafusion::SessionContext".into(),
+            PlanFlowEdge {
+                edge_id: "read_schema".into(),
+                relation: PlanFlowRelation::Call {
+                    callable: PlanCallable {
+                        kind: PlanCallableKind::Method,
+                        name: "count".into(),
+                    },
                 },
-                result: Some(" ".into()),
+                target: EntityReference::ExternalEntity {
+                    entity_kind: ExternalEntityKind::Type,
+                    name: "SessionContext".into(),
+                    dependency: Some("datafusion".into()),
+                },
+                result: Some(PlanFlowValue::Text { text: " ".into() }),
             },
         ];
 
@@ -917,7 +976,34 @@ mod test {
 
         assert!(error.contains("duplicates identifier read_schema"));
         assert!(error.contains("references unknown planned entity `missing_entity`"));
-        assert!(error.contains("result: cannot be empty"));
+        assert!(error.contains("result.text: cannot be empty"));
+    }
+
+    #[test]
+    fn callable_edges_require_bare_callable_names_and_type_receivers() {
+        let mut document = test_fixture("plan", "Validate typed receivers.");
+        document.flows[0].steps[0].edges = vec![PlanFlowEdge {
+            edge_id: "read_schema".into(),
+            relation: PlanFlowRelation::Read {
+                callable: PlanCallable {
+                    kind: PlanCallableKind::Method,
+                    name: "schema()".into(),
+                },
+            },
+            target: EntityReference::ExternalEntity {
+                entity_kind: ExternalEntityKind::Endpoint,
+                name: "registered relation".into(),
+                dependency: Some(" ".into()),
+            },
+            result: Some(PlanFlowValue::Type {
+                name: "SchemaRef".into(),
+            }),
+        }];
+
+        let error = document.validate().unwrap_err().to_string();
+        assert!(error.contains("without parentheses"));
+        assert!(error.contains("must reference one type entity"));
+        assert!(error.contains("target.dependency: cannot be empty"));
     }
 
     #[test]
@@ -1043,8 +1129,9 @@ mod test {
         document.tasks[0]
             .files
             .push(super::super::document::PlanFile {
-                path: "Cargo.toml".into(),
-                action: super::super::document::ChangeAction::Modify,
+                change: super::super::document::PlanFileChange::Modify {
+                    path: "Cargo.toml".into(),
+                },
                 subtasks: vec![super::super::document::PlanSubtask::Work(
                     super::super::document::PlanWorkSubtask {
                         subtask_id: "configure_runtime".into(),

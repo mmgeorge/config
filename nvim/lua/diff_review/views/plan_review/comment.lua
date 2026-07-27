@@ -2,12 +2,14 @@ local M = {}
 
 local comment_box = require("diff_review.render.comment_box")
 local comment_editor = require("diff_review.render.comment_editor")
+local notifications = require("diff_review.infra.notifications")
 
 local namespace = vim.api.nvim_create_namespace("DiffReviewPlanReviewComment")
 
 ---@class DiffReviewPlanAnnotation
 ---@field id integer
 ---@field source_line integer
+---@field end_source_line integer
 ---@field body string
 ---@field focused boolean?
 
@@ -130,6 +132,32 @@ local function source_line_at_row(state, row)
   return nil
 end
 
+---@param state DiffReviewPlanCommentState
+---@param first_row integer
+---@param last_row integer
+---@return integer?, integer?
+local function source_range_at_rows(state, first_row, last_row)
+  local start_source_line = nil
+  local end_source_line = nil
+  for row = math.min(first_row, last_row), math.max(first_row, last_row) do
+    local source_line = source_line_at_row(state, row)
+    if source_line then
+      start_source_line = math.min(start_source_line or source_line, source_line)
+      end_source_line = math.max(end_source_line or source_line, source_line)
+    end
+  end
+  return start_source_line, end_source_line
+end
+
+---@param annotation DiffReviewPlanAnnotation
+---@return string
+local function annotation_line_label(annotation)
+  if annotation.source_line == annotation.end_source_line then
+    return "line " .. tostring(annotation.source_line)
+  end
+  return ("lines %d-%d"):format(annotation.source_line, annotation.end_source_line)
+end
+
 ---@param segmented_line string[][]
 ---@return string, { start_col: integer, end_col: integer, hl: string }[]
 local function flatten_segmented_line(segmented_line)
@@ -201,8 +229,10 @@ local function build_projection(state, width)
   local source_count = math.max(1, #state.source_lines)
   for _, annotation in ipairs(state.annotation_list) do
     annotation.source_line = math.max(1, math.min(tonumber(annotation.source_line) or 1, source_count))
-    annotation_by_source[annotation.source_line] = annotation_by_source[annotation.source_line] or {}
-    table.insert(annotation_by_source[annotation.source_line], annotation)
+    annotation.end_source_line =
+      math.max(annotation.source_line, math.min(tonumber(annotation.end_source_line) or annotation.source_line, source_count))
+    annotation_by_source[annotation.end_source_line] = annotation_by_source[annotation.end_source_line] or {}
+    table.insert(annotation_by_source[annotation.end_source_line], annotation)
   end
 
   local source_row_list = {}
@@ -251,7 +281,7 @@ local function build_projection(state, width)
       if annotation.focused then
         projection.line_list[#projection.line_list + 1] = comment_editor.rule_line(
           " Plan comment ",
-          " line " .. tostring(source_line) .. " ",
+          " " .. annotation_line_label(annotation) .. " ",
           width
         )
         projection.line_meta_list[#projection.line_list] = {
@@ -271,7 +301,7 @@ local function build_projection(state, width)
         local descriptor = {
           id = annotation.id,
           anchor = { line = source_line },
-          heading = " Plan comment • line " .. tostring(source_line) .. " ",
+          heading = " Plan comment • " .. annotation_line_label(annotation) .. " ",
           body_lines = comment_editor.body_lines(annotation.body),
           readonly = false,
         }
@@ -423,7 +453,7 @@ local function handle_cursor_moved(state)
   end
   if focused_annotation then
     if vim.trim(focused_annotation.body) == "" then remove_annotation(state, focused_annotation) end
-    render(state, { source_line = source_line or focused_annotation.source_line })
+    render(state, { source_line = source_line or focused_annotation.end_source_line })
   else
     set_modifiable(state, false)
   end
@@ -508,11 +538,25 @@ end
 function M.add_at_cursor(buf)
   local state = state_by_buf[buf]
   if not state then return end
-  local source_line = M.source_line_at_cursor(buf) or 1
+  local win = displayed_window(state)
+  if not win then return end
+  local mode = vim.fn.mode(1)
+  local cursor_row = vim.api.nvim_win_get_cursor(win)[1] - 1
+  local first_row = cursor_row
+  local last_row = cursor_row
+  if mode == "v" or mode == "V" or mode == "\22" then
+    first_row = vim.fn.getpos("v")[2] - 1
+  end
+  local source_line, end_source_line = source_range_at_rows(state, first_row, last_row)
+  if not source_line or not end_source_line then
+    notifications.error("Selected PlanReview rows have no semantic plan lines", "PlanReview")
+    return
+  end
   for _, annotation in ipairs(state.annotation_list) do annotation.focused = false end
   local annotation = {
     id = state.next_id,
     source_line = source_line,
+    end_source_line = end_source_line,
     body = "",
     focused = true,
   }
@@ -538,6 +582,21 @@ function M.source_line_at_cursor(buf)
 end
 
 ---@param buf integer
+---@param source_line integer
+---@return integer?
+function M.display_line_for_source_line(buf, source_line)
+  local state = state_by_buf[buf]
+  if not state then return nil end
+  for _, record in ipairs(state.source_mark) do
+    if record.source_line == source_line then
+      local row = mark_row(state, record.mark)
+      if row then return row + 1 end
+    end
+  end
+  return nil
+end
+
+---@param buf integer
 ---@return table[]
 function M.serialize(buf)
   local state = state_by_buf[buf]
@@ -547,7 +606,8 @@ function M.serialize(buf)
   for _, annotation in ipairs(state.annotation_list) do
     if vim.trim(annotation.body) ~= "" then
       result[#result + 1] = {
-        line = annotation.source_line,
+        start_line = annotation.source_line,
+        end_line = annotation.end_source_line,
         body = annotation.body,
       }
     end

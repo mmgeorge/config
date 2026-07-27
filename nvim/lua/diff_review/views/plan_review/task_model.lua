@@ -13,8 +13,15 @@ local uml_style = require("diff_review.views.plan_review.uml_style")
 ---@field anchor_by_json_path table<string, table>
 ---@field anchor_by_source_line table<integer, table>
 ---@field entity_name_set table<string, boolean>
+---@field entity_source_line_by_name table<string, integer>
 local PlanTaskModel = {}
 PlanTaskModel.__index = PlanTaskModel
+
+---@class DiffReviewPlanEntity
+---@field entity_id string
+---@field action "add"|"modify"|"remove"
+---@field name string
+---@field description string
 
 local entity_kind_label = {
   abstract_class = "abstract class",
@@ -92,6 +99,57 @@ local function index_anchor_by_source_line(navigation)
   return result
 end
 
+---@param character string
+---@return boolean
+local function is_identifier_character(character)
+  return character ~= "" and character:match("[%w_]") ~= nil
+end
+
+---@param line string
+---@param first_byte integer
+---@param last_byte integer
+---@param name string
+---@return boolean
+local function has_entity_boundaries(line, first_byte, last_byte, name)
+  local first_character = name:sub(1, 1)
+  local last_character = name:sub(-1)
+  if is_identifier_character(first_character)
+      and is_identifier_character(line:sub(first_byte - 1, first_byte - 1)) then
+    return false
+  end
+  if is_identifier_character(last_character)
+      and is_identifier_character(line:sub(last_byte + 1, last_byte + 1)) then
+    return false
+  end
+  return true
+end
+
+---@param document table
+---@param line string
+---@param byte_col integer Zero-based byte column.
+---@return DiffReviewPlanEntity?
+function M.entity_at_position(document, line, byte_col)
+  local cursor_byte = byte_col + 1
+  local selected_entity = nil
+  local selected_name_length = -1
+  for _, entity in ipairs(document.entity_changes or {}) do
+    local name = type(entity.name) == "string" and entity.name or ""
+    local search_byte = 1
+    while name ~= "" do
+      local first_byte, last_byte = line:find(name, search_byte, true)
+      if not first_byte then break end
+      if cursor_byte >= first_byte and cursor_byte <= last_byte
+          and has_entity_boundaries(line, first_byte, last_byte, name)
+          and #name > selected_name_length then
+        selected_entity = entity
+        selected_name_length = #name
+      end
+      search_byte = first_byte + 1
+    end
+  end
+  return selected_entity
+end
+
 ---@param model DiffReviewPlanTaskModel
 ---@param source_line integer
 ---@param width integer?
@@ -148,7 +206,7 @@ local function entity_node_fields(entity, entity_name_set)
   local kind = entity_kind_label[entity.kind] or tostring(entity.kind or "entity")
   local name = tostring(entity.name or "")
   return {
-    text = ("%s %s `%s` — %s"):format(action, kind, name, tostring(entity.description or "")),
+    text = ("%s %s %s — %s"):format(action, kind, name, tostring(entity.description or "")),
     segments_for_line = task_tree_style.entity_references(
       task_tree_style.change(action, kind, name),
       entity_name_set
@@ -200,6 +258,10 @@ function PlanTaskModel:task_nodes()
     for file_index, file in ipairs(task.files or {}) do
       local file_json_path = ("%s/files/%d"):format(task_json_path, file_index - 1)
       local file_source = node_source(self, file_json_path)
+      local file_path = tostring(file.to or file.path or "")
+      local file_label = file.action == "rename"
+          and ("%s → %s"):format(tostring(file.from or ""), file_path)
+        or file_path
       local subtask_node_list = {}
       for subtask_index, subtask in ipairs(file.subtasks or {}) do
         local subtask_json_path = ("%s/subtasks/%d"):format(file_json_path, subtask_index - 1)
@@ -238,8 +300,8 @@ function PlanTaskModel:task_nodes()
       end
       file_node_list[#file_node_list + 1] = vim.tbl_extend("force", {
         id = ("plan:task:%d:file:%d"):format(task_index, file_index),
-        text = "file " .. tostring(file.path or ""),
-        segments_for_line = task_tree_style.file(tostring(file.path or "")),
+        text = "file " .. file_label,
+        segments_for_line = task_tree_style.file(file_label),
         branch = false,
         foldable = false,
         child_prefix = "",
@@ -294,6 +356,19 @@ function PlanTaskModel:compose(task_row_list, width)
   return source_row_list
 end
 
+---@param line string
+---@param byte_col integer Zero-based byte column.
+---@return DiffReviewPlanEntity?
+function PlanTaskModel:entity_at_position(line, byte_col)
+  return M.entity_at_position(self.document, line, byte_col)
+end
+
+---@param entity DiffReviewPlanEntity
+---@return integer?
+function PlanTaskModel:entity_declaration_source_line(entity)
+  return self.entity_source_line_by_name[entity.name]
+end
+
 ---@param working_path string
 ---@return DiffReviewPlanTaskModel?, string?
 function M.load(working_path)
@@ -309,9 +384,16 @@ function M.load(working_path)
   if not task_heading_line or not test_heading_line or test_heading_line <= task_heading_line then
     return nil, "Plan projection does not contain ordered Tasks and Tests sections"
   end
+  local anchor_by_json_path = index_anchor_by_json_path(navigation)
   local entity_name_set = {}
-  for _, entity in ipairs(document.entity_changes or {}) do
-    if type(entity.name) == "string" and entity.name ~= "" then entity_name_set[entity.name] = true end
+  local entity_source_line_by_name = {}
+  for entity_index, entity in ipairs(document.entity_changes or {}) do
+    if type(entity.name) == "string" and entity.name ~= "" then
+      entity_name_set[entity.name] = true
+      local entity_anchor = anchor_by_json_path[("/entity_changes/%d"):format(entity_index - 1)]
+      local source_line = entity_anchor and tonumber(entity_anchor.line) or nil
+      if source_line then entity_source_line_by_name[entity.name] = source_line end
+    end
   end
   return setmetatable({
     working_path = working_path,
@@ -320,9 +402,10 @@ function M.load(working_path)
     navigation = navigation,
     task_heading_line = task_heading_line,
     test_heading_line = test_heading_line,
-    anchor_by_json_path = index_anchor_by_json_path(navigation),
+    anchor_by_json_path = anchor_by_json_path,
     anchor_by_source_line = index_anchor_by_source_line(navigation),
     entity_name_set = entity_name_set,
+    entity_source_line_by_name = entity_source_line_by_name,
   }, PlanTaskModel), nil
 end
 

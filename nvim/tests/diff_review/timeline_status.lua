@@ -46,8 +46,8 @@ local ok, failure = pcall(function()
     "idle elicitation should expose the configured feedback key")
   state.busy = true
   state.status = { kind = "working", started_at_ms = os.time() * 1000, activity = "planning" }
-  assert_equals(status_view.resolve(state).text, "Thinking for 0s",
-    "Rust working state should replace stale input status")
+  assert_equals(status_view.resolve(state).text, "Working for 0s",
+    "Rust working state should use one request-lifecycle label during planning")
   state.status = {
     kind = "retrying_plan_generation",
     plan_id = "plan-1",

@@ -292,8 +292,7 @@ mod test {
                             "path": "src/inspection.rs",
                             "members": [],
                             "extends": null,
-                            "conforms_to": [],
-                            "exclusive_owner_entity": null
+                            "conforms_to": []
                         }]
                     }
                 }),

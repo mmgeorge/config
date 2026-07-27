@@ -516,7 +516,7 @@ impl HarnessBroker {
         let timeline_stream = TimelineStream::new(session.id.clone());
         let mut broker = Self {
             store,
-            plan_file: PlanFileStore::new(&data_root),
+            plan_file: PlanFileStore::new(&data_root, &session.workspace),
             workspace_kind,
             data_root,
             client_id: request.client_id,
@@ -907,6 +907,7 @@ impl HarnessBroker {
             "plan.accept" => self.accept_plan(params).await,
             "plan.acceptance.begin" => self.begin_plan_acceptance(params),
             "plan.acceptance.cancel" => self.cancel_plan_acceptance(),
+            "plan.entity.rename" => self.rename_plan_entity(params),
             "plan.request_changes" => self.request_plan_changes(params).await,
             "plan.cancel" => self.cancel_plan(),
             "plan.activate" => self.activate_plan(params),
@@ -2806,11 +2807,14 @@ Planning continuation: turn {} of {}.",
                 let previous_markdown = if plan.model_revision == 0 {
                     String::new()
                 } else {
-                    crate::plan::render_plan(&self.plan_file.read_submitted_document(
-                        &self.session.id,
-                        &plan.id,
-                        plan.model_revision,
-                    )?)?
+                    crate::plan::render_plan_at(
+                        &self.plan_file.read_submitted_document(
+                            &self.session.id,
+                            &plan.id,
+                            plan.model_revision,
+                        )?,
+                        Path::new(&self.session.workspace),
+                    )?
                     .markdown
                 };
                 let lifecycle_kind = if plan.model_revision == 0 {
@@ -3793,6 +3797,94 @@ Planning continuation: turn {} of {}.",
         ))
     }
 
+    fn rename_plan_entity(&mut self, params: Value) -> Result<(Value, Vec<BrokerEvent>)> {
+        let plan_id = params
+            .get("plan_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| self.session.active_plan_id.clone())
+            .context("no plan awaits review")?;
+        let entity_id = required_text(&params, "entity_id")?;
+        let new_name = required_text(&params, "name")?;
+        anyhow::ensure!(!new_name.trim().is_empty(), "entity name cannot be empty");
+        let mut plan = self
+            .store
+            .load_plan(&plan_id)?
+            .context("active plan record is missing")?;
+        anyhow::ensure!(
+            plan.state == PlanState::AwaitingReview,
+            "plan does not await review"
+        );
+        let document = self
+            .plan_file
+            .read_working_document(&self.session.id, &plan.id)?;
+        if let Some(expected_version) = params.get("expected_version").and_then(Value::as_u64) {
+            anyhow::ensure!(
+                document.version == expected_version,
+                "plan version changed before entity rename"
+            );
+        }
+        let previous_name = document
+            .entity_changes
+            .iter()
+            .find(|entity| entity.entity_id == entity_id || entity.name == entity_id)
+            .map(|entity| entity.name.clone())
+            .with_context(|| format!("program entity `{entity_id}` does not exist"))?;
+        anyhow::ensure!(
+            previous_name != new_name,
+            "new entity name matches current name"
+        );
+        let result = self.plan_file.rename_added_entity(
+            &self.session.id,
+            &plan.id,
+            &entity_id,
+            new_name.clone(),
+        )?;
+        plan.model_revision = plan.model_revision.saturating_add(1);
+        plan.user_revision = plan.user_revision.saturating_add(1);
+        let (document, rendered, digest) = self.plan_file.submit_document_revision(
+            &self.session.id,
+            &plan.id,
+            plan.model_revision,
+            result.version,
+        )?;
+        plan.document_version = result.version;
+        plan.submitted_version = Some(result.version);
+        plan.title.clone_from(&document.title);
+        plan.review_digest = Some(digest);
+        plan.acceptance = None;
+        plan.updated_at_ms = self.clock.now_ms();
+        self.store.save_plan(&plan)?;
+        self.session.active_plan_id = Some(plan.id.clone());
+        self.save_session()?;
+        let lifecycle = PlanLifecycleRecord {
+            id: Uuid::new_v4().to_string(),
+            session_id: self.session.id.clone(),
+            plan_id: plan.id.clone(),
+            kind: PlanLifecycleKind::RevisionCreated,
+            model_revision: plan.model_revision,
+            user_revision: plan.user_revision,
+            overall_comment: Some(format!("Renamed {previous_name} to {new_name}")),
+            annotation: Vec::new(),
+            question: None,
+            answer: None,
+            created_at_ms: self.clock.now_ms(),
+        };
+        self.store.save_plan_lifecycle(&lifecycle)?;
+        let payload = json!({
+            "plan": &plan,
+            "lifecycle": &lifecycle,
+            "content": &rendered.markdown,
+            "document": &document,
+            "previous_name": previous_name,
+            "name": new_name,
+        });
+        Ok((
+            payload.clone(),
+            vec![self.event("plan_entity_renamed", payload)?],
+        ))
+    }
+
     async fn continue_plan_acceptance(&mut self) -> Result<(Value, Vec<BrokerEvent>)> {
         let plan = self.active_plan_acceptance()?;
         let acceptance = plan
@@ -3851,7 +3943,8 @@ Planning continuation: turn {} of {}.",
             &plan.id,
             plan.model_revision,
         )?;
-        let accepted_render = crate::plan::render_plan(&accepted_document)?;
+        let accepted_render =
+            crate::plan::render_plan_at(&accepted_document, Path::new(&self.session.workspace))?;
         let digest = plan
             .review_digest
             .clone()
@@ -4043,7 +4136,7 @@ Planning continuation: turn {} of {}.",
         let document = self
             .plan_file
             .read_working_document(&self.session.id, &plan.id)?;
-        let rendered = crate::plan::render_plan(&document)?;
+        let rendered = crate::plan::render_plan_at(&document, Path::new(&self.session.workspace))?;
         let annotation_input: Vec<crate::plan::PlanAnnotationInput> = serde_json::from_value(
             params
                 .get("annotations")
@@ -4057,20 +4150,39 @@ Planning continuation: turn {} of {}.",
                     !input.body.trim().is_empty(),
                     "plan annotation body cannot be empty"
                 );
-                let anchor = rendered
-                    .navigation
-                    .resolve_line(input.line)
-                    .with_context(|| {
-                        format!(
-                            "plan annotation line {} has no semantic render anchor",
-                            input.line
-                        )
-                    })?;
+                anyhow::ensure!(
+                    input.start_line <= input.end_line,
+                    "plan annotation start line must not follow its end line"
+                );
+                let mut seen_path = HashSet::new();
+                let subject = (input.start_line..=input.end_line)
+                    .filter_map(|line| rendered.navigation.resolve_line(line))
+                    .filter(|anchor| seen_path.insert(anchor.json_path.clone()))
+                    .map(|anchor| crate::plan::PlanAnnotationSubject {
+                        target: anchor.target.clone(),
+                        json_path: anchor.json_path.clone(),
+                        label: anchor.label.clone(),
+                        path: anchor.path.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                anyhow::ensure!(
+                    !subject.is_empty(),
+                    "plan annotation lines {}-{} have no semantic render anchors",
+                    input.start_line,
+                    input.end_line
+                );
+                let label = if subject.len() == 1 {
+                    subject[0].label.clone()
+                } else {
+                    format!(
+                        "{} through {}",
+                        subject.first().expect("nonempty subjects").label,
+                        subject.last().expect("nonempty subjects").label
+                    )
+                };
                 Ok(PlanAnnotation {
-                    target: anchor.target.clone(),
-                    json_path: anchor.json_path.clone(),
-                    label: anchor.label.clone(),
-                    path: anchor.path.clone(),
+                    subject,
+                    label,
                     body: input.body,
                 })
             })
@@ -5705,7 +5817,6 @@ mod test {
                     variants: Vec::new(),
                     extends: None,
                     conforms_to: Vec::new(),
-                    exclusive_owner_entity_id: None,
                 }],
                 ..Default::default()
             });
@@ -5720,8 +5831,23 @@ mod test {
                         target: crate::plan::EntityReference::PlannedEntity {
                             entity: "migrate".into(),
                         },
-                        operations: Vec::new(),
-                        value_to_next: None,
+                        edges: vec![crate::plan::PlanFlowEdge {
+                            edge_id: "migration_result".into(),
+                            relation: crate::plan::PlanFlowRelation::Write {
+                                callable: crate::plan::PlanCallable {
+                                    kind: crate::plan::PlanCallableKind::Method,
+                                    name: "persist".into(),
+                                },
+                            },
+                            target: crate::plan::EntityReference::ExternalEntity {
+                                entity_kind: crate::plan::ExternalEntityKind::Type,
+                                name: "MigrationStore".into(),
+                                dependency: None,
+                            },
+                            result: Some(crate::plan::PlanFlowValue::Text {
+                                text: "updated persisted state".into(),
+                            }),
+                        }],
                     }],
                 }],
                 ..Default::default()
@@ -5732,8 +5858,9 @@ mod test {
                     title: "Implement the migration".into(),
                     description: "Apply the selected strategy at its owner.".into(),
                     files: vec![crate::plan::PlanFile {
-                        path: "src/migration.rs".into(),
-                        action: crate::plan::ChangeAction::Modify,
+                        change: crate::plan::PlanFileChange::Modify {
+                            path: "src/migration.rs".into(),
+                        },
                         subtasks: vec![
                             crate::plan::PlanSubtask::Work(crate::plan::PlanWorkSubtask {
                                 subtask_id: "create_migration".into(),
@@ -7822,6 +7949,103 @@ mod test {
     }
 
     #[tokio::test]
+    async fn renames_only_added_plan_entities_and_publishes_a_fresh_review_revision() {
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        let planned = broker
+            .dispatch(BrokerRequest {
+                id: 1,
+                method: "prompt.submit".into(),
+                params: json!({ "text": "/plan migrate the event format" }),
+            })
+            .await;
+        assert!(planned.response.error.is_none());
+        let plan = broker.snapshot().unwrap().active_plan.unwrap();
+
+        let rejected = broker
+            .dispatch(BrokerRequest {
+                id: 2,
+                method: "plan.entity.rename".into(),
+                params: json!({
+                    "plan_id": plan.id,
+                    "entity_id": "migrate",
+                    "name": "MigrationRunner",
+                }),
+            })
+            .await;
+        assert!(
+            rejected
+                .response
+                .error
+                .as_ref()
+                .is_some_and(|error| error.message.contains("only newly added"))
+        );
+
+        let mut document = broker
+            .plan_file
+            .read_working_document(&broker.session.id, &plan.id)
+            .unwrap();
+        document.entity_changes[0].action = crate::plan::ChangeAction::Add;
+        document.overview = "migrate coordinates the migration.".into();
+        broker
+            .plan_file
+            .write_working_document(&broker.session.id, &plan.id, &document)
+            .unwrap();
+        let renamed = broker
+            .dispatch(BrokerRequest {
+                id: 3,
+                method: "plan.entity.rename".into(),
+                params: json!({
+                    "plan_id": plan.id,
+                    "entity_id": "migrate",
+                    "name": "MigrationRunner",
+                    "expected_version": document.version,
+                }),
+            })
+            .await;
+        assert!(
+            renamed.response.error.is_none(),
+            "{:?}",
+            renamed.response.error
+        );
+        assert!(
+            renamed
+                .event
+                .iter()
+                .any(|event| event.event == "plan_entity_renamed")
+        );
+
+        let updated_plan = broker.snapshot().unwrap().active_plan.unwrap();
+        let updated_document = broker
+            .plan_file
+            .read_working_document(&broker.session.id, &updated_plan.id)
+            .unwrap();
+        assert_eq!(updated_document.entity_changes[0].name, "MigrationRunner");
+        assert_eq!(
+            updated_document.tasks[0].files[0].subtasks[0].owned_entity_ids(),
+            ["MigrationRunner"]
+        );
+        assert_eq!(
+            updated_document.overview,
+            "MigrationRunner coordinates the migration."
+        );
+        let submitted_document = broker
+            .plan_file
+            .read_submitted_document(
+                &broker.session.id,
+                &updated_plan.id,
+                updated_plan.model_revision,
+            )
+            .unwrap();
+        assert_eq!(submitted_document, updated_document);
+        assert_eq!(
+            updated_plan.submitted_version,
+            Some(updated_document.version)
+        );
+    }
+
+    #[tokio::test]
     async fn reviews_revises_and_accepts_a_mock_plan_before_execution() {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
@@ -7922,6 +8146,19 @@ mod test {
             })
             .and_then(|anchor| anchor["line"].as_u64())
             .expect("overview navigation anchor");
+        let following_anchor = navigation["anchor"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|anchor| {
+                anchor["line"]
+                    .as_u64()
+                    .is_some_and(|line| line > overview_line)
+            })
+            .min_by_key(|anchor| anchor["line"].as_u64())
+            .expect("anchor after overview");
+        let following_line = following_anchor["line"].as_u64().unwrap();
+        let following_label = following_anchor["label"].as_str().unwrap().to_owned();
 
         let revised = broker
             .dispatch(BrokerRequest {
@@ -7930,7 +8167,8 @@ mod test {
                 params: json!({
                     "comment": "Name every dependency explicitly",
                     "annotations": [{
-                        "line": overview_line,
+                        "start_line": overview_line,
+                        "end_line": following_line,
                         "body": "Keep the reader boundary narrow"
                     }]
                 }),
@@ -7960,7 +8198,8 @@ mod test {
             revised_interaction[1].node_list.iter().any(
                 |node| matches!(node, InteractionNode::PlanCommentResolution { resolution }
                     if resolution.annotation[0].body == "Keep the reader boundary narrow"
-                        && resolution.annotation[0].label == "Overview")
+                        && resolution.annotation[0].label == format!("Overview through {following_label}")
+                        && resolution.annotation[0].subject.len() == 2)
             ),
             "a submitted revision should attach resolved inline comments before its artifact delta"
         );

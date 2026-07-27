@@ -525,7 +525,8 @@ local function on_event(event, payload)
   elseif event == "plan_question_updated" then
     state.active_plan = payload.plan or state.active_plan
     M.refresh_winbar()
-  elseif event == "plan_created" or event == "plan_revision_created" or event == "plan_changes_requested"
+  elseif event == "plan_created" or event == "plan_revision_created" or event == "plan_entity_renamed"
+    or event == "plan_changes_requested"
     or event == "plan_acceptance_started" or event == "plan_acceptance_updated"
     or event == "plan_acceptance_cancelled"
     or event == "plan_question_answered" or event == "plan_question_withdrawn"

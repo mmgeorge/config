@@ -538,7 +538,7 @@ mod test {
             agent_run_list: vec![root_run, child_run],
             agent_turn_list: vec![child_turn],
             session_event_list: Vec::new(),
-            plan_file: &PlanFileStore::new(directory.path()),
+            plan_file: &PlanFileStore::new(directory.path(), directory.path()),
         })
         .unwrap();
 

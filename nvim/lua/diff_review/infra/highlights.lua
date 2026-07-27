@@ -145,8 +145,12 @@ function M.setup()
   vim.api.nvim_set_hl(0, "DiffReviewWalkthroughType", { fg = "#5bff94" })
   vim.api.nvim_set_hl(0, "DiffReviewWalkthroughItemTitle", { fg = "#ffffff", bold = true })
   vim.api.nvim_set_hl(0, "DiffReviewFileKeyword", { fg = palette.yellow })
+  vim.api.nvim_set_hl(0, "DiffReviewFileStatusNew", { fg = "#50fa7b" })
+  vim.api.nvim_set_hl(0, "DiffReviewFileStatusModified", { fg = "#61afef" })
+  vim.api.nvim_set_hl(0, "DiffReviewFileStatusDeleted", { fg = "#ff5555" })
+  vim.api.nvim_set_hl(0, "DiffReviewFileStatusRenamed", { fg = "#c678dd" })
   vim.api.nvim_set_hl(0, "DiffReviewDependencyName", { fg = palette.teal })
-  vim.api.nvim_set_hl(0, "DiffReviewPlanMetadata", { fg = palette.light_gray })
+  vim.api.nvim_set_hl(0, "DiffReviewPlanMetadata", { link = "Normal" })
   if keyword_modifier.fg == normal.fg then
     vim.api.nvim_set_hl(0, "@keyword.modifier", { fg = "#ff79c6", bold = true })
   end

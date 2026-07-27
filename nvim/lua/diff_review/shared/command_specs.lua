@@ -105,7 +105,11 @@ M.view_specs = {
   plan_review = {
     { id = "toggle", label = "fold", desc = "Toggle the current plan task or subtask", modes = "n", pinned = true },
     { id = "open", label = "open", desc = "Open the source file for this plan node", modes = "n", pinned = true },
-    { id = "comment", label = "comment", desc = "Annotate the current plan line", modes = "n", pinned = true },
+    { id = "jump_entity", label = "entity", desc = "Jump to the current entity's UML declaration", modes = "n", pinned = false },
+    { id = "entity_info", label = "info", desc = "Show the current plan entity description", modes = "n", pinned = false },
+    { id = "rename_entity", label = "rename", desc = "Rename the current newly added plan entity", modes = "n", pinned = false },
+    { id = "schema", label = "schema", desc = "Open the canonical plan JSON", modes = "n", pinned = true },
+    { id = "comment", label = "comment", desc = "Annotate the current plan line or selection", modes = { "n", "x" }, visual = true, pinned = true },
     { id = "accept", label = "accept", desc = "Accept the exact saved plan and execute it", modes = "n", pinned = true },
     { id = "request_changes", label = "changes", desc = "Request a semantic revision from review comments", modes = "n", pinned = true },
     { id = "close", label = "close", desc = "Return to Harness without deciding", modes = "n", pinned = true },

@@ -94,6 +94,7 @@ local ok, failure = pcall(function()
         description = "Keep FirstOwner references semantic.",
         files = {
           {
+            action = "modify",
             path = "src/plan.rs",
             subtasks = {
               {
@@ -105,7 +106,9 @@ local ok, failure = pcall(function()
             },
           },
           {
-            path = "tests/plan_review.rs",
+            action = "rename",
+            from = "tests/legacy_plan_review.rs",
+            to = "tests/plan_review.rs",
             subtasks = {
               {
                 subtask_id = "file_groups",
@@ -207,7 +210,10 @@ local ok, failure = pcall(function()
     "only the file keyword should use the shared yellow highlight")
   assert_true(row_has_highlight(buf, first_file_row, "src/plan.rs", "DiffReviewWalkthroughItemTitle"),
     "file paths should retain their existing title highlight")
-  local second_file_row = find_row(buf, "   file tests/plan_review.rs")
+  local second_file_row = find_row(
+    buf,
+    "   file tests/legacy_plan_review.rs → tests/plan_review.rs"
+  )
   local separator_line = vim.api.nvim_buf_get_lines(buf, second_file_row - 2, second_file_row - 1, false)[1]
   assert_equals(separator_line, "", "sibling file groups should retain one blank separator row")
   local subtask_row = find_row(buf, "└─ Create the shared renderer.")
@@ -228,7 +234,7 @@ local ok, failure = pcall(function()
   assert_true(vim.fn.foldclosed(subtask_row) == -1,
     "subtasks should reopen independently after a recursive task expansion")
 
-  local first_owner_row = find_row(buf, "├─ Add Resource `FirstOwner`")
+  local first_owner_row = find_row(buf, "├─ Add Resource FirstOwner")
   local first_owner_line = vim.api.nvim_buf_get_lines(buf, first_owner_row - 1, first_owner_row, false)[1]
   assert_true(first_owner_line:find("      ├─ ", 1, true) == 1,
     "entity changes should indent beneath their subtask")
@@ -241,7 +247,7 @@ local ok, failure = pcall(function()
   assert_true(row_has_highlight(buf, test_row, "IntegrationTest", "@type"),
     "integration test categories should render as one Tree-sitter type token")
 
-  local final_owner_row = find_row(buf, "└─ Add Resource `FinalOwner`")
+  local final_owner_row = find_row(buf, "└─ Add Resource FinalOwner")
   local wrapped_owner_row = final_owner_row + 1
   local wrapped_owner_line = vim.api.nvim_buf_get_lines(buf, wrapped_owner_row - 1, wrapped_owner_row, false)[1]
   assert_true(wrapped_owner_line:find("         ", 1, true) == 1,
@@ -260,7 +266,7 @@ local ok, failure = pcall(function()
   local header_row = find_row(buf, " Plan comment ")
   vim.api.nvim_buf_set_lines(buf, header_row, header_row + 1, false, { "Keep the semantic anchor" })
   assert_equals(comment_view.serialize(buf), {
-    { line = 10, body = "Keep the semantic anchor" },
+    { start_line = 10, end_line = 10, body = "Keep the semantic anchor" },
   }, "wrapped task comments should retain the canonical Markdown source line")
 
   comment_view.detach(buf)
