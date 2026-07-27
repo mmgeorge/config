@@ -222,7 +222,7 @@ return {
               targetDir = true,
             },
             check = {
-              allTargets = false,
+              allTargets = true,
               workspace = false,
             },
             cachePriming = {

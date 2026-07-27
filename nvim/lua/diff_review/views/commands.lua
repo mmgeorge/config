@@ -481,9 +481,12 @@ end
 
 --- Open a standalone, Neogit-style DiffReview status buffer.
 function M.open()
-  status_helpers.setup_bg_highlights()
+  local trace = require("diff_review.infra.perf_trace")
+  trace.event("gitstatus.open.start", nil, { cwd = vim.fn.getcwd() })
+  trace.span("gitstatus.open.setup_bg_highlights", nil, nil, status_helpers.setup_bg_highlights)
   local buf = session.status and session.status.buf
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then
+    trace.event("gitstatus.open.create_buffer.start", nil)
     buf = vim.api.nvim_create_buf(true, false)
     vim.bo[buf].bufhidden = "hide"
     vim.bo[buf].buftype = "nofile"
@@ -506,20 +509,29 @@ function M.open()
     session.status = session.main_status
     state_mod().attach(buf, session.main_status)
     keymaps().setup_status_keymaps(buf)
+    trace.event("gitstatus.open.create_buffer.done", buf)
   else
     session.main_status = session.states and session.states[buf] or session.main_status or session.status
     session.status = session.main_status
+    trace.event("gitstatus.open.reuse_buffer", buf)
   end
 
   local win = vim.api.nvim_get_current_win()
+  trace.event("gitstatus.open.set_buffer.start", buf, { win = win })
   local ok, err = pcall(vim.api.nvim_win_set_buf, win, buf)
   if not ok then
+    trace.event("gitstatus.open.set_buffer.error", buf, { win = win, error = tostring(err) })
     notify_error("DiffReview open failed: " .. tostring(err))
     return
   end
-  window_options.apply(win, session.main_status)
+  trace.event("gitstatus.open.set_buffer.done", buf, { win = win })
+  trace.span("gitstatus.open.window_options", buf, { win = win }, function()
+    window_options.apply(win, session.main_status)
+  end)
   vim.wo[win].foldcolumn = "0"
+  trace.event("gitstatus.open.render.request", buf)
   render_orchestrator().render_status_or_notify(buf)
+  trace.event("gitstatus.open.return", buf)
 end
 
 return M

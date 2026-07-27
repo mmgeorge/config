@@ -544,6 +544,9 @@ The async pattern is uniform: on a cache miss the caller schedules
 `dr().compute_*_async(...)`, gets back a *pending* marker, and re-renders when the
 callback fills the cache. `prewarm_diff_syntax` preloads syntax for hunks near the
 cursor under a budget, so scrolling feels instant without parsing everything up front.
+The viewport prewarmer only schedules syntax for rendered hunk rows. Collapsed file rows
+stay cold until the cursor rests on them, preventing status open from parsing every
+changed file at once.
 
 `syntax_context.lua` is the per-file holder: for each side it stores the source
 snapshot, parser, parsed tree, and highlight query, and resolves

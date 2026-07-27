@@ -35,7 +35,7 @@ render_markdown.setup({
 })
 local configured_converter = require("render-markdown.state").get(buffer).latex.converter
 local available_converter = require("render-markdown.lib.env").commands(configured_converter)
-assert_true(#available_converter == 2, "render-markdown must resolve utftex and latex2text: " .. vim.inspect({
+assert_true(#available_converter == 1, "render-markdown must resolve the managed utftex converter: " .. vim.inspect({
   configured = configured_converter,
   available = available_converter,
 }))

@@ -8,14 +8,12 @@ return {
       "Harness", "HarnessNew", "HarnessLog", "Permissions",
     },
     opts = {
-      perf_logging = true,
+      perf_logging = false,
       status_cursor_prewarm = true,
+      status_cursor_prewarm_max_hunks = 2,
       walkthrough_inventory = "sem",
-      -- status_cursor_prewarm_max_hunks = 2
     },
     config = function(_, opts)
-      vim.g.diff_review_gitstatus_debug = 1
-      vim.g.diff_review_gitstatus_perf = 1
       local diff_review = require("diff_review")
       diff_review.setup(opts)
       vim.api.nvim_create_user_command("GitStatus", function()
