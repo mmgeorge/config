@@ -236,6 +236,7 @@ function M.segments(line, target)
   local is_flow_row = target_type == "flow_step"
     or target_type == "flow_edge"
     or target_type == "flow_edge_result"
+    or target_type == "flow_branch"
   if target_type ~= "entity"
       and target_type ~= "entity_member"
       and target_type ~= "enum_variant"
@@ -250,12 +251,25 @@ function M.segments(line, target)
   local inline_path_start = path_start(line)
   local limit = (inline_path_start or (#line + 1)) - 1
   local span_list = {}
-  if target_type == "flow_edge" then
+  if target_type == "flow_step" then
+    local target_name = target and target.target_name or nil
+    if type(target_name) == "string" and target_name ~= "" then
+      local target_start, target_end = line:find(target_name, 1, true)
+      if target_start and target_start <= limit then
+        add_span(
+          span_list,
+          target_start,
+          target_end,
+          target and target.target_is_type and "@type" or "@function"
+        )
+      end
+    end
+  elseif target_type == "flow_edge" then
     local callable_name = target and target.callable_name or nil
     if type(callable_name) == "string" and callable_name ~= "" then
       local callable_start, callable_end = line:find(callable_name, 1, true)
       if callable_start and callable_start <= limit then
-        local callable_highlight = target.callable_kind == "method"
+        local callable_highlight = target and target.callable_kind == "method"
             and "@function.method.call"
           or "@function.call"
         add_span(span_list, callable_start, callable_end, callable_highlight)
@@ -280,14 +294,20 @@ function M.segments(line, target)
   elseif target_type == "flow_edge_result" then
     local _, marker_end = line:find("├─", 1, true)
     if not marker_end then _, marker_end = line:find("└─", 1, true) end
-    local value_start = marker_end and line:find("%S", marker_end + 1) or nil
+    local arrow_start, arrow_end = line:find("→", (marker_end or 0) + 1, true)
+    local value_start = arrow_end and line:find("%S", arrow_end + 1) or nil
     local value_end = line:find("%s*$") - 1
     if value_start and target and target.value_kind == "type" then
       add_span(span_list, 1, value_start - 1, "Normal")
       add_span(span_list, value_start, value_end, "@type")
       add_span(span_list, value_end + 1, #line, "Normal")
-    elseif value_start then
+    elseif arrow_start then
       add_span(span_list, 1, #line, "Normal")
+    end
+  elseif target_type == "flow_branch" then
+    local keyword_start, keyword_end = line:find("when", 1, true)
+    if keyword_start and keyword_start <= limit then
+      add_span(span_list, keyword_start, keyword_end, "@keyword.conditional")
     end
   elseif target_type == "entity" then
     declaration_spans(line, span_list, limit)

@@ -1,11 +1,16 @@
 use super::{ControlToolInvocation, apply_invocation};
 use crate::backend::{BackendOutput, PromptMode};
-use crate::plan::{PlanDocument, PlanState, apply_plan_edit, render_plan};
+use crate::plan::{
+    PlanDocument, PlanState, apply_plan_edit, render_plan, validate_workspace_references,
+};
+use crate::rustdoc::{RustdocResolver, validate_plan_rust_api};
 use anyhow::{Context, Result};
 use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Carries the broker-owned control state visible to one provider turn.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ControlTurnContext {
     pub mode: PromptMode,
     pub planning_feedback: bool,
@@ -15,6 +20,29 @@ pub struct ControlTurnContext {
     pub has_active_elicitation: bool,
     pub has_active_execution: bool,
     pub has_active_goal: bool,
+    pub workspace_root: Option<PathBuf>,
+    pub rustdoc: Option<Arc<RustdocResolver>>,
+}
+
+impl std::fmt::Debug for ControlTurnContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ControlTurnContext")
+            .field("mode", &self.mode)
+            .field("planning_feedback", &self.planning_feedback)
+            .field("plan_state", &self.plan_state)
+            .field("plan_document", &self.plan_document)
+            .field(
+                "resolved_question_digest_set",
+                &self.resolved_question_digest_set,
+            )
+            .field("has_active_elicitation", &self.has_active_elicitation)
+            .field("has_active_execution", &self.has_active_execution)
+            .field("has_active_goal", &self.has_active_goal)
+            .field("workspace_root", &self.workspace_root)
+            .field("rustdoc_available", &self.rustdoc.is_some())
+            .finish()
+    }
 }
 
 impl ControlTurnContext {
@@ -29,6 +57,8 @@ impl ControlTurnContext {
             has_active_elicitation: false,
             has_active_execution: false,
             has_active_goal: false,
+            workspace_root: None,
+            rustdoc: None,
         }
     }
 }
@@ -41,6 +71,7 @@ pub struct ControlToolRuntime {
 }
 
 /// Returns one accepted invocation or an idempotent provider-visible result.
+#[derive(Debug)]
 pub struct ControlToolResult {
     pub invocation: Option<ControlToolInvocation>,
     pub message: String,
@@ -57,14 +88,14 @@ impl ControlToolRuntime {
     }
 
     /// Validate and stage one control invocation without persisting broker state.
-    pub fn invoke(&mut self, invocation: ControlToolInvocation) -> Result<ControlToolResult> {
+    pub async fn invoke(&mut self, invocation: ControlToolInvocation) -> Result<ControlToolResult> {
         let mut output = BackendOutput::default();
         apply_invocation(&invocation, &mut output)?;
-        self.invoke_decoded(invocation, output)
+        self.invoke_decoded(invocation, output).await
     }
 
     /// Execute one control invocation from arguments decoded by the provider boundary.
-    pub(crate) fn invoke_decoded(
+    pub(crate) async fn invoke_decoded(
         &mut self,
         invocation: ControlToolInvocation,
         mut output: BackendOutput,
@@ -124,11 +155,41 @@ impl ControlToolRuntime {
                     "submitted version does not match active version"
                 );
                 document.validate_for_submission()?;
+                let workspace_root = self
+                    .context
+                    .workspace_root
+                    .as_deref()
+                    .context("plan submission has no workspace root")?;
+                validate_workspace_references(document, workspace_root)?;
                 render_plan(document)?;
+                let resolver = self
+                    .context
+                    .rustdoc
+                    .as_ref()
+                    .context("plan submission has no Rust API validation service")?;
+                let mut validated_document = document.clone();
+                let report = validate_plan_rust_api(resolver, &mut validated_document).await?;
+                self.plan_document = Some(validated_document);
                 self.terminal = true;
                 Ok(ControlToolResult {
                     invocation: Some(invocation),
-                    message: self.plan_version_message("Plan passed submission validation"),
+                    message: if report.warning.is_empty() {
+                        self.plan_version_message("Plan passed canonical submission validation")
+                    } else {
+                        format!(
+                            "{} {} Rust API validation warning(s): {}",
+                            self.plan_version_message(
+                                "Plan passed canonical submission validation"
+                            ),
+                            report.warning.len(),
+                            report
+                                .warning
+                                .iter()
+                                .map(|warning| format!("{}: {}", warning.path, warning.message))
+                                .collect::<Vec<_>>()
+                                .join("; ")
+                        )
+                    },
                 })
             }
             "harness_question_ask" => {
@@ -234,6 +295,7 @@ mod test {
     use serde_json::json;
 
     fn planning_context() -> ControlTurnContext {
+        let cache_dir = tempfile::tempdir().unwrap().keep();
         ControlTurnContext {
             mode: PromptMode::Plan,
             planning_feedback: false,
@@ -243,11 +305,24 @@ mod test {
             has_active_elicitation: false,
             has_active_execution: false,
             has_active_goal: false,
+            workspace_root: Some(tempfile::tempdir().unwrap().keep()),
+            rustdoc: Some(Arc::new(
+                RustdocResolver::new(crate::rustdoc::RustdocResolverConfig {
+                    crates_io_base: "http://127.0.0.1:9".into(),
+                    docs_rs_base: "http://127.0.0.1:9".into(),
+                    cache_dir,
+                    cargo_source: crate::rustdoc::CargoSourceResolverConfig {
+                        cargo_executable: PathBuf::from("missing-cargo"),
+                        cargo_home: tempfile::tempdir().unwrap().keep(),
+                    },
+                })
+                .unwrap(),
+            )),
         }
     }
 
-    #[test]
-    fn stages_edits_and_closes_the_turn_after_submission() {
+    #[tokio::test]
+    async fn stages_edits_and_closes_the_turn_after_submission() {
         let mut runtime = ControlToolRuntime::new(planning_context());
         runtime
             .invoke(ControlToolInvocation {
@@ -257,12 +332,14 @@ mod test {
                     "plan": { "modify": { "overview": "Changed" } }
                 }),
             })
+            .await
             .unwrap();
         runtime
             .invoke(ControlToolInvocation {
                 name: "harness_plan_submit".into(),
                 arguments: json!({ "plan_id": "plan", "expected_version": 2 }),
             })
+            .await
             .unwrap();
         assert!(
             runtime
@@ -270,12 +347,13 @@ mod test {
                     name: "harness_plan_read".into(),
                     arguments: json!({ "plan_id": "plan" }),
                 })
+                .await
                 .is_err()
         );
     }
 
-    #[test]
-    fn keeps_the_draft_editable_after_submission_validation_fails() {
+    #[tokio::test]
+    async fn keeps_the_draft_editable_after_submission_validation_fails() {
         let mut runtime = ControlToolRuntime::new(planning_context());
         runtime
             .invoke(ControlToolInvocation {
@@ -297,11 +375,15 @@ mod test {
                     }
                 }),
             })
+            .await
             .unwrap();
-        let submission_error = match runtime.invoke(ControlToolInvocation {
-            name: "harness_plan_submit".into(),
-            arguments: json!({ "plan_id": "plan", "expected_version": 2 }),
-        }) {
+        let submission_error = match runtime
+            .invoke(ControlToolInvocation {
+                name: "harness_plan_submit".into(),
+                arguments: json!({ "plan_id": "plan", "expected_version": 2 }),
+            })
+            .await
+        {
             Ok(_) => panic!("incomplete plan submission should fail"),
             Err(error) => error.to_string(),
         };
@@ -348,17 +430,124 @@ mod test {
                     }
                 }),
             })
+            .await
             .unwrap();
         runtime
             .invoke(ControlToolInvocation {
                 name: "harness_plan_submit".into(),
                 arguments: json!({ "plan_id": "plan", "expected_version": 3 }),
             })
+            .await
             .unwrap();
     }
 
-    #[test]
-    fn consumes_a_repeated_question_by_content_digest() {
+    #[tokio::test]
+    async fn returns_rust_api_violations_to_the_submit_tool_and_keeps_editing_open() {
+        let mut context = planning_context();
+        context.plan_document.as_mut().unwrap().dependencies.push(
+            crate::plan::PlanDependencyChange {
+                dependency_id: "dependency_datafusion".into(),
+                action: crate::plan::ChangeAction::Add,
+                name: "datafusion".into(),
+                version: "not a Cargo requirement".into(),
+                resolved_version: None,
+                manifest: "Cargo.toml".into(),
+                license: Some("Apache-2.0".into()),
+                justification: "Runs relational queries. The standard library has no query engine."
+                    .into(),
+            },
+        );
+        context.plan_document.as_mut().unwrap().tasks[0].files.push(
+            serde_json::from_value(json!({
+                "action": "modify",
+                    "path": "Cargo.toml",
+                    "subtasks": [{
+                        "subtask_id": "configure_invalid_dependency",
+                        "operation": "configure",
+                    "description": "the invalid dependency requirement.",
+                    "entities": []
+                }]
+            }))
+            .unwrap(),
+        );
+        let mut runtime = ControlToolRuntime::new(context);
+
+        let error = runtime
+            .invoke(ControlToolInvocation {
+                name: "harness_plan_submit".into(),
+                arguments: json!({ "plan_id": "plan", "expected_version": 1 }),
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("dependencies.0.version"), "{error}");
+        assert!(
+            error.contains("invalid Cargo version requirement"),
+            "{error}"
+        );
+        assert!(
+            runtime
+                .invoke(ControlToolInvocation {
+                    name: "harness_plan_read".into(),
+                    arguments: json!({ "plan_id": "plan" }),
+                })
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn returns_network_validation_warnings_without_rejecting_submission() {
+        let mut context = planning_context();
+        context.plan_document.as_mut().unwrap().dependencies.push(
+            crate::plan::PlanDependencyChange {
+                dependency_id: "dependency_datafusion".into(),
+                action: crate::plan::ChangeAction::Add,
+                name: "datafusion".into(),
+                version: "54".into(),
+                resolved_version: None,
+                manifest: "Cargo.toml".into(),
+                license: Some("Apache-2.0".into()),
+                justification: "Runs relational queries. The standard library has no query engine."
+                    .into(),
+            },
+        );
+        context.plan_document.as_mut().unwrap().tasks[0].files.push(
+            serde_json::from_value(json!({
+                "action": "modify",
+                "path": "Cargo.toml",
+                "subtasks": [{
+                    "subtask_id": "configure_datafusion",
+                    "operation": "configure",
+                    "description": "the DataFusion dependency.",
+                    "entities": []
+                }]
+            }))
+            .unwrap(),
+        );
+        let mut runtime = ControlToolRuntime::new(context);
+
+        let result = runtime
+            .invoke(ControlToolInvocation {
+                name: "harness_plan_submit".into(),
+                arguments: json!({ "plan_id": "plan", "expected_version": 1 }),
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            result
+                .message
+                .contains("passed canonical submission validation")
+        );
+        assert!(result.message.contains("Rust API validation warning"));
+        assert!(result.message.contains("partially skipped"));
+        assert!(result.message.contains("datafusion"));
+    }
+
+    #[tokio::test]
+    async fn consumes_a_repeated_question_by_content_digest() {
         let question = crate::plan::PlanQuestion {
             id: "first_id".into(),
             header: "Scope".into(),
@@ -394,6 +583,7 @@ mod test {
                     }]
                 }),
             })
+            .await
             .unwrap();
         assert!(result.invocation.is_none());
         assert!(result.message.contains("already consumed"));

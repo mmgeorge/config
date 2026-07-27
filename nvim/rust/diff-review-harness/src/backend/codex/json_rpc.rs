@@ -308,9 +308,12 @@ impl CodexJsonRpc {
             rejects_question_resolution(self.planning_feedback, method, &message);
         let repeats_control_invocation = control_invocation_key(method, &message)
             .is_some_and(|key| !self.control_invocation_key_set.insert(key));
-        if message.get("id").is_some() && message.get("method").is_some() {
-            self.respond_to_provider_request(&message).await?;
-        }
+        let provider_request_success =
+            if message.get("id").is_some() && message.get("method").is_some() {
+                Some(self.respond_to_provider_request(&message).await?)
+            } else {
+                None
+            };
         let completed_control_lifecycle = repeats_control_invocation
             && control_tool_name(method, message.get("params").unwrap_or(&Value::Null)).is_some()
             && method.eq_ignore_ascii_case("item/completed");
@@ -322,7 +325,10 @@ impl CodexJsonRpc {
                 output,
                 self.event_sink.as_ref(),
                 &self.workspace,
-                !repeats_control_invocation,
+                should_apply_control_semantics(
+                    repeats_control_invocation,
+                    provider_request_success,
+                ),
             );
         }
         Ok(message)
@@ -368,7 +374,7 @@ impl CodexJsonRpc {
             .context("write shared Codex app-server JSON-RPC request")
     }
 
-    async fn respond_to_provider_request(&mut self, message: &Value) -> Result<()> {
+    async fn respond_to_provider_request(&mut self, message: &Value) -> Result<bool> {
         let id = message.get("id").cloned().unwrap_or(Value::Null);
         let method = message
             .get("method")
@@ -492,7 +498,8 @@ impl CodexJsonRpc {
                 }
             }
         }
-        write_result
+        write_result?;
+        Ok(response_success)
     }
 
     async fn provider_request_result(
@@ -568,31 +575,36 @@ impl CodexJsonRpc {
                         );
                     }
                     let execution_started_at = Instant::now();
-                    if let Err(error) = self.execute_control_invocation(&invocation, decoded_output)
+                    let execution_message = match self
+                        .execute_control_invocation(&invocation, decoded_output)
+                        .await
                     {
-                        if let Some(context) = trace_context {
-                            self.trace.record(
-                                &self.session_id,
-                                "dynamic_tool_failed",
-                                context.payload(json!({
-                                    "phase": "semantic_execution",
-                                    "error_category": "semantic",
-                                    "error": format!("{error:#}"),
-                                    "execution_ms": execution_started_at.elapsed().as_millis() as u64,
-                                })),
-                            );
+                        Ok(message) => message,
+                        Err(error) => {
+                            if let Some(context) = trace_context {
+                                self.trace.record(
+                                    &self.session_id,
+                                    "dynamic_tool_failed",
+                                    context.payload(json!({
+                                        "phase": "semantic_execution",
+                                        "error_category": "semantic",
+                                        "error": format!("{error:#}"),
+                                        "execution_ms": execution_started_at.elapsed().as_millis() as u64,
+                                    })),
+                                );
+                            }
+                            return Ok(json!({
+                                "contentItems": [{
+                                    "type": "inputText",
+                                    "text": format!(
+                                        "{} failed canonical validation: {error:#}. The plan remains editable. Correct the referenced resource and retry harness_plan_submit with the current version.",
+                                        invocation.name
+                                    )
+                                }],
+                                "success": false
+                            }));
                         }
-                        return Ok(json!({
-                            "contentItems": [{
-                                "type": "inputText",
-                                "text": format!(
-                                    "{} failed canonical validation: {error:#}. The plan remains editable. Correct the referenced resource and retry harness_plan_submit with the current version.",
-                                    invocation.name
-                                )
-                            }],
-                            "success": false
-                        }));
-                    }
+                    };
                     if let Some(context) = trace_context {
                         self.trace.record(
                             &self.session_id,
@@ -604,28 +616,32 @@ impl CodexJsonRpc {
                             })),
                         );
                     }
-                    let response_text = match invocation.name.as_str() {
-                        "harness_plan_edit" => format!(
-                            "Plan edit accepted. The active canonical version is {}.",
-                            self.plan_document
+                    let response_text = if let Some(message) = execution_message {
+                        message
+                    } else {
+                        match invocation.name.as_str() {
+                            "harness_plan_edit" => format!(
+                                "Plan edit accepted. The active canonical version is {}.",
+                                self.plan_document
+                                    .as_ref()
+                                    .map(|document| document.version)
+                                    .unwrap_or_default()
+                            ),
+                            "harness_plan_read" => self
+                                .plan_document
                                 .as_ref()
-                                .map(|document| document.version)
-                                .unwrap_or_default()
-                        ),
-                        "harness_plan_read" => self
-                            .plan_document
-                            .as_ref()
-                            .map(serde_json::to_string_pretty)
-                            .transpose()?
-                            .context("plan read lost its active canonical document")?,
-                        "harness_plan_submit" => format!(
-                            "Plan version {} passed canonical submission validation.",
-                            self.plan_document
-                                .as_ref()
-                                .map(|document| document.version)
-                                .unwrap_or_default()
-                        ),
-                        _ => "Recorded by DiffReview Harness".into(),
+                                .map(serde_json::to_string_pretty)
+                                .transpose()?
+                                .context("plan read lost its active canonical document")?,
+                            "harness_plan_submit" => format!(
+                                "Plan version {} passed canonical submission validation.",
+                                self.plan_document
+                                    .as_ref()
+                                    .map(|document| document.version)
+                                    .unwrap_or_default()
+                            ),
+                            _ => "Recorded by DiffReview Harness".into(),
+                        }
                     };
                     return Ok(json!({
                         "contentItems": [{ "type": "inputText", "text": response_text }],
@@ -641,18 +657,18 @@ impl CodexJsonRpc {
         }
     }
 
-    fn execute_control_invocation(
+    async fn execute_control_invocation(
         &mut self,
         invocation: &ControlToolInvocation,
         mut output: BackendOutput,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         if let Some(runtime) = self.control_runtime.as_mut() {
-            let result = runtime.invoke_decoded(invocation.clone(), output)?;
+            let result = runtime.invoke_decoded(invocation.clone(), output).await?;
             if result.invocation.is_none() {
-                return Ok(());
+                return Ok(Some(result.message));
             }
             self.plan_document = runtime.plan_document().cloned();
-            return Ok(());
+            return Ok(Some(result.message));
         }
         match invocation.name.as_str() {
             "harness_plan_edit" => {
@@ -704,7 +720,7 @@ impl CodexJsonRpc {
             }
             _ => {}
         }
-        Ok(())
+        Ok(None)
     }
 
     async fn authorize_provider_request(
@@ -729,6 +745,13 @@ impl CodexJsonRpc {
             .await?;
         Ok(resolution)
     }
+}
+
+fn should_apply_control_semantics(
+    repeats_control_invocation: bool,
+    provider_request_success: Option<bool>,
+) -> bool {
+    !repeats_control_invocation && provider_request_success.unwrap_or(true)
 }
 
 fn rejects_question_resolution(planning_feedback: bool, method: &str, value: &Value) -> bool {
@@ -1757,6 +1780,46 @@ fn first_text(value: &Value) -> Option<String> {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn exports_only_semantically_accepted_control_requests() {
+        assert!(!should_apply_control_semantics(false, Some(false)));
+        assert!(should_apply_control_semantics(false, Some(true)));
+        assert!(should_apply_control_semantics(false, None));
+        assert!(!should_apply_control_semantics(true, Some(true)));
+    }
+
+    #[test]
+    fn rejected_control_request_does_not_poison_corrected_output() {
+        let request = |overview: &str| {
+            json!({
+                "id": overview,
+                "method": "item/tool/call",
+                "params": {
+                    "tool": "harness_plan_edit",
+                    "arguments": {
+                        "plan_id": "plan-1",
+                        "expected_version": 1,
+                        "plan": { "modify": { "overview": overview } }
+                    }
+                }
+            })
+        };
+        let mut output = BackendOutput::default();
+
+        normalize_event_in_workspace(&request("rejected"), &mut output, None, "", false);
+        normalize_event_in_workspace(&request("corrected"), &mut output, None, "", true);
+
+        assert_eq!(output.plan_edit.len(), 1);
+        assert_eq!(
+            output.plan_edit[0]
+                .mutation
+                .plan
+                .as_ref()
+                .and_then(|plan| plan.modify.overview.as_deref()),
+            Some("corrected")
+        );
+    }
 
     #[test]
     fn extracts_structured_questions_from_dynamic_tool_arguments() {

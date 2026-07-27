@@ -148,7 +148,7 @@ impl<'a> PlanGraph<'a> {
     /// Resolve the lifecycle action attached to one semantic entity.
     pub fn entity_action(&self, entity_id: &str) -> Option<ChangeAction> {
         match self.resolve_entity(entity_id)? {
-            ResolvedPlanEntity::Entity(entity) => Some(entity.action),
+            ResolvedPlanEntity::Entity(entity) => Some(entity.action.base_action()),
             ResolvedPlanEntity::Member(_, member) => Some(member.action),
             ResolvedPlanEntity::Variant(_, variant) => Some(variant.action),
             ResolvedPlanEntity::VariantField(_, _, field) => Some(field.action),
@@ -391,15 +391,16 @@ fn is_contract_kind(kind: EntityKind) -> bool {
 mod test {
     use super::*;
     use crate::plan::{
-        ChangeAction, EnumVariantChange, EnumVariantFieldChange, FunctionParameter, MemberKind,
-        Visibility, document::test_fixture,
+        ChangeAction, EntityChangeAction, EnumVariantChange, EnumVariantFieldChange,
+        FunctionParameter, MemberKind, Visibility, document::test_fixture,
     };
 
     fn entity(entity_id: &str, name: &str, kind: EntityKind) -> ProgramEntityChange {
         ProgramEntityChange {
             entity_id: entity_id.into(),
-            action: ChangeAction::Add,
+            action: EntityChangeAction::Add,
             kind,
+            renamed_from: None,
             name: name.into(),
             description: format!("Defines {name}."),
             path: format!("src/{entity_id}.rs"),

@@ -1014,14 +1014,20 @@ impl ControlToolRouter {
         })
     }
 
-    fn route(&self, invocation: ControlToolInvocation) -> Result<String> {
-        let result = self
+    async fn route(&self, invocation: ControlToolInvocation) -> Result<String> {
+        let mut runtime = self
             .runtime
             .lock()
             .map_err(|_| anyhow::anyhow!("Copilot control-tool runtime lock poisoned"))?
-            .as_mut()
-            .context("Copilot control tool ran without an active turn")?
-            .invoke(invocation.clone())?;
+            .take()
+            .context("Copilot control tool ran without an active turn")?;
+        let result = runtime.invoke(invocation.clone()).await;
+        *self
+            .runtime
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Copilot control-tool runtime lock poisoned"))? =
+            Some(runtime);
+        let result = result?;
         let Some(invocation) = result.invocation else {
             return Ok(result.message);
         };
@@ -1116,10 +1122,13 @@ impl ToolHandler for CopilotControlToolHandler {
         invocation: ToolInvocation,
     ) -> std::result::Result<ToolResult, github_copilot_sdk::Error> {
         let name = invocation.tool_name;
-        let result = self.router.route(ControlToolInvocation {
-            name: name.clone(),
-            arguments: invocation.arguments,
-        });
+        let result = self
+            .router
+            .route(ControlToolInvocation {
+                name: name.clone(),
+                arguments: invocation.arguments,
+            })
+            .await;
         Ok(match result {
             Ok(message) => ToolResult::Text(message),
             Err(error) => ToolResult::Text(format!("{name} failed: {error:#}")),
@@ -1259,6 +1268,7 @@ mod test {
                 name: "harness_goal_complete".into(),
                 arguments: serde_json::json!({ "summary": "Complete" }),
             })
+            .await
             .unwrap();
         assert_eq!(
             stream.receive().await.unwrap().name,

@@ -126,8 +126,22 @@ assert_equals(
   "code-flow actions should retain their existing presentation styling"
 )
 
+local typed_flow_step = uml_style.segments(
+  "*main — Parse input path             [hello/src/main.rs]",
+  {
+    target_type = "flow_step",
+    target_name = "main",
+    target_is_type = false,
+  }
+)
+assert_equals(
+  highlight_for(typed_flow_step, "main"),
+  "@function",
+  "code-flow actors should expose their planned entity kind"
+)
+
 local flow_edge = uml_style.segments(
-  "  ├─ Read schema() from SessionContext",
+  "  ├─ SessionContext.schema()",
   {
     target_type = "flow_edge",
     callable_kind = "method",
@@ -142,7 +156,7 @@ assert_equals(
   "typed flow methods should use Tree-sitter method-call highlighting"
 )
 local function_edge = uml_style.segments(
-  "  └─ Call decode() on GeoMetadata",
+  "  └─ GeoMetadata.decode()",
   {
     target_type = "flow_edge",
     callable_kind = "function",
@@ -175,8 +189,18 @@ assert_equals(
   "endpoint names should retain standard text highlighting"
 )
 
+local flow_branch = uml_style.segments(
+  "  └─ when inspection fails",
+  { target_type = "flow_branch" }
+)
+assert_equals(
+  highlight_for(flow_branch, "when"),
+  "@keyword.conditional",
+  "code-flow branch conditions should expose their conditional keyword"
+)
+
 local entity_value = uml_style.segments(
-  "        └─ InspectionSummary",
+  "        └─ → InspectionSummary",
   { target_type = "flow_edge_result", value_kind = "type" }
 )
 assert_equals(
@@ -184,13 +208,18 @@ assert_equals(
   "@type",
   "flow values matching declared entities should use type highlighting"
 )
+assert_equals(
+  highlight_for(entity_value, "        └─ → "),
+  "Normal",
+  "flow result connectors should retain the standard text color"
+)
 
 local plain_flow_value = uml_style.segments(
-  "        └─ stdout and exit status",
+  "        └─ → stdout and exit status",
   { target_type = "flow_edge_result", value_kind = "text" }
 )
 assert_equals(
-  highlight_for(plain_flow_value, "        └─ stdout and exit status"),
+  highlight_for(plain_flow_value, "        └─ → stdout and exit status"),
   "Normal",
   "non-entity flow values should use the standard text color"
 )

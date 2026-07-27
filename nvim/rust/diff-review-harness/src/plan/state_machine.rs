@@ -106,6 +106,7 @@ mod test {
             acceptance: None,
             question_ledger: Default::default(),
             generation: Default::default(),
+            validation_warning: Vec::new(),
             created_at_ms: 1,
             updated_at_ms: 1,
         }

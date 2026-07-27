@@ -25,14 +25,15 @@ use crate::interaction::{
 use crate::permissions::store::PermissionStore;
 use crate::plan::state_machine::{PlanEvent, PlanStateMachine};
 use crate::plan::{
-    ArtifactSummary, ContextChoice, PlanAcceptance, PlanAnnotation, PlanDeviation,
+    ArtifactSummary, ContextChoice, PlanAcceptance, PlanAnnotation, PlanCallable, PlanDeviation,
     PlanDeviationDisposition, PlanDeviationKind, PlanDocument, PlanElicitation,
     PlanExecutionLifecycleEvent, PlanExecutionPromptKind, PlanExecutionRecord, PlanExecutionState,
-    PlanFileStore, PlanLifecycleKind, PlanLifecycleRecord, PlanPrompt, PlanQuestionAnswer,
-    PlanQuestionResponse, PlanQuestionSet, PlanQuestionWithdrawal, PlanRecord, PlanResolutionKind,
-    PlanState, ScopeDeviationReview, digest as plan_digest, execution_prompt,
+    PlanFileStore, PlanFlowRelation, PlanLifecycleKind, PlanLifecycleRecord, PlanPrompt,
+    PlanQuestionAnswer, PlanQuestionResponse, PlanQuestionSet, PlanQuestionWithdrawal, PlanRecord,
+    PlanResolutionKind, PlanState, ScopeDeviationReview, digest as plan_digest, execution_prompt,
 };
 use crate::protocol::{BrokerEvent, BrokerRequest, BrokerResponse};
+use crate::rustdoc::{RustdocResolver, RustdocResolverConfig, validate_plan_rust_api};
 use crate::session::{
     ContextUsage, ExecutionMode, HarnessMode, HarnessPreference, HarnessSession, ModelSetting,
     ProviderForkState, SessionStore,
@@ -166,6 +167,26 @@ struct AgentRuntime {
     task: TaskTracker,
 }
 
+struct RustdocTarget {
+    plan_id: String,
+    expected_version: u64,
+    selection: String,
+    receiver: String,
+    receiver_package: String,
+    receiver_version: String,
+    relation: PlanFlowRelation,
+    package_list: Vec<(String, String)>,
+}
+
+fn rustdoc_callable(relation: &PlanFlowRelation) -> Result<&PlanCallable> {
+    match relation {
+        PlanFlowRelation::Call { callable }
+        | PlanFlowRelation::Read { callable }
+        | PlanFlowRelation::Write { callable } => Ok(callable),
+        _ => anyhow::bail!("selected flow edge has no Rust callable"),
+    }
+}
+
 /// Represents one request result plus asynchronous events emitted before its response.
 pub struct DispatchResult {
     pub response: BrokerResponse,
@@ -178,6 +199,7 @@ pub struct BrokerRuntime {
     permission_store: Arc<RwLock<PermissionStore>>,
     permission_coordinator: Arc<PermissionCoordinator>,
     trace: Arc<TraceStore>,
+    rustdoc: Arc<RustdocResolver>,
 }
 
 impl BrokerRuntime {
@@ -202,6 +224,9 @@ impl BrokerRuntime {
         let permission_coordinator =
             Arc::new(PermissionCoordinator::new(Arc::clone(&permission_store)));
         let trace = Arc::new(TraceStore::open(&data_root)?);
+        let rustdoc = Arc::new(RustdocResolver::new(RustdocResolverConfig::production(
+            &data_root,
+        )?)?);
         let backend = Arc::<dyn Backend>::from(crate::backend::build(
             request.backend.clone(),
             Arc::clone(&permission_coordinator),
@@ -212,6 +237,7 @@ impl BrokerRuntime {
             permission_store,
             permission_coordinator,
             trace,
+            rustdoc,
         }))
     }
 
@@ -375,6 +401,7 @@ pub struct HarnessBroker {
     permission_store: Arc<RwLock<PermissionStore>>,
     permission_coordinator: Arc<PermissionCoordinator>,
     trace: Arc<TraceStore>,
+    rustdoc: Arc<RustdocResolver>,
     event_sink: Option<BackendEventSink>,
     clock: Box<dyn Clock>,
     interaction_runtime: Option<InteractionRuntime>,
@@ -529,6 +556,7 @@ impl HarnessBroker {
             permission_store,
             permission_coordinator,
             trace,
+            rustdoc: Arc::clone(&runtime.rustdoc),
             event_sink: None,
             clock,
             interaction_runtime: None,
@@ -601,6 +629,8 @@ impl HarnessBroker {
             has_active_elicitation: plan.as_ref().is_some_and(|plan| plan.elicitation.is_some()),
             has_active_execution: mode == PromptMode::ExecutePlan,
             has_active_goal: self.session.goal_id.is_some(),
+            workspace_root: Some(PathBuf::from(&self.session.workspace)),
+            rustdoc: Some(Arc::clone(&self.rustdoc)),
         })
     }
 
@@ -908,6 +938,8 @@ impl HarnessBroker {
             "plan.acceptance.begin" => self.begin_plan_acceptance(params),
             "plan.acceptance.cancel" => self.cancel_plan_acceptance(),
             "plan.entity.rename" => self.rename_plan_entity(params),
+            "plan.rustdoc.hover" => self.rustdoc_hover(params).await,
+            "plan.rustdoc.source" => self.rustdoc_source(params).await,
             "plan.request_changes" => self.request_plan_changes(params).await,
             "plan.cancel" => self.cancel_plan(),
             "plan.activate" => self.activate_plan(params),
@@ -946,6 +978,181 @@ impl HarnessBroker {
             }
             _ => anyhow::bail!("unknown Harness broker method: {method}"),
         }
+    }
+
+    async fn rustdoc_hover(&mut self, params: Value) -> Result<(Value, Vec<BrokerEvent>)> {
+        let target = self
+            .resolve_rustdoc_target(&params, "plan.rustdoc.hover")
+            .await?;
+        let hover = if target.selection == "receiver" {
+            self.rustdoc
+                .type_hover(
+                    &target.receiver_package,
+                    &target.receiver_version,
+                    &target.receiver,
+                )
+                .await?
+        } else {
+            let callable = rustdoc_callable(&target.relation)?;
+            self.rustdoc
+                .callable_hover(
+                    &target.package_list,
+                    &target.receiver,
+                    &callable.name,
+                    callable.kind,
+                )
+                .await?
+        };
+        Ok((serde_json::to_value(hover)?, Vec::new()))
+    }
+
+    async fn rustdoc_source(&mut self, params: Value) -> Result<(Value, Vec<BrokerEvent>)> {
+        let target = self
+            .resolve_rustdoc_target(&params, "plan.rustdoc.source")
+            .await?;
+        let location = if target.selection == "receiver" {
+            self.rustdoc
+                .type_source(
+                    &target.receiver_package,
+                    &target.receiver_version,
+                    &target.receiver,
+                )
+                .await?
+        } else {
+            let callable = rustdoc_callable(&target.relation)?;
+            self.rustdoc
+                .callable_source(
+                    &target.package_list,
+                    &target.receiver,
+                    &callable.name,
+                    callable.kind,
+                )
+                .await?
+        };
+        let current = self
+            .plan_file
+            .read_working_document(&self.session.id, &target.plan_id)?;
+        anyhow::ensure!(
+            current.version == target.expected_version,
+            "plan version changed before Rust source resolved"
+        );
+        Ok((serde_json::to_value(location)?, Vec::new()))
+    }
+
+    async fn resolve_rustdoc_target(
+        &mut self,
+        params: &Value,
+        method: &str,
+    ) -> Result<RustdocTarget> {
+        let plan_id = params
+            .get("plan_id")
+            .and_then(Value::as_str)
+            .with_context(|| format!("{method} requires plan_id"))?
+            .to_owned();
+        let expected_version = params
+            .get("expected_version")
+            .and_then(Value::as_u64)
+            .with_context(|| format!("{method} requires expected_version"))?;
+        let flow_id = params
+            .get("flow_id")
+            .and_then(Value::as_str)
+            .with_context(|| format!("{method} requires flow_id"))?;
+        let step_id = params
+            .get("step_id")
+            .and_then(Value::as_str)
+            .with_context(|| format!("{method} requires step_id"))?;
+        let edge_id = params
+            .get("edge_id")
+            .and_then(Value::as_str)
+            .with_context(|| format!("{method} requires edge_id"))?;
+        let selection = params
+            .get("selection")
+            .and_then(Value::as_str)
+            .with_context(|| format!("{method} requires selection"))?
+            .to_owned();
+        anyhow::ensure!(
+            matches!(selection.as_str(), "receiver" | "callable"),
+            "{method} selection must be receiver or callable"
+        );
+        let mut document = self
+            .plan_file
+            .read_working_document(&self.session.id, &plan_id)?;
+        anyhow::ensure!(
+            document.version == expected_version,
+            "plan version changed before Rust documentation resolved"
+        );
+        let flow = document
+            .flows
+            .iter()
+            .find(|flow| flow.flow_id == flow_id)
+            .context("Rust documentation flow no longer exists")?;
+        let edge = flow
+            .edge(step_id, edge_id)
+            .context("Rust documentation flow edge no longer exists")?;
+        let crate::plan::EntityReference::ExternalEntity {
+            name: receiver,
+            dependency: Some(receiver_dependency),
+            ..
+        } = &edge.target
+        else {
+            anyhow::bail!("Rust documentation requires an external typed receiver");
+        };
+        let receiver = receiver.clone();
+        let receiver_dependency = receiver_dependency.clone();
+        let relation = edge.relation.clone();
+        let dependency_index = document
+            .dependencies
+            .iter()
+            .position(|dependency| dependency.name == receiver_dependency)
+            .context("Rust receiver dependency is not declared by this plan")?;
+        let mut document_changed = false;
+        let dependency_index_list = if selection == "callable" {
+            (0..document.dependencies.len()).collect::<Vec<_>>()
+        } else {
+            vec![dependency_index]
+        };
+        for index in dependency_index_list {
+            if document.dependencies[index].resolved_version.is_some() {
+                continue;
+            }
+            let dependency_name = document.dependencies[index].name.clone();
+            let dependency_requirement = document.dependencies[index].version.clone();
+            let version = self
+                .rustdoc
+                .resolve_version(&dependency_name, &dependency_requirement)
+                .await?;
+            document.dependencies[index].resolved_version = Some(version);
+            document_changed = true;
+        }
+        if document_changed {
+            self.plan_file
+                .write_working_document(&self.session.id, &plan_id, &document)?;
+        }
+        let receiver_package = document.dependencies[dependency_index].name.clone();
+        let receiver_version = document.dependencies[dependency_index]
+            .resolved_version
+            .clone()
+            .context("Rust receiver dependency version was not resolved")?;
+        let package_list = document
+            .dependencies
+            .iter()
+            .filter_map(|dependency| {
+                dependency
+                    .resolved_version
+                    .as_ref()
+                    .map(|version| (dependency.name.clone(), version.clone()))
+            })
+            .collect();
+        Ok(RustdocTarget {
+            plan_id,
+            expected_version,
+            selection,
+            receiver,
+            receiver_package,
+            receiver_version,
+            relation,
+            package_list,
+        })
     }
 
     fn open_permission_document(&self) -> Result<(Value, Vec<BrokerEvent>)> {
@@ -1653,6 +1860,7 @@ impl HarnessBroker {
                 acceptance: None,
                 question_ledger: Default::default(),
                 generation: Default::default(),
+                validation_warning: Vec::new(),
                 created_at_ms: now_ms,
                 updated_at_ms: now_ms,
             };
@@ -2512,6 +2720,30 @@ Planning continuation: turn {} of {}.",
         text: String,
         mode: PromptMode,
         admission: Option<InteractionAdmission>,
+        input: BackendInput,
+    ) -> Result<(Value, Vec<BrokerEvent>)> {
+        match self
+            .run_interaction_input_inner(text, mode, admission, input)
+            .await
+        {
+            Ok(result) => Ok(result),
+            Err(error) if self.interaction_runtime.is_some() => {
+                match self.finalize_interaction_after_processing_failure().await {
+                    Ok(()) => Err(error),
+                    Err(finalization_error) => Err(error.context(format!(
+                        "also failed to finalize the interaction: {finalization_error:#}"
+                    ))),
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn run_interaction_input_inner(
+        &mut self,
+        text: String,
+        mode: PromptMode,
+        admission: Option<InteractionAdmission>,
         mut input: BackendInput,
     ) -> Result<(Value, Vec<BrokerEvent>)> {
         let now_ms = self.clock.now_ms();
@@ -2804,6 +3036,18 @@ Planning continuation: turn {} of {}.",
                     submission.plan_id == plan.id,
                     "submitted plan id does not match active plan"
                 );
+                let mut validated_document = self
+                    .plan_file
+                    .read_working_document(&self.session.id, &plan.id)?;
+                anyhow::ensure!(
+                    validated_document.version == submission.expected_version,
+                    "plan version changed before Rust API validation"
+                );
+                let validation_warning =
+                    match validate_plan_rust_api(&self.rustdoc, &mut validated_document).await {
+                        Ok(report) => report.warning,
+                        Err(error) => error.violation,
+                    };
                 let previous_markdown = if plan.model_revision == 0 {
                     String::new()
                 } else {
@@ -2823,16 +3067,19 @@ Planning continuation: turn {} of {}.",
                     PlanLifecycleKind::RevisionCreated
                 };
                 plan.model_revision += 1;
-                let (document, rendered, digest) = self.plan_file.submit_document_revision(
-                    &self.session.id,
-                    &plan.id,
-                    plan.model_revision,
-                    submission.expected_version,
-                )?;
+                let (document, rendered, digest) =
+                    self.plan_file.submit_validated_document_revision(
+                        &self.session.id,
+                        &plan.id,
+                        plan.model_revision,
+                        submission.expected_version,
+                        validated_document,
+                    )?;
                 plan.document_version = document.version;
                 plan.submitted_version = Some(document.version);
                 plan.title = document.title.clone();
                 plan.review_digest = Some(digest);
+                plan.validation_warning = validation_warning;
                 PlanStateMachine::apply(&mut plan, PlanEvent::PlanSubmitted, self.clock.now_ms())?;
                 self.store.save_plan(&plan)?;
                 self.record_plan_trace("plan_submitted", plan_trace_fields(&plan));
@@ -3045,6 +3292,54 @@ Planning continuation: turn {} of {}.",
             json!({ "interaction": interaction, "session": self.session, "capability": self.capability }),
             event,
         ))
+    }
+
+    async fn finalize_interaction_after_processing_failure(&mut self) -> Result<()> {
+        let Some(mut runtime) = self.interaction_runtime.take() else {
+            return Ok(());
+        };
+        let mut interaction = self
+            .store
+            .list_interaction(&self.session.id)?
+            .into_iter()
+            .find(|interaction| interaction.id == runtime.interaction_id)
+            .context("failed interaction runtime has no durable interaction")?;
+        if interaction.state != InteractionState::Running {
+            return Ok(());
+        }
+
+        let now_ms = self.clock.now_ms();
+        let mut event = Vec::new();
+        let (final_thought, response) = runtime.timeline.finish_turn(now_ms, false);
+        if let Some(thought) = final_thought {
+            self.complete_thought(&mut runtime, &mut interaction, thought, &mut event)?;
+        }
+        if let Some(response) = response {
+            interaction.ensure_running_segment(now_ms).response = Some(response);
+        }
+        interaction.complete_running_segment(now_ms);
+        self.capture_final_checkpoint(&mut interaction)?;
+        interaction.state = InteractionState::Failed;
+        interaction.completed_at_ms = Some(now_ms);
+        interaction.duration_ms = now_ms.saturating_sub(interaction.created_at_ms) as u64;
+        self.store.save_interaction(&interaction)?;
+        self.pause_goal_after_turn_failure().await?;
+        self.save_session()?;
+        self.working_started_at_ms = None;
+        self.active_wait_projection = None;
+        self.emit_live_interaction(
+            BackendEvent {
+                kind: "timeline_interaction_failed".into(),
+                text: None,
+                data: serde_json::to_value(&interaction)?,
+                activity: None,
+                summary: None,
+                task_update: None,
+            },
+            &interaction,
+            &mut event,
+        )?;
+        Ok(())
     }
 
     fn start_interaction_runtime(
@@ -5699,6 +5994,47 @@ mod test {
         }
     }
 
+    struct InvalidControlOutputBackend;
+
+    #[async_trait::async_trait]
+    impl Backend for InvalidControlOutputBackend {
+        async fn prompt_stream(
+            &self,
+            _request: BackendRequest,
+            event_sink: Option<BackendEventSink>,
+        ) -> Result<crate::backend::BackendOutput> {
+            if let Some(event_sink) = event_sink {
+                let _ = event_sink.send(BackendEvent {
+                    kind: "assistant_message".into(),
+                    text: Some("Validated the corrected plan.".into()),
+                    data: Value::Null,
+                    activity: None,
+                    summary: None,
+                    task_update: None,
+                });
+            }
+            Ok(crate::backend::BackendOutput {
+                plan_read: Some("rejected-plan".into()),
+                ..crate::backend::BackendOutput::default()
+            })
+        }
+
+        async fn fork(
+            &self,
+            _request: BackendForkRequest,
+        ) -> Result<crate::backend::BackendForkResult> {
+            anyhow::bail!("fork unavailable")
+        }
+    }
+
+    struct AdvancingClock(std::sync::atomic::AtomicI64);
+
+    impl Clock for AdvancingClock {
+        fn now_ms(&self) -> i64 {
+            self.0.fetch_add(10, std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
     struct ParentBoundaryBackend;
 
     #[async_trait::async_trait]
@@ -5808,8 +6144,9 @@ mod test {
             mutation.entity_changes = Some(crate::plan::CollectionMutation {
                 add: vec![crate::plan::ProgramEntityChange {
                     entity_id: "migrate".into(),
-                    action: crate::plan::ChangeAction::Modify,
+                    action: crate::plan::EntityChangeAction::Modify,
                     kind: crate::plan::EntityKind::Function,
+                    renamed_from: None,
                     name: "migrate".into(),
                     description: "Apply the selected strategy.".into(),
                     path: "src/migration.rs".into(),
@@ -5840,14 +6177,16 @@ mod test {
                                 },
                             },
                             target: crate::plan::EntityReference::ExternalEntity {
-                                entity_kind: crate::plan::ExternalEntityKind::Type,
+                                entity_kind: crate::plan::ReferencedEntityKind::Type,
                                 name: "MigrationStore".into(),
                                 dependency: None,
                             },
+                            expansion: Vec::new(),
                             result: Some(crate::plan::PlanFlowValue::Text {
                                 text: "updated persisted state".into(),
                             }),
                         }],
+                        branches: Vec::new(),
                     }],
                 }],
                 ..Default::default()
@@ -7930,6 +8269,42 @@ mod test {
     }
 
     #[tokio::test]
+    async fn postprocessing_failure_finalizes_the_interaction_timeline() {
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        broker.backend = Arc::new(InvalidControlOutputBackend);
+        broker.clock = Box::new(AdvancingClock(std::sync::atomic::AtomicI64::new(100)));
+
+        let result = broker
+            .dispatch(BrokerRequest {
+                id: 1,
+                method: "prompt.submit".into(),
+                params: json!({ "text": "/plan migrate the event format" }),
+            })
+            .await;
+
+        assert!(result.response.error.is_some());
+        let interaction = broker
+            .store
+            .list_interaction(&broker.session.id)
+            .unwrap()
+            .into_iter()
+            .last()
+            .expect("failed planning interaction");
+        assert_eq!(interaction.state, InteractionState::Failed);
+        assert!(interaction.completed_at_ms.is_some());
+        assert!(interaction.duration_ms > 0);
+        assert!(interaction.node_list.iter().all(|node| {
+            !matches!(
+                node,
+                InteractionNode::MainSegment { segment }
+                    if segment.state == crate::interaction::SegmentState::Running
+            )
+        }));
+    }
+
+    #[tokio::test]
     async fn retries_an_unstructured_planning_response_until_submission() {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
@@ -7986,7 +8361,7 @@ mod test {
             .plan_file
             .read_working_document(&broker.session.id, &plan.id)
             .unwrap();
-        document.entity_changes[0].action = crate::plan::ChangeAction::Add;
+        document.entity_changes[0].action = crate::plan::EntityChangeAction::Add;
         document.overview = "migrate coordinates the migration.".into();
         broker
             .plan_file

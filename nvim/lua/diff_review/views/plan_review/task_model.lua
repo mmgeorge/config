@@ -17,11 +17,15 @@ local uml_style = require("diff_review.views.plan_review.uml_style")
 local PlanTaskModel = {}
 PlanTaskModel.__index = PlanTaskModel
 
----@class DiffReviewPlanEntity
----@field entity_id string
----@field action "add"|"modify"|"remove"
+---@class DiffReviewPlanDescribedItem
 ---@field name string
 ---@field description string
+
+---@class DiffReviewPlanEntity: DiffReviewPlanDescribedItem
+---@field entity_id string
+---@field action "add"|"modify"|"remove"
+---@field members DiffReviewPlanDescribedItem[]
+---@field variants DiffReviewPlanDescribedItem[]
 
 local entity_kind_label = {
   abstract_class = "abstract class",
@@ -124,6 +128,25 @@ local function has_entity_boundaries(line, first_byte, last_byte, name)
   return true
 end
 
+---@param line string
+---@param byte_col integer Zero-based byte column.
+---@param name string?
+---@return boolean
+local function occupies_identifier(line, byte_col, name)
+  if type(name) ~= "string" or name == "" then return false end
+  local cursor_byte = byte_col + 1
+  local search_byte = 1
+  while true do
+    local first_byte, last_byte = line:find(name, search_byte, true)
+    if not first_byte then return false end
+    if cursor_byte >= first_byte and cursor_byte <= last_byte
+        and has_entity_boundaries(line, first_byte, last_byte, name) then
+      return true
+    end
+    search_byte = first_byte + 1
+  end
+end
+
 ---@param document table
 ---@param line string
 ---@param byte_col integer Zero-based byte column.
@@ -150,6 +173,105 @@ function M.entity_at_position(document, line, byte_col)
   return selected_entity
 end
 
+---@param path string
+---@param include_leaf boolean
+---@return string[]
+local function directory_fold_id_list(path, include_leaf)
+  local part_list = vim.split(path:gsub("\\", "/"), "/", { plain = true, trimempty = true })
+  local limit = include_leaf and #part_list or math.max(0, #part_list - 1)
+  local result = {}
+  local current = ""
+  for index = 1, limit do
+    current = current == "" and part_list[index] or (current .. "/" .. part_list[index])
+    result[#result + 1] = "file-directory:" .. current
+  end
+  return result
+end
+
+---@param model DiffReviewPlanTaskModel
+---@param entity_id string?
+---@return table?
+local function entity_by_id(model, entity_id)
+  return vim.iter(model.document.entity_changes or {}):find(function(entity)
+    return entity.entity_id == entity_id
+  end)
+end
+
+---@param model DiffReviewPlanTaskModel
+---@param subtask_id string?
+---@return table?
+local function test_by_id(model, subtask_id)
+  for _, task in ipairs(model.document.tasks or {}) do
+    for _, file in ipairs(task.files or {}) do
+      for _, subtask in ipairs(file.subtasks or {}) do
+        if subtask.subtask_id == subtask_id and subtask.operation == "test" then return subtask end
+      end
+    end
+  end
+  return nil
+end
+
+---@param model DiffReviewPlanTaskModel
+---@param text string
+---@param target table?
+---@return table[]
+local function file_tree_segments(model, text, target)
+  if not target then return { { text } } end
+  if target.target_type == "file_tree_file" then
+    local name = vim.fs.basename(tostring(target.path or ""))
+    if text:find("(new)", 1, true) then
+      return task_tree_style.change("(new)", "", name, nil, "DiffReviewWalkthroughItemTitle")(text, 1)
+    elseif text:find("(remove)", 1, true) then
+      return task_tree_style.change("(remove)", "", name, nil, "DiffReviewWalkthroughItemTitle")(text, 1)
+    end
+    local renamed_from = text:match("([^%s]+)%s+→%s+" .. vim.pesc(name))
+    if renamed_from then
+      return task_tree_style.rename(renamed_from, name, "DiffReviewWalkthroughItemTitle")(text, 1)
+    end
+    return task_tree_style.change("", "", name, nil, "DiffReviewWalkthroughItemTitle")(text, 1)
+  elseif target.target_type == "file_tree_entity" then
+    local entity = entity_by_id(model, target.entity_id)
+    if not entity then return { { text } } end
+    if entity.action == "rename" then
+      return task_tree_style.rename(tostring(entity.renamed_from or ""), tostring(entity.name or ""))(text, 1)
+    end
+    local action = entity.action == "add" and "(new)"
+        or entity.action == "remove" and "(remove)"
+        or ""
+    local kind = entity_kind_label[entity.kind] or tostring(entity.kind or "entity")
+    return task_tree_style.change(action, kind, tostring(entity.name or ""))(text, 1)
+  elseif target.target_type == "file_tree_test" then
+    local test = test_by_id(model, target.subtask_id)
+    if not test then return { { text } } end
+    local action = test.action == "add" and "(new)"
+        or test.action == "remove" and "(remove)"
+        or ""
+    local kind = title_case(test.category) .. "Test"
+    return task_tree_style.change(action, kind, tostring(test.name or ""), "@type", "@function")(text, 1)
+  end
+  return { { text } }
+end
+
+---@param target table?
+---@return string?, string[], boolean, string?
+local function file_tree_fold_metadata(target)
+  if not target or type(target.path) ~= "string" then return nil, {}, false, nil end
+  if target.target_type == "file_directory" then
+    local id_list = directory_fold_id_list(target.path, true)
+    local fold_id = table.remove(id_list)
+    return fold_id, id_list, false, nil
+  elseif target.target_type == "file_tree_file" then
+    local fold_id = "file-entry:" .. target.path
+    return fold_id, directory_fold_id_list(target.path, false), true, nil
+  elseif target.target_type == "file_tree_entity" or target.target_type == "file_tree_test" then
+    local fold_target_id = "file-entry:" .. target.path
+    local ancestor_ids = directory_fold_id_list(target.path, false)
+    ancestor_ids[#ancestor_ids + 1] = fold_target_id
+    return nil, ancestor_ids, false, fold_target_id
+  end
+  return nil, {}, false, nil
+end
+
 ---@param model DiffReviewPlanTaskModel
 ---@param source_line integer
 ---@param width integer?
@@ -159,17 +281,23 @@ local function source_row(model, source_line, width)
   local target = anchor and anchor.target or nil
   local text = uml_style.align_owner(model.source_lines[source_line] or "", target, width)
   local segments = uml_style.segments(text, target)
-  if target and target.target_type == "dependency_manifest" then
+  if target and type(target.target_type) == "string" and target.target_type:match("^file_") then
+    segments = file_tree_segments(model, text, target)
+  elseif target and target.target_type == "dependency_manifest" then
     segments = task_tree_style.file(tostring(target.manifest or ""))(text, 1)
   elseif source_line >= model.test_heading_line then
     local test_path = text:match("^file%s+(.+)$")
     if test_path then segments = task_tree_style.file(test_path)(text, 1) end
   end
+  local fold_id, ancestor_ids, default_folded, fold_target_id = file_tree_fold_metadata(target)
   return {
     id = ("plan:source:%d"):format(source_line),
     text = text,
     source_line = source_line,
-    ancestor_ids = {},
+    fold_id = fold_id,
+    fold_target_id = fold_target_id,
+    default_folded = default_folded,
+    ancestor_ids = ancestor_ids,
     segments = segments,
   }
 end
@@ -205,10 +333,14 @@ local function entity_node_fields(entity, entity_name_set)
   local action = title_case(entity.action)
   local kind = entity_kind_label[entity.kind] or tostring(entity.kind or "entity")
   local name = tostring(entity.name or "")
+  local target = name
+  if entity.action == "rename" then
+    target = ("%s → %s"):format(tostring(entity.renamed_from or ""), name)
+  end
   return {
-    text = ("%s %s %s — %s"):format(action, kind, name, tostring(entity.description or "")),
+    text = ("%s %s %s — %s"):format(action, kind, target, tostring(entity.description or "")),
     segments_for_line = task_tree_style.entity_references(
-      task_tree_style.change(action, kind, name),
+      task_tree_style.change(action, kind, target),
       entity_name_set
     ),
   }
@@ -361,6 +493,139 @@ end
 ---@return DiffReviewPlanEntity?
 function PlanTaskModel:entity_at_position(line, byte_col)
   return M.entity_at_position(self.document, line, byte_col)
+end
+
+---@param item_list table[]?
+---@param identity_key string
+---@param identity string?
+---@return table?
+local function item_by_identity(item_list, identity_key, identity)
+  if type(identity) ~= "string" or identity == "" then return nil end
+  for _, item in ipairs(item_list or {}) do
+    if item[identity_key] == identity then return item end
+  end
+  return nil
+end
+
+---@param document table
+---@param anchor table?
+---@param line string
+---@param byte_col integer Zero-based byte column.
+---@return DiffReviewPlanDescribedItem?
+function M.described_item_at_position(document, anchor, line, byte_col)
+  local target = anchor and anchor.target or nil
+  if type(target) == "table" then
+    local entity = item_by_identity(
+      document.entity_changes,
+      "entity_id",
+      target.entity_id
+    )
+    local item = entity
+    if entity and target.target_type == "entity_member" then
+      item = item_by_identity(entity.members, "member_id", target.member_id)
+    elseif entity and target.target_type == "enum_variant" then
+      item = item_by_identity(entity.variants, "variant_id", target.variant_id)
+    elseif entity and target.target_type == "enum_variant_field" then
+      local variant = item_by_identity(entity.variants, "variant_id", target.variant_id)
+      item = variant and item_by_identity(variant.fields, "field_id", target.field_id) or nil
+    end
+    if item and occupies_identifier(line, byte_col, item.name) then return item end
+  end
+  return M.entity_at_position(document, line, byte_col)
+end
+
+---@param source_line integer
+---@param line string
+---@param byte_col integer Zero-based byte column.
+---@return DiffReviewPlanDescribedItem?
+function PlanTaskModel:described_item_at_position(source_line, line, byte_col)
+  return M.described_item_at_position(
+    self.document,
+    self:anchor_at_source_line(source_line),
+    line,
+    byte_col
+  )
+end
+
+---@param source_line integer
+---@return table?
+function PlanTaskModel:anchor_at_source_line(source_line)
+  return self.anchor_by_source_line[source_line]
+end
+
+---@param source_line integer
+---@param line string
+---@param byte_col integer Zero-based byte column.
+---@return table?
+function PlanTaskModel:rustdoc_target_at_position(source_line, line, byte_col)
+  local anchor = self:anchor_at_source_line(source_line)
+  local target = anchor and anchor.target or nil
+  if not target
+      or target.target_type ~= "flow_edge"
+      or target.reference_kind ~= "external_entity" then
+    return nil
+  end
+  local selection = nil
+  if occupies_identifier(line, byte_col, target.callable_name) then
+    selection = "callable"
+  elseif target.target_is_type and occupies_identifier(line, byte_col, target.target_name) then
+    selection = "receiver"
+  end
+  if not selection then return nil end
+  return {
+    flow_id = target.flow_id,
+    step_id = target.step_id,
+    edge_id = target.edge_id,
+    selection = selection,
+  }
+end
+
+---@class DiffReviewPlanWorkspaceTarget
+---@field name string
+---@field path string
+---@field line integer
+
+---@param source_line integer
+---@param line string
+---@param byte_col integer Zero-based byte column.
+---@return DiffReviewPlanWorkspaceTarget?
+function PlanTaskModel:workspace_target_at_position(source_line, line, byte_col)
+  local anchor = self:anchor_at_source_line(source_line)
+  local target = anchor and anchor.target or nil
+  if not target
+      or (target.target_type ~= "flow_step" and target.target_type ~= "flow_edge")
+      or target.reference_kind ~= "workspace_entity"
+      or type(target.workspace_path) ~= "string"
+      or type(target.workspace_line) ~= "number"
+      or not occupies_identifier(line, byte_col, target.target_name) then
+    return nil
+  end
+  return {
+    name = target.target_name,
+    path = target.workspace_path,
+    line = target.workspace_line,
+  }
+end
+
+---@param source_line integer
+---@param line string
+---@param byte_col integer Zero-based byte column.
+---@return table?
+function PlanTaskModel:dependency_at_position(source_line, line, byte_col)
+  local anchor = self:anchor_at_source_line(source_line)
+  local target = anchor and anchor.target or nil
+  if not target or target.target_type ~= "dependency" then return nil end
+  local dependency = vim.iter(self.document.dependencies or {}):find(function(candidate)
+    return candidate.dependency_id == target.dependency_id
+  end)
+  if not dependency or type(dependency.name) ~= "string" then return nil end
+  local first_byte, last_byte = line:find(dependency.name, 1, true)
+  local cursor_byte = byte_col + 1
+  if first_byte and cursor_byte >= first_byte and cursor_byte <= last_byte
+      and has_entity_boundaries(line, first_byte, last_byte, dependency.name) then
+    return dependency
+  end
+  return nil
 end
 
 ---@param entity DiffReviewPlanEntity

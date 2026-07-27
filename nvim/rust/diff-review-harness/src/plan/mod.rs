@@ -37,8 +37,8 @@ pub use edit::{
 pub use graph::{PlanGraph, ResolvedPlanEntity};
 pub use prompt::{PlanExecutionPromptKind, PlanPrompt, execution_prompt};
 pub use render::{
-    PlanNavigationAnchor, PlanNavigationIndex, PlanReviewTarget, PlanSection, RenderedPlan,
-    render_plan, render_plan_at, render_plan_delta,
+    PlanNavigationAnchor, PlanNavigationIndex, PlanReviewReferenceKind, PlanReviewTarget,
+    PlanSection, RenderedPlan, render_plan, render_plan_at, render_plan_delta,
 };
 pub use resolution::{
     PlanResolutionKind, PlanResolutionRecord, PlanTaskSummary, PlanTestSummary,
@@ -49,7 +49,7 @@ pub use scheduler::{
 };
 pub use validation::{
     PlanValidationError, PlanValidationPhase, PlanViolation, validate_plan_edit,
-    validate_plan_render, validate_plan_submission,
+    validate_plan_render, validate_plan_submission, validate_workspace_references,
 };
 
 /// Represents the review lifecycle of one model-authored plan.
@@ -94,6 +94,8 @@ pub struct PlanRecord {
     pub question_ledger: PlanQuestionLedger,
     #[serde(default)]
     pub generation: PlanGeneration,
+    #[serde(default)]
+    pub validation_warning: Vec<PlanViolation>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
 }
@@ -885,6 +887,49 @@ impl PlanFileStore {
         Ok((document, rendered, checksum))
     }
 
+    /// Freeze one externally validated document without re-reading stale derived state.
+    pub fn submit_validated_document_revision(
+        &self,
+        session_id: &str,
+        plan_id: &str,
+        revision: u32,
+        expected_version: u64,
+        document: PlanDocument,
+    ) -> Result<(PlanDocument, RenderedPlan, String)> {
+        let current = self.read_working_document(session_id, plan_id)?;
+        anyhow::ensure!(
+            current.version == expected_version,
+            "plan version changed before validated submission"
+        );
+        anyhow::ensure!(
+            document.plan_id == plan_id && document.version == expected_version,
+            "validated document identity changed before submission"
+        );
+        document.validate_for_submission()?;
+        self.write_working_document(session_id, plan_id, &document)?;
+        let rendered = render_plan_at(&document, &self.workspace)?;
+        let plan_directory = self.plan_dir(session_id, plan_id);
+        let revision_directory = plan_directory.join("revisions");
+        fs::create_dir_all(&revision_directory)?;
+        write_text_atomically(&plan_directory.join("working.md"), &rendered.markdown)?;
+        write_json_atomically(
+            &plan_directory.join("working.index.json"),
+            &rendered.navigation,
+        )?;
+        let stem = format!("submitted-{revision:04}");
+        write_json_atomically(&revision_directory.join(format!("{stem}.json")), &document)?;
+        write_text_atomically(
+            &revision_directory.join(format!("{stem}.md")),
+            &rendered.markdown,
+        )?;
+        write_json_atomically(
+            &revision_directory.join(format!("{stem}.index.json")),
+            &rendered.navigation,
+        )?;
+        let checksum = digest(serde_json::to_vec(&document)?.as_slice());
+        Ok((document, rendered, checksum))
+    }
+
     /// Read one submitted canonical revision for acceptance or timeline expansion.
     pub fn read_submitted_document(
         &self,
@@ -1101,8 +1146,9 @@ mod test {
                         entity_changes: Some(CollectionMutation {
                             add: vec![ProgramEntityChange {
                                 entity_id: "inspection_service".into(),
-                                action: ChangeAction::Add,
+                                action: EntityChangeAction::Add,
                                 kind: EntityKind::Struct,
+                                renamed_from: None,
                                 name: "InspectionService".into(),
                                 description: "Own inspection.".into(),
                                 path: "src/inspection.rs".into(),
@@ -1142,6 +1188,7 @@ mod test {
                                 entity_id: "InspectionService".into(),
                                 action: None,
                                 kind: None,
+                                renamed_from: PatchField::Missing,
                                 name: None,
                                 description: None,
                                 path: None,

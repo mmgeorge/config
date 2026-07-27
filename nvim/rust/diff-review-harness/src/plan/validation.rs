@@ -3,11 +3,12 @@ use std::fmt;
 use std::path::{Component, Path};
 
 use anyhow::{Result, anyhow};
+use serde::{Deserialize, Serialize};
 
 use super::{
-    ChangeAction, EntityKind, EntityReference, ExternalEntityKind, PROVISIONAL_PLAN_TITLE,
-    PlanCallable, PlanDocument, PlanFlowRelation, PlanFlowValue, PlanGraph, PlanSubtask,
-    ProgramEntityChange,
+    ChangeAction, EntityChangeAction, EntityKind, EntityReference, PROVISIONAL_PLAN_TITLE,
+    PlanCallable, PlanDocument, PlanFlowEdge, PlanFlowRelation, PlanFlowStep, PlanFlowValue,
+    PlanGraph, PlanSubtask, ProgramEntityChange, ReferencedEntityKind,
 };
 
 /// Defines the validation boundary that rejected one canonical plan.
@@ -19,7 +20,7 @@ pub enum PlanValidationPhase {
 }
 
 /// Represents one actionable violation in a canonical plan.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PlanViolation {
     pub path: String,
     pub message: String,
@@ -72,6 +73,80 @@ pub fn validate_plan_render(document: &PlanDocument) -> Result<()> {
     validator.finish()
 }
 
+/// Validate source anchors for unchanged repository constructs at submission time.
+pub fn validate_workspace_references(document: &PlanDocument, workspace_root: &Path) -> Result<()> {
+    let mut violation = Vec::new();
+    let mut validate = |json_path: String, reference: &EntityReference| {
+        let EntityReference::WorkspaceEntity {
+            name, path, line, ..
+        } = reference
+        else {
+            return;
+        };
+        let source_path = workspace_root.join(path);
+        let source = match std::fs::read_to_string(&source_path) {
+            Ok(source) => source,
+            Err(error) => {
+                violation.push(PlanViolation {
+                    path: format!("{json_path}.path"),
+                    message: format!("could not read workspace source `{path}`: {error}"),
+                });
+                return;
+            }
+        };
+        let Some(source_line) = source.lines().nth(line.saturating_sub(1)) else {
+            violation.push(PlanViolation {
+                path: format!("{json_path}.line"),
+                message: format!(
+                    "line {line} is outside workspace source `{path}` with {} line(s)",
+                    source.lines().count()
+                ),
+            });
+            return;
+        };
+        if !source_line.contains(name) {
+            violation.push(PlanViolation {
+                path: format!("{json_path}.line"),
+                message: format!("line {line} in `{path}` does not contain entity name `{name}`"),
+            });
+        }
+    };
+    for (entity_index, entity) in document.entity_changes.iter().enumerate() {
+        if let Some(reference) = &entity.extends {
+            validate(format!("entity_changes.{entity_index}.extends"), reference);
+        }
+        for (reference_index, reference) in entity.conforms_to.iter().enumerate() {
+            validate(
+                format!("entity_changes.{entity_index}.conforms_to.{reference_index}"),
+                reference,
+            );
+        }
+    }
+    for (flow_index, flow) in document.flows.iter().enumerate() {
+        for (step_index, step) in flow.steps.iter().enumerate() {
+            validate(
+                format!("flows.{flow_index}.steps.{step_index}.target"),
+                &step.target,
+            );
+            for (edge_index, edge) in step.edges.iter().enumerate() {
+                validate(
+                    format!("flows.{flow_index}.steps.{step_index}.edges.{edge_index}.target"),
+                    &edge.target,
+                );
+            }
+        }
+    }
+    if violation.is_empty() {
+        Ok(())
+    } else {
+        Err(PlanValidationError {
+            phase: PlanValidationPhase::Submission,
+            violation,
+        }
+        .into())
+    }
+}
+
 struct PlanValidator<'a> {
     document: &'a PlanDocument,
     graph: PlanGraph<'a>,
@@ -120,6 +195,26 @@ impl<'a> PlanValidator<'a> {
             let path = format!("entity_changes.{}", entity.entity_id);
             self.semantic_id(&format!("{path}.entity_id"), &entity.entity_id);
             self.required(&format!("{path}.name"), &entity.name);
+            match (&entity.action, &entity.renamed_from) {
+                (EntityChangeAction::Rename, Some(renamed_from)) => {
+                    self.required(&format!("{path}.renamed_from"), renamed_from);
+                    if renamed_from == &entity.name {
+                        self.push(
+                            &format!("{path}.renamed_from"),
+                            "must differ from the renamed entity name",
+                        );
+                    }
+                }
+                (EntityChangeAction::Rename, None) => self.push(
+                    &format!("{path}.renamed_from"),
+                    "is required when action is rename",
+                ),
+                (_, Some(_)) => self.push(
+                    &format!("{path}.renamed_from"),
+                    "is valid only when action is rename",
+                ),
+                (_, None) => {}
+            }
             self.required(&format!("{path}.description"), &entity.description);
             self.repository_path(&format!("{path}.path"), &entity.path);
             self.unique_id(
@@ -218,13 +313,14 @@ impl<'a> PlanValidator<'a> {
 
     fn validate_entity_action_tree(&mut self, entity: &ProgramEntityChange, path: &str) {
         for member in &entity.members {
-            if entity.action == ChangeAction::Add && member.action != ChangeAction::Add {
+            if entity.action == EntityChangeAction::Add && member.action != ChangeAction::Add {
                 self.push(
                     &format!("{path}.members.{}.action", member.member_id),
                     "an added entity can contain only added members",
                 );
             }
-            if entity.action == ChangeAction::Remove && member.action != ChangeAction::Remove {
+            if entity.action == EntityChangeAction::Remove && member.action != ChangeAction::Remove
+            {
                 self.push(
                     &format!("{path}.members.{}.action", member.member_id),
                     "a removed entity can contain only removed members",
@@ -232,13 +328,14 @@ impl<'a> PlanValidator<'a> {
             }
         }
         for variant in &entity.variants {
-            if entity.action == ChangeAction::Add && variant.action != ChangeAction::Add {
+            if entity.action == EntityChangeAction::Add && variant.action != ChangeAction::Add {
                 self.push(
                     &format!("{path}.variants.{}.action", variant.variant_id),
                     "an added enum can contain only added variants",
                 );
             }
-            if entity.action == ChangeAction::Remove && variant.action != ChangeAction::Remove {
+            if entity.action == EntityChangeAction::Remove && variant.action != ChangeAction::Remove
+            {
                 self.push(
                     &format!("{path}.variants.{}.action", variant.variant_id),
                     "a removed enum can contain only removed variants",
@@ -288,45 +385,94 @@ impl<'a> PlanValidator<'a> {
                 flow.steps.iter().map(|step| step.step_id.as_str()),
             );
             for step in &flow.steps {
-                let step_path = format!("{path}.steps.{}", step.step_id);
-                self.semantic_id(&format!("{step_path}.step_id"), &step.step_id);
-                self.required(&format!("{step_path}.action"), &step.action);
-                self.validate_reference(&format!("{step_path}.target"), &step.target);
-                self.unique_id(
-                    &format!("{step_path}.edges"),
-                    step.edges.iter().map(|edge| edge.edge_id.as_str()),
+                self.validate_flow_step(step, &format!("{path}.steps.{}", step.step_id));
+            }
+        }
+    }
+
+    fn validate_flow_step(&mut self, step: &PlanFlowStep, step_path: &str) {
+        self.semantic_id(&format!("{step_path}.step_id"), &step.step_id);
+        self.required(&format!("{step_path}.action"), &step.action);
+        self.validate_reference(&format!("{step_path}.target"), &step.target);
+        if step.edges.is_empty() && step.branches.is_empty() {
+            self.push(step_path, "must contain at least one edge or branch");
+        }
+        self.unique_id(
+            &format!("{step_path}.edges"),
+            step.edges.iter().map(|edge| edge.edge_id.as_str()),
+        );
+        for edge in &step.edges {
+            self.validate_flow_edge(edge, &format!("{step_path}.edges.{}", edge.edge_id));
+        }
+        self.unique_id(
+            &format!("{step_path}.branches"),
+            step.branches.iter().map(|branch| branch.branch_id.as_str()),
+        );
+        let mut condition_set = HashSet::new();
+        for branch in &step.branches {
+            let branch_path = format!("{step_path}.branches.{}", branch.branch_id);
+            self.semantic_id(&format!("{branch_path}.branch_id"), &branch.branch_id);
+            self.required(&format!("{branch_path}.condition"), &branch.condition);
+            if !condition_set.insert(branch.condition.as_str()) {
+                self.push(
+                    &format!("{branch_path}.condition"),
+                    &format!("duplicates branch condition {}", branch.condition),
                 );
-                for edge in &step.edges {
-                    let edge_path = format!("{step_path}.edges.{}", edge.edge_id);
-                    self.semantic_id(&format!("{edge_path}.edge_id"), &edge.edge_id);
-                    self.validate_reference(&format!("{edge_path}.target"), &edge.target);
-                    match &edge.relation {
-                        PlanFlowRelation::Call { callable }
-                        | PlanFlowRelation::Read { callable }
-                        | PlanFlowRelation::Write { callable } => {
-                            self.callable(&format!("{edge_path}.relation.callable"), callable);
-                            self.validate_type_reference(
-                                &format!("{edge_path}.target"),
-                                &edge.target,
-                            );
-                        }
-                        PlanFlowRelation::Send { event } => {
-                            self.required(&format!("{edge_path}.relation.event"), event);
-                        }
-                        PlanFlowRelation::Construct => self
-                            .validate_type_reference(&format!("{edge_path}.target"), &edge.target),
-                        PlanFlowRelation::Emit | PlanFlowRelation::Return => {}
-                    }
-                    if let Some(result) = &edge.result {
-                        match result {
-                            PlanFlowValue::Type { name } => {
-                                self.required(&format!("{edge_path}.result.name"), name);
-                            }
-                            PlanFlowValue::Text { text } => {
-                                self.required(&format!("{edge_path}.result.text"), text);
-                            }
-                        }
-                    }
+            }
+            if branch.steps.is_empty() {
+                self.push(
+                    &format!("{branch_path}.steps"),
+                    "must contain at least one step",
+                );
+            }
+            self.unique_id(
+                &format!("{branch_path}.steps"),
+                branch.steps.iter().map(|step| step.step_id.as_str()),
+            );
+            for nested_step in &branch.steps {
+                self.validate_flow_step(
+                    nested_step,
+                    &format!("{branch_path}.steps.{}", nested_step.step_id),
+                );
+            }
+        }
+    }
+
+    fn validate_flow_edge(&mut self, edge: &PlanFlowEdge, edge_path: &str) {
+        self.semantic_id(&format!("{edge_path}.edge_id"), &edge.edge_id);
+        self.validate_reference(&format!("{edge_path}.target"), &edge.target);
+        match &edge.relation {
+            PlanFlowRelation::Call { callable }
+            | PlanFlowRelation::Read { callable }
+            | PlanFlowRelation::Write { callable } => {
+                self.callable(&format!("{edge_path}.relation.callable"), callable);
+                self.validate_type_reference(&format!("{edge_path}.target"), &edge.target);
+            }
+            PlanFlowRelation::Send { event } => {
+                self.required(&format!("{edge_path}.relation.event"), event);
+            }
+            PlanFlowRelation::Construct => {
+                self.validate_type_reference(&format!("{edge_path}.target"), &edge.target);
+            }
+            PlanFlowRelation::Emit | PlanFlowRelation::Return => {}
+        }
+        self.unique_id(
+            &format!("{edge_path}.expansion"),
+            edge.expansion.iter().map(|step| step.step_id.as_str()),
+        );
+        for nested_step in &edge.expansion {
+            self.validate_flow_step(
+                nested_step,
+                &format!("{edge_path}.expansion.{}", nested_step.step_id),
+            );
+        }
+        if let Some(result) = &edge.result {
+            match result {
+                PlanFlowValue::Type { name } => {
+                    self.required(&format!("{edge_path}.result.name"), name);
+                }
+                PlanFlowValue::Text { text } => {
+                    self.required(&format!("{edge_path}.result.text"), text);
                 }
             }
         }
@@ -405,7 +551,7 @@ impl<'a> PlanValidator<'a> {
                                     );
                                 }
                                 if file.change.entity_action() == ChangeAction::Add
-                                    && entity.action != ChangeAction::Add
+                                    && entity.action != EntityChangeAction::Add
                                 {
                                     self.push(
                                         &format!("{file_path}.action"),
@@ -413,7 +559,7 @@ impl<'a> PlanValidator<'a> {
                                     );
                                 }
                                 if file.change.entity_action() == ChangeAction::Remove
-                                    && entity.action != ChangeAction::Remove
+                                    && entity.action != EntityChangeAction::Remove
                                 {
                                     self.push(
                                         &format!("{file_path}.action"),
@@ -616,6 +762,29 @@ impl<'a> PlanValidator<'a> {
                     );
                 }
             }
+            EntityReference::WorkspaceEntity {
+                name,
+                path: source_path,
+                line,
+                ..
+            } => {
+                self.required(&format!("{path}.name"), name);
+                self.repository_path(&format!("{path}.path"), source_path);
+                if *line == 0 {
+                    self.push(&format!("{path}.line"), "must be greater than zero");
+                }
+                if self
+                    .document
+                    .entity_changes
+                    .iter()
+                    .any(|entity| entity.name == *name && entity.path == *source_path)
+                {
+                    self.push(
+                        path,
+                        "must use planned_entity for a construct changed by this plan",
+                    );
+                }
+            }
             EntityReference::ExternalEntity {
                 name, dependency, ..
             } => {
@@ -634,8 +803,9 @@ impl<'a> PlanValidator<'a> {
                 .graph
                 .entity(entity)
                 .is_some_and(|entity| entity_kind_is_type(entity.kind)),
-            EntityReference::ExternalEntity { entity_kind, .. } => {
-                *entity_kind == ExternalEntityKind::Type
+            EntityReference::WorkspaceEntity { entity_kind, .. }
+            | EntityReference::ExternalEntity { entity_kind, .. } => {
+                *entity_kind == ReferencedEntityKind::Type
             }
         };
         if !is_type {
@@ -686,21 +856,11 @@ impl<'a> PlanValidator<'a> {
         }
         for flow in &self.document.flows {
             entry_list.push((flow.flow_id.as_str(), format!("flows.{}", flow.flow_id)));
-            for step in &flow.steps {
-                entry_list.push((
-                    step.step_id.as_str(),
-                    format!("flows.{}.steps.{}", flow.flow_id, step.step_id),
-                ));
-                for edge in &step.edges {
-                    entry_list.push((
-                        edge.edge_id.as_str(),
-                        format!(
-                            "flows.{}.steps.{}.edges.{}",
-                            flow.flow_id, step.step_id, edge.edge_id
-                        ),
-                    ));
-                }
-            }
+            collect_flow_identity(
+                &flow.steps,
+                &format!("flows.{}.steps", flow.flow_id),
+                &mut entry_list,
+            );
         }
         for task in &self.document.tasks {
             entry_list.push((task.task_id.as_str(), format!("tasks.{}", task.task_id)));
@@ -804,6 +964,31 @@ impl<'a> PlanValidator<'a> {
     }
 }
 
+fn collect_flow_identity<'a>(
+    step_list: &'a [PlanFlowStep],
+    parent_path: &str,
+    entry_list: &mut Vec<(&'a str, String)>,
+) {
+    for step in step_list {
+        let step_path = format!("{parent_path}.{}", step.step_id);
+        entry_list.push((step.step_id.as_str(), step_path.clone()));
+        for edge in &step.edges {
+            let edge_path = format!("{step_path}.edges.{}", edge.edge_id);
+            entry_list.push((edge.edge_id.as_str(), edge_path.clone()));
+            collect_flow_identity(
+                &edge.expansion,
+                &format!("{edge_path}.expansion"),
+                entry_list,
+            );
+        }
+        for branch in &step.branches {
+            let branch_path = format!("{step_path}.branches.{}", branch.branch_id);
+            entry_list.push((branch.branch_id.as_str(), branch_path.clone()));
+            collect_flow_identity(&branch.steps, &format!("{branch_path}.steps"), entry_list);
+        }
+    }
+}
+
 fn description_starts_with_action(action: &str, description: &str) -> bool {
     let first_word = description
         .trim_start()
@@ -847,9 +1032,11 @@ fn sentence_count(value: &str) -> usize {
 #[cfg(test)]
 mod test {
     use super::super::{
-        EntityReference, ExternalEntityKind, PlanCallable, PlanCallableKind, PlanFileChange,
-        PlanFlowEdge, PlanFlowRelation, PlanFlowValue, attach_test_fixture, test_fixture,
+        EntityChangeAction, EntityReference, PlanCallable, PlanCallableKind, PlanFileChange,
+        PlanFlowEdge, PlanFlowRelation, PlanFlowStep, PlanFlowValue, ReferencedEntityKind,
+        attach_test_fixture, test_fixture,
     };
+    use super::validate_workspace_references;
 
     #[test]
     fn rejects_a_file_rename_without_distinct_paths() {
@@ -861,6 +1048,29 @@ mod test {
 
         let error = document.validate().unwrap_err().to_string();
         assert!(error.contains("rename source and destination must differ"));
+    }
+
+    #[test]
+    fn validates_entity_rename_identity() {
+        let mut document = test_fixture("plan", "Overview");
+        document.entity_changes[0].action = EntityChangeAction::Rename;
+        document.entity_changes[0].renamed_from = Some("LegacyPlanDocument".into());
+        document.tasks[0].files[0].change = PlanFileChange::Modify {
+            path: document.entity_changes[0].path.clone(),
+        };
+        assert!(document.validate().is_ok());
+
+        document.entity_changes[0].renamed_from = None;
+        let missing_error = document.validate().unwrap_err().to_string();
+        assert!(missing_error.contains("is required when action is rename"));
+
+        document.entity_changes[0].renamed_from = Some(document.entity_changes[0].name.clone());
+        let identical_error = document.validate().unwrap_err().to_string();
+        assert!(identical_error.contains("must differ from the renamed entity name"));
+
+        document.entity_changes[0].action = EntityChangeAction::Modify;
+        let unexpected_error = document.validate().unwrap_err().to_string();
+        assert!(unexpected_error.contains("is valid only when action is rename"));
     }
 
     #[test]
@@ -913,6 +1123,61 @@ mod test {
     }
 
     #[test]
+    fn workspace_entity_references_require_stable_unchanged_source_anchors() {
+        let mut document = test_fixture("plan", "Validate.");
+        document.flows[0].steps[0].target = EntityReference::WorkspaceEntity {
+            entity_kind: ReferencedEntityKind::Type,
+            name: document.entity_changes[0].name.clone(),
+            path: document.entity_changes[0].path.clone(),
+            line: 0,
+        };
+
+        let error = document.validate().unwrap_err().to_string();
+
+        assert!(error.contains("line: must be greater than zero"));
+        assert!(error.contains("must use planned_entity for a construct changed by this plan"));
+
+        document.flows[0].steps[0].target = EntityReference::WorkspaceEntity {
+            entity_kind: ReferencedEntityKind::Type,
+            name: "PlanValidator".into(),
+            path: "../validation.rs".into(),
+            line: 76,
+        };
+        let error = document.validate().unwrap_err().to_string();
+        assert!(error.contains("cannot escape the workspace"));
+    }
+
+    #[test]
+    fn workspace_entity_submission_validates_the_physical_declaration_line() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        std::fs::write(
+            temp.path().join("src").join("validation.rs"),
+            "pub struct PlanValidator;\n",
+        )
+        .unwrap();
+        let mut document = test_fixture("plan", "Validate.");
+        document.flows[0].steps[0].target = EntityReference::WorkspaceEntity {
+            entity_kind: ReferencedEntityKind::Type,
+            name: "PlanValidator".into(),
+            path: "src/validation.rs".into(),
+            line: 1,
+        };
+
+        validate_workspace_references(&document, temp.path()).unwrap();
+
+        let EntityReference::WorkspaceEntity { line, .. } = &mut document.flows[0].steps[0].target
+        else {
+            unreachable!()
+        };
+        *line = 2;
+        let error = validate_workspace_references(&document, temp.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("outside workspace source"));
+    }
+
+    #[test]
     fn structured_flow_values_require_nonempty_content() {
         let mut document = test_fixture("plan", "Build structured planning.");
         document.flows[0].steps[0].edges[0].result = Some(PlanFlowValue::Type { name: " ".into() });
@@ -937,6 +1202,57 @@ mod test {
     }
 
     #[test]
+    fn recursive_flows_validate_nested_work_and_distinct_branch_conditions() {
+        let mut document = test_fixture("plan", "Validate nested flows.");
+        let leaf = PlanFlowStep {
+            step_id: "emit_failure".into(),
+            action: "Emit failure".into(),
+            target: EntityReference::PlannedEntity {
+                entity: "plan_document".into(),
+            },
+            edges: vec![PlanFlowEdge {
+                edge_id: "emit_terminal".into(),
+                relation: PlanFlowRelation::Emit,
+                target: EntityReference::ExternalEntity {
+                    entity_kind: ReferencedEntityKind::Endpoint,
+                    name: "terminal".into(),
+                    dependency: None,
+                },
+                expansion: Vec::new(),
+                result: None,
+            }],
+            branches: Vec::new(),
+        };
+        document.flows[0].steps[0].edges[0].expansion = vec![PlanFlowStep {
+            step_id: "empty_nested_work".into(),
+            action: "Read metadata".into(),
+            target: EntityReference::PlannedEntity {
+                entity: "plan_document".into(),
+            },
+            edges: Vec::new(),
+            branches: Vec::new(),
+        }];
+        document.flows[0].steps[0].branches = vec![
+            crate::plan::PlanFlowBranch {
+                branch_id: "failure_one".into(),
+                condition: "failure".into(),
+                steps: vec![leaf.clone()],
+            },
+            crate::plan::PlanFlowBranch {
+                branch_id: "failure_two".into(),
+                condition: "failure".into(),
+                steps: vec![leaf],
+            },
+        ];
+
+        let error = document.validate().unwrap_err().to_string();
+
+        assert!(error.contains("empty_nested_work: must contain at least one edge or branch"));
+        assert!(error.contains("duplicates branch condition failure"));
+        assert!(error.contains("duplicates globally unique ID emit_failure"));
+    }
+
+    #[test]
     fn typed_flow_edges_require_unique_identity_valid_targets_and_results() {
         let mut document = test_fixture("plan", "Validate.");
         document.flows[0].steps[0].edges = vec![
@@ -951,6 +1267,7 @@ mod test {
                 target: EntityReference::PlannedEntity {
                     entity: "missing_entity".into(),
                 },
+                expansion: Vec::new(),
                 result: Some(PlanFlowValue::Text {
                     text: "schema text".into(),
                 }),
@@ -964,10 +1281,11 @@ mod test {
                     },
                 },
                 target: EntityReference::ExternalEntity {
-                    entity_kind: ExternalEntityKind::Type,
+                    entity_kind: ReferencedEntityKind::Type,
                     name: "SessionContext".into(),
                     dependency: Some("datafusion".into()),
                 },
+                expansion: Vec::new(),
                 result: Some(PlanFlowValue::Text { text: " ".into() }),
             },
         ];
@@ -991,10 +1309,11 @@ mod test {
                 },
             },
             target: EntityReference::ExternalEntity {
-                entity_kind: ExternalEntityKind::Endpoint,
+                entity_kind: ReferencedEntityKind::Endpoint,
                 name: "registered relation".into(),
                 dependency: Some(" ".into()),
             },
+            expansion: Vec::new(),
             result: Some(PlanFlowValue::Type {
                 name: "SchemaRef".into(),
             }),
@@ -1100,6 +1419,7 @@ mod test {
                 action: super::super::document::ChangeAction::Add,
                 name: "tokio".into(),
                 version: "1".into(),
+                resolved_version: None,
                 manifest: "Cargo.toml".into(),
                 license: Some("MIT".into()),
                 justification: "Run asynchronous work.".into(),
@@ -1122,6 +1442,7 @@ mod test {
                 action: super::super::document::ChangeAction::Add,
                 name: "tokio".into(),
                 version: "1".into(),
+                resolved_version: None,
                 manifest: "Cargo.toml".into(),
                 license: Some("MIT".into()),
                 justification: "Run asynchronous work.".into(),
@@ -1155,6 +1476,7 @@ mod test {
                 action: super::super::document::ChangeAction::Add,
                 name: "tokio".into(),
                 version: "1".into(),
+                resolved_version: None,
                 manifest: "src/plan.rs".into(),
                 license: Some("probably permissive".into()),
                 justification: "Run asynchronous work.".into(),

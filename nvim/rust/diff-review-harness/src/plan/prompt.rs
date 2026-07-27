@@ -31,11 +31,12 @@ Usage:
 Dependencies:
 - Write every dependency justification as exactly two sentences.
 - Use the first sentence to state the dependency's architectural role and the second to explain why the existing code or standard library cannot satisfy that role.
+- For Rust dependencies, write a valid Cargo version requirement. Harness resolves and preserves one exact published version when validating referenced APIs.
 
 Object model and ownership:
 - Establish ownership before describing flows. Model every relevant changed construct exactly once.
 - Represent traits, interfaces, and abstract base classes as contract entities. Represent structs, classes, enums, configs, resources, caches, adapters, applications, and other instantiable or value roles as concrete entities.
-- Set `action` to add, modify, or remove so the projection can mark new or modified declarations with `*` and removed declarations with `~`.
+- Set an entity `action` to add, modify, remove, or rename. A rename keeps the destination name in `name` and the existing source name in `renamed_from`. The projection marks added, modified, and renamed declarations with `*` and removed declarations with `~`.
 - Give every entity its complete declaration identity, semantic kind, repository-relative path, and architectural description.
 - The projection aligns repository-relative paths as bounded inline suffixes on entity declarations. Member and enum lines retain the full object-model column width, so do not shorten meaningful signatures merely to match the path alignment.
 - Nest fields, methods, functions, constants, and properties under their owning entity. Record visibility, type, parameters, and meaningful return type. Omit a meaningless void or unit return.
@@ -50,15 +51,18 @@ Object model and ownership:
 Flows:
 - Add one to three separate flows for the major affected runtime, data, request, event, persistence, recovery, or configuration paths.
 - Give every flow a natural title such as Capture, Sync, or Recovery and exactly two substantive description sentences. Use the first sentence to state the actual entry point and observable outcome. Use the second sentence to explain the ownership boundary, architectural risk, or independent review reason that makes this flow distinct. Do not merely repeat the title or enumerate steps already visible in the diagram.
-- Harness renders every flow as an adjacency graph with each acting step above its typed outgoing runtime edges. Only planned repository paths occupy the right column; external participants remain inline.
-- Give every step a concise action and the planned or external entity that performs it. Use the step's `edges` to state every material runtime relationship from that actor to another participant.
+- Harness renders every flow as a rooted execution tree. Top-level steps are independent roots, edge `expansion` steps execute inside that relationship before its result returns, and step `branches` represent labeled alternative continuations.
+- Give every step a concise action and the planned, workspace, or external entity that performs it. Use the step's `edges` for material runtime relationships and `branches` for mutually exclusive outcomes. Always send `edges`, `branches`, and each edge's `expansion` as complete arrays, including empty arrays.
+- Put work performed by a callee inside that edge's `expansion`. Put every branch condition in `condition` and its nonempty continuation in `steps`. Never infer nesting from adjacent top-level steps.
+- Planned and workspace repository paths occupy the aligned right column. External participants remain inline without repository paths.
 - Choose the exact edge relation: `construct` creates the target, `call` invokes a callable, `read` obtains data through a callable, `write` mutates or persists through a callable, `send` transfers its named request or event, `emit` produces an observable effect, and `return` sends a result back to the target.
 - Give every `call`, `read`, and `write` relation one structured `callable` with `kind: "function"` or `"method"` and its bare identifier in `name`. Never put parentheses, arguments, receiver names, or prose in the callable name.
-- Put exactly one type entity in the target of every `construct`, `call`, `read`, and `write` edge. A planned target resolves through `{"kind":"planned_entity","entity":"entity_id"}`. An external target uses `{"kind":"external_entity","entity_kind":"type","name":"TypeName","dependency":"package-name"}`; omit or null the dependency only when no package provenance applies.
+- Put exactly one type entity in the target of every `construct`, `call`, `read`, and `write` edge. A changed target resolves through `{"kind":"planned_entity","entity":"entity_id"}`. An unchanged repository target uses `{"kind":"workspace_entity","entity_kind":"type","name":"TypeName","path":"src/file.rs","line":42}` with a repository-relative path and one-indexed declaration line. An external target uses `{"kind":"external_entity","entity_kind":"type","name":"TypeName","dependency":"package-name"}`; omit or null the dependency only when no package provenance applies.
+- For a Rust callable, use the receiver type's owning Cargo package in `dependency` and the exact public Rust identifier in `callable.name`. Harness validates inherent methods, associated functions, and extension-trait methods against the plan's resolved dependency versions.
 - Use `entity_kind: "endpoint"` only for external actors or destinations such as terminals, workers, storage boundaries, or schedulers. `send`, `emit`, and `return` may target endpoint entities.
 - Put the value, event, result, or observable effect produced by each relationship in `result`. Use `{"kind":"type","name":"TypeName"}` for a named type and `{"kind":"text","text":"observable value"}` for other results. Inputs such as paths and files belong in the step action or callable context, never as a callable receiver.
 - For changed orchestration functions such as `main`, show concrete construction and invocation edges instead of jumping from input parsing directly to a downstream result. Reuse planned entity names and real member names so reviewers can see who constructs, calls, reads, writes, sends, emits, or returns each value.
-- Top-level step order controls reviewer presentation only. Runtime meaning comes from typed edges, never adjacency or array position.
+- Top-level step order controls reviewer presentation only. Runtime meaning comes from explicit edges, expansions, and branches, never adjacency or array position.
 - Reuse entity names from the object model. Keep independent flows separate.
 - Use compact action, result, value, and entity names so the vertical projection keeps its aligned owner column within 100 characters.
 
@@ -72,7 +76,7 @@ Tasks:
 - Treat each task file as a concrete source-file boundary. Use `action: "add"`, `"modify"`, or `"remove"` with one repository-relative `path`. Use `action: "rename"` with distinct repository-relative `from` and `to` paths. Renamed entities and subtasks belong to the destination path.
 - Treat each implementation subtask as a local design move. Use exactly one supported operation: expose, encapsulate, move, centralize, distribute, extract, inline, split, merge, compose, embed, create, destroy, register, unregister, attach, detach, start, stop, route, resolve, defer, configure, relax, enable, disable, reuse, generalize, or specialize.
 - Write each subtask description as the grammatical complement to its structured operation because renderers prepend the operation label. For `operation: "route"`, write `"the command path into GeoParquetInspector."`, not `"Route the command path into GeoParquetInspector."`.
-- Express every concrete construct edit through an entity or nested member with action add, modify, or remove and an accurate kind such as class, struct, enum, trait, interface, test, app, config, function, method, constant, field, Resource, Cache, or Adapter.
+- Express every concrete construct edit through an entity or nested member with an accurate kind such as class, struct, enum, trait, interface, test, app, config, function, method, constant, field, Resource, Cache, or Adapter. Top-level entities may use action add, modify, remove, or rename; rename requires `renamed_from` and the destination identifier in `name`. Nested members, variants, fields, dependencies, and tests remain add, modify, or remove.
 - Keep file boundaries, construct kinds, and target names distinct so the renderer can colorize and navigate them independently.
 - Include every function, type, configuration, application, test, and field that will be added, modified, or removed.
 - Attach every planned entity to exactly one implementation subtask. Order tasks by the object model and ownership relationships. Within a task, order changes in the sequence that makes the ownership change easiest to review.
@@ -98,7 +102,7 @@ Validation:
 - Ensure every major independent flow has its own description.
 - Ensure task claims, entity fields, flow values, dependencies, tests, and assumptions describe the same boundaries.
 - Revise any plan that violates the modularity rules, produces flow lines over 100 characters, or collapses failures and user-visible behavior into vague `handle`, `support`, `make`, or `update` wording."#;
-const EDIT_CONTRACT: &str = r#"Use harness_plan_edit as one resource-oriented mutation. Put additions under `add`, field patches under `modify`, and semantic names under `remove`. Every resource supports the same add, modify, and remove lifecycle. Nested resources use the same structure inside their owner. A complete task file uses its tagged `action` plus `path`, or `from` and `to` for a rename. A `files.modify` patch selects the current destination with `path` and replaces its tagged operation through `change` when needed. Use `members` for fields, methods, functions, constants, and properties. Use `variants` only on enum entities. Use `name` when adding an entity, member, variant, or dependency. Use `entity`, `member`, `variant`, or `dependency` when selecting an existing value, and the corresponding singular selector `field`, `flow`, `step`, `task`, or `subtask` for other modifications. Every `subtasks.modify` entry must include its `subtask` selector. A test-subtask modification must also retain `operation: "test"`. `entities` and flow-step `edges` are always complete replacement arrays, never add/modify/remove resource mutations. Implementation-subtask `entities` may contain only planned program entities. Never put package names there or create a synthetic config entity solely to group dependencies. A dependency-only manifest subtask may use an empty entity array because Harness derives dependency ownership from the manifest task file. Use `operation` for a subtask design move.
+const EDIT_CONTRACT: &str = r#"Use harness_plan_edit as one resource-oriented mutation. Put additions under `add`, field patches under `modify`, and semantic names under `remove`. Every resource supports the same add, modify, and remove lifecycle. Nested resources use the same structure inside their owner. A complete task file uses its tagged `action` plus `path`, or `from` and `to` for a rename. A `files.modify` patch selects the current destination with `path` and replaces its tagged operation through `change` when needed. Use `members` for fields, methods, functions, constants, and properties. Use `variants` only on enum entities. Use `name` when adding an entity, member, variant, or dependency. Use `entity`, `member`, `variant`, or `dependency` when selecting an existing value, and the corresponding singular selector `field`, `flow`, `step`, `task`, or `subtask` for other modifications. Every `subtasks.modify` entry must include its `subtask` selector. A test-subtask modification must also retain `operation: "test"`. `entities`, flow-step `edges`, flow-step `branches`, edge `expansion`, and branch `steps` are always complete replacement arrays, never add/modify/remove resource mutations. Implementation-subtask `entities` may contain only planned program entities. Never put package names there or create a synthetic config entity solely to group dependencies. A dependency-only manifest subtask may use an empty entity array because Harness derives dependency ownership from the manifest task file. Use `operation` for a subtask design move.
 
 Represent each concrete test as its own flat task-file subtask with `operation: "test"`, `action`, `name`, `category`, and `behavior` directly on that subtask. Never model a concrete test as an `entity_change`, nest a `tests` collection, or create a top-level tests resource. `covers_entities` optionally traces one test to production entities without establishing ownership. Tests inherit their source path and architectural task from their parent file and task. Harness generates internal IDs. Never invent or send ID fields. Never use JSON Patch `op`, `path`, or `value` fields.
 
@@ -206,27 +210,30 @@ Represent each concrete test as its own flat task-file subtask with `operation: 
               "callable": {"kind": "method", "name": "store"}
             },
             "target": {"kind": "planned_entity", "entity": "DraftCache"},
+            "expansion": [{
+              "action": "Persist pending draft",
+              "target": {"kind": "planned_entity", "entity": "DraftCache"},
+              "edges": [
+                {
+                  "relation": {
+                    "kind": "write",
+                    "callable": {"kind": "method", "name": "persist"}
+                  },
+                  "target": {
+                    "kind": "external_entity",
+                    "entity_kind": "type",
+                    "name": "DraftStore",
+                    "dependency": null
+                  },
+                  "expansion": [],
+                  "result": null
+                }
+              ],
+              "branches": []
+            }],
             "result": {"kind": "type", "name": "DraftId"}
-          }]
-        },
-        {
-          "action": "Persist pending draft",
-          "target": {"kind": "planned_entity", "entity": "DraftCache"},
-          "edges": [
-            {
-              "relation": {
-                "kind": "write",
-                "callable": {"kind": "method", "name": "persist"}
-              },
-              "target": {
-                "kind": "external_entity",
-                "entity_kind": "type",
-                "name": "DraftStore",
-                "dependency": null
-              },
-              "result": null
-            }
-          ]
+          }],
+          "branches": []
         }
       ]
     }]
@@ -352,7 +359,7 @@ impl PlanPrompt {
 
 Explore the repository before asking questions. Resolve discoverable facts from the code. You may write supporting planning material when the retained authorization permits it. Ask only when a product decision materially changes the implementation. When feedback is required, call harness_question_ask with one to three concise questions, two or three mutually exclusive choices per structured question, and a recommended choice first. End that turn after requesting feedback.
 
-Harness already created the canonical PlanDocument and owns its plan ID, version, and original prompt. The prompt is Harness-owned render context and is not a model-editable field. Build the semantic plan only through harness_plan_edit. Model each changed program construct once as a ProgramEntityChange with its add, modify, or remove action. Model every package decision once as a top-level dependency change with its version, manifest, license, and justification. Nest ordinary member changes under their owning entity and enum cases under the enum's dedicated variants collection. Express inheritance and conformance directly on that entity. Use tagged planned_entity or external_entity references in flows. Attach every entity to exactly one subtask. Harness derives dependency ownership by matching each manifest to exactly one task file. Keep dependencies, entities, independent flows, architectural tasks, file boundaries, optional high-value tests, and assumptions aligned. Harness owns internal IDs. {USAGE_CONTRACT} Do not use provider task updates as the plan. When the document passes submission validation, call harness_plan_submit with the exact plan_id and expected_version. Ordinary prose and provider checklists do not submit a plan.
+Harness already created the canonical PlanDocument and owns its plan ID, version, and original prompt. The prompt is Harness-owned render context and is not a model-editable field. Build the semantic plan only through harness_plan_edit. Model each changed program construct once as a ProgramEntityChange with its add, modify, remove, or rename action. For a rename, put the existing identifier in `renamed_from` and the destination identifier in `name`; never encode one rename as separate remove and add entities. Model every package decision once as a top-level dependency change with its version, manifest, license, and justification. Nest ordinary member changes under their owning entity and enum cases under the enum's dedicated variants collection. Express inheritance and conformance directly on that entity. Use tagged planned_entity, workspace_entity, or external_entity references in flows. Reserve workspace_entity for unchanged repository constructs and record their entity kind, name, repository-relative path, and one-indexed declaration line. Attach every entity to exactly one subtask. Harness derives dependency ownership by matching each manifest to exactly one task file. Keep dependencies, entities, independent flows, architectural tasks, file boundaries, optional high-value tests, and assumptions aligned. Harness owns internal IDs. {USAGE_CONTRACT} Do not use provider task updates as the plan. When the document passes submission validation, call harness_plan_submit with the exact plan_id and expected_version. Ordinary prose and provider checklists do not submit a plan.
 
 {WALKTHROUGH_CONTRACT}
 
@@ -508,7 +515,10 @@ mod test {
         assert!(prompt.contains("derives UML indentation from concrete entities"));
         assert!(!prompt.contains("exclusive_owner_entity"));
         assert!(prompt.contains("one to three separate flows"));
-        assert!(prompt.contains("renders every flow as an adjacency graph"));
+        assert!(prompt.contains("renders every flow as a rooted execution tree"));
+        assert!(prompt.contains("edge `expansion` steps execute inside that relationship"));
+        assert!(prompt.contains("step `branches` represent labeled alternative continuations"));
+        assert!(prompt.contains("Never infer nesting from adjacent top-level steps"));
         assert!(prompt.contains("structured `callable`"));
         assert!(prompt.contains("bare identifier"));
         assert!(prompt.contains("exactly one type entity"));
@@ -522,7 +532,9 @@ mod test {
         assert!(prompt.contains(r#"{"kind":"type","name":"TypeName"}"#));
         assert!(prompt.contains(r#"{"kind":"text","text":"observable value"}"#));
         assert!(prompt.contains("show concrete construction and invocation edges"));
-        assert!(prompt.contains("Runtime meaning comes from typed edges"));
+        assert!(
+            prompt.contains("Runtime meaning comes from explicit edges, expansions, and branches")
+        );
         assert!(prompt.contains("`construct` creates the target"));
         assert!(prompt.contains("aligned owner column within 100 characters"));
         assert!(prompt.contains("Organize tasks by domain object and ownership responsibility"));
@@ -536,7 +548,8 @@ mod test {
         assert_eq!(prompt.matches("\nModularity:\n").count(), 1);
         assert_eq!(prompt.matches("\nValidation:\n").count(), 1);
         assert!(prompt.contains("complete replacement array"));
-        assert!(prompt.contains("flow-step `edges` are always complete replacement arrays"));
+        assert!(prompt.contains("flow-step `branches`"));
+        assert!(prompt.contains("edge `expansion`"));
         assert!(prompt.contains("Every `subtasks.modify` entry"));
         assert!(prompt.contains("Never put package names there"));
         assert!(prompt.contains(r#""entity_changes": {"#));

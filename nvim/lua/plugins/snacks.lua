@@ -151,6 +151,7 @@ return {
             follow = false,
             supports_live = true,
             exclude = {
+              "node_modules",
               ".captures",
               ".logs",
               ".traces",

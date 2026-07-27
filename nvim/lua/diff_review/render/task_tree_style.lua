@@ -4,6 +4,9 @@ local action_highlight_by_name = {
   Add = "DiffReviewWalkthroughActionAdd",
   Modify = "DiffReviewWalkthroughActionModify",
   Remove = "DiffReviewWalkthroughActionRemove",
+  Rename = "DiffReviewWalkthroughActionRename",
+  ["(new)"] = "DiffReviewWalkthroughActionAdd",
+  ["(remove)"] = "DiffReviewWalkthroughActionRemove",
 }
 
 ---@class DiffReviewTaskTreeStyleTerm
@@ -96,6 +99,22 @@ function M.change(action, kind, target, kind_highlight, target_highlight)
       { text = action, hl = action_highlight },
       { text = kind, hl = kind_highlight or "@keyword" },
       { text = target, hl = target_highlight or "@type" },
+    })
+  end
+end
+
+---Build semantic segments for one rename row.
+---@param renamed_from string
+---@param name string
+---@param target_highlight? string
+---@return fun(line: string, line_index: integer): table[]
+function M.rename(renamed_from, name, target_highlight)
+  return function(line, line_index)
+    if line_index ~= 1 then return { { line } } end
+    return ordered_segments(line, {
+      { text = renamed_from, hl = "DiffReviewWalkthroughActionRename" },
+      { text = "→", hl = "DiffReviewWalkthroughActionRename" },
+      { text = name, hl = target_highlight or "@type" },
     })
   end
 end

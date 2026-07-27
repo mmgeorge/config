@@ -135,8 +135,10 @@ pub struct ProgramEntityMemberPatch {
 pub struct ProgramEntityPatch {
     #[serde(rename = "entity")]
     pub entity_id: String,
-    pub action: Option<ChangeAction>,
+    pub action: Option<EntityChangeAction>,
     pub kind: Option<EntityKind>,
+    #[serde(default)]
+    pub renamed_from: PatchField<String>,
     pub name: Option<String>,
     pub description: Option<String>,
     pub path: Option<String>,
@@ -170,6 +172,7 @@ pub struct PlanFlowStepPatch {
     pub action: Option<String>,
     pub target: Option<EntityReference>,
     pub edges: Option<Vec<PlanFlowEdge>>,
+    pub branches: Option<Vec<PlanFlowBranch>>,
 }
 
 /// Modifies one flow and optionally its nested steps.
@@ -399,7 +402,7 @@ pub fn rename_added_entity(
         .find(|entity| entity.entity_id == entity_id || entity.name == entity_id)
         .with_context(|| format!("program entity `{entity_id}` does not exist"))?;
     anyhow::ensure!(
-        entity.action == ChangeAction::Add,
+        entity.action == EntityChangeAction::Add,
         "only newly added plan entities can be renamed"
     );
     apply_plan_edit(
@@ -413,6 +416,7 @@ pub fn rename_added_entity(
                         entity_id: entity.entity_id.clone(),
                         action: None,
                         kind: None,
+                        renamed_from: PatchField::Missing,
                         name: Some(new_name),
                         description: None,
                         path: None,
@@ -492,6 +496,7 @@ pub fn apply_plan_mutation(document: &mut PlanDocument, mutation: PlanMutation) 
         )?;
     }
     propagate_entity_rename(document, &previous_name_by_id);
+    restore_internal_identity(document);
     Ok(())
 }
 
@@ -560,41 +565,7 @@ fn propagate_entity_rename(
         replace_identifier_occurrences(&mut flow.title, &rename_by_previous_name);
         replace_identifier_occurrences(&mut flow.description, &rename_by_previous_name);
         for step in &mut flow.steps {
-            replace_identifier_occurrences(&mut step.action, &rename_by_previous_name);
-            if let EntityReference::PlannedEntity { entity } = &mut step.target {
-                rename(entity);
-            }
-            for edge in &mut step.edges {
-                match &mut edge.relation {
-                    PlanFlowRelation::Call { callable }
-                    | PlanFlowRelation::Read { callable }
-                    | PlanFlowRelation::Write { callable } => {
-                        replace_identifier_occurrences(
-                            &mut callable.name,
-                            &rename_by_previous_name,
-                        );
-                    }
-                    PlanFlowRelation::Send { event } => {
-                        replace_identifier_occurrences(event, &rename_by_previous_name);
-                    }
-                    PlanFlowRelation::Construct
-                    | PlanFlowRelation::Emit
-                    | PlanFlowRelation::Return => {}
-                }
-                if let Some(result) = &mut edge.result {
-                    match result {
-                        PlanFlowValue::Type { name } => {
-                            replace_identifier_occurrences(name, &rename_by_previous_name);
-                        }
-                        PlanFlowValue::Text { text } => {
-                            replace_identifier_occurrences(text, &rename_by_previous_name);
-                        }
-                    }
-                }
-                if let EntityReference::PlannedEntity { entity } = &mut edge.target {
-                    rename(entity);
-                }
-            }
+            propagate_flow_step_rename(step, &rename_by_previous_name);
         }
     }
     for task in &mut document.tasks {
@@ -626,6 +597,59 @@ fn propagate_entity_rename(
                 }
             }
         }
+    }
+}
+
+fn propagate_flow_step_rename(
+    step: &mut PlanFlowStep,
+    rename_by_previous_name: &HashMap<String, String>,
+) {
+    replace_identifier_occurrences(&mut step.action, rename_by_previous_name);
+    rename_planned_reference(&mut step.target, rename_by_previous_name);
+    for edge in &mut step.edges {
+        match &mut edge.relation {
+            PlanFlowRelation::Call { callable }
+            | PlanFlowRelation::Read { callable }
+            | PlanFlowRelation::Write { callable } => {
+                replace_identifier_occurrences(&mut callable.name, rename_by_previous_name);
+            }
+            PlanFlowRelation::Send { event } => {
+                replace_identifier_occurrences(event, rename_by_previous_name);
+            }
+            PlanFlowRelation::Construct | PlanFlowRelation::Emit | PlanFlowRelation::Return => {}
+        }
+        if let Some(result) = &mut edge.result {
+            match result {
+                PlanFlowValue::Type { name } => {
+                    replace_identifier_occurrences(name, rename_by_previous_name);
+                }
+                PlanFlowValue::Text { text } => {
+                    replace_identifier_occurrences(text, rename_by_previous_name);
+                }
+            }
+        }
+        rename_planned_reference(&mut edge.target, rename_by_previous_name);
+        for nested_step in &mut edge.expansion {
+            propagate_flow_step_rename(nested_step, rename_by_previous_name);
+        }
+    }
+    for branch in &mut step.branches {
+        replace_identifier_occurrences(&mut branch.condition, rename_by_previous_name);
+        for nested_step in &mut branch.steps {
+            propagate_flow_step_rename(nested_step, rename_by_previous_name);
+        }
+    }
+}
+
+fn rename_planned_reference(
+    reference: &mut EntityReference,
+    rename_by_previous_name: &HashMap<String, String>,
+) {
+    let EntityReference::PlannedEntity { entity } = reference else {
+        return;
+    };
+    if let Some(name) = rename_by_previous_name.get(entity) {
+        entity.clone_from(name);
     }
 }
 
@@ -679,6 +703,7 @@ fn apply_plan_field_patch(document: &mut PlanDocument, patch: PlanFieldPatch) {
 fn apply_entity_patch(entity: &mut ProgramEntityChange, patch: ProgramEntityPatch) -> Result<()> {
     assign(&mut entity.action, patch.action);
     assign(&mut entity.kind, patch.kind);
+    patch.renamed_from.apply(&mut entity.renamed_from);
     assign(&mut entity.name, patch.name);
     assign(&mut entity.description, patch.description);
     assign(&mut entity.path, patch.path);
@@ -711,12 +736,27 @@ fn apply_dependency_patch(
     dependency: &mut PlanDependencyChange,
     patch: PlanDependencyPatch,
 ) -> Result<()> {
+    let identity_before = (
+        dependency.action,
+        dependency.name.clone(),
+        dependency.version.clone(),
+        dependency.manifest.clone(),
+    );
     assign(&mut dependency.action, patch.action);
     assign(&mut dependency.name, patch.name);
     assign(&mut dependency.version, patch.version);
     assign(&mut dependency.manifest, patch.manifest);
     patch.license.apply(&mut dependency.license);
     assign(&mut dependency.justification, patch.justification);
+    let identity_after = (
+        dependency.action,
+        dependency.name.clone(),
+        dependency.version.clone(),
+        dependency.manifest.clone(),
+    );
+    if identity_before != identity_after {
+        dependency.resolved_version = None;
+    }
     Ok(())
 }
 
@@ -781,18 +821,6 @@ fn normalize_added_identity(mutation: &mut PlanMutation) {
                 let flow_identity = format!("flow_{}", semantic_identity(&flow.flow_id));
                 for step in &mut steps.add {
                     normalize_step_identity(&flow_identity, step);
-                }
-                for step in &mut steps.modify {
-                    if let Some(edge_list) = &mut step.edges {
-                        let step_identity = format!(
-                            "{}_step_{}",
-                            flow_identity,
-                            semantic_identity(&step.step_id)
-                        );
-                        for edge in edge_list {
-                            normalize_edge_identity(&step_identity, edge);
-                        }
-                    }
                 }
             }
         }
@@ -907,13 +935,17 @@ fn normalize_step_identity(flow_identity: &str, step: &mut PlanFlowStep) {
     for edge in &mut step.edges {
         normalize_edge_identity(&step.step_id, edge);
     }
+    for branch in &mut step.branches {
+        normalize_branch_identity(&step.step_id, branch);
+    }
 }
 
 fn normalize_edge_identity(step_identity: &str, edge: &mut PlanFlowEdge) {
     if edge.edge_id.is_empty() {
         let target = match &edge.target {
             EntityReference::PlannedEntity { entity } => entity,
-            EntityReference::ExternalEntity { name, .. } => name,
+            EntityReference::WorkspaceEntity { name, .. }
+            | EntityReference::ExternalEntity { name, .. } => name,
         };
         edge.edge_id = format!(
             "{}_edge_{}_{}",
@@ -921,6 +953,22 @@ fn normalize_edge_identity(step_identity: &str, edge: &mut PlanFlowEdge) {
             semantic_identity(&edge.relation.label()),
             semantic_identity(target)
         );
+    }
+    for step in &mut edge.expansion {
+        normalize_step_identity(&edge.edge_id, step);
+    }
+}
+
+fn normalize_branch_identity(step_identity: &str, branch: &mut PlanFlowBranch) {
+    if branch.branch_id.is_empty() {
+        branch.branch_id = format!(
+            "{}_branch_{}",
+            step_identity,
+            semantic_identity(&branch.condition)
+        );
+    }
+    for step in &mut branch.steps {
+        normalize_step_identity(&branch.branch_id, step);
     }
 }
 
@@ -1008,14 +1056,7 @@ fn apply_flow_patch(flow: &mut PlanFlow, patch: PlanFlowPatch) -> Result<()> {
     assign(&mut flow.title, patch.title);
     assign(&mut flow.description, patch.description);
     if let Some(steps) = patch.steps {
-        apply_collection_mutation(
-            &mut flow.steps,
-            steps,
-            |step| step.action.as_str(),
-            |patch| patch.step_id.as_str(),
-            apply_flow_step_patch,
-            "flow step",
-        )?;
+        apply_flow_step_mutation(flow, steps)?;
     }
     Ok(())
 }
@@ -1024,7 +1065,101 @@ fn apply_flow_step_patch(step: &mut PlanFlowStep, patch: PlanFlowStepPatch) -> R
     assign(&mut step.action, patch.action);
     assign(&mut step.target, patch.target);
     assign(&mut step.edges, patch.edges);
+    assign(&mut step.branches, patch.branches);
     Ok(())
+}
+
+fn apply_flow_step_mutation(
+    flow: &mut PlanFlow,
+    mutation: CollectionMutation<PlanFlowStep, PlanFlowStepPatch>,
+) -> Result<()> {
+    let mut target_set = HashSet::new();
+    for step in &mutation.add {
+        ensure_unique_target(&mut target_set, &step.action, "flow step")?;
+    }
+    for patch in &mutation.modify {
+        ensure_unique_target(&mut target_set, &patch.step_id, "flow step")?;
+    }
+    for selector in &mutation.remove {
+        ensure_unique_target(&mut target_set, selector, "flow step")?;
+    }
+
+    for step in mutation.add {
+        anyhow::ensure!(
+            flow.steps
+                .iter()
+                .all(|candidate| candidate.action != step.action),
+            "flow step {} already exists",
+            step.action
+        );
+        flow.steps.push(step);
+    }
+    for patch in mutation.modify {
+        let match_count = flow_step_match_count(&flow.steps, &patch.step_id);
+        anyhow::ensure!(
+            match_count == 1,
+            "flow step {} {}",
+            patch.step_id,
+            if match_count == 0 {
+                "not found"
+            } else {
+                "is ambiguous"
+            }
+        );
+        let step = find_flow_step_by_selector_mut(&mut flow.steps, &patch.step_id)
+            .expect("one matching flow step must exist");
+        apply_flow_step_patch(step, patch)?;
+    }
+    for selector in mutation.remove {
+        let index = flow
+            .steps
+            .iter()
+            .position(|step| step.action == selector || step.step_id == selector)
+            .with_context(|| format!("root flow step {selector} not found"))?;
+        flow.steps.remove(index);
+    }
+    Ok(())
+}
+
+fn flow_step_match_count(step_list: &[PlanFlowStep], selector: &str) -> usize {
+    step_list
+        .iter()
+        .map(|step| {
+            usize::from(step.action == selector || step.step_id == selector)
+                + step
+                    .edges
+                    .iter()
+                    .map(|edge| flow_step_match_count(&edge.expansion, selector))
+                    .sum::<usize>()
+                + step
+                    .branches
+                    .iter()
+                    .map(|branch| flow_step_match_count(&branch.steps, selector))
+                    .sum::<usize>()
+        })
+        .sum()
+}
+
+fn find_flow_step_by_selector_mut<'a>(
+    step_list: &'a mut [PlanFlowStep],
+    selector: &str,
+) -> Option<&'a mut PlanFlowStep> {
+    for step in step_list {
+        if step.action == selector || step.step_id == selector {
+            return Some(step);
+        }
+        for edge in &mut step.edges {
+            if let Some(found) = find_flow_step_by_selector_mut(&mut edge.expansion, selector) {
+                return Some(found);
+            }
+        }
+        for branch in &mut step.branches {
+            if let Some(found) = find_flow_step_by_selector_mut(&mut branch.steps, selector) {
+                return Some(found);
+            }
+        }
+    }
+    None
 }
 
 fn apply_task_patch(task: &mut PlanTask, patch: PlanTaskPatch) -> Result<()> {
@@ -1204,8 +1339,9 @@ mod test {
                     entity_changes: Some(CollectionMutation {
                         add: vec![ProgramEntityChange {
                             entity_id: String::new(),
-                            action: ChangeAction::Add,
+                            action: EntityChangeAction::Add,
                             kind: EntityKind::Resource,
+                            renamed_from: None,
                             name: "DraftCache".into(),
                             description: "Own pending drafts.".into(),
                             path: "src/draft_sync.rs".into(),
@@ -1252,6 +1388,7 @@ mod test {
                             entity_id: "DraftCache".into(),
                             action: None,
                             kind: None,
+                            renamed_from: PatchField::Missing,
                             name: None,
                             description: Some("Own durable pending drafts.".into()),
                             path: None,
@@ -1320,6 +1457,7 @@ mod test {
                             action: ChangeAction::Add,
                             name: "tokio".into(),
                             version: "1".into(),
+                            resolved_version: None,
                             manifest: "Cargo.toml".into(),
                             license: Some("MIT".into()),
                             justification: "Run asynchronous work.".into(),
@@ -1369,6 +1507,34 @@ mod test {
     }
 
     #[test]
+    fn dependency_identity_edits_clear_the_harness_resolved_version() {
+        let mut dependency = PlanDependencyChange {
+            dependency_id: "dependency_datafusion".into(),
+            action: ChangeAction::Add,
+            name: "datafusion".into(),
+            version: "54".into(),
+            resolved_version: Some("54.1.0".into()),
+            manifest: "Cargo.toml".into(),
+            license: Some("Apache-2.0".into()),
+            justification: "Runs queries. The standard library cannot execute them.".into(),
+        };
+        apply_dependency_patch(
+            &mut dependency,
+            PlanDependencyPatch {
+                dependency: "datafusion".into(),
+                action: None,
+                name: None,
+                version: Some("55".into()),
+                manifest: None,
+                license: PatchField::default(),
+                justification: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(dependency.resolved_version, None);
+    }
+
+    #[test]
     fn modifies_one_nested_member_without_replacing_its_entity() {
         let mut document = super::super::test_fixture("plan", "Modify one member.");
         document.entity_changes[0]
@@ -1396,6 +1562,7 @@ mod test {
                             entity_id: "PlanDocument".into(),
                             action: None,
                             kind: None,
+                            renamed_from: PatchField::Missing,
                             name: None,
                             description: None,
                             path: None,
@@ -1447,6 +1614,7 @@ mod test {
                             entity_id: "PlanDocument".into(),
                             action: None,
                             kind: None,
+                            renamed_from: PatchField::Missing,
                             name: None,
                             description: None,
                             path: None,
@@ -1492,6 +1660,7 @@ mod test {
                             entity_id: "PlanDocument".into(),
                             action: None,
                             kind: None,
+                            renamed_from: PatchField::Missing,
                             name: None,
                             description: None,
                             path: None,
@@ -1532,6 +1701,7 @@ mod test {
                             entity_id: "PlanDocument".into(),
                             action: None,
                             kind: None,
+                            renamed_from: PatchField::Missing,
                             name: None,
                             description: None,
                             path: None,
@@ -1564,6 +1734,7 @@ mod test {
             action: ChangeAction::Add,
             name: "serde".into(),
             version: "1".into(),
+            resolved_version: None,
             manifest: "Cargo.toml".into(),
             license: Some("MIT OR Apache-2.0".into()),
             justification: "Serialize PlanDocument without PlanDocumentFactory.".into(),
@@ -1594,6 +1765,7 @@ mod test {
             target: EntityReference::PlannedEntity {
                 entity: "PlanDocument".into(),
             },
+            expansion: Vec::new(),
             result: Some(PlanFlowValue::Type {
                 name: "ValidatedPlan".into(),
             }),
@@ -1617,6 +1789,7 @@ mod test {
                             entity_id: "PlanDocument".into(),
                             action: None,
                             kind: None,
+                            renamed_from: PatchField::Missing,
                             name: Some("CanonicalPlan".into()),
                             description: None,
                             path: None,
@@ -1681,7 +1854,7 @@ mod test {
     #[test]
     fn direct_entity_rename_rejects_existing_entities() {
         let mut document = super::super::test_fixture("plan", "Rename one entity.");
-        document.entity_changes[0].action = ChangeAction::Modify;
+        document.entity_changes[0].action = EntityChangeAction::Modify;
 
         let error = rename_added_entity(&document, "PlanDocument", "CanonicalPlan".into())
             .unwrap_err()
@@ -1764,7 +1937,7 @@ mod test {
                                 step_id: String::new(),
                                 action: "Read table observations".into(),
                                 target: EntityReference::ExternalEntity {
-                                    entity_kind: ExternalEntityKind::Type,
+                                    entity_kind: ReferencedEntityKind::Type,
                                     name: "GeoParquetInspector".into(),
                                     dependency: None,
                                 },
@@ -1777,14 +1950,16 @@ mod test {
                                         },
                                     },
                                     target: EntityReference::ExternalEntity {
-                                        entity_kind: ExternalEntityKind::Type,
+                                        entity_kind: ReferencedEntityKind::Type,
                                         name: "SessionContext".into(),
                                         dependency: Some("datafusion".into()),
                                     },
+                                    expansion: Vec::new(),
                                     result: Some(PlanFlowValue::Text {
                                         text: "schema text".into(),
                                     }),
                                 }],
+                                branches: Vec::new(),
                             }],
                         }],
                         ..CollectionMutation::default()
@@ -1826,12 +2001,14 @@ mod test {
                                             },
                                         },
                                         target: EntityReference::ExternalEntity {
-                                            entity_kind: ExternalEntityKind::Type,
+                                            entity_kind: ReferencedEntityKind::Type,
                                             name: "SessionContext".into(),
                                             dependency: Some("datafusion".into()),
                                         },
+                                        expansion: Vec::new(),
                                         result: Some(PlanFlowValue::Type { name: "u64".into() }),
                                     }]),
+                                    branches: None,
                                 }],
                                 ..CollectionMutation::default()
                             }),
@@ -1855,6 +2032,148 @@ mod test {
             edge_list[0].edge_id,
             "flow_table_inspection_step_read_table_observations_edge_call_count_session_context"
         );
+    }
+
+    #[test]
+    fn generates_recursive_flow_identity_and_patches_one_nested_step() {
+        let mut document = super::super::test_fixture("plan", "Initial");
+        document.version = 4;
+        document.flows.clear();
+        let nested_step = PlanFlowStep {
+            step_id: String::new(),
+            action: "Read metadata".into(),
+            target: EntityReference::PlannedEntity {
+                entity: "plan_document".into(),
+            },
+            edges: vec![PlanFlowEdge {
+                edge_id: String::new(),
+                relation: PlanFlowRelation::Emit,
+                target: EntityReference::ExternalEntity {
+                    entity_kind: ReferencedEntityKind::Endpoint,
+                    name: "metadata".into(),
+                    dependency: None,
+                },
+                expansion: Vec::new(),
+                result: None,
+            }],
+            branches: Vec::new(),
+        };
+        let failure_step = PlanFlowStep {
+            step_id: String::new(),
+            action: "Emit failure".into(),
+            target: EntityReference::PlannedEntity {
+                entity: "plan_document".into(),
+            },
+            edges: vec![PlanFlowEdge {
+                edge_id: String::new(),
+                relation: PlanFlowRelation::Emit,
+                target: EntityReference::ExternalEntity {
+                    entity_kind: ReferencedEntityKind::Endpoint,
+                    name: "terminal".into(),
+                    dependency: None,
+                },
+                expansion: Vec::new(),
+                result: None,
+            }],
+            branches: Vec::new(),
+        };
+        let added = apply_plan_edit(
+            &document,
+            PlanEditRequest {
+                plan_id: "plan".into(),
+                expected_version: 4,
+                mutation: PlanMutation {
+                    flows: Some(CollectionMutation {
+                        add: vec![PlanFlow {
+                            flow_id: String::new(),
+                            title: "Nested inspection".into(),
+                            description: "Inspect one local file and return one report. Keep file interpretation inside the inspector boundary.".into(),
+                            steps: vec![PlanFlowStep {
+                                step_id: String::new(),
+                                action: "Parse path".into(),
+                                target: EntityReference::PlannedEntity {
+                                    entity: "plan_document".into(),
+                                },
+                                edges: vec![PlanFlowEdge {
+                                    edge_id: String::new(),
+                                    relation: PlanFlowRelation::Call {
+                                        callable: PlanCallable {
+                                            kind: PlanCallableKind::Method,
+                                            name: "inspect".into(),
+                                        },
+                                    },
+                                    target: EntityReference::PlannedEntity {
+                                        entity: "plan_document".into(),
+                                    },
+                                    expansion: vec![nested_step],
+                                    result: Some(PlanFlowValue::Type {
+                                        name: "InspectionReport".into(),
+                                    }),
+                                }],
+                                branches: vec![PlanFlowBranch {
+                                    branch_id: String::new(),
+                                    condition: "failure".into(),
+                                    steps: vec![failure_step],
+                                }],
+                            }],
+                        }],
+                        ..CollectionMutation::default()
+                    }),
+                    ..PlanMutation::default()
+                },
+            },
+        )
+        .unwrap();
+
+        let flow = &added.document.flows[0];
+        let root = &flow.steps[0];
+        let edge = &root.edges[0];
+        let branch = &root.branches[0];
+        assert_eq!(
+            edge.expansion[0].step_id,
+            format!("{}_step_read_metadata", edge.edge_id)
+        );
+        assert_eq!(branch.branch_id, format!("{}_branch_failure", root.step_id));
+        assert_eq!(
+            branch.steps[0].step_id,
+            format!("{}_step_emit_failure", branch.branch_id)
+        );
+
+        let modified = apply_plan_edit(
+            &added.document,
+            PlanEditRequest {
+                plan_id: "plan".into(),
+                expected_version: 5,
+                mutation: PlanMutation {
+                    flows: Some(CollectionMutation {
+                        modify: vec![PlanFlowPatch {
+                            flow_id: "Nested inspection".into(),
+                            title: None,
+                            description: None,
+                            steps: Some(CollectionMutation {
+                                modify: vec![PlanFlowStepPatch {
+                                    step_id: "Read metadata".into(),
+                                    action: Some("Read typed metadata".into()),
+                                    target: None,
+                                    edges: None,
+                                    branches: None,
+                                }],
+                                ..CollectionMutation::default()
+                            }),
+                        }],
+                        ..CollectionMutation::default()
+                    }),
+                    ..PlanMutation::default()
+                },
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            modified.document.flows[0].steps[0].edges[0].expansion[0].action,
+            "Read typed metadata"
+        );
+        assert_eq!(modified.version, 6);
     }
 
     #[test]

@@ -84,7 +84,8 @@ function FoldController:apply(buf, win, projection)
     for _, range in ipairs(range_list) do
       vim.cmd(("%d,%dfold"):format(range.start_line, range.end_line))
     end
-    for _, range in ipairs(range_list) do
+    for index = #range_list, 1, -1 do
+      local range = range_list[index]
       local folded = self.folded_by_id[range.id]
       if folded == nil then folded = range.default_folded end
       if not folded then

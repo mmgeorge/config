@@ -9,6 +9,8 @@ local task_tree = require("diff_review.render.task_tree")
 local session = require("diff_review.session")
 local comment_view = require("diff_review.views.plan_review.comment")
 local entity_info = require("diff_review.views.plan_review.entity_info")
+local entity_navigation = require("diff_review.views.plan_review.entity_navigation")
+local dependency_browser = require("diff_review.views.plan_review.dependency_browser")
 local entity_rename = require("diff_review.views.plan_review.entity_rename")
 local plan_fold = require("diff_review.views.plan_review.fold")
 local plan_schema = require("diff_review.views.plan_review.schema")
@@ -32,7 +34,18 @@ end
 
 ---@param plan table
 ---@param buf integer
-local function open_source(plan, buf)
+local function open_source(plan, review)
+  local buf = review.buf
+  local source_line = comment_view.source_line_at_cursor(buf) or vim.api.nvim_win_get_cursor(review.win)[1]
+  local cursor = vim.api.nvim_win_get_cursor(review.win)
+  local line = vim.api.nvim_buf_get_lines(buf, cursor[1] - 1, cursor[1], false)[1] or ""
+  local dependency = review.task_model
+      and review.task_model:dependency_at_position(source_line, line, cursor[2])
+      or nil
+  if dependency then
+    dependency_browser.open(dependency.name)
+    return
+  end
   local index_path = vim.fs.joinpath(vim.fs.dirname(plan.working_path), "working.index.json")
   local ok, source = pcall(vim.fn.readfile, index_path)
   if not ok then
@@ -44,10 +57,10 @@ local function open_source(plan, buf)
     notifications.error("Failed to decode plan navigation index", "PlanReview")
     return
   end
-  local line = comment_view.source_line_at_cursor(buf) or vim.api.nvim_win_get_cursor(0)[1]
+  local source_line = comment_view.source_line_at_cursor(buf) or vim.api.nvim_win_get_cursor(0)[1]
   local candidate = nil
   for _, anchor in ipairs(index.anchor or {}) do
-    if anchor.path and line == anchor.line then candidate = anchor end
+    if anchor.path and source_line == anchor.line then candidate = anchor end
   end
   if not candidate then
     notifications.info("This plan line has no source boundary", "PlanReview")
@@ -222,12 +235,31 @@ local function commands(plan, review)
   command_set.register(set, "toggle", function()
     review.fold_controller:toggle(review.buf, review.win)
   end)
-  command_set.register(set, "open", function() open_source(plan, review.buf) end)
+  command_set.register(set, "open", function() open_source(plan, review) end)
   command_set.register(set, "jump_entity", function()
-    entity_info.jump(review.task_model, review.buf, review.win)
+    local source_line = comment_view.source_line_at_cursor(review.buf)
+        or vim.api.nvim_win_get_cursor(review.win)[1]
+    entity_navigation.jump(review.task_model, review.buf, review.win, {
+      source_line = source_line,
+      plan_id = plan.id,
+      expected_version = review.task_model and review.task_model.document.version or 0,
+      workspace_root = vim.fn.getcwd(),
+      request = function(params, callback)
+        client.request("plan.rustdoc.source", params, callback)
+      end,
+    })
   end)
   command_set.register(set, "entity_info", function()
-    entity_info.show(review.task_model, review.buf, review.win)
+    local source_line = comment_view.source_line_at_cursor(review.buf)
+        or vim.api.nvim_win_get_cursor(review.win)[1]
+    entity_info.show_context(review.task_model, review.buf, review.win, {
+      source_line = source_line,
+      plan_id = plan.id,
+      expected_version = review.task_model and review.task_model.document.version or 0,
+      request = function(params, callback)
+        client.request("plan.rustdoc.hover", params, callback)
+      end,
+    })
   end)
   command_set.register(set, "rename_entity", function() rename_entity(plan, review) end)
   command_set.register(set, "schema", function() plan_schema.open(plan, review) end)
@@ -296,6 +328,12 @@ function M.open(plan)
   local set = commands(plan, review)
   review.command_set = set
   session.harness.plan_review = review
+  for _, warning in ipairs(plan.validation_warning or {}) do
+    notifications.warn(
+      ("%s: %s"):format(warning.path or "Rust API", warning.message or "validation unavailable"),
+      "PlanReview validation"
+    )
+  end
   keymaps.setup_view_keymaps(buf, "plan_review", set)
   refresh_review_winbar(buf, awaiting_review_status)
 end

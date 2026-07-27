@@ -12,6 +12,27 @@ pub enum ChangeAction {
     Remove,
 }
 
+/// Defines whether one top-level program entity enters, changes, leaves, or changes its name.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntityChangeAction {
+    Add,
+    Modify,
+    Remove,
+    Rename,
+}
+
+impl EntityChangeAction {
+    /// Map entity-specific lifecycle semantics onto the shared add/modify/remove graph behavior.
+    pub fn base_action(self) -> ChangeAction {
+        match self {
+            Self::Add => ChangeAction::Add,
+            Self::Modify | Self::Rename => ChangeAction::Modify,
+            Self::Remove => ChangeAction::Remove,
+        }
+    }
+}
+
 /// Represents one concrete caller interaction and its observable result.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PlanUsage {
@@ -111,23 +132,29 @@ pub struct ProgramEntityMemberChange {
     pub return_type: Option<String>,
 }
 
-/// Defines whether one external flow participant names a type or an endpoint.
+/// Defines whether one referenced flow participant names a type or an endpoint.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ExternalEntityKind {
+pub enum ReferencedEntityKind {
     Type,
     Endpoint,
 }
 
-/// Identifies one planned entity or one typed external architectural boundary.
+/// Identifies one planned, workspace-owned, or external architectural boundary.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum EntityReference {
     PlannedEntity {
         entity: String,
     },
+    WorkspaceEntity {
+        entity_kind: ReferencedEntityKind,
+        name: String,
+        path: String,
+        line: usize,
+    },
     ExternalEntity {
-        entity_kind: ExternalEntityKind,
+        entity_kind: ReferencedEntityKind,
         name: String,
         dependency: Option<String>,
     },
@@ -138,8 +165,10 @@ pub enum EntityReference {
 pub struct ProgramEntityChange {
     #[serde(default)]
     pub entity_id: String,
-    pub action: ChangeAction,
+    pub action: EntityChangeAction,
     pub kind: EntityKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renamed_from: Option<String>,
     pub name: String,
     pub description: String,
     pub path: String,
@@ -160,6 +189,8 @@ pub struct PlanDependencyChange {
     pub action: ChangeAction,
     pub name: String,
     pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_version: Option<String>,
     pub manifest: String,
     pub license: Option<String>,
     pub justification: String,
@@ -259,7 +290,18 @@ pub struct PlanFlowEdge {
     pub edge_id: String,
     pub relation: PlanFlowRelation,
     pub target: EntityReference,
+    pub expansion: Vec<PlanFlowStep>,
     pub result: Option<PlanFlowValue>,
+}
+
+/// Represents one labeled continuation from an acting flow step.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanFlowBranch {
+    #[serde(default)]
+    pub branch_id: String,
+    pub condition: String,
+    pub steps: Vec<PlanFlowStep>,
 }
 
 /// Represents one boundary in an affected runtime or data flow.
@@ -270,8 +312,8 @@ pub struct PlanFlowStep {
     pub step_id: String,
     pub action: String,
     pub target: EntityReference,
-    #[serde(default)]
     pub edges: Vec<PlanFlowEdge>,
+    pub branches: Vec<PlanFlowBranch>,
 }
 
 /// Represents one independent runtime, data, request, or recovery flow.
@@ -281,8 +323,68 @@ pub struct PlanFlow {
     pub flow_id: String,
     pub title: String,
     pub description: String,
-    #[serde(default)]
     pub steps: Vec<PlanFlowStep>,
+}
+
+impl PlanFlow {
+    /// Resolve one step from any depth in this flow's execution tree.
+    pub fn step(&self, step_id: &str) -> Option<&PlanFlowStep> {
+        find_flow_step(&self.steps, step_id)
+    }
+
+    /// Resolve one mutable step from any depth in this flow's execution tree.
+    pub fn step_mut(&mut self, step_id: &str) -> Option<&mut PlanFlowStep> {
+        find_flow_step_mut(&mut self.steps, step_id)
+    }
+
+    /// Resolve one edge through its owning step from any depth in the execution tree.
+    pub fn edge(&self, step_id: &str, edge_id: &str) -> Option<&PlanFlowEdge> {
+        self.step(step_id)?
+            .edges
+            .iter()
+            .find(|edge| edge.edge_id == edge_id)
+    }
+}
+
+fn find_flow_step<'a>(step_list: &'a [PlanFlowStep], step_id: &str) -> Option<&'a PlanFlowStep> {
+    for step in step_list {
+        if step.step_id == step_id {
+            return Some(step);
+        }
+        for edge in &step.edges {
+            if let Some(found) = find_flow_step(&edge.expansion, step_id) {
+                return Some(found);
+            }
+        }
+        for branch in &step.branches {
+            if let Some(found) = find_flow_step(&branch.steps, step_id) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+fn find_flow_step_mut<'a>(
+    step_list: &'a mut [PlanFlowStep],
+    step_id: &str,
+) -> Option<&'a mut PlanFlowStep> {
+    for step in step_list {
+        if step.step_id == step_id {
+            return Some(step);
+        }
+        for edge in &mut step.edges {
+            if let Some(found) = find_flow_step_mut(&mut edge.expansion, step_id) {
+                return Some(found);
+            }
+        }
+        for branch in &mut step.branches {
+            if let Some(found) = find_flow_step_mut(&mut branch.steps, step_id) {
+                return Some(found);
+            }
+        }
+    }
+    None
 }
 
 /// Defines one local architectural move inside a source file.
@@ -568,12 +670,14 @@ fn hide_internal_identity(value: &mut serde_json::Value) {
             for key in [
                 "entity_id",
                 "dependency_id",
+                "resolved_version",
                 "member_id",
                 "variant_id",
                 "field_id",
                 "flow_id",
                 "step_id",
                 "edge_id",
+                "branch_id",
                 "task_id",
                 "subtask_id",
             ] {
@@ -598,8 +702,9 @@ pub(crate) fn test_fixture(plan_id: &str, overview: &str) -> PlanDocument {
         usage: None,
         entity_changes: vec![ProgramEntityChange {
             entity_id: "plan_document".into(),
-            action: ChangeAction::Add,
+            action: EntityChangeAction::Add,
             kind: EntityKind::Struct,
+            renamed_from: None,
             name: "PlanDocument".into(),
             description: "Own canonical planning data.".into(),
             path: "src/plan.rs".into(),
@@ -623,14 +728,16 @@ pub(crate) fn test_fixture(plan_id: &str, overview: &str) -> PlanDocument {
                     edge_id: "read_plan_edge_return".into(),
                     relation: PlanFlowRelation::Return,
                     target: EntityReference::ExternalEntity {
-                        entity_kind: ExternalEntityKind::Endpoint,
+                        entity_kind: ReferencedEntityKind::Endpoint,
                         name: "execution scheduler".into(),
                         dependency: None,
                     },
+                    expansion: Vec::new(),
                     result: Some(PlanFlowValue::Type {
                         name: "ExecutablePlan".into(),
                     }),
                 }],
+                branches: Vec::new(),
             }],
         }],
         tasks: vec![PlanTask {
@@ -762,6 +869,7 @@ mod test {
                 "callable": {"kind": "method", "name": "inspect"}
             },
             "target": {"kind": "planned_entity", "entity": "GeoParquetInspector"},
+            "expansion": [],
             "result": {"kind": "type", "name": "InspectionReport"}
         }))
         .unwrap();
@@ -777,6 +885,69 @@ mod test {
                 "target": {"kind": "planned_entity", "entity": "GeoParquetInspector"},
                 "operations": [],
                 "value_to_next": {"kind": "type", "name": "InspectionReport"}
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn deserializes_recursive_flow_trees_and_requires_explicit_child_arrays() {
+        let flow = serde_json::from_value::<PlanFlow>(serde_json::json!({
+            "title": "Inspection",
+            "description": "Inspect one file and return a report. Keep file interpretation inside the inspector.",
+            "steps": [{
+                "action": "Parse local file path",
+                "target": {"kind": "planned_entity", "entity": "main"},
+                "edges": [{
+                    "relation": {
+                        "kind": "call",
+                        "callable": {"kind": "method", "name": "inspect"}
+                    },
+                    "target": {
+                        "kind": "planned_entity",
+                        "entity": "GeoParquetInspector"
+                    },
+                    "expansion": [{
+                        "action": "Read metadata",
+                        "target": {
+                            "kind": "planned_entity",
+                            "entity": "GeoParquetInspector"
+                        },
+                        "edges": [],
+                        "branches": []
+                    }],
+                    "result": {"kind": "type", "name": "InspectionReport"}
+                }],
+                "branches": [{
+                    "condition": "failure",
+                    "steps": [{
+                        "action": "Emit failure",
+                        "target": {"kind": "planned_entity", "entity": "main"},
+                        "edges": [],
+                        "branches": []
+                    }]
+                }]
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(flow.steps[0].edges[0].expansion[0].action, "Read metadata");
+        assert_eq!(flow.steps[0].branches[0].condition, "failure");
+        assert!(flow.step("missing").is_none());
+
+        assert!(
+            serde_json::from_value::<PlanFlowStep>(serde_json::json!({
+                "action": "Inspect",
+                "target": {"kind": "planned_entity", "entity": "Inspector"},
+                "edges": []
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<PlanFlowEdge>(serde_json::json!({
+                "relation": {"kind": "construct"},
+                "target": {"kind": "planned_entity", "entity": "Inspector"},
+                "result": null
             }))
             .is_err()
         );
@@ -828,14 +999,27 @@ mod test {
     fn serializes_tagged_entity_references() {
         let mut document = test_fixture("plan", "Build structured planning.");
         document.flows[0].steps.push(PlanFlowStep {
+            step_id: "workspace_validation".into(),
+            action: "Validate plan".into(),
+            target: EntityReference::WorkspaceEntity {
+                entity_kind: ReferencedEntityKind::Type,
+                name: "PlanValidator".into(),
+                path: "src/plan/validation.rs".into(),
+                line: 76,
+            },
+            edges: Vec::new(),
+            branches: Vec::new(),
+        });
+        document.flows[0].steps.push(PlanFlowStep {
             step_id: "external_output".into(),
             action: "Print result".into(),
             target: EntityReference::ExternalEntity {
-                entity_kind: ExternalEntityKind::Endpoint,
+                entity_kind: ReferencedEntityKind::Endpoint,
                 name: "terminal stdout".into(),
                 dependency: None,
             },
             edges: Vec::new(),
+            branches: Vec::new(),
         });
         let value = serde_json::to_value(document).unwrap();
 
@@ -849,14 +1033,26 @@ mod test {
         );
         assert_eq!(
             value.pointer("/flows/0/steps/1/target/kind"),
+            Some(&serde_json::json!("workspace_entity"))
+        );
+        assert_eq!(
+            value.pointer("/flows/0/steps/1/target/path"),
+            Some(&serde_json::json!("src/plan/validation.rs"))
+        );
+        assert_eq!(
+            value.pointer("/flows/0/steps/1/target/line"),
+            Some(&serde_json::json!(76))
+        );
+        assert_eq!(
+            value.pointer("/flows/0/steps/2/target/kind"),
             Some(&serde_json::json!("external_entity"))
         );
         assert_eq!(
-            value.pointer("/flows/0/steps/1/target/name"),
+            value.pointer("/flows/0/steps/2/target/name"),
             Some(&serde_json::json!("terminal stdout"))
         );
         assert_eq!(
-            value.pointer("/flows/0/steps/1/target/entity_kind"),
+            value.pointer("/flows/0/steps/2/target/entity_kind"),
             Some(&serde_json::json!("endpoint"))
         );
     }
@@ -884,10 +1080,11 @@ mod test {
                 },
             },
             target: EntityReference::ExternalEntity {
-                entity_kind: ExternalEntityKind::Type,
+                entity_kind: ReferencedEntityKind::Type,
                 name: "PlanValidator".into(),
                 dependency: None,
             },
+            expansion: Vec::new(),
             result: Some(PlanFlowValue::Type {
                 name: "ValidatedPlan".into(),
             }),
@@ -897,6 +1094,7 @@ mod test {
             action: ChangeAction::Add,
             name: "tokio".into(),
             version: "1".into(),
+            resolved_version: None,
             manifest: "Cargo.toml".into(),
             license: Some("MIT".into()),
             justification: "Run asynchronous work.".into(),

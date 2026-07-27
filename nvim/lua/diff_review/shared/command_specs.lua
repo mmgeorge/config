@@ -106,7 +106,7 @@ M.view_specs = {
     { id = "toggle", label = "fold", desc = "Toggle the current plan task or subtask", modes = "n", pinned = true },
     { id = "open", label = "open", desc = "Open the source file for this plan node", modes = "n", pinned = true },
     { id = "jump_entity", label = "entity", desc = "Jump to the current entity's UML declaration", modes = "n", pinned = false },
-    { id = "entity_info", label = "info", desc = "Show the current plan entity description", modes = "n", pinned = false },
+    { id = "entity_info", label = "info", desc = "Show the current plan item description", modes = "n", pinned = false },
     { id = "rename_entity", label = "rename", desc = "Rename the current newly added plan entity", modes = "n", pinned = false },
     { id = "schema", label = "schema", desc = "Open the canonical plan JSON", modes = "n", pinned = true },
     { id = "comment", label = "comment", desc = "Annotate the current plan line or selection", modes = { "n", "x" }, visual = true, pinned = true },

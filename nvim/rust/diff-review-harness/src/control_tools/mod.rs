@@ -298,6 +298,10 @@ fn change_action_schema() -> Value {
     json!({ "type": "string", "enum": ["add", "modify", "remove"] })
 }
 
+fn entity_change_action_schema() -> Value {
+    json!({ "type": "string", "enum": ["add", "modify", "remove", "rename"] })
+}
+
 fn entity_kind_schema() -> Value {
     json!({
         "type": "string",
@@ -338,7 +342,7 @@ fn plan_usage_input_schema() -> Value {
 
 fn entity_reference_input_schema() -> Value {
     json!({
-        "description": "Use planned_entity for one entity in entity_changes. External entities explicitly distinguish type receivers from runtime endpoints and may name their owning dependency.",
+        "description": "Use planned_entity for one entity in entity_changes, workspace_entity for an unchanged repository construct, and external_entity for a dependency or runtime boundary.",
         "oneOf": [
             strict_object_input_schema(
                 vec![
@@ -346,6 +350,19 @@ fn entity_reference_input_schema() -> Value {
                     ("entity", string_schema()),
                 ],
                 &["kind", "entity"],
+            ),
+            strict_object_input_schema(
+                vec![
+                    ("kind", json!({ "type": "string", "const": "workspace_entity" })),
+                    (
+                        "entity_kind",
+                        json!({ "type": "string", "enum": ["type", "endpoint"] }),
+                    ),
+                    ("name", string_schema()),
+                    ("path", string_schema()),
+                    ("line", json!({ "type": "integer", "minimum": 1 })),
+                ],
+                &["kind", "entity_kind", "name", "path", "line"],
             ),
             strict_object_input_schema(
                 vec![
@@ -467,10 +484,11 @@ fn entity_member_patch_input_schema() -> Value {
 }
 
 fn entity_change_input_schema() -> Value {
-    strict_object_input_schema(
+    let mut schema = strict_object_input_schema(
         vec![
-            ("action", change_action_schema()),
+            ("action", entity_change_action_schema()),
             ("kind", entity_kind_schema()),
+            ("renamed_from", string_schema()),
             ("name", string_schema()),
             ("description", string_schema()),
             (
@@ -495,15 +513,37 @@ fn entity_change_input_schema() -> Value {
             ),
         ],
         &["action", "kind", "name", "description", "path"],
-    )
+    );
+    schema
+        .as_object_mut()
+        .expect("entity change schema")
+        .insert(
+            "allOf".into(),
+            json!([
+                {
+                    "if": { "properties": { "action": { "const": "rename" } } },
+                    "then": { "required": ["renamed_from"] }
+                },
+                {
+                    "if": {
+                        "properties": {
+                            "action": { "enum": ["add", "modify", "remove"] }
+                        }
+                    },
+                    "then": { "not": { "required": ["renamed_from"] } }
+                }
+            ]),
+        );
+    schema
 }
 
 fn entity_change_patch_input_schema() -> Value {
     strict_object_input_schema(
         vec![
             ("entity", string_schema()),
-            ("action", change_action_schema()),
+            ("action", entity_change_action_schema()),
             ("kind", entity_kind_schema()),
+            ("renamed_from", nullable_string_schema()),
             ("name", string_schema()),
             ("description", string_schema()),
             ("path", string_schema()),
@@ -599,6 +639,10 @@ fn flow_value_input_schema() -> Value {
 }
 
 fn flow_step_input_schema() -> Value {
+    json!({ "$ref": "#/$defs/flow_step" })
+}
+
+fn flow_step_definition_schema() -> Value {
     strict_object_input_schema(
         vec![
             ("action", string_schema()),
@@ -607,8 +651,12 @@ fn flow_step_input_schema() -> Value {
                 "edges",
                 json!({ "type": "array", "items": flow_edge_input_schema() }),
             ),
+            (
+                "branches",
+                json!({ "type": "array", "items": flow_branch_input_schema() }),
+            ),
         ],
-        &["action", "target", "edges"],
+        &["action", "target", "edges", "branches"],
     )
 }
 
@@ -621,6 +669,10 @@ fn flow_step_patch_input_schema() -> Value {
             (
                 "edges",
                 json!({ "type": "array", "items": flow_edge_input_schema() }),
+            ),
+            (
+                "branches",
+                json!({ "type": "array", "items": flow_branch_input_schema() }),
             ),
         ],
         &["step"],
@@ -688,17 +740,55 @@ fn flow_relation_input_schema() -> Value {
 }
 
 fn flow_edge_input_schema() -> Value {
+    json!({ "$ref": "#/$defs/flow_edge" })
+}
+
+fn flow_edge_definition_schema() -> Value {
     strict_object_input_schema(
         vec![
             ("relation", flow_relation_input_schema()),
             ("target", entity_reference_input_schema()),
             (
+                "expansion",
+                json!({ "type": "array", "items": flow_step_input_schema() }),
+            ),
+            (
                 "result",
                 json!({ "oneOf": [flow_value_input_schema(), { "type": "null" }] }),
             ),
         ],
-        &["relation", "target", "result"],
+        &["relation", "target", "expansion", "result"],
     )
+}
+
+fn flow_branch_input_schema() -> Value {
+    json!({ "$ref": "#/$defs/flow_branch" })
+}
+
+fn flow_branch_definition_schema() -> Value {
+    strict_object_input_schema(
+        vec![
+            ("condition", string_schema()),
+            (
+                "steps",
+                json!({ "type": "array", "items": flow_step_input_schema() }),
+            ),
+        ],
+        &["condition", "steps"],
+    )
+}
+
+fn flow_definition_map() -> Value {
+    json!({
+        "flow_step": flow_step_definition_schema(),
+        "flow_edge": flow_edge_definition_schema(),
+        "flow_branch": flow_branch_definition_schema()
+    })
+}
+
+fn attach_flow_definitions(mut schema: Value) -> Value {
+    schema["$defs"] = flow_definition_map();
+    schema
 }
 
 fn flow_input_schema() -> Value {
@@ -711,7 +801,7 @@ fn flow_input_schema() -> Value {
                 json!({ "type": "array", "items": flow_step_input_schema() }),
             ),
         ],
-        &["title", "description"],
+        &["title", "description", "steps"],
     )
 }
 
@@ -1038,12 +1128,12 @@ fn plan_edit_input_schema() -> Value {
         { "required": ["tasks"] },
         { "required": ["assumptions"] }
     ]);
-    schema
+    attach_flow_definitions(schema)
 }
 
 fn plan_deviation_input_schema() -> Value {
     let proposed_changes = strict_object_input_schema(plan_mutation_property_list(), &[]);
-    strict_object_input_schema(
+    attach_flow_definitions(strict_object_input_schema(
         vec![
             ("plan_id", string_schema()),
             (
@@ -1058,7 +1148,7 @@ fn plan_deviation_input_schema() -> Value {
             ("proposed_changes", proposed_changes),
         ],
         &["plan_id", "kind", "summary", "reason", "proposed_changes"],
-    )
+    ))
 }
 
 fn plan_task_report_input_schema() -> Value {
@@ -1238,8 +1328,8 @@ pub async fn run_stdio() -> Result<()> {
 mod test {
     use super::*;
     use crate::plan::{
-        PatchField, PlanCallableKind, PlanFlowRelation, PlanFlowValue, PlanSubtask, PlanUsage,
-        TestCategory,
+        EntityReference, PatchField, PlanCallableKind, PlanFlowRelation, PlanFlowValue,
+        PlanSubtask, PlanUsage, ReferencedEntityKind, TestCategory,
     };
 
     #[test]
@@ -1272,6 +1362,25 @@ mod test {
             schema
                 .pointer("/properties/entity_changes/properties/add/items/properties/name")
                 .is_some()
+        );
+        assert!(
+            schema
+                .pointer("/properties/entity_changes/properties/add/items/properties/action/enum")
+                .and_then(Value::as_array)
+                .is_some_and(|action_list| action_list.contains(&json!("rename")))
+        );
+        assert!(
+            schema
+                .pointer("/properties/entity_changes/properties/add/items/properties/renamed_from")
+                .is_some()
+        );
+        assert!(
+            schema
+                .pointer(
+                    "/properties/entity_changes/properties/add/items/properties/members/items/properties/action/enum"
+                )
+                .and_then(Value::as_array)
+                .is_some_and(|action_list| !action_list.contains(&json!("rename")))
         );
         assert!(
             schema
@@ -1332,43 +1441,53 @@ mod test {
                 .is_some()
         );
         assert_eq!(
-            schema.pointer(
-                "/properties/flows/properties/add/items/properties/steps/items/properties/target/oneOf/0/properties/kind/const"
-            ),
+            schema.pointer("/$defs/flow_step/properties/target/oneOf/0/properties/kind/const"),
             Some(&json!("planned_entity"))
         );
-        assert!(schema
-            .pointer(
-                "/properties/flows/properties/add/items/properties/steps/items/properties/edges/items/properties/result"
-            )
-            .is_some());
+        assert!(
+            schema
+                .pointer("/$defs/flow_edge/properties/result")
+                .is_some()
+        );
         assert_eq!(
             schema.pointer(
-                "/properties/flows/properties/add/items/properties/steps/items/properties/edges/items/properties/relation/oneOf/1/properties/callable/properties/kind/enum/1"
+                "/$defs/flow_edge/properties/relation/oneOf/1/properties/callable/properties/kind/enum/1"
             ),
             Some(&json!("method"))
         );
         assert_eq!(
             schema.pointer(
-                "/properties/flows/properties/add/items/properties/steps/items/properties/edges/items/properties/target/oneOf/1/properties/entity_kind/enum/0"
+                "/$defs/flow_edge/properties/target/oneOf/1/properties/entity_kind/enum/0"
             ),
             Some(&json!("type"))
         );
-        assert!(schema
-            .pointer(
-                "/properties/flows/properties/add/items/properties/steps/items/properties/edges/items/properties/target/oneOf/1/properties/dependency"
-            )
-            .is_some());
-        assert!(schema
-            .pointer(
-                "/properties/flows/properties/add/items/properties/steps/items/properties/edges/items/properties/edge_id"
-            )
-            .is_none());
-        assert!(schema
-            .pointer(
-                "/properties/flows/properties/modify/items/properties/steps/properties/modify/items/properties/edges/items/properties/target"
-            )
-            .is_some());
+        assert_eq!(
+            schema.pointer("/$defs/flow_edge/properties/target/oneOf/1/properties/kind/const"),
+            Some(&json!("workspace_entity"))
+        );
+        assert_eq!(
+            schema.pointer("/$defs/flow_edge/properties/target/oneOf/1/properties/line/minimum"),
+            Some(&json!(1))
+        );
+        assert!(
+            schema
+                .pointer("/$defs/flow_edge/properties/target/oneOf/2/properties/dependency")
+                .is_some()
+        );
+        assert!(
+            schema
+                .pointer("/$defs/flow_edge/properties/edge_id")
+                .is_none()
+        );
+        assert!(
+            schema
+                .pointer("/$defs/flow_branch/properties/steps")
+                .is_some()
+        );
+        assert_eq!(
+            schema.pointer("/properties/flows/properties/add/items/properties/steps/items/$ref"),
+            Some(&json!("#/$defs/flow_step"))
+        );
         assert!(
             schema
                 .pointer(
@@ -1481,6 +1600,24 @@ mod test {
                             "edges": [
                                 {
                                     "relation": {
+                                        "kind": "call",
+                                        "callable": {
+                                            "kind": "method",
+                                            "name": "schedule"
+                                        }
+                                    },
+                                    "target": {
+                                        "kind": "workspace_entity",
+                                        "entity_kind": "type",
+                                        "name": "RetryScheduler",
+                                        "path": "src/scheduler.rs",
+                                        "line": 42
+                                    },
+                                    "expansion": [],
+                                    "result": null
+                                },
+                                {
+                                    "relation": {
                                         "kind": "read",
                                         "callable": {
                                             "kind": "method",
@@ -1491,6 +1628,7 @@ mod test {
                                         "kind": "planned_entity",
                                         "entity": "DraftCache"
                                     },
+                                    "expansion": [],
                                     "result": {
                                         "kind": "type",
                                         "name": "DraftChange[]"
@@ -1510,9 +1648,11 @@ mod test {
                                         "name": "DraftStore",
                                         "dependency": null
                                     },
+                                    "expansion": [],
                                     "result": null
                                 }
-                            ]
+                            ],
+                            "branches": []
                         }]
                     }]
                 },
@@ -1574,19 +1714,28 @@ mod test {
         assert_eq!(dependency.version, "1");
         assert!(dependency.dependency_id.is_empty());
         let edge_list = &request.mutation.flows.as_ref().unwrap().add[0].steps[0].edges;
-        assert_eq!(edge_list.len(), 2);
+        assert_eq!(edge_list.len(), 3);
         assert!(matches!(
-            &edge_list[0].relation,
+            &edge_list[1].relation,
             PlanFlowRelation::Read { callable }
                 if callable.kind == PlanCallableKind::Method && callable.name == "pending"
         ));
         assert_eq!(
-            edge_list[0].result,
+            edge_list[1].result,
             Some(PlanFlowValue::Type {
                 name: "DraftChange[]".into()
             })
         );
-        assert_eq!(edge_list[1].result, None);
+        assert!(matches!(
+            &edge_list[0].target,
+            EntityReference::WorkspaceEntity {
+                entity_kind: ReferencedEntityKind::Type,
+                name,
+                path,
+                line: 42,
+            } if name == "RetryScheduler" && path == "src/scheduler.rs"
+        ));
+        assert_eq!(edge_list[2].result, None);
         assert!(edge_list.iter().all(|edge| edge.edge_id.is_empty()));
         assert_eq!(
             request.mutation.plan.as_ref().unwrap().modify.usage,
@@ -1637,6 +1786,35 @@ mod test {
             .to_string();
 
         assert!(error.contains("entity_id"));
+        assert!(error.contains("Additional properties are not allowed"));
+    }
+
+    #[test]
+    fn rejects_harness_resolved_dependency_versions_from_model_edits() {
+        let invocation = ControlToolInvocation {
+            name: "harness_plan_edit".into(),
+            arguments: json!({
+                "plan_id": "plan",
+                "expected_version": 1,
+                "dependencies": {
+                    "add": [{
+                        "action": "add",
+                        "name": "datafusion",
+                        "version": "54",
+                        "resolved_version": "54.1.0",
+                        "manifest": "Cargo.toml",
+                        "license": "Apache-2.0",
+                        "justification": "Runs queries. The standard library has no query engine."
+                    }]
+                }
+            }),
+        };
+
+        let error = apply_invocation(&invocation, &mut BackendOutput::default())
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("resolved_version"));
         assert!(error.contains("Additional properties are not allowed"));
     }
 

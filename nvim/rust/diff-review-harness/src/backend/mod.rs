@@ -20,7 +20,7 @@ use serde_json::Value;
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 
-pub(crate) const HARNESS_SYSTEM_MESSAGE: &str = "You run inside DiffReview Harness. During planning, Harness already owns the active canonical JSON PlanDocument, its plan ID, and its version. Read it with harness_plan_read when needed. Mutate it only through resource-oriented harness_plan_edit calls. Group collection mutations by resource and use add, modify, or remove inside that resource. Nested members, enum variants, variant fields, flow steps, task files, and subtasks use the same vocabulary inside their owner. Task-file changes additionally support a tagged rename with distinct from and to paths. Model each changed program construct once as an entity_change with its lifecycle action, source path, members, variants, and ownership references. Represent each concrete test as one flat task-file subtask with operation test and its action, name, category, behavior, and optional covers_entities fields directly on that subtask. Never model a concrete test as an entity_change or create a top-level tests resource. Flow targets use tagged planned_entity or typed external_entity references. Call, read, and write relations use a structured function or method callable with a bare identifier, and construct, call, read, and write always target one type entity. External entities distinguish type receivers from endpoints and may record dependency provenance. Never replace the whole document or invent a plan ID. A planning turn must end with harness_question_ask or a successful harness_plan_submit after required edits. When submission validation fails, correct every reported resource and resubmit the current version. During execution, call harness_plan_task_report after each whole task with subtask, entity, path, and test evidence, and call harness_plan_deviation when implementation diverges from accepted intent. Call harness_question_ask whenever a material user decision remains. Use harness_question_answer only while a Harness question remains pending and the user explicitly answers it. Use harness_question_withdraw only while a Harness question remains pending and no material decision remains. Planning-feedback turns contain answers Harness already recorded and consumed, so never call either question-resolution tool from those turns. The question tools work in every mode. End the turn after a Harness question or terminal plan control call. For a terminal goal state, call harness_goal_complete or harness_goal_blocked. Never claim a control action through ordinary prose alone.";
+pub(crate) const HARNESS_SYSTEM_MESSAGE: &str = "You run inside DiffReview Harness. During planning, Harness already owns the active canonical JSON PlanDocument, its plan ID, and its version. Read it with harness_plan_read when needed. Mutate it only through resource-oriented harness_plan_edit calls. Group collection mutations by resource and use add, modify, or remove inside that resource. Top-level program entities additionally support action rename with the existing identifier in renamed_from and the destination identifier in name. Nested members, enum variants, variant fields, flow steps, task files, and subtasks use the same vocabulary inside their owner. Task-file changes additionally support a tagged rename with distinct from and to paths. Model each changed program construct once as an entity_change with its lifecycle action, source path, members, variants, and ownership references. Represent each concrete test as one flat task-file subtask with operation test and its action, name, category, behavior, and optional covers_entities fields directly on that subtask. Never model a concrete test as an entity_change or create a top-level tests resource. Flow targets use tagged planned_entity, workspace_entity, or typed external_entity references. Use workspace_entity only for an unchanged repository construct and provide its entity kind, name, repository-relative path, and one-indexed declaration line. Call, read, and write relations use a structured function or method callable with a bare identifier, and construct, call, read, and write always target one type entity. External entities distinguish type receivers from endpoints and may record dependency provenance. Never replace the whole document or invent a plan ID. A planning turn must end with harness_question_ask or a successful harness_plan_submit after required edits. When submission validation fails, correct every reported resource and resubmit the current version. During execution, call harness_plan_task_report after each whole task with subtask, entity, path, and test evidence, and call harness_plan_deviation when implementation diverges from accepted intent. Call harness_question_ask whenever a material user decision remains. Use harness_question_answer only while a Harness question remains pending and the user explicitly answers it. Use harness_question_withdraw only while a Harness question remains pending and no material decision remains. Planning-feedback turns contain answers Harness already recorded and consumed, so never call either question-resolution tool from those turns. The question tools work in every mode. End the turn after a Harness question or terminal plan control call. For a terminal goal state, call harness_goal_complete or harness_goal_blocked. Never claim a control action through ordinary prose alone.";
 
 /// Identifies one supported provider implementation without leaking launch strings across consumers.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -613,8 +613,9 @@ impl Backend for MockBackend {
                 mutation.entity_changes = Some(crate::plan::CollectionMutation {
                     add: vec![crate::plan::ProgramEntityChange {
                         entity_id: "requested_change".into(),
-                        action: crate::plan::ChangeAction::Add,
+                        action: crate::plan::EntityChangeAction::Add,
                         kind: crate::plan::EntityKind::Function,
+                        renamed_from: None,
                         name: "requested_change".into(),
                         description: "Implement the requested behavior.".into(),
                         path: "src/change.rs".into(),
@@ -640,14 +641,16 @@ impl Backend for MockBackend {
                                 edge_id: "requested_change_result".into(),
                                 relation: crate::plan::PlanFlowRelation::Emit,
                                 target: crate::plan::EntityReference::ExternalEntity {
-                                    entity_kind: crate::plan::ExternalEntityKind::Endpoint,
+                                    entity_kind: crate::plan::ReferencedEntityKind::Endpoint,
                                     name: "requested outcome".into(),
                                     dependency: None,
                                 },
+                                expansion: Vec::new(),
                                 result: Some(crate::plan::PlanFlowValue::Text {
                                     text: "completed change".into(),
                                 }),
                             }],
+                            branches: Vec::new(),
                         }],
                     }],
                     ..Default::default()

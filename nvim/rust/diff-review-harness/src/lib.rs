@@ -8,6 +8,7 @@ pub mod interaction;
 pub mod permissions;
 pub mod plan;
 pub mod protocol;
+pub mod rustdoc;
 pub mod session;
 pub mod storage;
 pub mod timeline;
