@@ -91,7 +91,6 @@ def --wrapped co [...args] {
     # let instruction_dirs = (get_copilot_instruction_dirs)
     let copilot_args = [
         --no-auto-update
-        --yolo
         --allow-tool 'shell(python)'
         --allow-tool 'shell(python:*)'
         --allow-tool 'shell(pnpm:*)'
