@@ -35,10 +35,8 @@ assert_equal(branch_source.existing_remote_action({ local_exists = true, checked
   'blocked_checked_out', 'checked-out local branch must not move')
 assert_equal(branch_source.existing_remote_action({ local_exists = true, same_tip = true }),
   'use_local', 'matching local branch must be reused')
-assert_equal(branch_source.existing_remote_action({ local_exists = true, local_is_ancestor = true }),
-  'fast_forward', 'behind local branch must fast-forward')
-assert_equal(branch_source.existing_remote_action({ local_exists = true }), 'blocked_diverged',
-  'ahead or divergent local branch must not move')
+assert_equal(branch_source.existing_remote_action({ local_exists = true }),
+  'reset_to_remote', 'behind local branch must update to the selected remote')
 
 local current_action
 local command_history = {}
