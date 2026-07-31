@@ -745,6 +745,8 @@ tree-sitter parser to that range) so the title and reviewer rows are not re-styl
 The batched review mode (`view_kind = "review"`). It loads a local draft from disk and
 the remote pending review from GitHub, **merges them with conflict detection**, and lets
 the reviewer comment per hunk, mark files viewed/unviewed, pick a verdict, and submit. A
+review loads GitHub's net PR diff rather than its per-commit patch series, so changes
+introduced and reverted within the PR never appear as commentable rows. A
 comment carries `body` (current), `base_body` (last synced), and `remote_body` (on
 conflict) plus a `local_state` machine. Mutations flow through the `annotations` serial
 sync queue, and the draft is persisted to the `github.repo_cache` so a closed buffer
