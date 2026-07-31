@@ -31,8 +31,7 @@
       "args": [
         "-y",
         "chrome-devtools-mcp@latest",
-        "--browserUrl",
-        "http://127.0.0.1:9222"
+        "--autoConnect"
       ],
       "default_tools_approval_mode": "approve"
     },
@@ -50,12 +49,15 @@
       "default_tools_approval_mode": "approve"
     },
     "github": {
-      "targets": ["claudecode", "codexcli", "antigravity-cli"],
+      "targets": ["claudecode", "codexcli", "antigravity-cli", "copilotcli"],
       "command": "github-mcp-server",
       "args": [
         "stdio",
         "--toolsets=context,actions,discussions,issues,labels,pull_requests,repos,users"
       ],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "$GITHUB_PERSONAL_ACCESS_TOKEN"
+      },
       "envVars": [
         "GITHUB_PERSONAL_ACCESS_TOKEN"
       ],
