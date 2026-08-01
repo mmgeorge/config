@@ -118,7 +118,10 @@ impl ControlToolRuntime {
                 self.plan_document = Some(apply_plan_edit(document, request)?.document);
                 Ok(ControlToolResult {
                     invocation: Some(invocation),
-                    message: self.plan_version_message("Plan edit accepted"),
+                    message: format!(
+                        "{} Submission validation has not run.",
+                        self.plan_version_message("Plan edit accepted")
+                    ),
                 })
             }
             "harness_plan_read" => {
@@ -329,7 +332,7 @@ mod test {
                 name: "harness_plan_edit".into(),
                 arguments: json!({
                     "plan_id": "plan", "expected_version": 1,
-                    "plan": { "modify": { "overview": "Changed" } }
+                    "plan": { "overview": "Changed" }
                 }),
             })
             .await
@@ -361,14 +364,15 @@ mod test {
                 arguments: json!({
                     "plan_id": "plan",
                     "expected_version": 1,
-                    "entity_changes": {
-                        "add": [{
+                    "set": {
+                        "entity_changes": [{
                             "action": "add",
                             "kind": "struct",
                             "name": "InspectionService",
                             "description": "Own inspection.",
                             "path": "src/inspection.rs",
                             "members": [],
+                            "variants": [],
                             "extends": null,
                             "conforms_to": []
                         }]
@@ -395,11 +399,14 @@ mod test {
                 arguments: json!({
                     "plan_id": "plan",
                     "expected_version": 2,
-                    "entity_changes": {
-                        "modify": [{
-                            "entity": "InspectionService",
-                            "members": {
-                                "add": [{
+                    "set": {
+                        "entity_changes": [{
+                            "action": "add",
+                            "kind": "struct",
+                            "name": "InspectionService",
+                            "description": "Own inspection.",
+                            "path": "src/inspection.rs",
+                            "members": [{
                                 "action": "add",
                                 "kind": "method",
                                 "name": "inspect",
@@ -408,24 +415,31 @@ mod test {
                                 "type": null,
                                 "parameters": [],
                                 "return_type": "InspectionReport"
-                            }]
-                            }
-                        }]
-                    },
-                    "tasks": {
-                        "modify": [{
-                            "task": "Create plan state",
-                            "files": {
-                                "add": [{
-                                    "path": "src/inspection.rs",
-                                    "action": "add",
-                                    "subtasks": [{
-                                        "operation": "create",
-                                        "description": "the inspection owner.",
-                                        "entities": ["InspectionService"]
-                                    }]
+                            }],
+                            "variants": [],
+                            "extends": null,
+                            "conforms_to": []
+                        }],
+                        "tasks": [{
+                            "title": "Create plan state",
+                            "description": "Give planning one owner.",
+                            "files": [{
+                                "path": "src/plan.rs",
+                                "action": "add",
+                                "subtasks": [{
+                                    "operation": "create",
+                                    "description": "Keep state durable.",
+                                    "entities": ["PlanDocument"]
                                 }]
-                            }
+                            }, {
+                                "path": "src/inspection.rs",
+                                "action": "add",
+                                "subtasks": [{
+                                    "operation": "create",
+                                    "description": "the inspection owner.",
+                                    "entities": ["InspectionService"]
+                                }]
+                            }]
                         }]
                     }
                 }),
@@ -446,7 +460,6 @@ mod test {
         let mut context = planning_context();
         context.plan_document.as_mut().unwrap().dependencies.push(
             crate::plan::PlanDependencyChange {
-                dependency_id: "dependency_datafusion".into(),
                 action: crate::plan::ChangeAction::Add,
                 name: "datafusion".into(),
                 version: "not a Cargo requirement".into(),
@@ -462,7 +475,6 @@ mod test {
                 "action": "modify",
                     "path": "Cargo.toml",
                     "subtasks": [{
-                        "subtask_id": "configure_invalid_dependency",
                         "operation": "configure",
                     "description": "the invalid dependency requirement.",
                     "entities": []
@@ -502,7 +514,6 @@ mod test {
         let mut context = planning_context();
         context.plan_document.as_mut().unwrap().dependencies.push(
             crate::plan::PlanDependencyChange {
-                dependency_id: "dependency_datafusion".into(),
                 action: crate::plan::ChangeAction::Add,
                 name: "datafusion".into(),
                 version: "54".into(),
@@ -518,7 +529,6 @@ mod test {
                 "action": "modify",
                 "path": "Cargo.toml",
                 "subtasks": [{
-                    "subtask_id": "configure_datafusion",
                     "operation": "configure",
                     "description": "the DataFusion dependency.",
                     "entities": []

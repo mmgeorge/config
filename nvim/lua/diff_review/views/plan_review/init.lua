@@ -205,7 +205,7 @@ local function rename_entity(plan, review)
     if not begin_review_request(review.buf, "Renaming plan entity…") then return end
     client.request("plan.entity.rename", {
       plan_id = plan.id,
-      entity_id = entity.entity_id or entity.name,
+      entity_name = entity.name,
       expected_version = review.task_model.document.version,
       name = new_name,
     }, function(result, request_error)
@@ -241,8 +241,8 @@ local function commands(plan, review)
         or vim.api.nvim_win_get_cursor(review.win)[1]
     entity_navigation.jump(review.task_model, review.buf, review.win, {
       source_line = source_line,
-      plan_id = plan.id,
-      expected_version = review.task_model and review.task_model.document.version or 0,
+      plan_id = review.task_model and review.task_model.plan_id or plan.id,
+      expected_version = review.task_model and review.task_model.plan_version or 0,
       workspace_root = vim.fn.getcwd(),
       request = function(params, callback)
         client.request("plan.rustdoc.source", params, callback)
@@ -254,8 +254,8 @@ local function commands(plan, review)
         or vim.api.nvim_win_get_cursor(review.win)[1]
     entity_info.show_context(review.task_model, review.buf, review.win, {
       source_line = source_line,
-      plan_id = plan.id,
-      expected_version = review.task_model and review.task_model.document.version or 0,
+      plan_id = review.task_model and review.task_model.plan_id or plan.id,
+      expected_version = review.task_model and review.task_model.plan_version or 0,
       request = function(params, callback)
         client.request("plan.rustdoc.hover", params, callback)
       end,

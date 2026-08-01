@@ -1920,9 +1920,9 @@ local ok, failure = xpcall(function()
     created_at_ms = os.time() * 1000,
     scheduler = {
       task = {
-        { task_id = "task-one", state = "complete" },
-        { task_id = "task-two", state = "active" },
-        { task_id = "task-three", state = "pending" },
+        { task_path = "/tasks/0", state = "complete" },
+        { task_path = "/tasks/1", state = "active" },
+        { task_path = "/tasks/2", state = "pending" },
       },
     },
   }
@@ -2671,7 +2671,7 @@ local ok, failure = xpcall(function()
     item = {
       {
         kind = "task_started",
-        task_id = "task-one",
+        task_path = "/tasks/0",
         ordinal = 1,
         total = 1,
         title = "Rewrite core",
@@ -2701,7 +2701,7 @@ local ok, failure = xpcall(function()
       },
       {
         kind = "task_completed",
-        task_id = "task-one",
+        task_path = "/tasks/0",
         ordinal = 1,
         total = 1,
         title = "Rewrite core",

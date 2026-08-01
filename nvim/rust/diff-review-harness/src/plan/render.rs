@@ -38,33 +38,31 @@ pub enum PlanReviewTarget {
         section: PlanSection,
     },
     Entity {
-        entity_id: String,
+        name: String,
     },
     EntityMember {
-        entity_id: String,
-        member_id: String,
+        entity: String,
+        member: String,
     },
     EnumVariant {
-        entity_id: String,
-        variant_id: String,
+        entity: String,
+        variant: String,
     },
     EnumVariantField {
-        entity_id: String,
-        variant_id: String,
-        field_id: String,
+        entity: String,
+        variant: String,
+        field: String,
     },
     Dependency {
-        dependency_id: String,
+        name: String,
     },
     DependencyManifest {
         manifest: String,
     },
     Flow {
-        flow_id: String,
+        title: String,
     },
     FlowStep {
-        flow_id: String,
-        step_id: String,
         reference_kind: PlanReviewReferenceKind,
         target_name: String,
         target_is_type: bool,
@@ -72,9 +70,6 @@ pub enum PlanReviewTarget {
         workspace_line: Option<usize>,
     },
     FlowEdge {
-        flow_id: String,
-        step_id: String,
-        edge_id: String,
         callable_kind: Option<PlanCallableKind>,
         callable_name: Option<String>,
         reference_kind: PlanReviewReferenceKind,
@@ -84,22 +79,15 @@ pub enum PlanReviewTarget {
         workspace_line: Option<usize>,
     },
     FlowEdgeResult {
-        flow_id: String,
-        step_id: String,
-        edge_id: String,
         value_kind: PlanFlowValueKind,
     },
     FlowBranch {
-        flow_id: String,
-        step_id: String,
-        branch_id: String,
         condition: String,
     },
     Task {
-        task_id: String,
+        title: String,
     },
     File {
-        task_id: String,
         path: String,
     },
     FileDirectory {
@@ -109,21 +97,19 @@ pub enum PlanReviewTarget {
         path: String,
     },
     FileTreeEntity {
-        entity_id: String,
+        name: String,
         path: String,
     },
     FileTreeTest {
-        subtask_id: String,
+        name: String,
+        action: ChangeAction,
         path: String,
         category: TestCategory,
     },
     Subtask {
-        task_id: String,
         path: String,
-        subtask_id: String,
     },
     Test {
-        subtask_id: String,
         category: TestCategory,
     },
     Assumption {
@@ -144,6 +130,8 @@ pub struct PlanNavigationAnchor {
 /// Owns exact source-navigation anchors for one rendered plan revision.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PlanNavigationIndex {
+    pub plan_id: String,
+    pub plan_version: u64,
     pub anchor: Vec<PlanNavigationAnchor>,
 }
 
@@ -185,10 +173,14 @@ struct DiagramCell {
 }
 
 impl PlanRenderer {
-    fn new() -> Self {
+    fn new(document: &PlanDocument) -> Self {
         Self {
             line: Vec::new(),
-            navigation: PlanNavigationIndex::default(),
+            navigation: PlanNavigationIndex {
+                plan_id: document.plan_id.clone(),
+                plan_version: document.version,
+                anchor: Vec::new(),
+            },
         }
     }
 
@@ -298,7 +290,7 @@ pub fn render_plan(document: &PlanDocument) -> Result<RenderedPlan> {
 pub fn render_plan_at(document: &PlanDocument, workspace: &Path) -> Result<RenderedPlan> {
     validate_plan_render(document)?;
     let graph = PlanGraph::new(document);
-    let mut renderer = PlanRenderer::new();
+    let mut renderer = PlanRenderer::new(document);
     renderer.section(
         format!("# {}", document.title),
         PlanSection::Title,
@@ -405,22 +397,22 @@ fn render_files(
         return;
     }
 
-    let entity_id_list = document
+    let entity_name_list = document
         .entity_changes
         .iter()
-        .map(|entity| entity.entity_id.clone())
+        .map(|entity| entity.name.clone())
         .collect::<Vec<_>>();
-    for entity in graph.entities_in_presentation_order(&entity_id_list) {
+    for entity in graph.entities_in_presentation_order(&entity_name_list) {
         let Some(entry) = file_list.iter_mut().find(|entry| entry.path == entity.path) else {
             continue;
         };
         entry.symbol_list.push(RenderedFileSymbol {
             label: file_entity_label(entity),
             target: PlanReviewTarget::FileTreeEntity {
-                entity_id: entity.entity_id.clone(),
+                name: entity.name.clone(),
                 path: entity.path.clone(),
             },
-            json_path: entity_json_path(document, &entity.entity_id).to_owned(),
+            json_path: entity_json_path(document, &entity.name),
         });
     }
     for (task_index, task) in document.tasks.iter().enumerate() {
@@ -436,7 +428,8 @@ fn render_files(
                 entry.symbol_list.push(RenderedFileSymbol {
                     label: file_test_label(test),
                     target: PlanReviewTarget::FileTreeTest {
-                        subtask_id: test.subtask_id.clone(),
+                        name: test.name.clone(),
+                        action: test.action,
                         path: path.to_owned(),
                         category: test.category,
                     },
@@ -493,6 +486,11 @@ fn file_test_label(test: &PlanTestSubtask) -> String {
         ChangeAction::Add => format!("(new) {kind} {}", test.name),
         ChangeAction::Modify => format!("{kind} {}", test.name),
         ChangeAction::Remove => format!("(remove) {kind} {}", test.name),
+        ChangeAction::Rename => format!(
+            "(rename {} → {}) {kind}",
+            test.renamed_from.as_deref().unwrap_or("?"),
+            test.name
+        ),
     }
 }
 
@@ -666,7 +664,7 @@ fn render_diagrams(renderer: &mut PlanRenderer, document: &PlanDocument, graph: 
     for (flow_index, flow) in document.flows.iter().enumerate() {
         let flow_path = format!("/flows/{flow_index}");
         let flow_target = PlanReviewTarget::Flow {
-            flow_id: flow.flow_id.clone(),
+            title: flow.title.clone(),
         };
         renderer.push(
             format!("## Code flow: {}", flow.title),
@@ -718,7 +716,6 @@ fn render_flow_rows(
             collect_flow_step_rows(
                 &mut row_list,
                 graph,
-                flow,
                 step,
                 &format!("{flow_path}/steps/{step_index}"),
                 &[],
@@ -764,7 +761,6 @@ struct FlowRenderRow {
 fn collect_flow_step_rows(
     row_list: &mut Vec<FlowRenderRow>,
     graph: &PlanGraph<'_>,
-    flow: &PlanFlow,
     step: &PlanFlowStep,
     step_path: &str,
     ancestor_last_list: &[bool],
@@ -774,8 +770,6 @@ fn collect_flow_step_rows(
         content: flow_tree_content(ancestor_last_list, is_last, &flow_step_content(graph, step)),
         path: flow_target_path(graph, &step.target),
         target: PlanReviewTarget::FlowStep {
-            flow_id: flow.flow_id.clone(),
-            step_id: step.step_id.clone(),
             reference_kind: entity_reference_kind(&step.target),
             target_name: entity_reference_label(graph, &step.target),
             target_is_type: entity_reference_is_type(graph, &step.target),
@@ -795,8 +789,6 @@ fn collect_flow_step_rows(
         collect_flow_edge_rows(
             row_list,
             graph,
-            flow,
-            step,
             edge,
             &format!("{step_path}/edges/{edge_index}"),
             &child_ancestor_list,
@@ -807,8 +799,6 @@ fn collect_flow_step_rows(
         collect_flow_branch_rows(
             row_list,
             graph,
-            flow,
-            step,
             branch,
             &format!("{step_path}/branches/{branch_index}"),
             &child_ancestor_list,
@@ -820,8 +810,6 @@ fn collect_flow_step_rows(
 fn collect_flow_edge_rows(
     row_list: &mut Vec<FlowRenderRow>,
     graph: &PlanGraph<'_>,
-    flow: &PlanFlow,
-    owner: &PlanFlowStep,
     edge: &PlanFlowEdge,
     edge_path: &str,
     ancestor_last_list: &[bool],
@@ -835,9 +823,6 @@ fn collect_flow_edge_rows(
         ),
         path: flow_target_path(graph, &edge.target),
         target: PlanReviewTarget::FlowEdge {
-            flow_id: flow.flow_id.clone(),
-            step_id: owner.step_id.clone(),
-            edge_id: edge.edge_id.clone(),
             callable_kind: flow_edge_callable(edge).map(|callable| callable.kind),
             callable_name: flow_edge_callable(edge).map(|callable| callable.name.clone()),
             reference_kind: entity_reference_kind(&edge.target),
@@ -852,19 +837,19 @@ fn collect_flow_edge_rows(
 
     let mut child_ancestor_list = ancestor_last_list.to_vec();
     child_ancestor_list.push(is_last);
-    let child_count = edge.expansion.len() + usize::from(edge.result.is_some());
+    let renders_result = edge.result.is_some() && !flow_edge_constructs_target(graph, edge);
+    let child_count = edge.expansion.len() + usize::from(renders_result);
     for (step_index, step) in edge.expansion.iter().enumerate() {
         collect_flow_step_rows(
             row_list,
             graph,
-            flow,
             step,
             &format!("{edge_path}/expansion/{step_index}"),
             &child_ancestor_list,
             Some(step_index + 1 == child_count),
         );
     }
-    if let Some(result) = &edge.result {
+    if renders_result && let Some(result) = &edge.result {
         row_list.push(FlowRenderRow {
             content: flow_tree_content(
                 &child_ancestor_list,
@@ -873,9 +858,6 @@ fn collect_flow_edge_rows(
             ),
             path: None,
             target: PlanReviewTarget::FlowEdgeResult {
-                flow_id: flow.flow_id.clone(),
-                step_id: owner.step_id.clone(),
-                edge_id: edge.edge_id.clone(),
                 value_kind: result.kind(),
             },
             json_path: format!("{edge_path}/result"),
@@ -887,8 +869,6 @@ fn collect_flow_edge_rows(
 fn collect_flow_branch_rows(
     row_list: &mut Vec<FlowRenderRow>,
     graph: &PlanGraph<'_>,
-    flow: &PlanFlow,
-    owner: &PlanFlowStep,
     branch: &PlanFlowBranch,
     branch_path: &str,
     ancestor_last_list: &[bool],
@@ -902,9 +882,6 @@ fn collect_flow_branch_rows(
         ),
         path: None,
         target: PlanReviewTarget::FlowBranch {
-            flow_id: flow.flow_id.clone(),
-            step_id: owner.step_id.clone(),
-            branch_id: branch.branch_id.clone(),
             condition: branch.condition.clone(),
         },
         json_path: branch_path.to_owned(),
@@ -917,7 +894,6 @@ fn collect_flow_branch_rows(
         collect_flow_step_rows(
             row_list,
             graph,
-            flow,
             step,
             &format!("{branch_path}/steps/{step_index}"),
             &child_ancestor_list,
@@ -955,6 +931,9 @@ fn flow_edge_content(graph: &PlanGraph<'_>, edge: &PlanFlowEdge) -> String {
     let target = entity_reference_label(graph, &edge.target);
     match &edge.relation {
         PlanFlowRelation::Construct => format!("Construct {target}"),
+        PlanFlowRelation::Call { callable } if flow_edge_constructs_target(graph, edge) => {
+            format!("Construct {target}.{}()", callable.name)
+        }
         PlanFlowRelation::Call { callable } => {
             format!("Call {target}.{}()", callable.name)
         }
@@ -968,6 +947,19 @@ fn flow_edge_content(graph: &PlanGraph<'_>, edge: &PlanFlowEdge) -> String {
         PlanFlowRelation::Emit => format!("Emit to {target}"),
         PlanFlowRelation::Return => format!("Return to {target}"),
     }
+}
+
+fn flow_edge_constructs_target(graph: &PlanGraph<'_>, edge: &PlanFlowEdge) -> bool {
+    if matches!(edge.relation, PlanFlowRelation::Construct) {
+        return true;
+    }
+    matches!(
+        (&edge.relation, &edge.result),
+        (
+            PlanFlowRelation::Call { .. },
+            Some(PlanFlowValue::Type { name })
+        ) if name == &entity_reference_label(graph, &edge.target)
+    )
 }
 
 fn flow_edge_callable(edge: &PlanFlowEdge) -> Option<&PlanCallable> {
@@ -1108,12 +1100,12 @@ fn diagram_entity_group(
         .iter()
         .enumerate()
         .filter(|(_, entity)| {
-            graph.presentation_parent(&entity.entity_id).is_none() && include(entity.kind)
+            graph.presentation_parent(&entity.name).is_none() && include(entity.kind)
         })
         .collect::<Vec<_>>();
     entity_list.sort_by_key(|(_, entity)| {
         graph
-            .presentation_position(&entity.entity_id)
+            .presentation_position(&entity.name)
             .map(|position| position.preorder_rank())
             .unwrap_or(usize::MAX)
     });
@@ -1189,7 +1181,7 @@ fn append_entity_cells(
     declaration.push_str(&format!("{}[{}]", " ".repeat(path_gap), entity.path));
     let entity_anchor = DiagramAnchor {
         target: PlanReviewTarget::Entity {
-            entity_id: entity.entity_id.clone(),
+            name: entity.name.clone(),
         },
         json_path: entity_path.clone(),
         path: Some(entity.path.clone()),
@@ -1203,20 +1195,24 @@ fn append_entity_cells(
         entity_anchor.clone(),
     );
     for (member_index, member) in entity.members.iter().enumerate() {
+        let mut member_declaration = format!(
+            "{} {}",
+            visibility_marker(member.visibility),
+            member_signature(member)
+        );
+        if let Some(description) = &member.description {
+            member_declaration.push_str(&format!(" — {description}"));
+        }
         append_diagram_text(
             cell_list,
             &format!("{indent}  "),
             &format!("{indent}  "),
-            &format!(
-                "{} {}",
-                visibility_marker(member.visibility),
-                member_signature(member)
-            ),
+            &member_declaration,
             width,
             DiagramAnchor {
                 target: PlanReviewTarget::EntityMember {
-                    entity_id: entity.entity_id.clone(),
-                    member_id: member.member_id.clone(),
+                    entity: entity.name.clone(),
+                    member: member.name.clone(),
                 },
                 json_path: format!("{entity_path}/members/{member_index}"),
                 path: Some(entity.path.clone()),
@@ -1226,16 +1222,20 @@ fn append_entity_cells(
     }
     for (variant_index, variant) in entity.variants.iter().enumerate() {
         let variant_path = format!("{entity_path}/variants/{variant_index}");
+        let mut variant_declaration = variant.name.clone();
+        if let Some(description) = &variant.description {
+            variant_declaration.push_str(&format!(" — {description}"));
+        }
         append_diagram_text(
             cell_list,
             &format!("{indent}  "),
             &format!("{indent}  "),
-            &variant.name,
+            &variant_declaration,
             width,
             DiagramAnchor {
                 target: PlanReviewTarget::EnumVariant {
-                    entity_id: entity.entity_id.clone(),
-                    variant_id: variant.variant_id.clone(),
+                    entity: entity.name.clone(),
+                    variant: variant.name.clone(),
                 },
                 json_path: variant_path.clone(),
                 path: Some(entity.path.clone()),
@@ -1243,17 +1243,21 @@ fn append_entity_cells(
             },
         );
         for (field_index, field) in variant.fields.iter().enumerate() {
+            let mut field_declaration = format!("{}: {}", field.name, field.type_name);
+            if let Some(description) = &field.description {
+                field_declaration.push_str(&format!(" — {description}"));
+            }
             append_diagram_text(
                 cell_list,
                 &format!("{indent}    "),
                 &format!("{indent}    "),
-                &format!("{}: {}", field.name, field.type_name),
+                &field_declaration,
                 width,
                 DiagramAnchor {
                     target: PlanReviewTarget::EnumVariantField {
-                        entity_id: entity.entity_id.clone(),
-                        variant_id: variant.variant_id.clone(),
-                        field_id: field.field_id.clone(),
+                        entity: entity.name.clone(),
+                        variant: variant.name.clone(),
+                        field: field.name.clone(),
                     },
                     json_path: format!("{variant_path}/fields/{field_index}"),
                     path: Some(entity.path.clone()),
@@ -1262,7 +1266,7 @@ fn append_entity_cells(
             );
         }
     }
-    for child_index in graph.presentation_child_indices(&entity.entity_id) {
+    for child_index in graph.presentation_child_indices(&entity.name) {
         let child = &document.entity_changes[child_index];
         cell_list.push(DiagramCell {
             text: String::new(),
@@ -1339,7 +1343,7 @@ fn is_contract_kind(kind: EntityKind) -> bool {
 
 fn declaration_marker(action: ChangeAction) -> &'static str {
     match action {
-        ChangeAction::Add | ChangeAction::Modify => "*",
+        ChangeAction::Add | ChangeAction::Modify | ChangeAction::Rename => "*",
         ChangeAction::Remove => "~",
     }
 }
@@ -1380,7 +1384,7 @@ fn render_dependencies(renderer: &mut PlanRenderer, document: &PlanDocument) {
         {
             let dependency_path = format!("/dependencies/{dependency_index}");
             let target = PlanReviewTarget::Dependency {
-                dependency_id: dependency.dependency_id.clone(),
+                name: dependency.name.clone(),
             };
             let is_last = dependency_position + 1 == dependency_list.len();
             renderer.push_wrapped(
@@ -1417,7 +1421,7 @@ fn render_tasks(renderer: &mut PlanRenderer, document: &PlanDocument, graph: &Pl
             "   ",
             &format!("**{}** {}", task.title, task.description),
             PlanReviewTarget::Task {
-                task_id: task.task_id.clone(),
+                title: task.title.clone(),
             },
             &task_path,
             None,
@@ -1430,7 +1434,6 @@ fn render_tasks(renderer: &mut PlanRenderer, document: &PlanDocument, graph: &Pl
             renderer.push(
                 format!("   file {path}"),
                 PlanReviewTarget::File {
-                    task_id: task.task_id.clone(),
                     path: path.to_owned(),
                 },
                 &file_path,
@@ -1457,15 +1460,13 @@ fn render_tasks(renderer: &mut PlanRenderer, document: &PlanDocument, graph: &Pl
                             subtask_continuation,
                             &format!("{} {}", subtask.action.label(), subtask.description),
                             PlanReviewTarget::Subtask {
-                                task_id: task.task_id.clone(),
                                 path: path.to_owned(),
-                                subtask_id: subtask.subtask_id.clone(),
                             },
                             &subtask_path,
                             Some(path),
                             format!("{path}: {}", subtask.description),
                         );
-                        let entity_list = graph.entities_in_presentation_order(&subtask.entity_ids);
+                        let entity_list = graph.entities_in_presentation_order(&subtask.entities);
                         for (entity_index, entity) in entity_list.iter().enumerate() {
                             let entity_is_last = entity_index + 1 == entity_list.len();
                             let entity_prefix = format!(
@@ -1485,9 +1486,9 @@ fn render_tasks(renderer: &mut PlanRenderer, document: &PlanDocument, graph: &Pl
                                     entity.description
                                 ),
                                 PlanReviewTarget::Entity {
-                                    entity_id: entity.entity_id.clone(),
+                                    name: entity.name.clone(),
                                 },
-                                entity_json_path(document, &entity.entity_id),
+                                entity_json_path(document, &entity.name),
                                 Some(&entity.path),
                                 entity_change_label(entity),
                             );
@@ -1505,7 +1506,6 @@ fn render_tasks(renderer: &mut PlanRenderer, document: &PlanDocument, graph: &Pl
                                 test.behavior
                             ),
                             PlanReviewTarget::Test {
-                                subtask_id: test.subtask_id.clone(),
                                 category: test.category,
                             },
                             &subtask_path,
@@ -1538,7 +1538,7 @@ fn render_tests(renderer: &mut PlanRenderer, document: &PlanDocument) {
                 })
                 .collect::<Vec<_>>();
             if !test_list.is_empty() {
-                file_group_list.push((task_index, file_index, task, file, test_list));
+                file_group_list.push((task_index, file_index, file, test_list));
             }
         }
     }
@@ -1548,14 +1548,13 @@ fn render_tests(renderer: &mut PlanRenderer, document: &PlanDocument) {
         return;
     }
     let file_group_count = file_group_list.len();
-    for (group_index, (task_index, file_index, task, file, test_list)) in
+    for (group_index, (task_index, file_index, file, test_list)) in
         file_group_list.into_iter().enumerate()
     {
         let path = file.change.path();
         renderer.push(
             format!("file {path}"),
             PlanReviewTarget::File {
-                task_id: task.task_id.clone(),
                 path: path.to_owned(),
             },
             format!("/tasks/{task_index}/files/{file_index}"),
@@ -1576,7 +1575,6 @@ fn render_tests(renderer: &mut PlanRenderer, document: &PlanDocument) {
                     test.name
                 ),
                 PlanReviewTarget::Test {
-                    subtask_id: test.subtask_id.clone(),
                     category: test.category,
                 },
                 format!("/tasks/{task_index}/files/{file_index}/subtasks/{subtask_index}"),
@@ -1642,9 +1640,7 @@ fn entity_kind_label(kind: EntityKind) -> &'static str {
         EntityKind::App => "app",
         EntityKind::Config => "config",
         EntityKind::Function => "fn",
-        EntityKind::Method => "method",
         EntityKind::Constant => "constant",
-        EntityKind::Field => "field",
         EntityKind::Resource => "Resource",
         EntityKind::Cache => "Cache",
         EntityKind::Adapter => "Adapter",
@@ -1686,6 +1682,7 @@ fn action_label(action: ChangeAction) -> &'static str {
         ChangeAction::Add => "Add",
         ChangeAction::Modify => "Modify",
         ChangeAction::Remove => "Remove",
+        ChangeAction::Rename => "Rename",
     }
 }
 
@@ -1765,11 +1762,11 @@ fn entity_reference_workspace_line(target: &EntityReference) -> Option<usize> {
     }
 }
 
-fn entity_json_path(document: &PlanDocument, entity_id: &str) -> String {
+fn entity_json_path(document: &PlanDocument, entity_name: &str) -> String {
     document
         .entity_changes
         .iter()
-        .position(|entity| entity.entity_id == entity_id)
+        .position(|entity| entity.name == entity_name)
         .map(|index| format!("/entity_changes/{index}"))
         .unwrap_or_else(|| "/entity_changes".into())
 }
@@ -1787,7 +1784,6 @@ mod test {
         document.entity_changes[0].action = EntityChangeAction::Rename;
         document.entity_changes[0].renamed_from = Some("LegacyPlanDocument".into());
         let mut inspector = document.entity_changes[0].clone();
-        inspector.entity_id = "geo_parquet_inspector".into();
         inspector.action = EntityChangeAction::Add;
         inspector.renamed_from = None;
         inspector.kind = EntityKind::Struct;
@@ -1818,7 +1814,7 @@ mod test {
             subtasks: Vec::new(),
         });
 
-        let mut renderer = PlanRenderer::new();
+        let mut renderer = PlanRenderer::new(&document);
         let graph = PlanGraph::new(&document);
         render_files(&mut renderer, &document, &graph, workspace.path());
         let markdown = renderer.finish().markdown;
@@ -1848,11 +1844,11 @@ mod test {
         document.entity_changes[0].name = "GeoParquetInspector".into();
         document.entity_changes[0].path = "hello/src/inspection.rs".into();
         document.entity_changes[0].members = vec![ProgramEntityMemberChange {
-            member_id: "inspect".into(),
             action: ChangeAction::Add,
+            renamed_from: None,
             kind: MemberKind::Method,
             name: "inspect".into(),
-            description: "Inspect one local file.".into(),
+            description: Some("Inspect one local file.".into()),
             visibility: Some(Visibility::Public),
             type_name: None,
             parameters: vec![FunctionParameter {
@@ -1862,7 +1858,6 @@ mod test {
             return_type: Some("Result<InspectionReport, InspectionError>".into()),
         }];
         document.entity_changes.push(ProgramEntityChange {
-            entity_id: "inspection_report".into(),
             action: EntityChangeAction::Add,
             kind: EntityKind::Struct,
             renamed_from: None,
@@ -1875,7 +1870,6 @@ mod test {
             conforms_to: Vec::new(),
         });
         document.entity_changes.push(ProgramEntityChange {
-            entity_id: "inspection_error".into(),
             action: EntityChangeAction::Add,
             kind: EntityKind::Enum,
             renamed_from: None,
@@ -1889,7 +1883,7 @@ mod test {
         });
 
         let graph = PlanGraph::new(&document);
-        let mut renderer = PlanRenderer::new();
+        let mut renderer = PlanRenderer::new(&document);
         render_object_model(&mut renderer, &document, &graph);
         let rendered = renderer.finish();
         let inspector_line = rendered
@@ -1916,16 +1910,16 @@ mod test {
         let error_position = rendered.markdown.find(error_line).unwrap();
         assert!(inspector_position < report_position);
         assert!(report_position < error_position);
-        assert!(
-            rendered
-                .markdown
-                .contains("  + inspect(path: &Path): Result<InspectionReport, InspectionError>\n")
-        );
-        assert!(
-            rendered.markdown.contains(
-                "  + inspect(path: &Path): Result<InspectionReport, InspectionError>\n\n  *struct InspectionReport"
-            )
-        );
+        let normalized_markdown = rendered
+            .markdown
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(normalized_markdown.contains(
+            "+ inspect(path: &Path): Result<InspectionReport, InspectionError> — Inspect one local file."
+        ));
+        let description_position = rendered.markdown.find("Inspect one local file.").unwrap();
+        assert!(description_position < report_position);
         assert!(
             rendered
                 .markdown
@@ -2019,7 +2013,6 @@ mod test {
     fn renders_contracts_conformance_and_derived_children_in_fixed_columns() {
         let mut document = test_fixture("plan", "Overview");
         document.entity_changes[0] = ProgramEntityChange {
-            entity_id: "plan_document".into(),
             action: EntityChangeAction::Modify,
             kind: EntityKind::Trait,
             renamed_from: None,
@@ -2027,11 +2020,11 @@ mod test {
             description: "Defines execution behavior.".into(),
             path: "src/backend.rs".into(),
             members: vec![ProgramEntityMemberChange {
-                member_id: "backend_run".into(),
                 action: ChangeAction::Modify,
+                renamed_from: None,
                 kind: MemberKind::Method,
                 name: "run".into(),
-                description: "Run one request.".into(),
+                description: Some("Run one request.".into()),
                 visibility: Some(Visibility::Public),
                 type_name: None,
                 parameters: Vec::new(),
@@ -2042,7 +2035,6 @@ mod test {
             conforms_to: Vec::new(),
         };
         document.entity_changes.push(ProgramEntityChange {
-            entity_id: "codex_backend".into(),
             action: EntityChangeAction::Add,
             kind: EntityKind::Struct,
             renamed_from: None,
@@ -2051,22 +2043,22 @@ mod test {
             path: "src/codex.rs".into(),
             members: vec![
                 ProgramEntityMemberChange {
-                    member_id: "codex_backend_client".into(),
                     action: ChangeAction::Add,
+                    renamed_from: None,
                     kind: MemberKind::Field,
                     name: "client".into(),
-                    description: "Owns the provider client.".into(),
+                    description: Some("Owns the provider client.".into()),
                     visibility: Some(Visibility::Private),
                     type_name: Some("Client".into()),
                     parameters: Vec::new(),
                     return_type: None,
                 },
                 ProgramEntityMemberChange {
-                    member_id: "codex_backend_cache".into(),
                     action: ChangeAction::Add,
+                    renamed_from: None,
                     kind: MemberKind::Field,
                     name: "cache".into(),
-                    description: "Owns request state.".into(),
+                    description: Some("Owns request state.".into()),
                     visibility: Some(Visibility::Private),
                     type_name: Some("RequestCache".into()),
                     parameters: Vec::new(),
@@ -2076,11 +2068,10 @@ mod test {
             variants: Vec::new(),
             extends: None,
             conforms_to: vec![EntityReference::PlannedEntity {
-                entity: "plan_document".into(),
+                entity: "PlanDocument".into(),
             }],
         });
         document.entity_changes.push(ProgramEntityChange {
-            entity_id: "request_cache".into(),
             action: EntityChangeAction::Remove,
             kind: EntityKind::Cache,
             renamed_from: None,
@@ -2094,7 +2085,7 @@ mod test {
         });
 
         let graph = PlanGraph::new(&document);
-        let mut renderer = PlanRenderer::new();
+        let mut renderer = PlanRenderer::new(&document);
         render_object_model(&mut renderer, &document, &graph);
         let rendered = renderer.finish();
 
@@ -2108,12 +2099,17 @@ mod test {
         assert_eq!(backend_path_column, 26);
         assert_eq!(
             codex_path_column,
-            DIAGRAM_CONCRETE_COLUMN + DIAGRAM_PATH_COLUMN_MAX
+            DIAGRAM_CONCRETE_COLUMN + DIAGRAM_PATH_COLUMN_MAX + 3
         );
         assert!(
             rendered
                 .markdown
-                .contains("  + run(): Result                           - client: Client")
+                .contains("+ run(): Result — Run one request.")
+        );
+        assert!(
+            rendered
+                .markdown
+                .contains("- client: Client — Owns the provider client.")
         );
         let child_line = rendered
             .markdown
@@ -2194,15 +2190,14 @@ mod test {
     fn orders_task_entities_by_dependency_and_closes_final_siblings() {
         let mut document = test_fixture("plan", "Overview");
         let mut second_entity = document.entity_changes[0].clone();
-        second_entity.entity_id = "plan_renderer".into();
         second_entity.name = "PlanRenderer".into();
         second_entity.description = "Render canonical planning data.".into();
         second_entity.members = vec![ProgramEntityMemberChange {
-            member_id: "plan_renderer_document".into(),
             action: ChangeAction::Add,
+            renamed_from: None,
             kind: MemberKind::Field,
             name: "document".into(),
-            description: "Retains the canonical plan.".into(),
+            description: Some("Retains the canonical plan.".into()),
             visibility: Some(Visibility::Private),
             type_name: Some("PlanDocument".into()),
             parameters: Vec::new(),
@@ -2212,7 +2207,7 @@ mod test {
         let PlanSubtask::Work(subtask) = &mut document.tasks[0].files[0].subtasks[0] else {
             panic!("expected work subtask");
         };
-        subtask.entity_ids.push("plan_renderer".into());
+        subtask.entities.push("PlanRenderer".into());
 
         let rendered = render_plan(&document).unwrap();
         let task_markdown = rendered
@@ -2238,24 +2233,21 @@ mod test {
     fn orders_each_subtask_without_requiring_the_dependency_parent() {
         let mut document = test_fixture("plan", "Overview");
         let mut report = document.entity_changes[0].clone();
-        report.entity_id = "inspection_report".into();
         report.name = "InspectionReport".into();
         report.description = "Own one inspection result.".into();
         let mut error = document.entity_changes[0].clone();
-        error.entity_id = "inspection_error".into();
         error.kind = EntityKind::Enum;
         error.name = "InspectionError".into();
         error.description = "Classify inspection failures.".into();
         let mut inspector = document.entity_changes[0].clone();
-        inspector.entity_id = "geo_parquet_inspector".into();
         inspector.name = "GeoParquetInspector".into();
         inspector.description = "Coordinate one inspection.".into();
         inspector.members = vec![ProgramEntityMemberChange {
-            member_id: "geo_parquet_inspector_inspect".into(),
             action: ChangeAction::Add,
+            renamed_from: None,
             kind: MemberKind::Method,
             name: "inspect".into(),
-            description: "Inspect one local file.".into(),
+            description: Some("Inspect one local file.".into()),
             visibility: Some(Visibility::Public),
             type_name: None,
             parameters: Vec::new(),
@@ -2264,21 +2256,19 @@ mod test {
         document.entity_changes = vec![report, error, inspector];
         document.tasks[0].files[0].subtasks = vec![
             PlanSubtask::Work(PlanWorkSubtask {
-                subtask_id: "create_inspector".into(),
                 action: SubtaskAction::Create,
                 description: "Create the inspector boundary.".into(),
-                entity_ids: vec!["geo_parquet_inspector".into()],
+                entities: vec!["GeoParquetInspector".into()],
             }),
             PlanSubtask::Work(PlanWorkSubtask {
-                subtask_id: "create_results".into(),
                 action: SubtaskAction::Create,
                 description: "Create the result boundaries.".into(),
-                entity_ids: vec!["inspection_error".into(), "inspection_report".into()],
+                entities: vec!["InspectionError".into(), "InspectionReport".into()],
             }),
         ];
 
         let graph = PlanGraph::new(&document);
-        let mut renderer = PlanRenderer::new();
+        let mut renderer = PlanRenderer::new(&document);
         render_tasks(&mut renderer, &document, &graph);
         let task_markdown = renderer.finish().markdown;
         let result_subtask = task_markdown
@@ -2309,7 +2299,6 @@ mod test {
         document.flows[0].title = "DataFusion table inspection".into();
         document.flows[0].steps = vec![
             PlanFlowStep {
-                step_id: "register".into(),
                 action: "Register local Parquet".into(),
                 target: EntityReference::ExternalEntity {
                     entity_kind: ReferencedEntityKind::Type,
@@ -2317,7 +2306,6 @@ mod test {
                     dependency: Some("datafusion".into()),
                 },
                 edges: vec![PlanFlowEdge {
-                    edge_id: "register_table".into(),
                     relation: PlanFlowRelation::Write {
                         callable: PlanCallable {
                             kind: PlanCallableKind::Method,
@@ -2337,14 +2325,12 @@ mod test {
                 branches: Vec::new(),
             },
             PlanFlowStep {
-                step_id: "observe".into(),
                 action: "Read table observations".into(),
                 target: EntityReference::PlannedEntity {
-                    entity: "plan_document".into(),
+                    entity: "PlanDocument".into(),
                 },
                 edges: vec![
                     PlanFlowEdge {
-                        edge_id: "schema".into(),
                         relation: PlanFlowRelation::Read {
                             callable: PlanCallable {
                                 kind: PlanCallableKind::Method,
@@ -2362,7 +2348,6 @@ mod test {
                         }),
                     },
                     PlanFlowEdge {
-                        edge_id: "count".into(),
                         relation: PlanFlowRelation::Call {
                             callable: PlanCallable {
                                 kind: PlanCallableKind::Method,
@@ -2381,13 +2366,11 @@ mod test {
                 branches: Vec::new(),
             },
             PlanFlowStep {
-                step_id: "assemble".into(),
                 action: "Assemble inspection summary".into(),
                 target: EntityReference::PlannedEntity {
-                    entity: "plan_document".into(),
+                    entity: "PlanDocument".into(),
                 },
                 edges: vec![PlanFlowEdge {
-                    edge_id: "return_summary".into(),
                     relation: PlanFlowRelation::Return,
                     target: EntityReference::ExternalEntity {
                         entity_kind: ReferencedEntityKind::Endpoint,
@@ -2402,13 +2385,11 @@ mod test {
                 branches: Vec::new(),
             },
             PlanFlowStep {
-                step_id: "render".into(),
                 action: "Render inspection output".into(),
                 target: EntityReference::PlannedEntity {
-                    entity: "plan_document".into(),
+                    entity: "PlanDocument".into(),
                 },
                 edges: vec![PlanFlowEdge {
-                    edge_id: "emit_stdout".into(),
                     relation: PlanFlowRelation::Emit,
                     target: EntityReference::ExternalEntity {
                         entity_kind: ReferencedEntityKind::Endpoint,
@@ -2498,15 +2479,7 @@ mod test {
             .navigation
             .anchor
             .iter()
-            .find(|anchor| {
-                matches!(
-                    &anchor.target,
-                    PlanReviewTarget::FlowEdge {
-                        edge_id,
-                        ..
-                    } if edge_id == "schema"
-                )
-            })
+            .find(|anchor| anchor.json_path == "/flows/0/steps/1/edges/0")
             .expect("schema edge anchor");
         assert_eq!(schema_edge_anchor.json_path, "/flows/0/steps/1/edges/0");
         assert!(matches!(
@@ -2556,14 +2529,12 @@ mod test {
             name: "terminal".into(),
             dependency: None,
         };
-        let terminal_step = |step_id: &str, action: &str, result: &str| PlanFlowStep {
-            step_id: step_id.into(),
+        let terminal_step = |action: &str, result: &str| PlanFlowStep {
             action: action.into(),
             target: EntityReference::PlannedEntity {
-                entity: "plan_document".into(),
+                entity: "PlanDocument".into(),
             },
             edges: vec![PlanFlowEdge {
-                edge_id: format!("{step_id}_emit"),
                 relation: PlanFlowRelation::Emit,
                 target: terminal_target(),
                 expansion: Vec::new(),
@@ -2574,13 +2545,11 @@ mod test {
             branches: Vec::new(),
         };
         document.flows[0].steps = vec![PlanFlowStep {
-            step_id: "route".into(),
             action: "Route inspection".into(),
             target: EntityReference::PlannedEntity {
-                entity: "plan_document".into(),
+                entity: "PlanDocument".into(),
             },
             edges: vec![PlanFlowEdge {
-                edge_id: "inspect".into(),
                 relation: PlanFlowRelation::Call {
                     callable: PlanCallable {
                         kind: PlanCallableKind::Method,
@@ -2588,16 +2557,14 @@ mod test {
                     },
                 },
                 target: EntityReference::PlannedEntity {
-                    entity: "plan_document".into(),
+                    entity: "PlanDocument".into(),
                 },
                 expansion: vec![PlanFlowStep {
-                    step_id: "read_metadata".into(),
                     action: "Read metadata".into(),
                     target: EntityReference::PlannedEntity {
-                        entity: "plan_document".into(),
+                        entity: "PlanDocument".into(),
                     },
                     edges: vec![PlanFlowEdge {
-                        edge_id: "read_schema".into(),
                         relation: PlanFlowRelation::Read {
                             callable: PlanCallable {
                                 kind: PlanCallableKind::Method,
@@ -2622,14 +2589,12 @@ mod test {
             }],
             branches: vec![
                 PlanFlowBranch {
-                    branch_id: "success".into(),
                     condition: "success".into(),
-                    steps: vec![terminal_step("render_report", "Render report", "stdout")],
+                    steps: vec![terminal_step("Render report", "stdout")],
                 },
                 PlanFlowBranch {
-                    branch_id: "failure".into(),
                     condition: "failure".into(),
-                    steps: vec![terminal_step("emit_failure", "Emit failure", "stderr")],
+                    steps: vec![terminal_step("Emit failure", "stderr")],
                 },
             ],
         }];
@@ -2705,19 +2670,12 @@ mod test {
             path: "src/plan/validation.rs".into(),
             line: 76,
         };
-        let step_id = step.step_id.clone();
-
         let rendered = render_plan(&document).unwrap();
         let anchor = rendered
             .navigation
             .anchor
             .iter()
-            .find(|anchor| {
-                matches!(
-                    &anchor.target,
-                    PlanReviewTarget::FlowStep { step_id: candidate, .. } if candidate == &step_id
-                )
-            })
+            .find(|anchor| anchor.json_path == "/flows/0/steps/0")
             .expect("workspace flow step anchor");
 
         assert!(rendered.markdown.contains("[src/plan/validation.rs]"));
@@ -2753,17 +2711,69 @@ mod test {
     }
 
     #[test]
+    fn omits_explicit_and_inferred_construct_results_because_the_value_is_implied() {
+        let mut document = test_fixture("plan", "Overview");
+        document.flows[0].steps[0].edges = vec![
+            PlanFlowEdge {
+                relation: PlanFlowRelation::Construct,
+                target: EntityReference::PlannedEntity {
+                    entity: "PlanDocument".into(),
+                },
+                expansion: Vec::new(),
+                result: Some(PlanFlowValue::Type {
+                    name: "PlanDocument".into(),
+                }),
+            },
+            PlanFlowEdge {
+                relation: PlanFlowRelation::Call {
+                    callable: PlanCallable {
+                        kind: PlanCallableKind::Function,
+                        name: "from_parts".into(),
+                    },
+                },
+                target: EntityReference::PlannedEntity {
+                    entity: "PlanDocument".into(),
+                },
+                expansion: Vec::new(),
+                result: Some(PlanFlowValue::Type {
+                    name: "PlanDocument".into(),
+                }),
+            },
+        ];
+
+        let rendered = render_plan(&document).unwrap();
+        let diagram = rendered
+            .markdown
+            .split("## Code flow: Execution")
+            .nth(1)
+            .expect("flow section")
+            .split("```text\n")
+            .nth(1)
+            .expect("flow fence")
+            .split("\n```")
+            .next()
+            .expect("flow diagram");
+
+        assert!(diagram.contains("├─ Construct PlanDocument"));
+        assert!(diagram.contains("└─ Construct PlanDocument.from_parts()"));
+        assert!(!diagram.contains("→ PlanDocument"));
+        for edge_index in 0..2 {
+            assert!(!rendered.navigation.anchor.iter().any(|anchor| {
+                anchor.json_path == format!("/flows/0/steps/0/edges/{edge_index}/result")
+            }));
+        }
+    }
+
+    #[test]
     fn moves_an_owner_below_content_when_the_right_column_cannot_fit() {
         let mut document = test_fixture("plan", "Overview");
         let action = "Read a deliberately wide observation that consumes the diagram line width";
         document.flows[0].steps = vec![PlanFlowStep {
-            step_id: "wide_observation".into(),
             action: action.into(),
             target: EntityReference::PlannedEntity {
-                entity: "plan_document".into(),
+                entity: "PlanDocument".into(),
             },
             edges: vec![PlanFlowEdge {
-                edge_id: "emit_observation".into(),
                 relation: PlanFlowRelation::Emit,
                 target: EntityReference::ExternalEntity {
                     entity_kind: ReferencedEntityKind::Endpoint,
@@ -2806,22 +2816,12 @@ mod test {
         let first_step = document.flows[0].steps[0].clone();
         document.flows[0].steps = vec![
             PlanFlowStep {
-                step_id: "first".into(),
                 action: "First action".into(),
                 ..first_step.clone()
             },
             PlanFlowStep {
-                step_id: "second".into(),
                 action: "Second action".into(),
-                edges: first_step
-                    .edges
-                    .iter()
-                    .cloned()
-                    .map(|mut edge| {
-                        edge.edge_id = format!("second_{}", edge.edge_id);
-                        edge
-                    })
-                    .collect(),
+                edges: first_step.edges.clone(),
                 ..first_step
             },
         ];
@@ -2837,7 +2837,6 @@ mod test {
     fn renders_auditable_dependencies_before_tasks() {
         let mut document = test_fixture("plan", "Overview");
         document.dependencies.push(PlanDependencyChange {
-            dependency_id: "dependency_tokio".into(),
             action: ChangeAction::Add,
             name: "tokio".into(),
             version: "1".into(),
@@ -2848,7 +2847,6 @@ mod test {
                 .into(),
         });
         document.dependencies.push(PlanDependencyChange {
-            dependency_id: "dependency_serde".into(),
             action: ChangeAction::Modify,
             name: "serde".into(),
             version: "1.0".into(),
@@ -2927,7 +2925,6 @@ mod test {
         let PlanSubtask::Test(test) = &mut second_test else {
             panic!("expected test subtask");
         };
-        test.subtask_id = "test_rejects_missing_input".into();
         test.name = "rejects_missing_input".into();
         test.behavior = "Reject missing input.".into();
         file.subtasks.push(second_test);
@@ -2949,15 +2946,18 @@ mod test {
         let mut document = test_fixture("plan", "Overview");
         document.entity_changes[0].kind = EntityKind::Enum;
         document.entity_changes[0].variants.push(EnumVariantChange {
-            variant_id: "plan_document_variant_ready".into(),
             action: ChangeAction::Add,
+            renamed_from: None,
             name: "Ready".into(),
-            description: "Carries the ready version.".into(),
+            description: Some("Carries the ready version.".into()),
             fields: vec![EnumVariantFieldChange {
-                field_id: "plan_document_variant_ready_field_version".into(),
                 action: ChangeAction::Add,
+                renamed_from: None,
                 name: "version".into(),
                 type_name: "u64".into(),
+                kind: None,
+                description: Some("Carries the canonical plan version.".into()),
+                visibility: Some(Visibility::Public),
             }],
         });
 
@@ -2972,7 +2972,15 @@ mod test {
             enum_line.find("[src/plan.rs]"),
             Some(DIAGRAM_PATH_COLUMN_MAX)
         );
-        assert!(rendered.markdown.contains("\n  Ready\n    version: u64"));
+        let normalized_markdown = rendered
+            .markdown
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(normalized_markdown.contains(
+            "Ready — Carries the ready version. version: u64 — Carries the canonical plan version."
+        ));
+        assert!(!normalized_markdown.contains("public version"));
         assert!(!rendered.markdown.contains("**enum PlanDocument**"));
         let diagram = rendered
             .markdown
@@ -2999,7 +3007,7 @@ mod test {
     #[test]
     fn serializes_review_entities_with_an_explicit_target_type() {
         let value = serde_json::to_value(PlanReviewTarget::Entity {
-            entity_id: "plan_document".into(),
+            name: "PlanDocument".into(),
         })
         .unwrap();
 
@@ -3008,14 +3016,11 @@ mod test {
             Some(&serde_json::json!("entity"))
         );
         assert_eq!(
-            value.pointer("/entity_id"),
-            Some(&serde_json::json!("plan_document"))
+            value.pointer("/name"),
+            Some(&serde_json::json!("PlanDocument"))
         );
 
         let edge_value = serde_json::to_value(PlanReviewTarget::FlowEdge {
-            flow_id: "inspection".into(),
-            step_id: "observe".into(),
-            edge_id: "schema".into(),
             callable_kind: Some(PlanCallableKind::Method),
             callable_name: Some("schema".into()),
             reference_kind: PlanReviewReferenceKind::ExternalEntity,
@@ -3029,10 +3034,7 @@ mod test {
             edge_value.pointer("/target_type"),
             Some(&serde_json::json!("flow_edge"))
         );
-        assert_eq!(
-            edge_value.pointer("/edge_id"),
-            Some(&serde_json::json!("schema"))
-        );
+        assert!(edge_value.get("edge_id").is_none());
         assert_eq!(
             edge_value.pointer("/callable_kind"),
             Some(&serde_json::json!("method"))

@@ -997,6 +997,8 @@ impl HarnessBroker {
             self.rustdoc
                 .callable_hover(
                     &target.package_list,
+                    &target.receiver_package,
+                    &target.receiver_version,
                     &target.receiver,
                     &callable.name,
                     callable.kind,
@@ -1023,6 +1025,8 @@ impl HarnessBroker {
             self.rustdoc
                 .callable_source(
                     &target.package_list,
+                    &target.receiver_package,
+                    &target.receiver_version,
                     &target.receiver,
                     &callable.name,
                     callable.kind,
@@ -1053,18 +1057,10 @@ impl HarnessBroker {
             .get("expected_version")
             .and_then(Value::as_u64)
             .with_context(|| format!("{method} requires expected_version"))?;
-        let flow_id = params
-            .get("flow_id")
+        let json_path = params
+            .get("json_path")
             .and_then(Value::as_str)
-            .with_context(|| format!("{method} requires flow_id"))?;
-        let step_id = params
-            .get("step_id")
-            .and_then(Value::as_str)
-            .with_context(|| format!("{method} requires step_id"))?;
-        let edge_id = params
-            .get("edge_id")
-            .and_then(Value::as_str)
-            .with_context(|| format!("{method} requires edge_id"))?;
+            .with_context(|| format!("{method} requires json_path"))?;
         let selection = params
             .get("selection")
             .and_then(Value::as_str)
@@ -1081,14 +1077,14 @@ impl HarnessBroker {
             document.version == expected_version,
             "plan version changed before Rust documentation resolved"
         );
-        let flow = document
-            .flows
-            .iter()
-            .find(|flow| flow.flow_id == flow_id)
-            .context("Rust documentation flow no longer exists")?;
-        let edge = flow
-            .edge(step_id, edge_id)
-            .context("Rust documentation flow edge no longer exists")?;
+        let document_value = serde_json::to_value(&document)?;
+        let edge = document_value
+            .pointer(json_path)
+            .context("Rust documentation flow edge no longer exists")
+            .and_then(|value| {
+                serde_json::from_value::<crate::plan::PlanFlowEdge>(value.clone())
+                    .context("Rust documentation path does not identify a flow edge")
+            })?;
         let crate::plan::EntityReference::ExternalEntity {
             name: receiver,
             dependency: Some(receiver_dependency),
@@ -1099,7 +1095,7 @@ impl HarnessBroker {
         };
         let receiver = receiver.clone();
         let receiver_dependency = receiver_dependency.clone();
-        let relation = edge.relation.clone();
+        let relation = edge.relation;
         let dependency_index = document
             .dependencies
             .iter()
@@ -1827,6 +1823,7 @@ impl HarnessBroker {
             let now_ms = self.clock.now_ms();
             let plan_id = Uuid::new_v4().to_string();
             let document = PlanDocument {
+                schema_version: crate::plan::PLAN_SCHEMA_VERSION,
                 version: 1,
                 plan_id: plan_id.clone(),
                 title: crate::plan::PROVISIONAL_PLAN_TITLE.into(),
@@ -4099,7 +4096,7 @@ Planning continuation: turn {} of {}.",
             .map(str::to_owned)
             .or_else(|| self.session.active_plan_id.clone())
             .context("no plan awaits review")?;
-        let entity_id = required_text(&params, "entity_id")?;
+        let entity_name = required_text(&params, "entity_name")?;
         let new_name = required_text(&params, "name")?;
         anyhow::ensure!(!new_name.trim().is_empty(), "entity name cannot be empty");
         let mut plan = self
@@ -4122,9 +4119,9 @@ Planning continuation: turn {} of {}.",
         let previous_name = document
             .entity_changes
             .iter()
-            .find(|entity| entity.entity_id == entity_id || entity.name == entity_id)
+            .find(|entity| entity.name == entity_name)
             .map(|entity| entity.name.clone())
-            .with_context(|| format!("program entity `{entity_id}` does not exist"))?;
+            .with_context(|| format!("program entity `{entity_name}` does not exist"))?;
         anyhow::ensure!(
             previous_name != new_name,
             "new entity name matches current name"
@@ -4132,7 +4129,7 @@ Planning continuation: turn {} of {}.",
         let result = self.plan_file.rename_added_entity(
             &self.session.id,
             &plan.id,
-            &entity_id,
+            &entity_name,
             new_name.clone(),
         )?;
         plan.model_revision = plan.model_revision.saturating_add(1);
@@ -4303,11 +4300,18 @@ Planning continuation: turn {} of {}.",
             completed_at_ms: None,
         };
         if let Some(active_task) = active_task {
+            let task_path = execution_record
+                .scheduler
+                .task
+                .iter()
+                .find(|task| task.state == crate::plan::PlanTaskState::Active)
+                .map(|task| task.task_path.clone())
+                .context("activated task path is missing")?;
             execution_record.append_lifecycle(
                 None,
                 execution_created_at_ms,
                 PlanExecutionLifecycleEvent::TaskStarted {
-                    task_id: active_task.task_id.clone(),
+                    task_path,
                     ordinal: 1,
                     total: accepted_document.tasks.len(),
                     title: active_task.title.clone(),
@@ -4815,19 +4819,15 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             .filter(|deviation| deviation.execution_id == execution.id)
             .collect::<Vec<_>>();
         let effective = crate::plan::build_effective_plan(&accepted, &deviation_list)?;
-        let active_task_id = execution
+        let active_task_index = execution
             .scheduler
             .task
             .iter()
-            .find(|task| task.state == crate::plan::PlanTaskState::Active)
-            .map(|task| task.task_id.as_str());
-        let active_task = active_task_id.and_then(|task_id| {
-            effective
-                .document
-                .tasks
-                .iter()
-                .find(|task| task.task_id == task_id)
-        });
+            .enumerate()
+            .find(|(_, task)| task.state == crate::plan::PlanTaskState::Active)
+            .map(|(task_index, _)| task_index);
+        let active_task =
+            active_task_index.and_then(|task_index| effective.document.tasks.get(task_index));
         Ok(Some(execution_prompt(
             kind,
             &execution.id,
@@ -4923,12 +4923,27 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             accepted_revision,
         )?;
         let mut deviation_list = self.store.list_plan_deviation(&self.session.id)?;
+        let effective_before_deviation =
+            crate::plan::build_effective_plan(&accepted, &deviation_list)?;
         let mut pause_for_review = false;
         for request in std::mem::take(&mut output.plan_deviation) {
             anyhow::ensure!(
                 request.plan_id == plan.id,
                 "deviation plan id does not match execution"
             );
+            let effective_value = serde_json::to_value(&effective_before_deviation.document)?;
+            for pointer in [
+                request.task_path.as_deref(),
+                request.subtask_path.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                anyhow::ensure!(
+                    effective_value.pointer(pointer).is_some(),
+                    "deviation references a path outside the effective plan"
+                );
+            }
             let disposition = match request.kind {
                 PlanDeviationKind::Informational => PlanDeviationDisposition::Recorded,
                 PlanDeviationKind::Scope
@@ -4950,8 +4965,8 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
                 disposition,
                 summary: request.summary,
                 reason: request.reason,
-                task_id: request.task_id,
-                subtask_id: request.subtask_id,
+                task_path: request.task_path,
+                subtask_path: request.subtask_path,
                 affected_paths: request.affected_paths,
                 proposed_changes: request.proposed_changes,
                 created_at_ms: deviation_created_at_ms,
@@ -5003,15 +5018,14 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
                 .scheduler
                 .task
                 .iter()
-                .position(|task| task.task_id == report.task_id)
+                .position(|task| task.task_path == report.task_path)
                 .context("scheduled task not found")?;
             let task = effective
                 .document
                 .tasks
-                .iter()
-                .find(|task| task.task_id == report.task_id)
+                .get(task_index)
                 .context("canonical task not found")?;
-            let task_id = task.task_id.clone();
+            let task_path = report.task_path.clone();
             let task_title = task.title.clone();
             let task_started_at_ms = execution.scheduler.task[task_index].started_at_ms;
             let report_state = report.state;
@@ -5025,7 +5039,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
                     Some(interaction_id.to_owned()),
                     transition_at_ms,
                     PlanExecutionLifecycleEvent::TaskCompleted {
-                        task_id,
+                        task_path,
                         ordinal: task_index + 1,
                         total: execution.scheduler.task.len(),
                         title: task_title,
@@ -5039,13 +5053,14 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
                     .scheduler
                     .task
                     .iter()
-                    .position(|task| task.task_id == next_task.task_id)
+                    .position(|task| task.state == crate::plan::PlanTaskState::Active)
                     .context("activated task not found")?;
+                let next_task_path = execution.scheduler.task[next_index].task_path.clone();
                 execution.append_lifecycle(
                     Some(interaction_id.to_owned()),
                     transition_at_ms,
                     PlanExecutionLifecycleEvent::TaskStarted {
-                        task_id: next_task.task_id.clone(),
+                        task_path: next_task_path,
                         ordinal: next_index + 1,
                         total: execution.scheduler.task.len(),
                         title: next_task.title.clone(),
@@ -6131,94 +6146,85 @@ mod test {
                 panic!("planning prompt should include the canonical document: {request_text}")
             });
         let mut mutation = crate::plan::PlanMutation {
-            plan: Some(crate::plan::PlanFieldMutation {
-                modify: crate::plan::PlanFieldPatch {
-                    title: Some("Migration plan".into()),
-                    overview: Some(overview.into()),
-                    ..Default::default()
-                },
+            plan: Some(crate::plan::PlanFieldPatch {
+                title: Some("Migration plan".into()),
+                overview: Some(overview.into()),
+                ..Default::default()
             }),
             ..Default::default()
         };
         if document.tasks.is_empty() {
-            mutation.entity_changes = Some(crate::plan::CollectionMutation {
-                add: vec![crate::plan::ProgramEntityChange {
-                    entity_id: "migrate".into(),
-                    action: crate::plan::EntityChangeAction::Modify,
-                    kind: crate::plan::EntityKind::Function,
-                    renamed_from: None,
-                    name: "migrate".into(),
-                    description: "Apply the selected strategy.".into(),
-                    path: "src/migration.rs".into(),
-                    members: Vec::new(),
-                    variants: Vec::new(),
-                    extends: None,
-                    conforms_to: Vec::new(),
-                }],
-                ..Default::default()
-            });
-            mutation.flows = Some(crate::plan::CollectionMutation {
-                add: vec![crate::plan::PlanFlow {
-                    flow_id: "migration_flow".into(),
-                    title: "Migration".into(),
-                    description: "Start from the selected migration and produce updated persisted state. Keep migration decisions separate from storage ownership.".into(),
-                    steps: vec![crate::plan::PlanFlowStep {
-                        step_id: "apply_migration".into(),
-                        action: "Apply migration".into(),
-                        target: crate::plan::EntityReference::PlannedEntity {
-                            entity: "migrate".into(),
-                        },
-                        edges: vec![crate::plan::PlanFlowEdge {
-                            edge_id: "migration_result".into(),
-                            relation: crate::plan::PlanFlowRelation::Write {
-                                callable: crate::plan::PlanCallable {
-                                    kind: crate::plan::PlanCallableKind::Method,
-                                    name: "persist".into(),
+            mutation.set = Some(crate::plan::PlanResourceSet {
+                entity_changes: Some(vec![crate::plan::ProgramEntityChange {
+                        action: crate::plan::EntityChangeAction::Modify,
+                        kind: crate::plan::EntityKind::Function,
+                        renamed_from: None,
+                        name: "migrate".into(),
+                        description: "Apply the selected strategy.".into(),
+                        path: "src/migration.rs".into(),
+                        members: Vec::new(),
+                        variants: Vec::new(),
+                        extends: None,
+                        conforms_to: Vec::new(),
+                }]),
+                flows: Some(vec![crate::plan::PlanFlow {
+                        title: "Migration".into(),
+                        description: "Start from the selected migration and produce updated persisted state. Keep migration decisions separate from storage ownership.".into(),
+                        steps: vec![crate::plan::PlanFlowStep {
+                            action: "Apply migration".into(),
+                            target: crate::plan::EntityReference::PlannedEntity {
+                                entity: "migrate".into(),
+                            },
+                            edges: vec![crate::plan::PlanFlowEdge {
+                                relation: crate::plan::PlanFlowRelation::Write {
+                                    callable: crate::plan::PlanCallable {
+                                        kind: crate::plan::PlanCallableKind::Method,
+                                        name: "persist".into(),
+                                    },
                                 },
-                            },
-                            target: crate::plan::EntityReference::ExternalEntity {
-                                entity_kind: crate::plan::ReferencedEntityKind::Type,
-                                name: "MigrationStore".into(),
-                                dependency: None,
-                            },
-                            expansion: Vec::new(),
-                            result: Some(crate::plan::PlanFlowValue::Text {
-                                text: "updated persisted state".into(),
-                            }),
+                                target: crate::plan::EntityReference::ExternalEntity {
+                                    entity_kind: crate::plan::ReferencedEntityKind::Type,
+                                    name: "MigrationStore".into(),
+                                    dependency: None,
+                                },
+                                expansion: Vec::new(),
+                                result: Some(crate::plan::PlanFlowValue::Text {
+                                    text: "updated persisted state".into(),
+                                }),
+                            }],
+                            branches: Vec::new(),
                         }],
-                        branches: Vec::new(),
-                    }],
-                }],
-                ..Default::default()
-            });
-            mutation.tasks = Some(crate::plan::CollectionMutation {
-                add: vec![crate::plan::PlanTask {
-                    task_id: "implement_migration".into(),
-                    title: "Implement the migration".into(),
-                    description: "Apply the selected strategy at its owner.".into(),
-                    files: vec![crate::plan::PlanFile {
-                        change: crate::plan::PlanFileChange::Modify {
-                            path: "src/migration.rs".into(),
-                        },
-                        subtasks: vec![
-                            crate::plan::PlanSubtask::Work(crate::plan::PlanWorkSubtask {
-                                subtask_id: "create_migration".into(),
-                                action: crate::plan::SubtaskAction::Create,
-                                description: "Change the persisted format.".into(),
-                                entity_ids: vec!["migrate".into()],
-                            }),
-                            crate::plan::PlanSubtask::Test(crate::plan::PlanTestSubtask {
-                                subtask_id: "verify_migration".into(),
-                                operation: crate::plan::TestSubtaskOperation::Test,
-                                action: crate::plan::ChangeAction::Add,
-                                name: "verify_migration".into(),
-                                category: crate::plan::TestCategory::Unit,
-                                behavior: "The selected strategy preserves valid state.".into(),
-                                covered_entity_ids: vec!["migrate".into()],
-                            }),
-                        ],
-                    }],
-                }],
+                }]),
+                tasks: Some(vec![crate::plan::PlanTask {
+                        title: "Implement the migration".into(),
+                        description: "Apply the selected strategy at its owner.".into(),
+                        files: vec![crate::plan::PlanFile {
+                            change: crate::plan::PlanFileChange::Modify {
+                                path: "src/migration.rs".into(),
+                            },
+                            subtasks: vec![
+                                crate::plan::PlanSubtask::Work(
+                                    crate::plan::PlanWorkSubtask {
+                                        action: crate::plan::SubtaskAction::Create,
+                                        description: "Change the persisted format.".into(),
+                                        entities: vec!["migrate".into()],
+                                    },
+                                ),
+                                crate::plan::PlanSubtask::Test(
+                                    crate::plan::PlanTestSubtask {
+                                        operation: crate::plan::TestSubtaskOperation::Test,
+                                        action: crate::plan::ChangeAction::Add,
+                                        renamed_from: None,
+                                        name: "verify_migration".into(),
+                                        category: crate::plan::TestCategory::Unit,
+                                        behavior:
+                                            "The selected strategy preserves valid state.".into(),
+                                        covers_entities: vec!["migrate".into()],
+                                    },
+                                ),
+                            ],
+                        }],
+                }]),
                 ..Default::default()
             });
         }
@@ -8344,7 +8350,7 @@ mod test {
                 method: "plan.entity.rename".into(),
                 params: json!({
                     "plan_id": plan.id,
-                    "entity_id": "migrate",
+                    "entity_name": "migrate",
                     "name": "MigrationRunner",
                 }),
             })
@@ -8373,7 +8379,7 @@ mod test {
                 method: "plan.entity.rename".into(),
                 params: json!({
                     "plan_id": plan.id,
-                    "entity_id": "migrate",
+                    "entity_name": "migrate",
                     "name": "MigrationRunner",
                     "expected_version": document.version,
                 }),
@@ -8398,7 +8404,7 @@ mod test {
             .unwrap();
         assert_eq!(updated_document.entity_changes[0].name, "MigrationRunner");
         assert_eq!(
-            updated_document.tasks[0].files[0].subtasks[0].owned_entity_ids(),
+            updated_document.tasks[0].files[0].subtasks[0].owned_entities(),
             ["MigrationRunner"]
         );
         assert_eq!(

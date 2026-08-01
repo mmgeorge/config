@@ -21,18 +21,17 @@ mod validation;
 pub use audit::{
     PlanAudit, PlanAuditPathDifference, PlanAuditTask, build_plan_audit, render_plan_audit,
 };
+pub(crate) use deviation::plan_deviation_request_schema;
 pub use deviation::{
     EffectivePlan, PlanDeviation, PlanDeviationDisposition, PlanDeviationKind,
     PlanDeviationRequest, ScopeDeviationReview, build_effective_plan,
 };
 pub use document::*;
-pub(crate) use edit::restore_internal_identity;
+pub(crate) use edit::plan_edit_request_schema;
 pub use edit::{
-    CollectionMutation, EnumVariantFieldPatch, EnumVariantPatch, PatchField, PlanAssumptionPatch,
-    PlanEditRequest, PlanEditResult, PlanFieldMutation, PlanFieldPatch, PlanFilePatch,
-    PlanFlowPatch, PlanFlowStepPatch, PlanMutation, PlanSubtaskPatch, PlanTaskPatch,
-    PlanTestSubtaskPatch, PlanWorkSubtaskPatch, ProgramEntityMemberPatch, ProgramEntityPatch,
-    apply_plan_edit, apply_plan_mutation,
+    PatchField, PlanEditRequest, PlanEditResult, PlanFieldPatch, PlanMutation, PlanMutationError,
+    PlanResourceDelete, PlanResourceRename, PlanResourceSet, PlanSemanticRename, apply_plan_edit,
+    apply_plan_mutation,
 };
 pub use graph::{PlanGraph, ResolvedPlanEntity};
 pub use prompt::{PlanExecutionPromptKind, PlanPrompt, execution_prompt};
@@ -660,13 +659,13 @@ pub enum PlanExecutionState {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PlanExecutionLifecycleEvent {
     TaskStarted {
-        task_id: String,
+        task_path: String,
         ordinal: usize,
         total: usize,
         title: String,
     },
     TaskCompleted {
-        task_id: String,
+        task_path: String,
         ordinal: usize,
         total: usize,
         title: String,
@@ -841,11 +840,11 @@ impl PlanFileStore {
         &self,
         session_id: &str,
         plan_id: &str,
-        entity_id: &str,
+        entity_name: &str,
         new_name: String,
     ) -> Result<PlanEditResult> {
         let document = self.read_working_document(session_id, plan_id)?;
-        let result = edit::rename_added_entity(&document, entity_id, new_name)?;
+        let result = edit::rename_added_entity(&document, entity_name, new_name)?;
         self.write_working_document(session_id, &result.plan_id, &result.document)?;
         Ok(result)
     }
@@ -1088,11 +1087,9 @@ mod test {
                     plan_id: "plan".into(),
                     expected_version: 1,
                     mutation: PlanMutation {
-                        plan: Some(PlanFieldMutation {
-                            modify: PlanFieldPatch {
-                                overview: Some("Edited".into()),
-                                ..Default::default()
-                            },
+                        plan: Some(PlanFieldPatch {
+                            overview: Some("Edited".into()),
+                            ..Default::default()
                         }),
                         ..Default::default()
                     },
@@ -1143,9 +1140,8 @@ mod test {
                     plan_id: "plan".into(),
                     expected_version: 1,
                     mutation: PlanMutation {
-                        entity_changes: Some(CollectionMutation {
-                            add: vec![ProgramEntityChange {
-                                entity_id: "inspection_service".into(),
+                        set: Some(PlanResourceSet {
+                            entity_changes: Some(vec![ProgramEntityChange {
                                 action: EntityChangeAction::Add,
                                 kind: EntityKind::Struct,
                                 renamed_from: None,
@@ -1156,7 +1152,7 @@ mod test {
                                 variants: Vec::new(),
                                 extends: None,
                                 conforms_to: Vec::new(),
-                            }],
+                            }]),
                             ..Default::default()
                         }),
                         ..Default::default()
@@ -1176,6 +1172,41 @@ mod test {
             .to_string();
         assert!(submission_error.contains("must belong to exactly one subtask"));
 
+        let mut repaired_entity = incomplete
+            .document
+            .entity_changes
+            .iter()
+            .find(|entity| entity.name == "InspectionService")
+            .unwrap()
+            .clone();
+        repaired_entity.members.push(ProgramEntityMemberChange {
+            action: ChangeAction::Add,
+            renamed_from: None,
+            kind: MemberKind::Method,
+            name: "inspect".into(),
+            description: Some("Inspect input.".into()),
+            visibility: Some(Visibility::Public),
+            type_name: None,
+            parameters: Vec::new(),
+            return_type: Some("InspectionReport".into()),
+        });
+        let mut repaired_task = incomplete
+            .document
+            .tasks
+            .iter()
+            .find(|task| task.title == "Create plan state")
+            .unwrap()
+            .clone();
+        repaired_task.files.push(PlanFile {
+            change: PlanFileChange::Add {
+                path: "src/inspection.rs".into(),
+            },
+            subtasks: vec![PlanSubtask::Work(PlanWorkSubtask {
+                action: SubtaskAction::Create,
+                description: "the inspection owner.".into(),
+                entities: vec!["InspectionService".into()],
+            })],
+        });
         let repaired = store
             .edit_working_document(
                 "session",
@@ -1183,55 +1214,9 @@ mod test {
                     plan_id: "plan".into(),
                     expected_version: 2,
                     mutation: PlanMutation {
-                        entity_changes: Some(CollectionMutation {
-                            modify: vec![ProgramEntityPatch {
-                                entity_id: "InspectionService".into(),
-                                action: None,
-                                kind: None,
-                                renamed_from: PatchField::Missing,
-                                name: None,
-                                description: None,
-                                path: None,
-                                members: Some(CollectionMutation {
-                                    add: vec![ProgramEntityMemberChange {
-                                        member_id: "inspect".into(),
-                                        action: ChangeAction::Add,
-                                        kind: MemberKind::Method,
-                                        name: "inspect".into(),
-                                        description: "Inspect input.".into(),
-                                        visibility: Some(Visibility::Public),
-                                        type_name: None,
-                                        parameters: Vec::new(),
-                                        return_type: Some("InspectionReport".into()),
-                                    }],
-                                    ..Default::default()
-                                }),
-                                variants: None,
-                                extends: PatchField::Missing,
-                                conforms_to: None,
-                            }],
-                            ..Default::default()
-                        }),
-                        tasks: Some(CollectionMutation {
-                            modify: vec![PlanTaskPatch {
-                                task_id: "Create plan state".into(),
-                                title: None,
-                                description: None,
-                                files: Some(CollectionMutation {
-                                    add: vec![PlanFile {
-                                        change: PlanFileChange::Add {
-                                            path: "src/inspection.rs".into(),
-                                        },
-                                        subtasks: vec![PlanSubtask::Work(PlanWorkSubtask {
-                                            subtask_id: "create_inspection".into(),
-                                            action: SubtaskAction::Create,
-                                            description: "the inspection owner.".into(),
-                                            entity_ids: vec!["inspection_service".into()],
-                                        })],
-                                    }],
-                                    ..Default::default()
-                                }),
-                            }],
+                        set: Some(PlanResourceSet {
+                            entity_changes: Some(vec![repaired_entity]),
+                            tasks: Some(vec![repaired_task]),
                             ..Default::default()
                         }),
                         ..Default::default()

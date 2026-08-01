@@ -46,9 +46,10 @@ local ok, failure = pcall(function()
   }
   vim.fn.writefile(source_line_list, working_path)
   write_json(vim.fs.joinpath(fixture_directory, "working.json"), {
+    plan_id = "plan",
+    version = 1,
     entity_changes = {
       {
-        entity_id = "inspector",
         action = "add",
         kind = "struct",
         name = "GeoParquetInspector",
@@ -56,7 +57,6 @@ local ok, failure = pcall(function()
         path = "hello/src/inspection.rs",
       },
       {
-        entity_id = "report",
         action = "rename",
         renamed_from = "LegacyReport",
         kind = "struct",
@@ -68,6 +68,8 @@ local ok, failure = pcall(function()
     tasks = {},
   })
   write_json(vim.fs.joinpath(fixture_directory, "working.index.json"), {
+    plan_id = "plan",
+    plan_version = 1,
     anchor = {
       {
         line = 5,
@@ -94,7 +96,7 @@ local ok, failure = pcall(function()
         json_path = "/entity_changes/0",
         target = {
           target_type = "file_tree_entity",
-          entity_id = "inspector",
+          name = "GeoParquetInspector",
           path = "hello/src/inspection.rs",
         },
       },
@@ -103,7 +105,7 @@ local ok, failure = pcall(function()
         json_path = "/entity_changes/1",
         target = {
           target_type = "file_tree_entity",
-          entity_id = "report",
+          name = "InspectionReport",
           path = "hello/src/inspection.rs",
         },
       },

@@ -43,13 +43,13 @@ pub enum PlanExecutionTimelineItem {
         interaction: InteractionRecord,
     },
     TaskStarted {
-        task_id: String,
+        task_path: String,
         ordinal: usize,
         total: usize,
         title: String,
     },
     TaskCompleted {
-        task_id: String,
+        task_path: String,
         ordinal: usize,
         total: usize,
         title: String,
@@ -303,24 +303,24 @@ fn append_plan_execution_lifecycle<'a>(
 ) {
     item_list.extend(lifecycle_list.map(|record| match &record.event {
         PlanExecutionLifecycleEvent::TaskStarted {
-            task_id,
+            task_path,
             ordinal,
             total,
             title,
         } => PlanExecutionTimelineItem::TaskStarted {
-            task_id: task_id.clone(),
+            task_path: task_path.clone(),
             ordinal: *ordinal,
             total: *total,
             title: title.clone(),
         },
         PlanExecutionLifecycleEvent::TaskCompleted {
-            task_id,
+            task_path,
             ordinal,
             total,
             title,
             elapsed_ms,
         } => PlanExecutionTimelineItem::TaskCompleted {
-            task_id: task_id.clone(),
+            task_path: task_path.clone(),
             ordinal: *ordinal,
             total: *total,
             title: title.clone(),
@@ -578,7 +578,7 @@ mod test {
                     after_interaction_id: None,
                     occurred_at_ms: 1,
                     event: PlanExecutionLifecycleEvent::TaskStarted {
-                        task_id: "task-one".into(),
+                        task_path: "/tasks/0".into(),
                         ordinal: 1,
                         total: 2,
                         title: "First task".into(),
@@ -589,7 +589,7 @@ mod test {
                     after_interaction_id: Some("first".into()),
                     occurred_at_ms: 2,
                     event: PlanExecutionLifecycleEvent::TaskCompleted {
-                        task_id: "task-one".into(),
+                        task_path: "/tasks/0".into(),
                         ordinal: 1,
                         total: 2,
                         title: "First task".into(),
@@ -601,7 +601,7 @@ mod test {
                     after_interaction_id: Some("first".into()),
                     occurred_at_ms: 2,
                     event: PlanExecutionLifecycleEvent::TaskStarted {
-                        task_id: "task-two".into(),
+                        task_path: "/tasks/1".into(),
                         ordinal: 2,
                         total: 2,
                         title: "Second task".into(),
@@ -624,7 +624,7 @@ mod test {
         let item_list = project_plan_execution_item(&execution, vec![second, first]);
         assert!(matches!(
             &item_list[0],
-            PlanExecutionTimelineItem::TaskStarted { task_id, .. } if task_id == "task-one"
+            PlanExecutionTimelineItem::TaskStarted { task_path, .. } if task_path == "/tasks/0"
         ));
         assert!(matches!(
             &item_list[1],
@@ -632,11 +632,11 @@ mod test {
         ));
         assert!(matches!(
             &item_list[2],
-            PlanExecutionTimelineItem::TaskCompleted { task_id, .. } if task_id == "task-one"
+            PlanExecutionTimelineItem::TaskCompleted { task_path, .. } if task_path == "/tasks/0"
         ));
         assert!(matches!(
             &item_list[3],
-            PlanExecutionTimelineItem::TaskStarted { task_id, .. } if task_id == "task-two"
+            PlanExecutionTimelineItem::TaskStarted { task_path, .. } if task_path == "/tasks/1"
         ));
         assert!(matches!(
             &item_list[4],

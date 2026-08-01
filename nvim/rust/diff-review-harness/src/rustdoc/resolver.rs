@@ -230,12 +230,21 @@ impl RustdocResolver {
     pub async fn callable_hover(
         &self,
         package_list: &[(String, String)],
+        receiver_package: &str,
+        receiver_version: &str,
         receiver: &str,
         callable: &str,
         kind: PlanCallableKind,
     ) -> Result<RustdocHover, RustdocError> {
         Ok(self
-            .resolve_callable(package_list, receiver, callable, kind)
+            .resolve_callable(
+                package_list,
+                receiver_package,
+                receiver_version,
+                receiver,
+                callable,
+                kind,
+            )
             .await?
             .hover())
     }
@@ -253,12 +262,21 @@ impl RustdocResolver {
     pub async fn callable_source(
         &self,
         package_list: &[(String, String)],
+        receiver_package: &str,
+        receiver_version: &str,
         receiver: &str,
         callable: &str,
         kind: PlanCallableKind,
     ) -> Result<RustdocSourceLocation, RustdocError> {
         let resolved = self
-            .resolve_callable(package_list, receiver, callable, kind)
+            .resolve_callable(
+                package_list,
+                receiver_package,
+                receiver_version,
+                receiver,
+                callable,
+                kind,
+            )
             .await?;
         self.source_location(resolved).await
     }
@@ -277,15 +295,21 @@ impl RustdocResolver {
     async fn resolve_callable(
         &self,
         package_list: &[(String, String)],
+        receiver_package: &str,
+        receiver_version: &str,
         receiver: &str,
         callable: &str,
         kind: PlanCallableKind,
     ) -> Result<ResolvedRustdocItem, RustdocError> {
+        let receiver_index = self.index(receiver_package, receiver_version).await?;
+        let resolved_receiver = receiver_index
+            .resolve_receiver(receiver)
+            .map_err(map_lookup)?;
         let mut match_list = Vec::new();
         let mut unavailable_list = Vec::new();
         for (package, version) in package_list {
             match self.index(package, version).await {
-                Ok(index) => match index.callable(receiver, callable, kind) {
+                Ok(index) => match index.callable(&resolved_receiver, callable, kind) {
                     Ok(item) => match_list.push(ResolvedRustdocItem::new(package, version, item)),
                     Err(LookupError::Missing(_)) => {}
                     Err(error) => return Err(map_lookup(error)),
@@ -301,7 +325,8 @@ impl RustdocResolver {
                 unavailable_list.len()
             ))),
             [] => Err(RustdocError::Missing(format!(
-                "callable `{receiver}::{callable}` does not exist in the plan's Rust dependencies"
+                "callable `{}::{callable}` does not exist in the plan's Rust dependencies",
+                resolved_receiver.authored()
             ))),
             _ => Err(RustdocError::Ambiguous(format!(
                 "callable `{receiver}::{callable}` resolves in {} dependencies",
@@ -481,6 +506,8 @@ mod test {
         let hover = resolver
             .callable_hover(
                 &[("geoparquet".into(), version)],
+                "geoparquet",
+                "0.8.0",
                 "ReaderBuilder",
                 "metadata",
                 PlanCallableKind::Method,
@@ -547,6 +574,8 @@ mod test {
         let location = resolver
             .callable_source(
                 &[("geoparquet".into(), "0.8.0".into())],
+                "geoparquet",
+                "0.8.0",
                 "ReaderBuilder",
                 "metadata",
                 PlanCallableKind::Method,

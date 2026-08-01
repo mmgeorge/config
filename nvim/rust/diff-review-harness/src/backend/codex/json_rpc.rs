@@ -10,6 +10,7 @@ use crate::backend::{
 };
 use crate::control_tools::{
     ControlToolInvocation, ControlToolRuntime, ControlTurnContext, apply_invocation,
+    control_tool_failure_json,
 };
 use crate::plan::{PlanDocument, apply_plan_edit, render_plan};
 use crate::session::{ContextUsage, ExecutionMode};
@@ -130,34 +131,28 @@ impl DynamicToolTraceContext {
 
 fn plan_mutation_summary(arguments: &Value) -> Value {
     let mut resource_map = serde_json::Map::new();
-    for resource_name in [
-        "plan",
-        "entity_changes",
-        "dependencies",
-        "flows",
-        "tasks",
-        "assumptions",
-    ] {
-        let Some(resource) = arguments.get(resource_name).and_then(Value::as_object) else {
+    if let Some(plan) = arguments.get("plan").and_then(Value::as_object)
+        && !plan.is_empty()
+    {
+        resource_map.insert("plan".into(), json!({ "patch": plan.len() }));
+    }
+    if arguments.get("assumptions").is_some_and(Value::is_array) {
+        resource_map.insert("assumptions".into(), json!({ "replace": 1 }));
+    }
+    for resource_name in ["entity_changes", "dependencies", "flows", "tasks"] {
+        let Some(operation_list) = arguments.get(resource_name).and_then(Value::as_array) else {
             continue;
         };
         let mut action_map = serde_json::Map::new();
-        for action_name in ["add", "modify", "remove"] {
-            let count = resource
-                .get(action_name)
-                .and_then(Value::as_array)
-                .map_or(0, Vec::len);
+        for action_name in ["create", "replace", "delete"] {
+            let count = operation_list
+                .iter()
+                .filter(|operation| {
+                    operation.get("operation").and_then(Value::as_str) == Some(action_name)
+                })
+                .count();
             if count > 0 {
                 action_map.insert(action_name.into(), json!(count));
-            }
-        }
-        if resource_name == "plan" {
-            let count = resource
-                .get("modify")
-                .and_then(Value::as_object)
-                .map_or(0, serde_json::Map::len);
-            if count > 0 {
-                action_map.insert("modify".into(), json!(count));
             }
         }
         if !action_map.is_empty() {
@@ -551,6 +546,11 @@ impl CodexJsonRpc {
                     let validation_started_at = Instant::now();
                     let mut decoded_output = BackendOutput::default();
                     if let Err(error) = apply_invocation(&invocation, &mut decoded_output) {
+                        let failure_json = control_tool_failure_json(
+                            &invocation,
+                            &error,
+                            self.plan_document.as_ref(),
+                        );
                         if let Some(context) = trace_context {
                             self.trace.record(
                                 &self.session_id,
@@ -566,10 +566,7 @@ impl CodexJsonRpc {
                         return Ok(json!({
                             "contentItems": [{
                                 "type": "inputText",
-                                "text": format!(
-                                    "{} received invalid arguments: {error:#}. Use the exact tool schema. Group mutations by resource, then use add, modify, or remove inside that resource. Nested resources follow the same shape. Never use JSON Patch op, path, or value fields.",
-                                    invocation.name
-                                )
+                                "text": failure_json
                             }],
                             "success": false
                         }));
@@ -591,6 +588,11 @@ impl CodexJsonRpc {
                     {
                         Ok(message) => message,
                         Err(error) => {
+                            let failure_json = control_tool_failure_json(
+                                &invocation,
+                                &error,
+                                self.plan_document.as_ref(),
+                            );
                             if let Some(context) = trace_context {
                                 self.trace.record(
                                     &self.session_id,
@@ -606,10 +608,7 @@ impl CodexJsonRpc {
                             return Ok(json!({
                                 "contentItems": [{
                                     "type": "inputText",
-                                    "text": format!(
-                                        "{} failed canonical validation: {error:#}. The plan remains editable. Correct the referenced resource and retry harness_plan_submit with the current version.",
-                                        invocation.name
-                                    )
+                                    "text": failure_json
                                 }],
                                 "success": false
                             }));
@@ -631,7 +630,7 @@ impl CodexJsonRpc {
                     } else {
                         match invocation.name.as_str() {
                             "harness_plan_edit" => format!(
-                                "Plan edit accepted. The active canonical version is {}.",
+                                "Plan edit accepted. The active canonical version is {}. Submission validation has not run.",
                                 self.plan_document
                                     .as_ref()
                                     .map(|document| document.version)
@@ -1832,7 +1831,7 @@ mod test {
                         "arguments": {
                             "plan_id": "plan-1",
                             "expected_version": 1,
-                            "plan": { "modify": { "overview": overview } }
+                            "plan": { "overview": overview }
                         }
                     }
                 }
@@ -1886,7 +1885,7 @@ mod test {
                 .mutation
                 .plan
                 .as_ref()
-                .and_then(|plan| plan.modify.overview.as_deref()),
+                .and_then(|plan| plan.overview.as_deref()),
             Some("corrected")
         );
     }
@@ -1945,7 +1944,7 @@ mod test {
                 "arguments": {
                     "plan_id": "plan-1",
                     "expected_version": 1,
-                    "plan": { "modify": { "overview": "corrected" } }
+                    "plan": { "overview": "corrected" }
                 }
             }
         });
@@ -2122,10 +2121,8 @@ mod test {
                     "plan_id": "plan-1",
                     "expected_version": 3,
                     "plan": {
-                        "modify": {
-                            "overview": "Updated overview",
-                            "usage": null
-                        }
+                        "overview": "Updated overview",
+                        "usage": null
                     }
                 }
             }
@@ -2136,7 +2133,7 @@ mod test {
 
         assert_eq!(context.invocation_id, "call-1");
         assert_eq!(context.mutation_count, 2);
-        assert_eq!(context.mutation_summary["plan"]["modify"], 2);
+        assert_eq!(context.mutation_summary["plan"]["patch"], 2);
         assert_eq!(context.plan_id.as_deref(), Some("plan-1"));
         assert_eq!(context.expected_version, Some(3));
         assert_eq!(payload["thread_id"], "thread-1");
@@ -2182,7 +2179,7 @@ mod test {
                 "arguments": {
                     "plan_id": "plan-1",
                     "expected_version": 1,
-                    "plan": { "modify": { "overview": "Updated overview" } }
+                    "plan": { "overview": "Updated overview" }
                 }
             } }
         });
@@ -2205,7 +2202,7 @@ mod test {
         let arguments = json!({
             "plan_id": "plan-id",
             "expected_version": 1,
-            "plan": { "modify": { "overview": "Updated overview" } }
+            "plan": { "overview": "Updated overview" }
         });
         let completed = json!({
             "method": "item/completed",

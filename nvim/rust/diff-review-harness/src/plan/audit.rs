@@ -14,10 +14,10 @@ pub struct PlanAuditPathDifference {
 /// Reports the final execution state and evidence of one planned task.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PlanAuditTask {
-    pub task_id: String,
+    pub task_path: String,
     pub state: PlanTaskState,
-    pub completed_subtask_ids: Vec<String>,
-    pub completed_entity_ids: Vec<String>,
+    pub completed_subtask_paths: Vec<String>,
+    pub completed_entity_paths: Vec<String>,
     pub changed_paths: Vec<String>,
 }
 
@@ -99,10 +99,10 @@ pub fn build_plan_audit(
             .task
             .iter()
             .map(|task| PlanAuditTask {
-                task_id: task.task_id.clone(),
+                task_path: task.task_path.clone(),
                 state: task.state,
-                completed_subtask_ids: task.completed_subtask_ids.clone(),
-                completed_entity_ids: task.completed_entity_ids.clone(),
+                completed_subtask_paths: task.completed_subtask_paths.clone(),
+                completed_entity_paths: task.completed_entity_paths.clone(),
                 changed_paths: task.changed_paths.clone(),
             })
             .collect(),

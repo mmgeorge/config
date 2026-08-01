@@ -8,6 +8,8 @@ local uml_style = require("diff_review.views.plan_review.uml_style")
 ---@field source_lines string[]
 ---@field document table
 ---@field navigation table
+---@field plan_id string
+---@field plan_version integer
 ---@field task_heading_line integer
 ---@field test_heading_line integer
 ---@field anchor_by_json_path table<string, table>
@@ -22,7 +24,6 @@ PlanTaskModel.__index = PlanTaskModel
 ---@field description string
 
 ---@class DiffReviewPlanEntity: DiffReviewPlanDescribedItem
----@field entity_id string
 ---@field action "add"|"modify"|"remove"
 ---@field members DiffReviewPlanDescribedItem[]
 ---@field variants DiffReviewPlanDescribedItem[]
@@ -189,26 +190,12 @@ local function directory_fold_id_list(path, include_leaf)
 end
 
 ---@param model DiffReviewPlanTaskModel
----@param entity_id string?
+---@param entity_name string?
 ---@return table?
-local function entity_by_id(model, entity_id)
+local function entity_by_name(model, entity_name)
   return vim.iter(model.document.entity_changes or {}):find(function(entity)
-    return entity.entity_id == entity_id
+    return entity.name == entity_name
   end)
-end
-
----@param model DiffReviewPlanTaskModel
----@param subtask_id string?
----@return table?
-local function test_by_id(model, subtask_id)
-  for _, task in ipairs(model.document.tasks or {}) do
-    for _, file in ipairs(task.files or {}) do
-      for _, subtask in ipairs(file.subtasks or {}) do
-        if subtask.subtask_id == subtask_id and subtask.operation == "test" then return subtask end
-      end
-    end
-  end
-  return nil
 end
 
 ---@param model DiffReviewPlanTaskModel
@@ -230,7 +217,7 @@ local function file_tree_segments(model, text, target)
     end
     return task_tree_style.change("", "", name, nil, "DiffReviewWalkthroughItemTitle")(text, 1)
   elseif target.target_type == "file_tree_entity" then
-    local entity = entity_by_id(model, target.entity_id)
+    local entity = entity_by_name(model, target.name)
     if not entity then return { { text } } end
     if entity.action == "rename" then
       return task_tree_style.rename(tostring(entity.renamed_from or ""), tostring(entity.name or ""))(text, 1)
@@ -241,13 +228,11 @@ local function file_tree_segments(model, text, target)
     local kind = entity_kind_label[entity.kind] or tostring(entity.kind or "entity")
     return task_tree_style.change(action, kind, tostring(entity.name or ""))(text, 1)
   elseif target.target_type == "file_tree_test" then
-    local test = test_by_id(model, target.subtask_id)
-    if not test then return { { text } } end
-    local action = test.action == "add" and "(new)"
-        or test.action == "remove" and "(remove)"
+    local action = target.action == "add" and "(new)"
+        or target.action == "remove" and "(remove)"
         or ""
-    local kind = title_case(test.category) .. "Test"
-    return task_tree_style.change(action, kind, tostring(test.name or ""), "@type", "@function")(text, 1)
+    local kind = title_case(target.category) .. "Test"
+    return task_tree_style.change(action, kind, tostring(target.name or ""), "@type", "@function")(text, 1)
   end
   return { { text } }
 end
@@ -373,11 +358,9 @@ function PlanTaskModel:task_nodes()
   local entity_by_reference = {}
   local entity_index_by_reference = {}
   for entity_index, entity in ipairs(self.document.entity_changes or {}) do
-    for _, entity_reference in ipairs({ entity.entity_id, entity.name }) do
-      if type(entity_reference) == "string" and entity_reference ~= "" then
-        entity_by_reference[entity_reference] = entity
-        entity_index_by_reference[entity_reference] = entity_index - 1
-      end
+    if type(entity.name) == "string" and entity.name ~= "" then
+      entity_by_reference[entity.name] = entity
+      entity_index_by_reference[entity.name] = entity_index - 1
     end
   end
 
@@ -400,27 +383,27 @@ function PlanTaskModel:task_nodes()
         local subtask_source = node_source(self, subtask_json_path)
         if subtask.operation == "test" then
           local test_node = vim.tbl_extend("force", {
-            id = ("plan:task:%d:file:%d:test:%d"):format(task_index, file_index, subtask_index),
+            id = subtask_json_path,
             branch = true,
             foldable = false,
           }, test_node_fields(subtask, self.entity_name_set), source_fields(subtask_source))
           subtask_node_list[#subtask_node_list + 1] = test_node
         else
           local entity_node_list = {}
-          for entity_position, entity_id in ipairs(subtask.entities or {}) do
-            local entity = entity_by_reference[entity_id]
+          for _, entity_name in ipairs(subtask.entities or {}) do
+            local entity = entity_by_reference[entity_name]
             if entity then
-              local entity_json_path = ("/entity_changes/%d"):format(entity_index_by_reference[entity_id])
+              local entity_json_path = ("/entity_changes/%d"):format(entity_index_by_reference[entity_name])
               local entity_source = node_source(self, entity_json_path)
               entity_node_list[#entity_node_list + 1] = vim.tbl_extend("force", {
-                id = ("plan:entity:%s:%d"):format(tostring(entity_id), entity_position),
+                id = entity_json_path,
                 branch = true,
                 foldable = false,
               }, entity_node_fields(entity, self.entity_name_set), source_fields(entity_source))
             end
           end
           subtask_node_list[#subtask_node_list + 1] = vim.tbl_extend("force", {
-            id = ("plan:task:%d:file:%d:subtask:%d"):format(task_index, file_index, subtask_index),
+            id = subtask_json_path,
             text = ("%s %s"):format(title_case(subtask.operation), tostring(subtask.description or "")),
             segments_for_line = task_tree_style.entity_references(nil, self.entity_name_set),
             branch = true,
@@ -431,7 +414,7 @@ function PlanTaskModel:task_nodes()
         end
       end
       file_node_list[#file_node_list + 1] = vim.tbl_extend("force", {
-        id = ("plan:task:%d:file:%d"):format(task_index, file_index),
+        id = file_json_path,
         text = "file " .. file_label,
         segments_for_line = task_tree_style.file(file_label),
         branch = false,
@@ -442,7 +425,7 @@ function PlanTaskModel:task_nodes()
       }, source_fields(file_source))
     end
     task_node_list[#task_node_list + 1] = vim.tbl_extend("force", {
-      id = ("plan:task:%d"):format(task_index),
+      id = task_json_path,
       text = ("%s %s"):format(task_title, tostring(task.description or "")),
       segments_for_line = task_tree_style.entity_references(
         task_tree_style.task(("%d. %s"):format(task_index, task_title)),
@@ -515,19 +498,16 @@ end
 function M.described_item_at_position(document, anchor, line, byte_col)
   local target = anchor and anchor.target or nil
   if type(target) == "table" then
-    local entity = item_by_identity(
-      document.entity_changes,
-      "entity_id",
-      target.entity_id
-    )
+    local entity_name = target.target_type == "entity" and target.name or target.entity
+    local entity = item_by_identity(document.entity_changes, "name", entity_name)
     local item = entity
     if entity and target.target_type == "entity_member" then
-      item = item_by_identity(entity.members, "member_id", target.member_id)
+      item = item_by_identity(entity.members, "name", target.member)
     elseif entity and target.target_type == "enum_variant" then
-      item = item_by_identity(entity.variants, "variant_id", target.variant_id)
+      item = item_by_identity(entity.variants, "name", target.variant)
     elseif entity and target.target_type == "enum_variant_field" then
-      local variant = item_by_identity(entity.variants, "variant_id", target.variant_id)
-      item = variant and item_by_identity(variant.fields, "field_id", target.field_id) or nil
+      local variant = item_by_identity(entity.variants, "name", target.variant)
+      item = variant and item_by_identity(variant.fields, "name", target.field) or nil
     end
     if item and occupies_identifier(line, byte_col, item.name) then return item end
   end
@@ -573,9 +553,7 @@ function PlanTaskModel:rustdoc_target_at_position(source_line, line, byte_col)
   end
   if not selection then return nil end
   return {
-    flow_id = target.flow_id,
-    step_id = target.step_id,
-    edge_id = target.edge_id,
+    json_path = anchor.json_path,
     selection = selection,
   }
 end
@@ -616,7 +594,7 @@ function PlanTaskModel:dependency_at_position(source_line, line, byte_col)
   local target = anchor and anchor.target or nil
   if not target or target.target_type ~= "dependency" then return nil end
   local dependency = vim.iter(self.document.dependencies or {}):find(function(candidate)
-    return candidate.dependency_id == target.dependency_id
+    return candidate.name == target.name
   end)
   if not dependency or type(dependency.name) ~= "string" then return nil end
   local first_byte, last_byte = line:find(dependency.name, 1, true)
@@ -644,6 +622,18 @@ function M.load(working_path)
   if not document then return nil, document_error end
   local navigation, navigation_error = read_json(vim.fs.joinpath(directory, "working.index.json"))
   if not navigation then return nil, navigation_error end
+  if type(document.plan_id) ~= "string" or document.plan_id == "" then
+    return nil, "Canonical plan document does not contain plan_id"
+  end
+  if type(document.version) ~= "number" or document.version < 1 then
+    return nil, "Canonical plan document does not contain a valid version"
+  end
+  if navigation.plan_id ~= document.plan_id then
+    return nil, "Plan navigation index does not target the canonical plan"
+  end
+  if navigation.plan_version ~= document.version then
+    return nil, "Plan navigation index does not target the canonical plan version"
+  end
   local task_heading_line = heading_line(source_lines, "# Tasks")
   local test_heading_line = heading_line(source_lines, "# Tests")
   if not task_heading_line or not test_heading_line or test_heading_line <= task_heading_line then
@@ -665,6 +655,8 @@ function M.load(working_path)
     source_lines = source_lines,
     document = document,
     navigation = navigation,
+    plan_id = document.plan_id,
+    plan_version = document.version,
     task_heading_line = task_heading_line,
     test_heading_line = test_heading_line,
     anchor_by_json_path = anchor_by_json_path,

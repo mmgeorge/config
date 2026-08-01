@@ -26,7 +26,7 @@ pub enum PlanTestStatus {
 /// Represents one test result attached to task completion evidence.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PlanTestResult {
-    pub test_subtask_id: Option<String>,
+    pub test_subtask_path: Option<String>,
     pub status: PlanTestStatus,
     pub command: Option<String>,
     pub detail: Option<String>,
@@ -35,16 +35,16 @@ pub struct PlanTestResult {
 /// Tracks granular evidence while one complete task remains the scheduling unit.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PlanTaskExecution {
-    pub task_id: String,
+    pub task_path: String,
     pub state: PlanTaskState,
     #[serde(default)]
     pub started_at_ms: Option<i64>,
     #[serde(default)]
     pub completed_at_ms: Option<i64>,
     #[serde(default)]
-    pub completed_subtask_ids: Vec<String>,
+    pub completed_subtask_paths: Vec<String>,
     #[serde(default)]
-    pub completed_entity_ids: Vec<String>,
+    pub completed_entity_paths: Vec<String>,
     #[serde(default)]
     pub test_results: Vec<PlanTestResult>,
     #[serde(default)]
@@ -57,12 +57,12 @@ pub struct PlanTaskExecution {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PlanTaskReport {
     pub execution_id: String,
-    pub task_id: String,
+    pub task_path: String,
     pub state: PlanTaskState,
     #[serde(default)]
-    pub completed_subtask_ids: Vec<String>,
+    pub completed_subtask_paths: Vec<String>,
     #[serde(default)]
-    pub completed_entity_ids: Vec<String>,
+    pub completed_entity_paths: Vec<String>,
     #[serde(default)]
     pub test_results: Vec<PlanTestResult>,
     #[serde(default)]
@@ -72,19 +72,11 @@ pub struct PlanTaskReport {
 }
 
 /// Owns ordered task selection without promoting subtasks into goals.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct PlanScheduler {
     pub plan_id: String,
+    pub plan_version: u64,
     pub task: Vec<PlanTaskExecution>,
-}
-
-impl Default for PlanScheduler {
-    fn default() -> Self {
-        Self {
-            plan_id: String::new(),
-            task: Vec::new(),
-        }
-    }
 }
 
 impl PlanScheduler {
@@ -92,16 +84,18 @@ impl PlanScheduler {
     pub fn activate(document: &PlanDocument) -> Self {
         Self {
             plan_id: document.plan_id.clone(),
+            plan_version: document.version,
             task: document
                 .tasks
                 .iter()
-                .map(|task| PlanTaskExecution {
-                    task_id: task.task_id.clone(),
+                .enumerate()
+                .map(|(task_index, _)| PlanTaskExecution {
+                    task_path: task_pointer(task_index),
                     state: PlanTaskState::Pending,
                     started_at_ms: None,
                     completed_at_ms: None,
-                    completed_subtask_ids: Vec::new(),
-                    completed_entity_ids: Vec::new(),
+                    completed_subtask_paths: Vec::new(),
+                    completed_entity_paths: Vec::new(),
                     test_results: Vec::new(),
                     changed_paths: Vec::new(),
                     summary: None,
@@ -117,16 +111,14 @@ impl PlanScheduler {
         document: &'a PlanDocument,
         now_ms: i64,
     ) -> Option<&'a PlanTask> {
-        let execution = self
+        let (task_index, execution) = self
             .task
             .iter_mut()
-            .find(|task| task.state == PlanTaskState::Pending)?;
+            .enumerate()
+            .find(|(_, task)| task.state == PlanTaskState::Pending)?;
         execution.state = PlanTaskState::Active;
         execution.started_at_ms = Some(now_ms);
-        document
-            .tasks
-            .iter()
-            .find(|task| task.task_id == execution.task_id)
+        document.tasks.get(task_index)
     }
 
     /// Return whether every required task completed successfully.
@@ -152,22 +144,30 @@ impl PlanScheduler {
             ),
             "task report must complete or block a task"
         );
+        anyhow::ensure!(
+            self.plan_id == document.plan_id && self.plan_version == document.version,
+            "scheduler does not target this plan revision"
+        );
+        let task_index = task_index_from_pointer(&report.task_path)
+            .ok_or_else(|| anyhow::anyhow!("canonical task path is invalid"))?;
         let planned_task = document
             .tasks
-            .iter()
-            .find(|task| task.task_id == report.task_id)
+            .get(task_index)
             .ok_or_else(|| anyhow::anyhow!("canonical task not found"))?;
-        validate_task_evidence(document, planned_task, &report)?;
+        validate_task_evidence(document, task_index, planned_task, &report)?;
         let task = self
             .task
-            .iter_mut()
-            .find(|task| task.task_id == report.task_id)
+            .get_mut(task_index)
             .ok_or_else(|| anyhow::anyhow!("scheduled task not found"))?;
+        anyhow::ensure!(
+            task.task_path == report.task_path,
+            "task report path does not identify the scheduled task"
+        );
         anyhow::ensure!(task.state == PlanTaskState::Active, "task is not active");
         task.state = report.state;
         task.completed_at_ms = Some(now_ms);
-        task.completed_subtask_ids = report.completed_subtask_ids;
-        task.completed_entity_ids = report.completed_entity_ids;
+        task.completed_subtask_paths = report.completed_subtask_paths;
+        task.completed_entity_paths = report.completed_entity_paths;
         task.test_results = report.test_results;
         task.changed_paths = report.changed_paths;
         task.summary = report.summary;
@@ -180,22 +180,37 @@ impl PlanScheduler {
 }
 
 fn validate_task_evidence(
-    _document: &PlanDocument,
+    document: &PlanDocument,
+    task_index: usize,
     task: &PlanTask,
     report: &PlanTaskReport,
 ) -> anyhow::Result<()> {
-    let planned_subtask_id = task
+    let planned_subtask_path = task
         .files
         .iter()
-        .flat_map(|file| &file.subtasks)
-        .map(PlanSubtask::subtask_id)
+        .enumerate()
+        .flat_map(|(file_index, file)| {
+            file.subtasks
+                .iter()
+                .enumerate()
+                .map(move |(subtask_index, _)| {
+                    subtask_pointer(task_index, file_index, subtask_index)
+                })
+        })
         .collect::<HashSet<_>>();
-    let planned_entity_id = task
+    let entity_index_by_name = document
+        .entity_changes
+        .iter()
+        .enumerate()
+        .map(|(entity_index, entity)| (entity.name.as_str(), entity_index))
+        .collect::<std::collections::HashMap<_, _>>();
+    let planned_entity_path = task
         .files
         .iter()
         .flat_map(|file| &file.subtasks)
-        .flat_map(PlanSubtask::owned_entity_ids)
-        .map(String::as_str)
+        .flat_map(PlanSubtask::owned_entities)
+        .filter_map(|entity_name| entity_index_by_name.get(entity_name.as_str()).copied())
+        .map(entity_pointer)
         .collect::<HashSet<_>>();
     let planned_path = task
         .files
@@ -207,26 +222,33 @@ fn validate_task_evidence(
                 .chain(std::iter::once(file.change.path()))
         })
         .collect::<HashSet<_>>();
-    let planned_test_subtask_id = task
+    let planned_test_subtask_path = task
         .files
         .iter()
-        .flat_map(|file| &file.subtasks)
-        .filter_map(PlanSubtask::test)
-        .map(|test| test.subtask_id.as_str())
+        .enumerate()
+        .flat_map(|(file_index, file)| {
+            file.subtasks
+                .iter()
+                .enumerate()
+                .filter(|(_, subtask)| subtask.test().is_some())
+                .map(move |(subtask_index, _)| {
+                    subtask_pointer(task_index, file_index, subtask_index)
+                })
+        })
         .collect::<HashSet<_>>();
 
     anyhow::ensure!(
         report
-            .completed_subtask_ids
+            .completed_subtask_paths
             .iter()
-            .all(|id| planned_subtask_id.contains(id.as_str())),
+            .all(|path| planned_subtask_path.contains(path)),
         "task report contains an unknown subtask"
     );
     anyhow::ensure!(
         report
-            .completed_entity_ids
+            .completed_entity_paths
             .iter()
-            .all(|id| planned_entity_id.contains(id.as_str())),
+            .all(|path| planned_entity_path.contains(path)),
         "task report contains an unknown entity"
     );
     anyhow::ensure!(
@@ -239,33 +261,57 @@ fn validate_task_evidence(
     anyhow::ensure!(
         report.test_results.iter().all(|result| {
             result
-                .test_subtask_id
+                .test_subtask_path
                 .as_deref()
-                .is_none_or(|id| planned_test_subtask_id.contains(id))
+                .is_none_or(|path| planned_test_subtask_path.contains(path))
         }),
         "task report contains a test outside the active task"
     );
     if report.state == PlanTaskState::Complete {
-        let completed_subtask_id = report
-            .completed_subtask_ids
+        let completed_subtask_path = report
+            .completed_subtask_paths
             .iter()
             .map(String::as_str)
             .collect::<HashSet<_>>();
-        let completed_entity_id = report
-            .completed_entity_ids
+        let completed_entity_path = report
+            .completed_entity_paths
             .iter()
             .map(String::as_str)
             .collect::<HashSet<_>>();
         anyhow::ensure!(
-            planned_subtask_id == completed_subtask_id,
+            planned_subtask_path
+                .iter()
+                .map(String::as_str)
+                .collect::<HashSet<_>>()
+                == completed_subtask_path,
             "complete task report must account for every subtask"
         );
         anyhow::ensure!(
-            planned_entity_id == completed_entity_id,
+            planned_entity_path
+                .iter()
+                .map(String::as_str)
+                .collect::<HashSet<_>>()
+                == completed_entity_path,
             "complete task report must account for every entity"
         );
     }
     Ok(())
+}
+
+fn task_pointer(task_index: usize) -> String {
+    format!("/tasks/{task_index}")
+}
+
+fn task_index_from_pointer(pointer: &str) -> Option<usize> {
+    pointer.strip_prefix("/tasks/")?.parse().ok()
+}
+
+fn subtask_pointer(task_index: usize, file_index: usize, subtask_index: usize) -> String {
+    format!("/tasks/{task_index}/files/{file_index}/subtasks/{subtask_index}")
+}
+
+fn entity_pointer(entity_index: usize) -> String {
+    format!("/entity_changes/{entity_index}")
 }
 
 #[cfg(test)]
@@ -277,18 +323,18 @@ mod test {
         let document = super::super::document::test_fixture("plan", "Overview");
         let mut scheduler = PlanScheduler::activate(&document);
         assert_eq!(
-            scheduler.next_task(&document, 10).unwrap().task_id,
-            "create_plan_state"
+            scheduler.next_task(&document, 10).unwrap().title,
+            "Create plan state"
         );
         scheduler
             .apply_report(
                 &document,
                 PlanTaskReport {
                     execution_id: "execution".into(),
-                    task_id: "create_plan_state".into(),
+                    task_path: "/tasks/0".into(),
                     state: PlanTaskState::Complete,
-                    completed_subtask_ids: vec!["create_owner".into()],
-                    completed_entity_ids: vec!["plan_document".into()],
+                    completed_subtask_paths: vec!["/tasks/0/files/0/subtasks/0".into()],
+                    completed_entity_paths: vec!["/entity_changes/0".into()],
                     test_results: Vec::new(),
                     changed_paths: vec!["src/plan.rs".into()],
                     summary: Some("Complete".into()),
@@ -298,7 +344,10 @@ mod test {
             )
             .unwrap();
         assert!(scheduler.is_complete());
-        assert_eq!(scheduler.task[0].completed_subtask_ids, ["create_owner"]);
+        assert_eq!(
+            scheduler.task[0].completed_subtask_paths,
+            ["/tasks/0/files/0/subtasks/0"]
+        );
         assert_eq!(scheduler.task[0].started_at_ms, Some(10));
         assert_eq!(scheduler.task[0].completed_at_ms, Some(20));
     }
@@ -315,12 +364,15 @@ mod test {
                 &document,
                 PlanTaskReport {
                     execution_id: "execution".into(),
-                    task_id: "create_plan_state".into(),
+                    task_path: "/tasks/0".into(),
                     state: PlanTaskState::Complete,
-                    completed_subtask_ids: vec!["create_owner".into(), "validates_plans".into()],
-                    completed_entity_ids: vec!["plan_document".into()],
+                    completed_subtask_paths: vec![
+                        "/tasks/0/files/0/subtasks/0".into(),
+                        "/tasks/0/files/0/subtasks/1".into(),
+                    ],
+                    completed_entity_paths: vec!["/entity_changes/0".into()],
                     test_results: vec![PlanTestResult {
-                        test_subtask_id: Some("validates_plans".into()),
+                        test_subtask_path: Some("/tasks/0/files/0/subtasks/1".into()),
                         status: PlanTestStatus::Passed,
                         command: Some("cargo test validates_plans".into()),
                         detail: None,
@@ -334,8 +386,10 @@ mod test {
             .unwrap();
 
         assert_eq!(
-            scheduler.task[0].test_results[0].test_subtask_id.as_deref(),
-            Some("validates_plans")
+            scheduler.task[0].test_results[0]
+                .test_subtask_path
+                .as_deref(),
+            Some("/tasks/0/files/0/subtasks/1")
         );
     }
 
@@ -343,7 +397,6 @@ mod test {
     fn timestamps_each_whole_task_once_across_scheduler_transitions() {
         let mut document = super::super::document::test_fixture("plan", "Overview");
         let mut second_task = document.tasks[0].clone();
-        second_task.task_id = "second_task".into();
         second_task.title = "Second task".into();
         document.tasks.push(second_task);
         let mut scheduler = PlanScheduler::activate(&document);
@@ -353,10 +406,10 @@ mod test {
                 &document,
                 PlanTaskReport {
                     execution_id: "execution".into(),
-                    task_id: "create_plan_state".into(),
+                    task_path: "/tasks/0".into(),
                     state: PlanTaskState::Complete,
-                    completed_subtask_ids: vec!["create_owner".into()],
-                    completed_entity_ids: vec!["plan_document".into()],
+                    completed_subtask_paths: vec!["/tasks/0/files/0/subtasks/0".into()],
+                    completed_entity_paths: vec!["/entity_changes/0".into()],
                     test_results: Vec::new(),
                     changed_paths: Vec::new(),
                     summary: Some("Complete".into()),
@@ -367,7 +420,7 @@ mod test {
             .unwrap()
             .unwrap();
 
-        assert_eq!(next_task.task_id, "second_task");
+        assert_eq!(next_task.title, "Second task");
         assert_eq!(scheduler.task[0].started_at_ms, Some(10));
         assert_eq!(scheduler.task[0].completed_at_ms, Some(20));
         assert_eq!(scheduler.task[1].started_at_ms, Some(20));

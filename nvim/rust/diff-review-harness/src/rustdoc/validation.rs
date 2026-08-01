@@ -157,7 +157,14 @@ pub async fn validate_plan_rust_api(
             }
         }
         match resolver
-            .callable_hover(&package_list, receiver, &callable.name, callable.kind)
+            .callable_hover(
+                &package_list,
+                dependency_name,
+                version,
+                receiver,
+                &callable.name,
+                callable.kind,
+            )
             .await
         {
             Ok(_) => {}
@@ -240,13 +247,11 @@ mod test {
         }
     }
 
-    fn emitting_step(step_id: &str, edge_id: &str) -> PlanFlowStep {
+    fn emitting_step() -> PlanFlowStep {
         PlanFlowStep {
-            step_id: step_id.into(),
             action: "Emit result".into(),
             target: endpoint("worker"),
             edges: vec![PlanFlowEdge {
-                edge_id: edge_id.into(),
                 relation: PlanFlowRelation::Emit,
                 target: endpoint("terminal"),
                 expansion: Vec::new(),
@@ -261,20 +266,17 @@ mod test {
     #[test]
     fn collects_rust_api_edges_from_expansions_and_branches() {
         let step_list = vec![PlanFlowStep {
-            step_id: "root".into(),
             action: "Route work".into(),
             target: endpoint("worker"),
             edges: vec![PlanFlowEdge {
-                edge_id: "root_edge".into(),
                 relation: PlanFlowRelation::Emit,
                 target: endpoint("terminal"),
-                expansion: vec![emitting_step("expanded", "expanded_edge")],
+                expansion: vec![emitting_step()],
                 result: None,
             }],
             branches: vec![PlanFlowBranch {
-                branch_id: "failure".into(),
                 condition: "failure".into(),
-                steps: vec![emitting_step("branched", "branched_edge")],
+                steps: vec![emitting_step()],
             }],
         }];
         let mut edge_list = Vec::new();

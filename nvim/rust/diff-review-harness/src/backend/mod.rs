@@ -20,7 +20,21 @@ use serde_json::Value;
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 
-pub(crate) const HARNESS_SYSTEM_MESSAGE: &str = "You run inside DiffReview Harness. During planning, Harness already owns the active canonical JSON PlanDocument, its plan ID, and its version. Read it with harness_plan_read when needed. Mutate it only through resource-oriented harness_plan_edit calls. Group collection mutations by resource and use add, modify, or remove inside that resource. Top-level program entities additionally support action rename with the existing identifier in renamed_from and the destination identifier in name. Nested members, enum variants, variant fields, flow steps, task files, and subtasks use the same vocabulary inside their owner. Task-file changes additionally support a tagged rename with distinct from and to paths. Model each changed program construct once as an entity_change with its lifecycle action, source path, members, variants, and ownership references. Represent each concrete test as one flat task-file subtask with operation test and its action, name, category, behavior, and optional covers_entities fields directly on that subtask. Never model a concrete test as an entity_change or create a top-level tests resource. Flow targets use tagged planned_entity, workspace_entity, or typed external_entity references. Use workspace_entity only for an unchanged repository construct and provide its entity kind, name, repository-relative path, and one-indexed declaration line. Call, read, and write relations use a structured function or method callable with a bare identifier, and construct, call, read, and write always target one type entity. External entities distinguish type receivers from endpoints and may record dependency provenance. Never replace the whole document or invent a plan ID. A planning turn must end with harness_question_ask or a successful harness_plan_submit after required edits. When submission validation fails, correct every reported resource and resubmit the current version. During execution, call harness_plan_task_report after each whole task with subtask, entity, path, and test evidence, and call harness_plan_deviation when implementation diverges from accepted intent. Call harness_question_ask whenever a material user decision remains. Use harness_question_answer only while a Harness question remains pending and the user explicitly answers it. Use harness_question_withdraw only while a Harness question remains pending and no material decision remains. Planning-feedback turns contain answers Harness already recorded and consumed, so never call either question-resolution tool from those turns. The question tools work in every mode. End the turn after a Harness question or terminal plan control call. For a terminal goal state, call harness_goal_complete or harness_goal_blocked. Never claim a control action through ordinary prose alone.";
+pub(crate) const HARNESS_SYSTEM_MESSAGE: &str = r#"You run inside DiffReview Harness. During planning, Harness owns the active canonical JSON PlanDocument, its plan ID, version, and every internal ID. Read the document with harness_plan_read before editing it. Mutate it only through harness_plan_edit.
+
+The harness_plan_edit request uses a PlanDocument edit schema. Send plan_id, expected_version, and only plan, rename, set, delete, or assumptions. Patch title, overview, and usage inside plan. Send assumptions as one complete replacement array. Under set, place complete entity_changes, dependencies, flows, and tasks directly into their ordered collection arrays without key/value wrappers. Harness derives each semantic key from the resource name or title. A matching key replaces in place, while a new key appends in request order. Under rename, group explicit {"from":"<current semantic key>","to":"<new semantic key>"} entries by resource collection. Use rename only when changing an identifying name or title, then use the destination key in set when the complete resource also changes. Under delete, group current semantic keys by resource collection. Delete retracts an entry from the plan document. To plan source or manifest removal, set a complete resource whose implementation action is remove. Every action inside a resource describes future implementation, never document editing.
+
+Each set resource contains every retained nested member, variant, step, edge, file, and subtask. Never send Harness IDs, create/replace/delete operation envelopes, recursive mutation wrappers, JSON Patch op/path fields, or the whole PlanDocument. Never repeat a semantic key, rename and delete the same resource, or place the same key in both set and delete.
+
+Model each changed program construct once as an entity_change with its lifecycle action, source path, members, variants, and ownership references. Represent each concrete test as one flat task-file subtask with operation test and its action, name, category, behavior, and optional covers_entities fields directly on that subtask. Never model a concrete test as an entity_change or create a top-level tests resource.
+
+Flow targets use tagged planned_entity, workspace_entity, or typed external_entity references. Use workspace_entity only for an unchanged repository construct and provide its entity kind, name, repository-relative path, and one-indexed declaration line. Call, read, and write relations use a structured function or method callable with a bare identifier, and construct, call, read, and write always target one type entity.
+
+Trace every dependency's claimed role into concrete plan content. Show dependencies whose APIs perform domain work through typed external flow edges, and name the owning entity plus integration mechanism for runtime, derive, build, or test support that does not belong in a runtime flow. Before naming an external Rust callable, verify it against current documentation or source for the exact dependency version. If verification cannot establish the API, keep the boundary behind a planned entity, describe its concrete work through nested steps, and name the dependency responsibility in the owning entity or task instead of replacing the work with a vague step.
+
+Every failed control call returns one JSON object with ok false, a stable code, exact violation paths, correction hints, and retry data. Parse that object, correct every violation in one edit, and use retry.expected_version when present. A planning turn must end with harness_question_ask or a successful harness_plan_submit after required edits.
+
+During execution, call harness_plan_task_report after each whole task with subtask, entity, path, and test evidence, and call harness_plan_deviation when implementation diverges from accepted intent. Call harness_question_ask whenever a material user decision remains. Use harness_question_answer only while a Harness question remains pending and the user explicitly answers it. Use harness_question_withdraw only while a Harness question remains pending and no material decision remains. Planning-feedback turns contain answers Harness already recorded and consumed, so never call either question-resolution tool from those turns. The question tools work in every mode. End the turn after a Harness question or terminal plan control call. For a terminal goal state, call harness_goal_complete or harness_goal_blocked. Never claim a control action through ordinary prose alone."#;
 
 /// Identifies one supported provider implementation without leaking launch strings across consumers.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -600,91 +614,83 @@ impl Backend for MockBackend {
         let mut plan_edit = Vec::new();
         let plan_submit = plan_document.as_ref().map(|document| {
             let mut mutation = crate::plan::PlanMutation {
-                plan: Some(crate::plan::PlanFieldMutation {
-                    modify: crate::plan::PlanFieldPatch {
-                        title: Some("Implement the requested change".into()),
-                        overview: Some(planning_note.clone().unwrap_or_default()),
-                        ..Default::default()
-                    },
+                plan: Some(crate::plan::PlanFieldPatch {
+                    title: Some("Implement the requested change".into()),
+                    overview: Some(planning_note.clone().unwrap_or_default()),
+                    ..Default::default()
                 }),
                 ..Default::default()
             };
             if document.tasks.is_empty() {
-                mutation.entity_changes = Some(crate::plan::CollectionMutation {
-                    add: vec![crate::plan::ProgramEntityChange {
-                        entity_id: "requested_change".into(),
-                        action: crate::plan::EntityChangeAction::Add,
-                        kind: crate::plan::EntityKind::Function,
-                        renamed_from: None,
-                        name: "requested_change".into(),
-                        description: "Implement the requested behavior.".into(),
-                        path: "src/change.rs".into(),
-                        members: Vec::new(),
-                        variants: Vec::new(),
-                        extends: None,
-                        conforms_to: Vec::new(),
-                    }],
-                    ..Default::default()
-                });
-                mutation.flows = Some(crate::plan::CollectionMutation {
-                    add: vec![crate::plan::PlanFlow {
-                        flow_id: "requested_change_flow".into(),
-                        title: "Requested change".into(),
-                        description: "Start from the requested change and produce its observable result. Keep implementation ownership explicit at the changed entity boundary.".into(),
-                        steps: vec![crate::plan::PlanFlowStep {
-                            step_id: "implement_requested_change".into(),
-                            action: "Implement requested change".into(),
-                            target: crate::plan::EntityReference::PlannedEntity {
-                                entity: "requested_change".into(),
-                            },
-                            edges: vec![crate::plan::PlanFlowEdge {
-                                edge_id: "requested_change_result".into(),
-                                relation: crate::plan::PlanFlowRelation::Emit,
-                                target: crate::plan::EntityReference::ExternalEntity {
-                                    entity_kind: crate::plan::ReferencedEntityKind::Endpoint,
-                                    name: "requested outcome".into(),
-                                    dependency: None,
+                mutation.set = Some(crate::plan::PlanResourceSet {
+                    entity_changes: Some(vec![crate::plan::ProgramEntityChange {
+                            action: crate::plan::EntityChangeAction::Add,
+                            kind: crate::plan::EntityKind::Function,
+                            renamed_from: None,
+                            name: "requested_change".into(),
+                            description: "Implement the requested behavior.".into(),
+                            path: "src/change.rs".into(),
+                            members: Vec::new(),
+                            variants: Vec::new(),
+                            extends: None,
+                            conforms_to: Vec::new(),
+                    }]),
+                    flows: Some(vec![crate::plan::PlanFlow {
+                            title: "Requested change".into(),
+                            description: "Start from the requested change and produce its observable result. Keep implementation ownership explicit at the changed entity boundary.".into(),
+                            steps: vec![crate::plan::PlanFlowStep {
+                                action: "Implement requested change".into(),
+                                target: crate::plan::EntityReference::PlannedEntity {
+                                    entity: "requested_change".into(),
                                 },
-                                expansion: Vec::new(),
-                                result: Some(crate::plan::PlanFlowValue::Text {
-                                    text: "completed change".into(),
-                                }),
+                                edges: vec![crate::plan::PlanFlowEdge {
+                                    relation: crate::plan::PlanFlowRelation::Emit,
+                                    target: crate::plan::EntityReference::ExternalEntity {
+                                        entity_kind: crate::plan::ReferencedEntityKind::Endpoint,
+                                        name: "requested outcome".into(),
+                                        dependency: None,
+                                    },
+                                    expansion: Vec::new(),
+                                    result: Some(crate::plan::PlanFlowValue::Text {
+                                        text: "completed change".into(),
+                                    }),
+                                }],
+                                branches: Vec::new(),
                             }],
-                            branches: Vec::new(),
-                        }],
-                    }],
-                    ..Default::default()
-                });
-                mutation.tasks = Some(crate::plan::CollectionMutation {
-                    add: vec![crate::plan::PlanTask {
-                        task_id: "implement_change".into(),
-                        title: "Implement the requested change".into(),
-                        description: "Connect the requested behavior to its source boundary."
-                            .into(),
-                        files: vec![crate::plan::PlanFile {
-                            change: crate::plan::PlanFileChange::Add {
-                                path: "src/change.rs".into(),
-                            },
-                            subtasks: vec![
-                                crate::plan::PlanSubtask::Work(crate::plan::PlanWorkSubtask {
-                                    subtask_id: "create_implementation".into(),
-                                    action: crate::plan::SubtaskAction::Create,
-                                    description: "Apply the planned behavior at its owner.".into(),
-                                    entity_ids: vec!["requested_change".into()],
-                                }),
-                                crate::plan::PlanSubtask::Test(crate::plan::PlanTestSubtask {
-                                    subtask_id: "verify_requested_change".into(),
-                                    operation: crate::plan::TestSubtaskOperation::Test,
-                                    action: crate::plan::ChangeAction::Add,
-                                    name: "verify_requested_change".into(),
-                                    category: crate::plan::TestCategory::Unit,
-                                    behavior: "The implementation produces the requested result."
-                                        .into(),
-                                    covered_entity_ids: vec!["requested_change".into()],
-                                }),
-                            ],
-                        }],
-                    }],
+                    }]),
+                    tasks: Some(vec![crate::plan::PlanTask {
+                            title: "Implement the requested change".into(),
+                            description: "Connect the requested behavior to its source boundary."
+                                .into(),
+                            files: vec![crate::plan::PlanFile {
+                                change: crate::plan::PlanFileChange::Add {
+                                    path: "src/change.rs".into(),
+                                },
+                                subtasks: vec![
+                                    crate::plan::PlanSubtask::Work(
+                                        crate::plan::PlanWorkSubtask {
+                                            action: crate::plan::SubtaskAction::Create,
+                                            description: "Apply the planned behavior at its owner."
+                                                .into(),
+                                            entities: vec!["requested_change".into()],
+                                        },
+                                    ),
+                                    crate::plan::PlanSubtask::Test(
+                                        crate::plan::PlanTestSubtask {
+                                            operation: crate::plan::TestSubtaskOperation::Test,
+                                            action: crate::plan::ChangeAction::Add,
+                                            renamed_from: None,
+                                            name: "verify_requested_change".into(),
+                                            category: crate::plan::TestCategory::Unit,
+                                            behavior:
+                                                "The implementation produces the requested result."
+                                                    .into(),
+                                            covers_entities: vec!["requested_change".into()],
+                                        },
+                                    ),
+                                ],
+                            }],
+                    }]),
                     ..Default::default()
                 });
             }
@@ -721,35 +727,53 @@ impl Backend for MockBackend {
                     .map(|task| (document, task, execution_id))
             })
             .map(
-                |(_document, task, execution_id)| crate::plan::PlanTaskReport {
+                |(document, task, execution_id)| crate::plan::PlanTaskReport {
                     execution_id,
-                    task_id: task.task_id.clone(),
+                    task_path: "/tasks/0".into(),
                     state: crate::plan::PlanTaskState::Complete,
-                    completed_subtask_ids: task
+                    completed_subtask_paths: task
                         .files
                         .iter()
-                        .flat_map(|file| {
+                        .enumerate()
+                        .flat_map(|(file_index, file)| {
                             file.subtasks
                                 .iter()
-                                .map(|subtask| subtask.subtask_id().to_owned())
+                                .enumerate()
+                                .map(move |(subtask_index, _)| {
+                                    format!("/tasks/0/files/{file_index}/subtasks/{subtask_index}")
+                                })
                         })
                         .collect(),
-                    completed_entity_ids: task
+                    completed_entity_paths: task
                         .files
                         .iter()
                         .flat_map(|file| file.subtasks.iter())
-                        .flat_map(|subtask| subtask.owned_entity_ids().iter().cloned())
+                        .flat_map(|subtask| subtask.owned_entities().iter())
+                        .filter_map(|entity_name| {
+                            document
+                                .entity_changes
+                                .iter()
+                                .position(|entity| entity.name == *entity_name)
+                        })
+                        .map(|entity_index| format!("/entity_changes/{entity_index}"))
                         .collect(),
                     test_results: task
                         .files
                         .iter()
-                        .flat_map(|file| &file.subtasks)
-                        .filter_map(crate::plan::PlanSubtask::test)
-                        .map(|test| crate::plan::PlanTestResult {
-                            test_subtask_id: Some(test.subtask_id.clone()),
-                            status: crate::plan::PlanTestStatus::Passed,
-                            command: Some("mock test".into()),
-                            detail: None,
+                        .enumerate()
+                        .flat_map(|(file_index, file)| {
+                            file.subtasks.iter().enumerate().filter_map(
+                                move |(subtask_index, subtask)| {
+                                    subtask.test().map(|_| crate::plan::PlanTestResult {
+                                        test_subtask_path: Some(format!(
+                                            "/tasks/0/files/{file_index}/subtasks/{subtask_index}"
+                                        )),
+                                        status: crate::plan::PlanTestStatus::Passed,
+                                        command: Some("mock test".into()),
+                                        detail: None,
+                                    })
+                                },
+                            )
                         })
                         .collect(),
                     changed_paths: task
@@ -867,8 +891,7 @@ pub(crate) fn mock_plan_document_from_prompt(prompt: &str) -> Option<crate::plan
             return None;
         };
         let json_end = json_start + relative_end;
-        if let Ok(mut document) = serde_json::from_str(&remaining[json_start..json_end]) {
-            crate::plan::restore_internal_identity(&mut document);
+        if let Ok(document) = serde_json::from_str(&remaining[json_start..json_end]) {
             return Some(document);
         }
         remaining = &remaining[json_end + "\n```".len()..];
@@ -922,7 +945,7 @@ mod test {
                         harness_session_id: "harness-session".into(),
                         workspace: ".".into(),
                         input: super::BackendInput::from_text(
-                            "Active canonical PlanDocument:\n```json\n{\"version\":1,\"plan_id\":\"plan\",\"title\":\"Refactor X\",\"overview\":\"Planning\",\"usage\":null,\"entity_changes\":[],\"flows\":[],\"tasks\":[],\"assumptions\":[]}\n```\n\nRefactor X",
+                            "Active canonical PlanDocument:\n```json\n{\"schema_version\":2,\"version\":1,\"plan_id\":\"plan\",\"title\":\"Refactor X\",\"overview\":\"Planning\",\"usage\":null,\"entity_changes\":[],\"dependencies\":[],\"flows\":[],\"tasks\":[],\"assumptions\":[]}\n```\n\nRefactor X",
                         ),
                         mode: PromptMode::Plan,
                         model: "mock-model".into(),
@@ -951,7 +974,7 @@ mod test {
             .mutation
             .plan
             .as_ref()
-            .and_then(|plan| plan.modify.overview.as_deref())
+            .and_then(|plan| plan.overview.as_deref())
             .expect("mock planning should update the overview");
         assert!(text.contains("Refactor X"));
         assert!(text.contains("And be sure to modify Y"));

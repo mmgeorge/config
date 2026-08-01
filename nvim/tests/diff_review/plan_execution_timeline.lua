@@ -36,7 +36,7 @@ local ok, failure = pcall(function()
     item = {
       {
         kind = "task_started",
-        task_id = "task-one",
+        task_path = "/tasks/0",
         ordinal = 1,
         total = 2,
         title = "Add durable task state",
@@ -58,7 +58,7 @@ local ok, failure = pcall(function()
       },
       {
         kind = "task_completed",
-        task_id = "task-one",
+        task_path = "/tasks/0",
         ordinal = 1,
         total = 2,
         title = "Add durable task state",
@@ -66,7 +66,7 @@ local ok, failure = pcall(function()
       },
       {
         kind = "task_started",
-        task_id = "task-two",
+        task_path = "/tasks/1",
         ordinal = 2,
         total = 2,
         title = "Render scheduler progress",

@@ -13,7 +13,7 @@ use crate::backend::{
 };
 use crate::control_tools::{
     ControlToolInvocation, ControlToolRegistry, ControlToolRuntime, ControlTurnContext,
-    apply_invocation,
+    apply_invocation, control_tool_failure_json,
 };
 use crate::session::ExecutionMode;
 use anyhow::{Context, Result};
@@ -1022,12 +1022,23 @@ impl ControlToolRouter {
             .take()
             .context("Copilot control tool ran without an active turn")?;
         let result = runtime.invoke(invocation.clone()).await;
+        let failure_json = result
+            .as_ref()
+            .err()
+            .map(|error| control_tool_failure_json(&invocation, error, runtime.plan_document()));
         *self
             .runtime
             .lock()
             .map_err(|_| anyhow::anyhow!("Copilot control-tool runtime lock poisoned"))? =
             Some(runtime);
-        let result = result?;
+        let result = match result {
+            Ok(result) => result,
+            Err(_) => {
+                return Ok(
+                    failure_json.expect("failed control-tool invocation must format one failure")
+                );
+            }
+        };
         let Some(invocation) = result.invocation else {
             return Ok(result.message);
         };
@@ -1274,6 +1285,30 @@ mod test {
             stream.receive().await.unwrap().name,
             "harness_goal_complete"
         );
+    }
+
+    #[tokio::test]
+    async fn returns_control_failures_as_provider_neutral_json() {
+        let router = Arc::new(ControlToolRouter::default());
+        let mut context = ControlTurnContext::inactive(PromptMode::Chat);
+        context.has_active_goal = true;
+        let mut stream = router.activate(context).unwrap();
+
+        let response = router
+            .route(ControlToolInvocation {
+                name: "harness_goal_complete".into(),
+                arguments: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        let failure: Value = serde_json::from_str(&response).expect("valid failure JSON");
+
+        assert_eq!(failure["ok"], false);
+        assert_eq!(failure["tool"], "harness_goal_complete");
+        assert_eq!(failure["phase"], "argument_validation");
+        assert_eq!(failure["code"], "invalid_arguments");
+        assert_eq!(failure["violation"][0]["path"], "<arguments>");
+        assert!(stream.try_receive().is_err());
     }
 
     #[test]

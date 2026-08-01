@@ -23,14 +23,16 @@ Usage:
 - Populate `usage` immediately after the overview for every caller-facing command, API, function, UI action, configuration, or text-producing workflow.
 - Put one concrete call, command, or interaction in `command` and its expected observable result in `expected_result`.
 - For a CLI, put the full executable command in `command`. Put a representative literal terminal transcript in `expected_result` that shows the actual stdout or stderr line structure with concrete sample values and the resulting exit status.
-- Never use an imperative or prose summary such as `Print the geometry column...` as a CLI `expected_result`. Show the output itself. If the command intentionally emits no terminal output, write `<no stdout>` or `<no stderr>` and still include the exit status.
-- Example CLI `expected_result`: `geometry_column: geometry\ncrs: EPSG:4326\nrow_count: 42\nexit status: 0`.
+- Never use an imperative or prose summary such as `Print the result...` as a CLI `expected_result`. Show the output itself. If the command intentionally emits no terminal output, write `<no stdout>` or `<no stderr>` and still include the exit status.
+- Example CLI `expected_result`: `status: ready\nitem_count: 42\nexit status: 0`.
 - For a visual, audio, hardware, or other non-text result, use a compact placeholder such as `<visual result: rendered preview updates with the selected theme>`.
 - Encode `usage` as JSON null only when no caller-facing behavior applies. Harness alone renders that null as `<Omitted>`.
 
 Dependencies:
-- Write every dependency justification as exactly two sentences.
-- Use the first sentence to state the dependency's architectural role and the second to explain why the existing code or standard library cannot satisfy that role.
+- Write every dependency justification as substantive reviewer-facing prose.
+- State the dependency's architectural role and explain why the existing code or standard library cannot satisfy that role.
+- Trace every dependency's claimed role into concrete plan content. Show dependencies whose APIs perform domain work through typed external flow edges, and name the owning entity plus integration mechanism for runtime, derive, build, or test support that does not belong in a runtime flow.
+- Before submission, audit every dependency against its justification. A dependency list must not promise work that the object model, flows, and tasks leave implicit.
 - For Rust dependencies, write a valid Cargo version requirement. Harness resolves and preserves one exact published version when validating referenced APIs.
 
 Object model and ownership:
@@ -46,19 +48,24 @@ Object model and ownership:
 - Write retained-state types with the walkthrough notation: unqualified `Type` for owned state, `&Type` for a retained non-owning reference, `@Type` for retained shared ownership, `Type?` for optional state, and `Type[]` for zero or more values.
 - Harness derives UML indentation from concrete entities referenced by exactly one concrete entity. Keep type expressions precise so the reviewer projection can recover that dependency hierarchy without a separate ownership field.
 - Put enum cases in `variants`. Put named payload fields under their variant because the variant exposes that data. Reserve private member visibility for state hidden by its owning entity.
+- Members, enum variants, and enum payload fields share `action`, `renamed_from`, `name`, and an optional `description`. Use `renamed_from` only with `action: "rename"` and keep the destination identifier in `name`.
+- A variant payload field may include the redundant `"kind": "field"` discriminator, but it may also omit it. Harness renders every supplied member, variant, and payload-field description.
+- Send `members`, `variants`, `conforms_to`, and each variant's `fields` as complete arrays, including empty arrays, because a set resource replaces that complete declaration subtree.
 - When direct accessors belong in the design, name them `noun()`, `noun_mut()`, and `set_noun(value)`, not `get_noun()`. Omit `noun_mut()` when the language or API does not expose a distinct mutable-reference operation.
 
 Flows:
 - Add one to three separate flows for the major affected runtime, data, request, event, persistence, recovery, or configuration paths.
-- Give every flow a natural title such as Capture, Sync, or Recovery and exactly two substantive description sentences. Use the first sentence to state the actual entry point and observable outcome. Use the second sentence to explain the ownership boundary, architectural risk, or independent review reason that makes this flow distinct. Do not merely repeat the title or enumerate steps already visible in the diagram.
+- Give every flow a natural title such as Capture, Sync, or Recovery and a substantive description. State the actual entry point and observable outcome, then explain the ownership boundary, architectural risk, or independent review reason that makes this flow distinct. Do not merely repeat the title or enumerate steps already visible in the diagram.
 - Harness renders every flow as a rooted execution tree. Top-level steps are independent roots, edge `expansion` steps execute inside that relationship before its result returns, and step `branches` represent labeled alternative continuations.
 - Give every step a concise action and the planned, workspace, or external entity that performs it. Use the step's `edges` for material runtime relationships and `branches` for mutually exclusive outcomes. Always send `edges`, `branches`, and each edge's `expansion` as complete arrays, including empty arrays.
 - Put work performed by a callee inside that edge's `expansion`. Put every branch condition in `condition` and its nonempty continuation in `steps`. Never infer nesting from adjacent top-level steps.
+- An expansion must explain material work through a `construct`, `call`, `read`, `write`, `send`, or `emit` edge, or through a meaningful branch. Never add an expansion that only returns the result already recorded on its parent edge.
 - Planned and workspace repository paths occupy the aligned right column. External participants remain inline without repository paths.
 - Choose the exact edge relation: `construct` creates the target, `call` invokes a callable, `read` obtains data through a callable, `write` mutates or persists through a callable, `send` transfers its named request or event, `emit` produces an observable effect, and `return` sends a result back to the target.
+- Put relation-specific inputs inside `relation` and every produced value or effect in the sibling edge `result`. A `send` relation uses `{"kind":"send","event":"refresh requested"}` with a result such as `{"kind":"text","text":"request accepted"}`. An `emit` relation uses only `{"kind":"emit"}` with a result such as `{"kind":"text","text":"diagnostic written"}`. `emit` and `return` accept no additional relation fields.
 - Give every `call`, `read`, and `write` relation one structured `callable` with `kind: "function"` or `"method"` and its bare identifier in `name`. Never put parentheses, arguments, receiver names, or prose in the callable name.
-- Put exactly one type entity in the target of every `construct`, `call`, `read`, and `write` edge. A changed target resolves through `{"kind":"planned_entity","entity":"entity_id"}`. An unchanged repository target uses `{"kind":"workspace_entity","entity_kind":"type","name":"TypeName","path":"src/file.rs","line":42}` with a repository-relative path and one-indexed declaration line. An external target uses `{"kind":"external_entity","entity_kind":"type","name":"TypeName","dependency":"package-name"}`; omit or null the dependency only when no package provenance applies.
-- For a Rust callable, use the receiver type's owning Cargo package in `dependency` and the exact public Rust identifier in `callable.name`. Harness validates inherent methods, associated functions, and extension-trait methods against the plan's resolved dependency versions.
+- Put exactly one type entity in the target of every `construct`, `call`, `read`, and `write` edge. A changed target resolves by its unique semantic name through `{"kind":"planned_entity","entity":"TypeName"}`. An unchanged repository target uses `{"kind":"workspace_entity","entity_kind":"type","name":"TypeName","path":"src/file.rs","line":42}` with a repository-relative path and one-indexed declaration line. An external target uses `{"kind":"external_entity","entity_kind":"type","name":"TypeName","dependency":"package-name"}`; omit or null the dependency only when no package provenance applies.
+- For a Rust callable, use the receiver type's owning Cargo package in `dependency` and the exact public Rust identifier in `callable.name`. Keep a public type alias as the external target name when callers use that alias; Harness resolves the alias's typed Rustdoc target and generic arguments internally while preserving the authored alias in the plan and review.
 - Use `entity_kind: "endpoint"` only for external actors or destinations such as terminals, workers, storage boundaries, or schedulers. `send`, `emit`, and `return` may target endpoint entities.
 - Put the value, event, result, or observable effect produced by each relationship in `result`. Use `{"kind":"type","name":"TypeName"}` for a named type and `{"kind":"text","text":"observable value"}` for other results. Inputs such as paths and files belong in the step action or callable context, never as a callable receiver.
 - For changed orchestration functions such as `main`, show concrete construction and invocation edges instead of jumping from input parsing directly to a downstream result. Reuse planned entity names and real member names so reviewers can see who constructs, calls, reads, writes, sends, emits, or returns each value.
@@ -75,8 +82,8 @@ Tasks:
 - Treat each task as an architectural claim that advances the object model or clarifies an ownership boundary.
 - Treat each task file as a concrete source-file boundary. Use `action: "add"`, `"modify"`, or `"remove"` with one repository-relative `path`. Use `action: "rename"` with distinct repository-relative `from` and `to` paths. Renamed entities and subtasks belong to the destination path.
 - Treat each implementation subtask as a local design move. Use exactly one supported operation: expose, encapsulate, move, centralize, distribute, extract, inline, split, merge, compose, embed, create, destroy, register, unregister, attach, detach, start, stop, route, resolve, defer, configure, relax, enable, disable, reuse, generalize, or specialize.
-- Write each subtask description as the grammatical complement to its structured operation because renderers prepend the operation label. For `operation: "route"`, write `"the command path into GeoParquetInspector."`, not `"Route the command path into GeoParquetInspector."`.
-- Express every concrete construct edit through an entity or nested member with an accurate kind such as class, struct, enum, trait, interface, test, app, config, function, method, constant, field, Resource, Cache, or Adapter. Top-level entities may use action add, modify, remove, or rename; rename requires `renamed_from` and the destination identifier in `name`. Nested members, variants, fields, dependencies, and tests remain add, modify, or remove.
+- Write each subtask description as the grammatical complement to its structured operation because renderers prepend the operation label. For `operation: "route"`, write `"the editor change into DraftCache."`, not `"Route the editor change into DraftCache."`.
+- Express every concrete construct edit through an entity or nested member with an accurate kind such as class, struct, enum, trait, interface, test, app, config, function, method, constant, field, Resource, Cache, or Adapter. Top-level entities, nested members, variants, payload fields, and concrete tests may use action add, modify, remove, or rename; rename requires `renamed_from` and the destination identifier in `name`. Dependencies remain add, modify, or remove because their package name identifies the manifest declaration.
 - Keep file boundaries, construct kinds, and target names distinct so the renderer can colorize and navigate them independently.
 - Include every function, type, configuration, application, test, and field that will be added, modified, or removed.
 - Attach every planned entity to exactly one implementation subtask. Order tasks by the object model and ownership relationships. Within a task, order changes in the sequence that makes the ownership change easiest to review.
@@ -101,27 +108,52 @@ Validation:
 - Ensure every changed construct appears under exactly one task subtask and every file uses a repository-relative path.
 - Ensure every major independent flow has its own description.
 - Ensure task claims, entity fields, flow values, dependencies, tests, and assumptions describe the same boundaries.
+- Ensure every dependency justification maps to a concrete typed flow relationship or an explicit support mechanism owned by an entity or task.
 - Revise any plan that violates the modularity rules, produces flow lines over 100 characters, or collapses failures and user-visible behavior into vague `handle`, `support`, `make`, or `update` wording."#;
-const EDIT_CONTRACT: &str = r#"Use harness_plan_edit as one resource-oriented mutation. Put additions under `add`, field patches under `modify`, and semantic names under `remove`. Every resource supports the same add, modify, and remove lifecycle. Nested resources use the same structure inside their owner. A complete task file uses its tagged `action` plus `path`, or `from` and `to` for a rename. A `files.modify` patch selects the current destination with `path` and replaces its tagged operation through `change` when needed. Use `members` for fields, methods, functions, constants, and properties. Use `variants` only on enum entities. Use `name` when adding an entity, member, variant, or dependency. Use `entity`, `member`, `variant`, or `dependency` when selecting an existing value, and the corresponding singular selector `field`, `flow`, `step`, `task`, or `subtask` for other modifications. Every `subtasks.modify` entry must include its `subtask` selector. A test-subtask modification must also retain `operation: "test"`. `entities`, flow-step `edges`, flow-step `branches`, edge `expansion`, and branch `steps` are always complete replacement arrays, never add/modify/remove resource mutations. Implementation-subtask `entities` may contain only planned program entities. Never put package names there or create a synthetic config entity solely to group dependencies. A dependency-only manifest subtask may use an empty entity array because Harness derives dependency ownership from the manifest task file. Use `operation` for a subtask design move.
+const EDIT_CONTRACT: &str = r#"Use `harness_plan_edit` to apply one atomic patch through the PlanDocument edit schema. The tool request schema and the canonical PlanDocument schema serve different jobs:
 
-Represent each concrete test as its own flat task-file subtask with `operation: "test"`, `action`, `name`, `category`, and `behavior` directly on that subtask. Never model a concrete test as an `entity_change`, nest a `tests` collection, or create a top-level tests resource. `covers_entities` optionally traces one test to production entities without establishing ownership. Tests inherit their source path and architectural task from their parent file and task. Harness generates internal IDs. Never invent or send ID fields. Never use JSON Patch `op`, `path`, or `value` fields.
+- The canonical document uses PlanDocument schema version 2. Harness generates the edit and deviation input schemas from the same typed Rust declarations that Serde decodes, so follow the advertised tool schema instead of inferring fields from rendered Markdown.
+- Send `plan_id`, `expected_version`, and only the patch fields `plan`, `rename`, `set`, `delete`, or `assumptions`.
+- Patch `plan.title`, `plan.overview`, and `plan.usage` directly. Set usage to JSON null to clear it.
+- Replace `assumptions` with one complete string array.
+- Under `set`, group ordered complete Plan Schema resources directly by `entity_changes`, `dependencies`, `flows`, or `tasks`. Do not wrap a resource in `key` and `value`.
+- Harness derives each set resource's semantic key from its entity or dependency `name` or its flow or task `title`. A matching key replaces in place. A new key appends in request order.
+- Under `rename`, group explicit `{"from":<current semantic key>,"to":<new semantic key>}` entries by resource collection. Use rename only when changing the identifying name or title, then address the destination key from `set` when also replacing the complete resource.
+- Under `delete`, group current semantic keys by resource collection. `delete` retracts resources from this plan document.
+- To plan removal from source code or a manifest, use `set` with a complete value whose implementation `action` is `"remove"`. The `action` field never edits the PlanDocument.
+- Include every retained nested member, variant, field, step, edge, branch, task file, and subtask in each set resource.
+- Include the required implementation `action` on every entity, dependency, member, variant field, task file, and concrete test that defines one.
+- Descriptions on members, enum variants, and enum payload fields are optional but preserved and rendered. Enum payload fields also accept optional `visibility` metadata without applying visibility semantics, and the redundant `kind: "field"` discriminator remains optional.
+- For a nested declaration rename, set `action` to `"rename"`, put the previous identifier in `renamed_from`, and put the destination identifier in `name`; omit `renamed_from` for every other action.
+- Never invent node ID fields. The schema identifies semantic resources by name or title and addresses concrete nodes by position only after a plan version exists.
+- Never send `operation: "create"`, `"replace"`, or `"delete"` envelopes, recursive mutation wrappers, or JSON Patch `op` and `path` fields.
+- Never rename and delete the same resource, set and delete the same semantic key, or repeat a semantic key within one collection.
+
+Represent each concrete test as its own flat task-file subtask with `operation: "test"`, `action`, `name`, `category`, and `behavior` directly on that subtask. `covers_entities` optionally traces the test to production entities. Never model a concrete test as an `entity_change`, nest a `tests` collection, or create a top-level tests resource.
+
+Before adding an external Rust callable to a flow, verify the exact public identifier against current documentation or source for the dependency version in the plan. Preserve the public receiver alias in the external target when that alias forms the caller-facing API; Harness resolves its Rustdoc type tree to canonical generic targets for validation without rewriting the plan. If the API cannot be verified, keep the boundary inside a planned entity but still describe its concrete work through nested steps and name the dependency responsibility in the owning entity or task. Never replace unverified work with a vague build, handle, process, or support step.
+
+Every rejected control call returns exactly one JSON object. Read its `phase`, `code`, complete `violation` array, and optional `retry.expected_version`. Correct every reported violation together, then retry with the returned active version.
 
 ```json
 {
   "plan_id": "plan-uuid",
   "expected_version": 1,
   "plan": {
-    "modify": {
-      "title": "Preserve editor drafts across closed buffers",
-      "overview": "Add a durable draft cache that survives buffer closure and feeds retryable background saves.",
-      "usage": {
-        "command": "draft-sync status --document doc-42",
-        "expected_result": "Print one pending draft for doc-42 until the background save succeeds."
-      }
-    }
+    "title": "Preserve editor drafts across closed buffers",
+    "overview": "Add durable draft state behind one cache boundary.",
+    "usage": null
   },
-  "entity_changes": {
-    "add": [
+  "rename": {
+    "flows": [
+      {
+        "from": "Draft capture",
+        "to": "Durable draft capture"
+      }
+    ]
+  },
+  "set": {
+    "entity_changes": [
       {
         "action": "add",
         "kind": "resource",
@@ -132,51 +164,136 @@ Represent each concrete test as its own flat task-file subtask with `operation: 
           {
             "action": "add",
             "kind": "method",
-            "name": "store",
-            "description": "Store one pending draft.",
+            "name": "persist",
+            "description": "Write one pending draft through the workspace storage boundary.",
             "visibility": "public",
-            "parameters": [{"name": "draft", "type": "DraftChange"}]
+            "type": null,
+            "parameters": [],
+            "return_type": "Result<DraftId, DraftError>"
           }
-        ]
-      },
-      {
-        "action": "modify",
-        "kind": "struct",
-        "name": "DocumentEditor",
-        "description": "Routes edits into durable draft state.",
-        "path": "src/editor/session.rs",
-        "members": [
-          {
-            "action": "modify",
-            "kind": "method",
-            "name": "apply_edit",
-            "description": "Persist each edit before buffer lifetime can end.",
-            "visibility": "public"
-          }
-        ]
+        ],
+        "variants": [],
+        "extends": null,
+        "conforms_to": []
       },
       {
         "action": "add",
         "kind": "enum",
-        "name": "DraftStatus",
-        "description": "Tracks whether one durable draft still needs persistence.",
+        "name": "DraftState",
+        "description": "Represents the lifecycle of one editor draft.",
         "path": "src/draft_sync.rs",
+        "members": [],
         "variants": [
           {
             "action": "add",
             "name": "Pending",
-            "description": "Marks a draft that still needs persistence.",
-            "fields": []
-          },
-          {
-            "action": "add",
-            "name": "Failed",
-            "description": "Carries the reason the last persistence attempt failed.",
+            "description": "Carries a draft that still needs durable storage.",
             "fields": [
               {
                 "action": "add",
-                "name": "message",
-                "type": "String"
+                "kind": "field",
+                "name": "draft",
+                "description": "Carries the pending draft value.",
+                "visibility": "public",
+                "type": "Draft"
+              }
+            ]
+          }
+        ],
+        "extends": null,
+        "conforms_to": []
+      }
+    ],
+    "dependencies": [
+      {
+        "action": "add",
+        "name": "durable-cache",
+        "version": "1",
+        "manifest": "Cargo.toml",
+        "license": "MIT",
+        "justification": "Provides durable storage behind the cache boundary."
+      }
+    ],
+    "flows": [
+      {
+        "title": "Durable draft capture",
+        "description": "Persist an edit before its source buffer closes.",
+        "steps": [
+          {
+            "action": "Persist pending draft",
+            "target": {
+              "kind": "planned_entity",
+              "entity": "DraftCache"
+            },
+            "edges": [
+              {
+                "relation": {
+                  "kind": "call",
+                  "callable": {
+                    "kind": "method",
+                    "name": "persist"
+                  }
+                },
+                "target": {
+                  "kind": "planned_entity",
+                  "entity": "DraftCache"
+                },
+                "expansion": [
+                  {
+                    "action": "Store pending draft",
+                    "target": {
+                      "kind": "planned_entity",
+                      "entity": "DraftCache"
+                    },
+                    "edges": [
+                      {
+                        "relation": {
+                          "kind": "send",
+                          "event": "pending draft"
+                        },
+                        "target": {
+                          "kind": "external_entity",
+                          "entity_kind": "endpoint",
+                          "name": "durable cache",
+                          "dependency": "durable-cache"
+                        },
+                        "expansion": [],
+                        "result": {
+                          "kind": "text",
+                          "text": "durable draft"
+                        }
+                      }
+                    ],
+                    "branches": []
+                  }
+                ],
+                "result": {
+                  "kind": "type",
+                  "name": "DraftId"
+                }
+              }
+            ],
+            "branches": []
+          }
+        ]
+      }
+    ],
+    "tasks": [
+      {
+        "title": "Own pending drafts through durable state.",
+        "description": "Give unsaved edits a lifetime independent from editor buffers.",
+        "files": [
+          {
+            "action": "add",
+            "path": "src/draft_sync.rs",
+            "subtasks": [
+              {
+                "operation": "create",
+                "description": "the durable draft owner.",
+                "entities": [
+                  "DraftCache",
+                  "DraftState"
+                ]
               }
             ]
           }
@@ -184,123 +301,14 @@ Represent each concrete test as its own flat task-file subtask with `operation: 
       }
     ]
   },
-  "dependencies": {
-    "add": [
-      {
-        "action": "add",
-        "name": "tokio",
-        "version": "1",
-        "manifest": "Cargo.toml",
-        "license": "MIT",
-        "justification": "Runs asynchronous draft persistence and retry work. The existing synchronous runtime cannot schedule retries without blocking editor work."
-      }
+  "delete": {
+    "flows": [
+      "Obsolete draft flow"
     ]
   },
-  "flows": {
-    "add": [{
-      "title": "Draft capture",
-      "description": "Persist an edit before its source buffer closes. Typed edges expose the editor-to-cache boundary and its durable storage effect.",
-      "steps": [
-        {
-          "action": "Apply editor change",
-          "target": {"kind": "planned_entity", "entity": "DocumentEditor"},
-          "edges": [{
-            "relation": {
-              "kind": "call",
-              "callable": {"kind": "method", "name": "store"}
-            },
-            "target": {"kind": "planned_entity", "entity": "DraftCache"},
-            "expansion": [{
-              "action": "Persist pending draft",
-              "target": {"kind": "planned_entity", "entity": "DraftCache"},
-              "edges": [
-                {
-                  "relation": {
-                    "kind": "write",
-                    "callable": {"kind": "method", "name": "persist"}
-                  },
-                  "target": {
-                    "kind": "external_entity",
-                    "entity_kind": "type",
-                    "name": "DraftStore",
-                    "dependency": null
-                  },
-                  "expansion": [],
-                  "result": null
-                }
-              ],
-              "branches": []
-            }],
-            "result": {"kind": "type", "name": "DraftId"}
-          }],
-          "branches": []
-        }
-      ]
-    }]
-  },
-  "tasks": {
-    "add": [{
-      "title": "Own pending drafts through durable state.",
-      "description": "DraftCache gives unsaved edits a lifetime independent from editor buffers.",
-      "files": [
-        {
-          "action": "add",
-          "path": "src/draft_sync.rs",
-          "subtasks": [{
-            "operation": "create",
-            "description": "the durable draft owner.",
-            "entities": ["DraftCache", "DraftStatus"]
-          }, {
-            "operation": "test",
-            "action": "add",
-            "name": "retries_failed_draft_after_backoff",
-            "category": "unit",
-            "behavior": "The draft state machine retries a failed draft only after its backoff expires.",
-            "covers_entities": ["DraftCache", "DraftStatus"]
-          }]
-        },
-        {
-          "action": "modify",
-          "path": "src/editor/session.rs",
-          "subtasks": [{
-            "operation": "route",
-            "description": "editor changes into the draft owner.",
-            "entities": ["DocumentEditor"]
-          }]
-        },
-        {
-          "action": "modify",
-          "path": "Cargo.toml",
-          "subtasks": [{
-            "operation": "configure",
-            "description": "the asynchronous runtime."
-          }]
-        },
-        {
-          "path": "tests/draft_recovery.rs",
-          "action": "add",
-          "subtasks": [{
-            "operation": "test",
-            "action": "add",
-            "name": "restores_pending_draft_after_reopen",
-            "category": "integration",
-            "behavior": "Closing and reopening a document restores its pending draft through real editor and cache modules.",
-            "covers_entities": ["DraftCache", "DocumentEditor"]
-          }, {
-            "operation": "test",
-            "action": "add",
-            "name": "does_not_restore_saved_draft",
-            "category": "integration",
-            "behavior": "Reopening a document omits a draft that completed persistence before the original session closed.",
-            "covers_entities": ["DraftCache", "DocumentEditor"]
-          }]
-        }
-      ]
-    }]
-  },
-  "assumptions": {
-    "add": ["Draft persistence uses the existing workspace storage boundary."]
-  }
+  "assumptions": [
+    "Draft persistence uses the existing workspace storage boundary."
+  ]
 }
 ```"#;
 
@@ -327,25 +335,23 @@ pub fn execution_prompt(
             "Resume accepted-plan execution after an interruption. Preserve completed workspace changes and evidence. Do not repeat finished actions. Continue the same active task."
         }
     };
-    let active_entity_id = active_task
+    let active_entity_name = active_task
         .into_iter()
         .flat_map(|task| &task.files)
         .flat_map(|file| &file.subtasks)
-        .flat_map(PlanSubtask::owned_entity_ids)
+        .flat_map(PlanSubtask::owned_entities)
         .collect::<std::collections::HashSet<_>>();
     let active_entity_change = document
         .entity_changes
         .iter()
-        .filter(|entity| {
-            active_entity_id.contains(&entity.entity_id) || active_entity_id.contains(&entity.name)
-        })
+        .filter(|entity| active_entity_name.contains(&entity.name))
         .collect::<Vec<_>>();
     let active_work = serde_json::json!({
         "task": active_task,
         "entity_changes": active_entity_change,
     });
     Ok(format!(
-        "{boundary} Execution ID: {execution_id}. Complete the active whole task before calling harness_plan_task_report with detailed subtask, entity, path, and test evidence. Reference each planned test result through its test_subtask_id. Call harness_plan_deviation before departing from accepted intent. Call harness_goal_complete only after the scheduler has no incomplete tasks.\n\nActive task:\n```json\n{}\n```\n\nEffective canonical PlanDocument:\n```json\n{}\n```",
+        "{boundary} Execution ID: {execution_id}. Complete the active whole task before calling harness_plan_task_report with detailed subtask, entity, path, and test evidence. Address tasks, subtasks, entities, and tests by their JSON pointer paths in this exact plan version. Call harness_plan_deviation before departing from accepted intent. Call harness_goal_complete only after the scheduler has no incomplete tasks.\n\nActive task:\n```json\n{}\n```\n\nEffective canonical PlanDocument:\n```json\n{}\n```",
         serde_json::to_string_pretty(&active_work)?,
         serde_json::to_string_pretty(document)?,
     ))
@@ -359,7 +365,7 @@ impl PlanPrompt {
 
 Explore the repository before asking questions. Resolve discoverable facts from the code. You may write supporting planning material when the retained authorization permits it. Ask only when a product decision materially changes the implementation. When feedback is required, call harness_question_ask with one to three concise questions, two or three mutually exclusive choices per structured question, and a recommended choice first. End that turn after requesting feedback.
 
-Harness already created the canonical PlanDocument and owns its plan ID, version, and original prompt. The prompt is Harness-owned render context and is not a model-editable field. Build the semantic plan only through harness_plan_edit. Model each changed program construct once as a ProgramEntityChange with its add, modify, remove, or rename action. For a rename, put the existing identifier in `renamed_from` and the destination identifier in `name`; never encode one rename as separate remove and add entities. Model every package decision once as a top-level dependency change with its version, manifest, license, and justification. Nest ordinary member changes under their owning entity and enum cases under the enum's dedicated variants collection. Express inheritance and conformance directly on that entity. Use tagged planned_entity, workspace_entity, or external_entity references in flows. Reserve workspace_entity for unchanged repository constructs and record their entity kind, name, repository-relative path, and one-indexed declaration line. Attach every entity to exactly one subtask. Harness derives dependency ownership by matching each manifest to exactly one task file. Keep dependencies, entities, independent flows, architectural tasks, file boundaries, optional high-value tests, and assumptions aligned. Harness owns internal IDs. {USAGE_CONTRACT} Do not use provider task updates as the plan. When the document passes submission validation, call harness_plan_submit with the exact plan_id and expected_version. Ordinary prose and provider checklists do not submit a plan.
+Harness already created the canonical PlanDocument and owns its plan ID, version, and original prompt. The prompt is Harness-owned render context and is not a model-editable field. Build the semantic plan only through harness_plan_edit. Model each changed program construct once as a ProgramEntityChange with its add, modify, remove, or rename action. For a rename, put the existing identifier in `renamed_from` and the destination identifier in `name`; never encode one rename as separate remove and add entities. Model every package decision once as a top-level dependency change with its version, manifest, license, and justification. Nest ordinary member changes under their owning entity and enum cases under the enum's dedicated variants collection. Express inheritance and conformance directly on that entity. Use tagged planned_entity, workspace_entity, or external_entity references in flows. Reserve workspace_entity for unchanged repository constructs and record their entity kind, name, repository-relative path, and one-indexed declaration line. Attach every entity to exactly one subtask. Harness derives dependency ownership by matching each manifest to exactly one task file. Keep dependencies, entities, independent flows, architectural tasks, file boundaries, optional high-value tests, and assumptions aligned. Plan nodes have no generated IDs. Validation reports concise dot-and-index paths such as `flows[0].steps[1]`, while accepted-plan execution uses version-scoped JSON pointers such as `/tasks/0/files/1/subtasks/2`. {USAGE_CONTRACT} Do not use provider task updates as the plan. When the document passes submission validation, call harness_plan_submit with the exact plan_id and expected_version. Ordinary prose and provider checklists do not submit a plan.
 
 {WALKTHROUGH_CONTRACT}
 
@@ -475,7 +481,7 @@ User follow-up:
 
 #[cfg(test)]
 mod test {
-    use super::{PlanExecutionPromptKind, PlanPrompt, execution_prompt};
+    use super::{EDIT_CONTRACT, PlanExecutionPromptKind, PlanPrompt, execution_prompt};
 
     #[test]
     fn planning_contract_requires_structured_submission_without_native_mode() {
@@ -501,8 +507,15 @@ mod test {
         );
         assert!(prompt.contains("Never use an imperative or prose summary"));
         assert!(prompt.contains("<no stdout>"));
-        assert!(prompt.contains("geometry_column: geometry\\ncrs: EPSG:4326"));
-        assert!(prompt.contains("every dependency justification as exactly two sentences"));
+        assert!(prompt.contains("status: ready\\nitem_count: 42"));
+        assert!(
+            prompt.contains("every dependency justification as substantive reviewer-facing prose")
+        );
+        assert!(
+            prompt.contains("Trace every dependency's claimed role into concrete plan content")
+        );
+        assert!(prompt.contains("runtime, derive, build, or test support"));
+        assert!(prompt.contains("audit every dependency against its justification"));
         assert!(
             prompt
                 .contains("make the task that configures those dependency changes the first task")
@@ -519,12 +532,14 @@ mod test {
         assert!(prompt.contains("edge `expansion` steps execute inside that relationship"));
         assert!(prompt.contains("step `branches` represent labeled alternative continuations"));
         assert!(prompt.contains("Never infer nesting from adjacent top-level steps"));
+        assert!(prompt.contains("An expansion must explain material work"));
+        assert!(prompt.contains("Never add an expansion that only returns the result"));
         assert!(prompt.contains("structured `callable`"));
         assert!(prompt.contains("bare identifier"));
         assert!(prompt.contains("exactly one type entity"));
         assert!(prompt.contains("`entity_kind: \"endpoint\"`"));
         assert!(prompt.contains("\"dependency\":\"package-name\""));
-        assert!(prompt.contains("exactly two substantive description sentences"));
+        assert!(prompt.contains("a substantive description"));
         assert!(prompt.contains("actual entry point and observable outcome"));
         assert!(
             prompt.contains("ownership boundary, architectural risk, or independent review reason")
@@ -536,6 +551,10 @@ mod test {
             prompt.contains("Runtime meaning comes from explicit edges, expansions, and branches")
         );
         assert!(prompt.contains("`construct` creates the target"));
+        assert!(prompt.contains("relation-specific inputs inside `relation`"));
+        assert!(prompt.contains(r#"{"kind":"send","event":"refresh requested"}"#));
+        assert!(prompt.contains(r#"{"kind":"emit"}"#));
+        assert!(prompt.contains("`emit` and `return` accept no additional relation fields"));
         assert!(prompt.contains("aligned owner column within 100 characters"));
         assert!(prompt.contains("Organize tasks by domain object and ownership responsibility"));
         assert!(prompt.contains("renderers prepend the operation label"));
@@ -547,14 +566,42 @@ mod test {
         assert_eq!(prompt.matches("\nTests:\n").count(), 1);
         assert_eq!(prompt.matches("\nModularity:\n").count(), 1);
         assert_eq!(prompt.matches("\nValidation:\n").count(), 1);
-        assert!(prompt.contains("complete replacement array"));
-        assert!(prompt.contains("flow-step `branches`"));
-        assert!(prompt.contains("edge `expansion`"));
-        assert!(prompt.contains("Every `subtasks.modify` entry"));
-        assert!(prompt.contains("Never put package names there"));
-        assert!(prompt.contains(r#""entity_changes": {"#));
-        assert!(prompt.contains(r#""add": [{"#));
-        assert!(prompt.contains("Never use JSON Patch"));
+        assert!(prompt.contains("The tool request schema and the canonical PlanDocument schema"));
+        assert!(prompt.contains("step's `edges`"));
+        assert!(prompt.contains("edge's `expansion`"));
+        assert!(prompt.contains("ordered complete Plan Schema resources"));
+        assert!(prompt.contains("PlanDocument schema version 2"));
+        assert!(prompt.contains("same typed Rust declarations that Serde decodes"));
+        assert!(prompt.contains("`members`, `variants`, `conforms_to`"));
+        assert!(prompt.contains("redundant `kind: \"field\"` discriminator"));
+        assert!(prompt.contains(
+            "Descriptions on members, enum variants, and enum payload fields are optional"
+        ));
+        assert!(prompt.contains("For a nested declaration rename"));
+        assert!(prompt.contains("current semantic key"));
+        assert!(prompt.contains(r#""from": "Draft capture""#));
+        assert!(prompt.contains(r#""to": "Durable draft capture""#));
+        assert!(prompt.contains("Include every retained nested member"));
+        assert!(prompt.contains("implementation `action`"));
+        assert!(prompt.contains("`delete` retracts resources from this plan document"));
+        assert!(prompt.contains(r#""entity_changes": ["#));
+        assert!(prompt.contains(r#""name": "DraftCache""#));
+        assert!(!prompt.contains(r#""key": "DraftCache""#));
+        assert!(prompt.contains(r#""action": "add""#));
+        assert!(prompt.contains("verify the exact public identifier"));
+        assert!(prompt.contains("Preserve the public receiver alias"));
+        assert!(prompt.contains("canonical generic targets"));
+        assert!(prompt.contains("still describe its concrete work through nested steps"));
+        assert!(prompt.contains(r#""action": "Persist pending draft""#));
+        assert!(prompt.contains(r#""kind": "call""#));
+        assert!(prompt.contains(r#""dependency": "durable-cache""#));
+        assert!(!prompt.contains(r#""steps": []"#));
+        assert!(!prompt.contains(r#""files": []"#));
+        assert!(!prompt.to_ascii_lowercase().contains("geoparquet"));
+        assert!(!prompt.to_ascii_lowercase().contains("datafusion"));
+        assert!(prompt.contains("Every rejected control call returns exactly one JSON object"));
+        assert!(prompt.contains("Never send `operation: \"create\"`"));
+        assert!(prompt.contains("JSON Patch `op` and `path` fields"));
         assert!(!prompt.contains("collaborationMode"));
     }
 
@@ -569,18 +616,30 @@ mod test {
         assert!(prompt.contains("harness_question_ask"));
         assert!(prompt.contains("harness_plan_submit"));
         assert!(prompt.contains("Encode omitted Usage as JSON null"));
-        assert!(prompt.contains(r#""operation": "test""#));
-        assert!(prompt.contains(r#""category": "unit""#));
-        assert!(prompt.contains(r#""category": "integration""#));
-        assert!(prompt.contains(r#""covers_entities": ["DraftCache", "DocumentEditor"]"#));
-        assert!(!prompt.contains(r#""tests": {"#));
-        assert!(prompt.contains("draft-sync status --document doc-42"));
-        assert!(prompt.contains(r#""operation": "configure""#));
-        assert!(prompt.contains(r#""name": "tokio""#));
+        assert!(prompt.contains(r#"operation: "test""#));
+        assert!(prompt.contains(r#""set": {"#));
+        assert!(prompt.contains(r#""rename": {"#));
+        assert!(prompt.contains(r#""delete": {"#));
+        assert!(prompt.contains(r#""name": "DraftCache""#));
+        assert!(!prompt.contains(r#""tests":"#));
+        assert!(prompt.contains("semantic key"));
+        assert!(prompt.contains("external Rust callable"));
         assert!(prompt.contains("already recorded and consumed"));
         assert!(prompt.contains("Do not call harness_question_answer"));
         assert!(prompt.contains("reviewer-readable implementation walkthrough"));
         assert_eq!(prompt.matches("Planning feedback:").count(), 1);
+    }
+
+    #[test]
+    fn edit_contract_example_decodes_as_one_plan_edit_request() {
+        let example = EDIT_CONTRACT
+            .split_once("```json\n")
+            .and_then(|(_, remainder)| remainder.split_once("\n```"))
+            .map(|(example, _)| example)
+            .expect("edit contract must contain one JSON example");
+
+        serde_json::from_str::<crate::plan::PlanEditRequest>(example)
+            .expect("edit contract example must match the PlanDocument edit schema");
     }
 
     #[test]
@@ -594,7 +653,7 @@ mod test {
     fn revision_sends_canonical_json_and_semantic_annotations_without_markdown() {
         let prompt = PlanPrompt::revision(
             r#"{"plan_id":"plan","entity_changes":[]}"#,
-            r#"[{"json_path":"/entity_changes/0","label":"PlanDocument","target":{"target_type":"entity","entity_id":"plan_document"}}]"#,
+            r#"[{"json_path":"/entity_changes/0","label":"PlanDocument","target":{"target_type":"entity","name":"PlanDocument"}}]"#,
             Some("Tighten ownership"),
         );
 

@@ -5,7 +5,7 @@ use super::{
     PlanDocument, ProgramEntityChange, ProgramEntityMemberChange,
 };
 
-/// Represents the entity, member, variant field, or dependency behind one semantic identifier.
+/// Represents the entity, member, variant field, or dependency behind one semantic name.
 #[derive(Clone, Copy, Debug)]
 pub enum ResolvedPlanEntity<'a> {
     Entity(&'a ProgramEntityChange),
@@ -45,81 +45,73 @@ impl PresentationPosition {
 
 /// Indexes semantic plan entities for validation, rendering, review, and execution.
 pub struct PlanGraph<'a> {
-    entity_by_id: HashMap<&'a str, &'a ProgramEntityChange>,
-    resolved_by_id: HashMap<&'a str, ResolvedPlanEntity<'a>>,
-    presentation_parent_by_entity_id: HashMap<&'a str, &'a str>,
-    presentation_child_index_by_entity_id: HashMap<&'a str, Vec<usize>>,
-    presentation_position_by_entity_id: HashMap<&'a str, PresentationPosition>,
+    entity_by_name: HashMap<&'a str, &'a ProgramEntityChange>,
+    resolved_by_name: HashMap<String, ResolvedPlanEntity<'a>>,
+    presentation_parent_by_entity_name: HashMap<&'a str, &'a str>,
+    presentation_child_index_by_entity_name: HashMap<&'a str, Vec<usize>>,
+    presentation_position_by_entity_name: HashMap<&'a str, PresentationPosition>,
 }
 
 impl<'a> PlanGraph<'a> {
     /// Build one semantic index from the canonical document.
     pub fn new(document: &'a PlanDocument) -> Self {
-        let mut resolved_by_id = HashMap::new();
+        let mut resolved_by_name = HashMap::new();
         for entity in &document.entity_changes {
-            resolved_by_id.insert(
-                entity.entity_id.as_str(),
-                ResolvedPlanEntity::Entity(entity),
-            );
-            resolved_by_id.insert(entity.name.as_str(), ResolvedPlanEntity::Entity(entity));
+            resolved_by_name.insert(entity.name.clone(), ResolvedPlanEntity::Entity(entity));
             for member in &entity.members {
-                resolved_by_id.insert(
-                    member.member_id.as_str(),
+                resolved_by_name.insert(
+                    format!("{}::{}", entity.name, member.name),
                     ResolvedPlanEntity::Member(entity, member),
                 );
             }
             for variant in &entity.variants {
-                resolved_by_id.insert(
-                    variant.variant_id.as_str(),
+                resolved_by_name.insert(
+                    format!("{}::{}", entity.name, variant.name),
                     ResolvedPlanEntity::Variant(entity, variant),
                 );
                 for field in &variant.fields {
-                    resolved_by_id.insert(
-                        field.field_id.as_str(),
+                    resolved_by_name.insert(
+                        format!("{}::{}::{}", entity.name, variant.name, field.name),
                         ResolvedPlanEntity::VariantField(entity, variant, field),
                     );
                 }
             }
         }
         for dependency in &document.dependencies {
-            resolved_by_id.insert(
-                dependency.dependency_id.as_str(),
+            resolved_by_name.insert(
+                dependency.name.clone(),
                 ResolvedPlanEntity::Dependency(dependency),
             );
         }
-        let entity_by_id = document
+        let entity_by_name = document
             .entity_changes
             .iter()
-            .flat_map(|entity| {
-                [
-                    (entity.entity_id.as_str(), entity),
-                    (entity.name.as_str(), entity),
-                ]
-            })
+            .map(|entity| (entity.name.as_str(), entity))
             .collect();
         let presentation_hierarchy = build_presentation_hierarchy(document);
         Self {
-            entity_by_id,
-            resolved_by_id,
-            presentation_parent_by_entity_id: presentation_hierarchy.parent_by_entity_id,
-            presentation_child_index_by_entity_id: presentation_hierarchy.child_index_by_entity_id,
-            presentation_position_by_entity_id: presentation_hierarchy.position_by_entity_id,
+            entity_by_name,
+            resolved_by_name,
+            presentation_parent_by_entity_name: presentation_hierarchy.parent_by_entity_name,
+            presentation_child_index_by_entity_name: presentation_hierarchy
+                .child_index_by_entity_name,
+            presentation_position_by_entity_name: presentation_hierarchy.position_by_entity_name,
         }
     }
 
-    /// Resolve one program entity from its stable identifier.
-    pub fn entity(&self, entity_id: &str) -> Option<&'a ProgramEntityChange> {
-        self.entity_by_id.get(entity_id).copied()
+    /// Resolve one program entity from its unique semantic name.
+    pub fn entity(&self, entity_name: &str) -> Option<&'a ProgramEntityChange> {
+        self.entity_by_name.get(entity_name).copied()
     }
 
-    /// Resolve one exact semantic entity from the canonical object graph.
-    pub fn resolve_entity(&self, entity_id: &str) -> Option<ResolvedPlanEntity<'a>> {
-        self.resolved_by_id.get(entity_id).copied()
+    /// Resolve one exact semantic entity from its qualified semantic name.
+    pub fn resolve_entity(&self, entity_name: &str) -> Option<ResolvedPlanEntity<'a>> {
+        self.resolved_by_name.get(entity_name).copied()
     }
 
     /// Resolve the repository path owned by one semantic entity.
-    pub fn entity_path(&self, entity_id: &str) -> Option<&'a str> {
-        match self.resolve_entity(entity_id)? {
+    pub fn entity_path(&self, entity_name: &str) -> Option<&'a str> {
+        match self.resolve_entity(entity_name)? {
             ResolvedPlanEntity::Entity(entity)
             | ResolvedPlanEntity::Member(entity, _)
             | ResolvedPlanEntity::Variant(entity, _)
@@ -129,8 +121,8 @@ impl<'a> PlanGraph<'a> {
     }
 
     /// Render one concise reviewer label for a semantic entity.
-    pub fn entity_label(&self, entity_id: &str) -> Option<String> {
-        match self.resolve_entity(entity_id)? {
+    pub fn entity_label(&self, entity_name: &str) -> Option<String> {
+        match self.resolve_entity(entity_name)? {
             ResolvedPlanEntity::Entity(entity) => Some(entity.name.clone()),
             ResolvedPlanEntity::Member(entity, member) => {
                 Some(format!("{}::{}", entity.name, member.name))
@@ -146,8 +138,8 @@ impl<'a> PlanGraph<'a> {
     }
 
     /// Resolve the lifecycle action attached to one semantic entity.
-    pub fn entity_action(&self, entity_id: &str) -> Option<ChangeAction> {
-        match self.resolve_entity(entity_id)? {
+    pub fn entity_action(&self, entity_name: &str) -> Option<ChangeAction> {
+        match self.resolve_entity(entity_name)? {
             ResolvedPlanEntity::Entity(entity) => Some(entity.action.base_action()),
             ResolvedPlanEntity::Member(_, member) => Some(member.action),
             ResolvedPlanEntity::Variant(_, variant) => Some(variant.action),
@@ -157,44 +149,46 @@ impl<'a> PlanGraph<'a> {
     }
 
     /// Resolve the sole concrete user that visually owns one concrete entity.
-    pub fn presentation_parent(&self, entity_id: &str) -> Option<&'a str> {
-        self.presentation_parent_by_entity_id
-            .get(entity_id)
+    pub fn presentation_parent(&self, entity_name: &str) -> Option<&'a str> {
+        self.presentation_parent_by_entity_name
+            .get(entity_name)
             .copied()
     }
 
     /// Iterate concrete entities visually nested beneath one concrete user.
-    pub fn presentation_child_indices(&self, entity_id: &str) -> impl Iterator<Item = usize> + '_ {
-        self.presentation_child_index_by_entity_id
-            .get(entity_id)
+    pub fn presentation_child_indices(
+        &self,
+        entity_name: &str,
+    ) -> impl Iterator<Item = usize> + '_ {
+        self.presentation_child_index_by_entity_name
+            .get(entity_name)
             .into_iter()
             .flatten()
             .copied()
     }
 
     /// Resolve one entity's shared UML and task-list presentation position.
-    pub fn presentation_position(&self, entity_id: &str) -> Option<&PresentationPosition> {
-        let entity = self.entity(entity_id)?;
-        self.presentation_position_by_entity_id
-            .get(entity.entity_id.as_str())
+    pub fn presentation_position(&self, entity_name: &str) -> Option<&PresentationPosition> {
+        self.entity(entity_name)?;
+        self.presentation_position_by_entity_name.get(entity_name)
     }
 
     /// Resolve known entity IDs and order them by the shared presentation traversal.
     pub fn entities_in_presentation_order(
         &self,
-        entity_id_list: &[String],
+        entity_name_list: &[String],
     ) -> Vec<&'a ProgramEntityChange> {
-        let mut entity_list = entity_id_list
+        let mut entity_list = entity_name_list
             .iter()
             .enumerate()
-            .filter_map(|(original_index, entity_id)| {
-                self.entity(entity_id)
+            .filter_map(|(original_index, entity_name)| {
+                self.entity(entity_name)
                     .map(|entity| (original_index, entity))
             })
             .collect::<Vec<_>>();
         entity_list.sort_by_key(|(original_index, entity)| {
             (
-                self.presentation_position(&entity.entity_id)
+                self.presentation_position(&entity.name)
                     .map(PresentationPosition::preorder_rank)
                     .unwrap_or(usize::MAX),
                 *original_index,
@@ -205,9 +199,9 @@ impl<'a> PlanGraph<'a> {
 }
 
 struct PresentationHierarchy<'a> {
-    parent_by_entity_id: HashMap<&'a str, &'a str>,
-    child_index_by_entity_id: HashMap<&'a str, Vec<usize>>,
-    position_by_entity_id: HashMap<&'a str, PresentationPosition>,
+    parent_by_entity_name: HashMap<&'a str, &'a str>,
+    child_index_by_entity_name: HashMap<&'a str, Vec<usize>>,
+    position_by_entity_name: HashMap<&'a str, PresentationPosition>,
 }
 
 fn build_presentation_hierarchy<'a>(document: &'a PlanDocument) -> PresentationHierarchy<'a> {
@@ -216,7 +210,7 @@ fn build_presentation_hierarchy<'a>(document: &'a PlanDocument) -> PresentationH
         .iter()
         .map(|entity| (entity.name.as_str(), entity))
         .collect::<HashMap<_, _>>();
-    let mut user_id_set_by_entity_id = HashMap::<&str, HashSet<&str>>::new();
+    let mut user_name_set_by_entity_name = HashMap::<&str, HashSet<&str>>::new();
     for user in document
         .entity_changes
         .iter()
@@ -227,94 +221,94 @@ fn build_presentation_hierarchy<'a>(document: &'a PlanDocument) -> PresentationH
                 let Some(target) = entity_by_name.get(identifier) else {
                     continue;
                 };
-                if target.entity_id == user.entity_id || is_contract_kind(target.kind) {
+                if target.name == user.name || is_contract_kind(target.kind) {
                     continue;
                 }
-                user_id_set_by_entity_id
-                    .entry(target.entity_id.as_str())
+                user_name_set_by_entity_name
+                    .entry(target.name.as_str())
                     .or_default()
-                    .insert(user.entity_id.as_str());
+                    .insert(user.name.as_str());
             }
         }
     }
 
-    let mut parent_by_entity_id = user_id_set_by_entity_id
+    let mut parent_by_entity_name = user_name_set_by_entity_name
         .into_iter()
-        .filter_map(|(entity_id, user_id_set)| {
-            (user_id_set.len() == 1).then(|| (entity_id, *user_id_set.iter().next().unwrap()))
+        .filter_map(|(entity_name, user_name_set)| {
+            (user_name_set.len() == 1).then(|| (entity_name, *user_name_set.iter().next().unwrap()))
         })
         .collect::<HashMap<_, _>>();
-    let cyclic_entity_id_set = cyclic_entity_ids(&parent_by_entity_id);
-    parent_by_entity_id.retain(|entity_id, _| !cyclic_entity_id_set.contains(entity_id));
+    let cyclic_entity_name_set = cyclic_entity_names(&parent_by_entity_name);
+    parent_by_entity_name.retain(|entity_name, _| !cyclic_entity_name_set.contains(entity_name));
 
-    let mut child_index_by_entity_id = HashMap::<&str, Vec<usize>>::new();
+    let mut child_index_by_entity_name = HashMap::<&str, Vec<usize>>::new();
     for (entity_index, entity) in document.entity_changes.iter().enumerate() {
-        if let Some(parent_id) = parent_by_entity_id.get(entity.entity_id.as_str()) {
-            child_index_by_entity_id
-                .entry(*parent_id)
+        if let Some(parent_name) = parent_by_entity_name.get(entity.name.as_str()) {
+            child_index_by_entity_name
+                .entry(*parent_name)
                 .or_default()
                 .push(entity_index);
         }
     }
-    let position_by_entity_id = build_presentation_position_index(
+    let position_by_entity_name = build_presentation_position_index(
         document,
-        &parent_by_entity_id,
-        &child_index_by_entity_id,
+        &parent_by_entity_name,
+        &child_index_by_entity_name,
     );
     PresentationHierarchy {
-        parent_by_entity_id,
-        child_index_by_entity_id,
-        position_by_entity_id,
+        parent_by_entity_name,
+        child_index_by_entity_name,
+        position_by_entity_name,
     }
 }
 
 fn build_presentation_position_index<'a>(
     document: &'a PlanDocument,
-    parent_by_entity_id: &HashMap<&'a str, &'a str>,
-    child_index_by_entity_id: &HashMap<&'a str, Vec<usize>>,
+    parent_by_entity_name: &HashMap<&'a str, &'a str>,
+    child_index_by_entity_name: &HashMap<&'a str, Vec<usize>>,
 ) -> HashMap<&'a str, PresentationPosition> {
-    let mut position_by_entity_id = HashMap::new();
+    let mut position_by_entity_name = HashMap::new();
     let mut preorder_rank = 0;
     let mut root_ordinal = 0;
     for (entity_index, entity) in document.entity_changes.iter().enumerate() {
-        if parent_by_entity_id.contains_key(entity.entity_id.as_str()) {
+        if parent_by_entity_name.contains_key(entity.name.as_str()) {
             continue;
         }
         root_ordinal += 1;
         index_presentation_subtree(
             document,
-            child_index_by_entity_id,
+            child_index_by_entity_name,
             entity_index,
             vec![root_ordinal],
             &mut preorder_rank,
-            &mut position_by_entity_id,
+            &mut position_by_entity_name,
         );
     }
-    position_by_entity_id
+    position_by_entity_name
 }
 
 fn index_presentation_subtree<'a>(
     document: &'a PlanDocument,
-    child_index_by_entity_id: &HashMap<&'a str, Vec<usize>>,
+    child_index_by_entity_name: &HashMap<&'a str, Vec<usize>>,
     entity_index: usize,
     path: Vec<usize>,
     preorder_rank: &mut usize,
-    position_by_entity_id: &mut HashMap<&'a str, PresentationPosition>,
+    position_by_entity_name: &mut HashMap<&'a str, PresentationPosition>,
 ) {
     let entity = &document.entity_changes[entity_index];
-    if position_by_entity_id.contains_key(entity.entity_id.as_str()) {
+    if position_by_entity_name.contains_key(entity.name.as_str()) {
         return;
     }
-    position_by_entity_id.insert(
-        entity.entity_id.as_str(),
+    position_by_entity_name.insert(
+        entity.name.as_str(),
         PresentationPosition {
             path: path.clone(),
             preorder_rank: *preorder_rank,
         },
     );
     *preorder_rank += 1;
-    for (child_offset, child_index) in child_index_by_entity_id
-        .get(entity.entity_id.as_str())
+    for (child_offset, child_index) in child_index_by_entity_name
+        .get(entity.name.as_str())
         .into_iter()
         .flatten()
         .enumerate()
@@ -323,11 +317,11 @@ fn index_presentation_subtree<'a>(
         child_path.push(child_offset + 1);
         index_presentation_subtree(
             document,
-            child_index_by_entity_id,
+            child_index_by_entity_name,
             *child_index,
             child_path,
             preorder_rank,
-            position_by_entity_id,
+            position_by_entity_name,
         );
     }
 }
@@ -360,24 +354,24 @@ fn type_identifiers(type_expression: &str) -> impl Iterator<Item = &str> {
         .filter(|identifier| !identifier.is_empty())
 }
 
-fn cyclic_entity_ids<'a>(parent_by_entity_id: &HashMap<&'a str, &'a str>) -> HashSet<&'a str> {
-    let mut cyclic_entity_id_set = HashSet::new();
-    for start_id in parent_by_entity_id.keys().copied() {
-        let mut position_by_entity_id = HashMap::new();
-        let mut ordered_entity_id_list = Vec::new();
-        let mut current_id = start_id;
-        while let Some(parent_id) = parent_by_entity_id.get(current_id).copied() {
-            if let Some(cycle_start) = position_by_entity_id.get(current_id).copied() {
-                cyclic_entity_id_set
-                    .extend(ordered_entity_id_list.iter().skip(cycle_start).copied());
+fn cyclic_entity_names<'a>(parent_by_entity_name: &HashMap<&'a str, &'a str>) -> HashSet<&'a str> {
+    let mut cyclic_entity_name_set = HashSet::new();
+    for start_name in parent_by_entity_name.keys().copied() {
+        let mut position_by_entity_name = HashMap::new();
+        let mut ordered_entity_name_list = Vec::new();
+        let mut current_name = start_name;
+        while let Some(parent_name) = parent_by_entity_name.get(current_name).copied() {
+            if let Some(cycle_start) = position_by_entity_name.get(current_name).copied() {
+                cyclic_entity_name_set
+                    .extend(ordered_entity_name_list.iter().skip(cycle_start).copied());
                 break;
             }
-            position_by_entity_id.insert(current_id, ordered_entity_id_list.len());
-            ordered_entity_id_list.push(current_id);
-            current_id = parent_id;
+            position_by_entity_name.insert(current_name, ordered_entity_name_list.len());
+            ordered_entity_name_list.push(current_name);
+            current_name = parent_name;
         }
     }
-    cyclic_entity_id_set
+    cyclic_entity_name_set
 }
 
 fn is_contract_kind(kind: EntityKind) -> bool {
@@ -395,15 +389,14 @@ mod test {
         FunctionParameter, MemberKind, Visibility, document::test_fixture,
     };
 
-    fn entity(entity_id: &str, name: &str, kind: EntityKind) -> ProgramEntityChange {
+    fn entity(path_stem: &str, name: &str, kind: EntityKind) -> ProgramEntityChange {
         ProgramEntityChange {
-            entity_id: entity_id.into(),
             action: EntityChangeAction::Add,
             kind,
             renamed_from: None,
             name: name.into(),
             description: format!("Defines {name}."),
-            path: format!("src/{entity_id}.rs"),
+            path: format!("src/{path_stem}.rs"),
             members: Vec::new(),
             variants: Vec::new(),
             extends: None,
@@ -412,17 +405,17 @@ mod test {
     }
 
     fn member(
-        member_id: &str,
+        member_name: &str,
         type_name: Option<&str>,
         parameter_type_list: &[&str],
         return_type: Option<&str>,
     ) -> ProgramEntityMemberChange {
         ProgramEntityMemberChange {
-            member_id: member_id.into(),
             action: ChangeAction::Add,
+            renamed_from: None,
             kind: MemberKind::Method,
-            name: member_id.into(),
-            description: format!("Defines {member_id}."),
+            name: member_name.into(),
+            description: Some(format!("Defines {member_name}.")),
             visibility: Some(Visibility::Public),
             type_name: type_name.map(str::to_owned),
             parameters: parameter_type_list
@@ -470,75 +463,78 @@ mod test {
             EntityKind::Enum,
         );
         envelope.variants = vec![EnumVariantChange {
-            variant_id: "inspection_ready".into(),
             action: ChangeAction::Add,
+            renamed_from: None,
             name: "Ready".into(),
-            description: "Carries one inspection payload.".into(),
+            description: Some("Carries one inspection payload.".into()),
             fields: vec![EnumVariantFieldChange {
-                field_id: "inspection_ready_payload".into(),
                 action: ChangeAction::Add,
+                renamed_from: None,
                 name: "payload".into(),
                 type_name: "InspectionPayload[]".into(),
+                kind: None,
+                description: None,
+                visibility: None,
             }],
         }];
         document.entity_changes = vec![report, error, config, state, inspector, payload, envelope];
 
         let graph = PlanGraph::new(&document);
 
-        for child_id in [
-            "inspection_report",
-            "inspection_error",
-            "inspection_config",
-            "inspection_state",
+        for child_name in [
+            "InspectionReport",
+            "InspectionError",
+            "InspectionConfig",
+            "InspectionState",
         ] {
             assert_eq!(
-                graph.presentation_parent(child_id),
-                Some("geo_parquet_inspector")
+                graph.presentation_parent(child_name),
+                Some("GeoParquetInspector")
             );
         }
         assert_eq!(
-            graph.presentation_parent("inspection_payload"),
-            Some("inspection_envelope")
+            graph.presentation_parent("InspectionPayload"),
+            Some("InspectionEnvelope")
         );
-        assert_eq!(graph.presentation_parent("geo_parquet_inspector"), None);
+        assert_eq!(graph.presentation_parent("GeoParquetInspector"), None);
         assert_eq!(
             graph
-                .presentation_position("geo_parquet_inspector")
+                .presentation_position("GeoParquetInspector")
                 .unwrap()
                 .path(),
             &[1]
         );
         assert_eq!(
             graph
-                .presentation_position("inspection_report")
+                .presentation_position("InspectionReport")
                 .unwrap()
                 .path(),
             &[1, 1]
         );
         assert_eq!(
             graph
-                .presentation_position("inspection_error")
+                .presentation_position("InspectionError")
                 .unwrap()
                 .path(),
             &[1, 2]
         );
         assert_eq!(
             graph
-                .presentation_position("inspection_error")
+                .presentation_position("InspectionError")
                 .unwrap()
                 .depth(),
             1
         );
         assert_eq!(
             graph
-                .presentation_position("inspection_envelope")
+                .presentation_position("InspectionEnvelope")
                 .unwrap()
                 .path(),
             &[2]
         );
         assert_eq!(
             graph
-                .presentation_position("inspection_payload")
+                .presentation_position("InspectionPayload")
                 .unwrap()
                 .path(),
             &[2, 1]
@@ -566,9 +562,9 @@ mod test {
 
         let graph = PlanGraph::new(&document);
 
-        assert_eq!(graph.presentation_parent("backend"), None);
-        assert_eq!(graph.presentation_parent("contract_output"), None);
-        assert_eq!(graph.presentation_parent("shared_cache"), None);
+        assert_eq!(graph.presentation_parent("Backend"), None);
+        assert_eq!(graph.presentation_parent("ContractOutput"), None);
+        assert_eq!(graph.presentation_parent("SharedCache"), None);
     }
 
     #[test]
@@ -587,29 +583,29 @@ mod test {
 
         let graph = PlanGraph::new(&document);
 
-        assert_eq!(graph.presentation_parent("cycle_left"), None);
-        assert_eq!(graph.presentation_parent("cycle_right"), None);
-        assert_eq!(graph.presentation_parent("child"), Some("root"));
-        assert_eq!(graph.presentation_parent("leaf"), Some("child"));
+        assert_eq!(graph.presentation_parent("CycleLeft"), None);
+        assert_eq!(graph.presentation_parent("CycleRight"), None);
+        assert_eq!(graph.presentation_parent("Child"), Some("Root"));
+        assert_eq!(graph.presentation_parent("Leaf"), Some("Child"));
         assert_eq!(
-            graph.presentation_child_indices("root").collect::<Vec<_>>(),
+            graph.presentation_child_indices("Root").collect::<Vec<_>>(),
             vec![3]
         );
         assert_eq!(
-            graph.presentation_position("cycle_left").unwrap().path(),
+            graph.presentation_position("CycleLeft").unwrap().path(),
             &[1]
         );
         assert_eq!(
-            graph.presentation_position("cycle_right").unwrap().path(),
+            graph.presentation_position("CycleRight").unwrap().path(),
             &[2]
         );
-        assert_eq!(graph.presentation_position("root").unwrap().path(), &[3]);
+        assert_eq!(graph.presentation_position("Root").unwrap().path(), &[3]);
         assert_eq!(
-            graph.presentation_position("child").unwrap().path(),
+            graph.presentation_position("Child").unwrap().path(),
             &[3, 1]
         );
         assert_eq!(
-            graph.presentation_position("leaf").unwrap().path(),
+            graph.presentation_position("Leaf").unwrap().path(),
             &[3, 1, 1]
         );
     }
@@ -637,10 +633,10 @@ mod test {
 
         let ordered_name_list = graph
             .entities_in_presentation_order(&[
-                "inspection_error".into(),
+                "InspectionError".into(),
                 "main".into(),
-                "inspection_report".into(),
-                "geo_parquet_inspector".into(),
+                "InspectionReport".into(),
+                "GeoParquetInspector".into(),
             ])
             .into_iter()
             .map(|entity| entity.name.as_str())
@@ -657,9 +653,9 @@ mod test {
 
         let missing_parent_name_list = graph
             .entities_in_presentation_order(&[
-                "inspection_error".into(),
+                "InspectionError".into(),
                 "main".into(),
-                "inspection_report".into(),
+                "InspectionReport".into(),
             ])
             .into_iter()
             .map(|entity| entity.name.as_str())

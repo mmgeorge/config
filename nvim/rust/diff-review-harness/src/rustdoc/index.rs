@@ -2,8 +2,11 @@ use crate::plan::PlanCallableKind;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+
+const MIN_SUPPORTED_RUSTDOC_FORMAT_VERSION: u32 = 33;
+const MAX_SUPPORTED_RUSTDOC_FORMAT_VERSION: u32 = 60;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct RustdocJson {
@@ -60,7 +63,62 @@ pub(crate) struct RustdocItem {
 #[derive(Debug)]
 pub(crate) struct RustdocIndex {
     item_by_name: HashMap<String, Vec<RustdocItem>>,
-    callable_by_receiver: HashMap<(String, String), Vec<RustdocItem>>,
+    receiver_by_name: HashMap<String, Vec<RustType>>,
+    callable_list: Vec<RustdocCallable>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ResolvedReceiver {
+    authored: String,
+    canonical: RustType,
+}
+
+impl ResolvedReceiver {
+    pub(crate) fn authored(&self) -> &str {
+        &self.authored
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RustdocCallable {
+    receiver: RustType,
+    name: String,
+    item: RustdocItem,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RustType {
+    Path {
+        item_id: Option<String>,
+        path: String,
+        arguments: Vec<RustGenericArgument>,
+    },
+    Generic(String),
+    Primitive(String),
+    Borrowed {
+        mutable: bool,
+        target: Box<RustType>,
+    },
+    Tuple(Vec<RustType>),
+    Slice(Box<RustType>),
+    Array {
+        target: Box<RustType>,
+        length: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RustGenericArgument {
+    Type(RustType),
+    Lifetime(String),
+    Const(String),
+    Infer,
+}
+
+#[derive(Clone, Debug)]
+struct AliasTemplate {
+    parameter_list: Vec<String>,
+    target: RustType,
 }
 
 impl RustdocIndex {
@@ -68,14 +126,17 @@ impl RustdocIndex {
         let document: RustdocJson =
             serde_json::from_slice(source).context("decode Rustdoc JSON")?;
         anyhow::ensure!(
-            document.format_version >= 33,
-            "unsupported Rustdoc JSON format {}",
-            document.format_version
+            (MIN_SUPPORTED_RUSTDOC_FORMAT_VERSION..=MAX_SUPPORTED_RUSTDOC_FORMAT_VERSION)
+                .contains(&document.format_version),
+            "unsupported Rustdoc JSON format {}; supported versions are {} through {}",
+            document.format_version,
+            MIN_SUPPORTED_RUSTDOC_FORMAT_VERSION,
+            MAX_SUPPORTED_RUSTDOC_FORMAT_VERSION
         );
-        Ok(Self::build(&document))
+        Self::build(&document)
     }
 
-    fn build(document: &RustdocJson) -> Self {
+    fn build(document: &RustdocJson) -> Result<Self> {
         let mut item_by_name = HashMap::<String, Vec<RustdocItem>>::new();
         for (item_id, path) in &document.paths {
             let Some(item) = document.index.get(item_id) else {
@@ -95,23 +156,66 @@ impl RustdocIndex {
                 });
         }
 
-        let mut callable_by_receiver = HashMap::<(String, String), Vec<RustdocItem>>::new();
+        let alias_by_id = document
+            .index
+            .iter()
+            .filter_map(|(item_id, item)| {
+                let alias = item.inner_for("type_alias")?;
+                let target = alias
+                    .get("type")
+                    .and_then(|value| rust_type(document, value))?;
+                Some((
+                    item_id.clone(),
+                    AliasTemplate {
+                        parameter_list: alias_parameter_list(alias),
+                        target,
+                    },
+                ))
+            })
+            .collect::<HashMap<_, _>>();
+        let mut receiver_by_name = HashMap::<String, Vec<RustType>>::new();
+        for (item_id, path) in &document.paths {
+            let Some(item) = document.index.get(item_id) else {
+                continue;
+            };
+            let Some(name) = item.name.as_deref() else {
+                continue;
+            };
+            let receiver = if alias_by_id.contains_key(item_id) {
+                expand_alias(
+                    RustType::Path {
+                        item_id: Some(item_id.clone()),
+                        path: path.full_path(),
+                        arguments: Vec::new(),
+                    },
+                    &alias_by_id,
+                    &mut HashSet::new(),
+                )?
+            } else {
+                RustType::Path {
+                    item_id: Some(item_id.clone()),
+                    path: path.full_path(),
+                    arguments: Vec::new(),
+                }
+            };
+            receiver_by_name
+                .entry(name.to_owned())
+                .or_default()
+                .push(receiver);
+        }
+
+        let mut callable_list = Vec::new();
         for item in document.index.values() {
             let Some(implementation) = item.inner_for("impl") else {
                 continue;
             };
-            let receiver = implementation
+            let Some(receiver) = implementation
                 .get("for")
-                .map(|value| type_name(document, value))
-                .unwrap_or_default();
-            if receiver.is_empty() {
+                .and_then(|value| rust_type(document, value))
+            else {
                 continue;
-            }
-            let receiver_name = receiver
-                .rsplit("::")
-                .next()
-                .unwrap_or(receiver.as_str())
-                .to_owned();
+            };
+            let receiver = expand_alias(receiver, &alias_by_id, &mut HashSet::new())?;
             let trait_reference = implementation.get("trait").filter(|value| !value.is_null());
             let trait_path = trait_reference.map(|value| type_name(document, value));
             let mut method_id_list = implementation
@@ -145,49 +249,78 @@ impl RustdocIndex {
                 if method.inner_for("function").is_none() {
                     continue;
                 }
-                let owner_path = trait_path.clone().unwrap_or_else(|| receiver.clone());
+                let owner_path = trait_path
+                    .clone()
+                    .unwrap_or_else(|| rust_type_display(&receiver));
                 let resolved = RustdocItem {
                     path: format!("{owner_path}::{method_name}"),
                     signature: function_signature(method),
                     docs: method.docs.clone().unwrap_or_default(),
                     span: method.span.clone(),
                 };
-                let item_list = callable_by_receiver
-                    .entry((receiver_name.clone(), method_name.to_owned()))
-                    .or_default();
-                if !item_list.iter().any(|item| item.path == resolved.path) {
-                    item_list.push(resolved);
+                if !callable_list.iter().any(|entry: &RustdocCallable| {
+                    entry.receiver == receiver
+                        && entry.name == method_name
+                        && entry.item.path == resolved.path
+                }) {
+                    callable_list.push(RustdocCallable {
+                        receiver: receiver.clone(),
+                        name: method_name.to_owned(),
+                        item: resolved,
+                    });
                 }
             }
         }
 
-        Self {
+        Ok(Self {
             item_by_name,
-            callable_by_receiver,
-        }
+            receiver_by_name,
+            callable_list,
+        })
     }
 
     pub(crate) fn type_item(&self, name: &str) -> Result<RustdocItem, LookupError> {
         unique(self.item_by_name.get(name), "type", name)
     }
 
+    pub(crate) fn resolve_receiver(&self, authored: &str) -> Result<ResolvedReceiver, LookupError> {
+        let receiver_list = self
+            .receiver_by_name
+            .get(short_name(authored).as_str())
+            .cloned()
+            .unwrap_or_default();
+        match receiver_list.as_slice() {
+            [canonical] => Ok(ResolvedReceiver {
+                authored: authored.to_owned(),
+                canonical: canonical.clone(),
+            }),
+            [] => Err(LookupError::Missing(format!(
+                "type `{authored}` does not exist"
+            ))),
+            _ => Err(LookupError::Ambiguous(format!(
+                "type `{authored}` resolves to {} items",
+                receiver_list.len()
+            ))),
+        }
+    }
+
     pub(crate) fn callable(
         &self,
-        receiver: &str,
+        receiver: &ResolvedReceiver,
         callable: &str,
         kind: PlanCallableKind,
     ) -> Result<RustdocItem, LookupError> {
-        let item_list = self
-            .callable_by_receiver
-            .get(&(short_name(receiver), callable.to_owned()))
-            .map(|item_list| {
-                item_list
-                    .iter()
-                    .filter(|item| callable_kind(&item.signature) == kind)
-                    .cloned()
-                    .collect::<Vec<_>>()
-            });
-        unique(item_list.as_ref(), "callable", callable)
+        let mut item_list = self
+            .callable_list
+            .iter()
+            .filter(|entry| entry.name == callable)
+            .filter(|entry| callable_kind(&entry.item.signature) == kind)
+            .filter(|entry| receiver_matches(&receiver.canonical, &entry.receiver))
+            .map(|entry| entry.item.clone())
+            .collect::<Vec<_>>();
+        item_list.sort_by(|left, right| left.path.cmp(&right.path));
+        item_list.dedup_by(|left, right| left.path == right.path);
+        unique(Some(&item_list), "callable", callable)
     }
 }
 
@@ -254,6 +387,322 @@ fn type_name(document: &RustdocJson, value: &Value) -> String {
         .or_else(|| value.get("name").and_then(Value::as_str))
         .unwrap_or("")
         .to_owned()
+}
+
+fn rust_type(document: &RustdocJson, value: &Value) -> Option<RustType> {
+    if let Some(generic) = value.get("generic").and_then(Value::as_str) {
+        return Some(RustType::Generic(generic.to_owned()));
+    }
+    if let Some(primitive) = value.get("primitive").and_then(Value::as_str) {
+        return Some(RustType::Primitive(primitive.to_owned()));
+    }
+    if let Some(reference) = value.get("borrowed_ref") {
+        return Some(RustType::Borrowed {
+            mutable: reference
+                .get("is_mutable")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            target: Box::new(rust_type(document, reference.get("type")?)?),
+        });
+    }
+    if let Some(tuple) = value.get("tuple").and_then(Value::as_array) {
+        return Some(RustType::Tuple(
+            tuple
+                .iter()
+                .map(|value| rust_type(document, value))
+                .collect::<Option<Vec<_>>>()?,
+        ));
+    }
+    if let Some(slice) = value.get("slice") {
+        return Some(RustType::Slice(Box::new(rust_type(document, slice)?)));
+    }
+    if let Some(array) = value.get("array") {
+        return Some(RustType::Array {
+            target: Box::new(rust_type(document, array.get("type")?)?),
+            length: array
+                .get("len")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+        });
+    }
+    let path = value.get("resolved_path").unwrap_or(value);
+    let path_name = type_id(path)
+        .and_then(|item_id| document.paths.get(&item_id))
+        .map(PathEntry::full_path)
+        .or_else(|| {
+            path.get("path")
+                .and_then(Value::as_str)
+                .or_else(|| path.get("name").and_then(Value::as_str))
+                .map(str::to_owned)
+        })?;
+    Some(RustType::Path {
+        item_id: type_id(path),
+        path: path_name,
+        arguments: generic_argument_list(document, path.get("args")),
+    })
+}
+
+fn generic_argument_list(
+    document: &RustdocJson,
+    value: Option<&Value>,
+) -> Vec<RustGenericArgument> {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+    let argument_list = value
+        .get("angle_bracketed")
+        .and_then(|value| value.get("args"))
+        .and_then(Value::as_array)
+        .or_else(|| value.get("args").and_then(Value::as_array))
+        .cloned()
+        .unwrap_or_default();
+    argument_list
+        .into_iter()
+        .filter_map(|argument| {
+            if let Some(value) = argument.get("type") {
+                return rust_type(document, value).map(RustGenericArgument::Type);
+            }
+            if let Some(lifetime) = argument.get("lifetime").and_then(Value::as_str) {
+                return Some(RustGenericArgument::Lifetime(lifetime.to_owned()));
+            }
+            if let Some(constant) = argument.get("const") {
+                return Some(RustGenericArgument::Const(constant.to_string()));
+            }
+            argument
+                .get("infer")
+                .is_some()
+                .then_some(RustGenericArgument::Infer)
+        })
+        .collect()
+}
+
+fn alias_parameter_list(alias: &Value) -> Vec<String> {
+    alias
+        .get("generics")
+        .and_then(|value| value.get("params"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|parameter| parameter.get("name").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn expand_alias(
+    receiver: RustType,
+    alias_by_id: &HashMap<String, AliasTemplate>,
+    visiting: &mut HashSet<String>,
+) -> Result<RustType> {
+    let RustType::Path {
+        item_id: Some(item_id),
+        arguments,
+        ..
+    } = &receiver
+    else {
+        return Ok(receiver);
+    };
+    let Some(alias) = alias_by_id.get(item_id) else {
+        return Ok(receiver);
+    };
+    anyhow::ensure!(
+        visiting.insert(item_id.clone()),
+        "cyclic Rust type alias involving item {item_id}"
+    );
+    let substitution = alias
+        .parameter_list
+        .iter()
+        .cloned()
+        .zip(arguments.iter().filter_map(|argument| match argument {
+            RustGenericArgument::Type(value) => Some(value.clone()),
+            _ => None,
+        }))
+        .collect::<HashMap<_, _>>();
+    let expanded = substitute_type(&alias.target, &substitution);
+    let expanded = expand_alias(expanded, alias_by_id, visiting);
+    visiting.remove(item_id);
+    expanded
+}
+
+fn substitute_type(value: &RustType, substitution: &HashMap<String, RustType>) -> RustType {
+    match value {
+        RustType::Generic(name) => substitution
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| value.clone()),
+        RustType::Path {
+            item_id,
+            path,
+            arguments,
+        } => RustType::Path {
+            item_id: item_id.clone(),
+            path: path.clone(),
+            arguments: arguments
+                .iter()
+                .map(|argument| match argument {
+                    RustGenericArgument::Type(value) => {
+                        RustGenericArgument::Type(substitute_type(value, substitution))
+                    }
+                    argument => argument.clone(),
+                })
+                .collect(),
+        },
+        RustType::Borrowed { mutable, target } => RustType::Borrowed {
+            mutable: *mutable,
+            target: Box::new(substitute_type(target, substitution)),
+        },
+        RustType::Tuple(value_list) => RustType::Tuple(
+            value_list
+                .iter()
+                .map(|value| substitute_type(value, substitution))
+                .collect(),
+        ),
+        RustType::Slice(target) => RustType::Slice(Box::new(substitute_type(target, substitution))),
+        RustType::Array { target, length } => RustType::Array {
+            target: Box::new(substitute_type(target, substitution)),
+            length: length.clone(),
+        },
+        RustType::Primitive(_) => value.clone(),
+    }
+}
+
+fn receiver_matches(query: &RustType, implementation: &RustType) -> bool {
+    match_receiver(query, implementation, &mut HashMap::new())
+}
+
+fn match_receiver(
+    query: &RustType,
+    implementation: &RustType,
+    binding: &mut HashMap<String, RustType>,
+) -> bool {
+    if let RustType::Generic(name) = implementation {
+        return match binding.get(name) {
+            Some(existing) => existing == query,
+            None => {
+                binding.insert(name.clone(), query.clone());
+                true
+            }
+        };
+    }
+    match (query, implementation) {
+        (
+            RustType::Path {
+                path: query_path,
+                arguments: query_arguments,
+                ..
+            },
+            RustType::Path {
+                path: implementation_path,
+                arguments: implementation_arguments,
+                ..
+            },
+        ) => {
+            query_path == implementation_path
+                && (query_arguments.is_empty()
+                    || query_arguments.len() == implementation_arguments.len()
+                        && query_arguments.iter().zip(implementation_arguments).all(
+                            |(query, implementation)| {
+                                match_generic_argument(query, implementation, binding)
+                            },
+                        ))
+        }
+        (
+            RustType::Borrowed {
+                mutable: query_mutable,
+                target: query_target,
+            },
+            RustType::Borrowed {
+                mutable: implementation_mutable,
+                target: implementation_target,
+            },
+        ) => {
+            query_mutable == implementation_mutable
+                && match_receiver(query_target, implementation_target, binding)
+        }
+        (RustType::Tuple(query), RustType::Tuple(implementation)) => {
+            query.len() == implementation.len()
+                && query
+                    .iter()
+                    .zip(implementation)
+                    .all(|(query, implementation)| match_receiver(query, implementation, binding))
+        }
+        (RustType::Slice(query), RustType::Slice(implementation)) => {
+            match_receiver(query, implementation, binding)
+        }
+        (
+            RustType::Array {
+                target: query_target,
+                length: query_length,
+            },
+            RustType::Array {
+                target: implementation_target,
+                length: implementation_length,
+            },
+        ) => {
+            query_length == implementation_length
+                && match_receiver(query_target, implementation_target, binding)
+        }
+        _ => query == implementation,
+    }
+}
+
+fn match_generic_argument(
+    query: &RustGenericArgument,
+    implementation: &RustGenericArgument,
+    binding: &mut HashMap<String, RustType>,
+) -> bool {
+    match (query, implementation) {
+        (RustGenericArgument::Type(query), RustGenericArgument::Type(implementation)) => {
+            match_receiver(query, implementation, binding)
+        }
+        _ => query == implementation,
+    }
+}
+
+fn rust_type_display(value: &RustType) -> String {
+    match value {
+        RustType::Path {
+            path, arguments, ..
+        } if arguments.is_empty() => path.clone(),
+        RustType::Path {
+            path, arguments, ..
+        } => format!(
+            "{path}<{}>",
+            arguments
+                .iter()
+                .map(rust_generic_argument_display)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        RustType::Generic(name) | RustType::Primitive(name) => name.clone(),
+        RustType::Borrowed { mutable, target } => {
+            format!(
+                "&{}{}",
+                if *mutable { "mut " } else { "" },
+                rust_type_display(target)
+            )
+        }
+        RustType::Tuple(value_list) => format!(
+            "({})",
+            value_list
+                .iter()
+                .map(rust_type_display)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        RustType::Slice(target) => format!("[{}]", rust_type_display(target)),
+        RustType::Array { target, length } => {
+            format!("[{}; {length}]", rust_type_display(target))
+        }
+    }
+}
+
+fn rust_generic_argument_display(value: &RustGenericArgument) -> String {
+    match value {
+        RustGenericArgument::Type(value) => rust_type_display(value),
+        RustGenericArgument::Lifetime(value) | RustGenericArgument::Const(value) => value.clone(),
+        RustGenericArgument::Infer => "_".into(),
+    }
 }
 
 fn item_signature(item: &Item, kind: &str) -> String {
@@ -416,15 +865,165 @@ mod test {
         .unwrap()
     }
 
+    fn generic_alias_fixture() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "format_version": 57,
+            "paths": {
+                "1": { "path": ["parquet", "ArrowReaderBuilder"], "kind": "struct" },
+                "2": { "path": ["parquet", "SyncReader"], "kind": "struct" },
+                "3": {
+                    "path": ["parquet", "ParquetRecordBatchReaderBuilder"],
+                    "kind": "type_alias"
+                }
+            },
+            "index": {
+                "1": {
+                    "name": "ArrowReaderBuilder",
+                    "span": null,
+                    "docs": "Builds one Arrow reader.",
+                    "inner": { "struct": { "impls": [4] } }
+                },
+                "2": {
+                    "name": "SyncReader",
+                    "span": null,
+                    "docs": "Reads Parquet bytes synchronously.",
+                    "inner": { "struct": { "impls": [] } }
+                },
+                "3": {
+                    "name": "ParquetRecordBatchReaderBuilder",
+                    "span": null,
+                    "docs": "Names the synchronous Parquet reader builder.",
+                    "inner": {
+                        "type_alias": {
+                            "type": {
+                                "resolved_path": {
+                                    "name": "ArrowReaderBuilder",
+                                    "id": 1,
+                                    "args": {
+                                        "angle_bracketed": {
+                                            "args": [{
+                                                "type": {
+                                                    "resolved_path": {
+                                                        "name": "SyncReader",
+                                                        "id": 2,
+                                                        "args": {
+                                                            "angle_bracketed": {
+                                                                "args": [{
+                                                                    "type": { "generic": "T" }
+                                                                }]
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }]
+                                        }
+                                    }
+                                }
+                            },
+                            "generics": {
+                                "params": [{
+                                    "name": "T",
+                                    "kind": { "type": {} }
+                                }]
+                            }
+                        }
+                    }
+                },
+                "4": {
+                    "name": null,
+                    "span": null,
+                    "docs": null,
+                    "inner": {
+                        "impl": {
+                            "trait": null,
+                            "for": {
+                                "resolved_path": {
+                                    "name": "ArrowReaderBuilder",
+                                    "id": 1,
+                                    "args": {
+                                        "angle_bracketed": {
+                                            "args": [{
+                                                "type": {
+                                                    "resolved_path": {
+                                                        "name": "SyncReader",
+                                                        "id": 2,
+                                                        "args": {
+                                                            "angle_bracketed": {
+                                                                "args": [{
+                                                                    "type": { "generic": "T" }
+                                                                }]
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }]
+                                        }
+                                    }
+                                }
+                            },
+                            "items": [5]
+                        }
+                    }
+                },
+                "5": {
+                    "name": "try_new",
+                    "span": {
+                        "filename": "src/arrow_reader/mod.rs",
+                        "begin": [120, 5],
+                        "end": [123, 6]
+                    },
+                    "docs": "Builds a synchronous Parquet record batch reader.",
+                    "inner": {
+                        "function": {
+                            "sig": {
+                                "inputs": [[
+                                    "reader",
+                                    { "generic": "T" }
+                                ]],
+                                "output": {
+                                    "resolved_path": {
+                                        "path": "Result",
+                                        "id": 6
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn resolves_generic_alias_methods_without_rewriting_the_authored_receiver() {
+        let index = RustdocIndex::parse(&generic_alias_fixture()).unwrap();
+        let receiver = index
+            .resolve_receiver("ParquetRecordBatchReaderBuilder")
+            .unwrap();
+
+        assert_eq!(receiver.authored, "ParquetRecordBatchReaderBuilder");
+        assert_eq!(
+            rust_type_display(&receiver.canonical),
+            "parquet::ArrowReaderBuilder<parquet::SyncReader<T>>"
+        );
+        let method = index
+            .callable(&receiver, "try_new", PlanCallableKind::Function)
+            .unwrap();
+        assert_eq!(
+            method.path,
+            "parquet::ArrowReaderBuilder<parquet::SyncReader<T>>::try_new"
+        );
+    }
+
     #[test]
     fn resolves_extension_trait_methods_for_external_receivers() {
         let index = RustdocIndex::parse(&fixture()).unwrap();
+        let receiver = index
+            .resolve_receiver("ParquetRecordBatchReaderBuilder")
+            .unwrap();
         let method = index
-            .callable(
-                "ParquetRecordBatchReaderBuilder",
-                "geoparquet_metadata",
-                PlanCallableKind::Method,
-            )
+            .callable(&receiver, "geoparquet_metadata", PlanCallableKind::Method)
             .unwrap();
         assert_eq!(
             method.path,
@@ -448,12 +1047,11 @@ mod test {
     #[test]
     fn rejects_a_callable_kind_that_conflicts_with_its_receiver() {
         let index = RustdocIndex::parse(&fixture()).unwrap();
+        let receiver = index
+            .resolve_receiver("ParquetRecordBatchReaderBuilder")
+            .unwrap();
         assert!(matches!(
-            index.callable(
-                "ParquetRecordBatchReaderBuilder",
-                "geoparquet_metadata",
-                PlanCallableKind::Function,
-            ),
+            index.callable(&receiver, "geoparquet_metadata", PlanCallableKind::Function,),
             Err(LookupError::Missing(_))
         ));
     }

@@ -13,7 +13,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const SESSION_FORMAT_VERSION: u32 = 22;
+const SESSION_FORMAT_VERSION: u32 = 25;
 
 /// Stores one session with the exact durable format that produced it.
 #[derive(Deserialize, Serialize)]
@@ -938,6 +938,57 @@ mod test {
                 .as_deref(),
             Some("client-two")
         );
+    }
+
+    #[test]
+    fn reopens_current_sessions_with_ordered_plan_deviations() {
+        let temporary = tempfile::tempdir().unwrap();
+        {
+            let mut store = SqliteStore::open(temporary.path()).unwrap();
+            store.save_session(&session("current", "D:/work")).unwrap();
+            let document = crate::plan::test_fixture("plan", "Overview");
+            let entity = document.entity_changes[0].clone();
+            store
+                .save_plan_deviation(
+                    "current",
+                    &crate::plan::PlanDeviation {
+                        id: "deviation".into(),
+                        plan_id: "plan".into(),
+                        execution_id: "execution".into(),
+                        kind: crate::plan::PlanDeviationKind::Scope,
+                        disposition: crate::plan::PlanDeviationDisposition::AutoApproved,
+                        summary: "Extend the accepted entity.".into(),
+                        reason: "Repository evidence requires the additional change.".into(),
+                        task_path: None,
+                        subtask_path: None,
+                        affected_paths: Vec::new(),
+                        proposed_changes: crate::plan::PlanMutation {
+                            set: Some(crate::plan::PlanResourceSet {
+                                entity_changes: Some(vec![entity]),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
+                        created_at_ms: 1,
+                        resolved_at_ms: Some(1),
+                    },
+                )
+                .unwrap();
+        }
+
+        let store = SqliteStore::open(temporary.path()).unwrap();
+        assert_eq!(
+            store.load_session("current").unwrap().unwrap().id,
+            "current"
+        );
+        let deviation_list = store.list_plan_deviation("current").unwrap();
+        let entry_list = deviation_list[0]
+            .proposed_changes
+            .set
+            .as_ref()
+            .and_then(|set| set.entity_changes.as_ref())
+            .unwrap();
+        assert!(!entry_list[0].name.is_empty());
     }
 
     #[test]

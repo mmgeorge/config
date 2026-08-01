@@ -18,12 +18,10 @@ vim.o.columns = math.max(vim.o.columns, 160)
 local document = {
   entity_changes = {
     {
-      entity_id = "entity_geo_parquet_inspector",
       name = "GeoParquetInspector",
       description = "Coordinates one local GeoParquet inspection.",
       members = {
         {
-          member_id = "entity_geo_parquet_inspector_member_geometry_column",
           name = "geometry_column",
           description = "Stores the primary geometry column declared by GeoParquet metadata.",
         },
@@ -48,8 +46,8 @@ assert_equals(
 local member_anchor = {
   target = {
     target_type = "entity_member",
-    entity_id = "entity_geo_parquet_inspector",
-    member_id = "entity_geo_parquet_inspector_member_geometry_column",
+    entity = "GeoParquetInspector",
+    member = "geometry_column",
   },
 }
 local resolved_member = task_model.described_item_at_position(

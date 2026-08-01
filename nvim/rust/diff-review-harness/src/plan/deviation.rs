@@ -1,10 +1,12 @@
 use super::document::PlanDocument;
 use super::edit::{PlanEditRequest, PlanMutation, apply_plan_edit};
 use anyhow::Result;
+use schemars::{JsonSchema, generate::SchemaSettings};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// Defines whether one divergence changes accepted scope.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanDeviationKind {
     Informational,
@@ -41,8 +43,8 @@ pub struct PlanDeviation {
     pub disposition: PlanDeviationDisposition,
     pub summary: String,
     pub reason: String,
-    pub task_id: Option<String>,
-    pub subtask_id: Option<String>,
+    pub task_path: Option<String>,
+    pub subtask_path: Option<String>,
     #[serde(default)]
     pub affected_paths: Vec<String>,
     #[serde(default)]
@@ -52,18 +54,25 @@ pub struct PlanDeviation {
 }
 
 /// Carries one model-authored divergence before Harness assigns lifecycle metadata.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlanDeviationRequest {
     pub plan_id: String,
     pub kind: PlanDeviationKind,
     pub summary: String,
     pub reason: String,
-    pub task_id: Option<String>,
-    pub subtask_id: Option<String>,
+    pub task_path: Option<String>,
+    pub subtask_path: Option<String>,
     #[serde(default)]
     pub affected_paths: Vec<String>,
-    #[serde(default)]
     pub proposed_changes: PlanMutation,
+}
+
+/// Generate the deviation schema from its Serde request contract.
+pub(crate) fn plan_deviation_request_schema() -> Value {
+    let generator = SchemaSettings::draft07().for_deserialize().into_generator();
+    serde_json::to_value(generator.into_root_schema_for::<PlanDeviationRequest>())
+        .expect("PlanDeviationRequest schema serializes")
 }
 
 impl PlanDeviation {
@@ -149,15 +158,13 @@ mod test {
             disposition: PlanDeviationDisposition::AutoApproved,
             summary: "Change overview".into(),
             reason: "Repository evidence changed.".into(),
-            task_id: Some("task".into()),
-            subtask_id: None,
+            task_path: Some("/tasks/0".into()),
+            subtask_path: None,
             affected_paths: Vec::new(),
             proposed_changes: PlanMutation {
-                plan: Some(super::super::edit::PlanFieldMutation {
-                    modify: super::super::edit::PlanFieldPatch {
-                        overview: Some("Effective".into()),
-                        ..Default::default()
-                    },
+                plan: Some(super::super::edit::PlanFieldPatch {
+                    overview: Some("Effective".into()),
+                    ..Default::default()
                 }),
                 ..Default::default()
             },

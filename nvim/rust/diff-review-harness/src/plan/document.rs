@@ -1,19 +1,40 @@
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
+use schemars::JsonSchema;
+use serde::{Deserialize, Deserializer, Serialize};
+use std::borrow::Cow;
 
 use super::validation::{validate_plan_edit, validate_plan_submission};
 
 /// Defines whether one planned entity enters, changes, or leaves the codebase.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChangeAction {
     Add,
     Modify,
     Remove,
+    Rename,
+}
+
+#[derive(JsonSchema)]
+#[schemars(rename = "DependencyChangeAction", rename_all = "snake_case")]
+pub enum DependencyChangeAction {
+    Add,
+    Modify,
+    Remove,
+}
+
+impl ChangeAction {
+    /// Map nested declaration renames onto modification behavior.
+    pub fn base_action(self) -> Self {
+        match self {
+            Self::Rename => Self::Modify,
+            action => action,
+        }
+    }
 }
 
 /// Defines whether one top-level program entity enters, changes, leaves, or changes its name.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntityChangeAction {
     Add,
@@ -34,14 +55,15 @@ impl EntityChangeAction {
 }
 
 /// Represents one concrete caller interaction and its observable result.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlanUsage {
     pub command: String,
     pub expected_result: String,
 }
 
 /// Defines the semantic role of one named program entity.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntityKind {
     Class,
@@ -54,16 +76,14 @@ pub enum EntityKind {
     Config,
     #[serde(alias = "fn")]
     Function,
-    Method,
     Constant,
-    Field,
     Resource,
     Cache,
     Adapter,
 }
 
 /// Defines one member role inside a program entity.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemberKind {
     Field,
@@ -74,8 +94,17 @@ pub enum MemberKind {
     Property,
 }
 
+/// Accepts the optional redundant discriminator shared by field-like declarations.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FieldKind {
+    Field,
+}
+
 /// Defines the reviewer-visible visibility of one planned member.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Ord, PartialOrd, Serialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Visibility {
     Public,
@@ -85,7 +114,8 @@ pub enum Visibility {
 }
 
 /// Represents one ordered function or method parameter.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct FunctionParameter {
     pub name: String,
     #[serde(rename = "type")]
@@ -93,37 +123,47 @@ pub struct FunctionParameter {
 }
 
 /// Represents one changed field exposed by an enum variant.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct EnumVariantFieldChange {
-    #[serde(default)]
-    pub field_id: String,
     pub action: ChangeAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renamed_from: Option<String>,
     pub name: String,
     #[serde(rename = "type")]
     pub type_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<FieldKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<Visibility>,
 }
 
 /// Represents one changed enum case and its optional variant fields.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct EnumVariantChange {
-    #[serde(default)]
-    pub variant_id: String,
     pub action: ChangeAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renamed_from: Option<String>,
     pub name: String,
-    pub description: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub fields: Vec<EnumVariantFieldChange>,
 }
 
 /// Represents one changed field or operation nested inside a program entity.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProgramEntityMemberChange {
-    #[serde(default)]
-    pub member_id: String,
     pub action: ChangeAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renamed_from: Option<String>,
     pub kind: MemberKind,
     pub name: String,
-    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub visibility: Option<Visibility>,
     #[serde(rename = "type")]
     pub type_name: Option<String>,
@@ -133,7 +173,7 @@ pub struct ProgramEntityMemberChange {
 }
 
 /// Defines whether one referenced flow participant names a type or an endpoint.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReferencedEntityKind {
     Type,
@@ -141,7 +181,7 @@ pub enum ReferencedEntityKind {
 }
 
 /// Identifies one planned, workspace-owned, or external architectural boundary.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum EntityReference {
     PlannedEntity {
@@ -161,10 +201,9 @@ pub enum EntityReference {
 }
 
 /// Represents one named program entity and its planned implementation lifecycle.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProgramEntityChange {
-    #[serde(default)]
-    pub entity_id: String,
     pub action: EntityChangeAction,
     pub kind: EntityKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -172,24 +211,22 @@ pub struct ProgramEntityChange {
     pub name: String,
     pub description: String,
     pub path: String,
-    #[serde(default)]
     pub members: Vec<ProgramEntityMemberChange>,
-    #[serde(default)]
     pub variants: Vec<EnumVariantChange>,
     pub extends: Option<EntityReference>,
-    #[serde(default)]
     pub conforms_to: Vec<EntityReference>,
 }
 
 /// Represents one auditable package dependency and its manifest declaration.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlanDependencyChange {
-    #[serde(default)]
-    pub dependency_id: String,
+    #[schemars(with = "DependencyChangeAction")]
     pub action: ChangeAction,
     pub name: String,
     pub version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
     pub resolved_version: Option<String>,
     pub manifest: String,
     pub license: Option<String>,
@@ -197,7 +234,7 @@ pub struct PlanDependencyChange {
 }
 
 /// Defines the verification boundary exercised by one test subtask.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TestCategory {
     Unit,
@@ -205,7 +242,7 @@ pub enum TestCategory {
 }
 
 /// Defines how one flow value should render and participate in review.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanFlowValueKind {
     Type,
@@ -213,7 +250,7 @@ pub enum PlanFlowValueKind {
 }
 
 /// Defines the semantic value crossing from one flow step to its consumer.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PlanFlowValue {
     Type { name: String },
@@ -239,7 +276,7 @@ impl PlanFlowValue {
 }
 
 /// Defines whether one invoked callable is a free function or a method.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanCallableKind {
     Function,
@@ -247,7 +284,7 @@ pub enum PlanCallableKind {
 }
 
 /// Identifies one callable without embedding presentation punctuation in its name.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlanCallable {
     pub kind: PlanCallableKind,
@@ -255,15 +292,22 @@ pub struct PlanCallable {
 }
 
 /// Defines one typed runtime relationship between two flow participants.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PlanFlowRelation {
+    /// Creates one instance of the target type.
     Construct,
+    /// Invokes a callable for its returned value or behavior.
     Call { callable: PlanCallable },
+    /// Obtains data through a callable without assigning ownership semantics from prose.
     Read { callable: PlanCallable },
+    /// Mutates or persists state through a callable.
     Write { callable: PlanCallable },
+    /// Transfers the named event or request to the target.
     Send { event: String },
+    /// Produces an observable effect at the target. The relation contains only kind; describe the produced effect in the edge result.
     Emit,
+    /// Sends a result back to the target. The relation contains only kind; describe the returned value in the edge result.
     Return,
 }
 
@@ -283,11 +327,9 @@ impl PlanFlowRelation {
 }
 
 /// Connects one flow step owner to a concrete runtime receiver.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlanFlowEdge {
-    #[serde(default)]
-    pub edge_id: String,
     pub relation: PlanFlowRelation,
     pub target: EntityReference,
     pub expansion: Vec<PlanFlowStep>,
@@ -295,21 +337,17 @@ pub struct PlanFlowEdge {
 }
 
 /// Represents one labeled continuation from an acting flow step.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlanFlowBranch {
-    #[serde(default)]
-    pub branch_id: String,
     pub condition: String,
     pub steps: Vec<PlanFlowStep>,
 }
 
 /// Represents one boundary in an affected runtime or data flow.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlanFlowStep {
-    #[serde(default)]
-    pub step_id: String,
     pub action: String,
     pub target: EntityReference,
     pub edges: Vec<PlanFlowEdge>,
@@ -317,78 +355,16 @@ pub struct PlanFlowStep {
 }
 
 /// Represents one independent runtime, data, request, or recovery flow.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlanFlow {
-    #[serde(default)]
-    pub flow_id: String,
     pub title: String,
     pub description: String,
     pub steps: Vec<PlanFlowStep>,
 }
 
-impl PlanFlow {
-    /// Resolve one step from any depth in this flow's execution tree.
-    pub fn step(&self, step_id: &str) -> Option<&PlanFlowStep> {
-        find_flow_step(&self.steps, step_id)
-    }
-
-    /// Resolve one mutable step from any depth in this flow's execution tree.
-    pub fn step_mut(&mut self, step_id: &str) -> Option<&mut PlanFlowStep> {
-        find_flow_step_mut(&mut self.steps, step_id)
-    }
-
-    /// Resolve one edge through its owning step from any depth in the execution tree.
-    pub fn edge(&self, step_id: &str, edge_id: &str) -> Option<&PlanFlowEdge> {
-        self.step(step_id)?
-            .edges
-            .iter()
-            .find(|edge| edge.edge_id == edge_id)
-    }
-}
-
-fn find_flow_step<'a>(step_list: &'a [PlanFlowStep], step_id: &str) -> Option<&'a PlanFlowStep> {
-    for step in step_list {
-        if step.step_id == step_id {
-            return Some(step);
-        }
-        for edge in &step.edges {
-            if let Some(found) = find_flow_step(&edge.expansion, step_id) {
-                return Some(found);
-            }
-        }
-        for branch in &step.branches {
-            if let Some(found) = find_flow_step(&branch.steps, step_id) {
-                return Some(found);
-            }
-        }
-    }
-    None
-}
-
-fn find_flow_step_mut<'a>(
-    step_list: &'a mut [PlanFlowStep],
-    step_id: &str,
-) -> Option<&'a mut PlanFlowStep> {
-    for step in step_list {
-        if step.step_id == step_id {
-            return Some(step);
-        }
-        for edge in &mut step.edges {
-            if let Some(found) = find_flow_step_mut(&mut edge.expansion, step_id) {
-                return Some(found);
-            }
-        }
-        for branch in &mut step.branches {
-            if let Some(found) = find_flow_step_mut(&mut branch.steps, step_id) {
-                return Some(found);
-            }
-        }
-    }
-    None
-}
-
 /// Defines one local architectural move inside a source file.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SubtaskAction {
     Expose,
@@ -460,45 +436,40 @@ impl SubtaskAction {
 }
 
 /// Represents one local architectural move inside a source file.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlanWorkSubtask {
-    #[serde(default)]
-    pub subtask_id: String,
     #[serde(rename = "operation")]
     pub action: SubtaskAction,
     pub description: String,
-    #[serde(default)]
-    #[serde(rename = "entities")]
-    pub entity_ids: Vec<String>,
+    pub entities: Vec<String>,
 }
 
 /// Defines the sole operation accepted by a test subtask.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TestSubtaskOperation {
     Test,
 }
 
 /// Represents one concrete test edit inside its owning source file.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlanTestSubtask {
-    #[serde(default)]
-    pub subtask_id: String,
     #[serde(rename = "operation")]
     pub operation: TestSubtaskOperation,
     pub action: ChangeAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renamed_from: Option<String>,
     pub name: String,
     pub category: TestCategory,
     pub behavior: String,
     #[serde(default)]
-    #[serde(rename = "covers_entities")]
-    pub covered_entity_ids: Vec<String>,
+    pub covers_entities: Vec<String>,
 }
 
 /// Represents one implementation or test responsibility inside a source file.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum PlanSubtask {
     Test(PlanTestSubtask),
@@ -506,42 +477,26 @@ pub enum PlanSubtask {
 }
 
 impl PlanSubtask {
-    /// Resolve the Harness-owned identity shared by every subtask role.
-    pub fn subtask_id(&self) -> &str {
-        match self {
-            Self::Test(subtask) => &subtask.subtask_id,
-            Self::Work(subtask) => &subtask.subtask_id,
-        }
-    }
-
-    /// Resolve the mutable Harness-owned identity shared by every subtask role.
-    pub fn subtask_id_mut(&mut self) -> &mut String {
-        match self {
-            Self::Test(subtask) => &mut subtask.subtask_id,
-            Self::Work(subtask) => &mut subtask.subtask_id,
-        }
-    }
-
     /// Resolve program entities owned by an implementation subtask.
-    pub fn owned_entity_ids(&self) -> &[String] {
+    pub fn owned_entities(&self) -> &[String] {
         match self {
             Self::Test(_) => &[],
-            Self::Work(subtask) => &subtask.entity_ids,
+            Self::Work(subtask) => &subtask.entities,
         }
     }
 
     /// Resolve mutable program-entity ownership for an implementation subtask.
-    pub fn owned_entity_ids_mut(&mut self) -> Option<&mut Vec<String>> {
+    pub fn owned_entities_mut(&mut self) -> Option<&mut Vec<String>> {
         match self {
             Self::Test(_) => None,
-            Self::Work(subtask) => Some(&mut subtask.entity_ids),
+            Self::Work(subtask) => Some(&mut subtask.entities),
         }
     }
 
     /// Resolve optional production-entity traceability for a test subtask.
-    pub fn covered_entity_ids(&self) -> &[String] {
+    pub fn covered_entities(&self) -> &[String] {
         match self {
-            Self::Test(subtask) => &subtask.covered_entity_ids,
+            Self::Test(subtask) => &subtask.covers_entities,
             Self::Work(_) => &[],
         }
     }
@@ -556,13 +511,35 @@ impl PlanSubtask {
 }
 
 /// Defines how one task changes a concrete source-file boundary.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum PlanFileChange {
     Add { path: String },
     Modify { path: String },
     Remove { path: String },
     Rename { from: String, to: String },
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+enum PlanFileWire {
+    Add {
+        path: String,
+        subtasks: Vec<PlanSubtask>,
+    },
+    Modify {
+        path: String,
+        subtasks: Vec<PlanSubtask>,
+    },
+    Remove {
+        path: String,
+        subtasks: Vec<PlanSubtask>,
+    },
+    Rename {
+        from: String,
+        to: String,
+        subtasks: Vec<PlanSubtask>,
+    },
 }
 
 impl PlanFileChange {
@@ -593,30 +570,69 @@ impl PlanFileChange {
 }
 
 /// Represents one concrete source-file boundary owned by a task.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PlanFile {
     #[serde(flatten)]
     pub change: PlanFileChange,
-    #[serde(default)]
     pub subtasks: Vec<PlanSubtask>,
 }
 
+impl<'de> Deserialize<'de> for PlanFile {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match PlanFileWire::deserialize(deserializer)? {
+            PlanFileWire::Add { path, subtasks } => Self {
+                change: PlanFileChange::Add { path },
+                subtasks,
+            },
+            PlanFileWire::Modify { path, subtasks } => Self {
+                change: PlanFileChange::Modify { path },
+                subtasks,
+            },
+            PlanFileWire::Remove { path, subtasks } => Self {
+                change: PlanFileChange::Remove { path },
+                subtasks,
+            },
+            PlanFileWire::Rename { from, to, subtasks } => Self {
+                change: PlanFileChange::Rename { from, to },
+                subtasks,
+            },
+        })
+    }
+}
+
+impl JsonSchema for PlanFile {
+    fn schema_name() -> Cow<'static, str> {
+        "PlanFile".into()
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        concat!(module_path!(), "::PlanFile").into()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        generator.subschema_for::<PlanFileWire>()
+    }
+}
+
 /// Represents one architectural execution unit and its complete source subtree.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlanTask {
-    #[serde(default)]
-    pub task_id: String,
     pub title: String,
     pub description: String,
-    #[serde(default)]
     pub files: Vec<PlanFile>,
 }
 
 pub const PROVISIONAL_PLAN_TITLE: &str = "Planning in progress";
+pub const PLAN_SCHEMA_VERSION: u32 = 3;
 
 /// Owns the complete canonical plan consumed by review and execution.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct PlanDocument {
+    pub schema_version: u32,
     pub version: u64,
     pub plan_id: String,
     pub title: String,
@@ -637,7 +653,7 @@ pub struct PlanDocument {
 }
 
 impl PlanDocument {
-    /// Validate references and stable identifiers after every semantic edit.
+    /// Validate references and structural invariants after every semantic edit.
     pub fn validate(&self) -> Result<()> {
         validate_plan_edit(self)
     }
@@ -647,44 +663,29 @@ impl PlanDocument {
         validate_plan_submission(self)
     }
 
-    /// Serialize the semantic planning surface without Harness-owned identities.
+    /// Serialize the semantic planning surface without Harness-derived state.
     pub fn model_json(&self) -> Result<String> {
         let mut value = serde_json::to_value(self)?;
         value
             .as_object_mut()
             .expect("PlanDocument serializes as an object")
             .remove("prompt");
-        hide_internal_identity(&mut value);
+        hide_derived_state(&mut value);
         Ok(serde_json::to_string_pretty(&value)?)
     }
 }
 
-fn hide_internal_identity(value: &mut serde_json::Value) {
+fn hide_derived_state(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Array(item_list) => {
             for item in item_list {
-                hide_internal_identity(item);
+                hide_derived_state(item);
             }
         }
         serde_json::Value::Object(object) => {
-            for key in [
-                "entity_id",
-                "dependency_id",
-                "resolved_version",
-                "member_id",
-                "variant_id",
-                "field_id",
-                "flow_id",
-                "step_id",
-                "edge_id",
-                "branch_id",
-                "task_id",
-                "subtask_id",
-            ] {
-                object.remove(key);
-            }
+            object.remove("resolved_version");
             for child in object.values_mut() {
-                hide_internal_identity(child);
+                hide_derived_state(child);
             }
         }
         _ => {}
@@ -694,6 +695,7 @@ fn hide_internal_identity(value: &mut serde_json::Value) {
 #[cfg(test)]
 pub(crate) fn test_fixture(plan_id: &str, overview: &str) -> PlanDocument {
     PlanDocument {
+        schema_version: PLAN_SCHEMA_VERSION,
         version: 1,
         plan_id: plan_id.into(),
         title: "Structured plan".into(),
@@ -701,7 +703,6 @@ pub(crate) fn test_fixture(plan_id: &str, overview: &str) -> PlanDocument {
         overview: overview.into(),
         usage: None,
         entity_changes: vec![ProgramEntityChange {
-            entity_id: "plan_document".into(),
             action: EntityChangeAction::Add,
             kind: EntityKind::Struct,
             renamed_from: None,
@@ -715,17 +716,14 @@ pub(crate) fn test_fixture(plan_id: &str, overview: &str) -> PlanDocument {
         }],
         dependencies: Vec::new(),
         flows: vec![PlanFlow {
-            flow_id: "execution".into(),
             title: "Execution".into(),
             description: "Start from the accepted plan and produce executable work. Keep planning ownership distinct from execution state.".into(),
             steps: vec![PlanFlowStep {
-                step_id: "read_plan".into(),
                 action: "Read plan".into(),
                 target: EntityReference::PlannedEntity {
-                    entity: "plan_document".into(),
+                    entity: "PlanDocument".into(),
                 },
                 edges: vec![PlanFlowEdge {
-                    edge_id: "read_plan_edge_return".into(),
                     relation: PlanFlowRelation::Return,
                     target: EntityReference::ExternalEntity {
                         entity_kind: ReferencedEntityKind::Endpoint,
@@ -741,7 +739,6 @@ pub(crate) fn test_fixture(plan_id: &str, overview: &str) -> PlanDocument {
             }],
         }],
         tasks: vec![PlanTask {
-            task_id: "create_plan_state".into(),
             title: "Create plan state".into(),
             description: "Give planning one owner.".into(),
             files: vec![PlanFile {
@@ -749,10 +746,9 @@ pub(crate) fn test_fixture(plan_id: &str, overview: &str) -> PlanDocument {
                     path: "src/plan.rs".into(),
                 },
                 subtasks: vec![PlanSubtask::Work(PlanWorkSubtask {
-                    subtask_id: "create_owner".into(),
                     action: SubtaskAction::Create,
                     description: "Keep state durable.".into(),
-                    entity_ids: vec!["plan_document".into()],
+                    entities: vec!["PlanDocument".into()],
                 })],
             }],
         }],
@@ -763,26 +759,26 @@ pub(crate) fn test_fixture(plan_id: &str, overview: &str) -> PlanDocument {
 #[cfg(test)]
 pub(crate) fn test_subtask_fixture() -> PlanSubtask {
     PlanSubtask::Test(PlanTestSubtask {
-        subtask_id: "validates_plans".into(),
         operation: TestSubtaskOperation::Test,
         action: ChangeAction::Add,
+        renamed_from: None,
         name: "validates_plans".into(),
         category: TestCategory::Unit,
         behavior: "Reject malformed plans.".into(),
-        covered_entity_ids: vec!["plan_document".into()],
+        covers_entities: vec!["PlanDocument".into()],
     })
 }
 
 #[cfg(test)]
 pub(crate) fn integration_test_subtask_fixture() -> PlanSubtask {
     PlanSubtask::Test(PlanTestSubtask {
-        subtask_id: "submits_complete_plan".into(),
         operation: TestSubtaskOperation::Test,
         action: ChangeAction::Add,
+        renamed_from: None,
         name: "submits_complete_plan".into(),
         category: TestCategory::Integration,
         behavior: "Submit one complete plan through the real broker boundary.".into(),
-        covered_entity_ids: vec!["plan_document".into()],
+        covers_entities: vec!["PlanDocument".into()],
     })
 }
 
@@ -831,6 +827,15 @@ mod test {
             serde_json::from_value::<PlanFile>(serde_json::json!({
                 "path": "src/new.rs",
                 "subtasks": []
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<PlanFile>(serde_json::json!({
+                "action": "add",
+                "path": "src/new.rs",
+                "subtasks": [],
+                "legacy_operation": "create"
             }))
             .is_err()
         );
@@ -933,7 +938,6 @@ mod test {
 
         assert_eq!(flow.steps[0].edges[0].expansion[0].action, "Read metadata");
         assert_eq!(flow.steps[0].branches[0].condition, "failure");
-        assert!(flow.step("missing").is_none());
 
         assert!(
             serde_json::from_value::<PlanFlowStep>(serde_json::json!({
@@ -988,7 +992,7 @@ mod test {
         assert_eq!(value.pointer("/category"), Some(&serde_json::json!("unit")));
         assert_eq!(
             value.pointer("/covers_entities/0"),
-            Some(&serde_json::json!("plan_document"))
+            Some(&serde_json::json!("PlanDocument"))
         );
         assert!(value.get("tests").is_none());
         assert!(value.get("entities").is_none());
@@ -999,7 +1003,6 @@ mod test {
     fn serializes_tagged_entity_references() {
         let mut document = test_fixture("plan", "Build structured planning.");
         document.flows[0].steps.push(PlanFlowStep {
-            step_id: "workspace_validation".into(),
             action: "Validate plan".into(),
             target: EntityReference::WorkspaceEntity {
                 entity_kind: ReferencedEntityKind::Type,
@@ -1011,7 +1014,6 @@ mod test {
             branches: Vec::new(),
         });
         document.flows[0].steps.push(PlanFlowStep {
-            step_id: "external_output".into(),
             action: "Print result".into(),
             target: EntityReference::ExternalEntity {
                 entity_kind: ReferencedEntityKind::Endpoint,
@@ -1029,7 +1031,7 @@ mod test {
         );
         assert_eq!(
             value.pointer("/flows/0/steps/0/target/entity"),
-            Some(&serde_json::json!("plan_document"))
+            Some(&serde_json::json!("PlanDocument"))
         );
         assert_eq!(
             value.pointer("/flows/0/steps/1/target/kind"),
@@ -1061,7 +1063,7 @@ mod test {
     fn rejects_ambiguous_entity_references() {
         let result = serde_json::from_value::<EntityReference>(serde_json::json!({
             "kind": "planned_entity",
-            "entity": "plan_document",
+            "entity": "PlanDocument",
             "external_entity_name": "CLI"
         }));
 
@@ -1069,10 +1071,9 @@ mod test {
     }
 
     #[test]
-    fn model_json_hides_internal_identity() {
+    fn model_json_omits_generated_node_ids() {
         let mut document = test_fixture("plan", "Build structured planning.");
         document.flows[0].steps[0].edges.push(PlanFlowEdge {
-            edge_id: "read_plan_edge_validate".into(),
             relation: PlanFlowRelation::Call {
                 callable: PlanCallable {
                     kind: PlanCallableKind::Method,
@@ -1090,7 +1091,6 @@ mod test {
             }),
         });
         document.dependencies.push(PlanDependencyChange {
-            dependency_id: "dependency_tokio".into(),
             action: ChangeAction::Add,
             name: "tokio".into(),
             version: "1".into(),
@@ -1113,5 +1113,18 @@ mod test {
         assert!(model_json.contains(r#""kind": "method""#));
         assert!(model_json.contains(r#""name": "validate""#));
         assert!(model_json.contains(r#""name": "ValidatedPlan""#));
+    }
+
+    #[test]
+    fn requires_the_explicit_plan_document_schema_version() {
+        let mut value = serde_json::to_value(test_fixture("plan", "Version plans.")).unwrap();
+        value.as_object_mut().unwrap().remove("schema_version");
+        let missing = serde_json::from_value::<PlanDocument>(value).unwrap_err();
+        assert!(missing.to_string().contains("schema_version"));
+
+        let mut document = test_fixture("plan", "Version plans.");
+        document.schema_version = PLAN_SCHEMA_VERSION + 1;
+        let unsupported = document.validate().unwrap_err().to_string();
+        assert!(unsupported.contains("supported PlanDocument schema version 3"));
     }
 }

@@ -21,8 +21,8 @@ function M.append(result, entry, options, host)
       result.lines[#result.lines + 1] = "▸ " .. label
       result.rows[#result.lines] = {
         kind = "plan_task_started",
-        task_id = item.task_id,
-        node_id = ("%s:task:%s:started"):format(entry.id or "execution", item.task_id or item.ordinal),
+        task_path = item.task_path,
+        node_id = ("%s:%s:started"):format(entry.id or "execution", item.task_path or item.ordinal),
       }
       result.highlights[#result.highlights + 1] = {
         line = #result.lines,
@@ -40,8 +40,8 @@ function M.append(result, entry, options, host)
       result.lines[#result.lines + 1] = "✓ " .. label
       result.rows[#result.lines] = {
         kind = "plan_task_completed",
-        task_id = item.task_id,
-        node_id = ("%s:task:%s:completed"):format(entry.id or "execution", item.task_id or item.ordinal),
+        task_path = item.task_path,
+        node_id = ("%s:%s:completed"):format(entry.id or "execution", item.task_path or item.ordinal),
       }
       result.highlights[#result.highlights + 1] = {
         line = #result.lines,
