@@ -544,6 +544,9 @@ The async pattern is uniform: on a cache miss the caller schedules
 `dr().compute_*_async(...)`, gets back a *pending* marker, and re-renders when the
 callback fills the cache. `prewarm_diff_syntax` preloads syntax for hunks near the
 cursor under a budget, so scrolling feels instant without parsing everything up front.
+The viewport prewarmer only schedules syntax for rendered hunk rows. Collapsed file rows
+stay cold until the cursor rests on them, preventing status open from parsing every
+changed file at once.
 
 `syntax_context.lua` is the per-file holder: for each side it stores the source
 snapshot, parser, parsed tree, and highlight query, and resolves
@@ -742,6 +745,8 @@ tree-sitter parser to that range) so the title and reviewer rows are not re-styl
 The batched review mode (`view_kind = "review"`). It loads a local draft from disk and
 the remote pending review from GitHub, **merges them with conflict detection**, and lets
 the reviewer comment per hunk, mark files viewed/unviewed, pick a verdict, and submit. A
+review loads GitHub's net PR diff rather than its per-commit patch series, so changes
+introduced and reverted within the PR never appear as commentable rows. A
 comment carries `body` (current), `base_body` (last synced), and `remote_body` (on
 conflict) plus a `local_state` machine. Mutations flow through the `annotations` serial
 sync queue, and the draft is persisted to the `github.repo_cache` so a closed buffer

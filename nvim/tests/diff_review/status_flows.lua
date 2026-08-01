@@ -759,8 +759,12 @@ local function run()
     return original_prewarm(...)
   end
   status_render.status_decorate_visible(buf, 1, vim.api.nvim_buf_line_count(buf))
+  assert_true(decorate_prewarm_count == 0, "decoration provider prewarmed collapsed file rows")
+  trigger_normal_mapping("<Tab>", find_row(buf, "mod.txt"))
+  wait_for(function() return buffer_contains(buf, "@@ +1 -1") end, "visible prewarm test hunk did not render")
+  status_render.status_decorate_visible(buf, 1, vim.api.nvim_buf_line_count(buf))
   syntax_engine.prewarm_diff_syntax = original_prewarm
-  assert_true(decorate_prewarm_count > 0, "decoration provider visible prewarm did not warm any visible diff syntax")
+  assert_true(decorate_prewarm_count > 0, "decoration provider did not prewarm visible expanded hunk syntax")
 
   reset_notifications()
   trigger_normal_mapping("S", find_row(buf, "mod.txt"))

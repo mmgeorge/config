@@ -30,7 +30,7 @@ local function convert(input)
   if cached == false then return nil end
 
   local error_list = {}
-  local command_list = environment.commands({ dependency.executable_path(), "latex2text" })
+  local command_list = environment.commands({ dependency.executable_path() })
   for _, command in ipairs(command_list) do
     local result = vim.system({ command }, { stdin = input, text = true, stdout = true, stderr = true }):wait()
     local output = (result.stdout or ""):gsub("\r", ""):gsub("\n+$", "")

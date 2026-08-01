@@ -3,7 +3,10 @@
 --- Routes process failures into the callback result rather than throwing.
 ---@class DiffReviewGitBackendModule
 ---@field current DiffReviewGitBackend? injected backend; nil uses the process runner
-local M = { current = nil }
+---@field debug_request_id integer
+local M = { current = nil, debug_request_id = 0 }
+
+local trace = require("diff_review.infra.perf_trace")
 
 ---@param backend DiffReviewGitBackend?
 function M.set_backend(backend)
@@ -55,16 +58,38 @@ end
 ---@param input? string
 ---@param cb DiffReviewGitTextCallback
 function M.system_text_async(command, input, cb)
+  M.debug_request_id = M.debug_request_id + 1
+  local request_id = M.debug_request_id
+  local started = vim.uv.hrtime()
+  trace.event("git.command.start", nil, {
+    request_id = request_id,
+    command = command,
+    input_bytes = input and #input or 0,
+  })
+
+  ---@param result DiffReviewGitCommandResult
+  local function finish(result)
+    trace.event("git.command.done", nil, {
+      request_id = request_id,
+      command = command,
+      code = result.code,
+      elapsed_ms = math.floor((vim.uv.hrtime() - started) / 1000000),
+      stdout_bytes = #(result.stdout or ""),
+      stderr_bytes = #(result.stderr or ""),
+    })
+    cb(result)
+  end
+
   local backend = M.current
   if backend and backend.system_async then
-    backend.system_async(command, input, cb)
+    backend.system_async(command, input, finish)
     return
   end
   if backend and backend.system then
     vim.schedule(function()
       local output, code = backend.system(command, input)
       local text = tostring(output or "")
-      cb({ code = code or 0, stdout = text, stderr = "", output = text })
+      finish({ code = code or 0, stdout = text, stderr = "", output = text })
     end)
     return
   end
@@ -78,13 +103,13 @@ function M.system_text_async(command, input, cb)
     vim.schedule(function()
       local stdout = result.stdout or ""
       local stderr = result.stderr or ""
-      cb({ code = result.code or 0, stdout = stdout, stderr = stderr, output = M.system_output(stdout, stderr) })
+      finish({ code = result.code or 0, stdout = stdout, stderr = stderr, output = M.system_output(stdout, stderr) })
     end)
   end)
   if not ok then
     vim.schedule(function()
       local message = tostring(process)
-      cb({ code = -1, stdout = "", stderr = message, output = message })
+      finish({ code = -1, stdout = "", stderr = message, output = message })
     end)
   end
 end

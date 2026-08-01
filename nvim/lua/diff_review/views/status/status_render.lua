@@ -815,7 +815,7 @@ local function status_decorate_visible(buf, first_row, last_row)
   local seen = {}
   for row = first_row, last_row do
     local entry = status.entries[row]
-    if entry and (entry_nav._status_entry_is_file_like(entry) or entry_nav._status_entry_is_hunk_like(entry)) then
+    if entry and entry_nav._status_entry_is_hunk_like(entry) then
       local key = entry.id or (entry.file and entry.file.filename) or tostring(row)
       if not seen[key] then
         seen[key] = true

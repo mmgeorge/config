@@ -1655,25 +1655,6 @@ local function ref_oid(repo, ref)
   return git_capture(repo.main_path, { 'rev-parse', '--verify', ref })
 end
 
-local function local_branch_is_ancestor(repo, branch, remote_ref)
-  local stdout, stderr = git_output(repo.main_path, {
-    'merge-base',
-    '--is-ancestor',
-    branch,
-    remote_ref,
-  })
-
-  if stdout ~= nil then
-    return true, nil
-  end
-
-  if stderr and stderr ~= '' then
-    return nil, stderr
-  end
-
-  return false, nil
-end
-
 local function created_branch(opts)
   return opts.branch or opts.new_branch or opts.start_point
 end
@@ -2011,19 +1992,9 @@ local function prepare_remote_existing_branch(window, repo, record)
   end
 
   local same_tip = local_oid ~= nil and remote_oid ~= nil and local_oid == remote_oid
-  local local_is_ancestor = false
-  if local_exists and not checked_out and not same_tip then
-    local ancestor, ancestor_err = local_branch_is_ancestor(repo, branch, record.id)
-    if ancestor == nil then
-      notify(window, 'Could not compare ' .. branch .. ' with ' .. record.id .. ': ' .. ancestor_err)
-      return nil
-    end
-    local_is_ancestor = ancestor
-  end
   local action = branch_source.existing_remote_action({
     checked_out = checked_out ~= nil,
     local_exists = local_exists,
-    local_is_ancestor = local_is_ancestor,
     same_tip = same_tip,
   })
 
@@ -2032,15 +2003,7 @@ local function prepare_remote_existing_branch(window, repo, record)
     return nil
   end
 
-  if action == 'blocked_diverged' then
-    notify(
-      window,
-      'Local branch ' .. branch .. ' is ahead of or diverged from ' .. record.id .. '. Choose Local branch or resolve it first'
-    )
-    return nil
-  end
-
-  if action == 'fast_forward' then
+  if action == 'reset_to_remote' then
     local stdout, stderr = git_output(repo.main_path, {
       'branch',
       '--force',
@@ -2048,7 +2011,7 @@ local function prepare_remote_existing_branch(window, repo, record)
       record.id,
     })
     if not stdout then
-      notify(window, 'Could not fast-forward ' .. branch .. ' to ' .. record.id .. ': ' .. stderr)
+      notify(window, 'Could not update ' .. branch .. ' to ' .. record.id .. ': ' .. stderr)
       return nil
     end
   end

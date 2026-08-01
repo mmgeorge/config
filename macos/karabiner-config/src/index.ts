@@ -8,6 +8,11 @@ import {
   writeToProfile,
 } from 'karabiner.ts'
 
+const vimModeBundleIdentifiers = [
+  "^com\\.github\\.wez\\.wezterm$",
+  "^md\\.obsidian$",
+]
+
 const aptV3AngleMod = {
   // LHS
   "q": "w",
@@ -52,7 +57,7 @@ writeToProfile('Default profile', [
   rule("control - as command").manipulators([
     withCondition(
       { type: "device_if", identifiers: [{ is_built_in_keyboard: false }] },
-      { type: "frontmost_application_unless", bundle_identifiers: ["^com\\.github\\.wez\\.wezterm$"] }
+      { type: "frontmost_application_unless", bundle_identifiers: vimModeBundleIdentifiers }
     )(
       [
         map('left_control').to('left_command'),
@@ -63,7 +68,7 @@ writeToProfile('Default profile', [
   rule("laptop option - as command").manipulators([
     withCondition(
       { type: "device_if", identifiers: [{ is_built_in_keyboard: true }] },
-      // { type: "frontmost_application_unless", bundle_identifiers: ["^com\\.github\\.wez\\.wezterm$"] }
+      // { type: "frontmost_application_unless", bundle_identifiers: vimModeBundleIdentifiers }
     )(
       [
         map('left_option').to('right_command'),
@@ -73,7 +78,7 @@ writeToProfile('Default profile', [
   rule("caps-lock - as command").manipulators([
     withCondition(
       { type: "device_if", identifiers: [{ is_built_in_keyboard: true }] },
-      { type: "frontmost_application_unless", bundle_identifiers: ["^com\\.github\\.wez\\.wezterm$"] }
+      { type: "frontmost_application_unless", bundle_identifiers: vimModeBundleIdentifiers }
     )(
       [
         map('caps_lock').to('right_command'),
@@ -84,7 +89,7 @@ writeToProfile('Default profile', [
   rule("caps-lock - as escape-control").manipulators([
     withCondition(
       { type: "device_if", identifiers: [{ is_built_in_keyboard: true }] },
-      { type: "frontmost_application_if", bundle_identifiers: ["^com\\.github\\.wez\\.wezterm$"] }
+      { type: "frontmost_application_if", bundle_identifiers: vimModeBundleIdentifiers }
 
     )([
       map('caps_lock').toIfHeldDown('left_control').toIfAlone('escape')

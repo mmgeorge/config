@@ -10,7 +10,6 @@ local M = {}
 ---@field local_exists boolean
 ---@field checked_out? boolean
 ---@field same_tip? boolean
----@field local_is_ancestor? boolean
 
 ---@return WorktreeBranchChoice[]
 function M.source_choices()
@@ -61,7 +60,7 @@ function M.logical_name(ref, source)
 end
 
 ---@param state WorktreeRemoteState
----@return 'create_tracking'|'blocked_checked_out'|'use_local'|'fast_forward'|'blocked_diverged'
+---@return 'create_tracking'|'blocked_checked_out'|'use_local'|'reset_to_remote'
 function M.existing_remote_action(state)
   if not state.local_exists then
     return 'create_tracking'
@@ -75,11 +74,7 @@ function M.existing_remote_action(state)
     return 'use_local'
   end
 
-  if state.local_is_ancestor then
-    return 'fast_forward'
-  end
-
-  return 'blocked_diverged'
+  return 'reset_to_remote'
 end
 
 return M

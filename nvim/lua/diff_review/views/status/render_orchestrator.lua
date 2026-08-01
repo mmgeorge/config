@@ -125,7 +125,12 @@ end
 
 function M.render_status(buf, target_id, fallback_line, opts)
   opts = opts or {}
-  status_helpers.setup_bg_highlights()
+  trace.event("status.render.start", buf, {
+    target_id = target_id,
+    fallback_line = fallback_line,
+    reuse_sections = opts.reuse_sections == true,
+  })
+  trace.span("status.render.setup_bg_highlights", buf, nil, status_helpers.setup_bg_highlights)
   if session.states and session.states[buf] then
     session.status = session.states[buf]
   end
@@ -139,7 +144,9 @@ function M.render_status(buf, target_id, fallback_line, opts)
     if preserve_current_cursor then
       target_id, fallback_line = cursor_target(buf)
     end
-    status_render().status_render_loaded(buf, target_id, fallback_line, opts, session.status.head_lines, session.status.sections)
+    trace.span("status.render.reuse_sections", buf, nil, function()
+      status_render().status_render_loaded(buf, target_id, fallback_line, opts, session.status.head_lines, session.status.sections)
+    end)
     return
   end
 
@@ -150,7 +157,13 @@ function M.render_status(buf, target_id, fallback_line, opts)
     entry_nav._status_set_plain_lines(buf, { "Loading DiffReview..." })
   end
 
+  trace.event("status.git_root.request", buf, { request_id = request_id })
   git_backend.git_root_async(function(cwd, root_err)
+    trace.event("status.git_root.done", buf, {
+      request_id = request_id,
+      cwd = cwd,
+      error = root_err,
+    })
     local latest_status = session.states and session.states[buf] or render_state
     if not (latest_status and latest_status.request_id == request_id) then return end
     session.status = latest_status
@@ -166,7 +179,13 @@ function M.render_status(buf, target_id, fallback_line, opts)
     status_issues.ensure_state(latest_status, cwd)
     local pr_request_id = pr_state.status_ensure_pr_state(cwd, buf, opts.refresh_pr)
 
+    trace.event("status.load.request", buf, { request_id = request_id, cwd = cwd })
     section_map._status_load_async(cwd, function(result)
+      trace.event("status.load.done", buf, {
+        request_id = request_id,
+        cwd = cwd,
+        section_count = result.sections and #result.sections or 0,
+      })
       local current_status = session.states and session.states[buf] or render_state
       if not (current_status and current_status.request_id == request_id) then return end
       session.status = current_status
@@ -195,7 +214,13 @@ function M.render_status(buf, target_id, fallback_line, opts)
       if preserve_current_cursor and not opts.restore_initial_folds then
         target_id, fallback_line = cursor_target(buf)
       end
-      status_render().status_render_loaded(buf, target_id, fallback_line, opts, result.head_lines, result.sections)
+      trace.span("status.render.loaded", buf, {
+        request_id = request_id,
+        section_count = #result.sections,
+      }, function()
+        status_render().status_render_loaded(buf, target_id, fallback_line, opts, result.head_lines, result.sections)
+      end)
+      trace.event("status.render.done", buf, { request_id = request_id })
       vim.schedule(function()
         local metadata_status = session.states and session.states[buf] or render_state
         if not (

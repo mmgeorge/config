@@ -284,7 +284,7 @@ function gh_backend.system_async(command, input, cb, cwd)
       cb({ code = 0, stdout = stdout, stderr = "", output = stdout })
       return
     end
-    if key == "gh\tpr\tdiff\t42\t--patch\t--color\tnever" then
+    if key == "gh\tpr\tdiff\t42\t--color\tnever" then
       local diff = table.concat({
         "diff --git a/lua/diff_review/gh.lua b/lua/diff_review/gh.lua",
         "index 1111111..2222222 100644",

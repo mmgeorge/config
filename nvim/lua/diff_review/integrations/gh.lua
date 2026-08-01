@@ -671,7 +671,7 @@ function M.pr_diff_async(cwd, number, repo, cb)
     cb = repo
     repo = nil
   end
-  local command = { "gh", "pr", "diff", tostring(number), "--patch", "--color", "never" }
+  local command = { "gh", "pr", "diff", tostring(number), "--color", "never" }
   if repo and repo ~= "" then vim.list_extend(command, { "--repo", repo }) end
   system_text_async(command, nil, cwd, cb)
 end

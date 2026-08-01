@@ -35,7 +35,6 @@ return {
         latex = {
           converter = {
             require('markdown_math.dependency').executable_path(),
-            'latex2text',
           },
         },
       }
