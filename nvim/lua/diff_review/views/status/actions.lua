@@ -1,7 +1,13 @@
---- Applies stage, unstage, and discard mutations for the status view, then reconciles the
 --- Coordinates GitStatus actions across optimistic projection, repository mutation, and deferred
 --- authoritative synchronization, keeping cursor policy outside stage and unstage operations.
 local M = {}
+
+---@class DiffReviewStatusIndexActionOptions
+---@field ignored_path_list? string[]
+---@field cursor_target? DiffReviewListCursorTarget
+
+---@class DiffReviewStatusListActionOptions
+---@field visual_selection? DiffReviewVisualSelection
 
 local notifications = require("diff_review.infra.notifications")
 local git_backend = require("diff_review.git.git_backend")
@@ -14,6 +20,7 @@ local source_loader = require("diff_review.render.source_loader")
 local function render_orchestrator() return require("diff_review.views.status.render_orchestrator") end
 local diff_source_state = require("diff_review.views.status.diff_source_state")
 local git_data = require("diff_review.git.git_data")
+local ignored_path_store = require("diff_review.views.status.ignored_path_store")
 local entry_nav = require("diff_review.views.status.entry_nav")
 local status_helpers = require("diff_review.views.status.status_helpers")
 local trace = require("diff_review.infra.perf_trace")
@@ -55,19 +62,73 @@ local function status_operations_pending()
   local status = session.status
   return status ~= nil and status.cwd ~= nil and mutation_coordinator.pending(status.cwd)
 end
+---@param root string
+---@param entry DiffReviewStatusEntry
+---@return string?
+local function status_entry_relative_path(root, entry)
+  if not (entry and entry.file) then return nil end
+  local relpath = entry.file.relpath or repo_relative(entry.file.filename, root)
+  return relpath and relpath:gsub("\\", "/") or nil
+end
+
+---@param entry DiffReviewStatusEntry
+---@return DiffReviewStatusEntry
+local function status_ignored_file_stage_entry(entry)
+  local file = vim.deepcopy(entry.file)
+  file.section_name = "unstaged"
+  for _, hunk in ipairs(file.hunks or {}) do
+    hunk.section_name = "unstaged"
+    hunk.staged = false
+  end
+  return {
+    kind = "file",
+    file = file,
+  }
+end
+
+--- Preserve normal hunk staging while coercing every Ignored selection to one whole-file target.
+---@param root string
 ---@param entries DiffReviewStatusEntry[]
----@param target_section DiffReviewStatusStageSectionName
----@return DiffReviewStatusEntry[]
-local function status_action_entries_for_target(entries, target_section)
-  local action_entries = {}
+---@return DiffReviewStatusEntry[], string[]
+local function status_stage_action_entries(root, entries)
+  local action_entry_list = {}
+  local ignored_entry_by_filename = {}
+  local ignored_path_set = {}
   for _, entry in ipairs(entries) do
-    if entry.kind == "file" and entry.file and entry.file.section_name ~= target_section then
-      action_entries[#action_entries + 1] = entry
-    elseif entry.kind == "hunk" and entry.hunk and entry.file and entry.hunk.staged ~= (target_section == "staged") then
-      action_entries[#action_entries + 1] = entry
+    local file = entry.file
+    if file and file.section_name == "ignored" then
+      ignored_entry_by_filename[file.filename] = ignored_entry_by_filename[file.filename]
+        or status_ignored_file_stage_entry(entry)
+      local relpath = status_entry_relative_path(root, entry)
+      if relpath then ignored_path_set[relpath] = true end
+    elseif entry.kind == "file" and file and file.section_name == "unstaged" then
+      action_entry_list[#action_entry_list + 1] = entry
+    elseif entry.kind == "hunk" and entry.hunk and file and not entry.hunk.staged then
+      action_entry_list[#action_entry_list + 1] = entry
     end
   end
-  return action_entries
+  local ignored_filename_list = vim.tbl_keys(ignored_entry_by_filename)
+  table.sort(ignored_filename_list)
+  for _, filename in ipairs(ignored_filename_list) do
+    action_entry_list[#action_entry_list + 1] = ignored_entry_by_filename[filename]
+  end
+  local ignored_path_list = entry_nav._status_files_from_set(ignored_path_set)
+  return action_entry_list, ignored_path_list
+end
+
+---@param root string
+---@param entries DiffReviewStatusEntry[]
+---@param source_section "unstaged"|"ignored"
+---@return string[]
+local function status_virtual_path_list(root, entries, source_section)
+  local path_set = {}
+  for _, entry in ipairs(entry_nav._status_expanded_entries(entries)) do
+    if entry.file and entry.file.section_name == source_section then
+      local relpath = status_entry_relative_path(root, entry)
+      if relpath then path_set[relpath] = true end
+    end
+  end
+  return entry_nav._status_files_from_set(path_set)
 end
 
 ---@param entry DiffReviewStatusEntry
@@ -182,7 +243,10 @@ end
 ---@param entries DiffReviewStatusEntry[]
 ---@param target_section DiffReviewStatusStageSectionName
 ---@param root_override? string
-local function status_enqueue_index_action(label, completed_label, direction, entries, target_section, root_override)
+---@param opts? DiffReviewStatusIndexActionOptions
+local function status_enqueue_index_action(label, completed_label, direction, entries, target_section, root_override, opts)
+  opts = opts or {}
+  opts.ignored_path_list = opts.ignored_path_list or {}
   local status = session.status
   local root = root_override or (status and status.cwd or nil)
   if not root then
@@ -207,7 +271,19 @@ local function status_enqueue_index_action(label, completed_label, direction, en
       recovery_entry_list = vim.deepcopy(target_entry_list),
     },
     on_enqueue = function(task)
-      status_sync.apply_optimistic(root, assert(task.burst_id), entries, target_section)
+      if #opts.ignored_path_list > 0 then ignored_path_store.begin_stage(root, assert(task.id), opts.ignored_path_list) end
+      local optimistic_ok, optimistic_error = pcall(
+        status_sync.apply_optimistic,
+        root,
+        assert(task.burst_id),
+        entries,
+        target_section,
+        opts.cursor_target
+      )
+      if not optimistic_ok then
+        ignored_path_store.cancel_stage(root, assert(task.id))
+        error(optimistic_error)
+      end
     end,
     execute = function(done)
       index_mutation.execute_async(root, {
@@ -215,29 +291,57 @@ local function status_enqueue_index_action(label, completed_label, direction, en
         target_list = target_list,
       }, done)
     end,
-    on_complete = function(result)
+    on_complete = function(result, task)
       ---@cast result DiffReviewIndexMutationResult
+      if #opts.ignored_path_list > 0 then
+        local ignored_path_set = {}
+        for _, path in ipairs(opts.ignored_path_list) do ignored_path_set[path] = true end
+        local completed_path_list = {}
+        for _, target in ipairs(result.completed_target_list or {}) do
+          local completed_path = target.path and repo_relative(target.path, root) or nil
+          if completed_path then
+            completed_path = completed_path:gsub("\\", "/")
+            if ignored_path_set[completed_path] then completed_path_list[#completed_path_list + 1] = completed_path end
+          end
+        end
+        ignored_path_store.finish_stage(root, assert(task.id), completed_path_list)
+      end
       if result.ok and result.count and result.count > 0 then
         entry_nav._status_notify_action(completed_label, result.hunk_count or 0, result.file_count or 0)
       end
+    end,
+    on_cancel = function(task)
+      if #opts.ignored_path_list > 0 then ignored_path_store.cancel_stage(root, assert(task.id)) end
     end,
   })
   if enqueue_error then notify_error(label .. " failed: " .. enqueue_error, "DiffReview") end
 end
 
 ---@class DiffReviewStatusDiscardOpts
----@field preserve_cursor? boolean
+---@field visual_selection? DiffReviewVisualSelection
 
 ---@param entries DiffReviewStatusEntry[]
-local function status_stage_entries(entries)
+---@param opts? DiffReviewStatusListActionOptions
+local function status_stage_entries(entries, opts)
   if #entries == 0 then return end
   if blocked_by_active_commit("Stage") then return end
   local expanded_entries = entry_nav._status_expanded_entries(entries)
   if #expanded_entries == 0 then return end
 
-  local action_entries = status_action_entries_for_target(expanded_entries, "staged")
+  local status = session.status
+  local root = status and status.cwd or nil
+  if not root then
+    notify_error("Stage failed: missing Git root", "DiffReview")
+    return
+  end
+  local action_entries, ignored_path_list = status_stage_action_entries(root, expanded_entries)
   if #action_entries == 0 then return end
-  status_enqueue_index_action("Stage", "Staged", "stage", action_entries, "staged")
+  local cursor_target = opts and opts.visual_selection
+      and entry_nav._status_visual_action_cursor_target(opts.visual_selection, action_entries) or nil
+  status_enqueue_index_action("Stage", "Staged", "stage", action_entries, "staged", nil, {
+    ignored_path_list = ignored_path_list,
+    cursor_target = cursor_target,
+  })
 end
 
 ---@param entry DiffReviewStatusEntry?
@@ -247,21 +351,67 @@ local function status_stage(entry)
 end
 
 ---@param entries DiffReviewStatusEntry[]
-local function status_unstage_entries(entries)
+---@param opts? DiffReviewStatusListActionOptions
+local function status_unstage_entries(entries, opts)
   if #entries == 0 then return end
-  if blocked_by_active_commit("Unstage") then return end
   local expanded_entries = entry_nav._status_expanded_entries(entries)
   if #expanded_entries == 0 then return end
 
+  local status = session.status
+  local root = status and status.cwd or nil
+  if not root then
+    notify_error("Unstage failed: missing Git root", "DiffReview")
+    return
+  end
+  local ignored_path_list = status_virtual_path_list(root, expanded_entries, "ignored")
+  local virtual_changed = #ignored_path_list > 0 and ignored_path_store.unignore_paths(root, ignored_path_list)
+  if virtual_changed then
+    entry_nav._status_notify_action("Unignored", 0, #ignored_path_list)
+  end
+
   local action_entries = status_unstage_action_entries(expanded_entries)
-  if #action_entries == 0 then return end
-  status_enqueue_index_action("Unstage", "Unstaged", "unstage", action_entries, "unstaged")
+  local target_entries = #action_entries > 0 and action_entries or expanded_entries
+  local cursor_target = opts and opts.visual_selection
+      and entry_nav._status_visual_action_cursor_target(opts.visual_selection, target_entries) or nil
+  if #action_entries == 0 then
+    if virtual_changed then status_sync.reproject_ignored(root, cursor_target) end
+    return
+  end
+  if blocked_by_active_commit("Unstage") then return end
+  status_enqueue_index_action("Unstage", "Unstaged", "unstage", action_entries, "unstaged", nil, {
+    cursor_target = cursor_target,
+  })
 end
 
 ---@param entry DiffReviewStatusEntry?
 local function status_unstage(entry)
   if not entry then return end
   status_unstage_entries({ entry })
+end
+
+---@param entries DiffReviewStatusEntry[]
+---@param opts? DiffReviewStatusListActionOptions
+local function status_ignore_entries(entries, opts)
+  local status = session.status
+  local root = status and status.cwd or nil
+  if not root then
+    notify_error("Ignore failed: missing Git root", "DiffReview")
+    return
+  end
+  local ignored_path_list = status_virtual_path_list(root, entries, "unstaged")
+  if #ignored_path_list == 0 then return end
+  local expanded_entries = entry_nav._status_expanded_entries(entries)
+  local cursor_target = opts and opts.visual_selection
+      and entry_nav._status_visual_action_cursor_target(opts.visual_selection, expanded_entries) or nil
+  if ignored_path_store.ignore_paths(root, ignored_path_list) then
+    status_sync.reproject_ignored(root, cursor_target)
+    entry_nav._status_notify_action("Ignored", 0, #ignored_path_list)
+  end
+end
+
+---@param entry DiffReviewStatusEntry?
+local function status_ignore(entry)
+  if entry then status_ignore_entries({ entry }) end
 end
 
 ---@param filename string
@@ -374,7 +524,8 @@ end
 
 ---@param entries DiffReviewStatusEntry[]
 ---@param target_id? string
-local function status_discard_entries(entries, target_id)
+---@param fallback_line? integer
+local function status_discard_entries(entries, target_id, fallback_line)
   if blocked_by_active_commit("Discard") then return end
   local status_buf = session.status and session.status.buf
   git_backend.git_root_async(function(cwd, root_err)
@@ -389,7 +540,11 @@ local function status_discard_entries(entries, target_id)
 
     local function finish_all()
       if #failures > 0 then notifications.git_failures("Discard failed", failures) end
-      refresh_status_after_discard(status_buf, target_id)
+      if fallback_line and status_buf and vim.api.nvim_buf_is_valid(status_buf) then
+        render_orchestrator().render_status_or_notify(status_buf, target_id, fallback_line)
+      else
+        refresh_status_after_discard(status_buf, target_id)
+      end
     end
 
     local function discard_at(index)
@@ -542,10 +697,11 @@ local function status_discard_entry_list(entries, target_id, opts)
     end
   end
   if #discard_entries == 0 then return end
-  local action_target_id = nil
-  if not opts.preserve_cursor then
-    action_target_id = entry_nav._status_action_target_id(entries, discard_entries) or target_id
-  end
+  local cursor_target = opts.visual_selection
+      and entry_nav._status_visual_action_cursor_target(opts.visual_selection, discard_entries) or nil
+  local action_target_id = cursor_target and cursor_target.id
+    or entry_nav._status_action_target_id(entries, discard_entries)
+    or target_id
 
   local message
   if #discard_entries == 1 then
@@ -561,7 +717,7 @@ local function status_discard_entry_list(entries, target_id, opts)
     message = { ("Discard changes in %d file(s)?"):format(entry_nav._status_count_set(files)) }
   end
   status_helpers.confirm(message, function()
-    status_discard_entries(discard_entries, action_target_id)
+    status_discard_entries(discard_entries, action_target_id, cursor_target and cursor_target.fallback_line or nil)
   end)
 end
 
@@ -577,6 +733,8 @@ M._status_stage_diff_hunk = status_stage_diff_hunk
 M._status_unstage = status_unstage
 M._status_unstage_entries = status_unstage_entries
 M._status_unstage_diff_hunk = status_unstage_diff_hunk
+M._status_ignore = status_ignore
+M._status_ignore_entries = status_ignore_entries
 M._status_discard_entry_list = status_discard_entry_list
 M._status_discard = status_discard
 M._status_operations_pending = status_operations_pending

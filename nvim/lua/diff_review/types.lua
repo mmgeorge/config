@@ -135,6 +135,18 @@
 
 ---@alias DiffReviewStatusViewKind "status"|"pr"|"diff"|"review"
 
+---@class DiffReviewListCursorTarget
+---@field buf integer
+---@field id string
+---@field fallback_line integer
+
+---@class DiffReviewVisualSelection
+---@field buf integer
+---@field entries DiffReviewStatusEntry[]
+---@field start_line integer
+---@field end_line integer
+---@field cursor_target? DiffReviewListCursorTarget
+
 ---@class DiffReviewStatusPRState
 ---@field state "fetching"|"ready"|"closed"|"none"|"unavailable"|"error"
 ---@field pr? DiffReviewGhPR
@@ -151,7 +163,7 @@
 ---@field parent_id? string
 ---@field default_folded? boolean
 
----@alias DiffReviewStatusSectionName "unstaged"|"staged"|"unmerged"|"recent"|"pr_commits"
+---@alias DiffReviewStatusSectionName "unstaged"|"staged"|"ignored"|"unmerged"|"recent"|"pr_commits"
 
 ---@class DiffReviewTreeSitterContextPending
 ---@field pending true

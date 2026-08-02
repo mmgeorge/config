@@ -45,13 +45,14 @@ local function status_show_help(...) return commit_view()._status_show_help(...)
 local status_command_visible_for_view
 local function render_status_or_notify(...) return render_orchestrator().render_status_or_notify(...) end
 local function status_leave_visual_mode(...) return entry_nav()._status_leave_visual_mode(...) end
-local function status_entries_from_visual_selection(...) return entry_nav()._status_entries_from_visual_selection(...) end
 local function status_jump(...) return commit_view()._status_jump(...) end
 local function status_remote_action(...) return commit_view()._status_remote_action(...) end
 local function status_defer_prewarm_under_cursor(...) return entry_nav()._status_defer_prewarm_under_cursor(...) end
 local function status_toggle(...) return commit_view()._status_toggle(...) end
 local function status_stage_entries(...) return actions()._status_stage_entries(...) end
 local function status_stage(...) return actions()._status_stage(...) end
+local function status_ignore_entries(...) return actions()._status_ignore_entries(...) end
+local function status_ignore(...) return actions()._status_ignore(...) end
 local function status_primary_key(...) return status_keys.primary_key(...) end
 local function status_open_about(...) return commit_view()._status_open_about(...) end
 local function status_discard_entry_list(...) return actions()._status_discard_entry_list(...) end
@@ -242,9 +243,19 @@ local function stage_under_cursor(buf)
 end
 
 local function stage_selection(buf)
-  local entries = status_entries_from_visual_selection()
+  local selection = entry_nav()._status_visual_selection()
   status_leave_visual_mode()
-  status_stage_entries(entries)
+  status_stage_entries(selection.entries, { visual_selection = selection })
+end
+
+local function ignore_under_cursor(buf)
+  status_ignore(status_entry_under_cursor())
+end
+
+local function ignore_selection(buf)
+  local selection = entry_nav()._status_visual_selection()
+  status_leave_visual_mode()
+  status_ignore_entries(selection.entries, { visual_selection = selection })
 end
 
 local function unstage_under_cursor(buf)
@@ -252,9 +263,9 @@ local function unstage_under_cursor(buf)
 end
 
 local function unstage_selection(buf)
-  local entries = status_entries_from_visual_selection()
+  local selection = entry_nav()._status_visual_selection()
   status_leave_visual_mode()
-  status_unstage_entries(entries)
+  status_unstage_entries(selection.entries, { visual_selection = selection })
 end
 
 local function discard_under_cursor(buf)
@@ -262,9 +273,9 @@ local function discard_under_cursor(buf)
 end
 
 local function discard_selection(buf)
-  local entries = status_entries_from_visual_selection()
+  local selection = entry_nav()._status_visual_selection()
   status_leave_visual_mode()
-  status_discard_entry_list(entries, nil, { preserve_cursor = true })
+  status_discard_entry_list(selection.entries, nil, { visual_selection = selection })
 end
 
 local function status_open(buf)
@@ -443,6 +454,8 @@ local VIEW_KEYMAPS = {
     { id = "stage", mode = "x", handler = stage_selection, desc = "Stage selection" },
     { id = "unstage", mode = "n", handler = unstage_under_cursor, desc = "Unstage hunk/file" },
     { id = "unstage", mode = "x", handler = unstage_selection, desc = "Unstage selection" },
+    { id = "ignore", mode = "n", handler = ignore_under_cursor, desc = "Ignore file in DiffReview" },
+    { id = "ignore", mode = "x", handler = ignore_selection, desc = "Ignore selection in DiffReview" },
     { id = "discard", mode = "n", handler = discard_under_cursor, desc = "Discard hunk/file" },
     { id = "discard", mode = "x", handler = discard_selection, desc = "Discard selection" },
     { id = "open", mode = "n", handler = status_open },

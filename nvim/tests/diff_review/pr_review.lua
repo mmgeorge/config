@@ -462,6 +462,24 @@ local function run()
   wait_for(function() return buffer_contains(buf, "Unviewed Changes (2)") end, "U on Viewed header did not move all files")
   assert_true(buffer_contains(buf, "Viewed Changes (0)"), "U on Viewed header did not clear Viewed")
 
+  local visual_viewed_mapping = vim.api.nvim_buf_call(buf, function()
+    return vim.fn.maparg("S", "x", false, true)
+  end)
+  local visual_unviewed_mapping = vim.api.nvim_buf_call(buf, function()
+    return vim.fn.maparg("U", "x", false, true)
+  end)
+  assert_true(type(visual_viewed_mapping.callback) == "function", "review S missing visual selection mapping")
+  assert_true(type(visual_unviewed_mapping.callback) == "function", "review U missing visual selection mapping")
+  trigger_visual(buf, "S", find_row(buf, "src/a.txt +1 -1"), find_row(buf, "src/b.txt +1 -1"))
+  wait_for(function() return buffer_contains(buf, "Viewed Changes (2)") end, "visual S did not move both review files")
+  trigger_visual(
+    buf,
+    "U",
+    row_after(buf, "src/a.txt +1 -1", find_row(buf, "Viewed Changes")),
+    row_after(buf, "src/b.txt +1 -1", find_row(buf, "Viewed Changes"))
+  )
+  wait_for(function() return buffer_contains(buf, "Unviewed Changes (2)") end, "visual U did not move both review files")
+
   trigger(buf, "S", find_row(buf, "src/a.txt +1 -1"))
   wait_for(function() return buffer_contains(buf, "Unviewed Changes (1)") end, "S did not move a.txt to viewed")
   assert_true(buffer_contains(buf, "Viewed Changes (1)"), "viewed count did not increase")

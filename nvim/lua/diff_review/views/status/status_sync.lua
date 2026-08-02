@@ -4,6 +4,7 @@ local M = {}
 local diff_buffer = require("diff_review.views.diff_buffer")
 local diff_source_state = require("diff_review.views.status.diff_source_state")
 local git_data = require("diff_review.git.git_data")
+local ignored_path_store = require("diff_review.views.status.ignored_path_store")
 local mutation_coordinator = require("diff_review.git.mutation_coordinator")
 local notifications = require("diff_review.infra.notifications")
 local operation_journal = require("diff_review.views.status.operation_journal")
@@ -101,11 +102,25 @@ local function ensure_journal(status)
 end
 
 ---@param status table
-local function render_current_projection(status)
+---@param journal? DiffReviewOperationJournal
+---@return DiffReviewStatusSection[], DiffReviewStatusSection[]
+local function project_status(status, journal)
+  local git_section_list = operation_journal.project(journal or ensure_journal(status))
+  if not status.cwd then return git_section_list, git_section_list end
+  return ignored_path_store.project(status.cwd, git_section_list), git_section_list
+end
+
+---@param status table
+---@param cursor_target? DiffReviewListCursorTarget
+local function render_current_projection(status, cursor_target)
   if not (status.buf and vim.api.nvim_buf_is_valid(status.buf)) then return end
   local previous_status = session.status
   session.status = status
-  status_render().status_render_current_model(nil, { restore_cursor = false })
+  if cursor_target and cursor_target.buf == status.buf then
+    status_render().status_render_current_model(cursor_target.id, { fallback_line = cursor_target.fallback_line })
+  else
+    status_render().status_render_current_model(nil, { restore_cursor = false })
+  end
   session.status = previous_status
 end
 
@@ -375,9 +390,9 @@ local function commit_status_snapshot(status, snapshot, snapshot_section_list, r
     committed_journal = operation_journal.commit(committed_journal, authoritative_section_list, resolved_burst_id)
   end
   status.operation_journal = committed_journal
-  local projected_section_list = operation_journal.project(committed_journal)
+  local projected_section_list, git_projected_section_list = project_status(status, committed_journal)
   local corrected = not section_map.equivalent(status.sections or {}, projected_section_list)
-  apply_snapshot_sources(status, projected_section_list, snapshot)
+  apply_snapshot_sources(status, git_projected_section_list, snapshot)
   status.verification_stale = false
   if force_render or corrected then
     status.sections = projected_section_list
@@ -524,7 +539,7 @@ local function recover_burst(state, burst, done)
         )
       end
       status.operation_journal = operation_journal.mark_succeeded(status.operation_journal, burst.id)
-      status.sections = operation_journal.project(status.operation_journal)
+      status.sections = project_status(status, status.operation_journal)
       status.verification_stale = true
       status_render().status_cancel_pending_enrichment(status)
       render_current_projection(status)
@@ -562,7 +577,8 @@ end
 ---@param burst_id integer
 ---@param entries DiffReviewStatusEntry[]
 ---@param target_section DiffReviewStatusStageSectionName
-function M.apply_optimistic(root, burst_id, entries, target_section)
+---@param cursor_target? DiffReviewListCursorTarget
+function M.apply_optimistic(root, burst_id, entries, target_section, cursor_target)
   local state = root_state(root)
   local layer = capture_cache_layer(root, entries, target_section)
   layer.burst_id = burst_id
@@ -574,11 +590,11 @@ function M.apply_optimistic(root, burst_id, entries, target_section)
     status_render().status_cancel_pending_enrichment(status)
     local journal = operation_journal.append(ensure_journal(status), burst_id, entries, target_section)
     status.operation_journal = journal
-    status.sections = operation_journal.project(journal)
+    status.sections = project_status(status, journal)
     if status.diff_source_registry and #layer.path_list > 0 then
       source_loader.invalidate(status.diff_source_registry, { "unstaged", "staged" }, layer.path_list)
     end
-    render_current_projection(status)
+    render_current_projection(status, cursor_target)
   end
   for _, selection in ipairs(layer.selection_list) do
     diff_buffer.refresh_open_diff_buffer_from_cache(selection.filename)
@@ -590,6 +606,7 @@ end
 ---@param authoritative_section_list DiffReviewStatusSection[]
 function M.reset_status(status, authoritative_section_list)
   status.operation_journal = operation_journal.reset(ensure_journal(status), authoritative_section_list)
+  status.sections = project_status(status, status.operation_journal)
   status.verification_stale = false
   if status.cwd then
     local state = root_state(status.cwd)
@@ -598,9 +615,23 @@ function M.reset_status(status, authoritative_section_list)
   end
 end
 
+
+--- Reapply the virtual Ignored overlay and consume an originating visual-action target once.
+---@param root string
+---@param cursor_target? DiffReviewListCursorTarget
+function M.reproject_ignored(root, cursor_target)
+  for _, status in ipairs(status_state_list(root)) do
+    status.request_id = (status.request_id or 0) + 1
+    status.sections = project_status(status)
+    status_render().status_cancel_pending_enrichment(status)
+    render_current_projection(status, cursor_target)
+  end
+end
+
 --- Reset private synchronization state for deterministic tests.
 function M.reset_for_test()
   root_state_by_key = {}
+  ignored_path_store.reset_for_test()
 end
 
 return M

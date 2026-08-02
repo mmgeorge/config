@@ -35,6 +35,7 @@
 ---@field visual_line_with_gutter DiffReviewKeymap
 ---@field stage DiffReviewKeymap
 ---@field unstage DiffReviewKeymap
+---@field ignore DiffReviewKeymap
 ---@field discard DiffReviewKeymap
 ---@field open DiffReviewKeymap
 ---@field commit DiffReviewKeymap
@@ -211,6 +212,7 @@ M.defaults = {
       visual_line_with_gutter = "W",
       stage = "S",
       unstage = "U",
+      ignore = "I",
       discard = "j",
       open = { "o", "<CR>", "." },
       commit = "cc",

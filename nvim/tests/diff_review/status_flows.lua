@@ -870,7 +870,7 @@ local function run()
     "status hint winbar did not include the buffer name\n" .. status_hint
   )
   assert_true(
-    status_hint:find("S stage | U unstage | j discard | cc commit | o open | R refresh | q close | ? help", 1, true) ~= nil,
+    status_hint:find("S stage | U unstage | I ignore | j discard | cc commit | o open | R refresh | q close | ? help", 1, true) ~= nil,
     "status hint winbar did not use the compact binding list\n" .. status_hint
   )
   assert_true(
@@ -967,6 +967,10 @@ local function run()
   local visual_second_row = find_row(buf, "visual-stage-b.txt")
   assert_visual_callback_exits_mode("S", visual_first_row, visual_second_row)
   assert_true(not mode_is_visual(vim.api.nvim_get_mode().mode), "visual stage left test in visual mode")
+  assert_true(
+    vim.api.nvim_get_current_line():find("visual-stage-c.txt", 1, true) ~= nil,
+    "visual stage did not move the cursor to the next surviving file"
+  )
   wait_for(function()
     return state.staged_modified["visual-stage-a.txt"]
       and state.staged_modified["visual-stage-b.txt"]
@@ -975,6 +979,25 @@ local function run()
   wait_for(function()
     return count_snapshot_diff_calls() > 0
   end, "visual stage queue did not reconcile")
+  wait_for(function() return not mutation_coordinator.pending(root) end, "visual stage queue did not settle")
+
+  reset_state({
+    modified = {
+      ["visual-tail-a.txt"] = true,
+      ["visual-tail-b.txt"] = true,
+      ["visual-tail-c.txt"] = true,
+    },
+  })
+  render_and_wait(buf, "visual-tail-a.txt +1 -1")
+  assert_visual_callback_exits_mode(
+    "S",
+    find_row(buf, "visual-tail-b.txt"),
+    find_row(buf, "visual-tail-c.txt")
+  )
+  assert_true(
+    vim.api.nvim_get_current_line():find("visual-tail-a.txt", 1, true) ~= nil,
+    "visual stage at the end did not move the cursor to the previous surviving file"
+  )
 
   reset_state({ modified = { ["hunk-stage.txt"] = true } })
   render_and_wait(buf, "hunk-stage.txt +1 -1")

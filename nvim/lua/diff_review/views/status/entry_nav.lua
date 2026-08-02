@@ -257,17 +257,28 @@ local function status_entries_for_lines(start_line, end_line)
   return entries
 end
 
----@return DiffReviewStatusEntry[]
-local function status_entries_from_visual_selection()
+---@return DiffReviewVisualSelection
+local function status_visual_selection()
   local mode = vim.fn.mode()
   local in_visual_mode = mode == "v" or mode == "V" or mode:byte() == 22
+  local start_line
+  local end_line
   if in_visual_mode then
-    return status_entries_for_lines(vim.fn.line("v"), vim.api.nvim_win_get_cursor(0)[1])
+    start_line = vim.fn.line("v")
+    end_line = vim.api.nvim_win_get_cursor(0)[1]
+  else
+    local start_pos = vim.fn.getpos("'<")
+    local end_pos = vim.fn.getpos("'>")
+    start_line = start_pos[2]
+    end_line = end_pos[2]
   end
-
-  local start_pos = vim.fn.getpos("'<")
-  local end_pos = vim.fn.getpos("'>")
-  return status_entries_for_lines(start_pos[2], end_pos[2])
+  if start_line > end_line then start_line, end_line = end_line, start_line end
+  return {
+    buf = vim.api.nvim_get_current_buf(),
+    entries = status_entries_for_lines(start_line, end_line),
+    start_line = start_line,
+    end_line = end_line,
+  }
 end
 
 local function status_leave_visual_mode()
@@ -345,35 +356,81 @@ local function status_notify_action(action, hunk_count, file_count)
   notifications.debug(("%s %s"):format(action, table.concat(parts, ", ")), vim.log.levels.INFO, { title = "DiffReview" })
 end
 
----@param entries DiffReviewStatusEntry[]
+---@param entry DiffReviewStatusEntry?
+---@return "file"|"hunk"?
+local function status_entry_granularity(entry)
+  if M._status_entry_is_file_like(entry) then return "file" end
+  if M._status_entry_is_hunk_like(entry) then return "hunk" end
+  return nil
+end
+
+---@param entry DiffReviewStatusEntry?
 ---@return string?
-local function status_hunk_action_target_id(entries)
+local function status_entry_section_name(entry)
+  return entry and ((entry.file and entry.file.section_name) or (entry.section and entry.section.name)) or nil
+end
+
+--- Resolve the next surviving semantic sibling for one visual list mutation.
+---@param selection DiffReviewVisualSelection
+---@param action_entries DiffReviewStatusEntry[]
+---@return DiffReviewListCursorTarget?
+local function status_visual_action_cursor_target(selection, action_entries)
   local status = session.status
-  if not (status and status.entries) then return nil end
+  if not (status and status.entries and status.buf == selection.buf) then return nil end
 
   local action_ids = {}
-  local has_hunk = false
-  for _, entry in ipairs(entries or {}) do
-    if entry.kind == "hunk" and entry.id then
-      has_hunk = true
-      action_ids[entry.id] = true
+  local action_file_set = {}
+  local granularity = nil
+  for _, entry in ipairs(action_entries or {}) do
+    if entry.id then action_ids[entry.id] = true end
+    if M._status_entry_is_file_like(entry) then
+      granularity = "file"
+      if entry.file and entry.file.filename then action_file_set[entry.file.filename] = true end
     end
+    if not granularity and M._status_entry_is_hunk_like(entry) then granularity = "hunk" end
   end
-  if not has_hunk then return nil end
+  if not granularity then return nil end
 
-  local cursor_line = vim.api.nvim_win_get_cursor(0)[1]
-  if not (status.buf and vim.api.nvim_buf_is_valid(status.buf)) then return nil end
-  local max_line = vim.api.nvim_buf_line_count(status.buf)
-  for line = cursor_line + 1, max_line do
+  local function entry_is_action(entry)
+    if not entry then return false end
+    if entry.id and action_ids[entry.id] then return true end
+    return granularity == "file"
+      and entry.file ~= nil
+      and action_file_set[entry.file.filename] == true
+  end
+
+  local last_section = nil
+  for line = selection.end_line, selection.start_line, -1 do
     local entry = status.entries[line]
-    if entry and entry.kind == "hunk" and entry.id and not action_ids[entry.id] then
-      return entry.id
+    if entry_is_action(entry) and status_entry_granularity(entry) == granularity then
+      last_section = status_entry_section_name(entry)
+      break
     end
   end
-  for line = cursor_line - 1, 1, -1 do
+  local first_section = nil
+  for line = selection.start_line, selection.end_line do
     local entry = status.entries[line]
-    if entry and entry.kind == "hunk" and entry.id and not action_ids[entry.id] then
-      return entry.id
+    if entry_is_action(entry) and status_entry_granularity(entry) == granularity then
+      first_section = status_entry_section_name(entry)
+      break
+    end
+  end
+
+  local max_line = vim.api.nvim_buf_line_count(status.buf)
+  for line = selection.end_line + 1, max_line do
+    local entry = status.entries[line]
+    if entry and entry.id and not entry_is_action(entry)
+        and status_entry_granularity(entry) == granularity
+        and status_entry_section_name(entry) == last_section then
+      return { buf = selection.buf, id = entry.id, fallback_line = line }
+    end
+  end
+  for line = selection.start_line - 1, 1, -1 do
+    local entry = status.entries[line]
+    if entry and entry.id and not entry_is_action(entry)
+        and status_entry_granularity(entry) == granularity
+        and status_entry_section_name(entry) == first_section then
+      return { buf = selection.buf, id = entry.id, fallback_line = line }
     end
   end
   return nil
@@ -402,10 +459,8 @@ end
 ---@param action_entries DiffReviewStatusEntry[]
 ---@return string?
 local function status_action_target_id(selected_entries, action_entries)
-  if status_entries_are_headers(selected_entries) then
-    return nil
-  end
-  return status_hunk_action_target_id(action_entries) or (action_entries[1] and action_entries[1].id or nil)
+  if status_entries_are_headers(selected_entries) then return nil end
+  return action_entries[1] and action_entries[1].id or nil
 end
 
 ---@param target_id? string
@@ -534,7 +589,8 @@ M._status_entry_under_cursor = status_entry_under_cursor
 M._status_prewarm_entry_syntax = status_prewarm_entry_syntax
 M._status_restore_cursor = status_restore_cursor
 M._status_leave_visual_mode = status_leave_visual_mode
-M._status_entries_from_visual_selection = status_entries_from_visual_selection
+M._status_visual_selection = status_visual_selection
+M._status_visual_action_cursor_target = status_visual_action_cursor_target
 M._status_action_target_id = status_action_target_id
 M._status_expanded_entries = status_expanded_entries
 M._status_files_from_set = status_files_from_set

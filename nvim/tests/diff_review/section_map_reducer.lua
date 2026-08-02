@@ -287,12 +287,45 @@ local function assert_load_failure_completes_without_empty_sections()
   assert_true(callback_result and callback_result.sections == nil, "status load failure synthesized empty sections")
 end
 
+local function assert_ignored_overlay_moves_only_unstaged_whole_file()
+  local ignored_filename = "D:/repo/ignored.lua"
+  local staged_filename = "D:/repo/staged.lua"
+  local visible_filename = "D:/repo/visible.lua"
+  local ignored_file = status_file(ignored_filename, "unstaged", "M", false, {
+    status_hunk(ignored_filename, "first", false, "M", 2),
+    status_hunk(ignored_filename, "second", false, "M", 20),
+  })
+  ignored_file.relpath = "ignored.lua"
+  local staged_file = status_file(staged_filename, "staged", "M", false, {
+    status_hunk(staged_filename, "staged", true, "M", 4),
+  })
+  staged_file.relpath = "staged.lua"
+  local visible_file = status_file(visible_filename, "unstaged", "M", false, {
+    status_hunk(visible_filename, "visible", false, "M", 8),
+  })
+  visible_file.relpath = "visible.lua"
+
+  local projected = section_map.apply_ignored_paths({
+    status_section("unstaged", { ignored_file, visible_file }),
+    status_section("staged", { staged_file }),
+  }, { ["ignored.lua"] = true, ["staged.lua"] = true })
+
+  assert_true(find_file(projected, "unstaged", ignored_filename) == nil, "ignored file remained in Unstaged")
+  assert_true(find_section(projected, "ignored").default_folded, "ignored section did not default to folded")
+  assert_equal(#required_file(projected, "ignored", ignored_filename).hunks, 2, "ignored overlay lost whole-file hunks")
+  assert_true(find_file(projected, "unstaged", visible_filename) ~= nil, "ignored overlay moved an unrelated file")
+  assert_true(find_file(projected, "staged", staged_filename) ~= nil, "ignored overlay moved a staged file")
+  assert_true(find_file(projected, "ignored", staged_filename) == nil, "ignored overlay shadowed staged Git state")
+  assert_true(find_file({ status_section("unstaged", { ignored_file }) }, "unstaged", ignored_filename) ~= nil, "ignored overlay mutated its input")
+end
+
 local function run()
   assert_semantic_hunk_move_uses_value_identity()
   assert_added_file_unstages_as_untracked()
   assert_path_replacement_is_authoritative_and_local()
   assert_snapshot_conversion_and_semantic_equivalence()
   assert_normal_stage_matches_authoritative_snapshot()
+  assert_ignored_overlay_moves_only_unstaged_whole_file()
   assert_load_failure_completes_without_empty_sections()
 end
 

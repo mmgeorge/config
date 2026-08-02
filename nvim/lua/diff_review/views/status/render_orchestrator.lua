@@ -17,6 +17,7 @@ local state = require("diff_review.views.status.state")
 local pr_overview = require("diff_review.views.pr.pr_overview")
 local actions = require("diff_review.views.status.actions")
 local git_data = require("diff_review.git.git_data")
+local ignored_path_store = require("diff_review.views.status.ignored_path_store")
 local section_builder = require("diff_review.views.status.section_builder")
 local pr_state = require("diff_review.views.status.pr_state")
 local status_head = require("diff_review.views.status.status_head")
@@ -185,7 +186,13 @@ function M.render_status(buf, target_id, fallback_line, opts)
     local pr_request_id = pr_state.status_ensure_pr_state(cwd, buf, opts.refresh_pr)
 
     trace.event("status.load.request", buf, { request_id = request_id, cwd = cwd })
-    section_map._status_load_async(cwd, function(result)
+    local ignored_store_loaded = false
+    local status_load_completed = false
+    local loaded_result = nil ---@type DiffReviewStatusLoadResult?
+
+    local function finish_status_load()
+      if not (ignored_store_loaded and status_load_completed and loaded_result) then return end
+      local result = loaded_result
       trace.event("status.load.done", buf, {
         request_id = request_id,
         cwd = cwd,
@@ -203,6 +210,8 @@ function M.render_status(buf, target_id, fallback_line, opts)
       session.untracked = vim.deepcopy(result.snapshot.untracked_by_file or {})
       session.file_diffs = vim.deepcopy(result.snapshot.file_diffs or {})
       session.file_hunk_staged = vim.deepcopy(result.snapshot.file_hunk_staged or {})
+      status_sync.reset_status(current_status, result.sections)
+      result.sections = current_status.sections
       if opts.restore_initial_folds then
         state.restore_initial_folds(result.sections)
         target_id = state.first_grouping_id(result.sections)
@@ -218,8 +227,6 @@ function M.render_status(buf, target_id, fallback_line, opts)
       )
       current_status.head_lines = result.head_lines
       current_status.head_values = result.head_values
-      status_sync.reset_status(current_status, result.sections)
-      current_status.sections = result.sections
       current_status.fancy_rows = {}
       if preserve_current_cursor and not opts.restore_initial_folds then
         target_id, fallback_line = cursor_target(buf)
@@ -246,6 +253,16 @@ function M.render_status(buf, target_id, fallback_line, opts)
           pr_state.status_start_pr_lookup(cwd, buf, pr_request_id)
         end, 50)
       end
+    end
+
+    ignored_path_store.load_async(cwd, function()
+      ignored_store_loaded = true
+      finish_status_load()
+    end)
+    section_map._status_load_async(cwd, function(result)
+      loaded_result = result
+      status_load_completed = true
+      finish_status_load()
     end)
   end)
 end

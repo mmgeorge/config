@@ -1143,7 +1143,7 @@ local function status_render_loaded(buf, target_id, fallback_line, opts, head_li
 end
 
 ---@param target_id? string
----@param opts? { clear_fancy_rows?: boolean, restore_cursor?: boolean }
+---@param opts? { clear_fancy_rows?: boolean, restore_cursor?: boolean, fallback_line?: integer }
 status_render_current_model = function(target_id, opts)
   local status = session.status
   if not (status and status.buf and vim.api.nvim_buf_is_valid(status.buf) and status.head_lines and status.sections) then
@@ -1154,7 +1154,7 @@ status_render_current_model = function(target_id, opts)
   if opts.clear_fancy_rows ~= false then
     status.fancy_rows = {}
   end
-  local fallback_line = opts.restore_cursor == false and nil or vim.api.nvim_win_get_cursor(0)[1]
+  local fallback_line = opts.restore_cursor == false and nil or opts.fallback_line or vim.api.nvim_win_get_cursor(0)[1]
   status_render_loaded(
     status.buf,
     target_id,

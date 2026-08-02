@@ -17,6 +17,7 @@ local session = require("diff_review.session")
 local M = {}
 
 ---@alias DiffReviewStatusStageSectionName "unstaged"|"staged"
+---@alias DiffReviewStatusDisplaySectionName "unstaged"|"staged"|"ignored"
 
 --- Represents one value-addressed file or hunk selected for a status move.
 ---@class DiffReviewStatusMoveSelection
@@ -56,7 +57,7 @@ local M = {}
 ---@field git_status string
 ---@field hunk_list DiffReviewStatusSemanticHunk[]
 
----@alias DiffReviewStatusSemanticSectionMap table<DiffReviewStatusStageSectionName, DiffReviewStatusSemanticFile[]>
+---@alias DiffReviewStatusSemanticSectionMap table<DiffReviewStatusDisplaySectionName, DiffReviewStatusSemanticFile[]>
 
 --- Represents one complete status model produced by a successful load.
 ---@class DiffReviewStatusLoadSuccess
@@ -72,12 +73,13 @@ local M = {}
 
 ---@alias DiffReviewStatusLoadResult DiffReviewStatusLoadSuccess|DiffReviewStatusLoadFailure
 
---- Ordered status sections (unstaged before staged). Owned here, the sole consumer; previously
+--- Ordered status sections. Owned here, the sole consumer; previously
 --- parked on the init table as M._status_section_order during the monolith era.
 ---@type DiffReviewSectionConfig[]
 local status_section_order = {
   { name = "unstaged", title = "Unstaged changes", default_folded = false },
   { name = "staged", title = "Staged changes", default_folded = false },
+  { name = "ignored", title = "Ignored changes", default_folded = true },
 }
 
 local function status_section_for_item(item)
@@ -689,12 +691,12 @@ local function status_file_is_added(file)
 end
 
 ---@param file DiffReviewStatusFile
----@param section_name DiffReviewStatusStageSectionName
+---@param section_name DiffReviewStatusDisplaySectionName
 ---@return DiffReviewStatusFile
 local function status_copy_file_for_section(file, section_name)
   local copied_file = vim.deepcopy(file)
   copied_file.section_name = section_name
-  copied_file.untracked = section_name == "unstaged" and status_file_is_added(file)
+  copied_file.untracked = section_name ~= "staged" and status_file_is_added(file)
   if copied_file.untracked then
     copied_file.git_status = "??"
   elseif section_name == "staged" and status_file_is_added(file) then
@@ -932,6 +934,35 @@ function M.replace_paths(confirmed_sections, snapshot_sections, affected_path_se
   return status_order_section_map(mapped_section, source_sections, nil)
 end
 
+---@param path string
+---@return string
+local function status_normalized_relative_path(path)
+  return (tostring(path or ""):gsub("\\", "/"):gsub("^%./", ""))
+end
+
+--- Move complete unstaged files into the virtual Ignored section by repository-relative path.
+---@param section_list DiffReviewStatusSection[]
+---@param ignored_path_set table<string, boolean>
+---@return DiffReviewStatusSection[]
+function M.apply_ignored_paths(section_list, ignored_path_set)
+  local source_sections = vim.deepcopy(section_list or {})
+  local mapped_section = status_section_map(source_sections)
+  mapped_section.ignored.files = {}
+  mapped_section.ignored.files_by_name = {}
+  local unstaged_section = mapped_section.unstaged
+  for file_index = #unstaged_section.files, 1, -1 do
+    local file = unstaged_section.files[file_index]
+    local relpath = status_normalized_relative_path(file.relpath)
+    if ignored_path_set[relpath] then
+      table.remove(unstaged_section.files, file_index)
+      local ignored_file = status_copy_file_for_section(file, "ignored")
+      status_merge_file_into_section(mapped_section, "ignored", ignored_file)
+    end
+  end
+  status_reindex_section(unstaged_section)
+  return status_order_section_map(mapped_section, source_sections, nil)
+end
+
 ---@param file_snapshot DiffReviewPathStatusFileSnapshot
 ---@param section_name DiffReviewStatusStageSectionName
 ---@param hunk_list DiffReviewHunk[]
@@ -1032,7 +1063,7 @@ end
 ---@param sections DiffReviewStatusSection[]
 ---@return DiffReviewStatusSemanticSectionMap
 local function status_semantic_section_map(sections)
-  local semantic_section_map = { unstaged = {}, staged = {} } ---@type DiffReviewStatusSemanticSectionMap
+  local semantic_section_map = { unstaged = {}, staged = {}, ignored = {} } ---@type DiffReviewStatusSemanticSectionMap
   for _, section in ipairs(sections or {}) do
     local semantic_file_list = semantic_section_map[section.name]
     if semantic_file_list then
@@ -1047,7 +1078,7 @@ local function status_semantic_section_map(sections)
   return semantic_section_map
 end
 
---- Validate equivalent stage and unstage data while ignoring render-owned metadata.
+--- Validate equivalent staged, unstaged, and ignored data while ignoring render-owned metadata.
 ---@param left_sections DiffReviewStatusSection[]
 ---@param right_sections DiffReviewStatusSection[]
 ---@return boolean

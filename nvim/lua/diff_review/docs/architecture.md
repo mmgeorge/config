@@ -107,6 +107,7 @@ diff_review/
 │       ├── status_issues.lua   `#`-issue completion + issue integration in the status buffer
 │       ├── section_map.lua     Pure section projection, path replacement, and semantic equivalence
 │       ├── operation_journal.lua Confirmed section baseline plus ordered optimistic mutation layers
+│       ├── ignored_path_store.lua Durable worktree-scoped virtual ignore markers and stage suppressions
 │       ├── status_sync.lua     Optimistic cache projection and path-scoped authoritative synchronization
 │       ├── section_builder.lua Build sections/files from diff text, attach review comments
 │       ├── fold_state.lua      Per-key fold map, native fold application, foldtext, resize refresh
@@ -671,6 +672,12 @@ full load can therefore finish late without overwriting the optimistic cache pro
 tree. `section_map.lua` owns pure projection, path replacement, and semantic equivalence.
 `operation_journal.lua` holds one confirmed section baseline plus ordered optimistic
 layers, which lets a new stage or unstage project over synchronization already in flight.
+`ignored_path_store.lua` then projects repository-relative markers over that Git model,
+moving matching Unstaged files into a folded **Ignored changes** section. It persists one
+versioned JSON document per normalized worktree root under Neovim's data directory, so
+branch switches share markers while unrelated worktrees remain isolated. Startup loads
+the Git snapshot and marker document concurrently and renders only after both complete,
+which prevents an Unstaged-to-Ignored flash without serializing the two reads.
 `status_keys.lua` assigns each section/file/hunk a **stable identity key** so fold state,
 caches, and actions all index the same canonical key across renders.
 
@@ -695,10 +702,22 @@ git text loaders, and the layout build that `diff_render` consumes.
 
 **6. Navigate and act.** `entry_nav.lua` resolves the entry under the cursor, parent/file/
 hunk relationships, visual-selection entry sets, action targets, and decoration prewarm.
+Visual line mutations capture the next surviving semantic sibling before changing the
+component model, falling back to the previous sibling when the selection reaches the
+end. The originating action render consumes that target once. Normal-mode actions,
+other open buffers, deferred Git synchronization, recovery, and enrichment renders
+never receive it, which prevents delayed work from steering the user's cursor.
 For stage and unstage, `actions.lua` immediately appends an optimistic journal layer,
 projects the section and diff caches, and renders that projection. It then submits the
 Git index mutation to `mutation_coordinator.lua`, whose repository-root FIFO prevents
 `.git/index.lock` races across every status and diff buffer for that repository.
+
+The Ignored section never enters the Git journal. `I` moves whole Unstaged files into
+the virtual marker set, while `U` removes those markers without invoking Git. `S`
+temporarily suppresses selected markers and submits ordinary whole-file stage targets,
+so the existing optimistic journal moves them directly to Staged. Successful targets
+delete their markers after Git completes. Failed or cancelled targets retain their
+markers and reappear through the normal recovery snapshot, including partial batches.
 
 After the FIFO drains, a **120 ms quiet window** closes the burst and `status_sync.lua`
 runs one path-scoped three-command snapshot for the union of affected paths. A matching
@@ -721,8 +740,9 @@ or merge. It does not count as a mutation failure.
 The first failed mutation cancels the queued tasks from that burst and notifies
 immediately. Successful Git writes that completed before the failure remain intact. One
 path snapshot then rebuilds actual Git truth and forces one recovery render. Stage and
-unstage never restore or move the cursor during optimistic, corrective, or recovery
-renders. If both bounded snapshot attempts fail, recovery marks verification stale,
+unstage only restore the one target captured by an originating visual bulk action during
+its optimistic render. Normal actions, corrective renders, and recovery renders never
+move the cursor. If both bounded snapshot attempts fail, recovery marks verification stale,
 reverses the failed and cancelled projections, and retains only targets Git already
 reported complete. Discard follows its separate destructive flow and retains an explicit
 target.
@@ -1057,6 +1077,17 @@ cursor on a hunk, press the stage key
 
 Later accepted journal layers replay over any confirmed snapshot before the next task
 runs, so rapid stage and unstage actions never expose an intermediate backend frame.
+```
+
+**Stage a visual file selection**
+
+```
+visual line range, press the stage key
+  └─ entry_nav captures the next surviving file id, otherwise the previous file id
+       ├─ keymaps exits visual mode and dispatches the normalized selection
+       ├─ actions projects the accepted files into Staged
+       ├─ originating status render restores the captured id once
+       └─ queued Git work and every deferred synchronization render stay cursor-neutral
 ```
 
 **Open a PR review**

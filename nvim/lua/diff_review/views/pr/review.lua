@@ -1004,7 +1004,8 @@ function M.ensure_expanded(state)
 end
 
 ---@param buf integer
-function M.render(buf)
+---@param cursor_target? DiffReviewListCursorTarget
+function M.render(buf, cursor_target)
   local state = M.state(buf)
   if not state then return end
   session.status = state
@@ -1023,7 +1024,14 @@ function M.render(buf)
     M.emit_comments_for(state, diff_line, indent)
   end
   state.review_rendering = true
-  status_render_loaded(buf, nil, nil, { reuse_sections = true }, state.head_lines, state.sections)
+  status_render_loaded(
+    buf,
+    cursor_target and cursor_target.id or nil,
+    cursor_target and cursor_target.fallback_line or nil,
+    { reuse_sections = true, restore_cursor = cursor_target ~= nil },
+    state.head_lines,
+    state.sections
+  )
   state.review_rendering = nil
   local total_comments = 0
   for _, comment in ipairs(state.review_comments or {}) do
@@ -2449,12 +2457,13 @@ end
 
 ---@param buf integer
 ---@param viewed boolean
-function M.toggle_viewed(buf, viewed)
+---@param selection? DiffReviewVisualSelection
+function M.toggle_viewed(buf, viewed, selection)
   local state = M.state(buf)
   if not state then return end
   session.status = state
-  local entry = status_entry_under_cursor()
-  if not entry then return end
+  local selected_entries = selection and selection.entries or { status_entry_under_cursor() }
+  if not selected_entries[1] then return end
   state.review_viewed_hunks = state.review_viewed_hunks or {}
 
   local function apply_file(file, selected_hunk)
@@ -2486,18 +2495,31 @@ function M.toggle_viewed(buf, viewed)
     end
   end
 
-  if entry.file then
-    apply_file(entry.file, entry.hunk)
-  elseif entry.kind == "section" and entry.section then
-    for _, file in ipairs(entry.section.files or {}) do
-      apply_file(file)
+  local selected_file_set = {}
+  for _, entry in ipairs(selected_entries) do
+    if entry.file and entry_nav._status_entry_is_file_like(entry) then
+      selected_file_set[entry.file.relpath or entry.file.filename] = true
     end
-  else
-    return
   end
+  local action_entries = {}
+  for _, entry in ipairs(selected_entries) do
+    if entry.kind == "section" and entry.section then
+      for _, file in ipairs(entry.section.files or {}) do apply_file(file) end
+      action_entries[#action_entries + 1] = entry
+    elseif entry.file and entry_nav._status_entry_is_file_like(entry) then
+      apply_file(entry.file)
+      action_entries[#action_entries + 1] = entry
+    elseif entry.file and entry_nav._status_entry_is_hunk_like(entry)
+        and not selected_file_set[entry.file.relpath or entry.file.filename] then
+      apply_file(entry.file, entry.hunk)
+      action_entries[#action_entries + 1] = entry
+    end
+  end
+  if #action_entries == 0 then return end
 
   M.save_draft(state)
-  M.render(buf)
+  local cursor_target = selection and entry_nav._status_visual_action_cursor_target(selection, action_entries) or nil
+  M.render(buf, cursor_target)
 end
 
 ---Build the comment target (path/side/line range) from the visual selection
@@ -2890,8 +2912,18 @@ function M.setup_keymaps(buf)
       M.register_command_map(buf, id, spec.modes, key, mapped, { buffer = buf, silent = true, nowait = true, desc = spec.desc })
     end
   end
-  map("viewed", function() M.toggle_viewed(buf, true) end)
-  map("unviewed", function() M.toggle_viewed(buf, false) end)
+  map("viewed", function()
+    local mode = vim.fn.mode()
+    local selection = (mode == "v" or mode == "V" or mode:byte() == 22) and entry_nav._status_visual_selection() or nil
+    if selection then entry_nav._status_leave_visual_mode() end
+    M.toggle_viewed(buf, true, selection)
+  end)
+  map("unviewed", function()
+    local mode = vim.fn.mode()
+    local selection = (mode == "v" or mode == "V" or mode:byte() == 22) and entry_nav._status_visual_selection() or nil
+    if selection then entry_nav._status_leave_visual_mode() end
+    M.toggle_viewed(buf, false, selection)
+  end)
   map("comment", function() M.add_comment(buf) end)
   map("delete", function() M.delete_comment(buf) end)
   map("next_comment", function() M.navigate(buf, 1) end)
