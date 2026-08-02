@@ -110,9 +110,9 @@ In the PR view (`ogp`), the PR title and description are editable in place
 description block (regions tracked with extmarks), locked everywhere else,
 so every native editing command works in the regions. Unsynced fields show
 an inline `*` before their label; `:w` clears the markers immediately and
-syncs via `gh pr edit` through a sequential queue (`M._pr_edit.enqueue` —
-not `status_enqueue_operation`, whose reconcile tail would rebuild the PR
-buffer as a status view). Failures notify and restore the markers.
+syncs via `gh pr edit` through a sequential queue (`M._pr_edit.enqueue`, not
+the repository-root Git index mutation coordinator, whose snapshot contract
+belongs only to stage and unstage). Failures notify and restore the markers.
 Re-renders are blocked while edits are unsynced.
 
 The PR lifecycle row renders `DRAFT`, `OPEN`, or `CLOSED`. Activating its
@@ -558,8 +558,9 @@ reuse the same concepts instead of inventing a separate interaction model:
   `status_toggle()`; section, file, and hunk folds should all flow through the
   shared fold state (`status_folded` / `set_status_folded`).
 - Use movement actions like GitStatus stage/unstage: update the in-memory
-  section model immediately, preserve cursor/fold intent, then sync/reconcile
-  asynchronously. For review mode, `S`/`U` moving hunks or files between
+  section model immediately, preserve fold intent, then synchronize
+  asynchronously. GitStatus stage/unstage must never restore or explicitly
+  move the cursor. For review mode, `S`/`U` moving hunks or files between
   Unviewed/Viewed should feel like GitStatus `S`/`U` moving items between
   Unstaged/Staged. Header actions matter too: pressing `S`/`U` on a section
   header should apply to all actionable items in that section, matching
@@ -577,10 +578,58 @@ can override or disable a mapping, and the actual keymaps plus displayed help
 must stay in sync from that single source.
 
 For status actions, do not replace an already-rendered status buffer with a
-generic loading line. Apply an optimistic in-memory section update immediately,
-enqueue the Git operation, and reconcile from Git after the operation queue is
-idle. This keeps rapid actions such as stage-then-unstage ordered without UI
-flashing.
+generic loading line. Append an optimistic operation-journal layer, project the
+section and per-file diff caches, and render immediately. Route every stage and
+unstage index write from status and `diff://` buffers through one FIFO keyed by
+repository root, preventing `.git/index.lock` races across views.
+
+After the FIFO drains, wait for a 120 ms quiet window and run one path-scoped
+authoritative snapshot for the union of burst paths. The snapshot must execute
+exactly three commands with one shared pathspec: porcelain-v2 status with NUL
+records and all untracked files, a zero-context unstaged diff, and a zero-context
+staged diff. Full status load uses the same seam with an empty path list. Treat
+those three commands as one attempt. Retry one failed authoritative attempt after
+120 ms, then mark verification stale if the retry also fails. Do not render or
+notify between attempts.
+
+Read untracked file content through a bounded asynchronous libuv pool after
+the three Git commands finish. Do not add one Git command per untracked file and do
+not call `vim.fn.readfile` in the snapshot callback. Preserve CRLF bytes and the
+missing-final-newline marker, skip NUL-containing content, and retain the status row
+when a file disappears during the read.
+
+Keep full snapshot collection pure until `render_orchestrator.lua` accepts the
+request generation and confirms that no index mutation is pending. Only then replace
+the session diff, staged-flag, and untracked caches. A stale full load must not mutate
+those caches even when its status model never renders.
+
+When Git truth semantically matches the optimistic projection, retire the
+resolved journal layers without rendering the status buffer or writing an open
+diff buffer. On a mismatch, replace only the affected paths and perform one
+corrective render. Replay later optimistic layers over the new confirmed
+baseline.
+
+Do not predict a correction for tracked hunk staging merely because the worktree
+uses CRLF or a clean filter. Git-generated hunk patches already reflect canonical
+content and must not modify worktree bytes. Whole-file staging of an untracked file
+can legitimately differ because `git add` normalizes EOLs and applies clean filters
+while writing the index. Treat that authoritative difference as one correction, not
+as a Git failure.
+
+On the first Git mutation failure in a burst, notify immediately and cancel its
+queued tasks. Preserve completed Git writes, path-resync actual truth, and force
+one recovery render. If both snapshot attempts fail, retain only the projections
+for targets Git reported complete, reverse failed and cancelled cache layers, mark
+verification stale, and render once. Keep discard outside this index-mutation pipeline because
+its destructive worktree semantics require an explicit action target.
+
+Carry rename-versus-copy identity from porcelain status into the section model.
+Include the original path in a mutation and replacement scope only for a rename.
+A copied destination behaves like an added path, while its source stays untouched.
+
+When a status render changes text, use `vim.diff` histogram indices and apply
+disjoint line edits from bottom to top. Do not rewrite unchanged rows, which
+keeps extmark movement and visible redraw work bounded to the real correction.
 
 Tree-sitter context lookup must use async `LanguageTree:parse(range, on_parse)`
 with a cached fallback-render-then-upgrade flow. Do not call synchronous

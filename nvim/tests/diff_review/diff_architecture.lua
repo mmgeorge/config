@@ -3,7 +3,6 @@ package.path = "nvim/lua/?.lua;nvim/lua/?/init.lua;" .. package.path
 local annotation_model = require("diff_review.render.annotations")
 local hunk_index = require("diff_review.render.hunk_index")
 local layout = require("diff_review.render.layout")
-local mutation_queue = require("diff_review.render.mutation_queue")
 local row_tree = require("diff_review.render.row_tree")
 local source_model = require("diff_review.render.source")
 local source_loader = require("diff_review.render.source_loader")
@@ -217,24 +216,6 @@ local function assert_source_path_reload()
   assert_equal(reloaded_paths[1], "src/main.lua", "reload path should normalize")
   assert_true(not file.pending, "reloaded file should not be pending")
   assert_true(not file.stale, "reloaded file should not be stale")
-end
-
-local function assert_mutation_queue()
-  local queue = mutation_queue.new()
-  local event = {}
-  mutation_queue.enqueue(queue, function(done)
-    event[#event + 1] = "first"
-    done()
-  end)
-  mutation_queue.enqueue(queue, function(done)
-    event[#event + 1] = "second"
-    done()
-  end)
-  mutation_queue.on_idle(queue, function()
-    event[#event + 1] = "idle"
-  end)
-  assert_equal(table.concat(event, ","), "first,second,idle", "mutation queue should run FIFO then idle")
-  assert_true(not mutation_queue.pending(queue), "queue should be idle")
 end
 
 local function assert_annotation_index()
@@ -481,7 +462,6 @@ local function run()
   assert_source_loader()
   assert_text_loader()
   assert_source_path_reload()
-  assert_mutation_queue()
   assert_annotation_index()
   assert_row_tree()
   assert_syntax_context()

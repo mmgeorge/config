@@ -8,11 +8,16 @@
 
 local diff_render = require("diff_review.render.diff_render")
 local git_backend = require("diff_review.git.git_backend")
+local notifications = require("diff_review.infra.notifications")
 
 -- state edge kept lazy to avoid a load-time cycle.
 local function state() return require("diff_review.views.status.state") end
 -- git_data edge kept lazy to avoid a load-time cycle.
 local function git_data() return require("diff_review.git.git_data") end
+-- Keep the status_snapshot edge lazy because it reaches git_data.
+local function status_snapshot() return require("diff_review.git.status_snapshot") end
+-- actions reaches this module through status_sync, so keep the back edge lazy.
+local function status_actions() return require("diff_review.views.status.actions") end
 local window_options = require("diff_review.views.status.window_options")
 local trace = require("diff_review.infra.perf_trace")
 local ui = require("diff_review.infra.ui")
@@ -30,6 +35,8 @@ local diff_bufs = {}
 local buf_hunks = {}
 local buf_filename = {}
 local buf_saved_cursor = {}
+local untracked_diff_waiter_by_file = {}
+local untracked_diff_generation = 0
 
 local M = {}
 
@@ -45,6 +52,8 @@ function M.cleanup_diff_buffers()
   buf_hunks = {}
   buf_filename = {}
   buf_saved_cursor = {}
+  untracked_diff_waiter_by_file = {}
+  untracked_diff_generation = untracked_diff_generation + 1
 end
 
 ---@param virt_text table[]?
@@ -667,53 +676,15 @@ function M.open_diff_buffer(filename)
       vim.cmd("normal! zz")
     end, vim.tbl_extend("force", kopts, { desc = "Jump to file", nowait = true }))
 
-    -- Stage the hunk under cursor, then jump to the next hunk
+    -- Stage the hunk under cursor.
     vim.keymap.set("n", "S", function()
-      local patch, hunk_start = get_hunk_at_cursor(buf)
+      local patch = get_hunk_at_cursor(buf)
       if not patch then
         vim.notify("No hunk under cursor", vim.log.levels.WARN)
         return
       end
-      -- Find the index of the current hunk so we can jump to the next one
-      local cur_hunk_idx = nil
-      local hunks = buf_hunks[buf]
-      if hunks and hunk_start then
-        for i, h in ipairs(hunks) do
-          if h.start_line == hunk_start then
-            cur_hunk_idx = i
-            break
-          end
-        end
-      end
-      git_data().stage_patch_async(patch, function(ok)
-        if not ok then return end
-        notify_debug("Hunk staged")
-        local win = vim.api.nvim_get_current_win()
-        local filename = buf_filename[buf]
-        -- Move to the next hunk. The staged hunk keeps its position (it only
-        -- folds), so "next" is the following index in the rebuilt hunk map.
-        local function goto_next()
-          if not vim.api.nvim_win_is_valid(win) or vim.api.nvim_win_get_buf(win) ~= buf then
-            return
-          end
-          local new_hunks = buf_hunks[buf]
-          if new_hunks and cur_hunk_idx then
-            local target = new_hunks[cur_hunk_idx + 1] or new_hunks[cur_hunk_idx]
-            if target then
-              local max = vim.api.nvim_buf_line_count(buf)
-              pcall(vim.api.nvim_win_set_cursor, win, { math.min(target.start_line, max), 0 })
-            end
-          end
-        end
-        -- Re-render this file's diff buffer so the staged hunk folds in place.
-        if filename then
-          M.refresh_open_diff_buffer(filename)
-        end
-        goto_next()
-        -- The async list refresh re-renders the buffer (resetting the
-        -- cursor), so re-assert the next-hunk position once it settles.
-        vim.defer_fn(goto_next, 60)
-      end)
+      local filename = buf_filename[buf]
+      if filename then status_actions()._status_stage_diff_hunk(filename, patch) end
     end, vim.tbl_extend("force", kopts, { desc = "Stage hunk", nowait = true }))
 
     -- Unstage the hunk under cursor
@@ -723,45 +694,8 @@ function M.open_diff_buffer(filename)
         vim.notify("No hunk under cursor", vim.log.levels.WARN)
         return
       end
-      git_data().unstage_patch_async(patch, function(ok)
-        if not ok then return end
-        notify_debug("Hunk unstaged")
-        local win = vim.api.nvim_get_current_win()
-        local filename = buf_filename[buf]
-        -- Find the current hunk so we can stay on it after the re-render
-        -- (it expands in place; unstaging must not jump to the buffer top).
-        local cur_idx, cur_offset = nil, 0
-        local cursor_line = vim.api.nvim_win_get_cursor(0)[1]
-        local hunks = buf_hunks[buf]
-        if hunks then
-          for i, h in ipairs(hunks) do
-            if cursor_line >= h.start_line and cursor_line <= h.end_line then
-              cur_idx = i
-              cur_offset = cursor_line - h.start_line
-              break
-            end
-          end
-        end
-        local function stay()
-          if not vim.api.nvim_win_is_valid(win) or vim.api.nvim_win_get_buf(win) ~= buf then
-            return
-          end
-          local new_hunks = buf_hunks[buf]
-          if new_hunks and cur_idx and new_hunks[cur_idx] then
-            local max = vim.api.nvim_buf_line_count(buf)
-            local line = math.min(new_hunks[cur_idx].start_line + cur_offset, max)
-            pcall(vim.api.nvim_win_set_cursor, win, { line, 0 })
-          end
-        end
-        -- Re-render this file's diff buffer so the hunk expands in place.
-        if filename then
-          M.refresh_open_diff_buffer(filename)
-        end
-        stay()
-        -- The async list refresh re-renders the buffer (resetting the
-        -- cursor), so re-assert the current-hunk position once it settles.
-        vim.defer_fn(stay, 60)
-      end)
+      local filename = buf_filename[buf]
+      if filename then status_actions()._status_unstage_diff_hunk(filename, patch) end
     end, vim.tbl_extend("force", kopts, { desc = "Unstage hunk", nowait = true }))
 
     -- Toggle fold (collapse/expand) the hunk under cursor
@@ -777,7 +711,9 @@ function M.open_diff_buffer(filename)
         if cursor >= h.start_line and cursor <= h.end_line then
           found = true
           h.folded = not h.folded
-          notify_debug("Hunk " .. i .. " folded=" .. tostring(h.folded) .. " range=" .. h.start_line .. "-" .. h.end_line)
+          notifications.debug(
+            "Hunk " .. i .. " folded=" .. tostring(h.folded) .. " range=" .. h.start_line .. "-" .. h.end_line
+          )
           M._render_with_folds(buf)
           pcall(vim.api.nvim_win_set_cursor, 0, { h.start_line, 0 })
           return
@@ -961,12 +897,27 @@ function M._update_file_diff_cache_async(filename, cb)
   -- and doesn't re-run this on every cursor move.
   local relpath = session.untracked and session.untracked[filename]
   if relpath then
-    local diff_text = git_data()._build_untracked_diff(filename, relpath)
-    -- Cache `false` (not nil) as a "checked, no diff" sentinel; cast to satisfy the
-    -- string-valued field type while preserving the boolean sentinel at runtime.
-    session.file_diffs[filename] = diff_text or false
-    session.file_hunk_staged[filename] = diff_text and { false } or nil
-    if cb then cb() end
+    local waiter_list = untracked_diff_waiter_by_file[filename]
+    if waiter_list then
+      if cb then waiter_list[#waiter_list + 1] = cb end
+      return
+    end
+
+    waiter_list = {}
+    if cb then waiter_list[#waiter_list + 1] = cb end
+    untracked_diff_waiter_by_file[filename] = waiter_list
+    local read_generation = untracked_diff_generation
+    status_snapshot().read_untracked_diff_async(filename, relpath, function(diff_text)
+      if read_generation ~= untracked_diff_generation then return end
+      local current_relpath = session.untracked and session.untracked[filename]
+      if current_relpath == relpath then
+        session.file_diffs[filename] = diff_text or false
+        session.file_hunk_staged[filename] = diff_text and { false } or nil
+      end
+      local completed_waiter_list = untracked_diff_waiter_by_file[filename] or {}
+      untracked_diff_waiter_by_file[filename] = nil
+      for _, waiter in ipairs(completed_waiter_list) do waiter() end
+    end)
     return
   end
   git_backend.git_root_async(function(cwd)
@@ -982,8 +933,19 @@ function M._update_file_diff_cache_async(filename, cb)
   end)
 end
 
---- Refresh an open diff buffer for the given filename (if one exists).
---- Called from Trouble S/U actions to sync the diff buffer.
+--- Render an open per-file diff buffer from the current session cache.
+---@param filename string
+function M.refresh_open_diff_buffer_from_cache(filename)
+  local key = "diff:" .. filename
+  diff_bufs = diff_bufs or {}
+  local buf = diff_bufs[key]
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+
+  session.buf_last_rendered[buf] = nil
+  M._refresh_diff_buffer(buf, filename)
+end
+
+--- Reload one open per-file diff buffer from Git.
 ---@param filename string
 function M.refresh_open_diff_buffer(filename)
   local key = "diff:" .. filename
@@ -994,8 +956,7 @@ function M.refresh_open_diff_buffer(filename)
   -- Re-fetch diff data for this file only (cache is stale after staging)
   M._update_file_diff_cache_async(filename, function()
     if not vim.api.nvim_buf_is_valid(buf) then return end
-    session.buf_last_rendered[buf] = nil  -- force re-render
-    M._refresh_diff_buffer(buf, filename)
+    M.refresh_open_diff_buffer_from_cache(filename)
   end)
 end
 

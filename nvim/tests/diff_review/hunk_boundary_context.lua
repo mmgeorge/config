@@ -113,6 +113,63 @@ local diff_text = table.concat({
   "+new target",
 }, "\n")
 
+local modified_path_list = {
+  "src/engine.rs",
+  "src/tangent.rs",
+  "src/material.rs",
+  "src/model_store.rs",
+  "src/render_system.rs",
+  "src/struct_gap.rs",
+  "src/render_barrier.rs",
+  "src/notes.txt",
+}
+
+local raw_hunk_list = git_data._parse_diff(diff_text, false)
+local staged_hunk_by_diff = {}
+
+local function requested_path_set(command)
+  for argument_index, argument in ipairs(command) do
+    if argument == "--" then
+      local path_set = {}
+      for path_index = argument_index + 1, #command do path_set[command[path_index]] = true end
+      return path_set
+    end
+  end
+  return nil
+end
+
+local function snapshot_diff_text(staged, path_set)
+  local diff_list = {}
+  for _, hunk in ipairs(raw_hunk_list) do
+    local hunk_staged = staged_hunk_by_diff[hunk.diff] == true
+    if hunk_staged == staged and (not path_set or path_set[hunk.file]) then
+      diff_list[#diff_list + 1] = hunk.diff
+    end
+  end
+  return table.concat(diff_list, "\n")
+end
+
+local function status_snapshot_text(path_set)
+  local hunk_count_by_path = {}
+  for _, hunk in ipairs(raw_hunk_list) do
+    local count = hunk_count_by_path[hunk.file] or { staged = 0, unstaged = 0 }
+    local field = staged_hunk_by_diff[hunk.diff] and "staged" or "unstaged"
+    count[field] = count[field] + 1
+    hunk_count_by_path[hunk.file] = count
+  end
+
+  local record_list = {}
+  for _, relpath in ipairs(modified_path_list) do
+    if not path_set or path_set[relpath] then
+      local count = hunk_count_by_path[relpath] or { staged = 0, unstaged = 1 }
+      local xy = (count.staged > 0 and "M" or ".") .. (count.unstaged > 0 and "M" or ".")
+      record_list[#record_list + 1] =
+        ("1 %s N... 100644 100644 100644 1111111 2222222 %s\0"):format(xy, relpath)
+    end
+  end
+  return table.concat(record_list)
+end
+
 ---@type DiffReviewGitBackend
 local backend = {}
 
@@ -126,7 +183,11 @@ function backend.systemlist(command)
   if key:find("@{upstream}", 1, true) or key:find("@{push}", 1, true) then return {}, 1 end
   if key == "git\t-C\t" .. root .. "\tls-files\t--others\t--exclude-standard" then return {}, 0 end
   if key == "git\t-C\t" .. root .. "\tdiff\t--cached\t--name-status" then return {}, 0 end
-  if key == "git\t-C\t" .. root .. "\tdiff\t--name-status" then return { "M\tsrc/engine.rs", "M\tsrc/tangent.rs", "M\tsrc/material.rs", "M\tsrc/model_store.rs", "M\tsrc/render_system.rs", "M\tsrc/struct_gap.rs", "M\tsrc/render_barrier.rs", "M\tsrc/notes.txt" }, 0 end
+  if key == "git\t-C\t" .. root .. "\tdiff\t--name-status" then
+    local line_list = {}
+    for _, relpath in ipairs(modified_path_list) do line_list[#line_list + 1] = "M\t" .. relpath end
+    return line_list, 0
+  end
   if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0" then
     return vim.split(diff_text, "\n", { plain = true }), 0
   end
@@ -145,6 +206,28 @@ end
 
 function backend.system(command, input)
   calls[#calls + 1] = { kind = "system", key = command_key(command), input = input }
+  local key = command_key(command)
+  local status_key = "git\t--no-optional-locks\t-C\t" .. root .. "\tstatus\t--porcelain=v2\t-z\t--untracked-files=all"
+  local unstaged_key = "git\t--no-optional-locks\t-C\t" .. root
+    .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0"
+  local staged_key = unstaged_key .. "\t--cached"
+  local path_set = requested_path_set(command)
+  if key == status_key or key:find(status_key .. "\t--\t", 1, true) == 1 then
+    return status_snapshot_text(path_set), 0
+  end
+  if key == unstaged_key or key:find(unstaged_key .. "\t--\t", 1, true) == 1 then
+    return snapshot_diff_text(false, path_set), 0
+  end
+  if key == staged_key or key:find(staged_key .. "\t--\t", 1, true) == 1 then
+    return snapshot_diff_text(true, path_set), 0
+  end
+  if key:find("git\t-C\t" .. root .. "\tapply\t--cached", 1, true) == 1 then
+    local target_staged = key:find("\t--reverse\t", 1, true) == nil
+    for _, hunk in ipairs(git_data._parse_diff(input or "", target_staged)) do
+      staged_hunk_by_diff[hunk.diff] = target_staged
+    end
+    return "", 0
+  end
   return "", 0
 end
 

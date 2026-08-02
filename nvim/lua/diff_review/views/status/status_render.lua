@@ -84,24 +84,35 @@ local function status_request_current_model_render(opts)
     return
   end
   if status.current_model_render_pending then return end
+  status.current_model_render_generation = (status.current_model_render_generation or 0) + 1
+  local generation = status.current_model_render_generation
   status.current_model_render_pending = true
   local buf = status.buf
   vim.defer_fn(function()
     local latest_status = session.states and session.states[buf] or session.status
-    if latest_status then latest_status.current_model_render_pending = false end
     if not (
       latest_status
       and latest_status.buf == buf
+      and latest_status.current_model_render_generation == generation
       and vim.api.nvim_buf_is_valid(buf)
       and latest_status.head_lines
       and latest_status.sections
     ) then
       return
     end
+    latest_status.current_model_render_pending = false
     session.status = latest_status
     if opts.skip_operations and status_operations_pending() then return end
     status_render_current_model(nil, { clear_fancy_rows = opts.clear_fancy_rows })
   end, status_current_model_render_delay_ms)
+end
+
+--- Cancel pending context-driven renders before the status model changes.
+---@param status table
+local function status_cancel_pending_enrichment(status)
+  status.current_model_render_generation = (status.current_model_render_generation or 0) + 1
+  status.current_model_render_pending = false
+  status.file_expansion_context_generations = {}
 end
 
 local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_kind, hunk_key_override)
@@ -344,7 +355,7 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_ki
       end_text = ts_context.end_text or ""
     end
     local start_line = status_add_line(header, entry, hunk_folded and "DiffReviewActiveHunkHeader" or "DiffReviewHunkHeader")
-    if visible_hunk_lines and node_start and node_end and end_text then
+    if ts_context and visible_hunk_lines and node_start and node_end and end_text then
       if not suppress_start_boundary and not visible_hunk_lines[start_text] then
         status_add_fancy_row(diff_render.hunk_boundary_row(start_text, ts_context.start_segments, node_start), nil, status_hunk_indent)
         if node_start ~= node_end then
@@ -868,10 +879,39 @@ local function status_register_decoration_provider()
   })
 end
 
---- Write only the changed line span so unchanged rows keep their extmarks, because a full
---- nvim_buf_set_lines(0, -1) relocates and collapses every overlapping mark -- reverting
---- concealed description/comment markdown to raw text until the async repaint, the fold flicker.
---- Preserve every mark outside the diffed head/tail span.
+---@alias DiffReviewLineDiffHunk [integer, integer, integer, integer]
+
+--- Preserve unchanged head and tail rows when native line diffing fails, replacing the
+--- conservative middle span.
+---@param buf integer
+---@param old_lines string[]
+---@param new_lines string[]
+local function status_reconcile_buffer_lines_fallback(buf, old_lines, new_lines)
+  local old_count = #old_lines
+  local new_count = #new_lines
+  local shared = math.min(old_count, new_count)
+  local prefix = 0
+  while prefix < shared and old_lines[prefix + 1] == new_lines[prefix + 1] do
+    prefix = prefix + 1
+  end
+
+  local suffix = 0
+  local tail_limit = shared - prefix
+  while suffix < tail_limit and old_lines[old_count - suffix] == new_lines[new_count - suffix] do
+    suffix = suffix + 1
+  end
+
+  if old_count == new_count and prefix + suffix == old_count then return end
+
+  local replacement = {}
+  for index = prefix + 1, new_count - suffix do
+    replacement[#replacement + 1] = new_lines[index]
+  end
+  vim.api.nvim_buf_set_lines(buf, prefix, old_count - suffix, false, replacement)
+end
+
+--- Apply native line-diff hunks from bottom to top so disjoint edits preserve unchanged
+--- rows and their extmarks without translating later hunk coordinates.
 ---
 --- This edits the buffer in place, so a treesitter parser kept on it across renders holds
 --- stale trees afterward. pr_edit.apply_markdown_parser_regions invalidates the markdown
@@ -880,31 +920,36 @@ end
 ---@param new_lines string[]
 local function status_reconcile_buffer_lines(buf, new_lines)
   local old_lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-  local old_count = #old_lines
-  local new_count = #new_lines
-
-  -- Keep the matching head, leaving those rows and every mark anchored to them untouched.
-  local shared = math.min(old_count, new_count)
-  local prefix = 0
-  while prefix < shared and old_lines[prefix + 1] == new_lines[prefix + 1] do
-    prefix = prefix + 1
+  local old_text = table.concat(old_lines, "\n") .. "\n"
+  local new_text = table.concat(new_lines, "\n") .. "\n"
+  local diff_ok, diff_result = pcall(vim.diff, old_text, new_text, {
+    result_type = "indices",
+    algorithm = "histogram",
+  })
+  if not diff_ok or type(diff_result) ~= "table" then
+    local reason = diff_ok and "vim.diff returned invalid indices" or tostring(diff_result)
+    status_reconcile_buffer_lines_fallback(buf, old_lines, new_lines)
+    vim.notify(("DiffReview line diff failed, using single-span fallback: %s"):format(reason), vim.log.levels.WARN)
+    return
   end
 
-  -- Keep the matching tail without reclaiming rows the head already matched.
-  local suffix = 0
-  local tail_limit = shared - prefix
-  while suffix < tail_limit and old_lines[old_count - suffix] == new_lines[new_count - suffix] do
-    suffix = suffix + 1
-  end
+  ---@type DiffReviewLineDiffHunk[]
+  local diff_hunks = diff_result
+  for hunk_index = #diff_hunks, 1, -1 do
+    local hunk = diff_hunks[hunk_index]
+    local old_start = hunk[1]
+    local old_count = hunk[2]
+    local new_start = hunk[3]
+    local new_count = hunk[4]
+    local start_row = old_start
+    if old_count > 0 then start_row = start_row - 1 end
 
-  -- Skip the write when nothing moved so no row, and no mark, is disturbed.
-  if old_count == new_count and prefix + suffix == old_count then return end
-
-  local replacement = {}
-  for index = prefix + 1, new_count - suffix do
-    replacement[#replacement + 1] = new_lines[index]
+    local replacement = {}
+    for line_index = new_start, new_start + new_count - 1 do
+      replacement[#replacement + 1] = new_lines[line_index]
+    end
+    vim.api.nvim_buf_set_lines(buf, start_row, start_row + old_count, false, replacement)
   end
-  vim.api.nvim_buf_set_lines(buf, prefix, old_count - suffix, false, replacement)
 end
 
 local function status_write_rendered_buffer(buf)
@@ -1082,12 +1127,14 @@ local function status_render_loaded(buf, target_id, fallback_line, opts, head_li
   }, function()
     status_apply_rendered_extmarks(buf)
   end)
-  trace.span("status_render.render_loaded.restore_cursor", buf, {
-    target_id = target_id,
-    fallback_line = fallback_line,
-  }, function()
-    status_restore_cursor(buf, target_id, fallback_line)
-  end)
+  if opts.restore_cursor ~= false then
+    trace.span("status_render.render_loaded.restore_cursor", buf, {
+      target_id = target_id,
+      fallback_line = fallback_line,
+    }, function()
+      status_restore_cursor(buf, target_id, fallback_line)
+    end)
+  end
 
   trace.span("status_render.render_loaded.after_render", buf, nil, function()
     status_after_buffer_render(buf, walkthrough)
@@ -1096,17 +1143,26 @@ local function status_render_loaded(buf, target_id, fallback_line, opts, head_li
 end
 
 ---@param target_id? string
----@param opts? { clear_fancy_rows?: boolean }
+---@param opts? { clear_fancy_rows?: boolean, restore_cursor?: boolean }
 status_render_current_model = function(target_id, opts)
   local status = session.status
   if not (status and status.buf and vim.api.nvim_buf_is_valid(status.buf) and status.head_lines and status.sections) then
     return
   end
   opts = opts or {}
+  if opts.restore_cursor == false then target_id = nil end
   if opts.clear_fancy_rows ~= false then
     status.fancy_rows = {}
   end
-  status_render_loaded(status.buf, target_id, vim.api.nvim_win_get_cursor(0)[1], { reuse_sections = true }, status.head_lines, status.sections)
+  local fallback_line = opts.restore_cursor == false and nil or vim.api.nvim_win_get_cursor(0)[1]
+  status_render_loaded(
+    status.buf,
+    target_id,
+    fallback_line,
+    { reuse_sections = true, restore_cursor = opts.restore_cursor },
+    status.head_lines,
+    status.sections
+  )
 end
 
 -- Public surface (init reaches these via seams).
@@ -1125,5 +1181,6 @@ M.status_render_loaded = status_render_loaded
 M.status_prepare_file_expansion_context = status_prepare_file_expansion_context
 M.status_render_current_model = status_render_current_model
 M.status_request_current_model_render = status_request_current_model_render
+M.status_cancel_pending_enrichment = status_cancel_pending_enrichment
 
 return M

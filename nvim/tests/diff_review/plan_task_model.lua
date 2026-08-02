@@ -69,9 +69,10 @@ local ok, failure = pcall(function()
   }
   vim.fn.writefile(source_lines, working_path)
   write_json(vim.fs.joinpath(fixture_dir, "working.json"), {
+    plan_id = "plan",
+    version = 1,
     entity_changes = {
       {
-        entity_id = "first_owner",
         action = "add",
         kind = "resource",
         name = "FirstOwner",
@@ -79,7 +80,6 @@ local ok, failure = pcall(function()
         path = "src/plan.rs",
       },
       {
-        entity_id = "final_owner",
         action = "add",
         kind = "resource",
         name = "FinalOwner",
@@ -89,7 +89,6 @@ local ok, failure = pcall(function()
     },
     tasks = {
       {
-        task_id = "task",
         title = "Own task rendering.",
         description = "Keep FirstOwner references semantic.",
         files = {
@@ -98,10 +97,9 @@ local ok, failure = pcall(function()
             path = "src/plan.rs",
             subtasks = {
               {
-                subtask_id = "renderer",
                 operation = "create",
                 description = "the shared renderer.",
-                entities = { "first_owner", "final_owner" },
+                entities = { "FirstOwner", "FinalOwner" },
               },
             },
           },
@@ -111,7 +109,6 @@ local ok, failure = pcall(function()
             to = "tests/plan_review.rs",
             subtasks = {
               {
-                subtask_id = "file_groups",
                 operation = "test",
                 action = "add",
                 category = "integration",
@@ -125,37 +122,43 @@ local ok, failure = pcall(function()
     },
   })
   write_json(vim.fs.joinpath(fixture_dir, "working.index.json"), {
+    plan_id = "plan",
+    plan_version = 1,
     anchor = {
-      { line = 5, json_path = "/tasks/0", target = { target_type = "task", task_id = "task" } },
+      {
+        line = 5,
+        json_path = "/tasks/0",
+        target = { target_type = "task", title = "Own task rendering." },
+      },
       {
         line = 7,
         json_path = "/tasks/0/files/0",
         path = "src/plan.rs",
-        target = { target_type = "file", task_id = "task", path = "src/plan.rs" },
+        target = { target_type = "file", path = "src/plan.rs" },
       },
       {
         line = 8,
         json_path = "/tasks/0/files/0/subtasks/0",
         path = "src/plan.rs",
-        target = { target_type = "subtask", task_id = "task", path = "src/plan.rs", subtask_id = "renderer" },
+        target = { target_type = "subtask", path = "src/plan.rs" },
       },
       {
         line = 9,
         json_path = "/entity_changes/0",
         path = "src/plan.rs",
-        target = { target_type = "entity", entity_id = "first_owner" },
+        target = { target_type = "entity", name = "FirstOwner" },
       },
       {
         line = 10,
         json_path = "/entity_changes/1",
         path = "src/plan.rs",
-        target = { target_type = "entity", entity_id = "final_owner" },
+        target = { target_type = "entity", name = "FinalOwner" },
       },
       {
         line = 12,
         json_path = "/tasks/0/files/1",
         path = "tests/plan_review.rs",
-        target = { target_type = "file", task_id = "task", path = "tests/plan_review.rs" },
+        target = { target_type = "file", path = "tests/plan_review.rs" },
       },
       {
         line = 13,
@@ -163,9 +166,7 @@ local ok, failure = pcall(function()
         path = "tests/plan_review.rs",
         target = {
           target_type = "subtask",
-          task_id = "task",
           path = "tests/plan_review.rs",
-          subtask_id = "file_groups",
         },
       },
     },
@@ -271,6 +272,18 @@ local ok, failure = pcall(function()
 
   comment_view.detach(buf)
   vim.api.nvim_buf_delete(buf, { force = true })
+
+  local navigation_path = vim.fs.joinpath(fixture_dir, "working.index.json")
+  local stale_navigation = vim.json.decode(table.concat(vim.fn.readfile(navigation_path), "\n"))
+  stale_navigation.plan_version = 2
+  write_json(navigation_path, stale_navigation)
+  local stale_model, stale_error = task_model.load(working_path)
+  assert_equals(stale_model, nil, "a stale navigation index must not produce a task model")
+  assert_equals(
+    stale_error,
+    "Plan navigation index does not target the canonical plan version",
+    "task models should reject navigation paths from another plan revision"
+  )
 end)
 
 vim.fn.delete(fixture_dir, "rf")

@@ -30,9 +30,7 @@ local model = {
   rustdoc_target_at_position = function(_, source_line, _, _)
     assert_equals(source_line, 22, "Rustdoc hover should preserve the canonical source line")
     return {
-      flow_id = "metadata",
-      step_id = "read",
-      edge_id = "geoparquet_metadata",
+      json_path = "/flows/0/steps/0/edges/0",
       selection = "callable",
     }
   end,

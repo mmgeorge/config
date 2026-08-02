@@ -236,7 +236,7 @@ assert_equals(
 
 local dependency = uml_style.segments(
   "└─ Add datafusion (54.0, Apache-2.0) - Register the local Parquet file.",
-  { target_type = "dependency", dependency_id = "datafusion" }
+  { target_type = "dependency", name = "datafusion" }
 )
 assert_equals(
   highlight_for(dependency, "Add"),
@@ -255,7 +255,7 @@ assert_equals(
 )
 local dependency_continuation = uml_style.segments(
   "│  schema access, and aggregate row-count query.",
-  { target_type = "dependency", dependency_id = "datafusion" }
+  { target_type = "dependency", name = "datafusion" }
 )
 assert_equals(
   highlight_for(dependency_continuation, "│  schema access, and aggregate row-count query."),
@@ -269,7 +269,7 @@ assert_equals(
 )
 local action_word_continuation = uml_style.segments(
   "│  Add support without starting another dependency.",
-  { target_type = "dependency", dependency_id = "datafusion" }
+  { target_type = "dependency", name = "datafusion" }
 )
 assert_equals(
   highlight_for(action_word_continuation, "│  Add support without starting another dependency."),
@@ -299,10 +299,11 @@ vim.fn.writefile({
 vim.fn.writefile(
   {
     vim.json.encode({
+      plan_id = "plan",
+      version = 1,
       entity_changes = {},
       dependencies = {
         {
-          dependency_id = "datafusion",
           action = "add",
           name = "datafusion",
           version = "54.0",
@@ -337,10 +338,12 @@ vim.fn.writefile(
 )
 vim.fn.writefile({
   vim.json.encode({
+    plan_id = "plan",
+    plan_version = 1,
     anchor = {
       {
         line = 5,
-        target = { target_type = "entity", entity_id = "inspection_summary" },
+        target = { target_type = "entity", name = "InspectionSummary" },
       },
       {
         line = 9,
@@ -348,7 +351,7 @@ vim.fn.writefile({
       },
       {
         line = 10,
-        target = { target_type = "dependency", dependency_id = "datafusion" },
+        target = { target_type = "dependency", name = "datafusion" },
       },
     },
   }),

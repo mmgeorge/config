@@ -1,6 +1,6 @@
---- Owns the git/diff data layer for the status views: the async stage/unstage execution wrappers,
---- unified-diff parsing, hunk extraction/ordering, untracked-diff synthesis, the git-status item
---- collector, and the async tree-sitter syntax computation entry points.
+--- Owns the git/diff data layer for the status views: unified-diff parsing, hunk
+--- extraction/ordering, the git-status item collector, and the
+--- async tree-sitter syntax computation entry points.
 ---
 --- Reads the notify/filetype/nul helpers and live status state from session.lua and sibling modules,
 --- and the git backend, syntax engine, and path helpers as direct requires.
@@ -20,226 +20,10 @@ local session = require("diff_review.session")
 local M = {}
 require("diff_review.query_runtime")
 
-local function run_file_batch_async(files, args_for_file, title, cb)
-  git_backend.git_root_async(function(root, root_err)
-  if not root then
-    local failures = { { message = root_err or "Unable to find git root" } }
-    notifications.git_failures(title, failures)
-    cb({ ok = false, successes = {}, failures = failures })
-    return
-  end
-
-  local successes = {}
-  local failures = {}
-  local seen = {}
-  local tasks = {}
-
-  local function finish_all()
-    if #failures > 0 then
-      notifications.git_failures(title, failures)
-    end
-    cb({ ok = #failures == 0, successes = successes, failures = failures })
-  end
-
-  local function run_next(index)
-    local task = tasks[index]
-    if not task then
-      finish_all()
-      return
-    end
-    git_backend.run_git_at_root_async(root, task.args, nil, function(result)
-      if result.ok then
-        successes[#successes + 1] = task.filename
-      else
-        result.file = task.filename
-        failures[#failures + 1] = result
-      end
-      run_next(index + 1)
-    end)
-  end
-
-  for _, filename in ipairs(files) do
-    if filename and filename ~= "" and not seen[filename] then
-      seen[filename] = true
-      local relpath, rel_err = paths.repo_relative(filename, root)
-      if not relpath then
-        failures[#failures + 1] = { file = filename, message = rel_err }
-      else
-        tasks[#tasks + 1] = { filename = filename, args = args_for_file(relpath) }
-      end
-    end
-  end
-
-  run_next(1)
-  end)
-end
-
----@param files string[]
----@param args_for_file fun(relpath: string): string[]
----@param title string
----@return { ok: boolean, successes: string[], failures: DiffReviewGitFailure[] }
-local function run_file_batch_sync_for_test_backend(files, args_for_file, title)
-  local root, root_err = git_backend.git_root_sync_for_test_backend()
-  if not root then
-    local failures = { { message = root_err or "Unable to find git root" } }
-    notifications.git_failures(title, failures)
-    return { ok = false, successes = {}, failures = failures }
-  end
-
-  local successes = {}
-  local failures = {}
-  local seen = {}
-  for _, filename in ipairs(files) do
-    if filename and filename ~= "" and not seen[filename] then
-      seen[filename] = true
-      local relpath, rel_err = paths.repo_relative(filename, root)
-      if not relpath then
-        failures[#failures + 1] = { file = filename, message = rel_err }
-      else
-        local result = git_backend.run_git_sync_for_test_backend(args_for_file(relpath))
-        if result.ok then
-          successes[#successes + 1] = filename
-        else
-          result.file = filename
-          failures[#failures + 1] = result
-        end
-      end
-    end
-  end
-  if #failures > 0 then
-    notifications.git_failures(title, failures)
-  end
-  return { ok = #failures == 0, successes = successes, failures = failures }
-end
-
----@param diff string?
----@param cb fun(ok: boolean)
-function M.stage_patch_async(diff, cb)
-  if not diff or diff == "" then
-    notifications.error("No patch to stage")
-    cb(false)
-    return
-  end
-  git_backend.run_git_async({ "apply", "--cached", "--whitespace=nowarn", "--unidiff-zero", "-" }, diff .. "\n", function(result)
-    if not result.ok then
-      notifications.error("Stage failed: " .. (result.output ~= "" and result.output or ("git exited " .. result.code)))
-      cb(false)
-      return
-    end
-    cb(true)
-  end)
-end
-
----@param diff string?
----@param cb fun(ok: boolean)
-function M.unstage_patch_async(diff, cb)
-  if not diff or diff == "" then
-    notifications.error("No patch to unstage")
-    cb(false)
-    return
-  end
-  git_backend.run_git_async({ "apply", "--cached", "--reverse", "--whitespace=nowarn", "--unidiff-zero", "-" }, diff .. "\n", function(result)
-    if not result.ok then
-      notifications.error("Unstage failed: " .. (result.output ~= "" and result.output or ("git exited " .. result.code)))
-      cb(false)
-      return
-    end
-    cb(true)
-  end)
-end
-
----@param diff string?
----@return boolean
-function M.stage_patch(diff)
-  if not diff or diff == "" then
-    notifications.error("No patch to stage")
-    return false
-  end
-  local result = git_backend.run_git_sync_for_test_backend({ "apply", "--cached", "--whitespace=nowarn", "--unidiff-zero", "-" }, diff .. "\n")
-  if not result.ok then
-    notifications.error("Stage failed: " .. (result.output ~= "" and result.output or ("git exited " .. result.code)))
-    return false
-  end
-  return true
-end
-
----@param diff string?
----@return boolean
-function M.unstage_patch(diff)
-  if not diff or diff == "" then
-    notifications.error("No patch to unstage")
-    return false
-  end
-  local result = git_backend.run_git_sync_for_test_backend({ "apply", "--cached", "--reverse", "--whitespace=nowarn", "--unidiff-zero", "-" }, diff .. "\n")
-  if not result.ok then
-    notifications.error("Unstage failed: " .. (result.output ~= "" and result.output or ("git exited " .. result.code)))
-    return false
-  end
-  return true
-end
-
----@param files string[]
----@param cb fun(result: { ok: boolean, successes: string[], failures: DiffReviewGitFailure[] })
-function M.stage_files_async(files, cb)
-  run_file_batch_async(files, function(relpath)
-    return { "add", "--", relpath }
-  end, "Stage failed", cb)
-end
-
----@param files string[]
----@param cb fun(result: { ok: boolean, successes: string[], failures: DiffReviewGitFailure[] })
-function M.stage_tracked_files_async(files, cb)
-  run_file_batch_async(files, function(relpath)
-    return { "add", "-u", "--", relpath }
-  end, "Stage failed", cb)
-end
-
----@param files string[]
----@param cb fun(result: { ok: boolean, successes: string[], failures: DiffReviewGitFailure[] })
-function M.unstage_files_async(files, cb)
-  run_file_batch_async(files, function(relpath)
-    return { "restore", "--staged", "--", relpath }
-  end, "Unstage failed", cb)
-end
-
----@param files string[]
----@param cb fun(result: { ok: boolean, successes: string[], failures: DiffReviewGitFailure[] })
-function M.unstage_added_files_async(files, cb)
-  run_file_batch_async(files, function(relpath)
-    return { "rm", "--cached", "--ignore-unmatch", "--", relpath }
-  end, "Unstage failed", cb)
-end
-
----@param files string[]
----@return { ok: boolean, successes: string[], failures: DiffReviewGitFailure[] }
-function M.stage_files(files)
-  return run_file_batch_sync_for_test_backend(files, function(relpath)
-    return { "add", "--", relpath }
-  end, "Stage failed")
-end
-
----@param files string[]
----@return { ok: boolean, successes: string[], failures: DiffReviewGitFailure[] }
-function M.stage_tracked_files(files)
-  return run_file_batch_sync_for_test_backend(files, function(relpath)
-    return { "add", "-u", "--", relpath }
-  end, "Stage failed")
-end
-
----@param files string[]
----@return { ok: boolean, successes: string[], failures: DiffReviewGitFailure[] }
-function M.unstage_files(files)
-  return run_file_batch_sync_for_test_backend(files, function(relpath)
-    return { "restore", "--staged", "--", relpath }
-  end, "Unstage failed")
-end
-
----@param files string[]
----@return { ok: boolean, successes: string[], failures: DiffReviewGitFailure[] }
-function M.unstage_added_files(files)
-  return run_file_batch_sync_for_test_backend(files, function(relpath)
-    return { "rm", "--cached", "--ignore-unmatch", "--", relpath }
-  end, "Unstage failed")
+--- Resolve the path snapshot seam lazily to avoid its parser dependency closing a load-time cycle.
+---@return DiffReviewPathStatusSnapshotModule
+local function status_snapshot()
+  return (require("diff_review.git.status_snapshot"))
 end
 
 ---@param line string
@@ -265,7 +49,9 @@ end
 ---@param status string?
 ---@return boolean
 local function git_status_is_added(status)
-  return type(status) == "string" and status:sub(1, 1) == "A"
+  if type(status) ~= "string" then return false end
+  local status_kind = status:sub(1, 1)
+  return status_kind == "A" or status_kind == "C"
 end
 
 ---@param status string?
@@ -514,34 +300,6 @@ local function file_diff_and_flags_async(cwd, filename, cb)
   end
 end
 
---- Build a synthetic "new file" diff (every line an addition) for an untracked
---- file, so it previews as a single hunk straight from disk — no git, which is
---- both faster and the only way to show content git doesn't track yet.
----@param filename string absolute path
----@param relpath string path relative to the git root (forward slashes)
----@return string? diff_text
-local function build_untracked_diff(filename, relpath)
-  if util.file_contains_nul(filename) then return nil end
-
-  local ok, lines = pcall(vim.fn.readfile, filename)
-  if not ok or type(lines) ~= "table" or #lines == 0 then
-    return nil
-  end
-  -- Skip binary files (a NUL byte in any line).
-  if util.lines_contain_nul(lines) then return nil end
-  local out = {
-    "diff --git a/" .. relpath .. " b/" .. relpath,
-    "new file mode 100644",
-    "--- /dev/null",
-    "+++ b/" .. relpath,
-    "@@ -0,0 +1," .. #lines .. " @@",
-  }
-  for _, line in ipairs(lines) do
-    out[#out + 1] = "+" .. line
-  end
-  return table.concat(out, "\n")
-end
-
 --- Compute Tree-sitter scope context for a hunk without blocking UI render.
 ---@param filename string absolute path
 ---@param line number 1-based line number
@@ -764,166 +522,111 @@ function M.compute_diff_syntax_async(filename, lines, cb)
     end
   end)
 end
-local function collect_items_from_git(cwd, cb, _ctx)
-  syntax_engine.clear_context_cache() -- clear treesitter context cache on refresh
-  syntax_engine.clear_treesitter_source_buffers()
-  session.untracked = {} -- map of absolute path -> repo-relative path for untracked files
-  local results = {
-    unstaged = {},
-    staged = {},
-    untracked_output = {},
-    staged_name_status = {},
-    unstaged_name_status = {},
-    untracked_code = 1,
-    staged_name_status_code = 1,
-    unstaged_name_status_code = 1,
+
+---@param file_snapshot DiffReviewPathStatusFileSnapshot
+---@param staged boolean
+---@return DiffReviewHunk
+local function status_placeholder_hunk(file_snapshot, staged)
+  local record = file_snapshot.status_record
+  local git_status = staged and record.index_status or record.worktree_status
+  return {
+    file = file_snapshot.path,
+    filename = file_snapshot.abs_file,
+    pos = 1,
+    context = nil,
+    diff = nil,
+    staged = staged,
+    added = 0,
+    removed = 0,
+    status = git_status,
+    git_status = git_status,
+    git_original_file = record.original_path,
+    git_path_change_kind = (record.kind == "renamed" or record.kind == "copied") and record.kind or nil,
   }
-  local pending = 5
+end
 
-  local function finish_one()
-    pending = pending - 1
-    if pending > 0 then return end
-
-    local all_hunks = {}
-    vim.list_extend(all_hunks, results.unstaged)
-    vim.list_extend(all_hunks, results.staged)
-
-    local untracked_files = {}
-    if results.untracked_code == 0 then
-      for _, filename in ipairs(results.untracked_output) do
-        if filename ~= "" then
-          untracked_files[#untracked_files + 1] = filename
-        end
+---@param snapshot DiffReviewPathStatusSnapshot
+---@return DiffReviewHunk[] all_hunk_list
+---@return DiffReviewPathStatusFileSnapshot[] untracked_file_list
+local function snapshot_status_hunk_list(snapshot)
+  local all_hunk_list = {}
+  local untracked_file_list = {}
+  for _, file_snapshot in ipairs(snapshot.file_list) do
+    local record = file_snapshot.status_record
+    if record.untracked then
+      untracked_file_list[#untracked_file_list + 1] = file_snapshot
+    else
+      local has_hunk = #file_snapshot.unstaged_hunk_list > 0 or #file_snapshot.staged_hunk_list > 0
+      vim.list_extend(all_hunk_list, file_snapshot.unstaged_hunk_list)
+      vim.list_extend(all_hunk_list, file_snapshot.staged_hunk_list)
+      if not has_hunk and record.staged then
+        all_hunk_list[#all_hunk_list + 1] = status_placeholder_hunk(file_snapshot, true)
       end
-    end
-
-  -- Get all changed files (staged + unstaged) to catch files with no hunks
-  -- (e.g., empty new files, binary files), and to preserve Git status for
-  -- textual hunks so action routing can distinguish added files from modified
-  -- tracked files.
-  local staged_status_by_file = {}
-  local staged_original_by_file = {}
-  if results.staged_name_status_code == 0 then
-    for _, line in ipairs(results.staged_name_status) do
-      local status, file, original_file = parse_name_status_line(line)
-      if status and file then
-        staged_status_by_file[file] = status
-        staged_original_by_file[file] = original_file
+      if not has_hunk and record.unstaged then
+        all_hunk_list[#all_hunk_list + 1] = status_placeholder_hunk(file_snapshot, false)
       end
     end
   end
+  return all_hunk_list, untracked_file_list
+end
 
-  local unstaged_status_by_file = {}
-  local unstaged_original_by_file = {}
-  if results.unstaged_name_status_code == 0 then
-    for _, line in ipairs(results.unstaged_name_status) do
-      local status, file, original_file = parse_name_status_line(line)
-      if status and file then
-        unstaged_status_by_file[file] = status
-        unstaged_original_by_file[file] = original_file
-      end
+---@param all_hunk_list DiffReviewHunk[]
+---@return table<string, { added: number, removed: number, total: number, staged: number }>
+local function snapshot_file_stat_by_path(all_hunk_list)
+  local file_stat_by_path = {}
+  for _, hunk in ipairs(all_hunk_list) do
+    local path = hunk.file
+    if not file_stat_by_path[path] then
+      file_stat_by_path[path] = { added = 0, removed = 0, total = 0, staged = 0 }
     end
+    local file_stat = file_stat_by_path[path]
+    file_stat.added = file_stat.added + hunk.added
+    file_stat.removed = file_stat.removed + hunk.removed
+    file_stat.total = file_stat.total + 1
+    if hunk.staged then file_stat.staged = file_stat.staged + 1 end
   end
+  return file_stat_by_path
+end
 
-  local tracked_files_with_hunks = {}
-  for _, h in ipairs(all_hunks) do
-    tracked_files_with_hunks[h.file] = true
-    h.git_status = h.staged and staged_status_by_file[h.file] or unstaged_status_by_file[h.file]
-    h.git_original_file = h.staged and staged_original_by_file[h.file] or unstaged_original_by_file[h.file]
-  end
-  if results.staged_name_status_code == 0 then
-    for file, status in pairs(staged_status_by_file) do
-      if file and not tracked_files_with_hunks[file] then
-        -- File has staged changes but no hunks (empty new file, binary, etc.)
-        all_hunks[#all_hunks + 1] = {
-          file = file,
-          pos = 1,
-          context = nil,
-          diff = nil,
-          staged = true,
-          added = 0,
-          removed = 0,
-          status = status,
-          git_status = status,
-          git_original_file = staged_original_by_file[file],
-        }
-      end
-    end
-  end
-  if results.unstaged_name_status_code == 0 then
-    for file, status in pairs(unstaged_status_by_file) do
-      if file and not tracked_files_with_hunks[file] then
-        all_hunks[#all_hunks + 1] = {
-          file = file,
-          pos = 1,
-          context = nil,
-          diff = nil,
-          staged = false,
-          added = 0,
-          removed = 0,
-          status = status,
-          git_status = status,
-          git_original_file = unstaged_original_by_file[file],
-        }
-      end
-    end
-  end
-
-  -- Compute per-file aggregate stats and staging state
-  local file_stats = {} ---@type table<string, { added: number, removed: number, total: number, staged: number }>
-  for _, hunk in ipairs(all_hunks) do
-    local f = hunk.file
-    if not file_stats[f] then
-      file_stats[f] = { added = 0, removed = 0, total = 0, staged = 0 }
-    end
-    local fs = file_stats[f]
-    fs.added = fs.added + hunk.added
-    fs.removed = fs.removed + hunk.removed
-    fs.total = fs.total + 1
-    if hunk.staged then
-      fs.staged = fs.staged + 1
-    end
-  end
-
-  local items = {}
-  for _, hunk in ipairs(all_hunks) do
-    local filename = paths.repo_file_path(cwd, hunk.file)
-    -- Use treesitter scope context if available, fall back to git's @@ context
+---@param cwd string
+---@param all_hunk_list DiffReviewHunk[]
+---@param file_stat_by_path table<string, { added: number, removed: number, total: number, staged: number }>
+---@param context? { skip_ts_context?: boolean }
+---@return table[]
+local function snapshot_tracked_item_list(cwd, all_hunk_list, file_stat_by_path, context)
+  local item_list = {}
+  for _, hunk in ipairs(all_hunk_list) do
+    local filename = hunk.filename or paths.repo_file_path(cwd, hunk.file)
     local context_text = hunk.context or ""
-    if hunk.diff and not (_ctx and _ctx.skip_ts_context) then
+    if hunk.diff and not (context and context.skip_ts_context) then
       local cached = syntax_engine.cached_hunk_context(filename, hunk.pos, "items:" .. filename .. ":" .. hunk.pos)
       local cached_label = syntax_engine.hunk_context_label(cached)
-      if cached_label then
-        context_text = cached_label
-      end
+      if cached_label then context_text = cached_label end
     end
-    -- Parse range numbers from @@ header
-    local full_header = hunk.status or "@@"
+
+    local full_header = rawget(hunk, "status") or "@@"
     if hunk.diff then
       full_header = hunk.diff:match("\n(@@[^@]+@@)") or hunk.diff:match("^(@@[^@]+@@)") or "@@"
     end
     local old_range = full_header:match("%-(%d+,?%d*)") or ""
     local new_range = full_header:match("%+(%d+,?%d*)") or ""
-    local range_text = "-" .. old_range .. " +" .. new_range
-
-    local fs = file_stats[hunk.file]
-    local file_check
-    if fs.staged == fs.total then
+    local file_stat = file_stat_by_path[hunk.file]
+    local file_check = "[ ]"
+    if file_stat.staged == file_stat.total then
       file_check = "[x]"
-    elseif fs.staged > 0 then
+    elseif file_stat.staged > 0 then
       file_check = "[-]"
-    else
-      file_check = "[ ]"
     end
 
-    items[#items + 1] = ({
+    item_list[#item_list + 1] = {
       filename = filename,
+      relpath = hunk.file,
       pos = { hunk.pos, 0 },
       item = {
         category = "Tracked Changes",
         check = hunk.staged and "[x]" or "[ ]",
         file_check = file_check,
-        hunk_header = range_text,
+        hunk_header = "-" .. old_range .. " +" .. new_range,
         old_range = "-" .. old_range,
         new_range = "+" .. new_range,
         context_text = context_text,
@@ -933,20 +636,24 @@ local function collect_items_from_git(cwd, cb, _ctx)
         removed = hunk.removed,
         added_pad = hunk.added,
         removed_pad = hunk.removed,
-        file_added = fs.added,
-        file_removed = fs.removed,
+        file_added = file_stat.added,
+        file_removed = file_stat.removed,
         git_status = hunk.git_status,
         git_original_file = hunk.git_original_file,
+        git_path_change_kind = hunk.git_path_change_kind,
       },
-    })
+    }
   end
+  return item_list
+end
 
-  -- Add untracked files
-  for _, f in ipairs(untracked_files) do
-    local filename = paths.repo_file_path(cwd, f)
-    session.untracked[filename] = f -- remember repo-relative path for the synthetic diff
-    items[#items + 1] = ({
-      filename = filename,
+---@param item_list table[]
+---@param untracked_file_list DiffReviewPathStatusFileSnapshot[]
+local function append_untracked_items(item_list, untracked_file_list)
+  for _, file_snapshot in ipairs(untracked_file_list) do
+    item_list[#item_list + 1] = {
+      filename = file_snapshot.abs_file,
+      relpath = file_snapshot.path,
       pos = { 1, 0 },
       item = {
         category = "Untracked Files",
@@ -961,70 +668,67 @@ local function collect_items_from_git(cwd, cb, _ctx)
         stats = "new",
         git_status = "??",
       },
-    })
+    }
   end
+end
 
-  -- Build per-file combined diffs + staged status for file-level preview.
-  -- order_file_hunks keeps hunks in line order so staging folds a hunk in
-  -- place instead of moving it to the end of the file.
-  local file_hunks = {} ---@type table<string, DiffReviewHunk[]>
-  for _, hunk in ipairs(all_hunks) do
-    local f = hunk.file
-    file_hunks[f] = file_hunks[f] or {}
-    file_hunks[f][#file_hunks[f] + 1] = hunk
+---@param snapshot_error DiffReviewPathStatusSnapshotError
+local function notify_snapshot_error(snapshot_error)
+  if snapshot_error.failure_list and #snapshot_error.failure_list > 0 then
+    local failure_list = {}
+    for _, failure in ipairs(snapshot_error.failure_list) do
+      failure_list[#failure_list + 1] = {
+        path = failure.source,
+        message = failure.message,
+        code = failure.code,
+        stdout = failure.stdout,
+        stderr = failure.stderr,
+        output = failure.output,
+      }
+    end
+    notifications.git_failures("Git status refresh failed", failure_list)
+    return
   end
-  session.file_diffs = {}
-  session.file_hunk_staged = {}
-  for f, hunks in pairs(file_hunks) do
-    local diffs, flags = order_file_hunks(hunks)
-    local filename = paths.repo_file_path(cwd, f)
-    session.file_diffs[filename] = #diffs > 0 and table.concat(diffs, "\n") or false
-    session.file_hunk_staged[filename] = #flags > 0 and flags or nil
-  end
+  notifications.error(snapshot_error.message, "Git status refresh failed")
+end
 
-  cb(items)
+---@param cwd string
+---@param callback fun(item_list?: table[], error?: DiffReviewPathStatusSnapshotError, snapshot?: DiffReviewPathStatusSnapshot)
+---@param context? { skip_pre_render?: boolean, skip_ts_context?: boolean }
+local function collect_items_from_git(cwd, callback, context)
+  syntax_engine.clear_context_cache()
+  syntax_engine.clear_treesitter_source_buffers()
+  status_snapshot().collect_async(cwd, {}, function(snapshot, snapshot_error)
+    if not snapshot then
+      local effective_error = snapshot_error or { kind = "parse", message = "Git status snapshot returned no result" }
+      notify_snapshot_error(effective_error)
+      callback(nil, effective_error)
+      return
+    end
 
-  -- Pre-render all diff buffers so file switching is instant
-  if not (_ctx and _ctx.skip_pre_render) then
-    vim.schedule(function()
-      for filename, diff_text in pairs(session.file_diffs) do
-        if diff_text and diff_text ~= "" then
-          local buf = diff_buffer.open_diff_buffer(filename)
-          diff_buffer._refresh_diff_buffer(buf, filename)
+    local all_hunk_list, untracked_file_list = snapshot_status_hunk_list(snapshot)
+    local file_stat_by_path = snapshot_file_stat_by_path(all_hunk_list)
+    local item_list = snapshot_tracked_item_list(cwd, all_hunk_list, file_stat_by_path, context)
+    append_untracked_items(item_list, untracked_file_list)
+
+    callback(item_list, nil, snapshot)
+
+    if not (context and context.skip_pre_render) then
+      vim.schedule(function()
+        for filename, diff_text in pairs(snapshot.file_diffs) do
+          if diff_text and diff_text ~= "" and not snapshot.untracked_by_file[filename] then
+            local buf = diff_buffer.open_diff_buffer(filename)
+            diff_buffer._refresh_diff_buffer(buf, filename)
+          end
         end
-      end
-    end)
-  end
-  end
-
-  get_hunks_async(cwd, false, function(hunks)
-    results.unstaged = hunks
-    finish_one()
-  end)
-  get_hunks_async(cwd, true, function(hunks)
-    results.staged = hunks
-    finish_one()
-  end)
-  git_backend.systemlist_async({ "git", "-C", cwd, "ls-files", "--others", "--exclude-standard" }, function(output, code)
-    results.untracked_output = output
-    results.untracked_code = code
-    finish_one()
-  end)
-  git_backend.systemlist_async({ "git", "-C", cwd, "diff", "--cached", "--name-status" }, function(output, code)
-    results.staged_name_status = output
-    results.staged_name_status_code = code
-    finish_one()
-  end)
-  git_backend.systemlist_async({ "git", "-C", cwd, "diff", "--name-status" }, function(output, code)
-    results.unstaged_name_status = output
-    results.unstaged_name_status_code = code
-    finish_one()
+      end)
+    end
   end)
 end
 
 -- Expose the bare-local git data builders that init and other modules call by name.
 M._parse_diff = parse_diff
-M._build_untracked_diff = build_untracked_diff
+M._order_file_hunks = order_file_hunks
 M._file_diff_and_flags_async = file_diff_and_flags_async
 M._collect_items_from_git = collect_items_from_git
 M._parse_name_status_line = parse_name_status_line

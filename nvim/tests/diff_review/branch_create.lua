@@ -64,6 +64,10 @@ end
 
 function backend.system(command)
   local key = command_key(command)
+  local status_key = "git\t--no-optional-locks\t-C\t" .. root .. "\tstatus\t--porcelain=v2\t-z\t--untracked-files=all"
+  local unstaged_key = "git\t--no-optional-locks\t-C\t" .. root
+    .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0"
+  if key == status_key or key == unstaged_key or key == unstaged_key .. "\t--cached" then return "", 0 end
   if key == "git\t-C\t" .. root .. "\tswitch\t-c\tmatt9222/feature" or key == "git\t-C\t" .. root .. "\tswitch\t-c\tteam/feature" then
     switch_calls[#switch_calls + 1] = key
     if switch_should_fail then return "fatal: branch exists", 128 end

@@ -37,6 +37,49 @@ local staged_diff = unstaged_diff
 local staged = false
 local calls = {}
 
+local function requested_path_set(command)
+  for argument_index, argument in ipairs(command) do
+    if argument == "--" then
+      local path_set = {}
+      for path_index = argument_index + 1, #command do path_set[command[path_index]] = true end
+      return path_set
+    end
+  end
+  return nil
+end
+
+local function filter_diff_text(diff_text, path_set)
+  if not path_set then return diff_text end
+  local block_list = {}
+  local current_block = nil
+  local include_block = false
+  for line in (diff_text .. "\n"):gmatch("(.-)\n") do
+    if line:sub(1, 11) == "diff --git " then
+      if current_block and include_block then block_list[#block_list + 1] = table.concat(current_block, "\n") end
+      current_block = { line }
+      local relpath = line:match(" b/(.+)$")
+      include_block = relpath ~= nil and path_set[relpath] == true
+    elseif current_block then
+      current_block[#current_block + 1] = line
+    end
+  end
+  if current_block and include_block then block_list[#block_list + 1] = table.concat(current_block, "\n") end
+  return table.concat(block_list, "\n")
+end
+
+local function status_snapshot_text(path_set)
+  local xy = staged and "M." or ".M"
+  local record_list = {}
+  for _, relpath in ipairs({ "a.txt", "b.txt" }) do
+    if not path_set or path_set[relpath] then
+      record_list[#record_list + 1] =
+        ("1 %s N... 100644 100644 100644 1111111 2222222 %s\0"):format(xy, relpath)
+    end
+  end
+  if not path_set or path_set["c.txt"] then record_list[#record_list + 1] = "? c.txt\0" end
+  return table.concat(record_list)
+end
+
 ---@class DiffReviewMockCall
 ---@field kind "systemlist"|"system"|"systemlist_async"|"system_async"
 ---@field command DiffReviewGitCommand
@@ -137,6 +180,24 @@ end
 function backend.system(command, input)
   record("system", command, input)
   local key = command_key(command)
+  local status_key = "git\t--no-optional-locks\t-C\t" .. root .. "\tstatus\t--porcelain=v2\t-z\t--untracked-files=all"
+  local unstaged_key = "git\t--no-optional-locks\t-C\t" .. root
+    .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0"
+  local staged_key = unstaged_key .. "\t--cached"
+  local path_set = requested_path_set(command)
+  if key == status_key or key:find(status_key .. "\t--\t", 1, true) == 1 then
+    return status_snapshot_text(path_set), 0
+  end
+  if key == unstaged_key or key:find(unstaged_key .. "\t--\t", 1, true) == 1 then
+    return filter_diff_text(staged and "" or unstaged_diff, path_set), 0
+  end
+  if key == staged_key or key:find(staged_key .. "\t--\t", 1, true) == 1 then
+    return filter_diff_text(staged and staged_diff or "", path_set), 0
+  end
+  if key:find("git\t-C\t" .. root .. "\tapply\t--cached", 1, true) == 1 then
+    staged = key:find("\t--reverse\t", 1, true) == nil
+    return "", 0
+  end
   if key == "git\t-C\t" .. root .. "\tadd\t-u\t--\ta.txt" then
     staged = true
     return "", 0
@@ -307,11 +368,11 @@ local function run()
   assert_true(contains_line(lines, "master"), "missing branch row")
   assert_true(contains_line(lines, "Unstaged changes (3)"), "missing merged unstaged heading")
   assert_true(not contains_line(lines, "Untracked files (1)"), "untracked files should be merged into unstaged heading")
-  assert_true(contains_line(lines, "Modified " .. root .. "/a.txt +1 -1"), "missing modified a.txt prefix")
-  assert_true(contains_line(lines, "Modified " .. root .. "/b.txt +1 -1"), "missing modified b.txt prefix")
-  assert_true(contains_line(lines, "New      " .. root .. "/c.txt new"), "missing new c.txt prefix")
+  assert_true(contains_line(lines, "Modified a.txt +1 -1"), "missing modified a.txt prefix")
+  assert_true(contains_line(lines, "Modified b.txt +1 -1"), "missing modified b.txt prefix")
+  assert_true(contains_line(lines, "New      c.txt new"), "missing new c.txt prefix")
   assert_true(git_data._status_file_change_label({ git_status = "D" }) == "Removed", "deleted file label should render as Removed")
-  local modified_a_row = find_row(lines, "Modified " .. root .. "/a.txt +1 -1")
+  local modified_a_row = find_row(lines, "Modified a.txt +1 -1")
   local add_start, add_end = row_substring_range(lines, modified_a_row, "+1")
   local delete_start, delete_end = row_substring_range(lines, modified_a_row, "-1", add_end + 1)
   assert_true(

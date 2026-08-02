@@ -53,6 +53,14 @@ local function original_lines(relpath)
   return { "alpha " .. relpath, "old " .. relpath, "omega " .. relpath }
 end
 
+local function status_snapshot_text()
+  return table.concat({
+    "1 .M N... 100644 100644 100644 1111111 2222222 a.txt\0",
+    "1 .M N... 100644 100644 100644 1111111 2222222 b.txt\0",
+    "1 M. N... 100644 100644 100644 1111111 2222222 c.txt\0",
+  })
+end
+
 ---@type DiffReviewGhBackend
 local gh_backend = {}
 
@@ -120,6 +128,13 @@ function backend.systemlist_async(command, cb)
 end
 
 function backend.system(command)
+  local key = command_key(command)
+  local status_key = "git\t--no-optional-locks\t-C\t" .. root .. "\tstatus\t--porcelain=v2\t-z\t--untracked-files=all"
+  local unstaged_key = "git\t--no-optional-locks\t-C\t" .. root
+    .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0"
+  if key == status_key then return status_snapshot_text(), 0 end
+  if key == unstaged_key then return modified_diff("a.txt") .. "\n" .. modified_diff("b.txt"), 0 end
+  if key == unstaged_key .. "\t--cached" then return modified_diff("c.txt"), 0 end
   return "unexpected command: " .. command_key(command), 1
 end
 

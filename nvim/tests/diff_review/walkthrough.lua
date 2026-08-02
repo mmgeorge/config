@@ -161,7 +161,25 @@ function backend.systemlist_async(command, cb)
 end
 
 function backend.system(command)
-  return "unexpected command: " .. command_key(command), 1
+  local key = command_key(command)
+  local status_key = "git\t--no-optional-locks\t-C\t" .. root .. "\tstatus\t--porcelain=v2\t-z\t--untracked-files=all"
+  local unstaged_key = "git\t--no-optional-locks\t-C\t" .. root
+    .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0"
+  if key == status_key then
+    local record_list = {
+      "1 .M N... 100644 100644 100644 1111111 2222222 a.txt\0",
+      "1 .M N... 100644 100644 100644 1111111 2222222 b.txt\0",
+      "1 .A N... 000000 100644 100644 0000000 2222222 new.txt\0",
+      "1 M. N... 100644 100644 100644 1111111 2222222 c.txt\0",
+    }
+    for _, relpath in ipairs(untracked_files) do record_list[#record_list + 1] = "? " .. relpath .. "\0" end
+    return table.concat(record_list), 0
+  end
+  if key == unstaged_key then
+    return long_region_diff("a.txt") .. "\n" .. modified_diff("b.txt") .. "\n" .. new_file_diff("new.txt"), 0
+  end
+  if key == unstaged_key .. "\t--cached" then return modified_diff("c.txt"), 0 end
+  return "unexpected command: " .. key, 1
 end
 
 function backend.system_async(command, input, cb)

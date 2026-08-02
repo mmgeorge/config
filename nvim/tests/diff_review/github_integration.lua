@@ -92,6 +92,28 @@ end
 function git_backend.system(command, input)
   record("system", command, input)
   local key = command_key(command)
+  local status_key = "git\t--no-optional-locks\t-C\t" .. root .. "\tstatus\t--porcelain=v2\t-z\t--untracked-files=all"
+  local unstaged_key = "git\t--no-optional-locks\t-C\t" .. root
+    .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0"
+  if key == status_key then
+    local output = ""
+    if has_changes then
+      output = "1 .M N... 100644 100644 100644 1111111 2222222 lua/diff_review/init.lua\0"
+    end
+    return output, 0
+  end
+  if key == unstaged_key then
+    if not has_changes then return "", 0 end
+    return table.concat({
+      "diff --git a/lua/diff_review/init.lua b/lua/diff_review/init.lua",
+      "--- a/lua/diff_review/init.lua",
+      "+++ b/lua/diff_review/init.lua",
+      "@@ -1 +1 @@",
+      "-old",
+      "+new",
+    }, "\n"), 0
+  end
+  if key == unstaged_key .. "\t--cached" then return "", 0 end
   if key == "git\t-C\t" .. root .. "\tpush\t--progress" then return "", 0 end
   if key == "git\t-C\t" .. root .. "\tpull\t--progress" then return "", 0 end
   return "unexpected command: " .. key, 1

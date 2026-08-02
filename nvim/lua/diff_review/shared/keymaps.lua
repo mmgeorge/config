@@ -244,7 +244,7 @@ end
 local function stage_selection(buf)
   local entries = status_entries_from_visual_selection()
   status_leave_visual_mode()
-  status_stage_entries(entries, { preserve_cursor = true })
+  status_stage_entries(entries)
 end
 
 local function unstage_under_cursor(buf)
@@ -254,7 +254,7 @@ end
 local function unstage_selection(buf)
   local entries = status_entries_from_visual_selection()
   status_leave_visual_mode()
-  status_unstage_entries(entries, { preserve_cursor = true })
+  status_unstage_entries(entries)
 end
 
 local function discard_under_cursor(buf)

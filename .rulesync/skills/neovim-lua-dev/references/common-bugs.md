@@ -181,42 +181,48 @@ refresh renders it collapsed in one pass:
 ```lua
 -- direction depends on the action: stage -> "Tracked Changes",
 -- unstage of a new file -> "Untracked Files"
-local id = node.id:gsub("#Untracked Files#", "#" .. category .. "#")
-                  :gsub("#Tracked Changes#",  "#" .. category .. "#")
-view.renderer._folded[id] = true          -- before view:refresh()
+local destination_id = node.id:gsub("#Untracked Files#", "#" .. category .. "#")
+                              :gsub("#Tracked Changes#",  "#" .. category .. "#")
+view.renderer._folded[destination_id] = true
 ```
 
 Seed only the *destination* id, never the current one — a file that stays in its
 category (unstaging a *modified*, not new, file) then keeps the fold state the
 user chose. This is also how "untracked files are never expanded" survives a
-stage→unstage round-trip.
-For the cursor, capture the *next* file **before** the action (its row moves
-once the staged file changes category), then after the single refresh find it by
-identity — scan `view.renderer._locations` for the file-level group node
-(`node.group.fields[1] == "filename"`, matching `node.item.filename`) and put
-the cursor on its row. Identity beats `cursor + 1`: when staging creates a brand
-new category header, `+1` lands on the header, not the next file.
+stage→unstage round-trip. Do not pair that fold projection with an action-owned
+cursor target. Apply the smallest buffer edit and let Neovim retain the cursor
+without a second render or explicit move.
 
 ### 11. Async Context Rerenders Steal the Cursor
 
-**Bug**: A status/list action moves the cursor correctly, then a moment later it
-jumps back to an earlier hunk or the top of the buffer.
+**Bug**: A stage or unstage appears immediately, then a later callback jumps the
+cursor to an earlier hunk or the top of the buffer.
 
 **Cause**: A delayed enrichment callback, such as Tree-sitter context or syntax
-highlighting, rerenders the list and passes the callback's item id as the
-cursor target. If that callback belongs to a different hunk than the one the
-user is now on, the late render steals the cursor. Renders with no explicit
-target are also dangerous if the generic fallback is line 1.
+highlighting, rerenders the list and passes a stale item id as the cursor target.
+The same jump occurs when stage or unstage routes its later authoritative sync
+through generic cursor restoration. A full-buffer rewrite compounds the visible
+movement even when only a few rows changed.
 
-**Fix**: Treat cursor restore as two different flows:
+**Fix**: Give each render source an explicit cursor policy:
 
 - **Passive async rerender:** no explicit target means "preserve wherever the
   user is now." Capture the stable item id plus raw cursor line immediately
   before mutating buffer lines. Do not capture when the async request starts;
   the user may move while Git, Tree-sitter, or syntax work is in flight.
-- **Action rerender:** pass an explicit semantic target chosen by the action,
-  such as the next hunk after stage/unstage/discard or the destination
-  section/file header after a section-level action.
+- **Stage/unstage render:** never restore or explicitly move the cursor during
+  optimistic, corrective, or failure-recovery renders. Let Neovim place it as
+  the affected lines move.
+- **Discard rerender:** pass an explicit semantic target chosen before deletion
+  because the removed entry cannot preserve its identity.
+
+Starting a stage or unstage must also invalidate any in-flight full status load
+and pending enrichment generation. Otherwise a callback launched against the
+old section model can finish after the mutation and reintroduce its stale target.
+
+When correction changes the status text, apply `vim.diff` index hunks from
+bottom to top instead of replacing the full buffer. This keeps unchanged rows
+out of the mutation surface.
 
 ```lua
 -- BAD: captures the target before async work, targets the completed item
@@ -238,16 +244,34 @@ end)
 briefly flickers through an intermediate state even though optimistic UI updates
 work.
 
-**Cause**: The first async git mutation finishes and immediately starts a full
-backend reconcile before the second keypress has been processed or queued. That
-backend snapshot is technically current for only the first mutation, so it
-repaints over the optimistic UI until the second action renders.
+**Cause**: The first async Git mutation finishes and starts a full repository
+refresh. That intermediate snapshot can describe only the completed prefix, so
+it replaces newer optimistic state and writes every status row again.
 
-**Fix**: Keep index mutations sequential, but debounce backend reconciliation
-after the queue becomes idle. Enqueuing another mutation must cancel the pending
-reconcile. While mutations are running or queued, suppress unrelated full status
-loads and async enrichment rerenders; the final debounced reconcile refreshes
-from Git once the burst has settled.
+**Fix**: Store a confirmed baseline plus ordered optimistic journal layers, and
+render each new layer immediately. Serialize index mutations through one FIFO
+per repository root. After the FIFO drains, wait for a 120 ms quiet window and
+run exactly one path-scoped snapshot for the burst's affected paths:
+
+- porcelain-v2 status with NUL records and all untracked files
+- zero-context unstaged diff
+- zero-context staged diff
+
+When the snapshot semantically matches the projection, retire the resolved
+layers without rendering the status buffer or writing an open diff buffer. On a
+real mismatch, replace only those paths and render once. Replay later optimistic
+layers over the confirmed snapshot so a sync can never erase a newer keypress.
+
+If one three-command snapshot attempt fails, retry it once after 120 ms while the
+projection stays visible. Do not notify or render between attempts. Mark
+verification stale only after the retry fails too.
+
+If one Git mutation fails, notify immediately and cancel the queued tasks from
+that burst. Preserve the Git writes that already completed, then use one path
+snapshot attempt, with the same single retry on read failure, and one forced
+recovery render to show actual truth. A batch can
+partially succeed, so pretending to roll back every completed action creates a
+second lie instead of recovery.
 
 ### 13. Windows MSYS/Cygwin Stdio Leak On Status Startup
 

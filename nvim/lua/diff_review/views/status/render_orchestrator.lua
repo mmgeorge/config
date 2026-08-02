@@ -21,6 +21,7 @@ local section_builder = require("diff_review.views.status.section_builder")
 local pr_state = require("diff_review.views.status.pr_state")
 local status_head = require("diff_review.views.status.status_head")
 local section_map = require("diff_review.views.status.section_map")
+local status_sync = require("diff_review.views.status.status_sync")
 local entry_nav = require("diff_review.views.status.entry_nav")
 local fold_state = require("diff_review.views.status.fold_state")
 local status_helpers = require("diff_review.views.status.status_helpers")
@@ -58,8 +59,7 @@ local function diff_hunks_for_file(file)
     if #file.hunks > 0 then return file.hunks end
     if not file.untracked then return {} end
 
-    local relpath = session.untracked and session.untracked[file.filename]
-    local diff_text = relpath and git_data._build_untracked_diff(file.filename, relpath) or nil
+    local diff_text = session.file_diffs and session.file_diffs[file.filename] or nil
     if not diff_text then return {} end
 
     local hunks = {}
@@ -125,6 +125,10 @@ end
 
 function M.render_status(buf, target_id, fallback_line, opts)
   opts = opts or {}
+  if opts.restore_cursor == false then
+    target_id = nil
+    fallback_line = nil
+  end
   trace.event("status.render.start", buf, {
     target_id = target_id,
     fallback_line = fallback_line,
@@ -138,7 +142,7 @@ function M.render_status(buf, target_id, fallback_line, opts)
   session.status.buf = buf
   session.status.reconcile_generation = (session.status.reconcile_generation or 0) + 1
   local render_state = session.status
-  local preserve_current_cursor = target_id == nil and fallback_line == nil
+  local preserve_current_cursor = opts.restore_cursor ~= false and target_id == nil and fallback_line == nil
 
   if opts.reuse_sections and session.status.head_lines and session.status.sections then
     if preserve_current_cursor then
@@ -149,6 +153,7 @@ function M.render_status(buf, target_id, fallback_line, opts)
     end)
     return
   end
+  if actions._status_operations_pending() then return end
 
   session.status.request_id = (session.status.request_id or 0) + 1
   local request_id = session.status.request_id
@@ -190,10 +195,14 @@ function M.render_status(buf, target_id, fallback_line, opts)
       if not (current_status and current_status.request_id == request_id) then return end
       session.status = current_status
       if not vim.api.nvim_buf_is_valid(buf) then return end
-      if actions._status_operations_pending() then
-        actions._status_request_reconcile(buf, target_id)
+      if result.error then
+        if not has_existing_view then entry_nav._status_set_plain_lines(buf, { "Git status load failed" }) end
         return
       end
+      if actions._status_operations_pending() then return end
+      session.untracked = vim.deepcopy(result.snapshot.untracked_by_file or {})
+      session.file_diffs = vim.deepcopy(result.snapshot.file_diffs or {})
+      session.file_hunk_staged = vim.deepcopy(result.snapshot.file_hunk_staged or {})
       if opts.restore_initial_folds then
         state.restore_initial_folds(result.sections)
         target_id = state.first_grouping_id(result.sections)
@@ -209,6 +218,7 @@ function M.render_status(buf, target_id, fallback_line, opts)
       )
       current_status.head_lines = result.head_lines
       current_status.head_values = result.head_values
+      status_sync.reset_status(current_status, result.sections)
       current_status.sections = result.sections
       current_status.fancy_rows = {}
       if preserve_current_cursor and not opts.restore_initial_folds then

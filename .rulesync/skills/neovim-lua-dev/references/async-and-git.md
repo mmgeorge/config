@@ -70,49 +70,108 @@ already reopened the PR.
 
 ---
 
-## Optimistic UI model, reconcile after the queue is idle
+## Optimistic journal first, authoritative snapshot after the burst
 
-Keep the UI model separate from backend (git) state. A user action updates the in-memory model and renders **immediately**; the async git command reconciles afterward. Never flash a loading state during an action-triggered refresh — only on first load or when there is no useful previous model. In `views/status/actions.lua` a stage does:
+Keep the rendered projection separate from Git truth. `operation_journal.lua` stores one
+confirmed section baseline plus ordered optimistic layers. A stage or unstage appends a
+layer, projects both section and per-file diff caches, and renders **immediately** before
+its Git command runs. Never replace an existing model with a loading row.
 
 ```lua
-status_mark_diff_paths_pending(action_entries, { "unstaged", "staged" })
-status_apply_optimistic_entries(action_entries, "staged", target_id)  -- model + render now
-status_enqueue_operation(function(done)
-  git_data().stage_patch_async(diff, function(ok)
-    -- failure already notified inside stage_patch_async
-    done()
-  end)
-end)
+mutation_coordinator.enqueue(root, {
+  paths = path_list,
+  on_enqueue = function(task)
+    status_sync.apply_optimistic(root, task.burst_id, entries, target_section)
+  end,
+  execute = function(done)
+    index_mutation.execute_async(root, mutation, done)
+  end,
+})
 ```
 
-If the user stages then immediately unstages before git finishes, the second action operates on the optimistic model, and the git commands still run in order. Reconcile from git **once the queue drains**, not after each command while later ones are pending.
+The next keypress reads that projection, not the last confirmed snapshot. If an older
+burst finishes while newer layers wait, commit only the resolved layers and replay the
+later layers over the new baseline. This prevents an authoritative read from erasing UI
+work the user has already requested.
 
 ---
 
-## The mutation queue: sequential, FIFO, debounced reconcile
+## Repository-root FIFO and one path-scoped synchronization
 
-Parallel `git add` / `git restore --staged` / `git checkout` / `git apply --cached` race on `.git/index.lock`. Run index mutations async but **sequentially**. `render/mutation_queue.lua` is a tiny FIFO: `enqueue` appends and calls `run_next`, which refuses to start a second op while `running`, and flushes `on_idle` callbacks only when both `running` is false and the queue is empty.
+Parallel `git add`, `git restore --staged`, `git rm --cached`, and
+`git apply --cached` contend for `.git/index.lock`. Serialize index writes through
+`git/mutation_coordinator.lua`, keyed by repository root rather than status buffer. Every
+status view and `diff://` buffer for one repository therefore shares one FIFO, while
+different repositories continue independently.
 
-```lua
-status.operation_queue_model = status.operation_queue_model or mutation_queue.new()
-mutation_queue.enqueue(status.operation_queue_model, operation)
-mutation_queue.on_idle(status.operation_queue_model, function()
-  status_request_reconcile(status.reconcile_buf, status.reconcile_target_id)
-end)
-```
+Successful tasks remain in one accepting burst until the FIFO drains and a **120 ms quiet
+window** expires. Then `views/status/status_sync.lua` requests exactly one snapshot for
+the union of affected root-relative paths. `git/status_snapshot.lua` runs exactly three
+commands with the same pathspec:
 
-Reconcile is **debounced and cancelable** (`actions.lua`, `status_reconcile_delay_ms = 120`). `status_request_reconcile` bumps `reconcile_generation`, then `vim.defer_fn`s a check; if a newer generation exists or operations are still pending, it bails. Critically, **enqueuing another mutation also bumps `reconcile_generation`**, which cancels any pending reconcile — so `S S S` does not repaint the backend snapshot from after the first stage on top of the optimistic UI. While mutations are queued or running (`status_operations_pending()`), suppress unrelated full status loads and async enrichment rerenders; the final debounced reconcile refreshes from git once the burst settles.
+- `git --no-optional-locks -C <root> status --porcelain=v2 -z --untracked-files=all -- <paths>`
+- `git --no-optional-locks -C <root> -c core.quotepath=false diff --no-color --no-ext-diff --unified=0 -- <paths>`
+- `git --no-optional-locks -C <root> -c core.quotepath=false diff --no-color --no-ext-diff --unified=0 --cached -- <paths>`
+
+The full status load uses the same three-command seam with an empty path list. A matching
+snapshot retires the confirmed layers without a status render or an open diff-buffer
+write. A semantic mismatch replaces only the affected paths and performs one corrective
+render. The snapshot also updates the section model, diff-source registry, session diff
+caches, and open diff buffers without a duplicate Git reload.
+
+Keep collection pure until the owning render request passes its generation and
+pending-mutation checks. Adopt the full snapshot caches only at that point. Rejecting a
+stale model after its collector already replaced global caches still corrupts the
+optimistic projection.
+
+One failed authoritative attempt may retry once after 120 ms. Keep the optimistic
+projection visible, do not notify between attempts, and do not turn a matching retry into
+a render. Only the terminal read failure marks verification stale.
+
+Treat the first mutation failure in a burst as the recovery boundary. Notify immediately,
+cancel the queued tasks from that burst, and keep every Git write that already completed.
+Run one path snapshot, rebuild actual Git truth, and force one recovery render. Do not
+model the failure as a transaction rollback because Git has already committed the earlier
+index writes.
+
+If both bounded snapshot attempts fail, use the mutation result's completed target count.
+Reverse every layer from the failed burst, then replay only fully successful tasks and the
+completed prefix of the failed task. Mark verification stale and render once. This keeps
+known index writes visible without pretending failed or cancelled targets succeeded.
+
+Porcelain type `2` covers both rename and copy. Carry that distinction into the status
+file. Rename stage and unstage include current and original paths. Copy stage and unstage
+include only the destination, which behaves like an added file, because including its
+source can unstage unrelated work.
 
 ---
 
-## Cursor restore: passive rerender vs explicit action target
+## Cursor restore: passive rerender vs mutation policy
 
 There are two distinct flows, and conflating them makes the cursor jump:
 
 - **Passive async rerender** (Tree-sitter context arrived, syntax finished): no explicit target means "preserve wherever the user is **now**." Capture the stable item id + raw cursor line *inside the callback, immediately before mutating lines* — never when the request started, because the user moves while git/Tree-sitter work is in flight.
-- **Action rerender** (stage/unstage/discard): pass an explicit semantic `target_id` chosen by the action (the next hunk, or the destination section header).
+- **Stage/unstage render:** never restore or explicitly move the cursor. Apply that
+  policy to optimistic, corrective, and failure-recovery renders, then let Neovim place
+  the cursor as minimal buffer-line edits land.
+- **Discard rerender:** pass the explicit semantic `target_id` chosen before deletion because the removed content cannot retain identity.
 
-In `render_orchestrator.lua`, `preserve_current_cursor = target_id == nil and fallback_line == nil` encodes exactly this. Bad: `local id = cursor_target(buf); load_async(function(r) render(r, id) end)`. Good: capture inside the callback.
+`status_sync.lua` passes `{ restore_cursor = false }` for every stage and unstage render.
+It also invalidates in-flight full loads and pending context-render generations before
+projecting, preventing older callbacks from restoring a stale target after the action.
+For passive work, `target_id == nil and fallback_line == nil` preserves the cursor captured
+at render time. Bad: `local id = cursor_target(buf); load_async(function(r) render(r, id)
+end)`. Good: capture inside the callback.
+
+---
+
+## Reconcile buffer text with minimal line edits
+
+When a real mismatch requires a status render, do not replace the entire buffer. Ask
+`vim.diff` for histogram `indices`, then apply each disjoint line edit from bottom to
+top. Bottom-up edits preserve every earlier index while the patch runs. Unchanged spans
+never get written, which limits extmark movement, `CursorMoved` cascades, and visible
+redraw work to the rows that Git actually changed.
 
 ---
 
@@ -140,28 +199,45 @@ Never feed a synthesized virtual `@@ +N -N` display header back to git: it may s
 
 ## Staging / unstaging individual hunks
 
-Use `git apply --cached`. Because hunks are fetched with `--unified=0`, you **must** pass `--unidiff-zero`, or git rejects zero-context patches. `git_data.stage_patch_async`:
+Use `git apply --cached`. Because hunks are fetched with `--unified=0`, you **must** pass `--unidiff-zero`, or git rejects zero-context patches. Route the semantic target through `git/index_mutation.lua` so status and standalone diff buffers share the same ordered mutation path:
 
 ```lua
-git_backend.run_git_async(
-  { "apply", "--cached", "--whitespace=nowarn", "--unidiff-zero", "-" },
-  diff .. "\n",
-  function(result) if not result.ok then notifications.error(...) end end
-)
+index_mutation.execute_async(root, {
+  direction = "stage",
+  target_list = { { kind = "hunk", path = filename, diff = diff } },
+}, callback)
 ```
 
 - The patch text must include the file header (`diff --git`, `---`, `+++`) **and** the hunk (`@@` + lines), with a trailing newline.
 - `--whitespace=nowarn` avoids whitespace noise; `--unidiff-zero` is mandatory for `--unified=0` hunks.
-- `run_git_async` runs from the git root (`git -C root`), so paths in the patch are root-relative.
+- `index_mutation` runs from the known Git root (`git -C root`), so paths in the patch are root-relative.
 - For unstage, add `--reverse` — same patch, reversed application.
+
+Tracked hunk patches come from Git's own diff, so CRLF conversion and idempotent clean
+filters already feed the canonical patch comparison. Applying or reversing that patch
+changes the index while leaving worktree bytes untouched, and it should normally match
+the optimistic projection. Do not cite line-ending normalization alone as a reason to
+reload or preemptively render.
 
 ---
 
 ## Empty new files and untracked files
 
-`git diff --cached` for an empty new file produces `new file mode` but **no `@@` header**. A parser that only emits hunks on `@@` will drop the file; cross-check `git diff --name-status` (or `--cached --name-status`) for files that produced zero hunks and represent them explicitly.
+`git diff --cached` for an empty new file produces `new file mode` but **no `@@` header**. A parser that only emits hunks on `@@` will drop the file. Preserve the file record from `status --porcelain=v2 -z` and synthesize a placeholder when neither diff emits a hunk.
 
-Untracked files have no git diff at all — `git diff` and `git diff --cached` ignore them. Do not shell out for one. Synthesize a "new file" patch from disk (`git_data.build_untracked_diff`): `vim.fn.readfile`, prefix every line with `+`, header `@@ -0,0 +1,N @@`, and skip binary files (a NUL byte in any line). Feed it through the normal render path so it previews as one all-additions hunk.
+Untracked files have no git diff at all — `git diff` and `git diff --cached` ignore them.
+Do not shell out for one. After the three Git commands finish, read every required file
+through the bounded asynchronous libuv seam in `status_snapshot.lua`. Synthesize a `new file`
+patch from the exact bytes, prefix every line with `+`, use `@@ -0,0 +1,N @@`, preserve
+CRLF and the `\\ No newline at end of file` marker, and skip NUL-containing files. A
+read failure retains the untracked status row with no textual hunk. Feed a successful
+patch through the normal render path so it previews as one all-additions hunk.
+
+Whole-file staging crosses the filter boundary that synthetic preview does not. `git add`
+may store LF-normalized or clean-filtered bytes while leaving the untracked worktree file
+unchanged. The authoritative staged diff can therefore differ from the raw synthetic
+patch after a successful mutation. Let semantic comparison trigger one correction in
+that case.
 
 **The false-sentinel cache trap** (`views/diff_buffer.lua`): the per-file cache `session.file_diffs` is keyed by filename, and the "do I need to fetch?" guard must be `== nil`, not falsy. Untracked/empty files yield no diff; if you cache `nil` there, every cursor move re-runs the fetch (for tracked files, two full-repo `git diff` calls — visibly laggy). Cache the boolean `false` for "checked, no diff" and reserve `nil` for "invalidated, must re-fetch":
 

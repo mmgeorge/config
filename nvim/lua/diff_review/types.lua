@@ -53,12 +53,14 @@
 ---@field removed integer
 ---@field git_status? string
 ---@field git_original_file? string
+---@field git_path_change_kind? "renamed"|"copied"
 ---@field raw_hunks? DiffReviewHunk[]
 
 ---@class DiffReviewStatusFile
 ---@field filename string
 ---@field relpath string
 ---@field original_relpath? string
+---@field path_change_kind? "renamed"|"copied"
 ---@field section_name string
 ---@field added integer
 ---@field removed integer
@@ -66,6 +68,8 @@
 ---@field untracked boolean
 ---@field status string
 ---@field git_status? string
+---@field diff_source_id? string
+---@field diff_file_key? string
 
 ---@class DiffReviewStatusCommit
 ---@field oid string

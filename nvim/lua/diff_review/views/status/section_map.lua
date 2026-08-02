@@ -16,6 +16,62 @@ local session = require("diff_review.session")
 
 local M = {}
 
+---@alias DiffReviewStatusStageSectionName "unstaged"|"staged"
+
+--- Represents one value-addressed file or hunk selected for a status move.
+---@class DiffReviewStatusMoveSelection
+---@field kind "file"|"hunk"
+---@field filename string
+---@field source_section DiffReviewStatusStageSectionName
+---@field hunk_identity? string
+
+--- Defines one semantic stage or unstage layer for optimistic projection.
+---@class DiffReviewStatusMove
+---@field target_section DiffReviewStatusStageSectionName
+---@field selection_list DiffReviewStatusMoveSelection[]
+
+---@alias DiffReviewAffectedPathSet table<string, boolean>
+
+--- Represents visible hunk state used for authoritative projection comparison.
+---@class DiffReviewStatusSemanticHunk
+---@field identity string
+---@field pos integer
+---@field diff string
+---@field staged boolean
+---@field context_text string
+---@field git_status string
+---@field git_original_file string
+---@field added integer
+---@field removed integer
+
+--- Represents visible file state used for authoritative projection comparison.
+---@class DiffReviewStatusSemanticFile
+---@field filename string
+---@field relpath string
+---@field original_relpath string
+---@field path_change_kind string
+---@field added integer
+---@field removed integer
+---@field untracked boolean
+---@field git_status string
+---@field hunk_list DiffReviewStatusSemanticHunk[]
+
+---@alias DiffReviewStatusSemanticSectionMap table<DiffReviewStatusStageSectionName, DiffReviewStatusSemanticFile[]>
+
+--- Represents one complete status model produced by a successful load.
+---@class DiffReviewStatusLoadSuccess
+---@field head_lines DiffReviewStatusHeadLine[]
+---@field head_values table
+---@field sections DiffReviewStatusSection[]
+---@field snapshot DiffReviewPathStatusSnapshot
+---@field error nil
+
+--- Represents one actionable status load failure without a synthetic model.
+---@class DiffReviewStatusLoadFailure
+---@field error DiffReviewPathStatusSnapshotError
+
+---@alias DiffReviewStatusLoadResult DiffReviewStatusLoadSuccess|DiffReviewStatusLoadFailure
+
 --- Ordered status sections (unstaged before staged). Owned here, the sole consumer; previously
 --- parked on the init table as M._status_section_order during the monolith era.
 ---@type DiffReviewSectionConfig[]
@@ -97,7 +153,7 @@ local function status_sections_from_items(collected_items)
       if not file then
         file = {
           filename = filename,
-          relpath = vim.fn.fnamemodify(filename, ":."),
+          relpath = item.relpath or data.relpath or vim.fn.fnamemodify(filename, ":."),
           section_name = section_name,
           added = 0,
           removed = 0,
@@ -106,6 +162,7 @@ local function status_sections_from_items(collected_items)
           status = data.stats or data.hunk_header or "",
           git_status = data.git_status,
           original_relpath = data.git_original_file,
+          path_change_kind = data.git_path_change_kind,
         }
         section.files_by_name[filename] = file
         section.files[#section.files + 1] = file
@@ -569,12 +626,15 @@ local function status_remove_file_from_section(section_map, section_name, filena
 end
 
 ---@param section_map table<DiffReviewStatusSectionName, DiffReviewStatusSection>
+---@param source_sections DiffReviewStatusSection[]
+---@param buf integer?
 ---@return DiffReviewStatusSection[]
-local function status_order_section_map(section_map)
+local function status_order_section_map(section_map, source_sections, buf)
   local ordered = {}
+  local included_section = {}
   for _, section_config in ipairs(status_section_order) do
     local section = section_map[section_config.name]
-    M._status_sort_section_files(session.status and session.status.buf or nil, section)
+    M._status_sort_section_files(buf, section)
     for _, file in ipairs(section.files) do
       file.section_name = section.name
       file.untracked = section.name ~= "staged" and file.untracked == true
@@ -593,27 +653,51 @@ local function status_order_section_map(section_map)
       end)
     end
     status_reindex_section(section)
+    included_section[section.name] = true
     if #section.files > 0 then ordered[#ordered + 1] = section end
   end
-  if M.unmerged and #(M.unmerged.commits or {}) > 0 then
-    ordered[#ordered + 1] = M.unmerged
-  end
-  if M.recent and #(M.recent.commits or {}) > 0 then
-    ordered[#ordered + 1] = M.recent
+  for _, source_section in ipairs(source_sections or {}) do
+    if not included_section[source_section.name] then
+      local section = section_map[source_section.name] or source_section
+      ordered[#ordered + 1] = section
+      included_section[source_section.name] = true
+    end
   end
   return ordered
 end
 
+---@param hunk DiffReviewHunk
+---@return string
+local function status_hunk_identity(hunk)
+  if type(hunk.diff) == "string" and hunk.diff ~= "" then
+    return "diff:" .. vim.fn.sha256(hunk.diff)
+  end
+  return table.concat({
+    tostring(hunk.file or hunk.filename or ""),
+    tostring(hunk.pos or 0),
+    tostring(hunk.added or 0),
+    tostring(hunk.removed or 0),
+    tostring(hunk.context_text or hunk.context or ""),
+    tostring(hunk.git_original_file or ""),
+  }, "\31")
+end
+
 ---@param file DiffReviewStatusFile
----@param section_name DiffReviewStatusSectionName
+---@return boolean
+local function status_file_is_added(file)
+  return file.untracked == true or git_data._git_status_is_added(file.git_status)
+end
+
+---@param file DiffReviewStatusFile
+---@param section_name DiffReviewStatusStageSectionName
 ---@return DiffReviewStatusFile
 local function status_copy_file_for_section(file, section_name)
   local copied_file = vim.deepcopy(file)
   copied_file.section_name = section_name
-  copied_file.untracked = section_name ~= "staged" and file.untracked == true
+  copied_file.untracked = section_name == "unstaged" and status_file_is_added(file)
   if copied_file.untracked then
     copied_file.git_status = "??"
-  elseif section_name == "staged" and file.untracked then
+  elseif section_name == "staged" and status_file_is_added(file) then
     copied_file.git_status = "A"
   end
   copied_file.hunks = copied_file.hunks or {}
@@ -626,23 +710,33 @@ local function status_copy_file_for_section(file, section_name)
 end
 
 ---@param section_map table<DiffReviewStatusSectionName, DiffReviewStatusSection>
----@param section_name DiffReviewStatusSectionName
+---@param section_name DiffReviewStatusStageSectionName
 ---@param file DiffReviewStatusFile
 ---@return DiffReviewStatusFile
 local function status_ensure_file(section_map, section_name, file)
   local section = section_map[section_name]
   local existing_file = section.files_by_name[file.filename]
-  if existing_file then return existing_file end
-  local is_untracked = section_name ~= "staged" and file.untracked == true
+  if existing_file then
+    if section_name == "unstaged" and status_file_is_added(file) then
+      existing_file.untracked = true
+      existing_file.git_status = "??"
+    elseif section_name == "staged" and status_file_is_added(file) then
+      existing_file.git_status = "A"
+    end
+    return existing_file
+  end
+  local is_untracked = section_name == "unstaged" and status_file_is_added(file)
   local git_status = file.git_status
   if is_untracked then
     git_status = "??"
-  elseif section_name == "staged" and file.untracked then
+  elseif section_name == "staged" and status_file_is_added(file) then
     git_status = "A"
   end
   existing_file = {
     filename = file.filename,
     relpath = file.relpath,
+    original_relpath = file.original_relpath,
+    path_change_kind = file.path_change_kind,
     section_name = section_name,
     added = 0,
     removed = 0,
@@ -661,7 +755,7 @@ end
 ---@return boolean
 local function status_append_hunk_to_file(file, hunk)
   for _, existing_hunk in ipairs(file.hunks or {}) do
-    if existing_hunk.diff == hunk.diff then return false end
+    if status_hunk_identity(existing_hunk) == status_hunk_identity(hunk) then return false end
   end
   file.hunks = file.hunks or {}
   file.hunks[#file.hunks + 1] = hunk
@@ -682,6 +776,13 @@ local function status_merge_file_into_section(section_map, section_name, file)
     return
   end
 
+  if file.untracked then
+    existing_file.untracked = true
+    existing_file.git_status = "??"
+  elseif section_name == "staged" and status_file_is_added(file) then
+    existing_file.git_status = "A"
+  end
+
   local moved_hunks = file.hunks or {}
   if #moved_hunks == 0 then
     existing_file.added = (existing_file.added or 0) + (file.added or 0)
@@ -693,69 +794,304 @@ local function status_merge_file_into_section(section_map, section_name, file)
   end
 end
 
----@param sections DiffReviewStatusSection[]?
+--- Build a semantic status move from rendered entries before their tables can change.
 ---@param entries DiffReviewStatusEntry[]
----@param target_section DiffReviewStatusSectionName
----@return DiffReviewStatusSection[]?
-local function status_apply_optimistic_move(sections, entries, target_section)
-  if not sections then return nil end
-  local section_map = status_section_map(sections)
-  for _, entry in ipairs(entries) do
-    if entry.kind == "file" and entry.file then
-      local source_section = entry.file.section_name
-      if source_section ~= target_section then
-        status_remove_file_from_section(section_map, source_section, entry.file.filename)
-        local moved_file = status_copy_file_for_section(entry.file, target_section)
-        status_merge_file_into_section(section_map, target_section, moved_file)
+---@param target_section DiffReviewStatusStageSectionName
+---@return DiffReviewStatusMove
+function M.capture_move(entries, target_section)
+  assert(target_section == "unstaged" or target_section == "staged", "status move target must be staged or unstaged")
+  local selection_list = {} ---@type DiffReviewStatusMoveSelection[]
+  local selected_key = {} ---@type table<string, boolean>
+  for _, entry in ipairs(entries or {}) do
+    local file = entry.file
+    local source_section = file and file.section_name or nil
+    if file and source_section ~= target_section and (source_section == "unstaged" or source_section == "staged") then
+      local selection = nil ---@type DiffReviewStatusMoveSelection?
+      if entry.kind == "file" then
+        selection = {
+          kind = "file",
+          filename = file.filename,
+          source_section = source_section,
+        }
+      elseif entry.kind == "hunk" and entry.hunk then
+        selection = {
+          kind = "hunk",
+          filename = file.filename,
+          source_section = source_section,
+          hunk_identity = status_hunk_identity(entry.hunk),
+        }
       end
-    elseif entry.kind == "hunk" and entry.file and entry.hunk then
-      local source_file = entry.file
-      local source_section = source_file.section_name
-      if source_section ~= target_section then
-        local source = section_map[source_section] and section_map[source_section].files_by_name[source_file.filename]
-        if source then
-          for index = #source.hunks, 1, -1 do
-            if source.hunks[index].diff == entry.hunk.diff then
-              table.remove(source.hunks, index)
-              break
-            end
-          end
-          source.added = math.max(0, source.added - (entry.hunk.added or 0))
-          source.removed = math.max(0, source.removed - (entry.hunk.removed or 0))
-          if #source.hunks == 0 then
-            status_remove_file_from_section(section_map, source_section, source.filename)
-          end
+      if selection then
+        local key = table.concat({ selection.kind, selection.source_section, selection.filename, selection.hunk_identity or "" }, "\31")
+        if not selected_key[key] then
+          selection_list[#selection_list + 1] = selection
+          selected_key[key] = true
         end
-        local target_file = status_ensure_file(section_map, target_section, source_file)
-        local moved_hunk = vim.deepcopy(entry.hunk)
-        moved_hunk.section_name = target_section
-        moved_hunk.staged = target_section == "staged"
+      end
+    end
+  end
+  return { target_section = target_section, selection_list = selection_list }
+end
+
+--- Build a projected section model from one semantic move, preserving the input baseline.
+---@param sections DiffReviewStatusSection[]
+---@param move DiffReviewStatusMove
+---@param buf? integer
+---@return DiffReviewStatusSection[]
+function M.apply_move(sections, move, buf)
+  local source_sections = vim.deepcopy(sections or {})
+  local mapped_section = status_section_map(source_sections)
+  for _, selection in ipairs(move.selection_list or {}) do
+    local source_section = mapped_section[selection.source_section]
+    local source_file = source_section and source_section.files_by_name[selection.filename] or nil
+    if selection.kind == "file" and source_file then
+      local removed_file = status_remove_file_from_section(mapped_section, selection.source_section, selection.filename)
+      if removed_file then
+        local moved_file = status_copy_file_for_section(removed_file, move.target_section)
+        status_merge_file_into_section(mapped_section, move.target_section, moved_file)
+      end
+    elseif selection.kind == "hunk" and source_file and selection.hunk_identity then
+      local moved_hunk = nil ---@type DiffReviewHunk?
+      for hunk_index = #source_file.hunks, 1, -1 do
+        local candidate_hunk = source_file.hunks[hunk_index]
+        if status_hunk_identity(candidate_hunk) == selection.hunk_identity then
+          moved_hunk = table.remove(source_file.hunks, hunk_index)
+          break
+        end
+      end
+      if moved_hunk then
+        source_file.added = math.max(0, source_file.added - (moved_hunk.added or 0))
+        source_file.removed = math.max(0, source_file.removed - (moved_hunk.removed or 0))
+        if #source_file.hunks == 0 then
+          status_remove_file_from_section(mapped_section, selection.source_section, source_file.filename)
+        end
+        local target_file = status_ensure_file(mapped_section, move.target_section, source_file)
+        moved_hunk.section_name = move.target_section
+        moved_hunk.staged = move.target_section == "staged"
         moved_hunk.git_status = target_file.git_status or moved_hunk.git_status
         status_append_hunk_to_file(target_file, moved_hunk)
       end
     end
   end
-  return status_order_section_map(section_map)
+  return status_order_section_map(mapped_section, source_sections, buf)
+end
+
+---@param path string
+---@return string
+local function status_normalized_path(path)
+  return vim.fs.normalize(path):gsub("\\", "/")
+end
+
+---@param affected_path_set DiffReviewAffectedPathSet
+---@return DiffReviewAffectedPathSet
+local function status_normalized_path_set(affected_path_set)
+  local normalized_path_set = {} ---@type DiffReviewAffectedPathSet
+  for path, affected in pairs(affected_path_set or {}) do
+    if affected then
+      normalized_path_set[path] = true
+      normalized_path_set[status_normalized_path(path)] = true
+    end
+  end
+  return normalized_path_set
+end
+
+---@param file DiffReviewStatusFile
+---@param normalized_path_set DiffReviewAffectedPathSet
+---@return boolean
+local function status_file_path_is_affected(file, normalized_path_set)
+  return normalized_path_set[file.filename] == true or normalized_path_set[status_normalized_path(file.filename)] == true
+end
+
+--- Merge authoritative files for selected paths while preserving every unrelated section entry.
+---@param confirmed_sections DiffReviewStatusSection[]
+---@param snapshot_sections DiffReviewStatusSection[]
+---@param affected_path_set DiffReviewAffectedPathSet
+---@return DiffReviewStatusSection[]
+function M.replace_paths(confirmed_sections, snapshot_sections, affected_path_set)
+  local source_sections = vim.deepcopy(confirmed_sections or {})
+  local mapped_section = status_section_map(source_sections)
+  local normalized_path_set = status_normalized_path_set(affected_path_set)
+  for _, section_name in ipairs({ "unstaged", "staged" }) do
+    local section = mapped_section[section_name]
+    for file_index = #section.files, 1, -1 do
+      if status_file_path_is_affected(section.files[file_index], normalized_path_set) then
+        table.remove(section.files, file_index)
+      end
+    end
+    status_reindex_section(section)
+  end
+  for _, snapshot_section in ipairs(snapshot_sections or {}) do
+    if snapshot_section.name == "unstaged" or snapshot_section.name == "staged" then
+      for _, snapshot_file in ipairs(snapshot_section.files or {}) do
+        if status_file_path_is_affected(snapshot_file, normalized_path_set) then
+          status_merge_file_into_section(mapped_section, snapshot_section.name, vim.deepcopy(snapshot_file))
+        end
+      end
+    end
+  end
+  return status_order_section_map(mapped_section, source_sections, nil)
+end
+
+---@param file_snapshot DiffReviewPathStatusFileSnapshot
+---@param section_name DiffReviewStatusStageSectionName
+---@param hunk_list DiffReviewHunk[]
+---@return DiffReviewStatusFile
+local function status_file_from_snapshot(file_snapshot, section_name, hunk_list)
+  local status_record = file_snapshot.status_record or {}
+  local git_status = section_name == "staged" and status_record.index_status or status_record.worktree_status
+  local untracked = section_name == "unstaged" and status_record.untracked == true
+  if untracked then git_status = "??" end
+  local file = {
+    filename = file_snapshot.abs_file,
+    relpath = file_snapshot.path,
+    original_relpath = status_record.original_path,
+    path_change_kind = (status_record.kind == "renamed" or status_record.kind == "copied") and status_record.kind or nil,
+    section_name = section_name,
+    added = 0,
+    removed = 0,
+    hunks = {},
+    untracked = untracked,
+    status = status_record.xy or "",
+    git_status = git_status,
+  } ---@type DiffReviewStatusFile
+  for _, source_hunk in ipairs(hunk_list or {}) do
+    local hunk = vim.deepcopy(source_hunk)
+    hunk.filename = file.filename
+    hunk.section_name = section_name
+    hunk.staged = section_name == "staged"
+    hunk.git_status = git_status or hunk.git_status
+    hunk.git_original_file = hunk.git_original_file or status_record.original_path
+    file.hunks[#file.hunks + 1] = hunk
+    file.added = file.added + (hunk.added or 0)
+    file.removed = file.removed + (hunk.removed or 0)
+  end
+  return file
+end
+
+--- Build authoritative stage and unstage sections from a path status snapshot.
+---@param snapshot DiffReviewPathStatusSnapshot
+---@return DiffReviewStatusSection[]
+function M.sections_from_snapshot(snapshot)
+  local mapped_section = status_empty_section_map()
+  for _, file_snapshot in ipairs(snapshot.file_list or {}) do
+    local status_record = file_snapshot.status_record or {}
+    local unstaged_hunk_list = file_snapshot.unstaged_hunk_list or {}
+    local staged_hunk_list = file_snapshot.staged_hunk_list or {}
+    if status_record.unstaged or status_record.untracked or #unstaged_hunk_list > 0 then
+      local file = status_file_from_snapshot(file_snapshot, "unstaged", unstaged_hunk_list)
+      status_merge_file_into_section(mapped_section, "unstaged", file)
+    end
+    if status_record.staged or #staged_hunk_list > 0 then
+      local file = status_file_from_snapshot(file_snapshot, "staged", staged_hunk_list)
+      status_merge_file_into_section(mapped_section, "staged", file)
+    end
+  end
+  return status_order_section_map(mapped_section, {}, nil)
+end
+
+---@param hunk DiffReviewHunk
+---@return DiffReviewStatusSemanticHunk
+local function status_semantic_hunk(hunk)
+  return {
+    identity = status_hunk_identity(hunk),
+    pos = hunk.pos or 0,
+    diff = hunk.diff or "",
+    staged = hunk.staged == true,
+    context_text = hunk.context_text or hunk.context or "",
+    git_status = hunk.git_status or "",
+    git_original_file = hunk.git_original_file or "",
+    added = hunk.added or 0,
+    removed = hunk.removed or 0,
+  }
+end
+
+---@param file DiffReviewStatusFile
+---@return DiffReviewStatusSemanticFile
+local function status_semantic_file(file)
+  local semantic_hunk_list = {} ---@type DiffReviewStatusSemanticHunk[]
+  for _, hunk in ipairs(file.hunks or {}) do
+    semantic_hunk_list[#semantic_hunk_list + 1] = status_semantic_hunk(hunk)
+  end
+  table.sort(semantic_hunk_list, function(left_hunk, right_hunk)
+    if left_hunk.pos ~= right_hunk.pos then return left_hunk.pos < right_hunk.pos end
+    return left_hunk.identity < right_hunk.identity
+  end)
+  return {
+    filename = file.filename,
+    relpath = file.relpath or "",
+    original_relpath = file.original_relpath or "",
+    path_change_kind = file.path_change_kind or "",
+    added = file.added or 0,
+    removed = file.removed or 0,
+    untracked = file.untracked == true,
+    git_status = file.git_status or "",
+    hunk_list = semantic_hunk_list,
+  }
+end
+
+---@param sections DiffReviewStatusSection[]
+---@return DiffReviewStatusSemanticSectionMap
+local function status_semantic_section_map(sections)
+  local semantic_section_map = { unstaged = {}, staged = {} } ---@type DiffReviewStatusSemanticSectionMap
+  for _, section in ipairs(sections or {}) do
+    local semantic_file_list = semantic_section_map[section.name]
+    if semantic_file_list then
+      for _, file in ipairs(section.files or {}) do
+        semantic_file_list[#semantic_file_list + 1] = status_semantic_file(file)
+      end
+      table.sort(semantic_file_list, function(left_file, right_file)
+        return left_file.filename < right_file.filename
+      end)
+    end
+  end
+  return semantic_section_map
+end
+
+--- Validate equivalent stage and unstage data while ignoring render-owned metadata.
+---@param left_sections DiffReviewStatusSection[]
+---@param right_sections DiffReviewStatusSection[]
+---@return boolean
+function M.equivalent(left_sections, right_sections)
+  return vim.deep_equal(status_semantic_section_map(left_sections), status_semantic_section_map(right_sections))
+end
+
+---@param sections DiffReviewStatusSection[]?
+---@param entries DiffReviewStatusEntry[]
+---@param target_section DiffReviewStatusStageSectionName
+---@return DiffReviewStatusSection[]?
+local function status_apply_optimistic_move(sections, entries, target_section)
+  if not sections then return nil end
+  return M.apply_move(sections, M.capture_move(entries, target_section), session.status and session.status.buf or nil)
 end
 
 ---@param cwd string
----@param cb fun(result: { head_lines: DiffReviewStatusHeadLine[], head_values: table, sections: DiffReviewStatusSection[] })
+---@param cb fun(result: DiffReviewStatusLoadResult)
 local function status_load_async(cwd, cb)
   local head_lines = nil
   local head_values = nil
   local sections = nil
+  local snapshot = nil ---@type DiffReviewPathStatusSnapshot?
   local unmerged_section = nil
   local unmerged_loaded = false
   local recent_commits_section = nil
   local recent_commits_loaded = false
+  local completed = false
+
+  ---@param result DiffReviewStatusLoadResult
+  local function finish(result)
+    if completed then return end
+    completed = true
+    cb(result)
+  end
 
   local function maybe_done()
+    if completed then return end
     if not (head_lines and sections and unmerged_loaded and recent_commits_loaded) then return end
     local ordered_sections = {}
     vim.list_extend(ordered_sections, sections)
     if unmerged_section then ordered_sections[#ordered_sections + 1] = unmerged_section end
     if recent_commits_section then ordered_sections[#ordered_sections + 1] = recent_commits_section end
-    cb({ head_lines = head_lines, head_values = head_values or {}, sections = ordered_sections })
+    finish({ head_lines = head_lines, head_values = head_values or {}, sections = ordered_sections, snapshot = assert(snapshot) })
   end
 
   status_head._status_head_lines_async(cwd, function(lines, values)
@@ -773,8 +1109,15 @@ local function status_load_async(cwd, cb)
     end)
     maybe_done()
   end)
-  git_data._collect_items_from_git(cwd, function(items)
-    sections = status_sections_from_items(items or {})
+  git_data._collect_items_from_git(cwd, function(items, collection_error, collected_snapshot)
+    if collection_error or not items then
+      finish({
+        error = collection_error or { kind = "parse", message = "Git status collector returned no result" },
+      })
+      return
+    end
+    snapshot = collected_snapshot
+    sections = status_sections_from_items(items)
     maybe_done()
   end, { skip_pre_render = true, skip_ts_context = true })
 end

@@ -46,6 +46,46 @@ local full_untracked = git_lines({ "ls-files", "--others", "--exclude-standard" 
 
 assert_true(#full_unstaged_diff > 0, "Ferrous working tree has no unstaged diff to reproduce")
 
+local function full_status_snapshot_text()
+  local status_entry_by_path = {}
+
+  local function apply_name_status(line, field)
+    local field_list = vim.split(line, "\t", { plain = true })
+    local status_code = field_list[1]
+    local relpath = field_list[#field_list]
+    local entry = status_entry_by_path[relpath] or { index = ".", worktree = "." }
+    entry[field] = status_code:sub(1, 1)
+    if #field_list > 2 then
+      entry.score = status_code
+      entry.original_path = field_list[#field_list - 1]
+    end
+    status_entry_by_path[relpath] = entry
+  end
+
+  for _, line in ipairs(full_staged_name_status) do apply_name_status(line, "index") end
+  for _, line in ipairs(full_unstaged_name_status) do apply_name_status(line, "worktree") end
+  for _, relpath in ipairs(full_untracked) do status_entry_by_path[relpath] = { untracked = true } end
+
+  local path_list = {}
+  for relpath in pairs(status_entry_by_path) do path_list[#path_list + 1] = relpath end
+  table.sort(path_list)
+
+  local record_list = {}
+  for _, relpath in ipairs(path_list) do
+    local entry = status_entry_by_path[relpath]
+    if entry.untracked then
+      record_list[#record_list + 1] = "? " .. relpath .. "\0"
+    elseif entry.original_path then
+      record_list[#record_list + 1] = ("2 %s%s N... 100644 100644 100644 1111111 2222222 %s %s\0%s\0")
+        :format(entry.index, entry.worktree, entry.score, relpath, entry.original_path)
+    else
+      record_list[#record_list + 1] = ("1 %s%s N... 100644 100644 100644 1111111 2222222 %s\0")
+        :format(entry.index, entry.worktree, relpath)
+    end
+  end
+  return table.concat(record_list)
+end
+
 ---@type DiffReviewGitBackend
 local backend = {}
 
@@ -75,12 +115,22 @@ function backend.systemlist_async(command, cb)
   cb(output, code, "")
 end
 
-function backend.system()
+function backend.system(command)
+  local key = command_key(command)
+  local status_key = "git\t--no-optional-locks\t-C\t" .. ferrous_root
+    .. "\tstatus\t--porcelain=v2\t-z\t--untracked-files=all"
+  local unstaged_key = "git\t--no-optional-locks\t-C\t" .. ferrous_root
+    .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0"
+  if key == status_key then return full_status_snapshot_text(), 0 end
+  if key == unstaged_key then return table.concat(full_unstaged_diff, "\n"), 0 end
+  if key == unstaged_key .. "\t--cached" then return table.concat(full_staged_diff, "\n"), 0 end
   return "", 0
 end
 
-function backend.system_async(_, _, cb)
-  cb({ code = 0, stdout = "", stderr = "", output = "" })
+function backend.system_async(command, _, cb)
+  calls[#calls + 1] = command_key(command)
+  local output, code = backend.system(command)
+  cb({ code = code, stdout = output, stderr = "", output = output })
 end
 
 ---@type DiffReviewGhBackend

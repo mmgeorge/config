@@ -22,9 +22,7 @@ local model = {
   rustdoc_target_at_position = function(_, source_line, _, _)
     assert_equals(source_line, 42, "Rust source navigation should retain the canonical source line")
     return {
-      flow_id = "inspection",
-      step_id = "query",
-      edge_id = "count",
+      json_path = "/flows/0/steps/0/edges/0",
       selection = "callable",
     }
   end,

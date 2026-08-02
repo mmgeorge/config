@@ -96,6 +96,29 @@ local function write_binary_file(path)
   assert_true(ok ~= nil, "write binary file failed: " .. tostring(write_err))
 end
 
+local function status_snapshot_text()
+  local status_by_path = {}
+  for _, relpath in ipairs(sorted_keys(state.unstaged_binary)) do
+    status_by_path[relpath] = status_by_path[relpath] or { index = ".", worktree = "." }
+    status_by_path[relpath].worktree = "M"
+  end
+  for _, relpath in ipairs(sorted_keys(state.staged_binary)) do
+    status_by_path[relpath] = status_by_path[relpath] or { index = ".", worktree = "." }
+    status_by_path[relpath].index = "M"
+  end
+
+  local record_list = {}
+  for _, relpath in ipairs(sorted_keys(status_by_path)) do
+    local status = status_by_path[relpath]
+    record_list[#record_list + 1] = ("1 %s%s N... 100644 100644 100644 1111111 2222222 %s\0")
+      :format(status.index, status.worktree, relpath)
+  end
+  for _, relpath in ipairs(sorted_keys(state.untracked_binary)) do
+    record_list[#record_list + 1] = "? " .. relpath .. "\0"
+  end
+  return table.concat(record_list)
+end
+
 ---@type DiffReviewGitBackend
 local backend = {}
 
@@ -135,9 +158,17 @@ function backend.systemlist_async(command, cb)
   end, 5)
 end
 
-function backend.system_async(_, _, cb)
+function backend.system_async(command, _, cb)
+  record("system_async", command)
+  local key = command_key(command)
+  local status_key = "git\t--no-optional-locks\t-C\t" .. root .. "\tstatus\t--porcelain=v2\t-z\t--untracked-files=all"
+  local unstaged_key = "git\t--no-optional-locks\t-C\t" .. root
+    .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0"
+  local staged_key = unstaged_key .. "\t--cached"
   vim.defer_fn(function()
-    cb({ code = 1, stdout = "", stderr = "", output = "" })
+    local matched = key == status_key or key == unstaged_key or key == staged_key
+    local output = key == status_key and status_snapshot_text() or ""
+    cb({ code = matched and 0 or 1, stdout = output, stderr = "", output = output })
   end, 5)
 end
 

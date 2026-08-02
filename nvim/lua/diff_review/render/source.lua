@@ -92,6 +92,7 @@ local text_snapshot = require("diff_review.render.text_snapshot")
 ---@field file_by_key table<string, DiffReviewDiffFileState>
 ---@field file_order string[]
 ---@field pending_callback function[]
+---@field metadata table
 
 ---@class DiffReviewDiffSourceRegistry
 ---@field handle_by_id table<string, DiffReviewDiffSourceHandle>
@@ -398,6 +399,27 @@ function M.clear_invalidated_paths(registry, source_id)
   registry.invalidation_by_source[source_id] = nil
   local source = registry.source_by_id[source_id]
   if source then source.invalidated_path = {} end
+end
+
+--- Clear resolved invalidations while preserving paths owned by later mutations.
+---@param registry DiffReviewDiffSourceRegistry
+---@param source_ids string|string[]
+---@param paths string|string[]
+function M.clear_invalidated_path_list(registry, source_ids, paths)
+  if type(source_ids) == "string" then source_ids = { source_ids } end
+  if type(paths) == "string" then paths = { paths } end
+  for _, source_id in ipairs(source_ids or {}) do
+    local registry_path_set = registry.invalidation_by_source[source_id]
+    local source_state = registry.source_by_id[source_id]
+    for _, path in ipairs(paths or {}) do
+      local normalized_path = M.normalize_path(path)
+      if registry_path_set then registry_path_set[normalized_path] = nil end
+      if source_state then source_state.invalidated_path[normalized_path] = nil end
+    end
+    if registry_path_set and next(registry_path_set) == nil then
+      registry.invalidation_by_source[source_id] = nil
+    end
+  end
 end
 
 ---@param registry DiffReviewDiffSourceRegistry

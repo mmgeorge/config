@@ -94,12 +94,23 @@ function backend.systemlist_async(command, cb)
   cb(output, code, "")
 end
 
-function backend.system()
+function backend.system(command)
+  local key = command_key(command)
+  local status_key = "git\t--no-optional-locks\t-C\t" .. root .. "\tstatus\t--porcelain=v2\t-z\t--untracked-files=all"
+  local unstaged_key = "git\t--no-optional-locks\t-C\t" .. root
+    .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0"
+  if key == status_key then
+    return "1 .M N... 100644 100644 100644 1111111 2222222 src/model.rs\0", 0
+  end
+  if key == unstaged_key then return diff_text, 0 end
+  if key == unstaged_key .. "\t--cached" then return "", 0 end
   return "", 0
 end
 
-function backend.system_async(_, _, cb)
-  cb({ code = 0, stdout = "", stderr = "", output = "" })
+function backend.system_async(command, _, cb)
+  calls[#calls + 1] = command_key(command)
+  local output, code = backend.system(command)
+  cb({ code = code, stdout = output, stderr = "", output = output })
 end
 
 ---@type DiffReviewGhBackend

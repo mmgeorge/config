@@ -400,10 +400,8 @@ end
 
 ---@param selected_entries DiffReviewStatusEntry[]
 ---@param action_entries DiffReviewStatusEntry[]
----@param target_section? DiffReviewStatusSectionName
----@param opts? { file_target?: "destination"|"next" }
 ---@return string?
-local function status_action_target_id(selected_entries, action_entries, target_section, opts)
+local function status_action_target_id(selected_entries, action_entries)
   if status_entries_are_headers(selected_entries) then
     return nil
   end

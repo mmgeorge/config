@@ -3,7 +3,9 @@ vim.loader.enable(false)
 local diff_review = require("diff_review")
 local render_orchestrator = require("diff_review.views.status.render_orchestrator")
 local status_render = require("diff_review.views.status.status_render")
+local entry_nav = require("diff_review.views.status.entry_nav")
 local git_data = require("diff_review.git.git_data")
+local mutation_coordinator = require("diff_review.git.mutation_coordinator")
 local paths = require("diff_review.infra.paths")
 local session = require("diff_review.session")
 local syntax_engine = require("diff_review.render.syntax_engine")
@@ -20,6 +22,8 @@ local state = {}
 local held_systemlist_async = nil
 local held_gh_async = nil
 local captured_notifications = {}
+local forced_mutation_failure_path = nil
+local forced_snapshot_failure_command_count = 0
 local gh_calls = 0
 local repo_metadata_calls = 0
 
@@ -110,6 +114,12 @@ local function saw_notification_containing(needle)
 end
 
 local function reset_state(next_state)
+  assert_true(
+    vim.wait(3000, function()
+      return not mutation_coordinator.pending(root) and not mutation_coordinator.recovering(root)
+    end, 10),
+    "previous status mutation did not settle before fixture reset"
+  )
   state = {
     modified = next_state.modified or {},
     staged_modified = next_state.staged_modified or {},
@@ -118,8 +128,11 @@ local function reset_state(next_state)
     unstaged_added = next_state.unstaged_added or {},
     staged_deleted = next_state.staged_deleted or {},
     staged_renamed = next_state.staged_renamed or {},
+    staged_copied = next_state.staged_copied or {},
     ignored = next_state.ignored or {},
   }
+  forced_mutation_failure_path = nil
+  forced_snapshot_failure_command_count = 0
   reset_calls()
 end
 
@@ -178,6 +191,88 @@ local function name_status(files, status)
     lines[#lines + 1] = status .. "\t" .. relpath
   end
   return lines
+end
+
+local function command_path_set(command)
+  for command_index, argument in ipairs(command) do
+    if argument == "--" then
+      local path_set = {}
+      for path_index = command_index + 1, #command do path_set[command[path_index]] = true end
+      return path_set
+    end
+  end
+  return nil
+end
+
+local function path_selected(path_set, path)
+  return path_set == nil or path_set[path] == true
+end
+
+local function filtered_file_map(file_map, path_set)
+  local filtered = {}
+  for path, value in pairs(file_map or {}) do
+    if path_selected(path_set, path) then filtered[path] = value end
+  end
+  return filtered
+end
+
+local function porcelain_status(command)
+  local path_set = command_path_set(command)
+  local status_by_path = {}
+  local function set_status(file_map, side, status)
+    for path in pairs(file_map or {}) do
+      if path_selected(path_set, path) then
+        local current = status_by_path[path] or { index = ".", worktree = "." }
+        current[side] = status
+        status_by_path[path] = current
+      end
+    end
+  end
+  set_status(state.modified, "worktree", "M")
+  set_status(state.unstaged_added, "worktree", "A")
+  set_status(state.staged_modified, "index", "M")
+  set_status(state.staged_added, "index", "A")
+  set_status(state.staged_deleted, "index", "D")
+
+  local record_list = {}
+  for _, path in ipairs(sorted_keys(status_by_path)) do
+    local status = status_by_path[path]
+    record_list[#record_list + 1] = (
+      "1 %s%s N... 100644 100644 100644 1111111 2222222 %s\0"
+    ):format(status.index, status.worktree, path)
+  end
+  for _, path in ipairs(sorted_keys(state.untracked or {})) do
+    if path_selected(path_set, path) then record_list[#record_list + 1] = "? " .. path .. "\0" end
+  end
+  for new_path, old_path in pairs(state.staged_renamed or {}) do
+    if path_selected(path_set, new_path) or path_selected(path_set, old_path) then
+      record_list[#record_list + 1] = (
+        "2 R. N... 100644 100644 100644 1111111 2222222 R100 %s\0%s\0"
+      ):format(new_path, old_path)
+    end
+  end
+  for new_path, old_path in pairs(state.staged_copied or {}) do
+    if path_selected(path_set, new_path) then
+      record_list[#record_list + 1] = (
+        "2 C. N... 100644 100644 100644 1111111 2222222 C100 %s\0%s\0"
+      ):format(new_path, old_path)
+    end
+  end
+  table.sort(record_list)
+  return table.concat(record_list)
+end
+
+local function snapshot_diff(command, staged)
+  local path_set = command_path_set(command)
+  local modified_file_map = filtered_file_map(staged and state.staged_modified or state.modified, path_set)
+  local added_file_map = filtered_file_map(staged and state.staged_added or state.unstaged_added, path_set)
+  if staged then
+    for copied_path in pairs(filtered_file_map(state.staged_copied, path_set)) do added_file_map[copied_path] = true end
+  end
+  local text = joined_diff(modified_file_map, modified_diff)
+  local added = joined_diff(added_file_map, added_diff)
+  if text ~= "" and added ~= "" then return text .. "\n" .. added end
+  return text .. added
 end
 
 local function input_relpath(input)
@@ -266,6 +361,37 @@ function backend.system(command, input)
   local key = command_key(command)
   local relpath = command[#command]
 
+  local snapshot_status_command = key:find(
+    "git\t--no-optional-locks\t-C\t" .. root .. "\tstatus\t--porcelain=v2\t-z",
+    1,
+    true
+  ) ~= nil
+  local snapshot_diff_command = key:find(
+    "git\t--no-optional-locks\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff",
+    1,
+    true
+  ) ~= nil
+  if (snapshot_status_command or snapshot_diff_command) and forced_snapshot_failure_command_count > 0 then
+    forced_snapshot_failure_command_count = forced_snapshot_failure_command_count - 1
+    return "forced snapshot failure", 1
+  end
+  if snapshot_status_command then
+    return porcelain_status(command), 0
+  end
+  if snapshot_diff_command then
+    return snapshot_diff(command, key:find("\t--cached", 1, true) ~= nil), 0
+  end
+
+  local mutation_path = key:find("\tapply\t", 1, true) and input_relpath(input) or relpath
+  if forced_mutation_failure_path == mutation_path
+    and (key:find("\tadd\t", 1, true)
+      or key:find("\trestore\t--staged\t", 1, true)
+      or key:find("\trm\t--cached\t", 1, true)
+      or key:find("\tapply\t", 1, true))
+  then
+    return "forced mutation failure for " .. mutation_path, 1
+  end
+
   if key:find("\tadd\t-u\t--\t", 1, true) then
     if state.modified[relpath] then
       state.modified[relpath] = nil
@@ -324,6 +450,10 @@ function backend.system(command, input)
   if key:find("\trm\t--cached\t--ignore-unmatch\t--\t", 1, true) then
     if state.staged_added[relpath] then
       state.staged_added[relpath] = nil
+      state.untracked[relpath] = true
+    end
+    if state.staged_copied[relpath] then
+      state.staged_copied[relpath] = nil
       state.untracked[relpath] = true
     end
     return "", 0
@@ -552,6 +682,18 @@ local function count_calls(kind, needle)
     end
   end
   return count
+end
+
+local function count_calls_with_input(kind, needle)
+  local count = 0
+  for _, call in ipairs(calls) do
+    if call.kind == kind and tostring(call.input or ""):find(needle, 1, true) then count = count + 1 end
+  end
+  return count
+end
+
+local function count_snapshot_diff_calls()
+  return count_calls("system_async", "\tdiff")
 end
 
 local function calls_text()
@@ -802,20 +944,12 @@ local function run()
   reset_calls()
   local folded_stage_row = find_row(buf, "folded-stage-b.txt")
   trigger_normal_mapping("S", folded_stage_row)
-  assert_true(
-    vim.api.nvim_win_get_cursor(0)[1] == folded_stage_row,
-    "folded file header stage moved cursor before reconcile\n" .. table.concat(status_lines(buf), "\n")
-  )
   wait_for(function()
     return state.staged_modified["folded-stage-b.txt"] == true
   end, "folded file stage did not finish")
   wait_for(function()
-    return count_calls("systemlist_async", "\tdiff") > 0
+    return count_snapshot_diff_calls() > 0
   end, "folded file stage did not reconcile")
-  assert_true(
-    vim.api.nvim_win_get_cursor(0)[1] == folded_stage_row,
-    "folded file header stage moved cursor after reconcile\n" .. table.concat(status_lines(buf), "\n")
-  )
 
   reset_state({
     modified = {
@@ -829,48 +963,102 @@ local function run()
   reset_calls()
   local single_file_stage_row = find_row(buf, "visual-stage-d.txt")
   trigger_normal_mapping("S", single_file_stage_row)
-  assert_true(
-    vim.api.nvim_win_get_cursor(0)[1] == single_file_stage_row,
-    "single file header stage moved cursor before reconcile\n" .. table.concat(status_lines(buf), "\n")
-  )
   local visual_first_row = find_row(buf, "visual-stage-a.txt")
   local visual_second_row = find_row(buf, "visual-stage-b.txt")
   assert_visual_callback_exits_mode("S", visual_first_row, visual_second_row)
   assert_true(not mode_is_visual(vim.api.nvim_get_mode().mode), "visual stage left test in visual mode")
-  assert_true(
-    vim.api.nvim_win_get_cursor(0)[1] == visual_second_row,
-    "visual stage moved cursor row during optimistic render\n" .. table.concat(status_lines(buf), "\n")
-  )
   wait_for(function()
     return state.staged_modified["visual-stage-a.txt"]
       and state.staged_modified["visual-stage-b.txt"]
       and state.staged_modified["visual-stage-d.txt"]
   end, "visual stage queue did not finish")
   wait_for(function()
-    return count_calls("systemlist_async", "\tdiff") > 0
+    return count_snapshot_diff_calls() > 0
   end, "visual stage queue did not reconcile")
-  assert_true(
-    vim.api.nvim_win_get_cursor(0)[1] == visual_second_row,
-    "visual stage inherited the previous action target after reconcile\n" .. table.concat(status_lines(buf), "\n")
-  )
 
   reset_state({ modified = { ["hunk-stage.txt"] = true } })
   render_and_wait(buf, "hunk-stage.txt +1 -1")
   trigger_normal_mapping("<Tab>", find_row(buf, "hunk-stage.txt"))
   wait_for(function() return buffer_contains(buf, "@@ +1 -1") end, "hunk row did not render")
+  local original_render_current_model = status_render.status_render_current_model
+  local original_restore_cursor = entry_nav._status_restore_cursor
+  local optimistic_action_cursor_disabled = false
+  local current_model_render_count = 0
+  local action_restore_cursor_count = 0
+  entry_nav._status_restore_cursor = function(...)
+    action_restore_cursor_count = action_restore_cursor_count + 1
+    return original_restore_cursor(...)
+  end
+  status_render.status_render_current_model = function(target_id, opts)
+    current_model_render_count = current_model_render_count + 1
+    if opts and opts.restore_cursor == false then
+      optimistic_action_cursor_disabled = target_id == nil
+    end
+    return original_render_current_model(target_id, opts)
+  end
+  reset_calls()
   trigger_normal_mapping("S", find_row(buf, "@@ +1 -1"))
   wait_for(function()
     return saw_system_call_containing("\tapply\t--cached\t--whitespace=nowarn\t--unidiff-zero\t-")
   end, "hunk stage did not run cached apply")
   wait_for(function() return buffer_contains(buf, "Staged changes (1)") end, "hunk stage did not reconcile")
+  wait_for(function() return count_snapshot_diff_calls() > 0 end, "hunk stage did not reload Git state")
+  wait_for(function() return not mutation_coordinator.pending(root) end, "hunk stage did not finish synchronization")
+  assert_true(action_restore_cursor_count == 0, "hunk stage invoked cursor restoration")
   reset_calls()
   trigger_normal_mapping("<Tab>", find_row(buf, "hunk-stage.txt"))
   wait_for(function() return buffer_contains(buf, "@@ +1 -1") end, "staged hunk row did not render")
+  action_restore_cursor_count = 0
   trigger_normal_mapping("U", find_row(buf, "@@ +1 -1"))
   wait_for(function()
     return saw_system_call_containing("\tapply\t--cached\t--reverse\t--whitespace=nowarn\t--unidiff-zero\t-")
   end, "hunk unstage did not run reverse cached apply")
   wait_for(function() return buffer_contains(buf, "Unstaged changes (1)") end, "hunk unstage did not reconcile")
+  wait_for(function() return count_snapshot_diff_calls() > 0 end, "hunk unstage did not reload Git state")
+  wait_for(function() return not mutation_coordinator.pending(root) end, "hunk unstage did not finish synchronization")
+  status_render.status_render_current_model = original_render_current_model
+  entry_nav._status_restore_cursor = original_restore_cursor
+  assert_true(optimistic_action_cursor_disabled, "stage/unstage optimistic render still controlled the cursor")
+  assert_true(action_restore_cursor_count == 0, "hunk unstage invoked cursor restoration")
+  assert_true(
+    current_model_render_count == 2,
+    ("matching stage/unstage sync triggered a redundant status render (%d)"):format(current_model_render_count)
+  )
+
+  reset_state({ modified = { ["transient-snapshot.txt"] = true } })
+  render_and_wait(buf, "transient-snapshot.txt +1 -1")
+  local transient_original_render_current_model = status_render.status_render_current_model
+  local transient_render_count = 0
+  status_render.status_render_current_model = function(...)
+    transient_render_count = transient_render_count + 1
+    return transient_original_render_current_model(...)
+  end
+  forced_snapshot_failure_command_count = 3
+  reset_calls()
+  reset_notifications()
+  trigger_normal_mapping("S", find_row(buf, "transient-snapshot.txt"))
+  assert_true(buffer_contains(buf, "Staged changes (1)"), "transient snapshot stage did not project immediately")
+  wait_for(function()
+    return count_calls("system_async", "git\t--no-optional-locks\t") >= 3
+  end, "transient snapshot stage did not run its first authoritative read")
+  assert_true(
+    not saw_notification_containing("Git status snapshot failed"),
+    "transient snapshot failure notified before the bounded retry"
+  )
+  wait_for(function() return not mutation_coordinator.pending(root) end, "transient snapshot retry did not settle")
+  status_render.status_render_current_model = transient_original_render_current_model
+  assert_true(state.staged_modified["transient-snapshot.txt"], "transient snapshot retry lost the successful Git write")
+  assert_true(buffer_contains(buf, "Staged changes (1)"), "transient snapshot retry changed the matching projection")
+  assert_true(transient_render_count == 1, "matching snapshot retry rendered after the optimistic action")
+  assert_true(count_snapshot_diff_calls() == 4, "transient snapshot failure did not run exactly one retry")
+  assert_true(
+    count_calls("system_async", "git\t--no-optional-locks\t") == 6,
+    "transient snapshot retry did not use two three-command attempts\n" .. calls_text()
+  )
+  assert_true(
+    not saw_notification_containing("Git status snapshot failed"),
+    "successful snapshot retry emitted a synchronization failure"
+  )
 
   reset_state({ modified = { ["fold-highlight.txt"] = true } })
   render_and_wait(buf, "fold-highlight.txt +1 -1")
@@ -976,45 +1164,163 @@ local function run()
   end, "refresh did not preserve the materialized file in its native fold\n" .. table.concat(status_lines(buf), "\n"))
   session.status.folds = {}
 
-  reset_state({ modified = { ["cursor-stage-a.txt"] = true, ["cursor-stage-b.txt"] = true } })
-  render_and_wait(buf, "cursor-stage-a.txt +1 -1")
-  trigger_normal_mapping("<Tab>", find_row(buf, "cursor-stage-a.txt"))
-  trigger_normal_mapping("<Tab>", find_row(buf, "cursor-stage-b.txt"))
-  reset_calls()
-  trigger_normal_mapping("S", find_row_after(buf, "@@ +1 -1", find_row(buf, "cursor-stage-a.txt")))
-  wait_for(function()
-    return saw_system_call_containing("\tapply\t--cached\t--whitespace=nowarn\t--unidiff-zero\t-")
-  end, "cursor hunk stage did not run cached apply")
-  wait_for(function()
-    return cursor_is_on_hunk_after_file(buf, "cursor-stage-b.txt")
-  end, "cursor did not move to next hunk after staging\n" .. table.concat(status_lines(buf), "\n"))
-
   reset_state({ modified = { ["rapid-stage-a.txt"] = true, ["rapid-stage-b.txt"] = true } })
   render_and_wait(buf, "rapid-stage-a.txt +1 -1")
   trigger_normal_mapping("<Tab>", find_row(buf, "rapid-stage-a.txt"))
   trigger_normal_mapping("<Tab>", find_row(buf, "rapid-stage-b.txt"))
+  local rapid_original_render_current_model = status_render.status_render_current_model
+  local rapid_render_count = 0
+  status_render.status_render_current_model = function(...)
+    rapid_render_count = rapid_render_count + 1
+    return rapid_original_render_current_model(...)
+  end
   reset_calls()
   trigger_normal_mapping("S", find_hunk_row_after_file(buf, "rapid-stage-a.txt"))
+  trigger_normal_mapping("S", find_hunk_row_after_file(buf, "rapid-stage-b.txt"))
+  render_orchestrator.render_status(buf)
+  assert_true(buffer_contains(buf, "Staged changes (2)"), "rapid hunk stages did not project immediately")
+  assert_true(
+    not state.staged_modified["rapid-stage-a.txt"] and not state.staged_modified["rapid-stage-b.txt"],
+    "rapid optimistic projection waited for Git"
+  )
   wait_for(function()
     return state.staged_modified["rapid-stage-a.txt"] == true
-  end, "first rapid hunk stage did not finish")
+      and state.staged_modified["rapid-stage-b.txt"] == true
+  end, "rapid hunk stages did not finish")
   vim.wait(20)
   assert_true(
-    count_calls("systemlist_async", "\tdiff") == 0,
-    "rapid first hunk stage reconciled before debounce\n" .. table.concat(status_lines(buf), "\n")
-  )
-  trigger_normal_mapping("S", find_hunk_row_after_file(buf, "rapid-stage-b.txt"))
-  wait_for(function()
-    return state.staged_modified["rapid-stage-b.txt"] == true
-  end, "second rapid hunk stage did not finish")
-  vim.wait(20)
-  assert_true(
-    count_calls("systemlist_async", "\tdiff") == 0,
+    count_snapshot_diff_calls() == 0,
     "rapid queued hunk stages reconciled before debounce\n" .. table.concat(status_lines(buf), "\n")
   )
   wait_for(function()
-    return count_calls("systemlist_async", "\tdiff") > 0
+    return count_snapshot_diff_calls() > 0
   end, "rapid hunk stages did not reconcile after debounce")
+  wait_for(function() return not mutation_coordinator.pending(root) end, "rapid hunk stage sync did not finish")
+  status_render.status_render_current_model = rapid_original_render_current_model
+  assert_true(rapid_render_count == 2, "matching rapid hunk sync rendered more than the two optimistic actions")
+  assert_true(count_snapshot_diff_calls() == 2, "rapid hunk stage burst did not use one three-command snapshot")
+  assert_true(
+    count_calls("system_async", "\t--\trapid-stage-a.txt\trapid-stage-b.txt") == 3,
+    "rapid hunk stage snapshot did not union both pathspecs\n" .. calls_text()
+  )
+
+  reset_state({ modified = { ["rapid-fail-a.txt"] = true, ["rapid-fail-b.txt"] = true } })
+  render_and_wait(buf, "rapid-fail-a.txt +1 -1")
+  trigger_normal_mapping("<Tab>", find_row(buf, "rapid-fail-a.txt"))
+  trigger_normal_mapping("<Tab>", find_row(buf, "rapid-fail-b.txt"))
+  local recovery_original_render_current_model = status_render.status_render_current_model
+  local recovery_original_cancel_pending_enrichment = status_render.status_cancel_pending_enrichment
+  local recovery_render_count = 0
+  local recovery_cancel_pending_enrichment_count = 0
+  status_render.status_render_current_model = function(...)
+    recovery_render_count = recovery_render_count + 1
+    return recovery_original_render_current_model(...)
+  end
+  status_render.status_cancel_pending_enrichment = function(...)
+    recovery_cancel_pending_enrichment_count = recovery_cancel_pending_enrichment_count + 1
+    return recovery_original_cancel_pending_enrichment(...)
+  end
+  forced_mutation_failure_path = "rapid-fail-a.txt"
+  forced_snapshot_failure_command_count = 3
+  reset_calls()
+  reset_notifications()
+  trigger_normal_mapping("S", find_hunk_row_after_file(buf, "rapid-fail-a.txt"))
+  trigger_normal_mapping("S", find_hunk_row_after_file(buf, "rapid-fail-b.txt"))
+  assert_true(buffer_contains(buf, "Staged changes (2)"), "failed rapid burst did not project both actions immediately")
+  wait_for(function()
+    return saw_notification_containing("Cancelled 1 queued action(s)")
+  end, "failed rapid burst did not report the cancelled queued action")
+  wait_for(function() return not mutation_coordinator.pending(root) end, "failed rapid burst did not recover")
+  status_render.status_render_current_model = recovery_original_render_current_model
+  status_render.status_cancel_pending_enrichment = recovery_original_cancel_pending_enrichment
+  assert_true(
+    state.modified["rapid-fail-a.txt"] and state.modified["rapid-fail-b.txt"],
+    "failed rapid burst changed backend state for a failed or cancelled hunk"
+  )
+  assert_true(
+    buffer_contains(buf, "Unstaged changes (2)") and not buffer_contains(buf, "Staged changes"),
+    "failed rapid burst did not render authoritative Git state once\n" .. table.concat(status_lines(buf), "\n")
+  )
+  assert_true(recovery_render_count == 3, "failed rapid burst did not use two projections and one recovery render")
+  assert_true(
+    recovery_cancel_pending_enrichment_count == 3,
+    "failed rapid burst did not cancel enrichment before each optimistic and recovery render"
+  )
+  assert_true(count_calls_with_input("system", "rapid-fail-a.txt") == 1, "failed rapid hunk did not execute exactly once")
+  assert_true(count_calls_with_input("system", "rapid-fail-b.txt") == 0, "cancelled rapid hunk still reached Git")
+  assert_true(count_snapshot_diff_calls() == 4, "failed rapid burst did not retry the transient recovery snapshot once")
+  assert_true(
+    count_calls("system_async", "\t--\trapid-fail-a.txt\trapid-fail-b.txt") == 6,
+    "failed rapid burst recovery did not include every optimistic path\n" .. calls_text()
+  )
+  assert_true(
+    not saw_notification_containing("Git mutation recovery failed"),
+    "successful recovery snapshot retry emitted a recovery failure"
+  )
+
+  reset_state({ modified = { ["partial-stage-a.txt"] = true, ["partial-stage-b.txt"] = true } })
+  render_and_wait(buf, "partial-stage-a.txt +1 -1")
+  local partial_original_render_current_model = status_render.status_render_current_model
+  local partial_render_count = 0
+  status_render.status_render_current_model = function(...)
+    partial_render_count = partial_render_count + 1
+    return partial_original_render_current_model(...)
+  end
+  forced_mutation_failure_path = "partial-stage-b.txt"
+  reset_calls()
+  reset_notifications()
+  trigger_normal_mapping("S", find_row(buf, "Unstaged changes (2)"))
+  assert_true(buffer_contains(buf, "Staged changes (2)"), "partial stage did not project the batch immediately")
+  wait_for(function() return saw_notification_containing("partial-stage-b.txt") end, "partial stage failure was not reported")
+  wait_for(function() return not mutation_coordinator.pending(root) end, "partial stage failure did not recover")
+  status_render.status_render_current_model = partial_original_render_current_model
+  assert_true(
+    state.staged_modified["partial-stage-a.txt"] and state.modified["partial-stage-b.txt"],
+    "partial stage recovery discarded the successful Git write"
+  )
+  assert_true(
+    buffer_contains(buf, "Staged changes (1)") and buffer_contains(buf, "Unstaged changes (1)"),
+    "partial stage recovery did not render mixed authoritative state\n" .. table.concat(status_lines(buf), "\n")
+  )
+  assert_true(partial_render_count == 2, "partial stage failure did not use one projection and one recovery render")
+  assert_true(count_snapshot_diff_calls() == 2, "partial stage failure did not use one recovery snapshot")
+
+  reset_state({ modified = { ["stale-partial-a.txt"] = true, ["stale-partial-b.txt"] = true } })
+  render_and_wait(buf, "stale-partial-a.txt +1 -1")
+  local stale_partial_original_render_current_model = status_render.status_render_current_model
+  local stale_partial_render_count = 0
+  status_render.status_render_current_model = function(...)
+    stale_partial_render_count = stale_partial_render_count + 1
+    return stale_partial_original_render_current_model(...)
+  end
+  forced_mutation_failure_path = "stale-partial-b.txt"
+  forced_snapshot_failure_command_count = 6
+  reset_calls()
+  reset_notifications()
+  trigger_normal_mapping("S", find_row(buf, "Unstaged changes (2)"))
+  wait_for(function()
+    return saw_notification_containing("Git mutation recovery failed")
+  end, "terminal partial recovery failure was not reported")
+  wait_for(function() return not mutation_coordinator.pending(root) end, "terminal partial recovery did not finish")
+  status_render.status_render_current_model = stale_partial_original_render_current_model
+  assert_true(
+    state.staged_modified["stale-partial-a.txt"] and state.modified["stale-partial-b.txt"],
+    "terminal partial recovery changed actual Git state"
+  )
+  assert_true(
+    buffer_contains(buf, "Staged changes (1)") and buffer_contains(buf, "Unstaged changes (1)"),
+    "terminal partial recovery hid the known successful write\n" .. table.concat(status_lines(buf), "\n")
+  )
+  assert_true(
+    vim.deep_equal(session.file_hunk_staged[root .. "/stale-partial-a.txt"], { true }),
+    "terminal partial recovery lost the successful cache projection"
+  )
+  assert_true(
+    vim.deep_equal(session.file_hunk_staged[root .. "/stale-partial-b.txt"], { false }),
+    "terminal partial recovery retained the failed cache projection"
+  )
+  assert_true(stale_partial_render_count == 2, "terminal partial recovery did not use one projection and one fallback render")
+  assert_true(count_snapshot_diff_calls() == 4, "terminal partial recovery did not stop after two snapshot attempts")
 
   local pending_context_callbacks = {}
   local original_compute_hunk_context_async = git_data.compute_hunk_context_async
@@ -1047,9 +1353,6 @@ local function run()
   wait_for(function()
     return saw_system_call_containing("\tapply\t--cached\t--whitespace=nowarn\t--unidiff-zero\t-")
   end, "context cursor hunk stage did not run cached apply")
-  wait_for(function()
-    return cursor_is_on_hunk_after_file(buf, "context-stage-b.txt")
-  end, "cursor did not move to next hunk after context-gated open\n" .. table.concat(status_lines(buf), "\n"))
   git_data.compute_hunk_context_async = original_compute_hunk_context_async
   syntax_engine.clear_context_cache()
 
@@ -1079,38 +1382,17 @@ local function run()
     return cursor_line_text(buf):find("late-cursor-b.txt", 1, true) ~= nil
   end, "late async status refresh restored the old cursor instead of the latest cursor\n" .. table.concat(status_lines(buf), "\n"))
 
-  reset_state({ staged_modified = { ["cursor-unstage-a.txt"] = true, ["cursor-unstage-b.txt"] = true } })
-  render_and_wait(buf, "cursor-unstage-a.txt +1 -1")
-  trigger_normal_mapping("<Tab>", find_row(buf, "cursor-unstage-a.txt"))
-  trigger_normal_mapping("<Tab>", find_row(buf, "cursor-unstage-b.txt"))
-  reset_calls()
-  trigger_normal_mapping("U", find_row_after(buf, "@@ +1 -1", find_row(buf, "cursor-unstage-a.txt")))
-  wait_for(function()
-    return saw_system_call_containing("\tapply\t--cached\t--reverse\t--whitespace=nowarn\t--unidiff-zero\t-")
-  end, "cursor hunk unstage did not run reverse cached apply")
-  wait_for(function()
-    return cursor_is_on_hunk_after_file(buf, "cursor-unstage-b.txt")
-  end, "cursor did not move to next hunk after unstaging\n" .. table.concat(status_lines(buf), "\n"))
-
   reset_state({ modified = { ["header-stage-a.txt"] = true, ["header-stage-b.txt"] = true } })
   render_and_wait(buf, "header-stage-a.txt +1 -1")
   reset_calls()
   local only_unstaged_header_row = find_row(buf, "Unstaged changes (2)")
   trigger_normal_mapping("S", only_unstaged_header_row)
-  assert_true(
-    vim.api.nvim_win_get_cursor(0)[1] == only_unstaged_header_row,
-    "stage-all from the only section header moved the cursor row\n" .. table.concat(status_lines(buf), "\n")
-  )
   wait_for(function()
     return state.staged_modified["header-stage-a.txt"] and state.staged_modified["header-stage-b.txt"]
   end, "stage-all from section header did not finish")
   wait_for(function()
-    return count_calls("systemlist_async", "\tdiff") > 0
+    return count_snapshot_diff_calls() > 0
   end, "stage-all from section header did not reconcile")
-  assert_true(
-    cursor_line_text(buf):find("@@", 1, true) == nil,
-    "stage-all from section header jumped to a hunk after reconcile\n" .. table.concat(status_lines(buf), "\n")
-  )
 
   reset_state({
     modified = { ["header-stage-with-untracked-a.txt"] = true, ["header-stage-with-untracked-b.txt"] = true },
@@ -1120,24 +1402,14 @@ local function run()
   reset_calls()
   local unstaged_with_untracked_header_row = find_row(buf, "Unstaged changes (3)")
   trigger_normal_mapping("S", unstaged_with_untracked_header_row)
-  assert_true(
-    vim.api.nvim_win_get_cursor(0)[1] == unstaged_with_untracked_header_row,
-    "stage-all from unstaged section header moved cursor before reconcile\n"
-      .. table.concat(status_lines(buf), "\n")
-  )
   wait_for(function()
     return state.staged_modified["header-stage-with-untracked-a.txt"]
       and state.staged_modified["header-stage-with-untracked-b.txt"]
       and state.staged_added["header-stage-untracked-next.txt"]
   end, "stage-all from unstaged section with untracked did not finish")
   wait_for(function()
-    return count_calls("systemlist_async", "\tdiff") > 0
+    return count_snapshot_diff_calls() > 0
   end, "stage-all from unstaged section with untracked did not reconcile")
-  assert_true(
-    vim.api.nvim_win_get_cursor(0)[1] == unstaged_with_untracked_header_row,
-    "stage-all from unstaged section header moved cursor after reconcile\n"
-      .. table.concat(status_lines(buf), "\n")
-  )
 
   reset_state({
     modified = { ["header-untracked-stage-remaining.txt"] = true },
@@ -1147,35 +1419,20 @@ local function run()
   reset_calls()
   local untracked_with_unstaged_header_row = find_row(buf, "Unstaged changes (3)")
   trigger_normal_mapping("S", untracked_with_unstaged_header_row)
-  assert_true(
-    vim.api.nvim_win_get_cursor(0)[1] == untracked_with_unstaged_header_row,
-    "stage-all from merged unstaged section header moved cursor before reconcile\n"
-      .. table.concat(status_lines(buf), "\n")
-  )
   wait_for(function()
     return state.staged_modified["header-untracked-stage-remaining.txt"]
       and state.staged_added["header-untracked-stage-a.txt"]
       and state.staged_added["header-untracked-stage-b.txt"]
   end, "stage-all from merged unstaged section did not finish")
   wait_for(function()
-    return count_calls("systemlist_async", "\tdiff") > 0
+    return count_snapshot_diff_calls() > 0
   end, "stage-all from merged unstaged section did not reconcile")
-  assert_true(
-    vim.api.nvim_win_get_cursor(0)[1] == untracked_with_unstaged_header_row,
-    "stage-all from merged unstaged section header moved cursor after reconcile\n"
-      .. table.concat(status_lines(buf), "\n")
-  )
 
   reset_state({ untracked = { ["header-untracked-stage-only.txt"] = true } })
   render_and_wait(buf, "header-untracked-stage-only.txt new")
   reset_calls()
   local only_untracked_header_row = find_row(buf, "Unstaged changes (1)")
   trigger_normal_mapping("S", only_untracked_header_row)
-  assert_true(
-    vim.api.nvim_win_get_cursor(0)[1] == only_untracked_header_row,
-    "stage-all from the only unstaged new-file section moved the cursor row\n"
-      .. table.concat(status_lines(buf), "\n")
-  )
 
   reset_state({ modified = { ["codex/config.toml"] = true }, ignored = { ["codex/config.toml"] = true } })
   render_and_wait(buf, "codex")
@@ -1197,20 +1454,12 @@ local function run()
   reset_calls()
   local only_staged_header_row = find_row(buf, "Staged changes (2)")
   trigger_normal_mapping("U", only_staged_header_row)
-  assert_true(
-    vim.api.nvim_win_get_cursor(0)[1] == only_staged_header_row,
-    "unstage-all from the only staged section moved the cursor row\n" .. table.concat(status_lines(buf), "\n")
-  )
   assert_true(vim.wait(3000, function()
     return state.modified["header-unstage-a.txt"] and state.modified["header-unstage-b.txt"]
   end, 10), "unstage-all from section header did not finish\ncalls:\n" .. calls_text())
   wait_for(function()
-    return count_calls("systemlist_async", "\tdiff") > 0
+    return count_snapshot_diff_calls() > 0
   end, "unstage-all from section header did not reconcile")
-  assert_true(
-    cursor_line_text(buf):find("@@", 1, true) == nil,
-    "unstage-all from section header jumped to a hunk after reconcile\n" .. table.concat(status_lines(buf), "\n")
-  )
 
   reset_state({
     modified = { ["header-section-existing.txt"] = true },
@@ -1220,72 +1469,79 @@ local function run()
   reset_calls()
   local staged_with_unstaged_header_row = find_row(buf, "Staged changes (2)")
   trigger_normal_mapping("U", staged_with_unstaged_header_row)
-  assert_true(
-    cursor_line_text(buf):find("@@", 1, true) == nil,
-    "unstage-all from section header with existing destination moved cursor before reconcile\n"
-      .. table.concat(status_lines(buf), "\n")
-  )
   wait_for(function()
     return state.modified["header-section-a.txt"] and state.modified["header-section-b.txt"]
   end, "unstage-all from section header with existing destination did not finish")
   wait_for(function()
-    return count_calls("systemlist_async", "\tdiff") > 0
+    return count_snapshot_diff_calls() > 0
   end, "unstage-all from section header with existing destination did not reconcile")
-  assert_true(
-    cursor_line_text(buf):find("@@", 1, true) == nil,
-    "unstage-all from section header with existing destination moved cursor after reconcile\n"
-      .. table.concat(status_lines(buf), "\n")
-  )
 
   reset_state({ staged_added = { ["header-staged-added.txt"] = true } })
   render_and_wait(buf, "header-staged-added.txt +1 -0")
   reset_calls()
   local staged_added_header_row = find_row(buf, "Staged changes (1)")
   trigger_normal_mapping("U", staged_added_header_row)
-  assert_true(
-    vim.api.nvim_win_get_cursor(0)[1] == staged_added_header_row,
-    "unstage-all from staged added section moved cursor before reconcile\n"
-      .. table.concat(status_lines(buf), "\n")
-  )
   wait_for(function()
     return state.untracked["header-staged-added.txt"] == true
   end, "unstage-all from staged added section did not finish")
   wait_for(function()
-    return count_calls("systemlist_async", "\tdiff") > 0
+    return count_snapshot_diff_calls() > 0
   end, "unstage-all from staged added section did not reconcile")
+
+  reset_state({ staged_renamed = { ["rename-new.txt"] = "rename-old.txt" } })
+  render_and_wait(buf, "rename-new.txt")
+  reset_calls()
+  trigger_normal_mapping("U", find_row(buf, "rename-new.txt"))
+  wait_for(function()
+    return state.untracked["rename-new.txt"] and state.modified["rename-old.txt"]
+  end, "renamed-file unstage did not restore both paths")
+  wait_for(function() return not mutation_coordinator.pending(root) end, "renamed-file unstage did not synchronize")
   assert_true(
-    vim.api.nvim_win_get_cursor(0)[1] == staged_added_header_row,
-    "unstage-all from staged added section moved cursor after reconcile\n"
-      .. table.concat(status_lines(buf), "\n")
+    saw_system_call(
+      "git\t-C\t" .. root .. "\trestore\t--staged\t--\trename-new.txt\trename-old.txt"
+    ),
+    "renamed-file unstage did not pass both pathspecs\n" .. calls_text()
+  )
+  assert_true(
+    buffer_contains(buf, "rename-new.txt") and buffer_contains(buf, "rename-old.txt"),
+    "renamed-file unstage did not render the authoritative split paths"
+  )
+
+  reset_state({
+    staged_modified = { ["copy-source.txt"] = true },
+    staged_copied = { ["copy-destination.txt"] = "copy-source.txt" },
+  })
+  render_and_wait(buf, "copy-destination.txt")
+  reset_calls()
+  trigger_normal_mapping("U", find_row(buf, "copy-destination.txt"))
+  wait_for(function() return state.untracked["copy-destination.txt"] end, "copied-file unstage did not finish")
+  wait_for(function() return not mutation_coordinator.pending(root) end, "copied-file unstage did not synchronize")
+  assert_true(state.staged_modified["copy-source.txt"], "copied-file unstage changed the staged source")
+  assert_true(
+    saw_system_call(
+      "git\t-C\t" .. root .. "\trm\t--cached\t--ignore-unmatch\t--\tcopy-destination.txt"
+    ),
+    "copied-file unstage did not limit the pathspec to the destination\n" .. calls_text()
+  )
+  assert_true(
+    not calls_text():find("copy-destination.txt\tcopy-source.txt", 1, true),
+    "copied-file unstage included the source path\n" .. calls_text()
   )
 
   reset_state({ staged_modified = { ["header-file-unstage.txt"] = true } })
   render_and_wait(buf, "header-file-unstage.txt +1 -1")
   reset_calls()
   trigger_normal_mapping("U", find_row(buf, "header-file-unstage.txt +1 -1"))
-  assert_true(
-    cursor_line_text(buf):find("header-file-unstage.txt +1 -1", 1, true) ~= nil,
-    "unstage from file header did not keep cursor on the file row\n" .. table.concat(status_lines(buf), "\n")
-  )
   wait_for(function()
     return state.modified["header-file-unstage.txt"] == true
   end, "unstage from file header did not finish")
   wait_for(function()
-    return count_calls("systemlist_async", "\tdiff") > 0
+    return count_snapshot_diff_calls() > 0
   end, "unstage from file header did not reconcile")
-  assert_true(
-    cursor_line_text(buf):find("@@", 1, true) == nil,
-    "unstage from file header jumped to a hunk after reconcile\n" .. table.concat(status_lines(buf), "\n")
-  )
 
   reset_state({ modified = { ["merge-file.txt"] = true }, staged_modified = { ["merge-file.txt"] = true } })
   render_and_wait(buf, "merge-file.txt +1 -1")
   trigger_normal_mapping("U", find_row_after(buf, "merge-file.txt", find_row(buf, "merge-file.txt")))
-  assert_true(
-    cursor_line_text(buf):find("merge-file.txt", 1, true) ~= nil and cursor_line_text(buf):find("@@", 1, true) == nil,
-    "unstage from staged file header merged into existing file but cursor landed on a hunk\n"
-      .. table.concat(status_lines(buf), "\n")
-  )
   assert_true(
     count_lines_containing(buf, "merge-file.txt") == 1,
     "optimistic file unstage rendered duplicate file headings\n" .. table.concat(status_lines(buf), "\n")

@@ -18,7 +18,6 @@ vim.api.nvim_win_set_cursor(review_win, { 1, 0 })
 
 local entity = {
   action = "add",
-  entity_id = "geo_inspector",
   name = "GeoParquetInspector",
 }
 local model = {

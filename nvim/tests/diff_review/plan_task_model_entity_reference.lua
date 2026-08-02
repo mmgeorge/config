@@ -27,9 +27,10 @@ local ok, failure = pcall(function()
     "# Tests",
   }, working_path)
   write_json(vim.fs.joinpath(fixture_dir, "working.json"), {
+    plan_id = "plan",
+    version = 3,
     entity_changes = {
       {
-        entity_id = "entity_geo_parquet_inspector",
         action = "add",
         kind = "struct",
         name = "GeoParquetInspector",
@@ -37,7 +38,6 @@ local ok, failure = pcall(function()
         path = "hello/src/inspection.rs",
       },
       {
-        entity_id = "entity_inspection_report",
         action = "add",
         kind = "struct",
         name = "InspectionReport",
@@ -45,7 +45,6 @@ local ok, failure = pcall(function()
         path = "hello/src/inspection.rs",
       },
       {
-        entity_id = "entity_inspection_error",
         action = "add",
         kind = "enum",
         name = "InspectionError",
@@ -55,17 +54,14 @@ local ok, failure = pcall(function()
     },
     flows = {
       {
-        flow_id = "validation",
         steps = {
           {
-            step_id = "validate",
             target = {
               kind = "planned_entity",
-              entity = "entity_geo_parquet_inspector",
+              entity = "GeoParquetInspector",
             },
             edges = {
               {
-                edge_id = "call_validate",
                 relation = {
                   kind = "call",
                   callable = {
@@ -86,17 +82,14 @@ local ok, failure = pcall(function()
         },
       },
       {
-        flow_id = "metadata",
         steps = {
           {
-            step_id = "read",
             target = {
               kind = "planned_entity",
-              entity = "entity_geo_parquet_inspector",
+              entity = "GeoParquetInspector",
             },
             edges = {
               {
-                edge_id = "read_geoparquet_metadata",
                 relation = {
                   kind = "read",
                   callable = {
@@ -118,7 +111,6 @@ local ok, failure = pcall(function()
     },
     tasks = {
       {
-        task_id = "task_geo_parquet_inspection",
         title = "Own GeoParquet inspection through a typed report.",
         description = "",
         files = {
@@ -126,7 +118,6 @@ local ok, failure = pcall(function()
             path = "hello/src/inspection.rs",
             subtasks = {
               {
-                subtask_id = "subtask_inspection_boundary",
                 operation = "create",
                 description = "the inspector, report, and typed error boundary.",
                 entities = {
@@ -142,14 +133,14 @@ local ok, failure = pcall(function()
     },
   })
   write_json(vim.fs.joinpath(fixture_dir, "working.index.json"), {
+    plan_id = "plan",
+    plan_version = 3,
     anchor = {
       {
         line = 3,
+        json_path = "/flows/0/steps/0/edges/0",
         target = {
           target_type = "flow_edge",
-          flow_id = "validation",
-          step_id = "validate",
-          edge_id = "call_validate",
           callable_kind = "method",
           callable_name = "validate",
           reference_kind = "workspace_entity",
@@ -161,11 +152,9 @@ local ok, failure = pcall(function()
       },
       {
         line = 4,
+        json_path = "/flows/1/steps/0/edges/0",
         target = {
           target_type = "flow_edge",
-          flow_id = "metadata",
-          step_id = "read",
-          edge_id = "read_geoparquet_metadata",
           callable_kind = "method",
           callable_name = "geoparquet_metadata",
           reference_kind = "external_entity",
@@ -201,9 +190,7 @@ local ok, failure = pcall(function()
       assert(rustdoc_line:find("geoparquet_metadata", 1, true)) - 1
     ),
     {
-      flow_id = "metadata",
-      step_id = "read",
-      edge_id = "read_geoparquet_metadata",
+      json_path = "/flows/1/steps/0/edges/0",
       selection = "callable",
     }
   ), "external callable should resolve from the rendered external-entity anchor")
@@ -214,9 +201,7 @@ local ok, failure = pcall(function()
       assert(rustdoc_line:find("ParquetRecordBatchReaderBuilder", 1, true)) - 1
     ),
     {
-      flow_id = "metadata",
-      step_id = "read",
-      edge_id = "read_geoparquet_metadata",
+      json_path = "/flows/1/steps/0/edges/0",
       selection = "receiver",
     }
   ), "external receiver should resolve from the rendered external-entity anchor")
@@ -239,9 +224,7 @@ local ok, failure = pcall(function()
     end,
   }), "PlanReview ol should route an external callable to Rustdoc")
   assert(vim.deep_equal(requested_target, {
-    flow_id = "metadata",
-    step_id = "read",
-    edge_id = "read_geoparquet_metadata",
+    json_path = "/flows/1/steps/0/edges/0",
     selection = "callable",
     plan_id = "plan",
     expected_version = 3,

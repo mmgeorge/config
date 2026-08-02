@@ -98,14 +98,16 @@ diff_review/
 │       ├── state.lua           State lifecycle + per-buffer autocmd state machine + perf wrappers
 │       ├── status_buffer.lua   Accumulates lines/highlights/extmarks/folds into a per-buffer state
 │       ├── comment_box_rows.lua Owns compact comments as real status-buffer rows and resize records
-│       ├── status_render.lua   Full render pass: head + sections → buffer → extmarks → decoration provider
+│       ├── status_render.lua   Full render pass plus vim.diff-driven minimal buffer-line reconciliation
 │       ├── render_orchestrator.lua  Async git-root + load pipeline, PR-detail/PR-diff render passes
 │       ├── status_head.lua     Head/about lines (HEAD/merge/push rows, PR summary, section headings)
 │       ├── status_keys.lua     Stable identity keys for sections/files/hunks (fold + cache + action index)
 │       ├── status_helpers.lua  Shared helpers: notifications, git command building, branch creation, popups
 │       ├── status_debug.lua    Dev-only event log, perf timer, row/extmark/syntax inspection dump
 │       ├── status_issues.lua   `#`-issue completion + issue integration in the status buffer
-│       ├── section_map.lua     The section model: assemble + index sections/files/hunks, optimistic moves
+│       ├── section_map.lua     Pure section projection, path replacement, and semantic equivalence
+│       ├── operation_journal.lua Confirmed section baseline plus ordered optimistic mutation layers
+│       ├── status_sync.lua     Optimistic cache projection and path-scoped authoritative synchronization
 │       ├── section_builder.lua Build sections/files from diff text, attach review comments
 │       ├── fold_state.lua      Per-key fold map, native fold application, foldtext, resize refresh
 │       ├── size_gate.lua       Estimate render cost, decide which big files defer their body render
@@ -114,7 +116,7 @@ diff_review/
 │       ├── commit_view.lua     Commit-message editor, About view, create-PR/verdict/help popups, push/pull
 │       ├── window_options.lua  Window-local option overrides (number/fold/conceal/wrap) with restore
 │       ├── pr_state.lua        Async PR + AI-about lookup lifecycle with request-id race guards
-│       └── actions.lua         Stage/unstage/discard with the optimistic-move + reconcile queue
+│       └── actions.lua         Stage/unstage dispatch into the optimistic journal and index coordinator
 │
 ├── render/                   The shared diff render engine (pure + async, view-agnostic)
 │   ├── source.lua             Diff-source data model: registry, per-source/per-file state, lazy text loaders
@@ -139,14 +141,16 @@ diff_review/
 │   ├── row_tree.lua           Logical node tree (hunks/padding/annotations) kept in row-sync via layout
 │   ├── region.lua             Extmark-anchored buffer region with dirty tracking
 │   ├── annotations.lua        Review-comment model: by-anchor index + sync state machine + serial sync queue
-│   ├── mutation_queue.lua     Serial buffer-mutation queue with idle callbacks
 │   ├── decoration.lua         Decoration-provider cache for ephemeral per-row syntax highlights
 │   ├── text_snapshot.lua      Immutable byte-indexed text snapshot (line spans without copying lines)
 │   └── harness/              Interaction tree, tool, Markdown, queue, and node-local transaction renderers
 │
 ├── git/                      The Git data layer
 │   ├── git_backend.lua        Pluggable async process runner (vim.system or an injected test backend)
-│   ├── git_data.lua           Diff parsing, stage/unstage, item collection, async syntax compute
+│   ├── git_data.lua           Diff parsing, snapshot integration, session caching, async syntax compute
+│   ├── status_snapshot.lua     Full or path-scoped three-command authoritative status snapshot
+│   ├── index_mutation.lua      One semantic stage/unstage mutation with partial-success reporting
+│   ├── mutation_coordinator.lua Repository-root FIFO, burst debounce, settle, and failure recovery
 │   └── repo_config.lua        Per-repo .diffreview.json reader (branch_prefix) behind a test seam
 │
 ├── integrations/            External services
@@ -615,8 +619,6 @@ keep the cursor from stepping into that virtual gutter.
   state machine (`new`/`dirty`/`clean`/`deleted`/`conflict`), and a **serial sync queue**
   that drains dirty comments to the remote one at a time, rejecting stale completions by
   operation id.
-- **`mutation_queue.lua`** — a generic serial work queue for coordinated buffer edits
-  with idle callbacks.
 - **`decoration.lua`** — a `nvim_set_decoration_provider` cache for **ephemeral** per-row
   highlights computed at draw time (the alternative to baking every highlight into static
   extmarks; see the repo-root `architecture.md` for the full design).
@@ -642,26 +644,43 @@ file body ─► text_snapshot ─► syntax_context ◄─ syntax_engine (async
 
 ## 7. The status view (`views/status/`)
 
-`:GitStatus` is assembled from nineteen single-responsibility modules. The flow:
+`:GitStatus` is assembled from single-responsibility modules. The flow:
 
-**1. Collect.** `views/commands.open` creates/reuses the `GitStatus` buffer, attaches a
-state via `state.attach_status_state`, and kicks off `dr()._collect_items_from_git`
-(in `git_data.lua`). That fans out five parallel git queries — unstaged hunks, staged
-hunks, untracked files, and staged/unstaged name-status — parses each diff, synthesizes
-diffs for untracked files, orders hunks, and returns a flat item list.
+**1. Collect.** `views/commands.open` creates or reuses the `GitStatus` buffer, attaches
+a state through `state.attach_status_state`, and invokes the `status_snapshot.lua`
+collector through `git_data.lua`. One snapshot runs exactly three commands in parallel:
+
+- porcelain-v2 status with NUL records and all untracked files
+- a zero-context unstaged diff
+- a zero-context staged diff
+
+A full load passes an empty path list to cover the repository. Mutation verification
+passes only the affected root-relative paths through the same seam. The collector parses
+the three outputs into sections, source records, and staged/unstaged diff caches without
+starting a second Git reload. For untracked text files, the collector reads file bytes
+through a 16-read asynchronous libuv pool after the Git fan-in. Those reads add no Git
+commands, preserve CRLF and missing-final-newline semantics, and never block the render
+callback with `vim.fn.readfile`.
+
+Collection stays pure with respect to `session.file_diffs`, `session.file_hunk_staged`,
+and `session.untracked`. `render_orchestrator.lua` adopts a full snapshot only after the
+request ID, buffer validity, and pending-mutation gates accept that load. A pre-action
+full load can therefore finish late without overwriting the optimistic cache projection.
 
 **2. Build sections.** `section_builder.lua` turns diff text into the section/file/hunk
-tree, and `section_map.lua` owns that model: ordered sections keyed by name, get-or-insert
-files, append hunks, **optimistic stage/unstage moves**, and reindexing. `status_keys.lua`
-assigns each section/file/hunk a **stable identity key** so fold state, caches, and
-actions all index the same canonical key across re-renders.
+tree. `section_map.lua` owns pure projection, path replacement, and semantic equivalence.
+`operation_journal.lua` holds one confirmed section baseline plus ordered optimistic
+layers, which lets a new stage or unstage project over synchronization already in flight.
+`status_keys.lua` assigns each section/file/hunk a **stable identity key** so fold state,
+caches, and actions all index the same canonical key across renders.
 
 **3. Render.** `status_render.lua` runs the full pass: `status_head.lua` builds the
-head/about lines (HEAD/merge/push rows, branch summary), the sections render their files
-and hunks, `status_buffer.lua` accumulates lines/highlights/extmarks/folds into the
-state, the lines are written, extmarks applied, the cursor restored, and the decoration
-provider driven. `render_orchestrator.lua` wraps the async git-root + load pipeline and
-the PR-specific render passes.
+head/about lines, the sections render their files and hunks, and `status_buffer.lua`
+accumulates lines, highlights, extmarks, and folds. Buffer text reconciliation asks
+`vim.diff` for histogram indices, then applies disjoint edits from bottom to top so an
+unchanged prefix never gets rewritten. Extmarks and the decoration provider complete the
+pass. `render_orchestrator.lua` wraps the async git-root load and PR-specific render
+passes.
 
 **4. Fold and gate.** `fold_state.lua` owns the per-key fold map, native fold ranges,
 foldtext, materialized-entry state, and resize refresh. Initially collapsed files omit
@@ -675,11 +694,38 @@ and the render engine: it owns the per-file diff-source registry, commit source 
 git text loaders, and the layout build that `diff_render` consumes.
 
 **6. Navigate and act.** `entry_nav.lua` resolves the entry under the cursor, parent/file/
-hunk relationships, visual-selection entry sets, action targets, and decoration prewarm,
-and restores the cursor after a re-render. `actions.lua` applies stage/unstage/discard
-through an **optimistic-move + operation-queue + reconcile pipeline**: the UI moves the
-entry immediately, the git command runs async, and the result reconciles against the
-optimistic state — so staging feels instant and self-corrects if the command fails.
+hunk relationships, visual-selection entry sets, action targets, and decoration prewarm.
+For stage and unstage, `actions.lua` immediately appends an optimistic journal layer,
+projects the section and diff caches, and renders that projection. It then submits the
+Git index mutation to `mutation_coordinator.lua`, whose repository-root FIFO prevents
+`.git/index.lock` races across every status and diff buffer for that repository.
+
+After the FIFO drains, a **120 ms quiet window** closes the burst and `status_sync.lua`
+runs one path-scoped three-command snapshot for the union of affected paths. A matching
+snapshot retires the resolved journal layers without rendering the status buffer or
+writing an open diff buffer. A real mismatch replaces those paths from Git truth and
+performs one corrective render. Later optimistic layers replay over the new confirmed
+baseline, so verification never erases actions accepted during an earlier synchronization.
+If the authoritative read itself fails, synchronization retries that three-command
+attempt once after 120 ms before marking the projection stale. The normal path still
+runs one attempt, and a successful retry does not add a render when truth matches.
+
+Git-generated tracked hunk patches already express the canonical diff, including when
+the worktree uses CRLF or an idempotent clean filter, so stage and reverse-unstage leave
+worktree bytes untouched and normally match the projection. Whole-file `git add` for an
+untracked file crosses a different boundary. Git may normalize EOLs or run a clean filter
+while writing the index, which can make the authoritative staged diff differ from the raw
+synthetic untracked patch. That case receives the same single correction as a hunk split
+or merge. It does not count as a mutation failure.
+
+The first failed mutation cancels the queued tasks from that burst and notifies
+immediately. Successful Git writes that completed before the failure remain intact. One
+path snapshot then rebuilds actual Git truth and forces one recovery render. Stage and
+unstage never restore or move the cursor during optimistic, corrective, or recovery
+renders. If both bounded snapshot attempts fail, recovery marks verification stale,
+reverses the failed and cancelled projections, and retains only targets Git already
+reported complete. Discard follows its separate destructive flow and retains an explicit
+target.
 
 **Supporting:** `commit_view.lua` (commit editor, About view, create-PR/verdict/help
 popups, push/pull), `status_issues.lua` (`#`-issue completion), `status_debug.lua`
@@ -832,16 +878,41 @@ The diff-specific layer on top of the backend, and the busiest data module:
 
 - **Parse:** `parse_diff(output, staged)` → hunks with positions, context, counts.
   `order_file_hunks` sorts hunks so staging/unstaging folds in place.
-- **Mutate:** `stage_patch` / `unstage_patch` run `git apply --cached`; the `*_files`
-  variants batch per file.
-- **Synthesize:** `build_untracked_diff` reads an untracked file and wraps it as an
-  all-additions diff so new files show in the status like any other change.
+- **Integrate snapshots:** `collect_items_from_git(cwd, cb)` consumes one
+  `status_snapshot.collect_async` result and returns the flat section input plus the
+  typed snapshot without changing session caches. The accepted status orchestrator owns
+  full-cache adoption.
+- **Consume synthetic diffs:** production collection reads untracked bytes asynchronously
+  in `status_snapshot.lua`, then `git_data.lua` parses those all-additions diffs through
+  the same hunk path as tracked content.
 - **Compute syntax (async):** `compute_file_syntax_async` / `compute_diff_syntax_async` /
   `compute_hunk_context_async` create scratch buffers, parse with tree-sitter, and return
   `{ buf, tree, highlight_query }` — the producers behind the `syntax_engine` caches.
-- **Collect:** `collect_items_from_git(cwd, cb)` orchestrates the five parallel queries,
-  aggregates, caches context, optionally pre-renders previews, and returns the item list
-  that drives the status render.
+
+### Status snapshots and index mutations
+
+`status_snapshot.lua` owns the authoritative read seam. Each invocation starts exactly
+one porcelain-v2 status command, one zero-context unstaged diff, and one zero-context
+staged diff. A nonempty path list appends one shared pathspec to all three commands. An
+empty list produces the full status snapshot used for first load and explicit refresh.
+After those commands finish, untracked content loads through a bounded asynchronous filesystem
+reads and joins the same snapshot without another Git process. The collector distinguishes
+rename and copy records, preserves original paths, skips binary content, and represents
+missing final newlines in the synthesized patch.
+
+Rename and copy origins drive different mutation scopes. A rename includes both paths
+because the source disappears. A copy mutates and replaces only the destination because
+the source remains an independent tracked path. The section model retains that kind so
+unstaging a copy cannot unstage unrelated source changes.
+
+`index_mutation.lua` translates one semantic hunk, tracked-file, untracked-file, or
+added-file action into ordered Git commands. It stops at the first failure and reports
+the completed targets, which preserves partial success instead of pretending an entire
+batch rolled back.
+
+`mutation_coordinator.lua` serializes index writes per repository root, groups accepted
+tasks into quiet-window bursts, and delegates successful settle or failed recovery to
+`views/status/status_sync.lua`. Different repositories retain independent queues.
 
 ### `repo_config.lua`
 
@@ -954,11 +1025,16 @@ which is why `query_runtime` must run before any consumer.
 :GitStatus
   └─ views/commands.open
        ├─ create/reuse GitStatus buf, state.attach_status_state(buf, state)
-       ├─ git_data.collect_items_from_git(cwd)         (5 parallel git queries)
-       ├─ section_builder + section_map                (build the section tree)
+       ├─ status_snapshot.collect_async(cwd, {})
+       │    ├─ porcelain-v2 status -z --untracked-files=all
+       │    ├─ zero-context unstaged diff
+       │    └─ zero-context staged diff
+       ├─ git_data + section_builder + section_map     (cache + section tree)
+       ├─ operation_journal.reset                      (confirmed baseline)
        └─ status_render                                (head + sections → lines → extmarks)
             ├─ size_gate defers oversized file bodies
             ├─ fold_state applies native folds
+            ├─ vim.diff returns disjoint line indices applied bottom-up
             └─ diff_source_state + render/* paint expanded hunks
 ```
 
@@ -967,9 +1043,20 @@ which is why `query_runtime` must run before any consumer.
 ```
 cursor on a hunk, press the stage key
   └─ keymaps dispatch → actions.status_stage_entries
-       ├─ optimistic move: entry jumps to the staged section immediately
-       ├─ enqueue operation → git_data.stage_patch_async (git apply --cached)
-       └─ reconcile: on success keep the move, on failure revert + notify
+       ├─ operation_journal.append + cache projection
+       │    ├─ render the staged projection immediately
+       │    └─ never restore or move the cursor
+       ├─ mutation_coordinator.enqueue(root, task)
+       │    └─ repository FIFO → index_mutation → git apply --cached
+       └─ after FIFO idle + 120 ms quiet
+            └─ one path-scoped status_snapshot
+                 ├─ match → retire layer, perform no status or diff-buffer write
+                 ├─ mismatch → replace Git truth for the path, render once
+                 └─ failure → notify, cancel queued burst tasks, preserve completed
+                              Git writes, snapshot truth, force one recovery render
+
+Later accepted journal layers replay over any confirmed snapshot before the next task
+runs, so rapid stage and unstage actions never expose an intermediate backend frame.
 ```
 
 **Open a PR review**

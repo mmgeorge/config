@@ -3,6 +3,7 @@ vim.loader.enable(false)
 local diff_review = require("diff_review")
 local render_orchestrator = require("diff_review.views.status.render_orchestrator")
 local gh = require("diff_review.integrations.gh")
+local session = require("diff_review.session")
 local root = "D:/mock/project"
 
 local function assert_true(condition, message)
@@ -73,6 +74,23 @@ function backend.systemlist_async(command, cb)
   }
 end
 
+function backend.system_async(command, _, cb)
+  local request_generation = generation
+  local key = command_key(command)
+  local status_key = "git\t--no-optional-locks\t-C\t" .. root .. "\tstatus\t--porcelain=v2\t-z\t--untracked-files=all"
+  local unstaged_key = "git\t--no-optional-locks\t-C\t" .. root
+    .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0"
+  local staged_key = unstaged_key .. "\t--cached"
+  local code = (key == status_key or key == unstaged_key or key == staged_key) and 0 or 1
+  local output = ""
+  pending[#pending + 1] = {
+    generation = request_generation,
+    run = function()
+      cb({ code = code, stdout = output, stderr = "", output = output })
+    end,
+  }
+end
+
 local function flush(target_generation)
   local flushed = true
   while flushed do
@@ -113,10 +131,26 @@ local function run()
     return buffer_contains(buf, "second subject")
   end, 10), "second render did not complete")
 
+  session.file_diffs = { sentinel = "optimistic" }
+  session.file_hunk_staged = { sentinel = { true } }
+  session.untracked = { sentinel = "optimistic" }
+
   flush("first")
   vim.wait(50)
   assert_true(buffer_contains(buf, "second subject"), "stale first render replaced the second render")
   assert_true(not buffer_contains(buf, "first subject"), "stale first render became visible")
+  assert_true(
+    vim.deep_equal(session.file_diffs, { sentinel = "optimistic" }),
+    "stale first render replaced the accepted diff cache"
+  )
+  assert_true(
+    vim.deep_equal(session.file_hunk_staged, { sentinel = { true } }),
+    "stale first render replaced the accepted staged flags"
+  )
+  assert_true(
+    vim.deep_equal(session.untracked, { sentinel = "optimistic" }),
+    "stale first render replaced the accepted untracked cache"
+  )
 end
 
 local ok, err = xpcall(run, debug.traceback)

@@ -27,6 +27,7 @@ local function record(command)
   calls[#calls + 1] = command_key(command)
 end
 
+---@type DiffReviewGitBackend
 local git_backend = {}
 
 function git_backend.systemlist(command)
@@ -63,6 +64,34 @@ end
 function git_backend.systemlist_async(command, cb)
   local output, code = git_backend.systemlist(command)
   cb(output, code, "")
+end
+
+function git_backend.system_async(command, _, cb)
+  record(command)
+  local key = command_key(command)
+  local status_key = "git\t--no-optional-locks\t-C\t" .. root .. "\tstatus\t--porcelain=v2\t-z\t--untracked-files=all"
+  local unstaged_key = "git\t--no-optional-locks\t-C\t" .. root
+    .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0"
+  local output
+  if key == status_key then
+    output = "1 .M N... 100644 100644 100644 1111111 2222222 lua/diff_review/init.lua\0"
+  elseif key == unstaged_key then
+    output = table.concat({
+      "diff --git a/lua/diff_review/init.lua b/lua/diff_review/init.lua",
+      "--- a/lua/diff_review/init.lua",
+      "+++ b/lua/diff_review/init.lua",
+      "@@ -1 +1 @@",
+      "-old",
+      "+new",
+    }, "\n")
+  elseif key == unstaged_key .. "\t--cached" then
+    output = ""
+  else
+    local message = "unexpected git command: " .. key
+    cb({ code = 1, stdout = "", stderr = message, output = message })
+    return
+  end
+  cb({ code = 0, stdout = output, stderr = "", output = output })
 end
 
 local gh_backend = {}
