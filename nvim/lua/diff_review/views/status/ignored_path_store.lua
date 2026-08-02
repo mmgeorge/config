@@ -394,6 +394,21 @@ function M.contains(root, path)
   return normalized ~= nil and state_for_root(root).ignored_path_set[normalized] == true
 end
 
+--- Load and return the effective ignored path list for repository consumers.
+---@param root string
+---@param callback fun(path_list: string[]?)
+function M.paths_async(root, callback)
+  M.load_async(root, function(loaded)
+    if not loaded then
+      callback(nil)
+      return
+    end
+    local path_list = vim.tbl_keys(effective_path_set(state_for_root(root)))
+    table.sort(path_list)
+    callback(path_list)
+  end)
+end
+
 ---@param path? string
 function M.set_data_dir_for_test(path)
   data_dir_for_test = path

@@ -718,6 +718,9 @@ temporarily suppresses selected markers and submits ordinary whole-file stage ta
 so the existing optimistic journal moves them directly to Staged. Successful targets
 delete their markers after Git completes. Failed or cancelled targets retain their
 markers and reappear through the normal recovery snapshot, including partial batches.
+AI commit generation loads the same effective marker set and adds Git exclude pathspecs
+to both its context diff and fingerprint diff. Ignored-only edits therefore neither
+influence the generated message nor invalidate an otherwise reusable message.
 
 After the FIFO drains, a **120 ms quiet window** closes the burst and `status_sync.lua`
 runs one path-scoped three-command snapshot for the union of affected paths. A matching

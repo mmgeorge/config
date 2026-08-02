@@ -35,6 +35,9 @@ local M = {
   _request_id = 0,
 }
 
+-- ignored_path_store edge stays lazy because status projection reaches AI commit through pr_state.
+local function ignored_path_store() return require("diff_review.views.status.ignored_path_store") end
+
 local commit_context_limit = {
   stat = 12000,
   diff = 180000,
@@ -187,12 +190,22 @@ end
 ---@param cwd string
 ---@param ref string
 ---@return DiffReviewAICommitCommand
-local function diff_command(cwd, ref)
+---@param ignored_path_list? string[]
+---@param diff_option_list? string[]
+local function diff_command(cwd, ref, ignored_path_list, diff_option_list)
   local command = { "git", "-C", cwd, "diff", "--no-ext-diff", "--no-color" }
   if ref == "staged" then
     command[#command + 1] = "--staged"
   else
     command[#command + 1] = ref
+  end
+  vim.list_extend(command, diff_option_list or {})
+  if ignored_path_list and #ignored_path_list > 0 then
+    command[#command + 1] = "--"
+    command[#command + 1] = "."
+    for _, path in ipairs(ignored_path_list) do
+      command[#command + 1] = ":(exclude)" .. path
+    end
   end
   return command
 end
@@ -201,25 +214,29 @@ end
 ---@param ref string
 ---@param cb fun(fingerprint?: string)
 local function changes_fingerprint_async(cwd, ref, cb)
-  local command = diff_command(cwd, ref)
-  vim.list_extend(command, { "--stat", "--summary" })
-  systemlist_async(command, function(output, code)
-    if code ~= 0 then
+  ignored_path_store().paths_async(cwd, function(ignored_path_list)
+    if not ignored_path_list then
       cb(nil)
       return
     end
-    local text = vim.trim(table.concat(output or {}, "\n"))
-    cb(text ~= "" and text or nil)
+    local command = diff_command(cwd, ref, ignored_path_list, { "--stat", "--summary" })
+    systemlist_async(command, function(output, code)
+      if code ~= 0 then
+        cb(nil)
+        return
+      end
+      local text = vim.trim(table.concat(output or {}, "\n"))
+      cb(text ~= "" and text or nil, ignored_path_list)
+    end)
   end)
 end
 
 ---@param cwd string
 ---@param ref string
 ---@param cb fun(context?: string)
-local function build_commit_context_async(cwd, ref, cb)
-  local stat_command = diff_command(cwd, ref)
-  vim.list_extend(stat_command, { "--stat", "--summary" })
-  local raw_diff_command = diff_command(cwd, ref)
+local function build_commit_context_async(cwd, ref, ignored_path_list, cb)
+  local stat_command = diff_command(cwd, ref, ignored_path_list, { "--stat", "--summary" })
+  local raw_diff_command = diff_command(cwd, ref, ignored_path_list)
 
   systemlist_async(stat_command, function(stat_output, stat_code)
     if stat_code ~= 0 then
@@ -356,7 +373,7 @@ function M.ensure(cwd, opts, cb)
     return
   end
 
-  changes_fingerprint_async(cwd, ref, function(fingerprint)
+  changes_fingerprint_async(cwd, ref, function(fingerprint, ignored_path_list)
     if not fingerprint then
       local state = { state = "none", cwd = cwd, ref = ref, waiters = {} }
       set_state(cwd, ref, state)
@@ -406,7 +423,7 @@ function M.ensure(cwd, opts, cb)
     set_state(cwd, ref, state)
     if opts.on_start then pcall(opts.on_start, state) end
 
-    build_commit_context_async(cwd, ref, function(context)
+    build_commit_context_async(cwd, ref, ignored_path_list, function(context)
       if not (M._request_ids and M._request_ids[key] == request_id and get_state(cwd, ref) == state) then return end
       if not context then
         state.state = "none"
