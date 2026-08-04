@@ -219,7 +219,7 @@ return {
           ["rust-analyzer"] = {
             cargo = {
               features = "all",
-              targetDir = true,
+              -- targetDir = true,
             },
             check = {
               allTargets = true,

@@ -75,8 +75,11 @@ return {
 
           local spinner = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
           vim.notify(table.concat(msg, "\n"), "info", {
-            id = "lsp_progress",
+            id = ("lsp_progress_%d"):format(client.id),
             title = client.name,
+            keep = function()
+              return #progress[client.id] > 0
+            end,
             opts = function(notif)
               notif.icon = #progress[client.id] == 0 and " "
               or spinner[math.floor(vim.uv.hrtime() / (1e6 * 80)) % #spinner + 1]
@@ -739,19 +742,9 @@ return {
         },
       },
       styles = {
-        -- notification = {
-        --     border = false,
-        --     zindex = 100,
-        --     ft = "markdown",
-        --     wo = {
-        --       winblend = 5,
-        --       wrap = false,
-        --       conceallevel = 2,
-        --       colorcolumn = "",
-        --     },
-        --     bo = { filetype = "snacks_notif" },
-        --   }
-        -- wo = { wrap = true } -- Wrap notifications
+        notification = {
+          wo = { wrap = true },
+        },
         notification_history = {
           -- zindex = 100,
           width = 0.8,
