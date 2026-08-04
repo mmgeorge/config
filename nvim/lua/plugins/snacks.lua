@@ -743,7 +743,10 @@ return {
       },
       styles = {
         notification = {
-          wo = { wrap = true },
+          wo = {
+            wrap = true,
+            linebreak = true,
+          },
         },
         notification_history = {
           -- zindex = 100,
