@@ -724,13 +724,21 @@ fn render_flow_rows(
             row_list
         })
         .collect::<Vec<_>>();
-    let owner_column = row_group_list
+    let preferred_owner_column = row_group_list
         .iter()
         .flatten()
         .map(|row| row.content.chars().count())
         .max()
         .unwrap_or_default()
         + 4;
+    let widest_owner = row_group_list
+        .iter()
+        .flatten()
+        .filter_map(|row| row.path.as_ref())
+        .map(|path| path.chars().count() + 2)
+        .max()
+        .unwrap_or_default();
+    let owner_column = preferred_owner_column.min(PLAN_LINE_WIDTH.saturating_sub(widest_owner));
 
     for (group_index, row_group) in row_group_list.into_iter().enumerate() {
         for row in row_group {
@@ -985,7 +993,9 @@ fn push_owned_flow_line(
         return;
     };
     let owner = format!("[{path}]");
-    if owner_column + owner.chars().count() <= PLAN_LINE_WIDTH {
+    if content.chars().count() < owner_column
+        && owner_column + owner.chars().count() <= PLAN_LINE_WIDTH
+    {
         let mut line = pad_diagram_column(&content, owner_column);
         line.push_str(&owner);
         renderer.push(line, target, json_path, None, label);
@@ -2802,6 +2812,70 @@ mod test {
         assert_eq!(
             diagram,
             format!("*PlanDocument — {action}\n    [src/plan.rs]\n└─ Emit to terminal")
+        );
+        assert!(
+            diagram
+                .lines()
+                .all(|line| line.chars().count() <= PLAN_LINE_WIDTH)
+        );
+    }
+
+    #[test]
+    fn keeps_short_flow_owners_inline_when_a_sibling_action_is_wide() {
+        let mut document = test_fixture("plan", "Overview");
+        let owner_path = "hello/src/inspection.rs";
+        document.entity_changes[0].path = owner_path.into();
+        document.tasks[0].files[0].change = PlanFileChange::Add {
+            path: owner_path.into(),
+        };
+        let step = |action: &str| PlanFlowStep {
+            action: action.into(),
+            target: EntityReference::PlannedEntity {
+                entity: "PlanDocument".into(),
+            },
+            edges: vec![PlanFlowEdge {
+                relation: PlanFlowRelation::Emit,
+                target: EntityReference::ExternalEntity {
+                    entity_kind: ReferencedEntityKind::Endpoint,
+                    name: "terminal".into(),
+                    dependency: None,
+                },
+                expansion: Vec::new(),
+                result: None,
+            }],
+            branches: Vec::new(),
+        };
+        let wide_action =
+            "Read a deliberately wide observation that consumes the diagram line width";
+        let short_action = "Load and parse the Parquet footer";
+        document.flows[0].steps = vec![step(wide_action), step(short_action)];
+
+        let rendered = render_plan(&document).unwrap();
+        let diagram = rendered
+            .markdown
+            .split("## Code flow: Execution")
+            .nth(1)
+            .expect("flow section")
+            .split("```text\n")
+            .nth(1)
+            .expect("flow fence")
+            .split("\n```")
+            .next()
+            .expect("flow diagram");
+        let owner = format!("[{owner_path}]");
+        let short_line = diagram
+            .lines()
+            .find(|line| line.contains(short_action))
+            .expect("short owned action");
+
+        assert!(short_line.ends_with(&owner));
+        assert_eq!(
+            diagram
+                .lines()
+                .filter(|line| line.trim_start() == owner)
+                .count(),
+            1,
+            "only the genuinely overlapping owner should move below its action"
         );
         assert!(
             diagram

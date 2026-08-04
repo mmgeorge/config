@@ -1610,8 +1610,9 @@ their recorded declaration, and external Rust references resolve exact-version R
 Steps, edges, branches, and results remain in the left column while repository-relative paths for
 planned and workspace entities align in one calculated right column. External participants remain
 in the relationship text because their names identify runtime receivers rather than source locations.
-When a source path cannot fit beside its action within 100 columns, it moves to one indented
-physical line beneath that action without truncation. Every execution-tree level uses `├─` and
+The column reserves space for the longest owner path, so one wide action cannot force unrelated
+short owners onto separate lines. When one row still overlaps that reserved column, its source path
+moves to one indented physical line beneath the action without truncation. Every execution-tree level uses `├─` and
 `└─`, and non-final ancestors carry `│` through nested expansions, branches, and results. Top-level
 step order controls reviewer presentation only. Explicit edges, expansions, and branches carry
 runtime meaning.
