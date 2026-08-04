@@ -18,7 +18,7 @@
       "default_tools_approval_mode": "approve"
     },
     "google-dev-knowledge": {
-      "targets": ["claudecode", "codexcli", "antigravity-cli"],
+      "targets": ["claudecode", "codexcli", "antigravity-cli", "copilotcli"],
       "type": "http",
       "url": "https://developerknowledge.googleapis.com/mcp",
       "default_tools_approval_mode": "approve",
@@ -35,7 +35,7 @@
       ],
       "default_tools_approval_mode": "approve"
     },
-    "github-enterprise": {
+    "github-enterprise-mcp-server": {
       "targets": ["copilotcli"],
       "command": "github-mcp-server",
       "args": [
@@ -48,8 +48,8 @@
       },
       "default_tools_approval_mode": "approve"
     },
-    "github": {
-      "targets": ["claudecode", "codexcli", "antigravity-cli", "copilotcli"],
+    "github-mcp-server": {
+      "targets": ["claudecode", "codexcli", "antigravity-cli"],
       "command": "github-mcp-server",
       "args": [
         "stdio",

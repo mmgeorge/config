@@ -150,7 +150,7 @@ def --wrapped co [...args] {
         --deny-tool 'shell(azcopy:*)'
         --deny-tool 'shell(python)'
         --deny-tool 'shell(python:*)'
-        --disable-builtin-mcps
+        # --disable-builtin-mcps
         # --allow-all-urls
         # --add-dir '/Users/matt9222/Developer/agents'
         # --add-dir '/Users/matt9222/config/copilot/.github/instructions'
