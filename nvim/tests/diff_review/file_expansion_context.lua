@@ -1,6 +1,7 @@
 local render_orchestrator = require("diff_review.views.status.render_orchestrator")
 local status_render = require("diff_review.views.status.status_render")
 local git_data = require("diff_review.git.git_data")
+local file_body = require("diff_review.git.file_body")
 local syntax_engine = require("diff_review.render.syntax_engine")
 local session = require("diff_review.session")
 
@@ -101,6 +102,64 @@ local function run()
 
     vim.api.nvim_buf_delete(buf, { force = true })
   end)
+
+  local original_diff_hunks_for_file = render_orchestrator.diff_hunks_for_file
+  local original_load_async = file_body.load_async
+  local pending_body_callback = nil
+  local load_count = 0
+  render_orchestrator.diff_hunks_for_file = function(file) return file.hunks or {} end
+  file_body.load_async = function(_, _, callback)
+    load_count = load_count + 1
+    pending_body_callback = callback
+  end
+
+  local buf = vim.api.nvim_create_buf(false, true)
+  local file = {
+    filename = "D:/tmp/added.rs",
+    relpath = "added.rs",
+    section_name = "staged",
+    added = 1,
+    removed = 0,
+    hunks = {},
+    untracked = false,
+    status = "A.",
+    git_status = "A",
+    preview_state = "unloaded",
+    preview_source = "index_added",
+    line_stats_complete = true,
+  }
+  local state = {
+    buf = buf,
+    cwd = "D:/tmp",
+    view_kind = "status",
+    sections = { { files = { file } } },
+  }
+  session.status = state
+  session.states[buf] = state
+  session.file_diffs = {}
+  session.file_hunk_staged = {}
+  local ready_count = 0
+  local entry = { id = "file:staged:D:/tmp/added.rs", kind = "file", file = file }
+
+  assert_true(status_render.status_prepare_file_expansion_context(entry, state, function() ready_count = ready_count + 1 end), "lazy body load did not defer expansion")
+  assert_true(status_render.status_prepare_file_expansion_context(entry, state, function() ready_count = ready_count + 1 end), "duplicate lazy body load did not remain deferred")
+  assert_true(load_count == 1, "duplicate expansion started more than one body load")
+  pending_body_callback({
+    state = "loaded",
+    hunks = {},
+    diff = false,
+    added = 2,
+    removed = 0,
+    line_stats_complete = true,
+    binary = false,
+  })
+  wait_for(function() return ready_count == 1 end, "latest expansion did not resume after lazy body load")
+  assert_true(file.preview_state == "loaded", "lazy body result did not update the canonical file")
+  assert_true(file.added == 2, "lazy body result did not replace compact startup stats")
+
+  vim.api.nvim_buf_delete(buf, { force = true })
+  render_orchestrator.diff_hunks_for_file = original_diff_hunks_for_file
+  file_body.load_async = original_load_async
 end
 
 run()

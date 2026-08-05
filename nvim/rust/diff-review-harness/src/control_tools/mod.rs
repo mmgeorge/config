@@ -774,69 +774,59 @@ mod test {
                     "add": [{
                         "title": "Draft persistence",
                         "description": "Persist independent draft observations.",
-                        "steps": [{
-                            "action": "Read draft observations",
-                            "target": {
-                                "kind": "planned_entity",
-                                "entity": "DraftCache"
+                        "source": {
+                            "kind": "planned_entity",
+                            "entity": "DraftCache"
+                        },
+                        "edges": [
+                            {
+                                "relation": "call",
+                                "callable": {
+                                    "kind": "method",
+                                    "name": "schedule"
+                                },
+                                "target": {
+                                    "kind": "workspace_entity",
+                                    "entity_kind": "type",
+                                    "name": "RetryScheduler",
+                                    "path": "src/scheduler.rs",
+                                    "line": 42
+                                },
+                                "expansion": [],
+                                "branches": []
                             },
-                            "edges": [
-                                {
-                                    "relation": {
-                                        "kind": "call",
-                                        "callable": {
-                                            "kind": "method",
-                                            "name": "schedule"
-                                        }
-                                    },
-                                    "target": {
-                                        "kind": "workspace_entity",
-                                        "entity_kind": "type",
-                                        "name": "RetryScheduler",
-                                        "path": "src/scheduler.rs",
-                                        "line": 42
-                                    },
-                                    "expansion": [],
-                                    "result": null
+                            {
+                                "relation": "read",
+                                "callable": {
+                                    "kind": "method",
+                                    "name": "pending"
                                 },
-                                {
-                                    "relation": {
-                                        "kind": "read",
-                                        "callable": {
-                                            "kind": "method",
-                                            "name": "pending"
-                                        }
-                                    },
-                                    "target": {
-                                        "kind": "planned_entity",
-                                        "entity": "DraftCache"
-                                    },
-                                    "expansion": [],
-                                    "result": {
-                                        "kind": "type",
-                                        "name": "DraftChange[]"
-                                    }
+                                "target": {
+                                    "kind": "planned_entity",
+                                    "entity": "DraftCache"
                                 },
-                                {
-                                    "relation": {
-                                        "kind": "write",
-                                        "callable": {
-                                            "kind": "method",
-                                            "name": "persist"
-                                        }
-                                    },
-                                    "target": {
-                                        "kind": "external_entity",
-                                        "entity_kind": "type",
-                                        "name": "DraftStore",
-                                        "dependency": null
-                                    },
-                                    "expansion": [],
-                                    "result": null
-                                }
-                            ],
-                            "branches": []
-                        }]
+                                "return_type": {
+                                    "value_type": "DraftChange[]"
+                                },
+                                "expansion": [],
+                                "branches": []
+                            },
+                            {
+                                "relation": "write",
+                                "callable": {
+                                    "kind": "method",
+                                    "name": "persist"
+                                },
+                                "target": {
+                                    "kind": "external_entity",
+                                    "entity_kind": "type",
+                                    "name": "DraftStore",
+                                    "dependency": null
+                                },
+                                "expansion": [],
+                                "branches": []
+                            }
+                        ]
                     }]
                 },
                 "tasks": {
@@ -893,18 +883,13 @@ mod test {
         let dependency = &request.mutation.dependencies.as_ref().unwrap().add[0];
         assert_eq!(dependency.name, "tokio");
         assert_eq!(dependency.version, "1");
-        let edge_list = &request.mutation.flows.as_ref().unwrap().add[0].steps[0].edges;
+        let edge_list = &request.mutation.flows.as_ref().unwrap().add[0].edges;
         assert_eq!(edge_list.len(), 3);
-        assert!(matches!(
-            &edge_list[1].relation,
-            PlanFlowRelation::Read { callable }
-                if callable.kind == PlanCallableKind::Method && callable.name == "pending"
-        ));
+        assert!(matches!(&edge_list[1].relation, PlanFlowRelation::Read));
+        assert_eq!(edge_list[1].callable.as_ref().unwrap().name, "pending");
         assert_eq!(
-            edge_list[1].result,
-            Some(PlanFlowValue::Type {
-                name: "DraftChange[]".into()
-            })
+            edge_list[1].return_type.as_ref().unwrap().value_type,
+            "DraftChange[]"
         );
         assert!(matches!(
             &edge_list[0].target,
@@ -915,7 +900,7 @@ mod test {
                 line: 42,
             } if name == "RetryScheduler" && path == "src/scheduler.rs"
         ));
-        assert_eq!(edge_list[2].result, None);
+        assert_eq!(edge_list[2].return_type, None);
         assert_eq!(
             request.mutation.plan.as_ref().unwrap().modify.usage,
             PatchField::Value(PlanUsage {
@@ -1011,8 +996,16 @@ mod test {
                     "add": [{
                         "title": "Reader",
                         "description": "Read input.",
-                        "steps": [{
-                            "action": "Read",
+                        "source": {
+                            "kind": "planned_entity",
+                            "entity": "Reader"
+                        },
+                        "edges": [{
+                            "relation": "read",
+                            "callable": {
+                                "kind": "method",
+                                "name": "load"
+                            },
                             "target": { "entity": "reader" }
                         }]
                     }]
@@ -1025,7 +1018,7 @@ mod test {
         );
 
         assert!(
-            error.contains("flows.add[0].steps[0].target"),
+            error.contains("flows.add[0].edges[0].target"),
             "unexpected error: {error}"
         );
         assert!(error.contains("kind"));
@@ -1116,47 +1109,24 @@ mod test {
     }
 
     #[test]
-    fn reports_invalid_emit_payloads_with_the_emit_shape_and_result_hint() {
-        for unexpected_field in ["event", "effect"] {
-            let violation_list = relation_violation_list(json!({
-                "kind": "emit",
-                (unexpected_field): "diagnostic written"
-            }));
-
-            assert_eq!(violation_list.len(), 1);
-            let violation = &violation_list[0];
-            assert_eq!(violation.path, unexpected_field);
-            assert_eq!(violation.code, "unknown_field");
-            assert_eq!(
-                violation.expected_shape,
-                Some(json!({ "allowed_fields": ["kind"] }))
-            );
-            assert_eq!(
-                violation.hint.as_deref(),
-                Some(
-                    "Produces an observable effect at the target. The relation contains only kind; describe the produced effect in the edge result."
-                )
-            );
+    fn accepts_each_typed_relation_string() {
+        for relation in [
+            "construct",
+            "call",
+            "read",
+            "write",
+            "send",
+            "emit",
+            "return",
+        ] {
+            assert!(relation_violation_list(json!(relation)).is_empty());
         }
     }
 
     #[test]
-    fn reports_missing_fields_from_the_selected_relation_variant() {
-        let send_violation_list = relation_violation_list(json!({ "kind": "send" }));
-        assert_eq!(send_violation_list.len(), 1);
-        assert_eq!(send_violation_list[0].code, "missing_field");
-        assert_eq!(
-            send_violation_list[0].expected_shape,
-            Some(json!({ "required": ["event"] }))
-        );
-
-        let call_violation_list = relation_violation_list(json!({ "kind": "call" }));
-        assert_eq!(call_violation_list.len(), 1);
-        assert_eq!(call_violation_list[0].code, "missing_field");
-        assert_eq!(
-            call_violation_list[0].expected_shape,
-            Some(json!({ "required": ["callable"] }))
-        );
+    fn rejects_legacy_relation_objects() {
+        assert!(!relation_violation_list(json!({ "kind": "call" })).is_empty());
+        assert!(!relation_violation_list(json!("dispatch")).is_empty());
     }
 
     #[test]
@@ -1190,8 +1160,8 @@ mod test {
             Some(&json!("string"))
         );
         assert_eq!(
-            schema.pointer("/definitions/PlanFlow/properties/steps/items/$ref"),
-            Some(&json!("#/definitions/PlanFlowStep"))
+            schema.pointer("/definitions/PlanFlow/properties/source/$ref"),
+            Some(&json!("#/definitions/EntityReference"))
         );
         assert!(schema.pointer("/properties/entity_changes").is_none());
         assert!(
@@ -1392,30 +1362,24 @@ mod test {
                     "flows": [{
                         "title": "Draft persistence",
                         "description": "Persist draft observations.",
-                        "steps": [{
-                            "action": "Read draft observations",
+                        "source": {
+                            "kind": "planned_entity",
+                            "entity": "DraftCache"
+                        },
+                        "edges": [{
+                            "relation": "read",
+                            "callable": {
+                                "kind": "method",
+                                "name": "pending"
+                            },
                             "target": {
                                 "kind": "planned_entity",
                                 "entity": "DraftCache"
                             },
-                            "edges": [{
-                                "relation": {
-                                    "kind": "read",
-                                    "callable": {
-                                        "kind": "method",
-                                        "name": "pending"
-                                    }
-                                },
-                                "target": {
-                                    "kind": "planned_entity",
-                                    "entity": "DraftCache"
-                                },
-                                "expansion": [],
-                                "result": {
-                                    "kind": "type",
-                                    "name": "DraftChange[]"
-                                }
-                            }],
+                            "return_type": {
+                                "value_type": "DraftChange[]"
+                            },
+                            "expansion": [],
                             "branches": []
                         }]
                     }]
@@ -1433,7 +1397,7 @@ mod test {
         assert_eq!(entity.name, "DraftCache");
         assert_eq!(entity.members[0].name, "store");
         let flow = &set.flows.as_ref().unwrap()[0];
-        assert_eq!(flow.steps[0].edges.len(), 1);
+        assert_eq!(flow.edges.len(), 1);
         assert_eq!(
             request.mutation.plan.as_ref().unwrap().usage,
             PatchField::Value(PlanUsage {
@@ -1456,7 +1420,8 @@ mod test {
                     "value": {
                         "title": "Legacy flow",
                         "description": "Uses the removed operation envelope.",
-                        "steps": []
+                        "source": { "kind": "planned_entity", "entity": "Reader" },
+                        "edges": []
                     }
                 }]
             }),
@@ -1494,7 +1459,8 @@ mod test {
                         "value": {
                             "title": "Draft persistence",
                             "description": "Persist draft observations.",
-                            "steps": []
+                            "source": { "kind": "planned_entity", "entity": "DraftCache" },
+                            "edges": []
                         }
                     }]
                 }
@@ -1646,12 +1612,8 @@ mod test {
                     "flows": [{
                         "title": "Reader",
                         "description": "Read input.",
-                        "steps": [{
-                            "action": "Read",
-                            "target": { "entity": "reader" },
-                            "edges": [],
-                            "branches": []
-                        }]
+                        "source": { "entity": "reader" },
+                        "edges": []
                     }]
                 }
             }),

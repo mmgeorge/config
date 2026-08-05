@@ -255,10 +255,10 @@ M.new_harness_session = function() require("diff_review.views.harness").new_sess
 M.set_git_backend = git_backend.set_backend
 M.reset_git_backend = git_backend.reset_backend
 
---- Resolve the gitstatus debug log path. Kept on init as a dev/test override seam: tests swap
+--- Resolve the GitStatus debug log path. Kept on init as a dev/test override seam: tests swap
 --- M._gitstatus_debug_log_path to redirect the log file, and views/status/status_debug.lua reads
---- the debug flags (_gitstatus_debug_force / _gitstatus_debug_enabled / _gitstatus_debug_perf_*)
---- that also live on M. This is the one intentional require("diff_review") seam left in the tree.
+--- the debug flags (_gitstatus_debug_force / _gitstatus_debug_enabled) that also live on M. This
+--- is the one intentional require("diff_review") seam left in the tree.
 ---@return string
 function M._gitstatus_debug_log_path()
   if M._gitstatus_debug_log_file then return M._gitstatus_debug_log_file end

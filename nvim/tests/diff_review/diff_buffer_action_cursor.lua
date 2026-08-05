@@ -78,7 +78,7 @@ function backend.system_async(command, input, callback)
   elseif command_has(command, "diff") then
     snapshot_command_list[#snapshot_command_list + 1] = vim.deepcopy(command)
     local requests_staged = command_has(command, "--cached")
-    if requests_staged == authoritative_staged then stdout = diff_text end
+    if not command_has(command, "--numstat") and requests_staged == authoritative_staged then stdout = diff_text end
   else
     error("unexpected Git command: " .. table.concat(command, " "))
   end
@@ -93,9 +93,10 @@ local function assert_path_snapshot(first_snapshot_index)
   local status_count = 0
   local unstaged_diff_count = 0
   local staged_diff_count = 0
-  for snapshot_index = first_snapshot_index, first_snapshot_index + 2 do
+  local numstat_count = 0
+  for snapshot_index = first_snapshot_index, first_snapshot_index + 4 do
     local command = snapshot_command_list[snapshot_index]
-    assert_true(command ~= nil, "stage/unstage must collect all three snapshot commands")
+    assert_true(command ~= nil, "stage/unstage must collect all five snapshot commands")
     local separator_index = path_separator_index(command)
     assert_true(separator_index ~= nil, "snapshot command must contain a literal pathspec separator")
     assert_equals(command[separator_index + 1], relative_path, "snapshot command must scope Git to the affected path")
@@ -104,6 +105,8 @@ local function assert_path_snapshot(first_snapshot_index)
     if command_has(command, "status") then
       status_count = status_count + 1
       assert_true(command_has(command, "--porcelain=v2"), "snapshot status must use porcelain v2")
+    elseif command_has(command, "--numstat") then
+      numstat_count = numstat_count + 1
     elseif command_has(command, "--cached") then
       staged_diff_count = staged_diff_count + 1
     else
@@ -113,6 +116,7 @@ local function assert_path_snapshot(first_snapshot_index)
   assert_equals(status_count, 1, "snapshot must issue one status command")
   assert_equals(unstaged_diff_count, 1, "snapshot must issue one unstaged diff command")
   assert_equals(staged_diff_count, 1, "snapshot must issue one staged diff command")
+  assert_equals(numstat_count, 2, "snapshot must issue two added-file numstat commands")
 end
 
 ---@param mapping table
@@ -132,7 +136,7 @@ local function run_cursor_action(mapping, expected_staged, action_label)
   local action_ok, action_error = xpcall(function()
     mapping.callback()
     assert_true(vim.wait(3000, function()
-      return #snapshot_command_list == snapshot_count_before + 3 and not mutation_coordinator.pending(root)
+      return #snapshot_command_list == snapshot_count_before + 5 and not mutation_coordinator.pending(root)
     end, 10), action_label .. " synchronization timed out")
   end, debug.traceback)
   vim.api.nvim_win_set_cursor = original_set_cursor
@@ -141,7 +145,7 @@ local function run_cursor_action(mapping, expected_staged, action_label)
   assert_equals(cursor_move_count, 0, action_label .. " must not call cursor movement APIs")
   assert_equals(vim.api.nvim_win_get_cursor(0)[1], cursor_line_before, action_label .. " must leave the cursor in place")
   assert_equals(#mutation_command_list, mutation_count_before + 1, action_label .. " must issue one index mutation")
-  assert_equals(#snapshot_command_list, snapshot_count_before + 3, action_label .. " must settle with exactly three Git reads")
+  assert_equals(#snapshot_command_list, snapshot_count_before + 5, action_label .. " must settle with exactly five Git reads")
   assert_path_snapshot(snapshot_count_before + 1)
 
   local staged_flag_list = session.file_hunk_staged[filename]

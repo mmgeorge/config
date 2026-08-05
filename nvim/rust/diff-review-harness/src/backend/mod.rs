@@ -30,7 +30,7 @@ Model each changed program construct once as an entity_change with its lifecycle
 
 Flow targets use tagged planned_entity, workspace_entity, or typed external_entity references. Use workspace_entity only for an unchanged repository construct and provide its entity kind, name, repository-relative path, and one-indexed declaration line. Call, read, and write relations use a structured function or method callable with a bare identifier, and construct, call, read, and write always target one type entity.
 
-Trace every dependency's claimed role into concrete plan content. Show dependencies whose APIs perform domain work through typed external flow edges, and name the owning entity plus integration mechanism for runtime, derive, build, or test support that does not belong in a runtime flow. Before naming an external Rust callable, verify it against current documentation or source for the exact dependency version. If verification cannot establish the API, keep the boundary behind a planned entity, describe its concrete work through nested steps, and name the dependency responsibility in the owning entity or task instead of replacing the work with a vague step.
+Trace every dependency's claimed role into concrete plan content. Show dependencies whose APIs perform domain work through typed external flow edges, and name the owning entity plus integration mechanism for runtime, derive, build, or test support that does not belong in a runtime flow. Before naming an external Rust callable, verify it against current documentation or source for the exact dependency version. If verification cannot establish the API, keep the boundary behind a planned entity, describe its concrete work through nested edges, and name the dependency responsibility in the owning entity or task instead of replacing the work with vague prose.
 
 Every failed control call returns one JSON object with ok false, a stable code, exact violation paths, correction hints, and retry data. Parse that object, correct every violation in one edit, and use retry.expected_version when present. A planning turn must end with harness_question_ask or a successful harness_plan_submit after required edits.
 
@@ -638,24 +638,21 @@ impl Backend for MockBackend {
                     flows: Some(vec![crate::plan::PlanFlow {
                             title: "Requested change".into(),
                             description: "Start from the requested change and produce its observable result. Keep implementation ownership explicit at the changed entity boundary.".into(),
-                            steps: vec![crate::plan::PlanFlowStep {
-                                action: "Implement requested change".into(),
-                                target: crate::plan::EntityReference::PlannedEntity {
-                                    entity: "requested_change".into(),
-                                },
-                                edges: vec![crate::plan::PlanFlowEdge {
+                            source: crate::plan::EntityReference::PlannedEntity {
+                                entity: "requested_change".into(),
+                            },
+                            edges: vec![crate::plan::PlanFlowEdge {
                                     relation: crate::plan::PlanFlowRelation::Emit,
                                     target: crate::plan::EntityReference::ExternalEntity {
                                         entity_kind: crate::plan::ReferencedEntityKind::Endpoint,
                                         name: "requested outcome".into(),
                                         dependency: None,
                                     },
+                                    callable: None,
+                                    payload_type: Some("completed change".into()),
+                                    return_type: None,
                                     expansion: Vec::new(),
-                                    result: Some(crate::plan::PlanFlowValue::Text {
-                                        text: "completed change".into(),
-                                    }),
-                                }],
-                                branches: Vec::new(),
+                                    branches: Vec::new(),
                             }],
                     }]),
                     tasks: Some(vec![crate::plan::PlanTask {

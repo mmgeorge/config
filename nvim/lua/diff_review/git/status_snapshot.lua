@@ -1,5 +1,5 @@
---- Collects authoritative path-scoped Git status and diff state for idle reconciliation,
---- keeping every replacement source in one three-command snapshot.
+--- Collects authoritative path-scoped Git status and preview metadata for status rendering,
+--- keeping every replacement source in one atomic snapshot.
 
 local git_backend = require("diff_review.git.git_backend")
 local git_data = require("diff_review.git.git_data")
@@ -7,7 +7,19 @@ local paths = require("diff_review.infra.paths")
 local untracked_read_limit = 16
 
 ---@alias DiffReviewPathStatusKind "ordinary"|"renamed"|"copied"|"unmerged"|"untracked"
----@alias DiffReviewPathStatusSnapshotSource "status"|"unstaged_diff"|"staged_diff"
+---@alias DiffReviewPathStatusSnapshotSource "status"|"unstaged_diff"|"staged_diff"|"unstaged_added_numstat"|"staged_added_numstat"
+---@alias DiffReviewPreviewState "loaded"|"unloaded"|"loading"|"omitted"|"error"
+---@alias DiffReviewPreviewSource "diff"|"worktree_added"|"index_added"|"index_deleted"|"head_deleted"
+
+---@class DiffReviewPathPreview
+---@field state DiffReviewPreviewState
+---@field source DiffReviewPreviewSource
+---@field added integer
+---@field removed integer
+---@field line_stats_complete boolean
+---@field binary boolean
+---@field oid? string
+---@field mode? string
 
 ---@class DiffReviewPathStatusRecord
 ---@field kind DiffReviewPathStatusKind
@@ -18,6 +30,11 @@ local untracked_read_limit = 16
 ---@field worktree_status string porcelain v2 worktree status code
 ---@field submodule? string porcelain v2 submodule state
 ---@field score? string porcelain v2 rename or copy score
+---@field head_mode? string
+---@field index_mode? string
+---@field worktree_mode? string
+---@field head_oid? string
+---@field index_oid? string
 ---@field staged boolean
 ---@field unstaged boolean
 ---@field untracked boolean
@@ -37,6 +54,8 @@ local untracked_read_limit = 16
 ---@field staged_diff string|false
 ---@field combined_diff string|false
 ---@field staged_flag_list? boolean[]
+---@field unstaged_preview DiffReviewPathPreview
+---@field staged_preview DiffReviewPathPreview
 
 ---@class DiffReviewPathStatusCommandFailure
 ---@field source DiffReviewPathStatusSnapshotSource
@@ -71,6 +90,8 @@ local untracked_read_limit = 16
 ---@field status_output string
 ---@field unstaged_output string
 ---@field staged_output string
+---@field unstaged_added_numstat_output string
+---@field staged_added_numstat_output string
 
 ---@class DiffReviewPathStatusSnapshotModule
 local M = {}
@@ -183,7 +204,8 @@ end
 ---@param original_path? string
 ---@param score? string
 ---@return DiffReviewPathStatusRecord
-local function status_record(kind, path, xy, submodule, original_path, score)
+local function status_record(kind, path, xy, submodule, original_path, score, metadata)
+  metadata = metadata or {}
   local index_status = xy:sub(1, 1)
   local worktree_status = xy:sub(2, 2)
   local untracked = kind == "untracked"
@@ -199,6 +221,11 @@ local function status_record(kind, path, xy, submodule, original_path, score)
     worktree_status = worktree_status,
     submodule = submodule,
     score = score,
+    head_mode = metadata.head_mode,
+    index_mode = metadata.index_mode,
+    worktree_mode = metadata.worktree_mode,
+    head_oid = metadata.head_oid,
+    index_oid = metadata.index_oid,
     staged = not untracked and index_status ~= ".",
     unstaged = untracked or worktree_status ~= ".",
     untracked = untracked,
@@ -232,7 +259,13 @@ function M.parse_status(output)
         if not field_list or not path or path == "" or #field_list[1] ~= 2 then
           return nil, ("Malformed ordinary status record %d"):format(part_index)
         end
-        record_list[#record_list + 1] = status_record("ordinary", path, field_list[1], field_list[2])
+        record_list[#record_list + 1] = status_record("ordinary", path, field_list[1], field_list[2], nil, nil, {
+          head_mode = field_list[3],
+          index_mode = field_list[4],
+          worktree_mode = field_list[5],
+          head_oid = field_list[6],
+          index_oid = field_list[7],
+        })
       elseif record_type == "2" then
         local field_list, path = take_fields(part:sub(3), 8)
         local original_path = part_list[part_index + 1]
@@ -246,7 +279,14 @@ function M.parse_status(output)
           field_list[1],
           field_list[2],
           original_path,
-          field_list[8]
+          field_list[8],
+          {
+            head_mode = field_list[3],
+            index_mode = field_list[4],
+            worktree_mode = field_list[5],
+            head_oid = field_list[6],
+            index_oid = field_list[7],
+          }
         )
         part_index = part_index + 1
       elseif record_type == "u" then
@@ -282,18 +322,32 @@ local function snapshot_command_by_source(root, path_list)
   }
   append_path_list(status_command, path_list)
 
-  local unstaged_command = git_backend.git_diff_command(root)
+  local unstaged_command = git_backend.git_diff_command(root, { "--diff-filter=MRC" })
   table.insert(unstaged_command, 2, "--no-optional-locks")
   append_path_list(unstaged_command, path_list)
 
-  local staged_command = git_backend.git_diff_command(root, { "--cached" })
+  local staged_command = git_backend.git_diff_command(root, { "--cached", "--diff-filter=MRC" })
   table.insert(staged_command, 2, "--no-optional-locks")
   append_path_list(staged_command, path_list)
+
+  local unstaged_added_numstat_command = {
+    "git", "--no-optional-locks", "-C", root,
+    "-c", "core.quotepath=false", "diff", "--numstat", "-z", "--diff-filter=A",
+  }
+  append_path_list(unstaged_added_numstat_command, path_list)
+
+  local staged_added_numstat_command = {
+    "git", "--no-optional-locks", "-C", root,
+    "-c", "core.quotepath=false", "diff", "--cached", "--numstat", "-z", "--diff-filter=A",
+  }
+  append_path_list(staged_added_numstat_command, path_list)
 
   return {
     status = status_command,
     unstaged_diff = unstaged_command,
     staged_diff = staged_command,
+    unstaged_added_numstat = unstaged_added_numstat_command,
+    staged_added_numstat = staged_added_numstat_command,
   }
 end
 
@@ -404,10 +458,63 @@ function M.read_untracked_diff_async(filename, relpath, callback)
   end)
 end
 
+---@class DiffReviewNumstat
+---@field added integer
+---@field removed integer
+---@field line_stats_complete boolean
+---@field binary boolean
+
+--- Parse NUL-delimited numstat output into exact per-path line metadata.
+---@param output string
+---@return table<string, DiffReviewNumstat>? stat_by_path
+---@return string? error
+function M.parse_numstat(output)
+  local stat_by_path = {}
+  for part_index, part in ipairs(split_nul(tostring(output or ""))) do
+    if part ~= "" then
+      local first_tab = part:find("\t", 1, true)
+      local second_tab = first_tab and part:find("\t", first_tab + 1, true) or nil
+      if not first_tab or not second_tab then
+        return nil, ("Malformed numstat record %d"):format(part_index)
+      end
+      local added_text = part:sub(1, first_tab - 1)
+      local removed_text = part:sub(first_tab + 1, second_tab - 1)
+      local path = normalize_relative_path(part:sub(second_tab + 1))
+      local binary = added_text == "-" or removed_text == "-"
+      local added = binary and 0 or tonumber(added_text)
+      local removed = binary and 0 or tonumber(removed_text)
+      if path == "" or added == nil or removed == nil then
+        return nil, ("Malformed numstat record %d"):format(part_index)
+      end
+      stat_by_path[path] = {
+        added = added,
+        removed = removed,
+        line_stats_complete = not binary,
+        binary = binary,
+      }
+    end
+  end
+  return stat_by_path, nil
+end
+
+---@param content string
+---@return DiffReviewNumstat
+local function added_file_stat_from_bytes(content)
+  if content:find("\0", 1, true) then
+    return { added = 0, removed = 0, line_stats_complete = false, binary = true }
+  end
+  if content == "" then
+    return { added = 0, removed = 0, line_stats_complete = true, binary = false }
+  end
+  local newline_count = select(2, content:gsub("\n", ""))
+  local line_count = newline_count + (content:sub(-1) == "\n" and 0 or 1)
+  return { added = line_count, removed = 0, line_stats_complete = true, binary = false }
+end
+
 ---@param root string
 ---@param status_output string
----@param callback fun(diff_by_path?: table<string, string>, error?: DiffReviewPathStatusSnapshotError)
-local function collect_untracked_diff_async(root, status_output, callback)
+---@param callback fun(stat_by_path?: table<string, DiffReviewNumstat>, error?: DiffReviewPathStatusSnapshotError)
+local function collect_untracked_stat_async(root, status_output, callback)
   local status_record_list, status_error = M.parse_status(status_output)
   if not status_record_list then
     callback(nil, { kind = "parse", source = "status", message = status_error or "Unable to parse Git status" })
@@ -426,7 +533,7 @@ local function collect_untracked_diff_async(root, status_output, callback)
   local pending_read_count = #untracked_record_list
   local active_read_count = 0
   local next_record_index = 1
-  local diff_by_path = {}
+  local stat_by_path = {}
   local launch_read
   launch_read = function()
     while active_read_count < untracked_read_limit and next_record_index <= #untracked_record_list do
@@ -434,14 +541,14 @@ local function collect_untracked_diff_async(root, status_output, callback)
       next_record_index = next_record_index + 1
       active_read_count = active_read_count + 1
       local read_finished = false
-      M.read_untracked_diff_async(paths.repo_file_path(root, untracked_record.path), untracked_record.path, function(diff)
+      M._read_untracked_file_async(paths.repo_file_path(root, untracked_record.path), function(content)
         if read_finished then return end
         read_finished = true
-        if diff then diff_by_path[untracked_record.path] = diff end
+        if content ~= nil then stat_by_path[untracked_record.path] = added_file_stat_from_bytes(content) end
         active_read_count = active_read_count - 1
         pending_read_count = pending_read_count - 1
         if pending_read_count == 0 then
-          callback(diff_by_path)
+          callback(stat_by_path)
           return
         end
         launch_read()
@@ -458,7 +565,16 @@ end
 ---@param staged_output string
 ---@return DiffReviewPathStatusSnapshot? snapshot
 ---@return DiffReviewPathStatusSnapshotError? error
-local function build_snapshot(root, requested_path_list, status_output, unstaged_output, staged_output, untracked_diff_by_path)
+local function build_snapshot(
+  root,
+  requested_path_list,
+  status_output,
+  unstaged_output,
+  staged_output,
+  unstaged_added_numstat_output,
+  staged_added_numstat_output,
+  untracked_stat_by_path
+)
   local status_record_list, status_error = M.parse_status(status_output)
   if not status_record_list then
     return nil, { kind = "parse", source = "status", message = status_error or "Unable to parse Git status" }
@@ -471,6 +587,14 @@ local function build_snapshot(root, requested_path_list, status_output, unstaged
   local staged_ok, staged_hunk_list = pcall(git_data._parse_diff, staged_output, true)
   if not staged_ok then
     return nil, { kind = "parse", source = "staged_diff", message = tostring(staged_hunk_list) }
+  end
+  local unstaged_added_stat_by_path, unstaged_numstat_error = M.parse_numstat(unstaged_added_numstat_output)
+  if not unstaged_added_stat_by_path then
+    return nil, { kind = "parse", source = "unstaged_added_numstat", message = unstaged_numstat_error or "Unable to parse unstaged added-file stats" }
+  end
+  local staged_added_stat_by_path, staged_numstat_error = M.parse_numstat(staged_added_numstat_output)
+  if not staged_added_stat_by_path then
+    return nil, { kind = "parse", source = "staged_added_numstat", message = staged_numstat_error or "Unable to parse staged added-file stats" }
   end
 
   local status_record_by_path = {}
@@ -556,15 +680,7 @@ local function build_snapshot(root, requested_path_list, status_output, unstaged
     local file_unstaged_hunk_list = unstaged_hunk_by_path[path] or {}
     local file_staged_hunk_list = staged_hunk_by_path[path] or {}
 
-    if record.untracked then
-      untracked_by_file[abs_file] = path
-      if #file_unstaged_hunk_list == 0 then
-        local untracked_diff = untracked_diff_by_path and untracked_diff_by_path[path] or nil
-        if untracked_diff then
-          file_unstaged_hunk_list = git_data._parse_diff(untracked_diff, false)
-        end
-      end
-    end
+    if record.untracked then untracked_by_file[abs_file] = path end
 
     for _, hunk in ipairs(file_unstaged_hunk_list) do
       hunk.filename = abs_file
@@ -587,6 +703,67 @@ local function build_snapshot(root, requested_path_list, status_output, unstaged
     local unstaged_diff = hunk_diff(file_unstaged_hunk_list)
     local staged_diff = hunk_diff(file_staged_hunk_list)
 
+    ---@param staged boolean
+    ---@param hunk_list DiffReviewHunk[]
+    ---@return DiffReviewPathPreview
+    local function preview_for_stage(staged, hunk_list)
+      local status = staged and record.index_status or record.worktree_status
+      if #hunk_list > 0 then
+        local added = 0
+        local removed = 0
+        for _, hunk in ipairs(hunk_list) do
+          added = added + (hunk.added or 0)
+          removed = removed + (hunk.removed or 0)
+        end
+        return {
+          state = "loaded",
+          source = "diff",
+          added = added,
+          removed = removed,
+          line_stats_complete = true,
+          binary = false,
+        }
+      end
+      if record.untracked or status == "A" then
+        local stat = record.untracked and (untracked_stat_by_path and untracked_stat_by_path[path])
+          or (staged and staged_added_stat_by_path[path] or unstaged_added_stat_by_path[path])
+          or { added = 0, removed = 0, line_stats_complete = false, binary = false }
+        return {
+          state = "unloaded",
+          source = staged and "index_added" or "worktree_added",
+          added = stat.added,
+          removed = stat.removed,
+          line_stats_complete = stat.line_stats_complete,
+          binary = stat.binary,
+          oid = staged and record.index_oid or nil,
+          mode = staged and record.index_mode or record.worktree_mode,
+        }
+      end
+      if status == "D" then
+        return {
+          state = "unloaded",
+          source = staged and "head_deleted" or "index_deleted",
+          added = 0,
+          removed = 0,
+          line_stats_complete = false,
+          binary = false,
+          oid = staged and record.head_oid or record.index_oid,
+          mode = staged and record.head_mode or record.index_mode,
+        }
+      end
+      return {
+        state = "loaded",
+        source = "diff",
+        added = 0,
+        removed = 0,
+        line_stats_complete = true,
+        binary = false,
+      }
+    end
+
+    local unstaged_preview = preview_for_stage(false, file_unstaged_hunk_list)
+    local staged_preview = preview_for_stage(true, file_staged_hunk_list)
+
     ---@type DiffReviewPathStatusFileSnapshot
     local file_snapshot = {
       path = path,
@@ -599,6 +776,8 @@ local function build_snapshot(root, requested_path_list, status_output, unstaged
       staged_diff = staged_diff,
       combined_diff = combined_diff,
       staged_flag_list = #staged_flag_list > 0 and staged_flag_list or nil,
+      unstaged_preview = unstaged_preview,
+      staged_preview = staged_preview,
     }
     file_list[#file_list + 1] = file_snapshot
     file_by_path[path] = file_snapshot
@@ -631,18 +810,22 @@ local function build_snapshot(root, requested_path_list, status_output, unstaged
     status_output = status_output,
     unstaged_output = unstaged_output,
     staged_output = staged_output,
+    unstaged_added_numstat_output = unstaged_added_numstat_output,
+    staged_added_numstat_output = staged_added_numstat_output,
   }, nil
 end
 
---- Build one authoritative snapshot from the three Git command outputs.
+--- Build one authoritative snapshot from Git status, filtered patches, and added-file stats.
 ---@param root string
 ---@param path_list string[]
 ---@param status_output string
 ---@param unstaged_output string
 ---@param staged_output string
+---@param unstaged_added_numstat_output? string
+---@param staged_added_numstat_output? string
 ---@return DiffReviewPathStatusSnapshot? snapshot
 ---@return DiffReviewPathStatusSnapshotError? error
-function M.build(root, path_list, status_output, unstaged_output, staged_output)
+function M.build(root, path_list, status_output, unstaged_output, staged_output, unstaged_added_numstat_output, staged_added_numstat_output)
   local requested_path_list, input_error = normalize_requested_path_list(root, path_list)
   if not requested_path_list then return nil, input_error end
   return build_snapshot(
@@ -651,6 +834,8 @@ function M.build(root, path_list, status_output, unstaged_output, staged_output)
     tostring(status_output or ""),
     tostring(unstaged_output or ""),
     tostring(staged_output or ""),
+    tostring(unstaged_added_numstat_output or ""),
+    tostring(staged_added_numstat_output or ""),
     {}
   )
 end
@@ -678,7 +863,7 @@ local function command_failure(source, command, result)
   }
 end
 
---- Collect one authoritative snapshot with status, unstaged diff, and staged diff commands.
+--- Collect one atomic snapshot with status, filtered patches, and added-file stats.
 ---@param root string
 ---@param path_list string[] empty collects the full repository without a pathspec
 ---@param callback fun(snapshot?: DiffReviewPathStatusSnapshot, error?: DiffReviewPathStatusSnapshotError)
@@ -692,7 +877,7 @@ function M.collect_async(root, path_list, callback)
   local command_by_source = snapshot_command_by_source(root, requested_path_list)
   ---@type table<DiffReviewPathStatusSnapshotSource, DiffReviewGitAsyncResult>
   local result_by_source = {}
-  local pending = 3
+  local pending = 5
   local finished_source = {}
   local callback_finished = false
 
@@ -713,7 +898,13 @@ function M.collect_async(root, path_list, callback)
     pending = pending - 1
     if pending > 0 then return end
 
-    local source_order = { "status", "unstaged_diff", "staged_diff" }
+    local source_order = {
+      "status",
+      "unstaged_diff",
+      "staged_diff",
+      "unstaged_added_numstat",
+      "staged_added_numstat",
+    }
     local failure_list = {}
     for _, ordered_source in ipairs(source_order) do
       local ordered_result = result_by_source[ordered_source]
@@ -739,8 +930,8 @@ function M.collect_async(root, path_list, callback)
     end
 
     local status_output = tostring(result_by_source.status.stdout or "")
-    collect_untracked_diff_async(root, status_output, function(untracked_diff_by_path, untracked_error)
-      if not untracked_diff_by_path then
+    collect_untracked_stat_async(root, status_output, function(untracked_stat_by_path, untracked_error)
+      if not untracked_stat_by_path then
         complete(nil, untracked_error)
         return
       end
@@ -750,12 +941,20 @@ function M.collect_async(root, path_list, callback)
         status_output,
         tostring(result_by_source.unstaged_diff.stdout or ""),
         tostring(result_by_source.staged_diff.stdout or ""),
-        untracked_diff_by_path
+        tostring(result_by_source.unstaged_added_numstat.stdout or ""),
+        tostring(result_by_source.staged_added_numstat.stdout or ""),
+        untracked_stat_by_path
       ))
     end)
   end
 
-  for _, source in ipairs({ "status", "unstaged_diff", "staged_diff" }) do
+  for _, source in ipairs({
+    "status",
+    "unstaged_diff",
+    "staged_diff",
+    "unstaged_added_numstat",
+    "staged_added_numstat",
+  }) do
     git_backend.system_text_async(command_by_source[source], nil, function(result)
       finish(source, result)
     end)

@@ -990,13 +990,13 @@ function M.fork_session(name)
   if name and name ~= "" then params.name = name end
   local fork_started = perf.now()
   local pending = session_navigation.begin_fork(active_session, name)
-  perf.event("harness.fork.ui_opened", {
+  perf.event("harness", "harness.fork.ui_opened", {
     ms = perf.elapsed_ms(fork_started),
     source_session_id = active_session.id,
   })
   client.request_for(active_session.id, "session.fork", params, function(result, request_error)
     if request_error then
-      perf.event("harness.fork.failed", {
+      perf.event("harness", "harness.fork.failed", {
         ms = perf.elapsed_ms(fork_started),
         source_session_id = active_session.id,
         error = tostring(request_error),
@@ -1005,14 +1005,14 @@ function M.fork_session(name)
       return
     end
     local performance = result and result.fork_performance or {}
-    perf.event("harness.fork.complete", {
+    perf.event("harness", "harness.fork.complete", {
       ms = perf.elapsed_ms(fork_started),
       broker_ms = performance.total_ms,
       source_session_id = active_session.id,
       child_session_id = result.session and result.session.id,
     })
     for _, timing in ipairs(performance.timing or {}) do
-      perf.event("harness.fork.phase", {
+      perf.event("harness", "harness.fork.phase", {
         phase = timing.phase,
         ms = timing.duration_ms,
         source_session_id = active_session.id,

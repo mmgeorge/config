@@ -103,7 +103,7 @@ diff_review/
 │       ├── status_head.lua     Head/about lines (HEAD/merge/push rows, PR summary, section headings)
 │       ├── status_keys.lua     Stable identity keys for sections/files/hunks (fold + cache + action index)
 │       ├── status_helpers.lua  Shared helpers: notifications, git command building, branch creation, popups
-│       ├── status_debug.lua    Dev-only event log, perf timer, row/extmark/syntax inspection dump
+│       ├── status_debug.lua    Dev-only event log plus row/extmark/syntax inspection dump
 │       ├── status_issues.lua   `#`-issue completion + issue integration in the status buffer
 │       ├── section_map.lua     Pure section projection, path replacement, and semantic equivalence
 │       ├── operation_journal.lua Confirmed section baseline plus ordered optimistic mutation layers
@@ -149,7 +149,8 @@ diff_review/
 ├── git/                      The Git data layer
 │   ├── git_backend.lua        Pluggable async process runner (vim.system or an injected test backend)
 │   ├── git_data.lua           Diff parsing, snapshot integration, session caching, async syntax compute
-│   ├── status_snapshot.lua     Full or path-scoped three-command authoritative status snapshot
+│   ├── status_snapshot.lua     Atomic status, filtered-patch, and added-file metadata snapshot
+│   ├── file_body.lua           Lazy added/deleted preview loader using worktree bytes or Git blobs
 │   ├── index_mutation.lua      One semantic stage/unstage mutation with partial-success reporting
 │   ├── mutation_coordinator.lua Repository-root FIFO, burst debounce, settle, and failure recovery
 │   └── repo_config.lua        Per-repo .diffreview.json reader (branch_prefix) behind a test seam
@@ -501,6 +502,20 @@ what actually changed. `source_loader.lua` is the thin convenience facade
 (`ensure` → `ensure_file` → `replace_file_hunks`) so callers do not thread three handles
 around.
 
+Fully deleted files add a harder data boundary. Startup retains only their porcelain metadata.
+The first explicit expansion requests path-scoped numstat data. When the removed-line count exceeds
+`status_deleted_file_preview_line_limit` (default 1,000), the file entry renders a single
+`Preview omitted` row and never reads the source blob, constructs hunks, builds syntax, or prewarms.
+Smaller staged deletions read the porcelain HEAD object ID, while smaller unstaged deletions read the
+porcelain index object ID through `git cat-file blob`.
+
+Cursor-driven syntax prewarm applies a separate hard boundary before it constructs file-level
+highlight state. Deleted files never prewarm. A collapsed non-deleted file prewarms only when its
+known `added + removed` delta stays below 100 lines, including new files whose delta comes entirely
+from additions. Files at or above 100 lines, or files without known stats, must expand before
+file-level prewarm runs. Hunk rows already imply an expanded file and follow the same deleted-file
+exclusion.
+
 ### 6.2 Parsing (`diff_parse.lua`)
 
 A pure state machine over unified-diff text. It produces `DiffReviewParsedBlock[]` →
@@ -649,19 +664,18 @@ file body ─► text_snapshot ─► syntax_context ◄─ syntax_engine (async
 
 **1. Collect.** `views/commands.open` creates or reuses the `GitStatus` buffer, attaches
 a state through `state.attach_status_state`, and invokes the `status_snapshot.lua`
-collector through `git_data.lua`. One snapshot runs exactly three commands in parallel:
+collector through `git_data.lua`. One snapshot runs exactly five commands in parallel:
 
 - porcelain-v2 status with NUL records and all untracked files
-- a zero-context unstaged diff
-- a zero-context staged diff
+- zero-context unstaged and staged diffs filtered to modified, renamed, and copied paths
+- unstaged and staged NUL-delimited numstat queries filtered to added paths
 
 A full load passes an empty path list to cover the repository. Mutation verification
 passes only the affected root-relative paths through the same seam. The collector parses
-the three outputs into sections, source records, and staged/unstaged diff caches without
-starting a second Git reload. For untracked text files, the collector reads file bytes
-through a 16-read asynchronous libuv pool after the Git fan-in. Those reads add no Git
-commands, preserve CRLF and missing-final-newline semantics, and never block the render
-callback with `vim.fn.readfile`.
+the five outputs into canonical sections, source records, compact line metadata, and
+staged/unstaged diff caches without starting a second Git reload. Added and deleted bodies remain
+unloaded. Untracked files pass through a 16-read asynchronous libuv pool after the Git fan-in only
+to classify binary content and count lines, without retaining synthetic patches.
 
 Collection stays pure with respect to `session.file_diffs`, `session.file_hunk_staged`,
 and `session.untracked`. `render_orchestrator.lua` adopts a full snapshot only after the
@@ -723,12 +737,12 @@ to both its context diff and fingerprint diff. Ignored-only edits therefore neit
 influence the generated message nor invalidate an otherwise reusable message.
 
 After the FIFO drains, a **120 ms quiet window** closes the burst and `status_sync.lua`
-runs one path-scoped three-command snapshot for the union of affected paths. A matching
+runs one path-scoped five-command snapshot for the union of affected paths. A matching
 snapshot retires the resolved journal layers without rendering the status buffer or
 writing an open diff buffer. A real mismatch replaces those paths from Git truth and
 performs one corrective render. Later optimistic layers replay over the new confirmed
 baseline, so verification never erases actions accepted during an earlier synchronization.
-If the authoritative read itself fails, synchronization retries that three-command
+If the authoritative read itself fails, synchronization retries that five-command
 attempt once after 120 ms before marking the projection stale. The normal path still
 runs one attempt, and a successful retry does not add a render when truth matches.
 
@@ -901,13 +915,12 @@ The diff-specific layer on top of the backend, and the busiest data module:
 
 - **Parse:** `parse_diff(output, staged)` → hunks with positions, context, counts.
   `order_file_hunks` sorts hunks so staging/unstaging folds in place.
-- **Integrate snapshots:** `collect_items_from_git(cwd, cb)` consumes one
-  `status_snapshot.collect_async` result and returns the flat section input plus the
-  typed snapshot without changing session caches. The accepted status orchestrator owns
-  full-cache adoption.
-- **Consume synthetic diffs:** production collection reads untracked bytes asynchronously
-  in `status_snapshot.lua`, then `git_data.lua` parses those all-additions diffs through
-  the same hunk path as tracked content.
+- **Integrate snapshots:** `collect_status_snapshot_async(cwd, cb)` returns the typed canonical
+  snapshot without changing session caches. `section_map.sections_from_snapshot` drives both first
+  paint and reconciliation, while the accepted status orchestrator owns full-cache adoption.
+- **Materialize deferred bodies:** `file_body.lua` synthesizes canonical full-file hunks only after
+  explicit expansion. Added files come from worktree bytes or the porcelain index object ID.
+  Deleted files use numstat before reading the HEAD or index blob.
 - **Compute syntax (async):** `compute_file_syntax_async` / `compute_diff_syntax_async` /
   `compute_hunk_context_async` create scratch buffers, parse with tree-sitter, and return
   `{ buf, tree, highlight_query }` — the producers behind the `syntax_engine` caches.
@@ -915,13 +928,14 @@ The diff-specific layer on top of the backend, and the busiest data module:
 ### Status snapshots and index mutations
 
 `status_snapshot.lua` owns the authoritative read seam. Each invocation starts exactly
-one porcelain-v2 status command, one zero-context unstaged diff, and one zero-context
-staged diff. A nonempty path list appends one shared pathspec to all three commands. An
+one porcelain-v2 status command, modified/renamed/copied zero-context diffs for unstaged and staged
+state, and added-file numstat queries for unstaged and staged state. A nonempty path list appends one
+shared pathspec to all five commands. An
 empty list produces the full status snapshot used for first load and explicit refresh.
-After those commands finish, untracked content loads through a bounded asynchronous filesystem
-reads and joins the same snapshot without another Git process. The collector distinguishes
-rename and copy records, preserves original paths, skips binary content, and represents
-missing final newlines in the synthesized patch.
+After those commands finish, bounded asynchronous filesystem reads collect compact untracked-file
+metadata without another Git process. The collector preserves porcelain modes and object IDs so
+later body reads avoid path-revision ambiguity. Added and deleted paths never request unified Git
+diffs. Lazy synthesized patches retain binary, CRLF, and missing-final-newline behavior.
 
 Rename and copy origins drive different mutation scopes. A rename includes both paths
 because the source disappears. A copy mutates and replaces only the destination because
@@ -985,8 +999,10 @@ branch-create action) behind a reader seam so tests never hit the filesystem.
 - **`highlights.lua`** — defines every DiffReview highlight group at setup, deriving
   backgrounds from the active colorscheme so the diff colors track the theme.
 - **`notifications.lua`** — centralized `error` and `git_failures` notifications.
-- **`perf.lua`** — a JSON event/span profiler (batched, flushed on a timer) gated by
-  config, used to find slow renders.
+- **`perf.lua`** — two independently gated JSON event/span profilers, batched and flushed on a
+  timer. `diff_logging` records GitStatus, diffs, PRs, and shared UI work in
+  `diff-review-diff-perf.log`. `harness_logging` records Harness lifecycle and provider timings in
+  `diff-review-harness-perf.log`.
 - **`inventory.lua`** — computes the per-diff **change inventory**: which functions,
   structs, classes, traits, types, and modules a changeset adds/removes/modifies, via the
   bundled `diff_inventory` queries. Caches old/new source lines per path so it never
@@ -1050,9 +1066,9 @@ which is why `query_runtime` must run before any consumer.
        ├─ create/reuse GitStatus buf, state.attach_status_state(buf, state)
        ├─ status_snapshot.collect_async(cwd, {})
        │    ├─ porcelain-v2 status -z --untracked-files=all
-       │    ├─ zero-context unstaged diff
-       │    └─ zero-context staged diff
-       ├─ git_data + section_builder + section_map     (cache + section tree)
+       │    ├─ zero-context unstaged/staged MRC diffs
+       │    └─ unstaged/staged added-file numstat
+       ├─ git_data + section_map                       (cache + canonical section tree)
        ├─ operation_journal.reset                      (confirmed baseline)
        └─ status_render                                (head + sections → lines → extmarks)
             ├─ size_gate defers oversized file bodies
@@ -1409,7 +1425,8 @@ without inventing a durable session identity. A successful response promotes tha
 provider-backed child. A failure remains visible in the provisional timeline instead of restoring silence.
 Fork responses carry transient performance diagnostics for provider process startup, initialization,
 native fork work, broker persistence, and snapshot projection. Neovim records those phases alongside
-client-observed completion latency in the existing `diff-review-perf.log` JSONL stream.
+client-observed completion latency in the `diff-review-harness-perf.log` JSONL stream when
+`harness_logging` is enabled.
 Broker initialization selects the most recently updated session for the resolved repository
 and configured backend, then restores its interaction timeline, plan, goal, model controls,
 and provider session identity. Independent model, effort, and fast-mode preferences remain available
@@ -1448,10 +1465,10 @@ the resource's `name` or `title`. Existing keys replace in place and absent keys
 order. Collection-specific `rename` arrays carry explicit `from` and `to` keys, apply before set
 and delete, and preserve the resource's position. Collection-specific `delete` lists retract
 resources from the PlanDocument. They do not express implementation removal, which remains a
-complete set resource carrying `action: "remove"`. Nested members, variants, steps, edges, files, and
+complete set resource carrying `action: "remove"`. Nested members, variants, edges, files, and
 subtasks remain ordinary complete arrays rather than recursive mutation languages. Complete
 replacement arrays remain required even when empty, including entity `members`, `variants`, and
-`conforms_to`, variant `fields`, flow `steps`/`edges`/`branches`/`expansion`, and task
+`conforms_to`, variant `fields`, flow `edges`/`branches`/`expansion`, and task
 `files`/`subtasks`. This prevents omission from ambiguously meaning either retain or clear.
 Plan nodes carry no generated IDs. Semantic names and titles identify domain resources during edit
 operations, while a JSON Pointer identifies one exact node inside one immutable document revision.
@@ -1469,7 +1486,7 @@ symmetry, but Harness deliberately ignores that value during validation and rend
 owning enum controls payload accessibility. Members, variants, variant
 payload fields, and concrete tests share nested rename semantics: `action: "rename"` requires the
 old identifier in `renamed_from` and keeps the destination in `name`, while every other action omits
-`renamed_from`. Their `description` fields remain optional and render when supplied. Variant payload
+`renamed_from`. Their `description` fields remain optional and feed the PlanReview info popup instead of the Markdown projection. Variant payload
 fields may include the redundant `kind: "field"` discriminator or omit it, preserving one symmetric
 field shape without forcing duplicated information. Package decisions live in a separate
 top-level dependency collection. Each dependency records only its name, version, manifest, optional
@@ -1520,7 +1537,7 @@ task boundaries because aligned path suffixes retain each declaration's actual s
 Review annotations retain the renderer target plus the exact canonical JSON Pointer from
 `working.index.json`. The index records the owning `plan_id` and `plan_version`, so navigation
 consumers reject a stale revision before resolving `/entity_changes/2/members/1`. Diagnostics use
-compact dot-and-index paths such as `flows[0].steps[1]` for readable repair feedback, while
+compact dot-and-index paths such as `flows[0].edges[1]` for readable repair feedback, while
 execution evidence and navigation use standards-compliant JSON Pointers because machines must
 address one exact node.
 Edit, submission, and render validation aggregate every violation in one response. Submission
@@ -1574,7 +1591,7 @@ in graph presentation order. Task entity lists use that same order within each s
 the task tree's existing indentation. Entity change rows render semantic names as plain text so
 Tree-sitter type highlights, cursor inspection, and surrounding prose share one visual form.
 Member signatures and enum payloads retain the full
-object-model column width and their semantic indentation, so a long return type cannot push every
+object-model column width and their semantic indentation without inline descriptions, so a long return type cannot push every
 path outward or inherit a narrower wrapping boundary. A dedicated Dependencies section appears before Tasks and
 groups package changes beneath their repository-relative manifest. Each dependency row combines
 its action, package, version, license, and substantive justification into one wrapped tree node,
@@ -1587,34 +1604,31 @@ Green, light blue, red, and purple status highlights preserve lifecycle meaning 
 the neutral path tree. Incomplete drafts may still infer unmatched dependency or entity paths from
 the worktree until their required task-file owner exists. Runtime flow diagrams remain
 fenced text because their relationships encode execution rather than durable ownership. The flow
-title remains in the Markdown heading rather than consuming diagram width. Each top-level step
-names one acting planned, workspace, or external participant and starts one independent execution
-tree. A step owns typed runtime edges plus labeled alternative branches. An edge owns the nested
-steps that execute inside that relationship before its optional structured result returns.
+title remains in the Markdown heading rather than consuming diagram width. Each flow records one
+unrendered source participant and an ordered root edge list. An edge owns the nested edges and
+labeled alternative branches that execute inside that relationship.
 `construct`, `call`, `read`, `write`, `send`, `emit`, and `return` preserve the relationship
-between actors and edge targets without relying on array adjacency. Branch conditions preserve
+between the inherited source and edge targets without relying on array adjacency. Branch conditions preserve
 success, failure, and other control outcomes without encoding control flow in prose. This lets an
 orchestration function expose construction, invocation, and outcome boundaries without becoming a
-durable UML owner. A `construct` edge implies its declared result through the constructed target.
-A `call` edge implies the same construction when its typed result name exactly matches its target
-type name, rendering as `Construct Type.callable()` without changing the canonical relation used
-for API validation. The projection omits the redundant result row and navigation anchor for both
-forms while retaining results for every other relationship. Flow navigation anchors repeat actor
-or receiver identity, reference kind, callable metadata, workspace declaration locations, whether
+durable UML owner. A `construct` edge implies its produced type through the constructed target.
+Callable edges carry a structured return type with a required value type and optional error type,
+which the projection renders inline. Transfer edges carry an explicit payload type. Flow navigation
+anchors repeat receiver identity, reference kind, callable metadata, workspace declaration locations, whether
 the target resolves to a type, and the edge's version-scoped JSON Pointer.
 PlanReview uses that canonical metadata to highlight free-function invocations through
 `@function.call`, method invocations through `@function.method.call`, and type receivers through
 `@type`. Branch keywords use conditional highlighting, while endpoint labels retain ordinary text
 styling. Planned references open their canonical entity information, workspace references jump to
 their recorded declaration, and external Rust references resolve exact-version Rustdoc data.
-Steps, edges, branches, and results remain in the left column while repository-relative paths for
+Edges and branches remain in the left column while repository-relative paths for
 planned and workspace entities align in one calculated right column. External participants remain
 in the relationship text because their names identify runtime receivers rather than source locations.
 The column reserves space for the longest owner path, so one wide action cannot force unrelated
 short owners onto separate lines. When one row still overlaps that reserved column, its source path
 moves to one indented physical line beneath the action without truncation. Every execution-tree level uses `├─` and
-`└─`, and non-final ancestors carry `│` through nested expansions, branches, and results. Top-level
-step order controls reviewer presentation only. Explicit edges, expansions, and branches carry
+`└─`, and non-final ancestors carry `│` through nested expansions and branches. Root edge order
+controls reviewer presentation only. Explicit edges, expansions, and branches carry
 runtime meaning.
 PlanReview keeps the plan read-only and routes reviewer feedback back through semantic plan
 operations. `task_model.lua` reads `working.json` and `working.index.json`, maps the Tasks section

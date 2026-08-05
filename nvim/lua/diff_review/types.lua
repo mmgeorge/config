@@ -70,6 +70,13 @@
 ---@field git_status? string
 ---@field diff_source_id? string
 ---@field diff_file_key? string
+---@field preview_state? DiffReviewPreviewState
+---@field preview_source? DiffReviewPreviewSource
+---@field preview_oid? string
+---@field preview_mode? string
+---@field preview_binary? boolean
+---@field preview_error? string
+---@field line_stats_complete? boolean
 
 ---@class DiffReviewStatusCommit
 ---@field oid string
@@ -100,9 +107,11 @@
 
 ---@class DiffReviewStatusEntry
 ---@field id? string
+---@field default_folded? boolean
 ---@field kind "section"|"file"|"hunk"|"context_line"|"commit"|"commit_message"|"commit_file"|"commit_hunk"|"pr_file"|"pr_hunk"|"pr_comment"|"pr_comment_reply"|"pr_review"|"pr_review_file"|"pr_review_hunk"|"review_comment"|"comment_box"|"pr"|"about"|"pr_check"|"pr_head_section"|"pr_head_line"
 ---@field section? DiffReviewStatusSection
 ---@field file? DiffReviewStatusFile
+---@field preview_omitted? boolean
 ---@field hunk? DiffReviewHunk
 ---@field commit? DiffReviewStatusCommit
 ---@field pr_review? DiffReviewGhSubmittedReview

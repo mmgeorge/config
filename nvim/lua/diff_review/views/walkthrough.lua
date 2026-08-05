@@ -1008,36 +1008,59 @@ end
 --- then re-render synchronously so resolution can retry once.
 ---@param mode DiffReviewWalkthroughMode
 ---@param step DiffReviewWalkthroughStep
+---@param resume_row? integer
 ---@return boolean expanded whether anything was unfolded
-local function ensure_expanded(mode, step)
+---@return boolean pending whether a lazy preview must load first
+local function ensure_expanded(mode, step, resume_row)
   local state = mode.host.get_state()
   local sections = state and state.sections or {}
   local expanded = false
+  local pending = false
   local can_apply_native = true
   for _, section in ipairs(sections) do
     for _, file in ipairs(section.files or {}) do
       if matches_file(file.relpath, step.file) or matches_file(file.filename, step.file) then
         local section_key = "section:" .. (file.section_name or section.name)
         local file_key = mode.host.file_key(file.section_name, file.filename)
-        can_apply_native = can_apply_native and mode.host.has_native_fold(file_key)
-        mode.host.set_folded(section_key, false)
-        mode.host.set_folded(file_key, false)
-        for _, hunk in ipairs(file.hunks or {}) do
-          local hunk_key = mode.host.hunk_key(file.section_name, file.filename, hunk.diff)
-          mode.host.set_folded(hunk_key, false)
+        local function expand_file()
+          mode.host.set_folded(section_key, false)
+          mode.host.set_folded(file_key, false)
+          for _, hunk in ipairs(file.hunks or {}) do
+            local hunk_key = mode.host.hunk_key(file.section_name, file.filename, hunk.diff)
+            mode.host.set_folded(hunk_key, false)
+          end
         end
+        if file.preview_state == "unloaded" or file.preview_state == "loading" or file.preview_state == "error" then
+          local deferred = require("diff_review.views.status.status_render").status_prepare_file_expansion_context({
+            id = file_key,
+            kind = "file",
+            file = file,
+          }, state, function()
+            expand_file()
+            mode.host.rerender()
+            vim.schedule(function() M.jump_status_step(mode.host.buf, resume_row) end)
+          end)
+          if deferred then
+            pending = true
+          else
+            expand_file()
+          end
+        else
+          expand_file()
+        end
+        can_apply_native = can_apply_native and mode.host.has_native_fold(file_key)
         expanded = true
       end
     end
   end
-  if expanded then
+  if expanded and not pending then
     if can_apply_native then
       mode.host.apply_native_folds()
     else
       mode.host.rerender()
     end
   end
-  return expanded
+  return expanded, pending
 end
 
 -- ─── floats ──────────────────────────────────────────────────────────────────
@@ -2388,8 +2411,9 @@ end
 
 ---@param mode DiffReviewWalkthroughMode
 ---@param step DiffReviewWalkthroughStep
+---@param resume_row? integer
 ---@return DiffReviewWalkthroughTarget target
-local function resolve_visible_step_target(mode, step)
+local function resolve_visible_step_target(mode, step, resume_row)
   local state = mode.host.get_state()
   local target = rendered_step_target(mode, step, state)
   local function target_row_is_folded(candidate)
@@ -2413,7 +2437,13 @@ local function resolve_visible_step_target(mode, step)
   -- Only unfold + re-render when no diff rows are rendered at all; a
   -- "nearest" match means the hunks are visible and just don't contain the
   -- exact line (TS-context scoping, deletions, staleness).
-  if (not target.start_row or target_row_is_folded(target)) and ensure_expanded(mode, step) then
+  local expanded = false
+  local expansion_pending = false
+  if target.match == "file_only" or not target.start_row or target_row_is_folded(target) then
+    expanded, expansion_pending = ensure_expanded(mode, step, resume_row)
+  end
+  if expansion_pending then return { match = "pending" } end
+  if expanded then
     jump_debug_event("resolve_after_expand", {
       buf = mode.host.buf,
       previous_target = target,
@@ -2468,7 +2498,7 @@ function M.jump_status_step(buf, row)
   if not step then return false end
 
   local source_cursor = cursor
-  local target = resolve_visible_step_target(mode, step)
+  local target = resolve_visible_step_target(mode, step, cursor_row)
   jump_debug_event("jump_status_target", {
     buf = buf,
     source_cursor = source_cursor,
@@ -2486,16 +2516,13 @@ function M.jump_status_step(buf, row)
       target = target,
       view = jump_debug_snapshot(win, buf),
     })
-  else
+  elseif target.match ~= "pending" then
     notify("Walkthrough target is not in the current diff", vim.log.levels.WARN)
     jump_debug_event("jump_status_missing", { buf = buf, target = target })
   end
   return true
 end
 
----@param target DiffReviewWalkthroughTarget
----@param win integer
----@return boolean
 ---@param mode DiffReviewWalkthroughMode
 ---@param row integer
 ---@return string

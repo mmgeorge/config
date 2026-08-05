@@ -162,11 +162,16 @@ function backend.system_async(command, _, cb)
   record("system_async", command)
   local key = command_key(command)
   local status_key = "git\t--no-optional-locks\t-C\t" .. root .. "\tstatus\t--porcelain=v2\t-z\t--untracked-files=all"
-  local unstaged_key = "git\t--no-optional-locks\t-C\t" .. root
+  local diff_key = "git\t--no-optional-locks\t-C\t" .. root
     .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0"
-  local staged_key = unstaged_key .. "\t--cached"
+  local unstaged_key = diff_key .. "\t--diff-filter=MRC"
+  local staged_key = diff_key .. "\t--cached\t--diff-filter=MRC"
+  local numstat_key = "git\t--no-optional-locks\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff"
+  local unstaged_numstat_key = numstat_key .. "\t--numstat\t-z\t--diff-filter=A"
+  local staged_numstat_key = numstat_key .. "\t--cached\t--numstat\t-z\t--diff-filter=A"
   vim.defer_fn(function()
     local matched = key == status_key or key == unstaged_key or key == staged_key
+      or key == unstaged_numstat_key or key == staged_numstat_key
     local output = key == status_key and status_snapshot_text() or ""
     cb({ code = matched and 0 or 1, stdout = output, stderr = "", output = output })
   end, 5)
@@ -184,7 +189,7 @@ end
 local function assert_binary_status(buf, file_row_text, message)
   render_and_wait(buf, file_row_text)
   trigger_normal_mapping("<Tab>", find_row(buf, file_row_text))
-  assert_true(buffer_contains(buf, "No textual diff"), message .. "\n" .. table.concat(status_lines(buf), "\n"))
+  wait_for(function() return buffer_contains(buf, "No textual diff") end, message .. "\n" .. table.concat(status_lines(buf), "\n"))
 end
 
 local function run()

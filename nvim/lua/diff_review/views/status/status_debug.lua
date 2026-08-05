@@ -1,11 +1,8 @@
---- Owns the GitStatus debug/diagnostics surface: the structured event log, the per-render perf
---- timer that feeds the debug log, and the row/extmark/syntax inspection dump. Dev-only — the hot
---- path reaches it only when debug logging is enabled.
+--- Owns the GitStatus debug/diagnostics surface: structured debug events and row/extmark/syntax
+--- inspection dumps. Dev-only — the hot path reaches it only when debug logging is enabled.
 ---
---- Reads live status state and namespaces from session.lua and the perf module directly, and the
---- init-owned gitstatus-debug flags via require("diff_review") (the one intentional residual seam).
-
-local config = require("diff_review.infra.config")
+--- Reads live status state and namespaces from session.lua and init-owned gitstatus-debug flags
+--- via require("diff_review") (the one intentional residual seam).
 
 --- Resolve the init module lazily so diagnostics can read orchestrator state without a load-time
 --- circular require.
@@ -16,12 +13,8 @@ local notifications = require("diff_review.infra.notifications")
 local ui = require("diff_review.infra.ui")
 local session = require("diff_review.session")
 local syntax_engine = require("diff_review.render.syntax_engine")
-local perf_trace = require("diff_review.infra.perf_trace")
 
 local M = {}
-
--- Register this module as the perf_trace debug sink so spans and events also reach the dev perf log.
-perf_trace.set_debug_sink(M)
 
 function M.enabled()
   local global_enabled = vim.g.diff_review_gitstatus_debug
@@ -58,108 +51,6 @@ function M.event(event, payload)
   end
 end
 
-function M.perf_enabled()
-  local options = config.options or config.options or config.defaults
-  local global_enabled = vim.g.diff_review_gitstatus_perf
-  return dr()._gitstatus_debug_perf_force == true
-    or dr()._gitstatus_debug_perf_enabled == true
-    or global_enabled == true
-    or global_enabled == 1
-    or (options and options.perf_logging == true)
-    or M.enabled()
-end
-
----@return integer
-function M.perf_now()
-  local uv = vim.uv or vim.loop
-  if uv and uv.hrtime then return uv.hrtime() end
-  return math.floor(vim.fn.reltimefloat(vim.fn.reltime()) * 1000000000)
-end
-
----@param started integer
----@return number
-function M.perf_elapsed_ms(started)
-  local elapsed = M.perf_now() - started
-  return math.floor((elapsed / 1000000) * 1000 + 0.5) / 1000
-end
-
-function M.flush_perf()
-  local lines = dr()._gitstatus_debug_perf_queue
-  dr()._gitstatus_debug_perf_queue = nil
-  dr()._gitstatus_debug_perf_flush_pending = false
-  if not (lines and #lines > 0) then return end
-  local path = dr()._gitstatus_debug_log_path()
-  local text = table.concat(lines, "\n") .. "\n"
-  local uv = vim.uv or vim.loop
-  local function report_error(err)
-    if not err then return end
-    pcall(vim.schedule, function()
-      notifications.debug("GitStatus perf log failed: " .. tostring(err), vim.log.levels.WARN, { title = "GitStatus" })
-    end)
-  end
-  if uv and uv.fs_open and uv.fs_write and uv.fs_close then
-    uv.fs_open(path, "a", 438, function(open_err, fd)
-      if open_err or not fd then
-        report_error(open_err or "open failed")
-        return
-      end
-      uv.fs_write(fd, text, -1, function(write_err)
-        uv.fs_close(fd, function(close_err)
-          report_error(write_err or close_err)
-        end)
-      end)
-    end)
-    return
-  end
-  local ok, err = pcall(vim.fn.writefile, lines, dr()._gitstatus_debug_log_path(), "a")
-  if not ok then
-    notifications.debug("GitStatus perf log failed: " .. tostring(err), vim.log.levels.WARN, { title = "GitStatus" })
-  end
-end
-
----@param event string
----@param payload? table
-function M.perf_event(event, payload)
-  if not M.perf_enabled() then return end
-  dr()._gitstatus_debug_perf_sequence = (dr()._gitstatus_debug_perf_sequence or 0) + 1
-  local line = ("GitStatus perf seq=%d time=%s event=%s payload=%s"):format(
-    dr()._gitstatus_debug_perf_sequence,
-    os.date("%Y-%m-%d %H:%M:%S"),
-    tostring(event),
-    M.one_line(payload or {})
-  )
-  dr()._gitstatus_debug_perf_queue = dr()._gitstatus_debug_perf_queue or {}
-  dr()._gitstatus_debug_perf_queue[#dr()._gitstatus_debug_perf_queue + 1] = line
-  if dr()._gitstatus_debug_perf_flush_pending then return end
-  dr()._gitstatus_debug_perf_flush_pending = true
-  vim.defer_fn(function()
-    M.flush_perf()
-  end, 25)
-end
-
----@param event string
----@param payload table?
----@param callback fun(): any
----@return any
-function M.perf_span(event, payload, callback)
-  if not M.perf_enabled() then return callback() end
-  local started = M.perf_now()
-  local function pack_results(...)
-    return { n = select("#", ...), ... }
-  end
-  local results = pack_results(pcall(callback))
-  local ok = results[1]
-  local next_payload = vim.deepcopy(payload or {})
-  next_payload.ms = M.perf_elapsed_ms(started)
-  if not ok then
-    next_payload.error = tostring(results[2])
-    M.perf_event(event .. ".error", next_payload)
-    error(results[2], 0)
-  end
-  M.perf_event(event, next_payload)
-  local unpack_values = table.unpack or _G.unpack
-  return unpack_values(results, 2, results.n)
-end
 function M.row_text(row)
   if type(row) ~= "table" then return M.text(row) end
   local parts = {}

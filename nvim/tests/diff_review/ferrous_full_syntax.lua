@@ -38,8 +38,10 @@ local function git_lines(args)
   return output
 end
 
-local full_unstaged_diff = git_lines({ "-c", "core.quotepath=false", "diff", "--no-color", "--no-ext-diff", "--unified=0" })
-local full_staged_diff = git_lines({ "-c", "core.quotepath=false", "diff", "--no-color", "--no-ext-diff", "--unified=0", "--cached" })
+local full_unstaged_diff = git_lines({ "-c", "core.quotepath=false", "diff", "--no-color", "--no-ext-diff", "--unified=0", "--diff-filter=MRC" })
+local full_staged_diff = git_lines({ "-c", "core.quotepath=false", "diff", "--no-color", "--no-ext-diff", "--unified=0", "--cached", "--diff-filter=MRC" })
+local full_unstaged_added_numstat = {}
+local full_staged_added_numstat = {}
 local full_unstaged_name_status = git_lines({ "diff", "--name-status" })
 local full_staged_name_status = git_lines({ "diff", "--cached", "--name-status" })
 local full_untracked = git_lines({ "ls-files", "--others", "--exclude-standard" })
@@ -119,11 +121,16 @@ function backend.system(command)
   local key = command_key(command)
   local status_key = "git\t--no-optional-locks\t-C\t" .. ferrous_root
     .. "\tstatus\t--porcelain=v2\t-z\t--untracked-files=all"
-  local unstaged_key = "git\t--no-optional-locks\t-C\t" .. ferrous_root
+  local diff_key = "git\t--no-optional-locks\t-C\t" .. ferrous_root
     .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0"
+  local unstaged_key = diff_key .. "\t--diff-filter=MRC"
+  local staged_key = diff_key .. "\t--cached\t--diff-filter=MRC"
+  local numstat_key = "git\t--no-optional-locks\t-C\t" .. ferrous_root .. "\t-c\tcore.quotepath=false\tdiff"
   if key == status_key then return full_status_snapshot_text(), 0 end
   if key == unstaged_key then return table.concat(full_unstaged_diff, "\n"), 0 end
-  if key == unstaged_key .. "\t--cached" then return table.concat(full_staged_diff, "\n"), 0 end
+  if key == staged_key then return table.concat(full_staged_diff, "\n"), 0 end
+  if key == numstat_key .. "\t--numstat\t-z\t--diff-filter=A" then return table.concat(full_unstaged_added_numstat, "\n"), 0 end
+  if key == numstat_key .. "\t--cached\t--numstat\t-z\t--diff-filter=A" then return table.concat(full_staged_added_numstat, "\n"), 0 end
   return "", 0
 end
 

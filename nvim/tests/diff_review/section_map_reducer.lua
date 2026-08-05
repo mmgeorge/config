@@ -267,12 +267,12 @@ local function assert_normal_stage_matches_authoritative_snapshot()
 end
 
 local function assert_load_failure_completes_without_empty_sections()
-  local original_collector = git_data._collect_items_from_git
+  local original_collector = git_data._collect_status_snapshot_async
   local original_head_loader = status_head._status_head_lines_async
   local expected_error = { kind = "command", message = "snapshot failed" } ---@type DiffReviewPathStatusSnapshotError
   local callback_count = 0
   local callback_result = nil ---@type DiffReviewStatusLoadResult?
-  git_data._collect_items_from_git = function(_, callback) callback(nil, expected_error) end
+  git_data._collect_status_snapshot_async = function(_, callback) callback(nil, expected_error) end
   status_head._status_head_lines_async = function() end
 
   section_map._status_load_async("D:/repo", function(result)
@@ -280,7 +280,7 @@ local function assert_load_failure_completes_without_empty_sections()
     callback_result = result
   end)
 
-  git_data._collect_items_from_git = original_collector
+  git_data._collect_status_snapshot_async = original_collector
   status_head._status_head_lines_async = original_head_loader
   assert_equal(callback_count, 1, "status load failure did not complete exactly once")
   assert_true(callback_result and callback_result.error == expected_error, "status load failure lost the collector error")

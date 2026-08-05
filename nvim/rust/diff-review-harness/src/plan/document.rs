@@ -241,40 +241,6 @@ pub enum TestCategory {
     Integration,
 }
 
-/// Defines how one flow value should render and participate in review.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PlanFlowValueKind {
-    Type,
-    Text,
-}
-
-/// Defines the semantic value crossing from one flow step to its consumer.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum PlanFlowValue {
-    Type { name: String },
-    Text { text: String },
-}
-
-impl PlanFlowValue {
-    /// Resolve the stable semantic kind used by navigation and presentation.
-    pub fn kind(&self) -> PlanFlowValueKind {
-        match self {
-            Self::Type { .. } => PlanFlowValueKind::Type,
-            Self::Text { .. } => PlanFlowValueKind::Text,
-        }
-    }
-
-    /// Resolve the reviewer-visible value without discarding its semantic kind.
-    pub fn text(&self) -> &str {
-        match self {
-            Self::Type { name } => name,
-            Self::Text { text } => text,
-        }
-    }
-}
-
 /// Defines whether one invoked callable is a free function or a method.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -291,67 +257,57 @@ pub struct PlanCallable {
     pub name: String,
 }
 
-/// Defines one typed runtime relationship between two flow participants.
+/// Defines one runtime relationship between two flow participants.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
 pub enum PlanFlowRelation {
     /// Creates one instance of the target type.
     Construct,
     /// Invokes a callable for its returned value or behavior.
-    Call { callable: PlanCallable },
+    Call,
     /// Obtains data through a callable without assigning ownership semantics from prose.
-    Read { callable: PlanCallable },
+    Read,
     /// Mutates or persists state through a callable.
-    Write { callable: PlanCallable },
-    /// Transfers the named event or request to the target.
-    Send { event: String },
-    /// Produces an observable effect at the target. The relation contains only kind; describe the produced effect in the edge result.
+    Write,
+    /// Transfers one typed payload to the target.
+    Send,
+    /// Produces one typed payload at the target.
     Emit,
-    /// Sends a result back to the target. The relation contains only kind; describe the returned value in the edge result.
+    /// Transfers one typed payload back to the target.
     Return,
 }
 
-impl PlanFlowRelation {
-    /// Render the runtime relationship without inferring semantics from prose.
-    pub fn label(&self) -> String {
-        match self {
-            Self::Construct => "Construct".into(),
-            Self::Call { callable } => format!("Call {}()", callable.name),
-            Self::Read { callable } => format!("Read {}()", callable.name),
-            Self::Write { callable } => format!("Write {}()", callable.name),
-            Self::Send { event } => format!("Send {event}"),
-            Self::Emit => "Emit".into(),
-            Self::Return => "Return".into(),
-        }
-    }
+/// Describes the success and failure types returned by one callable.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanFlowReturnType {
+    pub value_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_type: Option<String>,
 }
 
-/// Connects one flow step owner to a concrete runtime receiver.
+/// Connects one flow participant to a concrete runtime receiver.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlanFlowEdge {
     pub relation: PlanFlowRelation,
     pub target: EntityReference,
-    pub expansion: Vec<PlanFlowStep>,
-    pub result: Option<PlanFlowValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callable: Option<PlanCallable>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_type: Option<PlanFlowReturnType>,
+    pub expansion: Vec<PlanFlowEdge>,
+    pub branches: Vec<PlanFlowBranch>,
 }
 
-/// Represents one labeled continuation from an acting flow step.
+/// Represents one conditional continuation from a runtime relationship.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlanFlowBranch {
     pub condition: String,
-    pub steps: Vec<PlanFlowStep>,
-}
-
-/// Represents one boundary in an affected runtime or data flow.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct PlanFlowStep {
-    pub action: String,
-    pub target: EntityReference,
     pub edges: Vec<PlanFlowEdge>,
-    pub branches: Vec<PlanFlowBranch>,
 }
 
 /// Represents one independent runtime, data, request, or recovery flow.
@@ -360,7 +316,8 @@ pub struct PlanFlowStep {
 pub struct PlanFlow {
     pub title: String,
     pub description: String,
-    pub steps: Vec<PlanFlowStep>,
+    pub source: EntityReference,
+    pub edges: Vec<PlanFlowEdge>,
 }
 
 /// Defines one local architectural move inside a source file.
@@ -627,7 +584,7 @@ pub struct PlanTask {
 }
 
 pub const PROVISIONAL_PLAN_TITLE: &str = "Planning in progress";
-pub const PLAN_SCHEMA_VERSION: u32 = 3;
+pub const PLAN_SCHEMA_VERSION: u32 = 4;
 
 /// Owns the complete canonical plan consumed by review and execution.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -718,23 +675,20 @@ pub(crate) fn test_fixture(plan_id: &str, overview: &str) -> PlanDocument {
         flows: vec![PlanFlow {
             title: "Execution".into(),
             description: "Start from the accepted plan and produce executable work. Keep planning ownership distinct from execution state.".into(),
-            steps: vec![PlanFlowStep {
-                action: "Read plan".into(),
-                target: EntityReference::PlannedEntity {
-                    entity: "PlanDocument".into(),
+            source: EntityReference::PlannedEntity {
+                entity: "PlanDocument".into(),
+            },
+            edges: vec![PlanFlowEdge {
+                relation: PlanFlowRelation::Return,
+                target: EntityReference::ExternalEntity {
+                    entity_kind: ReferencedEntityKind::Endpoint,
+                    name: "execution scheduler".into(),
+                    dependency: None,
                 },
-                edges: vec![PlanFlowEdge {
-                    relation: PlanFlowRelation::Return,
-                    target: EntityReference::ExternalEntity {
-                        entity_kind: ReferencedEntityKind::Endpoint,
-                        name: "execution scheduler".into(),
-                        dependency: None,
-                    },
-                    expansion: Vec::new(),
-                    result: Some(PlanFlowValue::Type {
-                        name: "ExecutablePlan".into(),
-                    }),
-                }],
+                callable: None,
+                payload_type: Some("ExecutablePlan".into()),
+                return_type: None,
+                expansion: Vec::new(),
                 branches: Vec::new(),
             }],
         }],
@@ -842,57 +796,29 @@ mod test {
     }
 
     #[test]
-    fn deserializes_only_structured_flow_values() {
-        assert_eq!(
-            serde_json::from_value::<PlanFlowValue>(serde_json::json!({
-                "kind": "type",
-                "name": "PathBuf"
-            }))
-            .unwrap(),
-            PlanFlowValue::Type {
-                name: "PathBuf".into()
-            }
-        );
-        assert_eq!(
-            serde_json::from_value::<PlanFlowValue>(serde_json::json!({
-                "kind": "text",
-                "text": "registered table"
-            }))
-            .unwrap(),
-            PlanFlowValue::Text {
-                text: "registered table".into()
-            }
-        );
-        assert!(serde_json::from_value::<PlanFlowValue>(serde_json::json!("PathBuf")).is_err());
+    fn deserializes_structured_callable_return_types() {
+        let return_type = serde_json::from_value::<PlanFlowReturnType>(serde_json::json!({
+            "value_type": "InspectionReport",
+            "error_type": "InspectError"
+        }))
+        .unwrap();
+        assert_eq!(return_type.value_type, "InspectionReport");
+        assert_eq!(return_type.error_type.as_deref(), Some("InspectError"));
     }
 
     #[test]
     fn deserializes_typed_runtime_edges_and_rejects_legacy_step_transitions() {
         let edge = serde_json::from_value::<PlanFlowEdge>(serde_json::json!({
-            "relation": {
-                "kind": "call",
-                "callable": {"kind": "method", "name": "inspect"}
-            },
+            "relation": "call",
             "target": {"kind": "planned_entity", "entity": "GeoParquetInspector"},
+            "callable": {"kind": "method", "name": "inspect"},
             "expansion": [],
-            "result": {"kind": "type", "name": "InspectionReport"}
+            "branches": [],
+            "return_type": {"value_type": "InspectionReport"}
         }))
         .unwrap();
-        assert!(matches!(
-            edge.relation,
-            PlanFlowRelation::Call { callable }
-                if callable.kind == PlanCallableKind::Method && callable.name == "inspect"
-        ));
-
-        assert!(
-            serde_json::from_value::<PlanFlowStep>(serde_json::json!({
-                "action": "Inspect dataset",
-                "target": {"kind": "planned_entity", "entity": "GeoParquetInspector"},
-                "operations": [],
-                "value_to_next": {"kind": "type", "name": "InspectionReport"}
-            }))
-            .is_err()
-        );
+        assert_eq!(edge.relation, PlanFlowRelation::Call);
+        assert_eq!(edge.callable.unwrap().name, "inspect");
     }
 
     #[test]
@@ -900,35 +826,22 @@ mod test {
         let flow = serde_json::from_value::<PlanFlow>(serde_json::json!({
             "title": "Inspection",
             "description": "Inspect one file and return a report. Keep file interpretation inside the inspector.",
-            "steps": [{
-                "action": "Parse local file path",
-                "target": {"kind": "planned_entity", "entity": "main"},
-                "edges": [{
-                    "relation": {
-                        "kind": "call",
-                        "callable": {"kind": "method", "name": "inspect"}
-                    },
+            "source": {"kind": "planned_entity", "entity": "main"},
+            "edges": [{
+                    "relation": "call",
                     "target": {
                         "kind": "planned_entity",
                         "entity": "GeoParquetInspector"
                     },
-                    "expansion": [{
-                        "action": "Read metadata",
-                        "target": {
-                            "kind": "planned_entity",
-                            "entity": "GeoParquetInspector"
-                        },
-                        "edges": [],
-                        "branches": []
-                    }],
-                    "result": {"kind": "type", "name": "InspectionReport"}
-                }],
-                "branches": [{
+                    "callable": {"kind": "method", "name": "inspect"},
+                    "expansion": [],
+                    "branches": [{
                     "condition": "failure",
-                    "steps": [{
-                        "action": "Emit failure",
-                        "target": {"kind": "planned_entity", "entity": "main"},
-                        "edges": [],
+                    "edges": [{
+                        "relation": "emit",
+                        "target": {"kind": "external_entity", "entity_kind":"endpoint", "name": "stderr", "dependency": null},
+                        "payload_type": "InspectError",
+                        "expansion": [],
                         "branches": []
                     }]
                 }]
@@ -936,22 +849,12 @@ mod test {
         }))
         .unwrap();
 
-        assert_eq!(flow.steps[0].edges[0].expansion[0].action, "Read metadata");
-        assert_eq!(flow.steps[0].branches[0].condition, "failure");
-
-        assert!(
-            serde_json::from_value::<PlanFlowStep>(serde_json::json!({
-                "action": "Inspect",
-                "target": {"kind": "planned_entity", "entity": "Inspector"},
-                "edges": []
-            }))
-            .is_err()
-        );
+        assert_eq!(flow.edges[0].branches[0].condition, "failure");
         assert!(
             serde_json::from_value::<PlanFlowEdge>(serde_json::json!({
-                "relation": {"kind": "construct"},
+                "relation": "construct",
                 "target": {"kind": "planned_entity", "entity": "Inspector"},
-                "result": null
+                "expansion": []
             }))
             .is_err()
         );
@@ -1002,59 +905,41 @@ mod test {
     #[test]
     fn serializes_tagged_entity_references() {
         let mut document = test_fixture("plan", "Build structured planning.");
-        document.flows[0].steps.push(PlanFlowStep {
-            action: "Validate plan".into(),
-            target: EntityReference::WorkspaceEntity {
-                entity_kind: ReferencedEntityKind::Type,
-                name: "PlanValidator".into(),
-                path: "src/plan/validation.rs".into(),
-                line: 76,
-            },
-            edges: Vec::new(),
-            branches: Vec::new(),
-        });
-        document.flows[0].steps.push(PlanFlowStep {
-            action: "Print result".into(),
-            target: EntityReference::ExternalEntity {
-                entity_kind: ReferencedEntityKind::Endpoint,
-                name: "terminal stdout".into(),
-                dependency: None,
-            },
-            edges: Vec::new(),
-            branches: Vec::new(),
-        });
+        document.flows[0].source = EntityReference::WorkspaceEntity {
+            entity_kind: ReferencedEntityKind::Type,
+            name: "PlanValidator".into(),
+            path: "src/plan/validation.rs".into(),
+            line: 76,
+        };
+        document.flows[0].edges[0].target = EntityReference::ExternalEntity {
+            entity_kind: ReferencedEntityKind::Endpoint,
+            name: "terminal stdout".into(),
+            dependency: None,
+        };
         let value = serde_json::to_value(document).unwrap();
 
         assert_eq!(
-            value.pointer("/flows/0/steps/0/target/kind"),
-            Some(&serde_json::json!("planned_entity"))
-        );
-        assert_eq!(
-            value.pointer("/flows/0/steps/0/target/entity"),
-            Some(&serde_json::json!("PlanDocument"))
-        );
-        assert_eq!(
-            value.pointer("/flows/0/steps/1/target/kind"),
+            value.pointer("/flows/0/source/kind"),
             Some(&serde_json::json!("workspace_entity"))
         );
         assert_eq!(
-            value.pointer("/flows/0/steps/1/target/path"),
+            value.pointer("/flows/0/source/path"),
             Some(&serde_json::json!("src/plan/validation.rs"))
         );
         assert_eq!(
-            value.pointer("/flows/0/steps/1/target/line"),
+            value.pointer("/flows/0/source/line"),
             Some(&serde_json::json!(76))
         );
         assert_eq!(
-            value.pointer("/flows/0/steps/2/target/kind"),
+            value.pointer("/flows/0/edges/0/target/kind"),
             Some(&serde_json::json!("external_entity"))
         );
         assert_eq!(
-            value.pointer("/flows/0/steps/2/target/name"),
+            value.pointer("/flows/0/edges/0/target/name"),
             Some(&serde_json::json!("terminal stdout"))
         );
         assert_eq!(
-            value.pointer("/flows/0/steps/2/target/entity_kind"),
+            value.pointer("/flows/0/edges/0/target/entity_kind"),
             Some(&serde_json::json!("endpoint"))
         );
     }
@@ -1073,22 +958,24 @@ mod test {
     #[test]
     fn model_json_omits_generated_node_ids() {
         let mut document = test_fixture("plan", "Build structured planning.");
-        document.flows[0].steps[0].edges.push(PlanFlowEdge {
-            relation: PlanFlowRelation::Call {
-                callable: PlanCallable {
-                    kind: PlanCallableKind::Method,
-                    name: "validate".into(),
-                },
-            },
+        document.flows[0].edges.push(PlanFlowEdge {
+            relation: PlanFlowRelation::Call,
             target: EntityReference::ExternalEntity {
                 entity_kind: ReferencedEntityKind::Type,
                 name: "PlanValidator".into(),
                 dependency: None,
             },
-            expansion: Vec::new(),
-            result: Some(PlanFlowValue::Type {
-                name: "ValidatedPlan".into(),
+            callable: Some(PlanCallable {
+                kind: PlanCallableKind::Method,
+                name: "validate".into(),
             }),
+            payload_type: None,
+            return_type: Some(PlanFlowReturnType {
+                value_type: "ValidatedPlan".into(),
+                error_type: None,
+            }),
+            expansion: Vec::new(),
+            branches: Vec::new(),
         });
         document.dependencies.push(PlanDependencyChange {
             action: ChangeAction::Add,
@@ -1112,7 +999,7 @@ mod test {
         assert!(!model_json.contains("subtask_id"));
         assert!(model_json.contains(r#""kind": "method""#));
         assert!(model_json.contains(r#""name": "validate""#));
-        assert!(model_json.contains(r#""name": "ValidatedPlan""#));
+        assert!(model_json.contains(r#""value_type": "ValidatedPlan""#));
     }
 
     #[test]
@@ -1125,6 +1012,6 @@ mod test {
         let mut document = test_fixture("plan", "Version plans.");
         document.schema_version = PLAN_SCHEMA_VERSION + 1;
         let unsupported = document.validate().unwrap_err().to_string();
-        assert!(unsupported.contains("supported PlanDocument schema version 3"));
+        assert!(unsupported.contains("supported PlanDocument schema version 4"));
     }
 }

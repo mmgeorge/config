@@ -79,7 +79,7 @@ pub enum PlanReviewTarget {
         workspace_line: Option<usize>,
     },
     FlowEdgeResult {
-        value_kind: PlanFlowValueKind,
+        type_name: String,
     },
     FlowBranch {
         condition: String,
@@ -707,54 +707,41 @@ fn render_flow_rows(
     flow: &PlanFlow,
     flow_path: &str,
 ) {
-    let row_group_list = flow
-        .steps
+    let mut row_list = Vec::new();
+    for (edge_index, edge) in flow.edges.iter().enumerate() {
+        collect_flow_edge_rows(
+            &mut row_list,
+            graph,
+            edge,
+            &format!("{flow_path}/edges/{edge_index}"),
+            &[],
+            edge_index + 1 == flow.edges.len(),
+        );
+    }
+    let preferred_owner_column = row_list
         .iter()
-        .enumerate()
-        .map(|(step_index, step)| {
-            let mut row_list = Vec::new();
-            collect_flow_step_rows(
-                &mut row_list,
-                graph,
-                step,
-                &format!("{flow_path}/steps/{step_index}"),
-                &[],
-                None,
-            );
-            row_list
-        })
-        .collect::<Vec<_>>();
-    let preferred_owner_column = row_group_list
-        .iter()
-        .flatten()
         .map(|row| row.content.chars().count())
         .max()
         .unwrap_or_default()
         + 4;
-    let widest_owner = row_group_list
+    let widest_owner = row_list
         .iter()
-        .flatten()
         .filter_map(|row| row.path.as_ref())
         .map(|path| path.chars().count() + 2)
         .max()
         .unwrap_or_default();
     let owner_column = preferred_owner_column.min(PLAN_LINE_WIDTH.saturating_sub(widest_owner));
 
-    for (group_index, row_group) in row_group_list.into_iter().enumerate() {
-        for row in row_group {
-            push_owned_flow_line(
-                renderer,
-                row.content,
-                row.path,
-                owner_column,
-                row.target,
-                &row.json_path,
-                row.label,
-            );
-        }
-        if group_index + 1 < flow.steps.len() {
-            renderer.blank();
-        }
+    for row in row_list {
+        push_owned_flow_line(
+            renderer,
+            row.content,
+            row.path,
+            owner_column,
+            row.target,
+            &row.json_path,
+            row.label,
+        );
     }
 }
 
@@ -764,55 +751,6 @@ struct FlowRenderRow {
     target: PlanReviewTarget,
     json_path: String,
     label: String,
-}
-
-fn collect_flow_step_rows(
-    row_list: &mut Vec<FlowRenderRow>,
-    graph: &PlanGraph<'_>,
-    step: &PlanFlowStep,
-    step_path: &str,
-    ancestor_last_list: &[bool],
-    is_last: Option<bool>,
-) {
-    row_list.push(FlowRenderRow {
-        content: flow_tree_content(ancestor_last_list, is_last, &flow_step_content(graph, step)),
-        path: flow_target_path(graph, &step.target),
-        target: PlanReviewTarget::FlowStep {
-            reference_kind: entity_reference_kind(&step.target),
-            target_name: entity_reference_label(graph, &step.target),
-            target_is_type: entity_reference_is_type(graph, &step.target),
-            workspace_path: entity_reference_workspace_path(&step.target),
-            workspace_line: entity_reference_workspace_line(&step.target),
-        },
-        json_path: step_path.to_owned(),
-        label: format!("Flow step: {}", step.action),
-    });
-
-    let mut child_ancestor_list = ancestor_last_list.to_vec();
-    if let Some(is_last) = is_last {
-        child_ancestor_list.push(is_last);
-    }
-    let child_count = step.edges.len() + step.branches.len();
-    for (edge_index, edge) in step.edges.iter().enumerate() {
-        collect_flow_edge_rows(
-            row_list,
-            graph,
-            edge,
-            &format!("{step_path}/edges/{edge_index}"),
-            &child_ancestor_list,
-            edge_index + 1 == child_count,
-        );
-    }
-    for (branch_index, branch) in step.branches.iter().enumerate() {
-        collect_flow_branch_rows(
-            row_list,
-            graph,
-            branch,
-            &format!("{step_path}/branches/{branch_index}"),
-            &child_ancestor_list,
-            step.edges.len() + branch_index + 1 == child_count,
-        );
-    }
 }
 
 fn collect_flow_edge_rows(
@@ -831,8 +769,8 @@ fn collect_flow_edge_rows(
         ),
         path: flow_target_path(graph, &edge.target),
         target: PlanReviewTarget::FlowEdge {
-            callable_kind: flow_edge_callable(edge).map(|callable| callable.kind),
-            callable_name: flow_edge_callable(edge).map(|callable| callable.name.clone()),
+            callable_kind: edge.callable.as_ref().map(|callable| callable.kind),
+            callable_name: edge.callable.as_ref().map(|callable| callable.name.clone()),
             reference_kind: entity_reference_kind(&edge.target),
             target_name: entity_reference_label(graph, &edge.target),
             target_is_type: entity_reference_is_type(graph, &edge.target),
@@ -840,37 +778,31 @@ fn collect_flow_edge_rows(
             workspace_line: entity_reference_workspace_line(&edge.target),
         },
         json_path: edge_path.to_owned(),
-        label: format!("Flow edge: {}", edge.relation.label()),
+        label: format!("Flow edge: {}", flow_relation_label(&edge.relation)),
     });
 
     let mut child_ancestor_list = ancestor_last_list.to_vec();
     child_ancestor_list.push(is_last);
-    let renders_result = edge.result.is_some() && !flow_edge_constructs_target(graph, edge);
-    let child_count = edge.expansion.len() + usize::from(renders_result);
+    let child_count = edge.expansion.len() + edge.branches.len();
     for (step_index, step) in edge.expansion.iter().enumerate() {
-        collect_flow_step_rows(
+        collect_flow_edge_rows(
             row_list,
             graph,
             step,
             &format!("{edge_path}/expansion/{step_index}"),
             &child_ancestor_list,
-            Some(step_index + 1 == child_count),
+            step_index + 1 == child_count,
         );
     }
-    if renders_result && let Some(result) = &edge.result {
-        row_list.push(FlowRenderRow {
-            content: flow_tree_content(
-                &child_ancestor_list,
-                Some(true),
-                &format!("→ {}", result.text()),
-            ),
-            path: None,
-            target: PlanReviewTarget::FlowEdgeResult {
-                value_kind: result.kind(),
-            },
-            json_path: format!("{edge_path}/result"),
-            label: format!("Flow edge result: {}", edge.relation.label()),
-        });
+    for (branch_index, branch) in edge.branches.iter().enumerate() {
+        collect_flow_branch_rows(
+            row_list,
+            graph,
+            branch,
+            &format!("{edge_path}/branches/{branch_index}"),
+            &child_ancestor_list,
+            edge.expansion.len() + branch_index + 1 == child_count,
+        );
     }
 }
 
@@ -898,14 +830,14 @@ fn collect_flow_branch_rows(
 
     let mut child_ancestor_list = ancestor_last_list.to_vec();
     child_ancestor_list.push(is_last);
-    for (step_index, step) in branch.steps.iter().enumerate() {
-        collect_flow_step_rows(
+    for (edge_index, edge) in branch.edges.iter().enumerate() {
+        collect_flow_edge_rows(
             row_list,
             graph,
-            step,
-            &format!("{branch_path}/steps/{step_index}"),
+            edge,
+            &format!("{branch_path}/edges/{edge_index}"),
             &child_ancestor_list,
-            Some(step_index + 1 == branch.steps.len()),
+            edge_index + 1 == branch.edges.len(),
         );
     }
 }
@@ -922,60 +854,47 @@ fn flow_tree_content(ancestor_last_list: &[bool], is_last: Option<bool>, content
     rendered
 }
 
-fn flow_step_content(graph: &PlanGraph<'_>, step: &PlanFlowStep) -> String {
-    format!(
-        "{}{} — {}",
-        if matches!(step.target, EntityReference::PlannedEntity { .. }) {
-            "*"
-        } else {
-            ""
-        },
-        entity_reference_label(graph, &step.target),
-        step.action
-    )
-}
-
 fn flow_edge_content(graph: &PlanGraph<'_>, edge: &PlanFlowEdge) -> String {
     let target = entity_reference_label(graph, &edge.target);
-    match &edge.relation {
+    let content = match edge.relation {
         PlanFlowRelation::Construct => format!("Construct {target}"),
-        PlanFlowRelation::Call { callable } if flow_edge_constructs_target(graph, edge) => {
-            format!("Construct {target}.{}()", callable.name)
-        }
-        PlanFlowRelation::Call { callable } => {
+        PlanFlowRelation::Call => {
+            let callable = edge.callable.as_ref().expect("validated callable");
             format!("Call {target}.{}()", callable.name)
         }
-        PlanFlowRelation::Read { callable } => {
+        PlanFlowRelation::Read => {
+            let callable = edge.callable.as_ref().expect("validated callable");
             format!("Read {target}.{}()", callable.name)
         }
-        PlanFlowRelation::Write { callable } => {
+        PlanFlowRelation::Write => {
+            let callable = edge.callable.as_ref().expect("validated callable");
             format!("Write {target}.{}()", callable.name)
         }
-        PlanFlowRelation::Send { event } => format!("Send {event} to {target}"),
+        PlanFlowRelation::Send => format!(
+            "Send {} to {target}",
+            edge.payload_type
+                .as_deref()
+                .expect("validated payload type")
+        ),
         PlanFlowRelation::Emit => format!("Emit to {target}"),
         PlanFlowRelation::Return => format!("Return to {target}"),
+    };
+    if let Some(return_type) = &edge.return_type {
+        format!("{content} → {}", return_type.value_type)
+    } else {
+        content
     }
 }
 
-fn flow_edge_constructs_target(graph: &PlanGraph<'_>, edge: &PlanFlowEdge) -> bool {
-    if matches!(edge.relation, PlanFlowRelation::Construct) {
-        return true;
-    }
-    matches!(
-        (&edge.relation, &edge.result),
-        (
-            PlanFlowRelation::Call { .. },
-            Some(PlanFlowValue::Type { name })
-        ) if name == &entity_reference_label(graph, &edge.target)
-    )
-}
-
-fn flow_edge_callable(edge: &PlanFlowEdge) -> Option<&PlanCallable> {
-    match &edge.relation {
-        PlanFlowRelation::Call { callable }
-        | PlanFlowRelation::Read { callable }
-        | PlanFlowRelation::Write { callable } => Some(callable),
-        _ => None,
+const fn flow_relation_label(relation: &PlanFlowRelation) -> &'static str {
+    match relation {
+        PlanFlowRelation::Construct => "Construct",
+        PlanFlowRelation::Call => "Call",
+        PlanFlowRelation::Read => "Read",
+        PlanFlowRelation::Write => "Write",
+        PlanFlowRelation::Send => "Send",
+        PlanFlowRelation::Emit => "Emit",
+        PlanFlowRelation::Return => "Return",
     }
 }
 
@@ -1205,14 +1124,11 @@ fn append_entity_cells(
         entity_anchor.clone(),
     );
     for (member_index, member) in entity.members.iter().enumerate() {
-        let mut member_declaration = format!(
+        let member_declaration = format!(
             "{} {}",
             visibility_marker(member.visibility),
             member_signature(member)
         );
-        if let Some(description) = &member.description {
-            member_declaration.push_str(&format!(" — {description}"));
-        }
         append_diagram_text(
             cell_list,
             &format!("{indent}  "),
@@ -1232,10 +1148,7 @@ fn append_entity_cells(
     }
     for (variant_index, variant) in entity.variants.iter().enumerate() {
         let variant_path = format!("{entity_path}/variants/{variant_index}");
-        let mut variant_declaration = variant.name.clone();
-        if let Some(description) = &variant.description {
-            variant_declaration.push_str(&format!(" — {description}"));
-        }
+        let variant_declaration = variant.name.clone();
         append_diagram_text(
             cell_list,
             &format!("{indent}  "),
@@ -1253,10 +1166,7 @@ fn append_entity_cells(
             },
         );
         for (field_index, field) in variant.fields.iter().enumerate() {
-            let mut field_declaration = format!("{}: {}", field.name, field.type_name);
-            if let Some(description) = &field.description {
-                field_declaration.push_str(&format!(" — {description}"));
-            }
+            let field_declaration = format!("{}: {}", field.name, field.type_name);
             append_diagram_text(
                 cell_list,
                 &format!("{indent}    "),
@@ -1925,11 +1835,11 @@ mod test {
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
-        assert!(normalized_markdown.contains(
-            "+ inspect(path: &Path): Result<InspectionReport, InspectionError> — Inspect one local file."
-        ));
-        let description_position = rendered.markdown.find("Inspect one local file.").unwrap();
-        assert!(description_position < report_position);
+        assert!(
+            normalized_markdown
+                .contains("+ inspect(path: &Path): Result<InspectionReport, InspectionError>")
+        );
+        assert!(!rendered.markdown.contains("Inspect one local file."));
         assert!(
             rendered
                 .markdown
@@ -2111,16 +2021,10 @@ mod test {
             codex_path_column,
             DIAGRAM_CONCRETE_COLUMN + DIAGRAM_PATH_COLUMN_MAX + 3
         );
-        assert!(
-            rendered
-                .markdown
-                .contains("+ run(): Result — Run one request.")
-        );
-        assert!(
-            rendered
-                .markdown
-                .contains("- client: Client — Owns the provider client.")
-        );
+        assert!(rendered.markdown.contains("+ run(): Result"));
+        assert!(rendered.markdown.contains("- client: Client"));
+        assert!(!rendered.markdown.contains("Run one request."));
+        assert!(!rendered.markdown.contains("Owns the provider client."));
         let child_line = rendered
             .markdown
             .lines()
@@ -2294,617 +2198,55 @@ mod test {
     }
 
     #[test]
-    fn renders_flow_diagrams_inside_text_fences() {
-        let rendered = render_plan(&test_fixture("plan", "Overview")).unwrap();
-
-        assert!(rendered.markdown.contains(
-            "## Code flow: Execution\n\nStart from the accepted plan and produce executable \
-                     work. Keep planning ownership distinct from execution state.\n\n```text",
-        ));
-    }
-
-    #[test]
-    fn renders_flow_projection_as_typed_runtime_edges_with_aligned_owners() {
+    fn renders_edge_only_flows_with_inline_return_types() {
         let mut document = test_fixture("plan", "Overview");
-        document.flows[0].title = "DataFusion table inspection".into();
-        document.flows[0].steps = vec![
-            PlanFlowStep {
-                action: "Register local Parquet".into(),
-                target: EntityReference::ExternalEntity {
-                    entity_kind: ReferencedEntityKind::Type,
-                    name: "SessionContext".into(),
-                    dependency: Some("datafusion".into()),
-                },
-                edges: vec![PlanFlowEdge {
-                    relation: PlanFlowRelation::Write {
-                        callable: PlanCallable {
-                            kind: PlanCallableKind::Method,
-                            name: "register_table".into(),
-                        },
-                    },
-                    target: EntityReference::ExternalEntity {
-                        entity_kind: ReferencedEntityKind::Type,
-                        name: "SessionContext".into(),
-                        dependency: Some("datafusion".into()),
-                    },
-                    expansion: Vec::new(),
-                    result: Some(PlanFlowValue::Text {
-                        text: "registered table".into(),
-                    }),
-                }],
-                branches: Vec::new(),
-            },
-            PlanFlowStep {
-                action: "Read table observations".into(),
-                target: EntityReference::PlannedEntity {
-                    entity: "PlanDocument".into(),
-                },
-                edges: vec![
-                    PlanFlowEdge {
-                        relation: PlanFlowRelation::Read {
-                            callable: PlanCallable {
-                                kind: PlanCallableKind::Method,
-                                name: "schema".into(),
-                            },
-                        },
-                        target: EntityReference::ExternalEntity {
-                            entity_kind: ReferencedEntityKind::Type,
-                            name: "SessionContext".into(),
-                            dependency: Some("datafusion".into()),
-                        },
-                        expansion: Vec::new(),
-                        result: Some(PlanFlowValue::Text {
-                            text: "schema text".into(),
-                        }),
-                    },
-                    PlanFlowEdge {
-                        relation: PlanFlowRelation::Call {
-                            callable: PlanCallable {
-                                kind: PlanCallableKind::Method,
-                                name: "count".into(),
-                            },
-                        },
-                        target: EntityReference::ExternalEntity {
-                            entity_kind: ReferencedEntityKind::Type,
-                            name: "DataFrame".into(),
-                            dependency: Some("datafusion".into()),
-                        },
-                        expansion: Vec::new(),
-                        result: Some(PlanFlowValue::Type { name: "u64".into() }),
-                    },
-                ],
-                branches: Vec::new(),
-            },
-            PlanFlowStep {
-                action: "Assemble inspection summary".into(),
-                target: EntityReference::PlannedEntity {
-                    entity: "PlanDocument".into(),
-                },
-                edges: vec![PlanFlowEdge {
-                    relation: PlanFlowRelation::Return,
-                    target: EntityReference::ExternalEntity {
-                        entity_kind: ReferencedEntityKind::Endpoint,
-                        name: "CLI command".into(),
-                        dependency: None,
-                    },
-                    expansion: Vec::new(),
-                    result: Some(PlanFlowValue::Type {
-                        name: "InspectionSummary".into(),
-                    }),
-                }],
-                branches: Vec::new(),
-            },
-            PlanFlowStep {
-                action: "Render inspection output".into(),
-                target: EntityReference::PlannedEntity {
-                    entity: "PlanDocument".into(),
-                },
-                edges: vec![PlanFlowEdge {
-                    relation: PlanFlowRelation::Emit,
-                    target: EntityReference::ExternalEntity {
-                        entity_kind: ReferencedEntityKind::Endpoint,
-                        name: "terminal stdout".into(),
-                        dependency: None,
-                    },
-                    expansion: Vec::new(),
-                    result: Some(PlanFlowValue::Text {
-                        text: "stdout".into(),
-                    }),
-                }],
-                branches: Vec::new(),
-            },
-        ];
-
-        let rendered = render_plan(&document).unwrap();
-        let diagram = rendered
-            .markdown
-            .split("## Code flow: DataFusion table inspection")
-            .nth(1)
-            .expect("flow section")
-            .split("```text\n")
-            .nth(1)
-            .expect("flow fence")
-            .split("\n```")
-            .next()
-            .expect("flow diagram");
-        let diagram_line_list = diagram.lines().collect::<Vec<_>>();
-
-        let expected_content_list = [
-            "SessionContext — Register local Parquet",
-            "└─ Write SessionContext.register_table()",
-            "   └─ → registered table",
-            "",
-            "*PlanDocument — Read table observations",
-            "├─ Read SessionContext.schema()",
-            "│  └─ → schema text",
-            "└─ Call DataFrame.count()",
-            "   └─ → u64",
-            "",
-            "*PlanDocument — Assemble inspection summary",
-            "└─ Return to CLI command",
-            "   └─ → InspectionSummary",
-            "",
-            "*PlanDocument — Render inspection output",
-            "└─ Emit to terminal stdout",
-            "   └─ → stdout",
-        ];
-        assert_eq!(diagram_line_list.len(), expected_content_list.len());
-        let mut owner_column_list = Vec::new();
-        for (line, expected_content) in diagram_line_list.iter().zip(expected_content_list) {
-            assert!(line.starts_with(expected_content));
-            if let Some(owner_byte_index) = line.find('[') {
-                owner_column_list.push(line[..owner_byte_index].chars().count());
-            }
-        }
-        assert_eq!(owner_column_list.len(), 3);
-        assert!(diagram_line_list[4].ends_with("[src/plan.rs]"));
-        assert!(diagram_line_list[10].ends_with("[src/plan.rs]"));
-        assert!(diagram_line_list[14].ends_with("[src/plan.rs]"));
-        assert!(!diagram.contains("[SessionContext]"));
-        assert!(!diagram.contains("[DataFrame]"));
-        assert!(!diagram.contains("[CLI command]"));
-        assert!(!diagram.contains("[terminal stdout]"));
-        assert!(
-            diagram_line_list
-                .iter()
-                .all(|line| line.chars().count() <= PLAN_LINE_WIDTH)
-        );
-        for action in [
-            "Register local Parquet",
-            "Read table observations",
-            "SessionContext.schema()",
-            "DataFrame.count()",
-            "Assemble inspection summary",
-            "Render inspection output",
-        ] {
-            assert_eq!(
-                diagram.matches(action).count(),
-                1,
-                "{action} must render once"
-            );
-        }
-        assert!(!diagram.contains("DataFusion table inspection"));
-
-        let schema_edge_anchor = rendered
-            .navigation
-            .anchor
-            .iter()
-            .find(|anchor| anchor.json_path == "/flows/0/steps/1/edges/0")
-            .expect("schema edge anchor");
-        assert_eq!(schema_edge_anchor.json_path, "/flows/0/steps/1/edges/0");
-        assert!(matches!(
-            &schema_edge_anchor.target,
-            PlanReviewTarget::FlowEdge {
-                callable_kind: Some(PlanCallableKind::Method),
-                callable_name: Some(callable_name),
-                target_name,
-                target_is_type: true,
-                ..
-            } if callable_name == "schema" && target_name == "SessionContext"
-        ));
-        let typed_value_anchor = rendered
-            .navigation
-            .anchor
-            .iter()
-            .find(|anchor| anchor.json_path == "/flows/0/steps/2/edges/0/result")
-            .expect("typed flow value anchor");
-        assert!(matches!(
-            typed_value_anchor.target,
-            PlanReviewTarget::FlowEdgeResult {
-                value_kind: PlanFlowValueKind::Type,
-                ..
-            }
-        ));
-        let text_value_anchor = rendered
-            .navigation
-            .anchor
-            .iter()
-            .find(|anchor| anchor.json_path == "/flows/0/steps/0/edges/0/result")
-            .expect("text flow value anchor");
-        assert!(matches!(
-            text_value_anchor.target,
-            PlanReviewTarget::FlowEdgeResult {
-                value_kind: PlanFlowValueKind::Text,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn renders_nested_expansions_and_labeled_branches_with_exact_anchors() {
-        let mut document = test_fixture("plan", "Overview");
-        document.flows[0].title = "Inspection routing".into();
-        let terminal_target = || EntityReference::ExternalEntity {
-            entity_kind: ReferencedEntityKind::Endpoint,
-            name: "terminal".into(),
-            dependency: None,
+        document.flows[0].source = EntityReference::PlannedEntity {
+            entity: "PlanDocument".into(),
         };
-        let terminal_step = |action: &str, result: &str| PlanFlowStep {
-            action: action.into(),
+        document.flows[0].edges = vec![PlanFlowEdge {
+            relation: PlanFlowRelation::Call,
             target: EntityReference::PlannedEntity {
                 entity: "PlanDocument".into(),
             },
-            edges: vec![PlanFlowEdge {
-                relation: PlanFlowRelation::Emit,
-                target: terminal_target(),
-                expansion: Vec::new(),
-                result: Some(PlanFlowValue::Text {
-                    text: result.into(),
-                }),
-            }],
-            branches: Vec::new(),
-        };
-        document.flows[0].steps = vec![PlanFlowStep {
-            action: "Route inspection".into(),
-            target: EntityReference::PlannedEntity {
-                entity: "PlanDocument".into(),
-            },
-            edges: vec![PlanFlowEdge {
-                relation: PlanFlowRelation::Call {
-                    callable: PlanCallable {
-                        kind: PlanCallableKind::Method,
-                        name: "validate".into(),
-                    },
-                },
-                target: EntityReference::PlannedEntity {
-                    entity: "PlanDocument".into(),
-                },
-                expansion: vec![PlanFlowStep {
-                    action: "Read metadata".into(),
-                    target: EntityReference::PlannedEntity {
-                        entity: "PlanDocument".into(),
-                    },
-                    edges: vec![PlanFlowEdge {
-                        relation: PlanFlowRelation::Read {
-                            callable: PlanCallable {
-                                kind: PlanCallableKind::Method,
-                                name: "schema".into(),
-                            },
-                        },
-                        target: EntityReference::ExternalEntity {
-                            entity_kind: ReferencedEntityKind::Type,
-                            name: "SessionContext".into(),
-                            dependency: Some("datafusion".into()),
-                        },
-                        expansion: Vec::new(),
-                        result: Some(PlanFlowValue::Type {
-                            name: "SchemaRef".into(),
-                        }),
-                    }],
-                    branches: Vec::new(),
-                }],
-                result: Some(PlanFlowValue::Type {
-                    name: "InspectionReport".into(),
-                }),
-            }],
-            branches: vec![
-                PlanFlowBranch {
-                    condition: "success".into(),
-                    steps: vec![terminal_step("Render report", "stdout")],
-                },
-                PlanFlowBranch {
-                    condition: "failure".into(),
-                    steps: vec![terminal_step("Emit failure", "stderr")],
-                },
-            ],
-        }];
-
-        let rendered = render_plan(&document).unwrap();
-        let diagram = rendered
-            .markdown
-            .split("## Code flow: Inspection routing")
-            .nth(1)
-            .expect("flow section")
-            .split("```text\n")
-            .nth(1)
-            .expect("flow fence")
-            .split("\n```")
-            .next()
-            .expect("flow diagram");
-        let content_list = diagram
-            .lines()
-            .map(|line| {
-                line.find('[')
-                    .map_or(line, |owner_start| line[..owner_start].trim_end())
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            content_list,
-            vec![
-                "*PlanDocument — Route inspection",
-                "├─ Call PlanDocument.validate()",
-                "│  ├─ *PlanDocument — Read metadata",
-                "│  │  └─ Read SessionContext.schema()",
-                "│  │     └─ → SchemaRef",
-                "│  └─ → InspectionReport",
-                "├─ when success",
-                "│  └─ *PlanDocument — Render report",
-                "│     └─ Emit to terminal",
-                "│        └─ → stdout",
-                "└─ when failure",
-                "   └─ *PlanDocument — Emit failure",
-                "      └─ Emit to terminal",
-                "         └─ → stderr",
-            ]
-        );
-        assert!(rendered.navigation.anchor.iter().any(|anchor| {
-            anchor.json_path == "/flows/0/steps/0/edges/0/expansion/0"
-                && matches!(
-                    anchor.target,
-                    PlanReviewTarget::FlowStep {
-                        target_is_type: true,
-                        ..
-                    }
-                )
-        }));
-        assert!(rendered.navigation.anchor.iter().any(|anchor| {
-            anchor.json_path == "/flows/0/steps/0/branches/0"
-                && matches!(
-                    &anchor.target,
-                    PlanReviewTarget::FlowBranch {
-                        condition,
-                        ..
-                    } if condition == "success"
-                )
-        }));
-    }
-
-    #[test]
-    fn renders_workspace_entities_with_repository_navigation_anchors() {
-        let mut document = test_fixture("plan", "Overview");
-        let step = &mut document.flows[0].steps[0];
-        step.target = EntityReference::WorkspaceEntity {
-            entity_kind: ReferencedEntityKind::Type,
-            name: "PlanValidator".into(),
-            path: "src/plan/validation.rs".into(),
-            line: 76,
-        };
-        let rendered = render_plan(&document).unwrap();
-        let anchor = rendered
-            .navigation
-            .anchor
-            .iter()
-            .find(|anchor| anchor.json_path == "/flows/0/steps/0")
-            .expect("workspace flow step anchor");
-
-        assert!(rendered.markdown.contains("[src/plan/validation.rs]"));
-        assert!(matches!(
-            &anchor.target,
-            PlanReviewTarget::FlowStep {
-                target_name,
-                workspace_path: Some(path),
-                workspace_line: Some(76),
-                ..
-            } if target_name == "PlanValidator" && path == "src/plan/validation.rs"
-        ));
-    }
-
-    #[test]
-    fn renders_even_a_short_flow_vertically() {
-        let rendered = render_plan(&test_fixture("plan", "Overview")).unwrap();
-        let diagram = rendered
-            .markdown
-            .split("## Code flow: Execution")
-            .nth(1)
-            .expect("flow section")
-            .split("```text\n")
-            .nth(1)
-            .expect("flow fence")
-            .split("\n```")
-            .next()
-            .expect("flow diagram");
-
-        assert!(diagram.contains("*PlanDocument — Read plan"));
-        assert!(diagram.contains("└─ Return to execution scheduler"));
-        assert!(diagram.contains("   └─ → ExecutablePlan"));
-    }
-
-    #[test]
-    fn omits_explicit_and_inferred_construct_results_because_the_value_is_implied() {
-        let mut document = test_fixture("plan", "Overview");
-        document.flows[0].steps[0].edges = vec![
-            PlanFlowEdge {
-                relation: PlanFlowRelation::Construct,
-                target: EntityReference::PlannedEntity {
-                    entity: "PlanDocument".into(),
-                },
-                expansion: Vec::new(),
-                result: Some(PlanFlowValue::Type {
-                    name: "PlanDocument".into(),
-                }),
-            },
-            PlanFlowEdge {
-                relation: PlanFlowRelation::Call {
-                    callable: PlanCallable {
-                        kind: PlanCallableKind::Function,
-                        name: "from_parts".into(),
-                    },
-                },
-                target: EntityReference::PlannedEntity {
-                    entity: "PlanDocument".into(),
-                },
-                expansion: Vec::new(),
-                result: Some(PlanFlowValue::Type {
-                    name: "PlanDocument".into(),
-                }),
-            },
-        ];
-
-        let rendered = render_plan(&document).unwrap();
-        let diagram = rendered
-            .markdown
-            .split("## Code flow: Execution")
-            .nth(1)
-            .expect("flow section")
-            .split("```text\n")
-            .nth(1)
-            .expect("flow fence")
-            .split("\n```")
-            .next()
-            .expect("flow diagram");
-
-        assert!(diagram.contains("├─ Construct PlanDocument"));
-        assert!(diagram.contains("└─ Construct PlanDocument.from_parts()"));
-        assert!(!diagram.contains("→ PlanDocument"));
-        for edge_index in 0..2 {
-            assert!(!rendered.navigation.anchor.iter().any(|anchor| {
-                anchor.json_path == format!("/flows/0/steps/0/edges/{edge_index}/result")
-            }));
-        }
-    }
-
-    #[test]
-    fn moves_an_owner_below_content_when_the_right_column_cannot_fit() {
-        let mut document = test_fixture("plan", "Overview");
-        let action = "Read a deliberately wide observation that consumes the diagram line width";
-        document.flows[0].steps = vec![PlanFlowStep {
-            action: action.into(),
-            target: EntityReference::PlannedEntity {
-                entity: "PlanDocument".into(),
-            },
-            edges: vec![PlanFlowEdge {
-                relation: PlanFlowRelation::Emit,
+            callable: Some(PlanCallable {
+                kind: PlanCallableKind::Method,
+                name: "validate".into(),
+            }),
+            payload_type: None,
+            return_type: Some(PlanFlowReturnType {
+                value_type: "ValidatedPlan".into(),
+                error_type: Some("PlanError".into()),
+            }),
+            expansion: vec![PlanFlowEdge {
+                relation: PlanFlowRelation::Send,
                 target: EntityReference::ExternalEntity {
                     entity_kind: ReferencedEntityKind::Endpoint,
-                    name: "terminal".into(),
+                    name: "execution scheduler".into(),
                     dependency: None,
                 },
+                callable: None,
+                payload_type: Some("ValidatedPlan".into()),
+                return_type: None,
                 expansion: Vec::new(),
-                result: None,
+                branches: Vec::new(),
             }],
             branches: Vec::new(),
         }];
 
         let rendered = render_plan(&document).unwrap();
-        let diagram = rendered
-            .markdown
-            .split("## Code flow: Execution")
-            .nth(1)
-            .expect("flow section")
-            .split("```text\n")
-            .nth(1)
-            .expect("flow fence")
-            .split("\n```")
-            .next()
-            .expect("flow diagram");
 
-        assert_eq!(
-            diagram,
-            format!("*PlanDocument — {action}\n    [src/plan.rs]\n└─ Emit to terminal")
+        assert!(
+            rendered
+                .markdown
+                .contains("Call PlanDocument.validate() → ValidatedPlan")
         );
         assert!(
-            diagram
-                .lines()
-                .all(|line| line.chars().count() <= PLAN_LINE_WIDTH)
+            rendered
+                .markdown
+                .contains("└─ Send ValidatedPlan to execution scheduler")
         );
-    }
-
-    #[test]
-    fn keeps_short_flow_owners_inline_when_a_sibling_action_is_wide() {
-        let mut document = test_fixture("plan", "Overview");
-        let owner_path = "hello/src/inspection.rs";
-        document.entity_changes[0].path = owner_path.into();
-        document.tasks[0].files[0].change = PlanFileChange::Add {
-            path: owner_path.into(),
-        };
-        let step = |action: &str| PlanFlowStep {
-            action: action.into(),
-            target: EntityReference::PlannedEntity {
-                entity: "PlanDocument".into(),
-            },
-            edges: vec![PlanFlowEdge {
-                relation: PlanFlowRelation::Emit,
-                target: EntityReference::ExternalEntity {
-                    entity_kind: ReferencedEntityKind::Endpoint,
-                    name: "terminal".into(),
-                    dependency: None,
-                },
-                expansion: Vec::new(),
-                result: None,
-            }],
-            branches: Vec::new(),
-        };
-        let wide_action =
-            "Read a deliberately wide observation that consumes the diagram line width";
-        let short_action = "Load and parse the Parquet footer";
-        document.flows[0].steps = vec![step(wide_action), step(short_action)];
-
-        let rendered = render_plan(&document).unwrap();
-        let diagram = rendered
-            .markdown
-            .split("## Code flow: Execution")
-            .nth(1)
-            .expect("flow section")
-            .split("```text\n")
-            .nth(1)
-            .expect("flow fence")
-            .split("\n```")
-            .next()
-            .expect("flow diagram");
-        let owner = format!("[{owner_path}]");
-        let short_line = diagram
-            .lines()
-            .find(|line| line.contains(short_action))
-            .expect("short owned action");
-
-        assert!(short_line.ends_with(&owner));
-        assert_eq!(
-            diagram
-                .lines()
-                .filter(|line| line.trim_start() == owner)
-                .count(),
-            1,
-            "only the genuinely overlapping owner should move below its action"
-        );
-        assert!(
-            diagram
-                .lines()
-                .all(|line| line.chars().count() <= PLAN_LINE_WIDTH)
-        );
-    }
-
-    #[test]
-    fn renders_flow_steps_in_array_position() {
-        let mut document = test_fixture("plan", "Overview");
-        let first_step = document.flows[0].steps[0].clone();
-        document.flows[0].steps = vec![
-            PlanFlowStep {
-                action: "First action".into(),
-                ..first_step.clone()
-            },
-            PlanFlowStep {
-                action: "Second action".into(),
-                edges: first_step.edges.clone(),
-                ..first_step
-            },
-        ];
-
-        let rendered = render_plan(&document).unwrap();
-        let first_position = rendered.markdown.find("First action").unwrap();
-        let second_position = rendered.markdown.find("Second action").unwrap();
-
-        assert!(first_position < second_position);
+        assert!(!rendered.markdown.contains("*PlanDocument —"));
+        assert!(!rendered.markdown.contains("→ PlanError"));
     }
 
     #[test]
@@ -3051,9 +2393,13 @@ mod test {
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
-        assert!(normalized_markdown.contains(
-            "Ready — Carries the ready version. version: u64 — Carries the canonical plan version."
-        ));
+        assert!(normalized_markdown.contains("Ready version: u64"));
+        assert!(!rendered.markdown.contains("Carries the ready version."));
+        assert!(
+            !rendered
+                .markdown
+                .contains("Carries the canonical plan version.")
+        );
         assert!(!normalized_markdown.contains("public version"));
         assert!(!rendered.markdown.contains("**enum PlanDocument**"));
         let diagram = rendered

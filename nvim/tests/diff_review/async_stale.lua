@@ -78,10 +78,15 @@ function backend.system_async(command, _, cb)
   local request_generation = generation
   local key = command_key(command)
   local status_key = "git\t--no-optional-locks\t-C\t" .. root .. "\tstatus\t--porcelain=v2\t-z\t--untracked-files=all"
-  local unstaged_key = "git\t--no-optional-locks\t-C\t" .. root
+  local diff_key = "git\t--no-optional-locks\t-C\t" .. root
     .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0"
-  local staged_key = unstaged_key .. "\t--cached"
-  local code = (key == status_key or key == unstaged_key or key == staged_key) and 0 or 1
+  local unstaged_key = diff_key .. "\t--diff-filter=MRC"
+  local staged_key = diff_key .. "\t--cached\t--diff-filter=MRC"
+  local numstat_key = "git\t--no-optional-locks\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff"
+  local unstaged_numstat_key = numstat_key .. "\t--numstat\t-z\t--diff-filter=A"
+  local staged_numstat_key = numstat_key .. "\t--cached\t--numstat\t-z\t--diff-filter=A"
+  local code = (key == status_key or key == unstaged_key or key == staged_key
+    or key == unstaged_numstat_key or key == staged_numstat_key) and 0 or 1
   local output = ""
   pending[#pending + 1] = {
     generation = request_generation,

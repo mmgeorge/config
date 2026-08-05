@@ -181,9 +181,11 @@ function backend.system(command, input)
   record("system", command, input)
   local key = command_key(command)
   local status_key = "git\t--no-optional-locks\t-C\t" .. root .. "\tstatus\t--porcelain=v2\t-z\t--untracked-files=all"
-  local unstaged_key = "git\t--no-optional-locks\t-C\t" .. root
+  local diff_key = "git\t--no-optional-locks\t-C\t" .. root
     .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0"
-  local staged_key = unstaged_key .. "\t--cached"
+  local unstaged_key = diff_key .. "\t--diff-filter=MRC"
+  local staged_key = diff_key .. "\t--cached\t--diff-filter=MRC"
+  local numstat_key = "git\t--no-optional-locks\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff"
   local path_set = requested_path_set(command)
   if key == status_key or key:find(status_key .. "\t--\t", 1, true) == 1 then
     return status_snapshot_text(path_set), 0
@@ -194,6 +196,7 @@ function backend.system(command, input)
   if key == staged_key or key:find(staged_key .. "\t--\t", 1, true) == 1 then
     return filter_diff_text(staged and staged_diff or "", path_set), 0
   end
+  if key:find(numstat_key, 1, true) == 1 and key:find("\t--numstat\t", 1, true) then return "", 0 end
   if key:find("git\t-C\t" .. root .. "\tapply\t--cached", 1, true) == 1 then
     staged = key:find("\t--reverse\t", 1, true) == nil
     return "", 0

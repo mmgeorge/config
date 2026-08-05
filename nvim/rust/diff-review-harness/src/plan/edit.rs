@@ -707,9 +707,8 @@ fn propagate_entity_rename(
     for flow in &mut document.flows {
         replace_identifier_occurrences(&mut flow.title, rename_by_previous_name);
         replace_identifier_occurrences(&mut flow.description, rename_by_previous_name);
-        for step in &mut flow.steps {
-            propagate_flow_step_rename(step, rename_by_previous_name);
-        }
+        rename_planned_reference(&mut flow.source, rename_by_previous_name);
+        propagate_flow_edge_rename(&mut flow.edges, rename_by_previous_name);
     }
     for task in &mut document.tasks {
         replace_identifier_occurrences(&mut task.title, rename_by_previous_name);
@@ -763,75 +762,51 @@ fn propagate_member_rename(document: &mut PlanDocument) {
         return;
     }
     for flow in &mut document.flows {
-        propagate_member_rename_in_steps(&mut flow.steps, &rename_by_entity);
+        propagate_member_rename_in_edges(&mut flow.edges, &rename_by_entity);
     }
 }
 
-fn propagate_member_rename_in_steps(
-    step_list: &mut [PlanFlowStep],
+fn propagate_member_rename_in_edges(
+    edge_list: &mut [PlanFlowEdge],
     rename_by_entity: &HashMap<String, HashMap<String, String>>,
 ) {
-    for step in step_list {
-        for edge in &mut step.edges {
-            if let EntityReference::PlannedEntity { entity } = &edge.target
-                && let Some(rename_by_name) = rename_by_entity.get(entity)
-            {
-                match &mut edge.relation {
-                    PlanFlowRelation::Call { callable }
-                    | PlanFlowRelation::Read { callable }
-                    | PlanFlowRelation::Write { callable } => {
-                        if let Some(replacement) = rename_by_name.get(&callable.name) {
-                            callable.name.clone_from(replacement);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            propagate_member_rename_in_steps(&mut edge.expansion, rename_by_entity);
+    for edge in edge_list {
+        if let EntityReference::PlannedEntity { entity } = &edge.target
+            && let Some(rename_by_name) = rename_by_entity.get(entity)
+            && let Some(callable) = &mut edge.callable
+            && let Some(replacement) = rename_by_name.get(&callable.name)
+        {
+            callable.name.clone_from(replacement);
         }
-        for branch in &mut step.branches {
-            propagate_member_rename_in_steps(&mut branch.steps, rename_by_entity);
+        propagate_member_rename_in_edges(&mut edge.expansion, rename_by_entity);
+        for branch in &mut edge.branches {
+            propagate_member_rename_in_edges(&mut branch.edges, rename_by_entity);
         }
     }
 }
 
-fn propagate_flow_step_rename(
-    step: &mut PlanFlowStep,
+fn propagate_flow_edge_rename(
+    edge_list: &mut [PlanFlowEdge],
     rename_by_previous_name: &HashMap<String, String>,
 ) {
-    replace_identifier_occurrences(&mut step.action, rename_by_previous_name);
-    rename_planned_reference(&mut step.target, rename_by_previous_name);
-    for edge in &mut step.edges {
-        match &mut edge.relation {
-            PlanFlowRelation::Call { callable }
-            | PlanFlowRelation::Read { callable }
-            | PlanFlowRelation::Write { callable } => {
-                replace_identifier_occurrences(&mut callable.name, rename_by_previous_name);
-            }
-            PlanFlowRelation::Send { event } => {
-                replace_identifier_occurrences(event, rename_by_previous_name);
-            }
-            PlanFlowRelation::Construct | PlanFlowRelation::Emit | PlanFlowRelation::Return => {}
+    for edge in edge_list {
+        if let Some(callable) = &mut edge.callable {
+            replace_identifier_occurrences(&mut callable.name, rename_by_previous_name);
         }
-        if let Some(result) = &mut edge.result {
-            match result {
-                PlanFlowValue::Type { name } => {
-                    replace_identifier_occurrences(name, rename_by_previous_name);
-                }
-                PlanFlowValue::Text { text } => {
-                    replace_identifier_occurrences(text, rename_by_previous_name);
-                }
+        if let Some(payload_type) = &mut edge.payload_type {
+            replace_identifier_occurrences(payload_type, rename_by_previous_name);
+        }
+        if let Some(return_type) = &mut edge.return_type {
+            replace_identifier_occurrences(&mut return_type.value_type, rename_by_previous_name);
+            if let Some(error_type) = &mut return_type.error_type {
+                replace_identifier_occurrences(error_type, rename_by_previous_name);
             }
         }
         rename_planned_reference(&mut edge.target, rename_by_previous_name);
-        for nested_step in &mut edge.expansion {
-            propagate_flow_step_rename(nested_step, rename_by_previous_name);
-        }
-    }
-    for branch in &mut step.branches {
-        replace_identifier_occurrences(&mut branch.condition, rename_by_previous_name);
-        for nested_step in &mut branch.steps {
-            propagate_flow_step_rename(nested_step, rename_by_previous_name);
+        propagate_flow_edge_rename(&mut edge.expansion, rename_by_previous_name);
+        for branch in &mut edge.branches {
+            replace_identifier_occurrences(&mut branch.condition, rename_by_previous_name);
+            propagate_flow_edge_rename(&mut branch.edges, rename_by_previous_name);
         }
     }
 }
@@ -1225,38 +1200,36 @@ mod test {
         });
         document.entity_changes.push(inspector.clone());
 
-        let call_step = |action: &str| PlanFlowStep {
-            action: action.into(),
+        let call_edge = || PlanFlowEdge {
+            relation: PlanFlowRelation::Call,
             target: EntityReference::PlannedEntity {
                 entity: "Inspector".into(),
             },
-            edges: vec![PlanFlowEdge {
-                relation: PlanFlowRelation::Call {
-                    callable: PlanCallable {
-                        kind: PlanCallableKind::Method,
-                        name: "inspect".into(),
-                    },
-                },
-                target: EntityReference::PlannedEntity {
-                    entity: "Inspector".into(),
-                },
-                expansion: Vec::new(),
-                result: Some(PlanFlowValue::Type {
-                    name: "Report".into(),
-                }),
-            }],
+            callable: Some(PlanCallable {
+                kind: PlanCallableKind::Method,
+                name: "inspect".into(),
+            }),
+            payload_type: None,
+            return_type: Some(PlanFlowReturnType {
+                value_type: "Report".into(),
+                error_type: None,
+            }),
+            expansion: Vec::new(),
             branches: Vec::new(),
         };
-        let mut root = call_step("Inspect root");
-        root.edges[0].expansion.push(call_step("Inspect expansion"));
+        let mut root = call_edge();
+        root.expansion.push(call_edge());
         root.branches.push(PlanFlowBranch {
             condition: "retry requested".into(),
-            steps: vec![call_step("Inspect branch")],
+            edges: vec![call_edge()],
         });
         document.flows.push(PlanFlow {
             title: "Inspection".into(),
             description: "Inspect one input.".into(),
-            steps: vec![root],
+            source: EntityReference::PlannedEntity {
+                entity: "Inspector".into(),
+            },
+            edges: vec![root],
         });
 
         inspector.members[0].action = ChangeAction::Rename;
@@ -1275,14 +1248,11 @@ mod test {
         .unwrap();
 
         assert_eq!(document.entity_changes[0].members[0].name, "inspect_file");
-        let root = &document.flows[0].steps[0];
-        let callable_name = |step: &PlanFlowStep| match &step.edges[0].relation {
-            PlanFlowRelation::Call { callable } => callable.name.clone(),
-            _ => unreachable!(),
-        };
+        let root = &document.flows[0].edges[0];
+        let callable_name = |edge: &PlanFlowEdge| edge.callable.as_ref().unwrap().name.clone();
         assert_eq!(callable_name(root), "inspect_file");
-        assert_eq!(callable_name(&root.edges[0].expansion[0]), "inspect_file");
-        assert_eq!(callable_name(&root.branches[0].steps[0]), "inspect_file");
+        assert_eq!(callable_name(&root.expansion[0]), "inspect_file");
+        assert_eq!(callable_name(&root.branches[0].edges[0]), "inspect_file");
     }
 
     #[test]

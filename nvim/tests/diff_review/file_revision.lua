@@ -130,11 +130,13 @@ end
 function backend.system(command)
   local key = command_key(command)
   local status_key = "git\t--no-optional-locks\t-C\t" .. root .. "\tstatus\t--porcelain=v2\t-z\t--untracked-files=all"
-  local unstaged_key = "git\t--no-optional-locks\t-C\t" .. root
+  local diff_key = "git\t--no-optional-locks\t-C\t" .. root
     .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0"
+  local unstaged_key = diff_key .. "\t--diff-filter=MRC"
   if key == status_key then return status_snapshot_text(), 0 end
   if key == unstaged_key then return modified_diff("a.txt") .. "\n" .. modified_diff("b.txt"), 0 end
-  if key == unstaged_key .. "\t--cached" then return modified_diff("c.txt"), 0 end
+  if key == diff_key .. "\t--cached\t--diff-filter=MRC" then return modified_diff("c.txt"), 0 end
+  if key:find("\tdiff\t", 1, true) and key:find("\t--numstat\t", 1, true) then return "", 0 end
   return "unexpected command: " .. command_key(command), 1
 end
 

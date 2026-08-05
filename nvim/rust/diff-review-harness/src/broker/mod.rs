@@ -28,9 +28,9 @@ use crate::plan::{
     ArtifactSummary, ContextChoice, PlanAcceptance, PlanAnnotation, PlanCallable, PlanDeviation,
     PlanDeviationDisposition, PlanDeviationKind, PlanDocument, PlanElicitation,
     PlanExecutionLifecycleEvent, PlanExecutionPromptKind, PlanExecutionRecord, PlanExecutionState,
-    PlanFileStore, PlanFlowRelation, PlanLifecycleKind, PlanLifecycleRecord, PlanPrompt,
-    PlanQuestionAnswer, PlanQuestionResponse, PlanQuestionSet, PlanQuestionWithdrawal, PlanRecord,
-    PlanResolutionKind, PlanState, ScopeDeviationReview, digest as plan_digest, execution_prompt,
+    PlanFileStore, PlanLifecycleKind, PlanLifecycleRecord, PlanPrompt, PlanQuestionAnswer,
+    PlanQuestionResponse, PlanQuestionSet, PlanQuestionWithdrawal, PlanRecord, PlanResolutionKind,
+    PlanState, ScopeDeviationReview, digest as plan_digest, execution_prompt,
 };
 use crate::protocol::{BrokerEvent, BrokerRequest, BrokerResponse};
 use crate::rustdoc::{RustdocResolver, RustdocResolverConfig, validate_plan_rust_api};
@@ -174,17 +174,12 @@ struct RustdocTarget {
     receiver: String,
     receiver_package: String,
     receiver_version: String,
-    relation: PlanFlowRelation,
+    callable: Option<PlanCallable>,
     package_list: Vec<(String, String)>,
 }
 
-fn rustdoc_callable(relation: &PlanFlowRelation) -> Result<&PlanCallable> {
-    match relation {
-        PlanFlowRelation::Call { callable }
-        | PlanFlowRelation::Read { callable }
-        | PlanFlowRelation::Write { callable } => Ok(callable),
-        _ => anyhow::bail!("selected flow edge has no Rust callable"),
-    }
+fn rustdoc_callable(callable: Option<&PlanCallable>) -> Result<&PlanCallable> {
+    callable.context("selected flow edge has no Rust callable")
 }
 
 /// Represents one request result plus asynchronous events emitted before its response.
@@ -993,7 +988,7 @@ impl HarnessBroker {
                 )
                 .await?
         } else {
-            let callable = rustdoc_callable(&target.relation)?;
+            let callable = rustdoc_callable(target.callable.as_ref())?;
             self.rustdoc
                 .callable_hover(
                     &target.package_list,
@@ -1021,7 +1016,7 @@ impl HarnessBroker {
                 )
                 .await?
         } else {
-            let callable = rustdoc_callable(&target.relation)?;
+            let callable = rustdoc_callable(target.callable.as_ref())?;
             self.rustdoc
                 .callable_source(
                     &target.package_list,
@@ -1095,7 +1090,7 @@ impl HarnessBroker {
         };
         let receiver = receiver.clone();
         let receiver_dependency = receiver_dependency.clone();
-        let relation = edge.relation;
+        let callable = edge.callable;
         let dependency_index = document
             .dependencies
             .iter()
@@ -1146,7 +1141,7 @@ impl HarnessBroker {
             receiver,
             receiver_package,
             receiver_version,
-            relation,
+            callable,
             package_list,
         })
     }
@@ -6170,29 +6165,27 @@ mod test {
                 flows: Some(vec![crate::plan::PlanFlow {
                         title: "Migration".into(),
                         description: "Start from the selected migration and produce updated persisted state. Keep migration decisions separate from storage ownership.".into(),
-                        steps: vec![crate::plan::PlanFlowStep {
-                            action: "Apply migration".into(),
-                            target: crate::plan::EntityReference::PlannedEntity {
-                                entity: "migrate".into(),
-                            },
-                            edges: vec![crate::plan::PlanFlowEdge {
-                                relation: crate::plan::PlanFlowRelation::Write {
-                                    callable: crate::plan::PlanCallable {
-                                        kind: crate::plan::PlanCallableKind::Method,
-                                        name: "persist".into(),
-                                    },
-                                },
+                        source: crate::plan::EntityReference::PlannedEntity {
+                            entity: "migrate".into(),
+                        },
+                        edges: vec![crate::plan::PlanFlowEdge {
+                                relation: crate::plan::PlanFlowRelation::Write,
                                 target: crate::plan::EntityReference::ExternalEntity {
                                     entity_kind: crate::plan::ReferencedEntityKind::Type,
                                     name: "MigrationStore".into(),
                                     dependency: None,
                                 },
-                                expansion: Vec::new(),
-                                result: Some(crate::plan::PlanFlowValue::Text {
-                                    text: "updated persisted state".into(),
+                                callable: Some(crate::plan::PlanCallable {
+                                    kind: crate::plan::PlanCallableKind::Method,
+                                    name: "persist".into(),
                                 }),
-                            }],
-                            branches: Vec::new(),
+                                payload_type: None,
+                                return_type: Some(crate::plan::PlanFlowReturnType {
+                                    value_type: "PersistedMigration".into(),
+                                    error_type: None,
+                                }),
+                                expansion: Vec::new(),
+                                branches: Vec::new(),
                         }],
                 }]),
                 tasks: Some(vec![crate::plan::PlanTask {

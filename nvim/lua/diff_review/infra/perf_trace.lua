@@ -1,25 +1,10 @@
---- Owns performance tracing for the diff-review render paths: builds the per-buffer perf payload
---- and fans each event/span out to the JSON perf log (infra/perf) and, when enabled, the GitStatus
---- debug perf log. Lives in infra so render, git, and view callers reach it downward rather than
---- through views/status.
----
---- The debug sink (views/status/status_debug) is injected via set_debug_sink, so infra never
---- depends on a view.
+--- Owns diff-scope performance tracing for render, GitStatus, PR, and shared UI paths. Builds
+--- per-buffer payloads and writes structured events through infra/perf without depending on views.
 ---@class DiffReviewPerfTraceModule
 local M = {}
 
 local perf = require("diff_review.infra.perf")
 local session = require("diff_review.session")
-
---- The GitStatus debug perf sink, registered at load by status_debug (infra must not require views).
----@type table?
-local debug_sink = nil
-
---- Register the GitStatus debug perf sink so spans and events also reach the dev perf log.
----@param sink table
-function M.set_debug_sink(sink)
-  debug_sink = sink
-end
 
 --- Build the perf payload for a status buffer from its live state, enriching with cursor, line
 --- count, and viewport fields when the buffer is current.
@@ -55,9 +40,7 @@ end
 ---@param extra table?
 function M.event(event, buf, extra)
   local payload = M.payload(buf, extra)
-  if perf and perf.enabled() then perf.event(event, payload) end
-  if not (debug_sink and debug_sink.perf_event) then return end
-  debug_sink.perf_event(event, payload)
+  if perf and perf.enabled("diff") then perf.event("diff", event, payload) end
 end
 
 ---@param event string
@@ -67,14 +50,8 @@ end
 ---@return any
 function M.span(event, buf, extra, callback)
   local payload = M.payload(buf, extra)
-  if perf and perf.enabled() then
-    return perf.span(event, payload, function()
-      if not (debug_sink and debug_sink.perf_span and debug_sink.perf_enabled and debug_sink.perf_enabled()) then return callback() end
-      return debug_sink.perf_span(event, payload, callback)
-    end)
-  end
-  if not (debug_sink and debug_sink.perf_span and debug_sink.perf_enabled and debug_sink.perf_enabled()) then return callback() end
-  return debug_sink.perf_span(event, payload, callback)
+  if perf and perf.enabled("diff") then return perf.span("diff", event, payload, callback) end
+  return callback()
 end
 
 return M

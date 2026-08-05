@@ -6,6 +6,7 @@ local session = require("diff_review.session")
 local gh = require("diff_review.integrations.gh")
 local walkthrough = require("diff_review.views.walkthrough")
 local commands = require("diff_review.views.commands")
+local status_snapshot = require("diff_review.git.status_snapshot")
 
 local root = "D:/diffreview-flow-root"
 local nested_cwd = root .. "/engine/plugins/model"
@@ -22,6 +23,7 @@ local function command_key(command)
 end
 
 local original_notify = vim.notify
+local original_untracked_reader = status_snapshot._read_untracked_file_async
 local captured_notifications = {}
 local function capture_notify(message, level, opts)
   captured_notifications[#captured_notifications + 1] = {
@@ -140,14 +142,16 @@ function backend.systemlist(command)
   if key == "git\t-C\t" .. root .. "\tdiff\t--cached\t--name-status" then
     return { "M\tc.txt" }, 0
   end
-  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0" then
+  local fallback_diff_key = "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0"
+  if key == fallback_diff_key or key:find(fallback_diff_key .. "\t--\t", 1, true) == 1 then
     return vim.split(
       long_region_diff("a.txt") .. "\n" .. modified_diff("b.txt") .. "\n" .. new_file_diff("new.txt"),
       "\n",
       { plain = true }
     ), 0
   end
-  if key == "git\t-C\t" .. root .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0\t--cached" then
+  local fallback_staged_diff_key = fallback_diff_key .. "\t--cached"
+  if key == fallback_staged_diff_key or key:find(fallback_staged_diff_key .. "\t--\t", 1, true) == 1 then
     return vim.split(modified_diff("c.txt"), "\n", { plain = true }), 0
   end
   return {}, 1
@@ -163,8 +167,9 @@ end
 function backend.system(command)
   local key = command_key(command)
   local status_key = "git\t--no-optional-locks\t-C\t" .. root .. "\tstatus\t--porcelain=v2\t-z\t--untracked-files=all"
-  local unstaged_key = "git\t--no-optional-locks\t-C\t" .. root
+  local diff_key = "git\t--no-optional-locks\t-C\t" .. root
     .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0"
+  local unstaged_key = diff_key .. "\t--diff-filter=MRC"
   if key == status_key then
     local record_list = {
       "1 .M N... 100644 100644 100644 1111111 2222222 a.txt\0",
@@ -175,10 +180,14 @@ function backend.system(command)
     for _, relpath in ipairs(untracked_files) do record_list[#record_list + 1] = "? " .. relpath .. "\0" end
     return table.concat(record_list), 0
   end
-  if key == unstaged_key then
-    return long_region_diff("a.txt") .. "\n" .. modified_diff("b.txt") .. "\n" .. new_file_diff("new.txt"), 0
+  if key == unstaged_key or key:find(unstaged_key .. "\t--\t", 1, true) == 1 then
+    return long_region_diff("a.txt") .. "\n" .. modified_diff("b.txt"), 0
   end
-  if key == unstaged_key .. "\t--cached" then return modified_diff("c.txt"), 0 end
+  local staged_key = diff_key .. "\t--cached\t--diff-filter=MRC"
+  if key == staged_key or key:find(staged_key .. "\t--\t", 1, true) == 1 then return modified_diff("c.txt"), 0 end
+  if key:find("\tdiff\t", 1, true) and key:find("\t--numstat\t", 1, true) then
+    return key:find("\t--cached\t", 1, true) and "" or "2\t0\tnew.txt\0", 0
+  end
   return "unexpected command: " .. key, 1
 end
 
@@ -239,7 +248,9 @@ local function fixture_reader(path)
 end
 
 local function wait_for(condition, message)
-  assert_true(vim.wait(2000, condition, 10), message)
+  local completed = vim.wait(2000, condition, 10)
+  if completed then return end
+  error(type(message) == "function" and message() or message, 2)
 end
 
 local function buffer_contains(buf, needle)
@@ -687,6 +698,15 @@ local function run()
   diff_review.set_git_backend(backend)
   gh.set_backend(gh_backend)
   walkthrough.set_reader(fixture_reader)
+  status_snapshot._read_untracked_file_async = function(filename, callback)
+    vim.schedule(function()
+      if filename:gsub("\\", "/"):sub(-#"new.txt") == "new.txt" then
+        callback("line one new.txt\nline two new.txt\n")
+      else
+        callback(nil)
+      end
+    end)
+  end
   local invalid_config_ok, invalid_config_error = pcall(diff_review.setup, {
     about_auto_generate = false,
     walkthrough_inventory = true,
@@ -1252,8 +1272,19 @@ local function run()
   local added_span_row = find_row(summary_buf, "Modify Cache a.txt rewrite")
   vim.api.nvim_win_set_cursor(vim.fn.bufwinid(summary_buf), { added_span_row, 0 })
   trigger_buf_mapping(summary_buf, ".")
-  wait_for(function() return buffer_contains(summary_buf, "line two new.txt") end,
-    "pressing dot on a selected-line walkthrough change should expand the target diff")
+  wait_for(function() return buffer_contains(summary_buf, "line two new.txt") end, function()
+    local status = session.states and session.states[summary_buf] or session.status
+    local new_file = nil
+    for _, section in ipairs(status and status.sections or {}) do
+      for _, file in ipairs(section.files or {}) do
+        if file.relpath == "new.txt" then new_file = file end
+      end
+    end
+    return "pressing dot on a selected-line walkthrough change should expand the target diff\n"
+      .. table.concat(vim.api.nvim_buf_get_lines(summary_buf, 0, -1, false), "\n")
+      .. "\n\nnew file:\n" .. vim.inspect(new_file)
+      .. "\n\nnotifications:\n" .. vim.inspect(captured_notifications)
+  end)
   assert_true(vim.api.nvim_win_get_cursor(vim.fn.bufwinid(summary_buf))[1] == find_row(summary_buf, "line two new.txt"),
     "pressing dot on a selected-line walkthrough change should jump to the selected diff row")
   trigger_buf_mapping(buf, "ow")
@@ -1593,6 +1624,7 @@ vim.notify = original_notify
 diff_review.reset_git_backend()
 gh.reset_backend()
 walkthrough.reset_reader()
+status_snapshot._read_untracked_file_async = original_untracked_reader
 if not ok then
   vim.api.nvim_err_writeln(err)
   vim.cmd("cquit")

@@ -1172,7 +1172,8 @@ local ok, failure = xpcall(function()
   assert_equals(default_config.harness.backend, "codex",
     "an empty setup should retain the complete default configuration")
   diff_review.setup({
-    perf_logging = false,
+    diff_logging = false,
+    harness_logging = false,
     harness = { backend = "mock" },
     keymaps = { status = { open = { "x" } } },
   })

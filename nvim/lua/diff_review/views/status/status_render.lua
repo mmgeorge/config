@@ -27,6 +27,7 @@ local pr_edit = require("diff_review.views.pr.pr_edit")
 local actions = require("diff_review.views.status.actions")
 local diff_buffer = require("diff_review.views.diff_buffer")
 local git_data = require("diff_review.git.git_data")
+local file_body = require("diff_review.git.file_body")
 local status_keys = require("diff_review.views.status.status_keys")
 local status_head = require("diff_review.views.status.status_head")
 local size_gate = require("diff_review.views.status.size_gate")
@@ -37,6 +38,7 @@ local status_helpers = require("diff_review.views.status.status_helpers")
 local keymaps = require("diff_review.shared.keymaps")
 local conventional_commit = require("diff_review.integrations.conventional_commit")
 local trace = require("diff_review.infra.perf_trace")
+local notifications = require("diff_review.infra.notifications")
 local ui = require("diff_review.infra.ui")
 local session = require("diff_review.session")
 
@@ -499,6 +501,7 @@ local function status_file_expansion_context_pending(entry, on_update)
   if not entry_nav._status_entry_is_file_like(entry) then return false end
   local file = entry.file
   if not file then return false end
+  if git_data._status_file_is_deleted(file) then return false end
   local file_key = entry.id or status_file_key(file.section_name, file.filename)
   local hunks = status_diff_hunks_for_file(file)
   if #hunks == 0 then return false end
@@ -530,6 +533,36 @@ local function status_file_expansion_context_pending(entry, on_update)
     end
   end
   return pending
+end
+
+---@param state table
+---@param file DiffReviewStatusFile
+---@param result DiffReviewFileBodyResult
+local function status_apply_file_body_result(state, file, result)
+  file.preview_state = result.state
+  file.preview_error = result.error
+  if result.state == "error" then return end
+  file.preview_binary = result.binary
+  file.line_stats_complete = result.line_stats_complete
+  file.added = result.added
+  file.removed = result.removed
+  file.hunks = result.hunks
+
+  local cache_hunk_list = {}
+  for _, section in ipairs(state.sections or {}) do
+    for _, section_file in ipairs(section.files or {}) do
+      if section_file.filename == file.filename then
+        for _, hunk in ipairs(section_file.hunks or {}) do
+          cache_hunk_list[#cache_hunk_list + 1] = vim.deepcopy(hunk)
+        end
+      end
+    end
+  end
+  local diff_list, staged_flag_list = git_data._order_file_hunks(cache_hunk_list)
+  session.file_diffs = session.file_diffs or {}
+  session.file_hunk_staged = session.file_hunk_staged or {}
+  session.file_diffs[file.filename] = #diff_list > 0 and table.concat(diff_list, "\n") or false
+  session.file_hunk_staged[file.filename] = #staged_flag_list > 0 and staged_flag_list or nil
 end
 
 ---@param entry DiffReviewStatusEntry?
@@ -571,6 +604,53 @@ local function status_prepare_file_expansion_context(entry, state, on_ready)
     if not pending then finish() end
   end
 
+  if entry.file.preview_state == "unloaded" or entry.file.preview_state == "error" or entry.file.preview_state == "loading" then
+    state.file_body_request_by_key = state.file_body_request_by_key or {}
+    local request = state.file_body_request_by_key[request_key]
+    local function body_ready(result)
+      if not still_current() then return end
+      if result.state == "error" then
+        finish()
+        return
+      end
+      retry()
+    end
+    if request then
+      request.callback_list[#request.callback_list + 1] = body_ready
+      return true
+    end
+
+    request = { callback_list = { body_ready } }
+    state.file_body_request_by_key[request_key] = request
+    entry.file.preview_state = "loading"
+    trace.event("status.expand_file_body.request", buf, {
+      entry_id = entry.id,
+      file = entry.file.filename,
+      preview_source = entry.file.preview_source,
+      generation = generation,
+    })
+    file_body.load_async(state.cwd, entry.file, function(result)
+      vim.schedule(function()
+        if state.file_body_request_by_key[request_key] ~= request then return end
+        state.file_body_request_by_key[request_key] = nil
+        local latest = buf and session.states and session.states[buf] or state
+        if latest ~= state or (buf and not vim.api.nvim_buf_is_valid(buf)) then return end
+        status_apply_file_body_result(state, entry.file, result)
+        if result.error then notifications.error(result.error, "Diff preview load failed") end
+        trace.event("status.expand_file_body.done", buf, {
+          entry_id = entry.id,
+          file = entry.file.filename,
+          preview_state = result.state,
+          added = result.added,
+          removed = result.removed,
+          error = result.error,
+        })
+        for _, callback in ipairs(request.callback_list) do callback(result) end
+      end)
+    end)
+    return true
+  end
+
   local pending = trace.span("status.expand_file_context.prepare", buf, {
     entry_id = entry.id,
     file = entry.file and entry.file.filename or nil,
@@ -603,16 +683,47 @@ local function status_render_file(file, entry_kind, hunk_entry_kind, file_key_ov
   opts = opts or {}
   local file_key = file_key_override or status_file_key(file.section_name, file.filename)
   local default_folded = not (opts.default_open or opts.force_open)
-  local entry = { id = file_key, kind = entry_kind or "file", file = file, default_folded = default_folded }
+  local omitted_line_count = size_gate._status_deleted_file_preview_omission(file)
+  local entry = {
+    id = file_key,
+    kind = entry_kind or "file",
+    file = file,
+    default_folded = default_folded,
+    preview_omitted = file.preview_state == "omitted" or omitted_line_count ~= nil,
+  }
   local line_number, file_segments = diff_component.append_file_header(session.status, file, entry, status_file_indent)
 
   local file_folded = (not opts.force_open) and status_folded(file_key, default_folded)
-  diff_source_state._status_record_diff_file_header_state(file, entry_kind, hunk_entry_kind, file_key)
+  if not omitted_line_count then
+    diff_source_state._status_record_diff_file_header_state(file, entry_kind, hunk_entry_kind, file_key)
+  end
   if file_folded and not fold_state._status_entry_materialized(session.status, file_key) then
     fold_state._status_register_fold_range(file_key, line_number, #session.status.lines, default_folded, file_segments)
     return
   end
   fold_state._status_set_entry_materialized(session.status, file_key)
+
+  if file.preview_state == "error" then
+    local preview_error = vim.trim(tostring(file.preview_error or "Preview unavailable")):gsub("[\r\n]+", " ")
+    status_add_line(
+      string.rep(" ", status_hunk_indent) .. "Preview unavailable — " .. preview_error,
+      entry,
+      "DiagnosticError"
+    )
+    fold_state._status_register_fold_range(file_key, line_number, #session.status.lines, default_folded, file_segments)
+    return
+  end
+
+  if omitted_line_count then
+    status_add_line(
+      string.rep(" ", status_hunk_indent)
+        .. ("Preview omitted — deleted file has %d lines"):format(omitted_line_count),
+      entry,
+      "Comment"
+    )
+    fold_state._status_register_fold_range(file_key, line_number, #session.status.lines, default_folded, file_segments)
+    return
+  end
 
   local hunks = trace.span("status_render.render_file.hunks", session.status and session.status.buf or nil, {
     file = file.filename,

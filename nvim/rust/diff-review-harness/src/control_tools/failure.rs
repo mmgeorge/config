@@ -415,10 +415,10 @@ fn plan_violation(violation: &PlanViolation) -> ControlToolViolation {
 fn plan_violation_code(message: &str) -> &'static str {
     if message.contains("callable") && message.contains("does not exist") {
         "unknown_rust_callable"
-    } else if message.contains("only returns a result and does not describe work") {
+    } else if message.contains("only returns a value and does not describe work") {
         "return_only_expansion"
     } else if message.contains("must contain at least one edge or branch") {
-        "incomplete_flow_step"
+        "incomplete_flow_edge"
     } else if message.contains("does not exist") || message.contains("not found") {
         "unknown_reference"
     } else {
@@ -607,11 +607,11 @@ mod test {
             arguments: json!({ "plan_id": "plan-1", "expected_version": 1 }),
         };
         let document = crate::plan::test_fixture("plan-1", "Overview");
-        let message = "Expansion only returns a result and does not describe work performed inside the parent relationship. Add a nested step containing a construct, call, read, write, send, or emit edge, add a meaningful branch, or remove the expansion and keep the result on the parent edge.";
+        let message = "Expansion only returns a value and does not describe work performed inside the parent relationship. Add a nested construct, call, read, write, send, or emit edge, add a meaningful branch, or remove the expansion and keep the return type on the parent edge.";
         let error = Error::new(PlanValidationError {
             phase: crate::plan::PlanValidationPhase::Submission,
             violation: vec![PlanViolation {
-                path: "flows.capture.steps.route.edges.persist.expansion".to_owned(),
+                path: "flows[0].edges[0].expansion".to_owned(),
                 message: message.to_owned(),
             }],
         });
@@ -623,7 +623,7 @@ mod test {
         assert_eq!(failure["code"], "canonical_validation_failed");
         assert_eq!(
             failure["violation"][0]["path"],
-            "flows.capture.steps.route.edges.persist.expansion"
+            "flows[0].edges[0].expansion"
         );
         assert_eq!(failure["violation"][0]["code"], "return_only_expansion");
         assert_eq!(failure["violation"][0]["message"], message);

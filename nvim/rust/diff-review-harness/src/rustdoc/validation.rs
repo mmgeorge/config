@@ -81,16 +81,16 @@ pub async fn validate_plan_rust_api(
     let mut edge_list = Vec::new();
     for (flow_index, flow) in document.flows.iter().enumerate() {
         collect_flow_edge(
-            &flow.steps,
-            &format!("flows.{flow_index}.steps"),
+            &flow.edges,
+            &format!("flows.{flow_index}.edges"),
             &mut edge_list,
         );
     }
     for (edge, path) in edge_list {
-        let callable = match &edge.relation {
-            PlanFlowRelation::Call { callable }
-            | PlanFlowRelation::Read { callable }
-            | PlanFlowRelation::Write { callable } => callable,
+        let callable = match edge.relation {
+            PlanFlowRelation::Call | PlanFlowRelation::Read | PlanFlowRelation::Write => {
+                edge.callable.as_ref().expect("validated callable")
+            }
             _ => continue,
         };
         let EntityReference::ExternalEntity {
@@ -190,25 +190,22 @@ pub async fn validate_plan_rust_api(
 }
 
 fn collect_flow_edge<'a>(
-    step_list: &'a [crate::plan::PlanFlowStep],
+    edge_slice: &'a [crate::plan::PlanFlowEdge],
     parent_path: &str,
     edge_list: &mut Vec<(&'a crate::plan::PlanFlowEdge, String)>,
 ) {
-    for (step_index, step) in step_list.iter().enumerate() {
-        let step_path = format!("{parent_path}.{step_index}");
-        for (edge_index, edge) in step.edges.iter().enumerate() {
-            let edge_path = format!("{step_path}.edges.{edge_index}");
-            edge_list.push((edge, format!("{edge_path}.relation.callable")));
+    for (edge_index, edge) in edge_slice.iter().enumerate() {
+        let edge_path = format!("{parent_path}.{edge_index}");
+        edge_list.push((edge, format!("{edge_path}.callable")));
+        collect_flow_edge(
+            &edge.expansion,
+            &format!("{edge_path}.expansion"),
+            edge_list,
+        );
+        for (branch_index, branch) in edge.branches.iter().enumerate() {
             collect_flow_edge(
-                &edge.expansion,
-                &format!("{edge_path}.expansion"),
-                edge_list,
-            );
-        }
-        for (branch_index, branch) in step.branches.iter().enumerate() {
-            collect_flow_edge(
-                &branch.steps,
-                &format!("{step_path}.branches.{branch_index}.steps"),
+                &branch.edges,
+                &format!("{edge_path}.branches.{branch_index}.edges"),
                 edge_list,
             );
         }
@@ -235,9 +232,7 @@ fn requirement_matches(requirement: &str, version: &str) -> bool {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::plan::{
-        PlanFlowBranch, PlanFlowEdge, PlanFlowStep, PlanFlowValue, ReferencedEntityKind,
-    };
+    use crate::plan::{PlanFlowBranch, PlanFlowEdge, ReferencedEntityKind};
 
     fn endpoint(name: &str) -> EntityReference {
         EntityReference::ExternalEntity {
@@ -247,51 +242,45 @@ mod test {
         }
     }
 
-    fn emitting_step() -> PlanFlowStep {
-        PlanFlowStep {
-            action: "Emit result".into(),
-            target: endpoint("worker"),
-            edges: vec![PlanFlowEdge {
-                relation: PlanFlowRelation::Emit,
-                target: endpoint("terminal"),
-                expansion: Vec::new(),
-                result: Some(PlanFlowValue::Text {
-                    text: "output".into(),
-                }),
-            }],
+    fn emitting_edge() -> PlanFlowEdge {
+        PlanFlowEdge {
+            relation: PlanFlowRelation::Emit,
+            target: endpoint("terminal"),
+            callable: None,
+            payload_type: Some("Output".into()),
+            return_type: None,
+            expansion: Vec::new(),
             branches: Vec::new(),
         }
     }
 
     #[test]
     fn collects_rust_api_edges_from_expansions_and_branches() {
-        let step_list = vec![PlanFlowStep {
-            action: "Route work".into(),
-            target: endpoint("worker"),
-            edges: vec![PlanFlowEdge {
-                relation: PlanFlowRelation::Emit,
-                target: endpoint("terminal"),
-                expansion: vec![emitting_step()],
-                result: None,
-            }],
+        let edge_list = vec![PlanFlowEdge {
+            relation: PlanFlowRelation::Emit,
+            target: endpoint("terminal"),
+            callable: None,
+            payload_type: Some("Output".into()),
+            return_type: None,
+            expansion: vec![emitting_edge()],
             branches: vec![PlanFlowBranch {
                 condition: "failure".into(),
-                steps: vec![emitting_step()],
+                edges: vec![emitting_edge()],
             }],
         }];
-        let mut edge_list = Vec::new();
+        let mut collected_edge_list = Vec::new();
 
-        collect_flow_edge(&step_list, "flows.0.steps", &mut edge_list);
+        collect_flow_edge(&edge_list, "flows.0.edges", &mut collected_edge_list);
 
         assert_eq!(
-            edge_list
+            collected_edge_list
                 .into_iter()
                 .map(|(_, path)| path)
                 .collect::<Vec<_>>(),
             vec![
-                "flows.0.steps.0.edges.0.relation.callable",
-                "flows.0.steps.0.edges.0.expansion.0.edges.0.relation.callable",
-                "flows.0.steps.0.branches.0.steps.0.edges.0.relation.callable",
+                "flows.0.edges.0.callable",
+                "flows.0.edges.0.expansion.0.callable",
+                "flows.0.edges.0.branches.0.edges.0.callable",
             ]
         );
     }

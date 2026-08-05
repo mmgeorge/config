@@ -86,7 +86,7 @@ local function fake_launcher(_, options, _)
 end
 
 local test_success, failure = pcall(function()
-  diff_review.setup({ perf_logging = false, harness = { backend = "mock" } })
+  diff_review.setup({ diff_logging = false, harness_logging = false, harness = { backend = "mock" } })
   builder._set_crate_dir_for_test(crate_root)
   builder._set_artifact_root_for_test(vim.fs.joinpath(test_root, "artifacts"))
   builder._set_runner_for_test(function(_, _, callback)

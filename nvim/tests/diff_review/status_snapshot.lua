@@ -15,6 +15,8 @@ local response_mode = "success"
 local status_output_override = nil
 local unstaged_output_override = nil
 local staged_output_override = nil
+local unstaged_added_numstat_output_override = nil
+local staged_added_numstat_output_override = nil
 
 local zero_oid = string.rep("0", 40)
 local first_oid = string.rep("1", 40)
@@ -51,13 +53,6 @@ local unstaged_output = table.concat({
 }, "\n")
 
 local staged_output = table.concat({
-  "diff --git a/deleted.txt b/deleted.txt",
-  "deleted file mode 100644",
-  "index 1111111..0000000",
-  "--- a/deleted.txt",
-  "+++ /dev/null",
-  "@@ -1 +0,0 @@",
-  "-deleted content",
   "diff --git a/original.txt b/renamed.txt",
   "similarity index 50%",
   "rename from original.txt",
@@ -76,6 +71,9 @@ local staged_output = table.concat({
   "-mixed head",
   "+mixed-index",
 }, "\n")
+
+local unstaged_added_numstat_output = ""
+local staged_added_numstat_output = "0\t0\tadded-empty.txt\0"
 
 local requested_path_list = {
   "modified file.txt",
@@ -129,6 +127,12 @@ local function response_for(command)
     local output = status_output_override or status_output
     return { ok = true, code = 0, stdout = output, stderr = "", output = output }
   end
+  if command_has(command, "--numstat") then
+    local output = command_has(command, "--cached")
+      and (staged_added_numstat_output_override or staged_added_numstat_output)
+      or (unstaged_added_numstat_output_override or unstaged_added_numstat_output)
+    return { ok = true, code = 0, stdout = output, stderr = "", output = output }
+  end
   if command_has(command, "--cached") then
     local output = staged_output_override or staged_output
     return { ok = true, code = 0, stdout = output, stderr = "", output = output }
@@ -175,19 +179,27 @@ local function collect_items()
 end
 
 local function assert_path_scoped_commands()
-  assert_equals(#call_list, 3, "path snapshot must issue exactly three Git commands")
+  assert_equals(#call_list, 5, "path snapshot must issue exactly five Git commands")
   assert_equals(call_list[1], vim.list_extend({
     "git", "--no-optional-locks", "-C", scratch_root,
     "status", "--porcelain=v2", "-z", "--untracked-files=all", "--",
   }, vim.deepcopy(requested_path_list)), "status command must use porcelain v2 with the complete path set")
   assert_equals(call_list[2], vim.list_extend({
     "git", "--no-optional-locks", "-C", scratch_root,
-    "-c", "core.quotepath=false", "diff", "--no-color", "--no-ext-diff", "--unified=0", "--",
-  }, vim.deepcopy(requested_path_list)), "unstaged command must request zero-context paths")
+    "-c", "core.quotepath=false", "diff", "--no-color", "--no-ext-diff", "--unified=0", "--diff-filter=MRC", "--",
+  }, vim.deepcopy(requested_path_list)), "unstaged command must request only modified, renamed, and copied paths")
   assert_equals(call_list[3], vim.list_extend({
     "git", "--no-optional-locks", "-C", scratch_root,
-    "-c", "core.quotepath=false", "diff", "--no-color", "--no-ext-diff", "--unified=0", "--cached", "--",
-  }, vim.deepcopy(requested_path_list)), "staged command must request zero-context cached paths")
+    "-c", "core.quotepath=false", "diff", "--no-color", "--no-ext-diff", "--unified=0", "--cached", "--diff-filter=MRC", "--",
+  }, vim.deepcopy(requested_path_list)), "staged command must request only cached modified, renamed, and copied paths")
+  assert_equals(call_list[4], vim.list_extend({
+    "git", "--no-optional-locks", "-C", scratch_root,
+    "-c", "core.quotepath=false", "diff", "--numstat", "-z", "--diff-filter=A", "--",
+  }, vim.deepcopy(requested_path_list)), "unstaged added-file metadata command changed")
+  assert_equals(call_list[5], vim.list_extend({
+    "git", "--no-optional-locks", "-C", scratch_root,
+    "-c", "core.quotepath=false", "diff", "--cached", "--numstat", "-z", "--diff-filter=A", "--",
+  }, vim.deepcopy(requested_path_list)), "staged added-file metadata command changed")
 end
 
 local function assert_snapshot_content(snapshot)
@@ -208,10 +220,15 @@ local function assert_snapshot_content(snapshot)
   assert_true(added.status_record.added and added.status_record.staged, "empty added file must survive without a hunk")
   assert_equals(added.combined_diff, false, "empty added file must use the checked-empty diff sentinel")
   assert_equals(snapshot.file_diffs[added.abs_file], false, "session cache must retain the empty-file sentinel")
+  assert_equals(added.staged_preview.source, "index_added", "staged addition must load from its index blob")
+  assert_equals(added.staged_preview.added, 0, "added-file numstat was lost")
+  assert_true(added.staged_preview.line_stats_complete, "added-file numstat must remain exact")
 
   local deleted = snapshot.file_by_path["deleted.txt"]
   assert_true(deleted.status_record.deleted, "deleted status was not parsed")
-  assert_equals(deleted.staged_hunk_list[1].git_status, "D", "deleted hunk lost its staged Git status")
+  assert_equals(deleted.staged_hunk_list, {}, "deleted file must not load a unified patch at startup")
+  assert_equals(deleted.staged_preview.source, "head_deleted", "staged deletion must load from its HEAD blob")
+  assert_equals(deleted.staged_preview.oid, first_oid, "deleted preview lost its porcelain HEAD object ID")
 
   local renamed = snapshot.file_by_path["renamed.txt"]
   assert_equals(renamed.status_record.kind, "renamed", "rename record kind was lost")
@@ -222,14 +239,12 @@ local function assert_snapshot_content(snapshot)
 
   local untracked = snapshot.file_by_path["untracked file.txt"]
   assert_true(untracked.status_record.untracked, "untracked record was not parsed")
-  assert_true(untracked.unstaged_diff:find("+untracked first", 1, true) ~= nil, "untracked source was not synthesized")
-  assert_equals(untracked.staged_flag_list, { false }, "untracked synthetic hunk must remain unstaged")
+  assert_equals(untracked.unstaged_diff, false, "untracked body must remain unloaded at startup")
+  assert_equals(untracked.unstaged_preview.source, "worktree_added", "untracked preview source changed")
+  assert_equals(untracked.unstaged_preview.added, 2, "untracked line metadata was not collected")
   assert_equals(snapshot.untracked_by_file[untracked.abs_file], "untracked file.txt", "untracked cache mapping was lost")
   local second_untracked = snapshot.file_by_path["second untracked.txt"]
-  assert_true(
-    second_untracked.unstaged_diff:find("+second untracked content", 1, true) ~= nil,
-    "parallel untracked reads crossed path content"
-  )
+  assert_equals(second_untracked.unstaged_preview.added, 1, "parallel untracked reads crossed path metadata")
 
   local mixed = snapshot.file_by_path["mixed.txt"]
   assert_equals(mixed.staged_flag_list, { false, true }, "same-position hunks must keep unstaged before staged")
@@ -253,7 +268,7 @@ local function assert_full_repository_scope()
   assert_true(snapshot_error == nil, "full repository collection failed: " .. vim.inspect(snapshot_error))
   assert_true(snapshot.full_repository, "empty path list must mean full repository")
   assert_equals(snapshot.requested_path_list, {}, "full repository snapshot must retain an empty path scope")
-  assert_equals(#call_list, 3, "full repository snapshot must still issue exactly three commands")
+  assert_equals(#call_list, 5, "full repository snapshot must still issue exactly five commands")
   for _, command in ipairs(call_list) do
     assert_true(not command_has(command, "--"), "full repository commands must omit the pathspec separator")
   end
@@ -265,7 +280,7 @@ local function assert_command_failure_detail()
   local snapshot, snapshot_error = collect({ "mixed.txt" })
   assert_true(snapshot == nil, "failed Git commands must not produce an authoritative snapshot")
   assert_equals(snapshot_error.kind, "command", "Git failures must remain command errors")
-  assert_equals(#snapshot_error.failure_list, 2, "each failed Git source must remain distinct")
+  assert_equals(#snapshot_error.failure_list, 3, "each failed Git source must remain distinct")
   assert_equals(snapshot_error.failure_list[1].source, "status", "status failure order changed")
   assert_equals(snapshot_error.failure_list[1].code, 128, "status failure code was lost")
   assert_equals(snapshot_error.failure_list[1].stderr, "fatal: status failed", "status stderr was lost")
@@ -274,7 +289,8 @@ local function assert_command_failure_detail()
   assert_equals(snapshot_error.failure_list[2].stderr, "fatal: staged failed", "staged stderr was lost")
   assert_true(snapshot_error.message:find("status: fatal: status failed", 1, true) ~= nil, "aggregate error omitted status")
   assert_true(snapshot_error.message:find("staged_diff: fatal: staged failed", 1, true) ~= nil, "aggregate error omitted staged diff")
-  assert_equals(#call_list, 3, "one failure must not prevent the remaining snapshot commands")
+  assert_equals(snapshot_error.failure_list[3].source, "staged_added_numstat", "staged numstat failure order changed")
+  assert_equals(#call_list, 5, "one failure must not prevent the remaining snapshot commands")
 end
 
 local function assert_full_load_adapter()
@@ -286,7 +302,7 @@ local function assert_full_load_adapter()
   local item_list, snapshot_error, snapshot = collect_items()
   assert_true(snapshot_error == nil, "full-load adapter failed: " .. vim.inspect(snapshot_error))
   assert_true(snapshot and snapshot.full_repository, "full-load adapter must expose its repository snapshot")
-  assert_equals(#call_list, 3, "full-load adapter must replace the former five Git reads")
+  assert_equals(#call_list, 5, "full-load adapter must share the atomic five-source snapshot")
 
   local saw_added_placeholder = false
   local saw_untracked_item = false

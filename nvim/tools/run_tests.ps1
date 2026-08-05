@@ -7,13 +7,14 @@ $ErrorActionPreference = "Stop"
 $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 Set-Location $repo
 
-# Truncate the diff-review perf log at the start of each run. Profiling is on by default and the
-# log balloons across runs (hundreds of MB), which slows the perf-heavy tests into timeouts.
+# Truncate scoped perf logs at the start of each run so prior diagnostics cannot affect test timing.
 try {
   $cache = (& nvim --headless -u NONE --cmd "set shadafile=NONE" -c "lua io.write(vim.fn.stdpath('cache'))" -c "qa!" 2>$null) -join ""
   if ($cache) {
-    $perfLog = Join-Path $cache "diff-review-perf.log"
-    if (Test-Path $perfLog) { Clear-Content $perfLog -ErrorAction SilentlyContinue }
+    foreach ($perfLogName in @("diff-review-diff-perf.log", "diff-review-harness-perf.log")) {
+      $perfLog = Join-Path $cache $perfLogName
+      if (Test-Path $perfLog) { Clear-Content $perfLog -ErrorAction SilentlyContinue }
+    }
   }
 } catch {}
 

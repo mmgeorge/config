@@ -265,14 +265,24 @@ end
 local function snapshot_diff(command, staged)
   local path_set = command_path_set(command)
   local modified_file_map = filtered_file_map(staged and state.staged_modified or state.modified, path_set)
-  local added_file_map = filtered_file_map(staged and state.staged_added or state.unstaged_added, path_set)
+  local copied_file_map = {}
   if staged then
-    for copied_path in pairs(filtered_file_map(state.staged_copied, path_set)) do added_file_map[copied_path] = true end
+    for copied_path in pairs(filtered_file_map(state.staged_copied, path_set)) do copied_file_map[copied_path] = true end
   end
   local text = joined_diff(modified_file_map, modified_diff)
-  local added = joined_diff(added_file_map, added_diff)
-  if text ~= "" and added ~= "" then return text .. "\n" .. added end
-  return text .. added
+  local copied = joined_diff(copied_file_map, added_diff)
+  if text ~= "" and copied ~= "" then return text .. "\n" .. copied end
+  return text .. copied
+end
+
+local function snapshot_added_numstat(command, staged)
+  local path_set = command_path_set(command)
+  local added_file_map = filtered_file_map(staged and state.staged_added or state.unstaged_added, path_set)
+  local record_list = {}
+  for _, path in ipairs(sorted_keys(added_file_map)) do
+    record_list[#record_list + 1] = "1\t0\t" .. path .. "\0"
+  end
+  return table.concat(record_list)
 end
 
 local function input_relpath(input)
@@ -379,7 +389,9 @@ function backend.system(command, input)
     return porcelain_status(command), 0
   end
   if snapshot_diff_command then
-    return snapshot_diff(command, key:find("\t--cached", 1, true) ~= nil), 0
+    local staged = key:find("\t--cached", 1, true) ~= nil
+    if key:find("\t--numstat\t", 1, true) then return snapshot_added_numstat(command, staged), 0 end
+    return snapshot_diff(command, staged), 0
   end
 
   local mutation_path = key:find("\tapply\t", 1, true) and input_relpath(input) or relpath
@@ -1056,7 +1068,7 @@ local function run()
     transient_render_count = transient_render_count + 1
     return transient_original_render_current_model(...)
   end
-  forced_snapshot_failure_command_count = 3
+  forced_snapshot_failure_command_count = 5
   reset_calls()
   reset_notifications()
   trigger_normal_mapping("S", find_row(buf, "transient-snapshot.txt"))
@@ -1073,10 +1085,10 @@ local function run()
   assert_true(state.staged_modified["transient-snapshot.txt"], "transient snapshot retry lost the successful Git write")
   assert_true(buffer_contains(buf, "Staged changes (1)"), "transient snapshot retry changed the matching projection")
   assert_true(transient_render_count == 1, "matching snapshot retry rendered after the optimistic action")
-  assert_true(count_snapshot_diff_calls() == 4, "transient snapshot failure did not run exactly one retry")
+  assert_true(count_snapshot_diff_calls() == 8, "transient snapshot failure did not run exactly one retry")
   assert_true(
-    count_calls("system_async", "git\t--no-optional-locks\t") == 6,
-    "transient snapshot retry did not use two three-command attempts\n" .. calls_text()
+    count_calls("system_async", "git\t--no-optional-locks\t") == 10,
+    "transient snapshot retry did not use two five-command attempts\n" .. calls_text()
   )
   assert_true(
     not saw_notification_containing("Git status snapshot failed"),
@@ -1221,9 +1233,9 @@ local function run()
   wait_for(function() return not mutation_coordinator.pending(root) end, "rapid hunk stage sync did not finish")
   status_render.status_render_current_model = rapid_original_render_current_model
   assert_true(rapid_render_count == 2, "matching rapid hunk sync rendered more than the two optimistic actions")
-  assert_true(count_snapshot_diff_calls() == 2, "rapid hunk stage burst did not use one three-command snapshot")
+  assert_true(count_snapshot_diff_calls() == 4, "rapid hunk stage burst did not use one five-command snapshot")
   assert_true(
-    count_calls("system_async", "\t--\trapid-stage-a.txt\trapid-stage-b.txt") == 3,
+    count_calls("system_async", "\t--\trapid-stage-a.txt\trapid-stage-b.txt") == 5,
     "rapid hunk stage snapshot did not union both pathspecs\n" .. calls_text()
   )
 
@@ -1271,9 +1283,9 @@ local function run()
   )
   assert_true(count_calls_with_input("system", "rapid-fail-a.txt") == 1, "failed rapid hunk did not execute exactly once")
   assert_true(count_calls_with_input("system", "rapid-fail-b.txt") == 0, "cancelled rapid hunk still reached Git")
-  assert_true(count_snapshot_diff_calls() == 4, "failed rapid burst did not retry the transient recovery snapshot once")
+  assert_true(count_snapshot_diff_calls() == 8, "failed rapid burst did not retry the transient recovery snapshot once")
   assert_true(
-    count_calls("system_async", "\t--\trapid-fail-a.txt\trapid-fail-b.txt") == 6,
+    count_calls("system_async", "\t--\trapid-fail-a.txt\trapid-fail-b.txt") == 10,
     "failed rapid burst recovery did not include every optimistic path\n" .. calls_text()
   )
   assert_true(
@@ -1306,7 +1318,7 @@ local function run()
     "partial stage recovery did not render mixed authoritative state\n" .. table.concat(status_lines(buf), "\n")
   )
   assert_true(partial_render_count == 2, "partial stage failure did not use one projection and one recovery render")
-  assert_true(count_snapshot_diff_calls() == 2, "partial stage failure did not use one recovery snapshot")
+  assert_true(count_snapshot_diff_calls() == 4, "partial stage failure did not use one recovery snapshot")
 
   reset_state({ modified = { ["stale-partial-a.txt"] = true, ["stale-partial-b.txt"] = true } })
   render_and_wait(buf, "stale-partial-a.txt +1 -1")
@@ -1343,7 +1355,7 @@ local function run()
     "terminal partial recovery retained the failed cache projection"
   )
   assert_true(stale_partial_render_count == 2, "terminal partial recovery did not use one projection and one fallback render")
-  assert_true(count_snapshot_diff_calls() == 4, "terminal partial recovery did not stop after two snapshot attempts")
+  assert_true(count_snapshot_diff_calls() == 8, "terminal partial recovery did not stop after two snapshot attempts")
 
   local pending_context_callbacks = {}
   local original_compute_hunk_context_async = git_data.compute_hunk_context_async

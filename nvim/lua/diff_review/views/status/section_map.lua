@@ -969,6 +969,16 @@ end
 ---@return DiffReviewStatusFile
 local function status_file_from_snapshot(file_snapshot, section_name, hunk_list)
   local status_record = file_snapshot.status_record or {}
+  local preview_provided = (section_name == "staged" and file_snapshot.staged_preview or file_snapshot.unstaged_preview) ~= nil
+  local preview = section_name == "staged" and file_snapshot.staged_preview or file_snapshot.unstaged_preview
+  preview = preview or {
+    state = "loaded",
+    source = "diff",
+    added = 0,
+    removed = 0,
+    line_stats_complete = true,
+    binary = false,
+  }
   local git_status = section_name == "staged" and status_record.index_status or status_record.worktree_status
   local untracked = section_name == "unstaged" and status_record.untracked == true
   if untracked then git_status = "??" end
@@ -978,12 +988,18 @@ local function status_file_from_snapshot(file_snapshot, section_name, hunk_list)
     original_relpath = status_record.original_path,
     path_change_kind = (status_record.kind == "renamed" or status_record.kind == "copied") and status_record.kind or nil,
     section_name = section_name,
-    added = 0,
-    removed = 0,
+    added = preview.added or 0,
+    removed = preview.removed or 0,
     hunks = {},
     untracked = untracked,
     status = status_record.xy or "",
     git_status = git_status,
+    preview_state = preview.state,
+    preview_source = preview.source,
+    preview_oid = preview.oid,
+    preview_mode = preview.mode,
+    preview_binary = preview.binary,
+    line_stats_complete = preview.line_stats_complete,
   } ---@type DiffReviewStatusFile
   for _, source_hunk in ipairs(hunk_list or {}) do
     local hunk = vim.deepcopy(source_hunk)
@@ -993,8 +1009,10 @@ local function status_file_from_snapshot(file_snapshot, section_name, hunk_list)
     hunk.git_status = git_status or hunk.git_status
     hunk.git_original_file = hunk.git_original_file or status_record.original_path
     file.hunks[#file.hunks + 1] = hunk
-    file.added = file.added + (hunk.added or 0)
-    file.removed = file.removed + (hunk.removed or 0)
+    if not preview_provided then
+      file.added = file.added + (hunk.added or 0)
+      file.removed = file.removed + (hunk.removed or 0)
+    end
   end
   return file
 end
@@ -1140,17 +1158,17 @@ local function status_load_async(cwd, cb)
     end)
     maybe_done()
   end)
-  git_data._collect_items_from_git(cwd, function(items, collection_error, collected_snapshot)
-    if collection_error or not items then
+  git_data._collect_status_snapshot_async(cwd, function(collected_snapshot, collection_error)
+    if collection_error or not collected_snapshot then
       finish({
         error = collection_error or { kind = "parse", message = "Git status collector returned no result" },
       })
       return
     end
     snapshot = collected_snapshot
-    sections = status_sections_from_items(items)
+    sections = M.sections_from_snapshot(collected_snapshot)
     maybe_done()
-  end, { skip_pre_render = true, skip_ts_context = true })
+  end)
 end
 
 -- Expose the bare-local section builders/movers that init and section_builder call by name.

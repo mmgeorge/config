@@ -77,9 +77,7 @@ return {
           vim.notify(table.concat(msg, "\n"), "info", {
             id = ("lsp_progress_%d"):format(client.id),
             title = client.name,
-            keep = function()
-              return #progress[client.id] > 0
-            end,
+            timeout = #progress[client.id] > 0 and 10000 or 3000,
             opts = function(notif)
               notif.icon = #progress[client.id] == 0 and " "
               or spinner[math.floor(vim.uv.hrtime() / (1e6 * 80)) % #spinner + 1]

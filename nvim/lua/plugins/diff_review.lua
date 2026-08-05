@@ -8,7 +8,8 @@ return {
       "Harness", "HarnessNew", "HarnessLog", "Permissions",
     },
     opts = {
-      perf_logging = true,
+      diff_logging = true,
+      harness_logging = false,
       status_cursor_prewarm = true,
       status_cursor_prewarm_max_hunks = 2,
       walkthrough_inventory = "sem",

@@ -2,10 +2,12 @@
 ---@field status_buffer_name string
 ---@field pr_buffer_name string
 ---@field debug_notifications boolean
----@field perf_logging boolean
----@field diff_profile_log_path string?
----@field diff_profile_slow_threshold_ms number
----@field diff_profile_sample_rate number
+---@field diff_logging boolean
+---@field harness_logging boolean
+---@field diff_log_path string?
+---@field harness_log_path string?
+---@field perf_slow_threshold_ms number
+---@field perf_sample_rate number
 ---@field pr_lookup_mode? "real"|"mock-delay"
 ---@field pr_mock_delay_ms? integer
 ---@field status_cursor_prewarm boolean
@@ -13,6 +15,7 @@
 ---@field status_diff_viewport_enabled boolean
 ---@field status_diff_viewport_threshold integer
 ---@field status_diff_viewport_overscan integer
+---@field status_deleted_file_preview_line_limit integer
 ---@field about_auto_generate boolean
 ---@field about_auto_generate_delay_ms integer
 ---@field walkthrough_inventory "sem"|false compute inventory with Sem or disable it
@@ -146,13 +149,14 @@ M.defaults = {
   status_buffer_name = "GitStatus",
   pr_buffer_name = "DiffReviewPR",
   debug_notifications = false,
-  -- Master perf switch: gates both the structured profiler (infra.perf →
-  -- diff-review-perf.log) and the GitStatus render timer (status_debug →
-  -- gitstatus-debug.log). The diff_profile_* keys below only tune the profiler.
-  perf_logging = true,
-  diff_profile_log_path = nil,
-  diff_profile_slow_threshold_ms = 8,
-  diff_profile_sample_rate = 0,
+  -- Gate non-Harness tracing (GitStatus, diffs, PRs, and shared UI work).
+  diff_logging = false,
+  -- Gate Harness lifecycle and provider-performance tracing.
+  harness_logging = false,
+  diff_log_path = nil,
+  harness_log_path = nil,
+  perf_slow_threshold_ms = 8,
+  perf_sample_rate = 0,
   pr_lookup_mode = "real",
   pr_mock_delay_ms = 5000,
   status_cursor_prewarm = true,
@@ -160,6 +164,7 @@ M.defaults = {
   status_diff_viewport_enabled = false,
   status_diff_viewport_threshold = 1200,
   status_diff_viewport_overscan = 80,
+  status_deleted_file_preview_line_limit = 1000,
   about_auto_generate = true,
   about_auto_generate_delay_ms = 1000,
   walkthrough_inventory = "sem",

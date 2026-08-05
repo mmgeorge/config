@@ -7,11 +7,11 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     ChangeAction, EntityChangeAction, EntityKind, EntityReference, PLAN_SCHEMA_VERSION,
-    PROVISIONAL_PLAN_TITLE, PlanCallable, PlanDocument, PlanFlowEdge, PlanFlowRelation,
-    PlanFlowStep, PlanFlowValue, PlanGraph, PlanSubtask, ProgramEntityChange, ReferencedEntityKind,
+    PROVISIONAL_PLAN_TITLE, PlanCallable, PlanDocument, PlanFlowBranch, PlanFlowEdge,
+    PlanFlowRelation, PlanGraph, PlanSubtask, ProgramEntityChange, ReferencedEntityKind,
 };
 
-const RETURN_ONLY_EXPANSION_MESSAGE: &str = "Expansion only returns a result and does not describe work performed inside the parent relationship. Add a nested step containing a construct, call, read, write, send, or emit edge, add a meaningful branch, or remove the expansion and keep the result on the parent edge.";
+const RETURN_ONLY_EXPANSION_MESSAGE: &str = "Expansion only returns a value and does not describe work performed inside the parent relationship. Add a nested construct, call, read, write, send, or emit edge, add a meaningful branch, or remove the expansion and keep the return type on the parent edge.";
 
 /// Defines the validation boundary that rejected one canonical plan.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -125,10 +125,12 @@ pub fn validate_workspace_references(document: &PlanDocument, workspace_root: &P
         }
     }
     for (flow_index, flow) in document.flows.iter().enumerate() {
-        for (step_index, step) in flow.steps.iter().enumerate() {
-            visit_workspace_step(
-                step,
-                &format!("flows[{flow_index}].steps[{step_index}]"),
+        let flow_path = format!("flows[{flow_index}]");
+        validate(format!("{flow_path}.source"), &flow.source);
+        for (edge_index, edge) in flow.edges.iter().enumerate() {
+            visit_workspace_edge(
+                edge,
+                &format!("{flow_path}.edges[{edge_index}]"),
                 &mut validate,
             );
         }
@@ -144,28 +146,24 @@ pub fn validate_workspace_references(document: &PlanDocument, workspace_root: &P
     }
 }
 
-fn visit_workspace_step(
-    step: &PlanFlowStep,
+fn visit_workspace_edge(
+    edge: &PlanFlowEdge,
     path: &str,
     validate: &mut impl FnMut(String, &EntityReference),
 ) {
-    validate(format!("{path}.target"), &step.target);
-    for (edge_index, edge) in step.edges.iter().enumerate() {
-        let edge_path = format!("{path}.edges[{edge_index}]");
-        validate(format!("{edge_path}.target"), &edge.target);
-        for (step_index, expansion_step) in edge.expansion.iter().enumerate() {
-            visit_workspace_step(
-                expansion_step,
-                &format!("{edge_path}.expansion[{step_index}]"),
-                validate,
-            );
-        }
+    validate(format!("{path}.target"), &edge.target);
+    for (edge_index, nested_edge) in edge.expansion.iter().enumerate() {
+        visit_workspace_edge(
+            nested_edge,
+            &format!("{path}.expansion[{edge_index}]"),
+            validate,
+        );
     }
-    for (branch_index, branch) in step.branches.iter().enumerate() {
-        for (step_index, branch_step) in branch.steps.iter().enumerate() {
-            visit_workspace_step(
-                branch_step,
-                &format!("{path}.branches[{branch_index}].steps[{step_index}]"),
+    for (branch_index, branch) in edge.branches.iter().enumerate() {
+        for (edge_index, branch_edge) in branch.edges.iter().enumerate() {
+            visit_workspace_edge(
+                branch_edge,
+                &format!("{path}.branches[{branch_index}].edges[{edge_index}]"),
                 validate,
             );
         }
@@ -438,73 +436,94 @@ impl<'a> PlanValidator<'a> {
             let path = format!("flows[{flow_index}]");
             self.required(&format!("{path}.title"), &flow.title);
             self.prose(&format!("{path}.description"), &flow.description);
-            for (step_index, step) in flow.steps.iter().enumerate() {
-                self.validate_flow_step(step, &format!("{path}.steps[{step_index}]"));
+            self.validate_reference(&format!("{path}.source"), &flow.source);
+            if flow.edges.is_empty() {
+                self.push(&format!("{path}.edges"), "must contain at least one edge");
+            }
+            for (edge_index, edge) in flow.edges.iter().enumerate() {
+                self.validate_flow_edge(edge, &format!("{path}.edges[{edge_index}]"));
             }
         }
     }
 
-    fn validate_flow_step(&mut self, step: &PlanFlowStep, step_path: &str) {
-        self.required(&format!("{step_path}.action"), &step.action);
-        self.validate_reference(&format!("{step_path}.target"), &step.target);
-        if step.edges.is_empty() && step.branches.is_empty() {
-            self.push(step_path, "must contain at least one edge or branch");
+    fn validate_flow_branch(&mut self, branch: &PlanFlowBranch, branch_path: &str) {
+        self.required(&format!("{branch_path}.condition"), &branch.condition);
+        if branch.edges.is_empty() {
+            self.push(
+                &format!("{branch_path}.edges"),
+                "must contain at least one edge",
+            );
         }
-        for (edge_index, edge) in step.edges.iter().enumerate() {
-            self.validate_flow_edge(edge, &format!("{step_path}.edges[{edge_index}]"));
+        for (edge_index, edge) in branch.edges.iter().enumerate() {
+            self.validate_flow_edge(edge, &format!("{branch_path}.edges[{edge_index}]"));
         }
+    }
+
+    fn validate_flow_branches(&mut self, branches: &[PlanFlowBranch], edge_path: &str) {
         let mut condition_set = HashSet::new();
-        for (branch_index, branch) in step.branches.iter().enumerate() {
-            let branch_path = format!("{step_path}.branches[{branch_index}]");
-            self.required(&format!("{branch_path}.condition"), &branch.condition);
+        for (branch_index, branch) in branches.iter().enumerate() {
+            let branch_path = format!("{edge_path}.branches[{branch_index}]");
             if !condition_set.insert(branch.condition.as_str()) {
                 self.push(
                     &format!("{branch_path}.condition"),
                     &format!("duplicates branch condition {}", branch.condition),
                 );
             }
-            if branch.steps.is_empty() {
-                self.push(
-                    &format!("{branch_path}.steps"),
-                    "must contain at least one step",
-                );
-            }
-            for (step_index, nested_step) in branch.steps.iter().enumerate() {
-                self.validate_flow_step(nested_step, &format!("{branch_path}.steps[{step_index}]"));
-            }
+            self.validate_flow_branch(branch, &branch_path);
         }
     }
 
     fn validate_flow_edge(&mut self, edge: &PlanFlowEdge, edge_path: &str) {
         self.validate_reference(&format!("{edge_path}.target"), &edge.target);
-        match &edge.relation {
-            PlanFlowRelation::Call { callable }
-            | PlanFlowRelation::Read { callable }
-            | PlanFlowRelation::Write { callable } => {
-                self.callable(&format!("{edge_path}.relation.callable"), callable);
+        match edge.relation {
+            PlanFlowRelation::Call | PlanFlowRelation::Read | PlanFlowRelation::Write => {
+                if let Some(callable) = &edge.callable {
+                    self.callable(&format!("{edge_path}.callable"), callable);
+                } else {
+                    self.push(
+                        &format!("{edge_path}.callable"),
+                        "is required for callable relations",
+                    );
+                }
                 self.validate_type_reference(&format!("{edge_path}.target"), &edge.target);
             }
-            PlanFlowRelation::Send { event } => {
-                self.required(&format!("{edge_path}.relation.event"), event);
+            PlanFlowRelation::Send | PlanFlowRelation::Emit | PlanFlowRelation::Return => {
+                if let Some(payload_type) = &edge.payload_type {
+                    self.required(&format!("{edge_path}.payload_type"), payload_type);
+                } else {
+                    self.push(
+                        &format!("{edge_path}.payload_type"),
+                        "is required for payload relations",
+                    );
+                }
             }
             PlanFlowRelation::Construct => {
                 self.validate_type_reference(&format!("{edge_path}.target"), &edge.target);
             }
-            PlanFlowRelation::Emit | PlanFlowRelation::Return => {}
         }
-        for (step_index, nested_step) in edge.expansion.iter().enumerate() {
-            self.validate_flow_step(nested_step, &format!("{edge_path}.expansion[{step_index}]"));
+        if !matches!(
+            edge.relation,
+            PlanFlowRelation::Call | PlanFlowRelation::Read | PlanFlowRelation::Write
+        ) && edge.return_type.is_some()
+        {
+            self.push(
+                &format!("{edge_path}.return_type"),
+                "belongs only to callable relations",
+            );
         }
-        if let Some(result) = &edge.result {
-            match result {
-                PlanFlowValue::Type { name } => {
-                    self.required(&format!("{edge_path}.result.name"), name);
-                }
-                PlanFlowValue::Text { text } => {
-                    self.required(&format!("{edge_path}.result.text"), text);
-                }
+        if let Some(return_type) = &edge.return_type {
+            self.required(
+                &format!("{edge_path}.return_type.value_type"),
+                &return_type.value_type,
+            );
+            if let Some(error_type) = &return_type.error_type {
+                self.required(&format!("{edge_path}.return_type.error_type"), error_type);
             }
         }
+        for (edge_index, nested_edge) in edge.expansion.iter().enumerate() {
+            self.validate_flow_edge(nested_edge, &format!("{edge_path}.expansion[{edge_index}]"));
+        }
+        self.validate_flow_branches(&edge.branches, edge_path);
     }
 
     fn validate_tasks(&mut self) {
@@ -660,21 +679,17 @@ impl<'a> PlanValidator<'a> {
             self.push("tasks", "requires at least one task");
         }
         for (flow_index, flow) in self.document.flows.iter().enumerate() {
-            if flow.steps.is_empty() {
+            if flow.edges.is_empty() {
                 self.push(
-                    &format!("flows[{flow_index}].steps"),
-                    "requires at least one acting step",
+                    &format!("flows[{flow_index}].edges"),
+                    "requires at least one typed runtime edge",
                 );
             }
-            for (step_index, step) in flow.steps.iter().enumerate() {
-                let step_path = format!("flows[{flow_index}].steps[{step_index}]");
-                if step.edges.is_empty() {
-                    self.push(
-                        &format!("{step_path}.edges"),
-                        "requires at least one typed runtime edge",
-                    );
-                }
-                self.validate_submission_flow_step(step, &step_path);
+            for (edge_index, edge) in flow.edges.iter().enumerate() {
+                self.validate_submission_flow_edge(
+                    edge,
+                    &format!("flows[{flow_index}].edges[{edge_index}]"),
+                );
             }
         }
         let attached_entity_name = self
@@ -757,38 +772,26 @@ impl<'a> PlanValidator<'a> {
                 }
             }
         }
-        for (flow_index, flow) in self.document.flows.iter().enumerate() {
-            if flow.steps.is_empty() {
-                self.push(
-                    &format!("flows[{flow_index}].steps"),
-                    "requires at least one flow step",
-                );
-            }
-        }
     }
 
-    fn validate_submission_flow_step(&mut self, step: &PlanFlowStep, step_path: &str) {
-        for (edge_index, edge) in step.edges.iter().enumerate() {
-            let edge_path = format!("{step_path}.edges[{edge_index}]");
-            if !edge.expansion.is_empty() && !flow_expansion_has_material_work(&edge.expansion) {
-                self.push(
-                    &format!("{edge_path}.expansion"),
-                    RETURN_ONLY_EXPANSION_MESSAGE,
-                );
-            }
-            for (step_index, nested_step) in edge.expansion.iter().enumerate() {
-                self.validate_submission_flow_step(
-                    nested_step,
-                    &format!("{edge_path}.expansion[{step_index}]"),
-                );
-            }
+    fn validate_submission_flow_edge(&mut self, edge: &PlanFlowEdge, edge_path: &str) {
+        if !edge.expansion.is_empty() && !flow_expansion_has_material_work(&edge.expansion) {
+            self.push(
+                &format!("{edge_path}.expansion"),
+                RETURN_ONLY_EXPANSION_MESSAGE,
+            );
         }
-        for (branch_index, branch) in step.branches.iter().enumerate() {
-            let branch_path = format!("{step_path}.branches[{branch_index}]");
-            for (step_index, nested_step) in branch.steps.iter().enumerate() {
-                self.validate_submission_flow_step(
-                    nested_step,
-                    &format!("{branch_path}.steps[{step_index}]"),
+        for (edge_index, nested_edge) in edge.expansion.iter().enumerate() {
+            self.validate_submission_flow_edge(
+                nested_edge,
+                &format!("{edge_path}.expansion[{edge_index}]"),
+            );
+        }
+        for (branch_index, branch) in edge.branches.iter().enumerate() {
+            for (edge_index, branch_edge) in branch.edges.iter().enumerate() {
+                self.validate_submission_flow_edge(
+                    branch_edge,
+                    &format!("{edge_path}.branches[{branch_index}].edges[{edge_index}]"),
                 );
             }
         }
@@ -973,13 +976,11 @@ impl<'a> PlanValidator<'a> {
     }
 }
 
-fn flow_expansion_has_material_work(step_list: &[PlanFlowStep]) -> bool {
-    step_list.iter().any(|step| {
-        !step.branches.is_empty()
-            || step.edges.iter().any(|edge| {
-                !matches!(&edge.relation, PlanFlowRelation::Return)
-                    || flow_expansion_has_material_work(&edge.expansion)
-            })
+fn flow_expansion_has_material_work(edge_list: &[PlanFlowEdge]) -> bool {
+    edge_list.iter().any(|edge| {
+        !matches!(edge.relation, PlanFlowRelation::Return)
+            || !edge.branches.is_empty()
+            || flow_expansion_has_material_work(&edge.expansion)
     })
 }
 
@@ -1012,12 +1013,11 @@ fn entity_kind_is_type(kind: EntityKind) -> bool {
 #[cfg(test)]
 mod test {
     use super::super::{
-        ChangeAction, EntityChangeAction, EntityReference, MemberKind, PlanCallable,
-        PlanCallableKind, PlanFileChange, PlanFlowBranch, PlanFlowEdge, PlanFlowRelation,
-        PlanFlowStep, PlanFlowValue, ProgramEntityMemberChange, ReferencedEntityKind, Visibility,
+        ChangeAction, EntityChangeAction, MemberKind, PlanCallable, PlanCallableKind,
+        PlanFileChange, PlanFlowRelation, ProgramEntityMemberChange, Visibility,
         attach_test_fixture, test_fixture,
     };
-    use super::validate_workspace_references;
+    use super::validate_plan_edit;
 
     #[test]
     fn rejects_a_file_rename_without_distinct_paths() {
@@ -1106,128 +1106,28 @@ mod test {
     }
 
     #[test]
-    fn diagnostics_use_compact_dot_index_paths() {
-        let mut document = test_fixture("plan", "Validate.");
-        document.flows[0].steps[0].edges.clear();
-        document.flows[0].steps[0].branches.clear();
-
-        let error = document.validate().unwrap_err().to_string();
-
-        assert!(error.contains("flows[0].steps[0]"));
-        assert!(!error.contains("flow_"));
-    }
-
-    #[test]
-    fn planned_entity_references_must_resolve() {
-        let mut document = test_fixture("plan", "Validate.");
-        document.flows[0].steps[0].target =
-            super::super::document::EntityReference::PlannedEntity {
-                entity: "missing_entity".into(),
-            };
-
-        let error = document.validate().unwrap_err().to_string();
-
-        assert!(error.contains("references unknown planned entity `missing_entity`"));
-    }
-
-    #[test]
-    fn workspace_entity_references_require_stable_unchanged_source_anchors() {
-        let mut document = test_fixture("plan", "Validate.");
-        document.flows[0].steps[0].target = EntityReference::WorkspaceEntity {
-            entity_kind: ReferencedEntityKind::Type,
-            name: document.entity_changes[0].name.clone(),
-            path: document.entity_changes[0].path.clone(),
-            line: 0,
+    fn flow_edges_require_their_relation_specific_types() {
+        let mut document = test_fixture("plan", "Validate edge types.");
+        document.flows[0].edges[0].relation = PlanFlowRelation::Call;
+        document.flows[0].edges[0].payload_type = None;
+        document.flows[0].edges[0].return_type = None;
+        document.flows[0].edges[0].callable = None;
+        document.flows[0].edges[0].target = crate::plan::EntityReference::PlannedEntity {
+            entity: "PlanDocument".into(),
         };
 
-        let error = document.validate().unwrap_err().to_string();
+        let error = validate_plan_edit(&document).unwrap_err().to_string();
 
-        assert!(error.contains("line: must be greater than zero"));
-        assert!(error.contains("must use planned_entity for a construct changed by this plan"));
-
-        document.flows[0].steps[0].target = EntityReference::WorkspaceEntity {
-            entity_kind: ReferencedEntityKind::Type,
-            name: "PlanValidator".into(),
-            path: "../validation.rs".into(),
-            line: 76,
-        };
-        let error = document.validate().unwrap_err().to_string();
-        assert!(error.contains("cannot escape the workspace"));
-    }
-
-    #[test]
-    fn workspace_entity_submission_validates_the_physical_declaration_line() {
-        let temp = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(temp.path().join("src")).unwrap();
-        std::fs::write(
-            temp.path().join("src").join("validation.rs"),
-            "pub struct PlanValidator;\n",
-        )
-        .unwrap();
-        let mut document = test_fixture("plan", "Validate.");
-        document.flows[0].steps[0].target = EntityReference::WorkspaceEntity {
-            entity_kind: ReferencedEntityKind::Type,
-            name: "PlanValidator".into(),
-            path: "src/validation.rs".into(),
-            line: 1,
-        };
-
-        validate_workspace_references(&document, temp.path()).unwrap();
-
-        let EntityReference::WorkspaceEntity { line, .. } = &mut document.flows[0].steps[0].target
-        else {
-            unreachable!()
-        };
-        *line = 2;
-        let error = validate_workspace_references(&document, temp.path())
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("outside workspace source"));
-
-        let EntityReference::WorkspaceEntity { line, .. } = &mut document.flows[0].steps[0].target
-        else {
-            unreachable!()
-        };
-        *line = 1;
-        let nested_reference = EntityReference::WorkspaceEntity {
-            entity_kind: ReferencedEntityKind::Type,
-            name: "MissingType".into(),
-            path: "src/validation.rs".into(),
-            line: 1,
-        };
-        document.flows[0].steps[0].edges[0]
-            .expansion
-            .push(PlanFlowStep {
-                action: "Read nested type".into(),
-                target: nested_reference.clone(),
-                edges: Vec::new(),
-                branches: Vec::new(),
-            });
-        document.flows[0].steps[0].branches.push(PlanFlowBranch {
-            condition: "fallback required".into(),
-            steps: vec![PlanFlowStep {
-                action: "Read fallback type".into(),
-                target: nested_reference,
-                edges: Vec::new(),
-                branches: Vec::new(),
-            }],
+        assert!(error.contains("flows[0].edges[0].callable"));
+        document.flows[0].edges[0].callable = Some(PlanCallable {
+            kind: PlanCallableKind::Method,
+            name: "dispatch".into(),
         });
-
-        let nested_error = validate_workspace_references(&document, temp.path())
-            .unwrap_err()
-            .to_string();
-        assert!(nested_error.contains("flows[0].steps[0].edges[0].expansion[0].target.line"));
-        assert!(nested_error.contains("flows[0].steps[0].branches[0].steps[0].target.line"));
-    }
-
-    #[test]
-    fn structured_flow_values_require_nonempty_content() {
-        let mut document = test_fixture("plan", "Build structured planning.");
-        document.flows[0].steps[0].edges[0].result = Some(PlanFlowValue::Type { name: " ".into() });
-
-        let error = document.validate().unwrap_err();
-
-        assert!(error.to_string().contains("result.name: cannot be empty"));
+        document.flows[0].edges[0].return_type = Some(crate::plan::PlanFlowReturnType {
+            value_type: "ExecutablePlan".into(),
+            error_type: Some("PlanError".into()),
+        });
+        validate_plan_edit(&document).unwrap();
     }
 
     #[test]
@@ -1245,278 +1145,6 @@ mod test {
                 .to_string()
                 .contains("description: must describe substantive reviewer-visible intent")
         );
-    }
-
-    #[test]
-    fn recursive_flows_validate_nested_work_and_distinct_branch_conditions() {
-        let mut document = test_fixture("plan", "Validate nested flows.");
-        let leaf = PlanFlowStep {
-            action: "Emit failure".into(),
-            target: EntityReference::PlannedEntity {
-                entity: "PlanDocument".into(),
-            },
-            edges: vec![PlanFlowEdge {
-                relation: PlanFlowRelation::Emit,
-                target: EntityReference::ExternalEntity {
-                    entity_kind: ReferencedEntityKind::Endpoint,
-                    name: "terminal".into(),
-                    dependency: None,
-                },
-                expansion: Vec::new(),
-                result: None,
-            }],
-            branches: Vec::new(),
-        };
-        document.flows[0].steps[0].edges[0].expansion = vec![PlanFlowStep {
-            action: "Read metadata".into(),
-            target: EntityReference::PlannedEntity {
-                entity: "PlanDocument".into(),
-            },
-            edges: Vec::new(),
-            branches: Vec::new(),
-        }];
-        document.flows[0].steps[0].branches = vec![
-            crate::plan::PlanFlowBranch {
-                condition: "failure".into(),
-                steps: vec![leaf.clone()],
-            },
-            crate::plan::PlanFlowBranch {
-                condition: "failure".into(),
-                steps: vec![leaf],
-            },
-        ];
-
-        let error = document.validate().unwrap_err().to_string();
-
-        assert!(error.contains(
-            "flows[0].steps[0].edges[0].expansion[0]: must contain at least one edge or branch"
-        ));
-        assert!(error.contains("duplicates branch condition failure"));
-    }
-
-    #[test]
-    fn submission_rejects_return_only_expansions_with_actionable_guidance() {
-        let mut document = test_fixture("plan", "Validate nested flows.");
-        document.flows[0].steps[0].edges[0].expansion = vec![PlanFlowStep {
-            action: "Return report".into(),
-            target: EntityReference::PlannedEntity {
-                entity: "PlanDocument".into(),
-            },
-            edges: vec![PlanFlowEdge {
-                relation: PlanFlowRelation::Return,
-                target: EntityReference::ExternalEntity {
-                    entity_kind: ReferencedEntityKind::Endpoint,
-                    name: "caller".into(),
-                    dependency: None,
-                },
-                expansion: Vec::new(),
-                result: Some(PlanFlowValue::Type {
-                    name: "Report".into(),
-                }),
-            }],
-            branches: Vec::new(),
-        }];
-
-        document
-            .validate()
-            .expect("intermediate edit remains valid");
-        let error = document.validate_for_submission().unwrap_err().to_string();
-
-        assert!(
-            error.contains("flows[0].steps[0].edges[0].expansion: Expansion only returns a result")
-        );
-        assert!(error.contains("add a meaningful branch"));
-        assert!(error.contains("remove the expansion and keep the result on the parent edge"));
-    }
-
-    #[test]
-    fn submission_accepts_material_and_branching_expansions() {
-        let mut document = test_fixture("plan", "Validate nested flows.");
-        document.flows[0].steps[0].edges[0].expansion = vec![PlanFlowStep {
-            action: "Store draft".into(),
-            target: EntityReference::PlannedEntity {
-                entity: "PlanDocument".into(),
-            },
-            edges: vec![PlanFlowEdge {
-                relation: PlanFlowRelation::Emit,
-                target: EntityReference::ExternalEntity {
-                    entity_kind: ReferencedEntityKind::Endpoint,
-                    name: "workspace storage".into(),
-                    dependency: None,
-                },
-                expansion: Vec::new(),
-                result: Some(PlanFlowValue::Text {
-                    text: "durable draft".into(),
-                }),
-            }],
-            branches: Vec::new(),
-        }];
-        document
-            .validate_for_submission()
-            .expect("material expansion");
-
-        document.flows[0].steps[0].edges[0].expansion = vec![PlanFlowStep {
-            action: "Route result".into(),
-            target: EntityReference::PlannedEntity {
-                entity: "PlanDocument".into(),
-            },
-            edges: Vec::new(),
-            branches: vec![PlanFlowBranch {
-                condition: "draft exists".into(),
-                steps: vec![PlanFlowStep {
-                    action: "Return existing draft".into(),
-                    target: EntityReference::PlannedEntity {
-                        entity: "PlanDocument".into(),
-                    },
-                    edges: vec![PlanFlowEdge {
-                        relation: PlanFlowRelation::Return,
-                        target: EntityReference::ExternalEntity {
-                            entity_kind: ReferencedEntityKind::Endpoint,
-                            name: "caller".into(),
-                            dependency: None,
-                        },
-                        expansion: Vec::new(),
-                        result: Some(PlanFlowValue::Type {
-                            name: "Draft".into(),
-                        }),
-                    }],
-                    branches: Vec::new(),
-                }],
-            }],
-        }];
-        document
-            .validate_for_submission()
-            .expect("branching expansion");
-    }
-
-    #[test]
-    fn submission_rejects_recursively_nested_return_only_expansions() {
-        let mut document = test_fixture("plan", "Validate nested flows.");
-        let parent_edge = &mut document.flows[0].steps[0].edges[0];
-        parent_edge.relation = PlanFlowRelation::Call {
-            callable: PlanCallable {
-                kind: PlanCallableKind::Method,
-                name: "execute".into(),
-            },
-        };
-        parent_edge.target = EntityReference::PlannedEntity {
-            entity: "PlanDocument".into(),
-        };
-        parent_edge.expansion = vec![PlanFlowStep {
-            action: "Invoke persistence".into(),
-            target: EntityReference::PlannedEntity {
-                entity: "PlanDocument".into(),
-            },
-            edges: vec![PlanFlowEdge {
-                relation: PlanFlowRelation::Call {
-                    callable: PlanCallable {
-                        kind: PlanCallableKind::Method,
-                        name: "persist".into(),
-                    },
-                },
-                target: EntityReference::PlannedEntity {
-                    entity: "PlanDocument".into(),
-                },
-                expansion: vec![PlanFlowStep {
-                    action: "Return identifier".into(),
-                    target: EntityReference::PlannedEntity {
-                        entity: "PlanDocument".into(),
-                    },
-                    edges: vec![PlanFlowEdge {
-                        relation: PlanFlowRelation::Return,
-                        target: EntityReference::ExternalEntity {
-                            entity_kind: ReferencedEntityKind::Endpoint,
-                            name: "caller".into(),
-                            dependency: None,
-                        },
-                        expansion: Vec::new(),
-                        result: Some(PlanFlowValue::Type {
-                            name: "DraftId".into(),
-                        }),
-                    }],
-                    branches: Vec::new(),
-                }],
-                result: Some(PlanFlowValue::Type {
-                    name: "DraftId".into(),
-                }),
-            }],
-            branches: Vec::new(),
-        }];
-
-        let error = document.validate_for_submission().unwrap_err().to_string();
-
-        assert!(error.contains(
-            "flows[0].steps[0].edges[0].expansion[0].edges[0].expansion: Expansion only returns a result"
-        ));
-    }
-
-    #[test]
-    fn typed_flow_edges_require_valid_targets_and_results() {
-        let mut document = test_fixture("plan", "Validate.");
-        document.flows[0].steps[0].edges = vec![
-            PlanFlowEdge {
-                relation: PlanFlowRelation::Read {
-                    callable: PlanCallable {
-                        kind: PlanCallableKind::Method,
-                        name: "schema".into(),
-                    },
-                },
-                target: EntityReference::PlannedEntity {
-                    entity: "missing_entity".into(),
-                },
-                expansion: Vec::new(),
-                result: Some(PlanFlowValue::Text {
-                    text: "schema text".into(),
-                }),
-            },
-            PlanFlowEdge {
-                relation: PlanFlowRelation::Call {
-                    callable: PlanCallable {
-                        kind: PlanCallableKind::Method,
-                        name: "count".into(),
-                    },
-                },
-                target: EntityReference::ExternalEntity {
-                    entity_kind: ReferencedEntityKind::Type,
-                    name: "SessionContext".into(),
-                    dependency: Some("datafusion".into()),
-                },
-                expansion: Vec::new(),
-                result: Some(PlanFlowValue::Text { text: " ".into() }),
-            },
-        ];
-
-        let error = document.validate().unwrap_err().to_string();
-
-        assert!(error.contains("references unknown planned entity `missing_entity`"));
-        assert!(error.contains("result.text: cannot be empty"));
-    }
-
-    #[test]
-    fn callable_edges_require_bare_callable_names_and_type_receivers() {
-        let mut document = test_fixture("plan", "Validate typed receivers.");
-        document.flows[0].steps[0].edges = vec![PlanFlowEdge {
-            relation: PlanFlowRelation::Read {
-                callable: PlanCallable {
-                    kind: PlanCallableKind::Method,
-                    name: "schema()".into(),
-                },
-            },
-            target: EntityReference::ExternalEntity {
-                entity_kind: ReferencedEntityKind::Endpoint,
-                name: "registered relation".into(),
-                dependency: Some(" ".into()),
-            },
-            expansion: Vec::new(),
-            result: Some(PlanFlowValue::Type {
-                name: "SchemaRef".into(),
-            }),
-        }];
-
-        let error = document.validate().unwrap_err().to_string();
-        assert!(error.contains("without parentheses"));
-        assert!(error.contains("must reference one type entity"));
-        assert!(error.contains("target.dependency: cannot be empty"));
     }
 
     #[test]

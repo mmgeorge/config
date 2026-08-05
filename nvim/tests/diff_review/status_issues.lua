@@ -70,8 +70,9 @@ function git_backend.system_async(command, _, cb)
   record(command)
   local key = command_key(command)
   local status_key = "git\t--no-optional-locks\t-C\t" .. root .. "\tstatus\t--porcelain=v2\t-z\t--untracked-files=all"
-  local unstaged_key = "git\t--no-optional-locks\t-C\t" .. root
+  local diff_key = "git\t--no-optional-locks\t-C\t" .. root
     .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0"
+  local unstaged_key = diff_key .. "\t--diff-filter=MRC"
   local output
   if key == status_key then
     output = "1 .M N... 100644 100644 100644 1111111 2222222 lua/diff_review/init.lua\0"
@@ -84,7 +85,9 @@ function git_backend.system_async(command, _, cb)
       "-old",
       "+new",
     }, "\n")
-  elseif key == unstaged_key .. "\t--cached" then
+  elseif key == diff_key .. "\t--cached\t--diff-filter=MRC" then
+    output = ""
+  elseif key:find("\tdiff\t", 1, true) and key:find("\t--numstat\t", 1, true) then
     output = ""
   else
     local message = "unexpected git command: " .. key

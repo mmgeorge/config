@@ -7,6 +7,7 @@
 
 local syntax_engine = require("diff_review.render.syntax_engine")
 
+local git_data = require("diff_review.git.git_data")
 local source = require("diff_review.render.source")
 -- diff_source_state edge kept lazy to avoid a load-time cycle.
 local function diff_source_state() return require("diff_review.views.status.diff_source_state") end
@@ -25,6 +26,8 @@ local ui = require("diff_review.infra.ui")
 local session = require("diff_review.session")
 
 local M = {}
+
+local status_cursor_prewarm_delta_limit = 100
 
 local function status_entry_under_cursor(state)
   local status = state or session.status
@@ -81,6 +84,23 @@ function M._status_entry_is_file_like(entry)
     and (entry.kind == "file" or entry.kind == "commit_file" or entry.kind == "pr_file" or entry.kind == "pr_review_file")
 end
 
+--- Decide whether cursor hover may prewarm a non-deleted file without an explicit expansion.
+--- Require known sub-100-line stats until the file expands.
+---@param entry DiffReviewStatusEntry
+---@return boolean
+local function status_file_cursor_prewarm_allowed(entry)
+  local file = entry.file
+  if not file then return false end
+  if status_buffer.folded(session.status or {}, entry.id, entry.default_folded) == false then return true end
+  if file.line_stats_complete == false then return false end
+
+  local added = tonumber(file.added)
+  local removed = tonumber(file.removed)
+  if not (added and removed) then return false end
+  local delta = math.max(0, math.floor(added)) + math.max(0, math.floor(removed))
+  return delta < status_cursor_prewarm_delta_limit
+end
+
 ---@param entry DiffReviewStatusEntry?
 ---@return boolean
 function M._status_entry_is_hunk_like(entry)
@@ -118,7 +138,10 @@ local function status_prewarm_entry_syntax(entry)
     file = entry and entry.file and entry.file.filename or nil,
   }, function()
     if not entry then return end
+    if entry.preview_omitted then return end
+    if entry.file and git_data._status_file_is_deleted(entry.file) then return end
     if M._status_entry_is_file_like(entry) and entry.file then
+      if not status_file_cursor_prewarm_allowed(entry) then return end
       local syntax_source = syntax_engine.status_syntax_source_for_entry_kind(entry.kind)
       syntax_engine.prewarm_file_diff_syntax(entry.file, "status-cursor-prewarm:" .. (entry.id or entry.file.filename), nil, { syntax_source = syntax_source })
     elseif M._status_entry_is_hunk_like(entry) and entry.file and entry.hunk then

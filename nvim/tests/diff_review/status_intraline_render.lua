@@ -97,13 +97,15 @@ end
 function backend.system(command)
   local key = command_key(command)
   local status_key = "git\t--no-optional-locks\t-C\t" .. root .. "\tstatus\t--porcelain=v2\t-z\t--untracked-files=all"
-  local unstaged_key = "git\t--no-optional-locks\t-C\t" .. root
+  local diff_key = "git\t--no-optional-locks\t-C\t" .. root
     .. "\t-c\tcore.quotepath=false\tdiff\t--no-color\t--no-ext-diff\t--unified=0"
+  local unstaged_key = diff_key .. "\t--diff-filter=MRC"
   if key == status_key then
     return "1 .M N... 100644 100644 100644 1111111 2222222 src/model.rs\0", 0
   end
   if key == unstaged_key then return diff_text, 0 end
-  if key == unstaged_key .. "\t--cached" then return "", 0 end
+  if key == diff_key .. "\t--cached\t--diff-filter=MRC" then return "", 0 end
+  if key:find("\tdiff\t", 1, true) and key:find("\t--numstat\t", 1, true) then return "", 0 end
   return "", 0
 end
 

@@ -20,6 +20,9 @@ local session = require("diff_review.session")
 local M = {}
 require("diff_review.query_runtime")
 
+---@type fun(snapshot_error: DiffReviewPathStatusSnapshotError)
+local notify_snapshot_error
+
 --- Resolve the path snapshot seam lazily to avoid its parser dependency closing a load-time cycle.
 ---@return DiffReviewPathStatusSnapshotModule
 local function status_snapshot()
@@ -60,6 +63,14 @@ local function git_status_is_deleted(status)
   return type(status) == "string" and status:sub(1, 1) == "D"
 end
 
+---@param file DiffReviewStatusFile
+---@return boolean
+local function status_file_is_deleted(file)
+  local status = type(file.git_status) == "string" and file.git_status or file.status
+  status = type(status) == "string" and status:lower() or ""
+  return status:sub(1, 1) == "d" or status == "deleted" or status == "removed"
+end
+
 ---@param status string?
 ---@return boolean
 local function git_status_is_renamed(status)
@@ -75,7 +86,7 @@ function M._status_file_change_label(file)
   if file.untracked or status:sub(1, 1) == "a" or status == "added" or status == "new" then
     return "New", "DiffReviewStatusFileNew"
   end
-  if status:sub(1, 1) == "d" or status == "deleted" or status == "removed" then
+  if status_file_is_deleted(file) then
     return "Removed", "DiffReviewStatusFileDeleted"
   end
   return "Modified", "DiffReviewStatusFileModified"
@@ -232,12 +243,22 @@ local function parse_diff(diff_output, staged)
   return hunks
 end
 
---- Run git diff and return parsed hunks
+--- Run one path-scoped Git diff and return parsed hunks.
 ---@param cwd string
 ---@param staged boolean
+---@param filename? string absolute file path
 ---@param cb fun(hunks: DiffReviewHunk[])
-local function get_hunks_async(cwd, staged, cb)
+local function get_hunks_async(cwd, staged, filename, cb)
   local args = git_backend.git_diff_command(cwd, staged and { "--cached" } or nil)
+  if filename then
+    local relpath, relative_error = paths.repo_relative(filename, cwd)
+    if not relpath then
+      notifications.error(relative_error or ("Unable to resolve %s from Git root"):format(filename))
+      cb({})
+      return
+    end
+    vim.list_extend(args, { "--", relpath })
+  end
   git_backend.systemlist_async(args, function(result, code)
     if code ~= 0 then
       cb({})
@@ -282,7 +303,7 @@ local function file_diff_and_flags_async(cwd, filename, cb)
   local hunks = {}
   local pending = 2
   for _, staged in ipairs({ false, true }) do
-    get_hunks_async(cwd, staged, function(result)
+    get_hunks_async(cwd, staged, filename, function(result)
       for _, hunk in ipairs(result) do
       if vim.fs.normalize(paths.repo_file_path(cwd, hunk.file)) == norm then
         hunks[#hunks + 1] = hunk
@@ -298,6 +319,22 @@ local function file_diff_and_flags_async(cwd, filename, cb)
       cb(table.concat(diffs, "\n"), flags)
     end)
   end
+end
+
+---@param cwd string
+---@param callback fun(snapshot?: DiffReviewPathStatusSnapshot, error?: DiffReviewPathStatusSnapshotError)
+local function collect_status_snapshot_async(cwd, callback)
+  syntax_engine.clear_context_cache()
+  syntax_engine.clear_treesitter_source_buffers()
+  status_snapshot().collect_async(cwd, {}, function(snapshot, snapshot_error)
+    if not snapshot then
+      local effective_error = snapshot_error or { kind = "parse", message = "Git status snapshot returned no result" }
+      notify_snapshot_error(effective_error)
+      callback(nil, effective_error)
+      return
+    end
+    callback(snapshot, nil)
+  end)
 end
 
 --- Compute Tree-sitter scope context for a hunk without blocking UI render.
@@ -673,7 +710,7 @@ local function append_untracked_items(item_list, untracked_file_list)
 end
 
 ---@param snapshot_error DiffReviewPathStatusSnapshotError
-local function notify_snapshot_error(snapshot_error)
+notify_snapshot_error = function(snapshot_error)
   if snapshot_error.failure_list and #snapshot_error.failure_list > 0 then
     local failure_list = {}
     for _, failure in ipairs(snapshot_error.failure_list) do
@@ -696,15 +733,8 @@ end
 ---@param callback fun(item_list?: table[], error?: DiffReviewPathStatusSnapshotError, snapshot?: DiffReviewPathStatusSnapshot)
 ---@param context? { skip_pre_render?: boolean, skip_ts_context?: boolean }
 local function collect_items_from_git(cwd, callback, context)
-  syntax_engine.clear_context_cache()
-  syntax_engine.clear_treesitter_source_buffers()
-  status_snapshot().collect_async(cwd, {}, function(snapshot, snapshot_error)
-    if not snapshot then
-      local effective_error = snapshot_error or { kind = "parse", message = "Git status snapshot returned no result" }
-      notify_snapshot_error(effective_error)
-      callback(nil, effective_error)
-      return
-    end
+  collect_status_snapshot_async(cwd, function(snapshot, snapshot_error)
+    if not snapshot then callback(nil, snapshot_error) return end
 
     local all_hunk_list, untracked_file_list = snapshot_status_hunk_list(snapshot)
     local file_stat_by_path = snapshot_file_stat_by_path(all_hunk_list)
@@ -730,10 +760,12 @@ end
 M._parse_diff = parse_diff
 M._order_file_hunks = order_file_hunks
 M._file_diff_and_flags_async = file_diff_and_flags_async
+M._collect_status_snapshot_async = collect_status_snapshot_async
 M._collect_items_from_git = collect_items_from_git
 M._parse_name_status_line = parse_name_status_line
 M._git_status_is_added = git_status_is_added
 M._git_status_is_deleted = git_status_is_deleted
+M._status_file_is_deleted = status_file_is_deleted
 M._git_status_is_renamed = git_status_is_renamed
 
 return M

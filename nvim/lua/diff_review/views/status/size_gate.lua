@@ -6,6 +6,7 @@
 --- via direct requires.
 
 local config = require("diff_review.infra.config")
+local git_data = require("diff_review.git.git_data")
 
 local hunk_model = require("diff_review.render.hunk_model")
 local source = require("diff_review.render.source")
@@ -238,6 +239,18 @@ function M._status_file_render_row_budget()
   local base = tonumber(options.status_diff_viewport_threshold) or 0
   if base <= 0 then return nil end
   return base
+end
+
+--- Resolve the deleted-file line count when its preview must be omitted.
+---@param file DiffReviewStatusFile
+---@return integer?
+function M._status_deleted_file_preview_omission(file)
+  if not git_data._status_file_is_deleted(file) then return nil end
+  local options = config.options or config.defaults
+  local limit = math.max(0, math.floor(tonumber(options.status_deleted_file_preview_line_limit) or 1000))
+  local line_count = math.max(0, math.floor(tonumber(file.removed) or 0))
+  if line_count <= limit then return nil end
+  return line_count
 end
 
 --- Count the leading display hunks a file body must render regardless of the row
