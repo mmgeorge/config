@@ -57,6 +57,13 @@ The critical piece to remember is residual heat isn't the driver here; it's pure
 - When asked a question, answer it directly — do not automatically start writing code. Often the user will want to bounce and iterate on an idea before moving to implementation.
 - **Prose Punctuation:** Never use semicolons in prose. Split sentences instead. *(Note: This constraint applies strictly to conversational text and narrative explanations; it does not apply to programming language syntax).*
 
+# Banned Words
+Avoid using these words:
+- Projection (unless specifically talking about coordinate spaces)
+- Materialization
+- Actor
+
+
 # Programming Philosophy
 - **Engineering over hacking.** When you spot a design issue, stop and refactor — fix the real problem even if it's substantial. Duplicated code should be shared. Minimize accumulated tech debt.
 - **Fix at the source.** Fix problems where they originate — never monkey-patch. Fixes must apply to all codepaths, current and future. Flawed abstraction? Fix the abstraction. Wrong data? Fix where it's produced. Adding an `if` for a case that "shouldn't happen"? Fix why it happens.
