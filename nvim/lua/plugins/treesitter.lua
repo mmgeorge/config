@@ -33,7 +33,8 @@ return {
         "nu",
         "markdown",
         "markdown_inline",
-        "latex"
+        "latex",
+        "cue"
       }
 
       local installed = require("nvim-treesitter.config").get_installed()

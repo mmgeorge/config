@@ -122,7 +122,7 @@ end
 ---@return string[]
 local function status_virtual_path_list(root, entries, source_section)
   local path_set = {}
-  for _, entry in ipairs(entry_nav._status_expanded_entries(entries)) do
+  for _, entry in ipairs(entry_nav._status_action_entries(entries)) do
     if entry.file and entry.file.section_name == source_section then
       local relpath = status_entry_relative_path(root, entry)
       if relpath then path_set[relpath] = true end
@@ -325,8 +325,8 @@ end
 local function status_stage_entries(entries, opts)
   if #entries == 0 then return end
   if blocked_by_active_commit("Stage") then return end
-  local expanded_entries = entry_nav._status_expanded_entries(entries)
-  if #expanded_entries == 0 then return end
+  local action_selection = entry_nav._status_action_entries(entries)
+  if #action_selection == 0 then return end
 
   local status = session.status
   local root = status and status.cwd or nil
@@ -334,7 +334,7 @@ local function status_stage_entries(entries, opts)
     notify_error("Stage failed: missing Git root", "DiffReview")
     return
   end
-  local action_entries, ignored_path_list = status_stage_action_entries(root, expanded_entries)
+  local action_entries, ignored_path_list = status_stage_action_entries(root, action_selection)
   if #action_entries == 0 then return end
   local cursor_target = opts and opts.visual_selection
       and entry_nav._status_visual_action_cursor_target(opts.visual_selection, action_entries) or nil
@@ -354,8 +354,8 @@ end
 ---@param opts? DiffReviewStatusListActionOptions
 local function status_unstage_entries(entries, opts)
   if #entries == 0 then return end
-  local expanded_entries = entry_nav._status_expanded_entries(entries)
-  if #expanded_entries == 0 then return end
+  local action_selection = entry_nav._status_action_entries(entries)
+  if #action_selection == 0 then return end
 
   local status = session.status
   local root = status and status.cwd or nil
@@ -363,14 +363,14 @@ local function status_unstage_entries(entries, opts)
     notify_error("Unstage failed: missing Git root", "DiffReview")
     return
   end
-  local ignored_path_list = status_virtual_path_list(root, expanded_entries, "ignored")
+  local ignored_path_list = status_virtual_path_list(root, action_selection, "ignored")
   local virtual_changed = #ignored_path_list > 0 and ignored_path_store.unignore_paths(root, ignored_path_list)
   if virtual_changed then
     entry_nav._status_notify_action("Unignored", 0, #ignored_path_list)
   end
 
-  local action_entries = status_unstage_action_entries(expanded_entries)
-  local target_entries = #action_entries > 0 and action_entries or expanded_entries
+  local action_entries = status_unstage_action_entries(action_selection)
+  local target_entries = #action_entries > 0 and action_entries or action_selection
   local cursor_target = opts and opts.visual_selection
       and entry_nav._status_visual_action_cursor_target(opts.visual_selection, target_entries) or nil
   if #action_entries == 0 then
@@ -400,9 +400,9 @@ local function status_ignore_entries(entries, opts)
   end
   local ignored_path_list = status_virtual_path_list(root, entries, "unstaged")
   if #ignored_path_list == 0 then return end
-  local expanded_entries = entry_nav._status_expanded_entries(entries)
+  local action_selection = entry_nav._status_action_entries(entries)
   local cursor_target = opts and opts.visual_selection
-      and entry_nav._status_visual_action_cursor_target(opts.visual_selection, expanded_entries) or nil
+      and entry_nav._status_visual_action_cursor_target(opts.visual_selection, action_selection) or nil
   if ignored_path_store.ignore_paths(root, ignored_path_list) then
     status_sync.reproject_ignored(root, cursor_target)
     entry_nav._status_notify_action("Ignored", 0, #ignored_path_list)
@@ -691,7 +691,7 @@ end
 local function status_discard_entry_list(entries, target_id, opts)
   opts = opts or {}
   local discard_entries = {}
-  for _, entry in ipairs(entry_nav._status_expanded_entries(entries)) do
+  for _, entry in ipairs(entry_nav._status_action_entries(entries)) do
     if entry.kind == "hunk" or entry.kind == "file" then
       discard_entries[#discard_entries + 1] = entry
     end

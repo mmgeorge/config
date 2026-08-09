@@ -716,6 +716,9 @@ git text loaders, and the layout build that `diff_render` consumes.
 
 **6. Navigate and act.** `entry_nav.lua` resolves the entry under the cursor, parent/file/
 hunk relationships, visual-selection entry sets, action targets, and decoration prewarm.
+Before dispatch, it expands selected sections into files and removes hunk targets already
+covered by a selected file in the same status section. This non-overlapping action set
+prevents one visual range from mutating a whole file and then mutating its former hunks.
 Visual line mutations capture the next surviving semantic sibling before changing the
 component model, falling back to the previous sibling when the selection reaches the
 end. The originating action render consumes that target once. Normal-mode actions,
@@ -1103,7 +1106,8 @@ runs, so rapid stage and unstage actions never expose an intermediate backend fr
 ```
 visual line range, press the stage key
   └─ entry_nav captures the next surviving file id, otherwise the previous file id
-       ├─ keymaps exits visual mode and dispatches the normalized selection
+       ├─ keymaps exits visual mode
+       ├─ entry_nav expands sections and lets selected files dominate their hunks
        ├─ actions projects the accepted files into Staged
        ├─ originating status render restores the captured id once
        └─ queued Git work and every deferred synchronization render stay cursor-neutral

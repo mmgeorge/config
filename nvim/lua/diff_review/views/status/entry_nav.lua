@@ -326,9 +326,19 @@ local function status_file_entries_for_entry(entry)
   return { entry }
 end
 
+---@param entry DiffReviewStatusEntry
+---@return string?
+local function status_file_scope(entry)
+  local file = entry.file
+  if not (file and file.filename and file.section_name) then return nil end
+  return status_keys.file_key(file.section_name, file.filename)
+end
+
+--- Build non-overlapping action entries from selected rows, expanding sections to files.
+--- Preserve hunk targets only when the same selection does not contain their file target.
 ---@param entries DiffReviewStatusEntry[]
 ---@return DiffReviewStatusEntry[]
-local function status_expanded_entries(entries)
+local function status_action_entries(entries)
   local expanded_entries = {}
   local seen = {}
   for _, selected_entry in ipairs(entries or {}) do
@@ -340,7 +350,19 @@ local function status_expanded_entries(entries)
       end
     end
   end
-  return expanded_entries
+
+  local selected_file_scope = {}
+  for _, entry in ipairs(expanded_entries) do
+    local file_scope = entry.kind == "file" and status_file_scope(entry) or nil
+    if file_scope then selected_file_scope[file_scope] = true end
+  end
+
+  local action_entries = {}
+  for _, entry in ipairs(expanded_entries) do
+    local covered_by_file = entry.kind == "hunk" and selected_file_scope[status_file_scope(entry) or ""] == true
+    if not covered_by_file then action_entries[#action_entries + 1] = entry end
+  end
+  return action_entries
 end
 
 ---@param file_set table<string, boolean>
@@ -615,7 +637,7 @@ M._status_leave_visual_mode = status_leave_visual_mode
 M._status_visual_selection = status_visual_selection
 M._status_visual_action_cursor_target = status_visual_action_cursor_target
 M._status_action_target_id = status_action_target_id
-M._status_expanded_entries = status_expanded_entries
+M._status_action_entries = status_action_entries
 M._status_files_from_set = status_files_from_set
 M._status_count_set = status_count_set
 M._status_notify_action = status_notify_action
