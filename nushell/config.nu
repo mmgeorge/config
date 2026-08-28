@@ -90,8 +90,10 @@ def test [
 def --wrapped co [...args] {
     # let instruction_dirs = (get_copilot_instruction_dirs)
     let allowed_tools = [
-        # 'shell(python )'
-        # 'shell(python:*)'
+        'shell(python)'
+        'shell(python:*)'
+        'shell(git)'
+        'shell(git:*)'
         'shell(nu-check)'
         'shell(nu-check:*)'
         'shell(pnpm run dev)'
@@ -127,7 +129,10 @@ def --wrapped co [...args] {
         'shell(jq:*)'
         'shell(tsgo)'
         'shell(tsgo:*)'
+        'shell(cargo)'
+        'shell(cargo:*)'
         'write'
+        'sem'
         'chrome-devtools'
         'docs-mcp'
         'github-mcp-enterprise'
@@ -138,8 +143,11 @@ def --wrapped co [...args] {
     let copilot_args = [
         # --sandbox
         --no-auto-update
+        --add-github-mcp-toolset pull_requests
+        --add-github-mcp-toolset discussions
+        --add-github-mcp-toolset actions
         ...$allowed_tool_args
-        --deny-tool 'shell'
+        # --deny-tool 'shell'
         --deny-tool 'shell(git commit)'
         --deny-tool 'shell(git commit:*)'
         --deny-tool 'shell(gh)'
@@ -148,10 +156,14 @@ def --wrapped co [...args] {
         --deny-tool 'shell(az:*)'
         --deny-tool 'shell(azcopy)'
         --deny-tool 'shell(azcopy:*)'
-        --deny-tool 'shell(python)'
-        --deny-tool 'shell(python:*)'
+        # --deny-tool 'shell(python)'
+        # --deny-tool 'shell(python:*)'
         # --disable-builtin-mcps
         # --allow-all-urls
+        --add-dir '/Users/matt9222/Developer'
+        --add-dir '/Users/matt9222/datasets'
+        --add-dir '/Users/matt9222/.cargo'
+        --add-dir '/Users/matt9222/Developer/maps/screenshots'
         # --add-dir '/Users/matt9222/Developer/agents'
         # --add-dir '/Users/matt9222/config/copilot/.github/instructions'
     ]

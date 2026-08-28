@@ -1,0 +1,39 @@
+[
+  {
+    "skills": ["parquet"],
+    "query": "Inspect ./fixtures/counties.parquet. Show its geometry metadata, schema, two NAME and POP records, and spatial index statistics.",
+    "expected_behavior": [
+      "Uses portal tools parquet rather than introducing an unrelated Parquet library",
+      "Uses meta, schema, a bounded query with projected columns, and stats with a spatial column path",
+      "Reports missing fields or metadata as errors instead of guessing replacements"
+    ]
+  },
+  {
+    "skills": ["parquet"],
+    "query": "Upload ./counties as a private Parquet Feature Layer item named Counties.",
+    "expected_behavior": [
+      "Recognizes that the current portal item parquet upload implementation shares new items publicly",
+      "Stops before upload because the requested privacy guarantee cannot be met",
+      "Explains that upload creates a Parquet Feature Layer item with resources rather than a hosted feature service"
+    ]
+  },
+  {
+    "skills": ["parquet"],
+    "query": "Replace item 0123456789abcdef0123456789abcdef with ./counties-v2 and regenerate its spatial metadata.",
+    "expected_behavior": [
+      "Uses portal item parquet update with the explicit item ID instead of relying on selection or upload --overwrite",
+      "Adds --spatial and explains the resource-directory swap",
+      "Verifies item metadata, resource listing, and spatial metadata after the update"
+    ]
+  },
+  {
+    "skills": ["parquet"],
+    "query": "Upload ./roads to container datasets in Azure storage alias prod at parquet/roads and create an app that renders the Parquet files.",
+    "expected_behavior": [
+      "Synchronizes the Azure CDN route cache before the CDN-dependent workflow",
+      "Inspects local metadata, uploads recursively, verifies the destination, generates spatial metadata when geometry is present, and opens portal tools azure file app",
+      "States that the result is an ArcGIS Play document rather than a Portal Application item",
+      "Reconciles expected and uploaded paths before retrying a partial upload or post-upload CDN failure"
+    ]
+  }
+]

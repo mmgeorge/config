@@ -4,6 +4,7 @@
 .claude/
 .codex/
 .copilot/
+.screenshots/
 .gemini/
 
 # Rulesync-generated LLM provider root files

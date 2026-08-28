@@ -44,9 +44,34 @@ M.settings = {
     },
     -- Add repo-specific layouts here, keyed by the repo directory name.
     by_repo = {
-      ['maps'] = {
+      ['wasm'] = {
+        tabs = {
+          { title = 'main',
+            focus = true,
+            first_run_commands = {
+              commands = {
+                'nvim',
+              },
+            },
+            panes = {
+              {
+                direction = 'Bottom',
+                size = 0.25,
+              },
+            },
+          },
+          { title = 'copilot',
+            first_run_commands = {
+              commands = {
+                'co',
+              },
+            },
+          },
+        },
+        branch_prefix = 'matt9222/',
+      },
+      ['webgis'] = {
         env = {
-          FOO = 1
         },
         new_worktree_setup = {
           symlinks = {
@@ -71,7 +96,7 @@ M.settings = {
                 size = 0.25,
                 first_run_commands = {
                   commands = {
-                    'git submodule update --init --recursive; pnpm install; pnpm run codegen',
+                    'git submodule update --init --recursive; pnpm install; pnpm core:start',
                   },
                 },
               },

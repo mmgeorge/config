@@ -1,0 +1,38 @@
+[
+  {
+    "skills": ["portal"],
+    "query": "Find my hosted Feature Layer titled Parcels in Portal alias prod and inspect five sample features.",
+    "expected_behavior": [
+      "Uses --portal prod, --me, --hosted, and title search to discover the item",
+      "Resolves the result to an item ID before calling feature layers",
+      "Uses --features 5 and reports authentication or private-service failures directly"
+    ]
+  },
+  {
+    "skills": ["portal"],
+    "query": "Share Web Map item 0123456789abcdef0123456789abcdef in Portal alias prod with the organization.",
+    "expected_behavior": [
+      "Uses the explicit item ID and --portal prod rather than a persisted selection",
+      "Uses --level org rather than the public default",
+      "Verifies the resulting item metadata or access level"
+    ]
+  },
+  {
+    "skills": ["portal"],
+    "query": "Export layer 0 from Feature Layer item fedcba9876543210fedcba9876543210 in Portal alias prod to ./parcels.geojson.",
+    "expected_behavior": [
+      "Inspects the Feature Layer and starts an export with an explicit title, format, and parameters JSON",
+      "Tracks the local job ID and checks job content rather than relying only on exit status",
+      "Downloads to an explicit output path and warns before overwriting an existing local file"
+    ]
+  },
+  {
+    "skills": ["portal"],
+    "query": "Create a compact ArcGIS Play example from private Web Map item abcdefabcdefabcdefabcdefabcdefab in Portal alias prod.",
+    "expected_behavior": [
+      "Explains that ArcGIS Play is external and not a Portal Application item",
+      "Requests explicit approval before using --mini because it uploads embedded private Web Map JSON",
+      "Uses the explicit item ID and --portal prod"
+    ]
+  }
+]

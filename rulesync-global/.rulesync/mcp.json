@@ -48,7 +48,7 @@
       },
       "default_tools_approval_mode": "approve"
     },
-    "github-mcp-server": {
+    "github-public-mcp-server": {
       "targets": ["claudecode", "codexcli", "antigravity-cli"],
       "command": "github-mcp-server",
       "args": [
@@ -67,6 +67,16 @@
       "targets": ["codexcli"],
       "type": "http",
       "url": "https://developers.openai.com/mcp",
+      "default_tools_approval_mode": "approve"
+    },
+    "play-mcp": {
+      "targets": ["copilotcli"],
+      "command": "npx",
+      "args": [
+        "-y",
+        "--@webgis:registry=https://olympus.esri.com/artifactory/api/npm/npm-repo/",
+        "@webgis/play-mcp@latest"
+      ],
       "default_tools_approval_mode": "approve"
     },
     "terminal-mcp": {
