@@ -76,6 +76,19 @@ local function assert_staged_addition_uses_index_blob()
   assert_true(result.hunks[1].diff:find("new file mode 100755", 1, true) ~= nil, "staged addition lost its index mode")
 end
 
+local function assert_large_addition_stops_before_diff_render()
+  command_list = {}
+  local content_line_list = {}
+  for line_number = 1, 1001 do content_line_list[line_number] = ("line %d"):format(line_number) end
+  response_list = { success(table.concat(content_line_list, "\n") .. "\n") }
+  local file = staged_file("index_added", string.rep("2", 40))
+  local result = load(file)
+  assert_equal(#command_list, 1, "large staged addition issued more than its blob read")
+  assert_equal(result.state, "omitted", "large addition did not enter the omitted state")
+  assert_equal(result.added, 1001, "large addition lost its exact line count")
+  assert_equal(result.hunks, {}, "large addition synthesized an oversized diff")
+end
+
 local function assert_large_deletion_stops_before_blob_read()
   command_list = {}
   response_list = { success("0\t1001\texample.txt\0") }
@@ -138,9 +151,10 @@ end
 local function run()
   git_backend.set_backend(backend)
   config.options = vim.tbl_deep_extend("force", vim.deepcopy(config.defaults), {
-    status_deleted_file_preview_line_limit = 1000,
+    status_file_preview_line_limit = 1000,
   })
   assert_staged_addition_uses_index_blob()
+  assert_large_addition_stops_before_diff_render()
   assert_large_deletion_stops_before_blob_read()
   assert_small_deletion_uses_head_blob()
   assert_unstaged_deletion_uses_index_blob()

@@ -93,9 +93,22 @@ local function content_result(file, content)
     }
   end
   local added = file.preview_source == "worktree_added" or file.preview_source == "index_added"
+  local line_count = #content_line_list(content)
+  local options = config.options or config.defaults
+  local limit = math.max(0, math.floor(tonumber(options.status_file_preview_line_limit) or 1000))
+  if line_count > limit then
+    return {
+      state = "omitted",
+      hunks = {},
+      diff = false,
+      added = added and line_count or 0,
+      removed = added and 0 or line_count,
+      line_stats_complete = true,
+      binary = false,
+    }
+  end
   local patch = synthetic_file_patch(file.relpath, content, added, file.preview_mode)
   local hunk_list = patch and git_data._parse_diff(patch, file.section_name == "staged") or {}
-  local line_count = #content_line_list(content)
   for _, hunk in ipairs(hunk_list) do
     hunk.filename = file.filename
     hunk.section_name = file.section_name
@@ -183,7 +196,7 @@ local function load_deleted_async(root, file, callback)
       return
     end
     local options = config.options or config.defaults
-    local limit = math.max(0, math.floor(tonumber(options.status_deleted_file_preview_line_limit) or 1000))
+    local limit = math.max(0, math.floor(tonumber(options.status_file_preview_line_limit) or 1000))
     if stat.removed > limit then
       callback({
         state = "omitted",

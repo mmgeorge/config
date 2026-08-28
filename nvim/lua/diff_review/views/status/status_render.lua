@@ -572,6 +572,7 @@ end
 local function status_prepare_file_expansion_context(entry, state, on_ready)
   state = state or session.status
   if not (state and entry and entry.file and entry_nav._status_entry_is_file_like(entry)) then return false end
+  if size_gate._status_file_preview_omission(entry.file) then return false end
   local request_key = entry.id or entry.file.filename
   state.file_expansion_context_generations = state.file_expansion_context_generations or {}
   state.file_expansion_context_generations[request_key] = (state.file_expansion_context_generations[request_key] or 0) + 1
@@ -683,7 +684,7 @@ local function status_render_file(file, entry_kind, hunk_entry_kind, file_key_ov
   opts = opts or {}
   local file_key = file_key_override or status_file_key(file.section_name, file.filename)
   local default_folded = not (opts.default_open or opts.force_open)
-  local omitted_line_count = size_gate._status_deleted_file_preview_omission(file)
+  local omitted_line_count, preview_line_limit = size_gate._status_file_preview_omission(file)
   local entry = {
     id = file_key,
     kind = entry_kind or "file",
@@ -717,7 +718,7 @@ local function status_render_file(file, entry_kind, hunk_entry_kind, file_key_ov
   if omitted_line_count then
     status_add_line(
       string.rep(" ", status_hunk_indent)
-        .. ("Preview omitted — deleted file has %d lines"):format(omitted_line_count),
+        .. ("Diff omitted — file has %d lines (limit %d)"):format(omitted_line_count, preview_line_limit),
       entry,
       "Comment"
     )

@@ -241,16 +241,19 @@ function M._status_file_render_row_budget()
   return base
 end
 
---- Resolve the deleted-file line count when its preview must be omitted.
+--- Resolve the whole-file line count and limit when its preview must be omitted.
 ---@param file DiffReviewStatusFile
----@return integer?
-function M._status_deleted_file_preview_omission(file)
-  if not git_data._status_file_is_deleted(file) then return nil end
+---@return integer? line_count
+---@return integer? limit
+function M._status_file_preview_omission(file)
   local options = config.options or config.defaults
-  local limit = math.max(0, math.floor(tonumber(options.status_deleted_file_preview_line_limit) or 1000))
-  local line_count = math.max(0, math.floor(tonumber(file.removed) or 0))
+  local limit = math.max(0, math.floor(tonumber(options.status_file_preview_line_limit) or 1000))
+  local added_file = file.preview_source == "worktree_added" or file.preview_source == "index_added"
+  local deleted_file = git_data._status_file_is_deleted(file)
+  if not (added_file or deleted_file) then return nil end
+  local line_count = math.max(0, math.floor(tonumber(added_file and file.added or file.removed) or 0))
   if line_count <= limit then return nil end
-  return line_count
+  return line_count, limit
 end
 
 --- Count the leading display hunks a file body must render regardless of the row

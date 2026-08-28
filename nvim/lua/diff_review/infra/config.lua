@@ -15,7 +15,7 @@
 ---@field status_diff_viewport_enabled boolean
 ---@field status_diff_viewport_threshold integer
 ---@field status_diff_viewport_overscan integer
----@field status_deleted_file_preview_line_limit integer
+---@field status_file_preview_line_limit integer
 ---@field about_auto_generate boolean
 ---@field about_auto_generate_delay_ms integer
 ---@field walkthrough_inventory "sem"|false compute inventory with Sem or disable it
@@ -164,7 +164,7 @@ M.defaults = {
   status_diff_viewport_enabled = false,
   status_diff_viewport_threshold = 1200,
   status_diff_viewport_overscan = 80,
-  status_deleted_file_preview_line_limit = 1000,
+  status_file_preview_line_limit = 1000,
   about_auto_generate = true,
   about_auto_generate_delay_ms = 1000,
   walkthrough_inventory = "sem",

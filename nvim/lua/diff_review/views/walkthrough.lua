@@ -2820,6 +2820,17 @@ function M.on_status_rendered(buf)
     vim.api.nvim_buf_clear_namespace(buf, M._ns, 0, -1)
     local state = active.host.get_state()
     apply_status_summary_highlights(active, state)
+    for row, entry in pairs(state and state.entries or {}) do
+      local file = entry and entry.file
+      local added_preview = file
+        and (file.preview_source == "worktree_added" or file.preview_source == "index_added")
+      local expanded = vim.api.nvim_win_call(win, function() return vim.fn.foldclosed(row) == -1 end)
+      if added_preview and file.preview_state == "unloaded" and expanded then
+        require("diff_review.views.status.status_render").status_prepare_file_expansion_context(entry, state, function()
+          active.host.rerender()
+        end)
+      end
+    end
     if active.index == 0 then return end
     local step = active.doc.steps[active.index]
     local target = rendered_step_target(active, step, state)

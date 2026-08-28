@@ -502,12 +502,14 @@ what actually changed. `source_loader.lua` is the thin convenience facade
 (`ensure` → `ensure_file` → `replace_file_hunks`) so callers do not thread three handles
 around.
 
-Fully deleted files add a harder data boundary. Startup retains only their porcelain metadata.
-The first explicit expansion requests path-scoped numstat data. When the removed-line count exceeds
-`status_deleted_file_preview_line_limit` (default 1,000), the file entry renders a single
-`Preview omitted` row and never reads the source blob, constructs hunks, builds syntax, or prewarms.
-Smaller staged deletions read the porcelain HEAD object ID, while smaller unstaged deletions read the
-porcelain index object ID through `git cat-file blob`.
+Whole-file additions and deletions add a harder data boundary. Startup retains their porcelain
+metadata and line counts without constructing full patches. Walkthrough mode hydrates an expanded
+added file automatically, while ordinary status interaction hydrates it on explicit expansion.
+When either side exceeds `status_file_preview_line_limit` (default 1,000), the file entry renders
+`Diff omitted — file has N lines (limit 1000)` and never constructs hunks, builds syntax, or
+prewarms. Deleted files also avoid reading their source blob after the path-scoped numstat query
+crosses the limit. Smaller staged deletions read the porcelain HEAD object ID, while smaller
+unstaged deletions read the porcelain index object ID through `git cat-file blob`.
 
 Cursor-driven syntax prewarm applies a separate hard boundary before it constructs file-level
 highlight state. Deleted files never prewarm. A collapsed non-deleted file prewarms only when its

@@ -11,23 +11,29 @@ local function assert_true(condition, message)
   if not condition then error(message, 2) end
 end
 
-local function assert_deleted_file_preview_gate()
+local function assert_file_preview_gate()
   assert_true(
-    size_gate._status_deleted_file_preview_omission({ git_status = "D", removed = 1000 }) == nil,
+    size_gate._status_file_preview_omission({ git_status = "D", removed = 1000 }) == nil,
     "deleted files at the line limit should retain their preview"
   )
   assert_true(
-    size_gate._status_deleted_file_preview_omission({ git_status = "D", removed = 1001 }) == 1001,
+    size_gate._status_file_preview_omission({ git_status = "D", removed = 1001 }) == 1001,
     "deleted files over the line limit should omit their preview"
   )
   assert_true(
-    size_gate._status_deleted_file_preview_omission({ status = "removed", removed = 1001 }) == 1001,
+    size_gate._status_file_preview_omission({ status = "removed", removed = 1001 }) == 1001,
     "provider deleted-file states should use the same preview gate"
   )
   assert_true(
-    size_gate._status_deleted_file_preview_omission({ git_status = "M", removed = 1001 }) == nil,
+    size_gate._status_file_preview_omission({ git_status = "M", removed = 1001 }) == nil,
     "large modified files should retain the normal size-gated preview"
   )
+  assert_true(
+    size_gate._status_file_preview_omission({ preview_source = "worktree_added", added = 1000 }) == nil,
+    "added files at the line limit should retain their preview"
+  )
+  local line_count, limit = size_gate._status_file_preview_omission({ preview_source = "index_added", added = 1001 })
+  assert_true(line_count == 1001 and limit == 1000, "added files over the line limit should report the gate")
 end
 
 local function assert_cursor_file_prewarm_gate()
@@ -155,7 +161,7 @@ local function assert_deleted_file_preview_render()
     status_render.status_render_file(file, nil, nil, nil, nil, { force_open = true })
     assert_true(#session.status.lines == 2, "omitted deleted file should render only its header and omission row")
     assert_true(
-      session.status.lines[2] == "Preview omitted — deleted file has 1001 lines",
+      session.status.lines[2] == "Diff omitted — file has 1001 lines (limit 1000)",
       "deleted-file omission message mismatch: " .. tostring(session.status.lines[2])
     )
     assert_true(session.status.entries[1].preview_omitted == true, "deleted-file header should block cursor prewarm")
@@ -189,7 +195,7 @@ end
 
 local function run()
   assert_size_gate_decision()
-  assert_deleted_file_preview_gate()
+  assert_file_preview_gate()
   assert_cursor_file_prewarm_gate()
   assert_deleted_file_preview_render()
   assert_prewarm_hunk_budget()
